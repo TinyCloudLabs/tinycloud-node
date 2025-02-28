@@ -1,0 +1,54 @@
+version: "3"
+
+services:
+  tinycloud:
+    build: ..
+    platform: linux/amd64
+    ports:
+      - "8000:8000"
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    environment:
+      RUST_LOG: "debug"
+      TINYCLOUD_STORAGE_BLOCKS_BUCKET: "tinycloud-blocks"
+      TINYCLOUD_STORAGE_BLOCKS_TYPE: S3
+      TINYCLOUD_STORAGE_BLOCKS_ENDPOINT: "http://localstack:4566"
+      TINYCLOUD_STORAGE_DATABASE: "postgres://postgres:postgres@postgres:5432/postgres"
+      TINYCLOUD_KEYS_TYPE: "Static"
+      TINYCLOUD_KEYS_SECRET: "U29tZSBsb25nIHBpZWNlIG9mIGVudHJvcHkgd2hpY2ggaXMgYSBzZWNyZXQgYW5kIG1vcmUgdGhhbiAzMiBieXRlcw"
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+      AWS_DEFAULT_REGION: "us-east-1"
+    depends_on:
+      - "localstack"
+      - "postgres"
+
+  localstack:
+    image: localstack/localstack
+    ports:
+      - "4566:4566"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    environment:
+      LOCALSTACK_SERVICES: "s3"
+    volumes:
+      - "./setup.sh:/docker-entrypoint-initaws.d/setup.sh:z"
+
+  postgres:
+    image: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_PASSWORD: "postgres"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
