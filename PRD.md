@@ -1,17 +1,17 @@
-# Kepler Product Requirements Document
+# TinyCloud Protocol Product Requirements Document
 
 Authors: Wayne Chang <wayne@spruceid.com>
 
 Date: October 9th, 2020
 
-Kepler is a decentralized data storage system built as a network of storage
+TinyCloud Protocol is a decentralized data storage system built as a network of storage
 nodes and data overlays called orbits. Orbits can be replicated, permissioned,
 and accessed according to their own policies.
 
 Many decentralized networks rely on centralized storage providers such as AWS
 S3, GitHub, or IPFS instances hosted by a single company. They do this to meet
 file hosting expectations of high public availability, low latency, reasonable
-cost. With Kepler, we seek to achieve decentralization through local
+cost. With TinyCloud Protocol, we seek to achieve decentralization through local
 consensus, with each orbit adhering to flexible governance criteria, for
 example:
 
@@ -127,37 +127,37 @@ usable storage that community members can rely on for their projects. We will
 describe the minimal “happy case” user workflow that must be implemented first,
 then possibly iterated upon to eventually meet all requirements.
 
-### Kepler Node Administrator
-A Kepler Node Administrator is typically the CTO or senior engineer at a
+### TinyCloud Protocol Node Administrator
+A TinyCloud Protocol Node Administrator is typically the CTO or senior engineer at a
 small engineering firm such as TQ, Baking Bad, ECAD Labs, or Spruce, that
-wishes to run and use the Kepler storage network. They are technically
+wishes to run and use the TinyCloud Protocol storage network. They are technically
 sophisticated but have limited time and developer resources to spend setting up
 a node and making it run reliably.
 
 For the MVP, they want to be able to
-- Run an instance of Kepler on their cloud provider of choice in an isolated
+- Run an instance of TinyCloud Protocol on their cloud provider of choice in an isolated
   but Internet-connected environment, such as on AWS, Azure, GCP, or Digital
   Ocean.
 - Not have to worry about cloud security settings, data storage abuse, takedown
   notices, or skyrocketing costs.
-- Be able to access their Kepler node through an administration panel and
+- Be able to access their TinyCloud Protocol node through an administration panel and
   monitor statistics such as peering, storage usage, uptime, bandwidth, and
   more.
 
-### Kepler Storage User
-A Kepler Storage User has a Tezos account and wants to store files on the
-Kepler storage network (KSN). For the MVP, they want to be able to:
-- Deploy their dApp to KSN including its frontend web assets.
-- Store files on KSN from a dApp without leaving the dApp.
-- Store arbitrary files on KSN from the command line.
+### TinyCloud Protocol Storage User
+A TinyCloud Protocol Storage User has a Tezos account and wants to store files on the
+TinyCloud Protocol storage network (TSN). For the MVP, they want to be able to:
+- Deploy their dApp to TSN including its frontend web assets.
+- Store files on TSN from a dApp without leaving the dApp.
+- Store arbitrary files on TSN from the command line.
 - Receive statistics on their hosted files, such as durability (redundancy),
   bandwidth statistics, and more.
-- Login to their KSN management portal and view their data and storage quotas.
+- Login to their TSN management portal and view their data and storage quotas.
 - View the reasons for increases in storage quota, such as having a certain
   number of mainnet transactions associated with their account.
 
-### Kepler Network Administrator
-The Kepler Network Administrator responds to takedown requests and fights spam
+### TinyCloud Protocol Network Administrator
+The TinyCloud Protocol Network Administrator responds to takedown requests and fights spam
 on behalf of all nodes. It is the centralized governance actor that we hope to
 eventually decentralize with BaseDAO. We expect a single party, possibly
 whoever builds the system, to play this role for now with oversight from the

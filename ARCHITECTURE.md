@@ -1,11 +1,11 @@
-# Kepler Architecture
+# TinyCloud Protocol Architecture
 
 Authors: Wayne Chang <wayne@spruceid.com>, Charles Cunningham <charles.cunningham@spruceid.com>
 
 Date: May 24th, 2021
 
 ## Major Subsystems
-Kepler has these major subsystems:
+TinyCloud Protocol has these major subsystems:
 - Orbit Manifest: Provides Root Authority, Discoverability, and Base Policy
 - Access Control: Modular Key-Based Authentication, Capabilities-Based Permissioning
 - Hosts: Logical Units Serving Requests
@@ -50,17 +50,17 @@ tz?account=tz1TUh4tk6xRGsrwstKFw88sapBs8iLB3LrP&host=kepler.tzprofiles.com&nonce
 tz?account=KT1XgKpd8KwyBUyE1Sfn8uXMr6qidRXJeM4B
 ```
 
-To go from an Orbit Identifier to an Kepler URI, the identifier is first
+To go from an Orbit Identifier to a TinyCloud Protocol URI, the identifier is first
 optionally hashed into a
 [multiformats representation](https://multiformats.io/). This is desirable to
 add privacy (especially if there is a nonce-like field) or keep a constant
-Kepler URI size. It is then prefixed with `kepler://`.
+TinyCloud Protocol URI size. It is then prefixed with `tinycloud://`.
 
-Examples of Kepler URIs:
+Examples of TinyCloud Protocol URIs:
 ```
-kepler://tz?account=tz1TUh4tk6xRGsrwstKFw88sapBs8iLB3LrP&host=kepler.tzprofiles.com&nonce=jVUYDuxJ
-kepler://F9bdb90a11d5b6ffc6f07f0a2f90563f0d38f1751585f6bb656c26e3d83b411ae
-kepler://tz?account=KT1XgKpd8KwyBUyE1Sfn8uXMr6qidRXJeM4B
+tinycloud://tz?account=tz1TUh4tk6xRGsrwstKFw88sapBs8iLB3LrP&host=tinycloud.tzprofiles.com&nonce=jVUYDuxJ
+tinycloud://F9bdb90a11d5b6ffc6f07f0a2f90563f0d38f1751585f6bb656c26e3d83b411ae
+tinycloud://tz?account=KT1XgKpd8KwyBUyE1Sfn8uXMr6qidRXJeM4B
 ```
 
 The Orbit Identifier is used in conjunction with an Orbit Method type

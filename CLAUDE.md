@@ -1,4 +1,4 @@
-# Kepler Development Guidelines
+# TinyCloud Protocol Development Guidelines
 
 ## Build Commands
 - Build project: `cargo build`
@@ -20,6 +20,6 @@
 - Validate inputs at API boundaries
 
 ## Project Structure
-- Core functionality in kepler-core/
+- Core functionality in tinycloud-core/
 - HTTP server in src/
 - SDKs in sdk/ and sdk-wasm/
