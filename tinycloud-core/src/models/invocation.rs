@@ -6,7 +6,7 @@ use super::super::{
 };
 use crate::hash::Hash;
 use crate::types::{Facts, OrbitIdWrap, Resource};
-use kepler_lib::{authorization::KeplerInvocation, resolver::DID_METHODS};
+use tinycloud_lib::{authorization::TinyCloudInvocation, resolver::DID_METHODS};
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, Condition, ConnectionTrait, QueryOrder};
 use time::OffsetDateTime;
 
@@ -87,7 +87,7 @@ pub(crate) async fn process<C: ConnectionTrait>(
     save(db, i, Some(now), serialized, ops).await
 }
 
-async fn verify(invocation: &KeplerInvocation) -> Result<(), Error> {
+async fn verify(invocation: &TinyCloudInvocation) -> Result<(), Error> {
     invocation
         .verify_signature(DID_METHODS.to_resolver())
         .await

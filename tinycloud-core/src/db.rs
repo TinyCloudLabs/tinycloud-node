@@ -10,8 +10,8 @@ use crate::storage::{
 };
 use crate::types::{Metadata, OrbitIdWrap, Resource};
 use crate::util::{Capability, DelegationInfo};
-use kepler_lib::{
-    authorization::{EncodingError, KeplerDelegation},
+use tinycloud_lib::{
+    authorization::{EncodingError, TinyCloudDelegation},
     resource::OrbitId,
 };
 use sea_orm::{
@@ -47,7 +47,7 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
     #[error(transparent)]
     Ucan(#[from] ssi::ucan::Error),
     #[error(transparent)]
-    Cacao(#[from] kepler_lib::cacaos::siwe_cacao::VerificationError),
+    Cacao(#[from] tinycloud_lib::cacaos::siwe_cacao::VerificationError),
     #[error(transparent)]
     InvalidDelegation(#[from] delegation::DelegationError),
     #[error(transparent)]
@@ -757,7 +757,7 @@ async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                 && del.not_before.map(|n| n <= now).unwrap_or(true)
                 && ability.iter().any(|a| a.resource.orbit() == Some(orbit))
             {
-                Some(match KeplerDelegation::from_bytes(&del.serialization) {
+                Some(match TinyCloudDelegation::from_bytes(&del.serialization) {
                     Ok(delegation) => Ok((
                         del.id,
                         DelegationInfo {

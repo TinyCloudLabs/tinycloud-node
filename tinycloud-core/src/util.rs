@@ -1,6 +1,6 @@
 use crate::types::Resource;
-use kepler_lib::{
-    authorization::{KeplerDelegation, KeplerInvocation, KeplerRevocation},
+use tinycloud_lib::{
+    authorization::{TinyCloudDelegation, TinyCloudInvocation, TinyCloudRevocation},
     cacaos::siwe::Message,
     libipld::Cid,
     resource::OrbitId,
@@ -25,7 +25,7 @@ pub enum CapExtractError {
     #[error("Invalid Extra Fields")]
     InvalidFields,
     #[error(transparent)]
-    Cid(#[from] kepler_lib::libipld::cid::Error),
+    Cid(#[from] tinycloud_lib::libipld::cid::Error),
 }
 
 fn extract_ucan_cap<T>(c: &UcanCap<T>) -> Result<Capability, CapExtractError> {
@@ -63,9 +63,9 @@ fn extract_siwe_cap(c: SiweCap) -> Result<(Vec<Capability>, Vec<Cid>), CapExtrac
                     .map(|s| {
                         s.as_str()
                             .map(Cid::from_str)
-                            .ok_or(kepler_lib::libipld::cid::Error::ParsingError)?
+                            .ok_or(tinycloud_lib::libipld::cid::Error::ParsingError)?
                     })
-                    .collect::<Result<Vec<Cid>, kepler_lib::libipld::cid::Error>>()?,
+                    .collect::<Result<Vec<Cid>, tinycloud_lib::libipld::cid::Error>>()?,
                 _ => return Err(CapExtractError::InvalidFields),
             },
         ))
@@ -78,7 +78,7 @@ pub struct DelegationInfo {
     pub delegator: String,
     pub delegate: String,
     pub parents: Vec<Cid>,
-    pub delegation: KeplerDelegation,
+    pub delegation: TinyCloudDelegation,
     pub expiry: Option<OffsetDateTime>,
     pub not_before: Option<OffsetDateTime>,
     pub issued_at: Option<OffsetDateTime>,
@@ -100,18 +100,18 @@ pub enum DelegationError {
     #[error("Missing Delegate")]
     MissingDelegate,
     #[error(transparent)]
-    SiweConversion(#[from] kepler_lib::cacaos::siwe_cacao::SIWEPayloadConversionError),
+    SiweConversion(#[from] tinycloud_lib::cacaos::siwe_cacao::SIWEPayloadConversionError),
     #[error(transparent)]
-    SiweCapError(#[from] kepler_lib::siwe_recap::Error),
+    SiweCapError(#[from] tinycloud_lib::siwe_recap::Error),
     #[error("Invalid Siwe Statement")]
     InvalidStatement,
 }
 
-impl TryFrom<KeplerDelegation> for DelegationInfo {
+impl TryFrom<TinyCloudDelegation> for DelegationInfo {
     type Error = DelegationError;
-    fn try_from(d: KeplerDelegation) -> Result<Self, Self::Error> {
+    fn try_from(d: TinyCloudDelegation) -> Result<Self, Self::Error> {
         Ok(match d {
-            KeplerDelegation::Ucan(ref u) => Self {
+            TinyCloudDelegation::Ucan(ref u) => Self {
                 capabilities: u
                     .payload
                     .attenuation
@@ -134,7 +134,7 @@ impl TryFrom<KeplerDelegation> for DelegationInfo {
                 delegation: d,
                 issued_at: None,
             },
-            KeplerDelegation::Cacao(ref c) => {
+            TinyCloudDelegation::Cacao(ref c) => {
                 let m: Message = c.payload().clone().try_into()?;
                 if !verify_statement(&m)? {
                     return Err(DelegationError::InvalidStatement);
@@ -164,7 +164,7 @@ pub struct InvocationInfo {
     pub capabilities: Vec<Capability>,
     pub invoker: String,
     pub parents: Vec<Cid>,
-    pub invocation: KeplerInvocation,
+    pub invocation: TinyCloudInvocation,
 }
 
 impl InvocationInfo {
@@ -182,9 +182,9 @@ pub enum InvocationError {
     ResourceParse(#[from] CapExtractError),
 }
 
-impl TryFrom<KeplerInvocation> for InvocationInfo {
+impl TryFrom<TinyCloudInvocation> for InvocationInfo {
     type Error = InvocationError;
-    fn try_from(invocation: KeplerInvocation) -> Result<Self, Self::Error> {
+    fn try_from(invocation: TinyCloudInvocation) -> Result<Self, Self::Error> {
         Ok(Self {
             capabilities: invocation
                 .payload
@@ -205,7 +205,7 @@ pub struct RevocationInfo {
     pub parents: Vec<Cid>,
     pub revoked: Cid,
     pub revoker: String,
-    pub revocation: KeplerRevocation,
+    pub revocation: TinyCloudRevocation,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -214,11 +214,11 @@ pub enum RevocationError {
     InvalidTarget,
 }
 
-impl TryFrom<KeplerRevocation> for RevocationInfo {
+impl TryFrom<TinyCloudRevocation> for RevocationInfo {
     type Error = RevocationError;
-    fn try_from(r: KeplerRevocation) -> Result<Self, Self::Error> {
+    fn try_from(r: TinyCloudRevocation) -> Result<Self, Self::Error> {
         match r {
-            KeplerRevocation::Cacao(ref c) => match c.payload().aud.as_str().split_once(':') {
+            TinyCloudRevocation::Cacao(ref c) => match c.payload().aud.as_str().split_once(':') {
                 Some(("ucan", ps)) => Ok(Self {
                     parents: Vec::new(),
                     revoked: ps.parse().map_err(|_| RevocationError::InvalidTarget)?,

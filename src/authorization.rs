@@ -31,13 +31,13 @@ macro_rules! impl_fromreq {
     };
 }
 
-impl_fromreq!(DelegationInfo, KeplerDelegation, "Authorization");
-impl_fromreq!(InvocationInfo, KeplerInvocation, "Authorization");
-impl_fromreq!(RevocationInfo, KeplerRevocation, "Authorization");
+impl_fromreq!(DelegationInfo, TinyCloudDelegation, "Authorization");
+impl_fromreq!(InvocationInfo, TinyCloudInvocation, "Authorization");
+impl_fromreq!(RevocationInfo, TinyCloudRevocation, "Authorization");
 
 #[cfg(test)]
 mod test {
-    use kepler_lib::{
+    use tinycloud_lib::{
         libipld::cid::Cid,
         resolver::DID_METHODS,
         ssi::{

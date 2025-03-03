@@ -1,4 +1,4 @@
-use kepler_lib::resource::OrbitId;
+use tinycloud_lib::resource::OrbitId;
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;

@@ -1,5 +1,5 @@
-use kepler_lib::resource::OrbitId;
-use kepler_lib::ssi::{
+use tinycloud_lib::resource::OrbitId;
+use tinycloud_lib::ssi::{
     did::{Document, RelativeDIDURL, Service, VerificationMethod, DIDURL},
     did_resolve::DIDResolver,
     one_or_many::OneOrMany,
@@ -119,7 +119,7 @@ pub async fn resolve_dyn(
     resolver: Option<&dyn DIDResolver>,
 ) -> Result<Option<Manifest>, ResolutionError> {
     let (md, doc, doc_md) = resolver
-        .unwrap_or_else(|| kepler_lib::resolver::DID_METHODS.to_resolver())
+        .unwrap_or_else(|| tinycloud_lib::resolver::DID_METHODS.to_resolver())
         .resolve(&id.did(), &Default::default())
         .await;
 
@@ -202,8 +202,8 @@ fn id_from_vm(did: &str, vm: VerificationMethod) -> DIDURL {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kepler_lib::resolver::DID_METHODS;
-    use kepler_lib::ssi::{
+    use tinycloud_lib::resolver::DID_METHODS;
+    use tinycloud_lib::ssi::{
         did::{Source, DIDURL},
         jwk::JWK,
     };

@@ -3,9 +3,9 @@ use crate::{
     types::Metadata,
     util::{DelegationInfo, InvocationInfo, RevocationInfo},
 };
-pub use kepler_lib::{
+pub use tinycloud_lib::{
     authorization::{
-        EncodingError, HeaderEncode, KeplerDelegation, KeplerInvocation, KeplerRevocation,
+        EncodingError, HeaderEncode, TinyCloudDelegation, TinyCloudInvocation, TinyCloudRevocation,
     },
     libipld::cid::{
         multihash::{Code, Error as MultihashError, MultihashDigest},

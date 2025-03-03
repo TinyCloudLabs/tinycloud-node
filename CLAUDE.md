@@ -22,4 +22,20 @@
 ## Project Structure
 - Core functionality in tinycloud-core/
 - HTTP server in src/
-- SDKs in sdk/ and sdk-wasm/
+- SDKs in tinycloud-sdk/ and tinycloud-sdk-wasm/
+
+## Migration Notes
+This project was forked from the archived Kepler protocol. The following changes were made:
+1. Renamed all references from "Kepler" to "TinyCloud Protocol"
+2. Renamed the crate `kepler` to `tinycloud`
+3. Renamed the crate `kepler-core` to `tinycloud-core`
+4. Renamed the crate `kepler-lib` to `tinycloud-lib`
+5. Renamed the crate `kepler-sdk` to `tinycloud-sdk`
+6. Renamed the crate `kepler-sdk-wasm` to `tinycloud-sdk-wasm`
+7. Renamed all imports from `kepler_*` to `tinycloud_*`
+8. Renamed types and modules:
+   - `KeplerDelegation` → `TinyCloudDelegation`
+   - `KeplerInvocation` → `TinyCloudInvocation`
+   - `KeplerRevocation` → `TinyCloudRevocation`
+9. Changed environment variables from `KEPLER_*` to `TINYCLOUD_*`
+10. Renamed configuration file from `kepler.toml` to `tinycloud.toml`

@@ -1,7 +1,7 @@
 use crate::hash::Hash;
 use crate::types::{Facts, Resource};
 use crate::{events::Delegation, models::*, relationships::*, util};
-use kepler_lib::{authorization::KeplerDelegation, resolver::DID_METHODS};
+use tinycloud_lib::{authorization::TinyCloudDelegation, resolver::DID_METHODS};
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, ConnectionTrait};
 use time::OffsetDateTime;
 
@@ -130,9 +130,9 @@ pub(crate) async fn process<C: ConnectionTrait>(
 }
 
 // verify signatures and time
-async fn verify(delegation: &KeplerDelegation) -> Result<(), Error> {
+async fn verify(delegation: &TinyCloudDelegation) -> Result<(), Error> {
     match delegation {
-        KeplerDelegation::Ucan(ref ucan) => {
+        TinyCloudDelegation::Ucan(ref ucan) => {
             ucan.verify_signature(DID_METHODS.to_resolver())
                 .await
                 .map_err(|_| DelegationError::InvalidSignature)?;
@@ -140,7 +140,7 @@ async fn verify(delegation: &KeplerDelegation) -> Result<(), Error> {
                 .validate_time(None)
                 .map_err(|_| DelegationError::InvalidTime)?;
         }
-        KeplerDelegation::Cacao(ref cacao) => {
+        TinyCloudDelegation::Cacao(ref cacao) => {
             cacao
                 .verify()
                 .await

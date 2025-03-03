@@ -18,12 +18,12 @@ pub trait HeaderEncode {
 }
 
 #[derive(Clone, Debug)]
-pub enum KeplerDelegation {
+pub enum TinyCloudDelegation {
     Ucan(Box<Ucan>),
     Cacao(Box<SiweCacao>),
 }
 
-impl HeaderEncode for KeplerDelegation {
+impl HeaderEncode for TinyCloudDelegation {
     fn encode(&self) -> Result<String, EncodingError> {
         use std::ops::Deref;
         Ok(match self {
@@ -47,7 +47,7 @@ impl HeaderEncode for KeplerDelegation {
     }
 }
 
-impl KeplerDelegation {
+impl TinyCloudDelegation {
     pub fn from_bytes(b: &[u8]) -> Result<Self, EncodingError> {
         match DagCborCodec.decode(b) {
             Ok(cacao) => Ok(Self::Cacao(Box::new(cacao))),
@@ -60,9 +60,9 @@ impl KeplerDelegation {
 
 // turn everything into url safe, b64-cacao or jwt
 
-pub type KeplerInvocation = Ucan;
+pub type TinyCloudInvocation = Ucan;
 
-impl HeaderEncode for KeplerInvocation {
+impl HeaderEncode for TinyCloudInvocation {
     fn encode(&self) -> Result<String, EncodingError> {
         Ok(self.encode()?)
     }
@@ -72,11 +72,11 @@ impl HeaderEncode for KeplerInvocation {
 }
 
 #[derive(Debug, Clone)]
-pub enum KeplerRevocation {
+pub enum TinyCloudRevocation {
     Cacao(SiweCacao),
 }
 
-impl HeaderEncode for KeplerRevocation {
+impl HeaderEncode for TinyCloudRevocation {
     fn encode(&self) -> Result<String, EncodingError> {
         match self {
             Self::Cacao(c) => Ok(base64::encode_config(

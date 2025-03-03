@@ -1,5 +1,5 @@
 use crate::storage::{ImmutableStaging, StorageConfig};
-use kepler_lib::resource::OrbitId;
+use tinycloud_lib::resource::OrbitId;
 use sea_orm_migration::async_trait::async_trait;
 
 #[derive(Default, Debug, Clone, Hash, PartialEq, Eq)]

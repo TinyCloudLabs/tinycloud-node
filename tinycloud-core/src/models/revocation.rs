@@ -1,6 +1,6 @@
 use super::super::{events::Revocation, models::*, relationships::*};
 use crate::hash::{hash, Hash};
-use kepler_lib::authorization::KeplerRevocation;
+use tinycloud_lib::authorization::TinyCloudRevocation;
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, ConnectionTrait};
 use time::OffsetDateTime;
 
@@ -74,7 +74,7 @@ pub(crate) async fn process<C: ConnectionTrait>(
     let t = OffsetDateTime::now_utc();
 
     match &r.revocation {
-        KeplerRevocation::Cacao(c) => {
+        TinyCloudRevocation::Cacao(c) => {
             c.verify()
                 .await
                 .map_err(|_| RevocationError::InvalidSignature)?;
