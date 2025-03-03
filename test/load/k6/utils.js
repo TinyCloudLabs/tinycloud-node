@@ -1,12 +1,12 @@
 import { check } from 'k6';
 import http from 'k6/http';
 
-export const kepler = __ENV.KEPLER || "http://127.0.0.1:8000";
+export const tinycloud = __ENV.TINYCLOUD || "http://127.0.0.1:8000";
 export const signer = __ENV.SIGNER || "http://127.0.0.1:3000";
 
-export function setup_orbit(kepler, signer, id) {
+export function setup_orbit(tinycloud, signer, id) {
     let orbit_id = http.get(`${signer}/orbit_id/${id}`).body;
-    let peer_id = http.get(`${kepler}/peer/generate/${encodeURIComponent(orbit_id)}`).body;
+    let peer_id = http.get(`${tinycloud}/peer/generate/${encodeURIComponent(orbit_id)}`).body;
     let orbit_creation = http.post(`${signer}/orbits/${id}`,
         JSON.stringify({ peer_id }),
         {
@@ -14,7 +14,7 @@ export function setup_orbit(kepler, signer, id) {
                 'Content-Type': 'application/json',
             },
         }).json();
-    let res = http.post(`${kepler}/delegate`,
+    let res = http.post(`${tinycloud}/delegate`,
         null,
         {
             headers: orbit_creation,
@@ -22,9 +22,9 @@ export function setup_orbit(kepler, signer, id) {
     check(res, {
         'orbit creation is succesful': (r) => r.status === 200,
     });
-    console.log(`[${id} CREATE ORBIT] (${res.headers["Spruce-Trace-Id"]}) -> ${res.status}`);
+    console.log(`[${id} CREATE ORBIT] (${res.headers["TinyCloud-Trace-Id"]}) -> ${res.status}`);
     let session_delegation = http.post(`${signer}/sessions/${id}/create`).json();
-    res = http.post(`${kepler}/delegate`,
+    res = http.post(`${tinycloud}/delegate`,
         null,
         {
             headers: session_delegation,
@@ -33,5 +33,5 @@ export function setup_orbit(kepler, signer, id) {
         'session delegation is succesful': (r) => r.status === 200,
     });
 
-    console.log(`[${id} SESSION DELEGATION] (${res.headers["Spruce-Trace-Id"]}) -> ${res.status}`);
+    console.log(`[${id} SESSION DELEGATION] (${res.headers["TinyCloud-Trace-Id"]}) -> ${res.status}`);
 }

@@ -1,7 +1,7 @@
 version: "3"
 
 services:
-  kepler:
+  tinycloud:
     build: ..
     platform: linux/amd64
     ports:
@@ -14,12 +14,12 @@ services:
       retries: 3
     environment:
       RUST_LOG: "debug"
-      KEPLER_STORAGE_BLOCKS_BUCKET: "kepler-blocks"
-      KEPLER_STORAGE_BLOCKS_TYPE: S3
-      KEPLER_STORAGE_BLOCKS_ENDPOINT: "http://localstack:4566"
-      KEPLER_STORAGE_DATABASE: "postgres://postgres:postgres@postgres:5432/postgres"
-      KEPLER_KEYS_TYPE: "Static"
-      KEPLER_KEYS_SECRET: "U29tZSBsb25nIHBpZWNlIG9mIGVudHJvcHkgd2hpY2ggaXMgYSBzZWNyZXQgYW5kIG1vcmUgdGhhbiAzMiBieXRlcw"
+      TINYCLOUD_STORAGE_BLOCKS_BUCKET: "tinycloud-blocks"
+      TINYCLOUD_STORAGE_BLOCKS_TYPE: S3
+      TINYCLOUD_STORAGE_BLOCKS_ENDPOINT: "http://localstack:4566"
+      TINYCLOUD_STORAGE_DATABASE: "postgres://postgres:postgres@postgres:5432/postgres"
+      TINYCLOUD_KEYS_TYPE: "Static"
+      TINYCLOUD_KEYS_SECRET: "U29tZSBsb25nIHBpZWNlIG9mIGVudHJvcHkgd2hpY2ggaXMgYSBzZWNyZXQgYW5kIG1vcmUgdGhhbiAzMiBieXRlcw"
       AWS_ACCESS_KEY_ID: "test"
       AWS_SECRET_ACCESS_KEY: "test"
       AWS_DEFAULT_REGION: "us-east-1"

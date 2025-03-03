@@ -4,7 +4,7 @@ import {
     randomString,
 } from 'https://jslib.k6.io/k6-utils/1.3.0/index.js';
 
-import { setup_orbit, kepler, signer } from './utils.js';
+import { setup_orbit, tinycloud, signer } from './utils.js';
 
 export const options = {
     scenarios: {
@@ -19,7 +19,7 @@ export const options = {
 };
 
 export function setup() {
-    setup_orbit(kepler, signer, 0);
+    setup_orbit(tinycloud, signer, 0);
 
     const key = randomString(15);
     let put_invocation = http.post(`${signer}/sessions/0/invoke`,
@@ -30,7 +30,7 @@ export function setup() {
             },
         }).json();
     put_invocation['Content-Type'] = 'application/json';
-    http.post(`${kepler}/invoke`,
+    http.post(`${tinycloud}/invoke`,
         JSON.stringify({ test: "data" }),
         {
             headers: put_invocation,
@@ -50,7 +50,7 @@ export default function(data) {
         }).json();
     get_invocation['Content-Type'] = 'application/json';
     let signer_now = Date.now();
-    let res = http.post(`${kepler}/invoke`,
+    let res = http.post(`${tinycloud}/invoke`,
         "",
         {
             headers: get_invocation,
@@ -60,7 +60,7 @@ export default function(data) {
     check(res, {
         'is status 200': (r) => r.status === 200,
     });
-    console.log(`${res.headers["Spruce-Trace-Id"]} -> ${res.status} [${signer_now - start_now}ms + ${invoke_now - signer_now}ms]`);
+    console.log(`${res.headers["TinyCloud-Trace-Id"]} -> ${res.status} [${signer_now - start_now}ms + ${invoke_now - signer_now}ms]`);
 }
 
 export function teardown(data) {
@@ -72,7 +72,7 @@ export function teardown(data) {
             },
         }).json();
     del_invocation['Content-Type'] = 'application/json';
-    let res = http.post(`${kepler}/invoke`,
+    let res = http.post(`${tinycloud}/invoke`,
         "",
         {
             headers: del_invocation

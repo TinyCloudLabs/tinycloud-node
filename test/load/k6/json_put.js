@@ -4,7 +4,7 @@ import {
     randomString,
 } from 'https://jslib.k6.io/k6-utils/1.3.0/index.js';
 
-import { setup_orbit, kepler, signer } from './utils.js';
+import { setup_orbit, tinycloud, signer } from './utils.js';
 
 export const options = {
     scenarios: {
@@ -20,7 +20,7 @@ export const options = {
 };
 
 export function setup() {
-    setup_orbit(kepler, signer, 0);
+    setup_orbit(tinycloud, signer, 0);
 }
 
 export default function() {
@@ -33,7 +33,7 @@ export default function() {
             },
         }).json();
     let content = new ArrayBuffer(randomString(256));
-    let res = http.post(`${kepler}/invoke`,
+    let res = http.post(`${tinycloud}/invoke`,
         content,
         {
             headers: put_invocation,
@@ -42,7 +42,7 @@ export default function() {
     check(res, {
         'is status 200': (r) => r.status === 200,
     });
-    console.log(`${res.headers["Spruce-Trace-Id"]} -> ${res.status}`);
+    console.log(`${res.headers["TinyCloud-Trace-Id"]} -> ${res.status}`);
 }
 
 export function teardown() {
@@ -53,7 +53,7 @@ export function teardown() {
                 'Content-Type': 'application/json',
             },
         }).json();
-    let res = http.post(`${kepler}/invoke`,
+    let res = http.post(`${tinycloud}/invoke`,
         null,
         {
             headers: list_invocation,
@@ -62,7 +62,7 @@ export function teardown() {
     check(res, {
         'is status 200': (r) => r.status === 200,
     });
-    console.log(`[TEARDOWN] ${res.headers["Spruce-Trace-Id"]} -> ${res.status}`);
+    console.log(`[TEARDOWN] ${res.headers["TinyCloud-Trace-Id"]} -> ${res.status}`);
     const keys = res.json();
 
     for (const key of keys) {
@@ -73,7 +73,7 @@ export function teardown() {
                     'Content-Type': 'application/json',
                 },
             }).json();
-        let res = http.post(`${kepler}/invoke`,
+        let res = http.post(`${tinycloud}/invoke`,
             null,
             {
                 headers: del_invocation,
@@ -82,6 +82,6 @@ export function teardown() {
         check(res, {
             'is status 200': (r) => r.status === 200,
         });
-        console.log(`[TEARDOWN] ${res.headers["Spruce-Trace-Id"]} -> ${res.status}`);
+        console.log(`[TEARDOWN] ${res.headers["TinyCloud-Trace-Id"]} -> ${res.status}`);
     }
 }

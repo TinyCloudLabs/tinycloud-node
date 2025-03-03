@@ -5,7 +5,7 @@ import {
     randomString,
 } from 'https://jslib.k6.io/k6-utils/1.3.0/index.js';
 
-import { setup_orbit, kepler, signer } from './utils.js';
+import { setup_orbit, tinycloud, signer } from './utils.js';
 
 export const options = {
     iterations: 300,
@@ -14,7 +14,7 @@ export const options = {
 
 export default function() {
     const id = exec.scenario.iterationInTest;
-    setup_orbit(kepler, signer, id);
+    setup_orbit(tinycloud, signer, id);
 
     const key = randomString(15);
     let put_invocation = http.post(`${signer}/sessions/${id}/invoke`,
@@ -25,7 +25,7 @@ export default function() {
             },
         }).json();
     put_invocation['Content-Type'] = 'application/json';
-    let res = http.post(`${kepler}/invoke`,
+    let res = http.post(`${tinycloud}/invoke`,
         JSON.stringify({ test: "data" }),
         {
             headers: put_invocation,
@@ -34,7 +34,7 @@ export default function() {
     check(res, {
         'is status 200': (r) => r.status === 200,
     });
-    console.log(`[${id} PUT] ${res.headers["Spruce-Trace-Id"]} -> ${res.status}`);
+    console.log(`[${id} PUT] ${res.headers["TinyCloud-Trace-Id"]} -> ${res.status}`);
 
     let get_invocation = http.post(`${signer}/sessions/${id}/invoke`,
         JSON.stringify({ name: key, action: "get" }),
@@ -44,7 +44,7 @@ export default function() {
             },
         }).json();
     get_invocation['Content-Type'] = 'application/json';
-    res = http.post(`${kepler}/invoke`,
+    res = http.post(`${tinycloud}/invoke`,
         "",
         {
             headers: get_invocation,
@@ -53,7 +53,7 @@ export default function() {
     check(res, {
         'is status 200': (r) => r.status === 200,
     });
-    console.log(`[${id} GET] ${res.headers["Spruce-Trace-Id"]} -> ${res.status}`);
+    console.log(`[${id} GET] ${res.headers["TinyCloud-Trace-Id"]} -> ${res.status}`);
 
     let del_invocation = http.post(`${signer}/sessions/${id}/invoke`,
         JSON.stringify({ name: key, action: "del" }),
@@ -63,7 +63,7 @@ export default function() {
             },
         }).json();
     del_invocation['Content-Type'] = 'application/json';
-    res = http.post(`${kepler}/invoke`,
+    res = http.post(`${tinycloud}/invoke`,
         "",
         {
             headers: del_invocation
@@ -72,5 +72,5 @@ export default function() {
     check(res, {
         'is status 200': (r) => r.status === 200,
     });
-    console.log(`[${id} DEL] ${res.headers["Spruce-Trace-Id"]} -> ${res.status}`);
+    console.log(`[${id} DEL] ${res.headers["TinyCloud-Trace-Id"]} -> ${res.status}`);
 }
