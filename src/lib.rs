@@ -7,7 +7,7 @@ extern crate anyhow;
 extern crate tokio;
 
 use anyhow::Result;
-use kepler_lib::libipld::{block::Block as OBlock, store::DefaultParams};
+use tinycloud_lib::libipld::{block::Block as OBlock, store::DefaultParams};
 use rocket::{fairing::AdHoc, figment::Figment, http::Header, Build, Rocket};
 
 pub mod allow_list;
@@ -20,7 +20,7 @@ pub mod storage;
 mod tracing;
 
 use config::{BlockStorage, Config, Keys, StagingStorage};
-use kepler_core::{
+use tinycloud_core::{
     keys::{SecretsSetup, StaticSecret},
     sea_orm::{ConnectOptions, Database, DatabaseConnection},
     storage::{either::Either, memory::MemoryStaging, StorageConfig},
@@ -73,25 +73,25 @@ impl From<BlockStage> for StagingStorage {
     }
 }
 
-pub type Kepler = OrbitDatabase<DatabaseConnection, BlockStores, StaticSecret>;
+pub type TinyCloud = OrbitDatabase<DatabaseConnection, BlockStores, StaticSecret>;
 
 pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
-    let kepler_config: Config = config.extract::<Config>()?;
+    let tinycloud_config: Config = config.extract::<Config>()?;
 
-    tracing::tracing_try_init(&kepler_config.log);
+    tracing::tracing_try_init(&tinycloud_config.log);
 
     let routes = routes![healthcheck, cors, open_host_key, invoke, delegate,];
 
-    let key_setup: StaticSecret = match kepler_config.keys {
+    let key_setup: StaticSecret = match tinycloud_config.keys {
         Keys::Static(s) => s.try_into()?,
     };
 
-    let mut connect_opts = ConnectOptions::from(&kepler_config.storage.database);
+    let mut connect_opts = ConnectOptions::from(&tinycloud_config.storage.database);
     connect_opts.max_connections(100);
 
-    let kepler = Kepler::new(
+    let tinycloud = TinyCloud::new(
         Database::connect(connect_opts).await?,
-        kepler_config.storage.blocks.open().await?,
+        tinycloud_config.storage.blocks.open().await?,
         key_setup.setup(()).await?,
     )
     .await?;
@@ -100,12 +100,12 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         .mount("/", routes)
         .attach(AdHoc::config::<Config>())
         .attach(tracing::TracingFairing {
-            header_name: kepler_config.log.tracing.traceheader,
+            header_name: tinycloud_config.log.tracing.traceheader,
         })
-        .manage(kepler)
-        .manage(kepler_config.storage.staging.open().await?);
+        .manage(tinycloud)
+        .manage(tinycloud_config.storage.staging.open().await?);
 
-    if kepler_config.cors {
+    if tinycloud_config.cors {
         Ok(rocket.attach(AdHoc::on_response("CORS", |_, resp| {
             Box::pin(async move {
                 resp.set_header(Header::new("Access-Control-Allow-Origin", "*"));

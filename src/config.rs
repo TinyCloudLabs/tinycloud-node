@@ -3,7 +3,7 @@ use crate::{
     storage::{file_system::FileSystemConfig, s3::S3BlockConfig},
     BlockConfig, BlockStage,
 };
-use kepler_core::keys::StaticSecret;
+use tinycloud_core::keys::StaticSecret;
 use rocket::data::ByteUnit;
 use serde::{Deserialize, Serialize};
 use serde_with::{
@@ -149,7 +149,7 @@ impl Default for Tracing {
     fn default() -> Tracing {
         Tracing {
             enabled: false,
-            traceheader: "Spruce-Trace-Id".to_string(),
+            traceheader: "TinyCloud-Trace-Id".to_string(),
         }
     }
 }

@@ -1,10 +1,10 @@
 use anyhow::Result;
-use kepler_core::{
+use tinycloud_core::{
     types::Metadata,
     util::{Capability, DelegationInfo},
     InvocationOutcome,
 };
-use kepler_lib::{
+use tinycloud_lib::{
     authorization::{EncodingError, HeaderEncode},
     libipld::cid::Cid,
     resource::OrbitId,

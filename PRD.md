@@ -54,14 +54,14 @@ allow for long term sustainability.
 - A keypair should be all you need to get started with data storage. The user
   should be able to use this storage service with just a wallet and dApp
   without ever leaving the dApp, even if you haven’t used the service before.
-- Kepler should work fine with regular Web 2 applications too, such as taking the
+- TinyCloud Protocol should work fine with regular Web 2 applications too, such as taking the
   form of a storage module in Rails or SDK usable by a Go microservice.
 - The nodes must be permissioned with authentication and authorization for
   storage, and we should figure out how to prevent basic spam attacks such as
   generating a billion keypairs and uploading 5 MB each from a few IP
   addresses.
 - We need a way to remove PII and illegal content from the network to comply with laws.
-- It should be straightforward to run a federated Kepler node on standard cloud
+- It should be straightforward to run a federated TinyCloud Protocol node on standard cloud
   hosting.
 - We should be able to grant people additional storage due to certain status in
   the community, for example:
@@ -76,13 +76,13 @@ allow for long term sustainability.
 ## Long Term Considerations
 - Users should also be able to pay for storage with cryptocurrencies such as
   XTZ, eventually to be collected by the people who run nodes.
-- Kepler should be equipped with different "orbits" which are file overlays and
+- TinyCloud Protocol should be equipped with different "orbits" which are file overlays and
   software-enforced policies for a specific community. For example, there may
   be a dApp Orbit dedicated to hosting dApp assets, or a Public Records Orbit
   which hosts copies of S1 filings from the SEC’s website among other public
-  documents of note. A Kepler node can belong to one or many orbits, and as a
+  documents of note. A TinyCloud Protocol node can belong to one or many orbits, and as a
   result adopts the rules and economic reward structure of that orbit.
-- We should have tooling to deploy, monitor, and manage Kepler nodes and
+- We should have tooling to deploy, monitor, and manage TinyCloud Protocol nodes and
   orbits. Ideally, a cloud subaccount API key would be all that is required to
   stand one up, and orbits may be selected from the administration panel.
 - We should support partial orbits, in which only a fraction of the files from
@@ -102,12 +102,12 @@ allow for long term sustainability.
   officially recognized by the orbit.
 
 ## Integration Considerations
-- Kepler should support a gateway where an orbit can be designated as public
+- TinyCloud Protocol should support a gateway where an orbit can be designated as public
   and then exposed to anyone on the internet, like a Tor exit node. The gateway
   should eventually be able to load balance requests across nodes in the orbit.
 - A cryptocurrency wallet such as Kukai or Temple be able to authorize CRUD
   requests against orbits, such as by using the `Tezos Signed Message`
-  functionality of the wallets. This allows dApps to access Kepler storage.
+  functionality of the wallets. This allows dApps to access TinyCloud Protocol storage.
 - W3C Verifiable Credentials or Verifiable Presentations may be presented to
   the nodes to authenticate or authorize.
 - We should support a variety of storage and replication backends, including

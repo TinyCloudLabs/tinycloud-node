@@ -1,4 +1,4 @@
-![kepler header](/docs/keplerheader.png)
+![TinyCloud Protocol header](/docs/keplerheader.png)
 
 [![](https://img.shields.io/badge/License-Apache--2.0-green)](https://github.com/spruceid/kepler/blob/main/LICENSE) [![](https://img.shields.io/twitter/follow/spruceid?label=Follow&style=social)](https://twitter.com/spruceid)
 
@@ -23,8 +23,8 @@ touch tinycloud/caps.db
 
 You will then need to set the environment variables to point to those directories:
 ```bash
-export KEPLER_STORAGE_BLOCKS_PATH="tinycloud/blocks"
-export KEPLER_STORAGE_DATABASE="tinycloud/caps.db"
+export TINYCLOUD_STORAGE_BLOCKS_PATH="tinycloud/blocks"
+export TINYCLOUD_STORAGE_DATABASE="tinycloud/caps.db"
 ```
 
 Finally you can run TinyCloud Protocol using `cargo`:
@@ -36,25 +36,25 @@ cargo run
 
 ## Configuration
 
-TinyCloud Protocol instances are configured by the [kepler.toml](kepler.toml) configuration file, or via environment variables. You can either modify them in this file, or specify them through environment variable using the prefix `KEPLER_`.
+TinyCloud Protocol instances are configured by the [tinycloud.toml](kepler.toml) configuration file, or via environment variables. You can either modify them in this file, or specify them through environment variable using the prefix `TINYCLOUD_`.
 
 The following common options are available:
 
-| Option              | env var                    | description                                                                |
-|:--------------------|:---------------------------|:---------------------------------------------------------------------------|
-| log_level           | KEPLER_LOG_LEVEL           | Set the level of logging output, options are "normal", "debug"             |
-| address             | KEPLER_ADDRESS             | Set the listening address of the TinyCloud Protocol instance                           |
-| port                | KEPLER_PORT                | Set the listening TCP port for the TinyCloud Protocol instance                         |
-| storage.blocks.type | KEPLER_STORAGE_BLOCKS_TYPE | Set the mode of block storage, options are "Local" and "S3"                |
-| storage.limit        | KEPLER_STORAGE_LIMIT        | Set a maximum limit on storage available to Orbits hosted on this instance. Limits are written as strings, e.g. `10 MiB`, `100 GiB`                                                                           |
-| storage.database    | KEPLER_STORAGE_DATABASE    | Set the location of the SQL database                                       |
-| storage.staging     | KEPLER_STORAGE_STAGING     | Set the mode of content staging, options are "Memory" and "FileSystem"     |
-| keys.type           | KEPLER_KEYS_TYPE           | Set the type of host key store, options are "Static"                       |
-| orbits.allowlist    | KEPLER_ORBITS_ALLOWLIST    | Set the URL of an allowlist service for gating the creation of Orbit Peers |
+| Option              | env var                      | description                                                                |
+|:--------------------|:-----------------------------|:---------------------------------------------------------------------------|
+| log_level           | TINYCLOUD_LOG_LEVEL           | Set the level of logging output, options are "normal", "debug"             |
+| address             | TINYCLOUD_ADDRESS             | Set the listening address of the TinyCloud Protocol instance                           |
+| port                | TINYCLOUD_PORT                | Set the listening TCP port for the TinyCloud Protocol instance                         |
+| storage.blocks.type | TINYCLOUD_STORAGE_BLOCKS_TYPE | Set the mode of block storage, options are "Local" and "S3"                |
+| storage.limit        | TINYCLOUD_STORAGE_LIMIT        | Set a maximum limit on storage available to Orbits hosted on this instance. Limits are written as strings, e.g. `10 MiB`, `100 GiB`                                                                           |
+| storage.database    | TINYCLOUD_STORAGE_DATABASE    | Set the location of the SQL database                                       |
+| storage.staging     | TINYCLOUD_STORAGE_STAGING     | Set the mode of content staging, options are "Memory" and "FileSystem"     |
+| keys.type           | TINYCLOUD_KEYS_TYPE           | Set the type of host key store, options are "Static"                       |
+| orbits.allowlist    | TINYCLOUD_ORBITS_ALLOWLIST    | Set the URL of an allowlist service for gating the creation of Orbit Peers |
 
 ### Database Config
 
-The SQL database can be configured with `storage.database` or the `KEPLER_STORAGE_DATABASE` environment variable. It supports Sqlite, MySQL and PostgresSQL. For example:
+The SQL database can be configured with `storage.database` or the `TINYCLOUD_STORAGE_DATABASE` environment variable. It supports Sqlite, MySQL and PostgresSQL. For example:
 
 | Type     | Example                                       | Description                                                                         |
 |:---------|:----------------------------------------------|:------------------------------------------------------------------------------------|
@@ -80,19 +80,19 @@ Storage can be configured for Blocks depending on it's `type`.
 
 When `storage.blocks.type` is `Local`, the local filesystem will be used for application content storage. The following config option will become available:
 
-| Option               | env var                     | description                                                    |
-|:---------------------|:----------------------------|:---------------------------------------------------------------|
-| storage.blocks.path  | KEPLER_STORAGE_BLOCKS_PATH  | Set the path of the block storage                              |
+| Option               | env var                       | description                                                    |
+|:---------------------|:------------------------------|:---------------------------------------------------------------|
+| storage.blocks.path  | TINYCLOUD_STORAGE_BLOCKS_PATH  | Set the path of the block storage                              |
 
 #### AWS Storage
 
 When `storage.blocks.type` is `S3` the instance will use the S3 AWS service for application storage. The following config options will become available:
 
-| Option               | env var                     | description                                                    |
-|:---------------------|:----------------------------|:---------------------------------------------------------------|
-| storage.blocks.type  | KEPLER_STORAGE_BLOCKS_TYPE  | Set the mode of block storage, options are "Local" and "S3"    |
-| storage.blocks.bucket  | KEPLER_STORAGE_BLOCKS_BUCKET  | Set the name of the S3 bucket    |
-| storage.blocks.endpoint  | KEPLER_STORAGE_BLOCKS_ENDPOINT  | Set the URL of the S3 store    |
+| Option               | env var                       | description                                                    |
+|:---------------------|:------------------------------|:---------------------------------------------------------------|
+| storage.blocks.type  | TINYCLOUD_STORAGE_BLOCKS_TYPE  | Set the mode of block storage, options are "Local" and "S3"    |
+| storage.blocks.bucket  | TINYCLOUD_STORAGE_BLOCKS_BUCKET  | Set the name of the S3 bucket    |
+| storage.blocks.endpoint  | TINYCLOUD_STORAGE_BLOCKS_ENDPOINT  | Set the URL of the S3 store    |
 
 Additionally, the following environment variables must be present: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_DEFAULT_REGION`.
 
@@ -104,22 +104,22 @@ TinyCloud Protocol hosts require key pairs to provide replication. The `keys` co
 
 When `keys.type` is `Static` the instance will use an array of bytes as a static secret from which it will derive key pairs on a per-Orbit basis. The following config options will be available:
 
-| Option      | env var            | description                                                                  |
-|:------------|:-------------------|:-----------------------------------------------------------------------------|
-| keys.secret | KEPLER_KEYS_SECRET | Unpadded base64Url-encoded byte string from which key pairs will be derived. |
+| Option      | env var              | description                                                                  |
+|:------------|:---------------------|:-----------------------------------------------------------------------------|
+| keys.secret | TINYCLOUD_KEYS_SECRET | Unpadded base64Url-encoded byte string from which key pairs will be derived. |
 
-The secret MUST contain at least 32 bytes of entropy (either randomly generated or derived in a cryptographically secure way). It is STRONGLY RECOMMENDED that the secret be given via environment variables and NOT in the `kepler.toml` config file. Additionally it is STRONGLY RECOMMENDED that the secret be backed up in a secure place if used in production. Loss of the secret will result in total loss of function for the TinyCloud Protocol instance.
+The secret MUST contain at least 32 bytes of entropy (either randomly generated or derived in a cryptographically secure way). It is STRONGLY RECOMMENDED that the secret be given via environment variables and NOT in the `tinycloud.toml` config file. Additionally it is STRONGLY RECOMMENDED that the secret be backed up in a secure place if used in production. Loss of the secret will result in total loss of function for the TinyCloud Protocol instance.
 
 ## Running
 
 TinyCloud Protocol instances can be started via command line, e.g.:
 
 ``` sh
-KEPLER_PORT=8001 kepler
+TINYCLOUD_PORT=8001 tinycloud
 ```
 
 If the TinyCloud Protocol instance is not able to find or establish a connection to the configured storage, the instance will terminate.
 
 ## Usage
 
-TinyCloud Protocol is most easily used via the [TinyCloud Protocol SDK](https://github.com/spruceid/kepler-sdk). See the example DApps and tutorials for detailed information.
+TinyCloud Protocol is most easily used via the [TinyCloud Protocol SDK](https://github.com/tinycloud/tinycloud-sdk). See the example DApps and tutorials for detailed information.

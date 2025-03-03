@@ -9,9 +9,9 @@ use crate::{
     authorization::AuthHeaderGetter,
     config::Config,
     tracing::TracingSpan,
-    BlockStage, BlockStores, Kepler,
+    BlockStage, BlockStores, TinyCloud,
 };
-use kepler_core::{
+use tinycloud_core::{
     sea_orm::DbErr,
     storage::{ImmutableReadStore, ImmutableStaging},
     types::Resource,
@@ -30,7 +30,7 @@ pub mod util_routes {
     pub async fn cors(_s: std::path::PathBuf) {}
 
     #[get("/healthz")]
-    pub async fn healthcheck(s: &State<Kepler>) -> Status {
+    pub async fn healthcheck(s: &State<TinyCloud>) -> Status {
         if s.check_db_connection().await.is_ok() {
             Status::Ok
         } else {
@@ -41,7 +41,7 @@ pub mod util_routes {
 
 #[get("/peer/generate/<orbit>")]
 pub async fn open_host_key(
-    s: &State<Kepler>,
+    s: &State<TinyCloud>,
     orbit: &str,
 ) -> Result<String, (Status, &'static str)> {
     s.stage_key(
@@ -62,7 +62,7 @@ pub async fn open_host_key(
 pub async fn delegate(
     d: AuthHeaderGetter<DelegationInfo>,
     req_span: TracingSpan,
-    kepler: &State<Kepler>,
+    tinycloud: &State<TinyCloud>,
 ) -> Result<String, (Status, String)> {
     let action_label = "delegation";
     let span = info_span!(parent: &req_span.0, "delegate", action = %action_label);
@@ -71,7 +71,7 @@ pub async fn delegate(
         let timer = crate::prometheus::AUTHORIZED_INVOKE_HISTOGRAM
             .with_label_values(&["delegate"])
             .start_timer();
-        let res = kepler
+        let res = tinycloud
             .delegate(d.0)
             .await
             .map_err(|e| {
@@ -105,7 +105,7 @@ pub async fn invoke(
     headers: ObjectHeaders,
     data: DataIn<'_>,
     staging: &State<BlockStage>,
-    kepler: &State<Kepler>,
+    tinycloud: &State<TinyCloud>,
     config: &State<Config>,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
     let action_label = "invocation";
@@ -137,7 +137,7 @@ pub async fn invoke(
                 let open_data = d.open(1u8.gigabytes()).compat();
 
                 if let Some(limit) = config.storage.limit {
-                    let current_size = kepler
+                    let current_size = tinycloud
                         .store_size(orbit)
                         .await
                         .map_err(|e| (Status::InternalServerError, e.to_string()))?
@@ -178,7 +178,7 @@ pub async fn invoke(
                 return Err((Status::BadRequest, "Invalid inputs".to_string()));
             }
         };
-        let res = kepler
+        let res = tinycloud
             .invoke::<BlockStage>(i.0, inputs)
             .await
             .map(

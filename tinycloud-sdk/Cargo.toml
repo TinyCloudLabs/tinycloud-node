@@ -1,5 +1,5 @@
 [package]
-name = "kepler-sdk"
+name = "tinycloud-sdk"
 version = "0.2.0"
 edition = "2021"
 
@@ -9,7 +9,7 @@ time = "0.3"
 hex = "0.4"
 http = "0.2"
 iri-string = "0.6"
-kepler-lib = { path = "../lib" }
+tinycloud-lib = { path = "../tinycloud-lib" }
 serde = { version = "1.0", features = ["derive"] }
 serde_with = { version = "1" }
 serde_json = "1.0"

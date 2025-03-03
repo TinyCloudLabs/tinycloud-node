@@ -2,7 +2,7 @@ use hyper::{
     service::{make_service_fn, service_fn},
     Server,
 };
-use kepler::{app, config, prometheus};
+use tinycloud::{app, config, prometheus};
 use rocket::{
     figment::providers::{Env, Format, Serialized, Toml},
     tokio,
@@ -12,14 +12,14 @@ use rocket::{
 async fn main() {
     let config = rocket::figment::Figment::from(rocket::Config::default())
         .merge(Serialized::defaults(config::Config::default()))
-        .merge(Toml::file("kepler.toml").nested())
-        .merge(Env::prefixed("KEPLER_").split("_").global())
+        .merge(Toml::file("tinycloud.toml").nested())
+        .merge(Env::prefixed("TINYCLOUD_").split("_").global())
         .merge(Env::prefixed("ROCKET_").global()); // That's just for easy access to ROCKET_LOG_LEVEL
-    let kepler_config = config.extract::<config::Config>().unwrap();
+    let tinycloud_config = config.extract::<config::Config>().unwrap();
 
     let rocket = app(&config).await.unwrap().ignite().await.unwrap();
 
-    let prom_addr = (rocket.config().address, kepler_config.prometheus.port).into();
+    let prom_addr = (rocket.config().address, tinycloud_config.prometheus.port).into();
     let prometheus = Server::bind(&prom_addr).serve(make_service_fn(|_| async {
         Ok::<_, hyper::Error>(service_fn(prometheus::serve_req))
     }));

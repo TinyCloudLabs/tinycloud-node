@@ -83,7 +83,7 @@ revoking capabilities, including:
 Host Managers may determine within the Orbit Manifest:
 - A list of public key-derived identifiers mapped to one or more addresses,
   such as IPv4, IPv6, and `.onion`, which are then used by clients to resolve
-  `kepler://` URIs.
+  `tinycloud://` URIs.
 
 Writers may determine within the Orbit Manifest:
 - The value of the Orbit Manifest field containing the latest Merkle root of the
@@ -142,7 +142,7 @@ authenticator. A Host may consist of one or many machines, IP addresses, or
 other form of distribution. The keypair is used to demarcate a logical
 separation useful to the Orbit, such as ownership, SLA, or region.
 
-Ultimately, Kepler will support a variety of storage systems, namely IPFS, but
+Ultimately, TinyCloud Protocol will support a variety of storage systems, namely IPFS, but
 also AWS S3, GCP Cloud Storage, Azure Blob Storage, Network File Systems, and
 even user-friendly REST API-supporting services such as Dropbox or Box.com.
 Different use cases have different backend requirements.

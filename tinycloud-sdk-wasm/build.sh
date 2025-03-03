@@ -2,7 +2,7 @@
 DEVMODE=$([[ "$1" == "--dev" ]] && echo "--dev")
 set -e
 
-PKG_NAME="kepler_sdk_wasm"
+PKG_NAME="tinycloud_sdk_wasm"
 PKG_DIR="wasm"
 
 
@@ -46,4 +46,4 @@ done
 
 rm ./$PKG_DIR/**/.gitignore
 
-sed -i 's/kepler-sdk-wasm/@spruceid\/kepler-sdk-wasm/g' $PKG_DIR/package.json
+sed -i 's/tinycloud-sdk-wasm/@tinycloud\/tinycloud-sdk-wasm/g' $PKG_DIR/package.json

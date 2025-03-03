@@ -3087,42 +3087,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kepler"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "aws-config",
- "aws-sdk-dynamodb",
- "aws-sdk-s3",
- "aws-smithy-http",
- "aws-types",
- "base64 0.13.1",
- "futures",
- "hyper",
- "kepler-core",
- "kepler-lib",
- "lazy_static",
- "opentelemetry",
- "opentelemetry-jaeger",
- "pin-project",
- "prometheus",
- "reqwest",
- "rocket",
- "serde",
- "serde_json",
- "serde_with 1.14.0",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tracing",
- "tracing-log",
- "tracing-opentelemetry",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "kepler-core"
 version = "0.1.0"
 dependencies = [
@@ -6500,6 +6464,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2c9d3793400a45f954c52e73d068316d76b6f4e36977e3fcebb13a2721e80237"
 dependencies = [
  "crunchy",
+]
+
+[[package]]
+name = "tinycloud"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "aws-config",
+ "aws-sdk-dynamodb",
+ "aws-sdk-s3",
+ "aws-smithy-http",
+ "aws-types",
+ "base64 0.13.1",
+ "futures",
+ "hyper",
+ "kepler-core",
+ "kepler-lib",
+ "lazy_static",
+ "opentelemetry",
+ "opentelemetry-jaeger",
+ "pin-project",
+ "prometheus",
+ "reqwest",
+ "rocket",
+ "serde",
+ "serde_json",
+ "serde_with 1.14.0",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "tracing-log",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
 ]
 
 [[package]]
