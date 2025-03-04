@@ -29,4 +29,4 @@ EXPOSE 8000
 EXPOSE 8001
 EXPOSE 8081
 CMD ["tinycloud"]
-LABEL org.opencontainers.image.source https://github.com/tinycloud/tinycloud
+LABEL org.opencontainers.image.source https://github.com/TinyCloudLabs/tinycloud-node

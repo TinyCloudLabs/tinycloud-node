@@ -1,6 +1,6 @@
 ![TinyCloud Protocol header](/docs/keplerheader.png)
 
-[![](https://img.shields.io/badge/License-Apache--2.0-green)](https://github.com/tinycloud/tinycloud/blob/main/LICENSE)
+[![](https://img.shields.io/badge/License-Apache--2.0-green)](https://github.com/TinyCloudLabs/tinycloud-node/blob/main/LICENSE)
 
 # TinyCloud Protocol
 
