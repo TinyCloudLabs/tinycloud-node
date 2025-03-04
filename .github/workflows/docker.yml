@@ -14,7 +14,7 @@ jobs:
     - name: Build and push image
       uses: elgohr/Publish-Docker-Github-Action@v4
       with:
-        name: spruceid/kepler
+        name: tinycloudlabs/tinycloud-node
         username: ${{ github.actor }}
         password: ${{ secrets.GH_PACKAGE_PUSH_TOKEN }}
         registry: ghcr.io
