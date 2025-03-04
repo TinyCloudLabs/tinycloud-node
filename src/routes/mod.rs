@@ -121,7 +121,7 @@ pub async fn invoke(
                 .capabilities
                 .iter()
                 .filter_map(|c| match (&c.resource, c.action.as_str()) {
-                    (Resource::Kepler(r), "put") if r.service() == Some("kv") => {
+                    (Resource::TinyCloud(r), "put") if r.service() == Some("kv") => {
                         r.path().map(|p| (r.orbit(), p))
                     }
                     _ => None,

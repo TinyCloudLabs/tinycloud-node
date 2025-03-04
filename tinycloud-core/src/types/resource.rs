@@ -6,29 +6,29 @@ use std::{fmt::Display, str::FromStr};
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(untagged)]
 pub enum Resource {
-    Kepler(ResourceId),
+    TinyCloud(ResourceId),
     Other(String),
 }
 
 impl Resource {
     pub fn orbit(&self) -> Option<&OrbitId> {
         match self {
-            Resource::Kepler(id) => Some(id.orbit()),
+            Resource::TinyCloud(id) => Some(id.orbit()),
             Resource::Other(_) => None,
         }
     }
 
     pub fn extends(&self, other: &Self) -> bool {
         match (self, other) {
-            (Resource::Kepler(a), Resource::Kepler(b)) => a.extends(b).is_ok(),
+            (Resource::TinyCloud(a), Resource::TinyCloud(b)) => a.extends(b).is_ok(),
             (Resource::Other(a), Resource::Other(b)) => a.starts_with(b),
             _ => false,
         }
     }
 
-    pub fn kepler_resource(&self) -> Option<&ResourceId> {
+    pub fn tinycloud_resource(&self) -> Option<&ResourceId> {
         match self {
-            Resource::Kepler(id) => Some(id),
+            Resource::TinyCloud(id) => Some(id),
             Resource::Other(_) => None,
         }
     }
@@ -36,14 +36,14 @@ impl Resource {
 
 impl From<ResourceId> for Resource {
     fn from(id: ResourceId) -> Self {
-        Resource::Kepler(id)
+        Resource::TinyCloud(id)
     }
 }
 
 impl From<Resource> for Value {
     fn from(r: Resource) -> Self {
         Value::String(Some(Box::new(match r {
-            Resource::Kepler(k) => k.to_string(),
+            Resource::TinyCloud(k) => k.to_string(),
             Resource::Other(o) => o,
         })))
     }
@@ -83,7 +83,7 @@ impl sea_orm::sea_query::ValueType for Resource {
 impl From<String> for Resource {
     fn from(s: String) -> Self {
         if let Ok(resource_id) = ResourceId::from_str(&s) {
-            Resource::Kepler(resource_id)
+            Resource::TinyCloud(resource_id)
         } else {
             Resource::Other(s)
         }
@@ -93,7 +93,7 @@ impl From<String> for Resource {
 impl Display for Resource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Resource::Kepler(resource_id) => write!(f, "{}", resource_id),
+            Resource::TinyCloud(resource_id) => write!(f, "{}", resource_id),
             Resource::Other(s) => write!(f, "{}", s),
         }
     }

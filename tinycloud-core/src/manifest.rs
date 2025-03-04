@@ -149,14 +149,14 @@ pub async fn resolve<D: DIDResolver>(
 pub enum ServicePeersConversionError {
     #[error(transparent)]
     IdParse(<PeerId as FromStr>::Err),
-    #[error("Missing KeplerOrbitPeer type string")]
+    #[error("Missing TinyCloudOrbitPeer type string")]
     WrongType,
 }
 
 impl TryFrom<&Service> for BootstrapPeers {
     type Error = ServicePeersConversionError;
     fn try_from(s: &Service) -> Result<Self, Self::Error> {
-        if s.type_.any(|t| t == "KeplerOrbitPeers") {
+        if s.type_.any(|t| t == "TinyCloudOrbitPeers") {
             Ok(Self {
                 id: s
                     .id

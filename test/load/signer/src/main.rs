@@ -4,8 +4,8 @@ use ethers::{
     prelude::rand::{prelude::StdRng, SeedableRng},
     signers::{LocalWallet, Signer},
 };
-use kepler_lib::{cacaos::siwe::TimeStamp, resource::OrbitId, ssi::jwk::JWK};
-use kepler_sdk::{
+use tinycloud_lib::{cacaos::siwe::TimeStamp, resource::OrbitId, ssi::jwk::JWK};
+use tinycloud_sdk::{
     authorization::{DelegationHeaders, InvocationHeaders},
     session::{complete_session_setup, prepare_session, Session, SessionConfig, SignedSession},
     siwe_utils::{

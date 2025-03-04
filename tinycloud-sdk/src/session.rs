@@ -1,7 +1,7 @@
 use crate::authorization::DelegationHeaders;
 use http::uri::Authority;
-use kepler_lib::{
-    authorization::{make_invocation, InvocationError, KeplerInvocation},
+use tinycloud_lib::{
+    authorization::{make_invocation, InvocationError, TinyCloudInvocation},
     cacaos::{
         siwe::{generate_nonce, Message, TimeStamp, Version as SIWEVersion},
         siwe_cacao::SIWESignature,
@@ -78,9 +78,9 @@ pub struct Session {
 impl SessionConfig {
     fn into_message(self, delegate: &str) -> Result<Message, String> {
         use serde_json::Value;
-        let ns = "kepler"
+        let ns = "tinycloud"
             .parse()
-            .map_err(|e| format!("error parsing kepler as Siwe Capability namespace: {e}"))?;
+            .map_err(|e| format!("error parsing tinycloud as Siwe Capability namespace: {e}"))?;
         let b = self
             .actions
             .into_iter()
@@ -132,7 +132,7 @@ impl Session {
     pub async fn invoke(
         self,
         actions: Vec<(String, String, String)>,
-    ) -> Result<KeplerInvocation, InvocationError> {
+    ) -> Result<TinyCloudInvocation, InvocationError> {
         let targets = actions
             .into_iter()
             .map(|(s, p, a)| self.orbit_id.clone().to_resource(Some(s), Some(p), Some(a)));
@@ -160,7 +160,7 @@ pub async fn prepare_session(config: SessionConfig) -> Result<PreparedSession, E
         Some(k) => k.clone(),
         None => JWK::generate_ed25519()?,
     };
-    jwk.algorithm = Some(kepler_lib::ssi::jwk::Algorithm::EdDSA);
+    jwk.algorithm = Some(tinycloud_lib::ssi::jwk::Algorithm::EdDSA);
 
     let did = DID_METHODS
         .generate(&Source::KeyAndPattern(&jwk, "key"))
@@ -185,8 +185,8 @@ pub async fn prepare_session(config: SessionConfig) -> Result<PreparedSession, E
 }
 
 pub fn complete_session_setup(signed_session: SignedSession) -> Result<Session, Error> {
-    use kepler_lib::{
-        authorization::KeplerDelegation,
+    use tinycloud_lib::{
+        authorization::TinyCloudDelegation,
         cacaos::siwe_cacao::SiweCacao,
         libipld::{cbor::DagCborCodec, multihash::Code, store::DefaultParams, Block},
     };
@@ -199,7 +199,7 @@ pub fn complete_session_setup(signed_session: SignedSession) -> Result<Session, 
         *Block::<DefaultParams>::encode(DagCborCodec, Code::Blake3_256, &delegation)
             .map_err(Error::UnableToGenerateCid)?
             .cid();
-    let delegation_header = DelegationHeaders::new(KeplerDelegation::Cacao(Box::new(delegation)));
+    let delegation_header = DelegationHeaders::new(TinyCloudDelegation::Cacao(Box::new(delegation)));
 
     Ok(Session {
         delegation_header,
@@ -213,13 +213,13 @@ pub fn complete_session_setup(signed_session: SignedSession) -> Result<Session, 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("unable to generate session key: {0}")]
-    UnableToGenerateKey(#[from] kepler_lib::ssi::jwk::Error),
+    UnableToGenerateKey(#[from] tinycloud_lib::ssi::jwk::Error),
     #[error("unable to generate the DID of the session key")]
     UnableToGenerateDID,
     #[error("unable to generate the SIWE message to start the session: {0}")]
     UnableToGenerateSIWEMessage(String),
     #[error("unable to generate the CID: {0}")]
-    UnableToGenerateCid(kepler_lib::libipld::error::Error),
+    UnableToGenerateCid(tinycloud_lib::libipld::error::Error),
     #[error("failed to translate response to JSON: {0}")]
     JSONSerializing(serde_json::Error),
     #[error("failed to parse input from JSON: {0}")]
@@ -238,7 +238,7 @@ pub mod test {
             "chainId": 1u8,
             "domain": "example.com",
             "issuedAt": "2022-01-01T00:00:00.000Z",
-            "orbitId": "kepler:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9://default",
+            "orbitId": "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9://default",
             "expirationTime": "3000-01-01T00:00:00.000Z",
         });
         let prepared = prepare_session(serde_json::from_value(config).unwrap())

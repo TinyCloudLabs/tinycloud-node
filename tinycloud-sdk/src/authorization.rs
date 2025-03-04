@@ -1,4 +1,4 @@
-use kepler_lib::authorization::{KeplerDelegation, KeplerInvocation};
+use tinycloud_lib::authorization::{TinyCloudDelegation, TinyCloudInvocation};
 use serde::{Deserialize, Serialize};
 
 use crate::session::Session;
@@ -6,13 +6,13 @@ use crate::session::Session;
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DelegationHeaders {
     #[serde(with = "header_enc", rename = "Authorization")]
-    delegation: KeplerDelegation,
+    delegation: TinyCloudDelegation,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct InvocationHeaders {
     #[serde(with = "header_enc", rename = "Authorization")]
-    invocation: KeplerInvocation,
+    invocation: TinyCloudInvocation,
 }
 
 impl InvocationHeaders {
@@ -30,7 +30,7 @@ impl InvocationHeaders {
 }
 
 impl DelegationHeaders {
-    pub fn new(delegation: KeplerDelegation) -> Self {
+    pub fn new(delegation: TinyCloudDelegation) -> Self {
         Self { delegation }
     }
 }
@@ -38,7 +38,7 @@ impl DelegationHeaders {
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("failed to generate proof for invocation: {0}")]
-    FailedToMakeInvocation(kepler_lib::authorization::InvocationError),
+    FailedToMakeInvocation(tinycloud_lib::authorization::InvocationError),
     #[error("failed to translate response to JSON: {0}")]
     JSONSerializing(serde_json::Error),
     #[error("failed to parse session from JSON: {0}")]
@@ -46,7 +46,7 @@ pub enum Error {
 }
 
 mod header_enc {
-    use kepler_lib::authorization::HeaderEncode;
+    use tinycloud_lib::authorization::HeaderEncode;
     use serde::{
         de::Error as DeError, ser::Error as SerError, Deserialize, Deserializer, Serialize,
         Serializer,

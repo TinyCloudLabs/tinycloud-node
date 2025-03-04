@@ -155,8 +155,8 @@ impl TryInto<Capability> for ResourceId {
             ))),
             can: UcanScope {
                 namespace: match self.service {
-                    Some(s) => format!("kepler.{s}"),
-                    None => "kepler".to_string(),
+                    Some(s) => format!("tinycloud.{s}"),
+                    None => "tinycloud".to_string(),
                 },
                 capability: self.fragment.ok_or(ResourceCapErr::MissingAction)?,
             },
@@ -170,9 +170,9 @@ impl<T> TryFrom<&Capability<T>> for ResourceId {
     fn try_from(c: &Capability<T>) -> Result<Self, Self::Error> {
         let n = &c.can.namespace;
         let mut r = Self::from_str(&c.with.to_string())?;
-        if n.starts_with("kepler")
-            && ((n.get(6..7) == Some(".") && n.get(7..) == r.service.as_deref())
-                || (n.get(6..7).is_none() && r.service.is_none()))
+        if n.starts_with("tinycloud")
+            && ((n.get(9..10) == Some(".") && n.get(10..) == r.service.as_deref())
+                || (n.get(9..10).is_none() && r.service.is_none()))
         {
             r.fragment = Some(c.can.capability.clone());
             Ok(r)
@@ -196,7 +196,7 @@ pub enum ResourceCheckError {
 
 impl fmt::Display for OrbitId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "kepler:{}://{}", &self.suffix, &self.id)
+        write!(f, "tinycloud:{}://{}", &self.suffix, &self.id)
     }
 }
 
@@ -228,7 +228,7 @@ impl FromStr for OrbitId {
     type Err = KRIParseError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s
-            .strip_prefix("kepler:")
+            .strip_prefix("tinycloud:")
             .ok_or(KRIParseError::IncorrectForm)?;
         let p = match s.find("://") {
             Some(p) if p > 0 => p,
@@ -258,7 +258,7 @@ impl FromStr for ResourceId {
     type Err = KRIParseError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s
-            .strip_prefix("kepler:")
+            .strip_prefix("tinycloud:")
             .ok_or(KRIParseError::IncorrectForm)?;
         let p = match s.find("://") {
             Some(p) if p > 0 => p,
@@ -313,7 +313,7 @@ mod tests {
 
     #[test]
     fn basic() {
-        let res: ResourceId = "kepler:ens:example.eth://orbit0/kv/path/to/image.jpg"
+        let res: ResourceId = "tinycloud:ens:example.eth://orbit0/kv/path/to/image.jpg"
             .parse()
             .unwrap();
 
@@ -324,7 +324,7 @@ mod tests {
         assert_eq!("/path/to/image.jpg", res.path().unwrap());
         assert_eq!(None, res.fragment().as_ref());
 
-        let res2: ResourceId = "kepler:ens:example.eth://orbit0#peer".parse().unwrap();
+        let res2: ResourceId = "tinycloud:ens:example.eth://orbit0#peer".parse().unwrap();
 
         assert_eq!("ens:example.eth", res2.orbit().suffix());
         assert_eq!("did:ens:example.eth", res2.orbit().did());
@@ -333,13 +333,13 @@ mod tests {
         assert_eq!(None, res2.path());
         assert_eq!("peer", res2.fragment().unwrap());
 
-        let res3: ResourceId = "kepler:ens:example.eth://orbit0/kv#list".parse().unwrap();
+        let res3: ResourceId = "tinycloud:ens:example.eth://orbit0/kv#list".parse().unwrap();
 
         assert_eq!("kv", res3.service().unwrap());
         assert_eq!("/", res3.path().unwrap());
         assert_eq!("list", res3.fragment().unwrap());
 
-        let res4: ResourceId = "kepler:ens:example.eth://orbit0/kv/#list".parse().unwrap();
+        let res4: ResourceId = "tinycloud:ens:example.eth://orbit0/kv/#list".parse().unwrap();
 
         assert_eq!("kv", res4.service().unwrap());
         assert_eq!("/", res4.path().unwrap());
@@ -348,17 +348,17 @@ mod tests {
 
     #[test]
     fn failures() {
-        let no_suffix: Result<ResourceId, _> = "kepler:://orbit0/kv/path/to/image.jpg".parse();
+        let no_suffix: Result<ResourceId, _> = "tinycloud:://orbit0/kv/path/to/image.jpg".parse();
         assert!(no_suffix.is_err());
 
         let invalid_name: Result<ResourceId, _> =
-            "kepler:ens:example.eth://or:bit0/kv/path/to/image.jpg".parse();
+            "tinycloud:ens:example.eth://or:bit0/kv/path/to/image.jpg".parse();
         assert!(invalid_name.is_err());
     }
 
     #[test]
     fn roundtrip() {
-        let resource_uri: String = "kepler:ens:example.eth://orbit0/kv/prefix#list".into();
+        let resource_uri: String = "tinycloud:ens:example.eth://orbit0/kv/prefix#list".into();
         let res4: ResourceId = resource_uri.parse().unwrap();
         assert_eq!(resource_uri, res4.to_string());
     }

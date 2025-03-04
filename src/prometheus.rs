@@ -4,13 +4,13 @@ use prometheus::{register_histogram_vec, Encoder, HistogramVec, TextEncoder};
 
 lazy_static! {
     pub static ref AUTHORIZED_INVOKE_HISTOGRAM: HistogramVec = register_histogram_vec!(
-        "kepler_authorized_invoke_duration_seconds",
+        "tinycloud_authorized_invoke_duration_seconds",
         "The authorized invocations latencies in seconds.",
         &["action"]
     )
     .unwrap();
     pub static ref AUTHORIZATION_HISTOGRAM: HistogramVec = register_histogram_vec!(
-        "kepler_authorization_duration_seconds",
+        "tinycloud_authorization_duration_seconds",
         "The authorization latencies in seconds.",
         &["request"]
     )

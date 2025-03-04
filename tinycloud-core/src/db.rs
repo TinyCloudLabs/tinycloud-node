@@ -215,7 +215,7 @@ where
         for cap in invocation.0.capabilities.iter() {
             match cap
                 .resource
-                .kepler_resource()
+                .tinycloud_resource()
                 .and_then(|r| Some((r.service()?, cap.action.as_str(), r.orbit(), r.path()?)))
             {
                 // stage inputs for content writes
@@ -268,7 +268,7 @@ where
         for cap in caps {
             match (
                 cap.resource
-                    .kepler_resource()
+                    .tinycloud_resource()
                     .and_then(|r| Some((r.orbit(), r.service()?, normalize_path(r.path()?)))),
                 cap.action.as_str(),
             ) {
@@ -423,7 +423,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         .filter_map(|(_, e)| match e {
             Event::Delegation(d) => Some(d.0.capabilities.iter().filter_map(|c| {
                 match (&c.resource, c.action.as_str()) {
-                    (Resource::Kepler(r), "host")
+                    (Resource::TinyCloud(r), "host")
                         if r.path().is_none()
                             && r.service().is_none()
                             && r.fragment().is_none() =>

@@ -1,6 +1,6 @@
 ![TinyCloud Protocol header](/docs/keplerheader.png)
 
-[![](https://img.shields.io/badge/License-Apache--2.0-green)](https://github.com/spruceid/kepler/blob/main/LICENSE) [![](https://img.shields.io/twitter/follow/spruceid?label=Follow&style=social)](https://twitter.com/spruceid)
+[![](https://img.shields.io/badge/License-Apache--2.0-green)](https://github.com/tinycloud/tinycloud/blob/main/LICENSE)
 
 # TinyCloud Protocol
 
@@ -38,7 +38,7 @@ cargo run
 
 ## Configuration
 
-TinyCloud Protocol instances are configured by the [tinycloud.toml](kepler.toml) configuration file, or via environment variables. You can either modify them in this file, or specify them through environment variable using the prefix `TINYCLOUD_`.
+TinyCloud Protocol instances are configured by the [tinycloud.toml](tinycloud.toml) configuration file, or via environment variables. You can either modify them in this file, or specify them through environment variable using the prefix `TINYCLOUD_`.
 
 The following common options are available:
 
@@ -124,4 +124,4 @@ If the TinyCloud Protocol instance is not able to find or establish a connection
 
 ## Usage
 
-TinyCloud Protocol is most easily used via the [TinyCloud Protocol SDK](https://github.com/tinycloud/tinycloud-sdk). See the example DApps and tutorials for detailed information.
+TinyCloud Protocol is most easily used via the TinyCloud Protocol SDK. See the example DApps and tutorials for detailed information.

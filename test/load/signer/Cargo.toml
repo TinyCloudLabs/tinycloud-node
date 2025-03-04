@@ -9,8 +9,8 @@ edition = "2021"
 axum = "0.5.6"
 ethers = "1.0.2"
 iri-string = { version = "0.6", features = ["serde"] }
-kepler-lib = { path = "../../../lib" }
-kepler-sdk = { path = "../../../sdk" }
+tinycloud-lib = { path = "../../../tinycloud-lib" }
+tinycloud-sdk = { path = "../../../tinycloud-sdk" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.81"
 tokio = { version = "1.14.0", features = ["full"] }

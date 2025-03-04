@@ -20,7 +20,7 @@ pub struct Capability {
 #[non_exhaustive]
 #[derive(thiserror::Error, Debug)]
 pub enum CapExtractError {
-    #[error("Default actions are not allowed for Kepler capabilities")]
+    #[error("Default actions are not allowed for TinyCloud capabilities")]
     DefaultActions,
     #[error("Invalid Extra Fields")]
     InvalidFields,
@@ -140,7 +140,7 @@ impl TryFrom<TinyCloudDelegation> for DelegationInfo {
                     return Err(DelegationError::InvalidStatement);
                 };
                 let (capabilities, parents) = extract_capabilities(&m)?
-                    .remove(&"kepler".parse()?)
+                    .remove(&"tinycloud".parse()?)
                     .map(extract_siwe_cap)
                     .transpose()?
                     .unwrap_or_default();

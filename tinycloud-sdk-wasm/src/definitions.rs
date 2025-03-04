@@ -3,7 +3,7 @@ use wasm_bindgen::prelude::*;
 #[wasm_bindgen(typescript_custom_section)]
 const TS_DEF: &'static str = r#"
 /**
- * Configuration object for starting a Kepler session.
+ * Configuration object for starting a TinyCloud session.
  */
 export type SessionConfig = {
   /** Actions that the session key will be permitted to perform, organized by service and path */
@@ -32,7 +32,7 @@ export type SessionConfig = {
 #[wasm_bindgen(typescript_custom_section)]
 const TS_DEF: &'static str = r#"
 /**
- * A Kepler session.
+ * A TinyCloud session.
  */
 export type Session = {
   /** The delegation from the user to the session key. */
@@ -51,7 +51,7 @@ export type Session = {
 #[wasm_bindgen(typescript_custom_section)]
 const TS_DEF: &'static str = r#"
 /**
- * Configuration object for generating a Orbit Host Delegation SIWE message.
+ * Configuration object for generating a TinyCloud Orbit Host Delegation SIWE message.
  */
 export type HostConfig = {
   /** Ethereum address. */

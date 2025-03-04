@@ -16,7 +16,7 @@ jobs:
         pkg: ["lib", ".", "sdk", "sdk-wasm"]
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout Kepler repository
+    - name: Checkout TinyCloud repository
       uses: actions/checkout@v2
     - name: Add WASM target
       if: ${{ matrix.pkg == 'sdk-wasm' }}
@@ -39,7 +39,7 @@ jobs:
         pkg: ["lib", ".", "sdk", "sdk-wasm"]
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout Kepler repository
+    - name: Checkout TinyCloud repository
       uses: actions/checkout@v2
     - name: Add WASM target
       if: ${{ matrix.pkg == 'sdk-wasm' }}
@@ -57,7 +57,7 @@ jobs:
         pkg: ["lib", ".", "sdk", "sdk-wasm"]
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout Kepler repository
+    - name: Checkout TinyCloud repository
       uses: actions/checkout@v2
     - name: Add WASM target
       if: ${{ matrix.pkg == 'sdk-wasm' }}

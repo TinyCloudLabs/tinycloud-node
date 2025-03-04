@@ -1,11 +1,11 @@
 use http::uri::Authority;
-use kepler_lib::authorization::KeplerDelegation;
-use kepler_lib::cacaos::{
+use tinycloud_lib::authorization::TinyCloudDelegation;
+use tinycloud_lib::cacaos::{
     siwe::{generate_nonce, Message, TimeStamp, Version},
     siwe_cacao::{SIWESignature, SiweCacao},
 };
-use kepler_lib::resource::OrbitId;
-use kepler_lib::siwe_recap::Builder;
+use tinycloud_lib::resource::OrbitId;
+use tinycloud_lib::siwe_recap::Builder;
 use serde::Deserialize;
 use serde_with::{serde_as, DisplayFromStr};
 
@@ -41,9 +41,9 @@ impl TryFrom<HostConfig> for Message {
     fn try_from(c: HostConfig) -> Result<Self, String> {
         Builder::new()
             .with_action(
-                &"kepler"
+                &"tinycloud"
                     .parse()
-                    .map_err(|e| format!("failed to parse kepler as namespace: {e}"))?,
+                    .map_err(|e| format!("failed to parse tinycloud as namespace: {e}"))?,
                 c.orbit_id.to_resource(None, None, None).to_string(),
                 "host".to_string(),
             )
@@ -73,7 +73,7 @@ pub fn generate_host_siwe_message(config: HostConfig) -> Result<Message, Error> 
 }
 
 pub fn siwe_to_delegation_headers(signed_message: SignedMessage) -> DelegationHeaders {
-    DelegationHeaders::new(KeplerDelegation::Cacao(Box::new(SiweCacao::new(
+    DelegationHeaders::new(TinyCloudDelegation::Cacao(Box::new(SiweCacao::new(
         signed_message.siwe.into(),
         signed_message.signature,
         None,
