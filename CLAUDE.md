@@ -21,21 +21,27 @@
 
 ## Project Structure
 - Core functionality in tinycloud-core/
+  - Database models and storage in tinycloud-core/src/models/ and tinycloud-core/src/storage/
+  - Event handling in tinycloud-core/src/events/
+  - Type definitions in tinycloud-core/src/types/
 - HTTP server in src/
-- SDKs in tinycloud-sdk/ and tinycloud-sdk-wasm/
+  - API routes in src/routes/
+  - Authentication guards in src/auth_guards.rs
+  - Storage implementations in src/storage/
+- SDK Libraries
+  - Core SDK in tinycloud-sdk/
+  - WebAssembly bindings in tinycloud-sdk-wasm/
+- Shared Libraries
+  - Common types and utilities in tinycloud-lib/
 
-## Migration Notes
-This project was forked from the archived Kepler protocol. The following changes were made:
-1. Renamed all references from "Kepler" to "TinyCloud Protocol"
-2. Renamed the crate `kepler` to `tinycloud`
-3. Renamed the crate `kepler-core` to `tinycloud-core`
-4. Renamed the crate `kepler-lib` to `tinycloud-lib`
-5. Renamed the crate `kepler-sdk` to `tinycloud-sdk`
-6. Renamed the crate `kepler-sdk-wasm` to `tinycloud-sdk-wasm`
-7. Renamed all imports from `kepler_*` to `tinycloud_*`
-8. Renamed types and modules:
-   - `KeplerDelegation` → `TinyCloudDelegation`
-   - `KeplerInvocation` → `TinyCloudInvocation`
-   - `KeplerRevocation` → `TinyCloudRevocation`
-9. Changed environment variables from `KEPLER_*` to `TINYCLOUD_*`
-10. Renamed configuration file from `kepler.toml` to `tinycloud.toml`
+## Configuration
+- Main configuration file: `tinycloud.toml`
+- Environment variables use the `TINYCLOUD_` prefix
+- Local development database defaults to SQLite
+- See README.md for complete configuration options
+
+## Testing
+- Unit tests within module files
+- Integration tests in the test/ directory
+- Load testing scripts in test/load/k6/
+- Sample signing utilities in test/load/signer/
