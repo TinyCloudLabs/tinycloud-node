@@ -6468,7 +6468,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tinycloud-sdk"
+name = "tinycloud-sdk-rs"
 version = "0.2.0"
 dependencies = [
  "base64 0.13.1",
@@ -6497,7 +6497,7 @@ dependencies = [
  "serde_json",
  "serde_with 1.14.0",
  "time 0.3.23",
- "tinycloud-sdk",
+ "tinycloud-sdk-rs",
  "wasm-bindgen",
  "wasm-bindgen-futures",
 ]

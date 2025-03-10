@@ -49,7 +49,7 @@ path = "tinycloud-lib/"
 members = [
     "tinycloud-lib",
     "tinycloud-sdk-wasm",
-    "tinycloud-sdk",
+    "tinycloud-sdk-rs",
     "tinycloud-core"
 ]
 
