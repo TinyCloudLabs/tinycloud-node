@@ -5,7 +5,7 @@ use ethers::{
     signers::{LocalWallet, Signer},
 };
 use tinycloud_lib::{cacaos::siwe::TimeStamp, resource::OrbitId, ssi::jwk::JWK};
-use tinycloud_sdk::{
+use tinycloud_sdk_rs::{
     authorization::{DelegationHeaders, InvocationHeaders},
     session::{complete_session_setup, prepare_session, Session, SessionConfig, SignedSession},
     siwe_utils::{
