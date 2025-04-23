@@ -33,6 +33,5 @@ version = "0.10.2"
 default-features = false
 features = ["ed25519", "rsa", "secp256k1"]
 
-[dev-dependencies.tokio]
-version = "1"
-features = ["macros"]
+[dev-dependencies]
+tokio.workspace = true
