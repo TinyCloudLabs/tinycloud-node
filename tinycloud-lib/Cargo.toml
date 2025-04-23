@@ -12,8 +12,8 @@ serde_json = "1.0"
 serde_with = "3"
 thiserror = "2"
 base64 = "0.22"
-cacaos = "0.6.0"
-siwe-recap = "0.2.0"
+cacaos = { path = "../cacao" }
+siwe-recap = { path = "../siwe-recap" }
 lazy_static = "1.4"
 did-method-key = { default-features = false, version = "0.3.1" }
 did-tz = { default-features = false, version = "0.3.1" }

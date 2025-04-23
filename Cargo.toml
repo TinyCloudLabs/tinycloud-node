@@ -50,7 +50,10 @@ members = [
     "tinycloud-lib",
     "tinycloud-sdk-wasm",
     "tinycloud-sdk-rs",
-    "tinycloud-core"
+    "tinycloud-core",
+    "siwe",
+    "siwe-recap",
+    "cacao",
 ]
 
 exclude = [
