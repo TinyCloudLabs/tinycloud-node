@@ -1,0 +1,10 @@
+example.com wants you to sign in with your Ethereum account:
+0x0000000000000000000000000000000000000000
+
+Some custom statement.
+
+URI: did:key:example
+Version: 1
+Chain ID: 1
+Nonce: mynonce1
+Issued At: 2022-06-21T12:00:00.000Z
