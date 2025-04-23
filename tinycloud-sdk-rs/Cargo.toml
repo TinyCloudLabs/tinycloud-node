@@ -4,17 +4,18 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-base64 = "0.13"
-time = "0.3"
-hex = "0.4"
-http = "0.2"
-iri-string = "0.6"
-tinycloud-lib = { path = "../tinycloud-lib" }
-serde = { version = "1.0", features = ["derive"] }
-serde_with = { version = "1" }
-serde_json = "1.0"
-thiserror = "1"
-tracing = "0.1.36"
+tinycloud-lib = { version = "0.2", path = "../tinycloud-lib" }
+siwe = { version = "1.0.0", path = "../siwe", features = ["serde"] }
+siwe-recap = { version = "0.2.0", path = "../siwe-recap" }
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+reqwest = { version = "0.11", features = ["json"] }
+k256 = { version = "0.13.1", features = ["ecdsa-core", "ecdsa", "std", "serde"] }
+time.workspace = true 
+http.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros"]}

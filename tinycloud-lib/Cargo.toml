@@ -4,14 +4,14 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-async-trait = "0.1"
-iri-string = "0.7"
-libipld = { version = "0.16", default-features = false, features = ["dag-cbor", "dag-json", "derive", "serde-codec"]}
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-serde_with = "3"
-thiserror = "2"
-base64 = "0.22"
+async-trait.workspace = true
+iri-string.workspace = true
+libipld.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_with.workspace = true
+thiserror.workspace = true
+base64.workspace = true
 cacaos = { path = "../cacao" }
 siwe-recap = { path = "../siwe-recap" }
 lazy_static = "1.4"
@@ -21,7 +21,6 @@ did-ethr = { default-features = false, version = "0.3.1" }
 did-pkh = { version = "0.3.1" }
 did-web = { default-features = false, version = "0.3.3" }
 did-ion = { default-features = false, version = "0.3.1" }
-
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 uuid = { version = "1", features = ["v4", "js"] }
 

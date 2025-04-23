@@ -8,13 +8,13 @@ readme = "README.md"
 repository = "https://github.com/spruceid/siwe-recap/"
 
 [dependencies]
-base64 = "0.22"
-iri-string = { version = "0.7", features = ["serde"] }
-siwe = "0.5"
-serde_json = { version = "1" }
-serde = { version = "1", features = ["derive"] }
-serde_with = { version = "2" }
-thiserror = "1"
+base64.workspace = true
+iri-string.workspace = true
+siwe = { path = "../siwe" }
+serde_json.workspace = true
+serde.workspace = true
+serde_with.workspace = true
+thiserror.workspace = true
 cid = "0.10"
-ucan-capabilities-object = "0.1"
+ucan-capabilities-object = { path = "../ucan-capabilities" }
 serde_jcs = "0.1"

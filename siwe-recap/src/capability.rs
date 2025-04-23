@@ -327,8 +327,7 @@ where
 #[derive(thiserror::Error, Debug)]
 pub enum DecodingError {
     #[error(
-        "invalid resource prefix (expected prefix: {}, found: {0})",
-        RESOURCE_PREFIX
+        "invalid resource prefix (expected prefix: {RESOURCE_PREFIX}, found: {0})"
     )]
     InvalidResourcePrefix(String),
     #[error("failed to decode base64 capability resource: {0}")]
