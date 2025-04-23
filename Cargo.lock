@@ -7332,7 +7332,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "678b5a069e50bf00ecd22d0cd8ddf7c236f68581b03db652061ed5eb13a312ff"
 dependencies = [
  "base64 0.13.1",
- "hex",
  "serde",
  "serde_with_macros 1.5.2",
 ]
@@ -7587,7 +7586,7 @@ dependencies = [
  "serde_with 2.3.3",
  "siwe 0.5.2",
  "thiserror 1.0.69",
- "ucan-capabilities-object",
+ "ucan-capabilities-object 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -9250,9 +9249,9 @@ dependencies = [
  "rocket",
  "serde",
  "serde_json",
- "serde_with 1.14.0",
+ "serde_with 3.12.0",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.12",
  "tinycloud-core",
  "tinycloud-lib",
  "tokio",
@@ -9700,6 +9699,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f720def6ce1ee2fc44d40ac9ed6d3a59c361c80a75a7aa8e75bb9baed31cf2ea"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "ucan-capabilities-object"
+version = "0.1.0"
+dependencies = [
+ "iri-string 0.6.0",
+ "nutype",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

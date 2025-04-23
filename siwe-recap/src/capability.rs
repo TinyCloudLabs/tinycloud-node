@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DeserializeAs, SerializeAs};
 
+use base64::Engine;
 use iri_string::types::UriString;
 use siwe::Message;
 
@@ -232,7 +233,11 @@ where
     fn encode(&self) -> Result<String, EncodingError> {
         serde_jcs::to_vec(self)
             .map_err(EncodingError::Ser)
-            .map(|bytes| base64::encode_config(bytes, base64::URL_SAFE_NO_PAD))
+            .map(|bytes| {
+                let mut encoded = String::new();
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode_string(&bytes, &mut encoded);
+                encoded
+            })
     }
 
     /// Apply this capabilities set to a SIWE message by writing to it's statement and resource list
@@ -282,9 +287,9 @@ where
     }
 
     fn decode(encoded: &str) -> Result<Self, DecodingError> {
-        base64::decode_config(encoded, base64::URL_SAFE_NO_PAD)
-            .map_err(DecodingError::Base64Decode)
-            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(DecodingError::De))
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded)
+            .map_err(DecodingError::Base64Decode)?;
+        serde_json::from_slice(&decoded).map_err(DecodingError::De)
     }
 }
 
