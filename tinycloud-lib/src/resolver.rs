@@ -1,20 +1,6 @@
-use did_ethr::DIDEthr;
-use did_method_key::DIDKey;
-use did_pkh::DIDPKH;
-use did_tz::DIDTz;
-use did_web::DIDWeb;
-use ssi::did::DIDMethods;
-use std::env::VarError;
+use ssi::dids::AnyDidMethod as DIDMethods;
 
 lazy_static::lazy_static! {
-    pub static ref DID_METHODS: DIDMethods<'static> = {
-        let mut methods = DIDMethods::default();
-        methods.insert(Box::new(DIDKey));
-        methods.insert(Box::<DIDTz>::default());
-        methods.insert(Box::new(DIDEthr));
-        // methods.insert(Box::new(DIDSol));
-        methods.insert(Box::new(DIDWeb));
-        methods.insert(Box::new(DIDPKH));
-        methods
-    };
+    // Initialize with default methods, remove lifetime parameter
+    pub static ref DID_METHODS: DIDMethods = DIDMethods::default();
 }

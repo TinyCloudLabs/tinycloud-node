@@ -1,4 +1,4 @@
-use iri_string::{types::UriString, validate::Error as UriError};
+use iri_string::types::UriString;
 use libipld::{
     cbor::DagCborCodec,
     cid::{
@@ -10,7 +10,7 @@ use libipld::{
 };
 use serde_with::{DeserializeFromStr, SerializeDisplay};
 use ssi::{
-    did::DIDURL,
+    dids::DIDURLBuf as DIDURL, // Updated import from ssi::dids
     ucan::{Capability, UcanResource, UcanScope},
 };
 
@@ -75,8 +75,8 @@ impl TryFrom<DIDURL> for OrbitId {
     type Error = KRIParseError;
     fn try_from(did: DIDURL) -> Result<Self, Self::Error> {
         match (
-            did.did.strip_prefix("did:").map(|s| s.to_string()),
-            did.fragment,
+            did.did().strip_prefix("did:").map(|s| s.to_string()), // Use did() method
+            did.fragment().map(|f| f.to_string()), // Use fragment() method and convert to String
         ) {
             (Some(suffix), Some(id)) => Ok(Self { suffix, id }),
             _ => Err(KRIParseError::IncorrectForm),
@@ -141,18 +141,20 @@ impl ResourceId {
 pub enum ResourceCapErr {
     #[error("Missing ResourceId fragment")]
     MissingAction,
+    #[error("Invalid URI string for capability: {0}")]
+    CapabilityUriParse(#[from] iri_string::validate::Error), // Add From implementation
 }
 
 impl TryInto<Capability> for ResourceId {
     type Error = ResourceCapErr;
     fn try_into(self) -> Result<Capability, Self::Error> {
         Ok(Capability {
-            with: UcanResource::URI(ssi::vc::URI::String(format!(
+            with: UcanResource::URI(UriString::from_str(&format!(
                 "{}/{}{}",
                 &self.orbit,
                 &self.service.as_deref().unwrap_or(""),
                 &self.path.as_deref().unwrap_or("")
-            ))),
+            ))?), // Error automatically converted via From
             can: UcanScope {
                 namespace: match self.service {
                     Some(s) => format!("tinycloud.{s}"),
@@ -220,8 +222,8 @@ impl fmt::Display for ResourceId {
 pub enum KRIParseError {
     #[error("Incorrect Structure")]
     IncorrectForm,
-    #[error(transparent)]
-    InvalidUri(#[from] UriError),
+    #[error("Invalid URI string: {0}")]
+    UriStringParse(#[from] iri_string::validate::Error),
 }
 
 impl FromStr for OrbitId {
