@@ -1,4 +1,4 @@
-use iri_string::types::UriString;
+use iri_string::{spec::UriSpec, types::{RiString, UriString}};
 use libipld::{
     cbor::DagCborCodec,
     cid::{
@@ -10,8 +10,7 @@ use libipld::{
 };
 use serde_with::{DeserializeFromStr, SerializeDisplay};
 use ssi::{
-    dids::DIDURLBuf as DIDURL, // Updated import from ssi::dids
-    ucan::{Capability, UcanResource, UcanScope},
+    dids::DIDURLBuf as DIDURL, json_ld::iref::UriBuf, ucan::{Capability, UcanResource, UcanScope}
 };
 
 use std::io::{Read, Seek, Write};
@@ -149,7 +148,7 @@ impl TryInto<Capability> for ResourceId {
     type Error = ResourceCapErr;
     fn try_into(self) -> Result<Capability, Self::Error> {
         Ok(Capability {
-            with: UcanResource::URI(UriString::from_str(&format!(
+            with: UcanResource::URI(UriBuf::from_str(&format!(
                 "{}/{}{}",
                 &self.orbit,
                 &self.service.as_deref().unwrap_or(""),

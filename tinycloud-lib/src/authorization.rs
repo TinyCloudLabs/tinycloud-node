@@ -6,12 +6,12 @@ use ssi::{
     jwk::JWK,
     ucan::{Payload, Ucan},
 };
-use ssi_jwt::NumericDate; // Import NumericDate from ssi_jwt
+use ssi_jwt::NumericDate;
 use iri_string::validate::Error as UriStringError;
-use time::{OffsetDateTime, error::ComponentRange as TimestampRangeError}; // Import ComponentRange
+use time::error::ComponentRange as TimestampRangeError;
 use std::str::FromStr;
 use uuid::Uuid;
-use base64::{engine::general_purpose::URL_SAFE, Engine as _}; // Import Engine trait and URL_SAFE engine
+use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 
 pub use libipld::Cid;
 
@@ -102,19 +102,15 @@ pub async fn make_invocation(
     delegation: Cid,
     jwk: &JWK,
     verification_method: String,
-    expiration: i64, // Change type to i64 for seconds
-    not_before: Option<i64>, // Change type to i64 for seconds
+    expiration: f64,
+    not_before: Option<f64>,
     nonce: Option<String>,
 ) -> Result<Ucan, InvocationError> {
-    let now = OffsetDateTime::now_utc();
-    let expiration_time = OffsetDateTime::from_unix_timestamp(expiration)?;
-    let nb_time = not_before.map(OffsetDateTime::from_unix_timestamp).transpose()?;
-
     Ok(Payload {
         issuer: DIDURLBuf::from_str(&verification_method)?,
         audience: DIDBuf::from_str(&verification_method.split('#').next().unwrap_or(&verification_method))?,
-        not_before: nb_time.map(NumericDate::from), // Convert Option<OffsetDateTime> to Option<NumericDate>
-        expiration: NumericDate::from(expiration_time), // Convert OffsetDateTime to NumericDate
+        not_before: not_before.map(NumericDate::try_from_seconds).transpose()?,
+        expiration: NumericDate::try_from_seconds(expiration).map_err(InvocationError::NumericDateConversionError)?,
         nonce: Some(nonce.unwrap_or_else(|| format!("urn:uuid:{}", Uuid::new_v4()))),
         facts: None,
         proof: vec![delegation.into()],
@@ -132,6 +128,8 @@ pub enum InvocationError {
     ResourceCap(#[from] ResourceCapErr),
     #[error("Timestamp component out of range: {0}")] // Add variant for ComponentRange
     TimestampRange(#[from] TimestampRangeError),
+    #[error("Invalid date format: {0}")]
+    NumericDateConversionError(#[from] ssi_jwt::NumericDateConversionError),
     #[error(transparent)]
     UCAN(#[from] ssi::ucan::error::Error),
     #[error(transparent)]
