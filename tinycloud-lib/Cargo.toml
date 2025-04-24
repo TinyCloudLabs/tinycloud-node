@@ -21,6 +21,7 @@ did-ethr = { default-features = false, version = "0.3.1" }
 did-pkh = { version = "0.3.1" }
 did-web = { default-features = false, version = "0.3.3" }
 did-ion = { default-features = false, version = "0.3.1" }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 uuid = { version = "1", features = ["v4", "js"] }
 
