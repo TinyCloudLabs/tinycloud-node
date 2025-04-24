@@ -1,4 +1,4 @@
-use iri_string::{spec::UriSpec, types::{RiString, UriString}};
+use iri_string::types::UriString;
 use libipld::{
     cbor::DagCborCodec,
     cid::{
@@ -141,7 +141,7 @@ pub enum ResourceCapErr {
     #[error("Missing ResourceId fragment")]
     MissingAction,
     #[error("Invalid URI string for capability: {0}")]
-    CapabilityUriParse(#[from] iri_string::validate::Error), // Add From implementation
+    CapabilityUriParse(#[from] ssi::json_ld::iref::uri::InvalidUri<String>), // Add From implementation
 }
 
 impl TryInto<Capability> for ResourceId {
