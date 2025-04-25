@@ -4,8 +4,13 @@ use tinycloud_lib::{
     cacaos::siwe::Message,
     libipld::Cid,
     resource::OrbitId,
-    siwe_recap::{extract_capabilities, verify_statement, Capability as SiweCap},
+    siwe_recap,
     ssi::ucan::Capability as UcanCap,
+};
+use tinycloud_lib::siwe_recap::{
+    extract_and_verify as verify_statement,
+    extract_capabilities as extract_capabilities_from_message, Capability as SiweCap,
+    VerificationError as SiweError,
 };
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -35,7 +40,7 @@ fn extract_ucan_cap<T>(c: &UcanCap<T>) -> Result<Capability, CapExtractError> {
     })
 }
 
-fn extract_siwe_cap(c: SiweCap) -> Result<(Vec<Capability>, Vec<Cid>), CapExtractError> {
+fn extract_siwe_cap(c: SiweCap<()>) -> Result<(Vec<Capability>, Vec<Cid>), CapExtractError> {
     if !c.default_actions.as_ref().is_empty() {
         Err(CapExtractError::DefaultActions)
     } else {
@@ -102,7 +107,7 @@ pub enum DelegationError {
     #[error(transparent)]
     SiweConversion(#[from] tinycloud_lib::cacaos::siwe_cacao::SIWEPayloadConversionError),
     #[error(transparent)]
-    SiweCapError(#[from] tinycloud_lib::siwe_recap::Error),
+    SiweCapError(#[from] SiweError),
     #[error("Invalid Siwe Statement")]
     InvalidStatement,
 }
@@ -139,7 +144,7 @@ impl TryFrom<TinyCloudDelegation> for DelegationInfo {
                 if !verify_statement(&m)? {
                     return Err(DelegationError::InvalidStatement);
                 };
-                let (capabilities, parents) = extract_capabilities(&m)?
+                let (capabilities, parents) = extract_capabilities_from_message(&m)?
                     .remove(&"tinycloud".parse()?)
                     .map(extract_siwe_cap)
                     .transpose()?

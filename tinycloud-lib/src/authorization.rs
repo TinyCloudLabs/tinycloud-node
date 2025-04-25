@@ -5,8 +5,8 @@ use ssi::{
     dids::{DIDBuf, DIDURLBuf, InvalidDID, InvalidDIDURL},
     jwk::JWK,
     ucan::{Payload, Ucan},
+    claims::jwt::NumericDate
 };
-use ssi_jwt::NumericDate;
 use iri_string::validate::Error as UriStringError;
 use time::error::ComponentRange as TimestampRangeError;
 use std::str::FromStr;
@@ -129,7 +129,7 @@ pub enum InvocationError {
     #[error("Timestamp component out of range: {0}")] // Add variant for ComponentRange
     TimestampRange(#[from] TimestampRangeError),
     #[error("Invalid date format: {0}")]
-    NumericDateConversionError(#[from] ssi_jwt::NumericDateConversionError),
+    NumericDateConversionError(#[from] ssi::claims::jwt::NumericDateConversionError),
     #[error(transparent)]
     UCAN(#[from] ssi::ucan::error::Error),
     #[error(transparent)]

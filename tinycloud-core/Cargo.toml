@@ -23,7 +23,6 @@ time.workspace = true
 tinycloud-lib = { version = "0.2", path = "../tinycloud-lib" }
 libp2p = { version = "0.52.1", default-features = false, features = ["ed25519"] }
 thiserror.workspace = true
-ssi = "0.10"
 serde.workspace = true
 serde_json.workspace = true
 serde_ipld_dagcbor = "0.3"
