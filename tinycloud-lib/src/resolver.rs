@@ -1,6 +1,5 @@
-use ssi::dids::AnyDidMethod as DIDMethods;
+use ssi::dids::AnyDidMethod;
 
 lazy_static::lazy_static! {
-    // Initialize with default methods, remove lifetime parameter
-    pub static ref DID_METHODS: DIDMethods = DIDMethods::default();
+    pub static ref DID_METHODS: AnyDidMethod = AnyDidMethod::default();
 }
