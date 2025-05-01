@@ -1,12 +1,13 @@
-use tinycloud_lib::resource::OrbitId;
-use tinycloud_lib::ssi::{
-    dids::{Document, RelativeDIDURL, Service, VerificationMethod, DIDURLBuf},
-    did_resolver::DIDResolver,
-    one_or_many::OneOrMany,
-};
 use libp2p::{Multiaddr, PeerId};
 use std::{convert::TryFrom, str::FromStr};
 use thiserror::Error;
+use tinycloud_lib::resource::OrbitId;
+use tinycloud_lib::ssi::dids::document::verification_method;
+use tinycloud_lib::ssi::{
+    did_resolver::DIDResolver,
+    dids::{DIDURLBuf, Document, RelativeDIDURL, Service, VerificationMethod},
+    one_or_many::OneOrMany,
+};
 
 /// An implementation of an Orbit Manifest.
 ///
@@ -94,13 +95,14 @@ impl<'a> From<(Document, &'a str)> for Manifest {
                 id: n.into(),
                 peers: vec![],
             });
-        let Document {
-            id,
-            capability_delegation,
-            capability_invocation,
-            verification_method,
-            ..
-        } = d;
+        let (id, capability_delegation, capability_invocation, verification_method) = {
+            (
+                d.id,
+                d.verification_relationships.capability_delegation,
+                d.verification_relationships.capability_invocation,
+                d.verification_method,
+            )
+        };
         Self {
             delegators: capability_delegation
                 .or_else(|| verification_method.clone())
@@ -186,12 +188,12 @@ fn id_from_vm(did: &str, vm: VerificationMethod) -> DIDURLBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::convert::TryInto;
     use tinycloud_lib::resolver::DID_METHODS;
     use tinycloud_lib::ssi::{
-        dids::{Source, DIDURLBuf},
+        dids::{DIDURLBuf, Source},
         jwk::JWK,
     };
-    use std::convert::TryInto;
 
     #[tokio::test]
     async fn basic_manifest() {
