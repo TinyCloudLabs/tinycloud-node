@@ -4,8 +4,7 @@ use thiserror::Error;
 use tinycloud_lib::resource::OrbitId;
 use tinycloud_lib::ssi::dids::document::verification_method;
 use tinycloud_lib::ssi::{
-    did_resolver::DIDResolver,
-    dids::{DIDURLBuf, Document, RelativeDIDURL, Service, VerificationMethod},
+    dids::{DIDURLBuf, Document, RelativeDIDURL, Service, VerificationMethod, DIDResolver},
     one_or_many::OneOrMany,
 };
 
@@ -42,28 +41,11 @@ impl Manifest {
         &self.invokers
     }
 
-    pub async fn resolve_dyn(
-        id: &OrbitId,
-        resolver: Option<&dyn DIDResolver>,
-    ) -> Result<Option<Self>, ResolutionError> {
-        let (md, doc, doc_md) = resolver
-            .unwrap_or_else(|| &tinycloud_lib::resolver::DID_METHODS)
-            .resolve(&id.did(), &Default::default())
-            .await;
-
-        match (md.error, doc, doc_md.and_then(|d| d.deactivated)) {
-            (Some(e), _, _) => Err(ResolutionError::Resolver(e)),
-            (_, _, Some(true)) => Err(ResolutionError::Deactivated),
-            (_, None, _) => Ok(None),
-            (None, Some(d), None | Some(false)) => Ok(Some((d, id.name()).into())),
-        }
-    }
-
     pub async fn resolve<D: DIDResolver>(
         id: &OrbitId,
         resolver: &D,
     ) -> Result<Option<Self>, ResolutionError> {
-        let (md, doc, doc_md) = resolver.resolve(&id.did(), &Default::default()).await;
+        let (md, doc, doc_md) = resolver.resolve(&id.did()).await;
 
         match (md.error, doc, doc_md.and_then(|d| d.deactivated)) {
             (Some(e), _, _) => Err(ResolutionError::Resolver(e)),
