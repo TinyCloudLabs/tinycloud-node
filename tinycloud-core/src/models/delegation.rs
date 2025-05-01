@@ -1,7 +1,7 @@
 use crate::hash::Hash;
 use crate::types::{Facts, Resource};
 use crate::{events::Delegation, models::*, relationships::*, util};
-use tinycloud_lib::{authorization::TinyCloudDelegation, resolver::DID_METHODS};
+use tinycloud_lib::{authorization::TinyCloudDelegation, resolver::DID_METHODS, ssi::dids::{DIDResolver, AnyDidMethod}};
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, ConnectionTrait};
 use time::OffsetDateTime;
 
@@ -133,7 +133,8 @@ pub(crate) async fn process<C: ConnectionTrait>(
 async fn verify(delegation: &TinyCloudDelegation) -> Result<(), Error> {
     match delegation {
         TinyCloudDelegation::Ucan(ref ucan) => {
-            ucan.verify_signature(DID_METHODS.to_resolver())
+            // TODO go back to static DID_METHODS
+            ucan.verify_signature(&AnyDidMethod::default())
                 .await
                 .map_err(|_| DelegationError::InvalidSignature)?;
             ucan.payload
