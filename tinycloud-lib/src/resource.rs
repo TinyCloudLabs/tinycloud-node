@@ -10,7 +10,9 @@ use libipld::{
 };
 use serde_with::{DeserializeFromStr, SerializeDisplay};
 use ssi::{
-    dids::DIDURLBuf as DIDURL, json_ld::iref::UriBuf, ucan::{Capability, UcanResource, UcanScope}
+    dids::{DIDBuf, DIDURLBuf as DIDURL, DID},
+    json_ld::iref::UriBuf,
+    ucan::{Capability, UcanResource, UcanScope},
 };
 
 use std::io::{Read, Seek, Write};
@@ -21,21 +23,21 @@ use thiserror::Error;
     Clone, Hash, PartialEq, Debug, Eq, SerializeDisplay, DeserializeFromStr, PartialOrd, Ord,
 )]
 pub struct OrbitId {
-    suffix: String,
+    base_did: DIDBuf,
     id: String,
 }
 
 impl OrbitId {
-    pub fn new(suffix: String, id: String) -> Self {
-        Self { suffix, id }
+    pub fn new(base_did: DIDBuf, id: String) -> Self {
+        Self { base_did, id }
     }
 
-    pub fn did(&self) -> String {
-        ["did", self.suffix()].join(":")
+    pub fn did(&self) -> &DID {
+        self.base_did.as_did()
     }
 
     pub fn suffix(&self) -> &str {
-        &self.suffix
+        &self.base_did.as_str()[4..]
     }
 
     pub fn name(&self) -> &str {
@@ -74,10 +76,13 @@ impl TryFrom<DIDURL> for OrbitId {
     type Error = KRIParseError;
     fn try_from(did: DIDURL) -> Result<Self, Self::Error> {
         match (
-            did.did().strip_prefix("did:").map(|s| s.to_string()), // Use did() method
+            &did,
             did.fragment().map(|f| f.to_string()), // Use fragment() method and convert to String
         ) {
-            (Some(suffix), Some(id)) => Ok(Self { suffix, id }),
+            (bd, Some(id)) => Ok(Self {
+                base_did: bd.did().to_owned(),
+                id,
+            }),
             _ => Err(KRIParseError::IncorrectForm),
         }
     }
@@ -197,7 +202,7 @@ pub enum ResourceCheckError {
 
 impl fmt::Display for OrbitId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "tinycloud:{}://{}", &self.suffix, &self.id)
+        write!(f, "tinycloud:{}://{}", &self.suffix(), &self.id)
     }
 }
 
@@ -223,6 +228,8 @@ pub enum KRIParseError {
     IncorrectForm,
     #[error("Invalid URI string: {0}")]
     UriStringParse(#[from] iri_string::validate::Error),
+    #[error("Invalid DID string: {0}")]
+    DidParse(#[from] ssi::dids::InvalidDID<String>),
 }
 
 impl FromStr for OrbitId {
@@ -247,7 +254,7 @@ impl FromStr for OrbitId {
             )
         }) {
             Some((id, None, None, "", None, None)) => Ok(Self {
-                suffix: s[..p].to_string(),
+                base_did: s.parse()?,
                 id,
             }),
             _ => Err(Self::Err::IncorrectForm),
@@ -278,7 +285,7 @@ impl FromStr for ResourceId {
         }) {
             Some((host, None, path)) => Ok(Self {
                 orbit: OrbitId {
-                    suffix: s[..p].to_string(),
+                    base_did: format!("did:{}", &s[..p]).parse()?,
                     id: host.into(),
                 },
                 service: path.map(|(s, _)| s.into()),
@@ -319,7 +326,7 @@ mod tests {
             .unwrap();
 
         assert_eq!("ens:example.eth", res.orbit().suffix());
-        assert_eq!("did:ens:example.eth", res.orbit().did());
+        assert_eq!("did:ens:example.eth", res.orbit().did().as_str());
         assert_eq!("orbit0", res.orbit().name());
         assert_eq!("kv", res.service().unwrap());
         assert_eq!("/path/to/image.jpg", res.path().unwrap());
@@ -328,19 +335,23 @@ mod tests {
         let res2: ResourceId = "tinycloud:ens:example.eth://orbit0#peer".parse().unwrap();
 
         assert_eq!("ens:example.eth", res2.orbit().suffix());
-        assert_eq!("did:ens:example.eth", res2.orbit().did());
+        assert_eq!("did:ens:example.eth", res2.orbit().did().as_str());
         assert_eq!("orbit0", res2.orbit().name());
         assert_eq!(None, res2.service());
         assert_eq!(None, res2.path());
         assert_eq!("peer", res2.fragment().unwrap());
 
-        let res3: ResourceId = "tinycloud:ens:example.eth://orbit0/kv#list".parse().unwrap();
+        let res3: ResourceId = "tinycloud:ens:example.eth://orbit0/kv#list"
+            .parse()
+            .unwrap();
 
         assert_eq!("kv", res3.service().unwrap());
         assert_eq!("/", res3.path().unwrap());
         assert_eq!("list", res3.fragment().unwrap());
 
-        let res4: ResourceId = "tinycloud:ens:example.eth://orbit0/kv/#list".parse().unwrap();
+        let res4: ResourceId = "tinycloud:ens:example.eth://orbit0/kv/#list"
+            .parse()
+            .unwrap();
 
         assert_eq!("kv", res4.service().unwrap());
         assert_eq!("/", res4.path().unwrap());
