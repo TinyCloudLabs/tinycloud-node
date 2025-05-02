@@ -1,8 +1,9 @@
 use libp2p::{Multiaddr, PeerId};
+use tinycloud_lib::ssi::dids::DID;
 use std::{convert::TryFrom, str::FromStr};
 use thiserror::Error;
 use tinycloud_lib::resource::OrbitId;
-use tinycloud_lib::ssi::dids::document::verification_method;
+use tinycloud_lib::ssi::dids::document::verification_method::{self, ValueOrReference};
 use tinycloud_lib::ssi::{
     dids::{DIDURLBuf, Document, RelativeDIDURL, document::{Service, DIDVerificationMethod}, DIDResolver},
     one_or_many::OneOrMany,
@@ -149,21 +150,10 @@ impl TryFrom<&Service> for BootstrapPeers {
     }
 }
 
-fn id_from_vm(did: &str, vm: DIDVerificationMethod) -> DIDURLBuf {
+fn id_from_vm(did: &DID, vm: ValueOrReference) -> DIDURLBuf {
     match vm {
-        DIDVerificationMethod::DIDURL(d) => d.to_buf(), // Assuming .to_buf() exists
-        DIDVerificationMethod::RelativeDIDURL(f) => f.to_absolute(did).to_buf(), // Assuming .to_buf() exists
-        DIDVerificationMethod::Map(m) => {
-            if let Ok(abs_did_url) = DIDURLBuf::from_str(&m.id) {
-                abs_did_url
-            } else if let Ok(rel_did_url) = RelativeDIDURL::from_str(&m.id) {
-                rel_did_url.to_absolute(did).to_buf() // Assuming .to_buf() exists
-            } else {
-                // HACK well-behaved did methods should not allow id's which lead to this path
-                // This part might need adjustment depending on DIDURLBuf's structure
-                DIDURLBuf::from_string(m.id).unwrap() // Assuming a constructor like this
-            }
-        }
+        ValueOrReference::Reference(r) => r.resolve(did),
+        ValueOrReference::Value(v) => v.id,
     }
 }
 
