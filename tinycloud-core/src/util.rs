@@ -45,7 +45,7 @@ fn extract_siwe_cap(c: SiweCap<()>) -> Result<(Vec<Capability>, Vec<Cid>), CapEx
                 acs.keys() // Iterate over Ability keys
                     .map(|action| Capability {
                         // action is &Ability
-                        resource: Resource::from(r.clone()), // Clone UriString for Resource
+                        resource: Resource::from(r.to_string()), // Convert RiString to String before From
                         action: action.to_string(),          // Convert Ability to String
                     })
                     .collect::<Vec<Capability>>()

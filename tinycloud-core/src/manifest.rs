@@ -4,7 +4,7 @@ use thiserror::Error;
 use tinycloud_lib::resource::OrbitId;
 use tinycloud_lib::ssi::dids::document::verification_method;
 use tinycloud_lib::ssi::{
-    dids::{DIDURLBuf, Document, RelativeDIDURL, Service, VerificationMethod, DIDResolver},
+    dids::{DIDURLBuf, Document, RelativeDIDURL, document::{Service, DIDVerificationMethod}, DIDResolver},
     one_or_many::OneOrMany,
 };
 
@@ -149,11 +149,11 @@ impl TryFrom<&Service> for BootstrapPeers {
     }
 }
 
-fn id_from_vm(did: &str, vm: VerificationMethod) -> DIDURLBuf {
+fn id_from_vm(did: &str, vm: DIDVerificationMethod) -> DIDURLBuf {
     match vm {
-        VerificationMethod::DIDURL(d) => d.to_buf(), // Assuming .to_buf() exists
-        VerificationMethod::RelativeDIDURL(f) => f.to_absolute(did).to_buf(), // Assuming .to_buf() exists
-        VerificationMethod::Map(m) => {
+        DIDVerificationMethod::DIDURL(d) => d.to_buf(), // Assuming .to_buf() exists
+        DIDVerificationMethod::RelativeDIDURL(f) => f.to_absolute(did).to_buf(), // Assuming .to_buf() exists
+        DIDVerificationMethod::Map(m) => {
             if let Ok(abs_did_url) = DIDURLBuf::from_str(&m.id) {
                 abs_did_url
             } else if let Ok(rel_did_url) = RelativeDIDURL::from_str(&m.id) {
