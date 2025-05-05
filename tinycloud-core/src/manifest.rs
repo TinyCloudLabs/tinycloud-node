@@ -72,7 +72,7 @@ pub struct BootstrapPeer {
 impl<'a> From<(Document, &'a str)> for Manifest {
     fn from((d, n): (Document, &'a str)) -> Self {
         let bootstrap_peers = d
-            .select_service(n)
+            .service(n)
             .and_then(|s| BootstrapPeers::try_from(s).ok())
             .unwrap_or_else(|| BootstrapPeers {
                 id: n.into(),
@@ -101,7 +101,7 @@ impl<'a> From<(Document, &'a str)> for Manifest {
                 .collect(),
             bootstrap_peers,
             id: OrbitId::new(
-                id.split_once(':').map(|(_, s)| s.into()).unwrap_or(id),
+                id,
                 n.into(),
             ),
         }

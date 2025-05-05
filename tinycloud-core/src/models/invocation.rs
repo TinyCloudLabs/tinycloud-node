@@ -114,7 +114,7 @@ async fn validate<C: ConnectionTrait>(
             // remove caps for which the invoker is the root authority
             c.resource
                 .orbit()
-                .map(|o| o.did() != invocation.invoker)
+                .map(|o| **o.did() != *invocation.invoker)
                 .unwrap_or(true)
         })
         .collect();

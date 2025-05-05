@@ -167,7 +167,7 @@ async fn validate<C: ConnectionTrait>(
             // remove caps for which the delegator is the root authority
             c.resource
                 .orbit()
-                .map(|o| o.did() != delegation.delegator)
+                .map(|o| **o.did() != *delegation.delegator)
                 .unwrap_or(true)
         })
         .collect();
