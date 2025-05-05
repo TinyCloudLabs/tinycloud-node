@@ -1,12 +1,12 @@
 use libp2p::{Multiaddr, PeerId};
-use tinycloud_lib::ssi::dids::resolution::Output;
-use tinycloud_lib::ssi::dids::DID;
 use std::{convert::TryFrom, str::FromStr};
 use thiserror::Error;
 use tinycloud_lib::resource::OrbitId;
-use tinycloud_lib::ssi::dids::document::verification_method::{self, ValueOrReference};
+use tinycloud_lib::ssi::dids::document::verification_method::ValueOrReference;
+use tinycloud_lib::ssi::dids::resolution::Output;
+use tinycloud_lib::ssi::dids::DID;
 use tinycloud_lib::ssi::{
-    dids::{DIDURLBuf, Document, RelativeDIDURL, document::{Service, DIDVerificationMethod}, DIDResolver},
+    dids::{document::Service, DIDResolver, DIDURLBuf, Document},
     one_or_many::OneOrMany,
 };
 
@@ -81,32 +81,20 @@ impl<'a> From<(Document, &'a str)> for Manifest {
                 id: n.into(),
                 peers: vec![],
             });
-        let (id, capability_delegation, capability_invocation, verification_method) = {
-            (
-                d.id,
-                d.verification_relationships.capability_delegation,
-                d.verification_relationships.capability_invocation,
-                d.verification_method,
-            )
-        };
+
         Self {
-            delegators: capability_delegation
-                .or_else(|| verification_method.clone())
-                .unwrap_or_default()
-                .into_iter()
-                .map(|vm| id_from_vm(&id, vm))
-                .collect(),
-            invokers: capability_invocation
-                .or_else(|| verification_method.clone())
-                .unwrap_or_default()
-                .into_iter()
-                .map(|vm| id_from_vm(&id, vm))
-                .collect(),
-            bootstrap_peers,
-            id: OrbitId::new(
-                id,
-                n.into(),
+            delegators: get_authorised_parties(
+                &d.id,
+                d.verification_relationships.capability_delegation,
+                &d.verification_relationships.authentication,
             ),
+            invokers: get_authorised_parties(
+                &d.id,
+                d.verification_relationships.capability_invocation,
+                &d.verification_relationships.authentication,
+            ),
+            bootstrap_peers,
+            id: OrbitId::new(d.id, n.into()),
         }
     }
 }
@@ -155,8 +143,25 @@ impl TryFrom<&Service> for BootstrapPeers {
 
 fn id_from_vm(did: &DID, vm: ValueOrReference) -> DIDURLBuf {
     match vm {
-        ValueOrReference::Reference(r) => r.resolve(did),
+        ValueOrReference::Reference(r) => r.resolve(did).into_owned(),
         ValueOrReference::Value(v) => v.id,
+    }
+}
+
+fn get_authorised_parties(
+    did: &DID,
+    main: Vec<ValueOrReference>,
+    default: &[ValueOrReference],
+) -> Vec<DIDURLBuf> {
+    if main.is_empty() {
+        default
+            .iter()
+            .map(|vm| id_from_vm(did, vm.clone()))
+            .collect()
+    } else {
+        main.into_iter()
+            .map(|vm| id_from_vm(did, vm.clone()))
+            .collect()
     }
 }
 
@@ -165,25 +170,22 @@ mod tests {
     use super::*;
     use std::convert::TryInto;
     use tinycloud_lib::resolver::DID_METHODS;
-    use tinycloud_lib::ssi::{
-        dids::{DIDURLBuf, Source},
-        jwk::JWK,
-    };
+    use tinycloud_lib::ssi::dids::AnyDidMethod;
+    use tinycloud_lib::ssi::{dids::DIDURLBuf, jwk::JWK};
 
     #[tokio::test]
     async fn basic_manifest() {
-        let j = JWK::generate_secp256k1().unwrap();
-        let did: DIDURLBuf = DID_METHODS
-            .generate(&Source::KeyAndPattern(&j, "pkh:tz"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        // TODO: Fix this part if DIDURLBuf doesn't support fragment directly
-        // let did_with_fragment = format!("{}#default", did);
+        let j = JWK::generate_secp256k1();
+        let mut did = DID_METHODS.generate(&j, "pkh:eth").unwrap().to_string();
+        did.extend("#default".chars());
+        let did: DIDURLBuf = did.parse().unwrap();
 
-        let _md = Manifest::resolve_dyn(&did.try_into().unwrap(), None)
+        println!("DID: {:#?}", did);
+
+        let md = Manifest::resolve(&did.try_into().unwrap(), &AnyDidMethod::default())
             .await
             .unwrap()
             .unwrap();
+        println!("Manifest: {:#?}", md);
     }
 }

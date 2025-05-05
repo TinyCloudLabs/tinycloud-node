@@ -37,7 +37,7 @@ pub enum KeyedWriteError<E> {
 }
 
 /// A Store implementing content-addressed storage
-/// Content is address by [Multihash][libipld::cid::multihash::Multihash] and represented as an
+/// Content is addressed by [Multihash][libipld::cid::multihash::Multihash] and represented as an
 /// [AsyncRead][futures::io::AsyncRead]-implementing type.
 #[async_trait]
 pub trait ImmutableReadStore: Send + Sync {
