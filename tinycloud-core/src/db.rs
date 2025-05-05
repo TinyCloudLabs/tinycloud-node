@@ -796,11 +796,14 @@ fn normalize_path(p: &str) -> &str {
 
 #[cfg(test)]
 mod test {
+    use crate::keys::StaticSecret;
+
     use super::*;
     use async_std::test;
+    use sea_orm::{ConnectOptions, Database};
 
-    async fn get_db(o: OrbitId) -> Result<OrbitDatabase, DbErr> {
-        OrbitDatabase::new("sqlite::memory:", o).await
+    async fn get_db(o: OrbitId) -> Result<OrbitDatabase<sea_orm::DbConn, _, StaticSecret>, DbErr> {
+        OrbitDatabase::new(Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?, todo!(), StaticSecret::new([0u8; 32].to_vec())).await
     }
 
     #[test]
