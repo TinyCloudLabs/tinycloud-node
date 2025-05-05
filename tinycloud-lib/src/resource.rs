@@ -369,6 +369,14 @@ mod tests {
     }
 
     #[test]
+    fn little_test() {
+        let did: DIDURL = "did:pkh:eth:0xb1fef8ed913821b941a76de9fc7c41b90de3d37f#default"
+            .parse()
+            .unwrap();
+        let _ = OrbitId::try_from(did).unwrap();
+    }
+
+    #[test]
     fn roundtrip() {
         let resource_uri: String = "tinycloud:ens:example.eth://orbit0/kv/prefix#list".into();
         let res4: ResourceId = resource_uri.parse().unwrap();

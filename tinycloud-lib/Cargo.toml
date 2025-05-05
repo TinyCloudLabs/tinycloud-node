@@ -26,8 +26,7 @@ uuid = { version = "1", features = ["v4"] }
 [dependencies.ssi]
 git = "https://github.com/spruceid/ssi.git"
 rev = "82b0bf3"
-default-features = false
-features = ["ed25519", "rsa", "secp256k1"]
+features = ["ethereum"]
 
 [dev-dependencies]
 tokio.workspace = true

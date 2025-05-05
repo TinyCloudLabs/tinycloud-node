@@ -806,7 +806,7 @@ mod test {
     #[test]
     async fn basic() {
         let db = get_db(OrbitId::new(
-            "example:alice".to_string(),
+            "did:example:alice".parse().unwrap(),
             "default".to_string(),
         ))
         .await

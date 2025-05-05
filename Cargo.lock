@@ -2516,6 +2516,7 @@ dependencies = [
  "iref",
  "k256",
  "multibase 0.9.1",
+ "p256",
  "serde_json",
  "simple_asn1",
  "ssi-dids-core",
@@ -6300,6 +6301,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ripemd160"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2eca4ecc81b7f313189bf73ce724400a07da2a6dac19588b03c8bd76a2dcc251"
+dependencies = [
+ "block-buffer 0.9.0",
+ "digest 0.9.0",
+ "opaque-debug",
+]
+
+[[package]]
 name = "rkyv"
 version = "0.7.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7606,6 +7618,7 @@ dependencies = [
  "ssi-crypto",
  "ssi-data-integrity",
  "ssi-dids-core",
+ "ssi-eip712",
  "ssi-json-ld",
  "ssi-jwk",
  "ssi-jws",
@@ -7677,8 +7690,10 @@ dependencies = [
  "hex",
  "iref",
  "k256",
+ "p256",
  "pin-project",
  "rand 0.8.5",
+ "ripemd160",
  "serde",
  "sha2 0.10.8",
  "sha3",
@@ -7773,12 +7788,14 @@ dependencies = [
  "linked-data",
  "locspan",
  "multibase 0.9.1",
+ "p256",
  "pin-project",
  "rand 0.8.5",
  "rdf-types",
  "self_cell",
  "serde",
  "serde_cbor",
+ "serde_json",
  "ssi-caips",
  "ssi-claims-core",
  "ssi-contexts",
@@ -7943,6 +7960,7 @@ dependencies = [
  "iref",
  "k256",
  "linked-data",
+ "p256",
  "rand 0.8.5",
  "rsa 0.9.8",
  "serde",
@@ -8167,16 +8185,19 @@ dependencies = [
  "k256",
  "linked-data",
  "multibase 0.9.1",
+ "p256",
  "pin-project",
  "rand_core 0.6.4",
  "rdf-types",
  "serde",
  "serde_json",
  "sha2 0.10.8",
+ "sha3",
  "ssi-caips",
  "ssi-claims-core",
  "ssi-core",
  "ssi-crypto",
+ "ssi-eip712",
  "ssi-jwk",
  "ssi-jws",
  "ssi-multicodec",
@@ -8657,6 +8678,7 @@ dependencies = [
  "thiserror 2.0.12",
  "time",
  "tinycloud-lib",
+ "tokio",
 ]
 
 [[package]]
