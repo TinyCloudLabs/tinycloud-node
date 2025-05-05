@@ -8667,6 +8667,7 @@ name = "tinycloud-core"
 version = "0.1.0"
 dependencies = [
  "async-std",
+ "dashmap",
  "futures",
  "libp2p",
  "pin-project",

@@ -7,6 +7,7 @@ pub mod either;
 pub mod memory;
 mod util;
 pub use util::{Content, HashBuffer};
+pub use memory::{MemoryStore, MemoryStoreConfig};
 
 #[async_trait]
 pub trait StorageConfig<S> {
