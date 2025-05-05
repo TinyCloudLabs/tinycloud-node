@@ -1,4 +1,5 @@
 use libp2p::{Multiaddr, PeerId};
+use tinycloud_lib::ssi::dids::resolution::Output;
 use tinycloud_lib::ssi::dids::DID;
 use std::{convert::TryFrom, str::FromStr};
 use thiserror::Error;
@@ -46,13 +47,15 @@ impl Manifest {
         id: &OrbitId,
         resolver: &D,
     ) -> Result<Option<Self>, ResolutionError> {
-        let (md, doc, doc_md) = resolver.resolve(&id.did()).await;
+        let Output {
+            document: doc,
+            document_metadata: doc_md,
+            ..
+        } = resolver.resolve(&id.did()).await?;
 
-        match (md.error, doc, doc_md.and_then(|d| d.deactivated)) {
-            (Some(e), _, _) => Err(ResolutionError::Resolver(e)),
-            (_, _, Some(true)) => Err(ResolutionError::Deactivated),
-            (_, None, _) => Ok(None),
-            (None, Some(d), None | Some(false)) => Ok(Some((d, id.name()).into())),
+        match (doc, doc_md.deactivated) {
+            (_, Some(true)) => Err(ResolutionError::Deactivated),
+            (d, _) => Ok(Some((d.into_document(), id.name()).into())),
         }
     }
 }
@@ -111,7 +114,7 @@ impl<'a> From<(Document, &'a str)> for Manifest {
 #[derive(Error, Debug)]
 pub enum ResolutionError {
     #[error("DID Resolution Error: {0}")]
-    Resolver(String),
+    Resolver(#[from] tinycloud_lib::ssi::dids::resolution::Error),
     #[error("DID Deactivated")]
     Deactivated,
 }
