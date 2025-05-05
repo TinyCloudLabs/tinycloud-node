@@ -35,8 +35,6 @@ fn extract_ucan_cap<T>(c: &UcanCap<T>) -> Result<Capability, CapExtractError> {
 }
 
 fn extract_siwe_cap(c: SiweCap<()>) -> Result<(Vec<Capability>, Vec<Cid>), CapExtractError> {
-    // Removed check for default_actions as the field doesn't exist
-    // Access abilities via the abilities() method
     Ok((
         c.abilities()
             .iter() // Iterate over the BTreeMap provided by abilities()
@@ -46,7 +44,7 @@ fn extract_siwe_cap(c: SiweCap<()>) -> Result<(Vec<Capability>, Vec<Cid>), CapEx
                     .map(|action| Capability {
                         // action is &Ability
                         resource: Resource::from(r.to_string()), // Convert RiString to String before From
-                        action: action.to_string(),          // Convert Ability to String
+                        action: action.to_string(),              // Convert Ability to String
                     })
                     .collect::<Vec<Capability>>()
             })

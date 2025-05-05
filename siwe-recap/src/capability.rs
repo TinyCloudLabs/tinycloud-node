@@ -1,5 +1,5 @@
 use crate::RESOURCE_PREFIX;
-use cid::Cid;
+use libipld::cid::Cid;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -235,7 +235,8 @@ where
             .map_err(EncodingError::Ser)
             .map(|bytes| {
                 let mut encoded = String::new();
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode_string(&bytes, &mut encoded);
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode_string(&bytes, &mut encoded);
                 encoded
             })
     }
@@ -287,7 +288,8 @@ where
     }
 
     fn decode(encoded: &str) -> Result<Self, DecodingError> {
-        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded)
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
             .map_err(DecodingError::Base64Decode)?;
         serde_json::from_slice(&decoded).map_err(DecodingError::De)
     }
@@ -326,9 +328,7 @@ where
 
 #[derive(thiserror::Error, Debug)]
 pub enum DecodingError {
-    #[error(
-        "invalid resource prefix (expected prefix: {RESOURCE_PREFIX}, found: {0})"
-    )]
+    #[error("invalid resource prefix (expected prefix: {RESOURCE_PREFIX}, found: {0})")]
     InvalidResourcePrefix(String),
     #[error("failed to decode base64 capability resource: {0}")]
     Base64Decode(#[from] base64::DecodeError),
@@ -361,7 +361,7 @@ impl SerializeAs<Cid> for B58Cid {
     {
         serializer.serialize_str(
             &source
-                .to_string_of_base(cid::multibase::Base::Base58Btc)
+                .to_string_of_base(libipld::cid::multibase::Base::Base58Btc)
                 .map_err(serde::ser::Error::custom)?,
         )
     }
