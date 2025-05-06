@@ -18,8 +18,9 @@ base64 = "0.13"
 futures = { default-features = false, version = "0.3", features = ["alloc", "std"] }
 hyper = "0.14" # Prometheus server
 lazy_static = "1.4.0"
-opentelemetry = { version = "0.17.0", features = ["rt-tokio"] }
-opentelemetry-jaeger = { version = "0.16.0", features = ["rt-tokio", "reqwest_collector_client"] }
+opentelemetry = { version = "0.29.1" }
+opentelemetry_sdk = { version = "0.29.0", features = ["rt-tokio"] } # Corrected name
+opentelemetry-otlp = { version = "0.29.0", features = ["grpc-tonic", "trace"] }
 pin-project = "1"
 prometheus = { version = "0.13.0", features = ["process"] }
 reqwest = { version = "0.11", features = ["json"] }

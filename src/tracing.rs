@@ -1,4 +1,6 @@
 use opentelemetry::trace::TraceContextExt;
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::runtime; // Added for runtime::Tokio
 use rocket::{
     fairing::{Fairing, Info, Kind},
     http::Status,
@@ -52,7 +54,7 @@ impl<'r> FromRequest<'r> for TracingSpan {
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, ()> {
         match request.local_cache(|| Option::<TracingSpan>::None) {
             Some(TracingSpan(span)) => Outcome::Success(TracingSpan(span.to_owned())),
-            None => Outcome::Failure((Status::InternalServerError, ())),
+            None => Outcome::Error((Status::InternalServerError, ())),
         }
     }
 }
@@ -66,10 +68,18 @@ pub fn tracing_try_init(config: &config::Logging) {
         config::LoggingFormat::Json => subscriber.json().boxed(),
     };
     let telemetry = if config.tracing.enabled {
-        let tracer = opentelemetry_jaeger::new_pipeline()
-            .with_service_name("tinycloud")
-            .install_batch(opentelemetry::runtime::Tokio)
-            .unwrap();
+        // Configure OTLP exporter (gRPC using tonic)
+        let tracer = opentelemetry_otlp::new_pipeline()
+            .tracing()
+            .with_exporter(
+                opentelemetry_otlp::new_exporter()
+                    .tonic()
+                    // Default endpoint is http://localhost:4317
+                    // Use .with_endpoint("http://your-jaeger-collector:4317") if needed
+            )
+            .install_batch(runtime::Tokio) // Use runtime from opentelemetry_sdk
+            .expect("Failed to install OTLP tracer");
+
         let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
         Some(telemetry)
     } else {
