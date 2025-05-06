@@ -23,8 +23,8 @@ macro_rules! impl_fromreq {
                     .map(SerializedEvent::<$type>::from_header_ser::<$inter>)
                 {
                     Some(Ok(e)) => Outcome::Success(AuthHeaderGetter(e)),
-                    Some(Err(e)) => Outcome::Failure((Status::Unauthorized, e)),
-                    None => Outcome::Forward(()),
+                    Some(Err(e)) => Outcome::Failure((Status::Unauthorized, e)), // Revert back to Failure variant
+                    None => Outcome::Forward(()), // Revert back to Forward(())
                 }
             }
         }
