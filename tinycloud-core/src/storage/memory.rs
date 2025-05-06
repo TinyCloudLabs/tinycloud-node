@@ -14,6 +14,26 @@ pub struct MemoryStore {
     orbits: Arc<DashMap<OrbitId, Arc<DashMap<Hash, Vec<u8>>>>>,
 }
 
+#[derive(Default, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct MemoryStaging;
+
+#[async_trait]
+impl ImmutableStaging for MemoryStaging {
+    type Writable = Vec<u8>;
+    type Error = std::io::Error;
+    async fn get_staging_buffer(&self, _: &OrbitId) -> Result<Self::Writable, Self::Error> {
+        Ok(Vec::new())
+    }
+}
+
+#[async_trait]
+impl StorageConfig<MemoryStaging> for MemoryStaging {
+    type Error = std::convert::Infallible;
+    async fn open(&self) -> Result<MemoryStaging, Self::Error> {
+        Ok(Self)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MemoryStoreConfig;
 
@@ -79,73 +99,24 @@ impl ImmutableReadStore for MemoryStore {
     }
 }
 
-// Use Vec<u8> as the staging buffer directly
-pub struct MemoryStagingBuffer(Cursor<Vec<u8>>);
-
-impl MemoryStagingBuffer {
-    fn new() -> Self {
-        Self(Cursor::new(Vec::new()))
-    }
-
-    fn into_inner(self) -> Vec<u8> {
-        self.0.into_inner()
-    }
-}
-
-impl AsyncWrite for MemoryStagingBuffer {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<io::Result<usize>> {
-        Pin::new(&mut self.0).poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_flush(cx)
-    }
-
-    fn poll_close(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_close(cx)
-    }
-}
-
 #[async_trait]
-impl ImmutableStaging for MemoryStore {
-    type Error = io::Error;
-    type Writable = MemoryStagingBuffer;
-
-    async fn get_staging_buffer(&self, _orbit: &OrbitId) -> Result<Self::Writable, Self::Error> {
-        // Ensure the orbit exists, though staging doesn't strictly need it yet
-        // self.create(orbit).await?; // Not strictly necessary here
-        Ok(MemoryStagingBuffer::new())
-    }
-}
-
-#[async_trait]
-impl ImmutableWriteStore<MemoryStore> for MemoryStore {
+impl ImmutableWriteStore<MemoryStaging> for MemoryStore {
     type Error = io::Error;
 
     async fn persist(
         &self,
         orbit: &OrbitId,
-        mut staged: HashBuffer<MemoryStagingBuffer>,
+        mut staged: HashBuffer<Vec<u8>>,
     ) -> Result<Hash, Self::Error> {
         let hash = staged.hash();
         let (_hasher, staging_buffer) = staged.into_inner();
-        let data = staging_buffer.into_inner(); // MemoryStagingBuffer -> Vec<u8>
+        let data = staging_buffer;
 
         let orbit_storage = self
             .orbits
             .entry(orbit.clone())
             .or_insert_with(|| Arc::new(DashMap::new()))
-            .clone(); // Clone the Arc<DashMap>
+            .clone();
 
         orbit_storage.insert(hash, data);
         Ok(hash)
@@ -154,14 +125,14 @@ impl ImmutableWriteStore<MemoryStore> for MemoryStore {
     async fn persist_keyed(
         &self,
         orbit: &OrbitId,
-        mut staged: HashBuffer<MemoryStagingBuffer>,
+        mut staged: HashBuffer<Vec<u8>>,
         hash: &Hash,
     ) -> Result<(), KeyedWriteError<Self::Error>> {
         if hash != &staged.hash() {
             return Err(KeyedWriteError::IncorrectHash);
         };
         let (_hasher, staging_buffer) = staged.into_inner();
-        let data = staging_buffer.into_inner();
+        let data = staging_buffer;
 
         let orbit_storage = self
             .orbits

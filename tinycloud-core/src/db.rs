@@ -798,18 +798,13 @@ fn normalize_path(p: &str) -> &str {
 mod test {
     use crate::{
         keys::StaticSecret,
-        storage::{
-            memory::{MemoryStore, MemoryStoreConfig},
-            StorageConfig
-        },
+        storage::memory::MemoryStore,
     };
 
     use super::*;
     use sea_orm::{ConnectOptions, Database};
 
-    async fn get_db(
-        o: OrbitId,
-    ) -> Result<OrbitDatabase<sea_orm::DbConn, MemoryStore, StaticSecret>, DbErr> {
+    async fn get_db() -> Result<OrbitDatabase<sea_orm::DbConn, MemoryStore, StaticSecret>, DbErr> {
         OrbitDatabase::new(
             Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?,
             MemoryStore::default(),
@@ -820,10 +815,7 @@ mod test {
 
     #[tokio::test]
     async fn basic() {
-        let db = get_db(OrbitId::new(
-            "did:example:alice".parse().unwrap(),
-            "default".to_string(),
-        ))
+        let db = get_db()
         .await
         .unwrap();
     }

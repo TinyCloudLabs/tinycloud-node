@@ -1,7 +1,7 @@
 use crate::hash::Hash;
 use crate::types::{Facts, Resource};
 use crate::{events::Delegation, models::*, relationships::*, util};
-use tinycloud_lib::{authorization::TinyCloudDelegation, resolver::DID_METHODS, ssi::dids::{DIDResolver, AnyDidMethod}};
+use tinycloud_lib::{authorization::TinyCloudDelegation, ssi::dids::AnyDidMethod};
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, ConnectionTrait};
 use time::OffsetDateTime;
 

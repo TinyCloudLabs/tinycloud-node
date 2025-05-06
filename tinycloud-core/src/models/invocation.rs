@@ -6,7 +6,7 @@ use super::super::{
 };
 use crate::hash::Hash;
 use crate::types::{Facts, OrbitIdWrap, Resource};
-use tinycloud_lib::{authorization::TinyCloudInvocation, resolver::DID_METHODS, ssi::dids::AnyDidMethod};
+use tinycloud_lib::{authorization::TinyCloudInvocation, ssi::dids::AnyDidMethod};
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, Condition, ConnectionTrait, QueryOrder};
 use time::OffsetDateTime;
 
