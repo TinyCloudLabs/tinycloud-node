@@ -1,6 +1,6 @@
 use opentelemetry::trace::TraceContextExt;
-use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::runtime; // Added for runtime::Tokio
+use opentelemetry_sdk::{runtime, trace::Tracer};
+use opentelemetry_otlp::TonicExporterBuilder;
 use rocket::{
     fairing::{Fairing, Info, Kind},
     http::Status,
@@ -69,16 +69,12 @@ pub fn tracing_try_init(config: &config::Logging) {
     };
     let telemetry = if config.tracing.enabled {
         // Configure OTLP exporter (gRPC using tonic)
-        let tracer = opentelemetry_otlp::new_pipeline()
-            .tracing()
-            .with_exporter(
-                opentelemetry_otlp::new_exporter()
-                    .tonic()
-                    // Default endpoint is http://localhost:4317
-                    // Use .with_endpoint("http://your-jaeger-collector:4317") if needed
-            )
-            .install_batch(runtime::Tokio) // Use runtime from opentelemetry_sdk
-            .expect("Failed to install OTLP tracer");
+        // Create a tracer provider with the exporter
+        // Default endpoint is http://localhost:4317
+        // Use .with_endpoint("http://your-jaeger-collector:4317") if needed
+        let tracer = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_batch_exporter(opentelemetry_otlp::ExportConfig::default().into())
+            .build();
 
         let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
         Some(telemetry)
