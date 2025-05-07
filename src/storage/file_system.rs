@@ -7,7 +7,7 @@ use futures::{
     task::{Context, Poll},
 };
 use tinycloud_core::{hash::Hash, storage::*};
-use tinycloud_lib::resource::OrbitId;
+use tinycloud_lib::{resource::OrbitId, ssi::dids::DIDBuf};
 use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -145,6 +145,12 @@ async fn store_sizes<P: AsRef<Path>>(path: &P) -> Result<HashMap<OrbitId, u64>, 
                 entry.file_name().into_string(),
             ) {
                 let mut ds = ReadDirStream::new(tokio::fs::read_dir(entry.path()).await?);
+                let did: DIDBuf = ["did:", suffix.as_str()].concat().parse().map_err(|_| {
+                    IoError::new(
+                        ErrorKind::InvalidData,
+                        format!("Invalid DID: {}", suffix),
+                    )
+                })?;
                 // go through each suffix directory
                 while let Some(entry) = ds.try_next().await? {
                     // for each entry in the suffix directory
@@ -154,7 +160,7 @@ async fn store_sizes<P: AsRef<Path>>(path: &P) -> Result<HashMap<OrbitId, u64>, 
                         entry.file_name().into_string(),
                     ) {
                         // get the orbit ID from suffix and name
-                        let orbit = OrbitId::new(suffix.clone(), name);
+                        let orbit = OrbitId::new(did.clone(), name);
                         let size = orbit_size(&entry.path()).await?;
                         acc.insert(orbit, size);
                     }
