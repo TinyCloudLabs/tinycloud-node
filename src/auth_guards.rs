@@ -43,7 +43,7 @@ impl<'r> FromData<'r> for DataIn<'r> {
     async fn from_data(
         req: &'r Request<'_>,
         data: Data<'r>,
-    ) -> rocket::outcome::Outcome<Self, (Status, Self::Error), Data<'r>> { // NOTE: This inferred Forward type (Data<'r>) likely mismatches the trait (Data<'r>, Status)
+    ) -> rocket::outcome::Outcome<Self, (Status, Self::Error), (Data<'r>, Status)> {
         let req_span = req
             .local_cache(|| Option::<crate::tracing::TracingSpan>::None)
             .as_ref()
@@ -56,7 +56,7 @@ impl<'r> FromData<'r> for DataIn<'r> {
                 .start_timer();
 
             let res = match <&'r ContentType>::from_request(req).await.succeeded() {
-                Some(c) if c.is_form_data() => rocket::outcome::Outcome::Failure((
+                Some(c) if c.is_form_data() => rocket::outcome::Outcome::Error((
                     Status::BadRequest,
                     anyhow::anyhow!("Multipart uploads not yet supported"),
                 )),
