@@ -1,6 +1,6 @@
-use opentelemetry::trace::TraceContextExt;
+use opentelemetry::trace::{TraceContextExt, TracerProvider};
 use opentelemetry_sdk::{runtime, trace::Tracer};
-use opentelemetry_otlp::TonicExporterBuilder;
+use opentelemetry_otlp::{ExporterBuildError, TonicExporterBuilder};
 use rocket::{
     fairing::{Fairing, Info, Kind},
     http::Status,
@@ -59,7 +59,7 @@ impl<'r> FromRequest<'r> for TracingSpan {
     }
 }
 
-pub fn tracing_try_init(config: &config::Logging) {
+pub fn tracing_try_init(config: &config::Logging) -> Result<(), ExporterBuildError> {
     LogTracer::init().unwrap();
     let env_filter = tracing_subscriber::EnvFilter::from_default_env();
     let subscriber = tracing_subscriber::fmt::layer();
@@ -72,9 +72,10 @@ pub fn tracing_try_init(config: &config::Logging) {
         // Create a tracer provider with the exporter
         // Default endpoint is http://localhost:4317
         // Use .with_endpoint("http://your-jaeger-collector:4317") if needed
-        let tracer = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-            .with_batch_exporter(opentelemetry_otlp::ExportConfig::default().into())
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_batch_exporter(opentelemetry_otlp::SpanExporter::builder().with_tonic().build()?)
             .build();
+        let tracer = provider.tracer("tinycloud");
 
         let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
         Some(telemetry)
@@ -86,4 +87,5 @@ pub fn tracing_try_init(config: &config::Logging) {
         .with(log)
         .with(telemetry);
     set_global_default(collector).unwrap();
+    Ok(())
 }
