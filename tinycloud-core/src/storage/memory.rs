@@ -150,7 +150,11 @@ impl ImmutableDeleteStore for MemoryStore {
     type Error = io::Error;
 
     async fn remove(&self, orbit: &OrbitId, id: &Hash) -> Result<Option<()>, Self::Error> {
-        Ok(self.orbits.get(orbit).and_then(|o| o.remove(id)).map(|_| ()))
+        Ok(self
+            .orbits
+            .get(orbit)
+            .and_then(|o| o.remove(id))
+            .map(|_| ()))
     }
 }
 

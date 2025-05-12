@@ -1,13 +1,13 @@
-use tinycloud_core::{
-    events::{FromReqErr, SerializedEvent},
-    util::{DelegationInfo, InvocationInfo, RevocationInfo},
-};
-use tinycloud_lib::authorization::{TinyCloudDelegation, TinyCloudInvocation, TinyCloudRevocation};
 use rocket::{
     http::Status,
     request::{FromRequest, Outcome, Request},
 };
 use std::convert::TryFrom;
+use tinycloud_core::{
+    events::{FromReqErr, SerializedEvent},
+    util::{DelegationInfo, InvocationInfo, RevocationInfo},
+};
+use tinycloud_lib::authorization::{TinyCloudDelegation, TinyCloudInvocation, TinyCloudRevocation};
 
 pub struct AuthHeaderGetter<T>(pub SerializedEvent<T>);
 

@@ -1,8 +1,8 @@
 mod definitions;
 
 use js_sys::Promise;
-use tinycloud_sdk_rs::*;
 use std::future::Future;
+use tinycloud_sdk_rs::*;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 

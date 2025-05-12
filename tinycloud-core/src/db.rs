@@ -796,10 +796,7 @@ fn normalize_path(p: &str) -> &str {
 
 #[cfg(test)]
 mod test {
-    use crate::{
-        keys::StaticSecret,
-        storage::memory::MemoryStore,
-    };
+    use crate::{keys::StaticSecret, storage::memory::MemoryStore};
 
     use super::*;
     use sea_orm::{ConnectOptions, Database};
@@ -815,8 +812,6 @@ mod test {
 
     #[tokio::test]
     async fn basic() {
-        let db = get_db()
-        .await
-        .unwrap();
+        let db = get_db().await.unwrap();
     }
 }

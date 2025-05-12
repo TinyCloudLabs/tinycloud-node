@@ -643,7 +643,7 @@ impl Message {
     /// ```
     pub fn eip191_bytes(&self) -> Result<Vec<u8>, fmt::Error> {
         let s = self.to_string();
-        Ok(format!("\x19Ethereum Signed Message:\n{}{}", s.as_bytes().len(), s).into())
+        Ok(format!("\x19Ethereum Signed Message:\n{}{}", s.len(), s).into())
     }
 
     /// Produces EIP-191 Personal-Signature Hashed signing-input
@@ -819,10 +819,8 @@ Resources:
 
     const PARSING_POSITIVE: &str = include_str!("../test/parsing_positive.json");
     const PARSING_NEGATIVE: &str = include_str!("../test/parsing_negative.json");
-    const VERIFICATION_POSITIVE: &str =
-        include_str!("../test/verification_positive.json");
-    const VERIFICATION_NEGATIVE: &str =
-        include_str!("../test/verification_negative.json");
+    const VERIFICATION_POSITIVE: &str = include_str!("../test/verification_positive.json");
+    const VERIFICATION_NEGATIVE: &str = include_str!("../test/verification_negative.json");
     const VERIFICATION_EIP1271: &str = include_str!("../test/eip1271.json");
 
     fn fields_to_message(fields: &serde_json::Value) -> anyhow::Result<Message> {

@@ -2,11 +2,11 @@ use hyper::{
     service::{make_service_fn, service_fn},
     Server,
 };
-use tinycloud::{app, config, prometheus};
 use rocket::{
     figment::providers::{Env, Format, Serialized, Toml},
     tokio,
 };
+use tinycloud::{app, config, prometheus};
 
 #[rocket::main]
 async fn main() {

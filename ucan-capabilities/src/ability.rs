@@ -53,19 +53,19 @@ impl Ability {
     }
 }
 
-impl<'a> AbilityNamespaceRef<'a> {
+impl AbilityNamespaceRef<'_> {
     pub fn to_owned(&self) -> AbilityNamespace {
         AbilityNamespace::try_from(self.as_ref()).unwrap()
     }
 }
 
-impl<'a> AbilityNameRef<'a> {
+impl AbilityNameRef<'_> {
     pub fn to_owned(&self) -> AbilityName {
         AbilityName::try_from(self.as_ref()).unwrap()
     }
 }
 
-impl<'a> AbilityRef<'a> {
+impl AbilityRef<'_> {
     pub fn to_owned(&self) -> Ability {
         Ability::try_from(self.as_ref()).unwrap()
     }
@@ -86,19 +86,19 @@ impl<'a> AbilityRef<'a> {
     }
 }
 
-impl<'a> Display for AbilityRef<'a> {
+impl Display for AbilityRef<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FmtError> {
         write!(f, "{}", &self.0)
     }
 }
 
-impl<'a> Display for AbilityNamespaceRef<'a> {
+impl Display for AbilityNamespaceRef<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FmtError> {
         write!(f, "{}", &self.0)
     }
 }
 
-impl<'a> Display for AbilityNameRef<'a> {
+impl Display for AbilityNameRef<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FmtError> {
         write!(f, "{}", &self.0)
     }

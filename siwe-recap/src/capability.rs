@@ -1,6 +1,6 @@
 use crate::RESOURCE_PREFIX;
 use libipld::cid::Cid;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt::Write};
 
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DeserializeAs, SerializeAs};
@@ -219,8 +219,11 @@ impl<NB> Capability<NB> {
                 .to_string(),
             self.to_statement_lines()
                 .enumerate()
-                .map(|(n, line)| format!(" ({}) {line}", n + 1))
-                .collect(),
+                .fold(String::new(), |mut acc, (n, line)| {
+                    // write! into a string can never fail, unwrapping here is safe
+                    write!(acc, " ({}) {line}", n + 1).unwrap();
+                    acc
+                }),
         ]
         .concat()
     }

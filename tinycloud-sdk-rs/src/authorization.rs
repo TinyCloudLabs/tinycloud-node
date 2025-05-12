@@ -1,5 +1,5 @@
-use tinycloud_lib::authorization::{TinyCloudDelegation, TinyCloudInvocation};
 use serde::{Deserialize, Serialize};
+use tinycloud_lib::authorization::{TinyCloudDelegation, TinyCloudInvocation};
 
 use crate::session::Session;
 
@@ -46,11 +46,11 @@ pub enum Error {
 }
 
 mod header_enc {
-    use tinycloud_lib::authorization::HeaderEncode;
     use serde::{
         de::Error as DeError, ser::Error as SerError, Deserialize, Deserializer, Serialize,
         Serializer,
     };
+    use tinycloud_lib::authorization::HeaderEncode;
 
     pub fn deserialize<'de, T, D>(d: D) -> Result<T, D::Error>
     where

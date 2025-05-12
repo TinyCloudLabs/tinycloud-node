@@ -1,14 +1,13 @@
 #[macro_use]
 extern crate rocket;
-#[macro_use]
 extern crate anyhow;
 #[cfg(test)]
 #[macro_use]
 extern crate tokio;
 
 use anyhow::Result;
-use tinycloud_lib::libipld::{block::Block as OBlock, store::DefaultParams};
 use rocket::{fairing::AdHoc, figment::Figment, http::Header, Build, Rocket};
+use tinycloud_lib::libipld::{block::Block as OBlock, store::DefaultParams};
 
 pub mod allow_list;
 pub mod auth_guards;
@@ -20,16 +19,16 @@ pub mod storage;
 mod tracing;
 
 use config::{BlockStorage, Config, Keys, StagingStorage};
+use routes::{delegate, invoke, open_host_key, util_routes::*};
+use storage::{
+    file_system::{FileSystemConfig, FileSystemStore, TempFileSystemStage},
+    s3::{S3BlockConfig, S3BlockStore},
+};
 use tinycloud_core::{
     keys::{SecretsSetup, StaticSecret},
     sea_orm::{ConnectOptions, Database, DatabaseConnection},
     storage::{either::Either, memory::MemoryStaging, StorageConfig},
     OrbitDatabase,
-};
-use routes::{delegate, invoke, open_host_key, util_routes::*};
-use storage::{
-    file_system::{FileSystemConfig, FileSystemStore, TempFileSystemStage},
-    s3::{S3BlockConfig, S3BlockStore},
 };
 
 pub type Block = OBlock<DefaultParams>;
