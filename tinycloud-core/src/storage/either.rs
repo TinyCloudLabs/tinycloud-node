@@ -1,7 +1,7 @@
 use crate::{hash::Hash, storage::*};
 use futures::future::Either as AsyncEither;
-use tinycloud_lib::resource::OrbitId;
 use sea_orm_migration::async_trait::async_trait;
+use tinycloud_lib::resource::OrbitId;
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum Either<A, B> {

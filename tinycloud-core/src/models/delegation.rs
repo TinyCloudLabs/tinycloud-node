@@ -1,9 +1,9 @@
 use crate::hash::Hash;
 use crate::types::{Facts, Resource};
 use crate::{events::Delegation, models::*, relationships::*, util};
-use tinycloud_lib::{authorization::TinyCloudDelegation, ssi::dids::AnyDidMethod};
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, ConnectionTrait};
 use time::OffsetDateTime;
+use tinycloud_lib::{authorization::TinyCloudDelegation, ssi::dids::AnyDidMethod};
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "delegation")]

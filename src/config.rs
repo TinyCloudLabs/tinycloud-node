@@ -3,7 +3,6 @@ use crate::{
     storage::{file_system::FileSystemConfig, s3::S3BlockConfig},
     BlockConfig, BlockStage,
 };
-use tinycloud_core::keys::StaticSecret;
 use rocket::data::ByteUnit;
 use serde::{Deserialize, Serialize};
 use serde_with::{
@@ -11,6 +10,7 @@ use serde_with::{
     formats::Unpadded,
     serde_as, FromInto,
 };
+use tinycloud_core::keys::StaticSecret;
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
 pub struct Config {

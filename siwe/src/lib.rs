@@ -819,10 +819,8 @@ Resources:
 
     const PARSING_POSITIVE: &str = include_str!("../test/parsing_positive.json");
     const PARSING_NEGATIVE: &str = include_str!("../test/parsing_negative.json");
-    const VERIFICATION_POSITIVE: &str =
-        include_str!("../test/verification_positive.json");
-    const VERIFICATION_NEGATIVE: &str =
-        include_str!("../test/verification_negative.json");
+    const VERIFICATION_POSITIVE: &str = include_str!("../test/verification_positive.json");
+    const VERIFICATION_NEGATIVE: &str = include_str!("../test/verification_negative.json");
     const VERIFICATION_EIP1271: &str = include_str!("../test/eip1271.json");
 
     fn fields_to_message(fields: &serde_json::Value) -> anyhow::Result<Message> {

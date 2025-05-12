@@ -1,5 +1,9 @@
 use crate::authorization::DelegationHeaders;
 use http::uri::Authority;
+use serde::{Deserialize, Serialize};
+use serde_with::{serde_as, DisplayFromStr};
+use std::collections::HashMap;
+use time::{ext::NumericalDuration, Duration, OffsetDateTime};
 use tinycloud_lib::{
     authorization::{make_invocation, InvocationError, TinyCloudInvocation},
     cacaos::{
@@ -12,10 +16,6 @@ use tinycloud_lib::{
     siwe_recap::Builder,
     ssi::{did::Source, jwk::JWK, vc::get_verification_method},
 };
-use serde::{Deserialize, Serialize};
-use serde_with::{serde_as, DisplayFromStr};
-use std::collections::HashMap;
-use time::{ext::NumericalDuration, Duration, OffsetDateTime};
 
 #[serde_as]
 #[derive(Deserialize, Clone)]
@@ -199,7 +199,8 @@ pub fn complete_session_setup(signed_session: SignedSession) -> Result<Session, 
         *Block::<DefaultParams>::encode(DagCborCodec, Code::Blake3_256, &delegation)
             .map_err(Error::UnableToGenerateCid)?
             .cid();
-    let delegation_header = DelegationHeaders::new(TinyCloudDelegation::Cacao(Box::new(delegation)));
+    let delegation_header =
+        DelegationHeaders::new(TinyCloudDelegation::Cacao(Box::new(delegation)));
 
     Ok(Session {
         delegation_header,

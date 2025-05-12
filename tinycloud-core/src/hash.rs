@@ -1,9 +1,9 @@
+use sea_orm::entity::prelude::*;
+use sea_orm::DbErr;
 use tinycloud_lib::libipld::cid::{
     multihash::{Blake3_256, Code, Hasher as MHasher, Multihash, MultihashDigest},
     Cid,
 };
-use sea_orm::entity::prelude::*;
-use sea_orm::DbErr;
 
 pub fn hash(data: &[u8]) -> Hash {
     Hasher::new().update(data).finalize()

@@ -1,13 +1,13 @@
 use crate::hash::Hash;
-use tinycloud_lib::resource::OrbitId;
 use sea_orm_migration::async_trait::async_trait;
 use std::error::Error as StdError;
+use tinycloud_lib::resource::OrbitId;
 
 pub mod either;
 pub mod memory;
 mod util;
-pub use util::{Content, HashBuffer};
 pub use memory::{MemoryStore, MemoryStoreConfig};
+pub use util::{Content, HashBuffer};
 
 #[async_trait]
 pub trait StorageConfig<S> {

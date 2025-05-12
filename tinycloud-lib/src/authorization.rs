@@ -1,17 +1,17 @@
 use crate::resource::{ResourceCapErr, ResourceId};
+use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use cacaos::siwe_cacao::SiweCacao;
+use iri_string::validate::Error as UriStringError;
 use libipld::{cbor::DagCborCodec, prelude::*};
 use ssi::{
+    claims::jwt::NumericDate,
     dids::{DIDBuf, DIDURLBuf, InvalidDID, InvalidDIDURL},
     jwk::JWK,
     ucan::{Payload, Ucan},
-    claims::jwt::NumericDate
 };
-use iri_string::validate::Error as UriStringError;
-use time::error::ComponentRange as TimestampRangeError;
 use std::str::FromStr;
+use time::error::ComponentRange as TimestampRangeError;
 use uuid::Uuid;
-use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 
 pub use libipld::Cid;
 
@@ -108,9 +108,15 @@ pub async fn make_invocation(
 ) -> Result<Ucan, InvocationError> {
     Ok(Payload {
         issuer: DIDURLBuf::from_str(&verification_method)?,
-        audience: DIDBuf::from_str(&verification_method.split('#').next().unwrap_or(&verification_method))?,
+        audience: DIDBuf::from_str(
+            &verification_method
+                .split('#')
+                .next()
+                .unwrap_or(&verification_method),
+        )?,
         not_before: not_before.map(NumericDate::try_from_seconds).transpose()?,
-        expiration: NumericDate::try_from_seconds(expiration).map_err(InvocationError::NumericDateConversionError)?,
+        expiration: NumericDate::try_from_seconds(expiration)
+            .map_err(InvocationError::NumericDateConversionError)?,
         nonce: Some(nonce.unwrap_or_else(|| format!("urn:uuid:{}", Uuid::new_v4()))),
         facts: None,
         proof: vec![delegation.into()],
