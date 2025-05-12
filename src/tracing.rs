@@ -1,6 +1,5 @@
 use opentelemetry::trace::{TraceContextExt, TracerProvider};
-use opentelemetry_sdk::{runtime, trace::Tracer};
-use opentelemetry_otlp::{ExporterBuildError, TonicExporterBuilder};
+use opentelemetry_otlp::ExporterBuildError;
 use rocket::{
     fairing::{Fairing, Info, Kind},
     http::Status,
