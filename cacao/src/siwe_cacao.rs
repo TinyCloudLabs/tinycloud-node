@@ -45,16 +45,17 @@ pub enum Version {
 }
 
 impl Payload {
-    pub fn sign<S: SignatureScheme<Eip4361>>(self, s: S::Signature) -> CACAO<S, Eip4361>
+    pub fn sign<S>(self, s: S::Signature) -> CACAO<S, Eip4361>
     where
+        S: SignatureScheme<Eip4361>,
         S::Signature: DagCbor + Debug,
     {
         CACAO::new(self, s, None)
     }
 
-    pub async fn verify<S: SignatureScheme<Eip4361>>(&self, s: &S::Signature) -> Result<(), S::Err>
+    pub async fn verify<S>(&self, s: &S::Signature) -> Result<(), S::Err>
     where
-        S: Send + Sync,
+        S: Send + Sync + SignatureScheme<Eip4361>,
         S::Signature: Send + Sync,
     {
         S::verify(self, s).await

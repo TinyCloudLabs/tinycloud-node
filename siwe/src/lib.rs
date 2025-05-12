@@ -643,7 +643,7 @@ impl Message {
     /// ```
     pub fn eip191_bytes(&self) -> Result<Vec<u8>, fmt::Error> {
         let s = self.to_string();
-        Ok(format!("\x19Ethereum Signed Message:\n{}{}", s.as_bytes().len(), s).into())
+        Ok(format!("\x19Ethereum Signed Message:\n{}{}", s.len(), s).into())
     }
 
     /// Produces EIP-191 Personal-Signature Hashed signing-input
