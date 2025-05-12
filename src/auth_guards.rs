@@ -13,7 +13,6 @@ use rocket::{
     data::{Capped, FromData},
     futures::io::AsyncRead,
     http::{ContentType, Header, Status},
-    outcome::Outcome as DataOutcome,
     request::{FromRequest, Outcome, Request},
     response::{Responder, Response},
     serde::json::Json,
@@ -44,7 +43,7 @@ impl<'r> FromData<'r> for DataIn<'r> {
     async fn from_data(
         req: &'r Request<'_>,
         data: Data<'r>,
-    ) -> DataOutcome<Self, (Status, Self::Error), Data<'r>> {
+    ) -> rocket::outcome::Outcome<Self, (Status, Self::Error), (Data<'r>, Status)> {
         let req_span = req
             .local_cache(|| Option::<crate::tracing::TracingSpan>::None)
             .as_ref()
@@ -57,11 +56,11 @@ impl<'r> FromData<'r> for DataIn<'r> {
                 .start_timer();
 
             let res = match <&'r ContentType>::from_request(req).await.succeeded() {
-                Some(c) if c.is_form_data() => DataOutcome::Failure((
+                Some(c) if c.is_form_data() => rocket::outcome::Outcome::Error((
                     Status::BadRequest,
-                    anyhow!("Multipart uploads not yet supported"),
+                    anyhow::anyhow!("Multipart uploads not yet supported"),
                 )),
-                _ => DataOutcome::Success(DataIn::One(data)),
+                _ => rocket::outcome::Outcome::Success(DataIn::One(data)),
             };
 
             timer.observe_duration();

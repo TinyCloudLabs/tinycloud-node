@@ -4,24 +4,18 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-async-trait = "0.1"
-iri-string = "0.6"
-libipld = { version = "0.14", default-features = false, features = ["dag-cbor", "dag-json", "derive", "serde-codec"]}
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-serde_with = "1.0"
-thiserror = "1"
-base64 = "0.13"
-cacaos = "0.5"
-siwe-recap = "0.1.0"
+async-trait.workspace = true
+iri-string.workspace = true
+libipld.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_with.workspace = true
+thiserror.workspace = true
+base64.workspace = true
+time.workspace = true
+cacaos = { path = "../cacao" }
+siwe-recap = { path = "../siwe-recap" }
 lazy_static = "1.4"
-did-method-key = { default-features = false, version = "0.2" }
-did-tz = { default-features = false, version = "0.2" }
-did-ethr = { default-features = false, version = "0.2" }
-did-pkh = { version = "0.2" }
-did-web = { default-features = false, version = "0.2" }
-did-webkey = { default-features = false, version = "0.2" }
-did-onion = { default-features = false, version = "0.2" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 uuid = { version = "1", features = ["v4", "js"] }
@@ -30,10 +24,9 @@ uuid = { version = "1", features = ["v4", "js"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dependencies.ssi]
-version = "0.6"
-default-features = false
-features = ["ed25519", "rsa", "secp256k1"]
+git = "https://github.com/spruceid/ssi.git"
+rev = "82b0bf3"
+features = ["ethereum"]
 
-[dev-dependencies.tokio]
-version = "1"
-features = ["macros"]
+[dev-dependencies]
+tokio.workspace = true

@@ -1,0 +1,1 @@
+{"att":{"http://example.com/public/photos/":{"crud/delete":[{}]},"mailto:username@example.com":{"msg/receive":[{"max_count":5,"templates":["newsletter","marketing"]}],"msg/send":[{"to":"someone@email.com"},{"to":"joe@email.com"}]}},"prf":["zM5K3WPEexRZN9x7ikg5LoijNjU2ytFTGJ6eeruGiN3Q9xkfGpMVei9cz5jMZAFUsmxXi9k"]}

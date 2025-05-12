@@ -1,0 +1,12 @@
+example.com wants you to sign in with your Ethereum account:
+0x0000000000000000000000000000000000000000
+
+I further authorize the stated URI to perform the following actions on my behalf: (1) 'kv': 'get', 'list', 'metadata' for 'kepler:ens:example.eth://default/kv'. (2) 'kv': 'delete', 'get', 'list', 'metadata', 'put' for 'kepler:ens:example.eth://default/kv/dapp-space'. (3) 'kv': 'delete', 'get', 'list', 'metadata', 'put' for 'kepler:ens:example.eth://default/kv/public'. (4) 'credential': 'present' for 'urn:credential:type:type1'.
+
+URI: did:key:example
+Version: 1
+Chain ID: 1
+Nonce: mynonce1
+Issued At: 2022-06-21T12:00:00.000Z
+Resources:
+- urn:recap:eyJhdHQiOnsia2VwbGVyOmVuczpleGFtcGxlLmV0aDovL2RlZmF1bHQva3YiOnsia3YvZ2V0Ijpbe31dLCJrdi9saXN0Ijpbe31dLCJrdi9tZXRhZGF0YSI6W3t9XX0sImtlcGxlcjplbnM6ZXhhbXBsZS5ldGg6Ly9kZWZhdWx0L2t2L2RhcHAtc3BhY2UiOnsia3YvZGVsZXRlIjpbe31dLCJrdi9nZXQiOlt7fV0sImt2L2xpc3QiOlt7fV0sImt2L21ldGFkYXRhIjpbe31dLCJrdi9wdXQiOlt7fV19LCJrZXBsZXI6ZW5zOmV4YW1wbGUuZXRoOi8vZGVmYXVsdC9rdi9wdWJsaWMiOnsia3YvZGVsZXRlIjpbe31dLCJrdi9nZXQiOlt7fV0sImt2L2xpc3QiOlt7fV0sImt2L21ldGFkYXRhIjpbe31dLCJrdi9wdXQiOlt7fV19LCJ1cm46Y3JlZGVudGlhbDp0eXBlOnR5cGUxIjp7ImNyZWRlbnRpYWwvcHJlc2VudCI6W3t9XX19LCJwcmYiOltdfQ

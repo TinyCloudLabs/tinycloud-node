@@ -78,7 +78,7 @@ pub type TinyCloud = OrbitDatabase<DatabaseConnection, BlockStores, StaticSecret
 pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     let tinycloud_config: Config = config.extract::<Config>()?;
 
-    tracing::tracing_try_init(&tinycloud_config.log);
+    tracing::tracing_try_init(&tinycloud_config.log)?;
 
     let routes = routes![healthcheck, cors, open_host_key, invoke, delegate,];
 

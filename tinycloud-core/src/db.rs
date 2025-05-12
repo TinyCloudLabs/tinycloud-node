@@ -10,10 +10,6 @@ use crate::storage::{
 };
 use crate::types::{Metadata, OrbitIdWrap, Resource};
 use crate::util::{Capability, DelegationInfo};
-use tinycloud_lib::{
-    authorization::{EncodingError, TinyCloudDelegation},
-    resource::OrbitId,
-};
 use sea_orm::{
     entity::prelude::*,
     error::{DbErr, RuntimeErr, SqlxError},
@@ -23,6 +19,10 @@ use sea_orm::{
 };
 use sea_orm_migration::MigratorTrait;
 use std::collections::HashMap;
+use tinycloud_lib::{
+    authorization::{EncodingError, TinyCloudDelegation},
+    resource::OrbitId,
+};
 
 #[derive(Debug, Clone)]
 pub struct OrbitDatabase<C, B, S> {
@@ -45,7 +45,7 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
     #[error("database error: {0}")]
     Db(#[from] DbErr),
     #[error(transparent)]
-    Ucan(#[from] ssi::ucan::Error),
+    Ucan(#[from] tinycloud_lib::ssi::ucan::Error),
     #[error(transparent)]
     Cacao(#[from] tinycloud_lib::cacaos::siwe_cacao::VerificationError),
     #[error(transparent)]
@@ -796,19 +796,26 @@ fn normalize_path(p: &str) -> &str {
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use async_std::test;
+    use crate::{
+        keys::StaticSecret,
+        storage::memory::MemoryStore,
+    };
 
-    async fn get_db(o: OrbitId) -> Result<OrbitDatabase, DbErr> {
-        OrbitDatabase::new("sqlite::memory:", o).await
+    use super::*;
+    use sea_orm::{ConnectOptions, Database};
+
+    async fn get_db() -> Result<OrbitDatabase<sea_orm::DbConn, MemoryStore, StaticSecret>, DbErr> {
+        OrbitDatabase::new(
+            Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?,
+            MemoryStore::default(),
+            StaticSecret::new([0u8; 32].to_vec()).unwrap(),
+        )
+        .await
     }
 
-    #[test]
+    #[tokio::test]
     async fn basic() {
-        let db = get_db(OrbitId::new(
-            "example:alice".to_string(),
-            "default".to_string(),
-        ))
+        let db = get_db()
         .await
         .unwrap();
     }

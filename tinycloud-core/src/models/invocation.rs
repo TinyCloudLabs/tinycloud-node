@@ -6,7 +6,7 @@ use super::super::{
 };
 use crate::hash::Hash;
 use crate::types::{Facts, OrbitIdWrap, Resource};
-use tinycloud_lib::{authorization::TinyCloudInvocation, resolver::DID_METHODS};
+use tinycloud_lib::{authorization::TinyCloudInvocation, ssi::dids::AnyDidMethod};
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, Condition, ConnectionTrait, QueryOrder};
 use time::OffsetDateTime;
 
@@ -89,7 +89,8 @@ pub(crate) async fn process<C: ConnectionTrait>(
 
 async fn verify(invocation: &TinyCloudInvocation) -> Result<(), Error> {
     invocation
-        .verify_signature(DID_METHODS.to_resolver())
+        // TODO go back to static DID_METHODS
+        .verify_signature(&AnyDidMethod::default())
         .await
         .map_err(|_| InvocationError::InvalidSignature)?;
     invocation
@@ -113,7 +114,7 @@ async fn validate<C: ConnectionTrait>(
             // remove caps for which the invoker is the root authority
             c.resource
                 .orbit()
-                .map(|o| o.did() != invocation.invoker)
+                .map(|o| **o.did() != *invocation.invoker)
                 .unwrap_or(true)
         })
         .collect();

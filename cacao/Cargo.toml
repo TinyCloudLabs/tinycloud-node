@@ -1,0 +1,30 @@
+[package]
+name = "cacaos"
+version = "0.5.1"
+authors = ["Spruce Systems, Inc."]
+edition = "2021"
+license = "Apache-2.0"
+description = "Core library for CACAO traits and data structures"
+repository = "https://github.com/spruceid/cacao-rs/"
+
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+eip4361 = ["hex"]
+default = ["eip4361"]
+
+[dependencies]
+siwe.workspace = true
+iri-string.workspace = true
+thiserror.workspace = true
+url = "2.2"
+async-trait.workspace = true
+serde.workspace = true
+libipld.workspace = true
+serde_with.workspace = true
+time.workspace = true
+http.workspace = true
+hex = { workspace = true, optional = true }
+
+[dev-dependencies]
+async-std = { version = "1.10", features = ["attributes"] }

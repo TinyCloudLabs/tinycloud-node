@@ -1,0 +1,20 @@
+[package]
+name = "siwe-recap"
+description = "EIP-5573: Mechanism on top of Sign-In with Ethereum for informed consent to delegate capabilities with an extensible scope mechanism."
+license = "Apache-2.0 OR MIT"
+version = "0.2.0"
+edition = "2021"
+readme = "README.md"
+repository = "https://github.com/spruceid/siwe-recap/"
+
+[dependencies]
+base64.workspace = true
+iri-string.workspace = true
+siwe = { path = "../siwe" }
+serde_json.workspace = true
+serde.workspace = true
+serde_with.workspace = true
+thiserror.workspace = true
+libipld.workspace = true
+ucan-capabilities-object = { path = "../ucan-capabilities" }
+serde_jcs = "0.1"

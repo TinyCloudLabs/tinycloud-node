@@ -2,11 +2,16 @@ use crate::resource::{ResourceCapErr, ResourceId};
 use cacaos::siwe_cacao::SiweCacao;
 use libipld::{cbor::DagCborCodec, prelude::*};
 use ssi::{
+    dids::{DIDBuf, DIDURLBuf, InvalidDID, InvalidDIDURL},
     jwk::JWK,
     ucan::{Payload, Ucan},
-    vc::NumericDate,
+    claims::jwt::NumericDate
 };
+use iri_string::validate::Error as UriStringError;
+use time::error::ComponentRange as TimestampRangeError;
+use std::str::FromStr;
 use uuid::Uuid;
+use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 
 pub use libipld::Cid;
 
@@ -29,7 +34,8 @@ impl HeaderEncode for TinyCloudDelegation {
         Ok(match self {
             Self::Ucan(u) => u.encode()?,
             Self::Cacao(c) => {
-                base64::encode_config(DagCborCodec.encode(c.deref())?, base64::URL_SAFE)
+                // Use the imported engine and trait method
+                URL_SAFE.encode(DagCborCodec.encode(c.deref())?)
             }
         })
     }
@@ -41,7 +47,8 @@ impl HeaderEncode for TinyCloudDelegation {
                 s.as_bytes().to_vec(),
             )
         } else {
-            let v = base64::decode_config(s, base64::URL_SAFE)?;
+            // Use the imported engine and trait method
+            let v = URL_SAFE.decode(s)?;
             (Self::Cacao(Box::new(DagCborCodec.decode(&v)?)), v)
         })
     }
@@ -79,14 +86,13 @@ pub enum TinyCloudRevocation {
 impl HeaderEncode for TinyCloudRevocation {
     fn encode(&self) -> Result<String, EncodingError> {
         match self {
-            Self::Cacao(c) => Ok(base64::encode_config(
-                DagCborCodec.encode(&c)?,
-                base64::URL_SAFE,
-            )),
+            // Use the imported engine and trait method
+            Self::Cacao(c) => Ok(URL_SAFE.encode(DagCborCodec.encode(&c)?)),
         }
     }
     fn decode(s: &str) -> Result<(Self, Vec<u8>), EncodingError> {
-        let v = base64::decode_config(s, base64::URL_SAFE)?;
+        // Use the imported engine and trait method
+        let v = URL_SAFE.decode(s)?;
         Ok((Self::Cacao(DagCborCodec.decode(&v)?), v))
     }
 }
@@ -101,13 +107,13 @@ pub async fn make_invocation(
     nonce: Option<String>,
 ) -> Result<Ucan, InvocationError> {
     Ok(Payload {
-        issuer: verification_method.clone(),
-        audience: verification_method,
+        issuer: DIDURLBuf::from_str(&verification_method)?,
+        audience: DIDBuf::from_str(&verification_method.split('#').next().unwrap_or(&verification_method))?,
         not_before: not_before.map(NumericDate::try_from_seconds).transpose()?,
-        expiration: NumericDate::try_from_seconds(expiration)?,
+        expiration: NumericDate::try_from_seconds(expiration).map_err(InvocationError::NumericDateConversionError)?,
         nonce: Some(nonce.unwrap_or_else(|| format!("urn:uuid:{}", Uuid::new_v4()))),
         facts: None,
-        proof: vec![delegation],
+        proof: vec![delegation.into()],
         attenuation: invocation_target
             .into_iter()
             .map(|t| t.try_into())
@@ -120,10 +126,18 @@ pub async fn make_invocation(
 pub enum InvocationError {
     #[error(transparent)]
     ResourceCap(#[from] ResourceCapErr),
-    #[error(transparent)]
-    NumericDateConversion(#[from] ssi::jwt::NumericDateConversionError),
+    #[error("Timestamp component out of range: {0}")] // Add variant for ComponentRange
+    TimestampRange(#[from] TimestampRangeError),
+    #[error("Invalid date format: {0}")]
+    NumericDateConversionError(#[from] ssi::claims::jwt::NumericDateConversionError),
     #[error(transparent)]
     UCAN(#[from] ssi::ucan::error::Error),
+    #[error(transparent)]
+    UriString(#[from] UriStringError),
+    #[error("Invalid DID URL: {0}")]
+    InvalidDIDURL(#[from] InvalidDIDURL<String>),
+    #[error("Invalid DID: {0}")]
+    InvalidDID(#[from] InvalidDID<String>),
 }
 
 #[derive(Debug, thiserror::Error)]

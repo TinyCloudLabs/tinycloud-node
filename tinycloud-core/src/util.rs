@@ -1,15 +1,14 @@
 use crate::types::Resource;
+use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
+use tinycloud_lib::siwe_recap::{Capability as SiweCap, VerificationError as SiweError};
 use tinycloud_lib::{
     authorization::{TinyCloudDelegation, TinyCloudInvocation, TinyCloudRevocation},
     cacaos::siwe::Message,
     libipld::Cid,
     resource::OrbitId,
-    siwe_recap::{extract_capabilities, verify_statement, Capability as SiweCap},
     ssi::ucan::Capability as UcanCap,
 };
-use serde::{Deserialize, Serialize};
-use std::str::FromStr;
-use time::OffsetDateTime;
 
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Capability {
@@ -35,41 +34,24 @@ fn extract_ucan_cap<T>(c: &UcanCap<T>) -> Result<Capability, CapExtractError> {
     })
 }
 
-fn extract_siwe_cap(c: SiweCap) -> Result<(Vec<Capability>, Vec<Cid>), CapExtractError> {
-    if !c.default_actions.as_ref().is_empty() {
-        Err(CapExtractError::DefaultActions)
-    } else {
-        Ok((
-            c.targeted_actions
-                .into_iter()
-                .flat_map(|(r, acs)| {
-                    acs.into_iter()
-                        .map(|action| Capability {
-                            resource: Resource::from(r.clone()),
-                            action,
-                        })
-                        .collect::<Vec<Capability>>()
-                })
-                .collect(),
-            match &c
-                .extra_fields
-                .iter()
-                .map(|(n, a)| (n.as_str(), a))
-                .collect::<Vec<(&str, &serde_json::Value)>>()[..]
-            {
-                [] => vec![],
-                [("parents", serde_json::Value::Array(a))] => a
-                    .iter()
-                    .map(|s| {
-                        s.as_str()
-                            .map(Cid::from_str)
-                            .ok_or(tinycloud_lib::libipld::cid::Error::ParsingError)?
+fn extract_siwe_cap(c: SiweCap<()>) -> Result<(Vec<Capability>, Vec<Cid>), CapExtractError> {
+    Ok((
+        c.abilities()
+            .iter() // Iterate over the BTreeMap provided by abilities()
+            .flat_map(|(r, acs)| {
+                // r is &UriString, acs is &BTreeMap<Ability, NotaBeneCollection<()>>
+                acs.keys() // Iterate over Ability keys
+                    .map(|action| Capability {
+                        // action is &Ability
+                        resource: Resource::from(r.to_string()), // Convert RiString to String before From
+                        action: action.to_string(),              // Convert Ability to String
                     })
-                    .collect::<Result<Vec<Cid>, tinycloud_lib::libipld::cid::Error>>()?,
-                _ => return Err(CapExtractError::InvalidFields),
-            },
-        ))
-    }
+                    .collect::<Vec<Capability>>()
+            })
+            .collect(),
+        // Access proof CIDs directly via the proof() method
+        c.proof().to_vec(),
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -102,7 +84,7 @@ pub enum DelegationError {
     #[error(transparent)]
     SiweConversion(#[from] tinycloud_lib::cacaos::siwe_cacao::SIWEPayloadConversionError),
     #[error(transparent)]
-    SiweCapError(#[from] tinycloud_lib::siwe_recap::Error),
+    SiweCapError(#[from] SiweError),
     #[error("Invalid Siwe Statement")]
     InvalidStatement,
 }
@@ -118,8 +100,8 @@ impl TryFrom<TinyCloudDelegation> for DelegationInfo {
                     .iter()
                     .map(extract_ucan_cap)
                     .collect::<Result<Vec<Capability>, CapExtractError>>()?,
-                delegator: u.payload.issuer.clone(),
-                delegate: u.payload.audience.clone(),
+                delegator: u.payload.issuer.to_string(),
+                delegate: u.payload.audience.to_string(),
                 parents: u.payload.proof.clone(),
                 expiry: OffsetDateTime::from_unix_timestamp_nanos(
                     (u.payload.expiration.as_seconds() * 1_000_000_000.0) as i128,
@@ -136,16 +118,22 @@ impl TryFrom<TinyCloudDelegation> for DelegationInfo {
             },
             TinyCloudDelegation::Cacao(ref c) => {
                 let m: Message = c.payload().clone().try_into()?;
-                if !verify_statement(&m)? {
-                    return Err(DelegationError::InvalidStatement);
+                // Use the public extract_and_verify, which returns Result<Option<SiweCap<()>>, VerificationError>
+                let maybe_siwe_cap = SiweCap::extract_and_verify(&m)?;
+
+                let (capabilities, parents) = match maybe_siwe_cap {
+                    Some(siwe_cap) => {
+                        // Pass the extracted cap to the helper function
+                        extract_siwe_cap(siwe_cap)?
+                    }
+                    None => {
+                        // No capabilities found
+                        (vec![], vec![])
+                    }
                 };
-                let (capabilities, parents) = extract_capabilities(&m)?
-                    .remove(&"tinycloud".parse()?)
-                    .map(extract_siwe_cap)
-                    .transpose()?
-                    .unwrap_or_default();
+
                 Self {
-                    capabilities,
+                    capabilities, // Result from extract_siwe_cap or default
                     delegator: c.payload().iss.to_string(),
                     delegate: c.payload().aud.to_string(),
                     parents,
@@ -192,7 +180,7 @@ impl TryFrom<TinyCloudInvocation> for InvocationInfo {
                 .iter()
                 .map(extract_ucan_cap)
                 .collect::<Result<Vec<Capability>, CapExtractError>>()?,
-            invoker: invocation.payload.issuer.clone(),
+            invoker: invocation.payload.issuer.to_string(),
             parents: invocation.payload.proof.clone(),
             invocation,
         })

@@ -7,6 +7,7 @@ pub mod either;
 pub mod memory;
 mod util;
 pub use util::{Content, HashBuffer};
+pub use memory::{MemoryStore, MemoryStoreConfig};
 
 #[async_trait]
 pub trait StorageConfig<S> {
@@ -37,7 +38,7 @@ pub enum KeyedWriteError<E> {
 }
 
 /// A Store implementing content-addressed storage
-/// Content is address by [Multihash][libipld::cid::multihash::Multihash] and represented as an
+/// Content is addressed by [Multihash][libipld::cid::multihash::Multihash] and represented as an
 /// [AsyncRead][futures::io::AsyncRead]-implementing type.
 #[async_trait]
 pub trait ImmutableReadStore: Send + Sync {
