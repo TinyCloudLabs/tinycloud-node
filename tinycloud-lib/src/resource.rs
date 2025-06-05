@@ -254,7 +254,7 @@ impl FromStr for OrbitId {
             )
         }) {
             Some((id, None, None, "", None, None)) => Ok(Self {
-                base_did: s.parse()?,
+                base_did: ["did:", &s[..p]].concat().try_into()?,
                 id,
             }),
             _ => Err(Self::Err::IncorrectForm),
