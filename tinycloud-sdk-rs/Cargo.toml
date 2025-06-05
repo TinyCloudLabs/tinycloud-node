@@ -9,6 +9,7 @@ siwe = { version = "1.0.0", path = "../siwe", features = ["serde"] }
 siwe-recap = { version = "0.2.0", path = "../siwe-recap" }
 serde.workspace = true
 serde_json.workspace = true
+serde_with.workspace = true
 hex.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true

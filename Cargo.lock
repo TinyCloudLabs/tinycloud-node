@@ -8754,6 +8754,7 @@ dependencies = [
  "reqwest 0.11.27",
  "serde",
  "serde_json",
+ "serde_with 3.12.0",
  "siwe",
  "siwe-recap",
  "thiserror 2.0.12",
