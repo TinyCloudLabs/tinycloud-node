@@ -2,7 +2,8 @@ use crate::authorization::DelegationHeaders;
 use http::uri::Authority;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
-use std::collections::HashMap;
+use siwe_recap::{Capability, ConvertError};
+use std::collections::{BTreeMap, HashMap};
 use time::{ext::NumericalDuration, Duration, OffsetDateTime};
 use tinycloud_lib::{
     authorization::{make_invocation, InvocationError, TinyCloudInvocation},
@@ -13,14 +14,15 @@ use tinycloud_lib::{
     libipld::Cid,
     resolver::DID_METHODS,
     resource::OrbitId,
-    siwe_recap::Builder,
-    ssi::{did::Source, jwk::JWK, vc::get_verification_method},
+    ssi::jwk::JWK,
 };
 
 #[serde_as]
 #[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionConfig {
+    // { service: { path: [action] } }
+    // e.g. { "kv": { "some/path": ["get", "put", "del"] } }
     pub actions: HashMap<String, HashMap<String, Vec<String>>>,
     #[serde(with = "crate::serde_siwe::address")]
     pub address: [u8; 20],
@@ -78,53 +80,46 @@ pub struct Session {
 impl SessionConfig {
     fn into_message(self, delegate: &str) -> Result<Message, String> {
         use serde_json::Value;
-        let ns = "tinycloud"
-            .parse()
-            .map_err(|e| format!("error parsing tinycloud as Siwe Capability namespace: {e}"))?;
-        let b = self
-            .actions
+        self.actions
             .into_iter()
-            .fold(Builder::new(), |builder, (service, actions)| {
-                actions.into_iter().fold(builder, |b, (path, action)| {
-                    b.with_actions(
-                        &ns,
+            .try_fold(
+                Capability::<Value>::default(),
+                |caps, (service, actions)| {
+                    actions.into_iter().try_fold(caps, |mut caps, (path, action)| {
+                    // weird type here cos we aren't using note benes
+                    caps.with_actions_convert::<_, _, [BTreeMap<String, Value>; 0]>(
                         self.orbit_id
                             .clone()
                             .to_resource(Some(service.clone()), Some(path), None)
                             .to_string(),
-                        action,
-                    )
+                        action.into_iter().map(|a| (a, []))
+                    )?;
+                    Ok(caps)
                 })
-            });
-        match self.parents {
-            Some(p) => b.with_extra_fields(
-                &ns,
-                [(
-                    "parents".to_string(),
-                    Value::Array(p.iter().map(|c| Value::String(c.to_string())).collect()),
-                )]
-                .into_iter()
-                .collect(),
-            ),
-            None => b,
-        }
-        .build(Message {
-            address: self.address,
-            chain_id: self.chain_id,
-            domain: self.domain,
-            expiration_time: Some(self.expiration_time),
-            issued_at: self.issued_at,
-            nonce: generate_nonce(),
-            not_before: self.not_before,
-            request_id: None,
-            statement: None,
-            resources: vec![],
-            uri: delegate
-                .try_into()
-                .map_err(|e| format!("failed to parse session key DID as a URI: {e}"))?,
-            version: SIWEVersion::V1,
-        })
-        .map_err(|e| format!("error building Host SIWE message: {e}"))
+                },
+            )
+            .map_err(|e: ConvertError<_, _>| format!("error building capabilities: {e}"))?
+            .with_proofs(match &self.parents {
+                Some(p) => p.as_slice(),
+                None => &[],
+            })
+            .build_message(Message {
+                address: self.address,
+                chain_id: self.chain_id,
+                domain: self.domain,
+                expiration_time: Some(self.expiration_time),
+                issued_at: self.issued_at,
+                nonce: generate_nonce(),
+                not_before: self.not_before,
+                request_id: None,
+                statement: None,
+                resources: vec![],
+                uri: delegate
+                    .try_into()
+                    .map_err(|e| format!("failed to parse session key DID as a URI: {e}"))?,
+                version: SIWEVersion::V1,
+            })
+            .map_err(|e| format!("error building Host SIWE message: {e}"))
     }
 }
 
@@ -162,13 +157,16 @@ pub async fn prepare_session(config: SessionConfig) -> Result<PreparedSession, E
     };
     jwk.algorithm = Some(tinycloud_lib::ssi::jwk::Algorithm::EdDSA);
 
-    let did = DID_METHODS
-        .generate(&Source::KeyAndPattern(&jwk, "key"))
-        .ok_or(Error::UnableToGenerateDID)?;
-    let did_resolver = DID_METHODS.to_resolver();
-    let verification_method = get_verification_method(&did, did_resolver)
-        .await
-        .ok_or(Error::UnableToGenerateDID)?;
+    // HACK bit of a hack here, because we know exactly how did:key works
+    // ideally we should use the did resolver to resolve the DID and find the
+    // right verification method, to support any arbitrary method.
+    let mut verification_method = DID_METHODS.generate(&jwk, "key")?.to_string();
+    let fragment = verification_method
+        .rsplit_once(':')
+        .ok_or_else(|| Error::UnableToGenerateSIWEMessage("Failed to calculate DID VM".into()))?
+        .1
+        .to_string();
+    verification_method.extend(fragment.chars());
 
     let orbit_id = config.orbit_id.clone();
 
@@ -215,8 +213,8 @@ pub fn complete_session_setup(signed_session: SignedSession) -> Result<Session, 
 pub enum Error {
     #[error("unable to generate session key: {0}")]
     UnableToGenerateKey(#[from] tinycloud_lib::ssi::jwk::Error),
-    #[error("unable to generate the DID of the session key")]
-    UnableToGenerateDID,
+    #[error("unable to generate the DID of the session key: {0}")]
+    UnableToGenerateDID(#[from] tinycloud_lib::ssi::dids::GenerateError),
     #[error("unable to generate the SIWE message to start the session: {0}")]
     UnableToGenerateSIWEMessage(String),
     #[error("unable to generate the CID: {0}")]

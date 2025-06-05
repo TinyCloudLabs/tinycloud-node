@@ -1,5 +1,5 @@
 use crate::RESOURCE_PREFIX;
-use libipld::cid::Cid;
+use libipld::Cid;
 use std::{collections::BTreeMap, fmt::Write};
 
 use serde::{Deserialize, Serialize};

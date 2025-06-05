@@ -1,13 +1,14 @@
 use http::uri::Authority;
 use serde::Deserialize;
+use serde_json::Value;
 use serde_with::{serde_as, DisplayFromStr};
+use siwe_recap::Capability;
 use tinycloud_lib::authorization::TinyCloudDelegation;
 use tinycloud_lib::cacaos::{
     siwe::{generate_nonce, Message, TimeStamp, Version},
     siwe_cacao::{SIWESignature, SiweCacao},
 };
 use tinycloud_lib::resource::OrbitId;
-use tinycloud_lib::siwe_recap::Builder;
 
 use crate::authorization::DelegationHeaders;
 
@@ -39,32 +40,31 @@ pub struct SignedMessage {
 impl TryFrom<HostConfig> for Message {
     type Error = String;
     fn try_from(c: HostConfig) -> Result<Self, String> {
-        Builder::new()
-            .with_action(
-                &"tinycloud"
-                    .parse()
-                    .map_err(|e| format!("failed to parse tinycloud as namespace: {e}"))?,
-                c.orbit_id.to_resource(None, None, None).to_string(),
-                "host".to_string(),
-            )
-            .build(Self {
-                address: c.address,
-                chain_id: c.chain_id,
-                domain: c.domain,
-                issued_at: c.issued_at,
-                uri: c
-                    .peer_id
-                    .try_into()
-                    .map_err(|e| format!("error parsing peer as a URI: {e}"))?,
-                nonce: generate_nonce(),
-                statement: None,
-                resources: vec![],
-                version: Version::V1,
-                not_before: None,
-                expiration_time: None,
-                request_id: None,
-            })
-            .map_err(|e| format!("error building Host SIWE message: {e}"))
+        let mut caps = Capability::<Value>::default();
+        caps.with_action_convert(
+            c.orbit_id.to_resource(None, None, None).to_string(),
+            "host",
+            [],
+        )
+        .map_err(|e| format!("error creating host capability: {e}"))?;
+        caps.build_message(Self {
+            address: c.address,
+            chain_id: c.chain_id,
+            domain: c.domain,
+            issued_at: c.issued_at,
+            uri: c
+                .peer_id
+                .try_into()
+                .map_err(|e| format!("error parsing peer as a URI: {e}"))?,
+            nonce: generate_nonce(),
+            statement: None,
+            resources: vec![],
+            version: Version::V1,
+            not_before: None,
+            expiration_time: None,
+            request_id: None,
+        })
+        .map_err(|e| format!("error building Host SIWE message: {e}"))
     }
 }
 
