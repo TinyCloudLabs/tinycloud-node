@@ -2,8 +2,8 @@ mod capability;
 
 pub use capability::{Capability, DecodingError, EncodingError, VerificationError};
 pub use ucan_capabilities_object::{
-    AbilityName, AbilityNameRef, AbilityNamespace, AbilityNamespaceRef, AbilityRef, CapsInner,
-    ConvertError, NotaBeneCollection,
+    Ability, AbilityName, AbilityNameRef, AbilityNamespace, AbilityNamespaceRef, AbilityRef,
+    CapsInner, ConvertError, NotaBeneCollection,
 };
 
 /// The prefix for a ReCap uri.
