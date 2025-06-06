@@ -16,17 +16,13 @@ time.workspace = true
 cacaos.workspace = true
 siwe-recap.workspace = true
 lazy_static = "1.4"
+ssi = { version = "0.12", features = ["ethereum"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 uuid = { version = "1", features = ["v4", "js"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 uuid = { version = "1", features = ["v4"] }
-
-[dependencies.ssi]
-git = "https://github.com/spruceid/ssi.git"
-rev = "82b0bf3"
-features = ["ethereum"]
 
 [dev-dependencies]
 tokio.workspace = true
