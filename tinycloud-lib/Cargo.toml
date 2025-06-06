@@ -13,8 +13,8 @@ serde_with.workspace = true
 thiserror.workspace = true
 base64.workspace = true
 time.workspace = true
-cacaos = { path = "../cacao" }
-siwe-recap = { path = "../siwe-recap" }
+cacaos.workspace = true
+siwe-recap.workspace = true
 lazy_static = "1.4"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

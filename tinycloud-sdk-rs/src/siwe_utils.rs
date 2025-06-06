@@ -2,13 +2,15 @@ use http::uri::Authority;
 use serde::Deserialize;
 use serde_json::Value;
 use serde_with::{serde_as, DisplayFromStr};
-use siwe_recap::Capability;
-use tinycloud_lib::authorization::TinyCloudDelegation;
-use tinycloud_lib::cacaos::{
-    siwe::{generate_nonce, Message, TimeStamp, Version},
-    siwe_cacao::{SIWESignature, SiweCacao},
+use tinycloud_lib::{
+    authorization::TinyCloudDelegation,
+    cacaos::{
+        siwe::{generate_nonce, Message, TimeStamp, Version},
+        siwe_cacao::{SIWESignature, SiweCacao},
+    },
+    resource::OrbitId,
+    siwe_recap::Capability,
 };
-use tinycloud_lib::resource::OrbitId;
 
 use crate::authorization::DelegationHeaders;
 
