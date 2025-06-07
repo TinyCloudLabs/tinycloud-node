@@ -92,7 +92,9 @@ impl SessionConfig {
                             .clone()
                             .to_resource(Some(service.clone()), Some(path), None)
                             .to_string(),
-                        action.into_iter().map(|a| (a, []))
+                        // TODO this is ugly, should be changed
+                        // (the self.actions type doesnt map very well to the ucan caps types)
+                        action.into_iter().map(|a| (format!("{}/{}", &service, a), []))
                     )?;
                     Ok(caps)
                 })
