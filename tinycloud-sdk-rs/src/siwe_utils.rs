@@ -45,7 +45,7 @@ impl TryFrom<HostConfig> for Message {
         let mut caps = Capability::<Value>::default();
         caps.with_action_convert(
             c.orbit_id.to_resource(None, None, None).to_string(),
-            "host",
+            "orbit/host",
             [],
         )
         .map_err(|e| format!("error creating host capability: {e}"))?;
