@@ -12,8 +12,7 @@ hex.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 reqwest = { version = "0.11", features = ["json"] }
-k256 = { version = "0.13.1", features = ["ecdsa-core", "ecdsa", "std", "serde"] }
-time.workspace = true 
+time.workspace = true
 http.workspace = true
 
 [dev-dependencies]

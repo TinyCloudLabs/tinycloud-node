@@ -3,9 +3,7 @@ use http::uri::Authority;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 use std::collections::{BTreeMap, HashMap};
-use time::{ext::NumericalDuration, Duration, OffsetDateTime};
 use tinycloud_lib::{
-    siwe_recap::{Capability, ConvertError},
     authorization::{make_invocation, InvocationError, TinyCloudInvocation},
     cacaos::{
         siwe::{generate_nonce, Message, TimeStamp, Version as SIWEVersion},
@@ -14,7 +12,8 @@ use tinycloud_lib::{
     libipld::Cid,
     resolver::DID_METHODS,
     resource::OrbitId,
-    ssi::jwk::JWK,
+    siwe_recap::{Capability, ConvertError},
+    ssi::{claims::chrono::Timelike, jwk::JWK},
 };
 
 #[serde_as]
@@ -85,19 +84,23 @@ impl SessionConfig {
             .try_fold(
                 Capability::<Value>::default(),
                 |caps, (service, actions)| {
-                    actions.into_iter().try_fold(caps, |mut caps, (path, action)| {
-                    // weird type here cos we aren't using note benes
-                    caps.with_actions_convert::<_, _, [BTreeMap<String, Value>; 0]>(
-                        self.orbit_id
-                            .clone()
-                            .to_resource(Some(service.clone()), Some(path), None)
-                            .to_string(),
-                        // TODO this is ugly, should be changed
-                        // (the self.actions type doesnt map very well to the ucan caps types)
-                        action.into_iter().map(|a| (format!("{}/{}", &service, a), []))
-                    )?;
-                    Ok(caps)
-                })
+                    actions
+                        .into_iter()
+                        .try_fold(caps, |mut caps, (path, action)| {
+                            // weird type here cos we aren't using note benes
+                            caps.with_actions_convert::<_, _, [BTreeMap<String, Value>; 0]>(
+                                self.orbit_id
+                                    .clone()
+                                    .to_resource(Some(service.clone()), Some(path), None)
+                                    .to_string(),
+                                // TODO this is ugly, should be changed
+                                // (the self.actions type doesnt map very well to the ucan caps types)
+                                action
+                                    .into_iter()
+                                    .map(|a| (format!("{}/{}", &service, a), [])),
+                            )?;
+                            Ok(caps)
+                        })
                 },
             )
             .map_err(|e: ConvertError<_, _>| format!("error building capabilities: {e}"))?
@@ -130,15 +133,14 @@ impl Session {
         self,
         actions: Vec<(String, String, String)>,
     ) -> Result<TinyCloudInvocation, InvocationError> {
+        use tinycloud_lib::ssi::claims::chrono;
         let targets = actions
             .into_iter()
             .map(|(s, p, a)| self.orbit_id.clone().to_resource(Some(s), Some(p), Some(a)));
-        let now = OffsetDateTime::now_utc();
-        let nanos = now.nanosecond();
-        let unix = now.unix_timestamp();
+        // we have to use chrono here because the time crate doesnt support "now_utc" in wasm
+        let now = chrono::Utc::now();
         // 60 seconds in the future
-        let exp = (unix.seconds() + Duration::nanoseconds(nanos.into()) + Duration::MINUTE)
-            .as_seconds_f64();
+        let exp = ((now.timestamp() * 1_000_000) + now.nanosecond() as i64) as f64 / 1_000_000.0;
         make_invocation(
             targets.collect(),
             self.delegation_cid,
