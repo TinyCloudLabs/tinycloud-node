@@ -423,7 +423,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         .filter_map(|(_, e)| match e {
             Event::Delegation(d) => Some(d.0.capabilities.iter().filter_map(|c| {
                 match (&c.resource, c.action.as_str()) {
-                    (Resource::TinyCloud(r), "host")
+                    (Resource::TinyCloud(r), "orbit/host")
                         if r.path().is_none()
                             && r.service().is_none()
                             && r.fragment().is_none() =>
