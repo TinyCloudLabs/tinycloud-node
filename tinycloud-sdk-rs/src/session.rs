@@ -140,7 +140,7 @@ impl Session {
         // we have to use chrono here because the time crate doesnt support "now_utc" in wasm
         let now = chrono::Utc::now();
         // 60 seconds in the future
-        let exp = (now.timestamp() as f64) + (now.nanosecond() as f64 / 1_000_000_000.0);
+        let exp = ((now.timestamp() + 60i64) as f64) + (now.nanosecond() as f64 / 1_000_000_000.0);
         make_invocation(
             targets.collect(),
             self.delegation_cid,
