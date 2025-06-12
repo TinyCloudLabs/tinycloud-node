@@ -10,11 +10,11 @@ repository = "https://github.com/spruceid/siwe-recap/"
 [dependencies]
 base64.workspace = true
 iri-string.workspace = true
-siwe = { path = "../siwe" }
+siwe.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 serde_with.workspace = true
 thiserror.workspace = true
 libipld.workspace = true
-ucan-capabilities-object = { git = "https://github.com/tinycloudlabs/ucan-capabilities-object" }
+ucan-capabilities-object.workspace = true
 serde_jcs = "0.1"

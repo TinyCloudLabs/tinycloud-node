@@ -2366,7 +2366,7 @@ dependencies = [
 [[package]]
 name = "did-ethr"
 version = "0.3.2"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "hex",
  "iref",
@@ -2381,7 +2381,7 @@ dependencies = [
 [[package]]
 name = "did-ion"
 version = "0.3.2"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "base64 0.22.1",
  "iref",
@@ -2402,7 +2402,7 @@ dependencies = [
 [[package]]
 name = "did-jwk"
 version = "0.2.1"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "async-trait",
  "iref",
@@ -2420,7 +2420,7 @@ dependencies = [
 [[package]]
 name = "did-method-key"
 version = "0.3.1"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "bs58 0.4.0",
  "iref",
@@ -2440,7 +2440,7 @@ dependencies = [
 [[package]]
 name = "did-pkh"
 version = "0.3.2"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "async-trait",
  "bech32",
@@ -2460,7 +2460,7 @@ dependencies = [
 [[package]]
 name = "did-tz"
 version = "0.3.2"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "async-trait",
  "bs58 0.4.0",
@@ -2482,7 +2482,7 @@ dependencies = [
 [[package]]
 name = "did-web"
 version = "0.3.4"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "http 0.2.12",
  "iref",
@@ -3246,9 +3246,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermit-abi"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f154ce46856750ed433c8649605bf7ed2de3bc35fd9d2a9f30cddd873c80cb08"
+checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
 name = "hex"
@@ -4536,9 +4536,9 @@ dependencies = [
 
 [[package]]
 name = "memchr"
-version = "2.7.4"
+version = "2.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78ca9ab1a0babb1e7d5695e3530886289c18cf2f87ec19a575a0abdce112e3a3"
+checksum = "32a282da65faaf38286cf3be983213fcf1d2e2a58700e808f83f4ea9a4804bc0"
 
 [[package]]
 name = "mime"
@@ -5203,7 +5203,7 @@ checksum = "bc838d2a56b5b1a6c25f55575dfc605fabb63bb2365f6c2353ef9159aa69e4a5"
 dependencies = [
  "cfg-if",
  "libc",
- "redox_syscall 0.5.12",
+ "redox_syscall 0.5.13",
  "smallvec",
  "windows-targets 0.52.6",
 ]
@@ -5783,9 +5783,9 @@ dependencies = [
 
 [[package]]
 name = "redox_syscall"
-version = "0.5.12"
+version = "0.5.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "928fca9cf2aa042393a8325b9ead81d2f0df4cb12e1e24cef072922ccd99c5af"
+checksum = "0d04b7d0ee6b4a0207a0a7adb104d23ecb0b47d6beae7152d0fa34b692b29fd6"
 dependencies = [
  "bitflags 2.9.1",
 ]
@@ -7230,7 +7230,7 @@ dependencies = [
 [[package]]
 name = "ssi"
 version = "0.12.0"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "document-features",
  "ssi-caips",
@@ -7256,7 +7256,7 @@ dependencies = [
 [[package]]
 name = "ssi-caips"
 version = "0.2.2"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "bs58 0.4.0",
  "linked-data",
@@ -7269,7 +7269,7 @@ dependencies = [
 [[package]]
 name = "ssi-claims"
 version = "0.4.0"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "educe 0.4.23",
  "iref",
@@ -7302,7 +7302,7 @@ dependencies = [
 [[package]]
 name = "ssi-claims-core"
 version = "0.1.3"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "chrono",
  "educe 0.4.23",
@@ -7317,12 +7317,12 @@ dependencies = [
 [[package]]
 name = "ssi-contexts"
 version = "0.1.10"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 
 [[package]]
 name = "ssi-core"
 version = "0.2.3"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "async-trait",
  "pin-project",
@@ -7333,7 +7333,7 @@ dependencies = [
 [[package]]
 name = "ssi-cose"
 version = "0.1.0"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "ciborium",
  "coset",
@@ -7346,7 +7346,7 @@ dependencies = [
 [[package]]
 name = "ssi-crypto"
 version = "0.2.1"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "async-trait",
  "bs58 0.4.0",
@@ -7371,7 +7371,7 @@ dependencies = [
 [[package]]
 name = "ssi-data-integrity"
 version = "0.2.0"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "chrono",
  "iref",
@@ -7399,7 +7399,7 @@ dependencies = [
 [[package]]
 name = "ssi-data-integrity-core"
 version = "0.3.0"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "chrono",
  "contextual",
@@ -7434,7 +7434,7 @@ dependencies = [
 [[package]]
 name = "ssi-data-integrity-suites"
 version = "0.2.0"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -7483,7 +7483,7 @@ dependencies = [
 [[package]]
 name = "ssi-di-sd-primitives"
 version = "0.2.1"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "base64 0.22.1",
  "digest 0.10.7",
@@ -7505,7 +7505,7 @@ dependencies = [
 [[package]]
 name = "ssi-dids"
 version = "0.2.1"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "did-ethr",
  "did-ion",
@@ -7522,7 +7522,7 @@ dependencies = [
 [[package]]
 name = "ssi-dids-core"
 version = "0.1.3"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "async-trait",
  "iref",
@@ -7546,7 +7546,7 @@ dependencies = [
 [[package]]
 name = "ssi-eip712"
 version = "0.1.1"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "hex",
  "indexmap 2.9.0",
@@ -7564,7 +7564,7 @@ dependencies = [
 [[package]]
 name = "ssi-json-ld"
 version = "0.3.2"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "combination",
  "iref",
@@ -7582,7 +7582,7 @@ dependencies = [
 [[package]]
 name = "ssi-jwk"
 version = "0.3.2"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "base64 0.22.1",
  "blake2b_simd 0.5.11",
@@ -7614,7 +7614,7 @@ dependencies = [
 [[package]]
 name = "ssi-jws"
 version = "0.3.1"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "base64 0.22.1",
  "blake2",
@@ -7641,7 +7641,7 @@ dependencies = [
 [[package]]
 name = "ssi-jwt"
 version = "0.3.1"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "async-trait",
  "chrono",
@@ -7664,7 +7664,7 @@ dependencies = [
 [[package]]
 name = "ssi-multicodec"
 version = "0.2.0"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "csv",
  "ed25519-dalek",
@@ -7678,7 +7678,7 @@ dependencies = [
 [[package]]
 name = "ssi-rdf"
 version = "0.1.1"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "combination",
  "indexmap 2.9.0",
@@ -7692,7 +7692,7 @@ dependencies = [
 [[package]]
 name = "ssi-sd-jwt"
 version = "0.3.1"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "base64 0.22.1",
  "indexmap 2.9.0",
@@ -7711,7 +7711,7 @@ dependencies = [
 [[package]]
 name = "ssi-security"
 version = "0.1.0"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "iref",
  "linked-data",
@@ -7724,7 +7724,7 @@ dependencies = [
 [[package]]
 name = "ssi-ssh"
 version = "0.2.1"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "sshkeys",
  "ssi-jwk",
@@ -7734,7 +7734,7 @@ dependencies = [
 [[package]]
 name = "ssi-status"
 version = "0.5.0"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "base64 0.22.1",
  "flate2",
@@ -7763,13 +7763,12 @@ dependencies = [
 [[package]]
 name = "ssi-ucan"
 version = "0.2.2"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "base64 0.22.1",
  "bs58 0.4.0",
  "chrono",
  "hex",
- "iref",
  "libipld",
  "multibase 0.9.1",
  "serde",
@@ -7783,12 +7782,13 @@ dependencies = [
  "ssi-jwt",
  "ssi-verification-methods",
  "thiserror 1.0.69",
+ "ucan-capabilities-object",
 ]
 
 [[package]]
 name = "ssi-vc"
 version = "0.6.1"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "base64 0.22.1",
  "bitvec 0.20.4",
@@ -7818,7 +7818,7 @@ dependencies = [
 [[package]]
 name = "ssi-vc-jose-cose"
 version = "0.4.0"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "base64 0.22.1",
  "ciborium",
@@ -7838,7 +7838,7 @@ dependencies = [
 [[package]]
 name = "ssi-verification-methods"
 version = "0.1.3"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "async-trait",
  "derivative",
@@ -7876,7 +7876,7 @@ dependencies = [
 [[package]]
 name = "ssi-verification-methods-core"
 version = "0.1.2"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "bs58 0.4.0",
  "educe 0.4.23",
@@ -7900,7 +7900,7 @@ dependencies = [
 [[package]]
 name = "ssi-zcap-ld"
 version = "0.5.0"
-source = "git+https://github.com/chunningham/ssi?branch=fix%2Fucans#8cca70b7d80406e92fbe42f4e4611b34724364fc"
+source = "git+https://github.com/chunningham/ssi?branch=feat%2Fupdate-ucan-impl#376f603ed2a37ba20bd1fea7be7cb85d05960c81"
 dependencies = [
  "async-trait",
  "iref",
@@ -8339,6 +8339,7 @@ dependencies = [
  "thiserror 2.0.12",
  "time",
  "tokio",
+ "ucan-capabilities-object",
  "uuid",
 ]
 
@@ -8350,6 +8351,7 @@ dependencies = [
  "base64 0.22.1",
  "hex",
  "http 1.3.1",
+ "iri-string",
  "reqwest 0.11.27",
  "serde",
  "serde_json",
@@ -8794,8 +8796,8 @@ dependencies = [
 
 [[package]]
 name = "ucan-capabilities-object"
-version = "0.1.0"
-source = "git+https://github.com/tinycloudlabs/ucan-capabilities-object#ae48e50a766103b1e9f1b4d1e45e06d2f50d1945"
+version = "0.2.0"
+source = "git+https://github.com/tinycloudlabs/ucan-capabilities-object#bfffcb2e48628c15756a1daa5c00882bcef85ae0"
 dependencies = [
  "iri-string",
  "nutype",
@@ -9148,7 +9150,7 @@ version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6994d13118ab492c3c80c1f81928718159254c53c472bf9ce36f8dae4add02a7"
 dependencies = [
- "redox_syscall 0.5.12",
+ "redox_syscall 0.5.13",
  "wasite",
  "web-sys",
 ]
@@ -9221,9 +9223,9 @@ dependencies = [
 
 [[package]]
 name = "windows-link"
-version = "0.1.1"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76840935b766e1b0a05c0066835fb9ec80071d4c09a16f6bd5f7e655e3c14c38"
+checksum = "5e6ad25900d524eaabdbbb96d20b4311e1e7ae1699af4fb28c17ae66c80d798a"
 
 [[package]]
 name = "windows-registry"
