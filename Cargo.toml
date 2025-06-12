@@ -54,8 +54,7 @@ members = [
     "tinycloud-core",
     "siwe",
     "siwe-recap",
-    "cacao",
-    "ucan-capabilities"
+    "cacao"
 ]
 
 exclude = [

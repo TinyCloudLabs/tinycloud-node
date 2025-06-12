@@ -8795,11 +8795,11 @@ dependencies = [
 [[package]]
 name = "ucan-capabilities-object"
 version = "0.1.0"
+source = "git+https://github.com/tinycloudlabs/ucan-capabilities-object#ae48e50a766103b1e9f1b4d1e45e06d2f50d1945"
 dependencies = [
  "iri-string",
  "nutype",
  "serde",
- "serde_json",
  "thiserror 2.0.12",
 ]
 
