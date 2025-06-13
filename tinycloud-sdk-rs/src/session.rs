@@ -2,18 +2,12 @@ use crate::authorization::DelegationHeaders;
 use http::uri::Authority;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
-use std::collections::{BTreeMap, HashMap};
+use std::{collections::{BTreeMap, HashMap}, str::FromStr};
 use tinycloud_lib::{
-    authorization::{make_invocation, InvocationError, TinyCloudInvocation},
-    cacaos::{
+    authorization::{make_invocation, InvocationError as LibInvocationError, TinyCloudInvocation}, cacaos::{
         siwe::{generate_nonce, Message, TimeStamp, Version as SIWEVersion},
         siwe_cacao::SIWESignature,
-    },
-    libipld::Cid,
-    resolver::DID_METHODS,
-    resource::OrbitId,
-    siwe_recap::{Capability, ConvertError},
-    ssi::{claims::chrono::Timelike, jwk::JWK},
+    }, libipld::Cid, resolver::DID_METHODS, resource::{OrbitId, ResourceUriErr}, siwe_recap::{Capability, ConvertError}, ssi::{claims::chrono::Timelike, jwk::JWK}, ucan_capabilities_object::{Ability, Capabilities}
 };
 
 #[serde_as]
@@ -128,21 +122,52 @@ impl SessionConfig {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum InvocationError<T = ResourceUriErr, A = <Ability as FromStr>::Err>
+    where
+        T: std::fmt::Display,
+        A: std::fmt::Display,
+{
+    #[error(transparent)]
+    InvocationCreation(#[from] LibInvocationError),
+    #[error("Invalid target: {0}")]
+    InvalidTarget(T),
+    #[error("Invalid action: {0}")]
+    InvalidAction(A),
+}
+
+impl <T, A>From<ConvertError<T, A>> for InvocationError<T, A>
+    where
+        T: std::fmt::Display,
+        A: std::fmt::Display,
+{
+    fn from(err: ConvertError<T, A>) -> Self {
+        match err {
+            ConvertError::A(e) => InvocationError::InvalidTarget(e),
+            ConvertError::B(e) => InvocationError::InvalidAction(e),
+        }
+    }
+}
+
 impl Session {
-    pub async fn invoke(
+    pub async fn invoke<F: Serialize, C: Serialize>(
         self,
         actions: Vec<(String, String, String)>,
-    ) -> Result<TinyCloudInvocation, InvocationError> {
+    ) -> Result<TinyCloudInvocation<F, C>, InvocationError> {
         use tinycloud_lib::ssi::claims::chrono;
         let targets = actions
             .into_iter()
-            .map(|(s, p, a)| self.orbit_id.clone().to_resource(Some(s), Some(p), Some(a)));
+            .try_fold(Capabilities::<C>::new(), |mut caps, (s, p, a)| {
+                let ab = format!("{s}/{a}");
+                caps.with_action_convert(self.orbit_id.clone().to_resource(Some(s), Some(p), None), ab, [])?;
+                Ok::<Capabilities<C>, ConvertError<ResourceUriErr, <Ability as FromStr>::Err>>(caps)
+            })?;
         // we have to use chrono here because the time crate doesnt support "now_utc" in wasm
         let now = chrono::Utc::now();
         // 60 seconds in the future
         let exp = ((now.timestamp() + 60i64) as f64) + (now.nanosecond() as f64 / 1_000_000_000.0);
-        make_invocation(
-            targets.collect(),
+        Ok(make_invocation::<F, C>(
+            targets,
             self.delegation_cid,
             &self.jwk,
             self.verification_method,
@@ -150,7 +175,7 @@ impl Session {
             None,
             None,
         )
-        .await
+        .await?)
     }
 }
 
@@ -233,6 +258,7 @@ pub enum Error {
 pub mod test {
     use super::*;
     use serde_json::json;
+    use tinycloud_lib::{libipld::{codec::Codec, json::DagJsonCodec}, ssi::{self, claims::jws::split_jws}};
     pub async fn test_session() -> Session {
         let config = json!({
             "actions": { "kv": { "path": vec!["put", "get", "list", "del", "metadata"] },
@@ -259,10 +285,18 @@ pub mod test {
 
     #[tokio::test]
     async fn create_session_and_invoke() {
-        test_session()
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let inv = test_session()
             .await
             .invoke(vec![("kv".into(), "path".into(), "get".into())])
             .await
             .expect("failed to create invocation");
+        let encoded = inv.encode().unwrap();
+        println!("{}", encoded);
+        let parts = split_jws(&encoded).unwrap();
+        let payload = URL_SAFE_NO_PAD.decode(parts.1).unwrap();
+        println!("{}", String::from_utf8(payload.to_vec()).unwrap());
+        let i: ssi::ucan::Payload = DagJsonCodec.decode(&payload).unwrap();
+        println!("{:?}", i);
     }
 }

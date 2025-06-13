@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tinycloud_lib::authorization::{TinyCloudDelegation, TinyCloudInvocation};
 
-use crate::session::Session;
+use crate::session::{Session, InvocationError};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DelegationHeaders {
@@ -23,8 +23,7 @@ impl InvocationHeaders {
         Ok(Self {
             invocation: session
                 .invoke(actions)
-                .await
-                .map_err(Error::FailedToMakeInvocation)?,
+                .await?,
         })
     }
 }
@@ -38,7 +37,7 @@ impl DelegationHeaders {
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("failed to generate proof for invocation: {0}")]
-    FailedToMakeInvocation(tinycloud_lib::authorization::InvocationError),
+    FailedToMakeInvocation(#[from] InvocationError),
     #[error("failed to translate response to JSON: {0}")]
     JSONSerializing(serde_json::Error),
     #[error("failed to parse session from JSON: {0}")]
