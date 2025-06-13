@@ -1,7 +1,5 @@
-use crate::resource::{ResourceCapErr, ResourceId};
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use cacaos::siwe_cacao::SiweCacao;
-use iri_string::validate::Error as UriStringError;
 use libipld::{cbor::DagCborCodec, prelude::*};
 use ssi::{
     claims::jwt::NumericDate,
@@ -10,8 +8,10 @@ use ssi::{
     ucan::{Payload, Ucan},
 };
 use std::str::FromStr;
-use time::error::ComponentRange as TimestampRangeError;
 use uuid::Uuid;
+use ucan_capabilities_object::Capabilities;
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 
 pub use libipld::Cid;
 
@@ -23,12 +23,16 @@ pub trait HeaderEncode {
 }
 
 #[derive(Clone, Debug)]
-pub enum TinyCloudDelegation {
-    Ucan(Box<Ucan>),
+pub enum TinyCloudDelegation<F = JsonValue, C = JsonValue> {
+    Ucan(Box<Ucan<F, C>>),
     Cacao(Box<SiweCacao>),
 }
 
-impl HeaderEncode for TinyCloudDelegation {
+impl <F, C>HeaderEncode for TinyCloudDelegation<F, C>
+where
+    for <'de> F: Serialize + Deserialize<'de>,
+    for <'de> C: Serialize + Deserialize<'de>,
+{
     fn encode(&self) -> Result<String, EncodingError> {
         use std::ops::Deref;
         Ok(match self {
@@ -54,7 +58,11 @@ impl HeaderEncode for TinyCloudDelegation {
     }
 }
 
-impl TinyCloudDelegation {
+impl <F, C>TinyCloudDelegation<F, C>
+where
+    for <'de> F: Deserialize<'de>,
+    for <'de> C: Deserialize<'de>,
+{
     pub fn from_bytes(b: &[u8]) -> Result<Self, EncodingError> {
         match DagCborCodec.decode(b) {
             Ok(cacao) => Ok(Self::Cacao(Box::new(cacao))),
@@ -67,9 +75,13 @@ impl TinyCloudDelegation {
 
 // turn everything into url safe, b64-cacao or jwt
 
-pub type TinyCloudInvocation = Ucan;
+pub type TinyCloudInvocation<F = JsonValue, C = JsonValue> = Ucan<F, C>;
 
-impl HeaderEncode for TinyCloudInvocation {
+impl <F, C>HeaderEncode for TinyCloudInvocation<F, C>
+where
+    for <'de> F: Serialize + Deserialize<'de>,
+    for <'de> C: Serialize + Deserialize<'de>,
+{
     fn encode(&self) -> Result<String, EncodingError> {
         Ok(self.encode()?)
     }
@@ -97,15 +109,15 @@ impl HeaderEncode for TinyCloudRevocation {
     }
 }
 
-pub async fn make_invocation(
-    invocation_target: Vec<ResourceId>,
+pub async fn make_invocation<F: Serialize, C: Serialize>(
+    invocation_target: Capabilities<C>,
     delegation: Cid,
     jwk: &JWK,
     verification_method: String,
     expiration: f64,
     not_before: Option<f64>,
     nonce: Option<String>,
-) -> Result<Ucan, InvocationError> {
+) -> Result<Ucan<F, C>, InvocationError> {
     Ok(Payload {
         issuer: DIDURLBuf::from_str(&verification_method)?,
         audience: DIDBuf::from_str(
@@ -120,26 +132,17 @@ pub async fn make_invocation(
         nonce: Some(nonce.unwrap_or_else(|| format!("urn:uuid:{}", Uuid::new_v4()))),
         facts: None,
         proof: vec![delegation.into()],
-        attenuation: invocation_target
-            .into_iter()
-            .map(|t| t.try_into())
-            .collect::<Result<Vec<ssi::ucan::Capability>, _>>()?,
+        attenuation: invocation_target,
     }
     .sign(jwk.get_algorithm().unwrap_or_default(), jwk)?)
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum InvocationError {
-    #[error(transparent)]
-    ResourceCap(#[from] ResourceCapErr),
-    #[error("Timestamp component out of range: {0}")] // Add variant for ComponentRange
-    TimestampRange(#[from] TimestampRangeError),
     #[error("Invalid date format: {0}")]
     NumericDateConversionError(#[from] ssi::claims::jwt::NumericDateConversionError),
     #[error(transparent)]
     UCAN(#[from] ssi::ucan::error::Error),
-    #[error(transparent)]
-    UriString(#[from] UriStringError),
     #[error("Invalid DID URL: {0}")]
     InvalidDIDURL(#[from] InvalidDIDURL<String>),
     #[error("Invalid DID: {0}")]

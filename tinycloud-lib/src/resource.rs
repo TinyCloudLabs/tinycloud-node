@@ -9,11 +9,7 @@ use libipld::{
     error::Error as IpldError,
 };
 use serde_with::{DeserializeFromStr, SerializeDisplay};
-use ssi::{
-    dids::{DIDBuf, DIDURLBuf as DIDURL, DID},
-    json_ld::iref::UriBuf,
-    ucan::{Capability, UcanResource, UcanScope},
-};
+use ssi::dids::{DIDBuf, DIDURLBuf as DIDURL, DID};
 
 use std::io::{Read, Seek, Write};
 use std::{convert::TryFrom, fmt, str::FromStr};
@@ -142,49 +138,27 @@ impl ResourceId {
 }
 
 #[derive(Error, Debug)]
-pub enum ResourceCapErr {
-    #[error("Missing ResourceId fragment")]
-    MissingAction,
-    #[error("Invalid URI string for capability: {0}")]
-    CapabilityUriParse(#[from] ssi::json_ld::iref::uri::InvalidUri<String>), // Add From implementation
+pub enum ResourceUriErr {
+    #[error("Missing Service with Path")]
+    MissingServiceWithPath,
+    #[error("Invalid URI string for resource (should never happen): {0}")]
+    InvalidIri(#[from] iri_string::validate::Error),
 }
 
-impl TryInto<Capability> for ResourceId {
-    type Error = ResourceCapErr;
-    fn try_into(self) -> Result<Capability, Self::Error> {
-        Ok(Capability {
-            with: UcanResource::URI(UriBuf::from_str(&format!(
-                "{}/{}{}",
-                &self.orbit,
-                &self.service.as_deref().unwrap_or(""),
-                &self.path.as_deref().unwrap_or("")
-            ))?), // Error automatically converted via From
-            can: UcanScope {
-                namespace: match self.service {
-                    Some(s) => format!("tinycloud.{s}"),
-                    None => "tinycloud".to_string(),
-                },
-                capability: self.fragment.ok_or(ResourceCapErr::MissingAction)?,
-            },
-            additional_fields: None,
-        })
+impl TryInto<UriString> for ResourceId {
+    type Error = ResourceUriErr;
+    fn try_into(self) -> Result<UriString, Self::Error> {
+        if self.service.is_none() && self.path.is_some() {
+            return Err(ResourceUriErr::MissingServiceWithPath);
+        }
+        Ok(self.to_string().parse()?)
     }
 }
 
-impl<T> TryFrom<&Capability<T>> for ResourceId {
+impl TryFrom<&UriString> for ResourceId {
     type Error = KRIParseError;
-    fn try_from(c: &Capability<T>) -> Result<Self, Self::Error> {
-        let n = &c.can.namespace;
-        let mut r = Self::from_str(&c.with.to_string())?;
-        if n.starts_with("tinycloud")
-            && ((n.get(9..10) == Some(".") && n.get(10..) == r.service.as_deref())
-                || (n.get(9..10).is_none() && r.service.is_none()))
-        {
-            r.fragment = Some(c.can.capability.clone());
-            Ok(r)
-        } else {
-            Err(KRIParseError::IncorrectForm)
-        }
+    fn try_from(c: &UriString) -> Result<Self, Self::Error> {
+        c.as_str().parse()
     }
 }
 
@@ -373,7 +347,13 @@ mod tests {
         let did: DIDURL = "did:pkh:eth:0xb1fef8ed913821b941a76de9fc7c41b90de3d37f#default"
             .parse()
             .unwrap();
-        let _ = OrbitId::try_from(did).unwrap();
+        let orbit_id = OrbitId::try_from(did).unwrap();
+        println!("{}", orbit_id);
+
+        let _: OrbitId =
+            "tinycloud:pkh:eip155:1:0x2E9760A079df62AF9815c697d015E70A5bAb9a28://default"
+                .parse()
+                .unwrap();
     }
 
     #[test]

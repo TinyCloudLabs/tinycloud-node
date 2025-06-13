@@ -6,3 +6,4 @@ pub use cacaos;
 pub use libipld;
 pub use siwe_recap;
 pub use ssi;
+pub use ucan_capabilities_object;
