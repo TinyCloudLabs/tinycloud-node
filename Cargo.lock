@@ -8308,6 +8308,7 @@ dependencies = [
  "async-std",
  "dashmap",
  "futures",
+ "iri-string",
  "libp2p",
  "pin-project",
  "sea-orm",
@@ -8319,6 +8320,7 @@ dependencies = [
  "time",
  "tinycloud-lib",
  "tokio",
+ "ucan-capabilities-object",
 ]
 
 [[package]]

@@ -1,9 +1,8 @@
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq, Default)]
-pub struct Caveats(pub BTreeMap<String, serde_json::Value>);
+pub struct Caveats(pub Vec<serde_json::Value>);
 
 impl From<Caveats> for Value {
     fn from(source: Caveats) -> Self {

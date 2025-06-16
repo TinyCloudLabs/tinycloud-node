@@ -1,5 +1,6 @@
 use crate::types::Resource;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use time::OffsetDateTime;
 use tinycloud_lib::siwe_recap::{Capability as SiweCap, VerificationError as SiweError};
 use tinycloud_lib::{
@@ -7,8 +8,8 @@ use tinycloud_lib::{
     cacaos::siwe::Message,
     libipld::Cid,
     resource::OrbitId,
-    ssi::ucan::Capability as UcanCap,
 };
+use ucan_capabilities_object::{Ability, Capabilities};
 
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Capability {
@@ -27,40 +28,13 @@ pub enum CapExtractError {
     Cid(#[from] tinycloud_lib::libipld::cid::Error),
 }
 
-fn extract_ucan_cap<T>(c: &UcanCap<T>) -> Result<Capability, CapExtractError> {
-    Ok(Capability {
-        resource: c.with.to_string().into(),
-        action: c.can.capability.clone(),
-    })
-}
-
-fn extract_siwe_cap(c: SiweCap<()>) -> Result<(Vec<Capability>, Vec<Cid>), CapExtractError> {
-    Ok((
-        c.abilities()
-            .iter() // Iterate over the BTreeMap provided by abilities()
-            .flat_map(|(r, acs)| {
-                // r is &UriString, acs is &BTreeMap<Ability, NotaBeneCollection<()>>
-                acs.keys() // Iterate over Ability keys
-                    .map(|action| Capability {
-                        // action is &Ability
-                        resource: Resource::from(r.to_string()), // Convert RiString to String before From
-                        action: action.to_string(),              // Convert Ability to String
-                    })
-                    .collect::<Vec<Capability>>()
-            })
-            .collect(),
-        // Access proof CIDs directly via the proof() method
-        c.proof().to_vec(),
-    ))
-}
-
 #[derive(Debug, Clone)]
-pub struct DelegationInfo {
-    pub capabilities: Vec<Capability>,
+pub struct DelegationInfo<F = JsonValue, C = JsonValue> {
+    pub capabilities: Capabilities<C>,
     pub delegator: String,
     pub delegate: String,
     pub parents: Vec<Cid>,
-    pub delegation: TinyCloudDelegation,
+    pub delegation: TinyCloudDelegation<F, C>,
     pub expiry: Option<OffsetDateTime>,
     pub not_before: Option<OffsetDateTime>,
     pub issued_at: Option<OffsetDateTime>,
@@ -94,12 +68,7 @@ impl TryFrom<TinyCloudDelegation> for DelegationInfo {
     fn try_from(d: TinyCloudDelegation) -> Result<Self, Self::Error> {
         Ok(match d {
             TinyCloudDelegation::Ucan(ref u) => Self {
-                capabilities: u
-                    .payload
-                    .attenuation
-                    .iter()
-                    .map(extract_ucan_cap)
-                    .collect::<Result<Vec<Capability>, CapExtractError>>()?,
+                capabilities: u.payload.attenuation,
                 delegator: u.payload.issuer.to_string(),
                 delegate: u.payload.audience.to_string(),
                 parents: u.payload.proof.clone(),
@@ -148,8 +117,8 @@ impl TryFrom<TinyCloudDelegation> for DelegationInfo {
 }
 
 #[derive(Debug, Clone)]
-pub struct InvocationInfo {
-    pub capabilities: Vec<Capability>,
+pub struct InvocationInfo<C> {
+    pub capabilities: Capabilities<C>,
     pub invoker: String,
     pub parents: Vec<Cid>,
     pub invocation: TinyCloudInvocation,
