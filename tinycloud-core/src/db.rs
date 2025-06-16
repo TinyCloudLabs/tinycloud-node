@@ -272,7 +272,7 @@ where
                     .and_then(|r| Some((r.orbit(), r.service()?, normalize_path(r.path()?)))),
                 cap.action.as_str(),
             ) {
-                (Some((orbit, "kv", path)), "get") => results.push(InvocationOutcome::KvRead(
+                (Some((orbit, "kv", path)), "kv/get") => results.push(InvocationOutcome::KvRead(
                     get_kv(&tx, &self.storage, orbit, path)
                         .await
                         .map_err(|e| match e {
@@ -280,10 +280,10 @@ where
                             EitherError::B(e) => TxStoreError::StoreRead(e),
                         })?,
                 )),
-                (Some((orbit, "kv", path)), "list") => {
+                (Some((orbit, "kv", path)), "kv/list") => {
                     results.push(InvocationOutcome::KvList(list(&tx, orbit, path).await?))
                 }
-                (Some((orbit, "kv", path)), "del") => {
+                (Some((orbit, "kv", path)), "kv/del") => {
                     let kv = get_kv_entity(&tx, orbit, path).await?;
                     if let Some(kv) = kv {
                         self.storage
@@ -293,7 +293,7 @@ where
                     }
                     results.push(InvocationOutcome::KvDelete)
                 }
-                (Some((orbit, "kv", path)), "put") => {
+                (Some((orbit, "kv", path)), "kv/put") => {
                     if let Some(stage) = stages.remove(&(orbit.clone(), path.to_string())) {
                         self.storage
                             .persist(orbit, stage)
@@ -302,10 +302,10 @@ where
                         results.push(InvocationOutcome::KvWrite)
                     }
                 }
-                (Some((orbit, "kv", path)), "metadata") => results.push(
+                (Some((orbit, "kv", path)), "kv/metadata") => results.push(
                     InvocationOutcome::KvMetadata(metadata(&tx, orbit, path).await?),
                 ),
-                (Some((orbit, "capabilities", "all")), "read") => results.push(
+                (Some((orbit, "capabilities", "all")), "kv/read") => results.push(
                     InvocationOutcome::OpenSessions(get_valid_delegations(&tx, orbit).await?),
                 ),
                 _ => {}

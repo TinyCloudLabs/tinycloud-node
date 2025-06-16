@@ -25,12 +25,19 @@ pub enum CapExtractError {
     InvalidFields,
     #[error(transparent)]
     Cid(#[from] tinycloud_lib::libipld::cid::Error),
+    #[error("Incorrect UCAN action namespace")]
+    UcanNamespace,
 }
 
 fn extract_ucan_cap<T>(c: &UcanCap<T>) -> Result<Capability, CapExtractError> {
     Ok(Capability {
         resource: c.with.to_string().into(),
-        action: c.can.capability.clone(),
+        action: c
+            .can
+            .to_string()
+            .strip_prefix("tinycloud.")
+            .ok_or_else(|| CapExtractError::UcanNamespace)?
+            .to_string(),
     })
 }
 
