@@ -219,7 +219,7 @@ where
                 .and_then(|r| Some((r.service()?, cap.action.as_str(), r.orbit(), r.path()?)))
             {
                 // stage inputs for content writes
-                Some(("kv", "put", orbit, path)) => {
+                Some(("kv", "kv/put", orbit, path)) => {
                     let (metadata, mut stage) = inputs
                         .remove(&(orbit.clone(), path.to_string()))
                         .ok_or(TxStoreError::MissingInput)?;
@@ -238,7 +238,7 @@ where
                     });
                 }
                 // add delete for tx
-                Some(("kv", "del", orbit, path)) => {
+                Some(("kv", "kv/del", orbit, path)) => {
                     ops.push(Operation::KvDelete {
                         orbit: orbit.clone(),
                         key: normalize_path(path).to_string(),
