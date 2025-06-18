@@ -22,4 +22,3 @@ jobs:
         tag_semver: true
         snapshot: true
         cache: true
-        default_branch: intro-ucans
