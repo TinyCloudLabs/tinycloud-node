@@ -1,5 +1,5 @@
 [global]
-# log_level = "normal"
+# log_level = "debug"
 # address = "127.0.0.1"
 # port = 8000
 # cors = true
@@ -7,7 +7,7 @@
 ## Example of nest config variable: TINYCLOUD_STORAGE_DATABASE
 [global.storage]
     ## Set the SQL deployment for TinyCloud Protocol
-    # database = "sqlite:./caps.db"
+    # database = "sqlite:./tinycloud/caps.db"
 
     ## Set the file-staging system for TinyCloud Protocol to use
     # staging = "FileSystem"
