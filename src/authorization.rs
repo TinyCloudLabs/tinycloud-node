@@ -41,12 +41,7 @@ mod test {
         libipld::cid::Cid,
         resolver::DID_METHODS,
         ssi::{
-            did::{Document, Source},
-            did_resolve::DIDResolver,
-            jwk::{Algorithm, JWK},
-            jws::Header,
-            ucan::{Capability, Payload},
-            vc::NumericDate,
+            claims::{jws::Header, jwt::NumericDate}, dids::{DIDBuf, DIDResolver, Document}, jwk::{Algorithm, JWK}, ucan::{Capability, Payload}
         },
     };
 
@@ -58,27 +53,28 @@ mod test {
         prf: Vec<Cid>,
     ) -> (Document, Thing) {
         let did = DID_METHODS
-            .generate(&Source::KeyAndPattern(iss, "key"))
+            .generate(iss, "key")
             .unwrap();
         (
             DID_METHODS
-                .resolve(&did, &Default::default())
+                .resolve(&did)
                 .await
-                .1
-                .unwrap(),
+                .unwrap()
+                .document
+                .into_document(),
             gen_ucan((iss, did), aud, caps, exp, prf).await,
         )
     }
     async fn gen_ucan(
-        iss: (&JWK, String),
+        iss: (&JWK, DIDBuf),
         audience: String,
         attenuation: Vec<Capability>,
         exp: f64,
         proof: Vec<Cid>,
     ) -> Thing {
         let p = Payload {
-            issuer: iss.1,
-            audience,
+            issuer: iss.1.parse().unwrap(),
+            audience: audience.parse().unwrap(),
             attenuation,
             proof,
             nonce: None,
