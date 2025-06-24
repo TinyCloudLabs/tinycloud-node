@@ -50,6 +50,7 @@ impl TryFrom<HostConfig> for Message {
         )
         .map_err(|e| format!("error creating host capability: {e}"))?;
         caps.build_message(Self {
+            scheme: None,
             address: c.address,
             chain_id: c.chain_id,
             domain: c.domain,

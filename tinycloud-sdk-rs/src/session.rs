@@ -109,6 +109,7 @@ impl SessionConfig {
                 None => &[],
             })
             .build_message(Message {
+                scheme: None,
                 address: self.address,
                 chain_id: self.chain_id,
                 domain: self.domain,
@@ -170,7 +171,7 @@ pub async fn prepare_session(config: SessionConfig) -> Result<PreparedSession, E
         .ok_or_else(|| Error::UnableToGenerateSIWEMessage("Failed to calculate DID VM".into()))?
         .1
         .to_string();
-    verification_method.extend(fragment.chars());
+    verification_method.push_str(&fragment);
 
     let orbit_id = config.orbit_id.clone();
 
