@@ -374,7 +374,7 @@ async fn event_orbits<'a, C: ConnectionTrait>(
         match &e.1 {
             Event::Delegation(d) => {
                 for orbit in d.0.orbits() {
-                    let entry = orbits.entry(orbit.clone()).or_insert_with(Vec::new);
+                    let entry = orbits.entry(orbit.clone()).or_default();
                     if !entry.iter().any(|(h, _)| h == &e.0) {
                         entry.push(e);
                     }
@@ -382,7 +382,7 @@ async fn event_orbits<'a, C: ConnectionTrait>(
             }
             Event::Invocation(i, _) => {
                 for orbit in i.0.orbits() {
-                    let entry = orbits.entry(orbit.clone()).or_insert_with(Vec::new);
+                    let entry = orbits.entry(orbit.clone()).or_default();
                     if !entry.iter().any(|(h, _)| h == &e.0) {
                         entry.push(e);
                     }
@@ -394,7 +394,7 @@ async fn event_orbits<'a, C: ConnectionTrait>(
                     if r_hash == revoked.event {
                         let entry = orbits
                             .entry(revoked.orbit.0.clone())
-                            .or_insert_with(Vec::new);
+                            .or_default();
                         if !entry.iter().any(|(h, _)| h == &e.0) {
                             entry.push(e);
                         }
@@ -493,8 +493,8 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         .all(db)
         .await?
         .into_iter()
-        .fold(HashMap::new(), |mut m, (orbit, epoch)| {
-            m.entry(orbit).or_insert_with(Vec::new).push(epoch);
+        .fold(HashMap::new(), |mut m: HashMap<OrbitIdWrap, Vec<Hash>>, (orbit, epoch)| {
+            m.entry(orbit).or_default().push(epoch);
             m
         });
 

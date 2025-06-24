@@ -36,7 +36,7 @@ fn extract_ucan_cap<T>(c: &UcanCap<T>) -> Result<Capability, CapExtractError> {
             .can
             .to_string()
             .strip_prefix("tinycloud.")
-            .ok_or_else(|| CapExtractError::UcanNamespace)?
+            .ok_or(CapExtractError::UcanNamespace)?
             .to_string(),
     })
 }
