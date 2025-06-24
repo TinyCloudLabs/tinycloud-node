@@ -11,8 +11,10 @@ use tinycloud_lib::resource::OrbitId;
 
 #[derive(Debug, Default, Clone)]
 pub struct MemoryStore {
-    orbits: Arc<DashMap<OrbitId, Arc<DashMap<Hash, Vec<u8>>>>>,
+    orbits: Arc<DashMap<OrbitId, Arc<Blocks>>>,
 }
+
+type Blocks = DashMap<Hash, Vec<u8>>;
 
 #[derive(Default, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct MemoryStaging;

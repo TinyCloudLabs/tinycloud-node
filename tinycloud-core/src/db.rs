@@ -812,6 +812,6 @@ mod test {
 
     #[tokio::test]
     async fn basic() {
-        let db = get_db().await.unwrap();
+        let _db = get_db().await.unwrap();
     }
 }
