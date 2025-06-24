@@ -33,8 +33,6 @@ impl OrbitSizes {
 
 impl From<HashMap<OrbitId, u64>> for OrbitSizes {
     fn from(map: HashMap<OrbitId, u64>) -> Self {
-        Self(Arc::new(RwLock::new(
-            map.into_iter().map(|(k, v)| (k, v)).collect(),
-        )))
+        Self(Arc::new(RwLock::new(map)))
     }
 }

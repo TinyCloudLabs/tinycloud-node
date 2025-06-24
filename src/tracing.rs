@@ -32,7 +32,7 @@ impl Fairing for TracingFairing {
         let span = info_span!(parent: None, "request", trace_id = field::Empty);
         span.record(
             "trace_id",
-            &field::display(&span.context().span().span_context().trace_id()),
+            field::display(&span.context().span().span_context().trace_id()),
         );
         req.local_cache(|| Some(TracingSpan(span)));
     }

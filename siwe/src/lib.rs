@@ -307,7 +307,7 @@ impl Serialize for Message {
 struct MessageVisitor;
 
 #[cfg(feature = "serde")]
-impl<'de> Visitor<'de> for MessageVisitor {
+impl Visitor<'_> for MessageVisitor {
     type Value = Message;
 
     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -861,12 +861,12 @@ Resources:
             .unwrap(),
             statement: fields
                 .get("statement")
-                .map(|s| s.as_str().unwrap().try_into().unwrap()),
+                .map(|s| s.as_str().unwrap().into()),
             uri: fields["uri"].as_str().unwrap().try_into().unwrap(),
             version: <Version as std::str::FromStr>::from_str(fields["version"].as_str().unwrap())
                 .unwrap(),
             chain_id: fields["chainId"].as_u64().unwrap(),
-            nonce: fields["nonce"].as_str().unwrap().try_into().unwrap(),
+            nonce: fields["nonce"].as_str().unwrap().into(),
             issued_at: <TimeStamp as std::str::FromStr>::from_str(
                 fields["issuedAt"].as_str().unwrap(),
             )?,
