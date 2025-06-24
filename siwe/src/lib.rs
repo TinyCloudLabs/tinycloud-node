@@ -198,12 +198,14 @@ impl FromStr for Message {
             .next()
             .and_then(|preamble| preamble.strip_suffix(PREAMBLE))
             .ok_or(ParseError::Format("Missing Preamble Line"))?;
-        
+
         // Extract scheme and domain from the preamble line
         let (scheme, domain) = if let Some(scheme_end) = preamble_line.find("://") {
             let scheme_str = &preamble_line[..scheme_end];
             let domain_str = &preamble_line[scheme_end + 3..];
-            let scheme = Some(Scheme::try_from(scheme_str).map_err(|_| ParseError::Format("Invalid scheme"))?);
+            let scheme = Some(
+                Scheme::try_from(scheme_str).map_err(|_| ParseError::Format("Invalid scheme"))?,
+            );
             let domain = Authority::from_str(domain_str)?;
             (scheme, domain)
         } else {

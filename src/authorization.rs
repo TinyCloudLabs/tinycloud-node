@@ -41,7 +41,10 @@ mod test {
         libipld::cid::Cid,
         resolver::DID_METHODS,
         ssi::{
-            claims::{jws::Header, jwt::NumericDate}, dids::{DIDBuf, DIDResolver, Document}, jwk::{Algorithm, JWK}, ucan::{Capability, Payload}
+            claims::{jws::Header, jwt::NumericDate},
+            dids::{DIDBuf, DIDResolver, Document},
+            jwk::{Algorithm, JWK},
+            ucan::{Capability, Payload},
         },
     };
 
@@ -52,9 +55,7 @@ mod test {
         exp: f64,
         prf: Vec<Cid>,
     ) -> (Document, Thing) {
-        let did = DID_METHODS
-            .generate(iss, "key")
-            .unwrap();
+        let did = DID_METHODS.generate(iss, "key").unwrap();
         (
             DID_METHODS
                 .resolve(&did)
