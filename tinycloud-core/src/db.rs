@@ -392,9 +392,7 @@ async fn event_orbits<'a, C: ConnectionTrait>(
                 let r_hash = Hash::from(r.0.revoked);
                 for revoked in &revoked_events {
                     if r_hash == revoked.event {
-                        let entry = orbits
-                            .entry(revoked.orbit.0.clone())
-                            .or_default();
+                        let entry = orbits.entry(revoked.orbit.0.clone()).or_default();
                         if !entry.iter().any(|(h, _)| h == &e.0) {
                             entry.push(e);
                         }
@@ -493,10 +491,13 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         .all(db)
         .await?
         .into_iter()
-        .fold(HashMap::new(), |mut m: HashMap<OrbitIdWrap, Vec<Hash>>, (orbit, epoch)| {
-            m.entry(orbit).or_default().push(epoch);
-            m
-        });
+        .fold(
+            HashMap::new(),
+            |mut m: HashMap<OrbitIdWrap, Vec<Hash>>, (orbit, epoch)| {
+                m.entry(orbit).or_default().push(epoch);
+                m
+            },
+        );
 
     // get all the orderings and associated data
     let (epoch_order, orbit_order, event_order, epochs) = event_orbits

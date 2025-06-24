@@ -860,9 +860,7 @@ Resources:
                     .unwrap(),
             )
             .unwrap(),
-            statement: fields
-                .get("statement")
-                .map(|s| s.as_str().unwrap().into()),
+            statement: fields.get("statement").map(|s| s.as_str().unwrap().into()),
             uri: fields["uri"].as_str().unwrap().try_into().unwrap(),
             version: <Version as std::str::FromStr>::from_str(fields["version"].as_str().unwrap())
                 .unwrap(),
