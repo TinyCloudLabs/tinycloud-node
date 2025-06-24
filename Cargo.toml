@@ -78,6 +78,7 @@ futures = { version = "0.3", features = ["alloc", "std"] }
 pin-project = "1"
 async-trait = "0.1"
 libipld = { version = "0.16", features = ["dag-cbor", "dag-json", "derive", "serde-codec"] }
+ipld-core = { version = "0.4", features = ["serde"] }
 
 # Internal crate dependencies
 tinycloud-lib = { path = "tinycloud-lib", version = "0.2.0" }
