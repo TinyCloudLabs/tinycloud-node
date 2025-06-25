@@ -2,8 +2,8 @@ mod capability;
 
 pub use capability::{Capability, DecodingError, EncodingError, VerificationError};
 pub use ucan_capabilities_object::{
-    AbilityName, AbilityNameRef, AbilityNamespace, AbilityNamespaceRef, AbilityRef, CapsInner,
-    ConvertError, NotaBeneCollection,
+    Ability, AbilityName, AbilityNameRef, AbilityNamespace, AbilityNamespaceRef, AbilityRef,
+    CapsInner, ConvertError, NotaBeneCollection,
 };
 
 /// The prefix for a ReCap uri.
@@ -27,6 +27,7 @@ mod test {
     fn no_caps_statement_append() {
         let msg = Capability::<Value>::default()
             .build_message(Message {
+                scheme: None,
                 domain: "example.com".parse().unwrap(),
                 address: Default::default(),
                 statement: Some("Some custom statement.".into()),
@@ -57,6 +58,7 @@ mod test {
 
         let msg = cap
             .build_message(Message {
+                scheme: None,
                 domain: "example.com".parse().unwrap(),
                 address: Default::default(),
                 statement: Some("Some custom statement.".into()),
@@ -83,6 +85,7 @@ mod test {
     fn no_caps() {
         let msg = Capability::<Value>::default()
             .build_message(Message {
+                scheme: None,
                 domain: "example.com".parse().unwrap(),
                 address: Default::default(),
                 statement: None,
@@ -138,6 +141,7 @@ mod test {
             )
             .unwrap()
             .build_message(Message {
+                scheme: None,
                 domain: "example.com".parse().unwrap(),
                 address: Default::default(),
                 statement: None,

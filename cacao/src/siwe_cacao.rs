@@ -1,7 +1,7 @@
 use super::{Representation, SignatureScheme, CACAO};
 use async_trait::async_trait;
 use hex::FromHex;
-use http::uri::Authority;
+use http::uri::{Authority, Scheme};
 use iri_string::{
     types::{UriAbsoluteString, UriString},
     validate::Error as URIStringError,
@@ -26,6 +26,7 @@ pub struct Header;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Payload {
+    pub scheme: Option<Scheme>,
     pub domain: Authority,
     pub iss: UriAbsoluteString,
     pub statement: Option<String>,
@@ -98,11 +99,14 @@ mod payload_ipld {
         request_id: Option<String>,
         #[ipld(default = None)]
         statement: Option<String>,
+        #[ipld(default = None)]
+        scheme: Option<String>,
     }
 
     impl From<&Payload> for TmpPayload {
         fn from(p: &Payload) -> Self {
             Self {
+                scheme: p.scheme.as_ref().map(|s| s.to_string()),
                 domain: p.domain.to_string(),
                 iss: p.iss.to_string(),
                 statement: p.statement.as_ref().map(|e| e.to_string()),
@@ -122,6 +126,7 @@ mod payload_ipld {
         type Error = IpldError;
         fn try_from(p: TmpPayload) -> Result<Self, Self::Error> {
             Ok(Self {
+                scheme: p.scheme.map(|s| s.parse()).transpose()?,
                 domain: p.domain.parse()?,
                 iss: p.iss.parse()?,
                 statement: p.statement,
@@ -248,6 +253,7 @@ impl TryInto<Message> for Payload {
             _ => return Err(Self::Error::InvalidDID),
         };
         Ok(Message {
+            scheme: self.scheme,
             domain: self.domain,
             address,
             chain_id,
@@ -267,6 +273,7 @@ impl TryInto<Message> for Payload {
 impl From<Message> for Payload {
     fn from(m: Message) -> Self {
         Self {
+            scheme: m.scheme,
             domain: m.domain,
             iss: format!("did:pkh:eip155:{}:{}", m.chain_id, eip55(&m.address))
                 .parse()

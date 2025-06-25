@@ -37,72 +37,69 @@ impl_fromreq!(RevocationInfo, TinyCloudRevocation, "Authorization");
 
 #[cfg(test)]
 mod test {
-    use tinycloud_lib::{
-        libipld::cid::Cid,
-        resolver::DID_METHODS,
-        ssi::{
-            did::{Document, Source},
-            did_resolve::DIDResolver,
-            jwk::{Algorithm, JWK},
-            jws::Header,
-            ucan::{Capability, Payload},
-            vc::NumericDate,
-        },
-    };
+    // use tinycloud_lib::{
+    //     libipld::cid::Cid,
+    //     resolver::DID_METHODS,
+    //     ssi::{
+    //         claims::{jws::Header, jwt::NumericDate},
+    //         dids::{DIDBuf, DIDResolver, Document},
+    //         jwk::{Algorithm, JWK},
+    //         ucan::{Capability, Payload},
+    //     },
+    // };
 
-    async fn gen(
-        iss: &JWK,
-        aud: String,
-        caps: Vec<Capability>,
-        exp: f64,
-        prf: Vec<Cid>,
-    ) -> (Document, Thing) {
-        let did = DID_METHODS
-            .generate(&Source::KeyAndPattern(iss, "key"))
-            .unwrap();
-        (
-            DID_METHODS
-                .resolve(&did, &Default::default())
-                .await
-                .1
-                .unwrap(),
-            gen_ucan((iss, did), aud, caps, exp, prf).await,
-        )
-    }
-    async fn gen_ucan(
-        iss: (&JWK, String),
-        audience: String,
-        attenuation: Vec<Capability>,
-        exp: f64,
-        proof: Vec<Cid>,
-    ) -> Thing {
-        let p = Payload {
-            issuer: iss.1,
-            audience,
-            attenuation,
-            proof,
-            nonce: None,
-            not_before: None,
-            facts: None,
-            expiration: NumericDate::try_from_seconds(exp).unwrap(),
-        }
-        .sign(Algorithm::EdDSA, iss.0)
-        .unwrap();
-        Thing {
-            token: p.encode().unwrap(),
-            payload: p.payload,
-            header: p.header,
-        }
-    }
+    // async fn gen(
+    //     iss: &JWK,
+    //     aud: String,
+    //     caps: Vec<Capability>,
+    //     exp: f64,
+    //     prf: Vec<Cid>,
+    // ) -> (Document, Thing) {
+    //     let did = DID_METHODS.generate(iss, "key").unwrap();
+    //     (
+    //         DID_METHODS
+    //             .resolve(&did)
+    //             .await
+    //             .unwrap()
+    //             .document
+    //             .into_document(),
+    //         gen_ucan((iss, did), aud, caps, exp, prf).await,
+    //     )
+    // }
+    // async fn gen_ucan(
+    //     iss: (&JWK, DIDBuf),
+    //     audience: String,
+    //     attenuation: Vec<Capability>,
+    //     exp: f64,
+    //     proof: Vec<Cid>,
+    // ) -> Thing {
+    //     let p = Payload {
+    //         issuer: iss.1.parse().unwrap(),
+    //         audience: audience.parse().unwrap(),
+    //         attenuation,
+    //         proof,
+    //         nonce: None,
+    //         not_before: None,
+    //         facts: None,
+    //         expiration: NumericDate::try_from_seconds(exp).unwrap(),
+    //     }
+    //     .sign(Algorithm::EdDSA, iss.0)
+    //     .unwrap();
+    //     Thing {
+    //         token: p.encode().unwrap(),
+    //         payload: p.payload,
+    //         header: p.header,
+    //     }
+    // }
 
-    #[derive(serde::Serialize)]
-    struct Thing {
-        pub token: String,
-        pub payload: Payload,
-        pub header: Header,
-    }
-    #[test]
-    async fn basic() -> anyhow::Result<()> {
-        Ok(())
-    }
+    // #[derive(serde::Serialize)]
+    // struct Thing {
+    //     pub token: String,
+    //     pub payload: Payload,
+    //     pub header: Header,
+    // }
+    // #[test]
+    // async fn basic() -> anyhow::Result<()> {
+    //     Ok(())
+    // }
 }

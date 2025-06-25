@@ -341,10 +341,10 @@ mod test {
     #[test]
     async fn test_file_system_store() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = FileSystemConfig::new(dir.path().to_path_buf());
+        let cfg = FileSystemConfig::new(dir.path());
         let store = cfg.open().await.unwrap();
         let data = b"hello world";
-        let orbit: OrbitId = "tinycloud:example://default".parse().unwrap();
+        let orbit: OrbitId = "tinycloud:key:test://default".parse().unwrap();
         assert_eq!(store.total_size(&orbit).await.unwrap(), None);
         store.create(&orbit).await.unwrap();
         assert_eq!(store.total_size(&orbit).await.unwrap(), Some(0));
@@ -356,7 +356,7 @@ mod test {
             .await
             .unwrap();
 
-        assert_eq!(store.contains(&orbit, &hash).await.unwrap(), true);
+        assert!(store.contains(&orbit, &hash).await.unwrap());
         assert_eq!(
             store.total_size(&orbit).await.unwrap(),
             Some(data.len() as u64)
@@ -379,7 +379,7 @@ mod test {
         );
         assert_eq!(store.remove(&orbit, &hash).await.unwrap(), Some(()));
         assert_eq!(store.remove(&orbit, &hash).await.unwrap(), None);
-        assert_eq!(store.contains(&orbit, &hash).await.unwrap(), false);
+        assert!(!store.contains(&orbit, &hash).await.unwrap());
         assert_eq!(store.total_size(&orbit).await.unwrap(), Some(0));
         assert_eq!(store.read(&orbit, &hash).await.unwrap().map(|_| ()), None);
     }

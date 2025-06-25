@@ -19,7 +19,7 @@ use alloy::{
 };
 
 use hex::FromHex;
-use http::uri::{Authority, InvalidUri};
+use http::uri::{Authority, InvalidUri, Scheme};
 use iri_string::types::UriString;
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use sha3::{Digest, Keccak256};
@@ -77,6 +77,8 @@ impl FromStr for Version {
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
+    /// The optional scheme that was part of the domain (e.g., "https", "http", etc.).
+    pub scheme: Option<Scheme>,
     /// The RFC 3986 authority that is requesting the signing.
     pub domain: Authority,
     /// The Ethereum address performing the signing conformant to capitalization encoded checksum specified in EIP-55 where applicable.
@@ -105,7 +107,11 @@ pub struct Message {
 
 impl Display for Message {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
-        writeln!(f, "{}{}", &self.domain, PREAMBLE)?;
+        if let Some(scheme) = &self.scheme {
+            writeln!(f, "{}://{}{}", scheme, &self.domain, PREAMBLE)?;
+        } else {
+            writeln!(f, "{}{}", &self.domain, PREAMBLE)?;
+        }
         writeln!(f, "{}", eip55(&self.address))?;
         writeln!(f)?;
         if let Some(statement) = &self.statement {
@@ -188,11 +194,24 @@ impl FromStr for Message {
     type Err = ParseError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut lines = s.split('\n');
-        let domain = lines
+        let preamble_line = lines
             .next()
             .and_then(|preamble| preamble.strip_suffix(PREAMBLE))
-            .map(Authority::from_str)
-            .ok_or(ParseError::Format("Missing Preamble Line"))??;
+            .ok_or(ParseError::Format("Missing Preamble Line"))?;
+
+        // Extract scheme and domain from the preamble line
+        let (scheme, domain) = if let Some(scheme_end) = preamble_line.find("://") {
+            let scheme_str = &preamble_line[..scheme_end];
+            let domain_str = &preamble_line[scheme_end + 3..];
+            let scheme = Some(
+                Scheme::try_from(scheme_str).map_err(|_| ParseError::Format("Invalid scheme"))?,
+            );
+            let domain = Authority::from_str(domain_str)?;
+            (scheme, domain)
+        } else {
+            let domain = Authority::from_str(preamble_line)?;
+            (None, domain)
+        };
         let address = tagged(ADDR_TAG, lines.next())
             .and_then(|a| {
                 if is_checksum(a) {
@@ -257,6 +276,7 @@ impl FromStr for Message {
         }?;
 
         Ok(Message {
+            scheme,
             domain,
             address,
             statement,
@@ -287,7 +307,7 @@ impl Serialize for Message {
 struct MessageVisitor;
 
 #[cfg(feature = "serde")]
-impl<'de> Visitor<'de> for MessageVisitor {
+impl Visitor<'_> for MessageVisitor {
     type Value = Message;
 
     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -821,11 +841,16 @@ Resources:
     const PARSING_NEGATIVE: &str = include_str!("../test/parsing_negative.json");
     const VERIFICATION_POSITIVE: &str = include_str!("../test/verification_positive.json");
     const VERIFICATION_NEGATIVE: &str = include_str!("../test/verification_negative.json");
-    const VERIFICATION_EIP1271: &str = include_str!("../test/eip1271.json");
+    // TODO add eip1271 tests
+    // const VERIFICATION_EIP1271: &str = include_str!("../test/eip1271.json");
 
     fn fields_to_message(fields: &serde_json::Value) -> anyhow::Result<Message> {
         let fields = fields.as_object().unwrap();
         Ok(Message {
+            scheme: fields
+                .get("scheme")
+                .and_then(|s| s.as_str())
+                .map(|s| Scheme::try_from(s).unwrap()),
             domain: fields["domain"].as_str().unwrap().try_into().unwrap(),
             address: <[u8; 20]>::from_hex(
                 fields["address"]
@@ -835,14 +860,12 @@ Resources:
                     .unwrap(),
             )
             .unwrap(),
-            statement: fields
-                .get("statement")
-                .map(|s| s.as_str().unwrap().try_into().unwrap()),
+            statement: fields.get("statement").map(|s| s.as_str().unwrap().into()),
             uri: fields["uri"].as_str().unwrap().try_into().unwrap(),
             version: <Version as std::str::FromStr>::from_str(fields["version"].as_str().unwrap())
                 .unwrap(),
             chain_id: fields["chainId"].as_u64().unwrap(),
-            nonce: fields["nonce"].as_str().unwrap().try_into().unwrap(),
+            nonce: fields["nonce"].as_str().unwrap().into(),
             issued_at: <TimeStamp as std::str::FromStr>::from_str(
                 fields["issuedAt"].as_str().unwrap(),
             )?,

@@ -51,7 +51,7 @@ impl Manifest {
             document: doc,
             document_metadata: doc_md,
             ..
-        } = resolver.resolve(&id.did()).await?;
+        } = resolver.resolve(id.did()).await?;
 
         match (doc, doc_md.deactivated) {
             (_, Some(true)) => Err(ResolutionError::Deactivated),
@@ -177,7 +177,7 @@ mod tests {
     async fn basic_manifest() {
         let j = JWK::generate_secp256k1();
         let mut did = DID_METHODS.generate(&j, "pkh:eth").unwrap().to_string();
-        did.extend("#default".chars());
+        did.push_str("#default");
         let did: DIDURLBuf = did.parse().unwrap();
 
         println!("DID: {:#?}", did);

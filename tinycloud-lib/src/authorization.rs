@@ -109,7 +109,7 @@ pub async fn make_invocation(
     Ok(Payload {
         issuer: DIDURLBuf::from_str(&verification_method)?,
         audience: DIDBuf::from_str(
-            &verification_method
+            verification_method
                 .split('#')
                 .next()
                 .unwrap_or(&verification_method),
@@ -119,7 +119,7 @@ pub async fn make_invocation(
             .map_err(InvocationError::NumericDateConversionError)?,
         nonce: Some(nonce.unwrap_or_else(|| format!("urn:uuid:{}", Uuid::new_v4()))),
         facts: None,
-        proof: vec![delegation.into()],
+        proof: vec![delegation],
         attenuation: invocation_target
             .into_iter()
             .map(|t| t.try_into())
