@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout TinyCloud repository
-      uses: actions/checkout@v2
+      uses: actions/checkout@v4
     - name: Add WASM target
       if: ${{ matrix.pkg == 'sdk-wasm' }}
       run: |
@@ -40,7 +40,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout TinyCloud repository
-      uses: actions/checkout@v2
+      uses: actions/checkout@v4
     - name: Add WASM target
       if: ${{ matrix.pkg == 'sdk-wasm' }}
       run: |
@@ -58,7 +58,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout TinyCloud repository
-      uses: actions/checkout@v2
+      uses: actions/checkout@v4
     - name: Add WASM target
       if: ${{ matrix.pkg == 'sdk-wasm' }}
       run: |

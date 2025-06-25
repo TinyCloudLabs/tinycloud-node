@@ -15,16 +15,12 @@ jobs:
       uses: elgohr/Publish-Docker-Github-Action@v4
       with:
         name: tinycloudlabs/tinycloud-node
-        username: ${{ github.actor }}
-        password: ${{ secrets.GH_PACKAGE_PUSH_TOKEN }}
-        registry: ghcr.io
         no_push: true
         cache: true
-        snapshot: true
     - name: Save Docker image
       run: docker save tinycloudlabs/tinycloud-node:latest | gzip > docker-image.tar.gz
     - name: Upload Docker image artifact
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v4
       with:
         name: docker-image
         path: docker-image.tar.gz
@@ -37,7 +33,7 @@ jobs:
     steps:
     - uses: actions/checkout@master
     - name: Download Docker image artifact
-      uses: actions/download-artifact@v2
+      uses: actions/download-artifact@v4
       with:
         name: docker-image
         path: .
