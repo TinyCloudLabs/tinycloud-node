@@ -1,8 +1,8 @@
-name: Publish Docker
+name: Docker Container
 
 on:
   push:
-    branches: [ main ]
+    branches: [ '*' ]
   release:
     types: [published, created, edited]
 
@@ -11,7 +11,39 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@master
-    - name: Build and push image
+    - name: Build Docker image
+      uses: elgohr/Publish-Docker-Github-Action@v4
+      with:
+        name: tinycloudlabs/tinycloud-node
+        username: ${{ github.actor }}
+        password: ${{ secrets.GH_PACKAGE_PUSH_TOKEN }}
+        registry: ghcr.io
+        no_push: true
+        cache: true
+        snapshot: true
+    - name: Save Docker image
+      run: docker save tinycloudlabs/tinycloud-node:latest | gzip > docker-image.tar.gz
+    - name: Upload Docker image artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: docker-image
+        path: docker-image.tar.gz
+        retention-days: 1
+  
+  publish:
+    needs: build
+    if: (github.ref == 'refs/heads/main' && startsWith(github.ref, 'refs/tags/')) || github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@master
+    - name: Download Docker image artifact
+      uses: actions/download-artifact@v2
+      with:
+        name: docker-image
+        path: .
+    - name: Load Docker image
+      run: docker load < docker-image.tar.gz
+    - name: Push Docker image
       uses: elgohr/Publish-Docker-Github-Action@v4
       with:
         name: tinycloudlabs/tinycloud-node
@@ -21,4 +53,4 @@ jobs:
         tag_names: true
         tag_semver: true
         snapshot: true
-        cache: true
+        no_build: true
