@@ -1,6 +1,42 @@
 [package]
-name = "client-cli"
+name = "tinycloud-client"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+
+[[bin]]
+name = "tinycloud-client"
+path = "src/main.rs"
 
 [dependencies]
+# CLI framework
+clap = { version = "4.0", features = ["derive", "env"] }
+
+# Async runtime and HTTP client
+tokio = { version = "1.0", features = ["full"] }
+reqwest = { version = "0.12.20", features = ["json", "stream"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror.workspace = true
+
+# Workspace dependencies
+tinycloud-lib.workspace = true
+tinycloud-sdk-rs.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Utilities
+uuid = { version = "1.0", features = ["v4"] }
+time.workspace = true
+hex = "0.4"
+libipld.workspace = true
+base64.workspace = true
+
+# Cryptography
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha3 = "0.10"
+
+[dev-dependencies]
+mockito = "1.0"
