@@ -1848,6 +1848,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cli-client"
+version = "0.1.0"
+
+[[package]]
+name = "client-cli"
+version = "0.1.0"
+
+[[package]]
 name = "combination"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -56,7 +56,7 @@ members = [
     "siwe-recap",
     "cacao",
     "ucan-capabilities"
-]
+, "cli-client", "client-cli"]
 
 exclude = [
     "test/load/signer",
