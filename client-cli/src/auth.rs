@@ -84,7 +84,7 @@ pub async fn create_capability_delegation(
     recipient_did: &str,
     orbit_id: OrbitId,
     capabilities: &[(String, Vec<String>)], // (path, abilities)
-    _parent_cids: &[Cid], // TODO: Add parent proof support
+    parent_cids: &[Cid],
     expires_in_seconds: u64,
 ) -> Result<TinyCloudDelegation> {
     let now = OffsetDateTime::now_utc();
@@ -130,7 +130,7 @@ pub async fn create_capability_delegation(
                         Ok(caps)
                     })
             },
-        )?;
+        )?.with_proofs(parent_cids);
     
     // Create the SIWE message
     let issued_at = TimeStamp::try_from(now)
@@ -148,7 +148,7 @@ pub async fn create_capability_delegation(
         uri: recipient_did.parse()
             .map_err(|e| CliError::AuthorizationError(format!("Invalid recipient DID URI: {}", e)))?,
         nonce: generate_nonce(),
-        statement: Some("Delegate capabilities".to_string()),
+        statement: None,
         resources: vec![],
         version: Version::V1,
         not_before: None,
@@ -211,17 +211,15 @@ fn sign_siwe_message(message: &Message, signing_key: &SigningKey) -> Result<SIWE
         .map_err(|e| CliError::CryptoError(format!("Failed to hash SIWE message: {}", e)))?;
     
     // Sign the hash
-    let signature: Signature = signing_key.sign_prehash(&message_hash)
+    let (signature, rec_id) = signing_key.sign_prehash_recoverable(&message_hash)
         .map_err(|e| CliError::CryptoError(format!("Failed to sign message: {}", e)))?;
     
     // Convert to SIWESignature format
-    let signature_bytes = signature.to_bytes();
     let mut sig_bytes = [0u8; 65];
-    sig_bytes[..64].copy_from_slice(&signature_bytes);
-    
+    sig_bytes[..64].copy_from_slice(&signature.to_bytes());
+
     // For Ethereum signatures, we need the recovery ID
-    // This is a simplified approach - in practice you'd need proper recovery ID calculation
-    sig_bytes[64] = 27; // Standard recovery ID
+    sig_bytes[64] = rec_id.into();
     
     let siwe_signature = SIWESignature::from(sig_bytes);
     
