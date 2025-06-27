@@ -79,10 +79,6 @@ pub async fn handle_invoke_kv_get(
     path: &str,
     parent_cids: &[Cid],
 ) -> Result<()> {
-    if parent_cids.is_empty() {
-        return Err(CliError::AuthorizationError("No parent delegation CIDs provided".to_string()).into());
-    }
-    
     // Create invocation for KV get operation
     let invocation = create_kv_invocation(key, orbit, path, "get", parent_cids, 300).await?;
     
@@ -103,10 +99,6 @@ pub async fn handle_invoke_kv_head(
     path: &str,
     parent_cids: &[Cid],
 ) -> Result<()> {
-    if parent_cids.is_empty() {
-        return Err(CliError::AuthorizationError("No parent delegation CIDs provided".to_string()).into());
-    }
-    
     // Create invocation for KV metadata operation
     let invocation = create_kv_invocation(key, orbit, path, "metadata", parent_cids, 300).await?;
     
@@ -126,10 +118,6 @@ pub async fn handle_invoke_kv_put(
     path: &str,
     parent_cids: &[Cid],
 ) -> Result<()> {
-    if parent_cids.is_empty() {
-        return Err(CliError::AuthorizationError("No parent delegation CIDs provided".to_string()).into());
-    }
-    
     // Read data from stdin
     let mut data = Vec::new();
     io::stdin().read_to_end(&mut data)?;
@@ -158,10 +146,6 @@ pub async fn handle_invoke_kv_delete(
     path: &str,
     parent_cids: &[Cid],
 ) -> Result<()> {
-    if parent_cids.is_empty() {
-        return Err(CliError::AuthorizationError("No parent delegation CIDs provided".to_string()).into());
-    }
-    
     // Create invocation for KV delete operation
     let invocation = create_kv_invocation(key, orbit, path, "del", parent_cids, 300).await?;
     

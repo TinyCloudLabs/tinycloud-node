@@ -171,10 +171,6 @@ pub async fn create_kv_invocation(
     parent_cids: &[Cid],
     expires_in_seconds: u64,
 ) -> Result<TinyCloudInvocation> {
-    if parent_cids.is_empty() {
-        return Err(CliError::AuthorizationError("At least one parent delegation CID is required".to_string()).into());
-    }
-    
     // Create resource ID
     let resource_id = orbit_id.to_resource(
         Some("kv".to_string()),
@@ -188,7 +184,7 @@ pub async fn create_kv_invocation(
     // Create invocation
     let invocation = make_invocation(
         vec![resource_id],
-        parent_cids[0], // Use first parent as primary delegation
+        parent_cids.first().copied(), // Use first parent as primary delegation
         invoker_key.get_jwk(),
         invoker_key.get_verification_method(),
         expiry.unix_timestamp() as f64,

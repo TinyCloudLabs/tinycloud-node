@@ -99,7 +99,7 @@ impl HeaderEncode for TinyCloudRevocation {
 
 pub async fn make_invocation(
     invocation_target: Vec<ResourceId>,
-    delegation: Cid,
+    delegation: Option<Cid>,
     jwk: &JWK,
     verification_method: String,
     expiration: f64,
@@ -119,7 +119,7 @@ pub async fn make_invocation(
             .map_err(InvocationError::NumericDateConversionError)?,
         nonce: Some(nonce.unwrap_or_else(|| format!("urn:uuid:{}", Uuid::new_v4()))),
         facts: None,
-        proof: vec![delegation],
+        proof: delegation.into_iter().collect(),
         attenuation: invocation_target
             .into_iter()
             .map(|t| t.try_into())
