@@ -1,14 +1,16 @@
+use std::str::FromStr;
+
 use anyhow::{anyhow, Result};
-use k256::{
-    ecdsa::{SigningKey, VerifyingKey},
-    elliptic_curve::sec1::ToEncodedPoint,
-};
+use k256::ecdsa::{SigningKey, VerifyingKey};
 use sha3::{Digest, Keccak256};
 use tinycloud_lib::ssi::{
-    dids::{AnyDidMethod, DIDBuf, DID},
+    dids::{DIDBuf, DID},
     jwk::{Base64urlUInt, ECParams, Params, JWK},
 };
 
+use crate::error::CliError;
+
+#[derive(Clone)]
 pub struct EthereumKey {
     private_key: [u8; 32],
     signing_key: SigningKey,
@@ -71,11 +73,75 @@ fn ethereum_address_from_public_key(verifying_key: &VerifyingKey) -> Result<Stri
     // Skip the 0x04 prefix and hash the remaining 64 bytes
     let public_key_hash = Keccak256::digest(&public_key_bytes[1..]);
 
-    // Take last 20 bytes and format as hex with 0x prefix
+    // Take last 20 bytes and format as hex
     let address_bytes = &public_key_hash[12..];
-    let address = format!("0x{}", hex::encode(address_bytes));
+    let address_hex = hex::encode(address_bytes);
 
-    Ok(address.to_lowercase())
+    // Apply EIP-55 checksum encoding
+    let checksum_hash = Keccak256::digest(address_hex.as_bytes());
+    let mut checksummed_address = String::with_capacity(42);
+    checksummed_address.push_str("0x");
+
+    for (i, c) in address_hex.chars().enumerate() {
+        if c.is_ascii_digit() {
+            checksummed_address.push(c);
+        } else {
+            // Check if the corresponding nibble in the hash is >= 8
+            let hash_byte = checksum_hash[i / 2];
+            let nibble = if i % 2 == 0 {
+                hash_byte >> 4
+            } else {
+                hash_byte & 0xf
+            };
+
+            let checksum_char = if nibble >= 8 {
+                c.to_ascii_uppercase()
+            } else {
+                c.to_ascii_lowercase()
+            };
+            checksummed_address.push(checksum_char);
+        }
+    }
+
+    Ok(checksummed_address)
+}
+
+impl FromStr for EthereumKey {
+    type Err = anyhow::Error;
+
+    fn from_str(hex: &str) -> Result<Self, Self::Err> {
+        // Remove 0x prefix if present
+        let hex = if hex.starts_with("0x") {
+            &hex[2..]
+        } else {
+            hex
+        };
+
+        // Ensure the hex string is 64 characters (32 bytes)
+        if hex.len() != 64 {
+            return Err(CliError::InvalidPrivateKey(format!(
+                "Expected 64 hex characters, found {}",
+                hex.len()
+            ))
+            .into());
+        }
+
+        // Parse the hex string into bytes
+        let bytes = hex::decode(hex).map_err(|e| anyhow!("Invalid hex format: {}", e))?;
+        if bytes.len() != 32 {
+            return Err(CliError::InvalidPrivateKey(format!(
+                "Expected 32 bytes, found {}",
+                bytes.len()
+            ))
+            .into());
+        }
+
+        // Convert to array
+        let mut private_key = [0u8; 32];
+        private_key.copy_from_slice(&bytes);
+
+        Ok(EthereumKey::new(private_key)?)
+    }
 }
 
 fn create_secp256k1_jwk(signing_key: &SigningKey) -> Result<JWK> {

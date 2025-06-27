@@ -1,6 +1,9 @@
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use reqwest::Url;
 use tinycloud_lib::{libipld::Cid, resource::OrbitId, ssi::dids::DIDURLBuf};
+
+use crate::key::EthereumKey;
 
 #[derive(Parser)]
 #[command(name = "tinycloud-client")]
@@ -8,7 +11,7 @@ use tinycloud_lib::{libipld::Cid, resource::OrbitId, ssi::dids::DIDURLBuf};
 pub struct Cli {
     /// Hex-encoded Ethereum private key
     #[arg(long, env = "TINYCLOUD_ETHKEY", value_parser = key_from_hex)]
-    pub ethkey: [u8; 32],
+    pub ethkey: EthereumKey,
 
     /// TinyCloud orbit host URL
     #[arg(long, default_value = "https://demo.tinycloud.xyz")]
@@ -22,14 +25,8 @@ pub struct Cli {
     pub command: Commands,
 }
 
-fn key_from_hex(hex: &str) -> Result<[u8; 32], String> {
-    let bytes = hex::decode(hex.strip_prefix("0x").unwrap_or(hex)).map_err(|e| e.to_string())?;
-    if bytes.len() != 32 {
-        return Err("Key must be 32 bytes".to_string());
-    }
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&bytes);
-    Ok(key)
+fn key_from_hex(hex: &str) -> Result<EthereumKey> {
+    hex.parse()
 }
 
 #[derive(Subcommand)]

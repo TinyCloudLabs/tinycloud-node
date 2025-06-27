@@ -15,13 +15,12 @@ use commands::{
     handle_host_command, handle_delegate_command, handle_invoke_kv_get,
     handle_invoke_kv_head, handle_invoke_kv_put, handle_invoke_kv_delete,
 };
-use key::EthereumKey;
 
 async fn app() -> Result<()> {
     let args = Cli::parse();
 
     // Initialize the Ethereum key from hex string
-    let key = EthereumKey::new(args.ethkey)?;
+    let key = args.ethkey;
 
     // Create HTTP client
     let client = TinyCloudClient::new(args.url);

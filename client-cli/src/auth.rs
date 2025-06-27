@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use std::collections::HashMap;
 use time::OffsetDateTime;
 use tinycloud_lib::{
@@ -7,15 +7,12 @@ use tinycloud_lib::{
         siwe::{generate_nonce, Message, TimeStamp, Version},
         siwe_cacao::{SIWESignature, SiweCacao},
     },
-    resource::{OrbitId, ResourceId},
+    resource::OrbitId,
     siwe_recap::Capability,
-    ssi::jwk::JWK,
 };
 use libipld::Cid;
 use serde_json::Value;
-use k256::{
-    ecdsa::{Signature, SigningKey, signature::hazmat::PrehashSigner},
-};
+use k256::ecdsa::SigningKey;
 
 use crate::{key::EthereumKey, error::CliError, utils::extract_address_from_did};
 

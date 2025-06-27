@@ -58,31 +58,6 @@ pub fn extract_address_from_did(did: &str) -> Result<String> {
     }
 }
 
-/// Validate that a string is a valid Ethereum address
-pub fn validate_ethereum_address(address: &str) -> Result<()> {
-    if !address.starts_with("0x") {
-        return Err(CliError::InvalidDid("Ethereum address must start with 0x".to_string()).into());
-    }
-
-    if address.len() != 42 {
-        return Err(CliError::InvalidDid(
-            "Ethereum address must be 42 characters long".to_string(),
-        )
-        .into());
-    }
-
-    // Validate hex characters
-    let hex_part = &address[2..];
-    if !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(CliError::InvalidDid(
-            "Ethereum address contains invalid hex characters".to_string(),
-        )
-        .into());
-    }
-
-    Ok(())
-}
-
 /// Validate that a string looks like a valid DID
 pub fn validate_did(did: &str) -> Result<()> {
     if !did.starts_with("did:") {
@@ -109,7 +84,7 @@ mod tests {
         let did = "did:pkh:eip155:1:0x1234567890123456789012345678901234567890";
         let orbit_id = generate_orbit_id(did, "myorbit").unwrap();
         assert_eq!(
-            orbit_id,
+            orbit_id.to_string(),
             "tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890://myorbit"
         );
     }
@@ -135,19 +110,6 @@ mod tests {
         // Test invalid DID
         let invalid_did = "did:key:invalid";
         assert!(extract_address_from_did(invalid_did).is_err());
-    }
-
-    #[test]
-    fn test_validate_ethereum_address() {
-        // Valid address
-        assert!(validate_ethereum_address("0x1234567890123456789012345678901234567890").is_ok());
-
-        // Invalid addresses
-        assert!(validate_ethereum_address("1234567890123456789012345678901234567890").is_err()); // No 0x
-        assert!(validate_ethereum_address("0x12345").is_err()); // Too short
-        assert!(validate_ethereum_address("0x1234567890123456789012345678901234567890XX").is_err()); // Too long
-        assert!(validate_ethereum_address("0x123456789012345678901234567890123456789G").is_err());
-        // Invalid hex
     }
 
     #[test]
