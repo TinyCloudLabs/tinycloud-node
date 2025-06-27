@@ -1,9 +1,9 @@
 use std::str::FromStr;
 
 use anyhow::{anyhow, Result};
-use k256::ecdsa::{SigningKey, VerifyingKey};
 use sha3::{Digest, Keccak256};
 use tinycloud_lib::ssi::{
+    crypto::k256::{elliptic_curve::sec1::ToEncodedPoint, PublicKey, SecretKey},
     dids::{DIDBuf, DID},
     jwk::{Base64urlUInt, ECParams, Params, JWK},
 };
@@ -12,8 +12,7 @@ use crate::error::CliError;
 
 #[derive(Clone)]
 pub struct EthereumKey {
-    private_key: [u8; 32],
-    signing_key: SigningKey,
+    secret_key: SecretKey,
     jwk: JWK,
     did: DIDBuf,
     address: String,
@@ -22,22 +21,21 @@ pub struct EthereumKey {
 impl EthereumKey {
     pub fn new(private_key: [u8; 32]) -> Result<Self> {
         // Create secp256k1 signing key
-        let signing_key = SigningKey::from_bytes(&private_key.into())
+        let secret_key = SecretKey::from_bytes(&private_key.into())
             .map_err(|e| anyhow!("Invalid secp256k1 private key: {}", e))?;
 
         // Generate Ethereum address
-        let verifying_key = VerifyingKey::from(&signing_key);
-        let address = ethereum_address_from_public_key(&verifying_key)?;
+        let public_key = secret_key.public_key();
+        let address = ethereum_address_from_public_key(&public_key)?;
 
         // Create JWK
-        let jwk = create_secp256k1_jwk(&signing_key)?;
+        let jwk = create_secp256k1_jwk(&secret_key)?;
 
         // Generate DID
         let did = format!("did:pkh:eip155:1:{}", address).parse()?;
 
         Ok(Self {
-            private_key,
-            signing_key,
+            secret_key,
             jwk,
             did,
             address,
@@ -60,14 +58,14 @@ impl EthereumKey {
         format!("{}#blockchainAccountId", self.did)
     }
 
-    pub fn get_signing_key(&self) -> &SigningKey {
-        &self.signing_key
+    pub fn get_secret_key(&self) -> &SecretKey {
+        &self.secret_key
     }
 }
 
-fn ethereum_address_from_public_key(verifying_key: &VerifyingKey) -> Result<String> {
+fn ethereum_address_from_public_key(public_key: &PublicKey) -> Result<String> {
     // Get uncompressed public key (65 bytes: 0x04 + 32 bytes x + 32 bytes y)
-    let public_key_point = verifying_key.to_encoded_point(false);
+    let public_key_point = public_key.to_encoded_point(false);
     let public_key_bytes = public_key_point.as_bytes();
 
     // Skip the 0x04 prefix and hash the remaining 64 bytes
@@ -144,34 +142,8 @@ impl FromStr for EthereumKey {
     }
 }
 
-fn create_secp256k1_jwk(signing_key: &SigningKey) -> Result<JWK> {
-    let verifying_key = VerifyingKey::from(signing_key);
-    let public_key_point = verifying_key.to_encoded_point(false);
-    let public_key_bytes = public_key_point.as_bytes();
-
-    // Extract x and y coordinates (skip 0x04 prefix)
-    let x = &public_key_bytes[1..33];
-    let y = &public_key_bytes[33..65];
-
-    // Create EC params
-    let ec_params = ECParams {
-        curve: Some("secp256k1".to_string()),
-        x_coordinate: Some(Base64urlUInt(x.to_vec())),
-        y_coordinate: Some(Base64urlUInt(y.to_vec())),
-        ecc_private_key: None, // Don't include private key in JWK
-    };
-
-    Ok(JWK {
-        params: Params::EC(ec_params),
-        public_key_use: None,
-        key_operations: None,
-        algorithm: Some(tinycloud_lib::ssi::jwk::Algorithm::ES256K),
-        key_id: None,
-        x509_url: None,
-        x509_certificate_chain: None,
-        x509_thumbprint_sha1: None,
-        x509_thumbprint_sha256: None,
-    })
+fn create_secp256k1_jwk(secret_key: &SecretKey) -> Result<JWK> {
+    Ok(Params::EC(ECParams::from(secret_key)).into())
 }
 
 #[cfg(test)]

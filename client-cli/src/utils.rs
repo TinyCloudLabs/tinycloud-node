@@ -1,5 +1,5 @@
 use crate::error::CliError;
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use tinycloud_lib::resource::OrbitId;
 
 /// Generate an orbit ID from a DID and name

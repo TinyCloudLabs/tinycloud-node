@@ -9,10 +9,10 @@ use tinycloud_lib::{
     },
     resource::OrbitId,
     siwe_recap::Capability,
+    ssi::crypto::k256::{ecdsa::SigningKey, SecretKey},
 };
 use libipld::Cid;
 use serde_json::Value;
-use k256::ecdsa::SigningKey;
 
 use crate::{key::EthereumKey, error::CliError, utils::extract_address_from_did};
 
@@ -68,7 +68,7 @@ pub async fn create_host_delegation(
     .map_err(|e| CliError::AuthorizationError(format!("Error building SIWE message: {}", e)))?;
     
     // Sign the message
-    let signature = sign_siwe_message(&message, delegator_key.get_signing_key())?;
+    let signature = sign_siwe_message(&message, delegator_key.get_secret_key())?;
     
     // Create CACAO
     let cacao = SiweCacao::new(message.into(), signature, None);
@@ -155,7 +155,7 @@ pub async fn create_capability_delegation(
     .map_err(|e| CliError::AuthorizationError(format!("Error building SIWE message: {}", e)))?;
     
     // Sign the message
-    let signature = sign_siwe_message(&message, delegator_key.get_signing_key())?;
+    let signature = sign_siwe_message(&message, delegator_key.get_secret_key())?;
     
     // Create CACAO
     let cacao = SiweCacao::new(message.into(), signature, None);
@@ -198,7 +198,8 @@ pub async fn create_kv_invocation(
 }
 
 /// Sign a SIWE message using secp256k1
-fn sign_siwe_message(message: &Message, signing_key: &SigningKey) -> Result<SIWESignature> {
+fn sign_siwe_message(message: &Message, secret_key: &SecretKey) -> Result<SIWESignature> {
+    let signing_key: SigningKey = secret_key.into();
     // Get the EIP-191 hash of the message
     let message_hash = message.eip191_hash()
         .map_err(|e| CliError::CryptoError(format!("Failed to hash SIWE message: {}", e)))?;
