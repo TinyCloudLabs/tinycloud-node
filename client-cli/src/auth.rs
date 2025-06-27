@@ -186,7 +186,7 @@ pub async fn create_kv_invocation(
         vec![resource_id],
         parent_cids.first().copied(), // Use first parent as primary delegation
         invoker_key.get_jwk(),
-        invoker_key.get_verification_method(),
+        invoker_key.get_did().to_string(),
         expiry.unix_timestamp() as f64,
         None, // not_before
         None, // nonce (will be auto-generated)
