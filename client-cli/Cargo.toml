@@ -35,9 +35,5 @@ libipld.workspace = true
 base64.workspace = true
 urlencoding = "2.1"
 
-# Cryptography
-k256 = { version = "0.13", features = ["ecdsa"] }
-sha3 = "0.10"
-
 [dev-dependencies]
 mockito = "1.0"
