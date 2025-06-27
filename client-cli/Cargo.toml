@@ -33,6 +33,7 @@ time.workspace = true
 hex = "0.4"
 libipld.workspace = true
 base64.workspace = true
+urlencoding = "2.1"
 
 # Cryptography
 k256 = { version = "0.13", features = ["ecdsa"] }

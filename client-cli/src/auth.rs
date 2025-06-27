@@ -23,16 +23,12 @@ use crate::{key::EthereumKey, error::CliError, utils::extract_address_from_did};
 pub async fn create_host_delegation(
     delegator_key: &EthereumKey,
     host_did: &str,
-    orbit: &str,
+    orbit_id: OrbitId,
     expires_in_seconds: u64,
 ) -> Result<TinyCloudDelegation> {
     let now = OffsetDateTime::now_utc();
     let expiry = now + time::Duration::seconds(expires_in_seconds as i64);
-    
-    // Parse orbit ID
-    let orbit_id: OrbitId = orbit.parse()
-        .map_err(|e| CliError::InvalidOrbitId(format!("Failed to parse orbit ID: {}", e)))?;
-    
+
     // Create address bytes from DID
     let address_str = extract_address_from_did(delegator_key.get_did())?;
     let address_bytes = hex::decode(&address_str[2..])
@@ -65,7 +61,7 @@ pub async fn create_host_delegation(
         uri: host_did.parse()
             .map_err(|e| CliError::AuthorizationError(format!("Invalid host DID URI: {}", e)))?,
         nonce: generate_nonce(),
-        statement: Some(format!("Delegate orbit hosting capability for {}", orbit)),
+        statement: None,
         resources: vec![],
         version: Version::V1,
         not_before: None,
@@ -86,18 +82,14 @@ pub async fn create_host_delegation(
 pub async fn create_capability_delegation(
     delegator_key: &EthereumKey,
     recipient_did: &str,
-    orbit: &str,
+    orbit_id: OrbitId,
     capabilities: &[(String, Vec<String>)], // (path, abilities)
     _parent_cids: &[Cid], // TODO: Add parent proof support
     expires_in_seconds: u64,
 ) -> Result<TinyCloudDelegation> {
     let now = OffsetDateTime::now_utc();
     let expiry = now + time::Duration::seconds(expires_in_seconds as i64);
-    
-    // Parse orbit ID
-    let orbit_id: OrbitId = orbit.parse()
-        .map_err(|e| CliError::InvalidOrbitId(format!("Failed to parse orbit ID: {}", e)))?;
-    
+
     // Create address bytes from DID
     let address_str = extract_address_from_did(delegator_key.get_did())?;
     let address_bytes = hex::decode(&address_str[2..])
@@ -176,7 +168,7 @@ pub async fn create_capability_delegation(
 /// Create a UCAN invocation for KV operations
 pub async fn create_kv_invocation(
     invoker_key: &EthereumKey,
-    orbit: &str,
+    orbit_id: OrbitId,
     path: &str,
     action: &str, // "get", "put", "del", "metadata"
     parent_cids: &[Cid],
@@ -185,10 +177,6 @@ pub async fn create_kv_invocation(
     if parent_cids.is_empty() {
         return Err(CliError::AuthorizationError("At least one parent delegation CID is required".to_string()).into());
     }
-    
-    // Parse orbit ID
-    let orbit_id: OrbitId = orbit.parse()
-        .map_err(|e| CliError::InvalidOrbitId(format!("Failed to parse orbit ID: {}", e)))?;
     
     // Create resource ID
     let resource_id = orbit_id.to_resource(

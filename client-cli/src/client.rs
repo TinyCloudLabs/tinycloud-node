@@ -1,15 +1,15 @@
 use anyhow::Result;
-use reqwest::Client;
-use tinycloud_lib::authorization::{TinyCloudDelegation, TinyCloudInvocation, HeaderEncode};
+use reqwest::{Client, Url};
+use tinycloud_lib::{authorization::{HeaderEncode, TinyCloudDelegation, TinyCloudInvocation}, resource::OrbitId};
 use crate::error::CliError;
 
 pub struct TinyCloudClient {
     client: Client,
-    base_url: String,
+    base_url: Url,
 }
 
 impl TinyCloudClient {
-    pub fn new(base_url: String) -> Self {
+    pub fn new(base_url: Url) -> Self {
         Self {
             client: Client::new(),
             base_url,
@@ -17,8 +17,8 @@ impl TinyCloudClient {
     }
     
     /// Generate a host key for the given orbit
-    pub async fn generate_host_key(&self, orbit: &str) -> Result<String> {
-        let url = format!("{}/peer/generate/{}", self.base_url, orbit);
+    pub async fn generate_host_key(&self, orbit: &OrbitId) -> Result<String> {
+        let url = format!("{}/peer/generate/{}", self.base_url, urlencoding::encode(&orbit.to_string()));
         let response = self.client
             .get(&url)
             .send()
@@ -45,18 +45,12 @@ impl TinyCloudClient {
         
         let response = self.client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", auth_header))
+            .header("Authorization", auth_header)
             .send()
             .await
             .map_err(CliError::HttpError)?;
-        
-        if !response.status().is_success() {
-            return Err(CliError::HttpError(reqwest::Error::from(
-                response.error_for_status().unwrap_err()
-            )).into());
-        }
-        
-        let cid = response.text().await.map_err(CliError::HttpError)?;
+
+        let cid = response.text().await?;
         Ok(cid)
     }
     
@@ -69,7 +63,7 @@ impl TinyCloudClient {
         
         let response = self.client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", auth_header))
+            .header("Authorization", auth_header)
             .send()
             .await
             .map_err(CliError::HttpError)?;
@@ -93,7 +87,7 @@ impl TinyCloudClient {
         
         let response = self.client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", auth_header))
+            .header("Authorization", auth_header)
             .header("Content-Type", "application/octet-stream")
             .body(data)
             .send()
@@ -118,7 +112,7 @@ impl TinyCloudClient {
         
         let response = self.client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", auth_header))
+            .header("Authorization", auth_header)
             .send()
             .await
             .map_err(CliError::HttpError)?;
@@ -142,7 +136,7 @@ impl TinyCloudClient {
         
         let response = self.client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", auth_header))
+            .header("Authorization", auth_header)
             .send()
             .await
             .map_err(CliError::HttpError)?;
@@ -163,7 +157,7 @@ mod tests {
     
     #[test]
     fn test_client_creation() {
-        let client = TinyCloudClient::new("https://demo.tinycloud.xyz".to_string());
-        assert_eq!(client.base_url, "https://demo.tinycloud.xyz");
+        let client = TinyCloudClient::new("https://demo.tinycloud.xyz".parse().unwrap());
+        assert_eq!(client.base_url.as_str(), "https://demo.tinycloud.xyz");
     }
 }

@@ -8496,6 +8496,7 @@ dependencies = [
  "tinycloud-lib",
  "tinycloud-sdk-rs",
  "tokio",
+ "urlencoding",
  "uuid",
 ]
 

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::io::{self, Read, Write};
 use libipld::Cid;
+use tinycloud_lib::resource::OrbitId;
 
 use crate::{
     auth::{create_host_delegation, create_capability_delegation, create_kv_invocation},
@@ -23,7 +24,7 @@ pub async fn handle_host_command(
     let host_did = client.generate_host_key(&orbit_id).await?;
     
     // 3. Create SIWE delegation for orbit hosting
-    let delegation = create_host_delegation(key, &host_did, &orbit_id, 3600).await?;
+    let delegation = create_host_delegation(key, &host_did, orbit_id.clone(), 3600).await?;
     
     // 4. Submit delegation to server
     let _cid = client.delegate(&delegation).await?;
@@ -38,7 +39,7 @@ pub async fn handle_delegate_command(
     key: &EthereumKey,
     client: &TinyCloudClient,
     recipient: &str,
-    orbit: &str,
+    orbit: OrbitId,
     kv_permissions: &[String],
     parent_cids: &[Cid],
 ) -> Result<()> {
@@ -74,7 +75,7 @@ pub async fn handle_delegate_command(
 pub async fn handle_invoke_kv_get(
     key: &EthereumKey,
     client: &TinyCloudClient,
-    orbit: &str,
+    orbit: OrbitId,
     path: &str,
     parent_cids: &[Cid],
 ) -> Result<()> {
@@ -98,7 +99,7 @@ pub async fn handle_invoke_kv_get(
 pub async fn handle_invoke_kv_head(
     key: &EthereumKey,
     client: &TinyCloudClient,
-    orbit: &str,
+    orbit: OrbitId,
     path: &str,
     parent_cids: &[Cid],
 ) -> Result<()> {
@@ -121,7 +122,7 @@ pub async fn handle_invoke_kv_head(
 pub async fn handle_invoke_kv_put(
     key: &EthereumKey,
     client: &TinyCloudClient,
-    orbit: &str,
+    orbit: OrbitId,
     path: &str,
     parent_cids: &[Cid],
 ) -> Result<()> {
@@ -153,7 +154,7 @@ pub async fn handle_invoke_kv_put(
 pub async fn handle_invoke_kv_delete(
     key: &EthereumKey,
     client: &TinyCloudClient,
-    orbit: &str,
+    orbit: OrbitId,
     path: &str,
     parent_cids: &[Cid],
 ) -> Result<()> {
