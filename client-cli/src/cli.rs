@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
+use std::path::PathBuf;
 use tinycloud_lib::{libipld::Cid, resource::OrbitId, ssi::dids::DIDURLBuf};
 
 use crate::{client::TinyCloudClient, key::EthereumKey};
@@ -97,6 +98,10 @@ pub enum KvCommands {
         /// Path to the key
         path: String,
 
+        /// File to write the value to (if not specified, writes to stdout)
+        #[arg(long)]
+        file: Option<PathBuf>,
+
         #[command(flatten)]
         common: Common,
     },
@@ -108,10 +113,14 @@ pub enum KvCommands {
         #[command(flatten)]
         common: Common,
     },
-    /// Put a value into the key-value store (reads from stdin)
+    /// Put a value into the key-value store (reads from stdin or file)
     Put {
         /// Path to the key
         path: String,
+
+        /// File to read the value from (if not specified, reads from stdin)
+        #[arg(long)]
+        file: Option<PathBuf>,
 
         #[command(flatten)]
         common: Common,

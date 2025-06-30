@@ -1,5 +1,7 @@
 use anyhow::Result;
 use std::io::{self, Read, Write};
+use std::path::Path;
+use std::fs::File;
 use libipld::Cid;
 use tinycloud_lib::{resource::OrbitId, ssi::dids::DIDURL};
 
@@ -75,16 +77,37 @@ pub async fn handle_invoke_kv_get(
     orbit: OrbitId,
     path: &str,
     parent_cids: &[Cid],
+    file_path: Option<&Path>,
 ) -> Result<()> {
+    // Check if file exists before making HTTP request
+    if let Some(file_path) = file_path {
+        if file_path.exists() {
+            return Err(CliError::IoError(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("File already exists: {}", file_path.display())
+            )).into());
+        }
+    }
+    
     // Create invocation for KV get operation
     let invocation = create_kv_invocation(key, orbit, path, "get", parent_cids, 300).await?;
     
     // Execute the invocation
     let data = client.invoke_get(&invocation).await?;
     
-    // Write data to stdout
-    io::stdout().write_all(&data)?;
-    io::stdout().flush()?;
+    // Write data to file or stdout
+    match file_path {
+        Some(file_path) => {
+            let mut file = File::create(file_path)?;
+            file.write_all(&data)?;
+            file.flush()?;
+        }
+        None => {
+            io::stdout().write_all(&data)?;
+            io::stdout().flush()?;
+        }
+    }
+    
     Ok(())
 }
 
@@ -107,22 +130,32 @@ pub async fn handle_invoke_kv_head(
     Ok(())
 }
 
-/// Handle KV put operation (reads from stdin)
+/// Handle KV put operation (reads from stdin or file)
 pub async fn handle_invoke_kv_put(
     key: &EthereumKey,
     client: &TinyCloudClient,
     orbit: OrbitId,
     path: &str,
     parent_cids: &[Cid],
+    file_path: Option<&Path>,
 ) -> Result<()> {
-    // Read data from stdin
+    // Read data from file or stdin
     let mut data = Vec::new();
-    io::stdin().read_to_end(&mut data)?;
+    match file_path {
+        Some(file_path) => {
+            let mut file = File::open(file_path)?;
+            file.read_to_end(&mut data)?;
+        }
+        None => {
+            io::stdin().read_to_end(&mut data)?;
+        }
+    }
     
     if data.is_empty() {
+        let source = file_path.map(|p| p.display().to_string()).unwrap_or_else(|| "stdin".to_string());
         return Err(CliError::IoError(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "No data provided on stdin"
+            format!("No data provided from {}", source)
         )).into());
     }
     

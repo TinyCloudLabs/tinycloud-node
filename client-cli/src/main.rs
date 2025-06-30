@@ -31,14 +31,14 @@ async fn app() -> Result<()> {
             match operation {
                 InvokeCommands::Kv { action } => {
                     match action {
-                        KvCommands::Get { path, common } => {
-                            handle_invoke_kv_get(&common.ethkey, &common.url, common.orbit, &path, &common.parents).await?;
+                        KvCommands::Get { path, file, common } => {
+                            handle_invoke_kv_get(&common.ethkey, &common.url, common.orbit, &path, &common.parents, file.as_deref()).await?;
                         }
                         KvCommands::Head { path, common } => {
                             handle_invoke_kv_head(&common.ethkey, &common.url, common.orbit, &path, &common.parents).await?;
                         }
-                        KvCommands::Put { path, common } => {
-                            handle_invoke_kv_put(&common.ethkey, &common.url, common.orbit, &path, &common.parents).await?;
+                        KvCommands::Put { path, file, common } => {
+                            handle_invoke_kv_put(&common.ethkey, &common.url, common.orbit, &path, &common.parents, file.as_deref()).await?;
                         }
                         KvCommands::Delete { path, common } => {
                             handle_invoke_kv_delete(&common.ethkey, &common.url, common.orbit, &path, &common.parents).await?;
