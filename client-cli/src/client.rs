@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn test_client_creation() {
-        let client = TinyCloudClient::new("https://demo.tinycloud.xyz".parse().unwrap());
-        assert_eq!(client.base_url.as_str(), "https://demo.tinycloud.xyz");
+        let client = TinyCloudClient::new("https://demo.tinycloud.xyz/".parse().unwrap());
+        assert_eq!(client.base_url.as_str(), "https://demo.tinycloud.xyz/");
     }
 }

@@ -62,11 +62,7 @@ impl FromStr for EthereumKey {
 
     fn from_str(hex: &str) -> Result<Self, Self::Err> {
         // Remove 0x prefix if present
-        let hex = if hex.starts_with("0x") {
-            &hex[2..]
-        } else {
-            hex
-        };
+        let hex = hex.strip_prefix("0x").unwrap_or(hex);
 
         // Ensure the hex string is 64 characters (32 bytes)
         if hex.len() != 64 {

@@ -5,7 +5,7 @@ use time::OffsetDateTime;
 use tinycloud_lib::{
     authorization::{make_invocation, TinyCloudDelegation, TinyCloudInvocation},
     cacaos::{
-        siwe::{generate_nonce, Message, TimeStamp, Version},
+        siwe::{generate_nonce, Message, Version},
         siwe_cacao::{SIWESignature, SiweCacao},
     },
     libipld::Cid,
@@ -47,12 +47,6 @@ pub async fn create_host_delegation(
     .map_err(|e| CliError::AuthorizationError(format!("Error creating host capability: {}", e)))?;
 
     // Create the SIWE message
-    let issued_at = TimeStamp::try_from(now)
-        .map_err(|e| CliError::CryptoError(format!("Failed to create timestamp: {}", e)))?;
-    let expiration_time = TimeStamp::try_from(expiry).map_err(|e| {
-        CliError::CryptoError(format!("Failed to create expiration timestamp: {}", e))
-    })?;
-
     let message = caps
         .build_message(Message {
             scheme: None,
@@ -61,7 +55,7 @@ pub async fn create_host_delegation(
             domain: "tinycloud.xyz"
                 .parse()
                 .map_err(|e| CliError::AuthorizationError(format!("Invalid domain: {}", e)))?,
-            issued_at,
+            issued_at: now.into(),
             uri: host_did.parse().map_err(|e| {
                 CliError::AuthorizationError(format!("Invalid host DID URI: {}", e))
             })?,
@@ -70,7 +64,7 @@ pub async fn create_host_delegation(
             resources: vec![],
             version: Version::V1,
             not_before: None,
-            expiration_time: Some(expiration_time),
+            expiration_time: Some(expiry.into()),
             request_id: None,
         })
         .map_err(|e| CliError::AuthorizationError(format!("Error building SIWE message: {}", e)))?;
@@ -146,12 +140,6 @@ pub async fn create_capability_delegation(
         .with_proofs(parent_cids);
 
     // Create the SIWE message
-    let issued_at = TimeStamp::try_from(now)
-        .map_err(|e| CliError::CryptoError(format!("Failed to create timestamp: {}", e)))?;
-    let expiration_time = TimeStamp::try_from(expiry).map_err(|e| {
-        CliError::CryptoError(format!("Failed to create expiration timestamp: {}", e))
-    })?;
-
     let message = caps
         .build_message(Message {
             scheme: None,
@@ -160,7 +148,7 @@ pub async fn create_capability_delegation(
             domain: "tinycloud.xyz"
                 .parse()
                 .map_err(|e| CliError::AuthorizationError(format!("Invalid domain: {}", e)))?,
-            issued_at,
+            issued_at: now.into(),
             uri: recipient_did.parse().map_err(|e| {
                 CliError::AuthorizationError(format!("Invalid recipient DID URI: {}", e))
             })?,
@@ -169,7 +157,7 @@ pub async fn create_capability_delegation(
             resources: vec![],
             version: Version::V1,
             not_before: None,
-            expiration_time: Some(expiration_time),
+            expiration_time: Some(expiry.into()),
             request_id: None,
         })
         .map_err(|e| CliError::AuthorizationError(format!("Error building SIWE message: {}", e)))?;
@@ -254,7 +242,7 @@ mod tests {
             .parse()
             .unwrap();
         let orbit: OrbitId =
-            "tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890://test/"
+            "tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890://test"
                 .parse()
                 .unwrap();
         let host: DIDURLBuf = "did:key:test".parse().unwrap();
@@ -269,7 +257,7 @@ mod tests {
             .parse()
             .unwrap();
         let orbit: OrbitId =
-            "tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890://test/"
+            "tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890://test"
                 .parse()
                 .unwrap();
         let capabilities = vec![

@@ -17,7 +17,7 @@ pub async fn handle_host_command(
     key: &EthereumKey,
     client: &TinyCloudClient,
     orbit_name: &str,
-    ttl: u64
+    ttl: u64,
 ) -> Result<()> {
     // 1. Generate orbit ID from user's DID
     let orbit_id = generate_orbit_id(key.get_did(), orbit_name)?;
@@ -54,15 +54,9 @@ pub async fn handle_delegate_command(
     }
 
     // Create capability delegation
-    let delegation = create_capability_delegation(
-        key,
-        recipient,
-        orbit,
-        &capabilities,
-        parent_cids,
-        ttl,
-    )
-    .await?;
+    let delegation =
+        create_capability_delegation(key, recipient, orbit, &capabilities, parent_cids, ttl)
+            .await?;
 
     // Submit delegation to server
     let cid = client.delegate(&delegation).await?;
@@ -221,7 +215,6 @@ pub async fn handle_invoke_cap_get(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mockito::{Mock, Server};
 
     #[tokio::test]
     async fn test_handle_host_command() {

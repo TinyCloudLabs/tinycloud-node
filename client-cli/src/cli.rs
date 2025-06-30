@@ -53,7 +53,7 @@ pub enum Commands {
         ttl: u64,
 
         #[arg(long, env = "TINYCLOUD_ETHKEY", value_parser = key_from_hex)]
-        ethkey: EthereumKey,
+        ethkey: Box<EthereumKey>,
 
         /// TinyCloud orbit host URL
         #[arg(
