@@ -17,6 +17,7 @@ pub async fn handle_host_command(
     key: &EthereumKey,
     client: &TinyCloudClient,
     orbit_name: &str,
+    ttl: u64
 ) -> Result<()> {
     // 1. Generate orbit ID from user's DID
     let orbit_id = generate_orbit_id(key.get_did(), orbit_name)?;
@@ -25,7 +26,7 @@ pub async fn handle_host_command(
     let host_did = client.generate_host_key(&orbit_id).await?;
 
     // 3. Create SIWE delegation for orbit hosting
-    let delegation = create_host_delegation(key, &host_did, orbit_id.clone(), 3600).await?;
+    let delegation = create_host_delegation(key, &host_did, orbit_id.clone(), ttl).await?;
 
     // 4. Submit delegation to server
     let _cid = client.delegate(&delegation).await?;
@@ -43,6 +44,7 @@ pub async fn handle_delegate_command(
     orbit: OrbitId,
     permissions: &[String],
     parent_cids: &[Cid],
+    ttl: u64,
 ) -> Result<()> {
     // Parse permissions (format: "service/path=ability1,ability2")
     let capabilities = parse_kv_permissions(permissions)?;
@@ -58,7 +60,7 @@ pub async fn handle_delegate_command(
         orbit,
         &capabilities,
         parent_cids,
-        3600, // 1 hour expiration
+        ttl,
     )
     .await?;
 

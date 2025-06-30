@@ -20,13 +20,14 @@ async fn app() -> Result<()> {
 
     // Route and execute commands
     match args.command {
-        Commands::Host { name, ethkey, url } => {
-            handle_host_command(&ethkey, &url, &name).await?;
+        Commands::Host { name, ethkey, url, ttl } => {
+            handle_host_command(&ethkey, &url, &name, ttl).await?;
         }
         Commands::Delegate {
             recipient,
             permissions,
             common,
+            ttl,
         } => {
             handle_delegate_command(
                 &common.ethkey,
@@ -35,6 +36,7 @@ async fn app() -> Result<()> {
                 common.orbit,
                 &permissions,
                 &common.parents,
+                ttl,
             )
             .await?;
         }

@@ -48,6 +48,10 @@ pub enum Commands {
         #[arg(long, default_value = "default")]
         name: String,
 
+        /// Name of the orbit to create
+        #[arg(long, default_value = "3600")]
+        ttl: u64,
+
         #[arg(long, env = "TINYCLOUD_ETHKEY", value_parser = key_from_hex)]
         ethkey: EthereumKey,
 
@@ -63,6 +67,10 @@ pub enum Commands {
     Delegate {
         /// DID of the recipient
         recipient: DIDURLBuf,
+
+        /// Name of the orbit to create
+        #[arg(long, default_value = "3600")]
+        ttl: u64,
 
         /// Orbit permissions in format "<service>/<path>=ability1,ability2"
         #[arg(long = "permissions")]
