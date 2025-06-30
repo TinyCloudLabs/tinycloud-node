@@ -91,7 +91,7 @@ impl FromStr for EthereumKey {
         let mut private_key = [0u8; 32];
         private_key.copy_from_slice(&bytes);
 
-        Ok(EthereumKey::new(private_key)?)
+        EthereumKey::new(private_key)
     }
 }
 

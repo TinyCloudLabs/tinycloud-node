@@ -1,12 +1,11 @@
 use anyhow::Result;
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::fs::File;
-use libipld::Cid;
-use tinycloud_lib::{resource::OrbitId, ssi::dids::DIDURL};
+use tinycloud_lib::{libipld::Cid, resource::OrbitId, ssi::dids::DIDURL};
 
 use crate::{
-    auth::{create_host_delegation, create_capability_delegation, create_kv_invocation},
+    auth::{create_capability_delegation, create_host_delegation, create_kv_invocation},
     client::TinyCloudClient,
     error::CliError,
     key::EthereumKey,
@@ -21,16 +20,16 @@ pub async fn handle_host_command(
 ) -> Result<()> {
     // 1. Generate orbit ID from user's DID
     let orbit_id = generate_orbit_id(key.get_did(), orbit_name)?;
-    
+
     // 2. Get host DID from server
     let host_did = client.generate_host_key(&orbit_id).await?;
-    
+
     // 3. Create SIWE delegation for orbit hosting
     let delegation = create_host_delegation(key, &host_did, orbit_id.clone(), 3600).await?;
-    
+
     // 4. Submit delegation to server
     let _cid = client.delegate(&delegation).await?;
-    
+
     // 5. Output the orbit ID for user reference
     println!("{}", orbit_id);
     Ok(())
@@ -47,11 +46,11 @@ pub async fn handle_delegate_command(
 ) -> Result<()> {
     // Parse permissions (format: "service/path=ability1,ability2")
     let capabilities = parse_kv_permissions(permissions)?;
-    
+
     if capabilities.is_empty() {
         return Err(CliError::InvalidCapability("No capabilities specified".to_string()).into());
     }
-    
+
     // Create capability delegation
     let delegation = create_capability_delegation(
         key,
@@ -60,11 +59,12 @@ pub async fn handle_delegate_command(
         &capabilities,
         parent_cids,
         3600, // 1 hour expiration
-    ).await?;
-    
+    )
+    .await?;
+
     // Submit delegation to server
     let cid = client.delegate(&delegation).await?;
-    
+
     // Output the delegation CID
     println!("{}", cid);
     Ok(())
@@ -84,17 +84,18 @@ pub async fn handle_invoke_kv_get(
         if file_path.exists() {
             return Err(CliError::IoError(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                format!("File already exists: {}", file_path.display())
-            )).into());
+                format!("File already exists: {}", file_path.display()),
+            ))
+            .into());
         }
     }
-    
+
     // Create invocation for KV get operation
     let invocation = create_kv_invocation(key, orbit, path, "get", parent_cids, 300).await?;
-    
+
     // Execute the invocation
     let data = client.invoke_get(&invocation).await?;
-    
+
     // Write data to file or stdout
     match file_path {
         Some(file_path) => {
@@ -107,7 +108,7 @@ pub async fn handle_invoke_kv_get(
             io::stdout().flush()?;
         }
     }
-    
+
     Ok(())
 }
 
@@ -121,10 +122,10 @@ pub async fn handle_invoke_kv_head(
 ) -> Result<()> {
     // Create invocation for KV metadata operation
     let invocation = create_kv_invocation(key, orbit, path, "metadata", parent_cids, 300).await?;
-    
+
     // Execute the invocation
     let metadata = client.invoke_head(&invocation).await?;
-    
+
     // Output metadata
     println!("{}", metadata);
     Ok(())
@@ -150,21 +151,24 @@ pub async fn handle_invoke_kv_put(
             io::stdin().read_to_end(&mut data)?;
         }
     }
-    
+
     if data.is_empty() {
-        let source = file_path.map(|p| p.display().to_string()).unwrap_or_else(|| "stdin".to_string());
+        let source = file_path
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "stdin".to_string());
         return Err(CliError::IoError(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("No data provided from {}", source)
-        )).into());
+            format!("No data provided from {}", source),
+        ))
+        .into());
     }
-    
+
     // Create invocation for KV put operation
     let invocation = create_kv_invocation(key, orbit, path, "put", parent_cids, 300).await?;
-    
+
     // Execute the invocation
     client.invoke_put(&invocation, data).await?;
-    
+
     Ok(())
 }
 
@@ -178,10 +182,10 @@ pub async fn handle_invoke_kv_delete(
 ) -> Result<()> {
     // Create invocation for KV delete operation
     let invocation = create_kv_invocation(key, orbit, path, "del", parent_cids, 300).await?;
-    
+
     // Execute the invocation
     client.invoke_delete(&invocation).await?;
-    
+
     Ok(())
 }
 
@@ -216,24 +220,23 @@ pub async fn handle_invoke_cap_get(
 mod tests {
     use super::*;
     use mockito::{Mock, Server};
-    
+
     #[tokio::test]
     async fn test_handle_host_command() {
-        let key: EthereumKey = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".parse().unwrap();
-        
+        let key: EthereumKey = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+            .parse()
+            .unwrap();
+
         // Mock server setup would go here
         // This is a placeholder for actual integration tests
         let orbit_id = generate_orbit_id(key.get_did(), "test").unwrap();
         assert!(orbit_id.to_string().contains("test"));
     }
-    
+
     #[test]
     fn test_permission_parsing() {
-        let permissions = vec![
-            "/path1=get,put".to_string(),
-            "/path2=del".to_string(),
-        ];
-        
+        let permissions = vec!["/path1=get,put".to_string(), "/path2=del".to_string()];
+
         let parsed = parse_kv_permissions(&permissions).unwrap();
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].0, "/path1");

@@ -8485,7 +8485,6 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "hex",
- "libipld",
  "mockito",
  "reqwest 0.12.20",
  "serde",

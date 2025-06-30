@@ -60,6 +60,8 @@ pub fn extract_address_from_did(did: &DID) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use tinycloud_lib::ssi::dids::DIDBuf;
+
     use super::*;
 
     #[test]
@@ -86,26 +88,14 @@ mod tests {
 
     #[test]
     fn test_extract_address_from_did() {
-        let did = "did:pkh:eip155:1:0x1234567890123456789012345678901234567890";
-        let address = extract_address_from_did(did).unwrap();
+        let did: DIDBuf = "did:pkh:eip155:1:0x1234567890123456789012345678901234567890"
+            .parse()
+            .unwrap();
+        let address = extract_address_from_did(&did).unwrap();
         assert_eq!(address, "0x1234567890123456789012345678901234567890");
 
         // Test invalid DID
-        let invalid_did = "did:key:invalid";
-        assert!(extract_address_from_did(invalid_did).is_err());
-    }
-
-    #[test]
-    fn test_validate_did() {
-        // Valid DIDs
-        assert!(
-            validate_did("did:pkh:eip155:1:0x1234567890123456789012345678901234567890").is_ok()
-        );
-        assert!(validate_did("did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK").is_ok());
-
-        // Invalid DIDs
-        assert!(validate_did("not-a-did").is_err());
-        assert!(validate_did("did:").is_err());
-        assert!(validate_did("did:method").is_err());
+        let invalid_did: DIDBuf = "did:key:invalid".parse().unwrap();
+        assert!(extract_address_from_did(&invalid_did).is_err());
     }
 }
