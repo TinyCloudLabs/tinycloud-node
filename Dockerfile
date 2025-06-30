@@ -19,6 +19,7 @@ COPY ./siwe/ ./siwe/
 COPY ./siwe-recap/ ./siwe-recap/
 COPY ./ucan-capabilities/ ./ucan-capabilities/
 COPY ./cacao/ ./cacao/
+COPY ./client-cli/ ./client-cli/
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
