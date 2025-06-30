@@ -1,6 +1,6 @@
 use crate::error::CliError;
 use anyhow::Result;
-use tinycloud_lib::resource::OrbitId;
+use tinycloud_lib::{resource::OrbitId, ssi::dids::DID};
 
 /// Generate an orbit ID from a DID and name
 pub fn generate_orbit_id(did: &str, name: &str) -> Result<OrbitId> {
@@ -42,7 +42,7 @@ pub fn parse_kv_permissions(permissions: &[String]) -> Result<Vec<(String, Vec<S
 }
 
 /// Extract Ethereum address from a DID
-pub fn extract_address_from_did(did: &str) -> Result<String> {
+pub fn extract_address_from_did(did: &DID) -> Result<String> {
     // Extract Ethereum address from did:pkh:eip155:1:0x... format
     if let Some(addr) = did.strip_prefix("did:pkh:eip155:1:") {
         if addr.starts_with("0x") && addr.len() == 42 {
@@ -56,23 +56,6 @@ pub fn extract_address_from_did(did: &str) -> Result<String> {
                 .into(),
         )
     }
-}
-
-/// Validate that a string looks like a valid DID
-pub fn validate_did(did: &str) -> Result<()> {
-    if !did.starts_with("did:") {
-        return Err(CliError::InvalidDid("DID must start with 'did:'".to_string()).into());
-    }
-
-    let parts: Vec<&str> = did.split(':').collect();
-    if parts.len() < 3 {
-        return Err(CliError::InvalidDid(
-            "DID must have at least method and identifier".to_string(),
-        )
-        .into());
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]

@@ -1,8 +1,11 @@
+use std::str::FromStr;
+
 use anyhow::Result;
 use reqwest::{Client, Url};
 use tinycloud_lib::{authorization::{HeaderEncode, TinyCloudDelegation, TinyCloudInvocation}, resource::OrbitId};
 use crate::error::CliError;
 
+#[derive(Debug, Clone)]
 pub struct TinyCloudClient {
     client: Client,
     base_url: Url,
@@ -148,6 +151,15 @@ impl TinyCloudClient {
         }
         
         Ok(())
+    }
+}
+
+impl FromStr for TinyCloudClient {
+    type Err = <Url as FromStr>::Err;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let base_url = Url::parse(s)?;
+        Ok(TinyCloudClient::new(base_url))
     }
 }
 

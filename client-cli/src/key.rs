@@ -1,9 +1,9 @@
-use std::str::FromStr;
+use std::{fmt::Debug, str::FromStr};
 
 use anyhow::{anyhow, Result};
 use tinycloud_lib::ssi::{
     crypto::k256::SecretKey,
-    dids::{DIDBuf, DIDResolver, DID, DIDPKH},
+    dids::{DIDBuf, DID, DIDPKH},
     jwk::{ECParams, Params, JWK},
 };
 
@@ -14,6 +14,14 @@ pub struct EthereumKey {
     secret_key: SecretKey,
     jwk: JWK,
     did: DIDBuf,
+}
+
+impl Debug for EthereumKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EthereumKey")
+            .field("did", &self.did)
+            .finish()
+    }
 }
 
 impl EthereumKey {
@@ -27,7 +35,6 @@ impl EthereumKey {
         jwk.algorithm = Some(tinycloud_lib::ssi::jwk::Algorithm::ES256KR);
 
         // Generate DID
-        // let did = format!("did:pkh:eip155:1:{}", address).parse()?;
         let did = DIDPKH::generate(&jwk, "eip155:1")?;
 
         Ok(Self {
@@ -43,10 +50,6 @@ impl EthereumKey {
 
     pub fn get_did(&self) -> &DID {
         &self.did
-    }
-
-    pub fn get_verification_method(&self) -> String {
-        format!("{}#blockchainAccountId", self.did)
     }
 
     pub fn get_secret_key(&self) -> &SecretKey {
@@ -99,29 +102,25 @@ mod tests {
     #[test]
     fn test_ethereum_key_from_hex() {
         // Test with 0x prefix
-        let key1 = EthereumKey::from_hex(
-            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-        );
+        let key1: Result<EthereumKey, _> =
+            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".parse();
         assert!(key1.is_ok());
 
         // Test without 0x prefix
-        let key2 = EthereumKey::from_hex(
-            "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-        );
+        let key2: Result<EthereumKey, _> =
+            "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".parse();
         assert!(key2.is_ok());
 
         // Test invalid length
-        let key3 = EthereumKey::from_hex("0x1234");
+        let key3: Result<EthereumKey, _> = "0x1234".parse();
         assert!(key3.is_err());
     }
 
     #[test]
     fn test_did_format() {
-        let key = EthereumKey::from_hex(
-            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-        )
-        .unwrap();
-        assert!(key.get_did().starts_with("did:pkh:eip155:1:0x"));
-        assert_eq!(key.get_address().len(), 42); // 0x + 40 hex chars
+        let key: EthereumKey = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+            .parse()
+            .unwrap();
+        assert!(key.get_did().as_str().starts_with("did:pkh:eip155:1:0x"));
     }
 }

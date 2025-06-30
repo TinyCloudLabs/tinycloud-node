@@ -1,32 +1,42 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
-use reqwest::Url;
+use clap::{Args, Parser, Subcommand};
 use tinycloud_lib::{libipld::Cid, resource::OrbitId, ssi::dids::DIDURLBuf};
 
-use crate::key::EthereumKey;
+use crate::{client::TinyCloudClient, key::EthereumKey};
 
 #[derive(Parser)]
 #[command(name = "tinycloud-client")]
 #[command(about = "A CLI client for TinyCloud Protocol")]
 pub struct Cli {
-    /// Hex-encoded Ethereum private key
-    #[arg(long, env = "TINYCLOUD_ETHKEY", value_parser = key_from_hex)]
-    pub ethkey: EthereumKey,
-
-    /// TinyCloud orbit host URL
-    #[arg(long, default_value = "https://demo.tinycloud.xyz")]
-    pub url: Url,
-
-    /// Parent capability CIDs
-    #[arg(long)]
-    pub parent: Vec<Cid>,
-
     #[command(subcommand)]
     pub command: Commands,
 }
 
 fn key_from_hex(hex: &str) -> Result<EthereumKey> {
     hex.parse()
+}
+
+#[derive(Debug, Args)]
+pub struct Common {
+    /// Hex-encoded Ethereum private key
+    #[arg(long, env = "TINYCLOUD_ETHKEY", value_parser = key_from_hex)]
+    pub ethkey: EthereumKey,
+
+    /// Target orbit ID
+    #[arg(long, env = "TINYCLOUD_ORBIT_ID")]
+    pub orbit: OrbitId,
+
+    /// TinyCloud orbit host URL
+    #[arg(
+        long,
+        default_value = "https://demo.tinycloud.xyz",
+        env = "TINYCLOUD_URL"
+    )]
+    pub url: TinyCloudClient,
+
+    /// Parent capability CIDs
+    #[arg(long, env = "TINYCLOUD_PERMISSIONS")]
+    pub parents: Vec<Cid>,
 }
 
 #[derive(Subcommand)]
@@ -36,23 +46,32 @@ pub enum Commands {
         /// Name of the orbit to create
         #[arg(long, default_value = "default")]
         name: String,
+
+        #[arg(long, env = "TINYCLOUD_ETHKEY", value_parser = key_from_hex)]
+        ethkey: EthereumKey,
+
+        /// TinyCloud orbit host URL
+        #[arg(
+            long,
+            default_value = "https://demo.tinycloud.xyz",
+            env = "TINYCLOUD_URL"
+        )]
+        url: TinyCloudClient,
     },
     /// Delegate capabilities to another entity
     Delegate {
-        /// Target orbit ID
-        #[arg(long)]
-        orbit: OrbitId,
         /// DID of the recipient
         recipient: DIDURLBuf,
-        /// KV permissions in format "path=ability1,ability2"
-        #[arg(long = "kv")]
-        kv_permissions: Vec<String>,
+
+        /// Orbit permissions in format "<service>/<path>=ability1,ability2"
+        #[arg(long = "permissions")]
+        permissions: Vec<String>,
+
+        #[command(flatten)]
+        common: Common,
     },
     /// Invoke an operation using existing capabilities
     Invoke {
-        /// Target orbit ID
-        #[arg(long)]
-        orbit: OrbitId,
         #[command(subcommand)]
         operation: InvokeCommands,
     },
@@ -65,6 +84,10 @@ pub enum InvokeCommands {
         #[command(subcommand)]
         action: KvCommands,
     },
+    Capabilities {
+        #[command(subcommand)]
+        action: CapCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -73,20 +96,49 @@ pub enum KvCommands {
     Get {
         /// Path to the key
         path: String,
+
+        #[command(flatten)]
+        common: Common,
     },
     /// Get metadata about a key
     Head {
         /// Path to the key
         path: String,
+
+        #[command(flatten)]
+        common: Common,
     },
     /// Put a value into the key-value store (reads from stdin)
     Put {
         /// Path to the key
         path: String,
+
+        #[command(flatten)]
+        common: Common,
     },
     /// Delete a key from the key-value store
     Delete {
         /// Path to the key
         path: String,
+
+        #[command(flatten)]
+        common: Common,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CapCommands {
+    /// List capabilities
+    List {
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Get details of a specific capability
+    Get {
+        /// Capability CID
+        cid: Cid,
+
+        #[command(flatten)]
+        common: Common,
     },
 }

@@ -9,7 +9,7 @@ use tinycloud_lib::{
     },
     resource::OrbitId,
     siwe_recap::Capability,
-    ssi::crypto::k256::{ecdsa::SigningKey, SecretKey},
+    ssi::{crypto::k256::{ecdsa::SigningKey, SecretKey}, dids::DIDURL},
 };
 use libipld::Cid;
 use serde_json::Value;
@@ -78,7 +78,7 @@ pub async fn create_host_delegation(
 /// Create a SIWE CACAO delegation for specific capabilities
 pub async fn create_capability_delegation(
     delegator_key: &EthereumKey,
-    recipient_did: &str,
+    recipient_did: &DIDURL,
     orbit_id: OrbitId,
     capabilities: &[(String, Vec<String>)], // (path, abilities)
     parent_cids: &[Cid],
@@ -226,8 +226,8 @@ mod tests {
     
     #[tokio::test]
     async fn test_host_delegation_creation() {
-        let key = EthereumKey::from_hex("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef").unwrap();
-        let orbit = "tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890://test/";
+        let key: EthereumKey = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".parse().unwrap();
+        let orbit: OrbitId = "tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890://test/".parse().unwrap();
         
         let result = create_host_delegation(&key, "did:key:test", orbit, 3600).await;
         assert!(result.is_ok());
@@ -235,8 +235,8 @@ mod tests {
     
     #[tokio::test]
     async fn test_capability_delegation_creation() {
-        let key = EthereumKey::from_hex("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef").unwrap();
-        let orbit = "tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890://test/";
+        let key: EthereumKey = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".parse().unwrap();
+        let orbit: OrbitId = "tinycloud:pkh:eip155:1:0x1234567890123456789012345678901234567890://test/".parse().unwrap();
         let capabilities = vec![
             ("/path1".to_string(), vec!["get".to_string(), "put".to_string()]),
             ("/path2".to_string(), vec!["del".to_string()]),

@@ -1,14 +1,14 @@
 use anyhow::Result;
 use std::io::{self, Read, Write};
 use libipld::Cid;
-use tinycloud_lib::resource::OrbitId;
+use tinycloud_lib::{resource::OrbitId, ssi::dids::DIDURL};
 
 use crate::{
     auth::{create_host_delegation, create_capability_delegation, create_kv_invocation},
     client::TinyCloudClient,
     error::CliError,
     key::EthereumKey,
-    utils::{generate_orbit_id, parse_kv_permissions, validate_did},
+    utils::{generate_orbit_id, parse_kv_permissions},
 };
 
 /// Handle the host command - creates and hosts a new orbit
@@ -38,16 +38,13 @@ pub async fn handle_host_command(
 pub async fn handle_delegate_command(
     key: &EthereumKey,
     client: &TinyCloudClient,
-    recipient: &str,
+    recipient: &DIDURL,
     orbit: OrbitId,
-    kv_permissions: &[String],
+    permissions: &[String],
     parent_cids: &[Cid],
 ) -> Result<()> {
-    // Validate recipient DID
-    validate_did(recipient)?;
-    
-    // Parse KV permissions (format: "path=ability1,ability2")
-    let capabilities = parse_kv_permissions(kv_permissions)?;
+    // Parse permissions (format: "service/path=ability1,ability2")
+    let capabilities = parse_kv_permissions(permissions)?;
     
     if capabilities.is_empty() {
         return Err(CliError::InvalidCapability("No capabilities specified".to_string()).into());
@@ -155,6 +152,33 @@ pub async fn handle_invoke_kv_delete(
     Ok(())
 }
 
+/// Handle capability list operation
+pub async fn handle_invoke_cap_list(
+    _key: &EthereumKey,
+    _client: &TinyCloudClient,
+    _orbit: OrbitId,
+    _parent_cids: &[Cid],
+) -> Result<()> {
+    // TODO: Implement capability listing
+    // This would need client support for capability listing
+    println!("Capability listing not yet implemented");
+    Ok(())
+}
+
+/// Handle capability get operation
+pub async fn handle_invoke_cap_get(
+    _key: &EthereumKey,
+    _client: &TinyCloudClient,
+    _orbit: OrbitId,
+    _cid: Cid,
+    _parent_cids: &[Cid],
+) -> Result<()> {
+    // TODO: Implement capability retrieval
+    // This would need client support for capability retrieval
+    println!("Capability retrieval not yet implemented");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,12 +186,12 @@ mod tests {
     
     #[tokio::test]
     async fn test_handle_host_command() {
-        let key = EthereumKey::from_hex("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef").unwrap();
+        let key: EthereumKey = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".parse().unwrap();
         
         // Mock server setup would go here
         // This is a placeholder for actual integration tests
         let orbit_id = generate_orbit_id(key.get_did(), "test").unwrap();
-        assert!(orbit_id.contains("test"));
+        assert!(orbit_id.to_string().contains("test"));
     }
     
     #[test]
