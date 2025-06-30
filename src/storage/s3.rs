@@ -107,11 +107,7 @@ impl S3BlockStore {
     }
 
     fn key(&self, orbit: &OrbitId, id: &Hash) -> String {
-        format!(
-            "{}/{}",
-            orbit,
-            URL_SAFE.encode(id.as_ref())
-        )
+        format!("{}/{}", orbit, URL_SAFE.encode(id.as_ref()))
     }
 
     async fn increment_size(&self, orbit: &OrbitId, size: u64) {
