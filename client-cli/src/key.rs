@@ -12,7 +12,6 @@ use crate::error::CliError;
 #[derive(Clone)]
 pub struct EthereumKey {
     secret_key: SecretKey,
-    jwk: JWK,
     did: DIDBuf,
 }
 
@@ -30,22 +29,16 @@ impl EthereumKey {
         let secret_key = SecretKey::from_bytes(&private_key.into())
             .map_err(|e| anyhow!("Invalid secp256k1 private key: {}", e))?;
 
-        // Create JWK
-        let mut jwk: JWK = Params::EC(ECParams::from(&secret_key)).into();
-        jwk.algorithm = Some(tinycloud_lib::ssi::jwk::Algorithm::ES256KR);
-
         // Generate DID
-        let did = DIDPKH::generate(&jwk, "eip155:1")?;
+        let did = DIDPKH::generate(&Params::EC(ECParams::from(&secret_key)).into(), "eip155:1")?;
 
-        Ok(Self {
-            secret_key,
-            jwk,
-            did,
-        })
+        Ok(Self { secret_key, did })
     }
 
-    pub fn get_jwk(&self) -> &JWK {
-        &self.jwk
+    pub fn get_jwk(&self) -> JWK {
+        let mut jwk: JWK = Params::EC(ECParams::from(&self.secret_key)).into();
+        jwk.algorithm = Some(tinycloud_lib::ssi::jwk::Algorithm::ES256KR);
+        jwk
     }
 
     pub fn get_did(&self) -> &DID {

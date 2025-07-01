@@ -30,7 +30,7 @@ pub struct Common {
     /// TinyCloud orbit host URL
     #[arg(
         long,
-        default_value = "https://demo.tinycloud.xyz",
+        default_value = "https://node.tinycloud.xyz",
         env = "TINYCLOUD_URL"
     )]
     pub url: TinyCloudClient,
@@ -53,7 +53,7 @@ pub enum Commands {
         ttl: u64,
 
         #[arg(long, env = "TINYCLOUD_ETHKEY", value_parser = key_from_hex)]
-        ethkey: Box<EthereumKey>,
+        ethkey: EthereumKey,
 
         /// TinyCloud orbit host URL
         #[arg(
