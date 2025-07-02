@@ -9,6 +9,7 @@ use aws_sdk_s3::{
 };
 use aws_smithy_http::{byte_stream::Error as ByteStreamError, endpoint::Endpoint};
 use aws_types::sdk_config::SdkConfig;
+use base64::{engine::general_purpose::URL_SAFE, Engine};
 use futures::{
     future::Either as AsyncEither,
     stream::{IntoAsyncRead, MapErr, TryStreamExt},
@@ -106,11 +107,7 @@ impl S3BlockStore {
     }
 
     fn key(&self, orbit: &OrbitId, id: &Hash) -> String {
-        format!(
-            "{}/{}",
-            orbit,
-            base64::encode_config(id.as_ref(), base64::URL_SAFE)
-        )
+        format!("{}/{}", orbit, URL_SAFE.encode(id.as_ref()))
     }
 
     async fn increment_size(&self, orbit: &OrbitId, size: u64) {

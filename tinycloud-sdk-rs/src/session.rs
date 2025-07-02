@@ -144,7 +144,7 @@ impl Session {
         let exp = ((now.timestamp() + 60i64) as f64) + (now.nanosecond() as f64 / 1_000_000_000.0);
         make_invocation(
             targets.collect(),
-            self.delegation_cid,
+            Some(self.delegation_cid),
             &self.jwk,
             self.verification_method,
             exp,

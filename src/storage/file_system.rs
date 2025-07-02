@@ -1,4 +1,5 @@
 use super::size::OrbitSizes;
+use base64::{engine::general_purpose::URL_SAFE, Engine};
 use core::pin::Pin;
 use futures::{
     future::{Either as AsyncEither, TryFutureExt},
@@ -38,7 +39,7 @@ impl FileSystemStore {
         self.path
             .join(orbit.suffix())
             .join(orbit.name())
-            .join(base64::encode_config(mh.as_ref(), base64::URL_SAFE))
+            .join(URL_SAFE.encode(mh.as_ref()))
     }
 
     async fn increment_size(&self, orbit: &OrbitId, size: u64) {
