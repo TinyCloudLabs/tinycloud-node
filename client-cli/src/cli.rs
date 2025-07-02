@@ -48,7 +48,7 @@ pub enum Commands {
         #[arg(long, default_value = "default")]
         name: String,
 
-        /// Name of the orbit to create
+        /// Time to live in seconds
         #[arg(long, default_value = "3600")]
         ttl: u64,
 
