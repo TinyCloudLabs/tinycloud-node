@@ -10,8 +10,8 @@ use iri_string::types::UriString;
 use siwe::Message;
 
 use ucan_capabilities_object::{
-    Ability, AbilityNameRef, AbilityNamespaceRef, Capabilities, CapsInner, ConvertError,
-    ConvertResult, NotaBeneCollection,
+    Ability, AbilityNameRef, AbilityNamespaceRef, Capabilities, CapsInner, Caveats, ConvertError,
+    ConvertResult,
 };
 
 /// Representation of a set of delegated Capabilities.
@@ -42,7 +42,7 @@ impl<NB> Capability<NB> {
         &self,
         target: T,
         action: A,
-    ) -> ConvertResult<Option<&NotaBeneCollection<NB>>, UriString, Ability, T, A>
+    ) -> ConvertResult<Option<&Caveats<NB>>, UriString, Ability, T, A>
     where
         T: TryInto<UriString>,
         A: TryInto<Ability>,
@@ -51,7 +51,7 @@ impl<NB> Capability<NB> {
     }
 
     /// Check if a particular action is allowed for the specified target, or is allowed globally, without type conversion.
-    pub fn can_do(&self, target: &UriString, action: &Ability) -> Option<&NotaBeneCollection<NB>> {
+    pub fn can_do(&self, target: &UriString, action: &Ability) -> Option<&Caveats<NB>> {
         self.attenuations.can_do(target, action)
     }
 
@@ -138,7 +138,7 @@ impl<NB> Capability<NB> {
     pub fn abilities_for<T>(
         &self,
         target: T,
-    ) -> Result<Option<&BTreeMap<Ability, NotaBeneCollection<NB>>>, T::Error>
+    ) -> Result<Option<&BTreeMap<Ability, Caveats<NB>>>, T::Error>
     where
         T: TryInto<UriString>,
     {
