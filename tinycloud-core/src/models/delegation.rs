@@ -137,7 +137,7 @@ async fn verify(delegation: &TinyCloudDelegation) -> Result<(), Error> {
             ucan.verify_signature(&AnyDidMethod::default())
                 .await
                 .map_err(|_| DelegationError::InvalidSignature)?;
-            ucan.payload
+            ucan.payload()
                 .validate_time(None)
                 .map_err(|_| DelegationError::InvalidTime)?;
         }

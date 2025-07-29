@@ -94,7 +94,7 @@ async fn verify(invocation: &TinyCloudInvocation) -> Result<(), Error> {
         .await
         .map_err(|_| InvocationError::InvalidSignature)?;
     invocation
-        .payload
+        .payload()
         .validate_time(None)
         .map_err(|_| InvocationError::InvalidTime)?;
     Ok(())

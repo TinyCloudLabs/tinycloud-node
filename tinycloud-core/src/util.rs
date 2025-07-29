@@ -1,12 +1,12 @@
 use crate::types::Resource;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
-use tinycloud_lib::siwe_recap::{Capability as SiweCap, VerificationError as SiweError};
 use tinycloud_lib::{
     authorization::{TinyCloudDelegation, TinyCloudInvocation, TinyCloudRevocation},
     cacaos::siwe::Message,
-    ipld_core::Cid,
+    ipld_core::cid::Cid,
     resource::OrbitId,
+    siwe_recap::{Capability as SiweCap, VerificationError as SiweError},
 };
 use ucan_capabilities_object::Capabilities as UcanCapabilities;
 
@@ -24,7 +24,7 @@ pub enum CapExtractError {
     #[error("Invalid Extra Fields")]
     InvalidFields,
     #[error(transparent)]
-    Cid(#[from] tinycloud_lib::libipld::cid::Error),
+    Cid(#[from] tinycloud_lib::ipld_core::cid::Error),
 }
 
 fn extract_ucan_caps<T>(caps: &UcanCapabilities<T>) -> Result<Vec<Capability>, CapExtractError> {
@@ -108,15 +108,15 @@ impl TryFrom<TinyCloudDelegation> for DelegationInfo {
     fn try_from(d: TinyCloudDelegation) -> Result<Self, Self::Error> {
         Ok(match d {
             TinyCloudDelegation::Ucan(ref u) => Self {
-                capabilities: extract_ucan_caps(&u.payload.attenuation)?,
-                delegator: u.payload.issuer.to_string(),
-                delegate: u.payload.audience.to_string(),
-                parents: u.payload.proof.clone(),
+                capabilities: extract_ucan_caps(&u.payload().attenuation)?,
+                delegator: u.payload().issuer.to_string(),
+                delegate: u.payload().audience.to_string(),
+                parents: u.payload().proof.clone(),
                 expiry: OffsetDateTime::from_unix_timestamp_nanos(
-                    (u.payload.expiration.as_seconds() * 1_000_000_000.0) as i128,
+                    (u.payload().expiration.as_seconds() * 1_000_000_000.0) as i128,
                 )
                 .ok(),
-                not_before: u.payload.not_before.and_then(|t| {
+                not_before: u.payload().not_before.and_then(|t| {
                     OffsetDateTime::from_unix_timestamp_nanos(
                         (t.as_seconds() * 1_000_000_000.0) as i128,
                     )
@@ -185,7 +185,7 @@ impl TryFrom<TinyCloudInvocation> for InvocationInfo {
         Ok(Self {
             capabilities: extract_ucan_caps(&invocation.payload().attenuation)?,
             invoker: invocation.payload().issuer.to_string(),
-            parents: invocation.payload.proof.clone(),
+            parents: invocation.payload().proof.clone(),
             invocation,
         })
     }

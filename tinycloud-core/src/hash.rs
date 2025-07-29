@@ -1,18 +1,19 @@
+use multihash_derive::Hasher;
 use sea_orm::entity::prelude::*;
 use sea_orm::DbErr;
-use tinycloud_lib::ipld_core::cid::{
-    multihash::{Blake3_256, Code, Hasher as MHasher, Multihash, MultihashDigest},
-    Cid,
+use tinycloud_lib::{
+    ipld_core::cid::{multihash::Multihash, Cid},
+    multihash_codetable::{Blake3_256, Code, MultihashDigest},
 };
 
 pub fn hash(data: &[u8]) -> Hash {
-    Hasher::new().update(data).finalize()
+    Blake3Hasher::new().update(data).finalize()
 }
 
 #[derive(Debug, Default)]
-pub struct Hasher(Blake3_256);
+pub struct Blake3Hasher(Blake3_256);
 
-impl Hasher {
+impl Blake3Hasher {
     pub fn new() -> Self {
         Self(Blake3_256::default())
     }
@@ -28,7 +29,8 @@ impl Hasher {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Hash(Multihash);
+// todo keep aligning
+pub struct Hash(Multihash<64>);
 
 impl Hash {
     pub fn to_cid(self, codec: u64) -> Cid {
@@ -71,8 +73,8 @@ impl TryFrom<Vec<u8>> for Hash {
     }
 }
 
-impl From<Multihash> for Hash {
-    fn from(value: Multihash) -> Self {
+impl From<Multihash<64>> for Hash {
+    fn from(value: Multihash<64>) -> Self {
         Self(value)
     }
 }

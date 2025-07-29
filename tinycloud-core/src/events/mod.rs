@@ -147,8 +147,6 @@ struct Epoch {
 pub enum HashError {
     #[error("encoding error: {0}")]
     EncodeError(#[from] EncodeError<std::collections::TryReserveError>),
-    #[error("hash error: {0}")]
-    HashError(#[from] MultihashError),
 }
 
 pub(crate) fn epoch_hash(

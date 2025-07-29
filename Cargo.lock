@@ -8317,6 +8317,7 @@ dependencies = [
  "dashmap",
  "futures",
  "libp2p",
+ "multihash-derive 0.9.1",
  "pin-project",
  "sea-orm",
  "sea-orm-migration",
