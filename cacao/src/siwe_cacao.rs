@@ -214,31 +214,27 @@ struct DummyHeader<'a> {
 
 const EIP_4361: &str = "eip4361";
 
-impl <'a>Serialize for Header {
-fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+impl<'a> Serialize for Header {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        DummyHeader {
-            t: EIP_4361,
-        }.serialize(serializer)
-     }
-
+        DummyHeader { t: EIP_4361 }.serialize(serializer)
+    }
 }
 
 #[derive(Error, Debug)]
 #[error("Invalid header type value")]
 struct HeaderTypeErr;
 
-impl<'de> Deserialize<'de> for Header
-{
+impl<'de> Deserialize<'de> for Header {
     fn deserialize<D>(deserializer: D) -> Result<Header, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let ds = DummyHeader::<'de>::deserialize(deserializer)?;
         if ds.t != EIP_4361 {
-            return Err(serde::de::Error::custom(HeaderTypeErr))
+            return Err(serde::de::Error::custom(HeaderTypeErr));
         }
         Ok(Header)
     }
@@ -252,34 +248,41 @@ struct DummySig<'a> {
 
 const EIP_191: &str = "eip191";
 
-impl <'a>Serialize for SIWESignature {
-fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+impl<'a> Serialize for SIWESignature {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
         DummySig {
             s: self.as_ref(),
             t: EIP_191,
-        }.serialize(serializer)
-     }
-
+        }
+        .serialize(serializer)
+    }
 }
 
-impl<'de> Deserialize<'de> for SIWESignature
-{
+impl<'de> Deserialize<'de> for SIWESignature {
     fn deserialize<D>(deserializer: D) -> Result<SIWESignature, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let ds = DummySig::<'de>::deserialize(deserializer)?;
         if ds.t != EIP_191 {
-            return Err(serde::de::Error::custom(SIWESignatureDecodeError::InvalidType(ds.t.to_string())))
+            return Err(serde::de::Error::custom(
+                SIWESignatureDecodeError::InvalidType(ds.t.to_string()),
+            ));
         }
         let l = ds.s.len();
         if l != 65 {
-            return Err(serde::de::Error::custom(SIWESignatureDecodeError::InvalidLength(l)))
+            return Err(serde::de::Error::custom(
+                SIWESignatureDecodeError::InvalidLength(l),
+            ));
         }
-        Ok(SIWESignature(ds.s.try_into().map_err(|_| SIWESignatureDecodeError::InvalidLength(l)).map_err(serde::de::Error::custom)?))
+        Ok(SIWESignature(
+            ds.s.try_into()
+                .map_err(|_| SIWESignatureDecodeError::InvalidLength(l))
+                .map_err(serde::de::Error::custom)?,
+        ))
     }
 }
 
