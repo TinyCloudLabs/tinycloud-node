@@ -2,7 +2,6 @@ use crate::resource::{ResourceCapErr, ResourceId};
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use cacaos::siwe_cacao::SiweCacao;
 use iri_string::validate::Error as UriStringError;
-use libipld::{cbor::DagCborCodec, prelude::*};
 use ssi::{
     claims::jwt::NumericDate,
     dids::{DIDBuf, DIDURLBuf, InvalidDID, InvalidDIDURL},
@@ -13,7 +12,8 @@ use std::str::FromStr;
 use time::error::ComponentRange as TimestampRangeError;
 use uuid::Uuid;
 
-pub use libipld::Cid;
+pub use ipld_core::cid::Cid;
+use serde_ipld_dagcbor;
 
 pub trait HeaderEncode {
     fn encode(&self) -> Result<String, EncodingError>;
@@ -30,12 +30,11 @@ pub enum TinyCloudDelegation {
 
 impl HeaderEncode for TinyCloudDelegation {
     fn encode(&self) -> Result<String, EncodingError> {
-        use std::ops::Deref;
         Ok(match self {
             Self::Ucan(u) => u.encode()?,
             Self::Cacao(c) => {
                 // Use the imported engine and trait method
-                URL_SAFE.encode(DagCborCodec.encode(c.deref())?)
+                URL_SAFE.encode(serde_ipld_dagcbor::to_vec(c)?)
             }
         })
     }
@@ -49,14 +48,14 @@ impl HeaderEncode for TinyCloudDelegation {
         } else {
             // Use the imported engine and trait method
             let v = URL_SAFE.decode(s)?;
-            (Self::Cacao(Box::new(DagCborCodec.decode(&v)?)), v)
+            (Self::Cacao(Box::new(serde_ipld_dagcbor::from_slice(&v)?)), v)
         })
     }
 }
 
 impl TinyCloudDelegation {
     pub fn from_bytes(b: &[u8]) -> Result<Self, EncodingError> {
-        match DagCborCodec.decode(b) {
+        match serde_ipld_dagcbor::from_slice(b) {
             Ok(cacao) => Ok(Self::Cacao(Box::new(cacao))),
             Err(_) => Ok(Self::Ucan(Box::new(Ucan::decode(
                 &String::from_utf8_lossy(b),
@@ -87,13 +86,13 @@ impl HeaderEncode for TinyCloudRevocation {
     fn encode(&self) -> Result<String, EncodingError> {
         match self {
             // Use the imported engine and trait method
-            Self::Cacao(c) => Ok(URL_SAFE.encode(DagCborCodec.encode(&c)?)),
+            Self::Cacao(c) => Ok(URL_SAFE.encode(serde_ipld_dagcbor::to_vec(c)?)),
         }
     }
     fn decode(s: &str) -> Result<(Self, Vec<u8>), EncodingError> {
         // Use the imported engine and trait method
         let v = URL_SAFE.decode(s)?;
-        Ok((Self::Cacao(DagCborCodec.decode(&v)?), v))
+        Ok((Self::Cacao(serde_ipld_dagcbor::from_slice(&v)?), v))
     }
 }
 
@@ -120,10 +119,33 @@ pub async fn make_invocation(
         nonce: Some(nonce.unwrap_or_else(|| format!("urn:uuid:{}", Uuid::new_v4()))),
         facts: None,
         proof: vec![delegation],
-        attenuation: invocation_target
-            .into_iter()
-            .map(|t| t.try_into())
-            .collect::<Result<Vec<ssi::ucan::Capability>, _>>()?,
+        attenuation: {
+            // The attenuation field expects Capabilities<A>, not Vec<Capability>
+            let mut caps = ucan_capabilities_object::Capabilities::new();
+            for resource in invocation_target {
+                // Create the resource URI
+                let resource_uri = iri_string::types::UriString::try_from(format!(
+                    "{}/{}{}",
+                    resource.orbit(),
+                    resource.service().unwrap_or(""),
+                    resource.path().unwrap_or("")
+                )).map_err(|e| InvocationError::UriString(e.validation_error()))?;
+                
+                // Create the action string with tinycloud namespace
+                let action = match resource.service() {
+                    Some(s) => format!("tinycloud.{}.{}", s, resource.fragment().ok_or(InvocationError::ResourceCap(ResourceCapErr::MissingAction))?),
+                    None => format!("tinycloud.{}", resource.fragment().ok_or(InvocationError::ResourceCap(ResourceCapErr::MissingAction))?),
+                };
+                
+                caps.with_action(
+                    resource_uri,
+                    ucan_capabilities_object::Ability::try_from(action)
+                        .map_err(|_| InvocationError::ResourceCap(ResourceCapErr::MissingAction))?,
+                    vec![], // No caveats
+                );
+            }
+            caps
+        },
     }
     .sign(jwk.get_algorithm().unwrap_or_default(), jwk)?)
 }
@@ -151,7 +173,9 @@ pub enum EncodingError {
     #[error(transparent)]
     SSIError(#[from] ssi::ucan::error::Error),
     #[error(transparent)]
-    IpldError(#[from] libipld::error::Error),
+    IpldEncode(#[from] serde_ipld_dagcbor::EncodeError<std::collections::TryReserveError>),
+    #[error(transparent)]
+    IpldDecode(#[from] serde_ipld_dagcbor::DecodeError<core::convert::Infallible>),
     #[error(transparent)]
     Base64(#[from] base64::DecodeError),
 }

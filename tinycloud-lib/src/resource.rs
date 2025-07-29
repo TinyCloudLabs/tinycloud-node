@@ -1,21 +1,9 @@
+use ipld_core::cid::Cid;
 use iri_string::types::UriString;
-use libipld::{
-    cbor::DagCborCodec,
-    cid::{
-        multihash::{Code, MultihashDigest},
-        Cid,
-    },
-    codec::{Decode, Encode},
-    error::Error as IpldError,
-};
+use multihash_codetable::{Code, MultihashDigest};
 use serde_with::{DeserializeFromStr, SerializeDisplay};
-use ssi::{
-    dids::{DIDBuf, DIDURLBuf as DIDURL, DID},
-    json_ld::iref::UriBuf,
-    ucan::{Capability, UcanResource, UcanScope},
-};
+use ssi::dids::{DIDBuf, DIDURLBuf as DIDURL, DID};
 
-use std::io::{Read, Seek, Write};
 use std::{convert::TryFrom, fmt, str::FromStr};
 use thiserror::Error;
 
@@ -149,44 +137,8 @@ pub enum ResourceCapErr {
     CapabilityUriParse(#[from] ssi::json_ld::iref::uri::InvalidUri<String>), // Add From implementation
 }
 
-impl TryInto<Capability> for ResourceId {
-    type Error = ResourceCapErr;
-    fn try_into(self) -> Result<Capability, Self::Error> {
-        Ok(Capability {
-            with: UcanResource::URI(UriBuf::from_str(&format!(
-                "{}/{}{}",
-                &self.orbit,
-                &self.service.as_deref().unwrap_or(""),
-                &self.path.as_deref().unwrap_or("")
-            ))?), // Error automatically converted via From
-            can: UcanScope {
-                namespace: match self.service {
-                    Some(s) => format!("tinycloud.{s}"),
-                    None => "tinycloud".to_string(),
-                },
-                capability: self.fragment.ok_or(ResourceCapErr::MissingAction)?,
-            },
-            additional_fields: None,
-        })
-    }
-}
-
-impl<T> TryFrom<&Capability<T>> for ResourceId {
-    type Error = KRIParseError;
-    fn try_from(c: &Capability<T>) -> Result<Self, Self::Error> {
-        let n = &c.can.namespace;
-        let mut r = Self::from_str(&c.with.to_string())?;
-        if n.starts_with("tinycloud")
-            && ((n.get(9..10) == Some(".") && n.get(10..) == r.service.as_deref())
-                || (n.get(9..10).is_none() && r.service.is_none()))
-        {
-            r.fragment = Some(c.can.capability.clone());
-            Ok(r)
-        } else {
-            Err(KRIParseError::IncorrectForm)
-        }
-    }
-}
+// Removed TryInto<Capability> and TryFrom<&Capability> implementations
+// as they are no longer needed with the new UCAN structure that uses Capabilities<A> directly
 
 #[derive(Error, Debug)]
 pub enum ResourceCheckError {
@@ -294,24 +246,6 @@ impl FromStr for ResourceId {
             }),
             _ => Err(Self::Err::IncorrectForm),
         }
-    }
-}
-
-impl Encode<DagCborCodec> for ResourceId {
-    fn encode<W>(&self, c: DagCborCodec, w: &mut W) -> Result<(), IpldError>
-    where
-        W: Write,
-    {
-        self.to_string().encode(c, w)
-    }
-}
-
-impl Decode<DagCborCodec> for ResourceId {
-    fn decode<R>(c: DagCborCodec, r: &mut R) -> Result<Self, IpldError>
-    where
-        R: Read + Seek,
-    {
-        Ok(String::decode(c, r)?.parse()?)
     }
 }
 

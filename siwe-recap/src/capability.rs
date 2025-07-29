@@ -1,5 +1,5 @@
 use crate::RESOURCE_PREFIX;
-use libipld::Cid;
+use ipld_core::cid::{multibase, Cid};
 use std::{collections::BTreeMap, fmt::Write};
 
 use serde::{Deserialize, Serialize};
@@ -364,7 +364,7 @@ impl SerializeAs<Cid> for B58Cid {
     {
         serializer.serialize_str(
             &source
-                .to_string_of_base(libipld::cid::multibase::Base::Base58Btc)
+                .to_string_of_base(multibase::Base::Base58Btc)
                 .map_err(serde::ser::Error::custom)?,
         )
     }

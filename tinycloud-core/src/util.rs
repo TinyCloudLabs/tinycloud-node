@@ -5,10 +5,10 @@ use tinycloud_lib::siwe_recap::{Capability as SiweCap, VerificationError as Siwe
 use tinycloud_lib::{
     authorization::{TinyCloudDelegation, TinyCloudInvocation, TinyCloudRevocation},
     cacaos::siwe::Message,
-    libipld::Cid,
+    ipld_core::Cid,
     resource::OrbitId,
-    ssi::ucan::Capability as UcanCap,
 };
+use ucan_capabilities_object::Capabilities as UcanCapabilities;
 
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Capability {
@@ -25,20 +25,27 @@ pub enum CapExtractError {
     InvalidFields,
     #[error(transparent)]
     Cid(#[from] tinycloud_lib::libipld::cid::Error),
-    #[error("Incorrect UCAN action namespace")]
-    UcanNamespace,
 }
 
-fn extract_ucan_cap<T>(c: &UcanCap<T>) -> Result<Capability, CapExtractError> {
-    Ok(Capability {
-        resource: c.with.to_string().into(),
-        action: c
-            .can
-            .to_string()
-            .strip_prefix("tinycloud.")
-            .ok_or(CapExtractError::UcanNamespace)?
-            .to_string(),
-    })
+fn extract_ucan_caps<T>(caps: &UcanCapabilities<T>) -> Result<Vec<Capability>, CapExtractError> {
+    let mut capabilities = Vec::new();
+
+    // Iterate over all capabilities in the Capabilities object
+    for (resource_uri, abilities) in caps.abilities() {
+        for ability in abilities.keys() {
+            let ability_str = ability.to_string();
+
+            // Only process tinycloud capabilities, skip others
+            if let Some(action) = ability_str.strip_prefix("tinycloud.") {
+                capabilities.push(Capability {
+                    resource: resource_uri.to_string().into(),
+                    action: action.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(capabilities)
 }
 
 fn extract_siwe_cap(c: SiweCap<()>) -> Result<(Vec<Capability>, Vec<Cid>), CapExtractError> {
@@ -101,12 +108,7 @@ impl TryFrom<TinyCloudDelegation> for DelegationInfo {
     fn try_from(d: TinyCloudDelegation) -> Result<Self, Self::Error> {
         Ok(match d {
             TinyCloudDelegation::Ucan(ref u) => Self {
-                capabilities: u
-                    .payload
-                    .attenuation
-                    .iter()
-                    .map(extract_ucan_cap)
-                    .collect::<Result<Vec<Capability>, CapExtractError>>()?,
+                capabilities: extract_ucan_caps(&u.payload.attenuation)?,
                 delegator: u.payload.issuer.to_string(),
                 delegate: u.payload.audience.to_string(),
                 parents: u.payload.proof.clone(),
@@ -181,13 +183,8 @@ impl TryFrom<TinyCloudInvocation> for InvocationInfo {
     type Error = InvocationError;
     fn try_from(invocation: TinyCloudInvocation) -> Result<Self, Self::Error> {
         Ok(Self {
-            capabilities: invocation
-                .payload
-                .attenuation
-                .iter()
-                .map(extract_ucan_cap)
-                .collect::<Result<Vec<Capability>, CapExtractError>>()?,
-            invoker: invocation.payload.issuer.to_string(),
+            capabilities: extract_ucan_caps(&invocation.payload().attenuation)?,
+            invoker: invocation.payload().issuer.to_string(),
             parents: invocation.payload.proof.clone(),
             invocation,
         })

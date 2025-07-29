@@ -9,10 +9,8 @@ pub use tinycloud_lib::{
     authorization::{
         EncodingError, HeaderEncode, TinyCloudDelegation, TinyCloudInvocation, TinyCloudRevocation,
     },
-    libipld::cid::{
-        multihash::{Code, Error as MultihashError, MultihashDigest},
-        Cid,
-    },
+    ipld_core::cid::Cid,
+    multihash_codetable::Code,
     resource::OrbitId,
 };
 

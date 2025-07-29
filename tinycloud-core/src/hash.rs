@@ -1,6 +1,6 @@
 use sea_orm::entity::prelude::*;
 use sea_orm::DbErr;
-use tinycloud_lib::libipld::cid::{
+use tinycloud_lib::ipld_core::cid::{
     multihash::{Blake3_256, Code, Hasher as MHasher, Multihash, MultihashDigest},
     Cid,
 };

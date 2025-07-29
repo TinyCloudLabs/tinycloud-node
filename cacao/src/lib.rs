@@ -1,32 +1,30 @@
 use std::fmt::Debug;
 
 use async_trait::async_trait;
-use libipld::{cbor::DagCbor, DagCbor};
+use serde::{Deserialize, Serialize};
 pub use siwe;
 
 pub mod siwe_cacao;
 
-#[derive(DagCbor, Debug, Clone, PartialEq)]
-pub struct CACAO<S, T>
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct CACAO<S, R>
 where
-    S: SignatureScheme<T>,
-    S::Signature: DagCbor,
-    T: Representation,
+    S: SignatureScheme<R>,
+    R: Representation,
 {
-    h: T::Header,
-    p: T::Payload,
+    h: R::Header,
+    p: R::Payload,
     s: S::Signature,
 }
 
 impl<S, R> CACAO<S, R>
 where
     S: SignatureScheme<R>,
-    S::Signature: DagCbor,
     R: Representation,
 {
-    pub fn new(p: R::Payload, s: S::Signature, h: Option<R::Header>) -> Self {
+    pub fn new(p: R::Payload, s: S::Signature, h: R::Header) -> Self {
         Self {
-            h: h.unwrap_or_else(R::header),
+            h,
             p,
             s,
         }
@@ -56,9 +54,8 @@ where
 }
 
 pub trait Representation {
-    type Payload: DagCbor;
-    type Header: DagCbor;
-    fn header() -> Self::Header;
+    type Payload;
+    type Header;
 }
 
 #[async_trait]
@@ -68,16 +65,14 @@ where
 {
     type Signature: Debug;
     type Err;
-    async fn verify(payload: &T::Payload, sig: &Self::Signature) -> Result<(), Self::Err>
-    where
-        Self::Signature: Send + Sync;
+    async fn verify(payload: &T::Payload, sig: &Self::Signature) -> Result<(), Self::Err>;
 
     async fn verify_cacao(cacao: &CACAO<Self, T>) -> Result<(), Self::Err>
     where
         Self: Sized,
-        Self::Signature: Send + Sync + Debug + DagCbor,
-        T::Payload: Send + Sync + Debug,
-        T::Header: Send + Sync + Debug,
+        Self::Signature: Send + Sync,
+        T::Payload: Send + Sync,
+        T::Header: Send + Sync,
     {
         Self::verify(cacao.payload(), cacao.signature()).await
     }
