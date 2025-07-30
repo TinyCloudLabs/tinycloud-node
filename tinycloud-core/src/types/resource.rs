@@ -93,8 +93,8 @@ impl From<String> for Resource {
 impl Display for Resource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Resource::TinyCloud(resource_id) => write!(f, "{}", resource_id),
-            Resource::Other(s) => write!(f, "{}", s),
+            Resource::TinyCloud(resource_id) => write!(f, "{resource_id}"),
+            Resource::Other(s) => write!(f, "{s}"),
         }
     }
 }

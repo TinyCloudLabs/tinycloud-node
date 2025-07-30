@@ -146,7 +146,7 @@ async fn store_sizes<P: AsRef<Path>>(path: &P) -> Result<HashMap<OrbitId, u64>, 
             ) {
                 let mut ds = ReadDirStream::new(tokio::fs::read_dir(entry.path()).await?);
                 let did: DIDBuf = ["did:", suffix.as_str()].concat().parse().map_err(|_| {
-                    IoError::new(ErrorKind::InvalidData, format!("Invalid DID: {}", suffix))
+                    IoError::new(ErrorKind::InvalidData, format!("Invalid DID: {suffix}"))
                 })?;
                 // go through each suffix directory
                 while let Some(entry) = ds.try_next().await? {

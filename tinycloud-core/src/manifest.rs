@@ -180,12 +180,12 @@ mod tests {
         did.push_str("#default");
         let did: DIDURLBuf = did.parse().unwrap();
 
-        println!("DID: {:#?}", did);
+        println!("DID: {did:#?}");
 
         let md = Manifest::resolve(&did.try_into().unwrap(), &AnyDidMethod::default())
             .await
             .unwrap()
             .unwrap();
-        println!("Manifest: {:#?}", md);
+        println!("Manifest: {md:#?}");
     }
 }
