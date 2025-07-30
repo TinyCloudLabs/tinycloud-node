@@ -1,14 +1,11 @@
-use multihash_derive::Hasher;
 use libp2p::identity::{
     ed25519::{Keypair as EdKP, SecretKey},
     DecodingError,
 };
+use multihash_derive::Hasher;
 use sea_orm_migration::async_trait::async_trait;
 use std::error::Error as StdError;
-use tinycloud_lib::{
-    multihash_codetable::Blake3_256,
-    resource::OrbitId,
-};
+use tinycloud_lib::{multihash_codetable::Blake3_256, resource::OrbitId};
 
 pub use libp2p::{
     identity::{Keypair, PublicKey},

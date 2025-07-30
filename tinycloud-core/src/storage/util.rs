@@ -1,4 +1,4 @@
-use crate::hash::{Hash, Blake3Hasher};
+use crate::hash::{Blake3Hasher, Hash};
 use core::pin::Pin;
 use futures::{
     io::AsyncWrite,

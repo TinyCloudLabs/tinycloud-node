@@ -214,7 +214,7 @@ struct DummyHeader<'a> {
 
 const EIP_4361: &str = "eip4361";
 
-impl<'a> Serialize for Header {
+impl Serialize for Header {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,

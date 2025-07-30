@@ -48,7 +48,10 @@ impl HeaderEncode for TinyCloudDelegation {
         } else {
             // Use the imported engine and trait method
             let v = URL_SAFE.decode(s)?;
-            (Self::Cacao(Box::new(serde_ipld_dagcbor::from_slice(&v)?)), v)
+            (
+                Self::Cacao(Box::new(serde_ipld_dagcbor::from_slice(&v)?)),
+                v,
+            )
         })
     }
 }
@@ -129,14 +132,26 @@ pub async fn make_invocation(
                     resource.orbit(),
                     resource.service().unwrap_or(""),
                     resource.path().unwrap_or("")
-                )).map_err(|e| InvocationError::UriString(e.validation_error()))?;
-                
+                ))
+                .map_err(|e| InvocationError::UriString(e.validation_error()))?;
+
                 // Create the action string with tinycloud namespace
                 let action = match resource.service() {
-                    Some(s) => format!("tinycloud.{}.{}", s, resource.fragment().ok_or(InvocationError::ResourceCap(ResourceCapErr::MissingAction))?),
-                    None => format!("tinycloud.{}", resource.fragment().ok_or(InvocationError::ResourceCap(ResourceCapErr::MissingAction))?),
+                    Some(s) => format!(
+                        "tinycloud.{}.{}",
+                        s,
+                        resource
+                            .fragment()
+                            .ok_or(InvocationError::ResourceCap(ResourceCapErr::MissingAction))?
+                    ),
+                    None => format!(
+                        "tinycloud.{}",
+                        resource
+                            .fragment()
+                            .ok_or(InvocationError::ResourceCap(ResourceCapErr::MissingAction))?
+                    ),
                 };
-                
+
                 caps.with_action(
                     resource_uri,
                     ucan_capabilities_object::Ability::try_from(action)

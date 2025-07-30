@@ -115,7 +115,7 @@ impl Display for Message {
         writeln!(f, "{}", eip55(&self.address))?;
         writeln!(f)?;
         if let Some(statement) = &self.statement {
-            writeln!(f, "{}", statement)?;
+            writeln!(f, "{statement}")?;
         }
         writeln!(f)?;
         writeln!(f, "{}{}", URI_TAG, &self.uri)?;
@@ -130,12 +130,12 @@ impl Display for Message {
             write!(f, "\n{}{}", NBF_TAG, &nbf)?
         };
         if let Some(rid) = &self.request_id {
-            write!(f, "\n{}{}", RID_TAG, rid)?
+            write!(f, "\n{RID_TAG}{rid}")?
         };
         if !self.resources.is_empty() {
-            write!(f, "\n{}", RES_TAG)?;
+            write!(f, "\n{RES_TAG}")?;
             for res in &self.resources {
-                write!(f, "\n- {}", res)?;
+                write!(f, "\n- {res}")?;
             }
         };
         Ok(())
@@ -320,7 +320,7 @@ impl Visitor<'_> for MessageVisitor {
     {
         match Message::from_str(value) {
             Ok(message) => Ok(message),
-            Err(error) => Err(E::custom(format!("error parsing message: {}", error))),
+            Err(error) => Err(E::custom(format!("error parsing message: {error}"))),
         }
     }
 }
@@ -904,7 +904,7 @@ Resources:
     fn parsing_positive() {
         let tests: serde_json::Value = serde_json::from_str(PARSING_POSITIVE).unwrap();
         for (test_name, test) in tests.as_object().unwrap() {
-            print!("{} -> ", test_name);
+            print!("{test_name} -> ");
             let parsed_message = Message::from_str(test["message"].as_str().unwrap()).unwrap();
             let fields = &test["fields"];
             let expected_message = fields_to_message(fields).unwrap();
@@ -917,7 +917,7 @@ Resources:
     fn parsing_negative() {
         let tests: serde_json::Value = serde_json::from_str(PARSING_NEGATIVE).unwrap();
         for (test_name, test) in tests.as_object().unwrap() {
-            print!("{} -> ", test_name);
+            print!("{test_name} -> ");
             assert!(Message::from_str(test.as_str().unwrap()).is_err());
             println!("✅")
         }
@@ -927,7 +927,7 @@ Resources:
     async fn verification_positive() {
         let tests: serde_json::Value = serde_json::from_str(VERIFICATION_POSITIVE).unwrap();
         for (test_name, test) in tests.as_object().unwrap() {
-            print!("{} -> ", test_name);
+            print!("{test_name} -> ");
             let fields = &test;
             let message = fields_to_message(fields).unwrap();
             let signature = <[u8; 65]>::from_hex(
@@ -983,7 +983,7 @@ Resources:
     async fn verification_negative() {
         let tests: serde_json::Value = serde_json::from_str(VERIFICATION_NEGATIVE).unwrap();
         for (test_name, test) in tests.as_object().unwrap() {
-            print!("{} -> ", test_name);
+            print!("{test_name} -> ");
             let fields = &test;
             let message = fields_to_message(fields);
             let signature = <Vec<u8>>::from_hex(
