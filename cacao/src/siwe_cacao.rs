@@ -165,28 +165,28 @@ impl From<Message> for Payload {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct SIWESignature([u8; 65]);
+pub struct Signature([u8; 65]);
 
-impl std::ops::Deref for SIWESignature {
+impl std::ops::Deref for Signature {
     type Target = [u8; 65];
     fn deref(&self) -> &[u8; 65] {
         &self.0
     }
 }
 
-impl From<[u8; 65]> for SIWESignature {
+impl From<[u8; 65]> for Signature {
     fn from(s: [u8; 65]) -> Self {
         Self(s)
     }
 }
 
-impl AsRef<[u8]> for SIWESignature {
+impl AsRef<[u8]> for Signature {
     fn as_ref(&self) -> &[u8] {
         self.0.as_ref()
     }
 }
 
-impl TryFrom<Vec<u8>> for SIWESignature {
+impl TryFrom<Vec<u8>> for Signature {
     type Error = SIWESignatureDecodeError;
     fn try_from(s: Vec<u8>) -> Result<Self, Self::Error> {
         Ok(Self(s.try_into().map_err(SIWESignatureDecodeError::from)?))
@@ -248,7 +248,7 @@ struct DummySig<'a> {
 
 const EIP_191: &str = "eip191";
 
-impl<'a> Serialize for SIWESignature {
+impl<'a> Serialize for Signature {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -261,8 +261,8 @@ impl<'a> Serialize for SIWESignature {
     }
 }
 
-impl<'de> Deserialize<'de> for SIWESignature {
-    fn deserialize<D>(deserializer: D) -> Result<SIWESignature, D::Error>
+impl<'de> Deserialize<'de> for Signature {
+    fn deserialize<D>(deserializer: D) -> Result<Signature, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
@@ -278,7 +278,7 @@ impl<'de> Deserialize<'de> for SIWESignature {
                 SIWESignatureDecodeError::InvalidLength(l),
             ));
         }
-        Ok(SIWESignature(
+        Ok(Signature(
             ds.s.try_into()
                 .map_err(|_| SIWESignatureDecodeError::InvalidLength(l))
                 .map_err(serde::de::Error::custom)?,
@@ -291,7 +291,7 @@ pub struct Eip191;
 
 #[async_trait]
 impl SignatureScheme<Eip4361> for Eip191 {
-    type Signature = SIWESignature;
+    type Signature = Signature;
     type Err = VerificationError;
     async fn verify(
         payload: &<Eip4361 as Representation>::Payload,

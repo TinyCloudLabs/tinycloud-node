@@ -16,9 +16,9 @@ pub mod address {
 pub mod signature {
     use hex::FromHex;
     use serde::de::{Deserialize, Deserializer, Error};
-    use tinycloud_lib::cacaos::siwe_cacao::SIWESignature;
+    use tinycloud_lib::cacaos::siwe_cacao::Signature;
 
-    pub fn deserialize<'de, D>(d: D) -> Result<SIWESignature, D::Error>
+    pub fn deserialize<'de, D>(d: D) -> Result<Signature, D::Error>
     where
         D: Deserializer<'de>,
     {

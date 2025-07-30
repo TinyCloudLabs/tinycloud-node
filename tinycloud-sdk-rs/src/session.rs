@@ -1,13 +1,14 @@
 use crate::authorization::DelegationHeaders;
 use http::uri::Authority;
 use serde::{Deserialize, Serialize};
+use serde_ipld_dagcbor::EncodeError;
 use serde_with::{serde_as, DisplayFromStr};
 use std::collections::{BTreeMap, HashMap};
 use tinycloud_lib::{
     authorization::{make_invocation, InvocationError, TinyCloudDelegation, TinyCloudInvocation},
     cacaos::{
         siwe::{generate_nonce, Message, TimeStamp, Version as SIWEVersion},
-        siwe_cacao::{SIWESignature, SiweCacao},
+        siwe_cacao::{Header as SiweHeader, Signature, SiweCacao},
     },
     ipld_core::cid::Cid,
     multihash_codetable::{Code, MultihashDigest},
@@ -62,7 +63,7 @@ pub struct SignedSession {
     #[serde(flatten)]
     pub session: PreparedSession,
     #[serde(with = "crate::serde_siwe::signature")]
-    pub signature: SIWESignature,
+    pub signature: Signature,
 }
 
 #[serde_as]
@@ -192,7 +193,7 @@ pub fn complete_session_setup(signed_session: SignedSession) -> Result<Session, 
     let delegation = SiweCacao::new(
         signed_session.session.siwe.into(),
         signed_session.signature,
-        None,
+        SiweHeader,
     );
     let serialised = serde_ipld_dagcbor::to_vec(&delegation)?;
     let hash = Code::Blake3_256.digest(&serialised);
@@ -218,6 +219,8 @@ pub enum Error {
     UnableToGenerateDID(#[from] tinycloud_lib::ssi::dids::GenerateError),
     #[error("unable to generate the SIWE message to start the session: {0}")]
     UnableToGenerateSIWEMessage(String),
+    #[error("unable to generate the CID: {0}")]
+    UnableToGenerateCid(#[from] EncodeError<std::collections::TryReserveError>),
     #[error("failed to translate response to JSON: {0}")]
     JSONSerializing(serde_json::Error),
     #[error("failed to parse input from JSON: {0}")]

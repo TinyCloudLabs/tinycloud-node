@@ -6,7 +6,7 @@ use tinycloud_lib::{
     authorization::TinyCloudDelegation,
     cacaos::{
         siwe::{generate_nonce, Message, TimeStamp, Version},
-        siwe_cacao::{SIWESignature, SiweCacao},
+        siwe_cacao::{Header as SiweHeader, Signature, SiweCacao},
     },
     resource::OrbitId,
     siwe_recap::Capability,
@@ -36,7 +36,7 @@ pub struct SignedMessage {
     #[serde_as(as = "DisplayFromStr")]
     pub siwe: Message,
     #[serde(with = "crate::serde_siwe::signature")]
-    pub signature: SIWESignature,
+    pub signature: Signature,
 }
 
 impl TryFrom<HostConfig> for Message {
@@ -79,7 +79,7 @@ pub fn siwe_to_delegation_headers(signed_message: SignedMessage) -> DelegationHe
     DelegationHeaders::new(TinyCloudDelegation::Cacao(Box::new(SiweCacao::new(
         signed_message.siwe.into(),
         signed_message.signature,
-        None,
+        SiweHeader,
     ))))
 }
 
