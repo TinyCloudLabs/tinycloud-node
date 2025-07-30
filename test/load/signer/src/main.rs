@@ -1,10 +1,20 @@
-use axum::{extract::Path, routing::{post, get}, Extension, Json, Router};
+use axum::{
+    extract::Path,
+    routing::{get, post},
+    Extension, Json, Router,
+};
 use ethers::{
     core::utils::to_checksum,
     prelude::rand::{prelude::StdRng, SeedableRng},
     signers::{LocalWallet, Signer},
 };
-use tinycloud_lib::{cacaos::siwe::TimeStamp, resource::OrbitId, ssi::jwk::JWK};
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc};
+use tinycloud_lib::{
+    cacaos::siwe::TimeStamp,
+    resource::OrbitId,
+    ssi::{dids::DIDBuf, jwk::JWK},
+};
 use tinycloud_sdk_rs::{
     authorization::{DelegationHeaders, InvocationHeaders},
     session::{complete_session_setup, prepare_session, Session, SessionConfig, SignedSession},
@@ -12,8 +22,6 @@ use tinycloud_sdk_rs::{
         generate_host_siwe_message, siwe_to_delegation_headers, HostConfig, SignedMessage,
     },
 };
-use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc};
 use tokio::sync::RwLock;
 
 #[derive(Clone)]
@@ -26,10 +34,7 @@ struct User {
 async fn new_user(wallet: LocalWallet, jwk: JWK) -> User {
     let address = to_checksum(&wallet.address(), None);
     let did = format!("did:pkh:eip155:1:{address}");
-    let orbit_id = OrbitId::new(
-        did.strip_prefix("did:").unwrap().to_string(),
-        String::from("default"),
-    );
+    let orbit_id = OrbitId::new(DIDBuf::from_str(&did).unwrap(), String::from("default"));
 
     let session_config = SessionConfig {
         actions: [(
@@ -89,7 +94,7 @@ struct OrbitParams {
 async fn create_orbit(
     Path(id): Path<u128>,
     Json(params): Json<OrbitParams>,
-    Extension(jwk): Extension<Arc<JWK>>,
+    Extension(_jwk): Extension<Arc<JWK>>,
     Extension(users): Extension<Arc<RwLock<HashMap<u128, User>>>>,
 ) -> Json<DelegationHeaders> {
     let reader = users.read().await;
@@ -150,7 +155,7 @@ async fn invoke_session(
 ) -> Json<InvocationHeaders> {
     let headers = InvocationHeaders::from(
         users.read().await.get(&id).unwrap().session.clone(),
-        vec![("kv".into(), params.name, params.action)]
+        vec![("kv".into(), params.name, params.action)],
     )
     .await
     .unwrap();

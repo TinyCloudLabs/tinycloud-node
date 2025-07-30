@@ -1,4 +1,4 @@
-# Kepler Load Tests
+# Tinycloud Load Tests
 
 ## Installation
 
@@ -20,9 +20,9 @@ Run an AWS local stack with:
 docker-compose up -d localstack ../
 ```
 
-Then run Kepler with:
+Then run Tinycloud with:
 ```bash
-RUST_LOG=warn KEPLER_STORAGE_BLOCKS_BUCKET="kepler-blocks" KEPLER_STORAGE_BLOCKS_DYNAMODB_TABLE="kepler-pinstore" KEPLER_STORAGE_BLOCKS_TYPE=S3 KEPLER_STORAGE_BLOCKS_ENDPOINT="http://localhost:4566" KEPLER_STORAGE_BLOCKS_DYNAMODB_ENDPOINT="http://localhost:4566" KEPLER_STORAGE_INDEXES_TYPE=DynamoDB KEPLER_STORAGE_INDEXES_TABLE="kepler-indexing" KEPLER_STORAGE_INDEXES_ENDPOINT="http://localhost:4566" AWS_ACCESS_KEY_ID="test" AWS_SECRET_ACCESS_KEY="test" AWS_DEFAULT_REGION="us-east-1" cargo run
+RUST_LOG=warn TINYCLOUD_STORAGE_BLOCKS_BUCKET="tinycloud-blocks" TINYCLOUD_STORAGE_BLOCKS_DYNAMODB_TABLE="tinycloud-pinstore" TINYCLOUD_STORAGE_BLOCKS_TYPE=S3 TINYCLOUD_STORAGE_BLOCKS_ENDPOINT="http://localhost:4566" TINYCLOUD_STORAGE_BLOCKS_DYNAMODB_ENDPOINT="http://localhost:4566" TINYCLOUD_STORAGE_INDEXES_TYPE=DynamoDB TINYCLOUD_STORAGE_INDEXES_TABLE="tinycloud-indexing" TINYCLOUD_STORAGE_INDEXES_ENDPOINT="http://localhost:4566" AWS_ACCESS_KEY_ID="test" AWS_SECRET_ACCESS_KEY="test" AWS_DEFAULT_REGION="us-east-1" cargo run
 ```
 
 ## Usage
