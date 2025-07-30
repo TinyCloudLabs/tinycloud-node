@@ -4,12 +4,13 @@ use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 use std::collections::{BTreeMap, HashMap};
 use tinycloud_lib::{
-    authorization::{make_invocation, InvocationError, TinyCloudInvocation},
+    authorization::{make_invocation, InvocationError, TinyCloudDelegation, TinyCloudInvocation},
     cacaos::{
         siwe::{generate_nonce, Message, TimeStamp, Version as SIWEVersion},
-        siwe_cacao::SIWESignature,
+        siwe_cacao::{SIWESignature, SiweCacao},
     },
-    libipld::Cid,
+    ipld_core::cid::Cid,
+    multihash_codetable::{Code, MultihashDigest},
     resolver::DID_METHODS,
     resource::OrbitId,
     siwe_recap::{Capability, ConvertError},
@@ -188,20 +189,15 @@ pub async fn prepare_session(config: SessionConfig) -> Result<PreparedSession, E
 }
 
 pub fn complete_session_setup(signed_session: SignedSession) -> Result<Session, Error> {
-    use tinycloud_lib::{
-        authorization::TinyCloudDelegation,
-        cacaos::siwe_cacao::SiweCacao,
-        libipld::{cbor::DagCborCodec, multihash::Code, store::DefaultParams, Block},
-    };
     let delegation = SiweCacao::new(
         signed_session.session.siwe.into(),
         signed_session.signature,
         None,
     );
-    let delegation_cid =
-        *Block::<DefaultParams>::encode(DagCborCodec, Code::Blake3_256, &delegation)
-            .map_err(Error::UnableToGenerateCid)?
-            .cid();
+    let serialised = serde_ipld_dagcbor::to_vec(&delegation)?;
+    let hash = Code::Blake3_256.digest(&serialised);
+    // DAG CBOR codec is 0x71
+    let delegation_cid = Cid::new_v1(0x71, hash);
     let delegation_header =
         DelegationHeaders::new(TinyCloudDelegation::Cacao(Box::new(delegation)));
 
@@ -222,8 +218,6 @@ pub enum Error {
     UnableToGenerateDID(#[from] tinycloud_lib::ssi::dids::GenerateError),
     #[error("unable to generate the SIWE message to start the session: {0}")]
     UnableToGenerateSIWEMessage(String),
-    #[error("unable to generate the CID: {0}")]
-    UnableToGenerateCid(tinycloud_lib::libipld::error::Error),
     #[error("failed to translate response to JSON: {0}")]
     JSONSerializing(serde_json::Error),
     #[error("failed to parse input from JSON: {0}")]
