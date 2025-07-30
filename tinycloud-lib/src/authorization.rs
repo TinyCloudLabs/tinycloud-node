@@ -99,7 +99,7 @@ impl HeaderEncode for TinyCloudRevocation {
     }
 }
 
-pub async fn make_invocation(
+pub fn make_invocation(
     invocation_target: Vec<ResourceId>,
     delegation: Cid,
     jwk: &JWK,

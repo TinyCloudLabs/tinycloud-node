@@ -1,27 +1,13 @@
 mod definitions;
 
-use js_sys::Promise;
-use std::future::Future;
 use tinycloud_sdk_rs::*;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::future_to_promise;
 
 fn map_jsvalue<E: std::error::Error>(result: Result<String, E>) -> Result<String, JsValue> {
     match result {
         Ok(string) => Ok(string),
         Err(err) => Err(err.to_string().into()),
     }
-}
-
-fn map_async_jsvalue<E: std::error::Error>(
-    future: impl Future<Output = Result<String, E>> + 'static,
-) -> Promise {
-    future_to_promise(async {
-        match future.await {
-            Ok(string) => Ok(string.into()),
-            Err(err) => Err(err.to_string().into()),
-        }
-    })
 }
 
 // removing since we have duplicate usage elsewhere
@@ -42,16 +28,15 @@ pub fn makeOrbitId(address: String, chainId: u32, name: Option<String>) -> Strin
 
 #[wasm_bindgen]
 #[allow(non_snake_case)]
-pub fn prepareSession(config: String) -> Promise {
-    map_async_jsvalue(async move {
-        session::prepare_session(
-            serde_json::from_str(&config).map_err(session::Error::JSONSerializing)?,
-        )
-        .await
-        .and_then(|preparation| {
-            serde_json::to_string(&preparation).map_err(session::Error::JSONDeserializing)
-        })
-    })
+pub fn prepareSession(config: String) -> Result<String, JsValue> {
+    map_jsvalue(
+        serde_json::from_str(&config)
+            .map_err(session::Error::JSONDeserializing)
+            .and_then(session::prepare_session)
+            .and_then(|preparation| {
+                serde_json::to_string(&preparation).map_err(session::Error::JSONSerializing)
+            }),
+    )
 }
 
 #[wasm_bindgen]
@@ -69,17 +54,20 @@ pub fn completeSessionSetup(config: String) -> Result<String, JsValue> {
 
 #[wasm_bindgen]
 #[allow(non_snake_case)]
-pub fn invoke(session: String, service: String, path: String, action: String) -> Promise {
-    map_async_jsvalue(async move {
-        authorization::InvocationHeaders::from(
-            serde_json::from_str(&session).map_err(authorization::Error::JSONDeserializing)?,
-            vec![(service, path, action)],
-        )
-        .await
-        .and_then(|headers| {
-            serde_json::to_string(&headers).map_err(authorization::Error::JSONSerializing)
-        })
-    })
+pub fn invoke(
+    session: String,
+    service: String,
+    path: String,
+    action: String,
+) -> Result<String, JsValue> {
+    map_jsvalue(
+        serde_json::from_str(&session)
+            .map_err(authorization::Error::JSONDeserializing)
+            .and_then(|s| authorization::InvocationHeaders::from(s, vec![(service, path, action)]))
+            .and_then(|headers| {
+                serde_json::to_string(&headers).map_err(authorization::Error::JSONSerializing)
+            }),
+    )
 }
 
 #[wasm_bindgen]

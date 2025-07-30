@@ -132,7 +132,7 @@ impl SessionConfig {
 }
 
 impl Session {
-    pub async fn invoke(
+    pub fn invoke(
         self,
         actions: Vec<(String, String, String)>,
     ) -> Result<TinyCloudInvocation, InvocationError> {
@@ -153,11 +153,10 @@ impl Session {
             None,
             None,
         )
-        .await
     }
 }
 
-pub async fn prepare_session(config: SessionConfig) -> Result<PreparedSession, Error> {
+pub fn prepare_session(config: SessionConfig) -> Result<PreparedSession, Error> {
     let mut jwk = match &config.jwk {
         Some(k) => k.clone(),
         None => JWK::generate_ed25519()?,
@@ -231,7 +230,7 @@ pub enum Error {
 pub mod test {
     use super::*;
     use serde_json::json;
-    pub async fn test_session() -> Session {
+    pub fn test_session() -> Session {
         let config = json!({
             "actions": { "kv": { "path": vec!["put", "get", "list", "del", "metadata"] },
             "capabilities": { "": vec!["read"] }},
@@ -242,9 +241,7 @@ pub mod test {
             "orbitId": "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9://default",
             "expirationTime": "3000-01-01T00:00:00.000Z",
         });
-        let prepared = prepare_session(serde_json::from_value(config).unwrap())
-            .await
-            .unwrap();
+        let prepared = prepare_session(serde_json::from_value(config).unwrap()).unwrap();
         let mut signed = serde_json::to_value(prepared).unwrap();
         signed.as_object_mut()
             .unwrap()
@@ -255,12 +252,10 @@ pub mod test {
         complete_session_setup(serde_json::from_value(signed).unwrap()).unwrap()
     }
 
-    #[tokio::test]
-    async fn create_session_and_invoke() {
+    #[test]
+    fn create_session_and_invoke() {
         test_session()
-            .await
             .invoke(vec![("kv".into(), "path".into(), "get".into())])
-            .await
             .expect("failed to create invocation");
     }
 }
