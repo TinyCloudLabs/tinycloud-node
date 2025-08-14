@@ -1,4 +1,4 @@
-use crate::resource::{ResourceCapErr, ResourceId};
+use crate::resource::ResourceId;
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use cacaos::siwe_cacao::SiweCacao;
 use iri_string::validate::Error as UriStringError;
@@ -10,6 +10,7 @@ use ssi::{
 };
 use std::str::FromStr;
 use time::error::ComponentRange as TimestampRangeError;
+use ucan_capabilities_object::Ability;
 use uuid::Uuid;
 
 pub use ipld_core::cid::Cid;
@@ -100,7 +101,7 @@ impl HeaderEncode for TinyCloudRevocation {
 }
 
 pub fn make_invocation(
-    invocation_target: Vec<ResourceId>,
+    invocation_target: Vec<(ResourceId, Ability)>,
     delegation: Cid,
     jwk: &JWK,
     verification_method: String,
@@ -125,37 +126,15 @@ pub fn make_invocation(
         attenuation: {
             // The attenuation field expects Capabilities<A>, not Vec<Capability>
             let mut caps = ucan_capabilities_object::Capabilities::new();
-            for resource in invocation_target {
-                // Create the resource URI
-                let resource_uri = iri_string::types::UriString::try_from(format!(
-                    "{}/{}{}",
-                    resource.orbit(),
-                    resource.service().unwrap_or(""),
-                    resource.path().unwrap_or("")
-                ))
-                .map_err(|e| InvocationError::UriString(e.validation_error()))?;
-
-                // Create the action string with tinycloud namespace
-                let action = match resource.service() {
-                    Some(s) => format!(
-                        "tinycloud.{}.{}",
-                        s,
-                        resource
-                            .fragment()
-                            .ok_or(InvocationError::ResourceCap(ResourceCapErr::MissingAction))?
-                    ),
-                    None => format!(
-                        "tinycloud.{}",
-                        resource
-                            .fragment()
-                            .ok_or(InvocationError::ResourceCap(ResourceCapErr::MissingAction))?
-                    ),
-                };
+            for (resource, ability) in invocation_target {
+                eprintln!("Processing resource in make_invocation: service={:?}, path={:?}, fragment={:?}", 
+                    resource.service(), resource.path(), resource.fragment());
+                // Create the resource URI (safe because resource  id is always a uri)
+                let resource_uri = unsafe {iri_string::types::UriString::new_unchecked(resource.to_string())};
 
                 caps.with_action(
                     resource_uri,
-                    ucan_capabilities_object::Ability::try_from(action)
-                        .map_err(|_| InvocationError::ResourceCap(ResourceCapErr::MissingAction))?,
+                    ability,
                     vec![], // No caveats
                 );
             }
@@ -167,8 +146,6 @@ pub fn make_invocation(
 
 #[derive(Debug, thiserror::Error)]
 pub enum InvocationError {
-    #[error(transparent)]
-    ResourceCap(#[from] ResourceCapErr),
     #[error("Timestamp component out of range: {0}")] // Add variant for ComponentRange
     TimestampRange(#[from] TimestampRangeError),
     #[error("Invalid date format: {0}")]

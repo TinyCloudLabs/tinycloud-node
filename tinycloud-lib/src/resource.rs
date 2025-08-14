@@ -1,23 +1,40 @@
 use ipld_core::cid::Cid;
-use iri_string::types::UriString;
+pub use iri_string;
+use iri_string::types::{UriFragmentString, UriQueryString, UriStr};
 use multihash_codetable::{Code, MultihashDigest};
+use serde::Serialize;
 use serde_with::{DeserializeFromStr, SerializeDisplay};
-use ssi::dids::{DIDBuf, DIDURLBuf as DIDURL, DID};
+use ssi::dids::{DIDBuf, DID};
 
 use std::{convert::TryFrom, fmt, str::FromStr};
 use thiserror::Error;
+
+#[derive(Clone, Hash, PartialEq, Debug, Eq, Serialize, PartialOrd, Ord)]
+pub struct Name(String);
+
+impl Name {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Name {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
 
 #[derive(
     Clone, Hash, PartialEq, Debug, Eq, SerializeDisplay, DeserializeFromStr, PartialOrd, Ord,
 )]
 pub struct OrbitId {
     base_did: DIDBuf,
-    id: String,
+    name: Name,
 }
 
 impl OrbitId {
-    pub fn new(base_did: DIDBuf, id: String) -> Self {
-        Self { base_did, id }
+    pub fn new(base_did: DIDBuf, name: Name) -> Self {
+        Self { base_did, name }
     }
 
     pub fn did(&self) -> &DID {
@@ -28,8 +45,8 @@ impl OrbitId {
         &self.base_did.as_str()[4..]
     }
 
-    pub fn name(&self) -> &str {
-        &self.id
+    pub fn name(&self) -> &Name {
+        &self.name
     }
 
     pub fn get_cid(&self) -> Cid {
@@ -41,38 +58,39 @@ impl OrbitId {
 
     pub fn to_resource(
         self,
-        service: Option<String>,
-        path: Option<String>,
-        fragment: Option<String>,
+        service: Segment,
+        path: Vec<Segment>,
+        query: Option<UriQueryString>,
+        fragment: Option<UriFragmentString>,
     ) -> ResourceId {
         ResourceId {
             orbit: self,
             service,
-            path: path.map(|p| {
-                if p.starts_with('/') {
-                    p
-                } else {
-                    format!("/{p}")
-                }
-            }),
+            path,
+            query,
             fragment,
         }
     }
 }
 
-impl TryFrom<DIDURL> for OrbitId {
-    type Error = KRIParseError;
-    fn try_from(did: DIDURL) -> Result<Self, Self::Error> {
-        match (
-            &did,
-            did.fragment().map(|f| f.to_string()), // Use fragment() method and convert to String
-        ) {
-            (bd, Some(id)) => Ok(Self {
-                base_did: bd.did().to_owned(),
-                id,
-            }),
-            _ => Err(KRIParseError::IncorrectForm),
-        }
+impl From<(DIDBuf, Name)> for OrbitId {
+    fn from((base_did, name): (DIDBuf, Name)) -> Self {
+        Self { base_did, name }
+    }
+}
+
+#[derive(Clone, Hash, PartialEq, Debug, Eq, Serialize, PartialOrd, Ord)]
+pub struct Segment(String);
+
+impl Segment {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Segment {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.as_str())
     }
 }
 
@@ -81,23 +99,27 @@ impl TryFrom<DIDURL> for OrbitId {
 )]
 pub struct ResourceId {
     orbit: OrbitId,
-    service: Option<String>,
-    path: Option<String>,
-    fragment: Option<String>,
+    service: Segment,
+    path: Vec<Segment>,
+    query: Option<UriQueryString>,
+    fragment: Option<UriFragmentString>,
 }
 
 impl ResourceId {
     pub fn orbit(&self) -> &OrbitId {
         &self.orbit
     }
-    pub fn service(&self) -> Option<&str> {
-        self.service.as_ref().map(|s| s.as_ref())
+    pub fn service(&self) -> &Segment {
+        &self.service
     }
-    pub fn path(&self) -> Option<&str> {
-        self.path.as_ref().map(|s| s.as_ref())
+    pub fn path(&self) -> &[Segment] {
+        self.path.as_slice()
     }
-    pub fn fragment(&self) -> Option<&str> {
-        self.fragment.as_ref().map(|s| s.as_ref())
+    pub fn query(&self) -> Option<&UriQueryString> {
+        self.query.as_ref()
+    }
+    pub fn fragment(&self) -> Option<&UriFragmentString> {
+        self.fragment.as_ref()
     }
     pub fn extends(&self, base: &ResourceId) -> Result<(), ResourceCheckError> {
         if base.orbit() != self.orbit() {
@@ -106,10 +128,12 @@ impl ResourceId {
             Err(ResourceCheckError::IncorrectService)
         } else if base.fragment() != self.fragment() {
             Err(ResourceCheckError::IncorrectFragment)
-        } else if !self
-            .path()
-            .unwrap_or("")
-            .starts_with(base.path().unwrap_or(""))
+        } else if base.path().len() > self.path().len()
+            || !self
+                .path()
+                .iter()
+                .zip(base.path().iter())
+                .all(|(seg, base_seg)| seg == base_seg)
         {
             Err(ResourceCheckError::DoesNotExtendPath)
         } else {
@@ -117,8 +141,22 @@ impl ResourceId {
         }
     }
 
-    pub fn into_inner(self) -> (OrbitId, Option<String>, Option<String>, Option<String>) {
-        (self.orbit, self.service, self.path, self.fragment)
+    pub fn into_inner(
+        self,
+    ) -> (
+        OrbitId,
+        Segment,
+        Vec<Segment>,
+        Option<UriQueryString>,
+        Option<UriFragmentString>,
+    ) {
+        (
+            self.orbit,
+            self.service,
+            self.path,
+            self.query,
+            self.fragment,
+        )
     }
 
     pub fn get_cid(&self) -> Cid {
@@ -128,17 +166,6 @@ impl ResourceId {
         )
     }
 }
-
-#[derive(Error, Debug)]
-pub enum ResourceCapErr {
-    #[error("Missing ResourceId fragment")]
-    MissingAction,
-    #[error("Invalid URI string for capability: {0}")]
-    CapabilityUriParse(#[from] ssi::json_ld::iref::uri::InvalidUri<String>), // Add From implementation
-}
-
-// Removed TryInto<Capability> and TryFrom<&Capability> implementations
-// as they are no longer needed with the new UCAN structure that uses Capabilities<A> directly
 
 #[derive(Error, Debug)]
 pub enum ResourceCheckError {
@@ -154,20 +181,20 @@ pub enum ResourceCheckError {
 
 impl fmt::Display for OrbitId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "tinycloud:{}://{}", &self.suffix(), &self.id)
+        write!(f, "tinycloud:{}:{}", &self.suffix(), &self.name)
     }
 }
 
 impl fmt::Display for ResourceId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", &self.orbit)?;
-        if let Some(s) = &self.service {
-            write!(f, "/{s}")?
+        write!(f, "{}/{}", &self.orbit, self.service)?;
+        for segment in self.path() {
+            write!(f, "/{segment}")?;
+        }
+        if let Some(query) = self.query() {
+            write!(f, "?{query}")?
         };
-        if let Some(p) = &self.path {
-            write!(f, "{p}")?
-        };
-        if let Some(fr) = &self.fragment {
+        if let Some(fr) = &self.fragment() {
             write!(f, "#{fr}")?
         };
         Ok(())
@@ -178,38 +205,92 @@ impl fmt::Display for ResourceId {
 pub enum KRIParseError {
     #[error("Incorrect Structure")]
     IncorrectForm,
+    #[error("Invalid Name")]
+    InvalidName,
+    #[error("Invalid Service")]
+    InvalidService,
+    #[error("Invalid Path")]
+    InvalidPath,
     #[error("Invalid URI string: {0}")]
     UriStringParse(#[from] iri_string::validate::Error),
     #[error("Invalid DID string: {0}")]
     DidParse(#[from] ssi::dids::InvalidDID<String>),
 }
 
+impl TryFrom<&UriStr> for OrbitId {
+    type Error = KRIParseError;
+    fn try_from(uri: &UriStr) -> Result<Self, Self::Error> {
+        if uri.scheme_str() != "tinycloud"
+            || uri.authority_str().is_some()
+            || uri.query_str().is_some()
+            || uri.fragment().is_some()
+            || uri.path_str().ends_with(':')
+            || uri.path_str().contains('/')
+            || !uri.is_normalized()
+        {
+            Err(KRIParseError::IncorrectForm)
+        } else if let Some((suf, name)) = uri.path_str().rsplit_once(':').and_then(|(suf, name)| {
+            if name.is_empty() {
+                None
+            } else {
+                Some((suf, name))
+            }
+        }) {
+            Ok(Self::new(
+                ["did:", suf].concat().try_into()?,
+                Name(name.to_string()),
+            ))
+        } else {
+            Err(KRIParseError::IncorrectForm)
+        }
+    }
+}
+
 impl FromStr for OrbitId {
     type Err = KRIParseError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s
-            .strip_prefix("tinycloud:")
-            .ok_or(KRIParseError::IncorrectForm)?;
-        let p = match s.find("://") {
-            Some(p) if p > 0 => p,
-            _ => return Err(Self::Err::IncorrectForm),
-        };
-        let uri = UriString::from_str(&["dummy", &s[p..]].concat())?;
-        match uri.authority_components().map(|a| {
-            (
-                a.host().to_string(),
-                a.port(),
-                a.userinfo(),
-                uri.path_str(),
-                uri.fragment(),
-                uri.query_str(),
+        UriStr::new(s)?.try_into()
+    }
+}
+
+impl TryFrom<&UriStr> for ResourceId {
+    type Error = KRIParseError;
+    fn try_from(uri: &UriStr) -> Result<Self, Self::Error> {
+        if uri.scheme_str() != "tinycloud"
+            || uri.authority_str().is_some()
+            || !uri.path_str().contains('/')
+            || !uri.is_normalized()
+        {
+            Err(KRIParseError::IncorrectForm)
+        } else if let Some(((suf, name), (service, path))) =
+            uri.path_str().split_once('/').and_then(|(orbit, path)| {
+                Some((
+                    orbit.rsplit_once(':').and_then(|(suf, name)| {
+                        if name.is_empty() {
+                            None
+                        } else {
+                            Some((suf, name))
+                        }
+                    })?,
+                    path.split_once('/')
+                        .map_or((path, None), |(service, path)| (service, Some(path))),
+                ))
+            })
+        {
+            Ok(
+                OrbitId::new(["did:", suf].concat().try_into()?, Name(name.to_string()))
+                    .to_resource(
+                        Segment(service.to_string()),
+                        match path {
+                            None => Vec::new(),
+                            Some(p) => p.split('/').map(|s| Segment(s.to_string())).collect(),
+                        },
+                        uri.query().map(|q| q.into()),
+                        uri.fragment().map(|q| q.into()),
+                    ),
             )
-        }) {
-            Some((id, None, None, "", None, None)) => Ok(Self {
-                base_did: ["did:", &s[..p]].concat().try_into()?,
-                id,
-            }),
-            _ => Err(Self::Err::IncorrectForm),
+        } else {
+            Err(KRIParseError::IncorrectForm)
         }
     }
 }
@@ -217,35 +298,7 @@ impl FromStr for OrbitId {
 impl FromStr for ResourceId {
     type Err = KRIParseError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s
-            .strip_prefix("tinycloud:")
-            .ok_or(KRIParseError::IncorrectForm)?;
-        let p = match s.find("://") {
-            Some(p) if p > 0 => p,
-            _ => return Err(Self::Err::IncorrectForm),
-        };
-        let uri = UriString::from_str(&["dummy", &s[p..]].concat())?;
-        match uri.authority_components().map(|a| {
-            (
-                a.host(),
-                a.userinfo(),
-                uri.path_str().split_once('/').map(|(s, r)| match s {
-                    "" => r.split_once('/').unwrap_or((r, "")),
-                    _ => (s, r),
-                }),
-            )
-        }) {
-            Some((host, None, path)) => Ok(Self {
-                orbit: OrbitId {
-                    base_did: format!("did:{}", &s[..p]).parse()?,
-                    id: host.into(),
-                },
-                service: path.map(|(s, _)| s.into()),
-                path: path.map(|(_, pa)| format!("/{pa}")),
-                fragment: uri.fragment().map(|s| s.to_string()),
-            }),
-            _ => Err(Self::Err::IncorrectForm),
-        }
+        UriStr::new(s)?.try_into()
     }
 }
 
@@ -255,65 +308,97 @@ mod tests {
 
     #[test]
     fn basic() {
-        let res: ResourceId = "tinycloud:ens:example.eth://orbit0/kv/path/to/image.jpg"
+        let res: ResourceId = "tinycloud:ens:example.eth:orbit0/kv/path/to/image.jpg"
             .parse()
             .unwrap();
 
         assert_eq!("ens:example.eth", res.orbit().suffix());
         assert_eq!("did:ens:example.eth", res.orbit().did().as_str());
-        assert_eq!("orbit0", res.orbit().name());
-        assert_eq!("kv", res.service().unwrap());
-        assert_eq!("/path/to/image.jpg", res.path().unwrap());
+        assert_eq!("orbit0", res.orbit().name().as_str());
+        assert_eq!("kv", res.service().as_str());
+        assert_eq!(
+            "path/to/image.jpg",
+            res.path()
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<&str>>()
+                .join("/")
+        );
         assert_eq!(None, res.fragment().as_ref());
+        assert_eq!(None, res.query().as_ref());
 
-        let res2: ResourceId = "tinycloud:ens:example.eth://orbit0#peer".parse().unwrap();
-
-        assert_eq!("ens:example.eth", res2.orbit().suffix());
-        assert_eq!("did:ens:example.eth", res2.orbit().did().as_str());
-        assert_eq!("orbit0", res2.orbit().name());
-        assert_eq!(None, res2.service());
-        assert_eq!(None, res2.path());
-        assert_eq!("peer", res2.fragment().unwrap());
-
-        let res3: ResourceId = "tinycloud:ens:example.eth://orbit0/kv#list"
+        let res2: ResourceId = "tinycloud:ens:example1.eth:orbit1/service#peer"
             .parse()
             .unwrap();
 
-        assert_eq!("kv", res3.service().unwrap());
-        assert_eq!("/", res3.path().unwrap());
+        assert_eq!("ens:example1.eth", res2.orbit().suffix());
+        assert_eq!("did:ens:example1.eth", res2.orbit().did().as_str());
+        assert_eq!("orbit1", res2.orbit().name().as_str());
+        assert_eq!("service", res2.service().as_str());
+        println!("{:#?}", res2.path());
+        assert!(res2.path().is_empty());
+        assert_eq!("peer", res2.fragment().unwrap().as_str());
+
+        let res3: ResourceId = "tinycloud:ens:example2.eth:orbit2/kv/#list"
+            .parse()
+            .unwrap();
+
+        assert_eq!("ens:example2.eth", res3.orbit().suffix());
+        assert_eq!("did:ens:example2.eth", res3.orbit().did().as_str());
+        assert_eq!("orbit2", res3.orbit().name().as_str());
+        assert_eq!("kv", res3.service().as_str());
+        assert_eq!(1, res3.path().len());
+        assert_eq!(
+            "",
+            res3.path()
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<&str>>()
+                .join("/")
+        );
         assert_eq!("list", res3.fragment().unwrap());
 
-        let res4: ResourceId = "tinycloud:ens:example.eth://orbit0/kv/#list"
+        let res4: ResourceId = "tinycloud:ens:example3.eth:orbit3/other/path/#list"
             .parse()
             .unwrap();
 
-        assert_eq!("kv", res4.service().unwrap());
-        assert_eq!("/", res4.path().unwrap());
+        assert_eq!("ens:example3.eth", res4.orbit().suffix());
+        assert_eq!("did:ens:example3.eth", res4.orbit().did().as_str());
+        assert_eq!("orbit3", res4.orbit().name().as_str());
+        assert_eq!("other", res4.service().as_str());
+        assert_eq!(2, res4.path().len());
+        assert_eq!(
+            "path/",
+            res4.path()
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<&str>>()
+                .join("/")
+        );
         assert_eq!("list", res4.fragment().unwrap());
     }
 
     #[test]
     fn failures() {
-        let no_suffix: Result<ResourceId, _> = "tinycloud:://orbit0/kv/path/to/image.jpg".parse();
+        let no_suffix: Result<ResourceId, _> = "tinycloud::orbit0/kv/path/to/image.jpg".parse();
         assert!(no_suffix.is_err());
 
         let invalid_name: Result<ResourceId, _> =
-            "tinycloud:ens:example.eth://or:bit0/kv/path/to/image.jpg".parse();
+            "tinycloud:ens:example.eth:/kv/path/to/image.jpg".parse();
         assert!(invalid_name.is_err());
     }
 
     #[test]
     fn little_test() {
-        let did: DIDURL = "did:pkh:eth:0xb1fef8ed913821b941a76de9fc7c41b90de3d37f#default"
+        let _: OrbitId = "tinycloud:pkh:eth:0xb1fef8ed913821b941a76de9fc7c41b90de3d37f:default"
             .parse()
             .unwrap();
-        let _ = OrbitId::try_from(did).unwrap();
     }
 
     #[test]
     fn roundtrip() {
-        let resource_uri: String = "tinycloud:ens:example.eth://orbit0/kv/prefix#list".into();
-        let res4: ResourceId = resource_uri.parse().unwrap();
-        assert_eq!(resource_uri, res4.to_string());
+        let resource_uri: String = "tinycloud:ens:example.eth:orbit0/kv/prefix#list".into();
+        let res: ResourceId = resource_uri.parse().unwrap();
+        assert_eq!(resource_uri, res.to_string());
     }
 }
