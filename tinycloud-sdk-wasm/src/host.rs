@@ -9,16 +9,16 @@ use tinycloud_lib::{
         siwe_cacao::{Header as SiweHeader, Signature, SiweCacao},
     },
     resource::OrbitId,
-    siwe_recap::Capability,
+    siwe_recap::{Ability, Capability},
 };
 
-use crate::authorization::DelegationHeaders;
+use tinycloud_sdk_rs::authorization::DelegationHeaders;
 
 #[serde_as]
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostConfig {
-    #[serde(with = "crate::serde_siwe::address")]
+    #[serde(with = "tinycloud_sdk_rs::serde_siwe::address")]
     pub address: [u8; 20],
     pub chain_id: u64,
     #[serde_as(as = "DisplayFromStr")]
@@ -35,7 +35,7 @@ pub struct HostConfig {
 pub struct SignedMessage {
     #[serde_as(as = "DisplayFromStr")]
     pub siwe: Message,
-    #[serde(with = "crate::serde_siwe::signature")]
+    #[serde(with = "tinycloud_sdk_rs::serde_siwe::signature")]
     pub signature: Signature,
 }
 
@@ -43,12 +43,14 @@ impl TryFrom<HostConfig> for Message {
     type Error = String;
     fn try_from(c: HostConfig) -> Result<Self, String> {
         let mut caps = Capability::<Value>::default();
-        caps.with_action_convert(
-            c.orbit_id.to_resource(None, None, None).to_string(),
-            "orbit/host",
+        let ab: Ability = "tinycloud.orbit/host".parse().unwrap();
+        caps.with_action(
+            c.orbit_id
+                .to_resource("orbit".parse().unwrap(), None, None, None)
+                .as_uri(),
+            ab,
             [],
-        )
-        .map_err(|e| format!("error creating host capability: {e}"))?;
+        );
         caps.build_message(Self {
             scheme: None,
             address: c.address,
@@ -87,8 +89,4 @@ pub fn siwe_to_delegation_headers(signed_message: SignedMessage) -> DelegationHe
 pub enum Error {
     #[error("unable to generate the SIWE message: {0}")]
     UnableToGenerateSIWEMessage(String),
-    #[error("failed to translate response to JSON: {0}")]
-    JSONSerializing(serde_json::Error),
-    #[error("failed to parse input from JSON: {0}")]
-    JSONDeserializing(serde_json::Error),
 }

@@ -1,13 +1,12 @@
 mod definitions;
+pub mod host;
+pub mod session;
 
-use tinycloud_sdk_rs::*;
+use tinycloud_sdk_rs::{authorization, siwe_utils, util};
 use wasm_bindgen::prelude::*;
 
-fn map_jsvalue<E: std::error::Error>(result: Result<String, E>) -> Result<String, JsValue> {
-    match result {
-        Ok(string) => Ok(string),
-        Err(err) => Err(err.to_string().into()),
-    }
+fn map_jserr<E: std::error::Error>(e: E) -> JsValue {
+    e.to_string().into()
 }
 
 // removing since we have duplicate usage elsewhere
@@ -22,74 +21,70 @@ fn map_jsvalue<E: std::error::Error>(result: Result<String, E>) -> Result<String
 
 #[wasm_bindgen]
 #[allow(non_snake_case)]
-pub fn makeOrbitId(address: String, chainId: u32, name: Option<String>) -> String {
-    util::make_orbit_id_pkh_eip155(address, chainId, name)
+pub fn makeOrbitId(address: String, chainId: u32, name: String) -> Result<String, JsValue> {
+    Ok(tinycloud_sdk_rs::util::make_orbit_id_pkh_eip155(
+        &util::decode_eip55(&address.strip_prefix("0x").unwrap_or(&address)).map_err(map_jserr)?,
+        chainId,
+        name,
+    )
+    .map_err(map_jserr)?
+    .to_string())
 }
 
 #[wasm_bindgen]
 #[allow(non_snake_case)]
-pub fn prepareSession(config: String) -> Result<String, JsValue> {
-    map_jsvalue(
-        serde_json::from_str(&config)
-            .map_err(session::Error::JSONDeserializing)
-            .and_then(session::prepare_session)
-            .and_then(|preparation| {
-                serde_json::to_string(&preparation).map_err(session::Error::JSONSerializing)
-            }),
-    )
+pub fn prepareSession(config: JsValue) -> Result<JsValue, JsValue> {
+    Ok(serde_wasm_bindgen::to_value(
+        &session::prepare_session(serde_wasm_bindgen::from_value(config)?).map_err(map_jserr)?,
+    )?)
 }
 
 #[wasm_bindgen]
 #[allow(non_snake_case)]
-pub fn completeSessionSetup(config: String) -> Result<String, JsValue> {
-    map_jsvalue(
-        serde_json::from_str(&config)
-            .map_err(session::Error::JSONDeserializing)
-            .and_then(session::complete_session_setup)
-            .and_then(|session| {
-                serde_json::to_string(&session).map_err(session::Error::JSONSerializing)
-            }),
-    )
+pub fn completeSessionSetup(config: JsValue) -> Result<JsValue, JsValue> {
+    Ok(serde_wasm_bindgen::to_value(
+        &session::complete_session_setup(serde_wasm_bindgen::from_value(config)?)
+            .map_err(map_jserr)?,
+    )?)
 }
 
 #[wasm_bindgen]
 #[allow(non_snake_case)]
 pub fn invoke(
-    session: String,
+    session: JsValue,
     service: String,
     path: String,
     action: String,
-) -> Result<String, JsValue> {
-    map_jsvalue(
-        serde_json::from_str(&session)
-            .map_err(authorization::Error::JSONDeserializing)
-            .and_then(|s| authorization::InvocationHeaders::from(s, vec![(service, path, action)]))
-            .and_then(|headers| {
-                serde_json::to_string(&headers).map_err(authorization::Error::JSONSerializing)
-            }),
+) -> Result<JsValue, JsValue> {
+    let session = serde_wasm_bindgen::from_value(session)?;
+    let authz = authorization::InvocationHeaders::from(
+        session,
+        std::iter::once((
+            service.parse().map_err(map_jserr)?,
+            path.parse().map_err(map_jserr)?,
+            None,
+            None,
+            std::iter::once(action.parse().map_err(map_jserr)?),
+        )),
+    )
+    .map_err(map_jserr)?;
+    Ok(serde_wasm_bindgen::to_value(&authz)?)
+}
+
+#[wasm_bindgen]
+#[allow(non_snake_case)]
+pub fn generateHostSIWEMessage(config: JsValue) -> Result<String, JsValue> {
+    Ok(
+        siwe_utils::generate_host_siwe_message(serde_wasm_bindgen::from_value(config)?)
+            .map_err(map_jserr)?
+            .to_string(),
     )
 }
 
 #[wasm_bindgen]
 #[allow(non_snake_case)]
-pub fn generateHostSIWEMessage(config: String) -> Result<String, JsValue> {
-    map_jsvalue(
-        serde_json::from_str(&config)
-            .map_err(siwe_utils::Error::JSONDeserializing)
-            .and_then(siwe_utils::generate_host_siwe_message)
-            .map(|message| message.to_string()),
-    )
-}
-
-#[wasm_bindgen]
-#[allow(non_snake_case)]
-pub fn siweToDelegationHeaders(signedSIWEMessage: String) -> Result<String, JsValue> {
-    map_jsvalue(
-        serde_json::from_str(&signedSIWEMessage)
-            .map_err(siwe_utils::Error::JSONDeserializing)
-            .map(siwe_utils::siwe_to_delegation_headers)
-            .and_then(|headers| {
-                serde_json::to_string(&headers).map_err(siwe_utils::Error::JSONSerializing)
-            }),
-    )
+pub fn siweToDelegationHeaders(signedSIWEMessage: JsValue) -> Result<JsValue, JsValue> {
+    Ok(serde_wasm_bindgen::to_value(
+        &siwe_utils::siwe_to_delegation_headers(serde_wasm_bindgen::from_value(signedSIWEMessage)?),
+    )?)
 }

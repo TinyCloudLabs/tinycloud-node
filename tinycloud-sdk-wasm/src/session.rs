@@ -1,9 +1,8 @@
-use crate::authorization::DelegationHeaders;
 use http::uri::Authority;
 use serde::{Deserialize, Serialize};
 use serde_ipld_dagcbor::EncodeError;
 use serde_with::{serde_as, DisplayFromStr};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use tinycloud_lib::{
     authorization::{make_invocation, InvocationError, TinyCloudDelegation, TinyCloudInvocation},
     cacaos::{
@@ -13,19 +12,23 @@ use tinycloud_lib::{
     ipld_core::cid::Cid,
     multihash_codetable::{Code, MultihashDigest},
     resolver::DID_METHODS,
-    resource::OrbitId,
-    siwe_recap::{Capability, ConvertError},
+    resource::{
+        iri_string::types::{UriFragmentString, UriQueryString},
+        OrbitId, Path, ResourceId, Service,
+    },
+    siwe_recap::{Ability, Capability},
     ssi::{claims::chrono::Timelike, jwk::JWK},
 };
+use tinycloud_sdk_rs::authorization::DelegationHeaders;
 
 #[serde_as]
-#[derive(Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionConfig {
     // { service: { path: [action] } }
-    // e.g. { "kv": { "some/path": ["get", "put", "del"] } }
-    pub actions: HashMap<String, HashMap<String, Vec<String>>>,
-    #[serde(with = "crate::serde_siwe::address")]
+    // e.g. { "kv": { "some/path": ["tinycloud.kv/get", "tinycloud.kv/put", "tinycloud.kv/del"] } }
+    pub abilities: HashMap<Service, HashMap<Path, Vec<Ability>>>,
+    #[serde(with = "tinycloud_sdk_rs::serde_siwe::address")]
     pub address: [u8; 20],
     pub chain_id: u64,
     #[serde_as(as = "DisplayFromStr")]
@@ -62,7 +65,7 @@ pub struct PreparedSession {
 pub struct SignedSession {
     #[serde(flatten)]
     pub session: PreparedSession,
-    #[serde(with = "crate::serde_siwe::signature")]
+    #[serde(with = "tinycloud_sdk_rs::serde_siwe::signature")]
     pub signature: Signature,
 }
 
@@ -81,31 +84,23 @@ pub struct Session {
 impl SessionConfig {
     fn into_message(self, delegate: &str) -> Result<Message, String> {
         use serde_json::Value;
-        self.actions
+        self.abilities
             .into_iter()
-            .try_fold(
+            .fold(
                 Capability::<Value>::default(),
                 |caps, (service, actions)| {
-                    actions
-                        .into_iter()
-                        .try_fold(caps, |mut caps, (path, action)| {
-                            // weird type here cos we aren't using note benes
-                            caps.with_actions_convert::<_, _, [BTreeMap<String, Value>; 0]>(
-                                self.orbit_id
-                                    .clone()
-                                    .to_resource(Some(service.clone()), Some(path), None)
-                                    .to_string(),
-                                // TODO this is ugly, should be changed
-                                // (the self.actions type doesnt map very well to the ucan caps types)
-                                action
-                                    .into_iter()
-                                    .map(|a| (format!("{}/{}", &service, a), [])),
-                            )?;
-                            Ok(caps)
-                        })
+                    actions.into_iter().fold(caps, |mut caps, (path, action)| {
+                        caps.with_actions(
+                            self.orbit_id
+                                .clone()
+                                .to_resource(service.clone(), Some(path), None, None)
+                                .as_uri(),
+                            action.into_iter().map(|a| (a, [])),
+                        );
+                        caps
+                    })
                 },
             )
-            .map_err(|e: ConvertError<_, _>| format!("error building capabilities: {e}"))?
             .with_proofs(match &self.parents {
                 Some(p) => p.as_slice(),
                 None => &[],
@@ -132,26 +127,43 @@ impl SessionConfig {
 }
 
 impl Session {
-    pub fn invoke(
-        self,
-        actions: Vec<(String, String, String)>,
+    /// Allows invoking ResourceId's with any OrbitId
+    pub fn invoke_any<A: IntoIterator<Item = Ability>>(
+        &self,
+        actions: impl IntoIterator<Item = (ResourceId, A)>,
     ) -> Result<TinyCloudInvocation, InvocationError> {
         use tinycloud_lib::ssi::claims::chrono;
-        let targets = actions
-            .into_iter()
-            .map(|(s, p, a)| self.orbit_id.clone().to_resource(Some(s), Some(p), Some(a)));
         // we have to use chrono here because the time crate doesnt support "now_utc" in wasm
         let now = chrono::Utc::now();
         // 60 seconds in the future
         let exp = ((now.timestamp() + 60i64) as f64) + (now.nanosecond() as f64 / 1_000_000_000.0);
         make_invocation(
-            targets.collect(),
-            self.delegation_cid,
+            actions,
+            &self.delegation_cid,
             &self.jwk,
-            self.verification_method,
+            &self.verification_method,
             exp,
             None,
             None,
+        )
+    }
+
+    pub fn invoke<A: IntoIterator<Item = Ability>>(
+        &self,
+        actions: impl IntoIterator<
+            Item = (
+                Service,
+                Path,
+                Option<UriQueryString>,
+                Option<UriFragmentString>,
+                A,
+            ),
+        >,
+    ) -> Result<TinyCloudInvocation, InvocationError> {
+        self.invoke_any(
+            actions
+                .into_iter()
+                .map(|(s, p, q, f, a)| (self.orbit_id.clone().to_resource(s, Some(p), q, f), a)),
         )
     }
 }
@@ -220,10 +232,6 @@ pub enum Error {
     UnableToGenerateSIWEMessage(String),
     #[error("unable to generate the CID: {0}")]
     UnableToGenerateCid(#[from] EncodeError<std::collections::TryReserveError>),
-    #[error("failed to translate response to JSON: {0}")]
-    JSONSerializing(serde_json::Error),
-    #[error("failed to parse input from JSON: {0}")]
-    JSONDeserializing(serde_json::Error),
 }
 
 #[cfg(test)]
@@ -232,13 +240,22 @@ pub mod test {
     use serde_json::json;
     pub fn test_session() -> Session {
         let config = json!({
-            "actions": { "kv": { "path": vec!["put", "get", "list", "del", "metadata"] },
-            "capabilities": { "": vec!["read"] }},
+            "abilities": {
+                "kv": {
+                    "path": vec![
+                        "tinycloud.kv/put",
+                        "tinycloud.kv/get",
+                        "tinycloud.kv/list",
+                        "tinycloud.kv/del",
+                        "tinycloud.kv/metadata"
+                    ]
+                },
+            },
             "address": "0x7BD63AA37326a64d458559F44432103e3d6eEDE9",
             "chainId": 1u8,
             "domain": "example.com",
             "issuedAt": "2022-01-01T00:00:00.000Z",
-            "orbitId": "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9://default",
+            "orbitId": "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:default",
             "expirationTime": "3000-01-01T00:00:00.000Z",
         });
         let prepared = prepare_session(serde_json::from_value(config).unwrap()).unwrap();
@@ -254,8 +271,11 @@ pub mod test {
 
     #[test]
     fn create_session_and_invoke() {
+        let s: Service = "kv".parse().unwrap();
+        let p: Path = "path".parse().unwrap();
+        let a: Ability = "tinycloud.kv/get".parse().unwrap();
         test_session()
-            .invoke(vec![("kv".into(), "path".into(), "get".into())])
+            .invoke([(s, p, None, None, [a])])
             .expect("failed to create invocation");
     }
 }

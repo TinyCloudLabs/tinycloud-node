@@ -6,7 +6,7 @@ use iri_string::types::{UriAbsoluteString, UriString};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 pub use siwe;
-use siwe::{eip55, Message, TimeStamp, VerificationError as SVE, Version as SVersion};
+use siwe::{encode_eip55, Message, TimeStamp, VerificationError as SVE, Version as SVersion};
 use std::fmt::Debug;
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -148,9 +148,13 @@ impl From<Message> for Payload {
         Self {
             scheme: m.scheme,
             domain: m.domain,
-            iss: format!("did:pkh:eip155:{}:{}", m.chain_id, eip55(&m.address))
-                .parse()
-                .unwrap(),
+            iss: format!(
+                "did:pkh:eip155:{}:0x{}",
+                m.chain_id,
+                encode_eip55(&m.address)
+            )
+            .parse()
+            .unwrap(),
             statement: m.statement,
             aud: m.uri,
             version: m.version.into(),

@@ -1,6 +1,6 @@
 use ipld_core::cid::Cid;
 pub use iri_string;
-use iri_string::types::{UriFragmentString, UriQueryString, UriStr};
+use iri_string::types::{UriFragmentString, UriQueryString, UriStr, UriString};
 use multihash_codetable::{Code, MultihashDigest};
 use serde::Serialize;
 use serde_with::{DeserializeFromStr, SerializeDisplay};
@@ -9,7 +9,7 @@ use ssi::dids::{DIDBuf, DID};
 use std::{convert::TryFrom, fmt, str::FromStr};
 use thiserror::Error;
 
-#[derive(Clone, Hash, PartialEq, Debug, Eq, Serialize, PartialOrd, Ord)]
+#[derive(Clone, Hash, PartialEq, Debug, Eq, Serialize, DeserializeFromStr, PartialOrd, Ord)]
 pub struct Name(String);
 
 impl Name {
@@ -25,10 +25,20 @@ impl fmt::Display for Name {
 }
 
 impl TryFrom<String> for Name {
-    // TODO finish this
-    type Error = &'static str;
+    type Error = KRIParseError;
+
+    // TODO finish this by doing validation
     fn try_from(n: String) -> Result<Self, Self::Error> {
         Ok(Self(n))
+    }
+}
+
+impl FromStr for Name {
+    type Err = KRIParseError;
+
+    // TODO finish this by doing validation
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_string()))
     }
 }
 
@@ -66,8 +76,8 @@ impl OrbitId {
 
     pub fn to_resource(
         self,
-        service: Segment,
-        path: Vec<Segment>,
+        service: Service,
+        path: Option<Path>,
         query: Option<UriQueryString>,
         fragment: Option<UriFragmentString>,
     ) -> ResourceId {
@@ -87,18 +97,68 @@ impl From<(DIDBuf, Name)> for OrbitId {
     }
 }
 
-#[derive(Clone, Hash, PartialEq, Debug, Eq, Serialize, PartialOrd, Ord)]
-pub struct Segment(String);
+#[derive(Clone, Hash, PartialEq, Debug, Eq, Serialize, DeserializeFromStr, PartialOrd, Ord)]
+pub struct Service(String);
 
-impl Segment {
+impl Service {
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-impl fmt::Display for Segment {
+impl fmt::Display for Service {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.as_str())
+    }
+}
+
+impl TryFrom<String> for Service {
+    type Error = KRIParseError;
+
+    // TODO finish this by doing validation
+    fn try_from(n: String) -> Result<Self, Self::Error> {
+        Ok(Self(n))
+    }
+}
+
+impl FromStr for Service {
+    type Err = KRIParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_string()))
+    }
+}
+
+#[derive(Clone, Hash, PartialEq, Debug, Eq, Serialize, DeserializeFromStr, PartialOrd, Ord)]
+pub struct Path(String);
+
+impl Path {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Path {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl TryFrom<String> for Path {
+    type Error = KRIParseError;
+
+    // TODO finish this by doing validation
+    fn try_from(n: String) -> Result<Self, Self::Error> {
+        Ok(Self(n))
+    }
+}
+
+impl FromStr for Path {
+    type Err = KRIParseError;
+
+    // TODO finish this by doing validation
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_string()))
     }
 }
 
@@ -107,8 +167,8 @@ impl fmt::Display for Segment {
 )]
 pub struct ResourceId {
     orbit: OrbitId,
-    service: Segment,
-    path: Vec<Segment>,
+    service: Service,
+    path: Option<Path>,
     query: Option<UriQueryString>,
     fragment: Option<UriFragmentString>,
 }
@@ -117,11 +177,11 @@ impl ResourceId {
     pub fn orbit(&self) -> &OrbitId {
         &self.orbit
     }
-    pub fn service(&self) -> &Segment {
+    pub fn service(&self) -> &Service {
         &self.service
     }
-    pub fn path(&self) -> &[Segment] {
-        self.path.as_slice()
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_ref()
     }
     pub fn query(&self) -> Option<&UriQueryString> {
         self.query.as_ref()
@@ -136,13 +196,14 @@ impl ResourceId {
             Err(ResourceCheckError::IncorrectService)
         } else if base.fragment() != self.fragment() {
             Err(ResourceCheckError::IncorrectFragment)
-        } else if base.path().len() > self.path().len()
-            || !self
-                .path()
-                .iter()
-                .zip(base.path().iter())
-                .all(|(seg, base_seg)| seg == base_seg)
-        {
+        } else if match (
+            self.path().map(|p| p.as_str()),
+            base.path().map(|p| p.as_str()),
+        ) {
+            (Some(s), Some(b)) => !s.starts_with(b),
+            (Some(_), None) | (None, None) => false,
+            (None, Some(_)) => true,
+        } {
             Err(ResourceCheckError::DoesNotExtendPath)
         } else {
             Ok(())
@@ -153,8 +214,8 @@ impl ResourceId {
         self,
     ) -> (
         OrbitId,
-        Segment,
-        Vec<Segment>,
+        Service,
+        Option<Path>,
         Option<UriQueryString>,
         Option<UriFragmentString>,
     ) {
@@ -172,6 +233,11 @@ impl ResourceId {
             0x55, // raw codec
             Code::Blake2b256.digest(self.to_string().as_bytes()),
         )
+    }
+
+    // Create the resource URI (safe because resource id is always a uri)
+    pub fn as_uri(&self) -> UriString {
+        unsafe { UriString::new_unchecked(self.to_string()) }
     }
 }
 
@@ -196,8 +262,8 @@ impl fmt::Display for OrbitId {
 impl fmt::Display for ResourceId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}/{}", &self.orbit, self.service)?;
-        for segment in self.path() {
-            write!(f, "/{segment}")?;
+        if let Some(path) = self.path() {
+            write!(f, "/{path}")?;
         }
         if let Some(query) = self.query() {
             write!(f, "?{query}")?
@@ -288,11 +354,8 @@ impl TryFrom<&UriStr> for ResourceId {
             Ok(
                 OrbitId::new(["did:", suf].concat().try_into()?, Name(name.to_string()))
                     .to_resource(
-                        Segment(service.to_string()),
-                        match path {
-                            None => Vec::new(),
-                            Some(p) => p.split('/').map(|s| Segment(s.to_string())).collect(),
-                        },
+                        Service(service.to_string()),
+                        path.map(|p| Path(p.to_string())),
                         uri.query().map(|q| q.into()),
                         uri.fragment().map(|q| q.into()),
                     ),
@@ -324,14 +387,7 @@ mod tests {
         assert_eq!("did:ens:example.eth", res.orbit().did().as_str());
         assert_eq!("orbit0", res.orbit().name().as_str());
         assert_eq!("kv", res.service().as_str());
-        assert_eq!(
-            "path/to/image.jpg",
-            res.path()
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<&str>>()
-                .join("/")
-        );
+        assert_eq!(Some("path/to/image.jpg"), res.path().map(|p| p.as_str()));
         assert_eq!(None, res.fragment().as_ref());
         assert_eq!(None, res.query().as_ref());
 
@@ -344,7 +400,7 @@ mod tests {
         assert_eq!("orbit1", res2.orbit().name().as_str());
         assert_eq!("service", res2.service().as_str());
         println!("{:#?}", res2.path());
-        assert!(res2.path().is_empty());
+        assert!(res2.path().is_none());
         assert_eq!("peer", res2.fragment().unwrap().as_str());
 
         let res3: ResourceId = "tinycloud:ens:example2.eth:orbit2/kv/#list"
@@ -355,15 +411,7 @@ mod tests {
         assert_eq!("did:ens:example2.eth", res3.orbit().did().as_str());
         assert_eq!("orbit2", res3.orbit().name().as_str());
         assert_eq!("kv", res3.service().as_str());
-        assert_eq!(1, res3.path().len());
-        assert_eq!(
-            "",
-            res3.path()
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<&str>>()
-                .join("/")
-        );
+        assert_eq!(Some(""), res3.path().map(|p| p.as_str()));
         assert_eq!("list", res3.fragment().unwrap());
 
         let res4: ResourceId = "tinycloud:ens:example3.eth:orbit3/other/path/#list"
@@ -374,15 +422,7 @@ mod tests {
         assert_eq!("did:ens:example3.eth", res4.orbit().did().as_str());
         assert_eq!("orbit3", res4.orbit().name().as_str());
         assert_eq!("other", res4.service().as_str());
-        assert_eq!(2, res4.path().len());
-        assert_eq!(
-            "path/",
-            res4.path()
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<&str>>()
-                .join("/")
-        );
+        assert_eq!(Some("path/"), res4.path().map(|s| s.as_str()));
         assert_eq!("list", res4.fragment().unwrap());
     }
 

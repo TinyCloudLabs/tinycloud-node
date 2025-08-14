@@ -8,7 +8,7 @@ use crate::types::{Facts, OrbitIdWrap, Resource};
 use crate::{hash::Hash, types::Ability};
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, Condition, ConnectionTrait, QueryOrder};
 use time::OffsetDateTime;
-use tinycloud_lib::{authorization::TinyCloudInvocation, ssi::dids::AnyDidMethod};
+use tinycloud_lib::{authorization::TinyCloudInvocation, resource::Path, ssi::dids::AnyDidMethod};
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "invocation")]
@@ -70,7 +70,7 @@ pub enum InvocationError {
     #[error("Cannot find parent delegation")]
     MissingParents,
     #[error("No Such Key: {0}")]
-    MissingKvWrite(String),
+    MissingKvWrite(Path),
 }
 
 pub(crate) async fn process<C: ConnectionTrait>(
@@ -246,7 +246,7 @@ async fn save<C: ConnectionTrait>(
             } => {
                 kv_write::Entity::insert(kv_write::ActiveModel::from(kv_write::Model {
                     invocation: hash,
-                    key,
+                    key: key.into(),
                     value,
                     orbit: orbit.into(),
                     metadata,
@@ -265,7 +265,7 @@ async fn save<C: ConnectionTrait>(
                 let deleted_invocation_id = if let Some((s, e, es)) = version {
                     kv_write::Entity::find().filter(
                         Condition::all()
-                            .add(kv_write::Column::Key.eq(key.clone()))
+                            .add(kv_write::Column::Key.eq(key.as_str()))
                             .add(kv_write::Column::Orbit.eq(OrbitIdWrap(orbit.clone())))
                             .add(kv_write::Column::Seq.eq(s))
                             .add(kv_write::Column::Epoch.eq(e))
@@ -273,7 +273,7 @@ async fn save<C: ConnectionTrait>(
                     )
                 } else {
                     kv_write::Entity::find()
-                        .filter(kv_write::Column::Key.eq(key.clone()))
+                        .filter(kv_write::Column::Key.eq(key.as_str()))
                         .filter(kv_write::Column::Orbit.eq(OrbitIdWrap(orbit.clone())))
                         .order_by_desc(kv_write::Column::Seq)
                         .order_by_desc(kv_write::Column::Epoch)
@@ -284,7 +284,7 @@ async fn save<C: ConnectionTrait>(
                 .ok_or_else(|| InvocationError::MissingKvWrite(key.clone()))?
                 .invocation;
                 kv_delete::Entity::insert(kv_delete::ActiveModel::from(kv_delete::Model {
-                    key,
+                    key: key.into(),
                     invocation_id: hash,
                     orbit: orbit.into(),
                     deleted_invocation_id,

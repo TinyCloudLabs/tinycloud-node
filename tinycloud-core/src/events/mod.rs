@@ -11,7 +11,7 @@ pub use tinycloud_lib::{
     },
     ipld_core::cid::Cid,
     multihash_codetable::Code,
-    resource::OrbitId,
+    resource::{OrbitId, Path},
 };
 
 #[derive(Debug)]
@@ -46,13 +46,13 @@ pub type Revocation = SerializedEvent<RevocationInfo>;
 pub(crate) enum Operation {
     KvWrite {
         orbit: OrbitId,
-        key: String,
+        key: Path,
         value: Hash,
         metadata: Metadata,
     },
     KvDelete {
         orbit: OrbitId,
-        key: String,
+        key: Path,
         version: Option<(i64, Hash, i64)>,
     },
 }
@@ -98,7 +98,7 @@ impl Operation {
 pub(crate) enum VersionedOperation {
     KvWrite {
         orbit: OrbitId,
-        key: String,
+        key: Path,
         value: Hash,
         metadata: Metadata,
         seq: i64,
@@ -107,7 +107,7 @@ pub(crate) enum VersionedOperation {
     },
     KvDelete {
         orbit: OrbitId,
-        key: String,
+        key: Path,
         version: Option<(i64, Hash, i64)>,
     },
 }
@@ -177,12 +177,12 @@ fn hash_inv(inv_hash: &Hash, o: &OrbitId, ops: &[Operation]) -> Result<OneOrMany
     #[serde(untagged)]
     enum Op<'a> {
         KvWrite {
-            key: &'a str,
+            key: &'a Path,
             value: Cid,
             metadata: &'a Metadata,
         },
         KvDelete {
-            key: &'a str,
+            key: &'a Path,
             version: Option<(i64, Cid, i64)>,
         },
     }

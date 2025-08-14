@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
-use tinycloud_lib::authorization::{TinyCloudDelegation, TinyCloudInvocation};
+use tinycloud_lib::{
+    authorization::{TinyCloudDelegation, TinyCloudInvocation},
+    resource::{
+        iri_string::types::{UriFragmentString, UriQueryString},
+        Path, Service,
+    },
+    siwe_recap::Ability,
+};
 
 use crate::session::Session;
 
@@ -16,7 +23,18 @@ pub struct InvocationHeaders {
 }
 
 impl InvocationHeaders {
-    pub fn from(session: Session, actions: Vec<(String, String, String)>) -> Result<Self, Error> {
+    pub fn from<A: IntoIterator<Item = Ability>>(
+        session: Session,
+        actions: impl IntoIterator<
+            Item = (
+                Service,
+                Path,
+                Option<UriQueryString>,
+                Option<UriFragmentString>,
+                A,
+            ),
+        >,
+    ) -> Result<Self, Error> {
         Ok(Self {
             invocation: session
                 .invoke(actions)

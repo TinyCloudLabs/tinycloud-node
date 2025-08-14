@@ -100,11 +100,11 @@ impl HeaderEncode for TinyCloudRevocation {
     }
 }
 
-pub fn make_invocation(
-    invocation_target: Vec<(ResourceId, Ability)>,
-    delegation: Cid,
+pub fn make_invocation<A: IntoIterator<Item = Ability>>(
+    invocation_target: impl IntoIterator<Item = (ResourceId, A)>,
+    delegation: &Cid,
     jwk: &JWK,
-    verification_method: String,
+    verification_method: &str,
     expiration: f64,
     not_before: Option<f64>,
     nonce: Option<String>,
@@ -122,21 +122,11 @@ pub fn make_invocation(
             .map_err(InvocationError::NumericDateConversionError)?,
         nonce: Some(nonce.unwrap_or_else(|| format!("urn:uuid:{}", Uuid::new_v4()))),
         facts: None,
-        proof: vec![delegation],
+        proof: vec![*delegation],
         attenuation: {
-            // The attenuation field expects Capabilities<A>, not Vec<Capability>
             let mut caps = ucan_capabilities_object::Capabilities::new();
-            for (resource, ability) in invocation_target {
-                eprintln!("Processing resource in make_invocation: service={:?}, path={:?}, fragment={:?}", 
-                    resource.service(), resource.path(), resource.fragment());
-                // Create the resource URI (safe because resource  id is always a uri)
-                let resource_uri = unsafe {iri_string::types::UriString::new_unchecked(resource.to_string())};
-
-                caps.with_action(
-                    resource_uri,
-                    ability,
-                    vec![], // No caveats
-                );
+            for (resource, abilities) in invocation_target {
+                caps.with_actions(resource.as_uri(), abilities.into_iter().map(|a| (a, [])));
             }
             caps
         },

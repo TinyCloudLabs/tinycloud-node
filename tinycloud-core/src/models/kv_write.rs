@@ -1,5 +1,5 @@
 use crate::hash::Hash;
-use crate::types::{Metadata, OrbitIdWrap};
+use crate::types::{Metadata, OrbitIdWrap, Path};
 use crate::{models::*, relationships::*};
 use sea_orm::entity::prelude::*;
 
@@ -9,7 +9,7 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub orbit: OrbitIdWrap,
     #[sea_orm(primary_key)]
-    pub key: String,
+    pub key: Path,
     #[sea_orm(primary_key)]
     pub invocation: Hash,
     pub seq: i64,

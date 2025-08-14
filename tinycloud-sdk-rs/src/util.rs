@@ -1,10 +1,12 @@
-pub fn make_orbit_id_pkh_eip155(address: String, chain_id: u32, name: Option<String>) -> String {
-    make_orbit_id(format!("pkh:eip155:{chain_id}:{address}"), name)
-}
+use std::str::FromStr;
+pub use tinycloud_lib::cacaos::siwe::{decode_eip55, encode_eip55};
+use tinycloud_lib::resource::{KRIParseError, OrbitId};
 
-fn make_orbit_id(did_suffix: String, name: Option<String>) -> String {
-    format!(
-        "tinycloud:{did_suffix}://{}",
-        name.unwrap_or_else(|| String::from("default"))
-    )
+pub fn make_orbit_id_pkh_eip155(
+    address: &[u8; 20],
+    chain_id: u32,
+    name: String,
+) -> Result<OrbitId, KRIParseError> {
+    let addr = encode_eip55(address);
+    OrbitId::from_str(&format!("tinycloud:pkh:eip155:{chain_id}:0x{addr}:{name}"))
 }
