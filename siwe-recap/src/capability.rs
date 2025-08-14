@@ -172,7 +172,7 @@ impl<NB> Capability<NB> {
 
     fn to_line_groups(
         &self,
-    ) -> impl Iterator<Item = (&UriString, AbilityNamespaceRef, Vec<AbilityNameRef>)> {
+    ) -> impl Iterator<Item = (&UriString, AbilityNamespaceRef<'_>, Vec<AbilityNameRef<'_>>)> {
         self.attenuations
             .abilities()
             .iter()
