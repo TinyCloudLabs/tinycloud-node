@@ -110,12 +110,12 @@ pub fn make_invocation<A: IntoIterator<Item = Ability>>(
     nonce: Option<String>,
 ) -> Result<Ucan, InvocationError> {
     Ok(Payload {
-        issuer: DIDURLBuf::from_str(&verification_method)?,
+        issuer: DIDURLBuf::from_str(verification_method)?,
         audience: DIDBuf::from_str(
             verification_method
                 .split('#')
                 .next()
-                .unwrap_or(&verification_method),
+                .unwrap_or(verification_method),
         )?,
         not_before: not_before.map(NumericDate::try_from_seconds).transpose()?,
         expiration: NumericDate::try_from_seconds(expiration)

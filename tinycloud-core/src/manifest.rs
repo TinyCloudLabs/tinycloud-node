@@ -166,21 +166,19 @@ fn get_authorised_parties(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::convert::TryInto;
     use tinycloud_lib::resolver::DID_METHODS;
     use tinycloud_lib::ssi::dids::AnyDidMethod;
-    use tinycloud_lib::ssi::{dids::DIDURLBuf, jwk::JWK};
+    use tinycloud_lib::ssi::jwk::JWK;
 
     #[tokio::test]
     async fn basic_manifest() {
         let j = JWK::generate_secp256k1();
-        let mut did = DID_METHODS.generate(&j, "pkh:eth").unwrap().to_string();
-        did.push_str("#default");
-        let did: DIDURLBuf = did.parse().unwrap();
+        let did = DID_METHODS.generate(&j, "pkh:eth").unwrap();
 
         println!("DID: {did:#?}");
+        let orbit = OrbitId::new(did, "orbit_name".parse().unwrap());
 
-        let md = Manifest::resolve(&did.try_into().unwrap(), &AnyDidMethod::default())
+        let md = Manifest::resolve(&orbit, &AnyDidMethod::default())
             .await
             .unwrap()
             .unwrap();

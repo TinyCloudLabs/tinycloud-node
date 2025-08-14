@@ -141,7 +141,7 @@ impl TryInto<Message> for Payload {
             not_before: self.nbf,
             expiration_time: self.exp,
             request_id: self.request_id,
-            resources: self.resources.unwrap_or_else(|| Vec::new()),
+            resources: self.resources.unwrap_or_default(),
         })
     }
 }
@@ -256,7 +256,7 @@ struct DummySig<'a> {
 
 const EIP_191: &str = "eip191";
 
-impl<'a> Serialize for Signature {
+impl Serialize for Signature {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,

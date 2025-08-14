@@ -278,7 +278,7 @@ where
         }) {
             match cap {
                 (orbit, "kv", "tinycloud.kv/get", path) => results.push(InvocationOutcome::KvRead(
-                    get_kv(&tx, &self.storage, orbit, &path)
+                    get_kv(&tx, &self.storage, orbit, path)
                         .await
                         .map_err(|e| match e {
                             EitherError::A(e) => TxStoreError::Tx(e.into()),
@@ -286,10 +286,10 @@ where
                         })?,
                 )),
                 (orbit, "kv", "tinycloud.kv/list", path) => {
-                    results.push(InvocationOutcome::KvList(list(&tx, orbit, &path).await?))
+                    results.push(InvocationOutcome::KvList(list(&tx, orbit, path).await?))
                 }
                 (orbit, "kv", "tinycloud.kv/del", path) => {
-                    let kv = get_kv_entity(&tx, orbit, &path).await?;
+                    let kv = get_kv_entity(&tx, orbit, path).await?;
                     if let Some(kv) = kv {
                         self.storage
                             .remove(orbit, &kv.value)
@@ -308,7 +308,7 @@ where
                     }
                 }
                 (orbit, "kv", "tinycloud.kv/metadata", path) => results.push(
-                    InvocationOutcome::KvMetadata(metadata(&tx, orbit, &path).await?),
+                    InvocationOutcome::KvMetadata(metadata(&tx, orbit, path).await?),
                 ),
                 (orbit, "capabilities", "tinycloud.capabilities/read", path)
                     if path.as_str() == "all" =>

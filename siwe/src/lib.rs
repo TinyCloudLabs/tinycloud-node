@@ -719,8 +719,8 @@ pub fn decode_eip55(addr: &str) -> Result<[u8; 20], Eip55Error> {
         .enumerate()
         .find_map(|(i, c)| match c {
             '0'..='9' => None,
-            'a'..='f' => check_byte(&hash, i).then(|| InvalidChecksum(i)),
-            'A'..='F' => check_byte(&hash, i).not().then(|| InvalidChecksum(i)),
+            'a'..='f' => check_byte(&hash, i).then_some(InvalidChecksum(i)),
+            'A'..='F' => check_byte(&hash, i).not().then_some(InvalidChecksum(i)),
             o => Some(InvalidChar(i, o)),
         })
         .map(Result::Err)
@@ -737,15 +737,11 @@ pub fn encode_eip55(addr: &[u8; 20]) -> String {
         .enumerate()
         .map(|(i, c)| match c {
             '0'..='9' => c,
-            'a'..='f' => check_byte(&hash, i)
-                .then(|| c.to_ascii_uppercase())
-                .unwrap_or(c),
+            'a'..='f' => if check_byte(&hash, i) { c.to_ascii_uppercase() } else { c },
             // HACK hex::encode should never put uppercase-hex in addr_str
             // but just in case
-            'A'..='F' => check_byte(&hash, i)
-                .not()
-                .then(|| c.to_ascii_lowercase())
-                .unwrap_or(c),
+            'A'..='F' => if check_byte(&hash, i)
+                .not() { c.to_ascii_lowercase() } else { c },
             // HACK hex::encode should never put non-hex in addr_str
             _ => c,
         })

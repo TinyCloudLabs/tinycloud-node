@@ -10,7 +10,7 @@ pub mod address {
     where
         S: Serializer,
     {
-        format!("0x{}", encode_eip55(&addr)).serialize(s)
+        format!("0x{}", encode_eip55(addr)).serialize(s)
     }
 
     pub fn deserialize<'de, D>(d: D) -> Result<[u8; 20], D::Error>
@@ -18,7 +18,7 @@ pub mod address {
         D: Deserializer<'de>,
     {
         let addr = Cow::<'_, str>::deserialize(d)?;
-        decode_eip55(&addr.strip_prefix("0x").unwrap_or(&addr)).map_err(D::Error::custom)
+        decode_eip55(addr.strip_prefix("0x").unwrap_or(&addr)).map_err(D::Error::custom)
     }
 }
 
