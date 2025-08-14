@@ -1,9 +1,6 @@
 use futures::io::AsyncRead;
 use pin_project::pin_project;
-use std::{
-    io::Error as IoError,
-    task::Poll,
-};
+use std::{io::Error as IoError, task::Poll};
 
 /// LimitedRead wraps an AsyncRead and limits the number of bytes that can be read.
 ///
