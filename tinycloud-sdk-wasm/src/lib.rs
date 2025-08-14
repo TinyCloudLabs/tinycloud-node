@@ -2,7 +2,7 @@ mod definitions;
 pub mod host;
 pub mod session;
 
-use tinycloud_sdk_rs::{authorization, siwe_utils, util};
+use tinycloud_sdk_rs::{authorization::InvocationHeaders, util};
 use wasm_bindgen::prelude::*;
 
 fn map_jserr<E: std::error::Error>(e: E) -> JsValue {
@@ -56,26 +56,26 @@ pub fn invoke(
     path: String,
     action: String,
 ) -> Result<JsValue, JsValue> {
-    let session = serde_wasm_bindgen::from_value(session)?;
-    let authz = authorization::InvocationHeaders::from(
-        session,
-        std::iter::once((
+    let session: session::Session = serde_wasm_bindgen::from_value(session)?;
+    let authz = session
+        .invoke(std::iter::once((
             service.parse().map_err(map_jserr)?,
             path.parse().map_err(map_jserr)?,
             None,
             None,
             std::iter::once(action.parse().map_err(map_jserr)?),
-        )),
-    )
-    .map_err(map_jserr)?;
-    Ok(serde_wasm_bindgen::to_value(&authz)?)
+        )))
+        .map_err(map_jserr)?;
+    Ok(serde_wasm_bindgen::to_value(&InvocationHeaders::new(
+        authz,
+    ))?)
 }
 
 #[wasm_bindgen]
 #[allow(non_snake_case)]
 pub fn generateHostSIWEMessage(config: JsValue) -> Result<String, JsValue> {
     Ok(
-        siwe_utils::generate_host_siwe_message(serde_wasm_bindgen::from_value(config)?)
+        host::generate_host_siwe_message(serde_wasm_bindgen::from_value(config)?)
             .map_err(map_jserr)?
             .to_string(),
     )
@@ -85,6 +85,6 @@ pub fn generateHostSIWEMessage(config: JsValue) -> Result<String, JsValue> {
 #[allow(non_snake_case)]
 pub fn siweToDelegationHeaders(signedSIWEMessage: JsValue) -> Result<JsValue, JsValue> {
     Ok(serde_wasm_bindgen::to_value(
-        &siwe_utils::siwe_to_delegation_headers(serde_wasm_bindgen::from_value(signedSIWEMessage)?),
+        &host::siwe_to_delegation_headers(serde_wasm_bindgen::from_value(signedSIWEMessage)?),
     )?)
 }
