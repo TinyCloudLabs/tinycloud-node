@@ -29,3 +29,10 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tokio.workspace = true
+k256 = { version = "0.13", features = ["ecdsa"] }
+hex.workspace = true
+http.workspace = true
+rand = "0.8"
+sha3 = "0.10"
+siwe.workspace = true
+siwe-recap.workspace = true
