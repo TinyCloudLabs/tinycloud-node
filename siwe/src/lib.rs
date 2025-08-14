@@ -737,11 +737,22 @@ pub fn encode_eip55(addr: &[u8; 20]) -> String {
         .enumerate()
         .map(|(i, c)| match c {
             '0'..='9' => c,
-            'a'..='f' => if check_byte(&hash, i) { c.to_ascii_uppercase() } else { c },
+            'a'..='f' => {
+                if check_byte(&hash, i) {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            }
             // HACK hex::encode should never put uppercase-hex in addr_str
             // but just in case
-            'A'..='F' => if check_byte(&hash, i)
-                .not() { c.to_ascii_lowercase() } else { c },
+            'A'..='F' => {
+                if check_byte(&hash, i).not() {
+                    c.to_ascii_lowercase()
+                } else {
+                    c
+                }
+            }
             // HACK hex::encode should never put non-hex in addr_str
             _ => c,
         })
