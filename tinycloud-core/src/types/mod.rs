@@ -1,9 +1,11 @@
+mod ability;
 mod caveats;
 mod facts;
 mod metadata;
 mod orbit_id_wrap;
 mod resource;
 
+pub use ability::Ability;
 pub use caveats::Caveats;
 pub use facts::Facts;
 pub use metadata::Metadata;

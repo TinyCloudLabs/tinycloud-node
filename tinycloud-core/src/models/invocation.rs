@@ -4,8 +4,8 @@ use super::super::{
     relationships::*,
     util,
 };
-use crate::hash::Hash;
 use crate::types::{Facts, OrbitIdWrap, Resource};
+use crate::{hash::Hash, types::Ability};
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, Condition, ConnectionTrait, QueryOrder};
 use time::OffsetDateTime;
 use tinycloud_lib::{authorization::TinyCloudInvocation, ssi::dids::AnyDidMethod};
@@ -66,7 +66,7 @@ pub enum InvocationError {
     #[error("Unauthorized Invoker")]
     UnauthorizedInvoker(String),
     #[error("Unauthorized Action: {0} / {1}")]
-    UnauthorizedAction(Resource, String),
+    UnauthorizedAction(Resource, Ability),
     #[error("Cannot find parent delegation")]
     MissingParents,
     #[error("No Such Key: {0}")]
@@ -169,11 +169,11 @@ async fn validate<C: ConnectionTrait>(
                 !parents
                     .iter()
                     .flat_map(|(_, a)| a)
-                    .any(|pc| c.resource.extends(&pc.resource) && c.action == pc.ability)
+                    .any(|pc| c.resource.extends(&pc.resource) && c.ability == pc.ability)
             }) {
                 Some(c) => Err(InvocationError::UnauthorizedAction(
                     c.resource.clone(),
-                    c.action.clone(),
+                    c.ability.clone(),
                 )
                 .into()),
                 None => Ok(()),
@@ -215,7 +215,7 @@ async fn save<C: ConnectionTrait>(
             invoked_abilities::ActiveModel::from(invoked_abilities::Model {
                 invocation: hash,
                 resource: c.resource,
-                ability: c.action,
+                ability: c.ability,
             })
         }))
         .exec(db)

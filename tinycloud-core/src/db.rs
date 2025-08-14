@@ -213,35 +213,40 @@ where
         let mut ops = Vec::new();
         // for each capability being invoked
         for cap in invocation.0.capabilities.iter() {
-            match cap
-                .resource
-                .tinycloud_resource()
-                .and_then(|r| Some((r.service()?, cap.action.as_str(), r.orbit(), r.path()?)))
-            {
+            match cap.resource.tinycloud_resource().map(|r| {
+                (
+                    r.orbit(),
+                    r.service().as_str(),
+                    cap.ability.as_ref().as_ref(),
+                    r.path()
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                )
+            }) {
                 // stage inputs for content writes
-                Some(("kv", "kv/put", orbit, path)) => {
+                Some((orbit, "kv", "tinycloud.kv/put", path)) => {
                     let (metadata, mut stage) = inputs
-                        .remove(&(orbit.clone(), path.to_string()))
+                        .remove(&(orbit.clone(), path.clone()))
                         .ok_or(TxStoreError::MissingInput)?;
 
                     let value = stage.hash();
 
-                    let norm_path = normalize_path(path);
-
-                    stages.insert((orbit.clone(), norm_path.to_string()), stage);
+                    stages.insert((orbit.clone(), path.clone()), stage);
                     // add write for tx
                     ops.push(Operation::KvWrite {
                         orbit: orbit.clone(),
-                        key: norm_path.to_string(),
+                        key: path,
                         metadata,
                         value,
                     });
                 }
                 // add delete for tx
-                Some(("kv", "kv/del", orbit, path)) => {
+                Some((orbit, "kv", "tinycloud.kv/del", path)) => {
                     ops.push(Operation::KvDelete {
                         orbit: orbit.clone(),
-                        key: normalize_path(path).to_string(),
+                        key: path,
                         version: None,
                     });
                 }
@@ -265,26 +270,34 @@ where
 
         let mut results = Vec::new();
         // perform and record side effects
-        for cap in caps {
-            match (
-                cap.resource
-                    .tinycloud_resource()
-                    .and_then(|r| Some((r.orbit(), r.service()?, normalize_path(r.path()?)))),
-                cap.action.as_str(),
-            ) {
-                (Some((orbit, "kv", path)), "kv/get") => results.push(InvocationOutcome::KvRead(
-                    get_kv(&tx, &self.storage, orbit, path)
+        for cap in caps.iter().filter_map(|c| {
+            c.resource.tinycloud_resource().map(|r| {
+                (
+                    r.orbit(),
+                    r.service().as_str(),
+                    c.ability.as_ref().as_ref(),
+                    r.path()
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                )
+            })
+        }) {
+            match cap {
+                (orbit, "kv", "tinycloud.kv/get", path) => results.push(InvocationOutcome::KvRead(
+                    get_kv(&tx, &self.storage, orbit, &path)
                         .await
                         .map_err(|e| match e {
                             EitherError::A(e) => TxStoreError::Tx(e.into()),
                             EitherError::B(e) => TxStoreError::StoreRead(e),
                         })?,
                 )),
-                (Some((orbit, "kv", path)), "kv/list") => {
-                    results.push(InvocationOutcome::KvList(list(&tx, orbit, path).await?))
+                (orbit, "kv", "tinycloud.kv/list", path) => {
+                    results.push(InvocationOutcome::KvList(list(&tx, orbit, &path).await?))
                 }
-                (Some((orbit, "kv", path)), "kv/del") => {
-                    let kv = get_kv_entity(&tx, orbit, path).await?;
+                (orbit, "kv", "tinycloud.kv/del", path) => {
+                    let kv = get_kv_entity(&tx, orbit, &path).await?;
                     if let Some(kv) = kv {
                         self.storage
                             .remove(orbit, &kv.value)
@@ -293,8 +306,8 @@ where
                     }
                     results.push(InvocationOutcome::KvDelete)
                 }
-                (Some((orbit, "kv", path)), "kv/put") => {
-                    if let Some(stage) = stages.remove(&(orbit.clone(), path.to_string())) {
+                (orbit, "kv", "tinycloud.kv/put", path) => {
+                    if let Some(stage) = stages.remove(&(orbit.clone(), path)) {
                         self.storage
                             .persist(orbit, stage)
                             .await
@@ -302,14 +315,16 @@ where
                         results.push(InvocationOutcome::KvWrite)
                     }
                 }
-                (Some((orbit, "kv", path)), "kv/metadata") => results.push(
-                    InvocationOutcome::KvMetadata(metadata(&tx, orbit, path).await?),
+                (orbit, "kv", "tinycloud.kv/metadata", path) => results.push(
+                    InvocationOutcome::KvMetadata(metadata(&tx, orbit, &path).await?),
                 ),
-                (Some((orbit, "capabilities", "all")), "kv/read") => results.push(
-                    InvocationOutcome::OpenSessions(get_valid_delegations(&tx, orbit).await?),
-                ),
+                (orbit, "capabilities", "tinycloud.capabilities/read", path) if path == "all" => {
+                    results.push(InvocationOutcome::OpenSessions(
+                        get_valid_delegations(&tx, orbit).await?,
+                    ))
+                }
                 _ => {}
-            }
+            };
         }
 
         // commit tx if all side effects worked
@@ -420,10 +435,11 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         .iter()
         .filter_map(|(_, e)| match e {
             Event::Delegation(d) => Some(d.0.capabilities.iter().filter_map(|c| {
-                match (&c.resource, c.action.as_str()) {
-                    (Resource::TinyCloud(r), "orbit/host")
-                        if r.path().is_none()
-                            && r.service().is_none()
+                match (&c.resource, c.ability.as_ref().as_ref()) {
+                    (Resource::TinyCloud(r), "tinycloud.orbit/host")
+                        if r.path().is_empty()
+                            && r.service().as_str() == "orbit"
+                            && r.query().is_none()
                             && r.fragment().is_none() =>
                     {
                         Some(OrbitIdWrap(r.orbit().clone()))
@@ -772,7 +788,7 @@ async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                                 .into_iter()
                                 .map(|a| Capability {
                                     resource: a.resource,
-                                    action: a.ability,
+                                    ability: a.ability,
                                 })
                                 .collect(),
                             delegation,
@@ -785,14 +801,6 @@ async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             }
         })
         .collect::<Result<HashMap<Hash, DelegationInfo>, EncodingError>>()?)
-}
-
-fn normalize_path(p: &str) -> &str {
-    if p.starts_with('/') {
-        p.get(1..).unwrap_or("")
-    } else {
-        p
-    }
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-use crate::types::Resource;
+use crate::types::{Ability, Resource};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tinycloud_lib::{
@@ -13,7 +13,7 @@ use ucan_capabilities_object::Capabilities as UcanCapabilities;
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Capability {
     pub resource: Resource,
-    pub action: String,
+    pub ability: Ability,
 }
 
 #[non_exhaustive]
@@ -27,45 +27,40 @@ pub enum CapExtractError {
     Cid(#[from] tinycloud_lib::ipld_core::cid::Error),
 }
 
-fn extract_ucan_caps<T>(caps: &UcanCapabilities<T>) -> Result<Vec<Capability>, CapExtractError> {
+fn extract_ucan_caps<T>(caps: &UcanCapabilities<T>) -> Vec<Capability> {
     let mut capabilities = Vec::new();
 
     // Iterate over all capabilities in the Capabilities object
     for (resource_uri, abilities) in caps.abilities() {
         for ability in abilities.keys() {
-            let ability_str = ability.to_string();
-
             // Only process tinycloud capabilities, skip others
-            if let Some(action) = ability_str.strip_prefix("tinycloud.") {
-                capabilities.push(Capability {
-                    resource: resource_uri.to_string().into(),
-                    action: action.to_string(),
-                });
-            }
+            capabilities.push(Capability {
+                resource: resource_uri.into(),
+                ability: ability.clone().into(),
+            });
         }
     }
 
-    Ok(capabilities)
+    capabilities
 }
 
-fn extract_siwe_cap(c: SiweCap<()>) -> Result<(Vec<Capability>, Vec<Cid>), CapExtractError> {
-    Ok((
-        c.abilities()
-            .iter() // Iterate over the BTreeMap provided by abilities()
+fn extract_siwe_cap(c: SiweCap<()>) -> (Vec<Capability>, Vec<Cid>) {
+    let (c, p) = c.into_inner();
+    (
+        c.into_inner()
+            .into_iter()
             .flat_map(|(r, acs)| {
-                // r is &UriString, acs is &BTreeMap<Ability, NotaBeneCollection<()>>
-                acs.keys() // Iterate over Ability keys
-                    .map(|action| Capability {
-                        // action is &Ability
-                        resource: Resource::from(r.to_string()), // Convert RiString to String before From
-                        action: action.to_string(),              // Convert Ability to String
+                // r is UriString, acs is BTreeMap<Ability, Caveats<()>>
+                acs.into_keys() // Iterate over Ability keys
+                    .map(|ability| Capability {
+                        resource: Resource::from(r.clone()),
+                        ability: ability.into(),
                     })
-                    .collect::<Vec<Capability>>()
+                    .collect::<Vec<_>>()
             })
             .collect(),
-        // Access proof CIDs directly via the proof() method
-        c.proof().to_vec(),
-    ))
+        p,
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -108,7 +103,7 @@ impl TryFrom<TinyCloudDelegation> for DelegationInfo {
     fn try_from(d: TinyCloudDelegation) -> Result<Self, Self::Error> {
         Ok(match d {
             TinyCloudDelegation::Ucan(ref u) => Self {
-                capabilities: extract_ucan_caps(&u.payload().attenuation)?,
+                capabilities: extract_ucan_caps(&u.payload().attenuation),
                 delegator: u.payload().issuer.to_string(),
                 delegate: u.payload().audience.to_string(),
                 parents: u.payload().proof.clone(),
@@ -133,7 +128,7 @@ impl TryFrom<TinyCloudDelegation> for DelegationInfo {
                 let (capabilities, parents) = match maybe_siwe_cap {
                     Some(siwe_cap) => {
                         // Pass the extracted cap to the helper function
-                        extract_siwe_cap(siwe_cap)?
+                        extract_siwe_cap(siwe_cap)
                     }
                     None => {
                         // No capabilities found
@@ -183,7 +178,7 @@ impl TryFrom<TinyCloudInvocation> for InvocationInfo {
     type Error = InvocationError;
     fn try_from(invocation: TinyCloudInvocation) -> Result<Self, Self::Error> {
         Ok(Self {
-            capabilities: extract_ucan_caps(&invocation.payload().attenuation)?,
+            capabilities: extract_ucan_caps(&invocation.payload().attenuation),
             invoker: invocation.payload().issuer.to_string(),
             parents: invocation.payload().proof.clone(),
             invocation,
