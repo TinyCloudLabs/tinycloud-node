@@ -419,11 +419,12 @@ pub enum VerificationError {
 
 /// Takes an UNPREFIXED eth address and returns whether it is in checksum format or not.
 pub fn is_checksum(address: &str) -> bool {
-    let hash = Keccak256::digest(address.as_bytes());
+    let hash = Keccak256::digest(address.to_ascii_lowercase().as_bytes());
     address.len() == 40
         && address.chars().enumerate().all(|(i, c)| match c {
-            'a'..='f' if check_byte(&hash, i) => false,
-            'a'..='f' | 'A'..='F' | '0'..='9' => true,
+            '0'..='9' => true,
+            'a'..='f' => !check_byte(&hash, i),
+            'A'..='F' => check_byte(&hash, i),
             _ => false,
         })
 }
@@ -709,15 +710,17 @@ pub enum Eip55Error {
 /// Decodes eth address bytes from an eip55-encoded string
 pub fn decode_eip55(addr: &str) -> Result<[u8; 20], Eip55Error> {
     use Eip55Error::*;
+    use std::ops::Not;
     if addr.len() != 40 {
         return Err(IncorrectLength(addr.len()));
     };
-    let hash = Keccak256::digest(addr.as_bytes());
+    let hash = Keccak256::digest(addr.to_ascii_lowercase().as_bytes());
     addr.chars()
         .enumerate()
         .find_map(|(i, c)| match c {
-            'a'..='f' if check_byte(&hash, i) => Some(InvalidChecksum(i)),
-            'a'..='f' | 'A'..='F' | '0'..='9' => None,
+            '0'..='9' => None,
+            'a'..='f' => check_byte(&hash, i).then(|| InvalidChecksum(i)),
+            'A'..='F' => check_byte(&hash, i).not().then(|| InvalidChecksum(i)),
             o => Some(InvalidChar(i, o)),
         })
         .map(Result::Err)
@@ -726,13 +729,24 @@ pub fn decode_eip55(addr: &str) -> Result<[u8; 20], Eip55Error> {
 
 /// Takes an eth address and returns it as a checksum formatted string without prefix.
 pub fn encode_eip55(addr: &[u8; 20]) -> String {
+    use std::ops::Not;
     let addr_str = hex::encode(addr);
-    let hash = Keccak256::digest(addr_str.as_bytes());
+    let hash = Keccak256::digest(addr_str.to_ascii_lowercase().as_bytes());
     addr_str
         .chars()
         .enumerate()
         .map(|(i, c)| match c {
-            'a'..='f' if check_byte(&hash, i) => c.to_ascii_uppercase(),
+            '0'..='9' => c,
+            'a'..='f' => check_byte(&hash, i)
+                .then(|| c.to_ascii_uppercase())
+                .unwrap_or(c),
+            // HACK hex::encode should never put uppercase-hex in addr_str
+            // but just in case
+            'A'..='F' => check_byte(&hash, i)
+                .not()
+                .then(|| c.to_ascii_lowercase())
+                .unwrap_or(c),
+            // HACK hex::encode should never put non-hex in addr_str
             _ => c,
         })
         .collect()
@@ -1157,6 +1171,10 @@ Resources:
             "0xD1220A0cf47c7B9Be7A2E6BA89F429762e7b9aDb",
             "0xD1220A0cf47c7B9Be7A2E6BA89F429762e7b9aDb"
         ));
+        assert!(test_eip55(
+            "0xCB51CA232F5C3F87Fad9512F2BbC1D8bC7e2f4C3",
+            "0xCB51CA232F5C3F87Fad9512F2BbC1D8bC7e2f4C3"
+        ))
     }
 
     fn test_eip55(addr: &str, checksum: &str) -> bool {
