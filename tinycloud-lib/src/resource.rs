@@ -24,6 +24,14 @@ impl fmt::Display for Name {
     }
 }
 
+impl TryFrom<String> for Name {
+    // TODO finish this
+    type Error = &'static str;
+    fn try_from(n: String) -> Result<Self, Self::Error> {
+        Ok(Self(n))
+    }
+}
+
 #[derive(
     Clone, Hash, PartialEq, Debug, Eq, SerializeDisplay, DeserializeFromStr, PartialOrd, Ord,
 )]

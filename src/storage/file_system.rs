@@ -37,7 +37,7 @@ impl FileSystemStore {
     fn get_path(&self, orbit: &OrbitId, mh: &Hash) -> PathBuf {
         self.path
             .join(orbit.suffix())
-            .join(orbit.name())
+            .join(orbit.name().as_str())
             .join(base64::encode_config(mh.as_ref(), base64::URL_SAFE))
     }
 
@@ -81,7 +81,7 @@ impl StorageConfig<FileSystemStore> for FileSystemConfig {
 impl StorageSetup for FileSystemStore {
     type Error = IoError;
     async fn create(&self, orbit: &OrbitId) -> Result<(), Self::Error> {
-        let path = self.path.join(orbit.suffix()).join(orbit.name());
+        let path = self.path.join(orbit.suffix()).join(orbit.name().as_str());
         if !path.is_dir() {
             create_dir_all(&path).await?;
         }
@@ -157,7 +157,8 @@ async fn store_sizes<P: AsRef<Path>>(path: &P) -> Result<HashMap<OrbitId, u64>, 
                         entry.file_name().into_string(),
                     ) {
                         // get the orbit ID from suffix and name
-                        let orbit = OrbitId::new(did.clone(), name);
+                        let orbit =
+                            OrbitId::new(did.clone(), name.try_into().map_err(IoError::other)?);
                         let size = orbit_size(&entry.path()).await?;
                         acc.insert(orbit, size);
                     }
