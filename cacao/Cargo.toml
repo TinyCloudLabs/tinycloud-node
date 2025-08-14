@@ -17,7 +17,6 @@ default = ["eip4361"]
 siwe.workspace = true
 iri-string.workspace = true
 thiserror.workspace = true
-url = "2.2"
 async-trait.workspace = true
 serde.workspace = true
 ipld-core.workspace = true
@@ -26,6 +25,8 @@ serde_with.workspace = true
 time.workspace = true
 http.workspace = true
 hex = { workspace = true, optional = true }
+serde_bytes = "0.11"
+serde_repr = "0.1"
 
 [dev-dependencies]
 async-std = { version = "1.10", features = ["attributes"] }

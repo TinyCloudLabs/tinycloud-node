@@ -4,10 +4,11 @@ use hex::FromHex;
 use http::uri::{Authority, Scheme};
 use iri_string::types::{UriAbsoluteString, UriString};
 use serde::{Deserialize, Serialize};
-use serde_with::{serde_as, DisplayFromStr};
+use serde_repr::{Deserialize_repr, Serialize_repr};
+use serde_with::{serde_as, skip_serializing_none, DisplayFromStr};
 pub use siwe;
 use siwe::{encode_eip55, Message, TimeStamp, VerificationError as SVE, Version as SVersion};
-use std::fmt::Debug;
+use std::{fmt::Debug, ops::Not};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -17,6 +18,7 @@ pub type SiweCacao = CACAO<Eip191, Eip4361>;
 pub struct Header;
 
 #[serde_as]
+#[skip_serializing_none]
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Payload {
     #[serde_as(as = "Option<DisplayFromStr>")]
@@ -35,10 +37,11 @@ pub struct Payload {
     #[serde_as(as = "Option<DisplayFromStr>")]
     pub nbf: Option<TimeStamp>,
     pub request_id: Option<String>,
-    pub resources: Vec<UriString>,
+    pub resources: Option<Vec<UriString>>,
 }
 
-#[derive(Serialize, Deserialize, Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize_repr, Deserialize_repr, Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Version {
     V1 = 1,
 }
@@ -138,7 +141,7 @@ impl TryInto<Message> for Payload {
             not_before: self.nbf,
             expiration_time: self.exp,
             request_id: self.request_id,
-            resources: self.resources,
+            resources: self.resources.unwrap_or_else(|| Vec::new()),
         })
     }
 }
@@ -163,7 +166,7 @@ impl From<Message> for Payload {
             nbf: m.not_before,
             exp: m.expiration_time,
             request_id: m.request_id,
-            resources: m.resources,
+            resources: m.resources.is_empty().not().then_some(m.resources),
         }
     }
 }
@@ -246,6 +249,7 @@ impl<'de> Deserialize<'de> for Header {
 
 #[derive(Serialize, Deserialize)]
 struct DummySig<'a> {
+    #[serde(with = "serde_bytes")]
     s: &'a [u8],
     t: &'a str,
 }
