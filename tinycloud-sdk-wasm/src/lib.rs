@@ -2,6 +2,7 @@ mod definitions;
 pub mod host;
 pub mod session;
 
+use hex::FromHex;
 use tinycloud_sdk_rs::{authorization::InvocationHeaders, util};
 use wasm_bindgen::prelude::*;
 
@@ -18,6 +19,18 @@ fn map_jserr<E: std::error::Error>(e: E) -> JsValue {
 // pub fn initPanicHook() {
 //     console_error_panic_hook::set_once();
 // }
+
+#[wasm_bindgen]
+#[allow(non_snake_case)]
+pub fn ensureEip55(address: String) -> Result<String, JsValue> {
+    Ok(format!(
+        "0x{}",
+        util::encode_eip55(
+            &<[u8; 20] as FromHex>::from_hex(address.strip_prefix("0x").unwrap_or(&address))
+                .map_err(map_jserr)?,
+        )
+    ))
+}
 
 #[wasm_bindgen]
 #[allow(non_snake_case)]
