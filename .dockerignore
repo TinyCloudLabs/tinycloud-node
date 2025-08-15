@@ -1,1 +1,15 @@
-/target
+target/
+Dockerfile
+.dockerignore
+.git/
+.gitignore
+*.md
+.env
+.env.*
+node_modules/
+.sst/
+.cache/
+test/
+docs/
+*.log
+.DS_Store
