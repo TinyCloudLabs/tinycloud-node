@@ -3,19 +3,21 @@
   "version": "1.0.0",
   "description": "SST deployment configuration for TinyCloud",
   "scripts": {
+    "predeploy": "cargo build --release",
     "dev": "sst dev",
     "deploy": "sst deploy",
     "remove": "sst remove",
     "console": "sst console",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "deploy:secrets": "node deploy-secrets.js"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
+    "dotenv": "^16.4.0",
     "sst": "^3.0.0",
     "typescript": "^5.3.0"
   },
   "dependencies": {
-    "@aws-cdk/aws-efs-alpha": "^2.0.0-alpha.0",
     "aws-cdk-lib": "^2.0.0",
     "constructs": "^10.0.0"
   }

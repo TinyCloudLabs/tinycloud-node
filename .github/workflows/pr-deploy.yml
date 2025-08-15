@@ -1,0 +1,167 @@
+name: PR Preview Deploy
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v1
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Generate unique secret for PR
+        id: generate-secret
+        run: |
+          SECRET=$(openssl rand -base64 32)
+          echo "::add-mask::$SECRET"
+          echo "secret=$SECRET" >> $GITHUB_OUTPUT
+
+      - name: Deploy to AWS
+        id: deploy
+        env:
+          STAGE: pr-${{ github.event.pull_request.number }}
+        run: |
+          # Set secrets for this PR stage
+          npx sst secret set TinycloudKeysSecret "${{ steps.generate-secret.outputs.secret }}" --stage $STAGE
+          npx sst secret set AwsAccessKeyId "${{ secrets.TINYCLOUD_AWS_ACCESS_KEY_ID }}" --stage $STAGE
+          npx sst secret set AwsSecretAccessKey "${{ secrets.TINYCLOUD_AWS_SECRET_ACCESS_KEY }}" --stage $STAGE
+          
+          # Deploy
+          npx sst deploy --stage $STAGE
+          
+          # Capture outputs
+          SERVICE_URL=$(npx sst output --stage $STAGE --key serviceUrl)
+          echo "url=$SERVICE_URL" >> $GITHUB_OUTPUT
+
+      - name: Comment PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const stage = `pr-${{ github.event.pull_request.number }}`;
+            const url = '${{ steps.deploy.outputs.url }}';
+            const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+            
+            // Find and update existing comment or create new one
+            const identifier = `<!-- sst-deploy-${stage} -->`;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const existingComment = comments.find(c => c.body.includes(identifier));
+            
+            const body = `${identifier}
+            ## 🚀 Preview Deployment Ready!
+            
+            **Environment:** \`${stage}\`
+            **URL:** ${url}
+            **Status:** ✅ Deployed successfully
+            
+            <details>
+            <summary>Deployment Details</summary>
+            
+            - **Stage:** \`${stage}\`
+            - **Region:** \`us-east-1\`
+            - **Deploy Time:** ${new Date().toISOString()}
+            - **Workflow Run:** [View Logs](${runUrl})
+            
+            </details>
+            
+            ---
+            
+            > 💡 This is an isolated preview environment with its own database. It will be automatically cleaned up when the PR is closed.`;
+            
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body
+              });
+            }
+
+      - name: Comment PR on Failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const stage = `pr-${{ github.event.pull_request.number }}`;
+            const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+            
+            const identifier = `<!-- sst-deploy-${stage} -->`;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const existingComment = comments.find(c => c.body.includes(identifier));
+            
+            const body = `${identifier}
+            ## ❌ Preview Deployment Failed
+            
+            **Environment:** \`${stage}\`
+            **Status:** Failed to deploy
+            
+            Please check the [workflow logs](${runUrl}) for more details.
+            
+            ---
+            
+            > 💡 Once the issues are resolved, push a new commit to trigger a redeployment.`;
+            
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body
+              });
+            }

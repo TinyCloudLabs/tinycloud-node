@@ -1,0 +1,35 @@
+Updating (samgbafa):
+@ updating....
+
+@ updating.......
+    aws:ec2:Eip TinycloudVpcElasticIp1  warning: urn:pulumi:samgbafa::tinycloud::sst:aws:Vpc$aws:ec2/eip:Eip::TinycloudVpcElasticIp1 verification warning: use domain attribute instead
+    aws:ec2:Eip TinycloudVpcElasticIp1  warning: urn:pulumi:samgbafa::tinycloud::sst:aws:Vpc$aws:ec2/eip:Eip::TinycloudVpcElasticIp1 verification warning: use domain attribute instead
+    aws:ec2:Eip TinycloudVpcElasticIp2  warning: urn:pulumi:samgbafa::tinycloud::sst:aws:Vpc$aws:ec2/eip:Eip::TinycloudVpcElasticIp2 verification warning: use domain attribute instead
+    aws:ec2:Eip TinycloudVpcElasticIp2  warning: urn:pulumi:samgbafa::tinycloud::sst:aws:Vpc$aws:ec2/eip:Eip::TinycloudVpcElasticIp2 verification warning: use domain attribute instead
+@ updating....
+ -  sst:sst:Secret TinycloudKeysSecret deleting (0s) 
+ -  sst:sst:Secret AwsAccessKeyId deleting (0s) 
+ -  sst:sst:LinkRef AwsAccessKeyIdLinkRef deleting (0s) 
+ -  sst:sst:Secret AwsSecretAccessKey deleting (0s) 
+ -  sst:sst:LinkRef TinycloudKeysSecretLinkRef deleting (0s) 
+ -  sst:sst:LinkRef AwsSecretAccessKeyLinkRef deleting (0s) 
+    pulumi:pulumi:Stack tinycloud-samgbafa  
+Diagnostics:
+  aws:ec2:Eip (TinycloudVpcElasticIp2):
+    warning: urn:pulumi:samgbafa::tinycloud::sst:aws:Vpc$aws:ec2/eip:Eip::TinycloudVpcElasticIp2 verification warning: use domain attribute instead
+
+  aws:ec2:Eip (TinycloudVpcElasticIp1):
+    warning: urn:pulumi:samgbafa::tinycloud::sst:aws:Vpc$aws:ec2/eip:Eip::TinycloudVpcElasticIp1 verification warning: use domain attribute instead
+
+Outputs:
+    _protect    : false
+    bucketName  : "tinycloud-samgbafa-blockstoragebucket-unssurke"
+    databaseHost: "tinycloud-samgbafa-databaseinstance-toretmrh.cfs08ws8o95w.us-east-2.rds.amazonaws.com"
+    serviceUrl  : "http://url-unavailable-in-dev.mode"
+
+Resources:
+    - 6 deleted
+    53 unchanged
+
+Duration: 6s
+
