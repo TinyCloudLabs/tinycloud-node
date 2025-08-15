@@ -40,8 +40,15 @@ export default $config({
       },
     });
 
+    // Get image from environment or build locally for dev
+    const image = process.env.TINYCLOUD_IMAGE || {
+      context: ".",
+      dockerfile: "Dockerfile",
+    };
+
     const service = new sst.aws.Service("TinycloudService", {
       cluster,
+      image,
       cpu: isPR ? "0.5 vCPU" : isProd ? "2 vCPU" : "1 vCPU",
       memory: isPR ? "1 GB" : isProd ? "4 GB" : "2 GB",
       link: [bucket, database, ...Object.values(secrets)],
@@ -52,14 +59,12 @@ export default $config({
         memoryUtilization: 80,
       },
       loadBalancer: {
-        ports: [{ listen: "80/http", forward: "8000/http", container: "web" }],
+        ports: [{ listen: "80/http", forward: "8000/http" }],
         health: {
-          "8000/http": {
-            path: "/healthz",
-            interval: "30 seconds",
-            timeout: "10 seconds",
-            unhealthyThreshold: 3,
-          },
+          path: "/healthz",
+          interval: "30 seconds",
+          timeout: "10 seconds",
+          unhealthyThreshold: 3,
         },
       },
       dev: {

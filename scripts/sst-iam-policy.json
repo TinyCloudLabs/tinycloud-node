@@ -48,6 +48,37 @@
                 "iam:ListPolicyVersions"
             ],
             "Resource": "arn:aws:iam::aws:policy/*"
+        },
+        {
+            "Sid": "ECRPermissions",
+            "Effect": "Allow",
+            "Action": [
+                "ecr:GetAuthorizationToken",
+                "ecr:BatchCheckLayerAvailability",
+                "ecr:GetDownloadUrlForLayer",
+                "ecr:BatchGetImage",
+                "ecr:PutImage",
+                "ecr:InitiateLayerUpload",
+                "ecr:UploadLayerPart",
+                "ecr:CompleteLayerUpload",
+                "ecr:CreateRepository",
+                "ecr:DescribeRepositories",
+                "ecr:SetRepositoryPolicy",
+                "ecr:PutLifecyclePolicy",
+                "ecr:TagResource"
+            ],
+            "Resource": [
+                "arn:aws:ecr:*:*:repository/tinycloud",
+                "arn:aws:ecr:*:*:repository/tinycloud/*"
+            ]
+        },
+        {
+            "Sid": "ECRGetToken",
+            "Effect": "Allow",
+            "Action": [
+                "ecr:GetAuthorizationToken"
+            ],
+            "Resource": "*"
         }
     ]
 }

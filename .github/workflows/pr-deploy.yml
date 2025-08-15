@@ -9,24 +9,67 @@ permissions:
   contents: read
   pull-requests: write
 
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: tinycloud
 
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          toolchain: stable
-          cache: true
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create ECR repository if it doesn't exist
+        run: |
+          aws ecr describe-repositories --repository-names ${{ env.ECR_REPOSITORY }} || \
+          aws ecr create-repository --repository-name ${{ env.ECR_REPOSITORY }} --image-scanning-configuration scanOnPush=true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:pr-${{ github.event.pull_request.number }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:pr-${{ github.event.pull_request.number }}-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Output image
+        id: image
+        run: |
+          echo "image=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:pr-${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: '20'
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v1
@@ -38,7 +81,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: us-east-1
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Generate unique secret for PR
         id: generate-secret
@@ -51,59 +94,47 @@ jobs:
         id: deploy
         env:
           STAGE: pr-${{ github.event.pull_request.number }}
+          TINYCLOUD_IMAGE: ${{ needs.build-and-push.outputs.image }}
         run: |
           # Set secrets for this PR stage
           npx sst secret set TINYCLOUD_KEYS_SECRET "${{ steps.generate-secret.outputs.secret }}" --stage $STAGE
           npx sst secret set AWS_ACCESS_KEY_ID "${{ secrets.TINYCLOUD_AWS_ACCESS_KEY_ID }}" --stage $STAGE
           npx sst secret set AWS_SECRET_ACCESS_KEY "${{ secrets.TINYCLOUD_AWS_SECRET_ACCESS_KEY }}" --stage $STAGE
-
-          # Deploy
+          
+          # Deploy with pre-built image
           npx sst deploy --stage $STAGE
-
+          
           # Capture outputs
           SERVICE_URL=$(npx sst output --stage $STAGE --key serviceUrl)
           echo "url=$SERVICE_URL" >> $GITHUB_OUTPUT
 
-      - name: Comment PR
+      - name: Comment PR - Building
+        if: needs.build-and-push.result == 'success'
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const stage = `pr-${{ github.event.pull_request.number }}`;
-            const url = '${{ steps.deploy.outputs.url }}';
-            const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
-
-            // Find and update existing comment or create new one
             const identifier = `<!-- sst-deploy-${stage} -->`;
+            
+            const body = `${identifier}
+            ## 🔨 Preview Deployment Building...
+            
+            **Environment:** \`${stage}\`
+            **Status:** 🟡 Deploying infrastructure...
+            
+            ---
+            
+            > 💡 This usually takes 3-5 minutes. This comment will update when deployment is complete.`;
+            
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
             });
-
+            
             const existingComment = comments.find(c => c.body.includes(identifier));
-
-            const body = `${identifier}
-            ## 🚀 Preview Deployment Ready!
-
-            **Environment:** \`${stage}\`
-            **URL:** ${url}
-            **Status:** ✅ Deployed successfully
-
-            <details>
-            <summary>Deployment Details</summary>
-
-            - **Stage:** \`${stage}\`
-            - **Region:** \`us-east-1\`
-            - **Deploy Time:** ${new Date().toISOString()}
-            - **Workflow Run:** [View Logs](${runUrl})
-
-            </details>
-
-            ---
-
-            > 💡 This is an isolated preview environment with its own database. It will be automatically cleaned up when the PR is closed.`;
-
+            
             if (existingComment) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
@@ -120,7 +151,65 @@ jobs:
               });
             }
 
-      - name: Comment PR on Failure
+      - name: Comment PR - Success
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const stage = `pr-${{ github.event.pull_request.number }}`;
+            const url = '${{ steps.deploy.outputs.url }}';
+            const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+            const image = '${{ needs.build-and-push.outputs.image }}';
+            
+            const identifier = `<!-- sst-deploy-${stage} -->`;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const existingComment = comments.find(c => c.body.includes(identifier));
+            
+            const body = `${identifier}
+            ## 🚀 Preview Deployment Ready!
+            
+            **Environment:** \`${stage}\`
+            **URL:** ${url}
+            **Status:** ✅ Deployed successfully
+            
+            <details>
+            <summary>Deployment Details</summary>
+            
+            - **Stage:** \`${stage}\`
+            - **Region:** \`${env.AWS_REGION}\`
+            - **Deploy Time:** ${new Date().toISOString()}
+            - **Docker Image:** \`${image}\`
+            - **Workflow Run:** [View Logs](${runUrl})
+            
+            </details>
+            
+            ---
+            
+            > 💡 This is an isolated preview environment with its own database. It will be automatically cleaned up when the PR is closed.`;
+            
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body
+              });
+            }
+
+      - name: Comment PR - Failure
         if: failure()
         uses: actions/github-script@v7
         with:
@@ -128,28 +217,28 @@ jobs:
           script: |
             const stage = `pr-${{ github.event.pull_request.number }}`;
             const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
-
+            
             const identifier = `<!-- sst-deploy-${stage} -->`;
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
             });
-
+            
             const existingComment = comments.find(c => c.body.includes(identifier));
-
+            
             const body = `${identifier}
             ## ❌ Preview Deployment Failed
-
+            
             **Environment:** \`${stage}\`
             **Status:** Failed to deploy
-
+            
             Please check the [workflow logs](${runUrl}) for more details.
-
+            
             ---
-
+            
             > 💡 Once the issues are resolved, push a new commit to trigger a redeployment.`;
-
+            
             if (existingComment) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,

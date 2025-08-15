@@ -7,11 +7,11 @@ This directory contains automated deployment workflows for TinyCloud using SST a
 ### 1. PR Preview Deploy (`pr-deploy.yml`)
 - **Triggers**: On PR open, synchronize, or reopen
 - **Actions**:
-  - Builds the Rust application
-  - Creates an isolated environment with stage name `pr-{number}`
-  - Deploys with its own database (Aurora Serverless)
-  - Posts/updates a comment with the preview URL
-  - Uses smaller resources to save costs
+  - **Build & Push**: Builds Docker image and pushes to ECR with tag `pr-{number}`
+  - **Deploy**: Creates isolated environment with stage name `pr-{number}`
+  - **Infrastructure**: Deploys with its own database (Aurora Serverless)
+  - **Notification**: Posts/updates a comment with the preview URL
+  - **Optimization**: Uses smaller resources and pre-built containers to save costs and time
 
 ### 2. PR Preview Cleanup (`pr-cleanup.yml`)
 - **Triggers**: On PR close
@@ -23,11 +23,12 @@ This directory contains automated deployment workflows for TinyCloud using SST a
 ### 3. Production Deploy (`deploy-production.yml`)
 - **Triggers**: On push to `main` branch
 - **Actions**:
-  - Runs tests before deployment
-  - Builds optimized release binary
-  - Deploys to production stage
-  - Uses production-grade resources
-  - Creates GitHub deployment record
+  - **Test**: Runs Rust tests before deployment
+  - **Build & Push**: Builds optimized Docker image and pushes to ECR with tags `latest` and `main-{sha}`
+  - **Deploy**: Deploys to production stage using pre-built container
+  - **Resources**: Uses production-grade resources
+  - **Record**: Creates GitHub deployment record
+  - **Cleanup**: Configures ECR lifecycle policies to manage image retention
 
 ## Required GitHub Secrets
 
@@ -89,6 +90,45 @@ SST creates IAM roles for:
 - Other service-linked roles
 
 The deployment fails without IAM permissions because PowerUserAccess specifically excludes IAM and Organizations services.
+
+## Container Optimization
+
+### ECR Setup
+
+Before first deployment, set up the ECR repository:
+
+```bash
+./scripts/setup-ecr.sh
+```
+
+This creates:
+- ECR repository named `tinycloud`
+- Lifecycle policies for automatic image cleanup
+- Security scanning enabled
+
+### Build Optimization Strategy
+
+**Build Once, Deploy Everywhere:**
+1. **GitHub Actions**: Builds Docker image with Rust compilation
+2. **ECR Storage**: Stores tagged images (`pr-123`, `main-abc1234`, `latest`)
+3. **SST Deploy**: Uses pre-built image, skips compilation entirely
+
+**Benefits:**
+- ⚡ **Faster deployments**: No Rust compilation during deploy (5-10x faster)
+- 🔄 **Reliable retries**: Same image for retries, no rebuild needed
+- 🎯 **Consistent environments**: Exact same container in test and production
+- 💰 **Cost savings**: Less compute time in deployment phase
+
+**Image Tagging Strategy:**
+- PR environments: `pr-123`, `pr-123-abc1234`
+- Production: `latest`, `main-abc1234`
+- Automatic cleanup via lifecycle policies
+
+### Caching Strategy
+
+- **Docker layer cache**: Shared between workflow runs via GitHub Actions cache
+- **Cargo dependencies**: Cached using cargo-chef in multi-stage build
+- **Incremental builds**: Only changed layers rebuilt
 
 ## Environment Isolation
 
