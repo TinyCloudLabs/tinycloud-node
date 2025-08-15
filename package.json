@@ -3,13 +3,16 @@
   "version": "1.0.0",
   "description": "SST deployment configuration for TinyCloud",
   "scripts": {
-    "predeploy": "cargo build --release",
     "dev": "sst dev",
+    "dev:local": "cargo run",
     "deploy": "sst deploy",
+    "deploy:prod": "sst deploy --stage production", 
     "remove": "sst remove",
+    "remove:dev": "sst remove --stage dev",
     "console": "sst console",
+    "console:dev": "sst console --stage dev",
     "typecheck": "tsc --noEmit",
-    "deploy:secrets": "node deploy-secrets.js"
+    "setup:secrets": "echo 'Set up dev secrets: npx sst secret set TINYCLOUD_KEYS_SECRET \"$(openssl rand -base64 32)\" --stage dev'"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",

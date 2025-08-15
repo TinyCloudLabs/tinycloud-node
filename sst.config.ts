@@ -65,14 +65,16 @@ export default $config({
       dev: {
         command: "cargo run",
         directory: ".",
+        autostart: true,
+        watch: ["src", "Cargo.toml", "Cargo.lock"],
       },
       environment: {
-        TINYCLOUD_LOG_LEVEL: "normal",
+        TINYCLOUD_LOG_LEVEL: isDev ? "debug" : "normal",
         TINYCLOUD_ADDRESS: "0.0.0.0",
         TINYCLOUD_PORT: "8000",
         TINYCLOUD_STORAGE_BLOCKS_TYPE: "S3",
         TINYCLOUD_STORAGE_BLOCKS_BUCKET: bucket.name,
-        TINYCLOUD_STORAGE_DATABASE: `postgres://${database.host}:${database.port}/${database.database}`,
+        TINYCLOUD_STORAGE_DATABASE: database.connectionString,
         TINYCLOUD_STORAGE_STAGING: "Memory",
         TINYCLOUD_KEYS_TYPE: "Static",
         TINYCLOUD_KEYS_SECRET: secrets.tinycloudKeysSecret.value,
@@ -80,6 +82,7 @@ export default $config({
         AWS_SECRET_ACCESS_KEY: secrets.awsSecretAccessKey.value,
         ROCKET_ADDRESS: "0.0.0.0",
         ROCKET_PORT: "8000",
+        AWS_DEFAULT_REGION: "us-east-1",
       },
     });
 

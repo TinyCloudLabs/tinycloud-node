@@ -1,5 +1,5 @@
 
-  .sst/platform/sst.config.1755278116302.mjs ────────────────────────────────────── 717.9kb ─ 100.0%
+  .sst/platform/sst.config.1755281106884.mjs ────────────────────────────────────── 717.8kb ─ 100.0%
    ├ .sst/platform/src/components/aws/router.ts ──────────────────────────────────── 34.9kb ─── 4.9%
    │  └ .sst/platform/src/components/aws/index.ts
    │     └ .sst/platform/src/components/index.ts
@@ -275,6 +275,8 @@
    │        └ .sst/platform/src/components/index.ts
    │           └ sst.config.ts
    │              └ eval.ts
+   ├ sst.config.ts ────────────────────────────────────────────────────────────────── 2.8kb ─── 0.4%
+   │  └ eval.ts
    ├ .sst/platform/src/components/rpc/rpc.ts ──────────────────────────────────────── 2.8kb ─── 0.4%
    │  └ .sst/platform/src/components/cloudflare/worker.ts
    │     └ .sst/platform/src/components/cloudflare/index.ts
@@ -304,8 +306,6 @@
    │           └ .sst/platform/src/components/index.ts
    │              └ sst.config.ts
    │                 └ eval.ts
-   ├ sst.config.ts ────────────────────────────────────────────────────────────────── 2.7kb ─── 0.4%
-   │  └ eval.ts
    ├ .sst/platform/src/components/aws/queue-lambda-subscriber.ts ──────────────────── 2.6kb ─── 0.4%
    │  └ .sst/platform/src/components/aws/queue.ts
    │     └ .sst/platform/src/components/aws/index.ts
@@ -575,8 +575,6 @@
    │        └ .sst/platform/src/components/index.ts
    │           └ sst.config.ts
    │              └ eval.ts
-   ├ <define:$cli> ────────────────────────────────────────────────────────────────── 882b ──── 0.1%
-   │  └ eval.ts
    ├ .sst/platform/src/components/aws/step-functions/wait.ts ──────────────────────── 818b ──── 0.1%
    │  └ .sst/platform/src/components/aws/step-functions.ts
    │     └ .sst/platform/src/components/aws/index.ts
@@ -596,6 +594,8 @@
    │           └ .sst/platform/src/components/index.ts
    │              └ sst.config.ts
    │                 └ eval.ts
+   ├ <define:$cli> ────────────────────────────────────────────────────────────────── 729b ──── 0.1%
+   │  └ eval.ts
    ├ .sst/platform/src/components/experimental/dev-command.ts ─────────────────────── 686b ──── 0.1%
    │  └ .sst/platform/src/components/experimental/index.ts
    │     └ .sst/platform/src/components/index.ts
