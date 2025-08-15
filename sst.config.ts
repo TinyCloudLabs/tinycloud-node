@@ -61,10 +61,12 @@ export default $config({
       loadBalancer: {
         ports: [{ listen: "80/http", forward: "8000/http" }],
         health: {
-          path: "/healthz",
-          interval: "30 seconds",
-          timeout: "10 seconds",
-          unhealthyThreshold: 3,
+          "8000/http": {
+            path: "/healthz",
+            interval: "30 seconds",
+            timeout: "10 seconds",
+            unhealthyThreshold: 3,
+          },
         },
       },
       dev: {

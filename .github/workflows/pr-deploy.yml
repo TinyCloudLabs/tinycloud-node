@@ -17,11 +17,26 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     outputs:
-      image: ${{ steps.image.outputs.image }}
+      image: ${{ steps.final-image.outputs.image }}
+      build-skipped: ${{ steps.should-build.outputs.should-build != 'true' }}
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Check for Rust code changes
+        id: check-changes
+        uses: dorny/paths-filter@v2
+        with:
+          filters: |
+            rust:
+              - 'src/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock' 
+              - 'Dockerfile'
+              - 'tinycloud-*/**'
+              - 'siwe*/**'
+              - 'cacao/**'
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -38,10 +53,44 @@ jobs:
           aws ecr describe-repositories --repository-names ${{ env.ECR_REPOSITORY }} || \
           aws ecr create-repository --repository-name ${{ env.ECR_REPOSITORY }} --image-scanning-configuration scanOnPush=true
 
+      - name: Check if image already exists for this PR
+        id: check-existing
+        run: |
+          PR_TAG="pr-${{ github.event.pull_request.number }}"
+          if aws ecr describe-images --repository-name ${{ env.ECR_REPOSITORY }} --image-ids imageTag=$PR_TAG >/dev/null 2>&1; then
+            echo "Image already exists for PR ${{ github.event.pull_request.number }}"
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "existing-image=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:$PR_TAG" >> $GITHUB_OUTPUT
+          else
+            echo "No existing image found for PR ${{ github.event.pull_request.number }}"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Determine if we should build
+        id: should-build
+        run: |
+          RUST_CHANGES="${{ steps.check-changes.outputs.rust }}"
+          EXISTING_BUILD="${{ steps.check-existing.outputs.exists }}"
+          
+          # Build when: (Rust changes) OR (no existing build)
+          if [ "$RUST_CHANGES" == "true" ] || [ "$EXISTING_BUILD" == "false" ]; then
+            echo "should-build=true" >> $GITHUB_OUTPUT
+            if [ "$RUST_CHANGES" == "true" ]; then
+              echo "🔨 Building because: Rust changes detected"
+            else
+              echo "🔨 Building because: No existing build found"
+            fi
+          else
+            echo "should-build=false" >> $GITHUB_OUTPUT
+            echo "♻️ Skipping build: No Rust changes and existing build found"
+          fi
+
       - name: Set up Docker Buildx
+        if: steps.should-build.outputs.should-build == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Build and push Docker image
+        if: steps.should-build.outputs.should-build == 'true'
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -53,10 +102,21 @@ jobs:
           cache-to: type=gha,mode=max
           platforms: linux/amd64
 
-      - name: Output image
-        id: image
+      - name: Determine final image
+        id: final-image
         run: |
-          echo "image=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:pr-${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+          if [ "${{ steps.should-build.outputs.should-build }}" == "true" ]; then
+            # We built a new image
+            IMAGE="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:pr-${{ github.event.pull_request.number }}"
+            echo "🔨 Using newly built image"
+          else
+            # Use existing image
+            IMAGE="${{ steps.check-existing.outputs.existing-image }}"
+            echo "♻️ Using existing image"
+          fi
+          
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+          echo "Final image: $IMAGE"
 
   deploy:
     needs: build-and-push
@@ -161,6 +221,15 @@ jobs:
             const url = '${{ steps.deploy.outputs.url }}';
             const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
             const image = '${{ needs.build-and-push.outputs.image }}';
+            const buildSkipped = '${{ needs.build-and-push.outputs.build-skipped }}' === 'true';
+            
+            // Determine build status message
+            let buildStatus = '';
+            if (buildSkipped) {
+              buildStatus = '♻️ **Build:** Skipped (no Rust changes, reused existing image)';
+            } else {
+              buildStatus = '🔨 **Build:** New image built from Rust changes';
+            }
             
             const identifier = `<!-- sst-deploy-${stage} -->`;
             const { data: comments } = await github.rest.issues.listComments({
@@ -178,6 +247,8 @@ jobs:
             **URL:** ${url}
             **Status:** ✅ Deployed successfully
             
+            ${buildStatus}
+            
             <details>
             <summary>Deployment Details</summary>
             
@@ -186,6 +257,7 @@ jobs:
             - **Deploy Time:** ${new Date().toISOString()}
             - **Docker Image:** \`${image}\`
             - **Workflow Run:** [View Logs](${runUrl})
+            - **Build Optimized:** ${buildSkipped ? 'Yes - reused existing build' : 'No - built new image'}
             
             </details>
             
