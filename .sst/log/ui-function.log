@@ -1,5 +1,0 @@
-time=2025-08-15T14:05:05.785-04:00 level=INFO msg="checking for pulumi" path="/Users/samgbafa/Library/Application Support/sst/bin/pulumi"
-time=2025-08-15T14:05:05.957-04:00 level=INFO msg="checking for bun" path="/Users/samgbafa/Library/Application Support/sst/bin/bun"
-time=2025-08-15T14:05:05.961-04:00 level=INFO msg="initializing ui" isTTY=true
-time=2025-08-15T14:05:05.963-04:00 level=INFO msg="initializing ui" isTTY=true
-time=2025-08-15T14:05:05.963-04:00 level=INFO msg="initialized ui"
