@@ -12,7 +12,7 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -26,7 +26,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v1
@@ -53,13 +53,13 @@ jobs:
           STAGE: pr-${{ github.event.pull_request.number }}
         run: |
           # Set secrets for this PR stage
-          npx sst secret set TinycloudKeysSecret "${{ steps.generate-secret.outputs.secret }}" --stage $STAGE
-          npx sst secret set AwsAccessKeyId "${{ secrets.TINYCLOUD_AWS_ACCESS_KEY_ID }}" --stage $STAGE
-          npx sst secret set AwsSecretAccessKey "${{ secrets.TINYCLOUD_AWS_SECRET_ACCESS_KEY }}" --stage $STAGE
-          
+          npx sst secret set TINYCLOUD_KEYS_SECRET "${{ steps.generate-secret.outputs.secret }}" --stage $STAGE
+          npx sst secret set AWS_ACCESS_KEY_ID "${{ secrets.TINYCLOUD_AWS_ACCESS_KEY_ID }}" --stage $STAGE
+          npx sst secret set AWS_SECRET_ACCESS_KEY "${{ secrets.TINYCLOUD_AWS_SECRET_ACCESS_KEY }}" --stage $STAGE
+
           # Deploy
           npx sst deploy --stage $STAGE
-          
+
           # Capture outputs
           SERVICE_URL=$(npx sst output --stage $STAGE --key serviceUrl)
           echo "url=$SERVICE_URL" >> $GITHUB_OUTPUT
@@ -72,7 +72,7 @@ jobs:
             const stage = `pr-${{ github.event.pull_request.number }}`;
             const url = '${{ steps.deploy.outputs.url }}';
             const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
-            
+
             // Find and update existing comment or create new one
             const identifier = `<!-- sst-deploy-${stage} -->`;
             const { data: comments } = await github.rest.issues.listComments({
@@ -80,30 +80,30 @@ jobs:
               repo: context.repo.repo,
               issue_number: context.issue.number,
             });
-            
+
             const existingComment = comments.find(c => c.body.includes(identifier));
-            
+
             const body = `${identifier}
             ## 🚀 Preview Deployment Ready!
-            
+
             **Environment:** \`${stage}\`
             **URL:** ${url}
             **Status:** ✅ Deployed successfully
-            
+
             <details>
             <summary>Deployment Details</summary>
-            
+
             - **Stage:** \`${stage}\`
             - **Region:** \`us-east-1\`
             - **Deploy Time:** ${new Date().toISOString()}
             - **Workflow Run:** [View Logs](${runUrl})
-            
+
             </details>
-            
+
             ---
-            
+
             > 💡 This is an isolated preview environment with its own database. It will be automatically cleaned up when the PR is closed.`;
-            
+
             if (existingComment) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
@@ -128,28 +128,28 @@ jobs:
           script: |
             const stage = `pr-${{ github.event.pull_request.number }}`;
             const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
-            
+
             const identifier = `<!-- sst-deploy-${stage} -->`;
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
             });
-            
+
             const existingComment = comments.find(c => c.body.includes(identifier));
-            
+
             const body = `${identifier}
             ## ❌ Preview Deployment Failed
-            
+
             **Environment:** \`${stage}\`
             **Status:** Failed to deploy
-            
+
             Please check the [workflow logs](${runUrl}) for more details.
-            
+
             ---
-            
+
             > 💡 Once the issues are resolved, push a new commit to trigger a redeployment.`;
-            
+
             if (existingComment) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,

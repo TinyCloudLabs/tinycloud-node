@@ -13,7 +13,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: production
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -27,7 +27,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v1
@@ -52,13 +52,13 @@ jobs:
           STAGE: production
         run: |
           # Set production secrets (these should already exist)
-          npx sst secret set TinycloudKeysSecret "${{ secrets.PROD_TINYCLOUD_KEYS_SECRET }}" --stage $STAGE
-          npx sst secret set AwsAccessKeyId "${{ secrets.PROD_TINYCLOUD_AWS_ACCESS_KEY_ID }}" --stage $STAGE
-          npx sst secret set AwsSecretAccessKey "${{ secrets.PROD_TINYCLOUD_AWS_SECRET_ACCESS_KEY }}" --stage $STAGE
-          
+          npx sst secret set TINYCLOUD_KEYS_SECRET "${{ secrets.PROD_TINYCLOUD_KEYS_SECRET }}" --stage $STAGE
+          npx sst secret set AWS_ACCESS_KEY_ID "${{ secrets.PROD_TINYCLOUD_AWS_ACCESS_KEY_ID }}" --stage $STAGE
+          npx sst secret set AWS_SECRET_ACCESS_KEY "${{ secrets.PROD_TINYCLOUD_AWS_SECRET_ACCESS_KEY }}" --stage $STAGE
+
           # Deploy with production stage
           npx sst deploy --stage $STAGE
-          
+
           # Show outputs
           echo "Production URL: $(npx sst output --stage $STAGE --key serviceUrl)"
 
@@ -75,7 +75,7 @@ jobs:
               required_contexts: [],
               auto_merge: false,
             });
-            
+
             await github.rest.repos.createDeploymentStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
