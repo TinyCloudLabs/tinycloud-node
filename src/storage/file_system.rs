@@ -345,7 +345,7 @@ mod test {
         let cfg = FileSystemConfig::new(dir.path());
         let store = cfg.open().await.unwrap();
         let data = b"hello world";
-        let orbit: OrbitId = "tinycloud:key:test://default".parse().unwrap();
+        let orbit: OrbitId = "tinycloud:key:test:default".parse().unwrap();
         assert_eq!(store.total_size(&orbit).await.unwrap(), None);
         store.create(&orbit).await.unwrap();
         assert_eq!(store.total_size(&orbit).await.unwrap(), Some(0));
