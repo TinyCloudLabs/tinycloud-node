@@ -1,0 +1,53 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "SSTECSPermissions",
+            "Effect": "Allow",
+            "Action": [
+                "iam:CreateRole",
+                "iam:DeleteRole",
+                "iam:GetRole",
+                "iam:PassRole",
+                "iam:AttachRolePolicy",
+                "iam:DetachRolePolicy",
+                "iam:ListAttachedRolePolicies",
+                "iam:UpdateAssumeRolePolicy",
+                "iam:PutRolePolicy",
+                "iam:DeleteRolePolicy",
+                "iam:GetRolePolicy",
+                "iam:ListRolePolicies"
+            ],
+            "Resource": [
+                "arn:aws:iam::*:role/tinycloud-*",
+                "arn:aws:iam::*:role/*ExecutionRole*",
+                "arn:aws:iam::*:role/*TaskRole*",
+                "arn:aws:iam::*:role/*ServiceRole*"
+            ]
+        },
+        {
+            "Sid": "SSTInstanceProfiles",
+            "Effect": "Allow",
+            "Action": [
+                "iam:CreateInstanceProfile",
+                "iam:DeleteInstanceProfile",
+                "iam:GetInstanceProfile",
+                "iam:AddRoleToInstanceProfile",
+                "iam:RemoveRoleFromInstanceProfile"
+            ],
+            "Resource": [
+                "arn:aws:iam::*:instance-profile/tinycloud-*"
+            ]
+        },
+        {
+            "Sid": "SSTPolicyManagement",
+            "Effect": "Allow",
+            "Action": [
+                "iam:GetPolicy",
+                "iam:GetPolicyVersion",
+                "iam:ListPolicyVersions"
+            ],
+            "Resource": "arn:aws:iam::aws:policy/*"
+        }
+    ]
+}

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Script to set up GitHub Actions OIDC for AWS deployments
+# Script to set up GitHub Actions OIDC for AWS deployments with minimal IAM permissions
 
 set -e
 
@@ -59,7 +59,22 @@ aws iam create-role \
     --description "Role for GitHub Actions to deploy TinyCloud via SST" \
     || echo "Role already exists"
 
-# Attach necessary policies for SST
+# Create custom IAM policy for SST
+POLICY_NAME="SST-TinyCloud-IAM-Policy"
+echo "Creating custom IAM policy: $POLICY_NAME"
+
+POLICY_ARN=$(aws iam create-policy \
+    --policy-name $POLICY_NAME \
+    --policy-document file://sst-iam-policy.json \
+    --description "Minimal IAM permissions for SST deployment of TinyCloud" \
+    --query 'Policy.Arn' \
+    --output text 2>/dev/null) || {
+    echo "Policy already exists, getting ARN..."
+    POLICY_ARN=$(aws iam list-policies \
+        --query "Policies[?PolicyName=='$POLICY_NAME'].Arn" \
+        --output text)
+}
+
 echo "Attaching policies..."
 
 # SST requires broad permissions for CloudFormation and resource creation
@@ -67,10 +82,10 @@ aws iam attach-role-policy \
     --role-name $ROLE_NAME \
     --policy-arn arn:aws:iam::aws:policy/PowerUserAccess
 
-# Add IAM permissions that PowerUserAccess excludes
+# Add our custom minimal IAM permissions
 aws iam attach-role-policy \
     --role-name $ROLE_NAME \
-    --policy-arn arn:aws:iam::aws:policy/IAMFullAccess
+    --policy-arn $POLICY_ARN
 
 # Get the role ARN
 ROLE_ARN=$(aws iam get-role --role-name $ROLE_NAME --query 'Role.Arn' --output text)
@@ -82,4 +97,4 @@ echo "Add the following secret to your GitHub repository:"
 echo "  Name: AWS_DEPLOY_ROLE_ARN"
 echo "  Value: $ROLE_ARN"
 echo ""
-echo "For more restrictive permissions, see the SST documentation on IAM permissions."
+echo "This setup uses minimal IAM permissions instead of IAMFullAccess for better security."

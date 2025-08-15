@@ -45,38 +45,50 @@ Set these in your repository's Settings → Secrets:
 
 ## AWS IAM Setup
 
-1. Create an OIDC provider for GitHub Actions:
+### Quick Fix (if you get IAM permissions error)
+
+If deployment fails with `iam:CreateRole` permission denied:
+
 ```bash
-aws iam create-open-id-connect-provider \
-  --url https://token.actions.githubusercontent.com \
-  --client-id-list sts.amazonaws.com
+aws iam attach-role-policy \
+  --role-name GitHubActions-TinyCloud-Deploy \
+  --policy-arn arn:aws:iam::aws:policy/IAMFullAccess
 ```
 
-2. Create an IAM role with trust policy:
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {
-        "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
-      },
-      "Action": "sts:AssumeRoleWithWebIdentity",
-      "Condition": {
-        "StringEquals": {
-          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
-        },
-        "StringLike": {
-          "token.actions.githubusercontent.com:sub": "repo:YOUR_ORG/tinycloud:*"
-        }
-      }
-    }
-  ]
-}
+### Secure Setup (Recommended)
+
+For new setups, use the secure script with minimal permissions:
+
+```bash
+cd scripts
+./setup-github-oidc-secure.sh YOUR_AWS_ACCOUNT_ID YOUR_ORG/REPO_NAME
 ```
 
-3. Attach necessary policies for SST deployment (see SST documentation)
+This creates:
+- OIDC provider for GitHub Actions
+- IAM role with trust policy
+- Custom policy with only required IAM permissions (not full IAM access)
+
+### Manual Setup
+
+1. Run the basic setup script:
+```bash
+./scripts/setup-github-oidc.sh YOUR_AWS_ACCOUNT_ID YOUR_ORG/REPO_NAME
+```
+
+2. The script attaches these policies:
+   - `PowerUserAccess` (for most AWS services)
+   - `IAMFullAccess` (for ECS role creation)
+
+### Why IAM Permissions Are Needed
+
+SST creates IAM roles for:
+- ECS task execution roles
+- ECS service roles  
+- Lambda execution roles (if using functions)
+- Other service-linked roles
+
+The deployment fails without IAM permissions because PowerUserAccess specifically excludes IAM and Organizations services.
 
 ## Environment Isolation
 
