@@ -24,14 +24,15 @@ export default $config({
     });
 
     const vpc = new sst.aws.Vpc("TinycloudVpc", {
-      nat: "managed",
+      // v2 Cluster doesn't require NAT gateways - cost optimization
     });
 
     const cluster = new sst.aws.Cluster("TinycloudCluster", {
       vpc,
+      forceUpgrade: "v2",
     });
 
-    const database = new sst.aws.Postgres("Database", {
+    const database = new sst.aws.Postgres.v1("Database", {
       vpc,
       scaling: {
         min: isPR ? "0.5 ACU" : isProd ? "2 ACU" : "0.5 ACU",
@@ -74,22 +75,45 @@ export default $config({
         directory: ".",
         autostart: true,
         watch: ["src", "Cargo.toml", "Cargo.lock"],
+        // Ensure we always connect to cloud resources in dev mode
+        env: {
+          // Force S3 storage type for dev (no local filesystem option)
+          TINYCLOUD_STORAGE_BLOCKS_TYPE: "S3",
+          // Add debug logging for dev
+          RUST_LOG: "debug",
+          RUST_BACKTRACE: "1",
+        },
       },
       environment: {
+        // TinyCloud configuration
         TINYCLOUD_LOG_LEVEL: isDev ? "debug" : "normal",
         TINYCLOUD_ADDRESS: "0.0.0.0",
         TINYCLOUD_PORT: "8000",
+        
+        // Storage configuration - ALWAYS use cloud resources
         TINYCLOUD_STORAGE_BLOCKS_TYPE: "S3",
         TINYCLOUD_STORAGE_BLOCKS_BUCKET: bucket.name,
         TINYCLOUD_STORAGE_DATABASE: database.connectionString,
         TINYCLOUD_STORAGE_STAGING: "Memory",
+        
+        // Authentication configuration
         TINYCLOUD_KEYS_TYPE: "Static",
         TINYCLOUD_KEYS_SECRET: secrets.tinycloudKeysSecret.value,
+        
+        // AWS credentials for S3 access
         AWS_ACCESS_KEY_ID: secrets.awsAccessKeyId.value,
         AWS_SECRET_ACCESS_KEY: secrets.awsSecretAccessKey.value,
+        AWS_DEFAULT_REGION: "us-east-1",
+        
+        // Rocket configuration
         ROCKET_ADDRESS: "0.0.0.0",
         ROCKET_PORT: "8000",
-        AWS_DEFAULT_REGION: "us-east-1",
+        
+        // Debug configuration for dev
+        ...(isDev && {
+          RUST_LOG: "tinycloud=debug,info",
+          RUST_BACKTRACE: "1",
+        }),
       },
     });
 

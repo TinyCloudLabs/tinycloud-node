@@ -13,3 +13,7 @@ test/
 docs/
 *.log
 .DS_Store
+
+
+# sst
+.sst

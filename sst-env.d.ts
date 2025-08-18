@@ -18,10 +18,12 @@ declare module "sst" {
       "type": "sst.aws.Bucket"
     }
     "Database": {
+      "clusterArn": string
       "database": string
       "host": string
       "password": string
       "port": number
+      "secretArn": string
       "type": "sst.aws.Postgres"
       "username": string
     }
