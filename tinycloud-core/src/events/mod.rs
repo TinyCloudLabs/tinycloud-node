@@ -9,11 +9,9 @@ pub use tinycloud_lib::{
     authorization::{
         EncodingError, HeaderEncode, TinyCloudDelegation, TinyCloudInvocation, TinyCloudRevocation,
     },
-    libipld::cid::{
-        multihash::{Code, Error as MultihashError, MultihashDigest},
-        Cid,
-    },
-    resource::OrbitId,
+    ipld_core::cid::Cid,
+    multihash_codetable::Code,
+    resource::{OrbitId, Path},
 };
 
 #[derive(Debug)]
@@ -48,13 +46,13 @@ pub type Revocation = SerializedEvent<RevocationInfo>;
 pub(crate) enum Operation {
     KvWrite {
         orbit: OrbitId,
-        key: String,
+        key: Path,
         value: Hash,
         metadata: Metadata,
     },
     KvDelete {
         orbit: OrbitId,
-        key: String,
+        key: Path,
         version: Option<(i64, Hash, i64)>,
     },
 }
@@ -100,7 +98,7 @@ impl Operation {
 pub(crate) enum VersionedOperation {
     KvWrite {
         orbit: OrbitId,
-        key: String,
+        key: Path,
         value: Hash,
         metadata: Metadata,
         seq: i64,
@@ -109,7 +107,7 @@ pub(crate) enum VersionedOperation {
     },
     KvDelete {
         orbit: OrbitId,
-        key: String,
+        key: Path,
         version: Option<(i64, Hash, i64)>,
     },
 }
@@ -149,8 +147,6 @@ struct Epoch {
 pub enum HashError {
     #[error("encoding error: {0}")]
     EncodeError(#[from] EncodeError<std::collections::TryReserveError>),
-    #[error("hash error: {0}")]
-    HashError(#[from] MultihashError),
 }
 
 pub(crate) fn epoch_hash(
@@ -181,12 +177,12 @@ fn hash_inv(inv_hash: &Hash, o: &OrbitId, ops: &[Operation]) -> Result<OneOrMany
     #[serde(untagged)]
     enum Op<'a> {
         KvWrite {
-            key: &'a str,
+            key: &'a Path,
             value: Cid,
             metadata: &'a Metadata,
         },
         KvDelete {
-            key: &'a str,
+            key: &'a Path,
             version: Option<(i64, Cid, i64)>,
         },
     }

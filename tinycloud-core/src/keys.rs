@@ -2,12 +2,10 @@ use libp2p::identity::{
     ed25519::{Keypair as EdKP, SecretKey},
     DecodingError,
 };
+use multihash_derive::Hasher;
 use sea_orm_migration::async_trait::async_trait;
 use std::error::Error as StdError;
-use tinycloud_lib::{
-    libipld::cid::multihash::{Blake3_256, Hasher},
-    resource::OrbitId,
-};
+use tinycloud_lib::{multihash_codetable::Blake3_256, resource::OrbitId};
 
 pub use libp2p::{
     identity::{Keypair, PublicKey},
@@ -15,7 +13,7 @@ pub use libp2p::{
 };
 
 pub(crate) fn get_did_key(key: PublicKey) -> String {
-    use tinycloud_lib::libipld::cid::multibase;
+    use tinycloud_lib::ipld_core::cid::multibase;
     // only ed25519 feature is enabled, so this unwrap should never fail
     let ed25519_pk_bytes = key.try_into_ed25519().unwrap().to_bytes();
     let multicodec_pk = [[0xed].as_slice(), ed25519_pk_bytes.as_slice()].concat();

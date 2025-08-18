@@ -1,7 +1,7 @@
 use anyhow::Result;
 use reqwest::get;
 use serde::{Deserialize, Serialize};
-use tinycloud_lib::libipld::{cid::Cid, multibase::Base};
+use tinycloud_lib::ipld_core::cid::{multibase::Base, Cid};
 use tinycloud_lib::resource::OrbitId;
 
 #[rocket::async_trait]

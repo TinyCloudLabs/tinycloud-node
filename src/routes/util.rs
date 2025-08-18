@@ -1,9 +1,6 @@
 use futures::io::AsyncRead;
 use pin_project::pin_project;
-use std::{
-    io::{Error as IoError, ErrorKind},
-    task::Poll,
-};
+use std::{io::Error as IoError, task::Poll};
 
 /// LimitedRead wraps an AsyncRead and limits the number of bytes that can be read.
 ///
@@ -47,7 +44,7 @@ where
         match this.inner.poll_read(cx, buf) {
             Poll::Ready(Ok(n)) if n as u64 > *this.remaining => {
                 // TODO once io_error_more is stable, use ErrorKind::FileTooLarge
-                Poll::Ready(Err(IoError::new(ErrorKind::Other, LimitExceeded)))
+                Poll::Ready(Err(IoError::other(LimitExceeded)))
             }
             Poll::Ready(Ok(n)) => {
                 // it's ok if remaining is 0 here, as writing 0 bytes won't change anything

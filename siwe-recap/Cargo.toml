@@ -15,6 +15,6 @@ serde_json.workspace = true
 serde.workspace = true
 serde_with.workspace = true
 thiserror.workspace = true
-libipld.workspace = true
-ucan-capabilities-object = { path = "../ucan-capabilities" }
+ipld-core.workspace = true
+ucan-capabilities-object.workspace = true
 serde_jcs = "0.1"

@@ -2,20 +2,13 @@ use super::{Representation, SignatureScheme, CACAO};
 use async_trait::async_trait;
 use hex::FromHex;
 use http::uri::{Authority, Scheme};
-use iri_string::{
-    types::{UriAbsoluteString, UriString},
-    validate::Error as URIStringError,
-};
-use libipld::{
-    cbor::{DagCbor, DagCborCodec},
-    codec::{Decode, Encode},
-    error::Error as IpldError,
-    DagCbor,
-};
+use iri_string::types::{UriAbsoluteString, UriString};
+use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
+use serde_with::{serde_as, skip_serializing_none, DisplayFromStr};
 pub use siwe;
-use siwe::{eip55, Message, TimeStamp, VerificationError as SVE, Version as SVersion};
-use std::fmt::Debug;
-use std::io::{Read, Seek, Write};
+use siwe::{encode_eip55, Message, TimeStamp, VerificationError as SVE, Version as SVersion};
+use std::{fmt::Debug, ops::Not};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -24,23 +17,31 @@ pub type SiweCacao = CACAO<Eip191, Eip4361>;
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Header;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[serde_as]
+#[skip_serializing_none]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Payload {
+    #[serde_as(as = "Option<DisplayFromStr>")]
     pub scheme: Option<Scheme>,
+    #[serde_as(as = "DisplayFromStr")]
     pub domain: Authority,
     pub iss: UriAbsoluteString,
     pub statement: Option<String>,
     pub aud: UriString,
     pub version: Version,
     pub nonce: String,
+    #[serde_as(as = "DisplayFromStr")]
     pub iat: TimeStamp,
+    #[serde_as(as = "Option<DisplayFromStr>")]
     pub exp: Option<TimeStamp>,
+    #[serde_as(as = "Option<DisplayFromStr>")]
     pub nbf: Option<TimeStamp>,
     pub request_id: Option<String>,
-    pub resources: Vec<UriString>,
+    pub resources: Option<Vec<UriString>>,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize_repr, Deserialize_repr, Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Version {
     V1 = 1,
 }
@@ -49,9 +50,9 @@ impl Payload {
     pub fn sign<S>(self, s: S::Signature) -> CACAO<S, Eip4361>
     where
         S: SignatureScheme<Eip4361>,
-        S::Signature: DagCbor + Debug,
+        S::Signature: Debug,
     {
-        CACAO::new(self, s, None)
+        CACAO::new(self, s, Header)
     }
 
     pub async fn verify<S>(&self, s: &S::Signature) -> Result<(), S::Err>
@@ -76,137 +77,12 @@ impl Payload {
     }
 }
 
-mod payload_ipld {
-    use super::*;
-    use libipld::error::Error as IpldError;
-    use std::io::{Read, Seek, Write};
-
-    #[derive(Clone, DagCbor)]
-    struct TmpPayload {
-        aud: String,
-        #[ipld(default = None)]
-        exp: Option<String>,
-        iat: String,
-        iss: String,
-        #[ipld(default = None)]
-        nbf: Option<String>,
-        nonce: String,
-        domain: String,
-        version: String,
-        resources: Vec<String>,
-        #[ipld(rename = "requestId")]
-        #[ipld(default = None)]
-        request_id: Option<String>,
-        #[ipld(default = None)]
-        statement: Option<String>,
-        #[ipld(default = None)]
-        scheme: Option<String>,
-    }
-
-    impl From<&Payload> for TmpPayload {
-        fn from(p: &Payload) -> Self {
-            Self {
-                scheme: p.scheme.as_ref().map(|s| s.to_string()),
-                domain: p.domain.to_string(),
-                iss: p.iss.to_string(),
-                statement: p.statement.as_ref().map(|e| e.to_string()),
-                aud: p.aud.to_string(),
-                version: (p.version as u64).to_string(),
-                nonce: p.nonce.to_string(),
-                iat: p.iat.to_string(),
-                exp: p.exp.as_ref().map(|e| e.to_string()),
-                nbf: p.nbf.as_ref().map(|e| e.to_string()),
-                request_id: p.request_id.clone(),
-                resources: p.resources.iter().map(|r| r.to_string()).collect(),
-            }
-        }
-    }
-
-    impl TryFrom<TmpPayload> for Payload {
-        type Error = IpldError;
-        fn try_from(p: TmpPayload) -> Result<Self, Self::Error> {
-            Ok(Self {
-                scheme: p.scheme.map(|s| s.parse()).transpose()?,
-                domain: p.domain.parse()?,
-                iss: p.iss.parse()?,
-                statement: p.statement,
-                aud: p.aud.parse()?,
-                version: Version::V1,
-                nonce: p.nonce,
-                iat: p.iat.parse()?,
-                exp: p.exp.map(|s| s.parse()).transpose()?,
-                nbf: p.nbf.map(|s| s.parse()).transpose()?,
-                request_id: p.request_id,
-                resources: p
-                    .resources
-                    .iter()
-                    .map(|r| r.parse())
-                    .collect::<Result<Vec<UriString>, URIStringError>>()?,
-            })
-        }
-    }
-
-    impl Encode<DagCborCodec> for Payload {
-        fn encode<W>(&self, c: DagCborCodec, w: &mut W) -> Result<(), IpldError>
-        where
-            W: Write,
-        {
-            TmpPayload::from(self).encode(c, w)
-        }
-    }
-
-    impl Decode<DagCborCodec> for Payload {
-        fn decode<R>(c: DagCborCodec, r: &mut R) -> Result<Self, IpldError>
-        where
-            R: Read + Seek,
-        {
-            TmpPayload::decode(c, r).and_then(|t| t.try_into())
-        }
-    }
-
-    #[derive(DagCbor)]
-    struct DummyHeader {
-        t: String,
-    }
-    impl Encode<DagCborCodec> for Header {
-        fn encode<W>(&self, c: DagCborCodec, w: &mut W) -> Result<(), IpldError>
-        where
-            W: Write,
-        {
-            DummyHeader {
-                t: "eip4361".to_string(),
-            }
-            .encode(c, w)
-        }
-    }
-
-    #[derive(Error, Debug)]
-    #[error("Invalid header type value")]
-    struct HeaderTypeErr;
-
-    impl Decode<DagCborCodec> for Header {
-        fn decode<R>(c: DagCborCodec, r: &mut R) -> Result<Self, IpldError>
-        where
-            R: Read + Seek,
-        {
-            if DummyHeader::decode(c, r)?.t != "eip4361" {
-                Err(HeaderTypeErr)?
-            } else {
-                Ok(Header)
-            }
-        }
-    }
-}
-
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Eip4361;
 
 impl Representation for Eip4361 {
     type Payload = Payload;
     type Header = Header;
-    fn header() -> Header {
-        Header
-    }
 }
 
 impl From<Version> for SVersion {
@@ -265,7 +141,7 @@ impl TryInto<Message> for Payload {
             not_before: self.nbf,
             expiration_time: self.exp,
             request_id: self.request_id,
-            resources: self.resources,
+            resources: self.resources.unwrap_or_default(),
         })
     }
 }
@@ -275,9 +151,13 @@ impl From<Message> for Payload {
         Self {
             scheme: m.scheme,
             domain: m.domain,
-            iss: format!("did:pkh:eip155:{}:{}", m.chain_id, eip55(&m.address))
-                .parse()
-                .unwrap(),
+            iss: format!(
+                "did:pkh:eip155:{}:0x{}",
+                m.chain_id,
+                encode_eip55(&m.address)
+            )
+            .parse()
+            .unwrap(),
             statement: m.statement,
             aud: m.uri,
             version: m.version.into(),
@@ -286,34 +166,34 @@ impl From<Message> for Payload {
             nbf: m.not_before,
             exp: m.expiration_time,
             request_id: m.request_id,
-            resources: m.resources,
+            resources: m.resources.is_empty().not().then_some(m.resources),
         }
     }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct SIWESignature([u8; 65]);
+pub struct Signature([u8; 65]);
 
-impl std::ops::Deref for SIWESignature {
+impl std::ops::Deref for Signature {
     type Target = [u8; 65];
     fn deref(&self) -> &[u8; 65] {
         &self.0
     }
 }
 
-impl From<[u8; 65]> for SIWESignature {
+impl From<[u8; 65]> for Signature {
     fn from(s: [u8; 65]) -> Self {
         Self(s)
     }
 }
 
-impl AsRef<[u8]> for SIWESignature {
+impl AsRef<[u8]> for Signature {
     fn as_ref(&self) -> &[u8] {
         self.0.as_ref()
     }
 }
 
-impl TryFrom<Vec<u8>> for SIWESignature {
+impl TryFrom<Vec<u8>> for Signature {
     type Error = SIWESignatureDecodeError;
     fn try_from(s: Vec<u8>) -> Result<Self, Self::Error> {
         Ok(Self(s.try_into().map_err(SIWESignatureDecodeError::from)?))
@@ -334,34 +214,83 @@ impl From<Vec<u8>> for SIWESignatureDecodeError {
     }
 }
 
-#[derive(DagCbor)]
-struct DummySig {
-    s: Vec<u8>,
-    t: String,
+#[derive(Serialize, Deserialize)]
+struct DummyHeader<'a> {
+    t: &'a str,
 }
 
-impl Encode<DagCborCodec> for SIWESignature {
-    fn encode<W>(&self, c: DagCborCodec, w: &mut W) -> Result<(), IpldError>
+const EIP_4361: &str = "eip4361";
+
+impl Serialize for Header {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        W: Write,
+        S: serde::Serializer,
     {
-        DummySig {
-            s: self.0.to_vec(),
-            t: "eip191".to_string(),
-        }
-        .encode(c, w)
+        DummyHeader { t: EIP_4361 }.serialize(serializer)
     }
 }
 
-impl Decode<DagCborCodec> for SIWESignature {
-    fn decode<R>(c: DagCborCodec, r: &mut R) -> Result<Self, IpldError>
+#[derive(Error, Debug)]
+#[error("Invalid header type value")]
+struct HeaderTypeErr;
+
+impl<'de> Deserialize<'de> for Header {
+    fn deserialize<D>(deserializer: D) -> Result<Header, D::Error>
     where
-        R: Read + Seek,
+        D: serde::Deserializer<'de>,
     {
-        match DummySig::decode(c, r)? {
-            d if d.t == "eip191" => Ok(d.s.try_into()?),
-            d => Err(SIWESignatureDecodeError::InvalidType(d.t))?,
+        let ds = DummyHeader::<'de>::deserialize(deserializer)?;
+        if ds.t != EIP_4361 {
+            return Err(serde::de::Error::custom(HeaderTypeErr));
         }
+        Ok(Header)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct DummySig<'a> {
+    #[serde(with = "serde_bytes")]
+    s: &'a [u8],
+    t: &'a str,
+}
+
+const EIP_191: &str = "eip191";
+
+impl Serialize for Signature {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        DummySig {
+            s: self.as_ref(),
+            t: EIP_191,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Signature {
+    fn deserialize<D>(deserializer: D) -> Result<Signature, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let ds = DummySig::<'de>::deserialize(deserializer)?;
+        if ds.t != EIP_191 {
+            return Err(serde::de::Error::custom(
+                SIWESignatureDecodeError::InvalidType(ds.t.to_string()),
+            ));
+        }
+        let l = ds.s.len();
+        if l != 65 {
+            return Err(serde::de::Error::custom(
+                SIWESignatureDecodeError::InvalidLength(l),
+            ));
+        }
+        Ok(Signature(
+            ds.s.try_into()
+                .map_err(|_| SIWESignatureDecodeError::InvalidLength(l))
+                .map_err(serde::de::Error::custom)?,
+        ))
     }
 }
 
@@ -370,7 +299,7 @@ pub struct Eip191;
 
 #[async_trait]
 impl SignatureScheme<Eip4361> for Eip191 {
-    type Signature = SIWESignature;
+    type Signature = Signature;
     type Err = VerificationError;
     async fn verify(
         payload: &<Eip4361 as Representation>::Payload,

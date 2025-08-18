@@ -1,7 +1,7 @@
 use libp2p::{Multiaddr, PeerId};
 use std::{convert::TryFrom, str::FromStr};
 use thiserror::Error;
-use tinycloud_lib::resource::OrbitId;
+use tinycloud_lib::resource::{KRIParseError, Name, OrbitId};
 use tinycloud_lib::ssi::dids::document::verification_method::ValueOrReference;
 use tinycloud_lib::ssi::dids::resolution::Output;
 use tinycloud_lib::ssi::dids::DID;
@@ -55,14 +55,14 @@ impl Manifest {
 
         match (doc, doc_md.deactivated) {
             (_, Some(true)) => Err(ResolutionError::Deactivated),
-            (d, _) => Ok(Some((d.into_document(), id.name()).into())),
+            (d, _) => Ok(Some((d.into_document(), id.name().clone()).into())),
         }
     }
 }
 
 #[derive(Clone, Debug, Hash)]
 pub struct BootstrapPeers {
-    pub id: String,
+    pub id: OrbitId,
     pub peers: Vec<BootstrapPeer>,
 }
 
@@ -72,13 +72,14 @@ pub struct BootstrapPeer {
     pub addrs: Vec<Multiaddr>,
 }
 
-impl<'a> From<(Document, &'a str)> for Manifest {
-    fn from((d, n): (Document, &'a str)) -> Self {
+impl From<(Document, Name)> for Manifest {
+    fn from((d, n): (Document, Name)) -> Self {
+        let id = OrbitId::new(d.id.clone(), n);
         let bootstrap_peers = d
-            .service(n)
+            .service(&id.to_string())
             .and_then(|s| BootstrapPeers::try_from(s).ok())
             .unwrap_or_else(|| BootstrapPeers {
-                id: n.into(),
+                id: id.clone(),
                 peers: vec![],
             });
 
@@ -94,7 +95,7 @@ impl<'a> From<(Document, &'a str)> for Manifest {
                 &d.verification_relationships.authentication,
             ),
             bootstrap_peers,
-            id: OrbitId::new(d.id, n.into()),
+            id,
         }
     }
 }
@@ -110,7 +111,9 @@ pub enum ResolutionError {
 #[derive(Error, Debug)]
 pub enum ServicePeersConversionError {
     #[error(transparent)]
-    IdParse(<PeerId as FromStr>::Err),
+    OrbitIdParse(#[from] KRIParseError),
+    #[error(transparent)]
+    PeerIdParse(<PeerId as FromStr>::Err),
     #[error("Missing TinyCloudOrbitPeer type string")]
     WrongType,
 }
@@ -120,12 +123,7 @@ impl TryFrom<&Service> for BootstrapPeers {
     fn try_from(s: &Service) -> Result<Self, Self::Error> {
         if s.type_.any(|t| t == "TinyCloudOrbitPeers") {
             Ok(Self {
-                id: s
-                    .id
-                    .rsplit_once('#')
-                    .map(|(_, id)| id)
-                    .unwrap_or_else(|| &s.id)
-                    .into(),
+                id: s.id.as_str().parse()?,
                 peers: s
                     .service_endpoint
                     .as_ref()
@@ -168,24 +166,22 @@ fn get_authorised_parties(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::convert::TryInto;
     use tinycloud_lib::resolver::DID_METHODS;
     use tinycloud_lib::ssi::dids::AnyDidMethod;
-    use tinycloud_lib::ssi::{dids::DIDURLBuf, jwk::JWK};
+    use tinycloud_lib::ssi::jwk::JWK;
 
     #[tokio::test]
     async fn basic_manifest() {
         let j = JWK::generate_secp256k1();
-        let mut did = DID_METHODS.generate(&j, "pkh:eth").unwrap().to_string();
-        did.push_str("#default");
-        let did: DIDURLBuf = did.parse().unwrap();
+        let did = DID_METHODS.generate(&j, "pkh:eth").unwrap();
 
-        println!("DID: {:#?}", did);
+        println!("DID: {did:#?}");
+        let orbit = OrbitId::new(did, "orbit_name".parse().unwrap());
 
-        let md = Manifest::resolve(&did.try_into().unwrap(), &AnyDidMethod::default())
+        let md = Manifest::resolve(&orbit, &AnyDidMethod::default())
             .await
             .unwrap()
             .unwrap();
-        println!("Manifest: {:#?}", md);
+        println!("Manifest: {md:#?}");
     }
 }

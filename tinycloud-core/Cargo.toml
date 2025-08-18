@@ -27,6 +27,8 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_ipld_dagcbor = "0.3"
+ucan-capabilities-object.workspace = true
+multihash-derive = "0.9"
 
 [dev-dependencies]
 sea-orm = { version = "0.11", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }

@@ -4,11 +4,11 @@ use super::super::{
     relationships::*,
     util,
 };
-use crate::hash::Hash;
 use crate::types::{Facts, OrbitIdWrap, Resource};
+use crate::{hash::Hash, types::Ability};
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, Condition, ConnectionTrait, QueryOrder};
 use time::OffsetDateTime;
-use tinycloud_lib::{authorization::TinyCloudInvocation, ssi::dids::AnyDidMethod};
+use tinycloud_lib::{authorization::TinyCloudInvocation, resource::Path, ssi::dids::AnyDidMethod};
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "invocation")]
@@ -66,11 +66,11 @@ pub enum InvocationError {
     #[error("Unauthorized Invoker")]
     UnauthorizedInvoker(String),
     #[error("Unauthorized Action: {0} / {1}")]
-    UnauthorizedAction(Resource, String),
+    UnauthorizedAction(Resource, Ability),
     #[error("Cannot find parent delegation")]
     MissingParents,
     #[error("No Such Key: {0}")]
-    MissingKvWrite(String),
+    MissingKvWrite(Path),
 }
 
 pub(crate) async fn process<C: ConnectionTrait>(
@@ -94,7 +94,7 @@ async fn verify(invocation: &TinyCloudInvocation) -> Result<(), Error> {
         .await
         .map_err(|_| InvocationError::InvalidSignature)?;
     invocation
-        .payload
+        .payload()
         .validate_time(None)
         .map_err(|_| InvocationError::InvalidTime)?;
     Ok(())
@@ -169,11 +169,11 @@ async fn validate<C: ConnectionTrait>(
                 !parents
                     .iter()
                     .flat_map(|(_, a)| a)
-                    .any(|pc| c.resource.extends(&pc.resource) && c.action == pc.ability)
+                    .any(|pc| c.resource.extends(&pc.resource) && c.ability == pc.ability)
             }) {
                 Some(c) => Err(InvocationError::UnauthorizedAction(
                     c.resource.clone(),
-                    c.action.clone(),
+                    c.ability.clone(),
                 )
                 .into()),
                 None => Ok(()),
@@ -215,7 +215,7 @@ async fn save<C: ConnectionTrait>(
             invoked_abilities::ActiveModel::from(invoked_abilities::Model {
                 invocation: hash,
                 resource: c.resource,
-                ability: c.action,
+                ability: c.ability,
             })
         }))
         .exec(db)
@@ -246,7 +246,7 @@ async fn save<C: ConnectionTrait>(
             } => {
                 kv_write::Entity::insert(kv_write::ActiveModel::from(kv_write::Model {
                     invocation: hash,
-                    key,
+                    key: key.into(),
                     value,
                     orbit: orbit.into(),
                     metadata,
@@ -265,7 +265,7 @@ async fn save<C: ConnectionTrait>(
                 let deleted_invocation_id = if let Some((s, e, es)) = version {
                     kv_write::Entity::find().filter(
                         Condition::all()
-                            .add(kv_write::Column::Key.eq(key.clone()))
+                            .add(kv_write::Column::Key.eq(key.as_str()))
                             .add(kv_write::Column::Orbit.eq(OrbitIdWrap(orbit.clone())))
                             .add(kv_write::Column::Seq.eq(s))
                             .add(kv_write::Column::Epoch.eq(e))
@@ -273,7 +273,7 @@ async fn save<C: ConnectionTrait>(
                     )
                 } else {
                     kv_write::Entity::find()
-                        .filter(kv_write::Column::Key.eq(key.clone()))
+                        .filter(kv_write::Column::Key.eq(key.as_str()))
                         .filter(kv_write::Column::Orbit.eq(OrbitIdWrap(orbit.clone())))
                         .order_by_desc(kv_write::Column::Seq)
                         .order_by_desc(kv_write::Column::Epoch)
@@ -284,7 +284,7 @@ async fn save<C: ConnectionTrait>(
                 .ok_or_else(|| InvocationError::MissingKvWrite(key.clone()))?
                 .invocation;
                 kv_delete::Entity::insert(kv_delete::ActiveModel::from(kv_delete::Model {
-                    key,
+                    key: key.into(),
                     invocation_id: hash,
                     orbit: orbit.into(),
                     deleted_invocation_id,

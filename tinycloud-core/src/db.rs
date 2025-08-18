@@ -21,7 +21,7 @@ use sea_orm_migration::MigratorTrait;
 use std::collections::HashMap;
 use tinycloud_lib::{
     authorization::{EncodingError, TinyCloudDelegation},
-    resource::OrbitId,
+    resource::{OrbitId, Path},
 };
 
 #[derive(Debug, Clone)]
@@ -153,7 +153,7 @@ where
     }
 }
 
-pub type InvocationInputs<W> = HashMap<(OrbitId, String), (Metadata, HashBuffer<W>)>;
+pub type InvocationInputs<W> = HashMap<(OrbitId, Path), (Metadata, HashBuffer<W>)>;
 
 impl<C, B, K> OrbitDatabase<C, B, K>
 where
@@ -213,35 +213,36 @@ where
         let mut ops = Vec::new();
         // for each capability being invoked
         for cap in invocation.0.capabilities.iter() {
-            match cap
-                .resource
-                .tinycloud_resource()
-                .and_then(|r| Some((r.service()?, cap.action.as_str(), r.orbit(), r.path()?)))
-            {
+            match cap.resource.tinycloud_resource().and_then(|r| {
+                Some((
+                    r.orbit(),
+                    r.service().as_str(),
+                    cap.ability.as_ref().as_ref(),
+                    r.path()?,
+                ))
+            }) {
                 // stage inputs for content writes
-                Some(("kv", "kv/put", orbit, path)) => {
+                Some((orbit, "kv", "tinycloud.kv/put", path)) => {
                     let (metadata, mut stage) = inputs
-                        .remove(&(orbit.clone(), path.to_string()))
+                        .remove(&(orbit.clone(), path.clone()))
                         .ok_or(TxStoreError::MissingInput)?;
 
                     let value = stage.hash();
 
-                    let norm_path = normalize_path(path);
-
-                    stages.insert((orbit.clone(), norm_path.to_string()), stage);
+                    stages.insert((orbit.clone(), path.clone()), stage);
                     // add write for tx
                     ops.push(Operation::KvWrite {
                         orbit: orbit.clone(),
-                        key: norm_path.to_string(),
+                        key: path.clone(),
                         metadata,
                         value,
                     });
                 }
                 // add delete for tx
-                Some(("kv", "kv/del", orbit, path)) => {
+                Some((orbit, "kv", "tinycloud.kv/del", path)) => {
                     ops.push(Operation::KvDelete {
                         orbit: orbit.clone(),
-                        key: normalize_path(path).to_string(),
+                        key: path.clone(),
                         version: None,
                     });
                 }
@@ -265,14 +266,18 @@ where
 
         let mut results = Vec::new();
         // perform and record side effects
-        for cap in caps {
-            match (
-                cap.resource
-                    .tinycloud_resource()
-                    .and_then(|r| Some((r.orbit(), r.service()?, normalize_path(r.path()?)))),
-                cap.action.as_str(),
-            ) {
-                (Some((orbit, "kv", path)), "kv/get") => results.push(InvocationOutcome::KvRead(
+        for cap in caps.iter().filter_map(|c| {
+            c.resource.tinycloud_resource().and_then(|r| {
+                Some((
+                    r.orbit(),
+                    r.service().as_str(),
+                    c.ability.as_ref().as_ref(),
+                    r.path()?,
+                ))
+            })
+        }) {
+            match cap {
+                (orbit, "kv", "tinycloud.kv/get", path) => results.push(InvocationOutcome::KvRead(
                     get_kv(&tx, &self.storage, orbit, path)
                         .await
                         .map_err(|e| match e {
@@ -280,10 +285,10 @@ where
                             EitherError::B(e) => TxStoreError::StoreRead(e),
                         })?,
                 )),
-                (Some((orbit, "kv", path)), "kv/list") => {
+                (orbit, "kv", "tinycloud.kv/list", path) => {
                     results.push(InvocationOutcome::KvList(list(&tx, orbit, path).await?))
                 }
-                (Some((orbit, "kv", path)), "kv/del") => {
+                (orbit, "kv", "tinycloud.kv/del", path) => {
                     let kv = get_kv_entity(&tx, orbit, path).await?;
                     if let Some(kv) = kv {
                         self.storage
@@ -293,8 +298,8 @@ where
                     }
                     results.push(InvocationOutcome::KvDelete)
                 }
-                (Some((orbit, "kv", path)), "kv/put") => {
-                    if let Some(stage) = stages.remove(&(orbit.clone(), path.to_string())) {
+                (orbit, "kv", "tinycloud.kv/put", path) => {
+                    if let Some(stage) = stages.remove(&(orbit.clone(), path.clone())) {
                         self.storage
                             .persist(orbit, stage)
                             .await
@@ -302,14 +307,18 @@ where
                         results.push(InvocationOutcome::KvWrite)
                     }
                 }
-                (Some((orbit, "kv", path)), "kv/metadata") => results.push(
+                (orbit, "kv", "tinycloud.kv/metadata", path) => results.push(
                     InvocationOutcome::KvMetadata(metadata(&tx, orbit, path).await?),
                 ),
-                (Some((orbit, "capabilities", "all")), "kv/read") => results.push(
-                    InvocationOutcome::OpenSessions(get_valid_delegations(&tx, orbit).await?),
-                ),
+                (orbit, "capabilities", "tinycloud.capabilities/read", path)
+                    if path.as_str() == "all" =>
+                {
+                    results.push(InvocationOutcome::OpenSessions(
+                        get_valid_delegations(&tx, orbit).await?,
+                    ))
+                }
                 _ => {}
-            }
+            };
         }
 
         // commit tx if all side effects worked
@@ -320,7 +329,7 @@ where
 
 #[derive(Debug)]
 pub enum InvocationOutcome<R> {
-    KvList(Vec<String>),
+    KvList(Vec<Path>),
     KvDelete,
     KvMetadata(Option<Metadata>),
     KvWrite,
@@ -420,10 +429,11 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         .iter()
         .filter_map(|(_, e)| match e {
             Event::Delegation(d) => Some(d.0.capabilities.iter().filter_map(|c| {
-                match (&c.resource, c.action.as_str()) {
-                    (Resource::TinyCloud(r), "orbit/host")
+                match (&c.resource, c.ability.as_ref().as_ref()) {
+                    (Resource::TinyCloud(r), "tinycloud.orbit/host")
                         if r.path().is_none()
-                            && r.service().is_none()
+                            && r.service().as_str() == "orbit"
+                            && r.query().is_none()
                             && r.fragment().is_none() =>
                     {
                         Some(OrbitIdWrap(r.orbit().clone()))
@@ -643,13 +653,13 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
 async fn list<C: ConnectionTrait>(
     db: &C,
     orbit: &OrbitId,
-    prefix: &str,
-) -> Result<Vec<String>, DbErr> {
+    prefix: &Path,
+) -> Result<Vec<Path>, DbErr> {
     // get content id for key from db
     let mut list = kv_write::Entity::find()
         .filter(
             Condition::all()
-                .add(kv_write::Column::Key.starts_with(prefix))
+                .add(kv_write::Column::Key.starts_with(prefix.as_str()))
                 .add(kv_write::Column::Orbit.eq(OrbitIdWrap(orbit.clone()))),
         )
         .find_also_related(kv_delete::Entity)
@@ -657,8 +667,8 @@ async fn list<C: ConnectionTrait>(
         .all(db)
         .await?
         .into_iter()
-        .map(|(kv, _)| kv.key)
-        .collect::<Vec<String>>();
+        .map(|(kv, _)| kv.key.0)
+        .collect::<Vec<Path>>();
     list.dedup();
     Ok(list)
 }
@@ -666,7 +676,7 @@ async fn list<C: ConnectionTrait>(
 async fn metadata<C: ConnectionTrait>(
     db: &C,
     orbit: &OrbitId,
-    key: &str,
+    key: &Path,
     // TODO version: Option<(i64, Hash, i64)>,
 ) -> Result<Option<Metadata>, DbErr> {
     match get_kv_entity(db, orbit, key).await? {
@@ -679,7 +689,7 @@ async fn get_kv<C: ConnectionTrait, B: ImmutableReadStore>(
     db: &C,
     store: &B,
     orbit: &OrbitId,
-    key: &str,
+    key: &Path,
     // TODO version: Option<(i64, Hash, i64)>,
 ) -> Result<Option<(Metadata, Content<B::Readable>)>, EitherError<DbErr, B::Error>> {
     let e = match get_kv_entity(db, orbit, key)
@@ -699,7 +709,7 @@ async fn get_kv<C: ConnectionTrait, B: ImmutableReadStore>(
 async fn get_kv_entity<C: ConnectionTrait>(
     db: &C,
     orbit: &OrbitId,
-    key: &str,
+    key: &Path,
     // TODO version: Option<(i64, Hash, i64)>,
 ) -> Result<Option<kv_write::Model>, DbErr> {
     // Ok(if let Some((seq, epoch, epoch_seq)) = version {
@@ -720,7 +730,7 @@ async fn get_kv_entity<C: ConnectionTrait>(
     Ok(kv_write::Entity::find()
         .filter(
             Condition::all()
-                .add(kv_write::Column::Key.eq(key))
+                .add(kv_write::Column::Key.eq(key.as_str()))
                 .add(kv_write::Column::Orbit.eq(OrbitIdWrap(orbit.clone()))),
         )
         .order_by_desc(kv_write::Column::Seq)
@@ -731,7 +741,6 @@ async fn get_kv_entity<C: ConnectionTrait>(
         .one(db)
         .await?
         .map(|(kv, _)| kv))
-    // })
 }
 
 async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
@@ -772,7 +781,7 @@ async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                                 .into_iter()
                                 .map(|a| Capability {
                                     resource: a.resource,
-                                    action: a.ability,
+                                    ability: a.ability,
                                 })
                                 .collect(),
                             delegation,
@@ -785,14 +794,6 @@ async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             }
         })
         .collect::<Result<HashMap<Hash, DelegationInfo>, EncodingError>>()?)
-}
-
-fn normalize_path(p: &str) -> &str {
-    if p.starts_with('/') {
-        p.get(1..).unwrap_or("")
-    } else {
-        p
-    }
 }
 
 #[cfg(test)]

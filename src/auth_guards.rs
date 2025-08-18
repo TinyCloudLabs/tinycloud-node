@@ -17,7 +17,7 @@ use tinycloud_core::{
 };
 use tinycloud_lib::{
     authorization::{EncodingError, HeaderEncode},
-    libipld::cid::Cid,
+    ipld_core::cid::Cid,
     resource::OrbitId,
 };
 use tokio_util::compat::FuturesAsyncReadCompatExt;

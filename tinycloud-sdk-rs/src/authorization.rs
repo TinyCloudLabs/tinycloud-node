@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
 use tinycloud_lib::authorization::{TinyCloudDelegation, TinyCloudInvocation};
 
-use crate::session::Session;
-
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DelegationHeaders {
     #[serde(with = "header_enc", rename = "Authorization")]
@@ -16,16 +14,8 @@ pub struct InvocationHeaders {
 }
 
 impl InvocationHeaders {
-    pub async fn from(
-        session: Session,
-        actions: Vec<(String, String, String)>,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            invocation: session
-                .invoke(actions)
-                .await
-                .map_err(Error::FailedToMakeInvocation)?,
-        })
+    pub fn new(invocation: TinyCloudInvocation) -> Self {
+        Self { invocation }
     }
 }
 

@@ -112,10 +112,10 @@ impl Display for Message {
         } else {
             writeln!(f, "{}{}", &self.domain, PREAMBLE)?;
         }
-        writeln!(f, "{}", eip55(&self.address))?;
+        writeln!(f, "0x{}", encode_eip55(&self.address))?;
         writeln!(f)?;
         if let Some(statement) = &self.statement {
-            writeln!(f, "{}", statement)?;
+            writeln!(f, "{statement}")?;
         }
         writeln!(f)?;
         writeln!(f, "{}{}", URI_TAG, &self.uri)?;
@@ -130,12 +130,12 @@ impl Display for Message {
             write!(f, "\n{}{}", NBF_TAG, &nbf)?
         };
         if let Some(rid) = &self.request_id {
-            write!(f, "\n{}{}", RID_TAG, rid)?
+            write!(f, "\n{RID_TAG}{rid}")?
         };
         if !self.resources.is_empty() {
-            write!(f, "\n{}", RES_TAG)?;
+            write!(f, "\n{RES_TAG}")?;
             for res in &self.resources {
-                write!(f, "\n- {}", res)?;
+                write!(f, "\n- {res}")?;
             }
         };
         Ok(())
@@ -153,7 +153,7 @@ pub enum ParseError {
     Format(&'static str),
     #[error("Invalid Address: {0}")]
     /// Address field is non-conformant.
-    Address(#[from] hex::FromHexError),
+    Address(#[from] Eip55Error),
     #[error("Invalid URI: {0}")]
     /// URI field is non-conformant.
     Uri(#[from] iri_string::validate::Error),
@@ -213,14 +213,7 @@ impl FromStr for Message {
             (None, domain)
         };
         let address = tagged(ADDR_TAG, lines.next())
-            .and_then(|a| {
-                if is_checksum(a) {
-                    Ok(a)
-                } else {
-                    Err(ParseError::Format("Address is not in EIP-55 format"))
-                }
-            })
-            .and_then(|a| <[u8; 20]>::from_hex(a).map_err(|e| e.into()))?;
+            .and_then(|a| decode_eip55(a).map_err(ParseError::from))?;
 
         // Skip the new line:
         lines.next();
@@ -320,7 +313,7 @@ impl Visitor<'_> for MessageVisitor {
     {
         match Message::from_str(value) {
             Ok(message) => Ok(message),
-            Err(error) => Err(E::custom(format!("error parsing message: {}", error))),
+            Err(error) => Err(E::custom(format!("error parsing message: {error}"))),
         }
     }
 }
@@ -426,14 +419,14 @@ pub enum VerificationError {
 
 /// Takes an UNPREFIXED eth address and returns whether it is in checksum format or not.
 pub fn is_checksum(address: &str) -> bool {
-    match <[u8; 20]>::from_hex(address) {
-        Ok(s) => {
-            let sum = eip55(&s);
-            let sum = sum.trim_start_matches("0x");
-            sum == address
-        }
-        Err(_) => false,
-    }
+    let hash = Keccak256::digest(address.to_ascii_lowercase().as_bytes());
+    address.len() == 40
+        && address.chars().enumerate().all(|(i, c)| match c {
+            '0'..='9' => true,
+            'a'..='f' => !check_byte(&hash, i),
+            'A'..='F' => check_byte(&hash, i),
+            _ => false,
+        })
 }
 
 impl Message {
@@ -693,17 +686,76 @@ impl Message {
     }
 }
 
-/// Takes an eth address and returns it as a checksum formatted string.
-pub fn eip55(addr: &[u8; 20]) -> String {
+fn check_byte(hash: &[u8], i: usize) -> bool {
+    hash[i >> 1] & if i % 2 == 0 { 128 } else { 8 } != 0
+}
+
+#[derive(Error, Debug)]
+/// Errors raised during Eip55 parsing/deserialization.
+pub enum Eip55Error {
+    #[error("Invalid checksum: position {0} should be uppercase")]
+    /// Invalid checksum at a given position
+    InvalidChecksum(usize),
+    #[error("Invalid char: position {0} found {1}")]
+    /// Non-Hex char found at position
+    InvalidChar(usize, char),
+    #[error(transparent)]
+    /// Invalid Hex string
+    InvalidHex(<[u8; 20] as FromHex>::Error),
+    #[error("Incorrect Eth address length: expected 40, got {0}")]
+    /// Incorrect Eth address length
+    IncorrectLength(usize),
+}
+
+/// Decodes eth address bytes from an eip55-encoded string
+pub fn decode_eip55(addr: &str) -> Result<[u8; 20], Eip55Error> {
+    use Eip55Error::*;
+    use std::ops::Not;
+    if addr.len() != 40 {
+        return Err(IncorrectLength(addr.len()));
+    };
+    let hash = Keccak256::digest(addr.to_ascii_lowercase().as_bytes());
+    addr.chars()
+        .enumerate()
+        .find_map(|(i, c)| match c {
+            '0'..='9' => None,
+            'a'..='f' => check_byte(&hash, i).then_some(InvalidChecksum(i)),
+            'A'..='F' => check_byte(&hash, i).not().then_some(InvalidChecksum(i)),
+            o => Some(InvalidChar(i, o)),
+        })
+        .map(Result::Err)
+        .unwrap_or_else(|| <[u8; 20]>::from_hex(addr).map_err(InvalidHex))
+}
+
+/// Takes an eth address and returns it as a checksum formatted string without prefix.
+pub fn encode_eip55(addr: &[u8; 20]) -> String {
+    use std::ops::Not;
     let addr_str = hex::encode(addr);
-    let hash = Keccak256::digest(addr_str.as_bytes());
-    "0x".chars()
-        .chain(addr_str.chars().enumerate().map(|(i, c)| {
-            match (c, hash[i >> 1] & if i % 2 == 0 { 128 } else { 8 } != 0) {
-                ('a'..='f' | 'A'..='F', true) => c.to_ascii_uppercase(),
-                _ => c.to_ascii_lowercase(),
+    let hash = Keccak256::digest(addr_str.to_ascii_lowercase().as_bytes());
+    addr_str
+        .chars()
+        .enumerate()
+        .map(|(i, c)| match c {
+            '0'..='9' => c,
+            'a'..='f' => {
+                if check_byte(&hash, i) {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
             }
-        }))
+            // HACK hex::encode should never put uppercase-hex in addr_str
+            // but just in case
+            'A'..='F' => {
+                if check_byte(&hash, i).not() {
+                    c.to_ascii_lowercase()
+                } else {
+                    c
+                }
+            }
+            // HACK hex::encode should never put non-hex in addr_str
+            _ => c,
+        })
         .collect()
 }
 
@@ -904,7 +956,7 @@ Resources:
     fn parsing_positive() {
         let tests: serde_json::Value = serde_json::from_str(PARSING_POSITIVE).unwrap();
         for (test_name, test) in tests.as_object().unwrap() {
-            print!("{} -> ", test_name);
+            print!("{test_name} -> ");
             let parsed_message = Message::from_str(test["message"].as_str().unwrap()).unwrap();
             let fields = &test["fields"];
             let expected_message = fields_to_message(fields).unwrap();
@@ -917,7 +969,7 @@ Resources:
     fn parsing_negative() {
         let tests: serde_json::Value = serde_json::from_str(PARSING_NEGATIVE).unwrap();
         for (test_name, test) in tests.as_object().unwrap() {
-            print!("{} -> ", test_name);
+            print!("{test_name} -> ");
             assert!(Message::from_str(test.as_str().unwrap()).is_err());
             println!("✅")
         }
@@ -927,7 +979,7 @@ Resources:
     async fn verification_positive() {
         let tests: serde_json::Value = serde_json::from_str(VERIFICATION_POSITIVE).unwrap();
         for (test_name, test) in tests.as_object().unwrap() {
-            print!("{} -> ", test_name);
+            print!("{test_name} -> ");
             let fields = &test;
             let message = fields_to_message(fields).unwrap();
             let signature = <[u8; 65]>::from_hex(
@@ -983,7 +1035,7 @@ Resources:
     async fn verification_negative() {
         let tests: serde_json::Value = serde_json::from_str(VERIFICATION_NEGATIVE).unwrap();
         for (test_name, test) in tests.as_object().unwrap() {
-            print!("{} -> ", test_name);
+            print!("{test_name} -> ");
             let fields = &test;
             let message = fields_to_message(fields);
             let signature = <Vec<u8>>::from_hex(
@@ -1126,12 +1178,18 @@ Resources:
             "0xD1220A0cf47c7B9Be7A2E6BA89F429762e7b9aDb",
             "0xD1220A0cf47c7B9Be7A2E6BA89F429762e7b9aDb"
         ));
+        assert!(test_eip55(
+            "0xCB51CA232F5C3F87Fad9512F2BbC1D8bC7e2f4C3",
+            "0xCB51CA232F5C3F87Fad9512F2BbC1D8bC7e2f4C3"
+        ))
     }
 
     fn test_eip55(addr: &str, checksum: &str) -> bool {
-        let unprefixed = addr.strip_prefix("0x").unwrap();
-        eip55(&<[u8; 20]>::from_hex(unprefixed).unwrap()) == checksum
-            && eip55(&<[u8; 20]>::from_hex(unprefixed.to_lowercase()).unwrap()) == checksum
-            && eip55(&<[u8; 20]>::from_hex(unprefixed.to_uppercase()).unwrap()) == checksum
+        let addr = addr.strip_prefix("0x").unwrap();
+        let checksum = checksum.strip_prefix("0x").unwrap();
+        encode_eip55(&<[u8; 20]>::from_hex(addr).unwrap()) == checksum
+            && encode_eip55(&<[u8; 20]>::from_hex(addr.to_lowercase()).unwrap()) == checksum
+            && encode_eip55(&<[u8; 20]>::from_hex(addr.to_uppercase()).unwrap()) == checksum
+            && encode_eip55(&decode_eip55(checksum).unwrap()) == checksum
     }
 }

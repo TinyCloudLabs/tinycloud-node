@@ -116,20 +116,20 @@ pub async fn invoke(
             .with_label_values(&["invoke"])
             .start_timer();
 
-        let mut put_iter =
-            i.0 .0
-                .capabilities
-                .iter()
-                .filter_map(|c| match (&c.resource, c.action.as_str()) {
-                    (Resource::TinyCloud(r), "kv/put") if r.service() == Some("kv") => {
-                        r.path().map(|p| (r.orbit(), p))
-                    }
-                    _ => None,
-                });
+        let mut put_iter = i.0 .0.capabilities.iter().filter_map(|c| {
+            match (&c.resource, c.ability.as_ref().as_ref()) {
+                (Resource::TinyCloud(r), "tinycloud.kv/put")
+                    if r.service().as_str() == "kv" && r.path().is_some() =>
+                {
+                    Some((r.orbit(), r.path()))
+                }
+                _ => None,
+            }
+        });
 
         let inputs = match (data, put_iter.next(), put_iter.next()) {
             (DataIn::None | DataIn::One(_), None, _) => HashMap::new(),
-            (DataIn::One(d), Some((orbit, path)), None) => {
+            (DataIn::One(d), Some((orbit, Some(path))), None) => {
                 let mut stage = staging
                     .stage(orbit)
                     .await
@@ -165,7 +165,7 @@ pub async fn invoke(
                 };
 
                 let mut inputs = HashMap::new();
-                inputs.insert((orbit.clone(), path.to_string()), (headers.0, stage));
+                inputs.insert((orbit.clone(), path.clone()), (headers.0, stage));
                 inputs
             }
             (DataIn::Many(_), Some(_), Some(_)) => {

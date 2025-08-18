@@ -1,8 +1,7 @@
-use crate::resource::{ResourceCapErr, ResourceId};
+use crate::resource::ResourceId;
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use cacaos::siwe_cacao::SiweCacao;
 use iri_string::validate::Error as UriStringError;
-use libipld::{cbor::DagCborCodec, prelude::*};
 use ssi::{
     claims::jwt::NumericDate,
     dids::{DIDBuf, DIDURLBuf, InvalidDID, InvalidDIDURL},
@@ -11,9 +10,11 @@ use ssi::{
 };
 use std::str::FromStr;
 use time::error::ComponentRange as TimestampRangeError;
+use ucan_capabilities_object::Ability;
 use uuid::Uuid;
 
-pub use libipld::Cid;
+pub use ipld_core::cid::Cid;
+use serde_ipld_dagcbor;
 
 pub trait HeaderEncode {
     fn encode(&self) -> Result<String, EncodingError>;
@@ -30,12 +31,11 @@ pub enum TinyCloudDelegation {
 
 impl HeaderEncode for TinyCloudDelegation {
     fn encode(&self) -> Result<String, EncodingError> {
-        use std::ops::Deref;
         Ok(match self {
             Self::Ucan(u) => u.encode()?,
             Self::Cacao(c) => {
                 // Use the imported engine and trait method
-                URL_SAFE.encode(DagCborCodec.encode(c.deref())?)
+                URL_SAFE.encode(serde_ipld_dagcbor::to_vec(c)?)
             }
         })
     }
@@ -49,14 +49,17 @@ impl HeaderEncode for TinyCloudDelegation {
         } else {
             // Use the imported engine and trait method
             let v = URL_SAFE.decode(s)?;
-            (Self::Cacao(Box::new(DagCborCodec.decode(&v)?)), v)
+            (
+                Self::Cacao(Box::new(serde_ipld_dagcbor::from_slice(&v)?)),
+                v,
+            )
         })
     }
 }
 
 impl TinyCloudDelegation {
     pub fn from_bytes(b: &[u8]) -> Result<Self, EncodingError> {
-        match DagCborCodec.decode(b) {
+        match serde_ipld_dagcbor::from_slice(b) {
             Ok(cacao) => Ok(Self::Cacao(Box::new(cacao))),
             Err(_) => Ok(Self::Ucan(Box::new(Ucan::decode(
                 &String::from_utf8_lossy(b),
@@ -87,51 +90,52 @@ impl HeaderEncode for TinyCloudRevocation {
     fn encode(&self) -> Result<String, EncodingError> {
         match self {
             // Use the imported engine and trait method
-            Self::Cacao(c) => Ok(URL_SAFE.encode(DagCborCodec.encode(&c)?)),
+            Self::Cacao(c) => Ok(URL_SAFE.encode(serde_ipld_dagcbor::to_vec(c)?)),
         }
     }
     fn decode(s: &str) -> Result<(Self, Vec<u8>), EncodingError> {
         // Use the imported engine and trait method
         let v = URL_SAFE.decode(s)?;
-        Ok((Self::Cacao(DagCborCodec.decode(&v)?), v))
+        Ok((Self::Cacao(serde_ipld_dagcbor::from_slice(&v)?), v))
     }
 }
 
-pub async fn make_invocation(
-    invocation_target: Vec<ResourceId>,
-    delegation: Cid,
+pub fn make_invocation<A: IntoIterator<Item = Ability>>(
+    invocation_target: impl IntoIterator<Item = (ResourceId, A)>,
+    delegation: &Cid,
     jwk: &JWK,
-    verification_method: String,
+    verification_method: &str,
     expiration: f64,
     not_before: Option<f64>,
     nonce: Option<String>,
 ) -> Result<Ucan, InvocationError> {
     Ok(Payload {
-        issuer: DIDURLBuf::from_str(&verification_method)?,
+        issuer: DIDURLBuf::from_str(verification_method)?,
         audience: DIDBuf::from_str(
             verification_method
                 .split('#')
                 .next()
-                .unwrap_or(&verification_method),
+                .unwrap_or(verification_method),
         )?,
         not_before: not_before.map(NumericDate::try_from_seconds).transpose()?,
         expiration: NumericDate::try_from_seconds(expiration)
             .map_err(InvocationError::NumericDateConversionError)?,
         nonce: Some(nonce.unwrap_or_else(|| format!("urn:uuid:{}", Uuid::new_v4()))),
         facts: None,
-        proof: vec![delegation],
-        attenuation: invocation_target
-            .into_iter()
-            .map(|t| t.try_into())
-            .collect::<Result<Vec<ssi::ucan::Capability>, _>>()?,
+        proof: vec![*delegation],
+        attenuation: {
+            let mut caps = ucan_capabilities_object::Capabilities::new();
+            for (resource, abilities) in invocation_target {
+                caps.with_actions(resource.as_uri(), abilities.into_iter().map(|a| (a, [])));
+            }
+            caps
+        },
     }
     .sign(jwk.get_algorithm().unwrap_or_default(), jwk)?)
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum InvocationError {
-    #[error(transparent)]
-    ResourceCap(#[from] ResourceCapErr),
     #[error("Timestamp component out of range: {0}")] // Add variant for ComponentRange
     TimestampRange(#[from] TimestampRangeError),
     #[error("Invalid date format: {0}")]
@@ -151,7 +155,9 @@ pub enum EncodingError {
     #[error(transparent)]
     SSIError(#[from] ssi::ucan::error::Error),
     #[error(transparent)]
-    IpldError(#[from] libipld::error::Error),
+    IpldEncode(#[from] serde_ipld_dagcbor::EncodeError<std::collections::TryReserveError>),
+    #[error(transparent)]
+    IpldDecode(#[from] serde_ipld_dagcbor::DecodeError<core::convert::Infallible>),
     #[error(transparent)]
     Base64(#[from] base64::DecodeError),
 }

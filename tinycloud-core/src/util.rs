@@ -1,19 +1,19 @@
-use crate::types::Resource;
+use crate::types::{Ability, Resource};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
-use tinycloud_lib::siwe_recap::{Capability as SiweCap, VerificationError as SiweError};
 use tinycloud_lib::{
     authorization::{TinyCloudDelegation, TinyCloudInvocation, TinyCloudRevocation},
     cacaos::siwe::Message,
-    libipld::Cid,
+    ipld_core::cid::Cid,
     resource::OrbitId,
-    ssi::ucan::Capability as UcanCap,
+    siwe_recap::{Capability as SiweCap, VerificationError as SiweError},
 };
+use ucan_capabilities_object::Capabilities as UcanCapabilities;
 
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Capability {
     pub resource: Resource,
-    pub action: String,
+    pub ability: Ability,
 }
 
 #[non_exhaustive]
@@ -24,41 +24,43 @@ pub enum CapExtractError {
     #[error("Invalid Extra Fields")]
     InvalidFields,
     #[error(transparent)]
-    Cid(#[from] tinycloud_lib::libipld::cid::Error),
-    #[error("Incorrect UCAN action namespace")]
-    UcanNamespace,
+    Cid(#[from] tinycloud_lib::ipld_core::cid::Error),
 }
 
-fn extract_ucan_cap<T>(c: &UcanCap<T>) -> Result<Capability, CapExtractError> {
-    Ok(Capability {
-        resource: c.with.to_string().into(),
-        action: c
-            .can
-            .to_string()
-            .strip_prefix("tinycloud.")
-            .ok_or(CapExtractError::UcanNamespace)?
-            .to_string(),
-    })
+fn extract_ucan_caps<T>(caps: &UcanCapabilities<T>) -> Vec<Capability> {
+    let mut capabilities = Vec::new();
+
+    // Iterate over all capabilities in the Capabilities object
+    for (resource_uri, abilities) in caps.abilities() {
+        for ability in abilities.keys() {
+            // Only process tinycloud capabilities, skip others
+            capabilities.push(Capability {
+                resource: resource_uri.into(),
+                ability: ability.clone().into(),
+            });
+        }
+    }
+
+    capabilities
 }
 
-fn extract_siwe_cap(c: SiweCap<()>) -> Result<(Vec<Capability>, Vec<Cid>), CapExtractError> {
-    Ok((
-        c.abilities()
-            .iter() // Iterate over the BTreeMap provided by abilities()
+fn extract_siwe_cap(c: SiweCap<()>) -> (Vec<Capability>, Vec<Cid>) {
+    let (c, p) = c.into_inner();
+    (
+        c.into_inner()
+            .into_iter()
             .flat_map(|(r, acs)| {
-                // r is &UriString, acs is &BTreeMap<Ability, NotaBeneCollection<()>>
-                acs.keys() // Iterate over Ability keys
-                    .map(|action| Capability {
-                        // action is &Ability
-                        resource: Resource::from(r.to_string()), // Convert RiString to String before From
-                        action: action.to_string(),              // Convert Ability to String
+                // r is UriString, acs is BTreeMap<Ability, Caveats<()>>
+                acs.into_keys() // Iterate over Ability keys
+                    .map(|ability| Capability {
+                        resource: Resource::from(r.clone()),
+                        ability: ability.into(),
                     })
-                    .collect::<Vec<Capability>>()
+                    .collect::<Vec<_>>()
             })
             .collect(),
-        // Access proof CIDs directly via the proof() method
-        c.proof().to_vec(),
-    ))
+        p,
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -101,20 +103,15 @@ impl TryFrom<TinyCloudDelegation> for DelegationInfo {
     fn try_from(d: TinyCloudDelegation) -> Result<Self, Self::Error> {
         Ok(match d {
             TinyCloudDelegation::Ucan(ref u) => Self {
-                capabilities: u
-                    .payload
-                    .attenuation
-                    .iter()
-                    .map(extract_ucan_cap)
-                    .collect::<Result<Vec<Capability>, CapExtractError>>()?,
-                delegator: u.payload.issuer.to_string(),
-                delegate: u.payload.audience.to_string(),
-                parents: u.payload.proof.clone(),
+                capabilities: extract_ucan_caps(&u.payload().attenuation),
+                delegator: u.payload().issuer.to_string(),
+                delegate: u.payload().audience.to_string(),
+                parents: u.payload().proof.clone(),
                 expiry: OffsetDateTime::from_unix_timestamp_nanos(
-                    (u.payload.expiration.as_seconds() * 1_000_000_000.0) as i128,
+                    (u.payload().expiration.as_seconds() * 1_000_000_000.0) as i128,
                 )
                 .ok(),
-                not_before: u.payload.not_before.and_then(|t| {
+                not_before: u.payload().not_before.and_then(|t| {
                     OffsetDateTime::from_unix_timestamp_nanos(
                         (t.as_seconds() * 1_000_000_000.0) as i128,
                     )
@@ -131,7 +128,7 @@ impl TryFrom<TinyCloudDelegation> for DelegationInfo {
                 let (capabilities, parents) = match maybe_siwe_cap {
                     Some(siwe_cap) => {
                         // Pass the extracted cap to the helper function
-                        extract_siwe_cap(siwe_cap)?
+                        extract_siwe_cap(siwe_cap)
                     }
                     None => {
                         // No capabilities found
@@ -181,14 +178,9 @@ impl TryFrom<TinyCloudInvocation> for InvocationInfo {
     type Error = InvocationError;
     fn try_from(invocation: TinyCloudInvocation) -> Result<Self, Self::Error> {
         Ok(Self {
-            capabilities: invocation
-                .payload
-                .attenuation
-                .iter()
-                .map(extract_ucan_cap)
-                .collect::<Result<Vec<Capability>, CapExtractError>>()?,
-            invoker: invocation.payload.issuer.to_string(),
-            parents: invocation.payload.proof.clone(),
+            capabilities: extract_ucan_caps(&invocation.payload().attenuation),
+            invoker: invocation.payload().issuer.to_string(),
+            parents: invocation.payload().proof.clone(),
             invocation,
         })
     }

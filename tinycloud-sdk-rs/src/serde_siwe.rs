@@ -1,31 +1,51 @@
 pub mod address {
-    use hex::FromHex;
-    use serde::de::{Deserialize, Deserializer, Error};
+    use crate::util::{decode_eip55, encode_eip55};
+    use serde::{
+        de::{Deserialize, Deserializer, Error as DeErr},
+        ser::{Serialize, Serializer},
+    };
+    use std::borrow::Cow;
+
+    pub fn serialize<S>(addr: &[u8; 20], s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        format!("0x{}", encode_eip55(addr)).serialize(s)
+    }
 
     pub fn deserialize<'de, D>(d: D) -> Result<[u8; 20], D::Error>
     where
         D: Deserializer<'de>,
     {
-        String::deserialize(d).and_then(|address| {
-            <[u8; 20]>::from_hex(address.strip_prefix("0x").unwrap_or(&address))
-                .map_err(|e| D::Error::custom(format!("failed to parse ethereum: {e}")))
-        })
+        let addr = Cow::<'_, str>::deserialize(d)?;
+        decode_eip55(addr.strip_prefix("0x").unwrap_or(&addr)).map_err(D::Error::custom)
     }
 }
 
 pub mod signature {
-    use hex::FromHex;
-    use serde::de::{Deserialize, Deserializer, Error};
-    use tinycloud_lib::cacaos::siwe_cacao::SIWESignature;
+    use hex::{FromHex, ToHex};
+    use serde::{
+        de::{Deserialize, Deserializer, Error as DeErr},
+        ser::{Serialize, Serializer},
+    };
+    use std::{borrow::Cow, ops::Deref};
 
-    pub fn deserialize<'de, D>(d: D) -> Result<SIWESignature, D::Error>
+    use tinycloud_lib::cacaos::siwe_cacao::Signature;
+
+    pub fn serialize<S>(addr: &Signature, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        format!("0x{}", addr.deref().encode_hex::<String>()).serialize(s)
+    }
+
+    pub fn deserialize<'de, D>(d: D) -> Result<Signature, D::Error>
     where
         D: Deserializer<'de>,
     {
-        String::deserialize(d).and_then(|sig| {
-            <[u8; 65]>::from_hex(sig.strip_prefix("0x").unwrap_or(&sig))
-                .map(Into::into)
-                .map_err(|e| D::Error::custom(format!("failed to parse SIWE signature: {e}")))
-        })
+        let sig = Cow::<'_, str>::deserialize(d)?;
+        <[u8; 65]>::from_hex(sig.strip_prefix("0x").unwrap_or(&sig))
+            .map(Into::into)
+            .map_err(|e| D::Error::custom(format!("failed to parse SIWE signature: {e}")))
     }
 }

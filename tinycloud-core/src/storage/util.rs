@@ -1,4 +1,4 @@
-use crate::hash::{Hash, Hasher};
+use crate::hash::{Blake3Hasher, Hash};
 use core::pin::Pin;
 use futures::{
     io::AsyncWrite,
@@ -12,14 +12,14 @@ use std::io::Error as IoError;
 pub struct HashBuffer<B> {
     #[pin]
     buffer: B,
-    hasher: Hasher,
+    hasher: Blake3Hasher,
 }
 
 impl<B> HashBuffer<B> {
-    pub fn into_inner(self) -> (Hasher, B) {
+    pub fn into_inner(self) -> (Blake3Hasher, B) {
         (self.hasher, self.buffer)
     }
-    pub fn hasher(&self) -> &Hasher {
+    pub fn hasher(&self) -> &Blake3Hasher {
         &self.hasher
     }
     pub fn hash(&mut self) -> Hash {
@@ -31,7 +31,7 @@ impl<B> HashBuffer<B> {
     pub fn new(buffer: B) -> Self {
         Self {
             buffer,
-            hasher: Hasher::new(),
+            hasher: Blake3Hasher::new(),
         }
     }
 }

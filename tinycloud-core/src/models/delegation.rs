@@ -1,5 +1,5 @@
 use crate::hash::Hash;
-use crate::types::{Facts, Resource};
+use crate::types::{Ability, Facts, Resource};
 use crate::{events::Delegation, models::*, relationships::*, util};
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, ConnectionTrait};
 use time::OffsetDateTime;
@@ -112,7 +112,7 @@ pub enum DelegationError {
     #[error("Unauthorized Delegator: {0}")]
     UnauthorizedDelegator(String),
     #[error("Unauthorized Capability: {0}, {1}")]
-    UnauthorizedCapability(Resource, String),
+    UnauthorizedCapability(Resource, Ability),
     #[error("Cannot find parent delegation")]
     MissingParents,
 }
@@ -137,7 +137,7 @@ async fn verify(delegation: &TinyCloudDelegation) -> Result<(), Error> {
             ucan.verify_signature(&AnyDidMethod::default())
                 .await
                 .map_err(|_| DelegationError::InvalidSignature)?;
-            ucan.payload
+            ucan.payload()
                 .validate_time(None)
                 .map_err(|_| DelegationError::InvalidTime)?;
         }
@@ -205,11 +205,11 @@ async fn validate<C: ConnectionTrait>(
                 !parent_abilities
                     .iter()
                     .flatten()
-                    .any(|pc| c.resource.extends(&pc.resource) && c.action == pc.ability)
+                    .any(|pc| c.resource.extends(&pc.resource) && c.ability == pc.ability)
             }) {
                 Some(c) => Err(DelegationError::UnauthorizedCapability(
                     c.resource.clone(),
-                    c.action.clone(),
+                    c.ability.clone(),
                 )
                 .into()),
                 None => Ok(()),
@@ -254,7 +254,7 @@ async fn save<C: ConnectionTrait>(
             abilities::ActiveModel::from(abilities::Model {
                 delegation: hash,
                 resource: ab.resource,
-                ability: ab.action,
+                ability: ab.ability,
                 caveats: Default::default(),
             })
         }))

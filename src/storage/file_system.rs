@@ -37,7 +37,7 @@ impl FileSystemStore {
     fn get_path(&self, orbit: &OrbitId, mh: &Hash) -> PathBuf {
         self.path
             .join(orbit.suffix())
-            .join(orbit.name())
+            .join(orbit.name().as_str())
             .join(base64::encode_config(mh.as_ref(), base64::URL_SAFE))
     }
 
@@ -81,7 +81,7 @@ impl StorageConfig<FileSystemStore> for FileSystemConfig {
 impl StorageSetup for FileSystemStore {
     type Error = IoError;
     async fn create(&self, orbit: &OrbitId) -> Result<(), Self::Error> {
-        let path = self.path.join(orbit.suffix()).join(orbit.name());
+        let path = self.path.join(orbit.suffix()).join(orbit.name().as_str());
         if !path.is_dir() {
             create_dir_all(&path).await?;
         }
@@ -146,7 +146,7 @@ async fn store_sizes<P: AsRef<Path>>(path: &P) -> Result<HashMap<OrbitId, u64>, 
             ) {
                 let mut ds = ReadDirStream::new(tokio::fs::read_dir(entry.path()).await?);
                 let did: DIDBuf = ["did:", suffix.as_str()].concat().parse().map_err(|_| {
-                    IoError::new(ErrorKind::InvalidData, format!("Invalid DID: {}", suffix))
+                    IoError::new(ErrorKind::InvalidData, format!("Invalid DID: {suffix}"))
                 })?;
                 // go through each suffix directory
                 while let Some(entry) = ds.try_next().await? {
@@ -157,7 +157,8 @@ async fn store_sizes<P: AsRef<Path>>(path: &P) -> Result<HashMap<OrbitId, u64>, 
                         entry.file_name().into_string(),
                     ) {
                         // get the orbit ID from suffix and name
-                        let orbit = OrbitId::new(did.clone(), name);
+                        let orbit =
+                            OrbitId::new(did.clone(), name.try_into().map_err(IoError::other)?);
                         let size = orbit_size(&entry.path()).await?;
                         acc.insert(orbit, size);
                     }
@@ -344,7 +345,7 @@ mod test {
         let cfg = FileSystemConfig::new(dir.path());
         let store = cfg.open().await.unwrap();
         let data = b"hello world";
-        let orbit: OrbitId = "tinycloud:key:test://default".parse().unwrap();
+        let orbit: OrbitId = "tinycloud:key:test:default".parse().unwrap();
         assert_eq!(store.total_size(&orbit).await.unwrap(), None);
         store.create(&orbit).await.unwrap();
         assert_eq!(store.total_size(&orbit).await.unwrap(), Some(0));

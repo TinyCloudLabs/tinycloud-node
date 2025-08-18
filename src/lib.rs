@@ -7,7 +7,6 @@ extern crate tokio;
 
 use anyhow::Result;
 use rocket::{fairing::AdHoc, figment::Figment, http::Header, Build, Rocket};
-use tinycloud_lib::libipld::{block::Block as OBlock, store::DefaultParams};
 
 pub mod allow_list;
 pub mod auth_guards;
@@ -31,7 +30,6 @@ use tinycloud_core::{
     OrbitDatabase,
 };
 
-pub type Block = OBlock<DefaultParams>;
 pub type BlockStores = Either<S3BlockStore, FileSystemStore>;
 pub type BlockConfig = Either<S3BlockConfig, FileSystemConfig>;
 pub type BlockStage = Either<TempFileSystemStage, MemoryStaging>;
