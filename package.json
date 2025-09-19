@@ -1,0 +1,27 @@
+{
+  "name": "tinycloud-sst",
+  "version": "1.0.0",
+  "description": "SST deployment configuration for TinyCloud",
+  "scripts": {
+    "dev": "sst dev",
+    "dev:local": "cargo run",
+    "dev:setup": "./scripts/setup-dev.sh",
+    "deploy": "sst deploy",
+    "deploy:prod": "sst deploy --stage production", 
+    "remove": "sst remove",
+    "remove:dev": "sst remove --stage dev",
+    "console": "sst console",
+    "console:dev": "sst console --stage dev",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "dotenv": "^16.4.0",
+    "sst": "^3.0.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.0.0",
+    "constructs": "^10.0.0"
+  }
+}

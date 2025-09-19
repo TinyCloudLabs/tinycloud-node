@@ -23,6 +23,15 @@ use tinycloud_lib::resource::OrbitId;
 use super::{file_system, size::OrbitSizes};
 
 async fn aws_config() -> SdkConfig {
+    // Debug: Print environment variables
+    println!("DEBUG: AWS_ACCESS_KEY_ID present: {}", std::env::var("AWS_ACCESS_KEY_ID").is_ok());
+    println!("DEBUG: AWS_SECRET_ACCESS_KEY present: {}", std::env::var("AWS_SECRET_ACCESS_KEY").is_ok());
+    println!("DEBUG: AWS_DEFAULT_REGION: {:?}", std::env::var("AWS_DEFAULT_REGION"));
+    
+    if let Ok(key_id) = std::env::var("AWS_ACCESS_KEY_ID") {
+        println!("DEBUG: AWS_ACCESS_KEY_ID starts with: {}", &key_id[..8]);
+    }
+    
     aws_config::from_env().load().await
 }
 
