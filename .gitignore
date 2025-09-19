@@ -3,3 +3,5 @@
 .env
 .dist
 .sst
+.env.local
+.env*
