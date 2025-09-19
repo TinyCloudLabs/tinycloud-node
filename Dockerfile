@@ -14,12 +14,14 @@ COPY ./tinycloud-sdk-wasm/ ./tinycloud-sdk-wasm/
 COPY ./siwe/ ./siwe/
 COPY ./siwe-recap/ ./siwe-recap/
 COPY ./cacao/ ./cacao/
+COPY ./scripts/ ./scripts/
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY --from=planner /app/ ./
+RUN chmod +x ./scripts/init-tinycloud.sh && ./scripts/init-tinycloud.sh
 RUN cargo build --release --bin tinycloud
 RUN addgroup -g 1000 tinycloud && adduser -u 1000 -G tinycloud -s /bin/sh -D tinycloud
 
@@ -27,6 +29,7 @@ FROM scratch AS runtime
 COPY --from=builder /etc/passwd /etc/passwd
 COPY --from=builder /etc/group /etc/group
 COPY --from=builder --chown=tinycloud:tinycloud /app/target/release/tinycloud /tinycloud
+COPY --from=builder --chown=tinycloud:tinycloud /app/tinycloud ./tinycloud
 COPY ./tinycloud.toml ./
 USER tinycloud:tinycloud
 ENV ROCKET_ADDRESS=0.0.0.0

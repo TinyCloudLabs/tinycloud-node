@@ -12,15 +12,19 @@ TinyCloud Protocol is self-sovereign storage. It is a fork of [Kepler](https://g
 
 To run TinyCloud Protocol locally you will need the latest version of [rust](https://rustup.rs).
 
-You will need to create a directory for TinyCloud Protocol to store data in:
+You will need to create a directory structure for TinyCloud Protocol to store data in. You can do this manually or use our initialization script:
+
+**Option 1: Using the initialization script (recommended)**
 ```bash
-mkdir tinycloud
+./scripts/init-tinycloud.sh
 ```
 
-Within this directory, create one more directories `blocks` and a database file `caps.db`:
+**Option 2: Manual setup**
 ```bash
+mkdir tinycloud
 mkdir tinycloud/blocks
 touch tinycloud/caps.db
+echo "*" > tinycloud/.gitignore
 ```
 
 You will then need to set the environment variables to point to those directories:
@@ -121,6 +125,20 @@ TINYCLOUD_PORT=8001 tinycloud
 ```
 
 If the TinyCloud Protocol instance is not able to find or establish a connection to the configured storage, the instance will terminate.
+
+## Scripts
+
+TinyCloud Protocol includes several utility scripts in the `scripts/` directory:
+
+| Script | Description |
+|:-------|:------------|
+| `init-tinycloud.sh` | Initialize TinyCloud directory structure (`./tinycloud/`, `./tinycloud/blocks/`, `./tinycloud/caps.db`, `./tinycloud/.gitignore`) |
+| `setup-dev.sh` | Set up development environment with cloud resources and SST secrets |
+| `setup-ecr.sh` | Configure AWS ECR repository for container deployments |
+| `setup-github-oidc.sh` | Set up GitHub OIDC for secure CI/CD deployments |
+| `setup-github-oidc-secure.sh` | Set up GitHub OIDC with additional security configurations |
+
+The initialization script is automatically called during Docker builds to ensure the proper directory structure exists in the container.
 
 ## Usage
 
