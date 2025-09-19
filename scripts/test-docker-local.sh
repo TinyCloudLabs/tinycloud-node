@@ -9,7 +9,7 @@
 set -e
 
 CONTAINER_NAME="tinycloud-node"
-IMAGE_NAME="tinycloudlabs:tincloud-node-simple"
+IMAGE_NAME="tinycloudlabs:tinycloud-node-simple"
 
 # Detect platform architecture
 ARCH=$(uname -m)

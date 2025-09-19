@@ -1,9 +1,12 @@
 target/
-Dockerfile
+Dockerfile*
 .dockerignore
 .git/
 .gitignore
 *.md
+README*
+CHANGELOG*
+LICENSE*
 .env
 .env.*
 node_modules/
@@ -14,6 +17,26 @@ docs/
 *.log
 .DS_Store
 
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# Build artifacts that don't affect the build
+*.deb
+*.rpm
+*.tar.gz
+*.zip
 
 # sst
 .sst
