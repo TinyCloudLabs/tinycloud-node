@@ -6,7 +6,7 @@
 
 The TinyCloud Protocol is a framework for creating interoperable software applications where users retain full sovereignty over their data. It provides a decentralized or user-controlled "cloud" that can serve as the backend for multiple apps, allowing users to maintain control over their data without ceding ownership or privacy to third parties. TinyCloud is built on core values of sovereignty, privacy, and interoperability, enabling users to store, stream, and compute upon their data in ways that minimize leakage while providing fine-grained permissioning capabilities.
 
-TinyCloud Protocol is self-sovereign storage. It is a fork of [Kepler](https://github.com/spruceid/kepler) and is architected as a decentralized storage system that uses DIDs and Authorization Capabilities to define Orbits, where your data lives and who has access. Any DID controller (e.g. people, applications, DAOs) can administer their own TinyCloud Protocol Orbit.
+TinyCloud Protocol is self-sovereign storage. It is a fork of [Kepler](https://github.com/spruceid/kepler) and is architected as a decentralized storage system that uses DIDs and Authorization Capabilities to define Orbits, where your data lives and who has access. Any DID controller (e.g. people, applications, DAOs) can administer their own TinyCloud.
 
 ## Quickstart
 
@@ -16,7 +16,7 @@ You will need to create a directory structure for TinyCloud Protocol to store da
 
 **Option 1: Using the initialization script (recommended)**
 ```bash
-./scripts/init-tinycloud.sh
+./scripts/init-tinycloud-data.sh
 ```
 
 **Option 2: Manual setup**
@@ -132,7 +132,7 @@ TinyCloud Protocol includes several utility scripts in the `scripts/` directory:
 
 | Script | Description |
 |:-------|:------------|
-| `init-tinycloud.sh` | Initialize TinyCloud directory structure (`./tinycloud/`, `./tinycloud/blocks/`, `./tinycloud/caps.db`, `./tinycloud/.gitignore`) |
+| `init-tinycloud-data.sh` | Initialize TinyCloud directory structure (`./data/`, `./data/blocks/`, `./data/caps.db`, `./tinycloud/.gitignore`) |
 | `setup-dev.sh` | Set up development environment with cloud resources and SST secrets |
 | `setup-ecr.sh` | Configure AWS ECR repository for container deployments |
 | `setup-github-oidc.sh` | Set up GitHub OIDC for secure CI/CD deployments |

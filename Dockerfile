@@ -21,7 +21,7 @@ FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY --from=planner /app/ ./
-RUN chmod +x ./scripts/init-tinycloud.sh && ./scripts/init-tinycloud.sh
+RUN chmod +x ./scripts/init-tinycloud-data.sh && ./scripts/init-tinycloud-data.sh
 RUN cargo build --release --bin tinycloud
 RUN addgroup -g 1000 tinycloud && adduser -u 1000 -G tinycloud -s /bin/sh -D tinycloud
 
@@ -29,7 +29,7 @@ FROM scratch AS runtime
 COPY --from=builder /etc/passwd /etc/passwd
 COPY --from=builder /etc/group /etc/group
 COPY --from=builder --chown=tinycloud:tinycloud /app/target/release/tinycloud /tinycloud
-COPY --from=builder --chown=tinycloud:tinycloud /app/tinycloud ./tinycloud
+COPY --from=builder --chown=tinycloud:tinycloud /app/data ./data
 COPY ./tinycloud.toml ./
 USER tinycloud:tinycloud
 ENV ROCKET_ADDRESS=0.0.0.0
