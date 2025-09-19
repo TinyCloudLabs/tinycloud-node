@@ -12,7 +12,7 @@ permissions:
 jobs:
   cleanup:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -20,7 +20,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v1
@@ -47,24 +47,24 @@ jobs:
           script: |
             const stage = `pr-${{ github.event.pull_request.number }}`;
             const identifier = `<!-- sst-deploy-${stage} -->`;
-            
+
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
             });
-            
+
             const existingComment = comments.find(c => c.body.includes(identifier));
-            
+
             if (existingComment) {
               const body = `${identifier}
               ## 🧹 Preview Environment Cleaned Up
-              
+
               **Environment:** \`${stage}\`
               **Status:** ✅ Successfully removed
-              
+
               All resources associated with this PR preview have been deleted.`;
-              
+
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
