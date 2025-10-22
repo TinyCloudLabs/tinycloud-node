@@ -13,7 +13,7 @@ async fn main() {
     let config = rocket::figment::Figment::from(rocket::Config::default())
         .merge(Serialized::defaults(config::Config::default()))
         .merge(Toml::file("tinycloud.toml").nested())
-        .merge(Env::prefixed("TINYCLOUD_").split("_").global())
+        .merge(Env::prefixed("TINYCLOUD_").global())
         .merge(Env::prefixed("ROCKET_").global()); // That's just for easy access to ROCKET_LOG_LEVEL
     let tinycloud_config = config.extract::<config::Config>().unwrap();
 
