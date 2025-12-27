@@ -27,6 +27,9 @@ use tinycloud_sdk_rs::authorization::DelegationHeaders;
 pub struct SessionConfig {
     // { service: { path: [action] } }
     // e.g. { "kv": { "some/path": ["tinycloud.kv/get", "tinycloud.kv/put", "tinycloud.kv/del"] } }
+    // Note: Actions use ReCap ability namespace format (e.g., "tinycloud.kv/get" where
+    // "tinycloud.kv" is the ability namespace). This is distinct from the TinyCloud user
+    // namespace (data container) referenced by namespace_id below.
     pub abilities: HashMap<Service, HashMap<Path, Vec<Ability>>>,
     #[serde(with = "tinycloud_sdk_rs::serde_siwe::address")]
     pub address: [u8; 20],
@@ -35,6 +38,9 @@ pub struct SessionConfig {
     pub domain: Authority,
     #[serde_as(as = "DisplayFromStr")]
     pub issued_at: TimeStamp,
+    /// The TinyCloud user namespace (data container) that this session targets.
+    /// Format: "tinycloud:pkh:eip155:{chainId}:{address}:{name}"
+    /// Not to be confused with ReCap ability namespaces (action categories like "kv").
     pub namespace_id: NamespaceId,
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(default)]
@@ -77,6 +83,8 @@ pub struct Session {
     #[serde_as(as = "DisplayFromStr")]
     pub delegation_cid: Cid,
     pub jwk: JWK,
+    /// The TinyCloud user namespace (data container) that this session is bound to.
+    /// Not to be confused with ReCap ability namespaces (action categories like "kv").
     pub namespace_id: NamespaceId,
     pub verification_method: String,
 }
