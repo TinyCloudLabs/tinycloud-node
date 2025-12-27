@@ -6,7 +6,7 @@
 
 The TinyCloud Protocol is a framework for creating interoperable software applications where users retain full sovereignty over their data. It provides a decentralized or user-controlled "cloud" that can serve as the backend for multiple apps, allowing users to maintain control over their data without ceding ownership or privacy to third parties. TinyCloud is built on core values of sovereignty, privacy, and interoperability, enabling users to store, stream, and compute upon their data in ways that minimize leakage while providing fine-grained permissioning capabilities.
 
-TinyCloud Protocol is self-sovereign storage. It is a fork of [Kepler](https://github.com/spruceid/kepler) and is architected as a decentralized storage system that uses DIDs and Authorization Capabilities to define Namespaces, where your data lives and who has access. Any DID controller (e.g. people, applications, DAOs) can administer their own TinyCloud Protocol Namespace.
+TinyCloud Protocol is self-sovereign storage. It is a decendant of [Kepler](https://github.com/spruceid/kepler) and is architected as a decentralized storage system that uses DIDs and Authorization Capabilities to define TinyCloud Namespaces, where your data lives and who has access. Any DID controller (e.g. people, applications, DAOs) can administer their own TinyCloud Protocol Namespace.
 
 ## Quickstart
 
