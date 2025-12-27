@@ -93,7 +93,7 @@ impl StorageSetup for FileSystemStore {
 impl Default for FileSystemConfig {
     fn default() -> Self {
         Self {
-            path: PathBuf::from(r"/tmp/tinycloud/blocks"),
+            path: PathBuf::from(r"./data/blocks"),
         }
     }
 }
