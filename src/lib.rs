@@ -27,7 +27,7 @@ use tinycloud_core::{
     keys::{SecretsSetup, StaticSecret},
     sea_orm::{ConnectOptions, Database, DatabaseConnection},
     storage::{either::Either, memory::MemoryStaging, StorageConfig},
-    OrbitDatabase,
+    NamespaceDatabase,
 };
 
 pub type BlockStores = Either<S3BlockStore, FileSystemStore>;
@@ -70,7 +70,7 @@ impl From<BlockStage> for StagingStorage {
     }
 }
 
-pub type TinyCloud = OrbitDatabase<DatabaseConnection, BlockStores, StaticSecret>;
+pub type TinyCloud = NamespaceDatabase<DatabaseConnection, BlockStores, StaticSecret>;
 
 pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     let tinycloud_config: Config = config.extract::<Config>()?;

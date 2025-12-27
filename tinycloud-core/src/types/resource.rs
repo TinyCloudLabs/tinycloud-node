@@ -6,7 +6,7 @@ use tinycloud_lib::resource::{
         types::{UriStr, UriString},
         validate::Error as UriError,
     },
-    KRIParseError, OrbitId, ResourceId,
+    KRIParseError, NamespaceId, ResourceId,
 };
 
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -17,9 +17,9 @@ pub enum Resource {
 }
 
 impl Resource {
-    pub fn orbit(&self) -> Option<&OrbitId> {
+    pub fn namespace(&self) -> Option<&NamespaceId> {
         match self {
-            Resource::TinyCloud(id) => Some(id.orbit()),
+            Resource::TinyCloud(id) => Some(id.namespace()),
             Resource::Other(_) => None,
         }
     }

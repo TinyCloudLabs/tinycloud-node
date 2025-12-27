@@ -4,7 +4,7 @@ import {
     randomString,
 } from 'https://jslib.k6.io/k6-utils/1.3.0/index.js';
 
-import { setup_orbit, tinycloud, signer } from './utils.js';
+import { setup_namespace, tinycloud, signer } from './utils.js';
 
 export const options = {
     scenarios: {
@@ -19,7 +19,7 @@ export const options = {
 };
 
 export function setup() {
-    setup_orbit(tinycloud, signer, 0);
+    setup_namespace(tinycloud, signer, 0);
 
     const key = randomString(15);
     let put_invocation = http.post(`${signer}/sessions/0/invoke`,

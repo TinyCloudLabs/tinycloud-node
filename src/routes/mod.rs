@@ -39,21 +39,21 @@ pub mod util_routes {
     }
 }
 
-#[get("/peer/generate/<orbit>")]
+#[get("/peer/generate/<namespace>")]
 pub async fn open_host_key(
     s: &State<TinyCloud>,
-    orbit: &str,
+    namespace: &str,
 ) -> Result<String, (Status, &'static str)> {
     s.stage_key(
-        &orbit
+        &namespace
             .parse()
-            .map_err(|_| (Status::BadRequest, "Invalid orbit ID"))?,
+            .map_err(|_| (Status::BadRequest, "Invalid namespace ID"))?,
     )
     .await
     .map_err(|_| {
         (
             Status::InternalServerError,
-            "Failed to stage keypair for orbit",
+            "Failed to stage keypair for namespace",
         )
     })
 }
@@ -77,7 +77,7 @@ pub async fn delegate(
             .map_err(|e| {
                 (
                     match e {
-                        TxError::OrbitNotFound => Status::NotFound,
+                        TxError::NamespaceNotFound => Status::NotFound,
                         TxError::Db(DbErr::ConnectionAcquire) => Status::InternalServerError,
                         _ => Status::Unauthorized,
                     },
@@ -121,7 +121,7 @@ pub async fn invoke(
                 (Resource::TinyCloud(r), "tinycloud.kv/put")
                     if r.service().as_str() == "kv" && r.path().is_some() =>
                 {
-                    Some((r.orbit(), r.path()))
+                    Some((r.namespace(), r.path()))
                 }
                 _ => None,
             }
@@ -129,20 +129,20 @@ pub async fn invoke(
 
         let inputs = match (data, put_iter.next(), put_iter.next()) {
             (DataIn::None | DataIn::One(_), None, _) => HashMap::new(),
-            (DataIn::One(d), Some((orbit, Some(path))), None) => {
+            (DataIn::One(d), Some((namespace, Some(path))), None) => {
                 let mut stage = staging
-                    .stage(orbit)
+                    .stage(namespace)
                     .await
                     .map_err(|e| (Status::InternalServerError, e.to_string()))?;
                 let open_data = d.open(1u8.gigabytes()).compat();
 
                 if let Some(limit) = config.storage.limit {
                     let current_size = tinycloud
-                        .store_size(orbit)
+                        .store_size(namespace)
                         .await
                         .map_err(|e| (Status::InternalServerError, e.to_string()))?
-                        .ok_or_else(|| (Status::NotFound, "orbit not found".to_string()))?;
-                    // get the remaining allocated space for the given orbit storage
+                        .ok_or_else(|| (Status::NotFound, "namespace not found".to_string()))?;
+                    // get the remaining allocated space for the given namespace storage
                     match limit.as_u64().checked_sub(current_size) {
                         // the current size is already equal or greater than the limit
                         None | Some(0) => {
@@ -165,7 +165,7 @@ pub async fn invoke(
                 };
 
                 let mut inputs = HashMap::new();
-                inputs.insert((orbit.clone(), path.clone()), (headers.0, stage));
+                inputs.insert((namespace.clone(), path.clone()), (headers.0, stage));
                 inputs
             }
             (DataIn::Many(_), Some(_), Some(_)) => {
@@ -196,7 +196,7 @@ pub async fn invoke(
             .map_err(|e| {
                 (
                     match e {
-                        TxStoreError::Tx(TxError::OrbitNotFound) => Status::NotFound,
+                        TxStoreError::Tx(TxError::NamespaceNotFound) => Status::NotFound,
                         TxStoreError::Tx(TxError::Db(DbErr::ConnectionAcquire)) => {
                             Status::InternalServerError
                         }

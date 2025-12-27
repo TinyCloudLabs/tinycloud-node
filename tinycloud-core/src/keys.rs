@@ -5,7 +5,7 @@ use libp2p::identity::{
 use multihash_derive::Hasher;
 use sea_orm_migration::async_trait::async_trait;
 use std::error::Error as StdError;
-use tinycloud_lib::{multihash_codetable::Blake3_256, resource::OrbitId};
+use tinycloud_lib::{multihash_codetable::Blake3_256, resource::NamespaceId};
 
 pub use libp2p::{
     identity::{Keypair, PublicKey},
@@ -26,14 +26,14 @@ pub(crate) fn get_did_key(key: PublicKey) -> String {
 #[async_trait]
 pub trait Secrets {
     type Error: StdError;
-    async fn get_keypair(&self, orbit: &OrbitId) -> Result<Keypair, Self::Error>;
-    async fn get_pubkey(&self, orbit: &OrbitId) -> Result<PublicKey, Self::Error> {
-        Ok(self.get_keypair(orbit).await?.public())
+    async fn get_keypair(&self, namespace: &NamespaceId) -> Result<Keypair, Self::Error>;
+    async fn get_pubkey(&self, namespace: &NamespaceId) -> Result<PublicKey, Self::Error> {
+        Ok(self.get_keypair(namespace).await?.public())
     }
-    async fn stage_keypair(&self, orbit: &OrbitId) -> Result<PublicKey, Self::Error>;
-    async fn save_keypair(&self, orbit: &OrbitId) -> Result<(), Self::Error>;
-    async fn get_peer_id(&self, orbit: &OrbitId) -> Result<PeerId, Self::Error> {
-        Ok(self.get_pubkey(orbit).await?.to_peer_id())
+    async fn stage_keypair(&self, namespace: &NamespaceId) -> Result<PublicKey, Self::Error>;
+    async fn save_keypair(&self, namespace: &NamespaceId) -> Result<(), Self::Error>;
+    async fn get_peer_id(&self, namespace: &NamespaceId) -> Result<PeerId, Self::Error> {
+        Ok(self.get_pubkey(namespace).await?.to_peer_id())
     }
 }
 
@@ -63,17 +63,17 @@ impl StaticSecret {
 #[async_trait]
 impl Secrets for StaticSecret {
     type Error = DecodingError;
-    async fn get_keypair(&self, orbit: &OrbitId) -> Result<Keypair, Self::Error> {
+    async fn get_keypair(&self, namespace: &NamespaceId) -> Result<Keypair, Self::Error> {
         let mut hasher = Blake3_256::default();
         hasher.update(&self.secret);
-        hasher.update(orbit.to_string().as_bytes());
+        hasher.update(namespace.to_string().as_bytes());
         let derived = hasher.finalize().to_vec();
         Ok(EdKP::from(SecretKey::try_from_bytes(derived)?).into())
     }
-    async fn stage_keypair(&self, orbit: &OrbitId) -> Result<PublicKey, Self::Error> {
-        self.get_pubkey(orbit).await
+    async fn stage_keypair(&self, namespace: &NamespaceId) -> Result<PublicKey, Self::Error> {
+        self.get_pubkey(namespace).await
     }
-    async fn save_keypair(&self, _orbit: &OrbitId) -> Result<(), Self::Error> {
+    async fn save_keypair(&self, _namespace: &NamespaceId) -> Result<(), Self::Error> {
         Ok(())
     }
 }

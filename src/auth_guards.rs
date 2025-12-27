@@ -18,7 +18,7 @@ use tinycloud_core::{
 use tinycloud_lib::{
     authorization::{EncodingError, HeaderEncode},
     ipld_core::cid::Cid,
-    resource::OrbitId,
+    resource::NamespaceId,
 };
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tracing::{info_span, Instrument};
@@ -33,7 +33,7 @@ pub enum DataHolder<O, M = O> {
 #[derive(Debug)]
 pub struct InvOut<R>(pub InvocationOutcome<R>);
 
-pub type DataIn<'a> = DataHolder<Data<'a>, (OrbitId, String, Metadata, Capped<&'a [u8]>)>;
+pub type DataIn<'a> = DataHolder<Data<'a>, (NamespaceId, String, Metadata, Capped<&'a [u8]>)>;
 pub type DataOut<R> = DataHolder<InvOut<R>>;
 
 #[async_trait]

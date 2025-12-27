@@ -1,7 +1,7 @@
 use crate::{hash::Hash, storage::*};
 use futures::future::Either as AsyncEither;
 use sea_orm_migration::async_trait::async_trait;
-use tinycloud_lib::resource::OrbitId;
+use tinycloud_lib::resource::NamespaceId;
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum Either<A, B> {
@@ -25,20 +25,20 @@ where
 {
     type Readable = AsyncEither<A::Readable, B::Readable>;
     type Error = EitherError<A::Error, B::Error>;
-    async fn contains(&self, orbit: &OrbitId, id: &Hash) -> Result<bool, Self::Error> {
+    async fn contains(&self, namespace: &NamespaceId, id: &Hash) -> Result<bool, Self::Error> {
         match self {
-            Self::A(l) => l.contains(orbit, id).await.map_err(Self::Error::A),
-            Self::B(r) => r.contains(orbit, id).await.map_err(Self::Error::B),
+            Self::A(l) => l.contains(namespace, id).await.map_err(Self::Error::A),
+            Self::B(r) => r.contains(namespace, id).await.map_err(Self::Error::B),
         }
     }
     async fn read(
         &self,
-        orbit: &OrbitId,
+        namespace: &NamespaceId,
         id: &Hash,
     ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
         match self {
             Self::A(l) => l
-                .read(orbit, id)
+                .read(namespace, id)
                 .await
                 .map(|o| {
                     o.map(|c| {
@@ -48,7 +48,7 @@ where
                 })
                 .map_err(Self::Error::A),
             Self::B(r) => r
-                .read(orbit, id)
+                .read(namespace, id)
                 .await
                 .map(|o| {
                     o.map(|c| {
@@ -69,15 +69,15 @@ where
 {
     type Writable = AsyncEither<A::Writable, B::Writable>;
     type Error = EitherError<A::Error, B::Error>;
-    async fn get_staging_buffer(&self, orbit: &OrbitId) -> Result<Self::Writable, Self::Error> {
+    async fn get_staging_buffer(&self, namespace: &NamespaceId) -> Result<Self::Writable, Self::Error> {
         match self {
             Self::A(l) => l
-                .get_staging_buffer(orbit)
+                .get_staging_buffer(namespace)
                 .await
                 .map(AsyncEither::Left)
                 .map_err(Self::Error::A),
             Self::B(r) => r
-                .get_staging_buffer(orbit)
+                .get_staging_buffer(namespace)
                 .await
                 .map(AsyncEither::Right)
                 .map_err(Self::Error::B),
@@ -96,12 +96,12 @@ where
     type Error = EitherError<A::Error, B::Error>;
     async fn persist(
         &self,
-        orbit: &OrbitId,
+        namespace: &NamespaceId,
         staged: HashBuffer<S::Writable>,
     ) -> Result<Hash, Self::Error> {
         match self {
-            Self::A(a) => a.persist(orbit, staged).await.map_err(Self::Error::A),
-            Self::B(b) => b.persist(orbit, staged).await.map_err(Self::Error::B),
+            Self::A(a) => a.persist(namespace, staged).await.map_err(Self::Error::A),
+            Self::B(b) => b.persist(namespace, staged).await.map_err(Self::Error::B),
         }
     }
 }
@@ -128,10 +128,10 @@ where
     B: StorageSetup + Sync,
 {
     type Error = EitherError<A::Error, B::Error>;
-    async fn create(&self, orbit: &OrbitId) -> Result<(), Self::Error> {
+    async fn create(&self, namespace: &NamespaceId) -> Result<(), Self::Error> {
         match self {
-            Self::A(a) => a.create(orbit).await.map_err(Self::Error::A),
-            Self::B(b) => b.create(orbit).await.map_err(Self::Error::B),
+            Self::A(a) => a.create(namespace).await.map_err(Self::Error::A),
+            Self::B(b) => b.create(namespace).await.map_err(Self::Error::B),
         }
     }
 }
@@ -143,10 +143,10 @@ where
     B: ImmutableDeleteStore,
 {
     type Error = EitherError<A::Error, B::Error>;
-    async fn remove(&self, orbit: &OrbitId, id: &Hash) -> Result<Option<()>, Self::Error> {
+    async fn remove(&self, namespace: &NamespaceId, id: &Hash) -> Result<Option<()>, Self::Error> {
         match self {
-            Self::A(l) => l.remove(orbit, id).await.map_err(Self::Error::A),
-            Self::B(r) => r.remove(orbit, id).await.map_err(Self::Error::B),
+            Self::A(l) => l.remove(namespace, id).await.map_err(Self::Error::A),
+            Self::B(r) => r.remove(namespace, id).await.map_err(Self::Error::B),
         }
     }
 }
@@ -158,10 +158,10 @@ where
     B: StoreSize,
 {
     type Error = EitherError<A::Error, B::Error>;
-    async fn total_size(&self, orbit: &OrbitId) -> Result<Option<u64>, Self::Error> {
+    async fn total_size(&self, namespace: &NamespaceId) -> Result<Option<u64>, Self::Error> {
         match self {
-            Either::A(a) => a.total_size(orbit).await.map_err(EitherError::A),
-            Either::B(b) => b.total_size(orbit).await.map_err(EitherError::B),
+            Either::A(a) => a.total_size(namespace).await.map_err(EitherError::A),
+            Either::B(b) => b.total_size(namespace).await.map_err(EitherError::B),
         }
     }
 }

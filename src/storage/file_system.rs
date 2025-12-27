@@ -1,4 +1,4 @@
-use super::size::OrbitSizes;
+use super::size::NamespaceSizes;
 use core::pin::Pin;
 use futures::{
     future::{Either as AsyncEither, TryFutureExt},
@@ -15,7 +15,7 @@ use std::{
 };
 use tempfile::{NamedTempFile, PathPersistError};
 use tinycloud_core::{hash::Hash, storage::*};
-use tinycloud_lib::{resource::OrbitId, ssi::dids::DIDBuf};
+use tinycloud_lib::{resource::NamespaceId, ssi::dids::DIDBuf};
 use tokio::fs::{create_dir_all, metadata, remove_file, File};
 use tokio_stream::wrappers::ReadDirStream;
 
@@ -24,7 +24,7 @@ use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 #[derive(Debug, Clone)]
 pub struct FileSystemStore {
     path: PathBuf,
-    sizes: OrbitSizes,
+    sizes: NamespaceSizes,
 }
 
 impl FileSystemStore {
@@ -34,18 +34,18 @@ impl FileSystemStore {
         Ok(Self { path, sizes })
     }
 
-    fn get_path(&self, orbit: &OrbitId, mh: &Hash) -> PathBuf {
+    fn get_path(&self, namespace: &NamespaceId, mh: &Hash) -> PathBuf {
         self.path
-            .join(orbit.suffix())
-            .join(orbit.name().as_str())
+            .join(namespace.suffix())
+            .join(namespace.name().as_str())
             .join(base64::encode_config(mh.as_ref(), base64::URL_SAFE))
     }
 
-    async fn increment_size(&self, orbit: &OrbitId, size: u64) {
-        self.sizes.increment_size(orbit, size).await;
+    async fn increment_size(&self, namespace: &NamespaceId, size: u64) {
+        self.sizes.increment_size(namespace, size).await;
     }
-    async fn decrement_size(&self, orbit: &OrbitId, size: u64) {
-        self.sizes.decrement_size(orbit, size).await;
+    async fn decrement_size(&self, namespace: &NamespaceId, size: u64) {
+        self.sizes.decrement_size(namespace, size).await;
     }
 }
 
@@ -80,12 +80,12 @@ impl StorageConfig<FileSystemStore> for FileSystemConfig {
 #[async_trait]
 impl StorageSetup for FileSystemStore {
     type Error = IoError;
-    async fn create(&self, orbit: &OrbitId) -> Result<(), Self::Error> {
-        let path = self.path.join(orbit.suffix()).join(orbit.name().as_str());
+    async fn create(&self, namespace: &NamespaceId) -> Result<(), Self::Error> {
+        let path = self.path.join(namespace.suffix()).join(namespace.name().as_str());
         if !path.is_dir() {
             create_dir_all(&path).await?;
         }
-        self.sizes.init_size(orbit.clone()).await;
+        self.sizes.init_size(namespace.clone()).await;
         Ok(())
     }
 }
@@ -110,15 +110,15 @@ pub enum FileSystemStoreError {
 impl ImmutableReadStore for FileSystemStore {
     type Error = FileSystemStoreError;
     type Readable = Compat<File>;
-    async fn contains(&self, orbit: &OrbitId, id: &Hash) -> Result<bool, Self::Error> {
-        Ok(self.get_path(orbit, id).exists())
+    async fn contains(&self, namespace: &NamespaceId, id: &Hash) -> Result<bool, Self::Error> {
+        Ok(self.get_path(namespace, id).exists())
     }
     async fn read(
         &self,
-        orbit: &OrbitId,
+        namespace: &NamespaceId,
         id: &Hash,
     ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
-        match File::open(self.get_path(orbit, id)).await {
+        match File::open(self.get_path(namespace, id)).await {
             Ok(f) => Ok(Some(Content::new(f.metadata().await?.len(), f.compat()))),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
@@ -129,13 +129,13 @@ impl ImmutableReadStore for FileSystemStore {
 #[async_trait]
 impl StoreSize for FileSystemStore {
     type Error = FileSystemStoreError;
-    async fn total_size(&self, orbit: &OrbitId) -> Result<Option<u64>, Self::Error> {
-        Ok(self.sizes.get_size(orbit).await)
+    async fn total_size(&self, namespace: &NamespaceId) -> Result<Option<u64>, Self::Error> {
+        Ok(self.sizes.get_size(namespace).await)
     }
 }
 
-// get the sum size of all files in this directory (recurse into subdirectories with orbit ID names)
-async fn store_sizes<P: AsRef<Path>>(path: &P) -> Result<HashMap<OrbitId, u64>, IoError> {
+// get the sum size of all files in this directory (recurse into subdirectories with namespace ID names)
+async fn store_sizes<P: AsRef<Path>>(path: &P) -> Result<HashMap<NamespaceId, u64>, IoError> {
     ReadDirStream::new(tokio::fs::read_dir(path).await?)
         // for every entry in the store dir
         .try_fold(HashMap::new(), |mut acc, entry| async move {
@@ -156,11 +156,11 @@ async fn store_sizes<P: AsRef<Path>>(path: &P) -> Result<HashMap<OrbitId, u64>, 
                         entry.metadata().await?.is_dir(),
                         entry.file_name().into_string(),
                     ) {
-                        // get the orbit ID from suffix and name
-                        let orbit =
-                            OrbitId::new(did.clone(), name.try_into().map_err(IoError::other)?);
-                        let size = orbit_size(&entry.path()).await?;
-                        acc.insert(orbit, size);
+                        // get the namespace ID from suffix and name
+                        let namespace =
+                            NamespaceId::new(did.clone(), name.try_into().map_err(IoError::other)?);
+                        let size = namespace_size(&entry.path()).await?;
+                        acc.insert(namespace, size);
                     }
                 }
             };
@@ -169,7 +169,7 @@ async fn store_sizes<P: AsRef<Path>>(path: &P) -> Result<HashMap<OrbitId, u64>, 
         .await
 }
 
-async fn orbit_size<P: AsRef<Path>>(path: &P) -> Result<u64, IoError> {
+async fn namespace_size<P: AsRef<Path>>(path: &P) -> Result<u64, IoError> {
     // get the sum size of all files in this directory (do not recurse into subdirectories)
     ReadDirStream::new(tokio::fs::read_dir(path).await?)
         .try_fold(0, |acc, entry| async move {
@@ -222,7 +222,7 @@ impl AsyncWrite for TempFileStage {
 impl ImmutableStaging for TempFileSystemStage {
     type Error = FileSystemStoreError;
     type Writable = TempFileStage;
-    async fn get_staging_buffer(&self, _: &OrbitId) -> Result<Self::Writable, Self::Error> {
+    async fn get_staging_buffer(&self, _: &NamespaceId) -> Result<Self::Writable, Self::Error> {
         Ok(TempFileStage::new(NamedTempFile::new()?))
     }
 }
@@ -232,17 +232,17 @@ impl ImmutableWriteStore<TempFileSystemStage> for FileSystemStore {
     type Error = FileSystemStoreError;
     async fn persist(
         &self,
-        orbit: &OrbitId,
+        namespace: &NamespaceId,
         staged: HashBuffer<<TempFileSystemStage as ImmutableStaging>::Writable>,
     ) -> Result<Hash, Self::Error> {
         let (mut h, f) = staged.into_inner();
 
         let hash = h.finalize();
-        if !self.contains(orbit, &hash).await? {
+        if !self.contains(namespace, &hash).await? {
             let size = f.size().await?;
             let (_, path) = f.into_inner();
-            path.persist(self.get_path(orbit, &hash))?;
-            self.increment_size(orbit, size).await;
+            path.persist(self.get_path(namespace, &hash))?;
+            self.increment_size(namespace, size).await;
         }
         Ok(hash)
     }
@@ -253,18 +253,18 @@ impl ImmutableWriteStore<memory::MemoryStaging> for FileSystemStore {
     type Error = FileSystemStoreError;
     async fn persist(
         &self,
-        orbit: &OrbitId,
+        namespace: &NamespaceId,
         staged: HashBuffer<<memory::MemoryStaging as ImmutableStaging>::Writable>,
     ) -> Result<Hash, Self::Error> {
         let (mut h, v) = staged.into_inner();
         let hash = h.finalize();
-        if !self.contains(orbit, &hash).await? {
-            let file = File::create(self.get_path(orbit, &hash)).await?;
+        if !self.contains(namespace, &hash).await? {
+            let file = File::create(self.get_path(namespace, &hash)).await?;
             let size = v.len() as u64;
             let mut writer = futures::io::BufWriter::new(file.compat());
             writer.write_all(&v).await?;
             writer.flush().await?;
-            self.increment_size(orbit, size).await;
+            self.increment_size(namespace, size).await;
         }
         Ok(hash)
     }
@@ -277,27 +277,27 @@ impl ImmutableWriteStore<either::Either<TempFileSystemStage, memory::MemoryStagi
     type Error = FileSystemStoreError;
     async fn persist(
         &self,
-        orbit: &OrbitId,
+        namespace: &NamespaceId,
         staged: HashBuffer<<either::Either<TempFileSystemStage, memory::MemoryStaging> as ImmutableStaging>::Writable>,
     ) -> Result<Hash, Self::Error> {
         let (mut h, f) = staged.into_inner();
         let hash = h.finalize();
 
-        if !self.contains(orbit, &hash).await? {
+        if !self.contains(namespace, &hash).await? {
             match f {
                 AsyncEither::Left(t_file) => {
                     let size = t_file.size().await?;
                     let (_, path) = t_file.into_inner();
-                    path.persist(self.get_path(orbit, &hash))?;
-                    self.increment_size(orbit, size).await;
+                    path.persist(self.get_path(namespace, &hash))?;
+                    self.increment_size(namespace, size).await;
                 }
                 AsyncEither::Right(v) => {
-                    let file = File::create(self.get_path(orbit, &hash)).await?;
+                    let file = File::create(self.get_path(namespace, &hash)).await?;
                     let size = v.len() as u64;
                     let mut writer = futures::io::BufWriter::new(file.compat());
                     writer.write_all(&v).await?;
                     writer.flush().await?;
-                    self.increment_size(orbit, size).await;
+                    self.increment_size(namespace, size).await;
                 }
             }
         };
@@ -308,8 +308,8 @@ impl ImmutableWriteStore<either::Either<TempFileSystemStage, memory::MemoryStagi
 #[async_trait]
 impl ImmutableDeleteStore for FileSystemStore {
     type Error = FileSystemStoreError;
-    async fn remove(&self, orbit: &OrbitId, id: &Hash) -> Result<Option<()>, Self::Error> {
-        let path = self.get_path(orbit, id);
+    async fn remove(&self, namespace: &NamespaceId, id: &Hash) -> Result<Option<()>, Self::Error> {
+        let path = self.get_path(namespace, id);
         let size = match metadata(&path).await {
             Ok(m) => m.len(),
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
@@ -317,7 +317,7 @@ impl ImmutableDeleteStore for FileSystemStore {
         };
         match remove_file(path).await {
             Ok(()) => {
-                self.decrement_size(orbit, size).await;
+                self.decrement_size(namespace, size).await;
                 Ok(Some(()))
             }
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
@@ -345,27 +345,27 @@ mod test {
         let cfg = FileSystemConfig::new(dir.path());
         let store = cfg.open().await.unwrap();
         let data = b"hello world";
-        let orbit: OrbitId = "tinycloud:key:test:default".parse().unwrap();
-        assert_eq!(store.total_size(&orbit).await.unwrap(), None);
-        store.create(&orbit).await.unwrap();
-        assert_eq!(store.total_size(&orbit).await.unwrap(), Some(0));
+        let namespace: NamespaceId = "tinycloud:key:test:default".parse().unwrap();
+        assert_eq!(store.total_size(&namespace).await.unwrap(), None);
+        store.create(&namespace).await.unwrap();
+        assert_eq!(store.total_size(&namespace).await.unwrap(), Some(0));
         let tfs = TempFileSystemStage;
-        let mut stage = tfs.stage(&orbit).await.unwrap();
+        let mut stage = tfs.stage(&namespace).await.unwrap();
         futures::io::copy(&mut &data[..], &mut stage).await.unwrap();
 
-        let hash = ImmutableWriteStore::<TempFileSystemStage>::persist(&store, &orbit, stage)
+        let hash = ImmutableWriteStore::<TempFileSystemStage>::persist(&store, &namespace, stage)
             .await
             .unwrap();
 
-        assert!(store.contains(&orbit, &hash).await.unwrap());
+        assert!(store.contains(&namespace, &hash).await.unwrap());
         assert_eq!(
-            store.total_size(&orbit).await.unwrap(),
+            store.total_size(&namespace).await.unwrap(),
             Some(data.len() as u64)
         );
 
         let mut buf = Vec::new();
         store
-            .read(&orbit, &hash)
+            .read(&namespace, &hash)
             .await
             .unwrap()
             .unwrap()
@@ -375,13 +375,13 @@ mod test {
 
         assert_eq!(buf, data);
         assert_eq!(
-            store.read_to_vec(&orbit, &hash).await.unwrap().unwrap(),
+            store.read_to_vec(&namespace, &hash).await.unwrap().unwrap(),
             data
         );
-        assert_eq!(store.remove(&orbit, &hash).await.unwrap(), Some(()));
-        assert_eq!(store.remove(&orbit, &hash).await.unwrap(), None);
-        assert!(!store.contains(&orbit, &hash).await.unwrap());
-        assert_eq!(store.total_size(&orbit).await.unwrap(), Some(0));
-        assert_eq!(store.read(&orbit, &hash).await.unwrap().map(|_| ()), None);
+        assert_eq!(store.remove(&namespace, &hash).await.unwrap(), Some(()));
+        assert_eq!(store.remove(&namespace, &hash).await.unwrap(), None);
+        assert!(!store.contains(&namespace, &hash).await.unwrap());
+        assert_eq!(store.total_size(&namespace).await.unwrap(), Some(0));
+        assert_eq!(store.read(&namespace, &hash).await.unwrap().map(|_| ()), None);
     }
 }

@@ -4,10 +4,10 @@ import http from 'k6/http';
 export const tinycloud = __ENV.TINYCLOUD || "http://127.0.0.1:8000";
 export const signer = __ENV.SIGNER || "http://127.0.0.1:3000";
 
-export function setup_orbit(tinycloud, signer, id) {
-    let orbit_id = http.get(`${signer}/orbit_id/${id}`).body;
-    let peer_id = http.get(`${tinycloud}/peer/generate/${encodeURIComponent(orbit_id)}`).body;
-    let orbit_creation = http.post(`${signer}/orbits/${id}`,
+export function setup_namespace(tinycloud, signer, id) {
+    let namespace_id = http.get(`${signer}/namespace_id/${id}`).body;
+    let peer_id = http.get(`${tinycloud}/peer/generate/${encodeURIComponent(namespace_id)}`).body;
+    let namespace_creation = http.post(`${signer}/namespaces/${id}`,
         JSON.stringify({ peer_id }),
         {
             headers: {
@@ -17,12 +17,12 @@ export function setup_orbit(tinycloud, signer, id) {
     let res = http.post(`${tinycloud}/delegate`,
         null,
         {
-            headers: orbit_creation,
+            headers: namespace_creation,
         });
     check(res, {
-        'orbit creation is succesful': (r) => r.status === 200,
+        'namespace creation is succesful': (r) => r.status === 200,
     });
-    console.log(`[${id} CREATE ORBIT] (${res.headers["TinyCloud-Trace-Id"]}) -> ${res.status}`);
+    console.log(`[${id} CREATE NAMESPACE] (${res.headers["TinyCloud-Trace-Id"]}) -> ${res.status}`);
     let session_delegation = http.post(`${signer}/sessions/${id}/create`).json();
     res = http.post(`${tinycloud}/delegate`,
         null,

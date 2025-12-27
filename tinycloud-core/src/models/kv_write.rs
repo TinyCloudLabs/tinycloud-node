@@ -1,5 +1,5 @@
 use crate::hash::Hash;
-use crate::types::{Metadata, OrbitIdWrap, Path};
+use crate::types::{Metadata, NamespaceIdWrap, Path};
 use crate::{models::*, relationships::*};
 use sea_orm::entity::prelude::*;
 
@@ -7,7 +7,7 @@ use sea_orm::entity::prelude::*;
 #[sea_orm(table_name = "kv_write")]
 pub struct Model {
     #[sea_orm(primary_key)]
-    pub orbit: OrbitIdWrap,
+    pub namespace: NamespaceIdWrap,
     #[sea_orm(primary_key)]
     pub key: Path,
     #[sea_orm(primary_key)]
@@ -31,8 +31,8 @@ pub enum Relation {
     Deleted,
     #[sea_orm(
         belongs_to = "event_order::Entity",
-        from = "(Column::Epoch, Column::EpochSeq, Column::Orbit)",
-        to = "(event_order::Column::Epoch, event_order::Column::EpochSeq, event_order::Column::Orbit)"
+        from = "(Column::Epoch, Column::EpochSeq, Column::Namespace)",
+        to = "(event_order::Column::Epoch, event_order::Column::EpochSeq, event_order::Column::Namespace)"
     )]
     Ordering,
 }

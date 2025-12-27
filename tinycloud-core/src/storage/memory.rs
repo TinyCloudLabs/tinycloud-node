@@ -7,11 +7,11 @@ use dashmap::DashMap;
 use futures::io::Cursor;
 use sea_orm_migration::async_trait::async_trait;
 use std::{io, sync::Arc};
-use tinycloud_lib::resource::OrbitId;
+use tinycloud_lib::resource::NamespaceId;
 
 #[derive(Debug, Default, Clone)]
 pub struct MemoryStore {
-    orbits: Arc<DashMap<OrbitId, Arc<Blocks>>>,
+    namespaces: Arc<DashMap<NamespaceId, Arc<Blocks>>>,
 }
 
 type Blocks = DashMap<Hash, Vec<u8>>;
@@ -23,7 +23,7 @@ pub struct MemoryStaging;
 impl ImmutableStaging for MemoryStaging {
     type Writable = Vec<u8>;
     type Error = std::io::Error;
-    async fn get_staging_buffer(&self, _: &OrbitId) -> Result<Self::Writable, Self::Error> {
+    async fn get_staging_buffer(&self, _: &NamespaceId) -> Result<Self::Writable, Self::Error> {
         Ok(Vec::new())
     }
 }
@@ -50,9 +50,9 @@ impl StorageConfig<MemoryStore> for MemoryStoreConfig {
 #[async_trait]
 impl StorageSetup for MemoryStore {
     type Error = io::Error;
-    async fn create(&self, orbit: &OrbitId) -> Result<(), Self::Error> {
-        self.orbits
-            .entry(orbit.clone())
+    async fn create(&self, namespace: &NamespaceId) -> Result<(), Self::Error> {
+        self.namespaces
+            .entry(namespace.clone())
             .or_insert_with(|| Arc::new(DashMap::new()));
         Ok(())
     }
@@ -63,20 +63,20 @@ impl ImmutableReadStore for MemoryStore {
     type Error = io::Error;
     type Readable = Cursor<Vec<u8>>;
 
-    async fn contains(&self, orbit: &OrbitId, id: &Hash) -> Result<bool, Self::Error> {
+    async fn contains(&self, namespace: &NamespaceId, id: &Hash) -> Result<bool, Self::Error> {
         Ok(self
-            .orbits
-            .get(orbit)
+            .namespaces
+            .get(namespace)
             .map(|o| o.contains_key(id))
             .unwrap_or(false))
     }
 
     async fn read(
         &self,
-        orbit: &OrbitId,
+        namespace: &NamespaceId,
         id: &Hash,
     ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
-        match self.orbits.get(orbit) {
+        match self.namespaces.get(namespace) {
             Some(o) => match o.get(id) {
                 Some(data) => {
                     let len = data.len() as u64;
@@ -91,10 +91,10 @@ impl ImmutableReadStore for MemoryStore {
 
     async fn read_to_vec(
         &self,
-        orbit: &OrbitId,
+        namespace: &NamespaceId,
         id: &Hash,
     ) -> Result<Option<Vec<u8>>, VecReadError<Self::Error>> {
-        match self.orbits.get(orbit) {
+        match self.namespaces.get(namespace) {
             Some(o) => Ok(o.get(id).map(|data| data.clone())),
             None => Ok(None),
         }
@@ -107,26 +107,26 @@ impl ImmutableWriteStore<MemoryStaging> for MemoryStore {
 
     async fn persist(
         &self,
-        orbit: &OrbitId,
+        namespace: &NamespaceId,
         mut staged: HashBuffer<Vec<u8>>,
     ) -> Result<Hash, Self::Error> {
         let hash = staged.hash();
         let (_hasher, staging_buffer) = staged.into_inner();
         let data = staging_buffer;
 
-        let orbit_storage = self
-            .orbits
-            .entry(orbit.clone())
+        let namespace_storage = self
+            .namespaces
+            .entry(namespace.clone())
             .or_insert_with(|| Arc::new(DashMap::new()))
             .clone();
 
-        orbit_storage.insert(hash, data);
+        namespace_storage.insert(hash, data);
         Ok(hash)
     }
 
     async fn persist_keyed(
         &self,
-        orbit: &OrbitId,
+        namespace: &NamespaceId,
         mut staged: HashBuffer<Vec<u8>>,
         hash: &Hash,
     ) -> Result<(), KeyedWriteError<Self::Error>> {
@@ -136,13 +136,13 @@ impl ImmutableWriteStore<MemoryStaging> for MemoryStore {
         let (_hasher, staging_buffer) = staged.into_inner();
         let data = staging_buffer;
 
-        let orbit_storage = self
-            .orbits
-            .entry(orbit.clone())
+        let namespace_storage = self
+            .namespaces
+            .entry(namespace.clone())
             .or_insert_with(|| Arc::new(DashMap::new()))
             .clone();
 
-        orbit_storage.insert(*hash, data);
+        namespace_storage.insert(*hash, data);
         Ok(())
     }
 }
@@ -151,10 +151,10 @@ impl ImmutableWriteStore<MemoryStaging> for MemoryStore {
 impl ImmutableDeleteStore for MemoryStore {
     type Error = io::Error;
 
-    async fn remove(&self, orbit: &OrbitId, id: &Hash) -> Result<Option<()>, Self::Error> {
+    async fn remove(&self, namespace: &NamespaceId, id: &Hash) -> Result<Option<()>, Self::Error> {
         Ok(self
-            .orbits
-            .get(orbit)
+            .namespaces
+            .get(namespace)
             .and_then(|o| o.remove(id))
             .map(|_| ()))
     }
@@ -164,8 +164,8 @@ impl ImmutableDeleteStore for MemoryStore {
 impl StoreSize for MemoryStore {
     type Error = io::Error;
 
-    async fn total_size(&self, orbit: &OrbitId) -> Result<Option<u64>, Self::Error> {
-        Ok(self.orbits.get(orbit).map(|o| {
+    async fn total_size(&self, namespace: &NamespaceId) -> Result<Option<u64>, Self::Error> {
+        Ok(self.namespaces.get(namespace).map(|o| {
             o.iter()
                 .map(|entry| entry.value().len() as u64)
                 .sum::<u64>()

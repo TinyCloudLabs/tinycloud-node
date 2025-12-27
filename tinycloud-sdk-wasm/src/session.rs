@@ -14,7 +14,7 @@ use tinycloud_lib::{
     resolver::DID_METHODS,
     resource::{
         iri_string::types::{UriFragmentString, UriQueryString},
-        OrbitId, Path, ResourceId, Service,
+        NamespaceId, Path, ResourceId, Service,
     },
     siwe_recap::{Ability, Capability},
     ssi::{claims::chrono::Timelike, jwk::JWK},
@@ -35,7 +35,7 @@ pub struct SessionConfig {
     pub domain: Authority,
     #[serde_as(as = "DisplayFromStr")]
     pub issued_at: TimeStamp,
-    pub orbit_id: OrbitId,
+    pub namespace_id: NamespaceId,
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(default)]
     pub not_before: Option<TimeStamp>,
@@ -53,7 +53,7 @@ pub struct SessionConfig {
 #[serde(rename_all = "camelCase")]
 pub struct PreparedSession {
     pub jwk: JWK,
-    pub orbit_id: OrbitId,
+    pub namespace_id: NamespaceId,
     #[serde_as(as = "DisplayFromStr")]
     pub siwe: Message,
     pub verification_method: String,
@@ -77,7 +77,7 @@ pub struct Session {
     #[serde_as(as = "DisplayFromStr")]
     pub delegation_cid: Cid,
     pub jwk: JWK,
-    pub orbit_id: OrbitId,
+    pub namespace_id: NamespaceId,
     pub verification_method: String,
 }
 
@@ -91,7 +91,7 @@ impl SessionConfig {
                 |caps, (service, actions)| {
                     actions.into_iter().fold(caps, |mut caps, (path, action)| {
                         caps.with_actions(
-                            self.orbit_id
+                            self.namespace_id
                                 .clone()
                                 .to_resource(service.clone(), Some(path), None, None)
                                 .as_uri(),
@@ -127,7 +127,7 @@ impl SessionConfig {
 }
 
 impl Session {
-    /// Allows invoking ResourceId's with any OrbitId
+    /// Allows invoking ResourceId's with any NamespaceId
     pub fn invoke_any<A: IntoIterator<Item = Ability>>(
         &self,
         actions: impl IntoIterator<Item = (ResourceId, A)>,
@@ -163,7 +163,7 @@ impl Session {
         self.invoke_any(
             actions
                 .into_iter()
-                .map(|(s, p, q, f, a)| (self.orbit_id.clone().to_resource(s, Some(p), q, f), a)),
+                .map(|(s, p, q, f, a)| (self.namespace_id.clone().to_resource(s, Some(p), q, f), a)),
         )
     }
 }
@@ -186,14 +186,14 @@ pub fn prepare_session(config: SessionConfig) -> Result<PreparedSession, Error> 
         .to_string();
     verification_method.push_str(&fragment);
 
-    let orbit_id = config.orbit_id.clone();
+    let namespace_id = config.namespace_id.clone();
 
     let siwe = config
         .into_message(&verification_method)
         .map_err(Error::UnableToGenerateSIWEMessage)?;
 
     Ok(PreparedSession {
-        orbit_id,
+        namespace_id,
         jwk,
         verification_method,
         siwe,
@@ -217,7 +217,7 @@ pub fn complete_session_setup(signed_session: SignedSession) -> Result<Session, 
         delegation_header,
         delegation_cid,
         jwk: signed_session.session.jwk,
-        orbit_id: signed_session.session.orbit_id,
+        namespace_id: signed_session.session.namespace_id,
         verification_method: signed_session.session.verification_method,
     })
 }
@@ -255,7 +255,7 @@ pub mod test {
             "chainId": 1u8,
             "domain": "example.com",
             "issuedAt": "2022-01-01T00:00:00.000Z",
-            "orbitId": "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:default",
+            "namespaceId": "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:default",
             "expirationTime": "3000-01-01T00:00:00.000Z",
         });
         let prepared = prepare_session(serde_json::from_value(config).unwrap()).unwrap();
