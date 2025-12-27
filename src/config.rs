@@ -1,5 +1,5 @@
 use crate::{
-    allow_list::OrbitAllowListService,
+    allow_list::NamespaceAllowListService,
     storage::{file_system::FileSystemConfig, s3::S3BlockConfig},
     BlockConfig, BlockStage,
 };
@@ -16,7 +16,7 @@ use tinycloud_core::keys::StaticSecret;
 pub struct Config {
     pub log: Logging,
     pub storage: Storage,
-    pub orbits: OrbitsConfig,
+    pub namespaces: NamespacesConfig,
     pub relay: Relay,
     pub prometheus: Prometheus,
     pub cors: bool,
@@ -78,9 +78,9 @@ pub struct Tracing {
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
-pub struct OrbitsConfig {
+pub struct NamespacesConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub allowlist: Option<OrbitAllowListService>,
+    pub allowlist: Option<NamespaceAllowListService>,
 }
 
 #[serde_as]

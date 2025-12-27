@@ -45,12 +45,12 @@ impl FromStr for Name {
 #[derive(
     Clone, Hash, PartialEq, Debug, Eq, SerializeDisplay, DeserializeFromStr, PartialOrd, Ord,
 )]
-pub struct OrbitId {
+pub struct NamespaceId {
     base_did: DIDBuf,
     name: Name,
 }
 
-impl OrbitId {
+impl NamespaceId {
     pub fn new(base_did: DIDBuf, name: Name) -> Self {
         Self { base_did, name }
     }
@@ -82,7 +82,7 @@ impl OrbitId {
         fragment: Option<UriFragmentString>,
     ) -> ResourceId {
         ResourceId {
-            orbit: self,
+            namespace: self,
             service,
             path,
             query,
@@ -91,7 +91,7 @@ impl OrbitId {
     }
 }
 
-impl From<(DIDBuf, Name)> for OrbitId {
+impl From<(DIDBuf, Name)> for NamespaceId {
     fn from((base_did, name): (DIDBuf, Name)) -> Self {
         Self { base_did, name }
     }
@@ -166,7 +166,7 @@ impl FromStr for Path {
     Clone, Hash, PartialEq, Debug, Eq, SerializeDisplay, DeserializeFromStr, PartialOrd, Ord,
 )]
 pub struct ResourceId {
-    orbit: OrbitId,
+    namespace: NamespaceId,
     service: Service,
     path: Option<Path>,
     query: Option<UriQueryString>,
@@ -174,8 +174,8 @@ pub struct ResourceId {
 }
 
 impl ResourceId {
-    pub fn orbit(&self) -> &OrbitId {
-        &self.orbit
+    pub fn namespace(&self) -> &NamespaceId {
+        &self.namespace
     }
     pub fn service(&self) -> &Service {
         &self.service
@@ -190,8 +190,8 @@ impl ResourceId {
         self.fragment.as_ref()
     }
     pub fn extends(&self, base: &ResourceId) -> Result<(), ResourceCheckError> {
-        if base.orbit() != self.orbit() {
-            Err(ResourceCheckError::IncorrectOrbit)
+        if base.namespace() != self.namespace() {
+            Err(ResourceCheckError::IncorrectNamespace)
         } else if base.service() != self.service() {
             Err(ResourceCheckError::IncorrectService)
         } else if base.fragment() != self.fragment() {
@@ -213,14 +213,14 @@ impl ResourceId {
     pub fn into_inner(
         self,
     ) -> (
-        OrbitId,
+        NamespaceId,
         Service,
         Option<Path>,
         Option<UriQueryString>,
         Option<UriFragmentString>,
     ) {
         (
-            self.orbit,
+            self.namespace,
             self.service,
             self.path,
             self.query,
@@ -243,8 +243,8 @@ impl ResourceId {
 
 #[derive(Error, Debug)]
 pub enum ResourceCheckError {
-    #[error("Base and Extension Orbits do not match")]
-    IncorrectOrbit,
+    #[error("Base and Extension Namespaces do not match")]
+    IncorrectNamespace,
     #[error("Base and Extension Services do not match")]
     IncorrectService,
     #[error("Base and Extension Fragments do not match")]
@@ -253,7 +253,7 @@ pub enum ResourceCheckError {
     DoesNotExtendPath,
 }
 
-impl fmt::Display for OrbitId {
+impl fmt::Display for NamespaceId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "tinycloud:{}:{}", &self.suffix(), &self.name)
     }
@@ -261,7 +261,7 @@ impl fmt::Display for OrbitId {
 
 impl fmt::Display for ResourceId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}/{}", &self.orbit, self.service)?;
+        write!(f, "{}/{}", &self.namespace, self.service)?;
         if let Some(path) = self.path() {
             write!(f, "/{path}")?;
         }
@@ -291,7 +291,7 @@ pub enum KRIParseError {
     DidParse(#[from] ssi::dids::InvalidDID<String>),
 }
 
-impl TryFrom<&UriStr> for OrbitId {
+impl TryFrom<&UriStr> for NamespaceId {
     type Error = KRIParseError;
     fn try_from(uri: &UriStr) -> Result<Self, Self::Error> {
         if uri.scheme_str() != "tinycloud"
@@ -320,7 +320,7 @@ impl TryFrom<&UriStr> for OrbitId {
     }
 }
 
-impl FromStr for OrbitId {
+impl FromStr for NamespaceId {
     type Err = KRIParseError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         UriStr::new(s)?.try_into()
@@ -337,9 +337,9 @@ impl TryFrom<&UriStr> for ResourceId {
         {
             Err(KRIParseError::IncorrectForm)
         } else if let Some(((suf, name), (service, path))) =
-            uri.path_str().split_once('/').and_then(|(orbit, path)| {
+            uri.path_str().split_once('/').and_then(|(namespace, path)| {
                 Some((
-                    orbit.rsplit_once(':').and_then(|(suf, name)| {
+                    namespace.rsplit_once(':').and_then(|(suf, name)| {
                         if name.is_empty() {
                             None
                         } else {
@@ -352,7 +352,7 @@ impl TryFrom<&UriStr> for ResourceId {
             })
         {
             Ok(
-                OrbitId::new(["did:", suf].concat().try_into()?, Name(name.to_string()))
+                NamespaceId::new(["did:", suf].concat().try_into()?, Name(name.to_string()))
                     .to_resource(
                         Service(service.to_string()),
                         path.map(|p| Path(p.to_string())),
@@ -379,48 +379,48 @@ mod tests {
 
     #[test]
     fn basic() {
-        let res: ResourceId = "tinycloud:ens:example.eth:orbit0/kv/path/to/image.jpg"
+        let res: ResourceId = "tinycloud:ens:example.eth:ns0/kv/path/to/image.jpg"
             .parse()
             .unwrap();
 
-        assert_eq!("ens:example.eth", res.orbit().suffix());
-        assert_eq!("did:ens:example.eth", res.orbit().did().as_str());
-        assert_eq!("orbit0", res.orbit().name().as_str());
+        assert_eq!("ens:example.eth", res.namespace().suffix());
+        assert_eq!("did:ens:example.eth", res.namespace().did().as_str());
+        assert_eq!("ns0", res.namespace().name().as_str());
         assert_eq!("kv", res.service().as_str());
         assert_eq!(Some("path/to/image.jpg"), res.path().map(|p| p.as_str()));
         assert_eq!(None, res.fragment().as_ref());
         assert_eq!(None, res.query().as_ref());
 
-        let res2: ResourceId = "tinycloud:ens:example1.eth:orbit1/service#peer"
+        let res2: ResourceId = "tinycloud:ens:example1.eth:ns1/service#peer"
             .parse()
             .unwrap();
 
-        assert_eq!("ens:example1.eth", res2.orbit().suffix());
-        assert_eq!("did:ens:example1.eth", res2.orbit().did().as_str());
-        assert_eq!("orbit1", res2.orbit().name().as_str());
+        assert_eq!("ens:example1.eth", res2.namespace().suffix());
+        assert_eq!("did:ens:example1.eth", res2.namespace().did().as_str());
+        assert_eq!("ns1", res2.namespace().name().as_str());
         assert_eq!("service", res2.service().as_str());
         println!("{:#?}", res2.path());
         assert!(res2.path().is_none());
         assert_eq!("peer", res2.fragment().unwrap().as_str());
 
-        let res3: ResourceId = "tinycloud:ens:example2.eth:orbit2/kv/#list"
+        let res3: ResourceId = "tinycloud:ens:example2.eth:ns2/kv/#list"
             .parse()
             .unwrap();
 
-        assert_eq!("ens:example2.eth", res3.orbit().suffix());
-        assert_eq!("did:ens:example2.eth", res3.orbit().did().as_str());
-        assert_eq!("orbit2", res3.orbit().name().as_str());
+        assert_eq!("ens:example2.eth", res3.namespace().suffix());
+        assert_eq!("did:ens:example2.eth", res3.namespace().did().as_str());
+        assert_eq!("ns2", res3.namespace().name().as_str());
         assert_eq!("kv", res3.service().as_str());
         assert_eq!(Some(""), res3.path().map(|p| p.as_str()));
         assert_eq!("list", res3.fragment().unwrap());
 
-        let res4: ResourceId = "tinycloud:ens:example3.eth:orbit3/other/path/#list"
+        let res4: ResourceId = "tinycloud:ens:example3.eth:ns3/other/path/#list"
             .parse()
             .unwrap();
 
-        assert_eq!("ens:example3.eth", res4.orbit().suffix());
-        assert_eq!("did:ens:example3.eth", res4.orbit().did().as_str());
-        assert_eq!("orbit3", res4.orbit().name().as_str());
+        assert_eq!("ens:example3.eth", res4.namespace().suffix());
+        assert_eq!("did:ens:example3.eth", res4.namespace().did().as_str());
+        assert_eq!("ns3", res4.namespace().name().as_str());
         assert_eq!("other", res4.service().as_str());
         assert_eq!(Some("path/"), res4.path().map(|s| s.as_str()));
         assert_eq!("list", res4.fragment().unwrap());
@@ -428,7 +428,7 @@ mod tests {
 
     #[test]
     fn failures() {
-        let no_suffix: Result<ResourceId, _> = "tinycloud::orbit0/kv/path/to/image.jpg".parse();
+        let no_suffix: Result<ResourceId, _> = "tinycloud::ns0/kv/path/to/image.jpg".parse();
         assert!(no_suffix.is_err());
 
         let invalid_name: Result<ResourceId, _> =
@@ -438,14 +438,14 @@ mod tests {
 
     #[test]
     fn little_test() {
-        let _: OrbitId = "tinycloud:pkh:eth:0xb1fef8ed913821b941a76de9fc7c41b90de3d37f:default"
+        let _: NamespaceId = "tinycloud:pkh:eth:0xb1fef8ed913821b941a76de9fc7c41b90de3d37f:default"
             .parse()
             .unwrap();
     }
 
     #[test]
     fn roundtrip() {
-        let resource_uri: String = "tinycloud:ens:example.eth:orbit0/kv/prefix#list".into();
+        let resource_uri: String = "tinycloud:ens:example.eth:ns0/kv/prefix#list".into();
         let res: ResourceId = resource_uri.parse().unwrap();
         assert_eq!(resource_uri, res.to_string());
     }

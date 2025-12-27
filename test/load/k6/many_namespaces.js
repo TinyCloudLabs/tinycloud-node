@@ -5,7 +5,7 @@ import {
     randomString,
 } from 'https://jslib.k6.io/k6-utils/1.3.0/index.js';
 
-import { setup_orbit, tinycloud, signer } from './utils.js';
+import { setup_namespace, tinycloud, signer } from './utils.js';
 
 export const options = {
     iterations: 300,
@@ -14,7 +14,7 @@ export const options = {
 
 export default function() {
     const id = exec.scenario.iterationInTest;
-    setup_orbit(tinycloud, signer, id);
+    setup_namespace(tinycloud, signer, id);
 
     const key = randomString(15);
     let put_invocation = http.post(`${signer}/sessions/${id}/invoke`,

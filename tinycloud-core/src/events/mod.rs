@@ -11,7 +11,7 @@ pub use tinycloud_lib::{
     },
     ipld_core::cid::Cid,
     multihash_codetable::Code,
-    resource::{OrbitId, Path},
+    resource::{NamespaceId, Path},
 };
 
 #[derive(Debug)]
@@ -45,13 +45,13 @@ pub type Revocation = SerializedEvent<RevocationInfo>;
 #[derive(Debug, Hash, PartialEq, Eq)]
 pub(crate) enum Operation {
     KvWrite {
-        orbit: OrbitId,
+        namespace: NamespaceId,
         key: Path,
         value: Hash,
         metadata: Metadata,
     },
     KvDelete {
-        orbit: OrbitId,
+        namespace: NamespaceId,
         key: Path,
         version: Option<(i64, Hash, i64)>,
     },
@@ -61,12 +61,12 @@ impl Operation {
     pub fn version(self, seq: i64, epoch: Hash, epoch_seq: i64) -> VersionedOperation {
         match self {
             Self::KvWrite {
-                orbit,
+                namespace,
                 key,
                 value,
                 metadata,
             } => VersionedOperation::KvWrite {
-                orbit,
+                namespace,
                 key,
                 value,
                 metadata,
@@ -75,21 +75,21 @@ impl Operation {
                 epoch_seq,
             },
             Self::KvDelete {
-                orbit,
+                namespace,
                 key,
                 version,
             } => VersionedOperation::KvDelete {
-                orbit,
+                namespace,
                 key,
                 version,
             },
         }
     }
 
-    pub fn orbit(&self) -> &OrbitId {
+    pub fn namespace(&self) -> &NamespaceId {
         match self {
-            Self::KvWrite { orbit, .. } => orbit,
-            Self::KvDelete { orbit, .. } => orbit,
+            Self::KvWrite { namespace, .. } => namespace,
+            Self::KvDelete { namespace, .. } => namespace,
         }
     }
 }
@@ -97,7 +97,7 @@ impl Operation {
 #[derive(Debug, Hash, PartialEq, Eq)]
 pub(crate) enum VersionedOperation {
     KvWrite {
-        orbit: OrbitId,
+        namespace: NamespaceId,
         key: Path,
         value: Hash,
         metadata: Metadata,
@@ -106,7 +106,7 @@ pub(crate) enum VersionedOperation {
         epoch_seq: i64,
     },
     KvDelete {
-        orbit: OrbitId,
+        namespace: NamespaceId,
         key: Path,
         version: Option<(i64, Hash, i64)>,
     },
@@ -150,7 +150,7 @@ pub enum HashError {
 }
 
 pub(crate) fn epoch_hash(
-    orbit: &OrbitId,
+    namespace: &NamespaceId,
     events: &[&(Hash, Event)],
     parents: &[Hash],
 ) -> Result<Hash, HashError> {
@@ -160,7 +160,7 @@ pub(crate) fn epoch_hash(
             .iter()
             .map(|(h, e)| {
                 Ok(match e {
-                    Event::Invocation(_, ops) => hash_inv(h, orbit, ops)?,
+                    Event::Invocation(_, ops) => hash_inv(h, namespace, ops)?,
                     Event::Delegation(_) => OneOrMany::One(h.to_cid(RAW_CODEC)),
                     Event::Revocation(_) => OneOrMany::One(h.to_cid(RAW_CODEC)),
                 })
@@ -172,7 +172,7 @@ pub(crate) fn epoch_hash(
 const CBOR_CODEC: u64 = 0x71;
 const RAW_CODEC: u64 = 0x55;
 
-fn hash_inv(inv_hash: &Hash, o: &OrbitId, ops: &[Operation]) -> Result<OneOrMany, HashError> {
+fn hash_inv(inv_hash: &Hash, ns: &NamespaceId, ops: &[Operation]) -> Result<OneOrMany, HashError> {
     #[derive(Debug, Serialize)]
     #[serde(untagged)]
     enum Op<'a> {
@@ -191,20 +191,20 @@ fn hash_inv(inv_hash: &Hash, o: &OrbitId, ops: &[Operation]) -> Result<OneOrMany
         .iter()
         .filter_map(|op| match op {
             Operation::KvWrite {
-                orbit,
+                namespace,
                 key,
                 value,
                 metadata,
-            } if orbit == o => Some(Op::KvWrite {
+            } if namespace == ns => Some(Op::KvWrite {
                 key,
                 value: value.to_cid(CBOR_CODEC),
                 metadata,
             }),
             Operation::KvDelete {
-                orbit,
+                namespace,
                 key,
                 version,
-            } if orbit == o => Some(Op::KvDelete {
+            } if namespace == ns => Some(Op::KvDelete {
                 key,
                 version: version.map(|(v, h, s)| (v, h.to_cid(CBOR_CODEC), s)),
             }),

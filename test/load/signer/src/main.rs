@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc};
 use tinycloud_lib::{
     cacaos::siwe::TimeStamp,
-    resource::OrbitId,
+    resource::NamespaceId,
     ssi::{dids::DIDBuf, jwk::JWK},
 };
 use tinycloud_sdk_rs::{
@@ -34,7 +34,7 @@ struct User {
 async fn new_user(wallet: LocalWallet, jwk: JWK) -> User {
     let address = to_checksum(&wallet.address(), None);
     let did = format!("did:pkh:eip155:1:{address}");
-    let orbit_id = OrbitId::new(DIDBuf::from_str(&did).unwrap(), String::from("default"));
+    let namespace_id = NamespaceId::new(DIDBuf::from_str(&did).unwrap(), String::from("default"));
 
     let session_config = SessionConfig {
         actions: [(
@@ -55,7 +55,7 @@ async fn new_user(wallet: LocalWallet, jwk: JWK) -> User {
         address: wallet.address().into(),
         chain_id: 1,
         domain: "localhost".try_into().unwrap(),
-        orbit_id,
+        namespace_id,
         not_before: None,
         parents: None,
         jwk: Some(jwk),
@@ -87,13 +87,13 @@ struct InvokeParams {
 }
 
 #[derive(Serialize, Deserialize)]
-struct OrbitParams {
+struct NamespaceParams {
     peer_id: String,
 }
 
-async fn create_orbit(
+async fn create_namespace(
     Path(id): Path<u128>,
-    Json(params): Json<OrbitParams>,
+    Json(params): Json<NamespaceParams>,
     Extension(_jwk): Extension<Arc<JWK>>,
     Extension(users): Extension<Arc<RwLock<HashMap<u128, User>>>>,
 ) -> Json<DelegationHeaders> {
@@ -105,7 +105,7 @@ async fn create_orbit(
         chain_id: user.session_config.chain_id,
         domain: user.session_config.domain.clone(),
         issued_at: user.session_config.issued_at.clone(),
-        orbit_id: user.session_config.orbit_id.clone(),
+        namespace_id: user.session_config.namespace_id.clone(),
         peer_id: params.peer_id,
     })
     .unwrap();
@@ -117,7 +117,7 @@ async fn create_orbit(
     Json(delegation)
 }
 
-async fn get_orbit_id(
+async fn get_namespace_id(
     Path(id): Path<u128>,
     Extension(jwk): Extension<Arc<JWK>>,
     Extension(users): Extension<Arc<RwLock<HashMap<u128, User>>>>,
@@ -130,7 +130,7 @@ async fn get_orbit_id(
     let user = new_user(wallet, (*jwk).clone()).await;
     users.write().await.insert(id, user.clone());
 
-    user.session_config.orbit_id.to_string()
+    user.session_config.namespace_id.to_string()
 }
 
 async fn create_session(
@@ -169,8 +169,8 @@ async fn main() {
     let jwk = JWK::generate_ed25519().unwrap();
     let users: HashMap<u128, User> = HashMap::new();
     let app = Router::new()
-        .route("/orbit_id/:id", get(get_orbit_id))
-        .route("/orbits/:id", post(create_orbit))
+        .route("/namespace_id/:id", get(get_namespace_id))
+        .route("/namespaces/:id", post(create_namespace))
         .route("/sessions/:id/create", post(create_session))
         .route("/sessions/:id/invoke", post(invoke_session))
         .layer(Extension(Arc::new(RwLock::new(users))))

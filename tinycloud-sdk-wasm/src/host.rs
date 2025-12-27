@@ -8,7 +8,7 @@ use tinycloud_lib::{
         siwe::{generate_nonce, Message, TimeStamp, Version},
         siwe_cacao::{Header as SiweHeader, Signature, SiweCacao},
     },
-    resource::OrbitId,
+    resource::NamespaceId,
     siwe_recap::{Ability, Capability},
 };
 
@@ -25,7 +25,7 @@ pub struct HostConfig {
     pub domain: Authority,
     #[serde_as(as = "DisplayFromStr")]
     pub issued_at: TimeStamp,
-    pub orbit_id: OrbitId,
+    pub namespace_id: NamespaceId,
     pub peer_id: String,
 }
 
@@ -43,10 +43,10 @@ impl TryFrom<HostConfig> for Message {
     type Error = String;
     fn try_from(c: HostConfig) -> Result<Self, String> {
         let mut caps = Capability::<Value>::default();
-        let ab: Ability = "tinycloud.orbit/host".parse().unwrap();
+        let ab: Ability = "tinycloud.namespace/host".parse().unwrap();
         caps.with_action(
-            c.orbit_id
-                .to_resource("orbit".parse().unwrap(), None, None, None)
+            c.namespace_id
+                .to_resource("namespace".parse().unwrap(), None, None, None)
                 .as_uri(),
             ab,
             [],

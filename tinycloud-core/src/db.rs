@@ -8,7 +8,7 @@ use crate::storage::{
     either::EitherError, Content, HashBuffer, ImmutableDeleteStore, ImmutableReadStore,
     ImmutableStaging, ImmutableWriteStore, StorageSetup, StoreSize,
 };
-use crate::types::{Metadata, OrbitIdWrap, Resource};
+use crate::types::{Metadata, NamespaceIdWrap, Resource};
 use crate::util::{Capability, DelegationInfo};
 use sea_orm::{
     entity::prelude::*,
@@ -21,11 +21,11 @@ use sea_orm_migration::MigratorTrait;
 use std::collections::HashMap;
 use tinycloud_lib::{
     authorization::{EncodingError, TinyCloudDelegation},
-    resource::{OrbitId, Path},
+    resource::{NamespaceId, Path},
 };
 
 #[derive(Debug, Clone)]
-pub struct OrbitDatabase<C, B, S> {
+pub struct NamespaceDatabase<C, B, S> {
     conn: C,
     storage: B,
     secrets: S,
@@ -62,8 +62,8 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
     StoreSetup(S::Error),
     #[error(transparent)]
     Secrets(K::Error),
-    #[error("Orbit not found")]
-    OrbitNotFound,
+    #[error("Namespace not found")]
+    NamespaceNotFound,
 }
 
 #[non_exhaustive]
@@ -101,7 +101,7 @@ where
     }
 }
 
-impl<B, K> OrbitDatabase<DatabaseConnection, B, K> {
+impl<B, K> NamespaceDatabase<DatabaseConnection, B, K> {
     pub async fn new(conn: DatabaseConnection, storage: B, secrets: K) -> Result<Self, DbErr> {
         Migrator::up(&conn, None).await?;
         Ok(Self {
@@ -112,16 +112,16 @@ impl<B, K> OrbitDatabase<DatabaseConnection, B, K> {
     }
 }
 
-impl<C, B, K> OrbitDatabase<C, B, K>
+impl<C, B, K> NamespaceDatabase<C, B, K>
 where
     K: Secrets,
 {
-    pub async fn stage_key(&self, orbit: &OrbitId) -> Result<String, K::Error> {
-        self.secrets.stage_keypair(orbit).await.map(get_did_key)
+    pub async fn stage_key(&self, namespace: &NamespaceId) -> Result<String, K::Error> {
+        self.secrets.stage_keypair(namespace).await.map(get_did_key)
     }
 }
 
-impl<C, B, K> OrbitDatabase<C, B, K>
+impl<C, B, K> NamespaceDatabase<C, B, K>
 where
     C: TransactionTrait,
 {
@@ -133,16 +133,16 @@ where
     }
 }
 
-impl<C, B, K> OrbitDatabase<C, B, K>
+impl<C, B, K> NamespaceDatabase<C, B, K>
 where
     B: StoreSize,
 {
-    pub async fn store_size(&self, orbit: &OrbitId) -> Result<Option<u64>, B::Error> {
-        self.storage.total_size(orbit).await
+    pub async fn store_size(&self, namespace: &NamespaceId) -> Result<Option<u64>, B::Error> {
+        self.storage.total_size(namespace).await
     }
 }
 
-impl<C, B, K> OrbitDatabase<C, B, K>
+impl<C, B, K> NamespaceDatabase<C, B, K>
 where
     C: TransactionTrait,
 {
@@ -153,9 +153,9 @@ where
     }
 }
 
-pub type InvocationInputs<W> = HashMap<(OrbitId, Path), (Metadata, HashBuffer<W>)>;
+pub type InvocationInputs<W> = HashMap<(NamespaceId, Path), (Metadata, HashBuffer<W>)>;
 
-impl<C, B, K> OrbitDatabase<C, B, K>
+impl<C, B, K> NamespaceDatabase<C, B, K>
 where
     C: TransactionTrait,
     B: StorageSetup,
@@ -164,7 +164,7 @@ where
     async fn transact(
         &self,
         events: Vec<Event>,
-    ) -> Result<HashMap<OrbitId, Commit>, TxError<B, K>> {
+    ) -> Result<HashMap<NamespaceId, Commit>, TxError<B, K>> {
         let tx = self
             .conn
             .begin_with_config(Some(sea_orm::IsolationLevel::ReadUncommitted), None)
@@ -180,7 +180,7 @@ where
     pub async fn delegate(
         &self,
         delegation: Delegation,
-    ) -> Result<HashMap<OrbitId, Commit>, TxError<B, K>> {
+    ) -> Result<HashMap<NamespaceId, Commit>, TxError<B, K>> {
         self.transact(vec![Event::Delegation(Box::new(delegation))])
             .await
     }
@@ -188,7 +188,7 @@ where
     pub async fn revoke(
         &self,
         revocation: Revocation,
-    ) -> Result<HashMap<OrbitId, Commit>, TxError<B, K>> {
+    ) -> Result<HashMap<NamespaceId, Commit>, TxError<B, K>> {
         self.transact(vec![Event::Revocation(Box::new(revocation))])
             .await
     }
@@ -199,7 +199,7 @@ where
         mut inputs: InvocationInputs<S::Writable>,
     ) -> Result<
         (
-            HashMap<OrbitId, Commit>,
+            HashMap<NamespaceId, Commit>,
             Vec<InvocationOutcome<B::Readable>>,
         ),
         TxStoreError<B, S, K>,
@@ -215,33 +215,33 @@ where
         for cap in invocation.0.capabilities.iter() {
             match cap.resource.tinycloud_resource().and_then(|r| {
                 Some((
-                    r.orbit(),
+                    r.namespace(),
                     r.service().as_str(),
                     cap.ability.as_ref().as_ref(),
                     r.path()?,
                 ))
             }) {
                 // stage inputs for content writes
-                Some((orbit, "kv", "tinycloud.kv/put", path)) => {
+                Some((namespace, "kv", "tinycloud.kv/put", path)) => {
                     let (metadata, mut stage) = inputs
-                        .remove(&(orbit.clone(), path.clone()))
+                        .remove(&(namespace.clone(), path.clone()))
                         .ok_or(TxStoreError::MissingInput)?;
 
                     let value = stage.hash();
 
-                    stages.insert((orbit.clone(), path.clone()), stage);
+                    stages.insert((namespace.clone(), path.clone()), stage);
                     // add write for tx
                     ops.push(Operation::KvWrite {
-                        orbit: orbit.clone(),
+                        namespace: namespace.clone(),
                         key: path.clone(),
                         metadata,
                         value,
                     });
                 }
                 // add delete for tx
-                Some((orbit, "kv", "tinycloud.kv/del", path)) => {
+                Some((namespace, "kv", "tinycloud.kv/del", path)) => {
                     ops.push(Operation::KvDelete {
-                        orbit: orbit.clone(),
+                        namespace: namespace.clone(),
                         key: path.clone(),
                         version: None,
                     });
@@ -269,7 +269,7 @@ where
         for cap in caps.iter().filter_map(|c| {
             c.resource.tinycloud_resource().and_then(|r| {
                 Some((
-                    r.orbit(),
+                    r.namespace(),
                     r.service().as_str(),
                     c.ability.as_ref().as_ref(),
                     r.path()?,
@@ -277,44 +277,44 @@ where
             })
         }) {
             match cap {
-                (orbit, "kv", "tinycloud.kv/get", path) => results.push(InvocationOutcome::KvRead(
-                    get_kv(&tx, &self.storage, orbit, path)
+                (namespace, "kv", "tinycloud.kv/get", path) => results.push(InvocationOutcome::KvRead(
+                    get_kv(&tx, &self.storage, namespace, path)
                         .await
                         .map_err(|e| match e {
                             EitherError::A(e) => TxStoreError::Tx(e.into()),
                             EitherError::B(e) => TxStoreError::StoreRead(e),
                         })?,
                 )),
-                (orbit, "kv", "tinycloud.kv/list", path) => {
-                    results.push(InvocationOutcome::KvList(list(&tx, orbit, path).await?))
+                (namespace, "kv", "tinycloud.kv/list", path) => {
+                    results.push(InvocationOutcome::KvList(list(&tx, namespace, path).await?))
                 }
-                (orbit, "kv", "tinycloud.kv/del", path) => {
-                    let kv = get_kv_entity(&tx, orbit, path).await?;
+                (namespace, "kv", "tinycloud.kv/del", path) => {
+                    let kv = get_kv_entity(&tx, namespace, path).await?;
                     if let Some(kv) = kv {
                         self.storage
-                            .remove(orbit, &kv.value)
+                            .remove(namespace, &kv.value)
                             .await
                             .map_err(TxStoreError::StoreDelete)?;
                     }
                     results.push(InvocationOutcome::KvDelete)
                 }
-                (orbit, "kv", "tinycloud.kv/put", path) => {
-                    if let Some(stage) = stages.remove(&(orbit.clone(), path.clone())) {
+                (namespace, "kv", "tinycloud.kv/put", path) => {
+                    if let Some(stage) = stages.remove(&(namespace.clone(), path.clone())) {
                         self.storage
-                            .persist(orbit, stage)
+                            .persist(namespace, stage)
                             .await
                             .map_err(TxStoreError::StoreWrite)?;
                         results.push(InvocationOutcome::KvWrite)
                     }
                 }
-                (orbit, "kv", "tinycloud.kv/metadata", path) => results.push(
-                    InvocationOutcome::KvMetadata(metadata(&tx, orbit, path).await?),
+                (namespace, "kv", "tinycloud.kv/metadata", path) => results.push(
+                    InvocationOutcome::KvMetadata(metadata(&tx, namespace, path).await?),
                 ),
-                (orbit, "capabilities", "tinycloud.capabilities/read", path)
+                (namespace, "capabilities", "tinycloud.capabilities/read", path)
                     if path.as_str() == "all" =>
                 {
                     results.push(InvocationOutcome::OpenSessions(
-                        get_valid_delegations(&tx, orbit).await?,
+                        get_valid_delegations(&tx, namespace).await?,
                     ))
                 }
                 _ => {}
@@ -364,12 +364,12 @@ impl<S: StorageSetup, K: Secrets> From<revocation::Error> for TxError<S, K> {
     }
 }
 
-async fn event_orbits<'a, C: ConnectionTrait>(
+async fn event_namespaces<'a, C: ConnectionTrait>(
     db: &C,
     ev: &'a [(Hash, Event)],
-) -> Result<HashMap<OrbitId, Vec<&'a (Hash, Event)>>, DbErr> {
+) -> Result<HashMap<NamespaceId, Vec<&'a (Hash, Event)>>, DbErr> {
     // get orderings of events listed as revoked by events in the ev list
-    let mut orbits = HashMap::<OrbitId, Vec<&'a (Hash, Event)>>::new();
+    let mut namespaces = HashMap::<NamespaceId, Vec<&'a (Hash, Event)>>::new();
     let revoked_events = event_order::Entity::find()
         .filter(
             event_order::Column::Event.is_in(ev.iter().filter_map(|(_, e)| match e {
@@ -382,16 +382,16 @@ async fn event_orbits<'a, C: ConnectionTrait>(
     for e in ev {
         match &e.1 {
             Event::Delegation(d) => {
-                for orbit in d.0.orbits() {
-                    let entry = orbits.entry(orbit.clone()).or_default();
+                for namespace in d.0.namespaces() {
+                    let entry = namespaces.entry(namespace.clone()).or_default();
                     if !entry.iter().any(|(h, _)| h == &e.0) {
                         entry.push(e);
                     }
                 }
             }
             Event::Invocation(i, _) => {
-                for orbit in i.0.orbits() {
-                    let entry = orbits.entry(orbit.clone()).or_default();
+                for namespace in i.0.namespaces() {
+                    let entry = namespaces.entry(namespace.clone()).or_default();
                     if !entry.iter().any(|(h, _)| h == &e.0) {
                         entry.push(e);
                     }
@@ -401,7 +401,7 @@ async fn event_orbits<'a, C: ConnectionTrait>(
                 let r_hash = Hash::from(r.0.revoked);
                 for revoked in &revoked_events {
                     if r_hash == revoked.event {
-                        let entry = orbits.entry(revoked.orbit.0.clone()).or_default();
+                        let entry = namespaces.entry(revoked.namespace.0.clone()).or_default();
                         if !entry.iter().any(|(h, _)| h == &e.0) {
                             entry.push(e);
                         }
@@ -410,7 +410,7 @@ async fn event_orbits<'a, C: ConnectionTrait>(
             }
         }
     }
-    Ok(orbits)
+    Ok(namespaces)
 }
 
 pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
@@ -418,25 +418,25 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     store_setup: &S,
     secrets: &K,
     events: Vec<Event>,
-) -> Result<HashMap<OrbitId, Commit>, TxError<S, K>> {
-    // for each event, get the hash and the relevent orbit(s)
+) -> Result<HashMap<NamespaceId, Commit>, TxError<S, K>> {
+    // for each event, get the hash and the relevent namespace(s)
     let event_hashes = events
         .into_iter()
         .map(|e| (e.hash(), e))
         .collect::<Vec<(Hash, Event)>>();
-    let event_orbits = event_orbits(db, &event_hashes).await?;
-    let mut new_orbits = event_hashes
+    let event_namespaces = event_namespaces(db, &event_hashes).await?;
+    let mut new_namespaces = event_hashes
         .iter()
         .filter_map(|(_, e)| match e {
             Event::Delegation(d) => Some(d.0.capabilities.iter().filter_map(|c| {
                 match (&c.resource, c.ability.as_ref().as_ref()) {
-                    (Resource::TinyCloud(r), "tinycloud.orbit/host")
+                    (Resource::TinyCloud(r), "tinycloud.namespace/host")
                         if r.path().is_none()
-                            && r.service().as_str() == "orbit"
+                            && r.service().as_str() == "namespace"
                             && r.query().is_none()
                             && r.fragment().is_none() =>
                     {
-                        Some(OrbitIdWrap(r.orbit().clone()))
+                        Some(NamespaceIdWrap(r.namespace().clone()))
                     }
                     _ => None,
                 }
@@ -444,19 +444,19 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             _ => None,
         })
         .flatten()
-        .collect::<Vec<OrbitIdWrap>>();
-    new_orbits.dedup();
+        .collect::<Vec<NamespaceIdWrap>>();
+    new_namespaces.dedup();
 
-    if !new_orbits.is_empty() {
-        match orbit::Entity::insert_many(
-            new_orbits
+    if !new_namespaces.is_empty() {
+        match namespace::Entity::insert_many(
+            new_namespaces
                 .iter()
                 .cloned()
-                .map(|id| orbit::Model { id })
-                .map(orbit::ActiveModel::from),
+                .map(|id| namespace::Model { id })
+                .map(namespace::ActiveModel::from),
         )
         .on_conflict(
-            OnConflict::column(orbit::Column::Id)
+            OnConflict::column(namespace::Column::Id)
                 .do_nothing()
                 .to_owned(),
         )
@@ -470,69 +470,69 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         };
     }
 
-    // get max sequence for each of the orbits
+    // get max sequence for each of the namespaces
     let mut max_seqs = event_order::Entity::find()
-        .filter(event_order::Column::Orbit.is_in(event_orbits.keys().cloned().map(OrbitIdWrap)))
+        .filter(event_order::Column::Namespace.is_in(event_namespaces.keys().cloned().map(NamespaceIdWrap)))
         .select_only()
-        .column(event_order::Column::Orbit)
+        .column(event_order::Column::Namespace)
         .column_as(event_order::Column::Seq.max(), "max_seq")
-        .group_by(event_order::Column::Orbit)
-        .into_tuple::<(OrbitIdWrap, i64)>()
+        .group_by(event_order::Column::Namespace)
+        .into_tuple::<(NamespaceIdWrap, i64)>()
         .all(db)
         .await?
         .into_iter()
-        .fold(HashMap::new(), |mut m, (orbit, seq)| {
-            m.insert(orbit, seq + 1);
+        .fold(HashMap::new(), |mut m, (namespace, seq)| {
+            m.insert(namespace, seq + 1);
             m
         });
 
-    // get 'most recent' epochs for each of the orbits
+    // get 'most recent' epochs for each of the namespaces
     let mut most_recent = epoch::Entity::find()
         .select_only()
         .left_join(epoch_order::Entity)
         .filter(
             Condition::all()
-                .add(epoch::Column::Orbit.is_in(event_orbits.keys().cloned().map(OrbitIdWrap)))
+                .add(epoch::Column::Namespace.is_in(event_namespaces.keys().cloned().map(NamespaceIdWrap)))
                 .add(epoch_order::Column::Child.is_null()),
         )
-        .column(epoch::Column::Orbit)
+        .column(epoch::Column::Namespace)
         .column(epoch::Column::Id)
-        .into_tuple::<(OrbitIdWrap, Hash)>()
+        .into_tuple::<(NamespaceIdWrap, Hash)>()
         .all(db)
         .await?
         .into_iter()
         .fold(
             HashMap::new(),
-            |mut m: HashMap<OrbitIdWrap, Vec<Hash>>, (orbit, epoch)| {
-                m.entry(orbit).or_default().push(epoch);
+            |mut m: HashMap<NamespaceIdWrap, Vec<Hash>>, (namespace, epoch)| {
+                m.entry(namespace).or_default().push(epoch);
                 m
             },
         );
 
     // get all the orderings and associated data
-    let (epoch_order, orbit_order, event_order, epochs) = event_orbits
+    let (epoch_order, namespace_order, event_order, epochs) = event_namespaces
         .into_iter()
-        .map(|(orbit, events)| {
-            let parents = most_recent.remove(&orbit).unwrap_or_default();
-            let epoch = epoch_hash(&orbit, &events, &parents)?;
-            let seq = max_seqs.remove(&orbit).unwrap_or(0);
-            Ok((orbit, (epoch, events, seq, parents)))
+        .map(|(namespace, events)| {
+            let parents = most_recent.remove(&namespace).unwrap_or_default();
+            let epoch = epoch_hash(&namespace, &events, &parents)?;
+            let seq = max_seqs.remove(&namespace).unwrap_or(0);
+            Ok((namespace, (epoch, events, seq, parents)))
         })
         .collect::<Result<HashMap<_, _>, HashError>>()?
         .into_iter()
-        .map(|(orbit, (epoch, hashes, seq, parents))| {
+        .map(|(namespace, (epoch, hashes, seq, parents))| {
             (
                 parents
                     .iter()
                     .map(|parent| epoch_order::Model {
                         parent: *parent,
                         child: epoch,
-                        orbit: orbit.clone().into(),
+                        namespace: namespace.clone().into(),
                     })
                     .map(epoch_order::ActiveModel::from)
                     .collect::<Vec<epoch_order::ActiveModel>>(),
                 (
-                    orbit.clone(),
+                    namespace.clone(),
                     (
                         seq,
                         epoch,
@@ -549,7 +549,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                     .enumerate()
                     .map(|(es, (hash, _))| event_order::Model {
                         event: *hash,
-                        orbit: orbit.clone().into(),
+                        namespace: namespace.clone().into(),
                         seq,
                         epoch,
                         epoch_seq: es as i64,
@@ -559,14 +559,14 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                 epoch::Model {
                     seq,
                     id: epoch,
-                    orbit: orbit.into(),
+                    namespace: namespace.into(),
                 },
             )
         })
         .fold(
             (
                 Vec::<epoch_order::ActiveModel>::new(),
-                HashMap::<OrbitId, (i64, Hash, Vec<Hash>, HashMap<Hash, i64>)>::new(),
+                HashMap::<NamespaceId, (i64, Hash, Vec<Hash>, HashMap<Hash, i64>)>::new(),
                 Vec::<event_order::ActiveModel>::new(),
                 Vec::<epoch::ActiveModel>::new(),
             ),
@@ -584,7 +584,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         .exec(db)
         .await
         .map_err(|e| match e {
-            DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(_))) => TxError::OrbitNotFound,
+            DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(_))) => TxError::NamespaceNotFound,
             _ => e.into(),
         })?;
 
@@ -609,8 +609,8 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                     *i,
                     ops.into_iter()
                         .map(|op| {
-                            let v = orbit_order
-                                .get(op.orbit())
+                            let v = namespace_order
+                                .get(op.namespace())
                                 .and_then(|(s, e, _, h)| Some((s, e, h.get(&hash)?)))
                                 .unwrap();
                             op.version(*v.0, *v.1, *v.2)
@@ -623,18 +623,18 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         };
     }
 
-    for orbit in new_orbits {
+    for namespace in new_namespaces {
         store_setup
-            .create(&orbit.0)
+            .create(&namespace.0)
             .await
             .map_err(TxError::StoreSetup)?;
         secrets
-            .save_keypair(&orbit.0)
+            .save_keypair(&namespace.0)
             .await
             .map_err(TxError::Secrets)?;
     }
 
-    Ok(orbit_order
+    Ok(namespace_order
         .into_iter()
         .map(|(o, (seq, rev, consumed_epochs, h))| {
             (
@@ -652,7 +652,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
 
 async fn list<C: ConnectionTrait>(
     db: &C,
-    orbit: &OrbitId,
+    namespace: &NamespaceId,
     prefix: &Path,
 ) -> Result<Vec<Path>, DbErr> {
     // get content id for key from db
@@ -660,7 +660,7 @@ async fn list<C: ConnectionTrait>(
         .filter(
             Condition::all()
                 .add(kv_write::Column::Key.starts_with(prefix.as_str()))
-                .add(kv_write::Column::Orbit.eq(OrbitIdWrap(orbit.clone()))),
+                .add(kv_write::Column::Namespace.eq(NamespaceIdWrap(namespace.clone()))),
         )
         .find_also_related(kv_delete::Entity)
         .filter(kv_delete::Column::InvocationId.is_null())
@@ -675,11 +675,11 @@ async fn list<C: ConnectionTrait>(
 
 async fn metadata<C: ConnectionTrait>(
     db: &C,
-    orbit: &OrbitId,
+    namespace: &NamespaceId,
     key: &Path,
     // TODO version: Option<(i64, Hash, i64)>,
 ) -> Result<Option<Metadata>, DbErr> {
-    match get_kv_entity(db, orbit, key).await? {
+    match get_kv_entity(db, namespace, key).await? {
         Some(entry) => Ok(Some(entry.metadata)),
         None => Ok(None),
     }
@@ -688,18 +688,18 @@ async fn metadata<C: ConnectionTrait>(
 async fn get_kv<C: ConnectionTrait, B: ImmutableReadStore>(
     db: &C,
     store: &B,
-    orbit: &OrbitId,
+    namespace: &NamespaceId,
     key: &Path,
     // TODO version: Option<(i64, Hash, i64)>,
 ) -> Result<Option<(Metadata, Content<B::Readable>)>, EitherError<DbErr, B::Error>> {
-    let e = match get_kv_entity(db, orbit, key)
+    let e = match get_kv_entity(db, namespace, key)
         .await
         .map_err(EitherError::A)?
     {
         Some(entry) => entry,
         None => return Ok(None),
     };
-    let c = match store.read(orbit, &e.value).await.map_err(EitherError::B)? {
+    let c = match store.read(namespace, &e.value).await.map_err(EitherError::B)? {
         Some(c) => c,
         None => return Ok(None),
     };
@@ -708,18 +708,18 @@ async fn get_kv<C: ConnectionTrait, B: ImmutableReadStore>(
 
 async fn get_kv_entity<C: ConnectionTrait>(
     db: &C,
-    orbit: &OrbitId,
+    namespace: &NamespaceId,
     key: &Path,
     // TODO version: Option<(i64, Hash, i64)>,
 ) -> Result<Option<kv_write::Model>, DbErr> {
     // Ok(if let Some((seq, epoch, epoch_seq)) = version {
-    //     event_order::Entity::find_by_id((epoch, epoch_seq, orbit.clone().into()))
+    //     event_order::Entity::find_by_id((epoch, epoch_seq, namespace.clone().into()))
     //         .reverse_join(kv_write::Entity)
     //         .find_also_related(kv_delete::Entity)
     //         .filter(
     //             Condition::all()
     //                 .add(kv_write::Column::Key.eq(key))
-    //                 .add(kv_write::Column::Orbit.eq(orbit.clone().into()))
+    //                 .add(kv_write::Column::Namespace.eq(namespace.clone().into()))
     //                 .add(kv_delete::Column::InvocationId.is_null()),
     //         )
     //         .one(db)
@@ -731,7 +731,7 @@ async fn get_kv_entity<C: ConnectionTrait>(
         .filter(
             Condition::all()
                 .add(kv_write::Column::Key.eq(key.as_str()))
-                .add(kv_write::Column::Orbit.eq(OrbitIdWrap(orbit.clone()))),
+                .add(kv_write::Column::Namespace.eq(NamespaceIdWrap(namespace.clone()))),
         )
         .order_by_desc(kv_write::Column::Seq)
         .order_by_desc(kv_write::Column::Epoch)
@@ -745,7 +745,7 @@ async fn get_kv_entity<C: ConnectionTrait>(
 
 async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     db: &C,
-    orbit: &OrbitId,
+    namespace: &NamespaceId,
 ) -> Result<HashMap<Hash, DelegationInfo>, TxError<S, K>> {
     let (dels, abilities): (Vec<delegation::Model>, Vec<Vec<abilities::Model>>) =
         delegation::Entity::find()
@@ -765,7 +765,7 @@ async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         .filter_map(|((del, ability), parents)| {
             if del.expiry.map(|e| e > now).unwrap_or(true)
                 && del.not_before.map(|n| n <= now).unwrap_or(true)
-                && ability.iter().any(|a| a.resource.orbit() == Some(orbit))
+                && ability.iter().any(|a| a.resource.namespace() == Some(namespace))
             {
                 Some(match TinyCloudDelegation::from_bytes(&del.serialization) {
                     Ok(delegation) => Ok((
@@ -803,8 +803,8 @@ mod test {
     use super::*;
     use sea_orm::{ConnectOptions, Database};
 
-    async fn get_db() -> Result<OrbitDatabase<sea_orm::DbConn, MemoryStore, StaticSecret>, DbErr> {
-        OrbitDatabase::new(
+    async fn get_db() -> Result<NamespaceDatabase<sea_orm::DbConn, MemoryStore, StaticSecret>, DbErr> {
+        NamespaceDatabase::new(
             Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?,
             MemoryStore::default(),
             StaticSecret::new([0u8; 32].to_vec()).unwrap(),

@@ -18,9 +18,9 @@ use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 use std::{collections::HashMap, io::Error as IoError, ops::AddAssign};
 use tinycloud_core::{hash::Hash, storage::*};
-use tinycloud_lib::resource::OrbitId;
+use tinycloud_lib::resource::NamespaceId;
 
-use super::{file_system, size::OrbitSizes};
+use super::{file_system, size::NamespaceSizes};
 
 async fn aws_config() -> SdkConfig {
     aws_config::from_env().load().await
@@ -30,7 +30,7 @@ async fn aws_config() -> SdkConfig {
 pub struct S3BlockStore {
     pub client: Client,
     pub bucket: String,
-    sizes: OrbitSizes,
+    sizes: NamespaceSizes,
 }
 
 #[serde_as]
@@ -53,8 +53,8 @@ impl StorageConfig<S3BlockStore> for S3BlockConfig {
 #[async_trait]
 impl StorageSetup for S3BlockStore {
     type Error = std::convert::Infallible;
-    async fn create(&self, orbit: &OrbitId) -> Result<(), Self::Error> {
-        self.sizes.init_size(orbit.clone()).await;
+    async fn create(&self, namespace: &NamespaceId) -> Result<(), Self::Error> {
+        self.sizes.init_size(namespace.clone()).await;
         Ok(())
     }
 }
@@ -80,19 +80,19 @@ impl S3BlockStore {
             .send()
             // get the sum of all objects in each page
             .try_fold(HashMap::new(), |mut acc, page| async move {
-                // get the sum of all objects per orbit in this particular page
-                for (orbit, obj_size) in page.contents.into_iter().flatten().filter_map(|content| {
+                // get the sum of all objects per namespace in this particular page
+                for (namespace, obj_size) in page.contents.into_iter().flatten().filter_map(|content| {
                     content.key().and_then(|key| {
                         let (o, _) = key.rsplit_once('/')?;
-                        let orbit: OrbitId = o.parse().ok()?;
+                        let namespace: NamespaceId = o.parse().ok()?;
                         if content.size() > 0 {
-                            Some((orbit, content.size() as u64))
+                            Some((namespace, content.size() as u64))
                         } else {
                             None
                         }
                     })
                 }) {
-                    acc.entry(orbit).or_insert(0).add_assign(obj_size);
+                    acc.entry(namespace).or_insert(0).add_assign(obj_size);
                 }
                 Ok(acc)
             })
@@ -105,19 +105,19 @@ impl S3BlockStore {
         })
     }
 
-    fn key(&self, orbit: &OrbitId, id: &Hash) -> String {
+    fn key(&self, namespace: &NamespaceId, id: &Hash) -> String {
         format!(
             "{}/{}",
-            orbit,
+            namespace,
             base64::encode_config(id.as_ref(), base64::URL_SAFE)
         )
     }
 
-    async fn increment_size(&self, orbit: &OrbitId, size: u64) {
-        self.sizes.increment_size(orbit, size).await;
+    async fn increment_size(&self, namespace: &NamespaceId, size: u64) {
+        self.sizes.increment_size(namespace, size).await;
     }
-    async fn decrement_size(&self, orbit: &OrbitId, size: u64) {
-        self.sizes.decrement_size(orbit, size).await;
+    async fn decrement_size(&self, namespace: &NamespaceId, size: u64) {
+        self.sizes.decrement_size(namespace, size).await;
     }
 }
 
@@ -141,12 +141,12 @@ pub enum S3StoreError {
 impl ImmutableReadStore for S3BlockStore {
     type Error = S3StoreError;
     type Readable = IntoAsyncRead<MapErr<ByteStream, fn(ByteStreamError) -> IoError>>;
-    async fn contains(&self, orbit: &OrbitId, id: &Hash) -> Result<bool, Self::Error> {
+    async fn contains(&self, namespace: &NamespaceId, id: &Hash) -> Result<bool, Self::Error> {
         match self
             .client
             .head_object()
             .bucket(&self.bucket)
-            .key(self.key(orbit, id))
+            .key(self.key(namespace, id))
             .send()
             .await
         {
@@ -165,14 +165,14 @@ impl ImmutableReadStore for S3BlockStore {
 
     async fn read(
         &self,
-        orbit: &OrbitId,
+        namespace: &NamespaceId,
         id: &Hash,
     ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
         let res = self
             .client
             .get_object()
             .bucket(&self.bucket)
-            .key(self.key(orbit, id))
+            .key(self.key(namespace, id))
             .send()
             .await;
         match res {
@@ -200,23 +200,23 @@ impl ImmutableWriteStore<memory::MemoryStaging> for S3BlockStore {
     type Error = S3StoreError;
     async fn persist(
         &self,
-        orbit: &OrbitId,
+        namespace: &NamespaceId,
         staged: HashBuffer<<memory::MemoryStaging as ImmutableStaging>::Writable>,
     ) -> Result<Hash, Self::Error> {
         let (mut h, f) = staged.into_inner();
         let hash = h.finalize();
 
-        if !self.contains(orbit, &hash).await? {
+        if !self.contains(namespace, &hash).await? {
             let size = f.len() as u64;
             self.client
                 .put_object()
                 .bucket(&self.bucket)
-                .key(self.key(orbit, &hash))
+                .key(self.key(namespace, &hash))
                 .body(ByteStream::from(f))
                 .send()
                 .await
                 .map_err(S3Error::from)?;
-            self.increment_size(orbit, size).await;
+            self.increment_size(namespace, size).await;
         }
         Ok(hash)
     }
@@ -227,25 +227,25 @@ impl ImmutableWriteStore<file_system::TempFileSystemStage> for S3BlockStore {
     type Error = S3StoreError;
     async fn persist(
         &self,
-        orbit: &OrbitId,
+        namespace: &NamespaceId,
         staged: HashBuffer<<file_system::TempFileSystemStage as ImmutableStaging>::Writable>,
     ) -> Result<Hash, Self::Error> {
         let (mut h, f) = staged.into_inner();
         let hash = h.finalize();
 
-        if !self.contains(orbit, &hash).await? {
+        if !self.contains(namespace, &hash).await? {
             let size = f.size().await?;
             let (_file, path) = f.into_inner();
 
             self.client
                 .put_object()
                 .bucket(&self.bucket)
-                .key(self.key(orbit, &hash))
+                .key(self.key(namespace, &hash))
                 .body(ByteStream::from_path(&path).await?)
                 .send()
                 .await
                 .map_err(S3Error::from)?;
-            self.increment_size(orbit, size).await;
+            self.increment_size(namespace, size).await;
         }
         Ok(hash)
     }
@@ -258,13 +258,13 @@ impl ImmutableWriteStore<either::Either<file_system::TempFileSystemStage, memory
     type Error = S3StoreError;
     async fn persist(
         &self,
-        orbit: &OrbitId,
+        namespace: &NamespaceId,
         staged: HashBuffer<<either::Either<file_system::TempFileSystemStage, memory::MemoryStaging> as ImmutableStaging>::Writable>,
     ) -> Result<Hash, Self::Error> {
         let (mut h, f) = staged.into_inner();
         let hash = h.finalize();
 
-        if !self.contains(orbit, &hash).await? {
+        if !self.contains(namespace, &hash).await? {
             match f {
                 AsyncEither::Left(t_file) => {
                     let size = t_file.size().await?;
@@ -272,24 +272,24 @@ impl ImmutableWriteStore<either::Either<file_system::TempFileSystemStage, memory
                     self.client
                         .put_object()
                         .bucket(&self.bucket)
-                        .key(self.key(orbit, &hash))
+                        .key(self.key(namespace, &hash))
                         .body(ByteStream::from_path(&path).await?)
                         .send()
                         .await
                         .map_err(S3Error::from)?;
-                    self.increment_size(orbit, size).await;
+                    self.increment_size(namespace, size).await;
                 }
                 AsyncEither::Right(b) => {
                     let size = b.len() as u64;
                     self.client
                         .put_object()
                         .bucket(&self.bucket)
-                        .key(self.key(orbit, &hash))
+                        .key(self.key(namespace, &hash))
                         .body(ByteStream::from(b))
                         .send()
                         .await
                         .map_err(S3Error::from)?;
-                    self.increment_size(orbit, size).await;
+                    self.increment_size(namespace, size).await;
                 }
             }
         };
@@ -300,12 +300,12 @@ impl ImmutableWriteStore<either::Either<file_system::TempFileSystemStage, memory
 #[async_trait]
 impl ImmutableDeleteStore for S3BlockStore {
     type Error = S3StoreError;
-    async fn remove(&self, orbit: &OrbitId, id: &Hash) -> Result<Option<()>, Self::Error> {
+    async fn remove(&self, namespace: &NamespaceId, id: &Hash) -> Result<Option<()>, Self::Error> {
         let size: u64 = match self
             .client
             .get_object_attributes()
             .bucket(&self.bucket)
-            .key(self.key(orbit, id))
+            .key(self.key(namespace, id))
             .send()
             .await
         {
@@ -325,12 +325,12 @@ impl ImmutableDeleteStore for S3BlockStore {
             .client
             .delete_object()
             .bucket(&self.bucket)
-            .key(self.key(orbit, id))
+            .key(self.key(namespace, id))
             .send()
             .await
         {
             Ok(_) => {
-                self.decrement_size(orbit, size).await;
+                self.decrement_size(namespace, size).await;
                 Ok(Some(()))
             }
             // TODO does this distinguish between object missing and object present?
@@ -342,7 +342,7 @@ impl ImmutableDeleteStore for S3BlockStore {
 #[async_trait]
 impl StoreSize for S3BlockStore {
     type Error = S3StoreError;
-    async fn total_size(&self, orbit: &OrbitId) -> Result<Option<u64>, Self::Error> {
-        Ok(self.sizes.get_size(orbit).await)
+    async fn total_size(&self, namespace: &NamespaceId) -> Result<Option<u64>, Self::Error> {
+        Ok(self.sizes.get_size(namespace).await)
     }
 }

@@ -1,6 +1,6 @@
 use super::*;
 use crate::hash::Hash;
-use crate::types::{OrbitIdWrap, Path};
+use crate::types::{NamespaceIdWrap, Path};
 use sea_orm::entity::prelude::*;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
@@ -9,7 +9,7 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub invocation_id: Hash,
     #[sea_orm(primary_key)]
-    pub orbit: OrbitIdWrap,
+    pub namespace: NamespaceIdWrap,
 
     pub key: Path,
     pub deleted_invocation_id: Hash,
@@ -25,8 +25,8 @@ pub enum Relation {
     Invocation,
     #[sea_orm(
         belongs_to = "kv_write::Entity",
-        from = "(Column::Orbit, Column::DeletedInvocationId, Column::Key)",
-        to = "(kv_write::Column::Orbit, kv_write::Column::Invocation, kv_write::Column::Key)"
+        from = "(Column::Namespace, Column::DeletedInvocationId, Column::Key)",
+        to = "(kv_write::Column::Namespace, kv_write::Column::Invocation, kv_write::Column::Key)"
     )]
     Write,
 }

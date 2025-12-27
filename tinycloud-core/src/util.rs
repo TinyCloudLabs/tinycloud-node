@@ -5,7 +5,7 @@ use tinycloud_lib::{
     authorization::{TinyCloudDelegation, TinyCloudInvocation, TinyCloudRevocation},
     cacaos::siwe::Message,
     ipld_core::cid::Cid,
-    resource::OrbitId,
+    resource::NamespaceId,
     siwe_recap::{Capability as SiweCap, VerificationError as SiweError},
 };
 use ucan_capabilities_object::Capabilities as UcanCapabilities;
@@ -76,8 +76,8 @@ pub struct DelegationInfo {
 }
 
 impl DelegationInfo {
-    pub fn orbits(&self) -> impl Iterator<Item = &OrbitId> + '_ {
-        self.capabilities.iter().filter_map(|c| c.resource.orbit())
+    pub fn namespaces(&self) -> impl Iterator<Item = &NamespaceId> + '_ {
+        self.capabilities.iter().filter_map(|c| c.resource.namespace())
     }
 }
 
@@ -160,8 +160,8 @@ pub struct InvocationInfo {
 }
 
 impl InvocationInfo {
-    pub fn orbits(&self) -> impl Iterator<Item = &OrbitId> + '_ {
-        self.capabilities.iter().filter_map(|c| c.resource.orbit())
+    pub fn namespaces(&self) -> impl Iterator<Item = &NamespaceId> + '_ {
+        self.capabilities.iter().filter_map(|c| c.resource.namespace())
     }
 }
 
