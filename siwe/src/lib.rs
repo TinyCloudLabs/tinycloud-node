@@ -687,7 +687,7 @@ impl Message {
 }
 
 fn check_byte(hash: &[u8], i: usize) -> bool {
-    hash[i >> 1] & if i % 2 == 0 { 128 } else { 8 } != 0
+    hash[i >> 1] & if i.is_multiple_of(2) { 128 } else { 8 } != 0
 }
 
 #[derive(Error, Debug)]
