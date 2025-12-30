@@ -277,14 +277,16 @@ where
             })
         }) {
             match cap {
-                (namespace, "kv", "tinycloud.kv/get", path) => results.push(InvocationOutcome::KvRead(
-                    get_kv(&tx, &self.storage, namespace, path)
-                        .await
-                        .map_err(|e| match e {
-                            EitherError::A(e) => TxStoreError::Tx(e.into()),
-                            EitherError::B(e) => TxStoreError::StoreRead(e),
-                        })?,
-                )),
+                (namespace, "kv", "tinycloud.kv/get", path) => {
+                    results.push(InvocationOutcome::KvRead(
+                        get_kv(&tx, &self.storage, namespace, path)
+                            .await
+                            .map_err(|e| match e {
+                                EitherError::A(e) => TxStoreError::Tx(e.into()),
+                                EitherError::B(e) => TxStoreError::StoreRead(e),
+                            })?,
+                    ))
+                }
                 (namespace, "kv", "tinycloud.kv/list", path) => {
                     results.push(InvocationOutcome::KvList(list(&tx, namespace, path).await?))
                 }
@@ -472,7 +474,10 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
 
     // get max sequence for each of the namespaces
     let mut max_seqs = event_order::Entity::find()
-        .filter(event_order::Column::Namespace.is_in(event_namespaces.keys().cloned().map(NamespaceIdWrap)))
+        .filter(
+            event_order::Column::Namespace
+                .is_in(event_namespaces.keys().cloned().map(NamespaceIdWrap)),
+        )
         .select_only()
         .column(event_order::Column::Namespace)
         .column_as(event_order::Column::Seq.max(), "max_seq")
@@ -492,7 +497,10 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         .left_join(epoch_order::Entity)
         .filter(
             Condition::all()
-                .add(epoch::Column::Namespace.is_in(event_namespaces.keys().cloned().map(NamespaceIdWrap)))
+                .add(
+                    epoch::Column::Namespace
+                        .is_in(event_namespaces.keys().cloned().map(NamespaceIdWrap)),
+                )
                 .add(epoch_order::Column::Child.is_null()),
         )
         .column(epoch::Column::Namespace)
@@ -584,7 +592,9 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         .exec(db)
         .await
         .map_err(|e| match e {
-            DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(_))) => TxError::NamespaceNotFound,
+            DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(_))) => {
+                TxError::NamespaceNotFound
+            }
             _ => e.into(),
         })?;
 
@@ -699,7 +709,11 @@ async fn get_kv<C: ConnectionTrait, B: ImmutableReadStore>(
         Some(entry) => entry,
         None => return Ok(None),
     };
-    let c = match store.read(namespace, &e.value).await.map_err(EitherError::B)? {
+    let c = match store
+        .read(namespace, &e.value)
+        .await
+        .map_err(EitherError::B)?
+    {
         Some(c) => c,
         None => return Ok(None),
     };
@@ -765,7 +779,9 @@ async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         .filter_map(|((del, ability), parents)| {
             if del.expiry.map(|e| e > now).unwrap_or(true)
                 && del.not_before.map(|n| n <= now).unwrap_or(true)
-                && ability.iter().any(|a| a.resource.namespace() == Some(namespace))
+                && ability
+                    .iter()
+                    .any(|a| a.resource.namespace() == Some(namespace))
             {
                 Some(match TinyCloudDelegation::from_bytes(&del.serialization) {
                     Ok(delegation) => Ok((
@@ -803,7 +819,8 @@ mod test {
     use super::*;
     use sea_orm::{ConnectOptions, Database};
 
-    async fn get_db() -> Result<NamespaceDatabase<sea_orm::DbConn, MemoryStore, StaticSecret>, DbErr> {
+    async fn get_db() -> Result<NamespaceDatabase<sea_orm::DbConn, MemoryStore, StaticSecret>, DbErr>
+    {
         NamespaceDatabase::new(
             Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?,
             MemoryStore::default(),

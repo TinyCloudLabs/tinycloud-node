@@ -336,8 +336,10 @@ impl TryFrom<&UriStr> for ResourceId {
             || !uri.is_normalized()
         {
             Err(KRIParseError::IncorrectForm)
-        } else if let Some(((suf, name), (service, path))) =
-            uri.path_str().split_once('/').and_then(|(namespace, path)| {
+        } else if let Some(((suf, name), (service, path))) = uri
+            .path_str()
+            .split_once('/')
+            .and_then(|(namespace, path)| {
                 Some((
                     namespace.rsplit_once(':').and_then(|(suf, name)| {
                         if name.is_empty() {
@@ -403,9 +405,7 @@ mod tests {
         assert!(res2.path().is_none());
         assert_eq!("peer", res2.fragment().unwrap().as_str());
 
-        let res3: ResourceId = "tinycloud:ens:example2.eth:ns2/kv/#list"
-            .parse()
-            .unwrap();
+        let res3: ResourceId = "tinycloud:ens:example2.eth:ns2/kv/#list".parse().unwrap();
 
         assert_eq!("ens:example2.eth", res3.namespace().suffix());
         assert_eq!("did:ens:example2.eth", res3.namespace().did().as_str());

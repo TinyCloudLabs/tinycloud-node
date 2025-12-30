@@ -18,7 +18,7 @@ time.workspace = true
 cacaos.workspace = true
 siwe-recap.workspace = true
 lazy_static = "1.4"
-ssi = { git = "https://github.com/chunningham/ssi", rev = "137e3b1", features = ["ethereum"] }
+ssi = { git = "https://github.com/tinycloudlabs/ssi", features = ["ethereum"] }
 ucan-capabilities-object.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

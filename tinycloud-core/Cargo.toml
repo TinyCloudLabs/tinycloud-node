@@ -16,8 +16,8 @@ async-std = ["sea-orm/runtime-async-std-rustls"]
 
 [dependencies]
 dashmap = "5.5"
-sea-orm = { version = "0.11", default-features = false, features = ["macros", "with-time", "with-json", "sqlx", "sea-orm-internal", "sqlx-dep"] }
-sea-orm-migration = { version = "0.11", default-features = false }
+sea-orm = { version = "1.1", default-features = false, features = ["macros", "with-time", "with-json"] }
+sea-orm-migration = { version = "1.1", default-features = false }
 futures.workspace = true
 pin-project.workspace = true
 time.workspace = true
@@ -31,6 +31,6 @@ ucan-capabilities-object.workspace = true
 multihash-derive = "0.9"
 
 [dev-dependencies]
-sea-orm = { version = "0.11", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
+sea-orm = { version = "1.1", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
 async-std = { version = "1", features = ["attributes"] }
 tokio.workspace = true

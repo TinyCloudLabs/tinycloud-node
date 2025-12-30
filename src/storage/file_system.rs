@@ -81,7 +81,10 @@ impl StorageConfig<FileSystemStore> for FileSystemConfig {
 impl StorageSetup for FileSystemStore {
     type Error = IoError;
     async fn create(&self, namespace: &NamespaceId) -> Result<(), Self::Error> {
-        let path = self.path.join(namespace.suffix()).join(namespace.name().as_str());
+        let path = self
+            .path
+            .join(namespace.suffix())
+            .join(namespace.name().as_str());
         if !path.is_dir() {
             create_dir_all(&path).await?;
         }
@@ -382,6 +385,9 @@ mod test {
         assert_eq!(store.remove(&namespace, &hash).await.unwrap(), None);
         assert!(!store.contains(&namespace, &hash).await.unwrap());
         assert_eq!(store.total_size(&namespace).await.unwrap(), Some(0));
-        assert_eq!(store.read(&namespace, &hash).await.unwrap().map(|_| ()), None);
+        assert_eq!(
+            store.read(&namespace, &hash).await.unwrap().map(|_| ()),
+            None
+        );
     }
 }

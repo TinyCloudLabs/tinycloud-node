@@ -169,9 +169,9 @@ impl Session {
         >,
     ) -> Result<TinyCloudInvocation, InvocationError> {
         self.invoke_any(
-            actions
-                .into_iter()
-                .map(|(s, p, q, f, a)| (self.namespace_id.clone().to_resource(s, Some(p), q, f), a)),
+            actions.into_iter().map(|(s, p, q, f, a)| {
+                (self.namespace_id.clone().to_resource(s, Some(p), q, f), a)
+            }),
         )
     }
 }
