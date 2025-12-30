@@ -278,11 +278,11 @@ async fn save<C: ConnectionTrait>(
 }
 
 async fn save_actors<C: ConnectionTrait>(actors: &[&str], db: &C) -> Result<(), DbErr> {
-    match actor::Entity::insert_many(
-        actors
-            .iter()
-            .map(|a| actor::ActiveModel::from(actor::Model { id: ToString::to_string(a) })),
-    )
+    match actor::Entity::insert_many(actors.iter().map(|a| {
+        actor::ActiveModel::from(actor::Model {
+            id: ToString::to_string(a),
+        })
+    }))
     .on_conflict(
         OnConflict::column(actor::Column::Id)
             .do_nothing()
