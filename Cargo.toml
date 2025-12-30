@@ -87,3 +87,8 @@ tinycloud-sdk-rs = { path = "tinycloud-sdk-rs", version = "0.2.0" }
 siwe = { path = "siwe", version = "1.0.0" }
 siwe-recap = { path = "siwe-recap", version = "0.2.0" }
 cacaos = { path = "cacao", version = "0.5.1" }
+
+# Security patches for transitive dependencies
+[patch.crates-io]
+# Fix RUSTSEC-2025-0047: Out-of-bounds access in get_disjoint_mut (0.4.10 -> 0.4.11)
+slab = { git = "https://github.com/tokio-rs/slab", tag = "v0.4.11" }
