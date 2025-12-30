@@ -137,7 +137,7 @@ impl sea_orm::sea_query::ValueType for Hash {
     }
 
     fn column_type() -> sea_orm::sea_query::ColumnType {
-        sea_orm::sea_query::ColumnType::Binary(sea_orm::sea_query::table::BlobSize::Blob(None))
+        sea_orm::sea_query::ColumnType::Blob
     }
 }
 
