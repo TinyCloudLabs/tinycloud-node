@@ -77,7 +77,9 @@ pub struct DelegationInfo {
 
 impl DelegationInfo {
     pub fn namespaces(&self) -> impl Iterator<Item = &NamespaceId> + '_ {
-        self.capabilities.iter().filter_map(|c| c.resource.namespace())
+        self.capabilities
+            .iter()
+            .filter_map(|c| c.resource.namespace())
     }
 }
 
@@ -161,7 +163,9 @@ pub struct InvocationInfo {
 
 impl InvocationInfo {
     pub fn namespaces(&self) -> impl Iterator<Item = &NamespaceId> + '_ {
-        self.capabilities.iter().filter_map(|c| c.resource.namespace())
+        self.capabilities
+            .iter()
+            .filter_map(|c| c.resource.namespace())
     }
 }
 

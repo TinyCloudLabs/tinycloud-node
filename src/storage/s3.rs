@@ -81,17 +81,19 @@ impl S3BlockStore {
             // get the sum of all objects in each page
             .try_fold(HashMap::new(), |mut acc, page| async move {
                 // get the sum of all objects per namespace in this particular page
-                for (namespace, obj_size) in page.contents.into_iter().flatten().filter_map(|content| {
-                    content.key().and_then(|key| {
-                        let (o, _) = key.rsplit_once('/')?;
-                        let namespace: NamespaceId = o.parse().ok()?;
-                        if content.size() > 0 {
-                            Some((namespace, content.size() as u64))
-                        } else {
-                            None
-                        }
+                for (namespace, obj_size) in
+                    page.contents.into_iter().flatten().filter_map(|content| {
+                        content.key().and_then(|key| {
+                            let (o, _) = key.rsplit_once('/')?;
+                            let namespace: NamespaceId = o.parse().ok()?;
+                            if content.size() > 0 {
+                                Some((namespace, content.size() as u64))
+                            } else {
+                                None
+                            }
+                        })
                     })
-                }) {
+                {
                     acc.entry(namespace).or_insert(0).add_assign(obj_size);
                 }
                 Ok(acc)
