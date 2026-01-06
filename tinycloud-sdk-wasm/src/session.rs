@@ -192,6 +192,8 @@ pub fn prepare_session(config: SessionConfig) -> Result<PreparedSession, Error> 
         .ok_or_else(|| Error::UnableToGenerateSIWEMessage("Failed to calculate DID VM".into()))?
         .1
         .to_string();
+    // Create a proper DID URL with fragment: did:key:z6Mk...#z6Mk...
+    verification_method.push('#');
     verification_method.push_str(&fragment);
 
     let namespace_id = config.namespace_id.clone();
