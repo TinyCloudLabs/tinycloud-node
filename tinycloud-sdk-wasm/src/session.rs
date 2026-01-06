@@ -52,6 +52,11 @@ pub struct SessionConfig {
     pub parents: Option<Vec<Cid>>,
     #[serde(default)]
     pub jwk: Option<JWK>,
+    /// Optional delegate URI for user-to-user delegation.
+    /// If provided, this DID URL is used as the delegation target instead of
+    /// deriving one from the jwk. Used when delegating to another user's DID.
+    #[serde(default)]
+    pub delegate_uri: Option<String>,
 }
 
 #[serde_as]
@@ -183,18 +188,26 @@ pub fn prepare_session(config: SessionConfig) -> Result<PreparedSession, Error> 
     };
     jwk.algorithm = Some(tinycloud_lib::ssi::jwk::Algorithm::EdDSA);
 
-    // HACK bit of a hack here, because we know exactly how did:key works
-    // ideally we should use the did resolver to resolve the DID and find the
-    // right verification method, to support any arbitrary method.
-    let mut verification_method = DID_METHODS.generate(&jwk, "key")?.to_string();
-    let fragment = verification_method
-        .rsplit_once(':')
-        .ok_or_else(|| Error::UnableToGenerateSIWEMessage("Failed to calculate DID VM".into()))?
-        .1
-        .to_string();
-    // Create a proper DID URL with fragment: did:key:z6Mk...#z6Mk...
-    verification_method.push('#');
-    verification_method.push_str(&fragment);
+    // Determine the verification method (delegation target)
+    let verification_method = if let Some(delegate_uri) = &config.delegate_uri {
+        // For user-to-user delegation: use the provided delegate URI directly
+        delegate_uri.clone()
+    } else {
+        // For session key delegation: derive from the JWK
+        // HACK bit of a hack here, because we know exactly how did:key works
+        // ideally we should use the did resolver to resolve the DID and find the
+        // right verification method, to support any arbitrary method.
+        let mut vm = DID_METHODS.generate(&jwk, "key")?.to_string();
+        let fragment = vm
+            .rsplit_once(':')
+            .ok_or_else(|| Error::UnableToGenerateSIWEMessage("Failed to calculate DID VM".into()))?
+            .1
+            .to_string();
+        // Create a proper DID URL with fragment: did:key:z6Mk...#z6Mk...
+        vm.push('#');
+        vm.push_str(&fragment);
+        vm
+    };
 
     let namespace_id = config.namespace_id.clone();
 
