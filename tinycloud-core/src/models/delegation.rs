@@ -189,11 +189,20 @@ async fn validate<C: ConnectionTrait>(
                 .await?
                 .into_iter()
                 .filter(|p| {
-                    // valid time bounds
-                    p.expiry < delegation.expiry
-                        && p.not_before
-                            .map(|pnbf| delegation.not_before.map(|nbf| pnbf > nbf).unwrap_or(true))
-                            .unwrap_or(false)
+                    // valid time bounds: child's validity must be within parent's validity
+                    // expiry: child must expire at or before parent (None = no expiry)
+                    let expiry_valid = match (&p.expiry, &delegation.expiry) {
+                        (None, _) => true, // parent never expires, any child expiry is valid
+                        (Some(_), None) => false, // parent expires but child doesn't - invalid
+                        (Some(pe), Some(de)) => *de <= *pe, // child must expire at or before parent
+                    };
+                    // not_before: child must become valid at or after parent (None = valid immediately)
+                    let not_before_valid = match (&p.not_before, &delegation.not_before) {
+                        (None, _) => true, // parent valid immediately, any child not_before is valid
+                        (Some(_), None) => false, // parent has restriction but child claims immediate validity
+                        (Some(pnbf), Some(dnbf)) => *dnbf >= *pnbf, // child must become valid at or after parent
+                    };
+                    expiry_valid && not_before_valid
                 })
                 .collect();
 
