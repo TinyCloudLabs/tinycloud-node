@@ -1,7 +1,7 @@
 [package]
 name = "siwe-recap"
 description = "EIP-5573: Mechanism on top of Sign-In with Ethereum for informed consent to delegate capabilities with an extensible scope mechanism."
-license = "Apache-2.0 OR MIT"
+license-file = "../LICENSE.md"
 version = "0.2.0"
 edition = "2021"
 readme = "README.md"
