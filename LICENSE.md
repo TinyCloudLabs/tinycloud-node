@@ -1,6 +1,6 @@
 # TinyCloud Ecosystem General Public License (EGPL) v1.5
 
-License text copyright (c) 2025 TinyCloud Labs. Based on the Ethereum General Public License v1.5.
+License text copyright (c) 2026 TinyCloud Labs. Based on the Ethereum General Public License v1.5.
 Original EGPL copyright © 2025 [Lighthouse Labs](https://lighthouse.cx). All rights reserved.
 
 ## Parameters
@@ -8,7 +8,7 @@ Original EGPL copyright © 2025 [Lighthouse Labs](https://lighthouse.cx). All ri
 **Licensor:** TinyCloud Labs
 
 **Licensed Work:** TinyCloud Protocol
-The Licensed Work is © 2025 TinyCloud Labs
+The Licensed Work is © 2026 TinyCloud Labs
 
 **Additional Use Grant:** Implementation of TinyCloud protocol specifications
 
