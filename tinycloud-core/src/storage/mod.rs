@@ -76,18 +76,10 @@ pub trait ImmutableReadStore: Send + Sync {
 pub trait ImmutableStaging: Send + Sync {
     type Error: StdError + Send + Sync;
     type Writable: futures::io::AsyncWrite + Send + Sync;
-    async fn stage(
-        &self,
-        space: &SpaceId,
-    ) -> Result<HashBuffer<Self::Writable>, Self::Error> {
-        self.get_staging_buffer(space)
-            .await
-            .map(HashBuffer::new)
+    async fn stage(&self, space: &SpaceId) -> Result<HashBuffer<Self::Writable>, Self::Error> {
+        self.get_staging_buffer(space).await.map(HashBuffer::new)
     }
-    async fn get_staging_buffer(
-        &self,
-        space: &SpaceId,
-    ) -> Result<Self::Writable, Self::Error>;
+    async fn get_staging_buffer(&self, space: &SpaceId) -> Result<Self::Writable, Self::Error>;
 }
 
 #[async_trait]
@@ -164,10 +156,7 @@ where
 {
     type Error = S::Error;
     type Writable = S::Writable;
-    async fn get_staging_buffer(
-        &self,
-        space: &SpaceId,
-    ) -> Result<Self::Writable, Self::Error> {
+    async fn get_staging_buffer(&self, space: &SpaceId) -> Result<Self::Writable, Self::Error> {
         self.get_staging_buffer(space).await
     }
 }

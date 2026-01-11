@@ -11,7 +11,7 @@ pub use tinycloud_lib::{
     },
     ipld_core::cid::Cid,
     multihash_codetable::Code,
-    resource::{SpaceId, Path},
+    resource::{Path, SpaceId},
 };
 
 #[derive(Debug)]

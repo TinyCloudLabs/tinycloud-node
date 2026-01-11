@@ -81,19 +81,17 @@ impl S3BlockStore {
             // get the sum of all objects in each page
             .try_fold(HashMap::new(), |mut acc, page| async move {
                 // get the sum of all objects per space in this particular page
-                for (space, obj_size) in
-                    page.contents.into_iter().flatten().filter_map(|content| {
-                        content.key().and_then(|key| {
-                            let (o, _) = key.rsplit_once('/')?;
-                            let space: SpaceId = o.parse().ok()?;
-                            if content.size() > 0 {
-                                Some((space, content.size() as u64))
-                            } else {
-                                None
-                            }
-                        })
+                for (space, obj_size) in page.contents.into_iter().flatten().filter_map(|content| {
+                    content.key().and_then(|key| {
+                        let (o, _) = key.rsplit_once('/')?;
+                        let space: SpaceId = o.parse().ok()?;
+                        if content.size() > 0 {
+                            Some((space, content.size() as u64))
+                        } else {
+                            None
+                        }
                     })
-                {
+                }) {
                     acc.entry(space).or_insert(0).add_assign(obj_size);
                 }
                 Ok(acc)

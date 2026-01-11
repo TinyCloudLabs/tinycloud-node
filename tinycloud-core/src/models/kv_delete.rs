@@ -1,6 +1,6 @@
 use super::*;
 use crate::hash::Hash;
-use crate::types::{SpaceIdWrap, Path};
+use crate::types::{Path, SpaceIdWrap};
 use sea_orm::entity::prelude::*;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]

@@ -77,9 +77,7 @@ pub struct DelegationInfo {
 
 impl DelegationInfo {
     pub fn spaces(&self) -> impl Iterator<Item = &SpaceId> + '_ {
-        self.capabilities
-            .iter()
-            .filter_map(|c| c.resource.space())
+        self.capabilities.iter().filter_map(|c| c.resource.space())
     }
 }
 
@@ -163,9 +161,7 @@ pub struct InvocationInfo {
 
 impl InvocationInfo {
     pub fn spaces(&self) -> impl Iterator<Item = &SpaceId> + '_ {
-        self.capabilities
-            .iter()
-            .filter_map(|c| c.resource.space())
+        self.capabilities.iter().filter_map(|c| c.resource.space())
     }
 }
 

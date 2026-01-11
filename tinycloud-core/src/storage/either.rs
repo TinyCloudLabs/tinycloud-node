@@ -69,10 +69,7 @@ where
 {
     type Writable = AsyncEither<A::Writable, B::Writable>;
     type Error = EitherError<A::Error, B::Error>;
-    async fn get_staging_buffer(
-        &self,
-        space: &SpaceId,
-    ) -> Result<Self::Writable, Self::Error> {
+    async fn get_staging_buffer(&self, space: &SpaceId) -> Result<Self::Writable, Self::Error> {
         match self {
             Self::A(l) => l
                 .get_staging_buffer(space)

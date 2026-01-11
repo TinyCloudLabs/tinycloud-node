@@ -81,10 +81,7 @@ impl StorageConfig<FileSystemStore> for FileSystemConfig {
 impl StorageSetup for FileSystemStore {
     type Error = IoError;
     async fn create(&self, space: &SpaceId) -> Result<(), Self::Error> {
-        let path = self
-            .path
-            .join(space.suffix())
-            .join(space.name().as_str());
+        let path = self.path.join(space.suffix()).join(space.name().as_str());
         if !path.is_dir() {
             create_dir_all(&path).await?;
         }

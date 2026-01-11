@@ -1,5 +1,5 @@
 use crate::hash::Hash;
-use crate::types::{Metadata, SpaceIdWrap, Path};
+use crate::types::{Metadata, Path, SpaceIdWrap};
 use crate::{models::*, relationships::*};
 use sea_orm::entity::prelude::*;
 

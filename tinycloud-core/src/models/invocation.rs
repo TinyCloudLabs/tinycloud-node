@@ -4,7 +4,7 @@ use super::super::{
     relationships::*,
     util,
 };
-use crate::types::{Facts, SpaceIdWrap, Resource};
+use crate::types::{Facts, Resource, SpaceIdWrap};
 use crate::{hash::Hash, types::Ability};
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, Condition, ConnectionTrait, QueryOrder};
 use time::OffsetDateTime;

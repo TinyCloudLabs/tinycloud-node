@@ -336,10 +336,8 @@ impl TryFrom<&UriStr> for ResourceId {
             || !uri.is_normalized()
         {
             Err(KRIParseError::IncorrectForm)
-        } else if let Some(((suf, name), (service, path))) = uri
-            .path_str()
-            .split_once('/')
-            .and_then(|(space, path)| {
+        } else if let Some(((suf, name), (service, path))) =
+            uri.path_str().split_once('/').and_then(|(space, path)| {
                 Some((
                     space.rsplit_once(':').and_then(|(suf, name)| {
                         if name.is_empty() {

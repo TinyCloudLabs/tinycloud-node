@@ -14,7 +14,7 @@ use tinycloud_lib::{
     resolver::DID_METHODS,
     resource::{
         iri_string::types::{UriFragmentString, UriQueryString},
-        SpaceId, Path, ResourceId, Service,
+        Path, ResourceId, Service, SpaceId,
     },
     siwe_recap::{Ability, Capability},
     ssi::{claims::chrono::Timelike, jwk::JWK},
@@ -174,9 +174,9 @@ impl Session {
         >,
     ) -> Result<TinyCloudInvocation, InvocationError> {
         self.invoke_any(
-            actions.into_iter().map(|(s, p, q, f, a)| {
-                (self.space_id.clone().to_resource(s, Some(p), q, f), a)
-            }),
+            actions
+                .into_iter()
+                .map(|(s, p, q, f, a)| (self.space_id.clone().to_resource(s, Some(p), q, f), a)),
         )
     }
 }

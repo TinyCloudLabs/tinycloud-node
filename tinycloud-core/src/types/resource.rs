@@ -6,7 +6,7 @@ use tinycloud_lib::resource::{
         types::{UriStr, UriString},
         validate::Error as UriError,
     },
-    KRIParseError, SpaceId, ResourceId,
+    KRIParseError, ResourceId, SpaceId,
 };
 
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
