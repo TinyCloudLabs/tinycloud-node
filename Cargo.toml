@@ -3,7 +3,7 @@ name = "tinycloud"
 version = "0.2.0"
 authors = ["TinyCloud Protocol"]
 edition = "2021"
-license-file = "LICENSE.md"
+license-file = "LICENSE"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
