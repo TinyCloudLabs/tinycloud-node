@@ -1,7 +1,7 @@
 use libp2p::{Multiaddr, PeerId};
 use std::{convert::TryFrom, str::FromStr};
 use thiserror::Error;
-use tinycloud_lib::resource::{KRIParseError, Name, NamespaceId};
+use tinycloud_lib::resource::{KRIParseError, Name, SpaceId};
 use tinycloud_lib::ssi::dids::document::verification_method::ValueOrReference;
 use tinycloud_lib::ssi::dids::resolution::Output;
 use tinycloud_lib::ssi::dids::DID;
@@ -10,25 +10,25 @@ use tinycloud_lib::ssi::{
     one_or_many::OneOrMany,
 };
 
-/// An implementation of a Namespace Manifest.
+/// An implementation of a Space Manifest.
 ///
-/// Namespace Manifests are [DID Documents](https://www.w3.org/TR/did-spec-registries/#did-methods) used directly as the root of a capabilities
-/// authorization framework. This enables Namespaces to be managed using independant DID lifecycle management tools.
+/// Space Manifests are [DID Documents](https://www.w3.org/TR/did-spec-registries/#did-methods) used directly as the root of a capabilities
+/// authorization framework. This enables Spaces to be managed using independant DID lifecycle management tools.
 #[derive(Clone, Debug)]
 pub struct Manifest {
-    id: NamespaceId,
+    id: SpaceId,
     delegators: Vec<DIDURLBuf>,
     invokers: Vec<DIDURLBuf>,
     bootstrap_peers: BootstrapPeers,
 }
 
 impl Manifest {
-    /// ID of the Namespace, usually a DID
-    pub fn id(&self) -> &NamespaceId {
+    /// ID of the Space, usually a DID
+    pub fn id(&self) -> &SpaceId {
         &self.id
     }
 
-    /// The set of Peers discoverable from the Namespace Manifest.
+    /// The set of Peers discoverable from the Space Manifest.
     pub fn bootstrap_peers(&self) -> &BootstrapPeers {
         &self.bootstrap_peers
     }
@@ -44,7 +44,7 @@ impl Manifest {
     }
 
     pub async fn resolve<D: DIDResolver>(
-        id: &NamespaceId,
+        id: &SpaceId,
         resolver: &D,
     ) -> Result<Option<Self>, ResolutionError> {
         let Output {
@@ -62,7 +62,7 @@ impl Manifest {
 
 #[derive(Clone, Debug, Hash)]
 pub struct BootstrapPeers {
-    pub id: NamespaceId,
+    pub id: SpaceId,
     pub peers: Vec<BootstrapPeer>,
 }
 
@@ -74,7 +74,7 @@ pub struct BootstrapPeer {
 
 impl From<(Document, Name)> for Manifest {
     fn from((d, n): (Document, Name)) -> Self {
-        let id = NamespaceId::new(d.id.clone(), n);
+        let id = SpaceId::new(d.id.clone(), n);
         let bootstrap_peers = d
             .service(&id.to_string())
             .and_then(|s| BootstrapPeers::try_from(s).ok())
@@ -111,17 +111,17 @@ pub enum ResolutionError {
 #[derive(Error, Debug)]
 pub enum ServicePeersConversionError {
     #[error(transparent)]
-    NamespaceIdParse(#[from] KRIParseError),
+    SpaceIdParse(#[from] KRIParseError),
     #[error(transparent)]
     PeerIdParse(<PeerId as FromStr>::Err),
-    #[error("Missing TinyCloudNamespacePeer type string")]
+    #[error("Missing TinyCloudSpacePeer type string")]
     WrongType,
 }
 
 impl TryFrom<&Service> for BootstrapPeers {
     type Error = ServicePeersConversionError;
     fn try_from(s: &Service) -> Result<Self, Self::Error> {
-        if s.type_.any(|t| t == "TinyCloudNamespacePeers") {
+        if s.type_.any(|t| t == "TinyCloudSpacePeers") {
             Ok(Self {
                 id: s.id.as_str().parse()?,
                 peers: s
@@ -176,9 +176,9 @@ mod tests {
         let did = DID_METHODS.generate(&j, "pkh:eth").unwrap();
 
         println!("DID: {did:#?}");
-        let namespace = NamespaceId::new(did, "namespace_name".parse().unwrap());
+        let space = SpaceId::new(did, "space_name".parse().unwrap());
 
-        let md = Manifest::resolve(&namespace, &AnyDidMethod::default())
+        let md = Manifest::resolve(&space, &AnyDidMethod::default())
             .await
             .unwrap()
             .unwrap();

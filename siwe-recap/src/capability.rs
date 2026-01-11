@@ -179,7 +179,7 @@ impl<NB> Capability<NB> {
             .flat_map(|(resource, abilities)| {
                 // Group abilities by their ReCap ability namespace (the action category).
                 // Note: This "ability namespace" (e.g., "kv", "tinycloud.kv") is distinct from
-                // TinyCloud's user namespace (data container), which appears in the resource URI.
+                // TinyCloud's Space (data container), which appears in the resource URI.
                 abilities
                     .iter()
                     .fold(

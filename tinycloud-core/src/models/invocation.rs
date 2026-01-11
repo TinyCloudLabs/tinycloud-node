@@ -4,7 +4,7 @@ use super::super::{
     relationships::*,
     util,
 };
-use crate::types::{Facts, NamespaceIdWrap, Resource};
+use crate::types::{Facts, SpaceIdWrap, Resource};
 use crate::{hash::Hash, types::Ability};
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, Condition, ConnectionTrait, QueryOrder};
 use time::OffsetDateTime;
@@ -113,7 +113,7 @@ async fn validate<C: ConnectionTrait>(
         .filter(|c| {
             // remove caps for which the invoker is the root authority
             c.resource
-                .namespace()
+                .space()
                 .map(|o| **o.did() != *invocation.invoker)
                 .unwrap_or(true)
         })
@@ -239,7 +239,7 @@ async fn save<C: ConnectionTrait>(
                 key,
                 value,
                 metadata,
-                namespace,
+                space,
                 seq,
                 epoch,
                 epoch_seq,
@@ -248,7 +248,7 @@ async fn save<C: ConnectionTrait>(
                     invocation: hash,
                     key: key.into(),
                     value,
-                    namespace: namespace.into(),
+                    space: space.into(),
                     metadata,
                     seq,
                     epoch,
@@ -260,13 +260,13 @@ async fn save<C: ConnectionTrait>(
             VersionedOperation::KvDelete {
                 key,
                 version,
-                namespace,
+                space,
             } => {
                 let deleted_invocation_id = if let Some((s, e, es)) = version {
                     kv_write::Entity::find().filter(
                         Condition::all()
                             .add(kv_write::Column::Key.eq(key.as_str()))
-                            .add(kv_write::Column::Namespace.eq(NamespaceIdWrap(namespace.clone())))
+                            .add(kv_write::Column::Space.eq(SpaceIdWrap(space.clone())))
                             .add(kv_write::Column::Seq.eq(s))
                             .add(kv_write::Column::Epoch.eq(e))
                             .add(kv_write::Column::EpochSeq.eq(es)),
@@ -274,7 +274,7 @@ async fn save<C: ConnectionTrait>(
                 } else {
                     kv_write::Entity::find()
                         .filter(kv_write::Column::Key.eq(key.as_str()))
-                        .filter(kv_write::Column::Namespace.eq(NamespaceIdWrap(namespace.clone())))
+                        .filter(kv_write::Column::Space.eq(SpaceIdWrap(space.clone())))
                         .order_by_desc(kv_write::Column::Seq)
                         .order_by_desc(kv_write::Column::Epoch)
                         .order_by_desc(kv_write::Column::EpochSeq)
@@ -286,7 +286,7 @@ async fn save<C: ConnectionTrait>(
                 kv_delete::Entity::insert(kv_delete::ActiveModel::from(kv_delete::Model {
                     key: key.into(),
                     invocation_id: hash,
-                    namespace: namespace.into(),
+                    space: space.into(),
                     deleted_invocation_id,
                 }))
                 .exec(db)

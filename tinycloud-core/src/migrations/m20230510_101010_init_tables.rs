@@ -11,7 +11,7 @@ impl MigrationTrait for Migration {
         let schema = Schema::new(manager.get_database_backend());
 
         manager
-            .create_table(schema.create_table_from_entity(namespace::Entity))
+            .create_table(schema.create_table_from_entity(space::Entity))
             .await?;
         manager
             .create_table(schema.create_table_from_entity(actor::Entity))
@@ -56,7 +56,7 @@ impl MigrationTrait for Migration {
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
-            .drop_table(Table::drop().table(namespace::Entity).to_owned())
+            .drop_table(Table::drop().table(space::Entity).to_owned())
             .await?;
         manager
             .drop_table(Table::drop().table(epoch::Entity).to_owned())
