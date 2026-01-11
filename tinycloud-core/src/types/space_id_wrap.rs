@@ -1,67 +1,67 @@
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use tinycloud_lib::resource::NamespaceId;
+use tinycloud_lib::resource::SpaceId;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq, Hash, PartialOrd, Ord)]
-pub struct NamespaceIdWrap(pub NamespaceId);
+pub struct SpaceIdWrap(pub SpaceId);
 
-impl From<NamespaceId> for NamespaceIdWrap {
-    fn from(id: NamespaceId) -> Self {
+impl From<SpaceId> for SpaceIdWrap {
+    fn from(id: SpaceId) -> Self {
         Self(id)
     }
 }
 
-impl From<NamespaceIdWrap> for NamespaceId {
-    fn from(id: NamespaceIdWrap) -> Self {
+impl From<SpaceIdWrap> for SpaceId {
+    fn from(id: SpaceIdWrap) -> Self {
         id.0
     }
 }
 
-impl AsRef<NamespaceId> for NamespaceIdWrap {
-    fn as_ref(&self) -> &NamespaceId {
+impl AsRef<SpaceId> for SpaceIdWrap {
+    fn as_ref(&self) -> &SpaceId {
         &self.0
     }
 }
 
-impl core::borrow::Borrow<NamespaceId> for NamespaceIdWrap {
-    fn borrow(&self) -> &NamespaceId {
+impl core::borrow::Borrow<SpaceId> for SpaceIdWrap {
+    fn borrow(&self) -> &SpaceId {
         &self.0
     }
 }
 
-impl PartialEq<NamespaceId> for NamespaceIdWrap {
-    fn eq(&self, other: &NamespaceId) -> bool {
+impl PartialEq<SpaceId> for SpaceIdWrap {
+    fn eq(&self, other: &SpaceId) -> bool {
         self.0 == *other
     }
 }
 
-impl From<NamespaceIdWrap> for Value {
-    fn from(o: NamespaceIdWrap) -> Self {
+impl From<SpaceIdWrap> for Value {
+    fn from(o: SpaceIdWrap) -> Self {
         Value::String(Some(Box::new(o.0.to_string())))
     }
 }
 
-impl sea_orm::TryGetable for NamespaceIdWrap {
+impl sea_orm::TryGetable for SpaceIdWrap {
     fn try_get_by<I: sea_orm::ColIdx>(
         res: &QueryResult,
         idx: I,
     ) -> Result<Self, sea_orm::TryGetError> {
         let s: String = res.try_get_by(idx).map_err(sea_orm::TryGetError::DbErr)?;
-        Ok(NamespaceIdWrap(NamespaceId::from_str(&s).map_err(|e| {
+        Ok(SpaceIdWrap(SpaceId::from_str(&s).map_err(|e| {
             sea_orm::TryGetError::DbErr(DbErr::TryIntoErr {
                 from: "String",
-                into: "NamespaceId",
+                into: "SpaceId",
                 source: Box::new(e),
             })
         })?))
     }
 }
 
-impl sea_orm::sea_query::ValueType for NamespaceIdWrap {
+impl sea_orm::sea_query::ValueType for SpaceIdWrap {
     fn try_from(v: Value) -> Result<Self, sea_orm::sea_query::ValueTypeErr> {
         match v {
-            Value::String(Some(x)) => Ok(NamespaceId::from_str(&x)
+            Value::String(Some(x)) => Ok(SpaceId::from_str(&x)
                 .map_err(|_| sea_orm::sea_query::ValueTypeErr)?
                 .into()),
             _ => Err(sea_orm::sea_query::ValueTypeErr),
@@ -69,7 +69,7 @@ impl sea_orm::sea_query::ValueType for NamespaceIdWrap {
     }
 
     fn type_name() -> String {
-        stringify!(NamespaceId).to_owned()
+        stringify!(SpaceId).to_owned()
     }
 
     fn array_type() -> sea_orm::sea_query::ArrayType {
@@ -81,13 +81,13 @@ impl sea_orm::sea_query::ValueType for NamespaceIdWrap {
     }
 }
 
-impl sea_orm::sea_query::Nullable for NamespaceIdWrap {
+impl sea_orm::sea_query::Nullable for SpaceIdWrap {
     fn null() -> Value {
         Value::String(None)
     }
 }
 
-impl sea_orm::TryFromU64 for NamespaceIdWrap {
+impl sea_orm::TryFromU64 for SpaceIdWrap {
     fn try_from_u64(_: u64) -> Result<Self, DbErr> {
         Err(DbErr::ConvertFromU64(stringify!($type)))
     }

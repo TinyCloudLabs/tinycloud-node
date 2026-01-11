@@ -39,21 +39,21 @@ pub mod util_routes {
     }
 }
 
-#[get("/peer/generate/<namespace>")]
+#[get("/peer/generate/<space>")]
 pub async fn open_host_key(
     s: &State<TinyCloud>,
-    namespace: &str,
+    space: &str,
 ) -> Result<String, (Status, &'static str)> {
     s.stage_key(
-        &namespace
+        &space
             .parse()
-            .map_err(|_| (Status::BadRequest, "Invalid namespace ID"))?,
+            .map_err(|_| (Status::BadRequest, "Invalid space ID"))?,
     )
     .await
     .map_err(|_| {
         (
             Status::InternalServerError,
-            "Failed to stage keypair for namespace",
+            "Failed to stage keypair for space",
         )
     })
 }
@@ -77,7 +77,7 @@ pub async fn delegate(
             .map_err(|e| {
                 (
                     match e {
-                        TxError::NamespaceNotFound => Status::NotFound,
+                        TxError::SpaceNotFound => Status::NotFound,
                         TxError::Db(DbErr::ConnectionAcquire(_)) => Status::InternalServerError,
                         _ => Status::Unauthorized,
                     },
@@ -121,7 +121,7 @@ pub async fn invoke(
                 (Resource::TinyCloud(r), "tinycloud.kv/put")
                     if r.service().as_str() == "kv" && r.path().is_some() =>
                 {
-                    Some((r.namespace(), r.path()))
+                    Some((r.space(), r.path()))
                 }
                 _ => None,
             }
@@ -129,20 +129,20 @@ pub async fn invoke(
 
         let inputs = match (data, put_iter.next(), put_iter.next()) {
             (DataIn::None | DataIn::One(_), None, _) => HashMap::new(),
-            (DataIn::One(d), Some((namespace, Some(path))), None) => {
+            (DataIn::One(d), Some((space, Some(path))), None) => {
                 let mut stage = staging
-                    .stage(namespace)
+                    .stage(space)
                     .await
                     .map_err(|e| (Status::InternalServerError, e.to_string()))?;
                 let open_data = d.open(1u8.gigabytes()).compat();
 
                 if let Some(limit) = config.storage.limit {
                     let current_size = tinycloud
-                        .store_size(namespace)
+                        .store_size(space)
                         .await
                         .map_err(|e| (Status::InternalServerError, e.to_string()))?
-                        .ok_or_else(|| (Status::NotFound, "namespace not found".to_string()))?;
-                    // get the remaining allocated space for the given namespace storage
+                        .ok_or_else(|| (Status::NotFound, "space not found".to_string()))?;
+                    // get the remaining allocated space for the given space storage
                     match limit.as_u64().checked_sub(current_size) {
                         // the current size is already equal or greater than the limit
                         None | Some(0) => {
@@ -165,7 +165,7 @@ pub async fn invoke(
                 };
 
                 let mut inputs = HashMap::new();
-                inputs.insert((namespace.clone(), path.clone()), (headers.0, stage));
+                inputs.insert((space.clone(), path.clone()), (headers.0, stage));
                 inputs
             }
             (DataIn::Many(_), Some(_), Some(_)) => {
@@ -196,7 +196,7 @@ pub async fn invoke(
             .map_err(|e| {
                 (
                     match e {
-                        TxStoreError::Tx(TxError::NamespaceNotFound) => Status::NotFound,
+                        TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
                         TxStoreError::Tx(TxError::Db(DbErr::ConnectionAcquire(_))) => {
                             Status::InternalServerError
                         }

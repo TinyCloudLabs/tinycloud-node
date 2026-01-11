@@ -1,6 +1,6 @@
 use crate::hash::Hash;
 use crate::models::*;
-use crate::types::NamespaceIdWrap;
+use crate::types::SpaceIdWrap;
 use sea_orm::entity::prelude::*;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
@@ -11,7 +11,7 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub child: Hash,
     #[sea_orm(primary_key)]
-    pub namespace: NamespaceIdWrap,
+    pub space: SpaceIdWrap,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -19,22 +19,22 @@ pub enum Relation {
     // inverse relation, delegations belong to delegators
     #[sea_orm(
         belongs_to = "epoch::Entity",
-        from = "(Column::Parent, Column::Namespace)",
-        to = "(epoch::Column::Id, epoch::Column::Namespace)"
+        from = "(Column::Parent, Column::Space)",
+        to = "(epoch::Column::Id, epoch::Column::Space)"
     )]
     Parent,
     #[sea_orm(
         belongs_to = "epoch::Entity",
-        from = "(Column::Child, Column::Namespace)",
-        to = "(epoch::Column::Id, epoch::Column::Namespace)"
+        from = "(Column::Child, Column::Space)",
+        to = "(epoch::Column::Id, epoch::Column::Space)"
     )]
     Child,
     #[sea_orm(
-        belongs_to = "namespace::Entity",
-        from = "Column::Namespace",
-        to = "namespace::Column::Id"
+        belongs_to = "space::Entity",
+        from = "Column::Space",
+        to = "space::Column::Id"
     )]
-    Namespace,
+    Space,
 }
 
 impl Related<epoch::Entity> for Entity {
@@ -43,9 +43,9 @@ impl Related<epoch::Entity> for Entity {
     }
 }
 
-impl Related<namespace::Entity> for Entity {
+impl Related<space::Entity> for Entity {
     fn to() -> RelationDef {
-        Relation::Namespace.def()
+        Relation::Space.def()
     }
 }
 

@@ -14,7 +14,7 @@ use tinycloud_lib::{
     resolver::DID_METHODS,
     resource::{
         iri_string::types::{UriFragmentString, UriQueryString},
-        NamespaceId, Path, ResourceId, Service,
+        Path, ResourceId, Service, SpaceId,
     },
     siwe_recap::{Ability, Capability},
     ssi::{claims::chrono::Timelike, jwk::JWK},
@@ -29,7 +29,7 @@ pub struct SessionConfig {
     // e.g. { "kv": { "some/path": ["tinycloud.kv/get", "tinycloud.kv/put", "tinycloud.kv/del"] } }
     // Note: Actions use ReCap ability namespace format (e.g., "tinycloud.kv/get" where
     // "tinycloud.kv" is the ability namespace). This is distinct from the TinyCloud user
-    // namespace (data container) referenced by namespace_id below.
+    // Space (data container) referenced by space_id below.
     pub abilities: HashMap<Service, HashMap<Path, Vec<Ability>>>,
     #[serde(with = "tinycloud_sdk_rs::serde_siwe::address")]
     pub address: [u8; 20],
@@ -38,10 +38,10 @@ pub struct SessionConfig {
     pub domain: Authority,
     #[serde_as(as = "DisplayFromStr")]
     pub issued_at: TimeStamp,
-    /// The TinyCloud user namespace (data container) that this session targets.
+    /// The TinyCloud user space (data container) that this session targets.
     /// Format: "tinycloud:pkh:eip155:{chainId}:{address}:{name}"
     /// Not to be confused with ReCap ability namespaces (action categories like "kv").
-    pub namespace_id: NamespaceId,
+    pub space_id: SpaceId,
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(default)]
     pub not_before: Option<TimeStamp>,
@@ -64,7 +64,7 @@ pub struct SessionConfig {
 #[serde(rename_all = "camelCase")]
 pub struct PreparedSession {
     pub jwk: JWK,
-    pub namespace_id: NamespaceId,
+    pub space_id: SpaceId,
     #[serde_as(as = "DisplayFromStr")]
     pub siwe: Message,
     pub verification_method: String,
@@ -88,9 +88,9 @@ pub struct Session {
     #[serde_as(as = "DisplayFromStr")]
     pub delegation_cid: Cid,
     pub jwk: JWK,
-    /// The TinyCloud user namespace (data container) that this session is bound to.
+    /// The TinyCloud user space (data container) that this session is bound to.
     /// Not to be confused with ReCap ability namespaces (action categories like "kv").
-    pub namespace_id: NamespaceId,
+    pub space_id: SpaceId,
     pub verification_method: String,
 }
 
@@ -104,7 +104,7 @@ impl SessionConfig {
                 |caps, (service, actions)| {
                     actions.into_iter().fold(caps, |mut caps, (path, action)| {
                         caps.with_actions(
-                            self.namespace_id
+                            self.space_id
                                 .clone()
                                 .to_resource(service.clone(), Some(path), None, None)
                                 .as_uri(),
@@ -140,7 +140,7 @@ impl SessionConfig {
 }
 
 impl Session {
-    /// Allows invoking ResourceId's with any NamespaceId
+    /// Allows invoking ResourceId's with any SpaceId
     pub fn invoke_any<A: IntoIterator<Item = Ability>>(
         &self,
         actions: impl IntoIterator<Item = (ResourceId, A)>,
@@ -174,9 +174,9 @@ impl Session {
         >,
     ) -> Result<TinyCloudInvocation, InvocationError> {
         self.invoke_any(
-            actions.into_iter().map(|(s, p, q, f, a)| {
-                (self.namespace_id.clone().to_resource(s, Some(p), q, f), a)
-            }),
+            actions
+                .into_iter()
+                .map(|(s, p, q, f, a)| (self.space_id.clone().to_resource(s, Some(p), q, f), a)),
         )
     }
 }
@@ -209,14 +209,14 @@ pub fn prepare_session(config: SessionConfig) -> Result<PreparedSession, Error> 
         vm
     };
 
-    let namespace_id = config.namespace_id.clone();
+    let space_id = config.space_id.clone();
 
     let siwe = config
         .into_message(&verification_method)
         .map_err(Error::UnableToGenerateSIWEMessage)?;
 
     Ok(PreparedSession {
-        namespace_id,
+        space_id,
         jwk,
         verification_method,
         siwe,
@@ -240,7 +240,7 @@ pub fn complete_session_setup(signed_session: SignedSession) -> Result<Session, 
         delegation_header,
         delegation_cid,
         jwk: signed_session.session.jwk,
-        namespace_id: signed_session.session.namespace_id,
+        space_id: signed_session.session.space_id,
         verification_method: signed_session.session.verification_method,
     })
 }
@@ -278,7 +278,7 @@ pub mod test {
             "chainId": 1u8,
             "domain": "example.com",
             "issuedAt": "2022-01-01T00:00:00.000Z",
-            "namespaceId": "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:default",
+            "spaceId": "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:default",
             "expirationTime": "3000-01-01T00:00:00.000Z",
         });
         let prepared = prepare_session(serde_json::from_value(config).unwrap()).unwrap();

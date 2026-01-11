@@ -1,7 +1,7 @@
 use crate::hash::Hash;
 use sea_orm_migration::async_trait::async_trait;
 use std::error::Error as StdError;
-use tinycloud_lib::resource::NamespaceId;
+use tinycloud_lib::resource::SpaceId;
 
 pub mod either;
 pub mod memory;
@@ -18,7 +18,7 @@ pub trait StorageConfig<S> {
 #[async_trait]
 pub trait StorageSetup {
     type Error: StdError;
-    async fn create(&self, namespace: &NamespaceId) -> Result<(), Self::Error>;
+    async fn create(&self, space: &SpaceId) -> Result<(), Self::Error>;
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -44,22 +44,22 @@ pub enum KeyedWriteError<E> {
 pub trait ImmutableReadStore: Send + Sync {
     type Error: StdError + Send + Sync;
     type Readable: futures::io::AsyncRead + Send + Sync;
-    async fn contains(&self, namespace: &NamespaceId, id: &Hash) -> Result<bool, Self::Error>;
+    async fn contains(&self, space: &SpaceId, id: &Hash) -> Result<bool, Self::Error>;
     async fn read(
         &self,
-        namespace: &NamespaceId,
+        space: &SpaceId,
         id: &Hash,
     ) -> Result<Option<Content<Self::Readable>>, Self::Error>;
     async fn read_to_vec(
         &self,
-        namespace: &NamespaceId,
+        space: &SpaceId,
         id: &Hash,
     ) -> Result<Option<Vec<u8>>, VecReadError<Self::Error>>
     where
         Self::Readable: Send,
     {
         use futures::io::AsyncReadExt;
-        let (l, r) = match self.read(namespace, id).await? {
+        let (l, r) = match self.read(space, id).await? {
             None => return Ok(None),
             Some(r) => r.into_inner(),
         };
@@ -76,18 +76,10 @@ pub trait ImmutableReadStore: Send + Sync {
 pub trait ImmutableStaging: Send + Sync {
     type Error: StdError + Send + Sync;
     type Writable: futures::io::AsyncWrite + Send + Sync;
-    async fn stage(
-        &self,
-        namespace: &NamespaceId,
-    ) -> Result<HashBuffer<Self::Writable>, Self::Error> {
-        self.get_staging_buffer(namespace)
-            .await
-            .map(HashBuffer::new)
+    async fn stage(&self, space: &SpaceId) -> Result<HashBuffer<Self::Writable>, Self::Error> {
+        self.get_staging_buffer(space).await.map(HashBuffer::new)
     }
-    async fn get_staging_buffer(
-        &self,
-        namespace: &NamespaceId,
-    ) -> Result<Self::Writable, Self::Error>;
+    async fn get_staging_buffer(&self, space: &SpaceId) -> Result<Self::Writable, Self::Error>;
 }
 
 #[async_trait]
@@ -99,19 +91,19 @@ where
     type Error: StdError + Send + Sync;
     async fn persist(
         &self,
-        namespace: &NamespaceId,
+        space: &SpaceId,
         staged: HashBuffer<S::Writable>,
     ) -> Result<Hash, Self::Error>;
     async fn persist_keyed(
         &self,
-        namespace: &NamespaceId,
+        space: &SpaceId,
         mut staged: HashBuffer<S::Writable>,
         hash: &Hash,
     ) -> Result<(), KeyedWriteError<Self::Error>> {
         if hash != &staged.hash() {
             return Err(KeyedWriteError::IncorrectHash);
         };
-        self.persist(namespace, staged).await?;
+        self.persist(space, staged).await?;
         Ok(())
     }
 }
@@ -119,13 +111,13 @@ where
 #[async_trait]
 pub trait ImmutableDeleteStore: Send + Sync {
     type Error: StdError + Send + Sync;
-    async fn remove(&self, namespace: &NamespaceId, id: &Hash) -> Result<Option<()>, Self::Error>;
+    async fn remove(&self, space: &SpaceId, id: &Hash) -> Result<Option<()>, Self::Error>;
 }
 
 #[async_trait]
 pub trait StoreSize: Send + Sync {
     type Error: StdError;
-    async fn total_size(&self, namespace: &NamespaceId) -> Result<Option<u64>, Self::Error>;
+    async fn total_size(&self, space: &SpaceId) -> Result<Option<u64>, Self::Error>;
 }
 
 #[async_trait]
@@ -135,25 +127,25 @@ where
 {
     type Error = S::Error;
     type Readable = S::Readable;
-    async fn contains(&self, namespace: &NamespaceId, id: &Hash) -> Result<bool, Self::Error> {
-        self.contains(namespace, id).await
+    async fn contains(&self, space: &SpaceId, id: &Hash) -> Result<bool, Self::Error> {
+        self.contains(space, id).await
     }
     async fn read(
         &self,
-        namespace: &NamespaceId,
+        space: &SpaceId,
         id: &Hash,
     ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
-        self.read(namespace, id).await
+        self.read(space, id).await
     }
     async fn read_to_vec(
         &self,
-        namespace: &NamespaceId,
+        space: &SpaceId,
         id: &Hash,
     ) -> Result<Option<Vec<u8>>, VecReadError<Self::Error>>
     where
         Self::Readable: Send,
     {
-        self.read_to_vec(namespace, id).await
+        self.read_to_vec(space, id).await
     }
 }
 
@@ -164,11 +156,8 @@ where
 {
     type Error = S::Error;
     type Writable = S::Writable;
-    async fn get_staging_buffer(
-        &self,
-        namespace: &NamespaceId,
-    ) -> Result<Self::Writable, Self::Error> {
-        self.get_staging_buffer(namespace).await
+    async fn get_staging_buffer(&self, space: &SpaceId) -> Result<Self::Writable, Self::Error> {
+        self.get_staging_buffer(space).await
     }
 }
 
@@ -182,18 +171,18 @@ where
     type Error = S::Error;
     async fn persist(
         &self,
-        namespace: &NamespaceId,
+        space: &SpaceId,
         staged: HashBuffer<W::Writable>,
     ) -> Result<Hash, Self::Error> {
-        self.persist(namespace, staged).await
+        self.persist(space, staged).await
     }
     async fn persist_keyed(
         &self,
-        namespace: &NamespaceId,
+        space: &SpaceId,
         staged: HashBuffer<W::Writable>,
         hash: &Hash,
     ) -> Result<(), KeyedWriteError<Self::Error>> {
-        self.persist_keyed(namespace, staged, hash).await
+        self.persist_keyed(space, staged, hash).await
     }
 }
 
@@ -203,8 +192,8 @@ where
     S: ImmutableDeleteStore,
 {
     type Error = S::Error;
-    async fn remove(&self, namespace: &NamespaceId, id: &Hash) -> Result<Option<()>, Self::Error> {
-        self.remove(namespace, id).await
+    async fn remove(&self, space: &SpaceId, id: &Hash) -> Result<Option<()>, Self::Error> {
+        self.remove(space, id).await
     }
 }
 
@@ -214,7 +203,7 @@ where
     S: StoreSize,
 {
     type Error = S::Error;
-    async fn total_size(&self, namespace: &NamespaceId) -> Result<Option<u64>, Self::Error> {
-        (**self).total_size(namespace).await
+    async fn total_size(&self, space: &SpaceId) -> Result<Option<u64>, Self::Error> {
+        (**self).total_size(space).await
     }
 }

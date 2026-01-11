@@ -12,7 +12,7 @@ cors = true
     ## Set the file-staging system for TinyCloud Protocol to use
     staging = "FileSystem"
 
-    ## Set the default limit for KV storage per Namespace
+    ## Set the default limit for KV storage per Space
     # limit = "10 MiB"
 
     ###### Document shared aws config (`aws_config::from_env()`)
@@ -24,6 +24,6 @@ cors = true
     type = "Static"
     secret = "U29tZSBsb25nIHBpZWNlIG9mIGVudHJvcHkgd2hpY2ggaXMgYSBzZWNyZXQgYW5kIG1vcmUgdGhhbiAzMiBieXRlcw"
 
-[global.namespaces]
-## Namespace allow list api endpoint
+[global.spaces]
+## Space allow list api endpoint
 # allowlist = "http://localhost:10000"

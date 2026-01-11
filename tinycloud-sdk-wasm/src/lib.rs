@@ -34,8 +34,8 @@ pub fn ensureEip55(address: String) -> Result<String, JsValue> {
 
 #[wasm_bindgen]
 #[allow(non_snake_case)]
-pub fn makeNamespaceId(address: String, chainId: u32, name: String) -> Result<String, JsValue> {
-    Ok(tinycloud_sdk_rs::util::make_namespace_id_pkh_eip155(
+pub fn makeSpaceId(address: String, chainId: u32, name: String) -> Result<String, JsValue> {
+    Ok(tinycloud_sdk_rs::util::make_space_id_pkh_eip155(
         &util::decode_eip55(address.strip_prefix("0x").unwrap_or(&address)).map_err(map_jserr)?,
         chainId,
         name,

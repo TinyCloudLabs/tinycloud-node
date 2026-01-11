@@ -1,13 +1,13 @@
 use crate::models::*;
 use crate::relationships::*;
-use crate::types::NamespaceIdWrap;
+use crate::types::SpaceIdWrap;
 use sea_orm::entity::prelude::*;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, PartialOrd, Ord)]
-#[sea_orm(table_name = "namespace")]
+#[sea_orm(table_name = "space")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, unique)]
-    pub id: NamespaceIdWrap,
+    pub id: SpaceIdWrap,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

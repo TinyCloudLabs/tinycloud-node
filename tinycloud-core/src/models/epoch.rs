@@ -1,7 +1,7 @@
 use crate::hash::Hash;
 use crate::models::*;
 use crate::relationships::*;
-use crate::types::NamespaceIdWrap;
+use crate::types::SpaceIdWrap;
 use sea_orm::entity::prelude::*;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, PartialOrd, Ord)]
@@ -14,7 +14,7 @@ pub struct Model {
     pub id: Hash,
 
     #[sea_orm(primary_key)]
-    pub namespace: NamespaceIdWrap,
+    pub space: SpaceIdWrap,
 }
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
@@ -23,11 +23,11 @@ pub enum Relation {
     #[sea_orm(has_many = "epoch_order::Entity")]
     Children,
     #[sea_orm(
-        belongs_to = "namespace::Entity",
-        from = "Column::Namespace",
-        to = "namespace::Column::Id"
+        belongs_to = "space::Entity",
+        from = "Column::Space",
+        to = "space::Column::Id"
     )]
-    Namespace,
+    Space,
 }
 
 impl Related<epoch_order::Entity> for Entity {
@@ -42,9 +42,9 @@ impl Related<event_order::Entity> for Entity {
     }
 }
 
-impl Related<namespace::Entity> for Entity {
+impl Related<space::Entity> for Entity {
     fn to() -> RelationDef {
-        Relation::Namespace.def()
+        Relation::Space.def()
     }
 }
 

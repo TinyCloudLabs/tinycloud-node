@@ -166,7 +166,7 @@ async fn validate<C: ConnectionTrait>(
         .filter(|c| {
             // remove caps for which the delegator is the root authority
             c.resource
-                .namespace()
+                .space()
                 .map(|o| **o.did() != *delegation.delegator)
                 .unwrap_or(true)
         })
@@ -192,7 +192,7 @@ async fn validate<C: ConnectionTrait>(
                     // valid time bounds: child's validity must be within parent's validity
                     // expiry: child must expire at or before parent (None = no expiry)
                     let expiry_valid = match (&p.expiry, &delegation.expiry) {
-                        (None, _) => true, // parent never expires, any child expiry is valid
+                        (None, _) => true,        // parent never expires, any child expiry is valid
                         (Some(_), None) => false, // parent expires but child doesn't - invalid
                         (Some(pe), Some(de)) => *de <= *pe, // child must expire at or before parent
                     };

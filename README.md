@@ -6,7 +6,7 @@
 
 The TinyCloud Protocol is a framework for creating interoperable software applications where users retain full sovereignty over their data. It provides a decentralized or user-controlled "cloud" that can serve as the backend for multiple apps, allowing users to maintain control over their data without ceding ownership or privacy to third parties. TinyCloud is built on core values of sovereignty, privacy, and interoperability, enabling users to store, stream, and compute upon their data in ways that minimize leakage while providing fine-grained permissioning capabilities.
 
-TinyCloud Protocol is self-sovereign storage. It is a decendant of [Kepler](https://github.com/spruceid/kepler) and is architected as a decentralized storage system that uses DIDs and Authorization Capabilities to define TinyCloud Namespaces, where your data lives and who has access. Any DID controller (e.g. people, applications, DAOs) can administer their own TinyCloud Protocol Namespace.
+TinyCloud Protocol is self-sovereign storage. It is a decendant of [Kepler](https://github.com/spruceid/kepler) and is architected as a decentralized storage system that uses DIDs and Authorization Capabilities to define TinyCloud Spaces, where your data lives and who has access. Any DID controller (e.g. people, applications, DAOs) can administer their own TinyCloud Protocol Space.
 
 ## Quickstart
 
@@ -48,11 +48,11 @@ The following common options are available:
 | address             | TINYCLOUD_ADDRESS             | Set the listening address of the TinyCloud Protocol instance                           |
 | port                | TINYCLOUD_PORT                | Set the listening TCP port for the TinyCloud Protocol instance                         |
 | storage.blocks.type | TINYCLOUD_STORAGE_BLOCKS_TYPE | Set the mode of block storage, options are "Local" and "S3"                |
-| storage.limit        | TINYCLOUD_STORAGE_LIMIT        | Set a maximum limit on storage available to Namespaces hosted on this instance. Limits are written as strings, e.g. `10 MiB`, `100 GiB`                                                                           |
+| storage.limit        | TINYCLOUD_STORAGE_LIMIT        | Set a maximum limit on storage available to Spaces hosted on this instance. Limits are written as strings, e.g. `10 MiB`, `100 GiB`                                                                           |
 | storage.database    | TINYCLOUD_STORAGE_DATABASE    | Set the location of the SQL database                                       |
 | storage.staging     | TINYCLOUD_STORAGE_STAGING     | Set the mode of content staging, options are "Memory" and "FileSystem"     |
 | keys.type           | TINYCLOUD_KEYS_TYPE           | Set the type of host key store, options are "Static"                       |
-| namespaces.allowlist    | TINYCLOUD_NAMESPACES_ALLOWLIST    | Set the URL of an allowlist service for gating the creation of Namespace Peers |
+| spaces.allowlist    | TINYCLOUD_SPACES_ALLOWLIST    | Set the URL of an allowlist service for gating the creation of Space Peers |
 
 ### Database Config
 
@@ -104,7 +104,7 @@ TinyCloud Protocol hosts require key pairs to provide replication. The `keys` co
 
 #### Static Secret Derivation
 
-When `keys.type` is `Static` the instance will use an array of bytes as a static secret from which it will derive key pairs on a per-Namespace basis. The following config options will be available:
+When `keys.type` is `Static` the instance will use an array of bytes as a static secret from which it will derive key pairs on a per-Space basis. The following config options will be available:
 
 | Option      | env var              | description                                                                  |
 |:------------|:---------------------|:-----------------------------------------------------------------------------|
