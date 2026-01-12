@@ -44,13 +44,13 @@ impl TryFrom<HostConfig> for Message {
     fn try_from(c: HostConfig) -> Result<Self, String> {
         let mut caps = Capability::<Value>::default();
         let ab: Ability = "tinycloud.space/host".parse().unwrap();
-        caps.with_action(
-            c.space_id
-                .to_resource("space".parse().unwrap(), None, None, None)
-                .as_uri(),
-            ab,
-            [],
-        );
+        // Use space ID directly as URI - no service suffix needed for host capability
+        let space_uri = unsafe {
+            tinycloud_lib::resource::iri_string::types::UriString::new_unchecked(
+                c.space_id.to_string(),
+            )
+        };
+        caps.with_action(space_uri, ab, []);
         caps.build_message(Self {
             scheme: None,
             address: c.address,
