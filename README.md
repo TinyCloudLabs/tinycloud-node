@@ -14,19 +14,19 @@ To run TinyCloud Protocol locally you will need the latest version of [rust](htt
 
 You will need to create a directory for TinyCloud Protocol to store data in:
 ```bash
-mkdir tinycloud
+mkdir data
 ```
 
 Within this directory, create one more directories `blocks` and a database file `caps.db`:
 ```bash
-mkdir tinycloud/blocks
-touch tinycloud/caps.db
+mkdir data/blocks
+touch data/caps.db
 ```
 
 You will then need to set the environment variables to point to those directories:
 ```bash
-export TINYCLOUD_STORAGE_BLOCKS_PATH="tinycloud/blocks"
-export TINYCLOUD_STORAGE_DATABASE="tinycloud/caps.db"
+export TINYCLOUD_STORAGE_BLOCKS_PATH="data/blocks"
+export TINYCLOUD_STORAGE_DATABASE="data/caps.db"
 ```
 
 Finally you can run TinyCloud Protocol using `cargo`:
