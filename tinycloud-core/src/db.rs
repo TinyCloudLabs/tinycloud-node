@@ -8,7 +8,7 @@ use crate::storage::{
     either::EitherError, Content, HashBuffer, ImmutableDeleteStore, ImmutableReadStore,
     ImmutableStaging, ImmutableWriteStore, StorageSetup, StoreSize,
 };
-use crate::types::{Metadata, Resource, SpaceIdWrap};
+use crate::types::{CapabilitiesReadParams, ListFilters, Metadata, Resource, SpaceIdWrap};
 use crate::util::{Capability, DelegationInfo};
 use sea_orm::{
     entity::prelude::*,
@@ -64,6 +64,8 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
     Secrets(K::Error),
     #[error("Space not found")]
     SpaceNotFound,
+    #[error("Invalid delegation CID: {0}")]
+    InvalidCid(String),
 }
 
 #[non_exhaustive]
@@ -255,6 +257,22 @@ where
             .begin_with_config(Some(sea_orm::IsolationLevel::ReadUncommitted), None)
             .await?;
         let caps = invocation.0.capabilities.clone();
+        let invoker = invocation.0.invoker.clone();
+        // Extract capabilities read params from UCAN facts field
+        // Facts is Vec<JsonValue>, we look for an object with capabilitiesReadParams key
+        let caps_read_params: Option<CapabilitiesReadParams> = invocation
+            .0
+            .invocation
+            .payload()
+            .facts
+            .as_ref()
+            .and_then(|facts| {
+                facts.iter().find_map(|fact| {
+                    fact.as_object()
+                        .and_then(|obj| obj.get("capabilitiesReadParams"))
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                })
+            });
         //  verify and commit invocation and kv operations
         let commit = transact(
             &tx,
@@ -313,9 +331,32 @@ where
                 (space, "capabilities", "tinycloud.capabilities/read", path)
                     if path.as_str() == "all" =>
                 {
-                    results.push(InvocationOutcome::OpenSessions(
-                        get_valid_delegations(&tx, space).await?,
-                    ))
+                    match &caps_read_params {
+                        None => {
+                            // Backward compatible: no params means return all valid delegations
+                            results.push(InvocationOutcome::OpenSessions(
+                                get_valid_delegations(&tx, space).await?,
+                            ))
+                        }
+                        Some(CapabilitiesReadParams::List { filters }) => {
+                            // List with optional filters
+                            results.push(InvocationOutcome::OpenSessions(
+                                get_filtered_delegations(
+                                    &tx,
+                                    space,
+                                    &invoker,
+                                    filters.as_ref(),
+                                )
+                                .await?,
+                            ))
+                        }
+                        Some(CapabilitiesReadParams::Chain { delegation_cid }) => {
+                            // Get the delegation chain for a specific delegation
+                            results.push(InvocationOutcome::DelegationChain(
+                                get_delegation_chain(&tx, space, delegation_cid).await?,
+                            ))
+                        }
+                    }
                 }
                 _ => {}
             };
@@ -335,6 +376,8 @@ pub enum InvocationOutcome<R> {
     KvWrite,
     KvRead(Option<(Metadata, Content<R>)>),
     OpenSessions(HashMap<Hash, DelegationInfo>),
+    /// Ordered delegation chain from leaf to root
+    DelegationChain(Vec<DelegationInfo>),
 }
 
 impl<S: StorageSetup, K: Secrets> From<delegation::Error> for TxError<S, K> {
@@ -798,6 +841,196 @@ async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             }
         })
         .collect::<Result<HashMap<Hash, DelegationInfo>, EncodingError>>()?)
+}
+
+/// Get delegations with optional filters applied.
+/// Filters by direction (created/received relative to invoker), path prefix, and actions.
+async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
+    db: &C,
+    space_id: &SpaceId,
+    invoker: &str,
+    filters: Option<&ListFilters>,
+) -> Result<HashMap<Hash, DelegationInfo>, TxError<S, K>> {
+    let (dels, abilities): (Vec<delegation::Model>, Vec<Vec<abilities::Model>>) =
+        delegation::Entity::find()
+            .left_join(revocation::Entity)
+            .filter(revocation::Column::Id.is_null())
+            .find_with_related(abilities::Entity)
+            .all(db)
+            .await?
+            .into_iter()
+            .unzip();
+    let parents = dels.load_many(parent_delegations::Entity, db).await?;
+    let now = time::OffsetDateTime::now_utc();
+
+    // Extract filter values
+    let direction = filters.and_then(|f| f.direction.as_deref());
+    let path_prefix = filters.and_then(|f| f.path.as_deref());
+    let actions = filters.and_then(|f| f.actions.as_ref());
+
+    Ok(dels
+        .into_iter()
+        .zip(abilities)
+        .zip(parents)
+        .filter_map(|((del, ability), parents)| {
+            // Time validity check
+            if !(del.expiry.map(|e| e > now).unwrap_or(true)
+                && del.not_before.map(|n| n <= now).unwrap_or(true))
+            {
+                return None;
+            }
+
+            // Space membership check
+            if !ability.iter().any(|a| a.resource.space() == Some(space_id)) {
+                return None;
+            }
+
+            // Direction filter
+            match direction {
+                Some("created") if del.delegator != invoker => return None,
+                Some("received") if del.delegatee != invoker => return None,
+                _ => {}
+            }
+
+            // Path prefix filter
+            if let Some(prefix) = path_prefix {
+                let has_matching_path = ability.iter().any(|a| {
+                    a.resource
+                        .tinycloud_resource()
+                        .and_then(|r| r.path())
+                        .map(|p| p.as_str().starts_with(prefix))
+                        .unwrap_or(false)
+                });
+                if !has_matching_path {
+                    return None;
+                }
+            }
+
+            // Actions filter
+            if let Some(action_list) = actions {
+                let has_matching_action = ability.iter().any(|a| {
+                    action_list
+                        .iter()
+                        .any(|action| a.ability.as_ref().as_ref() == action.as_str())
+                });
+                if !has_matching_action {
+                    return None;
+                }
+            }
+
+            Some(match TinyCloudDelegation::from_bytes(&del.serialization) {
+                Ok(delegation) => Ok((
+                    del.id,
+                    DelegationInfo {
+                        delegator: del.delegator,
+                        delegate: del.delegatee,
+                        parents: parents.into_iter().map(|p| p.parent.to_cid(0x55)).collect(),
+                        expiry: del.expiry,
+                        not_before: del.not_before,
+                        issued_at: del.issued_at,
+                        capabilities: ability
+                            .into_iter()
+                            .map(|a| Capability {
+                                resource: a.resource,
+                                ability: a.ability,
+                            })
+                            .collect(),
+                        delegation,
+                    },
+                )),
+                Err(e) => Err(e),
+            })
+        })
+        .collect::<Result<HashMap<Hash, DelegationInfo>, EncodingError>>()?)
+}
+
+/// Get the delegation chain for a specific delegation, ordered from leaf to root.
+/// The chain includes the requested delegation and all its ancestors.
+async fn get_delegation_chain<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
+    db: &C,
+    space_id: &SpaceId,
+    delegation_cid: &str,
+) -> Result<Vec<DelegationInfo>, TxError<S, K>> {
+    use tinycloud_lib::ipld_core::cid::Cid;
+
+    // Parse the delegation CID
+    let cid: Cid = delegation_cid
+        .parse()
+        .map_err(|_| TxError::<S, K>::InvalidCid(delegation_cid.to_string()))?;
+    let start_hash: Hash = cid.into();
+
+    let mut chain = Vec::new();
+    let mut current_hash = start_hash;
+    let now = time::OffsetDateTime::now_utc();
+
+    // Traverse the chain following parent relationships
+    loop {
+        // Find the delegation with this hash
+        let del_with_abilities = delegation::Entity::find_by_id(current_hash)
+            .left_join(revocation::Entity)
+            .filter(revocation::Column::Id.is_null())
+            .find_with_related(abilities::Entity)
+            .all(db)
+            .await?;
+
+        if del_with_abilities.is_empty() {
+            break;
+        }
+
+        let (del, ability) = del_with_abilities.into_iter().next().unwrap();
+
+        // Time validity check
+        if !(del.expiry.map(|e| e > now).unwrap_or(true)
+            && del.not_before.map(|n| n <= now).unwrap_or(true))
+        {
+            break;
+        }
+
+        // Space membership check
+        if !ability.iter().any(|a| a.resource.space() == Some(space_id)) {
+            break;
+        }
+
+        // Get parent relationships
+        let parents = parent_delegations::Entity::find()
+            .filter(parent_delegations::Column::Child.eq(current_hash))
+            .all(db)
+            .await?;
+
+        let parent_cids: Vec<Cid> = parents.iter().map(|p| p.parent.to_cid(0x55)).collect();
+
+        // Create DelegationInfo
+        let delegation = TinyCloudDelegation::from_bytes(&del.serialization)?;
+        let info = DelegationInfo {
+            delegator: del.delegator,
+            delegate: del.delegatee,
+            parents: parent_cids.clone(),
+            expiry: del.expiry,
+            not_before: del.not_before,
+            issued_at: del.issued_at,
+            capabilities: ability
+                .into_iter()
+                .map(|a| Capability {
+                    resource: a.resource,
+                    ability: a.ability,
+                })
+                .collect(),
+            delegation,
+        };
+
+        chain.push(info);
+
+        // Move to the first parent (if any) to continue the chain
+        // Note: We follow the first parent; for multiple parents, this gives one path
+        if let Some(first_parent) = parents.into_iter().next() {
+            current_hash = first_parent.parent;
+        } else {
+            // No more parents, we've reached the root
+            break;
+        }
+    }
+
+    Ok(chain)
 }
 
 #[cfg(test)]
