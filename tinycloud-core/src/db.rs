@@ -341,13 +341,8 @@ where
                         Some(CapabilitiesReadParams::List { filters }) => {
                             // List with optional filters
                             results.push(InvocationOutcome::OpenSessions(
-                                get_filtered_delegations(
-                                    &tx,
-                                    space,
-                                    &invoker,
-                                    filters.as_ref(),
-                                )
-                                .await?,
+                                get_filtered_delegations(&tx, space, &invoker, filters.as_ref())
+                                    .await?,
                             ))
                         }
                         Some(CapabilitiesReadParams::Chain { delegation_cid }) => {

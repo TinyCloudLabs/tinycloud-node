@@ -201,18 +201,10 @@ impl ResourceId {
             base.path().map(|p| p.as_str()),
         ) {
             (Some(s), Some(b)) => {
-                if s.starts_with(b) {
-                    if b.ends_with('/')
+                !s.starts_with(b)
+                    || !(b.ends_with('/')
                         || s.len() == b.len()
-                        || s.as_bytes().get(b.len()) == Some(&b'/')
-                    {
-                        false
-                    } else {
-                        true
-                    }
-                } else {
-                    true
-                }
+                        || s.as_bytes().get(b.len()) == Some(&b'/'))
             }
             (Some(_), None) | (None, None) => false,
             (None, Some(_)) => true,
