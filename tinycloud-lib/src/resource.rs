@@ -202,7 +202,10 @@ impl ResourceId {
         ) {
             (Some(s), Some(b)) => {
                 if s.starts_with(b) {
-                    if b.ends_with('/') || s.len() == b.len() || s.as_bytes().get(b.len()) == Some(&b'/') {
+                    if b.ends_with('/')
+                        || s.len() == b.len()
+                        || s.as_bytes().get(b.len()) == Some(&b'/')
+                    {
                         false
                     } else {
                         true
@@ -210,7 +213,7 @@ impl ResourceId {
                 } else {
                     true
                 }
-            },
+            }
             (Some(_), None) | (None, None) => false,
             (None, Some(_)) => true,
         } {
