@@ -144,6 +144,7 @@ impl Session {
     pub fn invoke_any<A: IntoIterator<Item = Ability>>(
         &self,
         actions: impl IntoIterator<Item = (ResourceId, A)>,
+        facts: Option<Vec<serde_json::Value>>,
     ) -> Result<TinyCloudInvocation, InvocationError> {
         use tinycloud_lib::ssi::claims::chrono;
         // we have to use chrono here because the time crate doesnt support "now_utc" in wasm
@@ -158,6 +159,7 @@ impl Session {
             exp,
             None,
             None,
+            facts,
         )
     }
 
@@ -172,11 +174,13 @@ impl Session {
                 A,
             ),
         >,
+        facts: Option<Vec<serde_json::Value>>,
     ) -> Result<TinyCloudInvocation, InvocationError> {
         self.invoke_any(
             actions
                 .into_iter()
                 .map(|(s, p, q, f, a)| (self.space_id.clone().to_resource(s, Some(p), q, f), a)),
+            facts,
         )
     }
 }

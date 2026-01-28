@@ -68,16 +68,26 @@ pub fn invoke(
     service: String,
     path: String,
     action: String,
+    facts: JsValue,
 ) -> Result<JsValue, JsValue> {
     let session: session::Session = serde_wasm_bindgen::from_value(session)?;
+    // Convert JsValue facts to Option<Vec<serde_json::Value>>
+    let facts_opt: Option<Vec<serde_json::Value>> = if facts.is_undefined() || facts.is_null() {
+        None
+    } else {
+        Some(serde_wasm_bindgen::from_value(facts)?)
+    };
     let authz = session
-        .invoke(std::iter::once((
-            service.parse().map_err(map_jserr)?,
-            path.parse().map_err(map_jserr)?,
-            None,
-            None,
-            std::iter::once(action.parse().map_err(map_jserr)?),
-        )))
+        .invoke(
+            std::iter::once((
+                service.parse().map_err(map_jserr)?,
+                path.parse().map_err(map_jserr)?,
+                None,
+                None,
+                std::iter::once(action.parse().map_err(map_jserr)?),
+            )),
+            facts_opt,
+        )
         .map_err(map_jserr)?;
     Ok(serde_wasm_bindgen::to_value(&InvocationHeaders::new(
         authz,
