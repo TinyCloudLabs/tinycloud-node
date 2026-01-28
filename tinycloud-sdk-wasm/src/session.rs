@@ -103,10 +103,12 @@ impl SessionConfig {
                 Capability::<Value>::default(),
                 |caps, (service, actions)| {
                     actions.into_iter().fold(caps, |mut caps, (path, action)| {
+                        // Empty path means wildcard - use None to allow any path to extend
+                        let path_opt = if path.as_str().is_empty() { None } else { Some(path) };
                         caps.with_actions(
                             self.space_id
                                 .clone()
-                                .to_resource(service.clone(), Some(path), None, None)
+                                .to_resource(service.clone(), path_opt, None, None)
                                 .as_uri(),
                             action.into_iter().map(|a| (a, [])),
                         );
