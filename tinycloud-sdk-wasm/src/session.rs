@@ -103,10 +103,12 @@ impl SessionConfig {
                 Capability::<Value>::default(),
                 |caps, (service, actions)| {
                     actions.into_iter().fold(caps, |mut caps, (path, action)| {
+                        // Empty path means wildcard - use None to allow any path to extend
+                        let path_opt = if path.as_str().is_empty() { None } else { Some(path) };
                         caps.with_actions(
                             self.space_id
                                 .clone()
-                                .to_resource(service.clone(), Some(path), None, None)
+                                .to_resource(service.clone(), path_opt, None, None)
                                 .as_uri(),
                             action.into_iter().map(|a| (a, [])),
                         );
@@ -144,6 +146,7 @@ impl Session {
     pub fn invoke_any<A: IntoIterator<Item = Ability>>(
         &self,
         actions: impl IntoIterator<Item = (ResourceId, A)>,
+        facts: Option<Vec<serde_json::Value>>,
     ) -> Result<TinyCloudInvocation, InvocationError> {
         use tinycloud_lib::ssi::claims::chrono;
         // we have to use chrono here because the time crate doesnt support "now_utc" in wasm
@@ -158,6 +161,7 @@ impl Session {
             exp,
             None,
             None,
+            facts,
         )
     }
 
@@ -172,11 +176,13 @@ impl Session {
                 A,
             ),
         >,
+        facts: Option<Vec<serde_json::Value>>,
     ) -> Result<TinyCloudInvocation, InvocationError> {
         self.invoke_any(
             actions
                 .into_iter()
                 .map(|(s, p, q, f, a)| (self.space_id.clone().to_resource(s, Some(p), q, f), a)),
+            facts,
         )
     }
 }

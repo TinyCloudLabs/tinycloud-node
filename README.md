@@ -12,6 +12,7 @@ TinyCloud Protocol is self-sovereign storage. It is a decendant of [Kepler](http
 
 To run TinyCloud Protocol locally you will need the latest version of [rust](https://rustup.rs).
 
+
 You will need to create a directory for TinyCloud Protocol to store data in:
 ```bash
 mkdir data
@@ -22,6 +23,8 @@ Within this directory, create one more directories `blocks` and a database file 
 mkdir data/blocks
 touch data/caps.db
 ```
+
+To setup local data storage you can also run `./scripts/init-tinycloud-data.sh`
 
 You will then need to set the environment variables to point to those directories:
 ```bash
