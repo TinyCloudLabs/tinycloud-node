@@ -838,6 +838,55 @@ async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         .collect::<Result<HashMap<Hash, DelegationInfo>, EncodingError>>()?)
 }
 
+/// Resolve a session key DID (did:key:...) to its root PKH DID (did:pkh:...).
+///
+/// Session keys are delegated to from PKH DIDs. This function traverses the delegation
+/// chain to find the root PKH DID that authorized the session key.
+///
+/// Returns the original DID if it's already a PKH DID or if no delegation chain is found.
+async fn resolve_pkh_did<C: ConnectionTrait>(db: &C, did: &str) -> Result<String, DbErr> {
+    // If already a PKH DID, return it directly
+    if did.starts_with("did:pkh:") {
+        return Ok(did.to_string());
+    }
+
+    // Look for a delegation where this DID is the delegatee
+    // The delegator would be the next step up in the chain
+    let mut current_did = did.to_string();
+    let mut visited = std::collections::HashSet::new();
+
+    loop {
+        // Prevent infinite loops
+        if !visited.insert(current_did.clone()) {
+            break;
+        }
+
+        // Find a delegation where current_did is the delegatee
+        let parent_delegation = delegation::Entity::find()
+            .filter(delegation::Column::Delegatee.eq(&current_did))
+            .one(db)
+            .await?;
+
+        match parent_delegation {
+            Some(del) => {
+                // Found a parent - check if it's a PKH DID
+                if del.delegator.starts_with("did:pkh:") {
+                    return Ok(del.delegator);
+                }
+                // Continue up the chain
+                current_did = del.delegator;
+            }
+            None => {
+                // No parent found - return what we have
+                break;
+            }
+        }
+    }
+
+    // Return the original DID if we couldn't resolve to a PKH
+    Ok(did.to_string())
+}
+
 /// Get delegations with optional filters applied.
 /// Filters by direction (created/received relative to invoker), path prefix, and actions.
 async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
@@ -846,6 +895,9 @@ async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secret
     invoker: &str,
     filters: Option<&ListFilters>,
 ) -> Result<HashMap<Hash, DelegationInfo>, TxError<S, K>> {
+    // Resolve session key DID to PKH DID for direction filtering
+    let pkh_did = resolve_pkh_did(db, invoker).await.unwrap_or_else(|_| invoker.to_string());
+
     let (dels, abilities): (Vec<delegation::Model>, Vec<Vec<abilities::Model>>) =
         delegation::Entity::find()
             .left_join(revocation::Entity)
@@ -880,10 +932,10 @@ async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secret
                 return None;
             }
 
-            // Direction filter
+            // Direction filter (using resolved PKH DID, not session key DID)
             match direction {
-                Some("created") if del.delegator != invoker => return None,
-                Some("received") if del.delegatee != invoker => return None,
+                Some("created") if del.delegator != pkh_did => return None,
+                Some("received") if del.delegatee != pkh_did => return None,
                 _ => {}
             }
 
