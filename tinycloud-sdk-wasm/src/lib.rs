@@ -111,3 +111,71 @@ pub fn siweToDelegationHeaders(signedSIWEMessage: JsValue) -> Result<JsValue, Js
         &host::siwe_to_delegation_headers(serde_wasm_bindgen::from_value(signedSIWEMessage)?),
     )?)
 }
+
+/// Create a delegation UCAN from a session to another DID.
+/// This allows session keys to delegate capabilities to other users client-side.
+///
+/// # Arguments
+/// * `session` - The current session (with JWK and delegation info)
+/// * `delegateDID` - The recipient's DID (audience of the delegation)
+/// * `spaceId` - The space being delegated (e.g., "tinycloud:pkh:eip155:1:0x....:default")
+/// * `path` - Path scope for the delegation
+/// * `actions` - Actions to delegate (e.g., ["tinycloud.kv/get", "tinycloud.kv/put"])
+/// * `expirationSecs` - Expiration timestamp in seconds since epoch
+/// * `notBeforeSecs` - Optional not-before timestamp in seconds since epoch
+///
+/// # Returns
+/// A `DelegationResult` containing:
+/// * `delegation` - Base64url-encoded UCAN JWT string
+/// * `cid` - CID of the delegation (for referencing in proof chains)
+/// * `delegateDID` - The delegate's DID
+/// * `path` - Path scope
+/// * `actions` - Delegated actions
+/// * `expiry` - Expiration timestamp
+#[wasm_bindgen]
+#[allow(non_snake_case)]
+pub fn createDelegation(
+    session: JsValue,
+    delegateDID: String,
+    spaceId: String,
+    path: String,
+    actions: Vec<String>,
+    expirationSecs: f64,
+    notBeforeSecs: JsValue,
+) -> Result<JsValue, JsValue> {
+    let session: session::Session = serde_wasm_bindgen::from_value(session)?;
+
+    // Parse space_id
+    let space_id: tinycloud_lib::resource::SpaceId = spaceId.parse().map_err(map_jserr)?;
+
+    // Parse path
+    let path: tinycloud_lib::resource::Path = path.parse().map_err(map_jserr)?;
+
+    // Parse actions
+    let abilities: Vec<tinycloud_lib::siwe_recap::Ability> = actions
+        .into_iter()
+        .map(|a| a.parse())
+        .collect::<Result<_, _>>()
+        .map_err(map_jserr)?;
+
+    // Parse optional not_before
+    let not_before: Option<f64> = if notBeforeSecs.is_undefined() || notBeforeSecs.is_null() {
+        None
+    } else {
+        Some(serde_wasm_bindgen::from_value(notBeforeSecs)?)
+    };
+
+    // Create the delegation
+    let result = session
+        .create_delegation(
+            &delegateDID,
+            &space_id,
+            &path,
+            abilities,
+            expirationSecs,
+            not_before,
+        )
+        .map_err(map_jserr)?;
+
+    Ok(serde_wasm_bindgen::to_value(&result)?)
+}

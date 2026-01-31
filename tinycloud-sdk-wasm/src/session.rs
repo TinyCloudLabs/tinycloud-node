@@ -17,7 +17,13 @@ use tinycloud_lib::{
         Path, ResourceId, Service, SpaceId,
     },
     siwe_recap::{Ability, Capability},
-    ssi::{claims::chrono::Timelike, jwk::JWK},
+    ssi::{
+        claims::chrono::Timelike,
+        claims::jwt::NumericDate,
+        dids::{DIDBuf, DIDURLBuf},
+        jwk::JWK,
+        ucan::Payload,
+    },
 };
 use tinycloud_sdk_rs::authorization::DelegationHeaders;
 
@@ -185,6 +191,107 @@ impl Session {
             facts,
         )
     }
+
+    /// Create a delegation UCAN from this session to another DID.
+    /// Unlike invocations (which are self-issued for immediate use),
+    /// delegations are issued to a recipient DID with longer expiry.
+    pub fn create_delegation(
+        &self,
+        delegate_did: &str,
+        space_id: &SpaceId,
+        path: &Path,
+        actions: Vec<Ability>,
+        expiration_secs: f64,
+        not_before_secs: Option<f64>,
+    ) -> Result<DelegationResult, DelegationError> {
+        use std::str::FromStr;
+
+        // Build the resource from space_id, service "kv", and path
+        let service: Service = "kv".parse().map_err(|_| DelegationError::InvalidService)?;
+        let resource = space_id.clone().to_resource(service, Some(path.clone()), None, None);
+
+        // Collect action strings for the result before consuming them
+        let action_strings: Vec<String> = actions.iter().map(|a| a.to_string()).collect();
+
+        // Build capabilities (type parameter is the caveats type, using empty array)
+        let mut caps = tinycloud_lib::ucan_capabilities_object::Capabilities::<[(); 0]>::new();
+        caps.with_actions(resource.as_uri(), actions.into_iter().map(|a| (a, [])));
+
+        // Build UCAN payload (F=serde_json::Value for facts, C=[();0] for caveats)
+        let payload: Payload<serde_json::Value, [(); 0]> = Payload {
+            issuer: DIDURLBuf::from_str(&self.verification_method)
+                .map_err(DelegationError::InvalidIssuer)?,
+            audience: DIDBuf::from_str(delegate_did)
+                .map_err(DelegationError::InvalidAudience)?,
+            not_before: not_before_secs
+                .map(NumericDate::try_from_seconds)
+                .transpose()
+                .map_err(DelegationError::InvalidNotBefore)?,
+            expiration: NumericDate::try_from_seconds(expiration_secs)
+                .map_err(DelegationError::InvalidExpiration)?,
+            nonce: Some(format!("urn:uuid:{}", uuid::Uuid::new_v4())),
+            facts: None,
+            proof: vec![self.delegation_cid],
+            attenuation: caps,
+        };
+
+        // Sign the UCAN
+        let ucan = payload
+            .sign(self.jwk.get_algorithm().unwrap_or_default(), &self.jwk)
+            .map_err(DelegationError::SigningError)?;
+
+        // Encode the UCAN to JWT string
+        let delegation_str = ucan.encode().map_err(DelegationError::EncodingError)?;
+
+        // Calculate CID (using raw codec for JWT bytes, like invocations)
+        let hash = Code::Blake3_256.digest(delegation_str.as_bytes());
+        let cid = Cid::new_v1(0x55, hash); // 0x55 = raw codec
+
+        Ok(DelegationResult {
+            delegation: delegation_str,
+            cid: cid.to_string(),
+            delegate_did: delegate_did.to_string(),
+            path: path.to_string(),
+            actions: action_strings,
+            expiry: expiration_secs,
+        })
+    }
+}
+
+/// Result of creating a delegation UCAN.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegationResult {
+    /// Base64url-encoded UCAN JWT string
+    pub delegation: String,
+    /// CID of the delegation (for referencing in proof chains)
+    pub cid: String,
+    /// The DID of the delegate (recipient)
+    pub delegate_did: String,
+    /// Path scope of the delegation
+    pub path: String,
+    /// Actions delegated
+    pub actions: Vec<String>,
+    /// Expiration timestamp in seconds since epoch
+    pub expiry: f64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DelegationError {
+    #[error("invalid service: must be 'kv'")]
+    InvalidService,
+    #[error("invalid issuer DID URL: {0}")]
+    InvalidIssuer(#[from] tinycloud_lib::ssi::dids::InvalidDIDURL<String>),
+    #[error("invalid audience DID: {0}")]
+    InvalidAudience(tinycloud_lib::ssi::dids::InvalidDID<String>),
+    #[error("invalid not_before timestamp: {0}")]
+    InvalidNotBefore(tinycloud_lib::ssi::claims::jwt::NumericDateConversionError),
+    #[error("invalid expiration timestamp: {0}")]
+    InvalidExpiration(tinycloud_lib::ssi::claims::jwt::NumericDateConversionError),
+    #[error("failed to sign UCAN: {0}")]
+    SigningError(tinycloud_lib::ssi::ucan::error::Error),
+    #[error("failed to encode UCAN: {0}")]
+    EncodingError(tinycloud_lib::ssi::ucan::error::Error),
 }
 
 pub fn prepare_session(config: SessionConfig) -> Result<PreparedSession, Error> {
