@@ -148,8 +148,8 @@ impl TryFrom<TinyCloudDelegation> for DelegationInfo {
 
                 Self {
                     capabilities, // Result from extract_siwe_cap or default
-                    delegator: strip_fragment(&c.payload().iss.to_string()),
-                    delegate: strip_fragment(&c.payload().aud.to_string()),
+                    delegator: strip_fragment(c.payload().iss.as_ref()),
+                    delegate: strip_fragment(c.payload().aud.as_ref()),
                     parents,
                     expiry: c.payload().exp.as_ref().map(|t| *t.as_ref()),
                     not_before: c.payload().nbf.as_ref().map(|t| *t.as_ref()),
@@ -219,7 +219,7 @@ impl TryFrom<TinyCloudRevocation> for RevocationInfo {
                 Some(("ucan", ps)) => Ok(Self {
                     parents: Vec::new(),
                     revoked: ps.parse().map_err(|_| RevocationError::InvalidTarget)?,
-                    revoker: strip_fragment(&c.payload().iss.to_string()),
+                    revoker: strip_fragment(c.payload().iss.as_ref()),
                     revocation: r,
                 }),
                 _ => Err(RevocationError::InvalidTarget),
