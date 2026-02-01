@@ -896,7 +896,9 @@ async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secret
     filters: Option<&ListFilters>,
 ) -> Result<HashMap<Hash, DelegationInfo>, TxError<S, K>> {
     // Resolve session key DID to PKH DID for direction filtering
-    let pkh_did = resolve_pkh_did(db, invoker).await.unwrap_or_else(|_| invoker.to_string());
+    let pkh_did = resolve_pkh_did(db, invoker)
+        .await
+        .unwrap_or_else(|_| invoker.to_string());
 
     let (dels, abilities): (Vec<delegation::Model>, Vec<Vec<abilities::Model>>) =
         delegation::Entity::find()

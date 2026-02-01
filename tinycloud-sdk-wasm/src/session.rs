@@ -110,7 +110,11 @@ impl SessionConfig {
                 |caps, (service, actions)| {
                     actions.into_iter().fold(caps, |mut caps, (path, action)| {
                         // Empty path means wildcard - use None to allow any path to extend
-                        let path_opt = if path.as_str().is_empty() { None } else { Some(path) };
+                        let path_opt = if path.as_str().is_empty() {
+                            None
+                        } else {
+                            Some(path)
+                        };
                         caps.with_actions(
                             self.space_id
                                 .clone()
@@ -208,7 +212,9 @@ impl Session {
 
         // Build the resource from space_id, service "kv", and path
         let service: Service = "kv".parse().map_err(|_| DelegationError::InvalidService)?;
-        let resource = space_id.clone().to_resource(service, Some(path.clone()), None, None);
+        let resource = space_id
+            .clone()
+            .to_resource(service, Some(path.clone()), None, None);
 
         // Collect action strings for the result before consuming them
         let action_strings: Vec<String> = actions.iter().map(|a| a.to_string()).collect();
@@ -221,8 +227,7 @@ impl Session {
         let payload: Payload<serde_json::Value, [(); 0]> = Payload {
             issuer: DIDURLBuf::from_str(&self.verification_method)
                 .map_err(DelegationError::InvalidIssuer)?,
-            audience: DIDBuf::from_str(delegate_did)
-                .map_err(DelegationError::InvalidAudience)?,
+            audience: DIDBuf::from_str(delegate_did).map_err(DelegationError::InvalidAudience)?,
             not_before: not_before_secs
                 .map(NumericDate::try_from_seconds)
                 .transpose()
