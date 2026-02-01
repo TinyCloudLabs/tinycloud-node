@@ -108,6 +108,7 @@ pub fn make_invocation<A: IntoIterator<Item = Ability>>(
     expiration: f64,
     not_before: Option<f64>,
     nonce: Option<String>,
+    facts: Option<Vec<serde_json::Value>>,
 ) -> Result<Ucan, InvocationError> {
     Ok(Payload {
         issuer: DIDURLBuf::from_str(verification_method)?,
@@ -121,7 +122,7 @@ pub fn make_invocation<A: IntoIterator<Item = Ability>>(
         expiration: NumericDate::try_from_seconds(expiration)
             .map_err(InvocationError::NumericDateConversionError)?,
         nonce: Some(nonce.unwrap_or_else(|| format!("urn:uuid:{}", Uuid::new_v4()))),
-        facts: None,
+        facts,
         proof: vec![*delegation],
         attenuation: {
             let mut caps = ucan_capabilities_object::Capabilities::new();

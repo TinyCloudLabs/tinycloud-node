@@ -36,6 +36,12 @@ impl<T> SerializedEvent<T> {
             .map_err(FromReqErr::from)
             .and_then(|(i, s)| Ok(Self(T::try_from(i).map_err(FromReqErr::TryFrom)?, s)))
     }
+
+    /// Hash the serialized bytes of this event.
+    /// This produces a deterministic hash that can be converted to a CID.
+    pub fn hash(&self) -> Hash {
+        hash(&self.1)
+    }
 }
 
 pub type Delegation = SerializedEvent<DelegationInfo>;

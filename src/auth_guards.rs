@@ -97,6 +97,14 @@ where
                     .map_err(|_| Status::InternalServerError)?,
             )
             .respond_to(request),
+            InvocationOutcome::DelegationChain(chain) => Json(
+                chain
+                    .into_iter()
+                    .map(|del| Ok(CapJsonRep::from_delegation(del)?))
+                    .collect::<Result<Vec<CapJsonRep>>>()
+                    .map_err(|_| Status::InternalServerError)?,
+            )
+            .respond_to(request),
         }
     }
 }
