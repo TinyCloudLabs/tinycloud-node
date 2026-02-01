@@ -3,6 +3,10 @@ pub mod host;
 pub mod session;
 
 use hex::FromHex;
+use tinycloud_lib::{
+    ipld_core::cid::Cid,
+    multihash_codetable::{Code, MultihashDigest},
+};
 use tinycloud_sdk_rs::{authorization::InvocationHeaders, util};
 use wasm_bindgen::prelude::*;
 
@@ -178,4 +182,23 @@ pub fn createDelegation(
         .map_err(map_jserr)?;
 
     Ok(serde_wasm_bindgen::to_value(&result)?)
+}
+
+/// Compute a CID from data bytes using Blake3_256 hash.
+///
+/// This uses the same hashing algorithm as the TinyCloud server,
+/// ensuring CID consistency between client and server.
+///
+/// # Arguments
+/// * `data` - The bytes to hash
+/// * `codec` - The multicodec code (e.g., 0x55 for raw)
+///
+/// # Returns
+/// The CID as a string (base32 multibase encoded)
+#[wasm_bindgen]
+#[allow(non_snake_case)]
+pub fn computeCid(data: &[u8], codec: u64) -> String {
+    let hash = Code::Blake3_256.digest(data);
+    let cid = Cid::new_v1(codec, hash);
+    cid.to_string()
 }

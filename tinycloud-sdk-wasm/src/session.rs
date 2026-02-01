@@ -344,8 +344,9 @@ pub fn complete_session_setup(signed_session: SignedSession) -> Result<Session, 
     );
     let serialised = serde_ipld_dagcbor::to_vec(&delegation)?;
     let hash = Code::Blake3_256.digest(&serialised);
-    // DAG CBOR codec is 0x71
-    let delegation_cid = Cid::new_v1(0x71, hash);
+    // Use raw codec 0x55 to match server behavior
+    // Server always returns CIDs with raw codec for consistency
+    let delegation_cid = Cid::new_v1(0x55, hash);
     let delegation_header =
         DelegationHeaders::new(TinyCloudDelegation::Cacao(Box::new(delegation)));
 

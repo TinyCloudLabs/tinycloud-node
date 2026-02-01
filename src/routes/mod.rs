@@ -63,7 +63,7 @@ pub async fn delegate(
     d: AuthHeaderGetter<DelegationInfo>,
     req_span: TracingSpan,
     tinycloud: &State<TinyCloud>,
-) -> Result<(Status, String), (Status, String)> {
+) -> Result<String, (Status, String)> {
     let action_label = "delegation";
     let span = info_span!(parent: &req_span.0, "delegate", action = %action_label);
     // Instrumenting async block to handle yielding properly
@@ -71,9 +71,6 @@ pub async fn delegate(
         let timer = crate::prometheus::AUTHORIZED_INVOKE_HISTOGRAM
             .with_label_values(&["delegate"])
             .start_timer();
-        // Compute the CID from the delegation input - this is deterministic
-        // and will be the same whether newly committed or already existing
-        let delegation_cid = d.0.hash().to_cid(0x55).to_string();
         let res = tinycloud
             .delegate(d.0)
             .await
@@ -87,12 +84,13 @@ pub async fn delegate(
                     e.to_string(),
                 )
             })
-            .map(|c| {
-                // Check if any events were committed (new delegation)
-                let is_new = c.values().any(|commit| !commit.committed_events.is_empty());
-                let status = if is_new { Status::Created } else { Status::Ok };
-                (status, delegation_cid)
-            });
+            .and_then(|c| {
+                c.into_iter()
+                    .next()
+                    .and_then(|(_, c)| c.committed_events.into_iter().next())
+                    .ok_or_else(|| (Status::Unauthorized, "Delegation not committed".to_string()))
+            })
+            .map(|h| h.to_cid(0x55).to_string());
         timer.observe_duration();
         res
     }
