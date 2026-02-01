@@ -1,6 +1,14 @@
-# Changesets (Rust Hybrid)
+# Changesets (Rust Workspace)
 
-This project uses a hybrid approach: changesets for tracking changes, with a custom script to apply them to `Cargo.toml`.
+This project uses a hybrid approach: changesets for tracking changes, with a custom script to apply them to multiple `Cargo.toml` files.
+
+## Crate Groups
+
+| Group/Alias | Crates Affected |
+|-------------|-----------------|
+| `core` or `tinycloud-node` | tinycloud, tinycloud-core, tinycloud-lib |
+| `sdk` | tinycloud-sdk-rs, tinycloud-sdk-wasm |
+| Individual names | siwe, siwe-recap, cacaos |
 
 ## Workflow
 
@@ -8,17 +16,35 @@ This project uses a hybrid approach: changesets for tracking changes, with a cus
 
 ```bash
 bun changeset
-# or manually create a file in .changeset/
+# or manually create .changeset/my-change.md
 ```
 
-Example changeset file (`.changeset/my-change.md`):
+**Examples:**
 
 ```markdown
 ---
-"tinycloud-node": patch
+"core": patch
 ---
 
-Fixed a bug in the authentication flow
+Fixed a bug in the delegation validation
+```
+
+```markdown
+---
+"sdk": minor
+"siwe": patch
+---
+
+Added new delegation helper functions
+Fixed SIWE message parsing edge case
+```
+
+```markdown
+---
+"tinycloud-sdk-wasm": patch
+---
+
+Fixed WASM initialization in static methods
 ```
 
 ### 2. Apply changesets to release
@@ -29,8 +55,8 @@ bun run version
 
 This will:
 - Read all `.changeset/*.md` files
-- Determine the version bump (highest of patch/minor/major wins)
-- Update `Cargo.toml` version
+- Resolve groups to individual crates
+- Update each affected `Cargo.toml`
 - Generate `CHANGELOG.md` entry
 - Delete processed changeset files
 
@@ -38,19 +64,31 @@ This will:
 
 ```bash
 git add -A
-git commit -m "chore: release vX.Y.Z"
-git tag vX.Y.Z
-git push && git push --tags
+git commit -m "chore: release"
+git push
 ```
 
 ## Version Types
 
-- `patch` - Bug fixes, small improvements (0.0.X)
-- `minor` - New features, non-breaking changes (0.X.0)
+- `patch` - Bug fixes (0.0.X)
+- `minor` - New features, non-breaking (0.X.0)
 - `major` - Breaking changes (X.0.0)
 
 ## Multiple Changesets
 
-You can have multiple changeset files. When `bun run version` is called:
+You can have multiple changeset files. When applied:
 - All descriptions are combined into a single CHANGELOG entry
-- The highest bump type wins (major > minor > patch)
+- If a crate is bumped multiple times, the highest bump wins (major > minor > patch)
+
+## Available Packages
+
+| Package Name | Cargo.toml Path |
+|--------------|-----------------|
+| `tinycloud` | `./Cargo.toml` |
+| `tinycloud-core` | `./tinycloud-core/Cargo.toml` |
+| `tinycloud-lib` | `./tinycloud-lib/Cargo.toml` |
+| `tinycloud-sdk-rs` | `./tinycloud-sdk-rs/Cargo.toml` |
+| `tinycloud-sdk-wasm` | `./tinycloud-sdk-wasm/Cargo.toml` |
+| `siwe` | `./siwe/Cargo.toml` |
+| `siwe-recap` | `./siwe-recap/Cargo.toml` |
+| `cacaos` | `./cacao/Cargo.toml` |
