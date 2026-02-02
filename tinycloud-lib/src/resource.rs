@@ -200,7 +200,12 @@ impl ResourceId {
             self.path().map(|p| p.as_str()),
             base.path().map(|p| p.as_str()),
         ) {
-            (Some(s), Some(b)) => !s.starts_with(b),
+            (Some(s), Some(b)) => {
+                !s.starts_with(b)
+                    || !(b.ends_with('/')
+                        || s.len() == b.len()
+                        || s.as_bytes().get(b.len()) == Some(&b'/'))
+            }
             (Some(_), None) | (None, None) => false,
             (None, Some(_)) => true,
         } {

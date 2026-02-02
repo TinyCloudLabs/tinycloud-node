@@ -10,6 +10,16 @@ use tinycloud_lib::{
 };
 use ucan_capabilities_object::Capabilities as UcanCapabilities;
 
+/// Strip the fragment from a DID URL, returning the base DID.
+/// For example: `did:key:z6Mk...#z6Mk...` -> `did:key:z6Mk...`
+///
+/// DID fragments identify specific verification methods, but for identity
+/// comparison purposes, the base DID is sufficient. This normalizes all
+/// DID strings to ensure consistent matching across delegation chains.
+fn strip_fragment(did: &str) -> String {
+    did.split('#').next().unwrap_or(did).to_string()
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Capability {
     pub resource: Resource,
@@ -104,8 +114,8 @@ impl TryFrom<TinyCloudDelegation> for DelegationInfo {
         Ok(match d {
             TinyCloudDelegation::Ucan(ref u) => Self {
                 capabilities: extract_ucan_caps(&u.payload().attenuation),
-                delegator: u.payload().issuer.to_string(),
-                delegate: u.payload().audience.to_string(),
+                delegator: strip_fragment(&u.payload().issuer.to_string()),
+                delegate: strip_fragment(&u.payload().audience.to_string()),
                 parents: u.payload().proof.clone(),
                 expiry: OffsetDateTime::from_unix_timestamp_nanos(
                     (u.payload().expiration.as_seconds() * 1_000_000_000.0) as i128,
@@ -138,8 +148,8 @@ impl TryFrom<TinyCloudDelegation> for DelegationInfo {
 
                 Self {
                     capabilities, // Result from extract_siwe_cap or default
-                    delegator: c.payload().iss.to_string(),
-                    delegate: c.payload().aud.to_string(),
+                    delegator: strip_fragment(c.payload().iss.as_ref()),
+                    delegate: strip_fragment(c.payload().aud.as_ref()),
                     parents,
                     expiry: c.payload().exp.as_ref().map(|t| *t.as_ref()),
                     not_before: c.payload().nbf.as_ref().map(|t| *t.as_ref()),
@@ -179,7 +189,7 @@ impl TryFrom<TinyCloudInvocation> for InvocationInfo {
     fn try_from(invocation: TinyCloudInvocation) -> Result<Self, Self::Error> {
         Ok(Self {
             capabilities: extract_ucan_caps(&invocation.payload().attenuation),
-            invoker: invocation.payload().issuer.to_string(),
+            invoker: strip_fragment(&invocation.payload().issuer.to_string()),
             parents: invocation.payload().proof.clone(),
             invocation,
         })
@@ -209,7 +219,7 @@ impl TryFrom<TinyCloudRevocation> for RevocationInfo {
                 Some(("ucan", ps)) => Ok(Self {
                     parents: Vec::new(),
                     revoked: ps.parse().map_err(|_| RevocationError::InvalidTarget)?,
-                    revoker: c.payload().iss.to_string(),
+                    revoker: strip_fragment(c.payload().iss.as_ref()),
                     revocation: r,
                 }),
                 _ => Err(RevocationError::InvalidTarget),

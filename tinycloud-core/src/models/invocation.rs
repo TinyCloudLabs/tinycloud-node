@@ -192,6 +192,24 @@ async fn save<C: ConnectionTrait>(
     let hash = crate::hash::hash(&serialization);
     let issued_at = time.unwrap_or_else(OffsetDateTime::now_utc);
 
+    // Ensure the invoker actor exists before inserting the invocation
+    match actor::Entity::insert(actor::ActiveModel::from(actor::Model {
+        id: invocation.invoker.clone(),
+    }))
+    .on_conflict(
+        OnConflict::column(actor::Column::Id)
+            .do_nothing()
+            .to_owned(),
+    )
+    .exec(db)
+    .await
+    {
+        Err(DbErr::RecordNotInserted) => (),
+        r => {
+            r?;
+        }
+    };
+
     match Entity::insert(ActiveModel::from(Model {
         id: hash,
         issued_at,
