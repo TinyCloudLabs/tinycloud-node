@@ -115,6 +115,10 @@ pub enum DelegationError {
     UnauthorizedCapability(Resource, Ability),
     #[error("Cannot find parent delegation")]
     MissingParents,
+    #[error("Child delegation expiry exceeds parent expiry")]
+    ExpiryExceedsParent,
+    #[error("Child delegation not_before precedes parent not_before")]
+    NotBeforePrecedesParent,
 }
 
 pub(crate) async fn process<C: ConnectionTrait>(
@@ -179,14 +183,25 @@ async fn validate<C: ConnectionTrait>(
         (false, true) => Err(DelegationError::MissingParents.into()),
         // dependant caps, parents, check parents
         (false, false) => {
-            // get parents which have
-            let parents: Vec<_> = Entity::find()
+            // get parents which have the correct id and delegatee
+            let all_parents: Vec<_> = Entity::find()
                 // the correct id
                 .filter(Column::Id.is_in(delegation.parents.iter().map(|c| Hash::from(*c))))
                 // the correct delegatee
                 .filter(Column::Delegatee.eq(delegation.delegator.clone()))
                 .all(db)
-                .await?
+                .await?;
+
+            // If no parents match by CID and delegatee, return MissingParents
+            if all_parents.is_empty() {
+                return Err(DelegationError::MissingParents.into());
+            }
+
+            // Check time constraints and track failures
+            let mut expiry_failed = false;
+            let mut not_before_failed = false;
+
+            let parents: Vec<_> = all_parents
                 .into_iter()
                 .filter(|p| {
                     // valid time bounds: child's validity must be within parent's validity
@@ -202,9 +217,27 @@ async fn validate<C: ConnectionTrait>(
                         (Some(_), None) => false, // parent has restriction but child claims immediate validity
                         (Some(pnbf), Some(dnbf)) => *dnbf >= *pnbf, // child must become valid at or after parent
                     };
+
+                    if !expiry_valid {
+                        expiry_failed = true;
+                    }
+                    if !not_before_valid {
+                        not_before_failed = true;
+                    }
+
                     expiry_valid && not_before_valid
                 })
                 .collect();
+
+            // If all parents were filtered out due to time constraints, return specific error
+            if parents.is_empty() {
+                if expiry_failed {
+                    return Err(DelegationError::ExpiryExceedsParent.into());
+                }
+                if not_before_failed {
+                    return Err(DelegationError::NotBeforePrecedesParent.into());
+                }
+            }
 
             // get delegated abilities from each parent
             let parent_abilities = parents.load_many(abilities::Entity, db).await?;
