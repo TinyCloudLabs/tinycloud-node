@@ -100,15 +100,21 @@ impl HeaderEncode for TinyCloudRevocation {
     }
 }
 
+/// Optional parameters for creating an invocation.
+#[derive(Default)]
+pub struct InvocationOptions {
+    pub not_before: Option<f64>,
+    pub nonce: Option<String>,
+    pub facts: Option<Vec<serde_json::Value>>,
+}
+
 pub fn make_invocation<A: IntoIterator<Item = Ability>>(
     invocation_target: impl IntoIterator<Item = (ResourceId, A)>,
     delegation: &Cid,
     jwk: &JWK,
     verification_method: &str,
     expiration: f64,
-    not_before: Option<f64>,
-    nonce: Option<String>,
-    facts: Option<Vec<serde_json::Value>>,
+    options: InvocationOptions,
 ) -> Result<Ucan, InvocationError> {
     Ok(Payload {
         issuer: DIDURLBuf::from_str(verification_method)?,
@@ -118,11 +124,18 @@ pub fn make_invocation<A: IntoIterator<Item = Ability>>(
                 .next()
                 .unwrap_or(verification_method),
         )?,
-        not_before: not_before.map(NumericDate::try_from_seconds).transpose()?,
+        not_before: options
+            .not_before
+            .map(NumericDate::try_from_seconds)
+            .transpose()?,
         expiration: NumericDate::try_from_seconds(expiration)
             .map_err(InvocationError::NumericDateConversionError)?,
-        nonce: Some(nonce.unwrap_or_else(|| format!("urn:uuid:{}", Uuid::new_v4()))),
-        facts,
+        nonce: Some(
+            options
+                .nonce
+                .unwrap_or_else(|| format!("urn:uuid:{}", Uuid::new_v4())),
+        ),
+        facts: options.facts,
         proof: vec![*delegation],
         attenuation: {
             let mut caps = ucan_capabilities_object::Capabilities::new();

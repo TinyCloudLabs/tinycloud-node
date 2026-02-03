@@ -1,6 +1,6 @@
 [package]
 name = "tinycloud-core"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -21,7 +21,7 @@ sea-orm-migration = { version = "1.1", default-features = false }
 futures.workspace = true
 pin-project.workspace = true
 time.workspace = true
-tinycloud-lib = { version = "0.2", path = "../tinycloud-lib" }
+tinycloud-lib = { version = "1.0", path = "../tinycloud-lib" }
 libp2p = { version = "0.52.1", default-features = false, features = ["ed25519"] }
 thiserror.workspace = true
 serde.workspace = true

@@ -14,6 +14,12 @@ fn map_jserr<E: std::error::Error>(e: E) -> JsValue {
     e.to_string().into()
 }
 
+#[wasm_bindgen]
+#[allow(non_snake_case)]
+pub fn protocolVersion() -> u32 {
+    tinycloud_lib::protocol::PROTOCOL_VERSION
+}
+
 // removing since we have duplicate usage elsewhere
 // #[wasm_bindgen]
 // #[allow(non_snake_case)]

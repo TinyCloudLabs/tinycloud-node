@@ -1,6 +1,6 @@
 [package]
 name = "cacaos"
-version = "0.5.1"
+version = "1.0.0"
 authors = ["Spruce Systems, Inc."]
 edition = "2021"
 license-file = "../LICENSE.md"

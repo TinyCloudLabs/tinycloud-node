@@ -18,7 +18,7 @@ pub mod storage;
 mod tracing;
 
 use config::{BlockStorage, Config, Keys, StagingStorage};
-use routes::{delegate, invoke, open_host_key, util_routes::*};
+use routes::{delegate, invoke, open_host_key, version, util_routes::*};
 use storage::{
     file_system::{FileSystemConfig, FileSystemStore, TempFileSystemStage},
     s3::{S3BlockConfig, S3BlockStore},
@@ -77,7 +77,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
 
     tracing::tracing_try_init(&tinycloud_config.log)?;
 
-    let routes = routes![healthcheck, cors, open_host_key, invoke, delegate,];
+    let routes = routes![healthcheck, cors, version, open_host_key, invoke, delegate,];
 
     let key_setup: StaticSecret = match tinycloud_config.keys {
         Keys::Static(s) => s.try_into()?,

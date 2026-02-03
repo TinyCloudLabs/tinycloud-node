@@ -1,5 +1,6 @@
 use anyhow::Result;
-use rocket::{data::ToByteUnit, http::Status, State};
+use rocket::{data::ToByteUnit, http::Status, serde::json::Json, State};
+use serde::Serialize;
 use std::collections::HashMap;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{info_span, Instrument};
@@ -21,6 +22,22 @@ use tinycloud_core::{
 
 pub mod util;
 use util::LimitedReader;
+
+#[derive(Serialize)]
+pub struct VersionInfo {
+    pub protocol: u32,
+    pub version: String,
+    pub features: Vec<&'static str>,
+}
+
+#[get("/version")]
+pub fn version() -> Json<VersionInfo> {
+    Json(VersionInfo {
+        protocol: tinycloud_lib::protocol::PROTOCOL_VERSION,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        features: vec!["kv", "delegation", "sharing"],
+    })
+}
 
 #[allow(clippy::let_unit_value)]
 pub mod util_routes {
