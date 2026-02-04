@@ -1,4 +1,5 @@
 pub mod authorization;
+pub mod protocol;
 pub mod resolver;
 pub mod resource;
 

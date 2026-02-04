@@ -4,7 +4,10 @@ use serde_ipld_dagcbor::EncodeError;
 use serde_with::{serde_as, DisplayFromStr};
 use std::collections::HashMap;
 use tinycloud_lib::{
-    authorization::{make_invocation, InvocationError, TinyCloudDelegation, TinyCloudInvocation},
+    authorization::{
+        make_invocation, InvocationError, InvocationOptions, TinyCloudDelegation,
+        TinyCloudInvocation,
+    },
     cacaos::{
         siwe::{generate_nonce, Message, TimeStamp, Version as SIWEVersion},
         siwe_cacao::{Header as SiweHeader, Signature, SiweCacao},
@@ -169,9 +172,10 @@ impl Session {
             &self.jwk,
             &self.verification_method,
             exp,
-            None,
-            None,
-            facts,
+            InvocationOptions {
+                facts,
+                ..Default::default()
+            },
         )
     }
 
@@ -417,7 +421,7 @@ pub mod test {
         let p: Path = "path".parse().unwrap();
         let a: Ability = "tinycloud.kv/get".parse().unwrap();
         test_session()
-            .invoke([(s, p, None, None, [a])])
+            .invoke([(s, p, None, None, [a])], None)
             .expect("failed to create invocation");
     }
 }

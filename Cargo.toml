@@ -1,6 +1,6 @@
 [package]
 name = "tinycloud"
-version = "0.2.1"
+version = "1.0.0"
 authors = ["TinyCloud Protocol"]
 edition = "2021"
 license-file = "LICENSE.md"
@@ -81,12 +81,12 @@ serde_ipld_dagcbor = "0.6"
 ucan-capabilities-object = { git = "https://github.com/tinycloudlabs/ucan-capabilities-object" }
 
 # Internal crate dependencies
-tinycloud-lib = { path = "tinycloud-lib", version = "0.2.0" }
-tinycloud-core = { path = "tinycloud-core", version = "0.1.0" }
-tinycloud-sdk-rs = { path = "tinycloud-sdk-rs", version = "0.2.0" }
+tinycloud-lib = { path = "tinycloud-lib", version = "1.0.0" }
+tinycloud-core = { path = "tinycloud-core", version = "1.0.0" }
+tinycloud-sdk-rs = { path = "tinycloud-sdk-rs", version = "1.0.0" }
 siwe = { path = "siwe", version = "1.0.0" }
-siwe-recap = { path = "siwe-recap", version = "0.2.0" }
-cacaos = { path = "cacao", version = "0.5.1" }
+siwe-recap = { path = "siwe-recap", version = "1.0.0" }
+cacaos = { path = "cacao", version = "1.0.0" }
 
 # Security patches for transitive dependencies
 [patch.crates-io]
