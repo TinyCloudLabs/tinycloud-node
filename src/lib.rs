@@ -18,7 +18,7 @@ pub mod storage;
 mod tracing;
 
 use config::{BlockStorage, Config, Keys, StagingStorage};
-use routes::{delegate, invoke, open_host_key, version, util_routes::*};
+use routes::{delegate, invoke, open_host_key, util_routes::*, version};
 use storage::{
     file_system::{FileSystemConfig, FileSystemStore, TempFileSystemStage},
     s3::{S3BlockConfig, S3BlockStore},

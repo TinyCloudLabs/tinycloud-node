@@ -421,7 +421,7 @@ pub mod test {
         let p: Path = "path".parse().unwrap();
         let a: Ability = "tinycloud.kv/get".parse().unwrap();
         test_session()
-            .invoke([(s, p, None, None, [a])])
+            .invoke([(s, p, None, None, [a])], None)
             .expect("failed to create invocation");
     }
 }
