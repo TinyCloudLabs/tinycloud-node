@@ -1,12 +1,41 @@
 ![TinyCloud Protocol header](/docs/tinycloudheader.png)
 
-[![](https://img.shields.io/badge/License-Apache--2.0-green)](https://github.com/TinyCloudLabs/tinycloud-node/blob/main/LICENSE)
+[![](https://img.shields.io/badge/License-EGPL--1.5-green)](https://github.com/TinyCloudLabs/tinycloud-node/blob/main/LICENSE.md)
+[![](https://img.shields.io/badge/Version-1.0.0-blue)](https://github.com/TinyCloudLabs/tinycloud-node/releases)
 
-# TinyCloud Protocol
+# TinyCloud Node
 
-The TinyCloud Protocol is a framework for creating interoperable software applications where users retain full sovereignty over their data. It provides a decentralized or user-controlled "cloud" that can serve as the backend for multiple apps, allowing users to maintain control over their data without ceding ownership or privacy to third parties. TinyCloud is built on core values of sovereignty, privacy, and interoperability, enabling users to store, stream, and compute upon their data in ways that minimize leakage while providing fine-grained permissioning capabilities.
+TinyCloud Node is the server component of the TinyCloud Protocol — a framework for creating interoperable software applications where users retain full sovereignty over their data. It provides a decentralized or user-controlled "cloud" that can serve as the backend for multiple apps, allowing users to maintain control over their data without ceding ownership or privacy to third parties.
 
-TinyCloud Protocol is self-sovereign storage. It is a decendant of [Kepler](https://github.com/spruceid/kepler) and is architected as a decentralized storage system that uses DIDs and Authorization Capabilities to define TinyCloud Spaces, where your data lives and who has access. Any DID controller (e.g. people, applications, DAOs) can administer their own TinyCloud Protocol Space.
+TinyCloud Node hosts user data spaces, processes delegations, and serves the KV storage API. It is a descendant of [Kepler](https://github.com/spruceid/kepler) and is architected as a decentralized storage system that uses DIDs and Authorization Capabilities to define TinyCloud Spaces, where your data lives and who has access.
+
+## Protocol Version
+
+TinyCloud Node v1.0.0 introduces a protocol version system for SDK-node compatibility. The node exposes a public `/version` endpoint:
+
+```
+GET /version
+```
+
+```json
+{
+  "protocol": 1,
+  "version": "1.0.0",
+  "features": ["kv", "delegation", "sharing"]
+}
+```
+
+The SDK checks this endpoint during sign-in and requires an exact protocol version match. This ensures clients and servers are always running compatible versions.
+
+## API Endpoints
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `GET` | `/version` | No | Protocol version and feature discovery |
+| `POST` | `/invoke` | Yes | Execute KV operations (get, put, list, delete) |
+| `POST` | `/delegate` | Yes | Create capability delegations |
+| `GET` | `/peer/generate/<space>` | No | Generate space host key pair |
+| `GET` | `/healthz` | No | Health check |
 
 ## Quickstart
 
