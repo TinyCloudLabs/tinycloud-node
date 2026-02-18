@@ -2,6 +2,7 @@ use anyhow::Result;
 use rocket::{data::ToByteUnit, http::Status, serde::json::Json, State};
 use serde::Serialize;
 use std::collections::HashMap;
+use tokio::io::AsyncReadExt;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{info_span, Instrument};
 
@@ -14,10 +15,11 @@ use crate::{
 };
 use tinycloud_core::{
     sea_orm::DbErr,
+    sql::{SqlCaveats, SqlError, SqlRequest, SqlService},
     storage::{ImmutableReadStore, ImmutableStaging},
     types::Resource,
     util::{DelegationInfo, InvocationInfo},
-    TxError, TxStoreError,
+    InvocationOutcome, TxError, TxStoreError,
 };
 
 pub mod util;
@@ -35,7 +37,7 @@ pub fn version() -> Json<VersionInfo> {
     Json(VersionInfo {
         protocol: tinycloud_lib::protocol::PROTOCOL_VERSION,
         version: env!("CARGO_PKG_VERSION").to_string(),
-        features: vec!["kv", "delegation", "sharing"],
+        features: vec!["kv", "delegation", "sharing", "sql"],
     })
 }
 
@@ -116,6 +118,7 @@ pub async fn delegate(
 }
 
 #[post("/invoke", data = "<data>")]
+#[allow(clippy::too_many_arguments)]
 pub async fn invoke(
     i: AuthHeaderGetter<InvocationInfo>,
     req_span: TracingSpan,
@@ -124,6 +127,7 @@ pub async fn invoke(
     staging: &State<BlockStage>,
     tinycloud: &State<TinyCloud>,
     config: &State<Config>,
+    sql_service: &State<SqlService>,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
     let action_label = "invocation";
     let span = info_span!(parent: &req_span.0, "invoke", action = %action_label);
@@ -132,6 +136,32 @@ pub async fn invoke(
         let timer = crate::prometheus::AUTHORIZED_INVOKE_HISTOGRAM
             .with_label_values(&["invoke"])
             .start_timer();
+
+        // Check for SQL capabilities
+        let sql_caps: Vec<_> = i
+            .0
+             .0
+            .capabilities
+            .iter()
+            .filter_map(|c| match (&c.resource, c.ability.as_ref().as_ref()) {
+                (Resource::TinyCloud(r), ability)
+                    if r.service().as_str() == "sql" && ability.starts_with("tinycloud.sql/") =>
+                {
+                    Some((
+                        r.space().clone(),
+                        r.path().map(|p| p.to_string()),
+                        ability.to_string(),
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
+
+        if !sql_caps.is_empty() {
+            let result = handle_sql_invoke(i, data, tinycloud, sql_service, &sql_caps).await;
+            timer.observe_duration();
+            return result;
+        }
 
         let mut put_iter = i.0 .0.capabilities.iter().filter_map(|c| {
             match (&c.resource, c.ability.as_ref().as_ref()) {
@@ -228,4 +258,101 @@ pub async fn invoke(
     }
     .instrument(span)
     .await
+}
+
+async fn handle_sql_invoke(
+    i: AuthHeaderGetter<InvocationInfo>,
+    data: DataIn<'_>,
+    tinycloud: &State<TinyCloud>,
+    sql_service: &State<SqlService>,
+    sql_caps: &[(tinycloud_lib::resource::SpaceId, Option<String>, String)],
+) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
+    // Extract caveats from the invocation facts before consuming i
+    let caveats: Option<SqlCaveats> =
+        i.0 .0
+            .invocation
+            .payload()
+            .facts
+            .as_ref()
+            .and_then(|facts| {
+                facts.iter().find_map(|fact| {
+                    fact.as_object()
+                        .and_then(|obj| obj.get("sqlCaveats"))
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                })
+            });
+
+    // Verify authorization by invoking with empty inputs
+    // SQL capabilities don't match KV patterns, so invoke just verifies auth
+    tinycloud
+        .invoke::<BlockStage>(i.0, HashMap::new())
+        .await
+        .map_err(|e| {
+            (
+                match e {
+                    TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
+                    TxStoreError::Tx(TxError::Db(DbErr::ConnectionAcquire(_))) => {
+                        Status::InternalServerError
+                    }
+                    _ => Status::Unauthorized,
+                },
+                e.to_string(),
+            )
+        })?;
+
+    // Read the request body as JSON
+    let body_str = match data {
+        DataIn::One(d) => {
+            let mut buf = Vec::new();
+            let mut reader = d.open(1u8.megabytes());
+            reader
+                .read_to_end(&mut buf)
+                .await
+                .map_err(|e| (Status::BadRequest, e.to_string()))?;
+            String::from_utf8(buf).map_err(|e| (Status::BadRequest, e.to_string()))?
+        }
+        _ => {
+            return Err((Status::BadRequest, "Expected JSON body".to_string()));
+        }
+    };
+
+    let (space, path, ability) = &sql_caps[0];
+    let db_name = SqlService::db_name_from_path(path.as_deref());
+
+    let sql_request: SqlRequest =
+        serde_json::from_str(&body_str).map_err(|e| (Status::BadRequest, e.to_string()))?;
+
+    // Handle export specially
+    if matches!(sql_request, SqlRequest::Export) {
+        let data = sql_service
+            .export(space, &db_name)
+            .await
+            .map_err(|e| (sql_error_to_status(&e), e.to_string()))?;
+        return Ok(DataOut::One(InvOut(InvocationOutcome::SqlExport(data))));
+    }
+
+    let response = sql_service
+        .execute(space, &db_name, sql_request, caveats, ability.clone())
+        .await
+        .map_err(|e| (sql_error_to_status(&e), e.to_string()))?;
+
+    let json =
+        serde_json::to_value(response).map_err(|e| (Status::InternalServerError, e.to_string()))?;
+
+    Ok(DataOut::One(InvOut(InvocationOutcome::SqlResult(json))))
+}
+
+fn sql_error_to_status(err: &SqlError) -> Status {
+    match err {
+        SqlError::Sqlite(_) => Status::BadRequest,
+        SqlError::PermissionDenied(_) => Status::Forbidden,
+        SqlError::DatabaseNotFound => Status::NotFound,
+        SqlError::ResponseTooLarge(_) => Status::new(413),
+        SqlError::QuotaExceeded => Status::new(429),
+        SqlError::InvalidStatement(_) => Status::BadRequest,
+        SqlError::SchemaError(_) => Status::BadRequest,
+        SqlError::ReadOnlyViolation => Status::Forbidden,
+        SqlError::ParseError(_) => Status::BadRequest,
+        SqlError::Internal(_) => Status::InternalServerError,
+    }
 }

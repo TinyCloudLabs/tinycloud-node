@@ -83,6 +83,33 @@ pub struct SpacesConfig {
     pub allowlist: Option<SpaceAllowListService>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct SqlStorageConfig {
+    #[serde(default = "default_sql_path")]
+    pub path: String,
+    pub limit: Option<ByteUnit>,
+    #[serde(default = "default_sql_memory_threshold")]
+    pub memory_threshold: ByteUnit,
+}
+
+fn default_sql_path() -> String {
+    "./tinycloud/sql".to_string()
+}
+
+fn default_sql_memory_threshold() -> ByteUnit {
+    ByteUnit::Mebibyte(10)
+}
+
+impl Default for SqlStorageConfig {
+    fn default() -> Self {
+        Self {
+            path: default_sql_path(),
+            limit: None,
+            memory_threshold: default_sql_memory_threshold(),
+        }
+    }
+}
+
 #[serde_as]
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Storage {
@@ -95,6 +122,8 @@ pub struct Storage {
     #[serde(default = "memory_db")]
     pub database: String,
     pub limit: Option<ByteUnit>,
+    #[serde(default)]
+    pub sql: SqlStorageConfig,
 }
 
 impl Default for Storage {
@@ -104,6 +133,7 @@ impl Default for Storage {
             staging: StagingStorage::default().into(),
             database: memory_db(),
             limit: None,
+            sql: SqlStorageConfig::default(),
         }
     }
 }
