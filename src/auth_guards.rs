@@ -11,6 +11,7 @@ use rocket::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use tinycloud_core::{
+    hash::Hash,
     types::Metadata,
     util::{Capability, DelegationInfo},
     InvocationOutcome,
@@ -81,9 +82,9 @@ where
             InvocationOutcome::KvDelete => ().respond_to(request),
             InvocationOutcome::KvMetadata(meta) => meta.map(ObjectHeaders).respond_to(request),
             InvocationOutcome::KvWrite => ().respond_to(request),
-            InvocationOutcome::KvRead(data) => {
-                data.map(|(md, c)| KVResponse(c, md)).respond_to(request)
-            }
+            InvocationOutcome::KvRead(data) => data
+                .map(|(md, hash, c)| KVResponse(c, md, hash))
+                .respond_to(request),
             InvocationOutcome::OpenSessions(sessions) => Json(
                 sessions
                     .into_iter()
@@ -170,11 +171,11 @@ impl<'r> Responder<'r, 'static> for ObjectHeaders {
     }
 }
 
-pub struct KVResponse<R>(R, pub Metadata);
+pub struct KVResponse<R>(R, pub Metadata, pub Hash);
 
 impl<R> KVResponse<R> {
-    pub fn new(md: Metadata, reader: R) -> Self {
-        Self(reader, md)
+    pub fn new(md: Metadata, hash: Hash, reader: R) -> Self {
+        Self(reader, md, hash)
     }
 }
 
@@ -183,7 +184,9 @@ where
     R: 'static + AsyncRead + Send,
 {
     fn respond_to(self, r: &'r Request<'_>) -> rocket::response::Result<'static> {
+        let etag = format!("\"blake3-{}\"", hex::encode(self.2.as_ref()));
         Ok(Response::build_from(ObjectHeaders(self.1).respond_to(r)?)
+            .header(Header::new("ETag", etag))
             // must ensure that Metadata::respond_to does not set the body of the response
             .streamed_body(self.0.compat())
             .finalize())

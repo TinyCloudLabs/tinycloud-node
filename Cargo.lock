@@ -8592,6 +8592,7 @@ dependencies = [
  "aws-types",
  "base64 0.13.1",
  "futures",
+ "hex",
  "hyper 0.14.32",
  "lazy_static",
  "opentelemetry",
