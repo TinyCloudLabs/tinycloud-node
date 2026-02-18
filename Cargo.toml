@@ -16,6 +16,7 @@ aws-types = "0.49"
 aws-smithy-http = "0.49"
 base64 = "0.13"
 futures = { default-features = false, version = "0.3", features = ["alloc", "std"] }
+hex.workspace = true
 hyper = "0.14" # Prometheus server
 lazy_static = "1.4.0"
 opentelemetry = { version = "0.29.1" }

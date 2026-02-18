@@ -369,7 +369,7 @@ pub enum InvocationOutcome<R> {
     KvDelete,
     KvMetadata(Option<Metadata>),
     KvWrite,
-    KvRead(Option<(Metadata, Content<R>)>),
+    KvRead(Option<(Metadata, Hash, Content<R>)>),
     OpenSessions(HashMap<Hash, DelegationInfo>),
     /// Ordered delegation chain from leaf to root
     DelegationChain(Vec<DelegationInfo>),
@@ -729,7 +729,7 @@ async fn get_kv<C: ConnectionTrait, B: ImmutableReadStore>(
     space_id: &SpaceId,
     key: &Path,
     // TODO version: Option<(i64, Hash, i64)>,
-) -> Result<Option<(Metadata, Content<B::Readable>)>, EitherError<DbErr, B::Error>> {
+) -> Result<Option<(Metadata, Hash, Content<B::Readable>)>, EitherError<DbErr, B::Error>> {
     let e = match get_kv_entity(db, space_id, key)
         .await
         .map_err(EitherError::A)?
@@ -737,15 +737,16 @@ async fn get_kv<C: ConnectionTrait, B: ImmutableReadStore>(
         Some(entry) => entry,
         None => return Ok(None),
     };
+    let content_hash = e.value;
     let c = match store
-        .read(space_id, &e.value)
+        .read(space_id, &content_hash)
         .await
         .map_err(EitherError::B)?
     {
         Some(c) => c,
         None => return Ok(None),
     };
-    Ok(Some((e.metadata, c)))
+    Ok(Some((e.metadata, content_hash, c)))
 }
 
 async fn get_kv_entity<C: ConnectionTrait>(
