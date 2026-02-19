@@ -29,6 +29,10 @@ serde_json.workspace = true
 serde_ipld_dagcbor = "0.3"
 ucan-capabilities-object.workspace = true
 multihash-derive = "0.9"
+rusqlite.workspace = true
+sqlparser.workspace = true
+tracing.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 sea-orm = { version = "1.1", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }

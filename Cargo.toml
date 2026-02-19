@@ -80,6 +80,9 @@ async-trait = "0.1"
 ipld-core = { version = "0.4", features = ["serde"] }
 serde_ipld_dagcbor = "0.6"
 ucan-capabilities-object = { git = "https://github.com/tinycloudlabs/ucan-capabilities-object" }
+rusqlite = { version = "0.32", features = ["bundled", "column_decltype", "hooks", "backup"] }
+sqlparser = { version = "0.44", features = ["serde"] }
+tracing = "0.1"
 
 # Internal crate dependencies
 tinycloud-lib = { path = "tinycloud-lib", version = "1.0.0" }

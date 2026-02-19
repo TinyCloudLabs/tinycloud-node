@@ -6,6 +6,7 @@ pub mod manifest;
 pub mod migrations;
 pub mod models;
 pub mod relationships;
+pub mod sql;
 pub mod storage;
 pub mod types;
 pub mod util;

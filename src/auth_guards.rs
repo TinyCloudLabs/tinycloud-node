@@ -106,6 +106,11 @@ where
                     .map_err(|_| Status::InternalServerError)?,
             )
             .respond_to(request),
+            InvocationOutcome::SqlResult(json) => Json(json).respond_to(request),
+            InvocationOutcome::SqlExport(data) => Response::build()
+                .header(ContentType::new("application", "x-sqlite3"))
+                .sized_body(data.len(), std::io::Cursor::new(data))
+                .ok(),
         }
     }
 }

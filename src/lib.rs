@@ -26,6 +26,7 @@ use storage::{
 use tinycloud_core::{
     keys::{SecretsSetup, StaticSecret},
     sea_orm::{ConnectOptions, Database, DatabaseConnection},
+    sql::SqlService,
     storage::{either::Either, memory::MemoryStaging, StorageConfig},
     SpaceDatabase,
 };
@@ -93,6 +94,11 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     )
     .await?;
 
+    let sql_service = SqlService::new(
+        tinycloud_config.storage.sql.path.clone(),
+        tinycloud_config.storage.sql.memory_threshold.as_u64(),
+    );
+
     let rocket = rocket::custom(config)
         .mount("/", routes)
         .attach(AdHoc::config::<Config>())
@@ -100,6 +106,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
             header_name: tinycloud_config.log.tracing.traceheader,
         })
         .manage(tinycloud)
+        .manage(sql_service)
         .manage(tinycloud_config.storage.staging.open().await?);
 
     if tinycloud_config.cors {

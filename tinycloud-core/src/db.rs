@@ -373,6 +373,8 @@ pub enum InvocationOutcome<R> {
     OpenSessions(HashMap<Hash, DelegationInfo>),
     /// Ordered delegation chain from leaf to root
     DelegationChain(Vec<DelegationInfo>),
+    SqlResult(serde_json::Value),
+    SqlExport(Vec<u8>),
 }
 
 impl<S: StorageSetup, K: Secrets> From<delegation::Error> for TxError<S, K> {
