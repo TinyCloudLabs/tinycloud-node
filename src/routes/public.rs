@@ -1,7 +1,7 @@
 use rocket::{
     futures::io::AsyncRead,
-    http::{Header, Status},
-    request::{FromRequest, Outcome, Request},
+    http::{uri::fmt, Header, Status},
+    request::{FromRequest, FromSegments, Outcome, Request},
     response::{Responder, Response},
     serde::json::Json,
     State,
@@ -12,6 +12,25 @@ use tinycloud_lib::resource::{Path, SpaceId};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 use crate::{auth_guards::ObjectHeaders, config::PublicSpacesConfig, BlockStores, TinyCloud};
+
+/// A key path that allows dot-prefixed segments like `.well-known/profile`.
+/// Unlike `std::path::PathBuf`, this does not reject hidden files/dirs.
+pub struct RawKeyPath(pub String);
+
+impl<'r> FromSegments<'r> for RawKeyPath {
+    type Error = String;
+
+    fn from_segments(
+        segments: rocket::http::uri::Segments<'r, fmt::Path>,
+    ) -> Result<Self, Self::Error> {
+        let joined: String = segments.collect::<Vec<_>>().join("/");
+        if joined.is_empty() {
+            Err("Empty key path".to_string())
+        } else {
+            Ok(RawKeyPath(joined))
+        }
+    }
+}
 
 /// Check if a space is a public space based on its name.
 pub fn is_public_space(space_id: &SpaceId) -> bool {
@@ -117,7 +136,7 @@ fn add_public_headers(response: &mut Response<'_>, etag: Option<&str>) {
     }
 }
 
-pub struct PublicKVResponse<R>(Content<R>, crate::auth_guards::ObjectHeaders, String);
+pub struct PublicKVResponse<R>(Content<R>, ObjectHeaders, String);
 
 impl<'r, R> Responder<'r, 'static> for PublicKVResponse<R>
 where
@@ -142,7 +161,7 @@ impl<'r> Responder<'r, 'static> for NotModifiedResponse {
     }
 }
 
-pub struct PublicMetadataResponse(crate::auth_guards::ObjectHeaders, String);
+pub struct PublicMetadataResponse(ObjectHeaders, String);
 
 impl<'r> Responder<'r, 'static> for PublicMetadataResponse {
     fn respond_to(self, r: &'r Request<'_>) -> rocket::response::Result<'static> {
@@ -167,7 +186,7 @@ impl<'r> Responder<'r, 'static> for PublicListResponse {
 #[get("/public/<space_id>/kv/<key..>")]
 pub async fn public_kv_get(
     space_id: &str,
-    key: std::path::PathBuf,
+    key: RawKeyPath,
     if_none_match: Option<IfNoneMatch>,
     client_ip: ClientIp,
     rate_limiter: &State<RateLimiter>,
@@ -189,8 +208,7 @@ pub async fn public_kv_get(
     }
 
     let key: Path = key
-        .to_str()
-        .ok_or_else(|| (Status::BadRequest, "Invalid key".to_string()))?
+        .0
         .parse()
         .map_err(|_| (Status::BadRequest, "Invalid key".to_string()))?;
 
@@ -218,7 +236,7 @@ pub async fn public_kv_get(
 #[head("/public/<space_id>/kv/<key..>")]
 pub async fn public_kv_head(
     space_id: &str,
-    key: std::path::PathBuf,
+    key: RawKeyPath,
     if_none_match: Option<IfNoneMatch>,
     client_ip: ClientIp,
     rate_limiter: &State<RateLimiter>,
@@ -237,13 +255,10 @@ pub async fn public_kv_head(
     }
 
     let key: Path = key
-        .to_str()
-        .ok_or_else(|| (Status::BadRequest, "Invalid key".to_string()))?
+        .0
         .parse()
         .map_err(|_| (Status::BadRequest, "Invalid key".to_string()))?;
 
-    // For HEAD we need the hash for ETag but don't need the content body.
-    // We use public_kv_get to get the hash, then return only metadata.
     let result = tinycloud
         .public_kv_get(&space_id, &key)
         .await
@@ -299,11 +314,6 @@ pub async fn public_kv_list(
 }
 
 #[options("/public/<_space_id>/kv/<_key..>")]
-pub async fn public_kv_options_key(_space_id: &str, _key: std::path::PathBuf) -> Status {
-    Status::NoContent
-}
-
-#[options("/public/<_space_id>/kv")]
-pub async fn public_kv_options_list(_space_id: &str) -> Status {
+pub async fn public_kv_options(_space_id: &str, _key: RawKeyPath) -> Status {
     Status::NoContent
 }
