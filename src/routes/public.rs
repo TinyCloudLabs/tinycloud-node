@@ -122,11 +122,7 @@ const CORS_EXPOSE_HEADERS: &str = "ETag, Content-Type, Content-Length";
 
 /// Headers safe to expose on unauthenticated public endpoints.
 /// Everything else (authorization, host, user-agent, etc.) is stripped.
-const PUBLIC_SAFE_HEADERS: &[&str] = &[
-    "content-type",
-    "content-encoding",
-    "content-language",
-];
+const PUBLIC_SAFE_HEADERS: &[&str] = &["content-type", "content-encoding", "content-language"];
 
 fn sanitized_metadata(md: &Metadata) -> impl Iterator<Item = (&String, &String)> {
     md.0.iter()
