@@ -1,6 +1,7 @@
 mod definitions;
 pub mod host;
 pub mod session;
+pub mod vault;
 
 use hex::FromHex;
 use tinycloud_lib::{
