@@ -11,7 +11,8 @@ use tinycloud_core::storage::{Content, ImmutableReadStore};
 use tinycloud_lib::resource::{Path, SpaceId};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-use crate::{auth_guards::ObjectHeaders, config::PublicSpacesConfig, BlockStores, TinyCloud};
+use crate::{config::PublicSpacesConfig, BlockStores, TinyCloud};
+use tinycloud_core::types::Metadata;
 
 /// A key path that allows dot-prefixed segments like `.well-known/profile`.
 /// Unlike `std::path::PathBuf`, this does not reject hidden files/dirs.
@@ -119,6 +120,15 @@ const CORS_METHODS: &str = "GET, HEAD, OPTIONS";
 const CORS_ALLOW_HEADERS: &str = "If-None-Match";
 const CORS_EXPOSE_HEADERS: &str = "ETag, Content-Type, Content-Length";
 
+/// Headers safe to expose on unauthenticated public endpoints.
+/// Everything else (authorization, host, user-agent, etc.) is stripped.
+const PUBLIC_SAFE_HEADERS: &[&str] = &["content-type", "content-encoding", "content-language"];
+
+fn sanitized_metadata(md: &Metadata) -> impl Iterator<Item = (&String, &String)> {
+    md.0.iter()
+        .filter(|(k, _)| PUBLIC_SAFE_HEADERS.contains(&k.to_lowercase().as_str()))
+}
+
 fn add_public_headers(response: &mut Response<'_>, etag: Option<&str>) {
     response.set_header(Header::new("Cache-Control", CACHE_CONTROL));
     response.set_header(Header::new("Access-Control-Allow-Origin", CORS_ORIGIN));
@@ -136,16 +146,17 @@ fn add_public_headers(response: &mut Response<'_>, etag: Option<&str>) {
     }
 }
 
-pub struct PublicKVResponse<R>(Content<R>, ObjectHeaders, String);
+pub struct PublicKVResponse<R>(Content<R>, Metadata, String);
 
 impl<'r, R> Responder<'r, 'static> for PublicKVResponse<R>
 where
     R: 'static + AsyncRead + Send,
 {
-    fn respond_to(self, r: &'r Request<'_>) -> rocket::response::Result<'static> {
-        let mut response = Response::build_from(self.1.respond_to(r)?)
-            .streamed_body(self.0.compat())
-            .finalize();
+    fn respond_to(self, _: &'r Request<'_>) -> rocket::response::Result<'static> {
+        let mut response = Response::build().streamed_body(self.0.compat()).finalize();
+        for (k, v) in sanitized_metadata(&self.1) {
+            response.set_header(Header::new(k.clone(), v.clone()));
+        }
         add_public_headers(&mut response, Some(&self.2));
         Ok(response)
     }
@@ -161,11 +172,14 @@ impl<'r> Responder<'r, 'static> for NotModifiedResponse {
     }
 }
 
-pub struct PublicMetadataResponse(ObjectHeaders, String);
+pub struct PublicMetadataResponse(Metadata, String);
 
 impl<'r> Responder<'r, 'static> for PublicMetadataResponse {
-    fn respond_to(self, r: &'r Request<'_>) -> rocket::response::Result<'static> {
-        let mut response = self.0.respond_to(r)?;
+    fn respond_to(self, _: &'r Request<'_>) -> rocket::response::Result<'static> {
+        let mut response = Response::build().finalize();
+        for (k, v) in sanitized_metadata(&self.0) {
+            response.set_header(Header::new(k.clone(), v.clone()));
+        }
         add_public_headers(&mut response, Some(&self.1));
         Ok(response)
     }
@@ -227,7 +241,7 @@ pub async fn public_kv_get(
                 }
             }
 
-            Ok(Ok(PublicKVResponse(content, ObjectHeaders(md), etag)))
+            Ok(Ok(PublicKVResponse(content, md, etag)))
         }
         None => Err((Status::NotFound, "Key not found".to_string())),
     }
@@ -274,7 +288,7 @@ pub async fn public_kv_head(
                 }
             }
 
-            Ok(Ok(PublicMetadataResponse(ObjectHeaders(md), etag)))
+            Ok(Ok(PublicMetadataResponse(md, etag)))
         }
         None => Err((Status::NotFound, "Key not found".to_string())),
     }

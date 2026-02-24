@@ -37,3 +37,8 @@ web-sys = { version = "0.3", features = [
 ] }
 uuid = { version = "1.3.4", features = ["v4", "js"] }
 getrandom = { version = "0.2", features = ["js"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+serde_bytes = "0.11"
