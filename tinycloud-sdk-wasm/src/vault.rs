@@ -22,12 +22,11 @@ pub fn vault_encrypt(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, JsValue> {
     let mut nonce_bytes = [0u8; 12];
     getrandom::getrandom(&mut nonce_bytes).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-    let cipher =
-        Aes256Gcm::new_from_slice(key).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let nonce = Nonce::from(nonce_bytes);
 
     let ciphertext_with_tag = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(&nonce, plaintext)
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
     let mut result = Vec::with_capacity(12 + ciphertext_with_tag.len());
@@ -51,12 +50,14 @@ pub fn vault_decrypt(key: &[u8], blob: &[u8]) -> Result<Vec<u8>, JsValue> {
     }
 
     let (nonce_bytes, ciphertext_with_tag) = blob.split_at(12);
-    let cipher =
-        Aes256Gcm::new_from_slice(key).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let nonce_array: [u8; 12] = nonce_bytes
+        .try_into()
+        .map_err(|_| map_vault_err("invalid nonce length"))?;
+    let nonce = Nonce::from(nonce_array);
 
     let plaintext = cipher
-        .decrypt(nonce, ciphertext_with_tag)
+        .decrypt(&nonce, ciphertext_with_tag)
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
     Ok(plaintext)
