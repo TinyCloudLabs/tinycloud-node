@@ -18,7 +18,15 @@ pub mod storage;
 mod tracing;
 
 use config::{BlockStorage, Config, Keys, StagingStorage};
-use routes::{delegate, invoke, open_host_key, util_routes::*, version};
+use routes::{
+    delegate, invoke, open_host_key,
+    public::{
+        public_kv_get, public_kv_head, public_kv_list, public_kv_options_key,
+        public_kv_options_list, RateLimiter,
+    },
+    util_routes::*,
+    version,
+};
 use storage::{
     file_system::{FileSystemConfig, FileSystemStore, TempFileSystemStage},
     s3::{S3BlockConfig, S3BlockStore},
@@ -78,7 +86,19 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
 
     tracing::tracing_try_init(&tinycloud_config.log)?;
 
-    let routes = routes![healthcheck, cors, version, open_host_key, invoke, delegate,];
+    let routes = routes![
+        healthcheck,
+        cors,
+        version,
+        open_host_key,
+        invoke,
+        delegate,
+        public_kv_get,
+        public_kv_head,
+        public_kv_list,
+        public_kv_options_key,
+        public_kv_options_list,
+    ];
 
     let key_setup: StaticSecret = match tinycloud_config.keys {
         Keys::Static(s) => s.try_into()?,
@@ -99,6 +119,8 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         tinycloud_config.storage.sql.memory_threshold.as_u64(),
     );
 
+    let rate_limiter = RateLimiter::new(&tinycloud_config.public_spaces);
+
     let rocket = rocket::custom(config)
         .mount("/", routes)
         .attach(AdHoc::config::<Config>())
@@ -107,6 +129,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         })
         .manage(tinycloud)
         .manage(sql_service)
+        .manage(rate_limiter)
         .manage(tinycloud_config.storage.staging.open().await?);
 
     if tinycloud_config.cors {

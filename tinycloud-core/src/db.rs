@@ -146,6 +146,36 @@ where
 
 impl<C, B, K> SpaceDatabase<C, B, K>
 where
+    C: ConnectionTrait,
+    B: ImmutableReadStore,
+{
+    pub async fn public_kv_get(
+        &self,
+        space_id: &SpaceId,
+        key: &Path,
+    ) -> Result<Option<(Metadata, Hash, Content<B::Readable>)>, EitherError<DbErr, B::Error>> {
+        get_kv(&self.conn, &self.storage, space_id, key).await
+    }
+
+    pub async fn public_kv_metadata(
+        &self,
+        space_id: &SpaceId,
+        key: &Path,
+    ) -> Result<Option<Metadata>, DbErr> {
+        metadata(&self.conn, space_id, key).await
+    }
+
+    pub async fn public_kv_list(
+        &self,
+        space_id: &SpaceId,
+        prefix: &Path,
+    ) -> Result<Vec<Path>, DbErr> {
+        list(&self.conn, space_id, prefix).await
+    }
+}
+
+impl<C, B, K> SpaceDatabase<C, B, K>
+where
     C: TransactionTrait,
 {
     pub async fn check_db_connection(&self) -> Result<(), DbErr> {

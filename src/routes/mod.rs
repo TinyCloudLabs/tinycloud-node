@@ -10,6 +10,7 @@ use crate::{
     auth_guards::{DataIn, DataOut, InvOut, ObjectHeaders},
     authorization::AuthHeaderGetter,
     config::Config,
+    routes::public::is_public_space,
     tracing::TracingSpan,
     BlockStage, BlockStores, TinyCloud,
 };
@@ -22,6 +23,7 @@ use tinycloud_core::{
     InvocationOutcome, TxError, TxStoreError,
 };
 
+pub mod public;
 pub mod util;
 use util::LimitedReader;
 
@@ -183,7 +185,14 @@ pub async fn invoke(
                     .map_err(|e| (Status::InternalServerError, e.to_string()))?;
                 let open_data = d.open(1u8.gigabytes()).compat();
 
-                if let Some(limit) = config.storage.limit {
+                // Use public space storage limit if applicable, otherwise regular limit
+                let effective_limit = if is_public_space(space) {
+                    Some(config.public_spaces.storage_limit)
+                } else {
+                    config.storage.limit
+                };
+
+                if let Some(limit) = effective_limit {
                     let current_size = tinycloud
                         .store_size(space)
                         .await
