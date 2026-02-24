@@ -21,6 +21,40 @@ pub struct Config {
     pub prometheus: Prometheus,
     pub cors: bool,
     pub keys: Keys,
+    #[serde(default)]
+    pub public_spaces: PublicSpacesConfig,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct PublicSpacesConfig {
+    #[serde(default = "default_rate_limit_per_minute")]
+    pub rate_limit_per_minute: u32,
+    #[serde(default = "default_rate_limit_burst")]
+    pub rate_limit_burst: u32,
+    #[serde(default = "default_public_storage_limit")]
+    pub storage_limit: ByteUnit,
+}
+
+fn default_rate_limit_per_minute() -> u32 {
+    60
+}
+
+fn default_rate_limit_burst() -> u32 {
+    10
+}
+
+fn default_public_storage_limit() -> ByteUnit {
+    ByteUnit::Mebibyte(10)
+}
+
+impl Default for PublicSpacesConfig {
+    fn default() -> Self {
+        Self {
+            rate_limit_per_minute: default_rate_limit_per_minute(),
+            rate_limit_burst: default_rate_limit_burst(),
+            storage_limit: default_public_storage_limit(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
