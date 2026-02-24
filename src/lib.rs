@@ -20,10 +20,7 @@ mod tracing;
 use config::{BlockStorage, Config, Keys, StagingStorage};
 use routes::{
     delegate, invoke, open_host_key,
-    public::{
-        public_kv_get, public_kv_head, public_kv_list, public_kv_options_key,
-        public_kv_options_list, RateLimiter,
-    },
+    public::{public_kv_get, public_kv_head, public_kv_list, public_kv_options, RateLimiter},
     util_routes::*,
     version,
 };
@@ -96,8 +93,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         public_kv_get,
         public_kv_head,
         public_kv_list,
-        public_kv_options_key,
-        public_kv_options_list,
+        public_kv_options,
     ];
 
     let key_setup: StaticSecret = match tinycloud_config.keys {
