@@ -18,7 +18,7 @@ use sea_orm::{
     ConnectionTrait, DatabaseTransaction, TransactionTrait,
 };
 use sea_orm_migration::MigratorTrait;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tinycloud_lib::{
     authorization::{EncodingError, TinyCloudDelegation},
     resource::{Path, SpaceId},
@@ -37,6 +37,15 @@ pub struct Commit {
     pub seq: i64,
     pub committed_events: Vec<Hash>,
     pub consumed_epochs: Vec<Hash>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransactResult {
+    pub commits: HashMap<SpaceId, Commit>,
+    pub skipped_spaces: Vec<SpaceId>,
+    /// CIDs of delegations that were processed (saved) regardless of space existence.
+    /// Used to return a CID even when all spaces were skipped.
+    pub delegation_cids: Vec<Hash>,
 }
 
 #[non_exhaustive]
@@ -196,23 +205,23 @@ where
     async fn transact(
         &self,
         events: Vec<Event>,
-    ) -> Result<HashMap<SpaceId, Commit>, TxError<B, K>> {
+    ) -> Result<TransactResult, TxError<B, K>> {
         let tx = self
             .conn
             .begin_with_config(Some(sea_orm::IsolationLevel::ReadUncommitted), None)
             .await?;
 
-        let commit = transact(&tx, &self.storage, &self.secrets, events).await?;
+        let result = transact(&tx, &self.storage, &self.secrets, events).await?;
 
         tx.commit().await?;
 
-        Ok(commit)
+        Ok(result)
     }
 
     pub async fn delegate(
         &self,
         delegation: Delegation,
-    ) -> Result<HashMap<SpaceId, Commit>, TxError<B, K>> {
+    ) -> Result<TransactResult, TxError<B, K>> {
         self.transact(vec![Event::Delegation(Box::new(delegation))])
             .await
     }
@@ -220,7 +229,7 @@ where
     pub async fn revoke(
         &self,
         revocation: Revocation,
-    ) -> Result<HashMap<SpaceId, Commit>, TxError<B, K>> {
+    ) -> Result<TransactResult, TxError<B, K>> {
         self.transact(vec![Event::Revocation(Box::new(revocation))])
             .await
     }
@@ -231,7 +240,7 @@ where
         mut inputs: InvocationInputs<S::Writable>,
     ) -> Result<
         (
-            HashMap<SpaceId, Commit>,
+            TransactResult,
             Vec<InvocationOutcome<B::Readable>>,
         ),
         TxStoreError<B, S, K>,
@@ -488,7 +497,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     store_setup: &S,
     secrets: &K,
     events: Vec<Event>,
-) -> Result<HashMap<SpaceId, Commit>, TxError<S, K>> {
+) -> Result<TransactResult, TxError<S, K>> {
     // for each event, get the hash and the relevent space(s)
     let event_hashes = events
         .into_iter()
@@ -540,184 +549,288 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         };
     }
 
-    // get max sequence for each of the spaces
-    let mut max_seqs = event_order::Entity::find()
-        .filter(event_order::Column::Space.is_in(event_spaces.keys().cloned().map(SpaceIdWrap)))
-        .select_only()
-        .column(event_order::Column::Space)
-        .column_as(event_order::Column::Seq.max(), "max_seq")
-        .group_by(event_order::Column::Space)
-        .into_tuple::<(SpaceIdWrap, i64)>()
-        .all(db)
-        .await?
-        .into_iter()
-        .fold(HashMap::new(), |mut m, (space, seq)| {
-            m.insert(space, seq + 1);
-            m
-        });
+    // For delegation-only transactions, skip spaces that don't exist yet
+    // instead of failing with SpaceNotFound
+    let is_delegation_only = event_hashes
+        .iter()
+        .all(|(_, e)| matches!(e, Event::Delegation(_)));
 
-    // get 'most recent' epochs for each of the spaces
-    let mut most_recent = epoch::Entity::find()
-        .select_only()
-        .left_join(epoch_order::Entity)
-        .filter(
-            Condition::all()
-                .add(epoch::Column::Space.is_in(event_spaces.keys().cloned().map(SpaceIdWrap)))
-                .add(epoch_order::Column::Child.is_null()),
-        )
-        .column(epoch::Column::Space)
-        .column(epoch::Column::Id)
-        .into_tuple::<(SpaceIdWrap, Hash)>()
-        .all(db)
-        .await?
-        .into_iter()
-        .fold(
-            HashMap::new(),
-            |mut m: HashMap<SpaceIdWrap, Vec<Hash>>, (space, epoch)| {
-                m.entry(space).or_default().push(epoch);
-                m
-            },
-        );
+    let (event_spaces, skipped_spaces) = if is_delegation_only {
+        let new_space_ids: HashSet<SpaceId> = new_spaces.iter().map(|s| s.0.clone()).collect();
+        // Spaces that were just created via new_spaces are definitely existing
+        let all_space_ids: Vec<SpaceIdWrap> = event_spaces
+            .keys()
+            .filter(|s| !new_space_ids.contains(s))
+            .cloned()
+            .map(SpaceIdWrap)
+            .collect();
 
-    // get all the orderings and associated data
-    let (epoch_order, space_order, event_order, epochs) = event_spaces
-        .into_iter()
-        .map(|(space, events)| {
-            let parents = most_recent.remove(&space).unwrap_or_default();
-            let epoch = epoch_hash(&space, &events, &parents)?;
-            let seq = max_seqs.remove(&space).unwrap_or(0);
-            Ok((space, (epoch, events, seq, parents)))
-        })
-        .collect::<Result<HashMap<_, _>, HashError>>()?
-        .into_iter()
-        .map(|(space, (epoch, hashes, seq, parents))| {
-            (
-                parents
-                    .iter()
-                    .map(|parent| epoch_order::Model {
-                        parent: *parent,
-                        child: epoch,
-                        space: space.clone().into(),
-                    })
-                    .map(epoch_order::ActiveModel::from)
-                    .collect::<Vec<epoch_order::ActiveModel>>(),
-                (
-                    space.clone(),
-                    (
-                        seq,
-                        epoch,
-                        parents,
-                        hashes
-                            .iter()
-                            .enumerate()
-                            .map(|(i, (h, _))| (*h, i as i64))
-                            .collect::<HashMap<_, _>>(),
-                    ),
-                ),
-                hashes
-                    .into_iter()
-                    .enumerate()
-                    .map(|(es, (hash, _))| event_order::Model {
-                        event: *hash,
-                        space: space.clone().into(),
-                        seq,
-                        epoch,
-                        epoch_seq: es as i64,
-                    })
-                    .map(event_order::ActiveModel::from)
-                    .collect::<Vec<event_order::ActiveModel>>(),
-                epoch::Model {
-                    seq,
-                    id: epoch,
-                    space: space.into(),
-                },
+        let existing: HashSet<SpaceId> = if all_space_ids.is_empty() {
+            HashSet::new()
+        } else {
+            space::Entity::find()
+                .filter(space::Column::Id.is_in(all_space_ids))
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|s| s.id.0)
+                .collect()
+        };
+
+        // new_spaces are always existing (just inserted above)
+        let existing: HashSet<SpaceId> = existing
+            .into_iter()
+            .chain(new_space_ids)
+            .collect();
+
+        let skipped: Vec<SpaceId> = event_spaces
+            .keys()
+            .filter(|s| !existing.contains(s))
+            .cloned()
+            .collect();
+
+        let filtered: HashMap<_, _> = event_spaces
+            .into_iter()
+            .filter(|(s, _)| existing.contains(s))
+            .collect();
+
+        (filtered, skipped)
+    } else {
+        (event_spaces, vec![])
+    };
+
+    // If all spaces were filtered out, we still process delegations below
+    // but skip epoch/event ordering creation
+    if !event_spaces.is_empty() {
+        // get max sequence for each of the spaces
+        let mut max_seqs = event_order::Entity::find()
+            .filter(
+                event_order::Column::Space
+                    .is_in(event_spaces.keys().cloned().map(SpaceIdWrap)),
             )
-        })
-        .fold(
-            (
-                Vec::<epoch_order::ActiveModel>::new(),
-                HashMap::<SpaceId, (i64, Hash, Vec<Hash>, HashMap<Hash, i64>)>::new(),
-                Vec::<event_order::ActiveModel>::new(),
-                Vec::<epoch::ActiveModel>::new(),
-            ),
-            |(mut eo, mut so, mut ev, mut ep), (eo2, order, ev2, ep2)| {
-                eo.extend(eo2);
-                ev.extend(ev2);
-                so.insert(order.0, order.1);
-                ep.push(ep2.into());
-                (eo, so, ev, ep)
-            },
-        );
+            .select_only()
+            .column(event_order::Column::Space)
+            .column_as(event_order::Column::Seq.max(), "max_seq")
+            .group_by(event_order::Column::Space)
+            .into_tuple::<(SpaceIdWrap, i64)>()
+            .all(db)
+            .await?
+            .into_iter()
+            .fold(HashMap::new(), |mut m, (space, seq)| {
+                m.insert(space, seq + 1);
+                m
+            });
 
-    // save epochs
-    epoch::Entity::insert_many(epochs)
-        .exec(db)
-        .await
-        .map_err(|e| match e {
-            DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(_))) => TxError::SpaceNotFound,
-            _ => e.into(),
-        })?;
+        // get 'most recent' epochs for each of the spaces
+        let mut most_recent = epoch::Entity::find()
+            .select_only()
+            .left_join(epoch_order::Entity)
+            .filter(
+                Condition::all()
+                    .add(
+                        epoch::Column::Space
+                            .is_in(event_spaces.keys().cloned().map(SpaceIdWrap)),
+                    )
+                    .add(epoch_order::Column::Child.is_null()),
+            )
+            .column(epoch::Column::Space)
+            .column(epoch::Column::Id)
+            .into_tuple::<(SpaceIdWrap, Hash)>()
+            .all(db)
+            .await?
+            .into_iter()
+            .fold(
+                HashMap::new(),
+                |mut m: HashMap<SpaceIdWrap, Vec<Hash>>, (space, epoch)| {
+                    m.entry(space).or_default().push(epoch);
+                    m
+                },
+            );
 
-    // save epoch orderings
-    if !epoch_order.is_empty() {
-        epoch_order::Entity::insert_many(epoch_order)
+        // get all the orderings and associated data
+        let (epoch_order, space_order, event_order, epochs) = event_spaces
+            .into_iter()
+            .map(|(space, events)| {
+                let parents = most_recent.remove(&space).unwrap_or_default();
+                let epoch = epoch_hash(&space, &events, &parents)?;
+                let seq = max_seqs.remove(&space).unwrap_or(0);
+                Ok((space, (epoch, events, seq, parents)))
+            })
+            .collect::<Result<HashMap<_, _>, HashError>>()?
+            .into_iter()
+            .map(|(space, (epoch, hashes, seq, parents))| {
+                (
+                    parents
+                        .iter()
+                        .map(|parent| epoch_order::Model {
+                            parent: *parent,
+                            child: epoch,
+                            space: space.clone().into(),
+                        })
+                        .map(epoch_order::ActiveModel::from)
+                        .collect::<Vec<epoch_order::ActiveModel>>(),
+                    (
+                        space.clone(),
+                        (
+                            seq,
+                            epoch,
+                            parents,
+                            hashes
+                                .iter()
+                                .enumerate()
+                                .map(|(i, (h, _))| (*h, i as i64))
+                                .collect::<HashMap<_, _>>(),
+                        ),
+                    ),
+                    hashes
+                        .into_iter()
+                        .enumerate()
+                        .map(|(es, (hash, _))| event_order::Model {
+                            event: *hash,
+                            space: space.clone().into(),
+                            seq,
+                            epoch,
+                            epoch_seq: es as i64,
+                        })
+                        .map(event_order::ActiveModel::from)
+                        .collect::<Vec<event_order::ActiveModel>>(),
+                    epoch::Model {
+                        seq,
+                        id: epoch,
+                        space: space.into(),
+                    },
+                )
+            })
+            .fold(
+                (
+                    Vec::<epoch_order::ActiveModel>::new(),
+                    HashMap::<SpaceId, (i64, Hash, Vec<Hash>, HashMap<Hash, i64>)>::new(),
+                    Vec::<event_order::ActiveModel>::new(),
+                    Vec::<epoch::ActiveModel>::new(),
+                ),
+                |(mut eo, mut so, mut ev, mut ep), (eo2, order, ev2, ep2)| {
+                    eo.extend(eo2);
+                    ev.extend(ev2);
+                    so.insert(order.0, order.1);
+                    ep.push(ep2.into());
+                    (eo, so, ev, ep)
+                },
+            );
+
+        // save epochs
+        epoch::Entity::insert_many(epochs)
+            .exec(db)
+            .await
+            .map_err(|e| match e {
+                DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(_))) => {
+                    TxError::SpaceNotFound
+                }
+                _ => e.into(),
+            })?;
+
+        // save epoch orderings
+        if !epoch_order.is_empty() {
+            epoch_order::Entity::insert_many(epoch_order)
+                .exec(db)
+                .await?;
+        }
+
+        // save event orderings
+        event_order::Entity::insert_many(event_order)
             .exec(db)
             .await?;
-    }
 
-    // save event orderings
-    event_order::Entity::insert_many(event_order)
-        .exec(db)
-        .await?;
+        let mut delegation_cids = Vec::new();
+        for (hash, event) in event_hashes {
+            match event {
+                Event::Delegation(d) => {
+                    let cid = delegation::process(db, *d).await?;
+                    delegation_cids.push(cid);
+                }
+                Event::Invocation(i, ops) => {
+                    invocation::process(
+                        db,
+                        *i,
+                        ops.into_iter()
+                            .map(|op| {
+                                let v = space_order
+                                    .get(op.space())
+                                    .and_then(|(s, e, _, h)| Some((s, e, h.get(&hash)?)))
+                                    .unwrap();
+                                op.version(*v.0, *v.1, *v.2)
+                            })
+                            .collect(),
+                    )
+                    .await?;
+                }
+                Event::Revocation(r) => {
+                    revocation::process(db, *r).await?;
+                }
+            };
+        }
 
-    for (hash, event) in event_hashes {
-        match event {
-            Event::Delegation(d) => delegation::process(db, *d).await?,
-            Event::Invocation(i, ops) => {
-                invocation::process(
-                    db,
-                    *i,
-                    ops.into_iter()
-                        .map(|op| {
-                            let v = space_order
-                                .get(op.space())
-                                .and_then(|(s, e, _, h)| Some((s, e, h.get(&hash)?)))
-                                .unwrap();
-                            op.version(*v.0, *v.1, *v.2)
-                        })
-                        .collect(),
-                )
-                .await?
-            }
-            Event::Revocation(r) => revocation::process(db, *r).await?,
-        };
-    }
+        for space in new_spaces {
+            store_setup
+                .create(&space.0)
+                .await
+                .map_err(TxError::StoreSetup)?;
+            secrets
+                .save_keypair(&space.0)
+                .await
+                .map_err(TxError::Secrets)?;
+        }
 
-    for space in new_spaces {
-        store_setup
-            .create(&space.0)
-            .await
-            .map_err(TxError::StoreSetup)?;
-        secrets
-            .save_keypair(&space.0)
-            .await
-            .map_err(TxError::Secrets)?;
-    }
-
-    Ok(space_order
-        .into_iter()
-        .map(|(o, (seq, rev, consumed_epochs, h))| {
-            (
-                o,
-                Commit {
-                    seq,
-                    rev,
-                    consumed_epochs,
-                    committed_events: h.keys().cloned().collect(),
-                },
-            )
+        Ok(TransactResult {
+            commits: space_order
+                .into_iter()
+                .map(|(o, (seq, rev, consumed_epochs, h))| {
+                    (
+                        o,
+                        Commit {
+                            seq,
+                            rev,
+                            consumed_epochs,
+                            committed_events: h.keys().cloned().collect(),
+                        },
+                    )
+                })
+                .collect(),
+            skipped_spaces,
+            delegation_cids,
         })
-        .collect())
+    } else {
+        // All spaces were skipped (delegation-only with no existing spaces)
+        // Still process delegation events to save the delegation records
+        let mut delegation_cids = Vec::new();
+        for (_, event) in event_hashes {
+            match event {
+                Event::Delegation(d) => {
+                    let cid = delegation::process(db, *d).await?;
+                    delegation_cids.push(cid);
+                }
+                Event::Invocation(_, _) | Event::Revocation(_) => {
+                    unreachable!("non-delegation events with empty event_spaces")
+                }
+            };
+        }
+
+        for space in new_spaces {
+            store_setup
+                .create(&space.0)
+                .await
+                .map_err(TxError::StoreSetup)?;
+            secrets
+                .save_keypair(&space.0)
+                .await
+                .map_err(TxError::Secrets)?;
+        }
+
+        Ok(TransactResult {
+            commits: HashMap::new(),
+            skipped_spaces,
+            delegation_cids,
+        })
+    }
 }
 
 async fn list<C: ConnectionTrait>(
