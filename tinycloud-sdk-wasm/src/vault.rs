@@ -2,8 +2,9 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
+use curve25519_dalek::edwards::CompressedEdwardsY;
 use hkdf::Hkdf;
-use sha2::Sha256;
+use sha2::{Digest, Sha256, Sha512};
 use wasm_bindgen::prelude::*;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -134,6 +135,57 @@ pub fn vault_random_bytes(length: usize) -> Result<Vec<u8>, JsValue> {
 /// SHA-256 hash of the input data.
 #[wasm_bindgen]
 pub fn vault_sha256(data: &[u8]) -> Vec<u8> {
-    use sha2::Digest;
     Sha256::new().chain_update(data).finalize().to_vec()
+}
+
+/// Convert an Ed25519 seed (32 bytes) to an X25519 key pair.
+///
+/// Uses the standard Ed25519-to-X25519 conversion:
+/// 1. SHA-512(seed) → take first 32 bytes → X25519 private scalar (clamped by StaticSecret)
+/// 2. Derive X25519 public key from private scalar
+///
+/// This allows session keys (Ed25519) to participate in vault encryption
+/// without requiring a wallet signature.
+#[wasm_bindgen]
+pub fn vault_ed25519_seed_to_x25519(ed25519_seed: &[u8]) -> Result<JsValue, JsValue> {
+    if ed25519_seed.len() != 32 {
+        return Err(map_vault_err("ed25519_seed must be 32 bytes"));
+    }
+
+    let hash = Sha512::digest(ed25519_seed);
+    let mut x25519_bytes: [u8; 32] = hash[..32].try_into().unwrap();
+
+    // StaticSecret::from applies X25519 clamping internally
+    let secret = StaticSecret::from(x25519_bytes);
+    let public = PublicKey::from(&secret);
+
+    // Zero the intermediate key material
+    x25519_bytes.fill(0);
+
+    let keypair = X25519KeyPair {
+        public_key: public.as_bytes().to_vec(),
+        private_key: secret.to_bytes().to_vec(),
+    };
+
+    serde_wasm_bindgen::to_value(&keypair).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Convert an Ed25519 public key (32 bytes, compressed Edwards Y) to X25519 public key.
+///
+/// Uses the birational Edwards-to-Montgomery map: u = (1 + y) / (1 - y)
+/// This lets us resolve X25519 public keys from did:key DIDs (which encode Ed25519 public keys).
+#[wasm_bindgen]
+pub fn vault_ed25519_pub_to_x25519(ed25519_pub: &[u8]) -> Result<Vec<u8>, JsValue> {
+    if ed25519_pub.len() != 32 {
+        return Err(map_vault_err("ed25519_pub must be 32 bytes"));
+    }
+
+    let compressed = CompressedEdwardsY::from_slice(ed25519_pub)
+        .map_err(|e| JsValue::from_str(&format!("invalid Ed25519 public key: {}", e)))?;
+    let edwards_point = compressed
+        .decompress()
+        .ok_or_else(|| map_vault_err("failed to decompress Ed25519 public key"))?;
+    let montgomery = edwards_point.to_montgomery();
+
+    Ok(montgomery.as_bytes().to_vec())
 }
