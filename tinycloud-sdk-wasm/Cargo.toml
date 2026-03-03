@@ -41,4 +41,5 @@ aes-gcm = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+curve25519-dalek = "4"
 serde_bytes = "0.11"

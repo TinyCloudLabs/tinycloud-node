@@ -8823,6 +8823,7 @@ dependencies = [
  "aes-gcm",
  "chrono",
  "console_error_panic_hook",
+ "curve25519-dalek",
  "getrandom 0.2.17",
  "hex",
  "hkdf",
