@@ -20,7 +20,7 @@ use tinycloud_core::{
     storage::{ImmutableReadStore, ImmutableStaging},
     types::Resource,
     util::{DelegationInfo, InvocationInfo},
-    InvocationOutcome, TxError, TxStoreError,
+    InvocationOutcome, TransactResult, TxError, TxStoreError,
 };
 
 pub mod public;
@@ -79,12 +79,19 @@ pub async fn open_host_key(
     })
 }
 
+#[derive(Serialize)]
+pub struct DelegateResponse {
+    pub cid: String,
+    pub activated: Vec<String>,
+    pub skipped: Vec<String>,
+}
+
 #[post("/delegate")]
 pub async fn delegate(
     d: AuthHeaderGetter<DelegationInfo>,
     req_span: TracingSpan,
     tinycloud: &State<TinyCloud>,
-) -> Result<String, (Status, String)> {
+) -> Result<Json<DelegateResponse>, (Status, String)> {
     let action_label = "delegation";
     let span = info_span!(parent: &req_span.0, "delegate", action = %action_label);
     // Instrumenting async block to handle yielding properly
@@ -105,13 +112,37 @@ pub async fn delegate(
                     e.to_string(),
                 )
             })
-            .and_then(|c| {
-                c.into_iter()
+            .and_then(|result: TransactResult| {
+                let activated: Vec<String> = result
+                    .commits
+                    .keys()
+                    .map(|s| s.to_string())
+                    .collect();
+                let skipped: Vec<String> = result
+                    .skipped_spaces
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+
+                // Get CID from the first committed event, or fall back to
+                // the delegation CID when all spaces were skipped
+                let cid = result
+                    .commits
+                    .into_values()
                     .next()
-                    .and_then(|(_, c)| c.committed_events.into_iter().next())
-                    .ok_or_else(|| (Status::Unauthorized, "Delegation not committed".to_string()))
-            })
-            .map(|h| h.to_cid(0x55).to_string());
+                    .and_then(|c| c.committed_events.into_iter().next())
+                    .or_else(|| result.delegation_cids.into_iter().next())
+                    .map(|h| h.to_cid(0x55).to_string())
+                    .ok_or_else(|| {
+                        (Status::Unauthorized, "Delegation not committed".to_string())
+                    })?;
+
+                Ok(Json(DelegateResponse {
+                    cid,
+                    activated,
+                    skipped,
+                }))
+            });
         timer.observe_duration();
         res
     }

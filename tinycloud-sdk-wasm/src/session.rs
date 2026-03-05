@@ -51,6 +51,11 @@ pub struct SessionConfig {
     /// Format: "tinycloud:pkh:eip155:{chainId}:{address}:{name}"
     /// Not to be confused with ReCap ability namespaces (action categories like "kv").
     pub space_id: SpaceId,
+    /// Additional spaces to include in this session's capabilities.
+    /// Key is a logical name (e.g., "public"), value is the SpaceId.
+    /// All additional spaces receive the same abilities as the primary space.
+    #[serde(default)]
+    pub additional_spaces: Option<HashMap<String, SpaceId>>,
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(default)]
     pub not_before: Option<TimeStamp>,
@@ -74,6 +79,8 @@ pub struct SessionConfig {
 pub struct PreparedSession {
     pub jwk: JWK,
     pub space_id: SpaceId,
+    #[serde(default)]
+    pub additional_spaces: Option<HashMap<String, SpaceId>>,
     #[serde_as(as = "DisplayFromStr")]
     pub siwe: Message,
     pub verification_method: String,
@@ -100,35 +107,47 @@ pub struct Session {
     /// The TinyCloud user space (data container) that this session is bound to.
     /// Not to be confused with ReCap ability namespaces (action categories like "kv").
     pub space_id: SpaceId,
+    #[serde(default)]
+    pub additional_spaces: Option<HashMap<String, SpaceId>>,
     pub verification_method: String,
 }
 
 impl SessionConfig {
     fn into_message(self, delegate: &str) -> Result<Message, String> {
         use serde_json::Value;
-        self.abilities
+
+        // Collect all spaces: primary + additional
+        let mut all_spaces = vec![self.space_id.clone()];
+        if let Some(ref additional) = self.additional_spaces {
+            for space_id in additional.values() {
+                all_spaces.push(space_id.clone());
+            }
+        }
+
+        // Clone abilities since we iterate per space
+        let abilities = self.abilities.clone();
+
+        all_spaces
             .into_iter()
-            .fold(
-                Capability::<Value>::default(),
-                |caps, (service, actions)| {
-                    actions.into_iter().fold(caps, |mut caps, (path, action)| {
-                        // Empty path means wildcard - use None to allow any path to extend
+            .fold(Capability::<Value>::default(), |caps, space_id| {
+                abilities.iter().fold(caps, |caps, (service, actions)| {
+                    actions.iter().fold(caps, |mut caps, (path, action)| {
                         let path_opt = if path.as_str().is_empty() {
                             None
                         } else {
-                            Some(path)
+                            Some(path.clone())
                         };
                         caps.with_actions(
-                            self.space_id
+                            space_id
                                 .clone()
                                 .to_resource(service.clone(), path_opt, None, None)
                                 .as_uri(),
-                            action.into_iter().map(|a| (a, [])),
+                            action.iter().map(|a| (a.clone(), [])),
                         );
                         caps
                     })
-                },
-            )
+                })
+            })
             .with_proofs(match &self.parents {
                 Some(p) => p.as_slice(),
                 None => &[],
@@ -332,6 +351,7 @@ pub fn prepare_session(config: SessionConfig) -> Result<PreparedSession, Error> 
     };
 
     let space_id = config.space_id.clone();
+    let additional_spaces = config.additional_spaces.clone();
 
     let siwe = config
         .into_message(&verification_method)
@@ -339,6 +359,7 @@ pub fn prepare_session(config: SessionConfig) -> Result<PreparedSession, Error> 
 
     Ok(PreparedSession {
         space_id,
+        additional_spaces,
         jwk,
         verification_method,
         siwe,
@@ -364,6 +385,7 @@ pub fn complete_session_setup(signed_session: SignedSession) -> Result<Session, 
         delegation_cid,
         jwk: signed_session.session.jwk,
         space_id: signed_session.session.space_id,
+        additional_spaces: signed_session.session.additional_spaces,
         verification_method: signed_session.session.verification_method,
     })
 }
@@ -423,5 +445,51 @@ pub mod test {
         test_session()
             .invoke([(s, p, None, None, [a])], None)
             .expect("failed to create invocation");
+    }
+
+    #[test]
+    fn session_with_additional_spaces() {
+        let config = json!({
+            "abilities": {
+                "kv": {
+                    "": vec![
+                        "tinycloud.kv/put",
+                        "tinycloud.kv/get",
+                    ]
+                },
+            },
+            "address": "0x7BD63AA37326a64d458559F44432103e3d6eEDE9",
+            "chainId": 1u8,
+            "domain": "example.com",
+            "issuedAt": "2022-01-01T00:00:00.000Z",
+            "spaceId": "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:default",
+            "additionalSpaces": {
+                "public": "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:public"
+            },
+            "expirationTime": "3000-01-01T00:00:00.000Z",
+        });
+        let session_config: SessionConfig = serde_json::from_value(config).unwrap();
+        assert!(session_config.additional_spaces.is_some());
+        let additional = session_config.additional_spaces.as_ref().unwrap();
+        assert_eq!(additional.len(), 1);
+        assert!(additional.contains_key("public"));
+
+        let prepared = prepare_session(session_config).unwrap();
+        assert!(prepared.additional_spaces.is_some());
+
+        // Verify the SIWE message contains resource URIs for both spaces
+        let siwe_str = prepared.siwe.to_string();
+        let primary_space =
+            "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:default";
+        let public_space =
+            "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:public";
+        assert!(
+            siwe_str.contains(primary_space),
+            "SIWE message should contain primary space resource URI"
+        );
+        assert!(
+            siwe_str.contains(public_space),
+            "SIWE message should contain additional space resource URI"
+        );
     }
 }

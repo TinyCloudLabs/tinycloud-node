@@ -11,7 +11,7 @@ pub mod storage;
 pub mod types;
 pub mod util;
 
-pub use db::{Commit, InvocationOutcome, SpaceDatabase, TxError, TxStoreError};
+pub use db::{Commit, InvocationOutcome, SpaceDatabase, TransactResult, TxError, TxStoreError};
 pub use libp2p;
 pub use sea_orm;
 pub use sea_orm_migration;
