@@ -15,7 +15,8 @@ use crate::{
     BlockStage, BlockStores, TinyCloud,
 };
 use tinycloud_core::{
-    duckdb::{DuckDbCaveats, DuckDbError, DuckDbRequest, DuckDbService},
+    duckdb::{DuckDbCaveats, DuckDbError, DuckDbRequest, DuckDbResponse, DuckDbService},
+    events::Invocation,
     sea_orm::DbErr,
     sql::{SqlCaveats, SqlError, SqlRequest, SqlService},
     storage::{ImmutableReadStore, ImmutableStaging},
@@ -114,11 +115,7 @@ pub async fn delegate(
                 )
             })
             .and_then(|result: TransactResult| {
-                let activated: Vec<String> = result
-                    .commits
-                    .keys()
-                    .map(|s| s.to_string())
-                    .collect();
+                let activated: Vec<String> = result.commits.keys().map(|s| s.to_string()).collect();
                 let skipped: Vec<String> = result
                     .skipped_spaces
                     .iter()
@@ -199,29 +196,39 @@ pub async fn invoke(
         }
 
         // Check for DuckDB capabilities
-        let duckdb_caps: Vec<_> = i
-            .0
-             .0
-            .capabilities
-            .iter()
-            .filter_map(|c| match (&c.resource, c.ability.as_ref().as_ref()) {
-                (Resource::TinyCloud(r), ability)
-                    if r.service().as_str() == "duckdb"
-                        && ability.starts_with("tinycloud.duckdb/") =>
-                {
-                    Some((
-                        r.space().clone(),
-                        r.path().map(|p| p.to_string()),
-                        ability.to_string(),
-                    ))
-                }
-                _ => None,
-            })
-            .collect();
+        let duckdb_caps: Vec<_> =
+            i.0 .0
+                .capabilities
+                .iter()
+                .filter_map(|c| match (&c.resource, c.ability.as_ref().as_ref()) {
+                    (Resource::TinyCloud(r), ability)
+                        if r.service().as_str() == "duckdb"
+                            && ability.starts_with("tinycloud.duckdb/") =>
+                    {
+                        Some((
+                            r.space().clone(),
+                            r.path().map(|p| p.to_string()),
+                            ability.to_string(),
+                        ))
+                    }
+                    _ => None,
+                })
+                .collect();
 
         if !duckdb_caps.is_empty() {
-            let result =
-                handle_duckdb_invoke(i, data, tinycloud, duckdb_service, &duckdb_caps).await;
+            let arrow_format = headers.0 .0.iter().any(|(k, v)| {
+                k.eq_ignore_ascii_case("accept")
+                    && v.contains("application/vnd.apache.arrow.stream")
+            });
+            let result = handle_duckdb_invoke(
+                i,
+                data,
+                tinycloud,
+                duckdb_service,
+                &duckdb_caps,
+                arrow_format,
+            )
+            .await;
             timer.observe_duration();
             return result;
         }
@@ -330,6 +337,48 @@ pub async fn invoke(
     .await
 }
 
+/// Verify authorization by invoking with empty inputs.
+///
+/// Shared by SQL and DuckDB invoke handlers. The caller must extract caveats
+/// from `i` before calling this, since the invocation tuple is consumed here.
+async fn verify_auth(
+    invocation: Invocation,
+    tinycloud: &State<TinyCloud>,
+) -> Result<(), (Status, String)> {
+    tinycloud
+        .invoke::<BlockStage>(invocation, HashMap::new())
+        .await
+        .map_err(|e| {
+            (
+                match e {
+                    TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
+                    TxStoreError::Tx(TxError::Db(DbErr::ConnectionAcquire(_))) => {
+                        Status::InternalServerError
+                    }
+                    _ => Status::Unauthorized,
+                },
+                e.to_string(),
+            )
+        })?;
+    Ok(())
+}
+
+/// Read the request body as a JSON string.
+async fn read_json_body(data: DataIn<'_>) -> Result<String, (Status, String)> {
+    match data {
+        DataIn::One(d) => {
+            let mut buf = Vec::new();
+            let mut reader = d.open(1u8.megabytes());
+            reader
+                .read_to_end(&mut buf)
+                .await
+                .map_err(|e| (Status::BadRequest, e.to_string()))?;
+            String::from_utf8(buf).map_err(|e| (Status::BadRequest, e.to_string()))
+        }
+        _ => Err((Status::BadRequest, "Expected JSON body".to_string())),
+    }
+}
+
 async fn handle_sql_invoke(
     i: AuthHeaderGetter<InvocationInfo>,
     data: DataIn<'_>,
@@ -352,39 +401,8 @@ async fn handle_sql_invoke(
                 })
             });
 
-    // Verify authorization by invoking with empty inputs
-    // SQL capabilities don't match KV patterns, so invoke just verifies auth
-    tinycloud
-        .invoke::<BlockStage>(i.0, HashMap::new())
-        .await
-        .map_err(|e| {
-            (
-                match e {
-                    TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
-                    TxStoreError::Tx(TxError::Db(DbErr::ConnectionAcquire(_))) => {
-                        Status::InternalServerError
-                    }
-                    _ => Status::Unauthorized,
-                },
-                e.to_string(),
-            )
-        })?;
-
-    // Read the request body as JSON
-    let body_str = match data {
-        DataIn::One(d) => {
-            let mut buf = Vec::new();
-            let mut reader = d.open(1u8.megabytes());
-            reader
-                .read_to_end(&mut buf)
-                .await
-                .map_err(|e| (Status::BadRequest, e.to_string()))?;
-            String::from_utf8(buf).map_err(|e| (Status::BadRequest, e.to_string()))?
-        }
-        _ => {
-            return Err((Status::BadRequest, "Expected JSON body".to_string()));
-        }
-    };
+    verify_auth(i.0, tinycloud).await?;
+    let body_str = read_json_body(data).await?;
 
     let (space, path, ability) = &sql_caps[0];
     let db_name = SqlService::db_name_from_path(path.as_deref());
@@ -433,7 +451,9 @@ async fn handle_duckdb_invoke(
     tinycloud: &State<TinyCloud>,
     duckdb_service: &State<DuckDbService>,
     duckdb_caps: &[(tinycloud_lib::resource::SpaceId, Option<String>, String)],
+    arrow_format: bool,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
+    // SECURITY TODO: Extract caveats from delegation chain, not invocation facts. See PR review [H3].
     // Extract caveats from the invocation facts before consuming i
     let caveats: Option<DuckDbCaveats> =
         i.0 .0
@@ -449,22 +469,7 @@ async fn handle_duckdb_invoke(
                 })
             });
 
-    // Verify authorization by invoking with empty inputs
-    tinycloud
-        .invoke::<BlockStage>(i.0, HashMap::new())
-        .await
-        .map_err(|e| {
-            (
-                match e {
-                    TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
-                    TxStoreError::Tx(TxError::Db(DbErr::ConnectionAcquire(_))) => {
-                        Status::InternalServerError
-                    }
-                    _ => Status::Unauthorized,
-                },
-                e.to_string(),
-            )
-        })?;
+    verify_auth(i.0, tinycloud).await?;
 
     let (space, path, ability) = &duckdb_caps[0];
     let db_name = DuckDbService::db_name_from_path(path.as_deref());
@@ -482,7 +487,10 @@ async fn handle_duckdb_invoke(
                 buf
             }
             _ => {
-                return Err((Status::BadRequest, "Expected binary body for import".to_string()));
+                return Err((
+                    Status::BadRequest,
+                    "Expected binary body for import".to_string(),
+                ));
             }
         };
 
@@ -495,27 +503,19 @@ async fn handle_duckdb_invoke(
         return Ok(DataOut::One(InvOut(InvocationOutcome::DuckDbResult(json))));
     }
 
-    // Read the request body as JSON
-    let body_str = match data {
-        DataIn::One(d) => {
-            let mut buf = Vec::new();
-            let mut reader = d.open(1u8.megabytes());
-            reader
-                .read_to_end(&mut buf)
-                .await
-                .map_err(|e| (Status::BadRequest, e.to_string()))?;
-            String::from_utf8(buf).map_err(|e| (Status::BadRequest, e.to_string()))?
-        }
-        _ => {
-            return Err((Status::BadRequest, "Expected JSON body".to_string()));
-        }
-    };
+    let body_str = read_json_body(data).await?;
 
     let duckdb_request: DuckDbRequest =
         serde_json::from_str(&body_str).map_err(|e| (Status::BadRequest, e.to_string()))?;
 
     // Handle export specially
     if matches!(duckdb_request, DuckDbRequest::Export) {
+        if caveats.is_some() {
+            return Err((
+                Status::Forbidden,
+                "Export not allowed with active caveats".into(),
+            ));
+        }
         let data = duckdb_service
             .export(space, &db_name)
             .await
@@ -524,14 +524,27 @@ async fn handle_duckdb_invoke(
     }
 
     let response = duckdb_service
-        .execute(space, &db_name, duckdb_request, caveats, ability.clone())
+        .execute(
+            space,
+            &db_name,
+            duckdb_request,
+            caveats,
+            ability.clone(),
+            arrow_format,
+        )
         .await
         .map_err(|e| (duckdb_error_to_status(&e), e.to_string()))?;
 
-    let json =
-        serde_json::to_value(response).map_err(|e| (Status::InternalServerError, e.to_string()))?;
-
-    Ok(DataOut::One(InvOut(InvocationOutcome::DuckDbResult(json))))
+    match response {
+        DuckDbResponse::Arrow(data) => {
+            Ok(DataOut::One(InvOut(InvocationOutcome::DuckDbArrow(data))))
+        }
+        other => {
+            let json = serde_json::to_value(other)
+                .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+            Ok(DataOut::One(InvOut(InvocationOutcome::DuckDbResult(json))))
+        }
+    }
 }
 
 fn duckdb_error_to_status(err: &DuckDbError) -> Status {

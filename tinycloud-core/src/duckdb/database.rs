@@ -1,11 +1,12 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use dashmap::DashMap;
 use tokio::sync::{mpsc, oneshot};
 
 use super::{
     caveats::DuckDbCaveats,
-    describe,
-    parser,
+    describe, parser,
     storage::{self, StorageMode},
     types::*,
 };
@@ -16,6 +17,7 @@ struct DbMessage {
     request: DuckDbRequest,
     caveats: Option<DuckDbCaveats>,
     ability: String,
+    arrow_format: bool,
     response_tx: oneshot::Sender<Result<DuckDbResponse, DuckDbError>>,
 }
 
@@ -30,6 +32,7 @@ impl DatabaseHandle {
         request: DuckDbRequest,
         caveats: Option<DuckDbCaveats>,
         ability: String,
+        arrow_format: bool,
     ) -> Result<DuckDbResponse, DuckDbError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
@@ -37,6 +40,7 @@ impl DatabaseHandle {
                 request,
                 caveats,
                 ability,
+                arrow_format,
                 response_tx,
             })
             .await
@@ -54,6 +58,7 @@ pub fn spawn_actor(
     memory_threshold: u64,
     idle_timeout_secs: u64,
     max_memory_per_connection: String,
+    databases: Arc<DashMap<(String, String), DatabaseHandle>>,
 ) -> DatabaseHandle {
     let (tx, mut rx) = mpsc::channel::<DbMessage>(32);
     let idle_timeout = std::time::Duration::from_secs(idle_timeout_secs);
@@ -70,8 +75,20 @@ pub fn spawn_actor(
         } else {
             StorageMode::InMemory
         };
-        let mut conn = storage::open_connection(&mode, &max_memory_per_connection)
-            .expect("Failed to open database");
+        let mut conn = match storage::open_connection(&mode, &max_memory_per_connection) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error=%e, "Failed to open database");
+                // Drain pending messages with error
+                while let Ok(msg) = rx.try_recv() {
+                    let _ = msg
+                        .response_tx
+                        .send(Err(DuckDbError::Internal(format!("Failed to open: {}", e))));
+                }
+                databases.remove(&(space_id, db_name));
+                return;
+            }
+        };
 
         loop {
             // Block on receiving with timeout
@@ -82,14 +99,23 @@ pub fn spawn_actor(
                     Err(_) => break,   // Idle timeout
                 };
 
-            let result = handle_message(&conn, &msg.request, &msg.caveats, &msg.ability);
+            let result = handle_message(
+                &conn,
+                &msg.request,
+                &msg.caveats,
+                &msg.ability,
+                msg.arrow_format,
+            );
 
             // Post-write promotion check
             if result.is_ok() && matches!(mode, StorageMode::InMemory) {
                 if let Ok(size) = storage::database_size(&conn) {
                     if size > memory_threshold {
-                        match storage::promote_to_file(&conn, &file_path, &max_memory_per_connection)
-                        {
+                        match storage::promote_to_file(
+                            &conn,
+                            &file_path,
+                            &max_memory_per_connection,
+                        ) {
                             Ok(new_conn) => {
                                 conn = new_conn;
                                 mode = StorageMode::File(file_path.clone());
@@ -106,6 +132,7 @@ pub fn spawn_actor(
             let _ = msg.response_tx.send(result);
         }
 
+        databases.remove(&(space_id.clone(), db_name.clone()));
         tracing::debug!(space=%space_id, db=%db_name, "Database actor shutting down");
     });
 
@@ -117,12 +144,17 @@ fn handle_message(
     request: &DuckDbRequest,
     caveats: &Option<DuckDbCaveats>,
     ability: &str,
+    arrow_format: bool,
 ) -> Result<DuckDbResponse, DuckDbError> {
     // No authorizer in DuckDB -- parser is the sole defense
     match request {
         DuckDbRequest::Query { sql, params } => {
             parser::validate_sql(sql, caveats, ability)?;
-            execute_query(conn, sql, params).map(DuckDbResponse::Query)
+            if arrow_format {
+                execute_query_arrow(conn, sql, params).map(DuckDbResponse::Arrow)
+            } else {
+                execute_query(conn, sql, params).map(DuckDbResponse::Query)
+            }
         }
         DuckDbRequest::Execute {
             sql,
@@ -157,9 +189,9 @@ fn handle_message(
             .map(DuckDbResponse::Batch)
         }
         DuckDbRequest::ExecuteStatement { name, params } => {
-            let caveats_ref = caveats.as_ref().ok_or_else(|| {
-                DuckDbError::InvalidStatement("No caveats found".to_string())
-            })?;
+            let caveats_ref = caveats
+                .as_ref()
+                .ok_or_else(|| DuckDbError::InvalidStatement("No caveats found".to_string()))?;
             let prepared = caveats_ref.find_statement(name).ok_or_else(|| {
                 DuckDbError::InvalidStatement(format!("Statement '{}' not found", name))
             })?;
@@ -178,7 +210,7 @@ fn handle_message(
             }
         }
         DuckDbRequest::Describe => {
-            describe::describe_schema(conn).map(DuckDbResponse::Describe)
+            describe::describe_schema(conn, caveats).map(DuckDbResponse::Describe)
         }
         DuckDbRequest::Ingest { .. } => Err(DuckDbError::Internal(
             "KV bridge not yet available".to_string(),
@@ -277,6 +309,50 @@ fn execute_query(
         rows,
         row_count,
     })
+}
+
+fn execute_query_arrow(
+    conn: &duckdb::Connection,
+    sql: &str,
+    params: &[DuckDbValue],
+) -> Result<Vec<u8>, DuckDbError> {
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| DuckDbError::DuckDb(e.to_string()))?;
+
+    let duckdb_params: Vec<duckdb::types::Value> =
+        params.iter().map(duckdb_value_to_param).collect();
+    let param_refs: Vec<&dyn duckdb::types::ToSql> = duckdb_params
+        .iter()
+        .map(|p| p as &dyn duckdb::types::ToSql)
+        .collect();
+
+    let arrow_result = stmt
+        .query_arrow(param_refs.as_slice())
+        .map_err(|e| DuckDbError::DuckDb(e.to_string()))?;
+
+    let schema = arrow_result.get_schema();
+    let mut buf = Vec::new();
+
+    {
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &schema)
+            .map_err(|e| DuckDbError::Internal(format!("Arrow writer error: {}", e)))?;
+
+        for batch in arrow_result {
+            writer
+                .write(&batch)
+                .map_err(|e| DuckDbError::Internal(format!("Arrow write error: {}", e)))?;
+        }
+        writer
+            .finish()
+            .map_err(|e| DuckDbError::Internal(format!("Arrow finish error: {}", e)))?;
+    }
+
+    if buf.len() > MAX_RESPONSE_SIZE {
+        return Err(DuckDbError::ResponseTooLarge(buf.len() as u64));
+    }
+
+    Ok(buf)
 }
 
 fn execute_statement(

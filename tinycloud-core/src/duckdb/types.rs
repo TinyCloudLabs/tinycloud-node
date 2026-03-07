@@ -34,9 +34,7 @@ pub enum DuckDbRequest {
     #[serde(rename = "describe")]
     Describe,
     #[serde(rename = "ingest")]
-    Ingest {
-        statement: IngestStatement,
-    },
+    Ingest { statement: IngestStatement },
     #[serde(rename = "exportToKv")]
     ExportToKv {
         sql: String,
@@ -47,9 +45,7 @@ pub enum DuckDbRequest {
     #[serde(rename = "export")]
     Export,
     #[serde(rename = "import")]
-    Import {
-        data: Vec<u8>,
-    },
+    Import { data: Vec<u8> },
 }
 
 fn default_export_format() -> String {
@@ -228,7 +224,13 @@ impl From<duckdb::types::Value> for DuckDbValue {
             duckdb::types::Value::UTinyInt(i) => DuckDbValue::Integer(i as i64),
             duckdb::types::Value::USmallInt(i) => DuckDbValue::Integer(i as i64),
             duckdb::types::Value::UInt(i) => DuckDbValue::Integer(i as i64),
-            duckdb::types::Value::UBigInt(i) => DuckDbValue::Integer(i as i64),
+            duckdb::types::Value::UBigInt(i) => {
+                if i <= i64::MAX as u64 {
+                    DuckDbValue::Integer(i as i64)
+                } else {
+                    DuckDbValue::Text(i.to_string())
+                }
+            }
             duckdb::types::Value::Float(f) => DuckDbValue::Float(f),
             duckdb::types::Value::Double(f) => DuckDbValue::Double(f),
             duckdb::types::Value::Decimal(d) => DuckDbValue::Text(ToString::to_string(&d)),
@@ -271,7 +273,17 @@ impl From<duckdb::types::Value> for DuckDbValue {
             duckdb::types::Value::Map(ordered_map) => {
                 let mut fields = HashMap::new();
                 for (k, v) in ordered_map.iter() {
-                    let key_str = format!("{:?}", k);
+                    let key_str = match k {
+                        duckdb::types::Value::Text(s) => s.clone(),
+                        duckdb::types::Value::Boolean(b) => b.to_string(),
+                        duckdb::types::Value::TinyInt(i) => i.to_string(),
+                        duckdb::types::Value::SmallInt(i) => i.to_string(),
+                        duckdb::types::Value::Int(i) => i.to_string(),
+                        duckdb::types::Value::BigInt(i) => i.to_string(),
+                        duckdb::types::Value::Float(f) => f.to_string(),
+                        duckdb::types::Value::Double(f) => f.to_string(),
+                        other => format!("{:?}", other),
+                    };
                     fields.insert(key_str, DuckDbValue::from(v.clone()));
                 }
                 DuckDbValue::Struct(fields)
@@ -322,8 +334,8 @@ fn format_timestamp(unit: duckdb::types::TimeUnit, val: i64) -> String {
 
 fn format_date32(days: i32) -> String {
     // Days since Unix epoch (1970-01-01)
-    let epoch = time::Date::from_calendar_date(1970, time::Month::January, 1)
-        .expect("valid epoch date");
+    let epoch =
+        time::Date::from_calendar_date(1970, time::Month::January, 1).expect("valid epoch date");
     match epoch.checked_add(time::Duration::days(days as i64)) {
         Some(date) => {
             let format =
@@ -346,10 +358,13 @@ fn format_time64(unit: duckdb::types::TimeUnit, val: i64) -> String {
     let mins = (total_secs % 3600) / 60;
     let secs = total_secs % 60;
     let remaining_micros = (micros % 1_000_000).unsigned_abs();
-    format!("{:02}:{:02}:{:02}.{:06}", hours, mins, secs, remaining_micros)
+    format!(
+        "{:02}:{:02}:{:02}.{:06}",
+        hours, mins, secs, remaining_micros
+    )
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum DuckDbResponse {
     Query(QueryResponse),
@@ -358,6 +373,7 @@ pub enum DuckDbResponse {
     Describe(SchemaInfo),
     Ingest(IngestResponse),
     ExportToKv(ExportResponse),
+    Arrow(Vec<u8>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -394,10 +410,11 @@ pub struct TableInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ColumnInfo {
     pub name: String,
+    #[serde(rename = "type")]
     pub data_type: String,
+    #[serde(rename = "nullable")]
     pub is_nullable: bool,
 }
 
@@ -450,4 +467,75 @@ pub enum DuckDbError {
     ImportError(String),
     #[error("Internal error: {0}")]
     Internal(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ubigint_no_truncation() {
+        let max_u64 = u64::MAX;
+        let val = DuckDbValue::from(duckdb::types::Value::UBigInt(max_u64));
+        match val {
+            DuckDbValue::Text(s) => assert_eq!(s, max_u64.to_string()),
+            _ => panic!("Expected Text for u64::MAX, got {:?}", val),
+        }
+    }
+
+    #[test]
+    fn test_ubigint_small_value() {
+        let val = DuckDbValue::from(duckdb::types::Value::UBigInt(42));
+        match val {
+            DuckDbValue::Integer(i) => assert_eq!(i, 42),
+            _ => panic!("Expected Integer for small u64, got {:?}", val),
+        }
+    }
+
+    #[test]
+    fn test_map_key_formatting() {
+        let pairs: Vec<(duckdb::types::Value, duckdb::types::Value)> = vec![
+            (
+                duckdb::types::Value::Text("key1".to_string()),
+                duckdb::types::Value::Int(1),
+            ),
+            (
+                duckdb::types::Value::Int(42),
+                duckdb::types::Value::Text("val".to_string()),
+            ),
+        ];
+        let map = duckdb::types::Value::Map(duckdb::types::OrderedMap::from(pairs));
+        let converted = DuckDbValue::from(map);
+        match converted {
+            DuckDbValue::Struct(fields) => {
+                assert!(
+                    fields.contains_key("key1"),
+                    "Missing text key, got keys: {:?}",
+                    fields.keys().collect::<Vec<_>>()
+                );
+                assert!(
+                    fields.contains_key("42"),
+                    "Missing int key, got keys: {:?}",
+                    fields.keys().collect::<Vec<_>>()
+                );
+            }
+            _ => panic!("Expected Struct, got {:?}", converted),
+        }
+    }
+
+    #[test]
+    fn test_column_info_serialization() {
+        let col = ColumnInfo {
+            name: "id".to_string(),
+            data_type: "INTEGER".to_string(),
+            is_nullable: false,
+        };
+        let json = serde_json::to_value(&col).unwrap();
+        assert_eq!(json["name"], "id");
+        assert_eq!(json["type"], "INTEGER");
+        assert_eq!(json["nullable"], false);
+        // Should NOT have "dataType" or "isNullable"
+        assert!(json.get("dataType").is_none());
+        assert!(json.get("isNullable").is_none());
+    }
 }

@@ -120,7 +120,11 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         tinycloud_config.storage.duckdb.path.clone(),
         tinycloud_config.storage.duckdb.memory_threshold.as_u64(),
         tinycloud_config.storage.duckdb.idle_timeout_secs,
-        tinycloud_config.storage.duckdb.max_memory_per_connection.clone(),
+        tinycloud_config
+            .storage
+            .duckdb
+            .max_memory_per_connection
+            .clone(),
     );
 
     let rate_limiter = RateLimiter::new(&tinycloud_config.public_spaces);
