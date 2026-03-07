@@ -144,6 +144,47 @@ impl Default for SqlStorageConfig {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct DuckDbStorageConfig {
+    #[serde(default = "default_duckdb_path")]
+    pub path: String,
+    pub limit: Option<ByteUnit>,
+    #[serde(default = "default_duckdb_memory_threshold")]
+    pub memory_threshold: ByteUnit,
+    #[serde(default = "default_duckdb_idle_timeout")]
+    pub idle_timeout_secs: u64,
+    #[serde(default = "default_duckdb_max_memory")]
+    pub max_memory_per_connection: String,
+}
+
+fn default_duckdb_path() -> String {
+    "./tinycloud/duckdb".to_string()
+}
+
+fn default_duckdb_memory_threshold() -> ByteUnit {
+    ByteUnit::Mebibyte(10)
+}
+
+fn default_duckdb_idle_timeout() -> u64 {
+    300
+}
+
+fn default_duckdb_max_memory() -> String {
+    "128MB".to_string()
+}
+
+impl Default for DuckDbStorageConfig {
+    fn default() -> Self {
+        Self {
+            path: default_duckdb_path(),
+            limit: None,
+            memory_threshold: default_duckdb_memory_threshold(),
+            idle_timeout_secs: default_duckdb_idle_timeout(),
+            max_memory_per_connection: default_duckdb_max_memory(),
+        }
+    }
+}
+
 #[serde_as]
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Storage {
@@ -158,6 +199,8 @@ pub struct Storage {
     pub limit: Option<ByteUnit>,
     #[serde(default)]
     pub sql: SqlStorageConfig,
+    #[serde(default)]
+    pub duckdb: DuckDbStorageConfig,
 }
 
 impl Default for Storage {
@@ -168,6 +211,7 @@ impl Default for Storage {
             database: memory_db(),
             limit: None,
             sql: SqlStorageConfig::default(),
+            duckdb: DuckDbStorageConfig::default(),
         }
     }
 }

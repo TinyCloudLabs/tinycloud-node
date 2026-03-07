@@ -414,6 +414,9 @@ pub enum InvocationOutcome<R> {
     DelegationChain(Vec<DelegationInfo>),
     SqlResult(serde_json::Value),
     SqlExport(Vec<u8>),
+    DuckDbResult(serde_json::Value),
+    DuckDbExport(Vec<u8>),
+    DuckDbArrow(Vec<u8>),
 }
 
 impl<S: StorageSetup, K: Secrets> From<delegation::Error> for TxError<S, K> {

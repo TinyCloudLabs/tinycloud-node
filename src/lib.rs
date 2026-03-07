@@ -29,6 +29,7 @@ use storage::{
     s3::{S3BlockConfig, S3BlockStore},
 };
 use tinycloud_core::{
+    duckdb::DuckDbService,
     keys::{SecretsSetup, StaticSecret},
     sea_orm::{ConnectOptions, Database, DatabaseConnection},
     sql::SqlService,
@@ -115,6 +116,13 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         tinycloud_config.storage.sql.memory_threshold.as_u64(),
     );
 
+    let duckdb_service = DuckDbService::new(
+        tinycloud_config.storage.duckdb.path.clone(),
+        tinycloud_config.storage.duckdb.memory_threshold.as_u64(),
+        tinycloud_config.storage.duckdb.idle_timeout_secs,
+        tinycloud_config.storage.duckdb.max_memory_per_connection.clone(),
+    );
+
     let rate_limiter = RateLimiter::new(&tinycloud_config.public_spaces);
 
     let rocket = rocket::custom(config)
@@ -125,6 +133,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         })
         .manage(tinycloud)
         .manage(sql_service)
+        .manage(duckdb_service)
         .manage(rate_limiter)
         .manage(tinycloud_config.storage.staging.open().await?);
 
