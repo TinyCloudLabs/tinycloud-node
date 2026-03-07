@@ -2,7 +2,7 @@
 ARG RUNTIME_BASE=scratch
 
 FROM rust:alpine AS chef
-RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static
+RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static g++
 RUN cargo install cargo-chef
 WORKDIR /app
 
