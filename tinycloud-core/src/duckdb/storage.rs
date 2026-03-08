@@ -55,8 +55,7 @@ pub fn apply_security_settings(conn: &Connection, max_memory: &str) -> Result<()
     conn.execute_batch(&format!(
         "SET enable_external_access = false;\
          SET allow_unsigned_extensions = false;\
-         SET max_memory = '{}';\
-         SET statement_timeout = 30000;",
+         SET max_memory = '{}';",
         max_memory
     ))
     .map_err(|e| DuckDbError::Internal(format!("Failed to apply security settings: {}", e)))?;

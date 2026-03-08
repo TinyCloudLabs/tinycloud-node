@@ -270,8 +270,6 @@ fn execute_query(
         .prepare(sql)
         .map_err(|e| DuckDbError::DuckDb(e.to_string()))?;
 
-    let columns: Vec<String> = stmt.column_names();
-
     let duckdb_params: Vec<duckdb::types::Value> =
         params.iter().map(duckdb_value_to_param).collect();
     let param_refs: Vec<&dyn duckdb::types::ToSql> = duckdb_params
@@ -279,12 +277,20 @@ fn execute_query(
         .map(|p| p as &dyn duckdb::types::ToSql)
         .collect();
 
-    let mut rows = Vec::new();
-    let mut size_estimate: usize = 0;
-
     let mut query_rows = stmt
         .query(param_refs.as_slice())
         .map_err(|e| DuckDbError::DuckDb(e.to_string()))?;
+
+    // column_names() must be called after query() — the duckdb crate
+    // only populates the schema once the statement has been executed.
+    // Access via the Rows reference to avoid borrow conflict with stmt.
+    let columns: Vec<String> = query_rows
+        .as_ref()
+        .map(|s| s.column_names())
+        .unwrap_or_default();
+
+    let mut rows = Vec::new();
+    let mut size_estimate: usize = 0;
 
     while let Some(row) = query_rows
         .next()
