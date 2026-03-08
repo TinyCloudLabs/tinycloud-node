@@ -17,7 +17,17 @@ async fn main() {
         .merge(Env::prefixed("ROCKET_").global()); // That's just for easy access to ROCKET_LOG_LEVEL
     let tinycloud_config = config.extract::<config::Config>().unwrap();
 
-    let rocket = app(&config).await.unwrap().ignite().await.unwrap();
+    let rocket = match app(&config).await {
+        Ok(r) => r.ignite().await.unwrap(),
+        Err(e) => {
+            eprintln!("\n✗ Failed to start tinycloud-node:\n");
+            for cause in e.chain() {
+                eprintln!("  {cause}");
+            }
+            eprintln!("\nCheck your tinycloud.toml or TINYCLOUD_ environment variables.");
+            std::process::exit(1);
+        }
+    };
 
     let prom_addr = (rocket.config().address, tinycloud_config.prometheus.port).into();
     let prometheus = Server::bind(&prom_addr).serve(make_service_fn(|_| async {
