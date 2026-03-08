@@ -202,10 +202,7 @@ where
     B: StorageSetup,
     K: Secrets,
 {
-    async fn transact(
-        &self,
-        events: Vec<Event>,
-    ) -> Result<TransactResult, TxError<B, K>> {
+    async fn transact(&self, events: Vec<Event>) -> Result<TransactResult, TxError<B, K>> {
         let tx = self
             .conn
             .begin_with_config(Some(sea_orm::IsolationLevel::ReadUncommitted), None)
@@ -218,18 +215,12 @@ where
         Ok(result)
     }
 
-    pub async fn delegate(
-        &self,
-        delegation: Delegation,
-    ) -> Result<TransactResult, TxError<B, K>> {
+    pub async fn delegate(&self, delegation: Delegation) -> Result<TransactResult, TxError<B, K>> {
         self.transact(vec![Event::Delegation(Box::new(delegation))])
             .await
     }
 
-    pub async fn revoke(
-        &self,
-        revocation: Revocation,
-    ) -> Result<TransactResult, TxError<B, K>> {
+    pub async fn revoke(&self, revocation: Revocation) -> Result<TransactResult, TxError<B, K>> {
         self.transact(vec![Event::Revocation(Box::new(revocation))])
             .await
     }
@@ -238,13 +229,7 @@ where
         &self,
         invocation: Invocation,
         mut inputs: InvocationInputs<S::Writable>,
-    ) -> Result<
-        (
-            TransactResult,
-            Vec<InvocationOutcome<B::Readable>>,
-        ),
-        TxStoreError<B, S, K>,
-    >
+    ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
     where
         B: ImmutableWriteStore<S> + ImmutableDeleteStore + ImmutableReadStore,
         S: ImmutableStaging,
@@ -414,6 +399,9 @@ pub enum InvocationOutcome<R> {
     DelegationChain(Vec<DelegationInfo>),
     SqlResult(serde_json::Value),
     SqlExport(Vec<u8>),
+    DuckDbResult(serde_json::Value),
+    DuckDbExport(Vec<u8>),
+    DuckDbArrow(Vec<u8>),
 }
 
 impl<S: StorageSetup, K: Secrets> From<delegation::Error> for TxError<S, K> {
@@ -578,10 +566,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         };
 
         // new_spaces are always existing (just inserted above)
-        let existing: HashSet<SpaceId> = existing
-            .into_iter()
-            .chain(new_space_ids)
-            .collect();
+        let existing: HashSet<SpaceId> = existing.into_iter().chain(new_space_ids).collect();
 
         let skipped: Vec<SpaceId> = event_spaces
             .keys()
@@ -604,10 +589,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     if !event_spaces.is_empty() {
         // get max sequence for each of the spaces
         let mut max_seqs = event_order::Entity::find()
-            .filter(
-                event_order::Column::Space
-                    .is_in(event_spaces.keys().cloned().map(SpaceIdWrap)),
-            )
+            .filter(event_order::Column::Space.is_in(event_spaces.keys().cloned().map(SpaceIdWrap)))
             .select_only()
             .column(event_order::Column::Space)
             .column_as(event_order::Column::Seq.max(), "max_seq")
@@ -627,10 +609,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             .left_join(epoch_order::Entity)
             .filter(
                 Condition::all()
-                    .add(
-                        epoch::Column::Space
-                            .is_in(event_spaces.keys().cloned().map(SpaceIdWrap)),
-                    )
+                    .add(epoch::Column::Space.is_in(event_spaces.keys().cloned().map(SpaceIdWrap)))
                     .add(epoch_order::Column::Child.is_null()),
             )
             .column(epoch::Column::Space)

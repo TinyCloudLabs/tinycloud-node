@@ -69,11 +69,10 @@ impl FileSystemConfig {
 impl StorageConfig<FileSystemStore> for FileSystemConfig {
     type Error = IoError;
     async fn open(&self) -> Result<FileSystemStore, Self::Error> {
-        if self.path.is_dir() {
-            Ok(FileSystemStore::new(self.path.clone()).await?)
-        } else {
-            Err(IoError::new(ErrorKind::NotFound, "path is not a directory"))
+        if !self.path.is_dir() {
+            create_dir_all(&self.path).await?;
         }
+        Ok(FileSystemStore::new(self.path.clone()).await?)
     }
 }
 
