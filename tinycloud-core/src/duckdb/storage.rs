@@ -107,8 +107,8 @@ pub fn copy_tables(src: &Connection, dest: &Connection) -> Result<(), DuckDbErro
     let table_names: Vec<String> = stmt
         .query_map([], |row| row.get::<_, String>(0))
         .map_err(|e| DuckDbError::Internal(e.to_string()))?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| DuckDbError::Internal(e.to_string()))?;
 
     for table in &table_names {
         // Get CREATE TABLE DDL
@@ -156,11 +156,13 @@ pub fn copy_tables(src: &Connection, dest: &Connection) -> Result<(), DuckDbErro
     let views: Vec<(String, String)> = view_stmt
         .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
         .map_err(|e| DuckDbError::Internal(e.to_string()))?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| DuckDbError::Internal(e.to_string()))?;
 
-    for (_, view_sql) in &views {
-        let _ = dest.execute_batch(view_sql);
+    for (name, view_sql) in &views {
+        if let Err(e) = dest.execute_batch(view_sql) {
+            tracing::warn!(view=%name, error=%e, "failed to copy view during table copy");
+        }
     }
 
     Ok(())
