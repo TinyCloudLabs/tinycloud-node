@@ -14,11 +14,16 @@ use super::{
 const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024; // 10MB
 const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300); // 5 min
 
-struct DbMessage {
-    request: SqlRequest,
-    caveats: Option<SqlCaveats>,
-    ability: String,
-    response_tx: oneshot::Sender<Result<SqlResponse, SqlError>>,
+enum DbMessage {
+    Execute {
+        request: SqlRequest,
+        caveats: Option<SqlCaveats>,
+        ability: String,
+        response_tx: oneshot::Sender<Result<SqlResponse, SqlError>>,
+    },
+    Export {
+        response_tx: oneshot::Sender<Result<Vec<u8>, SqlError>>,
+    },
 }
 
 #[derive(Clone)]
@@ -35,12 +40,23 @@ impl DatabaseHandle {
     ) -> Result<SqlResponse, SqlError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
-            .send(DbMessage {
+            .send(DbMessage::Execute {
                 request,
                 caveats,
                 ability,
                 response_tx,
             })
+            .await
+            .map_err(|_| SqlError::Internal("Database actor not available".to_string()))?;
+        response_rx
+            .await
+            .map_err(|_| SqlError::Internal("Database actor dropped response".to_string()))?
+    }
+
+    pub async fn export(&self) -> Result<Vec<u8>, SqlError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send(DbMessage::Export { response_tx })
             .await
             .map_err(|_| SqlError::Internal("Database actor not available".to_string()))?;
         response_rx
@@ -80,33 +96,80 @@ pub fn spawn_actor(
                     Err(_) => break,   // Idle timeout
                 };
 
-            let result = handle_message(&conn, &msg.request, &msg.caveats, &msg.ability);
+            match msg {
+                DbMessage::Execute {
+                    request,
+                    caveats,
+                    ability,
+                    response_tx,
+                } => {
+                    let result = handle_message(&conn, &request, &caveats, &ability);
 
-            // Post-write promotion check
-            if result.is_ok() && matches!(mode, StorageMode::InMemory) {
-                if let Ok(size) = storage::database_size(&conn) {
-                    if size > memory_threshold {
-                        match storage::promote_to_file(&conn, &file_path) {
-                            Ok(new_conn) => {
-                                conn = new_conn;
-                                mode = StorageMode::File(file_path.clone());
-                                tracing::info!(space=%space_id, db=%db_name, "Promoted database to file storage");
-                            }
-                            Err(e) => {
-                                tracing::error!(space=%space_id, db=%db_name, error=%e, "Failed to promote database to file");
+                    // Post-write promotion check
+                    if result.is_ok() && matches!(mode, StorageMode::InMemory) {
+                        if let Ok(size) = storage::database_size(&conn) {
+                            if size > memory_threshold {
+                                match storage::promote_to_file(&conn, &file_path) {
+                                    Ok(new_conn) => {
+                                        conn = new_conn;
+                                        mode = StorageMode::File(file_path.clone());
+                                        tracing::info!(space=%space_id, db=%db_name, "Promoted database to file storage");
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(space=%space_id, db=%db_name, error=%e, "Failed to promote database to file");
+                                    }
+                                }
                             }
                         }
                     }
+
+                    let _ = response_tx.send(result);
+                }
+                DbMessage::Export { response_tx } => {
+                    let result = handle_export(&conn, &mode, &file_path);
+                    let _ = response_tx.send(result);
                 }
             }
-
-            let _ = msg.response_tx.send(result);
         }
 
         tracing::debug!(space=%space_id, db=%db_name, "Database actor shutting down");
     });
 
     DatabaseHandle { tx }
+}
+
+fn handle_export(
+    conn: &rusqlite::Connection,
+    mode: &StorageMode,
+    file_path: &PathBuf,
+) -> Result<Vec<u8>, SqlError> {
+    match mode {
+        StorageMode::File(_) => {
+            // File-backed: read the file directly
+            std::fs::read(file_path).map_err(|e| SqlError::Internal(e.to_string()))
+        }
+        StorageMode::InMemory => {
+            // In-memory: serialize via SQLite backup API to a temp file
+            let temp_dir = tempfile::tempdir().map_err(|e| SqlError::Internal(e.to_string()))?;
+            let temp_path = temp_dir.path().join("export.db");
+
+            let mut dest = rusqlite::Connection::open(&temp_path)
+                .map_err(|e| SqlError::Internal(e.to_string()))?;
+
+            {
+                let backup = rusqlite::backup::Backup::new(conn, &mut dest)
+                    .map_err(|e| SqlError::Internal(e.to_string()))?;
+                backup
+                    .run_to_completion(5, std::time::Duration::from_millis(250), None)
+                    .map_err(|e| SqlError::Internal(e.to_string()))?;
+            }
+
+            // Close the connection so the file is flushed
+            drop(dest);
+
+            std::fs::read(&temp_path).map_err(|e| SqlError::Internal(e.to_string()))
+        }
+    }
 }
 
 fn handle_message(

@@ -13,12 +13,17 @@ use super::{
 
 const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024; // 10MB
 
-struct DbMessage {
-    request: DuckDbRequest,
-    caveats: Option<DuckDbCaveats>,
-    ability: String,
-    arrow_format: bool,
-    response_tx: oneshot::Sender<Result<DuckDbResponse, DuckDbError>>,
+enum DbMessage {
+    Execute {
+        request: DuckDbRequest,
+        caveats: Option<DuckDbCaveats>,
+        ability: String,
+        arrow_format: bool,
+        response_tx: oneshot::Sender<Result<DuckDbResponse, DuckDbError>>,
+    },
+    Export {
+        response_tx: oneshot::Sender<Result<Vec<u8>, DuckDbError>>,
+    },
 }
 
 #[derive(Clone)]
@@ -36,13 +41,24 @@ impl DatabaseHandle {
     ) -> Result<DuckDbResponse, DuckDbError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
-            .send(DbMessage {
+            .send(DbMessage::Execute {
                 request,
                 caveats,
                 ability,
                 arrow_format,
                 response_tx,
             })
+            .await
+            .map_err(|_| DuckDbError::Internal("Database actor not available".to_string()))?;
+        response_rx
+            .await
+            .map_err(|_| DuckDbError::Internal("Database actor dropped response".to_string()))?
+    }
+
+    pub async fn export(&self) -> Result<Vec<u8>, DuckDbError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send(DbMessage::Export { response_tx })
             .await
             .map_err(|_| DuckDbError::Internal("Database actor not available".to_string()))?;
         response_rx
@@ -81,9 +97,14 @@ pub fn spawn_actor(
                 tracing::error!(error=%e, "Failed to open database");
                 // Drain pending messages with error
                 while let Ok(msg) = rx.try_recv() {
-                    let _ = msg
-                        .response_tx
-                        .send(Err(DuckDbError::Internal(format!("Failed to open: {}", e))));
+                    match msg {
+                        DbMessage::Execute { response_tx, .. } => {
+                            let _ = response_tx.send(Err(DuckDbError::Internal(format!("Failed to open: {}", e))));
+                        }
+                        DbMessage::Export { response_tx } => {
+                            let _ = response_tx.send(Err(DuckDbError::Internal(format!("Failed to open: {}", e))));
+                        }
+                    }
                 }
                 databases.remove(&(space_id, db_name));
                 return;
@@ -99,37 +120,51 @@ pub fn spawn_actor(
                     Err(_) => break,   // Idle timeout
                 };
 
-            let result = handle_message(
-                &conn,
-                &msg.request,
-                &msg.caveats,
-                &msg.ability,
-                msg.arrow_format,
-            );
+            match msg {
+                DbMessage::Execute {
+                    request,
+                    caveats,
+                    ability,
+                    arrow_format,
+                    response_tx,
+                } => {
+                    let result = handle_message(
+                        &conn,
+                        &request,
+                        &caveats,
+                        &ability,
+                        arrow_format,
+                    );
 
-            // Post-write promotion check
-            if result.is_ok() && matches!(mode, StorageMode::InMemory) {
-                if let Ok(size) = storage::database_size(&conn) {
-                    if size > memory_threshold {
-                        match storage::promote_to_file(
-                            &conn,
-                            &file_path,
-                            &max_memory_per_connection,
-                        ) {
-                            Ok(new_conn) => {
-                                conn = new_conn;
-                                mode = StorageMode::File(file_path.clone());
-                                tracing::info!(space=%space_id, db=%db_name, "Promoted database to file storage");
-                            }
-                            Err(e) => {
-                                tracing::error!(space=%space_id, db=%db_name, error=%e, "Failed to promote database to file");
+                    // Post-write promotion check
+                    if result.is_ok() && matches!(mode, StorageMode::InMemory) {
+                        if let Ok(size) = storage::database_size(&conn) {
+                            if size > memory_threshold {
+                                match storage::promote_to_file(
+                                    &conn,
+                                    &file_path,
+                                    &max_memory_per_connection,
+                                ) {
+                                    Ok(new_conn) => {
+                                        conn = new_conn;
+                                        mode = StorageMode::File(file_path.clone());
+                                        tracing::info!(space=%space_id, db=%db_name, "Promoted database to file storage");
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(space=%space_id, db=%db_name, error=%e, "Failed to promote database to file");
+                                    }
+                                }
                             }
                         }
                     }
+
+                    let _ = response_tx.send(result);
+                }
+                DbMessage::Export { response_tx } => {
+                    let result = handle_export(&conn, &mode, &file_path);
+                    let _ = response_tx.send(result);
                 }
             }
-
-            let _ = msg.response_tx.send(result);
         }
 
         databases.remove(&(space_id.clone(), db_name.clone()));
@@ -137,6 +172,36 @@ pub fn spawn_actor(
     });
 
     DatabaseHandle { tx }
+}
+
+fn handle_export(
+    conn: &duckdb::Connection,
+    mode: &StorageMode,
+    file_path: &PathBuf,
+) -> Result<Vec<u8>, DuckDbError> {
+    match mode {
+        StorageMode::File(_) => {
+            // File-backed: read the file directly
+            std::fs::read(file_path).map_err(|e| DuckDbError::Internal(e.to_string()))
+        }
+        StorageMode::InMemory => {
+            // In-memory: copy tables into a new file-backed database.
+            // We can't use EXPORT/IMPORT DATABASE because enable_external_access=false
+            // cannot be toggled at runtime.
+            let temp_dir =
+                tempfile::tempdir().map_err(|e| DuckDbError::Internal(e.to_string()))?;
+            let temp_db_path = temp_dir.path().join("export.duckdb");
+
+            let dest = duckdb::Connection::open(&temp_db_path)
+                .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+
+            storage::copy_tables(conn, &dest)?;
+
+            drop(dest);
+
+            std::fs::read(&temp_db_path).map_err(|e| DuckDbError::Internal(e.to_string()))
+        }
+    }
 }
 
 fn handle_message(

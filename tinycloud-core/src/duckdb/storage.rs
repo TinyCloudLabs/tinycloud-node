@@ -84,34 +84,86 @@ pub fn promote_to_file(
         std::fs::create_dir_all(parent).map_err(|e| DuckDbError::Internal(e.to_string()))?;
     }
 
-    let temp_dir = tempfile::tempdir().map_err(|e| DuckDbError::Internal(e.to_string()))?;
-    let temp_path = temp_dir.path().to_string_lossy().to_string();
-
-    // Temporarily enable external access for EXPORT DATABASE
-    conn.execute_batch("SET enable_external_access = true;")
-        .map_err(|e| {
-            DuckDbError::Internal(format!(
-                "Failed to enable external access for export: {}",
-                e
-            ))
-        })?;
-
-    let export_result = conn.execute_batch(&format!("EXPORT DATABASE '{}';", temp_path));
-
-    // Always re-disable external access
-    let _ = conn.execute_batch("SET enable_external_access = false;");
-
-    export_result
-        .map_err(|e| DuckDbError::Internal(format!("Failed to export database: {}", e)))?;
-
     let file_conn = Connection::open(path).map_err(|e| DuckDbError::Internal(e.to_string()))?;
     apply_security_settings(&file_conn, max_memory)?;
 
-    file_conn
-        .execute_batch(&format!("IMPORT DATABASE '{}';", temp_path))
-        .map_err(|e| DuckDbError::Internal(format!("Failed to import database: {}", e)))?;
+    // Copy tables from in-memory conn to file-backed conn
+    copy_tables(conn, &file_conn)?;
 
     Ok(file_conn)
+}
+
+/// Copy all user tables and views from one connection to another.
+/// Uses Arrow record batches for fast bulk transfer.
+pub fn copy_tables(src: &Connection, dest: &Connection) -> Result<(), DuckDbError> {
+    // Get all user tables
+    let mut stmt = src
+        .prepare(
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_schema = 'main' AND table_type = 'BASE TABLE'",
+        )
+        .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+
+    let table_names: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| DuckDbError::Internal(e.to_string()))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for table in &table_names {
+        // Get CREATE TABLE DDL
+        let create_sql: String = src
+            .query_row(
+                &format!(
+                    "SELECT sql FROM duckdb_tables() WHERE table_name = '{}'",
+                    table.replace('\'', "''")
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| DuckDbError::Internal(format!("Failed to get DDL for {}: {}", table, e)))?;
+
+        dest.execute_batch(&create_sql)
+            .map_err(|e| DuckDbError::Internal(format!("Failed to create table {}: {}", table, e)))?;
+
+        // Bulk copy via Arrow record batches
+        let mut read_stmt = src
+            .prepare(&format!("SELECT * FROM \"{}\"", table.replace('"', "\"\"")))
+            .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+
+        let arrow_result = read_stmt
+            .query_arrow([])
+            .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+
+        let mut appender = dest
+            .appender(table)
+            .map_err(|e| {
+                DuckDbError::Internal(format!("Failed to create appender for {}: {}", table, e))
+            })?;
+
+        for batch in arrow_result {
+            appender.append_record_batch(batch).map_err(|e| {
+                DuckDbError::Internal(format!("Failed to append batch for {}: {}", table, e))
+            })?;
+        }
+    }
+
+    // Copy views
+    let mut view_stmt = src
+        .prepare("SELECT view_name, sql FROM duckdb_views() WHERE schema_name = 'main'")
+        .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+
+    let views: Vec<(String, String)> = view_stmt
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|e| DuckDbError::Internal(e.to_string()))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for (_, view_sql) in &views {
+        let _ = dest.execute_batch(view_sql);
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

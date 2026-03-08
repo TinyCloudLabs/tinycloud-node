@@ -33,7 +33,7 @@ rusqlite.workspace = true
 sqlparser.workspace = true
 tracing.workspace = true
 tokio.workspace = true
-duckdb = { version = "1.1", features = ["bundled"] }
+duckdb = { version = "1.1", features = ["bundled", "appender-arrow"] }
 arrow = { version = "56", features = ["ipc"] }
 tempfile = "3"
 

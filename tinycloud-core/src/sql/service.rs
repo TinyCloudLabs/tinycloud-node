@@ -50,6 +50,14 @@ impl SqlService {
     }
 
     pub async fn export(&self, space: &SpaceId, db_name: &str) -> Result<Vec<u8>, SqlError> {
+        let key = (space.to_string(), db_name.to_string());
+
+        // If there's a live actor, route through it (handles both in-memory and file-backed)
+        if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
+            return handle.export().await;
+        }
+
+        // No live actor — try reading the file directly (cold database)
         let path = std::path::PathBuf::from(&self.base_path)
             .join(space.to_string())
             .join(format!("{}.db", db_name));
