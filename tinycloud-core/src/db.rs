@@ -701,7 +701,13 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             .exec(db)
             .await
             .map_err(|e| match e {
-                DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(_))) => {
+                DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(ref db_err))) => {
+                    tracing::warn!(
+                        error = %e,
+                        db_error = %db_err,
+                        db_error_code = ?db_err.code(),
+                        "epoch insert failed with database error"
+                    );
                     TxError::SpaceNotFound
                 }
                 _ => e.into(),

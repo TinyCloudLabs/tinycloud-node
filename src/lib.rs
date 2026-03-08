@@ -108,7 +108,21 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     };
 
     let mut connect_opts = ConnectOptions::from(&tinycloud_config.storage.database);
-    connect_opts.max_connections(100);
+    let is_sqlite = tinycloud_config.storage.database.starts_with("sqlite");
+    if is_sqlite {
+        // SQLite cannot handle concurrent write transactions — two DEFERRED
+        // transactions deadlock when both try to upgrade to writers.  Use a
+        // single connection to serialize writes, and enable WAL mode so reads
+        // outside transactions remain concurrent.
+        connect_opts.max_connections(1);
+        connect_opts.map_sqlx_sqlite_opts(|opts| {
+            opts.create_if_missing(true)
+                .pragma("journal_mode", "WAL")
+                .busy_timeout(std::time::Duration::from_secs(5))
+        });
+    } else {
+        connect_opts.max_connections(100);
+    }
 
     let tinycloud = TinyCloud::new(
         Database::connect(connect_opts).await?,
