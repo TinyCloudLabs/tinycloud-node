@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.0] - 2026-03-09
+
+- Add DuckDB analytical database service (tinycloud.duckdb/*) with per-space isolation, UCAN capability model, SQL parser security, Arrow IPC support, and binary export/import. Fix SQLite concurrency deadlock for concurrent requests.
+- Add multi-space session support. SessionConfig accepts optional additionalSpaces so a single SIWE signature covers multiple spaces.
+- Add vault WASM crypto functions (AES-256-GCM, HKDF-SHA256, X25519) and sanitize public endpoint metadata headers
+
 All notable changes to this project will be documented in this file.
 
 ## [0.2.1] - 2026-02-01
