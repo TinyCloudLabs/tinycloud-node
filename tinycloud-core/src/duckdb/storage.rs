@@ -135,11 +135,9 @@ pub fn copy_tables(src: &Connection, dest: &Connection) -> Result<(), DuckDbErro
             .query_arrow([])
             .map_err(|e| DuckDbError::Internal(e.to_string()))?;
 
-        let mut appender = dest
-            .appender(table)
-            .map_err(|e| {
-                DuckDbError::Internal(format!("Failed to create appender for {}: {}", table, e))
-            })?;
+        let mut appender = dest.appender(table).map_err(|e| {
+            DuckDbError::Internal(format!("Failed to create appender for {}: {}", table, e))
+        })?;
 
         for batch in arrow_result {
             appender.append_record_batch(batch).map_err(|e| {
@@ -154,7 +152,9 @@ pub fn copy_tables(src: &Connection, dest: &Connection) -> Result<(), DuckDbErro
         .map_err(|e| DuckDbError::Internal(e.to_string()))?;
 
     let views: Vec<(String, String)> = view_stmt
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
         .map_err(|e| DuckDbError::Internal(e.to_string()))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| DuckDbError::Internal(e.to_string()))?;

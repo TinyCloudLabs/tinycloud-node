@@ -15,7 +15,7 @@ const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024; // 10MB
 
 enum DbMessage {
     Execute {
-        request: DuckDbRequest,
+        request: Box<DuckDbRequest>,
         caveats: Option<DuckDbCaveats>,
         ability: String,
         arrow_format: bool,
@@ -42,7 +42,7 @@ impl DatabaseHandle {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
             .send(DbMessage::Execute {
-                request,
+                request: Box::new(request),
                 caveats,
                 ability,
                 arrow_format,
