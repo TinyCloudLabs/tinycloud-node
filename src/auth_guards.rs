@@ -111,6 +111,15 @@ where
                 .header(ContentType::new("application", "x-sqlite3"))
                 .sized_body(data.len(), std::io::Cursor::new(data))
                 .ok(),
+            InvocationOutcome::DuckDbResult(json) => Json(json).respond_to(request),
+            InvocationOutcome::DuckDbExport(data) => Response::build()
+                .header(ContentType::new("application", "x-duckdb"))
+                .sized_body(data.len(), std::io::Cursor::new(data))
+                .ok(),
+            InvocationOutcome::DuckDbArrow(data) => Response::build()
+                .header(ContentType::new("application", "vnd.apache.arrow.stream"))
+                .sized_body(data.len(), std::io::Cursor::new(data))
+                .ok(),
         }
     }
 }

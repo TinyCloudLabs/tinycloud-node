@@ -1,4 +1,5 @@
 pub mod db;
+pub mod duckdb;
 pub mod events;
 pub mod hash;
 pub mod keys;
