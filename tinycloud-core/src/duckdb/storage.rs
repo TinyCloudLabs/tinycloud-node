@@ -121,10 +121,13 @@ pub fn copy_tables(src: &Connection, dest: &Connection) -> Result<(), DuckDbErro
                 [],
                 |row| row.get(0),
             )
-            .map_err(|e| DuckDbError::Internal(format!("Failed to get DDL for {}: {}", table, e)))?;
+            .map_err(|e| {
+                DuckDbError::Internal(format!("Failed to get DDL for {}: {}", table, e))
+            })?;
 
-        dest.execute_batch(&create_sql)
-            .map_err(|e| DuckDbError::Internal(format!("Failed to create table {}: {}", table, e)))?;
+        dest.execute_batch(&create_sql).map_err(|e| {
+            DuckDbError::Internal(format!("Failed to create table {}: {}", table, e))
+        })?;
 
         // Bulk copy via Arrow record batches
         let mut read_stmt = src

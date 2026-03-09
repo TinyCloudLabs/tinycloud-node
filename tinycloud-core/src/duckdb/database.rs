@@ -99,10 +99,12 @@ pub fn spawn_actor(
                 while let Ok(msg) = rx.try_recv() {
                     match msg {
                         DbMessage::Execute { response_tx, .. } => {
-                            let _ = response_tx.send(Err(DuckDbError::Internal(format!("Failed to open: {}", e))));
+                            let _ = response_tx
+                                .send(Err(DuckDbError::Internal(format!("Failed to open: {}", e))));
                         }
                         DbMessage::Export { response_tx } => {
-                            let _ = response_tx.send(Err(DuckDbError::Internal(format!("Failed to open: {}", e))));
+                            let _ = response_tx
+                                .send(Err(DuckDbError::Internal(format!("Failed to open: {}", e))));
                         }
                     }
                 }
@@ -128,13 +130,7 @@ pub fn spawn_actor(
                     arrow_format,
                     response_tx,
                 } => {
-                    let result = handle_message(
-                        &conn,
-                        &request,
-                        &caveats,
-                        &ability,
-                        arrow_format,
-                    );
+                    let result = handle_message(&conn, &request, &caveats, &ability, arrow_format);
 
                     // Post-write promotion check
                     if result.is_ok() && matches!(mode, StorageMode::InMemory) {
@@ -188,8 +184,7 @@ fn handle_export(
             // In-memory: copy tables into a new file-backed database.
             // We can't use EXPORT/IMPORT DATABASE because enable_external_access=false
             // cannot be toggled at runtime.
-            let temp_dir =
-                tempfile::tempdir().map_err(|e| DuckDbError::Internal(e.to_string()))?;
+            let temp_dir = tempfile::tempdir().map_err(|e| DuckDbError::Internal(e.to_string()))?;
             let temp_db_path = temp_dir.path().join("export.duckdb");
 
             let dest = duckdb::Connection::open(&temp_db_path)
