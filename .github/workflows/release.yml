@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  release:
+    name: Version & Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install changesets CLI
+        run: npm install -g @changesets/cli
+
+      - name: Check for changesets
+        id: check
+        run: |
+          # Count changeset files (excluding README.md and config.json)
+          COUNT=$(find .changeset -name '*.md' ! -name 'README.md' | wc -l)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Create Release PR
+        if: steps.check.outputs.count != '0'
+        uses: changesets/action@v1
+        with:
+          version: node .github/scripts/version-cargo.mjs
+          commit: "chore: version packages"
+          title: "chore: version packages"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create GitHub Release on version merge
+        if: steps.check.outputs.count == '0'
+        run: |
+          # If no changesets remain, check if Cargo.toml version changed in this push
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          TAG="v$VERSION"
+          if ! git tag -l "$TAG" | grep -q "$TAG"; then
+            echo "Creating release $TAG"
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --generate-notes
+          else
+            echo "Tag $TAG already exists, skipping release"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
