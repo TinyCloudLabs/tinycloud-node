@@ -20,7 +20,7 @@ use sea_orm::{
 };
 use sea_orm_migration::MigratorTrait;
 use std::collections::{HashMap, HashSet};
-use tinycloud_lib::{
+use tinycloud_auth::{
     authorization::{EncodingError, TinyCloudDelegation},
     resource::{Path, SpaceId},
 };
@@ -56,9 +56,9 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
     #[error("database error: {0}")]
     Db(#[from] DbErr),
     #[error(transparent)]
-    Ucan(#[from] tinycloud_lib::ssi::ucan::Error),
+    Ucan(#[from] tinycloud_auth::ssi::ucan::Error),
     #[error(transparent)]
-    Cacao(#[from] tinycloud_lib::cacaos::siwe_cacao::VerificationError),
+    Cacao(#[from] tinycloud_auth::cacaos::siwe_cacao::VerificationError),
     #[error(transparent)]
     InvalidDelegation(#[from] delegation::DelegationError),
     #[error(transparent)]
@@ -1174,7 +1174,7 @@ async fn get_delegation_chain<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     delegation_cid: &str,
     encryption: Option<&ColumnEncryption>,
 ) -> Result<Vec<DelegationInfo>, TxError<S, K>> {
-    use tinycloud_lib::ipld_core::cid::Cid;
+    use tinycloud_auth::ipld_core::cid::Cid;
 
     // Parse the delegation CID
     let cid: Cid = delegation_cid

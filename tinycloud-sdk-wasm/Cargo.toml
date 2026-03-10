@@ -12,9 +12,9 @@ js-sys = "0.3.61"
 wasm-bindgen-futures = "0.4.34"
 console_error_panic_hook = "0.1.7"
 chrono = { version = "0.4.24", features = ["wasmbind"] }
-siwe = { version = "1.0.0", path = "../siwe", features = ["serde"] }
-siwe-recap = { version = "1.0.0", path = "../siwe-recap"}
-tinycloud-lib = { version = "1.0", path = "../tinycloud-lib" }
+siwe = { version = "1.0.0", path = "../dependencies/siwe", features = ["serde"] }
+siwe-recap = { version = "1.0.0", path = "../dependencies/siwe-recap"}
+tinycloud-auth = { version = "1.0", path = "../tinycloud-auth" }
 tinycloud-sdk-rs = { version = "1.0", path = "../tinycloud-sdk-rs" }
 serde.workspace = true
 serde_json.workspace = true

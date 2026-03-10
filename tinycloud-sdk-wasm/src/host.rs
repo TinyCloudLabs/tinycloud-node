@@ -2,7 +2,7 @@ use http::uri::Authority;
 use serde::Deserialize;
 use serde_json::Value;
 use serde_with::{serde_as, DisplayFromStr};
-use tinycloud_lib::{
+use tinycloud_auth::{
     authorization::TinyCloudDelegation,
     cacaos::{
         siwe::{generate_nonce, Message, TimeStamp, Version},

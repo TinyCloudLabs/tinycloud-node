@@ -1,11 +1,11 @@
 use libp2p::{Multiaddr, PeerId};
 use std::{convert::TryFrom, str::FromStr};
 use thiserror::Error;
-use tinycloud_lib::resource::{KRIParseError, Name, SpaceId};
-use tinycloud_lib::ssi::dids::document::verification_method::ValueOrReference;
-use tinycloud_lib::ssi::dids::resolution::Output;
-use tinycloud_lib::ssi::dids::DID;
-use tinycloud_lib::ssi::{
+use tinycloud_auth::resource::{KRIParseError, Name, SpaceId};
+use tinycloud_auth::ssi::dids::document::verification_method::ValueOrReference;
+use tinycloud_auth::ssi::dids::resolution::Output;
+use tinycloud_auth::ssi::dids::DID;
+use tinycloud_auth::ssi::{
     dids::{document::Service, DIDResolver, DIDURLBuf, Document},
     one_or_many::OneOrMany,
 };
@@ -103,7 +103,7 @@ impl From<(Document, Name)> for Manifest {
 #[derive(Error, Debug)]
 pub enum ResolutionError {
     #[error("DID Resolution Error: {0}")]
-    Resolver(#[from] tinycloud_lib::ssi::dids::resolution::Error),
+    Resolver(#[from] tinycloud_auth::ssi::dids::resolution::Error),
     #[error("DID Deactivated")]
     Deactivated,
 }
@@ -166,9 +166,9 @@ fn get_authorised_parties(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tinycloud_lib::resolver::DID_METHODS;
-    use tinycloud_lib::ssi::dids::AnyDidMethod;
-    use tinycloud_lib::ssi::jwk::JWK;
+    use tinycloud_auth::resolver::DID_METHODS;
+    use tinycloud_auth::ssi::dids::AnyDidMethod;
+    use tinycloud_auth::ssi::jwk::JWK;
 
     #[tokio::test]
     async fn basic_manifest() {

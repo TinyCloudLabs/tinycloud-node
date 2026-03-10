@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use tinycloud_lib::authorization::{TinyCloudDelegation, TinyCloudInvocation};
+use tinycloud_auth::authorization::{TinyCloudDelegation, TinyCloudInvocation};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct DelegationHeaders {
@@ -28,7 +28,7 @@ impl DelegationHeaders {
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("failed to generate proof for invocation: {0}")]
-    FailedToMakeInvocation(tinycloud_lib::authorization::InvocationError),
+    FailedToMakeInvocation(tinycloud_auth::authorization::InvocationError),
     #[error("failed to translate response to JSON: {0}")]
     JSONSerializing(serde_json::Error),
     #[error("failed to parse session from JSON: {0}")]
@@ -40,7 +40,7 @@ mod header_enc {
         de::Error as DeError, ser::Error as SerError, Deserialize, Deserializer, Serialize,
         Serializer,
     };
-    use tinycloud_lib::authorization::HeaderEncode;
+    use tinycloud_auth::authorization::HeaderEncode;
 
     pub fn deserialize<'de, T, D>(d: D) -> Result<T, D::Error>
     where

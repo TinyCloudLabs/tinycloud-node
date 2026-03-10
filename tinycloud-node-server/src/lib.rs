@@ -86,7 +86,8 @@ impl From<BlockStage> for StagingStorage {
 pub type TinyCloud = SpaceDatabase<DatabaseConnection, BlockStores, StaticSecret>;
 
 pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
-    let tinycloud_config: Config = config.extract::<Config>()?;
+    let mut tinycloud_config: Config = config.extract::<Config>()?;
+    tinycloud_config.storage.resolve();
 
     // Ensure local storage directories exist.
     // SQLite file paths and local dirs are resources the server owns — auto-create them.
@@ -144,8 +145,9 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         }
     };
 
-    let mut connect_opts = ConnectOptions::from(&tinycloud_config.storage.database);
-    let is_sqlite = tinycloud_config.storage.database.starts_with("sqlite");
+    let database = tinycloud_config.storage.database();
+    let mut connect_opts = ConnectOptions::from(database);
+    let is_sqlite = database.starts_with("sqlite");
     if is_sqlite {
         // SQLite cannot handle concurrent write transactions — two DEFERRED
         // transactions deadlock when both try to upgrade to writers.  Use a
@@ -169,12 +171,17 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     .await?;
 
     let sql_service = SqlService::new(
-        tinycloud_config.storage.sql.path.clone(),
+        tinycloud_config.storage.sql.path.clone().expect("resolved"),
         tinycloud_config.storage.sql.memory_threshold.as_u64(),
     );
 
     let duckdb_service = DuckDbService::new(
-        tinycloud_config.storage.duckdb.path.clone(),
+        tinycloud_config
+            .storage
+            .duckdb
+            .path
+            .clone()
+            .expect("resolved"),
         tinycloud_config.storage.duckdb.memory_threshold.as_u64(),
         tinycloud_config.storage.duckdb.idle_timeout_secs,
         tinycloud_config
@@ -278,9 +285,11 @@ async fn resolve_keys(keys: &Keys) -> Result<StaticSecret> {
 /// automatically. For remote backends (Postgres, S3), do nothing — connection
 /// errors from those backends are already descriptive.
 async fn ensure_local_dirs(storage: &config::Storage) -> Result<()> {
+    let database = storage.database();
+
     // SQLite: ensure the parent directory of the database file exists.
     // Connection strings look like "sqlite:./data/caps.db" or "sqlite::memory:".
-    if let Some(path) = storage.database.strip_prefix("sqlite:") {
+    if let Some(path) = database.strip_prefix("sqlite:") {
         if path != ":memory:" && !path.starts_with(":memory:") {
             // Strip query params (e.g., "?mode=rwc")
             let file_path = path.split('?').next().unwrap_or(path);
@@ -295,12 +304,16 @@ async fn ensure_local_dirs(storage: &config::Storage) -> Result<()> {
     }
 
     // SQL and DuckDB storage paths are always local filesystem
-    tokio::fs::create_dir_all(&storage.sql.path)
-        .await
-        .with_context(|| format!("creating SQL storage directory: {}", storage.sql.path))?;
-    tokio::fs::create_dir_all(&storage.duckdb.path)
-        .await
-        .with_context(|| format!("creating DuckDB storage directory: {}", storage.duckdb.path))?;
+    if let Some(ref sql_path) = storage.sql.path {
+        tokio::fs::create_dir_all(sql_path)
+            .await
+            .with_context(|| format!("creating SQL storage directory: {}", sql_path))?;
+    }
+    if let Some(ref duckdb_path) = storage.duckdb.path {
+        tokio::fs::create_dir_all(duckdb_path)
+            .await
+            .with_context(|| format!("creating DuckDB storage directory: {}", duckdb_path))?;
+    }
 
     Ok(())
 }

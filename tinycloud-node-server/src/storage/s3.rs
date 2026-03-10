@@ -17,8 +17,8 @@ use rocket::{async_trait, http::hyper::Uri};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 use std::{collections::HashMap, io::Error as IoError, ops::AddAssign};
+use tinycloud_auth::resource::SpaceId;
 use tinycloud_core::{hash::Hash, storage::*};
-use tinycloud_lib::resource::SpaceId;
 
 use super::{file_system, size::SpaceSizes};
 

@@ -8,7 +8,7 @@
  * Usage: node scripts/apply-changesets.mjs
  *
  * Groups:
- *   - "core" or "tinycloud-core" → tinycloud, tinycloud-core, tinycloud-lib
+ *   - "core" or "tinycloud-core" → tinycloud-node-server, tinycloud-core, tinycloud-auth
  *   - "sdk" → tinycloud-sdk-rs, tinycloud-sdk-wasm
  *   - Individual crate names for independent versioning
  */
@@ -24,7 +24,7 @@ const CHANGELOG = join(ROOT, 'CHANGELOG.md');
 
 // Crate groups - bumping a group bumps all members together
 const GROUPS = {
-  'core': ['tinycloud', 'tinycloud-core', 'tinycloud-lib'],
+  'core': ['tinycloud-node-server', 'tinycloud-core', 'tinycloud-auth'],
   'sdk': ['tinycloud-sdk-rs', 'tinycloud-sdk-wasm'],
 };
 
@@ -35,14 +35,14 @@ const ALIASES = {
 
 // All known crates and their Cargo.toml paths (relative to ROOT)
 const CRATES = {
-  'tinycloud': 'Cargo.toml',
+  'tinycloud-node-server': 'tinycloud-node-server/Cargo.toml',
   'tinycloud-core': 'tinycloud-core/Cargo.toml',
-  'tinycloud-lib': 'tinycloud-lib/Cargo.toml',
+  'tinycloud-auth': 'tinycloud-auth/Cargo.toml',
   'tinycloud-sdk-rs': 'tinycloud-sdk-rs/Cargo.toml',
   'tinycloud-sdk-wasm': 'tinycloud-sdk-wasm/Cargo.toml',
-  'siwe': 'siwe/Cargo.toml',
-  'siwe-recap': 'siwe-recap/Cargo.toml',
-  'cacaos': 'cacao/Cargo.toml',
+  'siwe': 'dependencies/siwe/Cargo.toml',
+  'siwe-recap': 'dependencies/siwe-recap/Cargo.toml',
+  'cacaos': 'dependencies/cacao/Cargo.toml',
 };
 
 // Parse a changeset file - supports multiple packages

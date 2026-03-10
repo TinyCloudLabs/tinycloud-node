@@ -1,8 +1,8 @@
 use anyhow::Result;
 use reqwest::get;
 use serde::{Deserialize, Serialize};
-use tinycloud_lib::ipld_core::cid::{multibase::Base, Cid};
-use tinycloud_lib::resource::SpaceId;
+use tinycloud_auth::ipld_core::cid::{multibase::Base, Cid};
+use tinycloud_auth::resource::SpaceId;
 
 #[rocket::async_trait]
 pub trait SpaceAllowList {

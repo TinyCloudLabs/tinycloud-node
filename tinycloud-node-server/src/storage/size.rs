@@ -3,7 +3,7 @@ use std::{
     ops::{AddAssign, SubAssign},
     sync::Arc,
 };
-use tinycloud_lib::resource::SpaceId;
+use tinycloud_auth::resource::SpaceId;
 use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, Default)]

@@ -92,7 +92,7 @@ The SQL database can be configured with `storage.database` or the `TINYCLOUD_STO
 
 | Type     | Example                                       | Description                                                                         |
 |:---------|:----------------------------------------------|:------------------------------------------------------------------------------------|
-| Sqlite   | "sqlite:./tinycloud/caps.db"                     | Set TinyCloud Protocol to use a local Sqlite file at the relative path `./tinycloud/caps.db`       |
+| Sqlite   | "sqlite:./data/caps.db"                     | Set TinyCloud Protocol to use a local Sqlite file at the relative path `./data/caps.db`       |
 | MySQL    | "mysql://root:root@localhost:3306/example"    | Use the MySQL instance deployed at `localhost:3306`, with database name `example`   |
 | Postgres | "postgres://root:root@localhost:5432/example" | Use the Postgres instance deployed at `localhost:5432` with database name `example` |
 

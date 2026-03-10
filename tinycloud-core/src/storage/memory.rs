@@ -7,7 +7,7 @@ use dashmap::DashMap;
 use futures::io::Cursor;
 use sea_orm_migration::async_trait::async_trait;
 use std::{io, sync::Arc};
-use tinycloud_lib::resource::SpaceId;
+use tinycloud_auth::resource::SpaceId;
 
 #[derive(Debug, Default, Clone)]
 pub struct MemoryStore {

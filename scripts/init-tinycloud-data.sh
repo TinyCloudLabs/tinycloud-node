@@ -2,52 +2,39 @@
 
 # TinyCloud Directory Initialization Script
 #
-# This script ensures the TinyCloud runtime directory structure exists with the proper files:
-# - ./data/                      - Main TinyCloud data directory
-# - ./data/blocks/               - Directory for storing content blocks
-# - ./data/caps.db               - SQLite database for capability tokens
-# - ./data/.gitignore            - Git ignore file set to "*" to ignore all contents
+# Creates the runtime data directory structure. Honors DATA_DIR env var
+# (default: ./data) to match the `datadir` config in tinycloud.toml.
 #
-# The script is idempotent - it can be run multiple times safely and will only
-# create missing files/directories without affecting existing ones.
+# Structure created:
+#   $DATA_DIR/                   - Root data directory
+#   $DATA_DIR/blocks/            - Content block storage
+#   $DATA_DIR/sql/               - SQL service storage
+#   $DATA_DIR/duckdb/            - DuckDB service storage
+#   $DATA_DIR/caps.db            - SQLite capability database
+#   $DATA_DIR/.gitignore         - Ignores all contents
 #
-# This script is called during Docker image builds to ensure the runtime
-# environment has the proper directory structure.
+# Idempotent — safe to run multiple times.
+# Called during Docker builds and local setup.
 
 set -e
 
-echo "Initializing TinyCloud directory structure..."
+DATA_DIR="${DATA_DIR:-./data}"
 
-# Create the main data directory if it doesn't exist
-if [ ! -d "./data" ]; then
-    echo "Creating ./data directory..."
-    mkdir -p "./data"
+echo "Initializing TinyCloud data directory: $DATA_DIR"
+
+mkdir -p "$DATA_DIR/blocks"
+mkdir -p "$DATA_DIR/sql"
+mkdir -p "$DATA_DIR/duckdb"
+
+if [ ! -f "$DATA_DIR/caps.db" ]; then
+    touch "$DATA_DIR/caps.db"
 fi
 
-# Create the blocks directory if it doesn't exist
-if [ ! -d "./data/blocks" ]; then
-    echo "Creating ./data/blocks directory..."
-    mkdir -p "./data/blocks"
+if [ ! -f "$DATA_DIR/.gitignore" ]; then
+    echo "*" > "$DATA_DIR/.gitignore"
+elif [ "$(cat "$DATA_DIR/.gitignore")" != "*" ]; then
+    echo "*" > "$DATA_DIR/.gitignore"
 fi
 
-# Create caps.db if it doesn't exist
-if [ ! -f "./data/caps.db" ]; then
-    echo "Creating ./data/caps.db..."
-    touch "./data/caps.db"
-fi
-
-# Create .gitignore with "*" if it doesn't exist
-if [ ! -f "./data/.gitignore" ]; then
-    echo "Creating ./data/.gitignore..."
-    echo "*" > "./data/.gitignore"
-elif [ "$(cat ./data/.gitignore)" != "*" ]; then
-    echo "Updating ./data/.gitignore to contain '*'..."
-    echo "*" > "./data/.gitignore"
-fi
-
-echo "TinyCloud directory structure initialized successfully!"
-echo "Created/verified:"
-echo "  - ./data/"
-echo "  - ./data/blocks/"
-echo "  - ./data/caps.db"
-echo "  - ./data/.gitignore (contains '*')"
+echo "Data directory ready: $DATA_DIR"
+echo "  blocks/  sql/  duckdb/  caps.db  .gitignore"

@@ -1,7 +1,7 @@
 use crate::hash::Hash;
 use sea_orm_migration::async_trait::async_trait;
 use std::error::Error as StdError;
-use tinycloud_lib::resource::SpaceId;
+use tinycloud_auth::resource::SpaceId;
 
 pub mod either;
 pub mod memory;

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_ipld_dagcbor::EncodeError;
 use serde_with::{serde_as, DisplayFromStr};
 use std::collections::HashMap;
-use tinycloud_lib::{
+use tinycloud_auth::{
     authorization::{
         make_invocation, InvocationError, InvocationOptions, TinyCloudDelegation,
         TinyCloudInvocation,
@@ -180,7 +180,7 @@ impl Session {
         actions: impl IntoIterator<Item = (ResourceId, A)>,
         facts: Option<Vec<serde_json::Value>>,
     ) -> Result<TinyCloudInvocation, InvocationError> {
-        use tinycloud_lib::ssi::claims::chrono;
+        use tinycloud_auth::ssi::claims::chrono;
         // we have to use chrono here because the time crate doesnt support "now_utc" in wasm
         let now = chrono::Utc::now();
         // 60 seconds in the future
@@ -243,7 +243,7 @@ impl Session {
         let action_strings: Vec<String> = actions.iter().map(|a| a.to_string()).collect();
 
         // Build capabilities (type parameter is the caveats type, using empty array)
-        let mut caps = tinycloud_lib::ucan_capabilities_object::Capabilities::<[(); 0]>::new();
+        let mut caps = tinycloud_auth::ucan_capabilities_object::Capabilities::<[(); 0]>::new();
         caps.with_actions(resource.as_uri(), actions.into_iter().map(|a| (a, [])));
 
         // Build UCAN payload (F=serde_json::Value for facts, C=[();0] for caveats)
@@ -309,17 +309,17 @@ pub enum DelegationError {
     #[error("invalid service: must be 'kv'")]
     InvalidService,
     #[error("invalid issuer DID URL: {0}")]
-    InvalidIssuer(#[from] tinycloud_lib::ssi::dids::InvalidDIDURL<String>),
+    InvalidIssuer(#[from] tinycloud_auth::ssi::dids::InvalidDIDURL<String>),
     #[error("invalid audience DID: {0}")]
-    InvalidAudience(tinycloud_lib::ssi::dids::InvalidDID<String>),
+    InvalidAudience(tinycloud_auth::ssi::dids::InvalidDID<String>),
     #[error("invalid not_before timestamp: {0}")]
-    InvalidNotBefore(tinycloud_lib::ssi::claims::jwt::NumericDateConversionError),
+    InvalidNotBefore(tinycloud_auth::ssi::claims::jwt::NumericDateConversionError),
     #[error("invalid expiration timestamp: {0}")]
-    InvalidExpiration(tinycloud_lib::ssi::claims::jwt::NumericDateConversionError),
+    InvalidExpiration(tinycloud_auth::ssi::claims::jwt::NumericDateConversionError),
     #[error("failed to sign UCAN: {0}")]
-    SigningError(tinycloud_lib::ssi::ucan::error::Error),
+    SigningError(tinycloud_auth::ssi::ucan::error::Error),
     #[error("failed to encode UCAN: {0}")]
-    EncodingError(tinycloud_lib::ssi::ucan::error::Error),
+    EncodingError(tinycloud_auth::ssi::ucan::error::Error),
 }
 
 pub fn prepare_session(config: SessionConfig) -> Result<PreparedSession, Error> {
@@ -327,7 +327,7 @@ pub fn prepare_session(config: SessionConfig) -> Result<PreparedSession, Error> 
         Some(k) => k.clone(),
         None => JWK::generate_ed25519()?,
     };
-    jwk.algorithm = Some(tinycloud_lib::ssi::jwk::Algorithm::EdDSA);
+    jwk.algorithm = Some(tinycloud_auth::ssi::jwk::Algorithm::EdDSA);
 
     // Determine the verification method (delegation target)
     let verification_method = if let Some(delegate_uri) = &config.delegate_uri {
@@ -393,9 +393,9 @@ pub fn complete_session_setup(signed_session: SignedSession) -> Result<Session, 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("unable to generate session key: {0}")]
-    UnableToGenerateKey(#[from] tinycloud_lib::ssi::jwk::Error),
+    UnableToGenerateKey(#[from] tinycloud_auth::ssi::jwk::Error),
     #[error("unable to generate the DID of the session key: {0}")]
-    UnableToGenerateDID(#[from] tinycloud_lib::ssi::dids::GenerateError),
+    UnableToGenerateDID(#[from] tinycloud_auth::ssi::dids::GenerateError),
     #[error("unable to generate the SIWE message to start the session: {0}")]
     UnableToGenerateSIWEMessage(String),
     #[error("unable to generate the CID: {0}")]

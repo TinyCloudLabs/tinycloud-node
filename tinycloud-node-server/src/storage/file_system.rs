@@ -14,8 +14,8 @@ use std::{
     path::{Path, PathBuf},
 };
 use tempfile::{NamedTempFile, PathPersistError};
+use tinycloud_auth::{resource::SpaceId, ssi::dids::DIDBuf};
 use tinycloud_core::{hash::Hash, storage::*};
-use tinycloud_lib::{resource::SpaceId, ssi::dids::DIDBuf};
 use tokio::fs::{create_dir_all, metadata, remove_file, File};
 use tokio_stream::wrappers::ReadDirStream;
 
@@ -92,7 +92,7 @@ impl StorageSetup for FileSystemStore {
 impl Default for FileSystemConfig {
     fn default() -> Self {
         Self {
-            path: PathBuf::from(r"./data/blocks"),
+            path: PathBuf::new(),
         }
     }
 }

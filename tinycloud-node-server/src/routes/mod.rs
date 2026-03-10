@@ -46,7 +46,7 @@ pub fn version(tee: &State<Option<crate::tee::TeeContext>>) -> Json<VersionInfo>
     #[cfg(feature = "dstack")]
     features.push("tee");
     Json(VersionInfo {
-        protocol: tinycloud_lib::protocol::PROTOCOL_VERSION,
+        protocol: tinycloud_auth::protocol::PROTOCOL_VERSION,
         version: env!("CARGO_PKG_VERSION").to_string(),
         features,
         in_tee: tee.inner().is_some(),
@@ -392,7 +392,7 @@ async fn handle_sql_invoke(
     data: DataIn<'_>,
     tinycloud: &State<TinyCloud>,
     sql_service: &State<SqlService>,
-    sql_caps: &[(tinycloud_lib::resource::SpaceId, Option<String>, String)],
+    sql_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
     // Extract caveats from the invocation facts before consuming i
     let caveats: Option<SqlCaveats> =
@@ -458,7 +458,7 @@ async fn handle_duckdb_invoke(
     data: DataIn<'_>,
     tinycloud: &State<TinyCloud>,
     duckdb_service: &State<DuckDbService>,
-    duckdb_caps: &[(tinycloud_lib::resource::SpaceId, Option<String>, String)],
+    duckdb_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
     arrow_format: bool,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
     // SECURITY TODO: Extract caveats from delegation chain, not invocation facts. See PR review [H3].
