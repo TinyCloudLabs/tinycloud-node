@@ -35,10 +35,12 @@ pub struct VersionInfo {
     pub protocol: u32,
     pub version: String,
     pub features: Vec<&'static str>,
+    #[serde(rename = "inTEE")]
+    pub in_tee: bool,
 }
 
 #[get("/version")]
-pub fn version() -> Json<VersionInfo> {
+pub fn version(tee: &State<Option<crate::tee::TeeContext>>) -> Json<VersionInfo> {
     #[allow(unused_mut)]
     let mut features = vec!["kv", "delegation", "sharing", "sql", "duckdb"];
     #[cfg(feature = "dstack")]
@@ -47,6 +49,7 @@ pub fn version() -> Json<VersionInfo> {
         protocol: tinycloud_lib::protocol::PROTOCOL_VERSION,
         version: env!("CARGO_PKG_VERSION").to_string(),
         features,
+        in_tee: tee.inner().is_some(),
     })
 }
 
