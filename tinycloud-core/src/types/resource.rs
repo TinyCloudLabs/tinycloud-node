@@ -1,7 +1,7 @@
 use sea_orm::{entity::prelude::*, sea_query::ValueTypeErr};
 use serde::{Deserialize, Serialize};
 use std::{fmt::Display, str::FromStr};
-use tinycloud_lib::resource::{
+use tinycloud_auth::resource::{
     iri_string::{
         types::{UriStr, UriString},
         validate::Error as UriError,

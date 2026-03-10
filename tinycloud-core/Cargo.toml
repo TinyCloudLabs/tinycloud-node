@@ -21,7 +21,7 @@ sea-orm-migration = { version = "1.1", default-features = false }
 futures.workspace = true
 pin-project.workspace = true
 time.workspace = true
-tinycloud-lib = { version = "1.0", path = "../tinycloud-lib" }
+tinycloud-auth = { version = "1.0", path = "../tinycloud-auth" }
 libp2p = { version = "0.52.1", default-features = false, features = ["ed25519"] }
 thiserror.workspace = true
 serde.workspace = true

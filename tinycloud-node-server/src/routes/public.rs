@@ -7,8 +7,8 @@ use rocket::{
     State,
 };
 use std::{collections::HashMap, net::IpAddr, sync::Mutex, time::Instant};
+use tinycloud_auth::resource::{Path, SpaceId};
 use tinycloud_core::storage::{Content, ImmutableReadStore};
-use tinycloud_lib::resource::{Path, SpaceId};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 use crate::{config::PublicSpacesConfig, BlockStores, TinyCloud};

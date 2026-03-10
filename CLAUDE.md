@@ -45,17 +45,18 @@ cargo fmt && cargo clippy -- -D warnings && cargo test
 
 ```
 tinycloud-node/
-├── src/                          # Main HTTP server (Rocket-based)
-│   ├── main.rs                   # Server bootstrap, Prometheus metrics
-│   ├── lib.rs                    # Application setup, route mounting
-│   ├── routes/                   # API endpoint handlers
-│   │   └── mod.rs                # /invoke, /delegate, /peer/generate, /healthz
-│   ├── auth_guards.rs            # Request guards for authorization headers
-│   ├── authorization.rs          # Auth header parsing and verification
-│   ├── config.rs                 # Configuration structures
-│   ├── prometheus.rs             # Metrics exposition
-│   ├── tracing.rs                # Distributed tracing setup
-│   └── storage/                  # Storage backend implementations
+├── tinycloud-node-server/        # Main HTTP server binary (Rocket-based)
+│   └── src/
+│       ├── main.rs               # Server bootstrap, Prometheus metrics
+│       ├── lib.rs                # Application setup, route mounting
+│       ├── routes/               # API endpoint handlers
+│       │   └── mod.rs            # /invoke, /delegate, /peer/generate, /healthz
+│       ├── auth_guards.rs        # Request guards for authorization headers
+│       ├── authorization.rs      # Auth header parsing and verification
+│       ├── config.rs             # Configuration structures
+│       ├── prometheus.rs         # Metrics exposition
+│       ├── tracing.rs            # Distributed tracing setup
+│       └── storage/              # Storage backend implementations
 │
 ├── tinycloud-core/               # Core database layer (OrbitDatabase)
 │   └── src/
@@ -69,7 +70,7 @@ tinycloud-node/
 │       ├── keys.rs               # Cryptographic key management
 │       └── manifest.rs           # Orbit manifest handling
 │
-├── tinycloud-lib/                # Shared authorization library
+├── tinycloud-auth/               # Shared authorization library
 │   └── src/
 │       ├── authorization.rs      # TinyCloudDelegation, Invocation, Revocation
 │       ├── resource.rs           # TinyCloud resource URIs and paths
@@ -78,9 +79,10 @@ tinycloud-node/
 ├── tinycloud-sdk-rs/             # Rust SDK for client applications
 ├── tinycloud-sdk-wasm/           # WebAssembly SDK bindings for browsers
 │
-├── siwe/                         # EIP-4361 Sign-In with Ethereum
-├── siwe-recap/                   # EIP-5573 SIWE ReCap capability delegation
-├── cacao/                        # CAIP-74 Chain-Agnostic Object Capability
+├── dependencies/
+│   ├── siwe/                     # EIP-4361 Sign-In with Ethereum
+│   ├── siwe-recap/               # EIP-5573 SIWE ReCap capability delegation
+│   └── cacao/                    # CAIP-74 Chain-Agnostic Object Capability
 │
 ├── test/load/                    # Load testing infrastructure
 │   ├── k6/                       # k6 test scripts

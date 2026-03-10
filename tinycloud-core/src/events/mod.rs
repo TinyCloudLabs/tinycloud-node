@@ -5,7 +5,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_ipld_dagcbor::EncodeError;
-pub use tinycloud_lib::{
+pub use tinycloud_auth::{
     authorization::{
         EncodingError, HeaderEncode, TinyCloudDelegation, TinyCloudInvocation, TinyCloudRevocation,
     },

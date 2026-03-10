@@ -1,7 +1,7 @@
 use crate::types::{Ability, Resource};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
-use tinycloud_lib::{
+use tinycloud_auth::{
     authorization::{TinyCloudDelegation, TinyCloudInvocation, TinyCloudRevocation},
     cacaos::siwe::Message,
     ipld_core::cid::Cid,
@@ -34,7 +34,7 @@ pub enum CapExtractError {
     #[error("Invalid Extra Fields")]
     InvalidFields,
     #[error(transparent)]
-    Cid(#[from] tinycloud_lib::ipld_core::cid::Error),
+    Cid(#[from] tinycloud_auth::ipld_core::cid::Error),
 }
 
 fn extract_ucan_caps<T>(caps: &UcanCapabilities<T>) -> Vec<Capability> {
@@ -101,7 +101,7 @@ pub enum DelegationError {
     #[error("Missing Delegate")]
     MissingDelegate,
     #[error(transparent)]
-    SiweConversion(#[from] tinycloud_lib::cacaos::siwe_cacao::SIWEPayloadConversionError),
+    SiweConversion(#[from] tinycloud_auth::cacaos::siwe_cacao::SIWEPayloadConversionError),
     #[error(transparent)]
     SiweCapError(#[from] SiweError),
     #[error("Invalid Siwe Statement")]

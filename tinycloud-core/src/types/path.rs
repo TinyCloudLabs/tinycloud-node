@@ -1,7 +1,7 @@
 use sea_orm::{entity::prelude::*, sea_query::ValueTypeErr};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
-use tinycloud_lib::resource::{KRIParseError, Path as LibPath};
+use tinycloud_auth::resource::{KRIParseError, Path as LibPath};
 
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Path(pub LibPath);

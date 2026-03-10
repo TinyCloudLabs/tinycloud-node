@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use tinycloud_lib::resource::SpaceId;
+use tinycloud_auth::resource::SpaceId;
 
 use super::{
     caveats::SqlCaveats,

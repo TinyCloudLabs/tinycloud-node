@@ -4,7 +4,7 @@ pub mod session;
 pub mod vault;
 
 use hex::FromHex;
-use tinycloud_lib::{
+use tinycloud_auth::{
     ipld_core::cid::Cid,
     multihash_codetable::{Code, MultihashDigest},
 };
@@ -18,7 +18,7 @@ fn map_jserr<E: std::error::Error>(e: E) -> JsValue {
 #[wasm_bindgen]
 #[allow(non_snake_case)]
 pub fn protocolVersion() -> u32 {
-    tinycloud_lib::protocol::PROTOCOL_VERSION
+    tinycloud_auth::protocol::PROTOCOL_VERSION
 }
 
 // removing since we have duplicate usage elsewhere
@@ -157,13 +157,13 @@ pub fn createDelegation(
     let session: session::Session = serde_wasm_bindgen::from_value(session)?;
 
     // Parse space_id
-    let space_id: tinycloud_lib::resource::SpaceId = spaceId.parse().map_err(map_jserr)?;
+    let space_id: tinycloud_auth::resource::SpaceId = spaceId.parse().map_err(map_jserr)?;
 
     // Parse path
-    let path: tinycloud_lib::resource::Path = path.parse().map_err(map_jserr)?;
+    let path: tinycloud_auth::resource::Path = path.parse().map_err(map_jserr)?;
 
     // Parse actions
-    let abilities: Vec<tinycloud_lib::siwe_recap::Ability> = actions
+    let abilities: Vec<tinycloud_auth::siwe_recap::Ability> = actions
         .into_iter()
         .map(|a| a.parse())
         .collect::<Result<_, _>>()

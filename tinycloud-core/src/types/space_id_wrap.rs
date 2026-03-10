@@ -1,7 +1,7 @@
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use tinycloud_lib::resource::SpaceId;
+use tinycloud_auth::resource::SpaceId;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Eq, Hash, PartialOrd, Ord)]
 pub struct SpaceIdWrap(pub SpaceId);

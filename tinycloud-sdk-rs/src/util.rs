@@ -1,6 +1,6 @@
 use std::str::FromStr;
-pub use tinycloud_lib::cacaos::siwe::{decode_eip55, encode_eip55};
-use tinycloud_lib::resource::{KRIParseError, SpaceId};
+pub use tinycloud_auth::cacaos::siwe::{decode_eip55, encode_eip55};
+use tinycloud_auth::resource::{KRIParseError, SpaceId};
 
 pub fn make_space_id_pkh_eip155(
     address: &[u8; 20],

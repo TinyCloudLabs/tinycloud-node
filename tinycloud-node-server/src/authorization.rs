@@ -3,11 +3,13 @@ use rocket::{
     request::{FromRequest, Outcome, Request},
 };
 use std::convert::TryFrom;
+use tinycloud_auth::authorization::{
+    TinyCloudDelegation, TinyCloudInvocation, TinyCloudRevocation,
+};
 use tinycloud_core::{
     events::{FromReqErr, SerializedEvent},
     util::{DelegationInfo, InvocationInfo, RevocationInfo},
 };
-use tinycloud_lib::authorization::{TinyCloudDelegation, TinyCloudInvocation, TinyCloudRevocation};
 
 pub struct AuthHeaderGetter<T>(pub SerializedEvent<T>);
 
@@ -37,7 +39,7 @@ impl_fromreq!(RevocationInfo, TinyCloudRevocation, "Authorization");
 
 #[cfg(test)]
 mod test {
-    // use tinycloud_lib::{
+    // use tinycloud_auth::{
     //     libipld::cid::Cid,
     //     resolver::DID_METHODS,
     //     ssi::{

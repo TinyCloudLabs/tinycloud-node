@@ -30,7 +30,7 @@ pub mod signature {
     };
     use std::{borrow::Cow, ops::Deref};
 
-    use tinycloud_lib::cacaos::siwe_cacao::Signature;
+    use tinycloud_auth::cacaos::siwe_cacao::Signature;
 
     pub fn serialize<S>(addr: &Signature, s: S) -> Result<S::Ok, S::Error>
     where

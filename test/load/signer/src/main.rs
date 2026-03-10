@@ -10,7 +10,7 @@ use ethers::{
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc};
-use tinycloud_lib::{
+use tinycloud_auth::{
     cacaos::siwe::TimeStamp,
     resource::SpaceId,
     ssi::{dids::DIDBuf, jwk::JWK},

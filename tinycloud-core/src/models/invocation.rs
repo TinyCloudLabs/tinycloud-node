@@ -9,7 +9,7 @@ use crate::types::{Facts, Resource, SpaceIdWrap};
 use crate::{hash::Hash, types::Ability};
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, Condition, ConnectionTrait, QueryOrder};
 use time::OffsetDateTime;
-use tinycloud_lib::{authorization::TinyCloudInvocation, resource::Path, ssi::dids::AnyDidMethod};
+use tinycloud_auth::{authorization::TinyCloudInvocation, resource::Path, ssi::dids::AnyDidMethod};
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "invocation")]

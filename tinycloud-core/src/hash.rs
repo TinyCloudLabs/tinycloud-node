@@ -1,7 +1,7 @@
 use multihash_derive::Hasher;
 use sea_orm::entity::prelude::*;
 use sea_orm::DbErr;
-use tinycloud_lib::{
+use tinycloud_auth::{
     ipld_core::cid::{multihash::Multihash, Cid},
     multihash_codetable::{Blake3_256, Code, MultihashDigest},
 };
