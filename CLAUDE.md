@@ -138,20 +138,20 @@ port = 8000                       # HTTP server port
 cors = true                       # Enable CORS headers
 
 [global.storage]
-database = "sqlite:./tinycloud/caps.db?mode=rwc"  # Database URL
+database = "sqlite:./data/caps.db"  # Database URL
 staging = "FileSystem"            # Staging mode: Memory or FileSystem
-limit = "10 MiB"                  # Optional storage quota per orbit
+limit = "10 MiB"                  # Optional storage quota per space
 
 [global.storage.blocks]
 type = "Local"                    # Block storage: Local or S3
-path = "./tinycloud/blocks"       # Local filesystem path
+path = "./data/blocks"            # Local filesystem path
 
 [global.keys]
 type = "Static"                   # Key derivation type
 secret = "<base64url-32+bytes>"   # Secret for key derivation
 
-[global.orbits]
-# allowlist = "http://localhost:10000"  # Optional orbit allowlist service
+[global.spaces]
+# allowlist = "http://localhost:10000"  # Optional space allowlist service
 ```
 
 ### Environment Variables
@@ -162,9 +162,9 @@ All use the `TINYCLOUD_` prefix:
 |----------|-------------|---------|
 | `TINYCLOUD_LOG_LEVEL` | Log verbosity | `debug` |
 | `TINYCLOUD_PORT` | Server port | `8000` |
-| `TINYCLOUD_STORAGE_DATABASE` | Database URL | `sqlite:./tinycloud/caps.db` |
+| `TINYCLOUD_STORAGE_DATABASE` | Database URL | `sqlite:./data/caps.db` |
 | `TINYCLOUD_STORAGE_BLOCKS_TYPE` | Block storage backend | `Local`, `S3` |
-| `TINYCLOUD_STORAGE_BLOCKS_PATH` | Local block path | `./tinycloud/blocks` |
+| `TINYCLOUD_STORAGE_BLOCKS_PATH` | Local block path | `./data/blocks` |
 | `TINYCLOUD_STORAGE_BLOCKS_BUCKET` | S3 bucket name | `my-bucket` |
 | `TINYCLOUD_STORAGE_BLOCKS_ENDPOINT` | S3 endpoint | `https://s3.amazonaws.com` |
 | `TINYCLOUD_STORAGE_LIMIT` | Storage quota | `10 MiB` |
@@ -260,31 +260,10 @@ k6 run --vus 5 --duration 60s test/load/k6/many_orbits.js
 ## Local Development Setup
 
 ```bash
-# 1. Create required directories and files
-mkdir -p tinycloud/blocks
-touch tinycloud/caps.db
+# 1. Initialize data directory (or let the init script do it)
+./scripts/init-tinycloud-data.sh
 
-# 2. Create configuration (optional - uses defaults)
-cat > tinycloud.toml << 'EOF'
-[global]
-log_level = "debug"
-port = 8000
-cors = true
-
-[global.storage]
-database = "sqlite:./tinycloud/caps.db?mode=rwc"
-staging = "FileSystem"
-
-[global.storage.blocks]
-type = "Local"
-path = "./tinycloud/blocks"
-
-[global.keys]
-type = "Static"
-secret = "YOUR_32_BYTE_BASE64URL_SECRET_HERE"
-EOF
-
-# 3. Build and run
+# 2. Build and run (tinycloud.toml has sensible defaults)
 cargo build
 cargo run
 ```
@@ -300,7 +279,7 @@ docker run -d \
   -p 8000:8000 \
   -p 8001:8001 \
   -v $(pwd)/tinycloud:/app/tinycloud \
-  -e TINYCLOUD_STORAGE_DATABASE="sqlite:./tinycloud/caps.db?mode=rwc" \
+  -e TINYCLOUD_STORAGE_DATABASE="sqlite:./data/caps.db" \
   tinycloud:latest
 ```
 
@@ -314,11 +293,11 @@ docker run -d \
 ### Common Issues
 
 **Database connection errors:**
-- Ensure the SQLite file exists: `touch tinycloud/caps.db`
+- Ensure the SQLite file exists: `touch data/caps.db`
 - Check database URL format includes `?mode=rwc` for SQLite
 
 **Block storage errors:**
-- Ensure blocks directory exists: `mkdir -p tinycloud/blocks`
+- Ensure blocks directory exists: `mkdir -p data/blocks`
 - Check file permissions
 
 **Authorization failures:**
