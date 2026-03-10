@@ -1,0 +1,31 @@
+# dstack deployment - Topology 1: SQLite + Local Storage
+# Single container, everything in the CVM. Good for small/personal instances.
+#
+# Deploy on dstack:
+#   docker build --build-arg CARGO_FEATURES=dstack -t tinycloud-dstack .
+#   # Or use the pre-built image from ghcr.io
+#
+# The same image works on dstack (TEE) and classic (non-TEE) deployments.
+# In TEE mode, keys are derived from dstack KMS - never stored, never exposed.
+# In classic mode, set TINYCLOUD_KEYS_SECRET manually.
+
+services:
+  tinycloud:
+    image: ghcr.io/tinycloudlabs/tinycloud-node:latest
+    ports:
+      - "8000:8000"
+      - "8001:8001"
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - tinycloud-data:/app/data
+    environment:
+      TINYCLOUD_KEYS_TYPE: Dstack
+      TINYCLOUD_STORAGE_DATABASE: "sqlite:./data/caps.db?mode=rwc"
+      TINYCLOUD_STORAGE_BLOCKS_TYPE: Local
+      TINYCLOUD_STORAGE_BLOCKS_PATH: ./data/blocks
+      TINYCLOUD_LOG_LEVEL: info
+      TINYCLOUD_CORS: "true"
+      ROCKET_ADDRESS: "0.0.0.0"
+
+volumes:
+  tinycloud-data:

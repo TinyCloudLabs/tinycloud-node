@@ -9176,7 +9176,7 @@ dependencies = [
 
 [[package]]
 name = "tinycloud"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -9201,6 +9201,7 @@ dependencies = [
  "serde_with 3.16.1",
  "tempfile",
  "thiserror 2.0.18",
+ "time",
  "tinycloud-core",
  "tinycloud-lib",
  "tokio",
@@ -9214,8 +9215,9 @@ dependencies = [
 
 [[package]]
 name = "tinycloud-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
+ "aes-gcm",
  "arrow",
  "async-std",
  "dashmap",
@@ -9224,6 +9226,7 @@ dependencies = [
  "libp2p",
  "multihash-derive 0.9.1",
  "pin-project",
+ "rand 0.8.5",
  "rusqlite",
  "sea-orm",
  "sea-orm-migration",
@@ -9242,7 +9245,7 @@ dependencies = [
 
 [[package]]
 name = "tinycloud-lib"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -9266,7 +9269,7 @@ dependencies = [
 
 [[package]]
 name = "tinycloud-sdk-rs"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "hex",
@@ -9284,7 +9287,7 @@ dependencies = [
 
 [[package]]
 name = "tinycloud-sdk-wasm"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "aes-gcm",
  "chrono",

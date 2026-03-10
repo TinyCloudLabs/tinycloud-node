@@ -1,0 +1,40 @@
+# dstack deployment - Topology 3: Full Confidential (Postgres in CVM)
+# Both tinycloud-node and Postgres run inside the same CVM.
+# Maximum confidentiality - no external database exposure.
+
+services:
+  tinycloud:
+    image: ghcr.io/tinycloudlabs/tinycloud-node:latest
+    ports:
+      - "8000:8000"
+      - "8001:8001"
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+    environment:
+      TINYCLOUD_KEYS_TYPE: Dstack
+      TINYCLOUD_STORAGE_DATABASE: "postgres://tinycloud:tinycloud@postgres:5432/tinycloud"
+      TINYCLOUD_STORAGE_BLOCKS_TYPE: Local
+      TINYCLOUD_STORAGE_BLOCKS_PATH: /data/blocks
+      TINYCLOUD_LOG_LEVEL: info
+      TINYCLOUD_CORS: "true"
+      ROCKET_ADDRESS: "0.0.0.0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: tinycloud
+      POSTGRES_PASSWORD: tinycloud
+      POSTGRES_DB: tinycloud
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tinycloud"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
