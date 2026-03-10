@@ -10,6 +10,7 @@ use serde_with::{
     formats::Unpadded,
     serde_as, FromInto,
 };
+use std::path::PathBuf;
 use tinycloud_core::keys::StaticSecret;
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
@@ -148,15 +149,11 @@ pub struct SpacesConfig {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct SqlStorageConfig {
-    #[serde(default = "default_sql_path")]
-    pub path: String,
+    #[serde(default)]
+    pub path: Option<String>,
     pub limit: Option<ByteUnit>,
     #[serde(default = "default_sql_memory_threshold")]
     pub memory_threshold: ByteUnit,
-}
-
-fn default_sql_path() -> String {
-    "./data/sql".to_string()
 }
 
 fn default_sql_memory_threshold() -> ByteUnit {
@@ -166,7 +163,7 @@ fn default_sql_memory_threshold() -> ByteUnit {
 impl Default for SqlStorageConfig {
     fn default() -> Self {
         Self {
-            path: default_sql_path(),
+            path: None,
             limit: None,
             memory_threshold: default_sql_memory_threshold(),
         }
@@ -175,8 +172,8 @@ impl Default for SqlStorageConfig {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct DuckDbStorageConfig {
-    #[serde(default = "default_duckdb_path")]
-    pub path: String,
+    #[serde(default)]
+    pub path: Option<String>,
     pub limit: Option<ByteUnit>,
     #[serde(default = "default_duckdb_memory_threshold")]
     pub memory_threshold: ByteUnit,
@@ -184,10 +181,6 @@ pub struct DuckDbStorageConfig {
     pub idle_timeout_secs: u64,
     #[serde(default = "default_duckdb_max_memory")]
     pub max_memory_per_connection: String,
-}
-
-fn default_duckdb_path() -> String {
-    "./data/duckdb".to_string()
 }
 
 fn default_duckdb_memory_threshold() -> ByteUnit {
@@ -205,7 +198,7 @@ fn default_duckdb_max_memory() -> String {
 impl Default for DuckDbStorageConfig {
     fn default() -> Self {
         Self {
-            path: default_duckdb_path(),
+            path: None,
             limit: None,
             memory_threshold: default_duckdb_memory_threshold(),
             idle_timeout_secs: default_duckdb_idle_timeout(),
@@ -217,14 +210,18 @@ impl Default for DuckDbStorageConfig {
 #[serde_as]
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Storage {
+    /// Root directory for all local data (database, blocks, sql, duckdb).
+    /// Individual paths can still be overridden explicitly.
+    #[serde(default = "default_datadir")]
+    pub datadir: PathBuf,
     #[serde_as(as = "FromInto<BlockStorage>")]
     #[serde(default = "fs_store")]
     pub blocks: BlockConfig,
     #[serde_as(as = "FromInto<StagingStorage>")]
     #[serde(default = "memory_stage")]
     pub staging: BlockStage,
-    #[serde(default = "memory_db")]
-    pub database: String,
+    #[serde(default)]
+    pub database: Option<String>,
     pub limit: Option<ByteUnit>,
     #[serde(default)]
     pub sql: SqlStorageConfig,
@@ -232,21 +229,55 @@ pub struct Storage {
     pub duckdb: DuckDbStorageConfig,
 }
 
+fn default_datadir() -> PathBuf {
+    PathBuf::from("./data")
+}
+
+impl Storage {
+    /// Resolve all unset paths relative to `datadir`.
+    /// Call this after config extraction so that overrides from
+    /// tinycloud.toml or TINYCLOUD_ env vars take precedence.
+    pub fn resolve(&mut self) {
+        let dir = &self.datadir;
+
+        if self.database.is_none() {
+            self.database = Some(format!("sqlite:{}", dir.join("caps.db").display()));
+        }
+
+        if self.sql.path.is_none() {
+            self.sql.path = Some(dir.join("sql").to_string_lossy().into_owned());
+        }
+
+        if self.duckdb.path.is_none() {
+            self.duckdb.path = Some(dir.join("duckdb").to_string_lossy().into_owned());
+        }
+
+        // Resolve blocks path if it's the Local variant with the empty default
+        if let BlockConfig::B(ref fs) = self.blocks {
+            if fs.path().as_os_str().is_empty() {
+                self.blocks = BlockConfig::B(FileSystemConfig::new(dir.join("blocks")));
+            }
+        }
+    }
+
+    /// Get the database connection string. Panics if called before resolve().
+    pub fn database(&self) -> &str {
+        self.database.as_deref().expect("Storage::resolve() must be called before accessing database")
+    }
+}
+
 impl Default for Storage {
     fn default() -> Self {
         Self {
+            datadir: default_datadir(),
             blocks: BlockStorage::default().into(),
             staging: StagingStorage::default().into(),
-            database: memory_db(),
+            database: None,
             limit: None,
             sql: SqlStorageConfig::default(),
             duckdb: DuckDbStorageConfig::default(),
         }
     }
-}
-
-fn memory_db() -> String {
-    "sqlite::memory:".to_string()
 }
 
 fn memory_stage() -> BlockStage {

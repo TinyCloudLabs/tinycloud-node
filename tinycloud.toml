@@ -4,10 +4,11 @@ log_level = "debug"
 port = 8000
 cors = true
 
-## Example of nest config variable: TINYCLOUD_STORAGE_DATABASE
 [global.storage]
-    ## Set the SQL deployment for TinyCloud Protocol
-    database = "sqlite:./data/caps.db"
+    ## Root directory for all local data (database, blocks, sql, duckdb).
+    ## Individual paths below can override if needed.
+    ## Env: TINYCLOUD_STORAGE_DATADIR
+    datadir = "./data"
 
     ## Set the file-staging system for TinyCloud Protocol to use
     staging = "FileSystem"
@@ -15,10 +16,16 @@ cors = true
     ## Set the default limit for KV storage per Space
     # limit = "10 MiB"
 
-    ###### Document shared aws config (`aws_config::from_env()`)
+    ## Override individual paths (defaults derived from datadir):
+    # database = "sqlite:./data/caps.db"
+    # [global.storage.sql]
+    # path = "./data/sql"
+    # [global.storage.duckdb]
+    # path = "./data/duckdb"
+
     [global.storage.blocks]
     type = "Local"
-    path = "./data/blocks"
+    # path = "./data/blocks"   # defaults to {datadir}/blocks
 
 [global.keys]
     type = "Static"

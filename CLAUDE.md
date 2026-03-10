@@ -138,13 +138,14 @@ port = 8000                       # HTTP server port
 cors = true                       # Enable CORS headers
 
 [global.storage]
-database = "sqlite:./data/caps.db"  # Database URL
+datadir = "./data"                # Root for all local data paths
 staging = "FileSystem"            # Staging mode: Memory or FileSystem
 limit = "10 MiB"                  # Optional storage quota per space
+# database = "sqlite:./data/caps.db"  # Override: defaults to {datadir}/caps.db
 
 [global.storage.blocks]
 type = "Local"                    # Block storage: Local or S3
-path = "./data/blocks"            # Local filesystem path
+# path = "./data/blocks"          # Override: defaults to {datadir}/blocks
 
 [global.keys]
 type = "Static"                   # Key derivation type
@@ -162,14 +163,15 @@ All use the `TINYCLOUD_` prefix:
 |----------|-------------|---------|
 | `TINYCLOUD_LOG_LEVEL` | Log verbosity | `debug` |
 | `TINYCLOUD_PORT` | Server port | `8000` |
-| `TINYCLOUD_STORAGE_DATABASE` | Database URL | `sqlite:./data/caps.db` |
+| `TINYCLOUD_STORAGE_DATADIR` | Root data directory | `./data` |
+| `TINYCLOUD_STORAGE_DATABASE` | Database URL (override) | `sqlite:./data/caps.db` |
 | `TINYCLOUD_STORAGE_BLOCKS_TYPE` | Block storage backend | `Local`, `S3` |
-| `TINYCLOUD_STORAGE_BLOCKS_PATH` | Local block path | `./data/blocks` |
+| `TINYCLOUD_STORAGE_BLOCKS_PATH` | Local block path (override) | `./data/blocks` |
 | `TINYCLOUD_STORAGE_BLOCKS_BUCKET` | S3 bucket name | `my-bucket` |
 | `TINYCLOUD_STORAGE_BLOCKS_ENDPOINT` | S3 endpoint | `https://s3.amazonaws.com` |
 | `TINYCLOUD_STORAGE_LIMIT` | Storage quota | `10 MiB` |
 | `TINYCLOUD_KEYS_SECRET` | Key derivation secret | Base64URL string |
-| `TINYCLOUD_ORBITS_ALLOWLIST` | Allowlist endpoint | `http://localhost:10000` |
+| `TINYCLOUD_SPACES_ALLOWLIST` | Allowlist endpoint | `http://localhost:10000` |
 
 ### Database Support
 
