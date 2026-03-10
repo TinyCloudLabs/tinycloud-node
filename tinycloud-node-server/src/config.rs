@@ -262,7 +262,9 @@ impl Storage {
 
     /// Get the database connection string. Panics if called before resolve().
     pub fn database(&self) -> &str {
-        self.database.as_deref().expect("Storage::resolve() must be called before accessing database")
+        self.database
+            .as_deref()
+            .expect("Storage::resolve() must be called before accessing database")
     }
 }
 

@@ -176,7 +176,12 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     );
 
     let duckdb_service = DuckDbService::new(
-        tinycloud_config.storage.duckdb.path.clone().expect("resolved"),
+        tinycloud_config
+            .storage
+            .duckdb
+            .path
+            .clone()
+            .expect("resolved"),
         tinycloud_config.storage.duckdb.memory_threshold.as_u64(),
         tinycloud_config.storage.duckdb.idle_timeout_secs,
         tinycloud_config
