@@ -22,6 +22,8 @@ pub struct Config {
     pub cors: bool,
     pub keys: Keys,
     #[serde(default)]
+    pub tee: TeeConfig,
+    #[serde(default)]
     pub public_spaces: PublicSpacesConfig,
 }
 
@@ -57,15 +59,42 @@ impl Default for PublicSpacesConfig {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, Default)]
 #[serde(tag = "type")]
 pub enum Keys {
     Static(Static),
+    #[cfg(feature = "dstack")]
+    Dstack,
+    #[default]
+    Auto,
 }
 
-impl Default for Keys {
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct TeeConfig {
+    #[serde(default = "default_tee_mode")]
+    pub mode: TeeMode,
+    #[serde(default)]
+    pub attestation: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, Default)]
+pub enum TeeMode {
+    #[default]
+    Auto,
+    Dstack,
+    Off,
+}
+
+fn default_tee_mode() -> TeeMode {
+    TeeMode::Auto
+}
+
+impl Default for TeeConfig {
     fn default() -> Self {
-        Self::Static(Static::default())
+        Self {
+            mode: TeeMode::Auto,
+            attestation: false,
+        }
     }
 }
 

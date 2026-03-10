@@ -1,5 +1,6 @@
 pub mod db;
 pub mod duckdb;
+pub mod encryption;
 pub mod events;
 pub mod hash;
 pub mod keys;
@@ -13,6 +14,7 @@ pub mod types;
 pub mod util;
 
 pub use db::{Commit, InvocationOutcome, SpaceDatabase, TransactResult, TxError, TxStoreError};
+pub use encryption::ColumnEncryption;
 pub use libp2p;
 pub use sea_orm;
 pub use sea_orm_migration;

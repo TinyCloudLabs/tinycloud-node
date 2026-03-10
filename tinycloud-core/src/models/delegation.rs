@@ -1,3 +1,4 @@
+use crate::encryption::ColumnEncryption;
 use crate::hash::Hash;
 use crate::types::{Ability, Facts, Resource};
 use crate::{events::Delegation, models::*, relationships::*, util};
@@ -124,13 +125,14 @@ pub enum DelegationError {
 pub(crate) async fn process<C: ConnectionTrait>(
     db: &C,
     delegation: Delegation,
+    encryption: Option<&ColumnEncryption>,
 ) -> Result<Hash, Error> {
     let (d, ser) = (delegation.0, delegation.1);
     verify(&d.delegation).await?;
 
     validate(db, &d).await?;
 
-    save(db, d, ser).await
+    save(db, d, ser, encryption).await
 }
 
 // verify signatures and time
@@ -264,10 +266,15 @@ async fn save<C: ConnectionTrait>(
     db: &C,
     delegation: util::DelegationInfo,
     serialization: Vec<u8>,
+    encryption: Option<&ColumnEncryption>,
 ) -> Result<Hash, Error> {
     save_actors(&[&delegation.delegator, &delegation.delegate], db).await?;
 
+    // Hash is always computed on plaintext (before encryption)
     let hash: Hash = crate::hash::hash(&serialization);
+
+    // Encrypt for storage if encryption is configured
+    let stored_serialization = crate::encryption::maybe_encrypt(encryption, &serialization);
 
     // save delegation
     match Entity::insert(ActiveModel::from(Model {
@@ -278,7 +285,7 @@ async fn save<C: ConnectionTrait>(
         issued_at: delegation.issued_at,
         not_before: delegation.not_before,
         facts: None,
-        serialization,
+        serialization: stored_serialization,
     }))
     .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned())
     .exec(db)

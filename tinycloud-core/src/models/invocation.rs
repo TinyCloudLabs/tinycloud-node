@@ -4,6 +4,7 @@ use super::super::{
     relationships::*,
     util,
 };
+use crate::encryption::ColumnEncryption;
 use crate::types::{Facts, Resource, SpaceIdWrap};
 use crate::{hash::Hash, types::Ability};
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, Condition, ConnectionTrait, QueryOrder};
@@ -77,6 +78,7 @@ pub(crate) async fn process<C: ConnectionTrait>(
     db: &C,
     invocation: Invocation,
     ops: Vec<VersionedOperation>,
+    encryption: Option<&ColumnEncryption>,
 ) -> Result<Hash, Error> {
     let (i, serialized) = (invocation.0, invocation.1);
     verify(&i.invocation).await?;
@@ -84,7 +86,7 @@ pub(crate) async fn process<C: ConnectionTrait>(
     let now = OffsetDateTime::now_utc();
     validate(db, &i, Some(now)).await?;
 
-    save(db, i, Some(now), serialized, ops).await
+    save(db, i, Some(now), serialized, ops, encryption).await
 }
 
 async fn verify(invocation: &TinyCloudInvocation) -> Result<(), Error> {
@@ -188,9 +190,14 @@ async fn save<C: ConnectionTrait>(
     time: Option<OffsetDateTime>,
     serialization: Vec<u8>,
     parameters: Vec<VersionedOperation>,
+    encryption: Option<&ColumnEncryption>,
 ) -> Result<Hash, Error> {
+    // Hash is always computed on plaintext (before encryption)
     let hash = crate::hash::hash(&serialization);
     let issued_at = time.unwrap_or_else(OffsetDateTime::now_utc);
+
+    // Encrypt for storage if encryption is configured
+    let stored_serialization = crate::encryption::maybe_encrypt(encryption, &serialization);
 
     // Ensure the invoker actor exists before inserting the invocation
     match actor::Entity::insert(actor::ActiveModel::from(actor::Model {
@@ -213,7 +220,7 @@ async fn save<C: ConnectionTrait>(
     match Entity::insert(ActiveModel::from(Model {
         id: hash,
         issued_at,
-        serialization,
+        serialization: stored_serialization,
         facts: None,
         invoker: invocation.invoker,
     }))

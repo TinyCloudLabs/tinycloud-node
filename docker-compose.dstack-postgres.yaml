@@ -1,0 +1,27 @@
+# dstack deployment - Topology 2: Postgres + S3
+# tinycloud-node in the CVM, Postgres external.
+# Database credentials encrypted by dstack KMS.
+# Column encryption enabled for sensitive data.
+#
+# All ${...} variables should be encrypted using dstack's KMS public key
+# before deployment. The operator never sees plaintext values.
+
+services:
+  tinycloud:
+    image: ghcr.io/tinycloudlabs/tinycloud-node:latest
+    ports:
+      - "8000:8000"
+      - "8001:8001"
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+    environment:
+      TINYCLOUD_KEYS_TYPE: Dstack
+      TINYCLOUD_STORAGE_DATABASE: "${DATABASE_URL}"
+      TINYCLOUD_STORAGE_BLOCKS_TYPE: S3
+      TINYCLOUD_STORAGE_BLOCKS_BUCKET: "${S3_BUCKET}"
+      TINYCLOUD_STORAGE_BLOCKS_ENDPOINT: "${S3_ENDPOINT}"
+      AWS_ACCESS_KEY_ID: "${AWS_KEY}"
+      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET}"
+      TINYCLOUD_LOG_LEVEL: info
+      TINYCLOUD_CORS: "true"
+      ROCKET_ADDRESS: "0.0.0.0"

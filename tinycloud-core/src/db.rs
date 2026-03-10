@@ -1,3 +1,4 @@
+use crate::encryption::ColumnEncryption;
 use crate::events::{epoch_hash, Delegation, Event, HashError, Invocation, Operation, Revocation};
 use crate::hash::Hash;
 use crate::keys::{get_did_key, Secrets};
@@ -29,6 +30,7 @@ pub struct SpaceDatabase<C, B, S> {
     conn: C,
     storage: B,
     secrets: S,
+    encryption: Option<ColumnEncryption>,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +77,8 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
     SpaceNotFound,
     #[error("Invalid delegation CID: {0}")]
     InvalidCid(String),
+    #[error("encryption error: {0}")]
+    Encryption(#[from] crate::encryption::EncryptionError),
 }
 
 #[non_exhaustive]
@@ -119,7 +123,13 @@ impl<B, K> SpaceDatabase<DatabaseConnection, B, K> {
             conn,
             storage,
             secrets,
+            encryption: None,
         })
+    }
+
+    pub fn with_encryption(mut self, encryption: Option<ColumnEncryption>) -> Self {
+        self.encryption = encryption;
+        self
     }
 }
 
@@ -208,7 +218,14 @@ where
             .begin_with_config(Some(sea_orm::IsolationLevel::ReadUncommitted), None)
             .await?;
 
-        let result = transact(&tx, &self.storage, &self.secrets, events).await?;
+        let result = transact(
+            &tx,
+            &self.storage,
+            &self.secrets,
+            events,
+            self.encryption.as_ref(),
+        )
+        .await?;
 
         tx.commit().await?;
 
@@ -303,6 +320,7 @@ where
             &self.storage,
             &self.secrets,
             vec![Event::Invocation(Box::new(invocation), ops)],
+            self.encryption.as_ref(),
         )
         .await?;
 
@@ -359,20 +377,32 @@ where
                         None => {
                             // Backward compatible: no params means return all valid delegations
                             results.push(InvocationOutcome::OpenSessions(
-                                get_valid_delegations(&tx, space).await?,
+                                get_valid_delegations(&tx, space, self.encryption.as_ref()).await?,
                             ))
                         }
                         Some(CapabilitiesReadParams::List { filters }) => {
                             // List with optional filters
                             results.push(InvocationOutcome::OpenSessions(
-                                get_filtered_delegations(&tx, space, &invoker, filters.as_ref())
-                                    .await?,
+                                get_filtered_delegations(
+                                    &tx,
+                                    space,
+                                    &invoker,
+                                    filters.as_ref(),
+                                    self.encryption.as_ref(),
+                                )
+                                .await?,
                             ))
                         }
                         Some(CapabilitiesReadParams::Chain { delegation_cid }) => {
                             // Get the delegation chain for a specific delegation
                             results.push(InvocationOutcome::DelegationChain(
-                                get_delegation_chain(&tx, space, delegation_cid).await?,
+                                get_delegation_chain(
+                                    &tx,
+                                    space,
+                                    delegation_cid,
+                                    self.encryption.as_ref(),
+                                )
+                                .await?,
                             ))
                         }
                     }
@@ -485,6 +515,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     store_setup: &S,
     secrets: &K,
     events: Vec<Event>,
+    encryption: Option<&ColumnEncryption>,
 ) -> Result<TransactResult, TxError<S, K>> {
     // for each event, get the hash and the relevent space(s)
     let event_hashes = events
@@ -729,7 +760,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         for (hash, event) in event_hashes {
             match event {
                 Event::Delegation(d) => {
-                    let cid = delegation::process(db, *d).await?;
+                    let cid = delegation::process(db, *d, encryption).await?;
                     delegation_cids.push(cid);
                 }
                 Event::Invocation(i, ops) => {
@@ -745,6 +776,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                                 op.version(*v.0, *v.1, *v.2)
                             })
                             .collect(),
+                        encryption,
                     )
                     .await?;
                 }
@@ -790,7 +822,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         for (_, event) in event_hashes {
             match event {
                 Event::Delegation(d) => {
-                    let cid = delegation::process(db, *d).await?;
+                    let cid = delegation::process(db, *d, encryption).await?;
                     delegation_cids.push(cid);
                 }
                 Event::Invocation(_, _) | Event::Revocation(_) => {
@@ -919,6 +951,7 @@ async fn get_kv_entity<C: ConnectionTrait>(
 async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     db: &C,
     space_id: &SpaceId,
+    encryption: Option<&ColumnEncryption>,
 ) -> Result<HashMap<Hash, DelegationInfo>, TxError<S, K>> {
     let (dels, abilities): (Vec<delegation::Model>, Vec<Vec<abilities::Model>>) =
         delegation::Entity::find()
@@ -931,8 +964,7 @@ async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             .unzip();
     let parents = dels.load_many(parent_delegations::Entity, db).await?;
     let now = time::OffsetDateTime::now_utc();
-    Ok(dels
-        .into_iter()
+    dels.into_iter()
         .zip(abilities)
         .zip(parents)
         .filter_map(|((del, ability), parents)| {
@@ -940,7 +972,12 @@ async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                 && del.not_before.map(|n| n <= now).unwrap_or(true)
                 && ability.iter().any(|a| a.resource.space() == Some(space_id))
             {
-                Some(match TinyCloudDelegation::from_bytes(&del.serialization) {
+                let serialization =
+                    match crate::encryption::maybe_decrypt(encryption, &del.serialization) {
+                        Ok(s) => s,
+                        Err(e) => return Some(Err(TxError::Encryption(e))),
+                    };
+                Some(match TinyCloudDelegation::from_bytes(&serialization) {
                     Ok(delegation) => Ok((
                         del.id,
                         DelegationInfo {
@@ -960,13 +997,13 @@ async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                             delegation,
                         },
                     )),
-                    Err(e) => Err(e),
+                    Err(e) => Err(TxError::Encoding(e)),
                 })
             } else {
                 None
             }
         })
-        .collect::<Result<HashMap<Hash, DelegationInfo>, EncodingError>>()?)
+        .collect::<Result<HashMap<Hash, DelegationInfo>, TxError<S, K>>>()
 }
 
 /// Resolve a session key DID (did:key:...) to its root PKH DID (did:pkh:...).
@@ -1025,6 +1062,7 @@ async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secret
     space_id: &SpaceId,
     invoker: &str,
     filters: Option<&ListFilters>,
+    encryption: Option<&ColumnEncryption>,
 ) -> Result<HashMap<Hash, DelegationInfo>, TxError<S, K>> {
     // Resolve session key DID to PKH DID for direction filtering
     let pkh_did = resolve_pkh_did(db, invoker)
@@ -1048,8 +1086,7 @@ async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secret
     let path_prefix = filters.and_then(|f| f.path.as_deref());
     let actions = filters.and_then(|f| f.actions.as_ref());
 
-    Ok(dels
-        .into_iter()
+    dels.into_iter()
         .zip(abilities)
         .zip(parents)
         .filter_map(|((del, ability), parents)| {
@@ -1098,7 +1135,12 @@ async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secret
                 }
             }
 
-            Some(match TinyCloudDelegation::from_bytes(&del.serialization) {
+            let serialization =
+                match crate::encryption::maybe_decrypt(encryption, &del.serialization) {
+                    Ok(s) => s,
+                    Err(e) => return Some(Err(TxError::Encryption(e))),
+                };
+            Some(match TinyCloudDelegation::from_bytes(&serialization) {
                 Ok(delegation) => Ok((
                     del.id,
                     DelegationInfo {
@@ -1118,10 +1160,10 @@ async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secret
                         delegation,
                     },
                 )),
-                Err(e) => Err(e),
+                Err(e) => Err(TxError::Encoding(e)),
             })
         })
-        .collect::<Result<HashMap<Hash, DelegationInfo>, EncodingError>>()?)
+        .collect::<Result<HashMap<Hash, DelegationInfo>, TxError<S, K>>>()
 }
 
 /// Get the delegation chain for a specific delegation, ordered from leaf to root.
@@ -1130,6 +1172,7 @@ async fn get_delegation_chain<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     db: &C,
     space_id: &SpaceId,
     delegation_cid: &str,
+    encryption: Option<&ColumnEncryption>,
 ) -> Result<Vec<DelegationInfo>, TxError<S, K>> {
     use tinycloud_lib::ipld_core::cid::Cid;
 
@@ -1180,7 +1223,8 @@ async fn get_delegation_chain<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         let parent_cids: Vec<Cid> = parents.iter().map(|p| p.parent.to_cid(0x55)).collect();
 
         // Create DelegationInfo
-        let delegation = TinyCloudDelegation::from_bytes(&del.serialization)?;
+        let serialization = crate::encryption::maybe_decrypt(encryption, &del.serialization)?;
+        let delegation = TinyCloudDelegation::from_bytes(&serialization)?;
         let info = DelegationInfo {
             delegator: del.delegator,
             delegate: del.delegatee,

@@ -13,13 +13,17 @@ pub mod allow_list;
 pub mod auth_guards;
 pub mod authorization;
 pub mod config;
+#[cfg(feature = "dstack")]
+pub mod dstack;
 pub mod prometheus;
 pub mod routes;
 pub mod storage;
+pub mod tee;
 mod tracing;
 
 use config::{BlockStorage, Config, Keys, StagingStorage};
 use routes::{
+    attestation::attestation,
     delegate, invoke, open_host_key,
     public::{public_kv_get, public_kv_head, public_kv_list, public_kv_options, RateLimiter},
     util_routes::*,
@@ -29,6 +33,7 @@ use storage::{
     file_system::{FileSystemConfig, FileSystemStore, TempFileSystemStage},
     s3::{S3BlockConfig, S3BlockStore},
 };
+use tee::TeeContext;
 use tinycloud_core::{
     duckdb::DuckDbService,
     keys::{SecretsSetup, StaticSecret},
@@ -101,10 +106,42 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         public_kv_head,
         public_kv_list,
         public_kv_options,
+        attestation,
     ];
 
-    let key_setup: StaticSecret = match tinycloud_config.keys {
-        Keys::Static(s) => s.try_into()?,
+    let key_setup: StaticSecret = resolve_keys(&tinycloud_config.keys).await?;
+
+    // Initialize TEE context if running in dstack mode
+    let tee_context: Option<TeeContext> = {
+        #[cfg(feature = "dstack")]
+        {
+            if dstack::is_available() {
+                match dstack::get_info().await {
+                    Ok(info) => {
+                        ::tracing::info!(
+                            app_id = %info.app_id,
+                            compose_hash = %info.compose_hash,
+                            "Running in dstack TEE mode"
+                        );
+                        Some(TeeContext {
+                            app_id: info.app_id,
+                            compose_hash: info.compose_hash,
+                            instance_id: info.instance_id,
+                        })
+                    }
+                    Err(e) => {
+                        ::tracing::warn!("dstack socket available but get_info failed: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        }
+        #[cfg(not(feature = "dstack"))]
+        {
+            None
+        }
     };
 
     let mut connect_opts = ConnectOptions::from(&tinycloud_config.storage.database);
@@ -159,6 +196,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         .manage(sql_service)
         .manage(duckdb_service)
         .manage(rate_limiter)
+        .manage(tee_context)
         .manage(tinycloud_config.storage.staging.open().await?);
 
     if tinycloud_config.cors {
@@ -185,6 +223,52 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         })))
     } else {
         Ok(rocket)
+    }
+}
+
+async fn resolve_keys(keys: &Keys) -> Result<StaticSecret> {
+    match keys {
+        Keys::Static(s) => Ok(s.clone().try_into()?),
+        #[cfg(feature = "dstack")]
+        Keys::Dstack => {
+            let key_bytes = dstack::get_key("tinycloud/keys/primary").await?;
+            StaticSecret::new(key_bytes)
+                .map_err(|v| anyhow::anyhow!("dstack key too short: {} bytes", v.len()))
+        }
+        Keys::Auto => {
+            // Check TINYCLOUD_TEE_MODE env var first
+            match std::env::var("TINYCLOUD_TEE_MODE").ok().as_deref() {
+                #[cfg(feature = "dstack")]
+                Some("dstack") => {
+                    let key_bytes = dstack::get_key("tinycloud/keys/primary").await?;
+                    StaticSecret::new(key_bytes)
+                        .map_err(|v| anyhow::anyhow!("dstack key too short: {} bytes", v.len()))
+                }
+                Some("off") => {
+                    anyhow::bail!(
+                        "TEE mode disabled but no static key configured. \
+                         Set TINYCLOUD_KEYS_SECRET or configure [keys] in config."
+                    )
+                }
+                _ => {
+                    // Auto-detect: check for dstack socket
+                    #[cfg(feature = "dstack")]
+                    if dstack::is_available() {
+                        ::tracing::info!("dstack socket detected, using TEE key derivation");
+                        let key_bytes = dstack::get_key("tinycloud/keys/primary").await?;
+                        return StaticSecret::new(key_bytes).map_err(|v| {
+                            anyhow::anyhow!("dstack key too short: {} bytes", v.len())
+                        });
+                    }
+                    anyhow::bail!(
+                        "No key source configured. Either:\n  \
+                         - Set TINYCLOUD_KEYS_SECRET environment variable\n  \
+                         - Configure [keys] section in tinycloud.toml\n  \
+                         - Run inside a dstack TEE (with 'dstack' feature enabled)"
+                    )
+                }
+            }
+        }
     }
 }
 

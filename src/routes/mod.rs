@@ -25,6 +25,7 @@ use tinycloud_core::{
     InvocationOutcome, TransactResult, TxError, TxStoreError,
 };
 
+pub mod attestation;
 pub mod public;
 pub mod util;
 use util::LimitedReader;
@@ -38,10 +39,14 @@ pub struct VersionInfo {
 
 #[get("/version")]
 pub fn version() -> Json<VersionInfo> {
+    #[allow(unused_mut)]
+    let mut features = vec!["kv", "delegation", "sharing", "sql", "duckdb"];
+    #[cfg(feature = "dstack")]
+    features.push("tee");
     Json(VersionInfo {
         protocol: tinycloud_lib::protocol::PROTOCOL_VERSION,
         version: env!("CARGO_PKG_VERSION").to_string(),
-        features: vec!["kv", "delegation", "sharing", "sql", "duckdb"],
+        features,
     })
 }
 
