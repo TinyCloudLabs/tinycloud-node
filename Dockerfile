@@ -4,7 +4,7 @@ ARG RUNTIME_BASE=scratch
 ARG CARGO_FEATURES=""
 
 FROM rust:alpine AS chef
-RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static g++ perl
+RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static g++ perl make
 RUN cargo install cargo-chef
 WORKDIR /app
 
