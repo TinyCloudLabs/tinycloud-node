@@ -156,7 +156,7 @@ pub struct SqlStorageConfig {
 }
 
 fn default_sql_path() -> String {
-    "./tinycloud/sql".to_string()
+    "./data/sql".to_string()
 }
 
 fn default_sql_memory_threshold() -> ByteUnit {
@@ -187,7 +187,7 @@ pub struct DuckDbStorageConfig {
 }
 
 fn default_duckdb_path() -> String {
-    "./tinycloud/duckdb".to_string()
+    "./data/duckdb".to_string()
 }
 
 fn default_duckdb_memory_threshold() -> ByteUnit {
