@@ -33,7 +33,6 @@ impl QuotaCache {
     pub async fn get_limit(&self, space_id: &SpaceId) -> Option<ByteUnit> {
         let key = space_id.to_string();
 
-        // Check cache first
         {
             let overrides = self.overrides.read().await;
             if let Some(&limit) = overrides.get(&key) {
@@ -43,17 +42,23 @@ impl QuotaCache {
 
         // Try lazy-load from billing sidecar
         if let (Some(url), Some(client)) = (&self.billing_url, &self.client) {
-            match client.get(format!("{}/api/quota/{}", url, key)).send().await {
+            match client
+                .get(format!("{}/api/quota/{}", url, key))
+                .send()
+                .await
+            {
                 Ok(resp) if resp.status().is_success() => {
                     if let Ok(info) = resp.json::<QuotaInfo>().await {
-                        // Cache the result
                         let mut overrides = self.overrides.write().await;
                         overrides.insert(key, info.storage_limit_bytes);
                         return Some(ByteUnit::Byte(info.storage_limit_bytes));
                     }
                 }
                 _ => {
-                    tracing::debug!("billing sidecar unavailable for space {}, using default", key);
+                    tracing::debug!(
+                        "billing sidecar unavailable for space {}, using default",
+                        key
+                    );
                 }
             }
         }
