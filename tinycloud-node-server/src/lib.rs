@@ -16,15 +16,18 @@ pub mod config;
 #[cfg(feature = "dstack")]
 pub mod dstack;
 pub mod prometheus;
+pub mod quota;
 pub mod routes;
 pub mod storage;
 pub mod tee;
 mod tracing;
 
 use config::{BlockStorage, Config, Keys, StagingStorage};
+use quota::QuotaCache;
 use routes::{
+    admin::{delete_quota, get_quota, list_quotas, set_quota},
     attestation::attestation,
-    delegate, invoke, open_host_key,
+    delegate, info, invoke, open_host_key,
     public::{public_kv_get, public_kv_head, public_kv_list, public_kv_options, RateLimiter},
     util_routes::*,
     version,
@@ -99,6 +102,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     let routes = routes![
         healthcheck,
         cors,
+        info,
         version,
         open_host_key,
         invoke,
@@ -108,6 +112,10 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         public_kv_list,
         public_kv_options,
         attestation,
+        set_quota,
+        delete_quota,
+        get_quota,
+        list_quotas,
     ];
 
     let key_setup: StaticSecret = resolve_keys(&tinycloud_config.keys).await?;
@@ -191,6 +199,11 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
             .clone(),
     );
 
+    let quota_cache = QuotaCache::new(
+        tinycloud_config.storage.limit,
+        std::env::var("TINYCLOUD_QUOTA_URL").ok(),
+    );
+
     let rate_limiter = RateLimiter::new(&tinycloud_config.public_spaces);
 
     let rocket = rocket::custom(config)
@@ -202,6 +215,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         .manage(tinycloud)
         .manage(sql_service)
         .manage(duckdb_service)
+        .manage(quota_cache)
         .manage(rate_limiter)
         .manage(tee_context)
         .manage(tinycloud_config.storage.staging.open().await?);
