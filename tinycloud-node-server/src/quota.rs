@@ -13,17 +13,17 @@ pub struct QuotaInfo {
 pub struct QuotaCache {
     overrides: Arc<RwLock<HashMap<String, u64>>>,
     default_limit: Option<ByteUnit>,
-    billing_url: Option<String>,
+    quota_url: Option<String>,
     client: Option<reqwest::Client>,
 }
 
 impl QuotaCache {
-    pub fn new(default_limit: Option<ByteUnit>, billing_url: Option<String>) -> Self {
-        let client = billing_url.as_ref().map(|_| reqwest::Client::new());
+    pub fn new(default_limit: Option<ByteUnit>, quota_url: Option<String>) -> Self {
+        let client = quota_url.as_ref().map(|_| reqwest::Client::new());
         Self {
             overrides: Arc::new(RwLock::new(HashMap::new())),
             default_limit,
-            billing_url,
+            quota_url,
             client,
         }
     }
@@ -40,8 +40,7 @@ impl QuotaCache {
             }
         }
 
-        // Try lazy-load from billing sidecar
-        if let (Some(url), Some(client)) = (&self.billing_url, &self.client) {
+        if let (Some(url), Some(client)) = (&self.quota_url, &self.client) {
             match client
                 .get(format!("{}/api/quota/{}", url, key))
                 .send()
@@ -55,10 +54,7 @@ impl QuotaCache {
                     }
                 }
                 _ => {
-                    tracing::debug!(
-                        "billing sidecar unavailable for space {}, using default",
-                        key
-                    );
+                    tracing::debug!("quota service unavailable for space {}, using default", key);
                 }
             }
         }
@@ -89,5 +85,9 @@ impl QuotaCache {
 
     pub fn default_limit(&self) -> Option<ByteUnit> {
         self.default_limit
+    }
+
+    pub fn quota_url(&self) -> Option<&str> {
+        self.quota_url.as_deref()
     }
 }

@@ -39,10 +39,15 @@ pub struct VersionInfo {
     pub features: Vec<&'static str>,
     #[serde(rename = "inTEE")]
     pub in_tee: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_url: Option<String>,
 }
 
 #[get("/version")]
-pub fn version(tee: &State<Option<crate::tee::TeeContext>>) -> Json<VersionInfo> {
+pub fn version(
+    tee: &State<Option<crate::tee::TeeContext>>,
+    quota_cache: &State<QuotaCache>,
+) -> Json<VersionInfo> {
     #[allow(unused_mut)]
     let mut features = vec!["kv", "delegation", "sharing", "sql", "duckdb"];
     #[cfg(feature = "dstack")]
@@ -52,6 +57,7 @@ pub fn version(tee: &State<Option<crate::tee::TeeContext>>) -> Json<VersionInfo>
         version: env!("CARGO_PKG_VERSION").to_string(),
         features,
         in_tee: tee.inner().is_some(),
+        quota_url: quota_cache.quota_url().map(|s| s.to_string()),
     })
 }
 

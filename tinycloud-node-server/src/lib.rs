@@ -200,7 +200,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
 
     let quota_cache = QuotaCache::new(
         tinycloud_config.storage.limit,
-        std::env::var("TINYCLOUD_BILLING_URL").ok(),
+        std::env::var("TINYCLOUD_QUOTA_URL").ok(),
     );
 
     let rate_limiter = RateLimiter::new(&tinycloud_config.public_spaces);
