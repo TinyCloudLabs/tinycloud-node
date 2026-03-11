@@ -27,7 +27,7 @@ use quota::QuotaCache;
 use routes::{
     admin::{delete_quota, get_quota, list_quotas, set_quota},
     attestation::attestation,
-    delegate, invoke, open_host_key,
+    delegate, info, invoke, open_host_key,
     public::{public_kv_get, public_kv_head, public_kv_list, public_kv_options, RateLimiter},
     util_routes::*,
     version,
@@ -102,6 +102,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     let routes = routes![
         healthcheck,
         cors,
+        info,
         version,
         open_host_key,
         invoke,

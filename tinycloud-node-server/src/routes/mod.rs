@@ -33,7 +33,7 @@ pub mod util;
 use util::LimitedReader;
 
 #[derive(Serialize)]
-pub struct VersionInfo {
+pub struct NodeInfo {
     pub protocol: u32,
     pub version: String,
     pub features: Vec<&'static str>,
@@ -43,22 +43,37 @@ pub struct VersionInfo {
     pub quota_url: Option<String>,
 }
 
-#[get("/version")]
-pub fn version(
+fn build_info(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
-) -> Json<VersionInfo> {
+) -> NodeInfo {
     #[allow(unused_mut)]
     let mut features = vec!["kv", "delegation", "sharing", "sql", "duckdb"];
     #[cfg(feature = "dstack")]
     features.push("tee");
-    Json(VersionInfo {
+    NodeInfo {
         protocol: tinycloud_auth::protocol::PROTOCOL_VERSION,
         version: env!("CARGO_PKG_VERSION").to_string(),
         features,
         in_tee: tee.inner().is_some(),
         quota_url: quota_cache.quota_url().map(|s| s.to_string()),
-    })
+    }
+}
+
+#[get("/info")]
+pub fn info(
+    tee: &State<Option<crate::tee::TeeContext>>,
+    quota_cache: &State<QuotaCache>,
+) -> Json<NodeInfo> {
+    Json(build_info(tee, quota_cache))
+}
+
+#[get("/version")]
+pub fn version(
+    tee: &State<Option<crate::tee::TeeContext>>,
+    quota_cache: &State<QuotaCache>,
+) -> Json<NodeInfo> {
+    Json(build_info(tee, quota_cache))
 }
 
 #[allow(clippy::let_unit_value)]
