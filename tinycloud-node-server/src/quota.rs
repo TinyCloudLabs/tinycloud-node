@@ -29,7 +29,7 @@ impl QuotaCache {
     }
 
     /// Get the effective storage limit for a space.
-    /// Priority: cache override → lazy-load from billing sidecar → env default → None
+    /// Priority: cache override → lazy-load from quota service → env default → None
     pub async fn get_limit(&self, space_id: &SpaceId) -> Option<ByteUnit> {
         let key = space_id.to_string();
 
