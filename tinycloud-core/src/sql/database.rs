@@ -1,5 +1,7 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use dashmap::DashMap;
 use rusqlite::hooks::{AuthContext, Authorization};
 use tokio::sync::{mpsc, oneshot};
 
@@ -70,6 +72,7 @@ pub fn spawn_actor(
     db_name: String,
     base_path: String,
     memory_threshold: u64,
+    databases: Arc<DashMap<(String, String), DatabaseHandle>>,
 ) -> DatabaseHandle {
     let (tx, mut rx) = mpsc::channel::<DbMessage>(32);
 
@@ -132,6 +135,7 @@ pub fn spawn_actor(
             }
         }
 
+        databases.remove(&(space_id.clone(), db_name.clone()));
         tracing::debug!(space=%space_id, db=%db_name, "Database actor shutting down");
     });
 

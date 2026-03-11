@@ -35,18 +35,43 @@ impl SqlService {
         let key = (space.to_string(), db_name.to_string());
         let handle = self
             .databases
-            .entry(key)
+            .entry(key.clone())
             .or_insert_with(|| {
                 spawn_actor(
                     space.to_string(),
                     db_name.to_string(),
                     self.base_path.clone(),
                     self.memory_threshold,
+                    self.databases.clone(),
                 )
             })
             .clone();
 
-        handle.execute(request, caveats, ability).await
+        match handle
+            .execute(request.clone(), caveats.clone(), ability.clone())
+            .await
+        {
+            Err(SqlError::Internal(ref msg)) if msg.contains("Database actor not available") => {
+                // Actor is dead — remove stale entry and respawn
+                tracing::warn!(space=%space, db=%db_name, "Dead SQL actor detected, respawning");
+                self.databases.remove(&key);
+                let new_handle = self
+                    .databases
+                    .entry(key)
+                    .or_insert_with(|| {
+                        spawn_actor(
+                            space.to_string(),
+                            db_name.to_string(),
+                            self.base_path.clone(),
+                            self.memory_threshold,
+                            self.databases.clone(),
+                        )
+                    })
+                    .clone();
+                new_handle.execute(request, caveats, ability).await
+            }
+            other => other,
+        }
     }
 
     pub async fn export(&self, space: &SpaceId, db_name: &str) -> Result<Vec<u8>, SqlError> {
@@ -54,7 +79,16 @@ impl SqlService {
 
         // If there's a live actor, route through it (handles both in-memory and file-backed)
         if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
-            return handle.export().await;
+            match handle.export().await {
+                Err(SqlError::Internal(ref msg))
+                    if msg.contains("Database actor not available") =>
+                {
+                    // Actor is dead — remove stale entry and fall through to cold read
+                    tracing::warn!(space=%space, db=%db_name, "Dead SQL actor detected during export, removing");
+                    self.databases.remove(&key);
+                }
+                other => return other,
+            }
         }
 
         // No live actor — try reading the file directly (cold database)
