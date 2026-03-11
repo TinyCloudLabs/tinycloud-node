@@ -10,6 +10,7 @@ use crate::{
     auth_guards::{DataIn, DataOut, InvOut, ObjectHeaders},
     authorization::AuthHeaderGetter,
     config::Config,
+    quota::QuotaCache,
     routes::public::is_public_space,
     tracing::TracingSpan,
     BlockStage, BlockStores, TinyCloud,
@@ -25,6 +26,7 @@ use tinycloud_core::{
     InvocationOutcome, TransactResult, TxError, TxStoreError,
 };
 
+pub mod admin;
 pub mod attestation;
 pub mod public;
 pub mod util;
@@ -166,6 +168,7 @@ pub async fn invoke(
     staging: &State<BlockStage>,
     tinycloud: &State<TinyCloud>,
     config: &State<Config>,
+    quota_cache: &State<QuotaCache>,
     sql_service: &State<SqlService>,
     duckdb_service: &State<DuckDbService>,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
@@ -261,11 +264,11 @@ pub async fn invoke(
                     .map_err(|e| (Status::InternalServerError, e.to_string()))?;
                 let open_data = d.open(1u8.gigabytes()).compat();
 
-                // Use public space storage limit if applicable, otherwise regular limit
+                // Use public space storage limit if applicable, otherwise per-space quota
                 let effective_limit = if is_public_space(space) {
                     Some(config.public_spaces.storage_limit)
                 } else {
-                    config.storage.limit
+                    quota_cache.get_limit(space).await
                 };
 
                 if let Some(limit) = effective_limit {
@@ -279,14 +282,31 @@ pub async fn invoke(
                         // the current size is already equal or greater than the limit
                         None | Some(0) => {
                             return Err((
-                                Status::PayloadTooLarge,
-                                "The data storage limit has been reached".into(),
+                                Status::new(402),
+                                format!(
+                                    "Storage quota exceeded. Used: {} bytes, Limit: {} bytes",
+                                    current_size,
+                                    limit.as_u64()
+                                ),
                             ))
                         }
                         Some(remaining) => {
                             futures::io::copy(LimitedReader::new(open_data, remaining), &mut stage)
                                 .await
-                                .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+                                .map_err(|e| {
+                                    if e.to_string().contains("storage limit") {
+                                        (
+                                            Status::PayloadTooLarge,
+                                            format!(
+                                                "Write exceeds remaining storage. Used: {} bytes, Limit: {} bytes",
+                                                current_size,
+                                                limit.as_u64()
+                                            ),
+                                        )
+                                    } else {
+                                        (Status::InternalServerError, e.to_string())
+                                    }
+                                })?;
                         }
                     }
                 } else {
