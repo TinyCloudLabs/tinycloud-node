@@ -16,14 +16,17 @@ const ROOT = process.cwd();
 const CHANGESET_DIR = join(ROOT, ".changeset");
 const CHANGELOG_PATH = join(ROOT, "CHANGELOG.md");
 
-// Cargo.toml files to update (workspace root + sub-crates)
+// Cargo.toml files to update (all workspace crates)
 const CARGO_TOMLS = [
-  "Cargo.toml",
+  "tinycloud-node-server/Cargo.toml",
   "tinycloud-core/Cargo.toml",
-  "tinycloud-lib/Cargo.toml",
+  "tinycloud-auth/Cargo.toml",
   "tinycloud-sdk-rs/Cargo.toml",
   "tinycloud-sdk-wasm/Cargo.toml",
 ].map((p) => join(ROOT, p));
+
+// The primary crate used to read the current version
+const VERSION_SOURCE = join(ROOT, "tinycloud-node-server/Cargo.toml");
 
 function parseVersion(version) {
   const [major, minor, patch] = version.split(".").map(Number);
@@ -45,9 +48,9 @@ function bumpVersion(version, type) {
 }
 
 function getCurrentVersion() {
-  const cargo = readFileSync(join(ROOT, "Cargo.toml"), "utf8");
+  const cargo = readFileSync(VERSION_SOURCE, "utf8");
   const match = cargo.match(/^version\s*=\s*"([^"]+)"/m);
-  if (!match) throw new Error("Could not find version in root Cargo.toml");
+  if (!match) throw new Error(`Could not find version in ${VERSION_SOURCE}`);
   return match[1];
 }
 
@@ -87,6 +90,23 @@ function updateCargoToml(path, oldVersion, newVersion) {
     console.log(`  Updated ${path}`);
   } catch {
     // File may not exist (e.g. sdk crates not in all builds)
+  }
+}
+
+function updateWorkspaceDeps(oldVersion, newVersion) {
+  const rootCargoPath = join(ROOT, "Cargo.toml");
+  try {
+    let content = readFileSync(rootCargoPath, "utf8");
+    // Update version in internal workspace dependency declarations
+    // e.g. tinycloud-auth = { path = "tinycloud-auth", version = "1.0.0" }
+    content = content.replaceAll(
+      `version = "${oldVersion}" }`,
+      `version = "${newVersion}" }`
+    );
+    writeFileSync(rootCargoPath, content);
+    console.log(`  Updated workspace deps in ${rootCargoPath}`);
+  } catch {
+    // Root Cargo.toml should always exist, but don't crash
   }
 }
 
@@ -133,6 +153,9 @@ console.log(`Bumping ${currentVersion} → ${newVersion} (${highestBump})`);
 for (const cargoPath of CARGO_TOMLS) {
   updateCargoToml(cargoPath, currentVersion, newVersion);
 }
+
+// Update internal crate versions in root workspace dependencies
+updateWorkspaceDeps(currentVersion, newVersion);
 
 // Update CHANGELOG
 const summaries = changesets.map((cs) => cs.summary);

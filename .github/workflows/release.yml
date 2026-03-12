@@ -46,7 +46,7 @@ jobs:
         if: steps.check.outputs.count == '0'
         run: |
           # If no changesets remain, check if Cargo.toml version changed in this push
-          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          VERSION=$(grep '^version' tinycloud-node-server/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
           TAG="v$VERSION"
           if ! git tag -l "$TAG" | grep -q "$TAG"; then
             echo "Creating release $TAG"
