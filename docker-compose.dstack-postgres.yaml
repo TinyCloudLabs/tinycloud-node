@@ -8,10 +8,10 @@
 
 services:
   tinycloud:
-    image: ghcr.io/tinycloudlabs/tinycloud-node:latest
+    image: ghcr.io/tinycloudlabs/tinycloud-node:dstack
+    restart: unless-stopped
     ports:
       - "8000:8000"
-      - "8001:8001"
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
     environment:
