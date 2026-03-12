@@ -38,6 +38,7 @@ RUN addgroup -g 1000 tinycloud && adduser -u 1000 -G tinycloud -s /bin/sh -D tin
 
 # Runtime stage
 FROM ${RUNTIME_BASE} AS runtime
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /etc/passwd /etc/passwd
 COPY --from=builder /etc/group /etc/group
 COPY --from=builder --chown=tinycloud:tinycloud /app/tinycloud /tinycloud
