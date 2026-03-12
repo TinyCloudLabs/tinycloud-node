@@ -53,3 +53,45 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  build-dstack:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}},suffix=-dstack
+            type=semver,pattern={{major}}.{{minor}},suffix=-dstack
+            type=semver,pattern={{major}},suffix=-dstack
+            type=sha,prefix=dstack-
+            type=raw,value=dstack,enable={{is_default_branch}}
+
+      - name: Build and push dstack Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: CARGO_FEATURES=dstack
+          cache-from: type=gha,scope=dstack
+          cache-to: type=gha,mode=max,scope=dstack
