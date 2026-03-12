@@ -21,8 +21,7 @@ fn socket_path() -> String {
 
 #[derive(Debug, Deserialize)]
 struct GetKeyResponse {
-    #[serde(rename = "asBytes")]
-    as_bytes: String, // hex-encoded
+    key: String, // hex-encoded
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,7 +115,7 @@ pub async fn get_key(path: &str) -> Result<Vec<u8>> {
             .context("dstack GetKey request")?,
     )
     .context("parsing GetKey response")?;
-    hex::decode(&resp.as_bytes).context("decoding hex key bytes from dstack")
+    hex::decode(&resp.key).context("decoding hex key bytes from dstack")
 }
 
 /// Request a TDX attestation quote from the TEE.
