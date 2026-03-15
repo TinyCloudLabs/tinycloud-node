@@ -48,6 +48,7 @@ COPY ./tinycloud.toml ./
 COPY --from=builder /scratch-tmp /tmp
 USER tinycloud:tinycloud
 ENV ROCKET_ADDRESS=0.0.0.0
+ENV TMPDIR=/data
 EXPOSE 8000
 EXPOSE 8001
 EXPOSE 8081
