@@ -35,6 +35,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release -p tinycloud-node-server ${CARGO_FEATURES:+--features $CARGO_FEATURES} && \
     cp /app/target/release/tinycloud /app/tinycloud
 RUN addgroup -g 1000 tinycloud && adduser -u 1000 -G tinycloud -s /bin/sh -D tinycloud
+RUN mkdir -p /scratch-tmp && chmod 1777 /scratch-tmp
 
 # Runtime stage
 FROM ${RUNTIME_BASE} AS runtime
@@ -44,6 +45,7 @@ COPY --from=builder /etc/group /etc/group
 COPY --from=builder --chown=tinycloud:tinycloud /app/tinycloud /tinycloud
 COPY --from=builder --chown=tinycloud:tinycloud /app/data ./data
 COPY ./tinycloud.toml ./
+COPY --from=builder /scratch-tmp /tmp
 USER tinycloud:tinycloud
 ENV ROCKET_ADDRESS=0.0.0.0
 EXPOSE 8000
