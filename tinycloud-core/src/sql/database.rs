@@ -135,6 +135,22 @@ pub fn spawn_actor(
             }
         }
 
+        // Flush in-memory database to file before shutdown so data is not lost
+        if matches!(mode, StorageMode::InMemory) {
+            if let Ok(size) = storage::database_size(&conn) {
+                if size > 0 {
+                    match storage::promote_to_file(&conn, &file_path) {
+                        Ok(_) => {
+                            tracing::info!(space=%space_id, db=%db_name, "Flushed in-memory database to file on shutdown");
+                        }
+                        Err(e) => {
+                            tracing::error!(space=%space_id, db=%db_name, error=%e, "Failed to flush in-memory database on shutdown");
+                        }
+                    }
+                }
+            }
+        }
+
         databases.remove(&(space_id.clone(), db_name.clone()));
         tracing::debug!(space=%space_id, db=%db_name, "Database actor shutting down");
     });
