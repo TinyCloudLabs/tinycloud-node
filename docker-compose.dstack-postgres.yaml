@@ -26,3 +26,25 @@ services:
       TINYCLOUD_LOG_LEVEL: info
       TINYCLOUD_CORS: "true"
       ROCKET_ADDRESS: "0.0.0.0"
+
+  dstack-ingress:
+    image: dstacktee/dstack-ingress:20250924@sha256:40429d78060ef3066b5f93676bf3ba7c2e9ac47d4648440febfdda558aed4b32
+    ports:
+      - "443:443"
+    depends_on:
+      - tinycloud
+    environment:
+      - DOMAIN=tee.node.tinycloud.xyz
+      - TARGET_ENDPOINT=http://tinycloud:8000
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+      - GATEWAY_DOMAIN=_.${DSTACK_GATEWAY_DOMAIN}
+      - CERTBOT_EMAIL=${CERTBOT_EMAIL}
+      - SET_CAA=true
+      - DNS_PROVIDER=cloudflare
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - cert-data:/etc/letsencrypt
+    restart: unless-stopped
+
+volumes:
+  cert-data:
