@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::write_hooks::TouchedTables;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action")]
 pub enum SqlRequest {
@@ -181,6 +183,12 @@ pub struct ExecuteResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchResponse {
     pub results: Vec<ExecuteResponse>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SqlExecutionResult {
+    pub response: SqlResponse,
+    pub write_targets: Vec<TouchedTables>,
 }
 
 #[derive(Debug, thiserror::Error)]

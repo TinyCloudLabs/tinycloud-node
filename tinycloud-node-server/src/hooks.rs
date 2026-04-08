@@ -112,8 +112,7 @@ impl HookRuntime {
     pub fn sign_ticket(&self, claims: &HookTicketClaims) -> Result<String, String> {
         let payload = serde_json::to_vec(claims).map_err(|e| e.to_string())?;
         let encoded_payload = encode_config(payload, URL_SAFE_NO_PAD);
-        let mut mac =
-            TicketMac::new_from_slice(&self.ticket_key).map_err(|e| e.to_string())?;
+        let mut mac = TicketMac::new_from_slice(&self.ticket_key).map_err(|e| e.to_string())?;
         mac.update(encoded_payload.as_bytes());
         let signature = mac.finalize().into_bytes();
         let encoded_signature = encode_config(signature, URL_SAFE_NO_PAD);
@@ -125,16 +124,15 @@ impl HookRuntime {
             .split_once('.')
             .ok_or_else(|| "invalid ticket format".to_string())?;
 
-        let mut mac =
-            TicketMac::new_from_slice(&self.ticket_key).map_err(|e| e.to_string())?;
+        let mut mac = TicketMac::new_from_slice(&self.ticket_key).map_err(|e| e.to_string())?;
         mac.update(encoded_payload.as_bytes());
         let signature = decode_config(encoded_signature, URL_SAFE_NO_PAD)
             .map_err(|_| "invalid ticket signature".to_string())?;
         mac.verify_slice(&signature)
             .map_err(|_| "invalid ticket signature".to_string())?;
 
-        let payload =
-            decode_config(encoded_payload, URL_SAFE_NO_PAD).map_err(|_| "invalid ticket payload".to_string())?;
+        let payload = decode_config(encoded_payload, URL_SAFE_NO_PAD)
+            .map_err(|_| "invalid ticket payload".to_string())?;
         serde_json::from_slice(&payload).map_err(|_| "invalid ticket payload".to_string())
     }
 
@@ -173,7 +171,11 @@ pub fn matches_scope(event: &WriteEvent, scope: &HookSubscription) -> bool {
         return false;
     }
 
-    if !scope.abilities.is_empty() && !scope.abilities.iter().any(|ability| ability == &event.ability)
+    if !scope.abilities.is_empty()
+        && !scope
+            .abilities
+            .iter()
+            .any(|ability| ability == &event.ability)
     {
         return false;
     }
@@ -271,6 +273,38 @@ mod tests {
                 service: "kv".to_string(),
                 path_prefix: Some("document".to_string()),
                 abilities: vec!["tinycloud.kv/put".to_string()],
+            }
+        ));
+
+        let sql_event = WriteEvent {
+            id: "epoch:0".to_string(),
+            space: "tinycloud:space".to_string(),
+            service: "sql".to_string(),
+            ability: "tinycloud.sql/write".to_string(),
+            path: Some("main.db/users".to_string()),
+            actor: "did:key:test".to_string(),
+            epoch: "epoch".to_string(),
+            event_index: 0,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        assert!(matches_scope(
+            &sql_event,
+            &HookSubscription {
+                space: "tinycloud:space".to_string(),
+                service: "sql".to_string(),
+                path_prefix: Some("main.db".to_string()),
+                abilities: vec!["tinycloud.sql/write".to_string()],
+            }
+        ));
+
+        assert!(!matches_scope(
+            &sql_event,
+            &HookSubscription {
+                space: "tinycloud:space".to_string(),
+                service: "sql".to_string(),
+                path_prefix: Some("other.db".to_string()),
+                abilities: vec!["tinycloud.sql/write".to_string()],
             }
         ));
     }

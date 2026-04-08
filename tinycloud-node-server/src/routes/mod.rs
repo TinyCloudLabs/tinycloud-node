@@ -20,13 +20,14 @@ use crate::{
 use tinycloud_core::{
     duckdb::{DuckDbCaveats, DuckDbError, DuckDbRequest, DuckDbResponse, DuckDbService},
     events::Invocation,
+    models::{kv_delete, kv_write},
     sea_orm::DbErr,
     sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder},
-    models::{kv_delete, kv_write},
     sql::{SqlCaveats, SqlError, SqlRequest, SqlService},
     storage::{ImmutableReadStore, ImmutableStaging},
     types::Resource,
     util::{DelegationInfo, InvocationInfo},
+    write_hooks::{db_table_path, TouchedTables},
     InvocationOutcome, TransactResult, TxError, TxStoreError,
 };
 
@@ -228,7 +229,15 @@ pub async fn invoke(
             .collect();
 
         if !sql_caps.is_empty() {
-            let result = handle_sql_invoke(i, data, tinycloud, sql_service, &sql_caps).await;
+            let result = handle_sql_invoke(
+                i,
+                data,
+                tinycloud,
+                sql_service,
+                hook_runtime,
+                &sql_caps,
+            )
+            .await;
             timer.observe_duration();
             return result;
         }
@@ -263,6 +272,7 @@ pub async fn invoke(
                 data,
                 tinycloud,
                 duckdb_service,
+                hook_runtime,
                 &duckdb_caps,
                 arrow_format,
             )
@@ -533,32 +543,6 @@ async fn emit_kv_hook_events(
     }
 }
 
-/// Verify authorization by invoking with empty inputs.
-///
-/// Shared by SQL and DuckDB invoke handlers. The caller must extract caveats
-/// from `i` before calling this, since the invocation tuple is consumed here.
-async fn verify_auth(
-    invocation: Invocation,
-    tinycloud: &State<TinyCloud>,
-) -> Result<(), (Status, String)> {
-    tinycloud
-        .invoke::<BlockStage>(invocation, HashMap::new())
-        .await
-        .map_err(|e| {
-            (
-                match e {
-                    TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
-                    TxStoreError::Tx(TxError::Db(DbErr::ConnectionAcquire(_))) => {
-                        Status::InternalServerError
-                    }
-                    _ => Status::Unauthorized,
-                },
-                e.to_string(),
-            )
-        })?;
-    Ok(())
-}
-
 /// Read the request body as a JSON string.
 async fn read_json_body(data: DataIn<'_>) -> Result<String, (Status, String)> {
     match data {
@@ -580,9 +564,9 @@ async fn handle_sql_invoke(
     data: DataIn<'_>,
     tinycloud: &State<TinyCloud>,
     sql_service: &State<SqlService>,
+    hook_runtime: &State<HookRuntime>,
     sql_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
-    // Extract caveats from the invocation facts before consuming i
     let caveats: Option<SqlCaveats> =
         i.0 .0
             .invocation
@@ -597,16 +581,17 @@ async fn handle_sql_invoke(
                 })
             });
 
-    verify_auth(i.0, tinycloud).await?;
+    let actor = i.0 .0.invoker.clone();
+    let auth_result = verify_auth(i.0, tinycloud).await?;
     let body_str = read_json_body(data).await?;
 
-    let (space, path, ability) = &sql_caps[0];
-    let db_name = SqlService::db_name_from_path(path.as_deref());
+    let (space, path, ability) = select_database_scope(sql_caps, "sql")?;
+    let db_name = SqlService::db_name_from_path(path);
+    let space_id = space.to_string();
 
     let sql_request: SqlRequest =
         serde_json::from_str(&body_str).map_err(|e| (Status::BadRequest, e.to_string()))?;
 
-    // Handle export specially
     if matches!(sql_request, SqlRequest::Export) {
         let data = sql_service
             .export(space, &db_name)
@@ -616,12 +601,31 @@ async fn handle_sql_invoke(
     }
 
     let response = sql_service
-        .execute(space, &db_name, sql_request, caveats, ability.clone())
+        .execute(space, &db_name, sql_request, caveats, ability.to_string())
         .await
         .map_err(|e| (sql_error_to_status(&e), e.to_string()))?;
 
-    let json =
-        serde_json::to_value(response).map_err(|e| (Status::InternalServerError, e.to_string()))?;
+    if let Some(epoch) = auth_result
+        .commits
+        .get(space)
+        .map(|commit| commit.rev.to_cid(0x55).to_string())
+    {
+        if let Ok(timestamp) = OffsetDateTime::now_utc().format(&Rfc3339) {
+            publish_database_hook_events(
+                hook_runtime,
+                &space_id,
+                "sql",
+                &db_name,
+                &actor,
+                &epoch,
+                &timestamp,
+                &response.write_targets,
+            );
+        }
+    }
+
+    let json = serde_json::to_value(response.response)
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
 
     Ok(DataOut::One(InvOut(InvocationOutcome::SqlResult(json))))
 }
@@ -646,11 +650,10 @@ async fn handle_duckdb_invoke(
     data: DataIn<'_>,
     tinycloud: &State<TinyCloud>,
     duckdb_service: &State<DuckDbService>,
+    hook_runtime: &State<HookRuntime>,
     duckdb_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
     arrow_format: bool,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
-    // SECURITY TODO: Extract caveats from delegation chain, not invocation facts. See PR review [H3].
-    // Extract caveats from the invocation facts before consuming i
     let caveats: Option<DuckDbCaveats> =
         i.0 .0
             .invocation
@@ -665,12 +668,13 @@ async fn handle_duckdb_invoke(
                 })
             });
 
-    verify_auth(i.0, tinycloud).await?;
+    let actor = i.0 .0.invoker.clone();
+    let auth_result = verify_auth(i.0, tinycloud).await?;
 
-    let (space, path, ability) = &duckdb_caps[0];
-    let db_name = DuckDbService::db_name_from_path(path.as_deref());
+    let (space, path, ability) = select_database_scope(duckdb_caps, "duckdb")?;
+    let db_name = DuckDbService::db_name_from_path(path);
+    let space_id = space.to_string();
 
-    // Handle import: binary body with application/octet-stream
     if ability == "tinycloud.duckdb/import" {
         let body_bytes = match data {
             DataIn::One(d) => {
@@ -704,7 +708,6 @@ async fn handle_duckdb_invoke(
     let duckdb_request: DuckDbRequest =
         serde_json::from_str(&body_str).map_err(|e| (Status::BadRequest, e.to_string()))?;
 
-    // Handle export specially
     if matches!(duckdb_request, DuckDbRequest::Export) {
         if caveats.is_some() {
             return Err((
@@ -725,13 +728,32 @@ async fn handle_duckdb_invoke(
             &db_name,
             duckdb_request,
             caveats,
-            ability.clone(),
+            ability.to_string(),
             arrow_format,
         )
         .await
         .map_err(|e| (duckdb_error_to_status(&e), e.to_string()))?;
 
-    match response {
+    if let Some(epoch) = auth_result
+        .commits
+        .get(space)
+        .map(|commit| commit.rev.to_cid(0x55).to_string())
+    {
+        if let Ok(timestamp) = OffsetDateTime::now_utc().format(&Rfc3339) {
+            publish_database_hook_events(
+                hook_runtime,
+                &space_id,
+                "duckdb",
+                &db_name,
+                &actor,
+                &epoch,
+                &timestamp,
+                &response.write_targets,
+            );
+        }
+    }
+
+    match response.response {
         DuckDbResponse::Arrow(data) => {
             Ok(DataOut::One(InvOut(InvocationOutcome::DuckDbArrow(data))))
         }
@@ -758,5 +780,303 @@ fn duckdb_error_to_status(err: &DuckDbError) -> Status {
         DuckDbError::ExportError(_) => Status::InternalServerError,
         DuckDbError::ImportError(_) => Status::InternalServerError,
         DuckDbError::Internal(_) => Status::InternalServerError,
+    }
+}
+
+fn publish_database_hook_events(
+    hook_runtime: &HookRuntime,
+    space: &str,
+    service: &str,
+    db_name: &str,
+    actor: &str,
+    epoch: &str,
+    timestamp: &str,
+    write_targets: &[TouchedTables],
+) {
+    let mut event_index = 0u32;
+    let ability = database_write_ability(service);
+
+    for target in write_targets {
+        let TouchedTables::Supported(tables) = target else {
+            continue;
+        };
+
+        for table in tables {
+            hook_runtime.bus().publish(WriteEvent {
+                id: format!("{epoch}:{event_index}"),
+                space: space.to_string(),
+                service: service.to_string(),
+                ability: ability.to_string(),
+                path: Some(db_table_path(db_name, table)),
+                actor: actor.to_string(),
+                epoch: epoch.to_string(),
+                event_index,
+                timestamp: timestamp.to_string(),
+            });
+            event_index += 1;
+        }
+    }
+}
+
+fn database_write_ability(service: &str) -> &'static str {
+    match service {
+        "sql" => "tinycloud.sql/write",
+        "duckdb" => "tinycloud.duckdb/write",
+        _ => "tinycloud.kv/put",
+    }
+}
+
+fn select_database_scope<'a>(
+    caps: &'a [(tinycloud_auth::resource::SpaceId, Option<String>, String)],
+    service: &str,
+) -> Result<
+    (
+        &'a tinycloud_auth::resource::SpaceId,
+        Option<&'a str>,
+        &'a str,
+    ),
+    (Status, String),
+> {
+    let Some((space, _path, ability)) = caps.first() else {
+        return Err((
+            Status::BadRequest,
+            format!("No {service} capabilities found"),
+        ));
+    };
+
+    let same_space = caps
+        .iter()
+        .all(|(candidate_space, _, _)| candidate_space == space);
+    if !same_space {
+        return Err((
+            Status::BadRequest,
+            format!("Ambiguous {service} capabilities span multiple spaces"),
+        ));
+    }
+
+    let path_ref = select_database_path(caps, service)?;
+
+    Ok((
+        space,
+        path_ref,
+        preferred_database_ability(caps, service).unwrap_or(ability.as_str()),
+    ))
+}
+
+fn select_database_path<'a>(
+    caps: &'a [(tinycloud_auth::resource::SpaceId, Option<String>, String)],
+    service: &str,
+) -> Result<Option<&'a str>, (Status, String)> {
+    let mut selected_path = None;
+
+    for (_, candidate_path, _) in caps {
+        let Some(candidate_path) = candidate_path.as_deref() else {
+            continue;
+        };
+
+        match selected_path {
+            None => selected_path = Some(candidate_path),
+            Some(selected) if selected == candidate_path => {}
+            Some(_) => {
+                return Err((
+                    Status::BadRequest,
+                    format!("Ambiguous {service} capabilities span multiple database paths"),
+                ));
+            }
+        }
+    }
+
+    Ok(selected_path)
+}
+
+fn preferred_database_ability<'a>(
+    caps: &'a [(tinycloud_auth::resource::SpaceId, Option<String>, String)],
+    service: &str,
+) -> Option<&'a str> {
+    let preferred_abilities: &[&str] = match service {
+        "sql" => &[
+            "tinycloud.sql/write",
+            "tinycloud.sql/admin",
+            "tinycloud.sql/*",
+            "tinycloud.sql/read",
+            "tinycloud.sql/select",
+        ],
+        "duckdb" => &[
+            "tinycloud.duckdb/write",
+            "tinycloud.duckdb/admin",
+            "tinycloud.duckdb/*",
+            "tinycloud.duckdb/import",
+            "tinycloud.duckdb/export",
+            "tinycloud.duckdb/read",
+            "tinycloud.duckdb/select",
+        ],
+        _ => &[],
+    };
+
+    preferred_abilities.iter().find_map(|preferred| {
+        caps.iter()
+            .find(|(_, _, ability)| ability.as_str() == *preferred)
+            .map(|(_, _, ability)| ability.as_str())
+    })
+}
+
+/// Verify authorization by invoking with empty inputs.
+///
+/// Shared by SQL and DuckDB invoke handlers. The caller must extract caveats
+/// from `i` before calling this, since the invocation tuple is consumed here.
+/// Hook events are only emitted after the service returns Ok. If a batch or
+/// schema block partially applies and then fails, MVP does not emit hooks for
+/// the partial write set.
+async fn verify_auth(
+    invocation: Invocation,
+    tinycloud: &State<TinyCloud>,
+) -> Result<TransactResult, (Status, String)> {
+    tinycloud
+        .invoke::<BlockStage>(invocation, HashMap::new())
+        .await
+        .map_err(|e| {
+            (
+                match e {
+                    TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
+                    TxStoreError::Tx(TxError::Db(DbErr::ConnectionAcquire(_))) => {
+                        Status::InternalServerError
+                    }
+                    _ => Status::Unauthorized,
+                },
+                e.to_string(),
+            )
+        })
+        .map(|(tx_result, _)| tx_result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::HooksConfig;
+    use tinycloud_auth::{
+        resolver::DID_METHODS,
+        resource::SpaceId,
+        ssi::{dids::DIDBuf, jwk::JWK},
+    };
+    use tokio::time::{timeout, Duration};
+
+    fn test_space_id(name: &str) -> SpaceId {
+        let jwk = JWK::generate_ed25519().unwrap();
+        let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
+        SpaceId::new(did, name.parse().unwrap())
+    }
+
+    #[tokio::test]
+    async fn publish_database_hook_events_emits_table_paths() {
+        let hook_runtime = HookRuntime::new(HooksConfig::default(), [7u8; 32]);
+        let mut receiver = hook_runtime.bus().subscribe();
+
+        publish_database_hook_events(
+            &hook_runtime,
+            "tinycloud:space",
+            "sql",
+            "main.db",
+            "did:key:test",
+            "epoch",
+            "2026-01-01T00:00:00Z",
+            &[
+                TouchedTables::supported(vec!["users".to_string(), "orders".to_string()]),
+                TouchedTables::unsupported(),
+                TouchedTables::supported(vec!["audit".to_string()]),
+            ],
+        );
+
+        let first = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let third = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first.path.as_deref(), Some("main.db/users"));
+        assert_eq!(first.ability, "tinycloud.sql/write");
+        assert_eq!(first.event_index, 0);
+        assert_eq!(second.path.as_deref(), Some("main.db/orders"));
+        assert_eq!(second.ability, "tinycloud.sql/write");
+        assert_eq!(second.event_index, 1);
+        assert_eq!(third.path.as_deref(), Some("main.db/audit"));
+        assert_eq!(third.ability, "tinycloud.sql/write");
+        assert_eq!(third.event_index, 2);
+    }
+
+    #[tokio::test]
+    async fn publish_database_hook_events_uses_canonical_duckdb_write_ability() {
+        let hook_runtime = HookRuntime::new(HooksConfig::default(), [8u8; 32]);
+        let mut receiver = hook_runtime.bus().subscribe();
+
+        publish_database_hook_events(
+            &hook_runtime,
+            "tinycloud:space",
+            "duckdb",
+            "analytics.duckdb",
+            "did:key:test",
+            "epoch",
+            "2026-01-01T00:00:00Z",
+            &[TouchedTables::supported(vec!["events".to_string()])],
+        );
+
+        let event = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(event.ability, "tinycloud.duckdb/write");
+        assert_eq!(event.path.as_deref(), Some("analytics.duckdb/events"));
+    }
+
+    #[tokio::test]
+    async fn select_database_scope_prefers_exact_path_over_wildcard_scope() {
+        let space = test_space_id("alpha");
+        let caps = vec![
+            (space.clone(), None, "tinycloud.sql/read".to_string()),
+            (
+                space.clone(),
+                Some("main.db".to_string()),
+                "tinycloud.sql/write".to_string(),
+            ),
+        ];
+
+        let (selected_space, selected_path, ability) = select_database_scope(&caps, "sql").unwrap();
+
+        assert_eq!(selected_space, &space);
+        assert_eq!(selected_path, Some("main.db"));
+        assert_eq!(ability, "tinycloud.sql/write");
+    }
+
+    #[tokio::test]
+    async fn select_database_scope_rejects_multiple_exact_paths() {
+        let space = test_space_id("alpha");
+        let caps = vec![
+            (
+                space.clone(),
+                Some("main.db".to_string()),
+                "tinycloud.sql/write".to_string(),
+            ),
+            (
+                space,
+                Some("analytics.db".to_string()),
+                "tinycloud.sql/write".to_string(),
+            ),
+        ];
+
+        let err =
+            select_database_scope(&caps, "sql").expect_err("multiple paths should be rejected");
+
+        assert_eq!(err.0, Status::BadRequest);
+        assert_eq!(
+            err.1,
+            "Ambiguous sql capabilities span multiple database paths"
+        );
     }
 }

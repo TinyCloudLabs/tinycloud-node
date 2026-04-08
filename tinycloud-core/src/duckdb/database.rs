@@ -19,7 +19,7 @@ enum DbMessage {
         caveats: Option<DuckDbCaveats>,
         ability: String,
         arrow_format: bool,
-        response_tx: oneshot::Sender<Result<DuckDbResponse, DuckDbError>>,
+        response_tx: oneshot::Sender<Result<DuckDbExecutionResult, DuckDbError>>,
     },
     Export {
         response_tx: oneshot::Sender<Result<Vec<u8>, DuckDbError>>,
@@ -38,7 +38,7 @@ impl DatabaseHandle {
         caveats: Option<DuckDbCaveats>,
         ability: String,
         arrow_format: bool,
-    ) -> Result<DuckDbResponse, DuckDbError> {
+    ) -> Result<DuckDbExecutionResult, DuckDbError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
             .send(DbMessage::Execute {
@@ -205,15 +205,21 @@ fn handle_message(
     caveats: &Option<DuckDbCaveats>,
     ability: &str,
     arrow_format: bool,
-) -> Result<DuckDbResponse, DuckDbError> {
+) -> Result<DuckDbExecutionResult, DuckDbError> {
     // No authorizer in DuckDB -- parser is the sole defense
     match request {
         DuckDbRequest::Query { sql, params } => {
-            parser::validate_sql(sql, caveats, ability)?;
+            let parsed = parser::validate_sql(sql, caveats, ability)?;
             if arrow_format {
-                execute_query_arrow(conn, sql, params).map(DuckDbResponse::Arrow)
+                execute_query_arrow(conn, sql, params).map(|response| DuckDbExecutionResult {
+                    response: DuckDbResponse::Arrow(response),
+                    write_targets: parsed.write_targets,
+                })
             } else {
-                execute_query(conn, sql, params).map(DuckDbResponse::Query)
+                execute_query(conn, sql, params).map(|response| DuckDbExecutionResult {
+                    response: DuckDbResponse::Query(response),
+                    write_targets: parsed.write_targets,
+                })
             }
         }
         DuckDbRequest::Execute {
@@ -221,32 +227,50 @@ fn handle_message(
             params,
             schema,
         } => {
+            let mut write_targets = Vec::new();
             // Schema init
             if let Some(schema_stmts) = schema {
                 for stmt_sql in schema_stmts {
-                    parser::validate_sql(stmt_sql, caveats, ability)?;
+                    let parsed = parser::validate_sql(stmt_sql, caveats, ability)?;
+                    write_targets.extend(parsed.write_targets);
                     conn.execute_batch(stmt_sql)
                         .map_err(|e| DuckDbError::SchemaError(e.to_string()))?;
                 }
             }
 
-            parser::validate_sql(sql, caveats, ability)?;
-            execute_statement(conn, sql, params).map(DuckDbResponse::Execute)
+            let parsed = parser::validate_sql(sql, caveats, ability)?;
+            execute_statement(conn, sql, params).map(|response| {
+                write_targets.extend(parsed.write_targets);
+                DuckDbExecutionResult {
+                    response: DuckDbResponse::Execute(response),
+                    write_targets,
+                }
+            })
         }
         DuckDbRequest::Batch {
             statements,
             transactional,
         } => {
+            let mut write_targets = Vec::new();
+            // Hooks are emitted only after this branch returns Ok to the caller.
+            // If a later statement fails after some earlier statements applied,
+            // MVP intentionally under-emits rather than guessing partial success.
             for stmt in statements {
-                parser::validate_sql(&stmt.sql, caveats, ability)?;
+                let parsed = parser::validate_sql(&stmt.sql, caveats, ability)?;
+                write_targets.extend(parsed.write_targets);
             }
 
-            if *transactional {
+            let response = if *transactional {
                 execute_batch_transactional(conn, statements)
             } else {
                 execute_batch(conn, statements)
             }
-            .map(DuckDbResponse::Batch)
+            .map(DuckDbResponse::Batch)?;
+
+            Ok(DuckDbExecutionResult {
+                response,
+                write_targets,
+            })
         }
         DuckDbRequest::ExecuteStatement { name, params } => {
             let caveats_ref = caveats
@@ -256,9 +280,9 @@ fn handle_message(
                 DuckDbError::InvalidStatement(format!("Statement '{}' not found", name))
             })?;
 
-            parser::validate_sql(&prepared.sql, caveats, ability)?;
+            let parsed = parser::validate_sql(&prepared.sql, caveats, ability)?;
 
-            if prepared
+            let response = if prepared
                 .sql
                 .trim_start()
                 .to_uppercase()
@@ -267,10 +291,18 @@ fn handle_message(
                 execute_query(conn, &prepared.sql, params).map(DuckDbResponse::Query)
             } else {
                 execute_statement(conn, &prepared.sql, params).map(DuckDbResponse::Execute)
-            }
+            }?;
+
+            Ok(DuckDbExecutionResult {
+                response,
+                write_targets: parsed.write_targets,
+            })
         }
         DuckDbRequest::Describe => {
-            describe::describe_schema(conn, caveats).map(DuckDbResponse::Describe)
+            describe::describe_schema(conn, caveats).map(|response| DuckDbExecutionResult {
+                response: DuckDbResponse::Describe(response),
+                write_targets: Vec::new(),
+            })
         }
         DuckDbRequest::Ingest { .. } => Err(DuckDbError::Internal(
             "KV bridge not yet available".to_string(),

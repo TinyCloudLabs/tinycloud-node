@@ -4,11 +4,19 @@ use sqlparser::parser::Parser;
 
 use super::caveats::DuckDbCaveats;
 use super::types::DuckDbError;
+use crate::write_hooks::TouchedTables;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteTargets {
+    Supported(Vec<String>),
+    Unsupported,
+}
 
 pub struct ParsedQuery {
     pub statements: Vec<Statement>,
     pub referenced_tables: Vec<String>,
     pub referenced_columns: Vec<String>,
+    pub write_targets: Vec<TouchedTables>,
     pub is_read_only: bool,
     pub is_ddl: bool,
 }
@@ -38,6 +46,7 @@ pub fn validate_sql(
 
             let mut tables = Vec::new();
             let mut columns = Vec::new();
+            let mut write_targets = Vec::new();
             let mut is_read_only = true;
             let mut is_ddl = false;
 
@@ -49,6 +58,9 @@ pub fn validate_sql(
                     &mut is_read_only,
                     &mut is_ddl,
                 );
+                if let Some(targets) = extract_write_targets_from_statement(stmt) {
+                    write_targets.push(targets);
+                }
             }
 
             // Still apply caveat table/column checks
@@ -61,6 +73,7 @@ pub fn validate_sql(
                 statements,
                 referenced_tables: tables,
                 referenced_columns: columns,
+                write_targets,
                 is_read_only,
                 is_ddl,
             });
@@ -78,6 +91,7 @@ pub fn validate_sql(
 
     let mut tables = Vec::new();
     let mut columns = Vec::new();
+    let mut write_targets = Vec::new();
     let mut is_read_only = true;
     let mut is_ddl = false;
 
@@ -96,6 +110,9 @@ pub fn validate_sql(
             &mut is_read_only,
             &mut is_ddl,
         );
+        if let Some(targets) = extract_write_targets_from_statement(stmt) {
+            write_targets.push(targets);
+        }
     }
 
     // Function blocklist (defense in depth)
@@ -124,9 +141,107 @@ pub fn validate_sql(
         statements,
         referenced_tables: tables,
         referenced_columns: columns,
+        write_targets,
         is_read_only,
         is_ddl,
     })
+}
+
+pub fn extract_write_targets(sql: &str) -> Result<WriteTargets, DuckDbError> {
+    let dialect = GenericDialect {};
+    let statements =
+        Parser::parse_sql(&dialect, sql).map_err(|e| DuckDbError::ParseError(e.to_string()))?;
+
+    if statements.is_empty() {
+        return Err(DuckDbError::ParseError("Empty SQL statement".to_string()));
+    }
+
+    let mut tables = Vec::new();
+    let mut saw_supported_write = false;
+
+    for stmt in &statements {
+        match collect_write_targets_from_statement(stmt, &mut tables) {
+            CollectWriteTargets::Supported => saw_supported_write = true,
+            CollectWriteTargets::Unsupported => return Ok(WriteTargets::Unsupported),
+        }
+    }
+
+    if !saw_supported_write || tables.is_empty() {
+        return Ok(WriteTargets::Unsupported);
+    }
+
+    tables.sort();
+    tables.dedup();
+    Ok(WriteTargets::Supported(tables))
+}
+
+enum CollectWriteTargets {
+    Supported,
+    Unsupported,
+}
+
+fn collect_write_targets_from_statement(
+    stmt: &Statement,
+    tables: &mut Vec<String>,
+) -> CollectWriteTargets {
+    match stmt {
+        Statement::Insert { table_name, .. } => {
+            tables.push(table_name.to_string());
+            CollectWriteTargets::Supported
+        }
+        Statement::Update { table, .. } => {
+            if let Some(name) = table_target_name(table) {
+                tables.push(name);
+                CollectWriteTargets::Supported
+            } else {
+                CollectWriteTargets::Unsupported
+            }
+        }
+        Statement::Delete { from, .. } => match from {
+            FromTable::WithFromKeyword(from_items) | FromTable::WithoutKeyword(from_items) => {
+                if from_items.len() != 1 {
+                    return CollectWriteTargets::Unsupported;
+                }
+
+                if let Some(name) = table_target_name(&from_items[0]) {
+                    tables.push(name);
+                    CollectWriteTargets::Supported
+                } else {
+                    CollectWriteTargets::Unsupported
+                }
+            }
+        },
+        Statement::CreateTable { name, .. } => {
+            tables.push(name.to_string());
+            CollectWriteTargets::Supported
+        }
+        Statement::CreateView { name, .. } => {
+            tables.push(name.to_string());
+            CollectWriteTargets::Supported
+        }
+        Statement::AlterTable { name, .. } => {
+            tables.push(name.to_string());
+            CollectWriteTargets::Supported
+        }
+        Statement::Drop { names, .. } => {
+            for name in names {
+                tables.push(name.to_string());
+            }
+            CollectWriteTargets::Supported
+        }
+        Statement::CreateIndex { table_name, .. } => {
+            tables.push(table_name.to_string());
+            CollectWriteTargets::Supported
+        }
+        _ => CollectWriteTargets::Unsupported,
+    }
+}
+
+fn table_target_name(table: &TableWithJoins) -> Option<String> {
+    match &table.relation {
+        TableFactor::Table { name, .. } => Some(name.to_string()),
+        _ => None,
+    }
 }
 
 /// Classify a statement: extract tables/columns, set read_only/ddl flags.
@@ -468,10 +583,75 @@ fn extract_columns_from_query(query: &Query, columns: &mut Vec<String>) {
     }
 }
 
+pub fn extract_write_targets_from_statement(stmt: &Statement) -> Option<TouchedTables> {
+    match stmt {
+        Statement::Insert { table_name, .. } => {
+            Some(TouchedTables::supported(vec![table_name.to_string()]))
+        }
+        Statement::Update { table, .. } => extract_write_target_from_update(table),
+        Statement::Delete { tables, from, .. } => extract_write_target_from_delete(tables, from),
+        Statement::CreateTable { name, .. }
+        | Statement::AlterTable { name, .. }
+        | Statement::CreateView { name, .. } => {
+            Some(TouchedTables::supported(vec![name.to_string()]))
+        }
+        Statement::Drop { names, .. } => Some(TouchedTables::supported(unique_names(
+            names.iter().map(ToString::to_string).collect(),
+        ))),
+        Statement::CreateIndex { table_name, .. } => {
+            Some(TouchedTables::supported(vec![table_name.to_string()]))
+        }
+        _ => None,
+    }
+}
+
+fn extract_write_target_from_update(table: &TableWithJoins) -> Option<TouchedTables> {
+    match &table.relation {
+        TableFactor::Table { name, .. } => Some(TouchedTables::supported(vec![name.to_string()])),
+        _ => Some(TouchedTables::unsupported()),
+    }
+}
+
+fn extract_write_target_from_delete(
+    tables: &[ObjectName],
+    from: &FromTable,
+) -> Option<TouchedTables> {
+    if !tables.is_empty() {
+        return Some(TouchedTables::supported(unique_names(
+            tables.iter().map(ToString::to_string).collect(),
+        )));
+    }
+
+    let relation = match from {
+        FromTable::WithFromKeyword(from_items) | FromTable::WithoutKeyword(from_items) => {
+            if from_items.len() != 1 {
+                return Some(TouchedTables::unsupported());
+            }
+            &from_items[0].relation
+        }
+    };
+
+    match relation {
+        TableFactor::Table { name, .. } => Some(TouchedTables::supported(vec![name.to_string()])),
+        _ => Some(TouchedTables::unsupported()),
+    }
+}
+
+fn unique_names(names: Vec<String>) -> Vec<String> {
+    let mut unique = Vec::new();
+    for name in names {
+        if !unique.contains(&name) {
+            unique.push(name);
+        }
+    }
+    unique
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::caveats::{DuckDbCaveats, PreparedStatement};
     use super::*;
+    use crate::write_hooks::TouchedTables;
 
     #[test]
     fn test_select_allowed() {
@@ -701,5 +881,35 @@ mod tests {
             "tinycloud.duckdb/read"
         )
         .is_err());
+    }
+
+    #[test]
+    fn test_update_write_targets_only_include_target_table() {
+        let result = validate_sql(
+            "UPDATE users SET name = 'test'",
+            &None,
+            "tinycloud.duckdb/write",
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.write_targets,
+            vec![TouchedTables::supported(vec!["users".to_string()])]
+        );
+    }
+
+    #[test]
+    fn test_delete_write_targets_use_target_table_list() {
+        let result = validate_sql(
+            "DELETE FROM users WHERE id = 1",
+            &None,
+            "tinycloud.duckdb/write",
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.write_targets,
+            vec![TouchedTables::supported(vec!["users".to_string()])]
+        );
     }
 }

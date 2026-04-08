@@ -4,11 +4,13 @@ use sqlparser::parser::Parser;
 
 use super::caveats::SqlCaveats;
 use super::types::SqlError;
+use crate::write_hooks::TouchedTables;
 
 pub struct ParsedQuery {
     pub statements: Vec<Statement>,
     pub referenced_tables: Vec<String>,
     pub referenced_columns: Vec<String>,
+    pub write_targets: Vec<TouchedTables>,
     pub is_read_only: bool,
     pub is_ddl: bool,
 }
@@ -28,6 +30,7 @@ pub fn validate_sql(
 
     let mut tables = Vec::new();
     let mut columns = Vec::new();
+    let mut write_targets = Vec::new();
     let mut is_read_only = true;
     let mut is_ddl = false;
 
@@ -40,15 +43,24 @@ pub fn validate_sql(
             Statement::Insert { .. } => {
                 is_read_only = false;
                 extract_tables_from_statement(stmt, &mut tables);
+                if let Some(targets) = extract_write_targets_from_statement(stmt) {
+                    write_targets.push(targets);
+                }
             }
             Statement::Update { .. } => {
                 is_read_only = false;
                 extract_tables_from_statement(stmt, &mut tables);
                 extract_columns_from_statement(stmt, &mut columns);
+                if let Some(targets) = extract_write_targets_from_statement(stmt) {
+                    write_targets.push(targets);
+                }
             }
             Statement::Delete { .. } => {
                 is_read_only = false;
                 extract_tables_from_statement(stmt, &mut tables);
+                if let Some(targets) = extract_write_targets_from_statement(stmt) {
+                    write_targets.push(targets);
+                }
             }
             Statement::CreateTable { .. }
             | Statement::AlterTable { .. }
@@ -57,6 +69,9 @@ pub fn validate_sql(
                 is_read_only = false;
                 is_ddl = true;
                 extract_tables_from_statement(stmt, &mut tables);
+                if let Some(targets) = extract_write_targets_from_statement(stmt) {
+                    write_targets.push(targets);
+                }
             }
             Statement::AttachDatabase { .. } => {
                 return Err(SqlError::PermissionDenied(
@@ -120,6 +135,7 @@ pub fn validate_sql(
         statements,
         referenced_tables: tables,
         referenced_columns: columns,
+        write_targets,
         is_read_only,
         is_ddl,
     })
@@ -230,5 +246,91 @@ fn extract_columns_from_query(query: &Query, columns: &mut Vec<String>) {
                 columns.push(ident.value.clone());
             }
         }
+    }
+}
+
+pub fn extract_write_targets_from_statement(stmt: &Statement) -> Option<TouchedTables> {
+    match stmt {
+        Statement::Insert { table_name, .. } => {
+            Some(TouchedTables::supported(vec![table_name.to_string()]))
+        }
+        Statement::Update { table, .. } => extract_write_target_from_update(table),
+        Statement::Delete { tables, from, .. } => extract_write_target_from_delete(tables, from),
+        Statement::CreateTable { name, .. } | Statement::AlterTable { name, .. } => {
+            Some(TouchedTables::supported(vec![name.to_string()]))
+        }
+        Statement::Drop { names, .. } => Some(TouchedTables::supported(unique_names(
+            names.iter().map(ToString::to_string).collect(),
+        ))),
+        Statement::CreateIndex { table_name, .. } => {
+            Some(TouchedTables::supported(vec![table_name.to_string()]))
+        }
+        _ => None,
+    }
+}
+
+fn extract_write_target_from_update(table: &TableWithJoins) -> Option<TouchedTables> {
+    match &table.relation {
+        TableFactor::Table { name, .. } => Some(TouchedTables::supported(vec![name.to_string()])),
+        _ => Some(TouchedTables::unsupported()),
+    }
+}
+
+fn extract_write_target_from_delete(
+    tables: &[ObjectName],
+    from: &FromTable,
+) -> Option<TouchedTables> {
+    if !tables.is_empty() {
+        return Some(TouchedTables::supported(unique_names(
+            tables.iter().map(ToString::to_string).collect(),
+        )));
+    }
+
+    let relation = match from {
+        FromTable::WithFromKeyword(from_items) | FromTable::WithoutKeyword(from_items) => {
+            if from_items.len() != 1 {
+                return Some(TouchedTables::unsupported());
+            }
+            &from_items[0].relation
+        }
+    };
+
+    match relation {
+        TableFactor::Table { name, .. } => Some(TouchedTables::supported(vec![name.to_string()])),
+        _ => Some(TouchedTables::unsupported()),
+    }
+}
+
+fn unique_names(names: Vec<String>) -> Vec<String> {
+    let mut unique = Vec::new();
+    for name in names {
+        if !unique.contains(&name) {
+            unique.push(name);
+        }
+    }
+    unique
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::write_hooks::TouchedTables;
+
+    #[test]
+    fn update_write_targets_only_include_target_table() {
+        let dialect = SQLiteDialect {};
+        let statements = Parser::parse_sql(&dialect, "UPDATE users SET name = 'test'").unwrap();
+
+        let targets = extract_write_targets_from_statement(&statements[0]).unwrap();
+        assert_eq!(targets, TouchedTables::supported(vec!["users".to_string()]));
+    }
+
+    #[test]
+    fn delete_write_targets_use_target_table_list() {
+        let dialect = SQLiteDialect {};
+        let statements = Parser::parse_sql(&dialect, "DELETE FROM users WHERE id = 1").unwrap();
+
+        let targets = extract_write_targets_from_statement(&statements[0]).unwrap();
+        assert_eq!(targets, TouchedTables::supported(vec!["users".to_string()]));
     }
 }

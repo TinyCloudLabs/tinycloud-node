@@ -31,7 +31,7 @@ impl SqlService {
         request: SqlRequest,
         caveats: Option<SqlCaveats>,
         ability: String,
-    ) -> Result<SqlResponse, SqlError> {
+    ) -> Result<SqlExecutionResult, SqlError> {
         let key = (space.to_string(), db_name.to_string());
         let handle = self
             .databases

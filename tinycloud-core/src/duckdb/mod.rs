@@ -9,6 +9,6 @@ pub mod types;
 pub use caveats::DuckDbCaveats;
 pub use service::DuckDbService;
 pub use types::{
-    BatchResponse, DuckDbError, DuckDbRequest, DuckDbResponse, DuckDbValue, ExecuteResponse,
-    QueryResponse,
+    BatchResponse, DuckDbError, DuckDbExecutionResult, DuckDbRequest, DuckDbResponse, DuckDbValue,
+    ExecuteResponse, QueryResponse,
 };

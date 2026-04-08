@@ -7,8 +7,9 @@ use crate::{
     TinyCloud,
 };
 use rocket::{
-    get, post,
+    get,
     http::Status,
+    post,
     response::stream::{Event, EventStream},
     serde::json::Json,
     State,
@@ -18,8 +19,8 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_core::{
     hash::Hash,
     models::delegation,
-    types::Resource,
     sea_orm::{ColumnTrait, EntityTrait, QueryFilter},
+    types::Resource,
     util::InvocationInfo,
 };
 
@@ -30,9 +31,14 @@ pub async fn create_hook_ticket(
     hooks: &State<HookRuntime>,
     tinycloud: &State<TinyCloud>,
 ) -> Result<Json<HookTicketResponse>, (Status, String)> {
-    mint_hook_ticket(&invocation.0.0, request.into_inner(), hooks.inner(), tinycloud.inner())
-        .await
-        .map(Json)
+    mint_hook_ticket(
+        &invocation.0 .0,
+        request.into_inner(),
+        hooks.inner(),
+        tinycloud.inner(),
+    )
+    .await
+    .map(Json)
 }
 
 pub async fn mint_hook_ticket(
@@ -42,17 +48,26 @@ pub async fn mint_hook_ticket(
     tinycloud: &TinyCloud,
 ) -> Result<HookTicketResponse, (Status, String)> {
     if request.subscriptions.is_empty() {
-        return Err((Status::BadRequest, "at least one subscription is required".to_string()));
+        return Err((
+            Status::BadRequest,
+            "at least one subscription is required".to_string(),
+        ));
     }
     if request.subscriptions.len() > hooks.config().max_scopes_per_ticket {
-        return Err((Status::BadRequest, "too many requested hook scopes".to_string()));
+        return Err((
+            Status::BadRequest,
+            "too many requested hook scopes".to_string(),
+        ));
     }
 
     for subscription in &mut request.subscriptions {
         subscription.path_prefix = normalize_path_prefix(subscription.path_prefix.take());
         validate_subscription(subscription)?;
         if !is_subscription_authorized(&invocation, subscription) {
-            return Err((Status::Forbidden, "requested hook scope is not authorized".to_string()));
+            return Err((
+                Status::Forbidden,
+                "requested hook scope is not authorized".to_string(),
+            ));
         }
     }
 
@@ -71,7 +86,10 @@ pub async fn mint_hook_ticket(
         .min(parent_exp);
 
     if exp <= now.unix_timestamp() {
-        return Err((Status::Unauthorized, "hook ticket expired immediately".to_string()));
+        return Err((
+            Status::Unauthorized,
+            "hook ticket expired immediately".to_string(),
+        ));
     }
 
     let claims = HookTicketClaims {
@@ -120,7 +138,7 @@ pub async fn hook_events<'r>(
 
     Ok(EventStream! {
         let _lease = lease;
-        let mut deadline_sleep = rocket::tokio::time::sleep(sleep_duration);
+        let deadline_sleep = rocket::tokio::time::sleep(sleep_duration);
         rocket::tokio::pin!(deadline_sleep);
 
         loop {
@@ -152,40 +170,51 @@ pub async fn hook_events<'r>(
 }
 
 fn validate_subscription(subscription: &HookSubscription) -> Result<(), (Status, String)> {
-    if subscription.service.as_str() != "kv" {
-        return Err((Status::BadRequest, "Phase 1 only supports kv hooks".to_string()));
+    if !matches!(subscription.service.as_str(), "kv" | "sql" | "duckdb") {
+        return Err((Status::BadRequest, "Unsupported hook service".to_string()));
     }
 
-    let expected_prefix = "tinycloud.kv/";
+    let allowed_abilities: &[&str] = match subscription.service.as_str() {
+        "kv" => &["tinycloud.kv/put", "tinycloud.kv/del"],
+        "sql" => &["tinycloud.sql/write"],
+        "duckdb" => &["tinycloud.duckdb/write"],
+        _ => unreachable!(),
+    };
 
     if subscription
         .abilities
         .iter()
-        .any(|ability| !ability.starts_with(expected_prefix))
+        .any(|ability| !allowed_abilities.contains(&ability.as_str()))
     {
-        return Err((Status::BadRequest, "hook ability filter does not match service".to_string()));
+        return Err((
+            Status::BadRequest,
+            "hook ability filter does not match service".to_string(),
+        ));
     }
 
     Ok(())
 }
 
-fn is_subscription_authorized(invocation: &InvocationInfo, subscription: &HookSubscription) -> bool {
-    let requested_scope = hook_scope_path(
-        &subscription.service,
-        subscription.path_prefix.as_deref(),
-    );
+fn is_subscription_authorized(
+    invocation: &InvocationInfo,
+    subscription: &HookSubscription,
+) -> bool {
+    let requested_scope =
+        hook_scope_path(&subscription.service, subscription.path_prefix.as_deref());
 
-    invocation.capabilities.iter().any(|capability| match (&capability.resource, capability.ability.as_ref().as_ref()) {
-        (Resource::TinyCloud(resource), "tinycloud.hooks/subscribe")
-            if resource.service().as_str() == "hooks"
-                && resource.space().to_string() == subscription.space =>
-        {
-            match resource.path() {
-                Some(path) => scope_extends(&requested_scope, &path.to_string()),
-                None => true,
+    invocation.capabilities.iter().any(|capability| {
+        match (&capability.resource, capability.ability.as_ref().as_ref()) {
+            (Resource::TinyCloud(resource), "tinycloud.hooks/subscribe")
+                if resource.service().as_str() == "hooks"
+                    && resource.space().to_string() == subscription.space =>
+            {
+                match resource.path() {
+                    Some(path) => scope_extends(&requested_scope, &path.to_string()),
+                    None => true,
+                }
             }
+            _ => false,
         }
-        _ => false,
     })
 }
 
@@ -195,7 +224,12 @@ fn scope_extends(requested_scope: &str, authorized_scope: &str) -> bool {
 }
 
 fn invocation_expiry(invocation: &InvocationInfo) -> Result<i64, (Status, String)> {
-    Ok(invocation.invocation.payload().expiration.as_seconds().floor() as i64)
+    Ok(invocation
+        .invocation
+        .payload()
+        .expiration
+        .as_seconds()
+        .floor() as i64)
 }
 
 async fn find_parent_expiry(
@@ -211,7 +245,11 @@ async fn find_parent_expiry(
         .await
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
 
-    let parent_ids: Vec<Hash> = invocation.parents.iter().map(|cid| Hash::from(*cid)).collect();
+    let parent_ids: Vec<Hash> = invocation
+        .parents
+        .iter()
+        .map(|cid| Hash::from(*cid))
+        .collect();
 
     let expiries = delegation::Entity::find()
         .filter(delegation::Column::Id.is_in(parent_ids))
@@ -229,10 +267,8 @@ async fn find_parent_expiry(
 mod tests {
     use super::*;
     use crate::{
-        config::HooksConfig,
-        hooks::HookRuntime,
-        storage::file_system::FileSystemConfig as NodeFileSystemConfig,
-        TinyCloud,
+        config::HooksConfig, hooks::HookRuntime,
+        storage::file_system::FileSystemConfig as NodeFileSystemConfig, TinyCloud,
     };
     use anyhow::Result;
     use rocket::http::Status;
@@ -249,8 +285,8 @@ mod tests {
     use tinycloud_core::{
         keys::StaticSecret,
         sea_orm::{ConnectOptions, Database},
-        storage::StorageConfig as _,
         storage::either::Either,
+        storage::StorageConfig as _,
         util::InvocationInfo as CoreInvocationInfo,
     };
 
@@ -262,18 +298,16 @@ mod tests {
         let tempdir = TempDir::new()?;
         let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
-        let _persisted = tempdir.into_path();
-        Ok(
-            TinyCloud::new(
-                db,
-                Either::B(storage),
-                StaticSecret::new(vec![0u8; 32]).unwrap(),
-            )
-            .await?,
+        let _persisted = tempdir.keep();
+        Ok(TinyCloud::new(
+            db,
+            Either::B(storage),
+            StaticSecret::new(vec![0u8; 32]).unwrap(),
         )
+        .await?)
     }
 
-    fn test_invocation() -> Result<(CoreInvocationInfo, String)> {
+    fn test_invocation(hook_path: &str) -> Result<(CoreInvocationInfo, String)> {
         let jwk = JWK::generate_ed25519()?;
         let mut verification_method = DID_METHODS.generate(&jwk, "key")?.to_string();
         let fragment = verification_method
@@ -291,18 +325,19 @@ mod tests {
             .parse()?;
         let space = SpaceId::new(did, "alpha".parse()?);
         let space_string = space.to_string();
-        let hook_resource: ResourceId = space
-            .clone()
-            .to_resource(
-                "hooks".parse::<Service>()?,
-                Some("kv/documents".parse::<Path>()?),
-                None,
-                None,
-            );
+        let hook_resource: ResourceId = space.clone().to_resource(
+            "hooks".parse::<Service>()?,
+            Some(hook_path.parse::<Path>()?),
+            None,
+            None,
+        );
 
         let delegation = Cid::new_v1(0x55, Code::Blake3_256.digest(b"delegation"));
         let invocation = make_invocation(
-            vec![(hook_resource, vec!["tinycloud.hooks/subscribe".parse::<Ability>()?])],
+            vec![(
+                hook_resource,
+                vec!["tinycloud.hooks/subscribe".parse::<Ability>()?],
+            )],
             &delegation,
             &jwk,
             &verification_method,
@@ -317,7 +352,7 @@ mod tests {
     async fn mints_ticket_for_authorized_scope() -> Result<()> {
         let tinycloud = test_tinycloud().await?;
         let hooks = test_hook_runtime();
-        let (invocation, space) = test_invocation()?;
+        let (invocation, space) = test_invocation("kv/documents")?;
         let request = HookTicketRequest {
             subscriptions: vec![HookSubscription {
                 space,
@@ -340,10 +375,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mints_ticket_for_sql_scope() -> Result<()> {
+        let tinycloud = test_tinycloud().await?;
+        let hooks = test_hook_runtime();
+        let (invocation, space) = test_invocation("sql/main.db")?;
+        let request = HookTicketRequest {
+            subscriptions: vec![HookSubscription {
+                space,
+                service: "sql".to_string(),
+                path_prefix: Some("main.db".to_string()),
+                abilities: vec!["tinycloud.sql/write".to_string()],
+            }],
+            ttl_seconds: Some(60),
+        };
+
+        let response = mint_hook_ticket(&invocation, request, &hooks, &tinycloud)
+            .await
+            .expect("ticket");
+        let claims = hooks.verify_ticket(&response.ticket).unwrap();
+        assert_eq!(claims.scopes[0].service, "sql");
+        assert_eq!(claims.scopes[0].path_prefix.as_deref(), Some("main.db"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rejects_partially_authorized_ticket_requests() -> Result<()> {
         let tinycloud = test_tinycloud().await?;
         let hooks = test_hook_runtime();
-        let (invocation, space) = test_invocation()?;
+        let (invocation, space) = test_invocation("kv/documents")?;
 
         let request = HookTicketRequest {
             subscriptions: vec![
@@ -374,7 +433,7 @@ mod tests {
     async fn rejects_wrong_space_subscription() -> Result<()> {
         let tinycloud = test_tinycloud().await?;
         let hooks = test_hook_runtime();
-        let (invocation, _space) = test_invocation()?;
+        let (invocation, _space) = test_invocation("kv/documents")?;
         let request = HookTicketRequest {
             subscriptions: vec![HookSubscription {
                 space: "tinycloud:other-space".to_string(),
@@ -393,14 +452,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_non_kv_phase1_subscriptions() {
+    async fn rejects_unknown_hook_service() {
+        let err = validate_subscription(&HookSubscription {
+            space: "tinycloud:space".to_string(),
+            service: "ftp".to_string(),
+            path_prefix: Some("main".to_string()),
+            abilities: vec!["tinycloud.ftp/execute".to_string()],
+        })
+        .expect_err("invalid service should be rejected");
+
+        assert_eq!(err.0, Status::BadRequest);
+    }
+
+    #[tokio::test]
+    async fn accepts_sql_and_duckdb_subscription_filters() {
+        validate_subscription(&HookSubscription {
+            space: "tinycloud:space".to_string(),
+            service: "sql".to_string(),
+            path_prefix: Some("analytics".to_string()),
+            abilities: vec!["tinycloud.sql/write".to_string()],
+        })
+        .expect("sql subscription should be allowed");
+
+        validate_subscription(&HookSubscription {
+            space: "tinycloud:space".to_string(),
+            service: "duckdb".to_string(),
+            path_prefix: Some("analytics".to_string()),
+            abilities: vec!["tinycloud.duckdb/write".to_string()],
+        })
+        .expect("duckdb subscription should be allowed");
+    }
+
+    #[tokio::test]
+    async fn rejects_non_write_sql_subscription_filters() {
         let err = validate_subscription(&HookSubscription {
             space: "tinycloud:space".to_string(),
             service: "sql".to_string(),
-            path_prefix: Some("main".to_string()),
-            abilities: vec!["tinycloud.sql/execute".to_string()],
+            path_prefix: Some("analytics".to_string()),
+            abilities: vec!["tinycloud.sql/read".to_string()],
         })
-        .expect_err("phase 1 must reject sql subscriptions");
+        .expect_err("read-only sql filter should be rejected");
+
+        assert_eq!(err.0, Status::BadRequest);
+    }
+
+    #[tokio::test]
+    async fn rejects_non_write_duckdb_subscription_filters() {
+        let err = validate_subscription(&HookSubscription {
+            space: "tinycloud:space".to_string(),
+            service: "duckdb".to_string(),
+            path_prefix: Some("analytics".to_string()),
+            abilities: vec!["tinycloud.duckdb/import".to_string()],
+        })
+        .expect_err("non-write duckdb filter should be rejected");
 
         assert_eq!(err.0, Status::BadRequest);
     }
