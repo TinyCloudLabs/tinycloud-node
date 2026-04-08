@@ -58,6 +58,16 @@ impl StaticSecret {
             Ok(Self { secret })
         }
     }
+
+    pub fn derive_key(&self, context: &[u8]) -> [u8; 32] {
+        let mut hasher = Blake3_256::default();
+        hasher.update(&self.secret);
+        hasher.update(context);
+        let derived = hasher.finalize().to_vec();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&derived[..32]);
+        key
+    }
 }
 
 #[async_trait]

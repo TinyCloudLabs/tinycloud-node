@@ -15,6 +15,7 @@ pub mod authorization;
 pub mod config;
 #[cfg(feature = "dstack")]
 pub mod dstack;
+pub mod hooks;
 pub mod prometheus;
 pub mod quota;
 pub mod routes;
@@ -23,11 +24,14 @@ pub mod tee;
 mod tracing;
 
 use config::{BlockStorage, Config, Keys, StagingStorage};
+use hooks::HookRuntime;
 use quota::QuotaCache;
 use routes::{
     admin::{delete_quota, get_quota, list_quotas, set_quota},
     attestation::attestation,
-    delegate, info, invoke, open_host_key,
+    delegate, info, invoke,
+    hooks::{create_hook_ticket, hook_events},
+    open_host_key,
     public::{public_kv_get, public_kv_head, public_kv_list, public_kv_options, RateLimiter},
     util_routes::*,
     version,
@@ -107,6 +111,8 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         open_host_key,
         invoke,
         delegate,
+        create_hook_ticket,
+        hook_events,
         public_kv_get,
         public_kv_head,
         public_kv_list,
@@ -119,6 +125,10 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     ];
 
     let key_setup: StaticSecret = resolve_keys(&tinycloud_config.keys).await?;
+    let hook_runtime = HookRuntime::new(
+        tinycloud_config.hooks.clone(),
+        key_setup.derive_key(b"tinycloud/hooks/tickets"),
+    );
 
     // Initialize TEE context if running in dstack mode
     let tee_context: Option<TeeContext> = {
@@ -216,6 +226,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         .manage(sql_service)
         .manage(duckdb_service)
         .manage(quota_cache)
+        .manage(hook_runtime)
         .manage(rate_limiter)
         .manage(tee_context)
         .manage(tinycloud_config.storage.staging.open().await?);

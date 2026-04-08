@@ -18,6 +18,8 @@ pub struct Config {
     pub log: Logging,
     pub storage: Storage,
     pub spaces: SpacesConfig,
+    #[serde(default)]
+    pub hooks: HooksConfig,
     pub relay: Relay,
     pub prometheus: Prometheus,
     pub cors: bool,
@@ -56,6 +58,45 @@ impl Default for PublicSpacesConfig {
             rate_limit_per_minute: default_rate_limit_per_minute(),
             rate_limit_burst: default_rate_limit_burst(),
             storage_limit: default_public_storage_limit(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct HooksConfig {
+    #[serde(default = "default_hooks_max_ticket_ttl_seconds")]
+    pub max_ticket_ttl_seconds: u64,
+    #[serde(default = "default_hooks_max_scopes_per_ticket")]
+    pub max_scopes_per_ticket: usize,
+    #[serde(default = "default_hooks_max_active_sse_streams")]
+    pub max_active_sse_streams: usize,
+    #[serde(default = "default_hooks_sse_broadcast_capacity")]
+    pub sse_broadcast_capacity: usize,
+}
+
+fn default_hooks_max_ticket_ttl_seconds() -> u64 {
+    300
+}
+
+fn default_hooks_max_scopes_per_ticket() -> usize {
+    32
+}
+
+fn default_hooks_max_active_sse_streams() -> usize {
+    100
+}
+
+fn default_hooks_sse_broadcast_capacity() -> usize {
+    1024
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            max_ticket_ttl_seconds: default_hooks_max_ticket_ttl_seconds(),
+            max_scopes_per_ticket: default_hooks_max_scopes_per_ticket(),
+            max_active_sse_streams: default_hooks_max_active_sse_streams(),
+            sse_broadcast_capacity: default_hooks_sse_broadcast_capacity(),
         }
     }
 }

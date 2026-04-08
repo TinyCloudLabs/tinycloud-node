@@ -1,7 +1,8 @@
 use anyhow::Result;
 use rocket::{data::ToByteUnit, http::Status, serde::json::Json, State};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::io::AsyncReadExt;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{info_span, Instrument};
@@ -10,6 +11,7 @@ use crate::{
     auth_guards::{DataIn, DataOut, InvOut, ObjectHeaders},
     authorization::AuthHeaderGetter,
     config::Config,
+    hooks::{HookRuntime, WriteEvent},
     quota::QuotaCache,
     routes::public::is_public_space,
     tracing::TracingSpan,
@@ -19,6 +21,8 @@ use tinycloud_core::{
     duckdb::{DuckDbCaveats, DuckDbError, DuckDbRequest, DuckDbResponse, DuckDbService},
     events::Invocation,
     sea_orm::DbErr,
+    sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder},
+    models::{kv_delete, kv_write},
     sql::{SqlCaveats, SqlError, SqlRequest, SqlService},
     storage::{ImmutableReadStore, ImmutableStaging},
     types::Resource,
@@ -28,6 +32,7 @@ use tinycloud_core::{
 
 pub mod admin;
 pub mod attestation;
+pub mod hooks;
 pub mod public;
 pub mod util;
 use util::LimitedReader;
@@ -48,7 +53,7 @@ fn build_info(
     quota_cache: &State<QuotaCache>,
 ) -> NodeInfo {
     #[allow(unused_mut)]
-    let mut features = vec!["kv", "delegation", "sharing", "sql", "duckdb"];
+    let mut features = vec!["kv", "delegation", "sharing", "sql", "duckdb", "hooks"];
     #[cfg(feature = "dstack")]
     features.push("tee");
     NodeInfo {
@@ -192,6 +197,7 @@ pub async fn invoke(
     quota_cache: &State<QuotaCache>,
     sql_service: &State<SqlService>,
     duckdb_service: &State<DuckDbService>,
+    hook_runtime: &State<HookRuntime>,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
     let action_label = "invocation";
     let span = info_span!(parent: &req_span.0, "invoke", action = %action_label);
@@ -351,11 +357,11 @@ pub async fn invoke(
                 return Err((Status::BadRequest, "Invalid inputs".to_string()));
             }
         };
-        let res = tinycloud
-            .invoke::<BlockStage>(i.0, inputs)
-            .await
-            .map(
-                |(_, mut outcomes)| match (outcomes.pop(), outcomes.pop(), outcomes.drain(..)) {
+        let invocation_info = i.0 .0.clone();
+        let res = match tinycloud.invoke::<BlockStage>(i.0, inputs).await {
+            Ok((tx_result, mut outcomes)) => {
+                emit_kv_hook_events(hook_runtime, tinycloud, &invocation_info, &tx_result).await;
+                Ok(match (outcomes.pop(), outcomes.pop(), outcomes.drain(..)) {
                     (None, None, _) => DataOut::None,
                     (Some(o), None, _) => DataOut::One(InvOut(o)),
                     (Some(o), Some(next), rest) => {
@@ -364,26 +370,167 @@ pub async fn invoke(
                         DataOut::Many(v)
                     }
                     _ => unreachable!(),
+                })
+            }
+            Err(e) => Err((
+                match e {
+                    TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
+                    TxStoreError::Tx(TxError::Db(DbErr::ConnectionAcquire(_))) => {
+                        Status::InternalServerError
+                    }
+                    _ => Status::Unauthorized,
                 },
-            )
-            .map_err(|e| {
-                (
-                    match e {
-                        TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
-                        TxStoreError::Tx(TxError::Db(DbErr::ConnectionAcquire(_))) => {
-                            Status::InternalServerError
-                        }
-                        _ => Status::Unauthorized,
-                    },
-                    e.to_string(),
-                )
-            });
+                e.to_string(),
+            )),
+        };
 
         timer.observe_duration();
         res
     }
     .instrument(span)
     .await
+}
+
+async fn emit_kv_hook_events(
+    hook_runtime: &HookRuntime,
+    tinycloud: &State<TinyCloud>,
+    invocation: &InvocationInfo,
+    tx_result: &TransactResult,
+) {
+    let Some(commit_hash) = tx_result
+        .commits
+        .values()
+        .find_map(|commit| commit.committed_events.first().copied())
+    else {
+        return;
+    };
+
+    let timestamp = match OffsetDateTime::now_utc().format(&Rfc3339) {
+        Ok(timestamp) => timestamp,
+        Err(_) => return,
+    };
+
+    let tx = match tinycloud.readable().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read committed hook events");
+            return;
+        }
+    };
+
+    let write_rows = match kv_write::Entity::find()
+        .filter(kv_write::Column::Invocation.eq(commit_hash))
+        .order_by_asc(kv_write::Column::Seq)
+        .order_by_asc(kv_write::Column::Epoch)
+        .order_by_asc(kv_write::Column::EpochSeq)
+        .all(&tx)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load kv write hook rows");
+            return;
+        }
+    };
+
+    let delete_rows = match kv_delete::Entity::find()
+        .filter(kv_delete::Column::InvocationId.eq(commit_hash))
+        .all(&tx)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load kv delete hook rows");
+            return;
+        }
+    };
+
+    let mut writes = HashMap::new();
+    for row in write_rows {
+        writes.insert((row.space.as_ref().to_string(), row.key.to_string()), row);
+    }
+
+    let mut deletes = HashMap::new();
+    for row in delete_rows {
+        deletes.insert((row.space.as_ref().to_string(), row.key.to_string()), row);
+    }
+
+    let mut per_space_index = HashMap::<String, u32>::new();
+    let mut emitted = HashSet::<(String, String, String)>::new();
+
+    for capability in &invocation.capabilities {
+        let Some((space, service, ability, path)) = capability
+            .resource
+            .tinycloud_resource()
+            .and_then(|resource| {
+                Some((
+                    resource.space(),
+                    resource.service().as_str(),
+                    capability.ability.as_ref().as_ref(),
+                    resource.path()?,
+                ))
+            })
+        else {
+            continue;
+        };
+
+        if service != "kv" || !matches!(ability, "tinycloud.kv/put" | "tinycloud.kv/del") {
+            continue;
+        }
+
+        let space_id = space.to_string();
+        let commit = match tx_result.commits.get(space) {
+            Some(commit) => commit,
+            None => continue,
+        };
+        let event_index = per_space_index.entry(space_id.clone()).or_insert(0);
+        let current_index = *event_index;
+
+        let key = (space_id.clone(), path.to_string());
+        let event = match ability {
+            "tinycloud.kv/put" => writes.get(&key).map(|row| WriteEvent {
+                id: format!("{}:{current_index}", commit.rev.to_cid(0x55)),
+                space: space_id.clone(),
+                service: "kv".to_string(),
+                ability: "tinycloud.kv/put".to_string(),
+                path: Some(row.key.to_string()),
+                actor: invocation.invoker.clone(),
+                epoch: commit.rev.to_cid(0x55).to_string(),
+                event_index: current_index,
+                timestamp: timestamp.clone(),
+            }),
+            "tinycloud.kv/del" => deletes.get(&key).map(|row| WriteEvent {
+                id: format!("{}:{current_index}", commit.rev.to_cid(0x55)),
+                space: space_id.clone(),
+                service: "kv".to_string(),
+                ability: "tinycloud.kv/del".to_string(),
+                path: Some(row.key.to_string()),
+                actor: invocation.invoker.clone(),
+                epoch: commit.rev.to_cid(0x55).to_string(),
+                event_index: current_index,
+                timestamp: timestamp.clone(),
+            }),
+            _ => None,
+        };
+
+        let Some(event) = event else {
+            tracing::warn!(
+                space = %space_id,
+                path = %path,
+                ability = %ability,
+                "missing committed kv hook row for invocation"
+            );
+            continue;
+        };
+
+        let emitted_key = (space_id, path.to_string(), ability.to_string());
+        if !emitted.insert(emitted_key) {
+            continue;
+        }
+
+        *event_index += 1;
+        hook_runtime.bus().publish(event);
+    }
 }
 
 /// Verify authorization by invoking with empty inputs.
