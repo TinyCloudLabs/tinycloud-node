@@ -259,6 +259,8 @@ pub async fn recon_split_compare(
         .json(&KvReconSplitRequest {
             space_id: request.space_id.clone(),
             prefix: request.prefix.clone(),
+            child_start_after: None,
+            child_limit: None,
         })
         .send()
         .await
@@ -276,22 +278,34 @@ pub async fn recon_split_compare(
         .export_kv_recon_split(&KvReconSplitRequest {
             space_id: request.space_id.clone(),
             prefix: request.prefix.clone(),
+            child_start_after: None,
+            child_limit: None,
         })
         .await
         .map_err(map_replication_error)?;
-    let children = tinycloud_core::replication::recon::compare_kv_recon_split_children(
+    let all_children = tinycloud_core::replication::recon::compare_kv_recon_split_children(
         &local.children,
         &peer.children,
     );
+    let (children, has_more, next_child_start_after) =
+        tinycloud_core::replication::recon::window_kv_recon_split_comparisons(
+            &all_children,
+            request.child_start_after.as_deref(),
+            request.child_limit,
+        );
     let matches = local.fingerprint == peer.fingerprint
         && local.item_count == peer.item_count
-        && children.iter().all(|child| child.status == "match");
+        && all_children.iter().all(|child| child.status == "match");
 
     Ok(Json(KvReconSplitCompareResponse {
         space_id: request.space_id.clone(),
         prefix: request.prefix.clone(),
         peer_url: request.peer_url.clone(),
+        child_start_after: request.child_start_after.clone(),
+        child_limit: request.child_limit,
         matches,
+        has_more,
+        next_child_start_after,
         children,
     }))
 }
@@ -513,6 +527,8 @@ fn collect_split_reconcile_targets_for_scope<'a>(
             &KvReconSplitRequest {
                 space_id: space_id.to_string(),
                 prefix: prefix.clone(),
+                child_start_after: None,
+                child_limit: None,
             },
             tinycloud,
         )
@@ -623,6 +639,8 @@ pub async fn reconcile_split(
     let split_request = KvReconSplitRequest {
         space_id: request.space_id.clone(),
         prefix: request.prefix.clone(),
+        child_start_after: None,
+        child_limit: None,
     };
     let (_, _, before_children) =
         compare_split_scope(peer_url, &peer_token.0, &split_request, tinycloud).await?;
