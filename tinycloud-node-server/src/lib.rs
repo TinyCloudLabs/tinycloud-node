@@ -31,8 +31,8 @@ use routes::{
     public::{public_kv_get, public_kv_head, public_kv_list, public_kv_options, RateLimiter},
     replication::{
         auth_reconcile, auth_replication_export, recon_compare, recon_export, recon_split,
-        reconcile, replication_export, replication_info, replication_session_open, sql_reconcile,
-        sql_replication_export,
+        recon_split_compare, reconcile, replication_export, replication_info,
+        replication_session_open, sql_reconcile, sql_replication_export,
     },
     revoke,
     util_routes::*,
@@ -122,6 +122,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         replication_export,
         recon_export,
         recon_split,
+        recon_split_compare,
         recon_compare,
         reconcile,
         sql_replication_export,

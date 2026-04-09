@@ -20,7 +20,8 @@ pub use libp2p;
 pub use replication::{
     AuthReplicationApplyResponse, AuthReplicationExportRequest, AuthReplicationExportResponse,
     AuthReplicationReconcileRequest, KvReconCompareRequest, KvReconCompareResponse,
-    KvReconExportRequest, KvReconExportResponse, KvReconSplitChild, KvReconSplitRequest,
+    KvReconExportRequest, KvReconExportResponse, KvReconSplitChild, KvReconSplitChildComparison,
+    KvReconSplitCompareRequest, KvReconSplitCompareResponse, KvReconSplitRequest,
     KvReconSplitResponse, KvReplicationError, ReplicationApplyResponse, ReplicationExportRequest,
     ReplicationExportResponse, ReplicationReconcileRequest, ReplicationService,
     ReplicationSessionOpenRequest, ReplicationSessionOpenResponse,

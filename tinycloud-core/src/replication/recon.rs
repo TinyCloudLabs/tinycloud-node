@@ -1,6 +1,8 @@
 use super::{
     keys::KvReconKey,
-    messages::{KvReconItem, KvReconSplitChild},
+    messages::{
+        KvReconItem, KvReconSplitChild, KvReconSplitChildComparison, KvReconSplitChildStatus,
+    },
     store::encode_hash,
 };
 use crate::{hash::Blake3Hasher, models::kv_write};
@@ -99,6 +101,56 @@ pub fn split_kv_recon_items(items: &[KvReconItem], prefix: Option<&str>) -> Vec<
         .collect()
 }
 
+pub fn compare_kv_recon_split_children(
+    local: &[KvReconSplitChild],
+    peer: &[KvReconSplitChild],
+) -> Vec<KvReconSplitChildComparison> {
+    let mut prefixes =
+        BTreeMap::<String, (Option<&KvReconSplitChild>, Option<&KvReconSplitChild>)>::new();
+
+    for child in local {
+        prefixes.entry(child.prefix.clone()).or_default().0 = Some(child);
+    }
+    for child in peer {
+        prefixes.entry(child.prefix.clone()).or_default().1 = Some(child);
+    }
+
+    prefixes
+        .into_iter()
+        .map(|(prefix, (local, peer))| {
+            let status = match (local, peer) {
+                (Some(local), Some(peer))
+                    if local.item_count == peer.item_count
+                        && local.fingerprint == peer.fingerprint =>
+                {
+                    KvReconSplitChildStatus::Match
+                }
+                (Some(_), Some(_)) => KvReconSplitChildStatus::Mismatch,
+                (None, Some(_)) => KvReconSplitChildStatus::LocalMissing,
+                (Some(_), None) => KvReconSplitChildStatus::PeerMissing,
+                (None, None) => KvReconSplitChildStatus::Mismatch,
+            };
+
+            KvReconSplitChildComparison {
+                prefix,
+                status: split_child_status_label(&status).to_string(),
+                local_item_count: local.map_or(0, |child| child.item_count),
+                peer_item_count: peer.map_or(0, |child| child.item_count),
+                local_fingerprint: local
+                    .map(|child| child.fingerprint.clone())
+                    .unwrap_or_default(),
+                peer_fingerprint: peer
+                    .map(|child| child.fingerprint.clone())
+                    .unwrap_or_default(),
+                leaf: local
+                    .map(|child| child.leaf)
+                    .or_else(|| peer.map(|child| child.leaf))
+                    .unwrap_or(false),
+            }
+        })
+        .collect()
+}
+
 pub fn first_kv_recon_mismatch(left: &[KvReconItem], right: &[KvReconItem]) -> Option<String> {
     let mismatch_len = left.len().min(right.len());
     for index in 0..mismatch_len {
@@ -151,5 +203,14 @@ fn child_prefix_for_key(prefix: Option<&str>, key: &str) -> String {
     match prefix {
         Some(prefix) => format!("{prefix}/{segment}"),
         None => segment.to_string(),
+    }
+}
+
+fn split_child_status_label(status: &KvReconSplitChildStatus) -> &'static str {
+    match status {
+        KvReconSplitChildStatus::Match => "match",
+        KvReconSplitChildStatus::LocalMissing => "local-missing",
+        KvReconSplitChildStatus::PeerMissing => "peer-missing",
+        KvReconSplitChildStatus::Mismatch => "mismatch",
     }
 }

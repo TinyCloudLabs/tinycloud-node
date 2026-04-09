@@ -9,12 +9,13 @@ use tinycloud_core::{
     replication::{
         AuthReplicationApplyResponse, AuthReplicationExportRequest, AuthReplicationExportResponse,
         AuthReplicationReconcileRequest, KvReconCompareRequest, KvReconCompareResponse,
-        KvReconExportRequest, KvReconExportResponse, KvReconSplitRequest, KvReconSplitResponse,
-        KvReplicationError, ReplicationExportRequest, ReplicationExportResponse,
-        ReplicationReconcileRequest, ReplicationRouteStatus, ReplicationScope, ReplicationService,
-        ReplicationSessionError, ReplicationSessionOpenRequest, ReplicationSessionOpenResponse,
-        ReplicationSessionRecord, ReplicationSessionSummary, SqlReplicationApplyResponse,
-        SqlReplicationExportRequest, SqlReplicationExportResponse, SqlReplicationReconcileRequest,
+        KvReconExportRequest, KvReconExportResponse, KvReconSplitCompareRequest,
+        KvReconSplitCompareResponse, KvReconSplitRequest, KvReconSplitResponse, KvReplicationError,
+        ReplicationExportRequest, ReplicationExportResponse, ReplicationReconcileRequest,
+        ReplicationRouteStatus, ReplicationScope, ReplicationService, ReplicationSessionError,
+        ReplicationSessionOpenRequest, ReplicationSessionOpenResponse, ReplicationSessionRecord,
+        ReplicationSessionSummary, SqlReplicationApplyResponse, SqlReplicationExportRequest,
+        SqlReplicationExportResponse, SqlReplicationReconcileRequest,
     },
     sql::{SqlError, SqlService},
     types::Resource,
@@ -37,6 +38,7 @@ pub async fn replication_info(
             "POST /replication/export",
             "POST /replication/recon/export",
             "POST /replication/recon/split",
+            "POST /replication/recon/split/compare",
             "POST /replication/recon/compare",
             "POST /replication/reconcile",
             "POST /replication/sql/export",
@@ -214,6 +216,73 @@ pub async fn recon_split(
         .await
         .map(Json)
         .map_err(map_replication_error)
+}
+
+#[post(
+    "/replication/recon/split/compare",
+    format = "json",
+    data = "<request>"
+)]
+pub async fn recon_split_compare(
+    request: Json<KvReconSplitCompareRequest>,
+    token: Option<ReplicationSessionToken>,
+    peer_token: Option<PeerReplicationSessionToken>,
+    replication: &State<ReplicationService>,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Json<KvReconSplitCompareResponse>, (Status, String)> {
+    let scope = ReplicationScope::Kv {
+        prefix: request.prefix.clone(),
+    };
+    let session = authorize_session_scope(&request.space_id, &scope, token, replication)?;
+    ensure_replication_session_active(&session, tinycloud).await?;
+    let peer_token = peer_token.ok_or_else(|| {
+        (
+            Status::Unauthorized,
+            "missing Peer-Replication-Session for recon split compare".to_string(),
+        )
+    })?;
+    let peer_url = request.peer_url.trim_end_matches('/');
+    let export = reqwest::Client::new()
+        .post(format!("{peer_url}/replication/recon/split"))
+        .header("Replication-Session", peer_token.0)
+        .json(&KvReconSplitRequest {
+            space_id: request.space_id.clone(),
+            prefix: request.prefix.clone(),
+        })
+        .send()
+        .await
+        .map_err(|error| (Status::BadGateway, error.to_string()))?;
+
+    if !export.status().is_success() {
+        return Err(map_peer_error("peer recon split failed", export).await);
+    }
+
+    let peer = export
+        .json::<KvReconSplitResponse>()
+        .await
+        .map_err(|error| (Status::BadGateway, error.to_string()))?;
+    let local = tinycloud
+        .export_kv_recon_split(&KvReconSplitRequest {
+            space_id: request.space_id.clone(),
+            prefix: request.prefix.clone(),
+        })
+        .await
+        .map_err(map_replication_error)?;
+    let children = tinycloud_core::replication::recon::compare_kv_recon_split_children(
+        &local.children,
+        &peer.children,
+    );
+    let matches = local.fingerprint == peer.fingerprint
+        && local.item_count == peer.item_count
+        && children.iter().all(|child| child.status == "match");
+
+    Ok(Json(KvReconSplitCompareResponse {
+        space_id: request.space_id.clone(),
+        prefix: request.prefix.clone(),
+        peer_url: request.peer_url.clone(),
+        matches,
+        children,
+    }))
 }
 
 #[post("/replication/recon/compare", format = "json", data = "<request>")]
