@@ -11,8 +11,10 @@ use crate::relationships::*;
 use crate::replication::{
     decode_hash, encode_hash, AuthReplicationApplyResponse, AuthReplicationExportRequest,
     AuthReplicationExportResponse, KvReplicationError, KvReplicationEvent, KvReplicationOperation,
-    KvReplicationSequence, ReplicationApplyResponse, ReplicationExportRequest, ReplicationExportResponse,
+    KvReconExportRequest, KvReconExportResponse, KvReplicationSequence, ReplicationApplyResponse,
+    ReplicationExportRequest, ReplicationExportResponse,
 };
+use crate::replication::recon::{kv_recon_fingerprint, kv_recon_item, sort_kv_recon_items};
 use crate::storage::{
     either::EitherError, Content, HashBuffer, ImmutableDeleteStore, ImmutableReadStore,
     ImmutableStaging, ImmutableWriteStore, StorageSetup, StoreSize,
@@ -423,6 +425,29 @@ where
             requested_since_seq: request.since_seq,
             exported_until_seq,
             sequences: sequences.into_values().collect(),
+        })
+    }
+
+    pub async fn export_kv_recon(
+        &self,
+        request: &KvReconExportRequest,
+    ) -> Result<KvReconExportResponse, KvReplicationError> {
+        let space_id = parse_replication_space_id(&request.space_id)?;
+        let prefix = request
+            .prefix
+            .as_deref()
+            .map(parse_replication_path)
+            .transpose()?;
+        let writes = select_kv_recon_writes(&self.conn, &space_id, prefix.as_ref()).await?;
+        let mut items = writes.into_iter().map(|write| kv_recon_item(&write)).collect::<Vec<_>>();
+        sort_kv_recon_items(&mut items);
+
+        Ok(KvReconExportResponse {
+            space_id: request.space_id.clone(),
+            prefix: request.prefix.clone(),
+            item_count: items.len(),
+            fingerprint: kv_recon_fingerprint(&items),
+            items,
         })
     }
 
@@ -1578,6 +1603,50 @@ async fn select_kv_replication_seqs<C: ConnectionTrait>(
     }
 
     Ok(seqs.into_iter().take(limit as usize).collect())
+}
+
+async fn select_kv_recon_writes<C: ConnectionTrait>(
+    db: &C,
+    space_id: &SpaceId,
+    prefix: Option<&Path>,
+) -> Result<Vec<kv_write::Model>, KvReplicationError> {
+    let mut query = kv_write::Entity::find()
+        .filter(kv_write::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+        .find_also_related(kv_delete::Entity)
+        .filter(kv_delete::Column::InvocationId.is_null());
+
+    if let Some(prefix) = prefix {
+        query = query.filter(kv_write::Column::Key.like(format!("{}%", prefix.as_str())));
+    }
+
+    let writes = query.all(db).await?;
+    let mut latest = BTreeMap::<String, kv_write::Model>::new();
+    for (write, _) in writes {
+        let key = write.key.to_string();
+        let replace = latest
+            .get(&key)
+            .map(|current| kv_write_is_newer(&write, current))
+            .unwrap_or(true);
+        if replace {
+            latest.insert(key, write);
+        }
+    }
+
+    Ok(latest.into_values().collect())
+}
+
+fn kv_write_is_newer(candidate: &kv_write::Model, current: &kv_write::Model) -> bool {
+    (
+        candidate.seq,
+        candidate.epoch,
+        candidate.epoch_seq,
+        candidate.invocation,
+    ) > (
+        current.seq,
+        current.epoch,
+        current.epoch_seq,
+        current.invocation,
+    )
 }
 
 async fn export_invocation_delegations<C: ConnectionTrait>(
