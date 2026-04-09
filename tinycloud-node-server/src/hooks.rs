@@ -51,6 +51,8 @@ pub struct HookTicketClaims {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WriteEvent {
+    #[serde(rename = "type")]
+    pub event_type: String,
     pub id: String,
     pub space: String,
     pub service: String,
@@ -235,6 +237,7 @@ mod tests {
     #[tokio::test]
     async fn scope_matching_uses_prefix_and_ability() {
         let event = WriteEvent {
+            event_type: "write".to_string(),
             id: "epoch:0".to_string(),
             space: "tinycloud:space".to_string(),
             service: "kv".to_string(),
@@ -277,6 +280,7 @@ mod tests {
         ));
 
         let sql_event = WriteEvent {
+            event_type: "write".to_string(),
             id: "epoch:0".to_string(),
             space: "tinycloud:space".to_string(),
             service: "sql".to_string(),
@@ -307,5 +311,24 @@ mod tests {
                 abilities: vec!["tinycloud.sql/write".to_string()],
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn write_event_serializes_with_type_field() {
+        let event = WriteEvent {
+            event_type: "write".to_string(),
+            id: "epoch:0".to_string(),
+            space: "tinycloud:space".to_string(),
+            service: "kv".to_string(),
+            ability: "tinycloud.kv/put".to_string(),
+            path: Some("documents/123".to_string()),
+            actor: "did:key:test".to_string(),
+            epoch: "epoch".to_string(),
+            event_index: 0,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json.get("type").and_then(|v| v.as_str()), Some("write"));
     }
 }

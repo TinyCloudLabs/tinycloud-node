@@ -337,6 +337,8 @@ async fn save<C: ConnectionTrait>(
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct KvWebhookPayload {
+    #[serde(rename = "type")]
+    event_type: String,
     id: String,
     space: String,
     service: String,
@@ -401,6 +403,7 @@ async fn enqueue_kv_webhook_deliveries<C: ConnectionTrait>(
         let epoch_cid = epoch.to_cid(0x55).to_string();
         let event_id = format!("{epoch_cid}:{current_index}");
         let payload_json = serde_json::to_string(&KvWebhookPayload {
+            event_type: "write".to_string(),
             id: event_id.clone(),
             space: space.to_string(),
             service: "kv".to_string(),
@@ -448,4 +451,28 @@ async fn enqueue_kv_webhook_deliveries<C: ConnectionTrait>(
 
     let _ = invocation_hash;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kv_webhook_payload_serializes_with_type_field() {
+        let payload = KvWebhookPayload {
+            event_type: "write".to_string(),
+            id: "epoch:0".to_string(),
+            space: "tinycloud:space".to_string(),
+            service: "kv".to_string(),
+            ability: "tinycloud.kv/put".to_string(),
+            path: Some("docs/1".to_string()),
+            actor: "did:key:test".to_string(),
+            epoch: "epoch".to_string(),
+            event_index: 0,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        let json = serde_json::to_value(payload).unwrap();
+        assert_eq!(json.get("type").and_then(|v| v.as_str()), Some("write"));
+    }
 }

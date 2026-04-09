@@ -499,6 +499,7 @@ async fn emit_kv_hook_events(
         let key = (space_id.clone(), path.to_string());
         let event = match ability {
             "tinycloud.kv/put" => writes.get(&key).map(|row| WriteEvent {
+                event_type: "write".to_string(),
                 id: format!("{}:{current_index}", commit.rev.to_cid(0x55)),
                 space: space_id.clone(),
                 service: "kv".to_string(),
@@ -510,6 +511,7 @@ async fn emit_kv_hook_events(
                 timestamp: timestamp.clone(),
             }),
             "tinycloud.kv/del" => deletes.get(&key).map(|row| WriteEvent {
+                event_type: "write".to_string(),
                 id: format!("{}:{current_index}", commit.rev.to_cid(0x55)),
                 space: space_id.clone(),
                 service: "kv".to_string(),
@@ -823,6 +825,7 @@ fn database_write_events(
 
         for table in tables {
             events.push(WriteEvent {
+                event_type: "write".to_string(),
                 id: format!("{epoch}:{event_index}"),
                 space: space.to_string(),
                 service: service.to_string(),
