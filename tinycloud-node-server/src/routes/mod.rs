@@ -25,6 +25,13 @@ use crate::{
     },
     tracing::TracingSpan,
 };
+use tinycloud_auth::{
+    authorization::TinyCloudRevocation,
+    cacaos::{
+        siwe::Message,
+        siwe_cacao::{Header as SiweHeader, Signature, SiweCacao},
+    },
+};
 use tinycloud_core::{
     InvocationOutcome, TransactResult, TxError, TxStoreError,
     duckdb::{DuckDbCaveats, DuckDbError, DuckDbRequest, DuckDbResponse, DuckDbService},
@@ -38,13 +45,6 @@ use tinycloud_core::{
     types::Resource,
     util::{DelegationInfo, InvocationInfo},
     write_hooks::{TouchedTables, db_table_path, hook_delivery_id, subscription_matches_event},
-};
-use tinycloud_auth::{
-    authorization::TinyCloudRevocation,
-    cacaos::{
-        siwe::Message,
-        siwe_cacao::{Header as SiweHeader, Signature, SiweCacao},
-    },
 };
 
 pub mod admin;
@@ -307,14 +307,15 @@ pub async fn revoke(
         let timer = crate::prometheus::AUTHORIZED_INVOKE_HISTOGRAM
             .with_label_values(&["revoke"])
             .start_timer();
-        let siwe = Message::from_str(&request.siwe)
-            .map_err(|error| (Status::BadRequest, format!("invalid revocation SIWE: {error}")))?;
+        let siwe = Message::from_str(&request.siwe).map_err(|error| {
+            (
+                Status::BadRequest,
+                format!("invalid revocation SIWE: {error}"),
+            )
+        })?;
         let signature = parse_revocation_signature(&request.signature)?;
-        let revocation = TinyCloudRevocation::Cacao(SiweCacao::new(
-            siwe.into(),
-            signature,
-            SiweHeader,
-        ));
+        let revocation =
+            TinyCloudRevocation::Cacao(SiweCacao::new(siwe.into(), signature, SiweHeader));
         let revocation = Revocation::from_header_ser::<TinyCloudRevocation>(
             &revocation
                 .encode()

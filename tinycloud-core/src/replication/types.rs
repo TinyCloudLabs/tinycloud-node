@@ -11,6 +11,7 @@ use time::OffsetDateTime;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplicationScope {
+    Auth,
     Kv { prefix: Option<String> },
     Sql { db_name: String },
 }
@@ -18,6 +19,7 @@ pub enum ReplicationScope {
 impl ReplicationScope {
     pub fn service(&self) -> &'static str {
         match self {
+            Self::Auth => "auth",
             Self::Kv { .. } => "kv",
             Self::Sql { .. } => "sql",
         }
@@ -47,6 +49,7 @@ pub struct ReplicationSessionSummary {
 impl ReplicationSessionSummary {
     pub fn from_record(record: &ReplicationSessionRecord) -> Self {
         let (prefix, db_name) = match &record.scope {
+            ReplicationScope::Auth => (None, None),
             ReplicationScope::Kv { prefix } => (prefix.clone(), None),
             ReplicationScope::Sql { db_name } => (None, Some(db_name.clone())),
         };
@@ -99,7 +102,7 @@ impl Default for ReplicationStatus {
             roles_enabled: vec!["host"],
             peer_serving: true,
             recon: false,
-            auth_sync: false,
+            auth_sync: true,
             authored_fact_exchange: true,
             notifications: false,
             snapshots: false,
@@ -154,6 +157,8 @@ impl Default for ReplicationRouteStatus {
             endpoints: vec![
                 "GET /replication/info",
                 "POST /replication/session/open",
+                "POST /replication/auth/export",
+                "POST /replication/auth/reconcile",
                 "POST /replication/export",
                 "POST /replication/reconcile",
                 "POST /replication/sql/export",
@@ -281,6 +286,7 @@ fn normalize_scope_path(path: &str) -> &str {
 
 fn scope_is_subset(requested: &ReplicationScope, granted: &ReplicationScope) -> bool {
     match (requested, granted) {
+        (ReplicationScope::Auth, ReplicationScope::Auth) => true,
         (
             ReplicationScope::Kv {
                 prefix: requested_prefix,

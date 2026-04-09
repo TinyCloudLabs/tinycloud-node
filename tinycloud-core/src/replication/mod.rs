@@ -7,11 +7,13 @@ pub mod store;
 pub mod types;
 
 pub use messages::{
-    KvReplicationEvent, KvReplicationOperation, KvReplicationSequence, ReplicationApplyResponse,
-    ReplicationErrorResponse, ReplicationExportRequest, ReplicationExportResponse,
-    ReplicationInfoRequest, ReplicationReconcileRequest, ReplicationSessionOpenRequest,
-    ReplicationSessionOpenResponse, SqlReplicationApplyResponse, SqlReplicationExportRequest,
-    SqlReplicationExportResponse, SqlReplicationReconcileRequest,
+    AuthReplicationApplyResponse, AuthReplicationExportRequest, AuthReplicationExportResponse,
+    AuthReplicationReconcileRequest, KvReplicationEvent, KvReplicationOperation,
+    KvReplicationSequence, ReplicationApplyResponse, ReplicationErrorResponse,
+    ReplicationExportRequest, ReplicationExportResponse, ReplicationInfoRequest,
+    ReplicationReconcileRequest, ReplicationSessionOpenRequest, ReplicationSessionOpenResponse,
+    SqlReplicationApplyResponse, SqlReplicationExportRequest, SqlReplicationExportResponse,
+    SqlReplicationReconcileRequest,
 };
 pub use store::{decode_hash, encode_hash, KvReplicationError};
 pub use types::{
