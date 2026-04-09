@@ -9,6 +9,7 @@ pub mod manifest;
 pub mod migrations;
 pub mod models;
 pub mod relationships;
+pub mod replication;
 pub mod sql;
 pub mod storage;
 pub mod types;
@@ -18,5 +19,10 @@ pub mod write_hooks;
 pub use db::{Commit, InvocationOutcome, SpaceDatabase, TransactResult, TxError, TxStoreError};
 pub use encryption::ColumnEncryption;
 pub use libp2p;
+pub use replication::{
+    KvReplicationError, ReplicationApplyResponse, ReplicationExportRequest,
+    ReplicationExportResponse, ReplicationReconcileRequest, ReplicationService,
+    ReplicationSessionOpenRequest, ReplicationSessionOpenResponse,
+};
 pub use sea_orm;
 pub use sea_orm_migration;

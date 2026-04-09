@@ -26,6 +26,10 @@ enum DbMessage {
     Export {
         response_tx: oneshot::Sender<Result<Vec<u8>, SqlError>>,
     },
+    Import {
+        snapshot: Vec<u8>,
+        response_tx: oneshot::Sender<Result<(), SqlError>>,
+    },
 }
 
 #[derive(Clone)]
@@ -59,6 +63,20 @@ impl DatabaseHandle {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
             .send(DbMessage::Export { response_tx })
+            .await
+            .map_err(|_| SqlError::Internal("Database actor not available".to_string()))?;
+        response_rx
+            .await
+            .map_err(|_| SqlError::Internal("Database actor dropped response".to_string()))?
+    }
+
+    pub async fn import(&self, snapshot: Vec<u8>) -> Result<(), SqlError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send(DbMessage::Import {
+                snapshot,
+                response_tx,
+            })
             .await
             .map_err(|_| SqlError::Internal("Database actor not available".to_string()))?;
         response_rx
@@ -129,7 +147,20 @@ pub fn spawn_actor(
                     let _ = response_tx.send(result);
                 }
                 DbMessage::Export { response_tx } => {
-                    let result = handle_export(&conn, &mode, &file_path);
+                    let result = handle_export(&conn);
+                    let _ = response_tx.send(result);
+                }
+                DbMessage::Import {
+                    snapshot,
+                    response_tx,
+                } => {
+                    let result = handle_import(
+                        &mut conn,
+                        &mut mode,
+                        &file_path,
+                        memory_threshold,
+                        &snapshot,
+                    );
                     let _ = response_tx.send(result);
                 }
             }
@@ -142,30 +173,26 @@ pub fn spawn_actor(
     DatabaseHandle { tx }
 }
 
-fn handle_export(
-    conn: &rusqlite::Connection,
-    _mode: &StorageMode,
-    _file_path: &PathBuf,
-) -> Result<Vec<u8>, SqlError> {
-    // Serialize through SQLite's backup API for both in-memory and WAL-backed
-    // file databases so the exported artifact contains a complete checkpoint.
-    let temp_dir = tempfile::tempdir().map_err(|e| SqlError::Internal(e.to_string()))?;
-    let temp_path = temp_dir.path().join("export.db");
+fn handle_export(conn: &rusqlite::Connection) -> Result<Vec<u8>, SqlError> {
+    storage::export_snapshot(conn)
+}
 
-    let mut dest =
-        rusqlite::Connection::open(&temp_path).map_err(|e| SqlError::Internal(e.to_string()))?;
+fn handle_import(
+    conn: &mut rusqlite::Connection,
+    mode: &mut StorageMode,
+    file_path: &PathBuf,
+    memory_threshold: u64,
+    snapshot: &[u8],
+) -> Result<(), SqlError> {
+    storage::import_snapshot(conn, snapshot, matches!(mode, StorageMode::File(_)))?;
 
-    {
-        let backup = rusqlite::backup::Backup::new(conn, &mut dest)
-            .map_err(|e| SqlError::Internal(e.to_string()))?;
-        backup
-            .run_to_completion(5, std::time::Duration::from_millis(250), None)
-            .map_err(|e| SqlError::Internal(e.to_string()))?;
+    if matches!(mode, StorageMode::InMemory) && storage::database_size(conn)? > memory_threshold {
+        let new_conn = storage::promote_to_file(conn, file_path)?;
+        *conn = new_conn;
+        *mode = StorageMode::File(file_path.clone());
     }
 
-    drop(dest);
-
-    std::fs::read(&temp_path).map_err(|e| SqlError::Internal(e.to_string()))
+    Ok(())
 }
 
 fn handle_message(

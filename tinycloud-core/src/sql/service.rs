@@ -10,7 +10,7 @@ use crate::database_artifacts::{DatabaseArtifactError, DatabaseArtifactRepositor
 
 use super::{
     caveats::SqlCaveats,
-    database::{spawn_actor, DatabaseHandle},
+    database::{DatabaseHandle, spawn_actor},
     types::*,
 };
 
@@ -111,6 +111,39 @@ impl SqlService {
             }
             None => Err(SqlError::DatabaseNotFound),
         }
+    }
+
+    pub async fn import(
+        &self,
+        space: &SpaceId,
+        db_name: &str,
+        snapshot: &[u8],
+    ) -> Result<(), SqlError> {
+        let key = (space.to_string(), db_name.to_string());
+
+        self.artifact_repository
+            .save("sql", &space.to_string(), db_name, snapshot.to_vec())
+            .await
+            .map_err(artifact_error_to_sql)?;
+
+        if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
+            match handle.import(snapshot.to_vec()).await {
+                Err(SqlError::Internal(ref msg))
+                    if msg.contains("Database actor not available") =>
+                {
+                    tracing::warn!(space=%space, db=%db_name, "Dead SQL actor detected during import, removing");
+                    self.databases.remove(&key);
+                }
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let _ = self.discard_local_state(&key).await;
+                    return Err(e);
+                }
+            }
+        }
+
+        remove_sql_cache_files(&self.cache_path(space, db_name)).await?;
+        write_cache_file(&self.cache_path(space, db_name), snapshot).await
     }
 
     pub fn db_name_from_path(path: Option<&str>) -> String {

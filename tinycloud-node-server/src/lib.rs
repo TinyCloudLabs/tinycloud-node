@@ -6,7 +6,7 @@ extern crate anyhow;
 extern crate tokio;
 
 use anyhow::{Context, Result};
-use rocket::{fairing::AdHoc, figment::Figment, http::Header, Build, Rocket};
+use rocket::{Build, Rocket, fairing::AdHoc, figment::Figment, http::Header};
 use std::{path::Path, sync::Arc};
 
 pub mod allow_list;
@@ -34,7 +34,11 @@ use routes::{
     create_signed_kv_url, delegate,
     hooks::{create_hook_ticket, create_webhook, delete_webhook, hook_events, list_webhooks},
     info, invoke, open_host_key,
-    public::{public_kv_get, public_kv_head, public_kv_list, public_kv_options, RateLimiter},
+    public::{RateLimiter, public_kv_get, public_kv_head, public_kv_list, public_kv_options},
+    replication::{
+        reconcile, replication_export, replication_info, replication_session_open, sql_reconcile,
+        sql_replication_export,
+    },
     signed_kv_get,
     util_routes::*,
     version,
@@ -45,15 +49,15 @@ use storage::{
 };
 use tee::TeeContext;
 use tinycloud_core::{
+    ColumnEncryption, ReplicationService, SpaceDatabase,
     database_artifacts::SeaOrmDatabaseArtifactRepository,
     duckdb::DuckDbService,
     keys::{SecretsSetup, StaticSecret},
     sea_orm::{ConnectOptions, Database, DatabaseConnection},
     sql::SqlService,
-    storage::{either::Either, memory::MemoryStaging, StorageConfig},
-    ColumnEncryption, SpaceDatabase,
+    storage::{StorageConfig, either::Either, memory::MemoryStaging},
 };
-use webhook_dispatcher::{spawn_webhook_dispatcher, WebhookDispatcher};
+use webhook_dispatcher::{WebhookDispatcher, spawn_webhook_dispatcher};
 
 pub type BlockStores = Either<S3BlockStore, FileSystemStore>;
 pub type BlockConfig = Either<S3BlockConfig, FileSystemConfig>;
@@ -123,6 +127,12 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         create_webhook,
         list_webhooks,
         delete_webhook,
+        replication_info,
+        replication_session_open,
+        replication_export,
+        reconcile,
+        sql_replication_export,
+        sql_reconcile,
         public_kv_get,
         public_kv_head,
         public_kv_list,
@@ -253,6 +263,25 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         .manage(tinycloud)
         .manage(sql_service)
         .manage(duckdb_service)
+        .manage(ReplicationService::with_session_ttl(
+            tinycloud_core::replication::ReplicationStatus {
+                supported: true,
+                enabled: true,
+                roles_supported: vec!["host", "replica"],
+                roles_enabled: vec!["host", "replica"],
+                recon: false,
+                auth_sync: false,
+                authored_fact_exchange: true,
+                notifications: false,
+                snapshots: false,
+            },
+            std::time::Duration::from_secs(
+                std::env::var("TINYCLOUD_REPLICATION_SESSION_TTL_SECS")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(600),
+            ),
+        ))
         .manage(quota_cache)
         .manage(hook_runtime)
         .manage(signed_url_runtime)
@@ -273,12 +302,12 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
                 resp.set_header(Header::new(
                     // expose response headers to browser-run scripts
                     "Access-Control-Expose-Headers",
-                    "*, Authorization",
+                    "*, Authorization, Replication-Session",
                 ));
                 resp.set_header(Header::new(
                     // allow custom headers + Authorization in requests
                     "Access-Control-Allow-Headers",
-                    "*, Authorization",
+                    "*, Authorization, Replication-Session",
                 ));
                 resp.set_header(Header::new("Access-Control-Allow-Credentials", "true"));
             })

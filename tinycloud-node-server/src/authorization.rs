@@ -12,6 +12,7 @@ use tinycloud_core::{
 };
 
 pub struct AuthHeaderGetter<T>(pub SerializedEvent<T>);
+pub struct ReplicationSessionToken(pub String);
 
 macro_rules! impl_fromreq {
     ($type:ident, $inter:ident, $name:tt) => {
@@ -36,6 +37,29 @@ macro_rules! impl_fromreq {
 impl_fromreq!(DelegationInfo, TinyCloudDelegation, "Authorization");
 impl_fromreq!(InvocationInfo, TinyCloudInvocation, "Authorization");
 impl_fromreq!(RevocationInfo, TinyCloudRevocation, "Authorization");
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for ReplicationSessionToken {
+    type Error = &'static str;
+
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        let token = request.headers().iter().find_map(|header| {
+            header
+                .name
+                .as_str()
+                .eq_ignore_ascii_case("Replication-Session")
+                .then(|| header.value.to_string())
+        });
+
+        match token {
+            Some(token) if !token.trim().is_empty() => {
+                Outcome::Success(ReplicationSessionToken(token))
+            }
+            Some(_) => Outcome::Error((Status::Unauthorized, "invalid replication session token")),
+            None => Outcome::Forward(Status::Unauthorized),
+        }
+    }
+}
 
 #[cfg(test)]
 mod test {
