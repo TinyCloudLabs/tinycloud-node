@@ -19,7 +19,8 @@ pub use encryption::ColumnEncryption;
 pub use libp2p;
 pub use replication::{
     AuthReplicationApplyResponse, AuthReplicationExportRequest, AuthReplicationExportResponse,
-    AuthReplicationReconcileRequest, KvReplicationError, ReplicationApplyResponse,
+    AuthReplicationReconcileRequest, KvReconCompareRequest, KvReconCompareResponse,
+    KvReconExportRequest, KvReconExportResponse, KvReplicationError, ReplicationApplyResponse,
     ReplicationExportRequest, ReplicationExportResponse, ReplicationReconcileRequest,
     ReplicationService, ReplicationSessionOpenRequest, ReplicationSessionOpenResponse,
 };

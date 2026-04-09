@@ -8,13 +8,13 @@ use crate::keys::{get_did_key, Secrets};
 use crate::migrations::Migrator;
 use crate::models::*;
 use crate::relationships::*;
+use crate::replication::recon::{kv_recon_fingerprint, kv_recon_item, sort_kv_recon_items};
 use crate::replication::{
     decode_hash, encode_hash, AuthReplicationApplyResponse, AuthReplicationExportRequest,
-    AuthReplicationExportResponse, KvReplicationError, KvReplicationEvent, KvReplicationOperation,
-    KvReconExportRequest, KvReconExportResponse, KvReplicationSequence, ReplicationApplyResponse,
+    AuthReplicationExportResponse, KvReconExportRequest, KvReconExportResponse, KvReplicationError,
+    KvReplicationEvent, KvReplicationOperation, KvReplicationSequence, ReplicationApplyResponse,
     ReplicationExportRequest, ReplicationExportResponse,
 };
-use crate::replication::recon::{kv_recon_fingerprint, kv_recon_item, sort_kv_recon_items};
 use crate::storage::{
     either::EitherError, Content, HashBuffer, ImmutableDeleteStore, ImmutableReadStore,
     ImmutableStaging, ImmutableWriteStore, StorageSetup, StoreSize,
@@ -439,7 +439,10 @@ where
             .map(parse_replication_path)
             .transpose()?;
         let writes = select_kv_recon_writes(&self.conn, &space_id, prefix.as_ref()).await?;
-        let mut items = writes.into_iter().map(|write| kv_recon_item(&write)).collect::<Vec<_>>();
+        let mut items = writes
+            .into_iter()
+            .map(|write| kv_recon_item(&write))
+            .collect::<Vec<_>>();
         sort_kv_recon_items(&mut items);
 
         Ok(KvReconExportResponse {

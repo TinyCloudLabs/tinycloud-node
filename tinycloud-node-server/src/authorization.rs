@@ -58,10 +58,9 @@ macro_rules! impl_session_token_fromreq {
             async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
                 match session_token_from_header(request, $name) {
                     Some(token) if !token.trim().is_empty() => Outcome::Success($type(token)),
-                    Some(_) => Outcome::Error((
-                        Status::Unauthorized,
-                        "invalid replication session token",
-                    )),
+                    Some(_) => {
+                        Outcome::Error((Status::Unauthorized, "invalid replication session token"))
+                    }
                     None => Outcome::Forward(Status::Unauthorized),
                 }
             }

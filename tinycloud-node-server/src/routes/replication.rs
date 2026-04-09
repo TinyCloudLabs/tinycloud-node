@@ -8,13 +8,13 @@ use tinycloud_core::{
     events::Delegation,
     replication::{
         AuthReplicationApplyResponse, AuthReplicationExportRequest, AuthReplicationExportResponse,
-        AuthReplicationReconcileRequest, KvReconExportRequest, KvReconExportResponse,
-        KvReplicationError, ReplicationExportRequest, ReplicationExportResponse,
-        ReplicationReconcileRequest, ReplicationRouteStatus, ReplicationScope,
-        ReplicationService, ReplicationSessionError, ReplicationSessionOpenRequest,
-        ReplicationSessionOpenResponse, ReplicationSessionRecord, ReplicationSessionSummary,
-        SqlReplicationApplyResponse, SqlReplicationExportRequest, SqlReplicationExportResponse,
-        SqlReplicationReconcileRequest,
+        AuthReplicationReconcileRequest, KvReconCompareRequest, KvReconCompareResponse,
+        KvReconExportRequest, KvReconExportResponse, KvReplicationError, ReplicationExportRequest,
+        ReplicationExportResponse, ReplicationReconcileRequest, ReplicationRouteStatus,
+        ReplicationScope, ReplicationService, ReplicationSessionError,
+        ReplicationSessionOpenRequest, ReplicationSessionOpenResponse, ReplicationSessionRecord,
+        ReplicationSessionSummary, SqlReplicationApplyResponse, SqlReplicationExportRequest,
+        SqlReplicationExportResponse, SqlReplicationReconcileRequest,
     },
     sql::{SqlError, SqlService},
     types::Resource,
@@ -36,6 +36,7 @@ pub async fn replication_info(
             "POST /replication/auth/reconcile",
             "POST /replication/export",
             "POST /replication/recon/export",
+            "POST /replication/recon/compare",
             "POST /replication/reconcile",
             "POST /replication/sql/export",
             "POST /replication/sql/reconcile",
@@ -191,6 +192,71 @@ pub async fn recon_export(
         .await
         .map(Json)
         .map_err(map_replication_error)
+}
+
+#[post("/replication/recon/compare", format = "json", data = "<request>")]
+pub async fn recon_compare(
+    request: Json<KvReconCompareRequest>,
+    token: Option<ReplicationSessionToken>,
+    peer_token: Option<PeerReplicationSessionToken>,
+    replication: &State<ReplicationService>,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Json<KvReconCompareResponse>, (Status, String)> {
+    let scope = ReplicationScope::Kv {
+        prefix: request.prefix.clone(),
+    };
+    let session = authorize_session_scope(&request.space_id, &scope, token, replication)?;
+    ensure_replication_session_active(&session, tinycloud).await?;
+    let peer_token = peer_token.ok_or_else(|| {
+        (
+            Status::Unauthorized,
+            "missing Peer-Replication-Session for recon compare".to_string(),
+        )
+    })?;
+    let peer_url = request.peer_url.trim_end_matches('/');
+    let export = reqwest::Client::new()
+        .post(format!("{peer_url}/replication/recon/export"))
+        .header("Replication-Session", peer_token.0)
+        .json(&KvReconExportRequest {
+            space_id: request.space_id.clone(),
+            prefix: request.prefix.clone(),
+        })
+        .send()
+        .await
+        .map_err(|error| (Status::BadGateway, error.to_string()))?;
+
+    if !export.status().is_success() {
+        return Err(map_peer_error("peer recon export failed", export).await);
+    }
+
+    let peer = export
+        .json::<KvReconExportResponse>()
+        .await
+        .map_err(|error| (Status::BadGateway, error.to_string()))?;
+    let local = tinycloud
+        .export_kv_recon(&KvReconExportRequest {
+            space_id: request.space_id.clone(),
+            prefix: request.prefix.clone(),
+        })
+        .await
+        .map_err(map_replication_error)?;
+    let first_mismatch_key =
+        tinycloud_core::replication::recon::first_kv_recon_mismatch(&local.items, &peer.items);
+    let matches = local.fingerprint == peer.fingerprint
+        && local.item_count == peer.item_count
+        && first_mismatch_key.is_none();
+
+    Ok(Json(KvReconCompareResponse {
+        space_id: request.space_id.clone(),
+        prefix: request.prefix.clone(),
+        peer_url: request.peer_url.clone(),
+        matches,
+        local_item_count: local.item_count,
+        peer_item_count: peer.item_count,
+        local_fingerprint: local.fingerprint,
+        peer_fingerprint: peer.fingerprint,
+        first_mismatch_key,
+    }))
 }
 
 #[post("/replication/reconcile", format = "json", data = "<request>")]
