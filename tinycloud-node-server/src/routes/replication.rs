@@ -83,6 +83,16 @@ pub async fn replication_session_open(
     import_supporting_delegations(request.supporting_delegations.as_deref(), tinycloud).await?;
     verify_replication_delegation(delegation, tinycloud).await?;
     ensure_replication_delegation_active(delegation_hash, tinycloud).await?;
+    let space_id: SpaceId = request.space_id.parse().map_err(|_| {
+        (
+            Status::BadRequest,
+            format!("invalid space id: {}", request.space_id),
+        )
+    })?;
+    let server_did = tinycloud
+        .stage_key(&space_id)
+        .await
+        .map_err(|error| (Status::InternalServerError, error.to_string()))?;
 
     let (session_token, record) = replication.open_session(
         requester_did,
@@ -96,6 +106,7 @@ pub async fn replication_session_open(
         session_token,
         space_id: summary.space_id,
         service: summary.service,
+        server_did,
         prefix: summary.prefix,
         db_name: summary.db_name,
         expires_at: summary.expires_at,

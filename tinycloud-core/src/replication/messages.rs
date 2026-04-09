@@ -17,6 +17,7 @@ pub struct ReplicationSessionOpenResponse {
     pub session_token: String,
     pub space_id: String,
     pub service: String,
+    pub server_did: String,
     pub prefix: Option<String>,
     pub db_name: Option<String>,
     pub expires_at: String,
