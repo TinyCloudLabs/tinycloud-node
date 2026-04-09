@@ -18,6 +18,7 @@ use crate::{
 use tinycloud_core::{
     duckdb::{DuckDbCaveats, DuckDbError, DuckDbRequest, DuckDbResponse, DuckDbService},
     events::Invocation,
+    replication::{ReplicationService, ReplicationStatus},
     sea_orm::DbErr,
     sql::{SqlCaveats, SqlError, SqlRequest, SqlService},
     storage::{ImmutableReadStore, ImmutableStaging},
@@ -29,14 +30,31 @@ use tinycloud_core::{
 pub mod admin;
 pub mod attestation;
 pub mod public;
+pub mod replication;
 pub mod util;
 use util::LimitedReader;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeServices {
+    pub kv: bool,
+    pub delegation: bool,
+    pub sharing: bool,
+    pub sql: bool,
+    pub duckdb: bool,
+}
 
 #[derive(Serialize)]
 pub struct NodeInfo {
     pub protocol: u32,
     pub version: String,
     pub features: Vec<&'static str>,
+    #[serde(rename = "rolesSupported")]
+    pub roles_supported: Vec<&'static str>,
+    #[serde(rename = "rolesEnabled")]
+    pub roles_enabled: Vec<&'static str>,
+    pub services: NodeServices,
+    pub replication: ReplicationStatus,
     #[serde(rename = "inTEE")]
     pub in_tee: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -46,15 +64,33 @@ pub struct NodeInfo {
 fn build_info(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
+    replication: &State<ReplicationService>,
 ) -> NodeInfo {
     #[allow(unused_mut)]
-    let mut features = vec!["kv", "delegation", "sharing", "sql", "duckdb"];
+    let mut features = vec![
+        "kv",
+        "delegation",
+        "sharing",
+        "sql",
+        "duckdb",
+        "replication",
+    ];
     #[cfg(feature = "dstack")]
     features.push("tee");
     NodeInfo {
         protocol: tinycloud_auth::protocol::PROTOCOL_VERSION,
         version: env!("CARGO_PKG_VERSION").to_string(),
         features,
+        roles_supported: replication.status().roles_supported.clone(),
+        roles_enabled: replication.status().roles_enabled.clone(),
+        services: NodeServices {
+            kv: true,
+            delegation: true,
+            sharing: true,
+            sql: true,
+            duckdb: true,
+        },
+        replication: replication.status().clone(),
         in_tee: tee.inner().is_some(),
         quota_url: quota_cache.quota_url().map(|s| s.to_string()),
     }
@@ -64,16 +100,18 @@ fn build_info(
 pub fn info(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
+    replication: &State<ReplicationService>,
 ) -> Json<NodeInfo> {
-    Json(build_info(tee, quota_cache))
+    Json(build_info(tee, quota_cache, replication))
 }
 
 #[get("/version")]
 pub fn version(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
+    replication: &State<ReplicationService>,
 ) -> Json<NodeInfo> {
-    Json(build_info(tee, quota_cache))
+    Json(build_info(tee, quota_cache, replication))
 }
 
 #[allow(clippy::let_unit_value)]

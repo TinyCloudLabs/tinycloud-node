@@ -6,6 +6,7 @@ use tinycloud_auth::resource::SpaceId;
 use super::{
     caveats::SqlCaveats,
     database::{spawn_actor, DatabaseHandle},
+    storage,
     types::*,
 };
 
@@ -100,7 +101,34 @@ impl SqlService {
             return Err(SqlError::DatabaseNotFound);
         }
 
-        std::fs::read(&path).map_err(|e| SqlError::Internal(e.to_string()))
+        storage::export_snapshot_from_path(&path)
+    }
+
+    pub async fn import(
+        &self,
+        space: &SpaceId,
+        db_name: &str,
+        snapshot: &[u8],
+    ) -> Result<(), SqlError> {
+        let key = (space.to_string(), db_name.to_string());
+
+        if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
+            match handle.import(snapshot.to_vec()).await {
+                Err(SqlError::Internal(ref msg))
+                    if msg.contains("Database actor not available") =>
+                {
+                    tracing::warn!(space=%space, db=%db_name, "Dead SQL actor detected during import, removing");
+                    self.databases.remove(&key);
+                }
+                other => return other,
+            }
+        }
+
+        let path = std::path::PathBuf::from(&self.base_path)
+            .join(space.to_string())
+            .join(format!("{}.db", db_name));
+
+        storage::import_snapshot_to_path(&path, snapshot)
     }
 
     pub fn db_name_from_path(path: Option<&str>) -> String {
