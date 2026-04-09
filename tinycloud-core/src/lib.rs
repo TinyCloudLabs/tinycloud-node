@@ -18,9 +18,10 @@ pub use db::{Commit, InvocationOutcome, SpaceDatabase, TransactResult, TxError, 
 pub use encryption::ColumnEncryption;
 pub use libp2p;
 pub use replication::{
-    KvReplicationError, ReplicationApplyResponse, ReplicationExportRequest,
-    ReplicationExportResponse, ReplicationReconcileRequest, ReplicationService,
-    ReplicationSessionOpenRequest, ReplicationSessionOpenResponse,
+    AuthReplicationApplyResponse, AuthReplicationExportRequest, AuthReplicationExportResponse,
+    AuthReplicationReconcileRequest, KvReplicationError, ReplicationApplyResponse,
+    ReplicationExportRequest, ReplicationExportResponse, ReplicationReconcileRequest,
+    ReplicationService, ReplicationSessionOpenRequest, ReplicationSessionOpenResponse,
 };
 pub use sea_orm;
 pub use sea_orm_migration;

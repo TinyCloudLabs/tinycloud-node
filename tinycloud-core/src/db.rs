@@ -9,9 +9,10 @@ use crate::migrations::Migrator;
 use crate::models::*;
 use crate::relationships::*;
 use crate::replication::{
-    decode_hash, encode_hash, KvReplicationError, KvReplicationEvent, KvReplicationOperation,
+    decode_hash, encode_hash, AuthReplicationApplyResponse, AuthReplicationExportRequest,
+    AuthReplicationExportResponse, KvReplicationError, KvReplicationEvent, KvReplicationOperation,
     KvReplicationSequence, ReplicationApplyResponse, ReplicationExportRequest,
-    ReplicationExportResponse,
+    ReplicationExportResponse, ReplicationScope,
 };
 use crate::storage::{
     either::EitherError, Content, HashBuffer, ImmutableDeleteStore, ImmutableReadStore,
@@ -19,6 +20,7 @@ use crate::storage::{
 };
 use crate::types::{CapabilitiesReadParams, ListFilters, Metadata, Resource, SpaceIdWrap};
 use crate::util::{Capability, DelegationInfo};
+use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use sea_orm::{
     entity::prelude::*,
     error::{DbErr, RuntimeErr, SqlxError},
@@ -30,7 +32,7 @@ use sea_orm_migration::MigratorTrait;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::str::FromStr;
 use tinycloud_auth::{
-    authorization::{EncodingError, TinyCloudDelegation},
+    authorization::{EncodingError, TinyCloudDelegation, TinyCloudRevocation},
     resource::{Path, SpaceId},
 };
 
@@ -71,9 +73,13 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
     #[error(transparent)]
     InvalidDelegation(#[from] delegation::DelegationError),
     #[error(transparent)]
+    InvalidDelegationInfo(#[from] crate::util::DelegationError),
+    #[error(transparent)]
     InvalidInvocation(#[from] invocation::InvocationError),
     #[error(transparent)]
     InvalidRevocation(#[from] revocation::RevocationError),
+    #[error(transparent)]
+    InvalidRevocationInfo(#[from] crate::util::RevocationError),
     #[error("Epoch Hashing Err: {0}")]
     EpochHashingErr(#[from] HashError),
     #[error(transparent)]
@@ -420,6 +426,82 @@ where
             sequences: sequences.into_values().collect(),
         })
     }
+
+    pub async fn export_auth_replication(
+        &self,
+        request: &AuthReplicationExportRequest,
+    ) -> Result<AuthReplicationExportResponse, KvReplicationError> {
+        let space_id = parse_replication_space_id(&request.space_id)?;
+        let scope = parse_auth_replication_scope(request)?;
+        let (delegations, abilities): (Vec<delegation::Model>, Vec<Vec<abilities::Model>>) =
+            delegation::Entity::find()
+                .find_with_related(abilities::Entity)
+                .all(&self.conn)
+                .await?
+                .into_iter()
+                .unzip();
+        let delegation_ids = delegations
+            .iter()
+            .map(|delegation| delegation.id)
+            .collect::<Vec<_>>();
+        let parent_rows = parent_delegations::Entity::find()
+            .filter(parent_delegations::Column::Child.is_in(delegation_ids))
+            .all(&self.conn)
+            .await?;
+        let mut parent_ids_by_child = HashMap::<Hash, Vec<Hash>>::new();
+        for parent_row in parent_rows {
+            parent_ids_by_child
+                .entry(parent_row.child)
+                .or_default()
+                .push(parent_row.parent);
+        }
+
+        let mut encoded_delegations = HashMap::new();
+        let mut seed_ids = Vec::new();
+
+        for (delegation, ability_list) in delegations.iter().zip(abilities.iter()) {
+            let serialization = crate::encryption::maybe_decrypt(
+                self.encryption.as_ref(),
+                &delegation.serialization,
+            )?;
+            encoded_delegations.insert(
+                delegation.id,
+                TinyCloudDelegation::from_bytes(&serialization)?.encode()?,
+            );
+
+            if delegation_matches_auth_scope(ability_list, &space_id, &scope) {
+                seed_ids.push(delegation.id);
+            }
+        }
+
+        let delegations =
+            ordered_auth_delegations(seed_ids, &parent_ids_by_child, &encoded_delegations);
+        let included_ids: Vec<Hash> = delegations.iter().map(|(hash, _)| *hash).collect();
+        let revocations = if included_ids.is_empty() {
+            Vec::new()
+        } else {
+            revocation::Entity::find()
+                .filter(revocation::Column::Revoked.is_in(included_ids))
+                .order_by_asc(revocation::Column::Id)
+                .all(&self.conn)
+                .await?
+                .into_iter()
+                .map(|revocation| URL_SAFE.encode(&revocation.serialization))
+                .collect()
+        };
+
+        Ok(AuthReplicationExportResponse {
+            space_id: request.space_id.clone(),
+            service: request.service.clone(),
+            prefix: request.prefix.clone(),
+            db_name: request.db_name.clone(),
+            delegations: delegations
+                .into_iter()
+                .map(|(_, delegation)| delegation)
+                .collect(),
+            revocations,
+        })
+    }
 }
 
 impl<C, B, K> SpaceDatabase<C, B, K>
@@ -428,6 +510,74 @@ where
     B: ImmutableReadStore + StorageSetup,
     K: Secrets,
 {
+    pub async fn apply_auth_replication(
+        &self,
+        export: &AuthReplicationExportResponse,
+    ) -> Result<AuthReplicationApplyResponse, TxError<B, K>> {
+        let mut imported_delegations = 0usize;
+        let mut imported_revocations = 0usize;
+
+        for delegation_header in &export.delegations {
+            let delegation =
+                match Delegation::from_header_ser::<TinyCloudDelegation>(delegation_header) {
+                    Ok(delegation) => delegation,
+                    Err(crate::events::FromReqErr::Encoding(error)) => {
+                        return Err(TxError::Encoding(error));
+                    }
+                    Err(crate::events::FromReqErr::TryFrom(error)) => {
+                        return Err(TxError::InvalidDelegationInfo(error));
+                    }
+                };
+            let delegation_hash = delegation.hash();
+
+            if delegation::Entity::find_by_id(delegation_hash)
+                .one(&self.conn)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+
+            self.delegate(delegation).await?;
+            imported_delegations += 1;
+        }
+
+        for revocation_header in &export.revocations {
+            let revocation =
+                match Revocation::from_header_ser::<TinyCloudRevocation>(revocation_header) {
+                    Ok(revocation) => revocation,
+                    Err(crate::events::FromReqErr::Encoding(error)) => {
+                        return Err(TxError::Encoding(error));
+                    }
+                    Err(crate::events::FromReqErr::TryFrom(error)) => {
+                        return Err(TxError::InvalidRevocationInfo(error));
+                    }
+                };
+            let revocation_hash = revocation.hash();
+
+            if revocation::Entity::find_by_id(revocation_hash)
+                .one(&self.conn)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+
+            self.revoke(revocation).await?;
+            imported_revocations += 1;
+        }
+
+        Ok(AuthReplicationApplyResponse {
+            space_id: export.space_id.clone(),
+            peer_url: None,
+            service: export.service.clone(),
+            prefix: export.prefix.clone(),
+            db_name: export.db_name.clone(),
+            imported_delegations,
+            imported_revocations,
+        })
+    }
+
     pub async fn apply_kv_replication<S>(
         &self,
         export: &ReplicationExportResponse,
@@ -1314,6 +1464,163 @@ fn parse_replication_space_id(space_id: &str) -> Result<SpaceId, KvReplicationEr
 
 fn parse_replication_path(path: &str) -> Result<Path, KvReplicationError> {
     Path::from_str(path).map_err(|_| KvReplicationError::InvalidPath(path.to_string()))
+}
+
+fn parse_auth_replication_scope(
+    request: &AuthReplicationExportRequest,
+) -> Result<ReplicationScope, KvReplicationError> {
+    match request.service.as_str() {
+        "kv" => {
+            let prefix = request
+                .prefix
+                .as_deref()
+                .map(|value| value.trim_matches('/'))
+                .filter(|value| !value.is_empty())
+                .map(parse_replication_path)
+                .transpose()?
+                .map(|path| path.to_string());
+            Ok(ReplicationScope::Kv { prefix })
+        }
+        "sql" => {
+            let db_name = request
+                .db_name
+                .as_deref()
+                .map(|value| value.trim_matches('/'))
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| KvReplicationError::InvalidPath("dbName is required".to_string()))?;
+            Ok(ReplicationScope::Sql {
+                db_name: db_name.to_string(),
+            })
+        }
+        other => Err(KvReplicationError::InvalidPath(format!(
+            "unsupported auth replication service: {other}"
+        ))),
+    }
+}
+
+fn delegation_matches_auth_scope(
+    abilities: &[abilities::Model],
+    space_id: &SpaceId,
+    scope: &ReplicationScope,
+) -> bool {
+    abilities.iter().any(|ability| {
+        ability.ability.as_ref().as_ref() == "tinycloud.space/sync"
+            && auth_resource_matches_scope(&ability.resource, space_id, scope)
+    })
+}
+
+fn auth_resource_matches_scope(
+    resource: &Resource,
+    space_id: &SpaceId,
+    scope: &ReplicationScope,
+) -> bool {
+    let Some(resource) = resource.tinycloud_resource() else {
+        return false;
+    };
+
+    if resource.space() != space_id || resource.service().as_str() != "space" {
+        return false;
+    }
+
+    auth_scope_matches_space_resource(resource.path().map(|path| path.as_str()), scope)
+}
+
+fn auth_scope_matches_space_resource(
+    delegated_path: Option<&str>,
+    requested_scope: &ReplicationScope,
+) -> bool {
+    let Some(delegated_path) = delegated_path.map(|value| value.trim_matches('/')) else {
+        return true;
+    };
+
+    if delegated_path.is_empty() {
+        return true;
+    }
+
+    match requested_scope {
+        ReplicationScope::Auth => delegated_path == "auth",
+        ReplicationScope::Kv { prefix } => match delegated_path {
+            "kv" => true,
+            _ => delegated_path
+                .strip_prefix("kv/")
+                .map(|delegated_prefix| {
+                    auth_scope_path_is_subset(prefix.as_deref(), Some(delegated_prefix))
+                })
+                .unwrap_or(false),
+        },
+        ReplicationScope::Sql { db_name } => match delegated_path {
+            "sql" => true,
+            _ => delegated_path
+                .strip_prefix("sql/")
+                .map(|delegated_db| delegated_db.trim_matches('/') == db_name.trim_matches('/'))
+                .unwrap_or(false),
+        },
+    }
+}
+
+fn auth_scope_path_is_subset(requested: Option<&str>, delegated: Option<&str>) -> bool {
+    match (
+        requested
+            .map(|value| value.trim_matches('/'))
+            .filter(|value| !value.is_empty()),
+        delegated
+            .map(|value| value.trim_matches('/'))
+            .filter(|value| !value.is_empty()),
+    ) {
+        (_, None) => true,
+        (None, Some(_)) => false,
+        (Some(requested), Some(delegated)) => {
+            requested == delegated || requested.starts_with(&format!("{delegated}/"))
+        }
+    }
+}
+
+fn ordered_auth_delegations(
+    seed_ids: Vec<Hash>,
+    parent_ids_by_child: &HashMap<Hash, Vec<Hash>>,
+    encoded_delegations: &HashMap<Hash, String>,
+) -> Vec<(Hash, String)> {
+    let mut ordered = Vec::new();
+    let mut discovered = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut stack = seed_ids
+        .into_iter()
+        .rev()
+        .map(|hash| (hash, false))
+        .collect::<Vec<_>>();
+
+    while let Some((hash, expanded)) = stack.pop() {
+        if seen.contains(&hash) {
+            continue;
+        }
+
+        if expanded {
+            if let Some(encoded) = encoded_delegations.get(&hash) {
+                seen.insert(hash);
+                ordered.push((hash, encoded.clone()));
+            }
+            continue;
+        }
+
+        if !encoded_delegations.contains_key(&hash) {
+            continue;
+        }
+
+        if !discovered.insert(hash) {
+            continue;
+        }
+
+        stack.push((hash, true));
+        if let Some(parents) = parent_ids_by_child.get(&hash) {
+            for parent in parents.iter().rev() {
+                if !seen.contains(parent) {
+                    stack.push((*parent, false));
+                }
+            }
+        }
+    }
+
+    ordered
 }
 
 async fn select_kv_replication_seqs<C: ConnectionTrait>(

@@ -47,6 +47,50 @@ pub struct ReplicationReconcileRequest {
     pub limit: Option<usize>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthReplicationExportRequest {
+    pub space_id: String,
+    pub service: String,
+    pub prefix: Option<String>,
+    pub db_name: Option<String>,
+    pub supporting_delegations: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthReplicationReconcileRequest {
+    pub peer_url: String,
+    pub space_id: String,
+    pub service: String,
+    pub prefix: Option<String>,
+    pub db_name: Option<String>,
+    pub supporting_delegations: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthReplicationExportResponse {
+    pub space_id: String,
+    pub service: String,
+    pub prefix: Option<String>,
+    pub db_name: Option<String>,
+    pub delegations: Vec<String>,
+    pub revocations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthReplicationApplyResponse {
+    pub space_id: String,
+    pub peer_url: Option<String>,
+    pub service: String,
+    pub prefix: Option<String>,
+    pub db_name: Option<String>,
+    pub imported_delegations: usize,
+    pub imported_revocations: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ReplicationExportResponse {
