@@ -156,6 +156,7 @@ pub struct KvReconSplitReconcileRequest {
     pub space_id: String,
     pub prefix: Option<String>,
     pub child_limit: Option<usize>,
+    pub max_depth: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
