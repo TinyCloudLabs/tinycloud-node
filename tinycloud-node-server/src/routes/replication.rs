@@ -9,12 +9,12 @@ use tinycloud_core::{
     replication::{
         AuthReplicationApplyResponse, AuthReplicationExportRequest, AuthReplicationExportResponse,
         AuthReplicationReconcileRequest, KvReconCompareRequest, KvReconCompareResponse,
-        KvReconExportRequest, KvReconExportResponse, KvReplicationError, ReplicationExportRequest,
-        ReplicationExportResponse, ReplicationReconcileRequest, ReplicationRouteStatus,
-        ReplicationScope, ReplicationService, ReplicationSessionError,
-        ReplicationSessionOpenRequest, ReplicationSessionOpenResponse, ReplicationSessionRecord,
-        ReplicationSessionSummary, SqlReplicationApplyResponse, SqlReplicationExportRequest,
-        SqlReplicationExportResponse, SqlReplicationReconcileRequest,
+        KvReconExportRequest, KvReconExportResponse, KvReconSplitRequest, KvReconSplitResponse,
+        KvReplicationError, ReplicationExportRequest, ReplicationExportResponse,
+        ReplicationReconcileRequest, ReplicationRouteStatus, ReplicationScope, ReplicationService,
+        ReplicationSessionError, ReplicationSessionOpenRequest, ReplicationSessionOpenResponse,
+        ReplicationSessionRecord, ReplicationSessionSummary, SqlReplicationApplyResponse,
+        SqlReplicationExportRequest, SqlReplicationExportResponse, SqlReplicationReconcileRequest,
     },
     sql::{SqlError, SqlService},
     types::Resource,
@@ -36,6 +36,7 @@ pub async fn replication_info(
             "POST /replication/auth/reconcile",
             "POST /replication/export",
             "POST /replication/recon/export",
+            "POST /replication/recon/split",
             "POST /replication/recon/compare",
             "POST /replication/reconcile",
             "POST /replication/sql/export",
@@ -194,6 +195,27 @@ pub async fn recon_export(
         .map_err(map_replication_error)
 }
 
+#[post("/replication/recon/split", format = "json", data = "<request>")]
+pub async fn recon_split(
+    request: Json<KvReconSplitRequest>,
+    token: Option<ReplicationSessionToken>,
+    replication: &State<ReplicationService>,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Json<KvReconSplitResponse>, (Status, String)> {
+    ensure_peer_serving_enabled(replication)?;
+    let scope = ReplicationScope::Kv {
+        prefix: request.prefix.clone(),
+    };
+    let session = authorize_session_scope(&request.space_id, &scope, token, replication)?;
+    ensure_replication_session_active(&session, tinycloud).await?;
+
+    tinycloud
+        .export_kv_recon_split(&request)
+        .await
+        .map(Json)
+        .map_err(map_replication_error)
+}
+
 #[post("/replication/recon/compare", format = "json", data = "<request>")]
 pub async fn recon_compare(
     request: Json<KvReconCompareRequest>,
@@ -220,6 +242,8 @@ pub async fn recon_compare(
         .json(&KvReconExportRequest {
             space_id: request.space_id.clone(),
             prefix: request.prefix.clone(),
+            start_after: request.start_after.clone(),
+            limit: request.limit,
         })
         .send()
         .await
@@ -237,6 +261,8 @@ pub async fn recon_compare(
         .export_kv_recon(&KvReconExportRequest {
             space_id: request.space_id.clone(),
             prefix: request.prefix.clone(),
+            start_after: request.start_after.clone(),
+            limit: request.limit,
         })
         .await
         .map_err(map_replication_error)?;
@@ -250,9 +276,15 @@ pub async fn recon_compare(
         space_id: request.space_id.clone(),
         prefix: request.prefix.clone(),
         peer_url: request.peer_url.clone(),
+        start_after: request.start_after.clone(),
+        limit: request.limit,
         matches,
         local_item_count: local.item_count,
         peer_item_count: peer.item_count,
+        local_has_more: local.has_more,
+        peer_has_more: peer.has_more,
+        local_next_start_after: local.next_start_after,
+        peer_next_start_after: peer.next_start_after,
         local_fingerprint: local.fingerprint,
         peer_fingerprint: peer.fingerprint,
         first_mismatch_key,

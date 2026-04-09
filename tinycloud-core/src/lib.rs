@@ -22,9 +22,10 @@ pub use libp2p;
 pub use replication::{
     AuthReplicationApplyResponse, AuthReplicationExportRequest, AuthReplicationExportResponse,
     AuthReplicationReconcileRequest, KvReconCompareRequest, KvReconCompareResponse,
-    KvReconExportRequest, KvReconExportResponse, KvReplicationError, ReplicationApplyResponse,
-    ReplicationExportRequest, ReplicationExportResponse, ReplicationReconcileRequest,
-    ReplicationService, ReplicationSessionOpenRequest, ReplicationSessionOpenResponse,
+    KvReconExportRequest, KvReconExportResponse, KvReconSplitChild, KvReconSplitRequest,
+    KvReconSplitResponse, KvReplicationError, ReplicationApplyResponse, ReplicationExportRequest,
+    ReplicationExportResponse, ReplicationReconcileRequest, ReplicationService,
+    ReplicationSessionOpenRequest, ReplicationSessionOpenResponse,
 };
 pub use sea_orm;
 pub use sea_orm_migration;
