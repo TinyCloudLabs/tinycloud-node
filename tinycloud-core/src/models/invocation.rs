@@ -145,20 +145,16 @@ async fn validate<C: ConnectionTrait>(
                 .await?;
 
             // check parent identifies correct invoker
-            parents
-                .iter()
-                .map(|(p, _)| {
-                    if p.delegatee != invocation.invoker
-                        && !invocation.invoker.starts_with(&p.delegatee)
-                    {
-                        Err(InvocationError::UnauthorizedInvoker(
-                            invocation.invoker.clone(),
-                        ))
-                    } else {
-                        Ok(())
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            for (p, _) in &parents {
+                if p.delegatee != invocation.invoker
+                    && !invocation.invoker.starts_with(&p.delegatee)
+                {
+                    return Err(InvocationError::UnauthorizedInvoker(
+                        invocation.invoker.clone(),
+                    )
+                    .into());
+                }
+            }
 
             let now = time.unwrap_or_else(OffsetDateTime::now_utc);
 
