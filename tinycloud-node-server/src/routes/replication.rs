@@ -58,6 +58,7 @@ pub async fn replication_session_open(
     ensure_sync_scope(&delegation.0.capabilities, &requested_resource, &scope)?;
     let requester_did = delegation.0.delegate.clone();
 
+    import_supporting_delegations(request.supporting_delegations.as_deref(), tinycloud).await?;
     verify_replication_delegation(delegation, tinycloud).await?;
 
     let (session_token, record) =
@@ -236,9 +237,30 @@ async fn verify_replication_delegation(
         .await
         .map_err(|error| match error {
             TxError::SpaceNotFound => (Status::NotFound, error.to_string()),
-            TxError::Db(_) => (Status::InternalServerError, error.to_string()),
+            TxError::Db(tinycloud_core::sea_orm::DbErr::ConnectionAcquire(_)) => {
+                (Status::InternalServerError, error.to_string())
+            }
             _ => (Status::Unauthorized, error.to_string()),
         })?;
+    Ok(())
+}
+
+async fn import_supporting_delegations(
+    supporting_delegations: Option<&[String]>,
+    tinycloud: &State<TinyCloud>,
+) -> Result<(), (Status, String)> {
+    let Some(supporting_delegations) = supporting_delegations else {
+        return Ok(());
+    };
+
+    for delegation_header in supporting_delegations {
+        let delegation = Delegation::from_header_ser::<
+            tinycloud_auth::authorization::TinyCloudDelegation,
+        >(delegation_header)
+        .map_err(|error| (Status::BadRequest, error.to_string()))?;
+        verify_replication_delegation(delegation, tinycloud).await?;
+    }
+
     Ok(())
 }
 
