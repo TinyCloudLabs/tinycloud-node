@@ -82,6 +82,9 @@ impl Operation {
                 space,
                 key,
                 version,
+                seq,
+                epoch,
+                epoch_seq,
             },
         }
     }
@@ -109,6 +112,9 @@ pub(crate) enum VersionedOperation {
         space: SpaceId,
         key: Path,
         version: Option<(i64, Hash, i64)>,
+        seq: i64,
+        epoch: Hash,
+        epoch_seq: i64,
     },
 }
 
@@ -204,6 +210,7 @@ fn hash_inv(inv_hash: &Hash, sp: &SpaceId, ops: &[Operation]) -> Result<OneOrMan
                 space,
                 key,
                 version,
+                ..
             } if space == sp => Some(Op::KvDelete {
                 key,
                 version: version.map(|(v, h, s)| (v, h.to_cid(CBOR_CODEC), s)),

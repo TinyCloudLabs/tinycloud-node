@@ -72,6 +72,12 @@ pub struct HooksConfig {
     pub max_active_sse_streams: usize,
     #[serde(default = "default_hooks_sse_broadcast_capacity")]
     pub sse_broadcast_capacity: usize,
+    #[serde(default = "default_hooks_max_webhook_subscriptions_per_space")]
+    pub max_webhook_subscriptions_per_space: usize,
+    #[serde(default = "default_hooks_webhook_timeout_seconds")]
+    pub webhook_timeout_seconds: u64,
+    #[serde(default = "default_hooks_webhook_max_attempts")]
+    pub webhook_max_attempts: usize,
 }
 
 fn default_hooks_max_ticket_ttl_seconds() -> u64 {
@@ -90,6 +96,18 @@ fn default_hooks_sse_broadcast_capacity() -> usize {
     1024
 }
 
+fn default_hooks_max_webhook_subscriptions_per_space() -> usize {
+    5
+}
+
+fn default_hooks_webhook_timeout_seconds() -> u64 {
+    10
+}
+
+fn default_hooks_webhook_max_attempts() -> usize {
+    5
+}
+
 impl Default for HooksConfig {
     fn default() -> Self {
         Self {
@@ -97,6 +115,10 @@ impl Default for HooksConfig {
             max_scopes_per_ticket: default_hooks_max_scopes_per_ticket(),
             max_active_sse_streams: default_hooks_max_active_sse_streams(),
             sse_broadcast_capacity: default_hooks_sse_broadcast_capacity(),
+            max_webhook_subscriptions_per_space: default_hooks_max_webhook_subscriptions_per_space(
+            ),
+            webhook_timeout_seconds: default_hooks_webhook_timeout_seconds(),
+            webhook_max_attempts: default_hooks_webhook_max_attempts(),
         }
     }
 }

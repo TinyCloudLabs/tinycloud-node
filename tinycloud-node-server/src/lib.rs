@@ -22,6 +22,7 @@ pub mod routes;
 pub mod storage;
 pub mod tee;
 mod tracing;
+pub mod webhook_dispatcher;
 
 use config::{BlockStorage, Config, Keys, StagingStorage};
 use hooks::HookRuntime;
@@ -30,7 +31,7 @@ use routes::{
     admin::{delete_quota, get_quota, list_quotas, set_quota},
     attestation::attestation,
     delegate,
-    hooks::{create_hook_ticket, hook_events},
+    hooks::{create_hook_ticket, create_webhook, delete_webhook, hook_events, list_webhooks},
     info, invoke, open_host_key,
     public::{public_kv_get, public_kv_head, public_kv_list, public_kv_options, RateLimiter},
     util_routes::*,
@@ -47,8 +48,9 @@ use tinycloud_core::{
     sea_orm::{ConnectOptions, Database, DatabaseConnection},
     sql::SqlService,
     storage::{either::Either, memory::MemoryStaging, StorageConfig},
-    SpaceDatabase,
+    ColumnEncryption, SpaceDatabase,
 };
+use webhook_dispatcher::{spawn_webhook_dispatcher, WebhookDispatcher};
 
 pub type BlockStores = Either<S3BlockStore, FileSystemStore>;
 pub type BlockConfig = Either<S3BlockConfig, FileSystemConfig>;
@@ -113,6 +115,9 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         delegate,
         create_hook_ticket,
         hook_events,
+        create_webhook,
+        list_webhooks,
+        delete_webhook,
         public_kv_get,
         public_kv_head,
         public_kv_list,
@@ -125,6 +130,8 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     ];
 
     let key_setup: StaticSecret = resolve_keys(&tinycloud_config.keys).await?;
+    let webhook_encryption =
+        ColumnEncryption::new(key_setup.derive_key(b"tinycloud/hooks/webhook-secrets"));
     let hook_runtime = HookRuntime::new(
         tinycloud_config.hooks.clone(),
         key_setup.derive_key(b"tinycloud/hooks/tickets"),
@@ -186,7 +193,8 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         tinycloud_config.storage.blocks.open().await?,
         key_setup.setup(()).await?,
     )
-    .await?;
+    .await?
+    .with_encryption(Some(webhook_encryption.clone()));
 
     let sql_service = SqlService::new(
         tinycloud_config.storage.sql.path.clone().expect("resolved"),
@@ -215,6 +223,12 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     );
 
     let rate_limiter = RateLimiter::new(&tinycloud_config.public_spaces);
+    let webhook_dispatcher = WebhookDispatcher::new(
+        tinycloud.clone(),
+        tinycloud_config.hooks.clone(),
+        webhook_encryption.clone(),
+    )?;
+    spawn_webhook_dispatcher(webhook_dispatcher);
 
     let rocket = rocket::custom(config)
         .mount("/", routes)
@@ -227,6 +241,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         .manage(duckdb_service)
         .manage(quota_cache)
         .manage(hook_runtime)
+        .manage(webhook_encryption)
         .manage(rate_limiter)
         .manage(tee_context)
         .manage(tinycloud_config.storage.staging.open().await?);

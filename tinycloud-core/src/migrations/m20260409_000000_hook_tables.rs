@@ -1,0 +1,157 @@
+use sea_orm_migration::prelude::*;
+
+use crate::models::{hook_delivery, hook_subscription};
+
+#[derive(DeriveMigrationName)]
+pub struct Migration;
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(hook_subscription::Entity)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(hook_subscription::Column::Id)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(hook_subscription::Column::SubscriberDid)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(hook_subscription::Column::SpaceId)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(hook_subscription::Column::TargetService)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(hook_subscription::Column::PathPrefix)
+                            .string()
+                            .null(),
+                    )
+                    .col(
+                        ColumnDef::new(hook_subscription::Column::AbilitiesJson)
+                            .string()
+                            .null(),
+                    )
+                    .col(
+                        ColumnDef::new(hook_subscription::Column::CallbackUrl)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(hook_subscription::Column::EncryptedSecret)
+                            .blob()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(hook_subscription::Column::SecretKeyId)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(hook_subscription::Column::Active)
+                            .boolean()
+                            .not_null()
+                            .default(true),
+                    )
+                    .col(
+                        ColumnDef::new(hook_subscription::Column::CreatedAt)
+                            .string()
+                            .not_null(),
+                    )
+                    .primary_key(Index::create().col(hook_subscription::Column::Id))
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(hook_delivery::Entity)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(hook_delivery::Column::Id)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(hook_delivery::Column::SubscriptionId)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(hook_delivery::Column::EventId)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(hook_delivery::Column::PayloadJson)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(hook_delivery::Column::Status)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(hook_delivery::Column::Attempts)
+                            .big_integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .col(
+                        ColumnDef::new(hook_delivery::Column::NextAttemptAt)
+                            .string()
+                            .null(),
+                    )
+                    .col(
+                        ColumnDef::new(hook_delivery::Column::LastError)
+                            .string()
+                            .null(),
+                    )
+                    .col(
+                        ColumnDef::new(hook_delivery::Column::CreatedAt)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(hook_delivery::Column::DeliveredAt)
+                            .string()
+                            .null(),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_hook_delivery_subscription")
+                            .from(hook_delivery::Entity, hook_delivery::Column::SubscriptionId)
+                            .to(hook_subscription::Entity, hook_subscription::Column::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .primary_key(Index::create().col(hook_delivery::Column::Id))
+                    .to_owned(),
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(hook_delivery::Entity).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(hook_subscription::Entity).to_owned())
+            .await?;
+        Ok(())
+    }
+}
