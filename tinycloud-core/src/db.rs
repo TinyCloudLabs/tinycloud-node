@@ -10,7 +10,7 @@ use crate::models::*;
 use crate::relationships::*;
 use crate::replication::recon::{
     kv_recon_fingerprint, kv_recon_item, sort_kv_recon_items, split_kv_recon_items,
-    window_kv_recon_items,
+    window_kv_recon_items, window_kv_recon_split_children,
 };
 use crate::replication::{
     decode_hash, encode_hash, AuthReplicationApplyResponse, AuthReplicationExportRequest,
@@ -476,13 +476,23 @@ where
                 limit: None,
             })
             .await?;
+        let children = split_kv_recon_items(&export.items, request.prefix.as_deref());
+        let (children, has_more, next_child_start_after) = window_kv_recon_split_children(
+            &children,
+            request.child_start_after.as_deref(),
+            request.child_limit,
+        );
 
         Ok(KvReconSplitResponse {
             space_id: request.space_id.clone(),
             prefix: request.prefix.clone(),
+            child_start_after: request.child_start_after.clone(),
+            child_limit: request.child_limit,
             item_count: export.item_count,
             fingerprint: export.fingerprint,
-            children: split_kv_recon_items(&export.items, request.prefix.as_deref()),
+            has_more,
+            next_child_start_after,
+            children,
         })
     }
 

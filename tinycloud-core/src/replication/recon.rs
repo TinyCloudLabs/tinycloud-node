@@ -101,6 +101,30 @@ pub fn split_kv_recon_items(items: &[KvReconItem], prefix: Option<&str>) -> Vec<
         .collect()
 }
 
+pub fn window_kv_recon_split_children(
+    children: &[KvReconSplitChild],
+    child_start_after: Option<&str>,
+    child_limit: Option<usize>,
+) -> (Vec<KvReconSplitChild>, bool, Option<String>) {
+    let start_index = child_start_after.map_or(0, |cursor| {
+        match children.binary_search_by(|child| child.prefix.as_str().cmp(cursor)) {
+            Ok(index) => index + 1,
+            Err(index) => index,
+        }
+    });
+    let end_index = child_limit.map_or(children.len(), |limit| {
+        start_index.saturating_add(limit).min(children.len())
+    });
+    let window = children[start_index..end_index].to_vec();
+    let has_more = end_index < children.len();
+    let next_child_start_after = window
+        .last()
+        .map(|child| child.prefix.clone())
+        .filter(|_| has_more);
+
+    (window, has_more, next_child_start_after)
+}
+
 pub fn compare_kv_recon_split_children(
     local: &[KvReconSplitChild],
     peer: &[KvReconSplitChild],
@@ -149,6 +173,30 @@ pub fn compare_kv_recon_split_children(
             }
         })
         .collect()
+}
+
+pub fn window_kv_recon_split_comparisons(
+    children: &[KvReconSplitChildComparison],
+    child_start_after: Option<&str>,
+    child_limit: Option<usize>,
+) -> (Vec<KvReconSplitChildComparison>, bool, Option<String>) {
+    let start_index = child_start_after.map_or(0, |cursor| {
+        match children.binary_search_by(|child| child.prefix.as_str().cmp(cursor)) {
+            Ok(index) => index + 1,
+            Err(index) => index,
+        }
+    });
+    let end_index = child_limit.map_or(children.len(), |limit| {
+        start_index.saturating_add(limit).min(children.len())
+    });
+    let window = children[start_index..end_index].to_vec();
+    let has_more = end_index < children.len();
+    let next_child_start_after = window
+        .last()
+        .map(|child| child.prefix.clone())
+        .filter(|_| has_more);
+
+    (window, has_more, next_child_start_after)
 }
 
 pub fn first_kv_recon_mismatch(left: &[KvReconItem], right: &[KvReconItem]) -> Option<String> {

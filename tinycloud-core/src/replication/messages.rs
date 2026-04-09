@@ -89,6 +89,8 @@ pub struct KvReconExportResponse {
 pub struct KvReconSplitRequest {
     pub space_id: String,
     pub prefix: Option<String>,
+    pub child_start_after: Option<String>,
+    pub child_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -105,8 +107,12 @@ pub struct KvReconSplitChild {
 pub struct KvReconSplitResponse {
     pub space_id: String,
     pub prefix: Option<String>,
+    pub child_start_after: Option<String>,
+    pub child_limit: Option<usize>,
     pub item_count: usize,
     pub fingerprint: String,
+    pub has_more: bool,
+    pub next_child_start_after: Option<String>,
     pub children: Vec<KvReconSplitChild>,
 }
 
@@ -116,6 +122,8 @@ pub struct KvReconSplitCompareRequest {
     pub peer_url: String,
     pub space_id: String,
     pub prefix: Option<String>,
+    pub child_start_after: Option<String>,
+    pub child_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -145,7 +153,11 @@ pub struct KvReconSplitCompareResponse {
     pub space_id: String,
     pub prefix: Option<String>,
     pub peer_url: String,
+    pub child_start_after: Option<String>,
+    pub child_limit: Option<usize>,
     pub matches: bool,
+    pub has_more: bool,
+    pub next_child_start_after: Option<String>,
     pub children: Vec<KvReconSplitChildComparison>,
 }
 
