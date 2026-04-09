@@ -14,7 +14,8 @@ use tinycloud_core::{
         KvReconExportRequest, KvReconExportResponse, KvReconSplitChildComparison,
         KvReconSplitCompareRequest, KvReconSplitCompareResponse, KvReconSplitReconcileChildResult,
         KvReconSplitReconcileRequest, KvReconSplitReconcileResponse, KvReconSplitRequest,
-        KvReconSplitResponse, KvReplicationError, ReplicationExportRequest,
+        KvReconSplitResponse, KvReplicationError, KvStateCompareItem, KvStateCompareRequest,
+        KvStateCompareResponse, KvStateRequest, KvStateResponse, ReplicationExportRequest,
         ReplicationExportResponse, ReplicationReconcileRequest, ReplicationRouteStatus,
         ReplicationScope, ReplicationService, ReplicationSessionError,
         ReplicationSessionOpenRequest, ReplicationSessionOpenResponse, ReplicationSessionRecord,
@@ -46,6 +47,8 @@ pub async fn replication_info(
             "POST /replication/auth/export",
             "POST /replication/auth/reconcile",
             "POST /replication/export",
+            "POST /replication/kv/state",
+            "POST /replication/kv/state/compare",
             "POST /replication/recon/export",
             "POST /replication/recon/split",
             "POST /replication/recon/split/compare",
@@ -206,6 +209,118 @@ pub async fn replication_export(
         .await
         .map(Json)
         .map_err(map_replication_error)
+}
+
+#[post("/replication/kv/state", format = "json", data = "<request>")]
+pub async fn kv_state(
+    request: Json<KvStateRequest>,
+    token: Option<ReplicationSessionToken>,
+    replication: &State<ReplicationService>,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Json<KvStateResponse>, (Status, String)> {
+    ensure_peer_serving_enabled(replication)?;
+    let scope = ReplicationScope::Kv {
+        prefix: request.prefix.clone(),
+    };
+    let session = authorize_session_scope(&request.space_id, &scope, token, replication)?;
+    ensure_replication_session_active(&session, tinycloud).await?;
+
+    tinycloud
+        .export_kv_state(&request)
+        .await
+        .map(Json)
+        .map_err(map_replication_error)
+}
+
+#[post("/replication/kv/state/compare", format = "json", data = "<request>")]
+pub async fn kv_state_compare(
+    request: Json<KvStateCompareRequest>,
+    token: Option<ReplicationSessionToken>,
+    peer_token: Option<PeerReplicationSessionToken>,
+    replication: &State<ReplicationService>,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Json<KvStateCompareResponse>, (Status, String)> {
+    let scope = ReplicationScope::Kv {
+        prefix: request.prefix.clone(),
+    };
+    let session = authorize_session_scope(&request.space_id, &scope, token, replication)?;
+    ensure_replication_session_active(&session, tinycloud).await?;
+    let peer_token = peer_token.ok_or_else(|| {
+        (
+            Status::Unauthorized,
+            "missing Peer-Replication-Session for kv state compare".to_string(),
+        )
+    })?;
+    let peer_url = request.peer_url.trim_end_matches('/');
+    let local = tinycloud
+        .export_kv_recon(&KvReconExportRequest {
+            space_id: request.space_id.clone(),
+            prefix: request.prefix.clone(),
+            start_after: request.start_after.clone(),
+            limit: request.limit,
+        })
+        .await
+        .map_err(map_replication_error)?;
+
+    let keys = local
+        .items
+        .iter()
+        .map(|item| item.key.clone())
+        .collect::<Vec<_>>();
+    let peer_state = if keys.is_empty() {
+        KvStateResponse {
+            space_id: request.space_id.clone(),
+            prefix: request.prefix.clone(),
+            items: Vec::new(),
+        }
+    } else {
+        fetch_peer_kv_state(
+            peer_url,
+            &peer_token.0,
+            &KvStateRequest {
+                space_id: request.space_id.clone(),
+                prefix: request.prefix.clone(),
+                keys,
+            },
+        )
+        .await?
+    };
+    let peer_items = peer_state
+        .items
+        .into_iter()
+        .map(|item| (item.key.clone(), item))
+        .collect::<BTreeMap<_, _>>();
+    let items = local
+        .items
+        .into_iter()
+        .map(|item| {
+            let peer = peer_items.get(&item.key);
+            KvStateCompareItem {
+                key: item.key,
+                kind: item.kind,
+                local_invocation_id: Some(item.invocation_id),
+                peer_status: peer
+                    .map(|state| state.status.clone())
+                    .unwrap_or_else(|| "absent".to_string()),
+                peer_seq: peer.and_then(|state| state.seq),
+                peer_invocation_id: peer.and_then(|state| state.invocation_id.clone()),
+                peer_deleted_invocation_id: peer
+                    .and_then(|state| state.deleted_invocation_id.clone()),
+                peer_value_hash: peer.and_then(|state| state.value_hash.clone()),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Json(KvStateCompareResponse {
+        space_id: request.space_id.clone(),
+        prefix: request.prefix.clone(),
+        peer_url: request.peer_url.clone(),
+        start_after: request.start_after.clone(),
+        limit: request.limit,
+        has_more: local.has_more,
+        next_start_after: local.next_start_after,
+        items,
+    }))
 }
 
 #[post("/replication/recon/export", format = "json", data = "<request>")]
@@ -425,6 +540,29 @@ async fn fetch_peer_kv_export(
 
     export
         .json::<ReplicationExportResponse>()
+        .await
+        .map_err(|error| (Status::BadGateway, error.to_string()))
+}
+
+async fn fetch_peer_kv_state(
+    peer_url: &str,
+    peer_token: &str,
+    request: &KvStateRequest,
+) -> Result<KvStateResponse, (Status, String)> {
+    let export = reqwest::Client::new()
+        .post(format!("{peer_url}/replication/kv/state"))
+        .header("Replication-Session", peer_token)
+        .json(request)
+        .send()
+        .await
+        .map_err(|error| (Status::BadGateway, error.to_string()))?;
+
+    if !export.status().is_success() {
+        return Err(map_peer_error("peer kv state failed", export).await);
+    }
+
+    export
+        .json::<KvStateResponse>()
         .await
         .map_err(|error| (Status::BadGateway, error.to_string()))
 }

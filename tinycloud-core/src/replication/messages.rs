@@ -92,6 +92,77 @@ pub struct KvReconExportResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct KvStateRequest {
+    pub space_id: String,
+    pub prefix: Option<String>,
+    pub keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum KvStateStatus {
+    Present,
+    Deleted,
+    Absent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KvStateItem {
+    pub key: String,
+    pub status: String,
+    pub seq: Option<i64>,
+    pub invocation_id: Option<String>,
+    pub deleted_invocation_id: Option<String>,
+    pub value_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KvStateResponse {
+    pub space_id: String,
+    pub prefix: Option<String>,
+    pub items: Vec<KvStateItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KvStateCompareRequest {
+    pub peer_url: String,
+    pub space_id: String,
+    pub prefix: Option<String>,
+    pub start_after: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KvStateCompareItem {
+    pub key: String,
+    pub kind: String,
+    pub local_invocation_id: Option<String>,
+    pub peer_status: String,
+    pub peer_seq: Option<i64>,
+    pub peer_invocation_id: Option<String>,
+    pub peer_deleted_invocation_id: Option<String>,
+    pub peer_value_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KvStateCompareResponse {
+    pub space_id: String,
+    pub prefix: Option<String>,
+    pub peer_url: String,
+    pub start_after: Option<String>,
+    pub limit: Option<usize>,
+    pub has_more: bool,
+    pub next_start_after: Option<String>,
+    pub items: Vec<KvStateCompareItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct KvReconSplitRequest {
     pub space_id: String,
     pub prefix: Option<String>,
