@@ -8,11 +8,15 @@ use crate::keys::{get_did_key, Secrets};
 use crate::migrations::Migrator;
 use crate::models::*;
 use crate::relationships::*;
-use crate::replication::recon::{kv_recon_fingerprint, kv_recon_item, sort_kv_recon_items};
+use crate::replication::recon::{
+    kv_recon_fingerprint, kv_recon_item, sort_kv_recon_items, split_kv_recon_items,
+    window_kv_recon_items,
+};
 use crate::replication::{
     decode_hash, encode_hash, AuthReplicationApplyResponse, AuthReplicationExportRequest,
-    AuthReplicationExportResponse, KvReconExportRequest, KvReconExportResponse, KvReplicationError,
-    KvReplicationEvent, KvReplicationOperation, KvReplicationSequence, ReplicationApplyResponse,
+    AuthReplicationExportResponse, KvReconExportRequest, KvReconExportResponse,
+    KvReconSplitRequest, KvReconSplitResponse, KvReplicationError, KvReplicationEvent,
+    KvReplicationOperation, KvReplicationSequence, ReplicationApplyResponse,
     ReplicationExportRequest, ReplicationExportResponse,
 };
 use crate::storage::{
@@ -444,13 +448,41 @@ where
             .map(|write| kv_recon_item(&write))
             .collect::<Vec<_>>();
         sort_kv_recon_items(&mut items);
+        let (items, has_more, next_start_after) =
+            window_kv_recon_items(&items, request.start_after.as_deref(), request.limit);
 
         Ok(KvReconExportResponse {
             space_id: request.space_id.clone(),
             prefix: request.prefix.clone(),
+            start_after: request.start_after.clone(),
+            limit: request.limit,
             item_count: items.len(),
+            has_more,
+            next_start_after,
             fingerprint: kv_recon_fingerprint(&items),
             items,
+        })
+    }
+
+    pub async fn export_kv_recon_split(
+        &self,
+        request: &KvReconSplitRequest,
+    ) -> Result<KvReconSplitResponse, KvReplicationError> {
+        let export = self
+            .export_kv_recon(&KvReconExportRequest {
+                space_id: request.space_id.clone(),
+                prefix: request.prefix.clone(),
+                start_after: None,
+                limit: None,
+            })
+            .await?;
+
+        Ok(KvReconSplitResponse {
+            space_id: request.space_id.clone(),
+            prefix: request.prefix.clone(),
+            item_count: export.item_count,
+            fingerprint: export.fingerprint,
+            children: split_kv_recon_items(&export.items, request.prefix.as_deref()),
         })
     }
 

@@ -52,6 +52,8 @@ pub struct ReplicationReconcileRequest {
 pub struct KvReconExportRequest {
     pub space_id: String,
     pub prefix: Option<String>,
+    pub start_after: Option<String>,
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -73,9 +75,39 @@ pub struct KvReconItem {
 pub struct KvReconExportResponse {
     pub space_id: String,
     pub prefix: Option<String>,
+    pub start_after: Option<String>,
+    pub limit: Option<usize>,
     pub item_count: usize,
+    pub has_more: bool,
+    pub next_start_after: Option<String>,
     pub fingerprint: String,
     pub items: Vec<KvReconItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KvReconSplitRequest {
+    pub space_id: String,
+    pub prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KvReconSplitChild {
+    pub prefix: String,
+    pub item_count: usize,
+    pub fingerprint: String,
+    pub leaf: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KvReconSplitResponse {
+    pub space_id: String,
+    pub prefix: Option<String>,
+    pub item_count: usize,
+    pub fingerprint: String,
+    pub children: Vec<KvReconSplitChild>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +116,8 @@ pub struct KvReconCompareRequest {
     pub peer_url: String,
     pub space_id: String,
     pub prefix: Option<String>,
+    pub start_after: Option<String>,
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -92,9 +126,15 @@ pub struct KvReconCompareResponse {
     pub space_id: String,
     pub prefix: Option<String>,
     pub peer_url: String,
+    pub start_after: Option<String>,
+    pub limit: Option<usize>,
     pub matches: bool,
     pub local_item_count: usize,
     pub peer_item_count: usize,
+    pub local_has_more: bool,
+    pub peer_has_more: bool,
+    pub local_next_start_after: Option<String>,
+    pub peer_next_start_after: Option<String>,
     pub local_fingerprint: String,
     pub peer_fingerprint: String,
     pub first_mismatch_key: Option<String>,
