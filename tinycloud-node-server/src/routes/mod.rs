@@ -20,14 +20,14 @@ use crate::{
 use tinycloud_core::{
     duckdb::{DuckDbCaveats, DuckDbError, DuckDbRequest, DuckDbResponse, DuckDbService},
     events::Invocation,
-    models::{kv_delete, kv_write},
+    models::{hook_delivery, hook_subscription, kv_delete, kv_write},
     sea_orm::DbErr,
     sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder},
     sql::{SqlCaveats, SqlError, SqlRequest, SqlService},
     storage::{ImmutableReadStore, ImmutableStaging},
     types::Resource,
     util::{DelegationInfo, InvocationInfo},
-    write_hooks::{db_table_path, TouchedTables},
+    write_hooks::{db_table_path, hook_delivery_id, subscription_matches_event, TouchedTables},
     InvocationOutcome, TransactResult, TxError, TxStoreError,
 };
 
@@ -611,8 +611,7 @@ async fn handle_sql_invoke(
         .map(|commit| commit.rev.to_cid(0x55).to_string())
     {
         if let Ok(timestamp) = OffsetDateTime::now_utc().format(&Rfc3339) {
-            publish_database_hook_events(
-                hook_runtime,
+            let events = database_write_events(
                 &space_id,
                 "sql",
                 &db_name,
@@ -621,6 +620,17 @@ async fn handle_sql_invoke(
                 &timestamp,
                 &response.write_targets,
             );
+
+            enqueue_database_webhook_deliveries(tinycloud, &events)
+                .await
+                .map_err(|e| {
+                    (
+                        Status::InternalServerError,
+                        format!("sql write committed but webhook enqueue failed: {e}"),
+                    )
+                })?;
+
+            publish_database_hook_events(hook_runtime, &events);
         }
     }
 
@@ -740,8 +750,7 @@ async fn handle_duckdb_invoke(
         .map(|commit| commit.rev.to_cid(0x55).to_string())
     {
         if let Ok(timestamp) = OffsetDateTime::now_utc().format(&Rfc3339) {
-            publish_database_hook_events(
-                hook_runtime,
+            let events = database_write_events(
                 &space_id,
                 "duckdb",
                 &db_name,
@@ -750,6 +759,17 @@ async fn handle_duckdb_invoke(
                 &timestamp,
                 &response.write_targets,
             );
+
+            enqueue_database_webhook_deliveries(tinycloud, &events)
+                .await
+                .map_err(|e| {
+                    (
+                        Status::InternalServerError,
+                        format!("duckdb write committed but webhook enqueue failed: {e}"),
+                    )
+                })?;
+
+            publish_database_hook_events(hook_runtime, &events);
         }
     }
 
@@ -783,8 +803,7 @@ fn duckdb_error_to_status(err: &DuckDbError) -> Status {
     }
 }
 
-fn publish_database_hook_events(
-    hook_runtime: &HookRuntime,
+fn database_write_events(
     space: &str,
     service: &str,
     db_name: &str,
@@ -792,7 +811,8 @@ fn publish_database_hook_events(
     epoch: &str,
     timestamp: &str,
     write_targets: &[TouchedTables],
-) {
+) -> Vec<WriteEvent> {
+    let mut events = Vec::new();
     let mut event_index = 0u32;
     let ability = database_write_ability(service);
 
@@ -802,7 +822,7 @@ fn publish_database_hook_events(
         };
 
         for table in tables {
-            hook_runtime.bus().publish(WriteEvent {
+            events.push(WriteEvent {
                 id: format!("{epoch}:{event_index}"),
                 space: space.to_string(),
                 service: service.to_string(),
@@ -816,6 +836,76 @@ fn publish_database_hook_events(
             event_index += 1;
         }
     }
+
+    events
+}
+
+fn publish_database_hook_events(hook_runtime: &HookRuntime, events: &[WriteEvent]) {
+    for event in events {
+        hook_runtime.bus().publish(event.clone());
+    }
+}
+
+async fn enqueue_database_webhook_deliveries(
+    tinycloud: &TinyCloud,
+    events: &[WriteEvent],
+) -> Result<(), DbErr> {
+    // Phase 4 guarantee: SQL/DuckDB writes are already committed by the service path
+    // before these durable delivery rows are inserted into metadata storage.
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    let mut cached_subscriptions =
+        HashMap::<(String, String, String), Vec<hook_subscription::Model>>::new();
+    let mut pending = Vec::<hook_delivery::Model>::new();
+
+    for event in events {
+        let Some(path) = event.path.as_deref() else {
+            continue;
+        };
+
+        let cache_key = (event.space.clone(), event.service.clone(), path.to_string());
+
+        if !cached_subscriptions.contains_key(&cache_key) {
+            let rows = tinycloud
+                .list_active_hook_subscriptions(&event.space, &event.service, Some(path))
+                .await?;
+            cached_subscriptions.insert(cache_key.clone(), rows);
+        }
+
+        let subscriptions = cached_subscriptions
+            .get(&cache_key)
+            .expect("subscription cache entry should exist");
+        if subscriptions.is_empty() {
+            continue;
+        }
+
+        let payload_json = serde_json::to_string(event)
+            .expect("database webhook payload serialization should succeed");
+
+        pending.extend(
+            subscriptions
+                .iter()
+                .filter(|subscription| {
+                    subscription_matches_event(subscription, path, &event.ability)
+                })
+                .map(|subscription| hook_delivery::Model {
+                    id: hook_delivery_id(&subscription.id, &event.id),
+                    subscription_id: subscription.id.clone(),
+                    event_id: event.id.clone(),
+                    payload_json: payload_json.clone(),
+                    status: tinycloud_core::db::HOOK_DELIVERY_STATUS_PENDING.to_string(),
+                    attempts: 0,
+                    next_attempt_at: None,
+                    last_error: None,
+                    created_at: event.timestamp.clone(),
+                    delivered_at: None,
+                }),
+        );
+    }
+
+    tinycloud.enqueue_hook_deliveries(pending).await
 }
 
 fn database_write_ability(service: &str) -> &'static str {
@@ -952,11 +1042,22 @@ async fn verify_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::HooksConfig;
+    use crate::{
+        config::HooksConfig, storage::file_system::FileSystemConfig as NodeFileSystemConfig,
+    };
+    use anyhow::Result;
+    use tempfile::TempDir;
     use tinycloud_auth::{
         resolver::DID_METHODS,
         resource::SpaceId,
         ssi::{dids::DIDBuf, jwk::JWK},
+    };
+    use tinycloud_core::{
+        keys::StaticSecret,
+        models::{hook_delivery, hook_subscription},
+        sea_orm::{ColumnTrait, ConnectOptions, Database, EntityTrait, QueryFilter, QueryOrder},
+        storage::either::Either,
+        storage::StorageConfig as _,
     };
     use tokio::time::{timeout, Duration};
 
@@ -966,13 +1067,52 @@ mod tests {
         SpaceId::new(did, name.parse().unwrap())
     }
 
+    async fn test_tinycloud() -> Result<TinyCloud> {
+        let tempdir = TempDir::new()?;
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
+        let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
+        let _persisted = tempdir.keep();
+        Ok(TinyCloud::new(
+            db,
+            Either::B(storage),
+            StaticSecret::new(vec![0u8; 32]).unwrap(),
+        )
+        .await?)
+    }
+
+    fn subscription_model(
+        id: &str,
+        space: &str,
+        service: &str,
+        path_prefix: Option<&str>,
+        abilities: &[&str],
+    ) -> hook_subscription::Model {
+        hook_subscription::Model {
+            id: id.to_string(),
+            subscriber_did: "did:key:test".to_string(),
+            space_id: space.to_string(),
+            target_service: service.to_string(),
+            path_prefix: path_prefix.map(ToString::to_string),
+            abilities_json: hook_subscription::Model::set_abilities(
+                &abilities
+                    .iter()
+                    .map(|ability| ability.to_string())
+                    .collect::<Vec<_>>(),
+            ),
+            callback_url: "https://example.com/hooks".to_string(),
+            encrypted_secret: vec![1, 2, 3],
+            secret_key_id: "primary".to_string(),
+            active: true,
+            created_at: "2026-04-09T00:00:00Z".to_string(),
+        }
+    }
+
     #[tokio::test]
     async fn publish_database_hook_events_emits_table_paths() {
         let hook_runtime = HookRuntime::new(HooksConfig::default(), [7u8; 32]);
         let mut receiver = hook_runtime.bus().subscribe();
 
-        publish_database_hook_events(
-            &hook_runtime,
+        let events = database_write_events(
             "tinycloud:space",
             "sql",
             "main.db",
@@ -985,6 +1125,7 @@ mod tests {
                 TouchedTables::supported(vec!["audit".to_string()]),
             ],
         );
+        publish_database_hook_events(&hook_runtime, &events);
 
         let first = timeout(Duration::from_secs(1), receiver.recv())
             .await
@@ -1015,8 +1156,7 @@ mod tests {
         let hook_runtime = HookRuntime::new(HooksConfig::default(), [8u8; 32]);
         let mut receiver = hook_runtime.bus().subscribe();
 
-        publish_database_hook_events(
-            &hook_runtime,
+        let events = database_write_events(
             "tinycloud:space",
             "duckdb",
             "analytics.duckdb",
@@ -1025,6 +1165,7 @@ mod tests {
             "2026-01-01T00:00:00Z",
             &[TouchedTables::supported(vec!["events".to_string()])],
         );
+        publish_database_hook_events(&hook_runtime, &events);
 
         let event = timeout(Duration::from_secs(1), receiver.recv())
             .await
@@ -1078,5 +1219,99 @@ mod tests {
             err.1,
             "Ambiguous sql capabilities span multiple database paths"
         );
+    }
+
+    #[tokio::test]
+    async fn enqueue_database_webhook_deliveries_persists_matching_sql_and_duckdb() -> Result<()> {
+        let tinycloud = test_tinycloud().await?;
+        let sql_sub = subscription_model(
+            "sub_sql",
+            "tinycloud:space",
+            "sql",
+            Some("main.db/users"),
+            &["tinycloud.sql/write"],
+        );
+        let duck_sub = subscription_model(
+            "sub_duck",
+            "tinycloud:space",
+            "duckdb",
+            Some("analytics.duckdb/events"),
+            &["tinycloud.duckdb/write"],
+        );
+        tinycloud.create_hook_subscription(sql_sub).await?;
+        tinycloud.create_hook_subscription(duck_sub).await?;
+
+        let sql_events = database_write_events(
+            "tinycloud:space",
+            "sql",
+            "main.db",
+            "did:key:alice",
+            "epoch-sql",
+            "2026-04-09T01:00:00Z",
+            &[TouchedTables::supported(vec!["users".to_string()])],
+        );
+        let duck_events = database_write_events(
+            "tinycloud:space",
+            "duckdb",
+            "analytics.duckdb",
+            "did:key:alice",
+            "epoch-duck",
+            "2026-04-09T01:00:01Z",
+            &[TouchedTables::supported(vec!["events".to_string()])],
+        );
+        let mut events = sql_events;
+        events.extend(duck_events);
+
+        enqueue_database_webhook_deliveries(&tinycloud, &events).await?;
+        enqueue_database_webhook_deliveries(&tinycloud, &events).await?;
+
+        let tx = tinycloud.readable().await?;
+        let deliveries = hook_delivery::Entity::find()
+            .order_by_asc(hook_delivery::Column::EventId)
+            .all(&tx)
+            .await?;
+        assert_eq!(deliveries.len(), 2, "duplicate enqueue must be deduped");
+        assert_eq!(
+            deliveries[0].status,
+            tinycloud_core::db::HOOK_DELIVERY_STATUS_PENDING
+        );
+        assert_eq!(
+            deliveries[1].status,
+            tinycloud_core::db::HOOK_DELIVERY_STATUS_PENDING
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enqueue_database_webhook_deliveries_skips_unsupported_write_targets() -> Result<()> {
+        let tinycloud = test_tinycloud().await?;
+        let sql_sub = subscription_model(
+            "sub_sql",
+            "tinycloud:space",
+            "sql",
+            Some("main.db/users"),
+            &["tinycloud.sql/write"],
+        );
+        tinycloud.create_hook_subscription(sql_sub).await?;
+
+        let events = database_write_events(
+            "tinycloud:space",
+            "sql",
+            "main.db",
+            "did:key:alice",
+            "epoch-sql",
+            "2026-04-09T01:00:00Z",
+            &[TouchedTables::unsupported()],
+        );
+        assert!(events.is_empty());
+        enqueue_database_webhook_deliveries(&tinycloud, &events).await?;
+
+        let tx = tinycloud.readable().await?;
+        let deliveries = hook_delivery::Entity::find()
+            .filter(hook_delivery::Column::SubscriptionId.eq("sub_sql"))
+            .all(&tx)
+            .await?;
+        assert!(deliveries.is_empty());
+        Ok(())
     }
 }

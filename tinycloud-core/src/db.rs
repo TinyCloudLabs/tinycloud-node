@@ -303,6 +303,36 @@ where
         Ok(model)
     }
 
+    pub async fn enqueue_hook_deliveries(
+        &self,
+        models: Vec<hook_delivery::Model>,
+    ) -> Result<(), DbErr> {
+        if models.is_empty() {
+            return Ok(());
+        }
+
+        match hook_delivery::Entity::insert_many(
+            models
+                .into_iter()
+                .map(hook_delivery::ActiveModel::from)
+                .collect::<Vec<_>>(),
+        )
+        .on_conflict(
+            OnConflict::column(hook_delivery::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(&self.conn)
+        .await
+        {
+            Err(DbErr::RecordNotInserted) => {}
+            result => {
+                result?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn list_active_hook_subscriptions(
         &self,
         space_id: &str,

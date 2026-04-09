@@ -5,8 +5,8 @@ use super::super::{
     util,
 };
 use crate::encryption::ColumnEncryption;
-use crate::hash::Blake3Hasher;
 use crate::types::{Facts, Resource, SpaceIdWrap};
+use crate::write_hooks::{hook_delivery_id, subscription_matches_event};
 use crate::{hash::Hash, types::Ability};
 use sea_orm::{
     entity::prelude::*, sea_query::OnConflict, Condition, ConnectionTrait, QueryFilter, QueryOrder,
@@ -415,7 +415,7 @@ async fn enqueue_kv_webhook_deliveries<C: ConnectionTrait>(
 
         let pending = subscriptions
             .iter()
-            .filter(|subscription| subscription_matches_kv(subscription, key.as_str(), ability))
+            .filter(|subscription| subscription_matches_event(subscription, key.as_str(), ability))
             .map(|subscription| {
                 hook_delivery::ActiveModel::from(hook_delivery::Model {
                     id: hook_delivery_id(&subscription.id, &event_id),
@@ -448,45 +448,4 @@ async fn enqueue_kv_webhook_deliveries<C: ConnectionTrait>(
 
     let _ = invocation_hash;
     Ok(())
-}
-
-fn subscription_matches_kv(
-    subscription: &hook_subscription::Model,
-    key: &str,
-    ability: &str,
-) -> bool {
-    if !matches_prefix(subscription.path_prefix.as_deref(), key) {
-        return false;
-    }
-
-    match subscription.abilities() {
-        Ok(abilities) => {
-            abilities.is_empty() || abilities.iter().any(|candidate| candidate == ability)
-        }
-        Err(_) => false,
-    }
-}
-
-fn matches_prefix(prefix: Option<&str>, key: &str) -> bool {
-    match prefix.and_then(normalize_prefix) {
-        None => true,
-        Some(prefix) => key == prefix || key.starts_with(&format!("{prefix}/")),
-    }
-}
-
-fn normalize_prefix(prefix: &str) -> Option<&str> {
-    let trimmed = prefix.trim_matches('/');
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
-    }
-}
-
-fn hook_delivery_id(subscription_id: &str, event_id: &str) -> String {
-    let mut hasher = Blake3Hasher::new();
-    hasher.update(subscription_id.as_bytes());
-    hasher.update(b":");
-    hasher.update(event_id.as_bytes());
-    hasher.finalize().to_cid(0x55).to_string()
 }
