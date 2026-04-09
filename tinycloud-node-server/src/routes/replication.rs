@@ -3,6 +3,7 @@ use crate::{
     BlockStage, TinyCloud,
 };
 use rocket::{http::Status, serde::json::Json, State};
+use std::collections::BTreeMap;
 use tinycloud_auth::resource::{Path as ResourcePath, Service, SpaceId};
 use tinycloud_core::{
     events::Delegation,
@@ -10,9 +11,11 @@ use tinycloud_core::{
         AuthReplicationApplyResponse, AuthReplicationExportRequest, AuthReplicationExportResponse,
         AuthReplicationReconcileRequest, KvReconCompareRequest, KvReconCompareResponse,
         KvReconExportRequest, KvReconExportResponse, KvReconSplitCompareRequest,
-        KvReconSplitCompareResponse, KvReconSplitRequest, KvReconSplitResponse, KvReplicationError,
-        ReplicationExportRequest, ReplicationExportResponse, ReplicationReconcileRequest,
-        ReplicationRouteStatus, ReplicationScope, ReplicationService, ReplicationSessionError,
+        KvReconSplitCompareResponse, KvReconSplitReconcileChildResult,
+        KvReconSplitReconcileRequest, KvReconSplitReconcileResponse, KvReconSplitRequest,
+        KvReconSplitResponse, KvReplicationError, ReplicationExportRequest,
+        ReplicationExportResponse, ReplicationReconcileRequest, ReplicationRouteStatus,
+        ReplicationScope, ReplicationService, ReplicationSessionError,
         ReplicationSessionOpenRequest, ReplicationSessionOpenResponse, ReplicationSessionRecord,
         ReplicationSessionSummary, SqlReplicationApplyResponse, SqlReplicationExportRequest,
         SqlReplicationExportResponse, SqlReplicationReconcileRequest,
@@ -41,6 +44,7 @@ pub async fn replication_info(
             "POST /replication/recon/split/compare",
             "POST /replication/recon/compare",
             "POST /replication/reconcile",
+            "POST /replication/reconcile/split",
             "POST /replication/sql/export",
             "POST /replication/sql/reconcile",
         ],
@@ -360,6 +364,68 @@ pub async fn recon_compare(
     }))
 }
 
+async fn fetch_peer_kv_export(
+    peer_url: &str,
+    peer_token: &str,
+    request: &ReplicationExportRequest,
+) -> Result<ReplicationExportResponse, (Status, String)> {
+    let export = reqwest::Client::new()
+        .post(format!("{peer_url}/replication/export"))
+        .header("Replication-Session", peer_token)
+        .json(request)
+        .send()
+        .await
+        .map_err(|error| (Status::BadGateway, error.to_string()))?;
+
+    if !export.status().is_success() {
+        return Err(map_peer_error("peer export failed", export).await);
+    }
+
+    export
+        .json::<ReplicationExportResponse>()
+        .await
+        .map_err(|error| (Status::BadGateway, error.to_string()))
+}
+
+async fn apply_kv_reconcile_from_peer(
+    peer_url: &str,
+    peer_token: &str,
+    request: &ReplicationExportRequest,
+    staging: &BlockStage,
+    tinycloud: &State<TinyCloud>,
+) -> Result<tinycloud_core::replication::ReplicationApplyResponse, (Status, String)> {
+    let export = fetch_peer_kv_export(peer_url, peer_token, request).await?;
+    let mut applied = tinycloud
+        .apply_kv_replication(&export, staging)
+        .await
+        .map_err(map_replication_error)?;
+    applied.peer_url = Some(peer_url.to_string());
+    Ok(applied)
+}
+
+async fn fetch_peer_kv_recon_split(
+    peer_url: &str,
+    peer_token: &str,
+    request: &KvReconSplitRequest,
+) -> Result<KvReconSplitResponse, (Status, String)> {
+    let export = reqwest::Client::new()
+        .post(format!("{peer_url}/replication/recon/split"))
+        .header("Replication-Session", peer_token)
+        .json(request)
+        .send()
+        .await
+        .map_err(|error| (Status::BadGateway, error.to_string()))?;
+
+    if !export.status().is_success() {
+        return Err(map_peer_error("peer recon split failed", export).await);
+    }
+
+    export
+        .json::<KvReconSplitResponse>()
+        .await
+        .map_err(|error| (Status::BadGateway, error.to_string()))
+}
+
 #[post("/replication/reconcile", format = "json", data = "<request>")]
 pub async fn reconcile(
     request: Json<ReplicationReconcileRequest>,
@@ -381,37 +447,141 @@ pub async fn reconcile(
         )
     })?;
     let peer_url = request.peer_url.trim_end_matches('/');
-    let mut export_request = reqwest::Client::new()
-        .post(format!("{peer_url}/replication/export"))
-        .json(&ReplicationExportRequest {
+    let applied = apply_kv_reconcile_from_peer(
+        peer_url,
+        &peer_token.0,
+        &ReplicationExportRequest {
             space_id: request.space_id.clone(),
             prefix: request.prefix.clone(),
             since_seq: request.since_seq,
             limit: request.limit,
-        });
+        },
+        staging.inner(),
+        tinycloud,
+    )
+    .await?;
+    Ok(Json(applied))
+}
 
-    export_request = export_request.header("Replication-Session", peer_token.0);
-
-    let export = export_request
-        .send()
-        .await
-        .map_err(|error| (Status::BadGateway, error.to_string()))?;
-
-    if !export.status().is_success() {
-        return Err(map_peer_error("peer export failed", export).await);
-    }
-
-    let export = export
-        .json::<ReplicationExportResponse>()
-        .await
-        .map_err(|error| (Status::BadGateway, error.to_string()))?;
-
-    let mut applied = tinycloud
-        .apply_kv_replication(&export, staging.inner())
+#[post("/replication/reconcile/split", format = "json", data = "<request>")]
+pub async fn reconcile_split(
+    request: Json<KvReconSplitReconcileRequest>,
+    token: Option<ReplicationSessionToken>,
+    peer_token: Option<PeerReplicationSessionToken>,
+    replication: &State<ReplicationService>,
+    staging: &State<BlockStage>,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Json<KvReconSplitReconcileResponse>, (Status, String)> {
+    let scope = ReplicationScope::Kv {
+        prefix: request.prefix.clone(),
+    };
+    let session = authorize_session_scope(&request.space_id, &scope, token, replication)?;
+    ensure_replication_session_active(&session, tinycloud).await?;
+    let peer_token = peer_token.ok_or_else(|| {
+        (
+            Status::Unauthorized,
+            "missing Peer-Replication-Session for split-driven replication reconcile".to_string(),
+        )
+    })?;
+    let peer_url = request.peer_url.trim_end_matches('/');
+    let split_request = KvReconSplitRequest {
+        space_id: request.space_id.clone(),
+        prefix: request.prefix.clone(),
+    };
+    let peer_before = fetch_peer_kv_recon_split(peer_url, &peer_token.0, &split_request).await?;
+    let local_before = tinycloud
+        .export_kv_recon_split(&split_request)
         .await
         .map_err(map_replication_error)?;
-    applied.peer_url = Some(request.peer_url.clone());
-    Ok(Json(applied))
+    let before_children = tinycloud_core::replication::recon::compare_kv_recon_split_children(
+        &local_before.children,
+        &peer_before.children,
+    );
+    let mut results = before_children
+        .iter()
+        .map(|child| {
+            (
+                child.prefix.clone(),
+                KvReconSplitReconcileChildResult {
+                    prefix: child.prefix.clone(),
+                    before_status: child.status.clone(),
+                    after_status: child.status.clone(),
+                    applied_sequences: 0,
+                    applied_events: 0,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let reconcile_prefixes = before_children
+        .iter()
+        .filter(|child| child.status == "local-missing" || child.status == "mismatch")
+        .map(|child| child.prefix.clone())
+        .take(request.child_limit.unwrap_or(usize::MAX))
+        .collect::<Vec<_>>();
+
+    for prefix in &reconcile_prefixes {
+        let applied = apply_kv_reconcile_from_peer(
+            peer_url,
+            &peer_token.0,
+            &ReplicationExportRequest {
+                space_id: request.space_id.clone(),
+                prefix: Some(prefix.clone()),
+                since_seq: None,
+                limit: None,
+            },
+            staging.inner(),
+            tinycloud,
+        )
+        .await?;
+        if let Some(result) = results.get_mut(prefix) {
+            result.applied_sequences = applied.applied_sequences;
+            result.applied_events = applied.applied_events;
+        }
+    }
+
+    let peer_after = fetch_peer_kv_recon_split(peer_url, &peer_token.0, &split_request).await?;
+    let local_after = tinycloud
+        .export_kv_recon_split(&split_request)
+        .await
+        .map_err(map_replication_error)?;
+    let after_children = tinycloud_core::replication::recon::compare_kv_recon_split_children(
+        &local_after.children,
+        &peer_after.children,
+    );
+    for child in &after_children {
+        results
+            .entry(child.prefix.clone())
+            .and_modify(|result| result.after_status = child.status.clone())
+            .or_insert_with(|| KvReconSplitReconcileChildResult {
+                prefix: child.prefix.clone(),
+                before_status: child.status.clone(),
+                after_status: child.status.clone(),
+                applied_sequences: 0,
+                applied_events: 0,
+            });
+    }
+
+    let reconciled_children = reconcile_prefixes
+        .iter()
+        .filter(|prefix| {
+            results
+                .get(*prefix)
+                .map(|child| child.after_status == "match")
+                .unwrap_or(false)
+        })
+        .count();
+
+    Ok(Json(KvReconSplitReconcileResponse {
+        space_id: request.space_id.clone(),
+        prefix: request.prefix.clone(),
+        peer_url: request.peer_url.clone(),
+        matches: local_after.fingerprint == peer_after.fingerprint
+            && local_after.item_count == peer_after.item_count
+            && after_children.iter().all(|child| child.status == "match"),
+        attempted_children: reconcile_prefixes.len(),
+        reconciled_children,
+        children: results.into_values().collect(),
+    }))
 }
 
 #[post("/replication/sql/export", format = "json", data = "<request>")]

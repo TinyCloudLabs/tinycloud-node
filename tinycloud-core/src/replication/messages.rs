@@ -151,6 +151,37 @@ pub struct KvReconSplitCompareResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct KvReconSplitReconcileRequest {
+    pub peer_url: String,
+    pub space_id: String,
+    pub prefix: Option<String>,
+    pub child_limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KvReconSplitReconcileChildResult {
+    pub prefix: String,
+    pub before_status: String,
+    pub after_status: String,
+    pub applied_sequences: usize,
+    pub applied_events: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KvReconSplitReconcileResponse {
+    pub space_id: String,
+    pub prefix: Option<String>,
+    pub peer_url: String,
+    pub matches: bool,
+    pub attempted_children: usize,
+    pub reconciled_children: usize,
+    pub children: Vec<KvReconSplitReconcileChildResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct KvReconCompareRequest {
     pub peer_url: String,
     pub space_id: String,
