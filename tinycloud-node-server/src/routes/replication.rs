@@ -2,6 +2,7 @@ use crate::{
     authorization::{AuthHeaderGetter, PeerReplicationSessionToken, ReplicationSessionToken},
     BlockStage, TinyCloud,
 };
+use futures::future::BoxFuture;
 use rocket::{http::Status, serde::json::Json, State};
 use std::collections::BTreeMap;
 use tinycloud_auth::resource::{Path as ResourcePath, Service, SpaceId};
@@ -10,8 +11,8 @@ use tinycloud_core::{
     replication::{
         AuthReplicationApplyResponse, AuthReplicationExportRequest, AuthReplicationExportResponse,
         AuthReplicationReconcileRequest, KvReconCompareRequest, KvReconCompareResponse,
-        KvReconExportRequest, KvReconExportResponse, KvReconSplitCompareRequest,
-        KvReconSplitCompareResponse, KvReconSplitReconcileChildResult,
+        KvReconExportRequest, KvReconExportResponse, KvReconSplitChildComparison,
+        KvReconSplitCompareRequest, KvReconSplitCompareResponse, KvReconSplitReconcileChildResult,
         KvReconSplitReconcileRequest, KvReconSplitReconcileResponse, KvReconSplitRequest,
         KvReconSplitResponse, KvReplicationError, ReplicationExportRequest,
         ReplicationExportResponse, ReplicationReconcileRequest, ReplicationRouteStatus,
@@ -25,6 +26,12 @@ use tinycloud_core::{
     util::{Capability, DelegationInfo},
     TxError,
 };
+
+#[derive(Debug, Clone)]
+struct SplitReconcileTarget {
+    replay_prefix: String,
+    result_prefix: String,
+}
 
 #[get("/replication/info")]
 pub async fn replication_info(
@@ -426,6 +433,135 @@ async fn fetch_peer_kv_recon_split(
         .map_err(|error| (Status::BadGateway, error.to_string()))
 }
 
+async fn compare_split_scope(
+    peer_url: &str,
+    peer_token: &str,
+    request: &KvReconSplitRequest,
+    tinycloud: &State<TinyCloud>,
+) -> Result<
+    (
+        KvReconSplitResponse,
+        KvReconSplitResponse,
+        Vec<KvReconSplitChildComparison>,
+    ),
+    (Status, String),
+> {
+    let peer = fetch_peer_kv_recon_split(peer_url, peer_token, request).await?;
+    let local = tinycloud
+        .export_kv_recon_split(request)
+        .await
+        .map_err(map_replication_error)?;
+    let children = tinycloud_core::replication::recon::compare_kv_recon_split_children(
+        &local.children,
+        &peer.children,
+    );
+
+    Ok((local, peer, children))
+}
+
+async fn collect_split_reconcile_targets(
+    peer_url: &str,
+    peer_token: &str,
+    request: &KvReconSplitReconcileRequest,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Vec<SplitReconcileTarget>, (Status, String)> {
+    let child_limit = request.child_limit.unwrap_or(usize::MAX);
+    if child_limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let max_depth = request.max_depth.unwrap_or(1).max(1);
+    let mut targets = Vec::new();
+
+    collect_split_reconcile_targets_for_scope(
+        peer_url,
+        peer_token,
+        &request.space_id,
+        request.prefix.clone(),
+        None,
+        1,
+        max_depth,
+        child_limit,
+        tinycloud,
+        &mut targets,
+    )
+    .await?;
+
+    Ok(targets)
+}
+
+fn collect_split_reconcile_targets_for_scope<'a>(
+    peer_url: &'a str,
+    peer_token: &'a str,
+    space_id: &'a str,
+    prefix: Option<String>,
+    root_prefix: Option<String>,
+    child_depth: usize,
+    max_depth: usize,
+    child_limit: usize,
+    tinycloud: &'a State<TinyCloud>,
+    targets: &'a mut Vec<SplitReconcileTarget>,
+) -> BoxFuture<'a, Result<(), (Status, String)>> {
+    Box::pin(async move {
+        if targets.len() >= child_limit {
+            return Ok(());
+        }
+
+        let (_, _, children) = compare_split_scope(
+            peer_url,
+            peer_token,
+            &KvReconSplitRequest {
+                space_id: space_id.to_string(),
+                prefix: prefix.clone(),
+            },
+            tinycloud,
+        )
+        .await?;
+
+        for child in children {
+            if targets.len() >= child_limit {
+                break;
+            }
+            if child.status != "local-missing" && child.status != "mismatch" {
+                continue;
+            }
+
+            let result_prefix = root_prefix.clone().unwrap_or_else(|| child.prefix.clone());
+            if !child.leaf && child_depth < max_depth {
+                collect_split_reconcile_targets_for_scope(
+                    peer_url,
+                    peer_token,
+                    space_id,
+                    Some(child.prefix.clone()),
+                    Some(result_prefix.clone()),
+                    child_depth + 1,
+                    max_depth,
+                    child_limit,
+                    tinycloud,
+                    targets,
+                )
+                .await?;
+                if targets.len() >= child_limit {
+                    break;
+                }
+                if targets
+                    .iter()
+                    .any(|target| target.result_prefix == result_prefix)
+                {
+                    continue;
+                }
+            }
+
+            targets.push(SplitReconcileTarget {
+                replay_prefix: child.prefix,
+                result_prefix,
+            });
+        }
+
+        Ok(())
+    })
+}
+
 #[post("/replication/reconcile", format = "json", data = "<request>")]
 pub async fn reconcile(
     request: Json<ReplicationReconcileRequest>,
@@ -488,15 +624,8 @@ pub async fn reconcile_split(
         space_id: request.space_id.clone(),
         prefix: request.prefix.clone(),
     };
-    let peer_before = fetch_peer_kv_recon_split(peer_url, &peer_token.0, &split_request).await?;
-    let local_before = tinycloud
-        .export_kv_recon_split(&split_request)
-        .await
-        .map_err(map_replication_error)?;
-    let before_children = tinycloud_core::replication::recon::compare_kv_recon_split_children(
-        &local_before.children,
-        &peer_before.children,
-    );
+    let (_, _, before_children) =
+        compare_split_scope(peer_url, &peer_token.0, &split_request, tinycloud).await?;
     let mut results = before_children
         .iter()
         .map(|child| {
@@ -512,20 +641,16 @@ pub async fn reconcile_split(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let reconcile_prefixes = before_children
-        .iter()
-        .filter(|child| child.status == "local-missing" || child.status == "mismatch")
-        .map(|child| child.prefix.clone())
-        .take(request.child_limit.unwrap_or(usize::MAX))
-        .collect::<Vec<_>>();
+    let reconcile_targets =
+        collect_split_reconcile_targets(peer_url, &peer_token.0, &request, tinycloud).await?;
 
-    for prefix in &reconcile_prefixes {
+    for target in &reconcile_targets {
         let applied = apply_kv_reconcile_from_peer(
             peer_url,
             &peer_token.0,
             &ReplicationExportRequest {
                 space_id: request.space_id.clone(),
-                prefix: Some(prefix.clone()),
+                prefix: Some(target.replay_prefix.clone()),
                 since_seq: None,
                 limit: None,
             },
@@ -533,21 +658,23 @@ pub async fn reconcile_split(
             tinycloud,
         )
         .await?;
-        if let Some(result) = results.get_mut(prefix) {
-            result.applied_sequences = applied.applied_sequences;
-            result.applied_events = applied.applied_events;
-        }
+        results
+            .entry(target.result_prefix.clone())
+            .and_modify(|result| {
+                result.applied_sequences += applied.applied_sequences;
+                result.applied_events += applied.applied_events;
+            })
+            .or_insert_with(|| KvReconSplitReconcileChildResult {
+                prefix: target.result_prefix.clone(),
+                before_status: "local-missing".to_string(),
+                after_status: "local-missing".to_string(),
+                applied_sequences: applied.applied_sequences,
+                applied_events: applied.applied_events,
+            });
     }
 
-    let peer_after = fetch_peer_kv_recon_split(peer_url, &peer_token.0, &split_request).await?;
-    let local_after = tinycloud
-        .export_kv_recon_split(&split_request)
-        .await
-        .map_err(map_replication_error)?;
-    let after_children = tinycloud_core::replication::recon::compare_kv_recon_split_children(
-        &local_after.children,
-        &peer_after.children,
-    );
+    let (local_after, peer_after, after_children) =
+        compare_split_scope(peer_url, &peer_token.0, &split_request, tinycloud).await?;
     for child in &after_children {
         results
             .entry(child.prefix.clone())
@@ -561,8 +688,11 @@ pub async fn reconcile_split(
             });
     }
 
-    let reconciled_children = reconcile_prefixes
+    let reconciled_children = reconcile_targets
         .iter()
+        .map(|target| target.result_prefix.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
         .filter(|prefix| {
             results
                 .get(*prefix)
@@ -578,7 +708,7 @@ pub async fn reconcile_split(
         matches: local_after.fingerprint == peer_after.fingerprint
             && local_after.item_count == peer_after.item_count
             && after_children.iter().all(|child| child.status == "match"),
-        attempted_children: reconcile_prefixes.len(),
+        attempted_children: reconcile_targets.len(),
         reconciled_children,
         children: results.into_values().collect(),
     }))
