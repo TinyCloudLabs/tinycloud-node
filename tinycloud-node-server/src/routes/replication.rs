@@ -8,12 +8,13 @@ use tinycloud_core::{
     events::Delegation,
     replication::{
         AuthReplicationApplyResponse, AuthReplicationExportRequest, AuthReplicationExportResponse,
-        AuthReplicationReconcileRequest, KvReplicationError, ReplicationExportRequest,
-        ReplicationExportResponse, ReplicationReconcileRequest, ReplicationRouteStatus,
-        ReplicationScope, ReplicationService, ReplicationSessionError,
-        ReplicationSessionOpenRequest, ReplicationSessionOpenResponse, ReplicationSessionRecord,
-        ReplicationSessionSummary, SqlReplicationApplyResponse, SqlReplicationExportRequest,
-        SqlReplicationExportResponse, SqlReplicationReconcileRequest,
+        AuthReplicationReconcileRequest, KvReconExportRequest, KvReconExportResponse,
+        KvReplicationError, ReplicationExportRequest, ReplicationExportResponse,
+        ReplicationReconcileRequest, ReplicationRouteStatus, ReplicationScope,
+        ReplicationService, ReplicationSessionError, ReplicationSessionOpenRequest,
+        ReplicationSessionOpenResponse, ReplicationSessionRecord, ReplicationSessionSummary,
+        SqlReplicationApplyResponse, SqlReplicationExportRequest, SqlReplicationExportResponse,
+        SqlReplicationReconcileRequest,
     },
     sql::{SqlError, SqlService},
     types::Resource,
@@ -34,6 +35,7 @@ pub async fn replication_info(
             "POST /replication/auth/export",
             "POST /replication/auth/reconcile",
             "POST /replication/export",
+            "POST /replication/recon/export",
             "POST /replication/reconcile",
             "POST /replication/sql/export",
             "POST /replication/sql/reconcile",
@@ -165,6 +167,27 @@ pub async fn replication_export(
 
     tinycloud
         .export_kv_replication(&request)
+        .await
+        .map(Json)
+        .map_err(map_replication_error)
+}
+
+#[post("/replication/recon/export", format = "json", data = "<request>")]
+pub async fn recon_export(
+    request: Json<KvReconExportRequest>,
+    token: Option<ReplicationSessionToken>,
+    replication: &State<ReplicationService>,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Json<KvReconExportResponse>, (Status, String)> {
+    ensure_peer_serving_enabled(replication)?;
+    let scope = ReplicationScope::Kv {
+        prefix: request.prefix.clone(),
+    };
+    let session = authorize_session_scope(&request.space_id, &scope, token, replication)?;
+    ensure_replication_session_active(&session, tinycloud).await?;
+
+    tinycloud
+        .export_kv_recon(&request)
         .await
         .map(Json)
         .map_err(map_replication_error)

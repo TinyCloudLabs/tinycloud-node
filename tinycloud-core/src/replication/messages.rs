@@ -49,6 +49,37 @@ pub struct ReplicationReconcileRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct KvReconExportRequest {
+    pub space_id: String,
+    pub prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KvReconItem {
+    pub key: String,
+    pub kind: String,
+    pub recon_key: String,
+    pub invocation_id: String,
+    pub seq: i64,
+    pub epoch: String,
+    pub epoch_seq: i64,
+    pub value_hash: String,
+    pub metadata: Metadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KvReconExportResponse {
+    pub space_id: String,
+    pub prefix: Option<String>,
+    pub item_count: usize,
+    pub fingerprint: String,
+    pub items: Vec<KvReconItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AuthReplicationExportRequest {
     pub space_id: String,
 }
