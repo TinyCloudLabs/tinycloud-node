@@ -16,8 +16,8 @@ use crate::replication::{
     decode_hash, encode_hash, AuthReplicationApplyResponse, AuthReplicationExportRequest,
     AuthReplicationExportResponse, KvReconExportRequest, KvReconExportResponse,
     KvReconSplitRequest, KvReconSplitResponse, KvReplicationError, KvReplicationEvent,
-    KvReplicationOperation, KvReplicationSequence, ReplicationApplyResponse,
-    ReplicationExportRequest, ReplicationExportResponse,
+    KvReplicationOperation, KvReplicationSequence, KvStateItem, KvStateRequest, KvStateResponse,
+    KvStateStatus, ReplicationApplyResponse, ReplicationExportRequest, ReplicationExportResponse,
 };
 use crate::storage::{
     either::EitherError, Content, HashBuffer, ImmutableDeleteStore, ImmutableReadStore,
@@ -493,6 +493,69 @@ where
             has_more,
             next_child_start_after,
             children,
+        })
+    }
+
+    pub async fn export_kv_state(
+        &self,
+        request: &KvStateRequest,
+    ) -> Result<KvStateResponse, KvReplicationError> {
+        let space_id = parse_replication_space_id(&request.space_id)?;
+        let prefix = request
+            .prefix
+            .as_deref()
+            .map(parse_replication_path)
+            .transpose()?;
+        let prefix_str = prefix.as_ref().map(|value| value.as_str().to_string());
+        let mut items = Vec::with_capacity(request.keys.len());
+
+        for key in &request.keys {
+            let path = parse_replication_path(key)?;
+            if let Some(prefix) = prefix.as_ref() {
+                let path_str = path.as_str();
+                let prefix_value = prefix.as_str();
+                if path_str != prefix_value && !path_str.starts_with(&format!("{prefix_value}/")) {
+                    return Err(KvReplicationError::InvalidPath(key.clone()));
+                }
+            }
+
+            let present = get_kv_entity(&self.conn, &space_id, &path).await?;
+            let latest_delete = latest_kv_delete(&self.conn, &space_id, &path).await?;
+            let item = if let Some(entry) = present {
+                KvStateItem {
+                    key: path.as_str().to_string(),
+                    status: kv_state_status_label(&KvStateStatus::Present).to_string(),
+                    seq: Some(entry.seq),
+                    invocation_id: Some(encode_hash(entry.invocation)),
+                    deleted_invocation_id: None,
+                    value_hash: Some(encode_hash(entry.value)),
+                }
+            } else if let Some((delete, seq)) = latest_delete {
+                KvStateItem {
+                    key: path.as_str().to_string(),
+                    status: kv_state_status_label(&KvStateStatus::Deleted).to_string(),
+                    seq: Some(seq),
+                    invocation_id: Some(encode_hash(delete.invocation_id)),
+                    deleted_invocation_id: Some(encode_hash(delete.deleted_invocation_id)),
+                    value_hash: None,
+                }
+            } else {
+                KvStateItem {
+                    key: path.as_str().to_string(),
+                    status: kv_state_status_label(&KvStateStatus::Absent).to_string(),
+                    seq: None,
+                    invocation_id: None,
+                    deleted_invocation_id: None,
+                    value_hash: None,
+                }
+            };
+            items.push(item);
+        }
+
+        Ok(KvStateResponse {
+            space_id: request.space_id.clone(),
+            prefix: prefix_str,
+            items,
         })
     }
 
@@ -1826,6 +1889,54 @@ async fn get_kv_entity<C: ConnectionTrait>(
         .one(db)
         .await?
         .map(|(kv, _)| kv))
+}
+
+async fn latest_kv_delete<C: ConnectionTrait>(
+    db: &C,
+    space_id: &SpaceId,
+    key: &Path,
+) -> Result<Option<(kv_delete::Model, i64)>, DbErr> {
+    let deletes = kv_delete::Entity::find()
+        .filter(
+            Condition::all()
+                .add(kv_delete::Column::Key.eq(key.as_str()))
+                .add(kv_delete::Column::Space.eq(SpaceIdWrap(space_id.clone()))),
+        )
+        .all(db)
+        .await?;
+
+    let mut latest = None;
+    for delete in deletes {
+        let Some(ordering) = event_order::Entity::find()
+            .filter(
+                Condition::all()
+                    .add(event_order::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+                    .add(event_order::Column::Event.eq(delete.invocation_id)),
+            )
+            .one(db)
+            .await?
+        else {
+            continue;
+        };
+
+        let replace = latest
+            .as_ref()
+            .map(|(_, seq)| ordering.seq > *seq)
+            .unwrap_or(true);
+        if replace {
+            latest = Some((delete, ordering.seq));
+        }
+    }
+
+    Ok(latest)
+}
+
+fn kv_state_status_label(status: &KvStateStatus) -> &'static str {
+    match status {
+        KvStateStatus::Present => "present",
+        KvStateStatus::Deleted => "deleted",
+        KvStateStatus::Absent => "absent",
+    }
 }
 
 async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(

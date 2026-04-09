@@ -23,7 +23,8 @@ pub use replication::{
     KvReconExportRequest, KvReconExportResponse, KvReconSplitChild, KvReconSplitChildComparison,
     KvReconSplitCompareRequest, KvReconSplitCompareResponse, KvReconSplitReconcileChildResult,
     KvReconSplitReconcileRequest, KvReconSplitReconcileResponse, KvReconSplitRequest,
-    KvReconSplitResponse, KvReplicationError, ReplicationApplyResponse, ReplicationExportRequest,
+    KvReconSplitResponse, KvReplicationError, KvStateCompareItem, KvStateCompareRequest,
+    KvStateCompareResponse, ReplicationApplyResponse, ReplicationExportRequest,
     ReplicationExportResponse, ReplicationReconcileRequest, ReplicationService,
     ReplicationSessionOpenRequest, ReplicationSessionOpenResponse,
 };
