@@ -22,13 +22,19 @@ pub mod storage;
 pub mod tee;
 mod tracing;
 
-use config::{BlockStorage, Config, Keys, StagingStorage};
+use config::{BlockStorage, Config, Keys, ReplicationRole, StagingStorage};
 use quota::QuotaCache;
 use routes::{
     admin::{delete_quota, get_quota, list_quotas, set_quota},
     attestation::attestation,
     delegate, info, invoke, open_host_key,
     public::{public_kv_get, public_kv_head, public_kv_list, public_kv_options, RateLimiter},
+    replication::{
+        auth_reconcile, auth_replication_export, recon_compare, recon_export, recon_split,
+        recon_split_compare, reconcile, replication_export, replication_info,
+        replication_session_open, sql_reconcile, sql_replication_export,
+    },
+    revoke,
     util_routes::*,
     version,
 };
@@ -43,7 +49,7 @@ use tinycloud_core::{
     sea_orm::{ConnectOptions, Database, DatabaseConnection},
     sql::SqlService,
     storage::{either::Either, memory::MemoryStaging, StorageConfig},
-    SpaceDatabase,
+    ReplicationService, SpaceDatabase,
 };
 
 pub type BlockStores = Either<S3BlockStore, FileSystemStore>;
@@ -91,6 +97,7 @@ pub type TinyCloud = SpaceDatabase<DatabaseConnection, BlockStores, StaticSecret
 pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     let mut tinycloud_config: Config = config.extract::<Config>()?;
     tinycloud_config.storage.resolve();
+    tinycloud_config.replication.apply_env_overrides()?;
 
     // Ensure local storage directories exist.
     // SQLite file paths and local dirs are resources the server owns — auto-create them.
@@ -107,6 +114,19 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         open_host_key,
         invoke,
         delegate,
+        revoke,
+        replication_info,
+        replication_session_open,
+        auth_replication_export,
+        auth_reconcile,
+        replication_export,
+        recon_export,
+        recon_split,
+        recon_split_compare,
+        recon_compare,
+        reconcile,
+        sql_replication_export,
+        sql_reconcile,
         public_kv_get,
         public_kv_head,
         public_kv_list,
@@ -210,11 +230,15 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         .mount("/", routes)
         .attach(AdHoc::config::<Config>())
         .attach(tracing::TracingFairing {
-            header_name: tinycloud_config.log.tracing.traceheader,
+            header_name: tinycloud_config.log.tracing.traceheader.clone(),
         })
         .manage(tinycloud)
         .manage(sql_service)
         .manage(duckdb_service)
+        .manage(ReplicationService::with_session_ttl(
+            replication_status(&tinycloud_config),
+            std::time::Duration::from_secs(tinycloud_config.replication.session_ttl_secs),
+        ))
         .manage(quota_cache)
         .manage(rate_limiter)
         .manage(tee_context)
@@ -232,12 +256,12 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
                 resp.set_header(Header::new(
                     // expose response headers to browser-run scripts
                     "Access-Control-Expose-Headers",
-                    "*, Authorization",
+                    "*, Authorization, Replication-Session, Peer-Replication-Session",
                 ));
                 resp.set_header(Header::new(
                     // allow custom headers + Authorization in requests
                     "Access-Control-Allow-Headers",
-                    "*, Authorization",
+                    "*, Authorization, Replication-Session, Peer-Replication-Session",
                 ));
                 resp.set_header(Header::new("Access-Control-Allow-Credentials", "true"));
             })
@@ -330,4 +354,28 @@ async fn ensure_local_dirs(storage: &config::Storage) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn replication_status(config: &Config) -> tinycloud_core::replication::ReplicationStatus {
+    let role_name = match config.replication.role {
+        ReplicationRole::Host => "host",
+        ReplicationRole::Replica => "replica",
+    };
+    let peer_serving = match config.replication.role {
+        ReplicationRole::Host => true,
+        ReplicationRole::Replica => config.replication.peer_serving,
+    };
+
+    tinycloud_core::replication::ReplicationStatus {
+        supported: true,
+        enabled: true,
+        roles_supported: vec!["host", "replica"],
+        roles_enabled: vec![role_name],
+        peer_serving,
+        recon: true,
+        auth_sync: true,
+        authored_fact_exchange: true,
+        notifications: false,
+        snapshots: false,
+    }
 }

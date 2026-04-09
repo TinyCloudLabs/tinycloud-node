@@ -9176,7 +9176,7 @@ dependencies = [
 
 [[package]]
 name = "tinycloud-auth"
-version = "1.1.0"
+version = "1.2.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -9200,11 +9200,12 @@ dependencies = [
 
 [[package]]
 name = "tinycloud-core"
-version = "1.1.0"
+version = "1.2.1"
 dependencies = [
  "aes-gcm",
  "arrow",
  "async-std",
+ "base64 0.22.1",
  "dashmap",
  "duckdb",
  "futures",
@@ -9230,7 +9231,7 @@ dependencies = [
 
 [[package]]
 name = "tinycloud-node-server"
-version = "1.1.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -9270,7 +9271,7 @@ dependencies = [
 
 [[package]]
 name = "tinycloud-sdk-rs"
-version = "1.1.0"
+version = "1.2.1"
 dependencies = [
  "async-trait",
  "hex",
@@ -9288,7 +9289,7 @@ dependencies = [
 
 [[package]]
 name = "tinycloud-sdk-wasm"
-version = "1.1.0"
+version = "1.2.1"
 dependencies = [
  "aes-gcm",
  "chrono",

@@ -3,6 +3,7 @@ use crate::{
     storage::{file_system::FileSystemConfig, s3::S3BlockConfig},
     BlockConfig, BlockStage,
 };
+use anyhow::{bail, Context, Result};
 use rocket::data::ByteUnit;
 use serde::{Deserialize, Serialize};
 use serde_with::{
@@ -10,7 +11,7 @@ use serde_with::{
     formats::Unpadded,
     serde_as, FromInto,
 };
-use std::path::PathBuf;
+use std::{path::PathBuf, str::FromStr};
 use tinycloud_core::keys::StaticSecret;
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
@@ -23,9 +24,93 @@ pub struct Config {
     pub cors: bool,
     pub keys: Keys,
     #[serde(default)]
+    pub replication: ReplicationConfig,
+    #[serde(default)]
     pub tee: TeeConfig,
     #[serde(default)]
     pub public_spaces: PublicSpacesConfig,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct ReplicationConfig {
+    #[serde(default = "default_replication_role")]
+    pub role: ReplicationRole,
+    #[serde(default)]
+    pub peer_serving: bool,
+    #[serde(default = "default_replication_session_ttl_secs")]
+    pub session_ttl_secs: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ReplicationRole {
+    #[default]
+    Host,
+    Replica,
+}
+
+fn default_replication_role() -> ReplicationRole {
+    ReplicationRole::Host
+}
+
+fn default_replication_session_ttl_secs() -> u64 {
+    600
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            role: default_replication_role(),
+            peer_serving: false,
+            session_ttl_secs: default_replication_session_ttl_secs(),
+        }
+    }
+}
+
+impl ReplicationConfig {
+    pub fn apply_env_overrides(&mut self) -> Result<()> {
+        if let Ok(value) = std::env::var("TINYCLOUD_REPLICATION_ROLE") {
+            self.role = value
+                .parse()
+                .context("invalid TINYCLOUD_REPLICATION_ROLE (expected 'host' or 'replica')")?;
+        }
+
+        if let Some(value) = env_bool("TINYCLOUD_REPLICATION_PEER_SERVING")? {
+            self.peer_serving = value;
+        }
+
+        if let Ok(value) = std::env::var("TINYCLOUD_REPLICATION_SESSION_TTL_SECS") {
+            self.session_ttl_secs = value
+                .parse::<u64>()
+                .context("invalid TINYCLOUD_REPLICATION_SESSION_TTL_SECS")?;
+        }
+
+        Ok(())
+    }
+}
+
+impl FromStr for ReplicationRole {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "host" => Ok(Self::Host),
+            "replica" => Ok(Self::Replica),
+            other => bail!("unsupported replication role: {other}"),
+        }
+    }
+}
+
+fn env_bool(name: &str) -> Result<Option<bool>> {
+    let Ok(value) = std::env::var(name) else {
+        return Ok(None);
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(Some(true)),
+        "0" | "false" | "no" | "off" => Ok(Some(false)),
+        other => bail!("invalid {name} value: {other}"),
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
