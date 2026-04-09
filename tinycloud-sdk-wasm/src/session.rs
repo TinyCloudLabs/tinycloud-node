@@ -71,6 +71,11 @@ pub struct SessionConfig {
     /// deriving one from the jwk. Used when delegating to another user's DID.
     #[serde(default)]
     pub delegate_uri: Option<String>,
+    /// Optional SIWE nonce. If provided, this nonce is used in the SIWE message
+    /// instead of generating a random one. Allows the SDK caller to pass through
+    /// a server-issued nonce for replay protection.
+    #[serde(default)]
+    pub nonce: Option<String>,
 }
 
 #[serde_as]
@@ -159,7 +164,7 @@ impl SessionConfig {
                 domain: self.domain,
                 expiration_time: Some(self.expiration_time),
                 issued_at: self.issued_at,
-                nonce: generate_nonce(),
+                nonce: self.nonce.unwrap_or_else(generate_nonce),
                 not_before: self.not_before,
                 request_id: None,
                 statement: None,
