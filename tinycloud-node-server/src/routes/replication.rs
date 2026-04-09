@@ -476,30 +476,58 @@ async fn compare_split_scope(
 async fn collect_split_reconcile_targets(
     peer_url: &str,
     peer_token: &str,
-    request: &KvReconSplitReconcileRequest,
+    space_id: &str,
+    root_children: &[KvReconSplitChildComparison],
+    child_limit: Option<usize>,
+    max_depth: Option<usize>,
     tinycloud: &State<TinyCloud>,
 ) -> Result<Vec<SplitReconcileTarget>, (Status, String)> {
-    let child_limit = request.child_limit.unwrap_or(usize::MAX);
+    let child_limit = child_limit.unwrap_or(usize::MAX);
     if child_limit == 0 {
         return Ok(Vec::new());
     }
 
-    let max_depth = request.max_depth.unwrap_or(1).max(1);
+    let max_depth = max_depth.unwrap_or(1).max(1);
     let mut targets = Vec::new();
 
-    collect_split_reconcile_targets_for_scope(
-        peer_url,
-        peer_token,
-        &request.space_id,
-        request.prefix.clone(),
-        None,
-        1,
-        max_depth,
-        child_limit,
-        tinycloud,
-        &mut targets,
-    )
-    .await?;
+    for child in root_children {
+        if targets.len() >= child_limit {
+            break;
+        }
+        if child.status != "local-missing" && child.status != "mismatch" {
+            continue;
+        }
+
+        if !child.leaf && max_depth > 1 {
+            collect_split_reconcile_targets_for_scope(
+                peer_url,
+                peer_token,
+                space_id,
+                Some(child.prefix.clone()),
+                child.prefix.clone(),
+                2,
+                max_depth,
+                child_limit,
+                tinycloud,
+                &mut targets,
+            )
+            .await?;
+            if targets.len() >= child_limit {
+                break;
+            }
+            if targets
+                .iter()
+                .any(|target| target.result_prefix == child.prefix)
+            {
+                continue;
+            }
+        }
+
+        targets.push(SplitReconcileTarget {
+            replay_prefix: child.prefix.clone(),
+            result_prefix: child.prefix.clone(),
+        });
+    }
 
     Ok(targets)
 }
@@ -509,7 +537,7 @@ fn collect_split_reconcile_targets_for_scope<'a>(
     peer_token: &'a str,
     space_id: &'a str,
     prefix: Option<String>,
-    root_prefix: Option<String>,
+    root_prefix: String,
     child_depth: usize,
     max_depth: usize,
     child_limit: usize,
@@ -542,14 +570,13 @@ fn collect_split_reconcile_targets_for_scope<'a>(
                 continue;
             }
 
-            let result_prefix = root_prefix.clone().unwrap_or_else(|| child.prefix.clone());
             if !child.leaf && child_depth < max_depth {
                 collect_split_reconcile_targets_for_scope(
                     peer_url,
                     peer_token,
                     space_id,
                     Some(child.prefix.clone()),
-                    Some(result_prefix.clone()),
+                    root_prefix.clone(),
                     child_depth + 1,
                     max_depth,
                     child_limit,
@@ -562,7 +589,7 @@ fn collect_split_reconcile_targets_for_scope<'a>(
                 }
                 if targets
                     .iter()
-                    .any(|target| target.result_prefix == result_prefix)
+                    .any(|target| target.result_prefix == root_prefix)
                 {
                     continue;
                 }
@@ -570,7 +597,7 @@ fn collect_split_reconcile_targets_for_scope<'a>(
 
             targets.push(SplitReconcileTarget {
                 replay_prefix: child.prefix,
-                result_prefix,
+                result_prefix: root_prefix.clone(),
             });
         }
 
@@ -642,8 +669,14 @@ pub async fn reconcile_split(
         child_start_after: None,
         child_limit: None,
     };
-    let (_, _, before_children) =
+    let (_, _, before_all_children) =
         compare_split_scope(peer_url, &peer_token.0, &split_request, tinycloud).await?;
+    let (before_children, _, _) =
+        tinycloud_core::replication::recon::window_kv_recon_split_comparisons(
+            &before_all_children,
+            request.child_start_after.as_deref(),
+            request.child_limit,
+        );
     let mut results = before_children
         .iter()
         .map(|child| {
@@ -659,8 +692,16 @@ pub async fn reconcile_split(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let reconcile_targets =
-        collect_split_reconcile_targets(peer_url, &peer_token.0, &request, tinycloud).await?;
+    let reconcile_targets = collect_split_reconcile_targets(
+        peer_url,
+        &peer_token.0,
+        &request.space_id,
+        &before_children,
+        request.child_limit,
+        request.max_depth,
+        tinycloud,
+    )
+    .await?;
 
     for target in &reconcile_targets {
         let applied = apply_kv_reconcile_from_peer(
@@ -691,8 +732,14 @@ pub async fn reconcile_split(
             });
     }
 
-    let (local_after, peer_after, after_children) =
+    let (local_after, peer_after, after_all_children) =
         compare_split_scope(peer_url, &peer_token.0, &split_request, tinycloud).await?;
+    let (after_children, has_more, next_child_start_after) =
+        tinycloud_core::replication::recon::window_kv_recon_split_comparisons(
+            &after_all_children,
+            request.child_start_after.as_deref(),
+            request.child_limit,
+        );
     for child in &after_children {
         results
             .entry(child.prefix.clone())
@@ -723,9 +770,12 @@ pub async fn reconcile_split(
         space_id: request.space_id.clone(),
         prefix: request.prefix.clone(),
         peer_url: request.peer_url.clone(),
+        child_start_after: request.child_start_after.clone(),
+        child_limit: request.child_limit,
         matches: local_after.fingerprint == peer_after.fingerprint
-            && local_after.item_count == peer_after.item_count
-            && after_children.iter().all(|child| child.status == "match"),
+            && local_after.item_count == peer_after.item_count,
+        has_more,
+        next_child_start_after,
         attempted_children: reconcile_targets.len(),
         reconciled_children,
         children: results.into_values().collect(),
