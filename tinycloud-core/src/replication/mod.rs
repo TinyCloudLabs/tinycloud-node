@@ -16,5 +16,5 @@ pub use messages::{
 pub use store::{decode_hash, encode_hash, KvReplicationError};
 pub use types::{
     ReplicationRouteStatus, ReplicationScope, ReplicationService, ReplicationSessionError,
-    ReplicationSessionSummary, ReplicationStatus,
+    ReplicationSessionRecord, ReplicationSessionSummary, ReplicationStatus,
 };

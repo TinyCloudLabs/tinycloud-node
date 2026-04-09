@@ -201,6 +201,38 @@ where
         list(&self.conn, space_id, prefix).await
     }
 
+    pub async fn replication_session_delegation_active(
+        &self,
+        delegation_hash: Option<Hash>,
+    ) -> Result<bool, DbErr> {
+        let Some(delegation_hash) = delegation_hash else {
+            return Ok(true);
+        };
+
+        let now = time::OffsetDateTime::now_utc();
+        let delegation = delegation::Entity::find_by_id(delegation_hash)
+            .one(&self.conn)
+            .await?;
+        let revoked = revocation::Entity::find()
+            .filter(revocation::Column::Revoked.eq(delegation_hash))
+            .one(&self.conn)
+            .await?;
+
+        if revoked.is_some() {
+            return Ok(false);
+        }
+
+        Ok(delegation
+            .map(|delegation| {
+                delegation.expiry.map(|expiry| expiry > now).unwrap_or(true)
+                    && delegation
+                        .not_before
+                        .map(|not_before| not_before <= now)
+                        .unwrap_or(true)
+            })
+            .unwrap_or(false))
+    }
+
     pub async fn export_kv_replication(
         &self,
         request: &ReplicationExportRequest,
@@ -1216,8 +1248,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             delegation_cids,
         })
     } else {
-        // All spaces were skipped (delegation-only with no existing spaces)
-        // Still process delegation events to save the delegation records
+        // Auth-only facts can still be persisted even when no service-space ordering applies.
         let mut delegation_cids = Vec::new();
         for (_, event) in event_hashes {
             match event {
@@ -1225,7 +1256,10 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                     let cid = delegation::process(db, *d, encryption).await?;
                     delegation_cids.push(cid);
                 }
-                Event::Invocation(_, _) | Event::Revocation(_) => {
+                Event::Revocation(r) => {
+                    revocation::process(db, *r).await?;
+                }
+                Event::Invocation(_, _) => {
                     unreachable!("non-delegation events with empty event_spaces")
                 }
             };

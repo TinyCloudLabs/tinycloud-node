@@ -27,7 +27,7 @@ use quota::QuotaCache;
 use routes::{
     admin::{delete_quota, get_quota, list_quotas, set_quota},
     attestation::attestation,
-    delegate, info, invoke, open_host_key,
+    delegate, info, invoke, open_host_key, revoke,
     public::{public_kv_get, public_kv_head, public_kv_list, public_kv_options, RateLimiter},
     replication::{
         reconcile, replication_export, replication_info, replication_session_open, sql_reconcile,
@@ -112,6 +112,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         open_host_key,
         invoke,
         delegate,
+        revoke,
         replication_info,
         replication_session_open,
         replication_export,
