@@ -162,6 +162,7 @@ impl Default for ReplicationRouteStatus {
                 "POST /replication/export",
                 "POST /replication/recon/export",
                 "POST /replication/recon/split",
+                "POST /replication/recon/split/compare",
                 "POST /replication/recon/compare",
                 "POST /replication/reconcile",
                 "POST /replication/sql/export",
