@@ -101,12 +101,22 @@ pub async fn replication_session_open(
         Some(delegation_hash),
     );
     let summary = ReplicationSessionSummary::from_record(&record);
+    let status = replication.status();
 
     Ok(Json(ReplicationSessionOpenResponse {
         session_token,
         space_id: summary.space_id,
         service: summary.service,
         server_did,
+        roles_enabled: status
+            .roles_enabled
+            .iter()
+            .map(|role| (*role).to_string())
+            .collect(),
+        peer_serving: status.peer_serving,
+        can_export: peer_export_allowed(status),
+        recon: status.recon,
+        auth_sync: status.auth_sync,
         prefix: summary.prefix,
         db_name: summary.db_name,
         expires_at: summary.expires_at,
@@ -1175,11 +1185,7 @@ fn ensure_peer_serving_enabled(
         ));
     }
 
-    if status.roles_enabled.contains(&"host") {
-        return Ok(());
-    }
-
-    if status.roles_enabled.contains(&"replica") && status.peer_serving {
+    if peer_export_allowed(status) {
         return Ok(());
     }
 
@@ -1194,6 +1200,12 @@ fn ensure_peer_serving_enabled(
         Status::Forbidden,
         "replication export is not enabled for this node role".to_string(),
     ))
+}
+
+fn peer_export_allowed(status: &tinycloud_core::replication::ReplicationStatus) -> bool {
+    status.enabled
+        && (status.roles_enabled.contains(&"host")
+            || (status.roles_enabled.contains(&"replica") && status.peer_serving))
 }
 
 fn map_replication_error(error: KvReplicationError) -> (Status, String) {
