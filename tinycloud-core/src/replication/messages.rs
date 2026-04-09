@@ -54,7 +54,7 @@ pub struct KvReconExportRequest {
     pub prefix: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct KvReconItem {
     pub key: String,
@@ -76,6 +76,28 @@ pub struct KvReconExportResponse {
     pub item_count: usize,
     pub fingerprint: String,
     pub items: Vec<KvReconItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KvReconCompareRequest {
+    pub peer_url: String,
+    pub space_id: String,
+    pub prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KvReconCompareResponse {
+    pub space_id: String,
+    pub prefix: Option<String>,
+    pub peer_url: String,
+    pub matches: bool,
+    pub local_item_count: usize,
+    pub peer_item_count: usize,
+    pub local_fingerprint: String,
+    pub peer_fingerprint: String,
+    pub first_mismatch_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

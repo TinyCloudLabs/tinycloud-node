@@ -8,8 +8,9 @@ pub mod types;
 
 pub use messages::{
     AuthReplicationApplyResponse, AuthReplicationExportRequest, AuthReplicationExportResponse,
-    AuthReplicationReconcileRequest, KvReconExportRequest, KvReconExportResponse, KvReconItem,
-    KvReplicationEvent, KvReplicationOperation, KvReplicationSequence, ReplicationApplyResponse,
+    AuthReplicationReconcileRequest, KvReconCompareRequest, KvReconCompareResponse,
+    KvReconExportRequest, KvReconExportResponse, KvReconItem, KvReplicationEvent,
+    KvReplicationOperation, KvReplicationSequence, ReplicationApplyResponse,
     ReplicationErrorResponse, ReplicationExportRequest, ReplicationExportResponse,
     ReplicationInfoRequest, ReplicationReconcileRequest, ReplicationSessionOpenRequest,
     ReplicationSessionOpenResponse, SqlReplicationApplyResponse, SqlReplicationExportRequest,

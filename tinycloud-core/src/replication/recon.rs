@@ -1,8 +1,5 @@
 use super::{keys::KvReconKey, messages::KvReconItem, store::encode_hash};
-use crate::{
-    hash::Blake3Hasher,
-    models::kv_write,
-};
+use crate::{hash::Blake3Hasher, models::kv_write};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -51,4 +48,27 @@ pub fn kv_recon_fingerprint(items: &[KvReconItem]) -> String {
         hasher.update(&[0xff]);
     }
     encode_hash(hasher.finalize())
+}
+
+pub fn first_kv_recon_mismatch(left: &[KvReconItem], right: &[KvReconItem]) -> Option<String> {
+    let mismatch_len = left.len().min(right.len());
+    for index in 0..mismatch_len {
+        if left[index].kind != right[index].kind
+            || left[index].recon_key != right[index].recon_key
+            || left[index].invocation_id != right[index].invocation_id
+            || left[index].value_hash != right[index].value_hash
+            || left[index].metadata != right[index].metadata
+        {
+            return Some(left[index].key.clone());
+        }
+    }
+
+    if left.len() > mismatch_len {
+        return left.get(mismatch_len).map(|item| item.key.clone());
+    }
+    if right.len() > mismatch_len {
+        return right.get(mismatch_len).map(|item| item.key.clone());
+    }
+
+    None
 }
