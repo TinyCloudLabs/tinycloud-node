@@ -10,8 +10,8 @@ use tinycloud_core::{
         KvReplicationError, ReplicationExportRequest, ReplicationExportResponse,
         ReplicationReconcileRequest, ReplicationRouteStatus, ReplicationScope, ReplicationService,
         ReplicationSessionError, ReplicationSessionOpenRequest, ReplicationSessionOpenResponse,
-        ReplicationSessionSummary, SqlReplicationApplyResponse, SqlReplicationExportRequest,
-        SqlReplicationExportResponse, SqlReplicationReconcileRequest,
+        ReplicationSessionRecord, ReplicationSessionSummary, SqlReplicationApplyResponse,
+        SqlReplicationExportRequest, SqlReplicationExportResponse, SqlReplicationReconcileRequest,
     },
     sql::{SqlError, SqlService},
     types::Resource,
@@ -57,12 +57,17 @@ pub async fn replication_session_open(
     let requested_resource = requested_resource(&request.space_id, &scope)?;
     ensure_sync_scope(&delegation.0.capabilities, &requested_resource, &scope)?;
     let requester_did = delegation.0.delegate.clone();
+    let delegation_hash = delegation.hash();
 
     import_supporting_delegations(request.supporting_delegations.as_deref(), tinycloud).await?;
     verify_replication_delegation(delegation, tinycloud).await?;
 
-    let (session_token, record) =
-        replication.open_session(requester_did, request.space_id.clone(), scope);
+    let (session_token, record) = replication.open_session(
+        requester_did,
+        request.space_id.clone(),
+        scope,
+        Some(delegation_hash),
+    );
     let summary = ReplicationSessionSummary::from_record(&record);
 
     Ok(Json(ReplicationSessionOpenResponse {
@@ -86,7 +91,8 @@ pub async fn replication_export(
     let scope = ReplicationScope::Kv {
         prefix: request.prefix.clone(),
     };
-    authorize_export_scope(&request.space_id, &scope, token, replication)?;
+    let session = authorize_export_scope(&request.space_id, &scope, token, replication)?;
+    ensure_replication_session_active(&session, tinycloud).await?;
 
     tinycloud
         .export_kv_replication(&request)
@@ -148,12 +154,14 @@ pub async fn sql_replication_export(
     token: Option<ReplicationSessionToken>,
     replication: &State<ReplicationService>,
     sql_service: &State<SqlService>,
+    tinycloud: &State<TinyCloud>,
 ) -> Result<Json<SqlReplicationExportResponse>, (Status, String)> {
     ensure_peer_serving_enabled(replication)?;
     let scope = ReplicationScope::Sql {
         db_name: request.db_name.clone(),
     };
-    authorize_export_scope(&request.space_id, &scope, token, replication)?;
+    let session = authorize_export_scope(&request.space_id, &scope, token, replication)?;
+    ensure_replication_session_active(&session, tinycloud).await?;
 
     let space_id: SpaceId = request.space_id.parse().map_err(|_| {
         (
@@ -269,8 +277,8 @@ fn authorize_export_scope(
     scope: &ReplicationScope,
     token: Option<ReplicationSessionToken>,
     replication: &State<ReplicationService>,
-) -> Result<(), (Status, String)> {
-    replication
+) -> Result<ReplicationSessionRecord, (Status, String)> {
+    let session = replication
         .require_session(
             token.as_ref().map(|value| value.0.as_str()),
             space_id,
@@ -278,7 +286,26 @@ fn authorize_export_scope(
         )
         .map_err(map_replication_session_error)?;
 
-    Ok(())
+    Ok(session)
+}
+
+async fn ensure_replication_session_active(
+    session: &ReplicationSessionRecord,
+    tinycloud: &State<TinyCloud>,
+) -> Result<(), (Status, String)> {
+    let active = tinycloud
+        .replication_session_delegation_active(session.delegation_hash)
+        .await
+        .map_err(|error| (Status::InternalServerError, error.to_string()))?;
+
+    if active {
+        Ok(())
+    } else {
+        Err((
+            Status::Unauthorized,
+            "replication session delegation is no longer active".to_string(),
+        ))
+    }
 }
 
 fn request_scope(

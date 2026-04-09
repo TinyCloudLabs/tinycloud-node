@@ -1,3 +1,4 @@
+use crate::hash::Hash;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,7 @@ pub struct ReplicationSessionRecord {
     pub requester_did: String,
     pub space_id: String,
     pub scope: ReplicationScope,
+    pub delegation_hash: Option<Hash>,
     pub expires_at: OffsetDateTime,
 }
 
@@ -213,6 +215,7 @@ impl ReplicationService {
         requester_did: String,
         space_id: String,
         scope: ReplicationScope,
+        delegation_hash: Option<Hash>,
     ) -> (String, ReplicationSessionRecord) {
         let now = OffsetDateTime::now_utc();
         let expires_at = now + time::Duration::seconds(self.session_ttl.as_secs() as i64);
@@ -221,6 +224,7 @@ impl ReplicationService {
             requester_did,
             space_id,
             scope,
+            delegation_hash,
             expires_at,
         };
 

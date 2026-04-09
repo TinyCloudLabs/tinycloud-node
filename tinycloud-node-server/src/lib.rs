@@ -25,8 +25,6 @@ pub mod tee;
 mod tracing;
 pub mod webhook_dispatcher;
 
-use config::{BlockStorage, Config, Keys, StagingStorage};
-use hooks::HookRuntime;
 use config::{BlockStorage, Config, Keys, ReplicationRole, StagingStorage};
 use hooks::HookRuntime;
 use quota::QuotaCache;
@@ -35,8 +33,8 @@ use routes::{
     attestation::attestation,
     create_signed_kv_url, delegate,
     hooks::{create_hook_ticket, create_webhook, delete_webhook, hook_events, list_webhooks},
-    info, invoke, open_host_key,
-    public::{RateLimiter, public_kv_get, public_kv_head, public_kv_list, public_kv_options},
+    info, invoke, open_host_key, revoke,
+    public::{public_kv_get, public_kv_head, public_kv_list, public_kv_options, RateLimiter},
     replication::{
         reconcile, replication_export, replication_info, replication_session_open, sql_reconcile,
         sql_replication_export,
@@ -130,6 +128,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         create_webhook,
         list_webhooks,
         delete_webhook,
+        revoke,
         replication_info,
         replication_session_open,
         replication_export,
