@@ -16,14 +16,34 @@ use sea_orm::{
     error::{DbErr, RuntimeErr, SqlxError},
     query::*,
     sea_query::OnConflict,
-    ConnectionTrait, DatabaseTransaction, TransactionTrait,
+    ActiveValue::Set,
+    ConnectionTrait, DatabaseTransaction, IntoActiveModel, TransactionTrait,
 };
 use sea_orm_migration::MigratorTrait;
 use std::collections::{HashMap, HashSet};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_auth::{
     authorization::{EncodingError, TinyCloudDelegation},
     resource::{Path, SpaceId},
 };
+
+pub const HOOK_DELIVERY_STATUS_PENDING: &str = "pending";
+pub const HOOK_DELIVERY_STATUS_RETRYING: &str = "retrying";
+pub const HOOK_DELIVERY_STATUS_DELIVERED: &str = "delivered";
+pub const HOOK_DELIVERY_STATUS_DEAD_LETTER: &str = "dead_letter";
+
+#[derive(Debug, Clone)]
+pub struct PendingWebhookDelivery {
+    pub id: String,
+    pub subscription_id: String,
+    pub event_id: String,
+    pub payload_json: String,
+    pub attempts: i64,
+    pub callback_url: String,
+    pub encrypted_secret: Vec<u8>,
+    pub secret_key_id: String,
+    pub subscription_active: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct SpaceDatabase<C, B, S> {
@@ -151,6 +171,225 @@ where
         self.conn
             .begin_with_config(None, Some(sea_orm::AccessMode::ReadOnly))
             .await
+    }
+}
+
+impl<C, B, K> SpaceDatabase<C, B, K>
+where
+    C: ConnectionTrait,
+{
+    pub async fn list_due_webhook_deliveries(
+        &self,
+        limit: u64,
+    ) -> Result<Vec<PendingWebhookDelivery>, DbErr> {
+        let now = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .expect("current timestamps should format as RFC3339");
+
+        hook_delivery::Entity::find()
+            .filter(
+                Condition::all()
+                    .add(
+                        hook_delivery::Column::Status
+                            .is_in([HOOK_DELIVERY_STATUS_PENDING, HOOK_DELIVERY_STATUS_RETRYING]),
+                    )
+                    .add(
+                        Condition::any()
+                            .add(hook_delivery::Column::NextAttemptAt.is_null())
+                            .add(hook_delivery::Column::NextAttemptAt.lte(now)),
+                    ),
+            )
+            .order_by_asc(hook_delivery::Column::CreatedAt)
+            .order_by_asc(hook_delivery::Column::Attempts)
+            .limit(limit)
+            .find_also_related(hook_subscription::Entity)
+            .all(&self.conn)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .filter_map(|(delivery, subscription)| {
+                        subscription.map(|subscription| PendingWebhookDelivery {
+                            id: delivery.id,
+                            subscription_id: delivery.subscription_id,
+                            event_id: delivery.event_id,
+                            payload_json: delivery.payload_json,
+                            attempts: delivery.attempts,
+                            callback_url: subscription.callback_url,
+                            encrypted_secret: subscription.encrypted_secret,
+                            secret_key_id: subscription.secret_key_id,
+                            subscription_active: subscription.active,
+                        })
+                    })
+                    .collect()
+            })
+    }
+
+    pub async fn mark_webhook_delivery_delivered(
+        &self,
+        delivery_id: &str,
+        attempts: i64,
+    ) -> Result<(), DbErr> {
+        let Some(delivery) = hook_delivery::Entity::find_by_id(delivery_id.to_string())
+            .one(&self.conn)
+            .await?
+        else {
+            return Ok(());
+        };
+
+        let delivered_at = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .expect("current timestamps should format as RFC3339");
+        let mut active = delivery.into_active_model();
+        active.status = Set(HOOK_DELIVERY_STATUS_DELIVERED.to_string());
+        active.attempts = Set(attempts);
+        active.next_attempt_at = Set(None);
+        active.last_error = Set(None);
+        active.delivered_at = Set(Some(delivered_at));
+        active.update(&self.conn).await?;
+        Ok(())
+    }
+
+    pub async fn mark_webhook_delivery_failed(
+        &self,
+        delivery_id: &str,
+        attempts: i64,
+        next_attempt_at: Option<OffsetDateTime>,
+        last_error: String,
+        dead_letter: bool,
+    ) -> Result<(), DbErr> {
+        let Some(delivery) = hook_delivery::Entity::find_by_id(delivery_id.to_string())
+            .one(&self.conn)
+            .await?
+        else {
+            return Ok(());
+        };
+
+        let mut active = delivery.into_active_model();
+        active.status = Set(if dead_letter {
+            HOOK_DELIVERY_STATUS_DEAD_LETTER.to_string()
+        } else {
+            HOOK_DELIVERY_STATUS_RETRYING.to_string()
+        });
+        active.attempts = Set(attempts);
+        active.next_attempt_at = Set(next_attempt_at.map(|value| {
+            value
+                .format(&Rfc3339)
+                .expect("current timestamps should format as RFC3339")
+        }));
+        active.last_error = Set(Some(last_error));
+        active.delivered_at = Set(None);
+        active.update(&self.conn).await?;
+        Ok(())
+    }
+
+    pub async fn count_active_hook_subscriptions(&self, space_id: &str) -> Result<u64, DbErr> {
+        hook_subscription::Entity::find()
+            .filter(
+                Condition::all()
+                    .add(hook_subscription::Column::SpaceId.eq(space_id))
+                    .add(hook_subscription::Column::Active.eq(true)),
+            )
+            .count(&self.conn)
+            .await
+    }
+
+    pub async fn create_hook_subscription(
+        &self,
+        model: hook_subscription::Model,
+    ) -> Result<hook_subscription::Model, DbErr> {
+        hook_subscription::Entity::insert(hook_subscription::ActiveModel::from(model.clone()))
+            .exec(&self.conn)
+            .await?;
+        Ok(model)
+    }
+
+    pub async fn enqueue_hook_deliveries(
+        &self,
+        models: Vec<hook_delivery::Model>,
+    ) -> Result<(), DbErr> {
+        if models.is_empty() {
+            return Ok(());
+        }
+
+        match hook_delivery::Entity::insert_many(
+            models
+                .into_iter()
+                .map(hook_delivery::ActiveModel::from)
+                .collect::<Vec<_>>(),
+        )
+        .on_conflict(
+            OnConflict::column(hook_delivery::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(&self.conn)
+        .await
+        {
+            Err(DbErr::RecordNotInserted) => {}
+            result => {
+                result?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn list_active_hook_subscriptions(
+        &self,
+        space_id: &str,
+        target_service: &str,
+        prefix: Option<&str>,
+    ) -> Result<Vec<hook_subscription::Model>, DbErr> {
+        let mut query = hook_subscription::Entity::find().filter(
+            Condition::all()
+                .add(hook_subscription::Column::SpaceId.eq(space_id))
+                .add(hook_subscription::Column::TargetService.eq(target_service))
+                .add(hook_subscription::Column::Active.eq(true)),
+        );
+
+        if let Some(prefix) = prefix.and_then(normalize_hook_prefix) {
+            query = query.filter(
+                Condition::any()
+                    .add(hook_subscription::Column::PathPrefix.eq(prefix))
+                    .add(hook_subscription::Column::PathPrefix.starts_with(format!("{prefix}/"))),
+            );
+        }
+
+        query
+            .order_by_asc(hook_subscription::Column::CreatedAt)
+            .all(&self.conn)
+            .await
+    }
+
+    pub async fn find_hook_subscription(
+        &self,
+        subscription_id: &str,
+    ) -> Result<Option<hook_subscription::Model>, DbErr> {
+        hook_subscription::Entity::find_by_id(subscription_id.to_string())
+            .one(&self.conn)
+            .await
+    }
+
+    pub async fn deactivate_hook_subscription(&self, subscription_id: &str) -> Result<(), DbErr> {
+        let Some(model) = hook_subscription::Entity::find_by_id(subscription_id.to_string())
+            .one(&self.conn)
+            .await?
+        else {
+            return Ok(());
+        };
+
+        let mut active = model.into_active_model();
+        active.active = Set(false);
+        active.update(&self.conn).await?;
+        Ok(())
+    }
+}
+
+fn normalize_hook_prefix(prefix: &str) -> Option<&str> {
+    let trimmed = prefix.trim_matches('/');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
     }
 }
 

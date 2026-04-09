@@ -12,6 +12,7 @@ pub mod sql;
 pub mod storage;
 pub mod types;
 pub mod util;
+pub mod write_hooks;
 
 pub use db::{Commit, InvocationOutcome, SpaceDatabase, TransactResult, TxError, TxStoreError};
 pub use encryption::ColumnEncryption;

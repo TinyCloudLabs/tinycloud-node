@@ -21,7 +21,7 @@ enum DbMessage {
         request: SqlRequest,
         caveats: Option<SqlCaveats>,
         ability: String,
-        response_tx: oneshot::Sender<Result<SqlResponse, SqlError>>,
+        response_tx: oneshot::Sender<Result<SqlExecutionResult, SqlError>>,
     },
     Export {
         response_tx: oneshot::Sender<Result<Vec<u8>, SqlError>>,
@@ -39,7 +39,7 @@ impl DatabaseHandle {
         request: SqlRequest,
         caveats: Option<SqlCaveats>,
         ability: String,
-    ) -> Result<SqlResponse, SqlError> {
+    ) -> Result<SqlExecutionResult, SqlError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
             .send(DbMessage::Execute {
@@ -197,12 +197,12 @@ fn handle_message(
     request: &SqlRequest,
     caveats: &Option<SqlCaveats>,
     ability: &str,
-) -> Result<SqlResponse, SqlError> {
+) -> Result<SqlExecutionResult, SqlError> {
     let is_admin = matches!(ability, "tinycloud.sql/admin" | "tinycloud.sql/*");
 
     match request {
         SqlRequest::Query { sql, params } => {
-            parser::validate_sql(sql, caveats, ability)?;
+            let parsed = parser::validate_sql(sql, caveats, ability)?;
 
             let auth =
                 authorizer::create_authorizer(caveats.clone(), ability.to_string(), is_admin);
@@ -212,17 +212,22 @@ fn handle_message(
 
             conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
 
-            result.map(SqlResponse::Query)
+            result.map(|response| SqlExecutionResult {
+                response: SqlResponse::Query(response),
+                write_targets: parsed.write_targets,
+            })
         }
         SqlRequest::Execute {
             sql,
             params,
             schema,
         } => {
+            let mut write_targets = Vec::new();
             // Schema init
             if let Some(schema_stmts) = schema {
                 for stmt_sql in schema_stmts {
-                    parser::validate_sql(stmt_sql, caveats, ability)?;
+                    let parsed = parser::validate_sql(stmt_sql, caveats, ability)?;
+                    write_targets.extend(parsed.write_targets);
                     let auth = authorizer::create_authorizer(
                         caveats.clone(),
                         ability.to_string(),
@@ -235,7 +240,7 @@ fn handle_message(
                 }
             }
 
-            parser::validate_sql(sql, caveats, ability)?;
+            let parsed = parser::validate_sql(sql, caveats, ability)?;
             let auth =
                 authorizer::create_authorizer(caveats.clone(), ability.to_string(), is_admin);
             conn.authorizer(Some(auth));
@@ -244,11 +249,21 @@ fn handle_message(
 
             conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
 
-            result.map(SqlResponse::Execute)
+            let response = result.map(SqlResponse::Execute)?;
+            write_targets.extend(parsed.write_targets);
+            Ok(SqlExecutionResult {
+                response,
+                write_targets,
+            })
         }
         SqlRequest::Batch { statements } => {
+            let mut write_targets = Vec::new();
+            // Hooks are emitted only after this branch returns Ok to the caller.
+            // If a later statement fails after some earlier statements applied,
+            // MVP intentionally under-emits rather than guessing partial success.
             for stmt in statements {
-                parser::validate_sql(&stmt.sql, caveats, ability)?;
+                let parsed = parser::validate_sql(&stmt.sql, caveats, ability)?;
+                write_targets.extend(parsed.write_targets);
             }
 
             let auth =
@@ -268,7 +283,10 @@ fn handle_message(
 
             conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
 
-            Ok(SqlResponse::Batch(BatchResponse { results }))
+            Ok(SqlExecutionResult {
+                response: SqlResponse::Batch(BatchResponse { results }),
+                write_targets,
+            })
         }
         SqlRequest::ExecuteStatement { name, params } => {
             let caveats_ref = caveats
@@ -278,7 +296,7 @@ fn handle_message(
                 SqlError::InvalidStatement(format!("Statement '{}' not found", name))
             })?;
 
-            parser::validate_sql(&prepared.sql, caveats, ability)?;
+            let parsed = parser::validate_sql(&prepared.sql, caveats, ability)?;
 
             let auth =
                 authorizer::create_authorizer(caveats.clone(), ability.to_string(), is_admin);
@@ -297,7 +315,10 @@ fn handle_message(
 
             conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
 
-            result
+            result.map(|response| SqlExecutionResult {
+                response,
+                write_targets: parsed.write_targets,
+            })
         }
         SqlRequest::Export => Err(SqlError::Internal(
             "Export should be handled by service".to_string(),

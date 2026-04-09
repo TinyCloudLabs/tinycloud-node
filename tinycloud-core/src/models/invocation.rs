@@ -6,9 +6,14 @@ use super::super::{
 };
 use crate::encryption::ColumnEncryption;
 use crate::types::{Facts, Resource, SpaceIdWrap};
+use crate::write_hooks::{hook_delivery_id, subscription_matches_event};
 use crate::{hash::Hash, types::Ability};
-use sea_orm::{entity::prelude::*, sea_query::OnConflict, Condition, ConnectionTrait, QueryOrder};
-use time::OffsetDateTime;
+use sea_orm::{
+    entity::prelude::*, sea_query::OnConflict, Condition, ConnectionTrait, QueryFilter, QueryOrder,
+};
+use serde::Serialize;
+use std::collections::HashMap;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_auth::{authorization::TinyCloudInvocation, resource::Path, ssi::dids::AnyDidMethod};
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
@@ -140,20 +145,16 @@ async fn validate<C: ConnectionTrait>(
                 .await?;
 
             // check parent identifies correct invoker
-            parents
-                .iter()
-                .map(|(p, _)| {
-                    if p.delegatee != invocation.invoker
-                        && !invocation.invoker.starts_with(&p.delegatee)
-                    {
-                        Err(InvocationError::UnauthorizedInvoker(
-                            invocation.invoker.clone(),
-                        ))
-                    } else {
-                        Ok(())
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            for (p, _) in &parents {
+                if p.delegatee != invocation.invoker
+                    && !invocation.invoker.starts_with(&p.delegatee)
+                {
+                    return Err(InvocationError::UnauthorizedInvoker(
+                        invocation.invoker.clone(),
+                    )
+                    .into());
+                }
+            }
 
             let now = time.unwrap_or_else(OffsetDateTime::now_utc);
 
@@ -195,6 +196,7 @@ async fn save<C: ConnectionTrait>(
     // Hash is always computed on plaintext (before encryption)
     let hash = crate::hash::hash(&serialization);
     let issued_at = time.unwrap_or_else(OffsetDateTime::now_utc);
+    let invoker = invocation.invoker.clone();
 
     // Encrypt for storage if encryption is configured
     let stored_serialization = crate::encryption::maybe_encrypt(encryption, &serialization);
@@ -222,7 +224,7 @@ async fn save<C: ConnectionTrait>(
         issued_at,
         serialization: stored_serialization,
         facts: None,
-        invoker: invocation.invoker,
+        invoker,
     }))
     .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned())
     .exec(db)
@@ -258,7 +260,7 @@ async fn save<C: ConnectionTrait>(
         .await?;
     }
 
-    for param in parameters {
+    for param in &parameters {
         match param {
             VersionedOperation::KvWrite {
                 key,
@@ -271,13 +273,13 @@ async fn save<C: ConnectionTrait>(
             } => {
                 kv_write::Entity::insert(kv_write::ActiveModel::from(kv_write::Model {
                     invocation: hash,
-                    key: key.into(),
-                    value,
-                    space: space.into(),
-                    metadata,
-                    seq,
-                    epoch,
-                    epoch_seq,
+                    key: key.clone().into(),
+                    value: *value,
+                    space: space.clone().into(),
+                    metadata: metadata.clone(),
+                    seq: *seq,
+                    epoch: *epoch,
+                    epoch_seq: *epoch_seq,
                 }))
                 .exec(db)
                 .await?;
@@ -286,15 +288,18 @@ async fn save<C: ConnectionTrait>(
                 key,
                 version,
                 space,
+                seq: _,
+                epoch: _,
+                epoch_seq: _,
             } => {
                 let deleted_invocation_id = if let Some((s, e, es)) = version {
                     kv_write::Entity::find().filter(
                         Condition::all()
                             .add(kv_write::Column::Key.eq(key.as_str()))
                             .add(kv_write::Column::Space.eq(SpaceIdWrap(space.clone())))
-                            .add(kv_write::Column::Seq.eq(s))
-                            .add(kv_write::Column::Epoch.eq(e))
-                            .add(kv_write::Column::EpochSeq.eq(es)),
+                            .add(kv_write::Column::Seq.eq(*s))
+                            .add(kv_write::Column::Epoch.eq(*e))
+                            .add(kv_write::Column::EpochSeq.eq(*es)),
                     )
                 } else {
                     kv_write::Entity::find()
@@ -309,9 +314,9 @@ async fn save<C: ConnectionTrait>(
                 .ok_or_else(|| InvocationError::MissingKvWrite(key.clone()))?
                 .invocation;
                 kv_delete::Entity::insert(kv_delete::ActiveModel::from(kv_delete::Model {
-                    key: key.into(),
+                    key: key.clone().into(),
                     invocation_id: hash,
-                    space: space.into(),
+                    space: space.clone().into(),
                     deleted_invocation_id,
                 }))
                 .exec(db)
@@ -320,5 +325,150 @@ async fn save<C: ConnectionTrait>(
         }
     }
 
+    enqueue_kv_webhook_deliveries(db, hash, &invocation.invoker, issued_at, &parameters).await?;
+
     Ok(hash)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KvWebhookPayload {
+    #[serde(rename = "type")]
+    event_type: String,
+    id: String,
+    space: String,
+    service: String,
+    ability: String,
+    path: Option<String>,
+    actor: String,
+    epoch: String,
+    event_index: u32,
+    timestamp: String,
+}
+
+async fn enqueue_kv_webhook_deliveries<C: ConnectionTrait>(
+    db: &C,
+    invocation_hash: Hash,
+    actor: &str,
+    issued_at: OffsetDateTime,
+    parameters: &[VersionedOperation],
+) -> Result<(), DbErr> {
+    let timestamp = issued_at
+        .format(&Rfc3339)
+        .expect("valid invocation timestamps should format as RFC3339");
+    let mut cached_subscriptions = HashMap::<String, Vec<hook_subscription::Model>>::new();
+    let mut event_indexes = HashMap::<String, u32>::new();
+
+    for parameter in parameters {
+        let (space, key, ability, epoch) = match parameter {
+            VersionedOperation::KvWrite {
+                space, key, epoch, ..
+            } => (space, key, "tinycloud.kv/put", epoch),
+            VersionedOperation::KvDelete {
+                space, key, epoch, ..
+            } => (space, key, "tinycloud.kv/del", epoch),
+        };
+
+        let space_id = space.to_string();
+        let subscriptions = match cached_subscriptions.get(&space_id) {
+            Some(subscriptions) => subscriptions,
+            None => {
+                let rows = hook_subscription::Entity::find()
+                    .filter(
+                        Condition::all()
+                            .add(hook_subscription::Column::Active.eq(true))
+                            .add(hook_subscription::Column::SpaceId.eq(space_id.clone()))
+                            .add(hook_subscription::Column::TargetService.eq("kv")),
+                    )
+                    .all(db)
+                    .await?;
+                cached_subscriptions.insert(space_id.clone(), rows);
+                cached_subscriptions
+                    .get(&space_id)
+                    .expect("inserted subscription cache entry should exist")
+            }
+        };
+
+        if subscriptions.is_empty() {
+            *event_indexes.entry(space_id).or_insert(0) += 1;
+            continue;
+        }
+
+        let event_index = event_indexes.entry(space.to_string()).or_insert(0);
+        let current_index = *event_index;
+        let epoch_cid = epoch.to_cid(0x55).to_string();
+        let event_id = format!("{epoch_cid}:{current_index}");
+        let payload_json = serde_json::to_string(&KvWebhookPayload {
+            event_type: "write".to_string(),
+            id: event_id.clone(),
+            space: space.to_string(),
+            service: "kv".to_string(),
+            ability: ability.to_string(),
+            path: Some(key.to_string()),
+            actor: actor.to_string(),
+            epoch: epoch_cid,
+            event_index: current_index,
+            timestamp: timestamp.clone(),
+        })
+        .expect("KV webhook payload serialization should succeed");
+
+        let pending = subscriptions
+            .iter()
+            .filter(|subscription| subscription_matches_event(subscription, key.as_str(), ability))
+            .map(|subscription| {
+                hook_delivery::ActiveModel::from(hook_delivery::Model {
+                    id: hook_delivery_id(&subscription.id, &event_id),
+                    subscription_id: subscription.id.clone(),
+                    event_id: event_id.clone(),
+                    payload_json: payload_json.clone(),
+                    status: crate::db::HOOK_DELIVERY_STATUS_PENDING.to_string(),
+                    attempts: 0,
+                    next_attempt_at: None,
+                    last_error: None,
+                    created_at: timestamp.clone(),
+                    delivered_at: None,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        if !pending.is_empty() {
+            hook_delivery::Entity::insert_many(pending)
+                .on_conflict(
+                    OnConflict::column(hook_delivery::Column::Id)
+                        .do_nothing()
+                        .to_owned(),
+                )
+                .exec(db)
+                .await?;
+        }
+
+        *event_index += 1;
+    }
+
+    let _ = invocation_hash;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kv_webhook_payload_serializes_with_type_field() {
+        let payload = KvWebhookPayload {
+            event_type: "write".to_string(),
+            id: "epoch:0".to_string(),
+            space: "tinycloud:space".to_string(),
+            service: "kv".to_string(),
+            ability: "tinycloud.kv/put".to_string(),
+            path: Some("docs/1".to_string()),
+            actor: "did:key:test".to_string(),
+            epoch: "epoch".to_string(),
+            event_index: 0,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        let json = serde_json::to_value(payload).unwrap();
+        assert_eq!(json.get("type").and_then(|v| v.as_str()), Some("write"));
+    }
 }

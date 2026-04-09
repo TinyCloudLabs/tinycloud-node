@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::write_hooks::TouchedTables;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action")]
 pub enum DuckDbRequest {
@@ -393,6 +395,12 @@ pub struct ExecuteResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchResponse {
     pub results: Vec<ExecuteResponse>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DuckDbExecutionResult {
+    pub response: DuckDbResponse,
+    pub write_targets: Vec<TouchedTables>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

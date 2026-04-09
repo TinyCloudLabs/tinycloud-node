@@ -56,7 +56,7 @@ impl DuckDbService {
         caveats: Option<DuckDbCaveats>,
         ability: String,
         arrow_format: bool,
-    ) -> Result<DuckDbResponse, DuckDbError> {
+    ) -> Result<DuckDbExecutionResult, DuckDbError> {
         validate_db_name(db_name)?;
 
         let key = (space.to_string(), db_name.to_string());
