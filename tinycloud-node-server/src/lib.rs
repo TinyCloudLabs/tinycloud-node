@@ -251,12 +251,12 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
                 resp.set_header(Header::new(
                     // expose response headers to browser-run scripts
                     "Access-Control-Expose-Headers",
-                    "*, Authorization, Replication-Session",
+                    "*, Authorization, Replication-Session, Peer-Replication-Session",
                 ));
                 resp.set_header(Header::new(
                     // allow custom headers + Authorization in requests
                     "Access-Control-Allow-Headers",
-                    "*, Authorization, Replication-Session",
+                    "*, Authorization, Replication-Session, Peer-Replication-Session",
                 ));
                 resp.set_header(Header::new("Access-Control-Allow-Credentials", "true"));
             })

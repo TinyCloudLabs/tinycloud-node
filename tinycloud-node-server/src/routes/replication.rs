@@ -1,5 +1,5 @@
 use crate::{
-    authorization::{AuthHeaderGetter, ReplicationSessionToken},
+    authorization::{AuthHeaderGetter, PeerReplicationSessionToken, ReplicationSessionToken},
     BlockStage, TinyCloud,
 };
 use rocket::{http::Status, serde::json::Json, State};
@@ -93,8 +93,8 @@ pub async fn auth_replication_export(
     tinycloud: &State<TinyCloud>,
 ) -> Result<Json<AuthReplicationExportResponse>, (Status, String)> {
     ensure_peer_serving_enabled(replication)?;
-    let scope = auth_request_scope(&request)?;
-    let session = authorize_export_scope(&request.space_id, &scope, token, replication)?;
+    let scope = ReplicationScope::Auth;
+    let session = authorize_session_scope(&request.space_id, &scope, token, replication)?;
     ensure_replication_session_active(&session, tinycloud).await?;
 
     tinycloud
@@ -107,14 +107,18 @@ pub async fn auth_replication_export(
 #[post("/replication/auth/reconcile", format = "json", data = "<request>")]
 pub async fn auth_reconcile(
     request: Json<AuthReplicationReconcileRequest>,
-    peer_token: Option<ReplicationSessionToken>,
+    token: Option<ReplicationSessionToken>,
+    peer_token: Option<PeerReplicationSessionToken>,
+    replication: &State<ReplicationService>,
     tinycloud: &State<TinyCloud>,
 ) -> Result<Json<AuthReplicationApplyResponse>, (Status, String)> {
-    let _scope = auth_reconcile_scope(&request)?;
+    let scope = ReplicationScope::Auth;
+    let session = authorize_session_scope(&request.space_id, &scope, token, replication)?;
+    ensure_replication_session_active(&session, tinycloud).await?;
     let peer_token = peer_token.ok_or_else(|| {
         (
             Status::Unauthorized,
-            "missing Replication-Session for auth replication reconcile".to_string(),
+            "missing Peer-Replication-Session for auth replication reconcile".to_string(),
         )
     })?;
     let peer_url = request.peer_url.trim_end_matches('/');
@@ -123,10 +127,6 @@ pub async fn auth_reconcile(
         .header("Replication-Session", peer_token.0)
         .json(&AuthReplicationExportRequest {
             space_id: request.space_id.clone(),
-            service: request.service.clone(),
-            prefix: request.prefix.clone(),
-            db_name: request.db_name.clone(),
-            supporting_delegations: request.supporting_delegations.clone(),
         })
         .send()
         .await
@@ -146,9 +146,6 @@ pub async fn auth_reconcile(
         .await
         .map_err(map_auth_tx_error)?;
     applied.peer_url = Some(request.peer_url.clone());
-    applied.service = request.service.clone();
-    applied.prefix = request.prefix.clone();
-    applied.db_name = request.db_name.clone();
     Ok(Json(applied))
 }
 
@@ -163,7 +160,7 @@ pub async fn replication_export(
     let scope = ReplicationScope::Kv {
         prefix: request.prefix.clone(),
     };
-    let session = authorize_export_scope(&request.space_id, &scope, token, replication)?;
+    let session = authorize_session_scope(&request.space_id, &scope, token, replication)?;
     ensure_replication_session_active(&session, tinycloud).await?;
 
     tinycloud
@@ -176,14 +173,21 @@ pub async fn replication_export(
 #[post("/replication/reconcile", format = "json", data = "<request>")]
 pub async fn reconcile(
     request: Json<ReplicationReconcileRequest>,
-    peer_token: Option<ReplicationSessionToken>,
+    token: Option<ReplicationSessionToken>,
+    peer_token: Option<PeerReplicationSessionToken>,
+    replication: &State<ReplicationService>,
     staging: &State<BlockStage>,
     tinycloud: &State<TinyCloud>,
 ) -> Result<Json<tinycloud_core::replication::ReplicationApplyResponse>, (Status, String)> {
+    let scope = ReplicationScope::Kv {
+        prefix: request.prefix.clone(),
+    };
+    let session = authorize_session_scope(&request.space_id, &scope, token, replication)?;
+    ensure_replication_session_active(&session, tinycloud).await?;
     let peer_token = peer_token.ok_or_else(|| {
         (
             Status::Unauthorized,
-            "missing Replication-Session for replication reconcile".to_string(),
+            "missing Peer-Replication-Session for replication reconcile".to_string(),
         )
     })?;
     let peer_url = request.peer_url.trim_end_matches('/');
@@ -232,7 +236,7 @@ pub async fn sql_replication_export(
     let scope = ReplicationScope::Sql {
         db_name: request.db_name.clone(),
     };
-    let session = authorize_export_scope(&request.space_id, &scope, token, replication)?;
+    let session = authorize_session_scope(&request.space_id, &scope, token, replication)?;
     ensure_replication_session_active(&session, tinycloud).await?;
 
     let space_id: SpaceId = request.space_id.parse().map_err(|_| {
@@ -256,8 +260,11 @@ pub async fn sql_replication_export(
 #[post("/replication/sql/reconcile", format = "json", data = "<request>")]
 pub async fn sql_reconcile(
     request: Json<SqlReplicationReconcileRequest>,
-    peer_token: Option<ReplicationSessionToken>,
+    token: Option<ReplicationSessionToken>,
+    peer_token: Option<PeerReplicationSessionToken>,
+    replication: &State<ReplicationService>,
     sql_service: &State<SqlService>,
+    tinycloud: &State<TinyCloud>,
 ) -> Result<Json<SqlReplicationApplyResponse>, (Status, String)> {
     let space_id: SpaceId = request.space_id.parse().map_err(|_| {
         (
@@ -265,10 +272,15 @@ pub async fn sql_reconcile(
             format!("invalid space id: {}", request.space_id),
         )
     })?;
+    let scope = ReplicationScope::Sql {
+        db_name: request.db_name.clone(),
+    };
+    let session = authorize_session_scope(&request.space_id, &scope, token, replication)?;
+    ensure_replication_session_active(&session, tinycloud).await?;
     let peer_token = peer_token.ok_or_else(|| {
         (
             Status::Unauthorized,
-            "missing Replication-Session for replication reconcile".to_string(),
+            "missing Peer-Replication-Session for replication reconcile".to_string(),
         )
     })?;
     let peer_url = request.peer_url.trim_end_matches('/');
@@ -344,7 +356,7 @@ async fn import_supporting_delegations(
     Ok(())
 }
 
-fn authorize_export_scope(
+fn authorize_session_scope(
     space_id: &str,
     scope: &ReplicationScope,
     token: Option<ReplicationSessionToken>,
@@ -418,50 +430,6 @@ fn request_scope(
         other => Err((
             Status::BadRequest,
             format!("unsupported replication service: {other}"),
-        )),
-    }
-}
-
-fn auth_request_scope(
-    request: &AuthReplicationExportRequest,
-) -> Result<ReplicationScope, (Status, String)> {
-    auth_scope_from_parts(
-        request.service.as_str(),
-        request.prefix.as_deref(),
-        request.db_name.as_deref(),
-    )
-}
-
-fn auth_reconcile_scope(
-    request: &AuthReplicationReconcileRequest,
-) -> Result<ReplicationScope, (Status, String)> {
-    auth_scope_from_parts(
-        request.service.as_str(),
-        request.prefix.as_deref(),
-        request.db_name.as_deref(),
-    )
-}
-
-fn auth_scope_from_parts(
-    service: &str,
-    prefix: Option<&str>,
-    db_name: Option<&str>,
-) -> Result<ReplicationScope, (Status, String)> {
-    match service {
-        "kv" => Ok(ReplicationScope::Kv {
-            prefix: prefix.map(|value| value.to_string()),
-        }),
-        "sql" => Ok(ReplicationScope::Sql {
-            db_name: db_name.map(|value| value.to_string()).ok_or_else(|| {
-                (
-                    Status::BadRequest,
-                    "dbName is required for auth replication scope".to_string(),
-                )
-            })?,
-        }),
-        other => Err((
-            Status::BadRequest,
-            format!("unsupported auth replication service: {other}"),
         )),
     }
 }

@@ -11,8 +11,7 @@ use crate::relationships::*;
 use crate::replication::{
     decode_hash, encode_hash, AuthReplicationApplyResponse, AuthReplicationExportRequest,
     AuthReplicationExportResponse, KvReplicationError, KvReplicationEvent, KvReplicationOperation,
-    KvReplicationSequence, ReplicationApplyResponse, ReplicationExportRequest,
-    ReplicationExportResponse, ReplicationScope,
+    KvReplicationSequence, ReplicationApplyResponse, ReplicationExportRequest, ReplicationExportResponse,
 };
 use crate::storage::{
     either::EitherError, Content, HashBuffer, ImmutableDeleteStore, ImmutableReadStore,
@@ -432,7 +431,6 @@ where
         request: &AuthReplicationExportRequest,
     ) -> Result<AuthReplicationExportResponse, KvReplicationError> {
         let space_id = parse_replication_space_id(&request.space_id)?;
-        let scope = parse_auth_replication_scope(request)?;
         let (delegations, abilities): (Vec<delegation::Model>, Vec<Vec<abilities::Model>>) =
             delegation::Entity::find()
                 .find_with_related(abilities::Entity)
@@ -469,7 +467,7 @@ where
                 TinyCloudDelegation::from_bytes(&serialization)?.encode()?,
             );
 
-            if delegation_matches_auth_scope(ability_list, &space_id, &scope) {
+            if delegation_matches_space(ability_list, &space_id) {
                 seed_ids.push(delegation.id);
             }
         }
@@ -492,9 +490,6 @@ where
 
         Ok(AuthReplicationExportResponse {
             space_id: request.space_id.clone(),
-            service: request.service.clone(),
-            prefix: request.prefix.clone(),
-            db_name: request.db_name.clone(),
             delegations: delegations
                 .into_iter()
                 .map(|(_, delegation)| delegation)
@@ -570,9 +565,6 @@ where
         Ok(AuthReplicationApplyResponse {
             space_id: export.space_id.clone(),
             peer_url: None,
-            service: export.service.clone(),
-            prefix: export.prefix.clone(),
-            db_name: export.db_name.clone(),
             imported_delegations,
             imported_revocations,
         })
@@ -1466,113 +1458,18 @@ fn parse_replication_path(path: &str) -> Result<Path, KvReplicationError> {
     Path::from_str(path).map_err(|_| KvReplicationError::InvalidPath(path.to_string()))
 }
 
-fn parse_auth_replication_scope(
-    request: &AuthReplicationExportRequest,
-) -> Result<ReplicationScope, KvReplicationError> {
-    match request.service.as_str() {
-        "kv" => {
-            let prefix = request
-                .prefix
-                .as_deref()
-                .map(|value| value.trim_matches('/'))
-                .filter(|value| !value.is_empty())
-                .map(parse_replication_path)
-                .transpose()?
-                .map(|path| path.to_string());
-            Ok(ReplicationScope::Kv { prefix })
-        }
-        "sql" => {
-            let db_name = request
-                .db_name
-                .as_deref()
-                .map(|value| value.trim_matches('/'))
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| KvReplicationError::InvalidPath("dbName is required".to_string()))?;
-            Ok(ReplicationScope::Sql {
-                db_name: db_name.to_string(),
-            })
-        }
-        other => Err(KvReplicationError::InvalidPath(format!(
-            "unsupported auth replication service: {other}"
-        ))),
-    }
+fn delegation_matches_space(abilities: &[abilities::Model], space_id: &SpaceId) -> bool {
+    abilities
+        .iter()
+        .any(|ability| auth_resource_matches_space(&ability.resource, space_id))
 }
 
-fn delegation_matches_auth_scope(
-    abilities: &[abilities::Model],
-    space_id: &SpaceId,
-    scope: &ReplicationScope,
-) -> bool {
-    abilities.iter().any(|ability| {
-        ability.ability.as_ref().as_ref() == "tinycloud.space/sync"
-            && auth_resource_matches_scope(&ability.resource, space_id, scope)
-    })
-}
-
-fn auth_resource_matches_scope(
-    resource: &Resource,
-    space_id: &SpaceId,
-    scope: &ReplicationScope,
-) -> bool {
+fn auth_resource_matches_space(resource: &Resource, space_id: &SpaceId) -> bool {
     let Some(resource) = resource.tinycloud_resource() else {
         return false;
     };
 
-    if resource.space() != space_id || resource.service().as_str() != "space" {
-        return false;
-    }
-
-    auth_scope_matches_space_resource(resource.path().map(|path| path.as_str()), scope)
-}
-
-fn auth_scope_matches_space_resource(
-    delegated_path: Option<&str>,
-    requested_scope: &ReplicationScope,
-) -> bool {
-    let Some(delegated_path) = delegated_path.map(|value| value.trim_matches('/')) else {
-        return true;
-    };
-
-    if delegated_path.is_empty() {
-        return true;
-    }
-
-    match requested_scope {
-        ReplicationScope::Auth => delegated_path == "auth",
-        ReplicationScope::Kv { prefix } => match delegated_path {
-            "kv" => true,
-            _ => delegated_path
-                .strip_prefix("kv/")
-                .map(|delegated_prefix| {
-                    auth_scope_path_is_subset(prefix.as_deref(), Some(delegated_prefix))
-                })
-                .unwrap_or(false),
-        },
-        ReplicationScope::Sql { db_name } => match delegated_path {
-            "sql" => true,
-            _ => delegated_path
-                .strip_prefix("sql/")
-                .map(|delegated_db| delegated_db.trim_matches('/') == db_name.trim_matches('/'))
-                .unwrap_or(false),
-        },
-    }
-}
-
-fn auth_scope_path_is_subset(requested: Option<&str>, delegated: Option<&str>) -> bool {
-    match (
-        requested
-            .map(|value| value.trim_matches('/'))
-            .filter(|value| !value.is_empty()),
-        delegated
-            .map(|value| value.trim_matches('/'))
-            .filter(|value| !value.is_empty()),
-    ) {
-        (_, None) => true,
-        (None, Some(_)) => false,
-        (Some(requested), Some(delegated)) => {
-            requested == delegated || requested.starts_with(&format!("{delegated}/"))
-        }
-    }
+    resource.space() == space_id
 }
 
 fn ordered_auth_delegations(
