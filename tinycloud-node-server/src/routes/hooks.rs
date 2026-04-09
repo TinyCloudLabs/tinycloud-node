@@ -68,7 +68,7 @@ pub async fn mint_hook_ticket(
     for subscription in &mut request.subscriptions {
         subscription.path_prefix = normalize_path_prefix(subscription.path_prefix.take());
         validate_subscription(subscription)?;
-        if !is_subscription_authorized(&invocation, subscription) {
+        if !is_subscription_authorized(invocation, subscription) {
             return Err((
                 Status::Forbidden,
                 "requested hook scope is not authorized".to_string(),
