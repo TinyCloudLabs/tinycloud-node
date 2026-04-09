@@ -8,6 +8,7 @@ pub struct ReplicationSessionOpenRequest {
     pub service: String,
     pub prefix: Option<String>,
     pub db_name: Option<String>,
+    pub supporting_delegations: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
