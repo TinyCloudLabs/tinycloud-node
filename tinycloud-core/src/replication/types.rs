@@ -80,6 +80,7 @@ pub struct ReplicationStatus {
     pub enabled: bool,
     pub roles_supported: Vec<&'static str>,
     pub roles_enabled: Vec<&'static str>,
+    pub peer_serving: bool,
     pub recon: bool,
     pub auth_sync: bool,
     pub authored_fact_exchange: bool,
@@ -94,6 +95,7 @@ impl Default for ReplicationStatus {
             enabled: true,
             roles_supported: vec!["host", "replica"],
             roles_enabled: vec!["host"],
+            peer_serving: true,
             recon: false,
             auth_sync: false,
             authored_fact_exchange: true,
@@ -108,6 +110,7 @@ impl Default for ReplicationStatus {
 pub struct ReplicationCapabilities {
     pub supported: bool,
     pub enabled: bool,
+    pub peer_serving: bool,
     pub recon: bool,
     pub auth_sync: bool,
     pub authored_fact_exchange: bool,
@@ -120,6 +123,7 @@ impl Default for ReplicationCapabilities {
         Self {
             supported: false,
             enabled: false,
+            peer_serving: false,
             recon: false,
             auth_sync: false,
             authored_fact_exchange: false,
@@ -163,6 +167,7 @@ impl From<ReplicationStatus> for ReplicationCapabilities {
         Self {
             supported: status.supported,
             enabled: status.enabled,
+            peer_serving: status.peer_serving,
             recon: status.recon,
             auth_sync: status.auth_sync,
             authored_fact_exchange: status.authored_fact_exchange,

@@ -22,7 +22,7 @@ pub mod storage;
 pub mod tee;
 mod tracing;
 
-use config::{BlockStorage, Config, Keys, StagingStorage};
+use config::{BlockStorage, Config, Keys, ReplicationRole, StagingStorage};
 use quota::QuotaCache;
 use routes::{
     admin::{delete_quota, get_quota, list_quotas, set_quota},
@@ -95,6 +95,7 @@ pub type TinyCloud = SpaceDatabase<DatabaseConnection, BlockStores, StaticSecret
 pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     let mut tinycloud_config: Config = config.extract::<Config>()?;
     tinycloud_config.storage.resolve();
+    tinycloud_config.replication.apply_env_overrides()?;
 
     // Ensure local storage directories exist.
     // SQLite file paths and local dirs are resources the server owns — auto-create them.
@@ -220,29 +221,14 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         .mount("/", routes)
         .attach(AdHoc::config::<Config>())
         .attach(tracing::TracingFairing {
-            header_name: tinycloud_config.log.tracing.traceheader,
+            header_name: tinycloud_config.log.tracing.traceheader.clone(),
         })
         .manage(tinycloud)
         .manage(sql_service)
         .manage(duckdb_service)
         .manage(ReplicationService::with_session_ttl(
-            tinycloud_core::replication::ReplicationStatus {
-                supported: true,
-                enabled: true,
-                roles_supported: vec!["host", "replica"],
-                roles_enabled: vec!["host", "replica"],
-                recon: false,
-                auth_sync: false,
-                authored_fact_exchange: true,
-                notifications: false,
-                snapshots: false,
-            },
-            std::time::Duration::from_secs(
-                std::env::var("TINYCLOUD_REPLICATION_SESSION_TTL_SECS")
-                    .ok()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .unwrap_or(600),
-            ),
+            replication_status(&tinycloud_config),
+            std::time::Duration::from_secs(tinycloud_config.replication.session_ttl_secs),
         ))
         .manage(quota_cache)
         .manage(rate_limiter)
@@ -359,4 +345,28 @@ async fn ensure_local_dirs(storage: &config::Storage) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn replication_status(config: &Config) -> tinycloud_core::replication::ReplicationStatus {
+    let role_name = match config.replication.role {
+        ReplicationRole::Host => "host",
+        ReplicationRole::Replica => "replica",
+    };
+    let peer_serving = match config.replication.role {
+        ReplicationRole::Host => true,
+        ReplicationRole::Replica => config.replication.peer_serving,
+    };
+
+    tinycloud_core::replication::ReplicationStatus {
+        supported: true,
+        enabled: true,
+        roles_supported: vec!["host", "replica"],
+        roles_enabled: vec![role_name],
+        peer_serving,
+        recon: false,
+        auth_sync: false,
+        authored_fact_exchange: true,
+        notifications: false,
+        snapshots: false,
+    }
 }

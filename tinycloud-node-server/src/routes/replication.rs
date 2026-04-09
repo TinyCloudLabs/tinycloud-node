@@ -446,8 +446,19 @@ fn ensure_peer_serving_enabled(
         ));
     }
 
-    if status.roles_enabled.contains(&"host") || status.roles_enabled.contains(&"replica") {
+    if status.roles_enabled.contains(&"host") {
         return Ok(());
+    }
+
+    if status.roles_enabled.contains(&"replica") && status.peer_serving {
+        return Ok(());
+    }
+
+    if status.roles_enabled.contains(&"replica") {
+        return Err((
+            Status::Forbidden,
+            "replication export requires peerServing on replica nodes".to_string(),
+        ));
     }
 
     Err((
