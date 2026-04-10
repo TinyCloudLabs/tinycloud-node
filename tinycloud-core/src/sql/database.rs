@@ -34,6 +34,7 @@ enum DbMessage {
     },
     Import {
         snapshot: Vec<u8>,
+        snapshot_reason: Option<String>,
         response_tx: oneshot::Sender<Result<(), SqlError>>,
     },
     ApplyChangeset {
@@ -80,11 +81,16 @@ impl DatabaseHandle {
             .map_err(|_| SqlError::Internal("Database actor dropped response".to_string()))?
     }
 
-    pub async fn import(&self, snapshot: Vec<u8>) -> Result<(), SqlError> {
+    pub async fn import(
+        &self,
+        snapshot: Vec<u8>,
+        snapshot_reason: Option<String>,
+    ) -> Result<(), SqlError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
             .send(DbMessage::Import {
                 snapshot,
+                snapshot_reason,
                 response_tx,
             })
             .await
@@ -200,6 +206,7 @@ pub fn spawn_actor(
                 }
                 DbMessage::Import {
                     snapshot,
+                    snapshot_reason,
                     response_tx,
                 } => {
                     let result = handle_import(
@@ -208,6 +215,7 @@ pub fn spawn_actor(
                         &file_path,
                         memory_threshold,
                         &snapshot,
+                        snapshot_reason.as_deref(),
                     );
                     let _ = response_tx.send(result);
                 }
@@ -261,6 +269,7 @@ fn handle_import(
     file_path: &PathBuf,
     memory_threshold: u64,
     snapshot: &[u8],
+    snapshot_reason: Option<&str>,
 ) -> Result<(), SqlError> {
     storage::import_snapshot(conn, snapshot, matches!(mode, StorageMode::File(_)))?;
 
@@ -270,11 +279,17 @@ fn handle_import(
         *mode = StorageMode::File(file_path.clone());
     }
 
+    if let Some(reason) = snapshot_reason {
+        sql_replication::append_snapshot_barrier(conn, reason)?;
+    }
+
     Ok(())
 }
 
 fn handle_apply_changeset(conn: &rusqlite::Connection, changeset: &[u8]) -> Result<(), SqlError> {
-    sql_replication::apply_changeset(conn, changeset)
+    sql_replication::apply_changeset(conn, changeset)?;
+    sql_replication::append_changeset(conn, changeset)?;
+    Ok(())
 }
 
 fn handle_message(

@@ -171,11 +171,15 @@ impl SqlService {
         space: &SpaceId,
         db_name: &str,
         snapshot: &[u8],
+        snapshot_reason: Option<String>,
     ) -> Result<(), SqlError> {
         let key = (space.to_string(), db_name.to_string());
 
         if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
-            match handle.import(snapshot.to_vec()).await {
+            match handle
+                .import(snapshot.to_vec(), snapshot_reason.clone())
+                .await
+            {
                 Err(SqlError::Internal(ref msg))
                     if msg.contains("Database actor not available") =>
                 {
@@ -190,7 +194,12 @@ impl SqlService {
             .join(space.to_string())
             .join(format!("{}.db", db_name));
 
-        storage::import_snapshot_to_path(&path, snapshot)
+        storage::import_snapshot_to_path(&path, snapshot)?;
+        if let Some(reason) = snapshot_reason {
+            let conn = storage::open_connection(&storage::StorageMode::File(path))?;
+            sql_replication::append_snapshot_barrier(&conn, &reason)?;
+        }
+        Ok(())
     }
 
     pub async fn apply_changeset(
