@@ -2,6 +2,7 @@ pub mod authorizer;
 pub mod caveats;
 pub mod database;
 pub mod parser;
+pub mod replication;
 pub mod service;
 pub mod storage;
 pub mod types;

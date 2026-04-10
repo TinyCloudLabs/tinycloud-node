@@ -424,6 +424,6 @@ fn replication_status(config: &Config) -> tinycloud_core::replication::Replicati
         auth_sync: true,
         authored_fact_exchange: true,
         notifications: false,
-        snapshots: false,
+        snapshots: true,
     }
 }
