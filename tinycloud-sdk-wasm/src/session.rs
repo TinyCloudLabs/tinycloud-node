@@ -284,7 +284,8 @@ impl Session {
         // Sort services and paths so the resulting `resources` vector is
         // deterministic regardless of HashMap iteration order. This keeps
         // test assertions stable and makes the JS side's read-back predictable.
-        let mut services: Vec<(Service, HashMap<Path, Vec<Ability>>)> = abilities.into_iter().collect();
+        let mut services: Vec<(Service, HashMap<Path, Vec<Ability>>)> =
+            abilities.into_iter().collect();
         services.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
 
         for (service, paths_map) in services {
@@ -323,10 +324,7 @@ impl Session {
                 // Extend the capability object with this (resource, actions)
                 // pair. The ucan-capabilities-object crate keys internally by
                 // resource URI, so each iteration adds a distinct entry.
-                caps.with_actions(
-                    resource.as_uri(),
-                    path_actions.into_iter().map(|a| (a, [])),
-                );
+                caps.with_actions(resource.as_uri(), path_actions.into_iter().map(|a| (a, [])));
 
                 resources.push(DelegatedResource {
                     service: service.to_string(),
@@ -979,7 +977,13 @@ pub mod test {
         )]);
 
         let result = session
-            .create_delegation(delegate_did, &session.space_id, abilities, 4_000_000_000.0, None)
+            .create_delegation(
+                delegate_did,
+                &session.space_id,
+                abilities,
+                4_000_000_000.0,
+                None,
+            )
             .expect("single-resource delegation should succeed");
 
         assert_eq!(result.delegate_did, delegate_did);
@@ -989,7 +993,10 @@ pub mod test {
         assert_eq!(result.resources[0].path, "com.listen.app/");
         assert_eq!(
             result.resources[0].actions,
-            vec!["tinycloud.kv/get".to_string(), "tinycloud.kv/put".to_string()]
+            vec![
+                "tinycloud.kv/get".to_string(),
+                "tinycloud.kv/put".to_string()
+            ]
         );
 
         // Decode the UCAN and confirm the attenuation lines up with what we sent.
@@ -1033,7 +1040,13 @@ pub mod test {
         ]);
 
         let result = session
-            .create_delegation(delegate_did, &session.space_id, abilities, 4_000_000_000.0, None)
+            .create_delegation(
+                delegate_did,
+                &session.space_id,
+                abilities,
+                4_000_000_000.0,
+                None,
+            )
             .expect("multi-service delegation should succeed");
 
         assert_eq!(
@@ -1087,7 +1100,13 @@ pub mod test {
         ]);
 
         let result = session
-            .create_delegation(delegate_did, &session.space_id, abilities, 4_000_000_000.0, None)
+            .create_delegation(
+                delegate_did,
+                &session.space_id,
+                abilities,
+                4_000_000_000.0,
+                None,
+            )
             .expect("multi-service/multi-path delegation should succeed");
 
         assert_eq!(result.resources.len(), 3);
@@ -1222,7 +1241,13 @@ pub mod test {
             ("sql", "com.listen.app/", &["tinycloud.sql/read"]),
         ]);
         let result = session
-            .create_delegation(delegate_did, &session.space_id, abilities, 4_000_000_000.0, None)
+            .create_delegation(
+                delegate_did,
+                &session.space_id,
+                abilities,
+                4_000_000_000.0,
+                None,
+            )
             .expect("subset delegation should succeed");
 
         // Every resource in the delegation must be derivable from the parsed
