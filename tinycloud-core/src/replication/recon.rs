@@ -5,7 +5,7 @@ use super::{
     },
     store::encode_hash,
 };
-use crate::{hash::Blake3Hasher, models::kv_write};
+use crate::{hash::Blake3Hasher, models::canonical_commit};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -16,18 +16,21 @@ pub struct ReconInterest {
     pub range: String,
 }
 
-pub fn kv_recon_item(write: &kv_write::Model) -> KvReconItem {
-    let recon_key = KvReconKey::new(&write.key, write.invocation);
+pub fn kv_recon_item(commit: &canonical_commit::Model) -> KvReconItem {
+    let recon_key = KvReconKey::new(&commit.key, commit.invocation_id);
     KvReconItem {
-        key: write.key.to_string(),
+        key: commit.key.to_string(),
         kind: "put".to_string(),
         recon_key: recon_key.encoded,
-        invocation_id: encode_hash(write.invocation),
-        seq: write.seq,
-        epoch: encode_hash(write.epoch),
-        epoch_seq: write.epoch_seq,
-        value_hash: encode_hash(write.value),
-        metadata: write.metadata.clone(),
+        invocation_id: encode_hash(commit.invocation_id),
+        seq: commit.seq,
+        epoch: String::new(),
+        epoch_seq: 0,
+        value_hash: commit.value.clone().unwrap_or_default(),
+        metadata: commit
+            .metadata
+            .clone()
+            .unwrap_or_else(|| crate::types::Metadata(BTreeMap::new())),
     }
 }
 

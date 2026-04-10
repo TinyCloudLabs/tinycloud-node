@@ -9,11 +9,10 @@ use rocket::{
 use std::{collections::HashMap, net::IpAddr, sync::Mutex, time::Instant};
 use tinycloud_auth::resource::{Path, SpaceId};
 use tinycloud_core::storage::{Content, ImmutableReadStore};
-use tinycloud_core::types::KvReadParams;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 use crate::{config::PublicSpacesConfig, BlockStores, TinyCloud};
-use tinycloud_core::types::Metadata;
+use tinycloud_core::types::{KvReadParams, Metadata};
 
 /// A key path that allows dot-prefixed segments like `.well-known/profile`.
 /// Unlike `std::path::PathBuf`, this does not reject hidden files/dirs.
