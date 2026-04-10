@@ -191,6 +191,31 @@ pub fn createDelegation(
     Ok(serde_wasm_bindgen::to_value(&result)?)
 }
 
+/// Parse a signed SIWE message and extract its recap capabilities.
+///
+/// This is the inverse of what `prepareSession` + `completeSessionSetup`
+/// produce: given the SIWE string that a session was signed over, return the
+/// list of `{ service, space, path, actions }` entries that were granted.
+///
+/// Used by the SDK layer to decide whether a requested delegation is derivable
+/// from the current session (capability subset check). When the caps are a
+/// subset, the SDK can issue the delegation via `createDelegation` without any
+/// wallet prompt.
+///
+/// # Arguments
+/// * `siweString` - The signed SIWE message as a string (exactly as returned
+///   by `PreparedSession.siwe.toString()`, before or after signing).
+///
+/// # Returns
+/// An array of `{ service, space, path, actions }` objects. Returns an empty
+/// array (not an error) when the SIWE has no recap resource.
+#[wasm_bindgen]
+#[allow(non_snake_case)]
+pub fn parseRecapFromSiwe(siweString: &str) -> Result<JsValue, JsValue> {
+    let entries = session::parse_recap_from_siwe(siweString).map_err(map_jserr)?;
+    Ok(serde_wasm_bindgen::to_value(&entries)?)
+}
+
 /// Compute a CID from data bytes using Blake3_256 hash.
 ///
 /// This uses the same hashing algorithm as the TinyCloud server,
