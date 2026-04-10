@@ -203,7 +203,11 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         tinycloud_config.storage.blocks.open().await?,
         key_setup.setup(()).await?,
     )
-    .await?;
+    .await?
+    .with_local_canonical_commits_enabled(matches!(
+        tinycloud_config.replication.role,
+        ReplicationRole::Host
+    ));
 
     let sql_service = SqlService::new(
         tinycloud_config.storage.sql.path.clone().expect("resolved"),

@@ -51,6 +51,7 @@ pub struct SpaceDatabase<C, B, S> {
     storage: B,
     secrets: S,
     encryption: Option<ColumnEncryption>,
+    local_canonical_commits_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -151,11 +152,17 @@ impl<B, K> SpaceDatabase<DatabaseConnection, B, K> {
             storage,
             secrets,
             encryption: None,
+            local_canonical_commits_enabled: true,
         })
     }
 
     pub fn with_encryption(mut self, encryption: Option<ColumnEncryption>) -> Self {
         self.encryption = encryption;
+        self
+    }
+
+    pub fn with_local_canonical_commits_enabled(mut self, enabled: bool) -> Self {
+        self.local_canonical_commits_enabled = enabled;
         self
     }
 }
@@ -1159,6 +1166,7 @@ where
             &self.secrets,
             events,
             self.encryption.as_ref(),
+            self.local_canonical_commits_enabled,
         )
         .await?;
 
@@ -1270,6 +1278,7 @@ where
             &self.secrets,
             vec![Event::Invocation(Box::new(invocation), ops)],
             self.encryption.as_ref(),
+            self.local_canonical_commits_enabled,
         )
         .await?;
 
@@ -1467,6 +1476,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     secrets: &K,
     events: Vec<Event>,
     encryption: Option<&ColumnEncryption>,
+    local_canonical_commits_enabled: bool,
 ) -> Result<TransactResult, TxError<S, K>> {
     // for each event, get the hash and the relevent space(s)
     let event_hashes = events
@@ -1586,14 +1596,16 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             });
 
         let mut authority_spaces = HashSet::new();
-        for space in event_spaces.keys() {
-            let local_server_did = secrets
-                .stage_keypair(space)
-                .await
-                .map(get_did_key)
-                .map_err(TxError::Secrets)?;
-            if has_active_host_delegation_for_db(db, space, &local_server_did).await? {
-                authority_spaces.insert(space.clone());
+        if local_canonical_commits_enabled {
+            for space in event_spaces.keys() {
+                let local_server_did = secrets
+                    .stage_keypair(space)
+                    .await
+                    .map(get_did_key)
+                    .map_err(TxError::Secrets)?;
+                if has_active_host_delegation_for_db(db, space, &local_server_did).await? {
+                    authority_spaces.insert(space.clone());
+                }
             }
         }
         let authority_space_list = authority_spaces.iter().cloned().collect::<Vec<_>>();
@@ -1829,26 +1841,32 @@ async fn list<C: ConnectionTrait>(
     prefix: &Path,
     read_params: KvReadParams,
 ) -> Result<Vec<Path>, DbErr> {
-    // get content id for key from db
-    let mut list = kv_write::Entity::find()
-        .filter(
-            Condition::all()
-                .add(kv_write::Column::Key.starts_with(prefix.as_str()))
-                .add(kv_write::Column::Space.eq(SpaceIdWrap(space_id.clone()))),
-        )
-        .find_also_related(kv_delete::Entity)
-        .filter(kv_delete::Column::InvocationId.is_null())
-        .all(db)
-        .await?
-        .into_iter()
-        .map(|(kv, _)| kv.key.0)
-        .collect::<Vec<Path>>();
-    list.dedup();
-
-    if read_params.hides_quarantined_keys() {
-        if list.is_empty() {
-            return Ok(list);
+    let mut list: Vec<Path> = match read_params {
+        KvReadParams::Canonical => select_kv_recon_commits(db, space_id, Some(prefix))
+            .await?
+            .into_iter()
+            .map(|commit| commit.key.0)
+            .collect::<Vec<_>>(),
+        KvReadParams::Provisional => {
+            let mut list = kv_write::Entity::find()
+                .filter(
+                    Condition::all()
+                        .add(kv_write::Column::Key.starts_with(prefix.as_str()))
+                        .add(kv_write::Column::Space.eq(SpaceIdWrap(space_id.clone()))),
+                )
+                .find_also_related(kv_delete::Entity)
+                .filter(kv_delete::Column::InvocationId.is_null())
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|(kv, _)| kv.key.0)
+                .collect::<Vec<Path>>();
+            list.dedup();
+            list
         }
+    };
+
+    if read_params.hides_quarantined_keys() && !list.is_empty() {
         let quarantined = kv_quarantine::Entity::find()
             .filter(
                 Condition::all()
@@ -2154,7 +2172,7 @@ async fn select_kv_recon_commits<C: ConnectionTrait>(
     db: &C,
     space_id: &SpaceId,
     prefix: Option<&Path>,
-) -> Result<Vec<canonical_commit::Model>, KvReplicationError> {
+) -> Result<Vec<canonical_commit::Model>, DbErr> {
     let mut query = canonical_commit::Entity::find()
         .filter(canonical_commit::Column::Space.eq(SpaceIdWrap(space_id.clone())))
         .order_by_asc(canonical_commit::Column::Key)
@@ -2180,7 +2198,7 @@ async fn latest_canonical_kv_commit<C: ConnectionTrait>(
     db: &C,
     space_id: &SpaceId,
     key: &Path,
-) -> Result<Option<canonical_commit::Model>, KvReplicationError> {
+) -> Result<Option<canonical_commit::Model>, DbErr> {
     Ok(canonical_commit::Entity::find()
         .filter(
             Condition::all()
@@ -2296,16 +2314,21 @@ async fn metadata<C: ConnectionTrait>(
     read_params: KvReadParams,
     // TODO version: Option<(i64, Hash, i64)>,
 ) -> Result<Option<Metadata>, DbErr> {
-    match get_kv_entity(db, space_id, key).await? {
-        Some(entry) if read_params.hides_quarantined_keys() => {
+    match read_params {
+        KvReadParams::Canonical => {
             if is_kv_quarantined(db, space_id, key).await? {
-                Ok(None)
-            } else {
-                Ok(Some(entry.metadata))
+                return Ok(None);
+            }
+
+            match latest_canonical_kv_commit(db, space_id, key).await? {
+                Some(entry) if entry.kind == KV_CANONICAL_KIND_PUT => Ok(entry.metadata),
+                _ => Ok(None),
             }
         }
-        Some(entry) => Ok(Some(entry.metadata)),
-        None => Ok(None),
+        KvReadParams::Provisional => match get_kv_entity(db, space_id, key).await? {
+            Some(entry) => Ok(Some(entry.metadata)),
+            None => Ok(None),
+        },
     }
 }
 
@@ -2317,32 +2340,67 @@ async fn get_kv<C: ConnectionTrait, B: ImmutableReadStore>(
     read_params: KvReadParams,
     // TODO version: Option<(i64, Hash, i64)>,
 ) -> Result<Option<(Metadata, Hash, Content<B::Readable>)>, EitherError<DbErr, B::Error>> {
-    let e = match get_kv_entity(db, space_id, key)
-        .await
-        .map_err(EitherError::A)?
-    {
-        Some(entry) => entry,
-        None => return Ok(None),
-    };
+    match read_params {
+        KvReadParams::Canonical => {
+            if is_kv_quarantined(db, space_id, key)
+                .await
+                .map_err(EitherError::A)?
+            {
+                return Ok(None);
+            }
 
-    if read_params.hides_quarantined_keys()
-        && is_kv_quarantined(db, space_id, key)
-            .await
-            .map_err(EitherError::A)?
-    {
-        return Ok(None);
+            let entry = match latest_canonical_kv_commit(db, space_id, key)
+                .await
+                .map_err(EitherError::A)?
+            {
+                Some(entry) if entry.kind == KV_CANONICAL_KIND_PUT => entry,
+                _ => return Ok(None),
+            };
+
+            let metadata = entry.metadata.ok_or_else(|| {
+                EitherError::A(DbErr::Custom(format!(
+                    "missing canonical kv metadata for {}",
+                    key.as_str()
+                )))
+            })?;
+            let value_hash = entry.value.ok_or_else(|| {
+                EitherError::A(DbErr::Custom(format!(
+                    "missing canonical kv value hash for {}",
+                    key.as_str()
+                )))
+            })?;
+            let content_hash = decode_hash(&value_hash, "canonicalValueHash")
+                .map_err(|error| EitherError::A(DbErr::Custom(error.to_string())))?;
+            let c = match store
+                .read(space_id, &content_hash)
+                .await
+                .map_err(EitherError::B)?
+            {
+                Some(c) => c,
+                None => return Ok(None),
+            };
+            Ok(Some((metadata, content_hash, c)))
+        }
+        KvReadParams::Provisional => {
+            let entry = match get_kv_entity(db, space_id, key)
+                .await
+                .map_err(EitherError::A)?
+            {
+                Some(entry) => entry,
+                None => return Ok(None),
+            };
+            let content_hash = entry.value;
+            let c = match store
+                .read(space_id, &content_hash)
+                .await
+                .map_err(EitherError::B)?
+            {
+                Some(c) => c,
+                None => return Ok(None),
+            };
+            Ok(Some((entry.metadata, content_hash, c)))
+        }
     }
-
-    let content_hash = e.value;
-    let c = match store
-        .read(space_id, &content_hash)
-        .await
-        .map_err(EitherError::B)?
-    {
-        Some(c) => c,
-        None => return Ok(None),
-    };
-    Ok(Some((e.metadata, content_hash, c)))
 }
 
 async fn get_kv_entity<C: ConnectionTrait>(
