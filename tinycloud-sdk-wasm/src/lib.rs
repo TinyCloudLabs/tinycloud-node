@@ -123,34 +123,40 @@ pub fn siweToDelegationHeaders(signedSIWEMessage: JsValue) -> Result<JsValue, Js
     )?)
 }
 
-/// Create a delegation UCAN from a session to another DID.
-/// This allows session keys to delegate capabilities to other users client-side.
+/// Create a multi-resource delegation UCAN from a session to another DID.
+///
+/// Produces a **single** UCAN JWT that encodes every `(service, path, actions)`
+/// entry in `abilities`, scoped to `spaceId`. This lets a session key
+/// re-delegate exactly the capabilities it holds (or a strict subset) in one
+/// signed blob, regardless of how many services or paths the delegation
+/// covers.
 ///
 /// # Arguments
-/// * `session` - The current session (with JWK and delegation info)
-/// * `delegateDID` - The recipient's DID (audience of the delegation)
-/// * `spaceId` - The space being delegated (e.g., "tinycloud:pkh:eip155:1:0x....:default")
-/// * `path` - Path scope for the delegation
-/// * `actions` - Actions to delegate (e.g., ["tinycloud.kv/get", "tinycloud.kv/put"])
-/// * `expirationSecs` - Expiration timestamp in seconds since epoch
-/// * `notBeforeSecs` - Optional not-before timestamp in seconds since epoch
+/// * `session` - The current session (with JWK and delegation info).
+/// * `delegateDID` - The recipient DID (audience of the UCAN).
+/// * `spaceId` - The TinyCloud user space the delegation targets
+///   (e.g., `"tinycloud:pkh:eip155:1:0x....:default"`).
+/// * `abilities` - JS object shape `{ [service]: { [path]: [action, ...] } }`
+///   matching the shape `prepareSession` already accepts. Actions are
+///   full-URN strings (e.g., `"tinycloud.kv/get"`). An empty map is an error.
+/// * `expirationSecs` - UCAN expiration timestamp (seconds since epoch).
+/// * `notBeforeSecs` - Optional UCAN not-before timestamp.
 ///
 /// # Returns
-/// A `DelegationResult` containing:
-/// * `delegation` - Base64url-encoded UCAN JWT string
-/// * `cid` - CID of the delegation (for referencing in proof chains)
-/// * `delegateDID` - The delegate's DID
-/// * `path` - Path scope
-/// * `actions` - Delegated actions
-/// * `expiry` - Expiration timestamp
+/// A [`session::DelegationResult`] containing:
+/// * `delegation` - Base64url-encoded UCAN JWT.
+/// * `cid` - CID of the delegation (for proof chains).
+/// * `delegateDid` - The delegate's DID.
+/// * `expiry` - Expiration timestamp.
+/// * `resources` - Deterministic list of `{ service, space, path, actions }`
+///   entries describing what the UCAN grants. Sorted by `(service, path)`.
 #[wasm_bindgen]
 #[allow(non_snake_case)]
 pub fn createDelegation(
     session: JsValue,
     delegateDID: String,
     spaceId: String,
-    path: String,
-    actions: Vec<String>,
+    abilities: JsValue,
     expirationSecs: f64,
     notBeforeSecs: JsValue,
 ) -> Result<JsValue, JsValue> {
@@ -159,15 +165,17 @@ pub fn createDelegation(
     // Parse space_id
     let space_id: tinycloud_auth::resource::SpaceId = spaceId.parse().map_err(map_jserr)?;
 
-    // Parse path
-    let path: tinycloud_auth::resource::Path = path.parse().map_err(map_jserr)?;
-
-    // Parse actions
-    let abilities: Vec<tinycloud_auth::siwe_recap::Ability> = actions
-        .into_iter()
-        .map(|a| a.parse())
-        .collect::<Result<_, _>>()
-        .map_err(map_jserr)?;
+    // Parse the multi-resource abilities map. This is the same shape that
+    // `prepareSession` accepts: `{ [service]: { [path]: [action] } }`.
+    // serde_wasm_bindgen handles the nested HashMap deserialization directly
+    // because `Service`, `Path`, and `Ability` all implement `FromStr`/`Deserialize`.
+    let abilities_map: std::collections::HashMap<
+        tinycloud_auth::resource::Service,
+        std::collections::HashMap<
+            tinycloud_auth::resource::Path,
+            Vec<tinycloud_auth::siwe_recap::Ability>,
+        >,
+    > = serde_wasm_bindgen::from_value(abilities)?;
 
     // Parse optional not_before
     let not_before: Option<f64> = if notBeforeSecs.is_undefined() || notBeforeSecs.is_null() {
@@ -181,8 +189,7 @@ pub fn createDelegation(
         .create_delegation(
             &delegateDID,
             &space_id,
-            &path,
-            abilities,
+            abilities_map,
             expirationSecs,
             not_before,
         )
