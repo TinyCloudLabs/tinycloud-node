@@ -702,6 +702,43 @@ where
         })
     }
 
+    pub async fn has_active_host_delegation(
+        &self,
+        space_id: &str,
+        delegate_did: &str,
+    ) -> Result<bool, KvReplicationError> {
+        let space_id = parse_replication_space_id(space_id)?;
+        let now = time::OffsetDateTime::now_utc();
+        let (_delegations, abilities): (Vec<delegation::Model>, Vec<Vec<abilities::Model>>) =
+            delegation::Entity::find()
+                .left_join(revocation::Entity)
+                .filter(revocation::Column::Id.is_null())
+                .filter(delegation::Column::Delegatee.eq(delegate_did))
+                .filter(
+                    Condition::all()
+                        .add(
+                            Condition::any()
+                                .add(delegation::Column::Expiry.is_null())
+                                .add(delegation::Column::Expiry.gt(now)),
+                        )
+                        .add(
+                            Condition::any()
+                                .add(delegation::Column::NotBefore.is_null())
+                                .add(delegation::Column::NotBefore.lte(now)),
+                        ),
+                )
+                .find_with_related(abilities::Entity)
+                .all(&self.conn)
+                .await?
+                .into_iter()
+                .unzip();
+
+        Ok(abilities.into_iter().flatten().any(|ability| {
+            auth_resource_matches_host_delegate(&ability.resource, &space_id)
+                && ability.ability.as_ref().as_ref() == "tinycloud.space/host"
+        }))
+    }
+
     pub async fn export_auth_replication(
         &self,
         request: &AuthReplicationExportRequest,
@@ -1746,6 +1783,18 @@ fn auth_resource_matches_space(resource: &Resource, space_id: &SpaceId) -> bool 
     };
 
     resource.space() == space_id
+}
+
+fn auth_resource_matches_host_delegate(resource: &Resource, space_id: &SpaceId) -> bool {
+    let Some(resource) = resource.tinycloud_resource() else {
+        return false;
+    };
+
+    resource.space() == space_id
+        && resource.service().as_str() == "space"
+        && resource.path().is_none()
+        && resource.query().is_none()
+        && resource.fragment().is_none()
 }
 
 fn ordered_auth_delegations(
