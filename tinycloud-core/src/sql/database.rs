@@ -3,12 +3,14 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use rusqlite::hooks::{AuthContext, Authorization};
+use rusqlite::session::Session;
+use sqlparser::ast::Statement;
 use tokio::sync::{mpsc, oneshot};
 
 use super::{
     authorizer,
     caveats::SqlCaveats,
-    parser,
+    parser, replication as sql_replication,
     storage::{self, StorageMode},
     types::*,
 };
@@ -26,8 +28,16 @@ enum DbMessage {
     Export {
         response_tx: oneshot::Sender<Result<Vec<u8>, SqlError>>,
     },
+    ExportReplication {
+        since_seq: Option<i64>,
+        response_tx: oneshot::Sender<Result<sql_replication::SqlReplicationExport, SqlError>>,
+    },
     Import {
         snapshot: Vec<u8>,
+        response_tx: oneshot::Sender<Result<(), SqlError>>,
+    },
+    ApplyChangeset {
+        changeset: Vec<u8>,
         response_tx: oneshot::Sender<Result<(), SqlError>>,
     },
 }
@@ -75,6 +85,37 @@ impl DatabaseHandle {
         self.tx
             .send(DbMessage::Import {
                 snapshot,
+                response_tx,
+            })
+            .await
+            .map_err(|_| SqlError::Internal("Database actor not available".to_string()))?;
+        response_rx
+            .await
+            .map_err(|_| SqlError::Internal("Database actor dropped response".to_string()))?
+    }
+
+    pub async fn export_replication(
+        &self,
+        since_seq: Option<i64>,
+    ) -> Result<sql_replication::SqlReplicationExport, SqlError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send(DbMessage::ExportReplication {
+                since_seq,
+                response_tx,
+            })
+            .await
+            .map_err(|_| SqlError::Internal("Database actor not available".to_string()))?;
+        response_rx
+            .await
+            .map_err(|_| SqlError::Internal("Database actor dropped response".to_string()))?
+    }
+
+    pub async fn apply_changeset(&self, changeset: Vec<u8>) -> Result<(), SqlError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send(DbMessage::ApplyChangeset {
+                changeset,
                 response_tx,
             })
             .await
@@ -150,6 +191,13 @@ pub fn spawn_actor(
                     let result = handle_export(&conn);
                     let _ = response_tx.send(result);
                 }
+                DbMessage::ExportReplication {
+                    since_seq,
+                    response_tx,
+                } => {
+                    let result = handle_export_replication(&conn, since_seq);
+                    let _ = response_tx.send(result);
+                }
                 DbMessage::Import {
                     snapshot,
                     response_tx,
@@ -161,6 +209,13 @@ pub fn spawn_actor(
                         memory_threshold,
                         &snapshot,
                     );
+                    let _ = response_tx.send(result);
+                }
+                DbMessage::ApplyChangeset {
+                    changeset,
+                    response_tx,
+                } => {
+                    let result = handle_apply_changeset(&conn, &changeset);
                     let _ = response_tx.send(result);
                 }
             }
@@ -193,6 +248,13 @@ fn handle_export(conn: &rusqlite::Connection) -> Result<Vec<u8>, SqlError> {
     storage::export_snapshot(conn)
 }
 
+fn handle_export_replication(
+    conn: &rusqlite::Connection,
+    since_seq: Option<i64>,
+) -> Result<sql_replication::SqlReplicationExport, SqlError> {
+    sql_replication::export_replication(conn, since_seq)
+}
+
 fn handle_import(
     conn: &mut rusqlite::Connection,
     mode: &mut StorageMode,
@@ -209,6 +271,10 @@ fn handle_import(
     }
 
     Ok(())
+}
+
+fn handle_apply_changeset(conn: &rusqlite::Connection, changeset: &[u8]) -> Result<(), SqlError> {
+    sql_replication::apply_changeset(conn, changeset)
 }
 
 fn handle_message(
@@ -238,6 +304,8 @@ fn handle_message(
             params,
             schema,
         } => {
+            let schema_present = schema.is_some();
+
             // Schema init
             if let Some(schema_stmts) = schema {
                 for stmt_sql in schema_stmts {
@@ -254,40 +322,38 @@ fn handle_message(
                 }
             }
 
-            parser::validate_sql(sql, caveats, ability)?;
+            let parsed_query = parser::validate_sql(sql, caveats, ability)?;
             let auth =
                 authorizer::create_authorizer(caveats.clone(), ability.to_string(), is_admin);
             conn.authorizer(Some(auth));
 
-            let result = execute_statement(conn, sql, params);
+            let result = execute_statement_with_replication(
+                conn,
+                sql,
+                params,
+                &parsed_query,
+                schema_present,
+            );
 
             conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
 
             result.map(SqlResponse::Execute)
         }
         SqlRequest::Batch { statements } => {
-            for stmt in statements {
-                parser::validate_sql(&stmt.sql, caveats, ability)?;
-            }
+            let parsed_queries = statements
+                .iter()
+                .map(|stmt| parser::validate_sql(&stmt.sql, caveats, ability))
+                .collect::<Result<Vec<_>, _>>()?;
 
             let auth =
                 authorizer::create_authorizer(caveats.clone(), ability.to_string(), is_admin);
             conn.authorizer(Some(auth));
 
-            let mut results = Vec::new();
-            for stmt in statements {
-                match execute_statement(conn, &stmt.sql, &stmt.params) {
-                    Ok(result) => results.push(result),
-                    Err(e) => {
-                        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
-                        return Err(e);
-                    }
-                }
-            }
+            let result = execute_batch_with_replication(conn, statements, &parsed_queries);
 
             conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
 
-            Ok(SqlResponse::Batch(BatchResponse { results }))
+            result.map(SqlResponse::Batch)
         }
         SqlRequest::ExecuteStatement { name, params } => {
             let caveats_ref = caveats
@@ -297,21 +363,23 @@ fn handle_message(
                 SqlError::InvalidStatement(format!("Statement '{}' not found", name))
             })?;
 
-            parser::validate_sql(&prepared.sql, caveats, ability)?;
+            let parsed_query = parser::validate_sql(&prepared.sql, caveats, ability)?;
 
             let auth =
                 authorizer::create_authorizer(caveats.clone(), ability.to_string(), is_admin);
             conn.authorizer(Some(auth));
 
-            let result = if prepared
-                .sql
-                .trim_start()
-                .to_uppercase()
-                .starts_with("SELECT")
-            {
+            let result = if parsed_query.is_read_only {
                 execute_query(conn, &prepared.sql, params).map(SqlResponse::Query)
             } else {
-                execute_statement(conn, &prepared.sql, params).map(SqlResponse::Execute)
+                execute_statement_with_replication(
+                    conn,
+                    &prepared.sql,
+                    params,
+                    &parsed_query,
+                    false,
+                )
+                .map(SqlResponse::Execute)
             };
 
             conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
@@ -322,6 +390,100 @@ fn handle_message(
             "Export should be handled by service".to_string(),
         )),
     }
+}
+
+fn execute_statement_with_replication(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: &[SqlValue],
+    parsed_query: &parser::ParsedQuery,
+    force_snapshot_barrier: bool,
+) -> Result<ExecuteResponse, SqlError> {
+    let supports_changesets = supports_changeset_capture(parsed_query) && !force_snapshot_barrier;
+
+    if supports_changesets {
+        return with_changeset_session(conn, |conn| execute_statement(conn, sql, params));
+    }
+
+    let result = execute_statement(conn, sql, params)?;
+    if !parsed_query.is_read_only {
+        let reason = if force_snapshot_barrier || parsed_query.is_ddl {
+            "schema-change"
+        } else {
+            "unsupported-write"
+        };
+        sql_replication::append_snapshot_barrier(conn, reason)?;
+    }
+    Ok(result)
+}
+
+fn execute_batch_with_replication(
+    conn: &rusqlite::Connection,
+    statements: &[SqlStatement],
+    parsed_queries: &[parser::ParsedQuery],
+) -> Result<BatchResponse, SqlError> {
+    let supports_changesets = parsed_queries.iter().all(supports_changeset_capture);
+
+    if supports_changesets {
+        return with_changeset_session(conn, |conn| {
+            let mut results = Vec::with_capacity(statements.len());
+            for stmt in statements {
+                results.push(execute_statement(conn, &stmt.sql, &stmt.params)?);
+            }
+            Ok(BatchResponse { results })
+        });
+    }
+
+    let mut results = Vec::with_capacity(statements.len());
+    for stmt in statements {
+        results.push(execute_statement(conn, &stmt.sql, &stmt.params)?);
+    }
+
+    let barrier_reason = if parsed_queries.iter().any(|query| query.is_ddl) {
+        "schema-change"
+    } else if parsed_queries.iter().any(|query| !query.is_read_only) {
+        "unsupported-write"
+    } else {
+        ""
+    };
+    if !barrier_reason.is_empty() {
+        sql_replication::append_snapshot_barrier(conn, barrier_reason)?;
+    }
+
+    Ok(BatchResponse { results })
+}
+
+fn supports_changeset_capture(parsed_query: &parser::ParsedQuery) -> bool {
+    !parsed_query.is_read_only
+        && !parsed_query.is_ddl
+        && parsed_query.statements.len() == 1
+        && matches!(
+            parsed_query.statements.first(),
+            Some(Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. })
+        )
+}
+
+fn with_changeset_session<T, F>(conn: &rusqlite::Connection, body: F) -> Result<T, SqlError>
+where
+    F: FnOnce(&rusqlite::Connection) -> Result<T, SqlError>,
+{
+    let mut session = Session::new(conn).map_err(|e| SqlError::Internal(e.to_string()))?;
+    session.table_filter(Some(|table: &str| {
+        !sql_replication::is_internal_table_name(table)
+    }));
+    session
+        .attach(None)
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
+
+    let result = body(conn)?;
+    if !session.is_empty() {
+        let mut changeset = Vec::new();
+        session
+            .changeset_strm(&mut changeset)
+            .map_err(|e| SqlError::Internal(e.to_string()))?;
+        sql_replication::append_changeset(conn, &changeset)?;
+    }
+    Ok(result)
 }
 
 fn sql_value_to_rusqlite(v: &SqlValue) -> rusqlite::types::Value {

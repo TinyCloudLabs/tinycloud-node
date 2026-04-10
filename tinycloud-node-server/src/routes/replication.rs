@@ -1320,15 +1320,20 @@ pub async fn sql_replication_export(
             format!("invalid space id: {}", request.space_id),
         )
     })?;
-    let snapshot = sql_service
-        .export(&space_id, &request.db_name)
+    let export = sql_service
+        .export_replication(&space_id, &request.db_name, request.since_seq)
         .await
         .map_err(map_sql_error)?;
 
     Ok(Json(SqlReplicationExportResponse {
         space_id: request.space_id.clone(),
         db_name: request.db_name.clone(),
-        snapshot,
+        mode: export.mode.as_str().to_string(),
+        exported_until_seq: export.exported_until_seq,
+        snapshot_reason: export.snapshot_reason,
+        snapshot: export.snapshot,
+        changeset: export.changeset,
+        change_count: export.change_count,
     }))
 }
 
@@ -1359,16 +1364,84 @@ pub async fn sql_reconcile(
         )
     })?;
     let peer_url = request.peer_url.trim_end_matches('/');
-    let mut export_request = reqwest::Client::new()
+    let since_seq = sql_service
+        .read_peer_cursor(&space_id, &request.db_name, peer_url)
+        .map_err(map_sql_error)?;
+    let mut export = fetch_sql_replication_export(
+        peer_url,
+        &peer_token.0,
+        &request.space_id,
+        &request.db_name,
+        since_seq,
+    )
+    .await?;
+
+    if export.mode == "changeset" && !export.changeset.is_empty() {
+        if let Err(error) = sql_service
+            .apply_changeset(&space_id, &export.db_name, &export.changeset)
+            .await
+        {
+            tracing::warn!(
+                space=%request.space_id,
+                db=%request.db_name,
+                peer=%peer_url,
+                error=%error,
+                "SQL changeset apply failed, falling back to snapshot reconcile"
+            );
+            export = fetch_sql_replication_export(
+                peer_url,
+                &peer_token.0,
+                &request.space_id,
+                &request.db_name,
+                None,
+            )
+            .await?;
+        }
+    }
+
+    if export.mode == "snapshot" {
+        sql_service
+            .import(&space_id, &export.db_name, &export.snapshot)
+            .await
+            .map_err(map_sql_error)?;
+    }
+
+    sql_service
+        .write_peer_cursor(
+            &space_id,
+            &export.db_name,
+            peer_url,
+            export.exported_until_seq,
+        )
+        .map_err(map_sql_error)?;
+
+    Ok(Json(SqlReplicationApplyResponse {
+        space_id: export.space_id,
+        db_name: export.db_name,
+        peer_url: Some(request.peer_url.clone()),
+        mode: export.mode,
+        snapshot_bytes: export.snapshot.len(),
+        changeset_bytes: export.changeset.len(),
+        applied_until_seq: Some(export.exported_until_seq),
+        change_count: export.change_count,
+    }))
+}
+
+async fn fetch_sql_replication_export(
+    peer_url: &str,
+    peer_token: &str,
+    space_id: &str,
+    db_name: &str,
+    since_seq: Option<i64>,
+) -> Result<SqlReplicationExportResponse, (Status, String)> {
+    let export = reqwest::Client::new()
         .post(format!("{peer_url}/replication/sql/export"))
+        .header("Replication-Session", peer_token)
         .json(&SqlReplicationExportRequest {
-            space_id: request.space_id.clone(),
-            db_name: request.db_name.clone(),
-        });
-
-    export_request = export_request.header("Replication-Session", peer_token.0);
-
-    let export = export_request
+            space_id: space_id.to_string(),
+            db_name: db_name.to_string(),
+            since_seq,
+        })
         .send()
         .await
         .map_err(|error| (Status::BadGateway, error.to_string()))?;
@@ -1377,22 +1450,10 @@ pub async fn sql_reconcile(
         return Err(map_peer_error("peer sql export failed", export).await);
     }
 
-    let export = export
+    export
         .json::<SqlReplicationExportResponse>()
         .await
-        .map_err(|error| (Status::BadGateway, error.to_string()))?;
-
-    sql_service
-        .import(&space_id, &export.db_name, &export.snapshot)
-        .await
-        .map_err(map_sql_error)?;
-
-    Ok(Json(SqlReplicationApplyResponse {
-        space_id: export.space_id,
-        db_name: export.db_name,
-        peer_url: Some(request.peer_url.clone()),
-        snapshot_bytes: export.snapshot.len(),
-    }))
+        .map_err(|error| (Status::BadGateway, error.to_string()))
 }
 
 async fn verify_replication_delegation(

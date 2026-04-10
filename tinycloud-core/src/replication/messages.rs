@@ -469,6 +469,7 @@ pub struct ReplicationApplyResponse {
 pub struct SqlReplicationExportRequest {
     pub space_id: String,
     pub db_name: String,
+    pub since_seq: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -484,7 +485,12 @@ pub struct SqlReplicationReconcileRequest {
 pub struct SqlReplicationExportResponse {
     pub space_id: String,
     pub db_name: String,
+    pub mode: String,
+    pub exported_until_seq: i64,
+    pub snapshot_reason: Option<String>,
     pub snapshot: Vec<u8>,
+    pub changeset: Vec<u8>,
+    pub change_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -493,7 +499,11 @@ pub struct SqlReplicationApplyResponse {
     pub space_id: String,
     pub db_name: String,
     pub peer_url: Option<String>,
+    pub mode: String,
     pub snapshot_bytes: usize,
+    pub changeset_bytes: usize,
+    pub applied_until_seq: Option<i64>,
+    pub change_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

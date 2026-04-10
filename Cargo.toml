@@ -35,7 +35,7 @@ async-trait = "0.1"
 ipld-core = { version = "0.4", features = ["serde"] }
 serde_ipld_dagcbor = "0.6"
 ucan-capabilities-object = { git = "https://github.com/tinycloudlabs/ucan-capabilities-object" }
-rusqlite = { version = "0.32", features = ["bundled", "column_decltype", "hooks", "backup"] }
+rusqlite = { version = "0.32", features = ["bundled", "column_decltype", "hooks", "backup", "session"] }
 sqlparser = { version = "0.44", features = ["serde"] }
 tracing = "0.1"
 
@@ -51,3 +51,4 @@ cacaos = { path = "dependencies/cacao", version = "1.0.0" }
 [patch.crates-io]
 # Fix RUSTSEC-2025-0047: Out-of-bounds access in get_disjoint_mut (0.4.10 -> 0.4.11)
 slab = { git = "https://github.com/tokio-rs/slab", tag = "v0.4.11" }
+libsqlite3-sys = { path = "vendor/libsqlite3-sys" }

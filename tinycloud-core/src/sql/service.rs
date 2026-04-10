@@ -6,7 +6,7 @@ use tinycloud_auth::resource::SpaceId;
 use super::{
     caveats::SqlCaveats,
     database::{spawn_actor, DatabaseHandle},
-    storage,
+    replication as sql_replication, storage,
     types::*,
 };
 
@@ -104,6 +104,37 @@ impl SqlService {
         storage::export_snapshot_from_path(&path)
     }
 
+    pub async fn export_replication(
+        &self,
+        space: &SpaceId,
+        db_name: &str,
+        since_seq: Option<i64>,
+    ) -> Result<sql_replication::SqlReplicationExport, SqlError> {
+        let key = (space.to_string(), db_name.to_string());
+
+        if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
+            match handle.export_replication(since_seq).await {
+                Err(SqlError::Internal(ref msg))
+                    if msg.contains("Database actor not available") =>
+                {
+                    tracing::warn!(space=%space, db=%db_name, "Dead SQL actor detected during replication export, removing");
+                    self.databases.remove(&key);
+                }
+                other => return other,
+            }
+        }
+
+        let path = std::path::PathBuf::from(&self.base_path)
+            .join(space.to_string())
+            .join(format!("{}.db", db_name));
+
+        if !path.exists() {
+            return Err(SqlError::DatabaseNotFound);
+        }
+
+        sql_replication::export_replication_from_path(&path, since_seq)
+    }
+
     pub async fn import(
         &self,
         space: &SpaceId,
@@ -129,6 +160,58 @@ impl SqlService {
             .join(format!("{}.db", db_name));
 
         storage::import_snapshot_to_path(&path, snapshot)
+    }
+
+    pub async fn apply_changeset(
+        &self,
+        space: &SpaceId,
+        db_name: &str,
+        changeset: &[u8],
+    ) -> Result<(), SqlError> {
+        let key = (space.to_string(), db_name.to_string());
+
+        if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
+            match handle.apply_changeset(changeset.to_vec()).await {
+                Err(SqlError::Internal(ref msg))
+                    if msg.contains("Database actor not available") =>
+                {
+                    tracing::warn!(space=%space, db=%db_name, "Dead SQL actor detected during changeset apply, removing");
+                    self.databases.remove(&key);
+                }
+                other => return other,
+            }
+        }
+
+        let path = std::path::PathBuf::from(&self.base_path)
+            .join(space.to_string())
+            .join(format!("{}.db", db_name));
+
+        sql_replication::apply_changeset_to_path(&path, changeset)
+    }
+
+    pub fn read_peer_cursor(
+        &self,
+        space: &SpaceId,
+        db_name: &str,
+        peer_url: &str,
+    ) -> Result<Option<i64>, SqlError> {
+        sql_replication::read_peer_cursor(&self.base_path, &space.to_string(), db_name, peer_url)
+    }
+
+    pub fn write_peer_cursor(
+        &self,
+        space: &SpaceId,
+        db_name: &str,
+        peer_url: &str,
+        seq: i64,
+    ) -> Result<(), SqlError> {
+        sql_replication::write_peer_cursor(
+            &self.base_path,
+            &space.to_string(),
+            db_name,
+            peer_url,
+            seq,
+        )
     }
 
     pub fn db_name_from_path(path: Option<&str>) -> String {
