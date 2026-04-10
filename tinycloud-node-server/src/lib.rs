@@ -233,7 +233,11 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         key_setup.setup(()).await?,
     )
     .await?
-    .with_encryption(Some(webhook_encryption.clone()));
+    .with_encryption(Some(webhook_encryption.clone()))
+    .with_local_canonical_commits_enabled(matches!(
+        tinycloud_config.replication.role,
+        ReplicationRole::Host
+    ));
 
     let sql_service = SqlService::new(
         tinycloud_config.storage.sql.path.clone().expect("resolved"),
