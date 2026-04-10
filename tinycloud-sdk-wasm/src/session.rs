@@ -327,6 +327,104 @@ pub enum DelegationError {
     EncodingError(tinycloud_auth::ssi::ucan::error::Error),
 }
 
+/// A single recap permission entry extracted from a signed SIWE message.
+///
+/// This is the inverse of what `SessionConfig::into_message` produces when it
+/// writes resource capabilities into the SIWE `Resources:` list. The `service`,
+/// `space`, and `path` fields are pulled from the parsed resource URI; `actions`
+/// is the list of full-URN ability strings (e.g. `tinycloud.kv/get`).
+///
+/// Field names match the manifest `PermissionEntry` shape in the TypeScript SDK
+/// so the JS side can consume this directly after `serde_wasm_bindgen::to_value`.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ParsedRecapEntry {
+    /// Service name, e.g. "kv", "sql", "duckdb", "capabilities".
+    pub service: String,
+    /// Full space id string, e.g. "tinycloud:pkh:eip155:1:0x....:default".
+    pub space: String,
+    /// Resource path; empty string if the resource URI had no path segment.
+    pub path: String,
+    /// Full-URN ability strings, e.g. ["tinycloud.kv/get", "tinycloud.kv/put"].
+    pub actions: Vec<String>,
+}
+
+/// Parse a signed SIWE message string and extract its recap capabilities.
+///
+/// Returns an empty vector if the SIWE has no recap resource (plain auth SIWE).
+/// Returns an error if:
+/// - the string is not a valid SIWE message
+/// - the recap resource is present but cannot be decoded
+/// - a resource URI inside the recap cannot be parsed as a TinyCloud ResourceId
+///
+/// This is the inverse of `SessionConfig::into_message` and is used by the SDK
+/// layer to decide whether a requested delegation is a subset of the current
+/// session's granted capabilities.
+pub fn parse_recap_from_siwe(siwe_string: &str) -> Result<Vec<ParsedRecapEntry>, ParseRecapError> {
+    let message: Message =
+        siwe_string
+            .parse()
+            .map_err(|e: tinycloud_auth::cacaos::siwe::ParseError| {
+                ParseRecapError::InvalidSiwe(format!("{e}"))
+            })?;
+
+    // `extract_and_verify` returns:
+    //   - Ok(None) when there is no recap resource (plain auth SIWE)
+    //   - Ok(Some(cap)) when the recap is present and the statement matches
+    //   - Err(...) when the recap is malformed or the statement is tampered
+    let cap = match Capability::<serde_json::Value>::extract_and_verify(&message) {
+        Ok(Some(cap)) => cap,
+        Ok(None) => return Ok(Vec::new()),
+        Err(e) => return Err(ParseRecapError::VerificationFailed(e.to_string())),
+    };
+
+    let (caps, _proofs) = cap.into_inner();
+    let abilities_map = caps.abilities();
+
+    let mut entries: Vec<ParsedRecapEntry> = Vec::new();
+    for (resource_uri, ability_map) in abilities_map.iter() {
+        let resource: ResourceId = resource_uri.as_str().parse().map_err(
+            |e: tinycloud_auth::resource::KRIParseError| {
+                ParseRecapError::InvalidResourceUri(resource_uri.to_string(), e.to_string())
+            },
+        )?;
+
+        let space = resource.space().to_string();
+        let service = resource.service().to_string();
+        let path = resource
+            .path()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_default();
+
+        // Collect the full-URN ability strings. `ability_map` is a `BTreeMap`
+        // keyed by `Ability`, so iteration yields keys in sorted order — this
+        // gives us a deterministic action list without an extra sort pass.
+        let actions: Vec<String> = ability_map
+            .keys()
+            .map(|ability| ability.to_string())
+            .collect();
+
+        entries.push(ParsedRecapEntry {
+            service,
+            space,
+            path,
+            actions,
+        });
+    }
+
+    Ok(entries)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ParseRecapError {
+    #[error("invalid SIWE message: {0}")]
+    InvalidSiwe(String),
+    #[error("failed to verify recap capabilities: {0}")]
+    VerificationFailed(String),
+    #[error("invalid resource URI in recap ({0}): {1}")]
+    InvalidResourceUri(String, String),
+}
+
 pub fn prepare_session(config: SessionConfig) -> Result<PreparedSession, Error> {
     let mut jwk = match &config.jwk {
         Some(k) => k.clone(),
@@ -450,6 +548,166 @@ pub mod test {
         test_session()
             .invoke([(s, p, None, None, [a])], None)
             .expect("failed to create invocation");
+    }
+
+    #[test]
+    fn parse_recap_roundtrip() {
+        // Build a SIWE with a known set of capabilities, stringify it, then
+        // parse it back via parse_recap_from_siwe and verify we recover the
+        // same (service, space, path, actions) tuples.
+        let config = json!({
+            "abilities": {
+                "kv": {
+                    "com.listen.app/": vec![
+                        "tinycloud.kv/get",
+                        "tinycloud.kv/put",
+                        "tinycloud.kv/del",
+                        "tinycloud.kv/list",
+                        "tinycloud.kv/metadata",
+                    ],
+                },
+                "sql": {
+                    "com.listen.app/": vec![
+                        "tinycloud.sql/read",
+                        "tinycloud.sql/write",
+                    ],
+                },
+                "capabilities": {
+                    "com.listen.app/": vec![
+                        "tinycloud.capabilities/read",
+                    ],
+                },
+            },
+            "address": "0x7BD63AA37326a64d458559F44432103e3d6eEDE9",
+            "chainId": 1u8,
+            "domain": "example.com",
+            "issuedAt": "2022-01-01T00:00:00.000Z",
+            "spaceId": "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:default",
+            "expirationTime": "3000-01-01T00:00:00.000Z",
+        });
+        let prepared = prepare_session(serde_json::from_value(config).unwrap()).unwrap();
+        let siwe_string = prepared.siwe.to_string();
+
+        let entries = parse_recap_from_siwe(&siwe_string)
+            .expect("parse_recap_from_siwe should succeed on a well-formed SIWE");
+
+        // 3 services, each with one path under the primary space.
+        assert_eq!(entries.len(), 3, "expected 3 (service, space, path) groups");
+
+        let expected_space =
+            "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:default";
+        for entry in &entries {
+            assert_eq!(entry.space, expected_space, "space did not roundtrip");
+            assert_eq!(entry.path, "com.listen.app/", "path did not roundtrip");
+        }
+
+        // Build a service -> Vec<String> map for easier comparison.
+        let by_service: std::collections::HashMap<String, Vec<String>> = entries
+            .into_iter()
+            .map(|e| (e.service, e.actions))
+            .collect();
+
+        assert_eq!(
+            by_service.get("kv").cloned().unwrap_or_default(),
+            vec![
+                "tinycloud.kv/del".to_string(),
+                "tinycloud.kv/get".to_string(),
+                "tinycloud.kv/list".to_string(),
+                "tinycloud.kv/metadata".to_string(),
+                "tinycloud.kv/put".to_string(),
+            ],
+            "kv actions should roundtrip (sorted lexicographically)"
+        );
+        assert_eq!(
+            by_service.get("sql").cloned().unwrap_or_default(),
+            vec![
+                "tinycloud.sql/read".to_string(),
+                "tinycloud.sql/write".to_string(),
+            ]
+        );
+        assert_eq!(
+            by_service.get("capabilities").cloned().unwrap_or_default(),
+            vec!["tinycloud.capabilities/read".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_recap_empty_on_plain_siwe() {
+        // A plain SIWE with no recap resource should return an empty vec,
+        // not an error. This is the spec'd behavior: recap-less sign-ins are
+        // valid auth flows and we want the SDK to treat "no granted caps" as
+        // "empty granted set" rather than a failure.
+        let plain = "example.com wants you to sign in with your Ethereum account:\n\
+            0x7BD63AA37326a64d458559F44432103e3d6eEDE9\n\
+            \n\
+            \n\
+            URI: did:key:z6MkkjPSUV3dYfoVwRpyeaTPYiMCmvmSqD4oCxvbFb8xJpbF\n\
+            Version: 1\n\
+            Chain ID: 1\n\
+            Nonce: abcdefgh\n\
+            Issued At: 2022-01-01T00:00:00.000Z";
+        let entries = parse_recap_from_siwe(plain).expect("plain SIWE should parse");
+        assert!(
+            entries.is_empty(),
+            "plain SIWE must return empty recap entries, got {:?}",
+            entries
+        );
+    }
+
+    #[test]
+    fn parse_recap_with_additional_spaces() {
+        // When the session is signed with additional spaces (e.g., the public
+        // companion), the recap should contain entries for each space. We want
+        // the parser to expose them as distinct entries keyed by space.
+        let config = json!({
+            "abilities": {
+                "kv": {
+                    "": vec![
+                        "tinycloud.kv/get",
+                        "tinycloud.kv/put",
+                    ],
+                },
+            },
+            "address": "0x7BD63AA37326a64d458559F44432103e3d6eEDE9",
+            "chainId": 1u8,
+            "domain": "example.com",
+            "issuedAt": "2022-01-01T00:00:00.000Z",
+            "spaceId": "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:default",
+            "additionalSpaces": {
+                "public": "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:public"
+            },
+            "expirationTime": "3000-01-01T00:00:00.000Z",
+        });
+        let prepared = prepare_session(serde_json::from_value(config).unwrap()).unwrap();
+        let siwe_string = prepared.siwe.to_string();
+
+        let entries = parse_recap_from_siwe(&siwe_string)
+            .expect("parse_recap_from_siwe should succeed on multi-space SIWE");
+
+        // Two spaces, one service each, so we expect two entries.
+        assert_eq!(entries.len(), 2, "expected one entry per space");
+
+        let spaces: std::collections::HashSet<String> =
+            entries.iter().map(|e| e.space.clone()).collect();
+        assert!(spaces
+            .contains("tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:default"));
+        assert!(spaces
+            .contains("tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:public"));
+
+        for entry in entries {
+            assert_eq!(entry.service, "kv");
+            assert_eq!(
+                entry.path, "",
+                "path should be empty when abilities had empty path key"
+            );
+            assert_eq!(
+                entry.actions,
+                vec![
+                    "tinycloud.kv/get".to_string(),
+                    "tinycloud.kv/put".to_string(),
+                ]
+            );
+        }
     }
 
     #[test]
