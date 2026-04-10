@@ -4,23 +4,25 @@ use crate::{
 };
 use futures::future::BoxFuture;
 use rocket::{http::Status, serde::json::Json, State};
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use tinycloud_auth::resource::{Path as ResourcePath, Service, SpaceId};
 use tinycloud_core::{
     events::Delegation,
     replication::{
         AuthReplicationApplyResponse, AuthReplicationExportRequest, AuthReplicationExportResponse,
-        AuthReplicationReconcileRequest, KvReconCompareRequest, KvReconCompareResponse,
-        KvReconExportRequest, KvReconExportResponse, KvReconSplitChildComparison,
-        KvReconSplitCompareRequest, KvReconSplitCompareResponse, KvReconSplitReconcileChildResult,
-        KvReconSplitReconcileRequest, KvReconSplitReconcileResponse, KvReconSplitRequest,
-        KvReconSplitResponse, KvReplicationError, KvStateCompareItem, KvStateCompareRequest,
-        KvStateCompareResponse, KvStateRequest, KvStateResponse, ReplicationExportRequest,
-        ReplicationExportResponse, ReplicationReconcileRequest, ReplicationRouteStatus,
-        ReplicationScope, ReplicationService, ReplicationSessionError,
-        ReplicationSessionOpenRequest, ReplicationSessionOpenResponse, ReplicationSessionRecord,
-        ReplicationSessionSummary, SqlReplicationApplyResponse, SqlReplicationExportRequest,
-        SqlReplicationExportResponse, SqlReplicationReconcileRequest,
+        AuthReplicationReconcileRequest, KvPeerMissingAction, KvPeerMissingApplyItem,
+        KvPeerMissingApplyResponse, KvPeerMissingPlanItem, KvPeerMissingPlanResponse,
+        KvReconCompareRequest, KvReconCompareResponse, KvReconExportRequest, KvReconExportResponse,
+        KvReconSplitChildComparison, KvReconSplitCompareRequest, KvReconSplitCompareResponse,
+        KvReconSplitReconcileChildResult, KvReconSplitReconcileRequest,
+        KvReconSplitReconcileResponse, KvReconSplitRequest, KvReconSplitResponse,
+        KvReplicationError, KvStateCompareItem, KvStateCompareRequest, KvStateCompareResponse,
+        KvStateRequest, KvStateResponse, ReplicationExportRequest, ReplicationExportResponse,
+        ReplicationReconcileRequest, ReplicationRouteStatus, ReplicationScope, ReplicationService,
+        ReplicationSessionError, ReplicationSessionOpenRequest, ReplicationSessionOpenResponse,
+        ReplicationSessionRecord, ReplicationSessionSummary, SqlReplicationApplyResponse,
+        SqlReplicationExportRequest, SqlReplicationExportResponse, SqlReplicationReconcileRequest,
     },
     sql::{SqlError, SqlService},
     types::Resource,
@@ -32,6 +34,12 @@ use tinycloud_core::{
 struct SplitReconcileTarget {
     replay_prefix: String,
     result_prefix: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PeerNodeInfo {
+    roles_enabled: Vec<String>,
 }
 
 #[get("/replication/info")]
@@ -49,6 +57,8 @@ pub async fn replication_info(
             "POST /replication/export",
             "POST /replication/kv/state",
             "POST /replication/kv/state/compare",
+            "POST /replication/peer-missing/plan",
+            "POST /replication/peer-missing/apply",
             "POST /replication/recon/export",
             "POST /replication/recon/split",
             "POST /replication/recon/split/compare",
@@ -251,74 +261,157 @@ pub async fn kv_state_compare(
             "missing Peer-Replication-Session for kv state compare".to_string(),
         )
     })?;
-    let peer_url = request.peer_url.trim_end_matches('/');
-    let local = tinycloud
-        .export_kv_recon(&KvReconExportRequest {
-            space_id: request.space_id.clone(),
-            prefix: request.prefix.clone(),
-            start_after: request.start_after.clone(),
-            limit: request.limit,
-        })
+    compare_kv_state_scope(&request, &peer_token.0, tinycloud)
         .await
-        .map_err(map_replication_error)?;
+        .map(Json)
+}
 
-    let keys = local
-        .items
-        .iter()
-        .map(|item| item.key.clone())
-        .collect::<Vec<_>>();
-    let peer_state = if keys.is_empty() {
-        KvStateResponse {
-            space_id: request.space_id.clone(),
-            prefix: request.prefix.clone(),
-            items: Vec::new(),
-        }
-    } else {
-        fetch_peer_kv_state(
-            peer_url,
-            &peer_token.0,
-            &KvStateRequest {
-                space_id: request.space_id.clone(),
-                prefix: request.prefix.clone(),
-                keys,
-            },
-        )
-        .await?
-    };
-    let peer_items = peer_state
-        .items
-        .into_iter()
-        .map(|item| (item.key.clone(), item))
-        .collect::<BTreeMap<_, _>>();
-    let items = local
-        .items
-        .into_iter()
-        .map(|item| {
-            let peer = peer_items.get(&item.key);
-            KvStateCompareItem {
-                key: item.key,
-                kind: item.kind,
-                local_invocation_id: Some(item.invocation_id),
-                peer_status: peer
-                    .map(|state| state.status.clone())
-                    .unwrap_or_else(|| "absent".to_string()),
-                peer_seq: peer.and_then(|state| state.seq),
-                peer_invocation_id: peer.and_then(|state| state.invocation_id.clone()),
-                peer_deleted_invocation_id: peer
-                    .and_then(|state| state.deleted_invocation_id.clone()),
-                peer_value_hash: peer.and_then(|state| state.value_hash.clone()),
-            }
-        })
-        .collect::<Vec<_>>();
-
-    Ok(Json(KvStateCompareResponse {
-        space_id: request.space_id.clone(),
+#[post("/replication/peer-missing/plan", format = "json", data = "<request>")]
+pub async fn peer_missing_plan(
+    request: Json<KvStateCompareRequest>,
+    token: Option<ReplicationSessionToken>,
+    peer_token: Option<PeerReplicationSessionToken>,
+    replication: &State<ReplicationService>,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Json<KvPeerMissingPlanResponse>, (Status, String)> {
+    let scope = ReplicationScope::Kv {
         prefix: request.prefix.clone(),
-        peer_url: request.peer_url.clone(),
-        start_after: request.start_after.clone(),
-        limit: request.limit,
-        has_more: local.has_more,
-        next_start_after: local.next_start_after,
+    };
+    let session = authorize_session_scope(&request.space_id, &scope, token, replication)?;
+    ensure_replication_session_active(&session, tinycloud).await?;
+    let peer_token = peer_token.ok_or_else(|| {
+        (
+            Status::Unauthorized,
+            "missing Peer-Replication-Session for peer-missing plan".to_string(),
+        )
+    })?;
+    let peer_url = request.peer_url.trim_end_matches('/');
+    let peer_host_role = fetch_peer_host_role(peer_url).await?;
+    ensure_peer_host_role(peer_url, peer_host_role)?;
+    let compare = compare_kv_state_scope(&request, &peer_token.0, tinycloud).await?;
+    Ok(Json(build_peer_missing_plan(compare, peer_host_role)))
+}
+
+#[post("/replication/peer-missing/apply", format = "json", data = "<request>")]
+pub async fn peer_missing_apply(
+    request: Json<KvStateCompareRequest>,
+    token: Option<ReplicationSessionToken>,
+    peer_token: Option<PeerReplicationSessionToken>,
+    replication: &State<ReplicationService>,
+    staging: &State<BlockStage>,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Json<KvPeerMissingApplyResponse>, (Status, String)> {
+    let scope = ReplicationScope::Kv {
+        prefix: request.prefix.clone(),
+    };
+    let session = authorize_session_scope(&request.space_id, &scope, token, replication)?;
+    ensure_replication_session_active(&session, tinycloud).await?;
+    let peer_token = peer_token.ok_or_else(|| {
+        (
+            Status::Unauthorized,
+            "missing Peer-Replication-Session for peer-missing apply".to_string(),
+        )
+    })?;
+    let peer_url = request.peer_url.trim_end_matches('/');
+    let peer_host_role = fetch_peer_host_role(peer_url).await?;
+    ensure_peer_host_role(peer_url, peer_host_role)?;
+    let plan = build_peer_missing_plan(
+        compare_kv_state_scope(&request, &peer_token.0, tinycloud).await?,
+        peer_host_role,
+    );
+    let mut items = Vec::with_capacity(plan.items.len());
+    let mut pruned_deletes = 0;
+    let mut quarantined = 0;
+    let mut already_quarantined = 0;
+    let mut kept = 0;
+
+    for item in &plan.items {
+        let (result, applied_sequences, applied_events) = if item.action == "prune-delete" {
+            let export = fetch_peer_kv_export(
+                peer_url,
+                &peer_token.0,
+                &ReplicationExportRequest {
+                    space_id: request.space_id.clone(),
+                    prefix: Some(item.key.clone()),
+                    since_seq: None,
+                    limit: None,
+                },
+            )
+            .await?;
+            let filtered = filter_kv_export_to_exact_key(export, &item.key);
+            let applied = tinycloud
+                .apply_kv_replication(&filtered, staging.inner())
+                .await
+                .map_err(map_replication_error)?;
+            if applied.applied_events > 0 {
+                pruned_deletes += 1;
+            }
+            (
+                if applied.applied_events > 0 {
+                    "pruned-delete"
+                } else {
+                    "already-pruned"
+                },
+                applied.applied_sequences,
+                applied.applied_events,
+            )
+        } else if item.action == "quarantine-absent" {
+            let local_invocation_id = item.local_invocation_id.as_deref().ok_or_else(|| {
+                (
+                    Status::InternalServerError,
+                    format!("missing local invocation id for key {}", item.key),
+                )
+            })?;
+            let inserted = tinycloud
+                .quarantine_kv_peer_missing(
+                    &request.space_id,
+                    &item.key,
+                    peer_url,
+                    local_invocation_id,
+                    &item.peer_status,
+                    item.peer_invocation_id.as_deref(),
+                    item.peer_deleted_invocation_id.as_deref(),
+                )
+                .await
+                .map_err(map_replication_error)?;
+            if inserted {
+                quarantined += 1;
+                ("quarantined", 0, 0)
+            } else {
+                already_quarantined += 1;
+                ("already-quarantined", 0, 0)
+            }
+        } else {
+            kept += 1;
+            ("kept", 0, 0)
+        };
+
+        items.push(KvPeerMissingApplyItem {
+            key: item.key.clone(),
+            action: item.action.clone(),
+            result: result.to_string(),
+            local_invocation_id: item.local_invocation_id.clone(),
+            peer_status: item.peer_status.clone(),
+            peer_deleted_invocation_id: item.peer_deleted_invocation_id.clone(),
+            applied_sequences,
+            applied_events,
+        });
+    }
+
+    Ok(Json(KvPeerMissingApplyResponse {
+        space_id: plan.space_id,
+        prefix: plan.prefix,
+        peer_url: plan.peer_url,
+        peer_host_role,
+        start_after: plan.start_after,
+        limit: plan.limit,
+        has_more: plan.has_more,
+        next_start_after: plan.next_start_after,
+        attempted_items: items.len(),
+        pruned_deletes,
+        quarantined,
+        already_quarantined,
+        kept,
         items,
     }))
 }
@@ -521,6 +614,134 @@ pub async fn recon_compare(
     }))
 }
 
+async fn compare_kv_state_scope(
+    request: &KvStateCompareRequest,
+    peer_token: &str,
+    tinycloud: &State<TinyCloud>,
+) -> Result<KvStateCompareResponse, (Status, String)> {
+    let peer_url = request.peer_url.trim_end_matches('/');
+    let local = tinycloud
+        .export_kv_recon(&KvReconExportRequest {
+            space_id: request.space_id.clone(),
+            prefix: request.prefix.clone(),
+            start_after: request.start_after.clone(),
+            limit: request.limit,
+        })
+        .await
+        .map_err(map_replication_error)?;
+
+    let keys = local
+        .items
+        .iter()
+        .map(|item| item.key.clone())
+        .collect::<Vec<_>>();
+    let peer_state = if keys.is_empty() {
+        KvStateResponse {
+            space_id: request.space_id.clone(),
+            prefix: request.prefix.clone(),
+            items: Vec::new(),
+        }
+    } else {
+        fetch_peer_kv_state(
+            peer_url,
+            peer_token,
+            &KvStateRequest {
+                space_id: request.space_id.clone(),
+                prefix: request.prefix.clone(),
+                keys,
+            },
+        )
+        .await?
+    };
+    let peer_items = peer_state
+        .items
+        .into_iter()
+        .map(|item| (item.key.clone(), item))
+        .collect::<BTreeMap<_, _>>();
+    let items = local
+        .items
+        .into_iter()
+        .map(|item| {
+            let peer = peer_items.get(&item.key);
+            KvStateCompareItem {
+                key: item.key,
+                kind: item.kind,
+                local_invocation_id: Some(item.invocation_id),
+                peer_status: peer
+                    .map(|state| state.status.clone())
+                    .unwrap_or_else(|| "absent".to_string()),
+                peer_seq: peer.and_then(|state| state.seq),
+                peer_invocation_id: peer.and_then(|state| state.invocation_id.clone()),
+                peer_deleted_invocation_id: peer
+                    .and_then(|state| state.deleted_invocation_id.clone()),
+                peer_value_hash: peer.and_then(|state| state.value_hash.clone()),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(KvStateCompareResponse {
+        space_id: request.space_id.clone(),
+        prefix: request.prefix.clone(),
+        peer_url: request.peer_url.clone(),
+        start_after: request.start_after.clone(),
+        limit: request.limit,
+        has_more: local.has_more,
+        next_start_after: local.next_start_after,
+        items,
+    })
+}
+
+fn build_peer_missing_plan(
+    compare: KvStateCompareResponse,
+    peer_host_role: bool,
+) -> KvPeerMissingPlanResponse {
+    let mut keep_count = 0;
+    let mut prune_delete_count = 0;
+    let mut quarantine_absent_count = 0;
+    let items = compare
+        .items
+        .into_iter()
+        .map(|item| {
+            let action = match item.peer_status.as_str() {
+                "deleted" => KvPeerMissingAction::PruneDelete,
+                "absent" => KvPeerMissingAction::QuarantineAbsent,
+                _ => KvPeerMissingAction::Keep,
+            };
+            match action {
+                KvPeerMissingAction::Keep => keep_count += 1,
+                KvPeerMissingAction::PruneDelete => prune_delete_count += 1,
+                KvPeerMissingAction::QuarantineAbsent => quarantine_absent_count += 1,
+            }
+            KvPeerMissingPlanItem {
+                key: item.key,
+                kind: item.kind,
+                local_invocation_id: item.local_invocation_id,
+                peer_status: item.peer_status,
+                peer_seq: item.peer_seq,
+                peer_invocation_id: item.peer_invocation_id,
+                peer_deleted_invocation_id: item.peer_deleted_invocation_id,
+                peer_value_hash: item.peer_value_hash,
+                action: peer_missing_action_label(&action).to_string(),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    KvPeerMissingPlanResponse {
+        space_id: compare.space_id,
+        prefix: compare.prefix,
+        peer_url: compare.peer_url,
+        peer_host_role,
+        start_after: compare.start_after,
+        limit: compare.limit,
+        has_more: compare.has_more,
+        next_start_after: compare.next_start_after,
+        keep_count,
+        prune_delete_count,
+        quarantine_absent_count,
+        items,
+    }
+}
+
 async fn fetch_peer_kv_export(
     peer_url: &str,
     peer_token: &str,
@@ -565,6 +786,89 @@ async fn fetch_peer_kv_state(
         .json::<KvStateResponse>()
         .await
         .map_err(|error| (Status::BadGateway, error.to_string()))
+}
+
+async fn fetch_peer_host_role(peer_url: &str) -> Result<bool, (Status, String)> {
+    let response = reqwest::Client::new()
+        .get(format!("{peer_url}/info"))
+        .send()
+        .await
+        .map_err(|error| (Status::BadGateway, error.to_string()))?;
+
+    if !response.status().is_success() {
+        return Err(map_peer_error("peer info lookup failed", response).await);
+    }
+
+    let info = response
+        .json::<PeerNodeInfo>()
+        .await
+        .map_err(|error| (Status::BadGateway, error.to_string()))?;
+
+    Ok(info.roles_enabled.iter().any(|role| role == "host"))
+}
+
+fn ensure_peer_host_role(peer_url: &str, peer_host_role: bool) -> Result<(), (Status, String)> {
+    if peer_host_role {
+        Ok(())
+    } else {
+        Err((
+            Status::Forbidden,
+            format!(
+                "peer-missing authority mode requires a host-role peer: {}",
+                peer_url
+            ),
+        ))
+    }
+}
+
+fn filter_kv_export_to_exact_key(
+    export: ReplicationExportResponse,
+    key: &str,
+) -> ReplicationExportResponse {
+    let sequences = export
+        .sequences
+        .into_iter()
+        .filter_map(|sequence| {
+            let events = sequence
+                .events
+                .into_iter()
+                .filter(|event| kv_replication_event_matches_key(event, key))
+                .collect::<Vec<_>>();
+
+            if events.is_empty() {
+                None
+            } else {
+                Some(tinycloud_core::replication::KvReplicationSequence {
+                    seq: sequence.seq,
+                    epoch: sequence.epoch,
+                    events,
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+    let exported_until_seq = sequences.last().map(|sequence| sequence.seq);
+
+    ReplicationExportResponse {
+        space_id: export.space_id,
+        prefix: Some(key.to_string()),
+        requested_since_seq: export.requested_since_seq,
+        exported_until_seq,
+        sequences,
+    }
+}
+
+fn kv_replication_event_matches_key(
+    event: &tinycloud_core::replication::KvReplicationEvent,
+    key: &str,
+) -> bool {
+    match &event.operation {
+        tinycloud_core::replication::KvReplicationOperation::Put { key: event_key, .. } => {
+            event_key == key
+        }
+        tinycloud_core::replication::KvReplicationOperation::Delete { key: event_key, .. } => {
+            event_key == key
+        }
+    }
 }
 
 async fn apply_kv_reconcile_from_peer(
@@ -1253,6 +1557,14 @@ fn scope_path_is_subset(requested: Option<&str>, delegated: Option<&str>) -> boo
 
 fn normalize_scope_value(value: &str) -> &str {
     value.trim_matches('/')
+}
+
+fn peer_missing_action_label(action: &KvPeerMissingAction) -> &'static str {
+    match action {
+        KvPeerMissingAction::Keep => "keep",
+        KvPeerMissingAction::PruneDelete => "prune-delete",
+        KvPeerMissingAction::QuarantineAbsent => "quarantine-absent",
+    }
 }
 
 fn requested_resource(

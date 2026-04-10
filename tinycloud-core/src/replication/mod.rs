@@ -8,17 +8,18 @@ pub mod types;
 
 pub use messages::{
     AuthReplicationApplyResponse, AuthReplicationExportRequest, AuthReplicationExportResponse,
-    AuthReplicationReconcileRequest, KvReconCompareRequest, KvReconCompareResponse,
-    KvReconExportRequest, KvReconExportResponse, KvReconItem, KvReconSplitChild,
-    KvReconSplitChildComparison, KvReconSplitCompareRequest, KvReconSplitCompareResponse,
-    KvReconSplitReconcileChildResult, KvReconSplitReconcileRequest, KvReconSplitReconcileResponse,
-    KvReconSplitRequest, KvReconSplitResponse, KvReplicationEvent, KvReplicationOperation,
-    KvReplicationSequence, KvStateCompareItem, KvStateCompareRequest, KvStateCompareResponse,
-    KvStateItem, KvStateRequest, KvStateResponse, KvStateStatus, ReplicationApplyResponse,
-    ReplicationErrorResponse, ReplicationExportRequest, ReplicationExportResponse,
-    ReplicationInfoRequest, ReplicationReconcileRequest, ReplicationSessionOpenRequest,
-    ReplicationSessionOpenResponse, SqlReplicationApplyResponse, SqlReplicationExportRequest,
-    SqlReplicationExportResponse, SqlReplicationReconcileRequest,
+    AuthReplicationReconcileRequest, KvPeerMissingAction, KvPeerMissingApplyItem,
+    KvPeerMissingApplyResponse, KvPeerMissingPlanItem, KvPeerMissingPlanResponse,
+    KvReconCompareRequest, KvReconCompareResponse, KvReconExportRequest, KvReconExportResponse,
+    KvReconItem, KvReconSplitChild, KvReconSplitChildComparison, KvReconSplitCompareRequest,
+    KvReconSplitCompareResponse, KvReconSplitReconcileChildResult, KvReconSplitReconcileRequest,
+    KvReconSplitReconcileResponse, KvReconSplitRequest, KvReconSplitResponse, KvReplicationEvent,
+    KvReplicationOperation, KvReplicationSequence, KvStateCompareItem, KvStateCompareRequest,
+    KvStateCompareResponse, KvStateItem, KvStateRequest, KvStateResponse, KvStateStatus,
+    ReplicationApplyResponse, ReplicationErrorResponse, ReplicationExportRequest,
+    ReplicationExportResponse, ReplicationInfoRequest, ReplicationReconcileRequest,
+    ReplicationSessionOpenRequest, ReplicationSessionOpenResponse, SqlReplicationApplyResponse,
+    SqlReplicationExportRequest, SqlReplicationExportResponse, SqlReplicationReconcileRequest,
 };
 pub use store::{decode_hash, encode_hash, KvReplicationError};
 pub use types::{

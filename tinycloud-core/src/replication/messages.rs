@@ -161,6 +161,77 @@ pub struct KvStateCompareResponse {
     pub items: Vec<KvStateCompareItem>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum KvPeerMissingAction {
+    Keep,
+    PruneDelete,
+    QuarantineAbsent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KvPeerMissingPlanItem {
+    pub key: String,
+    pub kind: String,
+    pub local_invocation_id: Option<String>,
+    pub peer_status: String,
+    pub peer_seq: Option<i64>,
+    pub peer_invocation_id: Option<String>,
+    pub peer_deleted_invocation_id: Option<String>,
+    pub peer_value_hash: Option<String>,
+    pub action: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KvPeerMissingPlanResponse {
+    pub space_id: String,
+    pub prefix: Option<String>,
+    pub peer_url: String,
+    pub peer_host_role: bool,
+    pub start_after: Option<String>,
+    pub limit: Option<usize>,
+    pub has_more: bool,
+    pub next_start_after: Option<String>,
+    pub keep_count: usize,
+    pub prune_delete_count: usize,
+    pub quarantine_absent_count: usize,
+    pub items: Vec<KvPeerMissingPlanItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KvPeerMissingApplyItem {
+    pub key: String,
+    pub action: String,
+    pub result: String,
+    pub local_invocation_id: Option<String>,
+    pub peer_status: String,
+    pub peer_deleted_invocation_id: Option<String>,
+    pub applied_sequences: usize,
+    pub applied_events: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KvPeerMissingApplyResponse {
+    pub space_id: String,
+    pub prefix: Option<String>,
+    pub peer_url: String,
+    pub peer_host_role: bool,
+    pub start_after: Option<String>,
+    pub limit: Option<usize>,
+    pub has_more: bool,
+    pub next_start_after: Option<String>,
+    pub attempted_items: usize,
+    pub pruned_deletes: usize,
+    pub quarantined: usize,
+    pub already_quarantined: usize,
+    pub kept: usize,
+    pub items: Vec<KvPeerMissingApplyItem>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KvReconSplitRequest {
