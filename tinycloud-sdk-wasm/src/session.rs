@@ -361,9 +361,12 @@ pub struct ParsedRecapEntry {
 /// layer to decide whether a requested delegation is a subset of the current
 /// session's granted capabilities.
 pub fn parse_recap_from_siwe(siwe_string: &str) -> Result<Vec<ParsedRecapEntry>, ParseRecapError> {
-    let message: Message = siwe_string
-        .parse()
-        .map_err(|e: tinycloud_auth::cacaos::siwe::ParseError| ParseRecapError::InvalidSiwe(format!("{e}")))?;
+    let message: Message =
+        siwe_string
+            .parse()
+            .map_err(|e: tinycloud_auth::cacaos::siwe::ParseError| {
+                ParseRecapError::InvalidSiwe(format!("{e}"))
+            })?;
 
     // `extract_and_verify` returns:
     //   - Ok(None) when there is no recap resource (plain auth SIWE)
@@ -380,12 +383,11 @@ pub fn parse_recap_from_siwe(siwe_string: &str) -> Result<Vec<ParsedRecapEntry>,
 
     let mut entries: Vec<ParsedRecapEntry> = Vec::new();
     for (resource_uri, ability_map) in abilities_map.iter() {
-        let resource: ResourceId = resource_uri
-            .as_str()
-            .parse()
-            .map_err(|e: tinycloud_auth::resource::KRIParseError| {
+        let resource: ResourceId = resource_uri.as_str().parse().map_err(
+            |e: tinycloud_auth::resource::KRIParseError| {
                 ParseRecapError::InvalidResourceUri(resource_uri.to_string(), e.to_string())
-            })?;
+            },
+        )?;
 
         let space = resource.space().to_string();
         let service = resource.service().to_string();
@@ -687,16 +689,17 @@ pub mod test {
 
         let spaces: std::collections::HashSet<String> =
             entries.iter().map(|e| e.space.clone()).collect();
-        assert!(spaces.contains(
-            "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:default"
-        ));
-        assert!(spaces.contains(
-            "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:public"
-        ));
+        assert!(spaces
+            .contains("tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:default"));
+        assert!(spaces
+            .contains("tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:public"));
 
         for entry in entries {
             assert_eq!(entry.service, "kv");
-            assert_eq!(entry.path, "", "path should be empty when abilities had empty path key");
+            assert_eq!(
+                entry.path, "",
+                "path should be empty when abilities had empty path key"
+            );
             assert_eq!(
                 entry.actions,
                 vec![
