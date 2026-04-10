@@ -13,7 +13,8 @@ use tinycloud_core::{
         AuthReplicationApplyResponse, AuthReplicationExportRequest, AuthReplicationExportResponse,
         AuthReplicationReconcileRequest, KvPeerMissingAction, KvPeerMissingApplyItem,
         KvPeerMissingApplyResponse, KvPeerMissingPlanItem, KvPeerMissingPlanResponse,
-        KvReconCompareRequest, KvReconCompareResponse, KvReconExportRequest, KvReconExportResponse,
+        KvPeerMissingQuarantineRequest, KvPeerMissingQuarantineResponse, KvReconCompareRequest,
+        KvReconCompareResponse, KvReconExportRequest, KvReconExportResponse,
         KvReconSplitChildComparison, KvReconSplitCompareRequest, KvReconSplitCompareResponse,
         KvReconSplitReconcileChildResult, KvReconSplitReconcileRequest,
         KvReconSplitReconcileResponse, KvReconSplitRequest, KvReconSplitResponse,
@@ -59,6 +60,7 @@ pub async fn replication_info(
             "POST /replication/kv/state/compare",
             "POST /replication/peer-missing/plan",
             "POST /replication/peer-missing/apply",
+            "POST /replication/peer-missing/quarantine",
             "POST /replication/recon/export",
             "POST /replication/recon/split",
             "POST /replication/recon/split/compare",
@@ -323,73 +325,91 @@ pub async fn peer_missing_apply(
     let mut pruned_deletes = 0;
     let mut quarantined = 0;
     let mut already_quarantined = 0;
+    let mut cleared_quarantine = 0;
     let mut kept = 0;
 
     for item in &plan.items {
-        let (result, applied_sequences, applied_events) = if item.action == "prune-delete" {
-            let export = fetch_peer_kv_export(
-                peer_url,
-                &peer_token.0,
-                &ReplicationExportRequest {
-                    space_id: request.space_id.clone(),
-                    prefix: Some(item.key.clone()),
-                    since_seq: None,
-                    limit: None,
-                },
-            )
-            .await?;
-            let filtered = filter_kv_export_to_exact_key(export, &item.key);
-            let applied = tinycloud
-                .apply_kv_replication(&filtered, staging.inner())
-                .await
-                .map_err(map_replication_error)?;
-            if applied.applied_events > 0 {
-                pruned_deletes += 1;
-            }
-            (
-                if applied.applied_events > 0 {
-                    "pruned-delete"
-                } else {
-                    "already-pruned"
-                },
-                applied.applied_sequences,
-                applied.applied_events,
-            )
-        } else if item.action == "quarantine-absent" {
-            let local_invocation_id = item.local_invocation_id.as_deref().ok_or_else(|| {
-                (
-                    Status::InternalServerError,
-                    format!("missing local invocation id for key {}", item.key),
-                )
-            })?;
-            let inserted = tinycloud
-                .quarantine_kv_peer_missing(
-                    &request.space_id,
-                    &item.key,
+        let (result, applied_sequences, applied_events, item_cleared_quarantine) =
+            if item.action == "prune-delete" {
+                let export = fetch_peer_kv_export(
                     peer_url,
-                    local_invocation_id,
-                    &item.peer_status,
-                    item.peer_invocation_id.as_deref(),
-                    item.peer_deleted_invocation_id.as_deref(),
+                    &peer_token.0,
+                    &ReplicationExportRequest {
+                        space_id: request.space_id.clone(),
+                        prefix: Some(item.key.clone()),
+                        since_seq: None,
+                        limit: None,
+                    },
                 )
-                .await
-                .map_err(map_replication_error)?;
-            if inserted {
-                quarantined += 1;
-                ("quarantined", 0, 0)
+                .await?;
+                let filtered = filter_kv_export_to_exact_key(export, &item.key);
+                let applied = tinycloud
+                    .apply_kv_replication(&filtered, staging.inner())
+                    .await
+                    .map_err(map_replication_error)?;
+                if applied.applied_events > 0 {
+                    pruned_deletes += 1;
+                }
+                let cleared = tinycloud
+                    .clear_kv_peer_missing_quarantine(&request.space_id, &item.key)
+                    .await
+                    .map_err(map_replication_error)?;
+                if cleared {
+                    cleared_quarantine += 1;
+                }
+                (
+                    if applied.applied_events > 0 {
+                        "pruned-delete"
+                    } else {
+                        "already-pruned"
+                    },
+                    applied.applied_sequences,
+                    applied.applied_events,
+                    cleared,
+                )
+            } else if item.action == "quarantine-absent" {
+                let local_invocation_id = item.local_invocation_id.as_deref().ok_or_else(|| {
+                    (
+                        Status::InternalServerError,
+                        format!("missing local invocation id for key {}", item.key),
+                    )
+                })?;
+                let inserted = tinycloud
+                    .quarantine_kv_peer_missing(
+                        &request.space_id,
+                        &item.key,
+                        peer_url,
+                        local_invocation_id,
+                        &item.peer_status,
+                        item.peer_invocation_id.as_deref(),
+                        item.peer_deleted_invocation_id.as_deref(),
+                    )
+                    .await
+                    .map_err(map_replication_error)?;
+                if inserted {
+                    quarantined += 1;
+                    ("quarantined", 0, 0, false)
+                } else {
+                    already_quarantined += 1;
+                    ("already-quarantined", 0, 0, false)
+                }
             } else {
-                already_quarantined += 1;
-                ("already-quarantined", 0, 0)
-            }
-        } else {
-            kept += 1;
-            ("kept", 0, 0)
-        };
+                let cleared = tinycloud
+                    .clear_kv_peer_missing_quarantine(&request.space_id, &item.key)
+                    .await
+                    .map_err(map_replication_error)?;
+                if cleared {
+                    cleared_quarantine += 1;
+                }
+                kept += 1;
+                ("kept", 0, 0, cleared)
+            };
 
         items.push(KvPeerMissingApplyItem {
             key: item.key.clone(),
             action: item.action.clone(),
             result: result.to_string(),
+            cleared_quarantine: item_cleared_quarantine,
             local_invocation_id: item.local_invocation_id.clone(),
             peer_status: item.peer_status.clone(),
             peer_deleted_invocation_id: item.peer_deleted_invocation_id.clone(),
@@ -411,9 +431,34 @@ pub async fn peer_missing_apply(
         pruned_deletes,
         quarantined,
         already_quarantined,
+        cleared_quarantine,
         kept,
         items,
     }))
+}
+
+#[post(
+    "/replication/peer-missing/quarantine",
+    format = "json",
+    data = "<request>"
+)]
+pub async fn peer_missing_quarantine(
+    request: Json<KvPeerMissingQuarantineRequest>,
+    token: Option<ReplicationSessionToken>,
+    replication: &State<ReplicationService>,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Json<KvPeerMissingQuarantineResponse>, (Status, String)> {
+    let scope = ReplicationScope::Kv {
+        prefix: request.prefix.clone(),
+    };
+    let session = authorize_session_scope(&request.space_id, &scope, token, replication)?;
+    ensure_replication_session_active(&session, tinycloud).await?;
+
+    tinycloud
+        .export_kv_peer_missing_quarantine(&request)
+        .await
+        .map(Json)
+        .map_err(map_replication_error)
 }
 
 #[post("/replication/recon/export", format = "json", data = "<request>")]

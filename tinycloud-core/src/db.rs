@@ -14,7 +14,8 @@ use crate::replication::recon::{
 };
 use crate::replication::{
     decode_hash, encode_hash, AuthReplicationApplyResponse, AuthReplicationExportRequest,
-    AuthReplicationExportResponse, KvReconExportRequest, KvReconExportResponse,
+    AuthReplicationExportResponse, KvPeerMissingQuarantineItem, KvPeerMissingQuarantineRequest,
+    KvPeerMissingQuarantineResponse, KvReconExportRequest, KvReconExportResponse,
     KvReconSplitRequest, KvReconSplitResponse, KvReplicationError, KvReplicationEvent,
     KvReplicationOperation, KvReplicationSequence, KvStateItem, KvStateRequest, KvStateResponse,
     KvStateStatus, ReplicationApplyResponse, ReplicationExportRequest, ReplicationExportResponse,
@@ -614,6 +615,91 @@ where
             .await?;
             Ok(true)
         }
+    }
+
+    pub async fn clear_kv_peer_missing_quarantine(
+        &self,
+        space_id: &str,
+        key: &str,
+    ) -> Result<bool, KvReplicationError> {
+        let space_id = parse_replication_space_id(space_id)?;
+        let key = parse_replication_path(key)?;
+        let result = kv_quarantine::Entity::delete_many()
+            .filter(
+                Condition::all()
+                    .add(kv_quarantine::Column::Space.eq(SpaceIdWrap(space_id)))
+                    .add(kv_quarantine::Column::Key.eq(key.as_str())),
+            )
+            .exec(&self.conn)
+            .await?;
+        Ok(result.rows_affected > 0)
+    }
+
+    pub async fn export_kv_peer_missing_quarantine(
+        &self,
+        request: &KvPeerMissingQuarantineRequest,
+    ) -> Result<KvPeerMissingQuarantineResponse, KvReplicationError> {
+        let space_id = parse_replication_space_id(&request.space_id)?;
+        let prefix = request
+            .prefix
+            .as_deref()
+            .map(parse_replication_path)
+            .transpose()?;
+        let start_after = request
+            .start_after
+            .as_deref()
+            .map(parse_replication_path)
+            .transpose()?;
+        let limit = request.limit.unwrap_or(128).max(1).min(512);
+
+        let mut query = kv_quarantine::Entity::find()
+            .filter(Condition::all().add(kv_quarantine::Column::Space.eq(SpaceIdWrap(space_id))));
+
+        if let Some(prefix) = prefix.as_ref() {
+            query = query.filter(kv_quarantine::Column::Key.starts_with(prefix.as_str()));
+        }
+
+        if let Some(start_after) = start_after.as_ref() {
+            query = query.filter(kv_quarantine::Column::Key.gt(start_after.as_str()));
+        }
+
+        let mut rows = query
+            .order_by_asc(kv_quarantine::Column::Key)
+            .limit((limit + 1) as u64)
+            .all(&self.conn)
+            .await?;
+
+        let has_more = rows.len() > limit;
+        if has_more {
+            rows.truncate(limit);
+        }
+
+        let next_start_after = if has_more {
+            rows.last().map(|row| row.key.to_string())
+        } else {
+            None
+        };
+
+        Ok(KvPeerMissingQuarantineResponse {
+            space_id: request.space_id.clone(),
+            prefix: prefix.map(|value| value.to_string()),
+            start_after: start_after.map(|value| value.to_string()),
+            limit: Some(limit),
+            has_more,
+            next_start_after,
+            items: rows
+                .into_iter()
+                .map(|row| KvPeerMissingQuarantineItem {
+                    key: row.key.to_string(),
+                    peer_url: row.peer_url,
+                    local_invocation_id: row.local_invocation_id,
+                    peer_status: row.peer_status,
+                    peer_invocation_id: row.peer_invocation_id,
+                    peer_deleted_invocation_id: row.peer_deleted_invocation_id,
+                    quarantined_at: row.quarantined_at,
+                })
+                .collect(),
+        })
     }
 
     pub async fn export_auth_replication(
