@@ -200,12 +200,46 @@ pub struct KvPeerMissingPlanResponse {
     pub items: Vec<KvPeerMissingPlanItem>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KvPeerMissingQuarantineRequest {
+    pub space_id: String,
+    pub prefix: Option<String>,
+    pub start_after: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KvPeerMissingQuarantineItem {
+    pub key: String,
+    pub peer_url: String,
+    pub local_invocation_id: String,
+    pub peer_status: String,
+    pub peer_invocation_id: Option<String>,
+    pub peer_deleted_invocation_id: Option<String>,
+    pub quarantined_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KvPeerMissingQuarantineResponse {
+    pub space_id: String,
+    pub prefix: Option<String>,
+    pub start_after: Option<String>,
+    pub limit: Option<usize>,
+    pub has_more: bool,
+    pub next_start_after: Option<String>,
+    pub items: Vec<KvPeerMissingQuarantineItem>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct KvPeerMissingApplyItem {
     pub key: String,
     pub action: String,
     pub result: String,
+    pub cleared_quarantine: bool,
     pub local_invocation_id: Option<String>,
     pub peer_status: String,
     pub peer_deleted_invocation_id: Option<String>,
@@ -228,6 +262,7 @@ pub struct KvPeerMissingApplyResponse {
     pub pruned_deletes: usize,
     pub quarantined: usize,
     pub already_quarantined: usize,
+    pub cleared_quarantine: usize,
     pub kept: usize,
     pub items: Vec<KvPeerMissingApplyItem>,
 }

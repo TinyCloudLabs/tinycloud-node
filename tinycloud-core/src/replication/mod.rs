@@ -10,6 +10,7 @@ pub use messages::{
     AuthReplicationApplyResponse, AuthReplicationExportRequest, AuthReplicationExportResponse,
     AuthReplicationReconcileRequest, KvPeerMissingAction, KvPeerMissingApplyItem,
     KvPeerMissingApplyResponse, KvPeerMissingPlanItem, KvPeerMissingPlanResponse,
+    KvPeerMissingQuarantineItem, KvPeerMissingQuarantineRequest, KvPeerMissingQuarantineResponse,
     KvReconCompareRequest, KvReconCompareResponse, KvReconExportRequest, KvReconExportResponse,
     KvReconItem, KvReconSplitChild, KvReconSplitChildComparison, KvReconSplitCompareRequest,
     KvReconSplitCompareResponse, KvReconSplitReconcileChildResult, KvReconSplitReconcileRequest,
