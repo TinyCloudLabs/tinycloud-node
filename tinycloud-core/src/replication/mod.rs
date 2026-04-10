@@ -18,9 +18,10 @@ pub use messages::{
     KvReplicationOperation, KvReplicationSequence, KvStateCompareItem, KvStateCompareRequest,
     KvStateCompareResponse, KvStateItem, KvStateRequest, KvStateResponse, KvStateStatus,
     ReplicationApplyResponse, ReplicationErrorResponse, ReplicationExportRequest,
-    ReplicationExportResponse, ReplicationInfoRequest, ReplicationReconcileRequest,
-    ReplicationSessionOpenRequest, ReplicationSessionOpenResponse, SqlReplicationApplyResponse,
-    SqlReplicationExportRequest, SqlReplicationExportResponse, SqlReplicationReconcileRequest,
+    ReplicationExportResponse, ReplicationInfoRequest, ReplicationNotifyPollRequest,
+    ReplicationNotifyPollResponse, ReplicationReconcileRequest, ReplicationSessionOpenRequest,
+    ReplicationSessionOpenResponse, SqlReplicationApplyResponse, SqlReplicationExportRequest,
+    SqlReplicationExportResponse, SqlReplicationReconcileRequest,
 };
 pub use store::{decode_hash, encode_hash, KvReplicationError};
 pub use types::{

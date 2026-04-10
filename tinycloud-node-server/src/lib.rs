@@ -33,7 +33,7 @@ use routes::{
         auth_reconcile, auth_replication_export, kv_state, kv_state_compare, peer_missing_apply,
         peer_missing_plan, peer_missing_quarantine, recon_compare, recon_export, recon_split,
         recon_split_compare, reconcile, reconcile_split, replication_export, replication_info,
-        replication_session_open, sql_reconcile, sql_replication_export,
+        replication_notify_poll, replication_session_open, sql_reconcile, sql_replication_export,
     },
     revoke,
     util_routes::*,
@@ -126,6 +126,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         peer_missing_plan,
         peer_missing_apply,
         peer_missing_quarantine,
+        replication_notify_poll,
         recon_export,
         recon_split,
         recon_split_compare,
@@ -386,7 +387,7 @@ fn replication_status(config: &Config) -> tinycloud_core::replication::Replicati
         recon: true,
         auth_sync: true,
         authored_fact_exchange: true,
-        notifications: false,
+        notifications: true,
         snapshots: true,
     }
 }

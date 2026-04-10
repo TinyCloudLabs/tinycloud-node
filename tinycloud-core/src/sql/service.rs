@@ -135,6 +135,37 @@ impl SqlService {
         sql_replication::export_replication_from_path(&path, since_seq)
     }
 
+    pub async fn current_replication_seq(
+        &self,
+        space: &SpaceId,
+        db_name: &str,
+    ) -> Result<i64, SqlError> {
+        let key = (space.to_string(), db_name.to_string());
+
+        if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
+            match handle.export_replication(Some(i64::MAX)).await {
+                Err(SqlError::Internal(ref msg))
+                    if msg.contains("Database actor not available") =>
+                {
+                    tracing::warn!(space=%space, db=%db_name, "Dead SQL actor detected during replication seq lookup, removing");
+                    self.databases.remove(&key);
+                }
+                Ok(export) => return Ok(export.exported_until_seq),
+                Err(error) => return Err(error),
+            }
+        }
+
+        let path = std::path::PathBuf::from(&self.base_path)
+            .join(space.to_string())
+            .join(format!("{}.db", db_name));
+
+        if !path.exists() {
+            return Err(SqlError::DatabaseNotFound);
+        }
+
+        sql_replication::current_replication_seq_from_path(&path)
+    }
+
     pub async fn import(
         &self,
         space: &SpaceId,

@@ -229,6 +229,18 @@ where
         list(&self.conn, space_id, prefix, read_params).await
     }
 
+    pub async fn latest_kv_canonical_seq(
+        &self,
+        space_id: &str,
+        prefix: Option<&str>,
+    ) -> Result<i64, KvReplicationError> {
+        let space_id = parse_replication_space_id(space_id)?;
+        let prefix = prefix.map(parse_replication_path).transpose()?;
+        latest_canonical_kv_seq_for_prefix(&self.conn, &space_id, prefix.as_ref())
+            .await
+            .map_err(KvReplicationError::Db)
+    }
+
     pub async fn replication_session_delegation_active(
         &self,
         delegation_hash: Option<Hash>,
@@ -2208,6 +2220,31 @@ async fn latest_canonical_kv_commit<C: ConnectionTrait>(
         .order_by_desc(canonical_commit::Column::Seq)
         .one(db)
         .await?)
+}
+
+async fn latest_canonical_kv_seq_for_prefix<C: ConnectionTrait>(
+    db: &C,
+    space_id: &SpaceId,
+    prefix: Option<&Path>,
+) -> Result<i64, DbErr> {
+    let mut query = canonical_commit::Entity::find()
+        .filter(canonical_commit::Column::Space.eq(SpaceIdWrap(space_id.clone())));
+
+    if let Some(prefix) = prefix {
+        let prefix_value = prefix.as_str();
+        query = query.filter(
+            Condition::any()
+                .add(canonical_commit::Column::Key.eq(prefix_value))
+                .add(canonical_commit::Column::Key.starts_with(format!("{prefix_value}/"))),
+        );
+    }
+
+    let query = query
+        .select_only()
+        .column_as(canonical_commit::Column::Seq.max(), "max_seq")
+        .into_tuple::<Option<i64>>();
+
+    Ok(query.one(db).await?.flatten().unwrap_or(0))
 }
 
 async fn find_kv_canonical_commit_seq<C: ConnectionTrait>(

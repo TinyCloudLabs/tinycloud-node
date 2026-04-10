@@ -104,7 +104,7 @@ impl Default for ReplicationStatus {
             recon: false,
             auth_sync: true,
             authored_fact_exchange: true,
-            notifications: false,
+            notifications: true,
             snapshots: false,
         }
     }
@@ -157,6 +157,7 @@ impl Default for ReplicationRouteStatus {
             endpoints: vec![
                 "GET /replication/info",
                 "POST /replication/session/open",
+                "POST /replication/notify/poll",
                 "POST /replication/auth/export",
                 "POST /replication/auth/reconcile",
                 "POST /replication/export",
