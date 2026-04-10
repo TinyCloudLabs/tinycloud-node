@@ -136,6 +136,19 @@ pub fn export_replication_from_path(
     export_replication(&conn, since_seq)
 }
 
+pub fn current_replication_seq(conn: &Connection) -> Result<i64, SqlError> {
+    current_seq(conn)
+}
+
+pub fn current_replication_seq_from_path(path: &Path) -> Result<i64, SqlError> {
+    let conn =
+        storage::open_connection(&StorageMode::File(path.to_path_buf())).map_err(|e| match e {
+            SqlError::Internal(_) => e,
+            other => SqlError::Internal(other.to_string()),
+        })?;
+    current_replication_seq(&conn)
+}
+
 pub fn apply_changeset(conn: &Connection, changeset: &[u8]) -> Result<(), SqlError> {
     if changeset.is_empty() {
         return Ok(());

@@ -19,16 +19,18 @@ use tinycloud_core::{
         KvReconSplitReconcileResponse, KvReconSplitRequest, KvReconSplitResponse,
         KvReplicationError, KvStateCompareItem, KvStateCompareRequest, KvStateCompareResponse,
         KvStateRequest, KvStateResponse, ReplicationExportRequest, ReplicationExportResponse,
-        ReplicationReconcileRequest, ReplicationRouteStatus, ReplicationScope, ReplicationService,
-        ReplicationSessionError, ReplicationSessionOpenRequest, ReplicationSessionOpenResponse,
-        ReplicationSessionRecord, ReplicationSessionSummary, SqlReplicationApplyResponse,
-        SqlReplicationExportRequest, SqlReplicationExportResponse, SqlReplicationReconcileRequest,
+        ReplicationNotifyPollRequest, ReplicationNotifyPollResponse, ReplicationReconcileRequest,
+        ReplicationRouteStatus, ReplicationScope, ReplicationService, ReplicationSessionError,
+        ReplicationSessionOpenRequest, ReplicationSessionOpenResponse, ReplicationSessionRecord,
+        ReplicationSessionSummary, SqlReplicationApplyResponse, SqlReplicationExportRequest,
+        SqlReplicationExportResponse, SqlReplicationReconcileRequest,
     },
     sql::{SqlError, SqlService},
     types::Resource,
     util::{Capability, DelegationInfo},
     TxError,
 };
+use tokio::time::{sleep, Duration, Instant};
 
 #[derive(Debug, Clone)]
 struct SplitReconcileTarget {
@@ -46,6 +48,7 @@ pub async fn replication_info(
         endpoints: vec![
             "GET /replication/info",
             "POST /replication/session/open",
+            "POST /replication/notify/poll",
             "POST /replication/auth/export",
             "POST /replication/auth/reconcile",
             "POST /replication/export",
@@ -129,6 +132,55 @@ pub async fn replication_session_open(
         db_name: summary.db_name,
         expires_at: summary.expires_at,
     }))
+}
+
+#[post("/replication/notify/poll", format = "json", data = "<request>")]
+pub async fn replication_notify_poll(
+    request: Json<ReplicationNotifyPollRequest>,
+    token: Option<ReplicationSessionToken>,
+    replication: &State<ReplicationService>,
+    sql_service: &State<SqlService>,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Json<ReplicationNotifyPollResponse>, (Status, String)> {
+    ensure_peer_serving_enabled(replication)?;
+    let scope = notify_request_scope(&request)?;
+    let session = authorize_session_scope(&request.space_id, &scope, token, replication)?;
+    ensure_replication_session_active(&session, tinycloud).await?;
+
+    let timeout_ms = normalized_notify_timeout_ms(request.timeout_ms);
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let last_seen_seq = request.last_seen_seq.unwrap_or(0);
+
+    loop {
+        let latest_seq = notify_latest_seq(&request, &scope, sql_service, tinycloud).await?;
+        if latest_seq > last_seen_seq {
+            return Ok(Json(ReplicationNotifyPollResponse {
+                space_id: request.space_id.clone(),
+                service: scope.service().to_string(),
+                prefix: request.prefix.clone(),
+                db_name: request.db_name.clone(),
+                last_seen_seq: request.last_seen_seq,
+                latest_seq,
+                dirty: true,
+                timed_out: false,
+            }));
+        }
+
+        if Instant::now() >= deadline {
+            return Ok(Json(ReplicationNotifyPollResponse {
+                space_id: request.space_id.clone(),
+                service: scope.service().to_string(),
+                prefix: request.prefix.clone(),
+                db_name: request.db_name.clone(),
+                last_seen_seq: request.last_seen_seq,
+                latest_seq,
+                dirty: false,
+                timed_out: true,
+            }));
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
 }
 
 #[post("/replication/auth/export", format = "json", data = "<request>")]
@@ -1566,6 +1618,66 @@ fn request_scope(
         other => Err((
             Status::BadRequest,
             format!("unsupported replication service: {other}"),
+        )),
+    }
+}
+
+fn notify_request_scope(
+    request: &ReplicationNotifyPollRequest,
+) -> Result<ReplicationScope, (Status, String)> {
+    match request.service.as_str() {
+        "kv" => Ok(ReplicationScope::Kv {
+            prefix: request.prefix.clone(),
+        }),
+        "sql" => Ok(ReplicationScope::Sql {
+            db_name: request.db_name.clone().ok_or_else(|| {
+                (
+                    Status::BadRequest,
+                    "dbName is required for sql replication notifications".to_string(),
+                )
+            })?,
+        }),
+        "auth" => Err((
+            Status::BadRequest,
+            "auth notifications are not implemented".to_string(),
+        )),
+        other => Err((
+            Status::BadRequest,
+            format!("unsupported replication notification service: {other}"),
+        )),
+    }
+}
+
+fn normalized_notify_timeout_ms(timeout_ms: Option<u64>) -> u64 {
+    timeout_ms.unwrap_or(5_000).clamp(100, 15_000)
+}
+
+async fn notify_latest_seq(
+    request: &ReplicationNotifyPollRequest,
+    scope: &ReplicationScope,
+    sql_service: &State<SqlService>,
+    tinycloud: &State<TinyCloud>,
+) -> Result<i64, (Status, String)> {
+    match scope {
+        ReplicationScope::Kv { prefix } => tinycloud
+            .latest_kv_canonical_seq(&request.space_id, prefix.as_deref())
+            .await
+            .map_err(map_replication_error),
+        ReplicationScope::Sql { db_name } => {
+            let space_id: SpaceId = request.space_id.parse().map_err(|_| {
+                (
+                    Status::BadRequest,
+                    format!("invalid space id: {}", request.space_id),
+                )
+            })?;
+            sql_service
+                .current_replication_seq(&space_id, db_name)
+                .await
+                .map_err(map_sql_error)
+        }
+        ReplicationScope::Auth => Err((
+            Status::BadRequest,
+            "auth notifications are not implemented".to_string(),
         )),
     }
 }

@@ -30,6 +30,30 @@ pub struct ReplicationSessionOpenResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ReplicationNotifyPollRequest {
+    pub space_id: String,
+    pub service: String,
+    pub prefix: Option<String>,
+    pub db_name: Option<String>,
+    pub last_seen_seq: Option<i64>,
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplicationNotifyPollResponse {
+    pub space_id: String,
+    pub service: String,
+    pub prefix: Option<String>,
+    pub db_name: Option<String>,
+    pub last_seen_seq: Option<i64>,
+    pub latest_seq: i64,
+    pub dirty: bool,
+    pub timed_out: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReplicationInfoRequest {
     pub include_endpoints: bool,
 }
