@@ -4,7 +4,6 @@ use crate::{
 };
 use futures::future::BoxFuture;
 use rocket::{http::Status, serde::json::Json, State};
-use serde::Deserialize;
 use std::collections::BTreeMap;
 use tinycloud_auth::resource::{Path as ResourcePath, Service, SpaceId};
 use tinycloud_core::{
@@ -35,12 +34,6 @@ use tinycloud_core::{
 struct SplitReconcileTarget {
     replay_prefix: String,
     result_prefix: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PeerNodeInfo {
-    roles_enabled: Vec<String>,
 }
 
 #[get("/replication/info")]
@@ -288,10 +281,14 @@ pub async fn peer_missing_plan(
         )
     })?;
     let peer_url = request.peer_url.trim_end_matches('/');
-    let peer_host_role = fetch_peer_host_role(peer_url).await?;
-    ensure_peer_host_role(peer_url, peer_host_role)?;
+    let (peer_host_role, peer_server_did) =
+        ensure_peer_host_authority(peer_url, &request.space_id, tinycloud).await?;
     let compare = compare_kv_state_scope(&request, &peer_token.0, tinycloud).await?;
-    Ok(Json(build_peer_missing_plan(compare, peer_host_role)))
+    Ok(Json(build_peer_missing_plan(
+        compare,
+        peer_host_role,
+        peer_server_did,
+    )))
 }
 
 #[post("/replication/peer-missing/apply", format = "json", data = "<request>")]
@@ -315,11 +312,12 @@ pub async fn peer_missing_apply(
         )
     })?;
     let peer_url = request.peer_url.trim_end_matches('/');
-    let peer_host_role = fetch_peer_host_role(peer_url).await?;
-    ensure_peer_host_role(peer_url, peer_host_role)?;
+    let (peer_host_role, peer_server_did) =
+        ensure_peer_host_authority(peer_url, &request.space_id, tinycloud).await?;
     let plan = build_peer_missing_plan(
         compare_kv_state_scope(&request, &peer_token.0, tinycloud).await?,
         peer_host_role,
+        peer_server_did.clone(),
     );
     let mut items = Vec::with_capacity(plan.items.len());
     let mut pruned_deletes = 0;
@@ -422,6 +420,7 @@ pub async fn peer_missing_apply(
         space_id: plan.space_id,
         prefix: plan.prefix,
         peer_url: plan.peer_url,
+        peer_server_did: plan.peer_server_did,
         peer_host_role,
         start_after: plan.start_after,
         limit: plan.limit,
@@ -739,6 +738,7 @@ async fn compare_kv_state_scope(
 fn build_peer_missing_plan(
     compare: KvStateCompareResponse,
     peer_host_role: bool,
+    peer_server_did: String,
 ) -> KvPeerMissingPlanResponse {
     let mut keep_count = 0;
     let mut prune_delete_count = 0;
@@ -775,6 +775,7 @@ fn build_peer_missing_plan(
         space_id: compare.space_id,
         prefix: compare.prefix,
         peer_url: compare.peer_url,
+        peer_server_did,
         peer_host_role,
         start_after: compare.start_after,
         limit: compare.limit,
@@ -833,34 +834,42 @@ async fn fetch_peer_kv_state(
         .map_err(|error| (Status::BadGateway, error.to_string()))
 }
 
-async fn fetch_peer_host_role(peer_url: &str) -> Result<bool, (Status, String)> {
+async fn fetch_peer_server_did(peer_url: &str, space_id: &str) -> Result<String, (Status, String)> {
     let response = reqwest::Client::new()
-        .get(format!("{peer_url}/info"))
+        .get(format!("{peer_url}/peer/generate/{space_id}"))
         .send()
         .await
         .map_err(|error| (Status::BadGateway, error.to_string()))?;
 
     if !response.status().is_success() {
-        return Err(map_peer_error("peer info lookup failed", response).await);
+        return Err(map_peer_error("peer serverDid lookup failed", response).await);
     }
 
-    let info = response
-        .json::<PeerNodeInfo>()
+    response
+        .text()
         .await
-        .map_err(|error| (Status::BadGateway, error.to_string()))?;
-
-    Ok(info.roles_enabled.iter().any(|role| role == "host"))
+        .map_err(|error| (Status::BadGateway, error.to_string()))
 }
 
-fn ensure_peer_host_role(peer_url: &str, peer_host_role: bool) -> Result<(), (Status, String)> {
+async fn ensure_peer_host_authority(
+    peer_url: &str,
+    space_id: &str,
+    tinycloud: &State<TinyCloud>,
+) -> Result<(bool, String), (Status, String)> {
+    let peer_server_did = fetch_peer_server_did(peer_url, space_id).await?;
+    let peer_host_role = tinycloud
+        .has_active_host_delegation(space_id, &peer_server_did)
+        .await
+        .map_err(map_replication_error)?;
+
     if peer_host_role {
-        Ok(())
+        Ok((true, peer_server_did))
     } else {
         Err((
             Status::Forbidden,
             format!(
-                "peer-missing authority mode requires a host-role peer: {}",
-                peer_url
+                "peer-missing authority mode requires an active tinycloud.space/host delegation for {} at {}; sync auth facts first if this is first contact",
+                peer_server_did, peer_url
             ),
         ))
     }
