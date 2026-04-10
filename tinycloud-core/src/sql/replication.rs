@@ -165,7 +165,9 @@ pub fn apply_changeset(conn: &Connection, changeset: &[u8]) -> Result<(), SqlErr
 
 pub fn apply_changeset_to_path(path: &Path, changeset: &[u8]) -> Result<(), SqlError> {
     let conn = storage::open_connection(&StorageMode::File(path.to_path_buf()))?;
-    apply_changeset(&conn, changeset)
+    apply_changeset(&conn, changeset)?;
+    append_changeset(&conn, changeset)?;
+    Ok(())
 }
 
 pub fn read_peer_cursor(

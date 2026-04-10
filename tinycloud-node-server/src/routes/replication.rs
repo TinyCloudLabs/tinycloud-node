@@ -1458,7 +1458,12 @@ pub async fn sql_reconcile(
             applied_snapshot_reason = export.snapshot_reason.clone();
         }
         sql_service
-            .import(&space_id, &export.db_name, &export.snapshot)
+            .import(
+                &space_id,
+                &export.db_name,
+                &export.snapshot,
+                applied_snapshot_reason.clone(),
+            )
             .await
             .map_err(map_sql_error)?;
     } else {

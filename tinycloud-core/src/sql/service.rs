@@ -181,23 +181,35 @@ impl SqlService {
         space: &SpaceId,
         db_name: &str,
         snapshot: &[u8],
+        snapshot_reason: Option<String>,
     ) -> Result<(), SqlError> {
         let key = (space.to_string(), db_name.to_string());
 
-        self.artifact_repository
-            .save("sql", &space.to_string(), db_name, snapshot.to_vec())
-            .await
-            .map_err(artifact_error_to_sql)?;
-
         if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
-            match handle.import(snapshot.to_vec()).await {
+            match handle
+                .import(snapshot.to_vec(), snapshot_reason.clone())
+                .await
+            {
                 Err(SqlError::Internal(ref msg))
                     if msg.contains("Database actor not available") =>
                 {
                     tracing::warn!(space=%space, db=%db_name, "Dead SQL actor detected during import, removing");
                     self.databases.remove(&key);
                 }
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    let payload = match handle.export().await {
+                        Ok(payload) => payload,
+                        Err(e) => {
+                            let _ = self.discard_local_state(&key).await;
+                            return Err(e);
+                        }
+                    };
+                    self.artifact_repository
+                        .save("sql", &space.to_string(), db_name, payload)
+                        .await
+                        .map_err(artifact_error_to_sql)?;
+                    return Ok(());
+                }
                 Err(e) => {
                     let _ = self.discard_local_state(&key).await;
                     return Err(e);
@@ -205,8 +217,22 @@ impl SqlService {
             }
         }
 
+        let path = std::path::PathBuf::from(&self.base_path)
+            .join(space.to_string())
+            .join(format!("{}.db", db_name));
+
+        storage::import_snapshot_to_path(&path, snapshot)?;
+        if let Some(reason) = snapshot_reason {
+            let conn = storage::open_connection(&storage::StorageMode::File(path))?;
+            sql_replication::append_snapshot_barrier(&conn, &reason)?;
+        }
+        let payload = storage::export_snapshot_from_path(&self.cache_path(space, db_name))?;
+        self.artifact_repository
+            .save("sql", &space.to_string(), db_name, payload.clone())
+            .await
+            .map_err(artifact_error_to_sql)?;
         remove_sql_cache_files(&self.cache_path(space, db_name)).await?;
-        write_cache_file(&self.cache_path(space, db_name), snapshot).await
+        write_cache_file(&self.cache_path(space, db_name), &payload).await
     }
 
     pub async fn apply_changeset(
