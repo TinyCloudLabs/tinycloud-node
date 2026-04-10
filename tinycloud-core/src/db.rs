@@ -36,6 +36,7 @@ use sea_orm::{
 use sea_orm_migration::MigratorTrait;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::str::FromStr;
+use time::OffsetDateTime;
 use tinycloud_auth::{
     authorization::{EncodingError, TinyCloudDelegation, TinyCloudRevocation},
     resource::{Path, SpaceId},
@@ -557,6 +558,62 @@ where
             prefix: prefix_str,
             items,
         })
+    }
+
+    pub async fn quarantine_kv_peer_missing(
+        &self,
+        space_id: &str,
+        key: &str,
+        peer_url: &str,
+        local_invocation_id: &str,
+        peer_status: &str,
+        peer_invocation_id: Option<&str>,
+        peer_deleted_invocation_id: Option<&str>,
+    ) -> Result<bool, KvReplicationError> {
+        let space_id = parse_replication_space_id(space_id)?;
+        let key = parse_replication_path(key)?;
+        let quarantined_at = OffsetDateTime::now_utc().unix_timestamp();
+        let existing = kv_quarantine::Entity::find()
+            .filter(
+                Condition::all()
+                    .add(kv_quarantine::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+                    .add(kv_quarantine::Column::Key.eq(key.as_str())),
+            )
+            .one(&self.conn)
+            .await?;
+
+        if let Some(existing) = existing {
+            let mut active: kv_quarantine::ActiveModel = existing.into();
+            active.peer_url = sea_orm::ActiveValue::Set(peer_url.to_string());
+            active.local_invocation_id = sea_orm::ActiveValue::Set(local_invocation_id.to_string());
+            active.peer_status = sea_orm::ActiveValue::Set(peer_status.to_string());
+            active.peer_invocation_id =
+                sea_orm::ActiveValue::Set(peer_invocation_id.map(|value| value.to_string()));
+            active.peer_deleted_invocation_id = sea_orm::ActiveValue::Set(
+                peer_deleted_invocation_id.map(|value| value.to_string()),
+            );
+            active.quarantined_at = sea_orm::ActiveValue::Set(quarantined_at);
+            active.update(&self.conn).await?;
+            Ok(false)
+        } else {
+            kv_quarantine::Entity::insert(kv_quarantine::ActiveModel {
+                space: sea_orm::ActiveValue::Set(SpaceIdWrap(space_id)),
+                key: sea_orm::ActiveValue::Set(key.into()),
+                peer_url: sea_orm::ActiveValue::Set(peer_url.to_string()),
+                local_invocation_id: sea_orm::ActiveValue::Set(local_invocation_id.to_string()),
+                peer_status: sea_orm::ActiveValue::Set(peer_status.to_string()),
+                peer_invocation_id: sea_orm::ActiveValue::Set(
+                    peer_invocation_id.map(|value| value.to_string()),
+                ),
+                peer_deleted_invocation_id: sea_orm::ActiveValue::Set(
+                    peer_deleted_invocation_id.map(|value| value.to_string()),
+                ),
+                quarantined_at: sea_orm::ActiveValue::Set(quarantined_at),
+            })
+            .exec(&self.conn)
+            .await?;
+            Ok(true)
+        }
     }
 
     pub async fn export_auth_replication(

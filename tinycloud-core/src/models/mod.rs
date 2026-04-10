@@ -4,6 +4,7 @@ pub mod delegation;
 pub mod epoch;
 pub mod invocation;
 pub mod kv_delete;
+pub mod kv_quarantine;
 pub mod kv_write;
 pub mod revocation;
 pub mod space;
