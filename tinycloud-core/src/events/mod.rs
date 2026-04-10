@@ -98,7 +98,7 @@ impl Operation {
     }
 }
 
-#[derive(Debug, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub(crate) enum VersionedOperation {
     KvWrite {
         space: SpaceId,

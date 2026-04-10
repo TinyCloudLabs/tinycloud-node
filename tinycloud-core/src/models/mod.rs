@@ -1,5 +1,6 @@
 pub mod abilities;
 pub mod actor;
+pub mod canonical_commit;
 pub mod delegation;
 pub mod epoch;
 pub mod invocation;

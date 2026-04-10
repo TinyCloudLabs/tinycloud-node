@@ -518,6 +518,7 @@ pub struct KvReplicationSequence {
 #[serde(rename_all = "camelCase")]
 pub struct KvReplicationEvent {
     pub invocation_id: String,
+    pub canonical_commit_seq: Option<i64>,
     pub invocation: String,
     pub delegations: Vec<String>,
     pub operation: KvReplicationOperation,

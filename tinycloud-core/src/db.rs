@@ -70,6 +70,9 @@ pub struct TransactResult {
     pub delegation_cids: Vec<Hash>,
 }
 
+const KV_CANONICAL_KIND_PUT: &str = "put";
+const KV_CANONICAL_KIND_DELETE: &str = "delete";
+
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum TxError<S: StorageSetup, K: Secrets> {
@@ -418,6 +421,12 @@ where
 
                 entry.events.push(KvReplicationEvent {
                     invocation_id: encode_hash(committed.event),
+                    canonical_commit_seq: find_kv_canonical_commit_seq(
+                        &self.conn,
+                        &space_id,
+                        committed.event,
+                    )
+                    .await?,
                     invocation: invocation_string,
                     delegations,
                     operation,
@@ -449,10 +458,10 @@ where
             .as_deref()
             .map(parse_replication_path)
             .transpose()?;
-        let writes = select_kv_recon_writes(&self.conn, &space_id, prefix.as_ref()).await?;
-        let mut items = writes
+        let commits = select_kv_recon_commits(&self.conn, &space_id, prefix.as_ref()).await?;
+        let mut items = commits
             .into_iter()
-            .map(|write| kv_recon_item(&write))
+            .map(|commit| kv_recon_item(&commit))
             .collect::<Vec<_>>();
         sort_kv_recon_items(&mut items);
         let (items, has_more, next_start_after) =
@@ -526,25 +535,26 @@ where
                 }
             }
 
-            let present = get_kv_entity(&self.conn, &space_id, &path).await?;
-            let latest_delete = latest_kv_delete(&self.conn, &space_id, &path).await?;
-            let item = if let Some(entry) = present {
-                KvStateItem {
-                    key: path.as_str().to_string(),
-                    status: kv_state_status_label(&KvStateStatus::Present).to_string(),
-                    seq: Some(entry.seq),
-                    invocation_id: Some(encode_hash(entry.invocation)),
-                    deleted_invocation_id: None,
-                    value_hash: Some(encode_hash(entry.value)),
-                }
-            } else if let Some((delete, seq)) = latest_delete {
-                KvStateItem {
-                    key: path.as_str().to_string(),
-                    status: kv_state_status_label(&KvStateStatus::Deleted).to_string(),
-                    seq: Some(seq),
-                    invocation_id: Some(encode_hash(delete.invocation_id)),
-                    deleted_invocation_id: Some(encode_hash(delete.deleted_invocation_id)),
-                    value_hash: None,
+            let latest = latest_canonical_kv_commit(&self.conn, &space_id, &path).await?;
+            let item = if let Some(entry) = latest {
+                if entry.kind == KV_CANONICAL_KIND_PUT {
+                    KvStateItem {
+                        key: path.as_str().to_string(),
+                        status: kv_state_status_label(&KvStateStatus::Present).to_string(),
+                        seq: Some(entry.seq),
+                        invocation_id: Some(encode_hash(entry.invocation_id)),
+                        deleted_invocation_id: None,
+                        value_hash: entry.value.clone(),
+                    }
+                } else {
+                    KvStateItem {
+                        key: path.as_str().to_string(),
+                        status: kv_state_status_label(&KvStateStatus::Deleted).to_string(),
+                        seq: Some(entry.seq),
+                        invocation_id: Some(encode_hash(entry.invocation_id)),
+                        deleted_invocation_id: entry.deleted_invocation_id.clone(),
+                        value_hash: None,
+                    }
                 }
             } else {
                 KvStateItem {
@@ -713,35 +723,9 @@ where
         delegate_did: &str,
     ) -> Result<bool, KvReplicationError> {
         let space_id = parse_replication_space_id(space_id)?;
-        let now = time::OffsetDateTime::now_utc();
-        let (_delegations, abilities): (Vec<delegation::Model>, Vec<Vec<abilities::Model>>) =
-            delegation::Entity::find()
-                .left_join(revocation::Entity)
-                .filter(revocation::Column::Id.is_null())
-                .filter(delegation::Column::Delegatee.eq(delegate_did))
-                .filter(
-                    Condition::all()
-                        .add(
-                            Condition::any()
-                                .add(delegation::Column::Expiry.is_null())
-                                .add(delegation::Column::Expiry.gt(now)),
-                        )
-                        .add(
-                            Condition::any()
-                                .add(delegation::Column::NotBefore.is_null())
-                                .add(delegation::Column::NotBefore.lte(now)),
-                        ),
-                )
-                .find_with_related(abilities::Entity)
-                .all(&self.conn)
-                .await?
-                .into_iter()
-                .unzip();
-
-        Ok(abilities.into_iter().flatten().any(|ability| {
-            auth_resource_matches_host_delegate(&ability.resource, &space_id)
-                && ability.ability.as_ref().as_ref() == "tinycloud.space/host"
-        }))
+        has_active_host_delegation_for_db(&self.conn, &space_id, delegate_did)
+            .await
+            .map_err(KvReplicationError::from)
     }
 
     pub async fn export_auth_replication(
@@ -907,11 +891,12 @@ where
             for event in &sequence.events {
                 self.import_invocation_delegations(event).await?;
                 let invocation_hash = decode_hash(&event.invocation_id, "invocationId")?;
-                if invocation::Entity::find_by_id(invocation_hash)
+                let existing = invocation::Entity::find_by_id(invocation_hash)
                     .one(&self.conn)
-                    .await?
-                    .is_some()
-                {
+                    .await?;
+                if existing.is_some() {
+                    self.persist_replication_canonical_commit(&space_id, event)
+                        .await?;
                     continue;
                 }
 
@@ -929,6 +914,10 @@ where
             self.transact(events)
                 .await
                 .map_err(|error| KvReplicationError::Tx(error.to_string()))?;
+            for event in &sequence.events {
+                self.persist_replication_canonical_commit(&space_id, event)
+                    .await?;
+            }
             applied_sequences += 1;
         }
 
@@ -1054,6 +1043,60 @@ where
                 ))
             }
         }
+    }
+
+    async fn persist_replication_canonical_commit(
+        &self,
+        space_id: &SpaceId,
+        event: &KvReplicationEvent,
+    ) -> Result<(), KvReplicationError> {
+        let Some(seq) = event.canonical_commit_seq else {
+            return Ok(());
+        };
+
+        let invocation_id = decode_hash(&event.invocation_id, "invocationId")?;
+        let (key, kind, value, metadata, deleted_invocation_id) = match &event.operation {
+            KvReplicationOperation::Put {
+                key,
+                value_hash,
+                metadata,
+                ..
+            } => (
+                parse_replication_path(key)?,
+                KV_CANONICAL_KIND_PUT.to_string(),
+                Some(value_hash.to_string()),
+                Some(metadata.clone()),
+                None,
+            ),
+            KvReplicationOperation::Delete {
+                key,
+                deleted_invocation_id,
+                ..
+            } => (
+                parse_replication_path(key)?,
+                KV_CANONICAL_KIND_DELETE.to_string(),
+                None,
+                None,
+                Some(deleted_invocation_id.to_string()),
+            ),
+        };
+
+        insert_kv_canonical_commit(
+            &self.conn,
+            canonical_commit::Model {
+                space: SpaceIdWrap(space_id.clone()),
+                seq,
+                key: key.into(),
+                invocation_id,
+                kind,
+                value,
+                metadata,
+                deleted_invocation_id,
+            },
+        )
+        .await?;
+
+        Ok(())
     }
 
     async fn import_invocation_delegations(
@@ -1212,7 +1255,13 @@ where
             .payload()
             .facts
             .as_ref()
-            .and_then(|facts| KvReadParams::from_facts(facts))
+            .and_then(|facts| {
+                facts.iter().find_map(|fact| {
+                    fact.as_object()
+                        .and_then(|obj| obj.get("kvReadParams"))
+                        .and_then(|value| serde_json::from_value(value.clone()).ok())
+                })
+            })
             .unwrap_or_default();
         //  verify and commit invocation and kv operations
         let commit = transact(
@@ -1536,6 +1585,21 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                 m
             });
 
+        let mut authority_spaces = HashSet::new();
+        for space in event_spaces.keys() {
+            let local_server_did = secrets
+                .stage_keypair(space)
+                .await
+                .map(get_did_key)
+                .map_err(TxError::Secrets)?;
+            if has_active_host_delegation_for_db(db, space, &local_server_did).await? {
+                authority_spaces.insert(space.clone());
+            }
+        }
+        let authority_space_list = authority_spaces.iter().cloned().collect::<Vec<_>>();
+        let mut next_canonical_commit_seqs =
+            select_next_canonical_commit_seqs(db, &authority_space_list).await?;
+
         // get 'most recent' epochs for each of the spaces
         let mut most_recent = epoch::Entity::find()
             .select_only()
@@ -1666,19 +1730,24 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                     delegation_cids.push(cid);
                 }
                 Event::Invocation(i, ops) => {
-                    invocation::process(
+                    let versioned_ops = ops
+                        .into_iter()
+                        .map(|op| {
+                            let v = space_order
+                                .get(op.space())
+                                .and_then(|(s, e, _, h)| Some((s, e, h.get(&hash)?)))
+                                .unwrap();
+                            op.version(*v.0, *v.1, *v.2)
+                        })
+                        .collect::<Vec<_>>();
+
+                    invocation::process(db, *i, versioned_ops.clone(), encryption).await?;
+                    persist_local_canonical_kv_commits(
                         db,
-                        *i,
-                        ops.into_iter()
-                            .map(|op| {
-                                let v = space_order
-                                    .get(op.space())
-                                    .and_then(|(s, e, _, h)| Some((s, e, h.get(&hash)?)))
-                                    .unwrap();
-                                op.version(*v.0, *v.1, *v.2)
-                            })
-                            .collect(),
-                        encryption,
+                        hash,
+                        &versioned_ops,
+                        &mut next_canonical_commit_seqs,
+                        &authority_spaces,
                     )
                     .await?;
                 }
@@ -1832,6 +1901,147 @@ fn auth_resource_matches_host_delegate(resource: &Resource, space_id: &SpaceId) 
         && resource.fragment().is_none()
 }
 
+async fn has_active_host_delegation_for_db<C: ConnectionTrait>(
+    db: &C,
+    space_id: &SpaceId,
+    delegate_did: &str,
+) -> Result<bool, DbErr> {
+    let now = time::OffsetDateTime::now_utc();
+    let (_delegations, abilities): (Vec<delegation::Model>, Vec<Vec<abilities::Model>>) =
+        delegation::Entity::find()
+            .left_join(revocation::Entity)
+            .filter(revocation::Column::Id.is_null())
+            .filter(delegation::Column::Delegatee.eq(delegate_did))
+            .filter(
+                Condition::all()
+                    .add(
+                        Condition::any()
+                            .add(delegation::Column::Expiry.is_null())
+                            .add(delegation::Column::Expiry.gt(now)),
+                    )
+                    .add(
+                        Condition::any()
+                            .add(delegation::Column::NotBefore.is_null())
+                            .add(delegation::Column::NotBefore.lte(now)),
+                    ),
+            )
+            .find_with_related(abilities::Entity)
+            .all(db)
+            .await?
+            .into_iter()
+            .unzip();
+
+    Ok(abilities.into_iter().flatten().any(|ability| {
+        auth_resource_matches_host_delegate(&ability.resource, space_id)
+            && ability.ability.as_ref().as_ref() == "tinycloud.space/host"
+    }))
+}
+
+async fn select_next_canonical_commit_seqs<C: ConnectionTrait>(
+    db: &C,
+    spaces: &[SpaceId],
+) -> Result<HashMap<SpaceId, i64>, DbErr> {
+    if spaces.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut next = canonical_commit::Entity::find()
+        .filter(canonical_commit::Column::Space.is_in(spaces.iter().cloned().map(SpaceIdWrap)))
+        .select_only()
+        .column(canonical_commit::Column::Space)
+        .column_as(canonical_commit::Column::Seq.max(), "max_seq")
+        .group_by(canonical_commit::Column::Space)
+        .into_tuple::<(SpaceIdWrap, i64)>()
+        .all(db)
+        .await?
+        .into_iter()
+        .fold(HashMap::new(), |mut acc, (space, seq)| {
+            acc.insert(space.0, seq + 1);
+            acc
+        });
+
+    for space in spaces {
+        next.entry(space.clone()).or_insert(1);
+    }
+
+    Ok(next)
+}
+
+fn versioned_operation_space(operation: &crate::events::VersionedOperation) -> &SpaceId {
+    match operation {
+        crate::events::VersionedOperation::KvWrite { space, .. } => space,
+        crate::events::VersionedOperation::KvDelete { space, .. } => space,
+    }
+}
+
+async fn persist_local_canonical_kv_commits<C: ConnectionTrait>(
+    db: &C,
+    invocation_id: Hash,
+    operations: &[crate::events::VersionedOperation],
+    next_seqs: &mut HashMap<SpaceId, i64>,
+    authority_spaces: &HashSet<SpaceId>,
+) -> Result<(), DbErr> {
+    for operation in operations {
+        let space = versioned_operation_space(operation);
+        if !authority_spaces.contains(space) {
+            continue;
+        }
+
+        let commit_seq = *next_seqs.entry(space.clone()).or_insert(1);
+        let commit = match operation {
+            crate::events::VersionedOperation::KvWrite {
+                key,
+                value,
+                metadata,
+                ..
+            } => canonical_commit::Model {
+                space: SpaceIdWrap(space.clone()),
+                seq: commit_seq,
+                key: key.clone().into(),
+                invocation_id,
+                kind: KV_CANONICAL_KIND_PUT.to_string(),
+                value: Some(encode_hash(*value)),
+                metadata: Some(metadata.clone()),
+                deleted_invocation_id: None,
+            },
+            crate::events::VersionedOperation::KvDelete { key, .. } => {
+                let deleted = kv_delete::Entity::find()
+                    .filter(
+                        Condition::all()
+                            .add(kv_delete::Column::Space.eq(SpaceIdWrap(space.clone())))
+                            .add(kv_delete::Column::InvocationId.eq(invocation_id))
+                            .add(kv_delete::Column::Key.eq(key.as_str())),
+                    )
+                    .one(db)
+                    .await?
+                    .ok_or_else(|| {
+                        DbErr::Custom(format!(
+                            "missing canonical kv delete target {} for {}",
+                            key.as_str(),
+                            encode_hash(invocation_id)
+                        ))
+                    })?;
+
+                canonical_commit::Model {
+                    space: SpaceIdWrap(space.clone()),
+                    seq: commit_seq,
+                    key: key.clone().into(),
+                    invocation_id,
+                    kind: KV_CANONICAL_KIND_DELETE.to_string(),
+                    value: None,
+                    metadata: None,
+                    deleted_invocation_id: Some(encode_hash(deleted.deleted_invocation_id)),
+                }
+            }
+        };
+
+        insert_kv_canonical_commit(db, commit).await?;
+        next_seqs.insert(space.clone(), commit_seq + 1);
+    }
+
+    Ok(())
+}
+
 fn ordered_auth_delegations(
     seed_ids: Vec<Hash>,
     parent_ids_by_child: &HashMap<Hash, Vec<Hash>>,
@@ -1940,48 +2150,84 @@ async fn select_kv_replication_seqs<C: ConnectionTrait>(
     Ok(seqs.into_iter().take(limit as usize).collect())
 }
 
-async fn select_kv_recon_writes<C: ConnectionTrait>(
+async fn select_kv_recon_commits<C: ConnectionTrait>(
     db: &C,
     space_id: &SpaceId,
     prefix: Option<&Path>,
-) -> Result<Vec<kv_write::Model>, KvReplicationError> {
-    let mut query = kv_write::Entity::find()
-        .filter(kv_write::Column::Space.eq(SpaceIdWrap(space_id.clone())))
-        .find_also_related(kv_delete::Entity)
-        .filter(kv_delete::Column::InvocationId.is_null());
+) -> Result<Vec<canonical_commit::Model>, KvReplicationError> {
+    let mut query = canonical_commit::Entity::find()
+        .filter(canonical_commit::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+        .order_by_asc(canonical_commit::Column::Key)
+        .order_by_desc(canonical_commit::Column::Seq);
 
     if let Some(prefix) = prefix {
-        query = query.filter(kv_write::Column::Key.like(format!("{}%", prefix.as_str())));
+        query = query.filter(canonical_commit::Column::Key.like(format!("{}%", prefix.as_str())));
     }
 
-    let writes = query.all(db).await?;
-    let mut latest = BTreeMap::<String, kv_write::Model>::new();
-    for (write, _) in writes {
-        let key = write.key.to_string();
-        let replace = latest
-            .get(&key)
-            .map(|current| kv_write_is_newer(&write, current))
-            .unwrap_or(true);
-        if replace {
-            latest.insert(key, write);
-        }
+    let commits = query.all(db).await?;
+    let mut latest = BTreeMap::<String, canonical_commit::Model>::new();
+    for commit in commits {
+        latest.entry(commit.key.to_string()).or_insert(commit);
     }
 
-    Ok(latest.into_values().collect())
+    Ok(latest
+        .into_values()
+        .filter(|commit| commit.kind == KV_CANONICAL_KIND_PUT)
+        .collect())
 }
 
-fn kv_write_is_newer(candidate: &kv_write::Model, current: &kv_write::Model) -> bool {
-    (
-        candidate.seq,
-        candidate.epoch,
-        candidate.epoch_seq,
-        candidate.invocation,
-    ) > (
-        current.seq,
-        current.epoch,
-        current.epoch_seq,
-        current.invocation,
-    )
+async fn latest_canonical_kv_commit<C: ConnectionTrait>(
+    db: &C,
+    space_id: &SpaceId,
+    key: &Path,
+) -> Result<Option<canonical_commit::Model>, KvReplicationError> {
+    Ok(canonical_commit::Entity::find()
+        .filter(
+            Condition::all()
+                .add(canonical_commit::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+                .add(canonical_commit::Column::Key.eq(key.as_str())),
+        )
+        .order_by_desc(canonical_commit::Column::Seq)
+        .one(db)
+        .await?)
+}
+
+async fn find_kv_canonical_commit_seq<C: ConnectionTrait>(
+    db: &C,
+    space_id: &SpaceId,
+    invocation_id: Hash,
+) -> Result<Option<i64>, KvReplicationError> {
+    Ok(canonical_commit::Entity::find()
+        .filter(
+            Condition::all()
+                .add(canonical_commit::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+                .add(canonical_commit::Column::InvocationId.eq(invocation_id)),
+        )
+        .order_by_asc(canonical_commit::Column::Seq)
+        .one(db)
+        .await?
+        .map(|commit| commit.seq))
+}
+
+async fn insert_kv_canonical_commit<C: ConnectionTrait>(
+    db: &C,
+    commit: canonical_commit::Model,
+) -> Result<(), DbErr> {
+    match canonical_commit::Entity::insert(canonical_commit::ActiveModel::from(commit))
+        .on_conflict(
+            OnConflict::columns([
+                canonical_commit::Column::Space,
+                canonical_commit::Column::Seq,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec(db)
+        .await
+    {
+        Err(DbErr::RecordNotInserted) => Ok(()),
+        result => result.map(|_| ()),
+    }
 }
 
 async fn export_invocation_delegations<C: ConnectionTrait>(
@@ -2078,6 +2324,7 @@ async fn get_kv<C: ConnectionTrait, B: ImmutableReadStore>(
         Some(entry) => entry,
         None => return Ok(None),
     };
+
     if read_params.hides_quarantined_keys()
         && is_kv_quarantined(db, space_id, key)
             .await
@@ -2085,6 +2332,7 @@ async fn get_kv<C: ConnectionTrait, B: ImmutableReadStore>(
     {
         return Ok(None);
     }
+
     let content_hash = e.value;
     let c = match store
         .read(space_id, &content_hash)
@@ -2148,46 +2396,6 @@ async fn is_kv_quarantined<C: ConnectionTrait>(
         .one(db)
         .await?
         .is_some())
-}
-
-async fn latest_kv_delete<C: ConnectionTrait>(
-    db: &C,
-    space_id: &SpaceId,
-    key: &Path,
-) -> Result<Option<(kv_delete::Model, i64)>, DbErr> {
-    let deletes = kv_delete::Entity::find()
-        .filter(
-            Condition::all()
-                .add(kv_delete::Column::Key.eq(key.as_str()))
-                .add(kv_delete::Column::Space.eq(SpaceIdWrap(space_id.clone()))),
-        )
-        .all(db)
-        .await?;
-
-    let mut latest = None;
-    for delete in deletes {
-        let Some(ordering) = event_order::Entity::find()
-            .filter(
-                Condition::all()
-                    .add(event_order::Column::Space.eq(SpaceIdWrap(space_id.clone())))
-                    .add(event_order::Column::Event.eq(delete.invocation_id)),
-            )
-            .one(db)
-            .await?
-        else {
-            continue;
-        };
-
-        let replace = latest
-            .as_ref()
-            .map(|(_, seq)| ordering.seq > *seq)
-            .unwrap_or(true);
-        if replace {
-            latest = Some((delete, ordering.seq));
-        }
-    }
-
-    Ok(latest)
 }
 
 fn kv_state_status_label(status: &KvStateStatus) -> &'static str {
