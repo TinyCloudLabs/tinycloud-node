@@ -24,7 +24,9 @@ use crate::storage::{
     either::EitherError, Content, HashBuffer, ImmutableDeleteStore, ImmutableReadStore,
     ImmutableStaging, ImmutableWriteStore, StorageSetup, StoreSize,
 };
-use crate::types::{CapabilitiesReadParams, ListFilters, Metadata, Resource, SpaceIdWrap};
+use crate::types::{
+    CapabilitiesReadParams, KvReadParams, ListFilters, Metadata, Resource, SpaceIdWrap,
+};
 use crate::util::{Capability, DelegationInfo};
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use sea_orm::{
@@ -194,24 +196,27 @@ where
         &self,
         space_id: &SpaceId,
         key: &Path,
+        read_params: KvReadParams,
     ) -> Result<Option<(Metadata, Hash, Content<B::Readable>)>, EitherError<DbErr, B::Error>> {
-        get_kv(&self.conn, &self.storage, space_id, key).await
+        get_kv(&self.conn, &self.storage, space_id, key, read_params).await
     }
 
     pub async fn public_kv_metadata(
         &self,
         space_id: &SpaceId,
         key: &Path,
+        read_params: KvReadParams,
     ) -> Result<Option<Metadata>, DbErr> {
-        metadata(&self.conn, space_id, key).await
+        metadata(&self.conn, space_id, key, read_params).await
     }
 
     pub async fn public_kv_list(
         &self,
         space_id: &SpaceId,
         prefix: &Path,
+        read_params: KvReadParams,
     ) -> Result<Vec<Path>, DbErr> {
-        list(&self.conn, space_id, prefix).await
+        list(&self.conn, space_id, prefix, read_params).await
     }
 
     pub async fn replication_session_delegation_active(
@@ -1201,6 +1206,14 @@ where
                         .and_then(|v| serde_json::from_value(v.clone()).ok())
                 })
             });
+        let kv_read_params = invocation
+            .0
+            .invocation
+            .payload()
+            .facts
+            .as_ref()
+            .and_then(|facts| KvReadParams::from_facts(facts))
+            .unwrap_or_default();
         //  verify and commit invocation and kv operations
         let commit = transact(
             &tx,
@@ -1225,16 +1238,16 @@ where
         }) {
             match cap {
                 (space, "kv", "tinycloud.kv/get", path) => results.push(InvocationOutcome::KvRead(
-                    get_kv(&tx, &self.storage, space, path)
+                    get_kv(&tx, &self.storage, space, path, kv_read_params)
                         .await
                         .map_err(|e| match e {
                             EitherError::A(e) => TxStoreError::Tx(e.into()),
                             EitherError::B(e) => TxStoreError::StoreRead(e),
                         })?,
                 )),
-                (space, "kv", "tinycloud.kv/list", path) => {
-                    results.push(InvocationOutcome::KvList(list(&tx, space, path).await?))
-                }
+                (space, "kv", "tinycloud.kv/list", path) => results.push(
+                    InvocationOutcome::KvList(list(&tx, space, path, kv_read_params).await?),
+                ),
                 (space, "kv", "tinycloud.kv/del", path) => {
                     let kv = get_kv_entity(&tx, space, path).await?;
                     if let Some(kv) = kv {
@@ -1254,9 +1267,11 @@ where
                         results.push(InvocationOutcome::KvWrite)
                     }
                 }
-                (space, "kv", "tinycloud.kv/metadata", path) => results.push(
-                    InvocationOutcome::KvMetadata(metadata(&tx, space, path).await?),
-                ),
+                (space, "kv", "tinycloud.kv/metadata", path) => {
+                    results.push(InvocationOutcome::KvMetadata(
+                        metadata(&tx, space, path, kv_read_params).await?,
+                    ))
+                }
                 (space, "capabilities", "tinycloud.capabilities/read", path)
                     if path.as_str() == "all" =>
                 {
@@ -1743,6 +1758,7 @@ async fn list<C: ConnectionTrait>(
     db: &C,
     space_id: &SpaceId,
     prefix: &Path,
+    read_params: KvReadParams,
 ) -> Result<Vec<Path>, DbErr> {
     // get content id for key from db
     let mut list = kv_write::Entity::find()
@@ -1759,6 +1775,25 @@ async fn list<C: ConnectionTrait>(
         .map(|(kv, _)| kv.key.0)
         .collect::<Vec<Path>>();
     list.dedup();
+
+    if read_params.hides_quarantined_keys() {
+        if list.is_empty() {
+            return Ok(list);
+        }
+        let quarantined = kv_quarantine::Entity::find()
+            .filter(
+                Condition::all()
+                    .add(kv_quarantine::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+                    .add(kv_quarantine::Column::Key.is_in(list.iter().map(|key| key.as_str()))),
+            )
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|row| row.key.to_string())
+            .collect::<HashSet<_>>();
+        list.retain(|key| !quarantined.contains(key.as_str()));
+    }
+
     Ok(list)
 }
 
@@ -2012,9 +2047,17 @@ async fn metadata<C: ConnectionTrait>(
     db: &C,
     space_id: &SpaceId,
     key: &Path,
+    read_params: KvReadParams,
     // TODO version: Option<(i64, Hash, i64)>,
 ) -> Result<Option<Metadata>, DbErr> {
     match get_kv_entity(db, space_id, key).await? {
+        Some(entry) if read_params.hides_quarantined_keys() => {
+            if is_kv_quarantined(db, space_id, key).await? {
+                Ok(None)
+            } else {
+                Ok(Some(entry.metadata))
+            }
+        }
         Some(entry) => Ok(Some(entry.metadata)),
         None => Ok(None),
     }
@@ -2025,6 +2068,7 @@ async fn get_kv<C: ConnectionTrait, B: ImmutableReadStore>(
     store: &B,
     space_id: &SpaceId,
     key: &Path,
+    read_params: KvReadParams,
     // TODO version: Option<(i64, Hash, i64)>,
 ) -> Result<Option<(Metadata, Hash, Content<B::Readable>)>, EitherError<DbErr, B::Error>> {
     let e = match get_kv_entity(db, space_id, key)
@@ -2034,6 +2078,13 @@ async fn get_kv<C: ConnectionTrait, B: ImmutableReadStore>(
         Some(entry) => entry,
         None => return Ok(None),
     };
+    if read_params.hides_quarantined_keys()
+        && is_kv_quarantined(db, space_id, key)
+            .await
+            .map_err(EitherError::A)?
+    {
+        return Ok(None);
+    }
     let content_hash = e.value;
     let c = match store
         .read(space_id, &content_hash)
@@ -2081,6 +2132,22 @@ async fn get_kv_entity<C: ConnectionTrait>(
         .one(db)
         .await?
         .map(|(kv, _)| kv))
+}
+
+async fn is_kv_quarantined<C: ConnectionTrait>(
+    db: &C,
+    space_id: &SpaceId,
+    key: &Path,
+) -> Result<bool, DbErr> {
+    Ok(kv_quarantine::Entity::find()
+        .filter(
+            Condition::all()
+                .add(kv_quarantine::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+                .add(kv_quarantine::Column::Key.eq(key.as_str())),
+        )
+        .one(db)
+        .await?
+        .is_some())
 }
 
 async fn latest_kv_delete<C: ConnectionTrait>(
