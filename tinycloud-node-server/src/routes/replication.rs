@@ -1427,6 +1427,7 @@ pub async fn sql_reconcile(
         since_seq,
     )
     .await?;
+    let mut applied_snapshot_reason = export.snapshot_reason.clone();
 
     if export.mode == "changeset" && !export.changeset.is_empty() {
         if let Err(error) = sql_service
@@ -1448,14 +1449,20 @@ pub async fn sql_reconcile(
                 None,
             )
             .await?;
+            applied_snapshot_reason = Some("changeset-conflict".to_string());
         }
     }
 
     if export.mode == "snapshot" {
+        if applied_snapshot_reason.is_none() {
+            applied_snapshot_reason = export.snapshot_reason.clone();
+        }
         sql_service
             .import(&space_id, &export.db_name, &export.snapshot)
             .await
             .map_err(map_sql_error)?;
+    } else {
+        applied_snapshot_reason = None;
     }
 
     sql_service
@@ -1472,6 +1479,7 @@ pub async fn sql_reconcile(
         db_name: export.db_name,
         peer_url: Some(request.peer_url.clone()),
         mode: export.mode,
+        snapshot_reason: applied_snapshot_reason,
         snapshot_bytes: export.snapshot.len(),
         changeset_bytes: export.changeset.len(),
         applied_until_seq: Some(export.exported_until_seq),

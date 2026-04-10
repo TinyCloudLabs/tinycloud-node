@@ -524,6 +524,7 @@ pub struct SqlReplicationApplyResponse {
     pub db_name: String,
     pub peer_url: Option<String>,
     pub mode: String,
+    pub snapshot_reason: Option<String>,
     pub snapshot_bytes: usize,
     pub changeset_bytes: usize,
     pub applied_until_seq: Option<i64>,
