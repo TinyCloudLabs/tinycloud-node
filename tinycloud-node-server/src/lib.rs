@@ -52,13 +52,13 @@ use storage::{
 };
 use tee::TeeContext;
 use tinycloud_core::{
-    ColumnEncryption, ReplicationService, SpaceDatabase,
     database_artifacts::SeaOrmDatabaseArtifactRepository,
     duckdb::DuckDbService,
     keys::{SecretsSetup, StaticSecret},
     sea_orm::{ConnectOptions, Database, DatabaseConnection},
-    sql::SqlService,
+    sql::{SqlNodeMode, SqlService},
     storage::{StorageConfig, either::Either, memory::MemoryStaging},
+    ColumnEncryption, ReplicationService, SpaceDatabase,
 };
 use webhook_dispatcher::{WebhookDispatcher, spawn_webhook_dispatcher};
 
@@ -243,6 +243,10 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     let sql_service = SqlService::new(
         tinycloud_config.storage.sql.path.clone().expect("resolved"),
         tinycloud_config.storage.sql.memory_threshold.as_u64(),
+        match tinycloud_config.replication.role {
+            ReplicationRole::Host => SqlNodeMode::Host,
+            ReplicationRole::Replica => SqlNodeMode::Replica,
+        },
         database_artifact_repository.clone(),
     );
 

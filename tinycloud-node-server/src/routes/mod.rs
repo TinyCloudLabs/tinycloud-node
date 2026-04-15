@@ -42,7 +42,7 @@ use tinycloud_core::{
     sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder},
     sql::{SqlCaveats, SqlError, SqlRequest, SqlService},
     storage::{ImmutableReadStore, ImmutableStaging},
-    types::Resource,
+    types::{Resource, SqlReadParams},
     util::{DelegationInfo, InvocationInfo},
     write_hooks::{TouchedTables, db_table_path, hook_delivery_id, subscription_matches_event},
 };
@@ -746,6 +746,15 @@ async fn handle_sql_invoke(
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
         })
     });
+    let sql_read_params: SqlReadParams = i
+        .0
+        .0
+        .invocation
+        .payload()
+        .facts
+        .as_ref()
+        .and_then(|facts| SqlReadParams::from_facts(facts))
+        .unwrap_or_default();
 
     let actor = i.0.0.invoker.clone();
     let auth_result = verify_auth(i.0, tinycloud).await?;
@@ -767,7 +776,14 @@ async fn handle_sql_invoke(
     }
 
     let response = sql_service
-        .execute(space, &db_name, sql_request, caveats, ability.to_string())
+        .execute(
+            space,
+            &db_name,
+            sql_request,
+            caveats,
+            ability.clone(),
+            sql_read_params,
+        )
         .await
         .map_err(|e| (sql_error_to_status(&e), e.to_string()))?;
 

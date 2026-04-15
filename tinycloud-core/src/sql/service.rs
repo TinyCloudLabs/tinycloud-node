@@ -14,18 +14,27 @@ use super::{
     replication as sql_replication, storage,
     types::*,
 };
+use crate::types::SqlReadParams;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlNodeMode {
+    Host,
+    Replica,
+}
 
 pub struct SqlService {
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
     base_path: String,
     memory_threshold: u64,
     artifact_repository: Arc<dyn DatabaseArtifactRepository>,
+    mode: SqlNodeMode,
 }
 
 impl SqlService {
     pub fn new(
         base_path: String,
         memory_threshold: u64,
+        mode: SqlNodeMode,
         artifact_repository: Arc<dyn DatabaseArtifactRepository>,
     ) -> Self {
         Self {
@@ -33,6 +42,7 @@ impl SqlService {
             base_path,
             memory_threshold,
             artifact_repository,
+            mode,
         }
     }
 
@@ -43,12 +53,13 @@ impl SqlService {
         request: SqlRequest,
         caveats: Option<SqlCaveats>,
         ability: String,
+        read_params: SqlReadParams,
     ) -> Result<SqlExecutionResult, SqlError> {
         let key = (space.to_string(), db_name.to_string());
         let mut handle = self.handle(space, db_name).await?;
 
         let result = match handle
-            .execute(request.clone(), caveats.clone(), ability.clone())
+            .execute(request.clone(), caveats.clone(), ability.clone(), read_params)
             .await
         {
             Err(SqlError::Internal(ref msg)) if msg.contains("Database actor not available") => {
@@ -56,7 +67,7 @@ impl SqlService {
                 tracing::warn!(space=%space, db=%db_name, "Dead SQL actor detected, respawning");
                 self.databases.remove(&key);
                 handle = self.handle(space, db_name).await?;
-                handle.execute(request, caveats, ability).await
+                handle.execute(request, caveats, ability, read_params).await
             }
             other => other,
         }?;
@@ -292,6 +303,10 @@ impl SqlService {
             .unwrap_or_else(|| "default".to_string())
     }
 
+    pub fn node_mode(&self) -> SqlNodeMode {
+        self.mode
+    }
+
     async fn handle(&self, space: &SpaceId, db_name: &str) -> Result<DatabaseHandle, SqlError> {
         let key = (space.to_string(), db_name.to_string());
         if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
@@ -309,6 +324,7 @@ impl SqlService {
                     db_name.to_string(),
                     self.base_path.clone(),
                     self.memory_threshold,
+                    self.mode,
                     self.databases.clone(),
                 )
             })
