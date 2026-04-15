@@ -1,3 +1,4 @@
+use crate::sql::{SqlCaveats, SqlRequest};
 use crate::types::Metadata;
 use serde::{Deserialize, Serialize};
 
@@ -515,6 +516,10 @@ pub struct SqlReplicationExportResponse {
     pub snapshot: Vec<u8>,
     pub changeset: Vec<u8>,
     pub change_count: usize,
+    #[serde(default)]
+    pub authored_facts: Vec<SqlReplicationAuthoredFact>,
+    #[serde(default)]
+    pub canonicalized_authored_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -529,6 +534,22 @@ pub struct SqlReplicationApplyResponse {
     pub changeset_bytes: usize,
     pub applied_until_seq: Option<i64>,
     pub change_count: usize,
+    #[serde(default)]
+    pub authored_fact_count: usize,
+    #[serde(default)]
+    pub canonicalized_authored_count: usize,
+    #[serde(default)]
+    pub rejected_authored_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SqlReplicationAuthoredFact {
+    pub authored_id: String,
+    pub base_canonical_seq: i64,
+    pub request: SqlRequest,
+    pub caveats: Option<SqlCaveats>,
+    pub ability: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

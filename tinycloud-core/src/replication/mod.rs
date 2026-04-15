@@ -20,8 +20,8 @@ pub use messages::{
     ReplicationApplyResponse, ReplicationErrorResponse, ReplicationExportRequest,
     ReplicationExportResponse, ReplicationInfoRequest, ReplicationNotifyPollRequest,
     ReplicationNotifyPollResponse, ReplicationReconcileRequest, ReplicationSessionOpenRequest,
-    ReplicationSessionOpenResponse, SqlReplicationApplyResponse, SqlReplicationExportRequest,
-    SqlReplicationExportResponse, SqlReplicationReconcileRequest,
+    ReplicationSessionOpenResponse, SqlReplicationApplyResponse, SqlReplicationAuthoredFact,
+    SqlReplicationExportRequest, SqlReplicationExportResponse, SqlReplicationReconcileRequest,
 };
 pub use store::{decode_hash, encode_hash, KvReplicationError};
 pub use types::{

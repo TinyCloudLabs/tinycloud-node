@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use dashmap::DashMap;
+use rand::{rngs::OsRng, RngCore};
 use rusqlite::session::Session;
 use rusqlite::{
     hooks::{AuthContext, Authorization},
@@ -41,11 +43,18 @@ enum DbMessage {
     Import {
         snapshot: Vec<u8>,
         snapshot_reason: Option<String>,
+        canonicalized_authored_ids: Vec<String>,
         response_tx: oneshot::Sender<Result<(), SqlError>>,
     },
     ApplyChangeset {
         changeset: Vec<u8>,
+        canonicalized_authored_ids: Vec<String>,
         response_tx: oneshot::Sender<Result<(), SqlError>>,
+    },
+    ApplyAuthoredFacts {
+        peer_url: Option<String>,
+        facts: Vec<sql_replication::SqlAuthoredFact>,
+        response_tx: oneshot::Sender<Result<sql_replication::SqlAuthoredFactApplyResult, SqlError>>,
     },
 }
 
@@ -68,6 +77,8 @@ struct ReplicaState {
 
 struct PendingSqlFact {
     fact_id: i64,
+    authored_id: String,
+    base_canonical_seq: i64,
     request: SqlRequest,
     caveats: Option<SqlCaveats>,
     ability: String,
@@ -112,12 +123,14 @@ impl DatabaseHandle {
         &self,
         snapshot: Vec<u8>,
         snapshot_reason: Option<String>,
+        canonicalized_authored_ids: Vec<String>,
     ) -> Result<(), SqlError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
             .send(DbMessage::Import {
                 snapshot,
                 snapshot_reason,
+                canonicalized_authored_ids,
                 response_tx,
             })
             .await
@@ -149,6 +162,45 @@ impl DatabaseHandle {
         self.tx
             .send(DbMessage::ApplyChangeset {
                 changeset,
+                canonicalized_authored_ids: Vec::new(),
+                response_tx,
+            })
+            .await
+            .map_err(|_| SqlError::Internal("Database actor not available".to_string()))?;
+        response_rx
+            .await
+            .map_err(|_| SqlError::Internal("Database actor dropped response".to_string()))?
+    }
+
+    pub async fn apply_replication_changeset(
+        &self,
+        changeset: Vec<u8>,
+        canonicalized_authored_ids: Vec<String>,
+    ) -> Result<(), SqlError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send(DbMessage::ApplyChangeset {
+                changeset,
+                canonicalized_authored_ids,
+                response_tx,
+            })
+            .await
+            .map_err(|_| SqlError::Internal("Database actor not available".to_string()))?;
+        response_rx
+            .await
+            .map_err(|_| SqlError::Internal("Database actor dropped response".to_string()))?
+    }
+
+    pub async fn apply_authored_facts(
+        &self,
+        peer_url: Option<String>,
+        facts: Vec<sql_replication::SqlAuthoredFact>,
+    ) -> Result<sql_replication::SqlAuthoredFactApplyResult, SqlError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send(DbMessage::ApplyAuthoredFacts {
+                peer_url,
+                facts,
                 response_tx,
             })
             .await
@@ -222,6 +274,7 @@ fn open_metadata_connection(path: &PathBuf) -> Result<Connection, SqlError> {
         "
         CREATE TABLE IF NOT EXISTS pending_sql_fact (
             fact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            authored_id TEXT,
             request_json TEXT NOT NULL,
             caveats_json TEXT,
             ability TEXT NOT NULL,
@@ -234,7 +287,63 @@ fn open_metadata_connection(path: &PathBuf) -> Result<Connection, SqlError> {
         ",
     )
     .map_err(|e| SqlError::Internal(e.to_string()))?;
+    ensure_pending_sql_fact_authored_ids(&conn)?;
     Ok(conn)
+}
+
+fn ensure_pending_sql_fact_authored_ids(metadata: &Connection) -> Result<(), SqlError> {
+    let mut has_authored_id = false;
+    let mut stmt = metadata
+        .prepare("PRAGMA table_info(pending_sql_fact)")
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    for row in rows {
+        if row.map_err(|e| SqlError::Internal(e.to_string()))? == "authored_id" {
+            has_authored_id = true;
+            break;
+        }
+    }
+
+    if !has_authored_id {
+        metadata
+            .execute(
+                "ALTER TABLE pending_sql_fact ADD COLUMN authored_id TEXT",
+                [],
+            )
+            .map_err(|e| SqlError::Internal(e.to_string()))?;
+    }
+
+    let mut pending_fact_ids = Vec::new();
+    let mut stmt = metadata
+        .prepare(
+            "SELECT fact_id FROM pending_sql_fact WHERE authored_id IS NULL OR authored_id = ''",
+        )
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    for row in rows {
+        pending_fact_ids.push(row.map_err(|e| SqlError::Internal(e.to_string()))?);
+    }
+
+    for fact_id in pending_fact_ids {
+        metadata
+            .execute(
+                "UPDATE pending_sql_fact SET authored_id = ? WHERE fact_id = ?",
+                params![new_authored_id(), fact_id],
+            )
+            .map_err(|e| SqlError::Internal(e.to_string()))?;
+    }
+
+    metadata
+        .execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_sql_fact_authored_id ON pending_sql_fact(authored_id)",
+            [],
+        )
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    Ok(())
 }
 
 fn clone_store_from(
@@ -256,13 +365,20 @@ fn clone_store_from(
     })
 }
 
+fn new_authored_id() -> String {
+    let mut bytes = [0u8; 18];
+    OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
 fn append_pending_sql_fact(
     metadata: &Connection,
     request: &SqlRequest,
     caveats: &Option<SqlCaveats>,
     ability: &str,
     base_canonical_seq: i64,
-) -> Result<i64, SqlError> {
+) -> Result<(i64, String), SqlError> {
+    let authored_id = new_authored_id();
     let request_json =
         serde_json::to_string(request).map_err(|e| SqlError::Internal(e.to_string()))?;
     let caveats_json = caveats
@@ -272,13 +388,13 @@ fn append_pending_sql_fact(
     metadata
         .execute(
             "
-            INSERT INTO pending_sql_fact (request_json, caveats_json, ability, status, base_canonical_seq)
-            VALUES (?, ?, ?, 'pending', ?)
+            INSERT INTO pending_sql_fact (authored_id, request_json, caveats_json, ability, status, base_canonical_seq)
+            VALUES (?, ?, ?, ?, 'pending', ?)
             ",
-            params![request_json, caveats_json, ability, base_canonical_seq],
+            params![authored_id, request_json, caveats_json, ability, base_canonical_seq],
         )
         .map_err(|e| SqlError::Internal(e.to_string()))?;
-    Ok(metadata.last_insert_rowid())
+    Ok((metadata.last_insert_rowid(), authored_id))
 }
 
 fn update_pending_sql_fact(
@@ -310,11 +426,24 @@ fn delete_pending_sql_fact(metadata: &Connection, fact_id: i64) -> Result<(), Sq
     Ok(())
 }
 
+fn delete_pending_sql_fact_by_authored_id(
+    metadata: &Connection,
+    authored_id: &str,
+) -> Result<(), SqlError> {
+    metadata
+        .execute(
+            "DELETE FROM pending_sql_fact WHERE authored_id = ?",
+            params![authored_id],
+        )
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    Ok(())
+}
+
 fn load_replayable_pending_facts(metadata: &Connection) -> Result<Vec<PendingSqlFact>, SqlError> {
     let mut stmt = metadata
         .prepare(
             "
-            SELECT fact_id, request_json, caveats_json, ability
+            SELECT fact_id, authored_id, request_json, caveats_json, ability, COALESCE(base_canonical_seq, 0)
             FROM pending_sql_fact
             WHERE status IN ('pending', 'applied', 'rebase_needed')
             ORDER BY fact_id ASC
@@ -325,16 +454,25 @@ fn load_replayable_pending_facts(metadata: &Connection) -> Result<Vec<PendingSql
     let rows = stmt
         .query_map([], |row| {
             let fact_id: i64 = row.get(0)?;
-            let request_json: String = row.get(1)?;
-            let caveats_json: Option<String> = row.get(2)?;
-            let ability: String = row.get(3)?;
-            Ok((fact_id, request_json, caveats_json, ability))
+            let authored_id: String = row.get(1)?;
+            let request_json: String = row.get(2)?;
+            let caveats_json: Option<String> = row.get(3)?;
+            let ability: String = row.get(4)?;
+            let base_canonical_seq: i64 = row.get(5)?;
+            Ok((
+                fact_id,
+                authored_id,
+                request_json,
+                caveats_json,
+                ability,
+                base_canonical_seq,
+            ))
         })
         .map_err(|e| SqlError::Internal(e.to_string()))?;
 
     let mut facts = Vec::new();
     for row in rows {
-        let (fact_id, request_json, caveats_json, ability) =
+        let (fact_id, authored_id, request_json, caveats_json, ability, base_canonical_seq) =
             row.map_err(|e| SqlError::Internal(e.to_string()))?;
         let request =
             serde_json::from_str(&request_json).map_err(|e| SqlError::Internal(e.to_string()))?;
@@ -344,6 +482,8 @@ fn load_replayable_pending_facts(metadata: &Connection) -> Result<Vec<PendingSql
             .transpose()?;
         facts.push(PendingSqlFact {
             fact_id,
+            authored_id,
+            base_canonical_seq,
             request,
             caveats,
             ability,
@@ -481,12 +621,8 @@ pub fn spawn_actor(
                             &host_store.as_ref().expect("host store").conn,
                             since_seq,
                         ),
-                        SqlNodeMode::Replica => handle_export_replication(
-                            &replica_state
-                                .as_ref()
-                                .expect("replica state")
-                                .canonical
-                                .conn,
+                        SqlNodeMode::Replica => export_replica_replication(
+                            replica_state.as_ref().expect("replica state"),
                             since_seq,
                         ),
                     };
@@ -495,6 +631,7 @@ pub fn spawn_actor(
                 DbMessage::Import {
                     snapshot,
                     snapshot_reason,
+                    canonicalized_authored_ids,
                     response_tx,
                 } => {
                     let result = match node_mode {
@@ -507,6 +644,7 @@ pub fn spawn_actor(
                                 memory_threshold,
                                 &snapshot,
                                 snapshot_reason.as_deref(),
+                                &canonicalized_authored_ids,
                             )
                         }
                         SqlNodeMode::Replica => handle_replica_import(
@@ -514,24 +652,45 @@ pub fn spawn_actor(
                             memory_threshold,
                             &snapshot,
                             snapshot_reason.as_deref(),
+                            &canonicalized_authored_ids,
                         ),
                     };
                     let _ = response_tx.send(result);
                 }
                 DbMessage::ApplyChangeset {
                     changeset,
+                    canonicalized_authored_ids,
                     response_tx,
                 } => {
                     let result = match node_mode {
                         SqlNodeMode::Host => handle_apply_changeset(
                             &host_store.as_ref().expect("host store").conn,
                             &changeset,
+                            &canonicalized_authored_ids,
                         ),
                         SqlNodeMode::Replica => handle_replica_apply_changeset(
                             replica_state.as_mut().expect("replica state"),
                             memory_threshold,
                             &changeset,
+                            &canonicalized_authored_ids,
                         ),
+                    };
+                    let _ = response_tx.send(result);
+                }
+                DbMessage::ApplyAuthoredFacts {
+                    peer_url,
+                    facts,
+                    response_tx,
+                } => {
+                    let result = match node_mode {
+                        SqlNodeMode::Host => handle_apply_authored_facts(
+                            &host_store.as_ref().expect("host store").conn,
+                            peer_url.as_deref(),
+                            &facts,
+                        ),
+                        SqlNodeMode::Replica => Err(SqlError::Internal(
+                            "replica nodes cannot canonicalize authored SQL facts".to_string(),
+                        )),
                     };
                     let _ = response_tx.send(result);
                 }
@@ -576,6 +735,24 @@ fn handle_export_replication(
     sql_replication::export_replication(conn, since_seq)
 }
 
+fn export_replica_replication(
+    state: &ReplicaState,
+    since_seq: Option<i64>,
+) -> Result<sql_replication::SqlReplicationExport, SqlError> {
+    let mut export = sql_replication::export_replication(&state.canonical.conn, since_seq)?;
+    export.authored_facts = load_replayable_pending_facts(&state.metadata)?
+        .into_iter()
+        .map(|fact| sql_replication::SqlAuthoredFact {
+            authored_id: fact.authored_id,
+            base_canonical_seq: fact.base_canonical_seq,
+            request: fact.request,
+            caveats: fact.caveats,
+            ability: fact.ability,
+        })
+        .collect();
+    Ok(export)
+}
+
 fn handle_import(
     conn: &mut rusqlite::Connection,
     mode: &mut StorageMode,
@@ -583,6 +760,7 @@ fn handle_import(
     memory_threshold: u64,
     snapshot: &[u8],
     snapshot_reason: Option<&str>,
+    canonicalized_authored_ids: &[String],
 ) -> Result<(), SqlError> {
     storage::import_snapshot(conn, snapshot, matches!(mode, StorageMode::File(_)))?;
 
@@ -596,12 +774,57 @@ fn handle_import(
         sql_replication::append_snapshot_barrier(conn, reason)?;
     }
 
+    for authored_id in canonicalized_authored_ids {
+        let canonical_seq = sql_replication::current_replication_seq(conn)?;
+        sql_replication::record_canonicalized_authored_fact(
+            conn,
+            authored_id,
+            canonical_seq,
+            None,
+        )?;
+    }
+
     Ok(())
 }
 
-fn handle_apply_changeset(conn: &rusqlite::Connection, changeset: &[u8]) -> Result<(), SqlError> {
+fn handle_apply_changeset(
+    conn: &rusqlite::Connection,
+    changeset: &[u8],
+    canonicalized_authored_ids: &[String],
+) -> Result<(), SqlError> {
     sql_replication::apply_changeset(conn, changeset)?;
     sql_replication::append_changeset(conn, changeset)?;
+    let canonical_seq = sql_replication::current_replication_seq(conn)?;
+    for authored_id in canonicalized_authored_ids {
+        sql_replication::record_canonicalized_authored_fact(
+            conn,
+            authored_id,
+            canonical_seq,
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_canonicalized_authored_ids(
+    state: &mut ReplicaState,
+    canonicalized_authored_ids: &[String],
+) -> Result<(), SqlError> {
+    if canonicalized_authored_ids.is_empty() {
+        return Ok(());
+    }
+
+    let canonical_seq = sql_replication::current_replication_seq(&state.canonical.conn)?;
+    for authored_id in canonicalized_authored_ids {
+        sql_replication::record_canonicalized_authored_fact(
+            &state.canonical.conn,
+            authored_id,
+            canonical_seq,
+            None,
+        )?;
+        delete_pending_sql_fact_by_authored_id(&state.metadata, authored_id)?;
+    }
+
     Ok(())
 }
 
@@ -641,6 +864,7 @@ fn handle_replica_import(
     memory_threshold: u64,
     snapshot: &[u8],
     snapshot_reason: Option<&str>,
+    canonicalized_authored_ids: &[String],
 ) -> Result<(), SqlError> {
     handle_import(
         &mut state.canonical.conn,
@@ -649,7 +873,9 @@ fn handle_replica_import(
         memory_threshold,
         snapshot,
         snapshot_reason,
+        canonicalized_authored_ids,
     )?;
+    apply_canonicalized_authored_ids(state, canonicalized_authored_ids)?;
     rebuild_replica_provisional_from_canonical(state)
 }
 
@@ -657,10 +883,61 @@ fn handle_replica_apply_changeset(
     state: &mut ReplicaState,
     memory_threshold: u64,
     changeset: &[u8],
+    canonicalized_authored_ids: &[String],
 ) -> Result<(), SqlError> {
-    handle_apply_changeset(&state.canonical.conn, changeset)?;
+    handle_apply_changeset(&state.canonical.conn, changeset, canonicalized_authored_ids)?;
     state.canonical.promote_if_needed(memory_threshold)?;
+    apply_canonicalized_authored_ids(state, canonicalized_authored_ids)?;
     rebuild_replica_provisional_from_canonical(state)
+}
+
+fn handle_apply_authored_facts(
+    conn: &rusqlite::Connection,
+    peer_url: Option<&str>,
+    facts: &[sql_replication::SqlAuthoredFact],
+) -> Result<sql_replication::SqlAuthoredFactApplyResult, SqlError> {
+    let mut result = sql_replication::SqlAuthoredFactApplyResult::default();
+
+    for fact in facts {
+        if sql_replication::canonicalized_authored_fact_exists(conn, &fact.authored_id)? {
+            result
+                .canonicalized_authored_ids
+                .push(fact.authored_id.clone());
+            continue;
+        }
+
+        match handle_message(
+            conn,
+            &fact.request,
+            &fact.caveats,
+            &fact.ability,
+            SqlReadParams::Canonical,
+        ) {
+            Ok(_) => {
+                let canonical_seq = sql_replication::current_replication_seq(conn)?;
+                sql_replication::record_canonicalized_authored_fact(
+                    conn,
+                    &fact.authored_id,
+                    canonical_seq,
+                    peer_url,
+                )?;
+                result
+                    .canonicalized_authored_ids
+                    .push(fact.authored_id.clone());
+                result.canonicalized_count += 1;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    authored_id=%fact.authored_id,
+                    error=%error,
+                    "failed to canonicalize authored SQL fact"
+                );
+                result.rejected_count += 1;
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 fn execute_statement_without_replication(
@@ -845,7 +1122,7 @@ fn handle_replica_message(
     }
 
     let base_canonical_seq = sql_replication::current_replication_seq(&state.canonical.conn)?;
-    let fact_id = append_pending_sql_fact(
+    let (fact_id, _) = append_pending_sql_fact(
         &state.metadata,
         request,
         caveats,

@@ -191,12 +191,17 @@ impl SqlService {
         db_name: &str,
         snapshot: &[u8],
         snapshot_reason: Option<String>,
+        canonicalized_authored_ids: Vec<String>,
     ) -> Result<(), SqlError> {
         let key = (space.to_string(), db_name.to_string());
 
         if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
             match handle
-                .import(snapshot.to_vec(), snapshot_reason.clone())
+                .import(
+                    snapshot.to_vec(),
+                    snapshot_reason.clone(),
+                    canonicalized_authored_ids.clone(),
+                )
                 .await
             {
                 Err(SqlError::Internal(ref msg))
@@ -214,9 +219,18 @@ impl SqlService {
             .join(format!("{}.db", db_name));
 
         storage::import_snapshot_to_path(&path, snapshot)?;
+        let conn = storage::open_connection(&storage::StorageMode::File(path))?;
         if let Some(reason) = snapshot_reason {
-            let conn = storage::open_connection(&storage::StorageMode::File(path))?;
             sql_replication::append_snapshot_barrier(&conn, &reason)?;
+        }
+        let canonical_seq = sql_replication::current_replication_seq(&conn)?;
+        for authored_id in canonicalized_authored_ids {
+            sql_replication::record_canonicalized_authored_fact(
+                &conn,
+                &authored_id,
+                canonical_seq,
+                None,
+            )?;
         }
         Ok(())
     }
@@ -226,11 +240,15 @@ impl SqlService {
         space: &SpaceId,
         db_name: &str,
         changeset: &[u8],
+        canonicalized_authored_ids: Vec<String>,
     ) -> Result<(), SqlError> {
         let key = (space.to_string(), db_name.to_string());
 
         if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
-            match handle.apply_changeset(changeset.to_vec()).await {
+            match handle
+                .apply_replication_changeset(changeset.to_vec(), canonicalized_authored_ids.clone())
+                .await
+            {
                 Err(SqlError::Internal(ref msg))
                     if msg.contains("Database actor not available") =>
                 {
@@ -245,7 +263,73 @@ impl SqlService {
             .join(space.to_string())
             .join(format!("{}.db", db_name));
 
-        sql_replication::apply_changeset_to_path(&path, changeset)
+        let conn = storage::open_connection(&storage::StorageMode::File(path))?;
+        sql_replication::apply_changeset(&conn, changeset)?;
+        sql_replication::append_changeset(&conn, changeset)?;
+        let canonical_seq = sql_replication::current_replication_seq(&conn)?;
+        for authored_id in canonicalized_authored_ids {
+            sql_replication::record_canonicalized_authored_fact(
+                &conn,
+                &authored_id,
+                canonical_seq,
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub async fn apply_authored_replication_facts(
+        &self,
+        space: &SpaceId,
+        db_name: &str,
+        peer_url: Option<String>,
+        facts: Vec<sql_replication::SqlAuthoredFact>,
+    ) -> Result<sql_replication::SqlAuthoredFactApplyResult, SqlError> {
+        let key = (space.to_string(), db_name.to_string());
+        let handle = self
+            .databases
+            .entry(key.clone())
+            .or_insert_with(|| {
+                spawn_actor(
+                    space.to_string(),
+                    db_name.to_string(),
+                    self.base_path.clone(),
+                    self.memory_threshold,
+                    self.mode,
+                    self.databases.clone(),
+                )
+            })
+            .clone();
+
+        match handle
+            .apply_authored_facts(peer_url.clone(), facts.clone())
+            .await
+        {
+            Err(SqlError::Internal(ref msg)) if msg.contains("Database actor not available") => {
+                tracing::warn!(space=%space, db=%db_name, "Dead SQL actor detected during authored fact apply, respawning");
+                self.databases.remove(&key);
+                let new_handle = self
+                    .databases
+                    .entry(key)
+                    .or_insert_with(|| {
+                        spawn_actor(
+                            space.to_string(),
+                            db_name.to_string(),
+                            self.base_path.clone(),
+                            self.memory_threshold,
+                            self.mode,
+                            self.databases.clone(),
+                        )
+                    })
+                    .clone();
+                new_handle.apply_authored_facts(peer_url, facts).await
+            }
+            other => other,
+        }
+    }
+
+    pub fn node_mode(&self) -> SqlNodeMode {
+        self.mode
     }
 
     pub fn read_peer_cursor(
