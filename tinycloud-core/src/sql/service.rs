@@ -474,4 +474,140 @@ mod tests {
         };
         assert_eq!(query.row_count, 1);
     }
+
+    #[tokio::test]
+    async fn replica_applies_incremental_changeset_from_authority() {
+        let tempdir = tempdir().expect("tempdir");
+        let host_path = tempdir.path().join("host");
+        let replica_path = tempdir.path().join("replica");
+        let host = SqlService::new(
+            host_path.to_string_lossy().to_string(),
+            1024 * 1024,
+            SqlNodeMode::Host,
+        );
+        let replica = SqlService::new(
+            replica_path.to_string_lossy().to_string(),
+            1024 * 1024,
+            SqlNodeMode::Replica,
+        );
+        let space = test_space();
+
+        host.execute(
+            &space,
+            "default",
+            SqlRequest::Execute {
+                sql: "CREATE TABLE items (id TEXT PRIMARY KEY, label TEXT NOT NULL, quantity INTEGER NOT NULL)"
+                    .to_string(),
+                params: vec![],
+                schema: None,
+            },
+            None,
+            "tinycloud.sql/admin".to_string(),
+            SqlReadParams::Canonical,
+        )
+        .await
+        .expect("create table on host");
+
+        host.execute(
+            &space,
+            "default",
+            SqlRequest::Execute {
+                sql: "INSERT INTO items (id, label, quantity) VALUES (?, ?, ?)".to_string(),
+                params: vec![
+                    SqlValue::Text("item-1".to_string()),
+                    SqlValue::Text("camera".to_string()),
+                    SqlValue::Integer(2),
+                ],
+                schema: None,
+            },
+            None,
+            "tinycloud.sql/admin".to_string(),
+            SqlReadParams::Canonical,
+        )
+        .await
+        .expect("insert item on host");
+
+        let initial_snapshot = host.export(&space, "default").await.expect("host snapshot");
+        replica
+            .import(
+                &space,
+                "default",
+                &initial_snapshot,
+                Some("initial-sync".to_string()),
+                vec![],
+            )
+            .await
+            .expect("replica import");
+
+        let since_seq = host
+            .current_replication_seq(&space, "default")
+            .await
+            .expect("current seq after insert");
+        assert_eq!(since_seq, 2);
+
+        host.execute(
+            &space,
+            "default",
+            SqlRequest::Execute {
+                sql: "UPDATE items SET label = ?, quantity = ? WHERE id = ?".to_string(),
+                params: vec![
+                    SqlValue::Text("camera-pro".to_string()),
+                    SqlValue::Integer(4),
+                    SqlValue::Text("item-1".to_string()),
+                ],
+                schema: None,
+            },
+            None,
+            "tinycloud.sql/admin".to_string(),
+            SqlReadParams::Canonical,
+        )
+        .await
+        .expect("update item on host");
+
+        let incremental = host
+            .export_replication(&space, "default", Some(since_seq))
+            .await
+            .expect("incremental export");
+        assert_eq!(incremental.mode.as_str(), "changeset");
+        assert!(!incremental.changeset.is_empty());
+
+        replica
+            .apply_changeset(&space, "default", &incremental.changeset, vec![])
+            .await
+            .expect("apply changeset on replica");
+
+        let query = replica
+            .execute(
+                &space,
+                "default",
+                SqlRequest::Query {
+                    sql: "SELECT id, label, quantity FROM items WHERE id = ?".to_string(),
+                    params: vec![SqlValue::Text("item-1".to_string())],
+                },
+                None,
+                "tinycloud.sql/admin".to_string(),
+                SqlReadParams::Canonical,
+            )
+            .await
+            .expect("query replica canonical");
+
+        let SqlResponse::Query(query) = query else {
+            panic!("expected query response");
+        };
+        assert_eq!(query.row_count, 1);
+        assert_eq!(query.rows.len(), 1);
+        assert_eq!(query.rows[0].len(), 3);
+        match &query.rows[0][0] {
+            SqlValue::Text(value) => assert_eq!(value, "item-1"),
+            other => panic!("unexpected id value: {other:?}"),
+        }
+        match &query.rows[0][1] {
+            SqlValue::Text(value) => assert_eq!(value, "camera-pro"),
+            other => panic!("unexpected label value: {other:?}"),
+        }
+        match query.rows[0][2] {
+            SqlValue::Integer(value) => assert_eq!(value, 4),
+            ref other => panic!("unexpected quantity value: {other:?}"),
+        }
+    }
 }

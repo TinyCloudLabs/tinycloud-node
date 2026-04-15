@@ -1428,10 +1428,15 @@ pub async fn sql_reconcile(
         )
     })?;
     let peer_url = request.peer_url.trim_end_matches('/');
-    let local_current_seq = sql_service
-        .current_replication_seq(&space_id, &request.db_name)
-        .await
-        .unwrap_or(0);
+    let local_is_host = matches!(sql_service.node_mode(), SqlNodeMode::Host);
+    let local_current_seq = if local_is_host {
+        sql_service
+            .current_replication_seq(&space_id, &request.db_name)
+            .await
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let since_seq = sql_service
         .read_peer_cursor(&space_id, &request.db_name, peer_url)
         .map_err(map_sql_error)?;
@@ -1444,7 +1449,9 @@ pub async fn sql_reconcile(
     )
     .await?;
     let mut applied_snapshot_reason = export.snapshot_reason.clone();
-    let mut should_apply_canonical_export = export.exported_until_seq > local_current_seq;
+    let mut should_apply_canonical_export = !local_is_host
+        || export.authored_facts.is_empty()
+        || export.exported_until_seq > local_current_seq;
     let mut rejected_authored_count = 0usize;
 
     if should_apply_canonical_export && export.mode == "changeset" && !export.changeset.is_empty() {
