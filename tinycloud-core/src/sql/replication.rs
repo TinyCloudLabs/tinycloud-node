@@ -15,6 +15,7 @@ use super::{
 
 pub const INTERNAL_REPLICATION_TABLE_PREFIX: &str = "__tinycloud_sql_replication_";
 const REPLICATION_LOG_TABLE: &str = "__tinycloud_sql_replication_log";
+const AUTHORED_FACT_TABLE: &str = "__tinycloud_sql_replication_authored_fact";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SqlReplicationMode {
@@ -39,6 +40,24 @@ pub struct SqlReplicationExport {
     pub snapshot: Vec<u8>,
     pub changeset: Vec<u8>,
     pub change_count: usize,
+    pub authored_facts: Vec<SqlAuthoredFact>,
+    pub canonicalized_authored_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SqlAuthoredFact {
+    pub authored_id: String,
+    pub base_canonical_seq: i64,
+    pub request: super::types::SqlRequest,
+    pub caveats: Option<super::caveats::SqlCaveats>,
+    pub ability: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SqlAuthoredFactApplyResult {
+    pub canonicalized_authored_ids: Vec<String>,
+    pub canonicalized_count: usize,
+    pub rejected_count: usize,
 }
 
 pub fn is_internal_table_name(name: &str) -> bool {
@@ -96,6 +115,8 @@ pub fn export_replication(
             snapshot: storage::export_snapshot(conn)?,
             changeset: Vec::new(),
             change_count: 0,
+            authored_facts: Vec::new(),
+            canonicalized_authored_ids: canonicalized_authored_ids_since(conn, None)?,
         });
     }
 
@@ -110,6 +131,8 @@ pub fn export_replication(
             snapshot: storage::export_snapshot(conn)?,
             changeset: Vec::new(),
             change_count: 0,
+            authored_facts: Vec::new(),
+            canonicalized_authored_ids: canonicalized_authored_ids_since(conn, Some(since_seq))?,
         });
     }
 
@@ -121,6 +144,8 @@ pub fn export_replication(
         snapshot: Vec::new(),
         changeset,
         change_count,
+        authored_facts: Vec::new(),
+        canonicalized_authored_ids: canonicalized_authored_ids_since(conn, Some(since_seq))?,
     })
 }
 
@@ -168,6 +193,80 @@ pub fn apply_changeset_to_path(path: &Path, changeset: &[u8]) -> Result<(), SqlE
     apply_changeset(&conn, changeset)?;
     append_changeset(&conn, changeset)?;
     Ok(())
+}
+
+pub fn record_canonicalized_authored_fact(
+    conn: &Connection,
+    authored_id: &str,
+    canonical_seq: i64,
+    peer_url: Option<&str>,
+) -> Result<(), SqlError> {
+    ensure_authored_fact_log(conn)?;
+    conn.execute(
+        &format!(
+            "INSERT INTO {AUTHORED_FACT_TABLE} (authored_id, canonical_seq, peer_url, created_at)
+             VALUES (?, ?, ?, unixepoch())
+             ON CONFLICT(authored_id) DO UPDATE SET canonical_seq = excluded.canonical_seq, peer_url = excluded.peer_url"
+        ),
+        params![authored_id, canonical_seq, peer_url],
+    )
+    .map_err(|e| SqlError::Internal(e.to_string()))?;
+    Ok(())
+}
+
+pub fn canonicalized_authored_ids_since(
+    conn: &Connection,
+    since_seq: Option<i64>,
+) -> Result<Vec<String>, SqlError> {
+    if !authored_fact_log_exists(conn)? {
+        return Ok(Vec::new());
+    }
+
+    let mut ids = Vec::new();
+    if let Some(since_seq) = since_seq {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT authored_id FROM {AUTHORED_FACT_TABLE} WHERE canonical_seq > ? ORDER BY canonical_seq ASC, authored_id ASC"
+            ))
+            .map_err(|e| SqlError::Internal(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![since_seq], |row| row.get::<_, String>(0))
+            .map_err(|e| SqlError::Internal(e.to_string()))?;
+        for row in rows {
+            ids.push(row.map_err(|e| SqlError::Internal(e.to_string()))?);
+        }
+    } else {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT authored_id FROM {AUTHORED_FACT_TABLE} ORDER BY canonical_seq ASC, authored_id ASC"
+            ))
+            .map_err(|e| SqlError::Internal(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| SqlError::Internal(e.to_string()))?;
+        for row in rows {
+            ids.push(row.map_err(|e| SqlError::Internal(e.to_string()))?);
+        }
+    }
+
+    Ok(ids)
+}
+
+pub fn canonicalized_authored_fact_exists(
+    conn: &Connection,
+    authored_id: &str,
+) -> Result<bool, SqlError> {
+    if !authored_fact_log_exists(conn)? {
+        return Ok(false);
+    }
+
+    conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM {AUTHORED_FACT_TABLE} WHERE authored_id = ?)"),
+        params![authored_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|value| value != 0)
+    .map_err(|e| SqlError::Internal(e.to_string()))
 }
 
 pub fn read_peer_cursor(
@@ -280,10 +379,34 @@ fn ensure_replication_log(conn: &Connection) -> Result<(), SqlError> {
     .map_err(|e| SqlError::Internal(e.to_string()))
 }
 
+fn ensure_authored_fact_log(conn: &Connection) -> Result<(), SqlError> {
+    conn.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS {AUTHORED_FACT_TABLE} (
+            authored_id TEXT PRIMARY KEY,
+            canonical_seq INTEGER NOT NULL,
+            peer_url TEXT,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_{AUTHORED_FACT_TABLE}_canonical_seq
+            ON {AUTHORED_FACT_TABLE}(canonical_seq, authored_id);"
+    ))
+    .map_err(|e| SqlError::Internal(e.to_string()))
+}
+
 fn replication_log_exists(conn: &Connection) -> Result<bool, SqlError> {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)",
         params![REPLICATION_LOG_TABLE],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|value| value != 0)
+    .map_err(|e| SqlError::Internal(e.to_string()))
+}
+
+fn authored_fact_log_exists(conn: &Connection) -> Result<bool, SqlError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)",
+        params![AUTHORED_FACT_TABLE],
         |row| row.get::<_, i64>(0),
     )
     .map(|value| value != 0)

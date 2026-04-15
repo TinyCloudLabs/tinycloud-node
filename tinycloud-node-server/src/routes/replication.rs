@@ -22,10 +22,10 @@ use tinycloud_core::{
         ReplicationNotifyPollRequest, ReplicationNotifyPollResponse, ReplicationReconcileRequest,
         ReplicationRouteStatus, ReplicationScope, ReplicationService, ReplicationSessionError,
         ReplicationSessionOpenRequest, ReplicationSessionOpenResponse, ReplicationSessionRecord,
-        ReplicationSessionSummary, SqlReplicationApplyResponse, SqlReplicationExportRequest,
-        SqlReplicationExportResponse, SqlReplicationReconcileRequest,
+        ReplicationSessionSummary, SqlReplicationApplyResponse, SqlReplicationAuthoredFact,
+        SqlReplicationExportRequest, SqlReplicationExportResponse, SqlReplicationReconcileRequest,
     },
-    sql::{SqlError, SqlService},
+    sql::{SqlError, SqlNodeMode, SqlService},
     types::Resource,
     util::{Capability, DelegationInfo},
     TxError,
@@ -1386,6 +1386,18 @@ pub async fn sql_replication_export(
         snapshot: export.snapshot,
         changeset: export.changeset,
         change_count: export.change_count,
+        authored_facts: export
+            .authored_facts
+            .into_iter()
+            .map(|fact| SqlReplicationAuthoredFact {
+                authored_id: fact.authored_id,
+                base_canonical_seq: fact.base_canonical_seq,
+                request: fact.request,
+                caveats: fact.caveats,
+                ability: fact.ability,
+            })
+            .collect(),
+        canonicalized_authored_ids: export.canonicalized_authored_ids,
     }))
 }
 
@@ -1416,6 +1428,10 @@ pub async fn sql_reconcile(
         )
     })?;
     let peer_url = request.peer_url.trim_end_matches('/');
+    let local_current_seq = sql_service
+        .current_replication_seq(&space_id, &request.db_name)
+        .await
+        .unwrap_or(0);
     let since_seq = sql_service
         .read_peer_cursor(&space_id, &request.db_name, peer_url)
         .map_err(map_sql_error)?;
@@ -1428,10 +1444,53 @@ pub async fn sql_reconcile(
     )
     .await?;
     let mut applied_snapshot_reason = export.snapshot_reason.clone();
+    let mut should_apply_canonical_export = export.exported_until_seq > local_current_seq;
+    let mut rejected_authored_count = 0usize;
 
-    if export.mode == "changeset" && !export.changeset.is_empty() {
+    if matches!(sql_service.node_mode(), SqlNodeMode::Host) && !export.authored_facts.is_empty() {
+        let authored_facts = export
+            .authored_facts
+            .iter()
+            .map(|fact| tinycloud_core::sql::replication::SqlAuthoredFact {
+                authored_id: fact.authored_id.clone(),
+                base_canonical_seq: fact.base_canonical_seq,
+                request: fact.request.clone(),
+                caveats: fact.caveats.clone(),
+                ability: fact.ability.clone(),
+            })
+            .collect();
+        let authored_apply = sql_service
+            .apply_authored_replication_facts(
+                &space_id,
+                &request.db_name,
+                Some(peer_url.to_string()),
+                authored_facts,
+            )
+            .await
+            .map_err(map_sql_error)?;
+        rejected_authored_count = authored_apply.rejected_count;
+
+        if !authored_apply.canonicalized_authored_ids.is_empty() {
+            export
+                .canonicalized_authored_ids
+                .extend(authored_apply.canonicalized_authored_ids);
+            export.canonicalized_authored_ids.sort();
+            export.canonicalized_authored_ids.dedup();
+        }
+
+        if !should_apply_canonical_export && export.mode == "snapshot" {
+            applied_snapshot_reason = None;
+        }
+    }
+
+    if should_apply_canonical_export && export.mode == "changeset" && !export.changeset.is_empty() {
         if let Err(error) = sql_service
-            .apply_changeset(&space_id, &export.db_name, &export.changeset)
+            .apply_changeset(
+                &space_id,
+                &export.db_name,
+                &export.changeset,
+                export.canonicalized_authored_ids.clone(),
+            )
             .await
         {
             tracing::warn!(
@@ -1450,10 +1509,11 @@ pub async fn sql_reconcile(
             )
             .await?;
             applied_snapshot_reason = Some("changeset-conflict".to_string());
+            should_apply_canonical_export = true;
         }
     }
 
-    if export.mode == "snapshot" {
+    if should_apply_canonical_export && export.mode == "snapshot" {
         if applied_snapshot_reason.is_none() {
             applied_snapshot_reason = export.snapshot_reason.clone();
         }
@@ -1463,6 +1523,7 @@ pub async fn sql_reconcile(
                 &export.db_name,
                 &export.snapshot,
                 applied_snapshot_reason.clone(),
+                export.canonicalized_authored_ids.clone(),
             )
             .await
             .map_err(map_sql_error)?;
@@ -1489,6 +1550,9 @@ pub async fn sql_reconcile(
         changeset_bytes: export.changeset.len(),
         applied_until_seq: Some(export.exported_until_seq),
         change_count: export.change_count,
+        authored_fact_count: export.authored_facts.len(),
+        canonicalized_authored_count: export.canonicalized_authored_ids.len(),
+        rejected_authored_count,
     }))
 }
 
