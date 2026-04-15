@@ -362,3 +362,113 @@ impl SqlService {
             .unwrap_or_else(|| "default".to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::{SqlRequest, SqlResponse, SqlValue};
+    use tempfile::tempdir;
+
+    fn test_space() -> SpaceId {
+        "tinycloud:key:test:default".parse().expect("space id")
+    }
+
+    #[tokio::test]
+    async fn host_canonicalizes_replica_authored_sql_facts() {
+        let tempdir = tempdir().expect("tempdir");
+        let host_path = tempdir.path().join("host");
+        let replica_path = tempdir.path().join("replica");
+        let host = SqlService::new(
+            host_path.to_string_lossy().to_string(),
+            1024 * 1024,
+            SqlNodeMode::Host,
+        );
+        let replica = SqlService::new(
+            replica_path.to_string_lossy().to_string(),
+            1024 * 1024,
+            SqlNodeMode::Replica,
+        );
+        let space = test_space();
+
+        host.execute(
+            &space,
+            "default",
+            SqlRequest::Execute {
+                sql: "CREATE TABLE items (id TEXT PRIMARY KEY, label TEXT NOT NULL)".to_string(),
+                params: vec![],
+                schema: None,
+            },
+            None,
+            "tinycloud.sql/admin".to_string(),
+            SqlReadParams::Canonical,
+        )
+        .await
+        .expect("create table on host");
+
+        let host_snapshot = host.export(&space, "default").await.expect("host snapshot");
+        replica
+            .import(
+                &space,
+                "default",
+                &host_snapshot,
+                Some("initial-sync".to_string()),
+                vec![],
+            )
+            .await
+            .expect("import snapshot to replica");
+
+        replica
+            .execute(
+                &space,
+                "default",
+                SqlRequest::Execute {
+                    sql: "INSERT INTO items (id, label) VALUES (?, ?)".to_string(),
+                    params: vec![SqlValue::Text("item-1".to_string()), SqlValue::Text("camera".to_string())],
+                    schema: None,
+                },
+                None,
+                "tinycloud.sql/admin".to_string(),
+                SqlReadParams::Provisional,
+            )
+            .await
+            .expect("replica provisional insert");
+
+        let export = replica
+            .export_replication(&space, "default", Some(0))
+            .await
+            .expect("replica export");
+        assert_eq!(export.authored_facts.len(), 1);
+
+        let apply = host
+            .apply_authored_replication_facts(
+                &space,
+                "default",
+                Some("https://replica.example".to_string()),
+                export.authored_facts.clone(),
+            )
+            .await
+            .expect("apply authored facts on host");
+        assert_eq!(apply.canonicalized_count, 1);
+        assert_eq!(apply.rejected_count, 0);
+
+        let query = host
+            .execute(
+                &space,
+                "default",
+                SqlRequest::Query {
+                    sql: "SELECT id, label FROM items ORDER BY id".to_string(),
+                    params: vec![],
+                },
+                None,
+                "tinycloud.sql/admin".to_string(),
+                SqlReadParams::Canonical,
+            )
+            .await
+            .expect("query host canonical");
+
+        let SqlResponse::Query(query) = query else {
+            panic!("expected query response");
+        };
+        assert_eq!(query.row_count, 1);
+    }
+}
