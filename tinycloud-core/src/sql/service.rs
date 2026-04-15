@@ -423,7 +423,10 @@ mod tests {
                 "default",
                 SqlRequest::Execute {
                     sql: "INSERT INTO items (id, label) VALUES (?, ?)".to_string(),
-                    params: vec![SqlValue::Text("item-1".to_string()), SqlValue::Text("camera".to_string())],
+                    params: vec![
+                        SqlValue::Text("item-1".to_string()),
+                        SqlValue::Text("camera".to_string()),
+                    ],
                     schema: None,
                 },
                 None,
