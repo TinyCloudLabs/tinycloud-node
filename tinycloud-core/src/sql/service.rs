@@ -9,19 +9,28 @@ use super::{
     replication as sql_replication, storage,
     types::*,
 };
+use crate::types::SqlReadParams;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlNodeMode {
+    Host,
+    Replica,
+}
 
 pub struct SqlService {
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
     base_path: String,
     memory_threshold: u64,
+    mode: SqlNodeMode,
 }
 
 impl SqlService {
-    pub fn new(base_path: String, memory_threshold: u64) -> Self {
+    pub fn new(base_path: String, memory_threshold: u64, mode: SqlNodeMode) -> Self {
         Self {
             databases: Arc::new(DashMap::new()),
             base_path,
             memory_threshold,
+            mode,
         }
     }
 
@@ -32,6 +41,7 @@ impl SqlService {
         request: SqlRequest,
         caveats: Option<SqlCaveats>,
         ability: String,
+        read_params: SqlReadParams,
     ) -> Result<SqlResponse, SqlError> {
         let key = (space.to_string(), db_name.to_string());
         let handle = self
@@ -43,13 +53,19 @@ impl SqlService {
                     db_name.to_string(),
                     self.base_path.clone(),
                     self.memory_threshold,
+                    self.mode,
                     self.databases.clone(),
                 )
             })
             .clone();
 
         match handle
-            .execute(request.clone(), caveats.clone(), ability.clone())
+            .execute(
+                request.clone(),
+                caveats.clone(),
+                ability.clone(),
+                read_params,
+            )
             .await
         {
             Err(SqlError::Internal(ref msg)) if msg.contains("Database actor not available") => {
@@ -65,11 +81,14 @@ impl SqlService {
                             db_name.to_string(),
                             self.base_path.clone(),
                             self.memory_threshold,
+                            self.mode,
                             self.databases.clone(),
                         )
                     })
                     .clone();
-                new_handle.execute(request, caveats, ability).await
+                new_handle
+                    .execute(request, caveats, ability, read_params)
+                    .await
             }
             other => other,
         }

@@ -30,7 +30,7 @@ use tinycloud_core::{
     sea_orm::DbErr,
     sql::{SqlCaveats, SqlError, SqlRequest, SqlService},
     storage::{ImmutableReadStore, ImmutableStaging},
-    types::Resource,
+    types::{Resource, SqlReadParams},
     util::{DelegationInfo, InvocationInfo},
     InvocationOutcome, TransactResult, TxError, TxStoreError,
 };
@@ -567,6 +567,14 @@ async fn handle_sql_invoke(
                         .and_then(|v| serde_json::from_value(v.clone()).ok())
                 })
             });
+    let sql_read_params: SqlReadParams =
+        i.0 .0
+            .invocation
+            .payload()
+            .facts
+            .as_ref()
+            .and_then(|facts| SqlReadParams::from_facts(facts))
+            .unwrap_or_default();
 
     verify_auth(i.0, tinycloud).await?;
     let body_str = read_json_body(data).await?;
@@ -587,7 +595,14 @@ async fn handle_sql_invoke(
     }
 
     let response = sql_service
-        .execute(space, &db_name, sql_request, caveats, ability.clone())
+        .execute(
+            space,
+            &db_name,
+            sql_request,
+            caveats,
+            ability.clone(),
+            sql_read_params,
+        )
         .await
         .map_err(|e| (sql_error_to_status(&e), e.to_string()))?;
 

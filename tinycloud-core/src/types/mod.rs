@@ -7,6 +7,7 @@ mod metadata;
 mod path;
 mod resource;
 mod space_id_wrap;
+mod sql_read_params;
 
 pub use ability::Ability;
 pub use capabilities_read_params::{CapabilitiesReadParams, ListFilters};
@@ -17,3 +18,4 @@ pub use metadata::Metadata;
 pub use path::Path;
 pub use resource::Resource;
 pub use space_id_wrap::SpaceIdWrap;
+pub use sql_read_params::SqlReadParams;

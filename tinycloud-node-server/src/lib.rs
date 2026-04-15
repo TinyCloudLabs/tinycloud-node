@@ -48,7 +48,7 @@ use tinycloud_core::{
     duckdb::DuckDbService,
     keys::{SecretsSetup, StaticSecret},
     sea_orm::{ConnectOptions, Database, DatabaseConnection},
-    sql::SqlService,
+    sql::{SqlNodeMode, SqlService},
     storage::{either::Either, memory::MemoryStaging, StorageConfig},
     ReplicationService, SpaceDatabase,
 };
@@ -213,6 +213,10 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     let sql_service = SqlService::new(
         tinycloud_config.storage.sql.path.clone().expect("resolved"),
         tinycloud_config.storage.sql.memory_threshold.as_u64(),
+        match tinycloud_config.replication.role {
+            ReplicationRole::Host => SqlNodeMode::Host,
+            ReplicationRole::Replica => SqlNodeMode::Replica,
+        },
     );
 
     let duckdb_service = DuckDbService::new(

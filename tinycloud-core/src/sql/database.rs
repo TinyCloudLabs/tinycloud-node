@@ -2,8 +2,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use rusqlite::hooks::{AuthContext, Authorization};
 use rusqlite::session::Session;
+use rusqlite::{
+    hooks::{AuthContext, Authorization},
+    params, Connection,
+};
 use sqlparser::ast::Statement;
 use tokio::sync::{mpsc, oneshot};
 
@@ -11,9 +14,11 @@ use super::{
     authorizer,
     caveats::SqlCaveats,
     parser, replication as sql_replication,
+    service::SqlNodeMode,
     storage::{self, StorageMode},
     types::*,
 };
+use crate::types::SqlReadParams;
 
 const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024; // 10MB
 const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300); // 5 min
@@ -23,6 +28,7 @@ enum DbMessage {
         request: SqlRequest,
         caveats: Option<SqlCaveats>,
         ability: String,
+        read_params: SqlReadParams,
         response_tx: oneshot::Sender<Result<SqlResponse, SqlError>>,
     },
     Export {
@@ -48,12 +54,32 @@ pub struct DatabaseHandle {
     tx: mpsc::Sender<DbMessage>,
 }
 
+struct DatabaseStore {
+    conn: Connection,
+    mode: StorageMode,
+    file_path: PathBuf,
+}
+
+struct ReplicaState {
+    canonical: DatabaseStore,
+    provisional: DatabaseStore,
+    metadata: Connection,
+}
+
+struct PendingSqlFact {
+    fact_id: i64,
+    request: SqlRequest,
+    caveats: Option<SqlCaveats>,
+    ability: String,
+}
+
 impl DatabaseHandle {
     pub async fn execute(
         &self,
         request: SqlRequest,
         caveats: Option<SqlCaveats>,
         ability: String,
+        read_params: SqlReadParams,
     ) -> Result<SqlResponse, SqlError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
@@ -61,6 +87,7 @@ impl DatabaseHandle {
                 request,
                 caveats,
                 ability,
+                read_params,
                 response_tx,
             })
             .await
@@ -132,36 +159,249 @@ impl DatabaseHandle {
     }
 }
 
+impl DatabaseStore {
+    fn open(file_path: PathBuf) -> Result<Self, SqlError> {
+        let mode = if file_path.exists() {
+            StorageMode::File(file_path.clone())
+        } else {
+            StorageMode::InMemory
+        };
+        let conn = storage::open_connection(&mode)?;
+        Ok(Self {
+            conn,
+            mode,
+            file_path,
+        })
+    }
+
+    fn promote_if_needed(&mut self, memory_threshold: u64) -> Result<(), SqlError> {
+        if matches!(self.mode, StorageMode::InMemory)
+            && storage::database_size(&self.conn)? > memory_threshold
+        {
+            let new_conn = storage::promote_to_file(&self.conn, &self.file_path)?;
+            self.conn = new_conn;
+            self.mode = StorageMode::File(self.file_path.clone());
+        }
+        Ok(())
+    }
+
+    fn flush_if_needed(&mut self) -> Result<(), SqlError> {
+        if matches!(self.mode, StorageMode::InMemory) && storage::database_size(&self.conn)? > 0 {
+            let new_conn = storage::promote_to_file(&self.conn, &self.file_path)?;
+            self.conn = new_conn;
+            self.mode = StorageMode::File(self.file_path.clone());
+        }
+        Ok(())
+    }
+}
+
+fn metadata_path(base_path: &str, space_id: &str, db_name: &str) -> PathBuf {
+    PathBuf::from(base_path)
+        .join(space_id)
+        .join(format!("{}.metadata.db", db_name))
+}
+
+fn provisional_path(base_path: &str, space_id: &str, db_name: &str) -> PathBuf {
+    PathBuf::from(base_path)
+        .join(space_id)
+        .join(format!("{}.provisional.db", db_name))
+}
+
+fn canonical_path(base_path: &str, space_id: &str, db_name: &str) -> PathBuf {
+    PathBuf::from(base_path)
+        .join(space_id)
+        .join(format!("{}.db", db_name))
+}
+
+fn open_metadata_connection(path: &PathBuf) -> Result<Connection, SqlError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| SqlError::Internal(e.to_string()))?;
+    }
+    let conn = Connection::open(path).map_err(|e| SqlError::Internal(e.to_string()))?;
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pending_sql_fact (
+            fact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_json TEXT NOT NULL,
+            caveats_json TEXT,
+            ability TEXT NOT NULL,
+            status TEXT NOT NULL,
+            reason TEXT,
+            authored_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            last_attempted_at INTEGER,
+            base_canonical_seq INTEGER
+        );
+        ",
+    )
+    .map_err(|e| SqlError::Internal(e.to_string()))?;
+    Ok(conn)
+}
+
+fn clone_store_from(
+    source: &DatabaseStore,
+    target_path: PathBuf,
+) -> Result<DatabaseStore, SqlError> {
+    let snapshot = storage::export_snapshot(&source.conn)?;
+    let mode = if target_path.exists() {
+        StorageMode::File(target_path.clone())
+    } else {
+        StorageMode::InMemory
+    };
+    let mut conn = storage::open_connection(&mode)?;
+    storage::import_snapshot(&mut conn, &snapshot, matches!(mode, StorageMode::File(_)))?;
+    Ok(DatabaseStore {
+        conn,
+        mode,
+        file_path: target_path,
+    })
+}
+
+fn append_pending_sql_fact(
+    metadata: &Connection,
+    request: &SqlRequest,
+    caveats: &Option<SqlCaveats>,
+    ability: &str,
+    base_canonical_seq: i64,
+) -> Result<i64, SqlError> {
+    let request_json =
+        serde_json::to_string(request).map_err(|e| SqlError::Internal(e.to_string()))?;
+    let caveats_json = caveats
+        .as_ref()
+        .map(|value| serde_json::to_string(value).map_err(|e| SqlError::Internal(e.to_string())))
+        .transpose()?;
+    metadata
+        .execute(
+            "
+            INSERT INTO pending_sql_fact (request_json, caveats_json, ability, status, base_canonical_seq)
+            VALUES (?, ?, ?, 'pending', ?)
+            ",
+            params![request_json, caveats_json, ability, base_canonical_seq],
+        )
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    Ok(metadata.last_insert_rowid())
+}
+
+fn update_pending_sql_fact(
+    metadata: &Connection,
+    fact_id: i64,
+    status: &str,
+    reason: Option<&str>,
+) -> Result<(), SqlError> {
+    metadata
+        .execute(
+            "
+            UPDATE pending_sql_fact
+            SET status = ?, reason = ?, last_attempted_at = unixepoch()
+            WHERE fact_id = ?
+            ",
+            params![status, reason, fact_id],
+        )
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    Ok(())
+}
+
+fn delete_pending_sql_fact(metadata: &Connection, fact_id: i64) -> Result<(), SqlError> {
+    metadata
+        .execute(
+            "DELETE FROM pending_sql_fact WHERE fact_id = ?",
+            params![fact_id],
+        )
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    Ok(())
+}
+
+fn load_replayable_pending_facts(metadata: &Connection) -> Result<Vec<PendingSqlFact>, SqlError> {
+    let mut stmt = metadata
+        .prepare(
+            "
+            SELECT fact_id, request_json, caveats_json, ability
+            FROM pending_sql_fact
+            WHERE status IN ('pending', 'applied', 'rebase_needed')
+            ORDER BY fact_id ASC
+            ",
+        )
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            let fact_id: i64 = row.get(0)?;
+            let request_json: String = row.get(1)?;
+            let caveats_json: Option<String> = row.get(2)?;
+            let ability: String = row.get(3)?;
+            Ok((fact_id, request_json, caveats_json, ability))
+        })
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
+
+    let mut facts = Vec::new();
+    for row in rows {
+        let (fact_id, request_json, caveats_json, ability) =
+            row.map_err(|e| SqlError::Internal(e.to_string()))?;
+        let request =
+            serde_json::from_str(&request_json).map_err(|e| SqlError::Internal(e.to_string()))?;
+        let caveats = caveats_json
+            .as_deref()
+            .map(|json| serde_json::from_str(json).map_err(|e| SqlError::Internal(e.to_string())))
+            .transpose()?;
+        facts.push(PendingSqlFact {
+            fact_id,
+            request,
+            caveats,
+            ability,
+        });
+    }
+
+    Ok(facts)
+}
+
 pub fn spawn_actor(
     space_id: String,
     db_name: String,
     base_path: String,
     memory_threshold: u64,
+    node_mode: SqlNodeMode,
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
 ) -> DatabaseHandle {
     let (tx, mut rx) = mpsc::channel::<DbMessage>(32);
 
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Handle::current();
-        let file_path = PathBuf::from(&base_path)
-            .join(&space_id)
-            .join(format!("{}.db", db_name));
-
-        // Check if file already exists -- if so, open from file
-        let mut mode = if file_path.exists() {
-            StorageMode::File(file_path.clone())
+        let mut host_store = if matches!(node_mode, SqlNodeMode::Host) {
+            Some(
+                DatabaseStore::open(canonical_path(&base_path, &space_id, &db_name))
+                    .expect("Failed to open SQL host database"),
+            )
         } else {
-            StorageMode::InMemory
+            None
         };
-        let mut conn = storage::open_connection(&mode).expect("Failed to open database");
+        let mut replica_state = if matches!(node_mode, SqlNodeMode::Replica) {
+            let canonical = DatabaseStore::open(canonical_path(&base_path, &space_id, &db_name))
+                .expect("Failed to open SQL canonical database");
+            let provisional_path = provisional_path(&base_path, &space_id, &db_name);
+            let provisional = if provisional_path.exists() {
+                DatabaseStore::open(provisional_path)
+                    .expect("Failed to open SQL provisional database")
+            } else {
+                clone_store_from(&canonical, provisional_path)
+                    .expect("Failed to initialize SQL provisional database")
+            };
+            let metadata =
+                open_metadata_connection(&metadata_path(&base_path, &space_id, &db_name))
+                    .expect("Failed to open SQL metadata database");
+            Some(ReplicaState {
+                canonical,
+                provisional,
+                metadata,
+            })
+        } else {
+            None
+        };
 
         loop {
-            // Block on receiving with timeout
             let msg =
                 match rt.block_on(async { tokio::time::timeout(IDLE_TIMEOUT, rx.recv()).await }) {
                     Ok(Some(msg)) => msg,
-                    Ok(None) => break, // Channel closed
-                    Err(_) => break,   // Idle timeout
+                    Ok(None) => break,
+                    Err(_) => break,
                 };
 
             match msg {
@@ -169,22 +409,46 @@ pub fn spawn_actor(
                     request,
                     caveats,
                     ability,
+                    read_params,
                     response_tx,
                 } => {
-                    let result = handle_message(&conn, &request, &caveats, &ability);
+                    let result = match node_mode {
+                        SqlNodeMode::Host => handle_message(
+                            &host_store.as_ref().expect("host store").conn,
+                            &request,
+                            &caveats,
+                            &ability,
+                            read_params,
+                        ),
+                        SqlNodeMode::Replica => handle_replica_message(
+                            replica_state.as_mut().expect("replica state"),
+                            &request,
+                            &caveats,
+                            &ability,
+                            read_params,
+                        ),
+                    };
 
-                    // Post-write promotion check
-                    if result.is_ok() && matches!(mode, StorageMode::InMemory) {
-                        if let Ok(size) = storage::database_size(&conn) {
-                            if size > memory_threshold {
-                                match storage::promote_to_file(&conn, &file_path) {
-                                    Ok(new_conn) => {
-                                        conn = new_conn;
-                                        mode = StorageMode::File(file_path.clone());
-                                        tracing::info!(space=%space_id, db=%db_name, "Promoted database to file storage");
+                    if result.is_ok() {
+                        match node_mode {
+                            SqlNodeMode::Host => {
+                                if let Some(store) = host_store.as_mut() {
+                                    if let Err(error) = store.promote_if_needed(memory_threshold) {
+                                        tracing::error!(space=%space_id, db=%db_name, error=%error, "Failed to promote SQL host database");
                                     }
-                                    Err(e) => {
-                                        tracing::error!(space=%space_id, db=%db_name, error=%e, "Failed to promote database to file");
+                                }
+                            }
+                            SqlNodeMode::Replica => {
+                                if let Some(state) = replica_state.as_mut() {
+                                    if let Err(error) =
+                                        state.canonical.promote_if_needed(memory_threshold)
+                                    {
+                                        tracing::error!(space=%space_id, db=%db_name, error=%error, "Failed to promote SQL canonical database");
+                                    }
+                                    if let Err(error) =
+                                        state.provisional.promote_if_needed(memory_threshold)
+                                    {
+                                        tracing::error!(space=%space_id, db=%db_name, error=%error, "Failed to promote SQL provisional database");
                                     }
                                 }
                             }
@@ -194,14 +458,38 @@ pub fn spawn_actor(
                     let _ = response_tx.send(result);
                 }
                 DbMessage::Export { response_tx } => {
-                    let result = handle_export(&conn);
+                    let result = match node_mode {
+                        SqlNodeMode::Host => {
+                            handle_export(&host_store.as_ref().expect("host store").conn)
+                        }
+                        SqlNodeMode::Replica => handle_export(
+                            &replica_state
+                                .as_ref()
+                                .expect("replica state")
+                                .canonical
+                                .conn,
+                        ),
+                    };
                     let _ = response_tx.send(result);
                 }
                 DbMessage::ExportReplication {
                     since_seq,
                     response_tx,
                 } => {
-                    let result = handle_export_replication(&conn, since_seq);
+                    let result = match node_mode {
+                        SqlNodeMode::Host => handle_export_replication(
+                            &host_store.as_ref().expect("host store").conn,
+                            since_seq,
+                        ),
+                        SqlNodeMode::Replica => handle_export_replication(
+                            &replica_state
+                                .as_ref()
+                                .expect("replica state")
+                                .canonical
+                                .conn,
+                            since_seq,
+                        ),
+                    };
                     let _ = response_tx.send(result);
                 }
                 DbMessage::Import {
@@ -209,37 +497,62 @@ pub fn spawn_actor(
                     snapshot_reason,
                     response_tx,
                 } => {
-                    let result = handle_import(
-                        &mut conn,
-                        &mut mode,
-                        &file_path,
-                        memory_threshold,
-                        &snapshot,
-                        snapshot_reason.as_deref(),
-                    );
+                    let result = match node_mode {
+                        SqlNodeMode::Host => {
+                            let store = host_store.as_mut().expect("host store");
+                            handle_import(
+                                &mut store.conn,
+                                &mut store.mode,
+                                &store.file_path,
+                                memory_threshold,
+                                &snapshot,
+                                snapshot_reason.as_deref(),
+                            )
+                        }
+                        SqlNodeMode::Replica => handle_replica_import(
+                            replica_state.as_mut().expect("replica state"),
+                            memory_threshold,
+                            &snapshot,
+                            snapshot_reason.as_deref(),
+                        ),
+                    };
                     let _ = response_tx.send(result);
                 }
                 DbMessage::ApplyChangeset {
                     changeset,
                     response_tx,
                 } => {
-                    let result = handle_apply_changeset(&conn, &changeset);
+                    let result = match node_mode {
+                        SqlNodeMode::Host => handle_apply_changeset(
+                            &host_store.as_ref().expect("host store").conn,
+                            &changeset,
+                        ),
+                        SqlNodeMode::Replica => handle_replica_apply_changeset(
+                            replica_state.as_mut().expect("replica state"),
+                            memory_threshold,
+                            &changeset,
+                        ),
+                    };
                     let _ = response_tx.send(result);
                 }
             }
         }
 
-        // Flush in-memory database to file before shutdown so data is not lost
-        if matches!(mode, StorageMode::InMemory) {
-            if let Ok(size) = storage::database_size(&conn) {
-                if size > 0 {
-                    match storage::promote_to_file(&conn, &file_path) {
-                        Ok(_) => {
-                            tracing::info!(space=%space_id, db=%db_name, "Flushed in-memory database to file on shutdown");
-                        }
-                        Err(e) => {
-                            tracing::error!(space=%space_id, db=%db_name, error=%e, "Failed to flush in-memory database on shutdown");
-                        }
+        match node_mode {
+            SqlNodeMode::Host => {
+                if let Some(store) = host_store.as_mut() {
+                    if let Err(error) = store.flush_if_needed() {
+                        tracing::error!(space=%space_id, db=%db_name, error=%error, "Failed to flush SQL host database on shutdown");
+                    }
+                }
+            }
+            SqlNodeMode::Replica => {
+                if let Some(state) = replica_state.as_mut() {
+                    if let Err(error) = state.canonical.flush_if_needed() {
+                        tracing::error!(space=%space_id, db=%db_name, error=%error, "Failed to flush SQL canonical database on shutdown");
+                    }
+                    if let Err(error) = state.provisional.flush_if_needed() {
+                        tracing::error!(space=%space_id, db=%db_name, error=%error, "Failed to flush SQL provisional database on shutdown");
                     }
                 }
             }
@@ -292,11 +605,276 @@ fn handle_apply_changeset(conn: &rusqlite::Connection, changeset: &[u8]) -> Resu
     Ok(())
 }
 
+fn rebuild_replica_provisional_from_canonical(state: &mut ReplicaState) -> Result<(), SqlError> {
+    let snapshot = storage::export_snapshot(&state.canonical.conn)?;
+    storage::import_snapshot(
+        &mut state.provisional.conn,
+        &snapshot,
+        matches!(state.provisional.mode, StorageMode::File(_)),
+    )?;
+
+    for fact in load_replayable_pending_facts(&state.metadata)? {
+        let result = handle_message_local(
+            &state.provisional.conn,
+            &state.provisional.conn,
+            &fact.request,
+            &fact.caveats,
+            &fact.ability,
+        );
+
+        match result {
+            Ok(_) => update_pending_sql_fact(&state.metadata, fact.fact_id, "applied", None)?,
+            Err(error) => update_pending_sql_fact(
+                &state.metadata,
+                fact.fact_id,
+                "rebase_needed",
+                Some(&error.to_string()),
+            )?,
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_replica_import(
+    state: &mut ReplicaState,
+    memory_threshold: u64,
+    snapshot: &[u8],
+    snapshot_reason: Option<&str>,
+) -> Result<(), SqlError> {
+    handle_import(
+        &mut state.canonical.conn,
+        &mut state.canonical.mode,
+        &state.canonical.file_path,
+        memory_threshold,
+        snapshot,
+        snapshot_reason,
+    )?;
+    rebuild_replica_provisional_from_canonical(state)
+}
+
+fn handle_replica_apply_changeset(
+    state: &mut ReplicaState,
+    memory_threshold: u64,
+    changeset: &[u8],
+) -> Result<(), SqlError> {
+    handle_apply_changeset(&state.canonical.conn, changeset)?;
+    state.canonical.promote_if_needed(memory_threshold)?;
+    rebuild_replica_provisional_from_canonical(state)
+}
+
+fn execute_statement_without_replication(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: &[SqlValue],
+) -> Result<ExecuteResponse, SqlError> {
+    execute_statement(conn, sql, params)
+}
+
+fn execute_batch_without_replication(
+    conn: &rusqlite::Connection,
+    statements: &[SqlStatement],
+) -> Result<BatchResponse, SqlError> {
+    let mut results = Vec::with_capacity(statements.len());
+    for stmt in statements {
+        results.push(execute_statement(conn, &stmt.sql, &stmt.params)?);
+    }
+    Ok(BatchResponse { results })
+}
+
+fn handle_message_local(
+    read_conn: &rusqlite::Connection,
+    write_conn: &rusqlite::Connection,
+    request: &SqlRequest,
+    caveats: &Option<SqlCaveats>,
+    ability: &str,
+) -> Result<SqlResponse, SqlError> {
+    let is_admin = matches!(ability, "tinycloud.sql/admin" | "tinycloud.sql/*");
+
+    match request {
+        SqlRequest::Query { sql, params } => {
+            parser::validate_sql(sql, caveats, ability)?;
+
+            let auth =
+                authorizer::create_authorizer(caveats.clone(), ability.to_string(), is_admin);
+            read_conn.authorizer(Some(auth));
+
+            let result = execute_query(read_conn, sql, params);
+
+            read_conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+
+            result.map(SqlResponse::Query)
+        }
+        SqlRequest::Execute {
+            sql,
+            params,
+            schema,
+        } => {
+            if let Some(schema_stmts) = schema {
+                for stmt_sql in schema_stmts {
+                    parser::validate_sql(stmt_sql, caveats, ability)?;
+                    let auth = authorizer::create_authorizer(
+                        caveats.clone(),
+                        ability.to_string(),
+                        is_admin,
+                    );
+                    write_conn.authorizer(Some(auth));
+                    write_conn
+                        .execute_batch(stmt_sql)
+                        .map_err(|e| SqlError::SchemaError(e.to_string()))?;
+                    write_conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+                }
+            }
+
+            let parsed_query = parser::validate_sql(sql, caveats, ability)?;
+            let auth =
+                authorizer::create_authorizer(caveats.clone(), ability.to_string(), is_admin);
+            write_conn.authorizer(Some(auth));
+
+            let result = if parsed_query.is_read_only {
+                execute_query(read_conn, sql, params).map(SqlResponse::Query)
+            } else {
+                execute_statement_without_replication(write_conn, sql, params)
+                    .map(SqlResponse::Execute)
+            };
+
+            write_conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+
+            result
+        }
+        SqlRequest::Batch { statements } => {
+            let parsed_queries = statements
+                .iter()
+                .map(|stmt| parser::validate_sql(&stmt.sql, caveats, ability))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let auth =
+                authorizer::create_authorizer(caveats.clone(), ability.to_string(), is_admin);
+            write_conn.authorizer(Some(auth));
+
+            let result = if parsed_queries.iter().any(|query| query.is_read_only) {
+                Err(SqlError::ReadOnlyViolation)
+            } else {
+                execute_batch_without_replication(write_conn, statements).map(SqlResponse::Batch)
+            };
+
+            write_conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+
+            result
+        }
+        SqlRequest::ExecuteStatement { name, params } => {
+            let caveats_ref = caveats
+                .as_ref()
+                .ok_or_else(|| SqlError::InvalidStatement("No caveats found".to_string()))?;
+            let prepared = caveats_ref.find_statement(name).ok_or_else(|| {
+                SqlError::InvalidStatement(format!("Statement '{}' not found", name))
+            })?;
+
+            let parsed_query = parser::validate_sql(&prepared.sql, caveats, ability)?;
+            let auth =
+                authorizer::create_authorizer(caveats.clone(), ability.to_string(), is_admin);
+            let target_conn = if parsed_query.is_read_only {
+                read_conn
+            } else {
+                write_conn
+            };
+            target_conn.authorizer(Some(auth));
+
+            let result = if parsed_query.is_read_only {
+                execute_query(read_conn, &prepared.sql, params).map(SqlResponse::Query)
+            } else {
+                execute_statement_without_replication(write_conn, &prepared.sql, params)
+                    .map(SqlResponse::Execute)
+            };
+
+            target_conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+            result
+        }
+        SqlRequest::Export => Err(SqlError::Internal(
+            "Export should be handled by service".to_string(),
+        )),
+    }
+}
+
+fn execute_statement_requires_local_write(
+    request: &SqlRequest,
+    caveats: &Option<SqlCaveats>,
+    ability: &str,
+) -> Result<bool, SqlError> {
+    match request {
+        SqlRequest::Query { .. } | SqlRequest::Export => Ok(false),
+        SqlRequest::Execute { sql, .. } => {
+            let parsed = parser::validate_sql(sql, caveats, ability)?;
+            Ok(!parsed.is_read_only)
+        }
+        SqlRequest::Batch { statements } => Ok(!statements.is_empty()),
+        SqlRequest::ExecuteStatement { name, .. } => {
+            let caveats_ref = caveats
+                .as_ref()
+                .ok_or_else(|| SqlError::InvalidStatement("No caveats found".to_string()))?;
+            let prepared = caveats_ref.find_statement(name).ok_or_else(|| {
+                SqlError::InvalidStatement(format!("Statement '{}' not found", name))
+            })?;
+            let parsed = parser::validate_sql(&prepared.sql, caveats, ability)?;
+            Ok(!parsed.is_read_only)
+        }
+    }
+}
+
+fn handle_replica_message(
+    state: &mut ReplicaState,
+    request: &SqlRequest,
+    caveats: &Option<SqlCaveats>,
+    ability: &str,
+    read_params: SqlReadParams,
+) -> Result<SqlResponse, SqlError> {
+    let read_conn = if read_params.uses_provisional() {
+        &state.provisional.conn
+    } else {
+        &state.canonical.conn
+    };
+
+    if !execute_statement_requires_local_write(request, caveats, ability)? {
+        return handle_message_local(
+            read_conn,
+            &state.provisional.conn,
+            request,
+            caveats,
+            ability,
+        );
+    }
+
+    let base_canonical_seq = sql_replication::current_replication_seq(&state.canonical.conn)?;
+    let fact_id = append_pending_sql_fact(
+        &state.metadata,
+        request,
+        caveats,
+        ability,
+        base_canonical_seq,
+    )?;
+
+    let result = handle_message_local(
+        read_conn,
+        &state.provisional.conn,
+        request,
+        caveats,
+        ability,
+    );
+
+    match &result {
+        Ok(_) => update_pending_sql_fact(&state.metadata, fact_id, "applied", None)?,
+        Err(_) => delete_pending_sql_fact(&state.metadata, fact_id)?,
+    }
+
+    result
+}
+
 fn handle_message(
     conn: &rusqlite::Connection,
     request: &SqlRequest,
     caveats: &Option<SqlCaveats>,
     ability: &str,
+    _read_params: SqlReadParams,
 ) -> Result<SqlResponse, SqlError> {
     let is_admin = matches!(ability, "tinycloud.sql/admin" | "tinycloud.sql/*");
 
@@ -321,7 +899,6 @@ fn handle_message(
         } => {
             let schema_present = schema.is_some();
 
-            // Schema init
             if let Some(schema_stmts) = schema {
                 for stmt_sql in schema_stmts {
                     parser::validate_sql(stmt_sql, caveats, ability)?;
@@ -513,11 +1090,11 @@ fn row_to_sql_value(row: &rusqlite::Row, idx: usize) -> Result<SqlValue, SqlErro
 
 fn estimate_value_size(val: &SqlValue) -> usize {
     match val {
-        SqlValue::Null => 4,       // "null"
-        SqlValue::Integer(_) => 8, // up to 20 digits
+        SqlValue::Null => 4,
+        SqlValue::Integer(_) => 8,
         SqlValue::Real(_) => 8,
-        SqlValue::Text(s) => s.len() + 2, // quotes
-        SqlValue::Blob(b) => b.len() * 2, // hex encoding overhead
+        SqlValue::Text(s) => s.len() + 2,
+        SqlValue::Blob(b) => b.len() * 2,
     }
 }
 

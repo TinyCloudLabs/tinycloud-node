@@ -8,7 +8,7 @@ pub mod storage;
 pub mod types;
 
 pub use caveats::SqlCaveats;
-pub use service::SqlService;
+pub use service::{SqlNodeMode, SqlService};
 pub use types::{
     BatchResponse, ExecuteResponse, QueryResponse, SqlError, SqlRequest, SqlResponse, SqlValue,
 };
