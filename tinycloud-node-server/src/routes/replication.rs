@@ -1447,42 +1447,6 @@ pub async fn sql_reconcile(
     let mut should_apply_canonical_export = export.exported_until_seq > local_current_seq;
     let mut rejected_authored_count = 0usize;
 
-    if matches!(sql_service.node_mode(), SqlNodeMode::Host) && !export.authored_facts.is_empty() {
-        let authored_facts = export
-            .authored_facts
-            .iter()
-            .map(|fact| tinycloud_core::sql::replication::SqlAuthoredFact {
-                authored_id: fact.authored_id.clone(),
-                base_canonical_seq: fact.base_canonical_seq,
-                request: fact.request.clone(),
-                caveats: fact.caveats.clone(),
-                ability: fact.ability.clone(),
-            })
-            .collect();
-        let authored_apply = sql_service
-            .apply_authored_replication_facts(
-                &space_id,
-                &request.db_name,
-                Some(peer_url.to_string()),
-                authored_facts,
-            )
-            .await
-            .map_err(map_sql_error)?;
-        rejected_authored_count = authored_apply.rejected_count;
-
-        if !authored_apply.canonicalized_authored_ids.is_empty() {
-            export
-                .canonicalized_authored_ids
-                .extend(authored_apply.canonicalized_authored_ids);
-            export.canonicalized_authored_ids.sort();
-            export.canonicalized_authored_ids.dedup();
-        }
-
-        if !should_apply_canonical_export && export.mode == "snapshot" {
-            applied_snapshot_reason = None;
-        }
-    }
-
     if should_apply_canonical_export && export.mode == "changeset" && !export.changeset.is_empty() {
         if let Err(error) = sql_service
             .apply_changeset(
@@ -1529,6 +1493,38 @@ pub async fn sql_reconcile(
             .map_err(map_sql_error)?;
     } else {
         applied_snapshot_reason = None;
+    }
+
+    if matches!(sql_service.node_mode(), SqlNodeMode::Host) && !export.authored_facts.is_empty() {
+        let authored_facts = export
+            .authored_facts
+            .iter()
+            .map(|fact| tinycloud_core::sql::replication::SqlAuthoredFact {
+                authored_id: fact.authored_id.clone(),
+                base_canonical_seq: fact.base_canonical_seq,
+                request: fact.request.clone(),
+                caveats: fact.caveats.clone(),
+                ability: fact.ability.clone(),
+            })
+            .collect();
+        let authored_apply = sql_service
+            .apply_authored_replication_facts(
+                &space_id,
+                &request.db_name,
+                Some(peer_url.to_string()),
+                authored_facts,
+            )
+            .await
+            .map_err(map_sql_error)?;
+        rejected_authored_count = authored_apply.rejected_count;
+
+        if !authored_apply.canonicalized_authored_ids.is_empty() {
+            export
+                .canonicalized_authored_ids
+                .extend(authored_apply.canonicalized_authored_ids);
+            export.canonicalized_authored_ids.sort();
+            export.canonicalized_authored_ids.dedup();
+        }
     }
 
     sql_service
