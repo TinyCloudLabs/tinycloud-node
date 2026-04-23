@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.3.0] - 2026-04-10
+
+- Add `parseRecapFromSiwe` WASM export that parses a signed SIWE message and returns its recap capabilities as `{ service, space, path, actions }` entries. This is the inverse of the recap encoding done during session preparation and enables the SDK layer to perform capability subset checks for session-key-signed delegations (capability chain delegation).
+- Add write-hooks support through Phase 4 for KV, SQL, and DuckDB, including SSE subscriptions plus webhook CRUD and durable delivery paths.
+
 ## [1.2.1] - 2026-03-17
 
 - Fix SQL data loss: flush in-memory databases to file on actor shutdown.
