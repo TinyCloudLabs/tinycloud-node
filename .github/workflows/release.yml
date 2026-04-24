@@ -1,60 +1,99 @@
+# cargo-dist release workflow
+# Triggered when release-plz pushes a version tag (e.g., v1.3.1)
+# Builds binaries for all targets and uploads to GitHub Releases
+
 name: Release
+
+permissions:
+  contents: write
 
 on:
   push:
-    branches: [main]
+    tags:
+      - 'v[0-9]+.*'
 
 jobs:
-  release:
-    name: Version & Release
+  # Create the GitHub Release so that build jobs can upload to it
+  create-release:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
-      - name: Checkout
+      - name: Get tag
+        id: tag
+        run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+
+  # Build binaries for each target
+  build:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+
+    runs-on: ${{ matrix.os }}
+    env:
+      ARCHIVE_NAME: tinycloud-node-server-${{ matrix.target }}
+    steps:
+      - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          fetch-depth: 0
+          targets: ${{ matrix.target }}
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Install changesets CLI
-        run: npm install -g @changesets/cli
-
-      - name: Check for changesets
-        id: check
+      - name: Install cross-compilation tools (aarch64-linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
-          # Count changeset files (excluding README.md and config.json)
-          COUNT=$(find .changeset -name '*.md' ! -name 'README.md' | wc -l)
-          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
 
-      - name: Create Release PR
-        if: steps.check.outputs.count != '0'
-        uses: changesets/action@v1
-        with:
-          version: node .github/scripts/version-cargo.mjs
-          commit: "chore: version packages"
-          title: "chore: version packages"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }} -p tinycloud-node-server
 
-      - name: Create GitHub Release on version merge
-        if: steps.check.outputs.count == '0'
+      - name: Package binary (unix)
         run: |
-          # If no changesets remain, check if Cargo.toml version changed in this push
-          VERSION=$(grep '^version' tinycloud-node-server/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          TAG="v$VERSION"
-          if ! git tag -l "$TAG" | grep -q "$TAG"; then
-            echo "Creating release $TAG"
-            gh release create "$TAG" \
-              --title "$TAG" \
-              --generate-notes
+          mkdir -p "$ARCHIVE_NAME"
+          cp "target/${{ matrix.target }}/release/tinycloud" "$ARCHIVE_NAME/"
+          cp LICENSE.md README.md CHANGELOG.md "$ARCHIVE_NAME/" 2>/dev/null || true
+          tar czf "$ARCHIVE_NAME.tar.gz" "$ARCHIVE_NAME"
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag }}
+          files: |
+            ${{ env.ARCHIVE_NAME }}.tar.gz
+
+  # Announce completion after all builds succeed
+  publish-complete:
+    needs: [create-release, build]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Report status
+        run: |
+          if [ "${{ needs.build.result }}" = "success" ]; then
+            echo "All release artifacts uploaded successfully for ${{ needs.create-release.outputs.tag }}"
           else
-            echo "Tag $TAG already exists, skipping release"
+            echo "Some builds failed — check the workflow run for details"
+            exit 1
           fi
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
