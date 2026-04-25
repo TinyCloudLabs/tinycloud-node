@@ -4,8 +4,8 @@ release_commits = "^(feat|fix|chore|refactor|perf|docs|ci|test)(\\(.*\\))?!?:"
 
 # Only release the server binary — internal crates are not published
 [[package]]
-name = "tinycloud-node-server"
-publish = false          # Don't publish to crates.io
+name = "tinycloud-node"
+publish = true
 git_release_enable = true
 git_tag_enable = true
 git_tag_name = "v{{ version }}"
