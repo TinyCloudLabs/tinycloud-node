@@ -95,3 +95,33 @@ jobs:
           build-args: CARGO_FEATURES=dstack
           cache-from: type=gha,scope=dstack
           cache-to: type=gha,mode=max,scope=dstack
+
+  deploy-phala:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'release'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Phala CLI
+        run: npm install -g phala
+
+      - name: Update compose with release tag
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          # metadata-action emits {{version}} without the leading v (e.g. 1.3.0).
+          # Strip a leading v from the tag to match the pushed image tag.
+          VERSION="${TAG#v}"
+          sed -i "s|ghcr.io/tinycloudlabs/tinycloud-node:latest|ghcr.io/tinycloudlabs/tinycloud-node:${VERSION}|g" docker-compose.yml
+          echo "Resolved image tag: ghcr.io/tinycloudlabs/tinycloud-node:${VERSION}"
+          cat docker-compose.yml
+
+      - name: Deploy to Phala Cloud
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+        run: phala deploy -c docker-compose.yml -n tinycloud-node --wait

@@ -1,0 +1,29 @@
+# Phala Cloud deployment for tinycloud-node
+#
+# This file is consumed by the Phala Cloud CLI (`phala deploy`) on every
+# tagged GitHub release. The release workflow rewrites the image tag to
+# match the released version before deploying.
+#
+# Sensitive values (TINYCLOUD_KEYS_SECRET) must be supplied via the Phala
+# CVM's encrypted secrets store, not committed to this file.
+
+services:
+  tinycloud-node:
+    image: ${DOCKER_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-node:latest}
+    ports:
+      - "8000:8000"
+      - "8001:8001"
+      - "8081:8081"
+    environment:
+      - TINYCLOUD_LOG_LEVEL=${TINYCLOUD_LOG_LEVEL:-info}
+      - TINYCLOUD_PORT=8000
+      - TINYCLOUD_STORAGE_DATADIR=/app/data
+      - TINYCLOUD_STORAGE_DATABASE=sqlite:/app/data/caps.db?mode=rwc
+      - TINYCLOUD_KEYS_SECRET=${TINYCLOUD_KEYS_SECRET}
+      - ROCKET_ADDRESS=0.0.0.0
+    volumes:
+      - tinycloud-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  tinycloud-data:
