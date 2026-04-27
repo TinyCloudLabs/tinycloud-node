@@ -1,4 +1,5 @@
 [workspace]
+resolver = "2"
 
 members = [
     "tinycloud-auth",
@@ -64,7 +65,7 @@ targets = [
     "aarch64-apple-darwin",
 ]
 # Installers to generate
-installers = []
+installers = ["shell", "powershell"]
 # Whether to auto-include README/LICENSE/CHANGELOG
 auto-includes = true
 # Enable cargo-binstall support (generates binstall metadata in GitHub releases)
