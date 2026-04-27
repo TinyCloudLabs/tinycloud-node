@@ -15,7 +15,7 @@ services:
       TINYCLOUD_STORAGE_DATABASE: "postgres://tinycloud:tinycloud@postgres:5432/tinycloud"
       TINYCLOUD_STORAGE_BLOCKS_TYPE: Local
       TINYCLOUD_STORAGE_BLOCKS_PATH: /data/blocks
-      TINYCLOUD_LOG_LEVEL: info
+      TINYCLOUD_LOG_LEVEL: normal
       TINYCLOUD_CORS: "true"
       ROCKET_ADDRESS: "0.0.0.0"
     depends_on:
