@@ -34,10 +34,6 @@ jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
-    # Only run when a release PR is merged (detects version bump commits)
-    if: >
-      github.event_name == 'push' &&
-      startsWith(github.event.head_commit.message, 'chore(release)')
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
