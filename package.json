@@ -1,15 +1,9 @@
 {
   "name": "tinycloud-node",
   "private": true,
-  "description": "TinyCloud Protocol Node - Rust server with changesets for versioning",
+  "description": "TinyCloud Protocol Node",
   "scripts": {
-    "changeset": "changeset",
-    "changeset:add": "changeset add",
-    "version": "node scripts/apply-changesets.mjs",
     "release": "cargo build --release"
-  },
-  "devDependencies": {
-    "@changesets/cli": "^2.27.1"
   },
   "dependencies": {
     "zod": "3.22.4",

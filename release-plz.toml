@@ -1,0 +1,48 @@
+[workspace]
+# Create a single release PR for the whole workspace
+release_commits = "^(feat|fix|chore|refactor|perf|docs|ci|test)(\\(.*\\))?!?:"
+
+# Only release the server binary — internal crates are not published
+[[package]]
+name = "tinycloud-node"
+publish = true
+git_release_enable = true
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+changelog_include = ["tinycloud-core", "tinycloud-auth"]
+
+# Internal crates — skip release
+[[package]]
+name = "tinycloud-core"
+release = false
+publish = false
+
+[[package]]
+name = "tinycloud-auth"
+release = false
+publish = false
+
+[[package]]
+name = "tinycloud-sdk-rs"
+release = false
+publish = false
+
+[[package]]
+name = "tinycloud-sdk-wasm"
+release = false
+publish = false
+
+[[package]]
+name = "siwe"
+release = false
+publish = false
+
+[[package]]
+name = "siwe-recap"
+release = false
+publish = false
+
+[[package]]
+name = "cacaos"
+release = false
+publish = false

@@ -32,7 +32,7 @@ COPY --from=planner /app/ ./
 RUN chmod +x ./scripts/init-tinycloud-data.sh && ./scripts/init-tinycloud-data.sh
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release -p tinycloud-node-server ${CARGO_FEATURES:+--features $CARGO_FEATURES} && \
+    cargo build --release -p tinycloud-node ${CARGO_FEATURES:+--features $CARGO_FEATURES} && \
     cp /app/target/release/tinycloud /app/tinycloud
 RUN addgroup -g 1000 tinycloud && adduser -u 1000 -G tinycloud -s /bin/sh -D tinycloud
 RUN mkdir -p /scratch-tmp && chmod 1777 /scratch-tmp
