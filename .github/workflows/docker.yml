@@ -98,7 +98,7 @@ jobs:
 
   deploy-phala:
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, build-dstack]
     if: github.event_name == 'release'
     steps:
       - uses: actions/checkout@v4
@@ -117,11 +117,17 @@ jobs:
           # metadata-action emits {{version}} without the leading v (e.g. 1.3.0).
           # Strip a leading v from the tag to match the pushed image tag.
           VERSION="${TAG#v}"
-          sed -i "s|ghcr.io/tinycloudlabs/tinycloud-node:latest|ghcr.io/tinycloudlabs/tinycloud-node:${VERSION}|g" docker-compose.yml
-          echo "Resolved image tag: ghcr.io/tinycloudlabs/tinycloud-node:${VERSION}"
-          cat docker-compose.yml
+          # The prod CVM uses the dstack-suffixed image. Replace the floating
+          # ":dstack" tag in the checked-in compose with the versioned tag
+          # built by the build-dstack job (e.g. ":1.3.0-dstack").
+          sed -i "s|ghcr.io/tinycloudlabs/tinycloud-node:dstack|ghcr.io/tinycloudlabs/tinycloud-node:${VERSION}-dstack|g" docker-compose.dstack-postgres.yaml
+          echo "Resolved image tag: ghcr.io/tinycloudlabs/tinycloud-node:${VERSION}-dstack"
+          cat docker-compose.dstack-postgres.yaml
 
       - name: Deploy to Phala Cloud
         env:
           PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
-        run: phala deploy -c docker-compose.yml -n tinycloud-node --wait
+        # Update the existing prod CVM (name: tinycloud-node) in the
+        # Tiny Cloud workspace. The PHALA_CLOUD_API_KEY secret is
+        # workspace-scoped and must be issued from that workspace.
+        run: phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml --wait
