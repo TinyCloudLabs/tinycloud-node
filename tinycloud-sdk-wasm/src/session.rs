@@ -30,6 +30,8 @@ use tinycloud_auth::{
 };
 use tinycloud_sdk_rs::authorization::DelegationHeaders;
 
+type AbilitiesMap = HashMap<Service, HashMap<Path, Vec<Ability>>>;
+
 #[serde_as]
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -39,7 +41,13 @@ pub struct SessionConfig {
     // Note: Actions use ReCap ability namespace format (e.g., "tinycloud.kv/get" where
     // "tinycloud.kv" is the ability namespace). This is distinct from the TinyCloud user
     // Space (data container) referenced by space_id below.
-    pub abilities: HashMap<Service, HashMap<Path, Vec<Ability>>>,
+    pub abilities: AbilitiesMap,
+    /// Optional per-space abilities map. When present, this replaces the
+    /// legacy "primary space + additional spaces all share abilities" shape
+    /// and allows one SIWE to request different capabilities in different
+    /// spaces.
+    #[serde(default)]
+    pub space_abilities: Option<HashMap<SpaceId, AbilitiesMap>>,
     #[serde(with = "tinycloud_sdk_rs::serde_siwe::address")]
     pub address: [u8; 20],
     pub chain_id: u64,
@@ -121,38 +129,49 @@ impl SessionConfig {
     fn into_message(self, delegate: &str) -> Result<Message, String> {
         use serde_json::Value;
 
-        // Collect all spaces: primary + additional
-        let mut all_spaces = vec![self.space_id.clone()];
-        if let Some(ref additional) = self.additional_spaces {
-            for space_id in additional.values() {
-                all_spaces.push(space_id.clone());
+        let space_abilities = match &self.space_abilities {
+            Some(explicit) => explicit.clone(),
+            None => {
+                // Legacy shape: collect all spaces and apply the same
+                // abilities map to each one.
+                let mut all_spaces = vec![self.space_id.clone()];
+                if let Some(ref additional) = self.additional_spaces {
+                    for space_id in additional.values() {
+                        all_spaces.push(space_id.clone());
+                    }
+                }
+
+                all_spaces
+                    .into_iter()
+                    .map(|space_id| (space_id, self.abilities.clone()))
+                    .collect()
             }
-        }
+        };
 
-        // Clone abilities since we iterate per space
-        let abilities = self.abilities.clone();
-
-        all_spaces
+        space_abilities
             .into_iter()
-            .fold(Capability::<Value>::default(), |caps, space_id| {
-                abilities.iter().fold(caps, |caps, (service, actions)| {
-                    actions.iter().fold(caps, |mut caps, (path, action)| {
-                        let path_opt = if path.as_str().is_empty() {
-                            None
-                        } else {
-                            Some(path.clone())
-                        };
-                        caps.with_actions(
-                            space_id
-                                .clone()
-                                .to_resource(service.clone(), path_opt, None, None)
-                                .as_uri(),
-                            action.iter().map(|a| (a.clone(), [])),
-                        );
-                        caps
+            .fold(
+                Capability::<Value>::default(),
+                |caps, (space_id, abilities)| {
+                    abilities.iter().fold(caps, |caps, (service, actions)| {
+                        actions.iter().fold(caps, |mut caps, (path, action)| {
+                            let path_opt = if path.as_str().is_empty() {
+                                None
+                            } else {
+                                Some(path.clone())
+                            };
+                            caps.with_actions(
+                                space_id
+                                    .clone()
+                                    .to_resource(service.clone(), path_opt, None, None)
+                                    .as_uri(),
+                                action.iter().map(|a| (a.clone(), [])),
+                            );
+                            caps
+                        })
                     })
-                })
-            })
+                },
+            )
             .with_proofs(match &self.parents {
                 Some(p) => p.as_slice(),
                 None => &[],
@@ -816,6 +835,84 @@ pub mod test {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn parse_recap_with_distinct_space_abilities() {
+        let applications_space =
+            "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:applications";
+        let account_space =
+            "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:account";
+
+        let config = json!({
+            "abilities": {},
+            "spaceAbilities": {
+                applications_space: {
+                    "sql": {
+                        "com.tinycloud.conversation-sync/conversations": vec![
+                            "tinycloud.sql/read",
+                            "tinycloud.sql/write",
+                        ],
+                    },
+                },
+                account_space: {
+                    "kv": {
+                        "applications/": vec![
+                            "tinycloud.kv/get",
+                            "tinycloud.kv/put",
+                            "tinycloud.kv/list",
+                        ],
+                    },
+                },
+            },
+            "address": "0x7BD63AA37326a64d458559F44432103e3d6eEDE9",
+            "chainId": 1u8,
+            "domain": "example.com",
+            "issuedAt": "2022-01-01T00:00:00.000Z",
+            "spaceId": applications_space,
+            "expirationTime": "3000-01-01T00:00:00.000Z",
+        });
+
+        let prepared = prepare_session(serde_json::from_value(config).unwrap()).unwrap();
+        let entries = parse_recap_from_siwe(&prepared.siwe.to_string())
+            .expect("parse_recap_from_siwe should succeed on per-space SIWE");
+
+        assert_eq!(
+            entries.len(),
+            2,
+            "expected one entry for each requested space"
+        );
+        let app_entry = entries
+            .iter()
+            .find(|entry| entry.space == applications_space)
+            .expect("applications-space recap entry");
+        assert_eq!(app_entry.service, "sql");
+        assert_eq!(
+            app_entry.path,
+            "com.tinycloud.conversation-sync/conversations"
+        );
+        assert_eq!(
+            app_entry.actions,
+            vec![
+                "tinycloud.sql/read".to_string(),
+                "tinycloud.sql/write".to_string(),
+            ]
+        );
+
+        let account_entry = entries
+            .iter()
+            .find(|entry| entry.space == account_space)
+            .expect("account-space recap entry");
+        assert_eq!(account_entry.service, "kv");
+        assert_eq!(account_entry.path, "applications/");
+        assert_eq!(
+            account_entry.actions,
+            vec![
+                "tinycloud.kv/get".to_string(),
+                "tinycloud.kv/list".to_string(),
+                "tinycloud.kv/put".to_string(),
+            ]
+        );
     }
 
     #[test]
