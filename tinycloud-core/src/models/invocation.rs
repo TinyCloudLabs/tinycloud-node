@@ -149,10 +149,9 @@ async fn validate<C: ConnectionTrait>(
                 if p.delegatee != invocation.invoker
                     && !invocation.invoker.starts_with(&p.delegatee)
                 {
-                    return Err(InvocationError::UnauthorizedInvoker(
-                        invocation.invoker.clone(),
-                    )
-                    .into());
+                    return Err(
+                        InvocationError::UnauthorizedInvoker(invocation.invoker.clone()).into(),
+                    );
                 }
             }
 

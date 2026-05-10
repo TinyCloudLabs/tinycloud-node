@@ -777,7 +777,7 @@ mod tests {
             .await
             .expect("query host canonical");
 
-        let SqlResponse::Query(query) = query else {
+        let SqlResponse::Query(query) = query.response else {
             panic!("expected query response");
         };
         assert_eq!(query.row_count, 1);
@@ -899,7 +899,7 @@ mod tests {
             .await
             .expect("query replica canonical");
 
-        let SqlResponse::Query(query) = query else {
+        let SqlResponse::Query(query) = query.response else {
             panic!("expected query response");
         };
         assert_eq!(query.row_count, 1);

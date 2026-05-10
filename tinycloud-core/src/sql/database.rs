@@ -1097,27 +1097,73 @@ fn execute_statement_requires_local_write(
     }
 }
 
+fn collect_write_targets(
+    request: &SqlRequest,
+    caveats: &Option<SqlCaveats>,
+    ability: &str,
+) -> Result<Vec<crate::write_hooks::TouchedTables>, SqlError> {
+    match request {
+        SqlRequest::Query { sql, .. } => {
+            Ok(parser::validate_sql(sql, caveats, ability)?.write_targets)
+        }
+        SqlRequest::Execute { sql, schema, .. } => {
+            let mut write_targets = Vec::new();
+            if let Some(schema_stmts) = schema {
+                for stmt_sql in schema_stmts {
+                    write_targets
+                        .extend(parser::validate_sql(stmt_sql, caveats, ability)?.write_targets);
+                }
+            }
+            write_targets.extend(parser::validate_sql(sql, caveats, ability)?.write_targets);
+            Ok(write_targets)
+        }
+        SqlRequest::Batch { statements } => {
+            let mut write_targets = Vec::new();
+            for stmt in statements {
+                write_targets
+                    .extend(parser::validate_sql(&stmt.sql, caveats, ability)?.write_targets);
+            }
+            Ok(write_targets)
+        }
+        SqlRequest::ExecuteStatement { name, .. } => {
+            let caveats_ref = caveats
+                .as_ref()
+                .ok_or_else(|| SqlError::InvalidStatement("No caveats found".to_string()))?;
+            let prepared = caveats_ref.find_statement(name).ok_or_else(|| {
+                SqlError::InvalidStatement(format!("Statement '{}' not found", name))
+            })?;
+            Ok(parser::validate_sql(&prepared.sql, caveats, ability)?.write_targets)
+        }
+        SqlRequest::Export => Ok(Vec::new()),
+    }
+}
+
 fn handle_replica_message(
     state: &mut ReplicaState,
     request: &SqlRequest,
     caveats: &Option<SqlCaveats>,
     ability: &str,
     read_params: SqlReadParams,
-) -> Result<SqlResponse, SqlError> {
+) -> Result<SqlExecutionResult, SqlError> {
     let read_conn = if read_params.uses_provisional() {
         &state.provisional.conn
     } else {
         &state.canonical.conn
     };
+    let write_targets = collect_write_targets(request, caveats, ability)?;
 
     if !execute_statement_requires_local_write(request, caveats, ability)? {
-        return handle_message_local(
+        let response = handle_message_local(
             read_conn,
             &state.provisional.conn,
             request,
             caveats,
             ability,
-        );
+        )?;
+        return Ok(SqlExecutionResult {
+            response,
+            write_targets,
+        });
     }
 
     let base_canonical_seq = sql_replication::current_replication_seq(&state.canonical.conn)?;
@@ -1135,7 +1181,11 @@ fn handle_replica_message(
         request,
         caveats,
         ability,
-    );
+    )
+    .map(|response| SqlExecutionResult {
+        response,
+        write_targets,
+    });
 
     match &result {
         Ok(_) => update_pending_sql_fact(&state.metadata, fact_id, "applied", None)?,
@@ -1234,9 +1284,9 @@ fn handle_message(
 
             conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
 
-            let results = result?;
+            let response = result?;
             Ok(SqlExecutionResult {
-                response: SqlResponse::Batch(BatchResponse { results }),
+                response: SqlResponse::Batch(response),
                 write_targets,
             })
         }

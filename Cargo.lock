@@ -9204,6 +9204,7 @@ dependencies = [
  "arrow",
  "async-std",
  "async-trait",
+ "base64 0.22.1",
  "dashmap",
  "duckdb",
  "futures",

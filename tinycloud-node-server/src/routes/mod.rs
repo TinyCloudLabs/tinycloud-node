@@ -781,7 +781,7 @@ async fn handle_sql_invoke(
             &db_name,
             sql_request,
             caveats,
-            ability.clone(),
+            ability.to_string(),
             sql_read_params,
         )
         .await

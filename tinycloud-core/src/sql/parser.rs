@@ -3,7 +3,6 @@ use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
 
 use super::types::SqlError;
-use crate::write_hooks::TouchedTables;
 use super::{caveats::SqlCaveats, replication::is_internal_table_name};
 use crate::write_hooks::TouchedTables;
 
