@@ -13,10 +13,10 @@ use crate::{
     config::Config,
     hooks::{HookRuntime, WriteEvent},
     quota::QuotaCache,
-    routes::public::{is_public_space, RawKeyPath},
+    routes::public::is_public_space,
     signed_urls::{
-        mint_signed_kv_url, validate_signed_kv_url, SignedKvUrlRequest, SignedKvUrlResponse,
-        SignedUrlRuntime,
+        load_signed_kv_ticket, mint_signed_kv_url, validate_signed_kv_hash_binding,
+        validate_signed_kv_ticket, SignedKvUrlRequest, SignedKvUrlResponse, SignedUrlRuntime,
     },
     tracing::TracingSpan,
     BlockStage, BlockStores, TinyCloud,
@@ -138,6 +138,7 @@ pub async fn create_signed_kv_url(
     tinycloud: &State<TinyCloud>,
 ) -> Result<Json<SignedKvUrlResponse>, (Status, String)> {
     let invocation_info = invocation.0 .0.clone();
+    verify_auth(invocation.0, tinycloud).await?;
     let response = mint_signed_kv_url(
         &invocation_info,
         request.into_inner(),
@@ -145,37 +146,29 @@ pub async fn create_signed_kv_url(
         tinycloud.inner(),
     )
     .await?;
-    verify_auth(invocation.0, tinycloud).await?;
     Ok(Json(response))
 }
 
-#[get("/signed/kv/<space_id>/<key..>?<token>")]
+#[get("/signed/kv/<ticket_id>")]
 pub async fn signed_kv_get(
-    space_id: &str,
-    key: RawKeyPath,
-    token: &str,
-    runtime: &State<SignedUrlRuntime>,
+    ticket_id: &str,
     tinycloud: &State<TinyCloud>,
 ) -> Result<
     KVResponse<tinycloud_core::storage::Content<<BlockStores as ImmutableReadStore>::Readable>>,
     (Status, String),
 > {
-    let space_id: tinycloud_auth::resource::SpaceId = space_id
-        .parse()
-        .map_err(|_| (Status::BadRequest, "Invalid space ID".to_string()))?;
-    let key: tinycloud_auth::resource::Path = key
-        .0
-        .parse()
-        .map_err(|_| (Status::BadRequest, "Invalid key".to_string()))?;
-
-    validate_signed_kv_url(runtime.inner(), token, &space_id, &key)?;
+    let ticket = load_signed_kv_ticket(tinycloud.inner(), ticket_id).await?;
+    let (space_id, key) = validate_signed_kv_ticket(&ticket)?;
 
     match tinycloud
-        .public_kv_get(&space_id, &key)
+        .kv_get(&space_id, &key)
         .await
         .map_err(|e| (Status::InternalServerError, e.to_string()))?
     {
-        Some((md, hash, content)) => Ok(KVResponse::new(md, hash, content)),
+        Some((md, hash, content)) => {
+            validate_signed_kv_hash_binding(&ticket, &hash)?;
+            Ok(KVResponse::new(md, hash, content))
+        }
         None => Err((Status::NotFound, "Key not found".to_string())),
     }
 }

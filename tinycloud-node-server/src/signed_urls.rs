@@ -1,20 +1,24 @@
 use crate::TinyCloud;
-use base64::{decode_config, encode_config, URL_SAFE_NO_PAD};
+use base64::{encode_config, URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
+use rand::{rngs::OsRng, RngCore};
 use rocket::http::Status;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tinycloud_auth::resource::{Path, SpaceId};
+use tinycloud_auth::resource::{Path, Service, SpaceId};
 use tinycloud_core::{
     hash::Hash,
-    models::delegation,
+    models::{delegation, signed_kv_ticket},
     sea_orm::{ColumnTrait, EntityTrait, QueryFilter},
     types::Resource,
     util::InvocationInfo,
 };
 
-type SignedUrlMac = Hmac<Sha256>;
+type TicketIdMac = Hmac<Sha256>;
+
+const SIGNED_KV_SERVICE: &str = "kv";
+const SIGNED_KV_ABILITY: &str = "tinycloud.kv/get";
 
 #[derive(Debug)]
 pub struct SignedUrlRuntime {
@@ -34,31 +38,12 @@ impl SignedUrlRuntime {
         self.max_ttl_seconds
     }
 
-    pub fn sign(&self, claims: &SignedKvUrlClaims) -> Result<String, String> {
-        let payload = serde_json::to_vec(claims).map_err(|e| e.to_string())?;
-        let encoded_payload = encode_config(payload, URL_SAFE_NO_PAD);
-        let mut mac = SignedUrlMac::new_from_slice(&self.signing_key).map_err(|e| e.to_string())?;
-        mac.update(encoded_payload.as_bytes());
-        let signature = mac.finalize().into_bytes();
-        let encoded_signature = encode_config(signature, URL_SAFE_NO_PAD);
-        Ok(format!("{encoded_payload}.{encoded_signature}"))
-    }
-
-    pub fn verify(&self, token: &str) -> Result<SignedKvUrlClaims, String> {
-        let (encoded_payload, encoded_signature) = token
-            .split_once('.')
-            .ok_or_else(|| "invalid signed URL token format".to_string())?;
-
-        let mut mac = SignedUrlMac::new_from_slice(&self.signing_key).map_err(|e| e.to_string())?;
-        mac.update(encoded_payload.as_bytes());
-        let signature = decode_config(encoded_signature, URL_SAFE_NO_PAD)
-            .map_err(|_| "invalid signed URL token signature".to_string())?;
-        mac.verify_slice(&signature)
-            .map_err(|_| "invalid signed URL token signature".to_string())?;
-
-        let payload = decode_config(encoded_payload, URL_SAFE_NO_PAD)
-            .map_err(|_| "invalid signed URL token payload".to_string())?;
-        serde_json::from_slice(&payload).map_err(|_| "invalid signed URL token payload".to_string())
+    pub fn ticket_id(&self) -> Result<String, String> {
+        let mut nonce = [0u8; 32];
+        OsRng.fill_bytes(&mut nonce);
+        let mut mac = TicketIdMac::new_from_slice(&self.signing_key).map_err(|e| e.to_string())?;
+        mac.update(&nonce);
+        Ok(encode_config(mac.finalize().into_bytes(), URL_SAFE_NO_PAD))
     }
 }
 
@@ -71,26 +56,18 @@ pub struct SignedKvUrlRequest {
     pub ttl_seconds: Option<u64>,
     #[serde(default)]
     pub max_uses: Option<u64>,
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    #[serde(default)]
+    pub etag: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignedKvUrlResponse {
     pub url: String,
-    pub token: String,
+    pub ticket_id: String,
     pub expires_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct SignedKvUrlClaims {
-    pub v: u8,
-    pub sub: String,
-    pub space: String,
-    pub path: String,
-    pub iat: i64,
-    pub exp: i64,
-    pub parent_exp: i64,
 }
 
 pub async fn mint_signed_kv_url(
@@ -115,7 +92,7 @@ pub async fn mint_signed_kv_url(
         .parse()
         .map_err(|_| (Status::BadRequest, "Invalid path".to_string()))?;
 
-    if !has_only_exact_kv_get(invocation, &space, &path) {
+    if !has_attenuable_kv_get(invocation, &space, &path)? {
         return Err((
             Status::Forbidden,
             "signed URL scope is not authorized".to_string(),
@@ -124,9 +101,8 @@ pub async fn mint_signed_kv_url(
 
     let now = OffsetDateTime::now_utc();
     let invocation_exp = invocation_expiry(invocation);
-    let parent_exp = find_parent_expiry(invocation, tinycloud)
-        .await?
-        .unwrap_or(invocation_exp);
+    let parent_expiry = find_parent_expiry(invocation, tinycloud).await?;
+    let parent_exp = parent_expiry.unwrap_or(invocation_exp);
     let requested_ttl = request
         .ttl_seconds
         .unwrap_or(runtime.max_ttl_seconds())
@@ -142,76 +118,205 @@ pub async fn mint_signed_kv_url(
         ));
     }
 
-    let claims = SignedKvUrlClaims {
-        v: 1,
-        sub: invocation.invoker.clone(),
-        space: space.to_string(),
-        path: path.to_string(),
-        iat: now.unix_timestamp(),
-        exp,
-        parent_exp,
-    };
-    let token = runtime
-        .sign(&claims)
+    let ticket_id = runtime
+        .ticket_id()
         .map_err(|e| (Status::InternalServerError, e))?;
-    let expires_at = OffsetDateTime::from_unix_timestamp(exp)
-        .map_err(|e| (Status::InternalServerError, e.to_string()))?
-        .format(&Rfc3339)
+    let created_at = format_timestamp(now)?;
+    let expires_at = format_timestamp(unix_timestamp(exp)?)?;
+    let invocation_expires_at = Some(format_timestamp(unix_timestamp(invocation_exp)?)?);
+    let parent_expires_at = parent_expiry
+        .map(|expiry| unix_timestamp(expiry).and_then(format_timestamp))
+        .transpose()?;
+    let content_hash = request
+        .content_hash
+        .as_deref()
+        .map(normalize_content_hash)
+        .transpose()?;
+    let etag = request.etag.map(|etag| etag.trim().to_string());
+    let parent_cids_json = if invocation.parents.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string(
+                &invocation
+                    .parents
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|e| (Status::InternalServerError, e.to_string()))?,
+        )
+    };
+
+    let ticket = signed_kv_ticket::Model {
+        id: ticket_id.clone(),
+        issuer_did: invocation.invoker.clone(),
+        subject_did: invocation.invoker.clone(),
+        space_id: space.to_string(),
+        path: path.to_string(),
+        service: SIGNED_KV_SERVICE.to_string(),
+        ability: SIGNED_KV_ABILITY.to_string(),
+        created_at,
+        expires_at: expires_at.clone(),
+        invocation_expires_at,
+        parent_expires_at,
+        content_hash,
+        etag,
+        parent_cids_json,
+    };
+    tinycloud
+        .create_signed_kv_ticket(ticket)
+        .await
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
-    let url = format!("/signed/kv/{}/{}?token={}", space, path, token);
+    let url = format!("/signed/kv/{ticket_id}");
 
     Ok(SignedKvUrlResponse {
         url,
-        token,
+        ticket_id,
         expires_at,
     })
 }
 
-pub fn validate_signed_kv_url(
-    runtime: &SignedUrlRuntime,
-    token: &str,
-    space: &SpaceId,
-    path: &Path,
-) -> Result<SignedKvUrlClaims, (Status, String)> {
-    let claims = runtime
-        .verify(token)
-        .map_err(|e| (Status::Unauthorized, e))?;
-    let now = OffsetDateTime::now_utc().unix_timestamp();
+pub async fn load_signed_kv_ticket(
+    tinycloud: &TinyCloud,
+    ticket_id: &str,
+) -> Result<signed_kv_ticket::Model, (Status, String)> {
+    let ticket = tinycloud
+        .find_signed_kv_ticket(ticket_id)
+        .await
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?
+        .ok_or_else(|| {
+            (
+                Status::Unauthorized,
+                "signed URL ticket not found".to_string(),
+            )
+        })?;
+    validate_signed_kv_ticket(&ticket)?;
+    Ok(ticket)
+}
 
-    if claims.exp <= now || claims.parent_exp <= now {
-        return Err((Status::Unauthorized, "signed URL expired".to_string()));
-    }
-    if claims.space != space.to_string() || claims.path != path.to_string() {
+pub fn validate_signed_kv_ticket(
+    ticket: &signed_kv_ticket::Model,
+) -> Result<(SpaceId, Path), (Status, String)> {
+    if ticket.service != SIGNED_KV_SERVICE || ticket.ability != SIGNED_KV_ABILITY {
         return Err((
             Status::Forbidden,
-            "signed URL scope does not match request".to_string(),
+            "signed URL ticket has invalid scope".to_string(),
         ));
     }
 
-    Ok(claims)
+    let expires_at = OffsetDateTime::parse(&ticket.expires_at, &Rfc3339).map_err(|_| {
+        (
+            Status::Unauthorized,
+            "signed URL ticket is invalid".to_string(),
+        )
+    })?;
+    if expires_at <= OffsetDateTime::now_utc() {
+        return Err((Status::Unauthorized, "signed URL expired".to_string()));
+    }
+
+    let space = ticket.space_id.parse().map_err(|_| {
+        (
+            Status::Unauthorized,
+            "signed URL ticket is invalid".to_string(),
+        )
+    })?;
+    let path = ticket.path.parse().map_err(|_| {
+        (
+            Status::Unauthorized,
+            "signed URL ticket is invalid".to_string(),
+        )
+    })?;
+    Ok((space, path))
 }
 
-pub fn has_only_exact_kv_get(invocation: &InvocationInfo, space: &SpaceId, path: &Path) -> bool {
-    !invocation.capabilities.is_empty()
-        && invocation
-            .capabilities
-            .iter()
-            .all(|capability| matches_exact_kv_get(capability, space, path))
+pub fn validate_signed_kv_hash_binding(
+    ticket: &signed_kv_ticket::Model,
+    hash: &Hash,
+) -> Result<(), (Status, String)> {
+    let current_hash = hex::encode(hash.as_ref());
+
+    if let Some(bound_hash) = &ticket.content_hash {
+        let bound_hash = normalize_content_hash(bound_hash)?;
+        if bound_hash != current_hash {
+            return Err((
+                Status::PreconditionFailed,
+                "signed URL content hash does not match".to_string(),
+            ));
+        }
+    }
+
+    if let Some(bound_etag) = &ticket.etag {
+        let current_etag = format!("\"blake3-{current_hash}\"");
+        if bound_etag.trim() != current_etag {
+            return Err((
+                Status::PreconditionFailed,
+                "signed URL ETag does not match".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
-fn matches_exact_kv_get(
-    capability: &tinycloud_core::util::Capability,
+pub fn has_attenuable_kv_get(
+    invocation: &InvocationInfo,
     space: &SpaceId,
     path: &Path,
+) -> Result<bool, (Status, String)> {
+    let requested = requested_kv_resource(space, path)?;
+    Ok(invocation
+        .capabilities
+        .iter()
+        .any(|capability| matches_attenuable_kv_get(capability, &requested)))
+}
+
+fn matches_attenuable_kv_get(
+    capability: &tinycloud_core::util::Capability,
+    requested: &Resource,
 ) -> bool {
-    match (&capability.resource, capability.ability.as_ref().as_ref()) {
-        (Resource::TinyCloud(resource), "tinycloud.kv/get") => {
-            resource.service().as_str() == "kv"
-                && resource.space() == space
-                && resource.path().is_some_and(|p| p == path)
-        }
-        _ => false,
+    capability.ability.as_ref().as_ref() == SIGNED_KV_ABILITY
+        && requested.extends(&capability.resource)
+}
+
+fn requested_kv_resource(space: &SpaceId, path: &Path) -> Result<Resource, (Status, String)> {
+    Ok(Resource::TinyCloud(
+        space.clone().to_resource(
+            SIGNED_KV_SERVICE
+                .parse::<Service>()
+                .map_err(|_| (Status::InternalServerError, "Invalid service".to_string()))?,
+            Some(path.clone()),
+            None,
+            None,
+        ),
+    ))
+}
+
+fn normalize_content_hash(value: &str) -> Result<String, (Status, String)> {
+    let normalized = value
+        .trim()
+        .trim_matches('"')
+        .strip_prefix("blake3-")
+        .unwrap_or_else(|| value.trim().trim_matches('"'))
+        .to_ascii_lowercase();
+    if normalized.len() != 64 || !normalized.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err((
+            Status::BadRequest,
+            "contentHash must be a blake3 hex digest".to_string(),
+        ));
     }
+    Ok(normalized)
+}
+
+fn unix_timestamp(timestamp: i64) -> Result<OffsetDateTime, (Status, String)> {
+    OffsetDateTime::from_unix_timestamp(timestamp)
+        .map_err(|e| (Status::InternalServerError, e.to_string()))
+}
+
+fn format_timestamp(timestamp: OffsetDateTime) -> Result<String, (Status, String)> {
+    timestamp
+        .format(&Rfc3339)
+        .map_err(|e| (Status::InternalServerError, e.to_string()))
 }
 
 fn invocation_expiry(invocation: &InvocationInfo) -> i64 {
@@ -267,7 +372,9 @@ mod tests {
         ssi::{dids::DIDBuf, jwk::JWK},
     };
     use tinycloud_core::{
+        hash::hash,
         keys::StaticSecret,
+        models::signed_kv_ticket,
         sea_orm::{ConnectOptions, Database},
         storage::either::Either,
         storage::StorageConfig as _,
@@ -326,64 +433,87 @@ mod tests {
         Ok((CoreInvocationInfo::try_from(invocation)?, space))
     }
 
-    #[tokio::test]
-    async fn signed_kv_url_token_round_trips() {
-        let runtime = SignedUrlRuntime::new([7u8; 32]);
-        let claims = SignedKvUrlClaims {
-            v: 1,
-            sub: "did:key:test".to_string(),
-            space: "tinycloud:space".to_string(),
-            path: "documents/audio.wav".to_string(),
-            iat: 10,
-            exp: 20,
-            parent_exp: 20,
-        };
+    fn test_invocation_with_caps(
+        caps: &[(&str, &str, &str)],
+    ) -> Result<(CoreInvocationInfo, SpaceId)> {
+        let jwk = JWK::generate_ed25519()?;
+        let mut verification_method = DID_METHODS.generate(&jwk, "key")?.to_string();
+        let fragment = verification_method
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("missing verification method fragment"))?
+            .1
+            .to_string();
+        verification_method.push('#');
+        verification_method.push_str(&fragment);
 
-        let token = runtime.sign(&claims).unwrap();
-        let decoded = runtime.verify(&token).unwrap();
-        assert_eq!(decoded, claims);
+        let did: DIDBuf = verification_method
+            .split('#')
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing did"))?
+            .parse()?;
+        let space = SpaceId::new(did, "alpha".parse()?);
+        let resources = caps
+            .iter()
+            .map(|(service, path, ability)| {
+                Ok((
+                    space.clone().to_resource(
+                        service.parse::<Service>()?,
+                        Some(path.parse::<Path>()?),
+                        None,
+                        None,
+                    ),
+                    vec![ability.parse::<Ability>()?],
+                ))
+            })
+            .collect::<Result<Vec<(ResourceId, Vec<Ability>)>>>()?;
+
+        let delegation = Cid::new_v1(0x55, Code::Blake3_256.digest(b"delegation"));
+        let invocation = make_invocation(
+            resources,
+            &delegation,
+            &jwk,
+            &verification_method,
+            4_102_444_800.0,
+            InvocationOptions::default(),
+        )?;
+
+        Ok((CoreInvocationInfo::try_from(invocation)?, space))
     }
 
-    #[tokio::test]
-    async fn signed_kv_url_rejects_wrong_path_scope() -> Result<()> {
-        let runtime = SignedUrlRuntime::new([7u8; 32]);
-        let (invocation, space) = test_invocation("documents/audio.wav")?;
-        let claims = SignedKvUrlClaims {
-            v: 1,
-            sub: invocation.invoker,
-            space: space.to_string(),
-            path: "documents/audio.wav".to_string(),
-            iat: 10,
-            exp: 4_102_444_800,
-            parent_exp: 4_102_444_800,
-        };
-        let token = runtime.sign(&claims).unwrap();
-        let wrong_path = "documents/other.wav".parse::<Path>()?;
-
-        let err = validate_signed_kv_url(&runtime, &token, &space, &wrong_path)
-            .expect_err("wrong path should be rejected");
-        assert_eq!(err.0, Status::Forbidden);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn signed_kv_url_rejects_expired_token() -> Result<()> {
-        let runtime = SignedUrlRuntime::new([7u8; 32]);
-        let (_invocation, space) = test_invocation("documents/audio.wav")?;
-        let path = "documents/audio.wav".parse::<Path>()?;
-        let claims = SignedKvUrlClaims {
-            v: 1,
-            sub: "did:key:test".to_string(),
-            space: space.to_string(),
+    fn ticket_model(
+        space: &SpaceId,
+        path: &str,
+        expires_at: OffsetDateTime,
+    ) -> signed_kv_ticket::Model {
+        signed_kv_ticket::Model {
+            id: "ticket-id".to_string(),
+            issuer_did: "did:key:test".to_string(),
+            subject_did: "did:key:test".to_string(),
+            space_id: space.to_string(),
             path: path.to_string(),
-            iat: 10,
-            exp: 20,
-            parent_exp: 20,
-        };
-        let token = runtime.sign(&claims).unwrap();
+            service: SIGNED_KV_SERVICE.to_string(),
+            ability: SIGNED_KV_ABILITY.to_string(),
+            created_at: format_timestamp(OffsetDateTime::now_utc()).unwrap(),
+            expires_at: format_timestamp(expires_at).unwrap(),
+            invocation_expires_at: None,
+            parent_expires_at: None,
+            content_hash: None,
+            etag: None,
+            parent_cids_json: None,
+        }
+    }
 
-        let err = validate_signed_kv_url(&runtime, &token, &space, &path)
-            .expect_err("expired token should be rejected");
+    #[tokio::test]
+    async fn signed_kv_ticket_rejects_expired_ticket() -> Result<()> {
+        let (_invocation, space) = test_invocation("documents/audio.wav")?;
+        let ticket = ticket_model(
+            &space,
+            "documents/audio.wav",
+            OffsetDateTime::now_utc() - time::Duration::seconds(1),
+        );
+
+        let err =
+            validate_signed_kv_ticket(&ticket).expect_err("expired ticket should be rejected");
         assert_eq!(err.0, Status::Unauthorized);
         Ok(())
     }
@@ -400,6 +530,8 @@ mod tests {
                 path: "documents/audio.wav".to_string(),
                 ttl_seconds: Some(60),
                 max_uses: None,
+                content_hash: None,
+                etag: None,
             },
             &runtime,
             &tinycloud,
@@ -407,12 +539,74 @@ mod tests {
         .await
         .expect("signed URL");
 
-        let path = "documents/audio.wav".parse::<Path>()?;
-        let claims = validate_signed_kv_url(&runtime, &response.token, &space, &path)
-            .expect("minted URL should validate");
-        assert_eq!(claims.space, space.to_string());
-        assert_eq!(claims.path, "documents/audio.wav");
-        assert!(response.url.starts_with("/signed/kv/"));
+        assert_eq!(response.url, format!("/signed/kv/{}", response.ticket_id));
+        assert!(!response.url.contains("?token="));
+        assert!(!response.url.contains(&space.to_string()));
+
+        let ticket = load_signed_kv_ticket(&tinycloud, &response.ticket_id)
+            .await
+            .expect("minted ticket should be persisted");
+        let (ticket_space, ticket_path) =
+            validate_signed_kv_ticket(&ticket).expect("persisted ticket should validate");
+        assert_eq!(ticket_space, space);
+        assert_eq!(ticket_path.as_str(), "documents/audio.wav");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mints_signed_kv_url_for_broader_kv_get_among_other_caps() -> Result<()> {
+        let tinycloud = test_tinycloud().await?;
+        let runtime = SignedUrlRuntime::new([7u8; 32]);
+        let (invocation, space) = test_invocation_with_caps(&[
+            ("kv", "documents", "tinycloud.kv/get"),
+            ("sql", "main.db", "tinycloud.sql/read"),
+        ])?;
+        let response = mint_signed_kv_url(
+            &invocation,
+            SignedKvUrlRequest {
+                space: space.to_string(),
+                path: "documents/audio.wav".to_string(),
+                ttl_seconds: Some(60),
+                max_uses: None,
+                content_hash: None,
+                etag: None,
+            },
+            &runtime,
+            &tinycloud,
+        )
+        .await
+        .expect("broader kv/get capability should authorize ticket");
+
+        assert_eq!(response.url, format!("/signed/kv/{}", response.ticket_id));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_unauthorized_path_scope() -> Result<()> {
+        let tinycloud = test_tinycloud().await?;
+        let runtime = SignedUrlRuntime::new([7u8; 32]);
+        let (invocation, space) = test_invocation_with_caps(&[
+            ("kv", "documents", "tinycloud.kv/get"),
+            ("kv", "other", "tinycloud.kv/put"),
+        ])?;
+
+        let err = mint_signed_kv_url(
+            &invocation,
+            SignedKvUrlRequest {
+                space: space.to_string(),
+                path: "documents2/audio.wav".to_string(),
+                ttl_seconds: Some(60),
+                max_uses: None,
+                content_hash: None,
+                etag: None,
+            },
+            &runtime,
+            &tinycloud,
+        )
+        .await
+        .expect_err("sibling path should not be authorized by prefix");
+
+        assert_eq!(err.0, Status::Forbidden);
         Ok(())
     }
 
@@ -429,6 +623,8 @@ mod tests {
                 path: "documents/audio.wav".to_string(),
                 ttl_seconds: Some(60),
                 max_uses: Some(1),
+                content_hash: None,
+                etag: None,
             },
             &runtime,
             &tinycloud,
@@ -441,13 +637,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authorization_requires_exact_kv_get_scope() -> Result<()> {
-        let (invocation, space) = test_invocation("documents/audio.wav")?;
+    async fn authorization_allows_attenuable_kv_get_scope() -> Result<()> {
+        let (invocation, space) = test_invocation_with_caps(&[
+            ("kv", "documents", "tinycloud.kv/get"),
+            ("kv", "uploads", "tinycloud.kv/put"),
+        ])?;
         let authorized_path = "documents/audio.wav".parse::<Path>()?;
-        let wrong_path = "documents/other.wav".parse::<Path>()?;
+        let wrong_path = "documents2/audio.wav".parse::<Path>()?;
 
-        assert!(has_only_exact_kv_get(&invocation, &space, &authorized_path));
-        assert!(!has_only_exact_kv_get(&invocation, &space, &wrong_path));
+        assert!(has_attenuable_kv_get(&invocation, &space, &authorized_path)
+            .expect("valid requested resource"));
+        assert!(!has_attenuable_kv_get(&invocation, &space, &wrong_path)
+            .expect("valid requested resource"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn validates_optional_content_hash_binding() -> Result<()> {
+        let (_invocation, space) = test_invocation("documents/audio.wav")?;
+        let object_hash = hash(b"object bytes");
+        let mut ticket = ticket_model(
+            &space,
+            "documents/audio.wav",
+            OffsetDateTime::now_utc() + time::Duration::seconds(60),
+        );
+        ticket.content_hash = Some(hex::encode(object_hash.as_ref()));
+        validate_signed_kv_hash_binding(&ticket, &object_hash)
+            .expect("matching content hash should validate");
+
+        let other_hash = hash(b"other bytes");
+        let err = validate_signed_kv_hash_binding(&ticket, &other_hash)
+            .expect_err("mismatched content hash should be rejected");
+        assert_eq!(err.0, Status::PreconditionFailed);
         Ok(())
     }
 }
