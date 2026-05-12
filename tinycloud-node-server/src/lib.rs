@@ -19,6 +19,7 @@ pub mod hooks;
 pub mod prometheus;
 pub mod quota;
 pub mod routes;
+pub mod signed_urls;
 pub mod storage;
 pub mod tee;
 mod tracing;
@@ -30,10 +31,11 @@ use quota::QuotaCache;
 use routes::{
     admin::{delete_quota, get_quota, list_quotas, set_quota},
     attestation::attestation,
-    delegate,
+    create_signed_kv_url, delegate,
     hooks::{create_hook_ticket, create_webhook, delete_webhook, hook_events, list_webhooks},
     info, invoke, open_host_key,
     public::{public_kv_get, public_kv_head, public_kv_list, public_kv_options, RateLimiter},
+    signed_kv_get,
     util_routes::*,
     version,
 };
@@ -113,6 +115,8 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         open_host_key,
         invoke,
         delegate,
+        create_signed_kv_url,
+        signed_kv_get,
         create_hook_ticket,
         hook_events,
         create_webhook,
@@ -136,6 +140,8 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         tinycloud_config.hooks.clone(),
         key_setup.derive_key(b"tinycloud/hooks/tickets"),
     );
+    let signed_url_runtime =
+        signed_urls::SignedUrlRuntime::new(key_setup.derive_key(b"tinycloud/kv/signed-urls"));
 
     // Initialize TEE context if running in dstack mode
     let tee_context: Option<TeeContext> = {
@@ -241,6 +247,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         .manage(duckdb_service)
         .manage(quota_cache)
         .manage(hook_runtime)
+        .manage(signed_url_runtime)
         .manage(webhook_encryption)
         .manage(rate_limiter)
         .manage(tee_context)

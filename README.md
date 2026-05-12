@@ -33,9 +33,25 @@ The SDK checks this endpoint during sign-in and requires an exact protocol versi
 |--------|----------|------|-------------|
 | `GET` | `/version` | No | Protocol version and feature discovery |
 | `POST` | `/invoke` | Yes | Execute KV operations (get, put, list, delete) |
+| `POST` | `/signed/kv` | Yes | Create an expiring signed URL for an exact KV object read |
+| `GET` | `/signed/kv/<space>/<key..>?token=<token>` | Signed URL token | Fetch a KV object through a signed URL |
 | `POST` | `/delegate` | Yes | Create capability delegations |
 | `GET` | `/peer/generate/<space>` | No | Generate space host key pair |
 | `GET` | `/healthz` | No | Health check |
+
+### Signed KV URLs
+
+`POST /signed/kv` accepts a normal TinyCloud invocation with an exact `tinycloud.kv/get` capability for the requested object. The JSON body is:
+
+```json
+{
+  "space": "tinycloud:...",
+  "path": "transcripts/audio.wav",
+  "ttlSeconds": 60
+}
+```
+
+The response includes a relative `url`, bearer `token`, and RFC3339 `expiresAt`. The token is HMAC-signed by the node, scoped to the exact space and path, and expires at the earliest of the requested TTL, the node maximum TTL, the invocation expiry, and the parent delegation expiry. `maxUses` is rejected for now because limited-use URLs need durable server-side state to stay correct across restarts and multi-node deployments.
 
 ## Quickstart
 
