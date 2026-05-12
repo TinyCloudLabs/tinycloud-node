@@ -3,21 +3,16 @@ use serde_json::Value as JsonValue;
 
 /// Parameters for KV reads.
 /// Passed via the UCAN invocation facts field under `kvReadParams`.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum KvReadParams {
     /// Hide keys present in `kv_quarantine`.
     #[serde(rename = "canonical")]
+    #[default]
     Canonical,
     /// Preserve the existing visibility behavior, including quarantined keys.
     #[serde(rename = "provisional")]
     Provisional,
-}
-
-impl Default for KvReadParams {
-    fn default() -> Self {
-        Self::Canonical
-    }
 }
 
 impl KvReadParams {

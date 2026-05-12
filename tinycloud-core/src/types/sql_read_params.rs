@@ -3,19 +3,14 @@ use serde_json::Value as JsonValue;
 
 /// Parameters for SQL reads.
 /// Passed via the UCAN invocation facts field under `sqlReadParams`.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum SqlReadParams {
     #[serde(rename = "canonical")]
+    #[default]
     Canonical,
     #[serde(rename = "provisional")]
     Provisional,
-}
-
-impl Default for SqlReadParams {
-    fn default() -> Self {
-        Self::Canonical
-    }
 }
 
 impl SqlReadParams {

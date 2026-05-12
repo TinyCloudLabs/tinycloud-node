@@ -62,7 +62,7 @@ pub fn encode_hash(hash: Hash) -> String {
 }
 
 pub fn decode_hash(value: &str, label: &'static str) -> Result<Hash, KvReplicationError> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err(KvReplicationError::InvalidHashEncoding {
             label,
             value: value.to_string(),

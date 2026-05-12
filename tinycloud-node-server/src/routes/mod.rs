@@ -337,7 +337,7 @@ pub async fn revoke(
                     e.to_string(),
                 )
             })
-            .and_then(|result: TransactResult| {
+            .map(|result: TransactResult| {
                 let cid = result
                     .commits
                     .into_values()
@@ -346,7 +346,7 @@ pub async fn revoke(
                     .map(|h| h.to_cid(0x55).to_string())
                     .unwrap_or_else(|| revocation_cid.clone());
 
-                Ok(Json(RevokeResponse { cid }))
+                Json(RevokeResponse { cid })
             });
         timer.observe_duration();
         res

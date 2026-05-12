@@ -14,11 +14,12 @@ use crate::replication::recon::{
 };
 use crate::replication::{
     decode_hash, encode_hash, AuthReplicationApplyResponse, AuthReplicationExportRequest,
-    AuthReplicationExportResponse, KvPeerMissingQuarantineItem, KvPeerMissingQuarantineRequest,
-    KvPeerMissingQuarantineResponse, KvReconExportRequest, KvReconExportResponse,
-    KvReconSplitRequest, KvReconSplitResponse, KvReplicationError, KvReplicationEvent,
-    KvReplicationOperation, KvReplicationSequence, KvStateItem, KvStateRequest, KvStateResponse,
-    KvStateStatus, ReplicationApplyResponse, ReplicationExportRequest, ReplicationExportResponse,
+    AuthReplicationExportResponse, KvPeerMissingPlanItem, KvPeerMissingQuarantineItem,
+    KvPeerMissingQuarantineRequest, KvPeerMissingQuarantineResponse, KvReconExportRequest,
+    KvReconExportResponse, KvReconSplitRequest, KvReconSplitResponse, KvReplicationError,
+    KvReplicationEvent, KvReplicationOperation, KvReplicationSequence, KvStateItem, KvStateRequest,
+    KvStateResponse, KvStateStatus, ReplicationApplyResponse, ReplicationExportRequest,
+    ReplicationExportResponse,
 };
 use crate::storage::{
     either::EitherError, Content, HashBuffer, ImmutableDeleteStore, ImmutableReadStore,
@@ -870,15 +871,12 @@ where
     pub async fn quarantine_kv_peer_missing(
         &self,
         space_id: &str,
-        key: &str,
         peer_url: &str,
+        item: &KvPeerMissingPlanItem,
         local_invocation_id: &str,
-        peer_status: &str,
-        peer_invocation_id: Option<&str>,
-        peer_deleted_invocation_id: Option<&str>,
     ) -> Result<bool, KvReplicationError> {
         let space_id = parse_replication_space_id(space_id)?;
-        let key = parse_replication_path(key)?;
+        let key = parse_replication_path(&item.key)?;
         let quarantined_at = OffsetDateTime::now_utc().unix_timestamp();
         let existing = kv_quarantine::Entity::find()
             .filter(
@@ -893,12 +891,10 @@ where
             let mut active: kv_quarantine::ActiveModel = existing.into();
             active.peer_url = sea_orm::ActiveValue::Set(peer_url.to_string());
             active.local_invocation_id = sea_orm::ActiveValue::Set(local_invocation_id.to_string());
-            active.peer_status = sea_orm::ActiveValue::Set(peer_status.to_string());
-            active.peer_invocation_id =
-                sea_orm::ActiveValue::Set(peer_invocation_id.map(|value| value.to_string()));
-            active.peer_deleted_invocation_id = sea_orm::ActiveValue::Set(
-                peer_deleted_invocation_id.map(|value| value.to_string()),
-            );
+            active.peer_status = sea_orm::ActiveValue::Set(item.peer_status.clone());
+            active.peer_invocation_id = sea_orm::ActiveValue::Set(item.peer_invocation_id.clone());
+            active.peer_deleted_invocation_id =
+                sea_orm::ActiveValue::Set(item.peer_deleted_invocation_id.clone());
             active.quarantined_at = sea_orm::ActiveValue::Set(quarantined_at);
             active.update(&self.conn).await?;
             Ok(false)
@@ -908,12 +904,10 @@ where
                 key: sea_orm::ActiveValue::Set(key.into()),
                 peer_url: sea_orm::ActiveValue::Set(peer_url.to_string()),
                 local_invocation_id: sea_orm::ActiveValue::Set(local_invocation_id.to_string()),
-                peer_status: sea_orm::ActiveValue::Set(peer_status.to_string()),
-                peer_invocation_id: sea_orm::ActiveValue::Set(
-                    peer_invocation_id.map(|value| value.to_string()),
-                ),
+                peer_status: sea_orm::ActiveValue::Set(item.peer_status.clone()),
+                peer_invocation_id: sea_orm::ActiveValue::Set(item.peer_invocation_id.clone()),
                 peer_deleted_invocation_id: sea_orm::ActiveValue::Set(
-                    peer_deleted_invocation_id.map(|value| value.to_string()),
+                    item.peer_deleted_invocation_id.clone(),
                 ),
                 quarantined_at: sea_orm::ActiveValue::Set(quarantined_at),
             })
@@ -956,7 +950,7 @@ where
             .as_deref()
             .map(parse_replication_path)
             .transpose()?;
-        let limit = request.limit.unwrap_or(128).max(1).min(512);
+        let limit = request.limit.unwrap_or(128).clamp(1, 512);
 
         let mut query = kv_quarantine::Entity::find()
             .filter(Condition::all().add(kv_quarantine::Column::Space.eq(SpaceIdWrap(space_id))));
@@ -2483,7 +2477,7 @@ async fn latest_canonical_kv_commit<C: ConnectionTrait>(
     space_id: &SpaceId,
     key: &Path,
 ) -> Result<Option<canonical_commit::Model>, DbErr> {
-    Ok(canonical_commit::Entity::find()
+    canonical_commit::Entity::find()
         .filter(
             Condition::all()
                 .add(canonical_commit::Column::Space.eq(SpaceIdWrap(space_id.clone())))
@@ -2491,7 +2485,7 @@ async fn latest_canonical_kv_commit<C: ConnectionTrait>(
         )
         .order_by_desc(canonical_commit::Column::Seq)
         .one(db)
-        .await?)
+        .await
 }
 
 async fn latest_canonical_kv_seq_for_prefix<C: ConnectionTrait>(

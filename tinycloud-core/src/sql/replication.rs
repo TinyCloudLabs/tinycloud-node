@@ -355,13 +355,12 @@ fn current_seq(conn: &Connection) -> Result<i64, SqlError> {
         return Ok(0);
     }
 
-    Ok(conn
-        .query_row(
-            &format!("SELECT COALESCE(MAX(seq), 0) FROM {REPLICATION_LOG_TABLE}"),
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(|e| SqlError::Internal(e.to_string()))?)
+    conn.query_row(
+        &format!("SELECT COALESCE(MAX(seq), 0) FROM {REPLICATION_LOG_TABLE}"),
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map_err(|e| SqlError::Internal(e.to_string()))
 }
 
 fn ensure_replication_log(conn: &Connection) -> Result<(), SqlError> {

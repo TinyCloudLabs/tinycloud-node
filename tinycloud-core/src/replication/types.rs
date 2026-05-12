@@ -110,7 +110,7 @@ impl Default for ReplicationStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReplicationCapabilities {
     pub supported: bool,
@@ -121,21 +121,6 @@ pub struct ReplicationCapabilities {
     pub authored_fact_exchange: bool,
     pub notifications: bool,
     pub snapshots: bool,
-}
-
-impl Default for ReplicationCapabilities {
-    fn default() -> Self {
-        Self {
-            supported: false,
-            enabled: false,
-            peer_serving: false,
-            recon: false,
-            auth_sync: false,
-            authored_fact_exchange: false,
-            notifications: false,
-            snapshots: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]

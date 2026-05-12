@@ -379,81 +379,74 @@ pub async fn peer_missing_apply(
     let mut kept = 0;
 
     for item in &plan.items {
-        let (result, applied_sequences, applied_events, item_cleared_quarantine) =
-            if item.action == "prune-delete" {
-                let export = fetch_peer_kv_export(
-                    peer_url,
-                    &peer_token.0,
-                    &ReplicationExportRequest {
-                        space_id: request.space_id.clone(),
-                        prefix: Some(item.key.clone()),
-                        since_seq: None,
-                        limit: None,
-                    },
-                )
-                .await?;
-                let filtered = filter_kv_export_to_exact_key(export, &item.key);
-                let applied = tinycloud
-                    .apply_kv_replication(&filtered, staging.inner())
-                    .await
-                    .map_err(map_replication_error)?;
+        let (result, applied_sequences, applied_events, item_cleared_quarantine) = if item.action
+            == "prune-delete"
+        {
+            let export = fetch_peer_kv_export(
+                peer_url,
+                &peer_token.0,
+                &ReplicationExportRequest {
+                    space_id: request.space_id.clone(),
+                    prefix: Some(item.key.clone()),
+                    since_seq: None,
+                    limit: None,
+                },
+            )
+            .await?;
+            let filtered = filter_kv_export_to_exact_key(export, &item.key);
+            let applied = tinycloud
+                .apply_kv_replication(&filtered, staging.inner())
+                .await
+                .map_err(map_replication_error)?;
+            if applied.applied_events > 0 {
+                pruned_deletes += 1;
+            }
+            let cleared = tinycloud
+                .clear_kv_peer_missing_quarantine(&request.space_id, &item.key)
+                .await
+                .map_err(map_replication_error)?;
+            if cleared {
+                cleared_quarantine += 1;
+            }
+            (
                 if applied.applied_events > 0 {
-                    pruned_deletes += 1;
-                }
-                let cleared = tinycloud
-                    .clear_kv_peer_missing_quarantine(&request.space_id, &item.key)
-                    .await
-                    .map_err(map_replication_error)?;
-                if cleared {
-                    cleared_quarantine += 1;
-                }
-                (
-                    if applied.applied_events > 0 {
-                        "pruned-delete"
-                    } else {
-                        "already-pruned"
-                    },
-                    applied.applied_sequences,
-                    applied.applied_events,
-                    cleared,
-                )
-            } else if item.action == "quarantine-absent" {
-                let local_invocation_id = item.local_invocation_id.as_deref().ok_or_else(|| {
-                    (
-                        Status::InternalServerError,
-                        format!("missing local invocation id for key {}", item.key),
-                    )
-                })?;
-                let inserted = tinycloud
-                    .quarantine_kv_peer_missing(
-                        &request.space_id,
-                        &item.key,
-                        peer_url,
-                        local_invocation_id,
-                        &item.peer_status,
-                        item.peer_invocation_id.as_deref(),
-                        item.peer_deleted_invocation_id.as_deref(),
-                    )
-                    .await
-                    .map_err(map_replication_error)?;
-                if inserted {
-                    quarantined += 1;
-                    ("quarantined", 0, 0, false)
+                    "pruned-delete"
                 } else {
-                    already_quarantined += 1;
-                    ("already-quarantined", 0, 0, false)
-                }
+                    "already-pruned"
+                },
+                applied.applied_sequences,
+                applied.applied_events,
+                cleared,
+            )
+        } else if item.action == "quarantine-absent" {
+            let local_invocation_id = item.local_invocation_id.as_deref().ok_or_else(|| {
+                (
+                    Status::InternalServerError,
+                    format!("missing local invocation id for key {}", item.key),
+                )
+            })?;
+            let inserted = tinycloud
+                .quarantine_kv_peer_missing(&request.space_id, peer_url, item, local_invocation_id)
+                .await
+                .map_err(map_replication_error)?;
+            if inserted {
+                quarantined += 1;
+                ("quarantined", 0, 0, false)
             } else {
-                let cleared = tinycloud
-                    .clear_kv_peer_missing_quarantine(&request.space_id, &item.key)
-                    .await
-                    .map_err(map_replication_error)?;
-                if cleared {
-                    cleared_quarantine += 1;
-                }
-                kept += 1;
-                ("kept", 0, 0, cleared)
-            };
+                already_quarantined += 1;
+                ("already-quarantined", 0, 0, false)
+            }
+        } else {
+            let cleared = tinycloud
+                .clear_kv_peer_missing_quarantine(&request.space_id, &item.key)
+                .await
+                .map_err(map_replication_error)?;
+            if cleared {
+                cleared_quarantine += 1;
+            }
+            kept += 1;
+            ("kept", 0, 0, cleared)
+        };
 
         items.push(KvPeerMissingApplyItem {
             key: item.key.clone(),
@@ -1058,6 +1051,14 @@ async fn collect_split_reconcile_targets(
 
     let max_depth = max_depth.unwrap_or(1).max(1);
     let mut targets = Vec::new();
+    let scope = SplitReconcileScope {
+        peer_url,
+        peer_token,
+        space_id,
+        max_depth,
+        child_limit,
+        tinycloud,
+    };
 
     for child in root_children {
         if targets.len() >= child_limit {
@@ -1069,15 +1070,10 @@ async fn collect_split_reconcile_targets(
 
         if !child.leaf && max_depth > 1 {
             collect_split_reconcile_targets_for_scope(
-                peer_url,
-                peer_token,
-                space_id,
+                &scope,
                 Some(child.prefix.clone()),
                 child.prefix.clone(),
                 2,
-                max_depth,
-                child_limit,
-                tinycloud,
                 &mut targets,
             )
             .await?;
@@ -1101,59 +1097,58 @@ async fn collect_split_reconcile_targets(
     Ok(targets)
 }
 
-fn collect_split_reconcile_targets_for_scope<'a>(
+struct SplitReconcileScope<'a> {
     peer_url: &'a str,
     peer_token: &'a str,
     space_id: &'a str,
-    prefix: Option<String>,
-    root_prefix: String,
-    child_depth: usize,
     max_depth: usize,
     child_limit: usize,
     tinycloud: &'a State<TinyCloud>,
+}
+
+fn collect_split_reconcile_targets_for_scope<'a>(
+    scope: &'a SplitReconcileScope<'a>,
+    prefix: Option<String>,
+    root_prefix: String,
+    child_depth: usize,
     targets: &'a mut Vec<SplitReconcileTarget>,
 ) -> BoxFuture<'a, Result<(), (Status, String)>> {
     Box::pin(async move {
-        if targets.len() >= child_limit {
+        if targets.len() >= scope.child_limit {
             return Ok(());
         }
 
         let (_, _, children) = compare_split_scope(
-            peer_url,
-            peer_token,
+            scope.peer_url,
+            scope.peer_token,
             &KvReconSplitRequest {
-                space_id: space_id.to_string(),
+                space_id: scope.space_id.to_string(),
                 prefix: prefix.clone(),
                 child_start_after: None,
                 child_limit: None,
             },
-            tinycloud,
+            scope.tinycloud,
         )
         .await?;
 
         for child in children {
-            if targets.len() >= child_limit {
+            if targets.len() >= scope.child_limit {
                 break;
             }
             if child.status != "local-missing" && child.status != "mismatch" {
                 continue;
             }
 
-            if !child.leaf && child_depth < max_depth {
+            if !child.leaf && child_depth < scope.max_depth {
                 collect_split_reconcile_targets_for_scope(
-                    peer_url,
-                    peer_token,
-                    space_id,
+                    scope,
                     Some(child.prefix.clone()),
                     root_prefix.clone(),
                     child_depth + 1,
-                    max_depth,
-                    child_limit,
-                    tinycloud,
                     targets,
                 )
                 .await?;
-                if targets.len() >= child_limit {
+                if targets.len() >= scope.child_limit {
                     break;
                 }
                 if targets
