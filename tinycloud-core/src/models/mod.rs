@@ -8,4 +8,5 @@ pub mod invocation;
 pub mod kv_delete;
 pub mod kv_write;
 pub mod revocation;
+pub mod signed_kv_ticket;
 pub mod space;

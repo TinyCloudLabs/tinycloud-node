@@ -8,12 +8,16 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{info_span, Instrument};
 
 use crate::{
-    auth_guards::{DataIn, DataOut, InvOut, ObjectHeaders},
+    auth_guards::{DataIn, DataOut, InvOut, KVResponse, ObjectHeaders},
     authorization::AuthHeaderGetter,
     config::Config,
     hooks::{HookRuntime, WriteEvent},
     quota::QuotaCache,
     routes::public::is_public_space,
+    signed_urls::{
+        load_signed_kv_ticket, mint_signed_kv_url, validate_signed_kv_hash_binding,
+        validate_signed_kv_ticket, SignedKvUrlRequest, SignedKvUrlResponse, SignedUrlRuntime,
+    },
     tracing::TracingSpan,
     BlockStage, BlockStores, TinyCloud,
 };
@@ -54,7 +58,15 @@ fn build_info(
     quota_cache: &State<QuotaCache>,
 ) -> NodeInfo {
     #[allow(unused_mut)]
-    let mut features = vec!["kv", "delegation", "sharing", "sql", "duckdb", "hooks"];
+    let mut features = vec![
+        "kv",
+        "delegation",
+        "sharing",
+        "sql",
+        "duckdb",
+        "hooks",
+        "signed-urls",
+    ];
     #[cfg(feature = "dstack")]
     features.push("tee");
     NodeInfo {
@@ -116,6 +128,49 @@ pub async fn open_host_key(
             "Failed to stage keypair for space",
         )
     })
+}
+
+#[post("/signed/kv", format = "json", data = "<request>")]
+pub async fn create_signed_kv_url(
+    invocation: AuthHeaderGetter<InvocationInfo>,
+    request: Json<SignedKvUrlRequest>,
+    runtime: &State<SignedUrlRuntime>,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Json<SignedKvUrlResponse>, (Status, String)> {
+    let invocation_info = invocation.0 .0.clone();
+    verify_auth(invocation.0, tinycloud).await?;
+    let response = mint_signed_kv_url(
+        &invocation_info,
+        request.into_inner(),
+        runtime.inner(),
+        tinycloud.inner(),
+    )
+    .await?;
+    Ok(Json(response))
+}
+
+#[get("/signed/kv/<ticket_id>")]
+pub async fn signed_kv_get(
+    ticket_id: &str,
+    tinycloud: &State<TinyCloud>,
+) -> Result<
+    KVResponse<tinycloud_core::storage::Content<<BlockStores as ImmutableReadStore>::Readable>>,
+    (Status, String),
+> {
+    let ticket = load_signed_kv_ticket(tinycloud.inner(), ticket_id).await?;
+    let (space_id, key) = validate_signed_kv_ticket(&ticket)?;
+
+    match tinycloud
+        .kv_get(&space_id, &key)
+        .await
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?
+    {
+        Some((md, hash, content)) => {
+            validate_signed_kv_hash_binding(&ticket, &hash)?;
+            Ok(KVResponse::new(md, hash, content))
+        }
+        None => Err((Status::NotFound, "Key not found".to_string())),
+    }
 }
 
 #[derive(Serialize)]

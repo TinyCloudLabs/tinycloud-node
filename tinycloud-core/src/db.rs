@@ -369,6 +369,25 @@ where
             .await
     }
 
+    pub async fn create_signed_kv_ticket(
+        &self,
+        model: signed_kv_ticket::Model,
+    ) -> Result<signed_kv_ticket::Model, DbErr> {
+        signed_kv_ticket::Entity::insert(signed_kv_ticket::ActiveModel::from(model.clone()))
+            .exec(&self.conn)
+            .await?;
+        Ok(model)
+    }
+
+    pub async fn find_signed_kv_ticket(
+        &self,
+        ticket_id: &str,
+    ) -> Result<Option<signed_kv_ticket::Model>, DbErr> {
+        signed_kv_ticket::Entity::find_by_id(ticket_id.to_string())
+            .one(&self.conn)
+            .await
+    }
+
     pub async fn deactivate_hook_subscription(&self, subscription_id: &str) -> Result<(), DbErr> {
         let Some(model) = hook_subscription::Entity::find_by_id(subscription_id.to_string())
             .one(&self.conn)
@@ -408,6 +427,14 @@ where
     B: ImmutableReadStore,
 {
     pub async fn public_kv_get(
+        &self,
+        space_id: &SpaceId,
+        key: &Path,
+    ) -> Result<Option<(Metadata, Hash, Content<B::Readable>)>, EitherError<DbErr, B::Error>> {
+        self.kv_get(space_id, key).await
+    }
+
+    pub async fn kv_get(
         &self,
         space_id: &SpaceId,
         key: &Path,

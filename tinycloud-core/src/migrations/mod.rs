@@ -2,6 +2,7 @@ use sea_orm_migration::prelude::*;
 pub mod m20230510_101010_init_tables;
 pub mod m20260218_sql_database;
 pub mod m20260409_000000_hook_tables;
+pub mod m20260512_000000_signed_kv_tickets;
 
 pub struct Migrator;
 
@@ -12,6 +13,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20230510_101010_init_tables::Migration),
             Box::new(m20260218_sql_database::Migration),
             Box::new(m20260409_000000_hook_tables::Migration),
+            Box::new(m20260512_000000_signed_kv_tickets::Migration),
         ]
     }
 }
