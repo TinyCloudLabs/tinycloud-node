@@ -1,7 +1,10 @@
 # dstack deployment - Topology 2: Postgres + S3
-# tinycloud-node in the CVM, Postgres external.
+# tinycloud-node in the CVM, Postgres external for metadata, S3 external for blocks.
 # Database credentials encrypted by dstack KMS.
 # Column encryption enabled for sensitive data.
+# TinyCloud SQL and DuckDB remain embedded, file-backed services. Keep
+# TINYCLOUD_STORAGE_DATADIR mounted on a persistent volume so those databases
+# survive image updates, container replacement, and restarts.
 #
 # All ${...} variables should be encrypted using dstack's KMS public key
 # before deployment. The operator never sees plaintext values.
@@ -14,9 +17,11 @@ services:
       - "8000:8000"
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
+      - tinycloud-data:/data
     environment:
       TINYCLOUD_KEYS_TYPE: Dstack
       TINYCLOUD_STORAGE_DATABASE: "${DATABASE_URL}"
+      TINYCLOUD_STORAGE_DATADIR: /data
       TINYCLOUD_STORAGE_BLOCKS_TYPE: S3
       TINYCLOUD_STORAGE_BLOCKS_BUCKET: "${S3_BUCKET}"
       TINYCLOUD_STORAGE_BLOCKS_ENDPOINT: "${S3_ENDPOINT}"
@@ -48,3 +53,4 @@ services:
 
 volumes:
   cert-data:
+  tinycloud-data:
