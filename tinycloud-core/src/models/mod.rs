@@ -1,5 +1,6 @@
 pub mod abilities;
 pub mod actor;
+pub mod database_artifact;
 pub mod delegation;
 pub mod epoch;
 pub mod hook_delivery;

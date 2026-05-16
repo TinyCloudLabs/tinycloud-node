@@ -9205,6 +9205,7 @@ dependencies = [
  "aes-gcm",
  "arrow",
  "async-std",
+ "async-trait",
  "dashmap",
  "duckdb",
  "futures",

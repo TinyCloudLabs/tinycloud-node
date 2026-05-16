@@ -7,7 +7,7 @@ extern crate tokio;
 
 use anyhow::{Context, Result};
 use rocket::{fairing::AdHoc, figment::Figment, http::Header, Build, Rocket};
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 pub mod allow_list;
 pub mod auth_guards;
@@ -45,6 +45,7 @@ use storage::{
 };
 use tee::TeeContext;
 use tinycloud_core::{
+    database_artifacts::SeaOrmDatabaseArtifactRepository,
     duckdb::DuckDbService,
     keys::{SecretsSetup, StaticSecret},
     sea_orm::{ConnectOptions, Database, DatabaseConnection},
@@ -194,8 +195,13 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         connect_opts.max_connections(100);
     }
 
+    let database_connection = Database::connect(connect_opts).await?;
+    let database_artifact_repository = Arc::new(SeaOrmDatabaseArtifactRepository::new(
+        database_connection.clone(),
+    ));
+
     let tinycloud = TinyCloud::new(
-        Database::connect(connect_opts).await?,
+        database_connection,
         tinycloud_config.storage.blocks.open().await?,
         key_setup.setup(()).await?,
     )
@@ -205,6 +211,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     let sql_service = SqlService::new(
         tinycloud_config.storage.sql.path.clone().expect("resolved"),
         tinycloud_config.storage.sql.memory_threshold.as_u64(),
+        database_artifact_repository.clone(),
     );
 
     let duckdb_service = DuckDbService::new(
@@ -221,6 +228,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
             .duckdb
             .max_memory_per_connection
             .clone(),
+        database_artifact_repository,
     );
 
     let quota_cache = QuotaCache::new(
