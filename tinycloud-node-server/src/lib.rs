@@ -6,7 +6,7 @@ extern crate anyhow;
 extern crate tokio;
 
 use anyhow::{Context, Result};
-use rocket::{Build, Rocket, fairing::AdHoc, figment::Figment, http::Header};
+use rocket::{fairing::AdHoc, figment::Figment, http::Header, Build, Rocket};
 use std::{path::Path, sync::Arc};
 
 pub mod allow_list;
@@ -41,8 +41,7 @@ use routes::{
         recon_split_compare, reconcile, reconcile_split, replication_export, replication_info,
         replication_notify_poll, replication_session_open, sql_reconcile, sql_replication_export,
     },
-    signed_kv_get,
-    revoke,
+    revoke, signed_kv_get,
     util_routes::*,
     version,
 };
@@ -57,10 +56,10 @@ use tinycloud_core::{
     keys::{SecretsSetup, StaticSecret},
     sea_orm::{ConnectOptions, Database, DatabaseConnection},
     sql::{SqlNodeMode, SqlService},
-    storage::{StorageConfig, either::Either, memory::MemoryStaging},
+    storage::{either::Either, memory::MemoryStaging, StorageConfig},
     ColumnEncryption, ReplicationService, SpaceDatabase,
 };
-use webhook_dispatcher::{WebhookDispatcher, spawn_webhook_dispatcher};
+use webhook_dispatcher::{spawn_webhook_dispatcher, WebhookDispatcher};
 
 pub type BlockStores = Either<S3BlockStore, FileSystemStore>;
 pub type BlockConfig = Either<S3BlockConfig, FileSystemConfig>;
