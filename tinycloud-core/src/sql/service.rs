@@ -410,10 +410,6 @@ impl SqlService {
             .unwrap_or_else(|| "default".to_string())
     }
 
-    pub fn node_mode(&self) -> SqlNodeMode {
-        self.mode
-    }
-
     async fn handle(&self, space: &SpaceId, db_name: &str) -> Result<DatabaseHandle, SqlError> {
         let key = (space.to_string(), db_name.to_string());
         if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
@@ -505,7 +501,7 @@ fn artifact_error_to_sql(err: DatabaseArtifactError) -> SqlError {
 }
 
 #[cfg(test)]
-mod tests {
+mod artifact_tests {
     use super::*;
     use crate::{
         database_artifacts::{DatabaseArtifact, SeaOrmDatabaseArtifactRepository},
@@ -526,7 +522,7 @@ mod tests {
         SpaceId::new(did, name.parse().unwrap())
     }
 
-    async fn artifact_repository() -> Arc<SeaOrmDatabaseArtifactRepository> {
+    pub(super) async fn artifact_repository() -> Arc<SeaOrmDatabaseArtifactRepository> {
         let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
             .await
             .unwrap();
@@ -544,6 +540,7 @@ mod tests {
         let service = SqlService::new(
             cache_one.path().to_string_lossy().to_string(),
             u64::MAX,
+            SqlNodeMode::Host,
             repo.clone(),
         );
         service
@@ -560,6 +557,7 @@ mod tests {
                 },
                 None,
                 "tinycloud.sql/write".to_string(),
+                SqlReadParams::Canonical,
             )
             .await
             .unwrap();
@@ -574,6 +572,7 @@ mod tests {
                 },
                 None,
                 "tinycloud.sql/write".to_string(),
+                SqlReadParams::Canonical,
             )
             .await
             .unwrap();
@@ -582,6 +581,7 @@ mod tests {
         let recreated = SqlService::new(
             cache_two.path().to_string_lossy().to_string(),
             u64::MAX,
+            SqlNodeMode::Host,
             repo,
         );
         let result = recreated
@@ -594,6 +594,7 @@ mod tests {
                 },
                 None,
                 "tinycloud.sql/read".to_string(),
+                SqlReadParams::Canonical,
             )
             .await
             .unwrap();
@@ -645,6 +646,7 @@ mod tests {
         let service = SqlService::new(
             cache.path().to_string_lossy().to_string(),
             u64::MAX,
+            SqlNodeMode::Host,
             Arc::new(FailingArtifactRepository),
         );
 
@@ -659,6 +661,7 @@ mod tests {
                 },
                 None,
                 "tinycloud.sql/write".to_string(),
+                SqlReadParams::Canonical,
             )
             .await
             .expect_err("write must fail when durable save fails");
@@ -672,8 +675,9 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod replication_tests {
     use super::*;
+    use super::artifact_tests::artifact_repository;
     use crate::sql::{SqlRequest, SqlResponse, SqlValue};
     use tempfile::tempdir;
 
@@ -686,15 +690,19 @@ mod tests {
         let tempdir = tempdir().expect("tempdir");
         let host_path = tempdir.path().join("host");
         let replica_path = tempdir.path().join("replica");
+        let host_repo = artifact_repository().await;
+        let replica_repo = artifact_repository().await;
         let host = SqlService::new(
             host_path.to_string_lossy().to_string(),
             1024 * 1024,
             SqlNodeMode::Host,
+            host_repo,
         );
         let replica = SqlService::new(
             replica_path.to_string_lossy().to_string(),
             1024 * 1024,
             SqlNodeMode::Replica,
+            replica_repo,
         );
         let space = test_space();
 
@@ -788,15 +796,19 @@ mod tests {
         let tempdir = tempdir().expect("tempdir");
         let host_path = tempdir.path().join("host");
         let replica_path = tempdir.path().join("replica");
+        let host_repo = artifact_repository().await;
+        let replica_repo = artifact_repository().await;
         let host = SqlService::new(
             host_path.to_string_lossy().to_string(),
             1024 * 1024,
             SqlNodeMode::Host,
+            host_repo,
         );
         let replica = SqlService::new(
             replica_path.to_string_lossy().to_string(),
             1024 * 1024,
             SqlNodeMode::Replica,
+            replica_repo,
         );
         let space = test_space();
 
