@@ -133,6 +133,10 @@ Server debugging:
 - Storage changes must preserve user data across deploys, restarts, and local cache loss.
 - Deployment/release changes should not assume Docker Compose is the production path. TinyCloud
   deploys from GHCR images unless the issue explicitly says otherwise.
+- Release-worthy changes must be visible to release-plz. Use a conventional PR title or merge
+  commit matching `release-plz.toml` (`feat:`, `fix:`, `chore:`, `refactor:`, `perf:`, `docs:`,
+  `ci:`, or `test:`), and confirm the generated release PR changelog includes the user-facing
+  change before treating it as bundled for release.
 - When agent-facing context changes, update this document's additional notes and append a concise
   entry to `agent.changelog.md` so future agents can see what changed and why.
 - Linear issue context matters. Leave concise implementation, testing, and handoff notes on the
