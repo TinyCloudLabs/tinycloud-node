@@ -25,7 +25,7 @@ pub mod tee;
 mod tracing;
 pub mod webhook_dispatcher;
 
-use config::{BlockStorage, Config, Keys, StagingStorage};
+use config::{BlockStorage, Config, Keys, ReplicationRole, StagingStorage};
 use hooks::HookRuntime;
 use quota::QuotaCache;
 use routes::{
@@ -35,7 +35,13 @@ use routes::{
     hooks::{create_hook_ticket, create_webhook, delete_webhook, hook_events, list_webhooks},
     info, invoke, open_host_key,
     public::{public_kv_get, public_kv_head, public_kv_list, public_kv_options, RateLimiter},
-    signed_kv_get,
+    replication::{
+        auth_reconcile, auth_replication_export, kv_state, kv_state_compare, peer_missing_apply,
+        peer_missing_plan, peer_missing_quarantine, recon_compare, recon_export, recon_split,
+        recon_split_compare, reconcile, reconcile_split, replication_export, replication_info,
+        replication_notify_poll, replication_session_open, sql_reconcile, sql_replication_export,
+    },
+    revoke, signed_kv_get,
     util_routes::*,
     version,
 };
@@ -49,9 +55,9 @@ use tinycloud_core::{
     duckdb::DuckDbService,
     keys::{SecretsSetup, StaticSecret},
     sea_orm::{ConnectOptions, Database, DatabaseConnection},
-    sql::SqlService,
+    sql::{SqlNodeMode, SqlService},
     storage::{either::Either, memory::MemoryStaging, StorageConfig},
-    ColumnEncryption, SpaceDatabase,
+    ColumnEncryption, ReplicationService, SpaceDatabase,
 };
 use webhook_dispatcher::{spawn_webhook_dispatcher, WebhookDispatcher};
 
@@ -100,6 +106,7 @@ pub type TinyCloud = SpaceDatabase<DatabaseConnection, BlockStores, StaticSecret
 pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     let mut tinycloud_config: Config = config.extract::<Config>()?;
     tinycloud_config.storage.resolve();
+    tinycloud_config.replication.apply_env_overrides()?;
 
     // Ensure local storage directories exist.
     // SQLite file paths and local dirs are resources the server owns — auto-create them.
@@ -123,6 +130,26 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         create_webhook,
         list_webhooks,
         delete_webhook,
+        revoke,
+        replication_info,
+        replication_session_open,
+        auth_replication_export,
+        auth_reconcile,
+        replication_export,
+        kv_state,
+        kv_state_compare,
+        peer_missing_plan,
+        peer_missing_apply,
+        peer_missing_quarantine,
+        replication_notify_poll,
+        recon_export,
+        recon_split,
+        recon_split_compare,
+        recon_compare,
+        reconcile,
+        reconcile_split,
+        sql_replication_export,
+        sql_reconcile,
         public_kv_get,
         public_kv_head,
         public_kv_list,
@@ -206,11 +233,19 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         key_setup.setup(()).await?,
     )
     .await?
-    .with_encryption(Some(webhook_encryption.clone()));
+    .with_encryption(Some(webhook_encryption.clone()))
+    .with_local_canonical_commits_enabled(matches!(
+        tinycloud_config.replication.role,
+        ReplicationRole::Host
+    ));
 
     let sql_service = SqlService::new(
         tinycloud_config.storage.sql.path.clone().expect("resolved"),
         tinycloud_config.storage.sql.memory_threshold.as_u64(),
+        match tinycloud_config.replication.role {
+            ReplicationRole::Host => SqlNodeMode::Host,
+            ReplicationRole::Replica => SqlNodeMode::Replica,
+        },
         database_artifact_repository.clone(),
     );
 
@@ -248,11 +283,15 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         .mount("/", routes)
         .attach(AdHoc::config::<Config>())
         .attach(tracing::TracingFairing {
-            header_name: tinycloud_config.log.tracing.traceheader,
+            header_name: tinycloud_config.log.tracing.traceheader.clone(),
         })
         .manage(tinycloud)
         .manage(sql_service)
         .manage(duckdb_service)
+        .manage(ReplicationService::with_session_ttl(
+            replication_status(&tinycloud_config),
+            std::time::Duration::from_secs(tinycloud_config.replication.session_ttl_secs),
+        ))
         .manage(quota_cache)
         .manage(hook_runtime)
         .manage(signed_url_runtime)
@@ -273,12 +312,12 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
                 resp.set_header(Header::new(
                     // expose response headers to browser-run scripts
                     "Access-Control-Expose-Headers",
-                    "*, Authorization",
+                    "*, Authorization, Replication-Session, Peer-Replication-Session",
                 ));
                 resp.set_header(Header::new(
                     // allow custom headers + Authorization in requests
                     "Access-Control-Allow-Headers",
-                    "*, Authorization",
+                    "*, Authorization, Replication-Session, Peer-Replication-Session",
                 ));
                 resp.set_header(Header::new("Access-Control-Allow-Credentials", "true"));
             })
@@ -371,4 +410,28 @@ async fn ensure_local_dirs(storage: &config::Storage) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn replication_status(config: &Config) -> tinycloud_core::replication::ReplicationStatus {
+    let role_name = match config.replication.role {
+        ReplicationRole::Host => "host",
+        ReplicationRole::Replica => "replica",
+    };
+    let peer_serving = match config.replication.role {
+        ReplicationRole::Host => true,
+        ReplicationRole::Replica => config.replication.peer_serving,
+    };
+
+    tinycloud_core::replication::ReplicationStatus {
+        supported: true,
+        enabled: true,
+        roles_supported: vec!["host", "replica"],
+        roles_enabled: vec![role_name],
+        peer_serving,
+        recon: true,
+        auth_sync: true,
+        authored_fact_exchange: true,
+        notifications: true,
+        snapshots: true,
+    }
 }

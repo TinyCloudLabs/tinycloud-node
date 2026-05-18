@@ -86,6 +86,12 @@ pub enum TinyCloudRevocation {
     Cacao(SiweCacao),
 }
 
+impl TinyCloudRevocation {
+    pub fn from_bytes(b: &[u8]) -> Result<Self, EncodingError> {
+        Ok(Self::Cacao(serde_ipld_dagcbor::from_slice(b)?))
+    }
+}
+
 impl HeaderEncode for TinyCloudRevocation {
     fn encode(&self) -> Result<String, EncodingError> {
         match self {

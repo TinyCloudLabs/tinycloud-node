@@ -19,12 +19,14 @@ COPY ./tinycloud-sdk-wasm/ ./tinycloud-sdk-wasm/
 COPY ./dependencies/siwe/ ./dependencies/siwe/
 COPY ./dependencies/siwe-recap/ ./dependencies/siwe-recap/
 COPY ./dependencies/cacao/ ./dependencies/cacao/
+COPY ./vendor/ ./vendor/
 COPY ./scripts/ ./scripts/
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 ARG CARGO_FEATURES=""
 COPY --from=planner /app/recipe.json recipe.json
+COPY --from=planner /app/vendor/ ./vendor/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     cargo chef cook --release --recipe-path recipe.json ${CARGO_FEATURES:+--features $CARGO_FEATURES}

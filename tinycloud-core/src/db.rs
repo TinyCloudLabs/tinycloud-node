@@ -1,16 +1,35 @@
 use crate::encryption::ColumnEncryption;
-use crate::events::{epoch_hash, Delegation, Event, HashError, Invocation, Operation, Revocation};
+use crate::events::{
+    epoch_hash, Delegation, Event, HashError, HeaderEncode, Invocation, Operation, Revocation,
+    TinyCloudInvocation,
+};
 use crate::hash::Hash;
 use crate::keys::{get_did_key, Secrets};
 use crate::migrations::Migrator;
 use crate::models::*;
 use crate::relationships::*;
+use crate::replication::recon::{
+    kv_recon_fingerprint, kv_recon_item, sort_kv_recon_items, split_kv_recon_items,
+    window_kv_recon_items, window_kv_recon_split_children,
+};
+use crate::replication::{
+    decode_hash, encode_hash, AuthReplicationApplyResponse, AuthReplicationExportRequest,
+    AuthReplicationExportResponse, KvPeerMissingPlanItem, KvPeerMissingQuarantineItem,
+    KvPeerMissingQuarantineRequest, KvPeerMissingQuarantineResponse, KvReconExportRequest,
+    KvReconExportResponse, KvReconSplitRequest, KvReconSplitResponse, KvReplicationError,
+    KvReplicationEvent, KvReplicationOperation, KvReplicationSequence, KvStateItem, KvStateRequest,
+    KvStateResponse, KvStateStatus, ReplicationApplyResponse, ReplicationExportRequest,
+    ReplicationExportResponse,
+};
 use crate::storage::{
     either::EitherError, Content, HashBuffer, ImmutableDeleteStore, ImmutableReadStore,
     ImmutableStaging, ImmutableWriteStore, StorageSetup, StoreSize,
 };
-use crate::types::{CapabilitiesReadParams, ListFilters, Metadata, Resource, SpaceIdWrap};
+use crate::types::{
+    CapabilitiesReadParams, KvReadParams, ListFilters, Metadata, Resource, SpaceIdWrap,
+};
 use crate::util::{Capability, DelegationInfo};
+use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use sea_orm::{
     entity::prelude::*,
     error::{DbErr, RuntimeErr, SqlxError},
@@ -20,10 +39,11 @@ use sea_orm::{
     ConnectionTrait, DatabaseTransaction, IntoActiveModel, TransactionTrait,
 };
 use sea_orm_migration::MigratorTrait;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::str::FromStr;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_auth::{
-    authorization::{EncodingError, TinyCloudDelegation},
+    authorization::{EncodingError, TinyCloudDelegation, TinyCloudRevocation},
     resource::{Path, SpaceId},
 };
 
@@ -51,6 +71,7 @@ pub struct SpaceDatabase<C, B, S> {
     storage: B,
     secrets: S,
     encryption: Option<ColumnEncryption>,
+    local_canonical_commits_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +91,9 @@ pub struct TransactResult {
     pub delegation_cids: Vec<Hash>,
 }
 
+const KV_CANONICAL_KIND_PUT: &str = "put";
+const KV_CANONICAL_KIND_DELETE: &str = "delete";
+
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum TxError<S: StorageSetup, K: Secrets> {
@@ -82,9 +106,13 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
     #[error(transparent)]
     InvalidDelegation(#[from] delegation::DelegationError),
     #[error(transparent)]
+    InvalidDelegationInfo(#[from] crate::util::DelegationError),
+    #[error(transparent)]
     InvalidInvocation(#[from] invocation::InvocationError),
     #[error(transparent)]
     InvalidRevocation(#[from] revocation::RevocationError),
+    #[error(transparent)]
+    InvalidRevocationInfo(#[from] crate::util::RevocationError),
     #[error("Epoch Hashing Err: {0}")]
     EpochHashingErr(#[from] HashError),
     #[error(transparent)]
@@ -144,11 +172,17 @@ impl<B, K> SpaceDatabase<DatabaseConnection, B, K> {
             storage,
             secrets,
             encryption: None,
+            local_canonical_commits_enabled: true,
         })
     }
 
     pub fn with_encryption(mut self, encryption: Option<ColumnEncryption>) -> Self {
         self.encryption = encryption;
+        self
+    }
+
+    pub fn with_local_canonical_commits_enabled(mut self, enabled: bool) -> Self {
+        self.local_canonical_commits_enabled = enabled;
         self
     }
 }
@@ -430,8 +464,9 @@ where
         &self,
         space_id: &SpaceId,
         key: &Path,
+        read_params: KvReadParams,
     ) -> Result<Option<(Metadata, Hash, Content<B::Readable>)>, EitherError<DbErr, B::Error>> {
-        self.kv_get(space_id, key).await
+        get_kv(&self.conn, &self.storage, space_id, key, read_params).await
     }
 
     pub async fn kv_get(
@@ -439,23 +474,942 @@ where
         space_id: &SpaceId,
         key: &Path,
     ) -> Result<Option<(Metadata, Hash, Content<B::Readable>)>, EitherError<DbErr, B::Error>> {
-        get_kv(&self.conn, &self.storage, space_id, key).await
+        get_kv(
+            &self.conn,
+            &self.storage,
+            space_id,
+            key,
+            KvReadParams::default(),
+        )
+        .await
     }
 
     pub async fn public_kv_metadata(
         &self,
         space_id: &SpaceId,
         key: &Path,
+        read_params: KvReadParams,
     ) -> Result<Option<Metadata>, DbErr> {
-        metadata(&self.conn, space_id, key).await
+        metadata(&self.conn, space_id, key, read_params).await
     }
 
     pub async fn public_kv_list(
         &self,
         space_id: &SpaceId,
         prefix: &Path,
+        read_params: KvReadParams,
     ) -> Result<Vec<Path>, DbErr> {
-        list(&self.conn, space_id, prefix).await
+        list(&self.conn, space_id, prefix, read_params).await
+    }
+
+    pub async fn latest_kv_canonical_seq(
+        &self,
+        space_id: &str,
+        prefix: Option<&str>,
+    ) -> Result<i64, KvReplicationError> {
+        let space_id = parse_replication_space_id(space_id)?;
+        let prefix = prefix.map(parse_replication_path).transpose()?;
+        latest_canonical_kv_seq_for_prefix(&self.conn, &space_id, prefix.as_ref())
+            .await
+            .map_err(KvReplicationError::Db)
+    }
+
+    pub async fn replication_session_delegation_active(
+        &self,
+        delegation_hash: Option<Hash>,
+    ) -> Result<bool, DbErr> {
+        let Some(delegation_hash) = delegation_hash else {
+            return Ok(true);
+        };
+
+        let now = time::OffsetDateTime::now_utc();
+        let delegation = delegation::Entity::find_by_id(delegation_hash)
+            .one(&self.conn)
+            .await?;
+        let revoked = revocation::Entity::find()
+            .filter(revocation::Column::Revoked.eq(delegation_hash))
+            .one(&self.conn)
+            .await?;
+
+        if revoked.is_some() {
+            return Ok(false);
+        }
+
+        Ok(delegation
+            .map(|delegation| {
+                delegation.expiry.map(|expiry| expiry > now).unwrap_or(true)
+                    && delegation
+                        .not_before
+                        .map(|not_before| not_before <= now)
+                        .unwrap_or(true)
+            })
+            .unwrap_or(false))
+    }
+
+    pub async fn export_kv_replication(
+        &self,
+        request: &ReplicationExportRequest,
+    ) -> Result<ReplicationExportResponse, KvReplicationError> {
+        let space_id = parse_replication_space_id(&request.space_id)?;
+        let prefix = request
+            .prefix
+            .as_deref()
+            .map(parse_replication_path)
+            .transpose()?;
+        let since_seq = request.since_seq.unwrap_or(-1);
+        let limit = request.limit.unwrap_or(32).max(1) as u64;
+        let seqs =
+            select_kv_replication_seqs(&self.conn, &space_id, prefix.as_ref(), since_seq, limit)
+                .await?;
+        if seqs.is_empty() {
+            return Ok(ReplicationExportResponse {
+                space_id: request.space_id.clone(),
+                prefix: request.prefix.clone(),
+                requested_since_seq: request.since_seq,
+                exported_until_seq: request.since_seq,
+                sequences: Vec::new(),
+            });
+        }
+
+        let mut sequences = BTreeMap::<i64, KvReplicationSequence>::new();
+        for seq in &seqs {
+            let events = event_order::Entity::find()
+                .filter(
+                    Condition::all()
+                        .add(event_order::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+                        .add(event_order::Column::Seq.eq(*seq)),
+                )
+                .order_by_asc(event_order::Column::EpochSeq)
+                .all(&self.conn)
+                .await?;
+
+            let mut sequence = None::<KvReplicationSequence>;
+            for committed in events {
+                let invocation = invocation::Entity::find_by_id(committed.event)
+                    .one(&self.conn)
+                    .await?
+                    .ok_or(KvReplicationError::UnsupportedInvocation {
+                        invocation_id: encode_hash(committed.event),
+                        reason:
+                            "non-invocation events in a replication sequence are not yet supported",
+                    })?;
+
+                let serialization = crate::encryption::maybe_decrypt(
+                    self.encryption.as_ref(),
+                    &invocation.serialization,
+                )?;
+                let invocation_string = String::from_utf8(serialization).map_err(|error| {
+                    KvReplicationError::InvalidInvocationUtf8 {
+                        invocation_id: encode_hash(committed.event),
+                        reason: error.to_string(),
+                    }
+                })?;
+                let parsed_invocation =
+                    Invocation::from_header_ser::<TinyCloudInvocation>(&invocation_string)
+                        .map_err(|error| KvReplicationError::InvalidInvocation {
+                            invocation_id: encode_hash(committed.event),
+                            reason: error.to_string(),
+                        })?;
+                let delegations = export_invocation_delegations(
+                    &self.conn,
+                    self.encryption.as_ref(),
+                    &encode_hash(committed.event),
+                    &parsed_invocation.0.parents,
+                )
+                .await?;
+
+                let writes = kv_write::Entity::find()
+                    .filter(
+                        Condition::all()
+                            .add(kv_write::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+                            .add(kv_write::Column::Invocation.eq(committed.event)),
+                    )
+                    .all(&self.conn)
+                    .await?;
+
+                let operation = if let [write] = writes.as_slice() {
+                    if let Some(prefix) = prefix.as_ref() {
+                        if !write.key.0.as_str().starts_with(prefix.as_str()) {
+                            return Err(KvReplicationError::UnsupportedInvocation {
+                                invocation_id: encode_hash(committed.event),
+                                reason: "partial prefix export for a shared sequence is not yet supported",
+                            });
+                        }
+                    }
+
+                    let content = self
+                        .storage
+                        .read_to_vec(&space_id, &write.value)
+                        .await
+                        .map_err(|error| KvReplicationError::StoreRead(error.to_string()))?
+                        .ok_or_else(|| KvReplicationError::MissingBlock {
+                            invocation_id: encode_hash(committed.event),
+                            hash: encode_hash(write.value),
+                        })?;
+
+                    KvReplicationOperation::Put {
+                        key: write.key.to_string(),
+                        value_hash: encode_hash(write.value),
+                        metadata: write.metadata.clone(),
+                        content,
+                    }
+                } else if !writes.is_empty() {
+                    return Err(KvReplicationError::UnsupportedInvocation {
+                        invocation_id: encode_hash(committed.event),
+                        reason:
+                            "multi-key kv write invocations are not yet supported for replication export",
+                    });
+                } else if let Some(delete) =
+                    kv_delete::Entity::find_by_id((committed.event, SpaceIdWrap(space_id.clone())))
+                        .one(&self.conn)
+                        .await?
+                {
+                    if let Some(prefix) = prefix.as_ref() {
+                        if !delete.key.0.as_str().starts_with(prefix.as_str()) {
+                            return Err(KvReplicationError::UnsupportedInvocation {
+                                invocation_id: encode_hash(committed.event),
+                                reason: "partial prefix export for a shared sequence is not yet supported",
+                            });
+                        }
+                    }
+
+                    let deleted_ordering = event_order::Entity::find()
+                        .filter(
+                            Condition::all()
+                                .add(event_order::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+                                .add(event_order::Column::Event.eq(delete.deleted_invocation_id)),
+                        )
+                        .one(&self.conn)
+                        .await?
+                        .ok_or_else(|| KvReplicationError::MissingDeletedWrite {
+                            invocation_id: encode_hash(committed.event),
+                        })?;
+
+                    KvReplicationOperation::Delete {
+                        key: delete.key.to_string(),
+                        deleted_invocation_id: encode_hash(delete.deleted_invocation_id),
+                        deleted_seq: deleted_ordering.seq,
+                        deleted_epoch: encode_hash(deleted_ordering.epoch),
+                        deleted_epoch_seq: deleted_ordering.epoch_seq,
+                    }
+                } else {
+                    return Err(KvReplicationError::UnsupportedInvocation {
+                        invocation_id: encode_hash(committed.event),
+                        reason: "non-kv events in a replication sequence are not yet supported",
+                    });
+                };
+
+                let entry = sequence.get_or_insert_with(|| KvReplicationSequence {
+                    seq: committed.seq,
+                    epoch: encode_hash(committed.epoch),
+                    events: Vec::new(),
+                });
+                if entry.epoch != encode_hash(committed.epoch) {
+                    return Err(KvReplicationError::UnsupportedInvocation {
+                        invocation_id: encode_hash(committed.event),
+                        reason: "sequence mapped to multiple epochs",
+                    });
+                }
+
+                entry.events.push(KvReplicationEvent {
+                    invocation_id: encode_hash(committed.event),
+                    canonical_commit_seq: find_kv_canonical_commit_seq(
+                        &self.conn,
+                        &space_id,
+                        committed.event,
+                    )
+                    .await?,
+                    invocation: invocation_string,
+                    delegations,
+                    operation,
+                });
+            }
+
+            if let Some(sequence) = sequence {
+                sequences.insert(*seq, sequence);
+            }
+        }
+
+        let exported_until_seq = sequences.keys().next_back().copied();
+        Ok(ReplicationExportResponse {
+            space_id: request.space_id.clone(),
+            prefix: request.prefix.clone(),
+            requested_since_seq: request.since_seq,
+            exported_until_seq,
+            sequences: sequences.into_values().collect(),
+        })
+    }
+
+    pub async fn export_kv_recon(
+        &self,
+        request: &KvReconExportRequest,
+    ) -> Result<KvReconExportResponse, KvReplicationError> {
+        let space_id = parse_replication_space_id(&request.space_id)?;
+        let prefix = request
+            .prefix
+            .as_deref()
+            .map(parse_replication_path)
+            .transpose()?;
+        let commits = select_kv_recon_commits(&self.conn, &space_id, prefix.as_ref()).await?;
+        let mut items = commits
+            .into_iter()
+            .map(|commit| kv_recon_item(&commit))
+            .collect::<Vec<_>>();
+        sort_kv_recon_items(&mut items);
+        let (items, has_more, next_start_after) =
+            window_kv_recon_items(&items, request.start_after.as_deref(), request.limit);
+
+        Ok(KvReconExportResponse {
+            space_id: request.space_id.clone(),
+            prefix: request.prefix.clone(),
+            start_after: request.start_after.clone(),
+            limit: request.limit,
+            item_count: items.len(),
+            has_more,
+            next_start_after,
+            fingerprint: kv_recon_fingerprint(&items),
+            items,
+        })
+    }
+
+    pub async fn export_kv_recon_split(
+        &self,
+        request: &KvReconSplitRequest,
+    ) -> Result<KvReconSplitResponse, KvReplicationError> {
+        let export = self
+            .export_kv_recon(&KvReconExportRequest {
+                space_id: request.space_id.clone(),
+                prefix: request.prefix.clone(),
+                start_after: None,
+                limit: None,
+            })
+            .await?;
+        let children = split_kv_recon_items(&export.items, request.prefix.as_deref());
+        let (children, has_more, next_child_start_after) = window_kv_recon_split_children(
+            &children,
+            request.child_start_after.as_deref(),
+            request.child_limit,
+        );
+
+        Ok(KvReconSplitResponse {
+            space_id: request.space_id.clone(),
+            prefix: request.prefix.clone(),
+            child_start_after: request.child_start_after.clone(),
+            child_limit: request.child_limit,
+            item_count: export.item_count,
+            fingerprint: export.fingerprint,
+            has_more,
+            next_child_start_after,
+            children,
+        })
+    }
+
+    pub async fn export_kv_state(
+        &self,
+        request: &KvStateRequest,
+    ) -> Result<KvStateResponse, KvReplicationError> {
+        let space_id = parse_replication_space_id(&request.space_id)?;
+        let prefix = request
+            .prefix
+            .as_deref()
+            .map(parse_replication_path)
+            .transpose()?;
+        let prefix_str = prefix.as_ref().map(|value| value.as_str().to_string());
+        let mut items = Vec::with_capacity(request.keys.len());
+
+        for key in &request.keys {
+            let path = parse_replication_path(key)?;
+            if let Some(prefix) = prefix.as_ref() {
+                let path_str = path.as_str();
+                let prefix_value = prefix.as_str();
+                if path_str != prefix_value && !path_str.starts_with(&format!("{prefix_value}/")) {
+                    return Err(KvReplicationError::InvalidPath(key.clone()));
+                }
+            }
+
+            let latest = latest_canonical_kv_commit(&self.conn, &space_id, &path).await?;
+            let item = if let Some(entry) = latest {
+                if entry.kind == KV_CANONICAL_KIND_PUT {
+                    KvStateItem {
+                        key: path.as_str().to_string(),
+                        status: kv_state_status_label(&KvStateStatus::Present).to_string(),
+                        seq: Some(entry.seq),
+                        invocation_id: Some(encode_hash(entry.invocation_id)),
+                        deleted_invocation_id: None,
+                        value_hash: entry.value.clone(),
+                    }
+                } else {
+                    KvStateItem {
+                        key: path.as_str().to_string(),
+                        status: kv_state_status_label(&KvStateStatus::Deleted).to_string(),
+                        seq: Some(entry.seq),
+                        invocation_id: Some(encode_hash(entry.invocation_id)),
+                        deleted_invocation_id: entry.deleted_invocation_id.clone(),
+                        value_hash: None,
+                    }
+                }
+            } else {
+                KvStateItem {
+                    key: path.as_str().to_string(),
+                    status: kv_state_status_label(&KvStateStatus::Absent).to_string(),
+                    seq: None,
+                    invocation_id: None,
+                    deleted_invocation_id: None,
+                    value_hash: None,
+                }
+            };
+            items.push(item);
+        }
+
+        Ok(KvStateResponse {
+            space_id: request.space_id.clone(),
+            prefix: prefix_str,
+            items,
+        })
+    }
+
+    pub async fn quarantine_kv_peer_missing(
+        &self,
+        space_id: &str,
+        peer_url: &str,
+        item: &KvPeerMissingPlanItem,
+        local_invocation_id: &str,
+    ) -> Result<bool, KvReplicationError> {
+        let space_id = parse_replication_space_id(space_id)?;
+        let key = parse_replication_path(&item.key)?;
+        let quarantined_at = OffsetDateTime::now_utc().unix_timestamp();
+        let existing = kv_quarantine::Entity::find()
+            .filter(
+                Condition::all()
+                    .add(kv_quarantine::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+                    .add(kv_quarantine::Column::Key.eq(key.as_str())),
+            )
+            .one(&self.conn)
+            .await?;
+
+        if let Some(existing) = existing {
+            let mut active: kv_quarantine::ActiveModel = existing.into();
+            active.peer_url = sea_orm::ActiveValue::Set(peer_url.to_string());
+            active.local_invocation_id = sea_orm::ActiveValue::Set(local_invocation_id.to_string());
+            active.peer_status = sea_orm::ActiveValue::Set(item.peer_status.clone());
+            active.peer_invocation_id = sea_orm::ActiveValue::Set(item.peer_invocation_id.clone());
+            active.peer_deleted_invocation_id =
+                sea_orm::ActiveValue::Set(item.peer_deleted_invocation_id.clone());
+            active.quarantined_at = sea_orm::ActiveValue::Set(quarantined_at);
+            active.update(&self.conn).await?;
+            Ok(false)
+        } else {
+            kv_quarantine::Entity::insert(kv_quarantine::ActiveModel {
+                space: sea_orm::ActiveValue::Set(SpaceIdWrap(space_id)),
+                key: sea_orm::ActiveValue::Set(key.into()),
+                peer_url: sea_orm::ActiveValue::Set(peer_url.to_string()),
+                local_invocation_id: sea_orm::ActiveValue::Set(local_invocation_id.to_string()),
+                peer_status: sea_orm::ActiveValue::Set(item.peer_status.clone()),
+                peer_invocation_id: sea_orm::ActiveValue::Set(item.peer_invocation_id.clone()),
+                peer_deleted_invocation_id: sea_orm::ActiveValue::Set(
+                    item.peer_deleted_invocation_id.clone(),
+                ),
+                quarantined_at: sea_orm::ActiveValue::Set(quarantined_at),
+            })
+            .exec(&self.conn)
+            .await?;
+            Ok(true)
+        }
+    }
+
+    pub async fn clear_kv_peer_missing_quarantine(
+        &self,
+        space_id: &str,
+        key: &str,
+    ) -> Result<bool, KvReplicationError> {
+        let space_id = parse_replication_space_id(space_id)?;
+        let key = parse_replication_path(key)?;
+        let result = kv_quarantine::Entity::delete_many()
+            .filter(
+                Condition::all()
+                    .add(kv_quarantine::Column::Space.eq(SpaceIdWrap(space_id)))
+                    .add(kv_quarantine::Column::Key.eq(key.as_str())),
+            )
+            .exec(&self.conn)
+            .await?;
+        Ok(result.rows_affected > 0)
+    }
+
+    pub async fn export_kv_peer_missing_quarantine(
+        &self,
+        request: &KvPeerMissingQuarantineRequest,
+    ) -> Result<KvPeerMissingQuarantineResponse, KvReplicationError> {
+        let space_id = parse_replication_space_id(&request.space_id)?;
+        let prefix = request
+            .prefix
+            .as_deref()
+            .map(parse_replication_path)
+            .transpose()?;
+        let start_after = request
+            .start_after
+            .as_deref()
+            .map(parse_replication_path)
+            .transpose()?;
+        let limit = request.limit.unwrap_or(128).clamp(1, 512);
+
+        let mut query = kv_quarantine::Entity::find()
+            .filter(Condition::all().add(kv_quarantine::Column::Space.eq(SpaceIdWrap(space_id))));
+
+        if let Some(prefix) = prefix.as_ref() {
+            query = query.filter(kv_quarantine::Column::Key.starts_with(prefix.as_str()));
+        }
+
+        if let Some(start_after) = start_after.as_ref() {
+            query = query.filter(kv_quarantine::Column::Key.gt(start_after.as_str()));
+        }
+
+        let mut rows = query
+            .order_by_asc(kv_quarantine::Column::Key)
+            .limit((limit + 1) as u64)
+            .all(&self.conn)
+            .await?;
+
+        let has_more = rows.len() > limit;
+        if has_more {
+            rows.truncate(limit);
+        }
+
+        let next_start_after = if has_more {
+            rows.last().map(|row| row.key.to_string())
+        } else {
+            None
+        };
+
+        Ok(KvPeerMissingQuarantineResponse {
+            space_id: request.space_id.clone(),
+            prefix: prefix.map(|value| value.to_string()),
+            start_after: start_after.map(|value| value.to_string()),
+            limit: Some(limit),
+            has_more,
+            next_start_after,
+            items: rows
+                .into_iter()
+                .map(|row| KvPeerMissingQuarantineItem {
+                    key: row.key.to_string(),
+                    peer_url: row.peer_url,
+                    local_invocation_id: row.local_invocation_id,
+                    peer_status: row.peer_status,
+                    peer_invocation_id: row.peer_invocation_id,
+                    peer_deleted_invocation_id: row.peer_deleted_invocation_id,
+                    quarantined_at: row.quarantined_at,
+                })
+                .collect(),
+        })
+    }
+
+    pub async fn has_active_host_delegation(
+        &self,
+        space_id: &str,
+        delegate_did: &str,
+    ) -> Result<bool, KvReplicationError> {
+        let space_id = parse_replication_space_id(space_id)?;
+        has_active_host_delegation_for_db(&self.conn, &space_id, delegate_did)
+            .await
+            .map_err(KvReplicationError::from)
+    }
+
+    pub async fn export_auth_replication(
+        &self,
+        request: &AuthReplicationExportRequest,
+    ) -> Result<AuthReplicationExportResponse, KvReplicationError> {
+        let space_id = parse_replication_space_id(&request.space_id)?;
+        let (delegations, abilities): (Vec<delegation::Model>, Vec<Vec<abilities::Model>>) =
+            delegation::Entity::find()
+                .find_with_related(abilities::Entity)
+                .all(&self.conn)
+                .await?
+                .into_iter()
+                .unzip();
+        let delegation_ids = delegations
+            .iter()
+            .map(|delegation| delegation.id)
+            .collect::<Vec<_>>();
+        let parent_rows = parent_delegations::Entity::find()
+            .filter(parent_delegations::Column::Child.is_in(delegation_ids))
+            .all(&self.conn)
+            .await?;
+        let mut parent_ids_by_child = HashMap::<Hash, Vec<Hash>>::new();
+        for parent_row in parent_rows {
+            parent_ids_by_child
+                .entry(parent_row.child)
+                .or_default()
+                .push(parent_row.parent);
+        }
+
+        let mut encoded_delegations = HashMap::new();
+        let mut seed_ids = Vec::new();
+
+        for (delegation, ability_list) in delegations.iter().zip(abilities.iter()) {
+            let serialization = crate::encryption::maybe_decrypt(
+                self.encryption.as_ref(),
+                &delegation.serialization,
+            )?;
+            encoded_delegations.insert(
+                delegation.id,
+                TinyCloudDelegation::from_bytes(&serialization)?.encode()?,
+            );
+
+            if delegation_matches_space(ability_list, &space_id) {
+                seed_ids.push(delegation.id);
+            }
+        }
+
+        let delegations =
+            ordered_auth_delegations(seed_ids, &parent_ids_by_child, &encoded_delegations);
+        let included_ids: Vec<Hash> = delegations.iter().map(|(hash, _)| *hash).collect();
+        let revocations = if included_ids.is_empty() {
+            Vec::new()
+        } else {
+            revocation::Entity::find()
+                .filter(revocation::Column::Revoked.is_in(included_ids))
+                .order_by_asc(revocation::Column::Id)
+                .all(&self.conn)
+                .await?
+                .into_iter()
+                .map(|revocation| URL_SAFE.encode(&revocation.serialization))
+                .collect()
+        };
+
+        Ok(AuthReplicationExportResponse {
+            space_id: request.space_id.clone(),
+            delegations: delegations
+                .into_iter()
+                .map(|(_, delegation)| delegation)
+                .collect(),
+            revocations,
+        })
+    }
+}
+
+impl<C, B, K> SpaceDatabase<C, B, K>
+where
+    C: TransactionTrait + ConnectionTrait,
+    B: ImmutableReadStore + StorageSetup,
+    K: Secrets,
+{
+    pub async fn apply_auth_replication(
+        &self,
+        export: &AuthReplicationExportResponse,
+    ) -> Result<AuthReplicationApplyResponse, TxError<B, K>> {
+        let mut imported_delegations = 0usize;
+        let mut imported_revocations = 0usize;
+
+        for delegation_header in &export.delegations {
+            let delegation =
+                match Delegation::from_header_ser::<TinyCloudDelegation>(delegation_header) {
+                    Ok(delegation) => delegation,
+                    Err(crate::events::FromReqErr::Encoding(error)) => {
+                        return Err(TxError::Encoding(error));
+                    }
+                    Err(crate::events::FromReqErr::TryFrom(error)) => {
+                        return Err(TxError::InvalidDelegationInfo(error));
+                    }
+                };
+            let delegation_hash = delegation.hash();
+
+            if delegation::Entity::find_by_id(delegation_hash)
+                .one(&self.conn)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+
+            self.delegate(delegation).await?;
+            imported_delegations += 1;
+        }
+
+        for revocation_header in &export.revocations {
+            let revocation =
+                match Revocation::from_header_ser::<TinyCloudRevocation>(revocation_header) {
+                    Ok(revocation) => revocation,
+                    Err(crate::events::FromReqErr::Encoding(error)) => {
+                        return Err(TxError::Encoding(error));
+                    }
+                    Err(crate::events::FromReqErr::TryFrom(error)) => {
+                        return Err(TxError::InvalidRevocationInfo(error));
+                    }
+                };
+            let revocation_hash = revocation.hash();
+
+            if revocation::Entity::find_by_id(revocation_hash)
+                .one(&self.conn)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+
+            self.revoke(revocation).await?;
+            imported_revocations += 1;
+        }
+
+        Ok(AuthReplicationApplyResponse {
+            space_id: export.space_id.clone(),
+            peer_url: None,
+            imported_delegations,
+            imported_revocations,
+        })
+    }
+
+    pub async fn apply_kv_replication<S>(
+        &self,
+        export: &ReplicationExportResponse,
+        staging: &S,
+    ) -> Result<ReplicationApplyResponse, KvReplicationError>
+    where
+        B: ImmutableWriteStore<S> + ImmutableDeleteStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
+        let space_id = parse_replication_space_id(&export.space_id)?;
+        let mut applied_sequences = 0usize;
+        let mut applied_events = 0usize;
+
+        for sequence in &export.sequences {
+            let mut events = Vec::new();
+            for event in &sequence.events {
+                self.import_invocation_delegations(event).await?;
+                let invocation_hash = decode_hash(&event.invocation_id, "invocationId")?;
+                let existing = invocation::Entity::find_by_id(invocation_hash)
+                    .one(&self.conn)
+                    .await?;
+                if existing.is_some() {
+                    self.persist_replication_canonical_commit(&space_id, event)
+                        .await?;
+                    continue;
+                }
+
+                let (invocation, operation) = self
+                    .rebuild_kv_replication_event(&space_id, event, staging)
+                    .await?;
+                events.push(Event::Invocation(Box::new(invocation), vec![operation]));
+            }
+
+            if events.is_empty() {
+                continue;
+            }
+
+            applied_events += events.len();
+            self.transact(events)
+                .await
+                .map_err(|error| KvReplicationError::Tx(error.to_string()))?;
+            for event in &sequence.events {
+                self.persist_replication_canonical_commit(&space_id, event)
+                    .await?;
+            }
+            applied_sequences += 1;
+        }
+
+        Ok(ReplicationApplyResponse {
+            space_id: export.space_id.clone(),
+            requested_since_seq: export.requested_since_seq,
+            peer_url: None,
+            applied_sequences,
+            applied_events,
+            applied_until_seq: export.exported_until_seq,
+        })
+    }
+
+    async fn rebuild_kv_replication_event<S>(
+        &self,
+        space_id: &SpaceId,
+        event: &KvReplicationEvent,
+        staging: &S,
+    ) -> Result<(Invocation, Operation), KvReplicationError>
+    where
+        B: ImmutableWriteStore<S> + ImmutableDeleteStore + ImmutableReadStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
+        let invocation = Invocation::from_header_ser::<TinyCloudInvocation>(&event.invocation)
+            .map_err(|error| KvReplicationError::Tx(error.to_string()))?;
+
+        match &event.operation {
+            KvReplicationOperation::Put {
+                key,
+                value_hash,
+                metadata,
+                content,
+            } => {
+                let key = parse_replication_path(key)?;
+                let hash = decode_hash(value_hash, "valueHash")?;
+                let mut staged = staging
+                    .stage(space_id)
+                    .await
+                    .map_err(|error| KvReplicationError::Stage(error.to_string()))?;
+                futures::io::AsyncWriteExt::write_all(&mut staged, content)
+                    .await
+                    .map_err(KvReplicationError::Io)?;
+                futures::io::AsyncWriteExt::close(&mut staged)
+                    .await
+                    .map_err(KvReplicationError::Io)?;
+                self.storage
+                    .persist_keyed(space_id, staged, &hash)
+                    .await
+                    .map_err(|error| KvReplicationError::StoreWrite(error.to_string()))?;
+
+                Ok((
+                    invocation,
+                    Operation::KvWrite {
+                        space: space_id.clone(),
+                        key,
+                        value: hash,
+                        metadata: metadata.clone(),
+                    },
+                ))
+            }
+            KvReplicationOperation::Delete { .. } => {
+                let (key, deleted_invocation_id, deleted_seq, deleted_epoch, deleted_epoch_seq) =
+                    match &event.operation {
+                        KvReplicationOperation::Delete {
+                            key,
+                            deleted_invocation_id,
+                            deleted_seq,
+                            deleted_epoch,
+                            deleted_epoch_seq,
+                            ..
+                        } => (
+                            parse_replication_path(key)?,
+                            decode_hash(deleted_invocation_id, "deletedInvocationId")?,
+                            *deleted_seq,
+                            decode_hash(deleted_epoch, "deletedEpoch")?,
+                            *deleted_epoch_seq,
+                        ),
+                        _ => unreachable!(),
+                    };
+
+                let deleted_write = if let Some(write) = kv_write::Entity::find()
+                    .filter(
+                        Condition::all()
+                            .add(kv_write::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+                            .add(kv_write::Column::Key.eq(key.as_str()))
+                            .add(kv_write::Column::Invocation.eq(deleted_invocation_id)),
+                    )
+                    .one(&self.conn)
+                    .await?
+                {
+                    write
+                } else if let Some(write) = kv_write::Entity::find()
+                    .filter(
+                        Condition::all()
+                            .add(kv_write::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+                            .add(kv_write::Column::Key.eq(key.as_str()))
+                            .add(kv_write::Column::Seq.eq(deleted_seq))
+                            .add(kv_write::Column::Epoch.eq(deleted_epoch))
+                            .add(kv_write::Column::EpochSeq.eq(deleted_epoch_seq)),
+                    )
+                    .one(&self.conn)
+                    .await?
+                {
+                    write
+                } else {
+                    return Err(KvReplicationError::MissingDeletedWrite {
+                        invocation_id: event.invocation_id.clone(),
+                    });
+                };
+
+                Ok((
+                    invocation,
+                    Operation::KvDelete {
+                        space: space_id.clone(),
+                        key,
+                        version: Some((
+                            deleted_write.seq,
+                            deleted_write.epoch,
+                            deleted_write.epoch_seq,
+                        )),
+                    },
+                ))
+            }
+        }
+    }
+
+    async fn persist_replication_canonical_commit(
+        &self,
+        space_id: &SpaceId,
+        event: &KvReplicationEvent,
+    ) -> Result<(), KvReplicationError> {
+        let Some(seq) = event.canonical_commit_seq else {
+            return Ok(());
+        };
+
+        let invocation_id = decode_hash(&event.invocation_id, "invocationId")?;
+        let (key, kind, value, metadata, deleted_invocation_id) = match &event.operation {
+            KvReplicationOperation::Put {
+                key,
+                value_hash,
+                metadata,
+                ..
+            } => (
+                parse_replication_path(key)?,
+                KV_CANONICAL_KIND_PUT.to_string(),
+                Some(value_hash.to_string()),
+                Some(metadata.clone()),
+                None,
+            ),
+            KvReplicationOperation::Delete {
+                key,
+                deleted_invocation_id,
+                ..
+            } => (
+                parse_replication_path(key)?,
+                KV_CANONICAL_KIND_DELETE.to_string(),
+                None,
+                None,
+                Some(deleted_invocation_id.to_string()),
+            ),
+        };
+
+        insert_kv_canonical_commit(
+            &self.conn,
+            canonical_commit::Model {
+                space: SpaceIdWrap(space_id.clone()),
+                seq,
+                key: key.into(),
+                invocation_id,
+                kind,
+                value,
+                metadata,
+                deleted_invocation_id,
+            },
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn import_invocation_delegations(
+        &self,
+        event: &KvReplicationEvent,
+    ) -> Result<(), KvReplicationError> {
+        for delegation_header in &event.delegations {
+            let delegation = Delegation::from_header_ser::<TinyCloudDelegation>(delegation_header)
+                .map_err(|error| KvReplicationError::InvalidInvocation {
+                    invocation_id: event.invocation_id.clone(),
+                    reason: format!("invalid delegation chain entry: {error}"),
+                })?;
+            let delegation_hash = crate::hash::hash(&delegation.1);
+
+            if delegation::Entity::find_by_id(delegation_hash)
+                .one(&self.conn)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+
+            self.transact(vec![Event::Delegation(Box::new(delegation))])
+                .await
+                .map_err(|error| KvReplicationError::Tx(error.to_string()))?;
+        }
+
+        Ok(())
     }
 }
 
@@ -490,6 +1444,7 @@ where
             &self.secrets,
             events,
             self.encryption.as_ref(),
+            self.local_canonical_commits_enabled,
         )
         .await?;
 
@@ -580,6 +1535,20 @@ where
                         .and_then(|v| serde_json::from_value(v.clone()).ok())
                 })
             });
+        let kv_read_params = invocation
+            .0
+            .invocation
+            .payload()
+            .facts
+            .as_ref()
+            .and_then(|facts| {
+                facts.iter().find_map(|fact| {
+                    fact.as_object()
+                        .and_then(|obj| obj.get("kvReadParams"))
+                        .and_then(|value| serde_json::from_value(value.clone()).ok())
+                })
+            })
+            .unwrap_or_default();
         //  verify and commit invocation and kv operations
         let commit = transact(
             &tx,
@@ -587,6 +1556,7 @@ where
             &self.secrets,
             vec![Event::Invocation(Box::new(invocation), ops)],
             self.encryption.as_ref(),
+            self.local_canonical_commits_enabled,
         )
         .await?;
 
@@ -604,16 +1574,16 @@ where
         }) {
             match cap {
                 (space, "kv", "tinycloud.kv/get", path) => results.push(InvocationOutcome::KvRead(
-                    get_kv(&tx, &self.storage, space, path)
+                    get_kv(&tx, &self.storage, space, path, kv_read_params)
                         .await
                         .map_err(|e| match e {
                             EitherError::A(e) => TxStoreError::Tx(e.into()),
                             EitherError::B(e) => TxStoreError::StoreRead(e),
                         })?,
                 )),
-                (space, "kv", "tinycloud.kv/list", path) => {
-                    results.push(InvocationOutcome::KvList(list(&tx, space, path).await?))
-                }
+                (space, "kv", "tinycloud.kv/list", path) => results.push(
+                    InvocationOutcome::KvList(list(&tx, space, path, kv_read_params).await?),
+                ),
                 (space, "kv", "tinycloud.kv/del", path) => {
                     let kv = get_kv_entity(&tx, space, path).await?;
                     if let Some(kv) = kv {
@@ -633,9 +1603,11 @@ where
                         results.push(InvocationOutcome::KvWrite)
                     }
                 }
-                (space, "kv", "tinycloud.kv/metadata", path) => results.push(
-                    InvocationOutcome::KvMetadata(metadata(&tx, space, path).await?),
-                ),
+                (space, "kv", "tinycloud.kv/metadata", path) => {
+                    results.push(InvocationOutcome::KvMetadata(
+                        metadata(&tx, space, path, kv_read_params).await?,
+                    ))
+                }
                 (space, "capabilities", "tinycloud.capabilities/read", path)
                     if path.as_str() == "all" =>
                 {
@@ -782,6 +1754,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     secrets: &K,
     events: Vec<Event>,
     encryption: Option<&ColumnEncryption>,
+    local_canonical_commits_enabled: bool,
 ) -> Result<TransactResult, TxError<S, K>> {
     // for each event, get the hash and the relevent space(s)
     let event_hashes = events
@@ -899,6 +1872,23 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                 m.insert(space, seq + 1);
                 m
             });
+
+        let mut authority_spaces = HashSet::new();
+        if local_canonical_commits_enabled {
+            for space in event_spaces.keys() {
+                let local_server_did = secrets
+                    .stage_keypair(space)
+                    .await
+                    .map(get_did_key)
+                    .map_err(TxError::Secrets)?;
+                if has_active_host_delegation_for_db(db, space, &local_server_did).await? {
+                    authority_spaces.insert(space.clone());
+                }
+            }
+        }
+        let authority_space_list = authority_spaces.iter().cloned().collect::<Vec<_>>();
+        let mut next_canonical_commit_seqs =
+            select_next_canonical_commit_seqs(db, &authority_space_list).await?;
 
         // get 'most recent' epochs for each of the spaces
         let mut most_recent = epoch::Entity::find()
@@ -1030,19 +2020,24 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                     delegation_cids.push(cid);
                 }
                 Event::Invocation(i, ops) => {
-                    invocation::process(
+                    let versioned_ops = ops
+                        .into_iter()
+                        .map(|op| {
+                            let v = space_order
+                                .get(op.space())
+                                .and_then(|(s, e, _, h)| Some((s, e, h.get(&hash)?)))
+                                .unwrap();
+                            op.version(*v.0, *v.1, *v.2)
+                        })
+                        .collect::<Vec<_>>();
+
+                    invocation::process(db, *i, versioned_ops.clone(), encryption).await?;
+                    persist_local_canonical_kv_commits(
                         db,
-                        *i,
-                        ops.into_iter()
-                            .map(|op| {
-                                let v = space_order
-                                    .get(op.space())
-                                    .and_then(|(s, e, _, h)| Some((s, e, h.get(&hash)?)))
-                                    .unwrap();
-                                op.version(*v.0, *v.1, *v.2)
-                            })
-                            .collect(),
-                        encryption,
+                        hash,
+                        &versioned_ops,
+                        &mut next_canonical_commit_seqs,
+                        &authority_spaces,
                     )
                     .await?;
                 }
@@ -1082,8 +2077,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             delegation_cids,
         })
     } else {
-        // All spaces were skipped (delegation-only with no existing spaces)
-        // Still process delegation events to save the delegation records
+        // Auth-only facts can still be persisted even when no service-space ordering applies.
         let mut delegation_cids = Vec::new();
         for (_, event) in event_hashes {
             match event {
@@ -1091,7 +2085,10 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                     let cid = delegation::process(db, *d, encryption).await?;
                     delegation_cids.push(cid);
                 }
-                Event::Invocation(_, _) | Event::Revocation(_) => {
+                Event::Revocation(r) => {
+                    revocation::process(db, *r).await?;
+                }
+                Event::Invocation(_, _) => {
                     unreachable!("non-delegation events with empty event_spaces")
                 }
             };
@@ -1120,34 +2117,521 @@ async fn list<C: ConnectionTrait>(
     db: &C,
     space_id: &SpaceId,
     prefix: &Path,
+    read_params: KvReadParams,
 ) -> Result<Vec<Path>, DbErr> {
-    // get content id for key from db
-    let mut list = kv_write::Entity::find()
-        .filter(
-            Condition::all()
-                .add(kv_write::Column::Key.starts_with(prefix.as_str()))
-                .add(kv_write::Column::Space.eq(SpaceIdWrap(space_id.clone()))),
-        )
-        .find_also_related(kv_delete::Entity)
-        .filter(kv_delete::Column::InvocationId.is_null())
+    let mut list: Vec<Path> = match read_params {
+        KvReadParams::Canonical => select_kv_recon_commits(db, space_id, Some(prefix))
+            .await?
+            .into_iter()
+            .map(|commit| commit.key.0)
+            .collect::<Vec<_>>(),
+        KvReadParams::Provisional => {
+            let mut list = kv_write::Entity::find()
+                .filter(
+                    Condition::all()
+                        .add(kv_write::Column::Key.starts_with(prefix.as_str()))
+                        .add(kv_write::Column::Space.eq(SpaceIdWrap(space_id.clone()))),
+                )
+                .find_also_related(kv_delete::Entity)
+                .filter(kv_delete::Column::InvocationId.is_null())
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|(kv, _)| kv.key.0)
+                .collect::<Vec<Path>>();
+            list.dedup();
+            list
+        }
+    };
+
+    if read_params.hides_quarantined_keys() && !list.is_empty() {
+        let quarantined = kv_quarantine::Entity::find()
+            .filter(
+                Condition::all()
+                    .add(kv_quarantine::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+                    .add(kv_quarantine::Column::Key.is_in(list.iter().map(|key| key.as_str()))),
+            )
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|row| row.key.to_string())
+            .collect::<HashSet<_>>();
+        list.retain(|key| !quarantined.contains(key.as_str()));
+    }
+
+    Ok(list)
+}
+
+fn parse_replication_space_id(space_id: &str) -> Result<SpaceId, KvReplicationError> {
+    SpaceId::from_str(space_id)
+        .map_err(|_| KvReplicationError::InvalidSpaceId(space_id.to_string()))
+}
+
+fn parse_replication_path(path: &str) -> Result<Path, KvReplicationError> {
+    Path::from_str(path).map_err(|_| KvReplicationError::InvalidPath(path.to_string()))
+}
+
+fn delegation_matches_space(abilities: &[abilities::Model], space_id: &SpaceId) -> bool {
+    abilities
+        .iter()
+        .any(|ability| auth_resource_matches_space(&ability.resource, space_id))
+}
+
+fn auth_resource_matches_space(resource: &Resource, space_id: &SpaceId) -> bool {
+    let Some(resource) = resource.tinycloud_resource() else {
+        return false;
+    };
+
+    resource.space() == space_id
+}
+
+fn auth_resource_matches_host_delegate(resource: &Resource, space_id: &SpaceId) -> bool {
+    let Some(resource) = resource.tinycloud_resource() else {
+        return false;
+    };
+
+    resource.space() == space_id
+        && resource.service().as_str() == "space"
+        && resource.path().is_none()
+        && resource.query().is_none()
+        && resource.fragment().is_none()
+}
+
+async fn has_active_host_delegation_for_db<C: ConnectionTrait>(
+    db: &C,
+    space_id: &SpaceId,
+    delegate_did: &str,
+) -> Result<bool, DbErr> {
+    let now = time::OffsetDateTime::now_utc();
+    let (_delegations, abilities): (Vec<delegation::Model>, Vec<Vec<abilities::Model>>) =
+        delegation::Entity::find()
+            .left_join(revocation::Entity)
+            .filter(revocation::Column::Id.is_null())
+            .filter(delegation::Column::Delegatee.eq(delegate_did))
+            .filter(
+                Condition::all()
+                    .add(
+                        Condition::any()
+                            .add(delegation::Column::Expiry.is_null())
+                            .add(delegation::Column::Expiry.gt(now)),
+                    )
+                    .add(
+                        Condition::any()
+                            .add(delegation::Column::NotBefore.is_null())
+                            .add(delegation::Column::NotBefore.lte(now)),
+                    ),
+            )
+            .find_with_related(abilities::Entity)
+            .all(db)
+            .await?
+            .into_iter()
+            .unzip();
+
+    Ok(abilities.into_iter().flatten().any(|ability| {
+        auth_resource_matches_host_delegate(&ability.resource, space_id)
+            && ability.ability.as_ref().as_ref() == "tinycloud.space/host"
+    }))
+}
+
+async fn select_next_canonical_commit_seqs<C: ConnectionTrait>(
+    db: &C,
+    spaces: &[SpaceId],
+) -> Result<HashMap<SpaceId, i64>, DbErr> {
+    if spaces.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut next = canonical_commit::Entity::find()
+        .filter(canonical_commit::Column::Space.is_in(spaces.iter().cloned().map(SpaceIdWrap)))
+        .select_only()
+        .column(canonical_commit::Column::Space)
+        .column_as(canonical_commit::Column::Seq.max(), "max_seq")
+        .group_by(canonical_commit::Column::Space)
+        .into_tuple::<(SpaceIdWrap, i64)>()
         .all(db)
         .await?
         .into_iter()
-        .map(|(kv, _)| kv.key.0)
-        .collect::<Vec<Path>>();
-    list.dedup();
-    Ok(list)
+        .fold(HashMap::new(), |mut acc, (space, seq)| {
+            acc.insert(space.0, seq + 1);
+            acc
+        });
+
+    for space in spaces {
+        next.entry(space.clone()).or_insert(1);
+    }
+
+    Ok(next)
+}
+
+fn versioned_operation_space(operation: &crate::events::VersionedOperation) -> &SpaceId {
+    match operation {
+        crate::events::VersionedOperation::KvWrite { space, .. } => space,
+        crate::events::VersionedOperation::KvDelete { space, .. } => space,
+    }
+}
+
+async fn persist_local_canonical_kv_commits<C: ConnectionTrait>(
+    db: &C,
+    invocation_id: Hash,
+    operations: &[crate::events::VersionedOperation],
+    next_seqs: &mut HashMap<SpaceId, i64>,
+    authority_spaces: &HashSet<SpaceId>,
+) -> Result<(), DbErr> {
+    for operation in operations {
+        let space = versioned_operation_space(operation);
+        if !authority_spaces.contains(space) {
+            continue;
+        }
+
+        let commit_seq = *next_seqs.entry(space.clone()).or_insert(1);
+        let commit = match operation {
+            crate::events::VersionedOperation::KvWrite {
+                key,
+                value,
+                metadata,
+                ..
+            } => canonical_commit::Model {
+                space: SpaceIdWrap(space.clone()),
+                seq: commit_seq,
+                key: key.clone().into(),
+                invocation_id,
+                kind: KV_CANONICAL_KIND_PUT.to_string(),
+                value: Some(encode_hash(*value)),
+                metadata: Some(metadata.clone()),
+                deleted_invocation_id: None,
+            },
+            crate::events::VersionedOperation::KvDelete { key, .. } => {
+                let deleted = kv_delete::Entity::find()
+                    .filter(
+                        Condition::all()
+                            .add(kv_delete::Column::Space.eq(SpaceIdWrap(space.clone())))
+                            .add(kv_delete::Column::InvocationId.eq(invocation_id))
+                            .add(kv_delete::Column::Key.eq(key.as_str())),
+                    )
+                    .one(db)
+                    .await?
+                    .ok_or_else(|| {
+                        DbErr::Custom(format!(
+                            "missing canonical kv delete target {} for {}",
+                            key.as_str(),
+                            encode_hash(invocation_id)
+                        ))
+                    })?;
+
+                canonical_commit::Model {
+                    space: SpaceIdWrap(space.clone()),
+                    seq: commit_seq,
+                    key: key.clone().into(),
+                    invocation_id,
+                    kind: KV_CANONICAL_KIND_DELETE.to_string(),
+                    value: None,
+                    metadata: None,
+                    deleted_invocation_id: Some(encode_hash(deleted.deleted_invocation_id)),
+                }
+            }
+        };
+
+        insert_kv_canonical_commit(db, commit).await?;
+        next_seqs.insert(space.clone(), commit_seq + 1);
+    }
+
+    Ok(())
+}
+
+fn ordered_auth_delegations(
+    seed_ids: Vec<Hash>,
+    parent_ids_by_child: &HashMap<Hash, Vec<Hash>>,
+    encoded_delegations: &HashMap<Hash, String>,
+) -> Vec<(Hash, String)> {
+    let mut ordered = Vec::new();
+    let mut discovered = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut stack = seed_ids
+        .into_iter()
+        .rev()
+        .map(|hash| (hash, false))
+        .collect::<Vec<_>>();
+
+    while let Some((hash, expanded)) = stack.pop() {
+        if seen.contains(&hash) {
+            continue;
+        }
+
+        if expanded {
+            if let Some(encoded) = encoded_delegations.get(&hash) {
+                seen.insert(hash);
+                ordered.push((hash, encoded.clone()));
+            }
+            continue;
+        }
+
+        if !encoded_delegations.contains_key(&hash) {
+            continue;
+        }
+
+        if !discovered.insert(hash) {
+            continue;
+        }
+
+        stack.push((hash, true));
+        if let Some(parents) = parent_ids_by_child.get(&hash) {
+            for parent in parents.iter().rev() {
+                if !seen.contains(parent) {
+                    stack.push((*parent, false));
+                }
+            }
+        }
+    }
+
+    ordered
+}
+
+async fn select_kv_replication_seqs<C: ConnectionTrait>(
+    db: &C,
+    space_id: &SpaceId,
+    prefix: Option<&Path>,
+    since_seq: i64,
+    limit: u64,
+) -> Result<Vec<i64>, KvReplicationError> {
+    if prefix.is_none() {
+        return Ok(event_order::Entity::find()
+            .select_only()
+            .column(event_order::Column::Seq)
+            .filter(event_order::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+            .filter(event_order::Column::Seq.gt(since_seq))
+            .order_by_asc(event_order::Column::Seq)
+            .group_by(event_order::Column::Seq)
+            .limit(limit)
+            .into_tuple::<i64>()
+            .all(db)
+            .await?);
+    }
+
+    let prefix = prefix.expect("checked above");
+    let mut seqs = BTreeSet::new();
+
+    let write_seqs = kv_write::Entity::find()
+        .select_only()
+        .column(kv_write::Column::Seq)
+        .filter(kv_write::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+        .filter(kv_write::Column::Seq.gt(since_seq))
+        .filter(kv_write::Column::Key.like(format!("{}%", prefix.as_str())))
+        .order_by_asc(kv_write::Column::Seq)
+        .group_by(kv_write::Column::Seq)
+        .into_tuple::<i64>()
+        .all(db)
+        .await?;
+    seqs.extend(write_seqs);
+
+    let deletes = kv_delete::Entity::find()
+        .filter(kv_delete::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+        .filter(kv_delete::Column::Key.like(format!("{}%", prefix.as_str())))
+        .all(db)
+        .await?;
+    for delete in deletes {
+        if let Some(ordering) = event_order::Entity::find()
+            .filter(
+                Condition::all()
+                    .add(event_order::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+                    .add(event_order::Column::Event.eq(delete.invocation_id))
+                    .add(event_order::Column::Seq.gt(since_seq)),
+            )
+            .one(db)
+            .await?
+        {
+            seqs.insert(ordering.seq);
+        }
+    }
+
+    Ok(seqs.into_iter().take(limit as usize).collect())
+}
+
+async fn select_kv_recon_commits<C: ConnectionTrait>(
+    db: &C,
+    space_id: &SpaceId,
+    prefix: Option<&Path>,
+) -> Result<Vec<canonical_commit::Model>, DbErr> {
+    let mut query = canonical_commit::Entity::find()
+        .filter(canonical_commit::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+        .order_by_asc(canonical_commit::Column::Key)
+        .order_by_desc(canonical_commit::Column::Seq);
+
+    if let Some(prefix) = prefix {
+        query = query.filter(canonical_commit::Column::Key.like(format!("{}%", prefix.as_str())));
+    }
+
+    let commits = query.all(db).await?;
+    let mut latest = BTreeMap::<String, canonical_commit::Model>::new();
+    for commit in commits {
+        latest.entry(commit.key.to_string()).or_insert(commit);
+    }
+
+    Ok(latest
+        .into_values()
+        .filter(|commit| commit.kind == KV_CANONICAL_KIND_PUT)
+        .collect())
+}
+
+async fn latest_canonical_kv_commit<C: ConnectionTrait>(
+    db: &C,
+    space_id: &SpaceId,
+    key: &Path,
+) -> Result<Option<canonical_commit::Model>, DbErr> {
+    canonical_commit::Entity::find()
+        .filter(
+            Condition::all()
+                .add(canonical_commit::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+                .add(canonical_commit::Column::Key.eq(key.as_str())),
+        )
+        .order_by_desc(canonical_commit::Column::Seq)
+        .one(db)
+        .await
+}
+
+async fn latest_canonical_kv_seq_for_prefix<C: ConnectionTrait>(
+    db: &C,
+    space_id: &SpaceId,
+    prefix: Option<&Path>,
+) -> Result<i64, DbErr> {
+    let mut query = canonical_commit::Entity::find()
+        .filter(canonical_commit::Column::Space.eq(SpaceIdWrap(space_id.clone())));
+
+    if let Some(prefix) = prefix {
+        let prefix_value = prefix.as_str();
+        query = query.filter(
+            Condition::any()
+                .add(canonical_commit::Column::Key.eq(prefix_value))
+                .add(canonical_commit::Column::Key.starts_with(format!("{prefix_value}/"))),
+        );
+    }
+
+    let query = query
+        .select_only()
+        .column_as(canonical_commit::Column::Seq.max(), "max_seq")
+        .into_tuple::<Option<i64>>();
+
+    Ok(query.one(db).await?.flatten().unwrap_or(0))
+}
+
+async fn find_kv_canonical_commit_seq<C: ConnectionTrait>(
+    db: &C,
+    space_id: &SpaceId,
+    invocation_id: Hash,
+) -> Result<Option<i64>, KvReplicationError> {
+    Ok(canonical_commit::Entity::find()
+        .filter(
+            Condition::all()
+                .add(canonical_commit::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+                .add(canonical_commit::Column::InvocationId.eq(invocation_id)),
+        )
+        .order_by_asc(canonical_commit::Column::Seq)
+        .one(db)
+        .await?
+        .map(|commit| commit.seq))
+}
+
+async fn insert_kv_canonical_commit<C: ConnectionTrait>(
+    db: &C,
+    commit: canonical_commit::Model,
+) -> Result<(), DbErr> {
+    match canonical_commit::Entity::insert(canonical_commit::ActiveModel::from(commit))
+        .on_conflict(
+            OnConflict::columns([
+                canonical_commit::Column::Space,
+                canonical_commit::Column::Seq,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec(db)
+        .await
+    {
+        Err(DbErr::RecordNotInserted) => Ok(()),
+        result => result.map(|_| ()),
+    }
+}
+
+async fn export_invocation_delegations<C: ConnectionTrait>(
+    db: &C,
+    encryption: Option<&ColumnEncryption>,
+    invocation_id: &str,
+    parents: &[tinycloud_auth::authorization::Cid],
+) -> Result<Vec<String>, KvReplicationError> {
+    let mut seen = HashSet::new();
+    let mut ordered = Vec::new();
+    let mut stack = parents
+        .iter()
+        .map(|cid| (Hash::from(*cid), false))
+        .collect::<Vec<_>>();
+    let mut encoded = HashMap::<Hash, String>::new();
+
+    while let Some((hash, expanded)) = stack.pop() {
+        if seen.contains(&hash) {
+            continue;
+        }
+
+        if expanded {
+            let delegation =
+                encoded
+                    .remove(&hash)
+                    .ok_or(KvReplicationError::UnsupportedInvocation {
+                        invocation_id: invocation_id.to_string(),
+                        reason: "missing encoded parent delegation",
+                    })?;
+            seen.insert(hash);
+            ordered.push(delegation);
+            continue;
+        }
+
+        let model = delegation::Entity::find_by_id(hash).one(db).await?.ok_or(
+            KvReplicationError::UnsupportedInvocation {
+                invocation_id: invocation_id.to_string(),
+                reason: "missing parent delegation",
+            },
+        )?;
+
+        let parents = parent_delegations::Entity::find()
+            .filter(parent_delegations::Column::Child.eq(hash))
+            .all(db)
+            .await?;
+
+        let serialization = crate::encryption::maybe_decrypt(encryption, &model.serialization)?;
+        let header = TinyCloudDelegation::from_bytes(&serialization)?.encode()?;
+
+        encoded.insert(hash, header);
+        stack.push((hash, true));
+        for parent in parents.into_iter().rev() {
+            if !seen.contains(&parent.parent) {
+                stack.push((parent.parent, false));
+            }
+        }
+    }
+
+    Ok(ordered)
 }
 
 async fn metadata<C: ConnectionTrait>(
     db: &C,
     space_id: &SpaceId,
     key: &Path,
+    read_params: KvReadParams,
     // TODO version: Option<(i64, Hash, i64)>,
 ) -> Result<Option<Metadata>, DbErr> {
-    match get_kv_entity(db, space_id, key).await? {
-        Some(entry) => Ok(Some(entry.metadata)),
-        None => Ok(None),
+    match read_params {
+        KvReadParams::Canonical => {
+            if is_kv_quarantined(db, space_id, key).await? {
+                return Ok(None);
+            }
+
+            match latest_canonical_kv_commit(db, space_id, key).await? {
+                Some(entry) if entry.kind == KV_CANONICAL_KIND_PUT => Ok(entry.metadata),
+                _ => Ok(None),
+            }
+        }
+        KvReadParams::Provisional => match get_kv_entity(db, space_id, key).await? {
+            Some(entry) => Ok(Some(entry.metadata)),
+            None => Ok(None),
+        },
     }
 }
 
@@ -1156,25 +2640,70 @@ async fn get_kv<C: ConnectionTrait, B: ImmutableReadStore>(
     store: &B,
     space_id: &SpaceId,
     key: &Path,
+    read_params: KvReadParams,
     // TODO version: Option<(i64, Hash, i64)>,
 ) -> Result<Option<(Metadata, Hash, Content<B::Readable>)>, EitherError<DbErr, B::Error>> {
-    let e = match get_kv_entity(db, space_id, key)
-        .await
-        .map_err(EitherError::A)?
-    {
-        Some(entry) => entry,
-        None => return Ok(None),
-    };
-    let content_hash = e.value;
-    let c = match store
-        .read(space_id, &content_hash)
-        .await
-        .map_err(EitherError::B)?
-    {
-        Some(c) => c,
-        None => return Ok(None),
-    };
-    Ok(Some((e.metadata, content_hash, c)))
+    match read_params {
+        KvReadParams::Canonical => {
+            if is_kv_quarantined(db, space_id, key)
+                .await
+                .map_err(EitherError::A)?
+            {
+                return Ok(None);
+            }
+
+            let entry = match latest_canonical_kv_commit(db, space_id, key)
+                .await
+                .map_err(EitherError::A)?
+            {
+                Some(entry) if entry.kind == KV_CANONICAL_KIND_PUT => entry,
+                _ => return Ok(None),
+            };
+
+            let metadata = entry.metadata.ok_or_else(|| {
+                EitherError::A(DbErr::Custom(format!(
+                    "missing canonical kv metadata for {}",
+                    key.as_str()
+                )))
+            })?;
+            let value_hash = entry.value.ok_or_else(|| {
+                EitherError::A(DbErr::Custom(format!(
+                    "missing canonical kv value hash for {}",
+                    key.as_str()
+                )))
+            })?;
+            let content_hash = decode_hash(&value_hash, "canonicalValueHash")
+                .map_err(|error| EitherError::A(DbErr::Custom(error.to_string())))?;
+            let c = match store
+                .read(space_id, &content_hash)
+                .await
+                .map_err(EitherError::B)?
+            {
+                Some(c) => c,
+                None => return Ok(None),
+            };
+            Ok(Some((metadata, content_hash, c)))
+        }
+        KvReadParams::Provisional => {
+            let entry = match get_kv_entity(db, space_id, key)
+                .await
+                .map_err(EitherError::A)?
+            {
+                Some(entry) => entry,
+                None => return Ok(None),
+            };
+            let content_hash = entry.value;
+            let c = match store
+                .read(space_id, &content_hash)
+                .await
+                .map_err(EitherError::B)?
+            {
+                Some(c) => c,
+                None => return Ok(None),
+            };
+            Ok(Some((entry.metadata, content_hash, c)))
+        }
+    }
 }
 
 async fn get_kv_entity<C: ConnectionTrait>(
@@ -1212,6 +2741,30 @@ async fn get_kv_entity<C: ConnectionTrait>(
         .one(db)
         .await?
         .map(|(kv, _)| kv))
+}
+
+async fn is_kv_quarantined<C: ConnectionTrait>(
+    db: &C,
+    space_id: &SpaceId,
+    key: &Path,
+) -> Result<bool, DbErr> {
+    Ok(kv_quarantine::Entity::find()
+        .filter(
+            Condition::all()
+                .add(kv_quarantine::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+                .add(kv_quarantine::Column::Key.eq(key.as_str())),
+        )
+        .one(db)
+        .await?
+        .is_some())
+}
+
+fn kv_state_status_label(status: &KvStateStatus) -> &'static str {
+    match status {
+        KvStateStatus::Present => "present",
+        KvStateStatus::Deleted => "deleted",
+        KvStateStatus::Absent => "absent",
+    }
 }
 
 async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(

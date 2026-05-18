@@ -12,7 +12,7 @@ use tinycloud_core::storage::{Content, ImmutableReadStore};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 use crate::{config::PublicSpacesConfig, BlockStores, TinyCloud};
-use tinycloud_core::types::Metadata;
+use tinycloud_core::types::{KvReadParams, Metadata};
 
 /// A key path that allows dot-prefixed segments like `.well-known/profile`.
 /// Unlike `std::path::PathBuf`, this does not reject hidden files/dirs.
@@ -227,7 +227,7 @@ pub async fn public_kv_get(
         .map_err(|_| (Status::BadRequest, "Invalid key".to_string()))?;
 
     let result = tinycloud
-        .public_kv_get(&space_id, &key)
+        .public_kv_get(&space_id, &key, KvReadParams::Canonical)
         .await
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
 
@@ -274,7 +274,7 @@ pub async fn public_kv_head(
         .map_err(|_| (Status::BadRequest, "Invalid key".to_string()))?;
 
     let result = tinycloud
-        .public_kv_get(&space_id, &key)
+        .public_kv_get(&space_id, &key, KvReadParams::Canonical)
         .await
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
 
@@ -320,7 +320,7 @@ pub async fn public_kv_list(
         .map_err(|_| (Status::BadRequest, "Invalid prefix".to_string()))?;
 
     let list = tinycloud
-        .public_kv_list(&space_id, &prefix_path)
+        .public_kv_list(&space_id, &prefix_path, KvReadParams::Canonical)
         .await
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
 

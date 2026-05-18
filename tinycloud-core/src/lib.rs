@@ -9,6 +9,7 @@ pub mod manifest;
 pub mod migrations;
 pub mod models;
 pub mod relationships;
+pub mod replication;
 pub mod sql;
 pub mod storage;
 pub mod types;
@@ -18,5 +19,17 @@ pub mod write_hooks;
 pub use db::{Commit, InvocationOutcome, SpaceDatabase, TransactResult, TxError, TxStoreError};
 pub use encryption::ColumnEncryption;
 pub use libp2p;
+pub use replication::{
+    AuthReplicationApplyResponse, AuthReplicationExportRequest, AuthReplicationExportResponse,
+    AuthReplicationReconcileRequest, KvPeerMissingAction, KvPeerMissingApplyItem,
+    KvPeerMissingApplyResponse, KvPeerMissingPlanItem, KvPeerMissingPlanResponse,
+    KvReconCompareRequest, KvReconCompareResponse, KvReconExportRequest, KvReconExportResponse,
+    KvReconSplitChild, KvReconSplitChildComparison, KvReconSplitCompareRequest,
+    KvReconSplitCompareResponse, KvReconSplitReconcileChildResult, KvReconSplitReconcileRequest,
+    KvReconSplitReconcileResponse, KvReconSplitRequest, KvReconSplitResponse, KvReplicationError,
+    KvStateCompareItem, KvStateCompareRequest, KvStateCompareResponse, ReplicationApplyResponse,
+    ReplicationExportRequest, ReplicationExportResponse, ReplicationReconcileRequest,
+    ReplicationService, ReplicationSessionOpenRequest, ReplicationSessionOpenResponse,
+};
 pub use sea_orm;
 pub use sea_orm_migration;

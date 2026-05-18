@@ -1,7 +1,11 @@
 use anyhow::Result;
+use hex::FromHex;
 use rocket::{data::ToByteUnit, http::Status, serde::json::Json, State};
-use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{HashMap, HashSet},
+    str::FromStr,
+};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::io::AsyncReadExt;
 use tokio_util::compat::TokioAsyncReadCompatExt;
@@ -21,15 +25,23 @@ use crate::{
     tracing::TracingSpan,
     BlockStage, BlockStores, TinyCloud,
 };
+use tinycloud_auth::{
+    authorization::TinyCloudRevocation,
+    cacaos::{
+        siwe::Message,
+        siwe_cacao::{Header as SiweHeader, Signature, SiweCacao},
+    },
+};
 use tinycloud_core::{
     duckdb::{DuckDbCaveats, DuckDbError, DuckDbRequest, DuckDbResponse, DuckDbService},
-    events::Invocation,
+    events::{HeaderEncode, Invocation, Revocation},
     models::{hook_delivery, hook_subscription, kv_delete, kv_write},
+    replication::{ReplicationService, ReplicationStatus},
     sea_orm::DbErr,
     sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder},
     sql::{SqlCaveats, SqlError, SqlRequest, SqlService},
     storage::{ImmutableReadStore, ImmutableStaging},
-    types::Resource,
+    types::{Resource, SqlReadParams},
     util::{DelegationInfo, InvocationInfo},
     write_hooks::{db_table_path, hook_delivery_id, subscription_matches_event, TouchedTables},
     InvocationOutcome, TransactResult, TxError, TxStoreError,
@@ -39,14 +51,31 @@ pub mod admin;
 pub mod attestation;
 pub mod hooks;
 pub mod public;
+pub mod replication;
 pub mod util;
 use util::LimitedReader;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeServices {
+    pub kv: bool,
+    pub delegation: bool,
+    pub sharing: bool,
+    pub sql: bool,
+    pub duckdb: bool,
+}
 
 #[derive(Serialize)]
 pub struct NodeInfo {
     pub protocol: u32,
     pub version: String,
     pub features: Vec<&'static str>,
+    #[serde(rename = "rolesSupported")]
+    pub roles_supported: Vec<&'static str>,
+    #[serde(rename = "rolesEnabled")]
+    pub roles_enabled: Vec<&'static str>,
+    pub services: NodeServices,
+    pub replication: ReplicationStatus,
     #[serde(rename = "inTEE")]
     pub in_tee: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -56,6 +85,7 @@ pub struct NodeInfo {
 fn build_info(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
+    replication: &State<ReplicationService>,
 ) -> NodeInfo {
     #[allow(unused_mut)]
     let mut features = vec![
@@ -66,6 +96,7 @@ fn build_info(
         "duckdb",
         "hooks",
         "signed-urls",
+        "replication",
     ];
     #[cfg(feature = "dstack")]
     features.push("tee");
@@ -73,6 +104,16 @@ fn build_info(
         protocol: tinycloud_auth::protocol::PROTOCOL_VERSION,
         version: env!("CARGO_PKG_VERSION").to_string(),
         features,
+        roles_supported: replication.status().roles_supported.clone(),
+        roles_enabled: replication.status().roles_enabled.clone(),
+        services: NodeServices {
+            kv: true,
+            delegation: true,
+            sharing: true,
+            sql: true,
+            duckdb: true,
+        },
+        replication: replication.status().clone(),
         in_tee: tee.inner().is_some(),
         quota_url: quota_cache.quota_url().map(|s| s.to_string()),
     }
@@ -82,16 +123,18 @@ fn build_info(
 pub fn info(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
+    replication: &State<ReplicationService>,
 ) -> Json<NodeInfo> {
-    Json(build_info(tee, quota_cache))
+    Json(build_info(tee, quota_cache, replication))
 }
 
 #[get("/version")]
 pub fn version(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
+    replication: &State<ReplicationService>,
 ) -> Json<NodeInfo> {
-    Json(build_info(tee, quota_cache))
+    Json(build_info(tee, quota_cache, replication))
 }
 
 #[allow(clippy::let_unit_value)]
@@ -180,6 +223,18 @@ pub struct DelegateResponse {
     pub skipped: Vec<String>,
 }
 
+#[derive(Serialize)]
+pub struct RevokeResponse {
+    pub cid: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignedRevocationRequest {
+    pub siwe: String,
+    pub signature: String,
+}
+
 #[post("/delegate")]
 pub async fn delegate(
     d: AuthHeaderGetter<DelegationInfo>,
@@ -232,6 +287,66 @@ pub async fn delegate(
                     activated,
                     skipped,
                 }))
+            });
+        timer.observe_duration();
+        res
+    }
+    .instrument(span)
+    .await
+}
+
+#[post("/revoke", format = "json", data = "<request>")]
+pub async fn revoke(
+    request: Json<SignedRevocationRequest>,
+    req_span: TracingSpan,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Json<RevokeResponse>, (Status, String)> {
+    let action_label = "revocation";
+    let span = info_span!(parent: &req_span.0, "revoke", action = %action_label);
+    async move {
+        let timer = crate::prometheus::AUTHORIZED_INVOKE_HISTOGRAM
+            .with_label_values(&["revoke"])
+            .start_timer();
+        let siwe = Message::from_str(&request.siwe).map_err(|error| {
+            (
+                Status::BadRequest,
+                format!("invalid revocation SIWE: {error}"),
+            )
+        })?;
+        let signature = parse_revocation_signature(&request.signature)?;
+        let revocation =
+            TinyCloudRevocation::Cacao(SiweCacao::new(siwe.into(), signature, SiweHeader));
+        let revocation = Revocation::from_header_ser::<TinyCloudRevocation>(
+            &revocation
+                .encode()
+                .map_err(|error| (Status::InternalServerError, error.to_string()))?,
+        )
+        .map_err(|error| (Status::BadRequest, error.to_string()))?;
+        let revocation_cid = revocation.hash().to_cid(0x55).to_string();
+
+        let res = tinycloud
+            .revoke(revocation)
+            .await
+            .map_err(|e| {
+                (
+                    match e {
+                        TxError::SpaceNotFound => Status::NotFound,
+                        TxError::Db(DbErr::ConnectionAcquire(_)) => Status::InternalServerError,
+                        _ => Status::Unauthorized,
+                    },
+                    e.to_string(),
+                )
+            })
+            .map(|result: TransactResult| {
+                let cid = result
+                    .commits
+                    .into_values()
+                    .next()
+                    .and_then(|c| c.committed_events.into_iter().next())
+                    .map(|h| h.to_cid(0x55).to_string())
+                    .unwrap_or_else(|| revocation_cid.clone());
+
+                Json(RevokeResponse { cid })
             });
         timer.observe_duration();
         res
@@ -637,6 +752,14 @@ async fn handle_sql_invoke(
                         .and_then(|v| serde_json::from_value(v.clone()).ok())
                 })
             });
+    let sql_read_params: SqlReadParams =
+        i.0 .0
+            .invocation
+            .payload()
+            .facts
+            .as_ref()
+            .and_then(|facts| SqlReadParams::from_facts(facts))
+            .unwrap_or_default();
 
     let actor = i.0 .0.invoker.clone();
     let auth_result = verify_auth(i.0, tinycloud).await?;
@@ -658,7 +781,14 @@ async fn handle_sql_invoke(
     }
 
     let response = sql_service
-        .execute(space, &db_name, sql_request, caveats, ability.to_string())
+        .execute(
+            space,
+            &db_name,
+            sql_request,
+            caveats,
+            ability.to_string(),
+            sql_read_params,
+        )
         .await
         .map_err(|e| (sql_error_to_status(&e), e.to_string()))?;
 
@@ -710,6 +840,17 @@ fn sql_error_to_status(err: &SqlError) -> Status {
         SqlError::ParseError(_) => Status::BadRequest,
         SqlError::Internal(_) => Status::InternalServerError,
     }
+}
+
+fn parse_revocation_signature(signature: &str) -> Result<Signature, (Status, String)> {
+    <[u8; 65]>::from_hex(signature.strip_prefix("0x").unwrap_or(signature))
+        .map(Into::into)
+        .map_err(|error| {
+            (
+                Status::BadRequest,
+                format!("invalid revocation signature: {error}"),
+            )
+        })
 }
 
 async fn handle_duckdb_invoke(

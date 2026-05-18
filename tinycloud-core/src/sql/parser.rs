@@ -2,8 +2,8 @@ use sqlparser::ast::*;
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
 
-use super::caveats::SqlCaveats;
 use super::types::SqlError;
+use super::{caveats::SqlCaveats, replication::is_internal_table_name};
 use crate::write_hooks::TouchedTables;
 
 pub struct ParsedQuery {
@@ -125,6 +125,15 @@ pub fn validate_sql(
                     column
                 )));
             }
+        }
+    }
+
+    for table in &tables {
+        if is_internal_table_name(table) {
+            return Err(SqlError::PermissionDenied(format!(
+                "Access to internal replication table '{}' is not allowed",
+                table
+            )));
         }
     }
 
