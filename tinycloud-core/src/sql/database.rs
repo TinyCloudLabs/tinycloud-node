@@ -135,22 +135,6 @@ pub fn spawn_actor(
             }
         }
 
-        // Flush in-memory database to file before shutdown so data is not lost
-        if matches!(mode, StorageMode::InMemory) {
-            if let Ok(size) = storage::database_size(&conn) {
-                if size > 0 {
-                    match storage::promote_to_file(&conn, &file_path) {
-                        Ok(_) => {
-                            tracing::info!(space=%space_id, db=%db_name, "Flushed in-memory database to file on shutdown");
-                        }
-                        Err(e) => {
-                            tracing::error!(space=%space_id, db=%db_name, error=%e, "Failed to flush in-memory database on shutdown");
-                        }
-                    }
-                }
-            }
-        }
-
         databases.remove(&(space_id.clone(), db_name.clone()));
         tracing::debug!(space=%space_id, db=%db_name, "Database actor shutting down");
     });
@@ -160,36 +144,28 @@ pub fn spawn_actor(
 
 fn handle_export(
     conn: &rusqlite::Connection,
-    mode: &StorageMode,
-    file_path: &PathBuf,
+    _mode: &StorageMode,
+    _file_path: &PathBuf,
 ) -> Result<Vec<u8>, SqlError> {
-    match mode {
-        StorageMode::File(_) => {
-            // File-backed: read the file directly
-            std::fs::read(file_path).map_err(|e| SqlError::Internal(e.to_string()))
-        }
-        StorageMode::InMemory => {
-            // In-memory: serialize via SQLite backup API to a temp file
-            let temp_dir = tempfile::tempdir().map_err(|e| SqlError::Internal(e.to_string()))?;
-            let temp_path = temp_dir.path().join("export.db");
+    // Serialize through SQLite's backup API for both in-memory and WAL-backed
+    // file databases so the exported artifact contains a complete checkpoint.
+    let temp_dir = tempfile::tempdir().map_err(|e| SqlError::Internal(e.to_string()))?;
+    let temp_path = temp_dir.path().join("export.db");
 
-            let mut dest = rusqlite::Connection::open(&temp_path)
-                .map_err(|e| SqlError::Internal(e.to_string()))?;
+    let mut dest =
+        rusqlite::Connection::open(&temp_path).map_err(|e| SqlError::Internal(e.to_string()))?;
 
-            {
-                let backup = rusqlite::backup::Backup::new(conn, &mut dest)
-                    .map_err(|e| SqlError::Internal(e.to_string()))?;
-                backup
-                    .run_to_completion(5, std::time::Duration::from_millis(250), None)
-                    .map_err(|e| SqlError::Internal(e.to_string()))?;
-            }
-
-            // Close the connection so the file is flushed
-            drop(dest);
-
-            std::fs::read(&temp_path).map_err(|e| SqlError::Internal(e.to_string()))
-        }
+    {
+        let backup = rusqlite::backup::Backup::new(conn, &mut dest)
+            .map_err(|e| SqlError::Internal(e.to_string()))?;
+        backup
+            .run_to_completion(5, std::time::Duration::from_millis(250), None)
+            .map_err(|e| SqlError::Internal(e.to_string()))?;
     }
+
+    drop(dest);
+
+    std::fs::read(&temp_path).map_err(|e| SqlError::Internal(e.to_string()))
 }
 
 fn handle_message(

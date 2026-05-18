@@ -1,3 +1,4 @@
+pub mod database_artifacts;
 pub mod db;
 pub mod duckdb;
 pub mod encryption;

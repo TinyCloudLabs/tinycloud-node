@@ -38,7 +38,7 @@ pub struct SqlStatement {
     pub params: Vec<SqlValue>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SqlValue {
     Null,
     Integer(i64),

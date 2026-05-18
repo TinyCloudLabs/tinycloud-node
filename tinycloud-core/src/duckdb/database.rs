@@ -177,7 +177,8 @@ fn handle_export(
 ) -> Result<Vec<u8>, DuckDbError> {
     match mode {
         StorageMode::File(_) => {
-            // File-backed: read the file directly
+            conn.execute_batch("CHECKPOINT;")
+                .map_err(|e| DuckDbError::Internal(e.to_string()))?;
             std::fs::read(file_path).map_err(|e| DuckDbError::Internal(e.to_string()))
         }
         StorageMode::InMemory => {

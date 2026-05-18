@@ -80,7 +80,7 @@ fn default_ingest_mode() -> String {
     "create".to_string()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DuckDbValue {
     Null,
     Boolean(bool),
