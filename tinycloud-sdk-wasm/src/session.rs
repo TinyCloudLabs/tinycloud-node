@@ -543,19 +543,6 @@ pub fn parse_recap_from_siwe(siwe_string: &str) -> Result<Vec<ParsedRecapEntry>,
 
     let mut entries: Vec<ParsedRecapEntry> = Vec::new();
     for (resource_uri, ability_map) in abilities_map.iter() {
-        let resource: ResourceId = resource_uri.as_str().parse().map_err(
-            |e: tinycloud_auth::resource::KRIParseError| {
-                ParseRecapError::InvalidResourceUri(resource_uri.to_string(), e.to_string())
-            },
-        )?;
-
-        let space = resource.space().to_string();
-        let service = resource.service().to_string();
-        let path = resource
-            .path()
-            .map(|p| p.as_str().to_string())
-            .unwrap_or_default();
-
         // Collect the full-URN ability strings. `ability_map` is a `BTreeMap`
         // keyed by `Ability`, so iteration yields keys in sorted order — this
         // gives us a deterministic action list without an extra sort pass.
@@ -563,6 +550,34 @@ pub fn parse_recap_from_siwe(siwe_string: &str) -> Result<Vec<ParsedRecapEntry>,
             .keys()
             .map(|ability| ability.to_string())
             .collect();
+
+        let (space, service, path) = match resource_uri.as_str().parse::<ResourceId>() {
+            Ok(resource) => (
+                resource.space().to_string(),
+                resource.service().to_string(),
+                resource
+                    .path()
+                    .map(|p| p.as_str().to_string())
+                    .unwrap_or_default(),
+            ),
+            Err(e) => {
+                if resource_uri
+                    .as_str()
+                    .starts_with("urn:tinycloud:encryption:")
+                {
+                    (
+                        "encryption".to_string(),
+                        "encryption".to_string(),
+                        resource_uri.to_string(),
+                    )
+                } else {
+                    return Err(ParseRecapError::InvalidResourceUri(
+                        resource_uri.to_string(),
+                        e.to_string(),
+                    ));
+                }
+            }
+        };
 
         entries.push(ParsedRecapEntry {
             service,
@@ -946,6 +961,64 @@ pub mod test {
                 "tinycloud.kv/put".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn parse_recap_with_raw_encryption_ability() {
+        let network_id =
+            "urn:tinycloud:encryption:did:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:default";
+        let secrets_space =
+            "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:secrets";
+        let config = json!({
+            "abilities": {},
+            "spaceAbilities": {
+                secrets_space: {
+                    "kv": {
+                        "vault/secrets/": vec![
+                            "tinycloud.kv/get",
+                            "tinycloud.kv/put",
+                        ],
+                    },
+                },
+            },
+            "rawAbilities": {
+                network_id: vec![
+                    "tinycloud.encryption/decrypt",
+                    "tinycloud.encryption/network.create",
+                ],
+            },
+            "address": "0x7BD63AA37326a64d458559F44432103e3d6eEDE9",
+            "chainId": 1u8,
+            "domain": "example.com",
+            "issuedAt": "2022-01-01T00:00:00.000Z",
+            "spaceId": secrets_space,
+            "expirationTime": "3000-01-01T00:00:00.000Z",
+        });
+
+        let prepared = prepare_session(serde_json::from_value(config).unwrap()).unwrap();
+        let entries = parse_recap_from_siwe(&prepared.siwe.to_string())
+            .expect("parse_recap_from_siwe should support raw encryption resources");
+
+        let encryption_entry = entries
+            .iter()
+            .find(|entry| entry.service == "encryption")
+            .expect("encryption recap entry");
+        assert_eq!(encryption_entry.space, "encryption");
+        assert_eq!(encryption_entry.path, network_id);
+        assert_eq!(
+            encryption_entry.actions,
+            vec![
+                "tinycloud.encryption/decrypt".to_string(),
+                "tinycloud.encryption/network.create".to_string(),
+            ]
+        );
+
+        let secrets_entry = entries
+            .iter()
+            .find(|entry| entry.service == "kv")
+            .expect("secrets kv recap entry");
+        assert_eq!(secrets_entry.space, secrets_space);
+        assert_eq!(secrets_entry.path, "vault/secrets/");
     }
 
     #[test]

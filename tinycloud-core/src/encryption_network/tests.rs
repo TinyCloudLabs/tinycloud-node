@@ -14,10 +14,15 @@ use time::OffsetDateTime;
 use x25519_dalek::{PublicKey, StaticSecret as X25519StaticSecret};
 
 use tinycloud_auth::{
-    authorization::{make_invocation_from_uris, Cid, InvocationOptions},
+    authorization::Cid,
     multihash_codetable::{Code, MultihashDigest},
     resolver::DID_METHODS,
-    ssi::jwk::{Algorithm, JWK},
+    ssi::{
+        claims::jwt::NumericDate,
+        dids::{DIDBuf, DIDURLBuf},
+        jwk::{Algorithm, JWK},
+        ucan::Payload,
+    },
 };
 
 use crate::encryption::ColumnEncryption;
@@ -161,6 +166,7 @@ fn build_session_invocation_info(
     resource: &NetworkId,
     action: &str,
     facts: Vec<Value>,
+    audience: &str,
 ) -> crate::util::InvocationInfo {
     let mut jwk = JWK::generate_ed25519().expect("session jwk");
     jwk.algorithm = Some(Algorithm::EdDSA);
@@ -183,18 +189,24 @@ fn build_session_invocation_info(
         action.to_string().try_into().expect("capability");
     let delegation_cid = Cid::new_v1(0x55, Code::Blake3_256.digest(b"network-session-delegation"));
 
-    let invocation = make_invocation_from_uris(
-        std::iter::once((resource_uri, vec![capability])),
-        &delegation_cid,
-        &jwk,
-        &verification_method,
-        (OffsetDateTime::now_utc().unix_timestamp() + 60) as f64,
-        InvocationOptions {
-            facts: Some(facts),
-            ..Default::default()
-        },
-    )
-    .expect("session invocation");
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let mut attenuation = tinycloud_auth::ucan_capabilities_object::Capabilities::new();
+    attenuation.with_actions(resource_uri, std::iter::once((capability, [])));
+    let payload = Payload {
+        issuer: verification_method
+            .parse::<DIDURLBuf>()
+            .expect("session issuer"),
+        audience: audience.parse::<DIDBuf>().expect("session audience"),
+        not_before: None,
+        expiration: NumericDate::try_from_seconds((now + 60) as f64).expect("expiration"),
+        nonce: Some(format!("session-nonce-{now}")),
+        facts: Some(facts),
+        proof: vec![delegation_cid],
+        attenuation,
+    };
+    let invocation = payload
+        .sign(Algorithm::EdDSA, &jwk)
+        .expect("session invocation");
 
     crate::util::InvocationInfo::try_from(invocation).expect("invocation info")
 }
@@ -342,7 +354,8 @@ async fn network_admin_authorized_accepts_session_invoker() {
         action: NETWORK_CREATE_ACTION.to_string(),
     })
     .unwrap();
-    let invocation = build_session_invocation_info(&net, NETWORK_CREATE_ACTION, vec![facts]);
+    let invocation =
+        build_session_invocation_info(&net, NETWORK_CREATE_ACTION, vec![facts], NODE_DID);
 
     svc.verify_network_admin_authorized(&net, NETWORK_CREATE_ACTION, &invocation, &body_value)
         .await
@@ -407,7 +420,7 @@ async fn decrypt_authorized_accepts_session_invoker() {
         key_version: 1,
     })
     .unwrap();
-    let invocation = build_session_invocation_info(&net, DECRYPT_ACTION, vec![facts]);
+    let invocation = build_session_invocation_info(&net, DECRYPT_ACTION, vec![facts], NODE_DID);
 
     let verified = svc
         .decrypt_authorized(&net, &invocation, &body_value)
@@ -419,6 +432,49 @@ async fn decrypt_authorized_accepts_session_invoker() {
     let recovered = unwrap_with_secret(&ctx.receiver_secret, &rewrapped);
     assert_eq!(recovered, ctx.symmetric);
     assert_ne!(invocation.invoker, principal_did());
+}
+
+#[tokio::test]
+async fn decrypt_authorized_rejects_audience_mismatch() {
+    let svc = make_service(fresh_db().await);
+    let net = network_id();
+    let descriptor = svc
+        .create_one_of_one_network(CreateNetworkRequest {
+            name: NETWORK_NAME.to_string(),
+            principal: principal_did(),
+            threshold: Threshold::one_of_one(),
+        })
+        .await
+        .unwrap();
+    let ctx = make_client_request(&descriptor.public_encryption_key);
+    let (_, body_value) = build_body(&ctx, &net);
+    let facts = serde_json::to_value(DecryptFacts {
+        ty: DECRYPT_REQUEST_TYPE.to_string(),
+        target_node: NODE_DID.to_string(),
+        network_id: net.clone(),
+        body_hash: canonical_hash(&body_value),
+        encrypted_symmetric_key_hash: canonical_hash(&Value::String(
+            STANDARD.encode(&ctx.wrapped_key),
+        )),
+        receiver_public_key_hash: canonical_hash(&Value::String(
+            STANDARD.encode(&ctx.receiver_pub),
+        )),
+        alg: ALG_X25519_AES256GCM.to_string(),
+        key_version: 1,
+    })
+    .unwrap();
+    let invocation = build_session_invocation_info(
+        &net,
+        DECRYPT_ACTION,
+        vec![facts],
+        "did:key:z6MkSomeOtherNode",
+    );
+
+    let err = svc
+        .decrypt_authorized(&net, &invocation, &body_value)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EncryptionServiceError::AudienceMismatch));
 }
 
 #[tokio::test]

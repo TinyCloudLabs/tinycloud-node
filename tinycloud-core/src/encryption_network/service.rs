@@ -382,6 +382,9 @@ impl EncryptionService {
         if facts.ty != NETWORK_ADMIN_TYPE {
             return Err(EncryptionServiceError::WrongInvocationType);
         }
+        if invocation.invocation.payload().audience.to_string() != self.node_did {
+            return Err(EncryptionServiceError::AudienceMismatch);
+        }
         if facts.target_node != self.node_did {
             return Err(EncryptionServiceError::TargetNodeMismatch);
         }
@@ -602,6 +605,11 @@ impl EncryptionService {
 
         if body.ty != DECRYPT_REQUEST_TYPE || facts.ty != DECRYPT_REQUEST_TYPE {
             return Err(EncryptionServiceError::WrongInvocationType);
+        }
+        if invocation.invocation.payload().audience.to_string() != self.node_did {
+            self.record_native_audit(invocation, network_id, &facts, "denied:audience")
+                .await?;
+            return Err(EncryptionServiceError::AudienceMismatch);
         }
         if facts.target_node != self.node_did || body.target_node != self.node_did {
             self.record_native_audit(invocation, network_id, &facts, "denied:target-node")
