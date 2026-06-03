@@ -20,7 +20,7 @@ pub fn public_key_to_did_key(key: PublicKey) -> String {
     use tinycloud_auth::ipld_core::cid::multibase;
     // only ed25519 feature is enabled, so this unwrap should never fail
     let ed25519_pk_bytes = key.try_into_ed25519().unwrap().to_bytes();
-    let multicodec_pk = [[0xed].as_slice(), ed25519_pk_bytes.as_slice()].concat();
+    let multicodec_pk = [[0xed, 0x01].as_slice(), ed25519_pk_bytes.as_slice()].concat();
     format!(
         "did:key:{}",
         multibase::encode(multibase::Base::Base58Btc, multicodec_pk)
