@@ -366,9 +366,9 @@ impl Session {
                     Some(path.clone())
                 };
 
-                let resource_uri: UriString = if service.as_str() == "encryption"
-                    && path.as_str().starts_with("urn:tinycloud:encryption:")
-                {
+                let is_raw_encryption_resource = service.as_str() == "encryption"
+                    && path.as_str().starts_with("urn:tinycloud:encryption:");
+                let resource_uri: UriString = if is_raw_encryption_resource {
                     path.as_str()
                         .parse()
                         .map_err(|err| DelegationError::InvalidRawResource(format!("{err}")))?
@@ -389,7 +389,11 @@ impl Session {
 
                 resources.push(DelegatedResource {
                     service: service.to_string(),
-                    space: space_id.to_string(),
+                    space: if is_raw_encryption_resource {
+                        "encryption".to_string()
+                    } else {
+                        space_id.to_string()
+                    },
                     path: path.to_string(),
                     actions: action_strings,
                 });
@@ -1254,7 +1258,7 @@ pub mod test {
 
         assert_eq!(result.resources.len(), 1);
         assert_eq!(result.resources[0].service, "encryption");
-        assert_eq!(result.resources[0].space, session.space_id.to_string());
+        assert_eq!(result.resources[0].space, "encryption");
         assert_eq!(result.resources[0].path, network_id);
         assert_eq!(
             result.resources[0].actions,

@@ -1,3 +1,4 @@
+use crate::encryption_network::NetworkId;
 use sea_orm::{entity::prelude::*, sea_query::ValueTypeErr};
 use serde::{Deserialize, Serialize};
 use std::{fmt::Display, str::FromStr};
@@ -27,7 +28,16 @@ impl Resource {
     pub fn extends(&self, other: &Self) -> bool {
         match (self, other) {
             (Resource::TinyCloud(a), Resource::TinyCloud(b)) => a.extends(b).is_ok(),
-            (Resource::Other(a), Resource::Other(b)) => a.as_str().starts_with(b.as_str()),
+            (Resource::Other(a), Resource::Other(b)) => {
+                match (
+                    a.as_str().parse::<NetworkId>(),
+                    b.as_str().parse::<NetworkId>(),
+                ) {
+                    (Ok(a), Ok(b)) => a == b,
+                    (Ok(_), Err(_)) | (Err(_), Ok(_)) => false,
+                    (Err(_), Err(_)) => a.as_str().starts_with(b.as_str()),
+                }
+            }
             _ => false,
         }
     }
@@ -167,5 +177,35 @@ impl sea_orm::sea_query::Nullable for Resource {
 impl sea_orm::TryFromU64 for Resource {
     fn try_from_u64(_: u64) -> Result<Self, DbErr> {
         Err(DbErr::ConvertFromU64(stringify!($type)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encryption_network_resources_extend_only_exact_network_ids() {
+        let default: Resource = "urn:tinycloud:encryption:did:pkh:eip155:1:0xabc:default"
+            .parse()
+            .unwrap();
+        let default_again: Resource = "urn:tinycloud:encryption:did:pkh:eip155:1:0xabc:default"
+            .parse()
+            .unwrap();
+        let default_evil: Resource = "urn:tinycloud:encryption:did:pkh:eip155:1:0xabc:default-evil"
+            .parse()
+            .unwrap();
+
+        assert!(default.extends(&default_again));
+        assert!(!default_evil.extends(&default));
+        assert!(!default.extends(&default_evil));
+    }
+
+    #[test]
+    fn non_network_raw_resources_keep_prefix_containment() {
+        let child: Resource = "urn:example:resource:child".parse().unwrap();
+        let parent: Resource = "urn:example:resource".parse().unwrap();
+
+        assert!(child.extends(&parent));
     }
 }
