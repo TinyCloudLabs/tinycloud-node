@@ -39,8 +39,13 @@ arrow = { version = "56", features = ["ipc"] }
 tempfile = "3"
 aes-gcm = "0.10"
 rand = "0.8"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+hex.workspace = true
+base64.workspace = true
+sha2 = "0.10"
 
 [dev-dependencies]
 sea-orm = { version = "1.1", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
 async-std = { version = "1", features = ["attributes"] }
 tokio.workspace = true
+iri-string.workspace = true

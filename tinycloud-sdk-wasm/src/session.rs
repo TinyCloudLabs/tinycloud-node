@@ -5,8 +5,8 @@ use serde_with::{serde_as, DisplayFromStr};
 use std::collections::HashMap;
 use tinycloud_auth::{
     authorization::{
-        make_invocation, InvocationError, InvocationOptions, TinyCloudDelegation,
-        TinyCloudInvocation,
+        make_invocation, make_invocation_from_uris, InvocationError, InvocationOptions,
+        TinyCloudDelegation, TinyCloudInvocation,
     },
     cacaos::{
         siwe::{generate_nonce, Message, TimeStamp, Version as SIWEVersion},
@@ -16,7 +16,7 @@ use tinycloud_auth::{
     multihash_codetable::{Code, MultihashDigest},
     resolver::DID_METHODS,
     resource::{
-        iri_string::types::{UriFragmentString, UriQueryString},
+        iri_string::types::{UriFragmentString, UriQueryString, UriString},
         Path, ResourceId, Service, SpaceId,
     },
     siwe_recap::{Ability, Capability},
@@ -48,6 +48,10 @@ pub struct SessionConfig {
     /// spaces.
     #[serde(default)]
     pub space_abilities: Option<HashMap<SpaceId, AbilitiesMap>>,
+    /// Optional non-space resources to include directly in the ReCap.
+    /// Used by network-scoped capabilities such as TinyCloud encryption.
+    #[serde(default)]
+    pub raw_abilities: HashMap<String, Vec<Ability>>,
     #[serde(with = "tinycloud_sdk_rs::serde_siwe::address")]
     pub address: [u8; 20],
     pub chain_id: u64,
@@ -148,30 +152,38 @@ impl SessionConfig {
             }
         };
 
-        space_abilities
-            .into_iter()
-            .fold(
-                Capability::<Value>::default(),
-                |caps, (space_id, abilities)| {
-                    abilities.iter().fold(caps, |caps, (service, actions)| {
-                        actions.iter().fold(caps, |mut caps, (path, action)| {
-                            let path_opt = if path.as_str().is_empty() {
-                                None
-                            } else {
-                                Some(path.clone())
-                            };
-                            caps.with_actions(
-                                space_id
-                                    .clone()
-                                    .to_resource(service.clone(), path_opt, None, None)
-                                    .as_uri(),
-                                action.iter().map(|a| (a.clone(), [])),
-                            );
-                            caps
-                        })
+        let caps = space_abilities.into_iter().fold(
+            Capability::<Value>::default(),
+            |caps, (space_id, abilities)| {
+                abilities.iter().fold(caps, |caps, (service, actions)| {
+                    actions.iter().fold(caps, |mut caps, (path, action)| {
+                        let path_opt = if path.as_str().is_empty() {
+                            None
+                        } else {
+                            Some(path.clone())
+                        };
+                        caps.with_actions(
+                            space_id
+                                .clone()
+                                .to_resource(service.clone(), path_opt, None, None)
+                                .as_uri(),
+                            action.iter().map(|a| (a.clone(), [])),
+                        );
+                        caps
                     })
-                },
-            )
+                })
+            },
+        );
+
+        self.raw_abilities
+            .into_iter()
+            .try_fold(caps, |mut caps, (resource, actions)| {
+                let resource: UriString = resource
+                    .parse()
+                    .map_err(|err| format!("invalid raw resource URI: {err}"))?;
+                caps.with_actions(resource, actions.into_iter().map(|a| (a, [])));
+                Ok::<_, String>(caps)
+            })?
             .with_proofs(match &self.parents {
                 Some(p) => p.as_slice(),
                 None => &[],
@@ -210,6 +222,27 @@ impl Session {
         // 60 seconds in the future
         let exp = ((now.timestamp() + 60i64) as f64) + (now.nanosecond() as f64 / 1_000_000_000.0);
         make_invocation(
+            actions,
+            &self.delegation_cid,
+            &self.jwk,
+            &self.verification_method,
+            exp,
+            InvocationOptions {
+                facts,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn invoke_any_uri<A: IntoIterator<Item = Ability>>(
+        &self,
+        actions: impl IntoIterator<Item = (UriString, A)>,
+        facts: Option<Vec<serde_json::Value>>,
+    ) -> Result<TinyCloudInvocation, InvocationError> {
+        use tinycloud_auth::ssi::claims::chrono;
+        let now = chrono::Utc::now();
+        let exp = ((now.timestamp() + 60i64) as f64) + (now.nanosecond() as f64 / 1_000_000_000.0);
+        make_invocation_from_uris(
             actions,
             &self.delegation_cid,
             &self.jwk,

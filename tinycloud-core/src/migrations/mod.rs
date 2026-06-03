@@ -4,6 +4,7 @@ pub mod m20260218_sql_database;
 pub mod m20260409_000000_hook_tables;
 pub mod m20260512_000000_signed_kv_tickets;
 pub mod m20260516_000000_database_artifacts;
+pub mod m20260601_000000_encryption_networks;
 
 pub struct Migrator;
 
@@ -16,6 +17,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260409_000000_hook_tables::Migration),
             Box::new(m20260512_000000_signed_kv_tickets::Migration),
             Box::new(m20260516_000000_database_artifacts::Migration),
+            Box::new(m20260601_000000_encryption_networks::Migration),
         ]
     }
 }

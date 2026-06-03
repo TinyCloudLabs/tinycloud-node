@@ -13,6 +13,10 @@ pub use libp2p::{
 };
 
 pub(crate) fn get_did_key(key: PublicKey) -> String {
+    public_key_to_did_key(key)
+}
+
+pub fn public_key_to_did_key(key: PublicKey) -> String {
     use tinycloud_auth::ipld_core::cid::multibase;
     // only ed25519 feature is enabled, so this unwrap should never fail
     let ed25519_pk_bytes = key.try_into_ed25519().unwrap().to_bytes();
@@ -67,6 +71,19 @@ impl StaticSecret {
         let mut key = [0u8; 32];
         key.copy_from_slice(&derived[..32]);
         key
+    }
+
+    /// Derive a stable node-level did:key. The keypair is deterministic for a
+    /// given static secret. Used by node-wide identity contexts (encryption
+    /// module audience, signed responses).
+    pub fn node_did(&self) -> String {
+        public_key_to_did_key(self.node_keypair().public())
+    }
+
+    pub fn node_keypair(&self) -> Keypair {
+        let derived = self.derive_key(b"tinycloud/node/identity");
+        let secret = SecretKey::try_from_bytes(derived).expect("32 bytes");
+        EdKP::from(secret).into()
     }
 }
 

@@ -1,4 +1,5 @@
 use super::super::{
+    encryption_network::NetworkId,
     events::{Invocation, VersionedOperation},
     models::*,
     relationships::*,
@@ -119,10 +120,7 @@ async fn validate<C: ConnectionTrait>(
         .iter()
         .filter(|c| {
             // remove caps for which the invoker is the root authority
-            c.resource
-                .space()
-                .map(|o| **o.did() != *invocation.invoker)
-                .unwrap_or(true)
+            !is_root_authority(c, &invocation.invoker)
         })
         .collect();
 
@@ -149,10 +147,9 @@ async fn validate<C: ConnectionTrait>(
                 if p.delegatee != invocation.invoker
                     && !invocation.invoker.starts_with(&p.delegatee)
                 {
-                    return Err(InvocationError::UnauthorizedInvoker(
-                        invocation.invoker.clone(),
-                    )
-                    .into());
+                    return Err(
+                        InvocationError::UnauthorizedInvoker(invocation.invoker.clone()).into(),
+                    );
                 }
             }
 
@@ -182,6 +179,26 @@ async fn validate<C: ConnectionTrait>(
                 None => Ok(()),
             }
         }
+    }
+}
+
+fn is_root_authority(cap: &util::Capability, invoker: &str) -> bool {
+    if cap
+        .resource
+        .space()
+        .map(|o| o.did().as_str() == invoker)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    match &cap.resource {
+        Resource::Other(uri) => uri
+            .as_str()
+            .parse::<NetworkId>()
+            .map(|network_id| network_id.principal() == invoker)
+            .unwrap_or(false),
+        Resource::TinyCloud(_) => false,
     }
 }
 

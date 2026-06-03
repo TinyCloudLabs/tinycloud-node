@@ -32,6 +32,11 @@ use routes::{
     admin::{delete_quota, get_quota, list_quotas, set_quota},
     attestation::attestation,
     create_signed_kv_url, delegate,
+    encryption::{
+        create_network as create_encryption_network, decrypt as encryption_decrypt,
+        get_network as get_encryption_network, revoke_network as revoke_encryption_network,
+        well_known_network as encryption_well_known,
+    },
     hooks::{create_hook_ticket, create_webhook, delete_webhook, hook_events, list_webhooks},
     info, invoke, open_host_key,
     public::{public_kv_get, public_kv_head, public_kv_list, public_kv_options, RateLimiter},
@@ -47,6 +52,7 @@ use tee::TeeContext;
 use tinycloud_core::{
     database_artifacts::SeaOrmDatabaseArtifactRepository,
     duckdb::DuckDbService,
+    encryption_network::{EncryptionService, LocalOneOfOneBackend},
     keys::{SecretsSetup, StaticSecret},
     sea_orm::{ConnectOptions, Database, DatabaseConnection},
     sql::SqlService,
@@ -132,6 +138,11 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         delete_quota,
         get_quota,
         list_quotas,
+        create_encryption_network,
+        get_encryption_network,
+        encryption_well_known,
+        encryption_decrypt,
+        revoke_encryption_network,
     ];
 
     let key_setup: StaticSecret = resolve_keys(&tinycloud_config.keys).await?;
@@ -200,6 +211,20 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         database_connection.clone(),
     ));
 
+    // Encryption module: seal network private keys with the same kind of derived
+    // key used for DB column encryption. In DStack mode the seal is rooted in
+    // the dstack-derived `key_setup`, so this naturally lifts the network
+    // private key into DStack-derived key management.
+    let encryption_seal =
+        ColumnEncryption::new(key_setup.derive_key(b"tinycloud/encryption/network-seal"));
+    let encryption_backend = std::sync::Arc::new(LocalOneOfOneBackend::new(encryption_seal));
+    let node_keypair = key_setup.node_keypair();
+    let encryption_service = EncryptionService::new_with_node_keypair(
+        database_connection.clone(),
+        node_keypair,
+        encryption_backend,
+    );
+
     let tinycloud = TinyCloud::new(
         database_connection,
         tinycloud_config.storage.blocks.open().await?,
@@ -259,6 +284,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         .manage(webhook_encryption)
         .manage(rate_limiter)
         .manage(tee_context)
+        .manage(encryption_service)
         .manage(tinycloud_config.storage.staging.open().await?);
 
     if tinycloud_config.cors {

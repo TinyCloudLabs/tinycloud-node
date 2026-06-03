@@ -9206,9 +9206,12 @@ dependencies = [
  "arrow",
  "async-std",
  "async-trait",
+ "base64 0.22.1",
  "dashmap",
  "duckdb",
  "futures",
+ "hex",
+ "iri-string",
  "libp2p",
  "multihash-derive 0.9.1",
  "pin-project",
@@ -9219,6 +9222,7 @@ dependencies = [
  "serde",
  "serde_ipld_dagcbor 0.3.0",
  "serde_json",
+ "sha2 0.10.9",
  "sqlparser",
  "tempfile",
  "thiserror 2.0.18",
@@ -9227,6 +9231,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ucan-capabilities-object",
+ "x25519-dalek",
 ]
 
 [[package]]
