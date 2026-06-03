@@ -170,7 +170,7 @@ async fn verify_auth(
     tinycloud: &State<TinyCloud>,
     node_did: &str,
 ) -> Result<(), (Status, String)> {
-    if invocation.0.invocation.payload().audience.to_string() != node_did {
+    if invocation.0.invocation.payload().audience != node_did {
         return Err((
             Status::Unauthorized,
             EncryptionServiceError::AudienceMismatch.to_string(),
