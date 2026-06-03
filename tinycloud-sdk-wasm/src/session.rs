@@ -366,9 +366,18 @@ impl Session {
                     Some(path.clone())
                 };
 
-                let resource = space_id
-                    .clone()
-                    .to_resource(service.clone(), path_opt, None, None);
+                let resource_uri: UriString = if service.as_str() == "encryption"
+                    && path.as_str().starts_with("urn:tinycloud:encryption:")
+                {
+                    path.as_str()
+                        .parse()
+                        .map_err(|err| DelegationError::InvalidRawResource(format!("{err}")))?
+                } else {
+                    space_id
+                        .clone()
+                        .to_resource(service.clone(), path_opt, None, None)
+                        .as_uri()
+                };
 
                 let action_strings: Vec<String> =
                     path_actions.iter().map(|a| a.to_string()).collect();
@@ -376,7 +385,7 @@ impl Session {
                 // Extend the capability object with this (resource, actions)
                 // pair. The ucan-capabilities-object crate keys internally by
                 // resource URI, so each iteration adds a distinct entry.
-                caps.with_actions(resource.as_uri(), path_actions.into_iter().map(|a| (a, [])));
+                caps.with_actions(resource_uri, path_actions.into_iter().map(|a| (a, [])));
 
                 resources.push(DelegatedResource {
                     service: service.to_string(),
@@ -481,6 +490,8 @@ pub enum DelegationError {
     InvalidNotBefore(tinycloud_auth::ssi::claims::jwt::NumericDateConversionError),
     #[error("invalid expiration timestamp: {0}")]
     InvalidExpiration(tinycloud_auth::ssi::claims::jwt::NumericDateConversionError),
+    #[error("invalid raw resource URI: {0}")]
+    InvalidRawResource(String),
     #[error("failed to sign UCAN: {0}")]
     SigningError(tinycloud_auth::ssi::ucan::error::Error),
     #[error("failed to encode UCAN: {0}")]
@@ -1218,6 +1229,45 @@ pub mod test {
                 (expected_resource, "tinycloud.kv/put".to_string()),
             ],
             "UCAN attenuation should contain exactly the granted (resource, action) pairs"
+        );
+    }
+
+    #[test]
+    fn create_delegation_encodes_encryption_network_as_raw_resource() {
+        let session = rich_test_session();
+        let delegate_did = "did:pkh:eip155:1:0xBEEFBEEFBEEFBEEFBEEFBEEFBEEFBEEFBEEFBEEF";
+        let network_id =
+            "urn:tinycloud:encryption:did:pkh:eip155:1:0x7bd63aa37326a64d458559f44432103e3d6eede9:default";
+
+        let abilities =
+            build_abilities(&[("encryption", network_id, &["tinycloud.encryption/decrypt"])]);
+
+        let result = session
+            .create_delegation(
+                delegate_did,
+                &session.space_id,
+                abilities,
+                4_000_000_000.0,
+                None,
+            )
+            .expect("encryption network delegation should succeed");
+
+        assert_eq!(result.resources.len(), 1);
+        assert_eq!(result.resources[0].service, "encryption");
+        assert_eq!(result.resources[0].space, session.space_id.to_string());
+        assert_eq!(result.resources[0].path, network_id);
+        assert_eq!(
+            result.resources[0].actions,
+            vec!["tinycloud.encryption/decrypt".to_string()]
+        );
+
+        assert_eq!(
+            decode_delegation_pairs(&result.delegation),
+            vec![(
+                network_id.to_string(),
+                "tinycloud.encryption/decrypt".to_string()
+            )],
+            "encryption delegations must attenuate the raw network resource"
         );
     }
 
