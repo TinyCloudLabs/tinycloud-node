@@ -5,8 +5,8 @@ use serde_with::{serde_as, DisplayFromStr};
 use std::collections::HashMap;
 use tinycloud_auth::{
     authorization::{
-        make_invocation, InvocationError, InvocationOptions, TinyCloudDelegation,
-        TinyCloudInvocation,
+        make_invocation, make_invocation_from_uris, InvocationError, InvocationOptions,
+        TinyCloudDelegation, TinyCloudInvocation,
     },
     cacaos::{
         siwe::{generate_nonce, Message, TimeStamp, Version as SIWEVersion},
@@ -16,7 +16,7 @@ use tinycloud_auth::{
     multihash_codetable::{Code, MultihashDigest},
     resolver::DID_METHODS,
     resource::{
-        iri_string::types::{UriFragmentString, UriQueryString},
+        iri_string::types::{UriFragmentString, UriQueryString, UriString},
         Path, ResourceId, Service, SpaceId,
     },
     siwe_recap::{Ability, Capability},
@@ -48,6 +48,10 @@ pub struct SessionConfig {
     /// spaces.
     #[serde(default)]
     pub space_abilities: Option<HashMap<SpaceId, AbilitiesMap>>,
+    /// Optional non-space resources to include directly in the ReCap.
+    /// Used by network-scoped capabilities such as TinyCloud encryption.
+    #[serde(default)]
+    pub raw_abilities: HashMap<String, Vec<Ability>>,
     #[serde(with = "tinycloud_sdk_rs::serde_siwe::address")]
     pub address: [u8; 20],
     pub chain_id: u64,
@@ -148,30 +152,38 @@ impl SessionConfig {
             }
         };
 
-        space_abilities
-            .into_iter()
-            .fold(
-                Capability::<Value>::default(),
-                |caps, (space_id, abilities)| {
-                    abilities.iter().fold(caps, |caps, (service, actions)| {
-                        actions.iter().fold(caps, |mut caps, (path, action)| {
-                            let path_opt = if path.as_str().is_empty() {
-                                None
-                            } else {
-                                Some(path.clone())
-                            };
-                            caps.with_actions(
-                                space_id
-                                    .clone()
-                                    .to_resource(service.clone(), path_opt, None, None)
-                                    .as_uri(),
-                                action.iter().map(|a| (a.clone(), [])),
-                            );
-                            caps
-                        })
+        let caps = space_abilities.into_iter().fold(
+            Capability::<Value>::default(),
+            |caps, (space_id, abilities)| {
+                abilities.iter().fold(caps, |caps, (service, actions)| {
+                    actions.iter().fold(caps, |mut caps, (path, action)| {
+                        let path_opt = if path.as_str().is_empty() {
+                            None
+                        } else {
+                            Some(path.clone())
+                        };
+                        caps.with_actions(
+                            space_id
+                                .clone()
+                                .to_resource(service.clone(), path_opt, None, None)
+                                .as_uri(),
+                            action.iter().map(|a| (a.clone(), [])),
+                        );
+                        caps
                     })
-                },
-            )
+                })
+            },
+        );
+
+        self.raw_abilities
+            .into_iter()
+            .try_fold(caps, |mut caps, (resource, actions)| {
+                let resource: UriString = resource
+                    .parse()
+                    .map_err(|err| format!("invalid raw resource URI: {err}"))?;
+                caps.with_actions(resource, actions.into_iter().map(|a| (a, [])));
+                Ok::<_, String>(caps)
+            })?
             .with_proofs(match &self.parents {
                 Some(p) => p.as_slice(),
                 None => &[],
@@ -210,6 +222,27 @@ impl Session {
         // 60 seconds in the future
         let exp = ((now.timestamp() + 60i64) as f64) + (now.nanosecond() as f64 / 1_000_000_000.0);
         make_invocation(
+            actions,
+            &self.delegation_cid,
+            &self.jwk,
+            &self.verification_method,
+            exp,
+            InvocationOptions {
+                facts,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn invoke_any_uri<A: IntoIterator<Item = Ability>>(
+        &self,
+        actions: impl IntoIterator<Item = (UriString, A)>,
+        facts: Option<Vec<serde_json::Value>>,
+    ) -> Result<TinyCloudInvocation, InvocationError> {
+        use tinycloud_auth::ssi::claims::chrono;
+        let now = chrono::Utc::now();
+        let exp = ((now.timestamp() + 60i64) as f64) + (now.nanosecond() as f64 / 1_000_000_000.0);
+        make_invocation_from_uris(
             actions,
             &self.delegation_cid,
             &self.jwk,
@@ -333,9 +366,18 @@ impl Session {
                     Some(path.clone())
                 };
 
-                let resource = space_id
-                    .clone()
-                    .to_resource(service.clone(), path_opt, None, None);
+                let is_raw_encryption_resource = service.as_str() == "encryption"
+                    && path.as_str().starts_with("urn:tinycloud:encryption:");
+                let resource_uri: UriString = if is_raw_encryption_resource {
+                    path.as_str()
+                        .parse()
+                        .map_err(|err| DelegationError::InvalidRawResource(format!("{err}")))?
+                } else {
+                    space_id
+                        .clone()
+                        .to_resource(service.clone(), path_opt, None, None)
+                        .as_uri()
+                };
 
                 let action_strings: Vec<String> =
                     path_actions.iter().map(|a| a.to_string()).collect();
@@ -343,11 +385,15 @@ impl Session {
                 // Extend the capability object with this (resource, actions)
                 // pair. The ucan-capabilities-object crate keys internally by
                 // resource URI, so each iteration adds a distinct entry.
-                caps.with_actions(resource.as_uri(), path_actions.into_iter().map(|a| (a, [])));
+                caps.with_actions(resource_uri, path_actions.into_iter().map(|a| (a, [])));
 
                 resources.push(DelegatedResource {
                     service: service.to_string(),
-                    space: space_id.to_string(),
+                    space: if is_raw_encryption_resource {
+                        "encryption".to_string()
+                    } else {
+                        space_id.to_string()
+                    },
                     path: path.to_string(),
                     actions: action_strings,
                 });
@@ -448,6 +494,8 @@ pub enum DelegationError {
     InvalidNotBefore(tinycloud_auth::ssi::claims::jwt::NumericDateConversionError),
     #[error("invalid expiration timestamp: {0}")]
     InvalidExpiration(tinycloud_auth::ssi::claims::jwt::NumericDateConversionError),
+    #[error("invalid raw resource URI: {0}")]
+    InvalidRawResource(String),
     #[error("failed to sign UCAN: {0}")]
     SigningError(tinycloud_auth::ssi::ucan::error::Error),
     #[error("failed to encode UCAN: {0}")]
@@ -510,19 +558,6 @@ pub fn parse_recap_from_siwe(siwe_string: &str) -> Result<Vec<ParsedRecapEntry>,
 
     let mut entries: Vec<ParsedRecapEntry> = Vec::new();
     for (resource_uri, ability_map) in abilities_map.iter() {
-        let resource: ResourceId = resource_uri.as_str().parse().map_err(
-            |e: tinycloud_auth::resource::KRIParseError| {
-                ParseRecapError::InvalidResourceUri(resource_uri.to_string(), e.to_string())
-            },
-        )?;
-
-        let space = resource.space().to_string();
-        let service = resource.service().to_string();
-        let path = resource
-            .path()
-            .map(|p| p.as_str().to_string())
-            .unwrap_or_default();
-
         // Collect the full-URN ability strings. `ability_map` is a `BTreeMap`
         // keyed by `Ability`, so iteration yields keys in sorted order — this
         // gives us a deterministic action list without an extra sort pass.
@@ -530,6 +565,34 @@ pub fn parse_recap_from_siwe(siwe_string: &str) -> Result<Vec<ParsedRecapEntry>,
             .keys()
             .map(|ability| ability.to_string())
             .collect();
+
+        let (space, service, path) = match resource_uri.as_str().parse::<ResourceId>() {
+            Ok(resource) => (
+                resource.space().to_string(),
+                resource.service().to_string(),
+                resource
+                    .path()
+                    .map(|p| p.as_str().to_string())
+                    .unwrap_or_default(),
+            ),
+            Err(e) => {
+                if resource_uri
+                    .as_str()
+                    .starts_with("urn:tinycloud:encryption:")
+                {
+                    (
+                        "encryption".to_string(),
+                        "encryption".to_string(),
+                        resource_uri.to_string(),
+                    )
+                } else {
+                    return Err(ParseRecapError::InvalidResourceUri(
+                        resource_uri.to_string(),
+                        e.to_string(),
+                    ));
+                }
+            }
+        };
 
         entries.push(ParsedRecapEntry {
             service,
@@ -916,6 +979,64 @@ pub mod test {
     }
 
     #[test]
+    fn parse_recap_with_raw_encryption_ability() {
+        let network_id =
+            "urn:tinycloud:encryption:did:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:default";
+        let secrets_space =
+            "tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:secrets";
+        let config = json!({
+            "abilities": {},
+            "spaceAbilities": {
+                secrets_space: {
+                    "kv": {
+                        "vault/secrets/": vec![
+                            "tinycloud.kv/get",
+                            "tinycloud.kv/put",
+                        ],
+                    },
+                },
+            },
+            "rawAbilities": {
+                network_id: vec![
+                    "tinycloud.encryption/decrypt",
+                    "tinycloud.encryption/network.create",
+                ],
+            },
+            "address": "0x7BD63AA37326a64d458559F44432103e3d6eEDE9",
+            "chainId": 1u8,
+            "domain": "example.com",
+            "issuedAt": "2022-01-01T00:00:00.000Z",
+            "spaceId": secrets_space,
+            "expirationTime": "3000-01-01T00:00:00.000Z",
+        });
+
+        let prepared = prepare_session(serde_json::from_value(config).unwrap()).unwrap();
+        let entries = parse_recap_from_siwe(&prepared.siwe.to_string())
+            .expect("parse_recap_from_siwe should support raw encryption resources");
+
+        let encryption_entry = entries
+            .iter()
+            .find(|entry| entry.service == "encryption")
+            .expect("encryption recap entry");
+        assert_eq!(encryption_entry.space, "encryption");
+        assert_eq!(encryption_entry.path, network_id);
+        assert_eq!(
+            encryption_entry.actions,
+            vec![
+                "tinycloud.encryption/decrypt".to_string(),
+                "tinycloud.encryption/network.create".to_string(),
+            ]
+        );
+
+        let secrets_entry = entries
+            .iter()
+            .find(|entry| entry.service == "kv")
+            .expect("secrets kv recap entry");
+        assert_eq!(secrets_entry.space, secrets_space);
+        assert_eq!(secrets_entry.path, "vault/secrets/");
+    }
+
+    #[test]
     fn session_with_additional_spaces() {
         let config = json!({
             "abilities": {
@@ -1112,6 +1233,45 @@ pub mod test {
                 (expected_resource, "tinycloud.kv/put".to_string()),
             ],
             "UCAN attenuation should contain exactly the granted (resource, action) pairs"
+        );
+    }
+
+    #[test]
+    fn create_delegation_encodes_encryption_network_as_raw_resource() {
+        let session = rich_test_session();
+        let delegate_did = "did:pkh:eip155:1:0xBEEFBEEFBEEFBEEFBEEFBEEFBEEFBEEFBEEFBEEF";
+        let network_id =
+            "urn:tinycloud:encryption:did:pkh:eip155:1:0x7bd63aa37326a64d458559f44432103e3d6eede9:default";
+
+        let abilities =
+            build_abilities(&[("encryption", network_id, &["tinycloud.encryption/decrypt"])]);
+
+        let result = session
+            .create_delegation(
+                delegate_did,
+                &session.space_id,
+                abilities,
+                4_000_000_000.0,
+                None,
+            )
+            .expect("encryption network delegation should succeed");
+
+        assert_eq!(result.resources.len(), 1);
+        assert_eq!(result.resources[0].service, "encryption");
+        assert_eq!(result.resources[0].space, "encryption");
+        assert_eq!(result.resources[0].path, network_id);
+        assert_eq!(
+            result.resources[0].actions,
+            vec!["tinycloud.encryption/decrypt".to_string()]
+        );
+
+        assert_eq!(
+            decode_delegation_pairs(&result.delegation),
+            vec![(
+                network_id.to_string(),
+                "tinycloud.encryption/decrypt".to_string()
+            )],
+            "encryption delegations must attenuate the raw network resource"
         );
     }
 

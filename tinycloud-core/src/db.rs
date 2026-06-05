@@ -1091,8 +1091,11 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                     let cid = delegation::process(db, *d, encryption).await?;
                     delegation_cids.push(cid);
                 }
-                Event::Invocation(_, _) | Event::Revocation(_) => {
-                    unreachable!("non-delegation events with empty event_spaces")
+                Event::Invocation(i, _ops) => {
+                    invocation::process(db, *i, Vec::new(), encryption).await?;
+                }
+                Event::Revocation(r) => {
+                    revocation::process(db, *r).await?;
                 }
             };
         }

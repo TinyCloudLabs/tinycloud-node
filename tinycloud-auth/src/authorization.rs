@@ -1,6 +1,7 @@
 use crate::resource::ResourceId;
 use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use cacaos::siwe_cacao::SiweCacao;
+use iri_string::types::UriString;
 use iri_string::validate::Error as UriStringError;
 use ssi::{
     claims::jwt::NumericDate,
@@ -116,6 +117,26 @@ pub fn make_invocation<A: IntoIterator<Item = Ability>>(
     expiration: f64,
     options: InvocationOptions,
 ) -> Result<Ucan, InvocationError> {
+    make_invocation_from_uris(
+        invocation_target
+            .into_iter()
+            .map(|(resource, abilities)| (resource.as_uri(), abilities)),
+        delegation,
+        jwk,
+        verification_method,
+        expiration,
+        options,
+    )
+}
+
+pub fn make_invocation_from_uris<A: IntoIterator<Item = Ability>>(
+    invocation_target: impl IntoIterator<Item = (UriString, A)>,
+    delegation: &Cid,
+    jwk: &JWK,
+    verification_method: &str,
+    expiration: f64,
+    options: InvocationOptions,
+) -> Result<Ucan, InvocationError> {
     Ok(Payload {
         issuer: DIDURLBuf::from_str(verification_method)?,
         audience: DIDBuf::from_str(
@@ -140,7 +161,7 @@ pub fn make_invocation<A: IntoIterator<Item = Ability>>(
         attenuation: {
             let mut caps = ucan_capabilities_object::Capabilities::new();
             for (resource, abilities) in invocation_target {
-                caps.with_actions(resource.as_uri(), abilities.into_iter().map(|a| (a, [])));
+                caps.with_actions(resource, abilities.into_iter().map(|a| (a, [])));
             }
             caps
         },

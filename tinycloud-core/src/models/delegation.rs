@@ -1,4 +1,5 @@
 use crate::encryption::ColumnEncryption;
+use crate::encryption_network::NetworkId;
 use crate::hash::Hash;
 use crate::types::{Ability, Facts, Resource};
 use crate::{events::Delegation, models::*, relationships::*, util};
@@ -171,10 +172,7 @@ async fn validate<C: ConnectionTrait>(
         .iter()
         .filter(|c| {
             // remove caps for which the delegator is the root authority
-            c.resource
-                .space()
-                .map(|o| **o.did() != *delegation.delegator)
-                .unwrap_or(true)
+            !is_root_authority(c, &delegation.delegator)
         })
         .collect();
 
@@ -259,6 +257,26 @@ async fn validate<C: ConnectionTrait>(
                 None => Ok(()),
             }
         }
+    }
+}
+
+fn is_root_authority(cap: &util::Capability, delegator: &str) -> bool {
+    if cap
+        .resource
+        .space()
+        .map(|o| o.did().as_str() == delegator)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    match &cap.resource {
+        Resource::Other(uri) => uri
+            .as_str()
+            .parse::<NetworkId>()
+            .map(|network_id| network_id.principal() == delegator)
+            .unwrap_or(false),
+        Resource::TinyCloud(_) => false,
     }
 }
 

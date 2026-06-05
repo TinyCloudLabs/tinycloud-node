@@ -2,6 +2,7 @@ pub mod database_artifacts;
 pub mod db;
 pub mod duckdb;
 pub mod encryption;
+pub mod encryption_network;
 pub mod events;
 pub mod hash;
 pub mod keys;

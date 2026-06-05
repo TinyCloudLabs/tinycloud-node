@@ -23,6 +23,7 @@ use crate::{
 };
 use tinycloud_core::{
     duckdb::{DuckDbCaveats, DuckDbError, DuckDbRequest, DuckDbResponse, DuckDbService},
+    encryption_network::EncryptionService,
     events::Invocation,
     models::{hook_delivery, hook_subscription, kv_delete, kv_write},
     sea_orm::DbErr,
@@ -37,6 +38,7 @@ use tinycloud_core::{
 
 pub mod admin;
 pub mod attestation;
+pub mod encryption;
 pub mod hooks;
 pub mod public;
 pub mod util;
@@ -47,6 +49,8 @@ pub struct NodeInfo {
     pub protocol: u32,
     pub version: String,
     pub features: Vec<&'static str>,
+    #[serde(rename = "nodeId")]
+    pub node_id: String,
     #[serde(rename = "inTEE")]
     pub in_tee: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -56,6 +60,7 @@ pub struct NodeInfo {
 fn build_info(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
+    encryption: &State<EncryptionService>,
 ) -> NodeInfo {
     #[allow(unused_mut)]
     let mut features = vec![
@@ -66,6 +71,7 @@ fn build_info(
         "duckdb",
         "hooks",
         "signed-urls",
+        "encryption",
     ];
     #[cfg(feature = "dstack")]
     features.push("tee");
@@ -73,6 +79,7 @@ fn build_info(
         protocol: tinycloud_auth::protocol::PROTOCOL_VERSION,
         version: env!("CARGO_PKG_VERSION").to_string(),
         features,
+        node_id: encryption.node_did().to_string(),
         in_tee: tee.inner().is_some(),
         quota_url: quota_cache.quota_url().map(|s| s.to_string()),
     }
@@ -82,16 +89,18 @@ fn build_info(
 pub fn info(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
+    encryption: &State<EncryptionService>,
 ) -> Json<NodeInfo> {
-    Json(build_info(tee, quota_cache))
+    Json(build_info(tee, quota_cache, encryption))
 }
 
 #[get("/version")]
 pub fn version(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
+    encryption: &State<EncryptionService>,
 ) -> Json<NodeInfo> {
-    Json(build_info(tee, quota_cache))
+    Json(build_info(tee, quota_cache, encryption))
 }
 
 #[allow(clippy::let_unit_value)]

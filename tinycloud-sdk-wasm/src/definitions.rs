@@ -8,6 +8,8 @@ const TS_DEF: &'static str = r#"
 export type SessionConfig = {
   /** Actions that the session key will be permitted to perform, organized by service and path */
   actions: { [service: string]: { [key: string]: string[] }},
+  /** Non-space resources to include directly in the ReCap, keyed by raw resource URI */
+  rawAbilities?: { [resource: string]: string[] },
   /** Ethereum address. */
   address: string,
   /** Chain ID. */
