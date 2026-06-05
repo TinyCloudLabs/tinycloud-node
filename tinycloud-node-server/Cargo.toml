@@ -54,6 +54,7 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
 
 [dependencies.tinycloud-core]
 path = "../tinycloud-core/"
+default-features = false
 features = ["sqlite", "postgres", "mysql", "tokio"]
 
 [dependencies.tinycloud-auth]
@@ -62,6 +63,7 @@ path = "../tinycloud-auth/"
 [features]
 default = []
 dstack = []
+duckdb = ["tinycloud-core/duckdb"]
 
 # cargo-binstall support: allows `cargo binstall tinycloud-node`
 [package.metadata.binstall]

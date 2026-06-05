@@ -349,14 +349,15 @@ pub async fn delete_webhook(
 }
 
 fn validate_subscription(subscription: &HookSubscription) -> Result<(), (Status, String)> {
-    if !matches!(subscription.service.as_str(), "kv" | "sql" | "duckdb") {
+    let service = subscription.service.as_str();
+    if !(matches!(service, "kv" | "sql") || cfg!(feature = "duckdb") && service == "duckdb") {
         return Err((Status::BadRequest, "Unsupported hook service".to_string()));
     }
 
-    let allowed_abilities: &[&str] = match subscription.service.as_str() {
+    let allowed_abilities: &[&str] = match service {
         "kv" => &["tinycloud.kv/put", "tinycloud.kv/del"],
         "sql" => &["tinycloud.sql/write"],
-        "duckdb" => &["tinycloud.duckdb/write"],
+        "duckdb" if cfg!(feature = "duckdb") => &["tinycloud.duckdb/write"],
         _ => unreachable!(),
     };
 
@@ -833,7 +834,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepts_sql_and_duckdb_subscription_filters() {
+    async fn accepts_sql_subscription_filters() {
         validate_subscription(&HookSubscription {
             space: "tinycloud:space".to_string(),
             service: "sql".to_string(),
@@ -841,7 +842,11 @@ mod tests {
             abilities: vec!["tinycloud.sql/write".to_string()],
         })
         .expect("sql subscription should be allowed");
+    }
 
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn accepts_duckdb_subscription_filters() {
         validate_subscription(&HookSubscription {
             space: "tinycloud:space".to_string(),
             service: "duckdb".to_string(),

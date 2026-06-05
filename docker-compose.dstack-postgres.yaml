@@ -8,6 +8,8 @@
 
 services:
   tinycloud:
+    # DuckDB-enabled images are opt-in and use the -duckdb suffix, for example:
+    # ghcr.io/tinycloudlabs/tinycloud-node:1.4.0-dstack-duckdb
     image: ghcr.io/tinycloudlabs/tinycloud-node:dstack
     restart: unless-stopped
     ports:

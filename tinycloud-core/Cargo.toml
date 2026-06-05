@@ -10,6 +10,7 @@ default = ["sqlite", "postgres", "mysql", "tokio"]
 sqlite = ["sea-orm/sqlx-sqlite"]
 postgres = ["sea-orm/sqlx-postgres"]
 mysql = ["sea-orm/sqlx-mysql"]
+duckdb = ["dep:arrow", "dep:duckdb"]
 
 tokio = ["sea-orm/runtime-tokio-rustls"]
 async-std = ["sea-orm/runtime-async-std-rustls"]
@@ -34,8 +35,8 @@ rusqlite.workspace = true
 sqlparser.workspace = true
 tracing.workspace = true
 tokio.workspace = true
-duckdb = { version = "1.1", features = ["bundled", "appender-arrow"] }
-arrow = { version = "56", features = ["ipc"] }
+duckdb = { version = "1.1", features = ["bundled", "appender-arrow"], optional = true }
+arrow = { version = "56", features = ["ipc"], optional = true }
 tempfile = "3"
 aes-gcm = "0.10"
 rand = "0.8"

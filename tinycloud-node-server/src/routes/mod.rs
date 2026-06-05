@@ -21,8 +21,11 @@ use crate::{
     tracing::TracingSpan,
     BlockStage, BlockStores, TinyCloud,
 };
+#[cfg(feature = "duckdb")]
+use tinycloud_core::duckdb::{
+    DuckDbCaveats, DuckDbError, DuckDbRequest, DuckDbResponse, DuckDbService,
+};
 use tinycloud_core::{
-    duckdb::{DuckDbCaveats, DuckDbError, DuckDbRequest, DuckDbResponse, DuckDbService},
     encryption_network::EncryptionService,
     events::Invocation,
     models::{hook_delivery, hook_subscription, kv_delete, kv_write},
@@ -63,16 +66,10 @@ fn build_info(
     encryption: &State<EncryptionService>,
 ) -> NodeInfo {
     #[allow(unused_mut)]
-    let mut features = vec![
-        "kv",
-        "delegation",
-        "sharing",
-        "sql",
-        "duckdb",
-        "hooks",
-        "signed-urls",
-        "encryption",
-    ];
+    let mut features = vec!["kv", "delegation", "sharing", "sql"];
+    #[cfg(feature = "duckdb")]
+    features.push("duckdb");
+    features.extend(["hooks", "signed-urls", "encryption"]);
     #[cfg(feature = "dstack")]
     features.push("tee");
     NodeInfo {
@@ -250,6 +247,7 @@ pub async fn delegate(
 }
 
 #[post("/invoke", data = "<data>")]
+#[cfg(feature = "duckdb")]
 #[allow(clippy::too_many_arguments)]
 pub async fn invoke(
     i: AuthHeaderGetter<InvocationInfo>,
@@ -262,6 +260,74 @@ pub async fn invoke(
     quota_cache: &State<QuotaCache>,
     sql_service: &State<SqlService>,
     duckdb_service: &State<DuckDbService>,
+    hook_runtime: &State<HookRuntime>,
+) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
+    invoke_impl(
+        i,
+        req_span,
+        headers,
+        data,
+        staging,
+        tinycloud,
+        config,
+        quota_cache,
+        sql_service,
+        duckdb_service,
+        hook_runtime,
+    )
+    .await
+}
+
+#[post("/invoke", data = "<data>")]
+#[cfg(not(feature = "duckdb"))]
+#[allow(clippy::too_many_arguments)]
+pub async fn invoke(
+    i: AuthHeaderGetter<InvocationInfo>,
+    req_span: TracingSpan,
+    headers: ObjectHeaders,
+    data: DataIn<'_>,
+    staging: &State<BlockStage>,
+    tinycloud: &State<TinyCloud>,
+    config: &State<Config>,
+    quota_cache: &State<QuotaCache>,
+    sql_service: &State<SqlService>,
+    hook_runtime: &State<HookRuntime>,
+) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
+    invoke_impl(
+        i,
+        req_span,
+        headers,
+        data,
+        staging,
+        tinycloud,
+        config,
+        quota_cache,
+        sql_service,
+        (),
+        hook_runtime,
+    )
+    .await
+}
+
+#[cfg(feature = "duckdb")]
+type DuckDbInvokeState<'a> = &'a State<DuckDbService>;
+#[cfg(not(feature = "duckdb"))]
+type DuckDbInvokeState<'a> = ();
+
+#[allow(clippy::too_many_arguments)]
+async fn invoke_impl(
+    i: AuthHeaderGetter<InvocationInfo>,
+    req_span: TracingSpan,
+    headers: ObjectHeaders,
+    data: DataIn<'_>,
+    staging: &State<BlockStage>,
+    tinycloud: &State<TinyCloud>,
+    config: &State<Config>,
+    quota_cache: &State<QuotaCache>,
+    sql_service: &State<SqlService>,
+    #[cfg_attr(not(feature = "duckdb"), allow(unused_variables))] duckdb_service: DuckDbInvokeState<
+        '_,
+    >,
     hook_runtime: &State<HookRuntime>,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
     let action_label = "invocation";
@@ -306,43 +372,62 @@ pub async fn invoke(
             return result;
         }
 
-        // Check for DuckDB capabilities
-        let duckdb_caps: Vec<_> =
-            i.0 .0
-                .capabilities
-                .iter()
-                .filter_map(|c| match (&c.resource, c.ability.as_ref().as_ref()) {
-                    (Resource::TinyCloud(r), ability)
-                        if r.service().as_str() == "duckdb"
-                            && ability.starts_with("tinycloud.duckdb/") =>
-                    {
-                        Some((
-                            r.space().clone(),
-                            r.path().map(|p| p.to_string()),
-                            ability.to_string(),
-                        ))
-                    }
-                    _ => None,
-                })
-                .collect();
+        #[cfg(feature = "duckdb")]
+        {
+            // Check for DuckDB capabilities
+            let duckdb_caps: Vec<_> =
+                i.0 .0
+                    .capabilities
+                    .iter()
+                    .filter_map(|c| match (&c.resource, c.ability.as_ref().as_ref()) {
+                        (Resource::TinyCloud(r), ability)
+                            if r.service().as_str() == "duckdb"
+                                && ability.starts_with("tinycloud.duckdb/") =>
+                        {
+                            Some((
+                                r.space().clone(),
+                                r.path().map(|p| p.to_string()),
+                                ability.to_string(),
+                            ))
+                        }
+                        _ => None,
+                    })
+                    .collect();
 
-        if !duckdb_caps.is_empty() {
-            let arrow_format = headers.0 .0.iter().any(|(k, v)| {
-                k.eq_ignore_ascii_case("accept")
-                    && v.contains("application/vnd.apache.arrow.stream")
-            });
-            let result = handle_duckdb_invoke(
-                i,
-                data,
-                tinycloud,
-                duckdb_service,
-                hook_runtime,
-                &duckdb_caps,
-                arrow_format,
+            if !duckdb_caps.is_empty() {
+                let arrow_format = headers.0 .0.iter().any(|(k, v)| {
+                    k.eq_ignore_ascii_case("accept")
+                        && v.contains("application/vnd.apache.arrow.stream")
+                });
+                let result = handle_duckdb_invoke(
+                    i,
+                    data,
+                    tinycloud,
+                    duckdb_service,
+                    hook_runtime,
+                    &duckdb_caps,
+                    arrow_format,
+                )
+                .await;
+                timer.observe_duration();
+                return result;
+            }
+        }
+
+        #[cfg(not(feature = "duckdb"))]
+        if i.0 .0.capabilities.iter().any(|c| {
+            matches!(
+                (&c.resource, c.ability.as_ref().as_ref()),
+                (Resource::TinyCloud(r), ability)
+                    if r.service().as_str() == "duckdb"
+                        && ability.starts_with("tinycloud.duckdb/")
             )
-            .await;
+        }) {
             timer.observe_duration();
-            return result;
+            return Err((
+                Status::NotImplemented,
+                "DuckDB support is not enabled on this node".to_string(),
+            ));
         }
 
         let mut put_iter = i.0 .0.capabilities.iter().filter_map(|c| {
@@ -721,6 +806,7 @@ fn sql_error_to_status(err: &SqlError) -> Status {
     }
 }
 
+#[cfg(feature = "duckdb")]
 async fn handle_duckdb_invoke(
     i: AuthHeaderGetter<InvocationInfo>,
     data: DataIn<'_>,
@@ -851,6 +937,7 @@ async fn handle_duckdb_invoke(
     }
 }
 
+#[cfg(feature = "duckdb")]
 fn duckdb_error_to_status(err: &DuckDbError) -> Status {
     match err {
         DuckDbError::DuckDb(_) => Status::BadRequest,

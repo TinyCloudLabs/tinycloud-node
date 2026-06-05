@@ -7,6 +7,23 @@ on:
     branches: [main]
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      include_duckdb:
+        description: 'Build images with DuckDB support enabled'
+        required: false
+        type: boolean
+        default: false
+      deploy_phala:
+        description: 'Deploy the dstack image to Phala after build'
+        required: false
+        type: boolean
+        default: false
+      image_version:
+        description: 'Manual image version to tag/deploy, without leading v. Defaults to the selected ref name.'
+        required: false
+        type: string
+        default: ''
 
 env:
   REGISTRY: ghcr.io
@@ -25,12 +42,25 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        if: github.event_name == 'release' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve optional build features
+        id: build_features
+        run: |
+          FEATURES=""
+          IMAGE_SUFFIX=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.include_duckdb }}" = "true" ]; then
+            FEATURES="duckdb"
+            IMAGE_SUFFIX="-duckdb"
+          fi
+          echo "cargo_features=${FEATURES}" >> "$GITHUB_OUTPUT"
+          echo "image_suffix=${IMAGE_SUFFIX}" >> "$GITHUB_OUTPUT"
+          echo "manual_version=${{ inputs.image_version }}" >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata (tags, labels)
         id: meta
@@ -38,25 +68,27 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=semver,pattern={{version}},suffix=${{ steps.build_features.outputs.image_suffix }}
+            type=semver,pattern={{major}}.{{minor}},suffix=${{ steps.build_features.outputs.image_suffix }}
+            type=semver,pattern={{major}},suffix=${{ steps.build_features.outputs.image_suffix }}
+            type=raw,value=${{ steps.build_features.outputs.manual_version }}${{ steps.build_features.outputs.image_suffix }},enable=${{ github.event_name == 'workflow_dispatch' && steps.build_features.outputs.manual_version != '' }}
             type=sha,prefix=
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest${{ steps.build_features.outputs.image_suffix }},enable={{is_default_branch}}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: ${{ github.event_name == 'release' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+          push: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: CARGO_FEATURES=${{ steps.build_features.outputs.cargo_features }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
   build-dstack:
     runs-on: ubuntu-latest
-    if: github.event_name == 'release' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     permissions:
       contents: read
       packages: write
@@ -73,17 +105,34 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Resolve optional build features
+        id: build_features
+        run: |
+          FEATURES="dstack"
+          IMAGE_SUFFIX=""
+          SHA_PREFIX="dstack-"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.include_duckdb }}" = "true" ]; then
+            FEATURES="dstack duckdb"
+            IMAGE_SUFFIX="-duckdb"
+            SHA_PREFIX="dstack-duckdb-"
+          fi
+          echo "cargo_features=${FEATURES}" >> "$GITHUB_OUTPUT"
+          echo "image_suffix=${IMAGE_SUFFIX}" >> "$GITHUB_OUTPUT"
+          echo "sha_prefix=${SHA_PREFIX}" >> "$GITHUB_OUTPUT"
+          echo "manual_version=${{ inputs.image_version }}" >> "$GITHUB_OUTPUT"
+
       - name: Extract metadata (tags, labels)
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=semver,pattern={{version}},suffix=-dstack
-            type=semver,pattern={{major}}.{{minor}},suffix=-dstack
-            type=semver,pattern={{major}},suffix=-dstack
-            type=sha,prefix=dstack-
-            type=raw,value=dstack,enable={{is_default_branch}}
+            type=semver,pattern={{version}},suffix=-dstack${{ steps.build_features.outputs.image_suffix }}
+            type=semver,pattern={{major}}.{{minor}},suffix=-dstack${{ steps.build_features.outputs.image_suffix }}
+            type=semver,pattern={{major}},suffix=-dstack${{ steps.build_features.outputs.image_suffix }}
+            type=raw,value=${{ steps.build_features.outputs.manual_version }}-dstack${{ steps.build_features.outputs.image_suffix }},enable=${{ github.event_name == 'workflow_dispatch' && steps.build_features.outputs.manual_version != '' }}
+            type=sha,prefix=${{ steps.build_features.outputs.sha_prefix }}
+            type=raw,value=dstack${{ steps.build_features.outputs.image_suffix }},enable={{is_default_branch}}
 
       - name: Build and push dstack Docker image
         uses: docker/build-push-action@v5
@@ -92,14 +141,14 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: CARGO_FEATURES=dstack
+          build-args: CARGO_FEATURES=${{ steps.build_features.outputs.cargo_features }}
           cache-from: type=gha,scope=dstack
           cache-to: type=gha,mode=max,scope=dstack
 
   deploy-phala:
     runs-on: ubuntu-latest
     needs: [build, build-dstack]
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.deploy_phala)
     steps:
       - uses: actions/checkout@v4
 
@@ -113,15 +162,31 @@ jobs:
 
       - name: Update compose with release tag
         run: |
-          TAG="${{ github.event.release.tag_name }}"
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          else
+            TAG="${{ inputs.image_version }}"
+            if [ -z "${TAG}" ]; then
+              if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+                echo "::error::workflow_dispatch deploy_phala requires image_version unless the workflow is run from a tag"
+                exit 1
+              fi
+              TAG="${GITHUB_REF_NAME}"
+            fi
+          fi
           # metadata-action emits {{version}} without the leading v (e.g. 1.3.0).
           # Strip a leading v from the tag to match the pushed image tag.
           VERSION="${TAG#v}"
+          DUCKDB_SUFFIX=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.include_duckdb }}" = "true" ]; then
+            DUCKDB_SUFFIX="-duckdb"
+          fi
           # The prod CVM uses the dstack-suffixed image. Replace the floating
           # ":dstack" tag in the checked-in compose with the versioned tag
-          # built by the build-dstack job (e.g. ":1.3.0-dstack").
-          sed -i "s|ghcr.io/tinycloudlabs/tinycloud-node:dstack|ghcr.io/tinycloudlabs/tinycloud-node:${VERSION}-dstack|g" docker-compose.dstack-postgres.yaml
-          echo "Resolved image tag: ghcr.io/tinycloudlabs/tinycloud-node:${VERSION}-dstack"
+          # built by the build-dstack job (e.g. ":1.3.0-dstack" or
+          # ":1.3.0-dstack-duckdb").
+          sed -i "s|ghcr.io/tinycloudlabs/tinycloud-node:dstack|ghcr.io/tinycloudlabs/tinycloud-node:${VERSION}-dstack${DUCKDB_SUFFIX}|g" docker-compose.dstack-postgres.yaml
+          echo "Resolved image tag: ghcr.io/tinycloudlabs/tinycloud-node:${VERSION}-dstack${DUCKDB_SUFFIX}"
           cat docker-compose.dstack-postgres.yaml
 
       - name: Deploy to Phala Cloud

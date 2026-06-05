@@ -1,5 +1,6 @@
 pub mod database_artifacts;
 pub mod db;
+#[cfg(feature = "duckdb")]
 pub mod duckdb;
 pub mod encryption;
 pub mod encryption_network;
