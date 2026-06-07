@@ -1,6 +1,6 @@
 # Build argument to select runtime base (default scratch)
 ARG RUNTIME_BASE=scratch
-# Optional: pass "dstack" to enable TEE support
+# Optional: pass "dstack", "duckdb", or "dstack duckdb" to enable build features.
 ARG CARGO_FEATURES=""
 
 FROM rust:alpine AS chef
@@ -27,12 +27,20 @@ ARG CARGO_FEATURES=""
 COPY --from=planner /app/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo chef cook --release --recipe-path recipe.json ${CARGO_FEATURES:+--features $CARGO_FEATURES}
+    if [ -n "$CARGO_FEATURES" ]; then \
+        cargo chef cook --release --recipe-path recipe.json --features "$CARGO_FEATURES"; \
+    else \
+        cargo chef cook --release --recipe-path recipe.json; \
+    fi
 COPY --from=planner /app/ ./
 RUN chmod +x ./scripts/init-tinycloud-data.sh && ./scripts/init-tinycloud-data.sh
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release -p tinycloud-node ${CARGO_FEATURES:+--features $CARGO_FEATURES} && \
+    if [ -n "$CARGO_FEATURES" ]; then \
+        cargo build --release -p tinycloud-node --features "$CARGO_FEATURES"; \
+    else \
+        cargo build --release -p tinycloud-node; \
+    fi && \
     cp /app/target/release/tinycloud /app/tinycloud
 RUN addgroup -g 1000 tinycloud && adduser -u 1000 -G tinycloud -s /bin/sh -D tinycloud
 RUN mkdir -p /scratch-tmp && chmod 1777 /scratch-tmp

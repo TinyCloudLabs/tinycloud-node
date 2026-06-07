@@ -3,6 +3,8 @@
 #
 # Deploy on dstack:
 #   docker build --build-arg CARGO_FEATURES=dstack -t tinycloud-dstack .
+#   # DuckDB is opt-in:
+#   docker build --build-arg "CARGO_FEATURES=dstack duckdb" -t tinycloud-dstack-duckdb .
 #   # Or use the pre-built image from ghcr.io
 #
 # The same image works on dstack (TEE) and classic (non-TEE) deployments.

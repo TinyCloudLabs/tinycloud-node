@@ -49,9 +49,10 @@ use storage::{
     s3::{S3BlockConfig, S3BlockStore},
 };
 use tee::TeeContext;
+#[cfg(feature = "duckdb")]
+use tinycloud_core::duckdb::DuckDbService;
 use tinycloud_core::{
     database_artifacts::SeaOrmDatabaseArtifactRepository,
-    duckdb::DuckDbService,
     encryption_network::{EncryptionService, LocalOneOfOneBackend},
     keys::{SecretsSetup, StaticSecret},
     sea_orm::{ConnectOptions, Database, DatabaseConnection},
@@ -239,6 +240,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         database_artifact_repository.clone(),
     );
 
+    #[cfg(feature = "duckdb")]
     let duckdb_service = DuckDbService::new(
         tinycloud_config
             .storage
@@ -276,8 +278,10 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
             header_name: tinycloud_config.log.tracing.traceheader,
         })
         .manage(tinycloud)
-        .manage(sql_service)
-        .manage(duckdb_service)
+        .manage(sql_service);
+    #[cfg(feature = "duckdb")]
+    let rocket = rocket.manage(duckdb_service);
+    let rocket = rocket
         .manage(quota_cache)
         .manage(hook_runtime)
         .manage(signed_url_runtime)
@@ -384,12 +388,13 @@ async fn ensure_local_dirs(storage: &config::Storage) -> Result<()> {
         }
     }
 
-    // SQL and DuckDB storage paths are always local filesystem
+    // SQL storage paths are always local filesystem.
     if let Some(ref sql_path) = storage.sql.path {
         tokio::fs::create_dir_all(sql_path)
             .await
             .with_context(|| format!("creating SQL storage directory: {}", sql_path))?;
     }
+    #[cfg(feature = "duckdb")]
     if let Some(ref duckdb_path) = storage.duckdb.path {
         tokio::fs::create_dir_all(duckdb_path)
             .await
