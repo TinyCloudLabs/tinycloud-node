@@ -52,6 +52,11 @@ tracing-log = "0.2"
 tracing-opentelemetry = "0.30"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
 
+[target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
+# Release builds cross-compile aarch64 Linux from x86_64 Linux. Vendoring
+# OpenSSL avoids needing target OpenSSL headers/libs in the runner image.
+native-tls = { version = "0.2.14", features = ["vendored"] }
+
 [dependencies.tinycloud-core]
 path = "../tinycloud-core/"
 default-features = false

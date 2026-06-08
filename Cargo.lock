@@ -9250,6 +9250,7 @@ dependencies = [
  "hmac",
  "hyper 0.14.32",
  "lazy_static",
+ "native-tls",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
