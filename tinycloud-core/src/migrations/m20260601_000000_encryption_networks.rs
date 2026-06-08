@@ -21,11 +21,7 @@ impl MigrationTrait for Migration {
                             .string()
                             .not_null(),
                     )
-                    .col(
-                        ColumnDef::new(encryption_network::Column::OwnerDid)
-                            .string()
-                            .not_null(),
-                    )
+                    .col(ColumnDef::new(Alias::new("principal")).string().not_null())
                     .col(
                         ColumnDef::new(encryption_network::Column::Name)
                             .string()
