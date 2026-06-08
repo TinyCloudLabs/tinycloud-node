@@ -22,7 +22,7 @@ impl MigrationTrait for Migration {
                             .not_null(),
                     )
                     .col(
-                        ColumnDef::new(encryption_network::Column::Principal)
+                        ColumnDef::new(encryption_network::Column::OwnerDid)
                             .string()
                             .not_null(),
                     )

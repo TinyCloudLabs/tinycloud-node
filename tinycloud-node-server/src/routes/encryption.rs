@@ -7,7 +7,7 @@
 //! - `POST /encryption/networks/<network_id>/decrypt` — UCAN-style decrypt invocation
 //! - `POST /encryption/networks/<network_id>/revoke`  — admin revoke (placeholder)
 
-use rocket::{http::Status, serde::json::Json, State};
+use rocket::{form::FromForm, http::Status, serde::json::Json, State};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -22,7 +22,8 @@ use tinycloud_core::{events::Invocation, util::InvocationInfo};
 #[derive(Debug, Deserialize)]
 pub struct CreateNetworkBody {
     pub name: String,
-    pub principal: String,
+    #[serde(rename = "ownerDid")]
+    pub owner_did: String,
     #[serde(default = "default_threshold")]
     pub threshold: Threshold,
 }
@@ -34,6 +35,12 @@ fn default_threshold() -> Threshold {
 #[derive(Debug, Serialize)]
 pub struct DescriptorView {
     pub descriptor: NetworkDescriptor,
+}
+
+#[derive(Debug, FromForm)]
+pub struct WellKnownNetworkQuery {
+    #[field(name = "ownerDid")]
+    pub owner_did: Option<String>,
 }
 
 #[post("/encryption/networks", format = "json", data = "<body>")]
@@ -50,7 +57,7 @@ pub async fn create_network(
     let body_value = body.into_inner();
     let body: CreateNetworkBody = serde_json::from_value(body_value.clone())
         .map_err(|err| (Status::BadRequest, err.to_string()))?;
-    let network_id = NetworkId::new(body.principal.clone(), body.name.clone())
+    let network_id = NetworkId::new(body.owner_did.clone(), body.name.clone())
         .map_err(|err| (Status::BadRequest, err.to_string()))?;
     service
         .verify_network_admin_authorized(
@@ -63,7 +70,7 @@ pub async fn create_network(
         .map_err(map_service_err)?;
     let req = CreateNetworkRequest {
         name: body.name,
-        principal: body.principal,
+        owner_did: body.owner_did,
         threshold: body.threshold,
     };
     let descriptor = service
@@ -91,16 +98,16 @@ pub async fn get_network(
 /// Discovery record published as `.well-known/encryption/network/<name>`.
 /// Authoritative state still lives in the node DB; this endpoint just renders a
 /// cache-friendly view of the active network for the given name.
-#[get("/.well-known/encryption/network/<name>?<principal>")]
+#[get("/.well-known/encryption/network/<name>?<query..>")]
 pub async fn well_known_network(
     name: &str,
-    principal: Option<&str>,
+    query: WellKnownNetworkQuery,
     service: &State<EncryptionService>,
 ) -> Result<Json<WellKnownRecord>, (Status, String)> {
-    // V1 supports principal-qualified discovery when the caller has it, and a
-    // name-only fallback for single-principal nodes.
+    // V1 supports owner-qualified discovery when the caller has it, and a
+    // name-only fallback for single-owner nodes.
     let descriptor = service
-        .get_network_by_name(name, principal)
+        .get_network_by_name(name, query.owner_did.as_deref())
         .await
         .map_err(map_service_err)?;
     Ok(Json(WellKnownRecord::from(&descriptor)))
@@ -192,7 +199,7 @@ fn map_service_err(err: EncryptionServiceError) -> (Status, String) {
         EncryptionServiceError::Signing(_) => Status::InternalServerError,
         EncryptionServiceError::AudienceMismatch
         | EncryptionServiceError::TargetNodeMismatch
-        | EncryptionServiceError::PrincipalMismatch
+        | EncryptionServiceError::OwnerMismatch
         | EncryptionServiceError::NetworkMismatch
         | EncryptionServiceError::Unauthorized
         | EncryptionServiceError::NetworkRevoked

@@ -60,9 +60,9 @@ fn make_service(db: DatabaseConnection) -> EncryptionService {
     EncryptionService::new(db, NODE_DID.to_string(), backend)
 }
 
-fn principal_keypair() -> Keypair {
+fn owner_keypair() -> Keypair {
     NodeStaticSecret::new(vec![0x11; 32])
-        .expect("static principal secret")
+        .expect("static owner secret")
         .node_keypair()
 }
 
@@ -76,12 +76,12 @@ fn did_for(keypair: &Keypair) -> String {
     public_key_to_did_key(keypair.public())
 }
 
-fn principal_did() -> String {
-    did_for(&principal_keypair())
+fn owner_did() -> String {
+    did_for(&owner_keypair())
 }
 
 fn network_id() -> NetworkId {
-    NetworkId::new(principal_did(), NETWORK_NAME.to_string()).unwrap()
+    NetworkId::new(owner_did(), NETWORK_NAME.to_string()).unwrap()
 }
 
 struct ClientCtx {
@@ -130,7 +130,7 @@ fn build_invocation(
 ) -> DecryptInvocation {
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let mut inv = DecryptInvocation {
-        issuer: principal_did(),
+        issuer: owner_did(),
         audience: NODE_DID.to_string(),
         att: vec![InvocationCapability {
             with: net.to_string(),
@@ -158,7 +158,7 @@ fn build_invocation(
         sig: String::new(),
     };
     overrides(&mut inv);
-    sign_invocation(&mut inv, &principal_keypair());
+    sign_invocation(&mut inv, &owner_keypair());
     inv
 }
 
@@ -233,7 +233,7 @@ async fn create_one_of_one_network_initializes_active_state() {
     let descriptor = svc
         .create_one_of_one_network(CreateNetworkRequest {
             name: NETWORK_NAME.to_string(),
-            principal: principal_did(),
+            owner_did: owner_did(),
             threshold: Threshold::one_of_one(),
         })
         .await
@@ -268,7 +268,7 @@ async fn create_network_rejects_duplicate() {
     let svc = make_service(fresh_db().await);
     svc.create_one_of_one_network(CreateNetworkRequest {
         name: NETWORK_NAME.to_string(),
-        principal: principal_did(),
+        owner_did: owner_did(),
         threshold: Threshold::one_of_one(),
     })
     .await
@@ -276,7 +276,7 @@ async fn create_network_rejects_duplicate() {
     let err = svc
         .create_one_of_one_network(CreateNetworkRequest {
             name: NETWORK_NAME.to_string(),
-            principal: principal_did(),
+            owner_did: owner_did(),
             threshold: Threshold::one_of_one(),
         })
         .await
@@ -291,7 +291,7 @@ async fn get_network_returns_descriptor() {
     let net = network_id();
     svc.create_one_of_one_network(CreateNetworkRequest {
         name: NETWORK_NAME.to_string(),
-        principal: principal_did(),
+        owner_did: owner_did(),
         threshold: Threshold::one_of_one(),
     })
     .await
@@ -299,7 +299,7 @@ async fn get_network_returns_descriptor() {
 
     let fetched = svc.get_network(&net).await.unwrap();
     assert_eq!(fetched.network_id, net);
-    assert_eq!(fetched.principal, principal_did());
+    assert_eq!(fetched.owner_did, owner_did());
     assert_eq!(fetched.state, NetworkState::Active);
 }
 
@@ -311,19 +311,19 @@ async fn get_network_by_name_returns_discovery_view() {
     let descriptor = svc
         .create_one_of_one_network(CreateNetworkRequest {
             name: NETWORK_NAME.to_string(),
-            principal: principal_did(),
+            owner_did: owner_did(),
             threshold: Threshold::one_of_one(),
         })
         .await
         .unwrap();
 
-    let by_principal = svc
-        .get_network_by_name(NETWORK_NAME, Some(&principal_did()))
+    let by_owner = svc
+        .get_network_by_name(NETWORK_NAME, Some(&owner_did()))
         .await
         .unwrap();
     let by_name = svc.get_network_by_name(NETWORK_NAME, None).await.unwrap();
 
-    assert_eq!(by_principal.network_id, net);
+    assert_eq!(by_owner.network_id, net);
     assert_eq!(by_name.network_id, net);
 
     let well_known = WellKnownRecord::from(&descriptor);
@@ -343,7 +343,7 @@ async fn network_admin_authorized_accepts_session_invoker() {
     let net = network_id();
     let body_value = serde_json::json!({
         "name": NETWORK_NAME,
-        "principal": principal_did(),
+        "ownerDid": owner_did(),
         "threshold": { "n": 1, "t": 1 }
     });
     let facts = serde_json::to_value(NetworkAdminFacts {
@@ -360,7 +360,7 @@ async fn network_admin_authorized_accepts_session_invoker() {
     svc.verify_network_admin_authorized(&net, NETWORK_CREATE_ACTION, &invocation, &body_value)
         .await
         .unwrap();
-    assert_ne!(invocation.invoker, principal_did());
+    assert_ne!(invocation.invoker, owner_did());
 }
 
 #[tokio::test]
@@ -370,7 +370,7 @@ async fn decrypt_round_trip_returns_rewrapped_key() {
     let descriptor = svc
         .create_one_of_one_network(CreateNetworkRequest {
             name: NETWORK_NAME.to_string(),
-            principal: principal_did(),
+            owner_did: owner_did(),
             threshold: Threshold::one_of_one(),
         })
         .await
@@ -398,7 +398,7 @@ async fn decrypt_authorized_accepts_session_invoker() {
     let descriptor = svc
         .create_one_of_one_network(CreateNetworkRequest {
             name: NETWORK_NAME.to_string(),
-            principal: principal_did(),
+            owner_did: owner_did(),
             threshold: Threshold::one_of_one(),
         })
         .await
@@ -431,7 +431,7 @@ async fn decrypt_authorized_accepts_session_invoker() {
         .expect("base64 wrapped key");
     let recovered = unwrap_with_secret(&ctx.receiver_secret, &rewrapped);
     assert_eq!(recovered, ctx.symmetric);
-    assert_ne!(invocation.invoker, principal_did());
+    assert_ne!(invocation.invoker, owner_did());
 }
 
 #[tokio::test]
@@ -441,7 +441,7 @@ async fn decrypt_authorized_rejects_audience_mismatch() {
     let descriptor = svc
         .create_one_of_one_network(CreateNetworkRequest {
             name: NETWORK_NAME.to_string(),
-            principal: principal_did(),
+            owner_did: owner_did(),
             threshold: Threshold::one_of_one(),
         })
         .await
@@ -484,7 +484,7 @@ async fn decrypt_rejects_audience_mismatch() {
     let descriptor = svc
         .create_one_of_one_network(CreateNetworkRequest {
             name: NETWORK_NAME.to_string(),
-            principal: principal_did(),
+            owner_did: owner_did(),
             threshold: Threshold::one_of_one(),
         })
         .await
@@ -505,7 +505,7 @@ async fn decrypt_rejects_target_node_mismatch_in_body() {
     let descriptor = svc
         .create_one_of_one_network(CreateNetworkRequest {
             name: NETWORK_NAME.to_string(),
-            principal: principal_did(),
+            owner_did: owner_did(),
             threshold: Threshold::one_of_one(),
         })
         .await
@@ -526,7 +526,7 @@ async fn decrypt_rejects_target_node_mismatch_in_invocation() {
     let descriptor = svc
         .create_one_of_one_network(CreateNetworkRequest {
             name: NETWORK_NAME.to_string(),
-            principal: principal_did(),
+            owner_did: owner_did(),
             threshold: Threshold::one_of_one(),
         })
         .await
@@ -546,7 +546,7 @@ async fn decrypt_rejects_body_hash_mismatch() {
     let descriptor = svc
         .create_one_of_one_network(CreateNetworkRequest {
             name: NETWORK_NAME.to_string(),
-            principal: principal_did(),
+            owner_did: owner_did(),
             threshold: Threshold::one_of_one(),
         })
         .await
@@ -570,7 +570,7 @@ async fn decrypt_rejects_receiver_public_key_substitution() {
     let descriptor = svc
         .create_one_of_one_network(CreateNetworkRequest {
             name: NETWORK_NAME.to_string(),
-            principal: principal_did(),
+            owner_did: owner_did(),
             threshold: Threshold::one_of_one(),
         })
         .await
@@ -597,7 +597,7 @@ async fn decrypt_rejects_encrypted_key_substitution() {
     let descriptor = svc
         .create_one_of_one_network(CreateNetworkRequest {
             name: NETWORK_NAME.to_string(),
-            principal: principal_did(),
+            owner_did: owner_did(),
             threshold: Threshold::one_of_one(),
         })
         .await
@@ -623,12 +623,12 @@ async fn decrypt_rejects_wrong_network() {
     let descriptor = svc
         .create_one_of_one_network(CreateNetworkRequest {
             name: NETWORK_NAME.to_string(),
-            principal: principal_did(),
+            owner_did: owner_did(),
             threshold: Threshold::one_of_one(),
         })
         .await
         .unwrap();
-    let other_net = NetworkId::new(principal_did(), "wrong".to_string()).unwrap();
+    let other_net = NetworkId::new(owner_did(), "wrong".to_string()).unwrap();
     let ctx = make_client_request(&descriptor.public_encryption_key);
     let (_, body_value) = build_body(&ctx, &net);
     let inv = build_invocation(&net, &body_value, &ctx, |_| {});
@@ -646,14 +646,14 @@ async fn decrypt_rejects_invocation_network_mismatch() {
     let descriptor = svc
         .create_one_of_one_network(CreateNetworkRequest {
             name: NETWORK_NAME.to_string(),
-            principal: principal_did(),
+            owner_did: owner_did(),
             threshold: Threshold::one_of_one(),
         })
         .await
         .unwrap();
     let ctx = make_client_request(&descriptor.public_encryption_key);
     let (_, body_value) = build_body(&ctx, &net);
-    let other_net = NetworkId::new(principal_did(), "wrong".to_string()).unwrap();
+    let other_net = NetworkId::new(owner_did(), "wrong".to_string()).unwrap();
     let mut inv = build_invocation(&net, &body_value, &ctx, |_| {});
     inv.facts.network_id = other_net;
     let err = svc.decrypt(&net, &inv, &body_value).await.unwrap_err();
@@ -661,13 +661,13 @@ async fn decrypt_rejects_invocation_network_mismatch() {
 }
 
 #[tokio::test]
-async fn decrypt_rejects_wrong_principal() {
+async fn decrypt_rejects_wrong_owner() {
     let svc = make_service(fresh_db().await);
     let net = network_id();
     let descriptor = svc
         .create_one_of_one_network(CreateNetworkRequest {
             name: NETWORK_NAME.to_string(),
-            principal: principal_did(),
+            owner_did: owner_did(),
             threshold: Threshold::one_of_one(),
         })
         .await
@@ -681,7 +681,7 @@ async fn decrypt_rejects_wrong_principal() {
     });
     sign_invocation(&mut inv, &attacker);
     let err = svc.decrypt(&net, &inv, &body_value).await.unwrap_err();
-    assert!(matches!(err, EncryptionServiceError::PrincipalMismatch));
+    assert!(matches!(err, EncryptionServiceError::OwnerMismatch));
 }
 
 #[tokio::test]
@@ -691,7 +691,7 @@ async fn decrypt_rejects_signature_mismatch() {
     let descriptor = svc
         .create_one_of_one_network(CreateNetworkRequest {
             name: NETWORK_NAME.to_string(),
-            principal: principal_did(),
+            owner_did: owner_did(),
             threshold: Threshold::one_of_one(),
         })
         .await
@@ -711,7 +711,7 @@ async fn decrypt_rejects_replay() {
     let descriptor = svc
         .create_one_of_one_network(CreateNetworkRequest {
             name: NETWORK_NAME.to_string(),
-            principal: principal_did(),
+            owner_did: owner_did(),
             threshold: Threshold::one_of_one(),
         })
         .await
@@ -731,7 +731,7 @@ async fn decrypt_rejects_expired_invocation() {
     let descriptor = svc
         .create_one_of_one_network(CreateNetworkRequest {
             name: NETWORK_NAME.to_string(),
-            principal: principal_did(),
+            owner_did: owner_did(),
             threshold: Threshold::one_of_one(),
         })
         .await
@@ -752,7 +752,7 @@ async fn decrypt_rejects_wrong_capability_action() {
     let descriptor = svc
         .create_one_of_one_network(CreateNetworkRequest {
             name: NETWORK_NAME.to_string(),
-            principal: principal_did(),
+            owner_did: owner_did(),
             threshold: Threshold::one_of_one(),
         })
         .await
@@ -773,7 +773,7 @@ async fn revoked_network_refuses_decrypt() {
     let descriptor = svc
         .create_one_of_one_network(CreateNetworkRequest {
             name: NETWORK_NAME.to_string(),
-            principal: principal_did(),
+            owner_did: owner_did(),
             threshold: Threshold::one_of_one(),
         })
         .await
@@ -801,7 +801,7 @@ async fn unique_request_hashes_per_decrypt() {
     let descriptor = svc
         .create_one_of_one_network(CreateNetworkRequest {
             name: NETWORK_NAME.to_string(),
-            principal: principal_did(),
+            owner_did: owner_did(),
             threshold: Threshold::one_of_one(),
         })
         .await

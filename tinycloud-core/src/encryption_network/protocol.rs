@@ -77,7 +77,7 @@ pub struct DecryptResponseBody {
 ///
 /// `issuer` is the requester session DID. `audience` MUST equal the serving
 /// node's DID. `proof_cid` references the delegation chain that authorizes the
-/// decrypt action; verification rooted in the principal embedded in
+/// decrypt action; verification rooted in the owner DID embedded in
 /// `network_id` is performed by [`crate::encryption_network::service`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecryptInvocation {
@@ -207,7 +207,7 @@ mod tests {
     use serde_json::json;
 
     fn sample_invocation() -> DecryptInvocation {
-        let net: NetworkId = "urn:tinycloud:encryption:did:key:z6MkPrincipal:default"
+        let net: NetworkId = "urn:tinycloud:encryption:did:key:z6MkOwner:default"
             .parse()
             .unwrap();
         DecryptInvocation {

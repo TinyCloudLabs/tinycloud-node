@@ -58,8 +58,8 @@ pub enum EncryptionServiceError {
     AudienceMismatch,
     #[error("invocation target node does not match this node")]
     TargetNodeMismatch,
-    #[error("invocation root principal does not match network principal")]
-    PrincipalMismatch,
+    #[error("invocation root owner DID does not match network owner DID")]
+    OwnerMismatch,
     #[error("invocation references a different network")]
     NetworkMismatch,
     #[error("invocation expired")]
@@ -97,7 +97,7 @@ pub struct EncryptionService {
 #[derive(Debug, Clone)]
 pub struct CreateNetworkRequest {
     pub name: String,
-    pub principal: String,
+    pub owner_did: String,
     pub threshold: Threshold,
 }
 
@@ -147,7 +147,7 @@ impl EncryptionService {
         &self,
         req: CreateNetworkRequest,
     ) -> Result<NetworkDescriptor, EncryptionServiceError> {
-        let network_id = NetworkId::new(req.principal.clone(), req.name.clone())
+        let network_id = NetworkId::new(req.owner_did.clone(), req.name.clone())
             .map_err(|e| EncryptionServiceError::InvalidBody(format!("invalid network id: {e}")))?;
 
         // Reject duplicates up-front so callers see a clear error instead of a
@@ -181,7 +181,7 @@ impl EncryptionService {
 
         let model = encryption_network::ActiveModel {
             network_id: Set(network_id.to_string()),
-            principal: Set(req.principal.clone()),
+            owner_did: Set(req.owner_did.clone()),
             name: Set(req.name.clone()),
             alg: Set(generated.alg.clone()),
             key_version: Set(1),
@@ -219,7 +219,7 @@ impl EncryptionService {
 
         Ok(NetworkDescriptor {
             network_id,
-            principal: req.principal,
+            owner_did: req.owner_did,
             name: req.name,
             members: vec![NetworkMemberDescriptor {
                 node_id: self.node_did.clone(),
@@ -264,7 +264,7 @@ impl EncryptionService {
 
         Ok(NetworkDescriptor {
             network_id: network_id.clone(),
-            principal: model.principal,
+            owner_did: model.owner_did,
             name: model.name,
             members,
             threshold: Threshold {
@@ -284,11 +284,11 @@ impl EncryptionService {
     pub async fn get_network_by_name(
         &self,
         name: &str,
-        principal: Option<&str>,
+        owner_did: Option<&str>,
     ) -> Result<NetworkDescriptor, EncryptionServiceError> {
-        if let Some(principal) = principal {
+        if let Some(owner_did) = owner_did {
             let network_id =
-                NetworkId::new(principal.to_string(), name.to_string()).map_err(|e| {
+                NetworkId::new(owner_did.to_string(), name.to_string()).map_err(|e| {
                     EncryptionServiceError::InvalidBody(format!("invalid network id: {e}"))
                 })?;
             return self.get_network(&network_id).await;
@@ -352,8 +352,8 @@ impl EncryptionService {
         if cap.with != network_id.to_string() {
             return Err(EncryptionServiceError::NetworkMismatch);
         }
-        if invocation.issuer != network_id.principal() {
-            return Err(EncryptionServiceError::PrincipalMismatch);
+        if invocation.issuer != network_id.owner_did() {
+            return Err(EncryptionServiceError::OwnerMismatch);
         }
         let expected_body_hash = canonical_hash(body_value);
         if expected_body_hash != invocation.facts.body_hash {
@@ -460,8 +460,8 @@ impl EncryptionService {
         if cap.with != network_id.to_string() {
             return Err(EncryptionServiceError::NetworkMismatch);
         }
-        if invocation.issuer != network_id.principal() {
-            return Err(EncryptionServiceError::PrincipalMismatch);
+        if invocation.issuer != network_id.owner_did() {
+            return Err(EncryptionServiceError::OwnerMismatch);
         }
 
         // ---- Network state ----
@@ -964,7 +964,7 @@ fn native_invocation_cid(invocation: &InvocationInfo) -> Result<String, Encrypti
 #[serde(rename_all = "camelCase")]
 pub struct WellKnownRecord {
     pub network_id: String,
-    pub principal: String,
+    pub owner_did: String,
     pub name: String,
     pub alg: String,
     pub key_version: i64,
@@ -978,7 +978,7 @@ impl From<&NetworkDescriptor> for WellKnownRecord {
     fn from(d: &NetworkDescriptor) -> Self {
         Self {
             network_id: d.network_id.to_string(),
-            principal: d.principal.clone(),
+            owner_did: d.owner_did.clone(),
             name: d.name.clone(),
             alg: d.alg.clone(),
             key_version: d.key_version,

@@ -274,7 +274,7 @@ fn is_root_authority(cap: &util::Capability, delegator: &str) -> bool {
         Resource::Other(uri) => uri
             .as_str()
             .parse::<NetworkId>()
-            .map(|network_id| network_id.principal() == delegator)
+            .map(|network_id| network_id.owner_did() == delegator)
             .unwrap_or(false),
         Resource::TinyCloud(_) => false,
     }
