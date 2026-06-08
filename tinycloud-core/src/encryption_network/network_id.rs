@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 use thiserror::Error;
+use tinycloud_auth::identity::canonicalize_principal;
 
 const NETWORK_ID_PREFIX: &str = "urn:tinycloud:encryption:";
 
@@ -22,6 +23,8 @@ pub enum NetworkIdError {
     MissingSeparator,
     #[error("network name may not contain ':' or '/'")]
     InvalidName,
+    #[error("invalid owner principal: {0}")]
+    InvalidPrincipal(String),
 }
 
 /// Owned, validated network id. Round-trips through [`Display`] and [`FromStr`].
@@ -48,6 +51,8 @@ impl NetworkId {
         if name.contains(':') || name.contains('/') {
             return Err(NetworkIdError::InvalidName);
         }
+        let owner_did = canonicalize_principal(&owner_did)
+            .map_err(|err| NetworkIdError::InvalidPrincipal(err.to_string()))?;
         Ok(Self { owner_did, name })
     }
 
@@ -144,6 +149,22 @@ mod tests {
         assert_eq!(err, NetworkIdError::InvalidName);
         let err = NetworkId::new("did:key:abc", "bad:name").unwrap_err();
         assert_eq!(err, NetworkIdError::InvalidName);
+    }
+
+    #[test]
+    fn canonicalizes_pkh_principal() {
+        let id: NetworkId =
+            "urn:tinycloud:encryption:did:pkh:eip155:1:0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266:default"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            id.owner_did(),
+            "did:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+        );
+        assert_eq!(
+            id.to_string(),
+            "urn:tinycloud:encryption:did:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:default"
+        );
     }
 
     #[test]
