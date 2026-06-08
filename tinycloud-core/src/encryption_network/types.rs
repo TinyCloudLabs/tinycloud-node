@@ -97,7 +97,8 @@ pub struct NetworkMemberDescriptor {
 pub struct NetworkDescriptor {
     #[serde(rename = "networkId")]
     pub network_id: NetworkId,
-    pub principal: String,
+    #[serde(rename = "ownerDid")]
+    pub owner_did: String,
     pub name: String,
     pub members: Vec<NetworkMemberDescriptor>,
     pub threshold: Threshold,

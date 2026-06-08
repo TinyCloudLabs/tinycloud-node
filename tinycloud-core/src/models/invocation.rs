@@ -196,7 +196,7 @@ fn is_root_authority(cap: &util::Capability, invoker: &str) -> bool {
         Resource::Other(uri) => uri
             .as_str()
             .parse::<NetworkId>()
-            .map(|network_id| network_id.principal() == invoker)
+            .map(|network_id| network_id.owner_did() == invoker)
             .unwrap_or(false),
         Resource::TinyCloud(_) => false,
     }

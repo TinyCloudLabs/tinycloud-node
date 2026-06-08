@@ -5,7 +5,8 @@ use sea_orm::entity::prelude::*;
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, unique)]
     pub network_id: String,
-    pub principal: String,
+    #[sea_orm(column_name = "principal")]
+    pub owner_did: String,
     pub name: String,
     pub alg: String,
     pub key_version: i64,
