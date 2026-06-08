@@ -24,6 +24,7 @@ use std::collections::{HashMap, HashSet};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_auth::{
     authorization::{EncodingError, TinyCloudDelegation},
+    identity::{canonicalize_did, did_principal_matches},
     resource::{Path, SpaceId},
 };
 
@@ -1282,14 +1283,16 @@ async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
 ///
 /// Returns the original DID if it's already a PKH DID or if no delegation chain is found.
 async fn resolve_pkh_did<C: ConnectionTrait>(db: &C, did: &str) -> Result<String, DbErr> {
+    let canonical_did = canonicalize_did(did).unwrap_or_else(|_| did.to_string());
+
     // If already a PKH DID, return it directly
-    if did.starts_with("did:pkh:") {
-        return Ok(did.to_string());
+    if canonical_did.starts_with("did:pkh:") {
+        return Ok(canonical_did);
     }
 
     // Look for a delegation where this DID is the delegatee
     // The delegator would be the next step up in the chain
-    let mut current_did = did.to_string();
+    let mut current_did = canonical_did.clone();
     let mut visited = std::collections::HashSet::new();
 
     loop {
@@ -1308,10 +1311,10 @@ async fn resolve_pkh_did<C: ConnectionTrait>(db: &C, did: &str) -> Result<String
             Some(del) => {
                 // Found a parent - check if it's a PKH DID
                 if del.delegator.starts_with("did:pkh:") {
-                    return Ok(del.delegator);
+                    return Ok(canonicalize_did(&del.delegator).unwrap_or(del.delegator));
                 }
                 // Continue up the chain
-                current_did = del.delegator;
+                current_did = canonicalize_did(&del.delegator).unwrap_or(del.delegator);
             }
             None => {
                 // No parent found - return what we have
@@ -1321,7 +1324,7 @@ async fn resolve_pkh_did<C: ConnectionTrait>(db: &C, did: &str) -> Result<String
     }
 
     // Return the original DID if we couldn't resolve to a PKH
-    Ok(did.to_string())
+    Ok(canonical_did)
 }
 
 /// Get delegations with optional filters applied.
@@ -1373,8 +1376,12 @@ async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secret
 
             // Direction filter (using resolved PKH DID, not session key DID)
             match direction {
-                Some("created") if del.delegator != pkh_did => return None,
-                Some("received") if del.delegatee != pkh_did => return None,
+                Some("created") if !did_principal_matches(&del.delegator, &pkh_did) => {
+                    return None;
+                }
+                Some("received") if !did_principal_matches(&del.delegatee, &pkh_did) => {
+                    return None;
+                }
                 _ => {}
             }
 

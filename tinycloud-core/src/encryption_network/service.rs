@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use tinycloud_auth::identity::did_principal_matches;
 
 use crate::hash::hash;
 use crate::keys::{public_key_to_did_key, Keypair, PublicKey};
@@ -39,6 +40,13 @@ use super::types::{
 };
 
 const DEFAULT_INVOCATION_TTL_SECONDS: i64 = 300;
+
+fn network_id_matches(actual: &str, expected: &NetworkId) -> bool {
+    actual
+        .parse::<NetworkId>()
+        .map(|actual| &actual == expected)
+        .unwrap_or_else(|_| actual == expected.to_string())
+}
 
 #[derive(Debug, Error)]
 pub enum EncryptionServiceError {
@@ -181,7 +189,7 @@ impl EncryptionService {
 
         let model = encryption_network::ActiveModel {
             network_id: Set(network_id.to_string()),
-            owner_did: Set(req.owner_did.clone()),
+            owner_did: Set(network_id.owner_did().to_string()),
             name: Set(req.name.clone()),
             alg: Set(generated.alg.clone()),
             key_version: Set(1),
@@ -218,8 +226,8 @@ impl EncryptionService {
         ceremony_active.update(&self.db).await?;
 
         Ok(NetworkDescriptor {
-            network_id,
-            owner_did: req.owner_did,
+            network_id: network_id.clone(),
+            owner_did: network_id.owner_did().to_string(),
             name: req.name,
             members: vec![NetworkMemberDescriptor {
                 node_id: self.node_did.clone(),
@@ -349,10 +357,10 @@ impl EncryptionService {
             .iter()
             .find(|c| c.can == action)
             .ok_or(EncryptionServiceError::Unauthorized)?;
-        if cap.with != network_id.to_string() {
+        if !network_id_matches(&cap.with, network_id) {
             return Err(EncryptionServiceError::NetworkMismatch);
         }
-        if invocation.issuer != network_id.owner_did() {
+        if !did_principal_matches(&invocation.issuer, network_id.owner_did()) {
             return Err(EncryptionServiceError::OwnerMismatch);
         }
         let expected_body_hash = canonical_hash(body_value);
@@ -399,7 +407,7 @@ impl EncryptionService {
             .iter()
             .find(|c| c.ability.to_string() == action)
             .ok_or(EncryptionServiceError::Unauthorized)?;
-        if cap.resource.to_string() != network_id.to_string() {
+        if !network_id_matches(&cap.resource.to_string(), network_id) {
             return Err(EncryptionServiceError::NetworkMismatch);
         }
         let expected_body_hash = canonical_hash(body_value);
@@ -457,10 +465,10 @@ impl EncryptionService {
             .iter()
             .find(|c| c.can == DECRYPT_ACTION)
             .ok_or(EncryptionServiceError::Unauthorized)?;
-        if cap.with != network_id.to_string() {
+        if !network_id_matches(&cap.with, network_id) {
             return Err(EncryptionServiceError::NetworkMismatch);
         }
-        if invocation.issuer != network_id.owner_did() {
+        if !did_principal_matches(&invocation.issuer, network_id.owner_did()) {
             return Err(EncryptionServiceError::OwnerMismatch);
         }
 
@@ -625,7 +633,7 @@ impl EncryptionService {
             .iter()
             .find(|c| c.ability.to_string() == DECRYPT_ACTION)
             .ok_or(EncryptionServiceError::Unauthorized)?;
-        if cap.resource.to_string() != network_id.to_string() {
+        if !network_id_matches(&cap.resource.to_string(), network_id) {
             return Err(EncryptionServiceError::NetworkMismatch);
         }
 

@@ -5,7 +5,9 @@ use crate::types::{Ability, Facts, Resource};
 use crate::{events::Delegation, models::*, relationships::*, util};
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, ConnectionTrait};
 use time::OffsetDateTime;
-use tinycloud_auth::{authorization::TinyCloudDelegation, ssi::dids::AnyDidMethod};
+use tinycloud_auth::{
+    authorization::TinyCloudDelegation, identity::did_principal_matches, ssi::dids::AnyDidMethod,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "delegation")]
@@ -264,7 +266,7 @@ fn is_root_authority(cap: &util::Capability, delegator: &str) -> bool {
     if cap
         .resource
         .space()
-        .map(|o| o.did().as_str() == delegator)
+        .map(|o| did_principal_matches(o.did().as_str(), delegator))
         .unwrap_or(false)
     {
         return true;
@@ -274,7 +276,7 @@ fn is_root_authority(cap: &util::Capability, delegator: &str) -> bool {
         Resource::Other(uri) => uri
             .as_str()
             .parse::<NetworkId>()
-            .map(|network_id| network_id.owner_did() == delegator)
+            .map(|network_id| did_principal_matches(network_id.owner_did(), delegator))
             .unwrap_or(false),
         Resource::TinyCloud(_) => false,
     }

@@ -6,6 +6,7 @@ use serde::Serialize;
 use serde_with::{DeserializeFromStr, SerializeDisplay};
 use ssi::dids::{DIDBuf, DID};
 
+use crate::identity::canonicalize_did;
 use std::{convert::TryFrom, fmt, str::FromStr};
 use thiserror::Error;
 
@@ -294,6 +295,12 @@ pub enum KRIParseError {
     UriStringParse(#[from] iri_string::validate::Error),
     #[error("Invalid DID string: {0}")]
     DidParse(#[from] ssi::dids::InvalidDID<String>),
+    #[error(transparent)]
+    Identity(#[from] crate::identity::IdentityError),
+}
+
+fn did_from_suffix(suffix: &str) -> Result<DIDBuf, KRIParseError> {
+    Ok(canonicalize_did(&format!("did:{suffix}"))?.try_into()?)
 }
 
 impl TryFrom<&UriStr> for SpaceId {
@@ -315,10 +322,7 @@ impl TryFrom<&UriStr> for SpaceId {
                 Some((suf, name))
             }
         }) {
-            Ok(Self::new(
-                ["did:", suf].concat().try_into()?,
-                Name(name.to_string()),
-            ))
+            Ok(Self::new(did_from_suffix(suf)?, Name(name.to_string())))
         } else {
             Err(KRIParseError::IncorrectForm)
         }
@@ -357,13 +361,12 @@ impl TryFrom<&UriStr> for ResourceId {
             })
         {
             Ok(
-                SpaceId::new(["did:", suf].concat().try_into()?, Name(name.to_string()))
-                    .to_resource(
-                        Service(service.to_string()),
-                        path.map(|p| Path(p.to_string())),
-                        uri.query().map(|q| q.into()),
-                        uri.fragment().map(|q| q.into()),
-                    ),
+                SpaceId::new(did_from_suffix(suf)?, Name(name.to_string())).to_resource(
+                    Service(service.to_string()),
+                    path.map(|p| Path(p.to_string())),
+                    uri.query().map(|q| q.into()),
+                    uri.fragment().map(|q| q.into()),
+                ),
             )
         } else {
             Err(KRIParseError::IncorrectForm)
@@ -444,6 +447,28 @@ mod tests {
         let _: SpaceId = "tinycloud:pkh:eth:0xb1fef8ed913821b941a76de9fc7c41b90de3d37f:default"
             .parse()
             .unwrap();
+    }
+
+    #[test]
+    fn canonicalizes_pkh_eip155_addresses() {
+        let space: SpaceId =
+            "tinycloud:pkh:eip155:1:0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266:default"
+                .parse()
+                .unwrap();
+
+        assert_eq!(
+            space.to_string(),
+            "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:default"
+        );
+
+        let resource: ResourceId =
+            "tinycloud:pkh:eip155:1:0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266:default/kv/path"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            resource.to_string(),
+            "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:default/kv/path"
+        );
     }
 
     #[test]

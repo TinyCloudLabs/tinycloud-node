@@ -2,7 +2,7 @@ use super::super::{events::Revocation, models::*, relationships::*};
 use crate::hash::{hash, Hash};
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, ConnectionTrait};
 use time::OffsetDateTime;
-use tinycloud_auth::authorization::TinyCloudRevocation;
+use tinycloud_auth::{authorization::TinyCloudRevocation, identity::did_principal_matches};
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "revocation")]
@@ -91,7 +91,7 @@ pub(crate) async fn process<C: ConnectionTrait>(
         .ok_or(RevocationError::MissingParents)?;
 
     // check the revoker is also the delegator
-    if delegation.delegator != r.revoker {
+    if !did_principal_matches(&delegation.delegator, &r.revoker) {
         return Err(RevocationError::UnauthorizedRevoker(r.revoker).into());
     };
 

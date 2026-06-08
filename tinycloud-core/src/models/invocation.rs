@@ -15,7 +15,10 @@ use sea_orm::{
 use serde::Serialize;
 use std::collections::HashMap;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tinycloud_auth::{authorization::TinyCloudInvocation, resource::Path, ssi::dids::AnyDidMethod};
+use tinycloud_auth::{
+    authorization::TinyCloudInvocation, identity::did_principal_matches, resource::Path,
+    ssi::dids::AnyDidMethod,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "invocation")]
@@ -144,9 +147,7 @@ async fn validate<C: ConnectionTrait>(
 
             // check parent identifies correct invoker
             for (p, _) in &parents {
-                if p.delegatee != invocation.invoker
-                    && !invocation.invoker.starts_with(&p.delegatee)
-                {
+                if !did_principal_matches(&p.delegatee, &invocation.invoker) {
                     return Err(
                         InvocationError::UnauthorizedInvoker(invocation.invoker.clone()).into(),
                     );
@@ -186,7 +187,7 @@ fn is_root_authority(cap: &util::Capability, invoker: &str) -> bool {
     if cap
         .resource
         .space()
-        .map(|o| o.did().as_str() == invoker)
+        .map(|o| did_principal_matches(o.did().as_str(), invoker))
         .unwrap_or(false)
     {
         return true;
@@ -196,7 +197,7 @@ fn is_root_authority(cap: &util::Capability, invoker: &str) -> bool {
         Resource::Other(uri) => uri
             .as_str()
             .parse::<NetworkId>()
-            .map(|network_id| network_id.owner_did() == invoker)
+            .map(|network_id| did_principal_matches(network_id.owner_did(), invoker))
             .unwrap_or(false),
         Resource::TinyCloud(_) => false,
     }

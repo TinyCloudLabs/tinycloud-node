@@ -1,6 +1,7 @@
 use crate::types::{Ability, Resource};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+use tinycloud_auth::identity::principal_did;
 use tinycloud_auth::{
     authorization::{TinyCloudDelegation, TinyCloudInvocation, TinyCloudRevocation},
     cacaos::siwe::Message,
@@ -17,7 +18,7 @@ use ucan_capabilities_object::Capabilities as UcanCapabilities;
 /// comparison purposes, the base DID is sufficient. This normalizes all
 /// DID strings to ensure consistent matching across delegation chains.
 fn strip_fragment(did: &str) -> String {
-    did.split('#').next().unwrap_or(did).to_string()
+    principal_did(did).unwrap_or_else(|_| did.split('#').next().unwrap_or(did).to_string())
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]

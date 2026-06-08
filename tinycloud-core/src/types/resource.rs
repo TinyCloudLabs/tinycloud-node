@@ -10,6 +10,8 @@ use tinycloud_auth::resource::{
     KRIParseError, ResourceId, SpaceId,
 };
 
+const ENCRYPTION_NETWORK_PREFIX: &str = "urn:tinycloud:encryption:";
+
 #[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(untagged)]
 pub enum Resource {
@@ -35,6 +37,12 @@ impl Resource {
                 ) {
                     (Ok(a), Ok(b)) => a == b,
                     (Ok(_), Err(_)) | (Err(_), Ok(_)) => false,
+                    (Err(_), Err(_))
+                        if a.as_str().starts_with(ENCRYPTION_NETWORK_PREFIX)
+                            || b.as_str().starts_with(ENCRYPTION_NETWORK_PREFIX) =>
+                    {
+                        false
+                    }
                     (Err(_), Err(_)) => a.as_str().starts_with(b.as_str()),
                 }
             }
@@ -186,19 +194,27 @@ mod tests {
 
     #[test]
     fn encryption_network_resources_extend_only_exact_network_ids() {
-        let default: Resource = "urn:tinycloud:encryption:did:pkh:eip155:1:0xabc:default"
+        let default: Resource =
+            "urn:tinycloud:encryption:did:pkh:eip155:1:0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266:default"
             .parse()
             .unwrap();
-        let default_again: Resource = "urn:tinycloud:encryption:did:pkh:eip155:1:0xabc:default"
+        let default_again: Resource =
+            "urn:tinycloud:encryption:did:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:default"
             .parse()
             .unwrap();
-        let default_evil: Resource = "urn:tinycloud:encryption:did:pkh:eip155:1:0xabc:default-evil"
+        let default_evil: Resource =
+            "urn:tinycloud:encryption:did:pkh:eip155:1:0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266:default-evil"
+                .parse()
+                .unwrap();
+        let malformed_network: Resource = "urn:tinycloud:encryption:did:pkh:eip155:1:0xabc:default"
             .parse()
             .unwrap();
 
         assert!(default.extends(&default_again));
         assert!(!default_evil.extends(&default));
         assert!(!default.extends(&default_evil));
+        assert!(!malformed_network.extends(&default));
+        assert!(!default.extends(&malformed_network));
     }
 
     #[test]
