@@ -1,8 +1,11 @@
 use anyhow::Result;
+use futures::io::AsyncWriteExt;
+use percent_encoding::percent_decode_str;
 use rocket::{data::ToByteUnit, http::Status, serde::json::Json, State};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use tinycloud_auth::resource::{Path, SpaceId};
 use tokio::io::AsyncReadExt;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{info_span, Instrument};
@@ -32,9 +35,9 @@ use tinycloud_core::{
     sea_orm::DbErr,
     sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder},
     sql::{SqlCaveats, SqlError, SqlRequest, SqlService},
-    storage::{ImmutableReadStore, ImmutableStaging},
-    types::Resource,
-    util::{DelegationInfo, InvocationInfo},
+    storage::{HashBuffer, ImmutableReadStore, ImmutableStaging},
+    types::{Metadata, Resource},
+    util::{Capability, DelegationInfo, InvocationInfo},
     write_hooks::{db_table_path, hook_delivery_id, subscription_matches_event, TouchedTables},
     InvocationOutcome, TransactResult, TxError, TxStoreError,
 };
@@ -314,6 +317,298 @@ type DuckDbInvokeState<'a> = &'a State<DuckDbService>;
 #[cfg(not(feature = "duckdb"))]
 type DuckDbInvokeState<'a> = ();
 
+type KvInputMap = HashMap<
+    (SpaceId, Path),
+    (
+        Metadata,
+        HashBuffer<<BlockStage as ImmutableStaging>::Writable>,
+    ),
+>;
+type ExpectedKvBatchInputs = BTreeMap<String, (SpaceId, Path)>;
+
+fn metadata_header<'a>(metadata: &'a Metadata, name: &str) -> Option<&'a str> {
+    metadata
+        .0
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn is_multipart(headers: &ObjectHeaders) -> bool {
+    metadata_header(&headers.0, "content-type")
+        .map(|value| {
+            value
+                .to_ascii_lowercase()
+                .starts_with("multipart/form-data")
+        })
+        .unwrap_or(false)
+}
+
+fn kv_put_capabilities(invocation: &InvocationInfo) -> Vec<(SpaceId, Path)> {
+    invocation
+        .capabilities
+        .iter()
+        .filter_map(|c| match (&c.resource, c.ability.as_ref().as_ref()) {
+            (Resource::TinyCloud(r), "tinycloud.kv/put")
+                if r.service().as_str() == "kv" && r.path().is_some() =>
+            {
+                Some((r.space().clone(), r.path()?.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn is_tight_kv_put_capability(capability: &Capability) -> bool {
+    matches!(
+        (&capability.resource, capability.ability.as_ref().as_ref()),
+        (Resource::TinyCloud(resource), "tinycloud.kv/put")
+            if resource.service().as_str() == "kv" && resource.path().is_some()
+    )
+}
+
+fn validate_kv_batch_capabilities(
+    invocation: &InvocationInfo,
+    put_caps: &[(SpaceId, Path)],
+) -> Result<ExpectedKvBatchInputs, (Status, String)> {
+    validate_kv_batch_capability_set(&invocation.capabilities, put_caps)
+}
+
+fn validate_kv_batch_capability_set(
+    capabilities: &[Capability],
+    put_caps: &[(SpaceId, Path)],
+) -> Result<ExpectedKvBatchInputs, (Status, String)> {
+    if put_caps.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    if !capabilities.iter().all(is_tight_kv_put_capability) {
+        return Err((
+            Status::BadRequest,
+            "KV batch put only accepts tinycloud.kv/put capabilities with paths".to_string(),
+        ));
+    }
+
+    let (space, _) = put_caps.first().ok_or_else(|| {
+        (
+            Status::BadRequest,
+            "No KV put capabilities found".to_string(),
+        )
+    })?;
+    if put_caps.iter().any(|(candidate, _)| candidate != space) {
+        return Err((
+            Status::BadRequest,
+            "KV batch put must target one space".to_string(),
+        ));
+    }
+
+    let mut expected = BTreeMap::<String, (SpaceId, Path)>::new();
+    for (space, path) in put_caps {
+        if expected
+            .insert(path.to_string(), (space.clone(), path.clone()))
+            .is_some()
+        {
+            return Err((
+                Status::BadRequest,
+                format!("Duplicate KV batch put capability for path {path}"),
+            ));
+        }
+    }
+
+    Ok(expected)
+}
+
+fn decode_multipart_path_field_name(field_name: &str) -> Result<String, (Status, String)> {
+    percent_decode_str(field_name)
+        .decode_utf8()
+        .map(|decoded| decoded.into_owned())
+        .map_err(|e| {
+            (
+                Status::BadRequest,
+                format!("Multipart KV part name is not valid percent-encoded UTF-8: {e}"),
+            )
+        })
+}
+
+fn field_metadata(field: &multer::Field<'_>) -> Metadata {
+    let mut metadata = BTreeMap::new();
+    for (name, value) in field.headers().iter() {
+        let key = name.as_str();
+        if key.eq_ignore_ascii_case("content-disposition")
+            || key.eq_ignore_ascii_case("content-length")
+        {
+            continue;
+        }
+        if let Ok(value) = value.to_str() {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+    }
+    if let Some(content_type) = field.content_type() {
+        metadata
+            .entry("content-type".to_string())
+            .or_insert_with(|| content_type.to_string());
+    }
+    Metadata(metadata)
+}
+
+async fn staged_batch_remaining(
+    space: &SpaceId,
+    tinycloud: &State<TinyCloud>,
+    config: &State<Config>,
+    quota_cache: &State<QuotaCache>,
+) -> Result<Option<(u64, u64, u64)>, (Status, String)> {
+    let effective_limit = if is_public_space(space) {
+        Some(config.public_spaces.storage_limit)
+    } else {
+        quota_cache.get_limit(space).await
+    };
+
+    let Some(limit) = effective_limit else {
+        return Ok(None);
+    };
+
+    let limit_bytes = limit.as_u64();
+    let current_size = tinycloud
+        .store_size(space)
+        .await
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?
+        .ok_or_else(|| (Status::NotFound, "space not found".to_string()))?;
+    let remaining = match limit_bytes.checked_sub(current_size) {
+        None | Some(0) => {
+            return Err((
+                Status::new(402),
+                format!(
+                    "Storage quota exceeded. Used: {} bytes, Limit: {} bytes",
+                    current_size, limit_bytes
+                ),
+            ))
+        }
+        Some(remaining) => remaining,
+    };
+
+    Ok(Some((remaining, current_size, limit_bytes)))
+}
+
+async fn copy_multipart_field_to_stage(
+    mut field: multer::Field<'_>,
+    stage: &mut HashBuffer<<BlockStage as ImmutableStaging>::Writable>,
+    remaining: &mut Option<(u64, u64, u64)>,
+) -> Result<(), (Status, String)> {
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|e| (Status::BadRequest, e.to_string()))?
+    {
+        if let Some((remaining_bytes, current_size, limit_bytes)) = remaining.as_mut() {
+            let chunk_len = u64::try_from(chunk.len())
+                .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+            if chunk_len > *remaining_bytes {
+                return Err((
+                    Status::PayloadTooLarge,
+                    format!(
+                        "Write exceeds remaining storage. Used: {} bytes, Limit: {} bytes",
+                        current_size, limit_bytes
+                    ),
+                ));
+            }
+            *remaining_bytes -= chunk_len;
+        }
+
+        stage
+            .write_all(&chunk)
+            .await
+            .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+    }
+
+    Ok(())
+}
+
+async fn build_batch_kv_inputs(
+    data: rocket::Data<'_>,
+    headers: &ObjectHeaders,
+    expected: &ExpectedKvBatchInputs,
+    staging: &State<BlockStage>,
+    tinycloud: &State<TinyCloud>,
+    config: &State<Config>,
+    quota_cache: &State<QuotaCache>,
+) -> Result<KvInputMap, (Status, String)> {
+    if expected.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let content_type = metadata_header(&headers.0, "content-type").ok_or_else(|| {
+        (
+            Status::BadRequest,
+            "Missing multipart content-type".to_string(),
+        )
+    })?;
+    let boundary =
+        multer::parse_boundary(content_type).map_err(|e| (Status::BadRequest, e.to_string()))?;
+    let mut multipart = multer::Multipart::with_reader(data.open(1u8.gigabytes()), boundary);
+    let mut inputs = HashMap::new();
+    let (space, _) = expected
+        .values()
+        .next()
+        .expect("non-empty KV batch inputs have a target space");
+    let mut remaining = staged_batch_remaining(space, tinycloud, config, quota_cache).await?;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (Status::BadRequest, e.to_string()))?
+    {
+        let encoded_path = field
+            .name()
+            .ok_or_else(|| {
+                (
+                    Status::BadRequest,
+                    "Multipart KV part is missing a field name".to_string(),
+                )
+            })?
+            .to_string();
+        let path = decode_multipart_path_field_name(&encoded_path)?;
+        let Some((space, typed_path)) = expected.get(&path) else {
+            return Err((
+                Status::BadRequest,
+                format!("Multipart KV part {path} is not authorized by the invocation"),
+            ));
+        };
+        if inputs.contains_key(&(space.clone(), typed_path.clone())) {
+            return Err((
+                Status::BadRequest,
+                format!("Duplicate multipart KV part for path {path}"),
+            ));
+        }
+
+        let metadata = field_metadata(&field);
+        let mut stage = staging
+            .stage(space)
+            .await
+            .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+        copy_multipart_field_to_stage(field, &mut stage, &mut remaining).await?;
+        inputs.insert((space.clone(), typed_path.clone()), (metadata, stage));
+    }
+
+    if inputs.len() != expected.len() {
+        let missing = expected
+            .keys()
+            .filter(|path| {
+                !inputs
+                    .keys()
+                    .any(|(_, input_path)| input_path.as_str() == path.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err((
+            Status::BadRequest,
+            format!("Missing multipart KV parts for signed paths: {missing}"),
+        ));
+    }
+
+    Ok(inputs)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn invoke_impl(
     i: AuthHeaderGetter<InvocationInfo>,
@@ -430,20 +725,23 @@ async fn invoke_impl(
             ));
         }
 
-        let mut put_iter = i.0 .0.capabilities.iter().filter_map(|c| {
-            match (&c.resource, c.ability.as_ref().as_ref()) {
-                (Resource::TinyCloud(r), "tinycloud.kv/put")
-                    if r.service().as_str() == "kv" && r.path().is_some() =>
-                {
-                    Some((r.space(), r.path()))
-                }
-                _ => None,
-            }
+        let put_caps = kv_put_capabilities(&i.0 .0);
+        let is_multipart_request = is_multipart(&headers);
+        let expected_batch_inputs = if is_multipart_request && !put_caps.is_empty() {
+            Some(validate_kv_batch_capabilities(&i.0 .0, &put_caps)?)
+        } else {
+            None
+        };
+        let batch_written_paths = expected_batch_inputs.as_ref().map(|expected| {
+            expected
+                .values()
+                .map(|(_, path)| path.clone())
+                .collect::<Vec<_>>()
         });
 
-        let inputs = match (data, put_iter.next(), put_iter.next()) {
-            (DataIn::None | DataIn::One(_), None, _) => HashMap::new(),
-            (DataIn::One(d), Some((space, Some(path))), None) => {
+        let inputs = match (data, put_caps.as_slice(), is_multipart_request) {
+            (DataIn::None | DataIn::One(_), [], _) => HashMap::new(),
+            (DataIn::One(d), [(space, path)], false) => {
                 let mut stage = staging
                     .stage(space)
                     .await
@@ -506,11 +804,22 @@ async fn invoke_impl(
                 inputs.insert((space.clone(), path.clone()), (headers.0, stage));
                 inputs
             }
-            (DataIn::Many(_), Some(_), Some(_)) => {
-                return Err((
-                    Status::BadRequest,
-                    "Multipart not yet supported".to_string(),
-                ));
+            (DataIn::One(d), [_, ..], true) => {
+                build_batch_kv_inputs(
+                    d,
+                    &headers,
+                    expected_batch_inputs
+                        .as_ref()
+                        .expect("multipart KV batch inputs were validated"),
+                    staging,
+                    tinycloud,
+                    config,
+                    quota_cache,
+                )
+                .await?
+            }
+            (DataIn::One(_), [_, _, ..], false) => {
+                return Err((Status::BadRequest, "KV batch put requires multipart/form-data".to_string()));
             }
             _ => {
                 return Err((Status::BadRequest, "Invalid inputs".to_string()));
@@ -520,16 +829,33 @@ async fn invoke_impl(
         let res = match tinycloud.invoke::<BlockStage>(i.0, inputs).await {
             Ok((tx_result, mut outcomes)) => {
                 emit_kv_hook_events(hook_runtime, tinycloud, &invocation_info, &tx_result).await;
-                Ok(match (outcomes.pop(), outcomes.pop(), outcomes.drain(..)) {
-                    (None, None, _) => DataOut::None,
-                    (Some(o), None, _) => DataOut::One(InvOut(o)),
-                    (Some(o), Some(next), rest) => {
-                        let mut v = vec![InvOut(o), InvOut(next)];
-                        v.extend(rest.map(InvOut));
-                        DataOut::Many(v)
+                if let Some(written_paths) = batch_written_paths {
+                    if outcomes.len() != written_paths.len()
+                        || !outcomes.iter().all(|outcome| {
+                            matches!(outcome, InvocationOutcome::KvWrite)
+                        })
+                    {
+                        Err((
+                            Status::InternalServerError,
+                            "KV batch put committed unexpected invocation outcomes".to_string(),
+                        ))
+                    } else {
+                        Ok(DataOut::One(InvOut(InvocationOutcome::KvBatchWrite(
+                            written_paths,
+                        ))))
                     }
-                    _ => unreachable!(),
-                })
+                } else {
+                    Ok(match (outcomes.pop(), outcomes.pop(), outcomes.drain(..)) {
+                        (None, None, _) => DataOut::None,
+                        (Some(o), None, _) => DataOut::One(InvOut(o)),
+                        (Some(o), Some(next), rest) => {
+                            let mut v = vec![InvOut(o), InvOut(next)];
+                            v.extend(rest.map(InvOut));
+                            DataOut::Many(v)
+                        }
+                        _ => unreachable!(),
+                    })
+                }
             }
             Err(e) => Err((
                 match e {
@@ -1212,6 +1538,7 @@ mod tests {
         sea_orm::{ColumnTrait, ConnectOptions, Database, EntityTrait, QueryFilter, QueryOrder},
         storage::either::Either,
         storage::StorageConfig as _,
+        types::{Ability, Resource},
     };
     use tokio::time::{timeout, Duration};
 
@@ -1232,6 +1559,90 @@ mod tests {
             StaticSecret::new(vec![0u8; 32]).unwrap(),
         )
         .await?)
+    }
+
+    fn kv_put_capability(space: &SpaceId, path: &str) -> Capability {
+        let path = path.parse().unwrap();
+        Capability {
+            resource: Resource::TinyCloud(space.clone().to_resource(
+                "kv".parse().unwrap(),
+                Some(path),
+                None,
+                None,
+            )),
+            ability: Ability::try_from("tinycloud.kv/put".to_string()).unwrap(),
+        }
+    }
+
+    fn sql_read_capability(space: &SpaceId) -> Capability {
+        Capability {
+            resource: Resource::TinyCloud(space.clone().to_resource(
+                "sql".parse().unwrap(),
+                Some("main".parse().unwrap()),
+                None,
+                None,
+            )),
+            ability: Ability::try_from("tinycloud.sql/read".to_string()).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_batch_path_names_are_percent_decoded() {
+        assert_eq!(
+            decode_multipart_path_field_name("xyz.tinycloud.listen%2Ftranscript%2Fabc%253A1")
+                .unwrap(),
+            "xyz.tinycloud.listen/transcript/abc%3A1"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_validation_rejects_duplicate_put_paths() {
+        let space = test_space_id("default");
+        let path: Path = "app/transcript/1".parse().unwrap();
+        let caps = vec![
+            kv_put_capability(&space, "app/transcript/1"),
+            kv_put_capability(&space, "app/transcript/1"),
+        ];
+        let result = validate_kv_batch_capability_set(
+            &caps,
+            &[(space.clone(), path.clone()), (space, path)],
+        );
+
+        assert_eq!(result.unwrap_err().0, Status::BadRequest);
+    }
+
+    #[tokio::test]
+    async fn batch_validation_rejects_multiple_spaces() {
+        let first = test_space_id("first");
+        let second = test_space_id("second");
+        let caps = vec![
+            kv_put_capability(&first, "app/transcript/1"),
+            kv_put_capability(&second, "app/transcript/2"),
+        ];
+        let result = validate_kv_batch_capability_set(
+            &caps,
+            &[
+                (first, "app/transcript/1".parse().unwrap()),
+                (second, "app/transcript/2".parse().unwrap()),
+            ],
+        );
+
+        assert_eq!(result.unwrap_err().0, Status::BadRequest);
+    }
+
+    #[tokio::test]
+    async fn batch_validation_rejects_mixed_capabilities() {
+        let space = test_space_id("default");
+        let caps = vec![
+            kv_put_capability(&space, "app/transcript/1"),
+            sql_read_capability(&space),
+        ];
+        let result = validate_kv_batch_capability_set(
+            &caps,
+            &[(space, "app/transcript/1".parse().unwrap())],
+        );
+
+        assert_eq!(result.unwrap_err().0, Status::BadRequest);
     }
 
     fn subscription_model(
