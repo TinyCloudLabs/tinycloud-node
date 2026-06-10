@@ -37,6 +37,12 @@ pub struct InvOut<R>(pub InvocationOutcome<R>);
 pub type DataIn<'a> = DataHolder<Data<'a>, (SpaceId, String, Metadata, Capped<&'a [u8]>)>;
 pub type DataOut<R> = DataHolder<InvOut<R>>;
 
+#[derive(Serialize)]
+struct KvBatchWriteResponse {
+    written: Vec<String>,
+    count: usize,
+}
+
 #[async_trait]
 impl<'r> FromData<'r> for DataIn<'r> {
     type Error = anyhow::Error;
@@ -56,13 +62,7 @@ impl<'r> FromData<'r> for DataIn<'r> {
                 .with_label_values(&["invoke"])
                 .start_timer();
 
-            let res = match <&'r ContentType>::from_request(req).await.succeeded() {
-                Some(c) if c.is_form_data() => rocket::outcome::Outcome::Error((
-                    Status::BadRequest,
-                    anyhow::anyhow!("Multipart uploads not yet supported"),
-                )),
-                _ => rocket::outcome::Outcome::Success(DataIn::One(data)),
-            };
+            let res = rocket::outcome::Outcome::Success(DataIn::One(data));
 
             timer.observe_duration();
             res
@@ -82,6 +82,17 @@ where
             InvocationOutcome::KvDelete => ().respond_to(request),
             InvocationOutcome::KvMetadata(meta) => meta.map(ObjectHeaders).respond_to(request),
             InvocationOutcome::KvWrite => ().respond_to(request),
+            InvocationOutcome::KvBatchWrite(written) => {
+                let written = written
+                    .into_iter()
+                    .map(|path| path.to_string())
+                    .collect::<Vec<_>>();
+                Json(KvBatchWriteResponse {
+                    count: written.len(),
+                    written,
+                })
+                .respond_to(request)
+            }
             InvocationOutcome::KvRead(data) => data
                 .map(|(md, hash, c)| KVResponse(c, md, hash))
                 .respond_to(request),

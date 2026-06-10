@@ -690,6 +690,7 @@ pub enum InvocationOutcome<R> {
     KvDelete,
     KvMetadata(Option<Metadata>),
     KvWrite,
+    KvBatchWrite(Vec<Path>),
     KvRead(Option<(Metadata, Hash, Content<R>)>),
     OpenSessions(HashMap<Hash, DelegationInfo>),
     /// Ordered delegation chain from leaf to root
