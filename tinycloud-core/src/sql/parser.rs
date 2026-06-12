@@ -6,6 +6,7 @@ use super::caveats::SqlCaveats;
 use super::types::SqlError;
 use crate::write_hooks::TouchedTables;
 
+#[derive(Debug)]
 pub struct ParsedQuery {
     pub statements: Vec<Statement>,
     pub referenced_tables: Vec<String>,
@@ -20,6 +21,23 @@ pub fn validate_sql(
     caveats: &Option<SqlCaveats>,
     ability: &str,
 ) -> Result<ParsedQuery, SqlError> {
+    if is_pragma_sql(sql) {
+        if !matches!(ability, "tinycloud.sql/admin" | "tinycloud.sql/*") {
+            return Err(SqlError::PermissionDenied(
+                "PRAGMA operations require admin ability".to_string(),
+            ));
+        }
+
+        return Ok(ParsedQuery {
+            statements: Vec::new(),
+            referenced_tables: Vec::new(),
+            referenced_columns: Vec::new(),
+            write_targets: Vec::new(),
+            is_read_only: true,
+            is_ddl: false,
+        });
+    }
+
     let dialect = SQLiteDialect {};
     let statements =
         Parser::parse_sql(&dialect, sql).map_err(|e| SqlError::ParseError(e.to_string()))?;
@@ -139,6 +157,43 @@ pub fn validate_sql(
         is_read_only,
         is_ddl,
     })
+}
+
+pub fn is_pragma_sql(sql: &str) -> bool {
+    first_sql_token(sql).as_deref() == Some("pragma")
+}
+
+fn first_sql_token(sql: &str) -> Option<String> {
+    let mut index = 0;
+
+    while index < sql.len() {
+        while let Some(ch) = sql[index..].chars().next() {
+            if !ch.is_whitespace() {
+                break;
+            }
+            index += ch.len_utf8();
+        }
+
+        if sql[index..].starts_with("--") {
+            let newline = sql[index + 2..].find('\n')?;
+            index += 2 + newline + 1;
+            continue;
+        }
+
+        if sql[index..].starts_with("/*") {
+            let end = sql[index + 2..].find("*/")?;
+            index += 2 + end + 2;
+            continue;
+        }
+
+        break;
+    }
+
+    let token: String = sql[index..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphabetic() || *ch == '_')
+        .collect();
+    (!token.is_empty()).then(|| token.to_ascii_lowercase())
 }
 
 fn extract_tables_from_statement(stmt: &Statement, tables: &mut Vec<String>) {
@@ -332,5 +387,34 @@ mod tests {
 
         let targets = extract_write_targets_from_statement(&statements[0]).unwrap();
         assert_eq!(targets, TouchedTables::supported(vec!["users".to_string()]));
+    }
+
+    #[test]
+    fn pragma_requires_admin_before_generic_sql_parse() {
+        let err = validate_sql(
+            "PRAGMA table_info(secret_records)",
+            &None,
+            "tinycloud.sql/read",
+        )
+        .expect_err("read ability must not authorize PRAGMA");
+
+        assert!(matches!(err, SqlError::PermissionDenied(message) if message.contains("admin")));
+    }
+
+    #[test]
+    fn admin_pragma_is_validated_without_sqlparser() {
+        let parsed = validate_sql(
+            "
+              -- migration introspection
+              /* SQLite-specific */
+              PRAGMA table_info(secret_records)
+            ",
+            &None,
+            "tinycloud.sql/admin",
+        )
+        .expect("admin PRAGMA should not fail sqlparser parsing");
+
+        assert!(parsed.is_read_only);
+        assert!(parsed.write_targets.is_empty());
     }
 }
