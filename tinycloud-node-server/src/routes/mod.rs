@@ -36,7 +36,7 @@ use tinycloud_core::{
     sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder},
     sql::{SqlCaveats, SqlError, SqlRequest, SqlService},
     storage::{HashBuffer, ImmutableReadStore, ImmutableStaging},
-    types::{Metadata, Resource},
+    types::{Ability, Metadata, Resource},
     util::{Capability, DelegationInfo, InvocationInfo},
     write_hooks::{db_table_path, hook_delivery_id, subscription_matches_event, TouchedTables},
     InvocationOutcome, TransactResult, TxError, TxStoreError,
@@ -1069,6 +1069,8 @@ async fn handle_sql_invoke(
     let sql_request: SqlRequest =
         serde_json::from_str(&body_str).map_err(|e| (Status::BadRequest, e.to_string()))?;
 
+    require_sql_admin_for_request(&sql_request, space, path, &db_name, sql_caps)?;
+
     if matches!(sql_request, SqlRequest::Export) {
         let data = sql_service
             .export(space, &db_name)
@@ -1115,6 +1117,40 @@ async fn handle_sql_invoke(
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
 
     Ok(DataOut::One(InvOut(InvocationOutcome::SqlResult(json))))
+}
+
+fn require_sql_admin_for_request(
+    request: &SqlRequest,
+    space: &SpaceId,
+    path: Option<&str>,
+    db_name: &str,
+    caps: &[(SpaceId, Option<String>, String)],
+) -> Result<(), (Status, String)> {
+    if !sql_request_requires_admin(request) || has_database_admin_capability(caps, "sql") {
+        return Ok(());
+    }
+
+    Err(missing_database_admin_capability_error(
+        space, path, db_name, "sql",
+    ))
+}
+
+fn sql_request_requires_admin(request: &SqlRequest) -> bool {
+    match request {
+        SqlRequest::Query { sql, .. } => tinycloud_core::sql::parser::is_pragma_sql(sql),
+        SqlRequest::Execute { sql, schema, .. } => {
+            tinycloud_core::sql::parser::is_pragma_sql(sql)
+                || schema.as_ref().is_some_and(|statements| {
+                    statements
+                        .iter()
+                        .any(|statement| tinycloud_core::sql::parser::is_pragma_sql(statement))
+                })
+        }
+        SqlRequest::Batch { statements } => statements
+            .iter()
+            .any(|statement| tinycloud_core::sql::parser::is_pragma_sql(&statement.sql)),
+        SqlRequest::ExecuteStatement { .. } | SqlRequest::Export => false,
+    }
 }
 
 fn sql_error_to_status(err: &SqlError) -> Status {
@@ -1490,6 +1526,46 @@ fn preferred_database_ability<'a>(
     })
 }
 
+fn has_database_admin_capability(
+    caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
+    service: &str,
+) -> bool {
+    let admin_abilities: &[&str] = match service {
+        "sql" => &["tinycloud.sql/admin", "tinycloud.sql/*"],
+        "duckdb" => &["tinycloud.duckdb/admin", "tinycloud.duckdb/*"],
+        _ => &[],
+    };
+
+    caps.iter()
+        .any(|(_, _, ability)| admin_abilities.contains(&ability.as_str()))
+}
+
+fn missing_database_admin_capability_error(
+    space: &tinycloud_auth::resource::SpaceId,
+    path: Option<&str>,
+    db_name: &str,
+    service: &str,
+) -> (Status, String) {
+    let ability = match service {
+        "sql" => "tinycloud.sql/admin",
+        "duckdb" => "tinycloud.duckdb/admin",
+        _ => "tinycloud.kv/put",
+    };
+    let resource_path = path.unwrap_or(db_name).parse().unwrap();
+    let resource = Resource::TinyCloud(space.clone().to_resource(
+        service.parse().unwrap(),
+        Some(resource_path),
+        None,
+        None,
+    ));
+    let ability = Ability::try_from(ability.to_string()).unwrap();
+
+    (
+        Status::Unauthorized,
+        format!("Unauthorized Action: {resource} / {ability}"),
+    )
+}
+
 /// Verify authorization by invoking with empty inputs.
 ///
 /// Shared by SQL and DuckDB invoke handlers. The caller must extract caveats
@@ -1584,6 +1660,57 @@ mod tests {
             )),
             ability: Ability::try_from("tinycloud.sql/read".to_string()).unwrap(),
         }
+    }
+
+    #[tokio::test]
+    async fn sql_pragma_request_requires_admin() {
+        let request = SqlRequest::Query {
+            sql: "PRAGMA table_info(secret_records)".to_string(),
+            params: Vec::new(),
+        };
+
+        assert!(sql_request_requires_admin(&request));
+    }
+
+    #[tokio::test]
+    async fn sql_pragma_missing_admin_returns_auth_hint_shape() {
+        let space = test_space_id("secrets");
+        let request = SqlRequest::Query {
+            sql: "PRAGMA table_info(secret_records)".to_string(),
+            params: Vec::new(),
+        };
+        let caps = vec![(
+            space.clone(),
+            Some("default".to_string()),
+            "tinycloud.sql/read".to_string(),
+        )];
+
+        let err =
+            require_sql_admin_for_request(&request, &space, Some("default"), "default", &caps)
+                .expect_err("PRAGMA with only read should ask for admin");
+
+        assert_eq!(err.0, Status::Unauthorized);
+        assert_eq!(
+            err.1,
+            format!("Unauthorized Action: {space}/sql/default / tinycloud.sql/admin")
+        );
+    }
+
+    #[tokio::test]
+    async fn sql_pragma_admin_capability_is_accepted() {
+        let space = test_space_id("secrets");
+        let request = SqlRequest::Query {
+            sql: "PRAGMA table_info(secret_records)".to_string(),
+            params: Vec::new(),
+        };
+        let caps = vec![(
+            space.clone(),
+            Some("default".to_string()),
+            "tinycloud.sql/admin".to_string(),
+        )];
+
+        require_sql_admin_for_request(&request, &space, Some("default"), "default", &caps)
+            .expect("admin PRAGMA should be accepted");
     }
 
     #[tokio::test]
