@@ -58,13 +58,17 @@ impl<'r> FromData<'r> for DataIn<'r> {
         let span = info_span!(parent: &req_span.0, "data_in");
         // Instrumenting async block to handle yielding properly
         async move {
-            let timer = crate::prometheus::AUTHORIZATION_HISTOGRAM
-                .with_label_values(&["invoke"])
-                .start_timer();
+            let timer = crate::prometheus::enabled().then(|| {
+                crate::prometheus::AUTHORIZATION_HISTOGRAM
+                    .with_label_values(&["invoke"])
+                    .start_timer()
+            });
 
             let res = rocket::outcome::Outcome::Success(DataIn::One(data));
 
-            timer.observe_duration();
+            if let Some(timer) = timer {
+                timer.observe_duration();
+            }
             res
         }
         .instrument(span)

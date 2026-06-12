@@ -37,15 +37,19 @@ async fn main() {
         }
     };
 
-    let prom_addr = (rocket.config().address, tinycloud_config.prometheus.port).into();
-    let prometheus = Server::bind(&prom_addr).serve(make_service_fn(|_| async {
-        Ok::<_, hyper::Error>(service_fn(prometheus::serve_req))
-    }));
+    if tinycloud_config.telemetry.enabled {
+        let prom_addr = (rocket.config().address, tinycloud_config.prometheus.port).into();
+        let prometheus = Server::bind(&prom_addr).serve(make_service_fn(|_| async {
+            Ok::<_, hyper::Error>(service_fn(prometheus::serve_req))
+        }));
 
-    tokio::select! {
-        r = rocket.launch() => {let _ = r.unwrap();},
-        r = prometheus => r.unwrap()
-    };
+        tokio::select! {
+            r = rocket.launch() => {let _ = r.unwrap();},
+            r = prometheus => r.unwrap()
+        };
+    } else {
+        let _ = rocket.launch().await.unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -119,6 +123,32 @@ mod tests {
             cfg.storage.database.as_deref(),
             Some("sqlite:/tmp/canonical-storage.db")
         );
+    }
+
+    #[test]
+    fn telemetry_defaults_to_disabled() {
+        let _lock = lock_env();
+        let _legacy = EnvVarGuard::unset("TINYCLOUD_TELEMETRY_ENABLED");
+        let _canonical = EnvVarGuard::unset("TINYCLOUD_TELEMETRY__ENABLED");
+
+        let cfg = build_config_figment()
+            .extract::<config::Config>()
+            .expect("config should parse");
+
+        assert!(!cfg.telemetry.enabled);
+    }
+
+    #[test]
+    fn canonical_double_underscore_loads_telemetry_enabled() {
+        let _lock = lock_env();
+        let _legacy = EnvVarGuard::unset("TINYCLOUD_TELEMETRY_ENABLED");
+        let _canonical = EnvVarGuard::set("TINYCLOUD_TELEMETRY__ENABLED", "true");
+
+        let cfg = build_config_figment()
+            .extract::<config::Config>()
+            .expect("config should parse");
+
+        assert!(cfg.telemetry.enabled);
     }
 
     #[test]

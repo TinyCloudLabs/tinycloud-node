@@ -6,6 +6,7 @@ use rocket::{
     request::{FromRequest, Outcome},
     Data, Request, Response,
 };
+use std::time::Instant;
 use tracing::{field, info_span, subscriber::set_global_default, Span};
 use tracing_log::LogTracer;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -15,6 +16,11 @@ use crate::config;
 
 #[derive(Clone)]
 pub struct TracingSpan(pub Span);
+
+#[derive(Clone)]
+struct RequestTelemetry {
+    start: Instant,
+}
 
 pub struct TracingFairing {
     pub header_name: String,
@@ -35,6 +41,13 @@ impl Fairing for TracingFairing {
             field::display(&span.context().span().span_context().trace_id()),
         );
         req.local_cache(|| Some(TracingSpan(span)));
+        if crate::prometheus::enabled() {
+            req.local_cache(|| {
+                Some(RequestTelemetry {
+                    start: Instant::now(),
+                })
+            });
+        }
     }
 
     async fn on_response<'r>(&self, req: &'r Request<'_>, res: &mut Response<'r>) {
@@ -42,6 +55,24 @@ impl Fairing for TracingFairing {
         {
             let trace_id = span.context().span().span_context().trace_id();
             res.set_raw_header(self.header_name.clone(), format!("{trace_id}"));
+        }
+        if crate::prometheus::enabled() {
+            if let Some(telemetry) = req
+                .local_cache(|| Option::<RequestTelemetry>::None)
+                .to_owned()
+            {
+                let route = req
+                    .route()
+                    .map(|route| route.uri.to_string())
+                    .unwrap_or_else(|| req.uri().path().to_string());
+                crate::prometheus::REQUEST_HISTOGRAM
+                    .with_label_values(&[
+                        req.method().as_str(),
+                        route.as_str(),
+                        res.status().code.to_string().as_str(),
+                    ])
+                    .observe(telemetry.start.elapsed().as_secs_f64());
+            }
         }
     }
 }

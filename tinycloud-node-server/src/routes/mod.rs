@@ -3,7 +3,10 @@ use futures::io::AsyncWriteExt;
 use percent_encoding::percent_decode_str;
 use rocket::{data::ToByteUnit, http::Status, serde::json::Json, State};
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    time::Instant,
+};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_auth::resource::{Path, SpaceId};
 use tokio::io::AsyncReadExt;
@@ -147,14 +150,21 @@ pub async fn create_signed_kv_url(
     tinycloud: &State<TinyCloud>,
 ) -> Result<Json<SignedKvUrlResponse>, (Status, String)> {
     let invocation_info = invocation.0 .0.clone();
-    verify_auth(invocation.0, tinycloud).await?;
-    let response = mint_signed_kv_url(
+    verify_auth("server.signed_kv.auth", invocation.0, tinycloud).await?;
+    let mint_start = Instant::now();
+    let mint_result = mint_signed_kv_url(
         &invocation_info,
         request.into_inner(),
         runtime.inner(),
         tinycloud.inner(),
     )
-    .await?;
+    .await;
+    crate::prometheus::observe_span(
+        "server.signed_kv.mint_url",
+        if mint_result.is_ok() { "ok" } else { "error" },
+        mint_start.elapsed(),
+    );
+    let response = mint_result?;
     Ok(Json(response))
 }
 
@@ -166,14 +176,24 @@ pub async fn signed_kv_get(
     KVResponse<tinycloud_core::storage::Content<<BlockStores as ImmutableReadStore>::Readable>>,
     (Status, String),
 > {
-    let ticket = load_signed_kv_ticket(tinycloud.inner(), ticket_id).await?;
+    let load_start = Instant::now();
+    let load_result = load_signed_kv_ticket(tinycloud.inner(), ticket_id).await;
+    crate::prometheus::observe_span(
+        "server.signed_kv.load_ticket",
+        if load_result.is_ok() { "ok" } else { "error" },
+        load_start.elapsed(),
+    );
+    let ticket = load_result?;
     let (space_id, key) = validate_signed_kv_ticket(&ticket)?;
 
-    match tinycloud
-        .kv_get(&space_id, &key)
-        .await
-        .map_err(|e| (Status::InternalServerError, e.to_string()))?
-    {
+    let kv_start = Instant::now();
+    let kv_result = tinycloud.kv_get(&space_id, &key).await;
+    crate::prometheus::observe_span(
+        "server.signed_kv.kv_get",
+        if kv_result.is_ok() { "ok" } else { "error" },
+        kv_start.elapsed(),
+    );
+    match kv_result.map_err(|e| (Status::InternalServerError, e.to_string()))? {
         Some((md, hash, content)) => {
             validate_signed_kv_hash_binding(&ticket, &hash)?;
             Ok(KVResponse::new(md, hash, content))
@@ -199,9 +219,11 @@ pub async fn delegate(
     let span = info_span!(parent: &req_span.0, "delegate", action = %action_label);
     // Instrumenting async block to handle yielding properly
     async move {
-        let timer = crate::prometheus::AUTHORIZED_INVOKE_HISTOGRAM
-            .with_label_values(&["delegate"])
-            .start_timer();
+        let timer = crate::prometheus::enabled().then(|| {
+            crate::prometheus::AUTHORIZED_INVOKE_HISTOGRAM
+                .with_label_values(&["delegate"])
+                .start_timer()
+        });
         let res = tinycloud
             .delegate(d.0)
             .await
@@ -242,7 +264,9 @@ pub async fn delegate(
                     skipped,
                 }))
             });
-        timer.observe_duration();
+        if let Some(timer) = timer {
+            timer.observe_duration();
+        }
         res
     }
     .instrument(span)
@@ -629,9 +653,11 @@ async fn invoke_impl(
     let span = info_span!(parent: &req_span.0, "invoke", action = %action_label);
     // Instrumenting async block to handle yielding properly
     async move {
-        let timer = crate::prometheus::AUTHORIZED_INVOKE_HISTOGRAM
-            .with_label_values(&["invoke"])
-            .start_timer();
+        let timer = crate::prometheus::enabled().then(|| {
+            crate::prometheus::AUTHORIZED_INVOKE_HISTOGRAM
+                .with_label_values(&["invoke"])
+                .start_timer()
+        });
 
         // Check for SQL capabilities
         let sql_caps: Vec<_> = i
@@ -663,7 +689,9 @@ async fn invoke_impl(
                 &sql_caps,
             )
             .await;
-            timer.observe_duration();
+            if let Some(timer) = timer {
+                timer.observe_duration();
+            }
             return result;
         }
 
@@ -704,7 +732,9 @@ async fn invoke_impl(
                     arrow_format,
                 )
                 .await;
-                timer.observe_duration();
+                if let Some(timer) = timer {
+                    timer.observe_duration();
+                }
                 return result;
             }
         }
@@ -718,7 +748,9 @@ async fn invoke_impl(
                         && ability.starts_with("tinycloud.duckdb/")
             )
         }) {
-            timer.observe_duration();
+            if let Some(timer) = timer {
+                timer.observe_duration();
+            }
             return Err((
                 Status::NotImplemented,
                 "DuckDB support is not enabled on this node".to_string(),
@@ -739,8 +771,10 @@ async fn invoke_impl(
                 .collect::<Vec<_>>()
         });
 
-        let inputs = match (data, put_caps.as_slice(), is_multipart_request) {
-            (DataIn::None | DataIn::One(_), [], _) => HashMap::new(),
+        let staging_start = Instant::now();
+        let inputs_result: Result<KvInputMap, (Status, String)> =
+            match (data, put_caps.as_slice(), is_multipart_request) {
+                (DataIn::None | DataIn::One(_), [], _) => Ok(HashMap::new()),
             (DataIn::One(d), [(space, path)], false) => {
                 let mut stage = staging
                     .stage(space)
@@ -802,10 +836,9 @@ async fn invoke_impl(
 
                 let mut inputs = HashMap::new();
                 inputs.insert((space.clone(), path.clone()), (headers.0, stage));
-                inputs
+                Ok(inputs)
             }
-            (DataIn::One(d), [_, ..], true) => {
-                build_batch_kv_inputs(
+                (DataIn::One(d), [_, ..], true) => build_batch_kv_inputs(
                     d,
                     &headers,
                     expected_batch_inputs
@@ -816,17 +849,28 @@ async fn invoke_impl(
                     config,
                     quota_cache,
                 )
-                .await?
-            }
-            (DataIn::One(_), [_, _, ..], false) => {
-                return Err((Status::BadRequest, "KV batch put requires multipart/form-data".to_string()));
-            }
-            _ => {
-                return Err((Status::BadRequest, "Invalid inputs".to_string()));
-            }
-        };
+                .await,
+                (DataIn::One(_), [_, _, ..], false) => Err((
+                    Status::BadRequest,
+                    "KV batch put requires multipart/form-data".to_string(),
+                )),
+                _ => Err((Status::BadRequest, "Invalid inputs".to_string())),
+            };
+        crate::prometheus::observe_span(
+            "server.kv.stage_inputs",
+            if inputs_result.is_ok() { "ok" } else { "error" },
+            staging_start.elapsed(),
+        );
+        let inputs = inputs_result?;
         let invocation_info = i.0 .0.clone();
-        let res = match tinycloud.invoke::<BlockStage>(i.0, inputs).await {
+        let invoke_start = Instant::now();
+        let invoke_result = tinycloud.invoke::<BlockStage>(i.0, inputs).await;
+        crate::prometheus::observe_span(
+            "server.kv.invoke",
+            if invoke_result.is_ok() { "ok" } else { "error" },
+            invoke_start.elapsed(),
+        );
+        let res = match invoke_result {
             Ok((tx_result, mut outcomes)) => {
                 emit_kv_hook_events(hook_runtime, tinycloud, &invocation_info, &tx_result).await;
                 if let Some(written_paths) = batch_written_paths {
@@ -869,7 +913,9 @@ async fn invoke_impl(
             )),
         };
 
-        timer.observe_duration();
+        if let Some(timer) = timer {
+            timer.observe_duration();
+        }
         res
     }
     .instrument(span)
@@ -1059,8 +1105,15 @@ async fn handle_sql_invoke(
             });
 
     let actor = i.0 .0.invoker.clone();
-    let auth_result = verify_auth(i.0, tinycloud).await?;
-    let body_str = read_json_body(data).await?;
+    let auth_result = verify_auth("server.sql.auth", i.0, tinycloud).await?;
+    let body_start = Instant::now();
+    let body_result = read_json_body(data).await;
+    crate::prometheus::observe_span(
+        "server.sql.read_body",
+        if body_result.is_ok() { "ok" } else { "error" },
+        body_start.elapsed(),
+    );
+    let body_str = body_result?;
 
     let (space, path, ability) = select_database_scope(sql_caps, "sql")?;
     let db_name = SqlService::db_name_from_path(path);
@@ -1072,17 +1125,31 @@ async fn handle_sql_invoke(
     require_sql_admin_for_request(&sql_request, space, path, &db_name, sql_caps)?;
 
     if matches!(sql_request, SqlRequest::Export) {
-        let data = sql_service
-            .export(space, &db_name)
-            .await
-            .map_err(|e| (sql_error_to_status(&e), e.to_string()))?;
+        let export_start = Instant::now();
+        let export_result = sql_service.export(space, &db_name).await;
+        crate::prometheus::observe_span(
+            "server.sql.export",
+            if export_result.is_ok() { "ok" } else { "error" },
+            export_start.elapsed(),
+        );
+        let data = export_result.map_err(|e| (sql_error_to_status(&e), e.to_string()))?;
         return Ok(DataOut::One(InvOut(InvocationOutcome::SqlExport(data))));
     }
 
-    let response = sql_service
+    let execute_start = Instant::now();
+    let execute_result = sql_service
         .execute(space, &db_name, sql_request, caveats, ability.to_string())
-        .await
-        .map_err(|e| (sql_error_to_status(&e), e.to_string()))?;
+        .await;
+    crate::prometheus::observe_span(
+        "server.sql.execute",
+        if execute_result.is_ok() {
+            "ok"
+        } else {
+            "error"
+        },
+        execute_start.elapsed(),
+    );
+    let response = execute_result.map_err(|e| (sql_error_to_status(&e), e.to_string()))?;
 
     if let Some(epoch) = auth_result
         .commits
@@ -1100,14 +1167,23 @@ async fn handle_sql_invoke(
                 &response.write_targets,
             );
 
-            enqueue_database_webhook_deliveries(tinycloud, &events)
-                .await
-                .map_err(|e| {
-                    (
-                        Status::InternalServerError,
-                        format!("sql write committed but webhook enqueue failed: {e}"),
-                    )
-                })?;
+            let enqueue_start = Instant::now();
+            let enqueue_result = enqueue_database_webhook_deliveries(tinycloud, &events).await;
+            crate::prometheus::observe_span(
+                "server.sql.enqueue_hooks",
+                if enqueue_result.is_ok() {
+                    "ok"
+                } else {
+                    "error"
+                },
+                enqueue_start.elapsed(),
+            );
+            enqueue_result.map_err(|e| {
+                (
+                    Status::InternalServerError,
+                    format!("sql write committed but webhook enqueue failed: {e}"),
+                )
+            })?;
 
             publish_database_hook_events(hook_runtime, &events);
         }
@@ -1193,7 +1269,7 @@ async fn handle_duckdb_invoke(
             });
 
     let actor = i.0 .0.invoker.clone();
-    let auth_result = verify_auth(i.0, tinycloud).await?;
+    let auth_result = verify_auth("server.duckdb.auth", i.0, tinycloud).await?;
 
     let (space, path, ability) = select_database_scope(duckdb_caps, "duckdb")?;
     let db_name = DuckDbService::db_name_from_path(path);
@@ -1218,16 +1294,27 @@ async fn handle_duckdb_invoke(
             }
         };
 
-        duckdb_service
-            .import_db(space, &db_name, &body_bytes)
-            .await
-            .map_err(|e| (duckdb_error_to_status(&e), e.to_string()))?;
+        let import_start = Instant::now();
+        let import_result = duckdb_service.import_db(space, &db_name, &body_bytes).await;
+        crate::prometheus::observe_span(
+            "server.duckdb.import",
+            if import_result.is_ok() { "ok" } else { "error" },
+            import_start.elapsed(),
+        );
+        import_result.map_err(|e| (duckdb_error_to_status(&e), e.to_string()))?;
 
         let json = serde_json::json!({"imported": true});
         return Ok(DataOut::One(InvOut(InvocationOutcome::DuckDbResult(json))));
     }
 
-    let body_str = read_json_body(data).await?;
+    let body_start = Instant::now();
+    let body_result = read_json_body(data).await;
+    crate::prometheus::observe_span(
+        "server.duckdb.read_body",
+        if body_result.is_ok() { "ok" } else { "error" },
+        body_start.elapsed(),
+    );
+    let body_str = body_result?;
 
     let duckdb_request: DuckDbRequest =
         serde_json::from_str(&body_str).map_err(|e| (Status::BadRequest, e.to_string()))?;
@@ -1239,14 +1326,19 @@ async fn handle_duckdb_invoke(
                 "Export not allowed with active caveats".into(),
             ));
         }
-        let data = duckdb_service
-            .export(space, &db_name)
-            .await
-            .map_err(|e| (duckdb_error_to_status(&e), e.to_string()))?;
+        let export_start = Instant::now();
+        let export_result = duckdb_service.export(space, &db_name).await;
+        crate::prometheus::observe_span(
+            "server.duckdb.export",
+            if export_result.is_ok() { "ok" } else { "error" },
+            export_start.elapsed(),
+        );
+        let data = export_result.map_err(|e| (duckdb_error_to_status(&e), e.to_string()))?;
         return Ok(DataOut::One(InvOut(InvocationOutcome::DuckDbExport(data))));
     }
 
-    let response = duckdb_service
+    let execute_start = Instant::now();
+    let execute_result = duckdb_service
         .execute(
             space,
             &db_name,
@@ -1255,8 +1347,17 @@ async fn handle_duckdb_invoke(
             ability.to_string(),
             arrow_format,
         )
-        .await
-        .map_err(|e| (duckdb_error_to_status(&e), e.to_string()))?;
+        .await;
+    crate::prometheus::observe_span(
+        "server.duckdb.execute",
+        if execute_result.is_ok() {
+            "ok"
+        } else {
+            "error"
+        },
+        execute_start.elapsed(),
+    );
+    let response = execute_result.map_err(|e| (duckdb_error_to_status(&e), e.to_string()))?;
 
     if let Some(epoch) = auth_result
         .commits
@@ -1274,14 +1375,23 @@ async fn handle_duckdb_invoke(
                 &response.write_targets,
             );
 
-            enqueue_database_webhook_deliveries(tinycloud, &events)
-                .await
-                .map_err(|e| {
-                    (
-                        Status::InternalServerError,
-                        format!("duckdb write committed but webhook enqueue failed: {e}"),
-                    )
-                })?;
+            let enqueue_start = Instant::now();
+            let enqueue_result = enqueue_database_webhook_deliveries(tinycloud, &events).await;
+            crate::prometheus::observe_span(
+                "server.duckdb.enqueue_hooks",
+                if enqueue_result.is_ok() {
+                    "ok"
+                } else {
+                    "error"
+                },
+                enqueue_start.elapsed(),
+            );
+            enqueue_result.map_err(|e| {
+                (
+                    Status::InternalServerError,
+                    format!("duckdb write committed but webhook enqueue failed: {e}"),
+                )
+            })?;
 
             publish_database_hook_events(hook_runtime, &events);
         }
@@ -1574,10 +1684,12 @@ fn missing_database_admin_capability_error(
 /// schema block partially applies and then fails, MVP does not emit hooks for
 /// the partial write set.
 async fn verify_auth(
+    span: &'static str,
     invocation: Invocation,
     tinycloud: &State<TinyCloud>,
 ) -> Result<TransactResult, (Status, String)> {
-    tinycloud
+    let start = Instant::now();
+    let result = tinycloud
         .invoke::<BlockStage>(invocation, HashMap::new())
         .await
         .map_err(|e| {
@@ -1592,7 +1704,13 @@ async fn verify_auth(
                 e.to_string(),
             )
         })
-        .map(|(tx_result, _)| tx_result)
+        .map(|(tx_result, _)| tx_result);
+    crate::prometheus::observe_span(
+        span,
+        if result.is_ok() { "ok" } else { "error" },
+        start.elapsed(),
+    );
+    result
 }
 
 #[cfg(test)]

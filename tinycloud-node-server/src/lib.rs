@@ -113,6 +113,8 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     // Remote backends (Postgres, S3) are left alone; connection errors surface naturally.
     ensure_local_dirs(&tinycloud_config.storage).await?;
 
+    prometheus::set_enabled(tinycloud_config.telemetry.enabled);
+
     tracing::tracing_try_init(&tinycloud_config.log)?;
 
     let routes = routes![
