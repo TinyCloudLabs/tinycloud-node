@@ -34,3 +34,8 @@ cors = true
 [global.spaces]
 ## Space allow list api endpoint
 # allowlist = "http://localhost:10000"
+
+[global.telemetry]
+    ## Enable Prometheus latency metrics on global.prometheus.port.
+    ## Env: TINYCLOUD_TELEMETRY__ENABLED
+    enabled = false

@@ -21,6 +21,8 @@ pub struct Config {
     #[serde(default)]
     pub hooks: HooksConfig,
     pub relay: Relay,
+    #[serde(default)]
+    pub telemetry: Telemetry,
     pub prometheus: Prometheus,
     pub cors: bool,
     pub keys: Keys,
@@ -371,6 +373,11 @@ pub enum StagingStorage {
 pub struct Relay {
     pub address: String,
     pub port: u16,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, Default)]
+pub struct Telemetry {
+    pub enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]

@@ -113,6 +113,7 @@ The following common options are available:
 | storage.staging     | TINYCLOUD_STORAGE_STAGING     | Set the mode of content staging, options are "Memory" and "FileSystem"     |
 | keys.type           | TINYCLOUD_KEYS_TYPE           | Set the type of host key store, options are "Static"                       |
 | spaces.allowlist    | TINYCLOUD_SPACES_ALLOWLIST    | Set the URL of an allowlist service for gating the creation of Space Peers |
+| telemetry.enabled   | TINYCLOUD_TELEMETRY__ENABLED  | Enable Prometheus latency metrics on the configured Prometheus port        |
 
 ### Database Config
 
