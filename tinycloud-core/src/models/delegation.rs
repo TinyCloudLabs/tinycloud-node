@@ -2,8 +2,10 @@ use crate::encryption::ColumnEncryption;
 use crate::encryption_network::NetworkId;
 use crate::hash::Hash;
 use crate::types::{Ability, Facts, Resource};
+use crate::util::DelegationMode;
 use crate::{events::Delegation, models::*, relationships::*, util};
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, ConnectionTrait};
+use std::collections::BTreeMap;
 use time::OffsetDateTime;
 use tinycloud_auth::{
     authorization::TinyCloudDelegation, identity::did_principal_matches, ssi::dids::AnyDidMethod,
@@ -123,6 +125,10 @@ pub enum DelegationError {
     ExpiryExceedsParent,
     #[error("Child delegation not_before precedes parent not_before")]
     NotBeforePrecedesParent,
+    /// W1: parent delegation is terminal — children cannot redelegate.
+    /// Maps to `terminal-parent-cannot-redelegate` in the W0 vectors.
+    #[error("terminal-parent-cannot-redelegate")]
+    TerminalParentCannotRedelegate,
 }
 
 pub(crate) async fn process<C: ConnectionTrait>(
@@ -199,6 +205,16 @@ async fn validate<C: ConnectionTrait>(
                 return Err(DelegationError::MissingParents.into());
             }
 
+            // W1 (B): reject any chain that cites a terminal parent. The
+            // marker is persisted on the parent row's `facts` column at
+            // save time and is signed-into the parent's UCAN payload, so a
+            // cooperating holder cannot strip it after the fact.
+            for p in &all_parents {
+                if parent_is_terminal(p) {
+                    return Err(DelegationError::TerminalParentCannotRedelegate.into());
+                }
+            }
+
             // Check time constraints and track failures
             let mut expiry_failed = false;
             let mut not_before_failed = false;
@@ -262,6 +278,19 @@ async fn validate<C: ConnectionTrait>(
     }
 }
 
+/// True if the persisted parent row is marked terminal via the
+/// `xyz.tinycloud.policy/delegationMode` fact. The marker is stored in the
+/// `facts` JSON column at save time; absence is treated as attenuable.
+fn parent_is_terminal(p: &Model) -> bool {
+    let Some(Facts(map)) = &p.facts else {
+        return false;
+    };
+    map.get(DelegationMode::FACT_KEY)
+        .and_then(|v| v.as_str())
+        .map(|s| s == "terminal")
+        .unwrap_or(false)
+}
+
 fn is_root_authority(cap: &util::Capability, delegator: &str) -> bool {
     if cap
         .resource
@@ -296,6 +325,22 @@ async fn save<C: ConnectionTrait>(
     // Encrypt for storage if encryption is configured
     let stored_serialization = crate::encryption::maybe_encrypt(encryption, &serialization);
 
+    // Persist the signed-in `delegationMode` marker. We store ONLY the
+    // marker we recognize natively (not the full UCAN facts), keeping the
+    // serialization column as the source of truth for the bytes the holder
+    // actually signed and the `facts` column as a fast-path lookup index.
+    let facts = match delegation.delegation_mode {
+        DelegationMode::Attenuable => None,
+        DelegationMode::Terminal => {
+            let mut map: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+            map.insert(
+                DelegationMode::FACT_KEY.to_string(),
+                serde_json::Value::String(DelegationMode::Terminal.as_str().to_string()),
+            );
+            Some(Facts(map))
+        }
+    };
+
     // save delegation
     match Entity::insert(ActiveModel::from(Model {
         id: hash,
@@ -304,7 +349,7 @@ async fn save<C: ConnectionTrait>(
         expiry: delegation.expiry,
         issued_at: delegation.issued_at,
         not_before: delegation.not_before,
-        facts: None,
+        facts,
         serialization: stored_serialization,
     }))
     .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned())
@@ -317,14 +362,17 @@ async fn save<C: ConnectionTrait>(
         }
     };
 
-    // save abilities
+    // save abilities — persist UCAN caveats with the delegation row. W1
+    // contract: caveats MUST NOT be reconstructed from invocation facts;
+    // SQL constrained-statement guarantees fail in adversarial cases
+    // otherwise (see policy-engine/spec/revocation.md §2.5).
     if !delegation.capabilities.is_empty() {
         abilities::Entity::insert_many(delegation.capabilities.into_iter().map(|ab| {
             abilities::ActiveModel::from(abilities::Model {
                 delegation: hash,
                 resource: ab.resource,
                 ability: ab.ability,
-                caveats: Default::default(),
+                caveats: ab.caveats,
             })
         }))
         .exec(db)

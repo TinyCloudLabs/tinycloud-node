@@ -81,6 +81,17 @@ pub enum InvocationError {
     MissingParents,
     #[error("No Such Key: {0}")]
     MissingKvWrite(Path),
+    /// W1 (C): the directly-cited delegation has been revoked.
+    /// Code: `delegation-revoked`.
+    #[error("delegation-revoked: {0}")]
+    DelegationRevoked(String),
+    /// W1 (C): an attenuable ancestor of the cited delegation has been
+    /// revoked. Code: `delegation-ancestor-revoked`.
+    #[error("delegation-ancestor-revoked: ancestor={ancestor_cid} invoked={invoked_cid}")]
+    DelegationAncestorRevoked {
+        ancestor_cid: String,
+        invoked_cid: String,
+    },
 }
 
 pub(crate) async fn process<C: ConnectionTrait>(
@@ -154,6 +165,24 @@ async fn validate<C: ConnectionTrait>(
                 }
             }
 
+            // W1 (C): fail-closed on revocation. A revoked leaf rejects the
+            // invocation outright; a revoked ANCESTOR in the cited chain
+            // rejects descendants. Walked on every invocation — we must
+            // NOT cache "chain ok" across the revocation event
+            // (revocation.md §2.3).
+            for (p, _) in &parents {
+                if is_revoked(db, &p.id).await? {
+                    return Err(InvocationError::DelegationRevoked(p.id.to_cid(0x55).to_string()).into());
+                }
+                if let Some(ancestor_cid) = first_revoked_ancestor(db, &p.id).await? {
+                    return Err(InvocationError::DelegationAncestorRevoked {
+                        ancestor_cid,
+                        invoked_cid: p.id.to_cid(0x55).to_string(),
+                    }
+                    .into());
+                }
+            }
+
             let now = time.unwrap_or_else(OffsetDateTime::now_utc);
 
             // only use parents which are valid at the time of invocation
@@ -181,6 +210,43 @@ async fn validate<C: ConnectionTrait>(
             }
         }
     }
+}
+
+/// True if `delegation_id` has an active revocation row.
+async fn is_revoked<C: ConnectionTrait>(db: &C, delegation_id: &Hash) -> Result<bool, DbErr> {
+    let n = revocation::Entity::find()
+        .filter(revocation::Column::Revoked.eq(*delegation_id))
+        .count(db)
+        .await?;
+    Ok(n > 0)
+}
+
+/// Walk a chain transitively from `start` toward the root via the
+/// parent_delegations table and return the first revoked ancestor's CID, if
+/// any. Stops at the first hit; otherwise returns None.
+async fn first_revoked_ancestor<C: ConnectionTrait>(
+    db: &C,
+    start: &Hash,
+) -> Result<Option<String>, DbErr> {
+    let mut frontier: Vec<Hash> = vec![*start];
+    let mut visited: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+    while let Some(current) = frontier.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        let parents = parent_delegations::Entity::find()
+            .filter(parent_delegations::Column::Child.eq(current))
+            .all(db)
+            .await?;
+        for link in parents {
+            let parent_id = link.parent;
+            if is_revoked(db, &parent_id).await? {
+                return Ok(Some(parent_id.to_cid(0x55).to_string()));
+            }
+            frontier.push(parent_id);
+        }
+    }
+    Ok(None)
 }
 
 fn is_root_authority(cap: &util::Capability, invoker: &str) -> bool {

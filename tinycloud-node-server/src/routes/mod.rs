@@ -40,7 +40,7 @@ use tinycloud_core::{
     sql::{SqlCaveats, SqlError, SqlRequest, SqlService},
     storage::{HashBuffer, ImmutableReadStore, ImmutableStaging},
     types::{Ability, Metadata, Resource},
-    util::{Capability, DelegationInfo, InvocationInfo},
+    util::{Capability, DelegationInfo, InvocationInfo, RevocationInfo},
     write_hooks::{db_table_path, hook_delivery_id, subscription_matches_event, TouchedTables},
     InvocationOutcome, TransactResult, TxError, TxStoreError,
 };
@@ -271,6 +271,50 @@ pub async fn delegate(
     }
     .instrument(span)
     .await
+}
+
+/// W1 (C): node-confirmed revocation surface.
+///
+/// Accepts a CACAO/SIWE-encoded revocation today (the on-the-wire encoding
+/// supported by `TinyCloudRevocation`); the W0 spec also calls for a
+/// `did:key`-signed UCAN-format revocation by the Grant Issuer. That second
+/// signature suite is staged on top of the existing pipeline as a followup
+/// (it requires a new variant in `tinycloud-auth::TinyCloudRevocation`); the
+/// route itself is mounted so the Policy Engine `active_cutoff` loop can
+/// rely on a confirmation response.
+#[post("/revoke")]
+pub async fn revoke(
+    r: AuthHeaderGetter<RevocationInfo>,
+    req_span: TracingSpan,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Json<RevokeResponse>, (Status, String)> {
+    let span = info_span!(parent: &req_span.0, "revoke");
+    async move {
+        let revoked_cid = r.0 .0.revoked.to_string();
+        let res = tinycloud.revoke(r.0).await.map_err(|e| {
+            (
+                match e {
+                    TxError::SpaceNotFound => Status::NotFound,
+                    TxError::Db(DbErr::ConnectionAcquire(_)) => Status::InternalServerError,
+                    _ => Status::Forbidden,
+                },
+                e.to_string(),
+            )
+        })?;
+        let _ = res;
+        Ok(Json(RevokeResponse {
+            revoked: true,
+            cid: revoked_cid,
+        }))
+    }
+    .instrument(span)
+    .await
+}
+
+#[derive(Serialize)]
+pub struct RevokeResponse {
+    pub revoked: bool,
+    pub cid: String,
 }
 
 #[post("/invoke", data = "<data>")]
@@ -1090,7 +1134,16 @@ async fn handle_sql_invoke(
     hook_runtime: &State<HookRuntime>,
     sql_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
-    let caveats: Option<SqlCaveats> =
+    // W1 (D): derive the SQL caveat from the VALIDATED delegation chain,
+    // NOT from the invoker's own invocation facts. The invocation-facts
+    // path is a holdover (and is still consulted as a fallback so the
+    // tinycloud.sql/write path keeps working) but a constrained-statements
+    // caveat on the delegation chain MUST win and fail-closed.
+    let parent_cids: Vec<_> = i.0 .0.parents.iter().copied().collect();
+    let chain_constrained =
+        derive_chain_constrained_caveat(tinycloud, &parent_cids).await?;
+
+    let facts_caveats: Option<SqlCaveats> =
         i.0 .0
             .invocation
             .payload()
@@ -1124,6 +1177,20 @@ async fn handle_sql_invoke(
 
     require_sql_admin_for_request(&sql_request, space, path, &db_name, sql_caps)?;
 
+    // W1 (D): under a constrained-statements profile (carried by the
+    // validated transitive delegation chain), raw paths are blocked
+    // outright and named statements are validated against the chain caveat
+    // (including fixed-param pinning, server-side substitution, and
+    // primitive-only non-fixed binds). The chain caveat — NOT the
+    // invocation envelope's facts — is the source of truth so a holder
+    // cannot widen or drop their grant by editing the invocation.
+    let constrained = chain_constrained;
+    let sql_request = if let Some(caveat) = &constrained {
+        enforce_constrained_profile(caveat, sql_request)?
+    } else {
+        sql_request
+    };
+
     if matches!(sql_request, SqlRequest::Export) {
         let export_start = Instant::now();
         let export_result = sql_service.export(space, &db_name).await;
@@ -1136,9 +1203,17 @@ async fn handle_sql_invoke(
         return Ok(DataOut::One(InvOut(InvocationOutcome::SqlExport(data))));
     }
 
+    // W1 (D): bind the SQL service execution to the chain-derived caveat
+    // when present. The invocation envelope's facts (`facts_caveats`) are
+    // only used as a fallback when no constrained-statements caveat lives
+    // on the chain — they MUST NOT override the chain caveat.
+    let exec_caveats: Option<SqlCaveats> = match &constrained {
+        Some(c) => Some(constrained_caveat_to_sql_caveats(c)),
+        None => facts_caveats,
+    };
     let execute_start = Instant::now();
     let execute_result = sql_service
-        .execute(space, &db_name, sql_request, caveats, ability.to_string())
+        .execute(space, &db_name, sql_request, exec_caveats, ability.to_string())
         .await;
     crate::prometheus::observe_span(
         "server.sql.execute",
@@ -1226,6 +1301,292 @@ fn sql_request_requires_admin(request: &SqlRequest) -> bool {
             .iter()
             .any(|statement| tinycloud_core::sql::parser::is_pragma_sql(&statement.sql)),
         SqlRequest::ExecuteStatement { .. } | SqlRequest::Export => false,
+    }
+}
+
+/// W1 (D): walk the validated transitive delegation chain starting from the
+/// invocation's directly-cited parents and return the first SQL
+/// constrained-statement caveat present on any ancestor's persisted abilities
+/// row. The persisted `caveats` JSON (NOT the invocation envelope's facts) is
+/// the source of truth so a holder cannot widen or drop their grant by
+/// editing the invocation. Walking ancestors closes the audit gap where a
+/// child citing a no-caveat descendant would otherwise bypass an ancestor
+/// caveat row.
+async fn derive_chain_constrained_caveat(
+    tinycloud: &State<TinyCloud>,
+    parent_cids: &[tinycloud_auth::authorization::Cid],
+) -> Result<
+    Option<tinycloud_core::policy_capability::SqlConstrainedStatementCaveat>,
+    (Status, String),
+> {
+    use std::collections::HashSet;
+    use tinycloud_core::hash::Hash;
+    use tinycloud_core::models::{abilities, parent_delegations};
+    use tinycloud_core::policy_capability::sql_caveat;
+
+    if parent_cids.is_empty() {
+        return Ok(None);
+    }
+    let conn = tinycloud
+        .readable()
+        .await
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+
+    // BFS the chain via parent_delegations so an ancestor's caveat row binds
+    // even if the directly-cited descendant has no caveat row of its own.
+    let mut frontier: Vec<Hash> = parent_cids.iter().copied().map(Hash::from).collect();
+    let mut visited: HashSet<Hash> = HashSet::new();
+
+    while !frontier.is_empty() {
+        let batch: Vec<Hash> = frontier
+            .drain(..)
+            .filter(|h| visited.insert(*h))
+            .collect();
+        if batch.is_empty() {
+            break;
+        }
+        let rows = abilities::Entity::find()
+            .filter(abilities::Column::Delegation.is_in(batch.clone()))
+            .all(&conn)
+            .await
+            .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+        for row in rows {
+            for (_idx, v) in &row.caveats.0 {
+                if let Ok(caveat) = sql_caveat::parse(v) {
+                    return Ok(Some(caveat));
+                }
+                if let Some(inner) = v.as_object().and_then(|o| o.get("constrained-statements")) {
+                    if let Ok(caveat) = sql_caveat::parse(inner) {
+                        return Ok(Some(caveat));
+                    }
+                }
+            }
+        }
+
+        // Climb to parents of the batch we just scanned.
+        let parents = parent_delegations::Entity::find()
+            .filter(parent_delegations::Column::Child.is_in(batch))
+            .all(&conn)
+            .await
+            .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+        for link in parents {
+            if !visited.contains(&link.parent) {
+                frontier.push(link.parent);
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// W1 (D): translate the chain-derived constrained-statements caveat into
+/// the SQL service's `SqlCaveats` shape. This is what binds execution to the
+/// validated chain — the SQL service will only honor the named statements
+/// declared on the chain and will refuse writes when `read_only` is set.
+fn constrained_caveat_to_sql_caveats(
+    caveat: &tinycloud_core::policy_capability::SqlConstrainedStatementCaveat,
+) -> SqlCaveats {
+    let statements: Vec<tinycloud_core::sql::PreparedStatement> = caveat
+        .statements
+        .iter()
+        .map(|s| tinycloud_core::sql::PreparedStatement {
+            name: s.name.clone(),
+            sql: s.sql.clone(),
+        })
+        .collect();
+    SqlCaveats {
+        tables: None,
+        columns: None,
+        statements: Some(statements),
+        read_only: Some(caveat.read_only),
+    }
+}
+
+/// W1 (D): under a constrained-statements caveat profile, enforce the W0
+/// behavior tables in `sql-constrained-statement-caveat.md` §3-§4 before we
+/// touch the SQL execution path. fixedParams are substituted server-side
+/// into the params vector that is forwarded to the SQL service (audit P0
+/// finding 4) so row-pinning actually holds.
+fn enforce_constrained_profile(
+    caveat: &tinycloud_core::policy_capability::SqlConstrainedStatementCaveat,
+    request: SqlRequest,
+) -> Result<SqlRequest, (Status, String)> {
+    use tinycloud_core::policy_capability::sql_caveat;
+    use tinycloud_core::sql::SqlValue;
+
+    match request {
+        SqlRequest::Query { .. } => Err((
+            Status::Forbidden,
+            sql_caveat::InvocationReject::SqlRawQueryBlocked
+                .as_str()
+                .to_string(),
+        )),
+        SqlRequest::Execute { .. } => Err((
+            Status::Forbidden,
+            sql_caveat::InvocationReject::SqlRawExecuteBlocked
+                .as_str()
+                .to_string(),
+        )),
+        SqlRequest::Batch { .. } => Err((
+            Status::Forbidden,
+            sql_caveat::InvocationReject::SqlBatchBlocked
+                .as_str()
+                .to_string(),
+        )),
+        SqlRequest::Export => Err((
+            Status::Forbidden,
+            sql_caveat::InvocationReject::SqlExportBlocked
+                .as_str()
+                .to_string(),
+        )),
+        SqlRequest::ExecuteStatement { name, params } => {
+            let stmt = caveat.statements.iter().find(|s| s.name == name).ok_or_else(|| {
+                (
+                    Status::Forbidden,
+                    sql_caveat::InvocationReject::SqlStatementNotAllowed
+                        .as_str()
+                        .to_string(),
+                )
+            })?;
+
+            // Bound SQL must be read-only (caveat-level safety net).
+            if sql_caveat::contains_write_keyword(&stmt.sql) {
+                return Err((
+                    Status::Forbidden,
+                    sql_caveat::InvocationReject::SqlWriteBlocked
+                        .as_str()
+                        .to_string(),
+                ));
+            }
+            if sql_caveat::is_multistatement(&stmt.sql) {
+                return Err((
+                    Status::Forbidden,
+                    sql_caveat::InvocationReject::SqlMultistatementBlocked
+                        .as_str()
+                        .to_string(),
+                ));
+            }
+
+            // Caller-supplied params: any index that the caveat pins MUST
+            // NOT be supplied. We then substitute the pinned value verbatim
+            // before forwarding to the SQL service so the bound SQL gets
+            // exactly the row-pin the delegation chain authorized
+            // (audit P0 finding 4).
+            for fp in &stmt.fixed_params {
+                if params.get(fp.index as usize).is_some() {
+                    return Err((
+                        Status::Forbidden,
+                        sql_caveat::InvocationReject::SqlFixedParamOverride
+                            .as_str()
+                            .to_string(),
+                    ));
+                }
+            }
+
+            // Non-fixed bind values must be primitive JSON; reject
+            // identifier/string escape attempts before binding.
+            for (i, p) in params.iter().enumerate() {
+                if stmt.fixed_params.iter().any(|fp| fp.index as usize == i) {
+                    continue;
+                }
+                match p {
+                    SqlValue::Text(s) => {
+                        if sql_caveat::looks_like_escape(s) {
+                            return Err((
+                                Status::Forbidden,
+                                sql_caveat::InvocationReject::SqlEscapeBlocked
+                                    .as_str()
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    SqlValue::Null
+                    | SqlValue::Integer(_)
+                    | SqlValue::Real(_) => {}
+                    SqlValue::Blob(_) => {
+                        return Err((
+                            Status::Forbidden,
+                            sql_caveat::InvocationReject::SqlNonPrimitiveBind
+                                .as_str()
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+
+            // Substitute fixedParams into the params vector. Indices that
+            // the caveat pins are inserted with the pinned JSON value
+            // converted to `SqlValue`; absent intermediate slots are
+            // padded with NULL so caller indices keep their positions.
+            let substituted = substitute_fixed_params(&stmt.fixed_params, params)?;
+
+            Ok(SqlRequest::ExecuteStatement {
+                name,
+                params: substituted,
+            })
+        }
+    }
+}
+
+/// W1 (D): merge caller-supplied params with caveat-pinned `fixedParams`.
+/// Pinned indices win; absent intermediate slots are padded with NULL so
+/// non-fixed positional binds stay aligned with the bound SQL.
+fn substitute_fixed_params(
+    fixed: &[tinycloud_core::policy_capability::sql_caveat::FixedParam],
+    caller: Vec<tinycloud_core::sql::SqlValue>,
+) -> Result<Vec<tinycloud_core::sql::SqlValue>, (Status, String)> {
+    use tinycloud_core::policy_capability::sql_caveat;
+    use tinycloud_core::sql::SqlValue;
+
+    let max_caller = caller.len();
+    let max_fixed = fixed
+        .iter()
+        .map(|fp| fp.index)
+        .max()
+        .map(|m| (m as usize) + 1)
+        .unwrap_or(0);
+    let len = max_caller.max(max_fixed);
+
+    let mut out: Vec<SqlValue> = Vec::with_capacity(len);
+    for i in 0..len {
+        if let Some(fp) = fixed.iter().find(|fp| fp.index as usize == i) {
+            out.push(json_to_sql_value(&fp.value).map_err(|code| {
+                (
+                    Status::Forbidden,
+                    sql_caveat::InvocationReject::SqlNonPrimitiveBind
+                        .as_str()
+                        .to_string()
+                        .replace("sql-non-primitive-bind", code),
+                )
+            })?);
+        } else if let Some(v) = caller.get(i) {
+            out.push(v.clone());
+        } else {
+            out.push(SqlValue::Null);
+        }
+    }
+    Ok(out)
+}
+
+fn json_to_sql_value(
+    v: &serde_json::Value,
+) -> Result<tinycloud_core::sql::SqlValue, &'static str> {
+    use tinycloud_core::sql::SqlValue;
+    match v {
+        serde_json::Value::Null => Ok(SqlValue::Null),
+        serde_json::Value::Bool(b) => Ok(SqlValue::Integer(*b as i64)),
+        serde_json::Value::String(s) => Ok(SqlValue::Text(s.clone())),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(SqlValue::Integer(i))
+            } else if let Some(f) = n.as_f64() {
+                Ok(SqlValue::Real(f))
+            } else {
+                Err("sql-non-primitive-bind")
+            }
+        }
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            Err("sql-non-primitive-bind")
+        }
     }
 }
 
@@ -1765,6 +2126,7 @@ mod tests {
                 None,
             )),
             ability: Ability::try_from("tinycloud.kv/put".to_string()).unwrap(),
+            caveats: Default::default(),
         }
     }
 
@@ -1777,6 +2139,7 @@ mod tests {
                 None,
             )),
             ability: Ability::try_from("tinycloud.sql/read".to_string()).unwrap(),
+            caveats: Default::default(),
         }
     }
 

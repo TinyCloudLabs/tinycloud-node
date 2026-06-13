@@ -1,5 +1,6 @@
-use crate::types::{Ability, Resource};
+use crate::types::{Ability, Caveats, Resource};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use time::OffsetDateTime;
 use tinycloud_auth::identity::principal_did;
 use tinycloud_auth::{
@@ -21,10 +22,16 @@ fn strip_fragment(did: &str) -> String {
     principal_did(did).unwrap_or_else(|_| did.split('#').next().unwrap_or(did).to_string())
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Capability {
     pub resource: Resource,
     pub ability: Ability,
+    /// UCAN-shaped caveats attached to this capability. Persisted with the
+    /// delegation row (W1 native contract requirement); MUST NOT be dropped
+    /// at save time. For UCAN delegations these come from the per-ability
+    /// caveat list; for SIWE-ReCap they default to empty.
+    #[serde(default)]
+    pub caveats: Caveats,
 }
 
 #[non_exhaustive]
@@ -38,16 +45,28 @@ pub enum CapExtractError {
     Cid(#[from] tinycloud_auth::ipld_core::cid::Error),
 }
 
-fn extract_ucan_caps<T>(caps: &UcanCapabilities<T>) -> Vec<Capability> {
+fn extract_ucan_caps<T: serde::Serialize>(caps: &UcanCapabilities<T>) -> Vec<Capability> {
     let mut capabilities = Vec::new();
 
     // Iterate over all capabilities in the Capabilities object
     for (resource_uri, abilities) in caps.abilities() {
-        for ability in abilities.keys() {
-            // Only process tinycloud capabilities, skip others
+        for (ability, caveat_collection) in abilities.iter() {
+            // UCAN caveats are an array of nota-bene maps. Re-encode the
+            // array into a single Caveats map keyed by stringified index
+            // (i.e. "0", "1", …) so it round-trips through our JSONB column.
+            // This is the W1 caveat-persistence requirement — without it,
+            // chain-derived caveats (esp. SQL constrained statements) are
+            // lost between save and invocation (revocation.md §2.5).
+            let mut bmap: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+            for (i, nb) in caveat_collection.as_ref().iter().enumerate() {
+                if let Ok(v) = serde_json::to_value(nb) {
+                    bmap.insert(i.to_string(), v);
+                }
+            }
             capabilities.push(Capability {
                 resource: resource_uri.into(),
                 ability: ability.clone().into(),
+                caveats: Caveats(bmap),
             });
         }
     }
@@ -66,6 +85,7 @@ fn extract_siwe_cap(c: SiweCap<()>) -> (Vec<Capability>, Vec<Cid>) {
                     .map(|ability| Capability {
                         resource: Resource::from(r.clone()),
                         ability: ability.into(),
+                        caveats: Caveats::default(),
                     })
                     .collect::<Vec<_>>()
             })
@@ -84,6 +104,51 @@ pub struct DelegationInfo {
     pub expiry: Option<OffsetDateTime>,
     pub not_before: Option<OffsetDateTime>,
     pub issued_at: Option<OffsetDateTime>,
+    /// Node-recognized delegation mode marker carried INSIDE the signed
+    /// delegation facts. "terminal" forbids redelegation (rejected as a
+    /// parent at validate time); "attenuable" allows redelegation under
+    /// containment. Defaults to attenuable when absent. See
+    /// policy-engine/spec/revocation.md §1 + §2.1.
+    pub delegation_mode: DelegationMode,
+}
+
+/// W1 delegation mode marker. Carried in the signed UCAN delegation's
+/// `facts` array under the key `xyz.tinycloud.policy/delegationMode`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DelegationMode {
+    Attenuable,
+    Terminal,
+}
+
+impl DelegationMode {
+    pub const FACT_KEY: &'static str = "xyz.tinycloud.policy/delegationMode";
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Attenuable => "attenuable",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+/// Read the delegation mode marker from a UCAN facts array. Returns
+/// Attenuable when no marker is present.
+fn read_delegation_mode_from_ucan_facts(
+    facts: Option<&Vec<serde_json::Value>>,
+) -> DelegationMode {
+    let Some(facts) = facts else {
+        return DelegationMode::Attenuable;
+    };
+    for f in facts {
+        if let Some(obj) = f.as_object() {
+            if let Some(mode) = obj.get(DelegationMode::FACT_KEY).and_then(|v| v.as_str()) {
+                if mode == "terminal" {
+                    return DelegationMode::Terminal;
+                }
+            }
+        }
+    }
+    DelegationMode::Attenuable
 }
 
 impl DelegationInfo {
@@ -128,6 +193,9 @@ impl TryFrom<TinyCloudDelegation> for DelegationInfo {
                     )
                     .ok()
                 }),
+                delegation_mode: read_delegation_mode_from_ucan_facts(
+                    u.payload().facts.as_ref(),
+                ),
                 delegation: d,
                 issued_at: None,
             },
@@ -155,6 +223,9 @@ impl TryFrom<TinyCloudDelegation> for DelegationInfo {
                     expiry: c.payload().exp.as_ref().map(|t| *t.as_ref()),
                     not_before: c.payload().nbf.as_ref().map(|t| *t.as_ref()),
                     issued_at: Some(*c.payload().iat.as_ref()),
+                    // CACAO delegations do not currently carry the terminal
+                    // marker; only policy-engine-issued UCAN delegations do.
+                    delegation_mode: DelegationMode::Attenuable,
                     delegation: d,
                 }
             }
