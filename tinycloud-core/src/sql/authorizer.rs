@@ -215,7 +215,10 @@ pub fn create_authorizer(
         | AuthAction::CreateTempTrigger { .. }
         | AuthAction::DropTempTrigger { .. }
         | AuthAction::CreateTempView { .. }
-        | AuthAction::DropTempView { .. } => {
+        | AuthAction::DropTempView { .. }
+        // SQLite fires SQLITE_REINDEX while building an index; gate it like the
+        // CreateIndex it accompanies so an authorized CREATE INDEX can complete.
+        | AuthAction::Reindex { .. } => {
             if !is_admin && !matches!(ability.as_str(), "tinycloud.sql/write" | "tinycloud.sql/*") {
                 Authorization::Deny
             } else {
@@ -230,5 +233,146 @@ pub fn create_authorizer(
 
         // Deny everything else
         _ => Authorization::Deny,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn authorize(ability: &str, is_admin: bool, action: AuthAction<'_>) -> Authorization {
+        let mut auth = create_authorizer(None, ability.to_string(), is_admin);
+        auth(AuthContext {
+            action,
+            database_name: Some("main"),
+            accessor: None,
+        })
+    }
+
+    #[test]
+    fn create_index_allowed_with_write_ability() {
+        // CREATE [UNIQUE] INDEX fires CreateIndex followed by Reindex while the
+        // index is built; both must pass for the statement to succeed.
+        let create_index = AuthAction::CreateIndex {
+            index_name: "uq_interaction_nonce",
+            table_name: "interaction",
+        };
+        let reindex = AuthAction::Reindex {
+            index_name: "uq_interaction_nonce",
+        };
+
+        assert_eq!(
+            authorize("tinycloud.sql/write", false, create_index),
+            Authorization::Allow
+        );
+        assert_eq!(
+            authorize("tinycloud.sql/write", false, reindex),
+            Authorization::Allow
+        );
+    }
+
+    #[test]
+    fn create_index_allowed_for_admin() {
+        let create_index = AuthAction::CreateIndex {
+            index_name: "uq_interaction_nonce",
+            table_name: "interaction",
+        };
+        let reindex = AuthAction::Reindex {
+            index_name: "uq_interaction_nonce",
+        };
+
+        assert_eq!(
+            authorize("tinycloud.sql/read", true, create_index),
+            Authorization::Allow
+        );
+        assert_eq!(
+            authorize("tinycloud.sql/read", true, reindex),
+            Authorization::Allow
+        );
+    }
+
+    #[test]
+    fn create_index_denied_without_write() {
+        let create_index = AuthAction::CreateIndex {
+            index_name: "uq_interaction_nonce",
+            table_name: "interaction",
+        };
+        let reindex = AuthAction::Reindex {
+            index_name: "uq_interaction_nonce",
+        };
+
+        assert_eq!(
+            authorize("tinycloud.sql/read", false, create_index),
+            Authorization::Deny
+        );
+        // Reindex must be gated identically to CreateIndex: a read-only cap
+        // cannot sneak an index build through the companion callback.
+        assert_eq!(
+            authorize("tinycloud.sql/read", false, reindex),
+            Authorization::Deny
+        );
+    }
+
+    /// Install the authorizer on a real rusqlite connection (mirroring the
+    /// wiring in database.rs) and run `sql` under the given cap.
+    fn execute_under_authorizer(
+        conn: &rusqlite::Connection,
+        ability: &str,
+        is_admin: bool,
+        sql: &str,
+    ) -> rusqlite::Result<()> {
+        let auth = create_authorizer(None, ability.to_string(), is_admin);
+        conn.authorizer(Some(auth));
+        let result = conn.execute_batch(sql);
+        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        result
+    }
+
+    #[test]
+    fn create_unique_index_executes_with_write_cap() {
+        // End-to-end against real SQLite: the CreateIndex -> Reindex callback
+        // sequence fired while building the index must pass under a write cap.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        execute_under_authorizer(
+            &conn,
+            "tinycloud.sql/write",
+            false,
+            "CREATE TABLE interaction (reader_did TEXT, nonce TEXT)",
+        )
+        .unwrap();
+
+        execute_under_authorizer(
+            &conn,
+            "tinycloud.sql/write",
+            false,
+            "CREATE UNIQUE INDEX uq_interaction_nonce ON interaction (reader_did, nonce)",
+        )
+        .expect("CREATE UNIQUE INDEX should succeed with a write cap");
+    }
+
+    #[test]
+    fn create_unique_index_blocked_with_read_only_cap() {
+        // Set up the table with a write cap, then attempt the index under a
+        // read-only cap: SQLite must report "not authorized".
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        execute_under_authorizer(
+            &conn,
+            "tinycloud.sql/write",
+            false,
+            "CREATE TABLE interaction (reader_did TEXT, nonce TEXT)",
+        )
+        .unwrap();
+
+        let err = execute_under_authorizer(
+            &conn,
+            "tinycloud.sql/read",
+            false,
+            "CREATE UNIQUE INDEX uq_interaction_nonce ON interaction (reader_did, nonce)",
+        )
+        .expect_err("CREATE UNIQUE INDEX must be denied for a read-only cap");
+        assert!(
+            err.to_string().contains("not authorized"),
+            "expected an authorization error, got: {err}"
+        );
     }
 }
