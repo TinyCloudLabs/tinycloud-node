@@ -312,4 +312,67 @@ mod tests {
             Authorization::Deny
         );
     }
+
+    /// Install the authorizer on a real rusqlite connection (mirroring the
+    /// wiring in database.rs) and run `sql` under the given cap.
+    fn execute_under_authorizer(
+        conn: &rusqlite::Connection,
+        ability: &str,
+        is_admin: bool,
+        sql: &str,
+    ) -> rusqlite::Result<()> {
+        let auth = create_authorizer(None, ability.to_string(), is_admin);
+        conn.authorizer(Some(auth));
+        let result = conn.execute_batch(sql);
+        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        result
+    }
+
+    #[test]
+    fn create_unique_index_executes_with_write_cap() {
+        // End-to-end against real SQLite: the CreateIndex -> Reindex callback
+        // sequence fired while building the index must pass under a write cap.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        execute_under_authorizer(
+            &conn,
+            "tinycloud.sql/write",
+            false,
+            "CREATE TABLE interaction (reader_did TEXT, nonce TEXT)",
+        )
+        .unwrap();
+
+        execute_under_authorizer(
+            &conn,
+            "tinycloud.sql/write",
+            false,
+            "CREATE UNIQUE INDEX uq_interaction_nonce ON interaction (reader_did, nonce)",
+        )
+        .expect("CREATE UNIQUE INDEX should succeed with a write cap");
+    }
+
+    #[test]
+    fn create_unique_index_blocked_with_read_only_cap() {
+        // Set up the table with a write cap, then attempt the index under a
+        // read-only cap: SQLite must report "not authorized".
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        execute_under_authorizer(
+            &conn,
+            "tinycloud.sql/write",
+            false,
+            "CREATE TABLE interaction (reader_did TEXT, nonce TEXT)",
+        )
+        .unwrap();
+
+        let err = execute_under_authorizer(
+            &conn,
+            "tinycloud.sql/read",
+            false,
+            "CREATE UNIQUE INDEX uq_interaction_nonce ON interaction (reader_did, nonce)",
+        )
+        .expect_err("CREATE UNIQUE INDEX must be denied for a read-only cap");
+        assert!(
+            err.to_string().contains("not authorized"),
+            "expected an authorization error, got: {err}"
+        );
+    }
 }
