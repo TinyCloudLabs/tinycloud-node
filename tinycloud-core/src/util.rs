@@ -296,6 +296,36 @@ impl TryFrom<TinyCloudRevocation> for RevocationInfo {
                 }),
                 _ => Err(RevocationError::InvalidTarget),
             },
+            // W1 (audit P0 finding 5): UCAN-format revocation. We resolve
+            // the revoked target by walking the payload's attenuation map
+            // for an explicit `urn:cid:<cid>` resource, falling back to
+            // the first proof CID. Any did:key principal that signs the
+            // UCAN is the candidate revoker; the authorization check in
+            // `models/revocation::process` rejects non-owner / non-
+            // delegator signers.
+            TinyCloudRevocation::Ucan(ref u) => {
+                let payload = u.payload();
+                let mut explicit: Option<Cid> = None;
+                for (resource, _) in payload.attenuation.abilities() {
+                    let s = resource.to_string();
+                    if let Some(cid_str) = s.strip_prefix("urn:cid:") {
+                        if let Ok(cid) = cid_str.parse::<Cid>() {
+                            explicit = Some(cid);
+                            break;
+                        }
+                    }
+                }
+                let revoked = explicit
+                    .or_else(|| payload.proof.first().copied())
+                    .ok_or(RevocationError::InvalidTarget)?;
+                let revoker = strip_fragment(&payload.issuer.to_string());
+                Ok(Self {
+                    parents: payload.proof.clone(),
+                    revoked,
+                    revoker,
+                    revocation: r,
+                })
+            }
         }
     }
 }

@@ -44,6 +44,10 @@ x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 hex.workspace = true
 base64.workspace = true
 sha2 = "0.10"
+# W1 (audit P1): full Unicode NFC normalization for policy capability path
+# canonicalization. Replaces the hand-coded subset that only composed a
+# narrow Latin precomposed-pair table.
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 sea-orm = { version = "1.1", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }

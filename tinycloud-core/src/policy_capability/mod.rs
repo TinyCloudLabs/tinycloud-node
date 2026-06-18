@@ -288,64 +288,15 @@ fn percent_decode_unreserved(s: &str) -> String {
     out
 }
 
-/// Tiny NFC normalizer implementing the subset of Unicode NFC needed for
-/// path canonicalization in v0 (canonical composition of base+combining).
-///
-/// We avoid pulling in unicode-normalization as a workspace dep; the only
-/// case the v0 vectors exercise is base + combining acute (U+0301) →
-/// precomposed (e.g. "é" / U+00E9). This implementation walks scalar values,
-/// composes precomposed Latin-1 + Latin Extended pairs we care about, and
-/// passes everything else through unchanged. Adding more canonical
-/// compositions is a deliberate scope expansion.
+/// Full Unicode NFC normalization (W1 audit P1). Delegates to
+/// `unicode-normalization`, which implements UAX #15 — the prior hand-coded
+/// subset only covered a narrow precomposed-pair table and could not
+/// canonicalize arbitrary base+combining sequences. We want path
+/// canonicalization to be spec-sound; this also makes the JCS caveat-side
+/// containment robust against attacker-supplied glyph alternates.
 fn unicode_normalize_nfc(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let mut out = String::with_capacity(s.len());
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        let next = chars.get(i + 1).copied();
-        if let Some(n) = next {
-            if let Some(composed) = compose_pair(c, n) {
-                out.push(composed);
-                i += 2;
-                continue;
-            }
-        }
-        out.push(c);
-        i += 1;
-    }
-    out
-}
-
-fn compose_pair(base: char, combining: char) -> Option<char> {
-    match (base, combining) {
-        // Combining acute U+0301
-        ('a', '\u{0301}') => Some('á'),
-        ('e', '\u{0301}') => Some('é'),
-        ('i', '\u{0301}') => Some('í'),
-        ('o', '\u{0301}') => Some('ó'),
-        ('u', '\u{0301}') => Some('ú'),
-        ('y', '\u{0301}') => Some('ý'),
-        ('A', '\u{0301}') => Some('Á'),
-        ('E', '\u{0301}') => Some('É'),
-        ('I', '\u{0301}') => Some('Í'),
-        ('O', '\u{0301}') => Some('Ó'),
-        ('U', '\u{0301}') => Some('Ú'),
-        ('Y', '\u{0301}') => Some('Ý'),
-        // Combining grave U+0300
-        ('a', '\u{0300}') => Some('à'),
-        ('e', '\u{0300}') => Some('è'),
-        ('i', '\u{0300}') => Some('ì'),
-        ('o', '\u{0300}') => Some('ò'),
-        ('u', '\u{0300}') => Some('ù'),
-        // Combining diaeresis U+0308
-        ('a', '\u{0308}') => Some('ä'),
-        ('e', '\u{0308}') => Some('ë'),
-        ('i', '\u{0308}') => Some('ï'),
-        ('o', '\u{0308}') => Some('ö'),
-        ('u', '\u{0308}') => Some('ü'),
-        _ => None,
-    }
+    use unicode_normalization::UnicodeNormalization;
+    s.nfc().collect()
 }
 
 impl PolicyCapability {
