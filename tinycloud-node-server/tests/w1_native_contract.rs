@@ -20,12 +20,10 @@ use serde_json::Value;
 use tinycloud_core::policy_capability::{parse, sql_caveat, SqlConstrainedStatementCaveat};
 use tinycloud_core::sql::SqlRequest;
 
-const REJECT_VECTORS: &str = include_str!(
-    "../../../policy-engine/test-vectors/sql-caveat/reject.json"
-);
-const ACCEPT_VECTORS: &str = include_str!(
-    "../../../policy-engine/test-vectors/sql-caveat/accept.json"
-);
+const REJECT_VECTORS: &str =
+    include_str!("../../../policy-engine/test-vectors/sql-caveat/reject.json");
+const ACCEPT_VECTORS: &str =
+    include_str!("../../../policy-engine/test-vectors/sql-caveat/accept.json");
 
 #[derive(Deserialize)]
 struct RejectFile {
@@ -149,9 +147,7 @@ fn invocation_to_sql_request(value: &Value) -> Option<SqlRequest> {
                 let v = v.unwrap_or(Value::Null);
                 match v {
                     Value::Null => sqls.push(tinycloud_core::sql::SqlValue::Null),
-                    Value::Bool(b) => {
-                        sqls.push(tinycloud_core::sql::SqlValue::Integer(b as i64))
-                    }
+                    Value::Bool(b) => sqls.push(tinycloud_core::sql::SqlValue::Integer(b as i64)),
                     Value::Number(n) => {
                         if let Some(i) = n.as_i64() {
                             sqls.push(tinycloud_core::sql::SqlValue::Integer(i));
@@ -165,10 +161,7 @@ fn invocation_to_sql_request(value: &Value) -> Option<SqlRequest> {
                     }
                 }
             }
-            Some(SqlRequest::ExecuteStatement {
-                name,
-                params: sqls,
-            })
+            Some(SqlRequest::ExecuteStatement { name, params: sqls })
         }
         _ => None,
     }
@@ -197,12 +190,10 @@ fn w0_sql_invocation_reject_vectors_enforced() {
             .get("caveats")
             .cloned()
             .expect("auth_capability must carry caveats for invocation cases");
-        let caveat = sql_caveat::parse(&caveat_value).unwrap_or_else(|e| {
-            panic!("failed to parse caveat in case {}: {:?}", case.case, e)
-        });
+        let caveat = sql_caveat::parse(&caveat_value)
+            .unwrap_or_else(|e| panic!("failed to parse caveat in case {}: {:?}", case.case, e));
 
-        let Some(req) = case.invocation.as_ref().and_then(invocation_to_sql_request)
-        else {
+        let Some(req) = case.invocation.as_ref().and_then(invocation_to_sql_request) else {
             continue; // capability-only case
         };
         let err = enforce(&caveat, req).expect_err(&case.case);
@@ -219,13 +210,16 @@ fn w0_sql_invocation_accept_vectors_enforced() {
             .get("caveats")
             .cloned()
             .expect("auth_capability must carry caveats for accept cases");
-        let caveat = sql_caveat::parse(&caveat_value).unwrap_or_else(|e| {
-            panic!("failed to parse caveat in case {}: {:?}", case.case, e)
-        });
+        let caveat = sql_caveat::parse(&caveat_value)
+            .unwrap_or_else(|e| panic!("failed to parse caveat in case {}: {:?}", case.case, e));
         let req = invocation_to_sql_request(&case.invocation)
             .unwrap_or_else(|| panic!("could not convert invocation for {}", case.case));
         let _accepted = enforce(&caveat, req).unwrap_or_else(|e| {
-            panic!("accept case {} should pass enforcement: {:?}", case.case, e.as_str())
+            panic!(
+                "accept case {} should pass enforcement: {:?}",
+                case.case,
+                e.as_str()
+            )
         });
     }
 }
@@ -389,76 +383,124 @@ fn w0_native_read_denial_vector_parses_and_carries_codes() {
 }
 
 /// W1 architectural assertion: the `/invoke` data plane MUST NOT depend on
-/// policy evaluation or VC verification. We assert that `tinycloud-core`
-/// does NOT depend on `tinycloud-policy-engine` or any VC crate by both
-/// (a) scanning the workspace `Cargo.lock` and
-/// (b) shelling out to `cargo metadata` to compute the *resolved* dependency
-///     closure of the `tinycloud-core` crate. The combination is what makes
-///     this meaningful per audit P2: a string match in `Cargo.lock` alone
-///     would miss a transitive pull-in via aliasing, while a metadata-based
-///     closure walk reflects what cargo actually links.
+/// policy evaluation or VC verification. This walks the `cargo metadata`
+/// resolved dependency graph from the data-plane crates and checks both
+/// package names and renamed dependency aliases, so a transitive or aliased
+/// pull-in cannot hide behind a shallow workspace/package scan.
 #[test]
 fn data_plane_has_zero_policy_dependency() {
-    let banned = [
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+    fn normalize(name: &str) -> String {
+        name.replace('-', "_")
+    }
+
+    let banned: BTreeSet<&str> = [
         "tinycloud_policy_engine",
         "tinycloud_policy_core",
         "policy_evidence_vc",
         "opencredentials_verify",
-        "tinycloud-policy-engine",
-        "tinycloud-policy-core",
-        "policy-evidence-vc",
-        "opencredentials-verify",
-    ];
+    ]
+    .into_iter()
+    .collect();
 
     // (a) Cargo.lock string scan (cheap front-line check).
     let cargo_lock = include_str!("../../Cargo.lock");
-    for crate_name in banned {
+    for crate_name in &banned {
         assert!(
             !cargo_lock.contains(&format!("name = \"{crate_name}\"")),
             "data plane MUST NOT link {crate_name}"
         );
+        assert!(
+            !cargo_lock.contains(&format!("name = \"{}\"", crate_name.replace('_', "-"))),
+            "data plane MUST NOT link {crate_name}"
+        );
     }
 
-    // (b) cargo metadata-driven dependency walk: collect every crate the
-    // node-server (the binary that exposes /invoke) and tinycloud-core
-    // (the data-plane library) reach in their resolved graph and confirm
-    // none of them are policy/VC verifiers. This is meaningful even if
-    // the Cargo.lock string check passes — it catches renamed pulls and
-    // graph-only dependencies the lock file does not surface as a top
-    // level "name = " line.
+    // (b) cargo metadata-driven dependency walk. No `--no-deps`, no fallback:
+    // if Cargo cannot describe the resolved graph, this proof is absent.
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("Cargo.toml");
     let output = std::process::Command::new(env!("CARGO"))
-        .args([
-            "metadata",
-            "--format-version",
-            "1",
-            "--no-deps",
-            "--manifest-path",
-        ])
+        .args(["metadata", "--format-version", "1", "--manifest-path"])
         .arg(&manifest)
-        .output();
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        // In sandboxed test envs cargo metadata might not be available; do
-        // not regress the assertion — fall back to (a) above.
-        _ => return,
-    };
+        .output()
+        .expect("cargo metadata must run");
+    assert!(
+        output.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let metadata: Value = serde_json::from_slice(&output.stdout).expect("metadata json");
-    let workspace_names: Vec<String> = metadata["packages"]
+
+    let mut package_names = BTreeMap::<String, String>::new();
+    let mut roots = Vec::new();
+    for package in metadata["packages"]
         .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|p| p["name"].as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-    for banned_name in banned {
+        .expect("metadata packages must be an array")
+    {
+        let id = package["id"].as_str().expect("package id").to_string();
+        let name = package["name"].as_str().expect("package name").to_string();
+        if matches!(name.as_str(), "tinycloud-node" | "tinycloud-core") {
+            roots.push(id.clone());
+        }
+        package_names.insert(id, name);
+    }
+    assert_eq!(
+        roots.len(),
+        2,
+        "expected roots for tinycloud-node and tinycloud-core"
+    );
+
+    let mut normal_edges = BTreeMap::<String, Vec<(String, String)>>::new();
+    for node in metadata["resolve"]["nodes"]
+        .as_array()
+        .expect("metadata resolve.nodes must be an array")
+    {
+        let id = node["id"].as_str().expect("node id").to_string();
+        let deps = node["deps"]
+            .as_array()
+            .expect("metadata node.deps must be an array")
+            .iter()
+            .filter_map(|dep| {
+                let is_normal = dep["dep_kinds"]
+                    .as_array()
+                    .expect("dep_kinds must be an array")
+                    .iter()
+                    .any(|kind| kind["kind"].is_null());
+                is_normal.then(|| {
+                    (
+                        dep["pkg"].as_str().expect("dep pkg").to_string(),
+                        dep["name"].as_str().expect("dep name").to_string(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        normal_edges.insert(id, deps);
+    }
+
+    let mut seen = BTreeSet::<String>::new();
+    let mut queue = VecDeque::from(roots);
+    while let Some(id) = queue.pop_front() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+
+        let package_name = package_names
+            .get(&id)
+            .unwrap_or_else(|| panic!("missing package name for {id}"));
         assert!(
-            !workspace_names.iter().any(|n| n == banned_name),
-            "workspace MUST NOT contain {banned_name}"
+            !banned.contains(normalize(package_name).as_str()),
+            "data-plane dependency closure MUST NOT include package {package_name}"
         );
+        for (dep_id, edge_name) in normal_edges.get(&id).into_iter().flatten() {
+            assert!(
+                !banned.contains(normalize(edge_name).as_str()),
+                "data-plane dependency closure MUST NOT include renamed dependency alias {edge_name}"
+            );
+            queue.push_back(dep_id.clone());
+        }
     }
 }
 

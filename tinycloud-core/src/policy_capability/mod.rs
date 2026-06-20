@@ -591,6 +591,7 @@ mod tests {
     }
 
     #[derive(Deserialize)]
+    #[allow(dead_code)]
     struct SqlRejectCase {
         case: String,
         auth_capability: Value,
