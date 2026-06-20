@@ -70,9 +70,6 @@ path = "../tinycloud-auth/"
 [dev-dependencies]
 bs58 = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
-ed25519-dalek = "2"
-policy-core = { git = "https://github.com/TinyCloudLabs/policy-engine", branch = "skgbafa/policy-engine-v0-w5-runtime", package = "policy-core" }
-policy-runtime = { git = "https://github.com/TinyCloudLabs/policy-engine", branch = "skgbafa/policy-engine-v0-w5-runtime", package = "policy-runtime", default-features = false }
 
 [features]
 default = []
