@@ -38,9 +38,9 @@ use routes::{
         well_known_network as encryption_well_known,
     },
     hooks::{create_hook_ticket, create_webhook, delete_webhook, hook_events, list_webhooks},
-    info, invoke, open_host_key, revoke,
+    info, invoke, open_host_key,
     public::{public_kv_get, public_kv_head, public_kv_list, public_kv_options, RateLimiter},
-    signed_kv_get,
+    revoke, signed_kv_get,
     util_routes::*,
     version,
 };

@@ -3,8 +3,7 @@ use crate::hash::{hash, Hash};
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, ConnectionTrait};
 use time::OffsetDateTime;
 use tinycloud_auth::{
-    authorization::TinyCloudRevocation, identity::did_principal_matches,
-    ssi::dids::AnyDidMethod,
+    authorization::TinyCloudRevocation, identity::did_principal_matches, ssi::dids::AnyDidMethod,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]

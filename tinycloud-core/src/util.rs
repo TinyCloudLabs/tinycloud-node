@@ -133,9 +133,7 @@ impl DelegationMode {
 
 /// Read the delegation mode marker from a UCAN facts array. Returns
 /// Attenuable when no marker is present.
-fn read_delegation_mode_from_ucan_facts(
-    facts: Option<&Vec<serde_json::Value>>,
-) -> DelegationMode {
+fn read_delegation_mode_from_ucan_facts(facts: Option<&Vec<serde_json::Value>>) -> DelegationMode {
     let Some(facts) = facts else {
         return DelegationMode::Attenuable;
     };
@@ -193,9 +191,7 @@ impl TryFrom<TinyCloudDelegation> for DelegationInfo {
                     )
                     .ok()
                 }),
-                delegation_mode: read_delegation_mode_from_ucan_facts(
-                    u.payload().facts.as_ref(),
-                ),
+                delegation_mode: read_delegation_mode_from_ucan_facts(u.payload().facts.as_ref()),
                 delegation: d,
                 issued_at: None,
             },

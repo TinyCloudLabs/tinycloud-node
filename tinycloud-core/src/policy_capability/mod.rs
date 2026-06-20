@@ -270,11 +270,8 @@ fn percent_decode_unreserved(s: &str) -> String {
             if let (Some(hi), Some(lo)) = (hi, lo) {
                 let c = (hi << 4) | lo;
                 // Unreserved per RFC 3986: ALPHA / DIGIT / - / . / _ / ~
-                let is_unreserved = c.is_ascii_alphanumeric()
-                    || c == b'-'
-                    || c == b'.'
-                    || c == b'_'
-                    || c == b'~';
+                let is_unreserved =
+                    c.is_ascii_alphanumeric() || c == b'-' || c == b'.' || c == b'_' || c == b'~';
                 if is_unreserved {
                     out.push(c as char);
                     i += 3;
@@ -443,9 +440,8 @@ mod tests {
     fn w0_capability_canonicalization_and_hash_match() {
         let file: CanonFile = serde_json::from_str(CANON_VECTORS).unwrap();
         for v in file.vectors {
-            let parsed = parse(&v.input).unwrap_or_else(|e| {
-                panic!("vector {} should parse but rejected: {:?}", v.name, e)
-            });
+            let parsed = parse(&v.input)
+                .unwrap_or_else(|e| panic!("vector {} should parse but rejected: {:?}", v.name, e));
             let canon = parsed.canonical_bytes();
             assert_eq!(
                 hex_encode(&canon),
@@ -489,10 +485,9 @@ mod tests {
                         .unwrap_or_else(|e| panic!("{} should be contained: {:?}", v.name, e));
                 }
                 (Ok(a), Ok(r), false) => {
-                    let err = a.contains(&r).expect_err(&format!(
-                        "{} should NOT be contained but was",
-                        v.name
-                    ));
+                    let err = a
+                        .contains(&r)
+                        .expect_err(&format!("{} should NOT be contained but was", v.name));
                     if let Some(code) = v.rejection_code {
                         assert_eq!(err.as_str(), code, "code mismatch for {}", v.name);
                     }
@@ -531,8 +526,7 @@ mod tests {
     fn w0_capability_rejections_match_codes() {
         let file: RejectionFile = serde_json::from_str(REJECTION_VECTORS).unwrap();
         for v in file.vectors {
-            let err = parse(&v.input)
-                .expect_err(&format!("vector {} must be rejected", v.name));
+            let err = parse(&v.input).expect_err(&format!("vector {} must be rejected", v.name));
             assert_eq!(
                 err.as_str(),
                 v.rejection_code,
@@ -569,10 +563,8 @@ mod tests {
                         .unwrap_or_else(|e| panic!("{} should be contained: {:?}", v.name, e));
                 }
                 (Ok(a), Ok(r), false) => {
-                    let err = sql_caveat::contains(&a, &r).expect_err(&format!(
-                        "{} should NOT be contained",
-                        v.name
-                    ));
+                    let err = sql_caveat::contains(&a, &r)
+                        .expect_err(&format!("{} should NOT be contained", v.name));
                     if let Some(code) = v.rejection_code {
                         assert_eq!(err.as_str(), code, "code mismatch for {}", v.name);
                     }
@@ -612,7 +604,10 @@ mod tests {
         // enforcement is verified separately in the SQL service tests.
         let file: SqlRejectFile = serde_json::from_str(SQL_REJECT_VECTORS).unwrap();
         for case in file.cases {
-            if case.case.contains("write-keyword-in-bound-sql-rejects-caveat") {
+            if case
+                .case
+                .contains("write-keyword-in-bound-sql-rejects-caveat")
+            {
                 let err = parse(&case.auth_capability).expect_err(&case.case);
                 assert_eq!(err.as_str(), "sql-write-blocked");
             }

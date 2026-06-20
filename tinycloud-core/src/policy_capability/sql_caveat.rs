@@ -153,11 +153,7 @@ pub fn contains(
         }
         // Every auth fixedParam must be present in req with same value.
         for ap in &auth_stmt.fixed_params {
-            match req_stmt
-                .fixed_params
-                .iter()
-                .find(|rp| rp.index == ap.index)
-            {
+            match req_stmt.fixed_params.iter().find(|rp| rp.index == ap.index) {
                 None => return Err(RejectionCode::ContainmentSqlFixedParamDropped),
                 Some(rp) => {
                     if rp.value != ap.value {

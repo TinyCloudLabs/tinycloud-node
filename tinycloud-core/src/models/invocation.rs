@@ -179,7 +179,9 @@ async fn validate<C: ConnectionTrait>(
             // (revocation.md §2.3).
             for (p, _) in &parents {
                 if is_revoked(db, &p.id).await? {
-                    return Err(InvocationError::DelegationRevoked(p.id.to_cid(0x55).to_string()).into());
+                    return Err(
+                        InvocationError::DelegationRevoked(p.id.to_cid(0x55).to_string()).into(),
+                    );
                 }
                 if let Some(ancestor_cid) = first_revoked_ancestor(db, &p.id).await? {
                     return Err(InvocationError::DelegationAncestorRevoked {
@@ -253,8 +255,7 @@ fn caveats_contain_child(parent: &Caveats, child: &Caveats) -> Result<(), String
     let child_sql = extract_sql_caveat(child);
 
     match (parent_sql, child_sql) {
-        (Some(p), Some(c)) => sql_caveat::contains(&p, &c)
-            .map_err(|e| e.as_str().to_string()),
+        (Some(p), Some(c)) => sql_caveat::contains(&p, &c).map_err(|e| e.as_str().to_string()),
         (Some(_), None) => Err("containment-caveat-required".to_string()),
         (None, _) => {
             if parent.0 == child.0
@@ -695,13 +696,11 @@ mod tests {
             Caveats(map)
         };
 
-        caveats_contain_child(&parent, &child_same)
-            .expect("identical caveat must be contained");
+        caveats_contain_child(&parent, &child_same).expect("identical caveat must be contained");
         let err = caveats_contain_child(&parent, &child_different_sql)
             .expect_err("changing bound SQL must be rejected");
         assert!(
-            err == "containment-sql-statement-added"
-                || err == "child-caveats-not-subset-of-parent",
+            err == "containment-sql-statement-added" || err == "child-caveats-not-subset-of-parent",
             "unexpected reason: {err}",
         );
         caveats_contain_child(&parent, &child_added_stmt)

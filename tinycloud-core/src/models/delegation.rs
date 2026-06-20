@@ -321,8 +321,7 @@ fn caveats_contain_child(parent: &Caveats, child: &Caveats) -> Result<(), String
     let child_sql = extract_sql_caveat(child);
 
     match (parent_sql, child_sql) {
-        (Some(p), Some(c)) => sql_caveat::contains(&p, &c)
-            .map_err(|e| e.as_str().to_string()),
+        (Some(p), Some(c)) => sql_caveat::contains(&p, &c).map_err(|e| e.as_str().to_string()),
         (Some(_), None) => Err("containment-caveat-required".to_string()),
         (None, _) => {
             // No SQL caveat on the parent — fall back to structural equality
