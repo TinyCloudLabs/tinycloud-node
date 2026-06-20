@@ -273,7 +273,7 @@ fn caveats_contain_child(parent: &Caveats, child: &Caveats) -> Result<(), String
 fn extract_sql_caveat(
     caveats: &Caveats,
 ) -> Option<crate::policy_capability::SqlConstrainedStatementCaveat> {
-    for (_idx, v) in &caveats.0 {
+    for v in caveats.0.values() {
         if let Ok(c) = sql_caveat::parse(v) {
             return Some(c);
         }

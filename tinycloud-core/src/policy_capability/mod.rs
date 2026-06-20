@@ -189,7 +189,7 @@ pub fn parse(input: &Value) -> Result<PolicyCapability, RejectionCode> {
         if !s.contains('/') {
             return Err(RejectionCode::PolicyCapabilityMalformedActionShortname);
         }
-        if !accepted.iter().any(|x| *x == s) {
+        if !accepted.contains(&s) {
             return Err(RejectionCode::PolicyCapabilityMalformedAction);
         }
         actions.push(s.to_string());

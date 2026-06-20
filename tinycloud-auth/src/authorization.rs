@@ -84,7 +84,7 @@ impl HeaderEncode for TinyCloudInvocation {
 
 #[derive(Debug, Clone)]
 pub enum TinyCloudRevocation {
-    Cacao(SiweCacao),
+    Cacao(Box<SiweCacao>),
     /// W1 (audit P0 finding 5): did:key/UCAN-format revocation. Issued by a
     /// Grant Issuer or other did:key principal authorized to revoke. The
     /// UCAN payload's `attenuation` MUST cite the revoked delegation CID
@@ -110,7 +110,10 @@ impl HeaderEncode for TinyCloudRevocation {
         } else {
             // Use the imported engine and trait method
             let v = URL_SAFE.decode(s)?;
-            Ok((Self::Cacao(serde_ipld_dagcbor::from_slice(&v)?), v))
+            Ok((
+                Self::Cacao(Box::new(serde_ipld_dagcbor::from_slice(&v)?)),
+                v,
+            ))
         }
     }
 }

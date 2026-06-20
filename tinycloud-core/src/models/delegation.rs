@@ -332,8 +332,6 @@ fn caveats_contain_child(parent: &Caveats, child: &Caveats) -> Result<(), String
             // match an existing parent constraint, so we require equality.
             if parent.0 == child.0 {
                 Ok(())
-            } else if parent.0.is_empty() && child.0.is_empty() {
-                Ok(())
             } else if parent.0.is_empty() {
                 // Parent imposed no restrictions; children may introduce
                 // narrowing caveats only when those caveats are themselves
@@ -351,7 +349,7 @@ fn caveats_contain_child(parent: &Caveats, child: &Caveats) -> Result<(), String
 fn extract_sql_caveat(
     caveats: &Caveats,
 ) -> Option<crate::policy_capability::SqlConstrainedStatementCaveat> {
-    for (_idx, v) in &caveats.0 {
+    for v in caveats.0.values() {
         if let Ok(c) = sql_caveat::parse(v) {
             return Some(c);
         }

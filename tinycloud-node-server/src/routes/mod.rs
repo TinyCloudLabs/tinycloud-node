@@ -1139,7 +1139,7 @@ async fn handle_sql_invoke(
     // path is a holdover (and is still consulted as a fallback so the
     // tinycloud.sql/write path keeps working) but a constrained-statements
     // caveat on the delegation chain MUST win and fail-closed.
-    let parent_cids: Vec<_> = i.0 .0.parents.iter().copied().collect();
+    let parent_cids: Vec<_> = i.0 .0.parents.to_vec();
     let chain_constrained = derive_chain_constrained_caveat(tinycloud, &parent_cids).await?;
 
     let facts_caveats: Option<SqlCaveats> =
@@ -1370,7 +1370,7 @@ async fn derive_chain_constrained_caveat_with_conn<C: tinycloud_core::sea_orm::C
             .await
             .map_err(|e| (Status::InternalServerError, e.to_string()))?;
         for row in rows {
-            for (_idx, v) in &row.caveats.0 {
+            for v in row.caveats.0.values() {
                 if let Ok(caveat) = sql_caveat::parse(v) {
                     return Ok(Some(caveat));
                 }

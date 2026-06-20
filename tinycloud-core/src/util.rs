@@ -302,7 +302,7 @@ impl TryFrom<TinyCloudRevocation> for RevocationInfo {
             TinyCloudRevocation::Ucan(ref u) => {
                 let payload = u.payload();
                 let mut explicit: Option<Cid> = None;
-                for (resource, _) in payload.attenuation.abilities() {
+                for resource in payload.attenuation.abilities().keys() {
                     let s = resource.to_string();
                     if let Some(cid_str) = s.strip_prefix("urn:cid:") {
                         if let Ok(cid) = cid_str.parse::<Cid>() {
