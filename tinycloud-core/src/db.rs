@@ -10,7 +10,7 @@ use crate::storage::{
     ImmutableStaging, ImmutableWriteStore, StorageSetup, StoreSize,
 };
 use crate::types::{CapabilitiesReadParams, ListFilters, Metadata, Resource, SpaceIdWrap};
-use crate::util::{Capability, DelegationInfo};
+use crate::util::{Capability, DelegationInfo, DelegationMode};
 use sea_orm::{
     entity::prelude::*,
     error::{DbErr, RuntimeErr, SqlxError},
@@ -1258,11 +1258,13 @@ async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                             expiry: del.expiry,
                             not_before: del.not_before,
                             issued_at: del.issued_at,
+                            delegation_mode: mode_from_facts(&del.facts),
                             capabilities: ability
                                 .into_iter()
                                 .map(|a| Capability {
                                     resource: a.resource,
                                     ability: a.ability,
+                                    caveats: a.caveats,
                                 })
                                 .collect(),
                             delegation,
@@ -1275,6 +1277,22 @@ async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             }
         })
         .collect::<Result<HashMap<Hash, DelegationInfo>, TxError<S, K>>>()
+}
+
+/// Decode the persisted `xyz.tinycloud.policy/delegationMode` marker from
+/// a stored delegation row's facts column.
+fn mode_from_facts(facts: &Option<crate::types::Facts>) -> DelegationMode {
+    facts
+        .as_ref()
+        .and_then(|f| f.0.get(DelegationMode::FACT_KEY).and_then(|v| v.as_str()))
+        .map(|s| {
+            if s == "terminal" {
+                DelegationMode::Terminal
+            } else {
+                DelegationMode::Attenuable
+            }
+        })
+        .unwrap_or(DelegationMode::Attenuable)
 }
 
 /// Resolve a session key DID (did:key:...) to its root PKH DID (did:pkh:...).
@@ -1427,11 +1445,13 @@ async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secret
                         expiry: del.expiry,
                         not_before: del.not_before,
                         issued_at: del.issued_at,
+                        delegation_mode: mode_from_facts(&del.facts),
                         capabilities: ability
                             .into_iter()
                             .map(|a| Capability {
                                 resource: a.resource,
                                 ability: a.ability,
+                                caveats: a.caveats,
                             })
                             .collect(),
                         delegation,
@@ -1509,11 +1529,13 @@ async fn get_delegation_chain<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             expiry: del.expiry,
             not_before: del.not_before,
             issued_at: del.issued_at,
+            delegation_mode: mode_from_facts(&del.facts),
             capabilities: ability
                 .into_iter()
                 .map(|a| Capability {
                     resource: a.resource,
                     ability: a.ability,
+                    caveats: a.caveats,
                 })
                 .collect(),
             delegation,

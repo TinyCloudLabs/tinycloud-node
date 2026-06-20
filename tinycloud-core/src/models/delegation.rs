@@ -1,9 +1,12 @@
 use crate::encryption::ColumnEncryption;
 use crate::encryption_network::NetworkId;
 use crate::hash::Hash;
-use crate::types::{Ability, Facts, Resource};
+use crate::policy_capability::sql_caveat;
+use crate::types::{Ability, Caveats, Facts, Resource};
+use crate::util::DelegationMode;
 use crate::{events::Delegation, models::*, relationships::*, util};
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, ConnectionTrait};
+use std::collections::BTreeMap;
 use time::OffsetDateTime;
 use tinycloud_auth::{
     authorization::TinyCloudDelegation, identity::did_principal_matches, ssi::dids::AnyDidMethod,
@@ -123,6 +126,16 @@ pub enum DelegationError {
     ExpiryExceedsParent,
     #[error("Child delegation not_before precedes parent not_before")]
     NotBeforePrecedesParent,
+    /// W1: parent delegation is terminal — children cannot redelegate.
+    /// Maps to `terminal-parent-cannot-redelegate` in the W0 vectors.
+    #[error("terminal-parent-cannot-redelegate")]
+    TerminalParentCannotRedelegate,
+    /// W1: child caveats are not a subset of the parent's caveats — the
+    /// child dropped, widened, or replaced a constrained-statements caveat
+    /// the parent carried (audit P0 finding 1). Maps to the spec rejection
+    /// code from `sql-constrained-statement-caveat.md` containment.
+    #[error("child-caveats-not-subset-of-parent: {0}")]
+    CaveatsNotContained(String),
 }
 
 pub(crate) async fn process<C: ConnectionTrait>(
@@ -199,6 +212,16 @@ async fn validate<C: ConnectionTrait>(
                 return Err(DelegationError::MissingParents.into());
             }
 
+            // W1 (B): reject any chain that cites a terminal parent. The
+            // marker is persisted on the parent row's `facts` column at
+            // save time and is signed-into the parent's UCAN payload, so a
+            // cooperating holder cannot strip it after the fact.
+            for p in &all_parents {
+                if parent_is_terminal(p) {
+                    return Err(DelegationError::TerminalParentCannotRedelegate.into());
+                }
+            }
+
             // Check time constraints and track failures
             let mut expiry_failed = false;
             let mut not_before_failed = false;
@@ -244,22 +267,112 @@ async fn validate<C: ConnectionTrait>(
             // get delegated abilities from each parent
             let parent_abilities = parents.load_many(abilities::Entity, db).await?;
 
-            // check each dependant cap is supported by at least one parent cap
-            match dependant_caps.iter().find(|c| {
-                !parent_abilities
+            // W1 caveat-aware containment (audit P0 finding 1): a child cap is
+            // supported by a parent cap only when resource+ability extend AND
+            // the child's caveats are a subset of the parent's caveats. For
+            // SQL constrained-statements caveats we delegate to JCS caveat
+            // containment in `sql_caveat::contains`; for other caveat shapes
+            // we require structural equality so a child cannot silently
+            // replace a parent's caveat.
+            for c in &dependant_caps {
+                let mut candidates = parent_abilities
                     .iter()
                     .flatten()
-                    .any(|pc| c.resource.extends(&pc.resource) && c.ability == pc.ability)
-            }) {
-                Some(c) => Err(DelegationError::UnauthorizedCapability(
-                    c.resource.clone(),
-                    c.ability.clone(),
-                )
-                .into()),
-                None => Ok(()),
+                    .filter(|pc| c.resource.extends(&pc.resource) && c.ability == pc.ability)
+                    .peekable();
+
+                if candidates.peek().is_none() {
+                    return Err(DelegationError::UnauthorizedCapability(
+                        c.resource.clone(),
+                        c.ability.clone(),
+                    )
+                    .into());
+                }
+
+                let mut last_reason: Option<String> = None;
+                let mut authorized = false;
+                for pc in candidates {
+                    match caveats_contain_child(&pc.caveats, &c.caveats) {
+                        Ok(()) => {
+                            authorized = true;
+                            break;
+                        }
+                        Err(reason) => last_reason = Some(reason),
+                    }
+                }
+                if !authorized {
+                    let reason = last_reason
+                        .unwrap_or_else(|| "child-caveats-not-subset-of-parent".to_string());
+                    return Err(DelegationError::CaveatsNotContained(reason).into());
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// W1 (audit P0 finding 1): is `child` a subset of `parent` per JCS caveat
+/// containment? Today this distinguishes the SQL constrained-statements
+/// caveat (delegating to `sql_caveat::contains` for narrow/identical chain
+/// shapes) and otherwise requires structural equality so a child cannot
+/// silently drop or replace caveats the parent carried.
+fn caveats_contain_child(parent: &Caveats, child: &Caveats) -> Result<(), String> {
+    let parent_sql = extract_sql_caveat(parent);
+    let child_sql = extract_sql_caveat(child);
+
+    match (parent_sql, child_sql) {
+        (Some(p), Some(c)) => sql_caveat::contains(&p, &c).map_err(|e| e.as_str().to_string()),
+        (Some(_), None) => Err("containment-caveat-required".to_string()),
+        (None, _) => {
+            // No SQL caveat on the parent — fall back to structural equality
+            // on the raw JSON map so a child cannot inject a brand-new
+            // non-SQL caveat that the parent never authorized. If parent
+            // has no caveats at all, a child with no caveats is fine; a
+            // child that adds caveats is narrowing only when those caveats
+            // match an existing parent constraint, so we require equality.
+            if parent.0 == child.0 {
+                Ok(())
+            } else if parent.0.is_empty() {
+                // Parent imposed no restrictions; children may introduce
+                // narrowing caveats only when those caveats are themselves
+                // well-formed for the service. We allow it for now; the
+                // service-level enforcement (e.g. SQL constrained-profile)
+                // will fail-closed if the new caveat is incoherent.
+                Ok(())
+            } else {
+                Err("child-caveats-not-subset-of-parent".to_string())
             }
         }
     }
+}
+
+fn extract_sql_caveat(
+    caveats: &Caveats,
+) -> Option<crate::policy_capability::SqlConstrainedStatementCaveat> {
+    for v in caveats.0.values() {
+        if let Ok(c) = sql_caveat::parse(v) {
+            return Some(c);
+        }
+        if let Some(inner) = v.as_object().and_then(|o| o.get("constrained-statements")) {
+            if let Ok(c) = sql_caveat::parse(inner) {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+/// True if the persisted parent row is marked terminal via the
+/// `xyz.tinycloud.policy/delegationMode` fact. The marker is stored in the
+/// `facts` JSON column at save time; absence is treated as attenuable.
+fn parent_is_terminal(p: &Model) -> bool {
+    let Some(Facts(map)) = &p.facts else {
+        return false;
+    };
+    map.get(DelegationMode::FACT_KEY)
+        .and_then(|v| v.as_str())
+        .map(|s| s == "terminal")
+        .unwrap_or(false)
 }
 
 fn is_root_authority(cap: &util::Capability, delegator: &str) -> bool {
@@ -296,6 +409,22 @@ async fn save<C: ConnectionTrait>(
     // Encrypt for storage if encryption is configured
     let stored_serialization = crate::encryption::maybe_encrypt(encryption, &serialization);
 
+    // Persist the signed-in `delegationMode` marker. We store ONLY the
+    // marker we recognize natively (not the full UCAN facts), keeping the
+    // serialization column as the source of truth for the bytes the holder
+    // actually signed and the `facts` column as a fast-path lookup index.
+    let facts = match delegation.delegation_mode {
+        DelegationMode::Attenuable => None,
+        DelegationMode::Terminal => {
+            let mut map: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+            map.insert(
+                DelegationMode::FACT_KEY.to_string(),
+                serde_json::Value::String(DelegationMode::Terminal.as_str().to_string()),
+            );
+            Some(Facts(map))
+        }
+    };
+
     // save delegation
     match Entity::insert(ActiveModel::from(Model {
         id: hash,
@@ -304,7 +433,7 @@ async fn save<C: ConnectionTrait>(
         expiry: delegation.expiry,
         issued_at: delegation.issued_at,
         not_before: delegation.not_before,
-        facts: None,
+        facts,
         serialization: stored_serialization,
     }))
     .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned())
@@ -317,14 +446,17 @@ async fn save<C: ConnectionTrait>(
         }
     };
 
-    // save abilities
+    // save abilities — persist UCAN caveats with the delegation row. W1
+    // contract: caveats MUST NOT be reconstructed from invocation facts;
+    // SQL constrained-statement guarantees fail in adversarial cases
+    // otherwise (see policy-engine/spec/revocation.md §2.5).
     if !delegation.capabilities.is_empty() {
         abilities::Entity::insert_many(delegation.capabilities.into_iter().map(|ab| {
             abilities::ActiveModel::from(abilities::Model {
                 delegation: hash,
                 resource: ab.resource,
                 ability: ab.ability,
-                caveats: Default::default(),
+                caveats: ab.caveats,
             })
         }))
         .exec(db)

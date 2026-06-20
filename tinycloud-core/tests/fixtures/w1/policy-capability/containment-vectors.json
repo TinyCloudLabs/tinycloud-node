@@ -1,0 +1,515 @@
+{
+  "description": "PolicyCapability containment / SUBSET vectors.",
+  "vectors": [
+    {
+      "name": "kv-prefix-exact",
+      "auth": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/nb_project_notes/docs/",
+        "actions": [
+          "tinycloud.kv/get",
+          "tinycloud.kv/list",
+          "tinycloud.kv/metadata"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/nb_project_notes/docs/",
+        "actions": [
+          "tinycloud.kv/get",
+          "tinycloud.kv/list",
+          "tinycloud.kv/metadata"
+        ]
+      },
+      "contained": true
+    },
+    {
+      "name": "kv-prefix-narrower",
+      "auth": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/nb_project_notes/docs/",
+        "actions": [
+          "tinycloud.kv/get",
+          "tinycloud.kv/list",
+          "tinycloud.kv/metadata"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/nb_project_notes/docs/alice-note.md",
+        "actions": [
+          "tinycloud.kv/get"
+        ]
+      },
+      "contained": true
+    },
+    {
+      "name": "kv-exact-key-rejects-suffix",
+      "auth": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/nb_project_notes/docs/index.md",
+        "actions": [
+          "tinycloud.kv/get"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/nb_project_notes/docs/index.md/child",
+        "actions": [
+          "tinycloud.kv/get"
+        ]
+      },
+      "contained": false,
+      "rejection_code": "containment-path-mismatch"
+    },
+    {
+      "name": "kv-prefix-not-substring-match",
+      "auth": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/nb_project_notes/docs/",
+        "actions": [
+          "tinycloud.kv/get",
+          "tinycloud.kv/list",
+          "tinycloud.kv/metadata"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/nb_project_notes/docs",
+        "actions": [
+          "tinycloud.kv/get"
+        ]
+      },
+      "contained": false,
+      "rejection_code": "containment-path-mismatch"
+    },
+    {
+      "name": "service-mismatch",
+      "auth": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/nb_project_notes/docs/",
+        "actions": [
+          "tinycloud.kv/get",
+          "tinycloud.kv/list",
+          "tinycloud.kv/metadata"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.vfs",
+        "space": "applications",
+        "path": "notebooks/nb_project_notes/docs/alice-note.md",
+        "actions": [
+          "tinycloud.vfs/get"
+        ]
+      },
+      "contained": false,
+      "rejection_code": "containment-service-mismatch"
+    },
+    {
+      "name": "space-mismatch",
+      "auth": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/nb_project_notes/docs/",
+        "actions": [
+          "tinycloud.kv/get",
+          "tinycloud.kv/list",
+          "tinycloud.kv/metadata"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.kv",
+        "space": "other-space",
+        "path": "notebooks/nb_project_notes/docs/alice-note.md",
+        "actions": [
+          "tinycloud.kv/get"
+        ]
+      },
+      "contained": false,
+      "rejection_code": "containment-space-mismatch"
+    },
+    {
+      "name": "path-outside-prefix",
+      "auth": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/nb_project_notes/docs/",
+        "actions": [
+          "tinycloud.kv/get",
+          "tinycloud.kv/list",
+          "tinycloud.kv/metadata"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/other_notebook/docs/x.md",
+        "actions": [
+          "tinycloud.kv/get"
+        ]
+      },
+      "contained": false,
+      "rejection_code": "containment-path-mismatch"
+    },
+    {
+      "name": "action-widened",
+      "auth": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/nb_project_notes/docs/",
+        "actions": [
+          "tinycloud.kv/get",
+          "tinycloud.kv/list",
+          "tinycloud.kv/metadata"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/nb_project_notes/docs/",
+        "actions": [
+          "tinycloud.kv/put"
+        ]
+      },
+      "contained": false,
+      "rejection_code": "containment-action-not-subset"
+    },
+    {
+      "name": "manifest-shaped-rejected",
+      "auth": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/nb_project_notes/docs/",
+        "actions": [
+          "tinycloud.kv/get",
+          "tinycloud.kv/list",
+          "tinycloud.kv/metadata"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/nb_project_notes/docs/",
+        "actions": [
+          "get"
+        ]
+      },
+      "contained": false,
+      "rejection_code": "policy-capability-malformed-action-shortname"
+    },
+    {
+      "name": "sql-exact",
+      "auth": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.getConversation",
+              "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            },
+            {
+              "name": "listen.listParticipants",
+              "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "req": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.getConversation",
+              "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            },
+            {
+              "name": "listen.listParticipants",
+              "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "contained": true
+    },
+    {
+      "name": "sql-drops-fixed-param",
+      "auth": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.getConversation",
+              "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            },
+            {
+              "name": "listen.listParticipants",
+              "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "req": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.getConversation",
+              "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+              "fixedParams": []
+            },
+            {
+              "name": "listen.listParticipants",
+              "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "contained": false,
+      "rejection_code": "containment-sql-fixed-param-dropped"
+    },
+    {
+      "name": "sql-adds-statement",
+      "auth": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.getConversation",
+              "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            },
+            {
+              "name": "listen.listParticipants",
+              "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "req": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.getConversation",
+              "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            },
+            {
+              "name": "listen.listParticipants",
+              "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            },
+            {
+              "name": "listen.deleteConversation",
+              "sql": "DELETE FROM conversation WHERE id = ?",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "contained": false,
+      "rejection_code": "containment-sql-statement-added"
+    },
+    {
+      "name": "sql-narrower-statements",
+      "auth": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.getConversation",
+              "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            },
+            {
+              "name": "listen.listParticipants",
+              "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "req": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.getConversation",
+              "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "contained": true
+    },
+    {
+      "name": "kv-blob-exact",
+      "auth": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/caf\u00e9/notes/",
+        "actions": [
+          "tinycloud.kv/get"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/caf\u00e9/notes/",
+        "actions": [
+          "tinycloud.kv/get"
+        ]
+      },
+      "contained": true
+    }
+  ]
+}

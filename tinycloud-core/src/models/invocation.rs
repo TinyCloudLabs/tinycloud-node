@@ -6,7 +6,8 @@ use super::super::{
     util,
 };
 use crate::encryption::ColumnEncryption;
-use crate::types::{Facts, Resource, SpaceIdWrap};
+use crate::policy_capability::sql_caveat;
+use crate::types::{Caveats, Facts, Resource, SpaceIdWrap};
 use crate::write_hooks::{hook_delivery_id, subscription_matches_event};
 use crate::{hash::Hash, types::Ability};
 use sea_orm::{
@@ -81,6 +82,23 @@ pub enum InvocationError {
     MissingParents,
     #[error("No Such Key: {0}")]
     MissingKvWrite(Path),
+    /// W1 (C): the directly-cited delegation has been revoked.
+    /// Code: `delegation-revoked`.
+    #[error("delegation-revoked: {0}")]
+    DelegationRevoked(String),
+    /// W1 (C): an attenuable ancestor of the cited delegation has been
+    /// revoked. Code: `delegation-ancestor-revoked`.
+    #[error("delegation-ancestor-revoked: ancestor={ancestor_cid} invoked={invoked_cid}")]
+    DelegationAncestorRevoked {
+        ancestor_cid: String,
+        invoked_cid: String,
+    },
+    /// W1: invocation caveats are not a subset of the chain's caveats — the
+    /// invoker tried to widen or replace a constrained-statements caveat
+    /// the delegation chain carried (audit P0 finding 1, applied at the
+    /// invocation boundary).
+    #[error("invocation-caveats-not-subset-of-chain: {0}")]
+    CaveatsNotContained(String),
 }
 
 pub(crate) async fn process<C: ConnectionTrait>(
@@ -154,6 +172,26 @@ async fn validate<C: ConnectionTrait>(
                 }
             }
 
+            // W1 (C): fail-closed on revocation. A revoked leaf rejects the
+            // invocation outright; a revoked ANCESTOR in the cited chain
+            // rejects descendants. Walked on every invocation — we must
+            // NOT cache "chain ok" across the revocation event
+            // (revocation.md §2.3).
+            for (p, _) in &parents {
+                if is_revoked(db, &p.id).await? {
+                    return Err(
+                        InvocationError::DelegationRevoked(p.id.to_cid(0x55).to_string()).into(),
+                    );
+                }
+                if let Some(ancestor_cid) = first_revoked_ancestor(db, &p.id).await? {
+                    return Err(InvocationError::DelegationAncestorRevoked {
+                        ancestor_cid,
+                        invoked_cid: p.id.to_cid(0x55).to_string(),
+                    }
+                    .into());
+                }
+            }
+
             let now = time.unwrap_or_else(OffsetDateTime::now_utc);
 
             // only use parents which are valid at the time of invocation
@@ -165,22 +203,124 @@ async fn validate<C: ConnectionTrait>(
                 })
                 .collect();
 
-            // check each dependant cap is supported by at least one parent cap
-            match dependant_caps.iter().find(|c| {
-                !parents
+            // W1 caveat-aware containment at the invocation boundary
+            // (audit P0 finding 1): each invocation capability must be
+            // supported by a parent ability AND any chain-level caveat must
+            // contain the invocation's caveat. Invocation-supplied caveats
+            // are NOT trusted on their own — they are only authorized when
+            // the persisted chain ability row already has a matching or
+            // stricter caveat.
+            for c in &dependant_caps {
+                let mut candidates = parents
                     .iter()
                     .flat_map(|(_, a)| a)
-                    .any(|pc| c.resource.extends(&pc.resource) && c.ability == pc.ability)
-            }) {
-                Some(c) => Err(InvocationError::UnauthorizedAction(
-                    c.resource.clone(),
-                    c.ability.clone(),
-                )
-                .into()),
-                None => Ok(()),
+                    .filter(|pc| c.resource.extends(&pc.resource) && c.ability == pc.ability)
+                    .peekable();
+
+                if candidates.peek().is_none() {
+                    return Err(InvocationError::UnauthorizedAction(
+                        c.resource.clone(),
+                        c.ability.clone(),
+                    )
+                    .into());
+                }
+
+                let mut last_reason: Option<String> = None;
+                let mut authorized = false;
+                for pc in candidates {
+                    match caveats_contain_child(&pc.caveats, &c.caveats) {
+                        Ok(()) => {
+                            authorized = true;
+                            break;
+                        }
+                        Err(reason) => last_reason = Some(reason),
+                    }
+                }
+                if !authorized {
+                    let reason = last_reason
+                        .unwrap_or_else(|| "invocation-caveats-not-subset-of-chain".to_string());
+                    return Err(InvocationError::CaveatsNotContained(reason).into());
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// W1 (audit P0 finding 1): same containment helper as the delegation path,
+/// applied at invocation. Duplicated rather than shared because the error
+/// surface differs and the helper is small.
+fn caveats_contain_child(parent: &Caveats, child: &Caveats) -> Result<(), String> {
+    let parent_sql = extract_sql_caveat(parent);
+    let child_sql = extract_sql_caveat(child);
+
+    match (parent_sql, child_sql) {
+        (Some(p), Some(c)) => sql_caveat::contains(&p, &c).map_err(|e| e.as_str().to_string()),
+        (Some(_), None) => Err("containment-caveat-required".to_string()),
+        (None, _) => {
+            if parent.0 == child.0
+                || (parent.0.is_empty() && child.0.is_empty())
+                || parent.0.is_empty()
+            {
+                Ok(())
+            } else {
+                Err("invocation-caveats-not-subset-of-chain".to_string())
             }
         }
     }
+}
+
+fn extract_sql_caveat(
+    caveats: &Caveats,
+) -> Option<crate::policy_capability::SqlConstrainedStatementCaveat> {
+    for v in caveats.0.values() {
+        if let Ok(c) = sql_caveat::parse(v) {
+            return Some(c);
+        }
+        if let Some(inner) = v.as_object().and_then(|o| o.get("constrained-statements")) {
+            if let Ok(c) = sql_caveat::parse(inner) {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+/// True if `delegation_id` has an active revocation row.
+async fn is_revoked<C: ConnectionTrait>(db: &C, delegation_id: &Hash) -> Result<bool, DbErr> {
+    let n = revocation::Entity::find()
+        .filter(revocation::Column::Revoked.eq(*delegation_id))
+        .count(db)
+        .await?;
+    Ok(n > 0)
+}
+
+/// Walk a chain transitively from `start` toward the root via the
+/// parent_delegations table and return the first revoked ancestor's CID, if
+/// any. Stops at the first hit; otherwise returns None.
+async fn first_revoked_ancestor<C: ConnectionTrait>(
+    db: &C,
+    start: &Hash,
+) -> Result<Option<String>, DbErr> {
+    let mut frontier: Vec<Hash> = vec![*start];
+    let mut visited: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+    while let Some(current) = frontier.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        let parents = parent_delegations::Entity::find()
+            .filter(parent_delegations::Column::Child.eq(current))
+            .all(db)
+            .await?;
+        for link in parents {
+            let parent_id = link.parent;
+            if is_revoked(db, &parent_id).await? {
+                return Ok(Some(parent_id.to_cid(0x55).to_string()));
+            }
+            frontier.push(parent_id);
+        }
+    }
+    Ok(None)
 }
 
 fn is_root_authority(cap: &util::Capability, invoker: &str) -> bool {
@@ -470,6 +610,7 @@ async fn enqueue_kv_webhook_deliveries<C: ConnectionTrait>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn kv_webhook_payload_serializes_with_type_field() {
@@ -488,5 +629,108 @@ mod tests {
 
         let json = serde_json::to_value(payload).unwrap();
         assert_eq!(json.get("type").and_then(|v| v.as_str()), Some("write"));
+    }
+
+    // W1 (audit P0 finding 1) — caveats helper unit tests. We test the
+    // pure-function `caveats_contain_child` and `extract_sql_caveat`
+    // helpers here since they encode the spec rule that an invocation
+    // cannot widen, drop, or replace the chain caveat. DB-backed tests
+    // live next to the delegation::process integration tests so the
+    // chain's persisted caveats actually round-trip through the abilities
+    // row.
+    fn make_sql_constrained_caveat(name: &str, sql: &str) -> Caveats {
+        use serde_json::json;
+        let mut map = BTreeMap::new();
+        map.insert(
+            "0".to_string(),
+            json!({
+                "mode": "constrained-statements",
+                "readOnly": true,
+                "statements": [{
+                    "name": name,
+                    "sql": sql,
+                    "fixedParams": []
+                }]
+            }),
+        );
+        Caveats(map)
+    }
+
+    fn make_pinned_caveat(name: &str, sql: &str, index: i64, value: serde_json::Value) -> Caveats {
+        use serde_json::json;
+        let mut map = BTreeMap::new();
+        map.insert(
+            "0".to_string(),
+            json!({
+                "mode": "constrained-statements",
+                "readOnly": true,
+                "statements": [{
+                    "name": name,
+                    "sql": sql,
+                    "fixedParams": [{"index": index, "value": value}]
+                }]
+            }),
+        );
+        Caveats(map)
+    }
+
+    #[test]
+    fn invocation_caveats_must_match_parent_caveats_subset() {
+        let parent = make_sql_constrained_caveat("get", "SELECT 1");
+        let child_same = make_sql_constrained_caveat("get", "SELECT 1");
+        let child_different_sql = make_sql_constrained_caveat("get", "SELECT 2");
+        let child_added_stmt = {
+            use serde_json::json;
+            let mut map = BTreeMap::new();
+            map.insert(
+                "0".to_string(),
+                json!({
+                    "mode": "constrained-statements",
+                    "readOnly": true,
+                    "statements": [
+                        {"name":"get","sql":"SELECT 1","fixedParams":[]},
+                        {"name":"extra","sql":"SELECT 99","fixedParams":[]}
+                    ]
+                }),
+            );
+            Caveats(map)
+        };
+
+        caveats_contain_child(&parent, &child_same).expect("identical caveat must be contained");
+        let err = caveats_contain_child(&parent, &child_different_sql)
+            .expect_err("changing bound SQL must be rejected");
+        assert!(
+            err == "containment-sql-statement-added" || err == "child-caveats-not-subset-of-parent",
+            "unexpected reason: {err}",
+        );
+        caveats_contain_child(&parent, &child_added_stmt)
+            .expect_err("child must not add statements the parent never granted");
+    }
+
+    #[test]
+    fn invocation_dropping_chain_caveat_is_rejected() {
+        let parent = make_sql_constrained_caveat("get", "SELECT 1");
+        let child_empty = Caveats::default();
+        let err = caveats_contain_child(&parent, &child_empty)
+            .expect_err("child cannot drop the parent's caveat");
+        assert_eq!(err, "containment-caveat-required");
+    }
+
+    #[test]
+    fn invocation_widening_pinned_fixed_param_is_rejected() {
+        let parent =
+            make_pinned_caveat("get", "SELECT * FROM t WHERE id=?", 0, serde_json::json!(7));
+        let child = make_sql_constrained_caveat("get", "SELECT * FROM t WHERE id=?");
+        let err = caveats_contain_child(&parent, &child)
+            .expect_err("child dropping pinned fixedParam must be rejected");
+        assert_eq!(err, "containment-sql-fixed-param-dropped");
+    }
+
+    #[test]
+    fn invocation_with_no_chain_caveat_can_be_any() {
+        let parent = Caveats::default();
+        let child_with_constraints = make_sql_constrained_caveat("get", "SELECT 1");
+        caveats_contain_child(&parent, &child_with_constraints)
+            .expect("narrowing on an unconstrained parent must be allowed");
     }
 }

@@ -84,7 +84,13 @@ impl HeaderEncode for TinyCloudInvocation {
 
 #[derive(Debug, Clone)]
 pub enum TinyCloudRevocation {
-    Cacao(SiweCacao),
+    Cacao(Box<SiweCacao>),
+    /// W1 (audit P0 finding 5): did:key/UCAN-format revocation. Issued by a
+    /// Grant Issuer or other did:key principal authorized to revoke. The
+    /// UCAN payload's `attenuation` MUST cite the revoked delegation CID
+    /// via the conventional `urn:cid:<cid>` resource form; the audience
+    /// MUST be `ucan:<cid>` so existing parsing still resolves a target.
+    Ucan(Box<Ucan>),
 }
 
 impl HeaderEncode for TinyCloudRevocation {
@@ -92,12 +98,23 @@ impl HeaderEncode for TinyCloudRevocation {
         match self {
             // Use the imported engine and trait method
             Self::Cacao(c) => Ok(URL_SAFE.encode(serde_ipld_dagcbor::to_vec(c)?)),
+            Self::Ucan(u) => Ok(u.encode()?),
         }
     }
     fn decode(s: &str) -> Result<(Self, Vec<u8>), EncodingError> {
-        // Use the imported engine and trait method
-        let v = URL_SAFE.decode(s)?;
-        Ok((Self::Cacao(serde_ipld_dagcbor::from_slice(&v)?), v))
+        if s.contains('.') {
+            Ok((
+                Self::Ucan(Box::new(Ucan::decode(s)?)),
+                s.as_bytes().to_vec(),
+            ))
+        } else {
+            // Use the imported engine and trait method
+            let v = URL_SAFE.decode(s)?;
+            Ok((
+                Self::Cacao(Box::new(serde_ipld_dagcbor::from_slice(&v)?)),
+                v,
+            ))
+        }
     }
 }
 

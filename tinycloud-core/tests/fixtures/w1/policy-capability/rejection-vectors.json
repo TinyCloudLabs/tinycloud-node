@@ -1,0 +1,84 @@
+{
+  "description": "PolicyCapability payloads that MUST be rejected at the policy boundary BEFORE any containment check or hashing.",
+  "vectors": [
+    {
+      "name": "manifest-permission-entry-rejected",
+      "rejection_code": "policy-capability-malformed",
+      "reason": "Manifest-shaped PermissionEntry must resolve to PolicyCapability before signing/hashing.",
+      "input": {
+        "id": "notebook-read",
+        "service": "tinycloud.kv",
+        "actions": [
+          "read"
+        ],
+        "scope": {
+          "path": "notebooks/nb_project_notes/docs/"
+        }
+      }
+    },
+    {
+      "name": "path-with-dot-dot-rejected",
+      "rejection_code": "policy-capability-malformed-path",
+      "reason": "'..' segments MUST be rejected outright; no rewriting.",
+      "input": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/nb_project_notes/../private/",
+        "actions": [
+          "tinycloud.kv/get"
+        ]
+      }
+    },
+    {
+      "name": "wildcard-space-rejected",
+      "rejection_code": "policy-capability-malformed-space",
+      "reason": "space MUST be concrete; '*' is rejected.",
+      "input": {
+        "service": "tinycloud.kv",
+        "space": "*",
+        "path": "notebooks/",
+        "actions": [
+          "tinycloud.kv/get"
+        ]
+      }
+    },
+    {
+      "name": "unknown-top-level-key-rejected",
+      "rejection_code": "policy-capability-unknown-key",
+      "reason": "Unknown top-level keys are rejected.",
+      "input": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/",
+        "actions": [
+          "tinycloud.kv/get"
+        ],
+        "ttl": 3600
+      }
+    },
+    {
+      "name": "unknown-action-rejected",
+      "rejection_code": "policy-capability-malformed-action",
+      "reason": "Action not in the v0 action set is rejected.",
+      "input": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/",
+        "actions": [
+          "tinycloud.kv/sudo"
+        ]
+      }
+    },
+    {
+      "name": "empty-actions-rejected",
+      "rejection_code": "policy-capability-empty-actions",
+      "reason": "After normalization, action set MUST be non-empty.",
+      "input": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/",
+        "actions": []
+      }
+    }
+  ]
+}

@@ -1,0 +1,218 @@
+{
+  "description": "Revoking an attenuable ancestor invalidates all descendants.",
+  "vectors": [
+    {
+      "name": "ancestor-revoked-attenuable-rejects-descendant",
+      "chain": [
+        {
+          "cid": "bafy.parent.A",
+          "mode": "attenuable",
+          "issuer": "did:pkh:eip155:1:0x7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+          "audience": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK"
+        },
+        {
+          "cid": "bafy.mid.B",
+          "mode": "attenuable",
+          "issuer": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+          "audience": "did:key:zMid"
+        },
+        {
+          "cid": "bafy.leaf.C",
+          "mode": "attenuable",
+          "issuer": "did:key:zMid",
+          "audience": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5",
+          "capability": {
+            "service": "tinycloud.sql",
+            "space": "applications",
+            "path": "xyz.tinycloud.listen/conversations",
+            "actions": [
+              "tinycloud.sql/read"
+            ],
+            "caveats": {
+              "mode": "constrained-statements",
+              "readOnly": true,
+              "statements": [
+                {
+                  "name": "listen.getConversation",
+                  "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+                  "fixedParams": [
+                    {
+                      "index": 0,
+                      "value": "conv_456"
+                    }
+                  ]
+                },
+                {
+                  "name": "listen.listParticipants",
+                  "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+                  "fixedParams": [
+                    {
+                      "index": 0,
+                      "value": "conv_456"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "revoked_cids": [
+        "bafy.mid.B"
+      ],
+      "invocation_under_cid": "bafy.leaf.C",
+      "expected": "reject",
+      "rejection_code": "delegation-ancestor-revoked"
+    },
+    {
+      "name": "root-revoked-rejects-all-descendants",
+      "chain": [
+        {
+          "cid": "bafy.parent.A",
+          "mode": "attenuable",
+          "issuer": "did:pkh:eip155:1:0x7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+          "audience": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK"
+        },
+        {
+          "cid": "bafy.mid.B",
+          "mode": "attenuable",
+          "issuer": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+          "audience": "did:key:zMid"
+        },
+        {
+          "cid": "bafy.leaf.C",
+          "mode": "attenuable",
+          "issuer": "did:key:zMid",
+          "audience": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5",
+          "capability": {
+            "service": "tinycloud.sql",
+            "space": "applications",
+            "path": "xyz.tinycloud.listen/conversations",
+            "actions": [
+              "tinycloud.sql/read"
+            ],
+            "caveats": {
+              "mode": "constrained-statements",
+              "readOnly": true,
+              "statements": [
+                {
+                  "name": "listen.getConversation",
+                  "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+                  "fixedParams": [
+                    {
+                      "index": 0,
+                      "value": "conv_456"
+                    }
+                  ]
+                },
+                {
+                  "name": "listen.listParticipants",
+                  "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+                  "fixedParams": [
+                    {
+                      "index": 0,
+                      "value": "conv_456"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "revoked_cids": [
+        "bafy.parent.A"
+      ],
+      "invocation_under_cid": "bafy.leaf.C",
+      "expected": "reject",
+      "rejection_code": "delegation-ancestor-revoked"
+    },
+    {
+      "name": "attenuable-no-revoke-accepts",
+      "chain": [
+        {
+          "cid": "bafy.parent.A",
+          "mode": "attenuable",
+          "issuer": "did:pkh:eip155:1:0x7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+          "audience": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK"
+        },
+        {
+          "cid": "bafy.mid.B",
+          "mode": "attenuable",
+          "issuer": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+          "audience": "did:key:zMid"
+        },
+        {
+          "cid": "bafy.leaf.C",
+          "mode": "attenuable",
+          "issuer": "did:key:zMid",
+          "audience": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5",
+          "capability": {
+            "service": "tinycloud.sql",
+            "space": "applications",
+            "path": "xyz.tinycloud.listen/conversations",
+            "actions": [
+              "tinycloud.sql/read"
+            ],
+            "caveats": {
+              "mode": "constrained-statements",
+              "readOnly": true,
+              "statements": [
+                {
+                  "name": "listen.getConversation",
+                  "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+                  "fixedParams": [
+                    {
+                      "index": 0,
+                      "value": "conv_456"
+                    }
+                  ]
+                },
+                {
+                  "name": "listen.listParticipants",
+                  "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+                  "fixedParams": [
+                    {
+                      "index": 0,
+                      "value": "conv_456"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "revoked_cids": [],
+      "invocation_under_cid": "bafy.leaf.C",
+      "expected": "accept"
+    },
+    {
+      "name": "terminal-parent-prevents-descendants-anyway",
+      "chain": [
+        {
+          "cid": "bafy.parent.A",
+          "mode": "attenuable",
+          "issuer": "did:pkh:eip155:1:0x7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+          "audience": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK"
+        },
+        {
+          "cid": "bafy.terminal.B",
+          "mode": "terminal",
+          "issuer": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+          "audience": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+        },
+        {
+          "cid": "bafy.child.C",
+          "mode": "attenuable",
+          "issuer": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5",
+          "audience": "did:key:zChild"
+        }
+      ],
+      "revoked_cids": [],
+      "invocation_under_cid": "bafy.child.C",
+      "expected": "reject",
+      "rejection_code": "terminal-parent-cannot-redelegate"
+    }
+  ]
+}

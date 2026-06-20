@@ -9231,6 +9231,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ucan-capabilities-object",
+ "unicode-normalization",
  "x25519-dalek",
 ]
 
