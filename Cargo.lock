@@ -2636,7 +2636,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ab67060fc6b8ef687992d439ca0fa36e7ed17e9a0b16b25b601e8757df720de"
 dependencies = [
  "data-encoding",
- "syn 2.0.114",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -5908,6 +5908,38 @@ name = "pkg-config"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
+
+[[package]]
+name = "policy-core"
+version = "0.1.0"
+source = "git+https://github.com/TinyCloudLabs/policy-engine?branch=skgbafa%2Fpolicy-engine-v0-w5-runtime#63e6afb9bdeeddf67d5fe97ac2e1fa060e653a3d"
+dependencies = [
+ "base64 0.22.1",
+ "bs58 0.5.1",
+ "chrono",
+ "ed25519-dalek",
+ "k256",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sha3",
+ "thiserror 1.0.69",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "policy-runtime"
+version = "0.1.0"
+source = "git+https://github.com/TinyCloudLabs/policy-engine?branch=skgbafa%2Fpolicy-engine-v0-w5-runtime#63e6afb9bdeeddf67d5fe97ac2e1fa060e653a3d"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "getrandom 0.2.17",
+ "policy-core",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
 
 [[package]]
 name = "polling"
@@ -9246,6 +9278,9 @@ dependencies = [
  "aws-smithy-http",
  "aws-types",
  "base64 0.13.1",
+ "bs58 0.5.1",
+ "chrono",
+ "ed25519-dalek",
  "futures",
  "hex",
  "hmac",
@@ -9258,6 +9293,8 @@ dependencies = [
  "opentelemetry_sdk",
  "percent-encoding",
  "pin-project",
+ "policy-core",
+ "policy-runtime",
  "prometheus",
  "rand 0.8.5",
  "reqwest 0.11.27",
