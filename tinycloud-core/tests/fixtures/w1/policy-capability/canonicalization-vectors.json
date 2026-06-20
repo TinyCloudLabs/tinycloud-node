@@ -1,0 +1,148 @@
+{
+  "description": "PolicyCapability canonicalization vectors. Normalization sorts and dedupes the action URN list and JCS-canonicalizes caveats; the post-normalization action set MUST be non-empty.",
+  "domain": "xyz.tinycloud.policy/PolicyCapability/v0",
+  "hash_encoding": "bare lowercase hex of SHA-256 (no 0x prefix)",
+  "vectors": [
+    {
+      "name": "kv-notebook-prefix",
+      "input": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/nb_project_notes/docs/",
+        "actions": [
+          "tinycloud.kv/metadata",
+          "tinycloud.kv/get",
+          "tinycloud.kv/list",
+          "tinycloud.kv/get"
+        ]
+      },
+      "canonical": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/nb_project_notes/docs/",
+        "actions": [
+          "tinycloud.kv/get",
+          "tinycloud.kv/list",
+          "tinycloud.kv/metadata"
+        ]
+      },
+      "canonical_jcs_utf8_hex": "7b22616374696f6e73223a5b2274696e79636c6f75642e6b762f676574222c2274696e79636c6f75642e6b762f6c697374222c2274696e79636c6f75642e6b762f6d65746164617461225d2c2270617468223a226e6f7465626f6f6b732f6e625f70726f6a6563745f6e6f7465732f646f63732f222c2273657276696365223a2274696e79636c6f75642e6b76222c227370616365223a226170706c69636174696f6e73227d",
+      "policy_capability_hash_hex": "dfc31d97865dfd5ddb1da6032d2407e235cb43e42d2c37694c2774f8a710b1d6"
+    },
+    {
+      "name": "sql-transcript-with-caveats",
+      "input": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.getConversation",
+              "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            },
+            {
+              "name": "listen.listParticipants",
+              "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "canonical": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.getConversation",
+              "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            },
+            {
+              "name": "listen.listParticipants",
+              "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "canonical_jcs_utf8_hex": "7b22616374696f6e73223a5b2274696e79636c6f75642e73716c2f72656164225d2c2263617665617473223a7b226d6f6465223a22636f6e73747261696e65642d73746174656d656e7473222c22726561644f6e6c79223a747275652c2273746174656d656e7473223a5b7b226669786564506172616d73223a5b7b22696e646578223a302c2276616c7565223a22636f6e765f343536227d5d2c226e616d65223a226c697374656e2e676574436f6e766572736174696f6e222c2273716c223a2253454c4543542069642c207469746c652c20736f757263652c20736f757263655f69642c20736f757263655f75726c2c20737461727465645f61742c20656e6465645f61742c206475726174696f6e5f736563732c2073756d6d6172792c206d657461646174612c207472616e7363726970745f6a736f6e2c207472616e7363726970745f746578742c20637265617465645f61742c20757064617465645f61742046524f4d20636f6e766572736174696f6e205748455245206964203d203f227d2c7b226669786564506172616d73223a5b7b22696e646578223a302c2276616c7565223a22636f6e765f343536227d5d2c226e616d65223a226c697374656e2e6c6973745061727469636970616e7473222c2273716c223a2253454c4543542069642c206e616d652c20656d61696c2c20737065616b65725f6c6162656c2046524f4d207061727469636970616e7420574845524520636f6e766572736174696f6e5f6964203d203f204f5244455220425920434f414c4553434528737065616b65725f6c6162656c2c206e616d65292c206964227d5d7d2c2270617468223a2278797a2e74696e79636c6f75642e6c697374656e2f636f6e766572736174696f6e73222c2273657276696365223a2274696e79636c6f75642e73716c222c227370616365223a226170706c69636174696f6e73227d",
+      "policy_capability_hash_hex": "04bd54ea7c59efdd21351c975d12dea757840a723cf5417709c7cb4c0ab1b0ee"
+    },
+    {
+      "name": "kv-nfc-path-normalization",
+      "input": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/cafe\u0301/notes/",
+        "actions": [
+          "tinycloud.kv/get"
+        ]
+      },
+      "canonical": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/caf\u00e9/notes/",
+        "actions": [
+          "tinycloud.kv/get"
+        ]
+      },
+      "canonical_jcs_utf8_hex": "7b22616374696f6e73223a5b2274696e79636c6f75642e6b762f676574225d2c2270617468223a226e6f7465626f6f6b732f636166c3a92f6e6f7465732f222c2273657276696365223a2274696e79636c6f75642e6b76222c227370616365223a226170706c69636174696f6e73227d",
+      "policy_capability_hash_hex": "68809fe4b62e051d9af6c9e8242ccf561703a755c7ad4f3e591ffd918233066a"
+    },
+    {
+      "name": "kv-percent-decoded-unreserved",
+      "input": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/nb%2Dproject/docs/",
+        "actions": [
+          "tinycloud.kv/get"
+        ]
+      },
+      "canonical": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "notebooks/nb-project/docs/",
+        "actions": [
+          "tinycloud.kv/get"
+        ]
+      },
+      "canonical_jcs_utf8_hex": "7b22616374696f6e73223a5b2274696e79636c6f75642e6b762f676574225d2c2270617468223a226e6f7465626f6f6b732f6e622d70726f6a6563742f646f63732f222c2273657276696365223a2274696e79636c6f75642e6b76222c227370616365223a226170706c69636174696f6e73227d",
+      "policy_capability_hash_hex": "42da29732b2c45f0cd4c974e5efdf02728e3a5ba6ad16db9efb25de806e67216"
+    }
+  ]
+}

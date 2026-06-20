@@ -1,0 +1,120 @@
+{
+  "description": "SQL constrained-statement caveat \u2014 accept cases.",
+  "cases": [
+    {
+      "case": "named-getConversation-allowed",
+      "invocation": {
+        "kind": "executeStatement",
+        "name": "listen.getConversation",
+        "params": {}
+      },
+      "expected": "accept",
+      "auth_capability": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.getConversation",
+              "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            },
+            {
+              "name": "listen.listParticipants",
+              "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "case": "named-listParticipants-allowed",
+      "invocation": {
+        "kind": "executeStatement",
+        "name": "listen.listParticipants",
+        "params": {}
+      },
+      "expected": "accept",
+      "auth_capability": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.getConversation",
+              "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            },
+            {
+              "name": "listen.listParticipants",
+              "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "case": "search-primitive-bind-allowed",
+      "invocation": {
+        "kind": "executeStatement",
+        "name": "listen.searchConversations",
+        "params": {
+          "0": "%standup%"
+        }
+      },
+      "expected": "accept",
+      "auth_capability": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.searchConversations",
+              "sql": "SELECT id, title FROM conversation WHERE title LIKE ?"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

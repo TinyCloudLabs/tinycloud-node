@@ -20,10 +20,8 @@ use serde_json::Value;
 use tinycloud_core::policy_capability::{parse, sql_caveat, SqlConstrainedStatementCaveat};
 use tinycloud_core::sql::SqlRequest;
 
-const REJECT_VECTORS: &str =
-    include_str!("../../../policy-engine/test-vectors/sql-caveat/reject.json");
-const ACCEPT_VECTORS: &str =
-    include_str!("../../../policy-engine/test-vectors/sql-caveat/accept.json");
+const REJECT_VECTORS: &str = include_str!("fixtures/w1/sql-caveat/reject.json");
+const ACCEPT_VECTORS: &str = include_str!("fixtures/w1/sql-caveat/accept.json");
 
 #[derive(Deserialize)]
 struct RejectFile {
@@ -224,14 +222,11 @@ fn w0_sql_invocation_accept_vectors_enforced() {
     }
 }
 
-const TERMINAL_VECTORS: &str =
-    include_str!("../../../policy-engine/test-vectors/revocation/terminal-as-parent.json");
-const LEAF_REVO_VECTORS: &str =
-    include_str!("../../../policy-engine/test-vectors/revocation/leaf-revocation.json");
-const ANCESTOR_REVO_VECTORS: &str =
-    include_str!("../../../policy-engine/test-vectors/revocation/ancestor-revocation.json");
+const TERMINAL_VECTORS: &str = include_str!("fixtures/w1/revocation/terminal-as-parent.json");
+const LEAF_REVO_VECTORS: &str = include_str!("fixtures/w1/revocation/leaf-revocation.json");
+const ANCESTOR_REVO_VECTORS: &str = include_str!("fixtures/w1/revocation/ancestor-revocation.json");
 const NATIVE_READ_DENIAL_VECTORS: &str =
-    include_str!("../../../policy-engine/test-vectors/revocation/native-read-denial.json");
+    include_str!("fixtures/w1/revocation/native-read-denial.json");
 
 #[derive(Deserialize)]
 struct TerminalFile {

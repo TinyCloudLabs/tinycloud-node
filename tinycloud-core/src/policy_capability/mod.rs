@@ -410,18 +410,18 @@ mod tests {
     use super::*;
 
     const CANON_VECTORS: &str = include_str!(
-        "../../../../policy-engine/test-vectors/policy-capability/canonicalization-vectors.json"
+        "../../tests/fixtures/w1/policy-capability/canonicalization-vectors.json"
     );
     const CONTAINMENT_VECTORS: &str = include_str!(
-        "../../../../policy-engine/test-vectors/policy-capability/containment-vectors.json"
+        "../../tests/fixtures/w1/policy-capability/containment-vectors.json"
     );
     const REJECTION_VECTORS: &str = include_str!(
-        "../../../../policy-engine/test-vectors/policy-capability/rejection-vectors.json"
+        "../../tests/fixtures/w1/policy-capability/rejection-vectors.json"
     );
     const SQL_CONTAINMENT_VECTORS: &str =
-        include_str!("../../../../policy-engine/test-vectors/sql-caveat/containment.json");
+        include_str!("../../tests/fixtures/w1/sql-caveat/containment.json");
     const SQL_REJECT_VECTORS: &str =
-        include_str!("../../../../policy-engine/test-vectors/sql-caveat/reject.json");
+        include_str!("../../tests/fixtures/w1/sql-caveat/reject.json");
 
     #[derive(Deserialize)]
     struct CanonVector {

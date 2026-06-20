@@ -1,0 +1,317 @@
+{
+  "description": "Concrete subsequent-read denials against a real SQL invocation surface. Exercises BOTH leaf revocation (terminal chain) and ancestor revocation (attenuable chain).",
+  "leaf_revocation_denial": {
+    "description": "Subsequent native SQL reads are DENIED after revoke. Exercises the real delegation/invocation surface (executeStatement against a fixed Listen transcript statement), not abstract chain booleans.",
+    "chain": [
+      {
+        "cid": "bafy.parent.A",
+        "mode": "attenuable",
+        "issuer": "did:pkh:eip155:1:0x7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+        "audience": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK"
+      },
+      {
+        "cid": "bafy.leaf.B",
+        "mode": "terminal",
+        "issuer": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+        "audience": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5",
+        "capability": {
+          "service": "tinycloud.sql",
+          "space": "applications",
+          "path": "xyz.tinycloud.listen/conversations",
+          "actions": [
+            "tinycloud.sql/read"
+          ],
+          "caveats": {
+            "mode": "constrained-statements",
+            "readOnly": true,
+            "statements": [
+              {
+                "name": "listen.getConversation",
+                "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+                "fixedParams": [
+                  {
+                    "index": 0,
+                    "value": "conv_456"
+                  }
+                ]
+              },
+              {
+                "name": "listen.listParticipants",
+                "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+                "fixedParams": [
+                  {
+                    "index": 0,
+                    "value": "conv_456"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      }
+    ],
+    "leaf_capability": {
+      "service": "tinycloud.sql",
+      "space": "applications",
+      "path": "xyz.tinycloud.listen/conversations",
+      "actions": [
+        "tinycloud.sql/read"
+      ],
+      "caveats": {
+        "mode": "constrained-statements",
+        "readOnly": true,
+        "statements": [
+          {
+            "name": "listen.getConversation",
+            "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+            "fixedParams": [
+              {
+                "index": 0,
+                "value": "conv_456"
+              }
+            ]
+          },
+          {
+            "name": "listen.listParticipants",
+            "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+            "fixedParams": [
+              {
+                "index": 0,
+                "value": "conv_456"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "invocation": {
+      "kind": "executeStatement",
+      "service": "tinycloud.sql",
+      "space": "applications",
+      "path": "xyz.tinycloud.listen/conversations",
+      "name": "listen.getConversation",
+      "params": [],
+      "delegationCid": "bafy.leaf.B",
+      "audience": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+    },
+    "trace": [
+      {
+        "step": "pre-revoke",
+        "engine_state": {
+          "revoked_cids": []
+        },
+        "expected_response": {
+          "status": 200,
+          "body": {
+            "columns": [
+              "id"
+            ],
+            "rows": [
+              [
+                "conv_456"
+              ]
+            ]
+          }
+        }
+      },
+      {
+        "step": "revoke",
+        "revoke_request": {
+          "delegationCid": "bafy.leaf.B",
+          "issuedAt": "2026-06-12T01:00:00Z",
+          "signature": {
+            "suite": "eddsa-ed25519-sha256-jcs-v1",
+            "signerDid": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+            "value": "TzuhMTxO8ATJNUQC3T5mMpII1EwyJmJ-LevpBnVG_HQhQZ34OrgDzSowJgdUYHHW5BEfY_C4hQebyg5wRddVDQ"
+          }
+        },
+        "expected_response": {
+          "status": 200,
+          "body": {
+            "revoked": true,
+            "cid": "bafy.leaf.B"
+          }
+        }
+      },
+      {
+        "step": "post-revoke-read",
+        "engine_state": {
+          "revoked_cids": [
+            "bafy.leaf.B"
+          ]
+        },
+        "expected_response": {
+          "status": 403,
+          "body": {
+            "code": "delegation-revoked",
+            "delegationCid": "bafy.leaf.B"
+          }
+        }
+      },
+      {
+        "step": "post-revoke-second-statement-also-denied",
+        "engine_state": {
+          "revoked_cids": [
+            "bafy.leaf.B"
+          ]
+        },
+        "invocation_override": {
+          "kind": "executeStatement",
+          "service": "tinycloud.sql",
+          "space": "applications",
+          "path": "xyz.tinycloud.listen/conversations",
+          "name": "listen.listParticipants",
+          "params": [],
+          "delegationCid": "bafy.leaf.B",
+          "audience": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+        },
+        "expected_response": {
+          "status": 403,
+          "body": {
+            "code": "delegation-revoked",
+            "delegationCid": "bafy.leaf.B"
+          }
+        }
+      }
+    ]
+  },
+  "ancestor_revocation_denial": {
+    "description": "Subsequent native SQL read DENIED after an attenuable-chain ancestor is revoked.",
+    "chain": [
+      {
+        "cid": "bafy.parent.A",
+        "mode": "attenuable",
+        "issuer": "did:pkh:eip155:1:0x7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+        "audience": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK"
+      },
+      {
+        "cid": "bafy.mid.B",
+        "mode": "attenuable",
+        "issuer": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+        "audience": "did:key:zMid"
+      },
+      {
+        "cid": "bafy.leaf.C",
+        "mode": "attenuable",
+        "issuer": "did:key:zMid",
+        "audience": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5",
+        "capability": {
+          "service": "tinycloud.sql",
+          "space": "applications",
+          "path": "xyz.tinycloud.listen/conversations",
+          "actions": [
+            "tinycloud.sql/read"
+          ],
+          "caveats": {
+            "mode": "constrained-statements",
+            "readOnly": true,
+            "statements": [
+              {
+                "name": "listen.getConversation",
+                "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+                "fixedParams": [
+                  {
+                    "index": 0,
+                    "value": "conv_456"
+                  }
+                ]
+              },
+              {
+                "name": "listen.listParticipants",
+                "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+                "fixedParams": [
+                  {
+                    "index": 0,
+                    "value": "conv_456"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      }
+    ],
+    "leaf_capability": {
+      "service": "tinycloud.sql",
+      "space": "applications",
+      "path": "xyz.tinycloud.listen/conversations",
+      "actions": [
+        "tinycloud.sql/read"
+      ],
+      "caveats": {
+        "mode": "constrained-statements",
+        "readOnly": true,
+        "statements": [
+          {
+            "name": "listen.getConversation",
+            "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+            "fixedParams": [
+              {
+                "index": 0,
+                "value": "conv_456"
+              }
+            ]
+          },
+          {
+            "name": "listen.listParticipants",
+            "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+            "fixedParams": [
+              {
+                "index": 0,
+                "value": "conv_456"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "invocation": {
+      "kind": "executeStatement",
+      "service": "tinycloud.sql",
+      "space": "applications",
+      "path": "xyz.tinycloud.listen/conversations",
+      "name": "listen.getConversation",
+      "params": [],
+      "delegationCid": "bafy.leaf.C",
+      "audience": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+    },
+    "trace": [
+      {
+        "step": "pre-revoke",
+        "engine_state": {
+          "revoked_cids": []
+        },
+        "expected_response": {
+          "status": 200,
+          "body": {
+            "found": true
+          }
+        }
+      },
+      {
+        "step": "revoke-mid-ancestor",
+        "engine_state": {
+          "revoked_cids": [
+            "bafy.mid.B"
+          ]
+        }
+      },
+      {
+        "step": "post-revoke-read",
+        "engine_state": {
+          "revoked_cids": [
+            "bafy.mid.B"
+          ]
+        },
+        "expected_response": {
+          "status": 403,
+          "body": {
+            "code": "delegation-ancestor-revoked",
+            "ancestorCid": "bafy.mid.B",
+            "invokedCid": "bafy.leaf.C"
+          }
+        }
+      }
+    ]
+  }
+}

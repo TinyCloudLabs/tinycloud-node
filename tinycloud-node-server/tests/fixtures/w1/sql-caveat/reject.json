@@ -1,0 +1,485 @@
+{
+  "description": "SQL constrained-statement caveat \u2014 reject cases. sql-write-blocked and sql-escape-blocked are exercised directly; fixedParams pinning is exercised independently of statement-name and escape branches.",
+  "cases": [
+    {
+      "case": "wrong-fixed-param-override",
+      "auth_capability": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.getConversation",
+              "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            },
+            {
+              "name": "listen.listParticipants",
+              "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "invocation": {
+        "kind": "executeStatement",
+        "name": "listen.getConversation",
+        "params": {
+          "0": "conv_999"
+        }
+      },
+      "rejection_code": "sql-fixed-param-override",
+      "reason": "Caller supplied a value for fixedParams index 0."
+    },
+    {
+      "case": "table-name-escape-via-fixed-index-override",
+      "auth_capability": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.getConversation",
+              "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            },
+            {
+              "name": "listen.listParticipants",
+              "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "invocation": {
+        "kind": "executeStatement",
+        "name": "listen.getConversation",
+        "params": {
+          "0": "conv_456\"; DROP TABLE conversation; --"
+        }
+      },
+      "rejection_code": "sql-fixed-param-override",
+      "reason": "Override of a pinned fixed index \u2014 checked before escape detection."
+    },
+    {
+      "case": "object-bind-into-fixed-index-rejected",
+      "auth_capability": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.getConversation",
+              "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            },
+            {
+              "name": "listen.listParticipants",
+              "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "invocation": {
+        "kind": "executeStatement",
+        "name": "listen.getConversation",
+        "params": {
+          "0": [
+            "conv_456 OR 1=1"
+          ]
+        }
+      },
+      "rejection_code": "sql-fixed-param-override",
+      "reason": "Object/array bind value into a fixed index also trips the pin check first."
+    },
+    {
+      "case": "escape-attempt-on-non-fixed-param",
+      "auth_capability": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.searchConversations",
+              "sql": "SELECT id, title FROM conversation WHERE title LIKE ?"
+            }
+          ]
+        }
+      },
+      "invocation": {
+        "kind": "executeStatement",
+        "name": "listen.searchConversations",
+        "params": {
+          "0": "\"; DROP TABLE conversation; --"
+        }
+      },
+      "rejection_code": "sql-escape-blocked",
+      "reason": "Caller-supplied value at a non-fixed bind contains identifier/string escape; node MUST reject before binding."
+    },
+    {
+      "case": "object-bind-into-non-fixed-rejected",
+      "auth_capability": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.searchConversations",
+              "sql": "SELECT id, title FROM conversation WHERE title LIKE ?"
+            }
+          ]
+        }
+      },
+      "invocation": {
+        "kind": "executeStatement",
+        "name": "listen.searchConversations",
+        "params": {
+          "0": {
+            "$json": "%standup%"
+          }
+        }
+      },
+      "rejection_code": "sql-non-primitive-bind",
+      "reason": "Non-fixed bind values must be primitive JSON; object/array values are rejected."
+    },
+    {
+      "case": "write-keyword-in-bound-sql-rejects-caveat",
+      "auth_capability": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.purgeConversation",
+              "sql": "DELETE FROM conversation WHERE id = ?",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "rejection_code": "sql-write-blocked",
+      "reason": "Capability caveat declares DELETE in bound SQL; rejected up-front under the read-only constrained profile."
+    },
+    {
+      "case": "write-keyword-invocation-still-blocked",
+      "auth_capability": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.purgeConversation",
+              "sql": "DELETE FROM conversation WHERE id = ?",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "invocation": {
+        "kind": "executeStatement",
+        "name": "listen.purgeConversation",
+        "params": {}
+      },
+      "rejection_code": "sql-write-blocked",
+      "reason": "Even if the malformed caveat slipped through, invocation MUST be blocked because bound SQL has a write keyword."
+    },
+    {
+      "case": "raw-query",
+      "auth_capability": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.getConversation",
+              "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            },
+            {
+              "name": "listen.listParticipants",
+              "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "invocation": {
+        "kind": "query",
+        "sql": "SELECT * FROM conversation"
+      },
+      "rejection_code": "sql-raw-query-blocked"
+    },
+    {
+      "case": "raw-execute",
+      "auth_capability": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.getConversation",
+              "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            },
+            {
+              "name": "listen.listParticipants",
+              "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "invocation": {
+        "kind": "execute",
+        "sql": "SELECT 1"
+      },
+      "rejection_code": "sql-raw-execute-blocked"
+    },
+    {
+      "case": "batch",
+      "auth_capability": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.getConversation",
+              "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            },
+            {
+              "name": "listen.listParticipants",
+              "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "invocation": {
+        "kind": "batch",
+        "statements": [
+          {
+            "sql": "SELECT 1"
+          }
+        ]
+      },
+      "rejection_code": "sql-batch-blocked"
+    },
+    {
+      "case": "export",
+      "auth_capability": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.getConversation",
+              "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            },
+            {
+              "name": "listen.listParticipants",
+              "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "invocation": {
+        "kind": "export",
+        "format": "sql"
+      },
+      "rejection_code": "sql-export-blocked"
+    },
+    {
+      "case": "unknown-statement-name",
+      "auth_capability": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "xyz.tinycloud.listen/conversations",
+        "actions": [
+          "tinycloud.sql/read"
+        ],
+        "caveats": {
+          "mode": "constrained-statements",
+          "readOnly": true,
+          "statements": [
+            {
+              "name": "listen.getConversation",
+              "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            },
+            {
+              "name": "listen.listParticipants",
+              "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+              "fixedParams": [
+                {
+                  "index": 0,
+                  "value": "conv_456"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "invocation": {
+        "kind": "executeStatement",
+        "name": "listen.deleteConversation",
+        "params": {}
+      },
+      "rejection_code": "sql-statement-not-allowed"
+    }
+  ]
+}
