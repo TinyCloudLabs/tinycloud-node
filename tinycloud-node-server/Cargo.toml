@@ -67,6 +67,10 @@ features = ["sqlite", "postgres", "mysql", "tokio"]
 [dependencies.tinycloud-auth]
 path = "../tinycloud-auth/"
 
+[dev-dependencies]
+bs58 = "0.5"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+
 [features]
 default = []
 dstack = []
