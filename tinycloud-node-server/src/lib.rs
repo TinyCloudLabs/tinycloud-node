@@ -16,6 +16,7 @@ pub mod config;
 #[cfg(feature = "dstack")]
 pub mod dstack;
 pub mod hooks;
+pub mod invocation_replay;
 pub mod prometheus;
 pub mod quota;
 pub mod routes;
@@ -27,6 +28,7 @@ pub mod webhook_dispatcher;
 
 use config::{BlockStorage, Config, Keys, StagingStorage};
 use hooks::HookRuntime;
+use invocation_replay::InvocationReplayCache;
 use quota::QuotaCache;
 use routes::{
     admin::{delete_quota, get_quota, list_quotas, set_quota},
@@ -265,6 +267,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         tinycloud_config.storage.limit,
         std::env::var("TINYCLOUD_QUOTA_URL").ok(),
     );
+    let invocation_replay_cache = InvocationReplayCache::new();
 
     let rate_limiter = RateLimiter::new(&tinycloud_config.public_spaces);
     let webhook_dispatcher = WebhookDispatcher::new(
@@ -286,6 +289,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     let rocket = rocket.manage(duckdb_service);
     let rocket = rocket
         .manage(quota_cache)
+        .manage(invocation_replay_cache)
         .manage(hook_runtime)
         .manage(signed_url_runtime)
         .manage(webhook_encryption)

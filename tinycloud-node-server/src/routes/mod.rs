@@ -18,6 +18,7 @@ use crate::{
     authorization::AuthHeaderGetter,
     config::Config,
     hooks::{HookRuntime, WriteEvent},
+    invocation_replay::InvocationReplayCache,
     quota::QuotaCache,
     routes::public::is_public_space,
     signed_urls::{
@@ -329,6 +330,7 @@ pub async fn invoke(
     tinycloud: &State<TinyCloud>,
     config: &State<Config>,
     quota_cache: &State<QuotaCache>,
+    invocation_replay_cache: &State<InvocationReplayCache>,
     sql_service: &State<SqlService>,
     duckdb_service: &State<DuckDbService>,
     hook_runtime: &State<HookRuntime>,
@@ -342,6 +344,7 @@ pub async fn invoke(
         tinycloud,
         config,
         quota_cache,
+        invocation_replay_cache,
         sql_service,
         duckdb_service,
         hook_runtime,
@@ -361,6 +364,7 @@ pub async fn invoke(
     tinycloud: &State<TinyCloud>,
     config: &State<Config>,
     quota_cache: &State<QuotaCache>,
+    invocation_replay_cache: &State<InvocationReplayCache>,
     sql_service: &State<SqlService>,
     hook_runtime: &State<HookRuntime>,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
@@ -373,6 +377,7 @@ pub async fn invoke(
         tinycloud,
         config,
         quota_cache,
+        invocation_replay_cache,
         sql_service,
         (),
         hook_runtime,
@@ -687,6 +692,7 @@ async fn invoke_impl(
     tinycloud: &State<TinyCloud>,
     config: &State<Config>,
     quota_cache: &State<QuotaCache>,
+    invocation_replay_cache: &State<InvocationReplayCache>,
     sql_service: &State<SqlService>,
     #[cfg_attr(not(feature = "duckdb"), allow(unused_variables))] duckdb_service: DuckDbInvokeState<
         '_,
@@ -702,6 +708,8 @@ async fn invoke_impl(
                 .with_label_values(&["invoke"])
                 .start_timer()
         });
+
+        invocation_replay_cache.check_and_insert(&i.0).await?;
 
         // Check for SQL capabilities
         let sql_caps: Vec<_> = i
@@ -2892,7 +2900,6 @@ mod tests {
         .await?;
 
         let parent_cid: AuthCid = parent_hash.to_cid(0x55);
-        let mut invocation_caps = Capabilities::new();
         let mut invocation_nb = std::collections::BTreeMap::new();
         for (key, value) in constrained_caveat
             .as_object()
@@ -2900,38 +2907,42 @@ mod tests {
         {
             invocation_nb.insert(key.clone(), value.clone());
         }
-        invocation_caps.with_action(
-            sql_resource.as_uri(),
-            "tinycloud.sql/read".parse::<UcanAbility>()?,
-            [invocation_nb],
-        );
-        let invocation = Payload {
-            issuer: verification_method.parse::<DIDURLBuf>()?,
-            audience: verification_method
-                .split('#')
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("missing did"))?
-                .parse::<DIDBuf>()?,
-            not_before: None,
-            expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
-            nonce: Some("urn:uuid:00000000-0000-4000-8000-000000000001".to_string()),
-            // If the route trusted invocation facts over the persisted chain
-            // caveat, this prepared statement would return 999 instead of
-            // the chain-pinned alpha row value 111.
-            facts: Some(vec![json!({
-                "sqlCaveats": {
-                    "readOnly": true,
-                    "statements": [{
-                        "name": "get_val",
-                        "sql": "SELECT 999 WHERE ? = 'alpha'"
-                    }]
-                }
-            })]),
-            proof: vec![parent_cid],
-            attenuation: invocation_caps,
-        }
-        .sign(jwk.get_algorithm().unwrap_or_default(), &jwk)?;
-        let auth_header = invocation.encode()?;
+        let make_auth_header = |nonce: &str| -> Result<String> {
+            let mut invocation_caps = Capabilities::new();
+            invocation_caps.with_action(
+                sql_resource.as_uri(),
+                "tinycloud.sql/read".parse::<UcanAbility>()?,
+                [invocation_nb.clone()],
+            );
+            let invocation = Payload {
+                issuer: verification_method.parse::<DIDURLBuf>()?,
+                audience: verification_method
+                    .split('#')
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("missing did"))?
+                    .parse::<DIDBuf>()?,
+                not_before: None,
+                expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
+                nonce: Some(nonce.to_string()),
+                // If the route trusted invocation facts over the persisted chain
+                // caveat, this prepared statement would return 999 instead of
+                // the chain-pinned alpha row value 111.
+                facts: Some(vec![json!({
+                    "sqlCaveats": {
+                        "readOnly": true,
+                        "statements": [{
+                            "name": "get_val",
+                            "sql": "SELECT 999 WHERE ? = 'alpha'"
+                        }]
+                    }
+                })]),
+                proof: vec![parent_cid],
+                attenuation: invocation_caps,
+            }
+            .sign(jwk.get_algorithm().unwrap_or_default(), &jwk)?;
+            Ok(invocation.encode()?)
+        };
+        let auth_header = make_auth_header("urn:uuid:00000000-0000-4000-8000-000000000001")?;
 
         let rocket = rocket::build()
             .mount("/", routes![invoke])
@@ -2942,6 +2953,7 @@ mod tests {
             .manage(sql_service)
             .manage(Config::default())
             .manage(QuotaCache::new(None, None))
+            .manage(InvocationReplayCache::new())
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
 
@@ -2964,6 +2976,22 @@ mod tests {
         assert_eq!(json["rowCount"], 1);
         assert_eq!(json["rows"][0][0], 111);
 
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", auth_header.clone()))
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&SqlRequest::ExecuteStatement {
+                name: "get_val".to_string(),
+                params: vec![],
+            })?)
+            .dispatch()
+            .await;
+        assert_eq!(
+            response.status(),
+            Status::Conflict,
+            "exact invocation replay must be rejected"
+        );
+
         let revocation_hash = tinycloud_core::hash::hash(b"w1-rocket-http-revocation");
         revo_model::ActiveModel {
             id: Set(revocation_hash),
@@ -2974,6 +3002,7 @@ mod tests {
         .insert(&conn)
         .await?;
 
+        let auth_header = make_auth_header("urn:uuid:00000000-0000-4000-8000-000000000002")?;
         let response = client
             .post("/invoke")
             .header(Header::new("Authorization", auth_header.clone()))
