@@ -9,8 +9,8 @@ anyhow = "1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 ed25519-dalek = "2"
-policy-core = { git = "https://github.com/TinyCloudLabs/policy-engine", branch = "skgbafa/policy-engine-v0-w5-runtime", package = "policy-core" }
-policy-runtime = { git = "https://github.com/TinyCloudLabs/policy-engine", branch = "skgbafa/policy-engine-v0-w5-runtime", package = "policy-runtime", default-features = false }
+policy-core = { git = "https://github.com/TinyCloudLabs/policy-engine", branch = "main", package = "policy-core" }
+policy-runtime = { git = "https://github.com/TinyCloudLabs/policy-engine", branch = "main", package = "policy-runtime", default-features = false }
 rocket = { version = "0.5.1", features = ["json", "tls", "mtls"] }
 serde_json = "1"
 tempfile = "3"
