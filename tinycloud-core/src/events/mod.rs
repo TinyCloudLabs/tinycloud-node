@@ -36,6 +36,14 @@ impl<T> SerializedEvent<T> {
             .map_err(FromReqErr::from)
             .and_then(|(i, s)| Ok(Self(T::try_from(i).map_err(FromReqErr::TryFrom)?, s)))
     }
+
+    pub fn serialized_bytes(&self) -> &[u8] {
+        &self.1
+    }
+
+    pub fn content_hash(&self) -> Hash {
+        hash(self.serialized_bytes())
+    }
 }
 
 pub type Delegation = SerializedEvent<DelegationInfo>;

@@ -217,3 +217,42 @@ pub enum EncodingError {
 pub enum CapabilitiesQuery {
     All,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resolver::DID_METHODS;
+
+    #[test]
+    fn invocation_options_default_mints_nonce() {
+        let jwk = JWK::generate_ed25519().expect("jwk");
+        let mut verification_method = DID_METHODS.generate(&jwk, "key").expect("did").to_string();
+        let fragment = verification_method
+            .rsplit_once(':')
+            .expect("did has fragment material")
+            .1
+            .to_string();
+        verification_method.push('#');
+        verification_method.push_str(&fragment);
+
+        let invocation = make_invocation_from_uris(
+            [(
+                "tinycloud://example/kv/path".parse::<UriString>().unwrap(),
+                ["tinycloud.kv/get".parse::<Ability>().unwrap()],
+            )],
+            &Cid::default(),
+            &jwk,
+            &verification_method,
+            4_102_444_800.0,
+            InvocationOptions::default(),
+        )
+        .expect("invocation");
+
+        let nonce = invocation
+            .payload()
+            .nonce
+            .as_deref()
+            .expect("default invocation nonce");
+        assert!(nonce.starts_with("urn:uuid:"));
+    }
+}
