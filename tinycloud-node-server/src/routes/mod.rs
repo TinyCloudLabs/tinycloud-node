@@ -3168,7 +3168,6 @@ mod tests {
         .insert(&conn)
         .await?;
 
-        let mut invocation_caps = Capabilities::new();
         let mut invocation_nb = std::collections::BTreeMap::new();
         for (key, value) in constrained_caveat
             .as_object()
@@ -3176,24 +3175,28 @@ mod tests {
         {
             invocation_nb.insert(key.clone(), value.clone());
         }
-        invocation_caps.with_action(
-            sql_resource.as_uri(),
-            "tinycloud.sql/read".parse::<UcanAbility>()?,
-            [invocation_nb],
-        );
         let parent_cid: AuthCid = delegation_hash.to_cid(0x55);
-        let invocation = Payload {
-            issuer: holder_verification_method.parse::<DIDURLBuf>()?,
-            audience: holder_did.parse::<DIDBuf>()?,
-            not_before: None,
-            expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
-            nonce: Some("urn:uuid:00000000-0000-4000-8000-0000000000w5".to_string()),
-            facts: Some(Vec::<serde_json::Value>::new()),
-            proof: vec![parent_cid],
-            attenuation: invocation_caps,
-        }
-        .sign(holder_jwk.get_algorithm().unwrap_or_default(), &holder_jwk)?;
-        let auth_header = invocation.encode()?;
+        let make_auth_header = |nonce: &str| -> Result<String> {
+            let mut invocation_caps = Capabilities::new();
+            invocation_caps.with_action(
+                sql_resource.as_uri(),
+                "tinycloud.sql/read".parse::<UcanAbility>()?,
+                [invocation_nb.clone()],
+            );
+            let invocation = Payload {
+                issuer: holder_verification_method.parse::<DIDURLBuf>()?,
+                audience: holder_did.parse::<DIDBuf>()?,
+                not_before: None,
+                expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
+                nonce: Some(nonce.to_string()),
+                facts: Some(Vec::<serde_json::Value>::new()),
+                proof: vec![parent_cid],
+                attenuation: invocation_caps,
+            }
+            .sign(holder_jwk.get_algorithm().unwrap_or_default(), &holder_jwk)?;
+            Ok(invocation.encode()?)
+        };
+        let auth_header = make_auth_header("urn:uuid:00000000-0000-4000-8000-0000000000w5")?;
 
         let rocket = rocket::build()
             .mount("/", routes![invoke])
@@ -3204,6 +3207,7 @@ mod tests {
             .manage(sql_service)
             .manage(Config::default())
             .manage(QuotaCache::new(None, None))
+            .manage(InvocationReplayCache::new())
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
 
@@ -3236,6 +3240,7 @@ mod tests {
         .insert(&conn)
         .await?;
 
+        let auth_header = make_auth_header("urn:uuid:00000000-0000-4000-8000-0000000000w6")?;
         let response = client
             .post("/invoke")
             .header(Header::new("Authorization", auth_header.clone()))
