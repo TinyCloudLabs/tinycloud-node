@@ -222,7 +222,10 @@ pub fn create_authorizer(
             if !is_admin
                 && !matches!(
                     ability.as_str(),
-                    "tinycloud.sql/write" | "tinycloud.sql/ddl" | "tinycloud.sql/*"
+                    "tinycloud.sql/write"
+                        | "tinycloud.sql/schema"
+                        | "tinycloud.sql/ddl"
+                        | "tinycloud.sql/*"
                 )
             {
                 Authorization::Deny
