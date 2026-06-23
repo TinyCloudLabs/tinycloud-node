@@ -238,6 +238,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sql_ddl_ability_can_create_schema() {
+        let repo = artifact_repository().await;
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("sql-ddl");
+        let service = SqlService::new(cache.path().to_string_lossy().to_string(), u64::MAX, repo);
+
+        service
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: None,
+                    sql: "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
+                        .to_string(),
+                    params: Vec::new(),
+                },
+                None,
+                "tinycloud.sql/ddl".to_string(),
+            )
+            .await
+            .expect("ddl ability should create tables");
+    }
+
+    #[tokio::test]
     async fn sql_write_survives_service_recreation_with_empty_cache() {
         let repo = artifact_repository().await;
         let cache_one = TempDir::new().unwrap();

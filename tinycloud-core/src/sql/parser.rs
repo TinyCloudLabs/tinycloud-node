@@ -109,11 +109,11 @@ pub fn validate_sql(
     if is_ddl
         && !matches!(
             ability,
-            "tinycloud.sql/admin" | "tinycloud.sql/write" | "tinycloud.sql/*"
+            "tinycloud.sql/admin" | "tinycloud.sql/write" | "tinycloud.sql/ddl" | "tinycloud.sql/*"
         )
     {
         return Err(SqlError::PermissionDenied(
-            "DDL operations require admin or write ability".to_string(),
+            "DDL operations require admin, write, or ddl ability".to_string(),
         ));
     }
 
@@ -416,5 +416,18 @@ mod tests {
 
         assert!(parsed.is_read_only);
         assert!(parsed.write_targets.is_empty());
+    }
+
+    #[test]
+    fn validate_sql_allows_ddl_ability_for_schema_changes() {
+        let parsed = validate_sql(
+            "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)",
+            &None,
+            "tinycloud.sql/ddl",
+        )
+        .expect("ddl ability should allow schema changes");
+
+        assert!(parsed.is_ddl);
+        assert!(!parsed.is_read_only);
     }
 }
