@@ -1999,6 +1999,7 @@ fn preferred_database_ability<'a>(
     let preferred_abilities: &[&str] = match service {
         "sql" => &[
             "tinycloud.sql/write",
+            "tinycloud.sql/schema",
             "tinycloud.sql/ddl",
             "tinycloud.sql/admin",
             "tinycloud.sql/*",
@@ -2399,7 +2400,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn select_database_scope_accepts_sql_ddl_ability() {
+    async fn select_database_scope_accepts_sql_schema_ability() {
+        let space = test_space_id("alpha");
+        let caps = vec![(
+            space.clone(),
+            Some("main.db".to_string()),
+            "tinycloud.sql/schema".to_string(),
+        )];
+
+        let (selected_space, selected_path, ability) = select_database_scope(&caps, "sql").unwrap();
+
+        assert_eq!(selected_space, &space);
+        assert_eq!(selected_path, Some("main.db"));
+        assert_eq!(ability, "tinycloud.sql/schema");
+    }
+
+    #[tokio::test]
+    async fn select_database_scope_accepts_legacy_sql_ddl_ability() {
         let space = test_space_id("alpha");
         let caps = vec![(
             space.clone(),

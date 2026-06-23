@@ -238,10 +238,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_ddl_ability_can_create_schema() {
+    async fn sql_schema_ability_can_create_schema() {
         let repo = artifact_repository().await;
         let cache = TempDir::new().unwrap();
-        let space = test_space_id("sql-ddl");
+        let space = test_space_id("sql-schema");
         let service = SqlService::new(cache.path().to_string_lossy().to_string(), u64::MAX, repo);
 
         service
@@ -255,10 +255,10 @@ mod tests {
                     params: Vec::new(),
                 },
                 None,
-                "tinycloud.sql/ddl".to_string(),
+                "tinycloud.sql/schema".to_string(),
             )
             .await
-            .expect("ddl ability should create tables");
+            .expect("schema ability should create tables");
     }
 
     #[tokio::test]
