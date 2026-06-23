@@ -1940,7 +1940,7 @@ fn select_database_scope<'a>(
     ),
     (Status, String),
 > {
-    let Some((space, _path, ability)) = caps.first() else {
+    let Some((space, _path, _ability)) = caps.first() else {
         return Err((
             Status::BadRequest,
             format!("No {service} capabilities found"),
@@ -1959,11 +1959,14 @@ fn select_database_scope<'a>(
 
     let path_ref = select_database_path(caps, service)?;
 
-    Ok((
-        space,
-        path_ref,
-        preferred_database_ability(caps, service).unwrap_or(ability.as_str()),
-    ))
+    let Some(ability) = preferred_database_ability(caps, service) else {
+        return Err((
+            Status::Unauthorized,
+            format!("No supported {service} capabilities found"),
+        ));
+    };
+
+    Ok((space, path_ref, ability))
 }
 
 fn select_database_path<'a>(
@@ -2000,7 +2003,6 @@ fn preferred_database_ability<'a>(
         "sql" => &[
             "tinycloud.sql/write",
             "tinycloud.sql/schema",
-            "tinycloud.sql/ddl",
             "tinycloud.sql/admin",
             "tinycloud.sql/*",
             "tinycloud.sql/read",
@@ -2416,19 +2418,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn select_database_scope_accepts_legacy_sql_ddl_ability() {
+    async fn select_database_scope_rejects_sql_ddl_ability() {
         let space = test_space_id("alpha");
         let caps = vec![(
-            space.clone(),
+            space,
             Some("main.db".to_string()),
             "tinycloud.sql/ddl".to_string(),
         )];
 
-        let (selected_space, selected_path, ability) = select_database_scope(&caps, "sql").unwrap();
+        let err = select_database_scope(&caps, "sql").unwrap_err();
 
-        assert_eq!(selected_space, &space);
-        assert_eq!(selected_path, Some("main.db"));
-        assert_eq!(ability, "tinycloud.sql/ddl");
+        assert_eq!(err.0, Status::Unauthorized);
     }
 
     #[tokio::test]

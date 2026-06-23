@@ -112,7 +112,6 @@ pub fn validate_sql(
             "tinycloud.sql/admin"
                 | "tinycloud.sql/write"
                 | "tinycloud.sql/schema"
-                | "tinycloud.sql/ddl"
                 | "tinycloud.sql/*"
         )
     {
@@ -436,15 +435,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_sql_accepts_legacy_ddl_ability_for_schema_changes() {
-        let parsed = validate_sql(
+    fn validate_sql_rejects_ddl_ability_for_schema_changes() {
+        let err = validate_sql(
             "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)",
             &None,
             "tinycloud.sql/ddl",
         )
-        .expect("legacy ddl ability should allow schema changes");
+        .expect_err("ddl ability is not a schema permission");
 
-        assert!(parsed.is_ddl);
-        assert!(!parsed.is_read_only);
+        assert!(matches!(err, SqlError::PermissionDenied(_)));
     }
 }
