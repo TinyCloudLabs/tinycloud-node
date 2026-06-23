@@ -224,7 +224,6 @@ pub fn create_authorizer(
                     ability.as_str(),
                     "tinycloud.sql/write"
                         | "tinycloud.sql/schema"
-                        | "tinycloud.sql/ddl"
                         | "tinycloud.sql/*"
                 )
             {
