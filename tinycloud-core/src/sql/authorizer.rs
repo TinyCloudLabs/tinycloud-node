@@ -219,7 +219,12 @@ pub fn create_authorizer(
         // SQLite fires SQLITE_REINDEX while building an index; gate it like the
         // CreateIndex it accompanies so an authorized CREATE INDEX can complete.
         | AuthAction::Reindex { .. } => {
-            if !is_admin && !matches!(ability.as_str(), "tinycloud.sql/write" | "tinycloud.sql/*") {
+            if !is_admin
+                && !matches!(
+                    ability.as_str(),
+                    "tinycloud.sql/write" | "tinycloud.sql/ddl" | "tinycloud.sql/*"
+                )
+            {
                 Authorization::Deny
             } else {
                 Authorization::Allow
