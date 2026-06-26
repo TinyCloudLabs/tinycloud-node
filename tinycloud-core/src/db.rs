@@ -173,6 +173,10 @@ where
             .begin_with_config(None, Some(sea_orm::AccessMode::ReadOnly))
             .await
     }
+
+    pub async fn writable(&self) -> Result<DatabaseTransaction, DbErr> {
+        self.conn.begin().await
+    }
 }
 
 impl<C, B, K> SpaceDatabase<C, B, K>
@@ -1188,22 +1192,7 @@ async fn get_kv_entity<C: ConnectionTrait>(
     key: &Path,
     // TODO version: Option<(i64, Hash, i64)>,
 ) -> Result<Option<kv_write::Model>, DbErr> {
-    // Ok(if let Some((seq, epoch, epoch_seq)) = version {
-    //     event_order::Entity::find_by_id((epoch, epoch_seq, space_id.clone().into()))
-    //         .reverse_join(kv_write::Entity)
-    //         .find_also_related(kv_delete::Entity)
-    //         .filter(
-    //             Condition::all()
-    //                 .add(kv_write::Column::Key.eq(key))
-    //                 .add(kv_write::Column::Space.eq(space_id.clone().into()))
-    //                 .add(kv_delete::Column::InvocationId.is_null()),
-    //         )
-    //         .one(db)
-    //         .await?
-    //         .map(|(kv, _)| kv)
-    // } else {
-    // we want to find the latest kv_write which is not deleted
-    Ok(kv_write::Entity::find()
+    let latest_write = kv_write::Entity::find()
         .filter(
             Condition::all()
                 .add(kv_write::Column::Key.eq(key.as_str()))
@@ -1212,11 +1201,51 @@ async fn get_kv_entity<C: ConnectionTrait>(
         .order_by_desc(kv_write::Column::Seq)
         .order_by_desc(kv_write::Column::Epoch)
         .order_by_desc(kv_write::Column::EpochSeq)
-        .find_also_related(kv_delete::Entity)
-        .filter(kv_delete::Column::InvocationId.is_null())
         .one(db)
+        .await?;
+
+    let latest_write_order = latest_write
+        .as_ref()
+        .map(|row| (row.seq, row.epoch, row.epoch_seq));
+
+    let mut latest_delete_order: Option<(i64, Hash, i64)> = None;
+    for delete in kv_delete::Entity::find()
+        .filter(
+            Condition::all()
+                .add(kv_delete::Column::Key.eq(key.as_str()))
+                .add(kv_delete::Column::Space.eq(SpaceIdWrap(space_id.clone()))),
+        )
+        .all(db)
         .await?
-        .map(|(kv, _)| kv))
+    {
+        let Some(delete_order) = event_order::Entity::find()
+            .filter(event_order::Column::Space.eq(SpaceIdWrap(space_id.clone())))
+            .filter(event_order::Column::Event.eq(delete.invocation_id))
+            .one(db)
+            .await?
+        else {
+            continue;
+        };
+
+        let candidate = (delete_order.seq, delete_order.epoch, delete_order.epoch_seq);
+        if latest_delete_order
+            .as_ref()
+            .map(|current| candidate > *current)
+            .unwrap_or(true)
+        {
+            latest_delete_order = Some(candidate);
+        }
+    }
+
+    if latest_delete_order
+        .as_ref()
+        .zip(latest_write_order.as_ref())
+        .is_some_and(|(delete_order, write_order)| delete_order > write_order)
+    {
+        return Ok(None);
+    }
+
+    Ok(latest_write)
 }
 
 async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(

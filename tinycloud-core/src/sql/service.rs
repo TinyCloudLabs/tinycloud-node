@@ -7,6 +7,7 @@ use dashmap::DashMap;
 use tinycloud_auth::resource::SpaceId;
 
 use crate::database_artifacts::{DatabaseArtifactError, DatabaseArtifactRepository};
+use crate::hash::hash;
 
 use super::{
     caveats::SqlCaveats,
@@ -83,31 +84,56 @@ impl SqlService {
 
     pub async fn export(&self, space: &SpaceId, db_name: &str) -> Result<Vec<u8>, SqlError> {
         let key = (space.to_string(), db_name.to_string());
-
-        // If there's a live actor, route through it (handles both in-memory and file-backed)
-        if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
-            match handle.export().await {
-                Err(SqlError::Internal(ref msg))
-                    if msg.contains("Database actor not available") =>
-                {
-                    // Actor is dead — remove stale entry and fall through to cold read
-                    tracing::warn!(space=%space, db=%db_name, "Dead SQL actor detected during export, removing");
-                    self.databases.remove(&key);
-                }
-                other => return other,
-            }
-        }
-
-        match self
+        let artifact = self
             .artifact_repository
             .load("sql", &space.to_string(), db_name)
             .await
-            .map_err(artifact_error_to_sql)?
-        {
-            Some(artifact) => {
-                remove_sql_cache_files(&self.cache_path(space, db_name)).await?;
-                write_cache_file(&self.cache_path(space, db_name), &artifact.payload).await?;
-                Ok(artifact.payload)
+            .map_err(artifact_error_to_sql)?;
+
+        if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
+            if let Some(artifact) = artifact.as_ref() {
+                match handle.export().await {
+                    Ok(payload) => {
+                        let live_hash = hash(&payload).to_cid(0x55).to_string();
+                        if live_hash == artifact.content_hash {
+                            return Ok(payload);
+                        }
+                    }
+                    Err(SqlError::Internal(ref msg))
+                        if msg.contains("Database actor not available") =>
+                    {
+                        tracing::warn!(
+                            space=%space,
+                            db=%db_name,
+                            "Dead SQL actor detected during export, removing"
+                        );
+                    }
+                    Err(err) => return Err(err),
+                }
+
+                let _ = self.discard_local_state(&key).await;
+            } else {
+                return handle.export().await;
+            }
+        }
+
+        match artifact {
+            Some(_) => {
+                self.hydrate_cache(space, db_name).await?;
+                let handle = self
+                    .databases
+                    .entry(key)
+                    .or_insert_with(|| {
+                        spawn_actor(
+                            space.to_string(),
+                            db_name.to_string(),
+                            self.base_path.clone(),
+                            self.memory_threshold,
+                            self.databases.clone(),
+                        )
+                    })
+                    .clone();
+                handle.export().await
             }
             None => Err(SqlError::DatabaseNotFound),
         }
@@ -120,8 +146,40 @@ impl SqlService {
 
     async fn handle(&self, space: &SpaceId, db_name: &str) -> Result<DatabaseHandle, SqlError> {
         let key = (space.to_string(), db_name.to_string());
+
+        // If reconciliation replaced the durable artifact, drop any stale live
+        // actor so the next access rehydrates from the winning payload.
+        let artifact = self
+            .artifact_repository
+            .load("sql", &space.to_string(), db_name)
+            .await
+            .map_err(artifact_error_to_sql)?;
+
         if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
-            return Ok(handle);
+            if let Some(artifact) = artifact.as_ref() {
+                match handle.export().await {
+                    Ok(payload) => {
+                        let live_hash = hash(&payload).to_cid(0x55).to_string();
+                        if live_hash == artifact.content_hash {
+                            return Ok(handle);
+                        }
+                    }
+                    Err(SqlError::Internal(ref msg))
+                        if msg.contains("Database actor not available") =>
+                    {
+                        tracing::warn!(
+                            space=%space,
+                            db=%db_name,
+                            "Dead SQL actor detected during refresh, removing"
+                        );
+                    }
+                    Err(err) => return Err(err),
+                }
+
+                let _ = self.discard_local_state(&key).await;
+            } else {
+                return Ok(handle);
+            }
         }
 
         self.hydrate_cache(space, db_name).await?;

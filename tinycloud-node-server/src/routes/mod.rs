@@ -2,9 +2,13 @@ use anyhow::Result;
 use futures::io::AsyncWriteExt;
 use percent_encoding::percent_decode_str;
 use rocket::{data::ToByteUnit, http::Status, serde::json::Json, State};
-use serde::Serialize;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    path::{Path as StdPath, PathBuf},
+};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use tinycloud_auth::identity::did_principal_matches;
 use tinycloud_auth::resource::{Path, SpaceId};
 use tokio::io::AsyncReadExt;
 use tokio_util::compat::TokioAsyncReadCompatExt;
@@ -22,7 +26,7 @@ use crate::{
         validate_signed_kv_ticket, SignedKvUrlRequest, SignedKvUrlResponse, SignedUrlRuntime,
     },
     tracing::TracingSpan,
-    BlockStage, BlockStores, TinyCloud,
+    BlockConfig, BlockStage, BlockStores, TinyCloud,
 };
 #[cfg(feature = "duckdb")]
 use tinycloud_core::duckdb::{
@@ -31,9 +35,18 @@ use tinycloud_core::duckdb::{
 use tinycloud_core::{
     encryption_network::EncryptionService,
     events::Invocation,
-    models::{hook_delivery, hook_subscription, kv_delete, kv_write},
-    sea_orm::DbErr,
-    sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder},
+    hash::Hash,
+    models::{
+        abilities, actor, database_artifact, delegation, epoch, hook_delivery, hook_subscription,
+        invocation, kv_delete, kv_write, revocation, space,
+    },
+    relationships::{epoch_order, event_order, invoked_abilities, parent_delegations},
+    sea_orm::sea_query::OnConflict,
+    sea_orm::ActiveValue::Set,
+    sea_orm::{
+        self, ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter,
+        QueryOrder,
+    },
     sql::{SqlCaveats, SqlError, SqlRequest, SqlService},
     storage::{HashBuffer, ImmutableReadStore, ImmutableStaging},
     types::{Metadata, Resource},
@@ -101,6 +114,1380 @@ pub fn version(
     encryption: &State<EncryptionService>,
 ) -> Json<NodeInfo> {
     Json(build_info(tee, quota_cache, encryption))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalFactRangeResponse {
+    pub node_id: String,
+    pub planes: Vec<LocalFactPlaneRange>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalFactPlaneRange {
+    pub name: &'static str,
+    pub empty: bool,
+    pub tables: Vec<LocalFactTableRange>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalFactTableRange {
+    pub name: &'static str,
+    pub empty: bool,
+    pub count: usize,
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub keys: Vec<String>,
+}
+
+fn hash_to_cid(hash: Hash) -> String {
+    hash.to_cid(0x55).to_string()
+}
+
+fn build_table_range(name: &'static str, mut keys: Vec<String>) -> LocalFactTableRange {
+    keys.sort_unstable();
+    keys.dedup();
+
+    let count = keys.len();
+    let empty = count == 0;
+    let start = keys.first().cloned();
+    let end = keys.last().cloned();
+
+    LocalFactTableRange {
+        name,
+        empty,
+        count,
+        start,
+        end,
+        keys,
+    }
+}
+
+fn build_plane_range(name: &'static str, tables: Vec<LocalFactTableRange>) -> LocalFactPlaneRange {
+    let empty = tables.iter().all(|table| table.empty);
+
+    LocalFactPlaneRange {
+        name,
+        empty,
+        tables,
+    }
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    base64::encode(bytes)
+}
+
+fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
+    base64::decode(value).map_err(|err| err.to_string())
+}
+
+fn format_rfc3339(value: &OffsetDateTime) -> String {
+    value
+        .format(&Rfc3339)
+        .expect("current timestamps should format as RFC3339")
+}
+
+fn parse_rfc3339(value: Option<String>) -> Result<Option<OffsetDateTime>, String> {
+    match value {
+        Some(value) => OffsetDateTime::parse(&value, &Rfc3339)
+            .map(Some)
+            .map_err(|err| err.to_string()),
+        None => Ok(None),
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconciliationSnapshot {
+    pub node_id: String,
+    pub spaces: Vec<ReconciliationSpace>,
+    pub actors: Vec<ReconciliationActor>,
+    pub delegations: Vec<ReconciliationDelegation>,
+    pub revocations: Vec<ReconciliationRevocation>,
+    pub abilities: Vec<ReconciliationAbility>,
+    pub parent_delegations: Vec<ReconciliationParentDelegation>,
+    pub invocations: Vec<ReconciliationInvocation>,
+    pub invoked_abilities: Vec<ReconciliationInvokedAbility>,
+    pub kv_writes: Vec<ReconciliationKvWrite>,
+    pub kv_deletes: Vec<ReconciliationKvDelete>,
+    pub database_artifacts: Vec<ReconciliationDatabaseArtifact>,
+    pub epochs: Vec<ReconciliationEpoch>,
+    pub epoch_orders: Vec<ReconciliationEpochOrder>,
+    pub event_orders: Vec<ReconciliationEventOrder>,
+    pub blocks: Vec<ReconciliationBlock>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconciliationSpace {
+    pub id: tinycloud_core::types::SpaceIdWrap,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconciliationActor {
+    pub id: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconciliationDelegation {
+    pub id: String,
+    pub delegator: String,
+    pub delegatee: String,
+    pub expiry: Option<String>,
+    pub issued_at: Option<String>,
+    pub not_before: Option<String>,
+    pub facts: Option<tinycloud_core::types::Facts>,
+    pub serialization: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconciliationRevocation {
+    pub id: String,
+    pub revoker: String,
+    pub revoked: String,
+    pub serialization: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconciliationAbility {
+    pub resource: Resource,
+    pub ability: tinycloud_core::types::Ability,
+    pub delegation: String,
+    pub caveats: tinycloud_core::types::Caveats,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconciliationParentDelegation {
+    pub parent: String,
+    pub child: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconciliationInvocation {
+    pub id: String,
+    pub invoker: String,
+    pub issued_at: String,
+    pub facts: Option<tinycloud_core::types::Facts>,
+    pub serialization: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconciliationInvokedAbility {
+    pub invocation: String,
+    pub resource: Resource,
+    pub ability: tinycloud_core::types::Ability,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconciliationKvWrite {
+    pub space: tinycloud_core::types::SpaceIdWrap,
+    pub key: tinycloud_core::types::Path,
+    pub invocation: String,
+    pub seq: i64,
+    pub epoch: String,
+    pub epoch_seq: i64,
+    pub value: String,
+    pub metadata: Metadata,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconciliationKvDelete {
+    pub invocation_id: String,
+    pub space: tinycloud_core::types::SpaceIdWrap,
+    pub key: tinycloud_core::types::Path,
+    pub deleted_invocation_id: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconciliationDatabaseArtifact {
+    pub service: String,
+    pub space: String,
+    pub name: String,
+    pub revision: i64,
+    pub content_hash: String,
+    pub payload: String,
+    pub size_bytes: i64,
+    pub backend: String,
+    pub storage_mode: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconciliationEpoch {
+    pub seq: i64,
+    pub id: String,
+    pub space: tinycloud_core::types::SpaceIdWrap,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconciliationEpochOrder {
+    pub parent: String,
+    pub child: String,
+    pub space: tinycloud_core::types::SpaceIdWrap,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconciliationEventOrder {
+    pub seq: i64,
+    pub epoch: String,
+    pub epoch_seq: i64,
+    pub event: String,
+    pub space: tinycloud_core::types::SpaceIdWrap,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconciliationBlock {
+    pub path: String,
+    pub bytes: String,
+}
+
+macro_rules! collect_table_range {
+    ($db:expr, $entity:ty, $name:expr, $mapper:expr) => {{
+        let keys = <$entity>::find()
+            .all($db)
+            .await?
+            .into_iter()
+            .map($mapper)
+            .collect::<Vec<_>>();
+        build_table_range($name, keys)
+    }};
+}
+
+async fn local_fact_ranges(
+    tinycloud: &State<TinyCloud>,
+    encryption: &State<EncryptionService>,
+) -> Result<LocalFactRangeResponse, DbErr> {
+    let tx = tinycloud.readable().await?;
+
+    let auth_fact_plane = build_plane_range(
+        "authFacts",
+        vec![
+            collect_table_range!(&tx, space::Entity, "space", |row: space::Model| {
+                format!("space:{}", row.id.0)
+            }),
+            collect_table_range!(&tx, actor::Entity, "actor", |row: actor::Model| {
+                format!("actor:{}", row.id)
+            }),
+            collect_table_range!(
+                &tx,
+                delegation::Entity,
+                "delegation",
+                |row: delegation::Model| {
+                    format!(
+                        "delegation:{}|{}|{}",
+                        hash_to_cid(row.id),
+                        row.delegator,
+                        row.delegatee
+                    )
+                }
+            ),
+            collect_table_range!(
+                &tx,
+                revocation::Entity,
+                "revocation",
+                |row: revocation::Model| {
+                    format!(
+                        "revocation:{}|{}|{}",
+                        hash_to_cid(row.id),
+                        row.revoker,
+                        hash_to_cid(row.revoked)
+                    )
+                }
+            ),
+            collect_table_range!(
+                &tx,
+                abilities::Entity,
+                "ability",
+                |row: abilities::Model| {
+                    format!(
+                        "ability:{}|{}|{}",
+                        row.resource,
+                        row.ability,
+                        hash_to_cid(row.delegation)
+                    )
+                }
+            ),
+            collect_table_range!(
+                &tx,
+                parent_delegations::Entity,
+                "parentDelegation",
+                |row: parent_delegations::Model| {
+                    format!(
+                        "parent-delegation:{}|{}",
+                        hash_to_cid(row.parent),
+                        hash_to_cid(row.child)
+                    )
+                }
+            ),
+        ],
+    );
+
+    let authored_fact_plane = build_plane_range(
+        "authoredFacts",
+        vec![
+            collect_table_range!(
+                &tx,
+                invocation::Entity,
+                "invocation",
+                |row: invocation::Model| {
+                    format!("invocation:{}|{}", hash_to_cid(row.id), row.invoker)
+                }
+            ),
+            collect_table_range!(
+                &tx,
+                invoked_abilities::Entity,
+                "invokedAbilities",
+                |row: invoked_abilities::Model| {
+                    format!(
+                        "invoked-ability:{}|{}|{}",
+                        hash_to_cid(row.invocation),
+                        row.resource,
+                        row.ability
+                    )
+                }
+            ),
+            collect_table_range!(&tx, kv_write::Entity, "kvWrite", |row: kv_write::Model| {
+                format!(
+                    "kv-write:{}|{}|{}|{}",
+                    row.space.0,
+                    row.key,
+                    hash_to_cid(row.invocation),
+                    hash_to_cid(row.value)
+                )
+            }),
+            collect_table_range!(
+                &tx,
+                kv_delete::Entity,
+                "kvDelete",
+                |row: kv_delete::Model| {
+                    format!(
+                        "kv-delete:{}|{}|{}|{}",
+                        row.space.0,
+                        row.key,
+                        hash_to_cid(row.invocation_id),
+                        hash_to_cid(row.deleted_invocation_id)
+                    )
+                }
+            ),
+        ],
+    );
+
+    let blob_plane = build_plane_range(
+        "blobs",
+        vec![collect_table_range!(
+            &tx,
+            database_artifact::Entity,
+            "databaseArtifact",
+            |row: database_artifact::Model| {
+                format!(
+                    "database-artifact:{}|{}|{}|{:020}|{}",
+                    row.service, row.space, row.name, row.revision, row.content_hash
+                )
+            }
+        )],
+    );
+
+    let derived_view_input_plane = build_plane_range(
+        "derivedViewInputs",
+        vec![
+            collect_table_range!(&tx, epoch::Entity, "epoch", |row: epoch::Model| {
+                format!(
+                    "epoch:{}|{:020}|{}",
+                    row.space.0,
+                    row.seq,
+                    hash_to_cid(row.id)
+                )
+            }),
+            collect_table_range!(
+                &tx,
+                epoch_order::Entity,
+                "epochOrder",
+                |row: epoch_order::Model| {
+                    format!(
+                        "epoch-order:{}|{}|{}",
+                        row.space.0,
+                        hash_to_cid(row.parent),
+                        hash_to_cid(row.child)
+                    )
+                }
+            ),
+            collect_table_range!(
+                &tx,
+                event_order::Entity,
+                "eventOrder",
+                |row: event_order::Model| {
+                    format!(
+                        "event-order:{}|{}|{:020}|{:020}|{}",
+                        row.space.0,
+                        hash_to_cid(row.epoch),
+                        row.epoch_seq,
+                        row.seq,
+                        hash_to_cid(row.event)
+                    )
+                }
+            ),
+        ],
+    );
+
+    Ok(LocalFactRangeResponse {
+        node_id: encryption.node_did().to_string(),
+        planes: vec![
+            auth_fact_plane,
+            authored_fact_plane,
+            blob_plane,
+            derived_view_input_plane,
+        ],
+    })
+}
+
+#[get("/reconciliation/ranges")]
+pub async fn reconciliation_ranges(
+    tinycloud: &State<TinyCloud>,
+    encryption: &State<EncryptionService>,
+) -> Result<Json<LocalFactRangeResponse>, (Status, String)> {
+    local_fact_ranges(tinycloud, encryption)
+        .await
+        .map(Json)
+        .map_err(|e| (Status::InternalServerError, e.to_string()))
+}
+
+fn has_host_capability(delegation: &DelegationInfo) -> bool {
+    delegation.capabilities.iter().any(|cap| {
+        cap.ability.to_string() == "tinycloud.space/host" && cap.resource.space().is_some()
+    })
+}
+
+fn validate_host_reconciliation_access(
+    delegation: &DelegationInfo,
+) -> Result<(), (Status, String)> {
+    if !has_host_capability(delegation) {
+        return Err((Status::Unauthorized, "Host delegation required".to_string()));
+    }
+
+    let space = delegation
+        .capabilities
+        .iter()
+        .find_map(|cap| cap.resource.space())
+        .ok_or_else(|| {
+            (
+                Status::Unauthorized,
+                "Host delegation must target a space".to_string(),
+            )
+        })?;
+
+    if !did_principal_matches(space.did().as_str(), &delegation.delegator) {
+        return Err((
+            Status::Unauthorized,
+            "Host delegation must be issued by the space owner".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn local_block_root(config: &Config) -> Result<PathBuf, String> {
+    match &config.storage.blocks {
+        BlockConfig::B(fs) => Ok(fs.path().to_path_buf()),
+        BlockConfig::A(_) => Err(
+            "host-host reconciliation currently requires local filesystem block storage"
+                .to_string(),
+        ),
+    }
+}
+
+async fn collect_block_snapshots(root: &StdPath) -> Result<Vec<ReconciliationBlock>, String> {
+    let mut snapshots = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+
+    while let Some(current) = stack.pop() {
+        let mut dir = match tokio::fs::read_dir(&current).await {
+            Ok(dir) => dir,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.to_string()),
+        };
+
+        while let Some(entry) = dir.next_entry().await.map_err(|err| err.to_string())? {
+            let ty = entry.file_type().await.map_err(|err| err.to_string())?;
+            let path = entry.path();
+            if ty.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !ty.is_file() {
+                continue;
+            }
+
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|err| err.to_string())?
+                .to_string_lossy()
+                .into_owned();
+            let bytes = tokio::fs::read(&path)
+                .await
+                .map_err(|err| err.to_string())?;
+            snapshots.push(ReconciliationBlock {
+                path: rel,
+                bytes: encode_base64(&bytes),
+            });
+        }
+    }
+
+    snapshots.sort_by(|a, b| a.path.cmp(&b.path));
+    snapshots.dedup_by(|a, b| a.path == b.path);
+    Ok(snapshots)
+}
+
+async fn write_block_snapshots(
+    root: &StdPath,
+    blocks: &[ReconciliationBlock],
+) -> Result<(), String> {
+    for block in blocks {
+        let path = root.join(&block.path);
+        let bytes = decode_base64(&block.bytes)?;
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|err| err.to_string())?;
+        }
+        tokio::fs::write(&path, bytes)
+            .await
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+async fn insert_many_ignore<E, C, M>(
+    db: &C,
+    rows: Vec<M>,
+    conflict: OnConflict,
+) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+    E: EntityTrait,
+    E::ActiveModel: sea_orm::ActiveModelTrait<Entity = E>,
+    M: sea_orm::IntoActiveModel<E::ActiveModel>,
+{
+    let _ = conflict;
+    let rows = rows
+        .into_iter()
+        .map(sea_orm::IntoActiveModel::into_active_model)
+        .collect::<Vec<_>>();
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let mut conflict = OnConflict::new();
+    conflict.do_nothing();
+
+    match E::insert_many(rows).on_conflict(conflict).exec(db).await {
+        Err(DbErr::RecordNotInserted) => Ok(()),
+        result => {
+            result?;
+            Ok(())
+        }
+    }
+}
+
+// Deterministic SQL reducer policy:
+// prefer the higher revision, then break ties by content hash so every peer
+// converges on the same winning materialized view without consulting clocks.
+fn database_artifact_prefers_incoming(
+    existing: &database_artifact::Model,
+    incoming: &database_artifact::Model,
+) -> bool {
+    incoming.revision > existing.revision
+        || (incoming.revision == existing.revision && incoming.content_hash > existing.content_hash)
+}
+
+async fn upsert_database_artifact<C>(
+    db: &C,
+    incoming: database_artifact::Model,
+) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    let key = (
+        incoming.service.clone(),
+        incoming.space.clone(),
+        incoming.name.clone(),
+    );
+    let existing = database_artifact::Entity::find_by_id(key).one(db).await?;
+
+    if let Some(existing) = existing.as_ref() {
+        if !database_artifact_prefers_incoming(existing, &incoming) {
+            return Ok(());
+        }
+    }
+
+    let active = database_artifact::ActiveModel {
+        service: Set(incoming.service),
+        space: Set(incoming.space),
+        name: Set(incoming.name),
+        revision: Set(incoming.revision),
+        content_hash: Set(incoming.content_hash),
+        payload: Set(incoming.payload),
+        size_bytes: Set(incoming.size_bytes),
+        backend: Set(incoming.backend),
+        storage_mode: Set(incoming.storage_mode),
+        created_at: Set(incoming.created_at),
+        updated_at: Set(incoming.updated_at),
+    };
+
+    match existing {
+        Some(_) => {
+            active.update(db).await?;
+        }
+        None => {
+            active.insert(db).await?;
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconciliationApplyResponse {
+    pub node_id: String,
+    pub spaces: usize,
+    pub actors: usize,
+    pub delegations: usize,
+    pub revocations: usize,
+    pub abilities: usize,
+    pub parent_delegations: usize,
+    pub invocations: usize,
+    pub invoked_abilities: usize,
+    pub kv_writes: usize,
+    pub kv_deletes: usize,
+    pub database_artifacts: usize,
+    pub epochs: usize,
+    pub epoch_orders: usize,
+    pub event_orders: usize,
+    pub blocks: usize,
+}
+
+async fn build_reconciliation_snapshot(
+    tinycloud: &State<TinyCloud>,
+    config: &State<Config>,
+    encryption: &State<EncryptionService>,
+) -> Result<ReconciliationSnapshot, String> {
+    let tx = tinycloud.readable().await.map_err(|err| err.to_string())?;
+
+    let spaces = space::Entity::find()
+        .order_by_asc(space::Column::Id)
+        .all(&tx)
+        .await
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .map(|row| ReconciliationSpace { id: row.id })
+        .collect::<Vec<_>>();
+
+    let actors = actor::Entity::find()
+        .order_by_asc(actor::Column::Id)
+        .all(&tx)
+        .await
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .map(|row| ReconciliationActor { id: row.id })
+        .collect::<Vec<_>>();
+
+    let delegations = delegation::Entity::find()
+        .order_by_asc(delegation::Column::Id)
+        .all(&tx)
+        .await
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .map(|row| ReconciliationDelegation {
+            id: hash_to_cid(row.id),
+            delegator: row.delegator,
+            delegatee: row.delegatee,
+            expiry: row.expiry.as_ref().map(format_rfc3339),
+            issued_at: row.issued_at.as_ref().map(format_rfc3339),
+            not_before: row.not_before.as_ref().map(format_rfc3339),
+            facts: row.facts,
+            serialization: encode_base64(&row.serialization),
+        })
+        .collect::<Vec<_>>();
+
+    let revocations = revocation::Entity::find()
+        .order_by_asc(revocation::Column::Id)
+        .all(&tx)
+        .await
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .map(|row| ReconciliationRevocation {
+            id: hash_to_cid(row.id),
+            revoker: row.revoker,
+            revoked: hash_to_cid(row.revoked),
+            serialization: encode_base64(&row.serialization),
+        })
+        .collect::<Vec<_>>();
+
+    let abilities = abilities::Entity::find()
+        .order_by_asc(abilities::Column::Delegation)
+        .order_by_asc(abilities::Column::Resource)
+        .order_by_asc(abilities::Column::Ability)
+        .all(&tx)
+        .await
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .map(|row| ReconciliationAbility {
+            resource: row.resource,
+            ability: row.ability,
+            delegation: hash_to_cid(row.delegation),
+            caveats: row.caveats,
+        })
+        .collect::<Vec<_>>();
+
+    let parent_delegations = parent_delegations::Entity::find()
+        .order_by_asc(parent_delegations::Column::Parent)
+        .order_by_asc(parent_delegations::Column::Child)
+        .all(&tx)
+        .await
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .map(|row| ReconciliationParentDelegation {
+            parent: hash_to_cid(row.parent),
+            child: hash_to_cid(row.child),
+        })
+        .collect::<Vec<_>>();
+
+    let invocations = invocation::Entity::find()
+        .order_by_asc(invocation::Column::Id)
+        .all(&tx)
+        .await
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .map(|row| ReconciliationInvocation {
+            id: hash_to_cid(row.id),
+            invoker: row.invoker,
+            issued_at: format_rfc3339(&row.issued_at),
+            facts: row.facts,
+            serialization: encode_base64(&row.serialization),
+        })
+        .collect::<Vec<_>>();
+
+    let invoked_abilities = invoked_abilities::Entity::find()
+        .order_by_asc(invoked_abilities::Column::Invocation)
+        .order_by_asc(invoked_abilities::Column::Resource)
+        .order_by_asc(invoked_abilities::Column::Ability)
+        .all(&tx)
+        .await
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .map(|row| ReconciliationInvokedAbility {
+            invocation: hash_to_cid(row.invocation),
+            resource: row.resource,
+            ability: row.ability,
+        })
+        .collect::<Vec<_>>();
+
+    let kv_writes = kv_write::Entity::find()
+        .order_by_asc(kv_write::Column::Space)
+        .order_by_asc(kv_write::Column::Key)
+        .order_by_asc(kv_write::Column::Invocation)
+        .all(&tx)
+        .await
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .map(|row| ReconciliationKvWrite {
+            space: row.space,
+            key: row.key,
+            invocation: hash_to_cid(row.invocation),
+            seq: row.seq,
+            epoch: hash_to_cid(row.epoch),
+            epoch_seq: row.epoch_seq,
+            value: hash_to_cid(row.value),
+            metadata: row.metadata,
+        })
+        .collect::<Vec<_>>();
+
+    let kv_deletes = kv_delete::Entity::find()
+        .order_by_asc(kv_delete::Column::InvocationId)
+        .order_by_asc(kv_delete::Column::Space)
+        .order_by_asc(kv_delete::Column::Key)
+        .all(&tx)
+        .await
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .map(|row| ReconciliationKvDelete {
+            invocation_id: hash_to_cid(row.invocation_id),
+            space: row.space,
+            key: row.key,
+            deleted_invocation_id: hash_to_cid(row.deleted_invocation_id),
+        })
+        .collect::<Vec<_>>();
+
+    let database_artifacts = database_artifact::Entity::find()
+        .order_by_asc(database_artifact::Column::Service)
+        .order_by_asc(database_artifact::Column::Space)
+        .order_by_asc(database_artifact::Column::Name)
+        .all(&tx)
+        .await
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .map(|row| ReconciliationDatabaseArtifact {
+            service: row.service,
+            space: row.space,
+            name: row.name,
+            revision: row.revision,
+            content_hash: row.content_hash,
+            payload: encode_base64(&row.payload),
+            size_bytes: row.size_bytes,
+            backend: row.backend,
+            storage_mode: row.storage_mode,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })
+        .collect::<Vec<_>>();
+
+    let epochs = epoch::Entity::find()
+        .order_by_asc(epoch::Column::Space)
+        .order_by_asc(epoch::Column::Seq)
+        .order_by_asc(epoch::Column::Id)
+        .all(&tx)
+        .await
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .map(|row| ReconciliationEpoch {
+            seq: row.seq,
+            id: hash_to_cid(row.id),
+            space: row.space,
+        })
+        .collect::<Vec<_>>();
+
+    let epoch_orders = epoch_order::Entity::find()
+        .order_by_asc(epoch_order::Column::Space)
+        .order_by_asc(epoch_order::Column::Parent)
+        .order_by_asc(epoch_order::Column::Child)
+        .all(&tx)
+        .await
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .map(|row| ReconciliationEpochOrder {
+            parent: hash_to_cid(row.parent),
+            child: hash_to_cid(row.child),
+            space: row.space,
+        })
+        .collect::<Vec<_>>();
+
+    let event_orders = event_order::Entity::find()
+        .order_by_asc(event_order::Column::Space)
+        .order_by_asc(event_order::Column::Epoch)
+        .order_by_asc(event_order::Column::EpochSeq)
+        .order_by_asc(event_order::Column::Seq)
+        .all(&tx)
+        .await
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .map(|row| ReconciliationEventOrder {
+            seq: row.seq,
+            epoch: hash_to_cid(row.epoch),
+            epoch_seq: row.epoch_seq,
+            event: hash_to_cid(row.event),
+            space: row.space,
+        })
+        .collect::<Vec<_>>();
+
+    let blocks_root = local_block_root(config)?;
+    let blocks = collect_block_snapshots(&blocks_root).await?;
+
+    Ok(ReconciliationSnapshot {
+        node_id: encryption.node_did().to_string(),
+        spaces,
+        actors,
+        delegations,
+        revocations,
+        abilities,
+        parent_delegations,
+        invocations,
+        invoked_abilities,
+        kv_writes,
+        kv_deletes,
+        database_artifacts,
+        epochs,
+        epoch_orders,
+        event_orders,
+        blocks,
+    })
+}
+
+async fn apply_reconciliation_snapshot(
+    tinycloud: &State<TinyCloud>,
+    config: &State<Config>,
+    snapshot: ReconciliationSnapshot,
+) -> Result<ReconciliationApplyResponse, String> {
+    let blocks_root = local_block_root(config)?;
+    write_block_snapshots(&blocks_root, &snapshot.blocks).await?;
+
+    let tx = tinycloud.writable().await.map_err(|err| err.to_string())?;
+
+    insert_many_ignore::<space::Entity, _, _>(
+        &tx,
+        snapshot
+            .spaces
+            .iter()
+            .cloned()
+            .map(|row| space::Model { id: row.id })
+            .collect::<Vec<_>>(),
+        OnConflict::column(space::Column::Id)
+            .do_nothing()
+            .to_owned(),
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+
+    insert_many_ignore::<actor::Entity, _, _>(
+        &tx,
+        snapshot
+            .actors
+            .iter()
+            .cloned()
+            .map(|row| actor::Model { id: row.id })
+            .collect::<Vec<_>>(),
+        OnConflict::column(actor::Column::Id)
+            .do_nothing()
+            .to_owned(),
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+
+    insert_many_ignore::<delegation::Entity, _, _>(
+        &tx,
+        snapshot
+            .delegations
+            .iter()
+            .cloned()
+            .map(|row| {
+                let expiry = parse_rfc3339(row.expiry).map_err(|err| err.to_string())?;
+                let issued_at = parse_rfc3339(row.issued_at).map_err(|err| err.to_string())?;
+                let not_before = parse_rfc3339(row.not_before).map_err(|err| err.to_string())?;
+                Ok::<_, String>(delegation::Model {
+                    id: row
+                        .id
+                        .parse::<tinycloud_auth::ipld_core::cid::Cid>()
+                        .map_err(|err| err.to_string())?
+                        .into(),
+                    delegator: row.delegator,
+                    delegatee: row.delegatee,
+                    expiry,
+                    issued_at,
+                    not_before,
+                    facts: row.facts,
+                    serialization: decode_base64(&row.serialization)?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        OnConflict::column(delegation::Column::Id)
+            .do_nothing()
+            .to_owned(),
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+
+    insert_many_ignore::<revocation::Entity, _, _>(
+        &tx,
+        snapshot
+            .revocations
+            .iter()
+            .cloned()
+            .map(|row| {
+                Ok::<_, String>(revocation::Model {
+                    id: row
+                        .id
+                        .parse::<tinycloud_auth::ipld_core::cid::Cid>()
+                        .map_err(|err| err.to_string())?
+                        .into(),
+                    revoker: row.revoker,
+                    revoked: row
+                        .revoked
+                        .parse::<tinycloud_auth::ipld_core::cid::Cid>()
+                        .map_err(|err| err.to_string())?
+                        .into(),
+                    serialization: decode_base64(&row.serialization)?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        OnConflict::column(revocation::Column::Id)
+            .do_nothing()
+            .to_owned(),
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+
+    insert_many_ignore::<abilities::Entity, _, _>(
+        &tx,
+        snapshot
+            .abilities
+            .iter()
+            .cloned()
+            .map(|row| abilities::Model {
+                resource: row.resource,
+                ability: row.ability,
+                delegation: row
+                    .delegation
+                    .parse::<tinycloud_auth::ipld_core::cid::Cid>()
+                    .map_err(|err| err.to_string())
+                    .unwrap()
+                    .into(),
+                caveats: row.caveats,
+            })
+            .collect::<Vec<_>>(),
+        OnConflict::columns([
+            abilities::Column::Resource,
+            abilities::Column::Ability,
+            abilities::Column::Delegation,
+        ])
+        .do_nothing()
+        .to_owned(),
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+
+    insert_many_ignore::<parent_delegations::Entity, _, _>(
+        &tx,
+        snapshot
+            .parent_delegations
+            .iter()
+            .cloned()
+            .map(|row| {
+                Ok::<_, String>(parent_delegations::Model {
+                    parent: row
+                        .parent
+                        .parse::<tinycloud_auth::ipld_core::cid::Cid>()
+                        .map_err(|err| err.to_string())?
+                        .into(),
+                    child: row
+                        .child
+                        .parse::<tinycloud_auth::ipld_core::cid::Cid>()
+                        .map_err(|err| err.to_string())?
+                        .into(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        OnConflict::columns([
+            parent_delegations::Column::Parent,
+            parent_delegations::Column::Child,
+        ])
+        .do_nothing()
+        .to_owned(),
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+
+    insert_many_ignore::<invocation::Entity, _, _>(
+        &tx,
+        snapshot
+            .invocations
+            .iter()
+            .cloned()
+            .map(|row| {
+                Ok::<_, String>(invocation::Model {
+                    id: row
+                        .id
+                        .parse::<tinycloud_auth::ipld_core::cid::Cid>()
+                        .map_err(|err| err.to_string())?
+                        .into(),
+                    invoker: row.invoker,
+                    issued_at: OffsetDateTime::parse(&row.issued_at, &Rfc3339)
+                        .map_err(|err| err.to_string())?,
+                    facts: row.facts,
+                    serialization: decode_base64(&row.serialization)?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        OnConflict::column(invocation::Column::Id)
+            .do_nothing()
+            .to_owned(),
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+
+    insert_many_ignore::<invoked_abilities::Entity, _, _>(
+        &tx,
+        snapshot
+            .invoked_abilities
+            .iter()
+            .cloned()
+            .map(|row| {
+                Ok::<_, String>(invoked_abilities::Model {
+                    invocation: row
+                        .invocation
+                        .parse::<tinycloud_auth::ipld_core::cid::Cid>()
+                        .map_err(|err| err.to_string())?
+                        .into(),
+                    resource: row.resource,
+                    ability: row.ability,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        OnConflict::columns([
+            invoked_abilities::Column::Invocation,
+            invoked_abilities::Column::Resource,
+            invoked_abilities::Column::Ability,
+        ])
+        .do_nothing()
+        .to_owned(),
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+
+    insert_many_ignore::<epoch::Entity, _, _>(
+        &tx,
+        snapshot
+            .epochs
+            .iter()
+            .cloned()
+            .map(|row| {
+                Ok::<_, String>(epoch::Model {
+                    seq: row.seq,
+                    id: row
+                        .id
+                        .parse::<tinycloud_auth::ipld_core::cid::Cid>()
+                        .map_err(|err| err.to_string())?
+                        .into(),
+                    space: row.space,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        OnConflict::columns([epoch::Column::Id, epoch::Column::Space, epoch::Column::Seq])
+            .do_nothing()
+            .to_owned(),
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+
+    insert_many_ignore::<epoch_order::Entity, _, _>(
+        &tx,
+        snapshot
+            .epoch_orders
+            .iter()
+            .cloned()
+            .map(|row| {
+                Ok::<_, String>(epoch_order::Model {
+                    parent: row
+                        .parent
+                        .parse::<tinycloud_auth::ipld_core::cid::Cid>()
+                        .map_err(|err| err.to_string())?
+                        .into(),
+                    child: row
+                        .child
+                        .parse::<tinycloud_auth::ipld_core::cid::Cid>()
+                        .map_err(|err| err.to_string())?
+                        .into(),
+                    space: row.space,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        OnConflict::columns([
+            epoch_order::Column::Parent,
+            epoch_order::Column::Child,
+            epoch_order::Column::Space,
+        ])
+        .do_nothing()
+        .to_owned(),
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+
+    insert_many_ignore::<event_order::Entity, _, _>(
+        &tx,
+        snapshot
+            .event_orders
+            .iter()
+            .cloned()
+            .map(|row| {
+                Ok::<_, String>(event_order::Model {
+                    seq: row.seq,
+                    epoch: row
+                        .epoch
+                        .parse::<tinycloud_auth::ipld_core::cid::Cid>()
+                        .map_err(|err| err.to_string())?
+                        .into(),
+                    epoch_seq: row.epoch_seq,
+                    event: row
+                        .event
+                        .parse::<tinycloud_auth::ipld_core::cid::Cid>()
+                        .map_err(|err| err.to_string())?
+                        .into(),
+                    space: row.space,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        OnConflict::columns([
+            event_order::Column::Epoch,
+            event_order::Column::EpochSeq,
+            event_order::Column::Space,
+        ])
+        .do_nothing()
+        .to_owned(),
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+
+    insert_many_ignore::<kv_write::Entity, _, _>(
+        &tx,
+        snapshot
+            .kv_writes
+            .iter()
+            .cloned()
+            .map(|row| {
+                Ok::<_, String>(kv_write::Model {
+                    space: row.space,
+                    key: row.key,
+                    invocation: row
+                        .invocation
+                        .parse::<tinycloud_auth::ipld_core::cid::Cid>()
+                        .map_err(|err| err.to_string())?
+                        .into(),
+                    seq: row.seq,
+                    epoch: row
+                        .epoch
+                        .parse::<tinycloud_auth::ipld_core::cid::Cid>()
+                        .map_err(|err| err.to_string())?
+                        .into(),
+                    epoch_seq: row.epoch_seq,
+                    value: row
+                        .value
+                        .parse::<tinycloud_auth::ipld_core::cid::Cid>()
+                        .map_err(|err| err.to_string())?
+                        .into(),
+                    metadata: row.metadata,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        OnConflict::columns([
+            kv_write::Column::Space,
+            kv_write::Column::Key,
+            kv_write::Column::Invocation,
+        ])
+        .do_nothing()
+        .to_owned(),
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+
+    insert_many_ignore::<kv_delete::Entity, _, _>(
+        &tx,
+        snapshot
+            .kv_deletes
+            .iter()
+            .cloned()
+            .map(|row| {
+                Ok::<_, String>(kv_delete::Model {
+                    invocation_id: row
+                        .invocation_id
+                        .parse::<tinycloud_auth::ipld_core::cid::Cid>()
+                        .map_err(|err| err.to_string())?
+                        .into(),
+                    space: row.space,
+                    key: row.key,
+                    deleted_invocation_id: row
+                        .deleted_invocation_id
+                        .parse::<tinycloud_auth::ipld_core::cid::Cid>()
+                        .map_err(|err| err.to_string())?
+                        .into(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        OnConflict::columns([kv_delete::Column::InvocationId, kv_delete::Column::Space])
+            .do_nothing()
+            .to_owned(),
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+
+    for row in snapshot.database_artifacts.iter().cloned() {
+        upsert_database_artifact(
+            &tx,
+            database_artifact::Model {
+                service: row.service,
+                space: row.space,
+                name: row.name,
+                revision: row.revision,
+                content_hash: row.content_hash,
+                payload: decode_base64(&row.payload)?,
+                size_bytes: row.size_bytes,
+                backend: row.backend,
+                storage_mode: row.storage_mode,
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+            },
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+    }
+
+    tx.commit().await.map_err(|err| err.to_string())?;
+
+    Ok(ReconciliationApplyResponse {
+        node_id: snapshot.node_id,
+        spaces: snapshot.spaces.len(),
+        actors: snapshot.actors.len(),
+        delegations: snapshot.delegations.len(),
+        revocations: snapshot.revocations.len(),
+        abilities: snapshot.abilities.len(),
+        parent_delegations: snapshot.parent_delegations.len(),
+        invocations: snapshot.invocations.len(),
+        invoked_abilities: snapshot.invoked_abilities.len(),
+        kv_writes: snapshot.kv_writes.len(),
+        kv_deletes: snapshot.kv_deletes.len(),
+        database_artifacts: snapshot.database_artifacts.len(),
+        epochs: snapshot.epochs.len(),
+        epoch_orders: snapshot.epoch_orders.len(),
+        event_orders: snapshot.event_orders.len(),
+        blocks: snapshot.blocks.len(),
+    })
+}
+
+#[get("/reconciliation/snapshot")]
+pub async fn reconciliation_snapshot(
+    d: AuthHeaderGetter<DelegationInfo>,
+    tinycloud: &State<TinyCloud>,
+    config: &State<Config>,
+    encryption: &State<EncryptionService>,
+) -> Result<Json<ReconciliationSnapshot>, (Status, String)> {
+    let delegation = d.0 .0;
+    validate_host_reconciliation_access(&delegation)?;
+
+    build_reconciliation_snapshot(tinycloud, config, encryption)
+        .await
+        .map(Json)
+        .map_err(|err| (Status::InternalServerError, err))
+}
+
+#[post("/reconciliation/snapshot", data = "<snapshot>")]
+pub async fn reconciliation_snapshot_apply(
+    d: AuthHeaderGetter<DelegationInfo>,
+    snapshot: Json<ReconciliationSnapshot>,
+    tinycloud: &State<TinyCloud>,
+    config: &State<Config>,
+) -> Result<Json<ReconciliationApplyResponse>, (Status, String)> {
+    let delegation = d.0 .0;
+    validate_host_reconciliation_access(&delegation)?;
+
+    apply_reconciliation_snapshot(tinycloud, config, snapshot.into_inner())
+        .await
+        .map(Json)
+        .map_err(|err| (Status::InternalServerError, err))
 }
 
 #[allow(clippy::let_unit_value)]

@@ -40,7 +40,7 @@ use routes::{
     hooks::{create_hook_ticket, create_webhook, delete_webhook, hook_events, list_webhooks},
     info, invoke, open_host_key,
     public::{public_kv_get, public_kv_head, public_kv_list, public_kv_options, RateLimiter},
-    signed_kv_get,
+    reconciliation_ranges, reconciliation_snapshot, reconciliation_snapshot_apply, signed_kv_get,
     util_routes::*,
     version,
 };
@@ -125,6 +125,9 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         delegate,
         create_signed_kv_url,
         signed_kv_get,
+        reconciliation_ranges,
+        reconciliation_snapshot,
+        reconciliation_snapshot_apply,
         create_hook_ticket,
         hook_events,
         create_webhook,
