@@ -21,6 +21,7 @@ jobs:
         run: |
           set -x
           phala status
+          phala runtime-config tinycloud-node --json || true
           phala ps --cvm-id tinycloud-node || true
           phala logs dstack-tinycloud-1 --cvm-id tinycloud-node --stderr -n 300 || true
           phala logs dstack-tinycloud-1 --cvm-id tinycloud-node -n 300 || true
