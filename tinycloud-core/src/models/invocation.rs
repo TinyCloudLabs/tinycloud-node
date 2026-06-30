@@ -6,6 +6,7 @@ use super::super::{
     util,
 };
 use crate::encryption::ColumnEncryption;
+use crate::models::did_resolution::did_resolution_timeout;
 use crate::policy_capability::sql_caveat;
 use crate::types::{Caveats, Facts, Resource, SpaceIdWrap};
 use crate::write_hooks::{hook_delivery_id, subscription_matches_event};
@@ -15,14 +16,11 @@ use sea_orm::{
 };
 use serde::Serialize;
 use std::collections::HashMap;
-use std::time::Duration;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_auth::{
     authorization::TinyCloudInvocation, identity::did_principal_matches, resource::Path,
     ssi::dids::AnyDidMethod,
 };
-
-const DID_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "invocation")]
@@ -121,7 +119,7 @@ pub(crate) async fn process<C: ConnectionTrait>(
 
 async fn verify(invocation: &TinyCloudInvocation) -> Result<(), Error> {
     tokio::time::timeout(
-        DID_RESOLUTION_TIMEOUT,
+        did_resolution_timeout(),
         invocation
             // TODO go back to static DID_METHODS
             .verify_signature(&AnyDidMethod::default()),

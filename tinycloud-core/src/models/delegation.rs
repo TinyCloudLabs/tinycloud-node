@@ -1,18 +1,17 @@
 use crate::encryption::ColumnEncryption;
 use crate::encryption_network::NetworkId;
 use crate::hash::Hash;
+use crate::models::did_resolution::did_resolution_timeout;
 use crate::policy_capability::sql_caveat;
 use crate::types::{Ability, Caveats, Facts, Resource};
 use crate::util::DelegationMode;
 use crate::{events::Delegation, models::*, relationships::*, util};
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, ConnectionTrait};
-use std::{collections::BTreeMap, time::Duration};
+use std::collections::BTreeMap;
 use time::OffsetDateTime;
 use tinycloud_auth::{
     authorization::TinyCloudDelegation, identity::did_principal_matches, ssi::dids::AnyDidMethod,
 };
-
-const DID_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "delegation")]
@@ -158,7 +157,7 @@ async fn verify(delegation: &TinyCloudDelegation) -> Result<(), Error> {
     match delegation {
         TinyCloudDelegation::Ucan(ref ucan) => {
             tokio::time::timeout(
-                DID_RESOLUTION_TIMEOUT,
+                did_resolution_timeout(),
                 // TODO go back to static DID_METHODS
                 ucan.verify_signature(&AnyDidMethod::default()),
             )
