@@ -6,11 +6,13 @@ use crate::types::{Ability, Caveats, Facts, Resource};
 use crate::util::DelegationMode;
 use crate::{events::Delegation, models::*, relationships::*, util};
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, ConnectionTrait};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 use time::OffsetDateTime;
 use tinycloud_auth::{
     authorization::TinyCloudDelegation, identity::did_principal_matches, ssi::dids::AnyDidMethod,
 };
+
+const DID_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "delegation")]
@@ -155,10 +157,14 @@ pub(crate) async fn process<C: ConnectionTrait>(
 async fn verify(delegation: &TinyCloudDelegation) -> Result<(), Error> {
     match delegation {
         TinyCloudDelegation::Ucan(ref ucan) => {
-            // TODO go back to static DID_METHODS
-            ucan.verify_signature(&AnyDidMethod::default())
-                .await
-                .map_err(|_| DelegationError::InvalidSignature)?;
+            tokio::time::timeout(
+                DID_RESOLUTION_TIMEOUT,
+                // TODO go back to static DID_METHODS
+                ucan.verify_signature(&AnyDidMethod::default()),
+            )
+            .await
+            .map_err(|_| DelegationError::InvalidSignature)?
+            .map_err(|_| DelegationError::InvalidSignature)?;
             ucan.payload()
                 .validate_time(None)
                 .map_err(|_| DelegationError::InvalidTime)?;

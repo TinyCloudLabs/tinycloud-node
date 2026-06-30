@@ -81,6 +81,7 @@ pub fn validate_sql(
                 }
             }
             Statement::CreateTable { .. }
+            | Statement::CreateView { .. }
             | Statement::AlterTable { .. }
             | Statement::Drop { .. }
             | Statement::CreateIndex { .. } => {
@@ -116,7 +117,13 @@ pub fn validate_sql(
         )
     {
         return Err(SqlError::PermissionDenied(
-            "Schema operations require admin, write, or schema ability".to_string(),
+            "DDL operations require admin, schema, or write ability".to_string(),
+        ));
+    }
+
+    if !is_read_only && !is_ddl && matches!(ability, "tinycloud.sql/schema") {
+        return Err(SqlError::PermissionDenied(
+            "DML operations require write ability".to_string(),
         ));
     }
 
@@ -220,6 +227,9 @@ fn extract_tables_from_statement(stmt: &Statement, tables: &mut Vec<String>) {
         Statement::CreateTable { name, .. } => {
             tables.push(name.to_string());
         }
+        Statement::CreateView { name, .. } => {
+            tables.push(name.to_string());
+        }
         Statement::AlterTable { name, .. } => {
             tables.push(name.to_string());
         }
@@ -315,6 +325,9 @@ pub fn extract_write_targets_from_statement(stmt: &Statement) -> Option<TouchedT
         Statement::Update { table, .. } => extract_write_target_from_update(table),
         Statement::Delete { tables, from, .. } => extract_write_target_from_delete(tables, from),
         Statement::CreateTable { name, .. } | Statement::AlterTable { name, .. } => {
+            Some(TouchedTables::supported(vec![name.to_string()]))
+        }
+        Statement::CreateView { name, .. } => {
             Some(TouchedTables::supported(vec![name.to_string()]))
         }
         Statement::Drop { names, .. } => Some(TouchedTables::supported(unique_names(
@@ -422,19 +435,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_sql_allows_schema_ability_for_schema_changes() {
-        let parsed = validate_sql(
-            "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)",
-            &None,
-            "tinycloud.sql/schema",
-        )
-        .expect("schema ability should allow schema changes");
-
-        assert!(parsed.is_ddl);
-        assert!(!parsed.is_read_only);
-    }
-
-    #[test]
     fn validate_sql_rejects_ddl_ability_for_schema_changes() {
         let err = validate_sql(
             "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)",
@@ -444,5 +444,57 @@ mod tests {
         .expect_err("ddl ability is not a schema permission");
 
         assert!(matches!(err, SqlError::PermissionDenied(_)));
+    }
+
+    #[test]
+    fn schema_ability_allows_ddl() {
+        let parsed = validate_sql(
+            "CREATE TABLE IF NOT EXISTS conversation (id TEXT PRIMARY KEY)",
+            &None,
+            "tinycloud.sql/schema",
+        )
+        .expect("schema ability should authorize DDL");
+
+        assert!(parsed.is_ddl);
+        assert!(!parsed.is_read_only);
+        assert_eq!(
+            parsed.write_targets,
+            vec![TouchedTables::supported(vec!["conversation".to_string()])]
+        );
+    }
+
+    #[test]
+    fn schema_ability_rejects_dml() {
+        for sql in [
+            "INSERT INTO conversation (id) VALUES ('1')",
+            "UPDATE conversation SET id = '2'",
+            "DELETE FROM conversation WHERE id = '1'",
+        ] {
+            let err = validate_sql(sql, &None, "tinycloud.sql/schema")
+                .expect_err("schema ability must not authorize DML");
+
+            assert!(
+                matches!(err, SqlError::PermissionDenied(ref message) if message.contains("write ability")),
+                "expected DML permission denial for {sql}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_ability_allows_create_view() {
+        let parsed = validate_sql(
+            "CREATE VIEW conversation_ids AS SELECT id FROM conversation",
+            &None,
+            "tinycloud.sql/schema",
+        )
+        .expect("schema ability should authorize CREATE VIEW");
+
+        assert!(parsed.is_ddl);
+        assert_eq!(
+            parsed.write_targets,
+            vec![TouchedTables::supported(vec![
+                "conversation_ids".to_string()
+            ])]
+        );
     }
 }

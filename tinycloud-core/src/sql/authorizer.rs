@@ -2,6 +2,26 @@ use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 
 use super::caveats::SqlCaveats;
 
+fn can_write_data(ability: &str, is_admin: bool) -> bool {
+    is_admin
+        || matches!(
+            ability,
+            "tinycloud.sql/admin" | "tinycloud.sql/write" | "tinycloud.sql/*"
+        )
+}
+
+fn is_sqlite_schema_table(table_name: &str) -> bool {
+    matches!(
+        table_name,
+        "sqlite_master" | "sqlite_schema" | "sqlite_temp_master" | "sqlite_temp_schema"
+    )
+}
+
+fn can_write_table(ability: &str, is_admin: bool, table_name: &str) -> bool {
+    can_write_data(ability, is_admin)
+        || (ability == "tinycloud.sql/schema" && is_sqlite_schema_table(table_name))
+}
+
 pub fn create_authorizer(
     caveats: Option<SqlCaveats>,
     ability: String,
@@ -157,10 +177,7 @@ pub fn create_authorizer(
 
         // Write operations
         AuthAction::Insert { table_name } | AuthAction::Delete { table_name } => {
-            if matches!(
-                ability.as_str(),
-                "tinycloud.sql/read" | "tinycloud.sql/select"
-            ) {
+            if !can_write_table(ability.as_str(), is_admin, table_name) {
                 return Authorization::Deny;
             }
             if let Some(ref caveats) = caveats {
@@ -178,10 +195,7 @@ pub fn create_authorizer(
             table_name,
             column_name,
         } => {
-            if matches!(
-                ability.as_str(),
-                "tinycloud.sql/read" | "tinycloud.sql/select"
-            ) {
+            if !can_write_table(ability.as_str(), is_admin, table_name) {
                 return Authorization::Deny;
             }
             if let Some(ref caveats) = caveats {
@@ -279,6 +293,26 @@ mod tests {
     }
 
     #[test]
+    fn create_index_allowed_with_schema_ability() {
+        let create_index = AuthAction::CreateIndex {
+            index_name: "uq_interaction_nonce",
+            table_name: "interaction",
+        };
+        let reindex = AuthAction::Reindex {
+            index_name: "uq_interaction_nonce",
+        };
+
+        assert_eq!(
+            authorize("tinycloud.sql/schema", false, create_index),
+            Authorization::Allow
+        );
+        assert_eq!(
+            authorize("tinycloud.sql/schema", false, reindex),
+            Authorization::Allow
+        );
+    }
+
+    #[test]
     fn create_index_allowed_for_admin() {
         let create_index = AuthAction::CreateIndex {
             index_name: "uq_interaction_nonce",
@@ -320,6 +354,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn schema_ability_denies_dml() {
+        assert_eq!(
+            authorize(
+                "tinycloud.sql/schema",
+                false,
+                AuthAction::Insert {
+                    table_name: "interaction"
+                }
+            ),
+            Authorization::Deny
+        );
+        assert_eq!(
+            authorize(
+                "tinycloud.sql/schema",
+                false,
+                AuthAction::Delete {
+                    table_name: "interaction"
+                }
+            ),
+            Authorization::Deny
+        );
+        assert_eq!(
+            authorize(
+                "tinycloud.sql/schema",
+                false,
+                AuthAction::Update {
+                    table_name: "interaction",
+                    column_name: "nonce",
+                }
+            ),
+            Authorization::Deny
+        );
+    }
+
     /// Install the authorizer on a real rusqlite connection (mirroring the
     /// wiring in database.rs) and run `sql` under the given cap.
     fn execute_under_authorizer(
@@ -355,6 +424,26 @@ mod tests {
             "CREATE UNIQUE INDEX uq_interaction_nonce ON interaction (reader_did, nonce)",
         )
         .expect("CREATE UNIQUE INDEX should succeed with a write cap");
+    }
+
+    #[test]
+    fn create_unique_index_executes_with_schema_cap() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        execute_under_authorizer(
+            &conn,
+            "tinycloud.sql/schema",
+            false,
+            "CREATE TABLE interaction (reader_did TEXT, nonce TEXT)",
+        )
+        .unwrap();
+
+        execute_under_authorizer(
+            &conn,
+            "tinycloud.sql/schema",
+            false,
+            "CREATE UNIQUE INDEX uq_interaction_nonce ON interaction (reader_did, nonce)",
+        )
+        .expect("CREATE UNIQUE INDEX should succeed with a schema cap");
     }
 
     #[test]
