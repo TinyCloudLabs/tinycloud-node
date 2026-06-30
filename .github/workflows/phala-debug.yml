@@ -1,0 +1,29 @@
+name: Phala Debug
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Phala CLI
+        run: npm install -g phala
+
+      - name: Inspect prod CVM
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+        run: |
+          set -x
+          phala status
+          phala ps --cvm-id tinycloud-node || true
+          phala logs tinycloud --cvm-id tinycloud-node --stderr -n 200 || true
+          phala logs tinycloud --cvm-id tinycloud-node -n 200 || true
+          phala logs dstack-ingress --cvm-id tinycloud-node --stderr -n 200 || true
+          phala logs dstack-ingress --cvm-id tinycloud-node -n 200 || true
+          phala logs --cvm-id tinycloud-node --serial -n 200 || true
