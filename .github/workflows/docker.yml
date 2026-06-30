@@ -192,7 +192,51 @@ jobs:
       - name: Deploy to Phala Cloud
         env:
           PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+          PHALA_ENV_DATABASE_URL: ${{ secrets.PROD_TINYCLOUD_DATABASE_URL }}
+          PHALA_ENV_S3_BUCKET: ${{ secrets.PROD_TINYCLOUD_S3_BUCKET }}
+          PHALA_ENV_S3_ENDPOINT: ${{ secrets.PROD_TINYCLOUD_S3_ENDPOINT }}
+          PHALA_ENV_AWS_KEY: ${{ secrets.PROD_TINYCLOUD_AWS_ACCESS_KEY_ID }}
+          PHALA_ENV_AWS_SECRET: ${{ secrets.PROD_TINYCLOUD_AWS_SECRET_ACCESS_KEY }}
+          PHALA_ENV_AWS_REGION: ${{ secrets.PROD_TINYCLOUD_AWS_REGION }}
+          PHALA_ENV_CLOUDFLARE_API_TOKEN: ${{ secrets.PROD_TINYCLOUD_CLOUDFLARE_API_TOKEN }}
+          PHALA_ENV_DSTACK_GATEWAY_DOMAIN: ${{ secrets.PROD_TINYCLOUD_DSTACK_GATEWAY_DOMAIN }}
+          PHALA_ENV_CERTBOT_EMAIL: ${{ secrets.PROD_TINYCLOUD_CERTBOT_EMAIL }}
         # Update the existing prod CVM (name: tinycloud-node) in the
         # Tiny Cloud workspace. The PHALA_CLOUD_API_KEY secret is
         # workspace-scoped and must be issued from that workspace.
-        run: phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml --wait
+        run: |
+          set -euo pipefail
+
+          required_vars=(
+            PHALA_CLOUD_API_KEY
+            PHALA_ENV_DATABASE_URL
+            PHALA_ENV_S3_BUCKET
+            PHALA_ENV_S3_ENDPOINT
+            PHALA_ENV_AWS_KEY
+            PHALA_ENV_AWS_SECRET
+            PHALA_ENV_AWS_REGION
+            PHALA_ENV_CLOUDFLARE_API_TOKEN
+            PHALA_ENV_DSTACK_GATEWAY_DOMAIN
+            PHALA_ENV_CERTBOT_EMAIL
+          )
+
+          for var in "${required_vars[@]}"; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::Missing required GitHub secret for Phala deploy: ${var#PHALA_ENV_}"
+              exit 1
+            fi
+          done
+
+          {
+            printf 'DATABASE_URL=%s\n' "$PHALA_ENV_DATABASE_URL"
+            printf 'S3_BUCKET=%s\n' "$PHALA_ENV_S3_BUCKET"
+            printf 'S3_ENDPOINT=%s\n' "$PHALA_ENV_S3_ENDPOINT"
+            printf 'AWS_KEY=%s\n' "$PHALA_ENV_AWS_KEY"
+            printf 'AWS_SECRET=%s\n' "$PHALA_ENV_AWS_SECRET"
+            printf 'AWS_REGION=%s\n' "$PHALA_ENV_AWS_REGION"
+            printf 'CLOUDFLARE_API_TOKEN=%s\n' "$PHALA_ENV_CLOUDFLARE_API_TOKEN"
+            printf 'DSTACK_GATEWAY_DOMAIN=%s\n' "$PHALA_ENV_DSTACK_GATEWAY_DOMAIN"
+            printf 'CERTBOT_EMAIL=%s\n' "$PHALA_ENV_CERTBOT_EMAIL"
+          } > .phala-prod.env
+
+          phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml -e .phala-prod.env --wait
