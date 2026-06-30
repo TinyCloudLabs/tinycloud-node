@@ -27,6 +27,7 @@ pub fn create_authorizer(
     ability: String,
     is_admin: bool,
 ) -> impl FnMut(AuthContext<'_>) -> Authorization {
+    let mut schema_ddl_authorized = false;
     move |ctx: AuthContext<'_>| match ctx.action {
         // Always deny attach/detach
         AuthAction::Attach { .. } | AuthAction::Detach { .. } => Authorization::Deny,
@@ -164,6 +165,13 @@ pub fn create_authorizer(
             table_name,
             column_name,
         } => {
+            if !is_admin
+                && matches!(ability.as_str(), "tinycloud.sql/schema")
+                && !schema_ddl_authorized
+                && !is_sqlite_schema_table(table_name)
+            {
+                return Authorization::Deny;
+            }
             if let Some(ref caveats) = caveats {
                 if !caveats.is_table_allowed(table_name) {
                     return Authorization::Deny;
@@ -243,12 +251,21 @@ pub fn create_authorizer(
             {
                 Authorization::Deny
             } else {
+                if !is_admin && matches!(ability.as_str(), "tinycloud.sql/schema") {
+                    schema_ddl_authorized = true;
+                }
                 Authorization::Allow
             }
         }
 
         // Allow internal operations
         AuthAction::Transaction { .. } | AuthAction::Savepoint { .. } | AuthAction::Select => {
+            if !is_admin
+                && matches!(ability.as_str(), "tinycloud.sql/schema")
+                && !schema_ddl_authorized
+            {
+                return Authorization::Deny;
+            }
             Authorization::Allow
         }
 
@@ -386,6 +403,32 @@ mod tests {
                 }
             ),
             Authorization::Deny
+        );
+    }
+
+    #[test]
+    fn schema_ability_denies_application_table_reads() {
+        assert_eq!(
+            authorize(
+                "tinycloud.sql/schema",
+                false,
+                AuthAction::Read {
+                    table_name: "interaction",
+                    column_name: "nonce",
+                }
+            ),
+            Authorization::Deny
+        );
+        assert_eq!(
+            authorize(
+                "tinycloud.sql/schema",
+                false,
+                AuthAction::Read {
+                    table_name: "sqlite_schema",
+                    column_name: "sql",
+                }
+            ),
+            Authorization::Allow
         );
     }
 

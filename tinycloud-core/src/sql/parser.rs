@@ -121,9 +121,9 @@ pub fn validate_sql(
         ));
     }
 
-    if !is_read_only && !is_ddl && matches!(ability, "tinycloud.sql/schema") {
+    if !is_ddl && matches!(ability, "tinycloud.sql/schema") {
         return Err(SqlError::PermissionDenied(
-            "DML operations require write ability".to_string(),
+            "Schema ability only permits DDL operations".to_string(),
         ));
     }
 
@@ -474,10 +474,21 @@ mod tests {
                 .expect_err("schema ability must not authorize DML");
 
             assert!(
-                matches!(err, SqlError::PermissionDenied(ref message) if message.contains("write ability")),
+                matches!(err, SqlError::PermissionDenied(ref message) if message.contains("only permits DDL")),
                 "expected DML permission denial for {sql}, got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn schema_ability_rejects_select() {
+        let err = validate_sql("SELECT id FROM conversation", &None, "tinycloud.sql/schema")
+            .expect_err("schema ability must not authorize reads");
+
+        assert!(
+            matches!(err, SqlError::PermissionDenied(ref message) if message.contains("only permits DDL")),
+            "expected SELECT permission denial, got {err:?}"
+        );
     }
 
     #[test]

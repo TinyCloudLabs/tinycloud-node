@@ -39,6 +39,7 @@ pub fn accepted_actions(service: &str) -> Option<&'static [&'static str]> {
         "tinycloud.sql" => Some(&[
             "tinycloud.sql/read",
             "tinycloud.sql/select",
+            "tinycloud.sql/schema",
             "tinycloud.sql/write",
         ]),
         "tinycloud.vfs" => Some(&[
@@ -409,19 +410,15 @@ pub struct ResolvedAuthority {
 mod tests {
     use super::*;
 
-    const CANON_VECTORS: &str = include_str!(
-        "../../tests/fixtures/w1/policy-capability/canonicalization-vectors.json"
-    );
-    const CONTAINMENT_VECTORS: &str = include_str!(
-        "../../tests/fixtures/w1/policy-capability/containment-vectors.json"
-    );
-    const REJECTION_VECTORS: &str = include_str!(
-        "../../tests/fixtures/w1/policy-capability/rejection-vectors.json"
-    );
+    const CANON_VECTORS: &str =
+        include_str!("../../tests/fixtures/w1/policy-capability/canonicalization-vectors.json");
+    const CONTAINMENT_VECTORS: &str =
+        include_str!("../../tests/fixtures/w1/policy-capability/containment-vectors.json");
+    const REJECTION_VECTORS: &str =
+        include_str!("../../tests/fixtures/w1/policy-capability/rejection-vectors.json");
     const SQL_CONTAINMENT_VECTORS: &str =
         include_str!("../../tests/fixtures/w1/sql-caveat/containment.json");
-    const SQL_REJECT_VECTORS: &str =
-        include_str!("../../tests/fixtures/w1/sql-caveat/reject.json");
+    const SQL_REJECT_VECTORS: &str = include_str!("../../tests/fixtures/w1/sql-caveat/reject.json");
 
     #[derive(Deserialize)]
     struct CanonVector {

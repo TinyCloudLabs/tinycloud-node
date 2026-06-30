@@ -1,5 +1,6 @@
 use super::super::{events::Revocation, models::*, relationships::*};
 use crate::hash::{hash, Hash};
+use crate::models::did_resolution::did_resolution_timeout;
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, ConnectionTrait};
 use time::OffsetDateTime;
 use tinycloud_auth::{
@@ -89,9 +90,13 @@ pub(crate) async fn process<C: ConnectionTrait>(
             };
         }
         TinyCloudRevocation::Ucan(u) => {
-            u.verify_signature(&AnyDidMethod::default())
-                .await
-                .map_err(|_| RevocationError::InvalidSignature)?;
+            tokio::time::timeout(
+                did_resolution_timeout(),
+                u.verify_signature(&AnyDidMethod::default()),
+            )
+            .await
+            .map_err(|_| RevocationError::InvalidSignature)?
+            .map_err(|_| RevocationError::InvalidSignature)?;
             u.payload()
                 .validate_time(None)
                 .map_err(|_| RevocationError::InvalidTime)?;
