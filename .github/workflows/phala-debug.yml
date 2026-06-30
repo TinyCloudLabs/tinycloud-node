@@ -22,8 +22,10 @@ jobs:
           set -x
           phala status
           phala ps --cvm-id tinycloud-node || true
-          phala logs tinycloud --cvm-id tinycloud-node --stderr -n 200 || true
-          phala logs tinycloud --cvm-id tinycloud-node -n 200 || true
-          phala logs dstack-ingress --cvm-id tinycloud-node --stderr -n 200 || true
-          phala logs dstack-ingress --cvm-id tinycloud-node -n 200 || true
-          phala logs --cvm-id tinycloud-node --serial -n 200 || true
+          phala logs dstack-tinycloud-1 --cvm-id tinycloud-node --stderr -n 300 || true
+          phala logs dstack-tinycloud-1 --cvm-id tinycloud-node -n 300 || true
+          phala logs dstack-dstack-ingress-1 --cvm-id tinycloud-node --stderr -n 300 || true
+          phala logs dstack-dstack-ingress-1 --cvm-id tinycloud-node -n 300 || true
+          phala logs --cvm-id tinycloud-node --cvm-stderr -n 300 || true
+          phala logs --cvm-id tinycloud-node --cvm-stdout -n 300 || true
+          phala logs --cvm-id tinycloud-node --serial -n 300 || true
