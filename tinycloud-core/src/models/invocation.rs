@@ -6,6 +6,7 @@ use super::super::{
     util,
 };
 use crate::encryption::ColumnEncryption;
+use crate::models::did_resolution::did_resolution_timeout;
 use crate::policy_capability::sql_caveat;
 use crate::types::{Caveats, Facts, Resource, SpaceIdWrap};
 use crate::write_hooks::{hook_delivery_id, subscription_matches_event};
@@ -117,11 +118,15 @@ pub(crate) async fn process<C: ConnectionTrait>(
 }
 
 async fn verify(invocation: &TinyCloudInvocation) -> Result<(), Error> {
-    invocation
-        // TODO go back to static DID_METHODS
-        .verify_signature(&AnyDidMethod::default())
-        .await
-        .map_err(|_| InvocationError::InvalidSignature)?;
+    tokio::time::timeout(
+        did_resolution_timeout(),
+        invocation
+            // TODO go back to static DID_METHODS
+            .verify_signature(&AnyDidMethod::default()),
+    )
+    .await
+    .map_err(|_| InvocationError::InvalidSignature)?
+    .map_err(|_| InvocationError::InvalidSignature)?;
     invocation
         .payload()
         .validate_time(None)

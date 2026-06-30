@@ -2,6 +2,7 @@ pub mod abilities;
 pub mod actor;
 pub mod database_artifact;
 pub mod delegation;
+pub(crate) mod did_resolution;
 pub mod encryption_audit;
 pub mod encryption_ceremony;
 pub mod encryption_network;

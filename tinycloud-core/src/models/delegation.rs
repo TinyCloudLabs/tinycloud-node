@@ -1,6 +1,7 @@
 use crate::encryption::ColumnEncryption;
 use crate::encryption_network::NetworkId;
 use crate::hash::Hash;
+use crate::models::did_resolution::did_resolution_timeout;
 use crate::policy_capability::sql_caveat;
 use crate::types::{Ability, Caveats, Facts, Resource};
 use crate::util::DelegationMode;
@@ -155,10 +156,14 @@ pub(crate) async fn process<C: ConnectionTrait>(
 async fn verify(delegation: &TinyCloudDelegation) -> Result<(), Error> {
     match delegation {
         TinyCloudDelegation::Ucan(ref ucan) => {
-            // TODO go back to static DID_METHODS
-            ucan.verify_signature(&AnyDidMethod::default())
-                .await
-                .map_err(|_| DelegationError::InvalidSignature)?;
+            tokio::time::timeout(
+                did_resolution_timeout(),
+                // TODO go back to static DID_METHODS
+                ucan.verify_signature(&AnyDidMethod::default()),
+            )
+            .await
+            .map_err(|_| DelegationError::InvalidSignature)?
+            .map_err(|_| DelegationError::InvalidSignature)?;
             ucan.payload()
                 .validate_time(None)
                 .map_err(|_| DelegationError::InvalidTime)?;
