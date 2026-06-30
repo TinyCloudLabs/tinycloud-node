@@ -51,14 +51,17 @@ pub fn validate_sql(
     let mut write_targets = Vec::new();
     let mut is_read_only = true;
     let mut is_ddl = false;
+    let mut has_non_ddl = false;
 
     for stmt in &statements {
         match stmt {
             Statement::Query(_) => {
+                has_non_ddl = true;
                 extract_tables_from_statement(stmt, &mut tables);
                 extract_columns_from_statement(stmt, &mut columns);
             }
             Statement::Insert { .. } => {
+                has_non_ddl = true;
                 is_read_only = false;
                 extract_tables_from_statement(stmt, &mut tables);
                 if let Some(targets) = extract_write_targets_from_statement(stmt) {
@@ -66,6 +69,7 @@ pub fn validate_sql(
                 }
             }
             Statement::Update { .. } => {
+                has_non_ddl = true;
                 is_read_only = false;
                 extract_tables_from_statement(stmt, &mut tables);
                 extract_columns_from_statement(stmt, &mut columns);
@@ -74,6 +78,7 @@ pub fn validate_sql(
                 }
             }
             Statement::Delete { .. } => {
+                has_non_ddl = true;
                 is_read_only = false;
                 extract_tables_from_statement(stmt, &mut tables);
                 if let Some(targets) = extract_write_targets_from_statement(stmt) {
@@ -121,7 +126,7 @@ pub fn validate_sql(
         ));
     }
 
-    if !is_ddl && matches!(ability, "tinycloud.sql/schema") {
+    if matches!(ability, "tinycloud.sql/schema") && (!is_ddl || has_non_ddl) {
         return Err(SqlError::PermissionDenied(
             "Schema ability only permits DDL operations".to_string(),
         ));
@@ -488,6 +493,21 @@ mod tests {
         assert!(
             matches!(err, SqlError::PermissionDenied(ref message) if message.contains("only permits DDL")),
             "expected SELECT permission denial, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn schema_ability_rejects_mixed_ddl_and_select() {
+        let err = validate_sql(
+            "CREATE TABLE conversation (id TEXT); SELECT id FROM private_conversation",
+            &None,
+            "tinycloud.sql/schema",
+        )
+        .expect_err("schema ability must not authorize mixed DDL and reads");
+
+        assert!(
+            matches!(err, SqlError::PermissionDenied(ref message) if message.contains("only permits DDL")),
+            "expected mixed-statement permission denial, got {err:?}"
         );
     }
 
