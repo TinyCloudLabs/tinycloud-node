@@ -1255,25 +1255,12 @@ async fn handle_sql_invoke(
                 &response.write_targets,
             );
 
-            let enqueue_start = Instant::now();
-            let enqueue_result = enqueue_database_webhook_deliveries(tinycloud, &events).await;
-            crate::prometheus::observe_span(
+            spawn_database_hook_delivery(
+                tinycloud.inner().clone(),
+                hook_runtime.inner().clone(),
+                events,
                 "server.sql.enqueue_hooks",
-                if enqueue_result.is_ok() {
-                    "ok"
-                } else {
-                    "error"
-                },
-                enqueue_start.elapsed(),
             );
-            enqueue_result.map_err(|e| {
-                (
-                    Status::InternalServerError,
-                    format!("sql write committed but webhook enqueue failed: {e}"),
-                )
-            })?;
-
-            publish_database_hook_events(hook_runtime, &events);
         }
     }
 
@@ -1762,25 +1749,12 @@ async fn handle_duckdb_invoke(
                 &response.write_targets,
             );
 
-            let enqueue_start = Instant::now();
-            let enqueue_result = enqueue_database_webhook_deliveries(tinycloud, &events).await;
-            crate::prometheus::observe_span(
+            spawn_database_hook_delivery(
+                tinycloud.inner().clone(),
+                hook_runtime.inner().clone(),
+                events,
                 "server.duckdb.enqueue_hooks",
-                if enqueue_result.is_ok() {
-                    "ok"
-                } else {
-                    "error"
-                },
-                enqueue_start.elapsed(),
             );
-            enqueue_result.map_err(|e| {
-                (
-                    Status::InternalServerError,
-                    format!("duckdb write committed but webhook enqueue failed: {e}"),
-                )
-            })?;
-
-            publish_database_hook_events(hook_runtime, &events);
         }
     }
 
@@ -1857,6 +1831,34 @@ fn publish_database_hook_events(hook_runtime: &HookRuntime, events: &[WriteEvent
     for event in events {
         hook_runtime.bus().publish(event.clone());
     }
+}
+
+fn spawn_database_hook_delivery(
+    tinycloud: TinyCloud,
+    hook_runtime: HookRuntime,
+    events: Vec<WriteEvent>,
+    span: &'static str,
+) {
+    rocket::tokio::spawn(async move {
+        let enqueue_start = Instant::now();
+        let enqueue_result = enqueue_database_webhook_deliveries(&tinycloud, &events).await;
+        crate::prometheus::observe_span(
+            span,
+            if enqueue_result.is_ok() {
+                "ok"
+            } else {
+                "error"
+            },
+            enqueue_start.elapsed(),
+        );
+
+        if let Err(error) = enqueue_result {
+            tracing::warn!(error = %error, "database write committed but webhook enqueue failed");
+            return;
+        }
+
+        publish_database_hook_events(&hook_runtime, &events);
+    });
 }
 
 async fn enqueue_database_webhook_deliveries(

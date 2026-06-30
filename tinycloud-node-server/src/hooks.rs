@@ -85,7 +85,7 @@ impl WriteEventBus {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HookRuntime {
     bus: WriteEventBus,
     ticket_key: [u8; 32],
