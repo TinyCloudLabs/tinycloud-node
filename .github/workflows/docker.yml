@@ -31,6 +31,7 @@ env:
 
 jobs:
   build:
+    if: github.event_name != 'workflow_dispatch' || inputs.image_version != 'debug'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -88,7 +89,7 @@ jobs:
 
   build-dstack:
     runs-on: ubuntu-latest
-    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.image_version != 'debug') || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     permissions:
       contents: read
       packages: write
@@ -196,3 +197,28 @@ jobs:
         # Tiny Cloud workspace. The PHALA_CLOUD_API_KEY secret is
         # workspace-scoped and must be issued from that workspace.
         run: phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml --wait
+
+  phala-debug:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.image_version == 'debug'
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Phala CLI
+        run: npm install -g phala
+
+      - name: Inspect prod CVM
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+        run: |
+          set -x
+          phala status
+          phala ps --cvm-id tinycloud-node || true
+          phala logs tinycloud --cvm-id tinycloud-node --stderr -n 200 || true
+          phala logs tinycloud --cvm-id tinycloud-node -n 200 || true
+          phala logs dstack-ingress --cvm-id tinycloud-node --stderr -n 200 || true
+          phala logs dstack-ingress --cvm-id tinycloud-node -n 200 || true
+          phala logs --cvm-id tinycloud-node --serial -n 200 || true
