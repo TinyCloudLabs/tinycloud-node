@@ -38,13 +38,15 @@ use core_foundation_sys::{
     data::CFDataRef,
 };
 #[cfg(target_os = "macos")]
-use security_framework::access_control::{ProtectionMode, SecAccessControl};
+use security_framework_sys::access_control::{
+    kSecAttrAccessible, kSecAttrAccessibleAfterFirstUnlock,
+};
 #[cfg(target_os = "macos")]
 use security_framework_sys::{
     base::{errSecDuplicateItem, errSecItemNotFound, errSecSuccess},
     item::{
-        kSecAttrAccessControl, kSecAttrAccount, kSecAttrService, kSecAttrSynchronizable, kSecClass,
-        kSecClassGenericPassword, kSecReturnData, kSecValueData,
+        kSecAttrAccount, kSecAttrService, kSecAttrSynchronizable, kSecClass, kSecClassGenericPassword,
+        kSecReturnData, kSecValueData,
     },
     keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemDelete},
 };
@@ -811,16 +813,6 @@ impl KeyProvider for MacosKeychainProvider {
         }
 
         let mut query = self.base_query();
-        let base_len = query.len();
-        let access_control = SecAccessControl::create_with_protection(
-            Some(ProtectionMode::AccessibleAfterFirstUnlock),
-            0,
-        )
-        .context("failed to create macOS keychain access control")?;
-        query.push((
-            unsafe { CFString::wrap_under_get_rule(kSecAttrAccessControl) },
-            access_control.into_CFType(),
-        ));
         query.push((
             unsafe { CFString::wrap_under_get_rule(kSecValueData) },
             CFData::from_buffer(secret).into_CFType(),
@@ -829,25 +821,7 @@ impl KeyProvider for MacosKeychainProvider {
         let params = CFDictionary::from_CFType_pairs(&query);
         let mut ret: CFTypeRef = std::ptr::null();
         let status = unsafe { SecItemAdd(params.as_concrete_TypeRef(), &mut ret) };
-        if status == errSecSuccess {
-            return Ok(());
-        }
-        if status != errSecDuplicateItem {
-            return Err(anyhow!("keychain insert failed with status {}", status));
-        }
-
-        let delete_params = CFDictionary::from_CFType_pairs(&query[..base_len]);
-        let delete_status = unsafe { SecItemDelete(delete_params.as_concrete_TypeRef()) };
-        if delete_status != errSecSuccess && delete_status != errSecItemNotFound {
-            return Err(anyhow!(
-                "keychain replace failed while deleting existing item with status {}",
-                delete_status
-            ));
-        }
-
-        let mut ret: CFTypeRef = std::ptr::null();
-        let status = unsafe { SecItemAdd(params.as_concrete_TypeRef(), &mut ret) };
-        if status == errSecSuccess {
+        if status == errSecSuccess || status == errSecDuplicateItem {
             Ok(())
         } else {
             Err(anyhow!("keychain insert failed with status {}", status))
@@ -884,6 +858,11 @@ impl MacosKeychainProvider {
             (
                 unsafe { CFString::wrap_under_get_rule(kSecAttrSynchronizable) },
                 CFBoolean::from(true).into_CFType(),
+            ),
+            (
+                unsafe { CFString::wrap_under_get_rule(kSecAttrAccessible) },
+                unsafe { CFString::wrap_under_get_rule(kSecAttrAccessibleAfterFirstUnlock) }
+                    .into_CFType(),
             ),
         ]
     }
