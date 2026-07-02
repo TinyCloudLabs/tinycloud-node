@@ -37,20 +37,21 @@ token is stored in a local file with mode `0600`.
 
 ### Rocket 0.5 reality check
 
-Rocket 0.5 still expects TCP/IP listeners. Rocket's v0.5 release notes call
-pluggable listeners and Unix domain sockets out as next-major-release work, not
-something v0.5 gives us today. That means a UDS control plane would need extra
-plumbing that Rocket does not currently provide.
+Rocket 0.5 still expects TCP/IP listeners. Rocket's own v0.5 release notes say
+pluggable listeners and Unix domain sockets are next-major work, so UDS is not a
+native Rocket 0.5 deployment target. A Rocket-hosted control plane would either
+stay on TCP loopback or require extra listener plumbing that Rocket does not
+provide today.
 
 ### Why a separate axum listener
 
-axum is a better fit for the control listener than adding the control surface
-to Rocket:
+axum is the better control-plane host than adding these routes to Rocket:
 
-- `axum::serve` runs on a supplied listener and is intentionally minimal.
-- The control plane is JSON-only, local-only, and state-light.
-- Keeping the control listener separate preserves the Rocket public API and
-  avoids a big-bang migration.
+- `axum::serve` takes a supplied listener and stays deliberately minimal.
+- The control API is JSON-only, local-only, and state-light.
+- A separate listener keeps the public Rocket API unchanged for now.
+- If v2 ever switches the local transport to UDS, that change stays isolated to
+  the control plane instead of forcing a Rocket migration.
 
 ### Runtime files
 
@@ -96,6 +97,26 @@ Example `control.json`:
 state even when the node is stopped. `control.json` is the discovery file for
 the live control listener. Both files are local-only.
 
+`service.json` fields:
+
+- `contractVersion`: semver string for the CLI/control contract.
+- `platform`: `macos` or `linux`.
+- `manager`: `homebrew-launchagent`, `launchd-user`, `systemd-user`, or
+  `systemd-system`.
+- `version`: node binary version when known.
+- `configPath`: absolute base config path.
+- `dataPath`: absolute data root path.
+- `logMode`: `file`, `journald`, or `stdout`.
+- `keyBackend`: `macos-keychain` or `encrypted-file`.
+
+`control.json` fields:
+
+- `contractVersion`: semver string for the CLI/control contract.
+- `host`: loopback host bound by the live control listener.
+- `port`: loopback TCP port bound by the live control listener.
+- `pid`: process ID of the live node, when known.
+- `tokenPath`: absolute path to the bearer token file.
+
 ## 2. Control API v1
 
 ### Common rules
@@ -106,6 +127,9 @@ the live control listener. Both files are local-only.
 - The token is sent as `Authorization: Bearer <token>`.
 - The control plane never exposes private keys, passphrases, recovery seeds, or
   secret env-var values.
+- `GET /v1/config` and `PATCH /v1/config` return a public projection of the
+  effective config, not a verbatim serialization of the internal `Config`
+  struct. Secret-bearing fields are omitted entirely.
 - All paths in responses are absolute after resolution.
 - All byte sizes in JSON are exact byte counts, serialized as JSON numbers.
 
@@ -127,6 +151,9 @@ Additional rules:
 4. The desktop app may still use service-manager-only commands when the control
    contract is incompatible, but it MUST not issue control mutations across a
    major contract mismatch.
+5. `publicProtocolVersion` gates only the existing public Rocket API. It is
+   independent from the control contract version and can be checked separately by
+   SDK consumers.
 
 ### Error shape
 
@@ -190,7 +217,8 @@ Field definitions:
 - `appVersion`: `CARGO_PKG_VERSION` for the running node binary.
 - `publicProtocolVersion`: the current public TinyCloud protocol version.
 - `identityReady`: `true` when the node can sign with its identity key.
-- `keyBackend`: public KeyProvider kind.
+- `keyBackend`: public KeyProvider kind, or `null` before the backend has been
+  initialized.
 - `nodeDid`: public DID for the node identity, or `null` if the identity is not
   ready.
 
@@ -213,7 +241,8 @@ Field definitions:
 
 - `contractVersion`: semver string for the control contract.
 - `identityReady`: `true` when the KeyProvider can sign.
-- `keyBackend`: public KeyProvider kind.
+- `keyBackend`: public KeyProvider kind, or `null` before the backend has been
+  initialized.
 - `nodeDid`: public DID for the node identity, or `null` if the identity has
   not been generated yet.
 
@@ -243,7 +272,10 @@ Response:
 Field definitions:
 
 - `contractVersion`: semver string for the control contract.
-- `state`: live runtime state of the node process.
+- `state`: live runtime state of the node process. `starting` means the node is
+  booting but not yet ready, `running` means the control plane is serving,
+  `stopping` means shutdown is in progress, and `error` means the process
+  encountered an unrecoverable startup/runtime failure.
 - `pid`: the running process ID.
 - `version`: node binary version.
 - `configPath`: absolute path to the base config file in use.
@@ -256,7 +288,8 @@ Field definitions:
 
 ### 2.4 `GET /v1/config`
 
-Purpose: return the effective persisted config snapshot, with secrets redacted.
+Purpose: return the effective public config snapshot, with secret-bearing fields
+omitted.
 
 The snapshot is the normalized result of:
 
@@ -268,8 +301,8 @@ The snapshot is the normalized result of:
    `_` still accepted.
 
 Environment variables always win over files. This endpoint reports the
-effective persisted configuration; it does not claim that the running process
-has hot-reloaded every field.
+effective runtime configuration; it does not claim that the running process has
+hot-reloaded every field.
 
 Response:
 
@@ -293,7 +326,10 @@ Response:
         "path": "/Users/me/Library/Application Support/TinyCloud Node/blocks"
       },
       "staging": "memory",
-      "database": "sqlite:/Users/me/Library/Application Support/TinyCloud Node/caps.db",
+      "database": {
+        "backendKind": "sqlite",
+        "path": "/Users/me/Library/Application Support/TinyCloud Node/caps.db"
+      },
       "limitBytes": null,
       "sql": {
         "path": "/Users/me/Library/Application Support/TinyCloud Node/sql",
@@ -305,7 +341,7 @@ Response:
         "limitBytes": null,
         "memoryThresholdBytes": 10485760,
         "idleTimeoutSeconds": 300,
-        "maxMemoryPerConnection": "128MB"
+        "maxMemoryPerConnectionBytes": 134217728
       }
     },
     "spaces": {
@@ -350,8 +386,14 @@ Response:
 Schema notes:
 
 - Every path field in the snapshot is absolute.
+- `baseConfigPath` is the absolute path to the base config file selected by
+  `--config` or the platform default.
+- `overlayPath` is the absolute path to `dataPath/runtime/config.override.toml`.
 - `keyProvider.backend` is read-only, derived public metadata. It is not the
   raw on-disk key configuration.
+- `storage.database` is a public descriptor only. It never returns a raw DSN,
+  credentials, or query parameters. For SQLite, `path` is the absolute file
+  path; for MySQL/Postgres, `path` is `null`.
 - Secret-bearing fields are omitted, not masked with fake placeholder strings.
 
 Top-level `config` fields:
@@ -379,7 +421,9 @@ Top-level `config` fields:
 - `dataDir`: absolute path string
 - `blocks`: block store object
 - `staging`: `memory` or `file-system`
-- `database`: connection string
+- `database.backendKind`: `sqlite`, `mysql`, `postgres`, or `other`
+- `database.path`: absolute path string for file-backed SQLite, otherwise
+  `null`
 - `limitBytes`: integer or `null`
 - `sql.path`: absolute path string
 - `sql.limitBytes`: integer or `null`
@@ -388,7 +432,7 @@ Top-level `config` fields:
 - `duckdb.limitBytes`: integer or `null`
 - `duckdb.memoryThresholdBytes`: integer
 - `duckdb.idleTimeoutSeconds`: integer
-- `duckdb.maxMemoryPerConnection`: string
+- `duckdb.maxMemoryPerConnectionBytes`: integer
 
 `storage.blocks`:
 
@@ -501,6 +545,8 @@ Response:
 ```json
 {
   "contractVersion": "1.0.0",
+  "baseConfigPath": "/Users/me/Library/Application Support/TinyCloud Node/tinycloud.toml",
+  "overlayPath": "/Users/me/Library/Application Support/TinyCloud Node/runtime/config.override.toml",
   "restartRequired": true,
   "appliedPaths": [
     "cors",
@@ -508,18 +554,21 @@ Response:
     "publicSpaces.rateLimitPerMinute"
   ],
   "config": {
-    "...": "full effective snapshot after the overlay is written"
+    "...": "full public snapshot after the overlay is written"
   }
 }
 ```
 
 Field definitions:
 
+- `baseConfigPath`: absolute path to the base config file selected by the CLI
+  or platform default.
+- `overlayPath`: absolute path to `dataPath/runtime/config.override.toml`.
 - `restartRequired`: `true` when any requested field changed. v1 does not
   promise live reload, so a changed patch should be treated as requiring a
   restart to take effect in the running node.
 - `appliedPaths`: canonical leaf paths that actually changed value.
-- `config`: the full effective persisted snapshot after the overlay write.
+- `config`: the full effective public snapshot after the overlay write.
 
 Invalid, unsafe, or unknown fields MUST be rejected with `400 invalid_request`.
 
@@ -572,6 +621,7 @@ Log entry fields:
 
 - The node keeps an in-memory ring buffer of the most recent 2000 structured
   log entries.
+- The buffer is not persisted across restarts.
 - `cursor` values are valid only for the current process lifetime.
 - If a cursor has fallen out of the buffer, the server returns the newest
   available window instead of erroring.
@@ -589,13 +639,28 @@ it MUST NOT reshape the JSON contract.
 | `tinycloud serve --config <path>` | Base config file plus runtime overlay and env vars |
 | `tinycloud node service install` | Service manager + `service.json` |
 | `tinycloud node service start|stop|restart` | Service manager |
-| `tinycloud node service status --json` | Service manager + `service.json` + `control.json` + `GET /v1/version` + `GET /v1/status` + `GET /v1/identity` |
+| `tinycloud node service status --json` | Service manager + `service.json` + `control.json` + `control.token` + `GET /v1/version` + `GET /v1/status` + `GET /v1/identity` |
 | `tinycloud node service uninstall` | Service manager + runtime files |
-| `tinycloud node status` | `GET /v1/status` |
-| `tinycloud node logs` | `GET /v1/logs/tail` |
-| `tinycloud node doctor` | `service.json` + `control.json` + token file + `GET /v1/status` + `GET /v1/identity` + `GET /v1/config` + local filesystem checks |
+| `tinycloud node status` | `service.json` + `control.json` + `control.token` + `GET /v1/status` |
+| `tinycloud node logs` | `service.json` + `control.json` + `control.token` + `GET /v1/logs/tail` |
+| `tinycloud node doctor` | `service.json` + `control.json` + `control.token` + `GET /v1/status` + `GET /v1/identity` + `GET /v1/config` + local filesystem checks |
 | `tinycloud node key backup` | KeyProvider store + local backup bundle path |
-| `tinycloud node key export` | `GET /v1/identity` |
+| `tinycloud node key export` | `service.json` + `control.json` + `control.token` + `GET /v1/identity` |
+
+### Control discovery
+
+Any command that talks to the live control API MUST discover the node in this
+order:
+
+1. Locate `service.json` for the installed profile.
+2. Read `service.json` to learn `dataPath`, `configPath`, `logMode`,
+   `keyBackend`, `platform`, `manager`, and the fallback `contractVersion`.
+3. Read `dataPath/runtime/control.json` to obtain the loopback `host`, `port`,
+   `pid`, and `tokenPath`.
+4. Read the token file at `tokenPath` and send it as `Authorization: Bearer <token>`.
+
+If any discovery file is missing or unreadable, the command MUST fail locally
+rather than guessing at a host, port, or token.
 
 ### 3.1 `tinycloud serve --config <path>`
 
@@ -604,11 +669,14 @@ Starts the public Rocket server and the separate local control listener.
 Rules:
 
 - `--config <path>` selects the base config file.
-- If `--config` is omitted, the platform default `tinycloud.toml` is used.
+- If `--config` is omitted, the platform default `configRoot/tinycloud.toml`
+  path is used.
 - The node writes runtime files under `dataPath/runtime/`.
 - The public API remains on Rocket 0.5.
 - The control listener is separate, local-only, and never binds a non-loopback
   address.
+- `serve` is the only command that starts a foreground node process directly;
+  the service-manager commands wrap it for installation and lifetime control.
 
 ### 3.2 `tinycloud node service install|start|stop|restart|status --json|uninstall`
 
@@ -631,6 +699,10 @@ Command behavior:
 - `status` reports the merged service status object.
 - `uninstall` disables and removes the service definition and the runtime
   control files.
+
+`install` must also write `service.json` with the exact install profile used by
+the node, including the chosen `configPath`, `dataPath`, `logMode`, and
+`keyBackend`.
 
 The runtime control files that uninstall removes are:
 
@@ -663,7 +735,8 @@ The runtime control files that uninstall removes are:
 
 Field contract:
 
-- `contractVersion`: semver string for the control contract.
+- `contractVersion`: semver string for the CLI/control contract. It should match
+  the live `/v1/version` contract when the control API is reachable.
 - `platform`: `macos` or `linux`.
 - `manager`: `homebrew-launchagent`, `launchd-user`, `systemd-user`, or
   `systemd-system`.
@@ -675,7 +748,9 @@ Field contract:
 - `configPath`: absolute base config path.
 - `dataPath`: absolute data root path.
 - `logMode`: `file`, `journald`, `stdout`, or `null` if the install metadata is
-  unavailable.
+  unavailable. `file` is the normal mode for macOS user installs and Linux
+  user installs, `journald` is the normal mode for Linux system installs, and
+  `stdout` is only used for foreground `serve` runs or debug profiles.
 - `keyBackend`: identity KeyProvider backend kind, or `null` if the install
   metadata is unavailable.
 - `identityReady`: whether the node identity is ready for signing.
@@ -688,11 +763,16 @@ Source mapping:
   default target.
 - `contractVersion` comes from `GET /v1/version` when reachable, otherwise from
   `service.json`, otherwise from the CLI's built-in control contract version.
-- `state`, `pid`, and `enabledAtLogin` come from the service manager.
+- `state`, `pid`, and `enabledAtLogin` come from the service manager. If the
+  manager says the service is running but the live control probe fails, `state`
+  is normalized to `error`.
 - `version`, `identityReady`, and `nodeDid` come from the control API when
   reachable.
 - If the control API is unreachable, `identityReady` is `false`, `nodeDid` is
   `null`, and `version` falls back to `service.json` if available.
+
+`state` is therefore manager-first, with live control health used as a
+consistency check instead of a separate source of truth.
 
 ### 3.4 `tinycloud node status`
 
@@ -700,9 +780,12 @@ Returns the live control-plane status.
 
 Contract:
 
-- It maps to `GET /v1/status`.
+- It maps to `GET /v1/status` after the CLI has discovered `control.json` and
+  the bearer token.
 - In `--json` mode, it emits the exact `/v1/status` response body.
 - It is the runtime view, not the service-manager view.
+- If discovery fails or the control API is unreachable, the command fails
+  locally instead of fabricating a status object.
 
 ### 3.5 `tinycloud node logs`
 
@@ -710,11 +793,14 @@ Returns the live log tail.
 
 Contract:
 
-- It maps to `GET /v1/logs/tail`.
+- It maps to `GET /v1/logs/tail` after the CLI has discovered `control.json`
+  and the bearer token.
 - Default tail size is `200` lines.
 - In `--json` mode, it emits the exact `/v1/logs/tail` response body.
 - When the node is running in `stdout` log mode, tailing is best-effort and
   comes from the in-memory ring buffer described above.
+- If discovery fails or the control API is unreachable, the command fails
+  locally instead of guessing.
 
 ### 3.6 `tinycloud node doctor`
 
@@ -728,6 +814,8 @@ Sources:
 - `GET /v1/config` for config and overlay checks.
 - Local filesystem checks for config/data paths, runtime files, and token file
   permissions.
+- `doctor` must use the public config snapshot only; it must not read or echo a
+  raw DSN or any private key material.
 
 Suggested output shape:
 
@@ -757,6 +845,8 @@ Contract:
 
 - The backup bundle is local and opaque.
 - It MUST NOT print raw private key bytes.
+- The command reads the local KeyProvider store directly and does not require
+  the live control listener.
 - The default destination is under `dataPath/backups/`.
 - The CLI returns metadata JSON on success.
 
@@ -774,13 +864,17 @@ Suggested success JSON:
 If the node identity is not ready yet, `backup` MUST fail instead of inventing a
 bundle.
 
+The bundle format itself is intentionally opaque in v1. It is the recovery
+artifact for the CLI, not a public export.
+
 ### 3.8 `tinycloud node key export`
 
 Exports public identity material only.
 
 Contract:
 
-- It maps to `GET /v1/identity`.
+- It maps to `GET /v1/identity` after the CLI has discovered `control.json`
+  and the bearer token.
 - It MUST never expose the private key.
 - In `--json` mode, it emits the exact `/v1/identity` response body.
 
@@ -795,6 +889,11 @@ under the data root.
 | Linux `systemd-user` | `$XDG_CONFIG_HOME/tinycloud-node/` or `~/.config/tinycloud-node/` | `$XDG_DATA_HOME/tinycloud-node/` or `~/.local/share/tinycloud-node/` | `$XDG_STATE_HOME/tinycloud-node/` or `~/.local/state/tinycloud-node/` |
 | Linux `systemd-system` | `/etc/tinycloud-node/` | `/var/lib/tinycloud-node/` | journald |
 
+`configPath` is always `${configRoot}/tinycloud.toml`. `dataPath` is the root
+that owns `runtime/`, logs metadata, backups, and other node-managed files. On
+macOS, the config root and data root are the same directory; on Linux user and
+system installs, they are separate roots.
+
 ### Config loading order
 
 The node control plane keeps the existing config layering, with one runtime
@@ -802,7 +901,7 @@ overlay added for the control plane:
 
 1. Built-in defaults from `Config::default()`.
 2. Base config file from `--config <path>` or the platform default
-   `tinycloud.toml`.
+   `configRoot/tinycloud.toml`.
 3. Runtime overlay file at `dataPath/runtime/config.override.toml`.
 4. `TINYCLOUD_` env vars, with `__` nesting preferred and legacy `_` still
    accepted.
@@ -845,6 +944,12 @@ Backends:
   other Apple devices.
 - `encrypted-file`: stores the identity secret in an encrypted file under the
   data root for Linux and headless deployments.
+
+Default selection:
+
+- macOS desktop installs default to `macos-keychain`.
+- Linux user and system installs default to `encrypted-file` unless the
+  installer explicitly selects a different backend.
 
 ### First run
 
