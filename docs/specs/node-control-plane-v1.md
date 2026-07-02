@@ -844,6 +844,18 @@ Source mapping:
 `state` is therefore manager-first, with live control health used as a
 consistency check instead of a separate source of truth.
 
+V0 transition: until TC-78 lands, the CLI treats an unavailable control probe
+as `controlApi: "unavailable"` and applies the 30-second grace window to
+distinguish `starting` from `running` instead of escalating the service to
+`error`.
+
+During this transition, a manager-backed process with a missing or unreachable
+control listener remains `starting` while its age is under 30 seconds and then
+reports `running` with `controlApi: "unavailable"` after the grace window
+expires. This is a temporary TC-76/TC-78 bridge only; once TC-78 ships, the
+probe should map failed control health to `error` again when the live runtime
+cannot answer.
+
 ### 3.4 `tinycloud node status`
 
 Returns the live control-plane status.
@@ -984,6 +996,13 @@ For `systemd-system` installs, control commands require either root or
 membership in the `tinycloud` group because `control.token` is group-readable
 (`0640 root:tinycloud`). Reading `journald` tails requires membership in the
 `systemd-journal` group.
+
+For local development and smoke tests, `TINYCLOUD_NODE_CONFIG_ROOT` may
+override the macOS application-support root so the CLI-owned manifest,
+LaunchAgent plist, and paired node roots can be redirected away from the real
+home directory. Production installs should not depend on this escape hatch.
+It exists only as a test/dev escape hatch for this stage so macOS validation
+can run without touching `~/Library`.
 
 ### Config loading order
 
