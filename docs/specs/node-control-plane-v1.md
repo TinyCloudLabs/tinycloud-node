@@ -196,7 +196,9 @@ Suggested error codes:
 
 ### Shared enums
 
-- `keyBackend`: `macos-keychain`, `encrypted-file`
+- `keyBackend`: `macos-keychain`, `encrypted-file`, `static`, `dstack`. Legacy
+  `Static{secret}`/`TINYCLOUD_KEYS_SECRET` sources report `static` (`doctor`
+  emits a deprecation warning) and TEE deployments report `dstack`.
 - `logMode`: `file`, `journald`, `stdout`
 - `platform`: `macos`, `linux`
 - `manager`: `homebrew-launchagent`, `launchd-user`, `systemd-user`, `systemd-system`
@@ -496,7 +498,9 @@ Top-level `config` fields:
 
 `keyProvider`:
 
-- `backend`: `macos-keychain` or `encrypted-file`
+- `backend`: `macos-keychain`, `encrypted-file`, `static`, or `dstack`. Legacy
+  `Static{secret}`/`TINYCLOUD_KEYS_SECRET` sources report `static` (`doctor`
+  emits a deprecation warning) and TEE deployments report `dstack`.
 
 `tee`:
 
@@ -590,7 +594,10 @@ Field definitions:
 - `restartRequired`: `true` when any requested field changed. v1 does not
   promise live reload, so a changed patch should be treated as requiring a
   restart to take effect in the running node.
-- `appliedPaths`: canonical leaf paths that actually changed value.
+- `appliedPaths`: canonical leaf paths that actually changed value. Fields
+  masked by a higher-precedence env var are excluded: the overlay is still
+  written, but it has no effect until the env var is removed, and the
+  response's effective `config` snapshot reflects that.
 - `config`: the full effective public snapshot after the overlay write.
 
 Invalid, unsafe, or unknown fields MUST be rejected with `400 invalid_request`.
@@ -613,7 +620,7 @@ Response:
 {
   "contractVersion": "1.0.0",
   "source": "file",
-  "cursor": "2026-07-02T12:34:56Z#000120",
+  "cursor": "f:8388608:1234567",
   "entries": [
     {
       "timestamp": "2026-07-02T12:34:56Z",
@@ -757,6 +764,7 @@ The runtime control files that uninstall removes are:
 ```json
 {
   "contractVersion": "1.0.0",
+  "profile": "macos-user",
   "platform": "macos",
   "manager": "launchd-user",
   "state": "running",
@@ -780,6 +788,8 @@ Field contract:
 
 - `contractVersion`: semver string for the CLI/control contract. It should match
   the live `/v1/version` contract when the control API is reachable.
+- `profile`: install profile identifier: `macos-user`, `linux-user`, or
+  `linux-system`.
 - `platform`: `macos` or `linux`.
 - `manager`: `homebrew-launchagent`, `launchd-user`, `systemd-user`, or
   `systemd-system`.
