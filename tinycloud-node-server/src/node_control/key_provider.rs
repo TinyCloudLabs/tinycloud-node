@@ -38,15 +38,11 @@ use core_foundation_sys::{
     data::CFDataRef,
 };
 #[cfg(target_os = "macos")]
-use security_framework_sys::access_control::{
-    kSecAttrAccessible, kSecAttrAccessibleAfterFirstUnlock,
-};
-#[cfg(target_os = "macos")]
 use security_framework_sys::{
     base::{errSecDuplicateItem, errSecItemNotFound, errSecSuccess},
     item::{
         kSecAttrAccount, kSecAttrService, kSecAttrSynchronizable, kSecClass, kSecClassGenericPassword,
-        kSecReturnData, kSecValueData,
+        kSecReturnData, kSecUseDataProtectionKeychain, kSecValueData,
     },
     keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemDelete},
 };
@@ -860,9 +856,8 @@ impl MacosKeychainProvider {
                 CFBoolean::from(true).into_CFType(),
             ),
             (
-                unsafe { CFString::wrap_under_get_rule(kSecAttrAccessible) },
-                unsafe { CFString::wrap_under_get_rule(kSecAttrAccessibleAfterFirstUnlock) }
-                    .into_CFType(),
+                unsafe { CFString::wrap_under_get_rule(kSecUseDataProtectionKeychain) },
+                CFBoolean::from(true).into_CFType(),
             ),
         ]
     }
