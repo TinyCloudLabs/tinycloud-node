@@ -3,7 +3,19 @@ use anyhow::{anyhow, bail, Context, Result};
 use reqwest::blocking::Client as BlockingClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{fs, path::Path, process::Command, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    time::Duration,
+};
+
+use crate::{
+    config::Config,
+    node_control::key_provider::{
+        self, BackupResult, IdentityPurpose, IdentitySourceKind, IdentityState,
+    },
+};
 
 use super::paths::{
     dir_to_json_string, KeyBackend, LogMode, Manager, Platform, Profile, ProfilePaths,
@@ -125,6 +137,48 @@ pub fn current_profile_paths() -> ProfilePaths {
     Profile::default_for_host().paths()
 }
 
+fn installed_or_current_paths() -> Result<ProfilePaths> {
+    Ok(discover_installed_service()?
+        .map(|installed| installed.paths)
+        .unwrap_or_else(current_profile_paths))
+}
+
+fn effective_config(paths: &ProfilePaths) -> Result<Config> {
+    let figment = runtime::serve_config_figment(&paths.config_path)?;
+    let mut config = figment.extract::<Config>()?;
+    config.storage.resolve();
+    Ok(config)
+}
+
+fn local_identity_state(paths: &ProfilePaths) -> Result<IdentityState> {
+    let config = effective_config(paths)?;
+    key_provider::resolve_identity_state(
+        config.keys.as_ref(),
+        &config.storage.datadir,
+        IdentityPurpose::Probe,
+    )
+}
+
+fn local_identity_snapshot(paths: &ProfilePaths) -> Result<key_provider::IdentitySnapshot> {
+    let state = local_identity_state(paths)?;
+    Ok(key_provider::identity_snapshot(&state))
+}
+
+fn identity_source_warnings(state: Option<&IdentityState>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if let Some(state) = state {
+        if matches!(
+            state.source,
+            IdentitySourceKind::StaticEnv | IdentitySourceKind::StaticConfig
+        ) {
+            warnings.push("legacy static key source is deprecated for desktop installs".into());
+        }
+    } else if std::env::var_os("TINYCLOUD_KEYS_SECRET").is_some() {
+        warnings.push("legacy static key source is deprecated for desktop installs".into());
+    }
+    warnings
+}
+
 pub fn default_service_status() -> ServiceStatus {
     let paths = current_profile_paths();
     ServiceStatus {
@@ -140,7 +194,7 @@ pub fn default_service_status() -> ServiceStatus {
         config_path: paths.config_path_json(),
         data_path: paths.data_root_json(),
         log_mode: Some(paths.profile.log_mode()),
-        key_backend: Some(paths.profile.key_backend()),
+        key_backend: None,
         identity_ready: false,
         node_did: None,
         control_api: None,
@@ -207,6 +261,41 @@ pub fn node_logs_body(lines: Option<u32>) -> Result<String> {
     session.get_text(&url)
 }
 
+pub fn node_key_backup(passphrase: &[u8], output: Option<PathBuf>) -> Result<BackupResult> {
+    let paths = installed_or_current_paths()?;
+    let config = effective_config(&paths)?;
+    key_provider::backup_identity(
+        config.keys.as_ref(),
+        &config.storage.datadir,
+        passphrase,
+        output,
+    )
+}
+
+pub fn node_key_export_body() -> Result<String> {
+    node_identity_body()
+}
+
+pub fn node_identity_body() -> Result<String> {
+    let paths = installed_or_current_paths()?;
+    if let Some(body) = live_identity_body_for_paths(&paths)? {
+        return Ok(body);
+    }
+
+    let snapshot = local_identity_snapshot(&paths)?;
+    Ok(serde_json::to_string(&snapshot)?)
+}
+
+fn live_identity_body_for_paths(paths: &ProfilePaths) -> Result<Option<String>> {
+    match discover_control_session_for_paths(paths) {
+        Ok(session) => session
+            .get_text("/v1/identity")
+            .map(Some)
+            .or_else(|_| Ok(None)),
+        Err(_) => Ok(None),
+    }
+}
+
 pub fn node_doctor() -> Result<DoctorReport> {
     let current_paths = current_profile_paths();
     let discovered = discover_installed_service()?;
@@ -214,87 +303,115 @@ pub fn node_doctor() -> Result<DoctorReport> {
         Some(installed) => (installed.paths, Some(installed.manifest)),
         None => (current_paths, None),
     };
-    let session = discover_control_session_for_paths(&paths);
+    let session = discover_control_session_for_paths(&paths).ok();
+    let local_identity = local_identity_state(&paths).ok();
+    let local_identity_snapshot = local_identity
+        .as_ref()
+        .map(|state| key_provider::identity_snapshot(state));
+    let local_config = effective_config(&paths).ok();
     let mut checks = Vec::new();
-    let mut warnings = Vec::new();
+    let warnings = identity_source_warnings(local_identity.as_ref());
 
     checks.push(check_service_install(&paths, manifest.as_ref()));
     checks.push(check_local_files(&paths, manifest.as_ref()));
 
     let mut control_status = DoctorCheck {
         name: "control".into(),
-        status: DoctorCheckStatus::Fail,
+        status: DoctorCheckStatus::Warn,
         details: None,
     };
+    if let Some(session) = session.as_ref() {
+        match session.get_json("/v1/status") {
+            Ok(value) => {
+                control_status.status = DoctorCheckStatus::Pass;
+                control_status.details = Some(value);
+            }
+            Err(err) => {
+                control_status.details = Some(json!({"error": err.to_string()}));
+            }
+        }
+    } else {
+        control_status.details = Some(json!({"error": "control API unavailable"}));
+    }
+
     let mut identity_status = DoctorCheck {
         name: "identity".into(),
-        status: DoctorCheckStatus::Fail,
+        status: DoctorCheckStatus::Warn,
         details: None,
     };
-    let mut config_status = DoctorCheck {
-        name: "config".into(),
-        status: DoctorCheckStatus::Fail,
-        details: None,
-    };
-
-    match session {
-        Ok(session) => {
-            match session.get_json("/v1/status") {
-                Ok(value) => {
-                    control_status.status = DoctorCheckStatus::Pass;
-                    control_status.details = Some(value);
-                }
-                Err(err) => {
-                    control_status.status = DoctorCheckStatus::Fail;
-                    control_status.details = Some(json!({"error": err.to_string()}));
-                }
+    if let Some(session) = session.as_ref() {
+        match session.get_json("/v1/identity") {
+            Ok(value) => {
+                identity_status.status = DoctorCheckStatus::Pass;
+                identity_status.details = Some(value);
             }
-
-            match session.get_json("/v1/identity") {
-                Ok(value) => {
-                    identity_status.status = DoctorCheckStatus::Pass;
-                    identity_status.details = Some(value);
-                }
-                Err(err) => {
-                    identity_status.status = DoctorCheckStatus::Fail;
+            Err(err) => {
+                if let Some(snapshot) = local_identity_snapshot.as_ref() {
+                    identity_status.status = if snapshot.identity_ready {
+                        DoctorCheckStatus::Pass
+                    } else {
+                        DoctorCheckStatus::Warn
+                    };
+                    identity_status.details = Some(json!(snapshot));
+                } else {
                     identity_status.details = Some(json!({"error": err.to_string()}));
                 }
             }
-
-            match session.get_json("/v1/config") {
-                Ok(value) => {
-                    let public_api = value
-                        .get("config")
-                        .and_then(|config| config.get("publicApi"))
-                        .and_then(|public_api| public_api.get("address"))
-                        .and_then(|value| value.as_str());
-
-                    if public_api.map(is_loopback_address).unwrap_or(false) {
-                        config_status.status = DoctorCheckStatus::Pass;
-                    } else {
-                        config_status.status = DoctorCheckStatus::Fail;
-                    }
-                    config_status.details = Some(value);
-                }
-                Err(err) => {
-                    config_status.status = DoctorCheckStatus::Fail;
-                    config_status.details = Some(json!({"error": err.to_string()}));
-                }
-            }
         }
-        Err(err) => {
-            control_status.details = Some(json!({"error": err.to_string()}));
-            identity_status.details = Some(json!({"error": err.to_string()}));
-            config_status.details = Some(json!({"error": err.to_string()}));
-        }
+    } else if let Some(snapshot) = local_identity_snapshot.as_ref() {
+        identity_status.status = if snapshot.identity_ready {
+            DoctorCheckStatus::Pass
+        } else {
+            DoctorCheckStatus::Warn
+        };
+        identity_status.details = Some(json!(snapshot));
+    } else {
+        identity_status.details = Some(json!({"error": "identity unavailable"}));
     }
 
-    if let Some(manifest) = manifest.as_ref() {
-        if matches!(manifest.key_backend, KeyBackend::Static) {
-            warnings.push("legacy static key source is deprecated for desktop installs".into());
+    let mut config_status = DoctorCheck {
+        name: "config".into(),
+        status: DoctorCheckStatus::Warn,
+        details: None,
+    };
+    if let Some(session) = session.as_ref() {
+        match session.get_json("/v1/config") {
+            Ok(value) => {
+                let public_api = value
+                    .get("config")
+                    .and_then(|config| config.get("publicApi"))
+                    .and_then(|public_api| public_api.get("address"))
+                    .and_then(|value| value.as_str());
+
+                if public_api.map(is_loopback_address).unwrap_or(false) {
+                    config_status.status = DoctorCheckStatus::Pass;
+                } else {
+                    config_status.status = DoctorCheckStatus::Fail;
+                }
+                config_status.details = Some(value);
+            }
+            Err(err) => {
+                config_status.details = Some(json!({"error": err.to_string()}));
+            }
         }
-    } else if std::env::var_os("TINYCLOUD_KEYS_SECRET").is_some() {
-        warnings.push("legacy static key source is deprecated for desktop installs".into());
+    } else if let Some(config) = local_config.as_ref() {
+        let public_api = public_api_from_config(&paths.config_path);
+        if is_loopback_address(&public_api.address) {
+            config_status.status = DoctorCheckStatus::Pass;
+        } else {
+            config_status.status = DoctorCheckStatus::Fail;
+        }
+        config_status.details = Some(json!({
+            "configPath": paths.config_path.display().to_string(),
+            "publicApi": {
+                "address": public_api.address,
+                "port": public_api.port,
+            },
+            "dataPath": dir_to_json_string(&config.storage.datadir),
+        }));
+    } else {
+        config_status.status = DoctorCheckStatus::Fail;
+        config_status.details = Some(json!({"error": "config unavailable"}));
     }
 
     checks.push(control_status);
@@ -401,8 +518,26 @@ pub fn service_status_for_installed(installed: DiscoveredService) -> ServiceStat
         .version
         .clone()
         .or_else(|| Some(manifest.version.clone()));
-    let identity_ready = control.identity_ready.unwrap_or(false);
-    let node_did = control.node_did.clone();
+    let local_identity = local_identity_state(&paths).ok();
+    let local_identity_snapshot = local_identity
+        .as_ref()
+        .map(|state| key_provider::identity_snapshot(state));
+    let identity_ready = if control.unavailable {
+        local_identity_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.identity_ready)
+            .unwrap_or(false)
+    } else {
+        control.identity_ready.unwrap_or(false)
+    };
+    let node_did = if control.unavailable {
+        local_identity_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.node_did.clone())
+    } else {
+        control.node_did.clone()
+    };
+    let key_backend = control.key_backend.or(Some(manifest.key_backend));
     let (state, pid, control_api) = derive_state(&manifest, &paths, &control);
 
     ServiceStatus {
@@ -418,7 +553,7 @@ pub fn service_status_for_installed(installed: DiscoveredService) -> ServiceStat
         config_path: manifest.config_path,
         data_path: manifest.data_path,
         log_mode: Some(manifest.log_mode),
-        key_backend: Some(manifest.key_backend),
+        key_backend,
         identity_ready,
         node_did,
         control_api,
@@ -474,6 +609,7 @@ struct ControlProbe {
     contract_version: Option<String>,
     version: Option<String>,
     public_api: Option<PublicApi>,
+    key_backend: Option<KeyBackend>,
     identity_ready: Option<bool>,
     node_did: Option<String>,
 }
@@ -606,6 +742,7 @@ fn probe_control_api(manifest: &ServiceManifest, paths: &ProfilePaths) -> Contro
                 contract_version: None,
                 version: Some(manifest.version.clone()),
                 public_api: None,
+                key_backend: None,
                 identity_ready: None,
                 node_did: None,
             };
@@ -622,6 +759,7 @@ fn probe_control_api(manifest: &ServiceManifest, paths: &ProfilePaths) -> Contro
                 contract_version: None,
                 version: Some(manifest.version.clone()),
                 public_api: None,
+                key_backend: None,
                 identity_ready: None,
                 node_did: None,
             };
@@ -646,6 +784,7 @@ fn probe_control_api(manifest: &ServiceManifest, paths: &ProfilePaths) -> Contro
                 contract_version: None,
                 version: Some(manifest.version.clone()),
                 public_api: None,
+                key_backend: None,
                 identity_ready: None,
                 node_did: None,
             };
@@ -671,6 +810,11 @@ fn probe_control_api(manifest: &ServiceManifest, paths: &ProfilePaths) -> Contro
             .map(|value| value.to_string())
             .or_else(|| Some(manifest.version.clone())),
         public_api: status.get("publicApi").and_then(public_api_from_value),
+        key_backend: identity
+            .as_ref()
+            .and_then(|value| value.get("keyBackend"))
+            .and_then(key_backend_from_value)
+            .or_else(|| status.get("keyBackend").and_then(key_backend_from_value)),
         identity_ready: identity
             .as_ref()
             .and_then(|value| value.get("identityReady"))
@@ -808,6 +952,10 @@ fn public_api_from_value(value: &Value) -> Option<PublicApi> {
     })
 }
 
+fn key_backend_from_value(value: &Value) -> Option<KeyBackend> {
+    serde_json::from_value(value.clone()).ok()
+}
+
 fn default_public_api() -> PublicApi {
     PublicApi {
         address: "127.0.0.1".into(),
@@ -937,7 +1085,7 @@ fn write_bootstrap_config_if_absent(paths: &ProfilePaths) -> Result<()> {
     let address = serde_json::to_string(&public_api.address)?;
     let datadir = serde_json::to_string(&paths.data_root.display().to_string())?;
     let rendered = format!(
-        "# Generated by `tinycloud node service install`.\n[global]\naddress = {address}\nport = {port}\nlog_level = \"normal\"\n\n[global.storage]\ndatadir = {datadir}\n",
+        "# Generated by `tinycloud node service install`.\n[global]\naddress = {address}\nport = {port}\nlog_level = \"normal\"\n\n[global.storage]\ndatadir = {datadir}\n\n[global.keys]\ntype = \"provider\"\n",
         port = public_api.port,
     );
 
@@ -1298,7 +1446,6 @@ mod tests {
         ffi::{OsStr, OsString},
         fs,
         path::Path,
-        sync::{Mutex, OnceLock},
     };
     use tempfile::tempdir;
 
@@ -1345,10 +1492,7 @@ mod tests {
     }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
+        crate::test_support::env_lock()
     }
 
     fn write_script(dir: &Path, name: &str, body: &str) {
@@ -1458,6 +1602,7 @@ mod tests {
         fs::create_dir_all(&data).unwrap();
         let _storage_legacy = EnvGuard::unset("TINYCLOUD_STORAGE_DATADIR");
         let _storage_canonical = EnvGuard::unset("TINYCLOUD_STORAGE__DATADIR");
+        let _keys_secret = EnvGuard::unset("TINYCLOUD_KEYS_SECRET");
         let _address = EnvGuard::unset("TINYCLOUD_ADDRESS");
         let _port = EnvGuard::unset("TINYCLOUD_PORT");
         let _rocket_address = EnvGuard::unset("ROCKET_ADDRESS");
@@ -1486,6 +1631,7 @@ mod tests {
         let _config_root = EnvGuard::set("TINYCLOUD_NODE_CONFIG_ROOT", temp.path());
         let _storage_legacy = EnvGuard::unset("TINYCLOUD_STORAGE_DATADIR");
         let _storage_canonical = EnvGuard::unset("TINYCLOUD_STORAGE__DATADIR");
+        let _keys_secret = EnvGuard::unset("TINYCLOUD_KEYS_SECRET");
         let _address = EnvGuard::unset("TINYCLOUD_ADDRESS");
         let _port = EnvGuard::unset("TINYCLOUD_PORT");
         let _rocket_address = EnvGuard::unset("ROCKET_ADDRESS");
@@ -1528,6 +1674,8 @@ esac
         assert!(rendered.contains("address = \"127.0.0.1\""));
         assert!(rendered.contains("port = 8081"));
         assert!(rendered.contains("log_level = \"normal\""));
+        assert!(rendered.contains("[global.keys]"));
+        assert!(rendered.contains("type = \"provider\""));
 
         let installed = DiscoveredService {
             manifest: read_service_manifest(&paths.service_manifest_path).unwrap(),
@@ -1538,6 +1686,9 @@ esac
         assert_eq!(status.state, ServiceState::Stopped);
         assert_eq!(status.public_api.address, "127.0.0.1");
         assert_eq!(status.public_api.port, 8081);
+        assert_eq!(status.key_backend, Some(KeyBackend::MacosKeychain));
+        assert!(!status.identity_ready);
+        assert!(status.node_did.is_none());
 
         uninstall_for_paths(&paths).unwrap();
 
@@ -1551,6 +1702,7 @@ esac
         let _config_root = EnvGuard::set("TINYCLOUD_NODE_CONFIG_ROOT", temp.path());
         let _storage_legacy = EnvGuard::unset("TINYCLOUD_STORAGE_DATADIR");
         let _storage_canonical = EnvGuard::unset("TINYCLOUD_STORAGE__DATADIR");
+        let _keys_secret = EnvGuard::unset("TINYCLOUD_KEYS_SECRET");
         let _address = EnvGuard::unset("TINYCLOUD_ADDRESS");
         let _port = EnvGuard::unset("TINYCLOUD_PORT");
         let _rocket_address = EnvGuard::unset("ROCKET_ADDRESS");
@@ -1566,6 +1718,12 @@ esac
         // public_api_from_config (and by `serve --config <bootstrap>`).
         let figment = runtime::serve_config_figment(&paths.config_path).unwrap();
         rocket::Config::try_from(figment).unwrap();
+
+        let config = runtime::serve_config_figment(&paths.config_path)
+            .unwrap()
+            .extract::<crate::config::Config>()
+            .unwrap();
+        assert_eq!(config.keys, Some(crate::config::Keys::Provider));
     }
 
     #[test]
@@ -1634,6 +1792,7 @@ printf '%s\n' "${FAKE_PS_AGE:-29}"
             contract_version: None,
             version: None,
             public_api: None,
+            key_backend: None,
             identity_ready: None,
             node_did: None,
         };
@@ -1644,6 +1803,7 @@ printf '%s\n' "${FAKE_PS_AGE:-29}"
             contract_version: None,
             version: None,
             public_api: None,
+            key_backend: None,
             identity_ready: None,
             node_did: None,
         };
@@ -1740,6 +1900,9 @@ printf '%s\n' "${FAKE_PS_AGE:-29}"
         assert_eq!(value["enabledAtLogin"], true);
         assert_eq!(value["publicApi"]["address"], "127.0.0.1");
         assert_eq!(value["publicApi"]["port"], 8081);
+        assert_eq!(value["keyBackend"], "macos-keychain");
+        assert_eq!(value["identityReady"], true);
+        assert_eq!(value["nodeDid"], "did:key:z6Mk...");
         assert_eq!(value["controlApi"], "unavailable");
     }
 

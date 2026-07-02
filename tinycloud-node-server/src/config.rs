@@ -25,7 +25,8 @@ pub struct Config {
     pub telemetry: Telemetry,
     pub prometheus: Prometheus,
     pub cors: bool,
-    pub keys: Keys,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<Keys>,
     #[serde(default)]
     pub tee: TeeConfig,
     #[serde(default)]
@@ -125,14 +126,21 @@ impl Default for HooksConfig {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 #[serde(tag = "type")]
 pub enum Keys {
+    #[serde(rename = "static", alias = "Static")]
     Static(Static),
     #[cfg(feature = "dstack")]
+    #[serde(rename = "dstack", alias = "Dstack")]
     Dstack,
-    #[default]
-    Auto,
+    #[serde(
+        rename = "provider",
+        alias = "Auto",
+        alias = "Provider",
+        alias = "auto"
+    )]
+    Provider,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]

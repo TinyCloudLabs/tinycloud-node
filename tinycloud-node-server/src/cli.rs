@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use serde_json::Value;
 use std::{
+    fs,
     io::{self, Write},
     path::PathBuf,
 };
@@ -42,6 +43,7 @@ enum NodeCommand {
     Status(JsonArgs),
     Logs(LogsArgs),
     Doctor(JsonArgs),
+    Key(KeyArgs),
 }
 
 #[derive(Debug, Args)]
@@ -60,6 +62,18 @@ enum ServiceCommand {
     Status(JsonArgs),
 }
 
+#[derive(Debug, Args)]
+struct KeyArgs {
+    #[command(subcommand)]
+    command: KeyCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum KeyCommand {
+    Backup(BackupArgs),
+    Export(JsonArgs),
+}
+
 #[derive(Debug, Args, Default)]
 struct JsonArgs {
     /// Emit JSON.
@@ -76,6 +90,20 @@ struct LogsArgs {
     /// Number of log lines to tail.
     #[arg(long)]
     lines: Option<u32>,
+}
+
+#[derive(Debug, Args, Default)]
+struct BackupArgs {
+    /// Output path for the sealed backup bundle.
+    #[arg(long)]
+    output: Option<PathBuf>,
+
+    /// Read the passphrase from a file instead of prompting.
+    #[arg(long = "passphrase-file")]
+    passphrase_file: Option<PathBuf>,
+
+    #[command(flatten)]
+    json: JsonArgs,
 }
 
 pub async fn run() -> Result<()> {
@@ -107,6 +135,18 @@ fn run_node(args: NodeArgs) -> Result<()> {
             emit_control_json(service::node_logs_body(args.lines)?, args.json)
         }
         NodeCommand::Doctor(args) => emit_json(&service::node_doctor()?, args.json),
+        NodeCommand::Key(args) => run_key(args.command),
+    }
+}
+
+fn run_key(command: KeyCommand) -> Result<()> {
+    match command {
+        KeyCommand::Backup(args) => {
+            let passphrase = load_passphrase(args.passphrase_file)?;
+            let result = service::node_key_backup(&passphrase, args.output)?;
+            emit_json(&result, args.json.json)
+        }
+        KeyCommand::Export(args) => emit_control_json(service::node_key_export_body()?, args.json),
     }
 }
 
@@ -146,4 +186,26 @@ fn emit_control_json(body: String, json: bool) -> Result<()> {
         Err(_) => println!("{}", body),
     }
     Ok(())
+}
+
+fn load_passphrase(passphrase_file: Option<PathBuf>) -> Result<Vec<u8>> {
+    match passphrase_file {
+        Some(path) => {
+            let mut bytes = fs::read(&path)?;
+            while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+                bytes.pop();
+            }
+            if bytes.is_empty() {
+                return Err(anyhow::anyhow!("passphrase file is empty"));
+            }
+            Ok(bytes)
+        }
+        None => {
+            let passphrase = rpassword::prompt_password("Passphrase: ")?;
+            if passphrase.is_empty() {
+                return Err(anyhow::anyhow!("passphrase is required"));
+            }
+            Ok(passphrase.into_bytes())
+        }
+    }
 }

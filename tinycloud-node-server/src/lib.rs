@@ -26,9 +26,22 @@ pub mod tee;
 mod tracing;
 pub mod webhook_dispatcher;
 
-use config::{BlockStorage, Config, Keys, StagingStorage};
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Mutex, OnceLock};
+
+    pub fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+    }
+}
+
+use config::{BlockStorage, Config, StagingStorage};
 use hooks::HookRuntime;
 use invocation_replay::InvocationReplayCache;
+use node_control::key_provider::{self, IdentityPurpose};
 use quota::QuotaCache;
 use routes::{
     admin::{delete_quota, get_quota, list_quotas, set_quota},
@@ -151,7 +164,14 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         revoke_encryption_network,
     ];
 
-    let key_setup: StaticSecret = resolve_keys(&tinycloud_config.keys).await?;
+    let identity_state = key_provider::resolve_identity_state(
+        tinycloud_config.keys.as_ref(),
+        &tinycloud_config.storage.datadir,
+        IdentityPurpose::Serve,
+    )?;
+    let key_setup = identity_state
+        .secret
+        .ok_or_else(|| anyhow::anyhow!("node identity is not ready"))?;
     let webhook_encryption =
         ColumnEncryption::new(key_setup.derive_key(b"tinycloud/hooks/webhook-secrets"));
     let hook_runtime = HookRuntime::new(
@@ -322,52 +342,6 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         })))
     } else {
         Ok(rocket)
-    }
-}
-
-async fn resolve_keys(keys: &Keys) -> Result<StaticSecret> {
-    match keys {
-        Keys::Static(s) => Ok(s.clone().try_into()?),
-        #[cfg(feature = "dstack")]
-        Keys::Dstack => {
-            let key_bytes = dstack::get_key("tinycloud/keys/primary").await?;
-            StaticSecret::new(key_bytes)
-                .map_err(|v| anyhow::anyhow!("dstack key too short: {} bytes", v.len()))
-        }
-        Keys::Auto => {
-            // Check TINYCLOUD_TEE_MODE env var first
-            match std::env::var("TINYCLOUD_TEE_MODE").ok().as_deref() {
-                #[cfg(feature = "dstack")]
-                Some("dstack") => {
-                    let key_bytes = dstack::get_key("tinycloud/keys/primary").await?;
-                    StaticSecret::new(key_bytes)
-                        .map_err(|v| anyhow::anyhow!("dstack key too short: {} bytes", v.len()))
-                }
-                Some("off") => {
-                    anyhow::bail!(
-                        "TEE mode disabled but no static key configured. \
-                         Set TINYCLOUD_KEYS_SECRET or configure [keys] in config."
-                    )
-                }
-                _ => {
-                    // Auto-detect: check for dstack socket
-                    #[cfg(feature = "dstack")]
-                    if dstack::is_available() {
-                        ::tracing::info!("dstack socket detected, using TEE key derivation");
-                        let key_bytes = dstack::get_key("tinycloud/keys/primary").await?;
-                        return StaticSecret::new(key_bytes).map_err(|v| {
-                            anyhow::anyhow!("dstack key too short: {} bytes", v.len())
-                        });
-                    }
-                    anyhow::bail!(
-                        "No key source configured. Either:\n  \
-                         - Set TINYCLOUD_KEYS_SECRET environment variable\n  \
-                         - Configure [keys] section in tinycloud.toml\n  \
-                         - Run inside a dstack TEE (with 'dstack' feature enabled)"
-                    )
-                }
-            }
-        }
     }
 }
 

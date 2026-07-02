@@ -16,8 +16,30 @@ use crate::{app, config, node_control::paths::Profile, prometheus};
 
 fn with_serve_env(figment: rocket::figment::Figment) -> rocket::figment::Figment {
     figment
-        .merge(Env::prefixed("TINYCLOUD_").split("_").global())
-        .merge(Env::prefixed("TINYCLOUD_").split("__").global())
+        .merge(
+            Env::prefixed("TINYCLOUD_")
+                .split("_")
+                .ignore(&[
+                    "keys",
+                    "keys.secret",
+                    "keys_secret",
+                    "keys.type",
+                    "keys_type",
+                ])
+                .global(),
+        )
+        .merge(
+            Env::prefixed("TINYCLOUD_")
+                .split("__")
+                .ignore(&[
+                    "keys",
+                    "keys.secret",
+                    "keys_secret",
+                    "keys.type",
+                    "keys_type",
+                ])
+                .global(),
+        )
         .merge(Env::prefixed("ROCKET_").global())
 }
 
@@ -151,7 +173,6 @@ mod tests {
         ffi::OsString,
         fs,
         path::{Path, PathBuf},
-        sync::{Mutex, OnceLock},
     };
     use tempfile::tempdir;
 
@@ -202,10 +223,7 @@ mod tests {
     }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
+        crate::test_support::env_lock()
     }
 
     #[test]
@@ -234,6 +252,7 @@ mod tests {
         let _storage_datadir_canonical = EnvGuard::unset("TINYCLOUD_STORAGE__DATADIR");
         let _telemetry_legacy = EnvGuard::unset("TINYCLOUD_TELEMETRY_ENABLED");
         let _telemetry_canonical = EnvGuard::unset("TINYCLOUD_TELEMETRY__ENABLED");
+        let _keys_secret = EnvGuard::unset("TINYCLOUD_KEYS_SECRET");
         let _rocket_address = EnvGuard::unset("ROCKET_ADDRESS");
         let _rocket_port = EnvGuard::unset("ROCKET_PORT");
         let _rocket_config = EnvGuard::unset("ROCKET_CONFIG");
@@ -253,6 +272,7 @@ mod tests {
         let missing_config = temp.path().join("tinycloud.toml");
         let _storage_datadir = EnvGuard::unset("TINYCLOUD_STORAGE_DATADIR");
         let _storage_datadir_canonical = EnvGuard::unset("TINYCLOUD_STORAGE__DATADIR");
+        let _keys_secret = EnvGuard::unset("TINYCLOUD_KEYS_SECRET");
         let _address = EnvGuard::unset("TINYCLOUD_ADDRESS");
         let _port = EnvGuard::unset("TINYCLOUD_PORT");
         let _rocket_address = EnvGuard::unset("ROCKET_ADDRESS");
@@ -277,6 +297,7 @@ mod tests {
         let _cwd = CwdGuard::set(temp.path());
         let _storage_datadir = EnvGuard::unset("TINYCLOUD_STORAGE_DATADIR");
         let _storage_datadir_canonical = EnvGuard::unset("TINYCLOUD_STORAGE__DATADIR");
+        let _keys_secret = EnvGuard::unset("TINYCLOUD_KEYS_SECRET");
         let _address = EnvGuard::unset("TINYCLOUD_ADDRESS");
         let _port = EnvGuard::unset("TINYCLOUD_PORT");
         let _rocket_address = EnvGuard::unset("ROCKET_ADDRESS");
