@@ -7,7 +7,10 @@ use rocket::{
     figment::providers::{Env, Format, Serialized, Toml},
     tokio,
 };
-use std::path::{Path, PathBuf};
+use std::{
+    net::Ipv4Addr,
+    path::{Path, PathBuf},
+};
 
 use crate::{app, config, node_control::paths::Profile, prometheus};
 
@@ -18,16 +21,24 @@ fn with_serve_env(figment: rocket::figment::Figment) -> rocket::figment::Figment
         .merge(Env::prefixed("ROCKET_").global())
 }
 
+fn spec_default_rocket_config() -> rocket::Config {
+    rocket::Config {
+        address: Ipv4Addr::LOCALHOST.into(),
+        port: 8081,
+        ..rocket::Config::default()
+    }
+}
+
 pub fn legacy_config_figment() -> rocket::figment::Figment {
     with_serve_env(
-        rocket::figment::Figment::from(rocket::Config::default())
+        rocket::figment::Figment::from(spec_default_rocket_config())
             .merge(Serialized::defaults(config::Config::default()))
             .merge(Toml::file("tinycloud.toml").nested()),
     )
 }
 
 pub fn serve_config_figment(base_config_path: &Path) -> Result<rocket::figment::Figment> {
-    let mut base = rocket::figment::Figment::from(rocket::Config::default())
+    let mut base = rocket::figment::Figment::from(spec_default_rocket_config())
         .merge(Serialized::defaults(config::Config::default()));
 
     if base_config_path.exists() {
@@ -139,6 +150,7 @@ mod tests {
         env,
         ffi::OsString,
         fs,
+        path::{Path, PathBuf},
         sync::{Mutex, OnceLock},
     };
     use tempfile::tempdir;
@@ -168,6 +180,24 @@ mod tests {
                 Some(value) => env::set_var(self.key, value),
                 None => env::remove_var(self.key),
             }
+        }
+    }
+
+    struct CwdGuard {
+        previous: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn set(dir: impl AsRef<Path>) -> Self {
+            let previous = env::current_dir().unwrap();
+            env::set_current_dir(dir).unwrap();
+            Self { previous }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            env::set_current_dir(&self.previous).unwrap();
         }
     }
 
@@ -214,5 +244,53 @@ mod tests {
 
         assert_eq!(cfg.storage.datadir, override_data);
         assert!(cfg.telemetry.enabled);
+    }
+
+    #[test]
+    fn serve_config_figment_defaults_to_spec_bind_without_config_file() {
+        let _lock = env_lock();
+        let temp = tempdir().unwrap();
+        let missing_config = temp.path().join("tinycloud.toml");
+        let _storage_datadir = EnvGuard::unset("TINYCLOUD_STORAGE_DATADIR");
+        let _storage_datadir_canonical = EnvGuard::unset("TINYCLOUD_STORAGE__DATADIR");
+        let _address = EnvGuard::unset("TINYCLOUD_ADDRESS");
+        let _port = EnvGuard::unset("TINYCLOUD_PORT");
+        let _rocket_address = EnvGuard::unset("ROCKET_ADDRESS");
+        let _rocket_port = EnvGuard::unset("ROCKET_PORT");
+        let _rocket_config = EnvGuard::unset("ROCKET_CONFIG");
+        let _rocket_profile = EnvGuard::unset("ROCKET_PROFILE");
+
+        let figment = serve_config_figment(&missing_config).unwrap();
+        let rocket_cfg = figment.extract::<rocket::Config>().unwrap();
+
+        assert_eq!(
+            rocket_cfg.address,
+            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(rocket_cfg.port, 8081);
+    }
+
+    #[test]
+    fn legacy_config_figment_defaults_to_spec_bind_without_config_file() {
+        let _lock = env_lock();
+        let temp = tempdir().unwrap();
+        let _cwd = CwdGuard::set(temp.path());
+        let _storage_datadir = EnvGuard::unset("TINYCLOUD_STORAGE_DATADIR");
+        let _storage_datadir_canonical = EnvGuard::unset("TINYCLOUD_STORAGE__DATADIR");
+        let _address = EnvGuard::unset("TINYCLOUD_ADDRESS");
+        let _port = EnvGuard::unset("TINYCLOUD_PORT");
+        let _rocket_address = EnvGuard::unset("ROCKET_ADDRESS");
+        let _rocket_port = EnvGuard::unset("ROCKET_PORT");
+        let _rocket_config = EnvGuard::unset("ROCKET_CONFIG");
+        let _rocket_profile = EnvGuard::unset("ROCKET_PROFILE");
+
+        let figment = legacy_config_figment();
+        let rocket_cfg = figment.extract::<rocket::Config>().unwrap();
+
+        assert_eq!(
+            rocket_cfg.address,
+            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(rocket_cfg.port, 8081);
     }
 }
