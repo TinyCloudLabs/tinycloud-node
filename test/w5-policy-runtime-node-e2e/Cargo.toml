@@ -17,5 +17,5 @@ tempfile = "3"
 time = { version = "0.3", features = ["parsing", "formatting"] }
 tinycloud-auth = { path = "../../tinycloud-auth" }
 tinycloud-core = { path = "../../tinycloud-core" }
-tinycloud-node = { path = "../../tinycloud-node-server" }
+tinycloud-node = { path = "../../tinycloud-node-server", package = "tinycloud-node-server" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

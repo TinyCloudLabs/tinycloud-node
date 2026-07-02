@@ -437,7 +437,7 @@ fn data_plane_has_zero_policy_dependency() {
     {
         let id = package["id"].as_str().expect("package id").to_string();
         let name = package["name"].as_str().expect("package name").to_string();
-        if matches!(name.as_str(), "tinycloud-node" | "tinycloud-core") {
+        if matches!(name.as_str(), "tinycloud-node-server" | "tinycloud-core") {
             roots.push(id.clone());
         }
         package_names.insert(id, name);
@@ -445,7 +445,7 @@ fn data_plane_has_zero_policy_dependency() {
     assert_eq!(
         roots.len(),
         2,
-        "expected roots for tinycloud-node and tinycloud-core"
+        "expected roots for tinycloud-node-server and tinycloud-core"
     );
 
     let mut normal_edges = BTreeMap::<String, Vec<(String, String)>>::new();
