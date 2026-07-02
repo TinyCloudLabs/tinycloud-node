@@ -6,9 +6,9 @@ release_commits = "^(feat|fix|chore|refactor|perf|docs|ci|test)(\\(.*\\))?!?:"
 # TODO: when ready to publish to crates.io, publish all internal workspace
 # crates (tinycloud-auth, tinycloud-core, dependencies/siwe, siwe-recap,
 # cacao) with versioned deps so this can resolve. The crates.io name
-# `tinycloud-node` is reserved separately via a placeholder publish.
+# `tinycloud-node-server` is the published crate selected by release-plz.
 [[package]]
-name = "tinycloud-node"
+name = "tinycloud-node-server"
 # Skipping crates.io until internal workspace crates (tinycloud-auth,
 # tinycloud-core, dependencies/*) are also published with versioned deps.
 # Binary distribution happens via GitHub Releases + cargo-dist installers.

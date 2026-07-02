@@ -78,7 +78,7 @@ default = []
 dstack = []
 duckdb = ["tinycloud-core/duckdb"]
 
-# cargo-binstall support: allows `cargo binstall tinycloud-node`
+# cargo-binstall support: allows `cargo binstall tinycloud-node-server`
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/{ name }-v{ version }/{ name }-{ target }{ archive-suffix }"
 bin-dir = "{ name }-{ target }/{ bin }{ binary-ext }"
