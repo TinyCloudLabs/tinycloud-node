@@ -1150,18 +1150,58 @@ fn parse_systemd_pid(stdout: &[u8]) -> Option<u32> {
 
 fn process_age(pid: u32) -> Result<u64> {
     let output = Command::new("ps")
-        .args(["-o", "etimes=", "-p", &pid.to_string()])
+        .args(["-o", ps_elapsed_field(), "-p", &pid.to_string()])
         .output()
         .with_context(|| "failed to execute ps")?;
     if !output.status.success() {
         bail!("ps failed")
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    let age = text
-        .trim()
-        .parse::<u64>()
-        .context("failed to parse process age")?;
+    let age = parse_process_age(text.trim()).context("failed to parse process age")?;
     Ok(age)
+}
+
+fn ps_elapsed_field() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "etime="
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        "etimes="
+    }
+}
+
+fn parse_process_age(value: &str) -> Option<u64> {
+    if let Ok(age) = value.parse::<u64>() {
+        return Some(age);
+    }
+
+    let (days, time_part) = match value.split_once('-') {
+        Some((days, time_part)) => (days.parse::<u64>().ok()?, time_part),
+        None => (0, value),
+    };
+    let mut parts = time_part.split(':');
+
+    let (hours, minutes, seconds) = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(minutes), Some(seconds), None, None) => (
+            0,
+            minutes.parse::<u64>().ok()?,
+            seconds.parse::<u64>().ok()?,
+        ),
+        (Some(hours), Some(minutes), Some(seconds), None) => (
+            hours.parse::<u64>().ok()?,
+            minutes.parse::<u64>().ok()?,
+            seconds.parse::<u64>().ok()?,
+        ),
+        _ => return None,
+    };
+
+    let mut total = days.checked_mul(24 * 60 * 60)?;
+    total = total.checked_add(hours.checked_mul(60 * 60)?)?;
+    total = total.checked_add(minutes.checked_mul(60)?)?;
+    total.checked_add(seconds)
 }
 
 fn check_service_install(paths: &ProfilePaths, manifest: Option<&ServiceManifest>) -> DoctorCheck {
@@ -1599,6 +1639,26 @@ printf '%s\n' "${FAKE_PS_AGE:-29}"
         assert_eq!(state, ServiceState::Error);
         assert_eq!(pid, Some(4242));
         assert_eq!(control_api, None);
+    }
+
+    #[test]
+    fn parse_process_age_accepts_ps_elapsed_formats() {
+        assert_eq!(parse_process_age("29"), Some(29));
+        assert_eq!(parse_process_age("00:29"), Some(29));
+        assert_eq!(parse_process_age("01:02:03"), Some(3723));
+        assert_eq!(parse_process_age("1-02:03:04"), Some(93_784));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn process_age_uses_etime_on_macos() {
+        assert_eq!(ps_elapsed_field(), "etime=");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn process_age_uses_etimes_elsewhere() {
+        assert_eq!(ps_elapsed_field(), "etimes=");
     }
 
     #[test]
