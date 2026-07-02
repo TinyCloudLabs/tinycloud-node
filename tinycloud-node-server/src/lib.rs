@@ -12,14 +12,17 @@ use std::{path::Path, sync::Arc};
 pub mod allow_list;
 pub mod auth_guards;
 pub mod authorization;
+pub mod cli;
 pub mod config;
 #[cfg(feature = "dstack")]
 pub mod dstack;
 pub mod hooks;
 pub mod invocation_replay;
+pub mod node_control;
 pub mod prometheus;
 pub mod quota;
 pub mod routes;
+pub mod runtime;
 pub mod signed_urls;
 pub mod storage;
 pub mod tee;
