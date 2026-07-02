@@ -67,8 +67,8 @@ native-tls = { version = "0.2.14", features = ["vendored"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.9.4"
 core-foundation-sys = "0.8.6"
-security-framework = "2.11.1"
-security-framework-sys = "2.11.1"
+security-framework = { version = "2.11.1", features = ["OSX_10_15"] }
+security-framework-sys = { version = "2.11.1", features = ["OSX_10_15"] }
 
 [dependencies.tinycloud-core]
 path = "../tinycloud-core/"
