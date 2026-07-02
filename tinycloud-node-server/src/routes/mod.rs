@@ -738,6 +738,8 @@ async fn invoke_impl(
                 tinycloud,
                 sql_service,
                 hook_runtime,
+                quota_cache,
+                config,
                 &sql_caps,
             )
             .await;
@@ -780,6 +782,8 @@ async fn invoke_impl(
                     tinycloud,
                     duckdb_service,
                     hook_runtime,
+                    quota_cache,
+                    config,
                     &duckdb_caps,
                     arrow_format,
                 )
@@ -1134,12 +1138,47 @@ async fn read_json_body(data: DataIn<'_>) -> Result<String, (Status, String)> {
     }
 }
 
+/// Classify a SQL request as write-class for the storage quota gate.
+///
+/// Write-class = `!is_read_only` from `validate_sql`, gating DML + DDL
+/// uniformly. A parse/permission error is NOT a quota decision:
+/// `sql_service.execute` re-validates and surfaces the true error, so
+/// unparseable SQL is treated as non-write here (never masked as 402).
+/// `ExecuteStatement` resolves the named statement from the SAME caveats
+/// the execution path uses (chain caveat first, invocation facts as
+/// fallback) and classifies its SQL: on the facts fallback the statement
+/// body is invoker-controlled, so it must be parsed, never assumed
+/// read-only. An unresolvable name is non-write (execution fails with
+/// "statement not found" before any storage grows). `Export` is a read.
+fn sql_request_is_write(request: &SqlRequest, caveats: &Option<SqlCaveats>, ability: &str) -> bool {
+    let is_write_sql = |sql: &str| {
+        tinycloud_core::sql::parser::validate_sql(sql, caveats, ability)
+            .map(|p| !p.is_read_only)
+            .unwrap_or(false)
+    };
+    match request {
+        SqlRequest::Query { sql, .. } => is_write_sql(sql),
+        SqlRequest::Execute { sql, schema, .. } => {
+            schema.as_ref().is_some_and(|s| !s.is_empty()) || is_write_sql(sql)
+        }
+        SqlRequest::Batch { statements } => statements.iter().any(|s| is_write_sql(&s.sql)),
+        SqlRequest::ExecuteStatement { name, .. } => caveats
+            .as_ref()
+            .and_then(|c| c.find_statement(name))
+            .is_some_and(|stmt| is_write_sql(&stmt.sql)),
+        SqlRequest::Export => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_sql_invoke(
     i: AuthHeaderGetter<InvocationInfo>,
     data: DataIn<'_>,
     tinycloud: &State<TinyCloud>,
     sql_service: &State<SqlService>,
     hook_runtime: &State<HookRuntime>,
+    quota_cache: &State<QuotaCache>,
+    config: &State<Config>,
     sql_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
     // W1 (D): derive the SQL caveat from the VALIDATED delegation chain,
@@ -1218,6 +1257,17 @@ async fn handle_sql_invoke(
         Some(c) => Some(constrained_caveat_to_sql_caveats(c)),
         None => facts_caveats,
     };
+
+    // SQL storage quota pre-check — same limit resolution and 402 semantics
+    // as the KV path, via the shared helper so the two can't drift.
+    // Reads never 402. One-write overshoot accepted: usage is only known
+    // post-execute, so a write crossing the limit is admitted and the next
+    // write 402s. No shrink — DELETE does not reduce artifact size without
+    // VACUUM, so an over-quota space cannot self-serve shrink.
+    if sql_request_is_write(&sql_request, &exec_caveats, ability) {
+        staged_batch_remaining(space, tinycloud, config, quota_cache).await?;
+    }
+
     let execute_start = Instant::now();
     let execute_result = sql_service
         .execute(
@@ -1618,13 +1668,51 @@ fn sql_error_to_status(err: &SqlError) -> Status {
     }
 }
 
+/// Classify a DuckDB request as write-class for the storage quota gate.
+///
+/// Mirrors `sql_request_is_write`: SQL-bearing variants are classified by
+/// the duckdb parser's `is_read_only`, `ExecuteStatement` resolves the
+/// named statement from the same caveats the execution path uses, and
+/// `Ingest`/`Import`/`ExportToKv` always grow stored bytes so they are
+/// write-class by construction. `Describe` and `Export` are reads.
 #[cfg(feature = "duckdb")]
+fn duckdb_request_is_write(
+    request: &DuckDbRequest,
+    caveats: &Option<DuckDbCaveats>,
+    ability: &str,
+) -> bool {
+    let is_write_sql = |sql: &str| {
+        tinycloud_core::duckdb::parser::validate_sql(sql, caveats, ability)
+            .map(|p| !p.is_read_only)
+            .unwrap_or(false)
+    };
+    match request {
+        DuckDbRequest::Query { sql, .. } => is_write_sql(sql),
+        DuckDbRequest::Execute { sql, schema, .. } => {
+            schema.as_ref().is_some_and(|s| !s.is_empty()) || is_write_sql(sql)
+        }
+        DuckDbRequest::Batch { statements, .. } => statements.iter().any(|s| is_write_sql(&s.sql)),
+        DuckDbRequest::ExecuteStatement { name, .. } => caveats
+            .as_ref()
+            .and_then(|c| c.find_statement(name))
+            .is_some_and(|stmt| is_write_sql(&stmt.sql)),
+        DuckDbRequest::Ingest { .. }
+        | DuckDbRequest::Import { .. }
+        | DuckDbRequest::ExportToKv { .. } => true,
+        DuckDbRequest::Describe | DuckDbRequest::Export => false,
+    }
+}
+
+#[cfg(feature = "duckdb")]
+#[allow(clippy::too_many_arguments)]
 async fn handle_duckdb_invoke(
     i: AuthHeaderGetter<InvocationInfo>,
     data: DataIn<'_>,
     tinycloud: &State<TinyCloud>,
     duckdb_service: &State<DuckDbService>,
     hook_runtime: &State<HookRuntime>,
+    quota_cache: &State<QuotaCache>,
+    config: &State<Config>,
     duckdb_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
     arrow_format: bool,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
@@ -1650,6 +1738,10 @@ async fn handle_duckdb_invoke(
     let space_id = space.to_string();
 
     if ability == "tinycloud.duckdb/import" {
+        // Import always grows the database artifact — gate before reading
+        // the (up to 100 MB) body. Same 402 semantics as the KV/SQL paths.
+        staged_batch_remaining(space, tinycloud, config, quota_cache).await?;
+
         let body_bytes = match data {
             DataIn::One(d) => {
                 let mut buf = Vec::new();
@@ -1709,6 +1801,13 @@ async fn handle_duckdb_invoke(
         );
         let data = export_result.map_err(|e| (duckdb_error_to_status(&e), e.to_string()))?;
         return Ok(DataOut::One(InvOut(InvocationOutcome::DuckDbExport(data))));
+    }
+
+    // DuckDB storage quota pre-check — duckdb artifact bytes fold into
+    // store_size, so write-class requests must be gated exactly like the
+    // KV and SQL paths (reads never 402, one-write overshoot accepted).
+    if duckdb_request_is_write(&duckdb_request, &caveats, ability) {
+        staged_batch_remaining(space, tinycloud, config, quota_cache).await?;
     }
 
     let execute_start = Instant::now();
@@ -3533,6 +3632,563 @@ mod tests {
         assert_eq!(caveat.statements[0].name, "get");
         assert!(caveat.read_only);
         let _ = tinycloud;
+        Ok(())
+    }
+
+    // ---- T2: write-class SQL 402 gate ---------------------------------
+
+    #[tokio::test]
+    async fn sql_request_is_write_classifies_variants() {
+        use tinycloud_core::sql::types::SqlStatement;
+        let ability = "tinycloud.sql/write";
+        let caveats = &None;
+
+        // Execute carrying a non-empty schema (DDL) is write-class.
+        assert!(sql_request_is_write(
+            &SqlRequest::Execute {
+                schema: Some(vec!["CREATE TABLE t (a INTEGER NOT NULL)".to_string()]),
+                sql: "INSERT INTO t VALUES (1)".to_string(),
+                params: vec![],
+            },
+            caveats,
+            ability
+        ));
+
+        // Execute with no schema but a DML statement is write-class.
+        assert!(sql_request_is_write(
+            &SqlRequest::Execute {
+                schema: None,
+                sql: "INSERT INTO t VALUES (1)".to_string(),
+                params: vec![],
+            },
+            caveats,
+            ability
+        ));
+
+        // A read-only Query is not write-class.
+        assert!(!sql_request_is_write(
+            &SqlRequest::Query {
+                sql: "SELECT 1".to_string(),
+                params: vec![],
+            },
+            caveats,
+            ability
+        ));
+
+        // A Batch containing any write statement is write-class.
+        assert!(sql_request_is_write(
+            &SqlRequest::Batch {
+                statements: vec![SqlStatement {
+                    sql: "INSERT INTO t VALUES (1)".to_string(),
+                    params: vec![],
+                }],
+            },
+            caveats,
+            ability
+        ));
+
+        // ExecuteStatement is read-only by construction; Export is a read.
+        assert!(!sql_request_is_write(
+            &SqlRequest::ExecuteStatement {
+                name: "get".to_string(),
+                params: vec![],
+            },
+            caveats,
+            ability
+        ));
+        assert!(!sql_request_is_write(&SqlRequest::Export, caveats, ability));
+    }
+
+    /// A metered SQL HTTP stack: one shared `SqlSizes` feeds both the SQL
+    /// artifact save path (via `SizeTrackingArtifactRepository`) and
+    /// `TinyCloud::store_size` (via `.with_sql_sizes`), so a direct SQL
+    /// write is visible to the route-layer 402 gate. The space/actor/
+    /// delegation/abilities rows are inserted with EMPTY caveats so
+    /// `derive_chain_constrained_caveat` returns `None` and the raw request
+    /// reaches the gate.
+    struct MeteredSqlHttp {
+        tinycloud: TinyCloud,
+        sql_service: SqlService,
+        space: SpaceId,
+        resource: ResourceId,
+        jwk: JWK,
+        verification_method: String,
+        parent_cid: tinycloud_auth::authorization::Cid,
+        used: u64,
+    }
+
+    async fn metered_sql_http_setup(name: &str) -> Result<MeteredSqlHttp> {
+        use tinycloud_core::database_artifacts::DatabaseArtifactRepository;
+        use tinycloud_core::models::{
+            abilities, actor, delegation as deleg_model, space as space_model,
+        };
+        use tinycloud_core::sea_orm::ActiveModelTrait;
+        use tinycloud_core::sea_orm::ActiveValue::Set;
+        use tinycloud_core::types::{Caveats, SpaceIdWrap};
+        use tinycloud_core::{SizeTrackingArtifactRepository, SqlSizes};
+
+        // Shared size handle: the SQL artifact repo records into it, and
+        // TinyCloud reads it in store_size.
+        let sizes = SqlSizes::new();
+
+        // Auth/state DB + block storage for TinyCloud.
+        let tempdir = TempDir::new()?;
+        let auth_db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
+        let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
+        let _persisted = tempdir.keep();
+        let tinycloud = TinyCloud::new(
+            auth_db.clone(),
+            Either::B(storage),
+            StaticSecret::new(vec![0u8; 32]).unwrap(),
+        )
+        .await?
+        .with_sql_sizes(sizes.clone());
+        let conn = auth_db;
+
+        // Separate in-memory DB for the SQL artifact repository, size-tracked
+        // into the shared handle.
+        let cache = TempDir::new()?;
+        let cache_path = cache.path().to_string_lossy().to_string();
+        let _cache_persisted = cache.keep();
+        let sql_db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
+        Migrator::up(&sql_db, None).await?;
+        let raw_repo: Arc<dyn DatabaseArtifactRepository> =
+            Arc::new(SeaOrmDatabaseArtifactRepository::new(sql_db));
+        let tracked_repo = Arc::new(SizeTrackingArtifactRepository::new(raw_repo, sizes.clone()));
+        let sql_service = SqlService::new(cache_path, u64::MAX, tracked_repo);
+
+        let space = test_space_id(name);
+        space_model::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&conn)
+        .await?;
+
+        // Pre-grow SQL usage with a direct (unmetered-by-quota) write so the
+        // shared size handle reflects real artifact bytes for the gate.
+        sql_service
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: Some(vec![
+                        "CREATE TABLE labels (label TEXT PRIMARY KEY, val INTEGER NOT NULL)"
+                            .to_string(),
+                    ]),
+                    sql: "INSERT INTO labels (label, val) VALUES (?, ?)".to_string(),
+                    params: vec![SqlValue::Text("alpha".to_string()), SqlValue::Integer(111)],
+                },
+                None,
+                "tinycloud.sql/write".to_string(),
+            )
+            .await?;
+
+        let jwk = JWK::generate_ed25519()?;
+        let mut verification_method = DID_METHODS.generate(&jwk, "key")?.to_string();
+        let fragment = verification_method
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("missing verification method fragment"))?
+            .1
+            .to_string();
+        verification_method.push('#');
+        verification_method.push_str(&fragment);
+        let delegatee = verification_method
+            .split('#')
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing did"))?
+            .to_string();
+        let owner_did = space.did().to_string();
+
+        for did in [&owner_did, &delegatee] {
+            actor::ActiveModel {
+                id: Set(did.clone()),
+            }
+            .insert(&conn)
+            .await?;
+        }
+
+        let parent_hash = tinycloud_core::hash::hash(name.as_bytes());
+        deleg_model::ActiveModel {
+            id: Set(parent_hash),
+            delegator: Set(owner_did.clone()),
+            delegatee: Set(delegatee.clone()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(name.as_bytes().to_vec()),
+        }
+        .insert(&conn)
+        .await?;
+
+        let resource: ResourceId = space.clone().to_resource(
+            "sql".parse::<Service>()?,
+            Some("main".parse::<AuthPath>()?),
+            None,
+            None,
+        );
+
+        // Grant BOTH read and write with EMPTY caveats on the same parent
+        // delegation so either invocation ability is authorized and the raw
+        // request reaches the gate unconstrained.
+        for ability in ["tinycloud.sql/read", "tinycloud.sql/write"] {
+            abilities::ActiveModel {
+                delegation: Set(parent_hash),
+                resource: Set(Resource::TinyCloud(resource.clone())),
+                ability: Set(Ability::try_from(ability.to_string()).unwrap()),
+                caveats: Set(Caveats(std::collections::BTreeMap::new())),
+            }
+            .insert(&conn)
+            .await?;
+        }
+
+        let parent_cid = parent_hash.to_cid(0x55);
+        let used = tinycloud
+            .store_size(&space)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .expect("pre-grown space must report SQL usage");
+        assert!(
+            used >= 1,
+            "pre-grow must produce at least one byte of usage"
+        );
+
+        Ok(MeteredSqlHttp {
+            tinycloud,
+            sql_service,
+            space,
+            resource,
+            jwk,
+            verification_method,
+            parent_cid,
+            used,
+        })
+    }
+
+    fn sql_invocation_header(setup: &MeteredSqlHttp, ability: &str, nonce: &str) -> Result<String> {
+        sql_invocation_header_with_facts(setup, ability, nonce, Vec::new())
+    }
+
+    fn sql_invocation_header_with_facts(
+        setup: &MeteredSqlHttp,
+        ability: &str,
+        nonce: &str,
+        facts: Vec<serde_json::Value>,
+    ) -> Result<String> {
+        use tinycloud_auth::ssi::{claims::jwt::NumericDate, dids::DIDURLBuf, ucan::Payload};
+        use tinycloud_auth::ucan_capabilities_object::Capabilities;
+
+        let mut invocation_caps = Capabilities::new();
+        invocation_caps.with_action(
+            setup.resource.as_uri(),
+            ability.parse::<UcanAbility>()?,
+            [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+        );
+        let invocation = Payload {
+            issuer: setup.verification_method.parse::<DIDURLBuf>()?,
+            audience: setup
+                .verification_method
+                .split('#')
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing did"))?
+                .parse::<DIDBuf>()?,
+            not_before: None,
+            expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
+            nonce: Some(nonce.to_string()),
+            facts: Some(facts),
+            proof: vec![setup.parent_cid],
+            attenuation: invocation_caps,
+        }
+        .sign(setup.jwk.get_algorithm().unwrap_or_default(), &setup.jwk)?;
+        Ok(invocation.encode()?)
+    }
+
+    /// One rocket instance per metered-SQL test, differing only in the
+    /// quota limit — keeps the managed-state set in a single place so it
+    /// can't drift from production wiring test-by-test.
+    fn metered_sql_rocket(
+        setup: MeteredSqlHttp,
+        limit: rocket::data::ByteUnit,
+    ) -> rocket::Rocket<rocket::Build> {
+        rocket::build()
+            .mount("/", routes![invoke])
+            .attach(crate::tracing::TracingFairing {
+                header_name: Config::default().log.tracing.traceheader,
+            })
+            .manage(setup.tinycloud)
+            .manage(setup.sql_service)
+            .manage(Config::default())
+            .manage(QuotaCache::new(Some(limit), None))
+            .manage(InvocationReplayCache::new())
+            .manage(HookRuntime::new(HooksConfig::default(), [9u8; 32]))
+            .manage(BlockStage::from(crate::config::StagingStorage::Memory))
+    }
+
+    #[tokio::test]
+    async fn sql_write_over_limit_returns_402_with_kv_message() -> Result<()> {
+        use rocket::data::ByteUnit;
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+
+        let setup = metered_sql_http_setup("sql-write-402").await?;
+        let used = setup.used;
+        let auth_header = sql_invocation_header(
+            &setup,
+            "tinycloud.sql/write",
+            "urn:uuid:00000000-0000-4000-8000-0000000000t2",
+        )?;
+
+        let client = Client::tracked(metered_sql_rocket(setup, ByteUnit::Byte(1))).await?;
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", auth_header))
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&SqlRequest::Execute {
+                schema: None,
+                sql: "INSERT INTO labels (label, val) VALUES ('gamma', 333)".to_string(),
+                params: vec![],
+            })?)
+            .dispatch()
+            .await;
+
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            Status::new(402),
+            "expected 402, got {status}: {body}"
+        );
+        assert_eq!(
+            body,
+            format!(
+                "Storage quota exceeded. Used: {} bytes, Limit: {} bytes",
+                used, 1
+            )
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_read_at_or_over_limit_returns_200() -> Result<()> {
+        use rocket::data::ByteUnit;
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+
+        let setup = metered_sql_http_setup("sql-read-200").await?;
+        let auth_header = sql_invocation_header(
+            &setup,
+            "tinycloud.sql/read",
+            "urn:uuid:00000000-0000-4000-8000-0000000000t2",
+        )?;
+
+        let client = Client::tracked(metered_sql_rocket(setup, ByteUnit::Byte(1))).await?;
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", auth_header))
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&SqlRequest::Query {
+                sql: "SELECT val FROM labels WHERE label = 'alpha'".to_string(),
+                params: vec![],
+            })?)
+            .dispatch()
+            .await;
+
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_ne!(status, Status::new(402), "reads must never 402: {body}");
+        assert_eq!(status, Status::Ok, "read over limit must succeed: {body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_write_under_limit_returns_200() -> Result<()> {
+        use rocket::data::ByteUnit;
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+
+        let setup = metered_sql_http_setup("sql-write-200").await?;
+        let auth_header = sql_invocation_header(
+            &setup,
+            "tinycloud.sql/write",
+            "urn:uuid:00000000-0000-4000-8000-0000000000t2",
+        )?;
+
+        let client =
+            Client::tracked(metered_sql_rocket(setup, ByteUnit::Byte(1_000_000_000))).await?;
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", auth_header))
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&SqlRequest::Execute {
+                schema: None,
+                sql: "INSERT INTO labels (label, val) VALUES ('gamma', 333)".to_string(),
+                params: vec![],
+            })?)
+            .dispatch()
+            .await;
+
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_ne!(
+            status,
+            Status::new(402),
+            "under-limit write must not 402: {body}"
+        );
+        assert_eq!(status, Status::Ok, "under-limit write must succeed: {body}");
+        Ok(())
+    }
+
+    /// Regression: a write wrapped in `ExecuteStatement` whose SQL is pinned
+    /// by the invoker's OWN invocation facts (the facts-caveats fallback, no
+    /// chain constrained caveat) must hit the 402 gate like any other write.
+    /// Before the classifier resolved the named statement, `ExecuteStatement`
+    /// was hard-coded non-write and this bypassed quota enforcement entirely.
+    #[tokio::test]
+    async fn sql_execute_statement_write_via_facts_over_limit_returns_402() -> Result<()> {
+        use rocket::data::ByteUnit;
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+
+        let setup = metered_sql_http_setup("sql-execstmt-402").await?;
+        let used = setup.used;
+        let facts = vec![serde_json::json!({
+            "sqlCaveats": {
+                "statements": [{
+                    "name": "w",
+                    "sql": "INSERT INTO labels (label, val) VALUES ('delta', 444)"
+                }]
+            }
+        })];
+        let auth_header = sql_invocation_header_with_facts(
+            &setup,
+            "tinycloud.sql/write",
+            "urn:uuid:00000000-0000-4000-8000-0000000000t2",
+            facts,
+        )?;
+
+        let client = Client::tracked(metered_sql_rocket(setup, ByteUnit::Byte(1))).await?;
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", auth_header))
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&SqlRequest::ExecuteStatement {
+                name: "w".to_string(),
+                params: vec![],
+            })?)
+            .dispatch()
+            .await;
+
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            Status::new(402),
+            "facts-pinned ExecuteStatement write must 402, got {status}: {body}"
+        );
+        assert_eq!(
+            body,
+            format!(
+                "Storage quota exceeded. Used: {} bytes, Limit: {} bytes",
+                used, 1
+            )
+        );
+        Ok(())
+    }
+
+    /// Regression: a read-only `ExecuteStatement` resolved from invocation
+    /// facts must NOT 402 even when the space is over its limit — reads
+    /// never pay the quota gate.
+    #[tokio::test]
+    async fn sql_execute_statement_read_via_facts_over_limit_returns_200() -> Result<()> {
+        use rocket::data::ByteUnit;
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+
+        let setup = metered_sql_http_setup("sql-execstmt-200").await?;
+        let facts = vec![serde_json::json!({
+            "sqlCaveats": {
+                "statements": [{
+                    "name": "r",
+                    "sql": "SELECT val FROM labels WHERE label = 'alpha'"
+                }]
+            }
+        })];
+        let auth_header = sql_invocation_header_with_facts(
+            &setup,
+            "tinycloud.sql/read",
+            "urn:uuid:00000000-0000-4000-8000-0000000000t2",
+            facts,
+        )?;
+
+        let client = Client::tracked(metered_sql_rocket(setup, ByteUnit::Byte(1))).await?;
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", auth_header))
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&SqlRequest::ExecuteStatement {
+                name: "r".to_string(),
+                params: vec![],
+            })?)
+            .dispatch()
+            .await;
+
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_ne!(
+            status,
+            Status::new(402),
+            "facts-pinned read must never 402: {body}"
+        );
+        assert_eq!(status, Status::Ok, "over-limit read must succeed: {body}");
+        Ok(())
+    }
+
+    /// Integration proof for the metering fold (§E.T3): a SQL write performed
+    /// directly against `sql_service` is visible through `tinycloud.store_size`
+    /// — the one number behind the admin meter (`get_quota`, admin.rs:114) and
+    /// the write-path quota gates — for a space whose FileSystem block store
+    /// never saw a byte. Before the fold, `store_size` counted blocks only, so
+    /// this SQL-only space would have reported `None`.
+    #[tokio::test]
+    async fn sql_write_is_visible_to_store_size() -> Result<()> {
+        // The helper pre-grows usage with a direct `sql_service.execute`
+        // (CREATE TABLE + INSERT) for a space block storage never saw.
+        let setup = metered_sql_http_setup("visible_to_store_size").await?;
+
+        let before = setup
+            .tinycloud
+            .store_size(&setup.space)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .expect("SQL-only space must fold to Some(usage)");
+        assert!(before > 0, "SQL write must be visible to store_size");
+
+        // A further direct SQL write is metered through the same fold.
+        setup
+            .sql_service
+            .execute(
+                &setup.space,
+                "main",
+                SqlRequest::Execute {
+                    schema: None,
+                    sql: "INSERT INTO labels (label, val) VALUES (?, ?)".to_string(),
+                    params: vec![SqlValue::Text("beta".to_string()), SqlValue::Integer(222)],
+                },
+                None,
+                "tinycloud.sql/write".to_string(),
+            )
+            .await?;
+
+        let after = setup
+            .tinycloud
+            .store_size(&setup.space)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .expect("SQL-only space must fold to Some(usage)");
+        assert!(
+            after >= before,
+            "further SQL write must not shrink the meter"
+        );
         Ok(())
     }
 }
