@@ -1,7 +1,10 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::{
+    io::{self, Write},
+    path::PathBuf,
+};
 
 use crate::{node_control::paths::Profile, node_control::service, runtime};
 
@@ -99,11 +102,11 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
 fn run_node(args: NodeArgs) -> Result<()> {
     match args.command {
         NodeCommand::Service(service_args) => run_service(service_args.command),
-        NodeCommand::Status(args) => emit_value(service::node_status()?, args.json),
-        NodeCommand::Logs(args) => emit_value(service::node_logs(args.lines)?, args.json),
-        NodeCommand::Doctor(args) => {
-            emit_value(serde_json::to_value(service::node_doctor()?)?, args.json)
+        NodeCommand::Status(args) => emit_control_json(service::node_status_body()?, args.json),
+        NodeCommand::Logs(args) => {
+            emit_control_json(service::node_logs_body(args.lines)?, args.json)
         }
+        NodeCommand::Doctor(args) => emit_json(&service::node_doctor()?, args.json),
     }
 }
 
@@ -114,15 +117,33 @@ fn run_service(command: ServiceCommand) -> Result<()> {
         ServiceCommand::Start => service::start(),
         ServiceCommand::Stop => service::stop(),
         ServiceCommand::Restart => service::restart(),
-        ServiceCommand::Status(_args) => {
+        ServiceCommand::Status(args) => {
             let status = service::service_status()?;
-            println!("{}", serde_json::to_string_pretty(&status)?);
-            Ok(())
+            emit_json(&status, args.json)
         }
     }
 }
 
-fn emit_value(value: Value, _json: bool) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(&value)?);
+fn emit_json<T: serde::Serialize>(value: &T, json: bool) -> Result<()> {
+    if json {
+        print!("{}", serde_json::to_string(value)?);
+        io::stdout().flush()?;
+    } else {
+        println!("{}", serde_json::to_string_pretty(value)?);
+    }
+    Ok(())
+}
+
+fn emit_control_json(body: String, json: bool) -> Result<()> {
+    if json {
+        print!("{}", body);
+        io::stdout().flush()?;
+        return Ok(());
+    }
+
+    match serde_json::from_str::<Value>(&body) {
+        Ok(value) => println!("{}", serde_json::to_string_pretty(&value)?),
+        Err(_) => println!("{}", body),
+    }
     Ok(())
 }
