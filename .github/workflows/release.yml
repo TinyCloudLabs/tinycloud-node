@@ -49,7 +49,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     env:
-      ARCHIVE_NAME: tinycloud-node-server-${{ matrix.target }}
+      ARCHIVE_NAME: tinycloud-node-${{ matrix.target }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -69,7 +69,7 @@ jobs:
           echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar" >> "$GITHUB_ENV"
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }} -p tinycloud-node-server
+        run: cargo build --release --target ${{ matrix.target }} -p tinycloud-node
 
       - name: Package binary (unix)
         run: |

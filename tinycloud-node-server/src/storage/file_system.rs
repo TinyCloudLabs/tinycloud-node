@@ -339,51 +339,57 @@ mod test {
     use futures::io::AsyncReadExt;
 
     #[test]
-    async fn test_file_system_store() {
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = FileSystemConfig::new(dir.path());
-        let store = cfg.open().await.unwrap();
-        let data = b"hello world";
-        let space_id: SpaceId = "tinycloud:key:test:default".parse().unwrap();
-        assert_eq!(store.total_size(&space_id).await.unwrap(), None);
-        store.create(&space_id).await.unwrap();
-        assert_eq!(store.total_size(&space_id).await.unwrap(), Some(0));
-        let tfs = TempFileSystemStage;
-        let mut stage = tfs.stage(&space_id).await.unwrap();
-        futures::io::copy(&mut &data[..], &mut stage).await.unwrap();
+    fn test_file_system_store() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = FileSystemConfig::new(dir.path());
+            let store = cfg.open().await.unwrap();
+            let data = b"hello world";
+            let space_id: SpaceId = "tinycloud:key:test:default".parse().unwrap();
+            assert_eq!(store.total_size(&space_id).await.unwrap(), None);
+            store.create(&space_id).await.unwrap();
+            assert_eq!(store.total_size(&space_id).await.unwrap(), Some(0));
+            let tfs = TempFileSystemStage;
+            let mut stage = tfs.stage(&space_id).await.unwrap();
+            futures::io::copy(&mut &data[..], &mut stage).await.unwrap();
 
-        let hash = ImmutableWriteStore::<TempFileSystemStage>::persist(&store, &space_id, stage)
+            let hash = ImmutableWriteStore::<TempFileSystemStage>::persist(
+                &store,
+                &space_id,
+                stage,
+            )
             .await
             .unwrap();
 
-        assert!(store.contains(&space_id, &hash).await.unwrap());
-        assert_eq!(
-            store.total_size(&space_id).await.unwrap(),
-            Some(data.len() as u64)
-        );
+            assert!(store.contains(&space_id, &hash).await.unwrap());
+            assert_eq!(
+                store.total_size(&space_id).await.unwrap(),
+                Some(data.len() as u64)
+            );
 
-        let mut buf = Vec::new();
-        store
-            .read(&space_id, &hash)
-            .await
-            .unwrap()
-            .unwrap()
-            .read_to_end(&mut buf)
-            .await
-            .unwrap();
+            let mut buf = Vec::new();
+            store
+                .read(&space_id, &hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .read_to_end(&mut buf)
+                .await
+                .unwrap();
 
-        assert_eq!(buf, data);
-        assert_eq!(
-            store.read_to_vec(&space_id, &hash).await.unwrap().unwrap(),
-            data
-        );
-        assert_eq!(store.remove(&space_id, &hash).await.unwrap(), Some(()));
-        assert_eq!(store.remove(&space_id, &hash).await.unwrap(), None);
-        assert!(!store.contains(&space_id, &hash).await.unwrap());
-        assert_eq!(store.total_size(&space_id).await.unwrap(), Some(0));
-        assert_eq!(
-            store.read(&space_id, &hash).await.unwrap().map(|_| ()),
-            None
-        );
+            assert_eq!(buf, data);
+            assert_eq!(
+                store.read_to_vec(&space_id, &hash).await.unwrap().unwrap(),
+                data
+            );
+            assert_eq!(store.remove(&space_id, &hash).await.unwrap(), Some(()));
+            assert_eq!(store.remove(&space_id, &hash).await.unwrap(), None);
+            assert!(!store.contains(&space_id, &hash).await.unwrap());
+            assert_eq!(store.total_size(&space_id).await.unwrap(), Some(0));
+            assert_eq!(
+                store.read(&space_id, &hash).await.unwrap().map(|_| ()),
+                None
+            );
+        });
     }
 }

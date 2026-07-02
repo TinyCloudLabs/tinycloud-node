@@ -87,13 +87,7 @@ impl Profile {
 
     pub fn manager(self) -> Manager {
         match self {
-            Self::MacosUser => {
-                if env::var_os("HOMEBREW_PREFIX").is_some() {
-                    Manager::HomebrewLaunchagent
-                } else {
-                    Manager::LaunchdUser
-                }
-            }
+            Self::MacosUser => Manager::LaunchdUser,
             Self::LinuxUser => Manager::SystemdUser,
             Self::LinuxSystem => Manager::SystemdSystem,
         }
@@ -302,4 +296,39 @@ pub fn dir_to_json_string(path: &Path) -> String {
         rendered.push(std::path::MAIN_SEPARATOR);
     }
     rendered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{env, ffi::OsString};
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = env::var_os(key);
+            env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => env::set_var(self.key, value),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    fn macos_user_manager_stays_launchd_user_under_homebrew() {
+        let _guard = EnvGuard::set("HOMEBREW_PREFIX", "/opt/homebrew");
+
+        assert_eq!(Profile::MacosUser.manager(), Manager::LaunchdUser);
+    }
 }

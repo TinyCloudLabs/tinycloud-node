@@ -1,9 +1,6 @@
 #[macro_use]
 extern crate rocket;
 extern crate anyhow;
-#[cfg(test)]
-#[macro_use]
-extern crate tokio;
 
 use anyhow::{Context, Result};
 use rocket::{fairing::AdHoc, figment::Figment, http::Header, Build, Rocket};

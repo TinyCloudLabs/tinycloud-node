@@ -37,9 +37,9 @@ RUN chmod +x ./scripts/init-tinycloud-data.sh && ./scripts/init-tinycloud-data.s
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     if [ -n "$CARGO_FEATURES" ]; then \
-        cargo build --release -p tinycloud-node-server --features "$CARGO_FEATURES"; \
+        cargo build --release -p tinycloud-node --features "$CARGO_FEATURES"; \
     else \
-        cargo build --release -p tinycloud-node-server; \
+        cargo build --release -p tinycloud-node; \
     fi && \
     cp /app/target/release/tinycloud /app/tinycloud
 RUN addgroup -g 1000 tinycloud && adduser -u 1000 -G tinycloud -s /bin/sh -D tinycloud

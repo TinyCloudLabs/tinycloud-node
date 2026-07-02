@@ -9344,7 +9344,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tinycloud-node-server"
+name = "tinycloud-node"
 version = "1.4.2"
 dependencies = [
  "anyhow",
