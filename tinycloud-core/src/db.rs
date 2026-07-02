@@ -98,6 +98,8 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
     Secrets(K::Error),
     #[error("Space not found")]
     SpaceNotFound,
+    #[error("epoch insert failed: {0}")]
+    EpochInsert(DbErr),
     #[error("Invalid delegation CID: {0}")]
     InvalidCid(String),
     #[error("encryption error: {0}")]
@@ -897,6 +899,33 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
 
         (filtered, skipped)
     } else {
+        // Non-delegation-only txns must reference spaces that already exist
+        // (or are created in this same txn via `new_spaces`). A missing space
+        // is a genuine SpaceNotFound (404); checking up-front lets an FK
+        // violation on the epoch insert be treated as an integrity error (500)
+        // rather than silently coerced to 404.
+        let new_space_ids: HashSet<SpaceId> = new_spaces.iter().map(|s| s.0.clone()).collect();
+        let to_check: Vec<SpaceIdWrap> = event_spaces
+            .keys()
+            .filter(|s| !new_space_ids.contains(s))
+            .cloned()
+            .map(SpaceIdWrap)
+            .collect();
+        if !to_check.is_empty() {
+            let existing: HashSet<SpaceId> = space::Entity::find()
+                .filter(space::Column::Id.is_in(to_check))
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|s| s.id.0)
+                .collect();
+            if event_spaces
+                .keys()
+                .any(|s| !new_space_ids.contains(s) && !existing.contains(s))
+            {
+                return Err(TxError::SpaceNotFound);
+            }
+        }
         (event_spaces, vec![])
     };
 
@@ -1016,17 +1045,20 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         epoch::Entity::insert_many(epochs)
             .exec(db)
             .await
-            .map_err(|e| match e {
-                DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(ref db_err))) => {
-                    tracing::warn!(
+            .map_err(|e| {
+                if let DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(db_err))) = &e {
+                    tracing::error!(
                         error = %e,
                         db_error = %db_err,
                         db_error_code = ?db_err.code(),
-                        "epoch insert failed with database error"
+                        db_error_kind = ?db_err.kind(),
+                        "epoch insert failed with database error after space pre-check; \
+                         treating as integrity error"
                     );
-                    TxError::SpaceNotFound
+                } else {
+                    tracing::error!(error = %e, "epoch insert failed");
                 }
-                _ => e.into(),
+                TxError::EpochInsert(e)
             })?;
 
         // save epoch orderings
@@ -1621,5 +1653,35 @@ mod test {
         let space = test_space_id("untouched");
         let db = get_db().await.unwrap().with_sql_sizes(SqlSizes::new());
         assert_eq!(db.store_size(&space).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn epoch_insert_for_missing_space_is_fk_violation() {
+        let db = get_db().await.unwrap();
+        let space = test_space_id("ghost");
+        // Insert an epoch row for a space that was never created. With SQLite
+        // foreign keys enforced (sqlx default), this must trip the epoch->space
+        // FK rather than silently succeed.
+        let err = epoch::Entity::insert(epoch::ActiveModel::from(epoch::Model {
+            seq: 0,
+            id: crate::hash::hash(b"ghost-epoch"),
+            space: SpaceIdWrap(space),
+        }))
+        .exec(&db.conn)
+        .await
+        .unwrap_err();
+
+        match err {
+            DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(db_err))) => {
+                assert_eq!(
+                    db_err.kind(),
+                    sea_orm::sqlx::error::ErrorKind::ForeignKeyViolation,
+                    "expected a foreign-key violation, got kind {:?} (code {:?})",
+                    db_err.kind(),
+                    db_err.code()
+                );
+            }
+            other => panic!("expected FK database error, got {other:?}"),
+        }
     }
 }

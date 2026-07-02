@@ -232,6 +232,7 @@ pub async fn delegate(
                 (
                     match e {
                         TxError::SpaceNotFound => Status::NotFound,
+                        TxError::EpochInsert(_) => Status::InternalServerError,
                         TxError::Db(DbErr::ConnectionAcquire(_)) => Status::InternalServerError,
                         _ => Status::Unauthorized,
                     },
@@ -296,6 +297,7 @@ pub async fn revoke(
             (
                 match e {
                     TxError::SpaceNotFound => Status::NotFound,
+                    TxError::EpochInsert(_) => Status::InternalServerError,
                     TxError::Db(DbErr::ConnectionAcquire(_)) => Status::InternalServerError,
                     _ => Status::Forbidden,
                 },
@@ -960,6 +962,7 @@ async fn invoke_impl(
             Err(e) => Err((
                 match e {
                     TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
+                    TxStoreError::Tx(TxError::EpochInsert(_)) => Status::InternalServerError,
                     TxStoreError::Tx(TxError::Db(DbErr::ConnectionAcquire(_))) => {
                         Status::InternalServerError
                     }
@@ -2188,6 +2191,7 @@ async fn verify_auth(
             (
                 match e {
                     TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
+                    TxStoreError::Tx(TxError::EpochInsert(_)) => Status::InternalServerError,
                     TxStoreError::Tx(TxError::Db(DbErr::ConnectionAcquire(_))) => {
                         Status::InternalServerError
                     }
