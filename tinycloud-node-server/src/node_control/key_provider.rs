@@ -25,11 +25,34 @@ use std::{
 use tinycloud_core::keys::StaticSecret;
 
 #[cfg(target_os = "macos")]
-use security_framework_sys::base::errSecItemNotFound;
+use core_foundation::{
+    base::{CFType, TCFType},
+    boolean::CFBoolean,
+    data::{CFData, CFDataRef},
+    dictionary::CFDictionary,
+    string::CFString,
+};
+#[cfg(target_os = "macos")]
+use core_foundation_sys::base::{CFGetTypeID, CFRelease, CFTypeRef};
+#[cfg(target_os = "macos")]
+use security_framework_sys::{
+    base::{errSecDuplicateItem, errSecItemNotFound},
+    item::{
+        kSecAttrAccount, kSecAttrService, kSecAttrSynchronizable, kSecAttrSynchronizableAny,
+        kSecClass, kSecClassGenericPassword, kSecReturnData, kSecUseDataProtectionKeychain,
+        kSecValueData,
+    },
+    keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemDelete, SecItemUpdate},
+};
 #[cfg(target_os = "macos")]
 use sha2::{Digest, Sha256};
 #[cfg(feature = "dstack")]
 use std::future::Future;
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    static kSecAttrAccessible: core_foundation_sys::string::CFStringRef;
+}
 
 use crate::{config::Keys, node_control::paths::KeyBackend};
 
@@ -754,13 +777,17 @@ impl KeyProvider for MacosKeychainProvider {
     }
 
     fn load_secret(&self) -> Result<Option<Vec<u8>>> {
-        use security_framework::passwords::get_generic_password;
+        let query = macos_lookup_query(&self.service, &self.account);
+        let mut result: CFTypeRef = std::ptr::null_mut();
+        let status = unsafe { SecItemCopyMatching(query.as_concrete_TypeRef(), &mut result) };
+        if status == errSecItemNotFound {
+            return Ok(None);
+        }
+        if status != 0 {
+            return Err(anyhow!("keychain lookup failed with status {}", status));
+        }
 
-        let secret = match get_generic_password(&self.service, &self.account) {
-            Ok(secret) => secret,
-            Err(err) if err.code() == errSecItemNotFound => return Ok(None),
-            Err(err) => return Err(anyhow!("keychain lookup failed with status {}", err.code())),
-        };
+        let secret = macos_copy_result_bytes(result)?;
 
         if secret.len() < 32 {
             bail!(
@@ -780,21 +807,142 @@ impl KeyProvider for MacosKeychainProvider {
             );
         }
 
-        use security_framework::passwords::set_generic_password;
+        let add_query = macos_add_query(&self.service, &self.account, secret)?;
+        let status = unsafe { SecItemAdd(add_query.as_concrete_TypeRef(), std::ptr::null_mut()) };
+        if status == 0 {
+            return Ok(());
+        }
 
-        set_generic_password(&self.service, &self.account, secret)
-            .map_err(|err| anyhow!("keychain insert failed with status {}", err.code()))
+        if status == errSecDuplicateItem {
+            let update_query = macos_update_query(&self.service, &self.account);
+            let update = CFDictionary::from_CFType_pairs(&[(
+                unsafe { CFString::wrap_under_get_rule(kSecValueData) },
+                CFData::from_buffer(secret).into_CFType(),
+            )]);
+            let update_status = unsafe {
+                SecItemUpdate(
+                    update_query.as_concrete_TypeRef(),
+                    update.as_concrete_TypeRef(),
+                )
+            };
+            if update_status == 0 {
+                return Ok(());
+            }
+            return Err(anyhow!(
+                "keychain update failed with status {}",
+                update_status
+            ));
+        }
+
+        Err(anyhow!("keychain insert failed with status {}", status))
     }
 
     fn delete_secret(&self) -> Result<()> {
-        use security_framework::passwords::delete_generic_password;
-
-        match delete_generic_password(&self.service, &self.account) {
-            Ok(()) => Ok(()),
-            Err(err) if err.code() == errSecItemNotFound => Ok(()),
-            Err(err) => Err(anyhow!("keychain delete failed with status {}", err.code())),
+        let query = macos_delete_query(&self.service, &self.account);
+        let status = unsafe { SecItemDelete(query.as_concrete_TypeRef()) };
+        match status {
+            0 => Ok(()),
+            s if s == errSecItemNotFound => Ok(()),
+            _ => Err(anyhow!("keychain delete failed with status {}", status)),
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_common_pairs(
+    service: &str,
+    account: &str,
+    synchronizable: CFType,
+) -> Vec<(CFString, CFType)> {
+    vec![
+        (
+            unsafe { CFString::wrap_under_get_rule(kSecClass) },
+            unsafe { CFString::wrap_under_get_rule(kSecClassGenericPassword).into_CFType() },
+        ),
+        (
+            unsafe { CFString::wrap_under_get_rule(kSecAttrService) },
+            CFString::from(service).into_CFType(),
+        ),
+        (
+            unsafe { CFString::wrap_under_get_rule(kSecAttrAccount) },
+            CFString::from(account).into_CFType(),
+        ),
+        (
+            unsafe { CFString::wrap_under_get_rule(kSecAttrSynchronizable) },
+            synchronizable,
+        ),
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn macos_lookup_query(service: &str, account: &str) -> CFDictionary<CFString, CFType> {
+    let mut pairs = macos_common_pairs(service, account, unsafe {
+        CFString::wrap_under_get_rule(kSecAttrSynchronizableAny).into_CFType()
+    });
+    pairs.push((
+        unsafe { CFString::wrap_under_get_rule(kSecReturnData) },
+        CFBoolean::true_value().into_CFType(),
+    ));
+    CFDictionary::from_CFType_pairs(&pairs)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_delete_query(service: &str, account: &str) -> CFDictionary<CFString, CFType> {
+    let pairs = macos_common_pairs(service, account, unsafe {
+        CFString::wrap_under_get_rule(kSecAttrSynchronizableAny).into_CFType()
+    });
+    CFDictionary::from_CFType_pairs(&pairs)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_update_query(service: &str, account: &str) -> CFDictionary<CFString, CFType> {
+    macos_delete_query(service, account)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_add_query(
+    service: &str,
+    account: &str,
+    secret: &[u8],
+) -> Result<CFDictionary<CFString, CFType>> {
+    let mut pairs = macos_common_pairs(service, account, CFBoolean::true_value().into_CFType());
+    pairs.push((
+        unsafe { CFString::wrap_under_get_rule(kSecAttrAccessible) },
+        unsafe {
+            CFString::wrap_under_get_rule(
+                security_framework_sys::access_control::kSecAttrAccessibleAfterFirstUnlock,
+            )
+            .into_CFType()
+        },
+    ));
+    pairs.push((
+        unsafe { CFString::wrap_under_get_rule(kSecUseDataProtectionKeychain) },
+        CFBoolean::true_value().into_CFType(),
+    ));
+    pairs.push((
+        unsafe { CFString::wrap_under_get_rule(kSecValueData) },
+        CFData::from_buffer(secret).into_CFType(),
+    ));
+
+    Ok(CFDictionary::from_CFType_pairs(&pairs))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_copy_result_bytes(result: CFTypeRef) -> Result<Vec<u8>> {
+    if result.is_null() {
+        bail!("macOS keychain lookup returned no data");
+    }
+
+    let type_id = unsafe { CFGetTypeID(result) };
+    if type_id != CFData::type_id() {
+        unsafe {
+            CFRelease(result);
+        }
+        bail!("macOS keychain lookup returned unexpected data");
+    }
+
+    let data = unsafe { CFData::wrap_under_create_rule(result as CFDataRef) };
+    Ok(data.bytes().to_vec())
 }
 
 #[cfg(target_os = "macos")]
@@ -878,6 +1026,27 @@ mod tests {
             resolve_identity_state(Some(&Keys::Provider), temp.path(), IdentityPurpose::Probe)
                 .unwrap();
         assert_eq!(state.source, IdentitySourceKind::StaticEnv);
+        assert_eq!(state.backend, Some(KeyBackend::Static));
+        assert!(state.identity_ready);
+        assert!(state.node_did.is_some());
+    }
+
+    #[test]
+    fn provider_selection_prefers_static_config() {
+        let _lock = env_lock();
+        let temp = tempdir().unwrap();
+        let _env = EnvGuard::unset(STATIC_ENV_KEY);
+        let static_cfg: crate::config::Static = json::from_value(serde_json::json!({
+            "secret": encode_env_secret(&[2u8; 32]),
+        }))
+        .unwrap();
+        let state = resolve_identity_state(
+            Some(&Keys::Static(static_cfg)),
+            temp.path(),
+            IdentityPurpose::Probe,
+        )
+        .unwrap();
+        assert_eq!(state.source, IdentitySourceKind::StaticConfig);
         assert_eq!(state.backend, Some(KeyBackend::Static));
         assert!(state.identity_ready);
         assert!(state.node_did.is_some());
