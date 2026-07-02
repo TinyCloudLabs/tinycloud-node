@@ -12,9 +12,7 @@ use std::{
 
 use crate::{
     config::Config,
-    node_control::key_provider::{
-        self, BackupResult, IdentityPurpose, IdentitySourceKind, IdentityState,
-    },
+    node_control::key_provider::{self, BackupResult},
 };
 
 use super::paths::{
@@ -150,27 +148,15 @@ fn effective_config(paths: &ProfilePaths) -> Result<Config> {
     Ok(config)
 }
 
-fn local_identity_state(paths: &ProfilePaths) -> Result<IdentityState> {
-    let config = effective_config(paths)?;
-    key_provider::resolve_identity_state(
-        config.keys.as_ref(),
-        &config.storage.datadir,
-        IdentityPurpose::Probe,
-    )
-}
-
-fn local_identity_snapshot(paths: &ProfilePaths) -> Result<key_provider::IdentitySnapshot> {
-    let state = local_identity_state(paths)?;
-    Ok(key_provider::identity_snapshot(&state))
-}
-
-fn identity_source_warnings(state: Option<&IdentityState>) -> Vec<String> {
+fn identity_source_warnings(control_config: Option<&Value>) -> Vec<String> {
     let mut warnings = Vec::new();
-    if let Some(state) = state {
-        if matches!(
-            state.source,
-            IdentitySourceKind::StaticEnv | IdentitySourceKind::StaticConfig
-        ) {
+    if let Some(config) = control_config {
+        let backend = config
+            .get("config")
+            .and_then(|config| config.get("keyProvider"))
+            .and_then(|key_provider| key_provider.get("backend"))
+            .and_then(|backend| backend.as_str());
+        if matches!(backend, Some("static")) {
             warnings.push("legacy static key source is deprecated for desktop installs".into());
         }
     } else if std::env::var_os("TINYCLOUD_KEYS_SECRET").is_some() {
@@ -277,23 +263,8 @@ pub fn node_key_export_body() -> Result<String> {
 }
 
 pub fn node_identity_body() -> Result<String> {
-    let paths = installed_or_current_paths()?;
-    if let Some(body) = live_identity_body_for_paths(&paths)? {
-        return Ok(body);
-    }
-
-    let snapshot = local_identity_snapshot(&paths)?;
-    Ok(serde_json::to_string(&snapshot)?)
-}
-
-fn live_identity_body_for_paths(paths: &ProfilePaths) -> Result<Option<String>> {
-    match discover_control_session_for_paths(paths) {
-        Ok(session) => session
-            .get_text("/v1/identity")
-            .map(Some)
-            .or_else(|_| Ok(None)),
-        Err(_) => Ok(None),
-    }
+    let session = discover_control_session()?;
+    session.get_text("/v1/identity")
 }
 
 pub fn node_doctor() -> Result<DoctorReport> {
@@ -304,13 +275,15 @@ pub fn node_doctor() -> Result<DoctorReport> {
         None => (current_paths, None),
     };
     let session = discover_control_session_for_paths(&paths).ok();
-    let local_identity = local_identity_state(&paths).ok();
-    let local_identity_snapshot = local_identity
+    let control_config = session
         .as_ref()
-        .map(|state| key_provider::identity_snapshot(state));
-    let local_config = effective_config(&paths).ok();
+        .map(|session| session.get_json("/v1/config"));
     let mut checks = Vec::new();
-    let warnings = identity_source_warnings(local_identity.as_ref());
+    let warnings = identity_source_warnings(
+        control_config
+            .as_ref()
+            .and_then(|result| result.as_ref().ok()),
+    );
 
     checks.push(check_service_install(&paths, manifest.as_ref()));
     checks.push(check_local_files(&paths, manifest.as_ref()));
@@ -346,27 +319,11 @@ pub fn node_doctor() -> Result<DoctorReport> {
                 identity_status.details = Some(value);
             }
             Err(err) => {
-                if let Some(snapshot) = local_identity_snapshot.as_ref() {
-                    identity_status.status = if snapshot.identity_ready {
-                        DoctorCheckStatus::Pass
-                    } else {
-                        DoctorCheckStatus::Warn
-                    };
-                    identity_status.details = Some(json!(snapshot));
-                } else {
-                    identity_status.details = Some(json!({"error": err.to_string()}));
-                }
+                identity_status.details = Some(json!({"error": err.to_string()}));
             }
         }
-    } else if let Some(snapshot) = local_identity_snapshot.as_ref() {
-        identity_status.status = if snapshot.identity_ready {
-            DoctorCheckStatus::Pass
-        } else {
-            DoctorCheckStatus::Warn
-        };
-        identity_status.details = Some(json!(snapshot));
     } else {
-        identity_status.details = Some(json!({"error": "identity unavailable"}));
+        identity_status.details = Some(json!({"error": "control API unavailable"}));
     }
 
     let mut config_status = DoctorCheck {
@@ -374,9 +331,9 @@ pub fn node_doctor() -> Result<DoctorReport> {
         status: DoctorCheckStatus::Warn,
         details: None,
     };
-    if let Some(session) = session.as_ref() {
-        match session.get_json("/v1/config") {
-            Ok(value) => {
+    if session.is_some() {
+        match control_config.as_ref() {
+            Some(Ok(value)) => {
                 let public_api = value
                     .get("config")
                     .and_then(|config| config.get("publicApi"))
@@ -388,13 +345,16 @@ pub fn node_doctor() -> Result<DoctorReport> {
                 } else {
                     config_status.status = DoctorCheckStatus::Fail;
                 }
-                config_status.details = Some(value);
+                config_status.details = Some(value.clone());
             }
-            Err(err) => {
+            Some(Err(err)) => {
                 config_status.details = Some(json!({"error": err.to_string()}));
             }
+            None => {
+                config_status.details = Some(json!({"error": "config unavailable"}));
+            }
         }
-    } else if let Some(config) = local_config.as_ref() {
+    } else {
         let public_api = public_api_from_config(&paths.config_path);
         if is_loopback_address(&public_api.address) {
             config_status.status = DoctorCheckStatus::Pass;
@@ -407,11 +367,8 @@ pub fn node_doctor() -> Result<DoctorReport> {
                 "address": public_api.address,
                 "port": public_api.port,
             },
-            "dataPath": dir_to_json_string(&config.storage.datadir),
+            "dataPath": dir_to_json_string(&paths.data_root),
         }));
-    } else {
-        config_status.status = DoctorCheckStatus::Fail;
-        config_status.details = Some(json!({"error": "config unavailable"}));
     }
 
     checks.push(control_status);
@@ -518,22 +475,13 @@ pub fn service_status_for_installed(installed: DiscoveredService) -> ServiceStat
         .version
         .clone()
         .or_else(|| Some(manifest.version.clone()));
-    let local_identity = local_identity_state(&paths).ok();
-    let local_identity_snapshot = local_identity
-        .as_ref()
-        .map(|state| key_provider::identity_snapshot(state));
     let identity_ready = if control.unavailable {
-        local_identity_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.identity_ready)
-            .unwrap_or(false)
+        false
     } else {
         control.identity_ready.unwrap_or(false)
     };
     let node_did = if control.unavailable {
-        local_identity_snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.node_did.clone())
+        None
     } else {
         control.node_did.clone()
     };
@@ -1495,6 +1443,27 @@ mod tests {
         crate::test_support::env_lock()
     }
 
+    fn create_provider_identity(paths: &ProfilePaths) -> bool {
+        match key_provider::resolve_identity_state(
+            Some(&crate::config::Keys::Provider),
+            &paths.data_root,
+            key_provider::IdentityPurpose::Serve,
+        ) {
+            Ok(_) => true,
+            Err(err) => {
+                let rendered = format!("{err:#}");
+                #[cfg(target_os = "macos")]
+                {
+                    let skip_hints = ["keychain", "SecItem", "-34018", "-50", "entitlement"];
+                    if skip_hints.iter().any(|hint| rendered.contains(hint)) {
+                        return false;
+                    }
+                }
+                panic!("provider-backed first run failed: {rendered}");
+            }
+        }
+    }
+
     fn write_script(dir: &Path, name: &str, body: &str) {
         let path = dir.join(name);
         fs::write(&path, body).unwrap();
@@ -1693,6 +1662,221 @@ esac
         uninstall_for_paths(&paths).unwrap();
 
         assert!(paths.config_path.exists());
+    }
+
+    #[test]
+    fn node_identity_body_requires_control_session() {
+        let _lock = env_lock();
+        let temp = tempdir().unwrap();
+        let _keys_secret = EnvGuard::unset("TINYCLOUD_KEYS_SECRET");
+
+        #[cfg(target_os = "macos")]
+        let _config_root = EnvGuard::set("TINYCLOUD_NODE_CONFIG_ROOT", temp.path());
+        #[cfg(target_os = "linux")]
+        let (_home, _config_home, _data_home, _state_home) = {
+            let home = temp.path().join("home");
+            let config_home = temp.path().join("config");
+            let data_home = temp.path().join("data");
+            let state_home = temp.path().join("state");
+            fs::create_dir_all(&home).unwrap();
+            fs::create_dir_all(&config_home).unwrap();
+            fs::create_dir_all(&data_home).unwrap();
+            fs::create_dir_all(&state_home).unwrap();
+            (
+                EnvGuard::set("HOME", &home),
+                EnvGuard::set("XDG_CONFIG_HOME", &config_home),
+                EnvGuard::set("XDG_DATA_HOME", &data_home),
+                EnvGuard::set("XDG_STATE_HOME", &state_home),
+            )
+        };
+
+        #[cfg(target_os = "macos")]
+        let profile = Profile::MacosUser;
+        #[cfg(target_os = "linux")]
+        let profile = Profile::LinuxUser;
+        let paths = profile.paths();
+
+        write_bootstrap_config_if_absent(&paths).unwrap();
+        if !create_provider_identity(&paths) {
+            return;
+        }
+
+        let err = node_identity_body().unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("service is not installed"));
+    }
+
+    #[test]
+    fn node_doctor_does_not_use_local_identity_without_control() {
+        let _lock = env_lock();
+        let temp = tempdir().unwrap();
+        let _keys_secret = EnvGuard::unset("TINYCLOUD_KEYS_SECRET");
+
+        #[cfg(target_os = "macos")]
+        let _config_root = EnvGuard::set("TINYCLOUD_NODE_CONFIG_ROOT", temp.path());
+        #[cfg(target_os = "linux")]
+        let (_home, _config_home, _data_home, _state_home) = {
+            let home = temp.path().join("home");
+            let config_home = temp.path().join("config");
+            let data_home = temp.path().join("data");
+            let state_home = temp.path().join("state");
+            fs::create_dir_all(&home).unwrap();
+            fs::create_dir_all(&config_home).unwrap();
+            fs::create_dir_all(&data_home).unwrap();
+            fs::create_dir_all(&state_home).unwrap();
+            (
+                EnvGuard::set("HOME", &home),
+                EnvGuard::set("XDG_CONFIG_HOME", &config_home),
+                EnvGuard::set("XDG_DATA_HOME", &data_home),
+                EnvGuard::set("XDG_STATE_HOME", &state_home),
+            )
+        };
+
+        #[cfg(target_os = "macos")]
+        let profile = Profile::MacosUser;
+        #[cfg(target_os = "linux")]
+        let profile = Profile::LinuxUser;
+        let paths = profile.paths();
+
+        write_bootstrap_config_if_absent(&paths).unwrap();
+        if !create_provider_identity(&paths) {
+            return;
+        }
+
+        let report = node_doctor().unwrap();
+        let identity_check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "identity")
+            .expect("identity check should be present");
+
+        assert!(matches!(identity_check.status, DoctorCheckStatus::Warn));
+        assert_eq!(
+            identity_check
+                .details
+                .as_ref()
+                .and_then(|details| details.get("error")),
+            Some(&Value::String("control API unavailable".into()))
+        );
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn service_status_does_not_use_local_identity_when_control_is_unavailable() {
+        let _lock = env_lock();
+        let temp = tempdir().unwrap();
+        let _keys_secret = EnvGuard::unset("TINYCLOUD_KEYS_SECRET");
+
+        #[cfg(target_os = "macos")]
+        let _config_root = EnvGuard::set("TINYCLOUD_NODE_CONFIG_ROOT", temp.path());
+        #[cfg(target_os = "linux")]
+        let (_home, _config_home, _data_home, _state_home) = {
+            let home = temp.path().join("home");
+            let config_home = temp.path().join("config");
+            let data_home = temp.path().join("data");
+            let state_home = temp.path().join("state");
+            fs::create_dir_all(&home).unwrap();
+            fs::create_dir_all(&config_home).unwrap();
+            fs::create_dir_all(&data_home).unwrap();
+            fs::create_dir_all(&state_home).unwrap();
+            (
+                EnvGuard::set("HOME", &home),
+                EnvGuard::set("XDG_CONFIG_HOME", &config_home),
+                EnvGuard::set("XDG_DATA_HOME", &data_home),
+                EnvGuard::set("XDG_STATE_HOME", &state_home),
+            )
+        };
+
+        let bin = temp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+
+        #[cfg(target_os = "macos")]
+        write_script(
+            &bin,
+            "launchctl",
+            r#"#!/bin/sh
+cmd="$1"
+case "$cmd" in
+  print|kickstart|bootstrap|bootout|enable|disable)
+    if [ "$cmd" = "print" ]; then
+      echo "service = { state = stopped }"
+    fi
+    exit 0
+    ;;
+  print-disabled)
+    echo '"xyz.tinycloud.node" => false'
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+"#,
+        );
+
+        #[cfg(target_os = "linux")]
+        write_script(
+            &bin,
+            "systemctl",
+            r#"#!/bin/sh
+while [ "${1#-}" != "$1" ]; do
+  shift
+done
+case "$1" in
+  show)
+    echo "MainPID=0"
+    exit 0
+    ;;
+  is-enabled)
+    echo "disabled"
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+"#,
+        );
+
+        let _path = prepend_path(&bin);
+
+        #[cfg(target_os = "macos")]
+        let profile = Profile::MacosUser;
+        #[cfg(target_os = "linux")]
+        let profile = Profile::LinuxUser;
+        let paths = ProfilePaths::resolve(profile);
+        fs::create_dir_all(paths.service_manifest_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(paths.service_unit_path.parent().unwrap()).unwrap();
+        fs::write(&paths.service_unit_path, "").unwrap();
+
+        let manifest = ServiceManifest {
+            contract_version: CONTROL_CONTRACT_VERSION.into(),
+            profile,
+            platform: profile.platform(),
+            manager: profile.manager(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            config_path: paths.config_path_json(),
+            data_path: paths.data_root_json(),
+            log_mode: profile.log_mode(),
+            key_backend: profile.key_backend(),
+        };
+        write_service_manifest(&paths.service_manifest_path, &manifest).unwrap();
+
+        if !create_provider_identity(&paths) {
+            return;
+        }
+
+        let installed = DiscoveredService {
+            manifest,
+            paths: paths.clone(),
+        };
+        let status = service_status_for_installed(installed);
+
+        assert_eq!(status.state, ServiceState::Stopped);
+        assert_eq!(status.identity_ready, false);
+        assert!(status.node_did.is_none());
+        assert_eq!(status.key_backend, Some(profile.key_backend()));
+        assert_eq!(status.control_api, None);
     }
 
     #[test]
