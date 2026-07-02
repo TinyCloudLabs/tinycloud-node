@@ -116,6 +116,17 @@ impl Profile {
     pub fn paths(self) -> ProfilePaths {
         ProfilePaths::resolve(self)
     }
+
+    pub fn discovery_order_for_host() -> Vec<Self> {
+        match current_platform() {
+            Platform::Macos => vec![Self::MacosUser],
+            Platform::Linux => match Self::default_for_host() {
+                Self::LinuxUser => vec![Self::LinuxUser, Self::LinuxSystem],
+                Self::LinuxSystem => vec![Self::LinuxSystem, Self::LinuxUser],
+                Self::MacosUser => unreachable!(),
+            },
+        }
+    }
 }
 
 impl ProfilePaths {
@@ -129,8 +140,13 @@ impl ProfilePaths {
         let overlay_path = runtime_dir.join("config.override.toml");
         let control_json_path = runtime_dir.join("control.json");
         let control_token_path = runtime_dir.join("control.token");
-        let logs_file_path = logs_root.join("tinycloud.log");
-        let logs_error_path = logs_root.join("tinycloud.err.log");
+        let (logs_file_path, logs_error_path) = match profile.log_mode() {
+            LogMode::Journald => (logs_root.clone(), logs_root.clone()),
+            _ => (
+                logs_root.join("tinycloud.log"),
+                logs_root.join("tinycloud.err.log"),
+            ),
+        };
         let service_unit_path = match manager {
             Manager::HomebrewLaunchagent | Manager::LaunchdUser => {
                 service_unit_root.join(format!("{SERVICE_LABEL}.plist"))
@@ -168,7 +184,11 @@ impl ProfilePaths {
     }
 
     pub fn logs_root_json(&self) -> String {
-        dir_to_json_string(&self.logs_root)
+        if matches!(self.profile.log_mode(), LogMode::Journald) {
+            "journald".to_string()
+        } else {
+            dir_to_json_string(&self.logs_root)
+        }
     }
 
     pub fn overlay_path_json(&self) -> String {
@@ -212,23 +232,18 @@ pub fn current_platform() -> Platform {
 }
 
 fn resolve_roots(profile: Profile) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
-    if let Some(override_root) = env::var_os("TINYCLOUD_NODE_CONFIG_ROOT") {
-        let override_root = PathBuf::from(override_root);
-        let logs_root = override_root.join("logs");
-        let service_unit_root = match profile.platform() {
-            Platform::Macos => override_root.join("LaunchAgents"),
-            Platform::Linux => override_root.join(match profile {
-                Profile::LinuxUser => "systemd/user",
-                Profile::LinuxSystem => "systemd/system",
-                Profile::MacosUser => unreachable!(),
-            }),
-        };
-        return (
-            override_root.clone(),
-            override_root,
-            logs_root,
-            service_unit_root,
-        );
+    if matches!(profile, Profile::MacosUser) {
+        if let Some(override_root) = env::var_os("TINYCLOUD_NODE_CONFIG_ROOT") {
+            let override_root = PathBuf::from(override_root);
+            let logs_root = override_root.join("logs");
+            let service_unit_root = override_root.join("LaunchAgents");
+            return (
+                override_root.clone(),
+                override_root,
+                logs_root,
+                service_unit_root,
+            );
+        }
     }
 
     match profile {
@@ -248,7 +263,7 @@ fn resolve_roots(profile: Profile) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
         Profile::LinuxSystem => {
             let config_root = PathBuf::from("/etc/tinycloud-node");
             let data_root = PathBuf::from("/var/lib/tinycloud-node");
-            let logs_root = PathBuf::from("/var/log/tinycloud-node");
+            let logs_root = PathBuf::from("journald");
             let service_unit_root = PathBuf::from("/etc/systemd/system");
             (config_root, data_root, logs_root, service_unit_root)
         }

@@ -159,34 +159,35 @@ pub fn uninstall() -> Result<()> {
 }
 
 pub fn start() -> Result<()> {
-    let paths = load_installed_paths_or_default()?;
+    let paths = load_installed_paths()?;
     start_for_paths(&paths)
 }
 
 pub fn stop() -> Result<()> {
-    let paths = load_installed_paths_or_default()?;
+    let paths = load_installed_paths()?;
     stop_for_paths(&paths)
 }
 
 pub fn restart() -> Result<()> {
-    let paths = load_installed_paths_or_default()?;
+    let paths = load_installed_paths()?;
     restart_for_paths(&paths)
 }
 
 pub fn service_status() -> Result<ServiceStatus> {
-    let paths = current_profile_paths();
-    if !paths.service_manifest_path.exists() {
-        return Ok(default_service_status());
+    match discover_installed_service()? {
+        Some(installed) => Ok(service_status_for_installed(installed)),
+        None => Ok(default_service_status()),
     }
-
-    let manifest = read_service_manifest(&paths.service_manifest_path)?;
-    let installed = DiscoveredService { manifest, paths };
-    Ok(service_status_for_installed(installed))
 }
 
 pub fn node_status() -> Result<Value> {
     let session = discover_control_session()?;
     session.get_json("/v1/status")
+}
+
+pub fn node_status_body() -> Result<String> {
+    let session = discover_control_session()?;
+    session.get_text("/v1/status")
 }
 
 pub fn node_logs(lines: Option<u32>) -> Result<Value> {
@@ -198,10 +199,23 @@ pub fn node_logs(lines: Option<u32>) -> Result<Value> {
     session.get_json(&url)
 }
 
+pub fn node_logs_body(lines: Option<u32>) -> Result<String> {
+    let session = discover_control_session()?;
+    let mut url = String::from("/v1/logs/tail");
+    if let Some(lines) = lines {
+        url.push_str(&format!("?lines={lines}"));
+    }
+    session.get_text(&url)
+}
+
 pub fn node_doctor() -> Result<DoctorReport> {
-    let session = discover_control_session();
-    let paths = current_profile_paths();
-    let manifest = load_service_manifest_if_present(&paths.service_manifest_path)?;
+    let current_paths = current_profile_paths();
+    let discovered = discover_installed_service()?;
+    let (paths, manifest) = match discovered {
+        Some(installed) => (installed.paths, Some(installed.manifest)),
+        None => (current_paths, None),
+    };
+    let session = discover_control_session_for_paths(&paths);
     let mut checks = Vec::new();
     let mut warnings = Vec::new();
 
@@ -276,7 +290,7 @@ pub fn node_doctor() -> Result<DoctorReport> {
         }
     }
 
-    if let Some(manifest) = manifest {
+    if let Some(manifest) = manifest.as_ref() {
         if matches!(manifest.key_backend, KeyBackend::Static) {
             warnings.push("legacy static key source is deprecated for desktop installs".into());
         }
@@ -303,7 +317,9 @@ pub fn node_doctor() -> Result<DoctorReport> {
 pub fn install_for_paths(paths: &ProfilePaths) -> Result<()> {
     ensure_parent_dir(&paths.service_manifest_path)?;
     ensure_parent_dir(&paths.service_unit_path)?;
-    ensure_dir(&paths.logs_root)?;
+    if !matches!(paths.profile.log_mode(), LogMode::Journald) {
+        ensure_dir(&paths.logs_root)?;
+    }
 
     let manifest = ServiceManifest {
         contract_version: CONTROL_CONTRACT_VERSION.to_string(),
@@ -396,7 +412,7 @@ pub fn service_status_for_installed(installed: DiscoveredService) -> ServiceStat
         manager: manifest.manager,
         state,
         pid,
-        enabled_at_login: manifest.manager != Manager::SystemdSystem,
+        enabled_at_login: manager_enabled_at_login(manifest.manager, &paths),
         version,
         public_api,
         config_path: manifest.config_path,
@@ -512,6 +528,68 @@ fn current_manager_state(paths: &ProfilePaths, manifest: &ServiceManifest) -> Ma
     }
 }
 
+fn manager_enabled_at_login(manager: Manager, paths: &ProfilePaths) -> bool {
+    match manager {
+        Manager::LaunchdUser | Manager::HomebrewLaunchagent => {
+            launchd_enabled_at_login(paths).unwrap_or(true)
+        }
+        Manager::SystemdUser => systemd_enabled_at_login().unwrap_or(false),
+        Manager::SystemdSystem => false,
+    }
+}
+
+fn launchd_enabled_at_login(paths: &ProfilePaths) -> Result<bool> {
+    let output = Command::new("launchctl")
+        .args(["print-disabled", &launchd_domain(paths)])
+        .output()
+        .with_context(|| "failed to execute launchctl")?;
+
+    if !output.status.success() {
+        bail!("launchctl print-disabled failed");
+    }
+
+    Ok(
+        launchd_enabled_at_login_from_stdout(&String::from_utf8_lossy(&output.stdout))
+            .unwrap_or(true),
+    )
+}
+
+fn systemd_enabled_at_login() -> Result<bool> {
+    let output = Command::new("systemctl")
+        .args(["--user", "is-enabled", &service_unit_name()])
+        .output()
+        .with_context(|| "failed to execute systemctl")?;
+
+    if !output.status.success() {
+        return Ok(false);
+    }
+
+    Ok(systemd_enabled_at_login_from_stdout(
+        &String::from_utf8_lossy(&output.stdout),
+    ))
+}
+
+fn launchd_enabled_at_login_from_stdout(stdout: &str) -> Option<bool> {
+    for line in stdout.lines() {
+        if let Some((label, value)) = line.split_once("=>") {
+            let label = label.trim().trim_matches('"');
+            if label == SERVICE_LABEL {
+                return Some(value.trim_start().starts_with("false"));
+            }
+        }
+    }
+
+    None
+}
+
+fn systemd_enabled_at_login_from_stdout(stdout: &str) -> bool {
+    let state = stdout.trim();
+    matches!(
+        state,
+        "enabled" | "enabled-runtime" | "linked" | "linked-runtime" | "alias"
+    )
+}
+
 fn probe_control_api(manifest: &ServiceManifest, paths: &ProfilePaths) -> ControlProbe {
     let control_manifest = match read_control_manifest(&paths.control_json_path) {
         Ok(manifest) => manifest,
@@ -600,8 +678,35 @@ fn probe_control_api(manifest: &ServiceManifest, paths: &ProfilePaths) -> Contro
     }
 }
 
+fn discover_installed_service() -> Result<Option<DiscoveredService>> {
+    for profile in Profile::discovery_order_for_host() {
+        let paths = profile.paths();
+        if !paths.service_manifest_path.exists() {
+            continue;
+        }
+
+        let manifest = read_service_manifest(&paths.service_manifest_path)?;
+        return Ok(Some(DiscoveredService { manifest, paths }));
+    }
+
+    Ok(None)
+}
+
+fn load_installed_paths() -> Result<ProfilePaths> {
+    if let Some(installed) = discover_installed_service()? {
+        return Ok(installed.paths);
+    }
+
+    bail!("service is not installed")
+}
+
 fn discover_control_session() -> Result<ControlSession> {
-    let paths = current_profile_paths();
+    let installed =
+        discover_installed_service()?.ok_or_else(|| anyhow!("service is not installed"))?;
+    discover_control_session_for_paths(&installed.paths)
+}
+
+fn discover_control_session_for_paths(paths: &ProfilePaths) -> Result<ControlSession> {
     let _manifest = read_service_manifest_if_present(&paths.service_manifest_path)?
         .ok_or_else(|| anyhow!("service is not installed"))?;
     let control = read_control_manifest(&paths.control_json_path).with_context(|| {
@@ -639,6 +744,22 @@ fn control_base_url(host: &str, port: u16) -> String {
 }
 
 impl ControlSession {
+    fn get_text(&self, path: &str) -> Result<String> {
+        let url = format!("{}{}", self.base_url, path);
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(&self.token)
+            .send()
+            .with_context(|| "failed to reach control API")?;
+
+        if !response.status().is_success() {
+            bail!("control API returned {}", response.status());
+        }
+
+        response.text().context("failed to read control API body")
+    }
+
     fn get_json(&self, path: &str) -> Result<Value> {
         let url = format!("{}{}", self.base_url, path);
         let response = self
@@ -859,14 +980,22 @@ fn systemd_unit(
     } else {
         "default.target"
     };
-    let stdout = stdout.display().to_string();
-    let stderr = stderr.display().to_string();
+    let logging = if matches!(manager, Manager::SystemdSystem) {
+        "StandardOutput=journal\nStandardError=journal\n".to_string()
+    } else {
+        let stdout = stdout.display().to_string();
+        let stderr = stderr.display().to_string();
+        format!(
+            "StandardOutput=append:{}\nStandardError=append:{}\n",
+            shell_quote(&stdout),
+            shell_quote(&stderr)
+        )
+    };
     format!(
-        "[Unit]\nDescription=TinyCloud Node\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart={} serve --config {}\nRestart=on-failure\nStandardOutput=append:{}\nStandardError=append:{}\n\n[Install]\nWantedBy={}\n",
+        "[Unit]\nDescription=TinyCloud Node\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart={} serve --config {}\nRestart=on-failure\n{}\n[Install]\nWantedBy={}\n",
         shell_quote(&executable.display().to_string()),
         shell_quote(&config_path.display().to_string()),
-        shell_quote(&stdout),
-        shell_quote(&stderr),
+        logging,
         wanted_by,
     )
 }
@@ -1004,15 +1133,6 @@ fn process_age(pid: u32) -> Result<u64> {
     Ok(age)
 }
 
-fn load_installed_paths_or_default() -> Result<ProfilePaths> {
-    let paths = current_profile_paths();
-    if paths.service_manifest_path.exists() {
-        Ok(paths)
-    } else {
-        bail!("service is not installed")
-    }
-}
-
 fn check_service_install(paths: &ProfilePaths, manifest: Option<&ServiceManifest>) -> DoctorCheck {
     let installed = manifest.is_some() && paths.service_manifest_path.exists();
     DoctorCheck {
@@ -1041,21 +1161,7 @@ fn check_local_files(paths: &ProfilePaths, manifest: Option<&ServiceManifest>) -
     } else {
         DoctorCheckStatus::Warn
     };
-    let token_permission_ok = if control_token_exists {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::metadata(&paths.control_token_path)
-                .map(|metadata| metadata.permissions().mode() & 0o077 == 0)
-                .unwrap_or(false)
-        }
-        #[cfg(not(unix))]
-        {
-            true
-        }
-    } else {
-        false
-    };
+    let token_permission_ok = token_permissions_ok(paths, manifest);
 
     if manifest.is_none() {
         status = DoctorCheckStatus::Warn;
@@ -1081,11 +1187,43 @@ fn check_local_files(paths: &ProfilePaths, manifest: Option<&ServiceManifest>) -
     }
 }
 
+fn token_permissions_ok(paths: &ProfilePaths, manifest: Option<&ServiceManifest>) -> bool {
+    if !paths.control_token_path.exists() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let metadata = match fs::metadata(&paths.control_token_path) {
+            Ok(metadata) => metadata,
+            Err(_) => return false,
+        };
+
+        let mode = metadata.permissions().mode() & 0o777;
+        match manifest
+            .map(|manifest| manifest.manager)
+            .unwrap_or(paths.manager)
+        {
+            Manager::SystemdSystem => mode == 0o640 && metadata.uid() == 0,
+            _ => mode == 0o600,
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = manifest;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{
         env,
+        path::Path,
         sync::{Mutex, OnceLock},
     };
     use tempfile::tempdir;
@@ -1169,6 +1307,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn linux_system_paths_use_system_roots_and_journald() {
+        let _lock = env_lock();
+        let _override = EnvGuard::unset("TINYCLOUD_NODE_CONFIG_ROOT");
+
+        let paths = ProfilePaths::resolve(Profile::LinuxSystem);
+
+        assert_eq!(paths.config_root, Path::new("/etc/tinycloud-node"));
+        assert_eq!(paths.data_root, Path::new("/var/lib/tinycloud-node"));
+        assert_eq!(paths.logs_root, Path::new("journald"));
+        assert_eq!(
+            paths.service_manifest_path,
+            Path::new("/etc/tinycloud-node/service.json")
+        );
+        assert_eq!(paths.profile.log_mode(), LogMode::Journald);
+        assert_eq!(paths.manager, Manager::SystemdSystem);
+    }
+
+    #[tokio::test]
     async fn service_manifest_roundtrip() {
         let temp = tempdir().unwrap();
         let path = temp.path().join("service.json");
@@ -1221,8 +1377,26 @@ mod tests {
         assert_eq!(value["platform"], "macos");
         assert_eq!(value["manager"], "launchd-user");
         assert_eq!(value["state"], "running");
+        assert_eq!(value["enabledAtLogin"], true);
         assert_eq!(value["publicApi"]["address"], "127.0.0.1");
         assert_eq!(value["publicApi"]["port"], 8081);
         assert_eq!(value["controlApi"], "unavailable");
+    }
+
+    #[tokio::test]
+    async fn launchd_enabled_at_login_parser_reads_label_state() {
+        let stdout = r#"
+disabled services = {
+	"xyz.tinycloud.node" => false
+}
+"#;
+
+        assert_eq!(launchd_enabled_at_login_from_stdout(stdout), Some(true));
+    }
+
+    #[tokio::test]
+    async fn systemd_enabled_at_login_parser_accepts_enabled_states() {
+        assert!(systemd_enabled_at_login_from_stdout("enabled\n"));
+        assert!(!systemd_enabled_at_login_from_stdout("disabled\n"));
     }
 }
