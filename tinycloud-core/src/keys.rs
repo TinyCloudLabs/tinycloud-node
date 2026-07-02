@@ -63,6 +63,10 @@ impl StaticSecret {
         }
     }
 
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.secret
+    }
+
     pub fn derive_key(&self, context: &[u8]) -> [u8; 32] {
         let mut hasher = Blake3_256::default();
         hasher.update(&self.secret);
