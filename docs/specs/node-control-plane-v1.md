@@ -25,7 +25,9 @@ Use loopback HTTP plus a token file, with a separate control listener.
 
 The control listener MUST bind only to loopback (`127.0.0.1` or `::1`). It
 MUST authenticate every request with `Authorization: Bearer <token>`, where the
-token is stored in a local file with mode `0600`.
+token is stored in a local file. User installs keep that file mode `0600`;
+`systemd-system` installs may use `0640 root:tinycloud` so root or the
+`tinycloud` group can read it.
 
 ### Why this option
 
@@ -70,7 +72,8 @@ The CLI-owned install manifest lives at `${configRoot}/service.json`:
 
 The control listener chooses an available loopback port at startup and records
 it in `control.json`. The token file is generated on startup, stored only on
-disk, and MUST remain mode `0600`.
+disk, and MUST remain mode `0600` for user installs; `systemd-system` installs
+may use `0640 root:tinycloud` so the documented group-read access path works.
 
 Example `service.json`:
 
@@ -100,10 +103,11 @@ Example `control.json`:
 }
 ```
 
-`service.json` is the CLI-owned install-time manifest used by the CLI to report
-service state even when the node is stopped. `tinycloud node service install`
-writes it and `uninstall` removes it. `control.json` is the discovery file for
-the live control listener. Both files are local-only.
+`service.json` is the CLI-owned bootstrap install manifest used by the CLI to
+report service state even when the node is stopped. `tinycloud node service
+install` writes it and `uninstall` removes it; the node never writes it.
+`control.json` is the discovery file for the live control listener. Both files
+are local-only, and node-owned runtime files stay under `dataPath/runtime/`.
 
 `service.json` fields:
 
@@ -726,8 +730,9 @@ Manager selection:
 
 Command behavior:
 
-- `install` writes the service definition, writes `service.json` at the
-  well-known platform manifest path, and enables the service.
+- `install` writes the service definition, writes `service.json` at the fixed
+  well-known platform manifest path outside `dataPath/runtime/`, and enables
+  the service.
 - `start` launches the node.
 - `stop` stops the node.
 - `restart` stops and starts the node.
@@ -960,9 +965,10 @@ that owns `runtime/`, logs metadata, backups, and other node-managed files. On
 macOS, the config root and data root are the same directory; on Linux user and
 system installs, they are separate roots.
 
-The CLI-owned service manifest lives at `${configRoot}/service.json` on every
-platform. The node never writes this file; `service install` owns it and
-`uninstall` removes it.
+The CLI-owned service manifest lives at the fixed install path
+`${configRoot}/service.json` on every platform. It is install metadata, not
+runtime state; the node never writes this file, and `service install` owns it
+while `uninstall` removes it.
 
 For `systemd-system` installs, control commands require either root or
 membership in the `tinycloud` group because `control.token` is group-readable
@@ -991,19 +997,20 @@ Important:
 ## 5. Security Invariants
 
 - The control plane MUST never bind a non-loopback address.
-- The token file MUST be mode `0600`.
+- The token file MUST be mode `0600` for user installs; `systemd-system`
+  installs MAY use `0640 root:tinycloud` as documented in Section 4.
 - The runtime directory SHOULD be mode `0700`.
 - The token MUST not be passed through env vars or command-line arguments.
 - Private key material MUST never be transmitted over the control API, printed,
-  written unencrypted, or passed through env vars.
+  written unencrypted, or passed through env vars. `node key backup` is the
+  only explicit documented trust boundary for this rule: it links the
+  KeyProvider library in-process and holds secret material in memory only long
+  enough to seal the export bundle.
 - Private keys MUST NOT appear in control API responses, CLI JSON, logs, or
   doctor output.
 - Secret-bearing config values MUST be omitted, not redacted with fake
   placeholder strings.
 - The app requests actions and the node signs internally.
-- `node key backup` is the explicit documented trust boundary: it links the
-  KeyProvider library in-process and holds secret material in memory only long
-  enough to seal the export bundle.
 - `PATCH /v1/config` cannot mutate key material, storage roots, or binding
   endpoints.
 
