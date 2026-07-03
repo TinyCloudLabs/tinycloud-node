@@ -5,6 +5,7 @@ use crate::keys::{get_did_key, Secrets};
 use crate::migrations::Migrator;
 use crate::models::*;
 use crate::relationships::*;
+use crate::sql_sizes::SqlSizes;
 use crate::storage::{
     either::EitherError, Content, HashBuffer, ImmutableDeleteStore, ImmutableReadStore,
     ImmutableStaging, ImmutableWriteStore, StorageSetup, StoreSize,
@@ -52,6 +53,7 @@ pub struct SpaceDatabase<C, B, S> {
     storage: B,
     secrets: S,
     encryption: Option<ColumnEncryption>,
+    sql_sizes: SqlSizes,
 }
 
 #[derive(Debug, Clone)]
@@ -145,11 +147,17 @@ impl<B, K> SpaceDatabase<DatabaseConnection, B, K> {
             storage,
             secrets,
             encryption: None,
+            sql_sizes: SqlSizes::default(),
         })
     }
 
     pub fn with_encryption(mut self, encryption: Option<ColumnEncryption>) -> Self {
         self.encryption = encryption;
+        self
+    }
+
+    pub fn with_sql_sizes(mut self, sql_sizes: SqlSizes) -> Self {
+        self.sql_sizes = sql_sizes;
         self
     }
 }
@@ -417,8 +425,17 @@ impl<C, B, K> SpaceDatabase<C, B, K>
 where
     B: StoreSize,
 {
+    /// Total metered usage for a space: block-store (KV) bytes folded with the
+    /// sum of SQL/DuckDB artifact bytes (`SqlSizes`). Returns `None` only when
+    /// BOTH are absent (truly-unknown space → 404 preserved); a SQL-only space
+    /// reports `Some(sql_bytes)`.
     pub async fn store_size(&self, space_id: &SpaceId) -> Result<Option<u64>, B::Error> {
-        self.storage.total_size(space_id).await
+        let blocks = self.storage.total_size(space_id).await?; // Option<u64>
+        let sql = self.sql_sizes.space_total(space_id).await; // u64 (0 if none)
+        Ok(match (blocks, sql) {
+            (None, 0) => None,                                // truly absent → 404 preserved
+            (blocks, sql) => Some(blocks.unwrap_or(0) + sql), // SQL-only → Some(sql)
+        })
     }
 }
 
@@ -1558,10 +1575,14 @@ async fn get_delegation_chain<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
 
 #[cfg(test)]
 mod test {
-    use crate::{keys::StaticSecret, storage::memory::MemoryStore};
+    use crate::{keys::StaticSecret, sql_sizes::SqlSizes, storage::memory::MemoryStore};
 
     use super::*;
     use sea_orm::{ConnectOptions, Database};
+    use tinycloud_auth::{
+        resolver::DID_METHODS,
+        ssi::{dids::DIDBuf, jwk::JWK},
+    };
 
     async fn get_db() -> Result<SpaceDatabase<sea_orm::DbConn, MemoryStore, StaticSecret>, DbErr> {
         SpaceDatabase::new(
@@ -1572,8 +1593,33 @@ mod test {
         .await
     }
 
+    fn test_space_id(name: &str) -> SpaceId {
+        let jwk = JWK::generate_ed25519().unwrap();
+        let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
+        SpaceId::new(did, name.parse().unwrap())
+    }
+
     #[tokio::test]
     async fn basic() {
         let _db = get_db().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn store_size_folds_sql_only_space_to_some() {
+        let space = test_space_id("sql-only");
+        let sql_sizes = SqlSizes::new();
+        sql_sizes
+            .update("sql", &space.to_string(), "main", 512)
+            .await;
+        let db = get_db().await.unwrap().with_sql_sizes(sql_sizes);
+        // MemoryStore never saw this space, but SQL bytes exist → Some(512).
+        assert_eq!(db.store_size(&space).await.unwrap(), Some(512));
+    }
+
+    #[tokio::test]
+    async fn store_size_none_only_when_both_absent() {
+        let space = test_space_id("untouched");
+        let db = get_db().await.unwrap().with_sql_sizes(SqlSizes::new());
+        assert_eq!(db.store_size(&space).await.unwrap(), None);
     }
 }

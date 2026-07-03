@@ -54,11 +54,12 @@ use tee::TeeContext;
 #[cfg(feature = "duckdb")]
 use tinycloud_core::duckdb::DuckDbService;
 use tinycloud_core::{
-    database_artifacts::SeaOrmDatabaseArtifactRepository,
+    database_artifacts::{DatabaseArtifactRepository, SeaOrmDatabaseArtifactRepository},
     encryption_network::{EncryptionService, LocalOneOfOneBackend},
     keys::{SecretsSetup, StaticSecret},
     sea_orm::{ConnectOptions, Database, DatabaseConnection},
     sql::SqlService,
+    sql_sizes::{SizeTrackingArtifactRepository, SqlSizes},
     storage::{either::Either, memory::MemoryStaging, StorageConfig},
     ColumnEncryption, SpaceDatabase,
 };
@@ -213,9 +214,17 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     }
 
     let database_connection = Database::connect(connect_opts).await?;
-    let database_artifact_repository = Arc::new(SeaOrmDatabaseArtifactRepository::new(
+    // SQL/DuckDB artifact-size mirror folded into `store_size`. Empty here;
+    // wired into the decorator + SpaceDatabase BEFORE migrations, then seeded
+    // from DB truth AFTER `TinyCloud::new` runs migrations (see below).
+    let sql_sizes = SqlSizes::new();
+    let seed_conn = database_connection.clone();
+    let raw_artifact_repository = Arc::new(SeaOrmDatabaseArtifactRepository::new(
         database_connection.clone(),
     ));
+    let database_artifact_repository: Arc<dyn DatabaseArtifactRepository> = Arc::new(
+        SizeTrackingArtifactRepository::new(raw_artifact_repository, sql_sizes.clone()),
+    );
 
     // Encryption module: seal network private keys with the same kind of derived
     // key used for DB column encryption. In DStack mode the seal is rooted in
@@ -237,7 +246,13 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         key_setup.setup(()).await?,
     )
     .await?
-    .with_encryption(Some(webhook_encryption.clone()));
+    .with_encryption(Some(webhook_encryption.clone()))
+    .with_sql_sizes(sql_sizes.clone());
+
+    // Seed the SQL-size mirror AFTER `TinyCloud::new` ran migrations — the
+    // `database_artifact` table now exists (seeding before migrations would
+    // fail boot on a fresh datadir). Runs before Rocket serves any request.
+    sql_sizes.seed_from(&seed_conn).await?;
 
     let sql_service = SqlService::new(
         tinycloud_config.storage.sql.path.clone().expect("resolved"),
