@@ -110,7 +110,12 @@ pub async fn get_quota(
         .parse()
         .map_err(|_| (Status::BadRequest, "Invalid space ID".into()))?;
     let override_bytes = quota_cache.get_override(&sid).await;
-    let effective = quota_cache.get_limit(&sid).await.map(|l| l.as_u64());
+    // Never resolve via get_limit() here: it pulls from the remote quota
+    // service, and that service calls this endpoint per owned space to compute
+    // usage — on a cold cache the two recurse into a mutual-call storm.
+    // Report only what is already known locally (override/cached, else the
+    // env default).
+    let effective = override_bytes.or_else(|| quota_cache.default_limit().map(|l| l.as_u64()));
     let usage = tinycloud
         .store_size(&sid)
         .await

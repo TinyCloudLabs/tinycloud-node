@@ -2,6 +2,7 @@ use rocket::data::ByteUnit;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tinycloud_auth::resource::SpaceId;
 use tokio::sync::RwLock;
 
@@ -19,7 +20,13 @@ pub struct QuotaCache {
 
 impl QuotaCache {
     pub fn new(default_limit: Option<ByteUnit>, quota_url: Option<String>) -> Self {
-        let client = quota_url.as_ref().map(|_| reqwest::Client::new());
+        let client = quota_url.as_ref().map(|_| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .connect_timeout(Duration::from_secs(5))
+                .build()
+                .expect("failed to build quota reqwest client")
+        });
         Self {
             overrides: Arc::new(RwLock::new(HashMap::new())),
             default_limit,
