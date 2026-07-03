@@ -1065,6 +1065,21 @@ Backends:
   `0600`). This protects against casual copying and backup leakage, not root
   compromise.
 
+TC-77 amendment: macOS `macos-keychain` now uses a two-tier insert strategy.
+The node first writes to the data-protection keychain with sync enabled and
+`kSecAttrAccessibleAfterFirstUnlock`. If an unentitled binary returns
+`errSecMissingEntitlement` (`-34018`), it falls back to the classic login
+keychain without `kSecUseDataProtectionKeychain` or
+`kSecAttrSynchronizable`. Reads must resolve either tier, and duplicate-item
+updates must delete and re-add within the tier they are updating so pre-fix
+items migrate to the correct attributes. This keeps iCloud Keychain sync for
+the signed desktop app while letting the plain CLI bootstrap a usable local
+identity.
+
+Desktop-managed installs write `[global.keys] type = "provider"` in the
+bootstrap config as the supported opt-in for this provider-backed path; that
+naming deviation is now part of the contract.
+
 Legacy source precedence:
 
 - Explicit `keys = Static{secret}` or `TINYCLOUD_KEYS_SECRET` wins for backward

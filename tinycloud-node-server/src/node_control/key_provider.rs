@@ -7,7 +7,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chacha20poly1305::{
     aead::{Aead, KeyInit},
-    Key, XChaCha20Poly1305, XNonce,
+    XChaCha20Poly1305, XNonce,
 };
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -39,20 +39,15 @@ use security_framework_sys::{
     base::{errSecDuplicateItem, errSecItemNotFound},
     item::{
         kSecAttrAccount, kSecAttrService, kSecAttrSynchronizable, kSecAttrSynchronizableAny,
-        kSecClass, kSecClassGenericPassword, kSecReturnData, kSecUseDataProtectionKeychain,
-        kSecValueData,
+        kSecClass, kSecClassGenericPassword, kSecReturnData, kSecUseAuthenticationUI,
+        kSecUseAuthenticationUISkip, kSecUseDataProtectionKeychain, kSecValueData,
     },
-    keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemDelete, SecItemUpdate},
+    keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemDelete},
 };
 #[cfg(target_os = "macos")]
 use sha2::{Digest, Sha256};
 #[cfg(feature = "dstack")]
 use std::future::Future;
-
-#[cfg(target_os = "macos")]
-extern "C" {
-    static kSecAttrAccessible: core_foundation_sys::string::CFStringRef;
-}
 
 use crate::{config::Keys, node_control::paths::KeyBackend};
 
@@ -60,6 +55,12 @@ use super::paths::SERVICE_LABEL;
 
 const STATIC_ENV_KEY: &str = "TINYCLOUD_KEYS_SECRET";
 const KEYCHAIN_SERVICE: &str = "xyz.tinycloud.node.identity";
+#[cfg(target_os = "macos")]
+const ERR_SEC_MISSING_ENTITLEMENT: i32 = -34018;
+#[cfg(target_os = "macos")]
+const ERR_SEC_NOT_AVAILABLE: i32 = -25291;
+#[cfg(target_os = "macos")]
+const ERR_SEC_NO_DEFAULT_KEYCHAIN: i32 = -25307;
 const ENCRYPTED_FILE_AAD: &[u8] = b"tinycloud-node/encrypted-file/v1";
 const ENCRYPTED_FILE_KEY_WRAP_AAD: &[u8] = b"tinycloud-node/encrypted-file/key-wrap/v1";
 const BACKUP_AAD: &[u8] = b"tinycloud-node/key-backup/v1";
@@ -145,6 +146,36 @@ pub fn default_provider_backend() -> KeyBackend {
     #[cfg(not(target_os = "macos"))]
     {
         KeyBackend::EncryptedFile
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacosKeychainTier {
+    DataProtection,
+    Classic,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacosStoreOutcome {
+    Stored,
+    Duplicate,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosKeychainTier {
+    fn synchronizable(self) -> Option<CFType> {
+        match self {
+            MacosKeychainTier::DataProtection => {
+                Some(CFBoolean::true_value().into_CFType())
+            }
+            MacosKeychainTier::Classic => None,
+        }
+    }
+
+    fn uses_data_protection_keychain(self) -> bool {
+        matches!(self, MacosKeychainTier::DataProtection)
     }
 }
 
@@ -490,11 +521,12 @@ fn encrypt_xchacha(
     aad: &[u8],
     plaintext: &[u8],
 ) -> Result<Vec<u8>> {
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
-    let nonce = XNonce::from_slice(nonce);
+    let cipher = XChaCha20Poly1305::new_from_slice(key)
+        .context("xchacha20poly1305 key initialization failed")?;
+    let cipher_nonce: &XNonce = nonce.into();
     cipher
         .encrypt(
-            &nonce,
+            cipher_nonce,
             chacha20poly1305::aead::Payload {
                 msg: plaintext,
                 aad,
@@ -509,11 +541,12 @@ fn decrypt_xchacha(
     aad: &[u8],
     ciphertext: &[u8],
 ) -> Result<Vec<u8>> {
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
-    let nonce = XNonce::from_slice(nonce);
+    let cipher = XChaCha20Poly1305::new_from_slice(key)
+        .context("xchacha20poly1305 key initialization failed")?;
+    let cipher_nonce: &XNonce = nonce.into();
     cipher
         .decrypt(
-            &nonce,
+            cipher_nonce,
             chacha20poly1305::aead::Payload {
                 msg: ciphertext,
                 aad,
@@ -807,53 +840,79 @@ impl KeyProvider for MacosKeychainProvider {
             );
         }
 
-        let add_query = macos_add_query(&self.service, &self.account, secret)?;
-        let status = unsafe { SecItemAdd(add_query.as_concrete_TypeRef(), std::ptr::null_mut()) };
-        if status == 0 {
-            return Ok(());
-        }
-
-        if status == errSecDuplicateItem {
-            let update_query = macos_update_query(&self.service, &self.account);
-            let update = CFDictionary::from_CFType_pairs(&[(
-                unsafe { CFString::wrap_under_get_rule(kSecValueData) },
-                CFData::from_buffer(secret).into_CFType(),
-            )]);
-            let update_status = unsafe {
-                SecItemUpdate(
-                    update_query.as_concrete_TypeRef(),
-                    update.as_concrete_TypeRef(),
-                )
-            };
-            if update_status == 0 {
-                return Ok(());
+        match self.try_store_secret_in_tier(secret, MacosKeychainTier::DataProtection) {
+            Ok(MacosStoreOutcome::Stored) => Ok(()),
+            Ok(MacosStoreOutcome::Duplicate) => {
+                self.replace_secret_in_tier(secret, MacosKeychainTier::DataProtection)
             }
-            return Err(anyhow!(
-                "keychain update failed with status {}",
-                update_status
-            ));
+            Err(status) if status == ERR_SEC_MISSING_ENTITLEMENT => {
+                tracing::warn!(
+                    service = %self.service,
+                    account = %self.account,
+                    "macOS data-protection keychain insert lacks entitlement; falling back to the classic login keychain for this unentitled binary. iCloud Keychain sync will apply automatically in the signed desktop app."
+                );
+                match self.try_store_secret_in_tier(secret, MacosKeychainTier::Classic) {
+                    Ok(MacosStoreOutcome::Stored) => Ok(()),
+                    Ok(MacosStoreOutcome::Duplicate) => {
+                        self.replace_secret_in_tier(secret, MacosKeychainTier::Classic)
+                    }
+                    Err(status) => Err(anyhow!("keychain insert failed with status {}", status)),
+                }
+            }
+            Err(status) => Err(anyhow!("keychain insert failed with status {}", status)),
         }
-
-        Err(anyhow!("keychain insert failed with status {}", status))
     }
 
     fn delete_secret(&self) -> Result<()> {
-        let query = macos_delete_query(&self.service, &self.account);
+        self.delete_secret_in_tier(MacosKeychainTier::DataProtection)?;
+        self.delete_secret_in_tier(MacosKeychainTier::Classic)?;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl MacosKeychainProvider {
+    fn try_store_secret_in_tier(
+        &self,
+        secret: &[u8],
+        tier: MacosKeychainTier,
+    ) -> Result<MacosStoreOutcome, i32> {
+        let add_query = macos_add_query(&self.service, &self.account, secret, tier);
+        let status = unsafe { SecItemAdd(add_query.as_concrete_TypeRef(), std::ptr::null_mut()) };
+        match status {
+            0 => Ok(MacosStoreOutcome::Stored),
+            s if s == errSecDuplicateItem => Ok(MacosStoreOutcome::Duplicate),
+            s => Err(s),
+        }
+    }
+
+    fn replace_secret_in_tier(&self, secret: &[u8], tier: MacosKeychainTier) -> Result<()> {
+        self.delete_secret_in_tier(tier)?;
+        match self.try_store_secret_in_tier(secret, tier) {
+            Ok(MacosStoreOutcome::Stored) => Ok(()),
+            Ok(MacosStoreOutcome::Duplicate) => Err(anyhow!(
+                "keychain update failed with status {}",
+                errSecDuplicateItem
+            )),
+            Err(status) => Err(anyhow!("keychain insert failed with status {}", status)),
+        }
+    }
+
+    fn delete_secret_in_tier(&self, tier: MacosKeychainTier) -> Result<()> {
+        let query = macos_delete_query(&self.service, &self.account, tier);
         let status = unsafe { SecItemDelete(query.as_concrete_TypeRef()) };
         match status {
             0 => Ok(()),
             s if s == errSecItemNotFound => Ok(()),
+            s if s == ERR_SEC_MISSING_ENTITLEMENT => Ok(()),
+            s if s == ERR_SEC_NOT_AVAILABLE || s == ERR_SEC_NO_DEFAULT_KEYCHAIN => Ok(()),
             _ => Err(anyhow!("keychain delete failed with status {}", status)),
         }
     }
 }
 
 #[cfg(target_os = "macos")]
-fn macos_common_pairs(
-    service: &str,
-    account: &str,
-    synchronizable: CFType,
-) -> Vec<(CFString, CFType)> {
+fn macos_common_pairs(service: &str, account: &str) -> Vec<(CFString, CFType)> {
     vec![
         (
             unsafe { CFString::wrap_under_get_rule(kSecClass) },
@@ -867,18 +926,20 @@ fn macos_common_pairs(
             unsafe { CFString::wrap_under_get_rule(kSecAttrAccount) },
             CFString::from(account).into_CFType(),
         ),
-        (
-            unsafe { CFString::wrap_under_get_rule(kSecAttrSynchronizable) },
-            synchronizable,
-        ),
     ]
 }
 
 #[cfg(target_os = "macos")]
 fn macos_lookup_query(service: &str, account: &str) -> CFDictionary<CFString, CFType> {
-    let mut pairs = macos_common_pairs(service, account, unsafe {
-        CFString::wrap_under_get_rule(kSecAttrSynchronizableAny).into_CFType()
-    });
+    let mut pairs = macos_common_pairs(service, account);
+    pairs.push((
+        unsafe { CFString::wrap_under_get_rule(kSecUseAuthenticationUI) },
+        unsafe { CFString::wrap_under_get_rule(kSecUseAuthenticationUISkip).into_CFType() },
+    ));
+    pairs.push((
+        unsafe { CFString::wrap_under_get_rule(kSecAttrSynchronizable) },
+        unsafe { CFString::wrap_under_get_rule(kSecAttrSynchronizableAny).into_CFType() },
+    ));
     pairs.push((
         unsafe { CFString::wrap_under_get_rule(kSecReturnData) },
         CFBoolean::true_value().into_CFType(),
@@ -887,16 +948,25 @@ fn macos_lookup_query(service: &str, account: &str) -> CFDictionary<CFString, CF
 }
 
 #[cfg(target_os = "macos")]
-fn macos_delete_query(service: &str, account: &str) -> CFDictionary<CFString, CFType> {
-    let pairs = macos_common_pairs(service, account, unsafe {
-        CFString::wrap_under_get_rule(kSecAttrSynchronizableAny).into_CFType()
-    });
+fn macos_delete_query(
+    service: &str,
+    account: &str,
+    tier: MacosKeychainTier,
+) -> CFDictionary<CFString, CFType> {
+    let mut pairs = macos_common_pairs(service, account);
+    if let Some(synchronizable) = tier.synchronizable() {
+        pairs.push((
+            unsafe { CFString::wrap_under_get_rule(kSecAttrSynchronizable) },
+            synchronizable,
+        ));
+    }
+    if tier.uses_data_protection_keychain() {
+        pairs.push((
+            unsafe { CFString::wrap_under_get_rule(kSecUseDataProtectionKeychain) },
+            CFBoolean::true_value().into_CFType(),
+        ));
+    }
     CFDictionary::from_CFType_pairs(&pairs)
-}
-
-#[cfg(target_os = "macos")]
-fn macos_update_query(service: &str, account: &str) -> CFDictionary<CFString, CFType> {
-    macos_delete_query(service, account)
 }
 
 #[cfg(target_os = "macos")]
@@ -904,27 +974,27 @@ fn macos_add_query(
     service: &str,
     account: &str,
     secret: &[u8],
-) -> Result<CFDictionary<CFString, CFType>> {
-    let mut pairs = macos_common_pairs(service, account, CFBoolean::true_value().into_CFType());
-    pairs.push((
-        unsafe { CFString::wrap_under_get_rule(kSecAttrAccessible) },
-        unsafe {
-            CFString::wrap_under_get_rule(
-                security_framework_sys::access_control::kSecAttrAccessibleAfterFirstUnlock,
-            )
-            .into_CFType()
-        },
-    ));
-    pairs.push((
-        unsafe { CFString::wrap_under_get_rule(kSecUseDataProtectionKeychain) },
-        CFBoolean::true_value().into_CFType(),
-    ));
+    tier: MacosKeychainTier,
+) -> CFDictionary<CFString, CFType> {
+    let mut pairs = macos_common_pairs(service, account);
+    if let Some(synchronizable) = tier.synchronizable() {
+        pairs.push((
+            unsafe { CFString::wrap_under_get_rule(kSecAttrSynchronizable) },
+            synchronizable,
+        ));
+    }
+    if tier.uses_data_protection_keychain() {
+        pairs.push((
+            unsafe { CFString::wrap_under_get_rule(kSecUseDataProtectionKeychain) },
+            CFBoolean::true_value().into_CFType(),
+        ));
+    }
     pairs.push((
         unsafe { CFString::wrap_under_get_rule(kSecValueData) },
         CFData::from_buffer(secret).into_CFType(),
     ));
 
-    Ok(CFDictionary::from_CFType_pairs(&pairs))
+    CFDictionary::from_CFType_pairs(&pairs)
 }
 
 #[cfg(target_os = "macos")]
@@ -995,6 +1065,11 @@ mod tests {
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::test_support::env_lock()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn is_no_keychain_error(rendered: &str) -> bool {
+        rendered.contains("-25291") || rendered.contains("-25307")
     }
 
     fn encode_env_secret(secret: &[u8]) -> String {
@@ -1094,13 +1169,7 @@ mod tests {
             Ok(state) => state,
             Err(err) => {
                 let rendered = format!("{err:#}");
-                if cfg!(target_os = "macos")
-                    && (rendered.contains("keychain")
-                        || rendered.contains("SecItem")
-                        || rendered.contains("-34018")
-                        || rendered.contains("-50")
-                        || rendered.contains("entitlement"))
-                {
+                if cfg!(target_os = "macos") && is_no_keychain_error(&rendered) {
                     return;
                 }
                 panic!("provider-backed first run failed: {rendered}");
@@ -1129,6 +1198,16 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    struct KeychainCleanup<'a>(&'a MacosKeychainProvider);
+
+    #[cfg(target_os = "macos")]
+    impl Drop for KeychainCleanup<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.delete_secret();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn keychain_roundtrip_uses_namespaced_item_and_deletes_it() {
         let temp = tempdir().unwrap();
@@ -1138,35 +1217,25 @@ mod tests {
             account: keychain_account(temp.path()),
         };
         let secret = [9u8; FILE_KEY_LEN];
+        let _cleanup = KeychainCleanup(&provider);
 
         let _ = provider.delete_secret();
-        let store = provider.store_secret(&secret);
-        match store {
-            Ok(()) => {
-                let loaded = provider.load_secret().unwrap().unwrap();
-                assert_eq!(loaded, secret);
-                provider.delete_secret().unwrap();
-                assert!(provider.load_secret().unwrap().is_none());
-            }
+        match provider.store_secret(&secret) {
+            Ok(()) => {}
             Err(err) => {
                 let rendered = format!("{err:#}");
-                let skip_hints = [
-                    "-25294",
-                    "-25300",
-                    "-25308",
-                    "-25291",
-                    "-50",
-                    "-34018",
-                    "errSec",
-                    "entitlement",
-                ];
-                if std::env::var_os("CI").is_some()
-                    || skip_hints.iter().any(|hint| rendered.contains(hint))
-                {
+                if is_no_keychain_error(&rendered) {
                     return;
                 }
                 panic!("keychain roundtrip failed: {rendered}");
             }
         }
+
+        let loaded = provider.load_secret().unwrap().unwrap();
+        assert_eq!(loaded, secret);
+
+        provider.delete_secret().unwrap();
+        assert!(provider.load_secret().unwrap().is_none());
     }
+
 }

@@ -11,7 +11,7 @@ use std::{
 };
 
 use crate::{
-    config::Config,
+    config::{Config, Keys},
     node_control::key_provider::{self, BackupResult},
 };
 
@@ -148,18 +148,27 @@ fn effective_config(paths: &ProfilePaths) -> Result<Config> {
     Ok(config)
 }
 
-fn identity_source_warnings(control_config: Option<&Value>) -> Vec<String> {
+fn identity_source_warnings(paths: &ProfilePaths, control_config: Option<&Value>) -> Vec<String> {
     let mut warnings = Vec::new();
-    if let Some(config) = control_config {
-        let backend = config
-            .get("config")
-            .and_then(|config| config.get("keyProvider"))
-            .and_then(|key_provider| key_provider.get("backend"))
-            .and_then(|backend| backend.as_str());
-        if matches!(backend, Some("static")) {
-            warnings.push("legacy static key source is deprecated for desktop installs".into());
-        }
-    } else if std::env::var_os("TINYCLOUD_KEYS_SECRET").is_some() {
+    let static_source = match control_config {
+        Some(config) => matches!(
+            config
+                .get("config")
+                .and_then(|config| config.get("keyProvider"))
+                .and_then(|key_provider| key_provider.get("backend"))
+                .and_then(|backend| backend.as_str()),
+            Some("static")
+        ),
+        None => effective_config(paths)
+            .ok()
+            .and_then(|config| match config.keys {
+                Some(Keys::Static(_)) => Some(true),
+                _ => None,
+            })
+            .unwrap_or(false),
+    };
+
+    if static_source {
         warnings.push("legacy static key source is deprecated for desktop installs".into());
     }
     warnings
@@ -280,9 +289,8 @@ pub fn node_doctor() -> Result<DoctorReport> {
         .map(|session| session.get_json("/v1/config"));
     let mut checks = Vec::new();
     let warnings = identity_source_warnings(
-        control_config
-            .as_ref()
-            .and_then(|result| result.as_ref().ok()),
+        &paths,
+        control_config.as_ref().and_then(|result| result.as_ref().ok()),
     );
 
     checks.push(check_service_install(&paths, manifest.as_ref()));
@@ -1443,6 +1451,21 @@ mod tests {
         crate::test_support::env_lock()
     }
 
+    fn clear_keys_env() -> (EnvGuard, EnvGuard, EnvGuard, EnvGuard, EnvGuard) {
+        (
+            EnvGuard::unset("TINYCLOUD_KEYS"),
+            EnvGuard::unset("TINYCLOUD_KEYS_TYPE"),
+            EnvGuard::unset("TINYCLOUD_KEYS__TYPE"),
+            EnvGuard::unset("TINYCLOUD_KEYS_SECRET"),
+            EnvGuard::unset("TINYCLOUD_KEYS__SECRET"),
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn is_no_keychain_error(rendered: &str) -> bool {
+        rendered.contains("-25291") || rendered.contains("-25307")
+    }
+
     fn create_provider_identity(paths: &ProfilePaths) -> bool {
         match key_provider::resolve_identity_state(
             Some(&crate::config::Keys::Provider),
@@ -1454,8 +1477,7 @@ mod tests {
                 let rendered = format!("{err:#}");
                 #[cfg(target_os = "macos")]
                 {
-                    let skip_hints = ["keychain", "SecItem", "-34018", "-50", "entitlement"];
-                    if skip_hints.iter().any(|hint| rendered.contains(hint)) {
+                    if is_no_keychain_error(&rendered) {
                         return false;
                     }
                 }
@@ -1571,7 +1593,7 @@ mod tests {
         fs::create_dir_all(&data).unwrap();
         let _storage_legacy = EnvGuard::unset("TINYCLOUD_STORAGE_DATADIR");
         let _storage_canonical = EnvGuard::unset("TINYCLOUD_STORAGE__DATADIR");
-        let _keys_secret = EnvGuard::unset("TINYCLOUD_KEYS_SECRET");
+        let _keys_env = clear_keys_env();
         let _address = EnvGuard::unset("TINYCLOUD_ADDRESS");
         let _port = EnvGuard::unset("TINYCLOUD_PORT");
         let _rocket_address = EnvGuard::unset("ROCKET_ADDRESS");
@@ -1600,7 +1622,7 @@ mod tests {
         let _config_root = EnvGuard::set("TINYCLOUD_NODE_CONFIG_ROOT", temp.path());
         let _storage_legacy = EnvGuard::unset("TINYCLOUD_STORAGE_DATADIR");
         let _storage_canonical = EnvGuard::unset("TINYCLOUD_STORAGE__DATADIR");
-        let _keys_secret = EnvGuard::unset("TINYCLOUD_KEYS_SECRET");
+        let _keys_env = clear_keys_env();
         let _address = EnvGuard::unset("TINYCLOUD_ADDRESS");
         let _port = EnvGuard::unset("TINYCLOUD_PORT");
         let _rocket_address = EnvGuard::unset("ROCKET_ADDRESS");
@@ -1668,7 +1690,7 @@ esac
     fn node_identity_body_requires_control_session() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
-        let _keys_secret = EnvGuard::unset("TINYCLOUD_KEYS_SECRET");
+        let _keys_env = clear_keys_env();
 
         #[cfg(target_os = "macos")]
         let _config_root = EnvGuard::set("TINYCLOUD_NODE_CONFIG_ROOT", temp.path());
@@ -1710,7 +1732,7 @@ esac
     fn node_doctor_does_not_use_local_identity_without_control() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
-        let _keys_secret = EnvGuard::unset("TINYCLOUD_KEYS_SECRET");
+        let _keys_env = clear_keys_env();
 
         #[cfg(target_os = "macos")]
         let _config_root = EnvGuard::set("TINYCLOUD_NODE_CONFIG_ROOT", temp.path());
@@ -1765,7 +1787,7 @@ esac
     fn service_status_does_not_use_local_identity_when_control_is_unavailable() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
-        let _keys_secret = EnvGuard::unset("TINYCLOUD_KEYS_SECRET");
+        let _keys_env = clear_keys_env();
 
         #[cfg(target_os = "macos")]
         let _config_root = EnvGuard::set("TINYCLOUD_NODE_CONFIG_ROOT", temp.path());
@@ -1886,7 +1908,7 @@ esac
         let _config_root = EnvGuard::set("TINYCLOUD_NODE_CONFIG_ROOT", temp.path());
         let _storage_legacy = EnvGuard::unset("TINYCLOUD_STORAGE_DATADIR");
         let _storage_canonical = EnvGuard::unset("TINYCLOUD_STORAGE__DATADIR");
-        let _keys_secret = EnvGuard::unset("TINYCLOUD_KEYS_SECRET");
+        let _keys_env = clear_keys_env();
         let _address = EnvGuard::unset("TINYCLOUD_ADDRESS");
         let _port = EnvGuard::unset("TINYCLOUD_PORT");
         let _rocket_address = EnvGuard::unset("ROCKET_ADDRESS");
@@ -1908,6 +1930,56 @@ esac
             .extract::<crate::config::Config>()
             .unwrap();
         assert_eq!(config.keys, Some(crate::config::Keys::Provider));
+    }
+
+    #[test]
+    fn node_doctor_warns_for_static_key_install_without_control() {
+        let _lock = env_lock();
+        let temp = tempdir().unwrap();
+        let _keys_env = clear_keys_env();
+
+        #[cfg(target_os = "macos")]
+        let _config_root = EnvGuard::set("TINYCLOUD_NODE_CONFIG_ROOT", temp.path());
+        #[cfg(target_os = "linux")]
+        let (_home, _config_home, _data_home, _state_home) = {
+            let home = temp.path().join("home");
+            let config_home = temp.path().join("config");
+            let data_home = temp.path().join("data");
+            let state_home = temp.path().join("state");
+            fs::create_dir_all(&home).unwrap();
+            fs::create_dir_all(&config_home).unwrap();
+            fs::create_dir_all(&data_home).unwrap();
+            fs::create_dir_all(&state_home).unwrap();
+            (
+                EnvGuard::set("HOME", &home),
+                EnvGuard::set("XDG_CONFIG_HOME", &config_home),
+                EnvGuard::set("XDG_DATA_HOME", &data_home),
+                EnvGuard::set("XDG_STATE_HOME", &state_home),
+            )
+        };
+
+        #[cfg(target_os = "macos")]
+        let profile = Profile::MacosUser;
+        #[cfg(target_os = "linux")]
+        let profile = Profile::LinuxUser;
+        let paths = profile.paths();
+        fs::create_dir_all(paths.config_path.parent().unwrap()).unwrap();
+        fs::write(
+            &paths.config_path,
+            format!(
+                "[global]\naddress = \"127.0.0.1\"\nport = 8081\nlog_level = \"normal\"\n\n[global.storage]\ndatadir = \"{}\"\n\n[global.keys]\ntype = \"static\"\nsecret = \"{}\"\n",
+                paths.data_root.display(),
+                base64::encode_config([7u8; 32], base64::URL_SAFE_NO_PAD)
+            ),
+        )
+        .unwrap();
+
+        let report = node_doctor().unwrap();
+
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning == "legacy static key source is deprecated for desktop installs"));
     }
 
     #[test]
