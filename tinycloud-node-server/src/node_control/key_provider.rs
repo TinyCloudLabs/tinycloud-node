@@ -38,8 +38,8 @@ use core_foundation_sys::base::{CFGetTypeID, CFRelease, CFTypeRef};
 use core_foundation_sys::string::CFStringRef;
 #[cfg(target_os = "macos")]
 use security_framework_sys::{
-    base::{errSecDuplicateItem, errSecItemNotFound},
     access_control::kSecAttrAccessibleAfterFirstUnlock,
+    base::{errSecDuplicateItem, errSecItemNotFound},
     item::{
         kSecAttrAccount, kSecAttrService, kSecAttrSynchronizable, kSecAttrSynchronizableAny,
         kSecClass, kSecClassGenericPassword, kSecReturnData, kSecUseAuthenticationUI,
@@ -168,6 +168,14 @@ enum MacosKeychainTier {
 enum MacosStoreOutcome {
     Stored,
     Duplicate,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+enum MacosLookupOutcome {
+    Found(Vec<u8>),
+    Missing,
+    EntitlementMissing,
 }
 
 #[cfg(target_os = "macos")]
@@ -831,26 +839,19 @@ impl KeyProvider for MacosKeychainProvider {
     }
 
     fn load_secret(&self) -> Result<Option<Vec<u8>>> {
-        let query = macos_lookup_query(&self.service, &self.account);
-        let mut result: CFTypeRef = std::ptr::null_mut();
-        let status = unsafe { SecItemCopyMatching(query.as_concrete_TypeRef(), &mut result) };
-        if status == errSecItemNotFound {
-            return Ok(None);
-        }
-        if status != 0 {
-            return Err(anyhow!("keychain lookup failed with status {}", status));
+        match self.load_secret_in_tier(MacosKeychainTier::DataProtection)? {
+            MacosLookupOutcome::Found(secret) => return validate_loaded_secret(secret),
+            MacosLookupOutcome::Missing | MacosLookupOutcome::EntitlementMissing => {}
         }
 
-        let secret = macos_copy_result_bytes(result)?;
-
-        if secret.len() < 32 {
-            bail!(
-                "stored identity secret must be at least 32 bytes, got {}",
-                secret.len()
-            );
+        match self.load_secret_in_tier(MacosKeychainTier::Classic)? {
+            MacosLookupOutcome::Found(secret) => validate_loaded_secret(secret),
+            MacosLookupOutcome::Missing => Ok(None),
+            MacosLookupOutcome::EntitlementMissing => Err(anyhow!(
+                "keychain lookup failed with status {}",
+                ERR_SEC_MISSING_ENTITLEMENT
+            )),
         }
-
-        Ok(Some(secret))
     }
 
     fn store_secret(&self, secret: &[u8]) -> Result<()> {
@@ -868,11 +869,6 @@ impl KeyProvider for MacosKeychainProvider {
             }
             Err(status) if status == ERR_SEC_MISSING_ENTITLEMENT => {
                 let warning = "macOS data-protection keychain insert lacks entitlement; falling back to the classic login keychain for this unentitled binary. iCloud Keychain sync will apply automatically in the signed desktop app.";
-                tracing::warn!(
-                    service = %self.service,
-                    account = %self.account,
-                    "{warning}"
-                );
                 eprintln!("warning: {warning}");
                 match self.try_store_secret_in_tier(secret, MacosKeychainTier::Classic) {
                     Ok(MacosStoreOutcome::Stored) => Ok(()),
@@ -895,6 +891,18 @@ impl KeyProvider for MacosKeychainProvider {
 
 #[cfg(target_os = "macos")]
 impl MacosKeychainProvider {
+    fn load_secret_in_tier(&self, tier: MacosKeychainTier) -> Result<MacosLookupOutcome> {
+        let query = macos_lookup_query(&self.service, &self.account, tier);
+        let mut result: CFTypeRef = std::ptr::null_mut();
+        let status = unsafe { SecItemCopyMatching(query.as_concrete_TypeRef(), &mut result) };
+        match status {
+            0 => Ok(MacosLookupOutcome::Found(macos_copy_result_bytes(result)?)),
+            s if s == errSecItemNotFound => Ok(MacosLookupOutcome::Missing),
+            s if s == ERR_SEC_MISSING_ENTITLEMENT => Ok(MacosLookupOutcome::EntitlementMissing),
+            s => Err(anyhow!("keychain lookup failed with status {}", s)),
+        }
+    }
+
     fn try_store_secret_in_tier(
         &self,
         secret: &[u8],
@@ -953,7 +961,11 @@ fn macos_common_pairs(service: &str, account: &str) -> Vec<(CFString, CFType)> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_lookup_query(service: &str, account: &str) -> CFDictionary<CFString, CFType> {
+fn macos_lookup_query(
+    service: &str,
+    account: &str,
+    tier: MacosKeychainTier,
+) -> CFDictionary<CFString, CFType> {
     let mut pairs = macos_common_pairs(service, account);
     pairs.push((
         unsafe { CFString::wrap_under_get_rule(kSecUseAuthenticationUI) },
@@ -967,6 +979,12 @@ fn macos_lookup_query(service: &str, account: &str) -> CFDictionary<CFString, CF
         unsafe { CFString::wrap_under_get_rule(kSecReturnData) },
         CFBoolean::true_value().into_CFType(),
     ));
+    if tier.uses_data_protection_keychain() {
+        pairs.push((
+            unsafe { CFString::wrap_under_get_rule(kSecUseDataProtectionKeychain) },
+            CFBoolean::true_value().into_CFType(),
+        ));
+    }
     CFDictionary::from_CFType_pairs(&pairs)
 }
 
@@ -1042,6 +1060,18 @@ fn macos_copy_result_bytes(result: CFTypeRef) -> Result<Vec<u8>> {
 
     let data = unsafe { CFData::wrap_under_create_rule(result as CFDataRef) };
     Ok(data.bytes().to_vec())
+}
+
+#[cfg(target_os = "macos")]
+fn validate_loaded_secret(secret: Vec<u8>) -> Result<Option<Vec<u8>>> {
+    if secret.len() < 32 {
+        bail!(
+            "stored identity secret must be at least 32 bytes, got {}",
+            secret.len()
+        );
+    }
+
+    Ok(Some(secret))
 }
 
 #[cfg(target_os = "macos")]
@@ -1280,5 +1310,4 @@ mod tests {
         provider.delete_secret().unwrap();
         assert!(provider.load_secret().unwrap().is_none());
     }
-
 }
