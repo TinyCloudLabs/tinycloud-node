@@ -237,6 +237,11 @@ jobs:
             printf 'CLOUDFLARE_API_TOKEN=%s\n' "$PHALA_ENV_CLOUDFLARE_API_TOKEN"
             printf 'DSTACK_GATEWAY_DOMAIN=%s\n' "$PHALA_ENV_DSTACK_GATEWAY_DOMAIN"
             printf 'CERTBOT_EMAIL=%s\n' "$PHALA_ENV_CERTBOT_EMAIL"
+            # SSH public keys authorized on the CVM (checked into the repo,
+            # see dstack-authorized-keys). The Phala Cloud pre-launch script
+            # writes DSTACK_AUTHORIZED_KEYS to /home/root/.ssh/authorized_keys
+            # at boot, enabling `phala ssh tinycloud-node`.
+            printf 'DSTACK_AUTHORIZED_KEYS=%s\n' "$(cat dstack-authorized-keys)"
           } > .phala-prod.env
 
           phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml -e .phala-prod.env --wait
