@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::{
     fs,
     io::{self, Write},
+    future::Future,
     path::PathBuf,
 };
 
@@ -106,13 +107,21 @@ struct BackupArgs {
     json: JsonArgs,
 }
 
-pub async fn run() -> Result<()> {
+pub fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        None => run_legacy_server().await,
-        Some(Commands::Serve(args)) => run_serve(args).await,
+        None => block_on(run_legacy_server()),
+        Some(Commands::Serve(args)) => block_on(run_serve(args)),
         Some(Commands::Node(args)) => run_node(args),
     }
+}
+
+fn block_on<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
+    rocket::tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime should build")
+        .block_on(future)
 }
 
 async fn run_legacy_server() -> Result<()> {

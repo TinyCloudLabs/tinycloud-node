@@ -1,10 +1,5 @@
 fn main() {
-    let runtime = rocket::tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime should build");
-
-    if let Err(e) = runtime.block_on(tinycloud::cli::run()) {
+    if let Err(e) = tinycloud::cli::run() {
         eprintln!("\n✗ tinycloud-node failed:\n");
         for cause in e.chain() {
             eprintln!("  {cause}");
@@ -59,9 +54,20 @@ mod tests {
             .expect("env lock should not be poisoned")
     }
 
+    fn clear_keys_env() -> (EnvVarGuard, EnvVarGuard, EnvVarGuard, EnvVarGuard, EnvVarGuard) {
+        (
+            EnvVarGuard::unset("TINYCLOUD_KEYS"),
+            EnvVarGuard::unset("TINYCLOUD_KEYS_TYPE"),
+            EnvVarGuard::unset("TINYCLOUD_KEYS__TYPE"),
+            EnvVarGuard::unset("TINYCLOUD_KEYS_SECRET"),
+            EnvVarGuard::unset("TINYCLOUD_KEYS__SECRET"),
+        )
+    }
+
     #[test]
     fn canonical_double_underscore_loads_hooks_max_ticket_ttl_seconds() {
         let _lock = lock_env();
+        let _keys_env = clear_keys_env();
         let _legacy = EnvVarGuard::unset("TINYCLOUD_HOOKS_MAX_TICKET_TTL_SECONDS");
         let _canonical = EnvVarGuard::set("TINYCLOUD_HOOKS__MAX_TICKET_TTL_SECONDS", "777");
 
@@ -75,6 +81,7 @@ mod tests {
     #[test]
     fn canonical_double_underscore_loads_storage_database() {
         let _lock = lock_env();
+        let _keys_env = clear_keys_env();
         let _legacy = EnvVarGuard::unset("TINYCLOUD_STORAGE_DATABASE");
         let _canonical = EnvVarGuard::set(
             "TINYCLOUD_STORAGE__DATABASE",
@@ -94,6 +101,7 @@ mod tests {
     #[test]
     fn telemetry_defaults_to_disabled() {
         let _lock = lock_env();
+        let _keys_env = clear_keys_env();
         let _legacy = EnvVarGuard::unset("TINYCLOUD_TELEMETRY_ENABLED");
         let _canonical = EnvVarGuard::unset("TINYCLOUD_TELEMETRY__ENABLED");
 
@@ -107,6 +115,7 @@ mod tests {
     #[test]
     fn canonical_double_underscore_loads_telemetry_enabled() {
         let _lock = lock_env();
+        let _keys_env = clear_keys_env();
         let _legacy = EnvVarGuard::unset("TINYCLOUD_TELEMETRY_ENABLED");
         let _canonical = EnvVarGuard::set("TINYCLOUD_TELEMETRY__ENABLED", "true");
 
@@ -120,6 +129,7 @@ mod tests {
     #[test]
     fn canonical_double_underscore_wins_for_storage_database_when_both_are_set() {
         let _lock = lock_env();
+        let _keys_env = clear_keys_env();
         let _legacy = EnvVarGuard::set("TINYCLOUD_STORAGE_DATABASE", "sqlite:/tmp/legacy.db");
         let _canonical =
             EnvVarGuard::set("TINYCLOUD_STORAGE__DATABASE", "sqlite:/tmp/canonical.db");
