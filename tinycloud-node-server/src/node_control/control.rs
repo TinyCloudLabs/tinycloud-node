@@ -10,7 +10,7 @@ use axum::{
 };
 use base64::encode_config;
 use rand::{rngs::OsRng, RngCore};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -384,7 +384,40 @@ struct ControlOverlayTracing {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ControlOverlayStorage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    limit: Option<rocket::data::ByteUnit>,
+    limit: Option<ControlOverlayLimit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ControlOverlayLimit {
+    /// TOML has no native `null`, so the overlay file stores `0` as the clear sentinel.
+    Clear,
+    Set(rocket::data::ByteUnit),
+}
+
+impl Serialize for ControlOverlayLimit {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Clear => serializer.serialize_u64(0),
+            Self::Set(value) => serializer.serialize_u64(value.as_u64()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ControlOverlayLimit {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u64::deserialize(deserializer)?;
+        if value == 0 {
+            Ok(Self::Clear)
+        } else {
+            Ok(Self::Set(rocket::data::ByteUnit::Byte(value)))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -427,6 +460,7 @@ pub struct ControlPlaneServer {
 }
 
 struct ControlPlaneInner {
+    profile: Profile,
     pid: u32,
     base_config_path: PathBuf,
     data_path: PathBuf,
@@ -488,6 +522,7 @@ pub async fn spawn_control_plane(
     }
 
     let inner = Arc::new(ControlPlaneInner {
+        profile,
         pid,
         base_config_path,
         data_path,
@@ -713,7 +748,7 @@ impl ControlPlaneHandle {
                 .get_or_insert_with(ControlOverlayStorage::default);
             if let Some(value) = storage.get("limitBytes") {
                 let new_value = parse_byte_unit_patch(value, "storage.limitBytes")?;
-                if entry.limit != Some(new_value) {
+                if entry.limit.as_ref() != Some(&new_value) {
                     overlay_changed = true;
                 }
                 entry.limit = Some(new_value);
@@ -955,7 +990,12 @@ impl ControlPlaneHandle {
 impl ControlPlaneInner {
     async fn write_runtime_files(&self) -> Result<()> {
         ensure_dir_mode(&self.runtime_dir, 0o700).await?;
-        write_private_text(&self.control_token_path, &self.token).await?;
+        write_private_text(
+            &self.control_token_path,
+            &self.token,
+            runtime_file_mode(self.profile),
+        )
+        .await?;
         let rendered = serde_json::to_string_pretty(&service::ControlManifest {
             contract_version: CONTROL_CONTRACT_VERSION.to_string(),
             host: self.control_addr.ip().to_string(),
@@ -963,7 +1003,12 @@ impl ControlPlaneInner {
             pid: Some(self.pid),
             token_path: self.control_token_path.display().to_string(),
         })?;
-        write_private_text(&self.control_json_path, &rendered).await?;
+        write_private_text(
+            &self.control_json_path,
+            &rendered,
+            runtime_file_mode(self.profile),
+        )
+        .await?;
         Ok(())
     }
 }
@@ -1321,20 +1366,21 @@ fn parse_byte_unit_or_default(
     }
 }
 
-fn parse_byte_unit_patch(value: &Value, path: &str) -> ControlResult<rocket::data::ByteUnit> {
+fn parse_byte_unit_patch(value: &Value, path: &str) -> ControlResult<ControlOverlayLimit> {
     match value {
-        Value::Null => Ok(rocket::data::ByteUnit::Byte(0)),
+        Value::Null => Ok(ControlOverlayLimit::Clear),
         Value::Number(number) => number
             .as_u64()
-            .map(rocket::data::ByteUnit::Byte)
+            .filter(|value| *value > 0)
+            .map(|value| ControlOverlayLimit::Set(rocket::data::ByteUnit::Byte(value)))
             .ok_or_else(|| {
                 ControlError::invalid_request(
-                    format!("field '{}' must be a non-negative integer or null", path),
+                    format!("field '{}' must be a positive integer or null", path),
                     json!({ "field": path }),
                 )
             }),
         _ => Err(ControlError::invalid_request(
-            format!("field '{}' must be a non-negative integer or null", path),
+            format!("field '{}' must be a positive integer or null", path),
             json!({ "field": path }),
         )),
     }
@@ -1523,7 +1569,7 @@ async fn write_overlay(path: &Path, overlay: &ControlOverlayFile) -> Result<()> 
         ensure_dir_mode(parent, 0o700).await?;
     }
     let rendered = toml::to_string_pretty(overlay)?;
-    write_private_text(path, &rendered).await
+    write_private_text(path, &rendered, 0o600).await
 }
 
 fn generate_token() -> String {
@@ -1549,11 +1595,11 @@ async fn ensure_dir_mode(path: &Path, mode: u32) -> Result<()> {
     Ok(())
 }
 
-async fn write_private_text(path: &Path, contents: &str) -> Result<()> {
+async fn write_private_text(path: &Path, contents: &str, mode: u32) -> Result<()> {
     tokio::fs::write(path, contents)
         .await
         .with_context(|| format!("failed to write {}", path.display()))?;
-    set_private_permissions(path).await?;
+    set_private_permissions(path, mode).await?;
     Ok(())
 }
 
@@ -1561,7 +1607,7 @@ async fn remove_if_exists(path: &Path) {
     let _ = tokio::fs::remove_file(path).await;
 }
 
-async fn set_private_permissions(path: &Path) -> Result<()> {
+async fn set_private_permissions(path: &Path, mode: u32) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1569,12 +1615,20 @@ async fn set_private_permissions(path: &Path) -> Result<()> {
             .await
             .with_context(|| format!("failed to stat {}", path.display()))?;
         let mut permissions = metadata.permissions();
-        permissions.set_mode(0o600);
+        permissions.set_mode(mode);
         tokio::fs::set_permissions(path, permissions)
             .await
             .with_context(|| format!("failed to set permissions on {}", path.display()))?;
     }
     Ok(())
+}
+
+fn runtime_file_mode(profile: Profile) -> u32 {
+    if matches!(profile, Profile::LinuxSystem) {
+        0o640
+    } else {
+        0o600
+    }
 }
 
 #[cfg(test)]
@@ -1814,6 +1868,13 @@ mod tests {
         assert!(!control_json.exists());
         assert!(!control_token.exists());
         drop(handle);
+    }
+
+    #[test]
+    fn runtime_file_modes_follow_the_install_profile() {
+        assert_eq!(runtime_file_mode(Profile::MacosUser), 0o600);
+        assert_eq!(runtime_file_mode(Profile::LinuxUser), 0o600);
+        assert_eq!(runtime_file_mode(Profile::LinuxSystem), 0o640);
     }
 
     #[tokio::test]
@@ -2182,6 +2243,24 @@ mod tests {
         assert!(overlay.contains("cors = false"));
         assert!(overlay.contains("limit = 20971520"));
         assert!(overlay.contains("rate_limit_per_minute = 77"));
+
+        let zero_limit = client
+            .patch(format!("{base_url}/v1/config"))
+            .bearer_auth(&token)
+            .json(&json!({
+                "storage": { "limitBytes": 0 }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(zero_limit.status(), reqwest::StatusCode::BAD_REQUEST);
+        let zero_limit_body = zero_limit.json::<Value>().await.unwrap();
+        assert_keys_exact(&zero_limit_body, &["contractVersion", "error"]);
+        assert_eq!(zero_limit_body["error"]["code"], "invalid_request");
+        assert_eq!(
+            zero_limit_body["error"]["details"]["field"],
+            "storage.limitBytes"
+        );
 
         let invalid = client
             .patch(format!("{base_url}/v1/config"))
