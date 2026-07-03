@@ -35,8 +35,11 @@ use core_foundation::{
 #[cfg(target_os = "macos")]
 use core_foundation_sys::base::{CFGetTypeID, CFRelease, CFTypeRef};
 #[cfg(target_os = "macos")]
+use core_foundation_sys::string::CFStringRef;
+#[cfg(target_os = "macos")]
 use security_framework_sys::{
     base::{errSecDuplicateItem, errSecItemNotFound},
+    access_control::kSecAttrAccessibleAfterFirstUnlock,
     item::{
         kSecAttrAccount, kSecAttrService, kSecAttrSynchronizable, kSecAttrSynchronizableAny,
         kSecClass, kSecClassGenericPassword, kSecReturnData, kSecUseAuthenticationUI,
@@ -44,6 +47,10 @@ use security_framework_sys::{
     },
     keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemDelete},
 };
+#[cfg(target_os = "macos")]
+extern "C" {
+    static kSecAttrAccessible: CFStringRef;
+}
 #[cfg(target_os = "macos")]
 use sha2::{Digest, Sha256};
 #[cfg(feature = "dstack")]
@@ -167,9 +174,17 @@ enum MacosStoreOutcome {
 impl MacosKeychainTier {
     fn synchronizable(self) -> Option<CFType> {
         match self {
-            MacosKeychainTier::DataProtection => {
-                Some(CFBoolean::true_value().into_CFType())
-            }
+            MacosKeychainTier::DataProtection => Some(CFBoolean::true_value().into_CFType()),
+            MacosKeychainTier::Classic => None,
+        }
+    }
+
+    fn accessible(self) -> Option<CFType> {
+        match self {
+            MacosKeychainTier::DataProtection => Some(
+                unsafe { CFString::wrap_under_get_rule(kSecAttrAccessibleAfterFirstUnlock) }
+                    .into_CFType(),
+            ),
             MacosKeychainTier::Classic => None,
         }
     }
@@ -205,22 +220,10 @@ pub fn resolve_identity_state(
                 .context("failed to load static identity secret from config")?;
             Ok(static_state(IdentitySourceKind::StaticConfig, secret))
         }
+        None | Some(Keys::Auto) => resolve_auto_state(data_root, purpose),
         Some(Keys::Provider) => resolve_provider_state(data_root, purpose),
         #[cfg(feature = "dstack")]
         Some(Keys::Dstack) => resolve_dstack_state(purpose),
-        None => match purpose {
-            IdentityPurpose::Serve => bail!(
-                "No key source configured. Set TINYCLOUD_KEYS_SECRET, configure [global.keys] type = \"provider\" for desktop installs, or configure [keys] in config."
-            ),
-            IdentityPurpose::Probe => Ok(identity_state(
-                IdentitySourceKind::Missing,
-                None,
-                None,
-                false,
-                false,
-            )),
-            IdentityPurpose::Backup => bail!("node identity is not ready"),
-        },
     }
 }
 
@@ -306,6 +309,24 @@ fn resolve_static_env_secret() -> Result<Option<StaticSecret>> {
 fn static_state(source: IdentitySourceKind, secret: StaticSecret) -> IdentityState {
     let node_did = secret.node_did();
     identity_state(source, Some(secret), Some(node_did), true, false)
+}
+
+fn resolve_auto_state(data_root: &Path, purpose: IdentityPurpose) -> Result<IdentityState> {
+    #[cfg(feature = "dstack")]
+    {
+        match env::var("TINYCLOUD_TEE_MODE").ok().as_deref() {
+            Some("dstack") => return resolve_dstack_state(purpose),
+            Some("off") => return resolve_provider_state(data_root, purpose),
+            _ => {
+                if crate::dstack::is_available() {
+                    ::tracing::info!("dstack socket detected, using TEE key derivation");
+                    return resolve_dstack_state(purpose);
+                }
+            }
+        }
+    }
+
+    resolve_provider_state(data_root, purpose)
 }
 
 #[cfg(feature = "dstack")]
@@ -523,10 +544,10 @@ fn encrypt_xchacha(
 ) -> Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new_from_slice(key)
         .context("xchacha20poly1305 key initialization failed")?;
-    let cipher_nonce: &XNonce = nonce.into();
+    let cipher_nonce = XNonce::from(*nonce);
     cipher
         .encrypt(
-            cipher_nonce,
+            &cipher_nonce,
             chacha20poly1305::aead::Payload {
                 msg: plaintext,
                 aad,
@@ -543,10 +564,10 @@ fn decrypt_xchacha(
 ) -> Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new_from_slice(key)
         .context("xchacha20poly1305 key initialization failed")?;
-    let cipher_nonce: &XNonce = nonce.into();
+    let cipher_nonce = XNonce::from(*nonce);
     cipher
         .decrypt(
-            cipher_nonce,
+            &cipher_nonce,
             chacha20poly1305::aead::Payload {
                 msg: ciphertext,
                 aad,
@@ -846,11 +867,13 @@ impl KeyProvider for MacosKeychainProvider {
                 self.replace_secret_in_tier(secret, MacosKeychainTier::DataProtection)
             }
             Err(status) if status == ERR_SEC_MISSING_ENTITLEMENT => {
+                let warning = "macOS data-protection keychain insert lacks entitlement; falling back to the classic login keychain for this unentitled binary. iCloud Keychain sync will apply automatically in the signed desktop app.";
                 tracing::warn!(
                     service = %self.service,
                     account = %self.account,
-                    "macOS data-protection keychain insert lacks entitlement; falling back to the classic login keychain for this unentitled binary. iCloud Keychain sync will apply automatically in the signed desktop app."
+                    "{warning}"
                 );
+                eprintln!("warning: {warning}");
                 match self.try_store_secret_in_tier(secret, MacosKeychainTier::Classic) {
                     Ok(MacosStoreOutcome::Stored) => Ok(()),
                     Ok(MacosStoreOutcome::Duplicate) => {
@@ -981,6 +1004,12 @@ fn macos_add_query(
         pairs.push((
             unsafe { CFString::wrap_under_get_rule(kSecAttrSynchronizable) },
             synchronizable,
+        ));
+    }
+    if let Some(accessible) = tier.accessible() {
+        pairs.push((
+            unsafe { CFString::wrap_under_get_rule(kSecAttrAccessible) },
+            accessible,
         ));
     }
     if tier.uses_data_protection_keychain() {
@@ -1128,13 +1157,27 @@ mod tests {
     }
 
     #[test]
-    fn first_run_generation_requires_provider_config() {
+    fn first_run_generation_uses_auto_provider_backend() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
         let _env = EnvGuard::unset(STATIC_ENV_KEY);
-        let err = resolve_identity_state(None, temp.path(), IdentityPurpose::Serve).unwrap_err();
-        let rendered = format!("{err:#}");
-        assert!(rendered.contains("No key source configured"));
+        let _tee_mode = EnvGuard::set("TINYCLOUD_TEE_MODE", "off");
+        let state = match resolve_identity_state(None, temp.path(), IdentityPurpose::Serve) {
+            Ok(state) => state,
+            Err(err) => {
+                let rendered = format!("{err:#}");
+                if cfg!(target_os = "macos") && is_no_keychain_error(&rendered) {
+                    return;
+                }
+                panic!("auto first run failed: {rendered}");
+            }
+        };
+
+        assert_eq!(state.source, IdentitySourceKind::Provider);
+        assert_eq!(state.backend, Some(default_provider_backend()));
+        assert!(state.identity_ready);
+        assert!(state.secret.is_some());
+        assert!(state.node_did.is_some());
     }
 
     #[test]

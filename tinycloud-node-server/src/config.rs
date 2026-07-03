@@ -135,10 +135,13 @@ pub enum Keys {
     #[serde(rename = "dstack", alias = "Dstack")]
     Dstack,
     #[serde(
+        rename = "auto",
+        alias = "Auto"
+    )]
+    Auto,
+    #[serde(
         rename = "provider",
-        alias = "Auto",
-        alias = "Provider",
-        alias = "auto"
+        alias = "Provider"
     )]
     Provider,
 }
