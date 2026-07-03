@@ -1489,6 +1489,25 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    struct KeychainCleanup(key_provider::MacosKeychainProvider);
+
+    #[cfg(target_os = "macos")]
+    impl KeychainCleanup {
+        fn for_paths(paths: &ProfilePaths) -> Self {
+            Self(key_provider::MacosKeychainProvider::new(&paths.data_root))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for KeychainCleanup {
+        fn drop(&mut self) {
+            use key_provider::KeyProvider as _;
+
+            let _ = self.0.delete_secret();
+        }
+    }
+
     fn write_script(dir: &Path, name: &str, body: &str) {
         let path = dir.join(name);
         fs::write(&path, body).unwrap();
@@ -1722,6 +1741,8 @@ esac
         let paths = profile.paths();
 
         write_bootstrap_config_if_absent(&paths).unwrap();
+        #[cfg(target_os = "macos")]
+        let _keychain_cleanup = KeychainCleanup::for_paths(&paths);
         if !create_provider_identity(&paths) {
             return;
         }
@@ -1764,6 +1785,8 @@ esac
         let paths = profile.paths();
 
         write_bootstrap_config_if_absent(&paths).unwrap();
+        #[cfg(target_os = "macos")]
+        let _keychain_cleanup = KeychainCleanup::for_paths(&paths);
         if !create_provider_identity(&paths) {
             return;
         }
@@ -1887,6 +1910,8 @@ esac
         };
         write_service_manifest(&paths.service_manifest_path, &manifest).unwrap();
 
+        #[cfg(target_os = "macos")]
+        let _keychain_cleanup = KeychainCleanup::for_paths(&paths);
         if !create_provider_identity(&paths) {
             return;
         }

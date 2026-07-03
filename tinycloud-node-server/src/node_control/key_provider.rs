@@ -1192,6 +1192,10 @@ mod tests {
         let temp = tempdir().unwrap();
         let _env = EnvGuard::unset(STATIC_ENV_KEY);
         let _tee_mode = EnvGuard::set("TINYCLOUD_TEE_MODE", "off");
+        #[cfg(target_os = "macos")]
+        let provider = MacosKeychainProvider::new(temp.path());
+        #[cfg(target_os = "macos")]
+        let _cleanup = KeychainCleanup(&provider);
         let state = match resolve_identity_state(None, temp.path(), IdentityPurpose::Serve) {
             Ok(state) => state,
             Err(err) => {

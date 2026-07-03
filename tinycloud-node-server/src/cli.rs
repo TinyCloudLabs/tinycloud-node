@@ -3,8 +3,8 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::Value;
 use std::{
     fs,
-    io::{self, Write},
     future::Future,
+    io::{self, Write},
     path::PathBuf,
 };
 

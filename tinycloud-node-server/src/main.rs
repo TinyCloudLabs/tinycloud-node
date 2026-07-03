@@ -54,7 +54,13 @@ mod tests {
             .expect("env lock should not be poisoned")
     }
 
-    fn clear_keys_env() -> (EnvVarGuard, EnvVarGuard, EnvVarGuard, EnvVarGuard, EnvVarGuard) {
+    fn clear_keys_env() -> (
+        EnvVarGuard,
+        EnvVarGuard,
+        EnvVarGuard,
+        EnvVarGuard,
+        EnvVarGuard,
+    ) {
         (
             EnvVarGuard::unset("TINYCLOUD_KEYS"),
             EnvVarGuard::unset("TINYCLOUD_KEYS_TYPE"),

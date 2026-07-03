@@ -352,13 +352,9 @@ mod test {
         let mut stage = tfs.stage(&space_id).await.unwrap();
         futures::io::copy(&mut &data[..], &mut stage).await.unwrap();
 
-        let hash = ImmutableWriteStore::<TempFileSystemStage>::persist(
-            &store,
-            &space_id,
-            stage,
-        )
-        .await
-        .unwrap();
+        let hash = ImmutableWriteStore::<TempFileSystemStage>::persist(&store, &space_id, stage)
+            .await
+            .unwrap();
 
         assert!(store.contains(&space_id, &hash).await.unwrap());
         assert_eq!(
@@ -385,6 +381,9 @@ mod test {
         assert_eq!(store.remove(&space_id, &hash).await.unwrap(), None);
         assert!(!store.contains(&space_id, &hash).await.unwrap());
         assert_eq!(store.total_size(&space_id).await.unwrap(), Some(0));
-        assert_eq!(store.read(&space_id, &hash).await.unwrap().map(|_| ()), None);
+        assert_eq!(
+            store.read(&space_id, &hash).await.unwrap().map(|_| ()),
+            None
+        );
     }
 }
