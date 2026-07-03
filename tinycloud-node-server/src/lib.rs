@@ -165,7 +165,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     ];
 
     let identity_state = key_provider::resolve_identity_state(
-        tinycloud_config.keys.as_ref(),
+        Some(&tinycloud_config.keys),
         &tinycloud_config.storage.datadir,
         IdentityPurpose::Serve,
     )?;

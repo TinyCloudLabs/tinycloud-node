@@ -10,7 +10,10 @@ use std::{
     time::Duration,
 };
 
-use crate::{config::Config, node_control::key_provider::{self, BackupResult}};
+use crate::{
+    config::Config,
+    node_control::key_provider::{self, BackupResult},
+};
 
 use super::paths::{
     dir_to_json_string, KeyBackend, LogMode, Manager, Platform, Profile, ProfilePaths,
@@ -159,7 +162,7 @@ fn identity_source_warnings(paths: &ProfilePaths, control_config: Option<&Value>
         None => {
             let file_static = effective_config(paths)
                 .ok()
-                .map(|config| matches!(config.keys, Some(crate::config::Keys::Static(_))))
+                .map(|config| matches!(config.keys, crate::config::Keys::Static(_)))
                 .unwrap_or(false);
             let env_static = std::env::var_os("TINYCLOUD_KEYS_SECRET").is_some();
             file_static || env_static
@@ -258,7 +261,7 @@ pub fn node_key_backup(passphrase: &[u8], output: Option<PathBuf>) -> Result<Bac
     let paths = installed_or_current_paths()?;
     let config = effective_config(&paths)?;
     key_provider::backup_identity(
-        config.keys.as_ref(),
+        Some(&config.keys),
         &config.storage.datadir,
         passphrase,
         output,
@@ -288,7 +291,9 @@ pub fn node_doctor() -> Result<DoctorReport> {
     let mut checks = Vec::new();
     let warnings = identity_source_warnings(
         &paths,
-        control_config.as_ref().and_then(|result| result.as_ref().ok()),
+        control_config
+            .as_ref()
+            .and_then(|result| result.as_ref().ok()),
     );
 
     checks.push(check_service_install(&paths, manifest.as_ref()));
@@ -1927,7 +1932,7 @@ esac
             .unwrap()
             .extract::<crate::config::Config>()
             .unwrap();
-        assert_eq!(config.keys, Some(crate::config::Keys::Provider));
+        assert_eq!(config.keys, crate::config::Keys::Provider);
     }
 
     #[test]
@@ -1974,10 +1979,9 @@ esac
 
         let report = node_doctor().unwrap();
 
-        assert!(report
-            .warnings
-            .iter()
-            .any(|warning| warning == "legacy static key source is deprecated for desktop installs"));
+        assert!(report.warnings.iter().any(
+            |warning| warning == "legacy static key source is deprecated for desktop installs"
+        ));
     }
 
     #[test]
@@ -2027,10 +2031,9 @@ esac
 
         let report = node_doctor().unwrap();
 
-        assert!(report
-            .warnings
-            .iter()
-            .any(|warning| warning == "legacy static key source is deprecated for desktop installs"));
+        assert!(report.warnings.iter().any(
+            |warning| warning == "legacy static key source is deprecated for desktop installs"
+        ));
     }
 
     #[test]

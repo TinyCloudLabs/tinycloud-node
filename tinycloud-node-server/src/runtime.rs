@@ -270,12 +270,14 @@ mod tests {
 
         let figment = serve_config_figment(&missing_config).unwrap();
         let rocket_cfg = figment.extract::<rocket::Config>().unwrap();
+        let cfg = figment.extract::<config::Config>().unwrap();
 
         assert_eq!(
             rocket_cfg.address,
             std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)
         );
         assert_eq!(rocket_cfg.port, 8081);
+        assert_eq!(cfg.keys, config::Keys::Auto);
     }
 
     #[test]
@@ -295,12 +297,14 @@ mod tests {
 
         let figment = legacy_config_figment();
         let rocket_cfg = figment.extract::<rocket::Config>().unwrap();
+        let cfg = figment.extract::<config::Config>().unwrap();
 
         assert_eq!(
             rocket_cfg.address,
             std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)
         );
         assert_eq!(rocket_cfg.port, 8081);
+        assert_eq!(cfg.keys, config::Keys::Auto);
     }
 
     #[cfg(feature = "dstack")]
@@ -325,7 +329,7 @@ mod tests {
         let figment = serve_config_figment(&missing_config).unwrap();
         let cfg = figment.extract::<config::Config>().unwrap();
 
-        assert_eq!(cfg.keys, Some(config::Keys::Dstack));
+        assert_eq!(cfg.keys, config::Keys::Dstack);
     }
 
     #[cfg(feature = "dstack")]
@@ -348,6 +352,6 @@ mod tests {
         let figment = legacy_config_figment();
         let cfg = figment.extract::<config::Config>().unwrap();
 
-        assert_eq!(cfg.keys, Some(config::Keys::Dstack));
+        assert_eq!(cfg.keys, config::Keys::Dstack);
     }
 }
