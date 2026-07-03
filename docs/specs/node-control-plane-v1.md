@@ -844,17 +844,17 @@ Source mapping:
 `state` is therefore manager-first, with live control health used as a
 consistency check instead of a separate source of truth.
 
-V0 transition: until TC-78 lands, the CLI treats an unavailable control probe
-as `controlApi: "unavailable"` and applies the 30-second grace window to
-distinguish `starting` from `running` instead of escalating the service to
-`error`.
+TC-78 resolves the v0 transition for the node control plane: the CLI now reads
+live control health, identity, and version data from the local control API when
+the node is serving. Older nodes that do not expose the control listener still
+fall back to the legacy `controlApi: "unavailable"` behavior so the transition
+remains compatible during mixed-version upgrades.
 
-During this transition, a manager-backed process with a missing or unreachable
-control listener remains `starting` while its age is under 30 seconds and then
-reports `running` with `controlApi: "unavailable"` after the grace window
-expires. This is a temporary TC-76/TC-78 bridge only; once TC-78 ships, the
-probe should map failed control health to `error` again when the live runtime
-cannot answer.
+If the control listener is genuinely not serving, a manager-backed process may
+still surface `controlApi: "unavailable"` while the CLI falls back to the
+existing grace-window behavior. Once a live control API is available, failed
+control health is reported as `error` instead of being masked by the v0
+transition path.
 
 ### 3.4 `tinycloud node status`
 
