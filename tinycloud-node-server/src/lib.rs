@@ -41,7 +41,10 @@ pub(crate) mod test_support {
 use config::{BlockStorage, Config, StagingStorage};
 use hooks::HookRuntime;
 use invocation_replay::InvocationReplayCache;
-use node_control::key_provider::{self, IdentityPurpose};
+use node_control::{
+    control::ControlPlaneHandle,
+    key_provider::{self, IdentityPurpose},
+};
 use quota::QuotaCache;
 use routes::{
     admin::{delete_quota, get_quota, list_quotas, set_quota},
@@ -119,10 +122,11 @@ impl From<BlockStage> for StagingStorage {
 
 pub type TinyCloud = SpaceDatabase<DatabaseConnection, BlockStores, StaticSecret>;
 
-pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
-    let mut tinycloud_config: Config = config.extract::<Config>()?;
-    tinycloud_config.storage.resolve();
-
+pub async fn app(
+    config: &Figment,
+    tinycloud_config: &Config,
+    control: Option<ControlPlaneHandle>,
+) -> Result<Rocket<Build>> {
     // Ensure local storage directories exist.
     // SQLite file paths and local dirs are resources the server owns — auto-create them.
     // Remote backends (Postgres, S3) are left alone; connection errors surface naturally.
@@ -169,6 +173,11 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         &tinycloud_config.storage.datadir,
         IdentityPurpose::Serve,
     )?;
+    if let Some(control) = control.as_ref() {
+        control
+            .set_identity_snapshot(key_provider::identity_snapshot(&identity_state))
+            .await;
+    }
     let key_setup = identity_state
         .secret
         .ok_or_else(|| anyhow::anyhow!("node identity is not ready"))?;
@@ -301,7 +310,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         .mount("/", routes)
         .attach(AdHoc::config::<Config>())
         .attach(tracing::TracingFairing {
-            header_name: tinycloud_config.log.tracing.traceheader,
+            header_name: tinycloud_config.log.tracing.traceheader.clone(),
         })
         .manage(tinycloud)
         .manage(sql_service);
@@ -317,6 +326,26 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         .manage(tee_context)
         .manage(encryption_service)
         .manage(tinycloud_config.storage.staging.open().await?);
+
+    let rocket = if let Some(control) = control {
+        let control_running = control.clone();
+        let control_stopping = control.clone();
+        rocket
+            .attach(AdHoc::on_liftoff("control-plane-running", move |_| {
+                let control = control_running.clone();
+                Box::pin(async move {
+                    control.mark_running();
+                })
+            }))
+            .attach(AdHoc::on_shutdown("control-plane-stopping", move |_| {
+                let control = control_stopping.clone();
+                Box::pin(async move {
+                    control.mark_stopping();
+                })
+            }))
+    } else {
+        rocket
+    };
 
     if tinycloud_config.cors {
         Ok(rocket.attach(AdHoc::on_response("CORS", |_, resp| {

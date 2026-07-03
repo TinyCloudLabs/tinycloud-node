@@ -329,6 +329,10 @@ impl Storage {
                 self.blocks = BlockConfig::B(FileSystemConfig::new(dir.join("blocks")));
             }
         }
+
+        if self.limit.map(|limit| limit.as_u64()) == Some(0) {
+            self.limit = None;
+        }
     }
 
     /// Get the database connection string. Panics if called before resolve().

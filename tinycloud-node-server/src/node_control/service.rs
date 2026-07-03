@@ -540,10 +540,8 @@ fn derive_state(
                         Some(ControlApiAnnotation::Unavailable),
                     );
                 }
-                // TC-78 will provide the live control listener; until then we
-                // report an available manager with an unavailable control API as running.
                 return (
-                    ServiceState::Running,
+                    ServiceState::Error,
                     Some(pid),
                     Some(ControlApiAnnotation::Unavailable),
                 );
@@ -922,7 +920,7 @@ fn default_public_api() -> PublicApi {
     }
 }
 
-fn public_api_from_config(config_path: impl AsRef<Path>) -> PublicApi {
+pub(crate) fn public_api_from_config(config_path: impl AsRef<Path>) -> PublicApi {
     let config_path = config_path.as_ref();
     let figment = match runtime::serve_config_figment(config_path) {
         Ok(figment) => figment,
@@ -2151,7 +2149,7 @@ printf '%s\n' "${FAKE_PS_AGE:-29}"
 
         let _age_30 = EnvGuard::set("FAKE_PS_AGE", "30");
         let (state, pid, control_api) = derive_state(&manifest, &paths, &unavailable);
-        assert_eq!(state, ServiceState::Running);
+        assert_eq!(state, ServiceState::Error);
         assert_eq!(pid, Some(4242));
         assert_eq!(control_api, Some(ControlApiAnnotation::Unavailable));
 

@@ -125,7 +125,8 @@ fn block_on<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
 }
 
 async fn run_legacy_server() -> Result<()> {
-    runtime::launch_with_figment(runtime::legacy_config_figment()).await
+    let config_path = std::env::current_dir()?.join("tinycloud.toml");
+    runtime::launch_with_figment(runtime::legacy_config_figment(), config_path).await
 }
 
 async fn run_serve(args: ServeArgs) -> Result<()> {
@@ -133,7 +134,12 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         .config
         .unwrap_or_else(|| runtime::serve_profile_config_path(Profile::default_for_host()));
     let figment = runtime::serve_config_figment(&config_path)?;
-    runtime::launch_with_figment(figment).await
+    let config_path = if config_path.is_absolute() {
+        config_path
+    } else {
+        std::env::current_dir()?.join(config_path)
+    };
+    runtime::launch_with_figment(figment, config_path).await
 }
 
 fn run_node(args: NodeArgs) -> Result<()> {

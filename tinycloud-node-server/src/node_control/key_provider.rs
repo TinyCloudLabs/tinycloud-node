@@ -58,9 +58,11 @@ use std::future::Future;
 
 use crate::{config::Keys, node_control::paths::KeyBackend};
 
+#[cfg(target_os = "macos")]
 use super::paths::SERVICE_LABEL;
 
 const STATIC_ENV_KEY: &str = "TINYCLOUD_KEYS_SECRET";
+#[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "xyz.tinycloud.node.identity";
 #[cfg(target_os = "macos")]
 const ERR_SEC_MISSING_ENTITLEMENT: i32 = -34018;

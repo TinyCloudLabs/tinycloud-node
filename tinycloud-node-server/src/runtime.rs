@@ -12,7 +12,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{app, config, node_control::paths::Profile, prometheus};
+use crate::{
+    app, config,
+    node_control::{
+        control::{self, ControlPlaneServer},
+        paths::Profile,
+    },
+    prometheus,
+};
 
 fn with_serve_env(figment: rocket::figment::Figment) -> rocket::figment::Figment {
     figment
@@ -67,9 +74,19 @@ pub fn serve_config_figment(base_config_path: &Path) -> Result<rocket::figment::
     Ok(with_serve_env(figment))
 }
 
-pub async fn launch_with_figment(figment: rocket::figment::Figment) -> Result<()> {
-    let tinycloud_config = figment.extract::<config::Config>()?;
-    let rocket = match app(&figment).await {
+pub async fn launch_with_figment(
+    figment: rocket::figment::Figment,
+    base_config_path: PathBuf,
+) -> Result<()> {
+    let mut tinycloud_config = figment.extract::<config::Config>()?;
+    tinycloud_config.storage.resolve();
+    let control = control::spawn_control_plane(
+        &tinycloud_config,
+        base_config_path,
+        Profile::default_for_host(),
+    )
+    .await?;
+    let rocket = match app(&figment, &tinycloud_config, Some(control.handle())).await {
         Ok(r) => r.ignite().await?,
         Err(e) => {
             eprintln!("\n✗ Failed to start tinycloud-node:\n");
@@ -77,6 +94,7 @@ pub async fn launch_with_figment(figment: rocket::figment::Figment) -> Result<()
                 eprintln!("  {cause}");
             }
             eprintln!("\nCheck your tinycloud.toml or TINYCLOUD_ environment variables.");
+            let _ = control.shutdown().await;
             std::process::exit(1);
         }
     };
@@ -85,6 +103,7 @@ pub async fn launch_with_figment(figment: rocket::figment::Figment) -> Result<()
         rocket,
         tinycloud_config.telemetry.enabled,
         tinycloud_config.prometheus.port,
+        control,
     )
     .await
 }
@@ -93,34 +112,43 @@ async fn launch_rocket(
     rocket: rocket::Rocket<rocket::Ignite>,
     telemetry_enabled: bool,
     prometheus_port: u16,
+    control: ControlPlaneServer,
 ) -> Result<()> {
     let shutdown = rocket.shutdown();
+    let control_for_signal = control.handle();
 
     tokio::spawn(async move {
-        wait_for_shutdown_signal().await;
-        shutdown.notify();
+        wait_for_shutdown_signal(control_for_signal, shutdown).await;
     });
 
-    if telemetry_enabled {
+    let launch_result = if telemetry_enabled {
         let prom_addr = (rocket.config().address, prometheus_port).into();
         let prometheus = Server::bind(&prom_addr).serve(make_service_fn(|_| async {
             Ok::<_, hyper::Error>(service_fn(prometheus::serve_req))
         }));
 
         tokio::select! {
-            r = rocket.launch() => {
-                r?;
-            },
-            r = prometheus => r?,
-        };
+            r = rocket.launch() => r.context("rocket launch failed").map(|_| ()),
+            r = prometheus => r.context("prometheus listener failed").map(|_| ()),
+        }
     } else {
-        rocket.launch().await?;
-    }
+        rocket
+            .launch()
+            .await
+            .context("rocket launch failed")
+            .map(|_| ())
+    };
+
+    control.shutdown().await?;
+    launch_result?;
 
     Ok(())
 }
 
-async fn wait_for_shutdown_signal() {
+async fn wait_for_shutdown_signal(
+    control: control::ControlPlaneHandle,
+    shutdown: rocket::Shutdown,
+) {
     #[cfg(unix)]
     {
         use rocket::tokio::signal::unix::{signal, SignalKind};
@@ -137,6 +165,9 @@ async fn wait_for_shutdown_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+
+    control.mark_stopping();
+    shutdown.notify();
 }
 
 pub fn serve_profile_config_path(profile: Profile) -> PathBuf {
