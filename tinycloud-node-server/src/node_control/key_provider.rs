@@ -1126,7 +1126,9 @@ mod tests {
         crate::test_support::env_lock()
     }
 
-    #[cfg(target_os = "macos")]
+    // Matches macOS Security framework "no keychain available" status codes.
+    // Defined unconditionally so runtime `cfg!(target_os = "macos")` call sites
+    // compile on all platforms.
     fn is_no_keychain_error(rendered: &str) -> bool {
         rendered.contains("-25291") || rendered.contains("-25307")
     }
