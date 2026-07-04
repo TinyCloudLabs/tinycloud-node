@@ -848,7 +848,8 @@ TC-78 resolves the v0 transition for the node control plane: the CLI now reads
 live control health, identity, and version data from the local control API when
 the node is serving. Older nodes that do not expose the control listener still
 fall back to the legacy `controlApi: "unavailable"` behavior so the transition
-remains compatible during mixed-version upgrades.
+remains compatible during mixed-version upgrades, and managers may continue to
+surface that annotation while the CLI uses the existing grace-window behavior.
 
 If the control listener is genuinely not serving, a manager-backed process may
 still surface `controlApi: "unavailable"` while the CLI falls back to the

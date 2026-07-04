@@ -42,7 +42,6 @@ use crate::{
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PUBLIC_PROTOCOL_VERSION: u32 = tinycloud_auth::protocol::PROTOCOL_VERSION;
-const LOG_SOURCE: &str = "stdout";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControlRuntimeState {
@@ -926,6 +925,7 @@ impl ControlPlaneHandle {
     }
 
     async fn logs_tail(&self, query: LogsTailQuery) -> ControlResult<ControlLogsTailResponse> {
+        let log_source = log_source_name(self.inner.log_mode);
         let lines = match query.lines.unwrap_or(200) {
             0 => {
                 return Err(ControlError::invalid_request(
@@ -943,12 +943,7 @@ impl ControlPlaneHandle {
         };
 
         let cursor = if let Some(cursor) = query.cursor {
-            Some(cursor.parse::<u64>().map_err(|_| {
-                ControlError::invalid_request(
-                    "field 'cursor' must be an opaque log cursor string",
-                    json!({ "field": "cursor" }),
-                )
-            })?)
+            Some(parse_log_cursor(self.inner.log_mode, &cursor)?)
         } else {
             None
         };
@@ -972,8 +967,8 @@ impl ControlPlaneHandle {
         let (entries, cursor) = LogBuffer::global().tail(lines, cursor, since);
         Ok(ControlLogsTailResponse {
             contract_version: CONTROL_CONTRACT_VERSION,
-            source: LOG_SOURCE.to_string(),
-            cursor,
+            source: log_source.to_string(),
+            cursor: cursor.map(|cursor| encode_log_cursor(self.inner.log_mode, cursor)),
             entries,
         })
     }
@@ -1022,8 +1017,11 @@ fn build_router(handle: Arc<ControlPlaneInner>) -> Router {
         .route("/v1/config", get(get_config).patch(patch_config))
         .route("/v1/logs/tail", get(get_logs_tail))
         .fallback(not_found)
-        .with_state(state.clone())
-        .route_layer(middleware::from_fn_with_state(state, auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
+        .with_state(state)
 }
 
 async fn auth_middleware(
@@ -1234,6 +1232,37 @@ fn tee_mode_string(mode: &config::TeeMode) -> String {
         config::TeeMode::Dstack => "dstack".to_string(),
         config::TeeMode::Off => "off".to_string(),
     }
+}
+
+fn log_source_name(log_mode: LogMode) -> &'static str {
+    match log_mode {
+        LogMode::File => "file",
+        LogMode::Journald => "journald",
+        LogMode::Stdout => "stdout",
+    }
+}
+
+fn encode_log_cursor(log_mode: LogMode, cursor: String) -> String {
+    match log_mode {
+        LogMode::File => format!("file:{cursor}"),
+        LogMode::Journald => format!("journald:{cursor}"),
+        LogMode::Stdout => cursor,
+    }
+}
+
+fn parse_log_cursor(log_mode: LogMode, cursor: &str) -> ControlResult<u64> {
+    let rendered = match log_mode {
+        LogMode::File => cursor.strip_prefix("file:").unwrap_or(cursor),
+        LogMode::Journald => cursor.strip_prefix("journald:").unwrap_or(cursor),
+        LogMode::Stdout => cursor,
+    };
+
+    rendered.parse::<u64>().map_err(|_| {
+        ControlError::invalid_request(
+            "field 'cursor' must be an opaque log cursor string",
+            json!({ "field": "cursor" }),
+        )
+    })
 }
 
 fn database_backend_kind(database: &str) -> String {
@@ -1927,6 +1956,15 @@ mod tests {
         let wrong_token = wrong_token.json::<Value>().await.unwrap();
         assert_eq!(wrong_token["error"]["code"], "invalid_token");
 
+        let unknown_path = client
+            .get(format!("{base_url}/v1/does-not-exist"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unknown_path.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let unknown_path = unknown_path.json::<Value>().await.unwrap();
+        assert_eq!(unknown_path["error"]["code"], "invalid_token");
+
         let (status_code, status_body) =
             json_response(&client, &base_url, None, "/v1/status").await;
         assert_eq!(status_code, reqwest::StatusCode::UNAUTHORIZED);
@@ -2123,7 +2161,10 @@ mod tests {
             json_response(&client, &base_url, Some(&token), "/v1/logs/tail?lines=1").await;
         assert_keys_exact(&tail, &["contractVersion", "source", "cursor", "entries"]);
         assert_eq!(tail["contractVersion"], CONTROL_CONTRACT_VERSION);
-        assert_eq!(tail["source"], "stdout");
+        assert_eq!(
+            tail["source"],
+            serde_json::to_value(setup.profile.log_mode()).unwrap()
+        );
         assert_eq!(tail["entries"].as_array().unwrap().len(), 1);
         assert_keys_exact(
             tail["entries"].as_array().unwrap().first().unwrap(),
@@ -2139,7 +2180,10 @@ mod tests {
             &format!("/v1/logs/tail?lines=2000&cursor={cursor}"),
         )
         .await;
-        assert_eq!(tail_next["source"], "stdout");
+        assert_eq!(
+            tail_next["source"],
+            serde_json::to_value(setup.profile.log_mode()).unwrap()
+        );
         assert_keys_exact(
             &tail_next,
             &["contractVersion", "source", "cursor", "entries"],
@@ -2243,6 +2287,35 @@ mod tests {
         assert!(overlay.contains("cors = false"));
         assert!(overlay.contains("limit = 20971520"));
         assert!(overlay.contains("rate_limit_per_minute = 77"));
+
+        let clear_limit = client
+            .patch(format!("{base_url}/v1/config"))
+            .bearer_auth(&token)
+            .json(&json!({
+                "storage": { "limitBytes": null }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(clear_limit.status(), reqwest::StatusCode::OK);
+        let clear_limit = clear_limit.json::<Value>().await.unwrap();
+        assert_keys_exact(
+            &clear_limit,
+            &[
+                "contractVersion",
+                "baseConfigPath",
+                "overlayPath",
+                "restartRequired",
+                "appliedPaths",
+                "config",
+            ],
+        );
+        assert!(clear_limit["appliedPaths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "storage.limitBytes"));
+        assert!(clear_limit["config"]["storage"]["limitBytes"].is_null());
 
         let zero_limit = client
             .patch(format!("{base_url}/v1/config"))
