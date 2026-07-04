@@ -16,8 +16,8 @@ use crate::{
 };
 
 use super::paths::{
-    dir_to_json_string, KeyBackend, LogMode, Manager, Platform, Profile, ProfilePaths,
-    CONTROL_CONTRACT_VERSION, SERVICE_LABEL,
+    dir_to_json_string, systemd_system_group_gid, KeyBackend, LogMode, Manager, Platform, Profile,
+    ProfilePaths, CONTROL_CONTRACT_VERSION, SERVICE_LABEL, SYSTEMD_SYSTEM_GROUP,
 };
 
 const NODE_BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1121,6 +1121,11 @@ fn systemd_unit(
     } else {
         "default.target"
     };
+    let credentials = if matches!(manager, Manager::SystemdSystem) {
+        format!("User=root\nGroup={SYSTEMD_SYSTEM_GROUP}\n")
+    } else {
+        String::new()
+    };
     let logging = if matches!(manager, Manager::SystemdSystem) {
         "StandardOutput=journal\nStandardError=journal\n".to_string()
     } else {
@@ -1129,9 +1134,10 @@ fn systemd_unit(
         format!("StandardOutput=append:{stdout}\nStandardError=append:{stderr}\n")
     };
     format!(
-        "[Unit]\nDescription=TinyCloud Node\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart={} serve --config {}\nRestart=on-failure\n{}\n[Install]\nWantedBy={}\n",
+        "[Unit]\nDescription=TinyCloud Node\nAfter=network-online.target\n\n[Service]\nType=simple\nExecStart={} serve --config {}\nRestart=on-failure\n{}{}\n[Install]\nWantedBy={}\n",
         shell_quote(&executable.display().to_string()),
         shell_quote(&config_path.display().to_string()),
+        credentials,
         logging,
         wanted_by,
     )
@@ -1383,7 +1389,11 @@ fn token_permissions_ok(paths: &ProfilePaths, manifest: Option<&ServiceManifest>
             .map(|manifest| manifest.manager)
             .unwrap_or(paths.manager)
         {
-            Manager::SystemdSystem => mode == 0o640 && metadata.uid() == 0,
+            Manager::SystemdSystem => {
+                mode == 0o640
+                    && metadata.uid() == 0
+                    && metadata.gid() == systemd_system_group_gid().unwrap_or(u32::MAX)
+            }
             _ => mode == 0o600,
         }
     }
@@ -2197,6 +2207,22 @@ printf '%s\n' "${FAKE_PS_AGE:-29}"
         assert!(unit.contains(
             "StandardError=append:/Users/me/Library/Logs/TinyCloud Node/tinycloud.err.log"
         ));
+    }
+
+    #[test]
+    fn systemd_system_unit_uses_root_tinycloud_credentials() {
+        let unit = systemd_unit(
+            Path::new("/usr/bin/tinycloud"),
+            Path::new("/etc/tinycloud-node/tinycloud.toml"),
+            Path::new("journald"),
+            Path::new("journald"),
+            Manager::SystemdSystem,
+        );
+
+        assert!(unit.contains("User=root"));
+        assert!(unit.contains("Group=tinycloud"));
+        assert!(unit.contains("StandardOutput=journal"));
+        assert!(unit.contains("StandardError=journal"));
     }
 
     #[test]

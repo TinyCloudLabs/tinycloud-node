@@ -6,6 +6,7 @@ use std::{
 
 pub const SERVICE_LABEL: &str = "xyz.tinycloud.node";
 pub const CONTROL_CONTRACT_VERSION: &str = "1.0.0";
+pub const SYSTEMD_SYSTEM_GROUP: &str = "tinycloud";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -288,6 +289,36 @@ fn effective_uid() -> u32 {
     {
         1
     }
+}
+
+#[cfg(unix)]
+pub fn systemd_system_group_gid() -> Option<u32> {
+    use std::{ffi::CString, mem::MaybeUninit, ptr};
+
+    let name = CString::new(SYSTEMD_SYSTEM_GROUP).ok()?;
+    let mut result: *mut libc::group = ptr::null_mut();
+    let mut group = MaybeUninit::<libc::group>::zeroed();
+    let mut buffer = vec![0u8; 4096];
+    let rc = unsafe {
+        libc::getgrnam_r(
+            name.as_ptr(),
+            group.as_mut_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if rc == 0 && !result.is_null() {
+        let group = unsafe { group.assume_init() };
+        Some(group.gr_gid as u32)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+pub fn systemd_system_group_gid() -> Option<u32> {
+    None
 }
 
 pub fn dir_to_json_string(path: &Path) -> String {
