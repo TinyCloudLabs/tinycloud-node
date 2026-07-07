@@ -189,6 +189,18 @@ impl<C, B, K> SpaceDatabase<C, B, K>
 where
     C: ConnectionTrait,
 {
+    /// List every space id known to this node (the full `space` table).
+    /// Used by the admin usage endpoint to enumerate spaces without touching
+    /// SQL directly.
+    pub async fn list_space_ids(&self) -> Result<Vec<SpaceId>, DbErr> {
+        Ok(space::Entity::find()
+            .all(&self.conn)
+            .await?
+            .into_iter()
+            .map(|s| s.id.0)
+            .collect())
+    }
+
     pub async fn list_due_webhook_deliveries(
         &self,
         limit: u64,
@@ -1653,6 +1665,30 @@ mod test {
         let space = test_space_id("untouched");
         let db = get_db().await.unwrap().with_sql_sizes(SqlSizes::new());
         assert_eq!(db.store_size(&space).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn list_space_ids_returns_all_created_spaces() {
+        let db = get_db().await.unwrap();
+        // Empty node → empty list.
+        assert!(db.list_space_ids().await.unwrap().is_empty());
+
+        let a = test_space_id("alpha");
+        let b = test_space_id("beta");
+        space::Entity::insert_many([
+            space::ActiveModel::from(space::Model {
+                id: SpaceIdWrap(a.clone()),
+            }),
+            space::ActiveModel::from(space::Model {
+                id: SpaceIdWrap(b.clone()),
+            }),
+        ])
+        .exec(&db.conn)
+        .await
+        .unwrap();
+
+        let listed: HashSet<SpaceId> = db.list_space_ids().await.unwrap().into_iter().collect();
+        assert_eq!(listed, HashSet::from([a, b]));
     }
 
     #[tokio::test]

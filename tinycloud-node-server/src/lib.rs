@@ -31,7 +31,7 @@ use hooks::HookRuntime;
 use invocation_replay::InvocationReplayCache;
 use quota::QuotaCache;
 use routes::{
-    admin::{delete_quota, get_quota, list_quotas, set_quota},
+    admin::{delete_quota, get_quota, get_usage, list_quotas, set_quota},
     attestation::attestation,
     create_signed_kv_url, delegate,
     encryption::{
@@ -145,6 +145,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         delete_quota,
         get_quota,
         list_quotas,
+        get_usage,
         create_encryption_network,
         get_encryption_network,
         encryption_well_known,
