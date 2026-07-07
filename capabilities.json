@@ -1,0 +1,166 @@
+{
+  "$schema": "./capabilities.schema.json",
+  "version": 1,
+  "description": "Canonical single source of truth (SSOT) for TinyCloud capability action URNs (TC-112). Truth lives with the enforcer (tinycloud-node). Codegen (scripts/gen-capabilities.mjs) emits a Rust module and a TypeScript module from this file; the checked-in artifacts are verified against this registry in CI. Every entry is grounded in actual node dispatch code, not SDK declarations.",
+  "capabilities": [
+    {
+      "urn": "tinycloud.kv/get",
+      "service": "tinycloud.kv",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.kv/list",
+      "service": "tinycloud.kv",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.kv/metadata",
+      "service": "tinycloud.kv",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.kv/put",
+      "service": "tinycloud.kv",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.kv/del",
+      "service": "tinycloud.kv",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.kv/delete",
+      "service": "tinycloud.kv",
+      "status": "deprecated-alias",
+      "aliasOf": "tinycloud.kv/del"
+    },
+    {
+      "urn": "tinycloud.sql/read",
+      "service": "tinycloud.sql",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.sql/select",
+      "service": "tinycloud.sql",
+      "status": "deprecated-alias",
+      "aliasOf": "tinycloud.sql/read"
+    },
+    {
+      "urn": "tinycloud.sql/write",
+      "service": "tinycloud.sql",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.sql/schema",
+      "service": "tinycloud.sql",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.sql/admin",
+      "service": "tinycloud.sql",
+      "status": "active",
+      "implies": ["tinycloud.sql/schema"]
+    },
+    {
+      "urn": "tinycloud.duckdb/read",
+      "service": "tinycloud.duckdb",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.duckdb/write",
+      "service": "tinycloud.duckdb",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.duckdb/admin",
+      "service": "tinycloud.duckdb",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.duckdb/import",
+      "service": "tinycloud.duckdb",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.duckdb/export",
+      "service": "tinycloud.duckdb",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.duckdb/select",
+      "service": "tinycloud.duckdb",
+      "status": "deprecated-alias",
+      "aliasOf": "tinycloud.duckdb/read"
+    },
+    {
+      "urn": "tinycloud.capabilities/read",
+      "service": "tinycloud.capabilities",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.hooks/subscribe",
+      "service": "tinycloud.hooks",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.hooks/register",
+      "service": "tinycloud.hooks",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.hooks/list",
+      "service": "tinycloud.hooks",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.hooks/unregister",
+      "service": "tinycloud.hooks",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.encryption/decrypt",
+      "service": "tinycloud.encryption",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.encryption/network.create",
+      "service": "tinycloud.encryption",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.encryption/network.revoke",
+      "service": "tinycloud.encryption",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.space/host",
+      "service": "tinycloud.space",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.vfs/get",
+      "service": "tinycloud.vfs",
+      "status": "reserved"
+    },
+    {
+      "urn": "tinycloud.vfs/list",
+      "service": "tinycloud.vfs",
+      "status": "reserved"
+    },
+    {
+      "urn": "tinycloud.vfs/metadata",
+      "service": "tinycloud.vfs",
+      "status": "reserved"
+    },
+    {
+      "urn": "tinycloud.vfs/put",
+      "service": "tinycloud.vfs",
+      "status": "reserved"
+    },
+    {
+      "urn": "tinycloud.vfs/delete",
+      "service": "tinycloud.vfs",
+      "status": "reserved"
+    }
+  ]
+}

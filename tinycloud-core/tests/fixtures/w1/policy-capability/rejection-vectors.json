@@ -79,6 +79,58 @@
         "path": "notebooks/",
         "actions": []
       }
+    },
+    {
+      "name": "sql-ddl-rejected-not-in-registry",
+      "rejection_code": "policy-capability-malformed-action",
+      "reason": "sql/ddl is rejected by the node parser and is absent from the registry.",
+      "input": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/ddl"
+        ]
+      }
+    },
+    {
+      "name": "sql-execute-phantom-rejected",
+      "rejection_code": "policy-capability-malformed-action",
+      "reason": "Phantom SDK action with no node dispatch; absent from the registry.",
+      "input": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/execute"
+        ]
+      }
+    },
+    {
+      "name": "space-create-phantom-rejected",
+      "rejection_code": "policy-capability-malformed-action",
+      "reason": "Phantom SDK action; only space/host is dispatched.",
+      "input": {
+        "service": "tinycloud.space",
+        "space": "applications",
+        "path": "x/",
+        "actions": [
+          "tinycloud.space/create"
+        ]
+      }
+    },
+    {
+      "name": "duckdb-execute-phantom-rejected",
+      "rejection_code": "policy-capability-malformed-action",
+      "reason": "Phantom SDK action with no node dispatch.",
+      "input": {
+        "service": "tinycloud.duckdb",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.duckdb/execute"
+        ]
+      }
     }
   ]
 }
