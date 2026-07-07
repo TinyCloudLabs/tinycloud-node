@@ -728,6 +728,33 @@ mod tests {
         );
         // vfs stays accepted (reserved) so it never regresses to unknown-service.
         assert!(accepted_actions("tinycloud.vfs").is_some());
+
+        // Per-service wildcards expand (via implication) to every concrete
+        // action for the service, so a wildcard grant authorizes any request.
+        let sql_star_grant = ["tinycloud.sql/*".to_string()];
+        let sql_star = expand_granted_actions(&sql_star_grant);
+        for a in [
+            "tinycloud.sql/read",
+            "tinycloud.sql/write",
+            "tinycloud.sql/schema",
+            "tinycloud.sql/admin",
+        ] {
+            assert!(sql_star.contains(a), "sql/* should expand to include {a}");
+        }
+        let duckdb_star_grant = ["tinycloud.duckdb/*".to_string()];
+        let duckdb_star = expand_granted_actions(&duckdb_star_grant);
+        for a in [
+            "tinycloud.duckdb/read",
+            "tinycloud.duckdb/write",
+            "tinycloud.duckdb/admin",
+            "tinycloud.duckdb/import",
+            "tinycloud.duckdb/export",
+        ] {
+            assert!(
+                duckdb_star.contains(a),
+                "duckdb/* should expand to include {a}"
+            );
+        }
     }
 
     fn resolve_alias_via_generated(a: &str) -> &str {

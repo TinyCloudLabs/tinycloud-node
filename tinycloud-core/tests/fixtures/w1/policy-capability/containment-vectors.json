@@ -755,6 +755,128 @@
         ]
       },
       "contained": true
+    },
+    {
+      "name": "sql-wildcard-authorizes-write",
+      "auth": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/*"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/write"
+        ]
+      },
+      "contained": true
+    },
+    {
+      "name": "sql-wildcard-authorizes-schema-via-admin",
+      "auth": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/*"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/schema"
+        ]
+      },
+      "contained": true
+    },
+    {
+      "name": "sql-wildcard-authorizes-read-alias-select",
+      "auth": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/*"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/select"
+        ]
+      },
+      "contained": true
+    },
+    {
+      "name": "sql-write-does-not-authorize-wildcard",
+      "auth": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/write"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/*"
+        ]
+      },
+      "contained": false,
+      "rejection_code": "containment-action-not-subset"
+    },
+    {
+      "name": "duckdb-wildcard-authorizes-import",
+      "auth": {
+        "service": "tinycloud.duckdb",
+        "space": "applications",
+        "path": "data.db",
+        "actions": [
+          "tinycloud.duckdb/*"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.duckdb",
+        "space": "applications",
+        "path": "data.db",
+        "actions": [
+          "tinycloud.duckdb/import"
+        ]
+      },
+      "contained": true
+    },
+    {
+      "name": "sql-read-does-not-authorize-reserved-insert",
+      "auth": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/read"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/insert"
+        ]
+      },
+      "contained": false,
+      "rejection_code": "containment-action-not-subset"
     }
   ]
 }
