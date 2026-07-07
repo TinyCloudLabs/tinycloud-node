@@ -135,7 +135,26 @@
     {
       "urn": "tinycloud.space/host",
       "service": "tinycloud.space",
-      "status": "active"
+      "status": "active",
+      "notes": "Creates the space: a space/host delegation inserts the space row in transact() (tinycloud-core/src/db.rs ~818, matched on Delegation events)."
+    },
+    {
+      "urn": "tinycloud.space/create",
+      "service": "tinycloud.space",
+      "status": "active",
+      "notes": "Invoked by the SDK against /invoke (SpaceService.ts create(); TinyCloud.ts lazy public-space create). The node authorizes it via the delegation chain in the invocation-verification path (not via accepted_actions), but there is NO dedicated side-effect handler — db.rs invocation match falls through (_ => {}). Real space creation happens through space/host. 409/404 the SDK sees come from the space-existence check (TxError::SpaceNotFound), not a create handler."
+    },
+    {
+      "urn": "tinycloud.space/list",
+      "service": "tinycloud.space",
+      "status": "active",
+      "notes": "Invoked by the SDK (SpaceService.ts listOwnedSpaces). Authorized via the delegation chain; no dedicated node side-effect handler (db.rs invocation match falls through). Owned-space discovery is served via the capabilities/read + host layers, not a space/list handler."
+    },
+    {
+      "urn": "tinycloud.space/info",
+      "service": "tinycloud.space",
+      "status": "active",
+      "notes": "Invoked by the SDK (SpaceService.ts getSpaceInfo; TinyCloud.ts probe-before-create). Authorized via the delegation chain; no dedicated node side-effect handler. A nonexistent space yields TxError::SpaceNotFound -> 404, which is exactly the SDK's existence probe."
     },
     {
       "urn": "tinycloud.vfs/get",

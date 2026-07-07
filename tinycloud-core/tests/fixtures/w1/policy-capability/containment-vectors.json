@@ -713,6 +713,48 @@
         ]
       },
       "contained": true
+    },
+    {
+      "name": "space-host-accepted",
+      "auth": {
+        "service": "tinycloud.space",
+        "space": "applications",
+        "path": "myspace",
+        "actions": [
+          "tinycloud.space/host"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.space",
+        "space": "applications",
+        "path": "myspace",
+        "actions": [
+          "tinycloud.space/host"
+        ]
+      },
+      "contained": true
+    },
+    {
+      "name": "space-create-list-info-accepted",
+      "auth": {
+        "service": "tinycloud.space",
+        "space": "applications",
+        "path": "myspace",
+        "actions": [
+          "tinycloud.space/create",
+          "tinycloud.space/info",
+          "tinycloud.space/list"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.space",
+        "space": "applications",
+        "path": "myspace",
+        "actions": [
+          "tinycloud.space/info"
+        ]
+      },
+      "contained": true
     }
   ]
 }

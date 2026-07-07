@@ -96,7 +96,7 @@
     {
       "name": "sql-execute-phantom-rejected",
       "rejection_code": "policy-capability-malformed-action",
-      "reason": "Phantom SDK action with no node dispatch; absent from the registry.",
+      "reason": "No tinycloud.sql/execute URN dispatch: the node routes on the SqlRequest body kind (Execute/Query/Export) gated by sql/read|write|admin, not on a sql/execute ability. Absent from the registry.",
       "input": {
         "service": "tinycloud.sql",
         "space": "applications",
@@ -107,22 +107,9 @@
       }
     },
     {
-      "name": "space-create-phantom-rejected",
-      "rejection_code": "policy-capability-malformed-action",
-      "reason": "Phantom SDK action; only space/host is dispatched.",
-      "input": {
-        "service": "tinycloud.space",
-        "space": "applications",
-        "path": "x/",
-        "actions": [
-          "tinycloud.space/create"
-        ]
-      }
-    },
-    {
       "name": "duckdb-execute-phantom-rejected",
       "rejection_code": "policy-capability-malformed-action",
-      "reason": "Phantom SDK action with no node dispatch.",
+      "reason": "No tinycloud.duckdb/execute URN dispatch: the node routes on the DuckDbRequest body kind gated by duckdb/read|write|admin, not on a duckdb/execute ability. Absent from the registry.",
       "input": {
         "service": "tinycloud.duckdb",
         "space": "applications",

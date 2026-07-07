@@ -38,6 +38,10 @@
             "type": "array",
             "items": { "type": "string" },
             "description": "URNs implied by holding this one (e.g. sql/admin implies sql/schema). Used by containment subset checks."
+          },
+          "notes": {
+            "type": "string",
+            "description": "Provenance/grounding note — where the node-side handling lives, or why the status is what it is. Documentation only; not emitted into generated code."
           }
         }
       }
