@@ -118,6 +118,32 @@
           "tinycloud.duckdb/execute"
         ]
       }
+    },
+    {
+      "name": "sql-insert-rejected-not-in-registry",
+      "rejection_code": "policy-capability-malformed-action",
+      "reason": "tinycloud.sql/insert was never parse-accepted by the v0 contract and is absent from the registry (not reserved). Reserving it would newly widen the policy boundary, so it must be rejected at parse.",
+      "input": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/insert"
+        ]
+      }
+    },
+    {
+      "name": "sql-update-rejected-not-in-registry",
+      "rejection_code": "policy-capability-malformed-action",
+      "reason": "tinycloud.sql/update was never parse-accepted by the v0 contract and is absent from the registry (not reserved). Reserving it would newly widen the policy boundary, so it must be rejected at parse.",
+      "input": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/update"
+        ]
+      }
     }
   ]
 }

@@ -856,27 +856,6 @@
         ]
       },
       "contained": true
-    },
-    {
-      "name": "sql-read-does-not-authorize-reserved-insert",
-      "auth": {
-        "service": "tinycloud.sql",
-        "space": "applications",
-        "path": "main.db",
-        "actions": [
-          "tinycloud.sql/read"
-        ]
-      },
-      "req": {
-        "service": "tinycloud.sql",
-        "space": "applications",
-        "path": "main.db",
-        "actions": [
-          "tinycloud.sql/insert"
-        ]
-      },
-      "contained": false,
-      "rejection_code": "containment-action-not-subset"
     }
   ]
 }
