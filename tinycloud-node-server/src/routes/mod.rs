@@ -1056,7 +1056,12 @@ async fn emit_kv_hook_events(
                 Some((
                     resource.space(),
                     resource.service().as_str(),
-                    capability.ability.as_ref().as_ref(),
+                    // Resolve deprecated aliases (e.g. kv/delete -> kv/del) so
+                    // alias-invoked operations emit the same live-bus events as
+                    // canonical ones — mirrors the db.rs dispatch resolution.
+                    tinycloud_core::policy_capability::resolve_alias(
+                        capability.ability.as_ref().as_ref(),
+                    ),
                     resource.path()?,
                 ))
             })
@@ -2124,9 +2129,17 @@ fn preferred_database_ability<'a>(
         _ => &[],
     };
 
+    // TC-119: match held abilities to the (privilege-ordered) preferred slots
+    // by their canonical form, so a held deprecated alias (e.g. `sql/select`)
+    // matches its canonical slot. Identity for canonical URNs — the privilege
+    // ordering and the returned (unmodified) held ability are unchanged.
     preferred_abilities.iter().find_map(|preferred| {
+        let preferred_canonical = tinycloud_core::policy_capability::resolve_alias(preferred);
         caps.iter()
-            .find(|(_, _, ability)| ability.as_str() == *preferred)
+            .find(|(_, _, ability)| {
+                tinycloud_core::policy_capability::resolve_alias(ability.as_str())
+                    == preferred_canonical
+            })
             .map(|(_, _, ability)| ability.as_str())
     })
 }
@@ -2135,14 +2148,18 @@ fn has_database_admin_capability(
     caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
     service: &str,
 ) -> bool {
-    let admin_abilities: &[&str] = match service {
-        "sql" => &["tinycloud.sql/admin", "tinycloud.sql/*"],
-        "duckdb" => &["tinycloud.duckdb/admin", "tinycloud.duckdb/*"],
-        _ => &[],
+    // TC-119: confers-admin gate (registry-aware). Both `<svc>/admin` and the
+    // per-service wildcard (which implies admin) confer admin — identical to
+    // the prior explicit `{admin, *}` list, now via the registry.
+    let admin_ability = match service {
+        "sql" => "tinycloud.sql/admin",
+        "duckdb" => "tinycloud.duckdb/admin",
+        _ => return false,
     };
 
-    caps.iter()
-        .any(|(_, _, ability)| admin_abilities.contains(&ability.as_str()))
+    caps.iter().any(|(_, _, ability)| {
+        tinycloud_core::policy_capability::ability_matches(ability.as_str(), admin_ability)
+    })
 }
 
 fn missing_database_admin_capability_error(

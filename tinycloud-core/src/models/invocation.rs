@@ -216,10 +216,23 @@ async fn validate<C: ConnectionTrait>(
             // the persisted chain ability row already has a matching or
             // stricter caveat.
             for c in &dependant_caps {
+                // TC-119: ability containment is registry-aware. A parent
+                // ability supports the invoked ability when it is equal OR a
+                // registry-declared alias (`kv/delete`↔`kv/del`) OR implies it
+                // (`sql/admin` ⊃ `sql/schema`; `sql/*` ⊃ every sql action).
+                // This is a strict widening of the previous `c.ability ==
+                // pc.ability`: exact matches still match, only registry
+                // alias/implication pairs are added.
                 let mut candidates = parents
                     .iter()
                     .flat_map(|(_, a)| a)
-                    .filter(|pc| c.resource.extends(&pc.resource) && c.ability == pc.ability)
+                    .filter(|pc| {
+                        c.resource.extends(&pc.resource)
+                            && crate::policy_capability::ability_matches(
+                                pc.ability.as_ref().as_ref(),
+                                c.ability.as_ref().as_ref(),
+                            )
+                    })
                     .peekable();
 
                 if candidates.peek().is_none() {

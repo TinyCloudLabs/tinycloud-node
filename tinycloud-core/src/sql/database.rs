@@ -174,7 +174,9 @@ fn handle_message(
     caveats: &Option<SqlCaveats>,
     ability: &str,
 ) -> Result<SqlExecutionResult, SqlError> {
-    let is_admin = matches!(ability, "tinycloud.sql/admin" | "tinycloud.sql/*");
+    // TC-119: confers-admin gate (registry-aware). `sql/admin` and `sql/*`
+    // (implies admin) pass; identical to the prior `admin | *` match.
+    let is_admin = crate::policy_capability::ability_matches(ability, "tinycloud.sql/admin");
 
     match request {
         SqlRequest::Query { sql, params } => {
