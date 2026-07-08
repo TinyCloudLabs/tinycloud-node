@@ -1056,7 +1056,12 @@ async fn emit_kv_hook_events(
                 Some((
                     resource.space(),
                     resource.service().as_str(),
-                    capability.ability.as_ref().as_ref(),
+                    // Resolve deprecated aliases (e.g. kv/delete -> kv/del) so
+                    // alias-invoked operations emit the same live-bus events as
+                    // canonical ones — mirrors the db.rs dispatch resolution.
+                    tinycloud_core::policy_capability::resolve_alias(
+                        capability.ability.as_ref().as_ref(),
+                    ),
                     resource.path()?,
                 ))
             })
