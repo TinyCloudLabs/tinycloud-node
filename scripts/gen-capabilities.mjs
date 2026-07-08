@@ -8,6 +8,17 @@
 //
 // Run `node scripts/gen-capabilities.mjs` to regenerate, or with `--check` to
 // fail if the checked-in artifacts are stale (used by CI).
+//
+// TC-121: both artifacts also embed REGISTRY_SOURCE_GIT_SHA / REGISTRY_SOURCE_REPO
+// so js-sdk's capabilities-sync CI can fetch the matching capabilities.json from
+// raw.githubusercontent.com (a content sha256 is not fetchable). The sha is
+// GITHUB_SHA when set (CI is authoritative); otherwise `git rev-parse HEAD` at
+// gen time, which is approximate: it names the parent of the commit that will
+// eventually contain the regenerated artifact (the artifact cannot know its own
+// commit). Because the environment's sha differs from the committed artifact's
+// sha on every new commit, --check normalizes the REGISTRY_SOURCE_GIT_SHA value
+// out of both sides before comparing — everything else must match byte-exact.
+// Full regeneration (no --check) always writes the real current sha.
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -25,6 +36,29 @@ const TS_OUT = join(ROOT, "generated/capabilities.ts");
 const raw = readFileSync(REGISTRY_PATH, "utf8");
 const registry = JSON.parse(raw);
 const sourceHash = createHash("sha256").update(raw).digest("hex");
+
+// TC-121: git rev the artifacts were generated from (see header for semantics).
+const SOURCE_REPO = "TinyCloudLabs/tinycloud-node";
+function resolveSourceGitSha() {
+  const env = process.env.GITHUB_SHA;
+  if (env) {
+    if (!/^[0-9a-f]{40}$/.test(env)) {
+      throw new Error(`GITHUB_SHA is not a 40-char hex sha: ${env}`);
+    }
+    return env;
+  }
+  const res = spawnSync("git", ["rev-parse", "HEAD"], { cwd: ROOT, encoding: "utf8" });
+  if (res.error || res.status !== 0) {
+    const detail = res.error ? res.error.message : res.stderr;
+    throw new Error(`git rev-parse HEAD failed: ${detail}`);
+  }
+  const sha = res.stdout.trim();
+  if (!/^[0-9a-f]{40}$/.test(sha)) {
+    throw new Error(`unexpected git rev-parse HEAD output: ${sha}`);
+  }
+  return sha;
+}
+const sourceGitSha = resolveSourceGitSha();
 
 const caps = registry.capabilities;
 
@@ -122,6 +156,13 @@ function emitRust() {
   lines.push(`pub const REGISTRY_VERSION: u32 = ${registry.version};`);
   lines.push(`pub const REGISTRY_SOURCE_SHA256: &str = ${rustStr(sourceHash)};`);
   lines.push("");
+  lines.push("/// GitHub repository the registry lives in (TC-121; js-sdk sync anchor).");
+  lines.push(`pub const REGISTRY_SOURCE_REPO: &str = ${rustStr(SOURCE_REPO)};`);
+  lines.push("/// Git commit the artifact was generated from. Authoritative when generated");
+  lines.push("/// in CI (GITHUB_SHA); approximate when generated locally, where it names");
+  lines.push("/// the parent of the commit that will contain this artifact.");
+  lines.push(`pub const REGISTRY_SOURCE_GIT_SHA: &str = ${rustStr(sourceGitSha)};`);
+  lines.push("");
   lines.push("/// Every action URN accepted at the policy boundary for `service`");
   lines.push("/// (active, deprecated-alias, and reserved), sorted. `None` if the");
   lines.push("/// service is unknown to the registry.");
@@ -173,6 +214,15 @@ function emitTs() {
   lines.push("");
   lines.push(`export const REGISTRY_VERSION = ${registry.version} as const;`);
   lines.push(`export const REGISTRY_SOURCE_SHA256 = ${JSON.stringify(sourceHash)} as const;`);
+  lines.push("");
+  lines.push("/** GitHub repository the registry lives in (TC-121; js-sdk sync anchor). */");
+  lines.push(`export const REGISTRY_SOURCE_REPO = ${JSON.stringify(SOURCE_REPO)} as const;`);
+  lines.push("/**");
+  lines.push(" * Git commit the artifact was generated from. Authoritative when generated");
+  lines.push(" * in CI (GITHUB_SHA); approximate when generated locally, where it names");
+  lines.push(" * the parent of the commit that will contain this artifact.");
+  lines.push(" */");
+  lines.push(`export const REGISTRY_SOURCE_GIT_SHA = ${JSON.stringify(sourceGitSha)} as const;`);
   lines.push("");
   lines.push("export type CapabilityStatus = \"active\" | \"deprecated-alias\" | \"reserved\";");
   lines.push("");
@@ -249,6 +299,19 @@ function rustfmt(src) {
 const rust = rustfmt(emitRust());
 const ts = emitTs();
 
+// --check must not fail merely because the current environment's git sha
+// differs from the one embedded in the committed artifact (every CI run on a
+// new commit would otherwise report the artifacts stale). Normalize the
+// REGISTRY_SOURCE_GIT_SHA value out of both sides before comparing; every
+// other byte must still match exactly. A malformed committed sha does not
+// match the regex, so it is not normalized and --check fails as it should.
+function normalizeGitSha(s) {
+  return s.replace(
+    /(REGISTRY_SOURCE_GIT_SHA[^=\n]*= ")[0-9a-f]{40}(")/g,
+    "$1<git-sha>$2",
+  );
+}
+
 const check = process.argv.includes("--check");
 if (check) {
   let stale = false;
@@ -259,7 +322,7 @@ if (check) {
     } catch {
       got = "";
     }
-    if (got !== want) {
+    if (normalizeGitSha(got) !== normalizeGitSha(want)) {
       console.error(`stale generated artifact: ${path}`);
       stale = true;
     }
