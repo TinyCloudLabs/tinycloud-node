@@ -29,10 +29,14 @@ const sourceHash = createHash("sha256").update(raw).digest("hex");
 const caps = registry.capabilities;
 
 // --- Validation (fail loud; the registry is security-critical) ---
+const URN_PATTERN = /^[a-z0-9.]+\/[A-Za-z0-9._*]+$/;
 const byUrn = new Map();
 for (const c of caps) {
   if (byUrn.has(c.urn)) throw new Error(`duplicate URN in registry: ${c.urn}`);
   byUrn.set(c.urn, c);
+  if (!URN_PATTERN.test(c.urn)) {
+    throw new Error(`URN ${c.urn} does not match ${URN_PATTERN} (see capabilities.schema.json)`);
+  }
   if (!c.urn.startsWith(c.service + "/")) {
     throw new Error(`URN ${c.urn} does not match its service ${c.service}`);
   }
@@ -50,9 +54,32 @@ for (const c of caps) {
     if (target.status === "deprecated-alias") {
       throw new Error(`alias ${c.urn} points at another alias ${c.aliasOf} (aliases must resolve in one hop)`);
     }
+    if (target.service !== c.service) {
+      throw new Error(`alias ${c.urn} points across services at ${c.aliasOf}`);
+    }
   }
   for (const imp of c.implies ?? []) {
-    if (!byUrn.has(imp)) throw new Error(`${c.urn} implies unknown URN ${imp}`);
+    const target = byUrn.get(imp);
+    if (!target) throw new Error(`${c.urn} implies unknown URN ${imp}`);
+    if (target.service !== c.service) {
+      throw new Error(`${c.urn} implies across services: ${imp}`);
+    }
+  }
+}
+// Wildcard entries must imply exactly the active concrete actions of their
+// service — otherwise a later-added action would be silently missing from
+// the wildcard grant (deny-by-default, but a broken SSOT promise).
+for (const c of caps) {
+  if (!c.urn.endsWith("/*")) continue;
+  const want = caps
+    .filter((x) => x.service === c.service && x.status === "active" && !x.urn.endsWith("/*"))
+    .map((x) => x.urn)
+    .sort();
+  const got = [...(c.implies ?? [])].sort();
+  if (JSON.stringify(got) !== JSON.stringify(want)) {
+    throw new Error(
+      `wildcard ${c.urn} implies [${got.join(", ")}] but the active actions of ${c.service} are [${want.join(", ")}]`,
+    );
   }
 }
 
