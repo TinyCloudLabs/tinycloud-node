@@ -3,7 +3,9 @@
   "private": true,
   "description": "TinyCloud Protocol Node",
   "scripts": {
-    "release": "cargo build --release"
+    "release": "cargo build --release",
+    "gen:capabilities": "node scripts/gen-capabilities.mjs",
+    "check:capabilities": "node scripts/gen-capabilities.mjs --check"
   },
   "dependencies": {
     "zod": "3.22.4",

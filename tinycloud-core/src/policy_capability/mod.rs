@@ -13,6 +13,7 @@
 // Crucially, this module has ZERO dependency on policy evaluation or VC
 // verification — it is the native contract types only.
 
+pub mod generated;
 pub mod jcs;
 pub mod sql_caveat;
 
@@ -26,31 +27,11 @@ pub use sql_caveat::SqlConstrainedStatementCaveat;
 /// (0x00) is part of the hash input — do not strip it.
 pub const POLICY_CAPABILITY_DOMAIN: &[u8] = b"xyz.tinycloud.policy/PolicyCapability/v0\0";
 
-/// The v0 accepted action set per service. See policy-capability.md §4.
+/// The accepted action set per service. Sourced from the canonical capability
+/// registry (`capabilities.json`) via generated code (TC-112) — do not
+/// hand-edit; change the registry and rerun `scripts/gen-capabilities.mjs`.
 pub fn accepted_actions(service: &str) -> Option<&'static [&'static str]> {
-    match service {
-        "tinycloud.kv" => Some(&[
-            "tinycloud.kv/get",
-            "tinycloud.kv/list",
-            "tinycloud.kv/metadata",
-            "tinycloud.kv/put",
-            "tinycloud.kv/delete",
-        ]),
-        "tinycloud.sql" => Some(&[
-            "tinycloud.sql/read",
-            "tinycloud.sql/select",
-            "tinycloud.sql/schema",
-            "tinycloud.sql/write",
-        ]),
-        "tinycloud.vfs" => Some(&[
-            "tinycloud.vfs/get",
-            "tinycloud.vfs/list",
-            "tinycloud.vfs/metadata",
-            "tinycloud.vfs/put",
-            "tinycloud.vfs/delete",
-        ]),
-        _ => None,
-    }
+    generated::accepted_actions(service)
 }
 
 /// PolicyCapability — resolved authority shape used by ceilings, requested
@@ -339,8 +320,14 @@ impl PolicyCapability {
         if !path_contains(&self.service, &self.path, &req.path) {
             return Err(RejectionCode::ContainmentPathMismatch);
         }
+        // Action subset with registry-aware equivalence: aliases (e.g.
+        // kv/delete↔kv/del, sql/select↔sql/read) and implications (e.g.
+        // sql/admin ⊃ sql/schema) are resolved so a grant minted with either
+        // form authorizes both. Stored actions are never rewritten — only the
+        // comparison is registry-aware, so capability hashes are unaffected.
+        let granted = expand_granted_actions(&self.actions);
         for a in &req.actions {
-            if !self.actions.iter().any(|x| x == a) {
+            if !granted.contains(generated::resolve_alias(a)) {
                 return Err(RejectionCode::ContainmentActionNotSubset);
             }
         }
@@ -357,6 +344,24 @@ impl PolicyCapability {
         }
         Ok(())
     }
+}
+
+/// Build the set of canonical action URNs a grant authorizes, resolving
+/// deprecated aliases to their canonical form and expanding implications
+/// (e.g. `sql/admin` pulls in `sql/schema`) transitively. Used only for the
+/// containment subset check; it never mutates stored actions or hashes.
+fn expand_granted_actions(actions: &[String]) -> std::collections::HashSet<&str> {
+    let mut out: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut stack: Vec<&str> = actions.iter().map(String::as_str).collect();
+    while let Some(action) = stack.pop() {
+        let canonical = generated::resolve_alias(action);
+        if out.insert(canonical) {
+            for implied in generated::implied_actions(canonical) {
+                stack.push(implied);
+            }
+        }
+    }
+    out
 }
 
 /// Path containment per service. For KV/VFS, a trailing-slash auth.path is a
@@ -609,5 +614,150 @@ mod tests {
                 assert_eq!(err.as_str(), "sql-write-blocked");
             }
         }
+    }
+
+    // --- TC-112 registry / codegen drift guards ---
+
+    const REGISTRY_JSON: &str = include_str!("../../../capabilities.json");
+
+    #[derive(Deserialize)]
+    struct RegistryEntry {
+        urn: String,
+        service: String,
+        status: String,
+        #[serde(rename = "aliasOf", default)]
+        alias_of: Option<String>,
+        #[serde(default)]
+        implies: Vec<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct Registry {
+        version: u32,
+        capabilities: Vec<RegistryEntry>,
+    }
+
+    /// The generated Rust module must agree with the checked-in registry. This
+    /// catches a stale `generated.rs` (someone edited `capabilities.json`
+    /// without rerunning `scripts/gen-capabilities.mjs`) at `cargo test` time,
+    /// independent of the Node-side `--check` in CI.
+    #[test]
+    fn generated_module_matches_registry() {
+        let registry: Registry = serde_json::from_str(REGISTRY_JSON).unwrap();
+        assert_eq!(generated::REGISTRY_VERSION, registry.version);
+
+        // Every accepted-actions entry is exactly the registry's URNs for that
+        // service, sorted, with no extras.
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut by_service: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for e in &registry.capabilities {
+            assert!(
+                e.urn.starts_with(&format!("{}/", e.service)),
+                "urn {} does not match service {}",
+                e.urn,
+                e.service
+            );
+            by_service
+                .entry(e.service.as_str())
+                .or_default()
+                .insert(e.urn.as_str());
+        }
+        for (service, urns) in &by_service {
+            let accepted = generated::accepted_actions(service)
+                .unwrap_or_else(|| panic!("service {service} missing from generated module"));
+            let accepted_set: BTreeSet<&str> = accepted.iter().copied().collect();
+            let expected_set: BTreeSet<&str> = urns.iter().copied().collect();
+            assert_eq!(
+                &accepted_set, &expected_set,
+                "accepted mismatch for {service}"
+            );
+            // sorted invariant
+            let mut sorted = accepted.to_vec();
+            sorted.sort_unstable();
+            assert_eq!(accepted, sorted.as_slice(), "{service} not sorted");
+        }
+
+        // Alias + implication tables round-trip against the registry.
+        for e in &registry.capabilities {
+            match e.status.as_str() {
+                "deprecated-alias" => {
+                    let alias_of = e.alias_of.as_deref().expect("alias missing aliasOf");
+                    assert_eq!(
+                        generated::resolve_alias(&e.urn),
+                        alias_of,
+                        "resolve_alias mismatch for {}",
+                        e.urn
+                    );
+                }
+                _ => {
+                    assert_eq!(
+                        generated::resolve_alias(&e.urn),
+                        e.urn,
+                        "{} should not resolve to an alias",
+                        e.urn
+                    );
+                }
+            }
+            let implied: BTreeSet<&str> =
+                generated::implied_actions(&e.urn).iter().copied().collect();
+            let expected: BTreeSet<&str> = e.implies.iter().map(String::as_str).collect();
+            assert_eq!(implied, expected, "implied mismatch for {}", e.urn);
+        }
+    }
+
+    /// The canonical decisions from the TC-112 audit, asserted directly so a
+    /// registry edit that flips one is caught here with a clear message.
+    #[test]
+    fn canonical_decisions_are_locked() {
+        assert_eq!(
+            resolve_alias_via_generated("tinycloud.kv/delete"),
+            "tinycloud.kv/del"
+        );
+        assert_eq!(
+            resolve_alias_via_generated("tinycloud.sql/select"),
+            "tinycloud.sql/read"
+        );
+        assert_eq!(
+            generated::implied_actions("tinycloud.sql/admin"),
+            &["tinycloud.sql/schema"]
+        );
+        // kv/del is canonical (not an alias); kv/delete resolves onto it.
+        assert_eq!(
+            resolve_alias_via_generated("tinycloud.kv/del"),
+            "tinycloud.kv/del"
+        );
+        // vfs stays accepted (reserved) so it never regresses to unknown-service.
+        assert!(accepted_actions("tinycloud.vfs").is_some());
+
+        // Per-service wildcards expand (via implication) to every concrete
+        // action for the service, so a wildcard grant authorizes any request.
+        let sql_star_grant = ["tinycloud.sql/*".to_string()];
+        let sql_star = expand_granted_actions(&sql_star_grant);
+        for a in [
+            "tinycloud.sql/read",
+            "tinycloud.sql/write",
+            "tinycloud.sql/schema",
+            "tinycloud.sql/admin",
+        ] {
+            assert!(sql_star.contains(a), "sql/* should expand to include {a}");
+        }
+        let duckdb_star_grant = ["tinycloud.duckdb/*".to_string()];
+        let duckdb_star = expand_granted_actions(&duckdb_star_grant);
+        for a in [
+            "tinycloud.duckdb/read",
+            "tinycloud.duckdb/write",
+            "tinycloud.duckdb/admin",
+            "tinycloud.duckdb/import",
+            "tinycloud.duckdb/export",
+        ] {
+            assert!(
+                duckdb_star.contains(a),
+                "duckdb/* should expand to include {a}"
+            );
+        }
+    }
+
+    fn resolve_alias_via_generated(a: &str) -> &str {
+        generated::resolve_alias(a)
     }
 }

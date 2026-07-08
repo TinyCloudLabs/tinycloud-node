@@ -67,3 +67,17 @@ jobs:
     - name: Fmt
       working-directory: ${{ matrix.pkg }}
       run: cargo fmt -- --check
+
+  capabilities:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout TinyCloud repository
+      uses: actions/checkout@v4
+    - name: Setup Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
+    - name: Ensure rustfmt is available
+      run: rustup component add rustfmt
+    - name: Verify generated capability artifacts match capabilities.json
+      run: node scripts/gen-capabilities.mjs --check

@@ -510,6 +510,352 @@
         ]
       },
       "contained": true
+    },
+    {
+      "name": "kv-delete-alias-authorizes-del",
+      "auth": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "docs/",
+        "actions": [
+          "tinycloud.kv/delete"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "docs/",
+        "actions": [
+          "tinycloud.kv/del"
+        ]
+      },
+      "contained": true
+    },
+    {
+      "name": "kv-del-authorizes-delete-alias",
+      "auth": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "docs/",
+        "actions": [
+          "tinycloud.kv/del"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.kv",
+        "space": "applications",
+        "path": "docs/",
+        "actions": [
+          "tinycloud.kv/delete"
+        ]
+      },
+      "contained": true
+    },
+    {
+      "name": "sql-select-authorizes-read",
+      "auth": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/select"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/read"
+        ]
+      },
+      "contained": true
+    },
+    {
+      "name": "sql-read-authorizes-select",
+      "auth": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/read"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/select"
+        ]
+      },
+      "contained": true
+    },
+    {
+      "name": "sql-admin-implies-schema",
+      "auth": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/admin"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/schema"
+        ]
+      },
+      "contained": true
+    },
+    {
+      "name": "sql-schema-does-not-imply-admin",
+      "auth": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/schema"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/admin"
+        ]
+      },
+      "contained": false,
+      "rejection_code": "containment-action-not-subset"
+    },
+    {
+      "name": "capabilities-read-accepted",
+      "auth": {
+        "service": "tinycloud.capabilities",
+        "space": "applications",
+        "path": "all",
+        "actions": [
+          "tinycloud.capabilities/read"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.capabilities",
+        "space": "applications",
+        "path": "all",
+        "actions": [
+          "tinycloud.capabilities/read"
+        ]
+      },
+      "contained": true
+    },
+    {
+      "name": "hooks-subscribe-accepted",
+      "auth": {
+        "service": "tinycloud.hooks",
+        "space": "applications",
+        "path": "analytics/",
+        "actions": [
+          "tinycloud.hooks/subscribe",
+          "tinycloud.hooks/register"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.hooks",
+        "space": "applications",
+        "path": "analytics/",
+        "actions": [
+          "tinycloud.hooks/subscribe"
+        ]
+      },
+      "contained": true
+    },
+    {
+      "name": "encryption-decrypt-accepted",
+      "auth": {
+        "service": "tinycloud.encryption",
+        "space": "applications",
+        "path": "net-1",
+        "actions": [
+          "tinycloud.encryption/decrypt"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.encryption",
+        "space": "applications",
+        "path": "net-1",
+        "actions": [
+          "tinycloud.encryption/decrypt"
+        ]
+      },
+      "contained": true
+    },
+    {
+      "name": "duckdb-read-write-accepted",
+      "auth": {
+        "service": "tinycloud.duckdb",
+        "space": "applications",
+        "path": "data.db",
+        "actions": [
+          "tinycloud.duckdb/read",
+          "tinycloud.duckdb/write"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.duckdb",
+        "space": "applications",
+        "path": "data.db",
+        "actions": [
+          "tinycloud.duckdb/read"
+        ]
+      },
+      "contained": true
+    },
+    {
+      "name": "space-host-accepted",
+      "auth": {
+        "service": "tinycloud.space",
+        "space": "applications",
+        "path": "myspace",
+        "actions": [
+          "tinycloud.space/host"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.space",
+        "space": "applications",
+        "path": "myspace",
+        "actions": [
+          "tinycloud.space/host"
+        ]
+      },
+      "contained": true
+    },
+    {
+      "name": "space-create-list-info-accepted",
+      "auth": {
+        "service": "tinycloud.space",
+        "space": "applications",
+        "path": "myspace",
+        "actions": [
+          "tinycloud.space/create",
+          "tinycloud.space/info",
+          "tinycloud.space/list"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.space",
+        "space": "applications",
+        "path": "myspace",
+        "actions": [
+          "tinycloud.space/info"
+        ]
+      },
+      "contained": true
+    },
+    {
+      "name": "sql-wildcard-authorizes-write",
+      "auth": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/*"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/write"
+        ]
+      },
+      "contained": true
+    },
+    {
+      "name": "sql-wildcard-authorizes-schema-via-admin",
+      "auth": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/*"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/schema"
+        ]
+      },
+      "contained": true
+    },
+    {
+      "name": "sql-wildcard-authorizes-read-alias-select",
+      "auth": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/*"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/select"
+        ]
+      },
+      "contained": true
+    },
+    {
+      "name": "sql-write-does-not-authorize-wildcard",
+      "auth": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/write"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/*"
+        ]
+      },
+      "contained": false,
+      "rejection_code": "containment-action-not-subset"
+    },
+    {
+      "name": "duckdb-wildcard-authorizes-import",
+      "auth": {
+        "service": "tinycloud.duckdb",
+        "space": "applications",
+        "path": "data.db",
+        "actions": [
+          "tinycloud.duckdb/*"
+        ]
+      },
+      "req": {
+        "service": "tinycloud.duckdb",
+        "space": "applications",
+        "path": "data.db",
+        "actions": [
+          "tinycloud.duckdb/import"
+        ]
+      },
+      "contained": true
     }
   ]
 }
