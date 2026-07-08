@@ -257,7 +257,7 @@ secret = "{}"
         nonce: Some("urn:uuid:00000000-0000-4000-8000-0000000000w5".to_string()),
         facts: Some(Vec::<serde_json::Value>::new()),
         proof: vec![parent_cid],
-        attenuation: invocation_caps,
+        attenuation: invocation_caps.clone(),
     }
     .sign(holder_jwk.get_algorithm().unwrap_or_default(), &holder_jwk)?;
     let auth_header = invocation.encode()?;
@@ -265,7 +265,7 @@ secret = "{}"
     let client = Client::tracked(rocket).await?;
     let response = client
         .post("/invoke")
-        .header(Header::new("Authorization", auth_header.clone()))
+        .header(Header::new("Authorization", auth_header))
         .header(ContentType::JSON)
         .body(serde_json::to_string(&SqlRequest::ExecuteStatement {
             name: "get_val".to_string(),
@@ -298,9 +298,25 @@ secret = "{}"
     .insert(&conn)
     .await?;
 
+    // The node's invocation replay guard rejects reused nonces, so the
+    // post-revocation dispatch must carry a fresh nonce; only the nonce
+    // differs from the first invocation.
+    let post_revocation_invocation = Payload {
+        issuer: holder_verification_method.parse::<DIDURLBuf>()?,
+        audience: holder_did.parse::<DIDBuf>()?,
+        not_before: None,
+        expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
+        nonce: Some("urn:uuid:00000000-0000-4000-8000-0000000001w5".to_string()),
+        facts: Some(Vec::<serde_json::Value>::new()),
+        proof: vec![parent_cid],
+        attenuation: invocation_caps,
+    }
+    .sign(holder_jwk.get_algorithm().unwrap_or_default(), &holder_jwk)?;
+    let post_revocation_auth_header = post_revocation_invocation.encode()?;
+
     let response = client
         .post("/invoke")
-        .header(Header::new("Authorization", auth_header.clone()))
+        .header(Header::new("Authorization", post_revocation_auth_header))
         .header(ContentType::JSON)
         .body(serde_json::to_string(&SqlRequest::ExecuteStatement {
             name: "get_val".to_string(),
