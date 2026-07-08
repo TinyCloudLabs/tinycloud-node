@@ -558,7 +558,11 @@ where
                 Some((
                     r.space(),
                     r.service().as_str(),
-                    cap.ability.as_ref().as_ref(),
+                    // TC-119: resolve deprecated aliases to canonical so an
+                    // invocation using `kv/delete` dispatches identically to
+                    // `kv/del`. Identity for canonical URNs, so dispatch for
+                    // every non-alias action is byte-for-byte unchanged.
+                    crate::policy_capability::resolve_alias(cap.ability.as_ref().as_ref()),
                     r.path()?,
                 ))
             }) {
@@ -629,7 +633,9 @@ where
                 Some((
                     r.space(),
                     r.service().as_str(),
-                    c.ability.as_ref().as_ref(),
+                    // TC-119: resolve deprecated aliases to canonical (see the
+                    // staging loop above) — identity for canonical URNs.
+                    crate::policy_capability::resolve_alias(c.ability.as_ref().as_ref()),
                     r.path()?,
                 ))
             })

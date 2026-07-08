@@ -280,10 +280,22 @@ async fn validate<C: ConnectionTrait>(
             // we require structural equality so a child cannot silently
             // replace a parent's caveat.
             for c in &dependant_caps {
+                // TC-119: registry-aware ability containment (same primitive as
+                // the invocation boundary). A parent ability supports the child
+                // when equal OR a registry alias OR an implication of it. Strict
+                // widening of the previous `c.ability == pc.ability` — exact
+                // matches still match; only registry-declared alias/implication
+                // pairs are added.
                 let mut candidates = parent_abilities
                     .iter()
                     .flatten()
-                    .filter(|pc| c.resource.extends(&pc.resource) && c.ability == pc.ability)
+                    .filter(|pc| {
+                        c.resource.extends(&pc.resource)
+                            && crate::policy_capability::ability_matches(
+                                pc.ability.as_ref().as_ref(),
+                                c.ability.as_ref().as_ref(),
+                            )
+                    })
                     .peekable();
 
                 if candidates.peek().is_none() {

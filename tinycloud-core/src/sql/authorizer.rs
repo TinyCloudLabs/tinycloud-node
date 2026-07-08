@@ -1,13 +1,15 @@
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 
 use super::caveats::SqlCaveats;
+use crate::policy_capability::{ability_matches, resolve_alias};
 
 fn can_write_data(ability: &str, is_admin: bool) -> bool {
-    is_admin
-        || matches!(
-            ability,
-            "tinycloud.sql/admin" | "tinycloud.sql/write" | "tinycloud.sql/*"
-        )
+    // TC-119: confers-write gate (registry-aware). `admin` is covered by the
+    // `is_admin` flag; `write` matches directly; `sql/*` matches via the
+    // registry implication `* ⊃ write`. Identical to the prior
+    // `admin | write | *` set. NOTE: `schema` does NOT confer write here (the
+    // registry declares `admin ⊃ schema`, not `schema ⊃ write`).
+    is_admin || ability_matches(ability, "tinycloud.sql/write")
 }
 
 fn is_sqlite_schema_table(table_name: &str) -> bool {
@@ -18,8 +20,11 @@ fn is_sqlite_schema_table(table_name: &str) -> bool {
 }
 
 fn can_write_table(ability: &str, is_admin: bool, table_name: &str) -> bool {
+    // The second clause is an exact-tier match on `schema` (writes to the
+    // sqlite schema tables during DDL), NOT a confers-check — so compare the
+    // alias-resolved URN rather than using `ability_matches`.
     can_write_data(ability, is_admin)
-        || (ability == "tinycloud.sql/schema" && is_sqlite_schema_table(table_name))
+        || (resolve_alias(ability) == "tinycloud.sql/schema" && is_sqlite_schema_table(table_name))
 }
 
 pub fn create_authorizer(
@@ -166,7 +171,7 @@ pub fn create_authorizer(
             column_name,
         } => {
             if !is_admin
-                && matches!(ability.as_str(), "tinycloud.sql/schema")
+                && resolve_alias(ability.as_str()) == "tinycloud.sql/schema"
                 && !schema_ddl_authorized
                 && !is_sqlite_schema_table(table_name)
             {
@@ -241,17 +246,16 @@ pub fn create_authorizer(
         // SQLite fires SQLITE_REINDEX while building an index; gate it like the
         // CreateIndex it accompanies so an authorized CREATE INDEX can complete.
         | AuthAction::Reindex { .. } => {
-            if !is_admin
-                && !matches!(
-                    ability.as_str(),
-                    "tinycloud.sql/write"
-                        | "tinycloud.sql/schema"
-                        | "tinycloud.sql/*"
-                )
+            // TC-119: DDL is permitted for abilities that confer write OR
+            // schema (`sql/*` implies both). Equivalent to the prior
+            // `write | schema | *` set; `admin` is handled by `is_admin`.
+            if !(is_admin
+                || ability_matches(ability.as_str(), "tinycloud.sql/write")
+                || ability_matches(ability.as_str(), "tinycloud.sql/schema"))
             {
                 Authorization::Deny
             } else {
-                if !is_admin && matches!(ability.as_str(), "tinycloud.sql/schema") {
+                if !is_admin && resolve_alias(ability.as_str()) == "tinycloud.sql/schema" {
                     schema_ddl_authorized = true;
                 }
                 Authorization::Allow
@@ -261,7 +265,7 @@ pub fn create_authorizer(
         // Allow internal operations
         AuthAction::Transaction { .. } | AuthAction::Savepoint { .. } | AuthAction::Select => {
             if !is_admin
-                && matches!(ability.as_str(), "tinycloud.sql/schema")
+                && resolve_alias(ability.as_str()) == "tinycloud.sql/schema"
                 && !schema_ddl_authorized
             {
                 return Authorization::Deny;
