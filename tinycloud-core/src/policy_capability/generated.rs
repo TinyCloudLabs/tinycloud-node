@@ -8,6 +8,13 @@ pub const REGISTRY_VERSION: u32 = 1;
 pub const REGISTRY_SOURCE_SHA256: &str =
     "3850f17a9771600b4a0f7bfa38ccaed8464f3ee391342f5d5b627276e614a8ff";
 
+/// GitHub repository the registry lives in (TC-121; js-sdk sync anchor).
+pub const REGISTRY_SOURCE_REPO: &str = "TinyCloudLabs/tinycloud-node";
+/// Git commit the artifact was generated from. Authoritative when generated
+/// in CI (GITHUB_SHA); approximate when generated locally, where it names
+/// the parent of the commit that will contain this artifact.
+pub const REGISTRY_SOURCE_GIT_SHA: &str = "e9be8963aef608b2e7cd61df500c84a6104df62a";
+
 /// Every action URN accepted at the policy boundary for `service`
 /// (active, deprecated-alias, and reserved), sorted. `None` if the
 /// service is unknown to the registry.

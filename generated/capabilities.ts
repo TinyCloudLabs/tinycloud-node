@@ -7,6 +7,15 @@
 export const REGISTRY_VERSION = 1 as const;
 export const REGISTRY_SOURCE_SHA256 = "3850f17a9771600b4a0f7bfa38ccaed8464f3ee391342f5d5b627276e614a8ff" as const;
 
+/** GitHub repository the registry lives in (TC-121; js-sdk sync anchor). */
+export const REGISTRY_SOURCE_REPO = "TinyCloudLabs/tinycloud-node" as const;
+/**
+ * Git commit the artifact was generated from. Authoritative when generated
+ * in CI (GITHUB_SHA); approximate when generated locally, where it names
+ * the parent of the commit that will contain this artifact.
+ */
+export const REGISTRY_SOURCE_GIT_SHA = "e9be8963aef608b2e7cd61df500c84a6104df62a" as const;
+
 export type CapabilityStatus = "active" | "deprecated-alias" | "reserved";
 
 export interface CapabilityEntry {
