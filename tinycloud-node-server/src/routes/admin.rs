@@ -73,6 +73,11 @@ pub struct UsageResponse {
     pub count: usize,
 }
 
+/// Set an admin quota override for a space.
+///
+/// Overrides are held in memory only and DO NOT survive a node restart
+/// (tracked in issue #104) — re-apply them after deploys, or set durable
+/// limits through the billing sidecar instead.
 #[put("/admin/quota/<space_id>", data = "<body>")]
 pub async fn set_quota(
     _auth: AdminAuth,
@@ -92,6 +97,11 @@ pub async fn set_quota(
     }))
 }
 
+/// Drop a space's admin override and mark any remote-cached limit stale.
+///
+/// The billing sidecar calls this after a plan change: the stale value is
+/// served for at most one more write while the node refreshes the limit in
+/// the background (writes are never blocked on the quota service).
 #[delete("/admin/quota/<space_id>")]
 pub async fn delete_quota(
     _auth: AdminAuth,
@@ -127,7 +137,13 @@ pub async fn get_quota(
     // usage — on a cold cache the two recurse into a mutual-call storm.
     // Report only what is already known locally (override/cached, else the
     // env default).
-    let effective = override_bytes.or_else(|| quota_cache.default_limit().map(|l| l.as_u64()));
+    let effective = match override_bytes {
+        Some(b) => Some(b),
+        None => match quota_cache.get_cached_remote(&sid).await {
+            Some(b) => Some(b),
+            None => quota_cache.default_limit().map(|l| l.as_u64()),
+        },
+    };
     let usage = tinycloud
         .store_size(&sid)
         .await
