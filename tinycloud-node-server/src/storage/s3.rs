@@ -1,8 +1,5 @@
 use aws_sdk_s3::{
-    error::{
-        GetObjectAttributesError, GetObjectAttributesErrorKind, GetObjectError, GetObjectErrorKind,
-        HeadObjectError, HeadObjectErrorKind,
-    },
+    error::{GetObjectError, GetObjectErrorKind, HeadObjectError, HeadObjectErrorKind},
     types::{ByteStream, SdkError},
     Client, // Config,
     Error as S3Error,
@@ -303,18 +300,17 @@ impl ImmutableDeleteStore for S3BlockStore {
     async fn remove(&self, space: &SpaceId, id: &Hash) -> Result<Option<()>, Self::Error> {
         let size: u64 = match self
             .client
-            .get_object_attributes()
+            .head_object()
             .bucket(&self.bucket)
             .key(self.key(space, id))
             .send()
             .await
         {
-            Ok(o) if !o.delete_marker() => o.object_size().try_into()?,
-            Ok(_) => return Ok(None),
+            Ok(o) => o.content_length().try_into()?,
             Err(SdkError::ServiceError {
                 err:
-                    GetObjectAttributesError {
-                        kind: GetObjectAttributesErrorKind::NoSuchKey(_),
+                    HeadObjectError {
+                        kind: HeadObjectErrorKind::NotFound(_),
                         ..
                     },
                 ..
@@ -344,5 +340,53 @@ impl StoreSize for S3BlockStore {
     type Error = S3StoreError;
     async fn total_size(&self, space: &SpaceId) -> Result<Option<u64>, Self::Error> {
         Ok(self.sizes.get_size(space).await)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use tinycloud_core::storage::{memory::MemoryStaging, ImmutableStaging, StorageConfig};
+
+    /// Live test against an S3-compatible endpoint (localstack). Run:
+    ///   docker run --rm -d -p 4566:4566 -e SERVICES=s3 localstack/localstack
+    ///   AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1 \
+    ///   TINYCLOUD_TEST_S3_ENDPOINT=http://localhost:4566 \
+    ///   TINYCLOUD_TEST_S3_BUCKET=tinycloud-blocks-test \
+    ///   cargo test -p tinycloud-node s3_remove_lifecycle -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "requires live S3-compatible endpoint (localstack); see doc comment"]
+    async fn s3_remove_lifecycle() {
+        let endpoint =
+            std::env::var("TINYCLOUD_TEST_S3_ENDPOINT").expect("set TINYCLOUD_TEST_S3_ENDPOINT");
+        let bucket =
+            std::env::var("TINYCLOUD_TEST_S3_BUCKET").expect("set TINYCLOUD_TEST_S3_BUCKET");
+        let config = S3BlockConfig {
+            bucket: bucket.clone(),
+            endpoint: Some(endpoint.parse().unwrap()),
+        };
+
+        // Create the bucket idempotently BEFORE opening the store (S3BlockStore::new_ lists the bucket at s3.rs ~76, so it must exist).
+        let client = new_client(&config).await;
+        let _ = client.create_bucket().bucket(&bucket).send().await; // ignore "already exists"
+
+        let store = config.open().await.unwrap();
+        let space_id: SpaceId = "tinycloud:key:test:default".parse().unwrap();
+        store.create(&space_id).await.unwrap();
+
+        let data = b"tc-140 regression";
+        let staging = MemoryStaging;
+        let mut stage = staging.stage(&space_id).await.unwrap();
+        futures::io::copy(&mut &data[..], &mut stage).await.unwrap();
+        let hash = ImmutableWriteStore::<MemoryStaging>::persist(&store, &space_id, stage)
+            .await
+            .unwrap();
+
+        assert!(store.contains(&space_id, &hash).await.unwrap());
+        // THE TC-140 ASSERTION: remove of an existing object must succeed (Ok(Some(()))).
+        assert_eq!(store.remove(&space_id, &hash).await.unwrap(), Some(()));
+        // remove-nonexistent must be a clean None, not an error.
+        assert_eq!(store.remove(&space_id, &hash).await.unwrap(), None);
+        assert!(!store.contains(&space_id, &hash).await.unwrap());
     }
 }
