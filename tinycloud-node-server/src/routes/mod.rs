@@ -35,6 +35,7 @@ use tinycloud_core::duckdb::{
 use tinycloud_core::{
     encryption_network::EncryptionService,
     events::Invocation,
+    keys::StaticSecret,
     models::{hook_delivery, hook_subscription, kv_delete, kv_write},
     sea_orm::DbErr,
     sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder},
@@ -959,17 +960,7 @@ async fn invoke_impl(
                     })
                 }
             }
-            Err(e) => Err((
-                match e {
-                    TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
-                    TxStoreError::Tx(TxError::EpochInsert(_)) => Status::InternalServerError,
-                    TxStoreError::Tx(TxError::Db(DbErr::ConnectionAcquire(_))) => {
-                        Status::InternalServerError
-                    }
-                    _ => Status::Unauthorized,
-                },
-                e.to_string(),
-            )),
+            Err(e) => Err((map_invoke_error(&e), e.to_string())),
         };
 
         if let Some(timer) = timer {
@@ -2188,6 +2179,19 @@ fn missing_database_admin_capability_error(
     )
 }
 
+fn map_invoke_error(e: &TxStoreError<BlockStores, BlockStage, StaticSecret>) -> Status {
+    match e {
+        TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
+        TxStoreError::Tx(TxError::EpochInsert(_)) => Status::InternalServerError,
+        TxStoreError::Tx(TxError::Db(DbErr::ConnectionAcquire(_))) => Status::InternalServerError,
+        TxStoreError::StoreRead(_)
+        | TxStoreError::StoreWrite(_)
+        | TxStoreError::StoreDelete(_)
+        | TxStoreError::Io(_) => Status::InternalServerError,
+        _ => Status::Unauthorized,
+    }
+}
+
 /// Verify authorization by invoking with empty inputs.
 ///
 /// Shared by SQL and DuckDB invoke handlers. The caller must extract caveats
@@ -2204,19 +2208,7 @@ async fn verify_auth(
     let result = tinycloud
         .invoke::<BlockStage>(invocation, HashMap::new())
         .await
-        .map_err(|e| {
-            (
-                match e {
-                    TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
-                    TxStoreError::Tx(TxError::EpochInsert(_)) => Status::InternalServerError,
-                    TxStoreError::Tx(TxError::Db(DbErr::ConnectionAcquire(_))) => {
-                        Status::InternalServerError
-                    }
-                    _ => Status::Unauthorized,
-                },
-                e.to_string(),
-            )
-        })
+        .map_err(|e| (map_invoke_error(&e), e.to_string()))
         .map(|(tx_result, _)| tx_result);
     crate::prometheus::observe_span(
         span,
@@ -2232,7 +2224,10 @@ mod tests {
     use crate::{
         config::{Config, HooksConfig},
         quota::QuotaCache,
-        storage::file_system::FileSystemConfig as NodeFileSystemConfig,
+        storage::{
+            file_system::{FileSystemConfig as NodeFileSystemConfig, FileSystemStoreError},
+            s3::S3StoreError,
+        },
     };
     use anyhow::Result;
     use tempfile::TempDir;
@@ -2244,18 +2239,56 @@ mod tests {
     };
     use tinycloud_core::{
         keys::StaticSecret,
-        models::{hook_delivery, hook_subscription},
+        models::{hook_delivery, hook_subscription, invocation::InvocationError},
         sea_orm::{ColumnTrait, ConnectOptions, Database, EntityTrait, QueryFilter, QueryOrder},
-        storage::either::Either,
+        storage::either::{Either, EitherError},
         storage::StorageConfig as _,
         types::{Ability, Resource},
     };
     use tokio::time::{timeout, Duration};
 
+    type InvokeError = TxStoreError<BlockStores, BlockStage, StaticSecret>;
+    type BlockStoreError = EitherError<S3StoreError, FileSystemStoreError>;
+
     fn test_space_id(name: &str) -> SpaceId {
         let jwk = JWK::generate_ed25519().unwrap();
         let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
         SpaceId::new(did, name.parse().unwrap())
+    }
+
+    fn s3_store_error() -> BlockStoreError {
+        EitherError::A(S3StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "s3 exploded",
+        )))
+    }
+
+    #[tokio::test]
+    async fn storage_errors_map_to_500_not_401() {
+        let errors = [
+            InvokeError::StoreDelete(s3_store_error()),
+            InvokeError::StoreRead(s3_store_error()),
+            InvokeError::StoreWrite(s3_store_error()),
+            InvokeError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "s3 exploded",
+            )),
+        ];
+
+        for error in errors {
+            assert_eq!(map_invoke_error(&error), Status::InternalServerError);
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_and_notfound_mappings_unchanged() {
+        let not_found = InvokeError::Tx(TxError::SpaceNotFound);
+        assert_eq!(map_invoke_error(&not_found), Status::NotFound);
+
+        let auth_error = InvokeError::Tx(TxError::InvalidInvocation(
+            InvocationError::MissingKvWrite("missing".parse().unwrap()),
+        ));
+        assert_eq!(map_invoke_error(&auth_error), Status::Unauthorized);
     }
 
     async fn test_tinycloud() -> Result<TinyCloud> {
