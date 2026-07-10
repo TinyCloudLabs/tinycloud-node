@@ -321,6 +321,7 @@ async fn record_fetch(
 #[cfg(test)]
 mod test {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     fn space(n: u8) -> SpaceId {
         format!("tinycloud:pkh:eip155:1:0x7BD63AA37326a64d458559F44432103e3d6eEDE9:s{n}")
@@ -331,6 +332,47 @@ mod test {
     // Unroutable per RFC 5737 (TEST-NET-1): connects fail fast and never
     // succeed, exercising the failure paths without a live service.
     const DEAD_URL: &str = "http://192.0.2.1:1";
+
+    #[tokio::test]
+    async fn first_sight_http_success_is_parsed_and_cached() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local listener");
+        let quota_url = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address")
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept quota request");
+            let body = r#"{"storage_limit_bytes":500}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write quota response");
+            stream.shutdown().await.expect("close quota response");
+            listener
+        });
+
+        let cache = QuotaCache::new(Some(ByteUnit::Byte(100)), Some(quota_url));
+        let sid = space(1);
+        let key = sid.to_string();
+
+        assert_eq!(cache.get_limit(&sid).await, Some(ByteUnit::Byte(500)));
+        let listener = server.await.expect("quota server task");
+        assert_eq!(cache.remote_entry(&key).await, Some((Some(500), false)));
+        assert_eq!(cache.get_limit(&sid).await, Some(ByteUnit::Byte(500)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "the fresh cached entry must avoid a second network request",
+        );
+    }
 
     #[tokio::test]
     async fn refresh_decision_respects_failure_backoff_and_invalidation() {
