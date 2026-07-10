@@ -32,6 +32,19 @@ struct RemoteEntry {
     /// Set by `remove_limit` (billing invalidation after a plan change): the
     /// value is served one more time while a refresh runs in the background.
     stale: bool,
+    /// The most recent failed refresh of an already-known value. This keeps
+    /// stale writes from repeatedly retrying an unavailable quota service.
+    last_failure: Option<Instant>,
+}
+
+#[allow(clippy::unnecessary_map_or)] // Keep D1's no-failure-or-backoff-elapsed policy explicit.
+fn should_spawn_refresh(
+    stale: bool,
+    fetched_at_elapsed: Duration,
+    last_failure_elapsed: Option<Duration>,
+) -> bool {
+    (stale && last_failure_elapsed.map_or(true, |elapsed| elapsed >= FAILURE_BACKOFF))
+        || (!stale && fetched_at_elapsed >= FRESH_TTL)
 }
 
 pub struct QuotaCache {
@@ -99,8 +112,13 @@ impl QuotaCache {
                 limit_bytes: Some(limit),
                 fetched_at,
                 stale,
+                last_failure,
             }) => {
-                if stale || fetched_at.elapsed() >= FRESH_TTL {
+                if should_spawn_refresh(
+                    stale,
+                    fetched_at.elapsed(),
+                    last_failure.map(|failure| failure.elapsed()),
+                ) {
                     self.spawn_refresh(key);
                 }
                 Some(ByteUnit::Byte(limit))
@@ -212,6 +230,7 @@ impl QuotaCache {
                 limit_bytes,
                 fetched_at: Instant::now(),
                 stale,
+                last_failure: None,
             },
         );
     }
@@ -270,6 +289,7 @@ async fn record_fetch(
                     limit_bytes: Some(limit),
                     fetched_at: Instant::now(),
                     stale: false,
+                    last_failure: None,
                 },
             );
         }
@@ -280,6 +300,7 @@ async fn record_fetch(
                     limit_bytes: Some(previous),
                     fetched_at: Instant::now(),
                     stale: true,
+                    last_failure: Some(Instant::now()),
                 },
             );
         }
@@ -290,6 +311,7 @@ async fn record_fetch(
                     limit_bytes: None,
                     fetched_at: Instant::now(),
                     stale: false,
+                    last_failure: None,
                 },
             );
         }
@@ -309,6 +331,48 @@ mod test {
     // Unroutable per RFC 5737 (TEST-NET-1): connects fail fast and never
     // succeed, exercising the failure paths without a live service.
     const DEAD_URL: &str = "http://192.0.2.1:1";
+
+    #[tokio::test]
+    async fn refresh_decision_respects_failure_backoff_and_invalidation() {
+        assert!(!should_spawn_refresh(
+            true,
+            Duration::from_secs(0),
+            Some(FAILURE_BACKOFF - Duration::from_millis(1)),
+        ));
+        assert!(should_spawn_refresh(
+            true,
+            Duration::from_secs(0),
+            Some(FAILURE_BACKOFF),
+        ));
+        assert!(should_spawn_refresh(true, Duration::from_secs(0), None));
+        assert!(!should_spawn_refresh(false, Duration::from_secs(0), None));
+    }
+
+    #[tokio::test]
+    async fn recent_failed_stale_refresh_does_not_spawn() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local listener");
+        let cache = QuotaCache::new(
+            Some(ByteUnit::Byte(100)),
+            Some(format!(
+                "http://{}",
+                listener.local_addr().expect("listener address")
+            )),
+        );
+        let sid = space(1);
+        let key = sid.to_string();
+        cache.seed_remote(&key, Some(500), false).await;
+        record_fetch(&cache.remote, &key, None).await;
+
+        assert_eq!(cache.get_limit(&sid).await, Some(ByteUnit::Byte(500)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "a recent failed refresh must suppress another background fetch",
+        );
+    }
 
     #[tokio::test]
     async fn override_beats_remote_and_default() {
