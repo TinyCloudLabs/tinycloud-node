@@ -16,11 +16,12 @@ cargo test --manifest-path test/m1-realdata-e2e/Cargo.toml
 Observed result:
 
 ```text
-running 2 tests
+running 3 tests
 test evidence_verification_path_rejects_direct_wall_clock_reads ... ok
+test evidence_verification_uses_fixture_time_under_hostile_ambient ... ok
 test deterministic_cross_layer_contract_is_observed_from_real_operations ... ok
 
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
 ## Strict lint

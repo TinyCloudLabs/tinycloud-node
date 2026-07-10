@@ -84,12 +84,11 @@ struct NodeGrantIssuer {
     space: SpaceId,
 }
 
-type ClockObservation = Arc<Mutex<Option<(DateTime<Utc>, DateTime<Utc>, DateTime<Utc>)>>>;
+type ClockObservation = Arc<Mutex<Option<(DateTime<Utc>, DateTime<Utc>)>>>;
 
 struct FixtureTimeVerifier {
     inner: VcEvidenceVerifier,
     fixture_now: DateTime<Utc>,
-    injected_ambient_now: DateTime<Utc>,
     observation: Option<ClockObservation>,
 }
 
@@ -189,7 +188,7 @@ impl FixtureTimeVerifier {
     fn fixture_context(&self, ambient: &RuntimeEvidenceContext) -> RuntimeEvidenceContext {
         if let Some(observation) = &self.observation {
             *observation.lock().expect("clock observation lock") =
-                Some((ambient.now, self.injected_ambient_now, self.fixture_now));
+                Some((ambient.now, self.fixture_now));
         }
         RuntimeEvidenceContext {
             policy: ambient.policy.clone(),
@@ -276,19 +275,13 @@ secret = "{}"
 
     let before_delegations = delegation::Entity::find().count(&conn).await?;
     let before_abilities = abilities::Entity::find().count(&conn).await?;
-    let hostile_ambient_now = DateTime::from_timestamp(HOSTILE_AMBIENT_TIMESTAMP, 0)
-        .context("hostile ambient timestamp")?;
     let runtime_issuance_now = DateTime::from_timestamp(RUNTIME_ISSUANCE_TIMESTAMP, 0)
         .context("deterministic runtime issuance timestamp")?;
-    let fixture_now = fixture_verification_time(VALID_FIXTURE, hostile_ambient_now)?;
+    let fixture_now = fixture_verification_time(VALID_FIXTURE)?;
     assert_eq!(
         fixture_now.timestamp(),
         1_781_222_580,
         "runtime evidence time must be the fixture verificationOptions.now instant"
-    );
-    assert_ne!(
-        fixture_now, hostile_ambient_now,
-        "the injected advanced ambient time must not reach evidence verification"
     );
     let clock_observation = Arc::new(Mutex::new(None));
     let mut runtime = runtime(
@@ -297,7 +290,6 @@ secret = "{}"
         fixture_time_verifier(
             trusted_verifier(),
             fixture_now,
-            hostile_ambient_now,
             Some(Arc::clone(&clock_observation)),
         ),
         NodeGrantIssuer {
@@ -324,8 +316,8 @@ secret = "{}"
 
     assert_eq!(
         *clock_observation.lock().expect("clock observation lock"),
-        Some((runtime_issuance_now, hostile_ambient_now, fixture_now)),
-        "the verifier must replace the injected ambient time with the parsed fixture instant"
+        Some((runtime_issuance_now, fixture_now)),
+        "the verifier must replace the runtime time with the parsed fixture instant"
     );
     assert_eq!(
         issued.issued_at, runtime_issuance_now,
@@ -549,16 +541,14 @@ fn exercise_engine_denials(context: &EngineDenialContext<'_>) -> Result<()> {
         owner_did: (*owner_did).to_string(),
         space: (*space).clone(),
     };
-    let hostile_ambient_now = DateTime::from_timestamp(HOSTILE_AMBIENT_TIMESTAMP, 0)
-        .context("hostile ambient timestamp")?;
     let runtime_issuance_now = DateTime::from_timestamp(RUNTIME_ISSUANCE_TIMESTAMP, 0)
         .context("deterministic runtime issuance timestamp")?;
-    let valid_now = fixture_verification_time(VALID_FIXTURE, hostile_ambient_now)?;
+    let valid_now = fixture_verification_time(VALID_FIXTURE)?;
 
     let mut audience_runtime = runtime(
         (*policy).clone(),
         (*active_status).clone(),
-        fixture_time_verifier(trusted_verifier(), valid_now, hostile_ambient_now, None),
+        fixture_time_verifier(trusted_verifier(), valid_now, None),
         issuer(),
     )?;
     let challenge = audience_runtime.issue_challenge(&policy.policy_id, runtime_issuance_now)?;
@@ -577,11 +567,11 @@ fn exercise_engine_denials(context: &EngineDenialContext<'_>) -> Result<()> {
         .unwrap_err();
     assert_runtime_code(&audience_error, "presentation-audience-mismatch")?;
 
-    let expired_now = fixture_verification_time(EXPIRED_FIXTURE, hostile_ambient_now)?;
+    let expired_now = fixture_verification_time(EXPIRED_FIXTURE)?;
     let mut expired_runtime = runtime(
         (*policy).clone(),
         (*active_status).clone(),
-        fixture_time_verifier(trusted_verifier(), expired_now, hostile_ambient_now, None),
+        fixture_time_verifier(trusted_verifier(), expired_now, None),
         issuer(),
     )?;
     let challenge = expired_runtime.issue_challenge(&policy.policy_id, runtime_issuance_now)?;
@@ -619,16 +609,11 @@ fn exercise_engine_denials(context: &EngineDenialContext<'_>) -> Result<()> {
         ),
         &policy_key,
     )?;
-    let untrusted_now = fixture_verification_time(UNTRUSTED_FIXTURE, hostile_ambient_now)?;
+    let untrusted_now = fixture_verification_time(UNTRUSTED_FIXTURE)?;
     let mut untrusted_runtime = runtime(
         untrusted_policy.clone(),
         untrusted_status,
-        fixture_time_verifier(
-            untrusted_verifier(),
-            untrusted_now,
-            hostile_ambient_now,
-            None,
-        ),
+        fixture_time_verifier(untrusted_verifier(), untrusted_now, None),
         issuer(),
     )?;
     let challenge =
@@ -651,7 +636,7 @@ fn exercise_engine_denials(context: &EngineDenialContext<'_>) -> Result<()> {
     let mut inactive_runtime = runtime(
         (*policy).clone(),
         (*active_status).clone(),
-        fixture_time_verifier(trusted_verifier(), valid_now, hostile_ambient_now, None),
+        fixture_time_verifier(trusted_verifier(), valid_now, None),
         issuer(),
     )?;
     let challenge = inactive_runtime.issue_challenge(&policy.policy_id, runtime_issuance_now)?;
@@ -683,7 +668,7 @@ fn exercise_engine_denials(context: &EngineDenialContext<'_>) -> Result<()> {
     let mut compromised_runtime = runtime(
         (*policy).clone(),
         (*active_status).clone(),
-        fixture_time_verifier(trusted_verifier(), valid_now, hostile_ambient_now, None),
+        fixture_time_verifier(trusted_verifier(), valid_now, None),
         issuer(),
     )?;
     let revoked_enrollment = enrollment_status(2, HolderEnrollmentDisposition::Revoked);
@@ -762,13 +747,11 @@ fn untrusted_verifier() -> VcEvidenceVerifier {
 fn fixture_time_verifier(
     inner: VcEvidenceVerifier,
     fixture_now: DateTime<Utc>,
-    injected_ambient_now: DateTime<Utc>,
     observation: Option<ClockObservation>,
 ) -> FixtureTimeVerifier {
     FixtureTimeVerifier {
         inner,
         fixture_now,
-        injected_ambient_now,
         observation,
     }
 }
@@ -1205,15 +1188,60 @@ fn fixture_evidence(source: &str) -> Result<Value> {
     Ok(json!({ "sdJwt": value["evidencePresentation"]["sdJwt"] }))
 }
 
-fn fixture_verification_time(
-    source: &str,
-    _injected_ambient_now: DateTime<Utc>,
-) -> Result<DateTime<Utc>> {
+fn fixture_verification_time(source: &str) -> Result<DateTime<Utc>> {
     let fixture: Value = serde_json::from_str(source)?;
     let timestamp = fixture["verificationOptions"]["now"]
         .as_i64()
         .context("fixture verificationOptions.now integer timestamp")?;
     DateTime::from_timestamp(timestamp, 0).context("fixture verificationOptions.now timestamp")
+}
+
+#[test]
+fn evidence_verification_uses_fixture_time_under_hostile_ambient() -> Result<()> {
+    let mut owner_jwk = JWK::generate_ed25519()?;
+    owner_jwk.algorithm = Some(Algorithm::EdDSA);
+    let owner_did = node_identity(&owner_jwk)?.0;
+    let space = SpaceId::new(owner_did.parse::<DIDBuf>()?, SPACE_NAME.parse()?);
+    let policy = policy(&space, &owner_did);
+    let requirement = match &policy.when {
+        policy_core::Expression::Evidence(expression) => expression.evidence.clone(),
+        _ => anyhow::bail!("launch policy must contain its credential evidence requirement"),
+    };
+    let hostile_ambient_now = DateTime::from_timestamp(HOSTILE_AMBIENT_TIMESTAMP, 0)
+        .context("hostile ambient timestamp")?;
+    let fixture_now = fixture_verification_time(VALID_FIXTURE)?;
+    let observation = Arc::new(Mutex::new(None));
+    let verifier = fixture_time_verifier(
+        trusted_verifier(),
+        fixture_now,
+        Some(Arc::clone(&observation)),
+    );
+    let ambient_context = RuntimeEvidenceContext {
+        policy: policy.clone(),
+        eligible_subject_did: SUBJECT.to_string(),
+        holder_did: SUBJECT.to_string(),
+        requested_capabilities: policy.resource.permissions_ceiling.clone(),
+        now: hostile_ambient_now,
+    };
+
+    let satisfaction = EvidenceVerifier::verify_with_provenance(
+        &verifier,
+        &requirement,
+        &fixture_evidence(VALID_FIXTURE)?,
+        &ambient_context,
+    )?;
+
+    assert_eq!(
+        *observation.lock().expect("clock observation lock"),
+        Some((hostile_ambient_now, fixture_now)),
+        "the real verifier adapter must observe hostile ambient runtime time and pass fixture time onward"
+    );
+    assert_ne!(hostile_ambient_now, fixture_now);
+    assert!(
+        !satisfaction.evidence_ids.is_empty(),
+        "credential verification must produce evidence satisfaction under hostile ambient time"
+    );
+    Ok(())
 }
 
 #[test]
@@ -1254,6 +1282,13 @@ fn evidence_verification_path_rejects_direct_wall_clock_reads() {
         .split_once("#[test]")
         .expect("source guard marker")
         .0;
+    let ambient_independence_guard = source
+        .split_once("fn evidence_verification_uses_fixture_time_under_hostile_ambient")
+        .expect("ambient independence source marker")
+        .1
+        .split_once("fn evidence_verification_path_rejects_direct_wall_clock_reads")
+        .expect("source guard function marker")
+        .0;
 
     for evidence_path in [
         setup_and_resolve,
@@ -1261,6 +1296,7 @@ fn evidence_verification_path_rejects_direct_wall_clock_reads() {
         presentation_constructor,
         verifier_adapter,
         fixture_time_constructor,
+        ambient_independence_guard,
     ] {
         for prohibited in ["Utc::now", "SystemTime::now", "Local::now"] {
             assert!(
