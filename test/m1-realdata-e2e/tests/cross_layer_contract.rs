@@ -77,6 +77,30 @@ struct NodeGrantIssuer {
     space: SpaceId,
 }
 
+struct InvocationSigner<'a> {
+    jwk: &'a JWK,
+    verification_method: &'a str,
+    did: &'a str,
+    parent: Hash,
+}
+
+struct InvocationContext<'a> {
+    client: &'a Client,
+    signer: InvocationSigner<'a>,
+    space: &'a SpaceId,
+}
+
+struct EngineDenialContext<'a> {
+    policy: &'a Policy,
+    active_status: &'a PolicyStatus,
+    owner_jwk: &'a JWK,
+    owner_verification_method: &'a str,
+    owner_did: &'a str,
+    space: &'a SpaceId,
+    holder_did: &'a str,
+    holder_key: &'a SigningKey,
+}
+
 impl GrantIssuer for NodeGrantIssuer {
     fn issuer_did(&self) -> &str {
         &self.owner_did
@@ -154,6 +178,21 @@ secret = "{}"
     }
     .insert(&conn)
     .await?;
+    assert_eq!(
+        space::Entity::find().count(&conn).await?,
+        1,
+        "setup must provision exactly one non-authority space row"
+    );
+    assert_eq!(
+        delegation::Entity::find().count(&conn).await?,
+        0,
+        "space setup must not provision delegation authority"
+    );
+    assert_eq!(
+        abilities::Entity::find().count(&conn).await?,
+        0,
+        "space setup must not provision ability authority"
+    );
     tokio::fs::create_dir_all(
         datadir
             .join("blocks")
@@ -265,13 +304,18 @@ secret = "{}"
 
     seed_listen_kv(&client, &owner_jwk, &owner_vm, &owner_did, &space_id).await?;
 
+    let invocation = InvocationContext {
+        client: &client,
+        signer: InvocationSigner {
+            jwk: &holder_jwk,
+            verification_method: &holder_vm,
+            did: &holder_did,
+            parent: imported_hash,
+        },
+        space: &space_id,
+    };
     let conversation = invoke_sql(
-        &client,
-        &holder_jwk,
-        &holder_vm,
-        &holder_did,
-        imported_hash,
-        &space_id,
+        &invocation,
         "sql-success-conversation",
         SqlRequest::ExecuteStatement {
             name: "listen.getConversation".to_string(),
@@ -286,12 +330,7 @@ secret = "{}"
     assert_eq!(conversation_json["rows"][0][1], "Planning");
 
     let participants = invoke_sql(
-        &client,
-        &holder_jwk,
-        &holder_vm,
-        &holder_did,
-        imported_hash,
-        &space_id,
+        &invocation,
         "sql-success-participants",
         SqlRequest::ExecuteStatement {
             name: "listen.listParticipants".to_string(),
@@ -304,17 +343,7 @@ secret = "{}"
     assert_eq!(participant_json["rowCount"], 1);
     assert_eq!(participant_json["rows"][0][1], "Ada");
 
-    let kv = invoke_kv(
-        &client,
-        &holder_jwk,
-        &holder_vm,
-        &holder_did,
-        imported_hash,
-        &space_id,
-        "tinycloud.kv/get",
-        "kv-success",
-    )
-    .await?;
+    let kv = invoke_kv(&invocation, "tinycloud.kv/get", "kv-success").await?;
     assert_eq!(kv.0, Status::Ok, "{}", String::from_utf8_lossy(&kv.1));
     assert_eq!(kv.1, KV_SEED);
 
@@ -360,32 +389,12 @@ secret = "{}"
         ("export", SqlRequest::Export, "sql-export-blocked"),
     ];
     for (case, request, expected) in sql_denials {
-        let observed = invoke_sql(
-            &client,
-            &holder_jwk,
-            &holder_vm,
-            &holder_did,
-            imported_hash,
-            &space_id,
-            &format!("sql-denial-{case}"),
-            request,
-        )
-        .await?;
+        let observed = invoke_sql(&invocation, &format!("sql-denial-{case}"), request).await?;
         assert_eq!(observed.0, Status::Forbidden, "{case}: {}", observed.1);
         assert_eq!(observed.1, expected, "operation {case} native outcome");
     }
 
-    let unauthorized_kv = invoke_kv(
-        &client,
-        &holder_jwk,
-        &holder_vm,
-        &holder_did,
-        imported_hash,
-        &space_id,
-        "tinycloud.kv/del",
-        "kv-unauthorized",
-    )
-    .await?;
+    let unauthorized_kv = invoke_kv(&invocation, "tinycloud.kv/del", "kv-unauthorized").await?;
     assert_eq!(unauthorized_kv.0, Status::Unauthorized);
     assert!(String::from_utf8_lossy(&unauthorized_kv.1).contains("Unauthorized Action"));
     assert!(!unauthorized_kv
@@ -419,41 +428,42 @@ secret = "{}"
     let replay_error = runtime.resolve(replay_presentation, now).unwrap_err();
     assert_runtime_code(&replay_error, "challenge-nonce-consumed")?;
 
-    exercise_engine_denials(
-        &policy,
-        &active_status,
-        &owner_jwk,
-        &owner_vm,
-        &owner_did,
-        &space_id,
-        &holder_did,
-        &holder_signing_key,
-    )?;
+    exercise_engine_denials(&EngineDenialContext {
+        policy: &policy,
+        active_status: &active_status,
+        owner_jwk: &owner_jwk,
+        owner_verification_method: &owner_vm,
+        owner_did: &owner_did,
+        space: &space_id,
+        holder_did: &holder_did,
+        holder_key: &holder_signing_key,
+    })?;
 
     Ok(())
 }
 
-fn exercise_engine_denials(
-    policy: &Policy,
-    active_status: &PolicyStatus,
-    owner_jwk: &JWK,
-    owner_vm: &str,
-    owner_did: &str,
-    space: &SpaceId,
-    holder_did: &str,
-    holder_key: &SigningKey,
-) -> Result<()> {
+fn exercise_engine_denials(context: &EngineDenialContext<'_>) -> Result<()> {
+    let EngineDenialContext {
+        policy,
+        active_status,
+        owner_jwk,
+        owner_verification_method,
+        owner_did,
+        space,
+        holder_did,
+        holder_key,
+    } = context;
     let issuer = || NodeGrantIssuer {
-        owner_jwk: owner_jwk.clone(),
-        owner_vm: owner_vm.to_string(),
-        owner_did: owner_did.to_string(),
-        space: space.clone(),
+        owner_jwk: (*owner_jwk).clone(),
+        owner_vm: (*owner_verification_method).to_string(),
+        owner_did: (*owner_did).to_string(),
+        space: (*space).clone(),
     };
     let now = Utc::now();
 
     let mut audience_runtime = runtime(
-        policy.clone(),
-        active_status.clone(),
+        (*policy).clone(),
+        (*active_status).clone(),
         trusted_verifier(),
         issuer(),
     )?;
@@ -471,8 +481,8 @@ fn exercise_engine_denials(
     assert_runtime_code(&audience_error, "presentation-audience-mismatch")?;
 
     let mut expired_runtime = runtime(
-        policy.clone(),
-        active_status.clone(),
+        (*policy).clone(),
+        (*active_status).clone(),
         trusted_verifier(),
         issuer(),
     )?;
@@ -490,8 +500,8 @@ fn exercise_engine_denials(
     assert_runtime_code(&expired_error, "evidence-credential-invalid")?;
 
     let mut untrusted_runtime = runtime(
-        policy.clone(),
-        active_status.clone(),
+        (*policy).clone(),
+        (*active_status).clone(),
         untrusted_verifier(),
         issuer(),
     )?;
@@ -509,8 +519,8 @@ fn exercise_engine_denials(
     assert_runtime_code(&untrusted_error, "evidence-issuer-untrusted")?;
 
     let mut inactive_runtime = runtime(
-        policy.clone(),
-        active_status.clone(),
+        (*policy).clone(),
+        (*active_status).clone(),
         trusted_verifier(),
         issuer(),
     )?;
@@ -539,8 +549,8 @@ fn exercise_engine_denials(
     assert_runtime_code(&inactive_error, "policy-inactive")?;
 
     let mut compromised_runtime = runtime(
-        policy.clone(),
-        active_status.clone(),
+        (*policy).clone(),
+        (*active_status).clone(),
         trusted_verifier(),
         issuer(),
     )?;
@@ -855,10 +865,7 @@ fn signed_node_ucan(
 }
 
 fn holder_invocation(
-    holder_jwk: &JWK,
-    holder_vm: &str,
-    holder_did: &str,
-    parent: Hash,
+    signer: &InvocationSigner<'_>,
     resource: &ResourceId,
     ability: &str,
     caveat: Option<Value>,
@@ -873,48 +880,41 @@ fn holder_invocation(
     }
     caps.with_action(resource.as_uri(), ability.parse::<UcanAbility>()?, [nb]);
     let payload = Payload {
-        issuer: holder_vm.parse::<DIDURLBuf>()?,
-        audience: holder_did.parse::<DIDBuf>()?,
+        issuer: signer.verification_method.parse::<DIDURLBuf>()?,
+        audience: signer.did.parse::<DIDBuf>()?,
         not_before: None,
         expiration: NumericDate::try_from_seconds(
             (Utc::now() + Duration::minutes(2)).timestamp() as f64
         )?,
         nonce: Some(nonce.to_string()),
         facts: Some(Vec::<Value>::new()),
-        proof: vec![parent.to_cid(0x55)],
+        proof: vec![signer.parent.to_cid(0x55)],
         attenuation: caps,
     }
-    .sign(holder_jwk.get_algorithm().unwrap_or_default(), holder_jwk)?;
+    .sign(signer.jwk.get_algorithm().unwrap_or_default(), signer.jwk)?;
     Ok(payload.encode()?)
 }
 
 async fn invoke_sql(
-    client: &Client,
-    holder_jwk: &JWK,
-    holder_vm: &str,
-    holder_did: &str,
-    parent: Hash,
-    space: &SpaceId,
+    context: &InvocationContext<'_>,
     nonce: &str,
     request: SqlRequest,
 ) -> Result<(Status, String)> {
-    let resource = space.clone().to_resource(
+    let resource = context.space.clone().to_resource(
         "sql".parse::<Service>()?,
         Some(SQL_PATH.parse::<AuthPath>()?),
         None,
         None,
     );
     let header = holder_invocation(
-        holder_jwk,
-        holder_vm,
-        holder_did,
-        parent,
+        &context.signer,
         &resource,
         "tinycloud.sql/read",
         Some(sql_caveat()),
         nonce,
     )?;
-    let response = client
+    let response = context
+        .client
         .post("/invoke")
         .header(Header::new("Authorization", header))
         .header(ContentType::JSON)
@@ -927,25 +927,19 @@ async fn invoke_sql(
 }
 
 async fn invoke_kv(
-    client: &Client,
-    holder_jwk: &JWK,
-    holder_vm: &str,
-    holder_did: &str,
-    parent: Hash,
-    space: &SpaceId,
+    context: &InvocationContext<'_>,
     ability: &str,
     nonce: &str,
 ) -> Result<(Status, Vec<u8>)> {
-    let resource = space.clone().to_resource(
+    let resource = context.space.clone().to_resource(
         "kv".parse::<Service>()?,
         Some(KV_PATH.parse::<AuthPath>()?),
         None,
         None,
     );
-    let header = holder_invocation(
-        holder_jwk, holder_vm, holder_did, parent, &resource, ability, None, nonce,
-    )?;
-    let response = client
+    let header = holder_invocation(&context.signer, &resource, ability, None, nonce)?;
+    let response = context
+        .client
         .post("/invoke")
         .header(Header::new("Authorization", header))
         .dispatch()

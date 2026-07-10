@@ -9,8 +9,13 @@ whose vendored `reachability` is `mounted-runtime`.
 ## Startup and ordering
 
 1. Start a Rocket node in-process with the W5 Figment overlay. `tinycloud::app`
-   initializes the database and managed `SqlService`; the harness then seeds
-   Listen-shaped SQL and KV bytes through node-owned in-process services before
+   initializes the database and managed `SqlService`. There is no production
+   route for initial space creation: as in the W5 recipe, the harness inserts
+   exactly one `space` row and creates its block directory as a setup-only
+   storage precondition. It immediately observes one space row and zero
+   delegation/ability rows, so this direct setup mutation is explicitly outside
+   the authority-chain claim. The harness then seeds Listen-shaped SQL through
+   `SqlService` and KV bytes through an owner-signed native invocation before
    any holder read (`tinycloud-node-server/src/lib.rs`,
    `tinycloud-node-server/src/routes/mod.rs`, and
    `tinycloud-core/src/sql/service.rs`). No socket is bound.
@@ -38,6 +43,7 @@ whose vendored `reachability` is `mounted-runtime`.
 
 | Required behavior | Production hop | Observation produced by the harness |
 | --- | --- | --- |
+| Space storage precondition (not authority evidence) | No production initial-space route exists; W5 provisions `space::ActiveModel` plus the block directory before native service use | The setup insert produces exactly one space row while delegation and ability tables remain empty. Authority provenance is observed separately only after `/delegate`. |
 | Real launch-profile resolve | `PolicyRuntime::resolve` -> `verify_evidence` -> `policy_evidence_vc::VcEvidenceVerifier::verify` -> `GrantIssuer::issue` | The resolve returns a delegation whose holder, policy, capabilities, validity, and encoded UCAN are compared with the presentation and policy used by that call. |
 | Delegation import provenance | local `/delegate` -> `TinyCloud::delegate` -> delegation `verify`/`validate`/`save` | Delegation and ability tables are empty before import; the returned import CID is then observed in the created delegation row and its abilities. The test never writes either table. |
 | Named Listen SQL reads | local `/invoke` -> chain validation in `models/invocation.rs` -> `routes::enforce_constrained_profile` -> `SqlService::execute` | Named statements return the exact rows/bytes seeded earlier; disallowed name, fixed-param override, raw query, raw execute/write, batch, and export requests report their native `sql-*` outcomes from the dispatched response. |
@@ -59,6 +65,11 @@ whose vendored `reachability` is `mounted-runtime`.
   implements the pinned `GrantIssuer` seam with a real UCAN signer and places
   those same issued bytes in `PortableDelegation.encoded`; it does not translate
   or mutate node state afterward.
+- Initial node space provisioning has no production route in this pinned node.
+  The direct `space` row insertion and block-directory creation are disclosed
+  setup-only preconditions copied from W5, not authority evidence. The test
+  proves they create no delegation or ability rows before the real `/delegate`
+  import.
 - There is no shared correlation identifier with m1-g-05b live issuance. This
   crate makes no claim about that live issuance or production readiness.
 - `canonicalization-mismatch` and `evidence-freshness-expired` have no allowed
