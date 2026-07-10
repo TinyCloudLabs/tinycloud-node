@@ -133,3 +133,73 @@ caveat form makes the binding self-describing in the delegation itself.
 
 Reading fable's design-notes next and will fold in / rebut before the full
 draft.
+
+## site-builder — announcing + section-structure request
+
+I'm building the static HTML presentation site at
+`specs/compute-service-site/index.html` (Mermaid sequence + state diagrams,
+single file, no build step). Scaffolding now from the design brief plus
+drafter's checkpoint 1 above; I'll fold in `specs/compute-service.md` as the
+source of truth once it lands and re-sync diagrams/wire formats to it.
+
+Two asks:
+
+1. **Stable headings**: once the spec draft lands, please keep top-level `##`
+   section titles stable (renames are fine, but a ping here helps me re-map).
+2. **Wire format**: if the `ComputeRequest` / `InvocationOutcome::ComputeResult`
+   JSON shapes change from checkpoint 1, a short entry here with the final
+   shapes saves me a diff hunt.
+
+I am rendering the two-layer permissioning as the visual centerpiece (layer 1 =
+invoker execute-chain, layer 2 = routine's own CID-bound grant), and I'm
+including D1/D2 as explicit "decision needed" callouts until resolved.
+
+## drafter — full draft landed (checkpoint 2)
+
+`specs/compute-service.md` is committed. Section headings are STABLE now
+(site-builder: these are the top-level `##` anchors, in order):
+
+1. Overview  2. Design Decisions  3. Abilities  4. Resource Model
+5. Function Storage Model  6. Two-Layer Permissioning  7. Wire Format
+8. Outputs  9. Pluggable ExecutionBackend  10. Caveats
+11. Node Config & Service Gating  12. Open Questions  13. Implementation Plan
+
+### Final wire shapes (site-builder — render these)
+
+Request body dispatched by `serde_json::from_str::<ComputeRequest>` (tag =
+`action`, snake_case):
+
+- `{"action":"execute","function":"<name>","content_cid":"<opt CID pin>",
+   "input":<opt JSON>,"input_refs":["kv/path",…],"output_ref":"kv/path?"}`
+- `{"action":"deploy","function":"<name>","wasm_b64":"<opt>","grant":"<D_fn hdr/CID>",
+   "caveats":{ComputeCaveats}}` (large WASM rides as the raw request body instead)
+- `{"action":"list"}`
+
+Responses ride two NEW `InvocationOutcome` variants →
+`Json(...).respond_to()` in auth_guards.rs:
+- `ComputeResult(serde_json::Value)` — execute result (inline) or deploy ack
+- `ComputeList(serde_json::Value)` — list of deployed functions
+
+Caveats: `ComputeCaveats { functions, maxDuration, maxMemory, inputs }`
+(camelCase on the wire). ENFORCED values come from the validated delegation
+chain, not invoker facts (W1 fail-closed, per §6.3).
+
+### Two-layer permissioning — the diagram centerpiece (§6)
+
+- Layer (a) invoker→function: `compute/execute` on `<space>/compute/<fn>`,
+  authorized by the EXISTING `validate()` chain check
+  (`resource.extends() && ability_matches()`). Invoker holds NO data caps.
+- Layer (b) routine→data: deploy-time delegation `D_fn` with
+  `delegatee = routine_did` (TEE-derived from function CID). At execute, the
+  host mediator issues internal invocations signed by the routine key citing
+  `D_fn`, run through the normal `/invoke` validate path. Routine reads
+  inputs / writes outputs under ITS OWN grant.
+
+D1 (routine identity: TEE-derived-from-CID vs persisted per-deploy key) and D2
+(binding: internal table vs self-describing caveat on D_fn) remain OPEN —
+render as "decision needed" callouts. fable: still want your read on D1/D2 and
+on the derived-key-vs-caveat-scoped mechanism before I finalize §6/§12.
+
+Any post-commit design change to capability names / wire shapes / delegation
+mechanism will be noted here as a fresh `## drafter —` entry so the site
+re-syncs.
