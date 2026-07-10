@@ -1,0 +1,201 @@
+{
+  "fixtures": {
+    "challenge-expired.json": {
+      "code": "challenge-expired",
+      "sha256": "4daab4f08ca528cb12bdd08ce2bb4cb5071c3171dad5db6e4afed02d80f931f2",
+      "testRef": "grant_presentation_reject_vectors_fail_through_http"
+    },
+    "challenge-nonce-consumed.json": {
+      "code": "challenge-nonce-consumed",
+      "sha256": "f25bf3b5258276489bd7a9d8d9d1b2f57fb528c3ee76d12f0957475144037c7e",
+      "testRef": "grant_presentation_reject_vectors_fail_through_http"
+    },
+    "challenge-not-found.json": {
+      "code": "challenge-not-found",
+      "sha256": "97cb4857baf413b2434005ab33e943b3cd4ab301c96629cf2c6f43e10aedf3fb",
+      "testRef": "grant_presentation_reject_vectors_fail_through_http"
+    },
+    "digest-mismatch.json": {
+      "code": "digest-mismatch",
+      "sha256": "9ed7d7f821938b8e56e5c2a48c0b94a52121ff9217f819ce16ec5aba6fd2c9cc",
+      "testRef": "holder_enrollment_signed_object_digest_mismatch_uses_frozen_code_and_consumes_nonce"
+    },
+    "enrollment-binding-mismatch.json": {
+      "code": "enrollment-binding-mismatch",
+      "sha256": "42ec5f3ae78ed0901b4853108dcbfc7d194e8b48e3d0e83133e6457d25408e4f",
+      "testRef": "launch_profile_reject_vectors_fail_through_http_without_mutating_fixtures"
+    },
+    "enrollment-expired.json": {
+      "code": "enrollment-expired",
+      "sha256": "ff2878cfd8ee0f7b09548c6c7bc8f7bb4cd14dbca3a235832631dcfef721d39f",
+      "testRef": "enrollment_date_fields_reject_before_signature_verification"
+    },
+    "enrollment-not-yet-valid.json": {
+      "code": "enrollment-not-yet-valid",
+      "sha256": "c8818598bdbd1057cc96bc75c91547287ff3fa7f15c11ef278ffba3f3f6f52f2",
+      "testRef": "enrollment_date_fields_reject_before_signature_verification"
+    },
+    "enrollment-out-of-scope.json": {
+      "code": "enrollment-out-of-scope",
+      "sha256": "8f27c9f7f13adfbf71bcaf607a3724f767235b7ae227d7bdd8fd3e9410ec55a5",
+      "testRef": "enrollment_scope_denials_use_frozen_codes_through_http"
+    },
+    "enrollment-revoked-irreversible.json": {
+      "code": "enrollment-revoked-irreversible",
+      "sha256": "0169b3aaef000af6f9f5437abdc5567e361f068f6397612ae4fce5a74aa5674a",
+      "testRef": "holder_enrollment_rollback_vectors_fail_through_http"
+    },
+    "enrollment-revoked.json": {
+      "code": "enrollment-revoked",
+      "sha256": "eb8e84c77ce70cea75dc6b8f53b5a28f3035fc7693207db60d0f28d0019bb4c4",
+      "testRef": "holder_enrollment_rollback_vectors_fail_through_http"
+    },
+    "enrollment-status-rollback.json": {
+      "code": "enrollment-status-rollback",
+      "sha256": "b423a7b248b1dfd815022b04ba0fdfbfe60e1f3ea37695f4856fce76a4ad1b7a",
+      "testRef": "holder_enrollment_rollback_vectors_fail_through_http"
+    },
+    "evidence-authority-missing.json": {
+      "code": "evidence-authority-missing",
+      "sha256": "62b0f4bd5e836ca76128efd549682580ebe51938e86871c622cbb8de1b0db814",
+      "testRef": "evidence_denial_matrix_contract_cases"
+    },
+    "evidence-credential-invalid.json": {
+      "code": "evidence-credential-invalid",
+      "sha256": "b0f77f6be490cfb00427517fe4fe7fde1447762aff5b799198419fe6ac276c24",
+      "testRef": "launch_profile_reject_vectors_fail_through_http_without_mutating_fixtures"
+    },
+    "evidence-domain-invalid.json": {
+      "code": "evidence-domain-invalid",
+      "sha256": "efe9b68fa29c0aa2a8ea67fa9a40fc13758b178b1d53a1d2ce76ca6e06adf02a",
+      "testRef": "evidence_denial_matrix_contract_cases"
+    },
+    "evidence-domain-missing.json": {
+      "code": "evidence-domain-missing",
+      "sha256": "ee348bdba3f33ab158b7b8a52e8492d7e8607ae8384145e71b811c15170717bf",
+      "testRef": "evidence_denial_matrix_contract_cases"
+    },
+    "evidence-freshness-unestablishable.json": {
+      "code": "evidence-freshness-unestablishable",
+      "sha256": "95a7073f550b6d879ffc60424ef4d34354b9008e32b495f501e35d7183c32a92",
+      "testRef": "launch_profile_freshness_cannot_be_bypassed_with_spoofed_status_fields"
+    },
+    "evidence-issuer-missing.json": {
+      "code": "evidence-issuer-missing",
+      "sha256": "4b8237d6dd449bb0b0c554a8fc6a4a36304c474610a0f42c3a9a11493b7f3bbb",
+      "testRef": "evidence_denial_matrix_contract_cases"
+    },
+    "evidence-issuer-untrusted.json": {
+      "code": "evidence-issuer-untrusted",
+      "sha256": "a06a2cd7c4077a846808630c6e0f039b3d5fd4ffe540e37a3ae29b062876dc63",
+      "testRef": "launch_profile_reject_vectors_fail_through_http_without_mutating_fixtures"
+    },
+    "evidence-presentation-invalid.json": {
+      "code": "evidence-presentation-invalid",
+      "sha256": "42978f32d87936b27983842cc5fc6b351527ff0bf3b5992224ac307dc11ff372",
+      "testRef": "launch_profile_reject_vectors_fail_through_http_without_mutating_fixtures"
+    },
+    "evidence-requirement-duplicate.json": {
+      "code": "evidence-requirement-duplicate",
+      "sha256": "3a285ca87f1cc34053ac7777b463c9c476408704b17b94f743d13bc3a410ef40",
+      "testRef": "grant_presentation_denials_use_frozen_codes_through_http"
+    },
+    "evidence-requirement-unknown.json": {
+      "code": "evidence-requirement-unknown",
+      "sha256": "3ce5f3c566b7c8382c3d194342b07ff64ef9ea4e69f6bbb3d92b6099db0f01cc",
+      "testRef": "grant_presentation_denials_use_frozen_codes_through_http"
+    },
+    "evidence-requirements-invalid.json": {
+      "code": "evidence-requirements-invalid",
+      "sha256": "97e163f6385c610dc6971650f39dd843fea41cdb0fbe08df3208016599c74805",
+      "testRef": "evidence_denial_matrix_contract_cases"
+    },
+    "evidence-verifier-unsupported.json": {
+      "code": "evidence-verifier-unsupported",
+      "sha256": "1742bddd44803eeba59430d6f0cff69a4ae6da3f3c22e0da48de0946be21fc52",
+      "testRef": "evidence_denial_matrix_contract_cases"
+    },
+    "holder-signature-invalid.json": {
+      "code": "holder-signature-invalid",
+      "sha256": "cc1818506b2d97923a1a90747b69ce61ace7b8a8875b2df342d52ff577108b48",
+      "testRef": "grant_presentation_reject_vectors_fail_through_http"
+    },
+    "holder-signature-signer-mismatch.json": {
+      "code": "holder-signature-signer-mismatch",
+      "sha256": "36482e086d89b761bae5811f2652904a246543e4db3188544c9bbee5bc06d368",
+      "testRef": "grant_presentation_denials_use_frozen_codes_through_http"
+    },
+    "id-mismatch.json": {
+      "code": "id-mismatch",
+      "sha256": "3286c35c490c1666e3ff00123a67769452ee79eccc7824c464395d97b08555dd",
+      "testRef": "holder_enrollment_signed_object_id_mismatch_uses_frozen_code_and_consumes_nonce"
+    },
+    "policy-expired.json": {
+      "code": "policy-expired",
+      "sha256": "1bfb75fb2476c12f5be8440ead7047d3ae57f6583f3906ebcd38db15defac918",
+      "testRef": "policy_lifecycle_denials_use_frozen_codes"
+    },
+    "policy-inactive.json": {
+      "code": "policy-inactive",
+      "sha256": "6e417109074ef683ab97e2a53a71006f0b643e0119283bdaa39ff62faffd8e23",
+      "testRef": "policy_lifecycle_denials_use_frozen_codes"
+    },
+    "policy-not-found.json": {
+      "code": "policy-not-found",
+      "sha256": "d14124d30638ca4190d98493f94a32e70784c443bca66bd768102e0c8bdb387b",
+      "testRef": "policy_lifecycle_denials_use_frozen_codes"
+    },
+    "policy-not-satisfied.json": {
+      "code": "policy-not-satisfied",
+      "sha256": "bc1257a9136c604ba2ce217d2832d4f2c5fc96d41a3cfaeb4f091effd3616bf9",
+      "testRef": "policy_not_satisfied_uses_frozen_code_through_http"
+    },
+    "policy-status-rollback.json": {
+      "code": "policy-status-rollback",
+      "sha256": "41b89353d498039ab6f3bd2422b8573a9887c1a9c70aa92b2f51dc65613ea563",
+      "testRef": "policy_status_rollback_uses_frozen_code_through_mounted_challenge"
+    },
+    "presentation-audience-mismatch.json": {
+      "code": "presentation-audience-mismatch",
+      "sha256": "04e6ea37ddcddb1e2b097abbfc8f1d7975b0ed78d32f201fda41067c58a60ed1",
+      "testRef": "grant_presentation_denials_use_frozen_codes_through_http"
+    },
+    "presentation-evidence-missing.json": {
+      "code": "presentation-evidence-missing",
+      "sha256": "4e091f51d5fe7c9efe528b92d91732810297d122b7c2a501ebbf8a57b45f35e0",
+      "testRef": "grant_presentation_denials_use_frozen_codes_through_http"
+    },
+    "presentation-expired.json": {
+      "code": "presentation-expired",
+      "sha256": "ad1a0ee8b32bcd1ac21962f42aef196021c546331080615badb4bcbb44ef034f",
+      "testRef": "grant_presentation_reject_vectors_fail_through_http"
+    },
+    "requested-capabilities-exceeded.json": {
+      "code": "requested-capabilities-exceeded",
+      "sha256": "be76e592387cb0f1bde82966e1cf65d6c846d207cfe194f29a3f02938dc9a5de",
+      "testRef": "grant_presentation_denials_use_frozen_codes_through_http"
+    },
+    "requested-capabilities-hash-mismatch.json": {
+      "code": "requested-capabilities-hash-mismatch",
+      "sha256": "5be202f67bed795932e37834e24e4ae4bc61a930592b640c0c06a5d2ab01bc83",
+      "testRef": "grant_presentation_denials_use_frozen_codes_through_http"
+    },
+    "schema-invalid.json": {
+      "code": "schema-invalid",
+      "sha256": "8338f173ab4759aa3ee40c4dae2496ba4af5903d3e1b69c38ca760c118b5e5c6",
+      "testRef": "malformed_json_and_type_mismatch_use_schema_invalid_envelope"
+    },
+    "signature-invalid.json": {
+      "code": "signature-invalid",
+      "sha256": "cc8b2a667d107d42b0d95d0634971b6a2fd71f8d2d9165c346002caba071e2bd",
+      "testRef": "pre_runtime_rejections_still_consume_nonce_once"
+    },
+    "signer-not-authorized.json": {
+      "code": "signer-not-authorized",
+      "sha256": "216d45b0525259fa739eba4d9c1521916f39964f4a2fbe6394c033a2f74bb75f",
+      "testRef": "unauthorized_enrollment_signer_uses_frozen_code_and_consumes_nonce"
+    }
+  },
+  "label": "confirmed from code: policy-engine-http handlers @ 8c4cabbf56e51c7e37484c060ffd4a6d51521101",
+  "producerCommit": "8c4cabbf56e51c7e37484c060ffd4a6d51521101"
+}

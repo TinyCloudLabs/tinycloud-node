@@ -1,0 +1,78 @@
+{
+  "classification": {
+    "credentialStatusRevocation": "out-of-scope for v0; TC-102 forbids synthesizing statusList or credential status claims",
+    "holderBindingClaims": "launch profile forbids credential cnf/kb_jwt claims"
+  },
+  "description": "Valid launch email-domain baseline credential.",
+  "evidencePresentation": {
+    "format": "sd-jwt+jwt",
+    "sdJwt": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiMmxTSm1LemJOSFllNWhJQ0RrWlhZTkVJWmlvdnpKLWt1TmhDNzF6dlR5TSIsImF4clZtaGZjQmpxYUxCdzN5cmpsOV91RnNvTTJQTnlpTHRLeHRNM0dmT3MiXSwiX3NkX2FsZyI6InNoYS0yNTYiLCJleHAiOjE4MTI3NTg1MjAsImlhdCI6MTc4MTIyMjUyMCwiaXNzIjoiZGlkOndlYjppc3N1ZXIuY3JlZGVudGlhbHMub3JnIiwianRpIjoidXJuOnV1aWQ6MTAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAxIiwibmJmIjoxNzgxMjIyNTIwLCJzdWIiOiJkaWQ6cGtoOmVpcDE1NToxOjB4NzU2NDEwNWU5Nzc1MTZjNTNiZTMzNzMxNGM3ZTUzODM4OTY3YmRhYyIsInZjdCI6Im9wZW5jcmVkZW50aWFscy5lbWFpbC92MSJ9.rU1oWFRy49tj1mi_PDjF0HhJ3iWEv-c0_ZnfCQiJKmS2wKS4zVqyeun61AyysL9ObJkDVd7LuIhy4kqcdTVmDA~WyJkb21haW4tc2FsdC0wMDAwMDEiLCJlbWFpbERvbWFpbiIsImNyZWRlbnRpYWxzLm9yZyJd~"
+  },
+  "expected": "accept",
+  "expectedEngineWireCode": {
+    "classification": "integration expectation",
+    "code": "accept",
+    "provenAt": "policy-engine/g-03 layer, not opencredentials_verify"
+  },
+  "expectedVerifierRejection": null,
+  "fixtureClass": "baseline-valid",
+  "kind": "valid",
+  "name": "baseline-valid",
+  "profile": {
+    "acceptedIssuers": [
+      "did:web:issuer.credentials.org"
+    ],
+    "baseCommit": "ff47e55420f87552caf4e9144a0dfc748026e612",
+    "credentialType": "opencredentials.email/v1",
+    "fixedSalts": [
+      "email-salt-000001",
+      "domain-salt-000001"
+    ],
+    "keyMaterialLabel": "fixed-seed synthetic Ed25519 test material; NOT for production",
+    "keys": {
+      "trusted": {
+        "crv": "Ed25519",
+        "dB64u": "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU",
+        "kty": "OKP",
+        "label": "synthetic fixed-seed test key; NOT for production",
+        "publicKeyHex": "c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242",
+        "seedHex": "5555555555555555555555555555555555555555555555555555555555555555",
+        "xB64u": "xoImN8fTEOxXYnvgC6JZ0lN0n0qvZERwz_vlOjX3MkI"
+      },
+      "untrusted": {
+        "crv": "Ed25519",
+        "dB64u": "V1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1c",
+        "kty": "OKP",
+        "label": "synthetic fixed-seed test key; NOT for production",
+        "publicKeyHex": "c84069fa2216c6edc1d52ca83aa11c267dd5440afa526090ca43ebd0ca86a9cf",
+        "seedHex": "5757575757575757575757575757575757575757575757575757575757575757",
+        "xB64u": "yEBp-iIWxu3B1SyoOqEcJn3VRAr6UmCQykPr0MqGqc8"
+      },
+      "wrongSignature": {
+        "crv": "Ed25519",
+        "dB64u": "VlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlY",
+        "kty": "OKP",
+        "label": "synthetic fixed-seed test key; NOT for production",
+        "publicKeyHex": "88df556413538b002015e9619b01bdb5cc48c7215645792563f5460f7307a763",
+        "seedHex": "5656565656565656565656565656565656565656565656565656565656565656",
+        "xB64u": "iN9VZBNTiwAgFelhmwG9tcxIxyFWRXklY_VGD3MHp2M"
+      }
+    },
+    "signerKey": "trusted",
+    "trustedIssuerDid": "did:web:issuer.credentials.org",
+    "verifier": "w3c.vc/credential/v1",
+    "verifierKey": "trusted"
+  },
+  "schema": "xyz.tinycloud.opencredentials/m1-denial-credential-fixture/v0",
+  "verificationOptions": {
+    "acceptedIssuers": [
+      "did:web:issuer.credentials.org"
+    ],
+    "allowedEmailDomains": [
+      "credentials.org"
+    ],
+    "expectedHolderDid": "did:pkh:eip155:1:0x7564105e977516c53be337314c7e53838967bdac",
+    "now": 1781222580,
+    "requireEmailDomain": true
+  }
+}
