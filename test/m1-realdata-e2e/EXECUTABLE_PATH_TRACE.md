@@ -20,10 +20,18 @@ whose vendored `reachability` is `mounted-runtime`.
    `tinycloud-node-server/src/routes/mod.rs`, and
    `tinycloud-core/src/sql/service.rs`). No socket is bound.
 2. Compose and sign Policy and PolicyStatus objects, verify each with
-   `policy_core::verify_signed_object_value`, and insert only the verified
-   variants into `PolicySpaceState`. This mirrors the production startup load
-   loop in `crates/policy-engine-http/src/lib.rs::PolicyEngineService::load_objects`
-   (verification followed by `insert_policy` / `insert_policy_status`). Runtime
+   `policy_core::verify_signed_object_value`, and insert only the returned
+   `VerifiedSignedObject` variants into `PolicySpaceState`. The pinned
+   production loader is
+   `crates/policy-engine-http/src/lib.rs::PolicyEngineService::from_signed_objects_at`:
+   it rejects preloaded raw authority, verifies every signed object, constructs
+   an `AuthorityIndex`, performs authority validation, places the validated
+   Policy/PolicyStatus values into `ServiceConfig`, and
+   `build_after_validation` inserts them into `PolicySpaceState`. This harness
+   exercises the same signed-object verification and final runtime-state hops
+   for its composed Policy/PolicyStatus; the intervening HTTP-adapter authority
+   index validation is an explicit unsupported hop here because that adapter's
+   grant issuer cannot emit the node-importable UCAN required by step 5. Runtime
    authority is startup state except for the explicit in-process status-update
    denial below.
 3. Construct `PolicyRuntime` with `policy_evidence_vc::VcEvidenceVerifier` keyed
@@ -51,7 +59,7 @@ whose vendored `reachability` is `mounted-runtime`.
 | Expired delegation | `/delegate` -> `models/delegation.rs::verify` -> UCAN `validate_time` | A genuinely signed expired node delegation is refused by the import operation; no expired authority row is manufactured. |
 | Issuance read-back | successful `resolve` inserts `IssuanceRecord`; `PolicySpaceState::issuance` reads it | Every field is compared to this resolve's policy, subject, holder, resource/delegation id, evidence id, issued/expires times, and `RevocationMode::RefreshOnly`; observed TTL must be positive and at most 300 seconds. (`refresh_only` is the pinned API's `revocation` enum field, not a separate boolean.) |
 | Expired credential | fresh challenge + resolve -> VC verifier over vendored `expired.json` | The returned runtime error's nested mounted-runtime code is `evidence-credential-invalid`. |
-| Untrusted issuer | fresh challenge + resolve -> VC verifier over vendored `untrusted-issuer-did.json` | The returned runtime error's nested mounted-runtime code is `evidence-issuer-untrusted`. |
+| Untrusted issuer | decode the issuer claim from the vendored `untrusted-issuer-did.json` SD-JWT -> compose and verify a policy naming that issuer -> fresh challenge + resolve with no trust-registry key for that issuer | The credential-derived issuer drives the verifier's production trust-registry lookup, and the returned runtime error's exact nested mounted-runtime code is `evidence-issuer-untrusted`. The pinned verifier intentionally performs this lookup before cryptographic credential verification. |
 | Nonce replay | successful resolve then a second `resolve` with the consumed nonce | Second operation returns `challenge-nonce-consumed`. |
 | Audience mismatch | fresh challenge + holder-signed presentation with a different audience -> presentation validation | Resolve returns nested code `presentation-audience-mismatch`. |
 | Revoked PolicyStatus | `PolicySpaceState::insert_policy_status` with a higher sequence and revoked disposition, then a fresh resolve | The next resolve returns `policy-inactive`. This is only the deterministic in-process status-update contract. |
@@ -65,6 +73,13 @@ whose vendored `reachability` is `mounted-runtime`.
   implements the pinned `GrantIssuer` seam with a real UCAN signer and places
   those same issued bytes in `PortableDelegation.encoded`; it does not translate
   or mutate node state afterward.
+- Invoking `PolicyEngineService::from_signed_objects` as the runtime constructor
+  is unsupported for this cross-layer proof: its private `SharedGrantIssuer`
+  emits a `tc-pdel-v0` envelope, not the node-importable UCAN required by the
+  next production hop. The harness therefore verifies the composed signed
+  Policy/PolicyStatus objects with the same `policy-core` entry point and loads
+  only those verified variants into the public `PolicyRuntime` state API. It
+  does not claim to exercise the HTTP adapter's `AuthorityIndex` validation.
 - Initial node space provisioning has no production route in this pinned node.
   The direct `space` row insertion and block-directory creation are disclosed
   setup-only preconditions copied from W5, not authority evidence. The test

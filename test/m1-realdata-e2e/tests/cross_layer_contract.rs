@@ -499,15 +499,34 @@ fn exercise_engine_denials(context: &EngineDenialContext<'_>) -> Result<()> {
     let expired_error = expired_runtime.resolve(expired, now).unwrap_err();
     assert_runtime_code(&expired_error, "evidence-credential-invalid")?;
 
+    let fixture_issuer = fixture_sd_jwt_issuer(UNTRUSTED_FIXTURE)?;
+    assert_ne!(
+        fixture_issuer, ISSUER,
+        "the credential operation must exercise a distinct issuer"
+    );
+    let policy_key = signing_key(owner_jwk)?;
+    let untrusted_policy = verified_policy(
+        policy_with_accepted_issuer(space, owner_did, &fixture_issuer),
+        &policy_key,
+    )?;
+    let untrusted_status = verified_status(
+        policy_status(
+            &untrusted_policy,
+            &node_identity(owner_jwk)?.0,
+            1,
+            PolicyDisposition::Active,
+        ),
+        &policy_key,
+    )?;
     let mut untrusted_runtime = runtime(
-        (*policy).clone(),
-        (*active_status).clone(),
+        untrusted_policy.clone(),
+        untrusted_status,
         untrusted_verifier(),
         issuer(),
     )?;
-    let challenge = untrusted_runtime.issue_challenge(&policy.policy_id, now)?;
+    let challenge = untrusted_runtime.issue_challenge(&untrusted_policy.policy_id, now)?;
     let untrusted = signed_presentation(
-        policy,
+        &untrusted_policy,
         &challenge,
         holder_did,
         holder_key,
@@ -534,7 +553,6 @@ fn exercise_engine_denials(context: &EngineDenialContext<'_>) -> Result<()> {
         AUDIENCE,
         1,
     )?;
-    let policy_key = signing_key(owner_jwk)?;
     let revoked = verified_status(
         policy_status(
             policy,
@@ -625,6 +643,10 @@ fn untrusted_verifier() -> VcEvidenceVerifier {
 }
 
 fn policy(space: &SpaceId, signer_did: &str) -> Policy {
+    policy_with_accepted_issuer(space, signer_did, ISSUER)
+}
+
+fn policy_with_accepted_issuer(space: &SpaceId, signer_did: &str, accepted_issuer: &str) -> Policy {
     Policy {
         schema: policy_core::POLICY_SCHEMA.to_string(),
         policy_id: String::new(),
@@ -647,7 +669,7 @@ fn policy(space: &SpaceId, signer_did: &str) -> Policy {
                 }),
                 authority: Some(EvidenceAuthority {
                     profile: None,
-                    accepted_issuers: Some(vec![ISSUER.to_string()]),
+                    accepted_issuers: Some(vec![accepted_issuer.to_string()]),
                     allow_owner_authorized_issuer: None,
                 }),
                 freshness: None,
@@ -1050,6 +1072,23 @@ fn fixture_evidence(source: &str) -> Result<Value> {
     Ok(json!({ "sdJwt": value["evidencePresentation"]["sdJwt"] }))
 }
 
+fn fixture_sd_jwt_issuer(source: &str) -> Result<String> {
+    let fixture: Value = serde_json::from_str(source)?;
+    let sd_jwt = fixture["evidencePresentation"]["sdJwt"]
+        .as_str()
+        .context("fixture SD-JWT")?;
+    let compact_jwt = sd_jwt.split('~').next().context("fixture compact JWT")?;
+    let payload = compact_jwt
+        .split('.')
+        .nth(1)
+        .context("fixture compact JWT payload")?;
+    let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload)?)?;
+    claims["iss"]
+        .as_str()
+        .map(ToOwned::to_owned)
+        .context("fixture credential issuer")
+}
+
 fn mounted_code(code: &str) -> Result<String> {
     let matrix: Value = serde_json::from_str(DENIAL_MATRIX)?;
     matrix
@@ -1064,10 +1103,15 @@ fn mounted_code(code: &str) -> Result<String> {
 
 fn assert_runtime_code(error: &RuntimeError, code: &str) -> Result<()> {
     let expected = mounted_code(code)?;
-    let observed = error.to_string();
-    assert!(
-        observed.contains(&expected),
-        "operation returned {observed:?}, expected mounted-runtime code {expected:?}"
+    let observed = match error {
+        RuntimeError::Presentation(code)
+        | RuntimeError::HolderBinding(code)
+        | RuntimeError::Evidence(code) => code.as_str(),
+        _ => error.as_str(),
+    };
+    assert_eq!(
+        observed, expected,
+        "operation returned a different mounted-runtime code"
     );
     Ok(())
 }
