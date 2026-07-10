@@ -1,0 +1,1183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TinyCloud Compute Service — Design Specification</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,500;9..144,600&family=Source+Serif+4:opsz,ital,wght@8..60,0,400;8..60,0,600;8..60,1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ink: #0e1116;
+    --ink-raised: #141922;
+    --ink-panel: #10151d;
+    --hairline: #232b37;
+    --hairline-strong: #313c4b;
+    --paper: #e6e1d3;
+    --paper-dim: #a8a396;
+    --paper-faint: #6e6f6c;
+    --l1: #e2a144;          /* Layer 1 — who can run */
+    --l1-dim: #8a6626;
+    --l1-wash: rgba(226, 161, 68, 0.07);
+    --l2: #45c2a8;          /* Layer 2 — what the routine touches */
+    --l2-dim: #2b7a6a;
+    --l2-wash: rgba(69, 194, 168, 0.06);
+    --danger: #d4726a;
+    --display: "Fraunces", Georgia, serif;
+    --body: "Source Serif 4", Georgia, serif;
+    --mono: "IBM Plex Mono", "SF Mono", Menlo, monospace;
+    --rail-w: 248px;
+    --measure: 74ch;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    background: var(--ink);
+    color: var(--paper);
+    font-family: var(--body);
+    font-size: 17px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* grain overlay */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 1000;
+    opacity: 0.35;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3CfeColorMatrix values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.04 0'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+
+  ::selection { background: var(--l1); color: var(--ink); }
+
+  a { color: var(--l2); text-decoration: none; border-bottom: 1px solid var(--l2-dim); }
+  a:hover { color: var(--paper); border-bottom-color: var(--paper); }
+
+  /* ============ layout ============ */
+  .frame { display: flex; min-height: 100vh; }
+
+  nav.rail {
+    width: var(--rail-w);
+    flex: 0 0 var(--rail-w);
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow-y: auto;
+    border-right: 1px solid var(--hairline);
+    padding: 2.2rem 0 3rem 0;
+    scrollbar-width: thin;
+  }
+  .rail .brand {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--paper-dim);
+    padding: 0 1.6rem 1.6rem;
+    border-bottom: 1px solid var(--hairline);
+    margin-bottom: 1.2rem;
+  }
+  .rail .brand b { color: var(--l1); font-weight: 600; display: block; margin-top: 2px; }
+  .rail ol { list-style: none; }
+  .rail li a {
+    display: flex;
+    gap: 0.7em;
+    padding: 0.34rem 1.6rem;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--paper-dim);
+    border-bottom: none;
+    border-left: 2px solid transparent;
+    transition: color 120ms, border-color 120ms, background 120ms;
+  }
+  .rail li a .n { color: var(--paper-faint); min-width: 2ch; }
+  .rail li a:hover { color: var(--paper); }
+  .rail li a.active {
+    color: var(--l1);
+    border-left-color: var(--l1);
+    background: var(--l1-wash);
+  }
+  .rail li a.active .n { color: var(--l1-dim); }
+
+  main {
+    flex: 1;
+    min-width: 0;
+    padding: 0 clamp(1.4rem, 5vw, 5rem) 8rem;
+  }
+
+  @media (max-width: 900px) {
+    nav.rail { display: none; }
+  }
+
+  /* ============ hero ============ */
+  header.hero {
+    padding: clamp(3rem, 9vh, 6.5rem) 0 3.4rem;
+    border-bottom: 1px solid var(--hairline);
+    position: relative;
+  }
+  .hero .meta {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--paper-dim);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.8em 1.8em;
+    margin-bottom: 2.2rem;
+  }
+  .hero .meta .tag {
+    color: var(--l1);
+    border: 1px solid var(--l1-dim);
+    padding: 2px 10px;
+    border-radius: 999px;
+  }
+  .hero h1 {
+    font-family: var(--display);
+    font-weight: 340;
+    font-size: clamp(2.6rem, 6.2vw, 4.6rem);
+    line-height: 1.04;
+    letter-spacing: -0.015em;
+    max-width: 20ch;
+  }
+  .hero h1 em {
+    font-style: italic;
+    font-weight: 400;
+    color: var(--l2);
+  }
+  .hero p.dek {
+    margin-top: 1.6rem;
+    max-width: var(--measure);
+    font-size: 1.18rem;
+    line-height: 1.6;
+    color: var(--paper-dim);
+  }
+  .hero p.dek strong { color: var(--paper); font-weight: 600; }
+
+  /* the two-layer emblem */
+  .emblem {
+    margin-top: 2.6rem;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+    gap: 1px;
+    background: var(--hairline);
+    border: 1px solid var(--hairline);
+  }
+  .emblem .cell {
+    background: var(--ink-panel);
+    padding: 1.3rem 1.5rem 1.4rem;
+  }
+  .emblem .cell.one { box-shadow: inset 3px 0 0 var(--l1); }
+  .emblem .cell.two { box-shadow: inset 3px 0 0 var(--l2); }
+  .emblem .k {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    margin-bottom: 0.55rem;
+  }
+  .cell.one .k { color: var(--l1); }
+  .cell.two .k { color: var(--l2); }
+  .emblem .cell p { font-size: 0.98rem; color: var(--paper-dim); line-height: 1.55; }
+  .emblem .cell p code { color: var(--paper); }
+
+  /* ============ sections ============ */
+  section { padding-top: 4.2rem; }
+  section > .kicker {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--paper-faint);
+    margin-bottom: 0.7rem;
+  }
+  section > .kicker .num { color: var(--l1); margin-right: 0.9em; }
+  section h2 {
+    font-family: var(--display);
+    font-weight: 400;
+    font-size: clamp(1.7rem, 3.4vw, 2.35rem);
+    line-height: 1.15;
+    letter-spacing: -0.01em;
+    margin-bottom: 1.4rem;
+    max-width: 28ch;
+  }
+  section h3 {
+    font-family: var(--display);
+    font-weight: 500;
+    font-size: 1.25rem;
+    margin: 2.4rem 0 0.8rem;
+    color: var(--paper);
+  }
+  section p { max-width: var(--measure); margin-bottom: 1.05rem; }
+  section p.lead { font-size: 1.08rem; }
+  section ul, section ol { max-width: var(--measure); margin: 0 0 1.05rem 1.3rem; }
+  section li { margin-bottom: 0.45rem; }
+  .dim { color: var(--paper-dim); }
+
+  code {
+    font-family: var(--mono);
+    font-size: 0.82em;
+    background: var(--ink-raised);
+    border: 1px solid var(--hairline);
+    border-radius: 4px;
+    padding: 0.1em 0.42em;
+    color: var(--paper);
+    white-space: nowrap;
+  }
+
+  pre {
+    background: var(--ink-panel);
+    border: 1px solid var(--hairline);
+    border-left: 3px solid var(--hairline-strong);
+    padding: 1.1rem 1.3rem;
+    overflow-x: auto;
+    margin: 1.2rem 0 1.5rem;
+    max-width: 860px;
+  }
+  pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: 13px;
+    line-height: 1.6;
+    color: var(--paper);
+    white-space: pre;
+  }
+  pre .cm { color: var(--paper-faint); }
+  pre .k1 { color: var(--l1); }
+  pre .k2 { color: var(--l2); }
+
+  .pill {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    padding: 2px 10px 3px;
+    border-radius: 999px;
+    vertical-align: 2px;
+    margin-left: 0.6em;
+  }
+  .pill.l1 { color: var(--l1); border: 1px solid var(--l1-dim); background: var(--l1-wash); }
+  .pill.l2 { color: var(--l2); border: 1px solid var(--l2-dim); background: var(--l2-wash); }
+  .pill.warn { color: var(--danger); border: 1px solid #6d3b36; background: rgba(212, 114, 106, 0.07); }
+  .pill.dimp { color: var(--paper-dim); border: 1px solid var(--hairline-strong); }
+
+  /* callouts */
+  .callout {
+    max-width: 860px;
+    border: 1px solid var(--hairline);
+    background: var(--ink-panel);
+    padding: 1.1rem 1.4rem;
+    margin: 1.4rem 0;
+  }
+  .callout .t {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    margin-bottom: 0.5rem;
+  }
+  .callout p { margin-bottom: 0.4rem; font-size: 0.97rem; }
+  .callout p:last-child { margin-bottom: 0; }
+  .callout.decision { border-left: 3px solid var(--danger); }
+  .callout.decision .t { color: var(--danger); }
+  .callout.note { border-left: 3px solid var(--l2-dim); }
+  .callout.note .t { color: var(--l2); }
+  .callout.trust { border-left: 3px solid var(--l1-dim); }
+  .callout.trust .t { color: var(--l1); }
+
+  /* tables */
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    max-width: 940px;
+    margin: 1.3rem 0 1.8rem;
+    font-size: 0.92rem;
+  }
+  th {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    font-weight: 600;
+    color: var(--paper-dim);
+    text-align: left;
+    padding: 0.55rem 1rem 0.55rem 0;
+    border-bottom: 1px solid var(--hairline-strong);
+  }
+  td {
+    padding: 0.62rem 1rem 0.62rem 0;
+    border-bottom: 1px solid var(--hairline);
+    vertical-align: top;
+    color: var(--paper-dim);
+  }
+  td:first-child, th:first-child { padding-left: 0.2rem; }
+  td b, td strong { color: var(--paper); font-weight: 600; }
+  td.yes { color: var(--l2); }
+  td.no { color: var(--danger); }
+
+  /* diagram panels */
+  figure.diagram {
+    margin: 1.8rem 0 2.2rem;
+    border: 1px solid var(--hairline);
+    background:
+      radial-gradient(ellipse 120% 90% at 20% 0%, rgba(69,194,168,0.035), transparent 55%),
+      var(--ink-panel);
+    padding: 1.6rem 1.2rem 1rem;
+    max-width: 1040px;
+    overflow-x: auto;
+  }
+  figure.diagram figcaption {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--paper-faint);
+    padding: 0.9rem 0.4rem 0.2rem;
+    border-top: 1px solid var(--hairline);
+    margin-top: 1rem;
+  }
+  figure.diagram figcaption b { color: var(--paper-dim); font-weight: 600; }
+  .mermaid { display: flex; justify-content: center; min-height: 120px; }
+  .mermaid svg { max-width: 100%; height: auto; }
+
+  /* legend chips under diagrams */
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5em 1.4em;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--paper-dim);
+    margin: -0.9rem 0 1.6rem;
+    max-width: 1040px;
+  }
+  .legend .chip::before {
+    content: "";
+    display: inline-block;
+    width: 10px; height: 10px;
+    border-radius: 2px;
+    margin-right: 0.55em;
+    vertical-align: -1px;
+  }
+  .legend .c1::before { background: var(--l1); }
+  .legend .c2::before { background: var(--l2); }
+
+  hr.sep {
+    border: none;
+    border-top: 1px solid var(--hairline);
+    margin: 4.2rem 0 0;
+    max-width: 1040px;
+  }
+
+  footer {
+    margin-top: 5rem;
+    padding-top: 2rem;
+    border-top: 1px solid var(--hairline);
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--paper-faint);
+    line-height: 2;
+    max-width: var(--measure);
+  }
+  footer .src { color: var(--paper-dim); }
+
+  /* reveal on load */
+  @media (prefers-reduced-motion: no-preference) {
+    .hero > * { animation: rise 0.7s cubic-bezier(0.22, 1, 0.36, 1) both; }
+    .hero .meta { animation-delay: 0.05s; }
+    .hero h1 { animation-delay: 0.14s; }
+    .hero p.dek { animation-delay: 0.26s; }
+    .hero .emblem { animation-delay: 0.4s; }
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(14px); }
+      to { opacity: 1; transform: none; }
+    }
+  }
+</style>
+</head>
+<body>
+<div class="frame">
+
+<nav class="rail" aria-label="Sections">
+  <div class="brand">TinyCloud Protocol<b>Compute Service</b></div>
+  <ol>
+    <li><a href="#overview"><span class="n">01</span>Overview &amp; Goals</a></li>
+    <li><a href="#model"><span class="n">02</span>Programs Are Data</a></li>
+    <li><a href="#two-layer"><span class="n">03</span>Two-Layer Permissioning</a></li>
+    <li><a href="#deploy"><span class="n">04</span>Deploy Flow</a></li>
+    <li><a href="#execute-wasm"><span class="n">05</span>Execute — In-Node WASM</a></li>
+    <li><a href="#execute-cf"><span class="n">06</span>Execute — Cloudflare</a></li>
+    <li><a href="#backends"><span class="n">07</span>Execution Backends</a></li>
+    <li><a href="#caveats"><span class="n">08</span>Caveats &amp; Enforcement</a></li>
+    <li><a href="#fn-lifecycle"><span class="n">09</span>Function Lifecycle</a></li>
+    <li><a href="#inv-lifecycle"><span class="n">10</span>Invocation Lifecycle</a></li>
+    <li><a href="#wire"><span class="n">11</span>Wire Format &amp; Registry</a></li>
+    <li><a href="#trust"><span class="n">12</span>Trust &amp; Verification</a></li>
+    <li><a href="#scope"><span class="n">13</span>Scope &amp; Open Questions</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<header class="hero">
+  <div class="meta">
+    <span class="tag">Design Draft</span>
+    <span>tinycloud-node</span>
+    <span>specs/compute-service.md</span>
+    <span id="draft-status">tracking spec draft</span>
+  </div>
+  <h1>Compute over data you never <em>hand over</em>.</h1>
+  <p class="dek">
+    The TinyCloud compute service runs functions against user-owned space data under
+    <strong>capability-based least privilege</strong>. A WASM function is stored as
+    content-addressed data; whoever invokes it needs only the right to <em>run it</em> —
+    the function carries its <strong>own</strong> cryptographic grant to the data it touches,
+    bound to the exact bytes of its code.
+  </p>
+  <div class="emblem">
+    <div class="cell one">
+      <div class="k">Layer 1 — Who can run</div>
+      <p>The invoker presents a <code>tinycloud.compute/execute</code> delegation on the
+      function resource. The node verifies the chain cryptographically — resource
+      containment, ability matching — with the same machinery as every other service.</p>
+    </div>
+    <div class="cell two">
+      <div class="k">Layer 2 — What the routine touches</div>
+      <p>The routine holds its <em>own</em> delegation (e.g. <code>tinycloud.kv/get</code> on
+      <code>&lt;space&gt;/kv/calendar/</code>), bound at deploy time to the function's content CID.
+      Data access flows back through <code>/invoke</code> under the routine's grant — never the
+      invoker's authority. Change the code, and the grant is void.</p>
+    </div>
+  </div>
+</header>
+
+<!-- ================================================================ -->
+<section id="overview">
+  <div class="kicker"><span class="num">01</span>Overview</div>
+  <h2>Least-privilege function execution over space data</h2>
+  <p class="lead">
+    TinyCloud spaces already expose KV, SQL, and DuckDB services behind a single
+    capability-gated endpoint. The compute service adds a fourth: deploy a WASM function
+    into a space, then let holders of an execute capability run it — without ever granting
+    them access to the data the function reads or writes.
+  </p>
+  <p>Design goals:</p>
+  <ul>
+    <li><strong>Programs are data.</strong> Functions are stored content-addressed; the function's
+      identity <em>is</em> its content CID. Named and versioned like any other space artifact.</li>
+    <li><strong>No new endpoint.</strong> Everything rides the node's single <code>POST /invoke</code>;
+      dispatch is by the capability's service string, exactly like KV / SQL / DuckDB.</li>
+    <li><strong>Two-layer permissioning.</strong> Invocation rights and data rights are separate
+      capability chains. The invoker never needs the underlying data permission.</li>
+    <li><strong>Pluggable execution backends</strong> behind one interface —
+      in-node Wasmtime first, Cloudflare Workers second, TEE-quote and ZK verifiers as
+      documented future plugs.</li>
+    <li><strong>Authorization stays home.</strong> Data authorization always happens at the
+      data-owning node, regardless of where compute runs. Backends never get raw data access.</li>
+  </ul>
+  <p class="dim">Out of scope: multi-node orchestration (running the same routine across
+  several people's nodes and aggregating into a shared space) is handled by layers above,
+  e.g. Smithers. See <a href="#scope">§13</a>.</p>
+</section>
+
+<!-- ================================================================ -->
+<section id="model">
+  <div class="kicker"><span class="num">02</span>Core Model</div>
+  <h2>Programs are data</h2>
+  <p>
+    Three abilities, all pre-reserved in the protocol's capability vocabulary
+    (whitepaper Appendix J) and landing in the node's <code>capabilities.json</code> SSOT
+    as <code>status: "reserved"</code> before activation:
+  </p>
+  <table>
+    <thead><tr><th>Ability</th><th>Resource</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><b><code>tinycloud.compute/deploy</code></b></td>
+        <td><code>&lt;space&gt;/compute/&lt;name&gt;</code></td>
+        <td>Stores a WASM binary content-addressed. Function identity = content CID;
+            named + versioned via artifact revisions.</td>
+      </tr>
+      <tr>
+        <td><b><code>tinycloud.compute/execute</code></b></td>
+        <td><code>&lt;space&gt;/compute/&lt;name&gt;</code></td>
+        <td>Invokes a function: function ref + inputs (inline bytes or KV refs). Output
+            returned inline or written to a KV path.</td>
+      </tr>
+      <tr>
+        <td><b><code>tinycloud.compute/list</code></b></td>
+        <td><code>&lt;space&gt;/compute/</code></td>
+        <td>Enumerates deployed functions (name, CID, revision).</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    The resource URI needs zero parser changes: <code>ResourceId</code> is already
+    <code>&lt;space&gt;/&lt;service&gt;/&lt;path&gt;</code>, and <code>compute</code> is just another
+    service string. Containment (<code>extends()</code>) does the same space / service /
+    path-prefix check it does for KV.
+  </p>
+  <p>
+    Function storage reuses the node's existing artifact repository
+    (<code>DatabaseArtifactRepository</code> — the same store SQL and DuckDB persist through),
+    keyed <code>(service&nbsp;=&nbsp;"compute", space, name)</code> with a computed content CID and a
+    monotonically increasing revision. If output is written to a KV path, normal KV read
+    delegations then govern who can read it — compute introduces no parallel read path.
+  </p>
+</section>
+
+<!-- ================================================================ -->
+<section id="two-layer">
+  <div class="kicker"><span class="num">03</span>The Novel Part</div>
+  <h2>Two-layer permissioning</h2>
+  <p class="lead">
+    Every other capability system answers one question: <em>may this principal perform this
+    action on this resource?</em> Compute needs two answers at once — and keeps them in
+    separate chains.
+  </p>
+
+  <h3>Layer 1 — who can run <span class="pill l1">invoker's chain</span></h3>
+  <p>
+    The invoker holds a <code>tinycloud.compute/execute</code> delegation on
+    <code>&lt;space&gt;/compute/&lt;fn&gt;</code>. The node verifies the delegation chain
+    cryptographically — resource containment plus ability matching against the persisted
+    chain — using the <em>existing</em> invocation validation path, unchanged. Running a
+    function is just another capability-gated action.
+  </p>
+
+  <h3>Layer 2 — what the routine touches <span class="pill l2">routine's own grant</span></h3>
+  <p>
+    The routine holds its <em>own</em> delegation, <code>D_fn</code> — for example
+    <code>tinycloud.kv/get</code> on <code>&lt;space&gt;/kv/calendar/</code> — minted by the deployer
+    at deploy time and <strong>bound to the function's content CID</strong>. When the running
+    function needs data, the access goes back through <code>/invoke</code> as an internal
+    invocation under the routine's grant, validated by the standard capability engine.
+  </p>
+  <p>Consequences worth stating plainly:</p>
+  <ul>
+    <li><strong>The invoker never needs the underlying data permission.</strong> Alice can let
+      Bob run her calendar digest without Bob ever holding <code>kv/get</code> on her calendar.</li>
+    <li><strong>Changing the code voids the grant.</strong> A new WASM binary is a new CID; the
+      old CID-bound <code>D_fn</code> no longer applies. Code changes cannot silently inherit
+      data access.</li>
+    <li><strong>No new auth machinery.</strong> Layer 2 rides the same delegatee-match and
+      chain-containment checks as every user invocation.</li>
+  </ul>
+
+  <figure class="diagram">
+    <div class="mermaid" data-diagram="fig-3-1"></div>
+    <script type="text/mermaid" id="fig-3-1">
+flowchart LR
+  I["Invoker<br/>(holds execute cap only)"]
+  N["TinyCloud Node<br/>POST /invoke"]
+  E["Capability Engine<br/>chain validation"]
+  B["Execution Backend<br/>wasmtime | worker"]
+  D[("Space data<br/>kv / sql / duckdb")]
+
+  I -- "compute/execute<br/>fn ref + inputs" --> N
+  N -- "Layer 1: verify invoker chain<br/>on ‹space›/compute/‹fn›" --> E
+  N -- "run(function_cid, inputs, D_fn)" --> B
+  B -- "Layer 2: data ops via /invoke<br/>under routine grant D_fn" --> E
+  E -- "authorized reads/writes" --> D
+
+  style I stroke:#e2a144,stroke-width:2px
+  style B stroke:#45c2a8,stroke-width:2px
+  linkStyle 1 stroke:#e2a144,color:#e2a144
+  linkStyle 3 stroke:#45c2a8,color:#45c2a8
+    </script>
+    <figcaption><b>Fig. 3.1</b> — Two capability chains, one endpoint. The backend never
+    touches data directly; every access re-enters the capability engine.</figcaption>
+  </figure>
+  <div class="legend">
+    <span class="chip c1">Layer 1 — invoker's execute chain</span>
+    <span class="chip c2">Layer 2 — routine's CID-bound data grant</span>
+  </div>
+
+  <div class="callout decision">
+    <div class="t">Decision needed — D1: routine identity</div>
+    <p><strong>Option A (proposed):</strong> routine identity is a deterministic TEE-derived key —
+    <code>routine_did = did:key(get_key("tinycloud/compute/" + function_cid))</code> via the
+    node's existing dstack derivation. No secret at rest; the key never leaves the TEE; the
+    deployer can compute the CID (and hence the routine DID) before deploy. Cost: a
+    redeploy on a different node yields a different routine DID, so <code>D_fn</code> is
+    re-minted per node.</p>
+    <p><strong>Option B:</strong> a per-deploy session key generated fresh and persisted encrypted
+    alongside the artifact. Survives node migration but adds a secret at rest.</p>
+  </div>
+  <div class="callout decision">
+    <div class="t">Decision needed — D2: how D_fn binds to the CID</div>
+    <p><strong>Table-side (leaned):</strong> the artifact store keeps
+    <code>function_cid → D_fn</code>; no wire or caveat change.
+    <strong>Caveat-side:</strong> embed <code>function_cid</code> as a caveat, making the binding
+    self-describing inside the delegation itself.</p>
+  </div>
+</section>
+
+<!-- ================================================================ -->
+<section id="deploy">
+  <div class="kicker"><span class="num">04</span>Sequence</div>
+  <h2>Deploy flow</h2>
+  <p>
+    Deployment is two ordinary protocol operations: an <code>/invoke</code> that stores the
+    binary, and a <code>/delegate</code> that mints the routine's data grant. Because the
+    content CID is a pure function of the WASM bytes, the deployer can compute it — and
+    therefore the routine's identity — <em>before</em> deploying. No chicken-and-egg.
+  </p>
+  <figure class="diagram">
+    <div class="mermaid" data-diagram="fig-4-1"></div>
+    <script type="text/mermaid" id="fig-4-1">
+sequenceDiagram
+  autonumber
+  actor O as Owner / Deployer
+  participant N as TinyCloud Node<br/>(POST /invoke)
+  participant A as Capability Engine
+  participant S as Artifact Store<br/>(service = "compute")
+
+  O->>O: function_cid = CID(wasm bytes)<br/>computed locally, pre-deploy
+  O->>N: /invoke — tinycloud.compute/deploy<br/>name + wasm binary
+  rect rgba(226, 161, 68, 0.08)
+    N->>A: verify deploy chain on ‹space›/compute/‹name›
+    A-->>N: ok — containment + ability match
+  end
+  N->>S: save("compute", space, name, wasm)
+  S-->>N: content CID + revision
+  N-->>O: FunctionId { name, cid, revision }
+  rect rgba(69, 194, 168, 0.08)
+    O->>N: /delegate — mint D_fn<br/>delegatee = routine identity for function_cid<br/>caps = attenuated data grant (e.g. kv/get on kv/calendar/)
+    N-->>O: D_fn stored, bound function_cid → D_fn
+  end
+  Note over N,S: identity = content CID — changing the code<br/>changes the CID and voids the grant
+    </script>
+    <figcaption><b>Fig. 4.1</b> — Deploy: store the binary content-addressed
+    <span style="color:var(--l1)">(Layer-1 gated)</span>, then bind the routine's own data
+    grant to the CID <span style="color:var(--l2)">(Layer-2 provisioning)</span>.</figcaption>
+  </figure>
+</section>
+
+<!-- ================================================================ -->
+<section id="execute-wasm">
+  <div class="kicker"><span class="num">05</span>Sequence</div>
+  <h2>Execute flow — in-node WASM <span class="pill l2">WasmtimeBackend</span></h2>
+  <p>
+    The default backend runs the function inside the node under Wasmtime. Caveats map
+    directly onto runtime controls — <code>maxDuration</code> to fuel / epoch interruption,
+    <code>maxMemory</code> to store limits — and every data access is a host function call
+    mediated by the node, re-entering <code>/invoke</code> under the routine's grant.
+  </p>
+  <figure class="diagram">
+    <div class="mermaid" data-diagram="fig-5-1"></div>
+    <script type="text/mermaid" id="fig-5-1">
+sequenceDiagram
+  autonumber
+  actor I as Invoker
+  participant N as TinyCloud Node<br/>(POST /invoke)
+  participant A as Capability Engine
+  participant W as WasmtimeBackend
+  participant H as Host Mediator
+  participant K as KV Service
+
+  I->>N: /invoke — tinycloud.compute/execute<br/>fn ref + inputs (inline | KV refs)
+  rect rgba(226, 161, 68, 0.08)
+    Note right of N: LAYER 1 — who can run
+    N->>A: verify invoker chain on ‹space›/compute/‹fn›
+    A-->>N: ok
+  end
+  N->>W: run(function_cid, inputs, D_fn)
+  W->>W: instantiate — fuel := maxDuration<br/>StoreLimits := maxMemory
+  rect rgba(69, 194, 168, 0.08)
+    Note right of W: LAYER 2 — what the routine touches
+    W->>H: host import storage.get("calendar/…")
+    H->>A: internal invocation signed as routine,<br/>citing D_fn as parent
+    A-->>H: ok — delegatee match + chain containment
+    H->>K: kv/get
+    K-->>H: bytes
+    H-->>W: bytes
+  end
+  W-->>N: output + evidence
+  alt inline output
+    N-->>I: ComputeResult (inline bytes)
+  else output to KV path
+    N->>K: kv/put ‹space›/kv/‹outputPath› under D_fn
+    N-->>I: ComputeResult { outputRef }
+    Note over I,K: normal KV read delegations govern<br/>who may read the output
+  end
+    </script>
+    <figcaption><b>Fig. 5.1</b> — In-node execution. The WASM guest has no ambient I/O;
+    the only door to data is the host mediator, and the mediator only opens it under
+    the routine's own grant.</figcaption>
+  </figure>
+  <div class="legend">
+    <span class="chip c1">Layer 1 — invoker authorization</span>
+    <span class="chip c2">Layer 2 — routine-grant data access</span>
+  </div>
+</section>
+
+<!-- ================================================================ -->
+<section id="execute-cf">
+  <div class="kicker"><span class="num">06</span>Sequence</div>
+  <h2>Execute flow — Cloudflare backend <span class="pill warn">trust-the-deployment</span></h2>
+  <p>
+    The same entry point, a different <code>run()</code>. The node ships the function ref,
+    inputs, and the routine's grant to a deployed Worker. Crucially, <strong>authorization
+    still happens at the data-owning node</strong>: the Worker's data accesses come back as
+    <code>/invoke</code> calls under <code>D_fn</code>, validated by the same engine. What the node
+    <em>cannot</em> do is enforce runtime caveats inside Cloudflare's sandbox.
+  </p>
+  <figure class="diagram">
+    <div class="mermaid" data-diagram="fig-6-1"></div>
+    <script type="text/mermaid" id="fig-6-1">
+sequenceDiagram
+  autonumber
+  actor I as Invoker
+  participant N as TinyCloud Node<br/>(data owner)
+  participant A as Capability Engine
+  participant C as Cloudflare Worker<br/>(deployed backend)
+
+  I->>N: /invoke — tinycloud.compute/execute
+  rect rgba(226, 161, 68, 0.08)
+    N->>A: LAYER 1 — verify invoker chain
+    A-->>N: ok
+  end
+  N->>C: run() — function ref + inputs + routine grant (D_fn)
+  Note over N,C: what crosses the boundary: wasm ref,<br/>input bytes/refs, D_fn token.<br/>Never wholesale raw space data.
+  rect rgba(69, 194, 168, 0.08)
+    C->>N: data access — POST /invoke under D_fn
+    N->>A: LAYER 2 — validate routine chain<br/>(authorization stays at the data-owning node)
+    A-->>N: ok
+    N-->>C: data bytes
+  end
+  C-->>N: output + evidence (deployment identity)
+  N->>N: verify(evidence) = trust-the-deployment
+  N-->>I: output inline or KV ref
+  Note over N,C: maxMemory / maxDuration are NOT<br/>node-enforceable in this backend —<br/>see §8 enforcement matrix
+    </script>
+    <figcaption><b>Fig. 6.1</b> — Remote execution, home authorization. The Worker holds a
+    token, not the data; every byte it reads is a capability-checked round-trip.</figcaption>
+  </figure>
+  <div class="callout trust">
+    <div class="t">Trust model, stated honestly</div>
+    <p>With the Cloudflare backend, <code>verify()</code> reduces to trusting that the deployed
+    Worker runs the code it claims to. Resource caveats (<code>maxMemory</code>,
+    <code>maxDuration</code>) cannot be enforced by the node there. What survives the boundary:
+    Layer-1 and Layer-2 authorization, CID-bound grants, and the guarantee that raw data
+    never leaves the node except through capability-checked responses.</p>
+  </div>
+</section>
+
+<!-- ================================================================ -->
+<section id="backends">
+  <div class="kicker"><span class="num">07</span>Architecture</div>
+  <h2>Pluggable execution backends</h2>
+  <p>All backends implement one interface:</p>
+  <pre><code><span class="cm">// provisional shape — final trait in specs/compute-service.md</span>
+trait ExecutionBackend {
+    <span class="cm">/// Start execution of a stored function under the routine's grant.</span>
+    fn <span class="k2">run</span>(function_cid: Cid, inputs: Inputs, grant: Delegation) -&gt; Handle;
+
+    <span class="cm">/// Retrieve output plus whatever evidence the backend can produce.</span>
+    fn <span class="k2">output</span>(handle: Handle) -&gt; (Bytes, Evidence);
+
+    <span class="cm">/// Check the evidence. Strength varies by backend — see below.</span>
+    fn <span class="k2">verify</span>(evidence: Evidence) -&gt; bool;
+}</code></pre>
+
+  <table>
+    <thead><tr><th>Backend</th><th>Where code runs</th><th>Caveat enforcement</th><th>verify()</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><b>WasmtimeBackend</b></td>
+        <td>In the node process. Hosted nodes already run inside dstack TEEs.</td>
+        <td class="yes">Full — fuel/epoch for <code>maxDuration</code>, StoreLimits for
+            <code>maxMemory</code>, host-function mediation for all data access.</td>
+        <td>Trivial (same trust domain). TEE deployments expose a live
+            <code>/attestation?nonce</code> endpoint returning a TDX quote.</td>
+        <td><b>Initial</b></td>
+      </tr>
+      <tr>
+        <td><b>CloudflareWorkerBackend</b></td>
+        <td>A deployed Worker; node sends fn ref + inputs + routine grant.</td>
+        <td class="no">Partial — <code>maxMemory</code> / <code>maxDuration</code> not
+            node-enforceable. Data access still capability-checked at the node.</td>
+        <td>Trust-the-deployment.</td>
+        <td><b>Initial</b></td>
+      </tr>
+      <tr>
+        <td>Remote TEE</td>
+        <td>Any TEE-hosted runner.</td>
+        <td class="yes">Full, if quote checks out.</td>
+        <td>TDX/TEE quote checked against expected <code>compose_hash</code>.</td>
+        <td>Documented, not built</td>
+      </tr>
+      <tr>
+        <td>ZK prover</td>
+        <td>Anywhere — trust moves into the proof.</td>
+        <td class="yes">N/A — correctness is proven, not policed.</td>
+        <td><code>verify(proof, function_cid, inputs, outputs)</code> — RISC Zero / SP1.</td>
+        <td>Documented, not built</td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="callout note">
+    <div class="t">Invariant</div>
+    <p>Regardless of backend: <strong>authorization always happens at the data-owning
+    node</strong>. Backends receive a grant token, never raw data access. The weakest backend
+    can waste compute; it cannot widen data reach.</p>
+  </div>
+</section>
+
+<!-- ================================================================ -->
+<section id="caveats">
+  <div class="kicker"><span class="num">08</span>Constraints</div>
+  <h2>ComputeCaveats &amp; enforcement</h2>
+  <p>
+    Delegations carrying compute abilities may attenuate with
+    <code>ComputeCaveats</code>:
+  </p>
+  <pre><code><span class="cm">// provisional — field names per whitepaper Appendix J reservation</span>
+ComputeCaveats {
+    functions:   [String],   <span class="cm">// allowlist of function names/paths</span>
+    maxDuration: u64,        <span class="cm">// execution budget</span>
+    maxMemory:   u64,        <span class="cm">// memory ceiling</span>
+    inputs:      Schema,     <span class="cm">// input shape constraint</span>
+}</code></pre>
+  <table>
+    <thead><tr><th>Caveat</th><th>WasmtimeBackend</th><th>CloudflareWorkerBackend</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><b><code>functions</code></b></td>
+        <td class="yes">Enforced at dispatch (node-side, before backend)</td>
+        <td class="yes">Enforced at dispatch (node-side, before backend)</td>
+      </tr>
+      <tr>
+        <td><b><code>maxDuration</code></b></td>
+        <td class="yes">wasmtime fuel / epoch interruption</td>
+        <td class="no">Not node-enforceable — trust the deployment</td>
+      </tr>
+      <tr>
+        <td><b><code>maxMemory</code></b></td>
+        <td class="yes">wasmtime StoreLimits</td>
+        <td class="no">Not node-enforceable — trust the deployment</td>
+      </tr>
+      <tr>
+        <td><b><code>inputs</code> schema</b></td>
+        <td class="yes">Validated node-side before dispatch</td>
+        <td class="yes">Validated node-side before dispatch</td>
+      </tr>
+      <tr>
+        <td><b>data reach</b></td>
+        <td class="yes">Host-mediated, capability-checked per access</td>
+        <td class="yes">Capability-checked at the node per round-trip</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ================================================================ -->
+<section id="fn-lifecycle">
+  <div class="kicker"><span class="num">09</span>State</div>
+  <h2>Function lifecycle</h2>
+  <p>
+    A function's life is anchored to its content CID. Deploying new bytes under the same
+    name produces a <em>new</em> CID and a fresh lifecycle; the old CID's grant does not
+    carry over.
+  </p>
+  <figure class="diagram">
+    <div class="mermaid" data-diagram="fig-9-1"></div>
+    <script type="text/mermaid" id="fig-9-1">
+stateDiagram-v2
+  direction LR
+  Deployed : Deployed — wasm stored, identity = content CID
+  GrantBound : GrantBound — D_fn minted, bound to CID
+  Active : Active — executable
+  Superseded : Superseded — new CID, old grant VOID
+  Revoked : Revoked
+
+  [*] --> Deployed : compute/deploy
+  Deployed --> GrantBound : deployer mints D_fn (delegatee = routine)
+  GrantBound --> Active : capability entries active
+  Active --> Active : compute/execute invocations
+  Active --> Superseded : new bytes deployed under same name
+  Active --> Revoked : deployer revokes D_fn or execute delegation
+  Superseded --> [*]
+  Revoked --> [*]
+
+  note right of Superseded
+    A new binary is a new identity.
+    CID-bound grants cannot follow
+    a code change.
+  end note
+    </script>
+    <figcaption><b>Fig. 9.1</b> — Function lifecycle: deployed → grant-bound → active,
+    ending in supersession (new CID) or revocation.</figcaption>
+  </figure>
+  <p class="dim">
+    A function that is <em>Deployed</em> but never grant-bound is still executable if it
+    needs no data access at all — pure functions over inline inputs skip Layer 2 entirely.
+  </p>
+</section>
+
+<!-- ================================================================ -->
+<section id="inv-lifecycle">
+  <div class="kicker"><span class="num">10</span>State</div>
+  <h2>Invocation lifecycle</h2>
+  <p>
+    Each execution request moves through verification, dispatch, and delivery. Replay
+    protection is nonce-based, as everywhere else in the protocol: a previously seen
+    invocation is rejected before any chain work happens.
+  </p>
+  <figure class="diagram">
+    <div class="mermaid" data-diagram="fig-10-1"></div>
+    <script type="text/mermaid" id="fig-10-1">
+stateDiagram-v2
+  Rejected : Rejected — replay
+  Denied : Denied — unauthorized
+  ChainVerified : ChainVerified
+  Exhausted : Exhausted — fuel or memory limit
+
+  [*] --> Received : POST /invoke
+  Received --> Rejected : replay cache hit (nonce already seen)
+  Received --> Denied : Layer-1 chain invalid or caveat violated
+  Received --> ChainVerified : Layer-1 delegation chain valid
+  ChainVerified --> Dispatched : backend selected (wasmtime | cloudflare)
+  Dispatched --> Running
+  Running --> Completed : normal return
+  Running --> Failed : trap / runtime error
+  Running --> Exhausted : fuel out (maxDuration) or memory limit (maxMemory)
+  Completed --> Delivered : output inline, or kv/put under D_fn
+  Delivered --> [*]
+  Failed --> [*]
+  Exhausted --> [*]
+  Denied --> [*]
+  Rejected --> [*]
+
+  note right of Rejected
+    Nonce-based replay rejection.
+    Never timestamps alone.
+  end note
+    </script>
+    <figcaption><b>Fig. 10.1</b> — Invocation lifecycle: received → chain-verified →
+    dispatched → running → terminal, including the replay-rejection path.</figcaption>
+  </figure>
+</section>
+
+<!-- ================================================================ -->
+<section id="wire">
+  <div class="kicker"><span class="num">11</span>Protocol Surface</div>
+  <h2>Wire format &amp; capability registry <span class="pill dimp">provisional</span></h2>
+  <p>
+    Compute follows the SQL/DuckDB precedent byte for byte: <code>/invoke</code> filters
+    presented capabilities for <code>service == "compute"</code>, deserializes the body into a
+    request enum, and answers through a new <code>InvocationOutcome</code> arm. When the node
+    is built without the compute feature, a compute-service capability returns
+    <code>501 Not Implemented</code> — the same gating the DuckDB feature flag uses.
+  </p>
+  <pre><code><span class="cm">// request body over POST /invoke — provisional until the spec draft locks it</span>
+{ "<span class="k1">Execute</span>": {
+    "function": "calendar-digest",          <span class="cm">// name; resolves to current CID</span>
+    "inputs":   { "inline": "&lt;bytes&gt;" },    <span class="cm">// or { "kvRef": "kv/inbox/x" }</span>
+    "output":   { "inline": true }          <span class="cm">// or { "kvPath": "kv/digests/today" }</span>
+} }
+
+{ "<span class="k1">Deploy</span>":  { "name": "calendar-digest", "module": "&lt;wasm bytes&gt;" } }
+{ "<span class="k1">List</span>":    {} }</code></pre>
+  <pre><code><span class="cm">// tinycloud-core InvocationOutcome — new arms</span>
+InvocationOutcome::<span class="k2">ComputeResult</span>(serde_json::Value)
+InvocationOutcome::<span class="k2">ComputeList</span>(serde_json::Value)</code></pre>
+  <h3>capabilities.json — reserved first</h3>
+  <p>
+    New service entries land as <code>status: "reserved"</code> in the node's
+    <code>capabilities.json</code> single source of truth before activation — the same path
+    <code>tinycloud.vfs/*</code> took. The registry's generator enforces that a wildcard
+    <code>implies</code> every <em>active</em> concrete action of its service, so the reserved
+    wildcard carries no <code>implies</code> until the concrete actions go active.
+  </p>
+  <pre><code><span class="cm">// sketch of the registry diff (reserved stage)</span>
+{ "action": "tinycloud.compute/deploy",  "service": "compute", "status": "<span class="k1">reserved</span>" },
+{ "action": "tinycloud.compute/execute", "service": "compute", "status": "<span class="k1">reserved</span>" },
+{ "action": "tinycloud.compute/list",    "service": "compute", "status": "<span class="k1">reserved</span>" },
+{ "action": "tinycloud.compute/*",       "service": "compute", "status": "<span class="k1">reserved</span>" }</code></pre>
+</section>
+
+<!-- ================================================================ -->
+<section id="trust">
+  <div class="kicker"><span class="num">12</span>Verification</div>
+  <h2>Trust &amp; verification ladder</h2>
+  <p>
+    <code>verify(evidence)</code> is where backends differ most. The design names the rungs
+    explicitly rather than pretending they are equivalent:
+  </p>
+  <table>
+    <thead><tr><th>Rung</th><th>Evidence</th><th>What it proves</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><b>1 · Same trust domain</b></td>
+        <td>None needed — WasmtimeBackend runs inside the node.</td>
+        <td>Everything the node itself is trusted for. Hosted nodes run in dstack TEEs
+            with a live <code>/attestation?nonce</code> endpoint (TDX quote, nonce-bound), so
+            "the node" is itself attestable.</td>
+      </tr>
+      <tr>
+        <td><b>2 · Trust the deployment</b></td>
+        <td>Deployment identity of the Cloudflare Worker.</td>
+        <td>That <em>some</em> deployed code produced the output. No runtime-caveat
+            guarantees; data reach still bounded by <code>D_fn</code>.</td>
+      </tr>
+      <tr>
+        <td><b>3 · Remote TEE quote</b> <span class="pill dimp">future</span></td>
+        <td>TDX quote checked against expected <code>compose_hash</code>.</td>
+        <td>The exact runner image executed, in genuine TEE hardware.</td>
+      </tr>
+      <tr>
+        <td><b>4 · ZK proof</b> <span class="pill dimp">future</span></td>
+        <td><code>verify(proof, function_cid, inputs, outputs)</code> — RISC Zero / SP1.</td>
+        <td>This exact function, on these inputs, produced these outputs. No trust in the
+            runner at all.</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="dim">
+    Rungs 3 and 4 are documented plugs — the <code>Evidence</code> type and
+    <code>verify()</code> hook exist for them, but no implementation ships in v1.
+  </p>
+</section>
+
+<!-- ================================================================ -->
+<section id="scope">
+  <div class="kicker"><span class="num">13</span>Boundaries</div>
+  <h2>Scope &amp; open questions</h2>
+  <h3>Explicitly out of scope</h3>
+  <ul>
+    <li><strong>Multi-node orchestration</strong> — running the same routine across several
+      people's nodes and aggregating results into a shared space belongs to layers above
+      the protocol (e.g. Smithers). The compute service is single-node, single-space.</li>
+    <li><strong>A function marketplace / discovery layer</strong> — <code>compute/list</code>
+      enumerates one space; anything richer is an application concern.</li>
+  </ul>
+  <h3>Open questions</h3>
+  <ul>
+    <li><strong>D1</strong> — routine identity: TEE-derived deterministic key vs persisted
+      per-deploy session key (<a href="#two-layer">§3</a>).</li>
+    <li><strong>D2</strong> — CID binding of <code>D_fn</code>: artifact-table side vs
+      self-describing caveat (<a href="#two-layer">§3</a>).</li>
+    <li>Replay-cache scope and retention for compute invocations (idempotent re-execution
+      vs strict once-only).</li>
+    <li>Whether <code>compute/deploy</code> should be delegable below the space owner in v1.</li>
+  </ul>
+
+  <footer>
+    <div class="src">Sources</div>
+    <div>specs/compute-service.md — main specification (drafted alongside this site)</div>
+    <div>specs/compute-service-design-notes.md — design exploration</div>
+    <div>specs/compute-service-discussion.md — decision log (D1, D2)</div>
+    <div>whitepaper appendix J — reserved compute abilities &amp; ComputeCaveats</div>
+    <div style="margin-top:1.2rem">TinyCloud Labs · design draft · rendered with Mermaid</div>
+  </footer>
+</section>
+
+</main>
+</div>
+
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+
+  mermaid.initialize({
+    startOnLoad: false,
+    theme: "base",
+    fontFamily: "'IBM Plex Mono', Menlo, monospace",
+    themeVariables: {
+      background: "transparent",
+      fontFamily: "'IBM Plex Mono', Menlo, monospace",
+      fontSize: "13.5px",
+      primaryColor: "#1a212b",
+      primaryTextColor: "#e6e1d3",
+      primaryBorderColor: "#435061",
+      secondaryColor: "#232b37",
+      tertiaryColor: "#151a22",
+      lineColor: "#7e8794",
+      textColor: "#c9c4b6",
+      // sequence
+      actorBkg: "#1a212b",
+      actorBorder: "#4d5a6c",
+      actorTextColor: "#e6e1d3",
+      actorLineColor: "#4d5a6c",
+      signalColor: "#b9b3a4",
+      signalTextColor: "#c9c4b6",
+      labelBoxBkgColor: "#232b37",
+      labelBoxBorderColor: "#4d5a6c",
+      labelTextColor: "#e6e1d3",
+      loopTextColor: "#e6e1d3",
+      noteBkgColor: "#2a2517",
+      noteBorderColor: "#8a6626",
+      noteTextColor: "#e8ddbd",
+      activationBkgColor: "#2c3541",
+      activationBorderColor: "#5a6673",
+      sequenceNumberColor: "#0e1116",
+      // flowchart
+      nodeBorder: "#4d5a6c",
+      clusterBkg: "#151a22",
+      clusterBorder: "#313c4b",
+      edgeLabelBackground: "#151a22",
+      // state
+      stateBkg: "#1a212b",
+      stateLabelColor: "#e6e1d3",
+      transitionColor: "#7e8794",
+      transitionLabelColor: "#b9b3a4",
+      specialStateColor: "#e2a144",
+      innerEndBackground: "#1a212b",
+      compositeBackground: "#151a22",
+      compositeTitleBackground: "#232b37",
+    },
+    sequence: {
+      mirrorActors: false,
+      messageMargin: 42,
+      actorMargin: 26,
+      boxMargin: 8,
+      noteMargin: 8,
+      useMaxWidth: true,
+    },
+    flowchart: { useMaxWidth: true, curve: "basis", nodeSpacing: 46, rankSpacing: 60 },
+    state: { useMaxWidth: true },
+  });
+
+  // ---- render diagrams from raw text/mermaid script blocks ----
+  // (sources live in <script type="text/mermaid"> so the HTML parser never
+  //  mangles <br/> tags or angle-bracket placeholders)
+  for (const target of document.querySelectorAll("div.mermaid[data-diagram]")) {
+    const src = document.getElementById(target.dataset.diagram);
+    if (!src) continue;
+    try {
+      const { svg } = await mermaid.render("svg-" + target.dataset.diagram, src.textContent.trim());
+      target.innerHTML = svg;
+    } catch (err) {
+      target.innerHTML = '<pre style="color:#d4726a;font-size:12px;white-space:pre-wrap">' +
+        "diagram failed to render: " + String(err) + "</pre>";
+    }
+  }
+
+  // ---- scrollspy for the rail nav ----
+  const links = [...document.querySelectorAll("nav.rail li a")];
+  const byId = Object.fromEntries(links.map(a => [a.getAttribute("href").slice(1), a]));
+  const observer = new IntersectionObserver(entries => {
+    for (const e of entries) {
+      if (e.isIntersecting) {
+        links.forEach(a => a.classList.remove("active"));
+        const link = byId[e.target.id];
+        if (link) link.classList.add("active");
+      }
+    }
+  }, { rootMargin: "-15% 0px -70% 0px" });
+  document.querySelectorAll("main section[id]").forEach(s => observer.observe(s));
+</script>
+</body>
+</html>
