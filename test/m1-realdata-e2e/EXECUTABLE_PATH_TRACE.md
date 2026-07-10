@@ -25,7 +25,7 @@ whose vendored `reachability` is `mounted-runtime`.
    by the trusted public key in the vendored launch-profile fixture and a
    `GrantIssuer` that signs a real node UCAN delegation. The runtime is ready
    only after node seeding and verified authority loading.
-4. Call `issue_challenge_with_nonce`, sign a holder presentation containing the
+4. Call `issue_challenge`, sign a holder presentation containing the
    vendored SD-JWT, and call `resolve` (`crates/policy-runtime/src/lib.rs`). The
    issuer's returned `PortableDelegation.encoded` is the signed node UCAN.
 5. Import that exact encoding through Rocket's local `/delegate` route. The
@@ -42,7 +42,7 @@ whose vendored `reachability` is `mounted-runtime`.
 | Delegation import provenance | local `/delegate` -> `TinyCloud::delegate` -> delegation `verify`/`validate`/`save` | Delegation and ability tables are empty before import; the returned import CID is then observed in the created delegation row and its abilities. The test never writes either table. |
 | Named Listen SQL reads | local `/invoke` -> chain validation in `models/invocation.rs` -> `routes::enforce_constrained_profile` -> `SqlService::execute` | Named statements return the exact rows/bytes seeded earlier; disallowed name, fixed-param override, raw query, raw execute/write, batch, and export requests report their native `sql-*` outcomes from the dispatched response. |
 | KV read and containment | local `/invoke` -> invocation chain validation -> native KV dispatch | Authorized `kv/get` returns exactly the seeded bytes. An unauthorized KV ability reports `Unauthorized Action`, and a before/after read proves it returned no protected bytes. |
-| Expired delegation | invocation validation in `tinycloud-core/src/models/invocation.rs` filters parent delegations by current expiry | A separately imported, genuinely signed but expired node delegation is refused by a fresh holder invocation; the response is observed, not inferred from its payload. |
+| Expired delegation | `/delegate` -> `models/delegation.rs::verify` -> UCAN `validate_time` | A genuinely signed expired node delegation is refused by the import operation; no expired authority row is manufactured. |
 | Issuance read-back | successful `resolve` inserts `IssuanceRecord`; `PolicySpaceState::issuance` reads it | Every field is compared to this resolve's policy, subject, holder, resource/delegation id, evidence id, issued/expires times, and `RevocationMode::RefreshOnly`; observed TTL must be positive and at most 300 seconds. (`refresh_only` is the pinned API's `revocation` enum field, not a separate boolean.) |
 | Expired credential | fresh challenge + resolve -> VC verifier over vendored `expired.json` | The returned runtime error's nested mounted-runtime code is `evidence-credential-invalid`. |
 | Untrusted issuer | fresh challenge + resolve -> VC verifier over vendored `untrusted-issuer-did.json` | The returned runtime error's nested mounted-runtime code is `evidence-issuer-untrusted`. |
@@ -60,7 +60,7 @@ whose vendored `reachability` is `mounted-runtime`.
   those same issued bytes in `PortableDelegation.encoded`; it does not translate
   or mutate node state afterward.
 - There is no shared correlation identifier with m1-g-05b live issuance. This
-  crate makes no live-issuance or live-gate claim.
+  crate makes no claim about that live issuance or production readiness.
 - `canonicalization-mismatch` and `evidence-freshness-expired` have no allowed
   deterministic mounted-runtime hop for this ticket and are not manufactured.
 - Direct delegation/ability insertion, mocked evidence acceptance, subprocesses,

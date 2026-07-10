@@ -16,6 +16,7 @@ default-members = ["tinycloud-node-server"]
 
 exclude = [
     "test/load/signer",
+    "test/m1-realdata-e2e",
     "test/w5-policy-runtime-node-e2e",
 ]
 
