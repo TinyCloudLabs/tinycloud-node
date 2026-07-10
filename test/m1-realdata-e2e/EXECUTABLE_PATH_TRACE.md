@@ -36,8 +36,14 @@ whose vendored `reachability` is `mounted-runtime`.
    denial below.
 3. Construct `PolicyRuntime` with `policy_evidence_vc::VcEvidenceVerifier` keyed
    by the trusted public key in the vendored launch-profile fixture and a
-   `GrantIssuer` that signs a real node UCAN delegation. The runtime is ready
-   only after node seeding and verified authority loading.
+   `GrantIssuer` that signs a real node UCAN delegation. The evidence time is
+   parsed from that fixture's `verificationOptions.now`: Unix timestamp
+   `1781222580` (`2026-06-12T00:03:00Z`). A narrow `EvidenceVerifier` adapter
+   passes that parsed instant explicitly to `VcEvidenceVerifier`; the runtime's
+   separate deterministic issuance instant and an injected hostile ambient
+   instant in 2100 are both observed to differ from it. The successful resolve
+   therefore proves ambient time does not enter VC/SD-JWT verification. The
+   runtime is ready only after node seeding and verified authority loading.
 4. Call `issue_challenge`, sign a holder presentation containing the
    vendored SD-JWT, and call `resolve` (`crates/policy-runtime/src/lib.rs`). The
    issuer's returned `PortableDelegation.encoded` is the signed node UCAN.
@@ -52,7 +58,7 @@ whose vendored `reachability` is `mounted-runtime`.
 | Required behavior | Production hop | Observation produced by the harness |
 | --- | --- | --- |
 | Space storage precondition (not authority evidence) | No production initial-space route exists; W5 provisions `space::ActiveModel` plus the block directory before native service use | The setup insert produces exactly one space row while delegation and ability tables remain empty. Authority provenance is observed separately only after `/delegate`. |
-| Real launch-profile resolve | `PolicyRuntime::resolve` -> `verify_evidence` -> `policy_evidence_vc::VcEvidenceVerifier::verify` -> `GrantIssuer::issue` | The resolve returns a delegation whose holder, policy, capabilities, validity, and encoded UCAN are compared with the presentation and policy used by that call. |
+| Real launch-profile resolve | `PolicyRuntime::resolve` -> `verify_evidence` -> fixture-time `EvidenceVerifier` adapter -> `policy_evidence_vc::VcEvidenceVerifier::verify` -> `GrantIssuer::issue` | The adapter records the runtime instant and injected hostile ambient instant, passes the parsed fixture `verificationOptions.now` to the VC verifier, and the resolve succeeds. The returned delegation's holder, policy, capabilities, validity, issued time, and encoded UCAN are compared with the presentation and policy used by that call. |
 | Delegation import provenance | local `/delegate` -> `TinyCloud::delegate` -> delegation `verify`/`validate`/`save` | Delegation and ability tables are empty before import; the returned import CID is then observed in the created delegation row and its abilities. The test never writes either table. |
 | Named Listen SQL reads | local `/invoke` -> chain validation in `models/invocation.rs` -> `routes::enforce_constrained_profile` -> `SqlService::execute` | Named statements return the exact rows/bytes seeded earlier; disallowed name, fixed-param override, raw query, raw execute/write, batch, and export requests report their native `sql-*` outcomes from the dispatched response. |
 | KV read and containment | local `/invoke` -> invocation chain validation -> native KV dispatch | Authorized `kv/get` returns exactly the seeded bytes. An unauthorized KV ability reports `Unauthorized Action`, and a before/after read proves it returned no protected bytes. |

@@ -1,8 +1,12 @@
-use std::{collections::BTreeMap, convert::TryInto};
+use std::{
+    collections::BTreeMap,
+    convert::TryInto,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::{Signer, SigningKey};
 use policy_core::{
     requested_capabilities_hash_hex,
@@ -16,8 +20,9 @@ use policy_core::{
 };
 use policy_evidence_vc::VcEvidenceVerifier;
 use policy_runtime::{
-    GrantIssueRequest, GrantIssuer, PolicyRuntime, PolicySpaceState, PortableDelegation,
-    RuntimeConfig, RuntimeError,
+    EvidenceSatisfaction, EvidenceVerifier, GrantIssueRequest, GrantIssuer, PolicyRuntime,
+    PolicySpaceState, PortableDelegation, ProvenancedEvidenceSatisfaction, RuntimeConfig,
+    RuntimeError, RuntimeEvidenceContext,
 };
 use rocket::{
     figment::providers::{Format, Serialized, Toml},
@@ -61,6 +66,8 @@ const KV_PATH: &str = "audio/conversation-a/recording";
 const CONVERSATION_ID: &str = "conversation-a";
 const EVIDENCE_ID: &str = "email-domain";
 const KV_SEED: &[u8] = b"listen-audio-seed-from-m1-g-05a";
+const HOSTILE_AMBIENT_TIMESTAMP: i64 = 4_102_444_800;
+const RUNTIME_ISSUANCE_TIMESTAMP: i64 = 1_812_754_920;
 
 const VALID_FIXTURE: &str = include_str!("../vendor/launch-credential-denials/baseline-valid.json");
 const EXPIRED_FIXTURE: &str = include_str!("../vendor/launch-credential-denials/expired.json");
@@ -75,6 +82,15 @@ struct NodeGrantIssuer {
     owner_vm: String,
     owner_did: String,
     space: SpaceId,
+}
+
+type ClockObservation = Arc<Mutex<Option<(DateTime<Utc>, DateTime<Utc>, DateTime<Utc>)>>>;
+
+struct FixtureTimeVerifier {
+    inner: VcEvidenceVerifier,
+    fixture_now: DateTime<Utc>,
+    injected_ambient_now: DateTime<Utc>,
+    observation: Option<ClockObservation>,
 }
 
 struct InvocationSigner<'a> {
@@ -139,6 +155,49 @@ impl GrantIssuer for NodeGrantIssuer {
 
     fn revoke(&mut self, _delegation_id: &str) -> Result<(), RuntimeError> {
         Ok(())
+    }
+}
+
+impl EvidenceVerifier for FixtureTimeVerifier {
+    fn verify(
+        &self,
+        requirement: &EvidenceRequirement,
+        presentation: &Value,
+        context: &RuntimeEvidenceContext,
+    ) -> Result<EvidenceSatisfaction, RuntimeError> {
+        let fixture_context = self.fixture_context(context);
+        EvidenceVerifier::verify(&self.inner, requirement, presentation, &fixture_context)
+    }
+
+    fn verify_with_provenance(
+        &self,
+        requirement: &EvidenceRequirement,
+        presentation: &Value,
+        context: &RuntimeEvidenceContext,
+    ) -> Result<ProvenancedEvidenceSatisfaction, RuntimeError> {
+        let fixture_context = self.fixture_context(context);
+        EvidenceVerifier::verify_with_provenance(
+            &self.inner,
+            requirement,
+            presentation,
+            &fixture_context,
+        )
+    }
+}
+
+impl FixtureTimeVerifier {
+    fn fixture_context(&self, ambient: &RuntimeEvidenceContext) -> RuntimeEvidenceContext {
+        if let Some(observation) = &self.observation {
+            *observation.lock().expect("clock observation lock") =
+                Some((ambient.now, self.injected_ambient_now, self.fixture_now));
+        }
+        RuntimeEvidenceContext {
+            policy: ambient.policy.clone(),
+            eligible_subject_did: ambient.eligible_subject_did.clone(),
+            holder_did: ambient.holder_did.clone(),
+            requested_capabilities: ambient.requested_capabilities.clone(),
+            now: self.fixture_now,
+        }
     }
 }
 
@@ -217,11 +276,30 @@ secret = "{}"
 
     let before_delegations = delegation::Entity::find().count(&conn).await?;
     let before_abilities = abilities::Entity::find().count(&conn).await?;
-    let now = Utc::now();
+    let hostile_ambient_now = DateTime::from_timestamp(HOSTILE_AMBIENT_TIMESTAMP, 0)
+        .context("hostile ambient timestamp")?;
+    let runtime_issuance_now = DateTime::from_timestamp(RUNTIME_ISSUANCE_TIMESTAMP, 0)
+        .context("deterministic runtime issuance timestamp")?;
+    let fixture_now = fixture_verification_time(VALID_FIXTURE, hostile_ambient_now)?;
+    assert_eq!(
+        fixture_now.timestamp(),
+        1_781_222_580,
+        "runtime evidence time must be the fixture verificationOptions.now instant"
+    );
+    assert_ne!(
+        fixture_now, hostile_ambient_now,
+        "the injected advanced ambient time must not reach evidence verification"
+    );
+    let clock_observation = Arc::new(Mutex::new(None));
     let mut runtime = runtime(
         policy.clone(),
         active_status.clone(),
-        trusted_verifier(),
+        fixture_time_verifier(
+            trusted_verifier(),
+            fixture_now,
+            hostile_ambient_now,
+            Some(Arc::clone(&clock_observation)),
+        ),
         NodeGrantIssuer {
             owner_jwk: owner_jwk.clone(),
             owner_vm: owner_vm.clone(),
@@ -229,7 +307,7 @@ secret = "{}"
             space: space_id.clone(),
         },
     )?;
-    let challenge = runtime.issue_challenge(&policy.policy_id, now)?;
+    let challenge = runtime.issue_challenge(&policy.policy_id, runtime_issuance_now)?;
     let valid_evidence = fixture_evidence(VALID_FIXTURE)?;
     let presentation = signed_presentation(
         &policy,
@@ -239,10 +317,20 @@ secret = "{}"
         valid_evidence,
         AUDIENCE,
         1,
+        runtime_issuance_now,
     )?;
     let replay_presentation = presentation.clone();
-    let issued = runtime.resolve(presentation, now)?;
+    let issued = runtime.resolve(presentation, runtime_issuance_now)?;
 
+    assert_eq!(
+        *clock_observation.lock().expect("clock observation lock"),
+        Some((runtime_issuance_now, hostile_ambient_now, fixture_now)),
+        "the verifier must replace the injected ambient time with the parsed fixture instant"
+    );
+    assert_eq!(
+        issued.issued_at, runtime_issuance_now,
+        "issuance retains the injected runtime instant outside evidence verification"
+    );
     assert_eq!(issued.policy_id, policy.policy_id);
     assert_eq!(issued.holder_did, holder_did);
     assert_eq!(issued.capabilities, policy.resource.permissions_ceiling);
@@ -425,7 +513,9 @@ secret = "{}"
         after_delegations
     );
 
-    let replay_error = runtime.resolve(replay_presentation, now).unwrap_err();
+    let replay_error = runtime
+        .resolve(replay_presentation, runtime_issuance_now)
+        .unwrap_err();
     assert_runtime_code(&replay_error, "challenge-nonce-consumed")?;
 
     exercise_engine_denials(&EngineDenialContext {
@@ -459,15 +549,19 @@ fn exercise_engine_denials(context: &EngineDenialContext<'_>) -> Result<()> {
         owner_did: (*owner_did).to_string(),
         space: (*space).clone(),
     };
-    let now = Utc::now();
+    let hostile_ambient_now = DateTime::from_timestamp(HOSTILE_AMBIENT_TIMESTAMP, 0)
+        .context("hostile ambient timestamp")?;
+    let runtime_issuance_now = DateTime::from_timestamp(RUNTIME_ISSUANCE_TIMESTAMP, 0)
+        .context("deterministic runtime issuance timestamp")?;
+    let valid_now = fixture_verification_time(VALID_FIXTURE, hostile_ambient_now)?;
 
     let mut audience_runtime = runtime(
         (*policy).clone(),
         (*active_status).clone(),
-        trusted_verifier(),
+        fixture_time_verifier(trusted_verifier(), valid_now, hostile_ambient_now, None),
         issuer(),
     )?;
-    let challenge = audience_runtime.issue_challenge(&policy.policy_id, now)?;
+    let challenge = audience_runtime.issue_challenge(&policy.policy_id, runtime_issuance_now)?;
     let mismatched = signed_presentation(
         policy,
         &challenge,
@@ -476,17 +570,21 @@ fn exercise_engine_denials(context: &EngineDenialContext<'_>) -> Result<()> {
         fixture_evidence(VALID_FIXTURE)?,
         "policy-engine:wrong-audience",
         1,
+        runtime_issuance_now,
     )?;
-    let audience_error = audience_runtime.resolve(mismatched, now).unwrap_err();
+    let audience_error = audience_runtime
+        .resolve(mismatched, runtime_issuance_now)
+        .unwrap_err();
     assert_runtime_code(&audience_error, "presentation-audience-mismatch")?;
 
+    let expired_now = fixture_verification_time(EXPIRED_FIXTURE, hostile_ambient_now)?;
     let mut expired_runtime = runtime(
         (*policy).clone(),
         (*active_status).clone(),
-        trusted_verifier(),
+        fixture_time_verifier(trusted_verifier(), expired_now, hostile_ambient_now, None),
         issuer(),
     )?;
-    let challenge = expired_runtime.issue_challenge(&policy.policy_id, now)?;
+    let challenge = expired_runtime.issue_challenge(&policy.policy_id, runtime_issuance_now)?;
     let expired = signed_presentation(
         policy,
         &challenge,
@@ -495,8 +593,11 @@ fn exercise_engine_denials(context: &EngineDenialContext<'_>) -> Result<()> {
         fixture_evidence(EXPIRED_FIXTURE)?,
         AUDIENCE,
         1,
+        runtime_issuance_now,
     )?;
-    let expired_error = expired_runtime.resolve(expired, now).unwrap_err();
+    let expired_error = expired_runtime
+        .resolve(expired, runtime_issuance_now)
+        .unwrap_err();
     assert_runtime_code(&expired_error, "evidence-credential-invalid")?;
 
     let fixture_issuer = fixture_sd_jwt_issuer(UNTRUSTED_FIXTURE)?;
@@ -518,13 +619,20 @@ fn exercise_engine_denials(context: &EngineDenialContext<'_>) -> Result<()> {
         ),
         &policy_key,
     )?;
+    let untrusted_now = fixture_verification_time(UNTRUSTED_FIXTURE, hostile_ambient_now)?;
     let mut untrusted_runtime = runtime(
         untrusted_policy.clone(),
         untrusted_status,
-        untrusted_verifier(),
+        fixture_time_verifier(
+            untrusted_verifier(),
+            untrusted_now,
+            hostile_ambient_now,
+            None,
+        ),
         issuer(),
     )?;
-    let challenge = untrusted_runtime.issue_challenge(&untrusted_policy.policy_id, now)?;
+    let challenge =
+        untrusted_runtime.issue_challenge(&untrusted_policy.policy_id, runtime_issuance_now)?;
     let untrusted = signed_presentation(
         &untrusted_policy,
         &challenge,
@@ -533,17 +641,20 @@ fn exercise_engine_denials(context: &EngineDenialContext<'_>) -> Result<()> {
         fixture_evidence(UNTRUSTED_FIXTURE)?,
         AUDIENCE,
         1,
+        runtime_issuance_now,
     )?;
-    let untrusted_error = untrusted_runtime.resolve(untrusted, now).unwrap_err();
+    let untrusted_error = untrusted_runtime
+        .resolve(untrusted, runtime_issuance_now)
+        .unwrap_err();
     assert_runtime_code(&untrusted_error, "evidence-issuer-untrusted")?;
 
     let mut inactive_runtime = runtime(
         (*policy).clone(),
         (*active_status).clone(),
-        trusted_verifier(),
+        fixture_time_verifier(trusted_verifier(), valid_now, hostile_ambient_now, None),
         issuer(),
     )?;
-    let challenge = inactive_runtime.issue_challenge(&policy.policy_id, now)?;
+    let challenge = inactive_runtime.issue_challenge(&policy.policy_id, runtime_issuance_now)?;
     let pending = signed_presentation(
         policy,
         &challenge,
@@ -552,6 +663,7 @@ fn exercise_engine_denials(context: &EngineDenialContext<'_>) -> Result<()> {
         fixture_evidence(VALID_FIXTURE)?,
         AUDIENCE,
         1,
+        runtime_issuance_now,
     )?;
     let revoked = verified_status(
         policy_status(
@@ -563,13 +675,15 @@ fn exercise_engine_denials(context: &EngineDenialContext<'_>) -> Result<()> {
         &policy_key,
     )?;
     inactive_runtime.state_mut().insert_policy_status(revoked)?;
-    let inactive_error = inactive_runtime.resolve(pending, now).unwrap_err();
+    let inactive_error = inactive_runtime
+        .resolve(pending, runtime_issuance_now)
+        .unwrap_err();
     assert_runtime_code(&inactive_error, "policy-inactive")?;
 
     let mut compromised_runtime = runtime(
         (*policy).clone(),
         (*active_status).clone(),
-        trusted_verifier(),
+        fixture_time_verifier(trusted_verifier(), valid_now, hostile_ambient_now, None),
         issuer(),
     )?;
     let revoked_enrollment = enrollment_status(2, HolderEnrollmentDisposition::Revoked);
@@ -587,7 +701,7 @@ fn exercise_engine_denials(context: &EngineDenialContext<'_>) -> Result<()> {
         recovery_error.as_str(),
         mounted_code("enrollment-revoked-irreversible")?
     );
-    let challenge = compromised_runtime.issue_challenge(&policy.policy_id, now)?;
+    let challenge = compromised_runtime.issue_challenge(&policy.policy_id, runtime_issuance_now)?;
     let compromised = signed_presentation(
         policy,
         &challenge,
@@ -596,8 +710,11 @@ fn exercise_engine_denials(context: &EngineDenialContext<'_>) -> Result<()> {
         fixture_evidence(VALID_FIXTURE)?,
         AUDIENCE,
         3,
+        runtime_issuance_now,
     )?;
-    let compromised_error = compromised_runtime.resolve(compromised, now).unwrap_err();
+    let compromised_error = compromised_runtime
+        .resolve(compromised, runtime_issuance_now)
+        .unwrap_err();
     assert_runtime_code(&compromised_error, "enrollment-revoked-irreversible")?;
 
     Ok(())
@@ -606,9 +723,9 @@ fn exercise_engine_denials(context: &EngineDenialContext<'_>) -> Result<()> {
 fn runtime(
     policy: Policy,
     status: PolicyStatus,
-    verifier: VcEvidenceVerifier,
+    verifier: FixtureTimeVerifier,
     issuer: NodeGrantIssuer,
-) -> Result<PolicyRuntime<NodeGrantIssuer, VcEvidenceVerifier>> {
+) -> Result<PolicyRuntime<NodeGrantIssuer, FixtureTimeVerifier>> {
     let mut state = PolicySpaceState::default();
     state.insert_policy(policy);
     state.insert_policy_status(status)?;
@@ -640,6 +757,20 @@ fn trusted_verifier() -> VcEvidenceVerifier {
 
 fn untrusted_verifier() -> VcEvidenceVerifier {
     VcEvidenceVerifier::new(BTreeMap::new())
+}
+
+fn fixture_time_verifier(
+    inner: VcEvidenceVerifier,
+    fixture_now: DateTime<Utc>,
+    injected_ambient_now: DateTime<Utc>,
+    observation: Option<ClockObservation>,
+) -> FixtureTimeVerifier {
+    FixtureTimeVerifier {
+        inner,
+        fixture_now,
+        injected_ambient_now,
+        observation,
+    }
 }
 
 fn policy(space: &SpaceId, signer_did: &str) -> Policy {
@@ -743,7 +874,7 @@ fn policy_status(
         owner_did: policy.owner_did.clone(),
         sequence,
         disposition,
-        effective_at: Utc::now().to_rfc3339(),
+        effective_at: "2026-01-01T00:00:00Z".to_string(),
         reason_code: None,
         signing_key_did: signer_did.to_string(),
         signature: placeholder_signature(signer_did),
@@ -770,6 +901,7 @@ fn verified_status(mut value: PolicyStatus, key: &SigningKey) -> Result<PolicySt
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn signed_presentation(
     policy: &Policy,
     challenge: &GrantChallenge,
@@ -778,6 +910,7 @@ fn signed_presentation(
     evidence: Value,
     audience: &str,
     enrollment_sequence: u64,
+    verification_time: DateTime<Utc>,
 ) -> Result<GrantPresentation> {
     let capabilities = policy.resource.permissions_ceiling.clone();
     let mut presentation = GrantPresentation {
@@ -806,7 +939,7 @@ fn signed_presentation(
         requested_capabilities: capabilities,
         audience: audience.to_string(),
         nonce: challenge.nonce.clone(),
-        expires_at: (Utc::now() + Duration::minutes(5)).to_rfc3339(),
+        expires_at: (verification_time + Duration::minutes(5)).to_rfc3339(),
         evidence: Some(vec![PresentedEvidence {
             requirement_id: EVIDENCE_ID.to_string(),
             presentation: evidence,
@@ -829,7 +962,7 @@ fn enrollment_status(
         enrollment_id: "henr_m1_launch_holder".to_string(),
         sequence,
         disposition,
-        effective_at: Utc::now().to_rfc3339(),
+        effective_at: "2026-01-01T00:00:00Z".to_string(),
         signing_key_did: SUBJECT.to_string(),
         signature: placeholder_signature(SUBJECT),
     }
@@ -1070,6 +1203,72 @@ async fn seed_listen_sql(sql: &SqlService, space: &SpaceId) -> Result<()> {
 fn fixture_evidence(source: &str) -> Result<Value> {
     let value: Value = serde_json::from_str(source)?;
     Ok(json!({ "sdJwt": value["evidencePresentation"]["sdJwt"] }))
+}
+
+fn fixture_verification_time(
+    source: &str,
+    _injected_ambient_now: DateTime<Utc>,
+) -> Result<DateTime<Utc>> {
+    let fixture: Value = serde_json::from_str(source)?;
+    let timestamp = fixture["verificationOptions"]["now"]
+        .as_i64()
+        .context("fixture verificationOptions.now integer timestamp")?;
+    DateTime::from_timestamp(timestamp, 0).context("fixture verificationOptions.now timestamp")
+}
+
+#[test]
+fn evidence_verification_path_rejects_direct_wall_clock_reads() {
+    let source = include_str!("cross_layer_contract.rs");
+    let setup_and_resolve = source
+        .split_once("    let before_delegations =")
+        .expect("main resolve source marker")
+        .1
+        .split_once("    let client =")
+        .expect("main native-node source marker")
+        .0;
+    let denial_resolves = source
+        .split_once("fn exercise_engine_denials")
+        .expect("denial source marker")
+        .1
+        .split_once("fn runtime(")
+        .expect("runtime source marker")
+        .0;
+    let presentation_constructor = source
+        .split_once("fn signed_presentation")
+        .expect("presentation source marker")
+        .1
+        .split_once("fn enrollment_status")
+        .expect("enrollment source marker")
+        .0;
+    let verifier_adapter = source
+        .split_once("impl EvidenceVerifier for FixtureTimeVerifier")
+        .expect("fixture verifier source marker")
+        .1
+        .split_once("#[tokio::test]")
+        .expect("integration test source marker")
+        .0;
+    let fixture_time_constructor = source
+        .split_once("fn fixture_verification_time")
+        .expect("fixture time source marker")
+        .1
+        .split_once("#[test]")
+        .expect("source guard marker")
+        .0;
+
+    for evidence_path in [
+        setup_and_resolve,
+        denial_resolves,
+        presentation_constructor,
+        verifier_adapter,
+        fixture_time_constructor,
+    ] {
+        for prohibited in ["Utc::now", "SystemTime::now", "Local::now"] {
+            assert!(
+                !evidence_path.contains(prohibited),
+                "evidence-verification path contains direct wall-clock read {prohibited}"
+            );
+        }
+    }
 }
 
 fn fixture_sd_jwt_issuer(source: &str) -> Result<String> {
