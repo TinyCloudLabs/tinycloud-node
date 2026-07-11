@@ -112,23 +112,23 @@ struct Citation {
     location: String,
 }
 
-pub fn run(bundle: &Path, mode: Mode) -> Result<Report> {
-    let mut report = verify(bundle)?;
+pub fn run(bundle: &Path, mode: Mode, expected_node_sha: &str) -> Result<Report> {
+    let mut report = verify(bundle, expected_node_sha)?;
     if matches!(mode, Mode::VerifyAndMutationSelfTest) {
-        mutation_self_test(bundle)?;
+        mutation_self_test(bundle, expected_node_sha)?;
         report.mutation_self_test = Some("passed");
     }
     Ok(report)
 }
 
-fn verify(bundle: &Path) -> Result<Report> {
+fn verify(bundle: &Path, expected_node_sha: &str) -> Result<Report> {
     let manifest: Manifest = read_json(bundle, "manifest.json")?;
     if manifest.schema != "xyz.tinycloud.m1/live-gate-raw-bundle/v1" {
         bail!("manifest schema is not the live-gate raw-bundle contract");
     }
     parse_time(&manifest.created_at, "manifest.createdAt")?;
     require_hex_hashes(&manifest.inputs)?;
-    require_candidate_pins(&manifest.candidates)?;
+    require_candidate_pins(bundle, &manifest.candidates, expected_node_sha)?;
     require_process_evidence(bundle)?;
     let runner_pid: u32 = fs::read_to_string(bundle.join("meta/runner.pid"))?
         .trim()
@@ -275,7 +275,7 @@ fn verify(bundle: &Path) -> Result<Report> {
     })
 }
 
-fn mutation_self_test(bundle: &Path) -> Result<()> {
+fn mutation_self_test(bundle: &Path, expected_node_sha: &str) -> Result<()> {
     let temp = TempDir::new().context("create mutation bundle")?;
     copy_tree(bundle, temp.path())?;
     let target = temp.path().join("requester/renewal-denied.json");
@@ -286,7 +286,7 @@ fn mutation_self_test(bundle: &Path) -> Result<()> {
         .ok_or_else(|| anyhow!("real bundle denial has no response.error object to mutate"))?
         .remove("code");
     fs::write(&target, serde_json::to_vec_pretty(&value)?)?;
-    if verify(temp.path()).is_ok() {
+    if verify(temp.path(), expected_node_sha).is_ok() {
         bail!("negative mutation self-test unexpectedly accepted a missing denial code");
     }
     Ok(())
@@ -374,9 +374,23 @@ fn require_hex_hashes(inputs: &Inputs) -> Result<()> {
     Ok(())
 }
 
-fn require_candidate_pins(candidates: &Candidates) -> Result<()> {
+fn require_candidate_pins(
+    bundle: &Path,
+    candidates: &Candidates,
+    expected_node_sha: &str,
+) -> Result<()> {
+    if expected_node_sha.is_empty() {
+        bail!("expected node SHA is required");
+    }
+    let recorded_node_sha = fs::read_to_string(bundle.join("meta/tinycloud-node.sha"))?;
+    let recorded_node_sha = recorded_node_sha.trim();
+    if !recorded_node_sha.starts_with(expected_node_sha)
+        || !candidates.tinycloud_node.starts_with(expected_node_sha)
+        || candidates.tinycloud_node != recorded_node_sha
+    {
+        bail!("candidate SHA does not match required node pin {expected_node_sha}");
+    }
     let expected = [
-        (&candidates.tinycloud_node, "b51254e"),
         (&candidates.policy_engine, "d72812a"),
         (&candidates.js_sdk, "5a42dd6"),
         (&candidates.listen, "bd936c0"),

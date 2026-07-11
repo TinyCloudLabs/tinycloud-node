@@ -9,10 +9,24 @@ use tempfile::TempDir;
 fn verifier_rejects_critical_field_removed_from_accepted_bundle_copy() -> Result<()> {
     let bundle = TempDir::new()?;
     accepted_bundle(bundle.path())?;
-    let report = live_gate_verifier::run(bundle.path(), Mode::VerifyAndMutationSelfTest)?;
+    let report = live_gate_verifier::run(
+        bundle.path(),
+        Mode::VerifyAndMutationSelfTest,
+        "expected-node-sha",
+    )?;
     let rendered = serde_json::to_value(report)?;
     assert_eq!(rendered["verdict"], "pass");
     assert_eq!(rendered["mutationSelfTest"], "passed");
+    Ok(())
+}
+
+#[test]
+fn verifier_requires_matching_expected_node_sha() -> Result<()> {
+    let bundle = TempDir::new()?;
+    accepted_bundle(bundle.path())?;
+
+    assert!(live_gate_verifier::run(bundle.path(), Mode::Verify, "").is_err());
+    assert!(live_gate_verifier::run(bundle.path(), Mode::Verify, "wrong-node-sha").is_err());
     Ok(())
 }
 
@@ -22,6 +36,7 @@ fn accepted_bundle(root: &Path) -> Result<()> {
     }
     for (file, content) in [
         ("meta/artifacts.sha256", "aa artifact\n"),
+        ("meta/tinycloud-node.sha", "expected-node-sha\n"),
         ("meta/runner.pid", "39\n"),
         ("meta/runner.actual-command", "m1-gate-demo.sh\n"),
         ("node/process.pid", "40\n"),
@@ -48,7 +63,7 @@ fn accepted_bundle(root: &Path) -> Result<()> {
             "schema": "xyz.tinycloud.m1/live-gate-raw-bundle/v1", "runId": "verifier-contract-test",
             "createdAt": "2026-07-11T12:00:00Z",
             "inputs": {"nonceSha256":"11".repeat(32),"renewalNonceSha256":"22".repeat(32),"revokedNonceSha256":"33".repeat(32),"sqlSeedSha256":"44".repeat(32),"kvSeedSha256":"55".repeat(32)},
-            "candidates": {"tinycloudNode":"b51254e","policyEngine":"d72812a","jsSdk":"5a42dd6","listen":"bd936c0","openCredentials":"a1633710"}
+            "candidates": {"tinycloudNode":"expected-node-sha","policyEngine":"d72812a","jsSdk":"5a42dd6","listen":"bd936c0","openCredentials":"a1633710"}
         }),
     )?;
     exchange(
