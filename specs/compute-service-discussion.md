@@ -248,3 +248,67 @@ All other top-level `##` headings 1–11, 13 are unchanged. All "DECISION NEEDED
 markers are gone; still-open items are only: Cloudflare callback credential
 TTL/revocation, result cache, binary inline outputs, and (out-of-scope)
 multi-node execution.
+
+## drafter — fable review applied (checkpoint 4)
+
+fable's design notes (specs/compute-service-design-notes.md, 392 lines) are
+committed verbatim (387d545) and all findings F1–F9 + the §12.2 recommendations
+are now folded into specs/compute-service.md (48a761d). Verdict addressed: the
+four blockers (F1 caveat-echo, F2 handshake, F3 space-scope, F4
+delegation-path/atomicity) and F6 (CF egress) are all applied.
+
+### Which finding changed which section
+
+- **F1 (MUST) — caveat echo.** §6.2: new normative paragraph — the host mediator
+  copies D_fn's `computeFunctionBinding` caveat VERBATIM onto every internal
+  invocation (and D_worker, and Worker callbacks); W1 byte-equality rule, fails
+  closed otherwise. Corrected the old "nothing new required in the auth engine"
+  wording. §6.3: invoker-side echo note (SDK copies chain caveats onto the
+  invocation, sql precedent). §13.1: two test obligations.
+- **F2 (MUST) — routine_did handshake.** §6.2: replaced the FALSE "deployer can
+  compute routine_did client-side" claim with the read-only handshake (client
+  hashes WASM → `ComputeRequest::RoutineDid { content_cid }` → node returns
+  public routine_did → client mints D_fn → deploy). §7.2: added the `RoutineDid`
+  request variant. Doubles as the dstack-stability probe.
+- **F3 (MUST) — cross-space.** §6.2: derivation path now includes space:
+  `get_key("tinycloud/compute/" + space + "/" + function_cid)`. §5.1: normative
+  `(space, functionCid)` selection rule + resource-in-space verification. Both
+  layers ship.
+- **F4 (MUST) — delegation path + atomicity.** §5.1: D_fn processed through the
+  standard /delegate path, atomically with artifact save + SqlSizes update in one
+  transaction; revoke superseded D_fn on re-deploy.
+- **F5.** §5.1: cite-all-matching-D_fns selection rule.
+- **F6 (MUST) — CF egress.** §9.2 + §10.2: explicit confidentiality-asymmetry
+  paragraphs (unrestricted outbound fetch; everything readable under the grant
+  treated as disclosed to function author + Cloudflare).
+- **F7.** §9.2: CF binds the grant to what the node uploaded not what runs; CF
+  account creds join the TCB; "trusted-deployment" documented as carrying that.
+- **F8 (MUST).** §5: deploy MUST call `sql_sizes.update("compute", …)` or quota
+  is bypassed; fixed the stale §5→§10 xref.
+- **F9.** §3: SDK standard session grant must enumerate compute/execute +
+  compute/list, NEVER compute/*.
+- **§12.2:** callback mechanics (worker-side ephemeral keypair per execution,
+  TTL, revocation, D_fn = panic button) now concrete in §9.2; result cache
+  deferred with the structural gate criterion; binary inline outputs deferred.
+  Plus F1.5 compare-on-execute tripwire (`routine-identity-rotated`), caveat
+  encoding pinned per-ability, artifact history = revision counter (not
+  KV-history), internal invocations enter via core process() not the HTTP replay
+  cache, and the F1.8 caveated-deployer edge.
+
+### site-builder — what needs RE-RENDERING
+
+1. **Deploy sequence gains a step:** the RoutineDid handshake now precedes deploy
+   — client hashes WASM → asks node for public routine_did → mints D_fn → deploys.
+   Add it before the D_fn mint in the deploy diagram.
+2. **Derivation path now includes space:**
+   `get_key("tinycloud/compute/" + space + "/" + cid)` — update any node-derives-
+   routine-key label.
+3. **CF trust callout gains an egress warning:** the confidentiality asymmetry
+   (unrestricted `fetch`, everything readable = exfiltrable) is now the headline
+   CF caveat, above the resource-limit gap. If you render a backend-comparison,
+   this is the decisive row.
+4. **Two-layer diagram unchanged in shape**, but the layer-(b) internal-invocation
+   arrow should be annotated "echoes D_fn's binding caveat" (F1).
+
+Headings unchanged except §13 gained a §13.1 (Test obligations). No wire-shape
+changes except the new `RoutineDid` request action.
