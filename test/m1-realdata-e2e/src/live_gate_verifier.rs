@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tempfile::TempDir;
 
-const CLAIM: &str = "after the owner publishes a monotonic revoked PolicyStatus and redeploys the owner-controlled sidecar from that authority state, the next real renewal is denied policy-inactive, and the previously issued short-TTL delegation is refused by the node after expiry, within the declared TTL bound";
+const CLAIM: &str = "after the owner publishes a monotonic revoked PolicyStatus and redeploys the owner-controlled sidecar from that authority state, the next direct live challenge/resolve exchange is denied policy-inactive, and the previously issued short-TTL delegation is refused by the node after expiry; requester ownerNode public-IP SSRF behavior is unit-conformance-only and is not claimed as live-observed";
 
 #[derive(Clone, Copy)]
 pub enum Mode {
@@ -205,11 +205,26 @@ fn verify(bundle: &Path, expected_node_sha: &str) -> Result<Report> {
         "policy-inactive",
         "renewal denial",
     )?;
-    require_true(
+    require_eq(
         &denied.response,
-        "/accessEnded",
-        "SDK access-ended consequence",
+        "/execution",
+        "direct-live-challenge-resolve",
+        "denial execution boundary",
     )?;
+    require_eq(
+        &initial.response,
+        "/ssrfScope/coverage",
+        "unit-conformance-only",
+        "SSRF coverage scope",
+    )?;
+    if initial
+        .response
+        .pointer("/ssrfScope/liveObserved")
+        .and_then(Value::as_bool)
+        != Some(false)
+    {
+        bail!("SSRF live-observation label is not false");
+    }
     require_eq(
         &expired.response,
         "/layer",
@@ -256,10 +271,11 @@ fn verify(bundle: &Path, expected_node_sha: &str) -> Result<Report> {
         exchange_assertion("signed-authority-published", "driver/publish.json", &publish, "/response", "the production driver returned its raw publish artifact before sidecar startup"),
         exchange_assertion("resolve-import-byte-provenance", "requester/initial.json", &initial, "/response/delegation and /response/import/delegation", "the resolve output string is byte-identical to the native /delegate input string"),
         exchange_assertion("native-sql-kv-seed-reads", "requester/initial.json", &initial, "/response/reads", "SQL and KV returned hashes equal the independent hashes of caller-supplied seed bytes"),
-        exchange_assertion("short-ttl-and-renewal", "requester/renewal.json", &renewal, "/response/renewed", &format!("initial wire issuedAt/expiresAt difference is {ttl}s (1..=60) and the access-triggered renewal succeeded")),
+        exchange_assertion("short-ttl-and-renewal", "requester/renewal.json", &renewal, "/response/renewed", &format!("initial wire issuedAt/expiresAt difference is {ttl}s (1..=60) and a second direct live challenge/resolve/import exchange succeeded")),
         assertion("delegation-path-origin", "node-db/pre-import.json + node-db/post-import.json", runner_pid, &manifest.run_id, &initial.request_id, "/delegations, /abilities, /parentDelegations", "the same database gains delegation and ability rows only after /delegate, and the imported serialization is absent before but present after"),
         exchange_assertion("monotonic-revoke", "driver/revoke.json", &revoke, "/response/disposition", "the driver response records revoked and its timestamp precedes sidecar readiness"),
-        exchange_assertion("post-redeploy-renewal-denied", "requester/renewal-denied.json", &denied, "/response/error/code and /response/accessEnded", "the first renewal after redeployed readiness returned policy-inactive on wire; accessEnded is only its SDK consequence"),
+        exchange_assertion("post-redeploy-renewal-denied", "requester/renewal-denied.json", &denied, "/response/error/code and /response/execution", "the first direct live challenge/resolve exchange after redeployed readiness returned policy-inactive; no TranscriptRequester accessEnded transition is claimed"),
+        exchange_assertion("owner-node-ssrf-unit-scope", "requester/initial.json", &initial, "/response/ssrfScope", "ownerNode public-IP SSRF guard: unit-conformance-only (e-02 amendment 37 / Sol #10; sdk-core requester tests:565-620), liveObserved=false; not a live gate observation"),
         exchange_assertion("post-expiry-native-refusal", "requester/post-expiry-read.json", &expired, "/response/layer and /response/refused", "a later node response is classified native-node and refused after the issued expiry"),
         assertion("ordered-observation-window", "driver/revoke.json + sidecar/redeployed-ready.timestamp + requester/renewal-denied.json + requester/post-expiry-read.json", runner_pid, &manifest.run_id, "timeline", "observedAt", "revoked commit <= redeployed ready <= renewal denial < native refusal; the bound starts at successful redeploy"),
         assertion("clean-teardown", "meta/teardown.json", runner_pid, &manifest.run_id, "teardown", "/runnerExit, /allOwnedProcessesDead, /allDynamicPortsClosed", "runner exit is zero after probing every owned PID dead and every captured dynamic port closed"),

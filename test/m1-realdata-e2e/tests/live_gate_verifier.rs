@@ -81,7 +81,8 @@ fn accepted_bundle(root: &Path) -> Result<()> {
         json!({
             "delegation":"real-wire-delegation", "import":{"delegation":"real-wire-delegation"},
             "issuedAt":"2026-07-11T12:00:02Z", "expiresAt":"2026-07-11T12:01:02Z",
-            "reads":{"sql":{"sha256":"44".repeat(32)},"kv":{"sha256":"55".repeat(32)}}
+            "reads":{"sql":{"sha256":"44".repeat(32)},"kv":{"sha256":"55".repeat(32)}},
+            "ssrfScope":{"coverage":"unit-conformance-only","liveObserved":false}
         }),
     )?;
     exchange(
@@ -111,7 +112,7 @@ fn accepted_bundle(root: &Path) -> Result<()> {
         "requester/renewal-denied.json",
         "denied",
         "2026-07-11T12:00:06Z",
-        json!({"error":{"code":"policy-inactive"},"accessEnded":true}),
+        json!({"error":{"code":"policy-inactive"},"accessEnded":false,"execution":"direct-live-challenge-resolve"}),
     )?;
     exchange(
         root,

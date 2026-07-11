@@ -48,7 +48,5 @@ fn main() -> ExitCode {
 }
 
 fn usage() {
-    eprintln!(
-        "usage: m1-gate-verify <raw-bundle> [--self-test] [--expected-node-sha <sha>]"
-    );
+    eprintln!("usage: m1-gate-verify <raw-bundle> [--self-test] [--expected-node-sha <sha>]");
 }
