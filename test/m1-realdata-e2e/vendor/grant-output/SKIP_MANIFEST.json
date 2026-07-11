@@ -1,0 +1,20 @@
+{
+  "owner": "m1-g-07",
+  "reason": "Producer/engine and audit layers are verified by m1-g-07, not tinycloud-node consumer conformance.",
+  "skippedCases": [
+    "deterministic-native-identity-and-ledger-link",
+    "issuance-id-without-ledger-record",
+    "ledger-record-points-to-different-cid",
+    "duplicate-issuance-id-different-signed-bytes",
+    "response-before-atomically-durable-linkage",
+    "grant-issuer-config-record-mismatch",
+    "owner-impersonation",
+    "missing-terminal-mode-fact",
+    "expiry-beyond-policy-presentation-or-ttl-ceiling",
+    "expiry-beyond-policy-ceiling",
+    "expiry-beyond-presentation-validity",
+    "malformed-or-duplicate-provenance-facts",
+    "malformed-provenance-fact",
+    "capability-exceeds-configured-parent-bounds"
+  ]
+}

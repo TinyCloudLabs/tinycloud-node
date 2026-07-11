@@ -1,6 +1,9 @@
 use std::{
     collections::BTreeMap,
     convert::TryInto,
+    fs,
+    path::Path,
+    process::Command,
     sync::{Arc, Mutex},
 };
 
@@ -17,6 +20,9 @@ use policy_core::{
     HolderEnrollmentDisposition, HolderEnrollmentStatus, Policy, PolicyCapability,
     PolicyDisposition, PolicyResource, PolicyStatus, PresentedEvidence, RevocationMode, Signature,
     SignatureSuite, VerifiedSignedObject,
+};
+use policy_engine_http::{
+    CapturedParentDelegateReceipt, ParentCapabilityBound, ParentDelegationConfig, SharedGrantIssuer,
 };
 use policy_evidence_vc::VcEvidenceVerifier;
 use policy_runtime::{
@@ -48,8 +54,8 @@ use tinycloud_core::{
     hash::{hash, Hash},
     models::{abilities, delegation, space},
     sea_orm::{
-        ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions, Database, EntityTrait,
-        PaginatorTrait, QueryFilter,
+        ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions, Database,
+        DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
     },
     sql::{SqlRequest, SqlService, SqlValue},
     types::SpaceIdWrap,
@@ -75,6 +81,8 @@ const UNTRUSTED_FIXTURE: &str =
     include_str!("../vendor/launch-credential-denials/untrusted-issuer-did.json");
 const DENIAL_MATRIX: &str =
     include_str!("../vendor/policy-engine-conformance/denial-matrix-v0.json");
+const GRANT_OUTPUT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/vendor/grant-output");
+static NODE_APP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Clone)]
 struct NodeGrantIssuer {
@@ -202,6 +210,7 @@ impl FixtureTimeVerifier {
 
 #[tokio::test]
 async fn deterministic_cross_layer_contract_is_observed_from_real_operations() -> Result<()> {
+    let _node_app_guard = NODE_APP_TEST_LOCK.lock().await;
     let tempdir = TempDir::new()?;
     let datadir = tempdir.path().join("data");
     let db_url = format!("sqlite:{}", datadir.join("caps.db").display());
@@ -222,7 +231,9 @@ secret = "{}"
         .merge(Serialized::defaults(tinycloud::config::Config::default()))
         .merge(Toml::string(&overlay));
     let rocket = tinycloud::app(&figment).await?;
-    let sql_service = rocket
+    let client = Client::tracked(rocket).await?;
+    let sql_service = client
+        .rocket()
         .state::<SqlService>()
         .context("node app must manage SqlService")?;
     let conn = Database::connect(ConnectOptions::new(db_url)).await?;
@@ -345,7 +356,6 @@ secret = "{}"
     let observed_ttl = (record.expires_at - record.issued_at).num_seconds();
     assert!(observed_ttl > 0 && observed_ttl <= 300);
 
-    let client = Client::tracked(rocket).await?;
     let imported = client
         .post("/delegate")
         .header(Header::new("Authorization", issued.encoded.clone()))
@@ -520,6 +530,8 @@ secret = "{}"
         holder_did: &holder_did,
         holder_key: &holder_signing_key,
     })?;
+
+    observe_grant_output_on_real_node(&client, &conn, &datadir, sql_service).await?;
 
     Ok(())
 }
@@ -1196,6 +1208,982 @@ fn fixture_verification_time(source: &str) -> Result<DateTime<Utc>> {
     DateTime::from_timestamp(timestamp, 0).context("fixture verificationOptions.now timestamp")
 }
 
+async fn observe_grant_output_on_real_node(
+    client: &Client,
+    conn: &DatabaseConnection,
+    datadir: &Path,
+    sql_service: &SqlService,
+) -> Result<()> {
+    let authority_before = delegation::Entity::find().count(conn).await?;
+    let generated = TempDir::new()?;
+    let instant = Utc::now().timestamp();
+    let status = Command::new("python3")
+        .arg(Path::new(GRANT_OUTPUT_DIR).join("generate.py"))
+        .arg("--at-instant")
+        .arg(instant.to_string())
+        .arg("--output-dir")
+        .arg(generated.path())
+        .status()?;
+    anyhow::ensure!(status.success(), "pinned grant generator failed");
+    let accept: Value =
+        serde_json::from_str(&fs::read_to_string(generated.path().join("accept.json"))?)?;
+
+    let owner_did = accept["parentFormatVector"]["issuer"]
+        .as_str()
+        .context("parent issuer")?;
+    let space_id = SpaceId::new(owner_did.parse::<DIDBuf>()?, "default".parse()?);
+    space::ActiveModel {
+        id: Set(SpaceIdWrap(space_id.clone())),
+    }
+    .insert(conn)
+    .await?;
+    tokio::fs::create_dir_all(
+        datadir
+            .join("blocks")
+            .join(space_id.suffix())
+            .join(space_id.name().as_str()),
+    )
+    .await?;
+    seed_grant_vector_sql(sql_service, &space_id).await?;
+
+    let mut parent = accept["parentFormatVector"]["dagCborBase64Url"]
+        .as_str()
+        .context("parent bytes")?
+        .to_string();
+    while parent.len() % 4 != 0 {
+        parent.push('=');
+    }
+    let parent_response = client
+        .post("/delegate")
+        .header(Header::new("Authorization", parent))
+        .dispatch()
+        .await;
+    let parent_status = parent_response.status();
+    let parent_body = parent_response.into_string().await.unwrap_or_default();
+    assert_eq!(parent_status, Status::Ok, "parent import: {parent_body}");
+    let parent_json: Value = serde_json::from_str(&parent_body)?;
+    assert_eq!(
+        parent_json["cid"], accept["parentFormatVector"]["expectedCid"],
+        "the real node must derive the frozen parent-format CID"
+    );
+
+    let grant = accept["cases"][0]["ucan"]["encoded"]
+        .as_str()
+        .context("generated accept UCAN")?
+        .to_string();
+    let grant_response = client
+        .post("/delegate")
+        .header(Header::new("Authorization", grant))
+        .dispatch()
+        .await;
+    let grant_status = grant_response.status();
+    let grant_body = grant_response.into_string().await.unwrap_or_default();
+    assert_eq!(grant_status, Status::Ok, "grant import: {grant_body}");
+    let grant_json: Value = serde_json::from_str(&grant_body)?;
+    assert_eq!(
+        grant_json["cid"],
+        accept["cases"][0]["ucan"]["delegationId"]
+    );
+    assert_eq!(
+        delegation::Entity::find().count(conn).await?,
+        authority_before + 2
+    );
+
+    let holder_jwk = ed25519_jwk_from_seed([0x33; 32])?;
+    let (holder_did, holder_vm) = node_identity(&holder_jwk)?;
+    assert_eq!(holder_did, accept["cases"][0]["ucan"]["payload"]["aud"]);
+    let imported_hash = Hash::from(
+        grant_json["cid"]
+            .as_str()
+            .context("grant response CID")?
+            .parse::<AuthCid>()?,
+    );
+    let sql_resource = space_id.clone().to_resource(
+        "sql".parse::<Service>()?,
+        Some(SQL_PATH.parse::<AuthPath>()?),
+        None,
+        None,
+    );
+    let vector_caveat = accept["cases"][0]["expectedExtractedCapability"]["notaBene"]["0"].clone();
+    let invocation = holder_invocation(
+        &InvocationSigner {
+            jwk: &holder_jwk,
+            verification_method: &holder_vm,
+            did: &holder_did,
+            parent: imported_hash,
+        },
+        &sql_resource,
+        "tinycloud.sql/read",
+        Some(vector_caveat),
+        "grant-vector-named-sql",
+    )?;
+    let sql_response = client
+        .post("/invoke")
+        .header(Header::new("Authorization", invocation))
+        .header(ContentType::JSON)
+        .body(serde_json::to_string(&SqlRequest::ExecuteStatement {
+            name: "listen.getConversation".to_string(),
+            params: vec![],
+        })?)
+        .dispatch()
+        .await;
+    let sql_status = sql_response.status();
+    let sql_body = sql_response.into_string().await.unwrap_or_default();
+    assert_eq!(sql_status, Status::Ok, "vector named SQL: {sql_body}");
+    let sql_json: Value = serde_json::from_str(&sql_body)?;
+    assert_eq!(sql_json["rowCount"], 1);
+    assert_eq!(sql_json["rows"][0][0], "conv_456");
+
+    let grant_jwk = ed25519_jwk_from_seed([0x22; 32])?;
+    let grant_signer = signing_key(&grant_jwk)?;
+    let (grant_issuer_did, grant_issuer_vm) = node_identity(&grant_jwk)?;
+    assert_eq!(grant_issuer_did, accept["parentFormatVector"]["audience"]);
+    let sql_capability = policy_core::parse_policy_capability(&json!({
+        "service": "tinycloud.sql",
+        "space": "default",
+        "path": SQL_PATH,
+        "actions": ["tinycloud.sql/read"],
+        "caveats": accept["cases"][0]["expectedExtractedCapability"]["notaBene"]["0"].clone()
+    }))?;
+    let parent_config = parent_config_from_vector(&accept, vec![sql_capability.clone()])?;
+    let mut production_issuer =
+        SharedGrantIssuer::new(grant_issuer_did.clone(), grant_signer, [parent_config]);
+    let mut minimum_ttl_hash = None;
+    let mut terminal_parent_hash = None;
+    let interop_cases = [
+        ("named-statement", vec![sql_capability.clone()], 120_i64),
+        ("minimum-ttl", vec![sql_capability.clone()], 1_i64),
+        ("maximum-ttl", vec![sql_capability], 300_i64),
+    ];
+    for (case_name, capabilities, ttl_seconds) in interop_cases {
+        let issued_capabilities = capabilities.clone();
+        let issued_at = Utc::now();
+        let mut engine_policy = policy(&space_id, &grant_issuer_did);
+        engine_policy.policy_id = format!("pol_m1_g08_{case_name}");
+        engine_policy.resource.permissions_ceiling = capabilities.clone();
+        engine_policy.grant.max_ttl_seconds = ttl_seconds as u64;
+        engine_policy.grant.revocation = RevocationMode::RefreshOnly;
+        let emitted = production_issuer.issue(GrantIssueRequest {
+            holder_did: holder_did.clone(),
+            capabilities,
+            issued_at,
+            expires_at: issued_at + Duration::seconds(ttl_seconds),
+            presentation_expires_at: issued_at + Duration::seconds(300),
+            terminal: true,
+            evidence_ids: Vec::new(),
+            evidence_provenance: Vec::new(),
+            policy: engine_policy,
+        })?;
+        let emitted_response = client
+            .post("/delegate")
+            .header(Header::new("Authorization", emitted.encoded.clone()))
+            .dispatch()
+            .await;
+        let emitted_status = emitted_response.status();
+        let emitted_body = emitted_response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            emitted_status,
+            Status::Ok,
+            "actual g-07 engine {case_name}: {emitted_body}"
+        );
+        let emitted_json: Value = serde_json::from_str(&emitted_body)?;
+        assert_eq!(emitted_json["cid"], emitted.delegation_id);
+        assert_eq!(
+            production_issuer
+                .issued(&emitted.delegation_id)
+                .context("production issuer durable record")?
+                .encoded,
+            emitted.encoded
+        );
+        let emitted_hash = Hash::from(
+            emitted
+                .delegation_id
+                .parse::<AuthCid>()
+                .with_context(|| format!("{case_name} emitted CID"))?,
+        );
+        if case_name == "minimum-ttl" {
+            minimum_ttl_hash = Some(emitted_hash);
+        }
+        if case_name == "named-statement" {
+            terminal_parent_hash = Some(emitted_hash);
+        }
+        let emitted_invocation = holder_invocation(
+            &InvocationSigner {
+                jwk: &holder_jwk,
+                verification_method: &holder_vm,
+                did: &holder_did,
+                parent: emitted_hash,
+            },
+            &sql_resource,
+            "tinycloud.sql/read",
+            issued_capabilities[0].caveats.clone(),
+            &format!("engine-{case_name}"),
+        )?;
+        let enforced = client
+            .post("/invoke")
+            .header(Header::new("Authorization", emitted_invocation))
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&SqlRequest::ExecuteStatement {
+                name: "listen.getConversation".to_string(),
+                params: vec![],
+            })?)
+            .dispatch()
+            .await;
+        let enforced_status = enforced.status();
+        let enforced_body = enforced.into_string().await.unwrap_or_default();
+        assert_eq!(
+            enforced_status,
+            Status::Ok,
+            "actual g-07 engine {case_name} enforcement: {enforced_body}"
+        );
+        let enforced_json: Value = serde_json::from_str(&enforced_body)?;
+        assert_eq!(enforced_json["rows"][0][0], "conv_456");
+    }
+
+    exercise_engine_sql_kv_mix(EngineSqlKvContext {
+        client,
+        conn,
+        datadir,
+        sql_service,
+        grant_jwk: &grant_jwk,
+        grant_issuer_did: &grant_issuer_did,
+        holder_jwk: &holder_jwk,
+        holder_vm: &holder_vm,
+        holder_did: &holder_did,
+        caveat: accept["cases"][0]["expectedExtractedCapability"]["notaBene"]["0"].clone(),
+    })
+    .await?;
+
+    let wrong_jwk = ed25519_jwk_from_seed([0x11; 32])?;
+    let (wrong_did, wrong_vm) = node_identity(&wrong_jwk)?;
+    let terminal_child = signed_delegation_with_proof(
+        &holder_jwk,
+        &holder_vm,
+        &wrong_did,
+        &sql_resource,
+        "tinycloud.sql/read",
+        Some(accept["cases"][0]["expectedExtractedCapability"]["notaBene"]["0"].clone()),
+        vec![terminal_parent_hash
+            .context("terminal engine grant")?
+            .to_cid(0x55)],
+        "terminal",
+        60,
+        "terminal-parent-child",
+    )?;
+    assert_delegate_reject(
+        client,
+        terminal_child,
+        "terminal-parent",
+        "terminal-parent-cannot-redelegate",
+    )
+    .await?;
+
+    let cacao_parent_cid = accept["parentFormatVector"]["expectedCid"]
+        .as_str()
+        .context("CACAO parent CID")?
+        .parse::<AuthCid>()?;
+    let narrow_parent = signed_delegation_with_proof(
+        &grant_jwk,
+        &grant_issuer_vm,
+        &holder_did,
+        &sql_resource,
+        "tinycloud.sql/read",
+        Some(accept["cases"][0]["expectedExtractedCapability"]["notaBene"]["0"].clone()),
+        vec![cacao_parent_cid],
+        "attenuable",
+        120,
+        "caveat-parent",
+    )?;
+    let narrow_response = client
+        .post("/delegate")
+        .header(Header::new("Authorization", narrow_parent))
+        .dispatch()
+        .await;
+    let narrow_status = narrow_response.status();
+    let narrow_body = narrow_response.into_string().await.unwrap_or_default();
+    assert_eq!(narrow_status, Status::Ok, "caveat parent: {narrow_body}");
+    let narrow_json: Value = serde_json::from_str(&narrow_body)?;
+    let narrow_hash = Hash::from(
+        narrow_json["cid"]
+            .as_str()
+            .context("caveat parent CID")?
+            .parse::<AuthCid>()?,
+    );
+    let wider_child = signed_delegation_with_proof(
+        &holder_jwk,
+        &holder_vm,
+        &wrong_did,
+        &sql_resource,
+        "tinycloud.sql/read",
+        None,
+        vec![narrow_hash.to_cid(0x55)],
+        "terminal",
+        60,
+        "caveat-child",
+    )?;
+    assert_delegate_reject(
+        client,
+        wider_child,
+        "caveat-containment-failure",
+        "child-caveats-not-subset-of-parent: containment-caveat-required",
+    )
+    .await?;
+
+    let valid_grandchild = signed_delegation_with_proof(
+        &holder_jwk,
+        &holder_vm,
+        &wrong_did,
+        &sql_resource,
+        "tinycloud.sql/read",
+        Some(accept["cases"][0]["expectedExtractedCapability"]["notaBene"]["0"].clone()),
+        vec![narrow_hash.to_cid(0x55)],
+        "terminal",
+        60,
+        "revoked-parent-child",
+    )?;
+    let grandchild_response = client
+        .post("/delegate")
+        .header(Header::new("Authorization", valid_grandchild))
+        .dispatch()
+        .await;
+    let grandchild_status = grandchild_response.status();
+    let grandchild_body = grandchild_response.into_string().await.unwrap_or_default();
+    assert_eq!(
+        grandchild_status,
+        Status::Ok,
+        "revoked-parent child import: {grandchild_body}"
+    );
+    let grandchild_json: Value = serde_json::from_str(&grandchild_body)?;
+    let grandchild_hash = Hash::from(
+        grandchild_json["cid"]
+            .as_str()
+            .context("revoked-parent child CID")?
+            .parse::<AuthCid>()?,
+    );
+    let revocation = signed_ucan_revocation(
+        &grant_jwk,
+        &grant_issuer_vm,
+        &grant_issuer_did,
+        narrow_hash.to_cid(0x55),
+    )?;
+    let revoke_response = client
+        .post("/revoke")
+        .header(Header::new("Authorization", revocation))
+        .dispatch()
+        .await;
+    let revoke_status = revoke_response.status();
+    let revoke_body = revoke_response.into_string().await.unwrap_or_default();
+    assert_eq!(revoke_status, Status::Ok, "revoke parent: {revoke_body}");
+    let revoked_parent_invocation = holder_invocation(
+        &InvocationSigner {
+            jwk: &wrong_jwk,
+            verification_method: &wrong_vm,
+            did: &wrong_did,
+            parent: grandchild_hash,
+        },
+        &sql_resource,
+        "tinycloud.sql/read",
+        Some(accept["cases"][0]["expectedExtractedCapability"]["notaBene"]["0"].clone()),
+        "node-invocation-revoked-parent",
+    )?;
+    assert_invoke_reject(
+        client,
+        revoked_parent_invocation,
+        "revoked-parent",
+        "delegation-ancestor-revoked:",
+    )
+    .await?;
+
+    let wrong_invoker = holder_invocation(
+        &InvocationSigner {
+            jwk: &wrong_jwk,
+            verification_method: &wrong_vm,
+            did: &wrong_did,
+            parent: imported_hash,
+        },
+        &sql_resource,
+        "tinycloud.sql/read",
+        Some(accept["cases"][0]["expectedExtractedCapability"]["notaBene"]["0"].clone()),
+        "node-invocation-wrong-invoker",
+    )?;
+    assert_invoke_reject(
+        client,
+        wrong_invoker,
+        "holder-audience-mismatch",
+        "Unauthorized Invoker",
+    )
+    .await?;
+
+    let unauthorized_action = holder_invocation(
+        &InvocationSigner {
+            jwk: &holder_jwk,
+            verification_method: &holder_vm,
+            did: &holder_did,
+            parent: imported_hash,
+        },
+        &sql_resource,
+        "tinycloud.sql/write",
+        None,
+        "node-invocation-unauthorized-action",
+    )?;
+    assert_invoke_reject(
+        client,
+        unauthorized_action,
+        "unauthorized-requested-action",
+        "Unauthorized Action",
+    )
+    .await?;
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let expired_chain = holder_invocation(
+        &InvocationSigner {
+            jwk: &holder_jwk,
+            verification_method: &holder_vm,
+            did: &holder_did,
+            parent: minimum_ttl_hash.context("minimum TTL grant hash")?,
+        },
+        &sql_resource,
+        "tinycloud.sql/read",
+        Some(accept["cases"][0]["expectedExtractedCapability"]["notaBene"]["0"].clone()),
+        "node-invocation-expired-proof-chain",
+    )?;
+    assert_invoke_reject(
+        client,
+        expired_chain,
+        "expired-proof-chain",
+        "Unauthorized Action",
+    )
+    .await?;
+
+    let rejects: Value = serde_json::from_str(&fs::read_to_string(
+        generated.path().join("node-import-reject.json"),
+    )?)?;
+    for (case_name, expected_text) in [
+        ("invalid-signature", "Failed to verify signature"),
+        ("missing-persisted-parent", "Cannot find parent delegation"),
+        (
+            "parent-time-nesting-violation",
+            "Child delegation expiry exceeds parent expiry",
+        ),
+        (
+            "resource-or-ability-containment-failure",
+            "Unauthorized Capability",
+        ),
+    ] {
+        let case = rejects["cases"]
+            .as_array()
+            .context("node import cases")?
+            .iter()
+            .find(|case| case["case"] == case_name)
+            .with_context(|| format!("missing generated case {case_name}"))?;
+        let encoded = case["ucan"]["encoded"]
+            .as_str()
+            .context("reject UCAN")?
+            .to_string();
+        let response = client
+            .post("/delegate")
+            .header(Header::new("Authorization", encoded))
+            .dispatch()
+            .await;
+        let observed_status = response.status();
+        let observed_body = response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            observed_status,
+            Status::Unauthorized,
+            "{case_name}: {observed_body}"
+        );
+        assert!(
+            observed_body.contains(expected_text),
+            "{case_name} intended {expected_text}, observed {observed_body}"
+        );
+        if case_name != "invalid-signature" {
+            assert!(
+                !observed_body.contains("expired or not yet valid"),
+                "{case_name} was accidentally masked by ambient time: {observed_body}"
+            );
+        }
+    }
+
+    let frozen_accept: Value = serde_json::from_str(&fs::read_to_string(
+        Path::new(GRANT_OUTPUT_DIR).join("accept.json"),
+    )?)?;
+    let frozen_encoded = frozen_accept["cases"][0]["ucan"]["encoded"]
+        .as_str()
+        .context("frozen ACCEPT UCAN")?
+        .to_string();
+    let frozen_rejects: Value = serde_json::from_str(&fs::read_to_string(
+        Path::new(GRANT_OUTPUT_DIR).join("node-import-reject.json"),
+    )?)?;
+    let intended_invalid_time = frozen_rejects["cases"]
+        .as_array()
+        .context("frozen node import cases")?
+        .iter()
+        .find(|case| case["case"] == "invalid-time")
+        .context("frozen invalid-time case")?["ucan"]["encoded"]
+        .as_str()
+        .context("frozen invalid-time UCAN")?
+        .to_string();
+    let invalid_time = client
+        .post("/delegate")
+        .header(Header::new("Authorization", intended_invalid_time))
+        .dispatch()
+        .await;
+    let invalid_time_status = invalid_time.status();
+    let invalid_time_body = invalid_time.into_string().await.unwrap_or_default();
+    assert_eq!(invalid_time_status, Status::Unauthorized);
+    assert!(invalid_time_body.contains("expired or not yet valid"));
+    let expired = client
+        .post("/delegate")
+        .header(Header::new("Authorization", frozen_encoded))
+        .dispatch()
+        .await;
+    let expired_status = expired.status();
+    let expired_body = expired.into_string().await.unwrap_or_default();
+    assert_eq!(expired_status, Status::Unauthorized);
+    assert!(
+        expired_body.contains("expired or not yet valid"),
+        "LONGEVITY OBSERVATION: frozen ACCEPT should now be natively time-invalid: {expired_body}"
+    );
+    Ok(())
+}
+
+fn ed25519_jwk_from_seed(seed: [u8; 32]) -> Result<JWK> {
+    let key = SigningKey::from_bytes(&seed);
+    let mut jwk: JWK = serde_json::from_value(json!({
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes()),
+        "d": URL_SAFE_NO_PAD.encode(seed),
+        "alg": "EdDSA"
+    }))?;
+    jwk.algorithm = Some(Algorithm::EdDSA);
+    Ok(jwk)
+}
+
+fn parent_config_from_vector(
+    accept: &Value,
+    policy_capabilities: Vec<PolicyCapability>,
+) -> Result<ParentDelegationConfig> {
+    let vector = &accept["parentFormatVector"];
+    let not_before = Some(
+        DateTime::parse_from_rfc3339(vector["issuedAt"].as_str().context("parent issuedAt")?)?
+            .with_timezone(&Utc),
+    );
+    let expires_at =
+        DateTime::parse_from_rfc3339(vector["expiresAt"].as_str().context("parent expiresAt")?)?
+            .with_timezone(&Utc);
+    let native_resource = accept["cases"][0]["expectedExtractedCapability"]["resource"]
+        .as_str()
+        .context("native resource")?
+        .to_string();
+    let bounds = policy_capabilities
+        .into_iter()
+        .map(|policy_capability| ParentCapabilityBound {
+            policy_capability,
+            native_resource: native_resource.clone(),
+        })
+        .collect::<Vec<_>>();
+    let expected_cid = vector["expectedCid"]
+        .as_str()
+        .context("parent CID")?
+        .to_string();
+    let audience = vector["audience"]
+        .as_str()
+        .context("parent audience")?
+        .to_string();
+    Ok(ParentDelegationConfig {
+        owner_did: vector["issuer"]
+            .as_str()
+            .context("parent owner")?
+            .to_string(),
+        artifact_base64_url: vector["dagCborBase64Url"]
+            .as_str()
+            .context("parent artifact")?
+            .to_string(),
+        expected_cid: expected_cid.clone(),
+        audience: audience.clone(),
+        not_before,
+        expires_at,
+        terminal: false,
+        capability_bounds: bounds.clone(),
+        delegate_receipt: CapturedParentDelegateReceipt {
+            delegation_id: expected_cid,
+            delegatee_did: audience,
+            not_before,
+            expires_at,
+            terminal: false,
+            capability_bounds: bounds,
+        },
+    })
+}
+
+async fn seed_grant_vector_sql(sql: &SqlService, space: &SpaceId) -> Result<()> {
+    sql.execute(
+        space,
+        SQL_DB,
+        SqlRequest::Execute {
+            schema: Some(vec!["CREATE TABLE conversation (id TEXT PRIMARY KEY, title TEXT, source TEXT, source_id TEXT, source_url TEXT, started_at TEXT, ended_at TEXT, duration_secs INTEGER, summary TEXT, metadata TEXT, transcript_json TEXT, transcript_text TEXT, created_at TEXT, updated_at TEXT)".to_string()]),
+            sql: "INSERT INTO conversation (id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string(),
+            params: vec![
+                SqlValue::Text("conv_456".to_string()),
+                SqlValue::Text("Grant compatibility".to_string()),
+                SqlValue::Text("m1-g-08".to_string()),
+                SqlValue::Null,
+                SqlValue::Null,
+                SqlValue::Text("2026-07-11T00:00:00Z".to_string()),
+                SqlValue::Text("2026-07-11T00:01:00Z".to_string()),
+                SqlValue::Integer(60),
+                SqlValue::Text("real node vector seed".to_string()),
+                SqlValue::Text("{}".to_string()),
+                SqlValue::Text("[]".to_string()),
+                SqlValue::Text("seeded bytes".to_string()),
+                SqlValue::Text("2026-07-11T00:00:00Z".to_string()),
+                SqlValue::Text("2026-07-11T00:00:00Z".to_string()),
+            ],
+        },
+        None,
+        "tinycloud.sql/write".to_string(),
+    )
+    .await?;
+    Ok(())
+}
+
+struct EngineSqlKvContext<'a> {
+    client: &'a Client,
+    conn: &'a DatabaseConnection,
+    datadir: &'a Path,
+    sql_service: &'a SqlService,
+    grant_jwk: &'a JWK,
+    grant_issuer_did: &'a str,
+    holder_jwk: &'a JWK,
+    holder_vm: &'a str,
+    holder_did: &'a str,
+    caveat: Value,
+}
+
+async fn exercise_engine_sql_kv_mix(context: EngineSqlKvContext<'_>) -> Result<()> {
+    let owner_jwk = ed25519_jwk_from_seed([0x44; 32])?;
+    let (owner_did, owner_vm) = node_identity(&owner_jwk)?;
+    let space_id = SpaceId::new(owner_did.parse::<DIDBuf>()?, "default".parse()?);
+    space::ActiveModel {
+        id: Set(SpaceIdWrap(space_id.clone())),
+    }
+    .insert(context.conn)
+    .await?;
+    tokio::fs::create_dir_all(
+        context
+            .datadir
+            .join("blocks")
+            .join(space_id.suffix())
+            .join(space_id.name().as_str()),
+    )
+    .await?;
+    seed_grant_vector_sql(context.sql_service, &space_id).await?;
+    seed_listen_kv(context.client, &owner_jwk, &owner_vm, &owner_did, &space_id).await?;
+
+    let sql_resource = space_id.clone().to_resource(
+        "sql".parse::<Service>()?,
+        Some(SQL_PATH.parse::<AuthPath>()?),
+        None,
+        None,
+    );
+    let kv_resource = space_id.clone().to_resource(
+        "kv".parse::<Service>()?,
+        Some(KV_PATH.parse::<AuthPath>()?),
+        None,
+        None,
+    );
+    let encoded_parent = signed_multi_delegation(
+        &owner_jwk,
+        &owner_vm,
+        context.grant_issuer_did,
+        vec![
+            (sql_resource.clone(), "tinycloud.sql/read".to_string(), None),
+            (kv_resource.clone(), "tinycloud.kv/get".to_string(), None),
+        ],
+        Vec::new(),
+        "attenuable",
+        600,
+        "engine-sql-kv-parent",
+    )?;
+    let parent_response = context
+        .client
+        .post("/delegate")
+        .header(Header::new("Authorization", encoded_parent.clone()))
+        .dispatch()
+        .await;
+    let parent_status = parent_response.status();
+    let parent_body = parent_response.into_string().await.unwrap_or_default();
+    assert_eq!(parent_status, Status::Ok, "SQL+KV parent: {parent_body}");
+    let parent_json: Value = serde_json::from_str(&parent_body)?;
+    let parent_cid = parent_json["cid"]
+        .as_str()
+        .context("SQL+KV parent CID")?
+        .to_string();
+
+    let sql_capability = policy_core::parse_policy_capability(&json!({
+        "service": "tinycloud.sql",
+        "space": "default",
+        "path": SQL_PATH,
+        "actions": ["tinycloud.sql/read"],
+        "caveats": context.caveat.clone()
+    }))?;
+    let kv_capability = policy_core::parse_policy_capability(&json!({
+        "service": "tinycloud.kv",
+        "space": "default",
+        "path": KV_PATH,
+        "actions": ["tinycloud.kv/get"]
+    }))?;
+    let bounds = vec![
+        ParentCapabilityBound {
+            policy_capability: PolicyCapability {
+                caveats: None,
+                ..sql_capability.clone()
+            },
+            native_resource: sql_resource.as_uri().to_string(),
+        },
+        ParentCapabilityBound {
+            policy_capability: kv_capability.clone(),
+            native_resource: kv_resource.as_uri().to_string(),
+        },
+    ];
+    let expires_at = Utc::now() + Duration::minutes(10);
+    let parent_config = ParentDelegationConfig {
+        owner_did: owner_did.clone(),
+        artifact_base64_url: encoded_parent,
+        expected_cid: parent_cid.clone(),
+        audience: context.grant_issuer_did.to_string(),
+        not_before: None,
+        expires_at,
+        terminal: false,
+        capability_bounds: bounds.clone(),
+        delegate_receipt: CapturedParentDelegateReceipt {
+            delegation_id: parent_cid,
+            delegatee_did: context.grant_issuer_did.to_string(),
+            not_before: None,
+            expires_at,
+            terminal: false,
+            capability_bounds: bounds,
+        },
+    };
+    let mut issuer = SharedGrantIssuer::new(
+        context.grant_issuer_did,
+        signing_key(context.grant_jwk)?,
+        [parent_config],
+    );
+    let capabilities = vec![sql_capability, kv_capability];
+    let issued_at = Utc::now();
+    let mut grant_policy = policy(&space_id, context.grant_issuer_did);
+    grant_policy.policy_id = "pol_m1_g08_sql_kv_mix".to_string();
+    grant_policy.resource.permissions_ceiling = capabilities.clone();
+    grant_policy.grant.max_ttl_seconds = 120;
+    let emitted = issuer.issue(GrantIssueRequest {
+        holder_did: context.holder_did.to_string(),
+        capabilities,
+        issued_at,
+        expires_at: issued_at + Duration::seconds(120),
+        presentation_expires_at: issued_at + Duration::seconds(120),
+        terminal: true,
+        evidence_ids: Vec::new(),
+        evidence_provenance: Vec::new(),
+        policy: grant_policy,
+    })?;
+    let response = context
+        .client
+        .post("/delegate")
+        .header(Header::new("Authorization", emitted.encoded.clone()))
+        .dispatch()
+        .await;
+    let status = response.status();
+    let body = response.into_string().await.unwrap_or_default();
+    assert_eq!(status, Status::Ok, "SQL+KV engine grant: {body}");
+    let imported: Value = serde_json::from_str(&body)?;
+    assert_eq!(imported["cid"], emitted.delegation_id);
+    let invocation = InvocationContext {
+        client: context.client,
+        signer: InvocationSigner {
+            jwk: context.holder_jwk,
+            verification_method: context.holder_vm,
+            did: context.holder_did,
+            parent: Hash::from(emitted.delegation_id.parse::<AuthCid>()?),
+        },
+        space: &space_id,
+    };
+    let sql_header = holder_invocation(
+        &invocation.signer,
+        &sql_resource,
+        "tinycloud.sql/read",
+        Some(context.caveat),
+        "engine-mixed-sql",
+    )?;
+    let sql_response = context
+        .client
+        .post("/invoke")
+        .header(Header::new("Authorization", sql_header))
+        .header(ContentType::JSON)
+        .body(serde_json::to_string(&SqlRequest::ExecuteStatement {
+            name: "listen.getConversation".to_string(),
+            params: vec![],
+        })?)
+        .dispatch()
+        .await;
+    let sql_status = sql_response.status();
+    let sql_body = sql_response.into_string().await.unwrap_or_default();
+    assert_eq!(sql_status, Status::Ok, "SQL+KV SQL: {sql_body}");
+    let kv = invoke_kv(&invocation, "tinycloud.kv/get", "engine-mixed-kv").await?;
+    assert_eq!(
+        kv.0,
+        Status::Ok,
+        "SQL+KV KV: {}",
+        String::from_utf8_lossy(&kv.1)
+    );
+    assert_eq!(kv.1, KV_SEED);
+    Ok(())
+}
+
+async fn assert_invoke_reject(
+    client: &Client,
+    authorization: String,
+    case_name: &str,
+    expected_text: &str,
+) -> Result<()> {
+    let response = client
+        .post("/invoke")
+        .header(Header::new("Authorization", authorization))
+        .dispatch()
+        .await;
+    let status = response.status();
+    let body = response.into_string().await.unwrap_or_default();
+    assert_eq!(status, Status::Unauthorized, "{case_name}: {body}");
+    assert!(
+        body.contains(expected_text),
+        "{case_name} intended {expected_text}, observed {body}"
+    );
+    Ok(())
+}
+
+async fn assert_delegate_reject(
+    client: &Client,
+    authorization: String,
+    case_name: &str,
+    expected_text: &str,
+) -> Result<()> {
+    let response = client
+        .post("/delegate")
+        .header(Header::new("Authorization", authorization))
+        .dispatch()
+        .await;
+    let status = response.status();
+    let body = response.into_string().await.unwrap_or_default();
+    assert_eq!(status, Status::Unauthorized, "{case_name}: {body}");
+    assert!(
+        body.contains(expected_text),
+        "{case_name} intended {expected_text}, observed {body}"
+    );
+    assert!(
+        !body.contains("expired or not yet valid"),
+        "{case_name} was accidentally masked by ambient time: {body}"
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn signed_delegation_with_proof(
+    issuer_jwk: &JWK,
+    issuer_vm: &str,
+    audience: &str,
+    resource: &ResourceId,
+    ability: &str,
+    caveat: Option<Value>,
+    proof: Vec<AuthCid>,
+    mode: &str,
+    ttl_seconds: i64,
+    nonce: &str,
+) -> Result<String> {
+    signed_multi_delegation(
+        issuer_jwk,
+        issuer_vm,
+        audience,
+        vec![(resource.clone(), ability.to_string(), caveat)],
+        proof,
+        mode,
+        ttl_seconds,
+        nonce,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn signed_multi_delegation(
+    issuer_jwk: &JWK,
+    issuer_vm: &str,
+    audience: &str,
+    grants: Vec<(ResourceId, String, Option<Value>)>,
+    proof: Vec<AuthCid>,
+    mode: &str,
+    ttl_seconds: i64,
+    nonce: &str,
+) -> Result<String> {
+    let mut capabilities = Capabilities::new();
+    for (resource, ability, caveat) in grants {
+        let mut nota_bene = BTreeMap::new();
+        if let Some(caveat) = caveat {
+            for (key, value) in caveat.as_object().context("delegation caveat object")? {
+                nota_bene.insert(key.clone(), value.clone());
+            }
+        }
+        capabilities.with_action(
+            resource.as_uri(),
+            ability.parse::<UcanAbility>()?,
+            [nota_bene],
+        );
+    }
+    let payload = Payload {
+        issuer: issuer_vm.parse::<DIDURLBuf>()?,
+        audience: audience.parse::<DIDBuf>()?,
+        not_before: None,
+        expiration: NumericDate::try_from_seconds(
+            (Utc::now() + Duration::seconds(ttl_seconds)).timestamp() as f64,
+        )?,
+        nonce: Some(nonce.to_string()),
+        facts: Some(vec![json!({
+            tinycloud_core::util::DelegationMode::FACT_KEY: mode
+        })]),
+        proof,
+        attenuation: capabilities,
+    }
+    .sign(issuer_jwk.get_algorithm().unwrap_or_default(), issuer_jwk)?;
+    Ok(payload.encode()?)
+}
+
+fn signed_ucan_revocation(
+    issuer_jwk: &JWK,
+    issuer_vm: &str,
+    audience: &str,
+    target: AuthCid,
+) -> Result<String> {
+    let mut capabilities = Capabilities::new();
+    let resource = format!("urn:cid:{target}");
+    capabilities.with_action(
+        resource.parse()?,
+        "tinycloud/revoke".parse::<UcanAbility>()?,
+        [BTreeMap::<String, Value>::new()],
+    );
+    let payload = Payload {
+        issuer: issuer_vm.parse::<DIDURLBuf>()?,
+        audience: audience.parse::<DIDBuf>()?,
+        not_before: None,
+        expiration: NumericDate::try_from_seconds(
+            (Utc::now() + Duration::minutes(2)).timestamp() as f64
+        )?,
+        nonce: Some("m1-g-08-revoked-parent".to_string()),
+        facts: Some(Vec::<Value>::new()),
+        proof: Vec::new(),
+        attenuation: capabilities,
+    }
+    .sign(issuer_jwk.get_algorithm().unwrap_or_default(), issuer_jwk)?;
+    Ok(payload.encode()?)
+}
+
 #[test]
 fn evidence_verification_uses_fixture_time_under_hostile_ambient() -> Result<()> {
     let mut owner_jwk = JWK::generate_ed25519()?;
@@ -1251,7 +2239,7 @@ fn evidence_verification_path_rejects_direct_wall_clock_reads() {
         .split_once("    let before_delegations =")
         .expect("main resolve source marker")
         .1
-        .split_once("    let client =")
+        .split_once("    let imported = client")
         .expect("main native-node source marker")
         .0;
     let denial_resolves = source
@@ -1279,7 +2267,7 @@ fn evidence_verification_path_rejects_direct_wall_clock_reads() {
         .split_once("fn fixture_verification_time")
         .expect("fixture time source marker")
         .1
-        .split_once("#[test]")
+        .split_once("async fn observe_grant_output_on_real_node")
         .expect("source guard marker")
         .0;
     let ambient_independence_guard = source
