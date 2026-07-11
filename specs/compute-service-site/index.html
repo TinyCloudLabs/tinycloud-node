@@ -531,7 +531,12 @@
     a browser session may hold <code>execute</code> and <code>list</code>, but deploying
     executable code requires an explicitly elevated grant. No <code>compute/admin</code> URN
     is minted now; a future one would <code>implies</code> deploy (mirroring
-    <code>sql/admin ⊃ sql/schema</code>) only once a real admin-only surface exists.</p>
+    <code>sql/admin ⊃ sql/schema</code>) only once a real admin-only surface exists.
+    <strong>Corollary (MUST):</strong> the SDK standard session grant must enumerate
+    <code>compute/execute</code> + <code>compute/list</code> and <strong>never</strong>
+    <code>compute/*</code> — once the concretes go active the wildcard implies deploy, so
+    copying the existing <code>sql/*</code> grant habit would silently hand every browser
+    session deploy rights.</p>
   </div>
   <p>
     The resource URI needs zero parser changes: <code>ResourceId</code> is already
@@ -577,19 +582,26 @@
     shipped <em>inside the deploy request</em>, and <strong>bound to the function's content
     CID</strong>. When the running function needs data, the host mediator constructs an
     internal invocation <em>signed by the routine's key, citing <code>D_fn</code> as parent</em>,
-    and runs it through the normal <code>/invoke</code> validate path.
+    and runs it through the normal invocation validate/save path — entering via core
+    <code>process()</code>, not back through the HTTP route.
   </p>
   <p>
-    The routine's execution identity is deterministic — derived by the node from the
-    function CID via the existing dstack hierarchical key derivation:
+    The routine's execution identity is deterministic — derived by the node from
+    <strong>both the space and the function CID</strong> via the existing dstack
+    hierarchical key derivation:
   </p>
-  <pre><code>routine_did = did:key( get_key(<span class="k2">"tinycloud/compute/"</span> + function_cid) )</code></pre>
+  <pre><code>routine_did = did:key( get_key(<span class="k2">"tinycloud/compute/"</span> + space + <span class="k2">"/"</span> + function_cid) )</code></pre>
   <p>
     The private key is derived inside the TEE and never leaves it, so <strong>only this
-    node, running this exact function CID, can act as the routine</strong>. Because the CID
-    is a pure function of the WASM bytes, the deployer computes it — and therefore the
-    routine DID — <em>before</em> deploy. No chicken-and-egg. (Non-TEE classic mode runs the
-    same derivation off the node's static key material; the trust statement weakens to
+    node, running this exact function CID in this exact space, can act as the
+    routine</strong>. The <code>space</code> segment is mandatory, not cosmetic: identical WASM
+    deployed in two spaces shares one CID, and a CID-only identity would open a cross-space
+    confused deputy. Per-<code>(space, function)</code> derivation makes cross-space citation
+    <em>cryptographically impossible</em> rather than merely policy-blocked. The public
+    <code>routine_did</code> is <em>not</em> computable client-side (if it were, the private
+    key would be too) — the deployer obtains it via a read-only <code>RoutineDid</code>
+    handshake before deploy (<a href="#deploy">§4</a>). (Non-TEE classic mode runs the same
+    derivation off the node's static key material; the trust statement weakens to
     "the node".)
   </p>
   <p>Consequences worth stating plainly:</p>
@@ -599,8 +611,12 @@
     <li><strong>Changing the code voids the grant.</strong> A new WASM binary is a new CID; the
       old CID-bound <code>D_fn</code> no longer applies. Code changes cannot silently inherit
       data access.</li>
-    <li><strong>No new auth machinery.</strong> Layer 2 rides the same delegatee-match and
-      chain-containment checks as every user invocation.</li>
+    <li><strong>No new authorization-engine code</strong> — Layer 2 rides the same
+      delegatee-match and chain-containment checks as every user invocation. But the host
+      mediator carries one normative MUST: it <strong>echoes <code>D_fn</code>'s caveat map
+      verbatim</strong> on every internal invocation (byte-equality containment rule) — a
+      caveat-less internal invocation fails closed on the first host call. The echo
+      propagates down the Cloudflare chain (<code>D_worker</code> and Worker callbacks) too.</li>
   </ul>
 
   <figure class="diagram">
@@ -616,7 +632,7 @@ flowchart LR
   I -- "compute/execute<br/>fn ref + inputs" --> N
   N -- "Layer 1: verify invoker chain<br/>on ‹space›/compute/‹fn›" --> E
   N -- "run(function_cid, wasm, input,<br/>caveats, host)" --> B
-  B -- "Layer 2: data ops via /invoke<br/>under routine grant D_fn" --> E
+  B -- "Layer 2: data ops via /invoke under routine<br/>grant D_fn — echoes D_fn's binding caveat" --> E
   E -- "authorized reads/writes" --> D
 
   style I stroke:#e2a144,stroke-width:2px
@@ -633,14 +649,15 @@ flowchart LR
   </div>
 
   <div class="callout note">
-    <div class="t">Decided — D1: routine identity = TEE-derived key from the function CID</div>
-    <p>Chosen for <strong>no secret at rest</strong> and for binding data access to
-    <em>both</em> the function identity and the node identity (attestable via
+    <div class="t">Decided — D1: routine identity = TEE-derived key from (space, function CID)</div>
+    <p>Chosen for <strong>no secret at rest</strong> and for binding data access to the
+    function identity, the space, <em>and</em> the node identity (attestable via
     <code>/attestation</code>). Identity enforcement is cryptographic — only the execution of
-    <code>function_cid</code> can derive the key matching <code>D_fn.delegatee</code> — reusing
-    <code>did_principal_matches</code> and the existing chain walk, with no new runtime
-    "am I inside function X?" check. Cost accepted: a redeploy on a different node yields a
-    different routine DID, so <code>D_fn</code> is re-minted per node.</p>
+    <code>function_cid</code> in that space can derive the key matching
+    <code>D_fn.delegatee</code> — reusing <code>did_principal_matches</code> and the existing
+    chain walk, with no new runtime "am I inside function X?" check. Cost accepted: a
+    redeploy on a different node yields a different routine DID, so <code>D_fn</code> is
+    re-minted per node.</p>
   </div>
   <div class="callout decision">
     <div class="t">Deployment risk — dstack key stability (verify empirically)</div>
@@ -650,7 +667,13 @@ flowchart LR
     material shifting across deploys, which would change <code>routine_did</code> and silently
     invalidate every <code>D_fn</code> bound to the old identity.</p>
     <p><strong>Before production reliance:</strong> derive <code>routine_did</code> for a fixed
-    <code>function_cid</code>, redeploy the CVM, re-derive, assert equality.</p>
+    <code>(space, function_cid)</code>, redeploy the CVM, re-derive, assert equality — the
+    read-only <code>RoutineDid</code> handshake (<a href="#deploy">§4</a>) is exactly this
+    probe.</p>
+    <p><strong>Compare-on-execute tripwire:</strong> before running a function the node
+    re-derives the key and compares against <code>D_fn.delegatee</code>; a mismatch fails with
+    the distinct <code>routine-identity-rotated</code> error (409/503, not a generic 403), so a
+    seed rotation surfaces as itself, not as a buried authorization bug.</p>
     <p><strong>Recorded fallback</strong> if derivation proves unstable: a freshly generated
     per-deploy routine key persisted encrypted alongside the artifact — a localized
     <code>ComputeService</code> change with no impact on the wire format, the binding caveat,
@@ -666,9 +689,11 @@ flowchart LR
     sees exactly which function each <code>D_fn</code> authorizes) and <strong>portable</strong>
     (a node migration carries the binding inside the signed delegation). It composes with D1
     rather than overlapping it: <em>the derived key makes the binding unforgeable; the caveat
-    makes it auditable.</em> The execute path locates the right <code>D_fn</code> for a loaded
-    artifact by matching this caveat's <code>functionCid</code> against the artifact's
-    <code>content_hash</code>.</p>
+    makes it auditable.</em> The execute path selects <code>D_fn</code> by
+    <code>(space, functionCid)</code> — the space of the outer invocation, never the CID alone —
+    verifies every capability resource lives in that space, and cites <em>all</em> matching
+    valid <code>D_fn</code>s as parents (graceful degradation when an older grant is revoked
+    mid-life). On re-deploy the superseded <code>D_fn</code> is revoked.</p>
   </div>
 
   <h3>Two caveat namespaces — do not conflate them</h3>
@@ -701,13 +726,16 @@ flowchart LR
   <div class="kicker"><span class="num">04</span>Sequence</div>
   <h2>Deploy flow</h2>
   <p>
-    Deployment is a single <code>/invoke</code>: the WASM binary and the routine's data grant
-    <code>D_fn</code> travel together in the deploy request. Because the content CID is a pure
-    function of the WASM bytes, the deployer computes it — and therefore the routine's
-    derived identity — <em>before</em> deploying, mints <code>D_fn</code> against it (with the
-    <code>computeFunctionBinding</code> caveat naming that CID), and ships both at once. No
-    chicken-and-egg. Deploy authorization is the privileged tier
-    (<a href="#model">§2</a>) — standard-tier sessions cannot do this.
+    Deployment starts with a <strong>read-only handshake</strong>: the client hashes the WASM
+    locally (the CID convention is public), then asks the node for the routine identity —
+    <code>routine_did</code> is derived from the node's TEE-internal seed and is <em>not</em>
+    computable client-side. The node returns the <em>public</em> DID, no secret exposed, no
+    side effects. The client mints <code>D_fn</code> against it (with the
+    <code>computeFunctionBinding</code> caveat naming the CID) and ships binary + grant in one
+    deploy request; the node processes <code>D_fn</code> through the standard
+    <code>/delegate</code> path <strong>atomically</strong> with the artifact save and quota
+    accounting. Deploy authorization is the privileged tier (<a href="#model">§2</a>) —
+    standard-tier sessions cannot do this.
   </p>
   <figure class="diagram">
     <div class="mermaid" data-diagram="fig-4-1"></div>
@@ -719,26 +747,31 @@ sequenceDiagram
   participant A as Capability Engine
   participant S as Artifact Store<br/>(service = "compute")
 
-  O->>O: function_cid = CID(wasm bytes)<br/>computed locally, pre-deploy
-  O->>O: mint D_fn — delegatee = routine_did(function_cid),<br/>caveat computeFunctionBinding { functionCid },<br/>caps = attenuated data grant (e.g. kv/get on inputs/)
+  O->>O: function_cid = CID(wasm bytes)<br/>computed locally — the CID convention is public
+  O->>N: RoutineDid { content_cid } — read-only,<br/>side-effect-free handshake
+  N->>N: derive keypair for (space, function_cid)<br/>inside the TEE
+  N-->>O: public routine_did — no secret exposed<br/>(re-run after a CVM redeploy = dstack-stability probe)
+  O->>O: mint D_fn — delegatee = routine_did,<br/>caveat computeFunctionBinding { functionCid },<br/>caps = attenuated data grant (e.g. kv/get on inputs/)
   O->>N: /invoke — tinycloud.compute/deploy<br/>name + wasm binary + grant = D_fn
   rect rgba(226, 161, 68, 0.08)
     Note right of N: privileged tier — excluded from standard-tier grants
     N->>A: verify deploy chain on ‹space›/compute/‹name›
     A-->>N: ok — containment + ability match
   end
-  N->>S: save("compute", space, name, wasm)
-  S-->>N: content CID + revision
   rect rgba(69, 194, 168, 0.08)
-    N->>A: persist D_fn through the normal delegation path<br/>(binding caveat rides inside the signed delegation)
-    A-->>N: D_fn stored — execute path will match<br/>caveat functionCid against artifact content_hash
+    Note right of N: ONE TRANSACTION — all-or-nothing
+    N->>S: save("compute", space, name, wasm) + SqlSizes quota update
+    S-->>N: content CID + revision
+    N->>A: process D_fn through the standard /delegate path<br/>(signature check, containment, per-ability caveat persistence)
+    A-->>N: D_fn persisted — execute path selects by (space, functionCid).<br/>Superseded D_fn from a prior deploy is revoked.
   end
   N-->>O: ComputeResult ack — FunctionId { name, cid, revision }
   Note over N,S: identity = content CID — a same-bytes redeploy is idempotent.<br/>New bytes = new CID, and the old CID-bound grant no longer applies.
     </script>
-    <figcaption><b>Fig. 4.1</b> — Deploy: one request carries the binary
-    <span style="color:var(--l1)">(Layer-1 gated, privileged tier)</span> and the routine's
-    CID-bound data grant <span style="color:var(--l2)">(Layer-2 provisioning)</span>.</figcaption>
+    <figcaption><b>Fig. 4.1</b> — Deploy: a read-only RoutineDid handshake, then one request
+    carrying the binary <span style="color:var(--l1)">(Layer-1 gated, privileged tier)</span>
+    and the routine's CID-bound data grant
+    <span style="color:var(--l2)">(Layer-2 provisioning, atomic)</span>.</figcaption>
   </figure>
 </section>
 
@@ -772,13 +805,13 @@ sequenceDiagram
     N->>A: verify invoker chain on ‹space›/compute/‹fn›
     A-->>N: ok
   end
-  N->>N: load artifact + locate D_fn via<br/>computeFunctionBinding caveat, derive routine key
+  N->>N: load artifact, select D_fn by (space, functionCid),<br/>re-derive routine key — mismatch fails with<br/>routine-identity-rotated (never a generic 403)
   N->>W: run(function_cid, wasm, input, caveats, host)
   W->>W: instantiate — epoch deadline := maxDuration,<br/>StoreLimits := maxMemory, fuel = CPU budget
   rect rgba(69, 194, 168, 0.08)
     Note right of W: LAYER 2 — what the routine touches
     W->>H: host import storage.get("calendar/…")
-    H->>A: internal invocation signed as routine,<br/>citing D_fn as parent
+    H->>A: internal invocation signed as routine, citing D_fn —<br/>echoes D_fn's caveat map VERBATIM (byte-equality<br/>rule — a caveat-less invocation fails closed)
     A-->>H: ok — delegatee match + chain containment
     H->>K: kv/get
     K-->>H: bytes
@@ -808,14 +841,19 @@ sequenceDiagram
   <div class="kicker"><span class="num">06</span>Sequence</div>
   <h2>Execute flow — Cloudflare backend <span class="pill warn">trust-the-deployment</span></h2>
   <p>
-    The same entry point, a different <code>run()</code>. The node ships the function (or a
-    pre-deployed Worker reference), the input, and a <strong>scoped, short-lived callback
-    delegation</strong> — delegatee = the Worker's identity, attenuated to <code>D_fn</code>'s
-    grant. The routine's private key <strong>never leaves the node</strong>. Crucially,
-    authorization still happens at the data-owning node: the Worker's data accesses come
-    back as <code>/invoke</code> callbacks validated against that attenuated chain, so the
-    Worker cannot exceed the routine's data caps. What the node <em>cannot</em> do is
-    enforce runtime caveats inside Cloudflare's sandbox.
+    The same entry point, a different <code>run()</code>. The Worker generates a
+    <strong>fresh ephemeral keypair per execution</strong> (never reused) and returns its
+    public key; the node mints <code>D_worker</code> for that pubkey — a child of
+    <code>D_fn</code>, attenuated in resource/ability only, echoing the binding caveat, with a
+    TTL of roughly <code>maxDuration + slack</code> under a config ceiling (and capped by
+    <code>D_fn</code>'s own expiry). The routine's private key <strong>never leaves the
+    node</strong>, and the worker key never transits Cloudflare. Authorization still happens
+    at the data-owning node: callbacks are validated against the attenuated chain, so the
+    Worker cannot exceed the routine's data caps. On completion, timeout, or error the node
+    <strong>revokes <code>D_worker</code></strong> — the real kill switch (revocations are
+    checked per invocation); the TTL is only the crash backstop, and revoking
+    <code>D_fn</code> itself is the deployer's panic button, killing every live
+    <code>D_worker</code> transitively.
   </p>
   <figure class="diagram">
     <div class="mermaid" data-diagram="fig-6-1"></div>
@@ -832,34 +870,51 @@ sequenceDiagram
     N->>A: LAYER 1 — verify invoker chain
     A-->>N: ok
   end
-  N->>N: mint short-lived callback delegation —<br/>delegatee = worker identity, attenuated to D_fn's grant
-  N->>C: run() — function/worker ref + input + callback delegation
-  Note over N,C: what crosses the boundary: script ref or bytes,<br/>input, a narrow revocable callback delegation.<br/>NEVER the routine's private key or raw space data.
+  N->>C: start execution
+  C->>C: generate FRESH ephemeral keypair<br/>(per execution, never reused)
+  C-->>N: worker public key — private key never transits Cloudflare
+  N->>N: mint D_worker — child of D_fn, delegatee = worker pubkey,<br/>attenuated in resource/ability only, echoes the binding caveat,<br/>TTL ≈ maxDuration + slack (capped by D_fn's expiry)
+  N->>C: run() — function/worker ref + input + D_worker
+  Note over N,C: what crosses the boundary: script ref or bytes,<br/>input, the narrow revocable D_worker.<br/>NEVER the routine's private key or raw space data.
   rect rgba(69, 194, 168, 0.08)
-    C->>N: data callback — POST /invoke under the callback delegation
+    C->>N: data callback — POST /invoke under D_worker<br/>(echoes the binding caveat, fresh nonce per callback)
     N->>A: LAYER 2 — validate against the attenuated chain<br/>(authorization stays at the data-owning node)
     A-->>N: ok — the Worker cannot exceed D_fn's data caps
     N-->>C: data bytes
   end
   C-->>N: output
+  N->>N: revoke D_worker on completion / timeout / error —<br/>the kill switch (TTL is only the crash backstop).<br/>Revoking D_fn = deployer panic button.
   N->>N: verify() = trust-the-deployment —<br/>result carries verification { mode: "trusted-deployment", backend: "cloudflare" }
   N-->>I: output inline or KV ref
-  Note over N,C: maxMemory / maxDuration / CPU are NOT<br/>node-enforceable in this backend —<br/>see §8 enforcement matrix
+  Note over N,C: EGRESS: the Worker has unrestricted outbound fetch —<br/>anything readable under the grant is exfiltrable.<br/>Also NOT node-enforceable: maxMemory / maxDuration / CPU (§8)
     </script>
     <figcaption><b>Fig. 6.1</b> — Remote execution, home authorization. The Worker holds a
     token, not the data; every byte it reads is a capability-checked round-trip.</figcaption>
   </figure>
   <div class="callout trust">
     <div class="t">Trust model, stated honestly</div>
-    <p>With the Cloudflare backend, <code>verify()</code> reduces to trusting that Cloudflare's
-    runtime executed the deployed script faithfully, plus the node–Worker transport. Resource
-    caveats (<code>maxMemory</code>, <code>maxDuration</code>, CPU) cannot be enforced by the
-    node there — they pass as hints only, and the result MUST surface this as
-    <code>verification: { mode: "trusted-deployment", backend: "cloudflare" }</code>. What
-    survives the boundary: Layer-1 and Layer-2 authorization, the CID-bound grant (via the
-    attenuated callback delegation), and the guarantee that raw data never leaves the node
-    except through capability-checked responses. Callers who need enforced resource bounds
-    use the in-node WasmtimeBackend.</p>
+    <p><strong>The headline caveat is data egress.</strong> The wasmtime backend has no
+    exfiltration channel — no net, no fs, data flows only to the output or to
+    <code>D_fn</code>-granted KV paths. A Cloudflare Worker has <strong>unrestricted outbound
+    <code>fetch</code></strong>: a malicious or compromised function can ship everything its
+    grant lets it read to any endpoint, and the node can neither prevent nor detect it (the
+    input also transits and rests on Cloudflare infra). <em>Anything
+    <code>D_fn</code>/<code>D_worker</code> permits reading must be treated as disclosed to
+    the function author and to Cloudflare</em> — scope read grants to CF-backed functions
+    accordingly. This confidentiality asymmetry, not the resource-limit gap, is the decisive
+    fact when choosing backends.</p>
+    <p><strong>Code identity is a bookkeeping claim, not content-addressed.</strong> On
+    wasmtime the node hashes the bytes it is about to run; on CF the CID binds the grant to
+    <em>what the node uploaded</em>, not <em>what runs</em> — anyone with Cloudflare account
+    access (including Cloudflare) can swap the script behind the route while
+    <code>D_worker</code> is valid. The Cloudflare account credentials join the TCB.
+    <code>verification: { mode: "trusted-deployment", backend: "cloudflare" }</code> carries
+    exactly this meaning.</p>
+    <p><strong>Resource caveats are hints.</strong> <code>maxMemory</code>,
+    <code>maxDuration</code>, and CPU cannot be enforced by the node on CF. What survives the
+    boundary: Layer-1 and Layer-2 authorization, the CID-bound grant via <code>D_worker</code>,
+    and capability-checked data responses. Callers who need enforced bounds or
+    confidentiality use the in-node WasmtimeBackend.</p>
   </div>
 </section>
 
@@ -900,11 +955,13 @@ pub trait ExecutionBackend: Send + Sync {
       </tr>
       <tr>
         <td><b>CloudflareWorkerBackend</b></td>
-        <td>A deployed Worker; node sends fn/worker ref + input + a short-lived callback
-            delegation (never the routine key).</td>
-        <td class="no">Partial — <code>maxMemory</code> / <code>maxDuration</code> / CPU not
-            node-enforceable. Data access still capability-checked at the node.</td>
-        <td>Trust-the-deployment; result marked
+        <td>A deployed Worker; node sends fn/worker ref + input + <code>D_worker</code>
+            (worker-side ephemeral keypair per execution — never the routine key).</td>
+        <td class="no">Weakest — <strong>no egress control</strong> (unrestricted outbound
+            fetch: everything readable under the grant is exfiltrable), and
+            <code>maxMemory</code> / <code>maxDuration</code> / CPU not node-enforceable.
+            Data access still capability-checked at the node.</td>
+        <td>Trust-the-deployment; CF account creds join the TCB; result marked
             <code>verification: { mode: "trusted-deployment" }</code>.</td>
         <td><b>Initial</b></td>
       </tr>
@@ -960,7 +1017,11 @@ pub struct ComputeCaveats {
     chain</strong>. Caveats supplied in invocation facts (<code>computeCaveats</code>) are a
     non-authoritative fallback only. An invoker cannot widen or drop the allowlist by
     editing the invocation envelope. Numeric caveats are validated against sane ceilings on
-    ingest and applied without silent truncation.</p>
+    ingest and applied without silent truncation. The byte-equality rule bites Layer 1 too:
+    an invoker under a <code>ComputeCaveats</code>-carrying grant must <strong>echo the chain's
+    caveat map verbatim</strong> on the invocation (the SDK compute helper copies it, same as
+    the SQL constrained-statements flow) or the invocation is rejected before the handler
+    runs.</p>
   </div>
   <table>
     <thead><tr><th>Caveat</th><th>WasmtimeBackend</th><th>CloudflareWorkerBackend</th></tr></thead>
@@ -998,8 +1059,16 @@ pub struct ComputeCaveats {
         <td><b>Host reach / data caps</b></td>
         <td class="yes">Guest sees only mediated host imports (no WASI net/fs); each call
             gated by <code>D_fn</code></td>
-        <td class="yes">Callbacks validated at the node against the attenuated callback
-            delegation — cannot exceed <code>D_fn</code></td>
+        <td class="yes">Callbacks validated at the node against <code>D_worker</code> —
+            cannot exceed <code>D_fn</code></td>
+      </tr>
+      <tr>
+        <td><b>Confidentiality / egress</b></td>
+        <td class="yes">No exfiltration channel — data flows only to the output or to
+            <code>D_fn</code>-granted KV paths</td>
+        <td class="no"><strong>The decisive gap</strong> — unrestricted outbound
+            <code>fetch</code>; a read allowlist limits what is read, not where it then
+            goes. Everything readable is exfiltrable (§6)</td>
       </tr>
     </tbody>
   </table>
@@ -1043,7 +1112,8 @@ stateDiagram-v2
   note right of Superseded
     A new binary is a new identity.
     CID-bound grants cannot follow
-    a code change.
+    a code change. The superseded
+    D_fn is revoked on re-deploy.
   end note
     </script>
     <figcaption><b>Fig. 9.1</b> — Function lifecycle: deployed → grant-bound → active,
@@ -1127,11 +1197,15 @@ stateDiagram-v2
   "output_ref":  "kv/reports/q3"       <span class="cm">// optional: write result there instead of inline</span>
 }
 
+{ "action": "<span class="k1">routine_did</span>",              <span class="cm">// F2 handshake — read-only, side-effect-free:</span>
+  "content_cid": "bafk…"               <span class="cm">// returns the PUBLIC routine_did for (space, cid);</span>
+}                                      <span class="cm">// doubles as the dstack-stability probe</span>
+
 { "action": "<span class="k1">deploy</span>",
   "function": "report-generator",
   "wasm_b64": "…",                     <span class="cm">// small deploys; large WASM rides as the raw body</span>
-  "grant":    "&lt;D_fn header or CID&gt;",  <span class="cm">// the routine's data delegation (§3, §4)</span>
-  "caveats":  { … }                    <span class="cm">// ComputeCaveats</span>
+  "grant":    "&lt;D_fn header or CID&gt;",  <span class="cm">// processed via the standard /delegate path,</span>
+  "caveats":  { … }                    <span class="cm">// atomically with the artifact save (§4)</span>
 }
 
 { "action": "<span class="k1">list</span>" }</code></pre>
@@ -1232,15 +1306,31 @@ InvocationOutcome::<span class="k2">ComputeList</span>(serde_json::Value)    <sp
       <code>compute/admin</code> URN until a real admin-only surface exists
       (<a href="#model">§2</a>).</li>
   </ul>
-  <h3>Still open</h3>
+  <h3>Still open <span class="pill dimp">narrowed by the fable review</span></h3>
   <ul>
-    <li><strong>Cloudflare callback credential lifetime &amp; revocation</strong> — the
-      short-lived callback delegation needs a concrete TTL and a mid-execution revocation
-      story.</li>
-    <li><strong>Result cache</strong> — an opt-in <code>(content_cid, input_hash)</code>
-      cache for pure functions, and how a function declares itself pure.</li>
-    <li><strong>Binary inline outputs</strong> — a <code>ComputeBytes</code> outcome +
-      octet-stream responder, deferred until there is a concrete consumer.</li>
+    <li><strong>D_worker TTL tuning</strong> — the mechanics are now concrete (worker-side
+      ephemeral keypair per execution, TTL ≈ <code>maxDuration + slack</code> under a config
+      ceiling, per-execution revocation kill switch, <code>D_fn</code> revocation as panic
+      button); the remaining open bit is the exact slack multiplier / ceiling default
+      against real Cloudflare dispatch jitter.</li>
+    <li><strong>Result cache — deferred, gate criterion recorded</strong> — cacheable
+      <em>iff</em> <code>D_fn</code> grants no read capability and the request has no
+      <code>input_refs</code> (a structural, checkable gate — "the function declares itself
+      pure" is the wrong gate, declarations lie). No consumer today.</li>
+    <li><strong>Binary inline outputs — deferred</strong> — the KV output path already
+      handles binary; revisit when a consumer inlines &gt;1&nbsp;MB binaries.</li>
+  </ul>
+  <h3>Test obligations <span class="pill dimp">from the review</span></h3>
+  <ul>
+    <li>Caveat-echo: a non-echoing internal invocation (and CF callback) is rejected; the
+      echoed one succeeds. Invoker-side echo likewise.</li>
+    <li>Cross-space isolation: identical WASM in spaces A and B yields distinct routine
+      DIDs; a B execution cannot cite A's <code>D_fn</code>.</li>
+    <li>Deploy atomicity: a failed <code>D_fn</code> leaves no artifact row and no quota
+      entry, and vice versa.</li>
+    <li>Quota: deploy increments <code>store_size</code>; an over-quota deploy fails.</li>
+    <li>Rotation: re-derived key mismatch fails with <code>routine-identity-rotated</code>,
+      never a generic 403.</li>
   </ul>
   <h3>Explicitly out of scope</h3>
   <ul>
