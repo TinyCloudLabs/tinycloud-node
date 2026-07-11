@@ -3567,6 +3567,7 @@ dependencies = [
  "policy-evidence-vc",
  "policy-runtime",
  "rocket",
+ "serde",
  "serde_json",
  "tempfile",
  "time",

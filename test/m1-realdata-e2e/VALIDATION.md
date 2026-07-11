@@ -1,8 +1,9 @@
 # Validation record
 
-Observed locally on 2026-07-11 from the m1-g-08 ticket worktree. All commands
-used the shared ticket target directory. The vendored grant vectors, generator,
-and actual g-07 engine source remain content-hash pinned in `vendor/MANIFEST.json`.
+Observed locally on 2026-07-11 from the m1-g-05b-r1 ticket worktree. All
+commands used the shared ticket target directory. The vendored grant vectors,
+generator, and actual g-07 engine source remain content-hash pinned in
+`vendor/MANIFEST.json`.
 
 ## Cross-layer contract proof
 
@@ -21,6 +22,11 @@ test evidence_verification_uses_fixture_time_under_hostile_ambient ... ok
 test deterministic_cross_layer_contract_is_observed_from_real_operations ... ok
 
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+running 1 test
+test verifier_rejects_critical_field_removed_from_accepted_bundle_copy ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
 running 3 tests
 test frozen_plane_has_native_identity_shape_and_layer_partition ... ok
