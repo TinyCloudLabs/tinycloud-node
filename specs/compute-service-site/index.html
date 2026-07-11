@@ -586,17 +586,22 @@
     <code>process()</code>, not back through the HTTP route.
   </p>
   <p>
-    The routine's execution identity is deterministic — derived by the node from
-    <strong>both the space and the function CID</strong> via the existing dstack
-    hierarchical key derivation:
+    The routine's execution identity is deterministic — derived by the node from the
+    function's <strong>canonical resource URI</strong> under a versioned domain prefix, via
+    the existing dstack hierarchical key derivation:
   </p>
-  <pre><code>routine_did = did:key( get_key(<span class="k2">"tinycloud/compute/"</span> + space + <span class="k2">"/"</span> + function_cid) )</code></pre>
+  <pre><code>resource_uri = ‹space›/compute/‹function_cid›   <span class="cm">// the ResourceId display form (§2)</span>
+routine_did  = did:key( get_key(<span class="k2">"tinycloud/compute-key/v1/"</span> + resource_uri) )</code></pre>
   <p>
-    The private key is derived inside the TEE and never leaves it, so <strong>only this
-    node, running this exact function CID in this exact space, can act as the
-    routine</strong>. The <code>space</code> segment is mandatory, not cosmetic: identical WASM
+    Using the canonical <code>ResourceId</code> display string means <strong>one canonical
+    spelling is shared by the authorizer, the binding caveat, and the derivation</strong> —
+    no second serialization to keep in sync — and the versioned <code>compute-key/v1/</code>
+    prefix is domain-separated, so a future <code>v2</code> scheme cannot collide with
+    existing identities. The private key is derived inside the TEE and never leaves it, so
+    <strong>only this node, running this exact function CID in this exact space, can act as
+    the routine</strong>. The space component is mandatory, not cosmetic: identical WASM
     deployed in two spaces shares one CID, and a CID-only identity would open a cross-space
-    confused deputy. Per-<code>(space, function)</code> derivation makes cross-space citation
+    confused deputy — per-<code>(space, function)</code> derivation makes cross-space citation
     <em>cryptographically impossible</em> rather than merely policy-blocked. The public
     <code>routine_did</code> is <em>not</em> computable client-side (if it were, the private
     key would be too) — the deployer obtains it via a read-only <code>RoutineDid</code>
@@ -604,6 +609,17 @@
     derivation off the node's static key material; the trust statement weakens to
     "the node".)
   </p>
+  <div class="callout decision">
+    <div class="t">Blocking before activation — space-name validation</div>
+    <p>The derivation string's uniqueness requires that distinct
+    <code>(space, function)</code> pairs never collide into one string. CIDs are base32
+    (delimiter-free) — safe. But space <code>Name</code> validation is currently a stubbed
+    <code>// TODO</code> in <code>tinycloud-auth</code>: before compute activates, space names
+    MUST be validated to exclude the URI delimiters (<code>/</code>, <code>:</code>,
+    <code>#</code>, <code>?</code>) — or the space component MUST be hashed (fixed-width,
+    delimiter-free) before it enters the derivation string. Tracked as a test obligation
+    (<a href="#scope">§13</a>).</p>
+  </div>
   <p>Consequences worth stating plainly:</p>
   <ul>
     <li><strong>The invoker never needs the underlying data permission.</strong> Alice can let
@@ -749,7 +765,7 @@ sequenceDiagram
 
   O->>O: function_cid = CID(wasm bytes)<br/>computed locally — the CID convention is public
   O->>N: RoutineDid { content_cid } — read-only,<br/>side-effect-free handshake
-  N->>N: derive keypair for (space, function_cid)<br/>inside the TEE
+  N->>N: derive keypair inside the TEE —<br/>get_key("tinycloud/compute-key/v1/" + ‹space›/compute/‹cid›)
   N-->>O: public routine_did — no secret exposed<br/>(re-run after a CVM redeploy = dstack-stability probe)
   O->>O: mint D_fn — delegatee = routine_did,<br/>caveat computeFunctionBinding { functionCid },<br/>caps = attenuated data grant (e.g. kv/get on inputs/)
   O->>N: /invoke — tinycloud.compute/deploy<br/>name + wasm binary + grant = D_fn
@@ -787,6 +803,17 @@ sequenceDiagram
     the node, re-entering <code>/invoke</code> under the routine's grant. The guest has no
     WASI network or filesystem; its imports are exactly the mediator surface.
   </p>
+  <p>
+    That closed surface enables the <strong>execution manifest</strong> (normative on this
+    backend): the mediator journals every host call —
+    <code>(resource, ability, bytes in/out, output destination)</code> — plus the
+    capabilities <em>granted</em> by <code>D_fn</code> versus those actually
+    <em>exercised</em>. With no unmediated egress, the manifest is <strong>ground
+    truth</strong>: nothing leaves except through a logged host call or the returned output.
+    Granted-but-unexercised capabilities are the deployer's concrete scope-down signal for
+    the next deploy. The manifest rides in the outcome metadata (and MAY additionally
+    persist to a KV audit path under the routine's own grant, opt-in via node config).
+  </p>
   <figure class="diagram">
     <div class="mermaid" data-diagram="fig-5-1"></div>
     <script type="text/mermaid" id="fig-5-1">
@@ -816,13 +843,16 @@ sequenceDiagram
     H->>K: kv/get
     K-->>H: bytes
     H-->>W: bytes
+    H->>H: journal the host call —<br/>(resource, ability, bytes in/out, destination)
   end
   W-->>N: output + evidence
+  H->>N: execution manifest — host-call journal +<br/>granted-vs-exercised capabilities<br/>(GROUND TRUTH here: no unmediated egress)
+  Note over N,H: manifest rides in the outcome metadata.<br/>Granted-but-unexercised caps = the deployer's<br/>scope-down signal for the next deploy.
   alt inline output
-    N-->>I: ComputeResult (inline bytes)
+    N-->>I: ComputeResult (inline bytes + manifest metadata)
   else output to KV path
     N->>K: kv/put ‹space›/kv/‹outputPath› under D_fn
-    N-->>I: ComputeResult { outputRef }
+    N-->>I: ComputeResult { outputRef } + manifest metadata
     Note over I,K: normal KV read delegations govern<br/>who may read the output
   end
     </script>
@@ -855,6 +885,17 @@ sequenceDiagram
     <code>D_fn</code> itself is the deployer's panic button, killing every live
     <code>D_worker</code> transitively.
   </p>
+  <p>
+    Egress is mediated too: routines deploy into a <strong>Workers for Platforms dispatch
+    namespace</strong> with an <strong>Outbound Worker</strong> interposed on all
+    <code>fetch()</code> from the routine — a default-deny allowlist whose sole default entry
+    is the node's callback endpoint, with the full egress log returned in the run evidence
+    (folded into the execution manifest, which on this backend is a lower bound raised
+    toward ground truth for <code>fetch</code>). Enabling it disables raw TCP
+    <code>connect()</code>; the known DO/mTLS <code>fetch</code> bypass is closed by
+    construction because the node authors the deploy and grants routines no DO/mTLS
+    bindings.
+  </p>
   <figure class="diagram">
     <div class="mermaid" data-diagram="fig-6-1"></div>
     <script type="text/mermaid" id="fig-6-1">
@@ -863,7 +904,8 @@ sequenceDiagram
   actor I as Invoker
   participant N as TinyCloud Node<br/>(data owner)
   participant A as Capability Engine
-  participant C as Cloudflare Worker<br/>(deployed backend)
+  participant C as Routine Worker<br/>(dispatch namespace)
+  participant OW as Outbound Worker<br/>(default-deny egress)
 
   I->>N: /invoke — tinycloud.compute/execute
   rect rgba(226, 161, 68, 0.08)
@@ -877,32 +919,44 @@ sequenceDiagram
   N->>C: run() — function/worker ref + input + D_worker
   Note over N,C: what crosses the boundary: script ref or bytes,<br/>input, the narrow revocable D_worker.<br/>NEVER the routine's private key or raw space data.
   rect rgba(69, 194, 168, 0.08)
-    C->>N: data callback — POST /invoke under D_worker<br/>(echoes the binding caveat, fresh nonce per callback)
+    Note over C,OW: ALL fetch() from the routine worker<br/>passes through the Outbound Worker
+    C->>OW: fetch(node callback) — POST /invoke under D_worker<br/>(echoes the binding caveat, fresh nonce per callback)
+    OW->>N: allowed — node callback is the sole default allowlist entry
     N->>A: LAYER 2 — validate against the attenuated chain<br/>(authorization stays at the data-owning node)
     A-->>N: ok — the Worker cannot exceed D_fn's data caps
-    N-->>C: data bytes
+    N-->>OW: data bytes
+    OW-->>C: data bytes
+    C->>OW: fetch(anywhere else) — exfiltration attempt
+    OW--xC: DENIED — default-deny allowlist. Every attempt logged.
   end
   C-->>N: output
+  OW-->>N: egress log — returned in run evidence,<br/>folded into the execution manifest
   N->>N: revoke D_worker on completion / timeout / error —<br/>the kill switch (TTL is only the crash backstop).<br/>Revoking D_fn = deployer panic button.
   N->>N: verify() = trust-the-deployment —<br/>result carries verification { mode: "trusted-deployment", backend: "cloudflare" }
   N-->>I: output inline or KV ref
-  Note over N,C: EGRESS: the Worker has unrestricted outbound fetch —<br/>anything readable under the grant is exfiltrable.<br/>Also NOT node-enforceable: maxMemory / maxDuration / CPU (§8)
+  Note over C,OW: Outbound Worker disables raw TCP connect().<br/>DO/mTLS fetch bypass: closed by construction —<br/>the node grants routines no DO/mTLS bindings.
+  Note over N,C: still NOT node-enforceable:<br/>maxMemory / maxDuration / CPU (§8) —<br/>and the trust anchor remains Cloudflare
     </script>
-    <figcaption><b>Fig. 6.1</b> — Remote execution, home authorization. The Worker holds a
-    token, not the data; every byte it reads is a capability-checked round-trip.</figcaption>
+    <figcaption><b>Fig. 6.1</b> — Remote execution, home authorization, mediated egress.
+    The Worker holds a token, not the data; every byte it reads is a capability-checked
+    round-trip, and every byte it sends passes the default-deny Outbound Worker.</figcaption>
   </figure>
   <div class="callout trust">
     <div class="t">Trust model, stated honestly</div>
     <p><strong>The headline caveat is data egress.</strong> The wasmtime backend has no
     exfiltration channel — no net, no fs, data flows only to the output or to
-    <code>D_fn</code>-granted KV paths. A Cloudflare Worker has <strong>unrestricted outbound
-    <code>fetch</code></strong>: a malicious or compromised function can ship everything its
-    grant lets it read to any endpoint, and the node can neither prevent nor detect it (the
-    input also transits and rests on Cloudflare infra). <em>Anything
-    <code>D_fn</code>/<code>D_worker</code> permits reading must be treated as disclosed to
-    the function author and to Cloudflare</em> — scope read grants to CF-backed functions
-    accordingly. This confidentiality asymmetry, not the resource-limit gap, is the decisive
-    fact when choosing backends.</p>
+    <code>D_fn</code>-granted KV paths. A <em>bare</em> Cloudflare Worker has unrestricted
+    outbound <code>fetch</code>, so without mitigation everything readable under the grant
+    must be treated as disclosed to the function author <em>and</em> to Cloudflare. With the
+    <strong>Outbound Worker</strong> in place (default-deny allowlist, node callback as the
+    sole default entry, raw TCP <code>connect()</code> disabled, DO/mTLS bypass closed by
+    construction), function-author exfiltration is CF-enforced away and the rule
+    <strong>softens — not disappears — to: <em>"disclosed to Cloudflare; the function author
+    is confined by the CF-enforced egress policy."</em></strong> Cloudflare runs the
+    interceptor and sees plaintext (the input also transits and rests on its infra). Scope
+    read grants on that basis; on the in-node wasmtime backend there is no such disclosure.
+    This confidentiality posture, not the resource-limit gap, is the decisive fact when
+    choosing backends.</p>
     <p><strong>Code identity is a bookkeeping claim, not content-addressed.</strong> On
     wasmtime the node hashes the bytes it is about to run; on CF the CID binds the grant to
     <em>what the node uploaded</em>, not <em>what runs</em> — anyone with Cloudflare account
@@ -957,10 +1011,11 @@ pub trait ExecutionBackend: Send + Sync {
         <td><b>CloudflareWorkerBackend</b></td>
         <td>A deployed Worker; node sends fn/worker ref + input + <code>D_worker</code>
             (worker-side ephemeral keypair per execution — never the routine key).</td>
-        <td class="no">Weakest — <strong>no egress control</strong> (unrestricted outbound
-            fetch: everything readable under the grant is exfiltrable), and
-            <code>maxMemory</code> / <code>maxDuration</code> / CPU not node-enforceable.
-            Data access still capability-checked at the node.</td>
+        <td class="no">Weakest — egress mediated only by the CF-side Outbound Worker
+            (default-deny, node callback only; disclosure softens to
+            "disclosed to Cloudflare"), and <code>maxMemory</code> /
+            <code>maxDuration</code> / CPU not node-enforceable. Data access still
+            capability-checked at the node.</td>
         <td>Trust-the-deployment; CF account creds join the TCB; result marked
             <code>verification: { mode: "trusted-deployment" }</code>.</td>
         <td><b>Initial</b></td>
@@ -1065,10 +1120,12 @@ pub struct ComputeCaveats {
       <tr>
         <td><b>Confidentiality / egress</b></td>
         <td class="yes">No exfiltration channel — data flows only to the output or to
-            <code>D_fn</code>-granted KV paths</td>
-        <td class="no"><strong>The decisive gap</strong> — unrestricted outbound
-            <code>fetch</code>; a read allowlist limits what is read, not where it then
-            goes. Everything readable is exfiltrable (§6)</td>
+            <code>D_fn</code>-granted KV paths; the execution manifest is ground truth</td>
+        <td class="no"><strong>The decisive posture</strong> — with the Outbound Worker
+            (default-deny, node-callback-only, egress logged) author exfiltration is
+            CF-enforced away, but the residual rule is <em>"disclosed to Cloudflare;
+            author confined by CF-enforced egress policy"</em>. Bare Worker: everything
+            readable is exfiltrable (§6)</td>
       </tr>
     </tbody>
   </table>
@@ -1284,6 +1341,29 @@ InvocationOutcome::<span class="k2">ComputeList</span>(serde_json::Value)    <sp
     Rungs 3 and 4 are documented plugs — the <code>Evidence</code> type and
     <code>verify()</code> hook exist for them, but no implementation ships in v1.
   </p>
+  <h3>Future directions <span class="pill dimp">noted, not built</span></h3>
+  <ul>
+    <li><strong>Container/VM backend via the iron-proxy pattern.</strong> A future
+      self-hosted container backend would front all egress with an iron-proxy-style
+      mediator: default-deny outbound allowlist, per-request audit log, and credential
+      brokering (the sandbox holds only a short-lived proxy token; the real secret is
+      injected at the proxy boundary, never inside the sandbox). That recovers wasmtime's
+      execution-manifest <em>ground-truth</em> property — every byte out passes a logged,
+      policy-gated boundary — without an in-process WASM sandbox. No container backend is
+      specced.</li>
+    <li><strong>ZK verification is two-phase when it lands.</strong> The prover cannot run
+      in a Worker (~128&nbsp;MB isolate; current Jolt wants GPU-class hardware; a
+      &lt;2&nbsp;GB streaming prover may fit CF Containers later). Realistic shape: execute
+      fast, return the output marked <code>unverified</code>, prove asynchronously, and let
+      <code>verify()</code> flip it to <code>verified</code> — the
+      <code>run → output+evidence → verify</code> interface already supports the split.
+      Wrinkle: Jolt proves RISC-V, not WASM, so a zk-verified function pins a RISC-V build
+      digest in the binding caveat <em>alongside</em> the WASM CID. ZK fixes integrity (F7)
+      fully in principle; it does <strong>not</strong> address confidentiality (F6) — a proof
+      that the right code ran says nothing about where the data went. Cheap interim
+      integrity for CF: deterministic wasmtime + random k% spot re-execution on the
+      node.</li>
+  </ul>
 </section>
 
 <!-- ================================================================ -->
@@ -1326,6 +1406,12 @@ InvocationOutcome::<span class="k2">ComputeList</span>(serde_json::Value)    <sp
       echoed one succeeds. Invoker-side echo likewise.</li>
     <li>Cross-space isolation: identical WASM in spaces A and B yields distinct routine
       DIDs; a B execution cannot cite A's <code>D_fn</code>.</li>
+    <li>Space-name validation (precondition): a space name containing a URI delimiter
+      (<code>/ : # ?</code>) is rejected — or the space component is hashed — so no two
+      distinct spaces can produce the same derivation string.</li>
+    <li>Execution manifest: a run's returned manifest lists every host call and the
+      granted-vs-exercised sets; an untouched granted capability shows as
+      granted-but-unexercised (the scope-down signal).</li>
     <li>Deploy atomicity: a failed <code>D_fn</code> leaves no artifact row and no quota
       entry, and vice versa.</li>
     <li>Quota: deploy increments <code>store_size</code>; an over-quota deploy fails.</li>
