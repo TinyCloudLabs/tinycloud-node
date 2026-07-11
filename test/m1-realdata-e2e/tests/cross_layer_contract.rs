@@ -1,6 +1,9 @@
 use std::{
     collections::BTreeMap,
     convert::TryInto,
+    fs,
+    path::Path,
+    process::Command,
     sync::{Arc, Mutex},
 };
 
@@ -75,6 +78,7 @@ const UNTRUSTED_FIXTURE: &str =
     include_str!("../vendor/launch-credential-denials/untrusted-issuer-did.json");
 const DENIAL_MATRIX: &str =
     include_str!("../vendor/policy-engine-conformance/denial-matrix-v0.json");
+const GRANT_OUTPUT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/vendor/grant-output");
 
 #[derive(Clone)]
 struct NodeGrantIssuer {
@@ -1194,6 +1198,164 @@ fn fixture_verification_time(source: &str) -> Result<DateTime<Utc>> {
         .as_i64()
         .context("fixture verificationOptions.now integer timestamp")?;
     DateTime::from_timestamp(timestamp, 0).context("fixture verificationOptions.now timestamp")
+}
+
+#[tokio::test]
+async fn grant_output_live_material_traverses_real_delegate_route() -> Result<()> {
+    let generated = TempDir::new()?;
+    let instant = Utc::now().timestamp();
+    let status = Command::new("python3")
+        .arg(Path::new(GRANT_OUTPUT_DIR).join("generate.py"))
+        .arg("--at-instant")
+        .arg(instant.to_string())
+        .arg("--output-dir")
+        .arg(generated.path())
+        .status()?;
+    anyhow::ensure!(status.success(), "pinned grant generator failed");
+    let accept: Value =
+        serde_json::from_str(&fs::read_to_string(generated.path().join("accept.json"))?)?;
+
+    let tempdir = TempDir::new()?;
+    let datadir = tempdir.path().join("data");
+    let db_url = format!("sqlite:{}", datadir.join("caps.db").display());
+    let secret = URL_SAFE_NO_PAD.encode([31u8; 32]);
+    let overlay = format!(
+        r#"
+[storage]
+datadir = "{}"
+
+[keys]
+type = "Static"
+secret = "{}"
+"#,
+        datadir.display(),
+        secret
+    );
+    let figment = rocket::Config::figment()
+        .merge(Serialized::defaults(tinycloud::config::Config::default()))
+        .merge(Toml::string(&overlay));
+    let rocket = tinycloud::app(&figment).await?;
+    let conn = Database::connect(ConnectOptions::new(db_url)).await?;
+    let owner_did = accept["parentFormatVector"]["issuer"]
+        .as_str()
+        .context("parent issuer")?;
+    let space_id = SpaceId::new(owner_did.parse::<DIDBuf>()?, SPACE_NAME.parse()?);
+    space::ActiveModel {
+        id: Set(SpaceIdWrap(space_id)),
+    }
+    .insert(&conn)
+    .await?;
+    let client = Client::tracked(rocket).await?;
+
+    let mut parent = accept["parentFormatVector"]["dagCborBase64Url"]
+        .as_str()
+        .context("parent bytes")?
+        .to_string();
+    while parent.len() % 4 != 0 {
+        parent.push('=');
+    }
+    let parent_response = client
+        .post("/delegate")
+        .header(Header::new("Authorization", parent))
+        .dispatch()
+        .await;
+    let parent_status = parent_response.status();
+    let parent_body = parent_response.into_string().await.unwrap_or_default();
+    assert_eq!(parent_status, Status::Ok, "parent import: {parent_body}");
+    let parent_json: Value = serde_json::from_str(&parent_body)?;
+    assert_eq!(
+        parent_json["cid"], accept["parentFormatVector"]["expectedCid"],
+        "the real node must derive the frozen parent-format CID"
+    );
+
+    let grant = accept["cases"][0]["ucan"]["encoded"]
+        .as_str()
+        .context("generated accept UCAN")?
+        .to_string();
+    let grant_response = client
+        .post("/delegate")
+        .header(Header::new("Authorization", grant))
+        .dispatch()
+        .await;
+    let grant_status = grant_response.status();
+    let grant_body = grant_response.into_string().await.unwrap_or_default();
+    assert_eq!(grant_status, Status::Ok, "grant import: {grant_body}");
+    let grant_json: Value = serde_json::from_str(&grant_body)?;
+    assert_eq!(
+        grant_json["cid"],
+        accept["cases"][0]["ucan"]["delegationId"]
+    );
+    assert_eq!(delegation::Entity::find().count(&conn).await?, 2);
+
+    let rejects: Value = serde_json::from_str(&fs::read_to_string(
+        generated.path().join("node-import-reject.json"),
+    )?)?;
+    for (case_name, expected_text) in [
+        ("invalid-signature", "Failed to verify signature"),
+        ("missing-persisted-parent", "Cannot find parent delegation"),
+        (
+            "parent-time-nesting-violation",
+            "Child delegation expiry exceeds parent expiry",
+        ),
+        (
+            "resource-or-ability-containment-failure",
+            "Unauthorized Capability",
+        ),
+    ] {
+        let case = rejects["cases"]
+            .as_array()
+            .context("node import cases")?
+            .iter()
+            .find(|case| case["case"] == case_name)
+            .with_context(|| format!("missing generated case {case_name}"))?;
+        let encoded = case["ucan"]["encoded"]
+            .as_str()
+            .context("reject UCAN")?
+            .to_string();
+        let response = client
+            .post("/delegate")
+            .header(Header::new("Authorization", encoded))
+            .dispatch()
+            .await;
+        let observed_status = response.status();
+        let observed_body = response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            observed_status,
+            Status::Unauthorized,
+            "{case_name}: {observed_body}"
+        );
+        assert!(
+            observed_body.contains(expected_text),
+            "{case_name} intended {expected_text}, observed {observed_body}"
+        );
+        if case_name != "invalid-signature" {
+            assert!(
+                !observed_body.contains("expired or not yet valid"),
+                "{case_name} was accidentally masked by ambient time: {observed_body}"
+            );
+        }
+    }
+
+    let frozen_accept: Value = serde_json::from_str(&fs::read_to_string(
+        Path::new(GRANT_OUTPUT_DIR).join("accept.json"),
+    )?)?;
+    let frozen_encoded = frozen_accept["cases"][0]["ucan"]["encoded"]
+        .as_str()
+        .context("frozen ACCEPT UCAN")?
+        .to_string();
+    let expired = client
+        .post("/delegate")
+        .header(Header::new("Authorization", frozen_encoded))
+        .dispatch()
+        .await;
+    let expired_status = expired.status();
+    let expired_body = expired.into_string().await.unwrap_or_default();
+    assert_eq!(expired_status, Status::Unauthorized);
+    assert!(
+        expired_body.contains("expired or not yet valid"),
+        "LONGEVITY OBSERVATION: frozen ACCEPT should now be natively time-invalid: {expired_body}"
+    );
+    Ok(())
 }
 
 #[test]
