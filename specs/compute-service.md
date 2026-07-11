@@ -95,6 +95,17 @@ precedent). Concretely:
   session may hold `compute/execute` (and `compute/list`) but not
   `compute/deploy`; deploying executable code requires an explicitly elevated
   grant, exactly as issuing DDL requires `sql/schema`.
+- **F9 (MUST) — the SDK standard session grant must enumerate `compute/execute` +
+  `compute/list`, and NEVER `compute/*`.** This is not automatic. Once the
+  compute concretes flip to `active`, the codegen validator
+  (`gen-capabilities.mjs:105-118`) *forces* `compute/*` to imply **every** active
+  concrete — including `deploy`. So "standard sessions exclude deploy" is only
+  real if the standard session grant also excludes the wildcard. The live
+  precedent cuts the *wrong* way here: `sql/*` and `duckdb/*` ARE in today's SDK
+  root delegation grant (`capabilities.json:69,107` → `TinyCloudNode.ts`
+  ~2272/2279). If compute copies that habit, every browser session silently gets
+  deploy rights. The SDK MUST list the two specific execute/list URNs, not the
+  wildcard.
 - **No `compute/admin` is introduced yet.** A future `compute/admin` would be
   added only once there is a genuinely admin-only surface (e.g. function
   deletion, backend configuration); at that point it would `implies`
@@ -224,11 +235,23 @@ Properties inherited from `SeaOrmDatabaseArtifactRepository::save`
   0x55).to_string()`. Re-deploying identical bytes yields the same CID; the
   `(service, space, name)` row's `revision` bumps and `content_hash` is stable
   if the bytes are unchanged, or changes when the bytes change.
-- **Named + versioned.** Keyed on `(service, space, name)` with an incrementing
-  `revision`; `created_at` is preserved across updates, `updated_at` refreshed.
-- **Size accounting.** `size_bytes` is recorded and folds into the space's
-  `store_size` (so deploy is subject to the same quota pre-check as sql/duckdb
-  writes — see §10).
+- **Named + versioned (revision counter, not KV-like history).** Keyed on
+  `(service, space, name)` with an incrementing `revision`; `created_at` is
+  preserved across updates, `updated_at` refreshed. **`save` *replaces* the
+  payload in the single `(service, space, name)` row**
+  (`database_artifacts.rs:100-135`) — `revision` counts, but prior payloads are
+  NOT retained and are not executable. So the `content_cid` pin in §7.2 guards
+  against a re-deploy *race*, not rollback: pinning a superseded CID fails by
+  design (the old bytes are gone). Do not model this as KV-style version history.
+- **Size accounting — F8: NOT automatic; the deploy path MUST update `SqlSizes`.**
+  `DatabaseArtifactRepository::save` records `size_bytes` on the row only. The
+  space's `store_size` (`db.rs:446-452`) sums block bytes **plus the `SqlSizes`
+  registry**, and `SqlSizes` entries are written by the *services*
+  (`sql_sizes.update(service, space, name, size)`), not by the artifact repo. The
+  compute deploy path therefore MUST call `sql_sizes.update("compute", space,
+  name, size)` after a successful save, or **deploys silently bypass the storage
+  quota**. Deploy is a write-class request and is gated by the same
+  `staged_batch_remaining` pre-check the sql/duckdb write paths use (§10.1).
 
 **Whitepaper alignment.** `appendix/appendix-j.md:114-116` lists the function
 types (WASM now, ZK VM future); `appendix/appendix-i.md:299-301` specifies
@@ -242,10 +265,51 @@ Alongside the artifact, deploy records the **routine data grant binding**:
 binding is a **self-describing caveat on `D_fn`** naming the `function_cid` —
 `{ "computeFunctionBinding": { "functionCid": "<function_cid>" } }` — NOT an
 internal node-side table. `D_fn` is an ordinary delegation event, so its caveat
-is persisted and replayable through the normal delegation path; the execute path
-locates the correct `D_fn` for a loaded artifact by matching that caveat's
-`functionCid` against the artifact's `content_hash`. Rationale and the way this
-composes with the derived-key identity are in §6.2.
+is persisted and replayable through the normal delegation path. Rationale and the
+way this composes with the derived-key identity are in §6.2.
+
+**Caveat encoding (pin the shape).** `Caveats` is a `BTreeMap<String,
+serde_json::Value>` and the containment engine compares raw maps, so the exact
+shape is load-bearing (byte-equality in the echo rule of §6.2/F1 means key drift
+fails closed). The `computeFunctionBinding` object is carried under a positional
+map key exactly as the SQL caveat precedent uses (`"0"`), and it is attached to
+**every capability row** of `D_fn` (caveats persist per ability —
+`delegation.rs:466-476` — not per delegation).
+
+**F4 — `D_fn` rides the standard delegation path, atomically with the artifact
+save.** The deploy handler MUST process `D_fn` through the same
+verification/persistence path `/delegate` uses (signature check, delegation-side
+containment against the deployer's chain, per-ability caveat persistence —
+`delegation.rs:275-327, 466-476`), NOT store it as opaque bytes. This is
+required because the execute-time chain walk loads parents from the `delegation`
+table by CID (`invocation.rs:160-169`); an unverified/unpersisted `D_fn` breaks
+execute or defers the failure to the first host call. The artifact save
+(`DatabaseArtifactRepository::save` **+ the `SqlSizes` update** of §5's F8 note)
+and `D_fn` processing MUST succeed or fail **together, in one transaction** — a
+partial deploy yields either a function with no grant (every execution fails) or
+a live grant for an artifact that never landed.
+
+**Selecting `D_fn` at execute time — F3 (space scope) + F5 (cite-all).** The
+mediator resolves `D_fn` by `(space, functionCid)` where `space` is the space of
+the outer `compute/execute` invocation — NOT by `functionCid` alone. It MUST
+also verify every capability resource in the selected `D_fn` lives in that space
+before citing it. (Identical WASM deployed in two spaces shares one CID; matching
+on CID alone is a cross-space confused deputy — see §6.2/F3, which additionally
+hardens the derivation path so this is cryptographically impossible.) When more
+than one valid `D_fn` matches (a re-mint after key rotation, two deployers, a
+re-grant with wider caps), the mediator **cites all matching valid `D_fn`s as
+parents** — an invocation's `parents` is already a `Vec`, and `validate()`
+authorizes each capability if *any* parent supports it
+(`invocation.rs:226-236`). Cite-all degrades gracefully when an older grant is
+revoked mid-life.
+
+**Re-deploy hygiene.** A re-deploy with new bytes yields a new CID → a new
+`routine_did` → the old `D_fn` is dormant (the old bytes are gone, §5, so the old
+routine key is never derived again), but it remains a live-looking delegation
+row. The deploy path SHOULD **revoke the superseded `D_fn`** on re-deploy so the
+event graph does not accumulate live grants to identities that can no longer act.
+Re-mint (recovering from a dstack seed rotation, §6.2/F1.5) is cheap by design:
+deploy the identical bytes with a fresh `grant`, no artifact change.
 
 ---
 
@@ -285,18 +349,31 @@ under a grant **it owns**, minted at deploy time and bound to its content CID �
 so the invoker never needs (and never gains) data permissions.
 
 **Routine execution identity.** The function executes under a routine DID
-derived by the node from the function CID:
+derived by the node from **both the space and the function CID**:
 
 ```
-routine_did = did:key( get_key("tinycloud/compute/" + function_cid) )
+routine_did = did:key( get_key("tinycloud/compute/" + space + "/" + function_cid) )
 ```
 
 using the existing dstack hierarchical key derivation (`dstack::get_key`,
 `dstack.rs:110-119`). The private key is derived inside the TEE and never
-leaves it, so **only this node, running this exact function CID, can act as the
-routine.** (Non-TEE / classic mode: the same derivation runs off the node's
-static key material via `keys.rs`; the trust statement weakens to "the node" —
-see §9.3.)
+leaves it, so **only this node, running this exact function CID in this exact
+space, can act as the routine.** (Non-TEE / classic mode: the same derivation
+runs off the node's static key material via `keys.rs`; the trust statement
+weakens to "the node" — see §9.3.)
+
+**F3 — the `space` segment is mandatory, not cosmetic.** Deriving from the CID
+*alone* would give identical WASM deployed in space A and space B one shared
+`routine_did`, opening a **cross-space confused deputy**: a space-B execution
+could cite space A's `D_fn` (same delegatee, valid chain rooted in A's owner) and
+read/write space A's data for a space-B invoker who holds nothing on A. Putting
+`space` in the derivation path makes the routine identity per-`(space, function)`,
+so cross-space citation is **cryptographically impossible** rather than merely
+policy-blocked — which aligns with the strict-verifiability principle
+(cryptographically-impossible beats policy-checked) and preserves the D1 choice
+(still TEE-derived, still no secret at rest). This is defense-in-depth *with* the
+normative `(space, functionCid)` selection rule of §5.1 — both layers ship. CID
+strings are base32 (no `/`), so the path is injection-safe.
 
 **DECIDED (D1): routine identity is this deterministic TEE-derived key.** It
 needs no secret at rest and binds data access to both the function and the node.
@@ -328,10 +405,36 @@ needs no secret at rest and binds data access to both the function and the node.
   delegation is for (see below)
 - signed by the deployer, extending the deployer's own chain to the space owner
 
-Because the CID is a pure function of the WASM bytes, the deployer can compute
-`function_cid` (and therefore `routine_did`, given the node's derivation
-convention exposed by the SDK) **before** deploy — no chicken-and-egg. `D_fn`
-travels in the deploy request (§5.1).
+**F2 — the deployer obtains `routine_did` via a handshake, NOT client-side math.**
+`get_key(...)` derives from the node's TEE-internal (or `keys.rs`) secret seed;
+the public `routine_did` is **not** computable client-side from the CID (if it
+were, the private key would be too and the scheme would be broken). Knowing the
+derivation *convention* gives the deployer nothing. There is no chicken-and-egg —
+the fix is a read-only handshake:
+
+```
+1. Client hashes the WASM locally → function_cid (the CID convention is public).
+2. Client asks the node for the routine identity — a read-only, side-effect-free
+   request `ComputeRequest::RoutineDid { content_cid }` (§7.2). The node derives
+   the keypair for (space, content_cid) and returns the PUBLIC routine_did. No
+   secret is exposed.
+3. Client mints D_fn (delegatee = returned routine_did, binding caveat,
+   attenuated data caps) and submits deploy(wasm, D_fn).
+```
+
+This handshake **doubles as the dstack-stability probe** (the boxed note above):
+the same "derive and return" operation is exactly what you re-run after a CVM
+redeploy to check `routine_did` is unchanged. `D_fn` then travels in the deploy
+request (§5.1).
+
+**F1.5 — compare-on-execute tripwire.** The deploy ack returns the expected
+`routine_did` (already implied by `D_fn.delegatee`) and the SDK records it.
+Before running a function, the node **re-derives** the key for
+`(space, artifact CID)` and compares against `D_fn.delegatee`. On mismatch it
+fails with a *distinct* error code `routine-identity-rotated` (mapped to 409 or
+503 — NOT a generic 403), telling the deployer to re-mint `D_fn`. Without this, a
+dstack seed rotation surfaces as `UnauthorizedInvoker` deep inside a host call,
+indistinguishable from a bug.
 
 **DECIDED (D2): the `function_cid → D_fn` binding is a self-describing caveat on
 `D_fn`, NOT an internal node-side table.** The binding is expressed as a caveat
@@ -371,12 +474,46 @@ artifact.
    (§8).
 ```
 
-Nothing new is required in the authorization engine. `validate()` already
-enforces (i) `delegatee`-match via `did_principal_matches` (the routine's
-internal invocations are matched against `D_fn.delegatee == routine_did`), and
-(ii) chain containment against the persisted delegation. The only new code is
-the **host mediator** that mints and submits the routine's internal invocations,
-and the deploy-time binding store.
+No new *authorization-engine* code is required — `validate()` already enforces
+(i) `delegatee`-match via `did_principal_matches` (the routine's internal
+invocations are matched against `D_fn.delegatee == routine_did`), and (ii) chain
+containment against the persisted delegation. The new code is the **host
+mediator** that mints and submits the routine's internal invocations (and the
+deploy-time processing of §5.1). But the mediator carries a non-obvious, MUST-DO
+obligation that the "step 4" flow above hides:
+
+**F1 (MUST) — the caveat-echo obligation.** Once `D_fn` carries the
+`computeFunctionBinding` caveat (§6.2/D2), its ability rows have a non-empty,
+non-SQL caveat map. The invocation-path containment helper
+`caveats_contain_child` (`invocation.rs:271-289`) has exactly three outcomes for
+a non-SQL parent caveat: pass if the parent map is empty, pass if
+`parent.0 == child.0` (byte-equal JSON maps), otherwise **reject** with
+`invocation-caveats-not-subset-of-chain`. Therefore **every internal invocation
+the host mediator mints MUST echo `D_fn`'s caveat map verbatim on each
+capability**, or every `storage.get`/`storage.put`/`sql.query` host call fails
+closed on its first use. A mediator that mints caveat-less internal invocations
+(the natural reading of step 4) ships a service where every function fails on its
+first data access. The echo propagates down the Cloudflare chain (§9.2):
+`D_worker` is a child of `D_fn` and — under the same equality rule on the
+*delegation* side (`delegation.rs:336-364`) — must echo the binding caveat, and
+the Worker's callback invocations must echo it again. Consequence to record:
+because the rule is byte-equality (only resources/abilities narrow via
+`extends`), `D_worker` **cannot attenuate the caveat map**; that is acceptable
+(the binding caveat is metadata, not a constraint) but forecloses worker-specific
+restrictions in that map without touching the W1-hardened helper. See §13 for the
+matching test obligation.
+
+**F1.8 — caveated deployers (document the practical rule).** Delegation-side
+containment applies the same equality rule at *mint* time: if the deployer's own
+ability rows carry a **non-SQL** caveat, adding `computeFunctionBinding` breaks
+byte-equality and the `D_fn` mint is rejected (`child-caveats-not-subset-of-
+parent`). If the deployer's authority carries an *SQL* constrained-statements
+caveat, the `(Some, Some)` arm checks only SQL containment and ignores extra keys,
+so the binding caveat rides along. Net rule: **the deployer of record should hold
+caveat-free (or SQL-caveat-only) data authority.** Space owners — the expected
+deployers — always qualify via the root-authority short-circuit
+(`invocation.rs:344-362`). This is pre-existing W1 helper behavior, not a compute
+defect, but §6.2 states it so deployers are not surprised.
 
 **Why a derived-key *identity* over a caveat-scoped self-delegation.** This is a
 distinct question from the D2 binding caveat above. An alternative *identity*
@@ -402,6 +539,15 @@ fallback), the enforced `ComputeCaveats` (§7) — especially the `functions`
 allowlist — MUST be read from the validated chain, not trusted from the
 invoker's own invocation facts. An invoker cannot widen or drop the function
 allowlist by editing the invocation envelope.
+
+**Invoker-side caveat echo (F1 bites layer (a) too).** The same byte-equality
+containment rule means an invoker whose `compute/execute` delegation carries a
+non-SQL `ComputeCaveats` map MUST echo that map verbatim on the invocation
+capability, or `validate()` rejects the invocation before the handler ever runs
+(`invocation.rs:271-289`). The SDK's compute-invoke helper therefore has to copy
+the chain caveats onto the invocation — the same pattern the SQL
+constrained-statements flow already uses. Land this in the same SDK changeset so
+layer-(a) requests under a caveated grant do not fail closed.
 
 ---
 
@@ -485,9 +631,19 @@ pub enum ComputeRequest {
         /// (under the routine grant) instead of returned inline (§8).
         output_ref: Option<String>,
     },
+    /// Read-only: return the PUBLIC routine DID the node would derive for this
+    /// (space, content_cid). No side effects, no secret exposure. This is the
+    /// F2 handshake step (§6.2): the client needs it to set D_fn.delegatee
+    /// before deploy, and re-running it after a CVM redeploy is the
+    /// dstack-stability probe.
+    RoutineDid {
+        content_cid: String,
+    },
     /// Register / upload a new function version. The WASM binary rides as the
     /// request body when large; `wasm_b64` is accepted for small inline
-    /// deploys. `grant` carries the deploy-time delegation D_fn (§6.2).
+    /// deploys. `grant` carries the deploy-time delegation D_fn (§6.2), which
+    /// the handler processes through the standard /delegate path atomically
+    /// with the artifact save (§5.1/F4).
     Deploy {
         function: String,
         wasm_b64: Option<String>,
@@ -582,10 +738,18 @@ The outer `compute/execute` invocation passes through
 (`routes/mod.rs:714`) like every other invocation — a replayed *outer*
 invocation envelope is rejected as a duplicate. The routine's **internal**
 invocations (§6.2 step 4) are freshly minted per execution (fresh nonce), so
-they do not collide in the replay cache across repeated executions of the same
-function. This means "execute the same function twice" is allowed (two distinct
-outer envelopes, two distinct routine invocation sets); it is *not* an
-accidental replay.
+they do not collide across repeated executions of the same function. This means
+"execute the same function twice" is allowed (two distinct outer envelopes, two
+distinct routine invocation sets); it is *not* an accidental replay.
+
+**Entry point (precision).** The route-level replay cache guards
+`POST /invoke` only (`routes/mod.rs:714`). The mediator's internal invocations
+MUST enter through core `process()` (`invocation.rs:105-118`), **not** through
+the HTTP route — so they never touch the route replay cache at all (their
+fresh-nonce uniqueness is what prevents collisions). State this so no one
+"helpfully" routes internal invocations back through the HTTP path, which would
+subject them to the outer replay cache and CORS/auth guards they neither need nor
+should re-trigger.
 
 ---
 
@@ -645,13 +809,36 @@ pub trait ExecutionBackend: Send + Sync {
   orchestrator: it sends the function (or a pre-deployed Worker reference) and
   the input to the Worker, and the Worker returns the output.
 - **What is sent:** the WASM/Worker script reference or bytes, the input
-  payload, and a **scoped, short-lived credential** the Worker uses to call back
-  into the node's `/invoke` for the routine's data access. That callback
-  credential is a delegation whose delegatee is the Worker's identity, attenuated
-  to `D_fn`'s grant (the Worker cannot exceed the routine's data caps because
-  the node validates its callbacks through the normal chain check). The private
-  routine key is **not** shipped to the Worker; the Worker holds only a
-  narrower, revocable callback delegation.
+  payload, and a **scoped, short-lived credential** (`D_worker`) the Worker uses
+  to call back into the node's `/invoke` for the routine's data access.
+  `D_worker` is a delegation whose delegatee is the Worker's identity, a child of
+  `D_fn` attenuated (in resource/ability only) to the routine's data caps — the
+  Worker cannot exceed them because the node validates its callbacks through the
+  normal chain check. The private routine key is **not** shipped to the Worker.
+  Per F1, `D_worker` and the Worker's callback invocations MUST echo `D_fn`'s
+  `computeFunctionBinding` caveat verbatim (the byte-equality containment rule
+  applies on both the delegation and invocation sides), so the caveat map cannot
+  be attenuated — only resources/abilities narrow.
+- **Callback credential mechanics (`D_worker`).** The Worker identity is a
+  **fresh ephemeral keypair per execution — never reused** (reuse turns a leaked
+  key into a standing capability). **The keypair is generated worker-side**: the
+  Worker generates it at start and returns its public key, then the node mints
+  `D_worker` for that pubkey — so the private key never transits Cloudflare (one
+  extra round-trip, chosen over node-side generation precisely to keep the key
+  off the wire). **TTL:** `exp = now + effective_maxDuration + slack`, slack for
+  dispatch/queue jitter, e.g. `min(2 × maxDuration, cloudflare.callback_ttl_max)`
+  with a config ceiling like `120s`; `D_fn`'s own expiry naturally caps it (a
+  child cannot outlive its parent — `delegation.rs:230-270` filters parents by
+  the expiry / not-before window). **Revocation:** the node records the
+  `D_worker` CID in the execution context and issues a standard revocation on
+  completion, timeout, or error. Because `validate()` walks revocations *per
+  invocation* with no chain-ok caching (`invocation.rs:180-198`), a mid-flight
+  revocation cuts a misbehaving Worker off at its next callback — this is the
+  real kill switch; the TTL is only the backstop for a node that crashes before
+  revoking. Revoking `D_fn` itself kills every live `D_worker` transitively via
+  `first_revoked_ancestor` — the **deployer panic button**, effective even while
+  an execution is in flight. Callbacks are ordinary `/invoke` requests, so the
+  route replay cache rejects envelope replays; fresh nonces per callback.
 - **What is returned:** the function output (JSON or bytes).
 - **`verify` = trust-the-deployment.** There is no cryptographic execution proof
   from a stock Cloudflare Worker. The trust model is: you trust Cloudflare's
@@ -659,6 +846,29 @@ pub trait ExecutionBackend: Send + Sync {
   node↔Worker transport. This is strictly weaker than the in-node TEE backend
   and MUST be surfaced to callers (a `verification: { mode: "trusted-deployment",
   backend: "cloudflare" }` field on the result).
+- **F7 — code identity on CF is a bookkeeping claim, not content-addressed.** On
+  wasmtime, code identity is checked at the moment of use (the node hashes the
+  bytes it is about to run; the grant follows the hash). On CF the node deploys a
+  script once and thereafter trusts that the Worker at route R still corresponds
+  to `function_cid` — anyone with Cloudflare account access (**including
+  Cloudflare**) can swap the script behind R while `D_worker` is valid, and the
+  swapped code inherits the callback credential. So on CF the CID binds the grant
+  to *what the node uploaded*, not to *what runs*, and **the Cloudflare account
+  credentials join the TCB**. `verification: { mode: "trusted-deployment" }` is
+  documented as carrying exactly this meaning.
+- **F6 — egress: confidentiality is unprotectable on CF (MUST surface).** The
+  wasmtime backend's strongest property is that it has *no exfiltration channel*:
+  the guest has no net/fs, only mediated host imports (§9.1), so data the routine
+  reads can flow only to (a) the function output or (b) KV paths under `D_fn`'s
+  `kv/put`. On Cloudflare the Worker has **unrestricted outbound `fetch`**: a
+  malicious or compromised function can ship everything its grant lets it read to
+  any endpoint on the internet, and the node can neither prevent nor detect it
+  (the input payload additionally transits and rests on Cloudflare infra).
+  **Therefore anything `D_fn`/`D_worker` permits reading must be treated as
+  disclosed to the function author and to Cloudflare; grant read scopes to
+  CF-backed functions accordingly.** This confidentiality asymmetry — not the
+  resource-limit gap of §10.2 — is the single most decision-relevant fact when
+  choosing between backends. See also §10.2.
 
 ### 9.3 Future verifiers (documented plugs, NOT built)
 
@@ -734,6 +944,14 @@ sandbox, so the caveat enforcement story is materially weaker:
   model (§9.2) is trust-the-deployment: callers who need enforced resource
   bounds must use the in-node WasmtimeBackend. This limitation MUST be stated in
   the result's `verification` block and in the node config docs.
+- **Confidentiality / egress — NOT enforceable by us (the decisive gap).** Even
+  more important than the resource-limit concession above: the CF Worker has
+  unrestricted outbound `fetch`, so the CF backend **cannot constrain data
+  egress**. Anything `D_fn`/`D_worker` permits reading must be treated as
+  disclosed to the function author and to Cloudflare (§9.2/F6). A caveat like a
+  read allowlist limits *what the routine may read*, but on CF it does **not**
+  limit *where that data then goes*. Scope read grants to CF-backed functions on
+  the assumption that everything readable is exfiltrable.
 
 ---
 
@@ -833,14 +1051,31 @@ account_id = "…"
 
 ### 12.2 Still open
 
-- **Cloudflare callback credential lifetime & revocation.** The short-lived
-  callback delegation shipped to the Worker (§9.2) needs a concrete TTL and a
-  revocation story if a Worker misbehaves mid-execution.
-- **Result cache.** Whether to offer an opt-in `(content_cid, input_hash)`
-  result cache (§8.1) for pure functions, and how a function declares itself
-  pure.
-- **Binary inline outputs.** Whether to add a `ComputeBytes` outcome variant +
-  octet-stream responder now or defer until there is a concrete consumer (§7.3).
+- **Cloudflare callback credential lifetime & revocation — PROPOSAL RECORDED
+  (§9.2).** No longer fully open: §9.2 now specifies a fresh worker-side
+  ephemeral keypair per execution (key never transits), TTL = `maxDuration +
+  slack` under a `cloudflare.callback_ttl_max` ceiling (capped by `D_fn`'s
+  expiry), per-invocation revocation on completion/timeout/error as the kill
+  switch, and `D_fn` revocation as the deployer panic button. Remaining open bit:
+  the exact slack multiplier / ceiling default, to tune against real CF dispatch
+  jitter.
+- **Result cache — DEFER; structural gate criterion recorded.** A
+  `(content_cid, input_hash)` cache is only sound when the output depends on
+  nothing else. "The function declares itself pure" is the WRONG gate
+  (declarations lie). The *structural, checkable* gate is: cacheable **iff**
+  `D_fn` grants no read capability (or is absent) **and** the request has no
+  `input_refs` — then the WASM had nothing to read but `input`, and wasmtime is
+  deterministic for it (enable NaN canonicalization; use **fuel** — not epoch
+  deadlines, which are wall-clock-dependent — as the determinism-relevant budget,
+  so only *successful* results are cacheable). Anything that reads KV is a
+  function of mutable state; a correct key would need the read-set version vector.
+  No consumer today → out.
+- **Binary inline outputs — DEFER.** The KV output path (§8 option 2) already
+  handles binary results, and the `SqlExport`/`DuckDbExport` octet-stream
+  responder precedent (`auth_guards.rs:125-133`) makes a later `ComputeBytes`
+  variant mechanical. Base64-in-JSON inflation (~33%) under the 413 ceiling is
+  tolerable for small blobs; no consumer demands inline binary today. Revisit the
+  moment a consumer inlines >1 MB binaries (double-paying base64 + JSON parse).
 - **Multi-node execution.** Confirmed OUT of scope here; the escalation path is
   the orchestration layer (Smithers). Flagged so a reviewer does not expect it.
 
@@ -855,12 +1090,46 @@ steps are:
    drift-guard green.
 2. `ComputeService`, `ExecutionBackend` trait, `WasmtimeBackend`, `HostMediator`
    in a new `tinycloud-core/src/compute/` module (feature `compute`).
-3. Deploy path: artifact save (service tag `compute`) + `D_fn` binding store.
-4. Execute path: routine-key derivation, backend `run`, host-mediated internal
-   invocations, output inline/KV.
-5. `InvocationOutcome::ComputeResult`/`ComputeList` + Responder arms +
+   Routine-key derivation keyed on **`(space, function_cid)`** (§6.2/F3).
+3. `RoutineDid` handshake action (§7.2/F2) — read-only derive-and-return of the
+   public `routine_did`; also the dstack-stability probe (§6.2/F1.5).
+4. Deploy path: process `D_fn` through the standard `/delegate`
+   verification/persistence path **atomically** with the artifact save **and the
+   `SqlSizes` update** (one transaction — §5.1/F4, §5/F8); revoke a superseded
+   `D_fn` on re-deploy (§5.1).
+5. Execute path: re-derive routine key + compare-on-execute tripwire
+   (`routine-identity-rotated`, §6.2/F1.5); space-scoped cite-all `D_fn`
+   selection (§5.1/F3/F5); backend `run` with the **host mediator echoing
+   `D_fn`'s caveat map verbatim** on every internal invocation (§6.2/F1);
+   internal invocations enter via core `process()`, not the HTTP route (§8.2);
+   output inline/KV.
+6. `InvocationOutcome::ComputeResult`/`ComputeList` + Responder arms +
    `handle_compute_invoke` dispatch branch + 501 gate + `/version` feature.
-6. Flip registry entries to `active`, add wildcard `implies`, extend
-   `canonical_decisions_are_locked`.
-7. CloudflareWorkerBackend + callback-delegation minting.
-8. (Later) TEE-quote verifier binding `report_data` to execution; ZK-VM backend.
+7. Flip registry entries to `active`, add wildcard `implies`, extend
+   `canonical_decisions_are_locked`. **SDK: enumerate `compute/execute` +
+   `compute/list` in the standard session grant — NEVER `compute/*`** (§3/F9).
+8. CloudflareWorkerBackend + callback-delegation (`D_worker`) minting with the
+   worker-side ephemeral keypair, TTL, and revocation of §9.2 (echoing the
+   binding caveat down the chain, §6.2/F1).
+9. (Later) TEE-quote verifier binding `report_data` to execution; ZK-VM backend.
+
+### 13.1 Test obligations (from the fable review)
+
+- **F1 caveat-echo (integration):** a routine host call whose internal
+  invocation does NOT echo `D_fn`'s `computeFunctionBinding` caveat is rejected
+  with `invocation-caveats-not-subset-of-chain`; the correctly-echoed call
+  succeeds. Assert the same on the CF chain (`D_worker` + Worker callback).
+- **F1 invoker-side echo:** a `compute/execute` invocation under a
+  `ComputeCaveats`-carrying grant that omits the echoed caveat is rejected before
+  the handler runs.
+- **F3 cross-space isolation:** identical WASM deployed in space A and space B
+  yields distinct `routine_did`s; a space-B execution cannot cite space A's
+  `D_fn` (both the derivation-path hardening and the selection rule are
+  exercised).
+- **F4 atomicity:** a deploy whose `D_fn` fails verification leaves NO artifact
+  row and NO `SqlSizes` entry (and vice-versa) — the transaction is all-or-
+  nothing.
+- **F8 quota:** a deploy increments the space's `store_size` (via `SqlSizes`) and
+  a subsequent over-quota deploy 402s.
+- **F1.5 rotation:** an execute whose re-derived key ≠ `D_fn.delegatee` fails
+  with the distinct `routine-identity-rotated` code, not a generic 403.
