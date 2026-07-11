@@ -203,3 +203,48 @@ on the derived-key-vs-caveat-scoped mechanism before I finalize §6/§12.
 Any post-commit design change to capability names / wire shapes / delegation
 mechanism will be noted here as a fresh `## drafter —` entry so the site
 re-syncs.
+
+## drafter — decisions applied (checkpoint 3)
+
+Sam resolved the open items; `specs/compute-service.md` is updated and committed.
+fable + site-builder: re-sync from this entry (you're both rate-limited).
+
+**D1 — routine identity = deterministic TEE-derived key from the function CID**
+(my proposal, now decided). §6.2 gains a boxed DEPLOYMENT RISK note: dstack key
+stability across CVM redeploys is a known open question in this stack (prior
+DID-drift incident in OpenCredentials); it MUST be verified empirically on the
+target CVM before production reliance. Recorded fallback if derivation proves
+unstable: a persisted, encrypted per-deploy routine key (localized
+`ComputeService` change; NO wire/auth/caveat impact).
+
+**D2 — binding = self-describing caveat on `D_fn`, NOT an internal table.**
+The `function_cid → D_fn` link is now a caveat on the deploy-time delegation:
+`{ "computeFunctionBinding": { "functionCid": "<function_cid>" } }`. Rationale:
+an internal table is out-of-band state unverifiable from the event graph; the
+caveat keeps the binding auditable + portable. It COMPOSES with D1 (does not
+overlap): the derived key makes the binding unforgeable, the caveat makes it
+auditable. Updated in §5.1 and §6.2. NOTE for site-builder: this is a new
+delegation-caveat namespace on `D_fn`; it is distinct from the invoker-facing
+`ComputeCaveats` (functions/maxDuration/maxMemory/inputs) in §10 — please render
+them as two separate things (one on D_fn, one on the execute invocation).
+
+**Deploy tier — capabilities stay specific; NO `compute/admin` URN.**
+`compute/deploy` is the privileged code-mutating ability (analogous to
+`tinycloud.sql/schema`). Standard-tier session grants EXCLUDE `compute/deploy`
+(a browser session may hold execute/list but not deploy). A future
+`compute/admin` would `implies` deploy — like `sql/admin ⊃ sql/schema` — only
+once a real admin-only surface (function deletion, backend config) exists. Added
+to §3. **capabilities.json proposed diff is UNCHANGED** by this — still the same
+three specific URNs + wildcard, reserved-first, no admin.
+
+**Wire shapes: UNCHANGED.** `ComputeRequest` (execute/deploy/list),
+`InvocationOutcome::ComputeResult`/`ComputeList`, and `ComputeCaveats` are all
+exactly as in checkpoint 2. The only new wire artifact is the D_fn binding
+caveat above (on the delegation, not the invocation).
+
+**Heading note for site-builder:** §12 renamed `Open Questions` →
+`Resolved Decisions & Open Questions` (now `12.1 Resolved` + `12.2 Still open`).
+All other top-level `##` headings 1–11, 13 are unchanged. All "DECISION NEEDED"
+markers are gone; still-open items are only: Cloudflare callback credential
+TTL/revocation, result cache, binary inline outputs, and (out-of-scope)
+multi-node execution.
