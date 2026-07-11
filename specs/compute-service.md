@@ -85,6 +85,22 @@ tinycloud.compute/list      — List deployed functions in a space
 tinycloud.compute/*         — Wildcard: all compute actions
 ```
 
+**DECIDED (deploy tier): capabilities stay specific — there is no
+`tinycloud.compute/admin` URN for now.** `tinycloud.compute/deploy` IS the
+privileged, code-mutating ability, analogous to `tinycloud.sql/schema` (which
+standard-tier browser sessions do not receive — see the SQL schema-tier
+precedent). Concretely:
+
+- **Standard-tier session grants exclude `compute/deploy`.** A standard browser
+  session may hold `compute/execute` (and `compute/list`) but not
+  `compute/deploy`; deploying executable code requires an explicitly elevated
+  grant, exactly as issuing DDL requires `sql/schema`.
+- **No `compute/admin` is introduced yet.** A future `compute/admin` would be
+  added only once there is a genuinely admin-only surface (e.g. function
+  deletion, backend configuration); at that point it would `implies`
+  `compute/deploy` — mirroring `sql/admin ⊃ sql/schema` in the registry
+  (`capabilities.json:59-63`) — rather than being minted speculatively now.
+
 ### 3.1 `capabilities.json` diff (reserved first)
 
 New services land as `status: "reserved"` — the same pattern `tinycloud.vfs/*`
@@ -222,15 +238,14 @@ content CID from `artifact.content_hash`.
 ### 5.1 Deploy-time delegation binding
 
 Alongside the artifact, deploy records the **routine data grant binding**:
-`function_cid → D_fn` (the deploy-time delegation, see §6). Two storage options
-are on the table (DECISION NEEDED, §12/D2):
-
-- **Table-side (leaning):** a small `compute_function_grant(space, name,
-  content_hash, delegation_cid)` row written in the same transaction as the
-  artifact save. No wire/caveat change; the binding is internal node state.
-- **Caveat-side:** the binding is expressed as a caveat on `D_fn` naming the
-  `function_cid`, making the delegation self-describing but requiring the
-  execute path to read it out of the delegation.
+`function_cid → D_fn` (the deploy-time delegation, see §6). **DECIDED (D2):** the
+binding is a **self-describing caveat on `D_fn`** naming the `function_cid` —
+`{ "computeFunctionBinding": { "functionCid": "<function_cid>" } }` — NOT an
+internal node-side table. `D_fn` is an ordinary delegation event, so its caveat
+is persisted and replayable through the normal delegation path; the execute path
+locates the correct `D_fn` for a loaded artifact by matching that caveat's
+`functionCid` against the artifact's `content_hash`. Rationale and the way this
+composes with the derived-key identity are in §6.2.
 
 ---
 
@@ -283,18 +298,61 @@ routine.** (Non-TEE / classic mode: the same derivation runs off the node's
 static key material via `keys.rs`; the trust statement weakens to "the node" —
 see §9.3.)
 
+**DECIDED (D1): routine identity is this deterministic TEE-derived key.** It
+needs no secret at rest and binds data access to both the function and the node.
+
+> **Deployment risk — dstack key stability across CVM redeploys (VERIFY
+> EMPIRICALLY).** This mechanism assumes `dstack::get_key(path)` returns a
+> *stable* key for a given path across CVM redeploys. That stability is a known
+> open question in this stack: a prior **DID-drift incident in OpenCredentials**
+> showed dstack-derived key material shifting across deploys, which would change
+> `routine_did` and silently invalidate every `D_fn` bound to the old identity.
+> Before relying on derived-key identity in production, this MUST be verified
+> empirically on the target CVM (derive `routine_did` for a fixed
+> `function_cid`, redeploy the CVM, re-derive, assert equality). **Fallback if
+> derivation proves unstable:** a freshly-generated per-deploy routine key
+> persisted (encrypted) alongside the artifact — this survives node/CVM
+> migration at the cost of a secret at rest and a key-management surface. The
+> spec is written against the derived-key primary; switching to the persisted
+> key is a localized change to the routine-key handle in `ComputeService`
+> (§11.1) and does not affect the wire format, the binding caveat (§6.2/D2), or
+> the authorization layers.
+
 **Deploy-time binding.** At deploy, the deployer — who *does* hold data caps
 (the space owner, or an attenuated delegate) — mints a UCAN delegation `D_fn`:
 
 - `delegatee = routine_did`
 - `capabilities =` the attenuated data grant the routine needs, e.g.
   `tinycloud.kv/get` on `inputs/` and `tinycloud.kv/put` on `outputs/`
+- a **self-describing CID-binding caveat** naming the `function_cid` this
+  delegation is for (see below)
 - signed by the deployer, extending the deployer's own chain to the space owner
 
 Because the CID is a pure function of the WASM bytes, the deployer can compute
 `function_cid` (and therefore `routine_did`, given the node's derivation
 convention exposed by the SDK) **before** deploy — no chicken-and-egg. `D_fn`
-travels in the deploy request and is persisted bound to `function_cid` (§5.1).
+travels in the deploy request (§5.1).
+
+**DECIDED (D2): the `function_cid → D_fn` binding is a self-describing caveat on
+`D_fn`, NOT an internal node-side table.** The binding is expressed as a caveat
+on `D_fn` naming the `function_cid`:
+
+```json
+{ "computeFunctionBinding": { "functionCid": "<function_cid>" } }
+```
+
+Rationale (per the decision): an internal lookup table is out-of-band node
+state — unverifiable from the event graph and non-portable across nodes. The
+caveat keeps the binding **auditable** (any party replaying the delegation
+events sees exactly which function each `D_fn` authorizes) and **portable** (a
+node migration carries the binding inside the signed delegation, not a private
+side table). Note the binding is *enforced cryptographically already* by the
+derived-key identity (D1): only the execution of `function_cid` can derive the
+key that matches `D_fn.delegatee`, so the caveat is the auditable, self-
+describing record of a binding that the key derivation makes unforgeable — the
+two decisions compose, they do not overlap. The execute path reads
+`function_cid` out of this caveat to locate the correct `D_fn` for the loaded
+artifact.
 
 **Execute-time flow.**
 
@@ -320,15 +378,20 @@ internal invocations are matched against `D_fn.delegatee == routine_did`), and
 the **host mediator** that mints and submits the routine's internal invocations,
 and the deploy-time binding store.
 
-**Why derived-key over a caveat-scoped self-delegation.** An alternative is to
-let the routine act *as the deployer* under a new "only usable inside function
-CID X" caveat. That needs a new caveat type *and* a new invocation-path check
-("am I currently executing inside function CID X?"), which is exactly the kind
-of trust-boundary state that is hard to make fail-closed. The derived-key
-approach needs zero new caveat type and zero new invocation check; it reuses
-`did_principal_matches` and the existing chain walk; and it binds data access to
-**both** the function identity and the node identity, which is attestable via
-`/attestation`.
+**Why a derived-key *identity* over a caveat-scoped self-delegation.** This is a
+distinct question from the D2 binding caveat above. An alternative *identity*
+model is to let the routine act *as the deployer* under a new "only usable
+inside function CID X" caveat — i.e. the caveat would be the enforcement
+boundary. That needs a new runtime invocation-path check ("am I currently
+executing inside function CID X?"), which is exactly the kind of trust-boundary
+state that is hard to make fail-closed. The derived-key identity needs no such
+runtime check: only the execution of `function_cid` can derive the key that
+matches `D_fn.delegatee`, so identity enforcement is cryptographic, reusing
+`did_principal_matches` and the existing chain walk, and binds data access to
+**both** the function identity and the node identity (attestable via
+`/attestation`). The D2 caveat then rides *on top of* this as the auditable,
+portable record of the binding — it documents the linkage in the event graph;
+the derived key is what makes it unforgeable.
 
 ### 6.3 Caveat source is the chain, not the facts
 
@@ -743,23 +806,33 @@ account_id = "…"
 
 ---
 
-## 12. Open Questions
+## 12. Resolved Decisions & Open Questions
 
-- **DECISION NEEDED (D1) — routine identity.** Deterministic TEE-derived key
-  from the function CID (this spec's proposal — cleaner, no secret at rest, but
-  a re-deploy on a different node yields a different `routine_did`, so `D_fn`
-  must be re-minted per node) **vs.** a freshly-generated per-deploy session key
-  persisted (encrypted) alongside the artifact (survives node migration, but
-  adds a secret at rest and a key-management surface). *Which is primary?*
-- **DECISION NEEDED (D2) — binding representation.** Store `function_cid → D_fn`
-  as an internal table row (leaning: no wire/caveat change) **vs.** express it as
-  a self-describing caveat on `D_fn` naming the `function_cid` (the delegation
-  carries its own binding, at the cost of an execute-path read).
-- **Deploy authorization tier.** Should `compute/deploy` require an
-  admin-equivalent capability (like sql DDL requires `sql/schema`/`admin`), or is
-  a plain `compute/deploy` grant sufficient? Deploy mutates executable code in a
-  space — leaning toward a distinct, non-wildcard-implied tier, but this
-  interacts with the `compute/*` wildcard semantics.
+### 12.1 Resolved (decided by Sam, 2026-07-10)
+
+- **D1 — routine identity: DECIDED = deterministic TEE-derived key from the
+  function CID** (§6.2). Chosen for no-secret-at-rest and function+node binding.
+  **Carries a deployment risk that MUST be verified empirically:** dstack key
+  stability across CVM redeploys is a known open question in this stack (prior
+  DID-drift incident in OpenCredentials — see the boxed note in §6.2). If
+  derivation proves unstable on the target CVM, the recorded **fallback** is a
+  persisted, encrypted per-deploy routine key (a localized `ComputeService`
+  change; no wire/auth impact).
+- **D2 — binding representation: DECIDED = self-describing CID-binding caveat on
+  `D_fn`** (`{ "computeFunctionBinding": { "functionCid": … } }`), NOT an
+  internal node-side table (§5.1, §6.2). Rationale: an internal table is
+  out-of-band state unverifiable from the event graph; the caveat keeps the
+  binding auditable and portable. It composes with D1 — the derived key makes
+  the binding unforgeable; the caveat makes it auditable.
+- **Deploy authorization tier: DECIDED = capabilities stay specific, no
+  `compute/admin` URN for now** (§3). `compute/deploy` is the privileged
+  code-mutating ability, analogous to `tinycloud.sql/schema`; standard-tier
+  session grants exclude `compute/deploy`. A future `compute/admin` would
+  `implies` `compute/deploy` (mirroring `sql/admin ⊃ sql/schema`) only once a
+  real admin-only surface (function deletion, backend config) exists.
+
+### 12.2 Still open
+
 - **Cloudflare callback credential lifetime & revocation.** The short-lived
   callback delegation shipped to the Worker (§9.2) needs a concrete TTL and a
   revocation story if a Worker misbehaves mid-execution.
