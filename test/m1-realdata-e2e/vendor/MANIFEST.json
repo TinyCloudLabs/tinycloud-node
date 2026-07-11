@@ -1,5 +1,12 @@
 {
  "files": {
+  "grant-output/SKIP_MANIFEST.json": "62afca7edcde6b2dded3c2a281c65efc449d28af69f814093628e29e3c0ba7e2",
+  "grant-output/accept.json": "7ba6a5e19ee72ab8546ef06febebf3a3f612102407dc2be777e17a278419d5b3",
+  "grant-output/audit-reject.json": "6cb2471082fabdc97d5401422deb278d0a9dabb23c1d4b8696a6272f8e60a1cf",
+  "grant-output/generate.py": "b35336972cba3b51c93483aeb128709f24002637d58dda4185ac9dd826c250e1",
+  "grant-output/node-import-reject.json": "54a6721bf76b3d2be5d209c49e34aaf074767c262a096226dd44e14750bc6f66",
+  "grant-output/node-invocation-reject.json": "a6d0f0829c2784155bf52ad41fe1d36f11421e1d6350893ce45d3d5a06f52c1d",
+  "grant-output/producer-reject.json": "278b36e137312abff395c98afcb0b938f18490e2b9c327463c603c6a3396ab33",
   "js-sdk/tinycloud-sdk-core-2.6.0-m1-919f94a.tgz": "bc2fd4bf7d8517894f84e98c075a2ae40d91f543f3baba8330c92c63cd515f69",
   "launch-credential-denials/README.md": "e86eb66c05a43024432df86828ea343233646f26351a801f3cbb037a60bbb443",
   "launch-credential-denials/baseline-valid.json": "231706d9e89350f6820418f6a379454cb6d331ef1a24e1c480a23aba111c764a",
@@ -57,14 +64,31 @@
   "policy-engine-conformance/wire-denials/requested-capabilities-hash-mismatch.json": "5be202f67bed795932e37834e24e4ae4bc61a930592b640c0c06a5d2ab01bc83",
   "policy-engine-conformance/wire-denials/schema-invalid.json": "8338f173ab4759aa3ee40c4dae2496ba4af5903d3e1b69c38ca760c118b5e5c6",
   "policy-engine-conformance/wire-denials/signature-invalid.json": "cc8b2a667d107d42b0d95d0634971b6a2fd71f8d2d9165c346002caba071e2bd",
-  "policy-engine-conformance/wire-denials/signer-not-authorized.json": "216d45b0525259fa739eba4d9c1521916f39964f4a2fbe6394c033a2f74bb75f"
+  "policy-engine-conformance/wire-denials/signer-not-authorized.json": "216d45b0525259fa739eba4d9c1521916f39964f4a2fbe6394c033a2f74bb75f",
+  "policy-engine/Cargo.toml": "ed2b8e65bb6ac83ee3253dad25d50e435d6bba005ea3fcaa05bbaac065017c5c",
+  "policy-engine/crates/policy-engine-http/Cargo.toml": "8677197f057a22a0c3c8d11d4ed2e3e756d3fee6b2d2bcb1fd408f5dc09c02a7",
+  "policy-engine/crates/policy-engine-http/src/lib.rs": "55d2a5f1f5f68d0debafc26a9fe0907f52eca12d1d5c57970737ad28e69efc38",
+  "policy-engine/crates/policy-evidence-vc/Cargo.toml": "0b757154898a2d38b651d98b607fb63796a3904f07454d5a95b66b8bd608cbe1",
+  "policy-engine/crates/policy-evidence-vc/src/lib.rs": "6ee8e0a3f1713a8ebde036b4bfc622cffd4424d95fb9b143c94a2ee0f30d4c2d",
+  "policy-engine/crates/policy-runtime/Cargo.toml": "aedbc9dd40ba6559ccbf231f4be9db48f57005dc1f4453e45d3e9bb1ae94f7d3",
+  "policy-engine/crates/policy-runtime/src/lib.rs": "ca40c71afd869bacb48616d1d4de7b509990dbb5da9e4aa2d51a3f6cbaf61afe",
+  "policy-engine/src/capability.rs": "c5126380ba07b697f28bd25d613deeedb2d5168db27d74fdc821a43c0f37d949",
+  "policy-engine/src/crypto.rs": "446230042cc5091330516f24dbaed021f8c34cadf0a7941fe17bd05b4e321099",
+  "policy-engine/src/enrollment.rs": "46517bf2d96911f250d81359ed1744ba526cfdb83c25b978098fb031b374c4c2",
+  "policy-engine/src/evaluator.rs": "3b5db3dd84c63f391e866ef4e2eba4668b4100b1a6dc92a33f89ec05890cbc61",
+  "policy-engine/src/jcs.rs": "9874581f2f625d55da9a0308612084a4b95a34d1cb23dfc42fb3d6bf58b74e28",
+  "policy-engine/src/lib.rs": "2ed4c35cbdc772eeb6b0d670fac9e84cb4a8787e5212ab34c032e7224c285580",
+  "policy-engine/src/signed_object.rs": "536deeaeb9d322895b784d4c57431629b1174d0331219c870258fbd8e5bafa39",
+  "policy-engine/src/sql_caveat.rs": "6702ddd214dc24e69cedb055a0ddc17f770cadd4a8af2d6724e758e67f3f3930",
+  "policy-engine/src/types.rs": "4813b80cf7a99f4e2638ad2a9fd1884cd9eb7126ef454886bcdeaf551cbfc71e"
  },
  "label": "PM base-prep vendor tree for m1-g-05 (m1-wave-10); byte-identical/confirmed-from-code",
  "pins": {
   "js-sdk": "919f94abade6236368d3d82b5f841b934c194362 (smithers/data-exchange/m1-wave-8/m1-integration; sdk-core 2.6.0 tarball packed at this commit)",
   "launch-credential-denials": "a1633710f3e7f944f18b66b5c957d8d25085975b (OpenCredentials smithers/data-exchange/m1-wave-7/m1-integration)",
   "listen": "3c34a3e00ac2f9fb3b5ac21485063149719a9eb7 (smithers/data-exchange/m1-wave-8/m1-integration; canonical catalog + demo:m1-owner driver sources)",
-  "policy-engine-conformance": "ba318116365171f3be19de4e3efa1a5eafd842d2 (smithers/data-exchange/m1-wave-7c/m1-integration; consume ONLY reachability=='mounted-runtime' rows as expectable wire codes)"
+  "policy-engine-conformance": "ba318116365171f3be19de4e3efa1a5eafd842d2 (smithers/data-exchange/m1-wave-7c/m1-integration; consume ONLY reachability=='mounted-runtime' rows as expectable wire codes)",
+  "policy-engine-grant-output": "d72812ac018adbff3c4cf1e27f978df54501b158 (m1-g-06 vectors + m1-g-06b parameterized generator + m1-g-07 SharedGrantIssuer; vendored source)"
  },
- "policyEngineGitDepRev": "ba318116365171f3be19de4e3efa1a5eafd842d2"
+ "policyEngineGitDepRev": "d72812ac018adbff3c4cf1e27f978df54501b158"
 }

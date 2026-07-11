@@ -9,9 +9,10 @@ anyhow = "1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 ed25519-dalek = "2"
-policy-core = { git = "https://github.com/TinyCloudLabs/policy-engine", rev = "ba318116365171f3be19de4e3efa1a5eafd842d2", package = "policy-core" }
-policy-evidence-vc = { git = "https://github.com/TinyCloudLabs/policy-engine", rev = "ba318116365171f3be19de4e3efa1a5eafd842d2", package = "policy-evidence-vc" }
-policy-runtime = { git = "https://github.com/TinyCloudLabs/policy-engine", rev = "ba318116365171f3be19de4e3efa1a5eafd842d2", package = "policy-runtime", default-features = false, features = ["vc-evidence"] }
+policy-core = { path = "vendor/policy-engine", package = "policy-core" }
+policy-engine-http = { path = "vendor/policy-engine/crates/policy-engine-http", package = "policy-engine-http" }
+policy-evidence-vc = { path = "vendor/policy-engine/crates/policy-evidence-vc", package = "policy-evidence-vc" }
+policy-runtime = { path = "vendor/policy-engine/crates/policy-runtime", package = "policy-runtime", default-features = false, features = ["vc-evidence"] }
 rocket = { version = "0.5.1", features = ["json", "tls", "mtls"] }
 serde_json = "1"
 tempfile = "3"
