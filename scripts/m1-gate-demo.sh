@@ -100,7 +100,10 @@ POLICY_SHA=$(<"$BUNDLE/meta/policy-engine.sha")
 SDK_SHA=$(<"$BUNDLE/meta/js-sdk.sha")
 LISTEN_SHA=$(<"$BUNDLE/meta/listen.sha")
 OC_SHA=$(<"$BUNDLE/meta/open-credentials.sha")
-[[ $NODE_SHA == b51254e* && $POLICY_SHA == d72812a* && $SDK_SHA == 5a42dd6* && \
+need M1_EXPECTED_NODE_SHA
+# The node pin is env-supplied: the gate script lives in this repo, so a
+# hardcoded self-SHA would be stale the moment the script itself merges.
+[[ $NODE_SHA == "$M1_EXPECTED_NODE_SHA"* && $POLICY_SHA == d72812a* && $SDK_SHA == 5a42dd6* && \
    $LISTEN_SHA == bd936c0* && $OC_SHA == a1633710* ]] || die "candidate SHA mismatch"
 for dirty in "$BUNDLE"/meta/*.dirty; do [[ ! -s "$dirty" ]] || die "candidate checkout is dirty: $dirty"; done
 
