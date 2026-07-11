@@ -54,8 +54,8 @@ use tinycloud_core::{
     hash::{hash, Hash},
     models::{abilities, delegation, space},
     sea_orm::{
-        ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions, Database, EntityTrait,
-        PaginatorTrait, QueryFilter,
+        ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions, Database,
+        DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
     },
     sql::{SqlRequest, SqlService, SqlValue},
     types::SpaceIdWrap,
@@ -82,6 +82,7 @@ const UNTRUSTED_FIXTURE: &str =
 const DENIAL_MATRIX: &str =
     include_str!("../vendor/policy-engine-conformance/denial-matrix-v0.json");
 const GRANT_OUTPUT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/vendor/grant-output");
+static NODE_APP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Clone)]
 struct NodeGrantIssuer {
@@ -209,6 +210,7 @@ impl FixtureTimeVerifier {
 
 #[tokio::test]
 async fn deterministic_cross_layer_contract_is_observed_from_real_operations() -> Result<()> {
+    let _node_app_guard = NODE_APP_TEST_LOCK.lock().await;
     let tempdir = TempDir::new()?;
     let datadir = tempdir.path().join("data");
     let db_url = format!("sqlite:{}", datadir.join("caps.db").display());
@@ -229,7 +231,9 @@ secret = "{}"
         .merge(Serialized::defaults(tinycloud::config::Config::default()))
         .merge(Toml::string(&overlay));
     let rocket = tinycloud::app(&figment).await?;
-    let sql_service = rocket
+    let client = Client::tracked(rocket).await?;
+    let sql_service = client
+        .rocket()
         .state::<SqlService>()
         .context("node app must manage SqlService")?;
     let conn = Database::connect(ConnectOptions::new(db_url)).await?;
@@ -352,7 +356,6 @@ secret = "{}"
     let observed_ttl = (record.expires_at - record.issued_at).num_seconds();
     assert!(observed_ttl > 0 && observed_ttl <= 300);
 
-    let client = Client::tracked(rocket).await?;
     let imported = client
         .post("/delegate")
         .header(Header::new("Authorization", issued.encoded.clone()))
@@ -527,6 +530,8 @@ secret = "{}"
         holder_did: &holder_did,
         holder_key: &holder_signing_key,
     })?;
+
+    observe_grant_output_on_real_node(&client, &conn, &datadir, sql_service).await?;
 
     Ok(())
 }
@@ -1203,8 +1208,13 @@ fn fixture_verification_time(source: &str) -> Result<DateTime<Utc>> {
     DateTime::from_timestamp(timestamp, 0).context("fixture verificationOptions.now timestamp")
 }
 
-#[tokio::test]
-async fn grant_output_live_material_traverses_real_delegate_route() -> Result<()> {
+async fn observe_grant_output_on_real_node(
+    client: &Client,
+    conn: &DatabaseConnection,
+    datadir: &Path,
+    sql_service: &SqlService,
+) -> Result<()> {
+    let authority_before = delegation::Entity::find().count(conn).await?;
     let generated = TempDir::new()?;
     let instant = Utc::now().timestamp();
     let status = Command::new("python3")
@@ -1218,30 +1228,6 @@ async fn grant_output_live_material_traverses_real_delegate_route() -> Result<()
     let accept: Value =
         serde_json::from_str(&fs::read_to_string(generated.path().join("accept.json"))?)?;
 
-    let tempdir = TempDir::new()?;
-    let datadir = tempdir.path().join("data");
-    let db_url = format!("sqlite:{}", datadir.join("caps.db").display());
-    let secret = URL_SAFE_NO_PAD.encode([31u8; 32]);
-    let overlay = format!(
-        r#"
-[storage]
-datadir = "{}"
-
-[keys]
-type = "Static"
-secret = "{}"
-"#,
-        datadir.display(),
-        secret
-    );
-    let figment = rocket::Config::figment()
-        .merge(Serialized::defaults(tinycloud::config::Config::default()))
-        .merge(Toml::string(&overlay));
-    let rocket = tinycloud::app(&figment).await?;
-    let sql_service = rocket
-        .state::<SqlService>()
-        .context("node app must manage SqlService")?;
-    let conn = Database::connect(ConnectOptions::new(db_url)).await?;
     let owner_did = accept["parentFormatVector"]["issuer"]
         .as_str()
         .context("parent issuer")?;
@@ -1249,7 +1235,7 @@ secret = "{}"
     space::ActiveModel {
         id: Set(SpaceIdWrap(space_id.clone())),
     }
-    .insert(&conn)
+    .insert(conn)
     .await?;
     tokio::fs::create_dir_all(
         datadir
@@ -1259,7 +1245,6 @@ secret = "{}"
     )
     .await?;
     seed_grant_vector_sql(sql_service, &space_id).await?;
-    let client = Client::tracked(rocket).await?;
 
     let mut parent = accept["parentFormatVector"]["dagCborBase64Url"]
         .as_str()
@@ -1299,7 +1284,10 @@ secret = "{}"
         grant_json["cid"],
         accept["cases"][0]["ucan"]["delegationId"]
     );
-    assert_eq!(delegation::Entity::find().count(&conn).await?, 2);
+    assert_eq!(
+        delegation::Entity::find().count(conn).await?,
+        authority_before + 2
+    );
 
     let holder_jwk = ed25519_jwk_from_seed([0x33; 32])?;
     let (holder_did, holder_vm) = node_identity(&holder_jwk)?;
@@ -1357,24 +1345,12 @@ secret = "{}"
         "actions": ["tinycloud.sql/read"],
         "caveats": accept["cases"][0]["expectedExtractedCapability"]["notaBene"]["0"].clone()
     }))?;
-    let kv_capability = policy_core::parse_policy_capability(&json!({
-        "service": "tinycloud.kv",
-        "space": "default",
-        "path": SQL_PATH,
-        "actions": ["tinycloud.kv/get"]
-    }))?;
-    let parent_config =
-        parent_config_from_vector(&accept, vec![sql_capability.clone(), kv_capability.clone()])?;
+    let parent_config = parent_config_from_vector(&accept, vec![sql_capability.clone()])?;
     let mut production_issuer =
         SharedGrantIssuer::new(grant_issuer_did.clone(), grant_signer, [parent_config]);
     let mut minimum_ttl_hash = None;
     let mut terminal_parent_hash = None;
     let interop_cases = [
-        (
-            "sql-kv-mix",
-            vec![sql_capability.clone(), kv_capability],
-            120_i64,
-        ),
         ("named-statement", vec![sql_capability.clone()], 120_i64),
         ("minimum-ttl", vec![sql_capability.clone()], 1_i64),
         ("maximum-ttl", vec![sql_capability], 300_i64),
@@ -1462,34 +1438,21 @@ secret = "{}"
         );
         let enforced_json: Value = serde_json::from_str(&enforced_body)?;
         assert_eq!(enforced_json["rows"][0][0], "conv_456");
-        if case_name == "sql-kv-mix" {
-            let kv_invocation = holder_invocation(
-                &InvocationSigner {
-                    jwk: &holder_jwk,
-                    verification_method: &holder_vm,
-                    did: &holder_did,
-                    parent: emitted_hash,
-                },
-                &sql_resource,
-                "tinycloud.kv/get",
-                None,
-                "engine-sql-kv-mix-kv",
-            )?;
-            let kv_observation = client
-                .post("/invoke")
-                .header(Header::new("Authorization", kv_invocation))
-                .dispatch()
-                .await;
-            let kv_status = kv_observation.status();
-            let kv_body = kv_observation.into_bytes().await.unwrap_or_default();
-            assert_eq!(
-                kv_status,
-                Status::Ok,
-                "actual g-07 SQL+KV grant KV enforcement: {}",
-                String::from_utf8_lossy(&kv_body)
-            );
-        }
     }
+
+    exercise_engine_sql_kv_mix(EngineSqlKvContext {
+        client,
+        conn,
+        datadir,
+        sql_service,
+        grant_jwk: &grant_jwk,
+        grant_issuer_did: &grant_issuer_did,
+        holder_jwk: &holder_jwk,
+        holder_vm: &holder_vm,
+        holder_did: &holder_did,
+        caveat: accept["cases"][0]["expectedExtractedCapability"]["notaBene"]["0"].clone(),
+    })
+    .await?;
 
     let wrong_jwk = ed25519_jwk_from_seed([0x11; 32])?;
     let (wrong_did, wrong_vm) = node_identity(&wrong_jwk)?;
@@ -1508,7 +1471,7 @@ secret = "{}"
         "terminal-parent-child",
     )?;
     assert_delegate_reject(
-        &client,
+        client,
         terminal_child,
         "terminal-parent",
         "terminal-parent-cannot-redelegate",
@@ -1559,7 +1522,7 @@ secret = "{}"
         "caveat-child",
     )?;
     assert_delegate_reject(
-        &client,
+        client,
         wider_child,
         "caveat-containment-failure",
         "child-caveats-not-subset-of-parent: containment-caveat-required",
@@ -1624,7 +1587,7 @@ secret = "{}"
         "node-invocation-revoked-parent",
     )?;
     assert_invoke_reject(
-        &client,
+        client,
         revoked_parent_invocation,
         "revoked-parent",
         "delegation-ancestor-revoked:",
@@ -1644,7 +1607,7 @@ secret = "{}"
         "node-invocation-wrong-invoker",
     )?;
     assert_invoke_reject(
-        &client,
+        client,
         wrong_invoker,
         "holder-audience-mismatch",
         "Unauthorized Invoker",
@@ -1664,7 +1627,7 @@ secret = "{}"
         "node-invocation-unauthorized-action",
     )?;
     assert_invoke_reject(
-        &client,
+        client,
         unauthorized_action,
         "unauthorized-requested-action",
         "Unauthorized Action",
@@ -1685,7 +1648,7 @@ secret = "{}"
         "node-invocation-expired-proof-chain",
     )?;
     assert_invoke_reject(
-        &client,
+        client,
         expired_chain,
         "expired-proof-chain",
         "Unauthorized Action",
@@ -1885,6 +1848,199 @@ async fn seed_grant_vector_sql(sql: &SqlService, space: &SpaceId) -> Result<()> 
     Ok(())
 }
 
+struct EngineSqlKvContext<'a> {
+    client: &'a Client,
+    conn: &'a DatabaseConnection,
+    datadir: &'a Path,
+    sql_service: &'a SqlService,
+    grant_jwk: &'a JWK,
+    grant_issuer_did: &'a str,
+    holder_jwk: &'a JWK,
+    holder_vm: &'a str,
+    holder_did: &'a str,
+    caveat: Value,
+}
+
+async fn exercise_engine_sql_kv_mix(context: EngineSqlKvContext<'_>) -> Result<()> {
+    let owner_jwk = ed25519_jwk_from_seed([0x44; 32])?;
+    let (owner_did, owner_vm) = node_identity(&owner_jwk)?;
+    let space_id = SpaceId::new(owner_did.parse::<DIDBuf>()?, "default".parse()?);
+    space::ActiveModel {
+        id: Set(SpaceIdWrap(space_id.clone())),
+    }
+    .insert(context.conn)
+    .await?;
+    tokio::fs::create_dir_all(
+        context
+            .datadir
+            .join("blocks")
+            .join(space_id.suffix())
+            .join(space_id.name().as_str()),
+    )
+    .await?;
+    seed_grant_vector_sql(context.sql_service, &space_id).await?;
+    seed_listen_kv(context.client, &owner_jwk, &owner_vm, &owner_did, &space_id).await?;
+
+    let sql_resource = space_id.clone().to_resource(
+        "sql".parse::<Service>()?,
+        Some(SQL_PATH.parse::<AuthPath>()?),
+        None,
+        None,
+    );
+    let kv_resource = space_id.clone().to_resource(
+        "kv".parse::<Service>()?,
+        Some(KV_PATH.parse::<AuthPath>()?),
+        None,
+        None,
+    );
+    let encoded_parent = signed_multi_delegation(
+        &owner_jwk,
+        &owner_vm,
+        context.grant_issuer_did,
+        vec![
+            (sql_resource.clone(), "tinycloud.sql/read".to_string(), None),
+            (kv_resource.clone(), "tinycloud.kv/get".to_string(), None),
+        ],
+        Vec::new(),
+        "attenuable",
+        600,
+        "engine-sql-kv-parent",
+    )?;
+    let parent_response = context
+        .client
+        .post("/delegate")
+        .header(Header::new("Authorization", encoded_parent.clone()))
+        .dispatch()
+        .await;
+    let parent_status = parent_response.status();
+    let parent_body = parent_response.into_string().await.unwrap_or_default();
+    assert_eq!(parent_status, Status::Ok, "SQL+KV parent: {parent_body}");
+    let parent_json: Value = serde_json::from_str(&parent_body)?;
+    let parent_cid = parent_json["cid"]
+        .as_str()
+        .context("SQL+KV parent CID")?
+        .to_string();
+
+    let sql_capability = policy_core::parse_policy_capability(&json!({
+        "service": "tinycloud.sql",
+        "space": "default",
+        "path": SQL_PATH,
+        "actions": ["tinycloud.sql/read"],
+        "caveats": context.caveat.clone()
+    }))?;
+    let kv_capability = policy_core::parse_policy_capability(&json!({
+        "service": "tinycloud.kv",
+        "space": "default",
+        "path": KV_PATH,
+        "actions": ["tinycloud.kv/get"]
+    }))?;
+    let bounds = vec![
+        ParentCapabilityBound {
+            policy_capability: PolicyCapability {
+                caveats: None,
+                ..sql_capability.clone()
+            },
+            native_resource: sql_resource.as_uri().to_string(),
+        },
+        ParentCapabilityBound {
+            policy_capability: kv_capability.clone(),
+            native_resource: kv_resource.as_uri().to_string(),
+        },
+    ];
+    let expires_at = Utc::now() + Duration::minutes(10);
+    let parent_config = ParentDelegationConfig {
+        owner_did: owner_did.clone(),
+        artifact_base64_url: encoded_parent,
+        expected_cid: parent_cid.clone(),
+        audience: context.grant_issuer_did.to_string(),
+        not_before: None,
+        expires_at,
+        terminal: false,
+        capability_bounds: bounds.clone(),
+        delegate_receipt: CapturedParentDelegateReceipt {
+            delegation_id: parent_cid,
+            delegatee_did: context.grant_issuer_did.to_string(),
+            not_before: None,
+            expires_at,
+            terminal: false,
+            capability_bounds: bounds,
+        },
+    };
+    let mut issuer = SharedGrantIssuer::new(
+        context.grant_issuer_did,
+        signing_key(context.grant_jwk)?,
+        [parent_config],
+    );
+    let capabilities = vec![sql_capability, kv_capability];
+    let issued_at = Utc::now();
+    let mut grant_policy = policy(&space_id, context.grant_issuer_did);
+    grant_policy.policy_id = "pol_m1_g08_sql_kv_mix".to_string();
+    grant_policy.resource.permissions_ceiling = capabilities.clone();
+    grant_policy.grant.max_ttl_seconds = 120;
+    let emitted = issuer.issue(GrantIssueRequest {
+        holder_did: context.holder_did.to_string(),
+        capabilities,
+        issued_at,
+        expires_at: issued_at + Duration::seconds(120),
+        presentation_expires_at: issued_at + Duration::seconds(120),
+        terminal: true,
+        evidence_ids: Vec::new(),
+        evidence_provenance: Vec::new(),
+        policy: grant_policy,
+    })?;
+    let response = context
+        .client
+        .post("/delegate")
+        .header(Header::new("Authorization", emitted.encoded.clone()))
+        .dispatch()
+        .await;
+    let status = response.status();
+    let body = response.into_string().await.unwrap_or_default();
+    assert_eq!(status, Status::Ok, "SQL+KV engine grant: {body}");
+    let imported: Value = serde_json::from_str(&body)?;
+    assert_eq!(imported["cid"], emitted.delegation_id);
+    let invocation = InvocationContext {
+        client: context.client,
+        signer: InvocationSigner {
+            jwk: context.holder_jwk,
+            verification_method: context.holder_vm,
+            did: context.holder_did,
+            parent: Hash::from(emitted.delegation_id.parse::<AuthCid>()?),
+        },
+        space: &space_id,
+    };
+    let sql_header = holder_invocation(
+        &invocation.signer,
+        &sql_resource,
+        "tinycloud.sql/read",
+        Some(context.caveat),
+        "engine-mixed-sql",
+    )?;
+    let sql_response = context
+        .client
+        .post("/invoke")
+        .header(Header::new("Authorization", sql_header))
+        .header(ContentType::JSON)
+        .body(serde_json::to_string(&SqlRequest::ExecuteStatement {
+            name: "listen.getConversation".to_string(),
+            params: vec![],
+        })?)
+        .dispatch()
+        .await;
+    let sql_status = sql_response.status();
+    let sql_body = sql_response.into_string().await.unwrap_or_default();
+    assert_eq!(sql_status, Status::Ok, "SQL+KV SQL: {sql_body}");
+    let kv = invoke_kv(&invocation, "tinycloud.kv/get", "engine-mixed-kv").await?;
+    assert_eq!(
+        kv.0,
+        Status::Ok,
+        "SQL+KV KV: {}",
+        String::from_utf8_lossy(&kv.1)
+    );
+    assert_eq!(kv.1, KV_SEED);
+    Ok(())
+}
+
 async fn assert_invoke_reject(
     client: &Client,
     authorization: String,
@@ -1944,18 +2100,43 @@ fn signed_delegation_with_proof(
     ttl_seconds: i64,
     nonce: &str,
 ) -> Result<String> {
+    signed_multi_delegation(
+        issuer_jwk,
+        issuer_vm,
+        audience,
+        vec![(resource.clone(), ability.to_string(), caveat)],
+        proof,
+        mode,
+        ttl_seconds,
+        nonce,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn signed_multi_delegation(
+    issuer_jwk: &JWK,
+    issuer_vm: &str,
+    audience: &str,
+    grants: Vec<(ResourceId, String, Option<Value>)>,
+    proof: Vec<AuthCid>,
+    mode: &str,
+    ttl_seconds: i64,
+    nonce: &str,
+) -> Result<String> {
     let mut capabilities = Capabilities::new();
-    let mut nota_bene = BTreeMap::new();
-    if let Some(caveat) = caveat {
-        for (key, value) in caveat.as_object().context("delegation caveat object")? {
-            nota_bene.insert(key.clone(), value.clone());
+    for (resource, ability, caveat) in grants {
+        let mut nota_bene = BTreeMap::new();
+        if let Some(caveat) = caveat {
+            for (key, value) in caveat.as_object().context("delegation caveat object")? {
+                nota_bene.insert(key.clone(), value.clone());
+            }
         }
+        capabilities.with_action(
+            resource.as_uri(),
+            ability.parse::<UcanAbility>()?,
+            [nota_bene],
+        );
     }
-    capabilities.with_action(
-        resource.as_uri(),
-        ability.parse::<UcanAbility>()?,
-        [nota_bene],
-    );
     let payload = Payload {
         issuer: issuer_vm.parse::<DIDURLBuf>()?,
         audience: audience.parse::<DIDBuf>()?,
@@ -2058,7 +2239,7 @@ fn evidence_verification_path_rejects_direct_wall_clock_reads() {
         .split_once("    let before_delegations =")
         .expect("main resolve source marker")
         .1
-        .split_once("    let client =")
+        .split_once("    let imported = client")
         .expect("main native-node source marker")
         .0;
     let denial_resolves = source
@@ -2086,7 +2267,7 @@ fn evidence_verification_path_rejects_direct_wall_clock_reads() {
         .split_once("fn fixture_verification_time")
         .expect("fixture time source marker")
         .1
-        .split_once("#[test]")
+        .split_once("async fn observe_grant_output_on_real_node")
         .expect("source guard marker")
         .0;
     let ambient_independence_guard = source
