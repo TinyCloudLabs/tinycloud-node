@@ -46,6 +46,18 @@ cargo clippy --manifest-path test/m1-realdata-e2e/Cargo.toml --all-targets -- -D
 
 Observed result: exit status 0 with no warnings.
 
+## Ticket validateCommands
+
+The first ticket command (`cargo fmt --check`, strict `cargo clippy`, then the
+excluded-crate tests) exited 0. The second ticket command also exited 0:
+
+```sh
+CARGO_TARGET_DIR=/Users/pmess/conductor/workspaces/tinycloud-node/.smithers-data-exchange/cargo-target \
+cargo check --workspace
+```
+
+Observed result: the full workspace finished the dev profile successfully.
+
 ## Native data-plane dependency guard
 
 ```sh
