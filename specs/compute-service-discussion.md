@@ -312,3 +312,72 @@ delegation-path/atomicity) and F6 (CF egress) are all applied.
 
 Headings unchanged except §13 gained a §13.1 (Test obligations). No wire-shape
 changes except the new `RoutineDid` request action.
+
+## drafter — checkpoint 5 (egress observability + derivation URI + zk future)
+
+Sam directed a final amendment round; specs/compute-service.md updated (7f793c4).
+Scope: realistic-and-reasonable for the WASM path; ZK stays a future note only.
+Five changes:
+
+1. **Derivation string changed AGAIN → canonical resource URI.** §6.2 now:
+   `routine_did = did:key(get_key("tinycloud/compute-key/v1/" + <space>/compute/<function_cid>))`
+   — the `ResourceId` display form (§4), one canonical spelling shared by
+   authorizer + binding caveat + derivation, under a versioned `compute-key/v1/`
+   domain prefix. Added a BLOCKING safety requirement: space `Name` validation is
+   a stubbed `// TODO` in `tinycloud-auth/src/resource.rs` — names MUST exclude
+   URI delimiters (`/ : # ?`) or the space component MUST be hashed before compute
+   activates, so distinct (space, function) pairs can't collide into one
+   derivation string. CIDs are base32 (safe). Test obligation in §13.1.
+2. **NEW §9.1.1 — execution manifest / egress journal (wasmtime, NORMATIVE).**
+   The host mediator MUST journal every host call `(resource, ability, bytes
+   in/out, output destination)` + granted-vs-exercised capabilities. On wasmtime
+   the manifest is GROUND TRUTH (no unmediated egress); granted-but-unexercised
+   caps are the deployer's scope-down signal (permission observability). Storage:
+   rides in `InvocationOutcome` metadata (ObjectHeaders/`Metadata` precedent),
+   MAY persist to a KV audit path (`persist_manifest` config).
+3. **§9.2 — CF egress mitigation (SHOULD).** Workers for Platforms dispatch
+   namespaces + an Outbound Worker: default-deny allowlist (node callback = sole
+   default entry), full egress log in run evidence. Disables raw TCP `connect()`;
+   DO/mTLS `fetch` bypass is a known CF gap CLOSED BY CONSTRUCTION (node grants
+   routines no DO/mTLS bindings). Trust anchor stays Cloudflare, so the F6
+   disclosure rule is SOFTENED (not removed) to "disclosed to Cloudflare; function
+   author confined by CF-enforced egress policy." §10.2 updated to match.
+4. **NEW §9.4 — iron-proxy future-backend note.** For a FUTURE self-hosted
+   container/VM backend, iron-proxy is the egress-mediation pattern (default-deny
+   allowlist, per-request audit, credential brokering). Mirrors our
+   host-mediation philosophy; would give a container backend wasmtime's manifest
+   ground-truth property. Note only — NO container backend specced.
+5. **§12.2 — ZK deployment realities (FUTURE only).** Prover can't run in a Worker
+   (128MB isolate; Jolt alpha needs GPU-class HW; Twist/Shout streaming prover
+   <2GB fits CF Containers later). Realistic shape: two-phase — execute fast,
+   output marked `unverified`, prover runs async, node `verify()` flips it
+   `verified` (the run/output+evidence/verify interface already supports this).
+   Artifact wrinkle: Jolt proves RISC-V (RV64IMAC) not WASM, so a zk-verified fn
+   needs a RISC-V build whose digest is pinned in the binding caveat ALONGSIDE the
+   WASM CID. Interim cheap integrity for CF: deterministic wasmtime + random k%
+   spot re-execution on the node. ZK fixes F7 (integrity) fully in principle; does
+   NOT address F6 (confidentiality).
+
+### site-builder — what needs RE-RENDERING
+
+1. **Derivation formula changes AGAIN** — now the resource-URI form
+   `get_key("tinycloud/compute-key/v1/" + <space>/compute/<cid>)`. Update the
+   node-derives-routine-key label (this is the second derivation-string change;
+   this one is final for the WASM path).
+2. **Wasmtime execute diagram gains the execution-manifest step** — after the
+   host-mediated data calls, the mediator emits the manifest (host-call journal +
+   granted-vs-exercised) into the outcome metadata. Worth its own node in the
+   sequence; it's the permission-observability story.
+3. **CF diagram gains the Outbound-Worker hop** — user Worker `fetch()` → Outbound
+   Worker (default-deny, node callback only) → egress log. Show DO/mTLS bypass as
+   "not granted → not present."
+4. **CF trust callout restates the SOFTENED disclosure rule** — "disclosed to
+   Cloudflare; function author confined by CF-enforced egress policy" (WITH the
+   Outbound Worker), vs the hard "disclosed to author + Cloudflare" WITHOUT it.
+   Replace the checkpoint-4 headline egress wording accordingly.
+5. If you render a future/roadmap panel: iron-proxy (container backend) and the
+   two-phase ZK shape (RISC-V digest + async verify()) are new future items;
+   both are explicitly NOT-built.
+
+Headings: §9 gained §9.1.1 and §9.4; §12.2 gained the ZK note; §13.1 gained two
+obligations. No wire-shape changes beyond the manifest in outcome metadata.
