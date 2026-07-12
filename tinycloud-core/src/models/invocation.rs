@@ -94,6 +94,8 @@ pub enum InvocationError {
         ancestor_cid: String,
         invoked_cid: String,
     },
+    #[error("delegation-chain-traversal-limit-exceeded")]
+    ChainTraversalLimitExceeded,
     /// W1: invocation caveats are not a subset of the chain's caveats — the
     /// invoker tried to widen or replace a constrained-statements caveat
     /// the delegation chain carried (audit P0 finding 1, applied at the
@@ -183,12 +185,20 @@ async fn validate<C: ConnectionTrait>(
             // NOT cache "chain ok" across the revocation event
             // (revocation.md §2.3).
             for (p, _) in &parents {
-                if is_revoked(db, &p.id).await? {
+                if revocation::is_revoked(db, &p.id).await? {
                     return Err(
                         InvocationError::DelegationRevoked(p.id.to_cid(0x55).to_string()).into(),
                     );
                 }
-                if let Some(ancestor_cid) = first_revoked_ancestor(db, &p.id).await? {
+                let revoked_ancestor = revocation::first_revoked_ancestor(db, &p.id)
+                    .await
+                    .map_err(|error| match error {
+                        revocation::ChainTraversalError::Db(error) => Error::Db(error),
+                        revocation::ChainTraversalError::LimitExceeded => {
+                            Error::InvalidInvocation(InvocationError::ChainTraversalLimitExceeded)
+                        }
+                    })?;
+                if let Some(ancestor_cid) = revoked_ancestor {
                     return Err(InvocationError::DelegationAncestorRevoked {
                         ancestor_cid,
                         invoked_cid: p.id.to_cid(0x55).to_string(),
@@ -302,43 +312,6 @@ fn extract_sql_caveat(
         }
     }
     None
-}
-
-/// True if `delegation_id` has an active revocation row.
-async fn is_revoked<C: ConnectionTrait>(db: &C, delegation_id: &Hash) -> Result<bool, DbErr> {
-    let n = revocation::Entity::find()
-        .filter(revocation::Column::Revoked.eq(*delegation_id))
-        .count(db)
-        .await?;
-    Ok(n > 0)
-}
-
-/// Walk a chain transitively from `start` toward the root via the
-/// parent_delegations table and return the first revoked ancestor's CID, if
-/// any. Stops at the first hit; otherwise returns None.
-async fn first_revoked_ancestor<C: ConnectionTrait>(
-    db: &C,
-    start: &Hash,
-) -> Result<Option<String>, DbErr> {
-    let mut frontier: Vec<Hash> = vec![*start];
-    let mut visited: std::collections::HashSet<Hash> = std::collections::HashSet::new();
-    while let Some(current) = frontier.pop() {
-        if !visited.insert(current) {
-            continue;
-        }
-        let parents = parent_delegations::Entity::find()
-            .filter(parent_delegations::Column::Child.eq(current))
-            .all(db)
-            .await?;
-        for link in parents {
-            let parent_id = link.parent;
-            if is_revoked(db, &parent_id).await? {
-                return Ok(Some(parent_id.to_cid(0x55).to_string()));
-            }
-            frontier.push(parent_id);
-        }
-    }
-    Ok(None)
 }
 
 fn is_root_authority(cap: &util::Capability, invoker: &str) -> bool {
@@ -628,7 +601,70 @@ async fn enqueue_kv_webhook_deliveries<C: ConnectionTrait>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migrations::Migrator;
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database};
+    use sea_orm_migration::MigratorTrait;
     use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn existing_child_chain_is_rejected_after_parent_revocation() {
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+
+        for actor_id in ["did:key:owner", "did:key:parent", "did:key:child"] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        let parent_id = crate::hash::hash(b"parent");
+        let child_id = crate::hash::hash(b"existing-child");
+        for (id, delegator, delegatee) in [
+            (parent_id, "did:key:owner", "did:key:parent"),
+            (child_id, "did:key:parent", "did:key:child"),
+        ] {
+            delegation::ActiveModel {
+                id: Set(id),
+                delegator: Set(delegator.to_string()),
+                delegatee: Set(delegatee.to_string()),
+                expiry: Set(None),
+                issued_at: Set(None),
+                not_before: Set(None),
+                facts: Set(None),
+                serialization: Set(id.as_ref().to_vec()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        parent_delegations::ActiveModel {
+            parent: Set(parent_id),
+            child: Set(child_id),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        revocation::ActiveModel {
+            id: Set(crate::hash::hash(b"revocation")),
+            revoker: Set("did:key:owner".to_string()),
+            revoked: Set(parent_id),
+            serialization: Set(b"revocation".to_vec()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            revocation::first_revoked_ancestor(&db, &child_id)
+                .await
+                .unwrap(),
+            Some(parent_id.to_cid(0x55).to_string())
+        );
+    }
 
     #[test]
     fn kv_webhook_payload_serializes_with_type_field() {

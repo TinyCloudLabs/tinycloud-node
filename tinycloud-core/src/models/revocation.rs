@@ -1,7 +1,8 @@
 use super::super::{events::Revocation, models::*, relationships::*};
 use crate::hash::{hash, Hash};
 use crate::models::did_resolution::did_resolution_timeout;
-use sea_orm::{entity::prelude::*, sea_query::OnConflict, ConnectionTrait};
+use sea_orm::{entity::prelude::*, sea_query::OnConflict, ConnectionTrait, QuerySelect};
+use std::collections::HashSet;
 use time::OffsetDateTime;
 use tinycloud_auth::{
     authorization::TinyCloudRevocation, identity::did_principal_matches, ssi::dids::AnyDidMethod,
@@ -47,6 +48,74 @@ impl Related<delegation::Entity> for Entity {
 }
 
 impl ActiveModelBehavior for ActiveModel {}
+
+/// Maximum number of distinct delegation nodes examined while validating a
+/// proof chain. This bounds database work for deep and wide proof DAGs.
+pub const MAX_CHAIN_TRAVERSAL_NODES: usize = 64;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ChainTraversalError {
+    #[error(transparent)]
+    Db(#[from] DbErr),
+    #[error("delegation-chain-traversal-limit-exceeded")]
+    LimitExceeded,
+}
+
+pub(crate) async fn is_revoked<C: ConnectionTrait>(
+    db: &C,
+    delegation_id: &Hash,
+) -> Result<bool, DbErr> {
+    Ok(Entity::find()
+        .filter(Column::Revoked.eq(*delegation_id))
+        .count(db)
+        .await?
+        > 0)
+}
+
+pub(crate) async fn first_revoked_ancestor<C: ConnectionTrait>(
+    db: &C,
+    start: &Hash,
+) -> Result<Option<String>, ChainTraversalError> {
+    for ancestor in ancestor_chain_ids(db, start).await?.into_iter().skip(1) {
+        if is_revoked(db, &ancestor).await? {
+            return Ok(Some(ancestor.to_cid(0x55).to_string()));
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) async fn ancestor_chain_ids<C: ConnectionTrait>(
+    db: &C,
+    start: &Hash,
+) -> Result<Vec<Hash>, ChainTraversalError> {
+    let mut frontier = vec![*start];
+    let mut visited = HashSet::new();
+    let mut ordered = Vec::new();
+    while let Some(current) = frontier.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        if visited.len() > MAX_CHAIN_TRAVERSAL_NODES {
+            return Err(ChainTraversalError::LimitExceeded);
+        }
+        let remaining = MAX_CHAIN_TRAVERSAL_NODES - visited.len();
+        ordered.push(current);
+        let parents = parent_delegations::Entity::find()
+            .filter(parent_delegations::Column::Child.eq(current))
+            .limit((remaining + 1) as u64)
+            .all(db)
+            .await?;
+        for link in parents {
+            if !visited.contains(&link.parent) && !frontier.contains(&link.parent) {
+                if visited.len() + frontier.len() >= MAX_CHAIN_TRAVERSAL_NODES {
+                    return Err(ChainTraversalError::LimitExceeded);
+                }
+                frontier.push(link.parent);
+            }
+        }
+    }
+    Ok(ordered)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -185,4 +254,101 @@ async fn revoker_is_authorized<C: ConnectionTrait>(
         }
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migrations::Migrator;
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database};
+    use sea_orm_migration::MigratorTrait;
+
+    async fn database() -> sea_orm::DbConn {
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        actor::ActiveModel {
+            id: Set("did:key:actor".to_string()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        db
+    }
+
+    async fn insert_delegation(db: &sea_orm::DbConn, id: Hash) {
+        delegation::ActiveModel {
+            id: Set(id),
+            delegator: Set("did:key:actor".to_string()),
+            delegatee: Set("did:key:actor".to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(id.as_ref().to_vec()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_link(db: &sea_orm::DbConn, child: Hash, parent: Hash) {
+        parent_delegations::ActiveModel {
+            parent: Set(parent),
+            child: Set(child),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn deep_chain_fails_closed_at_traversal_limit() {
+        let db = database().await;
+        let ids: Vec<_> = (0..=MAX_CHAIN_TRAVERSAL_NODES)
+            .map(|index| hash(format!("deep-{index}").as_bytes()))
+            .collect();
+        for id in &ids {
+            insert_delegation(&db, *id).await;
+        }
+        for pair in ids.windows(2) {
+            insert_link(&db, pair[0], pair[1]).await;
+        }
+
+        assert!(matches!(
+            first_revoked_ancestor(&db, &ids[0]).await,
+            Err(ChainTraversalError::LimitExceeded)
+        ));
+    }
+
+    #[tokio::test]
+    async fn wide_proof_dag_fails_closed_at_traversal_limit() {
+        let db = database().await;
+        let child = hash(b"wide-child");
+        insert_delegation(&db, child).await;
+        for index in 0..MAX_CHAIN_TRAVERSAL_NODES {
+            let parent = hash(format!("wide-parent-{index}").as_bytes());
+            insert_delegation(&db, parent).await;
+            insert_link(&db, child, parent).await;
+        }
+
+        assert!(matches!(
+            first_revoked_ancestor(&db, &child).await,
+            Err(ChainTraversalError::LimitExceeded)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cyclic_proof_graph_terminates_without_amplification() {
+        let db = database().await;
+        let first = hash(b"cycle-first");
+        let second = hash(b"cycle-second");
+        insert_delegation(&db, first).await;
+        insert_delegation(&db, second).await;
+        insert_link(&db, first, second).await;
+        insert_link(&db, second, first).await;
+
+        assert_eq!(first_revoked_ancestor(&db, &first).await.unwrap(), None);
+    }
 }

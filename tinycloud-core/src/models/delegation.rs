@@ -131,6 +131,15 @@ pub enum DelegationError {
     /// Maps to `terminal-parent-cannot-redelegate` in the W0 vectors.
     #[error("terminal-parent-cannot-redelegate")]
     TerminalParentCannotRedelegate,
+    #[error("delegation-parent-revoked: {0}")]
+    ParentRevoked(String),
+    #[error("delegation-ancestor-revoked: ancestor={ancestor_cid} parent={parent_cid}")]
+    AncestorRevoked {
+        ancestor_cid: String,
+        parent_cid: String,
+    },
+    #[error("delegation-chain-traversal-limit-exceeded")]
+    ChainTraversalLimitExceeded,
     /// W1: child caveats are not a subset of the parent's caveats — the
     /// child dropped, widened, or replaced a constrained-statements caveat
     /// the parent carried (audit P0 finding 1). Maps to the spec rejection
@@ -215,6 +224,13 @@ async fn validate<C: ConnectionTrait>(
             // If no parents match by CID and delegatee, return MissingParents
             if all_parents.is_empty() {
                 return Err(DelegationError::MissingParents.into());
+            }
+
+            // A revoked grant cannot authorize new descendants. Check both
+            // the directly cited parents and their transitive ancestors on
+            // every registration so revocation takes effect immediately.
+            for parent in &all_parents {
+                ensure_parent_active(db, &parent.id).await?;
             }
 
             // W1 (B): reject any chain that cites a terminal parent. The
@@ -392,6 +408,28 @@ fn parent_is_terminal(p: &Model) -> bool {
         .unwrap_or(false)
 }
 
+async fn ensure_parent_active<C: ConnectionTrait>(db: &C, parent_id: &Hash) -> Result<(), Error> {
+    if revocation::is_revoked(db, parent_id).await? {
+        return Err(DelegationError::ParentRevoked(parent_id.to_cid(0x55).to_string()).into());
+    }
+    let revoked_ancestor = revocation::first_revoked_ancestor(db, parent_id)
+        .await
+        .map_err(|error| match error {
+            revocation::ChainTraversalError::Db(error) => Error::Db(error),
+            revocation::ChainTraversalError::LimitExceeded => {
+                Error::InvalidDelegation(DelegationError::ChainTraversalLimitExceeded)
+            }
+        })?;
+    if let Some(ancestor_cid) = revoked_ancestor {
+        return Err(DelegationError::AncestorRevoked {
+            ancestor_cid,
+            parent_cid: parent_id.to_cid(0x55).to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn is_root_authority(cap: &util::Capability, delegator: &str) -> bool {
     if cap
         .resource
@@ -515,4 +553,68 @@ async fn save_actors<C: ConnectionTrait>(actors: &[&str], db: &C) -> Result<(), 
         }
     };
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migrations::Migrator;
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database};
+    use sea_orm_migration::MigratorTrait;
+
+    async fn database() -> sea_orm::DbConn {
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        db
+    }
+
+    async fn insert_delegation(db: &sea_orm::DbConn, id: Hash, delegator: &str, delegatee: &str) {
+        for actor_id in [delegator, delegatee] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(db)
+            .await
+            .ok();
+        }
+        ActiveModel {
+            id: Set(id),
+            delegator: Set(delegator.to_string()),
+            delegatee: Set(delegatee.to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(id.as_ref().to_vec()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn new_child_from_revoked_parent_is_rejected() {
+        let db = database().await;
+        let parent_id = crate::hash::hash(b"revoked-parent");
+        insert_delegation(&db, parent_id, "did:key:owner", "did:key:holder").await;
+        revocation::ActiveModel {
+            id: Set(crate::hash::hash(b"parent-revocation")),
+            revoker: Set("did:key:owner".to_string()),
+            revoked: Set(parent_id),
+            serialization: Set(b"parent-revocation".to_vec()),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        let error = ensure_parent_active(&db, &parent_id)
+            .await
+            .expect_err("a revoked parent must not authorize a new child");
+        assert!(matches!(
+            error,
+            Error::InvalidDelegation(DelegationError::ParentRevoked(_))
+        ));
+    }
 }
