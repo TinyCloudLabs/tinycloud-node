@@ -5,7 +5,9 @@ use sea_orm::{entity::prelude::*, sea_query::OnConflict, ConnectionTrait, QueryS
 use std::collections::HashSet;
 use time::OffsetDateTime;
 use tinycloud_auth::{
-    authorization::TinyCloudRevocation, identity::did_principal_matches, ssi::dids::AnyDidMethod,
+    authorization::{Cid, TinyCloudRevocation},
+    identity::did_principal_matches,
+    ssi::dids::AnyDidMethod,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
@@ -117,6 +119,58 @@ pub(crate) async fn ancestor_chain_ids<C: ConnectionTrait>(
     Ok(ordered)
 }
 
+/// Resolve the persistent principals represented by exact session proofs.
+/// Every cited proof must identify the signer as its delegatee and remain
+/// current and unrevoked. Invalid, over-budget, or mixed proof sets fail
+/// closed without falling back to a global DID lookup.
+pub(crate) async fn proven_persistent_principals<C: ConnectionTrait>(
+    db: &C,
+    signer: &str,
+    proofs: &[Cid],
+) -> Result<Vec<String>, DbErr> {
+    if proofs.is_empty() || proofs.len() > MAX_CHAIN_TRAVERSAL_NODES {
+        return Ok(Vec::new());
+    }
+
+    let now = OffsetDateTime::now_utc();
+    let mut principals = Vec::new();
+    let mut chain_nodes = HashSet::new();
+    for proof in proofs {
+        let proof_id = Hash::from(*proof);
+        let Some(parent) = delegation::Entity::find_by_id(proof_id).one(db).await? else {
+            return Ok(Vec::new());
+        };
+        if !did_principal_matches(&parent.delegatee, signer)
+            || parent.expiry.map(|expiry| now >= expiry).unwrap_or(false)
+            || parent
+                .not_before
+                .map(|not_before| now < not_before)
+                .unwrap_or(false)
+        {
+            return Ok(Vec::new());
+        }
+        let nodes = match ancestor_chain_ids(db, &proof_id).await {
+            Ok(nodes) => nodes,
+            Err(ChainTraversalError::Db(error)) => return Err(error),
+            Err(ChainTraversalError::LimitExceeded) => return Ok(Vec::new()),
+        };
+        chain_nodes.extend(nodes);
+        if chain_nodes.len() > MAX_CHAIN_TRAVERSAL_NODES {
+            return Ok(Vec::new());
+        }
+        principals.push(parent.delegator);
+    }
+
+    for node in chain_nodes {
+        if is_revoked(db, &node).await? {
+            return Ok(Vec::new());
+        }
+    }
+    principals.sort();
+    principals.dedup();
+    Ok(principals)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -187,7 +241,7 @@ pub(crate) async fn process<C: ConnectionTrait>(
     // Any one of these is sufficient. The Cacao revoker == delegator
     // path stays as the cheapest check; owner-authorized falls back to
     // walking the ability rows.
-    if !revoker_is_authorized(db, &delegation, &r.revoker).await? {
+    if !revoker_is_authorized(db, &delegation, &r.revoker, &r.parents).await? {
         return Err(RevocationError::UnauthorizedRevoker(r.revoker).into());
     };
 
@@ -234,11 +288,20 @@ async fn revoker_is_authorized<C: ConnectionTrait>(
     db: &C,
     delegation: &delegation::Model,
     revoker: &str,
+    proofs: &[Cid],
 ) -> Result<bool, DbErr> {
-    if did_principal_matches(&delegation.delegator, revoker) {
+    let mut principals = vec![revoker.to_string()];
+    principals.extend(proven_persistent_principals(db, revoker, proofs).await?);
+    if principals
+        .iter()
+        .any(|principal| did_principal_matches(&delegation.delegator, principal))
+    {
         return Ok(true);
     }
-    if did_principal_matches(&delegation.delegatee, revoker) {
+    if principals
+        .iter()
+        .any(|principal| did_principal_matches(&delegation.delegatee, principal))
+    {
         return Ok(true);
     }
 
@@ -248,7 +311,10 @@ async fn revoker_is_authorized<C: ConnectionTrait>(
         .await?;
     for row in ability_rows {
         if let Some(space) = row.resource.space() {
-            if did_principal_matches(space.did().as_str(), revoker) {
+            if principals
+                .iter()
+                .any(|principal| did_principal_matches(space.did().as_str(), principal))
+            {
                 return Ok(true);
             }
         }

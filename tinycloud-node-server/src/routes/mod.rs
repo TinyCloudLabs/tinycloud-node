@@ -296,7 +296,7 @@ pub async fn delegation_status(
         .map_err(|_| (Status::BadRequest, "Invalid delegation CID".to_string()))?;
     let target = tinycloud_core::hash::Hash::from(cid);
     match tinycloud
-        .delegation_status(target, &auth.invoker)
+        .delegation_status(target, &auth.invoker, &auth.parents)
         .await
         .map_err(|_| (Status::ServiceUnavailable, "Status unavailable".to_string()))?
     {
@@ -3653,6 +3653,7 @@ mod tests {
     async fn delegation_status_reports_chain_state_without_target_oracle() -> Result<()> {
         use rocket::http::{ContentType, Header, Status};
         use rocket::local::asynchronous::Client;
+        use tinycloud_auth::authorization::Cid as AuthCid;
         use tinycloud_auth::ssi::{
             claims::jwt::NumericDate,
             dids::{DIDBuf, DIDURLBuf},
@@ -3680,6 +3681,17 @@ mod tests {
             cid: &str,
             nonce: &str,
         ) -> Result<String> {
+            status_header_with_proofs(jwk, verification_method, did, cid, nonce, Vec::new())
+        }
+
+        fn status_header_with_proofs(
+            jwk: &JWK,
+            verification_method: &str,
+            did: &str,
+            cid: &str,
+            nonce: &str,
+            proofs: Vec<AuthCid>,
+        ) -> Result<String> {
             let mut capabilities = Capabilities::new();
             capabilities.with_action(
                 format!("urn:cid:{cid}").parse()?,
@@ -3693,7 +3705,34 @@ mod tests {
                 expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
                 nonce: Some(nonce.to_string()),
                 facts: Some(Vec::<serde_json::Value>::new()),
-                proof: vec![],
+                proof: proofs,
+                attenuation: capabilities,
+            }
+            .sign(jwk.get_algorithm().unwrap_or_default(), jwk)?
+            .encode()?)
+        }
+
+        fn revocation_header(
+            jwk: &JWK,
+            verification_method: &str,
+            did: &str,
+            cid: &str,
+            proof: AuthCid,
+        ) -> Result<String> {
+            let mut capabilities = Capabilities::new();
+            capabilities.with_action(
+                format!("urn:cid:{cid}").parse()?,
+                "tinycloud.delegation/revoke".parse::<UcanAbility>()?,
+                [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+            );
+            Ok(Payload {
+                issuer: verification_method.parse::<DIDURLBuf>()?,
+                audience: did.parse::<DIDBuf>()?,
+                not_before: None,
+                expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
+                nonce: Some("session-revokes-pkh-child".to_string()),
+                facts: Some(Vec::<serde_json::Value>::new()),
+                proof: vec![proof],
                 attenuation: capabilities,
             }
             .sign(jwk.get_algorithm().unwrap_or_default(), jwk)?
@@ -3706,7 +3745,10 @@ mod tests {
         holder_jwk.algorithm = Some(Algorithm::EdDSA);
         let (holder_did, holder_vm) = verification_method(&holder_jwk)?;
         let owner_did = "did:key:zStatusOwner".to_string();
-        for did in [&owner_did, &holder_did] {
+        let wallet_pkh = "did:pkh:eip155:1:0x1111111111111111111111111111111111111111".to_string();
+        let unrelated_pkh =
+            "did:pkh:eip155:1:0x2222222222222222222222222222222222222222".to_string();
+        for did in [&owner_did, &holder_did, &wallet_pkh, &unrelated_pkh] {
             actor::ActiveModel {
                 id: Set(did.clone()),
             }
@@ -3787,6 +3829,42 @@ mod tests {
         }
         .insert(&conn)
         .await?;
+        let wallet_session_id = tinycloud_core::hash::hash(b"wallet-session-proof");
+        let unrelated_session_id = tinycloud_core::hash::hash(b"unrelated-session-proof");
+        let wallet_child_id = tinycloud_core::hash::hash(b"wallet-pkh-child");
+        for (id, delegator, delegatee, bytes) in [
+            (
+                wallet_session_id,
+                &wallet_pkh,
+                &holder_did,
+                b"wallet-session-proof".as_slice(),
+            ),
+            (
+                unrelated_session_id,
+                &unrelated_pkh,
+                &holder_did,
+                b"unrelated-session-proof".as_slice(),
+            ),
+            (
+                wallet_child_id,
+                &owner_did,
+                &wallet_pkh,
+                b"wallet-pkh-child".as_slice(),
+            ),
+        ] {
+            deleg_model::ActiveModel {
+                id: Set(id),
+                delegator: Set(delegator.clone()),
+                delegatee: Set(delegatee.clone()),
+                expiry: Set(None),
+                issued_at: Set(None),
+                not_before: Set(None),
+                facts: Set(None),
+                serialization: Set(bytes.to_vec()),
+            }
+            .insert(&conn)
+            .await?;
+        }
         parent_delegations::ActiveModel {
             parent: Set(parent_id),
             child: Set(child_id),
@@ -3796,7 +3874,10 @@ mod tests {
         conn.commit().await?;
 
         let rocket = rocket::build()
-            .mount("/", routes![delegation_status])
+            .mount("/", routes![delegation_status, revoke])
+            .attach(crate::tracing::TracingFairing {
+                header_name: Config::default().log.tracing.traceheader,
+            })
             .manage(tinycloud);
         let client = Client::tracked(rocket).await?;
         let child_cid = child_id.to_cid(0x55).to_string();
@@ -3833,6 +3914,72 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&response.into_string().await.unwrap())?;
         assert_eq!(body["status"], "active");
         assert_eq!(body["active"], true);
+
+        let wallet_child_cid = wallet_child_id.to_cid(0x55).to_string();
+        let response = request(
+            &wallet_child_cid,
+            status_header_with_proofs(
+                &holder_jwk,
+                &holder_vm,
+                &holder_did,
+                &wallet_child_cid,
+                "wallet-session-status",
+                vec![wallet_session_id.to_cid(0x55)],
+            )?,
+        )
+        .dispatch()
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value = serde_json::from_str(&response.into_string().await.unwrap())?;
+        assert_eq!(body["status"], "active");
+
+        let response = request(
+            &wallet_child_cid,
+            status_header_with_proofs(
+                &holder_jwk,
+                &holder_vm,
+                &holder_did,
+                &wallet_child_cid,
+                "unrelated-session-status",
+                vec![unrelated_session_id.to_cid(0x55)],
+            )?,
+        )
+        .dispatch()
+        .await;
+        assert_eq!(response.status(), Status::NotFound);
+
+        let response = client
+            .post("/revoke")
+            .header(Header::new(
+                "Authorization",
+                revocation_header(
+                    &holder_jwk,
+                    &holder_vm,
+                    &holder_did,
+                    &wallet_child_cid,
+                    wallet_session_id.to_cid(0x55),
+                )?,
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+
+        let response = request(
+            &wallet_child_cid,
+            status_header_with_proofs(
+                &holder_jwk,
+                &holder_vm,
+                &holder_did,
+                &wallet_child_cid,
+                "wallet-session-post-revoke",
+                vec![wallet_session_id.to_cid(0x55)],
+            )?,
+        )
+        .dispatch()
+        .await;
+        let body: serde_json::Value = serde_json::from_str(&response.into_string().await.unwrap())?;
+        assert_eq!(body["status"], "revoked");
+        assert_eq!(body["revoked"], true);
 
         let conn = client
             .rocket()

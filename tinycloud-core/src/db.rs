@@ -599,9 +599,9 @@ where
     }
 
     pub async fn revoke(&self, revocation: Revocation) -> Result<TransactResult, TxError<B, K>> {
-        let _chain_guards = self
-            .acquire_chain_guards(&[Hash::from(revocation.0.revoked)])
-            .await?;
+        let mut roots = vec![Hash::from(revocation.0.revoked)];
+        roots.extend(revocation.0.parents.iter().copied().map(Hash::from));
+        let _chain_guards = self.acquire_chain_guards(&roots).await?;
         self.transact(vec![Event::Revocation(Box::new(revocation))])
             .await
     }
@@ -610,6 +610,7 @@ where
         &self,
         target: Hash,
         invoker: &str,
+        proofs: &[tinycloud_auth::authorization::Cid],
     ) -> Result<Option<DelegationStatus>, TxError<B, K>> {
         let Some(delegation) = delegation::Entity::find_by_id(target)
             .one(&self.conn)
@@ -622,26 +623,36 @@ where
             .all(&self.conn)
             .await?;
 
-        let authorized = did_principal_matches(&delegation.delegator, invoker)
-            || did_principal_matches(&delegation.delegatee, invoker)
-            || abilities.iter().any(|ability| {
-                ability
-                    .resource
-                    .space()
-                    .map(|space| did_principal_matches(space.did().as_str(), invoker))
-                    .unwrap_or(false)
-            });
-        if !authorized {
-            return Ok(None);
-        }
-
-        let _chain_guards = match self.acquire_chain_guards(&[target]).await {
+        let mut roots = vec![target];
+        roots.extend(proofs.iter().copied().map(Hash::from));
+        let _chain_guards = match self.acquire_chain_guards(&roots).await {
             Ok(guards) => guards,
             Err(TxError::ChainTraversalLimitExceeded) => {
                 return Ok(Some(DelegationStatus::Unavailable));
             }
             Err(error) => return Err(error),
         };
+
+        let mut principals = vec![invoker.to_string()];
+        principals
+            .extend(revocation::proven_persistent_principals(&self.conn, invoker, proofs).await?);
+        let authorized = principals.iter().any(|principal| {
+            did_principal_matches(&delegation.delegator, principal)
+                || did_principal_matches(&delegation.delegatee, principal)
+        }) || abilities.iter().any(|ability| {
+            ability
+                .resource
+                .space()
+                .map(|space| {
+                    principals
+                        .iter()
+                        .any(|principal| did_principal_matches(space.did().as_str(), principal))
+                })
+                .unwrap_or(false)
+        });
+        if !authorized {
+            return Ok(None);
+        }
 
         if revocation::is_revoked(&self.conn, &target).await? {
             return Ok(Some(DelegationStatus::Revoked));
