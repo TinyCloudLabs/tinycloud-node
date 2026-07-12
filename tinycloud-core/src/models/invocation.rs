@@ -111,7 +111,7 @@ pub(crate) async fn process<C: ConnectionTrait>(
     encryption: Option<&ColumnEncryption>,
 ) -> Result<Hash, Error> {
     let (i, serialized) = (invocation.0, invocation.1);
-    verify(&i.invocation).await?;
+    verify_invocation(&i.invocation).await?;
 
     let now = OffsetDateTime::now_utc();
     validate(db, &i, Some(now)).await?;
@@ -119,7 +119,7 @@ pub(crate) async fn process<C: ConnectionTrait>(
     save(db, i, Some(now), serialized, ops, encryption).await
 }
 
-async fn verify(invocation: &TinyCloudInvocation) -> Result<(), Error> {
+pub async fn verify_invocation(invocation: &TinyCloudInvocation) -> Result<(), Error> {
     tokio::time::timeout(
         did_resolution_timeout(),
         invocation

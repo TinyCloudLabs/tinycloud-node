@@ -75,6 +75,14 @@ pub struct TransactResult {
     pub delegation_cids: Vec<Hash>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegationStatus {
+    Active,
+    Revoked,
+    Expired,
+    Unavailable,
+}
+
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum TxError<S: StorageSetup, K: Secrets> {
@@ -596,6 +604,73 @@ where
             .await?;
         self.transact(vec![Event::Revocation(Box::new(revocation))])
             .await
+    }
+
+    pub async fn delegation_status(
+        &self,
+        target: Hash,
+        invoker: &str,
+    ) -> Result<Option<DelegationStatus>, TxError<B, K>> {
+        let Some(delegation) = delegation::Entity::find_by_id(target)
+            .one(&self.conn)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let abilities = abilities::Entity::find()
+            .filter(abilities::Column::Delegation.eq(target))
+            .all(&self.conn)
+            .await?;
+
+        let authorized = did_principal_matches(&delegation.delegator, invoker)
+            || did_principal_matches(&delegation.delegatee, invoker)
+            || abilities.iter().any(|ability| {
+                ability
+                    .resource
+                    .space()
+                    .map(|space| did_principal_matches(space.did().as_str(), invoker))
+                    .unwrap_or(false)
+            });
+        if !authorized {
+            return Ok(None);
+        }
+
+        let _chain_guards = match self.acquire_chain_guards(&[target]).await {
+            Ok(guards) => guards,
+            Err(TxError::ChainTraversalLimitExceeded) => {
+                return Ok(Some(DelegationStatus::Unavailable));
+            }
+            Err(error) => return Err(error),
+        };
+
+        if revocation::is_revoked(&self.conn, &target).await? {
+            return Ok(Some(DelegationStatus::Revoked));
+        }
+        match revocation::first_revoked_ancestor(&self.conn, &target).await {
+            Ok(Some(_)) => return Ok(Some(DelegationStatus::Revoked)),
+            Ok(None) => {}
+            Err(revocation::ChainTraversalError::LimitExceeded) => {
+                return Ok(Some(DelegationStatus::Unavailable));
+            }
+            Err(revocation::ChainTraversalError::Db(error)) => return Err(error.into()),
+        }
+
+        let now = OffsetDateTime::now_utc();
+        if delegation
+            .expiry
+            .map(|expiry| now >= expiry)
+            .unwrap_or(false)
+        {
+            return Ok(Some(DelegationStatus::Expired));
+        }
+        if delegation
+            .not_before
+            .map(|not_before| now < not_before)
+            .unwrap_or(false)
+        {
+            return Ok(Some(DelegationStatus::Unavailable));
+        }
+        Ok(Some(DelegationStatus::Active))
     }
 
     pub async fn invoke<S>(

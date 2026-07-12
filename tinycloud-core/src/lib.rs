@@ -19,7 +19,10 @@ pub mod types;
 pub mod util;
 pub mod write_hooks;
 
-pub use db::{Commit, InvocationOutcome, SpaceDatabase, TransactResult, TxError, TxStoreError};
+pub use db::{
+    Commit, DelegationStatus, InvocationOutcome, SpaceDatabase, TransactResult, TxError,
+    TxStoreError,
+};
 pub use encryption::ColumnEncryption;
 pub use libp2p;
 pub use sea_orm;

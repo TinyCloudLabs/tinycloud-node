@@ -1,8 +1,8 @@
 use anyhow::Result;
 use futures::io::AsyncWriteExt;
 use percent_encoding::percent_decode_str;
-use rocket::{data::ToByteUnit, http::Status, serde::json::Json, State};
-use serde::Serialize;
+use rocket::{data::ToByteUnit, http::Status, response::status::Custom, serde::json::Json, State};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     time::Instant,
@@ -35,7 +35,9 @@ use tinycloud_core::duckdb::{
 use tinycloud_core::{
     encryption_network::EncryptionService,
     events::Invocation,
-    models::{hook_delivery, hook_subscription, kv_delete, kv_write},
+    models::{
+        hook_delivery, hook_subscription, invocation as invocation_model, kv_delete, kv_write,
+    },
     sea_orm::DbErr,
     sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder},
     sql::{SqlCaveats, SqlError, SqlRequest, SqlService},
@@ -43,7 +45,7 @@ use tinycloud_core::{
     types::{Ability, Metadata, Resource},
     util::{Capability, DelegationInfo, InvocationInfo, RevocationInfo},
     write_hooks::{db_table_path, hook_delivery_id, subscription_matches_event, TouchedTables},
-    InvocationOutcome, TransactResult, TxError, TxStoreError,
+    DelegationStatus, InvocationOutcome, TransactResult, TxError, TxStoreError,
 };
 
 pub mod admin;
@@ -208,6 +210,105 @@ pub struct DelegateResponse {
     pub cid: String,
     pub activated: Vec<String>,
     pub skipped: Vec<String>,
+}
+
+#[derive(Deserialize)]
+pub struct DelegationStatusRequest {
+    pub cid: String,
+}
+
+#[derive(Serialize)]
+pub struct DelegationStatusResponse {
+    pub cid: String,
+    pub status: &'static str,
+    pub exists: bool,
+    pub active: bool,
+    pub revoked: bool,
+    pub expired: bool,
+}
+
+impl DelegationStatusResponse {
+    fn from_status(cid: String, status: DelegationStatus) -> Self {
+        let status_name = match status {
+            DelegationStatus::Active => "active",
+            DelegationStatus::Revoked => "revoked",
+            DelegationStatus::Expired => "expired",
+            DelegationStatus::Unavailable => "unavailable",
+        };
+        Self {
+            cid,
+            status: status_name,
+            exists: true,
+            active: status == DelegationStatus::Active,
+            revoked: status == DelegationStatus::Revoked,
+            expired: status == DelegationStatus::Expired,
+        }
+    }
+
+    fn not_found(cid: String) -> Self {
+        Self {
+            cid,
+            status: "not_found",
+            exists: false,
+            active: false,
+            revoked: false,
+            expired: false,
+        }
+    }
+}
+
+#[post("/delegation/status", format = "json", data = "<request>")]
+pub async fn delegation_status(
+    invocation: AuthHeaderGetter<InvocationInfo>,
+    request: Json<DelegationStatusRequest>,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Custom<Json<DelegationStatusResponse>>, (Status, String)> {
+    let request = request.into_inner();
+    let auth = &invocation.0 .0;
+    invocation_model::verify_invocation(&auth.invocation)
+        .await
+        .map_err(|_| {
+            (
+                Status::Unauthorized,
+                "Invalid status invocation".to_string(),
+            )
+        })?;
+
+    let expected_resource = format!("urn:cid:{}", request.cid);
+    let bound = auth.capabilities.len() == 1
+        && auth.capabilities.iter().any(|capability| {
+            capability.ability.as_ref().as_ref() == "tinycloud.delegation/status"
+                && matches!(
+                    &capability.resource,
+                    Resource::Other(resource) if resource.as_str() == expected_resource
+                )
+        });
+    if !bound {
+        return Err((
+            Status::Forbidden,
+            "Status invocation is not bound to the requested CID".to_string(),
+        ));
+    }
+
+    let cid: tinycloud_auth::authorization::Cid = request
+        .cid
+        .parse()
+        .map_err(|_| (Status::BadRequest, "Invalid delegation CID".to_string()))?;
+    let target = tinycloud_core::hash::Hash::from(cid);
+    match tinycloud
+        .delegation_status(target, &auth.invoker)
+        .await
+        .map_err(|_| (Status::ServiceUnavailable, "Status unavailable".to_string()))?
+    {
+        Some(status) => Ok(Custom(
+            Status::Ok,
+            Json(DelegationStatusResponse::from_status(request.cid, status)),
+        )),
+        None => Ok(Custom(
+            Status::NotFound,
+            Json(DelegationStatusResponse::not_found(request.cid)),
+        )),
+    }
 }
 
 #[post("/delegate")]
@@ -3545,6 +3646,298 @@ mod tests {
         assert!(row.is_some(), "revocation row must persist for chain check");
 
         let _ = tinycloud;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delegation_status_reports_chain_state_without_target_oracle() -> Result<()> {
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+        use tinycloud_auth::ssi::{
+            claims::jwt::NumericDate,
+            dids::{DIDBuf, DIDURLBuf},
+            jwk::Algorithm,
+            ucan::Payload,
+        };
+        use tinycloud_auth::ucan_capabilities_object::Capabilities;
+        use tinycloud_core::models::{actor, delegation as deleg_model, revocation as revo_model};
+        use tinycloud_core::relationships::parent_delegations;
+        use tinycloud_core::sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        fn verification_method(jwk: &JWK) -> Result<(String, String)> {
+            let did = DID_METHODS.generate(jwk, "key")?.to_string();
+            let fragment = did
+                .rsplit_once(':')
+                .ok_or_else(|| anyhow::anyhow!("missing did:key fragment"))?
+                .1;
+            Ok((did.clone(), format!("{did}#{fragment}")))
+        }
+
+        fn status_header(
+            jwk: &JWK,
+            verification_method: &str,
+            did: &str,
+            cid: &str,
+            nonce: &str,
+        ) -> Result<String> {
+            let mut capabilities = Capabilities::new();
+            capabilities.with_action(
+                format!("urn:cid:{cid}").parse()?,
+                "tinycloud.delegation/status".parse::<UcanAbility>()?,
+                [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+            );
+            Ok(Payload {
+                issuer: verification_method.parse::<DIDURLBuf>()?,
+                audience: did.parse::<DIDBuf>()?,
+                not_before: None,
+                expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
+                nonce: Some(nonce.to_string()),
+                facts: Some(Vec::<serde_json::Value>::new()),
+                proof: vec![],
+                attenuation: capabilities,
+            }
+            .sign(jwk.get_algorithm().unwrap_or_default(), jwk)?
+            .encode()?)
+        }
+
+        let tinycloud = test_tinycloud().await?;
+        let conn = tinycloud.readable().await?;
+        let mut holder_jwk = JWK::generate_ed25519()?;
+        holder_jwk.algorithm = Some(Algorithm::EdDSA);
+        let (holder_did, holder_vm) = verification_method(&holder_jwk)?;
+        let owner_did = "did:key:zStatusOwner".to_string();
+        for did in [&owner_did, &holder_did] {
+            actor::ActiveModel {
+                id: Set(did.clone()),
+            }
+            .insert(&conn)
+            .await?;
+        }
+        let parent_id = tinycloud_core::hash::hash(b"status-parent");
+        let mut child_capabilities = Capabilities::new();
+        child_capabilities.with_action(
+            format!("urn:cid:{}", parent_id.to_cid(0x55)).parse()?,
+            "tinycloud.delegation/status".parse::<UcanAbility>()?,
+            [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+        );
+        let child_serialization = Payload {
+            issuer: holder_vm.parse::<DIDURLBuf>()?,
+            audience: holder_did.parse::<DIDBuf>()?,
+            not_before: None,
+            expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
+            nonce: Some("signed-status-child".to_string()),
+            facts: Some(Vec::<serde_json::Value>::new()),
+            proof: vec![parent_id.to_cid(0x55)],
+            attenuation: child_capabilities,
+        }
+        .sign(holder_jwk.get_algorithm().unwrap_or_default(), &holder_jwk)?
+        .encode()?
+        .into_bytes();
+        let child_id = tinycloud_core::hash::hash(&child_serialization);
+        let direct_id = tinycloud_core::hash::hash(b"status-direct");
+        for (id, delegator, delegatee, bytes) in [
+            (
+                parent_id,
+                &owner_did,
+                &holder_did,
+                b"status-parent".as_slice(),
+            ),
+            (
+                direct_id,
+                &owner_did,
+                &holder_did,
+                b"status-direct".as_slice(),
+            ),
+        ] {
+            deleg_model::ActiveModel {
+                id: Set(id),
+                delegator: Set(delegator.clone()),
+                delegatee: Set(delegatee.clone()),
+                expiry: Set(None),
+                issued_at: Set(None),
+                not_before: Set(None),
+                facts: Set(None),
+                serialization: Set(bytes.to_vec()),
+            }
+            .insert(&conn)
+            .await?;
+        }
+        deleg_model::ActiveModel {
+            id: Set(child_id),
+            delegator: Set(holder_did.clone()),
+            delegatee: Set(holder_did.clone()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(child_serialization),
+        }
+        .insert(&conn)
+        .await?;
+        let expired_id = tinycloud_core::hash::hash(b"status-expired");
+        deleg_model::ActiveModel {
+            id: Set(expired_id),
+            delegator: Set(owner_did.clone()),
+            delegatee: Set(holder_did.clone()),
+            expiry: Set(Some(OffsetDateTime::from_unix_timestamp(1)?)),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(b"status-expired".to_vec()),
+        }
+        .insert(&conn)
+        .await?;
+        parent_delegations::ActiveModel {
+            parent: Set(parent_id),
+            child: Set(child_id),
+        }
+        .insert(&conn)
+        .await?;
+        conn.commit().await?;
+
+        let rocket = rocket::build()
+            .mount("/", routes![delegation_status])
+            .manage(tinycloud);
+        let client = Client::tracked(rocket).await?;
+        let child_cid = child_id.to_cid(0x55).to_string();
+        let request = |cid: &str, header: String| {
+            client
+                .post("/delegation/status")
+                .header(Header::new("Authorization", header))
+                .header(ContentType::JSON)
+                .body(serde_json::json!({ "cid": cid }).to_string())
+        };
+
+        let mismatched_cid = direct_id.to_cid(0x55).to_string();
+        let response = request(
+            &child_cid,
+            status_header(
+                &holder_jwk,
+                &holder_vm,
+                &holder_did,
+                &mismatched_cid,
+                "mismatched-body",
+            )?,
+        )
+        .dispatch()
+        .await;
+        assert_eq!(response.status(), Status::Forbidden);
+
+        let response = request(
+            &child_cid,
+            status_header(&holder_jwk, &holder_vm, &holder_did, &child_cid, "active")?,
+        )
+        .dispatch()
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value = serde_json::from_str(&response.into_string().await.unwrap())?;
+        assert_eq!(body["status"], "active");
+        assert_eq!(body["active"], true);
+
+        let conn = client
+            .rocket()
+            .state::<TinyCloud>()
+            .expect("tinycloud state")
+            .readable()
+            .await?;
+        revo_model::ActiveModel {
+            id: Set(tinycloud_core::hash::hash(b"status-parent-revocation")),
+            revoker: Set(owner_did),
+            revoked: Set(parent_id),
+            serialization: Set(b"status-parent-revocation".to_vec()),
+        }
+        .insert(&conn)
+        .await?;
+        revo_model::ActiveModel {
+            id: Set(tinycloud_core::hash::hash(b"status-direct-revocation")),
+            revoker: Set(holder_did.clone()),
+            revoked: Set(direct_id),
+            serialization: Set(b"status-direct-revocation".to_vec()),
+        }
+        .insert(&conn)
+        .await?;
+        conn.commit().await?;
+        let response = request(
+            &child_cid,
+            status_header(&holder_jwk, &holder_vm, &holder_did, &child_cid, "revoked")?,
+        )
+        .dispatch()
+        .await;
+        let body: serde_json::Value = serde_json::from_str(&response.into_string().await.unwrap())?;
+        assert_eq!(body["status"], "revoked");
+        assert_eq!(body["revoked"], true);
+
+        let expired_cid = expired_id.to_cid(0x55).to_string();
+        let response = request(
+            &expired_cid,
+            status_header(
+                &holder_jwk,
+                &holder_vm,
+                &holder_did,
+                &expired_cid,
+                "expired",
+            )?,
+        )
+        .dispatch()
+        .await;
+        let body: serde_json::Value = serde_json::from_str(&response.into_string().await.unwrap())?;
+        assert_eq!(body["status"], "expired");
+        assert_eq!(body["expired"], true);
+
+        let direct_cid = direct_id.to_cid(0x55).to_string();
+        let response = request(
+            &direct_cid,
+            status_header(
+                &holder_jwk,
+                &holder_vm,
+                &holder_did,
+                &direct_cid,
+                "direct-revoked",
+            )?,
+        )
+        .dispatch()
+        .await;
+        let body: serde_json::Value = serde_json::from_str(&response.into_string().await.unwrap())?;
+        assert_eq!(body["status"], "revoked");
+        assert_eq!(body["revoked"], true);
+
+        let mut stranger_jwk = JWK::generate_ed25519()?;
+        stranger_jwk.algorithm = Some(Algorithm::EdDSA);
+        let (stranger_did, stranger_vm) = verification_method(&stranger_jwk)?;
+        let response = request(
+            &child_cid,
+            status_header(
+                &stranger_jwk,
+                &stranger_vm,
+                &stranger_did,
+                &child_cid,
+                "stranger",
+            )?,
+        )
+        .dispatch()
+        .await;
+        assert_eq!(response.status(), Status::NotFound);
+
+        let missing_cid = tinycloud_core::hash::hash(b"missing-status")
+            .to_cid(0x55)
+            .to_string();
+        let response = request(
+            &missing_cid,
+            status_header(
+                &holder_jwk,
+                &holder_vm,
+                &holder_did,
+                &missing_cid,
+                "missing",
+            )?,
+        )
+        .dispatch()
+        .await;
+        assert_eq!(response.status(), Status::NotFound);
+        let body: serde_json::Value = serde_json::from_str(&response.into_string().await.unwrap())?;
+        assert_eq!(body["status"], "not_found");
+        assert_eq!(body["exists"], false);
+
         Ok(())
     }
 
