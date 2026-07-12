@@ -527,18 +527,14 @@ where
         &self,
         roots: &[Hash],
     ) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>, TxError<B, K>> {
-        let mut keys = Vec::new();
-        for root in roots {
-            let chain = revocation::ancestor_chain_ids(&self.conn, root)
-                .await
-                .map_err(|error| match error {
-                    revocation::ChainTraversalError::Db(error) => TxError::Db(error),
-                    revocation::ChainTraversalError::LimitExceeded => {
-                        TxError::ChainTraversalLimitExceeded
-                    }
-                })?;
-            keys.extend(chain);
-        }
+        let mut keys = revocation::ancestor_chain_ids_for_roots(&self.conn, roots)
+            .await
+            .map_err(|error| match error {
+                revocation::ChainTraversalError::Db(error) => TxError::Db(error),
+                revocation::ChainTraversalError::LimitExceeded => {
+                    TxError::ChainTraversalLimitExceeded
+                }
+            })?;
         keys.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
         keys.dedup();
 
@@ -612,6 +608,9 @@ where
         invoker: &str,
         proofs: &[tinycloud_auth::authorization::Cid],
     ) -> Result<Option<DelegationStatus>, TxError<B, K>> {
+        if proofs.len() > 1 {
+            return Ok(None);
+        }
         let Some(delegation) = delegation::Entity::find_by_id(target)
             .one(&self.conn)
             .await?
@@ -633,23 +632,27 @@ where
             Err(error) => return Err(error),
         };
 
-        let mut principals = vec![invoker.to_string()];
-        principals
-            .extend(revocation::proven_persistent_principals(&self.conn, invoker, proofs).await?);
-        let authorized = principals.iter().any(|principal| {
-            did_principal_matches(&delegation.delegator, principal)
-                || did_principal_matches(&delegation.delegatee, principal)
-        }) || abilities.iter().any(|ability| {
-            ability
-                .resource
-                .space()
-                .map(|space| {
-                    principals
-                        .iter()
-                        .any(|principal| did_principal_matches(space.did().as_str(), principal))
-                })
-                .unwrap_or(false)
-        });
+        let principal = match revocation::control_proof_decision(
+            &self.conn,
+            invoker,
+            proofs,
+            "tinycloud.delegation/status",
+        )
+        .await?
+        {
+            revocation::ControlProofDecision::DirectSigner(principal)
+            | revocation::ControlProofDecision::PersistentPrincipal(principal) => principal,
+            revocation::ControlProofDecision::Denied => return Ok(None),
+        };
+        let authorized = did_principal_matches(&delegation.delegator, &principal)
+            || did_principal_matches(&delegation.delegatee, &principal)
+            || abilities.iter().any(|ability| {
+                ability
+                    .resource
+                    .space()
+                    .map(|space| did_principal_matches(space.did().as_str(), &principal))
+                    .unwrap_or(false)
+            });
         if !authorized {
             return Ok(None);
         }

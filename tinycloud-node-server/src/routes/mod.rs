@@ -3155,7 +3155,6 @@ mod tests {
         }
         .insert(&conn)
         .await?;
-
         let parent_cid: AuthCid = parent_hash.to_cid(0x55);
         let mut invocation_nb = std::collections::BTreeMap::new();
         for (key, value) in constrained_caveat
@@ -3661,7 +3660,9 @@ mod tests {
             ucan::Payload,
         };
         use tinycloud_auth::ucan_capabilities_object::Capabilities;
-        use tinycloud_core::models::{actor, delegation as deleg_model, revocation as revo_model};
+        use tinycloud_core::models::{
+            abilities, actor, delegation as deleg_model, revocation as revo_model,
+        };
         use tinycloud_core::relationships::parent_delegations;
         use tinycloud_core::sea_orm::{ActiveModelTrait, ActiveValue::Set};
 
@@ -3841,7 +3842,7 @@ mod tests {
             ),
             (
                 unrelated_session_id,
-                &unrelated_pkh,
+                &wallet_pkh,
                 &holder_did,
                 b"unrelated-session-proof".as_slice(),
             ),
@@ -3865,6 +3866,82 @@ mod tests {
             .insert(&conn)
             .await?;
         }
+        let control_resource =
+            Resource::Other(format!("urn:cid:{}", wallet_child_id.to_cid(0x55)).parse()?);
+        for action in ["tinycloud.delegation/status", "tinycloud.delegation/revoke"] {
+            abilities::ActiveModel {
+                delegation: Set(wallet_session_id),
+                resource: Set(control_resource.clone()),
+                ability: Set(Ability::try_from(action.to_string())?),
+                caveats: Set(Default::default()),
+            }
+            .insert(&conn)
+            .await?;
+        }
+        abilities::ActiveModel {
+            delegation: Set(unrelated_session_id),
+            resource: Set(control_resource),
+            ability: Set(Ability::try_from("tinycloud.kv/get".to_string())?),
+            caveats: Set(Default::default()),
+        }
+        .insert(&conn)
+        .await?;
+        let expired_session_id = tinycloud_core::hash::hash(b"expired-session-proof");
+        let future_session_id = tinycloud_core::hash::hash(b"future-session-proof");
+        let revoked_session_id = tinycloud_core::hash::hash(b"revoked-session-proof");
+        for (id, expiry, not_before, bytes) in [
+            (
+                expired_session_id,
+                Some(OffsetDateTime::from_unix_timestamp(1)?),
+                None,
+                b"expired-session-proof".as_slice(),
+            ),
+            (
+                future_session_id,
+                None,
+                Some(OffsetDateTime::from_unix_timestamp(4_102_444_800)?),
+                b"future-session-proof".as_slice(),
+            ),
+            (
+                revoked_session_id,
+                None,
+                None,
+                b"revoked-session-proof".as_slice(),
+            ),
+        ] {
+            deleg_model::ActiveModel {
+                id: Set(id),
+                delegator: Set(wallet_pkh.clone()),
+                delegatee: Set(holder_did.clone()),
+                expiry: Set(expiry),
+                issued_at: Set(None),
+                not_before: Set(not_before),
+                facts: Set(None),
+                serialization: Set(bytes.to_vec()),
+            }
+            .insert(&conn)
+            .await?;
+            abilities::ActiveModel {
+                delegation: Set(id),
+                resource: Set(Resource::Other(
+                    format!("urn:cid:{}", wallet_child_id.to_cid(0x55)).parse()?,
+                )),
+                ability: Set(Ability::try_from(
+                    "tinycloud.delegation/status".to_string(),
+                )?),
+                caveats: Set(Default::default()),
+            }
+            .insert(&conn)
+            .await?;
+        }
+        revo_model::ActiveModel {
+            id: Set(tinycloud_core::hash::hash(b"revoked-session-proof-row")),
+            revoker: Set(wallet_pkh.clone()),
+            revoked: Set(revoked_session_id),
+            serialization: Set(b"revoked-session-proof-row".to_vec()),
+        }
+        .insert(&conn)
+        .await?;
         parent_delegations::ActiveModel {
             parent: Set(parent_id),
             child: Set(child_id),
@@ -3933,20 +4010,67 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&response.into_string().await.unwrap())?;
         assert_eq!(body["status"], "active");
 
-        let response = request(
-            &wallet_child_cid,
-            status_header_with_proofs(
-                &holder_jwk,
-                &holder_vm,
-                &holder_did,
-                &wallet_child_cid,
-                "unrelated-session-status",
+        let missing_session_id = tinycloud_core::hash::hash(b"missing-session-proof");
+        for (label, proofs) in [
+            (
+                "missing-session-status",
+                vec![missing_session_id.to_cid(0x55)],
+            ),
+            (
+                "expired-session-status",
+                vec![expired_session_id.to_cid(0x55)],
+            ),
+            (
+                "future-session-status",
+                vec![future_session_id.to_cid(0x55)],
+            ),
+            (
+                "revoked-session-status",
+                vec![revoked_session_id.to_cid(0x55)],
+            ),
+            (
+                "same-wallet-unrelated-capability",
                 vec![unrelated_session_id.to_cid(0x55)],
-            )?,
-        )
-        .dispatch()
-        .await;
-        assert_eq!(response.status(), Status::NotFound);
+            ),
+            (
+                "multiple-mixed-session-status",
+                vec![
+                    wallet_session_id.to_cid(0x55),
+                    unrelated_session_id.to_cid(0x55),
+                ],
+            ),
+        ] {
+            let response = request(
+                &wallet_child_cid,
+                status_header_with_proofs(
+                    &holder_jwk,
+                    &holder_vm,
+                    &holder_did,
+                    &wallet_child_cid,
+                    label,
+                    proofs,
+                )?,
+            )
+            .dispatch()
+            .await;
+            assert_eq!(response.status(), Status::NotFound, "{label}");
+        }
+
+        let response = client
+            .post("/revoke")
+            .header(Header::new(
+                "Authorization",
+                revocation_header(
+                    &holder_jwk,
+                    &holder_vm,
+                    &holder_did,
+                    &wallet_child_cid,
+                    unrelated_session_id.to_cid(0x55),
+                )?,
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Forbidden);
 
         let response = client
             .post("/revoke")

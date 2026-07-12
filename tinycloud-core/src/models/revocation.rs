@@ -90,7 +90,19 @@ pub(crate) async fn ancestor_chain_ids<C: ConnectionTrait>(
     db: &C,
     start: &Hash,
 ) -> Result<Vec<Hash>, ChainTraversalError> {
-    let mut frontier = vec![*start];
+    ancestor_chain_ids_for_roots(db, &[*start]).await
+}
+
+pub(crate) async fn ancestor_chain_ids_for_roots<C: ConnectionTrait>(
+    db: &C,
+    roots: &[Hash],
+) -> Result<Vec<Hash>, ChainTraversalError> {
+    let mut frontier = roots.to_vec();
+    frontier.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
+    frontier.dedup();
+    if frontier.len() > MAX_CHAIN_TRAVERSAL_NODES {
+        return Err(ChainTraversalError::LimitExceeded);
+    }
     let mut visited = HashSet::new();
     let mut ordered = Vec::new();
     while let Some(current) = frontier.pop() {
@@ -119,56 +131,66 @@ pub(crate) async fn ancestor_chain_ids<C: ConnectionTrait>(
     Ok(ordered)
 }
 
-/// Resolve the persistent principals represented by exact session proofs.
-/// Every cited proof must identify the signer as its delegatee and remain
-/// current and unrevoked. Invalid, over-budget, or mixed proof sets fail
-/// closed without falling back to a global DID lookup.
-pub(crate) async fn proven_persistent_principals<C: ConnectionTrait>(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ControlProofDecision {
+    DirectSigner(String),
+    PersistentPrincipal(String),
+    Denied,
+}
+
+/// Resolve the principal authorized for a control action. Proofless requests
+/// stay direct-signer-only. A proof-bearing request must cite exactly one
+/// current, unrevoked session/control delegation whose persisted abilities
+/// explicitly include the requested action; invalid proofs never fall back.
+pub(crate) async fn control_proof_decision<C: ConnectionTrait>(
     db: &C,
     signer: &str,
     proofs: &[Cid],
-) -> Result<Vec<String>, DbErr> {
-    if proofs.is_empty() || proofs.len() > MAX_CHAIN_TRAVERSAL_NODES {
-        return Ok(Vec::new());
+    requested_action: &str,
+) -> Result<ControlProofDecision, DbErr> {
+    if proofs.is_empty() {
+        return Ok(ControlProofDecision::DirectSigner(signer.to_string()));
+    }
+    if proofs.len() != 1 {
+        return Ok(ControlProofDecision::Denied);
     }
 
     let now = OffsetDateTime::now_utc();
-    let mut principals = Vec::new();
-    let mut chain_nodes = HashSet::new();
-    for proof in proofs {
-        let proof_id = Hash::from(*proof);
-        let Some(parent) = delegation::Entity::find_by_id(proof_id).one(db).await? else {
-            return Ok(Vec::new());
-        };
-        if !did_principal_matches(&parent.delegatee, signer)
-            || parent.expiry.map(|expiry| now >= expiry).unwrap_or(false)
-            || parent
-                .not_before
-                .map(|not_before| now < not_before)
-                .unwrap_or(false)
-        {
-            return Ok(Vec::new());
-        }
-        let nodes = match ancestor_chain_ids(db, &proof_id).await {
-            Ok(nodes) => nodes,
-            Err(ChainTraversalError::Db(error)) => return Err(error),
-            Err(ChainTraversalError::LimitExceeded) => return Ok(Vec::new()),
-        };
-        chain_nodes.extend(nodes);
-        if chain_nodes.len() > MAX_CHAIN_TRAVERSAL_NODES {
-            return Ok(Vec::new());
-        }
-        principals.push(parent.delegator);
+    let proof_id = Hash::from(proofs[0]);
+    let Some(parent) = delegation::Entity::find_by_id(proof_id).one(db).await? else {
+        return Ok(ControlProofDecision::Denied);
+    };
+    if !did_principal_matches(&parent.delegatee, signer)
+        || parent.expiry.map(|expiry| now >= expiry).unwrap_or(false)
+        || parent
+            .not_before
+            .map(|not_before| now < not_before)
+            .unwrap_or(false)
+    {
+        return Ok(ControlProofDecision::Denied);
     }
 
+    let chain_nodes = match ancestor_chain_ids(db, &proof_id).await {
+        Ok(nodes) => nodes,
+        Err(ChainTraversalError::Db(error)) => return Err(error),
+        Err(ChainTraversalError::LimitExceeded) => return Ok(ControlProofDecision::Denied),
+    };
     for node in chain_nodes {
         if is_revoked(db, &node).await? {
-            return Ok(Vec::new());
+            return Ok(ControlProofDecision::Denied);
         }
     }
-    principals.sort();
-    principals.dedup();
-    Ok(principals)
+
+    let has_control_ability = abilities::Entity::find()
+        .filter(abilities::Column::Delegation.eq(proof_id))
+        .filter(abilities::Column::Ability.eq(requested_action))
+        .count(db)
+        .await?
+        > 0;
+    if !has_control_ability {
+        return Ok(ControlProofDecision::Denied);
+    }
+    Ok(ControlProofDecision::PersistentPrincipal(parent.delegator))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -290,18 +312,16 @@ async fn revoker_is_authorized<C: ConnectionTrait>(
     revoker: &str,
     proofs: &[Cid],
 ) -> Result<bool, DbErr> {
-    let mut principals = vec![revoker.to_string()];
-    principals.extend(proven_persistent_principals(db, revoker, proofs).await?);
-    if principals
-        .iter()
-        .any(|principal| did_principal_matches(&delegation.delegator, principal))
-    {
+    let principal =
+        match control_proof_decision(db, revoker, proofs, "tinycloud.delegation/revoke").await? {
+            ControlProofDecision::DirectSigner(principal)
+            | ControlProofDecision::PersistentPrincipal(principal) => principal,
+            ControlProofDecision::Denied => return Ok(false),
+        };
+    if did_principal_matches(&delegation.delegator, &principal) {
         return Ok(true);
     }
-    if principals
-        .iter()
-        .any(|principal| did_principal_matches(&delegation.delegatee, principal))
-    {
+    if did_principal_matches(&delegation.delegatee, &principal) {
         return Ok(true);
     }
 
@@ -311,10 +331,7 @@ async fn revoker_is_authorized<C: ConnectionTrait>(
         .await?;
     for row in ability_rows {
         if let Some(space) = row.resource.space() {
-            if principals
-                .iter()
-                .any(|principal| did_principal_matches(space.did().as_str(), principal))
-            {
+            if did_principal_matches(space.did().as_str(), &principal) {
                 return Ok(true);
             }
         }
@@ -401,6 +418,25 @@ mod tests {
 
         assert!(matches!(
             first_revoked_ancestor(&db, &child).await,
+            Err(ChainTraversalError::LimitExceeded)
+        ));
+    }
+
+    #[tokio::test]
+    async fn multiple_roots_share_one_combined_traversal_budget() {
+        let db = database().await;
+        let mut roots = Vec::new();
+        for index in 0..33 {
+            let root = hash(format!("multi-root-{index}").as_bytes());
+            let parent = hash(format!("multi-parent-{index}").as_bytes());
+            insert_delegation(&db, root).await;
+            insert_delegation(&db, parent).await;
+            insert_link(&db, root, parent).await;
+            roots.push(root);
+        }
+
+        assert!(matches!(
+            ancestor_chain_ids_for_roots(&db, &roots).await,
             Err(ChainTraversalError::LimitExceeded)
         ));
     }
