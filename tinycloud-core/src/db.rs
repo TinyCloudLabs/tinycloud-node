@@ -637,6 +637,7 @@ where
             invoker,
             proofs,
             "tinycloud.delegation/status",
+            &target,
         )
         .await?
         {

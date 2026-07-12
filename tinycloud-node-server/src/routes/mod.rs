@@ -3832,6 +3832,9 @@ mod tests {
         .await?;
         let wallet_session_id = tinycloud_core::hash::hash(b"wallet-session-proof");
         let unrelated_session_id = tinycloud_core::hash::hash(b"unrelated-session-proof");
+        let wrong_target_session_id = tinycloud_core::hash::hash(b"wrong-target-session-proof");
+        let foreign_scope_session_id = tinycloud_core::hash::hash(b"foreign-scope-session-proof");
+        let narrow_scope_session_id = tinycloud_core::hash::hash(b"narrow-scope-session-proof");
         let wallet_child_id = tinycloud_core::hash::hash(b"wallet-pkh-child");
         for (id, delegator, delegatee, bytes) in [
             (
@@ -3852,6 +3855,24 @@ mod tests {
                 &wallet_pkh,
                 b"wallet-pkh-child".as_slice(),
             ),
+            (
+                wrong_target_session_id,
+                &wallet_pkh,
+                &holder_did,
+                b"wrong-target-session-proof".as_slice(),
+            ),
+            (
+                foreign_scope_session_id,
+                &wallet_pkh,
+                &holder_did,
+                b"foreign-scope-session-proof".as_slice(),
+            ),
+            (
+                narrow_scope_session_id,
+                &wallet_pkh,
+                &holder_did,
+                b"narrow-scope-session-proof".as_slice(),
+            ),
         ] {
             deleg_model::ActiveModel {
                 id: Set(id),
@@ -3866,8 +3887,16 @@ mod tests {
             .insert(&conn)
             .await?;
         }
-        let control_resource =
-            Resource::Other(format!("urn:cid:{}", wallet_child_id.to_cid(0x55)).parse()?);
+        let wallet_control_space = SpaceId::new(
+            wallet_pkh.parse::<DIDBuf>()?,
+            "control".parse().expect("valid space name"),
+        );
+        let control_resource = Resource::TinyCloud(wallet_control_space.clone().to_resource(
+            "delegation".parse()?,
+            None,
+            None,
+            None,
+        ));
         for action in ["tinycloud.delegation/status", "tinycloud.delegation/revoke"] {
             abilities::ActiveModel {
                 delegation: Set(wallet_session_id),
@@ -3886,6 +3915,45 @@ mod tests {
         }
         .insert(&conn)
         .await?;
+        let foreign_control_space = SpaceId::new(
+            unrelated_pkh.parse::<DIDBuf>()?,
+            "control".parse().expect("valid space name"),
+        );
+        for (proof_id, resource) in [
+            (
+                wrong_target_session_id,
+                Resource::Other(format!("urn:cid:{}", direct_id.to_cid(0x55)).parse()?),
+            ),
+            (
+                foreign_scope_session_id,
+                Resource::TinyCloud(foreign_control_space.to_resource(
+                    "delegation".parse()?,
+                    None,
+                    None,
+                    None,
+                )),
+            ),
+            (
+                narrow_scope_session_id,
+                Resource::TinyCloud(wallet_control_space.to_resource(
+                    "delegation".parse()?,
+                    Some("narrow".parse()?),
+                    None,
+                    None,
+                )),
+            ),
+        ] {
+            for action in ["tinycloud.delegation/status", "tinycloud.delegation/revoke"] {
+                abilities::ActiveModel {
+                    delegation: Set(proof_id),
+                    resource: Set(resource.clone()),
+                    ability: Set(Ability::try_from(action.to_string())?),
+                    caveats: Set(Default::default()),
+                }
+                .insert(&conn)
+                .await?;
+            }
+        }
         let expired_session_id = tinycloud_core::hash::hash(b"expired-session-proof");
         let future_session_id = tinycloud_core::hash::hash(b"future-session-proof");
         let revoked_session_id = tinycloud_core::hash::hash(b"revoked-session-proof");
@@ -4033,6 +4101,18 @@ mod tests {
                 vec![unrelated_session_id.to_cid(0x55)],
             ),
             (
+                "correct-action-wrong-target-resource",
+                vec![wrong_target_session_id.to_cid(0x55)],
+            ),
+            (
+                "correct-action-foreign-root-scope",
+                vec![foreign_scope_session_id.to_cid(0x55)],
+            ),
+            (
+                "correct-action-narrow-scope",
+                vec![narrow_scope_session_id.to_cid(0x55)],
+            ),
+            (
                 "multiple-mixed-session-status",
                 vec![
                     wallet_session_id.to_cid(0x55),
@@ -4056,21 +4136,28 @@ mod tests {
             assert_eq!(response.status(), Status::NotFound, "{label}");
         }
 
-        let response = client
-            .post("/revoke")
-            .header(Header::new(
-                "Authorization",
-                revocation_header(
-                    &holder_jwk,
-                    &holder_vm,
-                    &holder_did,
-                    &wallet_child_cid,
-                    unrelated_session_id.to_cid(0x55),
-                )?,
-            ))
-            .dispatch()
-            .await;
-        assert_eq!(response.status(), Status::Forbidden);
+        for (label, proof_id) in [
+            ("unrelated-capability-revoke", unrelated_session_id),
+            ("wrong-target-resource-revoke", wrong_target_session_id),
+            ("foreign-root-scope-revoke", foreign_scope_session_id),
+            ("narrow-scope-revoke", narrow_scope_session_id),
+        ] {
+            let response = client
+                .post("/revoke")
+                .header(Header::new(
+                    "Authorization",
+                    revocation_header(
+                        &holder_jwk,
+                        &holder_vm,
+                        &holder_did,
+                        &wallet_child_cid,
+                        proof_id.to_cid(0x55),
+                    )?,
+                ))
+                .dispatch()
+                .await;
+            assert_eq!(response.status(), Status::Forbidden, "{label}");
+        }
 
         let response = client
             .post("/revoke")

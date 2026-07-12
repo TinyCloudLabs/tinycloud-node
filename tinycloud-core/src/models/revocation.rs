@@ -1,6 +1,7 @@
 use super::super::{events::Revocation, models::*, relationships::*};
 use crate::hash::{hash, Hash};
 use crate::models::did_resolution::did_resolution_timeout;
+use crate::types::Resource;
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, ConnectionTrait, QuerySelect};
 use std::collections::HashSet;
 use time::OffsetDateTime;
@@ -147,6 +148,7 @@ pub(crate) async fn control_proof_decision<C: ConnectionTrait>(
     signer: &str,
     proofs: &[Cid],
     requested_action: &str,
+    target: &Hash,
 ) -> Result<ControlProofDecision, DbErr> {
     if proofs.is_empty() {
         return Ok(ControlProofDecision::DirectSigner(signer.to_string()));
@@ -181,12 +183,25 @@ pub(crate) async fn control_proof_decision<C: ConnectionTrait>(
         }
     }
 
-    let has_control_ability = abilities::Entity::find()
+    let control_abilities = abilities::Entity::find()
         .filter(abilities::Column::Delegation.eq(proof_id))
         .filter(abilities::Column::Ability.eq(requested_action))
-        .count(db)
-        .await?
-        > 0;
+        .all(db)
+        .await?;
+    let target_resource = format!("urn:cid:{}", target.to_cid(0x55));
+    let has_control_ability = control_abilities
+        .iter()
+        .any(|ability| match &ability.resource {
+            Resource::Other(resource) => resource.as_str() == target_resource,
+            Resource::TinyCloud(resource) => {
+                resource.service().as_str() == "delegation"
+                    && resource
+                        .path()
+                        .map(|path| path.as_str().is_empty())
+                        .unwrap_or(true)
+                    && resource.space().did().as_str() == parent.delegator
+            }
+        });
     if !has_control_ability {
         return Ok(ControlProofDecision::Denied);
     }
@@ -312,12 +327,19 @@ async fn revoker_is_authorized<C: ConnectionTrait>(
     revoker: &str,
     proofs: &[Cid],
 ) -> Result<bool, DbErr> {
-    let principal =
-        match control_proof_decision(db, revoker, proofs, "tinycloud.delegation/revoke").await? {
-            ControlProofDecision::DirectSigner(principal)
-            | ControlProofDecision::PersistentPrincipal(principal) => principal,
-            ControlProofDecision::Denied => return Ok(false),
-        };
+    let principal = match control_proof_decision(
+        db,
+        revoker,
+        proofs,
+        "tinycloud.delegation/revoke",
+        &delegation.id,
+    )
+    .await?
+    {
+        ControlProofDecision::DirectSigner(principal)
+        | ControlProofDecision::PersistentPrincipal(principal) => principal,
+        ControlProofDecision::Denied => return Ok(false),
+    };
     if did_principal_matches(&delegation.delegator, &principal) {
         return Ok(true);
     }
