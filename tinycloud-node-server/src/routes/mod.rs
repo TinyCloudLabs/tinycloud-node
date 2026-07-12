@@ -3835,6 +3835,8 @@ mod tests {
         let wrong_target_session_id = tinycloud_core::hash::hash(b"wrong-target-session-proof");
         let foreign_scope_session_id = tinycloud_core::hash::hash(b"foreign-scope-session-proof");
         let narrow_scope_session_id = tinycloud_core::hash::hash(b"narrow-scope-session-proof");
+        let query_scope_session_id = tinycloud_core::hash::hash(b"query-scope-session-proof");
+        let fragment_scope_session_id = tinycloud_core::hash::hash(b"fragment-scope-session-proof");
         let wallet_child_id = tinycloud_core::hash::hash(b"wallet-pkh-child");
         for (id, delegator, delegatee, bytes) in [
             (
@@ -3872,6 +3874,18 @@ mod tests {
                 &wallet_pkh,
                 &holder_did,
                 b"narrow-scope-session-proof".as_slice(),
+            ),
+            (
+                query_scope_session_id,
+                &wallet_pkh,
+                &holder_did,
+                b"query-scope-session-proof".as_slice(),
+            ),
+            (
+                fragment_scope_session_id,
+                &wallet_pkh,
+                &holder_did,
+                b"fragment-scope-session-proof".as_slice(),
             ),
         ] {
             deleg_model::ActiveModel {
@@ -3935,11 +3949,29 @@ mod tests {
             ),
             (
                 narrow_scope_session_id,
-                Resource::TinyCloud(wallet_control_space.to_resource(
+                Resource::TinyCloud(wallet_control_space.clone().to_resource(
                     "delegation".parse()?,
                     Some("narrow".parse()?),
                     None,
                     None,
+                )),
+            ),
+            (
+                query_scope_session_id,
+                Resource::TinyCloud(wallet_control_space.clone().to_resource(
+                    "delegation".parse()?,
+                    None,
+                    Some("scope=limited".parse()?),
+                    None,
+                )),
+            ),
+            (
+                fragment_scope_session_id,
+                Resource::TinyCloud(wallet_control_space.to_resource(
+                    "delegation".parse()?,
+                    None,
+                    None,
+                    Some("limited".parse()?),
                 )),
             ),
         ] {
@@ -4113,6 +4145,14 @@ mod tests {
                 vec![narrow_scope_session_id.to_cid(0x55)],
             ),
             (
+                "correct-action-query-scope",
+                vec![query_scope_session_id.to_cid(0x55)],
+            ),
+            (
+                "correct-action-fragment-scope",
+                vec![fragment_scope_session_id.to_cid(0x55)],
+            ),
+            (
                 "multiple-mixed-session-status",
                 vec![
                     wallet_session_id.to_cid(0x55),
@@ -4141,6 +4181,8 @@ mod tests {
             ("wrong-target-resource-revoke", wrong_target_session_id),
             ("foreign-root-scope-revoke", foreign_scope_session_id),
             ("narrow-scope-revoke", narrow_scope_session_id),
+            ("query-scope-revoke", query_scope_session_id),
+            ("fragment-scope-revoke", fragment_scope_session_id),
         ] {
             let response = client
                 .post("/revoke")

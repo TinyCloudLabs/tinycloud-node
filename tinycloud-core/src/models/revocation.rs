@@ -199,6 +199,8 @@ pub(crate) async fn control_proof_decision<C: ConnectionTrait>(
                         .path()
                         .map(|path| path.as_str().is_empty())
                         .unwrap_or(true)
+                    && resource.query().is_none()
+                    && resource.fragment().is_none()
                     && resource.space().did().as_str() == parent.delegator
             }
         });
