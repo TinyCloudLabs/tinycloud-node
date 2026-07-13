@@ -104,7 +104,7 @@ need M1_EXPECTED_NODE_SHA
 # The node pin is env-supplied: the gate script lives in this repo, so a
 # hardcoded self-SHA would be stale the moment the script itself merges.
 [[ $NODE_SHA == "$M1_EXPECTED_NODE_SHA"* && $POLICY_SHA == d9a8d37* && $SDK_SHA == 45c5816* && \
-   $LISTEN_SHA == c9cf086* && $OC_SHA == d2cf81e* ]] || die "candidate SHA mismatch"
+   $LISTEN_SHA == b26a447* && $OC_SHA == 70678a7* ]] || die "candidate SHA mismatch"
 for dirty in "$BUNDLE"/meta/*.dirty; do [[ ! -s "$dirty" ]] || die "candidate checkout is dirty: $dirty"; done
 
 cat >"$BUNDLE/manifest.json" <<JSON

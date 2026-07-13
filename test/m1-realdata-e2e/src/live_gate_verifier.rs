@@ -425,8 +425,8 @@ fn require_candidate_pins(
     let expected = [
         (&candidates.policy_engine, "d9a8d37"),
         (&candidates.js_sdk, "45c5816"),
-        (&candidates.listen, "c9cf086"),
-        (&candidates.open_credentials, "d2cf81e"),
+        (&candidates.listen, "b26a447"),
+        (&candidates.open_credentials, "70678a7"),
     ];
     for (actual, prefix) in expected {
         if !actual.starts_with(prefix) {
