@@ -1460,7 +1460,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ab67060fc6b8ef687992d439ca0fa36e7ed17e9a0b16b25b601e8757df720de"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.114",
 ]
 
 [[package]]
@@ -7397,7 +7397,7 @@ dependencies = [
 
 [[package]]
 name = "tinycloud-node"
-version = "1.4.5"
+version = "1.4.6"
 dependencies = [
  "anyhow",
  "aws-config",
