@@ -423,8 +423,8 @@ fn require_candidate_pins(
         bail!("candidate SHA does not match required node pin {expected_node_sha}");
     }
     let expected = [
-        (&candidates.policy_engine, "d9a8d37"),
-        (&candidates.js_sdk, "45c5816"),
+        (&candidates.policy_engine, "cdd78c5"),
+        (&candidates.js_sdk, "b225289"),
         (&candidates.listen, "b26a447"),
         (&candidates.open_credentials, "70678a7"),
     ];

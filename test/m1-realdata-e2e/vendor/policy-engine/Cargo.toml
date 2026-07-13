@@ -35,5 +35,5 @@ thiserror = "1"
 unicode-normalization = "0.1"
 
 [dev-dependencies]
-opencredentials-verify = { git = "https://github.com/TinyCloudLabs/OpenCredentials", rev = "c9fa2fe", package = "opencredentials-verify" }
+opencredentials-verify = { git = "https://github.com/TinyCloudLabs/OpenCredentials", rev = "70678a7", package = "opencredentials-verify" }
 policy-evidence-vc = { path = "crates/policy-evidence-vc" }

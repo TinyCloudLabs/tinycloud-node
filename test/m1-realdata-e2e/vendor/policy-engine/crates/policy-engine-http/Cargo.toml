@@ -17,7 +17,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 data-encoding = "2"
 ed25519-dalek = "2"
 getrandom = "0.2"
-opencredentials-verify = { git = "https://github.com/TinyCloudLabs/OpenCredentials", rev = "c9fa2fe", package = "opencredentials-verify" }
+opencredentials-verify = { git = "https://github.com/TinyCloudLabs/OpenCredentials", rev = "70678a7", package = "opencredentials-verify" }
 policy-core = { path = "../.." }
 policy-evidence-vc = { path = "../policy-evidence-vc" }
 policy-runtime = { path = "../policy-runtime" }
@@ -28,7 +28,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [dev-dependencies]
 did-method-key = { git = "https://github.com/tinycloudlabs/ssi", rev = "9d519692ab1b07b53d71f27ebad8473d64c338bf", default-features = false }
-opencredentials-verify = { git = "https://github.com/TinyCloudLabs/OpenCredentials", rev = "c9fa2fe", package = "opencredentials-verify" }
+opencredentials-verify = { git = "https://github.com/TinyCloudLabs/OpenCredentials", rev = "70678a7", package = "opencredentials-verify" }
 sha2 = "0.10"
 ssi-ucan = { git = "https://github.com/tinycloudlabs/ssi", rev = "9d519692ab1b07b53d71f27ebad8473d64c338bf" }
 ssi-verification-methods = { git = "https://github.com/tinycloudlabs/ssi", rev = "9d519692ab1b07b53d71f27ebad8473d64c338bf", default-features = false, features = ["ed25519"] }

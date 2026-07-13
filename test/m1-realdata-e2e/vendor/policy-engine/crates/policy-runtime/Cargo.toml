@@ -25,4 +25,4 @@ vc-evidence = ["dep:policy-evidence-vc"]
 [dev-dependencies]
 bs58 = "0.5"
 ed25519-dalek = "2"
-opencredentials-verify = { git = "https://github.com/TinyCloudLabs/OpenCredentials", rev = "c9fa2fe", package = "opencredentials-verify" }
+opencredentials-verify = { git = "https://github.com/TinyCloudLabs/OpenCredentials", rev = "70678a7", package = "opencredentials-verify" }
