@@ -10,7 +10,7 @@ connection.row_factory = sqlite3.Row
 def rows(table):
     present = connection.execute("select 1 from sqlite_master where type='table' and name=?", (table,)).fetchone()
     if not present:
-        return []
+        raise RuntimeError(f"required node authority table is missing: {table}")
     return [dict(row) for row in connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid')]
 def safe(value):
     if isinstance(value, bytes):
@@ -22,7 +22,7 @@ data = {
     "observedAt": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
     "database": db,
     "delegations": [{k: safe(v) for k, v in row.items()} for row in rows("delegation")],
-    "abilities": [{k: safe(v) for k, v in row.items()} for row in rows("abilities")],
+    "abilities": [{k: safe(v) for k, v in row.items()} for row in rows("ability")],
     "parentDelegations": [{k: safe(v) for k, v in row.items()} for row in rows("parent_delegation")],
 }
 with open(output, "x", encoding="utf-8") as handle:

@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, process::Command};
 
 use anyhow::Result;
 use m1_realdata_e2e::live_gate_verifier::{self, Mode};
@@ -27,6 +27,46 @@ fn verifier_requires_matching_expected_node_sha() -> Result<()> {
 
     assert!(live_gate_verifier::run(bundle.path(), Mode::Verify, "").is_err());
     assert!(live_gate_verifier::run(bundle.path(), Mode::Verify, "wrong-node-sha").is_err());
+    Ok(())
+}
+
+#[test]
+fn snapshot_reads_native_singular_ability_table() -> Result<()> {
+    let bundle = TempDir::new()?;
+    let database = bundle.path().join("caps.db");
+    let output = bundle.path().join("snapshot.json");
+    let created = Command::new("python3")
+        .arg("-c")
+        .arg(
+            r#"import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1])
+connection.executescript('''
+CREATE TABLE delegation (id BLOB, serialization TEXT);
+CREATE TABLE ability (resource TEXT, ability TEXT, delegation BLOB, caveats TEXT);
+CREATE TABLE parent_delegation (parent BLOB, child BLOB);
+INSERT INTO ability VALUES ('tinycloud:sql:test', 'tinycloud.sql/read', X'01', '{}');
+''')
+connection.commit()
+"#,
+        )
+        .arg(&database)
+        .status()?;
+    assert!(created.success());
+
+    let captured = Command::new("bash")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/scripts/snapshot-node-db.sh"
+        ))
+        .arg(&database)
+        .arg("snapshot-contract-test")
+        .arg(&output)
+        .status()?;
+    assert!(captured.success());
+
+    let snapshot: Value = serde_json::from_slice(&fs::read(output)?)?;
+    assert_eq!(snapshot["abilities"].as_array().map(Vec::len), Some(1));
+    assert_eq!(snapshot["abilities"][0]["ability"], "tinycloud.sql/read");
     Ok(())
 }
 
