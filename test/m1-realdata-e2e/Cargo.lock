@@ -3988,7 +3988,6 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 [[package]]
 name = "opencredentials-verify"
 version = "0.1.0"
-source = "git+https://github.com/TinyCloudLabs/OpenCredentials?rev=70678a7#70678a73131c783bcf3e4ae92b40597115e91ad1"
 dependencies = [
  "base64 0.21.7",
  "opencredentials_sd_jwt",
@@ -4000,7 +3999,6 @@ dependencies = [
 [[package]]
 name = "opencredentials_sd_jwt"
 version = "0.1.0"
-source = "git+https://github.com/TinyCloudLabs/OpenCredentials?rev=70678a7#70678a73131c783bcf3e4ae92b40597115e91ad1"
 dependencies = [
  "base64 0.21.7",
  "ed25519-dalek 1.0.1",
