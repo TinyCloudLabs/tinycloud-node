@@ -7,7 +7,7 @@ set -Eeuo pipefail
 die() { printf 'm1-gate-demo: %s\n' "$*" >&2; exit 2; }
 need() { [[ -n "${!1:-}" ]] || die "required environment variable $1 is unset"; }
 sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
-now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+now() { python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"))'; }
 json_string() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
 run_capture() {
   local phase=$1 command=$2 output=$3
