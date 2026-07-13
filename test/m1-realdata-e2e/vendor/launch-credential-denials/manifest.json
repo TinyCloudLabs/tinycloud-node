@@ -1,0 +1,68 @@
+{
+  "description": "Manifest and SHA-256 provenance for deterministic M1 OpenCredentials launch credential denial fixtures.",
+  "files": [
+    {
+      "path": "README.md",
+      "sha256": "e86eb66c05a43024432df86828ea343233646f26351a801f3cbb037a60bbb443"
+    },
+    {
+      "path": "baseline-valid.json",
+      "sha256": "231706d9e89350f6820418f6a379454cb6d331ef1a24e1c480a23aba111c764a"
+    },
+    {
+      "path": "enrollment-binding-mismatch.json",
+      "sha256": "25c9afdc36592d5fffca6b628c15d11f6cea6ea5ab1a912f1a064ccc43610a9a"
+    },
+    {
+      "path": "expired.json",
+      "sha256": "f8188a27da826a6d9da27d2f465fee8287fd017a72f42e2ca7df7c2156bafa53"
+    },
+    {
+      "path": "malformed-presentation.json",
+      "sha256": "3e42c2ffc1082928ff623eb01346cab21a751d2558a7ac4f41ddc69c9c427cda"
+    },
+    {
+      "path": "missing-required-disclosure.json",
+      "sha256": "98a24177480f2e33fd50c9c28707c45cfebdc39acda4143ccd6dc8c90b4634e7"
+    },
+    {
+      "path": "not-yet-valid.json",
+      "sha256": "e26d8afc7c8ece04d67ab7cce7f591bff5667e64226d27578cdb29751d70b6b7"
+    },
+    {
+      "path": "subject-mismatch.json",
+      "sha256": "9efe17ca79a5a36e7416f39b9190f1a65f01f962eb50ff6167302920b32c1296"
+    },
+    {
+      "path": "untrusted-issuer-did.json",
+      "sha256": "d899c40d50c0f06989d8732d7473e493204def54d335c3b35f2f9ee745c8a773"
+    },
+    {
+      "path": "wrong-issuer-signature.json",
+      "sha256": "28f5e7eb6aac2891dcf41c5909b4ff1068110ec061fb4277e8e7c36054e2592b"
+    },
+    {
+      "path": "wrong-vct.json",
+      "sha256": "b28857ed8967ddca3b38f63c444a03d8aa5e0a7b7b07a9caa00a04685500de59"
+    }
+  ],
+  "fixedInvalidClasses": [
+    "wrong-issuer-signature",
+    "untrusted-issuer-did",
+    "wrong-vct",
+    "subject-mismatch",
+    "expired",
+    "not-yet-valid",
+    "missing-required-disclosure",
+    "malformed-presentation",
+    "enrollment-binding-mismatch"
+  ],
+  "provenance": {
+    "baseCommit": "ff47e55420f87552caf4e9144a0dfc748026e612",
+    "confirmedFromCode": "opencredentials_verify @ ff47e55420f87552caf4e9144a0dfc748026e612",
+    "fixtureScope": "rust/opencredentials_verify/",
+    "generator": "rust/opencredentials_verify/tests/m1_denial_credentials.rs",
+    "note": "EmailCredentialIssuer::issue() uses OsRng salts; these fixture bytes are hand-authored from fixed salts and deterministic Ed25519 synthetic test seeds."
+  },
+  "schema": "xyz.tinycloud.opencredentials/m1-denial-credential-manifest/v0"
+}
