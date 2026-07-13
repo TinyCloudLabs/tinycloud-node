@@ -63,7 +63,7 @@ fn accepted_bundle(root: &Path) -> Result<()> {
             "schema": "xyz.tinycloud.m1/live-gate-raw-bundle/v1", "runId": "verifier-contract-test",
             "createdAt": "2026-07-11T12:00:00Z",
             "inputs": {"nonceSha256":"11".repeat(32),"renewalNonceSha256":"22".repeat(32),"revokedNonceSha256":"33".repeat(32),"sqlSeedSha256":"44".repeat(32)},
-            "candidates": {"tinycloudNode":"expected-node-sha","policyEngine":"d72812a","jsSdk":"8443b90","listen":"7bbd99a","openCredentials":"a1633710"}
+            "candidates": {"tinycloudNode":"expected-node-sha","policyEngine":"d72812a","jsSdk":"2949408","listen":"7bbd99a","openCredentials":"a1633710"}
         }),
     )?;
     exchange(
