@@ -89,11 +89,6 @@ jobs:
     steps:
     - name: Checkout TinyCloud repository
       uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-    - name: Configure git auth for private TinyCloudLabs dependencies
-      run: |
-        git config --global url."https://x-access-token:${{ secrets.TINYCLOUD_ORG_READ_TOKEN }}@github.com/TinyCloudLabs/".insteadOf "https://github.com/TinyCloudLabs/"
     - uses: dtolnay/rust-toolchain@stable
       with:
         components: rustfmt
