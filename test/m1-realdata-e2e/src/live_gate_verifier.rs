@@ -1,6 +1,7 @@
 use std::{fs, path::Path};
 
 use anyhow::{anyhow, bail, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -68,7 +69,6 @@ struct Snapshot {
 #[derive(Debug, Deserialize)]
 struct DelegationRow {
     id: Value,
-    serialization: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -242,19 +242,20 @@ fn verify(bundle: &Path, expected_node_sha: &str) -> Result<Report> {
     let imported_text = imported
         .as_str()
         .ok_or_else(|| anyhow!("import delegation is not a string"))?;
+    let imported_id: Vec<u8> = tinycloud_core::hash::hash(imported_text.as_bytes()).into();
     if pre
         .delegations
         .iter()
-        .any(|row| value_contains(&row.serialization, imported_text))
+        .any(|row| row_id_matches(row, &imported_id))
     {
         bail!("imported delegation was already present before /delegate");
     }
     if !post
         .delegations
         .iter()
-        .any(|row| value_contains(&row.serialization, imported_text))
+        .any(|row| row_id_matches(row, &imported_id))
     {
-        bail!("post-import authority rows do not contain the imported delegation bytes");
+        bail!("post-import authority rows do not contain the imported delegation identifier");
     }
     if post.delegations.iter().any(|row| row.id.is_null()) {
         bail!("post-import delegation has a null identity");
@@ -266,7 +267,7 @@ fn verify(bundle: &Path, expected_node_sha: &str) -> Result<Report> {
         exchange_assertion("resolve-import-byte-provenance", "requester/initial.json", &initial, "/response/delegation and /response/import/delegation", "the resolve output string is byte-identical to the native /delegate input string"),
         exchange_assertion("native-constrained-sql-seed-read", "requester/initial.json", &initial, "/response/reads/sql/sha256", "the named constrained SQL read hash equals the independent hash of caller-supplied seed bytes"),
         exchange_assertion("short-ttl-and-renewal", "requester/renewal.json", &renewal, "/response/renewed", &format!("initial wire issuedAt/expiresAt difference is {ttl}s (1..=60) and a second direct live challenge/resolve/import exchange succeeded")),
-        assertion("delegation-path-origin", "node-db/pre-import.json + node-db/post-import.json", runner_pid, &manifest.run_id, &initial.request_id, "/delegations, /abilities, /parentDelegations", "the same database gains delegation and ability rows only after /delegate, and the imported serialization is absent before but present after"),
+        assertion("delegation-path-origin", "node-db/pre-import.json + node-db/post-import.json", runner_pid, &manifest.run_id, &initial.request_id, "/delegations, /abilities, /parentDelegations", "the same database gains delegation and ability rows only after /delegate, and the plaintext hash identifier of the imported serialization is absent before but present after"),
         exchange_assertion("monotonic-revoke", "driver/revoke.json", &revoke, "/response/disposition", "the driver response records revoked and its timestamp precedes sidecar readiness"),
         exchange_assertion("post-redeploy-renewal-denied", "requester/renewal-denied.json", &denied, "/response/error/code and /response/execution", "the first direct live challenge after redeployed readiness returned policy-inactive; no TranscriptRequester accessEnded transition is claimed"),
         exchange_assertion("owner-node-ssrf-unit-scope", "requester/initial.json", &initial, "/response/ssrfScope", "ownerNode public-IP SSRF guard: unit-conformance-only (e-02 amendment 37 / Sol #10; sdk-core requester tests:565-620), liveObserved=false; not a live gate observation"),
@@ -447,14 +448,12 @@ fn require_process_evidence(bundle: &Path) -> Result<()> {
     Ok(())
 }
 
-fn value_contains(value: &Value, needle: &str) -> bool {
-    value.as_str().is_some_and(|text| text.contains(needle))
-        || value
-            .as_array()
-            .is_some_and(|items| items.iter().any(|item| value_contains(item, needle)))
-        || value
-            .as_object()
-            .is_some_and(|items| items.values().any(|item| value_contains(item, needle)))
+fn row_id_matches(row: &DelegationRow, expected: &[u8]) -> bool {
+    row.id
+        .pointer("/base64")
+        .and_then(Value::as_str)
+        .and_then(|encoded| URL_SAFE_NO_PAD.decode(encoded).ok())
+        .is_some_and(|actual| actual == expected)
 }
 
 fn assertion(

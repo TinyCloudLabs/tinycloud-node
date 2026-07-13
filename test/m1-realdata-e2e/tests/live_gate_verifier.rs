@@ -1,6 +1,7 @@
 use std::{fs, path::Path, process::Command};
 
 use anyhow::Result;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use m1_realdata_e2e::live_gate_verifier::{self, Mode};
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -167,9 +168,14 @@ fn accepted_bundle(root: &Path) -> Result<()> {
     )?;
     write(
         root.join("node-db/post-import.json"),
-        json!({"runId":"verifier-contract-test","observedAt":"2026-07-11T12:00:03Z","database":"caps.db","delegations":[{"id":"cid","serialization":"real-wire-delegation"}],"abilities":[{"delegation":"cid"}],"parentDelegations":[]}),
+        json!({"runId":"verifier-contract-test","observedAt":"2026-07-11T12:00:03Z","database":"caps.db","delegations":[{"id":delegation_id("real-wire-delegation"),"serialization":{"base64":"ZW5jcnlwdGVkLWF0LXJlc3Q"}}],"abilities":[{"delegation":"cid"}],"parentDelegations":[]}),
     )?;
     Ok(())
+}
+
+fn delegation_id(serialization: &str) -> Value {
+    let hash: Vec<u8> = tinycloud_core::hash::hash(serialization.as_bytes()).into();
+    json!({"base64": URL_SAFE_NO_PAD.encode(hash)})
 }
 
 fn exchange(
