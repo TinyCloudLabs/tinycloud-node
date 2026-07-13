@@ -424,7 +424,7 @@ fn require_candidate_pins(
     }
     let expected = [
         (&candidates.policy_engine, "cdd78c5"),
-        (&candidates.js_sdk, "b225289"),
+        (&candidates.js_sdk, "170f73d"),
         (&candidates.listen, "b26a447"),
         (&candidates.open_credentials, "70678a7"),
     ];
