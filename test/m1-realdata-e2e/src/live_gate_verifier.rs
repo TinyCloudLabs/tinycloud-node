@@ -423,10 +423,10 @@ fn require_candidate_pins(
         bail!("candidate SHA does not match required node pin {expected_node_sha}");
     }
     let expected = [
-        (&candidates.policy_engine, "d72812a"),
-        (&candidates.js_sdk, "2949408"),
-        (&candidates.listen, "7bbd99a"),
-        (&candidates.open_credentials, "a1633710"),
+        (&candidates.policy_engine, "d9a8d37"),
+        (&candidates.js_sdk, "d53c83e"),
+        (&candidates.listen, "c9cf086"),
+        (&candidates.open_credentials, "d2cf81e"),
     ];
     for (actual, prefix) in expected {
         if !actual.starts_with(prefix) {
