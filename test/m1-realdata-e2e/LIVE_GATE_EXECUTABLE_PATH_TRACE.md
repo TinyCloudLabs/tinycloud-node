@@ -12,11 +12,11 @@ js-sdk `5a42dd6`, Listen `bd936c0`, and OpenCredentials `a1633710`.
 
 | Step | Production path and state semantics | Required observation |
 | --- | --- | --- |
-| A. Inputs/identity | Caller supplies fresh nonce and SQL/KV bytes. `TinyCloudNode({privateKey})` selects `PrivateKeySigner`; `signIn()` runs `bootstrapAccountIfNeeded()` -> `bootstrapSteps(address, chainId)` (`packages/node-sdk/src/TinyCloudNode.ts:672-730,981-1100` at `5a42dd6`). | External input hashes/bytes through wire/read transcripts; no key material. Supported. |
-| B. Node/seed | Real `tinycloud-node-server` can run as its own PID/dynamic port/fresh datadir. Authenticated owner SDK SQL/KV calls reach node `/invoke` and `tinycloud-core` services. | PID/port/command/logs, authenticated seed wire exchanges, pre-import DB snapshot. Supported. |
+| A. Inputs/identity | Caller supplies fresh nonces and SQL bytes. `TinyCloudNode({privateKey})` selects `PrivateKeySigner`; `signIn()` runs `bootstrapAccountIfNeeded()` -> `bootstrapSteps(address, chainId)` (`packages/node-sdk/src/TinyCloudNode.ts:672-730,981-1100` at `5a42dd6`). | External input hashes/bytes through wire/read transcripts; no key material. Supported. |
+| B. Node/seed | Real `tinycloud-node-server` can run as its own PID/dynamic port/fresh datadir. An authenticated owner SDK SQL call reaches node `/invoke` and `tinycloud-core`. | PID/port/command/logs, authenticated seed wire exchange, pre-import DB snapshot. Supported. |
 | C. Publish/parent | Listen `publish` uses authenticated `node.kv.put` for four signed objects and `TinyCloudNode.createOwnerDelegation` for real `/delegate` (`test/m1-owner-demo.ts:151-197,249-336` at `bd936c0`; `TinyCloudNode.ts:2654-2710` at `5a42dd6`). The imported parent actions are exactly `tinycloud.sql/read` and `tinycloud.kv/get` (`test/m1-owner-demo.ts:118-120` at `bd936c0`). Receipt handling correctly distinguishes `commitEventCid` from locally derived delegation CID. | Raw fail-closed receipt, exact DAG-CBOR, independent CID, pre/post DB delegatee row. Supported for both required child capabilities. |
 | D. Sidecar startup | Production binary reads config and calls `PolicyEngineService::from_signed_objects`; signed authority is verified at startup and bounded parent bytes/CID/audience/receipt/bounds are locally validated (`crates/policy-engine-http/src/main.rs`; `lib.rs:100-241,945-1025` at `d72812a`). No running-sidecar PolicyStatus refresher exists. | Separate PID/config hash/readiness; later replacement process from updated signedObjects. Supported in isolation. |
-| E. Requester/seam/read | Amended `TranscriptRequester` performs challenge -> resolve -> exact-byte `/delegate` -> holder-signed native `/invoke` (`packages/sdk-core/src/requester/index.ts:464-862` at `5a42dd6`). `SharedGrantIssuer` emits node-native UCAN bytes and singleton `prf` after `validate_issue_request` (`policy-engine-http/src/lib.rs:321-755` at `d72812a`). Listen now signs terminal grant mode (`frontend/src/lib/listenOwnerShares.ts:635-641` at `bd936c0`), satisfying the issuer, and C's parent bounds both requested services. | Resolve/import/native SQL+KV transcripts and independent CID/prf derivation. Supported end to end by production paths. |
+| E. Requester/seam/read | `TranscriptRequester` performs challenge -> resolve -> exact-byte `/delegate` -> caveat-preserving holder-signed native `/invoke`. `SharedGrantIssuer` emits node-native UCAN bytes and singleton `prf` after `validate_issue_request` (`policy-engine-http/src/lib.rs:321-755` at `d72812a`). Listen signs terminal grant mode, satisfying the issuer, and the parent bounds the requested SQL service. | Resolve/import/native constrained-SQL transcript and independent CID/prf derivation. Supported end to end by production paths. |
 | F. Renewal | Requester `ensureFreshDelegation` performs access-triggered challenge/resolve with nonce replay protection. The signed policy ceiling remains `maxTtlSeconds: 300`; the caller's real request/presentation window narrows the emitted child to TTL <= 60 seconds without changing signed policy bytes. | Fresh nonce and successful TTL <= 60s delegation, derived from wire timestamps. Supported. |
 | G. Revoke/redeploy | Listen `revoke --state` starts a matching authenticated owner session and writes sequence-2 revoked PolicyStatus (`m1-owner-demo.ts:338-403` at `bd936c0`). Replacement sidecar can load updated signedObjects. | Revoked-commit and replacement-ready timestamps/PIDs. Supported. |
 | H. Denial | Replacement sidecar returns policy runtime's wire denial and requester latches access-ended only as consequence. | Third timestamp and raw `policy-inactive` response. Supported after the initial and renewed child are issued. |
@@ -42,7 +42,7 @@ signed production artifact now conforms, so issuance reaches UCAN encoding.
 The gate does not rewrite `maxTtlSeconds: 300`: the real request/presentation
 window narrows the child lifetime to <= 60 seconds beneath that signed ceiling.
 
-### 2. The imported owner parent authorizes both required child services
+### 2. The imported owner parent authorizes the required child service
 
 The same production driver fixes (`test/m1-owner-demo.ts:118-120` at `bd936c0`):
 
@@ -52,10 +52,11 @@ PARENT_ACTIONS = ["tinycloud.sql/read", "tinycloud.kv/get"]
 ```
 
 It passes those exact values to `createOwnerDelegation` at lines 315-321. The
-parent persisted by the mandated driver now bounds both native named-SQL and KV
-reads. g-07's local child-vs-parent checks (`policy-engine-http/src/lib.rs:
-191-241,595-607` at `d72812a`) can therefore validate both requested
-capabilities against the exact imported production artifact.
+parent persisted by the mandated driver bounds the native named-SQL read.
+g-07's local child-vs-parent checks (`policy-engine-http/src/lib.rs:
+191-241,595-607` at `d72812a`) therefore validate the requested capability
+against the exact imported production artifact. KV containment remains covered
+by the deterministic cross-layer suite; this Listen share does not grant KV.
 
 ## Constructibility decision
 

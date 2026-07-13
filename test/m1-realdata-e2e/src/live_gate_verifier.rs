@@ -31,7 +31,6 @@ struct Inputs {
     renewal_nonce_sha256: String,
     revoked_nonce_sha256: String,
     sql_seed_sha256: String,
-    kv_seed_sha256: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -187,11 +186,6 @@ fn verify(bundle: &Path, expected_node_sha: &str) -> Result<Report> {
         "/reads/sql/sha256",
         &manifest.inputs.sql_seed_sha256,
     )?;
-    require_seed_hash(
-        &initial.response,
-        "/reads/kv/sha256",
-        &manifest.inputs.kv_seed_sha256,
-    )?;
     require_true(&renewal.response, "/renewed", "renewal success")?;
     require_eq(
         &revoke.response,
@@ -267,10 +261,10 @@ fn verify(bundle: &Path, expected_node_sha: &str) -> Result<Report> {
     }
 
     let assertions = vec![
-        assertion("candidate-pins-and-external-inputs", "manifest.json", runner_pid, &manifest.run_id, "manifest", "/candidates and /inputs", "candidate SHAs equal the approved pins; all five caller inputs are nonempty SHA-256 digests"),
+        assertion("candidate-pins-and-external-inputs", "manifest.json", runner_pid, &manifest.run_id, "manifest", "/candidates and /inputs", "candidate SHAs equal the approved pins; all four caller inputs are nonempty SHA-256 digests"),
         exchange_assertion("signed-authority-published", "driver/publish.json", &publish, "/response", "the production driver returned its raw publish artifact before sidecar startup"),
         exchange_assertion("resolve-import-byte-provenance", "requester/initial.json", &initial, "/response/delegation and /response/import/delegation", "the resolve output string is byte-identical to the native /delegate input string"),
-        exchange_assertion("native-sql-kv-seed-reads", "requester/initial.json", &initial, "/response/reads", "SQL and KV returned hashes equal the independent hashes of caller-supplied seed bytes"),
+        exchange_assertion("native-constrained-sql-seed-read", "requester/initial.json", &initial, "/response/reads/sql/sha256", "the named constrained SQL read hash equals the independent hash of caller-supplied seed bytes"),
         exchange_assertion("short-ttl-and-renewal", "requester/renewal.json", &renewal, "/response/renewed", &format!("initial wire issuedAt/expiresAt difference is {ttl}s (1..=60) and a second direct live challenge/resolve/import exchange succeeded")),
         assertion("delegation-path-origin", "node-db/pre-import.json + node-db/post-import.json", runner_pid, &manifest.run_id, &initial.request_id, "/delegations, /abilities, /parentDelegations", "the same database gains delegation and ability rows only after /delegate, and the imported serialization is absent before but present after"),
         exchange_assertion("monotonic-revoke", "driver/revoke.json", &revoke, "/response/disposition", "the driver response records revoked and its timestamp precedes sidecar readiness"),
@@ -381,7 +375,6 @@ fn require_hex_hashes(inputs: &Inputs) -> Result<()> {
         &inputs.renewal_nonce_sha256,
         &inputs.revoked_nonce_sha256,
         &inputs.sql_seed_sha256,
-        &inputs.kv_seed_sha256,
     ] {
         if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             bail!("caller input digest is not a SHA-256 hex string");
@@ -408,7 +401,7 @@ fn require_candidate_pins(
     }
     let expected = [
         (&candidates.policy_engine, "d72812a"),
-        (&candidates.js_sdk, "4364b2c"),
+        (&candidates.js_sdk, "8443b90"),
         (&candidates.listen, "7bbd99a"),
         (&candidates.open_credentials, "a1633710"),
     ];

@@ -38,7 +38,7 @@ stop_pid() {
 
 for name in \
   M1_RUN_NONCE_FILE M1_RENEWAL_NONCE_FILE M1_REVOKED_NONCE_FILE \
-  M1_SQL_SEED_FILE M1_KV_SEED_FILE M1_OWNER_PRIVATE_KEY_FILE \
+  M1_SQL_SEED_FILE M1_OWNER_PRIVATE_KEY_FILE \
   M1_HOLDER_PRIVATE_KEY_FILE M1_NODE_REPO M1_POLICY_ENGINE_REPO M1_SDK_REPO \
   M1_LISTEN_REPO M1_OPEN_CREDENTIALS_REPO M1_NODE_DB \
   M1_PINNED_ARTIFACTS_FILE \
@@ -48,7 +48,7 @@ for name in \
   M1_WAIT_EXPIRY_CMD M1_POST_EXPIRY_READ_CMD; do need "$name"; done
 
 for file in "$M1_RUN_NONCE_FILE" "$M1_RENEWAL_NONCE_FILE" "$M1_REVOKED_NONCE_FILE" \
-  "$M1_SQL_SEED_FILE" "$M1_KV_SEED_FILE" "$M1_OWNER_PRIVATE_KEY_FILE" \
+  "$M1_SQL_SEED_FILE" "$M1_OWNER_PRIVATE_KEY_FILE" \
   "$M1_HOLDER_PRIVATE_KEY_FILE"; do [[ -s "$file" ]] || die "input file is missing/empty: $file"; done
 [[ -s "$M1_PINNED_ARTIFACTS_FILE" ]] || die "pinned artifact list is missing/empty"
 
@@ -65,7 +65,7 @@ export M1_BUNDLE="$BUNDLE" M1_RUN_ID="$RUN_ID"
 printf '%s\n' "$$" >"$BUNDLE/meta/runner.pid"
 ps -p "$$" -o command= >"$BUNDLE/meta/runner.actual-command"
 export M1_RUN_NONCE_FILE M1_RENEWAL_NONCE_FILE M1_REVOKED_NONCE_FILE
-export M1_SQL_SEED_FILE M1_KV_SEED_FILE M1_OWNER_PRIVATE_KEY_FILE M1_HOLDER_PRIVATE_KEY_FILE
+export M1_SQL_SEED_FILE M1_OWNER_PRIVATE_KEY_FILE M1_HOLDER_PRIVATE_KEY_FILE
 
 NODE_PID= SIDECAR_PID=
 NODE_STARTED_PID= SIDECAR_INITIAL_PID= SIDECAR_REDEPLOYED_PID=
@@ -103,12 +103,12 @@ OC_SHA=$(<"$BUNDLE/meta/open-credentials.sha")
 need M1_EXPECTED_NODE_SHA
 # The node pin is env-supplied: the gate script lives in this repo, so a
 # hardcoded self-SHA would be stale the moment the script itself merges.
-[[ $NODE_SHA == "$M1_EXPECTED_NODE_SHA"* && $POLICY_SHA == d72812a* && $SDK_SHA == 4364b2c* && \
+[[ $NODE_SHA == "$M1_EXPECTED_NODE_SHA"* && $POLICY_SHA == d72812a* && $SDK_SHA == 8443b90* && \
    $LISTEN_SHA == 7bbd99a* && $OC_SHA == a1633710* ]] || die "candidate SHA mismatch"
 for dirty in "$BUNDLE"/meta/*.dirty; do [[ ! -s "$dirty" ]] || die "candidate checkout is dirty: $dirty"; done
 
 cat >"$BUNDLE/manifest.json" <<JSON
-{"schema":"xyz.tinycloud.m1/live-gate-raw-bundle/v1","runId":$(json_string "$RUN_ID"),"createdAt":$(json_string "$(now)"),"inputs":{"nonceSha256":"$(sha256 "$M1_RUN_NONCE_FILE")","renewalNonceSha256":"$(sha256 "$M1_RENEWAL_NONCE_FILE")","revokedNonceSha256":"$(sha256 "$M1_REVOKED_NONCE_FILE")","sqlSeedSha256":"$(sha256 "$M1_SQL_SEED_FILE")","kvSeedSha256":"$(sha256 "$M1_KV_SEED_FILE")"},"candidates":{"tinycloudNode":"$NODE_SHA","policyEngine":"$POLICY_SHA","jsSdk":"$SDK_SHA","listen":"$LISTEN_SHA","openCredentials":"$OC_SHA"}}
+{"schema":"xyz.tinycloud.m1/live-gate-raw-bundle/v1","runId":$(json_string "$RUN_ID"),"createdAt":$(json_string "$(now)"),"inputs":{"nonceSha256":"$(sha256 "$M1_RUN_NONCE_FILE")","renewalNonceSha256":"$(sha256 "$M1_RENEWAL_NONCE_FILE")","revokedNonceSha256":"$(sha256 "$M1_REVOKED_NONCE_FILE")","sqlSeedSha256":"$(sha256 "$M1_SQL_SEED_FILE")"},"candidates":{"tinycloudNode":"$NODE_SHA","policyEngine":"$POLICY_SHA","jsSdk":"$SDK_SHA","listen":"$LISTEN_SHA","openCredentials":"$OC_SHA"}}
 JSON
 
 # B: real node, dynamic-port command supplied by PM, real owner seed.

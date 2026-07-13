@@ -62,8 +62,8 @@ fn accepted_bundle(root: &Path) -> Result<()> {
         json!({
             "schema": "xyz.tinycloud.m1/live-gate-raw-bundle/v1", "runId": "verifier-contract-test",
             "createdAt": "2026-07-11T12:00:00Z",
-            "inputs": {"nonceSha256":"11".repeat(32),"renewalNonceSha256":"22".repeat(32),"revokedNonceSha256":"33".repeat(32),"sqlSeedSha256":"44".repeat(32),"kvSeedSha256":"55".repeat(32)},
-            "candidates": {"tinycloudNode":"expected-node-sha","policyEngine":"d72812a","jsSdk":"4364b2c","listen":"7bbd99a","openCredentials":"a1633710"}
+            "inputs": {"nonceSha256":"11".repeat(32),"renewalNonceSha256":"22".repeat(32),"revokedNonceSha256":"33".repeat(32),"sqlSeedSha256":"44".repeat(32)},
+            "candidates": {"tinycloudNode":"expected-node-sha","policyEngine":"d72812a","jsSdk":"8443b90","listen":"7bbd99a","openCredentials":"a1633710"}
         }),
     )?;
     exchange(
@@ -81,7 +81,7 @@ fn accepted_bundle(root: &Path) -> Result<()> {
         json!({
             "delegation":"real-wire-delegation", "import":{"delegation":"real-wire-delegation"},
             "issuedAt":"2026-07-11T12:00:02Z", "expiresAt":"2026-07-11T12:01:02Z",
-            "reads":{"sql":{"sha256":"44".repeat(32)},"kv":{"sha256":"55".repeat(32)}},
+            "reads":{"sql":{"sha256":"44".repeat(32)}},
             "ssrfScope":{"coverage":"unit-conformance-only","liveObserved":false}
         }),
     )?;

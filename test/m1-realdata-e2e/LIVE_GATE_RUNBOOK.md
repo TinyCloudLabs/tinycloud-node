@@ -1,6 +1,6 @@
 # M1 live-gate PM runbook
 
-The runner accepts no generated authority or canned evidence. Create five
+The runner accepts no generated authority or canned evidence. Create four
 fresh binary input files and two key files outside the repository, then point
 the runner at them. Production command values must reference those file-path
 environment variables; do not embed secret bytes in command strings.
@@ -11,7 +11,6 @@ export M1_RUN_NONCE_FILE=/pm/secure/run-nonce.bin
 export M1_RENEWAL_NONCE_FILE=/pm/secure/renewal-nonce.bin
 export M1_REVOKED_NONCE_FILE=/pm/secure/post-revoke-nonce.bin
 export M1_SQL_SEED_FILE=/pm/secure/sql-seed.bin
-export M1_KV_SEED_FILE=/pm/secure/kv-seed.bin
 export M1_OWNER_PRIVATE_KEY_FILE=/pm/secure/owner.key
 export M1_HOLDER_PRIVATE_KEY_FILE=/pm/secure/holder.key
 
@@ -49,9 +48,9 @@ Expected success output is the verifier JSON on stdout with
 `"verdict":"pass"`, eleven passing assertions with citations, and
 `"mutationSelfTest":"passed"`. The same JSON is saved as
 `verifier-report.json`. Any missing raw field, dirty/wrong candidate checkout,
-non-monotonic timestamp, altered resolve/import bytes, seed mismatch, TTL over
+non-monotonic timestamp, altered resolve/import bytes, SQL seed mismatch, TTL over
 60 seconds, direct/preexisting imported child, wrong denial layer/code,
 surviving process, or mutation accepted by the verifier exits nonzero.
 
-The approved candidate prefixes are node `b51254e`, policy-engine `d72812a`,
-js-sdk `5a42dd6`, Listen `bd936c0`, and OpenCredentials `a1633710`.
+The approved candidate prefixes are supplied by the runner and verifier; the
+gate rejects any mismatch before starting the candidate processes.

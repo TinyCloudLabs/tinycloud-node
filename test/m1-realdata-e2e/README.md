@@ -40,7 +40,7 @@ CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test --manifest-path test/m1-realdata-e2
 ## Live M1 gate runner and independent verifier
 
 `scripts/m1-gate-demo.sh` is the A-J real-process runner. It receives all
-nonces, randomized SQL/KV bytes, keys, candidate checkouts, and production
+nonces, randomized SQL bytes, keys, candidate checkouts, and production
 commands from the PM. It does not create or rewrite any of them. It records
 unmodified stdout/stderr, commands, PIDs, repository SHAs/dirty state, input
 hashes, database snapshots, and timestamps under a new raw-bundle directory.
@@ -63,7 +63,7 @@ Each exchange is raw producer output with this envelope:
 ```
 
 The initial response carries `/delegation`, `/import/delegation`, `/issuedAt`,
-`/expiresAt`, `/reads/sql/sha256`, and `/reads/kv/sha256`. Renewal carries
+`/expiresAt` and `/reads/sql/sha256`. Renewal carries
 `/renewed`. Revoke carries `/disposition`. The denied renewal carries the raw
 sidecar `/error/code` plus the SDK consequence `/accessEnded`. The final native
 read carries `/layer` and `/refused`. These are producer facts, not
