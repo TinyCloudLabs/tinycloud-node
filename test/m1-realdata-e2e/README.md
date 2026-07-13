@@ -67,7 +67,8 @@ The initial response carries `/delegation`, `/import/delegation`, `/issuedAt`,
 `/renewed`. Revoke carries `/disposition`. The denied renewal carries the raw
 sidecar `/error/code` plus the SDK consequence `/accessEnded`. The final native
 read carries `/layer` and `/refused`. These are producer facts, not
-runner-authored verdict fields.
+runner-authored verdict fields. A revoked policy may deny at the challenge
+endpoint; the gate records that first fail-closed policy response directly.
 
 The independent verifier is:
 

@@ -202,7 +202,7 @@ fn verify(bundle: &Path, expected_node_sha: &str) -> Result<Report> {
     require_eq(
         &denied.response,
         "/execution",
-        "direct-live-challenge-resolve",
+        "direct-live-challenge",
         "denial execution boundary",
     )?;
     require_eq(
@@ -268,7 +268,7 @@ fn verify(bundle: &Path, expected_node_sha: &str) -> Result<Report> {
         exchange_assertion("short-ttl-and-renewal", "requester/renewal.json", &renewal, "/response/renewed", &format!("initial wire issuedAt/expiresAt difference is {ttl}s (1..=60) and a second direct live challenge/resolve/import exchange succeeded")),
         assertion("delegation-path-origin", "node-db/pre-import.json + node-db/post-import.json", runner_pid, &manifest.run_id, &initial.request_id, "/delegations, /abilities, /parentDelegations", "the same database gains delegation and ability rows only after /delegate, and the imported serialization is absent before but present after"),
         exchange_assertion("monotonic-revoke", "driver/revoke.json", &revoke, "/response/disposition", "the driver response records revoked and its timestamp precedes sidecar readiness"),
-        exchange_assertion("post-redeploy-renewal-denied", "requester/renewal-denied.json", &denied, "/response/error/code and /response/execution", "the first direct live challenge/resolve exchange after redeployed readiness returned policy-inactive; no TranscriptRequester accessEnded transition is claimed"),
+        exchange_assertion("post-redeploy-renewal-denied", "requester/renewal-denied.json", &denied, "/response/error/code and /response/execution", "the first direct live challenge after redeployed readiness returned policy-inactive; no TranscriptRequester accessEnded transition is claimed"),
         exchange_assertion("owner-node-ssrf-unit-scope", "requester/initial.json", &initial, "/response/ssrfScope", "ownerNode public-IP SSRF guard: unit-conformance-only (e-02 amendment 37 / Sol #10; sdk-core requester tests:565-620), liveObserved=false; not a live gate observation"),
         exchange_assertion("post-expiry-native-refusal", "requester/post-expiry-read.json", &expired, "/response/layer and /response/refused", "a later node response is classified native-node and refused after the issued expiry"),
         assertion("ordered-observation-window", "driver/revoke.json + sidecar/redeployed-ready.timestamp + requester/renewal-denied.json + requester/post-expiry-read.json", runner_pid, &manifest.run_id, "timeline", "observedAt", "revoked commit <= redeployed ready <= renewal denial < native refusal; the bound starts at successful redeploy"),

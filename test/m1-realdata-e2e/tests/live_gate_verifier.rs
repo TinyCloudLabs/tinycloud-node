@@ -112,7 +112,7 @@ fn accepted_bundle(root: &Path) -> Result<()> {
         "requester/renewal-denied.json",
         "denied",
         "2026-07-11T12:00:06Z",
-        json!({"error":{"code":"policy-inactive"},"accessEnded":false,"execution":"direct-live-challenge-resolve"}),
+        json!({"error":{"code":"policy-inactive"},"accessEnded":false,"execution":"direct-live-challenge"}),
     )?;
     exchange(
         root,
