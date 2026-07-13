@@ -2,6 +2,7 @@ use std::{fs, path::Path, process::Command};
 
 use anyhow::Result;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use chrono::DateTime;
 use m1_realdata_e2e::live_gate_verifier::{self, Mode};
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -28,6 +29,62 @@ fn verifier_requires_matching_expected_node_sha() -> Result<()> {
 
     assert!(live_gate_verifier::run(bundle.path(), Mode::Verify, "").is_err());
     assert!(live_gate_verifier::run(bundle.path(), Mode::Verify, "wrong-node-sha").is_err());
+    Ok(())
+}
+
+#[test]
+fn verifier_requires_ability_linked_to_imported_delegation() -> Result<()> {
+    let bundle = TempDir::new()?;
+    accepted_bundle(bundle.path())?;
+    let path = bundle.path().join("node-db/post-import.json");
+    let mut snapshot: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    snapshot["abilities"][0]["delegation"] = delegation_id("unrelated-delegation");
+    write(path, snapshot)?;
+
+    let error = live_gate_verifier::run(bundle.path(), Mode::Verify, "expected-node-sha")
+        .expect_err("unlinked ability row must fail closed");
+    assert!(error.to_string().contains("ability rows are not linked"));
+    Ok(())
+}
+
+#[test]
+fn verifier_requires_refusal_after_issued_expiry() -> Result<()> {
+    let bundle = TempDir::new()?;
+    accepted_bundle(bundle.path())?;
+    let path = bundle.path().join("requester/post-expiry-read.json");
+    let mut exchange: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    exchange["observedAt"] = json!("2026-07-11T12:01:01Z");
+    write(path, exchange)?;
+
+    let error = live_gate_verifier::run(bundle.path(), Mode::Verify, "expected-node-sha")
+        .expect_err("pre-expiry refusal must fail closed");
+    assert!(error
+        .to_string()
+        .contains("before the issued delegation expired"));
+    Ok(())
+}
+
+#[test]
+fn runner_timestamp_helper_has_millisecond_precision() -> Result<()> {
+    let source = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/m1-gate-demo.sh"
+    ))?;
+    let definition = source
+        .lines()
+        .find(|line| line.starts_with("now()"))
+        .expect("runner must define now()");
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(format!("{definition}\nnow"))
+        .output()?;
+    assert!(output.status.success());
+    let timestamp = String::from_utf8(output.stdout)?.trim().to_string();
+    DateTime::parse_from_rfc3339(&timestamp)?;
+    let fractional = timestamp
+        .split_once('.')
+        .and_then(|(_, suffix)| suffix.strip_suffix('Z'));
+    assert_eq!(fractional.map(str::len), Some(3));
     Ok(())
 }
 
@@ -68,6 +125,42 @@ connection.commit()
     let snapshot: Value = serde_json::from_slice(&fs::read(output)?)?;
     assert_eq!(snapshot["abilities"].as_array().map(Vec::len), Some(1));
     assert_eq!(snapshot["abilities"][0]["ability"], "tinycloud.sql/read");
+    Ok(())
+}
+
+#[test]
+fn snapshot_fails_closed_when_required_authority_table_is_missing() -> Result<()> {
+    let bundle = TempDir::new()?;
+    let database = bundle.path().join("caps.db");
+    let output = bundle.path().join("snapshot.json");
+    let created = Command::new("python3")
+        .arg("-c")
+        .arg(
+            r#"import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1])
+connection.executescript('''
+CREATE TABLE delegation (id BLOB, serialization TEXT);
+CREATE TABLE ability (resource TEXT, ability TEXT, delegation BLOB, caveats TEXT);
+''')
+connection.commit()
+"#,
+        )
+        .arg(&database)
+        .status()?;
+    assert!(created.success());
+
+    let captured = Command::new("bash")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/scripts/snapshot-node-db.sh"
+        ))
+        .arg(&database)
+        .arg("snapshot-contract-test")
+        .arg(&output)
+        .output()?;
+    assert!(!captured.status.success());
+    assert!(!output.exists());
+    assert!(String::from_utf8(captured.stderr)?.contains("parent_delegation"));
     Ok(())
 }
 
@@ -168,7 +261,7 @@ fn accepted_bundle(root: &Path) -> Result<()> {
     )?;
     write(
         root.join("node-db/post-import.json"),
-        json!({"runId":"verifier-contract-test","observedAt":"2026-07-11T12:00:03Z","database":"caps.db","delegations":[{"id":delegation_id("real-wire-delegation"),"serialization":{"base64":"ZW5jcnlwdGVkLWF0LXJlc3Q"}}],"abilities":[{"delegation":"cid"}],"parentDelegations":[]}),
+        json!({"runId":"verifier-contract-test","observedAt":"2026-07-11T12:00:03Z","database":"caps.db","delegations":[{"id":delegation_id("real-wire-delegation"),"serialization":{"base64":"ZW5jcnlwdGVkLWF0LXJlc3Q"}}],"abilities":[{"delegation":delegation_id("real-wire-delegation")}],"parentDelegations":[]}),
     )?;
     Ok(())
 }

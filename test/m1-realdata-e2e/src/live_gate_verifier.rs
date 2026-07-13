@@ -62,13 +62,18 @@ struct Snapshot {
     observed_at: String,
     database: String,
     delegations: Vec<DelegationRow>,
-    abilities: Vec<Value>,
+    abilities: Vec<AbilityRow>,
     parent_delegations: Vec<Value>,
 }
 
 #[derive(Debug, Deserialize)]
 struct DelegationRow {
     id: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct AbilityRow {
+    delegation: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,6 +186,9 @@ fn verify(bundle: &Path, expected_node_sha: &str) -> Result<Report> {
     if !(1..=60).contains(&ttl) {
         bail!("initial delegation TTL {ttl}s is outside 1..=60");
     }
+    if expired_time <= expires {
+        bail!("native refusal was observed before the issued delegation expired");
+    }
     require_seed_hash(
         &initial.response,
         "/reads/sql/sha256",
@@ -257,6 +265,20 @@ fn verify(bundle: &Path, expected_node_sha: &str) -> Result<Report> {
     {
         bail!("post-import authority rows do not contain the imported delegation identifier");
     }
+    if pre
+        .abilities
+        .iter()
+        .any(|row| value_id_matches(&row.delegation, &imported_id))
+    {
+        bail!("imported delegation already had ability rows before /delegate");
+    }
+    if !post
+        .abilities
+        .iter()
+        .any(|row| value_id_matches(&row.delegation, &imported_id))
+    {
+        bail!("post-import ability rows are not linked to the imported delegation identifier");
+    }
     if post.delegations.iter().any(|row| row.id.is_null()) {
         bail!("post-import delegation has a null identity");
     }
@@ -267,7 +289,7 @@ fn verify(bundle: &Path, expected_node_sha: &str) -> Result<Report> {
         exchange_assertion("resolve-import-byte-provenance", "requester/initial.json", &initial, "/response/delegation and /response/import/delegation", "the resolve output string is byte-identical to the native /delegate input string"),
         exchange_assertion("native-constrained-sql-seed-read", "requester/initial.json", &initial, "/response/reads/sql/sha256", "the named constrained SQL read hash equals the independent hash of caller-supplied seed bytes"),
         exchange_assertion("short-ttl-and-renewal", "requester/renewal.json", &renewal, "/response/renewed", &format!("initial wire issuedAt/expiresAt difference is {ttl}s (1..=60) and a second direct live challenge/resolve/import exchange succeeded")),
-        assertion("delegation-path-origin", "node-db/pre-import.json + node-db/post-import.json", runner_pid, &manifest.run_id, &initial.request_id, "/delegations, /abilities, /parentDelegations", "the same database gains delegation and ability rows only after /delegate, and the plaintext hash identifier of the imported serialization is absent before but present after"),
+        assertion("delegation-path-origin", "node-db/pre-import.json + node-db/post-import.json", runner_pid, &manifest.run_id, &initial.request_id, "/delegations, /abilities, /parentDelegations", "the same database gains delegation and ability rows only after /delegate; the plaintext hash identifier of the imported serialization is absent before, then identifies both the imported delegation row and at least one linked ability row after"),
         exchange_assertion("monotonic-revoke", "driver/revoke.json", &revoke, "/response/disposition", "the driver response records revoked and its timestamp precedes sidecar readiness"),
         exchange_assertion("post-redeploy-renewal-denied", "requester/renewal-denied.json", &denied, "/response/error/code and /response/execution", "the first direct live challenge after redeployed readiness returned policy-inactive; no TranscriptRequester accessEnded transition is claimed"),
         exchange_assertion("owner-node-ssrf-unit-scope", "requester/initial.json", &initial, "/response/ssrfScope", "ownerNode public-IP SSRF guard: unit-conformance-only (e-02 amendment 37 / Sol #10; sdk-core requester tests:565-620), liveObserved=false; not a live gate observation"),
@@ -449,7 +471,11 @@ fn require_process_evidence(bundle: &Path) -> Result<()> {
 }
 
 fn row_id_matches(row: &DelegationRow, expected: &[u8]) -> bool {
-    row.id
+    value_id_matches(&row.id, expected)
+}
+
+fn value_id_matches(value: &Value, expected: &[u8]) -> bool {
+    value
         .pointer("/base64")
         .and_then(Value::as_str)
         .and_then(|encoded| URL_SAFE_NO_PAD.decode(encoded).ok())
