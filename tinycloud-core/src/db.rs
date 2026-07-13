@@ -22,6 +22,7 @@ use sea_orm::{
 };
 use sea_orm_migration::MigratorTrait;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Weak};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_auth::{
     authorization::{EncodingError, TinyCloudDelegation},
@@ -54,6 +55,7 @@ pub struct SpaceDatabase<C, B, S> {
     secrets: S,
     encryption: Option<ColumnEncryption>,
     sql_sizes: SqlSizes,
+    revocation_chain_locks: Arc<tokio::sync::Mutex<HashMap<Hash, Weak<tokio::sync::Mutex<()>>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +73,14 @@ pub struct TransactResult {
     /// CIDs of delegations that were processed (saved) regardless of space existence.
     /// Used to return a CID even when all spaces were skipped.
     pub delegation_cids: Vec<Hash>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegationStatus {
+    Active,
+    Revoked,
+    Expired,
+    Unavailable,
 }
 
 #[non_exhaustive]
@@ -104,6 +114,8 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
     InvalidCid(String),
     #[error("encryption error: {0}")]
     Encryption(#[from] crate::encryption::EncryptionError),
+    #[error("delegation-chain-traversal-limit-exceeded")]
+    ChainTraversalLimitExceeded,
 }
 
 #[non_exhaustive]
@@ -150,6 +162,7 @@ impl<B, K> SpaceDatabase<DatabaseConnection, B, K> {
             secrets,
             encryption: None,
             sql_sizes: SqlSizes::default(),
+            revocation_chain_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -506,14 +519,52 @@ pub type InvocationInputs<W> = HashMap<(SpaceId, Path), (Metadata, HashBuffer<W>
 
 impl<C, B, K> SpaceDatabase<C, B, K>
 where
-    C: TransactionTrait,
+    C: TransactionTrait + ConnectionTrait,
     B: StorageSetup,
     K: Secrets,
 {
+    async fn acquire_chain_guards(
+        &self,
+        roots: &[Hash],
+    ) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>, TxError<B, K>> {
+        let mut keys = revocation::ancestor_chain_ids_for_roots(&self.conn, roots)
+            .await
+            .map_err(|error| match error {
+                revocation::ChainTraversalError::Db(error) => TxError::Db(error),
+                revocation::ChainTraversalError::LimitExceeded => {
+                    TxError::ChainTraversalLimitExceeded
+                }
+            })?;
+        keys.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
+        keys.dedup();
+
+        let locks = {
+            let mut registry = self.revocation_chain_locks.lock().await;
+            registry.retain(|_, lock| lock.strong_count() > 0);
+            keys.into_iter()
+                .map(|key| {
+                    if let Some(lock) = registry.get(&key).and_then(Weak::upgrade) {
+                        lock
+                    } else {
+                        let lock = Arc::new(tokio::sync::Mutex::new(()));
+                        registry.insert(key, Arc::downgrade(&lock));
+                        lock
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut guards = Vec::with_capacity(locks.len());
+        for lock in locks {
+            guards.push(lock.lock_owned().await);
+        }
+        Ok(guards)
+    }
+
     async fn transact(&self, events: Vec<Event>) -> Result<TransactResult, TxError<B, K>> {
         let tx = self
             .conn
-            .begin_with_config(Some(sea_orm::IsolationLevel::ReadUncommitted), None)
+            .begin_with_config(chain_isolation_level(&self.conn), None)
             .await?;
 
         let result = transact(
@@ -531,13 +582,110 @@ where
     }
 
     pub async fn delegate(&self, delegation: Delegation) -> Result<TransactResult, TxError<B, K>> {
+        let roots: Vec<Hash> = delegation
+            .0
+            .parents
+            .iter()
+            .copied()
+            .map(Hash::from)
+            .collect();
+        let _chain_guards = self.acquire_chain_guards(&roots).await?;
         self.transact(vec![Event::Delegation(Box::new(delegation))])
             .await
     }
 
     pub async fn revoke(&self, revocation: Revocation) -> Result<TransactResult, TxError<B, K>> {
+        let mut roots = vec![Hash::from(revocation.0.revoked)];
+        roots.extend(revocation.0.parents.iter().copied().map(Hash::from));
+        let _chain_guards = self.acquire_chain_guards(&roots).await?;
         self.transact(vec![Event::Revocation(Box::new(revocation))])
             .await
+    }
+
+    pub async fn delegation_status(
+        &self,
+        target: Hash,
+        invoker: &str,
+        proofs: &[tinycloud_auth::authorization::Cid],
+    ) -> Result<Option<DelegationStatus>, TxError<B, K>> {
+        if proofs.len() > 1 {
+            return Ok(None);
+        }
+        let Some(delegation) = delegation::Entity::find_by_id(target)
+            .one(&self.conn)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let abilities = abilities::Entity::find()
+            .filter(abilities::Column::Delegation.eq(target))
+            .all(&self.conn)
+            .await?;
+
+        let mut roots = vec![target];
+        roots.extend(proofs.iter().copied().map(Hash::from));
+        let _chain_guards = match self.acquire_chain_guards(&roots).await {
+            Ok(guards) => guards,
+            Err(TxError::ChainTraversalLimitExceeded) => {
+                return Ok(Some(DelegationStatus::Unavailable));
+            }
+            Err(error) => return Err(error),
+        };
+
+        let principal = match revocation::control_proof_decision(
+            &self.conn,
+            invoker,
+            proofs,
+            "tinycloud.delegation/status",
+            &target,
+        )
+        .await?
+        {
+            revocation::ControlProofDecision::DirectSigner(principal)
+            | revocation::ControlProofDecision::PersistentPrincipal(principal) => principal,
+            revocation::ControlProofDecision::Denied => return Ok(None),
+        };
+        let authorized = did_principal_matches(&delegation.delegator, &principal)
+            || did_principal_matches(&delegation.delegatee, &principal)
+            || abilities.iter().any(|ability| {
+                ability
+                    .resource
+                    .space()
+                    .map(|space| did_principal_matches(space.did().as_str(), &principal))
+                    .unwrap_or(false)
+            });
+        if !authorized {
+            return Ok(None);
+        }
+
+        if revocation::is_revoked(&self.conn, &target).await? {
+            return Ok(Some(DelegationStatus::Revoked));
+        }
+        match revocation::first_revoked_ancestor(&self.conn, &target).await {
+            Ok(Some(_)) => return Ok(Some(DelegationStatus::Revoked)),
+            Ok(None) => {}
+            Err(revocation::ChainTraversalError::LimitExceeded) => {
+                return Ok(Some(DelegationStatus::Unavailable));
+            }
+            Err(revocation::ChainTraversalError::Db(error)) => return Err(error.into()),
+        }
+
+        let now = OffsetDateTime::now_utc();
+        if delegation
+            .expiry
+            .map(|expiry| now >= expiry)
+            .unwrap_or(false)
+        {
+            return Ok(Some(DelegationStatus::Expired));
+        }
+        if delegation
+            .not_before
+            .map(|not_before| now < not_before)
+            .unwrap_or(false)
+        {
+            return Ok(Some(DelegationStatus::Unavailable));
+        }
+        Ok(Some(DelegationStatus::Active))
     }
 
     pub async fn invoke<S>(
@@ -550,6 +698,14 @@ where
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
+        let roots: Vec<Hash> = invocation
+            .0
+            .parents
+            .iter()
+            .copied()
+            .map(Hash::from)
+            .collect();
+        let _chain_guards = self.acquire_chain_guards(&roots).await?;
         let mut stages = HashMap::new();
         let mut ops = Vec::new();
         // for each capability being invoked
@@ -597,7 +753,7 @@ where
 
         let tx = self
             .conn
-            .begin_with_config(Some(sea_orm::IsolationLevel::ReadUncommitted), None)
+            .begin_with_config(chain_isolation_level(&self.conn), None)
             .await?;
         let caps = invocation.0.capabilities.clone();
         let invoker = invocation.0.invoker.clone();
@@ -718,6 +874,17 @@ where
         // commit tx if all side effects worked
         tx.commit().await?;
         Ok((commit, results))
+    }
+}
+
+fn chain_isolation_level<C: ConnectionTrait>(db: &C) -> Option<sea_orm::IsolationLevel> {
+    match db.get_database_backend() {
+        // SQLite's default transaction mode is serializable; sqlx rejects an
+        // explicit SET TRANSACTION isolation statement for SQLite.
+        sea_orm::DatabaseBackend::Sqlite => None,
+        sea_orm::DatabaseBackend::Postgres | sea_orm::DatabaseBackend::MySql => {
+            Some(sea_orm::IsolationLevel::Serializable)
+        }
     }
 }
 
@@ -1652,6 +1819,156 @@ mod test {
     #[tokio::test]
     async fn basic() {
         let _db = get_db().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn revoke_winner_serializes_before_descendant_issue_and_use_checks() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        let db = get_db().await.unwrap();
+        let parent_id = crate::hash::hash(b"race-parent");
+        for actor_id in ["did:key:owner", "did:key:holder"] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+        }
+        delegation::ActiveModel {
+            id: Set(parent_id),
+            delegator: Set("did:key:owner".to_string()),
+            delegatee: Set("did:key:holder".to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(b"race-parent".to_vec()),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        let child_id = crate::hash::hash(b"race-child");
+        delegation::ActiveModel {
+            id: Set(child_id),
+            delegator: Set("did:key:holder".to_string()),
+            delegatee: Set("did:key:holder".to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(b"race-child".to_vec()),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        parent_delegations::ActiveModel {
+            parent: Set(parent_id),
+            child: Set(child_id),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        let revoke_guard = db
+            .acquire_chain_guards(&[parent_id])
+            .await
+            .ok()
+            .expect("revoke chain lock");
+        let issue_db = db.clone();
+        let issue = tokio::spawn(async move {
+            let _guard = issue_db
+                .acquire_chain_guards(&[parent_id])
+                .await
+                .ok()
+                .expect("issue chain lock");
+            crate::models::revocation::is_revoked(&issue_db.conn, &parent_id)
+                .await
+                .unwrap()
+        });
+        let use_db = db.clone();
+        let use_existing = tokio::spawn(async move {
+            let _guard = use_db
+                .acquire_chain_guards(&[child_id])
+                .await
+                .ok()
+                .expect("use chain lock");
+            crate::models::revocation::is_revoked(&use_db.conn, &parent_id)
+                .await
+                .unwrap()
+        });
+        tokio::task::yield_now().await;
+        assert!(!issue.is_finished());
+        assert!(!use_existing.is_finished());
+
+        revocation::ActiveModel {
+            id: Set(crate::hash::hash(b"race-revocation")),
+            revoker: Set("did:key:owner".to_string()),
+            revoked: Set(parent_id),
+            serialization: Set(b"race-revocation".to_vec()),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        drop(revoke_guard);
+
+        assert!(issue.await.unwrap(), "new child check must observe revoke");
+        assert!(
+            use_existing.await.unwrap(),
+            "existing child use check must observe revoke"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_delegation_chains_do_not_serialize() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        let db = get_db().await.unwrap();
+        actor::ActiveModel {
+            id: Set("did:key:unrelated".to_string()),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        let first = crate::hash::hash(b"first-unrelated-chain");
+        let second = crate::hash::hash(b"second-unrelated-chain");
+        for id in [first, second] {
+            delegation::ActiveModel {
+                id: Set(id),
+                delegator: Set("did:key:unrelated".to_string()),
+                delegatee: Set("did:key:unrelated".to_string()),
+                expiry: Set(None),
+                issued_at: Set(None),
+                not_before: Set(None),
+                facts: Set(None),
+                serialization: Set(id.as_ref().to_vec()),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+        }
+
+        let first_guard = db
+            .acquire_chain_guards(&[first])
+            .await
+            .ok()
+            .expect("first chain lock");
+        let other_db = db.clone();
+        let unrelated = tokio::spawn(async move {
+            other_db
+                .acquire_chain_guards(&[second])
+                .await
+                .ok()
+                .expect("unrelated chain lock")
+        });
+        let second_guard = tokio::time::timeout(std::time::Duration::from_secs(1), unrelated)
+            .await
+            .expect("an unrelated chain must not wait for the first chain")
+            .unwrap();
+
+        drop(second_guard);
+        drop(first_guard);
     }
 
     #[tokio::test]
