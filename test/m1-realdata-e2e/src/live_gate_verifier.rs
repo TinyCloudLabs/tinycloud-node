@@ -408,8 +408,8 @@ fn require_candidate_pins(
     }
     let expected = [
         (&candidates.policy_engine, "d72812a"),
-        (&candidates.js_sdk, "5a42dd6"),
-        (&candidates.listen, "bd936c0"),
+        (&candidates.js_sdk, "4364b2c"),
+        (&candidates.listen, "c573818"),
         (&candidates.open_credentials, "a1633710"),
     ];
     for (actual, prefix) in expected {

@@ -103,8 +103,8 @@ OC_SHA=$(<"$BUNDLE/meta/open-credentials.sha")
 need M1_EXPECTED_NODE_SHA
 # The node pin is env-supplied: the gate script lives in this repo, so a
 # hardcoded self-SHA would be stale the moment the script itself merges.
-[[ $NODE_SHA == "$M1_EXPECTED_NODE_SHA"* && $POLICY_SHA == d72812a* && $SDK_SHA == 5a42dd6* && \
-   $LISTEN_SHA == bd936c0* && $OC_SHA == a1633710* ]] || die "candidate SHA mismatch"
+[[ $NODE_SHA == "$M1_EXPECTED_NODE_SHA"* && $POLICY_SHA == d72812a* && $SDK_SHA == 4364b2c* && \
+   $LISTEN_SHA == c573818* && $OC_SHA == a1633710* ]] || die "candidate SHA mismatch"
 for dirty in "$BUNDLE"/meta/*.dirty; do [[ ! -s "$dirty" ]] || die "candidate checkout is dirty: $dirty"; done
 
 cat >"$BUNDLE/manifest.json" <<JSON
