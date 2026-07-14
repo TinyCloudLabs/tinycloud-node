@@ -883,7 +883,11 @@ fn chain_isolation_level<C: ConnectionTrait>(db: &C) -> Option<sea_orm::Isolatio
         // explicit SET TRANSACTION isolation statement for SQLite.
         sea_orm::DatabaseBackend::Sqlite => None,
         sea_orm::DatabaseBackend::Postgres | sea_orm::DatabaseBackend::MySql => {
-            Some(sea_orm::IsolationLevel::Serializable)
+            // Revocation ordering is enforced by the chain-scoped guards held
+            // through commit. SERIALIZABLE also made unrelated chains contend
+            // on the shared epoch-tip read/write path, producing routine 40001
+            // aborts for every authenticated operation class.
+            Some(sea_orm::IsolationLevel::ReadCommitted)
         }
     }
 }
@@ -1795,7 +1799,7 @@ mod test {
     use crate::{keys::StaticSecret, sql_sizes::SqlSizes, storage::memory::MemoryStore};
 
     use super::*;
-    use sea_orm::{ConnectOptions, Database};
+    use sea_orm::{ConnectOptions, Database, DbBackend, Statement};
     use tinycloud_auth::{
         resolver::DID_METHODS,
         ssi::{dids::DIDBuf, jwk::JWK},
@@ -1969,6 +1973,136 @@ mod test {
 
         drop(second_guard);
         drop(first_guard);
+    }
+
+    #[tokio::test]
+    async fn postgres_concurrent_epoch_appends_do_not_serialize() {
+        let Ok(database_url) = std::env::var("TINYCLOUD_TEST_POSTGRES_URL") else {
+            eprintln!("skipping PostgreSQL concurrency test: TINYCLOUD_TEST_POSTGRES_URL is unset");
+            return;
+        };
+
+        let conn = Database::connect(ConnectOptions::new(database_url))
+            .await
+            .expect("connect to PostgreSQL test database");
+        assert_eq!(
+            chain_isolation_level(&conn),
+            Some(sea_orm::IsolationLevel::ReadCommitted)
+        );
+
+        let suffix = format!(
+            "{}_{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        let schema = format!("tc212_{suffix}");
+
+        conn.execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("CREATE SCHEMA {schema}"),
+        ))
+        .await
+        .expect("create isolated test schema");
+
+        let exercise: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+            let epoch_table = format!("{schema}.epoch");
+            let order_table = format!("{schema}.epoch_order");
+
+            conn.execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("CREATE TABLE {epoch_table} (id INTEGER PRIMARY KEY, space TEXT NOT NULL)"),
+            ))
+            .await?;
+            conn.execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!(
+                    "CREATE TABLE {order_table} (parent INTEGER NOT NULL, child INTEGER NOT NULL, \
+                     space TEXT NOT NULL, PRIMARY KEY (parent, child, space))"
+                ),
+            ))
+            .await?;
+            conn.execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("INSERT INTO {epoch_table} (id, space) VALUES (1, 'space')"),
+            ))
+            .await?;
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let append = |child: i32| {
+                let conn = conn.clone();
+                let barrier = Arc::clone(&barrier);
+                let epoch_table = epoch_table.clone();
+                let order_table = order_table.clone();
+                tokio::spawn(async move {
+                    let tx = conn
+                        .begin_with_config(chain_isolation_level(&conn), None)
+                        .await?;
+                    let tips = tx
+                        .query_all(Statement::from_string(
+                            DbBackend::Postgres,
+                            format!(
+                                "SELECT epoch.id FROM {epoch_table} AS epoch \
+                                 LEFT JOIN {order_table} AS ordering ON epoch.id = ordering.parent \
+                                 WHERE epoch.space = 'space' AND ordering.child IS NULL"
+                            ),
+                        ))
+                        .await?;
+                    if tips.len() != 1 {
+                        return Err(DbErr::Custom(format!(
+                            "expected one shared epoch tip, got {}",
+                            tips.len()
+                        )));
+                    }
+                    barrier.wait().await;
+                    tx.execute(Statement::from_string(
+                        DbBackend::Postgres,
+                        format!("INSERT INTO {epoch_table} (id, space) VALUES ({child}, 'space')"),
+                    ))
+                    .await?;
+                    tx.execute(Statement::from_string(
+                        DbBackend::Postgres,
+                        format!(
+                            "INSERT INTO {order_table} (parent, child, space) \
+                             VALUES (1, {child}, 'space')"
+                        ),
+                    ))
+                    .await?;
+                    tx.commit().await
+                })
+            };
+
+            let mut first = append(2);
+            let mut second = append(3);
+            match tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                tokio::join!(&mut first, &mut second)
+            })
+            .await
+            {
+                Ok((first, second)) => {
+                    first??;
+                    second??;
+                }
+                Err(error) => {
+                    first.abort();
+                    second.abort();
+                    let _ = first.await;
+                    let _ = second.await;
+                    return Err(error.into());
+                }
+            }
+
+            Ok(())
+        }
+        .await;
+
+        conn.execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+        ))
+        .await
+        .expect("clean up isolated test schema");
+
+        exercise.expect("both concurrent epoch appends committed");
     }
 
     #[tokio::test]
