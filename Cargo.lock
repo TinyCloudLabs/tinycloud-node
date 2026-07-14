@@ -9237,7 +9237,7 @@ dependencies = [
 
 [[package]]
 name = "tinycloud-node"
-version = "1.4.6"
+version = "1.4.7"
 dependencies = [
  "anyhow",
  "aws-config",
