@@ -38,8 +38,10 @@ use tinycloud_core::{
     models::{
         hook_delivery, hook_subscription, invocation as invocation_model, kv_delete, kv_write,
     },
-    sea_orm::DbErr,
-    sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder},
+    sea_orm::{
+        error::{RuntimeErr, SqlxError},
+        ColumnTrait, DbErr, EntityTrait, QueryFilter, QueryOrder,
+    },
     sql::{SqlCaveats, SqlError, SqlRequest, SqlService},
     storage::{HashBuffer, ImmutableReadStore, ImmutableStaging},
     types::{Ability, Metadata, Resource},
@@ -55,6 +57,32 @@ pub mod hooks;
 pub mod public;
 pub mod util;
 use util::LimitedReader;
+
+fn retryable_sqlstate(code: &str) -> bool {
+    matches!(code, "40001" | "40P01")
+}
+
+fn is_retryable_database_error(error: &DbErr) -> bool {
+    let runtime_error = match error {
+        DbErr::Conn(error) | DbErr::Exec(error) | DbErr::Query(error) => error,
+        _ => return false,
+    };
+    let RuntimeErr::SqlxError(SqlxError::Database(database_error)) = runtime_error else {
+        return false;
+    };
+    database_error
+        .code()
+        .as_deref()
+        .is_some_and(retryable_sqlstate)
+}
+
+fn database_error_status(error: &DbErr) -> Status {
+    if is_retryable_database_error(error) {
+        Status::ServiceUnavailable
+    } else {
+        Status::InternalServerError
+    }
+}
 
 #[derive(Serialize)]
 pub struct NodeInfo {
@@ -331,10 +359,11 @@ pub async fn delegate(
             .await
             .map_err(|e| {
                 (
-                    match e {
+                    match &e {
                         TxError::SpaceNotFound => Status::NotFound,
-                        TxError::EpochInsert(_) => Status::InternalServerError,
-                        TxError::Db(DbErr::ConnectionAcquire(_)) => Status::InternalServerError,
+                        TxError::Db(error) | TxError::EpochInsert(error) => {
+                            database_error_status(error)
+                        }
                         _ => Status::Unauthorized,
                     },
                     e.to_string(),
@@ -396,10 +425,11 @@ pub async fn revoke(
         let revoked_cid = r.0 .0.revoked.to_string();
         let res = tinycloud.revoke(r.0).await.map_err(|e| {
             (
-                match e {
+                match &e {
                     TxError::SpaceNotFound => Status::NotFound,
-                    TxError::EpochInsert(_) => Status::InternalServerError,
-                    TxError::Db(DbErr::ConnectionAcquire(_)) => Status::InternalServerError,
+                    TxError::Db(error) | TxError::EpochInsert(error) => {
+                        database_error_status(error)
+                    }
                     _ => Status::Forbidden,
                 },
                 e.to_string(),
@@ -1061,11 +1091,10 @@ async fn invoke_impl(
                 }
             }
             Err(e) => Err((
-                match e {
+                match &e {
                     TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
-                    TxStoreError::Tx(TxError::EpochInsert(_)) => Status::InternalServerError,
-                    TxStoreError::Tx(TxError::Db(DbErr::ConnectionAcquire(_))) => {
-                        Status::InternalServerError
+                    TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
+                        database_error_status(error)
                     }
                     _ => Status::Unauthorized,
                 },
@@ -2307,11 +2336,10 @@ async fn verify_auth(
         .await
         .map_err(|e| {
             (
-                match e {
+                match &e {
                     TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
-                    TxStoreError::Tx(TxError::EpochInsert(_)) => Status::InternalServerError,
-                    TxStoreError::Tx(TxError::Db(DbErr::ConnectionAcquire(_))) => {
-                        Status::InternalServerError
+                    TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
+                        database_error_status(error)
                     }
                     _ => Status::Unauthorized,
                 },
@@ -2352,6 +2380,67 @@ mod tests {
         types::{Ability, Resource},
     };
     use tokio::time::{timeout, Duration};
+
+    #[derive(Debug)]
+    struct TestDatabaseError {
+        code: &'static str,
+    }
+
+    impl std::fmt::Display for TestDatabaseError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("test database error")
+        }
+    }
+
+    impl std::error::Error for TestDatabaseError {}
+
+    impl tinycloud_core::sea_orm::sqlx::error::DatabaseError for TestDatabaseError {
+        fn message(&self) -> &str {
+            "test database error"
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(self.code.into())
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> tinycloud_core::sea_orm::sqlx::error::ErrorKind {
+            tinycloud_core::sea_orm::sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn db_error_with_sqlstate(code: &'static str) -> DbErr {
+        DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(Box::new(
+            TestDatabaseError { code },
+        ))))
+    }
+
+    #[tokio::test]
+    async fn serialization_and_deadlock_sqlstates_are_retryable() {
+        assert!(retryable_sqlstate("40001"));
+        assert!(retryable_sqlstate("40P01"));
+        assert!(!retryable_sqlstate("23505"));
+        assert!(!retryable_sqlstate("28000"));
+        assert_eq!(
+            database_error_status(&db_error_with_sqlstate("40001")),
+            Status::ServiceUnavailable
+        );
+        assert_eq!(
+            database_error_status(&db_error_with_sqlstate("23505")),
+            Status::InternalServerError
+        );
+    }
 
     fn test_space_id(name: &str) -> SpaceId {
         let jwk = JWK::generate_ed25519().unwrap();

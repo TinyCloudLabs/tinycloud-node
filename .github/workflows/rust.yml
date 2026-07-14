@@ -82,6 +82,29 @@ jobs:
     - name: Verify generated capability artifacts match capabilities.json
       run: node scripts/gen-capabilities.mjs --check
 
+  postgres-concurrency:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TINYCLOUD_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+    - name: Checkout TinyCloud repository
+      uses: actions/checkout@v4
+    - name: Run PostgreSQL epoch concurrency regression
+      run: cargo test -p tinycloud-core postgres_concurrent_epoch_appends_do_not_serialize -- --nocapture
+
   m1-realdata:
     runs-on: ubuntu-latest
     env:
