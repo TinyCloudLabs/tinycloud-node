@@ -262,6 +262,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sql_write_export_is_not_throttled_by_backup_pacing() {
+        // Regression for tinycloud-node#112: handle_export paced the SQLite
+        // backup at 5 pages / 250ms, capping export at ~80KB/s of database
+        // size. Every write exports the full database, so a write on a ~2MB
+        // database took ~25s and a production-sized (45MB) one ~9 minutes.
+        let repo = artifact_repository().await;
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("sql-export-speed");
+        let service = SqlService::new(cache.path().to_string_lossy().to_string(), u64::MAX, repo);
+
+        service
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: None,
+                    sql: "CREATE TABLE blobs (id INTEGER PRIMARY KEY, body TEXT NOT NULL)"
+                        .to_string(),
+                    params: Vec::new(),
+                },
+                None,
+                "tinycloud.sql/schema".to_string(),
+            )
+            .await
+            .expect("create table");
+
+        // Grow the database to ~2MB (1MB of random bytes hex-encoded).
+        service
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: None,
+                    sql: "INSERT INTO blobs (body) VALUES (hex(randomblob(1000000)))".to_string(),
+                    params: Vec::new(),
+                },
+                None,
+                "tinycloud.sql/write".to_string(),
+            )
+            .await
+            .expect("grow database");
+
+        let start = std::time::Instant::now();
+        service
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: None,
+                    sql: "INSERT INTO blobs (body) VALUES ('tiny')".to_string(),
+                    params: Vec::new(),
+                },
+                None,
+                "tinycloud.sql/write".to_string(),
+            )
+            .await
+            .expect("small write");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "small write on a ~2MB database took {elapsed:?}; the export backup must not be paced"
+        );
+    }
+
+    #[tokio::test]
     async fn sql_write_survives_service_recreation_with_empty_cache() {
         let repo = artifact_repository().await;
         let cache_one = TempDir::new().unwrap();
