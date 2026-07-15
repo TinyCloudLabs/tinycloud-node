@@ -108,9 +108,9 @@ pub struct Message {
 impl Display for Message {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
         if let Some(scheme) = &self.scheme {
-            writeln!(f, "{}://{}{}", scheme, &self.domain, PREAMBLE)?;
+            writeln!(f, "{}://{}{}", scheme, self.domain, PREAMBLE)?;
         } else {
-            writeln!(f, "{}{}", &self.domain, PREAMBLE)?;
+            writeln!(f, "{}{}", self.domain, PREAMBLE)?;
         }
         writeln!(f, "0x{}", encode_eip55(&self.address))?;
         writeln!(f)?;
@@ -118,16 +118,16 @@ impl Display for Message {
             writeln!(f, "{statement}")?;
         }
         writeln!(f)?;
-        writeln!(f, "{}{}", URI_TAG, &self.uri)?;
+        writeln!(f, "{}{}", URI_TAG, self.uri)?;
         writeln!(f, "{}{}", VERSION_TAG, self.version as u64)?;
-        writeln!(f, "{}{}", CHAIN_TAG, &self.chain_id)?;
-        writeln!(f, "{}{}", NONCE_TAG, &self.nonce)?;
-        write!(f, "{}{}", IAT_TAG, &self.issued_at)?;
+        writeln!(f, "{}{}", CHAIN_TAG, self.chain_id)?;
+        writeln!(f, "{}{}", NONCE_TAG, self.nonce)?;
+        write!(f, "{}{}", IAT_TAG, self.issued_at)?;
         if let Some(exp) = &self.expiration_time {
-            write!(f, "\n{}{}", EXP_TAG, &exp)?
+            write!(f, "\n{}{}", EXP_TAG, exp)?
         };
         if let Some(nbf) = &self.not_before {
-            write!(f, "\n{}{}", NBF_TAG, &nbf)?
+            write!(f, "\n{}{}", NBF_TAG, nbf)?
         };
         if let Some(rid) = &self.request_id {
             write!(f, "\n{RID_TAG}{rid}")?
