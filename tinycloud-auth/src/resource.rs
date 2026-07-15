@@ -261,13 +261,13 @@ pub enum ResourceCheckError {
 
 impl fmt::Display for SpaceId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "tinycloud:{}:{}", &self.suffix(), &self.name)
+        write!(f, "tinycloud:{}:{}", self.suffix(), self.name)
     }
 }
 
 impl fmt::Display for ResourceId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}/{}", &self.space, self.service)?;
+        write!(f, "{}/{}", self.space, self.service)?;
         if let Some(path) = self.path() {
             write!(f, "/{path}")?;
         }
