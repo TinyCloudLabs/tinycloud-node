@@ -26,6 +26,7 @@ pub use sql_caveat::SqlConstrainedStatementCaveat;
 /// Domain separator for `PolicyCapability` hashing. The trailing NUL byte
 /// (0x00) is part of the hash input — do not strip it.
 pub const POLICY_CAPABILITY_DOMAIN: &[u8] = b"xyz.tinycloud.policy/PolicyCapability/v0\0";
+pub const REQUESTED_CAPABILITIES_DOMAIN: &[u8] = b"xyz.tinycloud.policy/RequestedCapabilities/v0\0";
 
 /// The accepted action set per service. Sourced from the canonical capability
 /// registry (`capabilities.json`) via generated code (TC-112) — do not
@@ -312,25 +313,29 @@ fn unicode_normalize_nfc(s: &str) -> String {
 }
 
 impl PolicyCapability {
-    /// JCS-canonical UTF-8 bytes of the capability (sorted keys, no whitespace).
-    pub fn canonical_bytes(&self) -> Vec<u8> {
+    pub fn canonical_value(&self) -> Value {
         let mut map = serde_json::Map::new();
         map.insert(
             "actions".to_string(),
             Value::Array(
                 self.actions
                     .iter()
-                    .map(|s| Value::String(s.clone()))
+                    .map(|action| Value::String(action.clone()))
                     .collect(),
             ),
         );
-        if let Some(c) = &self.caveats {
-            map.insert("caveats".to_string(), c.clone());
+        if let Some(caveats) = &self.caveats {
+            map.insert("caveats".to_string(), caveats.clone());
         }
         map.insert("path".to_string(), Value::String(self.path.clone()));
         map.insert("service".to_string(), Value::String(self.service.clone()));
         map.insert("space".to_string(), Value::String(self.space.clone()));
-        jcs::canonicalize(&Value::Object(map))
+        Value::Object(map)
+    }
+
+    /// JCS-canonical UTF-8 bytes of the capability (sorted keys, no whitespace).
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        jcs::canonicalize(&self.canonical_value())
     }
 
     /// Bare lowercase hex of SHA-256(domain || canonical_bytes).
@@ -377,6 +382,29 @@ impl PolicyCapability {
         }
         Ok(())
     }
+}
+
+/// Canonical v0 hash used by policy ceilings, requests, and session facts.
+pub fn requested_capabilities_hash_hex(capabilities: &[PolicyCapability]) -> String {
+    let mut canonical: Vec<_> = capabilities
+        .iter()
+        .map(PolicyCapability::canonical_value)
+        .collect();
+    canonical.sort_by(|left, right| {
+        ["service", "space", "path"]
+            .into_iter()
+            .map(|field| {
+                let left = left.get(field).and_then(Value::as_str).unwrap_or("");
+                let right = right.get(field).and_then(Value::as_str).unwrap_or("");
+                left.cmp(right)
+            })
+            .find(|ordering| !ordering.is_eq())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(REQUESTED_CAPABILITIES_DOMAIN);
+    hasher.update(jcs::canonicalize(&Value::Array(canonical)));
+    hex_encode(&hasher.finalize())
 }
 
 /// Build the set of canonical action URNs a set of held actions authorizes,

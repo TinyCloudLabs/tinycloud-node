@@ -102,8 +102,8 @@ jobs:
     steps:
     - name: Checkout TinyCloud repository
       uses: actions/checkout@v4
-    - name: Run PostgreSQL epoch concurrency regression
-      run: cargo test -p tinycloud-core postgres_concurrent_epoch_appends_do_not_serialize -- --nocapture
+    - name: Run PostgreSQL concurrency regressions
+      run: cargo test -p tinycloud-core postgres_ -- --nocapture
 
   m1-realdata:
     runs-on: ubuntu-latest
