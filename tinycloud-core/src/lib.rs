@@ -10,6 +10,7 @@ pub mod keys;
 pub mod manifest;
 pub mod migrations;
 pub mod models;
+pub mod policy_authority;
 pub mod policy_capability;
 pub mod relationships;
 pub mod sql;
