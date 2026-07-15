@@ -1,0 +1,38 @@
+{
+  "bundle": {
+    "format": "tinycloud-recipient-delegation-v2",
+    "routing": {
+      "origin": "https://node.tinycloud.xyz",
+      "nodeAudience": "did:web:node.tinycloud.xyz"
+    },
+    "grant": {
+      "kind": "ucan",
+      "cid": "bafkr4id454qnh4esrkmtfnhm5tdomxpbwqmr6vj74635mlcbkjxncr645y",
+      "encoding": "jwt",
+      "value": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImt0eSI6Ik9LUCIsImNydiI6IkVkMjU1MTkiLCJ4IjoiYVdpMWJSTWxaQ0trak9Hb3VIZnlpZ2JzN0ZRMWZQNkUtZXl6U2hNekRadyJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJpc3MiOiJkaWQ6a2V5Ono2TWttWWpUWjh2R0NqMWFCYmU0d3h4bzNaZ1E4U3BDVFc2anFSSzNkbmF0RFdqTSN6Nk1rbVlqVFo4dkdDajFhQmJlNHd4eG8zWmdROFNwQ1RXNmpxUkszZG5hdERXak0iLCJhdWQiOiJkaWQ6cGtoOmVpcDE1NToxOjB4ZGU3MDlmMjEwMjMwNjIyMDkyMTA2MDMxNDcxNTYyOTA4MGUyZmI3NyIsImV4cCI6NDAwMDAwMDAwMCwibm5jIjoidXJuOnV1aWQ6NWFkNzIyNjItYThkMS00NDdhLTk0M2ItNDBmMjJhYWZlMjUyIiwicHJmIjpbImJhZmtyNGllcWhicnBwc20zNTM1cmpocmF2a29uM3Z0cDJuZnM3cmRrdmNrdWt0ZXlsaWs2ZHB6NXZ1Il0sImF0dCI6eyJ0aW55Y2xvdWQ6cGtoOmVpcDE1NToxOjB4MTlFN0UzNzZFN0MyMTNCN0U3ZTdlNDZjYzcwQTVkRDA4NkRBZmYyQTpkZWZhdWx0L2t2L3BhdGgiOnsidGlueWNsb3VkLmt2L2dldCI6W3t9XX19fQ.RxaV-JZqoOyumI4wIuv86q896qya9sYmixWgjYvrgjyd3uEuajQFpzW41V0joFVcnzLwojIncDfaOC5W_-WrCQ"
+    },
+    "issuerProofs": [
+      {
+        "kind": "cacao",
+        "cid": "bafkr4ieqhbrppsm3535rjhravkon3vtp2nfs7rdkvckukteylik6dpz5vu",
+        "encoding": "dag-cbor-base64url-pad",
+        "value": "o2FooWF0Z2VpcDQzNjFhcKljYXVkeGlkaWQ6a2V5Ono2TWttWWpUWjh2R0NqMWFCYmU0d3h4bzNaZ1E4U3BDVFc2anFSSzNkbmF0RFdqTSN6Nk1rbVlqVFo4dkdDajFhQmJlNHd4eG8zWmdROFNwQ1RXNmpxUkszZG5hdERXak1jZXhweBgzMDAwLTAxLTAxVDAwOjAwOjAwLjAwMFpjaWF0eBgyMDIyLTAxLTAxVDAwOjAwOjAwLjAwMFpjaXNzeDtkaWQ6cGtoOmVpcDE1NToxOjB4MTlFN0UzNzZFN0MyMTNCN0U3ZTdlNDZjYzcwQTVkRDA4NkRBZmYyQWVub25jZXBmaXh0dXJlTm9uY2UxMjM0ZmRvbWFpbmtleGFtcGxlLmNvbWd2ZXJzaW9uAWlyZXNvdXJjZXOBeNV1cm46cmVjYXA6ZXlKaGRIUWlPbnNpZEdsdWVXTnNiM1ZrT25CcmFEcGxhWEF4TlRVNk1Ub3dlREU1UlRkRk16YzJSVGRETWpFelFqZEZOMlUzWlRRMlkyTTNNRUUxWkVRd09EWkVRV1ptTWtFNlpHVm1ZWFZzZEM5cmRpOXdZWFJvSWpwN0luUnBibmxqYkc5MVpDNXJkaTluWlhRaU9sdDdmVjBzSW5ScGJubGpiRzkxWkM1cmRpOXdkWFFpT2x0N2ZWMTlmU3dpY0hKbUlqcGJYWDBpc3RhdGVtZW50eMtJIGZ1cnRoZXIgYXV0aG9yaXplIHRoZSBzdGF0ZWQgVVJJIHRvIHBlcmZvcm0gdGhlIGZvbGxvd2luZyBhY3Rpb25zIG9uIG15IGJlaGFsZjogKDEpICd0aW55Y2xvdWQua3YnOiAnZ2V0JywgJ3B1dCcgZm9yICd0aW55Y2xvdWQ6cGtoOmVpcDE1NToxOjB4MTlFN0UzNzZFN0MyMTNCN0U3ZTdlNDZjYzcwQTVkRDA4NkRBZmYyQTpkZWZhdWx0L2t2L3BhdGgnLmFzomFzWEEqq1o6S1ofLU-V7vyzmIs2GO0ZNUnhv9KwNmhygZi9r2lGaXDQwB1OKmNsuzMsN1pDQUVFvjBXvxfRTiD9mA8LHGF0ZmVpcDE5MQ=="
+      }
+    ]
+  },
+  "nativeVerified": {
+    "verification": "tinycloud-native-authority-v1",
+    "ownerDid": "did:pkh:eip155:1:0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A",
+    "sessionPrincipalDid": "did:key:z6MkmYjTZ8vGCj1aBbe4wxxo3ZgQ8SpCTW6jqRK3dnatDWjM",
+    "sessionVerificationMethod": "did:key:z6MkmYjTZ8vGCj1aBbe4wxxo3ZgQ8SpCTW6jqRK3dnatDWjM#z6MkmYjTZ8vGCj1aBbe4wxxo3ZgQ8SpCTW6jqRK3dnatDWjM",
+    "recipientDid": "did:pkh:eip155:1:0xde709f2102306220921060314715629080e2fb77",
+    "grantCid": "bafkr4id454qnh4esrkmtfnhm5tdomxpbwqmr6vj74635mlcbkjxncr645y",
+    "proofCids": ["bafkr4ieqhbrppsm3535rjhravkon3vtp2nfs7rdkvckukteylik6dpz5vu"],
+    "scope": {
+      "spaceId": "tinycloud:pkh:eip155:1:0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A:default",
+      "resource": { "kind": "exact", "path": "path" },
+      "actions": ["tinycloud.kv/get"]
+    },
+    "expiry": "2096-10-02T07:06:40.000Z"
+  }
+}

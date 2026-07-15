@@ -1,6 +1,7 @@
 pub mod authorization;
 pub mod identity;
 pub mod protocol;
+pub mod recipient_did;
 pub mod resolver;
 pub mod resource;
 
