@@ -23,7 +23,7 @@ impl AsRef<OffsetDateTime> for TimeStamp {
 
 impl Display for TimeStamp {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "{}", &self.0)
+        write!(f, "{}", self.0)
     }
 }
 

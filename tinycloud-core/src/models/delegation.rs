@@ -183,7 +183,7 @@ async fn verify(delegation: &TinyCloudDelegation) -> Result<(), Error> {
                 .await
                 .map_err(|_| DelegationError::InvalidSignature)?;
             if !cacao.payload().valid_now() {
-                return Err(DelegationError::InvalidTime)?;
+                Err(DelegationError::InvalidTime)?;
             }
         }
     };
