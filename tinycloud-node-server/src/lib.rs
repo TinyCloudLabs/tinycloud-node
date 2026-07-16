@@ -33,7 +33,7 @@ use quota::QuotaCache;
 use routes::{
     admin::{delete_quota, get_quota, get_usage, list_quotas, set_quota},
     attestation::attestation,
-    create_signed_kv_url, delegate, delegation_status,
+    create_signed_kv_url, delegate, delegation_query, delegation_status,
     encryption::{
         create_network as create_encryption_network, decrypt as encryption_decrypt,
         get_network as get_encryption_network, revoke_network as revoke_encryption_network,
@@ -128,6 +128,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         open_host_key,
         invoke,
         delegate,
+        delegation_query,
         delegation_status,
         revoke,
         create_signed_kv_url,

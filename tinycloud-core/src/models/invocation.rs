@@ -136,6 +136,17 @@ pub async fn verify_invocation(invocation: &TinyCloudInvocation) -> Result<(), E
     Ok(())
 }
 
+/// Verify an invocation and authorize its capabilities against the persisted
+/// delegation chain without recording an invocation event.
+pub async fn verify_and_authorize<C: ConnectionTrait>(
+    db: &C,
+    invocation: &util::InvocationInfo,
+    now: OffsetDateTime,
+) -> Result<(), Error> {
+    verify_invocation(&invocation.invocation).await?;
+    validate(db, invocation, Some(now)).await
+}
+
 // verify parenthood and authorization
 async fn validate<C: ConnectionTrait>(
     db: &C,
@@ -169,6 +180,10 @@ async fn validate<C: ConnectionTrait>(
                 .find_with_related(abilities::Entity)
                 .all(db)
                 .await?;
+
+            if parents.len() != invocation.parents.len() {
+                return Err(InvocationError::MissingParents.into());
+            }
 
             // check parent identifies correct invoker
             for (p, _) in &parents {
@@ -204,6 +219,45 @@ async fn validate<C: ConnectionTrait>(
                         invoked_cid: p.id.to_cid(0x55).to_string(),
                     }
                     .into());
+                }
+
+                // A child capability cannot outlive or predate any delegation
+                // in the chain that authorizes it. Validate the effective
+                // chain window, not only the directly cited leaf.
+                let chain_ids = revocation::ancestor_chain_ids(db, &p.id).await.map_err(
+                    |error| match error {
+                        revocation::ChainTraversalError::Db(error) => Error::Db(error),
+                        revocation::ChainTraversalError::LimitExceeded => {
+                            Error::InvalidInvocation(InvocationError::ChainTraversalLimitExceeded)
+                        }
+                    },
+                )?;
+                let chain = delegation::Entity::find()
+                    .filter(delegation::Column::Id.is_in(chain_ids.iter().copied()))
+                    .all(db)
+                    .await?;
+                if chain.len() != chain_ids.len() {
+                    return Err(InvocationError::MissingParents.into());
+                }
+                let chain_now = time.unwrap_or_else(OffsetDateTime::now_utc);
+                if chain.iter().any(|ancestor| {
+                    ancestor
+                        .expiry
+                        .map(|expiry| chain_now >= expiry)
+                        .unwrap_or(false)
+                        || ancestor
+                            .not_before
+                            .map(|not_before| chain_now < not_before)
+                            .unwrap_or(false)
+                }) {
+                    return match dependant_caps.first() {
+                        Some(capability) => Err(InvocationError::UnauthorizedAction(
+                            capability.resource.clone(),
+                            capability.ability.clone(),
+                        )
+                        .into()),
+                        None => Err(InvocationError::MissingParents.into()),
+                    };
                 }
             }
 
@@ -653,6 +707,7 @@ mod tests {
             revoker: Set("did:key:owner".to_string()),
             revoked: Set(parent_id),
             serialization: Set(b"revocation".to_vec()),
+            revoked_at: Set(Some(OffsetDateTime::now_utc())),
         }
         .insert(&db)
         .await

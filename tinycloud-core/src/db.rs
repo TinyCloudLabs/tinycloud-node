@@ -10,7 +10,11 @@ use crate::storage::{
     either::EitherError, Content, HashBuffer, ImmutableDeleteStore, ImmutableReadStore,
     ImmutableStaging, ImmutableWriteStore, StorageSetup, StoreSize,
 };
-use crate::types::{CapabilitiesReadParams, ListFilters, Metadata, Resource, SpaceIdWrap};
+use crate::types::{
+    AccountDelegationRecord, CapabilitiesReadParams, DelegationQuery, DelegationQueryDirection,
+    DelegationQueryPage, DelegationQueryStatus, DelegationResource, ListFilters, Metadata,
+    Resource, SpaceIdWrap,
+};
 use crate::util::{Capability, DelegationInfo, DelegationMode};
 use sea_orm::{
     entity::prelude::*,
@@ -46,6 +50,14 @@ pub struct PendingWebhookDelivery {
     pub encrypted_secret: Vec<u8>,
     pub secret_key_id: String,
     pub subscription_active: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AccountDelegationQueryError {
+    #[error(transparent)]
+    Db(#[from] DbErr),
+    #[error("delegation query invocation is not authorized")]
+    Unauthorized,
 }
 
 #[derive(Debug, Clone)]
@@ -212,6 +224,169 @@ where
             .into_iter()
             .map(|s| s.id.0)
             .collect())
+    }
+
+    /// Return lifecycle-complete delegations related to the authenticated account.
+    ///
+    /// The account is derived from the verified invocation signer and its one
+    /// current session proof. Callers cannot select another account in the query.
+    pub async fn query_account_delegations(
+        &self,
+        invocation: &crate::util::InvocationInfo,
+        query: &DelegationQuery,
+    ) -> Result<DelegationQueryPage, AccountDelegationQueryError> {
+        let now = OffsetDateTime::now_utc();
+        invocation::verify_and_authorize(&self.conn, invocation, now)
+            .await
+            .map_err(|_| AccountDelegationQueryError::Unauthorized)?;
+        let principal = account_query_principal(&self.conn, invocation)
+            .await?
+            .ok_or(AccountDelegationQueryError::Unauthorized)?;
+        let account_dids = account_session_dids(&self.conn, &principal).await?;
+        let actors = account_dids.iter().cloned().collect::<Vec<_>>();
+        let rows = delegation::Entity::find()
+            .filter(
+                Condition::any()
+                    .add(delegation::Column::Delegator.is_in(actors.clone()))
+                    .add(delegation::Column::Delegatee.is_in(actors)),
+            )
+            .find_with_related(abilities::Entity)
+            .all(&self.conn)
+            .await?;
+        let (delegations, ability_rows): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+        let roots = delegations.iter().map(|row| row.id).collect::<Vec<_>>();
+        let ancestor_state = load_account_ancestor_state(&self.conn, &roots).await?;
+        let now = OffsetDateTime::now_utc();
+        let mut records = Vec::new();
+
+        for (delegation, abilities) in delegations.into_iter().zip(ability_rows) {
+            let granted = account_dids.contains(&delegation.delegator);
+            let direction = if granted { "granted" } else { "received" };
+            if matches!(query.direction, DelegationQueryDirection::Granted) && !granted
+                || matches!(query.direction, DelegationQueryDirection::Received) && granted
+            {
+                continue;
+            }
+
+            let mut grouped: std::collections::BTreeMap<
+                String,
+                Vec<(String, crate::types::Caveats)>,
+            > = std::collections::BTreeMap::new();
+            for ability in abilities {
+                grouped
+                    .entry(ability.resource.to_string())
+                    .or_default()
+                    .push((ability.ability.to_string(), ability.caveats));
+            }
+            if let Some(space_filter) = query.space.as_deref() {
+                let matches_space = grouped.keys().any(|resource| {
+                    resource
+                        .parse::<Resource>()
+                        .ok()
+                        .and_then(|resource| resource.space().cloned())
+                        .map(|space| {
+                            space.to_string() == space_filter
+                                || space.name().as_str() == space_filter
+                        })
+                        .unwrap_or(false)
+                });
+                if !matches_space {
+                    continue;
+                }
+            }
+            let resources = grouped
+                .into_iter()
+                .map(|(resource, mut entries)| {
+                    entries.sort_by(|left, right| {
+                        left.0.cmp(&right.0).then_with(|| {
+                            serde_json::to_string(&left.1)
+                                .unwrap_or_default()
+                                .cmp(&serde_json::to_string(&right.1).unwrap_or_default())
+                        })
+                    });
+                    DelegationResource {
+                        resource,
+                        actions: entries.iter().map(|entry| entry.0.clone()).collect(),
+                        caveats: entries.into_iter().map(|entry| entry.1).collect(),
+                    }
+                })
+                .collect();
+
+            let lifecycle = ancestor_state.lifecycle(delegation.id, now)?;
+            let status_matches = match query.status {
+                None => true,
+                Some(DelegationQueryStatus::Active) => lifecycle.status == "active",
+                Some(DelegationQueryStatus::Pending) => lifecycle.status == "pending",
+                Some(DelegationQueryStatus::Expired) => lifecycle.status == "expired",
+                Some(DelegationQueryStatus::Revoked) => {
+                    matches!(lifecycle.status, "revoked" | "ancestor_revoked")
+                }
+                Some(DelegationQueryStatus::AncestorRevoked) => {
+                    lifecycle.status == "ancestor_revoked"
+                }
+            };
+            if !status_matches {
+                continue;
+            }
+
+            let cid = delegation.id.to_cid(0x55).to_string();
+            let mut parents = ancestor_state
+                .parents
+                .get(&delegation.id)
+                .cloned()
+                .unwrap_or_default();
+            parents.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
+            parents.dedup();
+            records.push(AccountDelegationRecord {
+                cid,
+                direction: direction.to_string(),
+                delegator_did: delegation.delegator,
+                delegate_did: delegation.delegatee,
+                resources,
+                parents: parents
+                    .into_iter()
+                    .map(|parent| parent.to_cid(0x55).to_string())
+                    .collect(),
+                issued_at: delegation.issued_at,
+                not_before: delegation.not_before,
+                expires_at: delegation.expiry,
+                status: lifecycle.status.to_string(),
+                revoked_at: lifecycle
+                    .direct_revocation
+                    .as_ref()
+                    .and_then(|row| row.revoked_at),
+                revoked_by: lifecycle
+                    .direct_revocation
+                    .as_ref()
+                    .map(|row| row.revoker.clone()),
+                revoked_ancestor_cid: lifecycle.revoked_ancestor_cid,
+            });
+        }
+
+        records.sort_by(|left, right| {
+            right
+                .issued_at
+                .cmp(&left.issued_at)
+                .then_with(|| left.cid.cmp(&right.cid))
+        });
+        if let Some(cursor) = query
+            .decoded_cursor()
+            .map_err(|_| AccountDelegationQueryError::Unauthorized)?
+        {
+            let Some(position) = records.iter().position(|record| record.cid == cursor) else {
+                return Err(AccountDelegationQueryError::Unauthorized);
+            };
+            records.drain(..=position);
+        }
+        let limit = query.limit.unwrap_or(50) as usize;
+        let next_cursor = (records.len() > limit)
+            .then(|| DelegationQuery::encode_cursor(&records[limit - 1].cid));
+        records.truncate(limit);
+        Ok(DelegationQueryPage {
+            schema_version: 2,
+            items: records,
+            next_cursor,
+        })
     }
 
     pub async fn list_due_webhook_deliveries(
@@ -1584,6 +1759,279 @@ async fn resolve_pkh_did<C: ConnectionTrait>(db: &C, did: &str) -> Result<String
     Ok(canonical_did)
 }
 
+async fn account_query_principal<C: ConnectionTrait>(
+    db: &C,
+    invocation: &crate::util::InvocationInfo,
+) -> Result<Option<String>, DbErr> {
+    let [capability] = invocation.capabilities.as_slice() else {
+        return Ok(None);
+    };
+    if capability.ability.as_ref().as_ref() != "tinycloud.delegation/list" {
+        return Ok(None);
+    }
+    let Resource::TinyCloud(resource) = &capability.resource else {
+        return Ok(None);
+    };
+    if resource.service().as_str() != "delegation"
+        || resource
+            .path()
+            .is_some_and(|path| !path.as_str().is_empty())
+        || resource.query().is_some()
+        || resource.fragment().is_some()
+    {
+        return Ok(None);
+    }
+    let principal = canonicalize_did(resource.space().did().as_str())
+        .unwrap_or_else(|_| resource.space().did().as_str().to_string());
+    if !principal.starts_with("did:pkh:") {
+        return Ok(None);
+    }
+    if invocation.parents.is_empty() {
+        return Ok(did_principal_matches(&principal, &invocation.invoker).then_some(principal));
+    }
+    if invocation.parents.len() != 1 {
+        return Ok(None);
+    }
+    let proof_id = Hash::from(invocation.parents[0]);
+    let chain_ids = match revocation::ancestor_chain_ids(db, &proof_id).await {
+        Ok(ids) => ids,
+        Err(revocation::ChainTraversalError::Db(error)) => return Err(error),
+        Err(revocation::ChainTraversalError::LimitExceeded) => return Ok(None),
+    };
+    let chain = delegation::Entity::find()
+        .filter(delegation::Column::Id.is_in(chain_ids.iter().copied()))
+        .all(db)
+        .await?;
+    Ok(chain
+        .iter()
+        .any(|delegation| did_principal_matches(&delegation.delegator, &principal))
+        .then_some(principal))
+}
+
+const MAX_ACCOUNT_SESSION_NODES: usize = 256;
+const MAX_ACCOUNT_SESSION_EDGES_PER_LEVEL: u64 = 1025;
+const MAX_ACCOUNT_ANCESTOR_NODES: usize = 4096;
+
+/// Discover only session/control DIDs that were delegated the account's list
+/// capability. Ordinary recipients are deliberately not pulled into the
+/// account relationship graph.
+async fn account_session_dids<C: ConnectionTrait>(
+    db: &C,
+    principal: &str,
+) -> Result<HashSet<String>, DbErr> {
+    let mut account_dids = HashSet::from([principal.to_string()]);
+    let mut frontier = vec![principal.to_string()];
+    for _ in 0..revocation::MAX_CHAIN_TRAVERSAL_NODES {
+        if frontier.is_empty() {
+            return Ok(account_dids);
+        }
+        let rows = delegation::Entity::find()
+            .filter(delegation::Column::Delegator.is_in(frontier.clone()))
+            .limit(MAX_ACCOUNT_SESSION_EDGES_PER_LEVEL)
+            .find_with_related(abilities::Entity)
+            .all(db)
+            .await?;
+        if rows.len() as u64 == MAX_ACCOUNT_SESSION_EDGES_PER_LEVEL {
+            return Err(DbErr::Custom(
+                "account-session-graph-level-limit-exceeded".to_string(),
+            ));
+        }
+        let mut next = Vec::new();
+        for (delegation, abilities) in rows {
+            let controls_account = abilities.iter().any(|ability| {
+                ability.ability.as_ref().as_ref() == "tinycloud.delegation/list"
+                    && ability
+                        .resource
+                        .tinycloud_resource()
+                        .is_some_and(|resource| {
+                            resource.service().as_str() == "delegation"
+                                && resource
+                                    .path()
+                                    .map(|path| path.as_str().is_empty())
+                                    .unwrap_or(true)
+                                && resource.query().is_none()
+                                && resource.fragment().is_none()
+                                && did_principal_matches(resource.space().did().as_str(), principal)
+                        })
+            });
+            if controls_account
+                && delegation.delegatee.starts_with("did:key:")
+                && account_dids.insert(delegation.delegatee.clone())
+            {
+                next.push(delegation.delegatee);
+                if account_dids.len() > MAX_ACCOUNT_SESSION_NODES {
+                    return Err(DbErr::Custom(
+                        "account-session-graph-node-limit-exceeded".to_string(),
+                    ));
+                }
+            }
+        }
+        next.sort();
+        next.dedup();
+        frontier = next;
+    }
+    Err(DbErr::Custom(
+        "account-session-graph-depth-limit-exceeded".to_string(),
+    ))
+}
+
+struct AccountAncestorState {
+    parents: HashMap<Hash, Vec<Hash>>,
+    delegations: HashMap<Hash, delegation::Model>,
+    revocations: HashMap<Hash, Vec<revocation::Model>>,
+}
+
+struct AccountLifecycle {
+    status: &'static str,
+    direct_revocation: Option<revocation::Model>,
+    revoked_ancestor_cid: Option<String>,
+}
+
+impl AccountAncestorState {
+    fn lifecycle(&self, root: Hash, now: OffsetDateTime) -> Result<AccountLifecycle, DbErr> {
+        let direct_revocation = self
+            .revocations
+            .get(&root)
+            .and_then(|rows| rows.first())
+            .cloned();
+        if direct_revocation.is_some() {
+            return Ok(AccountLifecycle {
+                status: "revoked",
+                direct_revocation,
+                revoked_ancestor_cid: None,
+            });
+        }
+
+        let mut frontier = self.parents.get(&root).cloned().unwrap_or_default();
+        frontier.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
+        let mut visited = HashSet::from([root]);
+        let mut effective_ids = vec![root];
+        while !frontier.is_empty() {
+            let current_level = std::mem::take(&mut frontier);
+            for current in current_level {
+                if !visited.insert(current) {
+                    continue;
+                }
+                if self
+                    .revocations
+                    .get(&current)
+                    .is_some_and(|rows| !rows.is_empty())
+                {
+                    return Ok(AccountLifecycle {
+                        status: "ancestor_revoked",
+                        direct_revocation: None,
+                        revoked_ancestor_cid: Some(current.to_cid(0x55).to_string()),
+                    });
+                }
+                effective_ids.push(current);
+                frontier.extend(self.parents.get(&current).cloned().unwrap_or_default());
+            }
+            frontier.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
+            frontier.dedup();
+            if visited.len() > MAX_ACCOUNT_ANCESTOR_NODES {
+                return Err(DbErr::Custom(
+                    "account-ancestor-graph-node-limit-exceeded".to_string(),
+                ));
+            }
+        }
+
+        let effective = effective_ids
+            .iter()
+            .filter_map(|id| self.delegations.get(id))
+            .collect::<Vec<_>>();
+        if effective.len() != effective_ids.len() {
+            return Err(DbErr::Custom(
+                "account-ancestor-delegation-missing".to_string(),
+            ));
+        }
+        let status = if effective
+            .iter()
+            .any(|row| row.expiry.is_some_and(|expiry| now >= expiry))
+        {
+            "expired"
+        } else if effective
+            .iter()
+            .any(|row| row.not_before.is_some_and(|not_before| now < not_before))
+        {
+            "pending"
+        } else {
+            "active"
+        };
+        Ok(AccountLifecycle {
+            status,
+            direct_revocation: None,
+            revoked_ancestor_cid: None,
+        })
+    }
+}
+
+async fn load_account_ancestor_state<C: ConnectionTrait>(
+    db: &C,
+    roots: &[Hash],
+) -> Result<AccountAncestorState, DbErr> {
+    let mut all_ids = roots.iter().copied().collect::<HashSet<_>>();
+    let mut frontier = roots.to_vec();
+    let mut parents: HashMap<Hash, Vec<Hash>> = HashMap::new();
+    for _ in 0..revocation::MAX_CHAIN_TRAVERSAL_NODES {
+        if frontier.is_empty() {
+            break;
+        }
+        let links = parent_delegations::Entity::find()
+            .filter(parent_delegations::Column::Child.is_in(frontier))
+            .all(db)
+            .await?;
+        let mut next = Vec::new();
+        for link in links {
+            parents.entry(link.child).or_default().push(link.parent);
+            if all_ids.insert(link.parent) {
+                next.push(link.parent);
+                if all_ids.len() > MAX_ACCOUNT_ANCESTOR_NODES {
+                    return Err(DbErr::Custom(
+                        "account-ancestor-graph-node-limit-exceeded".to_string(),
+                    ));
+                }
+            }
+        }
+        next.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
+        next.dedup();
+        frontier = next;
+    }
+    if !frontier.is_empty() {
+        return Err(DbErr::Custom(
+            "account-ancestor-graph-depth-limit-exceeded".to_string(),
+        ));
+    }
+    for values in parents.values_mut() {
+        values.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
+        values.dedup();
+    }
+    let ids = all_ids.iter().copied().collect::<Vec<_>>();
+    let delegation_rows = delegation::Entity::find()
+        .filter(delegation::Column::Id.is_in(ids.iter().copied()))
+        .all(db)
+        .await?;
+    let revocation_rows = revocation::Entity::find()
+        .filter(revocation::Column::Revoked.is_in(ids))
+        .all(db)
+        .await?;
+    let delegations = delegation_rows
+        .into_iter()
+        .map(|row| (row.id, row))
+        .collect();
+    let mut revocations: HashMap<Hash, Vec<revocation::Model>> = HashMap::new();
+    for row in revocation_rows {
+        revocations.entry(row.revoked).or_default().push(row);
+    }
+    for values in revocations.values_mut() {
+        values.sort_by(|left, right| left.id.as_ref().cmp(right.id.as_ref()));
+    }
+    Ok(AccountAncestorState {
+        parents,
+        delegations,
+        revocations,
+    })
+}
+
 /// Get delegations with optional filters applied.
 /// Filters by direction (created/received relative to invoker), path prefix, and actions.
 async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
@@ -1911,6 +2359,7 @@ mod test {
             revoker: Set("did:key:owner".to_string()),
             revoked: Set(parent_id),
             serialization: Set(b"race-revocation".to_vec()),
+            revoked_at: Set(Some(OffsetDateTime::now_utc())),
         }
         .insert(&db.conn)
         .await
@@ -1921,6 +2370,112 @@ mod test {
         assert!(
             use_existing.await.unwrap(),
             "existing child use check must observe revoke"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_query_groups_resources_and_distinguishes_ancestor_revocation() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        let db = get_db().await.unwrap();
+        let owner = "did:pkh:eip155:1:0x0000000000000000000000000000000000000001";
+        let recipient = "did:pkh:eip155:1:0x0000000000000000000000000000000000000002";
+        for actor_id in [owner, recipient] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+        }
+        let parent_id = crate::hash::hash(b"history-parent");
+        let child_id = crate::hash::hash(b"history-child");
+        for id in [parent_id, child_id] {
+            delegation::ActiveModel {
+                id: Set(id),
+                delegator: Set(owner.to_string()),
+                delegatee: Set(recipient.to_string()),
+                expiry: Set(Some(OffsetDateTime::now_utc() + time::Duration::hours(1))),
+                issued_at: Set(Some(OffsetDateTime::now_utc())),
+                not_before: Set(None),
+                facts: Set(None),
+                serialization: Set(id.as_ref().to_vec()),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+        }
+        parent_delegations::ActiveModel {
+            parent: Set(parent_id),
+            child: Set(child_id),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        for (resource, action) in [
+            (
+                "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:files/kv/docs",
+                "tinycloud.kv/get",
+            ),
+            (
+                "tinycloud:pkh:eip155:1:0x0000000000000000000000000000000000000001:files/sql/main",
+                "tinycloud.sql/read",
+            ),
+        ] {
+            abilities::ActiveModel {
+                resource: Set(resource.parse().unwrap()),
+                ability: Set(action.to_string().try_into().unwrap()),
+                delegation: Set(child_id),
+                caveats: Set(Default::default()),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+        }
+        revocation::ActiveModel {
+            id: Set(crate::hash::hash(b"history-revocation")),
+            revoker: Set(owner.to_string()),
+            revoked: Set(parent_id),
+            serialization: Set(b"history-revocation".to_vec()),
+            revoked_at: Set(Some(OffsetDateTime::now_utc())),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        let state = load_account_ancestor_state(&db.conn, &[child_id])
+            .await
+            .unwrap();
+        let child = state
+            .lifecycle(child_id, OffsetDateTime::now_utc())
+            .unwrap();
+        assert_eq!(child.status, "ancestor_revoked");
+        assert_eq!(
+            child.revoked_ancestor_cid,
+            Some(parent_id.to_cid(0x55).to_string())
+        );
+
+        revocation::Entity::delete_by_id(crate::hash::hash(b"history-revocation"))
+            .exec(&db.conn)
+            .await
+            .unwrap();
+        delegation::ActiveModel {
+            id: Set(parent_id),
+            expiry: Set(Some(OffsetDateTime::now_utc() - time::Duration::hours(1))),
+            ..Default::default()
+        }
+        .update(&db.conn)
+        .await
+        .unwrap();
+        let state = load_account_ancestor_state(&db.conn, &[child_id])
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .lifecycle(child_id, OffsetDateTime::now_utc())
+                .unwrap()
+                .status,
+            "expired"
         );
     }
 
