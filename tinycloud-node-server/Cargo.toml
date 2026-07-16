@@ -1,6 +1,6 @@
 [package]
 name = "tinycloud-node"
-version = "1.4.8"
+version = "1.4.9"
 authors = ["TinyCloud Protocol"]
 edition = "2021"
 description = "TinyCloud Protocol Node"
