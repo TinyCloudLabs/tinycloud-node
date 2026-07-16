@@ -250,7 +250,14 @@ async fn validate<C: ConnectionTrait>(
                             .map(|not_before| chain_now < not_before)
                             .unwrap_or(false)
                 }) {
-                    return Err(InvocationError::InvalidTime.into());
+                    return match dependant_caps.first() {
+                        Some(capability) => Err(InvocationError::UnauthorizedAction(
+                            capability.resource.clone(),
+                            capability.ability.clone(),
+                        )
+                        .into()),
+                        None => Err(InvocationError::MissingParents.into()),
+                    };
                 }
             }
 
