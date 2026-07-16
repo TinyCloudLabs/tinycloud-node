@@ -44,7 +44,7 @@ use tinycloud_core::{
     },
     sql::{SqlCaveats, SqlError, SqlRequest, SqlService},
     storage::{HashBuffer, ImmutableReadStore, ImmutableStaging},
-    types::{Ability, Metadata, Resource},
+    types::{Ability, DelegationQuery, DelegationQueryPage, Metadata, Resource},
     util::{Capability, DelegationInfo, InvocationInfo, RevocationInfo},
     write_hooks::{db_table_path, hook_delivery_id, subscription_matches_event, TouchedTables},
     DelegationStatus, InvocationOutcome, TransactResult, TxError, TxStoreError,
@@ -337,6 +337,43 @@ pub async fn delegation_status(
             Json(DelegationStatusResponse::not_found(request.cid)),
         )),
     }
+}
+
+#[post("/delegation/query", format = "json", data = "<request>")]
+pub async fn delegation_query(
+    invocation: AuthHeaderGetter<InvocationInfo>,
+    request: Json<serde_json::Value>,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Json<DelegationQueryPage>, (Status, String)> {
+    let auth = &invocation.0 .0;
+    let request: DelegationQuery =
+        serde_json::from_value(request.into_inner()).map_err(|error| {
+            (
+                Status::BadRequest,
+                format!("Invalid delegation query: {error}"),
+            )
+        })?;
+    request.validate().map_err(|error| {
+        (
+            Status::BadRequest,
+            format!("Invalid delegation query: {error}"),
+        )
+    })?;
+
+    tinycloud
+        .query_account_delegations(auth, &request)
+        .await
+        .map(Json)
+        .map_err(|error| match error {
+            tinycloud_core::db::AccountDelegationQueryError::Unauthorized => (
+                Status::Forbidden,
+                "Delegation query proof is not authorized".to_string(),
+            ),
+            tinycloud_core::db::AccountDelegationQueryError::Db(_) => (
+                Status::ServiceUnavailable,
+                "Delegation query unavailable".to_string(),
+            ),
+        })
 }
 
 #[post("/delegate")]
@@ -3343,6 +3380,7 @@ mod tests {
             revoker: Set(space.did().to_string()),
             revoked: Set(parent_hash),
             serialization: Set(b"w1-rocket-http-revocation".to_vec()),
+            revoked_at: Set(None),
         }
         .insert(&conn)
         .await?;
@@ -3581,6 +3619,7 @@ mod tests {
             revoker: Set(owner_did),
             revoked: Set(delegation_hash),
             serialization: Set(b"w5-runtime-node-revocation".to_vec()),
+            revoked_at: Set(None),
         }
         .insert(&conn)
         .await?;
@@ -3721,6 +3760,7 @@ mod tests {
             revoker: Set(revoker_did),
             revoked: Set(parent_hash),
             serialization: Set(b"revocation-bytes".to_vec()),
+            revoked_at: Set(None),
         }
         .insert(&conn)
         .await?;
@@ -3738,7 +3778,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delegation_status_reports_chain_state_without_target_oracle() -> Result<()> {
+    async fn delegation_status_and_query_enforce_control_proofs_without_oracles() -> Result<()> {
         use rocket::http::{ContentType, Header, Status};
         use rocket::local::asynchronous::Client;
         use tinycloud_auth::authorization::Cid as AuthCid;
@@ -3786,6 +3826,34 @@ mod tests {
             capabilities.with_action(
                 format!("urn:cid:{cid}").parse()?,
                 "tinycloud.delegation/status".parse::<UcanAbility>()?,
+                [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+            );
+            Ok(Payload {
+                issuer: verification_method.parse::<DIDURLBuf>()?,
+                audience: did.parse::<DIDBuf>()?,
+                not_before: None,
+                expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
+                nonce: Some(nonce.to_string()),
+                facts: Some(Vec::<serde_json::Value>::new()),
+                proof: proofs,
+                attenuation: capabilities,
+            }
+            .sign(jwk.get_algorithm().unwrap_or_default(), jwk)?
+            .encode()?)
+        }
+
+        fn query_header_with_proofs(
+            jwk: &JWK,
+            verification_method: &str,
+            did: &str,
+            resource: &Resource,
+            nonce: &str,
+            proofs: Vec<AuthCid>,
+        ) -> Result<String> {
+            let mut capabilities = Capabilities::new();
+            capabilities.with_action(
+                resource.to_string().parse()?,
+                "tinycloud.delegation/list".parse::<UcanAbility>()?,
                 [std::collections::BTreeMap::<String, serde_json::Value>::new()],
             );
             Ok(Payload {
@@ -4000,7 +4068,12 @@ mod tests {
             None,
             None,
         ));
-        for action in ["tinycloud.delegation/status", "tinycloud.delegation/revoke"] {
+        let query_control_resource = control_resource.clone();
+        for action in [
+            "tinycloud.delegation/status",
+            "tinycloud.delegation/revoke",
+            "tinycloud.delegation/list",
+        ] {
             abilities::ActiveModel {
                 delegation: Set(wallet_session_id),
                 resource: Set(control_resource.clone()),
@@ -4029,7 +4102,7 @@ mod tests {
             ),
             (
                 foreign_scope_session_id,
-                Resource::TinyCloud(foreign_control_space.to_resource(
+                Resource::TinyCloud(foreign_control_space.clone().to_resource(
                     "delegation".parse()?,
                     None,
                     None,
@@ -4122,12 +4195,21 @@ mod tests {
             }
             .insert(&conn)
             .await?;
+            abilities::ActiveModel {
+                delegation: Set(id),
+                resource: Set(query_control_resource.clone()),
+                ability: Set(Ability::try_from("tinycloud.delegation/list".to_string())?),
+                caveats: Set(Default::default()),
+            }
+            .insert(&conn)
+            .await?;
         }
         revo_model::ActiveModel {
             id: Set(tinycloud_core::hash::hash(b"revoked-session-proof-row")),
             revoker: Set(wallet_pkh.clone()),
             revoked: Set(revoked_session_id),
             serialization: Set(b"revoked-session-proof-row".to_vec()),
+            revoked_at: Set(None),
         }
         .insert(&conn)
         .await?;
@@ -4137,10 +4219,23 @@ mod tests {
         }
         .insert(&conn)
         .await?;
+        let foreign_record_id = tinycloud_core::hash::hash(b"foreign-account-record");
+        deleg_model::ActiveModel {
+            id: Set(foreign_record_id),
+            delegator: Set(unrelated_pkh.clone()),
+            delegatee: Set(owner_did.clone()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(b"foreign-account-record".to_vec()),
+        }
+        .insert(&conn)
+        .await?;
         conn.commit().await?;
 
         let rocket = rocket::build()
-            .mount("/", routes![delegation_status, revoke])
+            .mount("/", routes![delegation_status, delegation_query, revoke])
             .attach(crate::tracing::TracingFairing {
                 header_name: Config::default().log.tracing.traceheader,
             })
@@ -4154,6 +4249,80 @@ mod tests {
                 .header(ContentType::JSON)
                 .body(serde_json::json!({ "cid": cid }).to_string())
         };
+        let query_request = |header: String| {
+            client
+                .post("/delegation/query")
+                .header(Header::new("Authorization", header))
+                .header(ContentType::JSON)
+                .body("{}")
+        };
+
+        let response = query_request(query_header_with_proofs(
+            &holder_jwk,
+            &holder_vm,
+            &holder_did,
+            &query_control_resource,
+            "proofless-did-key-query",
+            Vec::new(),
+        )?)
+        .dispatch()
+        .await;
+        assert_eq!(response.status(), Status::Forbidden);
+
+        let response = query_request(query_header_with_proofs(
+            &holder_jwk,
+            &holder_vm,
+            &holder_did,
+            &query_control_resource,
+            "authorized-account-query",
+            vec![wallet_session_id.to_cid(0x55)],
+        )?)
+        .dispatch()
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+        let query_body = response.into_string().await.unwrap_or_default();
+        assert!(query_body.contains(&wallet_child_id.to_cid(0x55).to_string()));
+        assert!(!query_body.contains(&foreign_record_id.to_cid(0x55).to_string()));
+
+        let foreign_query_resource = Resource::TinyCloud(foreign_control_space.to_resource(
+            "delegation".parse()?,
+            None,
+            None,
+            None,
+        ));
+        let response = query_request(query_header_with_proofs(
+            &holder_jwk,
+            &holder_vm,
+            &holder_did,
+            &foreign_query_resource,
+            "mismatched-query-principal",
+            vec![wallet_session_id.to_cid(0x55)],
+        )?)
+        .dispatch()
+        .await;
+        assert_eq!(response.status(), Status::Forbidden);
+
+        for (label, proof_id) in [
+            ("expired-query-proof", expired_session_id),
+            ("future-query-proof", future_session_id),
+            ("revoked-query-proof", revoked_session_id),
+            (
+                "missing-query-proof",
+                tinycloud_core::hash::hash(b"missing-query-proof"),
+            ),
+        ] {
+            let response = query_request(query_header_with_proofs(
+                &holder_jwk,
+                &holder_vm,
+                &holder_did,
+                &query_control_resource,
+                label,
+                vec![proof_id.to_cid(0x55)],
+            )?)
+            .dispatch()
+            .await;
+            assert_eq!(response.status(), Status::Forbidden, "{label}");
+        }
 
         let mismatched_cid = direct_id.to_cid(0x55).to_string();
         let response = request(
@@ -4334,6 +4503,7 @@ mod tests {
             revoker: Set(owner_did),
             revoked: Set(parent_id),
             serialization: Set(b"status-parent-revocation".to_vec()),
+            revoked_at: Set(None),
         }
         .insert(&conn)
         .await?;
@@ -4342,6 +4512,7 @@ mod tests {
             revoker: Set(holder_did.clone()),
             revoked: Set(direct_id),
             serialization: Set(b"status-direct-revocation".to_vec()),
+            revoked_at: Set(None),
         }
         .insert(&conn)
         .await?;

@@ -25,8 +25,47 @@ impl MigrationTrait for Migration {
         manager
             .create_table(schema.create_table_from_entity(invocation::Entity))
             .await?;
+        // Keep the initial schema at its historical shape. Additive columns
+        // belong in later migrations so both clean installs and upgrades run
+        // the same sequence.
         manager
-            .create_table(schema.create_table_from_entity(revocation::Entity))
+            .create_table(
+                Table::create()
+                    .table(revocation::Entity)
+                    .col(
+                        ColumnDef::new(revocation::Column::Id)
+                            .binary()
+                            .not_null()
+                            .unique_key()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(revocation::Column::Revoker)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(revocation::Column::Revoked)
+                            .binary()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(revocation::Column::Serialization)
+                            .binary()
+                            .not_null(),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(revocation::Entity, revocation::Column::Revoker)
+                            .to(actor::Entity, actor::Column::Id),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(revocation::Entity, revocation::Column::Revoked)
+                            .to(delegation::Entity, delegation::Column::Id),
+                    )
+                    .to_owned(),
+            )
             .await?;
         manager
             .create_table(schema.create_table_from_entity(event_order::Entity))

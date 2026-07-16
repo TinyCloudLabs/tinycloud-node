@@ -604,6 +604,7 @@ mod tests {
             revoker: Set("did:key:owner".to_string()),
             revoked: Set(parent_id),
             serialization: Set(b"parent-revocation".to_vec()),
+            revoked_at: Set(Some(OffsetDateTime::now_utc())),
         }
         .insert(&db)
         .await

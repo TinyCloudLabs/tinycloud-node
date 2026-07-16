@@ -20,6 +20,7 @@ pub struct Model {
     pub revoker: String,
     pub revoked: Hash,
     pub serialization: Vec<u8>,
+    pub revoked_at: Option<OffsetDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -289,6 +290,7 @@ pub(crate) async fn process<C: ConnectionTrait>(
         serialization,
         revoker: r.revoker,
         revoked: delegation.id,
+        revoked_at: Some(OffsetDateTime::now_utc()),
     }))
     .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned())
     .exec(db)

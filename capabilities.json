@@ -117,6 +117,11 @@
       "status": "active"
     },
     {
+      "urn": "tinycloud.delegation/list",
+      "service": "tinycloud.delegation",
+      "status": "active"
+    },
+    {
       "urn": "tinycloud.hooks/subscribe",
       "service": "tinycloud.hooks",
       "status": "active"
