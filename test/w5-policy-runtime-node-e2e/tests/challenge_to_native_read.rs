@@ -137,7 +137,9 @@ secret = "{}"
     let figment = rocket::Config::figment()
         .merge(Serialized::defaults(tinycloud::config::Config::default()))
         .merge(Toml::string(&config_overlay));
-    let rocket = tinycloud::app(&figment).await?;
+    let mut tinycloud_config = figment.extract::<tinycloud::config::Config>()?;
+    tinycloud_config.storage.resolve();
+    let rocket = tinycloud::app(&figment, &tinycloud_config, None).await?;
 
     let sql_service = rocket
         .state::<SqlService>()
@@ -294,6 +296,7 @@ secret = "{}"
         revoker: Set(owner_did),
         revoked: Set(delegation_hash),
         serialization: Set(b"w5-runtime-node-revocation".to_vec()),
+        revoked_at: Set(Some(time::OffsetDateTime::now_utc())),
     }
     .insert(&conn)
     .await?;
