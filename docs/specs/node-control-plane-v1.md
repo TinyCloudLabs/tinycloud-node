@@ -290,9 +290,9 @@ Field definitions:
 
 - `contractVersion`: semver string for the control contract.
 - `state`: live runtime state of the node process. `starting` means the node is
-  booting but not yet ready, `running` means the control plane is serving,
-  `stopping` means shutdown is in progress, and `error` means the process
-  encountered an unrecoverable startup/runtime failure.
+  booting but not yet ready, `running` means the control plane is serving, and
+  `stopping` means shutdown is in progress. `error` is reserved and is not
+  emitted by v1.
 - `pid`: the running process ID.
 - `version`: node binary version.
 - `publicApi`: live Rocket bind address and port.
@@ -350,15 +350,12 @@ Response:
         "backendKind": "sqlite",
         "path": "/Users/me/Library/Application Support/TinyCloud Node/caps.db"
       },
-      "limitBytes": null,
       "sql": {
         "path": "/Users/me/Library/Application Support/TinyCloud Node/sql",
-        "limitBytes": null,
         "memoryThresholdBytes": 10485760
       },
       "duckdb": {
         "path": "/Users/me/Library/Application Support/TinyCloud Node/duckdb",
-        "limitBytes": null,
         "memoryThresholdBytes": 10485760,
         "idleTimeoutSeconds": 300,
         "maxMemoryPerConnection": "128MiB"
@@ -590,11 +587,11 @@ Field definitions:
 - `baseConfigPath`: absolute path to the base config file selected by the CLI
   or platform default.
 - `overlayPath`: absolute path to `dataPath/runtime/config.override.toml`.
-- `restartRequired`: `true` when the patch writes a changed overlay entry or
-  changes the effective config for at least one requested restart-required
-  field. Fields masked by a higher-precedence env var can still set this to
-  `true` even when `appliedPaths` is empty, because the overlay is written but
-  remains inert until the env var is removed.
+- `restartRequired`: `true` when the patch changes overlay state for a field
+  that requires restart, or when it changes the effective config for at least
+  one requested restart-required field. Fields masked by a higher-precedence
+  env var can still set this to `true` even when `appliedPaths` is empty,
+  because the overlay changed even though the effective value did not.
 - `appliedPaths`: canonical leaf paths that actually changed effective value.
   Fields masked by a higher-precedence env var are excluded; the response's
   effective `config` snapshot still reflects the env-masked value.
@@ -634,14 +631,14 @@ Response:
 
 Field definitions:
 
-- `source`: `file`, `journald`, or `stdout`
+- `source`: `file`, `journald`, or `stdout`. In v1, all three are served from
+  the node's in-memory ring buffer.
 - `cursor`: opaque cursor for the newest returned entry, or `null` if there are
   no entries
 - `entries`: ordered oldest-to-newest within the returned slice
 
-- `file` and `journald` tails are both served from the node's in-memory ring
-  buffer in v1. The native byte-offset and journald cursor formats are
-  reserved for a future version.
+- Native byte-offset and journald cursor formats are reserved for a future
+  version; v1 serves all sources from the node's in-memory ring buffer.
 - `cursor` values are opaque and process-lifetime scoped. If a cursor is
   stale, malformed, or has fallen out of the ring buffer, the server restarts
   from the newest tail window instead of erroring.
@@ -841,10 +838,10 @@ consistency check instead of a separate source of truth.
 
 TC-78 resolves the v0 transition for the node control plane: the CLI now reads
 live control health, identity, and version data from the local control API when
-the node is serving. During the initial grace window, nodes that do not expose
-the control listener may still surface `controlApi: "unavailable"`; if the
-probe is still failing after 30 seconds, the CLI escalates the service state to
-`error` instead of leaving the failure masked.
+the node is serving. During the initial 30-second grace window, nodes that do
+not expose the control listener may still surface `controlApi: "unavailable"`;
+if the probe is still failing after 30 seconds, the CLI escalates the service
+state to `error` instead of leaving the failure masked.
 
 ### 3.4 `tinycloud node status`
 
@@ -1018,7 +1015,8 @@ Important:
 - The control plane MUST never bind a non-loopback address.
 - The token file MUST be mode `0600` for user installs; `systemd-system`
   installs MAY use `0640 root:tinycloud` as documented in Section 4.
-- The runtime directory SHOULD be mode `0700`.
+- The runtime directory MUST be mode `0700` for user installs and `0750
+  root:tinycloud` for `systemd-system` installs.
 - The token MUST not be passed through env vars or command-line arguments.
 - Private key material MUST never be transmitted over the control API, printed,
   written unencrypted, or passed through env vars. `node key backup` is the

@@ -1603,7 +1603,9 @@ async fn read_overlay(path: &Path) -> Result<ControlOverlayFile> {
 
 async fn write_overlay(path: &Path, overlay: &ControlOverlayFile) -> Result<()> {
     if let Some(parent) = path.parent() {
-        ensure_dir_mode(parent, 0o700, None).await?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     let rendered = toml::to_string_pretty(overlay)?;
     write_private_text(path, &rendered, 0o600, None).await
@@ -1966,6 +1968,45 @@ mod tests {
         assert_eq!(runtime_file_mode(Profile::MacosUser), 0o600);
         assert_eq!(runtime_file_mode(Profile::LinuxUser), 0o600);
         assert_eq!(runtime_file_mode(Profile::LinuxSystem), 0o640);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_ownership_follows_the_install_profile() {
+        assert_eq!(runtime_ownership(Profile::MacosUser).unwrap(), None);
+        assert_eq!(runtime_ownership(Profile::LinuxUser).unwrap(), None);
+
+        match systemd_system_group_gid() {
+            Some(gid) => assert_eq!(
+                runtime_ownership(Profile::LinuxSystem).unwrap(),
+                Some((0, gid))
+            ),
+            None => assert!(runtime_ownership(Profile::LinuxSystem).is_err()),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn patch_overlay_does_not_downgrade_runtime_directory_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let runtime_dir = temp.path().join("runtime");
+        fs::create_dir_all(&runtime_dir).unwrap();
+
+        let mut permissions = fs::metadata(&runtime_dir).unwrap().permissions();
+        permissions.set_mode(0o750);
+        fs::set_permissions(&runtime_dir, permissions).unwrap();
+
+        let overlay_path = runtime_dir.join("config.override.toml");
+        write_overlay(&overlay_path, &ControlOverlayFile::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs::metadata(&runtime_dir).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
     }
 
     #[tokio::test]

@@ -584,7 +584,7 @@ fn derive_state(
                 return (state.clone(), Some(pid), control.annotation.clone());
             }
             if control.unavailable {
-                if age_secs.map(|age| age < 30).unwrap_or(true) {
+                if age_secs.is_none_or(|age| age < 30) {
                     return (
                         ServiceState::Starting,
                         Some(pid),
