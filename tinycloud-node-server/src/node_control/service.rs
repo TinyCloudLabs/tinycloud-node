@@ -399,6 +399,7 @@ pub fn node_doctor() -> Result<DoctorReport> {
 }
 
 pub fn install_for_paths(paths: &ProfilePaths) -> Result<()> {
+    ensure_systemd_system_group(paths.profile)?;
     ensure_parent_dir(&paths.service_manifest_path)?;
     ensure_parent_dir(&paths.service_unit_path)?;
     write_bootstrap_config_if_absent(paths)?;
@@ -422,6 +423,56 @@ pub fn install_for_paths(paths: &ProfilePaths) -> Result<()> {
     write_service_unit(paths)?;
     enable_service(paths)?;
     Ok(())
+}
+
+fn ensure_systemd_system_group(profile: Profile) -> Result<()> {
+    match systemd_system_group_install_step(profile, effective_uid(), systemd_system_group_gid().is_some()) {
+        SystemdSystemGroupInstallStep::NotNeeded | SystemdSystemGroupInstallStep::AlreadyPresent => Ok(()),
+        SystemdSystemGroupInstallStep::Create => {
+            let status = Command::new("groupadd")
+                .args(["--system", SYSTEMD_SYSTEM_GROUP])
+                .status()
+                .with_context(|| "failed to execute groupadd")?;
+            if !status.success() {
+                bail!(
+                    "failed to create the 'tinycloud' group for systemd-system install; run `groupadd --system tinycloud` manually and retry"
+                );
+            }
+
+            Ok(())
+        }
+        SystemdSystemGroupInstallStep::ManualStep => bail!(
+            "systemd-system installs require the 'tinycloud' group. Run `sudo groupadd --system tinycloud` and retry `tinycloud node service install`."
+        ),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemdSystemGroupInstallStep {
+    NotNeeded,
+    AlreadyPresent,
+    Create,
+    ManualStep,
+}
+
+fn systemd_system_group_install_step(
+    profile: Profile,
+    effective_uid: u32,
+    group_exists: bool,
+) -> SystemdSystemGroupInstallStep {
+    if !matches!(profile, Profile::LinuxSystem) {
+        return SystemdSystemGroupInstallStep::NotNeeded;
+    }
+
+    if group_exists {
+        return SystemdSystemGroupInstallStep::AlreadyPresent;
+    }
+
+    if effective_uid == 0 {
+        SystemdSystemGroupInstallStep::Create
+    } else {
+        SystemdSystemGroupInstallStep::ManualStep
+    }
 }
 
 pub fn uninstall_for_paths(paths: &ProfilePaths) -> Result<()> {
@@ -2187,6 +2238,30 @@ printf '%s\n' "${FAKE_PS_AGE:-29}"
     #[test]
     fn process_age_uses_etimes_elsewhere() {
         assert_eq!(ps_elapsed_field(), "etimes=");
+    }
+
+    #[test]
+    fn systemd_system_group_install_step_matches_profile_and_privilege() {
+        assert_eq!(
+            systemd_system_group_install_step(Profile::MacosUser, 0, false),
+            SystemdSystemGroupInstallStep::NotNeeded
+        );
+        assert_eq!(
+            systemd_system_group_install_step(Profile::LinuxUser, 0, false),
+            SystemdSystemGroupInstallStep::NotNeeded
+        );
+        assert_eq!(
+            systemd_system_group_install_step(Profile::LinuxSystem, 0, false),
+            SystemdSystemGroupInstallStep::Create
+        );
+        assert_eq!(
+            systemd_system_group_install_step(Profile::LinuxSystem, 1000, false),
+            SystemdSystemGroupInstallStep::ManualStep
+        );
+        assert_eq!(
+            systemd_system_group_install_step(Profile::LinuxSystem, 1000, true),
+            SystemdSystemGroupInstallStep::AlreadyPresent
+        );
     }
 
     #[test]
