@@ -4,6 +4,7 @@ use sqlparser::parser::Parser;
 
 use super::caveats::DuckDbCaveats;
 use super::types::DuckDbError;
+use crate::policy_capability::{ability_matches, resolve_alias};
 use crate::write_hooks::TouchedTables;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,11 +27,12 @@ pub fn validate_sql(
     caveats: &Option<DuckDbCaveats>,
     ability: &str,
 ) -> Result<ParsedQuery, DuckDbError> {
-    let is_admin = matches!(ability, "tinycloud.duckdb/admin" | "tinycloud.duckdb/*");
-    let has_write = matches!(
-        ability,
-        "tinycloud.duckdb/write" | "tinycloud.duckdb/admin" | "tinycloud.duckdb/*"
-    );
+    // TC-119: registry-aware capability tiers. `duckdb/*` implies every duckdb
+    // action, so it confers admin and write. `duckdb/admin` does NOT imply
+    // write in the registry, so `has_write` keeps admin via the `is_admin`
+    // term — reproducing the prior `admin | write | *` set exactly.
+    let is_admin = ability_matches(ability, "tinycloud.duckdb/admin");
+    let has_write = is_admin || ability_matches(ability, "tinycloud.duckdb/write");
 
     // Tier 3: Check if SQL is in pre-approved statements list
     if let Some(ref c) = caveats {
@@ -125,7 +127,10 @@ pub fn validate_sql(
         ));
     }
 
-    if !is_read_only && matches!(ability, "tinycloud.duckdb/read" | "tinycloud.duckdb/select") {
+    // Exact-tier restriction: read-tier (`read`, or its `select` alias) cannot
+    // run a write. Exact by design — `duckdb/*` implies read but must still
+    // permit writes, so this must not use `ability_matches`.
+    if !is_read_only && resolve_alias(ability) == "tinycloud.duckdb/read" {
         return Err(DuckDbError::ReadOnlyViolation);
     }
 

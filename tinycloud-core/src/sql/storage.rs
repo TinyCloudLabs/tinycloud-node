@@ -57,8 +57,12 @@ pub fn promote_to_file(conn: &Connection, path: &PathBuf) -> Result<Connection, 
     {
         let backup = rusqlite::backup::Backup::new(conn, &mut file_conn)
             .map_err(|e: rusqlite::Error| SqlError::Internal(e.to_string()))?;
+        // Single-step, unpaced copy (rusqlite rejects the sqlite "-1 = all
+        // pages" sentinel, so use i32::MAX): the caller blocks the actor on
+        // this promotion, and pacing (5 pages / 250ms) caps it at ~80KB/s
+        // (tinycloud-node#112).
         backup
-            .run_to_completion(5, std::time::Duration::from_millis(250), None)
+            .run_to_completion(i32::MAX, std::time::Duration::ZERO, None)
             .map_err(|e: rusqlite::Error| SqlError::Internal(e.to_string()))?;
     }
 

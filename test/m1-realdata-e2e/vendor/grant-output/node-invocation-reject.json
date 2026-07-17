@@ -1,0 +1,45 @@
+{
+  "description": "tinycloud-node invocation-only rejects at 4b6f3fca.",
+  "cases": [
+    {
+      "case": "holder-audience-mismatch",
+      "enforcementLayer": "node-invocation",
+      "expectedVerdict": "reject",
+      "reason": "wrong-invoker",
+      "consultCase": "consult-7-11",
+      "importedDelegationId": "bafkr4ie36bbhsrjielzqztlixjqtkyxld2ltfcp6no2pwuepqlmk3aq6wa",
+      "invokerDid": "did:key:z6MktULudTtAsAhRegYPiZ6631RV3viv12qd4GQF8z1xB22S",
+      "expectedAudience": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5"
+    },
+    {
+      "case": "expired-proof-chain",
+      "enforcementLayer": "node-invocation",
+      "expectedVerdict": "reject",
+      "reason": "proof-chain-expired",
+      "consultCase": "consult-7-invocation-expiry",
+      "importedDelegationId": "bafkr4ie36bbhsrjielzqztlixjqtkyxld2ltfcp6no2pwuepqlmk3aq6wa",
+      "invocationTimeEpochSeconds": 1783685101
+    },
+    {
+      "case": "revoked-parent",
+      "enforcementLayer": "node-invocation",
+      "expectedVerdict": "reject",
+      "reason": "revoked-ancestor",
+      "consultCase": "consult-8-revocation-layer",
+      "importedDelegationId": "bafkr4ie36bbhsrjielzqztlixjqtkyxld2ltfcp6no2pwuepqlmk3aq6wa",
+      "revokedCid": "bafkr4iglifjta4fae5ecx5jrmgrxrxhoz5luyu3o4v5b7aofqmfmzgfmay"
+    },
+    {
+      "case": "unauthorized-requested-action",
+      "enforcementLayer": "node-invocation",
+      "expectedVerdict": "reject",
+      "reason": "requested-action-not-authorized",
+      "consultCase": "consult-7-action",
+      "importedDelegationId": "bafkr4ie36bbhsrjielzqztlixjqtkyxld2ltfcp6no2pwuepqlmk3aq6wa",
+      "requested": {
+        "resource": "tinycloud:pkh:eip155:1:0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf:default/sql/xyz.tinycloud.listen/conversations",
+        "ability": "tinycloud.sql/write"
+      }
+    }
+  ]
+}

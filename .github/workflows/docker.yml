@@ -198,6 +198,8 @@ jobs:
           PHALA_ENV_AWS_KEY: ${{ secrets.PROD_TINYCLOUD_AWS_ACCESS_KEY_ID }}
           PHALA_ENV_AWS_SECRET: ${{ secrets.PROD_TINYCLOUD_AWS_SECRET_ACCESS_KEY }}
           PHALA_ENV_AWS_REGION: ${{ secrets.PROD_TINYCLOUD_AWS_REGION }}
+          PHALA_ENV_TINYCLOUD_QUOTA_URL: ${{ secrets.PROD_TINYCLOUD_QUOTA_URL }}
+          PHALA_ENV_TINYCLOUD_ADMIN_SECRET: ${{ secrets.PROD_TINYCLOUD_ADMIN_SECRET }}
           PHALA_ENV_CLOUDFLARE_API_TOKEN: ${{ secrets.PROD_TINYCLOUD_CLOUDFLARE_API_TOKEN }}
           PHALA_ENV_DSTACK_GATEWAY_DOMAIN: ${{ secrets.PROD_TINYCLOUD_DSTACK_GATEWAY_DOMAIN }}
           PHALA_ENV_CERTBOT_EMAIL: ${{ secrets.PROD_TINYCLOUD_CERTBOT_EMAIL }}
@@ -215,6 +217,8 @@ jobs:
             PHALA_ENV_AWS_KEY
             PHALA_ENV_AWS_SECRET
             PHALA_ENV_AWS_REGION
+            PHALA_ENV_TINYCLOUD_QUOTA_URL
+            PHALA_ENV_TINYCLOUD_ADMIN_SECRET
             PHALA_ENV_CLOUDFLARE_API_TOKEN
             PHALA_ENV_DSTACK_GATEWAY_DOMAIN
             PHALA_ENV_CERTBOT_EMAIL
@@ -234,9 +238,16 @@ jobs:
             printf 'AWS_KEY=%s\n' "$PHALA_ENV_AWS_KEY"
             printf 'AWS_SECRET=%s\n' "$PHALA_ENV_AWS_SECRET"
             printf 'AWS_REGION=%s\n' "$PHALA_ENV_AWS_REGION"
+            printf 'TINYCLOUD_QUOTA_URL=%s\n' "$PHALA_ENV_TINYCLOUD_QUOTA_URL"
+            printf 'TINYCLOUD_ADMIN_SECRET=%s\n' "$PHALA_ENV_TINYCLOUD_ADMIN_SECRET"
             printf 'CLOUDFLARE_API_TOKEN=%s\n' "$PHALA_ENV_CLOUDFLARE_API_TOKEN"
             printf 'DSTACK_GATEWAY_DOMAIN=%s\n' "$PHALA_ENV_DSTACK_GATEWAY_DOMAIN"
             printf 'CERTBOT_EMAIL=%s\n' "$PHALA_ENV_CERTBOT_EMAIL"
+            # SSH public keys authorized on the CVM (checked into the repo,
+            # see dstack-authorized-keys). The Phala Cloud pre-launch script
+            # writes DSTACK_AUTHORIZED_KEYS to /home/root/.ssh/authorized_keys
+            # at boot, enabling `phala ssh tinycloud-node`.
+            printf 'DSTACK_AUTHORIZED_KEYS=%s\n' "$(cat dstack-authorized-keys)"
           } > .phala-prod.env
 
           phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml -e .phala-prod.env --wait

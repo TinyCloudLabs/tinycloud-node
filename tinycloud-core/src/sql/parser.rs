@@ -4,6 +4,7 @@ use sqlparser::parser::Parser;
 
 use super::caveats::SqlCaveats;
 use super::types::SqlError;
+use crate::policy_capability::{ability_matches, resolve_alias};
 use crate::write_hooks::TouchedTables;
 
 #[derive(Debug)]
@@ -22,7 +23,9 @@ pub fn validate_sql(
     ability: &str,
 ) -> Result<ParsedQuery, SqlError> {
     if is_pragma_sql(sql) {
-        if !matches!(ability, "tinycloud.sql/admin" | "tinycloud.sql/*") {
+        // TC-119: confers-admin gate. `sql/admin` and `sql/*` (implies admin)
+        // pass; identical to the prior `admin | *` match.
+        if !ability_matches(ability, "tinycloud.sql/admin") {
             return Err(SqlError::PermissionDenied(
                 "PRAGMA operations require admin ability".to_string(),
             ));
@@ -112,27 +115,32 @@ pub fn validate_sql(
     }
 
     // Validate ability vs operation type
+    // TC-119: DDL requires an ability that confers write OR schema. `sql/admin`
+    // qualifies because the registry declares `admin ⊃ schema`; `sql/*` qualifies
+    // because it implies both. This reproduces the prior `admin|write|schema|*`
+    // set exactly, now sourced from the registry implication table.
     if is_ddl
-        && !matches!(
-            ability,
-            "tinycloud.sql/admin"
-                | "tinycloud.sql/write"
-                | "tinycloud.sql/schema"
-                | "tinycloud.sql/*"
-        )
+        && !(ability_matches(ability, "tinycloud.sql/write")
+            || ability_matches(ability, "tinycloud.sql/schema"))
     {
         return Err(SqlError::PermissionDenied(
             "DDL operations require admin, schema, or write ability".to_string(),
         ));
     }
 
-    if matches!(ability, "tinycloud.sql/schema") && (!is_ddl || has_non_ddl) {
+    // Exact-tier restriction: the `schema` ability is DDL-only. This is NOT a
+    // confers-check — it must stay exact (a broader ability like `admin` is not
+    // restricted here), so we compare the alias-resolved URN, not `ability_matches`.
+    if resolve_alias(ability) == "tinycloud.sql/schema" && (!is_ddl || has_non_ddl) {
         return Err(SqlError::PermissionDenied(
             "Schema ability only permits DDL operations".to_string(),
         ));
     }
 
-    if !is_read_only && matches!(ability, "tinycloud.sql/read" | "tinycloud.sql/select") {
+    // Exact-tier restriction: read-tier (`read`, or its `select` alias) cannot
+    // run a write. Exact by design — `sql/*` implies read but must still permit
+    // writes, so this must not use `ability_matches`.
+    if !is_read_only && resolve_alias(ability) == "tinycloud.sql/read" {
         return Err(SqlError::ReadOnlyViolation);
     }
 

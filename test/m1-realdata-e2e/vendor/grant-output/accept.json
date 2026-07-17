@@ -1,0 +1,280 @@
+{
+  "description": "Node-native grant-output accept vectors pinned to tinycloud-node 4b6f3fca.",
+  "pinnedConsumer": "tinycloud-node@4b6f3fca",
+  "fixedInstantEpochSeconds": 1783684800,
+  "parentFormatVector": {
+    "format": "siwe-cacao-eip191",
+    "issuer": "did:pkh:eip155:1:0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf",
+    "audience": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+    "delegateeLookupValue": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+    "issuedAt": "2026-07-10T11:00:00.000Z",
+    "expiresAt": "2027-07-10T12:00:00.000Z",
+    "siweMessage": "policy-engine.example wants you to sign in with your Ethereum account:\n0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf\n\nI further authorize the stated URI to perform the following actions on my behalf: (1) 'tinycloud.kv': 'get' for 'tinycloud:pkh:eip155:1:0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf:default/sql/xyz.tinycloud.listen/conversations'. (2) 'tinycloud.sql': 'read' for 'tinycloud:pkh:eip155:1:0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf:default/sql/xyz.tinycloud.listen/conversations'.\n\nURI: did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK\nVersion: 1\nChain ID: 1\nNonce: m1g060001\nIssued At: 2026-07-10T11:00:00.000Z\nExpiration Time: 2027-07-10T12:00:00.000Z\nResources:\n- urn:recap:eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vY29udmVyc2F0aW9ucyI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dLCJ0aW55Y2xvdWQuc3FsL3JlYWQiOlt7fV19fSwicHJmIjpbXX0",
+    "signatureHex": "6b33c1cfa88b6afbbeefea7929141fef949b277c575949bb4f5924d375a0089d7fbf3bdeefc5176035c23e3b541b635308cc3151007f2a59cb4e05cc7882bada1c",
+    "recap": {
+      "att": {
+        "tinycloud:pkh:eip155:1:0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf:default/sql/xyz.tinycloud.listen/conversations": {
+          "tinycloud.kv/get": [
+            {}
+          ],
+          "tinycloud.sql/read": [
+            {}
+          ]
+        }
+      },
+      "prf": []
+    },
+    "recapJcsUtf8Hex": "7b22617474223a7b2274696e79636c6f75643a706b683a6569703135353a313a3078374535463435353230393141363931323564354466436237623843323635393032393339354264663a64656661756c742f73716c2f78797a2e74696e79636c6f75642e6c697374656e2f636f6e766572736174696f6e73223a7b2274696e79636c6f75642e6b762f676574223a5b7b7d5d2c2274696e79636c6f75642e73716c2f72656164223a5b7b7d5d7d7d2c22707266223a5b5d7d",
+    "recapResource": "urn:recap:eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vY29udmVyc2F0aW9ucyI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dLCJ0aW55Y2xvdWQuc3FsL3JlYWQiOlt7fV19fSwicHJmIjpbXX0",
+    "cacao": {
+      "h": {
+        "t": "eip4361"
+      },
+      "p": {
+        "domain": "policy-engine.example",
+        "iss": "did:pkh:eip155:1:0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf",
+        "statement": "I further authorize the stated URI to perform the following actions on my behalf: (1) 'tinycloud.kv': 'get' for 'tinycloud:pkh:eip155:1:0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf:default/sql/xyz.tinycloud.listen/conversations'. (2) 'tinycloud.sql': 'read' for 'tinycloud:pkh:eip155:1:0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf:default/sql/xyz.tinycloud.listen/conversations'.",
+        "aud": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+        "version": 1,
+        "nonce": "m1g060001",
+        "iat": "2026-07-10T11:00:00.000Z",
+        "exp": "2027-07-10T12:00:00.000Z",
+        "resources": [
+          "urn:recap:eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vY29udmVyc2F0aW9ucyI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dLCJ0aW55Y2xvdWQuc3FsL3JlYWQiOlt7fV19fSwicHJmIjpbXX0"
+        ]
+      },
+      "s": {
+        "sHex": "6b33c1cfa88b6afbbeefea7929141fef949b277c575949bb4f5924d375a0089d7fbf3bdeefc5176035c23e3b541b635308cc3151007f2a59cb4e05cc7882bada1c",
+        "t": "eip191"
+      }
+    },
+    "dagCborBase64Url": "o2FooWF0Z2VpcDQzNjFhcKljYXVkeDhkaWQ6a2V5Ono2TWtxR0MzbldaaFlpZUVWVFZES1c1djU4OENpR2ZzRFNtUlZHOVp3d1dUdkxTS2NleHB4GDIwMjctMDctMTBUMTI6MDA6MDAuMDAwWmNpYXR4GDIwMjYtMDctMTBUMTE6MDA6MDAuMDAwWmNpc3N4O2RpZDpwa2g6ZWlwMTU1OjE6MHg3RTVGNDU1MjA5MUE2OTEyNWQ1RGZDYjdiOEMyNjU5MDI5Mzk1QmRmZW5vbmNlaW0xZzA2MDAwMWZkb21haW51cG9saWN5LWVuZ2luZS5leGFtcGxlZ3ZlcnNpb24BaXJlc291cmNlc4F5AQF1cm46cmVjYXA6ZXlKaGRIUWlPbnNpZEdsdWVXTnNiM1ZrT25CcmFEcGxhWEF4TlRVNk1Ub3dlRGRGTlVZME5UVXlNRGt4UVRZNU1USTFaRFZFWmtOaU4ySTRRekkyTlRrd01qa3pPVFZDWkdZNlpHVm1ZWFZzZEM5emNXd3ZlSGw2TG5ScGJubGpiRzkxWkM1c2FYTjBaVzR2WTI5dWRtVnljMkYwYVc5dWN5STZleUowYVc1NVkyeHZkV1F1YTNZdloyVjBJanBiZTMxZExDSjBhVzU1WTJ4dmRXUXVjM0ZzTDNKbFlXUWlPbHQ3ZlYxOWZTd2ljSEptSWpwYlhYMGlzdGF0ZW1lbnR5AXdJIGZ1cnRoZXIgYXV0aG9yaXplIHRoZSBzdGF0ZWQgVVJJIHRvIHBlcmZvcm0gdGhlIGZvbGxvd2luZyBhY3Rpb25zIG9uIG15IGJlaGFsZjogKDEpICd0aW55Y2xvdWQua3YnOiAnZ2V0JyBmb3IgJ3RpbnljbG91ZDpwa2g6ZWlwMTU1OjE6MHg3RTVGNDU1MjA5MUE2OTEyNWQ1RGZDYjdiOEMyNjU5MDI5Mzk1QmRmOmRlZmF1bHQvc3FsL3h5ei50aW55Y2xvdWQubGlzdGVuL2NvbnZlcnNhdGlvbnMnLiAoMikgJ3RpbnljbG91ZC5zcWwnOiAncmVhZCcgZm9yICd0aW55Y2xvdWQ6cGtoOmVpcDE1NToxOjB4N0U1RjQ1NTIwOTFBNjkxMjVkNURmQ2I3YjhDMjY1OTAyOTM5NUJkZjpkZWZhdWx0L3NxbC94eXoudGlueWNsb3VkLmxpc3Rlbi9jb252ZXJzYXRpb25zJy5hc6Jhc1hBazPBz6iLavu-7-p5KRQf75SbJ3xXWUm7T1kk03WgCJ1_vzve78UXYDXCPjtUG2NTCMwxUQB_KlnLTgXMeIK62hxhdGZlaXAxOTE",
+    "dagCborHex": "a36168a1617467656970343336316170a96361756478386469643a6b65793a7a364d6b714743336e575a6859696545565456444b573576353838436947667344536d525647395a77775754764c534b636578707818323032372d30372d31305431323a30303a30302e3030305a636961747818323032362d30372d31305431313a30303a30302e3030305a63697373783b6469643a706b683a6569703135353a313a307837453546343535323039314136393132356435446643623762384332363539303239333935426466656e6f6e6365696d316730363030303166646f6d61696e75706f6c6963792d656e67696e652e6578616d706c656776657273696f6e01697265736f75726365738179010175726e3a72656361703a65794a68644851694f6e736964476c7565574e736233566b4f6e42726144706c615841784e5455364d546f77654464464e5559304e5455794d446b78515459354d5449315a4456455a6b4e694e324934517a49324e546b774d6a6b7a4f5456435a4759365a47566d595856736443397a6357777665486c364c6e5270626e6c6a624739315a43357361584e305a57347659323975646d567963324630615739756379493665794a30615735355932787664575175613359765a325630496a7062653331644c434a30615735355932787664575175633346734c334a6c595751694f6c7437665631396653776963484a6d496a70625858306973746174656d656e7479017749206675727468657220617574686f72697a6520746865207374617465642055524920746f20706572666f726d2074686520666f6c6c6f77696e6720616374696f6e73206f6e206d7920626568616c663a20283129202774696e79636c6f75642e6b76273a20276765742720666f72202774696e79636c6f75643a706b683a6569703135353a313a3078374535463435353230393141363931323564354466436237623843323635393032393339354264663a64656661756c742f73716c2f78797a2e74696e79636c6f75642e6c697374656e2f636f6e766572736174696f6e73272e20283229202774696e79636c6f75642e73716c273a2027726561642720666f72202774696e79636c6f75643a706b683a6569703135353a313a3078374535463435353230393141363931323564354466436237623843323635393032393339354264663a64656661756c742f73716c2f78797a2e74696e79636c6f75642e6c697374656e2f636f6e766572736174696f6e73272e6173a2617358416b33c1cfa88b6afbbeefea7929141fef949b277c575949bb4f5924d375a0089d7fbf3bdeefc5176035c23e3b541b635308cc3151007f2a59cb4e05cc7882bada1c617466656970313931",
+    "dagCborSerializerContract": "serde_ipld_dagcbor::to_vec(SiweCacao)@0.6.4",
+    "expectedCid": "bafkr4iglifjta4fae5ecx5jrmgrxrxhoz5luyu3o4v5b7aofqmfmzgfmay",
+    "expectedCidBytesHex": "01551e20cb41533070a027482bf53161a378dceecf574c536ee57a1f81c5830acc98ac06"
+  },
+  "cases": [
+    {
+      "case": "valid-bounded-node-native-ucan",
+      "enforcementLayer": "node-import",
+      "expectedVerdict": "accept",
+      "reason": "valid-bounded-grant",
+      "consultCase": "consult-7-01",
+      "portableDelegation": {
+        "delegationId": "bafkr4ie36bbhsrjielzqztlixjqtkyxld2ltfcp6no2pwuepqlmk3aq6wa",
+        "issuanceId": "iss_m1g06_00000001",
+        "issuerDid": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+        "holderDid": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5",
+        "policyId": "pol_m1g06_transcript",
+        "capabilityHashHex": "04bd54ea7c59efdd21351c975d12dea757840a723cf5417709c7cb4c0ab1b0ee",
+        "revocationMode": "refresh_only",
+        "issuedAt": "2026-07-10T12:00:00Z",
+        "expiresAt": "2026-07-10T12:05:00Z",
+        "terminal": true,
+        "encoded": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4Ijoib0pxbDlIcG5XWUF2LVZYNDNDMHFGS1hKblNPLWxfaGtFbl81T0RSVnBQQSJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vY29udmVyc2F0aW9ucyI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dLCJ0aW55Y2xvdWQuc3FsL3JlYWQiOlt7Im1vZGUiOiJjb25zdHJhaW5lZC1zdGF0ZW1lbnRzIiwicmVhZE9ubHkiOnRydWUsInN0YXRlbWVudHMiOlt7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5nZXRDb252ZXJzYXRpb24iLCJzcWwiOiJTRUxFQ1QgaWQsIHRpdGxlLCBzb3VyY2UsIHNvdXJjZV9pZCwgc291cmNlX3VybCwgc3RhcnRlZF9hdCwgZW5kZWRfYXQsIGR1cmF0aW9uX3NlY3MsIHN1bW1hcnksIG1ldGFkYXRhLCB0cmFuc2NyaXB0X2pzb24sIHRyYW5zY3JpcHRfdGV4dCwgY3JlYXRlZF9hdCwgdXBkYXRlZF9hdCBGUk9NIGNvbnZlcnNhdGlvbiBXSEVSRSBpZCA9ID8ifSx7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5saXN0UGFydGljaXBhbnRzIiwic3FsIjoiU0VMRUNUIGlkLCBuYW1lLCBlbWFpbCwgc3BlYWtlcl9sYWJlbCBGUk9NIHBhcnRpY2lwYW50IFdIRVJFIGNvbnZlcnNhdGlvbl9pZCA9ID8gT1JERVIgQlkgQ09BTEVTQ0Uoc3BlYWtlcl9sYWJlbCwgbmFtZSksIGlkIn1dfV19fSwiYXVkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUiLCJleHAiOjE3ODM2ODUxMDAsImZjdCI6W3sieHl6LnRpbnljbG91ZC5wb2xpY3kvY2FwYWJpbGl0eUhhc2hIZXgiOiIwNGJkNTRlYTdjNTllZmRkMjEzNTFjOTc1ZDEyZGVhNzU3ODQwYTcyM2NmNTQxNzcwOWM3Y2I0YzBhYjFiMGVlIiwieHl6LnRpbnljbG91ZC5wb2xpY3kvZGVsZWdhdGlvbk1vZGUiOiJ0ZXJtaW5hbCIsInh5ei50aW55Y2xvdWQucG9saWN5L2lzc3VhbmNlSWQiOiJpc3NfbTFnMDZfMDAwMDAwMDEiLCJ4eXoudGlueWNsb3VkLnBvbGljeS9wb2xpY3lJZCI6InBvbF9tMWcwNl90cmFuc2NyaXB0IiwieHl6LnRpbnljbG91ZC5wb2xpY3kvcmV2b2NhdGlvbk1vZGUiOiJyZWZyZXNoX29ubHkifV0sImlzcyI6ImRpZDprZXk6ejZNa3FHQzNuV1poWWllRVZUVkRLVzV2NTg4Q2lHZnNEU21SVkc5Wnd3V1R2TFNLI3o2TWtxR0MzbldaaFlpZUVWVFZES1c1djU4OENpR2ZzRFNtUlZHOVp3d1dUdkxTSyIsIm5iZiI6MTc4MzY4NDgwMCwibm5jIjoibTEtZy0wNi1maXhlZC1ub25jZSIsInByZiI6WyJiYWZrcjRpZ2xpZmp0YTRmYWU1ZWN4NWpybWdyeHJ4aG96NWx1eXUzbzR2NWI3YW9mcW1mbXpnZm1heSJdfQ.nuFCoCUdZ3CIhrhYABmu5iaaPEJfGKkhsxv-j-x0q3vONMPidQZSRErvkTZxPHc5Vr9tzLZSqjarqUljBqpxDA"
+      },
+      "ucan": {
+        "encoded": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4Ijoib0pxbDlIcG5XWUF2LVZYNDNDMHFGS1hKblNPLWxfaGtFbl81T0RSVnBQQSJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vY29udmVyc2F0aW9ucyI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dLCJ0aW55Y2xvdWQuc3FsL3JlYWQiOlt7Im1vZGUiOiJjb25zdHJhaW5lZC1zdGF0ZW1lbnRzIiwicmVhZE9ubHkiOnRydWUsInN0YXRlbWVudHMiOlt7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5nZXRDb252ZXJzYXRpb24iLCJzcWwiOiJTRUxFQ1QgaWQsIHRpdGxlLCBzb3VyY2UsIHNvdXJjZV9pZCwgc291cmNlX3VybCwgc3RhcnRlZF9hdCwgZW5kZWRfYXQsIGR1cmF0aW9uX3NlY3MsIHN1bW1hcnksIG1ldGFkYXRhLCB0cmFuc2NyaXB0X2pzb24sIHRyYW5zY3JpcHRfdGV4dCwgY3JlYXRlZF9hdCwgdXBkYXRlZF9hdCBGUk9NIGNvbnZlcnNhdGlvbiBXSEVSRSBpZCA9ID8ifSx7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5saXN0UGFydGljaXBhbnRzIiwic3FsIjoiU0VMRUNUIGlkLCBuYW1lLCBlbWFpbCwgc3BlYWtlcl9sYWJlbCBGUk9NIHBhcnRpY2lwYW50IFdIRVJFIGNvbnZlcnNhdGlvbl9pZCA9ID8gT1JERVIgQlkgQ09BTEVTQ0Uoc3BlYWtlcl9sYWJlbCwgbmFtZSksIGlkIn1dfV19fSwiYXVkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUiLCJleHAiOjE3ODM2ODUxMDAsImZjdCI6W3sieHl6LnRpbnljbG91ZC5wb2xpY3kvY2FwYWJpbGl0eUhhc2hIZXgiOiIwNGJkNTRlYTdjNTllZmRkMjEzNTFjOTc1ZDEyZGVhNzU3ODQwYTcyM2NmNTQxNzcwOWM3Y2I0YzBhYjFiMGVlIiwieHl6LnRpbnljbG91ZC5wb2xpY3kvZGVsZWdhdGlvbk1vZGUiOiJ0ZXJtaW5hbCIsInh5ei50aW55Y2xvdWQucG9saWN5L2lzc3VhbmNlSWQiOiJpc3NfbTFnMDZfMDAwMDAwMDEiLCJ4eXoudGlueWNsb3VkLnBvbGljeS9wb2xpY3lJZCI6InBvbF9tMWcwNl90cmFuc2NyaXB0IiwieHl6LnRpbnljbG91ZC5wb2xpY3kvcmV2b2NhdGlvbk1vZGUiOiJyZWZyZXNoX29ubHkifV0sImlzcyI6ImRpZDprZXk6ejZNa3FHQzNuV1poWWllRVZUVkRLVzV2NTg4Q2lHZnNEU21SVkc5Wnd3V1R2TFNLI3o2TWtxR0MzbldaaFlpZUVWVFZES1c1djU4OENpR2ZzRFNtUlZHOVp3d1dUdkxTSyIsIm5iZiI6MTc4MzY4NDgwMCwibm5jIjoibTEtZy0wNi1maXhlZC1ub25jZSIsInByZiI6WyJiYWZrcjRpZ2xpZmp0YTRmYWU1ZWN4NWpybWdyeHJ4aG96NWx1eXUzbzR2NWI3YW9mcW1mbXpnZm1heSJdfQ.nuFCoCUdZ3CIhrhYABmu5iaaPEJfGKkhsxv-j-x0q3vONMPidQZSRErvkTZxPHc5Vr9tzLZSqjarqUljBqpxDA",
+        "header": {
+          "alg": "EdDSA",
+          "typ": "JWT",
+          "ucv": "0.10.0",
+          "jwk": {
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "oJql9HpnWYAv-VX43C0qFKXJnSO-l_hkEn_5ODRVpPA",
+            "alg": "EdDSA"
+          }
+        },
+        "payload": {
+          "iss": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK#z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+          "aud": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5",
+          "nbf": 1783684800,
+          "exp": 1783685100,
+          "nnc": "m1-g-06-fixed-nonce",
+          "fct": [
+            {
+              "xyz.tinycloud.policy/delegationMode": "terminal",
+              "xyz.tinycloud.policy/policyId": "pol_m1g06_transcript",
+              "xyz.tinycloud.policy/capabilityHashHex": "04bd54ea7c59efdd21351c975d12dea757840a723cf5417709c7cb4c0ab1b0ee",
+              "xyz.tinycloud.policy/revocationMode": "refresh_only",
+              "xyz.tinycloud.policy/issuanceId": "iss_m1g06_00000001"
+            }
+          ],
+          "prf": [
+            "bafkr4iglifjta4fae5ecx5jrmgrxrxhoz5luyu3o4v5b7aofqmfmzgfmay"
+          ],
+          "att": {
+            "tinycloud:pkh:eip155:1:0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf:default/sql/xyz.tinycloud.listen/conversations": {
+              "tinycloud.kv/get": [
+                {}
+              ],
+              "tinycloud.sql/read": [
+                {
+                  "mode": "constrained-statements",
+                  "readOnly": true,
+                  "statements": [
+                    {
+                      "name": "listen.getConversation",
+                      "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+                      "fixedParams": [
+                        {
+                          "index": 0,
+                          "value": "conv_456"
+                        }
+                      ]
+                    },
+                    {
+                      "name": "listen.listParticipants",
+                      "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+                      "fixedParams": [
+                        {
+                          "index": 0,
+                          "value": "conv_456"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "signerDid": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+        "signingInputAscii": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4Ijoib0pxbDlIcG5XWUF2LVZYNDNDMHFGS1hKblNPLWxfaGtFbl81T0RSVnBQQSJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vY29udmVyc2F0aW9ucyI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dLCJ0aW55Y2xvdWQuc3FsL3JlYWQiOlt7Im1vZGUiOiJjb25zdHJhaW5lZC1zdGF0ZW1lbnRzIiwicmVhZE9ubHkiOnRydWUsInN0YXRlbWVudHMiOlt7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5nZXRDb252ZXJzYXRpb24iLCJzcWwiOiJTRUxFQ1QgaWQsIHRpdGxlLCBzb3VyY2UsIHNvdXJjZV9pZCwgc291cmNlX3VybCwgc3RhcnRlZF9hdCwgZW5kZWRfYXQsIGR1cmF0aW9uX3NlY3MsIHN1bW1hcnksIG1ldGFkYXRhLCB0cmFuc2NyaXB0X2pzb24sIHRyYW5zY3JpcHRfdGV4dCwgY3JlYXRlZF9hdCwgdXBkYXRlZF9hdCBGUk9NIGNvbnZlcnNhdGlvbiBXSEVSRSBpZCA9ID8ifSx7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5saXN0UGFydGljaXBhbnRzIiwic3FsIjoiU0VMRUNUIGlkLCBuYW1lLCBlbWFpbCwgc3BlYWtlcl9sYWJlbCBGUk9NIHBhcnRpY2lwYW50IFdIRVJFIGNvbnZlcnNhdGlvbl9pZCA9ID8gT1JERVIgQlkgQ09BTEVTQ0Uoc3BlYWtlcl9sYWJlbCwgbmFtZSksIGlkIn1dfV19fSwiYXVkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUiLCJleHAiOjE3ODM2ODUxMDAsImZjdCI6W3sieHl6LnRpbnljbG91ZC5wb2xpY3kvY2FwYWJpbGl0eUhhc2hIZXgiOiIwNGJkNTRlYTdjNTllZmRkMjEzNTFjOTc1ZDEyZGVhNzU3ODQwYTcyM2NmNTQxNzcwOWM3Y2I0YzBhYjFiMGVlIiwieHl6LnRpbnljbG91ZC5wb2xpY3kvZGVsZWdhdGlvbk1vZGUiOiJ0ZXJtaW5hbCIsInh5ei50aW55Y2xvdWQucG9saWN5L2lzc3VhbmNlSWQiOiJpc3NfbTFnMDZfMDAwMDAwMDEiLCJ4eXoudGlueWNsb3VkLnBvbGljeS9wb2xpY3lJZCI6InBvbF9tMWcwNl90cmFuc2NyaXB0IiwieHl6LnRpbnljbG91ZC5wb2xpY3kvcmV2b2NhdGlvbk1vZGUiOiJyZWZyZXNoX29ubHkifV0sImlzcyI6ImRpZDprZXk6ejZNa3FHQzNuV1poWWllRVZUVkRLVzV2NTg4Q2lHZnNEU21SVkc5Wnd3V1R2TFNLI3o2TWtxR0MzbldaaFlpZUVWVFZES1c1djU4OENpR2ZzRFNtUlZHOVp3d1dUdkxTSyIsIm5iZiI6MTc4MzY4NDgwMCwibm5jIjoibTEtZy0wNi1maXhlZC1ub25jZSIsInByZiI6WyJiYWZrcjRpZ2xpZmp0YTRmYWU1ZWN4NWpybWdyeHJ4aG96NWx1eXUzbzR2NWI3YW9mcW1mbXpnZm1heSJdfQ",
+        "signatureHex": "9ee142a0251d67708886b8580019aee6269a3c425f18a921b31bfe8fec74ab7bce34c3e2750652444aef9136713c773956bf6dccb652aa36aba9496306aa710c",
+        "delegationId": "bafkr4ie36bbhsrjielzqztlixjqtkyxld2ltfcp6no2pwuepqlmk3aq6wa",
+        "delegationIdBytesHex": "01551e209bf04279452822f30ccd68ba613562eb1e973289fe6bb4fb508f82d8ad821eb0"
+      },
+      "expectedExtractedCapability": {
+        "resource": "tinycloud:pkh:eip155:1:0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf:default/sql/xyz.tinycloud.listen/conversations",
+        "ability": "tinycloud.sql/read",
+        "notaBene": {
+          "0": {
+            "mode": "constrained-statements",
+            "readOnly": true,
+            "statements": [
+              {
+                "name": "listen.getConversation",
+                "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+                "fixedParams": [
+                  {
+                    "index": 0,
+                    "value": "conv_456"
+                  }
+                ]
+              },
+              {
+                "name": "listen.listParticipants",
+                "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+                "fixedParams": [
+                  {
+                    "index": 0,
+                    "value": "conv_456"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "case": "deterministic-native-identity-and-ledger-link",
+      "enforcementLayer": "audit",
+      "expectedVerdict": "accept",
+      "reason": "same-signed-bytes-same-native-cid",
+      "consultCase": "consult-8-accept-identity",
+      "issuanceRecord": {
+        "issuanceId": "iss_m1g06_00000001",
+        "encoded": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4Ijoib0pxbDlIcG5XWUF2LVZYNDNDMHFGS1hKblNPLWxfaGtFbl81T0RSVnBQQSJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vY29udmVyc2F0aW9ucyI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dLCJ0aW55Y2xvdWQuc3FsL3JlYWQiOlt7Im1vZGUiOiJjb25zdHJhaW5lZC1zdGF0ZW1lbnRzIiwicmVhZE9ubHkiOnRydWUsInN0YXRlbWVudHMiOlt7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5nZXRDb252ZXJzYXRpb24iLCJzcWwiOiJTRUxFQ1QgaWQsIHRpdGxlLCBzb3VyY2UsIHNvdXJjZV9pZCwgc291cmNlX3VybCwgc3RhcnRlZF9hdCwgZW5kZWRfYXQsIGR1cmF0aW9uX3NlY3MsIHN1bW1hcnksIG1ldGFkYXRhLCB0cmFuc2NyaXB0X2pzb24sIHRyYW5zY3JpcHRfdGV4dCwgY3JlYXRlZF9hdCwgdXBkYXRlZF9hdCBGUk9NIGNvbnZlcnNhdGlvbiBXSEVSRSBpZCA9ID8ifSx7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5saXN0UGFydGljaXBhbnRzIiwic3FsIjoiU0VMRUNUIGlkLCBuYW1lLCBlbWFpbCwgc3BlYWtlcl9sYWJlbCBGUk9NIHBhcnRpY2lwYW50IFdIRVJFIGNvbnZlcnNhdGlvbl9pZCA9ID8gT1JERVIgQlkgQ09BTEVTQ0Uoc3BlYWtlcl9sYWJlbCwgbmFtZSksIGlkIn1dfV19fSwiYXVkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUiLCJleHAiOjE3ODM2ODUxMDAsImZjdCI6W3sieHl6LnRpbnljbG91ZC5wb2xpY3kvY2FwYWJpbGl0eUhhc2hIZXgiOiIwNGJkNTRlYTdjNTllZmRkMjEzNTFjOTc1ZDEyZGVhNzU3ODQwYTcyM2NmNTQxNzcwOWM3Y2I0YzBhYjFiMGVlIiwieHl6LnRpbnljbG91ZC5wb2xpY3kvZGVsZWdhdGlvbk1vZGUiOiJ0ZXJtaW5hbCIsInh5ei50aW55Y2xvdWQucG9saWN5L2lzc3VhbmNlSWQiOiJpc3NfbTFnMDZfMDAwMDAwMDEiLCJ4eXoudGlueWNsb3VkLnBvbGljeS9wb2xpY3lJZCI6InBvbF9tMWcwNl90cmFuc2NyaXB0IiwieHl6LnRpbnljbG91ZC5wb2xpY3kvcmV2b2NhdGlvbk1vZGUiOiJyZWZyZXNoX29ubHkifV0sImlzcyI6ImRpZDprZXk6ejZNa3FHQzNuV1poWWllRVZUVkRLVzV2NTg4Q2lHZnNEU21SVkc5Wnd3V1R2TFNLI3o2TWtxR0MzbldaaFlpZUVWVFZES1c1djU4OENpR2ZzRFNtUlZHOVp3d1dUdkxTSyIsIm5iZiI6MTc4MzY4NDgwMCwibm5jIjoibTEtZy0wNi1maXhlZC1ub25jZSIsInByZiI6WyJiYWZrcjRpZ2xpZmp0YTRmYWU1ZWN4NWpybWdyeHJ4aG96NWx1eXUzbzR2NWI3YW9mcW1mbXpnZm1heSJdfQ.nuFCoCUdZ3CIhrhYABmu5iaaPEJfGKkhsxv-j-x0q3vONMPidQZSRErvkTZxPHc5Vr9tzLZSqjarqUljBqpxDA",
+        "delegationId": "bafkr4ie36bbhsrjielzqztlixjqtkyxld2ltfcp6no2pwuepqlmk3aq6wa",
+        "atomicCommit": true
+      },
+      "expectedDelegationId": "bafkr4ie36bbhsrjielzqztlixjqtkyxld2ltfcp6no2pwuepqlmk3aq6wa",
+      "expectedDelegationIdBytesHex": "01551e209bf04279452822f30ccd68ba613562eb1e973289fe6bb4fb508f82d8ad821eb0"
+    },
+    {
+      "case": "empty-parent-caveats-permit-child-narrowing",
+      "enforcementLayer": "node-import",
+      "expectedVerdict": "accept",
+      "reason": "empty-parent-caveats-permit-narrowing",
+      "consultCase": "consult-8-parent-semantics",
+      "ucan": {
+        "encoded": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4Ijoib0pxbDlIcG5XWUF2LVZYNDNDMHFGS1hKblNPLWxfaGtFbl81T0RSVnBQQSJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vY29udmVyc2F0aW9ucyI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dLCJ0aW55Y2xvdWQuc3FsL3JlYWQiOlt7Im1vZGUiOiJjb25zdHJhaW5lZC1zdGF0ZW1lbnRzIiwicmVhZE9ubHkiOnRydWUsInN0YXRlbWVudHMiOlt7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5nZXRDb252ZXJzYXRpb24iLCJzcWwiOiJTRUxFQ1QgaWQsIHRpdGxlLCBzb3VyY2UsIHNvdXJjZV9pZCwgc291cmNlX3VybCwgc3RhcnRlZF9hdCwgZW5kZWRfYXQsIGR1cmF0aW9uX3NlY3MsIHN1bW1hcnksIG1ldGFkYXRhLCB0cmFuc2NyaXB0X2pzb24sIHRyYW5zY3JpcHRfdGV4dCwgY3JlYXRlZF9hdCwgdXBkYXRlZF9hdCBGUk9NIGNvbnZlcnNhdGlvbiBXSEVSRSBpZCA9ID8ifSx7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5saXN0UGFydGljaXBhbnRzIiwic3FsIjoiU0VMRUNUIGlkLCBuYW1lLCBlbWFpbCwgc3BlYWtlcl9sYWJlbCBGUk9NIHBhcnRpY2lwYW50IFdIRVJFIGNvbnZlcnNhdGlvbl9pZCA9ID8gT1JERVIgQlkgQ09BTEVTQ0Uoc3BlYWtlcl9sYWJlbCwgbmFtZSksIGlkIn1dfV19fSwiYXVkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUiLCJleHAiOjE3ODM2ODUxMDAsImZjdCI6W3sieHl6LnRpbnljbG91ZC5wb2xpY3kvY2FwYWJpbGl0eUhhc2hIZXgiOiIwNGJkNTRlYTdjNTllZmRkMjEzNTFjOTc1ZDEyZGVhNzU3ODQwYTcyM2NmNTQxNzcwOWM3Y2I0YzBhYjFiMGVlIiwieHl6LnRpbnljbG91ZC5wb2xpY3kvZGVsZWdhdGlvbk1vZGUiOiJ0ZXJtaW5hbCIsInh5ei50aW55Y2xvdWQucG9saWN5L2lzc3VhbmNlSWQiOiJpc3NfbTFnMDZfMDAwMDAwMDEiLCJ4eXoudGlueWNsb3VkLnBvbGljeS9wb2xpY3lJZCI6InBvbF9tMWcwNl90cmFuc2NyaXB0IiwieHl6LnRpbnljbG91ZC5wb2xpY3kvcmV2b2NhdGlvbk1vZGUiOiJyZWZyZXNoX29ubHkifV0sImlzcyI6ImRpZDprZXk6ejZNa3FHQzNuV1poWWllRVZUVkRLVzV2NTg4Q2lHZnNEU21SVkc5Wnd3V1R2TFNLI3o2TWtxR0MzbldaaFlpZUVWVFZES1c1djU4OENpR2ZzRFNtUlZHOVp3d1dUdkxTSyIsIm5iZiI6MTc4MzY4NDgwMCwibm5jIjoibTEtZy0wNi1maXhlZC1ub25jZSIsInByZiI6WyJiYWZrcjRpZ2xpZmp0YTRmYWU1ZWN4NWpybWdyeHJ4aG96NWx1eXUzbzR2NWI3YW9mcW1mbXpnZm1heSJdfQ.nuFCoCUdZ3CIhrhYABmu5iaaPEJfGKkhsxv-j-x0q3vONMPidQZSRErvkTZxPHc5Vr9tzLZSqjarqUljBqpxDA",
+        "header": {
+          "alg": "EdDSA",
+          "typ": "JWT",
+          "ucv": "0.10.0",
+          "jwk": {
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "oJql9HpnWYAv-VX43C0qFKXJnSO-l_hkEn_5ODRVpPA",
+            "alg": "EdDSA"
+          }
+        },
+        "payload": {
+          "iss": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK#z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+          "aud": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5",
+          "nbf": 1783684800,
+          "exp": 1783685100,
+          "nnc": "m1-g-06-fixed-nonce",
+          "fct": [
+            {
+              "xyz.tinycloud.policy/delegationMode": "terminal",
+              "xyz.tinycloud.policy/policyId": "pol_m1g06_transcript",
+              "xyz.tinycloud.policy/capabilityHashHex": "04bd54ea7c59efdd21351c975d12dea757840a723cf5417709c7cb4c0ab1b0ee",
+              "xyz.tinycloud.policy/revocationMode": "refresh_only",
+              "xyz.tinycloud.policy/issuanceId": "iss_m1g06_00000001"
+            }
+          ],
+          "prf": [
+            "bafkr4iglifjta4fae5ecx5jrmgrxrxhoz5luyu3o4v5b7aofqmfmzgfmay"
+          ],
+          "att": {
+            "tinycloud:pkh:eip155:1:0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf:default/sql/xyz.tinycloud.listen/conversations": {
+              "tinycloud.kv/get": [
+                {}
+              ],
+              "tinycloud.sql/read": [
+                {
+                  "mode": "constrained-statements",
+                  "readOnly": true,
+                  "statements": [
+                    {
+                      "name": "listen.getConversation",
+                      "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+                      "fixedParams": [
+                        {
+                          "index": 0,
+                          "value": "conv_456"
+                        }
+                      ]
+                    },
+                    {
+                      "name": "listen.listParticipants",
+                      "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+                      "fixedParams": [
+                        {
+                          "index": 0,
+                          "value": "conv_456"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "signerDid": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+        "signingInputAscii": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4Ijoib0pxbDlIcG5XWUF2LVZYNDNDMHFGS1hKblNPLWxfaGtFbl81T0RSVnBQQSJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vY29udmVyc2F0aW9ucyI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dLCJ0aW55Y2xvdWQuc3FsL3JlYWQiOlt7Im1vZGUiOiJjb25zdHJhaW5lZC1zdGF0ZW1lbnRzIiwicmVhZE9ubHkiOnRydWUsInN0YXRlbWVudHMiOlt7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5nZXRDb252ZXJzYXRpb24iLCJzcWwiOiJTRUxFQ1QgaWQsIHRpdGxlLCBzb3VyY2UsIHNvdXJjZV9pZCwgc291cmNlX3VybCwgc3RhcnRlZF9hdCwgZW5kZWRfYXQsIGR1cmF0aW9uX3NlY3MsIHN1bW1hcnksIG1ldGFkYXRhLCB0cmFuc2NyaXB0X2pzb24sIHRyYW5zY3JpcHRfdGV4dCwgY3JlYXRlZF9hdCwgdXBkYXRlZF9hdCBGUk9NIGNvbnZlcnNhdGlvbiBXSEVSRSBpZCA9ID8ifSx7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5saXN0UGFydGljaXBhbnRzIiwic3FsIjoiU0VMRUNUIGlkLCBuYW1lLCBlbWFpbCwgc3BlYWtlcl9sYWJlbCBGUk9NIHBhcnRpY2lwYW50IFdIRVJFIGNvbnZlcnNhdGlvbl9pZCA9ID8gT1JERVIgQlkgQ09BTEVTQ0Uoc3BlYWtlcl9sYWJlbCwgbmFtZSksIGlkIn1dfV19fSwiYXVkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUiLCJleHAiOjE3ODM2ODUxMDAsImZjdCI6W3sieHl6LnRpbnljbG91ZC5wb2xpY3kvY2FwYWJpbGl0eUhhc2hIZXgiOiIwNGJkNTRlYTdjNTllZmRkMjEzNTFjOTc1ZDEyZGVhNzU3ODQwYTcyM2NmNTQxNzcwOWM3Y2I0YzBhYjFiMGVlIiwieHl6LnRpbnljbG91ZC5wb2xpY3kvZGVsZWdhdGlvbk1vZGUiOiJ0ZXJtaW5hbCIsInh5ei50aW55Y2xvdWQucG9saWN5L2lzc3VhbmNlSWQiOiJpc3NfbTFnMDZfMDAwMDAwMDEiLCJ4eXoudGlueWNsb3VkLnBvbGljeS9wb2xpY3lJZCI6InBvbF9tMWcwNl90cmFuc2NyaXB0IiwieHl6LnRpbnljbG91ZC5wb2xpY3kvcmV2b2NhdGlvbk1vZGUiOiJyZWZyZXNoX29ubHkifV0sImlzcyI6ImRpZDprZXk6ejZNa3FHQzNuV1poWWllRVZUVkRLVzV2NTg4Q2lHZnNEU21SVkc5Wnd3V1R2TFNLI3o2TWtxR0MzbldaaFlpZUVWVFZES1c1djU4OENpR2ZzRFNtUlZHOVp3d1dUdkxTSyIsIm5iZiI6MTc4MzY4NDgwMCwibm5jIjoibTEtZy0wNi1maXhlZC1ub25jZSIsInByZiI6WyJiYWZrcjRpZ2xpZmp0YTRmYWU1ZWN4NWpybWdyeHJ4aG96NWx1eXUzbzR2NWI3YW9mcW1mbXpnZm1heSJdfQ",
+        "signatureHex": "9ee142a0251d67708886b8580019aee6269a3c425f18a921b31bfe8fec74ab7bce34c3e2750652444aef9136713c773956bf6dccb652aa36aba9496306aa710c",
+        "delegationId": "bafkr4ie36bbhsrjielzqztlixjqtkyxld2ltfcp6no2pwuepqlmk3aq6wa",
+        "delegationIdBytesHex": "01551e209bf04279452822f30ccd68ba613562eb1e973289fe6bb4fb508f82d8ad821eb0"
+      },
+      "parentCid": "bafkr4iglifjta4fae5ecx5jrmgrxrxhoz5luyu3o4v5b7aofqmfmzgfmay"
+    }
+  ]
+}

@@ -94,6 +94,8 @@ pub enum InvocationError {
         ancestor_cid: String,
         invoked_cid: String,
     },
+    #[error("delegation-chain-traversal-limit-exceeded")]
+    ChainTraversalLimitExceeded,
     /// W1: invocation caveats are not a subset of the chain's caveats — the
     /// invoker tried to widen or replace a constrained-statements caveat
     /// the delegation chain carried (audit P0 finding 1, applied at the
@@ -109,7 +111,7 @@ pub(crate) async fn process<C: ConnectionTrait>(
     encryption: Option<&ColumnEncryption>,
 ) -> Result<Hash, Error> {
     let (i, serialized) = (invocation.0, invocation.1);
-    verify(&i.invocation).await?;
+    verify_invocation(&i.invocation).await?;
 
     let now = OffsetDateTime::now_utc();
     validate(db, &i, Some(now)).await?;
@@ -117,7 +119,7 @@ pub(crate) async fn process<C: ConnectionTrait>(
     save(db, i, Some(now), serialized, ops, encryption).await
 }
 
-async fn verify(invocation: &TinyCloudInvocation) -> Result<(), Error> {
+pub async fn verify_invocation(invocation: &TinyCloudInvocation) -> Result<(), Error> {
     tokio::time::timeout(
         did_resolution_timeout(),
         invocation
@@ -132,6 +134,17 @@ async fn verify(invocation: &TinyCloudInvocation) -> Result<(), Error> {
         .validate_time(None)
         .map_err(|_| InvocationError::InvalidTime)?;
     Ok(())
+}
+
+/// Verify an invocation and authorize its capabilities against the persisted
+/// delegation chain without recording an invocation event.
+pub async fn verify_and_authorize<C: ConnectionTrait>(
+    db: &C,
+    invocation: &util::InvocationInfo,
+    now: OffsetDateTime,
+) -> Result<(), Error> {
+    verify_invocation(&invocation.invocation).await?;
+    validate(db, invocation, Some(now)).await
 }
 
 // verify parenthood and authorization
@@ -168,6 +181,10 @@ async fn validate<C: ConnectionTrait>(
                 .all(db)
                 .await?;
 
+            if parents.len() != invocation.parents.len() {
+                return Err(InvocationError::MissingParents.into());
+            }
+
             // check parent identifies correct invoker
             for (p, _) in &parents {
                 if !did_principal_matches(&p.delegatee, &invocation.invoker) {
@@ -183,17 +200,64 @@ async fn validate<C: ConnectionTrait>(
             // NOT cache "chain ok" across the revocation event
             // (revocation.md §2.3).
             for (p, _) in &parents {
-                if is_revoked(db, &p.id).await? {
+                if revocation::is_revoked(db, &p.id).await? {
                     return Err(
                         InvocationError::DelegationRevoked(p.id.to_cid(0x55).to_string()).into(),
                     );
                 }
-                if let Some(ancestor_cid) = first_revoked_ancestor(db, &p.id).await? {
+                let revoked_ancestor = revocation::first_revoked_ancestor(db, &p.id)
+                    .await
+                    .map_err(|error| match error {
+                        revocation::ChainTraversalError::Db(error) => Error::Db(error),
+                        revocation::ChainTraversalError::LimitExceeded => {
+                            Error::InvalidInvocation(InvocationError::ChainTraversalLimitExceeded)
+                        }
+                    })?;
+                if let Some(ancestor_cid) = revoked_ancestor {
                     return Err(InvocationError::DelegationAncestorRevoked {
                         ancestor_cid,
                         invoked_cid: p.id.to_cid(0x55).to_string(),
                     }
                     .into());
+                }
+
+                // A child capability cannot outlive or predate any delegation
+                // in the chain that authorizes it. Validate the effective
+                // chain window, not only the directly cited leaf.
+                let chain_ids = revocation::ancestor_chain_ids(db, &p.id).await.map_err(
+                    |error| match error {
+                        revocation::ChainTraversalError::Db(error) => Error::Db(error),
+                        revocation::ChainTraversalError::LimitExceeded => {
+                            Error::InvalidInvocation(InvocationError::ChainTraversalLimitExceeded)
+                        }
+                    },
+                )?;
+                let chain = delegation::Entity::find()
+                    .filter(delegation::Column::Id.is_in(chain_ids.iter().copied()))
+                    .all(db)
+                    .await?;
+                if chain.len() != chain_ids.len() {
+                    return Err(InvocationError::MissingParents.into());
+                }
+                let chain_now = time.unwrap_or_else(OffsetDateTime::now_utc);
+                if chain.iter().any(|ancestor| {
+                    ancestor
+                        .expiry
+                        .map(|expiry| chain_now >= expiry)
+                        .unwrap_or(false)
+                        || ancestor
+                            .not_before
+                            .map(|not_before| chain_now < not_before)
+                            .unwrap_or(false)
+                }) {
+                    return match dependant_caps.first() {
+                        Some(capability) => Err(InvocationError::UnauthorizedAction(
+                            capability.resource.clone(),
+                            capability.ability.clone(),
+                        )
+                        .into()),
+                        None => Err(InvocationError::MissingParents.into()),
+                    };
                 }
             }
 
@@ -216,10 +280,23 @@ async fn validate<C: ConnectionTrait>(
             // the persisted chain ability row already has a matching or
             // stricter caveat.
             for c in &dependant_caps {
+                // TC-119: ability containment is registry-aware. A parent
+                // ability supports the invoked ability when it is equal OR a
+                // registry-declared alias (`kv/delete`↔`kv/del`) OR implies it
+                // (`sql/admin` ⊃ `sql/schema`; `sql/*` ⊃ every sql action).
+                // This is a strict widening of the previous `c.ability ==
+                // pc.ability`: exact matches still match, only registry
+                // alias/implication pairs are added.
                 let mut candidates = parents
                     .iter()
                     .flat_map(|(_, a)| a)
-                    .filter(|pc| c.resource.extends(&pc.resource) && c.ability == pc.ability)
+                    .filter(|pc| {
+                        c.resource.extends(&pc.resource)
+                            && crate::policy_capability::ability_matches(
+                                pc.ability.as_ref().as_ref(),
+                                c.ability.as_ref().as_ref(),
+                            )
+                    })
                     .peekable();
 
                 if candidates.peek().is_none() {
@@ -289,43 +366,6 @@ fn extract_sql_caveat(
         }
     }
     None
-}
-
-/// True if `delegation_id` has an active revocation row.
-async fn is_revoked<C: ConnectionTrait>(db: &C, delegation_id: &Hash) -> Result<bool, DbErr> {
-    let n = revocation::Entity::find()
-        .filter(revocation::Column::Revoked.eq(*delegation_id))
-        .count(db)
-        .await?;
-    Ok(n > 0)
-}
-
-/// Walk a chain transitively from `start` toward the root via the
-/// parent_delegations table and return the first revoked ancestor's CID, if
-/// any. Stops at the first hit; otherwise returns None.
-async fn first_revoked_ancestor<C: ConnectionTrait>(
-    db: &C,
-    start: &Hash,
-) -> Result<Option<String>, DbErr> {
-    let mut frontier: Vec<Hash> = vec![*start];
-    let mut visited: std::collections::HashSet<Hash> = std::collections::HashSet::new();
-    while let Some(current) = frontier.pop() {
-        if !visited.insert(current) {
-            continue;
-        }
-        let parents = parent_delegations::Entity::find()
-            .filter(parent_delegations::Column::Child.eq(current))
-            .all(db)
-            .await?;
-        for link in parents {
-            let parent_id = link.parent;
-            if is_revoked(db, &parent_id).await? {
-                return Ok(Some(parent_id.to_cid(0x55).to_string()));
-            }
-            frontier.push(parent_id);
-        }
-    }
-    Ok(None)
 }
 
 fn is_root_authority(cap: &util::Capability, invoker: &str) -> bool {
@@ -615,7 +655,71 @@ async fn enqueue_kv_webhook_deliveries<C: ConnectionTrait>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migrations::Migrator;
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database};
+    use sea_orm_migration::MigratorTrait;
     use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn existing_child_chain_is_rejected_after_parent_revocation() {
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+
+        for actor_id in ["did:key:owner", "did:key:parent", "did:key:child"] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        let parent_id = crate::hash::hash(b"parent");
+        let child_id = crate::hash::hash(b"existing-child");
+        for (id, delegator, delegatee) in [
+            (parent_id, "did:key:owner", "did:key:parent"),
+            (child_id, "did:key:parent", "did:key:child"),
+        ] {
+            delegation::ActiveModel {
+                id: Set(id),
+                delegator: Set(delegator.to_string()),
+                delegatee: Set(delegatee.to_string()),
+                expiry: Set(None),
+                issued_at: Set(None),
+                not_before: Set(None),
+                facts: Set(None),
+                serialization: Set(id.as_ref().to_vec()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        parent_delegations::ActiveModel {
+            parent: Set(parent_id),
+            child: Set(child_id),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        revocation::ActiveModel {
+            id: Set(crate::hash::hash(b"revocation")),
+            revoker: Set("did:key:owner".to_string()),
+            revoked: Set(parent_id),
+            serialization: Set(b"revocation".to_vec()),
+            revoked_at: Set(Some(OffsetDateTime::now_utc())),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            revocation::first_revoked_ancestor(&db, &child_id)
+                .await
+                .unwrap(),
+            Some(parent_id.to_cid(0x55).to_string())
+        );
+    }
 
     #[test]
     fn kv_webhook_payload_serializes_with_type_field() {

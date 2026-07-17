@@ -222,7 +222,6 @@ pub struct SpacesConfig {
 pub struct SqlStorageConfig {
     #[serde(default)]
     pub path: Option<String>,
-    pub limit: Option<ByteUnit>,
     #[serde(default = "default_sql_memory_threshold")]
     pub memory_threshold: ByteUnit,
 }
@@ -235,7 +234,6 @@ impl Default for SqlStorageConfig {
     fn default() -> Self {
         Self {
             path: None,
-            limit: None,
             memory_threshold: default_sql_memory_threshold(),
         }
     }
@@ -245,7 +243,6 @@ impl Default for SqlStorageConfig {
 pub struct DuckDbStorageConfig {
     #[serde(default)]
     pub path: Option<String>,
-    pub limit: Option<ByteUnit>,
     #[serde(default = "default_duckdb_memory_threshold")]
     pub memory_threshold: ByteUnit,
     #[serde(default = "default_duckdb_idle_timeout")]
@@ -270,7 +267,6 @@ impl Default for DuckDbStorageConfig {
     fn default() -> Self {
         Self {
             path: None,
-            limit: None,
             memory_threshold: default_duckdb_memory_threshold(),
             idle_timeout_secs: default_duckdb_idle_timeout(),
             max_memory_per_connection: default_duckdb_max_memory(),

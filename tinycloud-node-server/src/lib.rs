@@ -47,9 +47,9 @@ use node_control::{
 };
 use quota::QuotaCache;
 use routes::{
-    admin::{delete_quota, get_quota, list_quotas, set_quota},
+    admin::{delete_quota, get_quota, get_usage, list_quotas, set_quota},
     attestation::attestation,
-    create_signed_kv_url, delegate,
+    create_signed_kv_url, delegate, delegation_query, delegation_status,
     encryption::{
         create_network as create_encryption_network, decrypt as encryption_decrypt,
         get_network as get_encryption_network, revoke_network as revoke_encryption_network,
@@ -70,11 +70,12 @@ use tee::TeeContext;
 #[cfg(feature = "duckdb")]
 use tinycloud_core::duckdb::DuckDbService;
 use tinycloud_core::{
-    database_artifacts::SeaOrmDatabaseArtifactRepository,
+    database_artifacts::{DatabaseArtifactRepository, SeaOrmDatabaseArtifactRepository},
     encryption_network::{EncryptionService, LocalOneOfOneBackend},
     keys::{SecretsSetup, StaticSecret},
     sea_orm::{ConnectOptions, Database, DatabaseConnection},
     sql::SqlService,
+    sql_sizes::{SizeTrackingArtifactRepository, SqlSizes},
     storage::{either::Either, memory::MemoryStaging, StorageConfig},
     ColumnEncryption, SpaceDatabase,
 };
@@ -144,6 +145,8 @@ pub async fn app(
         open_host_key,
         invoke,
         delegate,
+        delegation_query,
+        delegation_status,
         revoke,
         create_signed_kv_url,
         signed_kv_get,
@@ -161,6 +164,7 @@ pub async fn app(
         delete_quota,
         get_quota,
         list_quotas,
+        get_usage,
         create_encryption_network,
         get_encryption_network,
         encryption_well_known,
@@ -242,9 +246,17 @@ pub async fn app(
     }
 
     let database_connection = Database::connect(connect_opts).await?;
-    let database_artifact_repository = Arc::new(SeaOrmDatabaseArtifactRepository::new(
+    // SQL/DuckDB artifact-size mirror folded into `store_size`. Empty here;
+    // wired into the decorator + SpaceDatabase BEFORE migrations, then seeded
+    // from DB truth AFTER `TinyCloud::new` runs migrations (see below).
+    let sql_sizes = SqlSizes::new();
+    let seed_conn = database_connection.clone();
+    let raw_artifact_repository = Arc::new(SeaOrmDatabaseArtifactRepository::new(
         database_connection.clone(),
     ));
+    let database_artifact_repository: Arc<dyn DatabaseArtifactRepository> = Arc::new(
+        SizeTrackingArtifactRepository::new(raw_artifact_repository, sql_sizes.clone()),
+    );
 
     // Encryption module: seal network private keys with the same kind of derived
     // key used for DB column encryption. In DStack mode the seal is rooted in
@@ -266,7 +278,13 @@ pub async fn app(
         key_setup.setup(()).await?,
     )
     .await?
-    .with_encryption(Some(webhook_encryption.clone()));
+    .with_encryption(Some(webhook_encryption.clone()))
+    .with_sql_sizes(sql_sizes.clone());
+
+    // Seed the SQL-size mirror AFTER `TinyCloud::new` ran migrations — the
+    // `database_artifact` table now exists (seeding before migrations would
+    // fail boot on a fresh datadir). Runs before Rocket serves any request.
+    sql_sizes.seed_from(&seed_conn).await?;
 
     let sql_service = SqlService::new(
         tinycloud_config.storage.sql.path.clone().expect("resolved"),

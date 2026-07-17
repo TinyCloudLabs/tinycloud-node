@@ -79,6 +79,71 @@
         "path": "notebooks/",
         "actions": []
       }
+    },
+    {
+      "name": "sql-ddl-rejected-not-in-registry",
+      "rejection_code": "policy-capability-malformed-action",
+      "reason": "sql/ddl is rejected by the node parser and is absent from the registry.",
+      "input": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/ddl"
+        ]
+      }
+    },
+    {
+      "name": "sql-execute-phantom-rejected",
+      "rejection_code": "policy-capability-malformed-action",
+      "reason": "No tinycloud.sql/execute URN dispatch: the node routes on the SqlRequest body kind (Execute/Query/Export) gated by sql/read|write|admin, not on a sql/execute ability. Absent from the registry.",
+      "input": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/execute"
+        ]
+      }
+    },
+    {
+      "name": "duckdb-execute-phantom-rejected",
+      "rejection_code": "policy-capability-malformed-action",
+      "reason": "No tinycloud.duckdb/execute URN dispatch: the node routes on the DuckDbRequest body kind gated by duckdb/read|write|admin, not on a duckdb/execute ability. Absent from the registry.",
+      "input": {
+        "service": "tinycloud.duckdb",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.duckdb/execute"
+        ]
+      }
+    },
+    {
+      "name": "sql-insert-rejected-not-in-registry",
+      "rejection_code": "policy-capability-malformed-action",
+      "reason": "tinycloud.sql/insert was never parse-accepted by the v0 contract and is absent from the registry (not reserved). Reserving it would newly widen the policy boundary, so it must be rejected at parse.",
+      "input": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/insert"
+        ]
+      }
+    },
+    {
+      "name": "sql-update-rejected-not-in-registry",
+      "rejection_code": "policy-capability-malformed-action",
+      "reason": "tinycloud.sql/update was never parse-accepted by the v0 contract and is absent from the registry (not reserved). Reserving it would newly widen the policy boundary, so it must be rejected at parse.",
+      "input": {
+        "service": "tinycloud.sql",
+        "space": "applications",
+        "path": "main.db",
+        "actions": [
+          "tinycloud.sql/update"
+        ]
+      }
     }
   ]
 }

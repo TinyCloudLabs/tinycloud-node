@@ -13,6 +13,7 @@
 // Crucially, this module has ZERO dependency on policy evaluation or VC
 // verification — it is the native contract types only.
 
+pub mod generated;
 pub mod jcs;
 pub mod sql_caveat;
 
@@ -26,31 +27,44 @@ pub use sql_caveat::SqlConstrainedStatementCaveat;
 /// (0x00) is part of the hash input — do not strip it.
 pub const POLICY_CAPABILITY_DOMAIN: &[u8] = b"xyz.tinycloud.policy/PolicyCapability/v0\0";
 
-/// The v0 accepted action set per service. See policy-capability.md §4.
+/// The accepted action set per service. Sourced from the canonical capability
+/// registry (`capabilities.json`) via generated code (TC-112) — do not
+/// hand-edit; change the registry and rerun `scripts/gen-capabilities.mjs`.
 pub fn accepted_actions(service: &str) -> Option<&'static [&'static str]> {
-    match service {
-        "tinycloud.kv" => Some(&[
-            "tinycloud.kv/get",
-            "tinycloud.kv/list",
-            "tinycloud.kv/metadata",
-            "tinycloud.kv/put",
-            "tinycloud.kv/delete",
-        ]),
-        "tinycloud.sql" => Some(&[
-            "tinycloud.sql/read",
-            "tinycloud.sql/select",
-            "tinycloud.sql/schema",
-            "tinycloud.sql/write",
-        ]),
-        "tinycloud.vfs" => Some(&[
-            "tinycloud.vfs/get",
-            "tinycloud.vfs/list",
-            "tinycloud.vfs/metadata",
-            "tinycloud.vfs/put",
-            "tinycloud.vfs/delete",
-        ]),
-        _ => None,
-    }
+    generated::accepted_actions(service)
+}
+
+/// Resolve a deprecated-alias action URN to its canonical form (registry
+/// SSOT — e.g. `tinycloud.kv/delete` → `tinycloud.kv/del`). Identity for
+/// canonical or unknown URNs. Re-exported so the live wire paths (invocation
+/// dispatch, exact-tier authorization gates) resolve aliases the *same* way
+/// the containment engine does, instead of hand-maintaining alias lists.
+pub fn resolve_alias(action: &str) -> &str {
+    generated::resolve_alias(action)
+}
+
+/// Does holding `held` satisfy a requirement for `required`, accounting for
+/// deprecated-alias equivalence and implication expansion exactly as the
+/// registry declares — and nothing more (TC-119)?
+///
+/// This is the single capability-comparison primitive for the live wire
+/// paths: UCAN delegation/invocation chain containment and the per-service
+/// authorization gates (SQL/DuckDB parsers, the rusqlite authorizer, the
+/// route-level admin checks). It is a strict *widening* of byte equality:
+///
+///   * when `held == required` it always returns `true` (so every request
+///     authorized before this change is still authorized), and
+///   * it returns `true` for additional pairs ONLY where the registry
+///     declares an alias (`kv/delete`↔`kv/del`, `sql/select`↔`sql/read`,
+///     `duckdb/select`↔`duckdb/read`) or an implication (`sql/admin` ⊃
+///     `sql/schema`; `sql/*` / `duckdb/*` ⊃ every action for their service).
+///
+/// For URNs the registry does not know it degrades to exact string equality,
+/// so it never widens anything the registry has not declared. Stored URNs are
+/// never rewritten; only the comparison is registry-aware, so persisted
+/// capability rows, hashes, and serialized formats are unaffected.
+pub fn ability_matches(held: &str, required: &str) -> bool {
+    expand_actions(std::iter::once(held)).contains(generated::resolve_alias(required))
 }
 
 /// PolicyCapability — resolved authority shape used by ceilings, requested
@@ -339,8 +353,14 @@ impl PolicyCapability {
         if !path_contains(&self.service, &self.path, &req.path) {
             return Err(RejectionCode::ContainmentPathMismatch);
         }
+        // Action subset with registry-aware equivalence: aliases (e.g.
+        // kv/delete↔kv/del, sql/select↔sql/read) and implications (e.g.
+        // sql/admin ⊃ sql/schema) are resolved so a grant minted with either
+        // form authorizes both. Stored actions are never rewritten — only the
+        // comparison is registry-aware, so capability hashes are unaffected.
+        let granted = expand_granted_actions(&self.actions);
         for a in &req.actions {
-            if !self.actions.iter().any(|x| x == a) {
+            if !granted.contains(generated::resolve_alias(a)) {
                 return Err(RejectionCode::ContainmentActionNotSubset);
             }
         }
@@ -357,6 +377,31 @@ impl PolicyCapability {
         }
         Ok(())
     }
+}
+
+/// Build the set of canonical action URNs a set of held actions authorizes,
+/// resolving deprecated aliases to their canonical form and expanding
+/// implications (e.g. `sql/admin` pulls in `sql/schema`) transitively. Used
+/// by both the containment subset check and `ability_matches`; it never
+/// mutates stored actions or hashes.
+fn expand_actions<'a>(
+    actions: impl IntoIterator<Item = &'a str>,
+) -> std::collections::HashSet<&'a str> {
+    let mut out: std::collections::HashSet<&'a str> = std::collections::HashSet::new();
+    let mut stack: Vec<&'a str> = actions.into_iter().collect();
+    while let Some(action) = stack.pop() {
+        let canonical = generated::resolve_alias(action);
+        if out.insert(canonical) {
+            for implied in generated::implied_actions(canonical) {
+                stack.push(implied);
+            }
+        }
+    }
+    out
+}
+
+fn expand_granted_actions(actions: &[String]) -> std::collections::HashSet<&str> {
+    expand_actions(actions.iter().map(String::as_str))
 }
 
 /// Path containment per service. For KV/VFS, a trailing-slash auth.path is a
@@ -609,5 +654,285 @@ mod tests {
                 assert_eq!(err.as_str(), "sql-write-blocked");
             }
         }
+    }
+
+    // --- TC-112 registry / codegen drift guards ---
+
+    const REGISTRY_JSON: &str = include_str!("../../../capabilities.json");
+
+    #[derive(Deserialize)]
+    struct RegistryEntry {
+        urn: String,
+        service: String,
+        status: String,
+        #[serde(rename = "aliasOf", default)]
+        alias_of: Option<String>,
+        #[serde(default)]
+        implies: Vec<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct Registry {
+        version: u32,
+        capabilities: Vec<RegistryEntry>,
+    }
+
+    /// The generated Rust module must agree with the checked-in registry. This
+    /// catches a stale `generated.rs` (someone edited `capabilities.json`
+    /// without rerunning `scripts/gen-capabilities.mjs`) at `cargo test` time,
+    /// independent of the Node-side `--check` in CI.
+    #[test]
+    fn generated_module_matches_registry() {
+        let registry: Registry = serde_json::from_str(REGISTRY_JSON).unwrap();
+        assert_eq!(generated::REGISTRY_VERSION, registry.version);
+
+        // Every accepted-actions entry is exactly the registry's URNs for that
+        // service, sorted, with no extras.
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut by_service: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for e in &registry.capabilities {
+            assert!(
+                e.urn.starts_with(&format!("{}/", e.service)),
+                "urn {} does not match service {}",
+                e.urn,
+                e.service
+            );
+            by_service
+                .entry(e.service.as_str())
+                .or_default()
+                .insert(e.urn.as_str());
+        }
+        for (service, urns) in &by_service {
+            let accepted = generated::accepted_actions(service)
+                .unwrap_or_else(|| panic!("service {service} missing from generated module"));
+            let accepted_set: BTreeSet<&str> = accepted.iter().copied().collect();
+            let expected_set: BTreeSet<&str> = urns.iter().copied().collect();
+            assert_eq!(
+                &accepted_set, &expected_set,
+                "accepted mismatch for {service}"
+            );
+            // sorted invariant
+            let mut sorted = accepted.to_vec();
+            sorted.sort_unstable();
+            assert_eq!(accepted, sorted.as_slice(), "{service} not sorted");
+        }
+
+        // Alias + implication tables round-trip against the registry.
+        for e in &registry.capabilities {
+            match e.status.as_str() {
+                "deprecated-alias" => {
+                    let alias_of = e.alias_of.as_deref().expect("alias missing aliasOf");
+                    assert_eq!(
+                        generated::resolve_alias(&e.urn),
+                        alias_of,
+                        "resolve_alias mismatch for {}",
+                        e.urn
+                    );
+                }
+                _ => {
+                    assert_eq!(
+                        generated::resolve_alias(&e.urn),
+                        e.urn,
+                        "{} should not resolve to an alias",
+                        e.urn
+                    );
+                }
+            }
+            let implied: BTreeSet<&str> =
+                generated::implied_actions(&e.urn).iter().copied().collect();
+            let expected: BTreeSet<&str> = e.implies.iter().map(String::as_str).collect();
+            assert_eq!(implied, expected, "implied mismatch for {}", e.urn);
+        }
+    }
+
+    /// The canonical decisions from the TC-112 audit, asserted directly so a
+    /// registry edit that flips one is caught here with a clear message.
+    #[test]
+    fn canonical_decisions_are_locked() {
+        assert_eq!(
+            resolve_alias_via_generated("tinycloud.kv/delete"),
+            "tinycloud.kv/del"
+        );
+        assert_eq!(
+            resolve_alias_via_generated("tinycloud.sql/select"),
+            "tinycloud.sql/read"
+        );
+        assert_eq!(
+            generated::implied_actions("tinycloud.sql/admin"),
+            &["tinycloud.sql/schema"]
+        );
+        // kv/del is canonical (not an alias); kv/delete resolves onto it.
+        assert_eq!(
+            resolve_alias_via_generated("tinycloud.kv/del"),
+            "tinycloud.kv/del"
+        );
+        // vfs stays accepted (reserved) so it never regresses to unknown-service.
+        assert!(accepted_actions("tinycloud.vfs").is_some());
+
+        // Per-service wildcards expand (via implication) to every concrete
+        // action for the service, so a wildcard grant authorizes any request.
+        let sql_star_grant = ["tinycloud.sql/*".to_string()];
+        let sql_star = expand_granted_actions(&sql_star_grant);
+        for a in [
+            "tinycloud.sql/read",
+            "tinycloud.sql/write",
+            "tinycloud.sql/schema",
+            "tinycloud.sql/admin",
+        ] {
+            assert!(sql_star.contains(a), "sql/* should expand to include {a}");
+        }
+        let duckdb_star_grant = ["tinycloud.duckdb/*".to_string()];
+        let duckdb_star = expand_granted_actions(&duckdb_star_grant);
+        for a in [
+            "tinycloud.duckdb/read",
+            "tinycloud.duckdb/write",
+            "tinycloud.duckdb/admin",
+            "tinycloud.duckdb/import",
+            "tinycloud.duckdb/export",
+        ] {
+            assert!(
+                duckdb_star.contains(a),
+                "duckdb/* should expand to include {a}"
+            );
+        }
+    }
+
+    fn resolve_alias_via_generated(a: &str) -> &str {
+        generated::resolve_alias(a)
+    }
+
+    // --- TC-119: `ability_matches` (the live-wire comparison primitive) ---
+
+    #[test]
+    fn ability_matches_is_reflexive_over_every_registry_action() {
+        // Monotonicity floor: for EVERY URN the registry knows, holding it
+        // satisfies a request for the same URN. This is the property the wire
+        // paths rely on (every previously-authorized exact match still holds).
+        let registry: Registry = serde_json::from_str(REGISTRY_JSON).unwrap();
+        for e in &registry.capabilities {
+            assert!(
+                ability_matches(&e.urn, &e.urn),
+                "{} must match itself",
+                e.urn
+            );
+        }
+    }
+
+    #[test]
+    fn ability_matches_resolves_aliases_both_directions() {
+        // A grant in either the canonical or the deprecated-alias form must
+        // authorize a request in either form.
+        for (canonical, alias) in [
+            ("tinycloud.kv/del", "tinycloud.kv/delete"),
+            ("tinycloud.sql/read", "tinycloud.sql/select"),
+            ("tinycloud.duckdb/read", "tinycloud.duckdb/select"),
+        ] {
+            assert!(ability_matches(alias, canonical), "{alias} ⊇ {canonical}");
+            assert!(ability_matches(canonical, alias), "{canonical} ⊇ {alias}");
+            assert!(ability_matches(alias, alias));
+            assert!(ability_matches(canonical, canonical));
+        }
+    }
+
+    #[test]
+    fn ability_matches_expands_implications_one_directionally() {
+        // admin ⊃ schema (TC-109), but schema does NOT confer admin, and admin
+        // does NOT confer write (the registry only declares admin ⊃ schema).
+        assert!(ability_matches(
+            "tinycloud.sql/admin",
+            "tinycloud.sql/schema"
+        ));
+        assert!(!ability_matches(
+            "tinycloud.sql/schema",
+            "tinycloud.sql/admin"
+        ));
+        assert!(!ability_matches(
+            "tinycloud.sql/admin",
+            "tinycloud.sql/write"
+        ));
+        assert!(!ability_matches(
+            "tinycloud.sql/admin",
+            "tinycloud.sql/read"
+        ));
+        // DuckDB admin implies nothing (only the wildcard does).
+        assert!(!ability_matches(
+            "tinycloud.duckdb/admin",
+            "tinycloud.duckdb/write"
+        ));
+        assert!(!ability_matches(
+            "tinycloud.duckdb/admin",
+            "tinycloud.duckdb/read"
+        ));
+    }
+
+    #[test]
+    fn ability_matches_wildcard_covers_every_service_action() {
+        for req in [
+            "tinycloud.sql/read",
+            "tinycloud.sql/write",
+            "tinycloud.sql/schema",
+            "tinycloud.sql/admin",
+            "tinycloud.sql/select", // alias resolves under the wildcard too
+        ] {
+            assert!(
+                ability_matches("tinycloud.sql/*", req),
+                "sql/* must confer {req}"
+            );
+        }
+        for req in [
+            "tinycloud.duckdb/read",
+            "tinycloud.duckdb/write",
+            "tinycloud.duckdb/admin",
+            "tinycloud.duckdb/import",
+            "tinycloud.duckdb/export",
+        ] {
+            assert!(
+                ability_matches("tinycloud.duckdb/*", req),
+                "duckdb/* must confer {req}"
+            );
+        }
+        // Wildcards never cross service boundaries.
+        assert!(!ability_matches("tinycloud.sql/*", "tinycloud.duckdb/read"));
+        assert!(!ability_matches("tinycloud.duckdb/*", "tinycloud.sql/read"));
+    }
+
+    #[test]
+    fn ability_matches_rejects_unrelated_and_lower_tiers() {
+        // read does not confer write; a wildcard req is never satisfied by a
+        // concrete grant; distinct kv actions do not cross-authorize.
+        assert!(!ability_matches(
+            "tinycloud.sql/read",
+            "tinycloud.sql/write"
+        ));
+        assert!(!ability_matches("tinycloud.sql/write", "tinycloud.sql/*"));
+        assert!(!ability_matches("tinycloud.kv/get", "tinycloud.kv/put"));
+        assert!(!ability_matches("tinycloud.kv/get", "tinycloud.kv/del"));
+    }
+
+    #[test]
+    fn ability_matches_degrades_to_exact_equality_off_registry() {
+        // For URNs the registry does not model, `ability_matches` is exactly
+        // string equality — it never widens anything undeclared.
+        assert!(ability_matches(
+            "tinycloud.encryption/decrypt",
+            "tinycloud.encryption/decrypt"
+        ));
+        assert!(!ability_matches(
+            "tinycloud.encryption/decrypt",
+            "tinycloud.encryption/network.create"
+        ));
+        assert!(ability_matches(
+            "totally.unknown/thing",
+            "totally.unknown/thing"
+        ));
+        assert!(!ability_matches("totally.unknown/a", "totally.unknown/b"));
+    }
+
+    #[test]
+    fn resolve_alias_reexport_matches_generated() {
+        assert_eq!(resolve_alias("tinycloud.kv/delete"), "tinycloud.kv/del");
+        assert_eq!(resolve_alias("tinycloud.kv/del"), "tinycloud.kv/del");
+        assert_eq!(resolve_alias("tinycloud.sql/select"), "tinycloud.sql/read");
+        assert_eq!(resolve_alias("unknown/x"), "unknown/x");
     }
 }

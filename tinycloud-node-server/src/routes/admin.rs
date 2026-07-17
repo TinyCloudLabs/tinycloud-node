@@ -61,6 +61,23 @@ pub struct QuotaListResponse {
     pub default_limit_bytes: Option<u64>,
 }
 
+#[derive(Serialize)]
+pub struct SpaceUsage {
+    pub space_id: String,
+    pub usage_bytes: Option<u64>,
+}
+
+#[derive(Serialize)]
+pub struct UsageResponse {
+    pub spaces: Vec<SpaceUsage>,
+    pub count: usize,
+}
+
+/// Set an admin quota override for a space.
+///
+/// Overrides are held in memory only and DO NOT survive a node restart
+/// (tracked in issue #104) — re-apply them after deploys, or set durable
+/// limits through the billing sidecar instead.
 #[put("/admin/quota/<space_id>", data = "<body>")]
 pub async fn set_quota(
     _auth: AdminAuth,
@@ -80,6 +97,11 @@ pub async fn set_quota(
     }))
 }
 
+/// Drop a space's admin override and mark any remote-cached limit stale.
+///
+/// The billing sidecar calls this after a plan change: the stale value is
+/// served for at most one more write while the node refreshes the limit in
+/// the background (writes are never blocked on the quota service).
 #[delete("/admin/quota/<space_id>")]
 pub async fn delete_quota(
     _auth: AdminAuth,
@@ -110,7 +132,18 @@ pub async fn get_quota(
         .parse()
         .map_err(|_| (Status::BadRequest, "Invalid space ID".into()))?;
     let override_bytes = quota_cache.get_override(&sid).await;
-    let effective = quota_cache.get_limit(&sid).await.map(|l| l.as_u64());
+    // Never resolve via get_limit() here: it pulls from the remote quota
+    // service, and that service calls this endpoint per owned space to compute
+    // usage — on a cold cache the two recurse into a mutual-call storm.
+    // Report only what is already known locally (override/cached, else the
+    // env default).
+    let effective = match override_bytes {
+        Some(b) => Some(b),
+        None => match quota_cache.get_cached_remote(&sid).await {
+            Some(b) => Some(b),
+            None => quota_cache.default_limit().map(|l| l.as_u64()),
+        },
+    };
     let usage = tinycloud
         .store_size(&sid)
         .await
@@ -133,4 +166,85 @@ pub async fn list_quotas(
         overrides,
         default_limit_bytes: quota_cache.default_limit().map(|l| l.as_u64()),
     })
+}
+
+/// Enumerate every space on the node with its authoritative metered usage
+/// (`store_size`: KV block bytes + SQL/DuckDB artifact bytes, per #89).
+/// Sorted by usage descending, with unknown (`null`) usage last. No
+/// pagination: with a few hundred spaces this is a single pass.
+#[get("/admin/usage")]
+pub async fn get_usage(
+    _auth: AdminAuth,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Json<UsageResponse>, (Status, String)> {
+    let space_ids = tinycloud
+        .list_space_ids()
+        .await
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+
+    let mut spaces = Vec::with_capacity(space_ids.len());
+    for sid in space_ids {
+        let usage = tinycloud
+            .store_size(&sid)
+            .await
+            .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+        spaces.push(SpaceUsage {
+            space_id: sid.to_string(),
+            usage_bytes: usage,
+        });
+    }
+
+    // Descending by usage; `None` (unknown) sorts last.
+    sort_usage_desc_nulls_last(&mut spaces);
+
+    let count = spaces.len();
+    Ok(Json(UsageResponse { spaces, count }))
+}
+
+/// Sort spaces by usage descending, with unknown (`None`) usage last.
+fn sort_usage_desc_nulls_last(spaces: &mut [SpaceUsage]) {
+    spaces.sort_by(|a, b| match (a.usage_bytes, b.usage_bytes) {
+        (Some(x), Some(y)) => y.cmp(&x),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn su(space_id: &str, usage_bytes: Option<u64>) -> SpaceUsage {
+        SpaceUsage {
+            space_id: space_id.to_string(),
+            usage_bytes,
+        }
+    }
+
+    #[tokio::test]
+    async fn sort_orders_desc_with_nulls_last() {
+        let mut spaces = vec![
+            su("a", Some(10)),
+            su("b", None),
+            su("c", Some(100)),
+            su("d", None),
+            su("e", Some(50)),
+        ];
+        sort_usage_desc_nulls_last(&mut spaces);
+        let order: Vec<(&str, Option<u64>)> = spaces
+            .iter()
+            .map(|s| (s.space_id.as_str(), s.usage_bytes))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("c", Some(100)),
+                ("e", Some(50)),
+                ("a", Some(10)),
+                ("b", None),
+                ("d", None),
+            ]
+        );
+    }
 }

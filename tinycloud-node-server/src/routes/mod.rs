@@ -1,8 +1,8 @@
 use anyhow::Result;
 use futures::io::AsyncWriteExt;
 use percent_encoding::percent_decode_str;
-use rocket::{data::ToByteUnit, http::Status, serde::json::Json, State};
-use serde::Serialize;
+use rocket::{data::ToByteUnit, http::Status, response::status::Custom, serde::json::Json, State};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     time::Instant,
@@ -35,15 +35,19 @@ use tinycloud_core::duckdb::{
 use tinycloud_core::{
     encryption_network::EncryptionService,
     events::Invocation,
-    models::{hook_delivery, hook_subscription, kv_delete, kv_write},
-    sea_orm::DbErr,
-    sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder},
+    models::{
+        hook_delivery, hook_subscription, invocation as invocation_model, kv_delete, kv_write,
+    },
+    sea_orm::{
+        error::{RuntimeErr, SqlxError},
+        ColumnTrait, DbErr, EntityTrait, QueryFilter, QueryOrder,
+    },
     sql::{SqlCaveats, SqlError, SqlRequest, SqlService},
     storage::{HashBuffer, ImmutableReadStore, ImmutableStaging},
-    types::{Ability, Metadata, Resource},
+    types::{Ability, DelegationQuery, DelegationQueryPage, Metadata, Resource},
     util::{Capability, DelegationInfo, InvocationInfo, RevocationInfo},
     write_hooks::{db_table_path, hook_delivery_id, subscription_matches_event, TouchedTables},
-    InvocationOutcome, TransactResult, TxError, TxStoreError,
+    DelegationStatus, InvocationOutcome, TransactResult, TxError, TxStoreError,
 };
 
 pub mod admin;
@@ -53,6 +57,32 @@ pub mod hooks;
 pub mod public;
 pub mod util;
 use util::LimitedReader;
+
+fn retryable_sqlstate(code: &str) -> bool {
+    matches!(code, "40001" | "40P01")
+}
+
+fn is_retryable_database_error(error: &DbErr) -> bool {
+    let runtime_error = match error {
+        DbErr::Conn(error) | DbErr::Exec(error) | DbErr::Query(error) => error,
+        _ => return false,
+    };
+    let RuntimeErr::SqlxError(SqlxError::Database(database_error)) = runtime_error else {
+        return false;
+    };
+    database_error
+        .code()
+        .as_deref()
+        .is_some_and(retryable_sqlstate)
+}
+
+fn database_error_status(error: &DbErr) -> Status {
+    if is_retryable_database_error(error) {
+        Status::ServiceUnavailable
+    } else {
+        Status::InternalServerError
+    }
+}
 
 #[derive(Serialize)]
 pub struct NodeInfo {
@@ -210,6 +240,142 @@ pub struct DelegateResponse {
     pub skipped: Vec<String>,
 }
 
+#[derive(Deserialize)]
+pub struct DelegationStatusRequest {
+    pub cid: String,
+}
+
+#[derive(Serialize)]
+pub struct DelegationStatusResponse {
+    pub cid: String,
+    pub status: &'static str,
+    pub exists: bool,
+    pub active: bool,
+    pub revoked: bool,
+    pub expired: bool,
+}
+
+impl DelegationStatusResponse {
+    fn from_status(cid: String, status: DelegationStatus) -> Self {
+        let status_name = match status {
+            DelegationStatus::Active => "active",
+            DelegationStatus::Revoked => "revoked",
+            DelegationStatus::Expired => "expired",
+            DelegationStatus::Unavailable => "unavailable",
+        };
+        Self {
+            cid,
+            status: status_name,
+            exists: true,
+            active: status == DelegationStatus::Active,
+            revoked: status == DelegationStatus::Revoked,
+            expired: status == DelegationStatus::Expired,
+        }
+    }
+
+    fn not_found(cid: String) -> Self {
+        Self {
+            cid,
+            status: "not_found",
+            exists: false,
+            active: false,
+            revoked: false,
+            expired: false,
+        }
+    }
+}
+
+#[post("/delegation/status", format = "json", data = "<request>")]
+pub async fn delegation_status(
+    invocation: AuthHeaderGetter<InvocationInfo>,
+    request: Json<DelegationStatusRequest>,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Custom<Json<DelegationStatusResponse>>, (Status, String)> {
+    let request = request.into_inner();
+    let auth = &invocation.0 .0;
+    invocation_model::verify_invocation(&auth.invocation)
+        .await
+        .map_err(|_| {
+            (
+                Status::Unauthorized,
+                "Invalid status invocation".to_string(),
+            )
+        })?;
+
+    let expected_resource = format!("urn:cid:{}", request.cid);
+    let bound = auth.capabilities.len() == 1
+        && auth.capabilities.iter().any(|capability| {
+            capability.ability.as_ref().as_ref() == "tinycloud.delegation/status"
+                && matches!(
+                    &capability.resource,
+                    Resource::Other(resource) if resource.as_str() == expected_resource
+                )
+        });
+    if !bound {
+        return Err((
+            Status::Forbidden,
+            "Status invocation is not bound to the requested CID".to_string(),
+        ));
+    }
+
+    let cid: tinycloud_auth::authorization::Cid = request
+        .cid
+        .parse()
+        .map_err(|_| (Status::BadRequest, "Invalid delegation CID".to_string()))?;
+    let target = tinycloud_core::hash::Hash::from(cid);
+    match tinycloud
+        .delegation_status(target, &auth.invoker, &auth.parents)
+        .await
+        .map_err(|_| (Status::ServiceUnavailable, "Status unavailable".to_string()))?
+    {
+        Some(status) => Ok(Custom(
+            Status::Ok,
+            Json(DelegationStatusResponse::from_status(request.cid, status)),
+        )),
+        None => Ok(Custom(
+            Status::NotFound,
+            Json(DelegationStatusResponse::not_found(request.cid)),
+        )),
+    }
+}
+
+#[post("/delegation/query", format = "json", data = "<request>")]
+pub async fn delegation_query(
+    invocation: AuthHeaderGetter<InvocationInfo>,
+    request: Json<serde_json::Value>,
+    tinycloud: &State<TinyCloud>,
+) -> Result<Json<DelegationQueryPage>, (Status, String)> {
+    let auth = &invocation.0 .0;
+    let request: DelegationQuery =
+        serde_json::from_value(request.into_inner()).map_err(|error| {
+            (
+                Status::BadRequest,
+                format!("Invalid delegation query: {error}"),
+            )
+        })?;
+    request.validate().map_err(|error| {
+        (
+            Status::BadRequest,
+            format!("Invalid delegation query: {error}"),
+        )
+    })?;
+
+    tinycloud
+        .query_account_delegations(auth, &request)
+        .await
+        .map(Json)
+        .map_err(|error| match error {
+            tinycloud_core::db::AccountDelegationQueryError::Unauthorized => (
+                Status::Forbidden,
+                "Delegation query proof is not authorized".to_string(),
+            ),
+            tinycloud_core::db::AccountDelegationQueryError::Db(_) => (
+                Status::ServiceUnavailable,
+                "Delegation query unavailable".to_string(),
+            ),
+        })
+}
+
 #[post("/delegate")]
 pub async fn delegate(
     d: AuthHeaderGetter<DelegationInfo>,
@@ -230,9 +396,11 @@ pub async fn delegate(
             .await
             .map_err(|e| {
                 (
-                    match e {
+                    match &e {
                         TxError::SpaceNotFound => Status::NotFound,
-                        TxError::Db(DbErr::ConnectionAcquire(_)) => Status::InternalServerError,
+                        TxError::Db(error) | TxError::EpochInsert(error) => {
+                            database_error_status(error)
+                        }
                         _ => Status::Unauthorized,
                     },
                     e.to_string(),
@@ -294,9 +462,11 @@ pub async fn revoke(
         let revoked_cid = r.0 .0.revoked.to_string();
         let res = tinycloud.revoke(r.0).await.map_err(|e| {
             (
-                match e {
+                match &e {
                     TxError::SpaceNotFound => Status::NotFound,
-                    TxError::Db(DbErr::ConnectionAcquire(_)) => Status::InternalServerError,
+                    TxError::Db(error) | TxError::EpochInsert(error) => {
+                        database_error_status(error)
+                    }
                     _ => Status::Forbidden,
                 },
                 e.to_string(),
@@ -738,6 +908,8 @@ async fn invoke_impl(
                 tinycloud,
                 sql_service,
                 hook_runtime,
+                quota_cache,
+                config,
                 &sql_caps,
             )
             .await;
@@ -780,6 +952,8 @@ async fn invoke_impl(
                     tinycloud,
                     duckdb_service,
                     hook_runtime,
+                    quota_cache,
+                    config,
                     &duckdb_caps,
                     arrow_format,
                 )
@@ -954,10 +1128,10 @@ async fn invoke_impl(
                 }
             }
             Err(e) => Err((
-                match e {
+                match &e {
                     TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
-                    TxStoreError::Tx(TxError::Db(DbErr::ConnectionAcquire(_))) => {
-                        Status::InternalServerError
+                    TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
+                        database_error_status(error)
                     }
                     _ => Status::Unauthorized,
                 },
@@ -1049,7 +1223,12 @@ async fn emit_kv_hook_events(
                 Some((
                     resource.space(),
                     resource.service().as_str(),
-                    capability.ability.as_ref().as_ref(),
+                    // Resolve deprecated aliases (e.g. kv/delete -> kv/del) so
+                    // alias-invoked operations emit the same live-bus events as
+                    // canonical ones — mirrors the db.rs dispatch resolution.
+                    tinycloud_core::policy_capability::resolve_alias(
+                        capability.ability.as_ref().as_ref(),
+                    ),
                     resource.path()?,
                 ))
             })
@@ -1134,12 +1313,47 @@ async fn read_json_body(data: DataIn<'_>) -> Result<String, (Status, String)> {
     }
 }
 
+/// Classify a SQL request as write-class for the storage quota gate.
+///
+/// Write-class = `!is_read_only` from `validate_sql`, gating DML + DDL
+/// uniformly. A parse/permission error is NOT a quota decision:
+/// `sql_service.execute` re-validates and surfaces the true error, so
+/// unparseable SQL is treated as non-write here (never masked as 402).
+/// `ExecuteStatement` resolves the named statement from the SAME caveats
+/// the execution path uses (chain caveat first, invocation facts as
+/// fallback) and classifies its SQL: on the facts fallback the statement
+/// body is invoker-controlled, so it must be parsed, never assumed
+/// read-only. An unresolvable name is non-write (execution fails with
+/// "statement not found" before any storage grows). `Export` is a read.
+fn sql_request_is_write(request: &SqlRequest, caveats: &Option<SqlCaveats>, ability: &str) -> bool {
+    let is_write_sql = |sql: &str| {
+        tinycloud_core::sql::parser::validate_sql(sql, caveats, ability)
+            .map(|p| !p.is_read_only)
+            .unwrap_or(false)
+    };
+    match request {
+        SqlRequest::Query { sql, .. } => is_write_sql(sql),
+        SqlRequest::Execute { sql, schema, .. } => {
+            schema.as_ref().is_some_and(|s| !s.is_empty()) || is_write_sql(sql)
+        }
+        SqlRequest::Batch { statements } => statements.iter().any(|s| is_write_sql(&s.sql)),
+        SqlRequest::ExecuteStatement { name, .. } => caveats
+            .as_ref()
+            .and_then(|c| c.find_statement(name))
+            .is_some_and(|stmt| is_write_sql(&stmt.sql)),
+        SqlRequest::Export => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_sql_invoke(
     i: AuthHeaderGetter<InvocationInfo>,
     data: DataIn<'_>,
     tinycloud: &State<TinyCloud>,
     sql_service: &State<SqlService>,
     hook_runtime: &State<HookRuntime>,
+    quota_cache: &State<QuotaCache>,
+    config: &State<Config>,
     sql_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
     // W1 (D): derive the SQL caveat from the VALIDATED delegation chain,
@@ -1218,6 +1432,17 @@ async fn handle_sql_invoke(
         Some(c) => Some(constrained_caveat_to_sql_caveats(c)),
         None => facts_caveats,
     };
+
+    // SQL storage quota pre-check — same limit resolution and 402 semantics
+    // as the KV path, via the shared helper so the two can't drift.
+    // Reads never 402. One-write overshoot accepted: usage is only known
+    // post-execute, so a write crossing the limit is admitted and the next
+    // write 402s. No shrink — DELETE does not reduce artifact size without
+    // VACUUM, so an over-quota space cannot self-serve shrink.
+    if sql_request_is_write(&sql_request, &exec_caveats, ability) {
+        staged_batch_remaining(space, tinycloud, config, quota_cache).await?;
+    }
+
     let execute_start = Instant::now();
     let execute_result = sql_service
         .execute(
@@ -1618,13 +1843,51 @@ fn sql_error_to_status(err: &SqlError) -> Status {
     }
 }
 
+/// Classify a DuckDB request as write-class for the storage quota gate.
+///
+/// Mirrors `sql_request_is_write`: SQL-bearing variants are classified by
+/// the duckdb parser's `is_read_only`, `ExecuteStatement` resolves the
+/// named statement from the same caveats the execution path uses, and
+/// `Ingest`/`Import`/`ExportToKv` always grow stored bytes so they are
+/// write-class by construction. `Describe` and `Export` are reads.
 #[cfg(feature = "duckdb")]
+fn duckdb_request_is_write(
+    request: &DuckDbRequest,
+    caveats: &Option<DuckDbCaveats>,
+    ability: &str,
+) -> bool {
+    let is_write_sql = |sql: &str| {
+        tinycloud_core::duckdb::parser::validate_sql(sql, caveats, ability)
+            .map(|p| !p.is_read_only)
+            .unwrap_or(false)
+    };
+    match request {
+        DuckDbRequest::Query { sql, .. } => is_write_sql(sql),
+        DuckDbRequest::Execute { sql, schema, .. } => {
+            schema.as_ref().is_some_and(|s| !s.is_empty()) || is_write_sql(sql)
+        }
+        DuckDbRequest::Batch { statements, .. } => statements.iter().any(|s| is_write_sql(&s.sql)),
+        DuckDbRequest::ExecuteStatement { name, .. } => caveats
+            .as_ref()
+            .and_then(|c| c.find_statement(name))
+            .is_some_and(|stmt| is_write_sql(&stmt.sql)),
+        DuckDbRequest::Ingest { .. }
+        | DuckDbRequest::Import { .. }
+        | DuckDbRequest::ExportToKv { .. } => true,
+        DuckDbRequest::Describe | DuckDbRequest::Export => false,
+    }
+}
+
+#[cfg(feature = "duckdb")]
+#[allow(clippy::too_many_arguments)]
 async fn handle_duckdb_invoke(
     i: AuthHeaderGetter<InvocationInfo>,
     data: DataIn<'_>,
     tinycloud: &State<TinyCloud>,
     duckdb_service: &State<DuckDbService>,
     hook_runtime: &State<HookRuntime>,
+    quota_cache: &State<QuotaCache>,
+    config: &State<Config>,
     duckdb_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
     arrow_format: bool,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
@@ -1650,6 +1913,10 @@ async fn handle_duckdb_invoke(
     let space_id = space.to_string();
 
     if ability == "tinycloud.duckdb/import" {
+        // Import always grows the database artifact — gate before reading
+        // the (up to 100 MB) body. Same 402 semantics as the KV/SQL paths.
+        staged_batch_remaining(space, tinycloud, config, quota_cache).await?;
+
         let body_bytes = match data {
             DataIn::One(d) => {
                 let mut buf = Vec::new();
@@ -1709,6 +1976,13 @@ async fn handle_duckdb_invoke(
         );
         let data = export_result.map_err(|e| (duckdb_error_to_status(&e), e.to_string()))?;
         return Ok(DataOut::One(InvOut(InvocationOutcome::DuckDbExport(data))));
+    }
+
+    // DuckDB storage quota pre-check — duckdb artifact bytes fold into
+    // store_size, so write-class requests must be gated exactly like the
+    // KV and SQL paths (reads never 402, one-write overshoot accepted).
+    if duckdb_request_is_write(&duckdb_request, &caveats, ability) {
+        staged_batch_remaining(space, tinycloud, config, quota_cache).await?;
     }
 
     let execute_start = Instant::now();
@@ -2022,9 +2296,17 @@ fn preferred_database_ability<'a>(
         _ => &[],
     };
 
+    // TC-119: match held abilities to the (privilege-ordered) preferred slots
+    // by their canonical form, so a held deprecated alias (e.g. `sql/select`)
+    // matches its canonical slot. Identity for canonical URNs — the privilege
+    // ordering and the returned (unmodified) held ability are unchanged.
     preferred_abilities.iter().find_map(|preferred| {
+        let preferred_canonical = tinycloud_core::policy_capability::resolve_alias(preferred);
         caps.iter()
-            .find(|(_, _, ability)| ability.as_str() == *preferred)
+            .find(|(_, _, ability)| {
+                tinycloud_core::policy_capability::resolve_alias(ability.as_str())
+                    == preferred_canonical
+            })
             .map(|(_, _, ability)| ability.as_str())
     })
 }
@@ -2033,14 +2315,18 @@ fn has_database_admin_capability(
     caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
     service: &str,
 ) -> bool {
-    let admin_abilities: &[&str] = match service {
-        "sql" => &["tinycloud.sql/admin", "tinycloud.sql/*"],
-        "duckdb" => &["tinycloud.duckdb/admin", "tinycloud.duckdb/*"],
-        _ => &[],
+    // TC-119: confers-admin gate (registry-aware). Both `<svc>/admin` and the
+    // per-service wildcard (which implies admin) confer admin — identical to
+    // the prior explicit `{admin, *}` list, now via the registry.
+    let admin_ability = match service {
+        "sql" => "tinycloud.sql/admin",
+        "duckdb" => "tinycloud.duckdb/admin",
+        _ => return false,
     };
 
-    caps.iter()
-        .any(|(_, _, ability)| admin_abilities.contains(&ability.as_str()))
+    caps.iter().any(|(_, _, ability)| {
+        tinycloud_core::policy_capability::ability_matches(ability.as_str(), admin_ability)
+    })
 }
 
 fn missing_database_admin_capability_error(
@@ -2087,10 +2373,10 @@ async fn verify_auth(
         .await
         .map_err(|e| {
             (
-                match e {
+                match &e {
                     TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
-                    TxStoreError::Tx(TxError::Db(DbErr::ConnectionAcquire(_))) => {
-                        Status::InternalServerError
+                    TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
+                        database_error_status(error)
                     }
                     _ => Status::Unauthorized,
                 },
@@ -2131,6 +2417,67 @@ mod tests {
         types::{Ability, Resource},
     };
     use tokio::time::{timeout, Duration};
+
+    #[derive(Debug)]
+    struct TestDatabaseError {
+        code: &'static str,
+    }
+
+    impl std::fmt::Display for TestDatabaseError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("test database error")
+        }
+    }
+
+    impl std::error::Error for TestDatabaseError {}
+
+    impl tinycloud_core::sea_orm::sqlx::error::DatabaseError for TestDatabaseError {
+        fn message(&self) -> &str {
+            "test database error"
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(self.code.into())
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> tinycloud_core::sea_orm::sqlx::error::ErrorKind {
+            tinycloud_core::sea_orm::sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn db_error_with_sqlstate(code: &'static str) -> DbErr {
+        DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(Box::new(
+            TestDatabaseError { code },
+        ))))
+    }
+
+    #[tokio::test]
+    async fn serialization_and_deadlock_sqlstates_are_retryable() {
+        assert!(retryable_sqlstate("40001"));
+        assert!(retryable_sqlstate("40P01"));
+        assert!(!retryable_sqlstate("23505"));
+        assert!(!retryable_sqlstate("28000"));
+        assert_eq!(
+            database_error_status(&db_error_with_sqlstate("40001")),
+            Status::ServiceUnavailable
+        );
+        assert_eq!(
+            database_error_status(&db_error_with_sqlstate("23505")),
+            Status::InternalServerError
+        );
+    }
 
     fn test_space_id(name: &str) -> SpaceId {
         let jwk = JWK::generate_ed25519().unwrap();
@@ -2934,7 +3281,6 @@ mod tests {
         }
         .insert(&conn)
         .await?;
-
         let parent_cid: AuthCid = parent_hash.to_cid(0x55);
         let mut invocation_nb = std::collections::BTreeMap::new();
         for (key, value) in constrained_caveat
@@ -3034,6 +3380,7 @@ mod tests {
             revoker: Set(space.did().to_string()),
             revoked: Set(parent_hash),
             serialization: Set(b"w1-rocket-http-revocation".to_vec()),
+            revoked_at: Set(None),
         }
         .insert(&conn)
         .await?;
@@ -3272,6 +3619,7 @@ mod tests {
             revoker: Set(owner_did),
             revoked: Set(delegation_hash),
             serialization: Set(b"w5-runtime-node-revocation".to_vec()),
+            revoked_at: Set(None),
         }
         .insert(&conn)
         .await?;
@@ -3412,6 +3760,7 @@ mod tests {
             revoker: Set(revoker_did),
             revoked: Set(parent_hash),
             serialization: Set(b"revocation-bytes".to_vec()),
+            revoked_at: Set(None),
         }
         .insert(&conn)
         .await?;
@@ -3425,6 +3774,830 @@ mod tests {
         assert!(row.is_some(), "revocation row must persist for chain check");
 
         let _ = tinycloud;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delegation_status_and_query_enforce_control_proofs_without_oracles() -> Result<()> {
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+        use tinycloud_auth::authorization::Cid as AuthCid;
+        use tinycloud_auth::ssi::{
+            claims::jwt::NumericDate,
+            dids::{DIDBuf, DIDURLBuf},
+            jwk::Algorithm,
+            ucan::Payload,
+        };
+        use tinycloud_auth::ucan_capabilities_object::Capabilities;
+        use tinycloud_core::models::{
+            abilities, actor, delegation as deleg_model, revocation as revo_model,
+        };
+        use tinycloud_core::relationships::parent_delegations;
+        use tinycloud_core::sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        fn verification_method(jwk: &JWK) -> Result<(String, String)> {
+            let did = DID_METHODS.generate(jwk, "key")?.to_string();
+            let fragment = did
+                .rsplit_once(':')
+                .ok_or_else(|| anyhow::anyhow!("missing did:key fragment"))?
+                .1;
+            Ok((did.clone(), format!("{did}#{fragment}")))
+        }
+
+        fn status_header(
+            jwk: &JWK,
+            verification_method: &str,
+            did: &str,
+            cid: &str,
+            nonce: &str,
+        ) -> Result<String> {
+            status_header_with_proofs(jwk, verification_method, did, cid, nonce, Vec::new())
+        }
+
+        fn status_header_with_proofs(
+            jwk: &JWK,
+            verification_method: &str,
+            did: &str,
+            cid: &str,
+            nonce: &str,
+            proofs: Vec<AuthCid>,
+        ) -> Result<String> {
+            let mut capabilities = Capabilities::new();
+            capabilities.with_action(
+                format!("urn:cid:{cid}").parse()?,
+                "tinycloud.delegation/status".parse::<UcanAbility>()?,
+                [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+            );
+            Ok(Payload {
+                issuer: verification_method.parse::<DIDURLBuf>()?,
+                audience: did.parse::<DIDBuf>()?,
+                not_before: None,
+                expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
+                nonce: Some(nonce.to_string()),
+                facts: Some(Vec::<serde_json::Value>::new()),
+                proof: proofs,
+                attenuation: capabilities,
+            }
+            .sign(jwk.get_algorithm().unwrap_or_default(), jwk)?
+            .encode()?)
+        }
+
+        fn query_header_with_proofs(
+            jwk: &JWK,
+            verification_method: &str,
+            did: &str,
+            resource: &Resource,
+            nonce: &str,
+            proofs: Vec<AuthCid>,
+        ) -> Result<String> {
+            let mut capabilities = Capabilities::new();
+            capabilities.with_action(
+                resource.to_string().parse()?,
+                "tinycloud.delegation/list".parse::<UcanAbility>()?,
+                [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+            );
+            Ok(Payload {
+                issuer: verification_method.parse::<DIDURLBuf>()?,
+                audience: did.parse::<DIDBuf>()?,
+                not_before: None,
+                expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
+                nonce: Some(nonce.to_string()),
+                facts: Some(Vec::<serde_json::Value>::new()),
+                proof: proofs,
+                attenuation: capabilities,
+            }
+            .sign(jwk.get_algorithm().unwrap_or_default(), jwk)?
+            .encode()?)
+        }
+
+        fn revocation_header(
+            jwk: &JWK,
+            verification_method: &str,
+            did: &str,
+            cid: &str,
+            proof: AuthCid,
+        ) -> Result<String> {
+            let mut capabilities = Capabilities::new();
+            capabilities.with_action(
+                format!("urn:cid:{cid}").parse()?,
+                "tinycloud.delegation/revoke".parse::<UcanAbility>()?,
+                [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+            );
+            Ok(Payload {
+                issuer: verification_method.parse::<DIDURLBuf>()?,
+                audience: did.parse::<DIDBuf>()?,
+                not_before: None,
+                expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
+                nonce: Some("session-revokes-pkh-child".to_string()),
+                facts: Some(Vec::<serde_json::Value>::new()),
+                proof: vec![proof],
+                attenuation: capabilities,
+            }
+            .sign(jwk.get_algorithm().unwrap_or_default(), jwk)?
+            .encode()?)
+        }
+
+        let tinycloud = test_tinycloud().await?;
+        let conn = tinycloud.readable().await?;
+        let mut holder_jwk = JWK::generate_ed25519()?;
+        holder_jwk.algorithm = Some(Algorithm::EdDSA);
+        let (holder_did, holder_vm) = verification_method(&holder_jwk)?;
+        let owner_did = "did:key:zStatusOwner".to_string();
+        let wallet_pkh = "did:pkh:eip155:1:0x1111111111111111111111111111111111111111".to_string();
+        let unrelated_pkh =
+            "did:pkh:eip155:1:0x2222222222222222222222222222222222222222".to_string();
+        for did in [&owner_did, &holder_did, &wallet_pkh, &unrelated_pkh] {
+            actor::ActiveModel {
+                id: Set(did.clone()),
+            }
+            .insert(&conn)
+            .await?;
+        }
+        let parent_id = tinycloud_core::hash::hash(b"status-parent");
+        let mut child_capabilities = Capabilities::new();
+        child_capabilities.with_action(
+            format!("urn:cid:{}", parent_id.to_cid(0x55)).parse()?,
+            "tinycloud.delegation/status".parse::<UcanAbility>()?,
+            [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+        );
+        let child_serialization = Payload {
+            issuer: holder_vm.parse::<DIDURLBuf>()?,
+            audience: holder_did.parse::<DIDBuf>()?,
+            not_before: None,
+            expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
+            nonce: Some("signed-status-child".to_string()),
+            facts: Some(Vec::<serde_json::Value>::new()),
+            proof: vec![parent_id.to_cid(0x55)],
+            attenuation: child_capabilities,
+        }
+        .sign(holder_jwk.get_algorithm().unwrap_or_default(), &holder_jwk)?
+        .encode()?
+        .into_bytes();
+        let child_id = tinycloud_core::hash::hash(&child_serialization);
+        let direct_id = tinycloud_core::hash::hash(b"status-direct");
+        for (id, delegator, delegatee, bytes) in [
+            (
+                parent_id,
+                &owner_did,
+                &holder_did,
+                b"status-parent".as_slice(),
+            ),
+            (
+                direct_id,
+                &owner_did,
+                &holder_did,
+                b"status-direct".as_slice(),
+            ),
+        ] {
+            deleg_model::ActiveModel {
+                id: Set(id),
+                delegator: Set(delegator.clone()),
+                delegatee: Set(delegatee.clone()),
+                expiry: Set(None),
+                issued_at: Set(None),
+                not_before: Set(None),
+                facts: Set(None),
+                serialization: Set(bytes.to_vec()),
+            }
+            .insert(&conn)
+            .await?;
+        }
+        deleg_model::ActiveModel {
+            id: Set(child_id),
+            delegator: Set(holder_did.clone()),
+            delegatee: Set(holder_did.clone()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(child_serialization),
+        }
+        .insert(&conn)
+        .await?;
+        let expired_id = tinycloud_core::hash::hash(b"status-expired");
+        deleg_model::ActiveModel {
+            id: Set(expired_id),
+            delegator: Set(owner_did.clone()),
+            delegatee: Set(holder_did.clone()),
+            expiry: Set(Some(OffsetDateTime::from_unix_timestamp(1)?)),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(b"status-expired".to_vec()),
+        }
+        .insert(&conn)
+        .await?;
+        let wallet_session_id = tinycloud_core::hash::hash(b"wallet-session-proof");
+        let unrelated_session_id = tinycloud_core::hash::hash(b"unrelated-session-proof");
+        let wrong_target_session_id = tinycloud_core::hash::hash(b"wrong-target-session-proof");
+        let foreign_scope_session_id = tinycloud_core::hash::hash(b"foreign-scope-session-proof");
+        let narrow_scope_session_id = tinycloud_core::hash::hash(b"narrow-scope-session-proof");
+        let query_scope_session_id = tinycloud_core::hash::hash(b"query-scope-session-proof");
+        let fragment_scope_session_id = tinycloud_core::hash::hash(b"fragment-scope-session-proof");
+        let wallet_child_id = tinycloud_core::hash::hash(b"wallet-pkh-child");
+        for (id, delegator, delegatee, bytes) in [
+            (
+                wallet_session_id,
+                &wallet_pkh,
+                &holder_did,
+                b"wallet-session-proof".as_slice(),
+            ),
+            (
+                unrelated_session_id,
+                &wallet_pkh,
+                &holder_did,
+                b"unrelated-session-proof".as_slice(),
+            ),
+            (
+                wallet_child_id,
+                &owner_did,
+                &wallet_pkh,
+                b"wallet-pkh-child".as_slice(),
+            ),
+            (
+                wrong_target_session_id,
+                &wallet_pkh,
+                &holder_did,
+                b"wrong-target-session-proof".as_slice(),
+            ),
+            (
+                foreign_scope_session_id,
+                &wallet_pkh,
+                &holder_did,
+                b"foreign-scope-session-proof".as_slice(),
+            ),
+            (
+                narrow_scope_session_id,
+                &wallet_pkh,
+                &holder_did,
+                b"narrow-scope-session-proof".as_slice(),
+            ),
+            (
+                query_scope_session_id,
+                &wallet_pkh,
+                &holder_did,
+                b"query-scope-session-proof".as_slice(),
+            ),
+            (
+                fragment_scope_session_id,
+                &wallet_pkh,
+                &holder_did,
+                b"fragment-scope-session-proof".as_slice(),
+            ),
+        ] {
+            deleg_model::ActiveModel {
+                id: Set(id),
+                delegator: Set(delegator.clone()),
+                delegatee: Set(delegatee.clone()),
+                expiry: Set(None),
+                issued_at: Set(None),
+                not_before: Set(None),
+                facts: Set(None),
+                serialization: Set(bytes.to_vec()),
+            }
+            .insert(&conn)
+            .await?;
+        }
+        let wallet_control_space = SpaceId::new(
+            wallet_pkh.parse::<DIDBuf>()?,
+            "control".parse().expect("valid space name"),
+        );
+        let control_resource = Resource::TinyCloud(wallet_control_space.clone().to_resource(
+            "delegation".parse()?,
+            None,
+            None,
+            None,
+        ));
+        let query_control_resource = control_resource.clone();
+        for action in [
+            "tinycloud.delegation/status",
+            "tinycloud.delegation/revoke",
+            "tinycloud.delegation/list",
+        ] {
+            abilities::ActiveModel {
+                delegation: Set(wallet_session_id),
+                resource: Set(control_resource.clone()),
+                ability: Set(Ability::try_from(action.to_string())?),
+                caveats: Set(Default::default()),
+            }
+            .insert(&conn)
+            .await?;
+        }
+        abilities::ActiveModel {
+            delegation: Set(unrelated_session_id),
+            resource: Set(control_resource),
+            ability: Set(Ability::try_from("tinycloud.kv/get".to_string())?),
+            caveats: Set(Default::default()),
+        }
+        .insert(&conn)
+        .await?;
+        let foreign_control_space = SpaceId::new(
+            unrelated_pkh.parse::<DIDBuf>()?,
+            "control".parse().expect("valid space name"),
+        );
+        for (proof_id, resource) in [
+            (
+                wrong_target_session_id,
+                Resource::Other(format!("urn:cid:{}", direct_id.to_cid(0x55)).parse()?),
+            ),
+            (
+                foreign_scope_session_id,
+                Resource::TinyCloud(foreign_control_space.clone().to_resource(
+                    "delegation".parse()?,
+                    None,
+                    None,
+                    None,
+                )),
+            ),
+            (
+                narrow_scope_session_id,
+                Resource::TinyCloud(wallet_control_space.clone().to_resource(
+                    "delegation".parse()?,
+                    Some("narrow".parse()?),
+                    None,
+                    None,
+                )),
+            ),
+            (
+                query_scope_session_id,
+                Resource::TinyCloud(wallet_control_space.clone().to_resource(
+                    "delegation".parse()?,
+                    None,
+                    Some("scope=limited".parse()?),
+                    None,
+                )),
+            ),
+            (
+                fragment_scope_session_id,
+                Resource::TinyCloud(wallet_control_space.to_resource(
+                    "delegation".parse()?,
+                    None,
+                    None,
+                    Some("limited".parse()?),
+                )),
+            ),
+        ] {
+            for action in ["tinycloud.delegation/status", "tinycloud.delegation/revoke"] {
+                abilities::ActiveModel {
+                    delegation: Set(proof_id),
+                    resource: Set(resource.clone()),
+                    ability: Set(Ability::try_from(action.to_string())?),
+                    caveats: Set(Default::default()),
+                }
+                .insert(&conn)
+                .await?;
+            }
+        }
+        let expired_session_id = tinycloud_core::hash::hash(b"expired-session-proof");
+        let future_session_id = tinycloud_core::hash::hash(b"future-session-proof");
+        let revoked_session_id = tinycloud_core::hash::hash(b"revoked-session-proof");
+        for (id, expiry, not_before, bytes) in [
+            (
+                expired_session_id,
+                Some(OffsetDateTime::from_unix_timestamp(1)?),
+                None,
+                b"expired-session-proof".as_slice(),
+            ),
+            (
+                future_session_id,
+                None,
+                Some(OffsetDateTime::from_unix_timestamp(4_102_444_800)?),
+                b"future-session-proof".as_slice(),
+            ),
+            (
+                revoked_session_id,
+                None,
+                None,
+                b"revoked-session-proof".as_slice(),
+            ),
+        ] {
+            deleg_model::ActiveModel {
+                id: Set(id),
+                delegator: Set(wallet_pkh.clone()),
+                delegatee: Set(holder_did.clone()),
+                expiry: Set(expiry),
+                issued_at: Set(None),
+                not_before: Set(not_before),
+                facts: Set(None),
+                serialization: Set(bytes.to_vec()),
+            }
+            .insert(&conn)
+            .await?;
+            abilities::ActiveModel {
+                delegation: Set(id),
+                resource: Set(Resource::Other(
+                    format!("urn:cid:{}", wallet_child_id.to_cid(0x55)).parse()?,
+                )),
+                ability: Set(Ability::try_from(
+                    "tinycloud.delegation/status".to_string(),
+                )?),
+                caveats: Set(Default::default()),
+            }
+            .insert(&conn)
+            .await?;
+            abilities::ActiveModel {
+                delegation: Set(id),
+                resource: Set(query_control_resource.clone()),
+                ability: Set(Ability::try_from("tinycloud.delegation/list".to_string())?),
+                caveats: Set(Default::default()),
+            }
+            .insert(&conn)
+            .await?;
+        }
+        revo_model::ActiveModel {
+            id: Set(tinycloud_core::hash::hash(b"revoked-session-proof-row")),
+            revoker: Set(wallet_pkh.clone()),
+            revoked: Set(revoked_session_id),
+            serialization: Set(b"revoked-session-proof-row".to_vec()),
+            revoked_at: Set(None),
+        }
+        .insert(&conn)
+        .await?;
+        parent_delegations::ActiveModel {
+            parent: Set(parent_id),
+            child: Set(child_id),
+        }
+        .insert(&conn)
+        .await?;
+        let foreign_record_id = tinycloud_core::hash::hash(b"foreign-account-record");
+        deleg_model::ActiveModel {
+            id: Set(foreign_record_id),
+            delegator: Set(unrelated_pkh.clone()),
+            delegatee: Set(owner_did.clone()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(b"foreign-account-record".to_vec()),
+        }
+        .insert(&conn)
+        .await?;
+        conn.commit().await?;
+
+        let rocket = rocket::build()
+            .mount("/", routes![delegation_status, delegation_query, revoke])
+            .attach(crate::tracing::TracingFairing {
+                header_name: Config::default().log.tracing.traceheader,
+            })
+            .manage(tinycloud);
+        let client = Client::tracked(rocket).await?;
+        let child_cid = child_id.to_cid(0x55).to_string();
+        let request = |cid: &str, header: String| {
+            client
+                .post("/delegation/status")
+                .header(Header::new("Authorization", header))
+                .header(ContentType::JSON)
+                .body(serde_json::json!({ "cid": cid }).to_string())
+        };
+        let query_request = |header: String| {
+            client
+                .post("/delegation/query")
+                .header(Header::new("Authorization", header))
+                .header(ContentType::JSON)
+                .body("{}")
+        };
+
+        let response = query_request(query_header_with_proofs(
+            &holder_jwk,
+            &holder_vm,
+            &holder_did,
+            &query_control_resource,
+            "proofless-did-key-query",
+            Vec::new(),
+        )?)
+        .dispatch()
+        .await;
+        assert_eq!(response.status(), Status::Forbidden);
+
+        let response = query_request(query_header_with_proofs(
+            &holder_jwk,
+            &holder_vm,
+            &holder_did,
+            &query_control_resource,
+            "authorized-account-query",
+            vec![wallet_session_id.to_cid(0x55)],
+        )?)
+        .dispatch()
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+        let query_body = response.into_string().await.unwrap_or_default();
+        assert!(query_body.contains(&wallet_child_id.to_cid(0x55).to_string()));
+        assert!(!query_body.contains(&foreign_record_id.to_cid(0x55).to_string()));
+
+        let foreign_query_resource = Resource::TinyCloud(foreign_control_space.to_resource(
+            "delegation".parse()?,
+            None,
+            None,
+            None,
+        ));
+        let response = query_request(query_header_with_proofs(
+            &holder_jwk,
+            &holder_vm,
+            &holder_did,
+            &foreign_query_resource,
+            "mismatched-query-principal",
+            vec![wallet_session_id.to_cid(0x55)],
+        )?)
+        .dispatch()
+        .await;
+        assert_eq!(response.status(), Status::Forbidden);
+
+        for (label, proof_id) in [
+            ("expired-query-proof", expired_session_id),
+            ("future-query-proof", future_session_id),
+            ("revoked-query-proof", revoked_session_id),
+            (
+                "missing-query-proof",
+                tinycloud_core::hash::hash(b"missing-query-proof"),
+            ),
+        ] {
+            let response = query_request(query_header_with_proofs(
+                &holder_jwk,
+                &holder_vm,
+                &holder_did,
+                &query_control_resource,
+                label,
+                vec![proof_id.to_cid(0x55)],
+            )?)
+            .dispatch()
+            .await;
+            assert_eq!(response.status(), Status::Forbidden, "{label}");
+        }
+
+        let mismatched_cid = direct_id.to_cid(0x55).to_string();
+        let response = request(
+            &child_cid,
+            status_header(
+                &holder_jwk,
+                &holder_vm,
+                &holder_did,
+                &mismatched_cid,
+                "mismatched-body",
+            )?,
+        )
+        .dispatch()
+        .await;
+        assert_eq!(response.status(), Status::Forbidden);
+
+        let response = request(
+            &child_cid,
+            status_header(&holder_jwk, &holder_vm, &holder_did, &child_cid, "active")?,
+        )
+        .dispatch()
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value = serde_json::from_str(&response.into_string().await.unwrap())?;
+        assert_eq!(body["status"], "active");
+        assert_eq!(body["active"], true);
+
+        let wallet_child_cid = wallet_child_id.to_cid(0x55).to_string();
+        let response = request(
+            &wallet_child_cid,
+            status_header_with_proofs(
+                &holder_jwk,
+                &holder_vm,
+                &holder_did,
+                &wallet_child_cid,
+                "wallet-session-status",
+                vec![wallet_session_id.to_cid(0x55)],
+            )?,
+        )
+        .dispatch()
+        .await;
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value = serde_json::from_str(&response.into_string().await.unwrap())?;
+        assert_eq!(body["status"], "active");
+
+        let missing_session_id = tinycloud_core::hash::hash(b"missing-session-proof");
+        for (label, proofs) in [
+            (
+                "missing-session-status",
+                vec![missing_session_id.to_cid(0x55)],
+            ),
+            (
+                "expired-session-status",
+                vec![expired_session_id.to_cid(0x55)],
+            ),
+            (
+                "future-session-status",
+                vec![future_session_id.to_cid(0x55)],
+            ),
+            (
+                "revoked-session-status",
+                vec![revoked_session_id.to_cid(0x55)],
+            ),
+            (
+                "same-wallet-unrelated-capability",
+                vec![unrelated_session_id.to_cid(0x55)],
+            ),
+            (
+                "correct-action-wrong-target-resource",
+                vec![wrong_target_session_id.to_cid(0x55)],
+            ),
+            (
+                "correct-action-foreign-root-scope",
+                vec![foreign_scope_session_id.to_cid(0x55)],
+            ),
+            (
+                "correct-action-narrow-scope",
+                vec![narrow_scope_session_id.to_cid(0x55)],
+            ),
+            (
+                "correct-action-query-scope",
+                vec![query_scope_session_id.to_cid(0x55)],
+            ),
+            (
+                "correct-action-fragment-scope",
+                vec![fragment_scope_session_id.to_cid(0x55)],
+            ),
+            (
+                "multiple-mixed-session-status",
+                vec![
+                    wallet_session_id.to_cid(0x55),
+                    unrelated_session_id.to_cid(0x55),
+                ],
+            ),
+        ] {
+            let response = request(
+                &wallet_child_cid,
+                status_header_with_proofs(
+                    &holder_jwk,
+                    &holder_vm,
+                    &holder_did,
+                    &wallet_child_cid,
+                    label,
+                    proofs,
+                )?,
+            )
+            .dispatch()
+            .await;
+            assert_eq!(response.status(), Status::NotFound, "{label}");
+        }
+
+        for (label, proof_id) in [
+            ("unrelated-capability-revoke", unrelated_session_id),
+            ("wrong-target-resource-revoke", wrong_target_session_id),
+            ("foreign-root-scope-revoke", foreign_scope_session_id),
+            ("narrow-scope-revoke", narrow_scope_session_id),
+            ("query-scope-revoke", query_scope_session_id),
+            ("fragment-scope-revoke", fragment_scope_session_id),
+        ] {
+            let response = client
+                .post("/revoke")
+                .header(Header::new(
+                    "Authorization",
+                    revocation_header(
+                        &holder_jwk,
+                        &holder_vm,
+                        &holder_did,
+                        &wallet_child_cid,
+                        proof_id.to_cid(0x55),
+                    )?,
+                ))
+                .dispatch()
+                .await;
+            assert_eq!(response.status(), Status::Forbidden, "{label}");
+        }
+
+        let response = client
+            .post("/revoke")
+            .header(Header::new(
+                "Authorization",
+                revocation_header(
+                    &holder_jwk,
+                    &holder_vm,
+                    &holder_did,
+                    &wallet_child_cid,
+                    wallet_session_id.to_cid(0x55),
+                )?,
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+
+        let response = request(
+            &wallet_child_cid,
+            status_header_with_proofs(
+                &holder_jwk,
+                &holder_vm,
+                &holder_did,
+                &wallet_child_cid,
+                "wallet-session-post-revoke",
+                vec![wallet_session_id.to_cid(0x55)],
+            )?,
+        )
+        .dispatch()
+        .await;
+        let body: serde_json::Value = serde_json::from_str(&response.into_string().await.unwrap())?;
+        assert_eq!(body["status"], "revoked");
+        assert_eq!(body["revoked"], true);
+
+        let conn = client
+            .rocket()
+            .state::<TinyCloud>()
+            .expect("tinycloud state")
+            .readable()
+            .await?;
+        revo_model::ActiveModel {
+            id: Set(tinycloud_core::hash::hash(b"status-parent-revocation")),
+            revoker: Set(owner_did),
+            revoked: Set(parent_id),
+            serialization: Set(b"status-parent-revocation".to_vec()),
+            revoked_at: Set(None),
+        }
+        .insert(&conn)
+        .await?;
+        revo_model::ActiveModel {
+            id: Set(tinycloud_core::hash::hash(b"status-direct-revocation")),
+            revoker: Set(holder_did.clone()),
+            revoked: Set(direct_id),
+            serialization: Set(b"status-direct-revocation".to_vec()),
+            revoked_at: Set(None),
+        }
+        .insert(&conn)
+        .await?;
+        conn.commit().await?;
+        let response = request(
+            &child_cid,
+            status_header(&holder_jwk, &holder_vm, &holder_did, &child_cid, "revoked")?,
+        )
+        .dispatch()
+        .await;
+        let body: serde_json::Value = serde_json::from_str(&response.into_string().await.unwrap())?;
+        assert_eq!(body["status"], "revoked");
+        assert_eq!(body["revoked"], true);
+
+        let expired_cid = expired_id.to_cid(0x55).to_string();
+        let response = request(
+            &expired_cid,
+            status_header(
+                &holder_jwk,
+                &holder_vm,
+                &holder_did,
+                &expired_cid,
+                "expired",
+            )?,
+        )
+        .dispatch()
+        .await;
+        let body: serde_json::Value = serde_json::from_str(&response.into_string().await.unwrap())?;
+        assert_eq!(body["status"], "expired");
+        assert_eq!(body["expired"], true);
+
+        let direct_cid = direct_id.to_cid(0x55).to_string();
+        let response = request(
+            &direct_cid,
+            status_header(
+                &holder_jwk,
+                &holder_vm,
+                &holder_did,
+                &direct_cid,
+                "direct-revoked",
+            )?,
+        )
+        .dispatch()
+        .await;
+        let body: serde_json::Value = serde_json::from_str(&response.into_string().await.unwrap())?;
+        assert_eq!(body["status"], "revoked");
+        assert_eq!(body["revoked"], true);
+
+        let mut stranger_jwk = JWK::generate_ed25519()?;
+        stranger_jwk.algorithm = Some(Algorithm::EdDSA);
+        let (stranger_did, stranger_vm) = verification_method(&stranger_jwk)?;
+        let response = request(
+            &child_cid,
+            status_header(
+                &stranger_jwk,
+                &stranger_vm,
+                &stranger_did,
+                &child_cid,
+                "stranger",
+            )?,
+        )
+        .dispatch()
+        .await;
+        assert_eq!(response.status(), Status::NotFound);
+
+        let missing_cid = tinycloud_core::hash::hash(b"missing-status")
+            .to_cid(0x55)
+            .to_string();
+        let response = request(
+            &missing_cid,
+            status_header(
+                &holder_jwk,
+                &holder_vm,
+                &holder_did,
+                &missing_cid,
+                "missing",
+            )?,
+        )
+        .dispatch()
+        .await;
+        assert_eq!(response.status(), Status::NotFound);
+        let body: serde_json::Value = serde_json::from_str(&response.into_string().await.unwrap())?;
+        assert_eq!(body["status"], "not_found");
+        assert_eq!(body["exists"], false);
+
         Ok(())
     }
 
@@ -3533,6 +4706,563 @@ mod tests {
         assert_eq!(caveat.statements[0].name, "get");
         assert!(caveat.read_only);
         let _ = tinycloud;
+        Ok(())
+    }
+
+    // ---- T2: write-class SQL 402 gate ---------------------------------
+
+    #[tokio::test]
+    async fn sql_request_is_write_classifies_variants() {
+        use tinycloud_core::sql::types::SqlStatement;
+        let ability = "tinycloud.sql/write";
+        let caveats = &None;
+
+        // Execute carrying a non-empty schema (DDL) is write-class.
+        assert!(sql_request_is_write(
+            &SqlRequest::Execute {
+                schema: Some(vec!["CREATE TABLE t (a INTEGER NOT NULL)".to_string()]),
+                sql: "INSERT INTO t VALUES (1)".to_string(),
+                params: vec![],
+            },
+            caveats,
+            ability
+        ));
+
+        // Execute with no schema but a DML statement is write-class.
+        assert!(sql_request_is_write(
+            &SqlRequest::Execute {
+                schema: None,
+                sql: "INSERT INTO t VALUES (1)".to_string(),
+                params: vec![],
+            },
+            caveats,
+            ability
+        ));
+
+        // A read-only Query is not write-class.
+        assert!(!sql_request_is_write(
+            &SqlRequest::Query {
+                sql: "SELECT 1".to_string(),
+                params: vec![],
+            },
+            caveats,
+            ability
+        ));
+
+        // A Batch containing any write statement is write-class.
+        assert!(sql_request_is_write(
+            &SqlRequest::Batch {
+                statements: vec![SqlStatement {
+                    sql: "INSERT INTO t VALUES (1)".to_string(),
+                    params: vec![],
+                }],
+            },
+            caveats,
+            ability
+        ));
+
+        // ExecuteStatement is read-only by construction; Export is a read.
+        assert!(!sql_request_is_write(
+            &SqlRequest::ExecuteStatement {
+                name: "get".to_string(),
+                params: vec![],
+            },
+            caveats,
+            ability
+        ));
+        assert!(!sql_request_is_write(&SqlRequest::Export, caveats, ability));
+    }
+
+    /// A metered SQL HTTP stack: one shared `SqlSizes` feeds both the SQL
+    /// artifact save path (via `SizeTrackingArtifactRepository`) and
+    /// `TinyCloud::store_size` (via `.with_sql_sizes`), so a direct SQL
+    /// write is visible to the route-layer 402 gate. The space/actor/
+    /// delegation/abilities rows are inserted with EMPTY caveats so
+    /// `derive_chain_constrained_caveat` returns `None` and the raw request
+    /// reaches the gate.
+    struct MeteredSqlHttp {
+        tinycloud: TinyCloud,
+        sql_service: SqlService,
+        space: SpaceId,
+        resource: ResourceId,
+        jwk: JWK,
+        verification_method: String,
+        parent_cid: tinycloud_auth::authorization::Cid,
+        used: u64,
+    }
+
+    async fn metered_sql_http_setup(name: &str) -> Result<MeteredSqlHttp> {
+        use tinycloud_core::database_artifacts::DatabaseArtifactRepository;
+        use tinycloud_core::models::{
+            abilities, actor, delegation as deleg_model, space as space_model,
+        };
+        use tinycloud_core::sea_orm::ActiveModelTrait;
+        use tinycloud_core::sea_orm::ActiveValue::Set;
+        use tinycloud_core::types::{Caveats, SpaceIdWrap};
+        use tinycloud_core::{SizeTrackingArtifactRepository, SqlSizes};
+
+        // Shared size handle: the SQL artifact repo records into it, and
+        // TinyCloud reads it in store_size.
+        let sizes = SqlSizes::new();
+
+        // Auth/state DB + block storage for TinyCloud.
+        let tempdir = TempDir::new()?;
+        let auth_db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
+        let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
+        let _persisted = tempdir.keep();
+        let tinycloud = TinyCloud::new(
+            auth_db.clone(),
+            Either::B(storage),
+            StaticSecret::new(vec![0u8; 32]).unwrap(),
+        )
+        .await?
+        .with_sql_sizes(sizes.clone());
+        let conn = auth_db;
+
+        // Separate in-memory DB for the SQL artifact repository, size-tracked
+        // into the shared handle.
+        let cache = TempDir::new()?;
+        let cache_path = cache.path().to_string_lossy().to_string();
+        let _cache_persisted = cache.keep();
+        let sql_db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
+        Migrator::up(&sql_db, None).await?;
+        let raw_repo: Arc<dyn DatabaseArtifactRepository> =
+            Arc::new(SeaOrmDatabaseArtifactRepository::new(sql_db));
+        let tracked_repo = Arc::new(SizeTrackingArtifactRepository::new(raw_repo, sizes.clone()));
+        let sql_service = SqlService::new(cache_path, u64::MAX, tracked_repo);
+
+        let space = test_space_id(name);
+        space_model::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&conn)
+        .await?;
+
+        // Pre-grow SQL usage with a direct (unmetered-by-quota) write so the
+        // shared size handle reflects real artifact bytes for the gate.
+        sql_service
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: Some(vec![
+                        "CREATE TABLE labels (label TEXT PRIMARY KEY, val INTEGER NOT NULL)"
+                            .to_string(),
+                    ]),
+                    sql: "INSERT INTO labels (label, val) VALUES (?, ?)".to_string(),
+                    params: vec![SqlValue::Text("alpha".to_string()), SqlValue::Integer(111)],
+                },
+                None,
+                "tinycloud.sql/write".to_string(),
+            )
+            .await?;
+
+        let jwk = JWK::generate_ed25519()?;
+        let mut verification_method = DID_METHODS.generate(&jwk, "key")?.to_string();
+        let fragment = verification_method
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("missing verification method fragment"))?
+            .1
+            .to_string();
+        verification_method.push('#');
+        verification_method.push_str(&fragment);
+        let delegatee = verification_method
+            .split('#')
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing did"))?
+            .to_string();
+        let owner_did = space.did().to_string();
+
+        for did in [&owner_did, &delegatee] {
+            actor::ActiveModel {
+                id: Set(did.clone()),
+            }
+            .insert(&conn)
+            .await?;
+        }
+
+        let parent_hash = tinycloud_core::hash::hash(name.as_bytes());
+        deleg_model::ActiveModel {
+            id: Set(parent_hash),
+            delegator: Set(owner_did.clone()),
+            delegatee: Set(delegatee.clone()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(name.as_bytes().to_vec()),
+        }
+        .insert(&conn)
+        .await?;
+
+        let resource: ResourceId = space.clone().to_resource(
+            "sql".parse::<Service>()?,
+            Some("main".parse::<AuthPath>()?),
+            None,
+            None,
+        );
+
+        // Grant BOTH read and write with EMPTY caveats on the same parent
+        // delegation so either invocation ability is authorized and the raw
+        // request reaches the gate unconstrained.
+        for ability in ["tinycloud.sql/read", "tinycloud.sql/write"] {
+            abilities::ActiveModel {
+                delegation: Set(parent_hash),
+                resource: Set(Resource::TinyCloud(resource.clone())),
+                ability: Set(Ability::try_from(ability.to_string()).unwrap()),
+                caveats: Set(Caveats(std::collections::BTreeMap::new())),
+            }
+            .insert(&conn)
+            .await?;
+        }
+
+        let parent_cid = parent_hash.to_cid(0x55);
+        let used = tinycloud
+            .store_size(&space)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .expect("pre-grown space must report SQL usage");
+        assert!(
+            used >= 1,
+            "pre-grow must produce at least one byte of usage"
+        );
+
+        Ok(MeteredSqlHttp {
+            tinycloud,
+            sql_service,
+            space,
+            resource,
+            jwk,
+            verification_method,
+            parent_cid,
+            used,
+        })
+    }
+
+    fn sql_invocation_header(setup: &MeteredSqlHttp, ability: &str, nonce: &str) -> Result<String> {
+        sql_invocation_header_with_facts(setup, ability, nonce, Vec::new())
+    }
+
+    fn sql_invocation_header_with_facts(
+        setup: &MeteredSqlHttp,
+        ability: &str,
+        nonce: &str,
+        facts: Vec<serde_json::Value>,
+    ) -> Result<String> {
+        use tinycloud_auth::ssi::{claims::jwt::NumericDate, dids::DIDURLBuf, ucan::Payload};
+        use tinycloud_auth::ucan_capabilities_object::Capabilities;
+
+        let mut invocation_caps = Capabilities::new();
+        invocation_caps.with_action(
+            setup.resource.as_uri(),
+            ability.parse::<UcanAbility>()?,
+            [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+        );
+        let invocation = Payload {
+            issuer: setup.verification_method.parse::<DIDURLBuf>()?,
+            audience: setup
+                .verification_method
+                .split('#')
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing did"))?
+                .parse::<DIDBuf>()?,
+            not_before: None,
+            expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
+            nonce: Some(nonce.to_string()),
+            facts: Some(facts),
+            proof: vec![setup.parent_cid],
+            attenuation: invocation_caps,
+        }
+        .sign(setup.jwk.get_algorithm().unwrap_or_default(), &setup.jwk)?;
+        Ok(invocation.encode()?)
+    }
+
+    /// One rocket instance per metered-SQL test, differing only in the
+    /// quota limit — keeps the managed-state set in a single place so it
+    /// can't drift from production wiring test-by-test.
+    fn metered_sql_rocket(
+        setup: MeteredSqlHttp,
+        limit: rocket::data::ByteUnit,
+    ) -> rocket::Rocket<rocket::Build> {
+        rocket::build()
+            .mount("/", routes![invoke])
+            .attach(crate::tracing::TracingFairing {
+                header_name: Config::default().log.tracing.traceheader,
+            })
+            .manage(setup.tinycloud)
+            .manage(setup.sql_service)
+            .manage(Config::default())
+            .manage(QuotaCache::new(Some(limit), None))
+            .manage(InvocationReplayCache::new())
+            .manage(HookRuntime::new(HooksConfig::default(), [9u8; 32]))
+            .manage(BlockStage::from(crate::config::StagingStorage::Memory))
+    }
+
+    #[tokio::test]
+    async fn sql_write_over_limit_returns_402_with_kv_message() -> Result<()> {
+        use rocket::data::ByteUnit;
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+
+        let setup = metered_sql_http_setup("sql-write-402").await?;
+        let used = setup.used;
+        let auth_header = sql_invocation_header(
+            &setup,
+            "tinycloud.sql/write",
+            "urn:uuid:00000000-0000-4000-8000-0000000000t2",
+        )?;
+
+        let client = Client::tracked(metered_sql_rocket(setup, ByteUnit::Byte(1))).await?;
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", auth_header))
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&SqlRequest::Execute {
+                schema: None,
+                sql: "INSERT INTO labels (label, val) VALUES ('gamma', 333)".to_string(),
+                params: vec![],
+            })?)
+            .dispatch()
+            .await;
+
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            Status::new(402),
+            "expected 402, got {status}: {body}"
+        );
+        assert_eq!(
+            body,
+            format!(
+                "Storage quota exceeded. Used: {} bytes, Limit: {} bytes",
+                used, 1
+            )
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_read_at_or_over_limit_returns_200() -> Result<()> {
+        use rocket::data::ByteUnit;
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+
+        let setup = metered_sql_http_setup("sql-read-200").await?;
+        let auth_header = sql_invocation_header(
+            &setup,
+            "tinycloud.sql/read",
+            "urn:uuid:00000000-0000-4000-8000-0000000000t2",
+        )?;
+
+        let client = Client::tracked(metered_sql_rocket(setup, ByteUnit::Byte(1))).await?;
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", auth_header))
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&SqlRequest::Query {
+                sql: "SELECT val FROM labels WHERE label = 'alpha'".to_string(),
+                params: vec![],
+            })?)
+            .dispatch()
+            .await;
+
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_ne!(status, Status::new(402), "reads must never 402: {body}");
+        assert_eq!(status, Status::Ok, "read over limit must succeed: {body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sql_write_under_limit_returns_200() -> Result<()> {
+        use rocket::data::ByteUnit;
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+
+        let setup = metered_sql_http_setup("sql-write-200").await?;
+        let auth_header = sql_invocation_header(
+            &setup,
+            "tinycloud.sql/write",
+            "urn:uuid:00000000-0000-4000-8000-0000000000t2",
+        )?;
+
+        let client =
+            Client::tracked(metered_sql_rocket(setup, ByteUnit::Byte(1_000_000_000))).await?;
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", auth_header))
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&SqlRequest::Execute {
+                schema: None,
+                sql: "INSERT INTO labels (label, val) VALUES ('gamma', 333)".to_string(),
+                params: vec![],
+            })?)
+            .dispatch()
+            .await;
+
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_ne!(
+            status,
+            Status::new(402),
+            "under-limit write must not 402: {body}"
+        );
+        assert_eq!(status, Status::Ok, "under-limit write must succeed: {body}");
+        Ok(())
+    }
+
+    /// Regression: a write wrapped in `ExecuteStatement` whose SQL is pinned
+    /// by the invoker's OWN invocation facts (the facts-caveats fallback, no
+    /// chain constrained caveat) must hit the 402 gate like any other write.
+    /// Before the classifier resolved the named statement, `ExecuteStatement`
+    /// was hard-coded non-write and this bypassed quota enforcement entirely.
+    #[tokio::test]
+    async fn sql_execute_statement_write_via_facts_over_limit_returns_402() -> Result<()> {
+        use rocket::data::ByteUnit;
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+
+        let setup = metered_sql_http_setup("sql-execstmt-402").await?;
+        let used = setup.used;
+        let facts = vec![serde_json::json!({
+            "sqlCaveats": {
+                "statements": [{
+                    "name": "w",
+                    "sql": "INSERT INTO labels (label, val) VALUES ('delta', 444)"
+                }]
+            }
+        })];
+        let auth_header = sql_invocation_header_with_facts(
+            &setup,
+            "tinycloud.sql/write",
+            "urn:uuid:00000000-0000-4000-8000-0000000000t2",
+            facts,
+        )?;
+
+        let client = Client::tracked(metered_sql_rocket(setup, ByteUnit::Byte(1))).await?;
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", auth_header))
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&SqlRequest::ExecuteStatement {
+                name: "w".to_string(),
+                params: vec![],
+            })?)
+            .dispatch()
+            .await;
+
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            Status::new(402),
+            "facts-pinned ExecuteStatement write must 402, got {status}: {body}"
+        );
+        assert_eq!(
+            body,
+            format!(
+                "Storage quota exceeded. Used: {} bytes, Limit: {} bytes",
+                used, 1
+            )
+        );
+        Ok(())
+    }
+
+    /// Regression: a read-only `ExecuteStatement` resolved from invocation
+    /// facts must NOT 402 even when the space is over its limit — reads
+    /// never pay the quota gate.
+    #[tokio::test]
+    async fn sql_execute_statement_read_via_facts_over_limit_returns_200() -> Result<()> {
+        use rocket::data::ByteUnit;
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+
+        let setup = metered_sql_http_setup("sql-execstmt-200").await?;
+        let facts = vec![serde_json::json!({
+            "sqlCaveats": {
+                "statements": [{
+                    "name": "r",
+                    "sql": "SELECT val FROM labels WHERE label = 'alpha'"
+                }]
+            }
+        })];
+        let auth_header = sql_invocation_header_with_facts(
+            &setup,
+            "tinycloud.sql/read",
+            "urn:uuid:00000000-0000-4000-8000-0000000000t2",
+            facts,
+        )?;
+
+        let client = Client::tracked(metered_sql_rocket(setup, ByteUnit::Byte(1))).await?;
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", auth_header))
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&SqlRequest::ExecuteStatement {
+                name: "r".to_string(),
+                params: vec![],
+            })?)
+            .dispatch()
+            .await;
+
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_ne!(
+            status,
+            Status::new(402),
+            "facts-pinned read must never 402: {body}"
+        );
+        assert_eq!(status, Status::Ok, "over-limit read must succeed: {body}");
+        Ok(())
+    }
+
+    /// Integration proof for the metering fold (§E.T3): a SQL write performed
+    /// directly against `sql_service` is visible through `tinycloud.store_size`
+    /// — the one number behind the admin meter (`get_quota`, admin.rs:114) and
+    /// the write-path quota gates — for a space whose FileSystem block store
+    /// never saw a byte. Before the fold, `store_size` counted blocks only, so
+    /// this SQL-only space would have reported `None`.
+    #[tokio::test]
+    async fn sql_write_is_visible_to_store_size() -> Result<()> {
+        // The helper pre-grows usage with a direct `sql_service.execute`
+        // (CREATE TABLE + INSERT) for a space block storage never saw.
+        let setup = metered_sql_http_setup("visible_to_store_size").await?;
+
+        let before = setup
+            .tinycloud
+            .store_size(&setup.space)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .expect("SQL-only space must fold to Some(usage)");
+        assert!(before > 0, "SQL write must be visible to store_size");
+
+        // A further direct SQL write is metered through the same fold.
+        setup
+            .sql_service
+            .execute(
+                &setup.space,
+                "main",
+                SqlRequest::Execute {
+                    schema: None,
+                    sql: "INSERT INTO labels (label, val) VALUES (?, ?)".to_string(),
+                    params: vec![SqlValue::Text("beta".to_string()), SqlValue::Integer(222)],
+                },
+                None,
+                "tinycloud.sql/write".to_string(),
+            )
+            .await?;
+
+        let after = setup
+            .tinycloud
+            .store_size(&setup.space)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .expect("SQL-only space must fold to Some(usage)");
+        assert!(
+            after >= before,
+            "further SQL write must not shrink the meter"
+        );
         Ok(())
     }
 }

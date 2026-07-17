@@ -1,0 +1,7 @@
+base58==2.1.1
+blake3==1.0.9
+cbor2==5.9.0
+eth-keys==0.7.0
+eth-hash[pycryptodome]==0.7.1
+eth-utils==5.3.1
+PyNaCl==1.6.2

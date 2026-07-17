@@ -1,0 +1,676 @@
+{
+  "description": "Producer/engine rejects before node import.",
+  "cases": [
+    {
+      "case": "grant-issuer-config-record-mismatch",
+      "enforcementLayer": "producer/engine",
+      "expectedVerdict": "reject",
+      "reason": "unauthorized-issuer",
+      "consultCase": "consult-7-02",
+      "ucan": {
+        "encoded": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4IjoiMEVxeU1uUXJ0S3M2RTJpOVJoWGs1dEFpU3JjYUFXdXZoU0NqTXNsM2h6YyJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vY29udmVyc2F0aW9ucyI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dLCJ0aW55Y2xvdWQuc3FsL3JlYWQiOlt7Im1vZGUiOiJjb25zdHJhaW5lZC1zdGF0ZW1lbnRzIiwicmVhZE9ubHkiOnRydWUsInN0YXRlbWVudHMiOlt7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5nZXRDb252ZXJzYXRpb24iLCJzcWwiOiJTRUxFQ1QgaWQsIHRpdGxlLCBzb3VyY2UsIHNvdXJjZV9pZCwgc291cmNlX3VybCwgc3RhcnRlZF9hdCwgZW5kZWRfYXQsIGR1cmF0aW9uX3NlY3MsIHN1bW1hcnksIG1ldGFkYXRhLCB0cmFuc2NyaXB0X2pzb24sIHRyYW5zY3JpcHRfdGV4dCwgY3JlYXRlZF9hdCwgdXBkYXRlZF9hdCBGUk9NIGNvbnZlcnNhdGlvbiBXSEVSRSBpZCA9ID8ifSx7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5saXN0UGFydGljaXBhbnRzIiwic3FsIjoiU0VMRUNUIGlkLCBuYW1lLCBlbWFpbCwgc3BlYWtlcl9sYWJlbCBGUk9NIHBhcnRpY2lwYW50IFdIRVJFIGNvbnZlcnNhdGlvbl9pZCA9ID8gT1JERVIgQlkgQ09BTEVTQ0Uoc3BlYWtlcl9sYWJlbCwgbmFtZSksIGlkIn1dfV19fSwiYXVkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUiLCJleHAiOjE3ODM2ODUxMDAsImZjdCI6W3sieHl6LnRpbnljbG91ZC5wb2xpY3kvY2FwYWJpbGl0eUhhc2hIZXgiOiIwNGJkNTRlYTdjNTllZmRkMjEzNTFjOTc1ZDEyZGVhNzU3ODQwYTcyM2NmNTQxNzcwOWM3Y2I0YzBhYjFiMGVlIiwieHl6LnRpbnljbG91ZC5wb2xpY3kvZGVsZWdhdGlvbk1vZGUiOiJ0ZXJtaW5hbCIsInh5ei50aW55Y2xvdWQucG9saWN5L2lzc3VhbmNlSWQiOiJpc3NfbTFnMDZfMDAwMDAwMDEiLCJ4eXoudGlueWNsb3VkLnBvbGljeS9wb2xpY3lJZCI6InBvbF9tMWcwNl90cmFuc2NyaXB0IiwieHl6LnRpbnljbG91ZC5wb2xpY3kvcmV2b2NhdGlvbk1vZGUiOiJyZWZyZXNoX29ubHkifV0sImlzcyI6ImRpZDprZXk6ejZNa3RVTHVkVHRBc0FoUmVnWVBpWjY2MzFSVjN2aXYxMnFkNEdRRjh6MXhCMjJTI3o2TWt0VUx1ZFR0QXNBaFJlZ1lQaVo2NjMxUlYzdml2MTJxZDRHUUY4ejF4QjIyUyIsIm5iZiI6MTc4MzY4NDgwMCwibm5jIjoibTEtZy0wNi1maXhlZC1ub25jZSIsInByZiI6WyJiYWZrcjRpZ2xpZmp0YTRmYWU1ZWN4NWpybWdyeHJ4aG96NWx1eXUzbzR2NWI3YW9mcW1mbXpnZm1heSJdfQ.jVPd6ovRR8mB1zglUxxLk3XuWNnZxWdpBrtxhGHlWUHuFvacLrogrbjy_cQVXFXOGp74Sci_rOCauTI08xhECw",
+        "header": {
+          "alg": "EdDSA",
+          "typ": "JWT",
+          "ucv": "0.10.0",
+          "jwk": {
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc",
+            "alg": "EdDSA"
+          }
+        },
+        "payload": {
+          "iss": "did:key:z6MktULudTtAsAhRegYPiZ6631RV3viv12qd4GQF8z1xB22S#z6MktULudTtAsAhRegYPiZ6631RV3viv12qd4GQF8z1xB22S",
+          "aud": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5",
+          "nbf": 1783684800,
+          "exp": 1783685100,
+          "nnc": "m1-g-06-fixed-nonce",
+          "fct": [
+            {
+              "xyz.tinycloud.policy/delegationMode": "terminal",
+              "xyz.tinycloud.policy/policyId": "pol_m1g06_transcript",
+              "xyz.tinycloud.policy/capabilityHashHex": "04bd54ea7c59efdd21351c975d12dea757840a723cf5417709c7cb4c0ab1b0ee",
+              "xyz.tinycloud.policy/revocationMode": "refresh_only",
+              "xyz.tinycloud.policy/issuanceId": "iss_m1g06_00000001"
+            }
+          ],
+          "prf": [
+            "bafkr4iglifjta4fae5ecx5jrmgrxrxhoz5luyu3o4v5b7aofqmfmzgfmay"
+          ],
+          "att": {
+            "tinycloud:pkh:eip155:1:0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf:default/sql/xyz.tinycloud.listen/conversations": {
+              "tinycloud.kv/get": [
+                {}
+              ],
+              "tinycloud.sql/read": [
+                {
+                  "mode": "constrained-statements",
+                  "readOnly": true,
+                  "statements": [
+                    {
+                      "name": "listen.getConversation",
+                      "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+                      "fixedParams": [
+                        {
+                          "index": 0,
+                          "value": "conv_456"
+                        }
+                      ]
+                    },
+                    {
+                      "name": "listen.listParticipants",
+                      "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+                      "fixedParams": [
+                        {
+                          "index": 0,
+                          "value": "conv_456"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "signerDid": "did:key:z6MktULudTtAsAhRegYPiZ6631RV3viv12qd4GQF8z1xB22S",
+        "signingInputAscii": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4IjoiMEVxeU1uUXJ0S3M2RTJpOVJoWGs1dEFpU3JjYUFXdXZoU0NqTXNsM2h6YyJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vY29udmVyc2F0aW9ucyI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dLCJ0aW55Y2xvdWQuc3FsL3JlYWQiOlt7Im1vZGUiOiJjb25zdHJhaW5lZC1zdGF0ZW1lbnRzIiwicmVhZE9ubHkiOnRydWUsInN0YXRlbWVudHMiOlt7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5nZXRDb252ZXJzYXRpb24iLCJzcWwiOiJTRUxFQ1QgaWQsIHRpdGxlLCBzb3VyY2UsIHNvdXJjZV9pZCwgc291cmNlX3VybCwgc3RhcnRlZF9hdCwgZW5kZWRfYXQsIGR1cmF0aW9uX3NlY3MsIHN1bW1hcnksIG1ldGFkYXRhLCB0cmFuc2NyaXB0X2pzb24sIHRyYW5zY3JpcHRfdGV4dCwgY3JlYXRlZF9hdCwgdXBkYXRlZF9hdCBGUk9NIGNvbnZlcnNhdGlvbiBXSEVSRSBpZCA9ID8ifSx7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5saXN0UGFydGljaXBhbnRzIiwic3FsIjoiU0VMRUNUIGlkLCBuYW1lLCBlbWFpbCwgc3BlYWtlcl9sYWJlbCBGUk9NIHBhcnRpY2lwYW50IFdIRVJFIGNvbnZlcnNhdGlvbl9pZCA9ID8gT1JERVIgQlkgQ09BTEVTQ0Uoc3BlYWtlcl9sYWJlbCwgbmFtZSksIGlkIn1dfV19fSwiYXVkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUiLCJleHAiOjE3ODM2ODUxMDAsImZjdCI6W3sieHl6LnRpbnljbG91ZC5wb2xpY3kvY2FwYWJpbGl0eUhhc2hIZXgiOiIwNGJkNTRlYTdjNTllZmRkMjEzNTFjOTc1ZDEyZGVhNzU3ODQwYTcyM2NmNTQxNzcwOWM3Y2I0YzBhYjFiMGVlIiwieHl6LnRpbnljbG91ZC5wb2xpY3kvZGVsZWdhdGlvbk1vZGUiOiJ0ZXJtaW5hbCIsInh5ei50aW55Y2xvdWQucG9saWN5L2lzc3VhbmNlSWQiOiJpc3NfbTFnMDZfMDAwMDAwMDEiLCJ4eXoudGlueWNsb3VkLnBvbGljeS9wb2xpY3lJZCI6InBvbF9tMWcwNl90cmFuc2NyaXB0IiwieHl6LnRpbnljbG91ZC5wb2xpY3kvcmV2b2NhdGlvbk1vZGUiOiJyZWZyZXNoX29ubHkifV0sImlzcyI6ImRpZDprZXk6ejZNa3RVTHVkVHRBc0FoUmVnWVBpWjY2MzFSVjN2aXYxMnFkNEdRRjh6MXhCMjJTI3o2TWt0VUx1ZFR0QXNBaFJlZ1lQaVo2NjMxUlYzdml2MTJxZDRHUUY4ejF4QjIyUyIsIm5iZiI6MTc4MzY4NDgwMCwibm5jIjoibTEtZy0wNi1maXhlZC1ub25jZSIsInByZiI6WyJiYWZrcjRpZ2xpZmp0YTRmYWU1ZWN4NWpybWdyeHJ4aG96NWx1eXUzbzR2NWI3YW9mcW1mbXpnZm1heSJdfQ",
+        "signatureHex": "8d53ddea8bd147c981d73825531c4b9375ee58d9d9c5676906bb718461e55941ee16f69c2eba20adb8f2fdc4155c55ce1a9ef849c8bface09ab93234f318440b",
+        "delegationId": "bafkr4ia6ce5nyknzwrvybn3ypgdlkzcr35tam5jk3nr32mwoecdboikvyi",
+        "delegationIdBytesHex": "01551e201e113adc29b9b46b80b7787986b56451df6606752adb63bd32ce2086172155c2"
+      },
+      "configuredGrantIssuerDid": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+      "engineRecordGrantIssuerDid": "did:key:z6MktULudTtAsAhRegYPiZ6631RV3viv12qd4GQF8z1xB22S",
+      "observedTokenIssuerDid": "did:key:z6MktULudTtAsAhRegYPiZ6631RV3viv12qd4GQF8z1xB22S"
+    },
+    {
+      "case": "owner-impersonation",
+      "enforcementLayer": "producer/engine",
+      "expectedVerdict": "reject",
+      "reason": "owner-did-is-not-the-grant-issuer",
+      "consultCase": "consult-7-02",
+      "configuredGrantIssuerDid": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+      "engineRecordGrantIssuerDid": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+      "observedTokenIssuerDid": "did:pkh:eip155:1:0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
+    },
+    {
+      "case": "missing-terminal-mode-fact",
+      "enforcementLayer": "producer/engine",
+      "expectedVerdict": "reject",
+      "reason": "missing-terminal-mode-fact",
+      "consultCase": "consult-7-03",
+      "ucan": {
+        "encoded": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4Ijoib0pxbDlIcG5XWUF2LVZYNDNDMHFGS1hKblNPLWxfaGtFbl81T0RSVnBQQSJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vY29udmVyc2F0aW9ucyI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dLCJ0aW55Y2xvdWQuc3FsL3JlYWQiOlt7Im1vZGUiOiJjb25zdHJhaW5lZC1zdGF0ZW1lbnRzIiwicmVhZE9ubHkiOnRydWUsInN0YXRlbWVudHMiOlt7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5nZXRDb252ZXJzYXRpb24iLCJzcWwiOiJTRUxFQ1QgaWQsIHRpdGxlLCBzb3VyY2UsIHNvdXJjZV9pZCwgc291cmNlX3VybCwgc3RhcnRlZF9hdCwgZW5kZWRfYXQsIGR1cmF0aW9uX3NlY3MsIHN1bW1hcnksIG1ldGFkYXRhLCB0cmFuc2NyaXB0X2pzb24sIHRyYW5zY3JpcHRfdGV4dCwgY3JlYXRlZF9hdCwgdXBkYXRlZF9hdCBGUk9NIGNvbnZlcnNhdGlvbiBXSEVSRSBpZCA9ID8ifSx7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5saXN0UGFydGljaXBhbnRzIiwic3FsIjoiU0VMRUNUIGlkLCBuYW1lLCBlbWFpbCwgc3BlYWtlcl9sYWJlbCBGUk9NIHBhcnRpY2lwYW50IFdIRVJFIGNvbnZlcnNhdGlvbl9pZCA9ID8gT1JERVIgQlkgQ09BTEVTQ0Uoc3BlYWtlcl9sYWJlbCwgbmFtZSksIGlkIn1dfV19fSwiYXVkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUiLCJleHAiOjE3ODM2ODUxMDAsImZjdCI6W3sieHl6LnRpbnljbG91ZC5wb2xpY3kvY2FwYWJpbGl0eUhhc2hIZXgiOiIwNGJkNTRlYTdjNTllZmRkMjEzNTFjOTc1ZDEyZGVhNzU3ODQwYTcyM2NmNTQxNzcwOWM3Y2I0YzBhYjFiMGVlIiwieHl6LnRpbnljbG91ZC5wb2xpY3kvaXNzdWFuY2VJZCI6Imlzc19tMWcwNl8wMDAwMDAwMSIsInh5ei50aW55Y2xvdWQucG9saWN5L3BvbGljeUlkIjoicG9sX20xZzA2X3RyYW5zY3JpcHQiLCJ4eXoudGlueWNsb3VkLnBvbGljeS9yZXZvY2F0aW9uTW9kZSI6InJlZnJlc2hfb25seSJ9XSwiaXNzIjoiZGlkOmtleTp6Nk1rcUdDM25XWmhZaWVFVlRWREtXNXY1ODhDaUdmc0RTbVJWRzlad3dXVHZMU0sjejZNa3FHQzNuV1poWWllRVZUVkRLVzV2NTg4Q2lHZnNEU21SVkc5Wnd3V1R2TFNLIiwibmJmIjoxNzgzNjg0ODAwLCJubmMiOiJtMS1nLTA2LWZpeGVkLW5vbmNlIiwicHJmIjpbImJhZmtyNGlnbGlmanRhNGZhZTVlY3g1anJtZ3J4cnhob3o1bHV5dTNvNHY1Yjdhb2ZxbWZtemdmbWF5Il19.jYiXPN9PlbwxFy8sTG5Wf10tyXEr6_KKxfRqhHXaehUciAdTxuGclbBWop_e2BBBbehl6uw3P0d0KO5VWnQiBA",
+        "header": {
+          "alg": "EdDSA",
+          "typ": "JWT",
+          "ucv": "0.10.0",
+          "jwk": {
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "oJql9HpnWYAv-VX43C0qFKXJnSO-l_hkEn_5ODRVpPA",
+            "alg": "EdDSA"
+          }
+        },
+        "payload": {
+          "iss": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK#z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+          "aud": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5",
+          "nbf": 1783684800,
+          "exp": 1783685100,
+          "nnc": "m1-g-06-fixed-nonce",
+          "fct": [
+            {
+              "xyz.tinycloud.policy/policyId": "pol_m1g06_transcript",
+              "xyz.tinycloud.policy/capabilityHashHex": "04bd54ea7c59efdd21351c975d12dea757840a723cf5417709c7cb4c0ab1b0ee",
+              "xyz.tinycloud.policy/revocationMode": "refresh_only",
+              "xyz.tinycloud.policy/issuanceId": "iss_m1g06_00000001"
+            }
+          ],
+          "prf": [
+            "bafkr4iglifjta4fae5ecx5jrmgrxrxhoz5luyu3o4v5b7aofqmfmzgfmay"
+          ],
+          "att": {
+            "tinycloud:pkh:eip155:1:0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf:default/sql/xyz.tinycloud.listen/conversations": {
+              "tinycloud.kv/get": [
+                {}
+              ],
+              "tinycloud.sql/read": [
+                {
+                  "mode": "constrained-statements",
+                  "readOnly": true,
+                  "statements": [
+                    {
+                      "name": "listen.getConversation",
+                      "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+                      "fixedParams": [
+                        {
+                          "index": 0,
+                          "value": "conv_456"
+                        }
+                      ]
+                    },
+                    {
+                      "name": "listen.listParticipants",
+                      "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+                      "fixedParams": [
+                        {
+                          "index": 0,
+                          "value": "conv_456"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "signerDid": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+        "signingInputAscii": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4Ijoib0pxbDlIcG5XWUF2LVZYNDNDMHFGS1hKblNPLWxfaGtFbl81T0RSVnBQQSJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vY29udmVyc2F0aW9ucyI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dLCJ0aW55Y2xvdWQuc3FsL3JlYWQiOlt7Im1vZGUiOiJjb25zdHJhaW5lZC1zdGF0ZW1lbnRzIiwicmVhZE9ubHkiOnRydWUsInN0YXRlbWVudHMiOlt7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5nZXRDb252ZXJzYXRpb24iLCJzcWwiOiJTRUxFQ1QgaWQsIHRpdGxlLCBzb3VyY2UsIHNvdXJjZV9pZCwgc291cmNlX3VybCwgc3RhcnRlZF9hdCwgZW5kZWRfYXQsIGR1cmF0aW9uX3NlY3MsIHN1bW1hcnksIG1ldGFkYXRhLCB0cmFuc2NyaXB0X2pzb24sIHRyYW5zY3JpcHRfdGV4dCwgY3JlYXRlZF9hdCwgdXBkYXRlZF9hdCBGUk9NIGNvbnZlcnNhdGlvbiBXSEVSRSBpZCA9ID8ifSx7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5saXN0UGFydGljaXBhbnRzIiwic3FsIjoiU0VMRUNUIGlkLCBuYW1lLCBlbWFpbCwgc3BlYWtlcl9sYWJlbCBGUk9NIHBhcnRpY2lwYW50IFdIRVJFIGNvbnZlcnNhdGlvbl9pZCA9ID8gT1JERVIgQlkgQ09BTEVTQ0Uoc3BlYWtlcl9sYWJlbCwgbmFtZSksIGlkIn1dfV19fSwiYXVkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUiLCJleHAiOjE3ODM2ODUxMDAsImZjdCI6W3sieHl6LnRpbnljbG91ZC5wb2xpY3kvY2FwYWJpbGl0eUhhc2hIZXgiOiIwNGJkNTRlYTdjNTllZmRkMjEzNTFjOTc1ZDEyZGVhNzU3ODQwYTcyM2NmNTQxNzcwOWM3Y2I0YzBhYjFiMGVlIiwieHl6LnRpbnljbG91ZC5wb2xpY3kvaXNzdWFuY2VJZCI6Imlzc19tMWcwNl8wMDAwMDAwMSIsInh5ei50aW55Y2xvdWQucG9saWN5L3BvbGljeUlkIjoicG9sX20xZzA2X3RyYW5zY3JpcHQiLCJ4eXoudGlueWNsb3VkLnBvbGljeS9yZXZvY2F0aW9uTW9kZSI6InJlZnJlc2hfb25seSJ9XSwiaXNzIjoiZGlkOmtleTp6Nk1rcUdDM25XWmhZaWVFVlRWREtXNXY1ODhDaUdmc0RTbVJWRzlad3dXVHZMU0sjejZNa3FHQzNuV1poWWllRVZUVkRLVzV2NTg4Q2lHZnNEU21SVkc5Wnd3V1R2TFNLIiwibmJmIjoxNzgzNjg0ODAwLCJubmMiOiJtMS1nLTA2LWZpeGVkLW5vbmNlIiwicHJmIjpbImJhZmtyNGlnbGlmanRhNGZhZTVlY3g1anJtZ3J4cnhob3o1bHV5dTNvNHY1Yjdhb2ZxbWZtemdmbWF5Il19",
+        "signatureHex": "8d88973cdf4f95bc31172f2c4c6e567f5d2dc9712bebf28ac5f46a8475da7a151c880753c6e19c95b056a29fded810416de865eaec373f477428ee555a742204",
+        "delegationId": "bafkr4ibk7lko3azxmog52rz6q7sckox37mu6i5jtavcj63i33ubtxfz5wq",
+        "delegationIdBytesHex": "01551e202afad4ed8337638ddd473e87e4253afbfb29e4753305449f6d1bdd033b973db4"
+      }
+    },
+    {
+      "case": "expiry-beyond-policy-presentation-or-ttl-ceiling",
+      "enforcementLayer": "producer/engine",
+      "expectedVerdict": "reject",
+      "reason": "expiry-ceiling-exceeded",
+      "consultCase": "consult-7-04",
+      "ucan": {
+        "encoded": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4Ijoib0pxbDlIcG5XWUF2LVZYNDNDMHFGS1hKblNPLWxfaGtFbl81T0RSVnBQQSJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vY29udmVyc2F0aW9ucyI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dLCJ0aW55Y2xvdWQuc3FsL3JlYWQiOlt7Im1vZGUiOiJjb25zdHJhaW5lZC1zdGF0ZW1lbnRzIiwicmVhZE9ubHkiOnRydWUsInN0YXRlbWVudHMiOlt7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5nZXRDb252ZXJzYXRpb24iLCJzcWwiOiJTRUxFQ1QgaWQsIHRpdGxlLCBzb3VyY2UsIHNvdXJjZV9pZCwgc291cmNlX3VybCwgc3RhcnRlZF9hdCwgZW5kZWRfYXQsIGR1cmF0aW9uX3NlY3MsIHN1bW1hcnksIG1ldGFkYXRhLCB0cmFuc2NyaXB0X2pzb24sIHRyYW5zY3JpcHRfdGV4dCwgY3JlYXRlZF9hdCwgdXBkYXRlZF9hdCBGUk9NIGNvbnZlcnNhdGlvbiBXSEVSRSBpZCA9ID8ifSx7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5saXN0UGFydGljaXBhbnRzIiwic3FsIjoiU0VMRUNUIGlkLCBuYW1lLCBlbWFpbCwgc3BlYWtlcl9sYWJlbCBGUk9NIHBhcnRpY2lwYW50IFdIRVJFIGNvbnZlcnNhdGlvbl9pZCA9ID8gT1JERVIgQlkgQ09BTEVTQ0Uoc3BlYWtlcl9sYWJlbCwgbmFtZSksIGlkIn1dfV19fSwiYXVkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUiLCJleHAiOjE3ODM2ODUxMDEsImZjdCI6W3sieHl6LnRpbnljbG91ZC5wb2xpY3kvY2FwYWJpbGl0eUhhc2hIZXgiOiIwNGJkNTRlYTdjNTllZmRkMjEzNTFjOTc1ZDEyZGVhNzU3ODQwYTcyM2NmNTQxNzcwOWM3Y2I0YzBhYjFiMGVlIiwieHl6LnRpbnljbG91ZC5wb2xpY3kvZGVsZWdhdGlvbk1vZGUiOiJ0ZXJtaW5hbCIsInh5ei50aW55Y2xvdWQucG9saWN5L2lzc3VhbmNlSWQiOiJpc3NfbTFnMDZfMDAwMDAwMDEiLCJ4eXoudGlueWNsb3VkLnBvbGljeS9wb2xpY3lJZCI6InBvbF9tMWcwNl90cmFuc2NyaXB0IiwieHl6LnRpbnljbG91ZC5wb2xpY3kvcmV2b2NhdGlvbk1vZGUiOiJyZWZyZXNoX29ubHkifV0sImlzcyI6ImRpZDprZXk6ejZNa3FHQzNuV1poWWllRVZUVkRLVzV2NTg4Q2lHZnNEU21SVkc5Wnd3V1R2TFNLI3o2TWtxR0MzbldaaFlpZUVWVFZES1c1djU4OENpR2ZzRFNtUlZHOVp3d1dUdkxTSyIsIm5iZiI6MTc4MzY4NDgwMCwibm5jIjoibTEtZy0wNi1maXhlZC1ub25jZSIsInByZiI6WyJiYWZrcjRpZ2xpZmp0YTRmYWU1ZWN4NWpybWdyeHJ4aG96NWx1eXUzbzR2NWI3YW9mcW1mbXpnZm1heSJdfQ.3ZJua91OhjhK4uwvpdpmwDncZjiw6b243AN3BJqwPBT2h19BJd01re8Me0Mt_g7d5jgJ0aHDJr4kSmO6QTfICw",
+        "header": {
+          "alg": "EdDSA",
+          "typ": "JWT",
+          "ucv": "0.10.0",
+          "jwk": {
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "oJql9HpnWYAv-VX43C0qFKXJnSO-l_hkEn_5ODRVpPA",
+            "alg": "EdDSA"
+          }
+        },
+        "payload": {
+          "iss": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK#z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+          "aud": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5",
+          "nbf": 1783684800,
+          "exp": 1783685101,
+          "nnc": "m1-g-06-fixed-nonce",
+          "fct": [
+            {
+              "xyz.tinycloud.policy/delegationMode": "terminal",
+              "xyz.tinycloud.policy/policyId": "pol_m1g06_transcript",
+              "xyz.tinycloud.policy/capabilityHashHex": "04bd54ea7c59efdd21351c975d12dea757840a723cf5417709c7cb4c0ab1b0ee",
+              "xyz.tinycloud.policy/revocationMode": "refresh_only",
+              "xyz.tinycloud.policy/issuanceId": "iss_m1g06_00000001"
+            }
+          ],
+          "prf": [
+            "bafkr4iglifjta4fae5ecx5jrmgrxrxhoz5luyu3o4v5b7aofqmfmzgfmay"
+          ],
+          "att": {
+            "tinycloud:pkh:eip155:1:0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf:default/sql/xyz.tinycloud.listen/conversations": {
+              "tinycloud.kv/get": [
+                {}
+              ],
+              "tinycloud.sql/read": [
+                {
+                  "mode": "constrained-statements",
+                  "readOnly": true,
+                  "statements": [
+                    {
+                      "name": "listen.getConversation",
+                      "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+                      "fixedParams": [
+                        {
+                          "index": 0,
+                          "value": "conv_456"
+                        }
+                      ]
+                    },
+                    {
+                      "name": "listen.listParticipants",
+                      "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+                      "fixedParams": [
+                        {
+                          "index": 0,
+                          "value": "conv_456"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "signerDid": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+        "signingInputAscii": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4Ijoib0pxbDlIcG5XWUF2LVZYNDNDMHFGS1hKblNPLWxfaGtFbl81T0RSVnBQQSJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vY29udmVyc2F0aW9ucyI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dLCJ0aW55Y2xvdWQuc3FsL3JlYWQiOlt7Im1vZGUiOiJjb25zdHJhaW5lZC1zdGF0ZW1lbnRzIiwicmVhZE9ubHkiOnRydWUsInN0YXRlbWVudHMiOlt7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5nZXRDb252ZXJzYXRpb24iLCJzcWwiOiJTRUxFQ1QgaWQsIHRpdGxlLCBzb3VyY2UsIHNvdXJjZV9pZCwgc291cmNlX3VybCwgc3RhcnRlZF9hdCwgZW5kZWRfYXQsIGR1cmF0aW9uX3NlY3MsIHN1bW1hcnksIG1ldGFkYXRhLCB0cmFuc2NyaXB0X2pzb24sIHRyYW5zY3JpcHRfdGV4dCwgY3JlYXRlZF9hdCwgdXBkYXRlZF9hdCBGUk9NIGNvbnZlcnNhdGlvbiBXSEVSRSBpZCA9ID8ifSx7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5saXN0UGFydGljaXBhbnRzIiwic3FsIjoiU0VMRUNUIGlkLCBuYW1lLCBlbWFpbCwgc3BlYWtlcl9sYWJlbCBGUk9NIHBhcnRpY2lwYW50IFdIRVJFIGNvbnZlcnNhdGlvbl9pZCA9ID8gT1JERVIgQlkgQ09BTEVTQ0Uoc3BlYWtlcl9sYWJlbCwgbmFtZSksIGlkIn1dfV19fSwiYXVkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUiLCJleHAiOjE3ODM2ODUxMDEsImZjdCI6W3sieHl6LnRpbnljbG91ZC5wb2xpY3kvY2FwYWJpbGl0eUhhc2hIZXgiOiIwNGJkNTRlYTdjNTllZmRkMjEzNTFjOTc1ZDEyZGVhNzU3ODQwYTcyM2NmNTQxNzcwOWM3Y2I0YzBhYjFiMGVlIiwieHl6LnRpbnljbG91ZC5wb2xpY3kvZGVsZWdhdGlvbk1vZGUiOiJ0ZXJtaW5hbCIsInh5ei50aW55Y2xvdWQucG9saWN5L2lzc3VhbmNlSWQiOiJpc3NfbTFnMDZfMDAwMDAwMDEiLCJ4eXoudGlueWNsb3VkLnBvbGljeS9wb2xpY3lJZCI6InBvbF9tMWcwNl90cmFuc2NyaXB0IiwieHl6LnRpbnljbG91ZC5wb2xpY3kvcmV2b2NhdGlvbk1vZGUiOiJyZWZyZXNoX29ubHkifV0sImlzcyI6ImRpZDprZXk6ejZNa3FHQzNuV1poWWllRVZUVkRLVzV2NTg4Q2lHZnNEU21SVkc5Wnd3V1R2TFNLI3o2TWtxR0MzbldaaFlpZUVWVFZES1c1djU4OENpR2ZzRFNtUlZHOVp3d1dUdkxTSyIsIm5iZiI6MTc4MzY4NDgwMCwibm5jIjoibTEtZy0wNi1maXhlZC1ub25jZSIsInByZiI6WyJiYWZrcjRpZ2xpZmp0YTRmYWU1ZWN4NWpybWdyeHJ4aG96NWx1eXUzbzR2NWI3YW9mcW1mbXpnZm1heSJdfQ",
+        "signatureHex": "dd926e6bdd4e86384ae2ec2fa5da66c039dc6638b0e9bdb8dc0377049ab03c14f6875f4125dd35adef0c7b432dfe0edde63809d1a1c326be244a63ba4137c80b",
+        "delegationId": "bafkr4icodzfnec2pwcivov3ot4hcky57qlegyp2y3bxu3nafinynyjo4l4",
+        "delegationIdBytesHex": "01551e204e1e4ad20b4fb09157576e9f0e2563bf82c86c3f58d86f4db4054370dc25dc5f"
+      },
+      "ceilings": {
+        "policyEpochSeconds": 1783685160,
+        "presentationEpochSeconds": 1783685160,
+        "maxTtlSeconds": 300,
+        "parentEpochSeconds": 1815220800
+      }
+    },
+    {
+      "case": "expiry-beyond-policy-ceiling",
+      "enforcementLayer": "producer/engine",
+      "expectedVerdict": "reject",
+      "reason": "expiry-ceiling-exceeded",
+      "consultCase": "consult-7-04",
+      "ucan": {
+        "encoded": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4Ijoib0pxbDlIcG5XWUF2LVZYNDNDMHFGS1hKblNPLWxfaGtFbl81T0RSVnBQQSJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vY29udmVyc2F0aW9ucyI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dLCJ0aW55Y2xvdWQuc3FsL3JlYWQiOlt7Im1vZGUiOiJjb25zdHJhaW5lZC1zdGF0ZW1lbnRzIiwicmVhZE9ubHkiOnRydWUsInN0YXRlbWVudHMiOlt7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5nZXRDb252ZXJzYXRpb24iLCJzcWwiOiJTRUxFQ1QgaWQsIHRpdGxlLCBzb3VyY2UsIHNvdXJjZV9pZCwgc291cmNlX3VybCwgc3RhcnRlZF9hdCwgZW5kZWRfYXQsIGR1cmF0aW9uX3NlY3MsIHN1bW1hcnksIG1ldGFkYXRhLCB0cmFuc2NyaXB0X2pzb24sIHRyYW5zY3JpcHRfdGV4dCwgY3JlYXRlZF9hdCwgdXBkYXRlZF9hdCBGUk9NIGNvbnZlcnNhdGlvbiBXSEVSRSBpZCA9ID8ifSx7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5saXN0UGFydGljaXBhbnRzIiwic3FsIjoiU0VMRUNUIGlkLCBuYW1lLCBlbWFpbCwgc3BlYWtlcl9sYWJlbCBGUk9NIHBhcnRpY2lwYW50IFdIRVJFIGNvbnZlcnNhdGlvbl9pZCA9ID8gT1JERVIgQlkgQ09BTEVTQ0Uoc3BlYWtlcl9sYWJlbCwgbmFtZSksIGlkIn1dfV19fSwiYXVkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUiLCJleHAiOjE3ODM2ODUxMDAsImZjdCI6W3sieHl6LnRpbnljbG91ZC5wb2xpY3kvY2FwYWJpbGl0eUhhc2hIZXgiOiIwNGJkNTRlYTdjNTllZmRkMjEzNTFjOTc1ZDEyZGVhNzU3ODQwYTcyM2NmNTQxNzcwOWM3Y2I0YzBhYjFiMGVlIiwieHl6LnRpbnljbG91ZC5wb2xpY3kvZGVsZWdhdGlvbk1vZGUiOiJ0ZXJtaW5hbCIsInh5ei50aW55Y2xvdWQucG9saWN5L2lzc3VhbmNlSWQiOiJpc3NfbTFnMDZfMDAwMDAwMDEiLCJ4eXoudGlueWNsb3VkLnBvbGljeS9wb2xpY3lJZCI6InBvbF9tMWcwNl90cmFuc2NyaXB0IiwieHl6LnRpbnljbG91ZC5wb2xpY3kvcmV2b2NhdGlvbk1vZGUiOiJyZWZyZXNoX29ubHkifV0sImlzcyI6ImRpZDprZXk6ejZNa3FHQzNuV1poWWllRVZUVkRLVzV2NTg4Q2lHZnNEU21SVkc5Wnd3V1R2TFNLI3o2TWtxR0MzbldaaFlpZUVWVFZES1c1djU4OENpR2ZzRFNtUlZHOVp3d1dUdkxTSyIsIm5iZiI6MTc4MzY4NDgwMCwibm5jIjoibTEtZy0wNi1maXhlZC1ub25jZSIsInByZiI6WyJiYWZrcjRpZ2xpZmp0YTRmYWU1ZWN4NWpybWdyeHJ4aG96NWx1eXUzbzR2NWI3YW9mcW1mbXpnZm1heSJdfQ.nuFCoCUdZ3CIhrhYABmu5iaaPEJfGKkhsxv-j-x0q3vONMPidQZSRErvkTZxPHc5Vr9tzLZSqjarqUljBqpxDA",
+        "header": {
+          "alg": "EdDSA",
+          "typ": "JWT",
+          "ucv": "0.10.0",
+          "jwk": {
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "oJql9HpnWYAv-VX43C0qFKXJnSO-l_hkEn_5ODRVpPA",
+            "alg": "EdDSA"
+          }
+        },
+        "payload": {
+          "iss": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK#z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+          "aud": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5",
+          "nbf": 1783684800,
+          "exp": 1783685100,
+          "nnc": "m1-g-06-fixed-nonce",
+          "fct": [
+            {
+              "xyz.tinycloud.policy/delegationMode": "terminal",
+              "xyz.tinycloud.policy/policyId": "pol_m1g06_transcript",
+              "xyz.tinycloud.policy/capabilityHashHex": "04bd54ea7c59efdd21351c975d12dea757840a723cf5417709c7cb4c0ab1b0ee",
+              "xyz.tinycloud.policy/revocationMode": "refresh_only",
+              "xyz.tinycloud.policy/issuanceId": "iss_m1g06_00000001"
+            }
+          ],
+          "prf": [
+            "bafkr4iglifjta4fae5ecx5jrmgrxrxhoz5luyu3o4v5b7aofqmfmzgfmay"
+          ],
+          "att": {
+            "tinycloud:pkh:eip155:1:0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf:default/sql/xyz.tinycloud.listen/conversations": {
+              "tinycloud.kv/get": [
+                {}
+              ],
+              "tinycloud.sql/read": [
+                {
+                  "mode": "constrained-statements",
+                  "readOnly": true,
+                  "statements": [
+                    {
+                      "name": "listen.getConversation",
+                      "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+                      "fixedParams": [
+                        {
+                          "index": 0,
+                          "value": "conv_456"
+                        }
+                      ]
+                    },
+                    {
+                      "name": "listen.listParticipants",
+                      "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+                      "fixedParams": [
+                        {
+                          "index": 0,
+                          "value": "conv_456"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "signerDid": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+        "signingInputAscii": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4Ijoib0pxbDlIcG5XWUF2LVZYNDNDMHFGS1hKblNPLWxfaGtFbl81T0RSVnBQQSJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vY29udmVyc2F0aW9ucyI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dLCJ0aW55Y2xvdWQuc3FsL3JlYWQiOlt7Im1vZGUiOiJjb25zdHJhaW5lZC1zdGF0ZW1lbnRzIiwicmVhZE9ubHkiOnRydWUsInN0YXRlbWVudHMiOlt7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5nZXRDb252ZXJzYXRpb24iLCJzcWwiOiJTRUxFQ1QgaWQsIHRpdGxlLCBzb3VyY2UsIHNvdXJjZV9pZCwgc291cmNlX3VybCwgc3RhcnRlZF9hdCwgZW5kZWRfYXQsIGR1cmF0aW9uX3NlY3MsIHN1bW1hcnksIG1ldGFkYXRhLCB0cmFuc2NyaXB0X2pzb24sIHRyYW5zY3JpcHRfdGV4dCwgY3JlYXRlZF9hdCwgdXBkYXRlZF9hdCBGUk9NIGNvbnZlcnNhdGlvbiBXSEVSRSBpZCA9ID8ifSx7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5saXN0UGFydGljaXBhbnRzIiwic3FsIjoiU0VMRUNUIGlkLCBuYW1lLCBlbWFpbCwgc3BlYWtlcl9sYWJlbCBGUk9NIHBhcnRpY2lwYW50IFdIRVJFIGNvbnZlcnNhdGlvbl9pZCA9ID8gT1JERVIgQlkgQ09BTEVTQ0Uoc3BlYWtlcl9sYWJlbCwgbmFtZSksIGlkIn1dfV19fSwiYXVkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUiLCJleHAiOjE3ODM2ODUxMDAsImZjdCI6W3sieHl6LnRpbnljbG91ZC5wb2xpY3kvY2FwYWJpbGl0eUhhc2hIZXgiOiIwNGJkNTRlYTdjNTllZmRkMjEzNTFjOTc1ZDEyZGVhNzU3ODQwYTcyM2NmNTQxNzcwOWM3Y2I0YzBhYjFiMGVlIiwieHl6LnRpbnljbG91ZC5wb2xpY3kvZGVsZWdhdGlvbk1vZGUiOiJ0ZXJtaW5hbCIsInh5ei50aW55Y2xvdWQucG9saWN5L2lzc3VhbmNlSWQiOiJpc3NfbTFnMDZfMDAwMDAwMDEiLCJ4eXoudGlueWNsb3VkLnBvbGljeS9wb2xpY3lJZCI6InBvbF9tMWcwNl90cmFuc2NyaXB0IiwieHl6LnRpbnljbG91ZC5wb2xpY3kvcmV2b2NhdGlvbk1vZGUiOiJyZWZyZXNoX29ubHkifV0sImlzcyI6ImRpZDprZXk6ejZNa3FHQzNuV1poWWllRVZUVkRLVzV2NTg4Q2lHZnNEU21SVkc5Wnd3V1R2TFNLI3o2TWtxR0MzbldaaFlpZUVWVFZES1c1djU4OENpR2ZzRFNtUlZHOVp3d1dUdkxTSyIsIm5iZiI6MTc4MzY4NDgwMCwibm5jIjoibTEtZy0wNi1maXhlZC1ub25jZSIsInByZiI6WyJiYWZrcjRpZ2xpZmp0YTRmYWU1ZWN4NWpybWdyeHJ4aG96NWx1eXUzbzR2NWI3YW9mcW1mbXpnZm1heSJdfQ",
+        "signatureHex": "9ee142a0251d67708886b8580019aee6269a3c425f18a921b31bfe8fec74ab7bce34c3e2750652444aef9136713c773956bf6dccb652aa36aba9496306aa710c",
+        "delegationId": "bafkr4ie36bbhsrjielzqztlixjqtkyxld2ltfcp6no2pwuepqlmk3aq6wa",
+        "delegationIdBytesHex": "01551e209bf04279452822f30ccd68ba613562eb1e973289fe6bb4fb508f82d8ad821eb0"
+      },
+      "ceilings": {
+        "policyEpochSeconds": 1783685099,
+        "presentationEpochSeconds": 1783685160,
+        "maxTtlSeconds": 300,
+        "parentEpochSeconds": 1815220800
+      }
+    },
+    {
+      "case": "expiry-beyond-presentation-validity",
+      "enforcementLayer": "producer/engine",
+      "expectedVerdict": "reject",
+      "reason": "expiry-ceiling-exceeded",
+      "consultCase": "consult-7-04",
+      "ucan": {
+        "encoded": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4Ijoib0pxbDlIcG5XWUF2LVZYNDNDMHFGS1hKblNPLWxfaGtFbl81T0RSVnBQQSJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vY29udmVyc2F0aW9ucyI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dLCJ0aW55Y2xvdWQuc3FsL3JlYWQiOlt7Im1vZGUiOiJjb25zdHJhaW5lZC1zdGF0ZW1lbnRzIiwicmVhZE9ubHkiOnRydWUsInN0YXRlbWVudHMiOlt7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5nZXRDb252ZXJzYXRpb24iLCJzcWwiOiJTRUxFQ1QgaWQsIHRpdGxlLCBzb3VyY2UsIHNvdXJjZV9pZCwgc291cmNlX3VybCwgc3RhcnRlZF9hdCwgZW5kZWRfYXQsIGR1cmF0aW9uX3NlY3MsIHN1bW1hcnksIG1ldGFkYXRhLCB0cmFuc2NyaXB0X2pzb24sIHRyYW5zY3JpcHRfdGV4dCwgY3JlYXRlZF9hdCwgdXBkYXRlZF9hdCBGUk9NIGNvbnZlcnNhdGlvbiBXSEVSRSBpZCA9ID8ifSx7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5saXN0UGFydGljaXBhbnRzIiwic3FsIjoiU0VMRUNUIGlkLCBuYW1lLCBlbWFpbCwgc3BlYWtlcl9sYWJlbCBGUk9NIHBhcnRpY2lwYW50IFdIRVJFIGNvbnZlcnNhdGlvbl9pZCA9ID8gT1JERVIgQlkgQ09BTEVTQ0Uoc3BlYWtlcl9sYWJlbCwgbmFtZSksIGlkIn1dfV19fSwiYXVkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUiLCJleHAiOjE3ODM2ODUxMDAsImZjdCI6W3sieHl6LnRpbnljbG91ZC5wb2xpY3kvY2FwYWJpbGl0eUhhc2hIZXgiOiIwNGJkNTRlYTdjNTllZmRkMjEzNTFjOTc1ZDEyZGVhNzU3ODQwYTcyM2NmNTQxNzcwOWM3Y2I0YzBhYjFiMGVlIiwieHl6LnRpbnljbG91ZC5wb2xpY3kvZGVsZWdhdGlvbk1vZGUiOiJ0ZXJtaW5hbCIsInh5ei50aW55Y2xvdWQucG9saWN5L2lzc3VhbmNlSWQiOiJpc3NfbTFnMDZfMDAwMDAwMDEiLCJ4eXoudGlueWNsb3VkLnBvbGljeS9wb2xpY3lJZCI6InBvbF9tMWcwNl90cmFuc2NyaXB0IiwieHl6LnRpbnljbG91ZC5wb2xpY3kvcmV2b2NhdGlvbk1vZGUiOiJyZWZyZXNoX29ubHkifV0sImlzcyI6ImRpZDprZXk6ejZNa3FHQzNuV1poWWllRVZUVkRLVzV2NTg4Q2lHZnNEU21SVkc5Wnd3V1R2TFNLI3o2TWtxR0MzbldaaFlpZUVWVFZES1c1djU4OENpR2ZzRFNtUlZHOVp3d1dUdkxTSyIsIm5iZiI6MTc4MzY4NDgwMCwibm5jIjoibTEtZy0wNi1maXhlZC1ub25jZSIsInByZiI6WyJiYWZrcjRpZ2xpZmp0YTRmYWU1ZWN4NWpybWdyeHJ4aG96NWx1eXUzbzR2NWI3YW9mcW1mbXpnZm1heSJdfQ.nuFCoCUdZ3CIhrhYABmu5iaaPEJfGKkhsxv-j-x0q3vONMPidQZSRErvkTZxPHc5Vr9tzLZSqjarqUljBqpxDA",
+        "header": {
+          "alg": "EdDSA",
+          "typ": "JWT",
+          "ucv": "0.10.0",
+          "jwk": {
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "oJql9HpnWYAv-VX43C0qFKXJnSO-l_hkEn_5ODRVpPA",
+            "alg": "EdDSA"
+          }
+        },
+        "payload": {
+          "iss": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK#z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+          "aud": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5",
+          "nbf": 1783684800,
+          "exp": 1783685100,
+          "nnc": "m1-g-06-fixed-nonce",
+          "fct": [
+            {
+              "xyz.tinycloud.policy/delegationMode": "terminal",
+              "xyz.tinycloud.policy/policyId": "pol_m1g06_transcript",
+              "xyz.tinycloud.policy/capabilityHashHex": "04bd54ea7c59efdd21351c975d12dea757840a723cf5417709c7cb4c0ab1b0ee",
+              "xyz.tinycloud.policy/revocationMode": "refresh_only",
+              "xyz.tinycloud.policy/issuanceId": "iss_m1g06_00000001"
+            }
+          ],
+          "prf": [
+            "bafkr4iglifjta4fae5ecx5jrmgrxrxhoz5luyu3o4v5b7aofqmfmzgfmay"
+          ],
+          "att": {
+            "tinycloud:pkh:eip155:1:0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf:default/sql/xyz.tinycloud.listen/conversations": {
+              "tinycloud.kv/get": [
+                {}
+              ],
+              "tinycloud.sql/read": [
+                {
+                  "mode": "constrained-statements",
+                  "readOnly": true,
+                  "statements": [
+                    {
+                      "name": "listen.getConversation",
+                      "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+                      "fixedParams": [
+                        {
+                          "index": 0,
+                          "value": "conv_456"
+                        }
+                      ]
+                    },
+                    {
+                      "name": "listen.listParticipants",
+                      "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+                      "fixedParams": [
+                        {
+                          "index": 0,
+                          "value": "conv_456"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "signerDid": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+        "signingInputAscii": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4Ijoib0pxbDlIcG5XWUF2LVZYNDNDMHFGS1hKblNPLWxfaGtFbl81T0RSVnBQQSJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vY29udmVyc2F0aW9ucyI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dLCJ0aW55Y2xvdWQuc3FsL3JlYWQiOlt7Im1vZGUiOiJjb25zdHJhaW5lZC1zdGF0ZW1lbnRzIiwicmVhZE9ubHkiOnRydWUsInN0YXRlbWVudHMiOlt7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5nZXRDb252ZXJzYXRpb24iLCJzcWwiOiJTRUxFQ1QgaWQsIHRpdGxlLCBzb3VyY2UsIHNvdXJjZV9pZCwgc291cmNlX3VybCwgc3RhcnRlZF9hdCwgZW5kZWRfYXQsIGR1cmF0aW9uX3NlY3MsIHN1bW1hcnksIG1ldGFkYXRhLCB0cmFuc2NyaXB0X2pzb24sIHRyYW5zY3JpcHRfdGV4dCwgY3JlYXRlZF9hdCwgdXBkYXRlZF9hdCBGUk9NIGNvbnZlcnNhdGlvbiBXSEVSRSBpZCA9ID8ifSx7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5saXN0UGFydGljaXBhbnRzIiwic3FsIjoiU0VMRUNUIGlkLCBuYW1lLCBlbWFpbCwgc3BlYWtlcl9sYWJlbCBGUk9NIHBhcnRpY2lwYW50IFdIRVJFIGNvbnZlcnNhdGlvbl9pZCA9ID8gT1JERVIgQlkgQ09BTEVTQ0Uoc3BlYWtlcl9sYWJlbCwgbmFtZSksIGlkIn1dfV19fSwiYXVkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUiLCJleHAiOjE3ODM2ODUxMDAsImZjdCI6W3sieHl6LnRpbnljbG91ZC5wb2xpY3kvY2FwYWJpbGl0eUhhc2hIZXgiOiIwNGJkNTRlYTdjNTllZmRkMjEzNTFjOTc1ZDEyZGVhNzU3ODQwYTcyM2NmNTQxNzcwOWM3Y2I0YzBhYjFiMGVlIiwieHl6LnRpbnljbG91ZC5wb2xpY3kvZGVsZWdhdGlvbk1vZGUiOiJ0ZXJtaW5hbCIsInh5ei50aW55Y2xvdWQucG9saWN5L2lzc3VhbmNlSWQiOiJpc3NfbTFnMDZfMDAwMDAwMDEiLCJ4eXoudGlueWNsb3VkLnBvbGljeS9wb2xpY3lJZCI6InBvbF9tMWcwNl90cmFuc2NyaXB0IiwieHl6LnRpbnljbG91ZC5wb2xpY3kvcmV2b2NhdGlvbk1vZGUiOiJyZWZyZXNoX29ubHkifV0sImlzcyI6ImRpZDprZXk6ejZNa3FHQzNuV1poWWllRVZUVkRLVzV2NTg4Q2lHZnNEU21SVkc5Wnd3V1R2TFNLI3o2TWtxR0MzbldaaFlpZUVWVFZES1c1djU4OENpR2ZzRFNtUlZHOVp3d1dUdkxTSyIsIm5iZiI6MTc4MzY4NDgwMCwibm5jIjoibTEtZy0wNi1maXhlZC1ub25jZSIsInByZiI6WyJiYWZrcjRpZ2xpZmp0YTRmYWU1ZWN4NWpybWdyeHJ4aG96NWx1eXUzbzR2NWI3YW9mcW1mbXpnZm1heSJdfQ",
+        "signatureHex": "9ee142a0251d67708886b8580019aee6269a3c425f18a921b31bfe8fec74ab7bce34c3e2750652444aef9136713c773956bf6dccb652aa36aba9496306aa710c",
+        "delegationId": "bafkr4ie36bbhsrjielzqztlixjqtkyxld2ltfcp6no2pwuepqlmk3aq6wa",
+        "delegationIdBytesHex": "01551e209bf04279452822f30ccd68ba613562eb1e973289fe6bb4fb508f82d8ad821eb0"
+      },
+      "ceilings": {
+        "policyEpochSeconds": 1783685160,
+        "presentationEpochSeconds": 1783685099,
+        "maxTtlSeconds": 300,
+        "parentEpochSeconds": 1815220800
+      }
+    },
+    {
+      "case": "malformed-or-duplicate-provenance-facts",
+      "enforcementLayer": "producer/engine",
+      "expectedVerdict": "reject",
+      "reason": "duplicate-provenance-fact",
+      "consultCase": "consult-7-provenance",
+      "ucan": {
+        "encoded": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4Ijoib0pxbDlIcG5XWUF2LVZYNDNDMHFGS1hKblNPLWxfaGtFbl81T0RSVnBQQSJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vY29udmVyc2F0aW9ucyI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dLCJ0aW55Y2xvdWQuc3FsL3JlYWQiOlt7Im1vZGUiOiJjb25zdHJhaW5lZC1zdGF0ZW1lbnRzIiwicmVhZE9ubHkiOnRydWUsInN0YXRlbWVudHMiOlt7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5nZXRDb252ZXJzYXRpb24iLCJzcWwiOiJTRUxFQ1QgaWQsIHRpdGxlLCBzb3VyY2UsIHNvdXJjZV9pZCwgc291cmNlX3VybCwgc3RhcnRlZF9hdCwgZW5kZWRfYXQsIGR1cmF0aW9uX3NlY3MsIHN1bW1hcnksIG1ldGFkYXRhLCB0cmFuc2NyaXB0X2pzb24sIHRyYW5zY3JpcHRfdGV4dCwgY3JlYXRlZF9hdCwgdXBkYXRlZF9hdCBGUk9NIGNvbnZlcnNhdGlvbiBXSEVSRSBpZCA9ID8ifSx7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5saXN0UGFydGljaXBhbnRzIiwic3FsIjoiU0VMRUNUIGlkLCBuYW1lLCBlbWFpbCwgc3BlYWtlcl9sYWJlbCBGUk9NIHBhcnRpY2lwYW50IFdIRVJFIGNvbnZlcnNhdGlvbl9pZCA9ID8gT1JERVIgQlkgQ09BTEVTQ0Uoc3BlYWtlcl9sYWJlbCwgbmFtZSksIGlkIn1dfV19fSwiYXVkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUiLCJleHAiOjE3ODM2ODUxMDAsImZjdCI6W3sieHl6LnRpbnljbG91ZC5wb2xpY3kvY2FwYWJpbGl0eUhhc2hIZXgiOiIwNGJkNTRlYTdjNTllZmRkMjEzNTFjOTc1ZDEyZGVhNzU3ODQwYTcyM2NmNTQxNzcwOWM3Y2I0YzBhYjFiMGVlIiwieHl6LnRpbnljbG91ZC5wb2xpY3kvZGVsZWdhdGlvbk1vZGUiOiJ0ZXJtaW5hbCIsInh5ei50aW55Y2xvdWQucG9saWN5L2lzc3VhbmNlSWQiOiJpc3NfbTFnMDZfMDAwMDAwMDEiLCJ4eXoudGlueWNsb3VkLnBvbGljeS9wb2xpY3lJZCI6InBvbF9tMWcwNl90cmFuc2NyaXB0IiwieHl6LnRpbnljbG91ZC5wb2xpY3kvcmV2b2NhdGlvbk1vZGUiOiJyZWZyZXNoX29ubHkifSx7Inh5ei50aW55Y2xvdWQucG9saWN5L2lzc3VhbmNlSWQiOiJpc3NfbTFnMDZfMDAwMDAwMDEifV0sImlzcyI6ImRpZDprZXk6ejZNa3FHQzNuV1poWWllRVZUVkRLVzV2NTg4Q2lHZnNEU21SVkc5Wnd3V1R2TFNLI3o2TWtxR0MzbldaaFlpZUVWVFZES1c1djU4OENpR2ZzRFNtUlZHOVp3d1dUdkxTSyIsIm5iZiI6MTc4MzY4NDgwMCwibm5jIjoibTEtZy0wNi1maXhlZC1ub25jZSIsInByZiI6WyJiYWZrcjRpZ2xpZmp0YTRmYWU1ZWN4NWpybWdyeHJ4aG96NWx1eXUzbzR2NWI3YW9mcW1mbXpnZm1heSJdfQ.rJQhj9O3sM5uZjY01VZZAqD8MHzmHhokgAB12Yc7WJIHTac6jv7w-1uo6qW7okYwTFnqOKRZnXTV6IHeVGxFAA",
+        "header": {
+          "alg": "EdDSA",
+          "typ": "JWT",
+          "ucv": "0.10.0",
+          "jwk": {
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "oJql9HpnWYAv-VX43C0qFKXJnSO-l_hkEn_5ODRVpPA",
+            "alg": "EdDSA"
+          }
+        },
+        "payload": {
+          "iss": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK#z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+          "aud": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5",
+          "nbf": 1783684800,
+          "exp": 1783685100,
+          "nnc": "m1-g-06-fixed-nonce",
+          "fct": [
+            {
+              "xyz.tinycloud.policy/delegationMode": "terminal",
+              "xyz.tinycloud.policy/policyId": "pol_m1g06_transcript",
+              "xyz.tinycloud.policy/capabilityHashHex": "04bd54ea7c59efdd21351c975d12dea757840a723cf5417709c7cb4c0ab1b0ee",
+              "xyz.tinycloud.policy/revocationMode": "refresh_only",
+              "xyz.tinycloud.policy/issuanceId": "iss_m1g06_00000001"
+            },
+            {
+              "xyz.tinycloud.policy/issuanceId": "iss_m1g06_00000001"
+            }
+          ],
+          "prf": [
+            "bafkr4iglifjta4fae5ecx5jrmgrxrxhoz5luyu3o4v5b7aofqmfmzgfmay"
+          ],
+          "att": {
+            "tinycloud:pkh:eip155:1:0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf:default/sql/xyz.tinycloud.listen/conversations": {
+              "tinycloud.kv/get": [
+                {}
+              ],
+              "tinycloud.sql/read": [
+                {
+                  "mode": "constrained-statements",
+                  "readOnly": true,
+                  "statements": [
+                    {
+                      "name": "listen.getConversation",
+                      "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+                      "fixedParams": [
+                        {
+                          "index": 0,
+                          "value": "conv_456"
+                        }
+                      ]
+                    },
+                    {
+                      "name": "listen.listParticipants",
+                      "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+                      "fixedParams": [
+                        {
+                          "index": 0,
+                          "value": "conv_456"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "signerDid": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+        "signingInputAscii": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4Ijoib0pxbDlIcG5XWUF2LVZYNDNDMHFGS1hKblNPLWxfaGtFbl81T0RSVnBQQSJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vY29udmVyc2F0aW9ucyI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dLCJ0aW55Y2xvdWQuc3FsL3JlYWQiOlt7Im1vZGUiOiJjb25zdHJhaW5lZC1zdGF0ZW1lbnRzIiwicmVhZE9ubHkiOnRydWUsInN0YXRlbWVudHMiOlt7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5nZXRDb252ZXJzYXRpb24iLCJzcWwiOiJTRUxFQ1QgaWQsIHRpdGxlLCBzb3VyY2UsIHNvdXJjZV9pZCwgc291cmNlX3VybCwgc3RhcnRlZF9hdCwgZW5kZWRfYXQsIGR1cmF0aW9uX3NlY3MsIHN1bW1hcnksIG1ldGFkYXRhLCB0cmFuc2NyaXB0X2pzb24sIHRyYW5zY3JpcHRfdGV4dCwgY3JlYXRlZF9hdCwgdXBkYXRlZF9hdCBGUk9NIGNvbnZlcnNhdGlvbiBXSEVSRSBpZCA9ID8ifSx7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5saXN0UGFydGljaXBhbnRzIiwic3FsIjoiU0VMRUNUIGlkLCBuYW1lLCBlbWFpbCwgc3BlYWtlcl9sYWJlbCBGUk9NIHBhcnRpY2lwYW50IFdIRVJFIGNvbnZlcnNhdGlvbl9pZCA9ID8gT1JERVIgQlkgQ09BTEVTQ0Uoc3BlYWtlcl9sYWJlbCwgbmFtZSksIGlkIn1dfV19fSwiYXVkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUiLCJleHAiOjE3ODM2ODUxMDAsImZjdCI6W3sieHl6LnRpbnljbG91ZC5wb2xpY3kvY2FwYWJpbGl0eUhhc2hIZXgiOiIwNGJkNTRlYTdjNTllZmRkMjEzNTFjOTc1ZDEyZGVhNzU3ODQwYTcyM2NmNTQxNzcwOWM3Y2I0YzBhYjFiMGVlIiwieHl6LnRpbnljbG91ZC5wb2xpY3kvZGVsZWdhdGlvbk1vZGUiOiJ0ZXJtaW5hbCIsInh5ei50aW55Y2xvdWQucG9saWN5L2lzc3VhbmNlSWQiOiJpc3NfbTFnMDZfMDAwMDAwMDEiLCJ4eXoudGlueWNsb3VkLnBvbGljeS9wb2xpY3lJZCI6InBvbF9tMWcwNl90cmFuc2NyaXB0IiwieHl6LnRpbnljbG91ZC5wb2xpY3kvcmV2b2NhdGlvbk1vZGUiOiJyZWZyZXNoX29ubHkifSx7Inh5ei50aW55Y2xvdWQucG9saWN5L2lzc3VhbmNlSWQiOiJpc3NfbTFnMDZfMDAwMDAwMDEifV0sImlzcyI6ImRpZDprZXk6ejZNa3FHQzNuV1poWWllRVZUVkRLVzV2NTg4Q2lHZnNEU21SVkc5Wnd3V1R2TFNLI3o2TWtxR0MzbldaaFlpZUVWVFZES1c1djU4OENpR2ZzRFNtUlZHOVp3d1dUdkxTSyIsIm5iZiI6MTc4MzY4NDgwMCwibm5jIjoibTEtZy0wNi1maXhlZC1ub25jZSIsInByZiI6WyJiYWZrcjRpZ2xpZmp0YTRmYWU1ZWN4NWpybWdyeHJ4aG96NWx1eXUzbzR2NWI3YW9mcW1mbXpnZm1heSJdfQ",
+        "signatureHex": "ac94218fd3b7b0ce6e663634d5565902a0fc307ce61e1a24800075d9873b5892074da73a8efef0fb5ba8eaa5bba246304c59ea38a4599d74d5e881de546c4500",
+        "delegationId": "bafkr4ih22tnijzv3mcyinz6rexnahdkjlec4tq5rg6w4retjfrknmrxbly",
+        "delegationIdBytesHex": "01551e20fad4da84e6bb60b086e7d125da038d495905c9c3b137adc892692c54d646e15e"
+      }
+    },
+    {
+      "case": "malformed-provenance-fact",
+      "enforcementLayer": "producer/engine",
+      "expectedVerdict": "reject",
+      "reason": "malformed-provenance-fact",
+      "consultCase": "consult-7-provenance",
+      "ucan": {
+        "encoded": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4Ijoib0pxbDlIcG5XWUF2LVZYNDNDMHFGS1hKblNPLWxfaGtFbl81T0RSVnBQQSJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vY29udmVyc2F0aW9ucyI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dLCJ0aW55Y2xvdWQuc3FsL3JlYWQiOlt7Im1vZGUiOiJjb25zdHJhaW5lZC1zdGF0ZW1lbnRzIiwicmVhZE9ubHkiOnRydWUsInN0YXRlbWVudHMiOlt7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5nZXRDb252ZXJzYXRpb24iLCJzcWwiOiJTRUxFQ1QgaWQsIHRpdGxlLCBzb3VyY2UsIHNvdXJjZV9pZCwgc291cmNlX3VybCwgc3RhcnRlZF9hdCwgZW5kZWRfYXQsIGR1cmF0aW9uX3NlY3MsIHN1bW1hcnksIG1ldGFkYXRhLCB0cmFuc2NyaXB0X2pzb24sIHRyYW5zY3JpcHRfdGV4dCwgY3JlYXRlZF9hdCwgdXBkYXRlZF9hdCBGUk9NIGNvbnZlcnNhdGlvbiBXSEVSRSBpZCA9ID8ifSx7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5saXN0UGFydGljaXBhbnRzIiwic3FsIjoiU0VMRUNUIGlkLCBuYW1lLCBlbWFpbCwgc3BlYWtlcl9sYWJlbCBGUk9NIHBhcnRpY2lwYW50IFdIRVJFIGNvbnZlcnNhdGlvbl9pZCA9ID8gT1JERVIgQlkgQ09BTEVTQ0Uoc3BlYWtlcl9sYWJlbCwgbmFtZSksIGlkIn1dfV19fSwiYXVkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUiLCJleHAiOjE3ODM2ODUxMDAsImZjdCI6W3sieHl6LnRpbnljbG91ZC5wb2xpY3kvY2FwYWJpbGl0eUhhc2hIZXgiOiJub3QtYS1oYXNoIiwieHl6LnRpbnljbG91ZC5wb2xpY3kvZGVsZWdhdGlvbk1vZGUiOiJ0ZXJtaW5hbCIsInh5ei50aW55Y2xvdWQucG9saWN5L2lzc3VhbmNlSWQiOiJpc3NfbTFnMDZfMDAwMDAwMDEiLCJ4eXoudGlueWNsb3VkLnBvbGljeS9wb2xpY3lJZCI6InBvbF9tMWcwNl90cmFuc2NyaXB0IiwieHl6LnRpbnljbG91ZC5wb2xpY3kvcmV2b2NhdGlvbk1vZGUiOiJyZWZyZXNoX29ubHkifV0sImlzcyI6ImRpZDprZXk6ejZNa3FHQzNuV1poWWllRVZUVkRLVzV2NTg4Q2lHZnNEU21SVkc5Wnd3V1R2TFNLI3o2TWtxR0MzbldaaFlpZUVWVFZES1c1djU4OENpR2ZzRFNtUlZHOVp3d1dUdkxTSyIsIm5iZiI6MTc4MzY4NDgwMCwibm5jIjoibTEtZy0wNi1maXhlZC1ub25jZSIsInByZiI6WyJiYWZrcjRpZ2xpZmp0YTRmYWU1ZWN4NWpybWdyeHJ4aG96NWx1eXUzbzR2NWI3YW9mcW1mbXpnZm1heSJdfQ.zNbg4bwBm80yG9v62s1YxyqjSZVkWz-Ne8XpxW-TXFL6Z1lVKcVbH6bumcfizzDgGqBZUBWSgzB4zEet46YACw",
+        "header": {
+          "alg": "EdDSA",
+          "typ": "JWT",
+          "ucv": "0.10.0",
+          "jwk": {
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "oJql9HpnWYAv-VX43C0qFKXJnSO-l_hkEn_5ODRVpPA",
+            "alg": "EdDSA"
+          }
+        },
+        "payload": {
+          "iss": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK#z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+          "aud": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5",
+          "nbf": 1783684800,
+          "exp": 1783685100,
+          "nnc": "m1-g-06-fixed-nonce",
+          "fct": [
+            {
+              "xyz.tinycloud.policy/delegationMode": "terminal",
+              "xyz.tinycloud.policy/policyId": "pol_m1g06_transcript",
+              "xyz.tinycloud.policy/capabilityHashHex": "not-a-hash",
+              "xyz.tinycloud.policy/revocationMode": "refresh_only",
+              "xyz.tinycloud.policy/issuanceId": "iss_m1g06_00000001"
+            }
+          ],
+          "prf": [
+            "bafkr4iglifjta4fae5ecx5jrmgrxrxhoz5luyu3o4v5b7aofqmfmzgfmay"
+          ],
+          "att": {
+            "tinycloud:pkh:eip155:1:0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf:default/sql/xyz.tinycloud.listen/conversations": {
+              "tinycloud.kv/get": [
+                {}
+              ],
+              "tinycloud.sql/read": [
+                {
+                  "mode": "constrained-statements",
+                  "readOnly": true,
+                  "statements": [
+                    {
+                      "name": "listen.getConversation",
+                      "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+                      "fixedParams": [
+                        {
+                          "index": 0,
+                          "value": "conv_456"
+                        }
+                      ]
+                    },
+                    {
+                      "name": "listen.listParticipants",
+                      "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+                      "fixedParams": [
+                        {
+                          "index": 0,
+                          "value": "conv_456"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "signerDid": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+        "signingInputAscii": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4Ijoib0pxbDlIcG5XWUF2LVZYNDNDMHFGS1hKblNPLWxfaGtFbl81T0RSVnBQQSJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vY29udmVyc2F0aW9ucyI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dLCJ0aW55Y2xvdWQuc3FsL3JlYWQiOlt7Im1vZGUiOiJjb25zdHJhaW5lZC1zdGF0ZW1lbnRzIiwicmVhZE9ubHkiOnRydWUsInN0YXRlbWVudHMiOlt7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5nZXRDb252ZXJzYXRpb24iLCJzcWwiOiJTRUxFQ1QgaWQsIHRpdGxlLCBzb3VyY2UsIHNvdXJjZV9pZCwgc291cmNlX3VybCwgc3RhcnRlZF9hdCwgZW5kZWRfYXQsIGR1cmF0aW9uX3NlY3MsIHN1bW1hcnksIG1ldGFkYXRhLCB0cmFuc2NyaXB0X2pzb24sIHRyYW5zY3JpcHRfdGV4dCwgY3JlYXRlZF9hdCwgdXBkYXRlZF9hdCBGUk9NIGNvbnZlcnNhdGlvbiBXSEVSRSBpZCA9ID8ifSx7ImZpeGVkUGFyYW1zIjpbeyJpbmRleCI6MCwidmFsdWUiOiJjb252XzQ1NiJ9XSwibmFtZSI6Imxpc3Rlbi5saXN0UGFydGljaXBhbnRzIiwic3FsIjoiU0VMRUNUIGlkLCBuYW1lLCBlbWFpbCwgc3BlYWtlcl9sYWJlbCBGUk9NIHBhcnRpY2lwYW50IFdIRVJFIGNvbnZlcnNhdGlvbl9pZCA9ID8gT1JERVIgQlkgQ09BTEVTQ0Uoc3BlYWtlcl9sYWJlbCwgbmFtZSksIGlkIn1dfV19fSwiYXVkIjoiZGlkOmtleTp6Nk1rZzQ5TnRRUjJMeVlSRENRRks0dzFWVkhxaHlwWlNTUm83SHN5dU43U1Y3djUiLCJleHAiOjE3ODM2ODUxMDAsImZjdCI6W3sieHl6LnRpbnljbG91ZC5wb2xpY3kvY2FwYWJpbGl0eUhhc2hIZXgiOiJub3QtYS1oYXNoIiwieHl6LnRpbnljbG91ZC5wb2xpY3kvZGVsZWdhdGlvbk1vZGUiOiJ0ZXJtaW5hbCIsInh5ei50aW55Y2xvdWQucG9saWN5L2lzc3VhbmNlSWQiOiJpc3NfbTFnMDZfMDAwMDAwMDEiLCJ4eXoudGlueWNsb3VkLnBvbGljeS9wb2xpY3lJZCI6InBvbF9tMWcwNl90cmFuc2NyaXB0IiwieHl6LnRpbnljbG91ZC5wb2xpY3kvcmV2b2NhdGlvbk1vZGUiOiJyZWZyZXNoX29ubHkifV0sImlzcyI6ImRpZDprZXk6ejZNa3FHQzNuV1poWWllRVZUVkRLVzV2NTg4Q2lHZnNEU21SVkc5Wnd3V1R2TFNLI3o2TWtxR0MzbldaaFlpZUVWVFZES1c1djU4OENpR2ZzRFNtUlZHOVp3d1dUdkxTSyIsIm5iZiI6MTc4MzY4NDgwMCwibm5jIjoibTEtZy0wNi1maXhlZC1ub25jZSIsInByZiI6WyJiYWZrcjRpZ2xpZmp0YTRmYWU1ZWN4NWpybWdyeHJ4aG96NWx1eXUzbzR2NWI3YW9mcW1mbXpnZm1heSJdfQ",
+        "signatureHex": "ccd6e0e1bc019bcd321bdbfadacd58c72aa34995645b3f8d7bc5e9c56f935c52fa67595529c55b1fa6ee99c7e2cf30e01aa059501592833078cc47ade3a6000b",
+        "delegationId": "bafkr4ia2ypnafdbtjgthntdghydxs67dd4uq3xg5qawcer4rw7dlznzune",
+        "delegationIdBytesHex": "01551e201ac3da028c3349a676cc663e07797be31f290ddcdd802c224791b7c6bcb73469"
+      }
+    },
+    {
+      "case": "capability-exceeds-configured-parent-bounds",
+      "enforcementLayer": "producer/engine",
+      "expectedVerdict": "reject",
+      "reason": "issue-time-parent-containment-failure",
+      "consultCase": "consult-7-05",
+      "ucan": {
+        "encoded": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4Ijoib0pxbDlIcG5XWUF2LVZYNDNDMHFGS1hKblNPLWxfaGtFbl81T0RSVnBQQSJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vcHJpdmF0ZS1sZWRnZXIiOnsidGlueWNsb3VkLnNxbC9yZWFkIjpbeyJtb2RlIjoiY29uc3RyYWluZWQtc3RhdGVtZW50cyIsInJlYWRPbmx5Ijp0cnVlLCJzdGF0ZW1lbnRzIjpbeyJmaXhlZFBhcmFtcyI6W3siaW5kZXgiOjAsInZhbHVlIjoiY29udl80NTYifV0sIm5hbWUiOiJsaXN0ZW4uZ2V0Q29udmVyc2F0aW9uIiwic3FsIjoiU0VMRUNUIGlkLCB0aXRsZSwgc291cmNlLCBzb3VyY2VfaWQsIHNvdXJjZV91cmwsIHN0YXJ0ZWRfYXQsIGVuZGVkX2F0LCBkdXJhdGlvbl9zZWNzLCBzdW1tYXJ5LCBtZXRhZGF0YSwgdHJhbnNjcmlwdF9qc29uLCB0cmFuc2NyaXB0X3RleHQsIGNyZWF0ZWRfYXQsIHVwZGF0ZWRfYXQgRlJPTSBjb252ZXJzYXRpb24gV0hFUkUgaWQgPSA_In0seyJmaXhlZFBhcmFtcyI6W3siaW5kZXgiOjAsInZhbHVlIjoiY29udl80NTYifV0sIm5hbWUiOiJsaXN0ZW4ubGlzdFBhcnRpY2lwYW50cyIsInNxbCI6IlNFTEVDVCBpZCwgbmFtZSwgZW1haWwsIHNwZWFrZXJfbGFiZWwgRlJPTSBwYXJ0aWNpcGFudCBXSEVSRSBjb252ZXJzYXRpb25faWQgPSA_IE9SREVSIEJZIENPQUxFU0NFKHNwZWFrZXJfbGFiZWwsIG5hbWUpLCBpZCJ9XX1dfX0sImF1ZCI6ImRpZDprZXk6ejZNa2c0OU50UVIyTHlZUkRDUUZLNHcxVlZIcWh5cFpTU1JvN0hzeXVON1NWN3Y1IiwiZXhwIjoxNzgzNjg1MTAwLCJmY3QiOlt7Inh5ei50aW55Y2xvdWQucG9saWN5L2NhcGFiaWxpdHlIYXNoSGV4IjoiMDRiZDU0ZWE3YzU5ZWZkZDIxMzUxYzk3NWQxMmRlYTc1Nzg0MGE3MjNjZjU0MTc3MDljN2NiNGMwYWIxYjBlZSIsInh5ei50aW55Y2xvdWQucG9saWN5L2RlbGVnYXRpb25Nb2RlIjoidGVybWluYWwiLCJ4eXoudGlueWNsb3VkLnBvbGljeS9pc3N1YW5jZUlkIjoiaXNzX20xZzA2XzAwMDAwMDAxIiwieHl6LnRpbnljbG91ZC5wb2xpY3kvcG9saWN5SWQiOiJwb2xfbTFnMDZfdHJhbnNjcmlwdCIsInh5ei50aW55Y2xvdWQucG9saWN5L3Jldm9jYXRpb25Nb2RlIjoicmVmcmVzaF9vbmx5In1dLCJpc3MiOiJkaWQ6a2V5Ono2TWtxR0MzbldaaFlpZUVWVFZES1c1djU4OENpR2ZzRFNtUlZHOVp3d1dUdkxTSyN6Nk1rcUdDM25XWmhZaWVFVlRWREtXNXY1ODhDaUdmc0RTbVJWRzlad3dXVHZMU0siLCJuYmYiOjE3ODM2ODQ4MDAsIm5uYyI6Im0xLWctMDYtZml4ZWQtbm9uY2UiLCJwcmYiOlsiYmFma3I0aWdsaWZqdGE0ZmFlNWVjeDVqcm1ncnhyeGhvejVsdXl1M280djViN2FvZnFtZm16Z2ZtYXkiXX0.hftnm5y4INThPVB0CZ3SNOGR77Secs9w41vU-7lHuDA1s4NMmVTS-NchuQl9SpjmVvZqU5zC1KXcP1QfK39cBg",
+        "header": {
+          "alg": "EdDSA",
+          "typ": "JWT",
+          "ucv": "0.10.0",
+          "jwk": {
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": "oJql9HpnWYAv-VX43C0qFKXJnSO-l_hkEn_5ODRVpPA",
+            "alg": "EdDSA"
+          }
+        },
+        "payload": {
+          "iss": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK#z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+          "aud": "did:key:z6Mkg49NtQR2LyYRDCQFK4w1VVHqhypZSSRo7HsyuN7SV7v5",
+          "nbf": 1783684800,
+          "exp": 1783685100,
+          "nnc": "m1-g-06-fixed-nonce",
+          "fct": [
+            {
+              "xyz.tinycloud.policy/delegationMode": "terminal",
+              "xyz.tinycloud.policy/policyId": "pol_m1g06_transcript",
+              "xyz.tinycloud.policy/capabilityHashHex": "04bd54ea7c59efdd21351c975d12dea757840a723cf5417709c7cb4c0ab1b0ee",
+              "xyz.tinycloud.policy/revocationMode": "refresh_only",
+              "xyz.tinycloud.policy/issuanceId": "iss_m1g06_00000001"
+            }
+          ],
+          "prf": [
+            "bafkr4iglifjta4fae5ecx5jrmgrxrxhoz5luyu3o4v5b7aofqmfmzgfmay"
+          ],
+          "att": {
+            "tinycloud:pkh:eip155:1:0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf:default/sql/xyz.tinycloud.listen/private-ledger": {
+              "tinycloud.sql/read": [
+                {
+                  "mode": "constrained-statements",
+                  "readOnly": true,
+                  "statements": [
+                    {
+                      "name": "listen.getConversation",
+                      "sql": "SELECT id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at FROM conversation WHERE id = ?",
+                      "fixedParams": [
+                        {
+                          "index": 0,
+                          "value": "conv_456"
+                        }
+                      ]
+                    },
+                    {
+                      "name": "listen.listParticipants",
+                      "sql": "SELECT id, name, email, speaker_label FROM participant WHERE conversation_id = ? ORDER BY COALESCE(speaker_label, name), id",
+                      "fixedParams": [
+                        {
+                          "index": 0,
+                          "value": "conv_456"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        "signerDid": "did:key:z6MkqGC3nWZhYieEVTVDKW5v588CiGfsDSmRVG9ZwwWTvLSK",
+        "signingInputAscii": "eyJhbGciOiJFZERTQSIsImp3ayI6eyJhbGciOiJFZERTQSIsImNydiI6IkVkMjU1MTkiLCJrdHkiOiJPS1AiLCJ4Ijoib0pxbDlIcG5XWUF2LVZYNDNDMHFGS1hKblNPLWxfaGtFbl81T0RSVnBQQSJ9LCJ0eXAiOiJKV1QiLCJ1Y3YiOiIwLjEwLjAifQ.eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweDdFNUY0NTUyMDkxQTY5MTI1ZDVEZkNiN2I4QzI2NTkwMjkzOTVCZGY6ZGVmYXVsdC9zcWwveHl6LnRpbnljbG91ZC5saXN0ZW4vcHJpdmF0ZS1sZWRnZXIiOnsidGlueWNsb3VkLnNxbC9yZWFkIjpbeyJtb2RlIjoiY29uc3RyYWluZWQtc3RhdGVtZW50cyIsInJlYWRPbmx5Ijp0cnVlLCJzdGF0ZW1lbnRzIjpbeyJmaXhlZFBhcmFtcyI6W3siaW5kZXgiOjAsInZhbHVlIjoiY29udl80NTYifV0sIm5hbWUiOiJsaXN0ZW4uZ2V0Q29udmVyc2F0aW9uIiwic3FsIjoiU0VMRUNUIGlkLCB0aXRsZSwgc291cmNlLCBzb3VyY2VfaWQsIHNvdXJjZV91cmwsIHN0YXJ0ZWRfYXQsIGVuZGVkX2F0LCBkdXJhdGlvbl9zZWNzLCBzdW1tYXJ5LCBtZXRhZGF0YSwgdHJhbnNjcmlwdF9qc29uLCB0cmFuc2NyaXB0X3RleHQsIGNyZWF0ZWRfYXQsIHVwZGF0ZWRfYXQgRlJPTSBjb252ZXJzYXRpb24gV0hFUkUgaWQgPSA_In0seyJmaXhlZFBhcmFtcyI6W3siaW5kZXgiOjAsInZhbHVlIjoiY29udl80NTYifV0sIm5hbWUiOiJsaXN0ZW4ubGlzdFBhcnRpY2lwYW50cyIsInNxbCI6IlNFTEVDVCBpZCwgbmFtZSwgZW1haWwsIHNwZWFrZXJfbGFiZWwgRlJPTSBwYXJ0aWNpcGFudCBXSEVSRSBjb252ZXJzYXRpb25faWQgPSA_IE9SREVSIEJZIENPQUxFU0NFKHNwZWFrZXJfbGFiZWwsIG5hbWUpLCBpZCJ9XX1dfX0sImF1ZCI6ImRpZDprZXk6ejZNa2c0OU50UVIyTHlZUkRDUUZLNHcxVlZIcWh5cFpTU1JvN0hzeXVON1NWN3Y1IiwiZXhwIjoxNzgzNjg1MTAwLCJmY3QiOlt7Inh5ei50aW55Y2xvdWQucG9saWN5L2NhcGFiaWxpdHlIYXNoSGV4IjoiMDRiZDU0ZWE3YzU5ZWZkZDIxMzUxYzk3NWQxMmRlYTc1Nzg0MGE3MjNjZjU0MTc3MDljN2NiNGMwYWIxYjBlZSIsInh5ei50aW55Y2xvdWQucG9saWN5L2RlbGVnYXRpb25Nb2RlIjoidGVybWluYWwiLCJ4eXoudGlueWNsb3VkLnBvbGljeS9pc3N1YW5jZUlkIjoiaXNzX20xZzA2XzAwMDAwMDAxIiwieHl6LnRpbnljbG91ZC5wb2xpY3kvcG9saWN5SWQiOiJwb2xfbTFnMDZfdHJhbnNjcmlwdCIsInh5ei50aW55Y2xvdWQucG9saWN5L3Jldm9jYXRpb25Nb2RlIjoicmVmcmVzaF9vbmx5In1dLCJpc3MiOiJkaWQ6a2V5Ono2TWtxR0MzbldaaFlpZUVWVFZES1c1djU4OENpR2ZzRFNtUlZHOVp3d1dUdkxTSyN6Nk1rcUdDM25XWmhZaWVFVlRWREtXNXY1ODhDaUdmc0RTbVJWRzlad3dXVHZMU0siLCJuYmYiOjE3ODM2ODQ4MDAsIm5uYyI6Im0xLWctMDYtZml4ZWQtbm9uY2UiLCJwcmYiOlsiYmFma3I0aWdsaWZqdGE0ZmFlNWVjeDVqcm1ncnhyeGhvejVsdXl1M280djViN2FvZnFtZm16Z2ZtYXkiXX0",
+        "signatureHex": "85fb679b9cb820d4e13d5074099dd234e191efb49e72cf70e35bd4fbb947b83035b3834c9954d2f8d721b9097d4a98e656f66a539cc2d4a5dc3f541f2b7f5c06",
+        "delegationId": "bafkr4ib6ebi6txzri7usoi2svlchtej5bh5tjlxvyengfwgcjqbvo5f3hm",
+        "delegationIdBytesHex": "01551e203e2051e9df3147e9272352aac479913d09fb34aef5c11a62d8c24c035774bb3b"
+      },
+      "configuredParentCid": "bafkr4iglifjta4fae5ecx5jrmgrxrxhoz5luyu3o4v5b7aofqmfmzgfmay"
+    }
+  ]
+}

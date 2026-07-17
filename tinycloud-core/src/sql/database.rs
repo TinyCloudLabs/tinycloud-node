@@ -158,8 +158,14 @@ fn handle_export(
     {
         let backup = rusqlite::backup::Backup::new(conn, &mut dest)
             .map_err(|e| SqlError::Internal(e.to_string()))?;
+        // Copy all pages in one step with no pause (rusqlite rejects the
+        // sqlite "-1 = all pages" sentinel, so use i32::MAX). The actor owns
+        // `conn` exclusively and every SQL write blocks on this export, so
+        // pacing (5 pages / 250ms) caps write throughput at ~80KB/s of
+        // database size — a 45MB database makes every write take ~9 minutes
+        // (tinycloud-node#112).
         backup
-            .run_to_completion(5, std::time::Duration::from_millis(250), None)
+            .run_to_completion(i32::MAX, std::time::Duration::ZERO, None)
             .map_err(|e| SqlError::Internal(e.to_string()))?;
     }
 
@@ -174,7 +180,9 @@ fn handle_message(
     caveats: &Option<SqlCaveats>,
     ability: &str,
 ) -> Result<SqlExecutionResult, SqlError> {
-    let is_admin = matches!(ability, "tinycloud.sql/admin" | "tinycloud.sql/*");
+    // TC-119: confers-admin gate (registry-aware). `sql/admin` and `sql/*`
+    // (implies admin) pass; identical to the prior `admin | *` match.
+    let is_admin = crate::policy_capability::ability_matches(ability, "tinycloud.sql/admin");
 
     match request {
         SqlRequest::Query { sql, params } => {

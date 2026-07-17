@@ -27,6 +27,8 @@ services:
       AWS_DEFAULT_REGION: "${AWS_REGION}"
       TINYCLOUD_LOG_LEVEL: normal
       TINYCLOUD_CORS: "true"
+      TINYCLOUD_QUOTA_URL: "${TINYCLOUD_QUOTA_URL}"
+      TINYCLOUD_ADMIN_SECRET: "${TINYCLOUD_ADMIN_SECRET}"
       ROCKET_ADDRESS: "0.0.0.0"
 
   dstack-ingress:
@@ -47,6 +49,20 @@ services:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - cert-data:/etc/letsencrypt
     restart: unless-stopped
+
+  # The dstack gateway's TLS-terminating routes (<app>-<port>.<domain>:443)
+  # only forward to compose-published ports, so guest sshd on :22 is
+  # unreachable via `phala ssh` even with authorized_keys installed.
+  # Publish a TCP forwarder on 10022 that relays to guest sshd via the
+  # docker host gateway. Port 10022 exposes ONLY sshd, which is key-gated.
+  ssh-gateway:
+    image: alpine/socat:1.8.1.3@sha256:188fe0a22182f81c16def9d1137930121eaa3023f427164e32c0d2f118f79dd6
+    restart: unless-stopped
+    ports:
+      - "10022:10022"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: TCP-LISTEN:10022,fork,reuseaddr TCP:host.docker.internal:22
 
 volumes:
   cert-data:

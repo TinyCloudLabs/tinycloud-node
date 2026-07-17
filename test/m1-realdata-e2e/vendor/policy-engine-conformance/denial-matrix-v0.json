@@ -1,0 +1,569 @@
+[
+  {
+    "code": "challenge-not-found",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-engine-http resolve handler",
+    "section65Mapping": "challenge-invalid=REFINED; challenge-expired=not-this-row",
+    "testRef": "grant_presentation_reject_vectors_fail_through_http",
+    "httpStatus": 404
+  },
+  {
+    "code": "challenge-expired",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-engine-http resolve handler",
+    "section65Mapping": "challenge-invalid=REFINED; challenge-expired=VERBATIM",
+    "testRef": "grant_presentation_reject_vectors_fail_through_http",
+    "httpStatus": 422
+  },
+  {
+    "code": "challenge-nonce-consumed",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-engine-http resolve handler",
+    "section65Mapping": "challenge-invalid=REFINED",
+    "testRef": "grant_presentation_reject_vectors_fail_through_http",
+    "httpStatus": 409
+  },
+  {
+    "code": "presentation-expired",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-engine-http resolve handler",
+    "section65Mapping": "presentation-invalid=SUPPRESSED-GENERIC",
+    "testRef": "grant_presentation_reject_vectors_fail_through_http",
+    "httpStatus": 422
+  },
+  {
+    "code": "presentation-audience-mismatch",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-engine-http resolve handler",
+    "section65Mapping": "presentation-invalid=SUPPRESSED-GENERIC",
+    "testRef": "grant_presentation_denials_use_frozen_codes_through_http",
+    "httpStatus": 422
+  },
+  {
+    "code": "presentation-evidence-missing",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-engine-http resolve handler",
+    "section65Mapping": "presentation-invalid=SUPPRESSED-GENERIC",
+    "testRef": "grant_presentation_denials_use_frozen_codes_through_http",
+    "httpStatus": 422
+  },
+  {
+    "code": "evidence-requirement-unknown",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-engine-http resolve handler",
+    "section65Mapping": "presentation-invalid=SUPPRESSED-GENERIC",
+    "testRef": "grant_presentation_denials_use_frozen_codes_through_http",
+    "httpStatus": 422
+  },
+  {
+    "code": "evidence-requirement-duplicate",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-engine-http resolve handler",
+    "section65Mapping": "presentation-invalid=SUPPRESSED-GENERIC",
+    "testRef": "grant_presentation_denials_use_frozen_codes_through_http",
+    "httpStatus": 422
+  },
+  {
+    "code": "holder-signature-invalid",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-engine-http resolve handler",
+    "section65Mapping": "holder-not-authorized=SUPPRESSED-GENERIC",
+    "testRef": "grant_presentation_reject_vectors_fail_through_http",
+    "httpStatus": 422
+  },
+  {
+    "code": "holder-signature-signer-mismatch",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-engine-http resolve handler",
+    "section65Mapping": "holder-not-authorized=SUPPRESSED-GENERIC",
+    "testRef": "grant_presentation_denials_use_frozen_codes_through_http",
+    "httpStatus": 422
+  },
+  {
+    "code": "requested-capabilities-exceeded",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-engine-http resolve handler",
+    "section65Mapping": "requested-capabilities-exceeded=VERBATIM",
+    "testRef": "grant_presentation_denials_use_frozen_codes_through_http",
+    "httpStatus": 422
+  },
+  {
+    "code": "requested-capabilities-hash-mismatch",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-engine-http resolve handler",
+    "section65Mapping": "requested-capabilities-hash-mismatch=VERBATIM",
+    "testRef": "grant_presentation_denials_use_frozen_codes_through_http",
+    "httpStatus": 422
+  },
+  {
+    "code": "evidence-authority-missing",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-evidence-vc via policy-engine-http resolve handler",
+    "section65Mapping": "evidence-invalid=SUPPRESSED-GENERIC",
+    "testRef": "evidence_denial_matrix_contract_cases",
+    "httpStatus": 422
+  },
+  {
+    "code": "evidence-credential-invalid",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-evidence-vc via policy-engine-http resolve handler",
+    "section65Mapping": "evidence-invalid=SUPPRESSED-GENERIC; evidence-expired=REFINED_BY_CASE{expired launch credential -> evidence-credential-invalid}; gate caveat: expired evidence cannot authorize, but no distinct producible expiration denial code exists at 8c4cabbf5",
+    "testRef": "launch_profile_reject_vectors_fail_through_http_without_mutating_fixtures",
+    "httpStatus": 422
+  },
+  {
+    "code": "evidence-domain-invalid",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-evidence-vc via policy-engine-http resolve handler",
+    "section65Mapping": "evidence-invalid=SUPPRESSED-GENERIC",
+    "testRef": "evidence_denial_matrix_contract_cases",
+    "httpStatus": 422
+  },
+  {
+    "code": "evidence-domain-missing",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-evidence-vc via policy-engine-http resolve handler",
+    "section65Mapping": "evidence-invalid=SUPPRESSED-GENERIC",
+    "testRef": "evidence_denial_matrix_contract_cases",
+    "httpStatus": 422
+  },
+  {
+    "code": "evidence-freshness-expired",
+    "layer": "FROZEN-VOCABULARY",
+    "reachability": "FROZEN-VOCABULARY/UNREACHABLE",
+    "producingModule": "policy-evidence-vc vocabulary only: enforce_freshness (crates/policy-evidence-vc/src/lib.rs:184) returns evidence-freshness-unestablishable for any freshness requirement; FreshnessExpired has no construction site at 8c4cabbf5",
+    "section65Mapping": "evidence-expired=REFINED_BY_CASE{expired launch credential -> evidence-credential-invalid}; gate caveat: expired evidence cannot authorize, but no distinct producible expiration denial code exists at 8c4cabbf5",
+    "cpFRecord": "CP-F: FreshnessExpired->FreshnessUnestablishable collapse is fail-closed for authorization but loses denial precision affecting SDK observability; v0 disposition FROZEN-VOCABULARY/UNREACHABLE; revisit with the freshness contract",
+    "libraryTestRefs": [
+      "tests/vector_tests.rs::launch_credential_profile_reject_vectors"
+    ]
+  },
+  {
+    "code": "evidence-freshness-unestablishable",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-evidence-vc via policy-engine-http resolve handler",
+    "section65Mapping": "evidence-status-stale=REFINED",
+    "testRef": "launch_profile_freshness_cannot_be_bypassed_with_spoofed_status_fields",
+    "httpStatus": 422
+  },
+  {
+    "code": "evidence-issuer-missing",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-evidence-vc via policy-engine-http resolve handler",
+    "section65Mapping": "evidence-invalid=SUPPRESSED-GENERIC",
+    "testRef": "evidence_denial_matrix_contract_cases",
+    "httpStatus": 422
+  },
+  {
+    "code": "evidence-issuer-untrusted",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-evidence-vc via policy-engine-http resolve handler",
+    "section65Mapping": "evidence-invalid=SUPPRESSED-GENERIC",
+    "testRef": "launch_profile_reject_vectors_fail_through_http_without_mutating_fixtures",
+    "httpStatus": 422
+  },
+  {
+    "code": "evidence-presentation-invalid",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-evidence-vc via policy-engine-http resolve handler",
+    "section65Mapping": "evidence-invalid=SUPPRESSED-GENERIC",
+    "testRef": "launch_profile_reject_vectors_fail_through_http_without_mutating_fixtures",
+    "httpStatus": 422
+  },
+  {
+    "code": "evidence-requirements-invalid",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-evidence-vc via policy-engine-http resolve handler",
+    "section65Mapping": "evidence-invalid=SUPPRESSED-GENERIC",
+    "testRef": "evidence_denial_matrix_contract_cases",
+    "httpStatus": 422
+  },
+  {
+    "code": "evidence-verifier-unsupported",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-evidence-vc via policy-engine-http resolve handler",
+    "section65Mapping": "verifier-unsupported=REFINED",
+    "testRef": "evidence_denial_matrix_contract_cases",
+    "httpStatus": 422
+  },
+  {
+    "code": "enrollment-binding-mismatch",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-engine-http holder enrollment validator",
+    "section65Mapping": "eligible-subject-not-authorized=REFINED; holder-not-authorized=SUPPRESSED-GENERIC",
+    "testRef": "launch_profile_reject_vectors_fail_through_http_without_mutating_fixtures",
+    "httpStatus": 403
+  },
+  {
+    "code": "enrollment-expired",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-engine-http holder enrollment validator",
+    "section65Mapping": "holder-not-authorized=SUPPRESSED-GENERIC",
+    "testRef": "enrollment_date_fields_reject_before_signature_verification",
+    "httpStatus": 403
+  },
+  {
+    "code": "enrollment-not-yet-valid",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-engine-http holder enrollment validator",
+    "section65Mapping": "holder-not-authorized=SUPPRESSED-GENERIC",
+    "testRef": "enrollment_date_fields_reject_before_signature_verification",
+    "httpStatus": 403
+  },
+  {
+    "code": "enrollment-out-of-scope",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-engine-http holder enrollment validator",
+    "section65Mapping": "eligible-subject-not-authorized=REFINED; holder-not-authorized=SUPPRESSED-GENERIC",
+    "testRef": "enrollment_scope_denials_use_frozen_codes_through_http",
+    "httpStatus": 403
+  },
+  {
+    "code": "enrollment-revoked",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-engine-http holder enrollment validator",
+    "section65Mapping": "holder-not-authorized=SUPPRESSED-GENERIC",
+    "testRef": "holder_enrollment_rollback_vectors_fail_through_http",
+    "httpStatus": 403
+  },
+  {
+    "code": "enrollment-revoked-irreversible",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-engine-http holder enrollment validator",
+    "section65Mapping": "holder-not-authorized=SUPPRESSED-GENERIC",
+    "testRef": "holder_enrollment_rollback_vectors_fail_through_http",
+    "httpStatus": 403
+  },
+  {
+    "code": "enrollment-status-rollback",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-engine-http holder enrollment validator",
+    "section65Mapping": "holder-not-authorized=SUPPRESSED-GENERIC",
+    "testRef": "holder_enrollment_rollback_vectors_fail_through_http",
+    "httpStatus": 403
+  },
+  {
+    "code": "signature-invalid",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-engine-http holder enrollment validator",
+    "section65Mapping": "policy-invalid=REFINED; holder-not-authorized=SUPPRESSED-GENERIC",
+    "testRef": "pre_runtime_rejections_still_consume_nonce_once",
+    "httpStatus": 403
+  },
+  {
+    "code": "signer-not-authorized",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-engine-http holder enrollment validator",
+    "section65Mapping": "holder-not-authorized=SUPPRESSED-GENERIC",
+    "testRef": "unauthorized_enrollment_signer_uses_frozen_code_and_consumes_nonce",
+    "httpStatus": 403
+  },
+  {
+    "code": "canonicalization-mismatch",
+    "layer": "FROZEN-VOCABULARY",
+    "reachability": "FROZEN-VOCABULARY/UNREACHABLE",
+    "producingModule": "policy_core vocabulary only: sole construction site validate_jcs_bytes (src/signed_object.rs:327-331); mounted policy-engine-http resolve uses typed verify_signed_object and cannot preserve original non-JCS bytes at 8c4cabbf5",
+    "section65Mapping": "policy-invalid=REFINED",
+    "cpFRecord": "CP-F: signed-object profile specifies canonicalization-mismatch but mounted typed path erases the byte representation needed to detect it; v0 disposition FROZEN-VOCABULARY/UNREACHABLE; revisit when a byte-preserving ingest exists",
+    "libraryTestRefs": [
+      "tests/vector_tests.rs::signed_object_negative_vectors"
+    ]
+  },
+  {
+    "code": "digest-mismatch",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-engine-http holder enrollment signed-object validator",
+    "section65Mapping": "policy-invalid=REFINED",
+    "testRef": "holder_enrollment_signed_object_digest_mismatch_uses_frozen_code_and_consumes_nonce",
+    "httpStatus": 403
+  },
+  {
+    "code": "id-mismatch",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-engine-http holder enrollment signed-object validator",
+    "section65Mapping": "policy-invalid=REFINED",
+    "testRef": "holder_enrollment_signed_object_id_mismatch_uses_frozen_code_and_consumes_nonce",
+    "httpStatus": 403
+  },
+  {
+    "code": "schema-invalid",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-engine-http JSON and signed-object schema validators",
+    "section65Mapping": "policy-invalid=REFINED",
+    "testRef": "malformed_json_and_type_mismatch_use_schema_invalid_envelope",
+    "httpStatus": 422
+  },
+  {
+    "code": "policy-not-found",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-runtime active_policy",
+    "section65Mapping": "policy-not-found=VERBATIM",
+    "testRef": "policy_lifecycle_denials_use_frozen_codes",
+    "httpStatus": 404
+  },
+  {
+    "code": "policy-inactive",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-runtime active_policy",
+    "section65Mapping": "policy-inactive=VERBATIM",
+    "testRef": "policy_lifecycle_denials_use_frozen_codes",
+    "httpStatus": 403
+  },
+  {
+    "code": "policy-expired",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-runtime active_policy",
+    "section65Mapping": "policy-expired=VERBATIM",
+    "testRef": "policy_lifecycle_denials_use_frozen_codes",
+    "httpStatus": 403
+  },
+  {
+    "code": "policy-status-rollback",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-runtime policy status tracker",
+    "section65Mapping": "policy-inactive=VERBATIM",
+    "testRef": "policy_status_rollback_uses_frozen_code_through_mounted_challenge",
+    "httpStatus": 409
+  },
+  {
+    "code": "policy-not-satisfied",
+    "layer": "E",
+    "reachability": "mounted-runtime",
+    "producingModule": "policy-runtime evaluator",
+    "section65Mapping": "presentation-invalid=SUPPRESSED-GENERIC",
+    "testRef": "policy_not_satisfied_uses_frozen_code_through_http",
+    "httpStatus": 403
+  },
+  {
+    "code": "policy-status-refresh-failed",
+    "layer": "S",
+    "producingModule": "policy-runtime policy status refresher",
+    "section65Mapping": "policy-inactive=server-side-refresh-failure",
+    "testRef": "crates/policy-runtime/tests/refresh_active_cutoff.rs::status_refresh_failure_fails_closed"
+  },
+  {
+    "code": "challenge-signing-failed",
+    "layer": "S",
+    "producingModule": "policy-runtime challenge signer",
+    "section65Mapping": "challenge-invalid=server-side-signing-failure",
+    "testRef": "crates/policy-runtime/tests/challenge_signing.rs::signed_challenge_fails_closed_when_signer_fails"
+  },
+  {
+    "code": "challenge-signature-invalid",
+    "layer": "S",
+    "producingModule": "policy-runtime challenge signature verifier",
+    "section65Mapping": "challenge-invalid=server-side-signature-verification",
+    "testRef": "crates/policy-runtime/tests/challenge_signing.rs::signed_challenge_rejects_malformed_signature"
+  },
+  {
+    "code": "challenge-signature-suite-not-accepted",
+    "layer": "S",
+    "producingModule": "policy-runtime challenge signature verifier",
+    "section65Mapping": "challenge-invalid=server-side-signature-suite",
+    "testRef": "crates/policy-runtime/tests/challenge_signing.rs::signed_challenge_rejects_suite_outside_accepted_suites"
+  },
+  {
+    "code": "grant-not-found",
+    "layer": "S",
+    "producingModule": "policy-runtime grant state",
+    "section65Mapping": "materialization-failed=REFINED",
+    "testRef": "crates/policy-runtime/tests/tracked_revocation.rs::continued_use_rejects_missing_grant"
+  },
+  {
+    "code": "grant-inactive",
+    "layer": "S",
+    "producingModule": "policy-runtime grant state",
+    "section65Mapping": "materialization-failed=REFINED",
+    "testRef": "crates/policy-runtime/tests/tracked_revocation.rs::continued_use_rejects_inactive_grant"
+  },
+  {
+    "code": "grant-expired",
+    "layer": "S",
+    "producingModule": "policy-runtime grant state",
+    "section65Mapping": "materialization-failed=REFINED",
+    "testRef": "crates/policy-runtime/tests/tracked_revocation.rs::continued_use_rejects_expired_grant"
+  },
+  {
+    "code": "grant-issuance-failed",
+    "layer": "S",
+    "producingModule": "policy-runtime grant issuer",
+    "section65Mapping": "materialization-failed=REFINED",
+    "testRef": "crates/policy-runtime/tests/tracked_revocation.rs::grant_issuance_failure_fails_closed"
+  },
+  {
+    "code": "active-cutoff-failed",
+    "layer": "S",
+    "producingModule": "policy-engine-http demo active-cutoff route / policy-runtime active cutoff",
+    "section65Mapping": "active-cutoff-failed=VERBATIM",
+    "testRef": "crates/policy-runtime/tests/refresh_active_cutoff.rs::active_cutoff_fails_closed_when_grant_issuer_cannot_revoke"
+  },
+  {
+    "code": "evidence-revoked",
+    "layer": "PROVISIONAL-S",
+    "producingModule": "policy-runtime tracked evidence continued-use refresh; not reachable from mounted challenge/resolve in v0",
+    "section65Mapping": "evidence-revoked=VERBATIM(PROVISIONAL-S reachability)",
+    "testRef": "crates/policy-runtime/tests/tracked_revocation.rs::revoked_tracked_evidence_invalidates_continued_use"
+  },
+  {
+    "code": "evidence-revocation-state-missing",
+    "layer": "PROVISIONAL-S",
+    "producingModule": "policy-runtime tracked evidence continued-use refresh; not reachable from mounted challenge/resolve in v0",
+    "section65Mapping": "evidence-status-stale=REFINED",
+    "testRef": "crates/policy-runtime/tests/tracked_revocation.rs::missing_revocation_state_for_expiry_bounded_evidence_fails_closed"
+  },
+  {
+    "code": "presentation-invalid",
+    "layer": "SUPPRESSED",
+    "producingModule": "policy-runtime category generic suppressed by adapter",
+    "section65Mapping": "presentation-invalid=SUPPRESSED-GENERIC",
+    "testRef": "adapter_frozen_denial_vocabulary_excludes_suppressed_generics"
+  },
+  {
+    "code": "evidence-invalid",
+    "layer": "SUPPRESSED",
+    "producingModule": "policy-runtime category generic suppressed by adapter",
+    "section65Mapping": "evidence-invalid=SUPPRESSED-GENERIC",
+    "testRef": "adapter_frozen_denial_vocabulary_excludes_suppressed_generics"
+  },
+  {
+    "code": "holder-not-authorized",
+    "layer": "SUPPRESSED",
+    "producingModule": "policy-runtime category generic suppressed by adapter",
+    "section65Mapping": "holder-not-authorized=SUPPRESSED-GENERIC",
+    "testRef": "adapter_frozen_denial_vocabulary_excludes_suppressed_generics"
+  },
+  {
+    "code": "sql-statement-not-allowed",
+    "layer": "N",
+    "producingModule": "tinycloud-node native denial",
+    "section65Mapping": "node-sql=LAYER-N",
+    "testRef": "m1-g-05 node vector coverage @ 8c4cabbf5",
+    "enforcedAt": "tinycloud-node"
+  },
+  {
+    "code": "sql-fixed-param-override",
+    "layer": "N",
+    "producingModule": "tinycloud-node native denial",
+    "section65Mapping": "node-sql=LAYER-N",
+    "testRef": "m1-g-05 node vector coverage @ 8c4cabbf5",
+    "enforcedAt": "tinycloud-node"
+  },
+  {
+    "code": "sql-raw-query-blocked",
+    "layer": "N",
+    "producingModule": "tinycloud-node native denial",
+    "section65Mapping": "node-sql=LAYER-N",
+    "testRef": "m1-g-05 node vector coverage @ 8c4cabbf5",
+    "enforcedAt": "tinycloud-node"
+  },
+  {
+    "code": "sql-raw-execute-blocked",
+    "layer": "N",
+    "producingModule": "tinycloud-node native denial",
+    "section65Mapping": "node-sql=LAYER-N",
+    "testRef": "m1-g-05 node vector coverage @ 8c4cabbf5",
+    "enforcedAt": "tinycloud-node"
+  },
+  {
+    "code": "sql-write-blocked",
+    "layer": "N",
+    "producingModule": "tinycloud-node native denial",
+    "section65Mapping": "node-sql=LAYER-N",
+    "testRef": "m1-g-05 node vector coverage @ 8c4cabbf5",
+    "enforcedAt": "tinycloud-node"
+  },
+  {
+    "code": "sql-export-blocked",
+    "layer": "N",
+    "producingModule": "tinycloud-node native denial",
+    "section65Mapping": "node-sql=LAYER-N",
+    "testRef": "m1-g-05 node vector coverage @ 8c4cabbf5",
+    "enforcedAt": "tinycloud-node"
+  },
+  {
+    "code": "sql-batch-blocked",
+    "layer": "N",
+    "producingModule": "tinycloud-node native denial",
+    "section65Mapping": "node-sql=LAYER-N",
+    "testRef": "m1-g-05 node vector coverage @ 8c4cabbf5",
+    "enforcedAt": "tinycloud-node"
+  },
+  {
+    "code": "sql-escape-blocked",
+    "layer": "N",
+    "producingModule": "tinycloud-node native denial",
+    "section65Mapping": "node-sql=LAYER-N",
+    "testRef": "m1-g-05 node vector coverage @ 8c4cabbf5",
+    "enforcedAt": "tinycloud-node"
+  },
+  {
+    "code": "sql-non-primitive-bind",
+    "layer": "N",
+    "producingModule": "tinycloud-node native denial",
+    "section65Mapping": "node-sql=LAYER-N",
+    "testRef": "m1-g-05 node vector coverage @ 8c4cabbf5",
+    "enforcedAt": "tinycloud-node"
+  },
+  {
+    "code": "delegation-revoked",
+    "layer": "N",
+    "producingModule": "tinycloud-node native denial",
+    "section65Mapping": "delegation=LAYER-N",
+    "testRef": "m1-g-05 node vector coverage @ 8c4cabbf5",
+    "enforcedAt": "tinycloud-node"
+  },
+  {
+    "code": "delegation-ancestor-revoked",
+    "layer": "N",
+    "producingModule": "tinycloud-node native denial",
+    "section65Mapping": "parent-authority-insufficient=LAYER-N",
+    "testRef": "m1-g-05 node vector coverage @ 8c4cabbf5",
+    "enforcedAt": "tinycloud-node"
+  },
+  {
+    "code": "terminal-parent-cannot-redelegate",
+    "layer": "N",
+    "producingModule": "tinycloud-node native denial",
+    "section65Mapping": "parent-authority-insufficient=LAYER-N",
+    "testRef": "m1-g-05 node vector coverage @ 8c4cabbf5",
+    "enforcedAt": "tinycloud-node"
+  }
+]

@@ -1,0 +1,17 @@
+[package]
+name = "opencredentials_sd_jwt"
+version = "0.1.0"
+edition = "2021"
+license-file = "../LICENSE.md"
+description = "Native SD-JWT helpers for OpenCredentials issuance, presentation, and verification"
+repository = "https://github.com/TinyCloudLabs/OpenCredentials"
+
+[dependencies]
+base64 = "0.21.3"
+ed25519-dalek = "1"
+getrandom = { version = "0.2", features = ["js"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
