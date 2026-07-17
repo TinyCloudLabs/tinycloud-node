@@ -33,7 +33,10 @@ use crate::{
     config::{self, Config, LoggingFormat},
     node_control::{
         key_provider::{self, IdentityPurpose, IdentitySnapshot},
-        paths::{dir_to_json_string, KeyBackend, LogMode, Profile, CONTROL_CONTRACT_VERSION},
+        paths::{
+            dir_to_json_string, systemd_system_group_gid, KeyBackend, LogMode, Profile,
+            CONTROL_CONTRACT_VERSION,
+        },
         service::{self, PublicApi},
     },
     tracing::{LogBuffer, LogEntry},
@@ -249,11 +252,18 @@ pub struct PublicTracingSnapshot {
 pub struct PublicStorageSnapshot {
     data_dir: String,
     blocks: PublicBlocksSnapshot,
-    staging: crate::config::StagingStorage,
+    staging: PublicStagingSnapshot,
     database: PublicDatabaseSnapshot,
     limit_bytes: Option<u64>,
     sql: PublicSqlSnapshot,
     duckdb: PublicDuckDbSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PublicStagingSnapshot {
+    FileSystem,
+    Memory,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -281,7 +291,6 @@ pub struct PublicDatabaseSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct PublicSqlSnapshot {
     path: Option<String>,
-    limit_bytes: Option<u64>,
     memory_threshold_bytes: u64,
 }
 
@@ -289,7 +298,6 @@ pub struct PublicSqlSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct PublicDuckDbSnapshot {
     path: Option<String>,
-    limit_bytes: Option<u64>,
     memory_threshold_bytes: u64,
     idle_timeout_seconds: u64,
     max_memory_per_connection: String,
@@ -593,12 +601,6 @@ impl ControlPlaneHandle {
         self.inner
             .state
             .store(ControlRuntimeState::Stopping as u8, Ordering::SeqCst);
-    }
-
-    pub fn mark_error(&self) {
-        self.inner
-            .state
-            .store(ControlRuntimeState::Error as u8, Ordering::SeqCst);
     }
 
     pub async fn set_identity_snapshot(&self, identity: IdentitySnapshot) {
@@ -926,7 +928,12 @@ impl ControlPlaneHandle {
 
     async fn logs_tail(&self, query: LogsTailQuery) -> ControlResult<ControlLogsTailResponse> {
         let log_source = log_source_name(self.inner.log_mode);
-        let lines = match query.lines.unwrap_or(200) {
+        let LogsTailQuery {
+            lines,
+            cursor: cursor_param,
+            since,
+        } = query;
+        let lines = match lines.unwrap_or(200) {
             0 => {
                 return Err(ControlError::invalid_request(
                     "field 'lines' must be between 1 and 2000",
@@ -942,15 +949,13 @@ impl ControlPlaneHandle {
             value => value,
         };
 
-        let cursor = if let Some(cursor) = query.cursor {
-            Some(parse_log_cursor(self.inner.log_mode, &cursor)?)
-        } else {
-            None
-        };
+        let cursor = cursor_param
+            .as_deref()
+            .and_then(|cursor| parse_log_cursor(self.inner.log_mode, cursor));
 
-        let since = if cursor.is_some() {
+        let since = if cursor_param.is_some() {
             None
-        } else if let Some(since) = query.since {
+        } else if let Some(since) = since {
             Some(
                 OffsetDateTime::parse(&since, &time::format_description::well_known::Rfc3339)
                     .map_err(|_| {
@@ -984,11 +989,13 @@ impl ControlPlaneHandle {
 
 impl ControlPlaneInner {
     async fn write_runtime_files(&self) -> Result<()> {
-        ensure_dir_mode(&self.runtime_dir, 0o700).await?;
+        let ownership = runtime_ownership(self.profile)?;
+        ensure_dir_mode(&self.runtime_dir, runtime_dir_mode(self.profile), ownership).await?;
         write_private_text(
             &self.control_token_path,
             &self.token,
             runtime_file_mode(self.profile),
+            ownership,
         )
         .await?;
         let rendered = serde_json::to_string_pretty(&service::ControlManifest {
@@ -1002,6 +1009,7 @@ impl ControlPlaneInner {
             &self.control_json_path,
             &rendered,
             runtime_file_mode(self.profile),
+            ownership,
         )
         .await?;
         Ok(())
@@ -1135,7 +1143,7 @@ fn effective_public_config(base_config_path: &Path) -> ControlResult<ControlConf
                 storage: PublicStorageSnapshot {
                     data_dir: dir_to_json_string(&config.storage.datadir),
                     blocks: public_block_config(&config.storage.blocks),
-                    staging: config.storage.staging.clone().into(),
+                    staging: public_staging_snapshot(&config.storage.staging),
                     database: PublicDatabaseSnapshot {
                         backend_kind: database_backend_kind(config.storage.database()),
                         path: database_path(config.storage.database()),
@@ -1143,12 +1151,10 @@ fn effective_public_config(base_config_path: &Path) -> ControlResult<ControlConf
                     limit_bytes: config.storage.limit.map(|value| value.as_u64()),
                     sql: PublicSqlSnapshot {
                         path: config.storage.sql.path.clone(),
-                        limit_bytes: config.storage.sql.limit.map(|value| value.as_u64()),
                         memory_threshold_bytes: config.storage.sql.memory_threshold.as_u64(),
                     },
                     duckdb: PublicDuckDbSnapshot {
                         path: config.storage.duckdb.path.clone(),
-                        limit_bytes: config.storage.duckdb.limit.map(|value| value.as_u64()),
                         memory_threshold_bytes: config.storage.duckdb.memory_threshold.as_u64(),
                         idle_timeout_seconds: config.storage.duckdb.idle_timeout_secs,
                         max_memory_per_connection: config
@@ -1242,6 +1248,13 @@ fn log_source_name(log_mode: LogMode) -> &'static str {
     }
 }
 
+fn public_staging_snapshot(staging: &crate::BlockStage) -> PublicStagingSnapshot {
+    match staging {
+        crate::BlockStage::A(_) => PublicStagingSnapshot::FileSystem,
+        crate::BlockStage::B(_) => PublicStagingSnapshot::Memory,
+    }
+}
+
 fn encode_log_cursor(log_mode: LogMode, cursor: String) -> String {
     match log_mode {
         LogMode::File => format!("file:{cursor}"),
@@ -1250,19 +1263,14 @@ fn encode_log_cursor(log_mode: LogMode, cursor: String) -> String {
     }
 }
 
-fn parse_log_cursor(log_mode: LogMode, cursor: &str) -> ControlResult<u64> {
+fn parse_log_cursor(log_mode: LogMode, cursor: &str) -> Option<u64> {
     let rendered = match log_mode {
         LogMode::File => cursor.strip_prefix("file:").unwrap_or(cursor),
         LogMode::Journald => cursor.strip_prefix("journald:").unwrap_or(cursor),
         LogMode::Stdout => cursor,
     };
 
-    rendered.parse::<u64>().map_err(|_| {
-        ControlError::invalid_request(
-            "field 'cursor' must be an opaque log cursor string",
-            json!({ "field": "cursor" }),
-        )
-    })
+    rendered.parse::<u64>().ok()
 }
 
 fn database_backend_kind(database: &str) -> String {
@@ -1539,7 +1547,7 @@ fn prune_overlay(overlay: &mut ControlOverlayFile) {
             && log
                 .tracing
                 .as_ref()
-                .map_or(true, |tracing| tracing.enabled.is_none())
+                .is_none_or(|tracing| tracing.enabled.is_none())
         {
             overlay.global.log = None;
         }
@@ -1595,10 +1603,10 @@ async fn read_overlay(path: &Path) -> Result<ControlOverlayFile> {
 
 async fn write_overlay(path: &Path, overlay: &ControlOverlayFile) -> Result<()> {
     if let Some(parent) = path.parent() {
-        ensure_dir_mode(parent, 0o700).await?;
+        ensure_dir_mode(parent, 0o700, None).await?;
     }
     let rendered = toml::to_string_pretty(overlay)?;
-    write_private_text(path, &rendered, 0o600).await
+    write_private_text(path, &rendered, 0o600, None).await
 }
 
 fn generate_token() -> String {
@@ -1607,7 +1615,7 @@ fn generate_token() -> String {
     encode_config(bytes, base64::URL_SAFE_NO_PAD)
 }
 
-async fn ensure_dir_mode(path: &Path, mode: u32) -> Result<()> {
+async fn ensure_dir_mode(path: &Path, mode: u32, ownership: Option<(u32, u32)>) -> Result<()> {
     fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
     #[cfg(unix)]
     {
@@ -1620,15 +1628,22 @@ async fn ensure_dir_mode(path: &Path, mode: u32) -> Result<()> {
         tokio::fs::set_permissions(path, permissions)
             .await
             .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+        set_private_ownership(path, ownership).await?;
     }
     Ok(())
 }
 
-async fn write_private_text(path: &Path, contents: &str, mode: u32) -> Result<()> {
+async fn write_private_text(
+    path: &Path,
+    contents: &str,
+    mode: u32,
+    ownership: Option<(u32, u32)>,
+) -> Result<()> {
     tokio::fs::write(path, contents)
         .await
         .with_context(|| format!("failed to write {}", path.display()))?;
     set_private_permissions(path, mode).await?;
+    set_private_ownership(path, ownership).await?;
     Ok(())
 }
 
@@ -1652,12 +1667,55 @@ async fn set_private_permissions(path: &Path, mode: u32) -> Result<()> {
     Ok(())
 }
 
+async fn set_private_ownership(path: &Path, ownership: Option<(u32, u32)>) -> Result<()> {
+    #[cfg(unix)]
+    if let Some((uid, gid)) = ownership {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let rendered = CString::new(path.as_os_str().as_bytes()).with_context(|| {
+            format!("failed to prepare {} for ownership change", path.display())
+        })?;
+        let rc = unsafe { libc::chown(rendered.as_ptr(), uid, gid) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to set ownership on {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+fn runtime_dir_mode(profile: Profile) -> u32 {
+    if matches!(profile, Profile::LinuxSystem) {
+        0o750
+    } else {
+        0o700
+    }
+}
+
 fn runtime_file_mode(profile: Profile) -> u32 {
     if matches!(profile, Profile::LinuxSystem) {
         0o640
     } else {
         0o600
     }
+}
+
+#[cfg(unix)]
+fn runtime_ownership(profile: Profile) -> Result<Option<(u32, u32)>> {
+    if matches!(profile, Profile::LinuxSystem) {
+        let gid = systemd_system_group_gid().ok_or_else(|| {
+            anyhow!("systemd-system installs require the 'tinycloud' group to exist")
+        })?;
+        Ok(Some((0, gid)))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(not(unix))]
+fn runtime_ownership(_profile: Profile) -> Result<Option<(u32, u32)>> {
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -1900,7 +1958,11 @@ mod tests {
     }
 
     #[test]
-    fn runtime_file_modes_follow_the_install_profile() {
+    fn runtime_access_modes_follow_the_install_profile() {
+        assert_eq!(runtime_dir_mode(Profile::MacosUser), 0o700);
+        assert_eq!(runtime_dir_mode(Profile::LinuxUser), 0o700);
+        assert_eq!(runtime_dir_mode(Profile::LinuxSystem), 0o750);
+
         assert_eq!(runtime_file_mode(Profile::MacosUser), 0o600);
         assert_eq!(runtime_file_mode(Profile::LinuxUser), 0o600);
         assert_eq!(runtime_file_mode(Profile::LinuxSystem), 0o640);
@@ -2105,19 +2167,19 @@ mod tests {
             ],
         );
         assert_keys_exact(&config["config"]["storage"]["blocks"], &["type", "path"]);
+        assert_eq!(config["config"]["storage"]["staging"], "memory");
         assert_keys_exact(
             &config["config"]["storage"]["database"],
             &["backendKind", "path"],
         );
         assert_keys_exact(
             &config["config"]["storage"]["sql"],
-            &["path", "limitBytes", "memoryThresholdBytes"],
+            &["path", "memoryThresholdBytes"],
         );
         assert_keys_exact(
             &config["config"]["storage"]["duckdb"],
             &[
                 "path",
-                "limitBytes",
                 "memoryThresholdBytes",
                 "idleTimeoutSeconds",
                 "maxMemoryPerConnection",
@@ -2199,6 +2261,16 @@ mod tests {
             .iter()
             .any(|entry| entry["message"] == "first log"));
 
+        let (_, invalid_cursor) = json_response(
+            &client,
+            &base_url,
+            Some(&token),
+            "/v1/logs/tail?lines=1&cursor=not-a-cursor",
+        )
+        .await;
+        assert_eq!(invalid_cursor["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(invalid_cursor["entries"][0]["message"], "second log");
+
         handle.mark_stopping();
         let stopping = wait_for_status(&client, &base_url, &token).await;
         assert_eq!(stopping["state"], "stopping");
@@ -2258,6 +2330,7 @@ mod tests {
             ],
         );
         assert_eq!(patch_response["contractVersion"], CONTROL_CONTRACT_VERSION);
+        assert_eq!(patch_response["restartRequired"], true);
         assert!(patch_response["appliedPaths"]
             .as_array()
             .unwrap()
@@ -2315,6 +2388,7 @@ mod tests {
             .unwrap()
             .iter()
             .any(|value| value == "storage.limitBytes"));
+        assert_eq!(clear_limit["restartRequired"], true);
         assert!(clear_limit["config"]["storage"]["limitBytes"].is_null());
 
         let zero_limit = client

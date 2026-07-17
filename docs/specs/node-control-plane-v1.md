@@ -203,7 +203,8 @@ Suggested error codes:
 - `platform`: `macos`, `linux`
 - `manager`: `homebrew-launchagent`, `launchd-user`, `systemd-user`, `systemd-system`
 - `state` for `service status`: `not-installed`, `stopped`, `starting`, `running`, `stopping`, `error`
-- `state` for `GET /v1/status`: `starting`, `running`, `stopping`, `error`
+- `state` for `GET /v1/status`: `starting`, `running`, `stopping`
+- `error` is reserved for future control-plane use and is not emitted by v1
 
 ### 2.1 `GET /v1/version`
 
@@ -451,10 +452,8 @@ Top-level `config` fields:
   `null`
 - `limitBytes`: integer or `null`
 - `sql.path`: absolute path string
-- `sql.limitBytes`: integer or `null`
 - `sql.memoryThresholdBytes`: integer
 - `duckdb.path`: absolute path string
-- `duckdb.limitBytes`: integer or `null`
 - `duckdb.memoryThresholdBytes`: integer
 - `duckdb.idleTimeoutSeconds`: integer
 - `duckdb.maxMemoryPerConnection`: raw string preserved from config
@@ -591,13 +590,14 @@ Field definitions:
 - `baseConfigPath`: absolute path to the base config file selected by the CLI
   or platform default.
 - `overlayPath`: absolute path to `dataPath/runtime/config.override.toml`.
-- `restartRequired`: `true` when any requested field changed. v1 does not
-  promise live reload, so a changed patch should be treated as requiring a
-  restart to take effect in the running node.
-- `appliedPaths`: canonical leaf paths that actually changed value. Fields
-  masked by a higher-precedence env var are excluded: the overlay is still
-  written, but it has no effect until the env var is removed, and the
-  response's effective `config` snapshot reflects that.
+- `restartRequired`: `true` when the patch writes a changed overlay entry or
+  changes the effective config for at least one requested restart-required
+  field. Fields masked by a higher-precedence env var can still set this to
+  `true` even when `appliedPaths` is empty, because the overlay is written but
+  remains inert until the env var is removed.
+- `appliedPaths`: canonical leaf paths that actually changed effective value.
+  Fields masked by a higher-precedence env var are excluded; the response's
+  effective `config` snapshot still reflects the env-masked value.
 - `config`: the full effective public snapshot after the overlay write.
 
 Invalid, unsafe, or unknown fields MUST be rejected with `400 invalid_request`.
@@ -639,20 +639,15 @@ Field definitions:
   no entries
 - `entries`: ordered oldest-to-newest within the returned slice
 
-`file` cursor behavior:
-
-- In v0, file logging comes from launchd/systemd stdout and stderr redirection
-  into per-service log files.
-- The cursor is a byte-offset token paired with the file inode.
-- If the inode changes because the file rotated, the cursor is invalid and the
-  server restarts from the newest tail window.
-
-`journald` cursor behavior:
-
-- The cursor is the native journald cursor string and is passed through
-  unchanged.
-- If the journald cursor is stale or invalid, the server restarts from the
-  newest tail window.
+- `file` and `journald` tails are both served from the node's in-memory ring
+  buffer in v1. The native byte-offset and journald cursor formats are
+  reserved for a future version.
+- `cursor` values are opaque and process-lifetime scoped. If a cursor is
+  stale, malformed, or has fallen out of the ring buffer, the server restarts
+  from the newest tail window instead of erroring.
+- Launchd/systemd stdout and stderr redirection remain the durable log sink on
+  disk or in the journal; `/v1/logs/tail` does not read those sources directly
+  in v1.
 
 Log entry fields:
 
@@ -846,16 +841,10 @@ consistency check instead of a separate source of truth.
 
 TC-78 resolves the v0 transition for the node control plane: the CLI now reads
 live control health, identity, and version data from the local control API when
-the node is serving. Older nodes that do not expose the control listener still
-fall back to the legacy `controlApi: "unavailable"` behavior so the transition
-remains compatible during mixed-version upgrades, and managers may continue to
-surface that annotation while the CLI uses the existing grace-window behavior.
-
-If the control listener is genuinely not serving, a manager-backed process may
-still surface `controlApi: "unavailable"` while the CLI falls back to the
-existing grace-window behavior. Once a live control API is available, failed
-control health is reported as `error` instead of being masked by the v0
-transition path.
+the node is serving. During the initial grace window, nodes that do not expose
+the control listener may still surface `controlApi: "unavailable"`; if the
+probe is still failing after 30 seconds, the CLI escalates the service state to
+`error` instead of leaving the failure masked.
 
 ### 3.4 `tinycloud node status`
 

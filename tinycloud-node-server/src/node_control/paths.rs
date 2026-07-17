@@ -310,7 +310,7 @@ pub fn systemd_system_group_gid() -> Option<u32> {
     };
     if rc == 0 && !result.is_null() {
         let group = unsafe { group.assume_init() };
-        Some(group.gr_gid as u32)
+        Some(group.gr_gid)
     } else {
         None
     }

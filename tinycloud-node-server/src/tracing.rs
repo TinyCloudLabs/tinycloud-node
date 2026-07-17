@@ -18,7 +18,7 @@ use tracing::{
     field::{Field, Visit},
     info_span,
     subscriber::set_global_default,
-    Event, Span, Subscriber,
+    Event, Level, Span, Subscriber,
 };
 use tracing_log::LogTracer;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -286,7 +286,9 @@ where
 
 pub fn tracing_try_init(config: &config::Logging) -> Result<(), ExporterBuildError> {
     let _ = LogTracer::init();
-    let env_filter = tracing_subscriber::EnvFilter::from_default_env();
+    let env_filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(Level::INFO.into())
+        .from_env_lossy();
     let subscriber = tracing_subscriber::fmt::layer();
     let log = match config.format {
         config::LoggingFormat::Text => subscriber.boxed(),
