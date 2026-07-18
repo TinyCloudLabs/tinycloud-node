@@ -356,16 +356,18 @@ versioned domain prefix:
 resource_uri = <space>/compute/<function_cid>          (ResourceId display form, §4;
                                                         used by authorizer + binding caveat)
 routine_did  = did:key( get_key("tinycloud/compute-key/v1/"
-                                 + hash(<space>) + "/compute/" + <function_cid>) )
+                                 + base32(blake3(space_canonical))
+                                 + "/compute/" + <function_cid>) )
 ```
 
 The **canonical resource URI** (`<space>/compute/<function_cid>`) remains the one
 spelling shared by the authorizer and the binding caveat — the exact bytes the
 resource machinery already produces (`resource.rs:268-282`), no second
 serialization to keep in sync. The **key-derivation input**, however, hashes the
-space component into a fixed-width, delimiter-free token (Codex C8, and the
-safety box below) so uniqueness does not depend on the still-stubbed `Name`
-grammar; the `function_cid` is base32 and delimiter-free already. The derivation
+space component: `base32(blake3(space_canonical))` — a **fixed-width, lowercase
+base32, delimiter-free** token (blake3 is already available in `tinycloud-core`
+`hash.rs`) — so uniqueness does not depend on the still-stubbed `Name` grammar
+(Codex C8, defect a); the `function_cid` is base32 and delimiter-free already. The derivation
 uses the existing dstack hierarchical key derivation (`dstack::get_key`,
 `dstack.rs:110-119`). The `compute-key/v1/` prefix is domain-separated and
 version-tagged, so a future derivation-scheme change (e.g. `v2`) does not collide
@@ -375,8 +377,13 @@ exact function CID in this exact space, can act as the routine.** (Non-TEE /
 classic mode: the same derivation runs off the node's static key material via
 `keys.rs`; the trust statement weakens to "the node" — see §9.3.)
 
-**F3 — the space component is mandatory, and space names MUST be validated
-before compute activates.** Deriving from the CID *alone* would give identical
+**F3 — the space component is mandatory, and it is hashed into the derivation.**
+The space component is not optional, and (per Codex C8/defect a) it enters the
+derivation as `base32(blake3(space_canonical))` rather than as a validated raw
+name — hashing REPLACES any "names must be validated first" requirement, so
+compute does not block on the auth-wide `Name` grammar (global `Name` hardening is
+a separate, deferred task, §12.2/P4). Deriving from the CID *alone* would give
+identical
 WASM deployed in space A and space B one shared `routine_did`, opening a
 **cross-space confused deputy**: a space-B execution could cite space A's `D_fn`
 (same delegatee, valid chain rooted in A's owner) and read/write space A's data
@@ -397,12 +404,12 @@ secret at rest). This is defense-in-depth *with* the normative
 > resource.rs:28-44), and `SpaceId`/`ResourceId` parsing constructs `Name`
 > directly, bypassing that validator (resource.rs:306-369) — so a narrow
 > `Name::from_str` check would not make real URI parsing safe. **Therefore the
-> compute derivation hashes the canonical space string into a fixed-width,
-> delimiter-free component** before it enters the derivation string, making
-> collisions impossible without depending on the global `Name` grammar. Global
-> `Name` hardening remains desirable but is a **separate, compatibility-sensitive
-> auth task** — NOT a compute precondition. Tracked as a test obligation in
-> §13.1.
+> compute derivation hashes the canonical space string —
+> `base32(blake3(space_canonical))`, fixed-width and delimiter-free** — before it
+> enters the derivation string, making collisions impossible without depending on
+> the global `Name` grammar. Global `Name` hardening remains desirable but is a
+> **separate, compatibility-sensitive auth task** — NOT a compute precondition.
+> Tracked as a test obligation in §13.1.
 
 **DECIDED (D1): routine identity is this deterministic TEE-derived key.** It
 needs no secret at rest and binds data access to both the function and the node.
@@ -702,11 +709,13 @@ Notes on encoding choices:
 - **Inline inputs vs KV refs.** Small inputs ride inline in `input`. Larger or
   pre-existing data is referenced by `input_refs` (KV paths); the routine reads
   them via host imports under `D_fn`, so the invoker never needs `kv/get`.
-- **Deploy body.** Like the duckdb `import` path (`routes/mod.rs:1748-1769`,
-  which reads a binary body up to 100 MB before falling through to JSON), a
-  large WASM binary is streamed as the raw request body; a small one may be
-  inlined as `wasm_b64`. The deploy handler computes the CID from the received
-  bytes.
+- **Deploy body.** **MVP (normative) = JSON body + base64 `wasm_b64` + an inline
+  encoded `D_fn` only.** Raw-body WASM streaming (the duckdb `import`-style path,
+  `routes/mod.rs:1748-1769`) and **pre-submitted grant CIDs** are **DEFERRED /
+  non-normative for the MVP** (Codex C7): raw bytes leave no defined channel for
+  the deploy metadata + grant, and a pre-submitted CID contradicts atomic grant
+  persistence (§5.1/F4). They are listed under the deferred work; the deploy
+  handler computes the CID from the received base64 bytes.
 - **Caveats via facts.** As with `sqlCaveats`/`duckdbCaveats`
   (`routes/mod.rs:1727-1739`), `ComputeCaveats` may also be supplied in
   invocation facts under key `computeCaveats` — but per §6.3 the *enforced*
@@ -783,14 +792,16 @@ they do not collide across repeated executions of the same function. This means
 "execute the same function twice" is allowed (two distinct outer envelopes, two
 distinct routine invocation sets); it is *not* an accidental replay.
 
-**Entry point (precision).** The route-level replay cache guards
-`POST /invoke` only (`routes/mod.rs:714`). The mediator's internal invocations
-MUST enter through core `process()` (`invocation.rs:105-118`), **not** through
-the HTTP route — so they never touch the route replay cache at all (their
-fresh-nonce uniqueness is what prevents collisions). State this so no one
-"helpfully" routes internal invocations back through the HTTP path, which would
-subject them to the outer replay cache and CORS/auth guards they neither need nor
-should re-trigger.
+**Entry point (precision — Codex C4).** The route-level replay cache guards
+`POST /invoke` only (`routes/mod.rs:714`). The mediator's internal routine
+invocations are verified AND executed through an **injected internal-invocation
+executor backed by `SpaceDatabase::invoke`** (server-composed, `db.rs:620-720`) —
+NOT by calling core `process()` alone, which only verifies+persists an invocation
+and returns its hash (`invocation.rs:105-118`) and so cannot return KV data. This
+executor path never touches the route replay cache (internal invocations use
+fresh nonces, so uniqueness is preserved); do not "helpfully" route internal
+invocations back through the HTTP path, which would re-trigger the outer replay
+cache and CORS/auth guards they neither need nor should re-trigger.
 
 ---
 

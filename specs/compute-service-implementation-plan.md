@@ -22,7 +22,8 @@ node <phase>:
   verify:  <named commands; each MUST exist and exit 0>
   suffix:  cargo fmt -- --check
            cargo clippy --features compute -- -D warnings
-           cargo test            # feature OFF must stay green (501 path/gating)
+           cargo test                                          # feature OFF stays green
+           cargo test -p tinycloud-node --test compute_disabled  # named 501/not-supported gate (C5)
   fix_loop: verify fail → review diff+error → patch → re-verify (max 3, then escalate)
 ```
 
@@ -49,9 +50,13 @@ file is absent. The `suffix` block runs on **every** node.
 - `cargo test -p tinycloud-core policy_capability` (drift guards)
 - `cargo test -p tinycloud-node --test compute_skeleton --features compute` —
   asserts: `/version` lists `compute`; an enabled dispatch reaches the handler;
-  disabled build returns **501**; **a wrong-ability request is rejected** (an
-  `Execute` capability presenting a `Deploy` body → 403, and vice-versa).
-- suffix (note: `cargo test` feature-off must also exercise the 501 path).
+  **a wrong-ability request is rejected** (an `Execute` capability presenting a
+  `Deploy` body → 403, and vice-versa); **a `List` body is rejected while reserved**
+  (no server-side listing handler exists in the MVP — assert the reject path, C1).
+- `cargo test -p tinycloud-node --test compute_disabled` — the named feature-off
+  gate: with `compute` off, a `tinycloud.compute/*` request returns 501/not-supported
+  (C5). Also runs in the shared suffix.
+- suffix.
 
 ---
 
@@ -84,10 +89,15 @@ The transaction seam is a **core primitive**, not a service-module change (C2):
   `SqlSizes` delta; artifact-persist-fails ⇒ no delegation row); **mirror only
   after commit**; **superseded-grant revocation** on re-deploy; **quota** (deploy
   bumps `store_size`, over-quota deploy → 402); **handshake** returns a stable
-  public `routine_did`; **hashed-space** collision-freedom (two delimiter-laden
-  space names never collide, §13.1).
-- `cargo test -p tinycloud-core --test routine_key_deriver --features compute` —
-  classic + dstack-**simulator** derivation is deterministic and machine-checked.
+  public `routine_did`; **`RoutineDid` body with the wrong ability is rejected**
+  (a non-`compute/deploy` capability presenting a `RoutineDid` body → 403, C1);
+  **hashed-space** collision-freedom (two delimiter-laden space names never
+  collide, §13.1).
+- `cargo test -p tinycloud-core --test routine_key_deriver` — the `RoutineKeyDeriver`
+  **trait** unit test with the **classic** impl only (core has no dstack adapter).
+- `cargo test -p tinycloud-node --test compute_routine_key --features compute,dstack`
+  (with `DSTACK_SIMULATOR_ENDPOINT` set) — the dstack-**simulator** adapter lives in
+  the server crate, so its machine-checked determinism test lands there (C11, defect b).
 - suffix.
 
 > **Deployment-readiness gate (NOT a test, C11):** real cross-CVM-redeploy
@@ -101,10 +111,20 @@ The transaction seam is a **core primitive**, not a service-module change (C2):
 
 First end-to-end least-privilege slice, deliberately narrow (C3/C4):
 
-- **Pinned minimal WASM ABI (C3):** one guest export + one `storage.get` host
-  import, with an **exact byte/JSON contract** (module name, signature, guest
-  memory ownership, serialization), gated by a **checked-in WAT/WASM fixture**.
-  The rest of the host-import surface is deferred.
+- **Pinned minimal WASM ABI (C3) — stated, not "TBD":**
+  - **core module** (NOT a component);
+  - guest exports `alloc(len: i32) -> ptr: i32` (guest owns its linear memory;
+    the host writes args into guest memory via `alloc`) and
+    `run(ptr: i32, len: i32) -> (ptr: i32, len: i32)` (the single entrypoint);
+  - one host import, module name **`"tinycloud"`**, function
+    `storage_get(ptr: i32, len: i32) -> (ptr: i32, len: i32)`;
+  - **all payloads are JSON bytes** in guest memory: `run`'s input is the JSON
+    request, its output is the JSON result; `storage_get`'s arg is the JSON key
+    ref, its return is the JSON value/bytes.
+  (Names may change only if the same completeness bar — module names, signatures,
+  memory ownership, encoding — stays fully stated.) The rest of the host-import
+  surface is deferred. Gated by a **checked-in WAT fixture that exercises exactly
+  this contract**.
 - **KV-read-only, inline output (C4):** the injected **internal-invocation
   executor** (named seam) reads through `SpaceDatabase::invoke` (`db.rs:620-720`);
   a bare `process()` only persists and returns a hash (`invocation.rs:105-118`)
