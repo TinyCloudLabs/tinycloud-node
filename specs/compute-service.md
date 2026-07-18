@@ -795,13 +795,16 @@ distinct routine invocation sets); it is *not* an accidental replay.
 **Entry point (precision — Codex C4).** The route-level replay cache guards
 `POST /invoke` only (`routes/mod.rs:714`). The mediator's internal routine
 invocations are verified AND executed through an **injected internal-invocation
-executor backed by `SpaceDatabase::invoke`** (server-composed, `db.rs:620-720`) —
-NOT by calling core `process()` alone, which only verifies+persists an invocation
-and returns its hash (`invocation.rs:105-118`) and so cannot return KV data. This
-executor path never touches the route replay cache (internal invocations use
-fresh nonces, so uniqueness is preserved); do not "helpfully" route internal
-invocations back through the HTTP path, which would re-trigger the outer replay
-cache and CORS/auth guards they neither need nor should re-trigger.
+executor** — NOT by calling core `process()` alone, which only verifies+persists
+an invocation and returns its hash (`invocation.rs:105-118`) and so cannot return
+KV data or run SQL. The executor is **composed in the SERVER crate**, where both
+`SpaceDatabase::invoke` (KV CRUD, `db.rs:620-720`) and `SqlService` (SQL,
+executed behind the route layer) are reachable — `SqlService` does not live in
+`tinycloud-core`, so the seam cannot be core-only. This executor path never
+touches the route replay cache (internal invocations use fresh nonces, so
+uniqueness is preserved); do not "helpfully" route internal invocations back
+through the HTTP path, which would re-trigger the outer replay cache and CORS/auth
+guards they neither need nor should re-trigger.
 
 ---
 
@@ -838,11 +841,23 @@ pub trait ExecutionBackend: Send + Sync {
 
 ### 9.1 WasmtimeBackend (in-node, default)
 
-- **Runs** the WASM via `wasmtime` inside the node process. Host imports
-  (`storage.get`/`put`/`list`, `sql.query`/`execute`) are provided by the
-  `HostMediator`, which issues the routine's internal invocations under `D_fn`
-  (§6.2). The WASM cannot reach the network or filesystem — only the mediated
-  host imports.
+- **Runs** the WASM via `wasmtime` inside the node process. Host imports are
+  provided by the `HostMediator`, which issues the routine's internal invocations
+  under `D_fn` (§6.2). The WASM cannot reach the network or filesystem — only the
+  mediated host imports.
+- **MVP host-import surface (NORMATIVE): KV CRUD + SQL — four imports.**
+  `storage_get`, `storage_put`, `storage_del`, and `sql_query`, all under module
+  `"tinycloud"`. Each is mediated under the corresponding `D_fn` ability —
+  `storage_get`→`kv/get`, `storage_put`→`kv/put`, `storage_del`→`kv/del`,
+  `sql_query`→`sql/read` or `sql/write` per the existing SQL ability tiers — so a
+  routine can only perform an operation its `D_fn` grants; each call is **journaled
+  in the manifest** (§9.1.1) and **echoes `D_fn`'s binding caveat** (§6.2/F1).
+  `sql_query` takes a JSON request and returns JSON rows, aligned with the
+  existing `SqlRequest`/`SqlResponse` shapes. **SQL statement-level authorization
+  still applies**: `sql_query` runs through the existing `create_authorizer` path
+  so per-statement/table restrictions are enforced exactly as on the normal SQL
+  route — the compute host import does not bypass it. (Deferred beyond MVP:
+  streaming/larger host surface, `list`; see §12.2/P4.)
 - **`verify` is trivial** — the result is trusted because it executed inside
   this node's own process. There is nothing to check beyond "the node ran it."
 - **Attestable context.** Nodes already run inside dstack TEEs with a live
