@@ -11,6 +11,7 @@ sqlite = ["sea-orm/sqlx-sqlite"]
 postgres = ["sea-orm/sqlx-postgres"]
 mysql = ["sea-orm/sqlx-mysql"]
 duckdb = ["dep:arrow", "dep:duckdb"]
+compute = []
 
 tokio = ["sea-orm/runtime-tokio-rustls"]
 async-std = ["sea-orm/runtime-async-std-rustls"]

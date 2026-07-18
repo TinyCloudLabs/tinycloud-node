@@ -1,3 +1,5 @@
+#[cfg(feature = "compute")]
+pub mod compute;
 pub mod database_artifacts;
 pub mod db;
 #[cfg(feature = "duckdb")]

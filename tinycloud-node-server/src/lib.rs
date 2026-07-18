@@ -71,6 +71,8 @@ use storage::{
     s3::{S3BlockConfig, S3BlockStore},
 };
 use tee::TeeContext;
+#[cfg(feature = "compute")]
+use tinycloud_core::compute::ComputeService;
 #[cfg(feature = "duckdb")]
 use tinycloud_core::duckdb::DuckDbService;
 use tinycloud_core::{
@@ -314,6 +316,12 @@ pub async fn app(
         database_artifact_repository,
     );
 
+    // P0 walking skeleton: a stateless stub. The artifact repository,
+    // backend registry, and routine-key derivation handle are P1/P2
+    // additions (compute-service.md §11.1).
+    #[cfg(feature = "compute")]
+    let compute_service = ComputeService::new();
+
     let quota_cache = QuotaCache::new(
         tinycloud_config.storage.limit,
         std::env::var("TINYCLOUD_QUOTA_URL").ok(),
@@ -338,6 +346,8 @@ pub async fn app(
         .manage(sql_service);
     #[cfg(feature = "duckdb")]
     let rocket = rocket.manage(duckdb_service);
+    #[cfg(feature = "compute")]
+    let rocket = rocket.manage(compute_service);
     let rocket = rocket
         .manage(quota_cache)
         .manage(invocation_replay_cache)
