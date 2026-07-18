@@ -98,7 +98,9 @@ impl<'de> Deserialize<'de> for SqlValue {
             }
 
             fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<SqlValue, E> {
-                Ok(SqlValue::Integer(v as i64))
+                i64::try_from(v)
+                    .map(SqlValue::Integer)
+                    .map_err(|_| E::custom("SQLite integers must fit in signed 64 bits"))
             }
 
             fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<SqlValue, E> {
@@ -183,6 +185,16 @@ mod request_tests {
             }
             _ => panic!("expected query request"),
         }
+    }
+
+    #[test]
+    fn request_rejects_unsigned_integer_overflow() {
+        let error = serde_json::from_str::<SqlRequest>(
+            r#"{"action":"query","sql":"SELECT ?","params":[18446744073709551615]}"#,
+        )
+        .expect_err("u64 values above SQLite's signed integer range must fail");
+
+        assert!(error.to_string().contains("signed 64 bits"));
     }
 }
 
