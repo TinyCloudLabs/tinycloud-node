@@ -53,9 +53,15 @@ toml = "0.8"
 thiserror = "2.0"
 time.workspace = true
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread", "signal", "net", "sync"] }
+tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread", "signal", "net", "sync", "time", "io-util"] }
 tokio-stream = { version = "0.1", features = ["fs"] }
 tokio-util = { version = "0.7", features = ["compat"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2"
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+if-addrs = "0.13"
+libp2p-identity = { version = "0.2", features = ["ed25519"] }
 tracing = "0.1"
 tracing-log = "0.2"
 tracing-opentelemetry = "0.30"
@@ -83,6 +89,10 @@ path = "../tinycloud-auth/"
 [dev-dependencies]
 bs58 = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+hyper = { version = "0.14", features = ["http1", "server", "tcp"] }
+pem = "3"
+x509-parser = "0.16"
 
 [features]
 default = []

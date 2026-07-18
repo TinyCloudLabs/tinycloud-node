@@ -11,9 +11,10 @@ use std::{
     net::Ipv4Addr,
     path::{Path, PathBuf},
 };
+use tokio::sync::watch;
 
 use crate::{
-    app, config,
+    app, config, link,
     node_control::{
         control::{self, ControlPlaneServer},
         paths::Profile,
@@ -99,11 +100,14 @@ pub async fn launch_with_figment(
         }
     };
 
+    let public_api_port = rocket.config().port;
     launch_rocket(
         rocket,
         tinycloud_config.telemetry.enabled,
         tinycloud_config.prometheus.port,
         control,
+        tinycloud_config.storage.datadir.clone(),
+        public_api_port,
     )
     .await
 }
@@ -113,13 +117,20 @@ async fn launch_rocket(
     telemetry_enabled: bool,
     prometheus_port: u16,
     control: ControlPlaneServer,
+    data_root: PathBuf,
+    public_api_port: u16,
 ) -> Result<()> {
     let shutdown = rocket.shutdown();
     let control_for_signal = control.handle();
+    let (link_shutdown_tx, link_shutdown_rx) = watch::channel(false);
 
     tokio::spawn(async move {
         wait_for_shutdown_signal(control_for_signal, shutdown).await;
     });
+
+    // Spawn the LAN TLS terminator + auto-renew task if link is enabled.
+    // Not enabled -> no listener bound, exactly as spec'd.
+    let link_task = spawn_link_task(&data_root, public_api_port, link_shutdown_rx);
 
     let launch_result = if telemetry_enabled {
         let prom_addr = (rocket.config().address, prometheus_port).into();
@@ -139,10 +150,145 @@ async fn launch_rocket(
             .map(|_| ())
     };
 
+    // Signal the link listener/renew task and let it drain.
+    let _ = link_shutdown_tx.send(true);
+    if let Some(handle) = link_task {
+        let _ = handle.await;
+    }
+
     control.shutdown().await?;
     launch_result?;
 
     Ok(())
+}
+
+fn spawn_link_task(
+    data_root: &Path,
+    public_api_port: u16,
+    shutdown: watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let material = match link::commands::load_tls_material(data_root) {
+        Ok(Some(material)) => material,
+        Ok(None) => {
+            tracing::info!("link is disabled: no state.json — LAN listener not started");
+            return None;
+        }
+        Err(err) => {
+            tracing::warn!(%err, "failed to load link state; LAN listener not started");
+            return None;
+        }
+    };
+    let (state, key_pem, cert_pem) = material;
+    let bind = link::commands::effective_bind_address(&state);
+    let bind_addr: std::net::SocketAddr = match bind.parse() {
+        Ok(addr) => addr,
+        Err(err) => {
+            tracing::warn!(%err, %bind, "invalid link bind address; LAN listener not started");
+            return None;
+        }
+    };
+    let upstream_addr: std::net::SocketAddr = match format!("127.0.0.1:{public_api_port}").parse() {
+        Ok(addr) => addr,
+        Err(err) => {
+            tracing::warn!(%err, "invalid loopback API address; LAN listener not started");
+            return None;
+        }
+    };
+    let server_config = match link::proxy::build_rustls_config(&key_pem, &cert_pem) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            tracing::warn!(%err, "failed to build TLS config; LAN listener not started");
+            return None;
+        }
+    };
+    let listener_shutdown = shutdown.clone();
+    let listener_task = tokio::spawn(async move {
+        if let Err(err) =
+            link::proxy::run(bind_addr, upstream_addr, server_config, listener_shutdown).await
+        {
+            tracing::error!(%err, "link LAN listener exited with error");
+        }
+    });
+
+    // Auto-renew loop: daily wake-up, renew when <30d from expiry OR if the
+    // LAN IP set changed. Runs in the background alongside the listener.
+    let renew_data_root = data_root.to_path_buf();
+    let renew_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        run_link_renew_loop(renew_data_root, renew_shutdown).await;
+    });
+
+    Some(listener_task)
+}
+
+async fn run_link_renew_loop(data_root: PathBuf, mut shutdown: watch::Receiver<bool>) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
+    // First tick fires immediately — skip that so we don't renew on boot.
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { break; }
+            }
+            _ = ticker.tick() => {
+                let should_renew = should_renew_now(&data_root);
+                if should_renew {
+                    // Off the async runtime because commands::renew uses blocking reqwest.
+                    let cloned = data_root.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let paths = match crate::node_control::paths::Profile::discovery_order_for_host()
+                            .into_iter()
+                            .map(|p| p.paths())
+                            .find(|p| p.data_root == cloned)
+                        {
+                            Some(paths) => paths,
+                            None => crate::node_control::paths::Profile::default_for_host().paths(),
+                        };
+                        let config = match crate::runtime::serve_config_figment(&paths.config_path)
+                            .and_then(|f| f.extract::<crate::config::Config>().map_err(Into::into))
+                        {
+                            Ok(cfg) => cfg,
+                            Err(err) => {
+                                tracing::warn!(%err, "failed to load config for auto-renew");
+                                return;
+                            }
+                        };
+                        if let Err(err) = crate::link::commands::renew(&cloned, Some(&config.keys)) {
+                            tracing::warn!(%err, "link auto-renew failed");
+                        } else {
+                            tracing::info!("link auto-renew succeeded");
+                        }
+                    }).await;
+                }
+            }
+        }
+    }
+}
+
+fn should_renew_now(data_root: &Path) -> bool {
+    // Load state — if it's gone, do nothing.
+    let Ok(Some(state)) = link::commands::load_state(data_root) else {
+        return false;
+    };
+    // Renew if IP set changed since last claim.
+    let current_ips = match link::ip::discover_lan_ips() {
+        Ok(ips) => link::ip::format_lan_ips(&ips),
+        Err(_) => return false,
+    };
+    if current_ips != state.last_lan_ips {
+        return true;
+    }
+    // Renew if within 30 days of cert notAfter.
+    let Some(not_after) = state.cert_not_after.as_deref() else {
+        return true;
+    };
+    match time::OffsetDateTime::parse(not_after, &time::format_description::well_known::Rfc3339) {
+        Ok(expiry) => {
+            let now = time::OffsetDateTime::now_utc();
+            (expiry - now) < time::Duration::days(link::RENEW_WINDOW_DAYS)
+        }
+        Err(_) => true,
+    }
 }
 
 async fn wait_for_shutdown_signal(

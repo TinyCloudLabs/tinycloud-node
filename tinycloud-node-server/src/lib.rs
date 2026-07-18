@@ -18,6 +18,7 @@ pub mod config;
 pub mod dstack;
 pub mod hooks;
 pub mod invocation_replay;
+pub mod link;
 pub mod node_control;
 pub mod prometheus;
 pub mod quota;

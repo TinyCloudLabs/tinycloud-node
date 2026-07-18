@@ -961,6 +961,90 @@ Contract:
 - It MUST never expose the private key.
 - In `--json` mode, it emits the exact `/v1/identity` response body.
 
+### 3.9 `tinycloud node link` (v1-link)
+
+`link` subcommands integrate the node with the tinycloud.link name+cert
+service so LAN clients can reach the node over browser-trusted HTTPS at
+`https://<name>.local.tinycloud.link[:<port>]`. Adding the link module does
+not change the localhost-only public API listener — the LAN TLS listener is
+only bound when link is explicitly enabled.
+
+Commands:
+
+- `tinycloud node link enable <name> [--service-url <url>] [--bind <addr:port>]`
+- `tinycloud node link disable`
+- `tinycloud node link status [--json]`
+- `tinycloud node link renew`
+
+`enable` behavior (v1-link):
+
+- Links the KeyProvider library in-process (same trust boundary as `node key
+  backup` — see §3.7) to derive the node's `did:key` and Ed25519 signing
+  keypair. Private key material is used only long enough to sign the service
+  payloads and never transits the control API.
+- Enumerates the host's private-range LAN IPs (RFC1918 IPv4, ULA `fc00::/7`,
+  and link-local `fe80::/10`; public and loopback addresses are excluded)
+  and caps the set at 8 addresses.
+- `PUT /v1/names/:name` on the link service with a signed claim payload and
+  a monotonically increasing `sequence` persisted at
+  `dataPath/link/state.json`.
+- Generates a fresh ECDSA P-256 keypair + PKCS#10 CSR whose CN and single
+  dNSName SAN are both exactly `<name>.local.tinycloud.link`. Sends the CSR
+  via `POST /v1/certs/:name`. Stores the private key and returned cert chain
+  under `dataPath/link/tls/{key,cert}.pem` with mode `0600`.
+- Writes `dataPath/link/state.json` (mode `0600`) with `{name, serviceUrl,
+  sequence, lastLanIps, certNotAfter, bind}`. The LAN listener activates on
+  next `serve` (re)start; hot-reload is out of scope for v1.
+
+`disable` behavior (v1-link):
+
+- Signs `DELETE /v1/names/:name` with the next sequence and removes the
+  `dataPath/link/` directory. If the service returns 404 the local state is
+  still cleaned up.
+
+`renew` behavior (v1-link):
+
+- If the current LAN IP set differs from `lastLanIps` in `state.json`,
+  re-claims the name (`PUT`) so DNS points at the current addresses.
+- Requests a fresh cert (`POST`), stores the new key + cert chain, and
+  refreshes `certNotAfter`.
+
+Auto-renew (v1-link):
+
+- `serve` starts a background task alongside the Rocket app that wakes daily,
+  re-claims when the LAN IP set changes, and issues a fresh cert when the
+  stored `certNotAfter` is less than 30 days away.
+
+Sequence and error handling (v1-link):
+
+- `sequence` is persisted after every successful signed action. All actions
+  submit `sequence + 1` next. The service rejects stale sequences with 409.
+- A 409 name-taken from `PUT` surfaces the conflicting name in the error
+  message and does not modify local state.
+- A 429 rate-limited response surfaces the `Retry-After` header value to the
+  caller and to the logs.
+
+`link status --json` and `service status --json` return the following extra
+fields (v1-link, all optional):
+
+```json
+{
+  "linkName": "mynode",
+  "localUrl": "https://mynode.local.tinycloud.link:8443",
+  "certNotAfter": "2027-06-01T00:00:00Z",
+  "linkListener": "running"
+}
+```
+
+`localUrl` omits the port when it is 443. `linkListener` is one of `disabled`
+(link is not enabled), `stopped` (state.json exists but `serve` is not
+running the listener yet), or `running` (LAN TLS terminator is bound and
+accepting connections).
+
+`--service-url` defaults to `https://api.tinycloud.link` and is intended for
+staging, self-hosted, or air-gapped deployments. `--bind` defaults to
+`0.0.0.0:8443`.
+
 ## 4. Platform Paths
 
 The node has a config root, a data root, and a logs root. The runtime files live

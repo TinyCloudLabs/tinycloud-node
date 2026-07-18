@@ -8,7 +8,11 @@ use std::{
     path::PathBuf,
 };
 
-use crate::{node_control::paths::Profile, node_control::service, runtime};
+use crate::{
+    link::commands::{EnableArgs, LinkStatusReport},
+    node_control::{paths::Profile, service},
+    runtime,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "tinycloud", version, disable_help_subcommand = true)]
@@ -45,6 +49,9 @@ enum NodeCommand {
     Logs(LogsArgs),
     Doctor(JsonArgs),
     Key(KeyArgs),
+    /// LAN HTTPS via tinycloud.link (claim a `<name>.local.tinycloud.link`
+    /// name and manage the LAN TLS listener).
+    Link(LinkArgs),
 }
 
 #[derive(Debug, Args)]
@@ -73,6 +80,41 @@ struct KeyArgs {
 enum KeyCommand {
     Backup(BackupArgs),
     Export(JsonArgs),
+}
+
+#[derive(Debug, Args)]
+struct LinkArgs {
+    #[command(subcommand)]
+    command: LinkCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum LinkCommand {
+    /// Claim `<name>.local.tinycloud.link` and provision a real TLS cert.
+    Enable(LinkEnableArgs),
+    /// Delete the claim and remove local link state.
+    Disable(JsonArgs),
+    /// Show the current link state.
+    Status(JsonArgs),
+    /// Renew the cert (and re-claim on IP change).
+    Renew(JsonArgs),
+}
+
+#[derive(Debug, Args, Default)]
+struct LinkEnableArgs {
+    /// The name label to claim under `local.tinycloud.link`.
+    name: String,
+
+    /// Override the link service base URL (default: https://api.tinycloud.link).
+    #[arg(long = "service-url")]
+    service_url: Option<String>,
+
+    /// Bind address for the LAN TLS listener (default: 0.0.0.0:8443).
+    #[arg(long)]
+    bind: Option<String>,
+
+    #[command(flatten)]
+    json: JsonArgs,
 }
 
 #[derive(Debug, Args, Default)]
@@ -151,7 +193,40 @@ fn run_node(args: NodeArgs) -> Result<()> {
         }
         NodeCommand::Doctor(args) => emit_json(&service::node_doctor()?, args.json),
         NodeCommand::Key(args) => run_key(args.command),
+        NodeCommand::Link(args) => run_link(args.command),
     }
+}
+
+/// Route link subcommands. All actions link the KeyProvider library in-process
+/// (the same documented trust boundary as `node key backup`) so canonical
+/// service payloads can be signed with the node's Ed25519 identity.
+fn run_link(command: LinkCommand) -> Result<()> {
+    match command {
+        LinkCommand::Enable(args) => {
+            let report = service::node_link_enable(EnableArgs {
+                name: args.name,
+                service_url: args.service_url,
+                bind: args.bind,
+            })?;
+            emit_link_status(&report, args.json.json)
+        }
+        LinkCommand::Disable(args) => {
+            let report = service::node_link_disable()?;
+            emit_link_status(&report, args.json)
+        }
+        LinkCommand::Status(args) => {
+            let report = service::node_link_status()?;
+            emit_link_status(&report, args.json)
+        }
+        LinkCommand::Renew(args) => {
+            let report = service::node_link_renew()?;
+            emit_link_status(&report, args.json)
+        }
+    }
+}
+
+fn emit_link_status(report: &LinkStatusReport, json: bool) -> Result<()> {
+    emit_json(report, json)
 }
 
 fn run_key(command: KeyCommand) -> Result<()> {
