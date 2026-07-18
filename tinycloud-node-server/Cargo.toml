@@ -88,6 +88,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 default = []
 dstack = []
 duckdb = ["tinycloud-core/duckdb"]
+compute = ["tinycloud-core/compute"]
 
 # cargo-binstall support: allows `cargo binstall tinycloud-node`
 [package.metadata.binstall]

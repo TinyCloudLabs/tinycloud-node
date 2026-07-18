@@ -28,6 +28,10 @@ use crate::{
     tracing::TracingSpan,
     BlockStage, BlockStores, TinyCloud,
 };
+#[cfg(feature = "compute")]
+use tinycloud_core::compute::{
+    required_ability as compute_required_ability, ComputeRequest, ComputeService,
+};
 #[cfg(feature = "duckdb")]
 use tinycloud_core::duckdb::{
     DuckDbCaveats, DuckDbError, DuckDbRequest, DuckDbResponse, DuckDbService,
@@ -106,6 +110,8 @@ fn build_info(
     let mut features = vec!["kv", "delegation", "sharing", "sql"];
     #[cfg(feature = "duckdb")]
     features.push("duckdb");
+    #[cfg(feature = "compute")]
+    features.push("compute");
     features.extend(["hooks", "signed-urls", "encryption"]);
     #[cfg(feature = "dstack")]
     features.push("tee");
@@ -488,8 +494,51 @@ pub struct RevokeResponse {
     pub cid: String,
 }
 
+// Four route variants, one per (duckdb, compute) feature combination. Rocket's
+// `#[post]` codegen needs to see a concrete `State<T>` guard (or its absence)
+// at the attribute-macro level, so a `DuckDbInvokeState<'_>`/`ComputeInvokeState<'_>`
+// alias that resolves to `()` cannot be used directly as a route parameter —
+// each combination gets its own `invoke` function, mirroring the pre-existing
+// duckdb on/off split.
+
 #[post("/invoke", data = "<data>")]
-#[cfg(feature = "duckdb")]
+#[cfg(all(feature = "duckdb", feature = "compute"))]
+#[allow(clippy::too_many_arguments)]
+pub async fn invoke(
+    i: AuthHeaderGetter<InvocationInfo>,
+    req_span: TracingSpan,
+    headers: ObjectHeaders,
+    data: DataIn<'_>,
+    staging: &State<BlockStage>,
+    tinycloud: &State<TinyCloud>,
+    config: &State<Config>,
+    quota_cache: &State<QuotaCache>,
+    invocation_replay_cache: &State<InvocationReplayCache>,
+    sql_service: &State<SqlService>,
+    duckdb_service: &State<DuckDbService>,
+    compute_service: &State<ComputeService>,
+    hook_runtime: &State<HookRuntime>,
+) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
+    invoke_impl(
+        i,
+        req_span,
+        headers,
+        data,
+        staging,
+        tinycloud,
+        config,
+        quota_cache,
+        invocation_replay_cache,
+        sql_service,
+        duckdb_service,
+        compute_service,
+        hook_runtime,
+    )
+    .await
+}
+
+#[post("/invoke", data = "<data>")]
+#[cfg(all(feature = "duckdb", not(feature = "compute")))]
 #[allow(clippy::too_many_arguments)]
 pub async fn invoke(
     i: AuthHeaderGetter<InvocationInfo>,
@@ -517,13 +566,49 @@ pub async fn invoke(
         invocation_replay_cache,
         sql_service,
         duckdb_service,
+        (),
         hook_runtime,
     )
     .await
 }
 
 #[post("/invoke", data = "<data>")]
-#[cfg(not(feature = "duckdb"))]
+#[cfg(all(not(feature = "duckdb"), feature = "compute"))]
+#[allow(clippy::too_many_arguments)]
+pub async fn invoke(
+    i: AuthHeaderGetter<InvocationInfo>,
+    req_span: TracingSpan,
+    headers: ObjectHeaders,
+    data: DataIn<'_>,
+    staging: &State<BlockStage>,
+    tinycloud: &State<TinyCloud>,
+    config: &State<Config>,
+    quota_cache: &State<QuotaCache>,
+    invocation_replay_cache: &State<InvocationReplayCache>,
+    sql_service: &State<SqlService>,
+    compute_service: &State<ComputeService>,
+    hook_runtime: &State<HookRuntime>,
+) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
+    invoke_impl(
+        i,
+        req_span,
+        headers,
+        data,
+        staging,
+        tinycloud,
+        config,
+        quota_cache,
+        invocation_replay_cache,
+        sql_service,
+        (),
+        compute_service,
+        hook_runtime,
+    )
+    .await
+}
+
+#[post("/invoke", data = "<data>")]
+#[cfg(not(any(feature = "duckdb", feature = "compute")))]
 #[allow(clippy::too_many_arguments)]
 pub async fn invoke(
     i: AuthHeaderGetter<InvocationInfo>,
@@ -550,6 +635,7 @@ pub async fn invoke(
         invocation_replay_cache,
         sql_service,
         (),
+        (),
         hook_runtime,
     )
     .await
@@ -559,6 +645,11 @@ pub async fn invoke(
 type DuckDbInvokeState<'a> = &'a State<DuckDbService>;
 #[cfg(not(feature = "duckdb"))]
 type DuckDbInvokeState<'a> = ();
+
+#[cfg(feature = "compute")]
+type ComputeInvokeState<'a> = &'a State<ComputeService>;
+#[cfg(not(feature = "compute"))]
+type ComputeInvokeState<'a> = ();
 
 type KvInputMap = HashMap<
     (SpaceId, Path),
@@ -867,6 +958,8 @@ async fn invoke_impl(
     #[cfg_attr(not(feature = "duckdb"), allow(unused_variables))] duckdb_service: DuckDbInvokeState<
         '_,
     >,
+    #[cfg_attr(not(feature = "compute"), allow(unused_variables))]
+    compute_service: ComputeInvokeState<'_>,
     hook_runtime: &State<HookRuntime>,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
     let action_label = "invocation";
@@ -980,6 +1073,57 @@ async fn invoke_impl(
             return Err((
                 Status::NotImplemented,
                 "DuckDB support is not enabled on this node".to_string(),
+            ));
+        }
+
+        #[cfg(feature = "compute")]
+        {
+            // Check for compute capabilities.
+            let compute_caps: Vec<_> =
+                i.0 .0
+                    .capabilities
+                    .iter()
+                    .filter_map(|c| match (&c.resource, c.ability.as_ref().as_ref()) {
+                        (Resource::TinyCloud(r), ability)
+                            if r.service().as_str() == "compute"
+                                && ability.starts_with("tinycloud.compute/") =>
+                        {
+                            Some((
+                                r.space().clone(),
+                                r.path().map(|p| p.to_string()),
+                                ability.to_string(),
+                            ))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+
+            if !compute_caps.is_empty() {
+                let result =
+                    handle_compute_invoke(i, data, tinycloud, compute_service, &compute_caps)
+                        .await;
+                if let Some(timer) = timer {
+                    timer.observe_duration();
+                }
+                return result;
+            }
+        }
+
+        #[cfg(not(feature = "compute"))]
+        if i.0 .0.capabilities.iter().any(|c| {
+            matches!(
+                (&c.resource, c.ability.as_ref().as_ref()),
+                (Resource::TinyCloud(r), ability)
+                    if r.service().as_str() == "compute"
+                        && ability.starts_with("tinycloud.compute/")
+            )
+        }) {
+            if let Some(timer) = timer {
+                timer.observe_duration();
+            }
+            return Err((
+                Status::NotImplemented,
+                "Compute support is not enabled on this node".to_string(),
             ));
         }
 
@@ -2042,6 +2186,62 @@ async fn handle_duckdb_invoke(
             Ok(DataOut::One(InvOut(InvocationOutcome::DuckDbResult(json))))
         }
     }
+}
+
+/// P0 walking skeleton (`specs/compute-service-implementation-plan.md`).
+///
+/// Mirrors `handle_sql_invoke`/`handle_duckdb_invoke`'s ordering: the
+/// delegation chain is verified first (`verify_auth`, consuming `i`), then
+/// the body is read and decoded. Unlike sql/duckdb, no compute variant has a
+/// live handler yet — `RoutineDid`/`Deploy` land in P1, `Execute` in P2,
+/// `List` stays reserved indefinitely (§3.1/C9, no server-side listing
+/// handler exists). What IS real at P0 is the request-variant → ability
+/// mapping (`specs/compute-service.md` §7.1 erratum, Codex C1): the dispatch
+/// above only proves the presented `tinycloud.compute/*` capability follows
+/// its delegation chain, not that it authorizes the specific request body.
+/// This function closes that gap by mapping the parsed body to its required
+/// ability via `compute_required_ability` and checking it against the held
+/// capabilities with `ability_matches` (so an active `compute/*` wildcard
+/// would cover every variant, mirroring `sql/*`/`duckdb/*`).
+#[cfg(feature = "compute")]
+async fn handle_compute_invoke(
+    i: AuthHeaderGetter<InvocationInfo>,
+    data: DataIn<'_>,
+    tinycloud: &State<TinyCloud>,
+    _compute_service: &State<ComputeService>,
+    compute_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
+) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
+    verify_auth("server.compute.auth", i.0, tinycloud).await?;
+
+    let body_str = read_json_body(data).await?;
+    let request: ComputeRequest =
+        serde_json::from_str(&body_str).map_err(|e| (Status::BadRequest, e.to_string()))?;
+
+    let required = compute_required_ability(&request);
+    let holds_required = compute_caps.iter().any(|(_, _, ability)| {
+        tinycloud_core::policy_capability::ability_matches(ability, required)
+    });
+    if !holds_required {
+        return Err((
+            Status::Forbidden,
+            format!(
+                "Unauthorized Action: tinycloud.compute/{} request requires {required}",
+                request.action_name()
+            ),
+        ));
+    }
+
+    // The mapping and its rejection are real; no compute variant is wired to
+    // a live handler yet (P1 wires deploy, P2 wires execute; list stays
+    // reserved). This is the walking-skeleton boundary — see the module doc
+    // comment above and specs/compute-service-implementation-plan.md (P0).
+    Err((
+        Status::NotImplemented,
+        format!(
+            "tinycloud.compute action '{}' is not implemented yet (P0 skeleton)",
+            request.action_name()
+        ),
+    ))
 }
 
 #[cfg(feature = "duckdb")]
@@ -3338,6 +3538,8 @@ mod tests {
             .manage(InvocationReplayCache::new())
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
+        #[cfg(feature = "compute")]
+        let rocket = rocket.manage(ComputeService::new());
 
         let client = Client::tracked(rocket).await?;
         let response = client
@@ -3593,6 +3795,8 @@ mod tests {
             .manage(InvocationReplayCache::new())
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
+        #[cfg(feature = "compute")]
+        let rocket = rocket.manage(ComputeService::new());
 
         let client = Client::tracked(rocket).await?;
         let response = client
@@ -4984,7 +5188,7 @@ mod tests {
         setup: MeteredSqlHttp,
         limit: rocket::data::ByteUnit,
     ) -> rocket::Rocket<rocket::Build> {
-        rocket::build()
+        let rocket = rocket::build()
             .mount("/", routes![invoke])
             .attach(crate::tracing::TracingFairing {
                 header_name: Config::default().log.tracing.traceheader,
@@ -4995,7 +5199,10 @@ mod tests {
             .manage(QuotaCache::new(Some(limit), None))
             .manage(InvocationReplayCache::new())
             .manage(HookRuntime::new(HooksConfig::default(), [9u8; 32]))
-            .manage(BlockStage::from(crate::config::StagingStorage::Memory))
+            .manage(BlockStage::from(crate::config::StagingStorage::Memory));
+        #[cfg(feature = "compute")]
+        let rocket = rocket.manage(ComputeService::new());
+        rocket
     }
 
     #[tokio::test]
