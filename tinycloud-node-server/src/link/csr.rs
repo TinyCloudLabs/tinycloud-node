@@ -3,11 +3,24 @@
 //! The service enforces (`assertCsrMatchesDomain` in `names.ts`) that the CN
 //! and the entire SAN set is exactly the expected domain as a single dNSName
 //! entry. We emit exactly that shape here so the service never rejects the CSR.
-use rcgen::{
-    CertificateParams, DistinguishedName, DnType, KeyPair, SanType, PKCS_ECDSA_P256_SHA256,
-};
+//!
+//! The key pair is RSA-2048, not ECDSA. The service parses submitted CSRs with
+//! `node-forge` (`forge.pki.certificationRequestFromPem` in `names.ts`), whose
+//! CSR/X.509 support only understands RSA `SubjectPublicKeyInfo`s — an
+//! EC (`id-ecPublicKey`) CSR is rejected with "Cannot read public key. OID is
+//! not RSA." before `assertCsrMatchesDomain` ever runs. `rcgen`'s `ring`
+//! backend cannot itself generate RSA keys, so we generate the key with the
+//! `rsa` crate and hand the PKCS#8 DER to `rcgen::KeyPair::from_der_and_sign_algo`.
+use rand::rngs::OsRng;
+use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType, PKCS_RSA_SHA256};
+use rsa::{pkcs8::EncodePrivateKey, RsaPrivateKey};
+use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
 use super::LinkError;
+
+/// RSA key size for the CSR keypair. 2048 bits is the minimum size accepted
+/// by common CAs and matches what the TS service's own test CSRs use.
+const RSA_KEY_BITS: usize = 2048;
 
 /// TLS keypair + CSR bundle for a link-managed name.
 pub struct CsrBundle {
@@ -22,13 +35,20 @@ pub fn fqdn_for_name(name: &str) -> String {
     format!("{name}.{}", super::DOMAIN_SUFFIX)
 }
 
-/// Generate a fresh ECDSA P-256 keypair + a PKCS#10 CSR whose CN and single
+/// Generate a fresh RSA-2048 keypair + a PKCS#10 CSR whose CN and single
 /// SAN dNSName entry are both `<name>.local.tinycloud.link`. This matches
 /// `assertCsrMatchesDomain(csrPem, expectedDomain)` in the link service.
 pub fn generate_csr(name: &str) -> Result<CsrBundle, LinkError> {
     let domain = fqdn_for_name(name);
 
-    let keypair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+    let rsa_key = RsaPrivateKey::new(&mut OsRng, RSA_KEY_BITS)
+        .map_err(|err| LinkError::Csr(err.to_string()))?;
+    let pkcs8_der = rsa_key
+        .to_pkcs8_der()
+        .map_err(|err| LinkError::Csr(err.to_string()))?;
+    let private_key_der =
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8_der.as_bytes().to_vec()));
+    let keypair = KeyPair::from_der_and_sign_algo(&private_key_der, &PKCS_RSA_SHA256)
         .map_err(|err| LinkError::Csr(err.to_string()))?;
 
     let mut params = CertificateParams::new(vec![domain.clone()])
@@ -122,5 +142,29 @@ mod tests {
             san_dns_entries,
             vec!["mynode.local.tinycloud.link".to_string()]
         );
+    }
+
+    // Regression guard: the link service parses CSRs with node-forge, which
+    // only understands RSA `SubjectPublicKeyInfo`s (`forge.pki.certificationRequestFromAsn1`
+    // throws "Cannot read public key. OID is not RSA." for EC keys). If this
+    // ever drifts back to an EC keypair, every `link enable`/`renew` cert
+    // request will be rejected with a 400 from the live service.
+    #[test]
+    fn generated_csr_public_key_is_rsa() {
+        use x509_parser::prelude::FromDer;
+        const RSA_ENCRYPTION_OID: &str = "1.2.840.113549.1.1.1";
+
+        let bundle = generate_csr("mynode").expect("CSR generated");
+        let der = pem::parse(&bundle.csr_pem).expect("PEM decode");
+        let (_, csr) =
+            x509_parser::certification_request::X509CertificationRequest::from_der(der.contents())
+                .expect("parse CSR");
+        let algorithm_oid = csr
+            .certification_request_info
+            .subject_pki
+            .algorithm
+            .algorithm
+            .to_id_string();
+        assert_eq!(algorithm_oid, RSA_ENCRYPTION_OID);
     }
 }

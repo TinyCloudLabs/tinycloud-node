@@ -1,12 +1,19 @@
 //! Private-range LAN IP discovery.
 //!
-//! Filtering mirrors `tinycloud-link/src/ip.ts::isPrivateAddress`:
+//! Filtering is based on `tinycloud-link/src/ip.ts::isPrivateAddress` but is
+//! not a byte-for-byte port:
 //!   - IPv4 RFC1918 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
 //!     plus link-local 169.254.0.0/16.
 //!   - IPv6 unique-local `fc00::/7` and link-local `fe80::/10`.
-//!   - Loopback and public addresses are excluded so a public IP can never be
-//!     handed to the service (which rejects public IPs anyway, but we don't
-//!     want to leak one).
+//!   - Unlike the TS implementation, loopback is always excluded here (TS
+//!     classifies 127.0.0.0/8 and `::1` as private). This is safe because
+//!     `discover_lan_ips` already filters loopback interfaces separately
+//!     before this function ever sees a loopback address.
+//!   - Unlike the TS implementation, IPv4-mapped (`::ffff:a.b.c.d`), NAT64
+//!     (`64:ff9b::/96`), and 6to4 (`2002::/16`) IPv6 addresses are not
+//!     unwrapped and classified by their embedded IPv4 — they fall through to
+//!     "not private". `if_addrs` does not surface these forms from OS
+//!     interface enumeration, so this gap is not currently reachable.
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::LinkError;

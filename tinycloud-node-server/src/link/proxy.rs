@@ -45,19 +45,32 @@ pub fn build_rustls_config(key_pem: &str, cert_chain_pem: &str) -> Result<Arc<Se
     Ok(Arc::new(config))
 }
 
+/// Synchronously bind the LAN TLS listener socket.
+///
+/// Binding is split out from [`run`] so callers can detect a failure to bind
+/// (bad address, port already in use, permission denied, ...) immediately and
+/// synchronously, rather than discovering it only after spawning an async
+/// task. This lets `serve` report the LAN listener's real health instead of
+/// inferring it from OS process state.
+pub fn bind(bind_addr: SocketAddr) -> std::io::Result<TcpListener> {
+    let std_listener = std::net::TcpListener::bind(bind_addr)?;
+    std_listener.set_nonblocking(true)?;
+    TcpListener::from_std(std_listener)
+}
+
 /// Run the LAN TLS listener until `shutdown` is triggered.
 ///
-/// `bind_addr` — the LAN bind address (e.g. `0.0.0.0:8443`).
+/// `listener` — an already-bound LAN listener (see [`bind`]).
 /// `upstream_addr` — the loopback public API socket, e.g. `127.0.0.1:8081`.
 pub async fn run(
-    bind_addr: SocketAddr,
+    listener: TcpListener,
     upstream_addr: SocketAddr,
     server_config: Arc<ServerConfig>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let listener = TcpListener::bind(bind_addr)
-        .await
-        .with_context(|| format!("failed to bind link listener at {bind_addr}"))?;
+    let bind_addr = listener
+        .local_addr()
+        .context("failed to read bind address")?;
     tracing::info!(%bind_addr, %upstream_addr, "link LAN TLS listener started");
 
     let acceptor = TlsAcceptor::from(server_config);

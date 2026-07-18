@@ -9662,6 +9662,7 @@ dependencies = [
  "reqwest 0.11.27",
  "rocket",
  "rpassword",
+ "rsa 0.9.10",
  "rustls 0.23.36",
  "rustls-pemfile 2.2.0",
  "scrypt",

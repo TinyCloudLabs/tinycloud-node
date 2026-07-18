@@ -988,9 +988,11 @@ Commands:
 - `PUT /v1/names/:name` on the link service with a signed claim payload and
   a monotonically increasing `sequence` persisted at
   `dataPath/link/state.json`.
-- Generates a fresh ECDSA P-256 keypair + PKCS#10 CSR whose CN and single
-  dNSName SAN are both exactly `<name>.local.tinycloud.link`. Sends the CSR
-  via `POST /v1/certs/:name`. Stores the private key and returned cert chain
+- Generates a fresh RSA-2048 keypair + PKCS#10 CSR whose CN and single
+  dNSName SAN are both exactly `<name>.local.tinycloud.link` (RSA, not ECDSA,
+  because the service parses submitted CSRs with `node-forge`, which only
+  understands RSA `SubjectPublicKeyInfo`s). Sends the CSR via
+  `POST /v1/certs/:name`. Stores the private key and returned cert chain
   under `dataPath/link/tls/{key,cert}.pem` with mode `0600`.
 - Writes `dataPath/link/state.json` (mode `0600`) with `{name, serviceUrl,
   sequence, lastLanIps, certNotAfter, bind}`. The LAN listener activates on

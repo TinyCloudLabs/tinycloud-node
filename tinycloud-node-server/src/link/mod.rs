@@ -61,7 +61,13 @@ pub enum LinkError {
     #[error("name `{name}` is already claimed by a different subject at the link service")]
     NameConflict { name: String, body: String },
 
-    #[error("link service rate-limited the request{retry_after:?}")]
+    #[error(
+        "link service rate-limited the request{}",
+        retry_after
+            .as_deref()
+            .map(|value| format!(" (retry after {value}s)"))
+            .unwrap_or_default()
+    )]
     RateLimited {
         retry_after: Option<String>,
         body: String,
@@ -78,5 +84,31 @@ pub fn local_url(name: &str, bind_port: u16) -> String {
         format!("https://{host}")
     } else {
         format!("https://{host}:{bind_port}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limited_display_includes_retry_after_cleanly() {
+        let err = LinkError::RateLimited {
+            retry_after: Some("120".to_string()),
+            body: "slow down".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "link service rate-limited the request (retry after 120s)"
+        );
+    }
+
+    #[test]
+    fn rate_limited_display_omits_suffix_when_retry_after_is_absent() {
+        let err = LinkError::RateLimited {
+            retry_after: None,
+            body: "slow down".to_string(),
+        };
+        assert_eq!(err.to_string(), "link service rate-limited the request");
     }
 }

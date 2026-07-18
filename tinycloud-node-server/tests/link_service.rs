@@ -16,7 +16,7 @@ use std::{
 use axum::{
     body::Bytes,
     extract::{Path, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::IntoResponse,
     routing::{post, put},
     Json, Router,
@@ -68,6 +68,7 @@ enum Behavior {
     #[default]
     Ok,
     ClaimConflict,
+    RateLimited,
 }
 
 async fn put_name(
@@ -81,6 +82,14 @@ async fn put_name(
         return (
             StatusCode::CONFLICT,
             Json(json!({"error": "name already claimed by a different subject"})),
+        )
+            .into_response();
+    }
+    if svc.behavior == Behavior::RateLimited {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, "120")],
+            Json(json!({"error": "rate limited"})),
         )
             .into_response();
     }
@@ -269,6 +278,43 @@ async fn enable_surfaces_409_name_conflict_with_named_error() {
 }
 
 #[tokio::test]
+async fn enable_surfaces_429_rate_limited_with_retry_after() {
+    let _ = install_env_secret();
+    let keys = Keys::Auto;
+    let data_root = tempdir().unwrap();
+    let (base_url, _service) = start_mock_service(Behavior::RateLimited).await;
+
+    let args = EnableArgs {
+        name: "throttlednode".to_string(),
+        service_url: Some(base_url),
+        bind: Some("127.0.0.1:0".to_string()),
+    };
+
+    let err = match run_enable(data_root.path().to_path_buf(), keys, args).await {
+        Ok(_) => panic!("enable should have failed with 429"),
+        Err(err) => err,
+    };
+    let rendered = format!("{err:#}");
+    if rendered.contains("no private-range LAN IPs were found on this host") {
+        eprintln!("skipping: host has no private LAN interface");
+        return;
+    }
+    assert!(
+        rendered.contains("rate-limited"),
+        "expected 429 rate-limited error, got: {rendered}"
+    );
+    assert!(
+        rendered.contains("retry after 120s"),
+        "expected the Retry-After value to be surfaced cleanly, got: {rendered}"
+    );
+    // Regression guard for the Debug-formatted `Some("120")` / `None` bug.
+    assert!(
+        !rendered.contains("Some(") && !rendered.contains("None"),
+        "rate-limit error must not leak Option Debug formatting, got: {rendered}"
+    );
+}
+
+#[tokio::test]
 async fn tls_proxy_round_trips_bytes_to_the_upstream_echo() {
     // Upstream: a simple echo server the proxy will forward bytes into.
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -301,12 +347,13 @@ async fn tls_proxy_round_trips_bytes_to_the_upstream_echo() {
     // Pick a bind address for the proxy.
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
-    drop(proxy_listener); // release; proxy.run rebinds
+    drop(proxy_listener); // release; proxy::bind rebinds
 
+    let bound = proxy::bind(proxy_addr).unwrap();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let proxy_task = tokio::spawn({
         let server_config = server_config.clone();
-        async move { proxy::run(proxy_addr, echo_addr, server_config, shutdown_rx).await }
+        async move { proxy::run(bound, echo_addr, server_config, shutdown_rx).await }
     });
 
     // Give the listener a moment to bind.

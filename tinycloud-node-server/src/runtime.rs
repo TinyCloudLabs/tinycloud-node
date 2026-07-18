@@ -201,10 +201,20 @@ fn spawn_link_task(
             return None;
         }
     };
+    // Bind synchronously so a failure (bad address, port in use, permission
+    // denied) is reported here rather than discovered later inside the
+    // spawned task.
+    let listener = match link::proxy::bind(bind_addr) {
+        Ok(listener) => listener,
+        Err(err) => {
+            tracing::warn!(%err, %bind_addr, "failed to bind link LAN listener; LAN listener not started");
+            return None;
+        }
+    };
     let listener_shutdown = shutdown.clone();
     let listener_task = tokio::spawn(async move {
         if let Err(err) =
-            link::proxy::run(bind_addr, upstream_addr, server_config, listener_shutdown).await
+            link::proxy::run(listener, upstream_addr, server_config, listener_shutdown).await
         {
             tracing::error!(%err, "link LAN listener exited with error");
         }
