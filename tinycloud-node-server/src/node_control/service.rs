@@ -1982,7 +1982,7 @@ esac
         let status = service_status_for_installed(installed);
 
         assert_eq!(status.state, ServiceState::Stopped);
-        assert_eq!(status.identity_ready, false);
+        assert!(!status.identity_ready);
         assert!(status.node_did.is_none());
         assert_eq!(status.key_backend, Some(profile.key_backend()));
         assert_eq!(status.control_api, None);
@@ -2110,7 +2110,7 @@ esac
         .unwrap();
         let _static_secret = EnvGuard::set(
             "TINYCLOUD_KEYS_SECRET",
-            &base64::encode_config([7u8; 32], base64::URL_SAFE_NO_PAD),
+            base64::encode_config([7u8; 32], base64::URL_SAFE_NO_PAD),
         );
 
         let report = node_doctor().unwrap();

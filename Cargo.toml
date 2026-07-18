@@ -79,4 +79,5 @@ install-updater = false
 # after this lands, cargo-dist's publish job pushes a real formula here and
 # replaces the placeholders.
 tap = "TinyCloudLabs/homebrew-tap"
+formula = "tinycloud-node"
 publish-jobs = ["homebrew"]

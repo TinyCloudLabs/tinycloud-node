@@ -1778,12 +1778,12 @@ mod tests {
             ];
             let profile = Profile::MacosUser;
             let paths = profile.paths();
-            return ProfileSetup {
+            ProfileSetup {
                 profile,
                 paths,
                 _temp: temp,
                 _guards: guards,
-            };
+            }
         }
 
         #[cfg(target_os = "linux")]
@@ -1808,12 +1808,12 @@ mod tests {
             ];
             let profile = Profile::LinuxUser;
             let paths = profile.paths();
-            return ProfileSetup {
+            ProfileSetup {
                 profile,
                 paths,
                 _temp: temp,
                 _guards: guards,
-            };
+            }
         }
     }
 
@@ -1918,6 +1918,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn control_files_are_written_and_cleaned_up() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
@@ -2010,6 +2011,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn control_auth_and_endpoints_match_the_contract() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
@@ -2320,6 +2322,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn control_config_patch_whitelist_and_cli_paths_work_live() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
@@ -2479,7 +2482,7 @@ mod tests {
             .unwrap();
         assert_eq!(service_status.contract_version, CONTROL_CONTRACT_VERSION);
         assert_eq!(service_status.state, ServiceState::Stopped);
-        assert_eq!(service_status.identity_ready, true);
+        assert!(service_status.identity_ready);
         assert!(service_status.node_did.is_some());
         assert_eq!(service_status.control_api, None);
         assert_eq!(service_status.version, Some(APP_VERSION.to_string()));

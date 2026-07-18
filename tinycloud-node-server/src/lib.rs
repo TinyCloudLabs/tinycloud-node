@@ -27,6 +27,7 @@ mod tracing;
 pub mod webhook_dispatcher;
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 pub(crate) mod test_support {
     use std::sync::{Mutex, OnceLock};
 
