@@ -419,3 +419,62 @@ phase; no hand-edits to `generated.rs`.
 No spec change in this commit — plan only. site-builder: nothing to re-render
 (the plan is not part of the presentation site unless Sam asks); flag if you want
 a phase-roadmap panel and I'll hand you the P0–P4 gate list.
+
+## drafter — codex review applied
+
+Codex reviewed the implementation plan against the codebase (verdict: needs
+changes, 12 code-grounded findings). Review committed verbatim
+(`specs/compute-service-plan-codex-review.md`); lead ACCEPTED ALL 12. Revised
+plan + two surgical spec errata committed (918159e).
+
+### Plan restructured: pipeline is now P0 → P1 → P2 (node work ends at P2)
+
+- **P3 removed.** SDK is not a member of this workspace (only the generated TS
+  mirror lives here); it becomes a **deferred, separate js-sdk workflow pointer**
+  in P4 (C10).
+- **Active-flip moved to the END of P2** per the spec's "when the handler ships"
+  rule. Codex caught that the old deny-by-default rationale was **factually
+  wrong**: reserved URNs are already exercisable (`accepted_actions` includes
+  reserved). `execute`+`deploy` flip active at P2; `list` stays reserved (C9).
+- **Exactly one human gate** — a security review after the full P2 slice; every
+  other former approval is now a machine assertion (C12).
+- **Gates are now real commands:** named `--test <file>` targets that error when
+  absent (name filters like `compute::execute` pass on zero matches — banned),
+  an exact E2E command with ephemeral port + 60s timeout, and a shared
+  feature-off + fmt + clippy suffix on every node (C5). P2 now tests EVERY
+  advertised control: allowlist, fuel, epoch, StoreLimits, input schema, numeric
+  ceilings, forbidden imports, invoker-side echo, full manifest shape (C6).
+- **Deliberately narrowed first slices:** P1 transport = JSON/base64 + inline
+  D_fn only (C7); P2 = KV-**read-only** inline output via `SpaceDatabase::invoke`
+  with a named internal-invocation executor seam (C4) and a **pinned minimal WASM
+  ABI** (one export + one `storage.get`) gated by a checked-in WAT fixture (C3).
+- **Two seams named as first-class deliverables:** the atomic **deploy
+  transaction primitive** (one SeaORM txn + mirror-after-commit; noted it's a
+  core seam refactor, not a service-module change, C2) and the **`RoutineKeyDeriver`**
+  interface injected server-side (dstack vs classic; `cargo check
+  --features compute,dstack`; cross-CVM-redeploy equality is a DEPLOYMENT-READINESS
+  gate, not a unit test — C11).
+
+### Two surgical spec errata (in `specs/compute-service.md`)
+
+1. **§7.1 (C1, NORMATIVE):** added the request-variant→ability mapping sentence —
+   the handler MUST map `Deploy`/`RoutineDid`→`compute/deploy`,
+   `Execute`→`compute/execute`, `List`→`compute/list` via `ability_matches`, or an
+   `execute` holder could submit a deploy body. Cites the SQL precedent
+   (`require_sql_admin_for_request`, routes/mod.rs:1232).
+2. **§6.2 (C8):** the derivation now **hashes the canonical space string** into a
+   fixed-width component — chosen over global `Name` validation, which is stubbed
+   and bypassed by direct `Name` construction in URI parsing. Formula, safety box,
+   and the §13.1 obligation all updated; global `Name` hardening spun out to P4.
+
+### site-builder — plan.html re-render
+
+- Pipeline is now **P0 → P1 → P2** with a **single** approval gate (security
+  review after P2). Remove the P3 node; add a "deferred: separate js-sdk
+  workflow" pointer alongside CF/ZK/containers in the deferred panel.
+- If you show gates: they're now concrete `cargo test --test <file>` commands +
+  an E2E boot/health/teardown — worth surfacing that the gates are executable, not
+  prose.
+- The two spec errata (§7.1 ability mapping, §6.2 hashed-space) don't change the
+  main spec diagrams, but if plan.html annotates the derivation, it's now
+  `get_key("tinycloud/compute-key/v1/" + hash(space) + "/compute/" + cid)`.
