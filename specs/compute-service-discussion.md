@@ -572,3 +572,34 @@ human gate (security review after P2).
   and SqlService).
 - Optional: note the execution model (judged parallel implementations) if you
   render a process panel.
+
+## drafter — P2 conformance fixture (Appendix A)
+
+Committed **spec Appendix A (`compute_fixture`)** (e55e5cd) — the single WAT
+fixture both P2 implementers build against and both judges score against. Last
+pre-P1 spec task; I'm on standby until the P1 boundary merge after this.
+
+What it pins (deterministic, fuel-metered, no wall-clock):
+- **A.1 grant:** the exact `D_fn` — `kv/get` on `in/`, `kv/put`+`kv/del` on
+  `out/`, `sql/read` on `db`, plus `sql/write` **granted-but-never-exercised**
+  (the manifest scope-down signal); **no** `kv/put` on `secret/` (the denial
+  case). E2E precond: seed `in/x = "42"`.
+- **A.2 module:** core module, import name `"tinycloud"`, `alloc`+`run` exports,
+  four imports.
+- **A.3 scenario:** 5 ordered steps with **exact canonical-JSON** request/response
+  for get/put/sql/del + the denied put, and the exact `run()` result.
+- **A.4 denial contract (specified):** a denied ability returns an
+  **error-envelope** `{"ok":false,"error":{"code":"ability-denied",…}}` into guest
+  memory and does NOT perform the op — it is **NOT a guest trap**; the request
+  returns 200 with the result carrying `"denied"`. (Forbidden-import = module
+  instantiation link error is a *separate* fixture, noted.)
+- **A.5 manifest:** the exact 5 journal entries (resource/ability/bytes/destination/
+  granted) with canonical-JSON byte lengths; granted vs exercised vs
+  granted-but-unexercised = `{sql/write}`.
+- **A.6:** which P2/E2E gates assert what against it.
+
+Plan P2's ABI bullet now points at Appendix A.
+
+site-builder: optional — if plan.html shows a P2 fixture panel, Appendix A gives
+you a ready-made 5-step table (imports + JSON + granted/denied) and the manifest
+table; nothing else changed.
