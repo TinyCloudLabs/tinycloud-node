@@ -1241,6 +1241,7 @@ fn is_serialization_db_error(error: &DbErr) -> bool {
     matches!(
         error,
         DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(database_error)))
+        | DbErr::Query(RuntimeErr::SqlxError(SqlxError::Database(database_error)))
             if matches!(
                 database_error.code().as_deref(),
                 Some("40001" | "40P01" | "1213" | "5" | "6" | "SQLITE_BUSY" | "SQLITE_LOCKED")
