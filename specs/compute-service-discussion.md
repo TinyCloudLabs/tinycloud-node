@@ -513,3 +513,62 @@ site-builder: no pipeline/diagram change this round (still P0→P1→P2, single 
 If plan.html annotates the derivation, it's now
 `get_key("tinycloud/compute-key/v1/" + base32(blake3(space)) + "/compute/" + cid)`;
 if it lists P2 gates, the ABI is now concrete (alloc/run/storage_get over JSON).
+
+## drafter — scope expansion: kv crud + sql + sdk e2e
+
+Sam expanded scope; implementation has STARTED (two parallel P0 implementers on
+separate worktrees — I did not touch their branches; only the spec branch is
+edited here). Committed on the spec branch (002c9fb).
+
+**P0 implementers were briefed on the OLD P2 scope (KV-read-only).** This does
+NOT affect P0 — P0 is skeleton/registry/feature/501/ability-mapping only, with no
+host-import surface. The two impl worktrees will REBASE/merge these spec-branch
+updates at the **P1 boundary**, which is where the expanded P2 surface first
+matters. Flagging so no one re-does P0 against the new scope.
+
+### P2 host surface expanded (supersedes the C4 KV-read-only cut)
+
+- **Four MVP host imports** (module `"tinycloud"`, all `(ptr,len)->(ptr,len)`,
+  JSON bytes): `storage_get`, `storage_put`, `storage_del`, `sql_query`. Each
+  mediated under its `D_fn` ability (`kv/get|put|del`, `sql/read|write` per the
+  existing SQL tiers), journaled in the manifest, echoing the binding caveat.
+  `sql_query` aligns with `SqlRequest`/`SqlResponse` and STILL goes through the
+  existing `create_authorizer` statement-level check — the host import does not
+  bypass SQL authz.
+- **Architectural consequence (named honestly):** the internal-invocation
+  executor is **composed in the SERVER crate**, not core — KV runs via
+  `SpaceDatabase::invoke` but `SqlService` lives behind the route layer, not in
+  `tinycloud-core`, so both are only reachable from the server crate. Spec §8.2 +
+  §9.1 updated; plan P2 names the seam.
+- **Test matrix** now has per-import allowed/denied (each import succeeds under a
+  granting `D_fn`, fails closed without) + the SQL statement-level authorizer
+  case; E2E does a granted read + `storage_put` + `sql_query` + a denial.
+- KV-write/SQL **removed** from P4's deferred list.
+
+### P3-SDK re-added (cross-repo; js-sdk is a workspace member)
+
+Node-SDK compute module (`deploy(wasm, grant)`, `execute(fn, input)`); session
+grant enumerates `compute/execute` and NEVER `compute/*`; deploy via an explicit
+privileged flow. E2E harness gate: boot a compute-enabled node on an ephemeral
+port, create space via SDK, deploy the fixture, mint routine+invoker grants,
+execute, assert output + manifest + ≥1 denial (ungranted read fails closed,
+wrong-ability deploy rejected); 120s timeout; teardown. The session-grant
+`compute/*`-absent check is machine-asserted (grep the emitted grant), not human.
+
+### Sequencing / execution model
+
+Pipeline is now **P0 → P1 → P2 → P3-SDK**; one sentence added acknowledging the
+**judged parallel implementations** model (multiple implementers per stage,
+fable + codex judges pick the winner — gates are the arbiter). Still exactly one
+human gate (security review after P2).
+
+### site-builder — plan.html re-render
+
+- Pipeline gains a **fourth stage P3-SDK** (cross-repo E2E) after P2; the
+  deferred panel loses KV-write/SQL (now in P2) and the "TS SDK deferred" item
+  (now P3-SDK); it keeps streaming/list/CF/ZK/containers + Name hardening.
+- P2 node diagram: the host surface is now **four imports** (get/put/del/sql),
+  and the executor seam is labeled **server-crate** (reaches both SpaceDatabase
+  and SqlService).
+- Optional: note the execution model (judged parallel implementations) if you
+  render a process panel.
