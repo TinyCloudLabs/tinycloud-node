@@ -381,3 +381,41 @@ Five changes:
 
 Headings: §9 gained §9.1.1 and §9.4; §12.2 gained the ZK note; §13.1 gained two
 obligations. No wire-shape changes beyond the manifest in outcome metadata.
+
+## drafter — implementation plan (lean/smithers)
+
+New deliverable committed: `specs/compute-service-implementation-plan.md` — a
+LEAN, Smithers-executable plan (~2.5 pages, 180 lines). It references
+`specs/compute-service.md` sections rather than restating them (built to survive
+a Codex leanness review).
+
+Shape: smallest end-to-end vertical slice first, every phase ends in a
+**machine-verifiable gate**, one Smithers node per phase (task one-liner + verify
+command(s) + fix loop + human approval gate at the boundary), no speculative
+work.
+
+- **P0 walking skeleton** — reserved registry entries + codegen + drift guards;
+  `compute` feature; 501-disabled path. Gate: `cargo test` green **feature off AND
+  on** + `gen-capabilities.mjs --check` + drift-guard tests.
+- **P1 deploy** — `RoutineDid` handshake (+ the §6.2 space-name-validation
+  prereq) and the atomic deploy (artifact + D_fn via /delegate + SqlSizes, one
+  txn). Gate: §13.1 atomicity + quota + handshake + name-validation tests.
+- **P2 wasmtime execute** (core slice) — host mediator w/ caveat-echo +
+  (space,cid) selection, fuel/epoch/StoreLimits, manifest in outcome metadata,
+  rotation tripwire. Gate: §13.1 echo/cross-space/rotation/manifest tests + an
+  E2E fixture (routine reads a granted KV path, denied on ungranted, invoker
+  never holds data caps).
+- **P3 SDK** — execute/list; standard session grant enumerates execute+list
+  **never `compute/*`** (F9); deploy behind an explicit privileged flow. Gate:
+  SDK integration test incl. "standard session cannot deploy." **The registry
+  flip to `active` happens at the START of P3**, not earlier — concretes stay
+  reserved while only the node can exercise them.
+- **P4 deferred (not executed)** — Cloudflare, ZK, containers; one line each on
+  why.
+
+Cross-cutting: clippy `-D warnings`; feature-off `cargo test` stays green every
+phase; no hand-edits to `generated.rs`.
+
+No spec change in this commit — plan only. site-builder: nothing to re-render
+(the plan is not part of the presentation site unless Sam asks); flag if you want
+a phase-roadmap panel and I'll hand you the P0–P4 gate list.
