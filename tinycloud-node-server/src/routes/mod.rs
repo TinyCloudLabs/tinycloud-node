@@ -47,7 +47,8 @@ use tinycloud_core::{
     types::{Ability, DelegationQuery, DelegationQueryPage, Metadata, Resource},
     util::{Capability, DelegationInfo, InvocationInfo, RevocationInfo},
     write_hooks::{db_table_path, hook_delivery_id, subscription_matches_event, TouchedTables},
-    DelegationStatus, InvocationOutcome, TransactResult, TxError, TxStoreError,
+    DelegationStatus, InvocationOutcome, KvInvokeOptions, KvPrecondition, TransactResult, TxError,
+    TxStoreError,
 };
 
 pub mod admin;
@@ -577,6 +578,167 @@ fn metadata_header<'a>(metadata: &'a Metadata, name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
+fn take_metadata_header(metadata: &mut Metadata, name: &str) -> Option<String> {
+    let key = metadata
+        .0
+        .keys()
+        .find(|key| key.eq_ignore_ascii_case(name))?
+        .clone();
+    metadata.0.remove(&key)
+}
+
+fn parse_strong_blake3_etag(value: &str) -> Result<[u8; 32], (Status, String)> {
+    let value = value.trim();
+    let digest = value
+        .strip_prefix("\"blake3-")
+        .and_then(|value| value.strip_suffix('"'))
+        .ok_or_else(|| {
+            (
+                Status::BadRequest,
+                "If-Match must be a strong TinyCloud ETag: \"blake3-<64 hex characters>\""
+                    .to_string(),
+            )
+        })?;
+    if digest.len() != 64 {
+        return Err((
+            Status::BadRequest,
+            "If-Match must contain a 32-byte BLAKE3 digest".to_string(),
+        ));
+    }
+    let bytes = hex::decode(digest).map_err(|_| {
+        (
+            Status::BadRequest,
+            "If-Match BLAKE3 digest must be hexadecimal".to_string(),
+        )
+    })?;
+    bytes.try_into().map_err(|_| {
+        (
+            Status::BadRequest,
+            "If-Match must contain a 32-byte BLAKE3 digest".to_string(),
+        )
+    })
+}
+
+fn parse_positive_u64_header(
+    metadata: &mut Metadata,
+    name: &str,
+) -> Result<Option<u64>, (Status, String)> {
+    take_metadata_header(metadata, name)
+        .map(|value| {
+            let parsed = value.trim().parse::<u64>().map_err(|_| {
+                (
+                    Status::BadRequest,
+                    format!("{name} must be a positive integer"),
+                )
+            })?;
+            if parsed == 0 {
+                return Err((
+                    Status::BadRequest,
+                    format!("{name} must be a positive integer"),
+                ));
+            }
+            Ok(parsed)
+        })
+        .transpose()
+}
+
+fn kv_invoke_options(
+    invocation: &InvocationInfo,
+    headers: &mut ObjectHeaders,
+    multipart: bool,
+) -> Result<KvInvokeOptions, (Status, String)> {
+    kv_invoke_options_for_capabilities(&invocation.capabilities, headers, multipart)
+}
+
+fn kv_invoke_options_for_capabilities(
+    capabilities: &[Capability],
+    headers: &mut ObjectHeaders,
+    multipart: bool,
+) -> Result<KvInvokeOptions, (Status, String)> {
+    let if_match = take_metadata_header(&mut headers.0, "if-match");
+    let if_none_match = take_metadata_header(&mut headers.0, "if-none-match");
+    if if_match.is_some() && if_none_match.is_some() {
+        return Err((
+            Status::BadRequest,
+            "If-Match and If-None-Match cannot be combined".to_string(),
+        ));
+    }
+
+    let mutation_targets = capabilities
+        .iter()
+        .filter_map(|capability| {
+            match (&capability.resource, capability.ability.as_ref().as_ref()) {
+                (Resource::TinyCloud(resource), ability)
+                    if resource.service().as_str() == "kv"
+                        && matches!(
+                            ability,
+                            "tinycloud.kv/put" | "tinycloud.kv/del" | "tinycloud.kv/delete"
+                        )
+                        && resource.path().is_some() =>
+                {
+                    Some((
+                        resource.space().clone(),
+                        resource.path()?.clone(),
+                        ability.to_string(),
+                    ))
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut preconditions = HashMap::new();
+    if let Some(value) = if_none_match {
+        if value.trim() != "*" {
+            return Err((
+                Status::BadRequest,
+                "If-None-Match only supports * for KV create".to_string(),
+            ));
+        }
+        if multipart || mutation_targets.len() != 1 || mutation_targets[0].2 != "tinycloud.kv/put" {
+            return Err((
+                Status::BadRequest,
+                "If-None-Match: * requires exactly one non-multipart KV put".to_string(),
+            ));
+        }
+        let (space, path, _) = &mutation_targets[0];
+        preconditions.insert((space.clone(), path.clone()), KvPrecondition::DoesNotExist);
+    } else if let Some(value) = if_match {
+        if multipart || mutation_targets.len() != 1 {
+            return Err((
+                Status::BadRequest,
+                "If-Match requires exactly one non-multipart KV put or delete".to_string(),
+            ));
+        }
+        let (space, path, _) = &mutation_targets[0];
+        preconditions.insert(
+            (space.clone(), path.clone()),
+            KvPrecondition::Matches(parse_strong_blake3_etag(&value)?),
+        );
+    }
+
+    let max_response_bytes =
+        parse_positive_u64_header(&mut headers.0, "x-tinycloud-max-response-bytes")?;
+    let list_limit = parse_positive_u64_header(&mut headers.0, "x-tinycloud-limit")?
+        .map(|limit| {
+            if limit > 1000 {
+                Err((
+                    Status::BadRequest,
+                    "x-tinycloud-limit must be between 1 and 1000".to_string(),
+                ))
+            } else {
+                Ok(limit as usize)
+            }
+        })
+        .transpose()?;
+
+    Ok(KvInvokeOptions {
+        preconditions,
+        max_response_bytes,
+        list_limit,
+    })
+}
+
 fn is_multipart(headers: &ObjectHeaders) -> bool {
     metadata_header(&headers.0, "content-type")
         .map(|value| {
@@ -856,7 +1018,7 @@ async fn build_batch_kv_inputs(
 async fn invoke_impl(
     i: AuthHeaderGetter<InvocationInfo>,
     req_span: TracingSpan,
-    headers: ObjectHeaders,
+    mut headers: ObjectHeaders,
     data: DataIn<'_>,
     staging: &State<BlockStage>,
     tinycloud: &State<TinyCloud>,
@@ -985,6 +1147,7 @@ async fn invoke_impl(
 
         let put_caps = kv_put_capabilities(&i.0 .0);
         let is_multipart_request = is_multipart(&headers);
+        let kv_options = kv_invoke_options(&i.0 .0, &mut headers, is_multipart_request)?;
         let expected_batch_inputs = if is_multipart_request && !put_caps.is_empty() {
             Some(validate_kv_batch_capabilities(&i.0 .0, &put_caps)?)
         } else {
@@ -1090,7 +1253,9 @@ async fn invoke_impl(
         let inputs = inputs_result?;
         let invocation_info = i.0 .0.clone();
         let invoke_start = Instant::now();
-        let invoke_result = tinycloud.invoke::<BlockStage>(i.0, inputs).await;
+        let invoke_result = tinycloud
+            .invoke_with_options::<BlockStage>(i.0, inputs, kv_options)
+            .await;
         crate::prometheus::observe_span(
             "server.kv.invoke",
             if invoke_result.is_ok() { "ok" } else { "error" },
@@ -1102,7 +1267,7 @@ async fn invoke_impl(
                 if let Some(written_paths) = batch_written_paths {
                     if outcomes.len() != written_paths.len()
                         || !outcomes.iter().all(|outcome| {
-                            matches!(outcome, InvocationOutcome::KvWrite)
+                            matches!(outcome, InvocationOutcome::KvWrite(_))
                         })
                     {
                         Err((
@@ -1130,6 +1295,9 @@ async fn invoke_impl(
             Err(e) => Err((
                 match &e {
                     TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
+                    TxStoreError::KvPreconditionFailed => Status::PreconditionFailed,
+                    TxStoreError::KvSerializationConflict => Status::ServiceUnavailable,
+                    TxStoreError::KvResponseTooLarge { .. } => Status::PayloadTooLarge,
                     TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
                         database_error_status(error)
                     }
@@ -2461,6 +2629,129 @@ mod tests {
         DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(Box::new(
             TestDatabaseError { code },
         ))))
+    }
+
+    #[test]
+    fn conditional_kv_etags_are_strong_blake3_etags() {
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            parse_strong_blake3_etag(&format!("\"blake3-{digest}\"")).unwrap(),
+            hex::decode(digest).unwrap().as_slice()
+        );
+
+        for invalid in [
+            "*",
+            "W/\"blake3-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"",
+            "\"sha256-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"",
+            "\"blake3-not-hex\"",
+        ] {
+            assert_eq!(
+                parse_strong_blake3_etag(invalid).unwrap_err().0,
+                Status::BadRequest
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_kv_headers_are_positive_and_removed_from_object_metadata() {
+        let mut metadata = Metadata(BTreeMap::from([
+            (
+                "X-TinyCloud-Max-Response-Bytes".to_string(),
+                "1048576".to_string(),
+            ),
+            ("content-type".to_string(), "text/plain".to_string()),
+        ]));
+        assert_eq!(
+            parse_positive_u64_header(&mut metadata, "x-tinycloud-max-response-bytes").unwrap(),
+            Some(1_048_576)
+        );
+        assert!(metadata_header(&metadata, "x-tinycloud-max-response-bytes").is_none());
+        assert_eq!(
+            metadata_header(&metadata, "content-type"),
+            Some("text/plain")
+        );
+
+        for invalid in ["0", "-1", "many"] {
+            let mut metadata = Metadata(BTreeMap::from([(
+                "x-tinycloud-limit".to_string(),
+                invalid.to_string(),
+            )]));
+            assert_eq!(
+                parse_positive_u64_header(&mut metadata, "x-tinycloud-limit")
+                    .unwrap_err()
+                    .0,
+                Status::BadRequest
+            );
+        }
+    }
+
+    #[test]
+    fn kv_create_and_replace_headers_build_exact_key_preconditions() {
+        let space = test_space_id("conditional-kv-options");
+        let capability = kv_put_capability(&space, "files/report.txt");
+
+        let mut create_headers = ObjectHeaders(Metadata(BTreeMap::from([(
+            "If-None-Match".to_string(),
+            "*".to_string(),
+        )])));
+        let create = kv_invoke_options_for_capabilities(
+            std::slice::from_ref(&capability),
+            &mut create_headers,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            create.preconditions.get(&(
+                space.clone(),
+                "files/report.txt".parse::<AuthPath>().unwrap()
+            )),
+            Some(&KvPrecondition::DoesNotExist)
+        );
+        assert!(metadata_header(&create_headers.0, "if-none-match").is_none());
+
+        let digest = [7u8; 32];
+        let mut replace_headers = ObjectHeaders(Metadata(BTreeMap::from([(
+            "If-Match".to_string(),
+            format!("\"blake3-{}\"", hex::encode(digest)),
+        )])));
+        let replace =
+            kv_invoke_options_for_capabilities(&[capability], &mut replace_headers, false).unwrap();
+        assert_eq!(
+            replace
+                .preconditions
+                .get(&(space, "files/report.txt".parse::<AuthPath>().unwrap())),
+            Some(&KvPrecondition::Matches(digest))
+        );
+    }
+
+    #[test]
+    fn kv_condition_headers_reject_ambiguous_or_batch_mutations() {
+        let space = test_space_id("conditional-kv-invalid");
+        let capabilities = [
+            kv_put_capability(&space, "a"),
+            kv_put_capability(&space, "b"),
+        ];
+        let mut headers = ObjectHeaders(Metadata(BTreeMap::from([(
+            "If-Match".to_string(),
+            format!("\"blake3-{}\"", hex::encode([1u8; 32])),
+        )])));
+        assert_eq!(
+            kv_invoke_options_for_capabilities(&capabilities, &mut headers, false)
+                .unwrap_err()
+                .0,
+            Status::BadRequest
+        );
+
+        let mut headers = ObjectHeaders(Metadata(BTreeMap::from([(
+            "If-None-Match".to_string(),
+            "*".to_string(),
+        )])));
+        assert_eq!(
+            kv_invoke_options_for_capabilities(&capabilities[..1], &mut headers, true)
+                .unwrap_err()
+                .0,
+            Status::BadRequest
+        );
     }
 
     #[tokio::test]
