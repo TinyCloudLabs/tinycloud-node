@@ -492,6 +492,13 @@ pub struct RevokeResponse {
     pub cid: String,
 }
 
+// Four route variants, one per (duckdb, compute) feature combination. Rocket's
+// `#[post]` codegen needs to see a concrete `State<T>` guard (or its absence)
+// at the attribute-macro level, so a `DuckDbInvokeState<'_>`/`ComputeInvokeState<'_>`
+// alias that resolves to `()` cannot be used directly as a route parameter —
+// each combination gets its own `invoke` function, mirroring the pre-existing
+// duckdb on/off split.
+
 #[post("/invoke", data = "<data>")]
 #[cfg(all(feature = "duckdb", feature = "compute"))]
 #[allow(clippy::too_many_arguments)]

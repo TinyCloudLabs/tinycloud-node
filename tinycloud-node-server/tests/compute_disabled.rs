@@ -131,5 +131,17 @@ secret = "{}"
     );
     assert_eq!(body, "Compute support is not enabled on this node");
 
+    // `/version` must NOT advertise compute when the feature is off.
+    let version = client.get("/version").dispatch().await;
+    let version_body: serde_json::Value =
+        serde_json::from_str(&version.into_string().await.unwrap())?;
+    let features = version_body["features"]
+        .as_array()
+        .context("features must be an array")?;
+    assert!(
+        !features.iter().any(|f| f == "compute"),
+        "compute must not be advertised in /version when the feature is off: {features:?}"
+    );
+
     Ok(())
 }
