@@ -478,3 +478,38 @@ plan + two surgical spec errata committed (918159e).
 - The two spec errata (§7.1 ability mapping, §6.2 hashed-space) don't change the
   main spec diagrams, but if plan.html annotates the derivation, it's now
   `get_key("tinycloud/compute-key/v1/" + hash(space) + "/compute/" + cid)`.
+
+## drafter — codex verify round applied
+
+Codex re-verified (7/12 resolved, 5 partial, 2 new small defects). Final surgical
+round committed (9beec00) — should be the last. All lead decisions folded in;
+nothing open.
+
+Plan:
+- C1: P1 gate adds `RoutineDid`-wrong-ability reject; P0 gate adds "`List` body →
+  rejected while reserved" (no MVP handler).
+- C3: P2 ABI now PINNED — core module; guest exports `alloc(len)->ptr` +
+  `run(ptr,len)->(ptr,len)`; host import module `"tinycloud"` fn
+  `storage_get(ptr,len)->(ptr,len)`; all payloads JSON bytes in guest memory; WAT
+  fixture exercises exactly this.
+- C5: named feature-off gate `--test compute_disabled` added to P0 verify + the
+  shared suffix (asserts the 501 path with the feature off).
+- C11/defect-b: dstack-simulator gate moved to the server crate
+  (`--test compute_routine_key --features compute,dstack`, `DSTACK_SIMULATOR_ENDPOINT`);
+  core keeps only the `RoutineKeyDeriver` trait unit test (classic impl).
+
+Spec errata (compute-service.md):
+- C4 §8.2: internal routine invocations are verified AND executed via an injected
+  executor backed by `SpaceDatabase::invoke` (server-composed), not `process()`
+  alone; replay-cache point kept.
+- C7 §7.2: raw-body WASM + pre-submitted grant CIDs marked DEFERRED/non-normative;
+  MVP = JSON/base64 + inline `D_fn` only.
+- defect-a §6.2: hash pinned to `base32(blake3(space_canonical))` (fixed-width,
+  lowercase base32, delimiter-free); fixed the contradictory "names MUST be
+  validated before activation" heading (hashing replaces it; global `Name`
+  hardening is a separate deferred task).
+
+site-builder: no pipeline/diagram change this round (still P0→P1→P2, single gate).
+If plan.html annotates the derivation, it's now
+`get_key("tinycloud/compute-key/v1/" + base32(blake3(space)) + "/compute/" + cid)`;
+if it lists P2 gates, the ABI is now concrete (alloc/run/storage_get over JSON).
