@@ -73,6 +73,10 @@ auto-includes = true
 # Whether to install an updater program
 install-updater = false
 # A GitHub repo to push Homebrew formulas to
+# NOTE: on the first tagged release cargo-dist will OVERWRITE Formula/tinycloud-node.rb
+# in the tap with a generated binary formula (no head/service/test blocks) — accepted:
+# the CLI (`tinycloud node service ...`) is the primary service path, brew-services
+# fallback is best-effort.
 tap = "TinyCloudLabs/homebrew-tap"
 # Customize the Homebrew formula name
 formula = "tinycloud-node"

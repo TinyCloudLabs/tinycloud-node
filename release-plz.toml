@@ -13,7 +13,8 @@ name = "tinycloud-node"
 # tinycloud-core, dependencies/*) are also published with versioned deps.
 # Binary distribution happens via GitHub Releases + cargo-dist installers.
 publish = false
-git_release_enable = true
+# cargo-dist's release workflow owns GitHub Release creation; release-plz only tags.
+git_release_enable = false
 git_tag_enable = true
 git_tag_name = "v{{ version }}"
 changelog_include = ["tinycloud-core", "tinycloud-auth"]
