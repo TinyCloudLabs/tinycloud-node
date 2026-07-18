@@ -5,12 +5,16 @@
 **Review:** `specs/compute-service-plan-codex-review.md` (C1–C12, all accepted)
 **Execution model:** Smithers durable plan→implement→review→fix→verify.
 
-Pipeline: **P0 skeleton → P1 deploy → P2 execute** (node work ENDS at P2). P4 is
-a deferred list, not executed. Exactly **one** human gate (security review after
-P2); every other former approval is now a machine assertion (C12).
+Pipeline: **P0 skeleton → P1 deploy → P2 execute (KV CRUD + SQL) → P3-SDK
+(node-SDK + cross-repo E2E)**. P4 is a deferred list, not executed. Exactly
+**one** human gate (security review after P2); every other approval — including
+P3-SDK's session-grant check — is a machine assertion (C12). Stages run as
+**judged parallel implementations** (multiple implementers per stage in separate
+worktrees, fable + codex judges pick the winner), so the gates are the arbiter.
 
 Crate names: server = `tinycloud-node` (dir `tinycloud-node-server/`), core =
-`tinycloud-core`. Integration tests live in `tinycloud-node-server/tests/`.
+`tinycloud-core`. Integration tests live in `tinycloud-node-server/tests/`. The
+`js-sdk` repo is a workspace member (P3-SDK).
 
 ---
 
@@ -107,28 +111,40 @@ The transaction seam is a **core primitive**, not a service-module change (C2):
 
 ---
 
-## P2 — Wasmtime execute (KV-read-only slice; node work ends here)
+## P2 — Wasmtime execute (KV CRUD + SQL host surface)
 
-First end-to-end least-privilege slice, deliberately narrow (C3/C4):
+First end-to-end least-privilege slice. Scope expanded from the earlier
+KV-read-only cut: the MVP host surface is **KV CRUD + SQL** (supersedes C4).
 
-- **Pinned minimal WASM ABI (C3) — stated, not "TBD":**
+- **Pinned WASM ABI (C3) — stated, not "TBD":**
   - **core module** (NOT a component);
   - guest exports `alloc(len: i32) -> ptr: i32` (guest owns its linear memory;
     the host writes args into guest memory via `alloc`) and
     `run(ptr: i32, len: i32) -> (ptr: i32, len: i32)` (the single entrypoint);
-  - one host import, module name **`"tinycloud"`**, function
-    `storage_get(ptr: i32, len: i32) -> (ptr: i32, len: i32)`;
-  - **all payloads are JSON bytes** in guest memory: `run`'s input is the JSON
-    request, its output is the JSON result; `storage_get`'s arg is the JSON key
-    ref, its return is the JSON value/bytes.
+  - **four host imports, module name `"tinycloud"`**, each
+    `(ptr: i32, len: i32) -> (ptr: i32, len: i32)`: `storage_get`, `storage_put`,
+    `storage_del`, `sql_query`;
+  - **all payloads are JSON bytes** in guest memory: `run` in = JSON request,
+    out = JSON result; `storage_{get,put,del}` arg = JSON key/value ref, return =
+    JSON value/ack; `sql_query` arg = JSON request, return = JSON rows — aligned
+    with the existing `SqlRequest` / `SqlResponse` shapes.
   (Names may change only if the same completeness bar — module names, signatures,
-  memory ownership, encoding — stays fully stated.) The rest of the host-import
-  surface is deferred. Gated by a **checked-in WAT fixture that exercises exactly
-  this contract**.
-- **KV-read-only, inline output (C4):** the injected **internal-invocation
-  executor** (named seam) reads through `SpaceDatabase::invoke` (`db.rs:620-720`);
-  a bare `process()` only persists and returns a hash (`invocation.rs:105-118`)
-  and cannot return KV data. **KV writes and SQL host calls move to P4.**
+  memory ownership, encoding — stays fully stated.) The exact fixture — module
+  shape, per-step request/response JSON, denial contract, and expected manifest —
+  is pinned in **spec Appendix A (`compute_fixture`)**; both implementers build
+  against it and both judges score against it. Gated by that checked-in WAT
+  fixture (get/put/del/sql).
+- **Mediated host surface + the SERVER-crate executor seam (supersedes C4):** each
+  import is mediated under its `D_fn` ability — `storage_get`→`kv/get`,
+  `storage_put`→`kv/put`, `storage_del`→`kv/del`, `sql_query`→`sql/read|write` per
+  the existing SQL tiers (§9.1). The injected **internal-invocation executor** is
+  **composed in the server crate** (`tinycloud-node-server`), because KV runs via
+  `SpaceDatabase::invoke` (`db.rs:620-720`) but **`SqlService` lives behind the
+  route layer, not in `tinycloud-core`** — both must be reachable from the seam, so
+  it cannot be core-only (§8.2). `sql_query` runs through the existing
+  `create_authorizer` path, so SQL statement/table restrictions still apply. A
+  bare `process()` only persists+returns a hash and cannot return KV data or run
+  SQL.
 - Host mediator: caveat-echo verbatim (§6.2/F1); `(space, functionCid)` cite-all
   `D_fn` selection (§5.1/F3/F5).
 - Full caveat enforcement (§10.1): fuel, epoch, `StoreLimits`, chain-derived
@@ -145,26 +161,71 @@ First end-to-end least-privilege slice, deliberately narrow (C3/C4):
 
 **verify** (every advertised control gets a focused test — C6)
 - `cargo test -p tinycloud-node --test compute_execute --features compute` —
-  asserts EACH: caveat-echo reject (`invocation-caveats-not-subset-of-chain`) +
-  invoker-side echo reject; cross-space isolation; rotation
-  (`routine-identity-rotated`, not 403); `functions` allowlist; **fuel
-  exhaustion** trap; **epoch/timeout** trap; **memory-growth** failure
-  (`StoreLimits`); **input-schema** reject; **numeric-ceiling** reject; **forbidden
-  import** reject; **full manifest shape** (per-call `(resource, ability,
-  bytes_in/out, destination)` fields + granted-vs-exercised, incl. a
-  granted-but-unexercised case, §9.1.1).
+  asserts EACH: **per-import allowed/denied** — `storage_get`/`storage_put`/
+  `storage_del`/`sql_query` each SUCCEED under a granting `D_fn` (`kv/get`,
+  `kv/put`, `kv/del`, `sql/read|write`) and FAIL CLOSED without it; **SQL
+  statement-level authorizer** still rejects an out-of-policy statement via
+  `create_authorizer` even with `sql/*`; caveat-echo reject
+  (`invocation-caveats-not-subset-of-chain`) + invoker-side echo reject;
+  cross-space isolation; rotation (`routine-identity-rotated`, not 403);
+  `functions` allowlist; **fuel exhaustion** trap; **epoch/timeout** trap;
+  **memory-growth** failure (`StoreLimits`); **input-schema** reject;
+  **numeric-ceiling** reject; **forbidden import** reject; **full manifest shape**
+  (per-call `(resource, ability, bytes_in/out, destination)` + granted-vs-exercised,
+  incl. a granted-but-unexercised case, §9.1.1).
 - `cargo test -p tinycloud-node --test compute_abi --features compute` — the WAT
-  fixture executes against the pinned ABI (export called, `storage.get` mediated).
+  fixture exercises the pinned ABI: `run` export + all four imports
+  (`storage_get`/`storage_put`/`storage_del`/`sql_query`) mediated.
 - **E2E** (real server, the P2 acceptance gate — C6): `cargo test -p tinycloud-node
   --test compute_e2e --features compute` — boots a node on an ephemeral port,
-  health-waits, a routine reads a **granted** KV path (succeeds, manifest shows it
-  exercised) and is **denied** on an **ungranted** path (host call fails closed),
-  invoker holds NO data caps throughout; tears the node down (timeout 60s).
+  health-waits, a routine does a granted read AND a granted `storage_put` AND a
+  granted `sql_query` (manifest shows each exercised) and is **denied** on an
+  **ungranted** path (host call fails closed), invoker holds NO data caps
+  throughout; tears the node down (timeout 60s).
 - `node scripts/gen-capabilities.mjs --check` (active-flip regen committed).
 - suffix.
 - **HUMAN GATE (the only one, C12):** a security review of the completed P2 slice
-  — the ability mapping, the caveat-echo enforcement, cross-space isolation, and
-  the active-flip diff. All other checks above are assertions, not reviews.
+  — the ability mapping, per-import mediation + SQL authorizer, caveat-echo
+  enforcement, cross-space isolation, and the active-flip diff. All other checks
+  above are assertions, not reviews.
+
+---
+
+## P3-SDK — node-SDK compute module + true cross-repo E2E
+
+The js-sdk repo is a member of this workspace, so real end-to-end via the node
+SDK is in scope (re-added). One page.
+
+- **Minimal node-SDK compute module:** `deploy(wasm, grant)` and
+  `execute(fn, input)`. `deploy` sends the MVP transport (JSON + base64 WASM +
+  inline `D_fn`, §7.2); `execute` sends a `compute/execute` invocation and returns
+  `{ result, manifest }`.
+- **Session-grant rule (F9, enforced here):** the standard session grant
+  enumerates **`compute/execute`** (and `compute/list` only once it ships) and
+  **NEVER `compute/*`**. `deploy` is reachable **only via an explicit privileged
+  flow** (a separately-minted `compute/deploy` grant), not the standard session.
+- **E2E harness (the gate):** `<js-sdk>/test/compute_e2e` — start a
+  compute-enabled node (`cargo run --features compute` or the P2 test binary) on
+  an **ephemeral port**, health-wait; via the SDK: create a space, deploy the
+  fixture routine, mint the routine grant (`D_fn`) + the invoker grant
+  (`compute/execute` only), `execute`, then assert: **output** matches, **manifest**
+  shows the exercised imports, and **≥1 denial** — an ungranted-path read fails
+  closed AND a wrong-ability deploy (standard session, no `compute/deploy`) is
+  rejected. **Teardown** the node. **120s timeout.**
+
+**verify**
+- `cargo build --features compute` (node builds for the harness)
+- the E2E harness command (exact, from the js-sdk package — e.g.
+  `bun test test/compute_e2e.ts` / `npm run test:compute-e2e`, whichever the
+  js-sdk package defines), which boots the node on an ephemeral port, runs the
+  scenario above, asserts output + manifest + the two denials, and tears down;
+  **120s timeout**.
+- suffix (node crate stays green).
+
+> Cross-repo note: this stage spans two workspace members (node + js-sdk). It
+> runs AFTER P2's active-flip so the abilities it grants are live. The session
+> grant assertion (`compute/*` absent) is machine-checked by grepping the emitted
+> grant in the harness, not by human review.
 
 ---
 
@@ -173,24 +234,24 @@ First end-to-end least-privilege slice, deliberately narrow (C3/C4):
 One line each on *why*:
 
 - **`compute/list`** (C9): no server-side listing exists (`DatabaseArtifactRepository`
-  has only `load`/`save`, `database_artifacts.rs:28-44`); stays reserved.
-- **KV-write / SQL host calls** (C4): need cross-layer executor wiring beyond the
-  read-only `SpaceDatabase::invoke` slice.
+  has only `load`/`save`, `database_artifacts.rs:28-44`); stays reserved (SDK
+  `list` waits for it).
 - **Streaming / multipart deploy transport + pre-submitted grant CIDs** (C7):
   contradicts inline atomic grant persistence; JSON/base64 suffices first.
-- **TS SDK (execute/list, session grant, privileged deploy)** (C10): the TS SDK is
-  **not a member of this workspace** (only the generated TS mirror lives here,
-  `gen-capabilities.mjs:31-34`). Runs as a **separate js-sdk worktree/workflow**
-  with its own commands and release coordination — the session grant there MUST
-  enumerate `compute/execute`(+`list` when it ships) and NEVER `compute/*` (§3/F9).
 - **Global `Name` hardening** (C8): a compatibility-sensitive auth-wide task,
   independent of compute (compute uses hashed-space derivation instead).
 - **Cloudflare backend / ZK / container backend** (§9.2/§12.2/§9.4): second trust
   models; land the in-node wasmtime slice first.
 
+> Note: KV-write and SQL host calls, previously deferred here, are now **in P2**
+> (scope expansion).
+
 ## Sequencing
 
-P0→P1→P2 is a strict precondition chain (each gate is the next phase's
-precondition). The active-flip is P2's final step. No hand-edits to
-`generated.rs` — registry changes go through `gen-capabilities.mjs` + drift
-guards, in every phase.
+Pipeline: **P0 → P1 → P2 → P3-SDK**, a strict precondition chain (each gate is
+the next stage's precondition); the registry active-flip is P2's final step and
+P3-SDK depends on it. **Execution model:** stages are run as *judged parallel
+implementations* — multiple implementers race each stage in separate worktrees
+and fable + codex judges pick the winner — so the plan's gates are the arbiter,
+not a single author. No hand-edits to `generated.rs`; registry changes go through
+`gen-capabilities.mjs` + drift guards, in every stage.
