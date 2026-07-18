@@ -5,7 +5,7 @@ authors = ["TinyCloud Protocol"]
 edition = "2021"
 description = "TinyCloud Protocol Node"
 repository = "https://github.com/TinyCloudLabs/tinycloud-node"
-license-file = "../LICENSE.md"
+license-file = "LICENSE.md"
 
 [lib]
 name = "tinycloud"
