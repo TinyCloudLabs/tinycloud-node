@@ -46,6 +46,8 @@ pub struct ArtifactHashes {
     pub contract_blake3: &'static str,
     pub golden_vectors_blake3: &'static str,
     pub block_fixtures_blake3: &'static str,
+    pub worker_bundle_sha256: String,
+    pub wasm_bundle_sha256: String,
 }
 
 impl Default for ArtifactHashes {
@@ -54,7 +56,21 @@ impl Default for ArtifactHashes {
             contract_blake3: CONTRACT_BLAKE3,
             golden_vectors_blake3: GOLDEN_VECTORS_BLAKE3,
             block_fixtures_blake3: BLOCK_FIXTURES_BLAKE3,
+            worker_bundle_sha256: String::new(),
+            wasm_bundle_sha256: String::new(),
         }
+    }
+}
+
+impl ArtifactHashes {
+    fn from_env() -> Result<Self, DbErr> {
+        Ok(Self {
+            contract_blake3: CONTRACT_BLAKE3,
+            golden_vectors_blake3: GOLDEN_VECTORS_BLAKE3,
+            block_fixtures_blake3: BLOCK_FIXTURES_BLAKE3,
+            worker_bundle_sha256: required_sha256_env("TC_BENCH_WORKER_BUNDLE_SHA256")?,
+            wasm_bundle_sha256: required_sha256_env("TC_BENCH_WASM_BUNDLE_SHA256")?,
+        })
     }
 }
 
@@ -316,7 +332,7 @@ impl BenchState {
             db,
             region,
             sqlite,
-            artifact_hashes: ArtifactHashes::default(),
+            artifact_hashes: ArtifactHashes::from_env()?,
         };
         state.ensure_schema().await?;
         Ok(state)
@@ -753,6 +769,21 @@ fn response_json_error(error: BenchError, timings: &BenchTimings) -> BenchRespon
     json_error(error, timings)
 }
 
+fn required_sha256_env(name: &str) -> Result<String, DbErr> {
+    let value = std::env::var(name)
+        .map_err(|_| DbErr::Custom(format!("missing required environment variable {name}")))?;
+    if value.len() != 64
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    {
+        return Err(DbErr::Custom(format!(
+            "environment variable {name} must be a 64-character hexadecimal string"
+        )));
+    }
+    Ok(value)
+}
+
 #[post("/auth/verify", data = "<body>")]
 pub async fn auth_verify(body: String, state: &State<BenchState>) -> BenchResponder {
     let mut timings = BenchTimings::new();
@@ -854,7 +885,6 @@ pub async fn auth_verify(body: String, state: &State<BenchState>) -> BenchRespon
             &timings,
         );
     }
-    timings.record("delegation", delegation_start.elapsed());
 
     let expires_at = match message.expiration_time {
         Some(timestamp) => timestamp.to_string(),
@@ -878,7 +908,6 @@ pub async fn auth_verify(body: String, state: &State<BenchState>) -> BenchRespon
         expires_at,
     };
 
-    let store_start = Instant::now();
     match nonce_replayed(state.inner().db(), &session.nonce).await {
         Ok(true) => {
             return response_json_error(BenchError::nonce_replay("nonce already used"), &timings)
@@ -886,10 +915,11 @@ pub async fn auth_verify(body: String, state: &State<BenchState>) -> BenchRespon
         Ok(false) => {}
         Err(err) => return response_json_error(BenchError::internal(err.to_string()), &timings),
     }
-    if let Err(err) = store_session(state, &session).await {
+    let store_result = store_session(state, &session).await;
+    timings.record("delegation", delegation_start.elapsed());
+    if let Err(err) = store_result {
         return response_json_error(BenchError::internal(err.to_string()), &timings);
     }
-    timings.record("sqlite", store_start.elapsed());
 
     let response = AuthVerifyResponse {
         ok: true,
@@ -1182,13 +1212,12 @@ pub async fn block_put(
     }
 
     let etag = format!("\"{}\"", blake3_content_hash(&bytes));
-    let sqlite_start = Instant::now();
-    let existed = match upsert_block(state, multihash, &bytes, bytes.len(), &etag).await {
+    let upsert_result = upsert_block(state, multihash, &bytes, bytes.len(), &etag).await;
+    timings.record("block_io", block_io_start.elapsed());
+    let existed = match upsert_result {
         Ok(created) => !created,
         Err(err) => return response_json_error(BenchError::internal(err.to_string()), &timings),
     };
-    timings.record("block_io", block_io_start.elapsed());
-    timings.record("sqlite", sqlite_start.elapsed());
 
     let response = BlockResponse {
         ok: true,
@@ -1251,14 +1280,15 @@ pub async fn block_get(
     timings.record("delegation", delegation_start.elapsed());
 
     let block_io_start = Instant::now();
-    let row = match load_block(state.inner().db(), multihash).await {
+    let row_result = load_block(state.inner().db(), multihash).await;
+    timings.record("block_io", block_io_start.elapsed());
+    let row = match row_result {
         Ok(Some(row)) => row,
         Ok(None) => {
             return response_json_error(BenchError::block_not_found("block not found"), &timings)
         }
         Err(err) => return response_json_error(BenchError::internal(err.to_string()), &timings),
     };
-    timings.record("block_io", block_io_start.elapsed());
 
     let serialize_start = Instant::now();
     timings.record("serialize", serialize_start.elapsed());
