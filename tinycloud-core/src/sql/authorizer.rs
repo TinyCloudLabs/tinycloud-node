@@ -27,18 +27,91 @@ fn can_write_table(ability: &str, is_admin: bool, table_name: &str) -> bool {
         || (resolve_alias(ability) == "tinycloud.sql/schema" && is_sqlite_schema_table(table_name))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SchemaDdlKind {
+    AlterTable,
+    DropIndex,
+    DropTable,
+}
+
+#[derive(Debug)]
+struct SchemaDdlState {
+    database_name: Option<String>,
+    kind: SchemaDdlKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SchemaDropKind {
+    Table,
+    View,
+}
+
+#[derive(Debug)]
+struct SchemaDropTarget {
+    database_name: Option<String>,
+    object_name: String,
+    kind: SchemaDropKind,
+}
+
+fn schema_ddl_matches_database(
+    database_name: Option<&str>,
+    schema_ddl_state: Option<&SchemaDdlState>,
+    kinds: &[SchemaDdlKind],
+) -> bool {
+    schema_ddl_state.is_some_and(|state| {
+        state.database_name.as_deref() == database_name && kinds.contains(&state.kind)
+    })
+}
+
+fn is_sqlite_stat_table(table_name: &str) -> bool {
+    matches!(table_name, "sqlite_stat1" | "sqlite_stat4")
+}
+
+fn can_update_table(
+    ability: &str,
+    is_admin: bool,
+    database_name: Option<&str>,
+    table_name: &str,
+    schema_ddl_state: Option<&SchemaDdlState>,
+) -> bool {
+    can_write_table(ability, is_admin, table_name)
+        || (resolve_alias(ability) == "tinycloud.sql/schema"
+            && matches!(
+                table_name,
+                "sqlite_sequence" | "sqlite_stat1" | "sqlite_stat4"
+            )
+            && schema_ddl_matches_database(
+                database_name,
+                schema_ddl_state,
+                &[SchemaDdlKind::AlterTable],
+            ))
+}
+
 fn can_delete_table(
     ability: &str,
     is_admin: bool,
     database_name: Option<&str>,
     table_name: &str,
-    schema_drop_target: Option<&(Option<String>, String)>,
+    schema_ddl_state: Option<&SchemaDdlState>,
+    schema_drop_target: Option<&SchemaDropTarget>,
 ) -> bool {
     can_write_table(ability, is_admin, table_name)
         || (resolve_alias(ability) == "tinycloud.sql/schema"
-            && schema_drop_target.is_some_and(|(target_database, target_name)| {
-                target_database.as_deref() == database_name && target_name == table_name
-            }))
+            && (schema_drop_target.is_some_and(|target| {
+                target.database_name.as_deref() == database_name && target.object_name == table_name
+            }) || (table_name == "sqlite_sequence"
+                && schema_drop_target.is_some_and(|target| target.kind == SchemaDropKind::Table)
+                && schema_ddl_matches_database(
+                    database_name,
+                    schema_ddl_state,
+                    &[SchemaDdlKind::DropTable],
+                ))
+                || (is_sqlite_stat_table(table_name)
+                    && schema_ddl_matches_database(
+                        database_name,
+                        schema_ddl_state,
+                        &[SchemaDdlKind::DropIndex, SchemaDdlKind::DropTable],
+                    ))))
 }
 
 pub fn create_authorizer(
@@ -47,7 +120,9 @@ pub fn create_authorizer(
     is_admin: bool,
 ) -> impl FnMut(AuthContext<'_>) -> Authorization {
     let mut schema_ddl_authorized = false;
-    let mut schema_drop_target: Option<(Option<String>, String)> = None;
+    let mut schema_ddl_state: Option<SchemaDdlState> = None;
+    let mut schema_drop_target: Option<SchemaDropTarget> = None;
+    let mut alter_table_authorized = false;
     move |ctx: AuthContext<'_>| match ctx.action {
         // Always deny attach/detach
         AuthAction::Attach { .. } | AuthAction::Detach { .. } => Authorization::Deny,
@@ -173,7 +248,16 @@ pub fn create_authorizer(
                 "tanh",
                 "trunc",
             ];
-            if allowed_functions.contains(&function_name) {
+            let alter_table_functions = [
+                "sqlite_rename_column",
+                "sqlite_rename_table",
+                "sqlite_rename_test",
+                "sqlite_drop_column",
+                "sqlite_rename_quotefix",
+            ];
+            if allowed_functions.contains(&function_name)
+                || (alter_table_authorized && alter_table_functions.contains(&function_name))
+            {
                 Authorization::Allow
             } else {
                 Authorization::Deny
@@ -225,6 +309,7 @@ pub fn create_authorizer(
                 is_admin,
                 ctx.database_name,
                 table_name,
+                schema_ddl_state.as_ref(),
                 schema_drop_target.as_ref(),
             ) {
                 return Authorization::Deny;
@@ -244,7 +329,13 @@ pub fn create_authorizer(
             table_name,
             column_name,
         } => {
-            if !can_write_table(ability.as_str(), is_admin, table_name) {
+            if !can_update_table(
+                ability.as_str(),
+                is_admin,
+                ctx.database_name,
+                table_name,
+                schema_ddl_state.as_ref(),
+            ) {
                 return Authorization::Deny;
             }
             if let Some(ref caveats) = caveats {
@@ -281,8 +372,30 @@ pub fn create_authorizer(
         }
         | AuthAction::DropTempTable {
             table_name: object_name,
+        } => {
+            if !(is_admin
+                || ability_matches(ability.as_str(), "tinycloud.sql/write")
+                || ability_matches(ability.as_str(), "tinycloud.sql/schema"))
+            {
+                Authorization::Deny
+            } else {
+                if !is_admin && resolve_alias(ability.as_str()) == "tinycloud.sql/schema" {
+                    schema_ddl_authorized = true;
+                    schema_ddl_state = Some(SchemaDdlState {
+                        database_name: ctx.database_name.map(str::to_owned),
+                        kind: SchemaDdlKind::DropTable,
+                    });
+                    schema_drop_target = Some(SchemaDropTarget {
+                        database_name: ctx.database_name.map(str::to_owned),
+                        object_name: object_name.to_owned(),
+                        kind: SchemaDropKind::Table,
+                    });
+                }
+                Authorization::Allow
+            }
         }
-        | AuthAction::DropView {
+
+        AuthAction::DropView {
             view_name: object_name,
         }
         | AuthAction::DropTempView {
@@ -296,23 +409,58 @@ pub fn create_authorizer(
             } else {
                 if !is_admin && resolve_alias(ability.as_str()) == "tinycloud.sql/schema" {
                     schema_ddl_authorized = true;
-                    schema_drop_target = Some((
-                        ctx.database_name.map(str::to_owned),
-                        object_name.to_owned(),
-                    ));
+                    schema_drop_target = Some(SchemaDropTarget {
+                        database_name: ctx.database_name.map(str::to_owned),
+                        object_name: object_name.to_owned(),
+                        kind: SchemaDropKind::View,
+                    });
                 }
                 Authorization::Allow
             }
         }
 
-        AuthAction::AlterTable { .. }
-        | AuthAction::CreateIndex { .. }
-        | AuthAction::DropIndex { .. }
+        AuthAction::AlterTable { database_name, .. } => {
+            if !(is_admin
+                || ability_matches(ability.as_str(), "tinycloud.sql/write")
+                || ability_matches(ability.as_str(), "tinycloud.sql/schema"))
+            {
+                Authorization::Deny
+            } else {
+                alter_table_authorized = true;
+                if !is_admin && resolve_alias(ability.as_str()) == "tinycloud.sql/schema" {
+                    schema_ddl_authorized = true;
+                    schema_ddl_state = Some(SchemaDdlState {
+                        database_name: Some(database_name.to_owned()),
+                        kind: SchemaDdlKind::AlterTable,
+                    });
+                }
+                Authorization::Allow
+            }
+        }
+
+        AuthAction::DropIndex { .. } | AuthAction::DropTempIndex { .. } => {
+            if !(is_admin
+                || ability_matches(ability.as_str(), "tinycloud.sql/write")
+                || ability_matches(ability.as_str(), "tinycloud.sql/schema"))
+            {
+                Authorization::Deny
+            } else {
+                if !is_admin && resolve_alias(ability.as_str()) == "tinycloud.sql/schema" {
+                    schema_ddl_authorized = true;
+                    schema_ddl_state = Some(SchemaDdlState {
+                        database_name: ctx.database_name.map(str::to_owned),
+                        kind: SchemaDdlKind::DropIndex,
+                    });
+                }
+                Authorization::Allow
+            }
+        }
+
+        AuthAction::CreateIndex { .. }
         | AuthAction::CreateTrigger { .. }
         | AuthAction::DropTrigger { .. }
         | AuthAction::CreateView { .. }
         | AuthAction::CreateTempIndex { .. }
-        | AuthAction::DropTempIndex { .. }
         | AuthAction::CreateTempTrigger { .. }
         | AuthAction::DropTempTrigger { .. }
         | AuthAction::CreateTempView { .. }
@@ -780,5 +928,286 @@ mod tests {
                 "expected an authorization error, got: {error}"
             );
         }
+    }
+
+    #[test]
+    fn schema_ability_renames_and_drops_autoincrement_tables_in_main_and_temp() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT);
+             CREATE TEMP TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT);
+             INSERT INTO main.items DEFAULT VALUES;
+             INSERT INTO temp.items DEFAULT VALUES;",
+        )
+        .unwrap();
+
+        execute_under_authorizer(
+            &conn,
+            "tinycloud.sql/schema",
+            false,
+            "ALTER TABLE main.items RENAME TO main_items",
+        )
+        .expect("schema authority should rename a main AUTOINCREMENT table");
+        let main_sequence_name: String = conn
+            .query_row("SELECT name FROM main.sqlite_sequence", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let temp_sequence_name: String = conn
+            .query_row("SELECT name FROM temp.sqlite_sequence", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(main_sequence_name, "main_items");
+        assert_eq!(temp_sequence_name, "items");
+
+        execute_under_authorizer(
+            &conn,
+            "tinycloud.sql/schema",
+            false,
+            "ALTER TABLE temp.items RENAME TO temp_items",
+        )
+        .expect("schema authority should rename a temp AUTOINCREMENT table");
+
+        execute_under_authorizer(
+            &conn,
+            "tinycloud.sql/schema",
+            false,
+            "DROP TABLE main.main_items",
+        )
+        .expect("schema authority should drop a main AUTOINCREMENT table");
+        let main_sequence_rows: i64 = conn
+            .query_row("SELECT count(*) FROM main.sqlite_sequence", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let temp_sequence_name: String = conn
+            .query_row("SELECT name FROM temp.sqlite_sequence", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(main_sequence_rows, 0);
+        assert_eq!(temp_sequence_name, "temp_items");
+
+        execute_under_authorizer(
+            &conn,
+            "tinycloud.sql/schema",
+            false,
+            "DROP TABLE temp.temp_items",
+        )
+        .expect("schema authority should drop a temp AUTOINCREMENT table");
+        let temp_sequence_rows: i64 = conn
+            .query_row("SELECT count(*) FROM temp.sqlite_sequence", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(temp_sequence_rows, 0);
+    }
+
+    #[test]
+    fn schema_ability_renames_and_drops_columns_in_main_and_temp() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE column_items (id INTEGER, old_value TEXT, removable TEXT);
+             CREATE TEMP TABLE column_items (id INTEGER, old_value TEXT, removable TEXT);
+             INSERT INTO main.column_items VALUES (1, 'main', 'unused');
+             INSERT INTO temp.column_items VALUES (2, 'temp', 'unused');",
+        )
+        .unwrap();
+
+        for database in ["main", "temp"] {
+            execute_under_authorizer(
+                &conn,
+                "tinycloud.sql/schema",
+                false,
+                &format!(
+                    "ALTER TABLE {database}.column_items RENAME COLUMN old_value TO new_value"
+                ),
+            )
+            .unwrap_or_else(|error| panic!("schema rename column failed in {database}: {error}"));
+            execute_under_authorizer(
+                &conn,
+                "tinycloud.sql/schema",
+                false,
+                &format!("ALTER TABLE {database}.column_items DROP COLUMN removable"),
+            )
+            .unwrap_or_else(|error| panic!("schema drop column failed in {database}: {error}"));
+        }
+
+        let main_value: String = conn
+            .query_row("SELECT new_value FROM main.column_items", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let temp_value: String = conn
+            .query_row("SELECT new_value FROM temp.column_items", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(main_value, "main");
+        assert_eq!(temp_value, "temp");
+    }
+
+    #[test]
+    fn schema_ability_drops_analyzed_indexes_in_main_and_temp() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE indexed_items (value TEXT);
+             CREATE INDEX shared_index ON indexed_items(value);
+             INSERT INTO main.indexed_items VALUES ('main');
+             ANALYZE main.shared_index;
+             CREATE TEMP TABLE indexed_items (value TEXT);
+             CREATE INDEX temp.shared_index ON indexed_items(value);
+             INSERT INTO temp.indexed_items VALUES ('temp');
+             ANALYZE temp.shared_index;",
+        )
+        .unwrap();
+
+        execute_under_authorizer(
+            &conn,
+            "tinycloud.sql/schema",
+            false,
+            "DROP INDEX main.shared_index",
+        )
+        .expect("schema authority should drop an analyzed main index");
+        let main_index_rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM main.sqlite_schema WHERE type = 'index' AND name = 'shared_index'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let temp_index_rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM temp.sqlite_schema WHERE type = 'index' AND name = 'shared_index'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(main_index_rows, 0);
+        assert_eq!(temp_index_rows, 1);
+
+        execute_under_authorizer(
+            &conn,
+            "tinycloud.sql/schema",
+            false,
+            "DROP INDEX temp.shared_index",
+        )
+        .expect("schema authority should drop an analyzed temp index");
+    }
+
+    #[test]
+    fn schema_auxiliary_access_requires_matching_ddl_state() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT);
+             CREATE INDEX items_value ON items(value);
+             INSERT INTO items(value) VALUES ('value');
+             ANALYZE main.items_value;",
+        )
+        .unwrap();
+
+        for sql in [
+            "DELETE FROM main.sqlite_sequence",
+            "UPDATE main.sqlite_sequence SET name = 'other'",
+            "DELETE FROM main.sqlite_stat1",
+            "DELETE FROM main.sqlite_stat4",
+        ] {
+            let error = execute_under_authorizer(&conn, "tinycloud.sql/schema", false, sql)
+                .expect_err("schema authority must not directly mutate auxiliary tables");
+            assert!(
+                error.to_string().contains("not authorized"),
+                "expected an authorization error for {sql}, got: {error}"
+            );
+        }
+
+        let mut auth = create_authorizer(None, "tinycloud.sql/schema".to_string(), false);
+        for function_name in [
+            "sqlite_rename_column",
+            "sqlite_rename_table",
+            "sqlite_rename_test",
+            "sqlite_drop_column",
+            "sqlite_rename_quotefix",
+        ] {
+            assert_eq!(
+                auth(AuthContext {
+                    action: AuthAction::Function { function_name },
+                    database_name: None,
+                    accessor: None,
+                }),
+                Authorization::Deny,
+                "internal ALTER function must be denied before an ALTER callback"
+            );
+        }
+        assert_eq!(
+            auth(AuthContext {
+                action: AuthAction::AlterTable {
+                    database_name: "main",
+                    table_name: "items",
+                },
+                database_name: None,
+                accessor: None,
+            }),
+            Authorization::Allow
+        );
+        for function_name in [
+            "sqlite_rename_column",
+            "sqlite_rename_table",
+            "sqlite_rename_test",
+            "sqlite_drop_column",
+            "sqlite_rename_quotefix",
+        ] {
+            assert_eq!(
+                auth(AuthContext {
+                    action: AuthAction::Function { function_name },
+                    database_name: None,
+                    accessor: None,
+                }),
+                Authorization::Allow,
+                "internal ALTER function should follow an authorized ALTER callback"
+            );
+        }
+        assert_eq!(
+            auth(AuthContext {
+                action: AuthAction::Update {
+                    table_name: "sqlite_sequence",
+                    column_name: "name",
+                },
+                database_name: Some("temp"),
+                accessor: None,
+            }),
+            Authorization::Deny,
+            "main ALTER state must not authorize a temp auxiliary update"
+        );
+
+        let caveats = SqlCaveats {
+            read_only: Some(true),
+            ..SqlCaveats::default()
+        };
+        let mut caveated_auth =
+            create_authorizer(Some(caveats), "tinycloud.sql/schema".to_string(), false);
+        assert_eq!(
+            caveated_auth(AuthContext {
+                action: AuthAction::AlterTable {
+                    database_name: "main",
+                    table_name: "items",
+                },
+                database_name: None,
+                accessor: None,
+            }),
+            Authorization::Allow
+        );
+        assert_eq!(
+            caveated_auth(AuthContext {
+                action: AuthAction::Update {
+                    table_name: "sqlite_sequence",
+                    column_name: "name",
+                },
+                database_name: Some("main"),
+                accessor: None,
+            }),
+            Authorization::Deny,
+            "read-only caveats must still reject DDL-internal auxiliary writes"
+        );
     }
 }
