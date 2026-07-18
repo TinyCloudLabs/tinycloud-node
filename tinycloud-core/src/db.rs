@@ -20,7 +20,7 @@ use sea_orm::{
     entity::prelude::*,
     error::{DbErr, RuntimeErr, SqlxError},
     query::*,
-    sea_query::OnConflict,
+    sea_query::{Alias, Expr, LikeExpr, OnConflict, Query},
     ActiveValue::Set,
     ConnectionTrait, DatabaseTransaction, IntoActiveModel, TransactionTrait,
 };
@@ -1731,25 +1731,102 @@ async fn list_bounded<C: ConnectionTrait>(
     prefix: &Path,
     limit: Option<usize>,
 ) -> Result<(Vec<Path>, bool), DbErr> {
-    let mut query = kv_write::Entity::find()
-        .select_only()
-        .column(kv_write::Column::Key)
-        .distinct()
-        .filter(
-            Condition::all()
-                .add(kv_write::Column::Key.starts_with(prefix.as_str()))
-                .add(kv_write::Column::Space.eq(SpaceIdWrap(space_id.clone()))),
+    let newer = Alias::new("newer_kv_write");
+    let newer_order = Condition::any()
+        .add(
+            Expr::col((newer.clone(), kv_write::Column::Seq))
+                .gt(Expr::col((kv_write::Entity, kv_write::Column::Seq))),
         )
-        .left_join(kv_delete::Entity)
-        .filter(kv_delete::Column::InvocationId.is_null())
-        .order_by_asc(kv_write::Column::Key);
+        .add(
+            Condition::all()
+                .add(
+                    Expr::col((newer.clone(), kv_write::Column::Seq))
+                        .equals((kv_write::Entity, kv_write::Column::Seq)),
+                )
+                .add(
+                    Expr::col((newer.clone(), kv_write::Column::Epoch))
+                        .gt(Expr::col((kv_write::Entity, kv_write::Column::Epoch))),
+                ),
+        )
+        .add(
+            Condition::all()
+                .add(
+                    Expr::col((newer.clone(), kv_write::Column::Seq))
+                        .equals((kv_write::Entity, kv_write::Column::Seq)),
+                )
+                .add(
+                    Expr::col((newer.clone(), kv_write::Column::Epoch))
+                        .equals((kv_write::Entity, kv_write::Column::Epoch)),
+                )
+                .add(
+                    Expr::col((newer.clone(), kv_write::Column::EpochSeq))
+                        .gt(Expr::col((kv_write::Entity, kv_write::Column::EpochSeq))),
+                ),
+        );
+    let newer_write = Query::select()
+        .expr(Expr::val(1))
+        .from_as(kv_write::Entity, newer.clone())
+        .cond_where(
+            Condition::all()
+                .add(
+                    Expr::col((newer.clone(), kv_write::Column::Space))
+                        .equals((kv_write::Entity, kv_write::Column::Space)),
+                )
+                .add(
+                    Expr::col((newer.clone(), kv_write::Column::Key))
+                        .equals((kv_write::Entity, kv_write::Column::Key)),
+                )
+                .add(newer_order),
+        )
+        .to_owned();
+    let escaped_prefix = prefix
+        .as_str()
+        .replace('!', "!!")
+        .replace('%', "!%")
+        .replace('_', "!_");
+    let mut query = Query::select();
+    query
+        .column((kv_write::Entity, kv_write::Column::Key))
+        .from(kv_write::Entity)
+        .left_join(
+            kv_delete::Entity,
+            Condition::all()
+                .add(
+                    Expr::col((kv_write::Entity, kv_write::Column::Space))
+                        .equals((kv_delete::Entity, kv_delete::Column::Space)),
+                )
+                .add(
+                    Expr::col((kv_write::Entity, kv_write::Column::Key))
+                        .equals((kv_delete::Entity, kv_delete::Column::Key)),
+                )
+                .add(
+                    Expr::col((kv_write::Entity, kv_write::Column::Invocation))
+                        .equals((kv_delete::Entity, kv_delete::Column::DeletedInvocationId)),
+                ),
+        )
+        .cond_where(
+            Condition::all()
+                .add(
+                    Expr::col((kv_write::Entity, kv_write::Column::Key))
+                        .like(LikeExpr::new(format!("{escaped_prefix}%")).escape('!')),
+                )
+                .add(
+                    Expr::col((kv_write::Entity, kv_write::Column::Space))
+                        .eq(SpaceIdWrap(space_id.clone())),
+                )
+                .add(Expr::col((kv_delete::Entity, kv_delete::Column::InvocationId)).is_null())
+                .add(Condition::all().not().add(Expr::exists(newer_write))),
+        )
+        .order_by((kv_write::Entity, kv_write::Column::Key), Order::Asc);
     if let Some(limit) = limit {
-        query = query.limit(limit.saturating_add(1) as u64);
+        query.limit(limit.saturating_add(1) as u64);
     }
-    let mut list = query
-        .into_tuple::<String>()
-        .all(db)
+    let mut list = db
+        .query_all(db.get_database_backend().build(&query))
         .await?
+        .into_iter()
+        .map(|row| row.try_get::<String>("", kv_write::Column::Key.as_str()))
+        .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .map(|key| key.parse())
         .collect::<Result<Vec<Path>, _>>()
@@ -1829,21 +1906,26 @@ async fn get_kv_entity<C: ConnectionTrait>(
     //         .await?
     //         .map(|(kv, _)| kv)
     // } else {
-    // we want to find the latest kv_write which is not deleted
-    Ok(kv_write::Entity::find()
-        .filter(
-            Condition::all()
-                .add(kv_write::Column::Key.eq(key.as_str()))
-                .add(kv_write::Column::Space.eq(SpaceIdWrap(space_id.clone()))),
-        )
-        .order_by_desc(kv_write::Column::Seq)
-        .order_by_desc(kv_write::Column::Epoch)
-        .order_by_desc(kv_write::Column::EpochSeq)
-        .find_also_related(kv_delete::Entity)
-        .filter(kv_delete::Column::InvocationId.is_null())
-        .one(db)
-        .await?
-        .map(|(kv, _)| kv))
+    // A delete tombstones the latest write. Select that write before checking
+    // its tombstone so older versions cannot reappear after deletion.
+    Ok(
+        match kv_write::Entity::find()
+            .filter(
+                Condition::all()
+                    .add(kv_write::Column::Key.eq(key.as_str()))
+                    .add(kv_write::Column::Space.eq(SpaceIdWrap(space_id.clone()))),
+            )
+            .order_by_desc(kv_write::Column::Seq)
+            .order_by_desc(kv_write::Column::Epoch)
+            .order_by_desc(kv_write::Column::EpochSeq)
+            .find_also_related(kv_delete::Entity)
+            .one(db)
+            .await?
+        {
+            Some((_, Some(_))) | None => None,
+            Some((kv, None)) => Some(kv),
+        },
+    )
 }
 
 async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
@@ -2578,7 +2660,10 @@ mod test {
         .unwrap();
 
         let shared_value = crate::hash::hash(b"shared-value");
-        for (index, key) in ["a", "a", "b", "c"].into_iter().enumerate() {
+        for (index, key) in ["a", "a", "b", "c", "literal%key", "literalXkey"]
+            .into_iter()
+            .enumerate()
+        {
             let invocation_id = crate::hash::hash(format!("invocation-{index}").as_bytes());
             let epoch_id = crate::hash::hash(format!("epoch-{index}").as_bytes());
             invocation::ActiveModel {
@@ -2640,7 +2725,7 @@ mod test {
             paths.iter().map(Path::as_str).collect::<Vec<_>>(),
             vec!["a", "b", "c"]
         );
-        assert!(!truncated);
+        assert!(truncated);
         assert_eq!(
             get_kv_entity(&db.conn, &space, &"b".parse().unwrap())
                 .await
@@ -2657,6 +2742,50 @@ mod test {
                 .value,
             shared_value
         );
+
+        let (paths, truncated) =
+            list_bounded(&db.conn, &space, &"literal%".parse().unwrap(), Some(10))
+                .await
+                .unwrap();
+        assert_eq!(
+            paths.iter().map(Path::as_str).collect::<Vec<_>>(),
+            vec!["literal%key"]
+        );
+        assert!(!truncated);
+
+        let delete_invocation = crate::hash::hash(b"delete-invocation");
+        invocation::ActiveModel {
+            id: Set(delete_invocation),
+            invoker: Set(actor_id.to_string()),
+            issued_at: Set(OffsetDateTime::now_utc()),
+            facts: Set(None),
+            serialization: Set(vec![6]),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        kv_delete::ActiveModel {
+            invocation_id: Set(delete_invocation),
+            space: Set(SpaceIdWrap(space.clone())),
+            key: Set("a".parse::<Path>().unwrap().into()),
+            deleted_invocation_id: Set(crate::hash::hash(b"invocation-1")),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        assert!(get_kv_entity(&db.conn, &space, &"a".parse().unwrap())
+            .await
+            .unwrap()
+            .is_none());
+        let (paths, truncated) = list_bounded(&db.conn, &space, &"".parse().unwrap(), Some(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            paths.iter().map(Path::as_str).collect::<Vec<_>>(),
+            vec!["b", "c", "literal%key", "literalXkey"]
+        );
+        assert!(!truncated);
     }
 
     #[tokio::test]

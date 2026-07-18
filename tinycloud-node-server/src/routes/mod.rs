@@ -1298,6 +1298,9 @@ async fn invoke_impl(
                     TxStoreError::KvPreconditionFailed => Status::PreconditionFailed,
                     TxStoreError::KvSerializationConflict => Status::ServiceUnavailable,
                     TxStoreError::KvResponseTooLarge { .. } => Status::PayloadTooLarge,
+                    TxStoreError::Tx(TxError::InvalidInvocation(
+                        invocation_model::InvocationError::MissingKvWrite(_),
+                    )) => Status::NotFound,
                     TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
                         database_error_status(error)
                     }
