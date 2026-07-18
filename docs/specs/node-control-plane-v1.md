@@ -515,7 +515,10 @@ Purpose: persist a safe config overlay.
 
 The request body is a partial update document with a strict whitelist. Omitted
 fields are unchanged. `null` resets a whitelisted field to its built-in default;
-for `storage.limitBytes`, `null` clears the limit entirely.
+for `storage.limitBytes`, `null` clears the limit entirely. TOML has no native
+`null`, so on disk the runtime overlay stores a cleared `storage.limitBytes` as
+`0`; that stored `0` is the null-clear sentinel and is never a real zero-byte
+quota.
 
 Allowed fields:
 
