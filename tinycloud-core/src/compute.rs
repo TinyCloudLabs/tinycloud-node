@@ -56,7 +56,7 @@ pub enum ComputeRequest {
         function: String,
         #[serde(default)]
         wasm_b64: Option<String>,
-        /// Encoded D_fn delegation header (or its CID if pre-submitted).
+        /// Encoded D_fn delegation header.
         #[serde(default)]
         grant: Option<String>,
         /// Caveats for the deployed function. A typed `ComputeCaveats` lands
