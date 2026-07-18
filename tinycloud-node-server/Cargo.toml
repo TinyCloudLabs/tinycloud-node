@@ -88,6 +88,18 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 default = []
 dstack = []
 duckdb = ["tinycloud-core/duckdb"]
+compute = ["tinycloud-core/compute"]
+
+# P0 (compute-service-implementation-plan.md): this target only makes sense
+# with the compute feature enabled -- ComputeRequest/ComputeService don't
+# exist without it. `required-features` makes cargo SKIP (not build) this
+# target on a plain `cargo test`, and ERROR if it's explicitly requested
+# (`--test compute_skeleton`) without `--features compute`, instead of
+# silently reporting zero tests (the C5 failure mode the plan bans).
+[[test]]
+name = "compute_skeleton"
+path = "tests/compute_skeleton.rs"
+required-features = ["compute"]
 
 # cargo-binstall support: allows `cargo binstall tinycloud-node`
 [package.metadata.binstall]
