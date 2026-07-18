@@ -19,19 +19,23 @@ fn is_sqlite_schema_table(table_name: &str) -> bool {
     )
 }
 
-fn can_write_table(
+fn can_write_table(ability: &str, is_admin: bool, table_name: &str) -> bool {
+    // The second clause is an exact-tier match on `schema` (writes to the
+    // sqlite schema tables during DDL), NOT a confers-check — so compare the
+    // alias-resolved URN rather than using `ability_matches`.
+    can_write_data(ability, is_admin)
+        || (resolve_alias(ability) == "tinycloud.sql/schema" && is_sqlite_schema_table(table_name))
+}
+
+fn can_delete_table(
     ability: &str,
     is_admin: bool,
     table_name: &str,
-    schema_ddl_authorized: bool,
+    schema_drop_target: Option<&str>,
 ) -> bool {
-    // The second clause is an exact-tier match on `schema` (writes to the
-    // sqlite schema tables and DDL-internal writes after SQLite reports the
-    // schema action), NOT a confers-check — so compare the alias-resolved URN
-    // rather than using `ability_matches`.
-    can_write_data(ability, is_admin)
+    can_write_table(ability, is_admin, table_name)
         || (resolve_alias(ability) == "tinycloud.sql/schema"
-            && (is_sqlite_schema_table(table_name) || schema_ddl_authorized))
+            && schema_drop_target == Some(table_name))
 }
 
 pub fn create_authorizer(
@@ -40,6 +44,7 @@ pub fn create_authorizer(
     is_admin: bool,
 ) -> impl FnMut(AuthContext<'_>) -> Authorization {
     let mut schema_ddl_authorized = false;
+    let mut schema_drop_target: Option<String> = None;
     move |ctx: AuthContext<'_>| match ctx.action {
         // Always deny attach/detach
         AuthAction::Attach { .. } | AuthAction::Detach { .. } => Authorization::Deny,
@@ -196,12 +201,27 @@ pub fn create_authorizer(
         }
 
         // Write operations
-        AuthAction::Insert { table_name } | AuthAction::Delete { table_name } => {
-            if !can_write_table(
+        AuthAction::Insert { table_name } => {
+            if !can_write_table(ability.as_str(), is_admin, table_name) {
+                return Authorization::Deny;
+            }
+            if let Some(ref caveats) = caveats {
+                if !caveats.is_write_allowed() {
+                    return Authorization::Deny;
+                }
+                if !caveats.is_table_allowed(table_name) {
+                    return Authorization::Deny;
+                }
+            }
+            Authorization::Allow
+        }
+
+        AuthAction::Delete { table_name } => {
+            if !can_delete_table(
                 ability.as_str(),
                 is_admin,
                 table_name,
-                schema_ddl_authorized,
+                schema_drop_target.as_deref(),
             ) {
                 return Authorization::Deny;
             }
@@ -220,12 +240,7 @@ pub fn create_authorizer(
             table_name,
             column_name,
         } => {
-            if !can_write_table(
-                ability.as_str(),
-                is_admin,
-                table_name,
-                schema_ddl_authorized,
-            ) {
+            if !can_write_table(ability.as_str(), is_admin, table_name) {
                 return Authorization::Deny;
             }
             if let Some(ref caveats) = caveats {
@@ -243,11 +258,36 @@ pub fn create_authorizer(
         }
 
         // DDL operations
-        AuthAction::CreateTable { .. }
-        | AuthAction::CreateTempTable { .. }
-        | AuthAction::DropTable { .. }
-        | AuthAction::DropTempTable { .. }
-        | AuthAction::AlterTable { .. }
+        AuthAction::CreateTable { .. } | AuthAction::CreateTempTable { .. } => {
+            // Do not enable application-table reads for CREATE TABLE. SQLite's
+            // authorizer does not emit an Insert callback for CTAS result rows,
+            // so allowing its source SELECT would let schema authority copy data.
+            if is_admin
+                || ability_matches(ability.as_str(), "tinycloud.sql/write")
+                || ability_matches(ability.as_str(), "tinycloud.sql/schema")
+            {
+                Authorization::Allow
+            } else {
+                Authorization::Deny
+            }
+        }
+
+        AuthAction::DropTable { table_name } | AuthAction::DropTempTable { table_name } => {
+            if !(is_admin
+                || ability_matches(ability.as_str(), "tinycloud.sql/write")
+                || ability_matches(ability.as_str(), "tinycloud.sql/schema"))
+            {
+                Authorization::Deny
+            } else {
+                if !is_admin && resolve_alias(ability.as_str()) == "tinycloud.sql/schema" {
+                    schema_ddl_authorized = true;
+                    schema_drop_target = Some(table_name.to_owned());
+                }
+                Authorization::Allow
+            }
+        }
+
+        AuthAction::AlterTable { .. }
         | AuthAction::CreateIndex { .. }
         | AuthAction::DropIndex { .. }
         | AuthAction::CreateTrigger { .. }
@@ -560,6 +600,104 @@ mod tests {
         assert!(
             error.to_string().contains("not authorized"),
             "expected an authorization error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn schema_ability_cannot_populate_create_table_as_select() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE source (id INTEGER); INSERT INTO source VALUES (1)")
+            .unwrap();
+
+        let error = execute_under_authorizer(
+            &conn,
+            "tinycloud.sql/schema",
+            false,
+            "CREATE TABLE copied AS SELECT id FROM source",
+        )
+        .expect_err("schema authority must not insert CTAS result rows");
+        assert!(
+            error.to_string().contains("not authorized")
+                || error.to_string().contains("is prohibited"),
+            "expected an authorization error, got: {error}"
+        );
+        let copied_tables: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'copied'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(copied_tables, 0, "failed CTAS must roll back its table");
+    }
+
+    #[test]
+    fn schema_drop_cannot_cascade_into_another_table() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE parents (id INTEGER PRIMARY KEY);
+             CREATE TABLE children (
+                 id INTEGER PRIMARY KEY,
+                 parent_id INTEGER REFERENCES parents(id) ON DELETE CASCADE
+             );
+             INSERT INTO parents VALUES (1);
+             INSERT INTO children VALUES (1, 1);",
+        )
+        .unwrap();
+
+        let error =
+            execute_under_authorizer(&conn, "tinycloud.sql/schema", false, "DROP TABLE parents")
+                .expect_err("schema authority must not cascade deletes into another table");
+        assert!(
+            error.to_string().contains("not authorized"),
+            "expected an authorization error, got: {error}"
+        );
+        let parent_rows: i64 = conn
+            .query_row("SELECT count(*) FROM parents", [], |row| row.get(0))
+            .unwrap();
+        let child_rows: i64 = conn
+            .query_row("SELECT count(*) FROM children", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(parent_rows, 1, "failed DROP must retain parent rows");
+        assert_eq!(child_rows, 1, "failed DROP must retain child rows");
+    }
+
+    #[test]
+    fn schema_drop_cannot_update_another_table_via_set_null() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE parents (id INTEGER PRIMARY KEY);
+             CREATE TABLE children (
+                 id INTEGER PRIMARY KEY,
+                 parent_id INTEGER REFERENCES parents(id) ON DELETE SET NULL
+             );
+             INSERT INTO parents VALUES (1);
+             INSERT INTO children VALUES (1, 1);",
+        )
+        .unwrap();
+
+        let error =
+            execute_under_authorizer(&conn, "tinycloud.sql/schema", false, "DROP TABLE parents")
+                .expect_err("schema authority must not update another table through SET NULL");
+        assert!(
+            error.to_string().contains("not authorized"),
+            "expected an authorization error, got: {error}"
+        );
+        let parent_rows: i64 = conn
+            .query_row("SELECT count(*) FROM parents", [], |row| row.get(0))
+            .unwrap();
+        let child_parent_id: Option<i64> = conn
+            .query_row("SELECT parent_id FROM children WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(parent_rows, 1, "failed DROP must retain parent rows");
+        assert_eq!(
+            child_parent_id,
+            Some(1),
+            "failed DROP must retain the child foreign key"
         );
     }
 }
