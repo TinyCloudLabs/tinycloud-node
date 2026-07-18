@@ -461,6 +461,8 @@ secret = "{}"
             SqlRequest::Query {
                 sql: "SELECT * FROM conversation".to_string(),
                 params: vec![],
+                max_rows: None,
+                max_bytes: None,
             },
             "sql-raw-query-blocked",
         ),
