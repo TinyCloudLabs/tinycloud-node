@@ -379,7 +379,6 @@
     <li><a href="#p0"><span class="n">P0</span>Walking Skeleton</a></li>
     <li><a href="#p1"><span class="n">P1</span>Deploy Path</a></li>
     <li><a href="#p2"><span class="n">P2</span>Wasmtime Execute</a></li>
-    <li><a href="#p3"><span class="n">P3</span>SDK Surface</a></li>
     <li><a href="#p4"><span class="n">P4</span>Deferred</a></li>
     <li><a href="#gates"><span class="n">03</span>Cross-Cutting Gates</a></li>
     <li class="xlink"><a href="index.html">← Spec</a></li>
@@ -394,16 +393,18 @@
     <span>tinycloud-node</span>
     <span>specs/compute-service-implementation-plan.md</span>
     <span>smithers execution</span>
+    <span>codex-reviewed · <a href="../compute-service-plan-codex-review.md">C1–C12 applied</a></span>
   </div>
-  <h1>Smallest vertical slice first. <em>Every phase ends in a gate.</em></h1>
+  <h1>Smallest vertical slice first. <em>One human gate; every other check asserts.</em></h1>
   <p class="dek">
-    The lean Smithers plan for landing the compute service: four executed phases —
-    <strong>P0 walking skeleton → P1 deploy → P2 wasmtime execute → P3 SDK</strong> — each a
-    single durable Smithers node with a task, a <strong>machine-verifiable gate</strong>, a
-    bounded fix loop, and a <strong>human approval</strong> at the phase boundary. Cloudflare,
-    ZK, and containers are explicitly out of this plan's execution (P4). No phase does
-    speculative work for a later phase. Section references (§N) point at the
-    <a href="index.html">design spec</a>.
+    The lean Smithers plan for landing the compute service: three executed phases —
+    <strong>P0 walking skeleton → P1 deploy → P2 wasmtime execute</strong> — and node work
+    <strong>ends at P2</strong>. Each phase is a single durable Smithers node with a task,
+    <strong>named machine-verifiable gates</strong>, and a bounded fix loop. Exactly
+    <strong>one human gate</strong> remains: a security review after the full P2 slice.
+    SDK work, Cloudflare, ZK, and containers are explicitly out of this plan's execution
+    (P4). No phase does speculative work for a later phase. Section references (§N) point
+    at the <a href="index.html">design spec</a>.
   </p>
 </header>
 
@@ -414,18 +415,29 @@
   <p>
     Every phase instantiates the same durable
     plan&nbsp;→&nbsp;implement&nbsp;→&nbsp;review&nbsp;→&nbsp;fix&nbsp;→&nbsp;verify template;
-    only the per-phase <code>task</code>, <code>verify</code> commands, and gate notes differ.
+    only the per-phase <code>task</code> and <code>verify</code> commands differ.
     All <code>cargo</code> commands run from the worktree root.
   </p>
   <pre><code>node &lt;phase&gt;:
-  task:     &lt;one-line implementer prompt&gt;            <span class="cm"># plan → implement</span>
-  <span class="k2">verify</span>:   &lt;command(s)&gt;; non-zero exit = fail       <span class="cm"># machine gate</span>
+  task:     &lt;one-line implementer prompt&gt;                  <span class="cm"># plan → implement</span>
+  <span class="k2">verify</span>:   &lt;named commands; each MUST exist and exit 0&gt;   <span class="cm"># machine gate</span>
+  <span class="k2">suffix</span>:   cargo fmt -- --check                           <span class="cm"># runs on EVERY node</span>
+            cargo clippy --features compute -- -D warnings
+            cargo test                                     <span class="cm"># feature OFF stays green</span>
+            cargo test -p tinycloud-node --test compute_disabled   <span class="cm"># named 501 gate (C5)</span>
   fix_loop: on verify fail → review diff + error → patch → re-verify
-            (max 3 iterations, then escalate)
-  <span class="k1">approve</span>:  human approval gate at phase boundary    <span class="cm"># blocking, before next node</span></code></pre>
+            (max 3 iterations, then escalate)</code></pre>
+  <p>
+    Gates are <strong>executable commands, not prose</strong> (C5): <code>--test</code>
+    targets are <strong>named files</strong>, never name filters —
+    <code>cargo test … compute::x</code> passes when zero tests match, so it is
+    <strong>banned</strong> as a gate. Use
+    <code>cargo test -p &lt;crate&gt; --test &lt;file&gt; --features compute</code>, which errors
+    if the test file is absent.
+  </p>
   <div class="legend">
-    <span class="chip c2">verify — machine gate (non-zero exit = fail)</span>
-    <span class="chip c1">approve — blocking human gate at each phase boundary</span>
+    <span class="chip c2">verify / suffix — machine gate (non-zero exit = fail)</span>
+    <span class="chip c1">the single human gate — security review after the full P2 slice (C12)</span>
   </div>
 </section>
 
@@ -435,38 +447,36 @@
   <h2>The phase pipeline</h2>
   <p>
     P0&nbsp;→&nbsp;P1&nbsp;→&nbsp;P2 is a strict chain — each gate is the next phase's
-    precondition. P3 depends on P2's wire shapes being final. The registry
-    <strong>flip to <code>active</code></strong> (wildcard <code>implies</code>, extended
-    drift-guard lock) happens at the <em>start of P3</em>, not earlier: the concretes stay
-    reserved while only the node can exercise them, and go active exactly when the SDK
-    begins to grant them.
+    precondition — and node work ends at P2. The registry <strong>flip to
+    <code>active</code></strong> for <code>execute</code>&nbsp;+&nbsp;<code>deploy</code>
+    happens at the <em>end of P2</em> (C10), per the spec's "flip when the handler ships"
+    rule: reserved URNs are <em>already exercisable</em> by any caller
+    (<code>accepted_actions</code> includes reserved), so the old deny-by-default rationale
+    for delaying was wrong. <code>list</code> stays reserved. Exactly <strong>one human
+    gate</strong> remains — a security review after the full P2 slice; every other former
+    approval is now a machine assertion (C12).
   </p>
   <figure class="diagram">
     <div class="mermaid" data-diagram="fig-pipeline"></div>
     <script type="text/mermaid" id="fig-pipeline">
 flowchart TD
-  P0["P0 — Walking skeleton<br/>reserved registry entries + codegen regen,<br/>compute cargo feature + stub ComputeService,<br/>dispatch branch + 501-disabled path"]
-  G0{{"verify — gen-capabilities --check · drift guards ·<br/>cargo test feature OFF and ON · clippy -D warnings"}}
-  A0(["APPROVE — registry entries are reserved, not active"])
+  P0["P0 — Walking skeleton<br/>reserved registry entries + codegen regen,<br/>compute cargo feature + stub ComputeService,<br/>dispatch branch + 501-disabled path,<br/>request-variant → ability mapping (§7.1 erratum)"]
+  G0{{"verify — gen-capabilities --check · drift guards ·<br/>--test compute_skeleton: dispatch · wrong-ability 403 ·<br/>List-reject · --test compute_disabled: 501 · suffix"}}
 
-  P1["P1 — Deploy path<br/>RoutineDid handshake (space-name prereq),<br/>atomic: artifact + D_fn via /delegate + SqlSizes,<br/>revoke superseded D_fn on re-deploy"]
-  G1{{"verify — §13.1 tests: atomicity (both rollback directions) ·<br/>quota (over-quota 402s) · handshake · space-name validation"}}
-  A1(["APPROVE — atomicity test genuinely exercises rollback"])
+  P1["P1 — Deploy path<br/>RoutineKeyDeriver seam (dstack | classic),<br/>hashed-space derivation, RoutineDid handshake,<br/>atomic core deploy txn (mirror-after-commit),<br/>transport: JSON/base64 + inline D_fn only"]
+  G1{{"verify — cargo check --features compute,dstack ·<br/>--test compute_deploy: rollback both directions ·<br/>quota 402 · handshake · hashed-space collisions ·<br/>--test routine_key_deriver + compute_routine_key · suffix"}}
 
-  P2["P2 — Wasmtime execute (the core slice)<br/>host mediator: caveat echo + (space, cid) cite-all,<br/>fuel / epoch / StoreLimits, rotation tripwire,<br/>execution manifest, ComputeResult/ComputeList"]
-  G2{{"verify — §13.1 tests: caveat-echo · cross-space ·<br/>rotation · manifest + E2E fixture:<br/>granted read OK, ungranted read DENIED"}}
-  A2(["APPROVE — E2E reviewed: invoker never held data caps"])
+  P2["P2 — Wasmtime execute (KV-read-only slice)<br/>pinned minimal WASM ABI + WAT fixture,<br/>caveat-echo mediator + (space, cid) cite-all,<br/>full caveat enforcement, rotation tripwire,<br/>execution manifest, ComputeResult"]
+  G2{{"verify — --test compute_execute: every advertised<br/>control · --test compute_abi: WAT fixture ·<br/>--test compute_e2e: granted read OK, ungranted<br/>DENIED, invoker holds no data caps · suffix"}}
 
-  P3["P3 — SDK surface<br/>execute/list service; standard grant enumerates<br/>execute + list, NEVER compute/* ;<br/>deploy behind an explicit privileged flow"]
-  G3{{"verify — SDK integration vs live node:<br/>standard session executes + lists, CANNOT deploy;<br/>privileged deploy succeeds; node regression green"}}
-  A3(["APPROVE — emitted grant greps clean of compute/*"])
+  FLIP["registry flips ACTIVE for execute + deploy —<br/>END of P2, when the handler ships;<br/>list stays reserved · drift-guard lock extended"]
 
-  P4["P4 — DEFERRED, not executed<br/>Cloudflare backend (Outbound Worker, D_worker) ·<br/>ZK verification (two-phase, RISC-V) ·<br/>container/VM backend (iron-proxy pattern)"]
+  SEC(["HUMAN GATE — the only one (C12):<br/>security review of the full P2 slice —<br/>ability mapping · caveat-echo enforcement ·<br/>cross-space isolation · active-flip diff"])
 
-  FLIP["registry flips ACTIVE at the start of P3 —<br/>wildcard implies added, drift-guard lock extended"]
+  P4["P4 — DEFERRED, not executed<br/>compute/list · KV writes / SQL host calls ·<br/>streaming deploy transport · TS SDK<br/>(separate js-sdk workflow) · global Name<br/>hardening · Cloudflare / ZK / containers"]
 
-  P0 --> G0 --> A0 --> P1 --> G1 --> A1 --> P2 --> G2 --> A2 --> FLIP --> P3 --> G3 --> A3
-  A3 -.-> P4
+  P0 --> G0 --> P1 --> G1 --> P2 --> G2 --> FLIP --> SEC
+  SEC -.-> P4
 
   classDef phase fill:#1a212b,stroke:#4d5a6c,stroke-width:1.5px
   classDef vgate fill:#12201d,stroke:#2b7a6a,stroke-width:1.5px
@@ -474,22 +484,23 @@ flowchart TD
   classDef deferred fill:#151a22,stroke:#4d5a6c,stroke-width:1.5px,stroke-dasharray:6 5
   classDef flip fill:#151a22,stroke:#313c4b,stroke-width:1px
 
-  class P0,P1,P2,P3 phase
-  class G0,G1,G2,G3 vgate
-  class A0,A1,A2,A3 agate
+  class P0,P1,P2 phase
+  class G0,G1,G2 vgate
+  class SEC agate
   class P4 deferred
   class FLIP flip
-  linkStyle 12 stroke-dasharray:6 5
+  linkStyle 7 stroke-dasharray:6 5
     </script>
     <figcaption><b>Fig. 1</b> — The Smithers pipeline: phase → machine verify gate
-    <span style="color:var(--l2)">(teal)</span> → human approval
-    <span style="color:var(--l1)">(amber)</span> → next phase. P4 hangs off the end,
-    dashed: deferred, not executed. Each gate carries the standard fix loop
-    (max 3 iterations, then escalate).</figcaption>
+    <span style="color:var(--l2)">(teal)</span> → next phase. Node work ends at P2;
+    the active-flip is P2's final step, then the single human gate
+    <span style="color:var(--l1)">(amber)</span> — a security review of the full slice.
+    P4 hangs off the end, dashed: deferred, not executed. Each gate carries the standard
+    fix loop (max 3 iterations, then escalate).</figcaption>
   </figure>
   <div class="legend">
     <span class="chip c2">machine verify gate</span>
-    <span class="chip c1">human approval gate</span>
+    <span class="chip c1">human gate — security review (the only one)</span>
   </div>
 </section>
 
@@ -511,146 +522,191 @@ flowchart TD
       <code>#[cfg(feature="compute")]</code> (§11.1).</li>
     <li>Dispatch branch + 501-when-disabled path (§7.1); <code>/version</code> feature flag
       (§11.2).</li>
+    <li><strong>Request-variant → ability mapping</strong> as a first-class deliverable
+      (§7.1 erratum, C1): <code>RoutineDid</code>/<code>Deploy</code> →
+      <code>compute/deploy</code>, <code>Execute</code> → <code>compute/execute</code>,
+      <code>List</code> → <code>compute/list</code>, via <code>ability_matches</code>. Lands
+      here as the enforced gate even though only the enabled variants exist yet.</li>
   </ul>
   <div class="node-card">
     <div class="row task"><div class="k">task</div><div class="v">"Add compute reserved
       registry entries + regen codegen; add the <code>compute</code> cargo feature, a stub
-      <code>ComputeService</code>, the invoke dispatch branch, and the 501-disabled path per
-      §3.1/§7.1/§11."</div></div>
+      <code>ComputeService</code>, the invoke dispatch branch, the 501-disabled path, and
+      the request-variant → ability mapping per §3.1/§7.1/§11."</div></div>
     <div class="row verify"><div class="k">verify</div><div class="v"><ul>
       <li><code>node scripts/gen-capabilities.mjs --check</code></li>
       <li><code>cargo test -p tinycloud-core policy_capability</code> — drift guards
         <code>generated_module_matches_registry</code>,
         <code>canonical_decisions_are_locked</code></li>
-      <li><code>cargo test</code> with the feature <em>off</em> AND
-        <code>cargo test --features compute</code> with it <em>on</em></li>
-      <li><code>cargo clippy --features compute -- -D warnings</code></li>
+      <li><code>cargo test -p tinycloud-node --test compute_skeleton --features compute</code>
+        — asserts: <code>/version</code> lists <code>compute</code>; an enabled dispatch
+        reaches the handler; <em>a wrong-ability request is rejected</em> (an
+        <code>Execute</code> capability presenting a <code>Deploy</code> body → 403, and
+        vice-versa); <em>a <code>List</code> body is rejected while reserved</em> (no
+        server-side listing handler exists in the MVP — assert the reject path, C1)</li>
+      <li><code>cargo test -p tinycloud-node --test compute_disabled</code> — the named
+        feature-off gate: with <code>compute</code> off, a <code>tinycloud.compute/*</code>
+        request returns 501/not-supported (C5). Also runs in the shared suffix.</li>
+      <li>suffix</li>
     </ul></div></div>
-    <div class="row gate"><div class="k">gate</div><div class="v">Both feature states green +
-      drift guards green.</div></div>
-    <div class="row approve"><div class="k">approve</div><div class="v">Human confirms the
-      registry entries are <em>reserved</em> (not active) before P1.</div></div>
+    <div class="row gate"><div class="k">assert</div><div class="v">Machine assertions only:
+      registry entries are <em>reserved</em> (drift-guard-locked) and mismatched bodies are
+      rejected — no human review at this boundary.</div></div>
   </div>
 </section>
 
 <!-- ================================================================ -->
 <section id="p1">
   <div class="kicker"><span class="num">P1</span>Phase 1</div>
-  <h2>Deploy path <span class="pill dimp">artifact + grant, atomic</span></h2>
+  <h2>Deploy path <span class="pill dimp">transaction seam + handshake + hashed-space identity</span></h2>
   <p>
-    Deploy stores the WASM and binds its data grant, atomically, with quota — plus the
-    read-only identity handshake the client needs first.
+    The transaction seam is a <strong>core primitive, not a service-module change</strong>
+    (C2): <code>TinyCloud::delegate</code> opens its own txn
+    (<code>db.rs:513-535</code>), <code>DatabaseArtifactRepository::save</code> owns a bare
+    <code>DatabaseConnection</code> with no txn param
+    (<code>database_artifacts.rs:28-53</code>), and <code>SqlSizes</code> is an infallible
+    in-memory mirror (<code>sql_sizes.rs:108-120</code>). So P1 must:
   </p>
   <ul>
-    <li><code>RoutineDid { content_cid }</code> read-only action → derives and returns the
-      <strong>public</strong> <code>routine_did</code> (§7.2/F2); derivation string per §6.2
-      (<code>compute-key/v1/</code> + <code>&lt;space&gt;/compute/&lt;cid&gt;</code>).
-      <strong>Prereq:</strong> space-<code>Name</code> delimiter validation (or
-      hash-the-space) — the blocking safety item in §6.2, currently a stubbed TODO in
-      <code>tinycloud-auth</code>.</li>
-    <li>Deploy: artifact save (service tag <code>"compute"</code>) + <code>D_fn</code> through
-      the standard <code>/delegate</code> verify/persist path +
-      <code>sql_sizes.update("compute", …)</code> — <strong>all in one transaction</strong>
-      (§5.1/F4, §5/F8). Revoke the superseded <code>D_fn</code> on re-deploy.</li>
+    <li>Add a <strong><code>RoutineKeyDeriver</code></strong> interface in
+      <code>tinycloud-core</code> (C11), injected from the server crate with
+      <code>dstack</code> (<code>dstack.rs:106-119</code>) and classic
+      (<code>keys.rs:57-74</code> <code>StaticSecret::derive_key</code>) impls —
+      <code>dstack::get_key</code> is server-only, so core cannot call it directly.
+      Derivation <strong>hashes the space component</strong> (§6.2 erratum, C8):
+      <code>get_key("tinycloud/compute-key/v1/" + base32(blake3(‹space›)) + "/compute/" + ‹cid›)</code>
+      — fixed-width, lowercase base32, delimiter-free. No global <code>Name</code> change
+      (deferred, P4).</li>
+    <li><code>RoutineDid { content_cid }</code> handshake → returns the
+      <strong>public</strong> <code>routine_did</code> (§7.2/F2). Gated by the C1 mapping
+      (needs <code>compute/deploy</code>).</li>
+    <li>A dedicated <strong>core deploy primitive</strong>: one SeaORM transaction that runs
+      delegation validation/persistence + <strong>transaction-aware</strong> artifact
+      persistence, commits, then updates the infallible <code>SqlSizes</code> mirror
+      (<em>mirror-after-commit</em>). Revoke the superseded <code>D_fn</code> on re-deploy
+      (§5.1).</li>
+    <li><strong>Transport (C7):</strong> JSON body + base64 WASM + <strong>inline</strong>
+      encoded <code>D_fn</code> only. Raw streaming and pre-submitted grant CIDs are
+      deferred (P4).</li>
   </ul>
   <div class="node-card">
-    <div class="row task"><div class="k">task</div><div class="v">"Implement the
-      <code>RoutineDid</code> handshake (with the §6.2 space-name validation prereq) and the
-      atomic deploy path (artifact + D_fn via /delegate + SqlSizes) per §5.1/§7.2."</div></div>
+    <div class="row task"><div class="k">task</div><div class="v">"Add the
+      <code>RoutineKeyDeriver</code> seam (dstack + classic impls, hashed-space derivation),
+      the <code>RoutineDid</code> handshake, and the atomic core deploy primitive (one txn:
+      delegation + artifact, mirror-after-commit, superseded-grant revocation) per
+      §5.1/§6.2/§7.2."</div></div>
     <div class="row verify"><div class="k">verify</div><div class="v"><ul>
-      <li><code>cargo test --features compute compute::deploy</code> — the §13.1
-        <em>atomicity</em> (D_fn-fails ⇒ no artifact row / no SqlSizes entry, and
-        vice-versa), <em>quota</em> (deploy bumps <code>store_size</code>; over-quota deploy
-        402s), <em>handshake</em> (stable public <code>routine_did</code>), and
-        <em>space-name-validation</em> tests</li>
-      <li><code>cargo clippy --features compute -- -D warnings</code></li>
+      <li><code>cargo check --features compute,dstack</code> — the feature combo compiles
+        (C11)</li>
+      <li><code>cargo test -p tinycloud-node --test compute_deploy --features compute</code>
+        — asserts: <em>atomic rollback</em> (D_fn-verify-fails ⇒ no artifact row
+        <em>and</em> no <code>SqlSizes</code> delta; artifact-persist-fails ⇒ no delegation
+        row); <em>mirror only after commit</em>; <em>superseded-grant revocation</em> on
+        re-deploy; <em>quota</em> (deploy bumps <code>store_size</code>, over-quota deploy
+        → 402); <em>handshake</em> returns a stable public <code>routine_did</code>;
+        <em><code>RoutineDid</code> body with the wrong ability is rejected</em> (a
+        non-<code>compute/deploy</code> capability presenting a <code>RoutineDid</code>
+        body → 403, C1); <em>hashed-space collision-freedom</em> (two delimiter-laden
+        space names never collide, §13.1)</li>
+      <li><code>cargo test -p tinycloud-core --test routine_key_deriver</code> — the
+        <code>RoutineKeyDeriver</code> <em>trait</em> unit test with the <em>classic</em>
+        impl only (core has no dstack adapter)</li>
+      <li><code>cargo test -p tinycloud-node --test compute_routine_key --features compute,dstack</code>
+        (with <code>DSTACK_SIMULATOR_ENDPOINT</code> set) — the dstack-<em>simulator</em>
+        adapter lives in the server crate, so its machine-checked determinism test lands
+        there (C11)</li>
+      <li>suffix</li>
     </ul></div></div>
-    <div class="row gate"><div class="k">gate</div><div class="v">Those four §13.1 tests
-      pass.</div></div>
-    <div class="row approve"><div class="k">approve</div><div class="v">Human confirms the
-      atomicity test genuinely exercises rollback (both failure directions) before
-      P2.</div></div>
+    <div class="row gate"><div class="k">assert</div><div class="v">Rollback in both failure
+      directions is machine-asserted in <code>compute_deploy</code> — no human review of the
+      atomicity tests.</div></div>
+  </div>
+  <div class="callout decision">
+    <div class="t">Deployment-readiness gate — NOT a test (C11)</div>
+    <p>Real cross-CVM-redeploy <code>routine_did</code> equality must be verified
+    <strong>empirically on the target CVM</strong> (§6.2 box). The simulator unit test does
+    not prove it. Recorded as a <em>release precondition</em>, separate from the phase's
+    machine gate.</p>
   </div>
 </section>
 
 <!-- ================================================================ -->
 <section id="p2">
   <div class="kicker"><span class="num">P2</span>Phase 2</div>
-  <h2>Wasmtime execute <span class="pill l2">the core slice</span></h2>
+  <h2>Wasmtime execute <span class="pill l2">KV-read-only slice — node work ends here</span></h2>
   <p>
-    The first end-to-end "run a function over space data under least privilege."
+    The first end-to-end "run a function over space data under least privilege" —
+    deliberately narrow (C3/C4): a routine reads granted KV data and returns inline output.
   </p>
   <ul>
-    <li>Host mediator: mints internal invocations under the selected <code>D_fn</code>,
-      <strong>echoing its caveat map verbatim</strong> (§6.2/F1), entering via core
-      <code>process()</code> not the HTTP route (§8.2); <code>(space, functionCid)</code>
-      cite-all selection (§5.1/F3/F5).</li>
-    <li><code>WasmtimeBackend::run</code>: fuel + epoch + <code>StoreLimits</code> caveat
-      enforcement (§10.1); no WASI net/fs.</li>
-    <li><code>routine-identity-rotated</code> compare-on-execute tripwire (§6.2/F1.5).</li>
-    <li>Execution manifest in <code>InvocationOutcome</code> metadata (§9.1.1).</li>
-    <li><code>InvocationOutcome::ComputeResult</code>/<code>ComputeList</code> + responder
-      arms (§7.3).</li>
+    <li><strong>Pinned minimal WASM ABI (C3) — stated, not "TBD":</strong> a
+      <em>core module</em> (not a component); guest exports
+      <code>alloc(len: i32) -&gt; ptr: i32</code> (guest owns its linear memory; the host
+      writes args in via <code>alloc</code>) and
+      <code>run(ptr: i32, len: i32) -&gt; (ptr: i32, len: i32)</code> (the single
+      entrypoint); one host import, module <code>"tinycloud"</code>, function
+      <code>storage_get(ptr: i32, len: i32) -&gt; (ptr: i32, len: i32)</code>; <em>all
+      payloads are JSON bytes</em> in guest memory. The rest of the host-import surface is
+      deferred. Gated by a <strong>checked-in WAT fixture that exercises exactly this
+      contract</strong>.</li>
+    <li><strong>KV-read-only, inline output (C4):</strong> the injected
+      <strong>internal-invocation executor</strong> (named seam) reads through
+      <code>SpaceDatabase::invoke</code> (<code>db.rs:620-720</code>); a bare
+      <code>process()</code> only persists and returns a hash
+      (<code>invocation.rs:105-118</code>) and cannot return KV data. <em>KV writes and SQL
+      host calls move to P4.</em></li>
+    <li>Host mediator: caveat-echo verbatim (§6.2/F1); <code>(space, functionCid)</code>
+      cite-all <code>D_fn</code> selection (§5.1/F3/F5).</li>
+    <li>Full caveat enforcement (§10.1): fuel, epoch, <code>StoreLimits</code>,
+      chain-derived <code>functions</code> allowlist, input schema, numeric ceilings,
+      forbidden imports.</li>
+    <li><code>routine-identity-rotated</code> tripwire (§6.2/F1.5); execution manifest in
+      outcome metadata (§9.1.1).</li>
+    <li><code>InvocationOutcome::ComputeResult</code> + responder arm (§7.3).
+      (<code>ComputeList</code> NOT here — C9, deferred.)</li>
+    <li><strong>Registry active-flip for <code>execute</code>+<code>deploy</code></strong>
+      at the END of P2 (C10), per the spec's "when the handler ships" rule — reserved URNs
+      are already exercisable by any caller (<code>accepted_actions</code> includes
+      reserved, <code>gen-capabilities.mjs:121-127</code>), so the old deny-by-default
+      rationale was wrong. <code>list</code> stays reserved. Extend
+      <code>canonical_decisions_are_locked</code>.</li>
   </ul>
   <div class="node-card">
-    <div class="row task"><div class="k">task</div><div class="v">"Implement the wasmtime
-      execute path: host mediator with caveat-echo + (space,cid) selection,
-      fuel/epoch/StoreLimits enforcement, rotation tripwire, and the execution manifest,
-      per §6.2/§9.1.1/§10.1."</div></div>
-    <div class="row verify"><div class="k">verify</div><div class="v"><ul>
-      <li><code>cargo test --features compute compute::execute</code> — §13.1
-        <em>caveat-echo</em> (non-echoed internal invocation rejected
-        <code>invocation-caveats-not-subset-of-chain</code>), <em>cross-space isolation</em>
-        (space-B execution cannot cite space-A <code>D_fn</code>), <em>rotation</em>
-        (<code>routine-identity-rotated</code>, not 403), <em>manifest</em>
-        (granted-vs-exercised present)</li>
-      <li><em>E2E fixture</em> (integration test, real server): a routine reads a
-        <em>granted</em> KV path (succeeds, manifest shows it exercised) and is denied on an
-        <em>ungranted</em> path (host call fails closed; the invoker holds no data caps
-        throughout)</li>
-      <li><code>cargo clippy --features compute -- -D warnings</code></li>
+    <div class="row task"><div class="k">task</div><div class="v">"Implement the KV-read-only
+      wasmtime execute slice: pinned ABI + WAT fixture, caveat-echo mediator with
+      (space,cid) cite-all selection, full caveat enforcement, rotation tripwire, execution
+      manifest, ComputeResult arm, and the end-of-phase active-flip, per
+      §6.2/§9.1.1/§10.1."</div></div>
+    <div class="row verify"><div class="k">verify</div><div class="v">
+      <p style="margin:0 0 0.5rem; font-size:inherit; max-width:none">Every advertised
+      control gets a focused test (C6):</p><ul>
+      <li><code>cargo test -p tinycloud-node --test compute_execute --features compute</code>
+        — asserts EACH: <em>caveat-echo reject</em>
+        (<code>invocation-caveats-not-subset-of-chain</code>) + invoker-side echo reject;
+        <em>cross-space isolation</em>; <em>rotation</em>
+        (<code>routine-identity-rotated</code>, not 403); <code>functions</code> allowlist;
+        <em>fuel exhaustion</em> trap; <em>epoch/timeout</em> trap; <em>memory-growth</em>
+        failure (<code>StoreLimits</code>); <em>input-schema</em> reject;
+        <em>numeric-ceiling</em> reject; <em>forbidden-import</em> reject; <em>full manifest
+        shape</em> (per-call <code>(resource, ability, bytes_in/out, destination)</code>
+        fields + granted-vs-exercised, incl. a granted-but-unexercised case, §9.1.1)</li>
+      <li><code>cargo test -p tinycloud-node --test compute_abi --features compute</code> —
+        the WAT fixture executes against the pinned ABI (export called,
+        <code>storage.get</code> mediated)</li>
+      <li><strong>E2E</strong> (real server, the P2 acceptance gate — C6):
+        <code>cargo test -p tinycloud-node --test compute_e2e --features compute</code> —
+        boots a node on an ephemeral port, health-waits, a routine reads a
+        <em>granted</em> KV path (succeeds, manifest shows it exercised) and is
+        <em>denied</em> on an <em>ungranted</em> path (host call fails closed), invoker
+        holds NO data caps throughout; tears the node down (timeout 60s)</li>
+      <li><code>node scripts/gen-capabilities.mjs --check</code> — active-flip regen
+        committed</li>
+      <li>suffix</li>
     </ul></div></div>
-    <div class="row gate"><div class="k">gate</div><div class="v">The §13.1 execute tests +
-      the E2E granted/denied fixture pass.</div></div>
-    <div class="row approve"><div class="k">approve</div><div class="v">Human reviews the E2E
-      fixture output (granted read succeeds, ungranted read denied, invoker never held data
-      caps) before P3.</div></div>
-  </div>
-</section>
-
-<!-- ================================================================ -->
-<section id="p3">
-  <div class="kicker"><span class="num">P3</span>Phase 3</div>
-  <h2>SDK surface <span class="pill dimp">typed access, safe defaults</span></h2>
-  <p>
-    Make the service usable from the TS SDK without handing browser sessions deploy rights.
-    The registry flip to <code>active</code> (wildcard <code>implies</code>, extended
-    <code>canonical_decisions_are_locked</code>) happens at the start of this phase.
-  </p>
-  <ul>
-    <li><code>execute</code> / <code>list</code> on the compute service (mirroring the KV/SQL
-      service-class pattern); the standard session grant enumerates
-      <strong><code>compute/execute</code> + <code>compute/list</code></strong> and
-      <strong>NEVER <code>compute/*</code></strong> (§3/F9).</li>
-    <li>Deploy exposed only via an explicit <strong>privileged</strong> flow (not the
-      standard session), consistent with the deploy-tier decision (§3).</li>
-  </ul>
-  <div class="node-card">
-    <div class="row task"><div class="k">task</div><div class="v">"Add the compute SDK
-      service (execute/list) and wire the standard session grant to enumerate execute+list
-      only — never compute/* — with deploy behind an explicit privileged path, per
-      §3/F9."</div></div>
-    <div class="row verify"><div class="k">verify</div><div class="v"><ul>
-      <li>SDK integration test against a running compute-enabled node: standard session can
-        <code>execute</code>/<code>list</code>; a standard-session <code>deploy</code> attempt
-        is rejected; a privileged deploy succeeds</li>
-      <li><code>cargo test --features compute</code> — node regression stays green</li>
-    </ul></div></div>
-    <div class="row gate"><div class="k">gate</div><div class="v">SDK integration test passes;
-      the "standard session cannot deploy" assertion is present and green.</div></div>
-    <div class="row approve"><div class="k">approve</div><div class="v">Human confirms the
-      session grant does not contain <code>compute/*</code> (grep the emitted grant) before
-      closing the run.</div></div>
+    <div class="row approve"><div class="k">approve</div><div class="v"><strong>HUMAN GATE —
+      the only one (C12):</strong> a security review of the completed P2 slice — the
+      ability mapping, the caveat-echo enforcement, cross-space isolation, and the
+      active-flip diff. All other checks above are assertions, not reviews.</div></div>
   </div>
 </section>
 
@@ -658,14 +714,26 @@ flowchart TD
 <section id="p4">
   <div class="kicker"><span class="num">P4</span>Phase 4</div>
   <h2>Explicitly deferred <span class="pill warn">not executed in this plan</span></h2>
+  <p>One line each on <em>why</em>:</p>
   <ul>
-    <li><strong>Cloudflare backend</strong> (§9.2) — needs the Outbound-Worker egress
-      mediation, ephemeral <code>D_worker</code> mechanics, and a CF account in the TCB; a
-      second backend with its own trust model. Land the wasmtime slice first.</li>
-    <li><strong>ZK verification</strong> (§12.2) — the prover cannot run in a Worker; needs a
-      RISC-V build + async two-phase <code>verify()</code>; no consumer yet.</li>
-    <li><strong>Container/VM backend</strong> (§9.4, iron-proxy pattern) — future
-      egress-mediated backend; not needed for the in-node slice.</li>
+    <li><strong><code>compute/list</code></strong> (C9) — no server-side listing exists
+      (<code>DatabaseArtifactRepository</code> has only <code>load</code>/<code>save</code>,
+      <code>database_artifacts.rs:28-44</code>); stays reserved.</li>
+    <li><strong>KV-write / SQL host calls</strong> (C4) — need cross-layer executor wiring
+      beyond the read-only <code>SpaceDatabase::invoke</code> slice.</li>
+    <li><strong>Streaming / multipart deploy transport + pre-submitted grant CIDs</strong>
+      (C7) — contradicts inline atomic grant persistence; JSON/base64 suffices first.</li>
+    <li><strong>TS SDK (execute/list, session grant, privileged deploy)</strong> (C10) — the
+      TS SDK is <strong>not a member of this workspace</strong> (only the generated TS
+      mirror lives here, <code>gen-capabilities.mjs:31-34</code>). Runs as a
+      <strong>separate js-sdk worktree/workflow</strong> with its own commands and release
+      coordination — the session grant there MUST enumerate <code>compute/execute</code>
+      (+<code>list</code> when it ships) and NEVER <code>compute/*</code> (§3/F9).</li>
+    <li><strong>Global <code>Name</code> hardening</strong> (C8) — a compatibility-sensitive
+      auth-wide task, independent of compute (compute uses hashed-space derivation
+      instead).</li>
+    <li><strong>Cloudflare backend / ZK verification / container-VM backend</strong>
+      (§9.2/§12.2/§9.4) — second trust models; land the in-node wasmtime slice first.</li>
   </ul>
 </section>
 
@@ -673,26 +741,30 @@ flowchart TD
 <section id="gates">
   <div class="kicker"><span class="num">03</span>Invariants</div>
   <h2>Cross-cutting gates &amp; sequencing</h2>
-  <h3>Every phase</h3>
+  <h3>Every phase — the shared suffix</h3>
   <ul>
-    <li><code>cargo clippy --features compute -- -D warnings</code> — no new warnings.</li>
+    <li><code>cargo fmt -- --check</code> and
+      <code>cargo clippy --features compute -- -D warnings</code> — no new warnings.</li>
     <li><code>cargo test</code> with the feature <strong>off</strong> stays green in every
       phase — the 501 path and gating must never regress.</li>
+    <li><code>--test</code> targets are <strong>named files</strong> that error when absent;
+      name filters (which pass on zero matches) are banned as gates (C5).</li>
     <li>No phase edits <code>generated.rs</code> by hand; registry changes go through
       <code>gen-capabilities.mjs</code> and the drift guards.</li>
   </ul>
   <h3>Sequencing</h3>
   <p>
-    P0&nbsp;→&nbsp;P1&nbsp;→&nbsp;P2 is a strict chain (each gate is the next phase's
-    precondition). P3 depends on P2's wire shapes being final. The registry flip to
-    <code>active</code> happens at the <strong>start of P3</strong>, not earlier — the
-    concretes stay reserved while only the node can exercise them, and go active exactly
-    when the SDK begins to grant them.
+    P0&nbsp;→&nbsp;P1&nbsp;→&nbsp;P2 is a strict precondition chain (each gate is the next
+    phase's precondition), and node work ends at P2. The active-flip for
+    <code>execute</code>+<code>deploy</code> is <strong>P2's final step</strong> — "flip
+    when the handler ships" — followed by the plan's single human gate, the security
+    review. Everything else (SDK included) is P4: deferred, not executed.
   </p>
 
   <footer>
     <div class="src">Sources</div>
-    <div>specs/compute-service-implementation-plan.md — this plan</div>
+    <div>specs/compute-service-implementation-plan.md — this plan (rev 2026-07-18)</div>
+    <div><a href="../compute-service-plan-codex-review.md">specs/compute-service-plan-codex-review.md — codex review (C1–C12, all accepted)</a></div>
     <div><a href="index.html">specs/compute-service-site/index.html — the design spec</a></div>
     <div>specs/compute-service.md — the design (all §N references)</div>
     <div style="margin-top:1.2rem">TinyCloud Labs · implementation plan · rendered with Mermaid</div>

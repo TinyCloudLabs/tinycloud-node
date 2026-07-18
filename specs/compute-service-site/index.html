@@ -594,15 +594,16 @@
   </p>
   <p>
     The routine's execution identity is deterministic — derived by the node from the
-    function's <strong>canonical resource URI</strong> under a versioned domain prefix, via
+    function's <strong>space and content CID</strong> under a versioned domain prefix, via
     the existing dstack hierarchical key derivation:
   </p>
-  <pre><code>resource_uri = ‹space›/compute/‹function_cid›   <span class="cm">// the ResourceId display form (§2)</span>
-routine_did  = did:key( get_key(<span class="k2">"tinycloud/compute-key/v1/"</span> + resource_uri) )</code></pre>
+  <pre><code>derivation_path = base32(blake3(‹space›)) + "/compute/" + ‹function_cid›   <span class="cm">// space component HASHED — fixed-width, lowercase base32, delimiter-free (§6.2)</span>
+routine_did     = did:key( get_key(<span class="k2">"tinycloud/compute-key/v1/"</span> + derivation_path) )</code></pre>
   <p>
-    Using the canonical <code>ResourceId</code> display string means <strong>one canonical
-    spelling is shared by the authorizer, the binding caveat, and the derivation</strong> —
-    no second serialization to keep in sync — and the versioned <code>compute-key/v1/</code>
+    The path mirrors the canonical <code>ResourceId</code> display form (§2) with the
+    <strong>space component hashed</strong> to a fixed width (§6.2 erratum) — so distinct
+    <code>(space, function)</code> pairs can never collide into one derivation string — and
+    the versioned <code>compute-key/v1/</code>
     prefix is domain-separated, so a future <code>v2</code> scheme cannot collide with
     existing identities. The private key is derived inside the TEE and never leaves it, so
     <strong>only this node, running this exact function CID in this exact space, can act as
@@ -616,15 +617,16 @@ routine_did  = did:key( get_key(<span class="k2">"tinycloud/compute-key/v1/"</sp
     derivation off the node's static key material; the trust statement weakens to
     "the node".)
   </p>
-  <div class="callout decision">
-    <div class="t">Blocking before activation — space-name validation</div>
+  <div class="callout note">
+    <div class="t">Resolved (§6.2 erratum) — the space component is hashed</div>
     <p>The derivation string's uniqueness requires that distinct
     <code>(space, function)</code> pairs never collide into one string. CIDs are base32
-    (delimiter-free) — safe. But space <code>Name</code> validation is currently a stubbed
-    <code>// TODO</code> in <code>tinycloud-auth</code>: before compute activates, space names
-    MUST be validated to exclude the URI delimiters (<code>/</code>, <code>:</code>,
-    <code>#</code>, <code>?</code>) — or the space component MUST be hashed (fixed-width,
-    delimiter-free) before it enters the derivation string. Tracked as a test obligation
+    (delimiter-free) — safe. But space <code>Name</code> validation is a stubbed
+    <code>// TODO</code> in <code>tinycloud-auth</code> and is bypassed by direct
+    <code>Name</code> construction in URI parsing — so the derivation <strong>hashes the
+    canonical space string</strong> into a fixed-width, delimiter-free component before it
+    enters the derivation string. Global <code>Name</code> hardening is spun out as
+    independent deferred work. Collision-freedom is a test obligation
     (<a href="#scope">§13</a>).</p>
   </div>
   <p>Consequences worth stating plainly:</p>
@@ -772,7 +774,7 @@ sequenceDiagram
 
   O->>O: function_cid = CID(wasm bytes)<br/>computed locally — the CID convention is public
   O->>N: RoutineDid { content_cid } — read-only,<br/>side-effect-free handshake
-  N->>N: derive keypair inside the TEE —<br/>get_key("tinycloud/compute-key/v1/" + ‹space›/compute/‹cid›)
+  N->>N: derive keypair inside the TEE —<br/>get_key("tinycloud/compute-key/v1/" + hash(‹space›)/compute/‹cid›)
   N-->>O: public routine_did — no secret exposed<br/>(re-run after a CVM redeploy = dstack-stability probe)
   O->>O: mint D_fn — delegatee = routine_did,<br/>caveat computeFunctionBinding { functionCid },<br/>caps = attenuated data grant (e.g. kv/get on inputs/)
   O->>N: /invoke — tinycloud.compute/deploy<br/>name + wasm binary + grant = D_fn
@@ -1252,6 +1254,13 @@ stateDiagram-v2
     same gating the DuckDB feature flag uses — and with it, <code>/version</code> advertises
     <code>"compute"</code> in its features list for client feature-detection.
   </p>
+  <p class="dim">
+    Normative (§7.1 erratum): the handler maps each request variant to its required ability
+    via <code>ability_matches</code> — <code>Deploy</code>/<code>RoutineDid</code> →
+    <code>compute/deploy</code>, <code>Execute</code> → <code>compute/execute</code>,
+    <code>List</code> → <code>compute/list</code> — so an <code>execute</code> holder cannot
+    submit a deploy body.
+  </p>
   <pre><code><span class="cm">// request body over POST /invoke — final shapes per spec §7.2</span>
 { "action": "<span class="k1">execute</span>",
   "function":    "report-generator",   <span class="cm">// name; resolves to current revision's CID</span>
@@ -1413,9 +1422,9 @@ InvocationOutcome::<span class="k2">ComputeList</span>(serde_json::Value)    <sp
       echoed one succeeds. Invoker-side echo likewise.</li>
     <li>Cross-space isolation: identical WASM in spaces A and B yields distinct routine
       DIDs; a B execution cannot cite A's <code>D_fn</code>.</li>
-    <li>Space-name validation (precondition): a space name containing a URI delimiter
-      (<code>/ : # ?</code>) is rejected — or the space component is hashed — so no two
-      distinct spaces can produce the same derivation string.</li>
+    <li>Hashed-space collision-freedom: the space component is hashed before entering the
+      derivation string (<a href="#two-layer">§3</a>), so two delimiter-laden space names
+      never produce the same derivation string.</li>
     <li>Execution manifest: a run's returned manifest lists every host call and the
       granted-vs-exercised sets; an untouched granted capability shows as
       granted-but-unexercised (the scope-down signal).</li>
