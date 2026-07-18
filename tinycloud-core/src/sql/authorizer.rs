@@ -19,12 +19,19 @@ fn is_sqlite_schema_table(table_name: &str) -> bool {
     )
 }
 
-fn can_write_table(ability: &str, is_admin: bool, table_name: &str) -> bool {
+fn can_write_table(
+    ability: &str,
+    is_admin: bool,
+    table_name: &str,
+    schema_ddl_authorized: bool,
+) -> bool {
     // The second clause is an exact-tier match on `schema` (writes to the
-    // sqlite schema tables during DDL), NOT a confers-check — so compare the
-    // alias-resolved URN rather than using `ability_matches`.
+    // sqlite schema tables and DDL-internal writes after SQLite reports the
+    // schema action), NOT a confers-check — so compare the alias-resolved URN
+    // rather than using `ability_matches`.
     can_write_data(ability, is_admin)
-        || (resolve_alias(ability) == "tinycloud.sql/schema" && is_sqlite_schema_table(table_name))
+        || (resolve_alias(ability) == "tinycloud.sql/schema"
+            && (is_sqlite_schema_table(table_name) || schema_ddl_authorized))
 }
 
 pub fn create_authorizer(
@@ -190,7 +197,12 @@ pub fn create_authorizer(
 
         // Write operations
         AuthAction::Insert { table_name } | AuthAction::Delete { table_name } => {
-            if !can_write_table(ability.as_str(), is_admin, table_name) {
+            if !can_write_table(
+                ability.as_str(),
+                is_admin,
+                table_name,
+                schema_ddl_authorized,
+            ) {
                 return Authorization::Deny;
             }
             if let Some(ref caveats) = caveats {
@@ -208,7 +220,12 @@ pub fn create_authorizer(
             table_name,
             column_name,
         } => {
-            if !can_write_table(ability.as_str(), is_admin, table_name) {
+            if !can_write_table(
+                ability.as_str(),
+                is_admin,
+                table_name,
+                schema_ddl_authorized,
+            ) {
                 return Authorization::Deny;
             }
             if let Some(ref caveats) = caveats {
@@ -516,6 +533,33 @@ mod tests {
         assert!(
             err.to_string().contains("not authorized"),
             "expected an authorization error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn drop_table_obeys_schema_authority() {
+        for (ability, is_admin) in [
+            ("tinycloud.sql/schema", false),
+            ("tinycloud.sql/write", false),
+            ("tinycloud.sql/admin", true),
+        ] {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE items (id INTEGER PRIMARY KEY)")
+                .unwrap();
+
+            execute_under_authorizer(&conn, ability, is_admin, "DROP TABLE items")
+                .unwrap_or_else(|error| panic!("{ability} should permit DROP TABLE: {error}"));
+        }
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE items (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let error =
+            execute_under_authorizer(&conn, "tinycloud.sql/read", false, "DROP TABLE items")
+                .expect_err("read authority must not permit DROP TABLE");
+        assert!(
+            error.to_string().contains("not authorized"),
+            "expected an authorization error, got: {error}"
         );
     }
 }
