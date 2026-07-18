@@ -297,6 +297,10 @@ async fn deploy_capability_rejects_execute_body() -> Result<()> {
         Status::Forbidden,
         "a compute/deploy capability must not authorize an Execute body: {body}"
     );
+    assert!(
+        body.starts_with("Unauthorized Action:"),
+        "expected the node's established rejection prefix, got: {body}"
+    );
     Ok(())
 }
 
@@ -330,6 +334,10 @@ async fn execute_capability_rejects_deploy_body() -> Result<()> {
         status,
         Status::Forbidden,
         "a compute/execute capability must not authorize a Deploy body: {body}"
+    );
+    assert!(
+        body.starts_with("Unauthorized Action:"),
+        "expected the node's established rejection prefix, got: {body}"
     );
     Ok(())
 }
@@ -366,6 +374,10 @@ async fn execute_capability_rejects_routine_did_body() -> Result<()> {
         status,
         Status::Forbidden,
         "a compute/execute capability must not authorize a RoutineDid body: {body}"
+    );
+    assert!(
+        body.starts_with("Unauthorized Action:"),
+        "expected the node's established rejection prefix, got: {body}"
     );
     Ok(())
 }

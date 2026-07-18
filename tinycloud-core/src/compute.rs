@@ -19,12 +19,12 @@
 //! has no server-side handler in this plan at all (compute-service.md
 //! §12.1/C9) and stays reserved indefinitely.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The compute service's `POST /invoke` request body, mirroring
 /// `SqlRequest`/`DuckDbRequest`'s tagged-enum `serde_json::from_str` dispatch
 /// (compute-service.md §7.2).
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ComputeRequest {
     /// Run a deployed function. Lands in P2.

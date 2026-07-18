@@ -2061,11 +2061,22 @@ async fn handle_compute_invoke(
         tinycloud_core::policy_capability::ability_matches(ability.as_str(), required_ability)
     });
     if !holds_required {
+        // Mirror the node's established "Unauthorized Action: {resource} /
+        // {ability}" phrasing (see `missing_database_admin_capability_error`,
+        // `InvocationError::UnauthorizedAction`) instead of a bespoke string,
+        // so every ability-mismatch rejection across services reads the same
+        // way on the wire.
+        let (space, path, _held_ability) = &compute_caps[0];
+        let resource = Resource::TinyCloud(space.clone().to_resource(
+            "compute".parse().unwrap(),
+            path.as_deref().map(|p| p.parse().unwrap()),
+            None,
+            None,
+        ));
+        let ability = Ability::try_from(required_ability.to_string()).unwrap();
         return Err((
             Status::Forbidden,
-            format!(
-                "compute request requires ability {required_ability}; presented capabilities do not satisfy it"
-            ),
+            format!("Unauthorized Action: {resource} / {ability}"),
         ));
     }
 
