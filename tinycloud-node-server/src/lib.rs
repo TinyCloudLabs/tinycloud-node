@@ -1,3 +1,6 @@
+//! TinyCloud node server: public API (Rocket), local control plane, and the
+//! `tinycloud node service ...` CLI for desktop/local installs.
+
 #[macro_use]
 extern crate rocket;
 extern crate anyhow;
