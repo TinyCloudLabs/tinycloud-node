@@ -55,6 +55,8 @@ pub mod attestation;
 pub mod encryption;
 pub mod hooks;
 pub mod public;
+#[cfg(feature = "tc-bench-v1")]
+pub mod tc_bench;
 pub mod util;
 use util::LimitedReader;
 
