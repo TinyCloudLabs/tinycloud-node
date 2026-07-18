@@ -353,19 +353,24 @@ derived by the node from the function's **canonical resource URI**, under a
 versioned domain prefix:
 
 ```
-resource_uri = <space>/compute/<function_cid>   (ResourceId display form, §4)
-routine_did  = did:key( get_key("tinycloud/compute-key/v1/" + resource_uri) )
+resource_uri = <space>/compute/<function_cid>          (ResourceId display form, §4;
+                                                        used by authorizer + binding caveat)
+routine_did  = did:key( get_key("tinycloud/compute-key/v1/"
+                                 + hash(<space>) + "/compute/" + <function_cid>) )
 ```
 
-using the existing dstack hierarchical key derivation (`dstack::get_key`,
-`dstack.rs:110-119`). Using the canonical `ResourceId` display string (rather
-than an ad-hoc `space + "/" + cid` concatenation) means **one canonical spelling
-is shared by the authorizer, the binding caveat, and the derivation** — the same
-bytes the resource machinery already produces (`resource.rs:268-282`), so there
-is no second serialization to keep in sync. The `compute-key/v1/` prefix is
-domain-separated and version-tagged, so a future derivation-scheme change (e.g.
-`v2`) does not collide with existing routine identities. The private key is
-derived inside the TEE and never leaves it, so **only this node, running this
+The **canonical resource URI** (`<space>/compute/<function_cid>`) remains the one
+spelling shared by the authorizer and the binding caveat — the exact bytes the
+resource machinery already produces (`resource.rs:268-282`), no second
+serialization to keep in sync. The **key-derivation input**, however, hashes the
+space component into a fixed-width, delimiter-free token (Codex C8, and the
+safety box below) so uniqueness does not depend on the still-stubbed `Name`
+grammar; the `function_cid` is base32 and delimiter-free already. The derivation
+uses the existing dstack hierarchical key derivation (`dstack::get_key`,
+`dstack.rs:110-119`). The `compute-key/v1/` prefix is domain-separated and
+version-tagged, so a future derivation-scheme change (e.g. `v2`) does not collide
+with existing routine identities. The private key is derived inside the TEE and
+never leaves it, so **only this node, running this
 exact function CID in this exact space, can act as the routine.** (Non-TEE /
 classic mode: the same derivation runs off the node's static key material via
 `keys.rs`; the trust statement weakens to "the node" — see §9.3.)
@@ -383,17 +388,21 @@ beats policy-checked) and preserves the D1 choice (still TEE-derived, still no
 secret at rest). This is defense-in-depth *with* the normative
 `(space, functionCid)` selection rule of §5.1 — both layers ship.
 
-> **Safety requirement (blocking before compute activates).** The derivation
-> string's uniqueness depends on `<space>` and `<function_cid>` not colliding
-> into one string across distinct `(space, function)` pairs. CIDs are base32
-> (no `/` or `:` delimiters) — safe. But **space `Name` validation is currently a
-> stubbed `// TODO` in `tinycloud-auth/src/resource.rs`** (`Name::try_from` /
-> `FromStr`, resource.rs:28-44 — accepts any string). Before compute is enabled,
-> space names MUST be validated to **exclude the path/URI delimiters** the
-> resource form uses (`/`, `:`, and the `#`/`?` component markers) — OR the space
-> component MUST be hashed (fixed-width, delimiter-free) before it enters the
-> derivation string — so that no two distinct spaces can produce the same
-> `resource_uri`. This is a precondition, tracked as a test obligation in §13.1.
+> **Safety requirement (blocking before compute activates) — CHOSEN OPTION:
+> hash the space component.** The derivation string's uniqueness depends on
+> `<space>` and `<function_cid>` not colliding into one string across distinct
+> `(space, function)` pairs. CIDs are base32 (no `/` or `:` delimiters) — safe.
+> But **space `Name` validation is a stubbed `// TODO` in
+> `tinycloud-auth/src/resource.rs`** (`Name::try_from` / `FromStr`,
+> resource.rs:28-44), and `SpaceId`/`ResourceId` parsing constructs `Name`
+> directly, bypassing that validator (resource.rs:306-369) — so a narrow
+> `Name::from_str` check would not make real URI parsing safe. **Therefore the
+> compute derivation hashes the canonical space string into a fixed-width,
+> delimiter-free component** before it enters the derivation string, making
+> collisions impossible without depending on the global `Name` grammar. Global
+> `Name` hardening remains desirable but is a **separate, compatibility-sensitive
+> auth task** — NOT a compute precondition. Tracked as a test obligation in
+> §13.1.
 
 **DECIDED (D1): routine identity is this deterministic TEE-derived key.** It
 needs no secret at rest and binds data access to both the function and the node.
@@ -623,6 +632,18 @@ if i.0 .0.capabilities.iter().any(|c| matches!(
 feature-gated `ComputeInvokeState<'a>` type alias exactly like
 `DuckDbInvokeState` (`routes/mod.rs:390-393`):
 `&'a State<ComputeService>` when the feature is on, `()` when off.
+
+**Request-variant → ability mapping (NORMATIVE — Codex C1).** The dispatch above
+only proves the presented `tinycloud.compute/*` capability follows its delegation
+chain (`invocation.rs:218`); it does NOT tie the capability to the *body*. The
+handler therefore MUST map each `ComputeRequest` variant to its required ability
+and reject a request whose presented capability does not satisfy it (via
+`ability_matches`, so an active `compute/*` wildcard covers all): `RoutineDid` and
+`Deploy` require `compute/deploy`; `Execute` requires `compute/execute`; `List`
+requires `compute/list`. Without this a holder of `compute/execute` (or `list`)
+could submit a `Deploy` body. This is exactly why the SQL path carries a separate
+request-sensitive authorization check (`require_sql_admin_for_request`,
+`routes/mod.rs:1232`); compute mirrors it.
 
 ### 7.2 Request encoding — `ComputeRequest`
 
@@ -1254,12 +1275,12 @@ steps are:
   yields distinct `routine_did`s; a space-B execution cannot cite space A's
   `D_fn` (both the derivation-path hardening and the selection rule are
   exercised).
-- **F3 space-name validation (precondition):** a space `Name` containing a URI
-  delimiter (`/`, `:`, `#`, `?`) is rejected at parse/registration before compute
-  activates (or the derivation hashes the space component) — assert that no two
-  distinct spaces can produce the same `resource_uri` derivation string. This
-  guards the currently-stubbed `Name` validation in `tinycloud-auth`
-  (resource.rs:28-44).
+- **Space-component hashing (precondition, Codex C8):** the routine-key
+  derivation hashes the canonical space string into a fixed-width, delimiter-free
+  token; assert that two distinct spaces (including adversarially-chosen names
+  with embedded delimiters) can NEVER produce the same derivation input, without
+  relying on the global `Name` grammar. (Global `Name` hardening is a separate
+  auth task, not tested here.)
 - **Execution manifest (F6 wasmtime):** an execution's returned manifest lists
   every host call `(resource, ability, bytes_in/out, destination)` and the
   granted-vs-exercised capability sets; a function that never touches a granted
