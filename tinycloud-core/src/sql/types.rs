@@ -10,6 +10,10 @@ pub enum SqlRequest {
         sql: String,
         #[serde(default)]
         params: Vec<SqlValue>,
+        #[serde(default, rename = "maxRows")]
+        max_rows: Option<usize>,
+        #[serde(default, rename = "maxBytes")]
+        max_bytes: Option<usize>,
     },
     #[serde(rename = "execute")]
     Execute {
@@ -153,6 +157,31 @@ impl From<&SqlValue> for rusqlite::types::Value {
             SqlValue::Real(f) => rusqlite::types::Value::Real(*f),
             SqlValue::Text(s) => rusqlite::types::Value::Text(s.clone()),
             SqlValue::Blob(b) => rusqlite::types::Value::Blob(b.clone()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    #[test]
+    fn query_deserializes_optional_camel_case_bounds() {
+        let request: SqlRequest = serde_json::from_str(
+            r#"{"action":"query","sql":"SELECT 1","maxRows":100,"maxBytes":1024}"#,
+        )
+        .unwrap();
+
+        match request {
+            SqlRequest::Query {
+                max_rows,
+                max_bytes,
+                ..
+            } => {
+                assert_eq!(max_rows, Some(100));
+                assert_eq!(max_bytes, Some(1024));
+            }
+            _ => panic!("expected query request"),
         }
     }
 }

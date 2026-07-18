@@ -2530,6 +2530,8 @@ mod tests {
         let request = SqlRequest::Query {
             sql: "PRAGMA table_info(secret_records)".to_string(),
             params: Vec::new(),
+            max_rows: None,
+            max_bytes: None,
         };
 
         assert!(sql_request_requires_admin(&request));
@@ -2541,6 +2543,8 @@ mod tests {
         let request = SqlRequest::Query {
             sql: "PRAGMA table_info(secret_records)".to_string(),
             params: Vec::new(),
+            max_rows: None,
+            max_bytes: None,
         };
         let caps = vec![(
             space.clone(),
@@ -2565,6 +2569,8 @@ mod tests {
         let request = SqlRequest::Query {
             sql: "PRAGMA table_info(secret_records)".to_string(),
             params: Vec::new(),
+            max_rows: None,
+            max_bytes: None,
         };
         let caps = vec![(
             space.clone(),
@@ -2962,6 +2968,8 @@ mod tests {
         let raw_query = SqlRequest::Query {
             sql: "SELECT * FROM t".to_string(),
             params: vec![],
+            max_rows: None,
+            max_bytes: None,
         };
         let err = enforce_constrained_profile(&caveat, raw_query).unwrap_err();
         assert_eq!(err.0, Status::Forbidden);
@@ -3663,6 +3671,8 @@ mod tests {
             SqlRequest::Query {
                 sql: "SELECT 1".to_string(),
                 params: vec![],
+                max_rows: None,
+                max_bytes: None,
             },
             SqlRequest::Execute {
                 sql: "INSERT INTO x VALUES (1)".to_string(),
@@ -4744,6 +4754,8 @@ mod tests {
             &SqlRequest::Query {
                 sql: "SELECT 1".to_string(),
                 params: vec![],
+                max_rows: None,
+                max_bytes: None,
             },
             caveats,
             ability
@@ -5063,6 +5075,8 @@ mod tests {
             .body(serde_json::to_string(&SqlRequest::Query {
                 sql: "SELECT val FROM labels WHERE label = 'alpha'".to_string(),
                 params: vec![],
+                max_rows: None,
+                max_bytes: None,
             })?)
             .dispatch()
             .await;

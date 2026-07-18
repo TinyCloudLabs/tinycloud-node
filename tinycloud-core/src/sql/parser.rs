@@ -48,6 +48,11 @@ pub fn validate_sql(
     if statements.is_empty() {
         return Err(SqlError::ParseError("Empty SQL statement".to_string()));
     }
+    if statements.len() != 1 {
+        return Err(SqlError::InvalidStatement(
+            "Exactly one SQL statement is required".to_string(),
+        ));
+    }
 
     let mut tables = Vec::new();
     let mut columns = Vec::new();
@@ -514,9 +519,24 @@ mod tests {
         .expect_err("schema ability must not authorize mixed DDL and reads");
 
         assert!(
-            matches!(err, SqlError::PermissionDenied(ref message) if message.contains("only permits DDL")),
-            "expected mixed-statement permission denial, got {err:?}"
+            matches!(err, SqlError::InvalidStatement(ref message) if message.contains("Exactly one")),
+            "expected multi-statement rejection, got {err:?}"
         );
+    }
+
+    #[test]
+    fn query_rejects_multiple_statements() {
+        let err = validate_sql(
+            "SELECT id FROM conversation; SELECT id FROM private_conversation",
+            &None,
+            "tinycloud.sql/read",
+        )
+        .expect_err("a query request must contain one statement");
+
+        assert!(matches!(
+            err,
+            SqlError::InvalidStatement(ref message) if message.contains("Exactly one")
+        ));
     }
 
     #[test]

@@ -14,6 +14,8 @@ use super::{
 };
 
 const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024; // 10MB
+const MAX_BOUNDED_QUERY_ROWS: usize = 1_000;
+const MAX_BOUNDED_QUERY_BYTES: usize = 4 * 1024 * 1024;
 const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300); // 5 min
 
 enum DbMessage {
@@ -185,14 +187,19 @@ fn handle_message(
     let is_admin = crate::policy_capability::ability_matches(ability, "tinycloud.sql/admin");
 
     match request {
-        SqlRequest::Query { sql, params } => {
+        SqlRequest::Query {
+            sql,
+            params,
+            max_rows,
+            max_bytes,
+        } => {
             let parsed = parser::validate_sql(sql, caveats, ability)?;
 
             let auth =
                 authorizer::create_authorizer(caveats.clone(), ability.to_string(), is_admin);
             conn.authorizer(Some(auth));
 
-            let result = execute_query(conn, sql, params);
+            let result = execute_query(conn, sql, params, *max_rows, *max_bytes);
 
             conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
 
@@ -292,7 +299,7 @@ fn handle_message(
                 .to_uppercase()
                 .starts_with("SELECT")
             {
-                execute_query(conn, &prepared.sql, params).map(SqlResponse::Query)
+                execute_query(conn, &prepared.sql, params, None, None).map(SqlResponse::Query)
             } else {
                 execute_statement(conn, &prepared.sql, params).map(SqlResponse::Execute)
             };
@@ -334,7 +341,10 @@ fn execute_query(
     conn: &rusqlite::Connection,
     sql: &str,
     params: &[SqlValue],
+    max_rows: Option<usize>,
+    max_bytes: Option<usize>,
 ) -> Result<QueryResponse, SqlError> {
+    validate_query_limits(max_rows, max_bytes)?;
     let mut stmt = conn
         .prepare(sql)
         .map_err(|e| SqlError::Sqlite(e.to_string()))?;
@@ -359,6 +369,9 @@ fn execute_query(
         .next()
         .map_err(|e| SqlError::Sqlite(e.to_string()))?
     {
+        if max_rows.is_some_and(|limit| rows.len() >= limit) {
+            return Err(SqlError::ResponseTooLarge(size_estimate as u64));
+        }
         let mut values = Vec::new();
         for i in 0..columns.len() {
             let val = row_to_sql_value(row, i)?;
@@ -367,7 +380,7 @@ fn execute_query(
         }
         rows.push(values);
 
-        if size_estimate > MAX_RESPONSE_SIZE {
+        if size_estimate > max_bytes.unwrap_or(MAX_RESPONSE_SIZE) {
             return Err(SqlError::ResponseTooLarge(size_estimate as u64));
         }
     }
@@ -378,6 +391,23 @@ fn execute_query(
         rows,
         row_count,
     })
+}
+
+fn validate_query_limits(
+    max_rows: Option<usize>,
+    max_bytes: Option<usize>,
+) -> Result<(), SqlError> {
+    if max_rows.is_some_and(|value| value == 0 || value > MAX_BOUNDED_QUERY_ROWS) {
+        return Err(SqlError::InvalidStatement(format!(
+            "maxRows must be between 1 and {MAX_BOUNDED_QUERY_ROWS}"
+        )));
+    }
+    if max_bytes.is_some_and(|value| value == 0 || value > MAX_BOUNDED_QUERY_BYTES) {
+        return Err(SqlError::InvalidStatement(format!(
+            "maxBytes must be between 1 and {MAX_BOUNDED_QUERY_BYTES}"
+        )));
+    }
+    Ok(())
 }
 
 fn execute_statement(
@@ -399,4 +429,43 @@ fn execute_statement(
         changes: conn.changes(),
         last_insert_row_id: conn.last_insert_rowid(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_query_rejects_more_rows_than_requested() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let err = execute_query(&conn, "SELECT 1 UNION ALL SELECT 2", &[], Some(1), None)
+            .expect_err("the second row must exceed maxRows");
+
+        assert!(matches!(err, SqlError::ResponseTooLarge(_)));
+    }
+
+    #[test]
+    fn bounded_query_rejects_response_larger_than_requested() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let err = execute_query(&conn, "SELECT 'payload'", &[], None, Some(1))
+            .expect_err("the text value must exceed maxBytes");
+
+        assert!(matches!(err, SqlError::ResponseTooLarge(_)));
+    }
+
+    #[test]
+    fn bounded_query_validates_public_limits() {
+        assert!(matches!(
+            validate_query_limits(Some(0), None),
+            Err(SqlError::InvalidStatement(_))
+        ));
+        assert!(matches!(
+            validate_query_limits(Some(MAX_BOUNDED_QUERY_ROWS + 1), None),
+            Err(SqlError::InvalidStatement(_))
+        ));
+        assert!(matches!(
+            validate_query_limits(None, Some(MAX_BOUNDED_QUERY_BYTES + 1)),
+            Err(SqlError::InvalidStatement(_))
+        ));
+    }
 }
