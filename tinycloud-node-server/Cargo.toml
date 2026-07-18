@@ -83,6 +83,8 @@ path = "../tinycloud-auth/"
 [dev-dependencies]
 bs58 = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+k256 = { version = "0.13.4", features = ["ecdsa"] }
+sha3 = "0.10"
 
 [features]
 default = []

@@ -148,7 +148,7 @@ pub async fn app(
     tracing::tracing_try_init(&tinycloud_config.log)?;
 
     let routes = {
-        let mut routes = routes![
+        let routes = routes![
             healthcheck,
             cors,
             info,
@@ -311,10 +311,7 @@ pub async fn app(
 
     #[cfg(feature = "tc-bench-v1")]
     let bench_state = BenchState::new(
-        std::env::var("TC_BENCH_REGION")
-            .or_else(|_| std::env::var("PHALA_REGION"))
-            .or_else(|_| std::env::var("AWS_REGION"))
-            .unwrap_or_else(|_| "phala-cvm".to_string()),
+        &tinycloud_config.tc_bench,
         bench_database_connection,
         if is_sqlite { 1 } else { 100 },
     )

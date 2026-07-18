@@ -28,6 +28,7 @@ use tinycloud_core::{
     },
 };
 
+use crate::config::TcBenchConfig;
 use crate::routes::public::RawKeyPath;
 
 const MAX_BLOCK_BYTES: u64 = 8 * 1024 * 1024;
@@ -63,13 +64,19 @@ impl Default for ArtifactHashes {
 }
 
 impl ArtifactHashes {
-    fn from_env() -> Result<Self, DbErr> {
+    fn from_config(config: &TcBenchConfig) -> Result<Self, DbErr> {
         Ok(Self {
             contract_blake3: CONTRACT_BLAKE3,
             golden_vectors_blake3: GOLDEN_VECTORS_BLAKE3,
             block_fixtures_blake3: BLOCK_FIXTURES_BLAKE3,
-            worker_bundle_sha256: required_sha256_env("TC_BENCH_WORKER_BUNDLE_SHA256")?,
-            wasm_bundle_sha256: required_sha256_env("TC_BENCH_WASM_BUNDLE_SHA256")?,
+            worker_bundle_sha256: required_sha256_config(
+                "tc_bench.worker_bundle_sha256",
+                config.worker_bundle_sha256.as_deref(),
+            )?,
+            wasm_bundle_sha256: required_sha256_config(
+                "tc_bench.wasm_bundle_sha256",
+                config.wasm_bundle_sha256.as_deref(),
+            )?,
         })
     }
 }
@@ -126,7 +133,7 @@ impl<'r> FromRequest<'r> for BenchSessionToken {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequiredCapability {
     pub service: String,
@@ -135,7 +142,7 @@ pub struct RequiredCapability {
     pub action: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthVerifyRequest {
     pub siwe: String,
@@ -161,7 +168,7 @@ pub struct AuthVerifyResponse {
     pub session: AuthVerifySession,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KvPutRequest {
     pub value: Value,
@@ -319,7 +326,7 @@ impl BenchTimings {
 
 impl BenchState {
     pub async fn new(
-        region: String,
+        config: &TcBenchConfig,
         db: DatabaseConnection,
         sqlite_pool_size: u32,
     ) -> Result<Self, DbErr> {
@@ -330,9 +337,9 @@ impl BenchState {
         };
         let state = Self {
             db,
-            region,
+            region: config.region.clone(),
             sqlite,
-            artifact_hashes: ArtifactHashes::from_env()?,
+            artifact_hashes: ArtifactHashes::from_config(config)?,
         };
         state.ensure_schema().await?;
         Ok(state)
@@ -573,18 +580,6 @@ where
     }
 }
 
-async fn nonce_replayed<C>(db: &C, nonce: &str) -> Result<bool, DbErr>
-where
-    C: ConnectionTrait + ?Sized,
-{
-    let statement = Statement::from_sql_and_values(
-        DatabaseBackend::Sqlite,
-        "SELECT 1 FROM tc_bench_sessions WHERE nonce = ? LIMIT 1".to_string(),
-        vec![nonce.to_string().into()],
-    );
-    Ok(db.query_one(statement).await?.is_some())
-}
-
 fn parse_signature(signature: &str) -> Result<[u8; 65], BenchError> {
     let signature = signature.strip_prefix("0x").unwrap_or(signature);
     let bytes =
@@ -678,11 +673,11 @@ impl TryFrom<QueryResult> for BenchBlockRow {
     }
 }
 
-async fn store_session(state: &BenchState, session: &BenchSessionRow) -> Result<(), DbErr> {
+async fn store_session(state: &BenchState, session: &BenchSessionRow) -> Result<bool, DbErr> {
     let tx = state.db().begin().await?;
-    tx.execute(Statement::from_sql_and_values(
+    let result = tx.execute(Statement::from_sql_and_values(
         DatabaseBackend::Sqlite,
-        "INSERT INTO tc_bench_sessions (token, nonce, principal_did, address, recap_depth, service, space, path, action, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string(),
+        "INSERT OR IGNORE INTO tc_bench_sessions (token, nonce, principal_did, address, recap_depth, service, space, path, action, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string(),
         vec![
             session.token.clone().into(),
             session.nonce.clone().into(),
@@ -697,8 +692,11 @@ async fn store_session(state: &BenchState, session: &BenchSessionRow) -> Result<
         ],
     ))
     .await?;
+    if result.rows_affected() == 0 {
+        return Ok(false);
+    }
     tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 async fn upsert_kv(
@@ -769,19 +767,19 @@ fn response_json_error(error: BenchError, timings: &BenchTimings) -> BenchRespon
     json_error(error, timings)
 }
 
-fn required_sha256_env(name: &str) -> Result<String, DbErr> {
-    let value = std::env::var(name)
-        .map_err(|_| DbErr::Custom(format!("missing required environment variable {name}")))?;
+fn required_sha256_config(name: &str, value: Option<&str>) -> Result<String, DbErr> {
+    let value =
+        value.ok_or_else(|| DbErr::Custom(format!("missing required config field {name}")))?;
     if value.len() != 64
         || !value
             .chars()
             .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
     {
         return Err(DbErr::Custom(format!(
-            "environment variable {name} must be a 64-character hexadecimal string"
+            "config field {name} must be a 64-character hexadecimal string"
         )));
     }
-    Ok(value)
+    Ok(value.to_string())
 }
 
 #[post("/auth/verify", data = "<body>")]
@@ -812,32 +810,13 @@ pub async fn auth_verify(body: String, state: &State<BenchState>) -> BenchRespon
         Err(err) => return response_json_error(err, &timings),
     };
 
-    let recovered = match message.verify_eip191(&signature) {
+    let _recovered = match message.verify_eip191(&signature) {
         Ok(recovered) => recovered,
         Err(e) => {
             return response_json_error(BenchError::auth_invalid_signature(e.to_string()), &timings)
         }
     };
 
-    let recovered: [u8; 20] = match recovered.try_into() {
-        Ok(address) => address,
-        Err(_) => {
-            return response_json_error(
-                BenchError::auth_invalid_signature("recovered signer must be a 20-byte address"),
-                &timings,
-            )
-        }
-    };
-    if recovered != message.address {
-        return response_json_error(
-            BenchError::auth_invalid_signature("recovered signer did not match the SIWE address"),
-            &timings,
-        );
-    }
-    let recovered_address = match eip55_address(&recovered) {
-        Ok(address) => address,
-        Err(err) => return response_json_error(err, &timings),
-    };
     let message_address = match eip55_address(&message.address) {
         Ok(address) => address,
         Err(err) => return response_json_error(err, &timings),
@@ -898,7 +877,7 @@ pub async fn auth_verify(body: String, state: &State<BenchState>) -> BenchRespon
     let session = BenchSessionRow {
         token: random_token(),
         nonce: message.nonce.clone(),
-        principal_did: principal_did(message.chain_id, &recovered_address),
+        principal_did: principal_did(message.chain_id, &message_address),
         address: message_address,
         recap_depth: recap.proof().len(),
         service: request.required_capability.service.clone(),
@@ -908,17 +887,14 @@ pub async fn auth_verify(body: String, state: &State<BenchState>) -> BenchRespon
         expires_at,
     };
 
-    match nonce_replayed(state.inner().db(), &session.nonce).await {
-        Ok(true) => {
-            return response_json_error(BenchError::nonce_replay("nonce already used"), &timings)
-        }
-        Ok(false) => {}
-        Err(err) => return response_json_error(BenchError::internal(err.to_string()), &timings),
-    }
     let store_result = store_session(state, &session).await;
     timings.record("delegation", delegation_start.elapsed());
-    if let Err(err) = store_result {
-        return response_json_error(BenchError::internal(err.to_string()), &timings);
+    match store_result {
+        Ok(true) => {}
+        Ok(false) => {
+            return response_json_error(BenchError::nonce_replay("nonce already used"), &timings)
+        }
+        Err(err) => return response_json_error(BenchError::internal(err.to_string()), &timings),
     }
 
     let response = AuthVerifyResponse {
@@ -1313,4 +1289,378 @@ pub async fn health(state: &State<BenchState>) -> BenchResponder {
     };
     timings.record("serialize", serialize_start.elapsed());
     response_with_headers(Status::Ok, ContentType::JSON, body, &timings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    use k256::ecdsa::SigningKey;
+    use rocket::http::{ContentType, Header, Status};
+    use rocket::local::asynchronous::Client;
+    use serde_json::{json, Value};
+    use sha3::{Digest, Keccak256};
+    use tempfile::TempDir;
+    use time::{Duration as TimeDuration, OffsetDateTime};
+    use tinycloud_auth::{
+        cacaos::siwe::{Message, Version},
+        resolver::DID_METHODS,
+        resource::SpaceId,
+        siwe_recap::{Ability as RecapAbility, Capability as RecapCapability},
+        ssi::{dids::DIDBuf, jwk::JWK},
+    };
+    use tinycloud_core::sea_orm::{ConnectOptions, Database};
+
+    fn test_space_id(name: &str) -> SpaceId {
+        let jwk = JWK::generate_ed25519().unwrap();
+        let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
+        SpaceId::new(did, name.parse().unwrap())
+    }
+
+    fn bench_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[0x11u8; 32].into()).unwrap()
+    }
+
+    fn ethereum_address(signing_key: &SigningKey) -> [u8; 20] {
+        let public_key = signing_key.verifying_key().to_encoded_point(false);
+        let digest = Keccak256::digest(&public_key.as_bytes()[1..]);
+        digest[12..].try_into().unwrap()
+    }
+
+    fn signed_siwe_payload(
+        signing_key: &SigningKey,
+        required_capability: &RequiredCapability,
+        nonce: &str,
+    ) -> Result<(String, String)> {
+        let address = ethereum_address(signing_key);
+        let resource =
+            required_resource(required_capability).map_err(|err| anyhow::anyhow!(err.message))?;
+        let mut recap = RecapCapability::<Value>::new();
+        recap.with_action(
+            resource.as_uri().clone(),
+            RecapAbility::try_from(required_capability.action.clone())?,
+            [std::collections::BTreeMap::<String, Value>::new()],
+        );
+        let message = recap.build_message(Message {
+            scheme: Some("https".parse().unwrap()),
+            domain: "bench.local".parse().unwrap(),
+            address,
+            statement: None,
+            uri: "https://bench.local/tc-bench".parse().unwrap(),
+            version: Version::V1,
+            chain_id: 1,
+            nonce: nonce.to_string(),
+            issued_at: (OffsetDateTime::now_utc() - TimeDuration::minutes(1)).into(),
+            expiration_time: Some((OffsetDateTime::now_utc() + TimeDuration::hours(1)).into()),
+            not_before: None,
+            request_id: None,
+            resources: vec![],
+        })?;
+        let (signature, recovery_id) =
+            signing_key.sign_prehash_recoverable(&message.eip191_hash()?)?;
+        let mut signature_bytes = [0u8; 65];
+        signature_bytes[..64].copy_from_slice(signature.to_bytes().as_ref());
+        signature_bytes[64] = u8::from(recovery_id) + 27;
+        Ok((
+            message.to_string(),
+            format!("0x{}", hex::encode(signature_bytes)),
+        ))
+    }
+
+    fn auth_verify_body(
+        required_capability: RequiredCapability,
+        signing_key: &SigningKey,
+        nonce: &str,
+    ) -> Result<String> {
+        let (siwe, signature) = signed_siwe_payload(signing_key, &required_capability, nonce)?;
+        Ok(serde_json::to_string(&AuthVerifyRequest {
+            siwe,
+            signature,
+            required_capability,
+        })?)
+    }
+
+    async fn bench_client() -> Result<(TempDir, Client)> {
+        let tempdir = TempDir::new()?;
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
+        let bench_config = TcBenchConfig {
+            region: "test-region".to_string(),
+            worker_bundle_sha256: Some("a".repeat(64)),
+            wasm_bundle_sha256: Some("b".repeat(64)),
+        };
+        let state = BenchState::new(&bench_config, db, 1).await?;
+        let rocket = rocket::build()
+            .mount(
+                "/",
+                routes![auth_verify, kv_put, kv_get, block_put, block_get, health],
+            )
+            .manage(state);
+        let client = Client::tracked(rocket).await?;
+        Ok((tempdir, client))
+    }
+
+    async fn issue_session(
+        client: &Client,
+        required_capability: RequiredCapability,
+        signing_key: &SigningKey,
+        nonce: &str,
+    ) -> Result<String> {
+        let body = auth_verify_body(required_capability, signing_key, nonce)?;
+        let response = client
+            .post("/auth/verify")
+            .header(ContentType::JSON)
+            .body(body)
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            Status::Ok,
+            "unexpected auth/verify response: {body}"
+        );
+        let json: Value = serde_json::from_str(&body)?;
+        Ok(json["session"]["token"]
+            .as_str()
+            .expect("session token present")
+            .to_string())
+    }
+
+    fn bearer(token: &str) -> Header<'static> {
+        Header::new("Authorization", format!("Bearer {token}"))
+    }
+
+    #[tokio::test]
+    async fn tc_bench_golden_vector_happy_path_round_trips() -> Result<()> {
+        let (_tempdir, client) = bench_client().await?;
+        let signing_key = bench_signing_key();
+        let space = test_space_id("bench");
+        let kv_path = "app/transcript/1";
+        let kv_value = json!({
+            "message": "hello tc-bench",
+            "sequence": 1,
+        });
+        let kv_content = serde_json::to_vec(&canonicalize_json(kv_value.clone()))?;
+        let kv_hash = blake3_content_hash(&kv_content);
+        let kv_put_capability = RequiredCapability {
+            service: "tinycloud.kv".to_string(),
+            space: space.to_string(),
+            path: kv_path.to_string(),
+            action: "tinycloud.kv/put".to_string(),
+        };
+        let kv_put_token = issue_session(
+            &client,
+            kv_put_capability,
+            &signing_key,
+            "urn:uuid:00000000-0000-4000-8000-000000000001",
+        )
+        .await?;
+        let kv_put_response = client
+            .put(format!("/kv/{}/{}", space, kv_path))
+            .header(bearer(&kv_put_token))
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&KvPutRequest {
+                value: kv_value.clone(),
+                content_type: "application/json".to_string(),
+                content_hash: kv_hash.clone(),
+            })?)
+            .dispatch()
+            .await;
+        let kv_put_status = kv_put_response.status();
+        let kv_put_body = kv_put_response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            kv_put_status,
+            Status::Created,
+            "unexpected kv/put response: {kv_put_body}"
+        );
+
+        let kv_get_capability = RequiredCapability {
+            service: "tinycloud.kv".to_string(),
+            space: space.to_string(),
+            path: kv_path.to_string(),
+            action: "tinycloud.kv/get".to_string(),
+        };
+        let kv_get_token = issue_session(
+            &client,
+            kv_get_capability,
+            &signing_key,
+            "urn:uuid:00000000-0000-4000-8000-000000000002",
+        )
+        .await?;
+        let kv_get_response = client
+            .get(format!("/kv/{}/{}", space, kv_path))
+            .header(bearer(&kv_get_token))
+            .dispatch()
+            .await;
+        let kv_get_status = kv_get_response.status();
+        let kv_get_body = kv_get_response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            kv_get_status,
+            Status::Ok,
+            "unexpected kv/get response: {kv_get_body}"
+        );
+        let kv_get_json: Value = serde_json::from_str(&kv_get_body)?;
+        assert_eq!(kv_get_json["value"], kv_value);
+
+        let block_bytes = b"bench block payload".to_vec();
+        let block_hash = hex::encode(Vec::<u8>::from(hash(&block_bytes)));
+        let block_capability = RequiredCapability {
+            service: "tinycloud.kv".to_string(),
+            space: space.to_string(),
+            path: "blocks/vector.bin".to_string(),
+            action: "tinycloud.kv/put".to_string(),
+        };
+        let block_token = issue_session(
+            &client,
+            block_capability,
+            &signing_key,
+            "urn:uuid:00000000-0000-4000-8000-000000000003",
+        )
+        .await?;
+        let block_put_response = client
+            .put(format!("/block/{block_hash}"))
+            .header(bearer(&block_token))
+            .body(block_bytes.clone())
+            .dispatch()
+            .await;
+        let block_put_status = block_put_response.status();
+        let block_put_body = block_put_response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            block_put_status,
+            Status::Created,
+            "unexpected block/put response: {block_put_body}"
+        );
+
+        let block_get_response = client
+            .get(format!("/block/{block_hash}"))
+            .header(bearer(&block_token))
+            .dispatch()
+            .await;
+        let block_get_status = block_get_response.status();
+        let block_get_body = block_get_response.into_bytes().await.unwrap_or_default();
+        assert_eq!(block_get_status, Status::Ok);
+        assert_eq!(block_get_body, block_bytes);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc_bench_replayed_nonce_is_rejected() -> Result<()> {
+        let (_tempdir, client) = bench_client().await?;
+        let signing_key = bench_signing_key();
+        let space = test_space_id("bench-replay");
+        let capability = RequiredCapability {
+            service: "tinycloud.kv".to_string(),
+            space: space.to_string(),
+            path: "app/transcript/2".to_string(),
+            action: "tinycloud.kv/put".to_string(),
+        };
+        let body = auth_verify_body(
+            capability,
+            &signing_key,
+            "urn:uuid:00000000-0000-4000-8000-000000000010",
+        )?;
+
+        let first = client
+            .post("/auth/verify")
+            .header(ContentType::JSON)
+            .body(body.clone())
+            .dispatch()
+            .await;
+        assert_eq!(first.status(), Status::Ok);
+
+        let replay = client
+            .post("/auth/verify")
+            .header(ContentType::JSON)
+            .body(body)
+            .dispatch()
+            .await;
+        let status = replay.status();
+        let body = replay.into_string().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            Status::Conflict,
+            "unexpected replay response: {body}"
+        );
+        let json: Value = serde_json::from_str(&body)?;
+        assert_eq!(json["error"]["code"], "NONCE_REPLAY");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc_bench_digest_mismatch_rejections_are_reported() -> Result<()> {
+        let (_tempdir, client) = bench_client().await?;
+        let signing_key = bench_signing_key();
+        let space = test_space_id("bench-digest");
+        let kv_path = "app/transcript/3";
+        let kv_capability = RequiredCapability {
+            service: "tinycloud.kv".to_string(),
+            space: space.to_string(),
+            path: kv_path.to_string(),
+            action: "tinycloud.kv/put".to_string(),
+        };
+        let kv_token = issue_session(
+            &client,
+            kv_capability,
+            &signing_key,
+            "urn:uuid:00000000-0000-4000-8000-000000000020",
+        )
+        .await?;
+        let kv_body = serde_json::to_string(&KvPutRequest {
+            value: json!({"message": "digest mismatch"}),
+            content_type: "application/json".to_string(),
+            content_hash: "blake3-0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+        })?;
+        let kv_response = client
+            .put(format!("/kv/{}/{}", space, kv_path))
+            .header(bearer(&kv_token))
+            .header(ContentType::JSON)
+            .body(kv_body)
+            .dispatch()
+            .await;
+        let kv_status = kv_response.status();
+        let kv_body = kv_response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            kv_status,
+            Status::UnprocessableEntity,
+            "unexpected kv mismatch response: {kv_body}"
+        );
+        let kv_json: Value = serde_json::from_str(&kv_body)?;
+        assert_eq!(kv_json["error"]["code"], "DIGEST_MISMATCH");
+
+        let block_bytes = b"block mismatch body".to_vec();
+        let block_hash = hex::encode(Vec::<u8>::from(hash(b"block mismatch expected")));
+        let block_capability = RequiredCapability {
+            service: "tinycloud.kv".to_string(),
+            space: space.to_string(),
+            path: "blocks/vector.bin".to_string(),
+            action: "tinycloud.kv/put".to_string(),
+        };
+        let block_token = issue_session(
+            &client,
+            block_capability,
+            &signing_key,
+            "urn:uuid:00000000-0000-4000-8000-000000000021",
+        )
+        .await?;
+        let block_response = client
+            .put(format!("/block/{block_hash}"))
+            .header(bearer(&block_token))
+            .body(block_bytes)
+            .dispatch()
+            .await;
+        let block_status = block_response.status();
+        let block_body = block_response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            block_status,
+            Status::UnprocessableEntity,
+            "unexpected block mismatch response: {block_body}"
+        );
+        let block_json: Value = serde_json::from_str(&block_body)?;
+        assert_eq!(block_json["error"]["code"], "DIGEST_MISMATCH");
+
+        Ok(())
+    }
 }
