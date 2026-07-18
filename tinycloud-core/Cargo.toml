@@ -11,6 +11,10 @@ sqlite = ["sea-orm/sqlx-sqlite"]
 postgres = ["sea-orm/sqlx-postgres"]
 mysql = ["sea-orm/sqlx-mysql"]
 duckdb = ["dep:arrow", "dep:duckdb"]
+# P0 walking skeleton (specs/compute-service-implementation-plan.md). No
+# extra deps yet — wasmtime and the routine-key-derivation backends land in
+# P1/P2.
+compute = []
 
 tokio = ["sea-orm/runtime-tokio-rustls"]
 async-std = ["sea-orm/runtime-async-std-rustls"]
