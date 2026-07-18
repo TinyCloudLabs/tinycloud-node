@@ -30,12 +30,15 @@ fn can_write_table(ability: &str, is_admin: bool, table_name: &str) -> bool {
 fn can_delete_table(
     ability: &str,
     is_admin: bool,
+    database_name: Option<&str>,
     table_name: &str,
-    schema_drop_target: Option<&str>,
+    schema_drop_target: Option<&(Option<String>, String)>,
 ) -> bool {
     can_write_table(ability, is_admin, table_name)
         || (resolve_alias(ability) == "tinycloud.sql/schema"
-            && schema_drop_target == Some(table_name))
+            && schema_drop_target.is_some_and(|(target_database, target_name)| {
+                target_database.as_deref() == database_name && target_name == table_name
+            }))
 }
 
 pub fn create_authorizer(
@@ -44,7 +47,7 @@ pub fn create_authorizer(
     is_admin: bool,
 ) -> impl FnMut(AuthContext<'_>) -> Authorization {
     let mut schema_ddl_authorized = false;
-    let mut schema_drop_target: Option<String> = None;
+    let mut schema_drop_target: Option<(Option<String>, String)> = None;
     move |ctx: AuthContext<'_>| match ctx.action {
         // Always deny attach/detach
         AuthAction::Attach { .. } | AuthAction::Detach { .. } => Authorization::Deny,
@@ -220,8 +223,9 @@ pub fn create_authorizer(
             if !can_delete_table(
                 ability.as_str(),
                 is_admin,
+                ctx.database_name,
                 table_name,
-                schema_drop_target.as_deref(),
+                schema_drop_target.as_ref(),
             ) {
                 return Authorization::Deny;
             }
@@ -272,7 +276,18 @@ pub fn create_authorizer(
             }
         }
 
-        AuthAction::DropTable { table_name } | AuthAction::DropTempTable { table_name } => {
+        AuthAction::DropTable {
+            table_name: object_name,
+        }
+        | AuthAction::DropTempTable {
+            table_name: object_name,
+        }
+        | AuthAction::DropView {
+            view_name: object_name,
+        }
+        | AuthAction::DropTempView {
+            view_name: object_name,
+        } => {
             if !(is_admin
                 || ability_matches(ability.as_str(), "tinycloud.sql/write")
                 || ability_matches(ability.as_str(), "tinycloud.sql/schema"))
@@ -281,7 +296,10 @@ pub fn create_authorizer(
             } else {
                 if !is_admin && resolve_alias(ability.as_str()) == "tinycloud.sql/schema" {
                     schema_ddl_authorized = true;
-                    schema_drop_target = Some(table_name.to_owned());
+                    schema_drop_target = Some((
+                        ctx.database_name.map(str::to_owned),
+                        object_name.to_owned(),
+                    ));
                 }
                 Authorization::Allow
             }
@@ -293,13 +311,11 @@ pub fn create_authorizer(
         | AuthAction::CreateTrigger { .. }
         | AuthAction::DropTrigger { .. }
         | AuthAction::CreateView { .. }
-        | AuthAction::DropView { .. }
         | AuthAction::CreateTempIndex { .. }
         | AuthAction::DropTempIndex { .. }
         | AuthAction::CreateTempTrigger { .. }
         | AuthAction::DropTempTrigger { .. }
         | AuthAction::CreateTempView { .. }
-        | AuthAction::DropTempView { .. }
         // SQLite fires SQLITE_REINDEX while building an index; gate it like the
         // CreateIndex it accompanies so an authorized CREATE INDEX can complete.
         | AuthAction::Reindex { .. } => {
@@ -592,15 +608,35 @@ mod tests {
         }
 
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE items (id INTEGER PRIMARY KEY)")
+        conn.execute_batch("CREATE TEMP TABLE temp_items (id INTEGER PRIMARY KEY)")
             .unwrap();
-        let error =
-            execute_under_authorizer(&conn, "tinycloud.sql/read", false, "DROP TABLE items")
+        execute_under_authorizer(
+            &conn,
+            "tinycloud.sql/schema",
+            false,
+            "DROP TABLE temp.temp_items",
+        )
+        .expect("schema authority should permit DROP TEMP TABLE");
+
+        for (setup, sql) in [
+            (
+                "CREATE TABLE read_items (id INTEGER PRIMARY KEY)",
+                "DROP TABLE read_items",
+            ),
+            (
+                "CREATE TEMP TABLE read_items (id INTEGER PRIMARY KEY)",
+                "DROP TABLE temp.read_items",
+            ),
+        ] {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            conn.execute_batch(setup).unwrap();
+            let error = execute_under_authorizer(&conn, "tinycloud.sql/read", false, sql)
                 .expect_err("read authority must not permit DROP TABLE");
-        assert!(
-            error.to_string().contains("not authorized"),
-            "expected an authorization error, got: {error}"
-        );
+            assert!(
+                error.to_string().contains("not authorized"),
+                "expected an authorization error, got: {error}"
+            );
+        }
     }
 
     #[test]
@@ -699,5 +735,50 @@ mod tests {
             Some(1),
             "failed DROP must retain the child foreign key"
         );
+    }
+
+    #[test]
+    fn drop_view_obeys_schema_authority_in_main_and_temp() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE VIEW shared_view AS SELECT 1 AS value;
+             CREATE TEMP VIEW shared_view AS SELECT 2 AS value;",
+        )
+        .unwrap();
+
+        execute_under_authorizer(
+            &conn,
+            "tinycloud.sql/schema",
+            false,
+            "DROP VIEW main.shared_view",
+        )
+        .expect("schema authority should drop the main view");
+        let temp_value: i64 = conn
+            .query_row("SELECT value FROM temp.shared_view", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(temp_value, 2, "dropping main must retain the temp view");
+
+        execute_under_authorizer(
+            &conn,
+            "tinycloud.sql/schema",
+            false,
+            "DROP VIEW temp.shared_view",
+        )
+        .expect("schema authority should drop the temp view");
+
+        for sql in ["DROP VIEW main.read_view", "DROP VIEW temp.read_view"] {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE VIEW read_view AS SELECT 1 AS value;
+                 CREATE TEMP VIEW read_view AS SELECT 2 AS value;",
+            )
+            .unwrap();
+            let error = execute_under_authorizer(&conn, "tinycloud.sql/read", false, sql)
+                .expect_err("read authority must not drop a view");
+            assert!(
+                error.to_string().contains("not authorized"),
+                "expected an authorization error, got: {error}"
+            );
+        }
     }
 }
