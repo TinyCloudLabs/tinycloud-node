@@ -1318,3 +1318,121 @@ steps are:
   a subsequent over-quota deploy 402s.
 - **F1.5 rotation:** an execute whose re-derived key ≠ `D_fn.delegatee` fails
   with the distinct `routine-identity-rotated` code, not a generic 403.
+
+---
+
+## Appendix A — P2 Conformance Fixture (`compute_fixture`)
+
+The single WAT fixture both P2 implementers build against and both judges score
+against. It exercises all four MVP host imports (§9.1), a denial case, and the
+granted-but-unexercised manifest signal — deterministically, with **no wall-clock
+dependence** (fuel-metered; no `maxDuration`/epoch assertion; the asserted
+manifest fields are structural).
+
+Conventions: all payloads are **canonical JSON** (UTF-8, sorted keys, no
+insignificant whitespace) so byte lengths are deterministic. `<space>` is the
+E2E's test space; `db` is its default SQL database (§7.2 `db_name`).
+
+### A.1 The `D_fn` grant the fixture assumes
+
+The routine's deploy-time `D_fn` (§6.2) grants exactly:
+
+| ability | resource path | used by |
+|---------|---------------|---------|
+| `tinycloud.kv/get` | `in/` (prefix) | step 1 |
+| `tinycloud.kv/put` | `out/` (prefix) | step 2 |
+| `tinycloud.kv/del` | `out/` (prefix) | step 4 |
+| `tinycloud.sql/read` | `db` | step 3 |
+| `tinycloud.sql/write` | `db` | **granted, never exercised** (manifest signal) |
+
+It does **NOT** grant `kv/put` on `secret/` — that is the denial case (step 5).
+
+**E2E precondition:** before `execute`, seed `in/x = "42"` (a normal KV put by
+the space owner, outside the routine).
+
+### A.2 Guest module (WAT shape)
+
+Core module (not a component), module import name `"tinycloud"`:
+
+```wat
+(module
+  (import "tinycloud" "storage_get" (func $get  (param i32 i32) (result i32 i32)))
+  (import "tinycloud" "storage_put" (func $put  (param i32 i32) (result i32 i32)))
+  (import "tinycloud" "storage_del" (func $del  (param i32 i32) (result i32 i32)))
+  (import "tinycloud" "sql_query"   (func $sql  (param i32 i32) (result i32 i32)))
+  (memory (export "memory") 1)
+  (func (export "alloc") (param i32) (result i32) ...)          ;; bump allocator
+  (func (export "run")   (param i32 i32) (result i32 i32) ...)) ;; the scenario below
+```
+
+`alloc(len)->ptr` reserves guest memory the host writes args into; the host reads
+each import's return `(ptr,len)` from guest memory. `run(ptr,len)` receives the
+invocation input JSON and returns the result JSON.
+
+### A.3 Deterministic scenario (what `run` does, in order)
+
+`run` input (from the `execute` invocation): `{}` (the fixture uses fixed keys;
+no input needed).
+
+| # | import | request JSON (arg) | response JSON (return) | effect |
+|---|--------|--------------------|------------------------|--------|
+| 1 | `storage_get` | `{"key":"in/x"}` | `{"ok":true,"value":"42"}` | reads seeded value |
+| 2 | `storage_put` | `{"key":"out/y","value":"84"}` | `{"ok":true}` | writes |
+| 3 | `sql_query` | `{"action":"query","sql":"SELECT 1 AS n","params":[]}` | `{"columns":["n"],"rows":[[1]],"rowCount":1}` | read-only SQL (SqlResponse shape) |
+| 4 | `storage_del` | `{"key":"out/y"}` | `{"ok":true}` | deletes what step 2 wrote |
+| 5 | `storage_put` | `{"key":"secret/z","value":"x"}` | `{"ok":false,"error":{"code":"ability-denied","ability":"tinycloud.kv/put","resource":"<space>/kv/secret/z"}}` | **DENIED** (no grant) — op NOT performed |
+
+`run` return (the compute result): combines the observable outcomes —
+
+```json
+{"got":"42","put":true,"sql_n":1,"deleted":true,"denied":"tinycloud.kv/put"}
+```
+
+### A.4 Denial contract (specified: error-envelope, NOT a trap)
+
+A host call for an ability the `D_fn` does not grant **returns the
+`{"ok":false,"error":{…}}` envelope above into guest memory and does NOT perform
+the operation** — it does **not** trap the guest. Rationale: deterministic and
+observable, the guest surfaces the denial in its result, and the underlying KV/SQL
+mutation never happens (fail-closed on the *data*, not on the *execution*). The
+compute request itself returns `200` with the `run` result (which carries
+`"denied"`); the denial is asserted from the result AND the manifest, not from an
+opaque 5xx.
+
+> Distinct, separately-tested case (NOT this fixture): a guest that imports a
+> function **outside** the `"tinycloud"` four-import surface fails at module
+> **instantiation** (deterministic link error) — that is the §10.1 "forbidden
+> import" reject, exercised by a *different* fixture, not `compute_fixture`.
+
+### A.5 Expected manifest (§9.1.1) the run MUST produce
+
+Five host-call journal entries, in order, each
+`{resource, ability, bytes_in, bytes_out, destination, granted}` where
+`bytes_in`/`bytes_out` equal the canonical-JSON byte lengths of the A.3
+request/response payloads (deterministic), and `destination` is `inline` for
+reads/SQL and the KV path for writes/deletes:
+
+| # | ability | resource | destination | granted |
+|---|---------|----------|-------------|---------|
+| 1 | `tinycloud.kv/get` | `<space>/kv/in/x` | inline | true |
+| 2 | `tinycloud.kv/put` | `<space>/kv/out/y` | `out/y` | true |
+| 3 | `tinycloud.sql/read` | `<space>/sql/db` | inline | true |
+| 4 | `tinycloud.kv/del` | `<space>/kv/out/y` | `out/y` | true |
+| 5 | `tinycloud.kv/put` | `<space>/kv/secret/z` | — | **false** (denied) |
+
+Capability sets:
+- **granted:** `{kv/get, kv/put, kv/del, sql/read, sql/write}`
+- **exercised:** `{kv/get, kv/put, kv/del, sql/read}`
+- **granted-but-unexercised:** `{sql/write}` — the scope-down signal (§9.1.1); the
+  fixture asserts this set is exactly `{sql/write}`.
+
+### A.6 What the P2/E2E gates assert against this fixture
+
+- `compute_abi` (§13 P2): the WAT loads, `run` executes, all four imports are
+  invoked and mediated.
+- `compute_execute` / `compute_e2e`: steps 1–4 succeed under the A.1 grant; step 5
+  is denied (envelope + op-not-performed + manifest `granted:false`); the `run`
+  result equals A.3's; the manifest equals A.5 (byte lengths included); the
+  granted-but-unexercised set is exactly `{sql/write}`. Determinism: re-running
+  yields byte-identical result + manifest (fuel-metered; no wall-clock field is
+  asserted).

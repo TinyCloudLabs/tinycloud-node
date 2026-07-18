@@ -129,8 +129,11 @@ KV-read-only cut: the MVP host surface is **KV CRUD + SQL** (supersedes C4).
     JSON value/ack; `sql_query` arg = JSON request, return = JSON rows — aligned
     with the existing `SqlRequest` / `SqlResponse` shapes.
   (Names may change only if the same completeness bar — module names, signatures,
-  memory ownership, encoding — stays fully stated.) Gated by a **checked-in WAT
-  fixture that exercises exactly this contract** (get/put/del/sql).
+  memory ownership, encoding — stays fully stated.) The exact fixture — module
+  shape, per-step request/response JSON, denial contract, and expected manifest —
+  is pinned in **spec Appendix A (`compute_fixture`)**; both implementers build
+  against it and both judges score against it. Gated by that checked-in WAT
+  fixture (get/put/del/sql).
 - **Mediated host surface + the SERVER-crate executor seam (supersedes C4):** each
   import is mediated under its `D_fn` ability — `storage_get`→`kv/get`,
   `storage_put`→`kv/put`, `storage_del`→`kv/del`, `sql_query`→`sql/read|write` per
