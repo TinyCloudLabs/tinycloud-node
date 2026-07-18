@@ -39,6 +39,10 @@ pub const HOOK_DELIVERY_STATUS_RETRYING: &str = "retrying";
 pub const HOOK_DELIVERY_STATUS_DELIVERED: &str = "delivered";
 pub const HOOK_DELIVERY_STATUS_DEAD_LETTER: &str = "dead_letter";
 
+type KvObjectKey = (SpaceId, Path);
+type KvObjectLock = tokio::sync::Mutex<()>;
+type KvObjectLockRegistry = Arc<tokio::sync::Mutex<HashMap<KvObjectKey, Weak<KvObjectLock>>>>;
+
 #[derive(Debug, Clone)]
 pub struct PendingWebhookDelivery {
     pub id: String,
@@ -68,8 +72,7 @@ pub struct SpaceDatabase<C, B, S> {
     encryption: Option<ColumnEncryption>,
     sql_sizes: SqlSizes,
     revocation_chain_locks: Arc<tokio::sync::Mutex<HashMap<Hash, Weak<tokio::sync::Mutex<()>>>>>,
-    kv_object_locks:
-        Arc<tokio::sync::Mutex<HashMap<(SpaceId, Path), Weak<tokio::sync::Mutex<()>>>>>,
+    kv_object_locks: KvObjectLockRegistry,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
