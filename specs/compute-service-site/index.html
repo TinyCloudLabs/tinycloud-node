@@ -106,6 +106,12 @@
     background: var(--l1-wash);
   }
   .rail li a.active .n { color: var(--l1-dim); }
+  .rail .xlink {
+    margin-top: 1.2rem;
+    padding-top: 1.2rem;
+    border-top: 1px solid var(--hairline);
+  }
+  .rail .xlink a { color: var(--l2); }
 
   main {
     flex: 1;
@@ -425,6 +431,7 @@
     <li><a href="#wire"><span class="n">11</span>Wire Format &amp; Registry</a></li>
     <li><a href="#trust"><span class="n">12</span>Trust &amp; Verification</a></li>
     <li><a href="#scope"><span class="n">13</span>Decisions &amp; Open Items</a></li>
+    <li class="xlink"><a href="plan.html">Implementation Plan →</a></li>
   </ol>
 </nav>
 
@@ -1519,7 +1526,7 @@ InvocationOutcome::<span class="k2">ComputeList</span>(serde_json::Value)    <sp
   }
 
   // ---- scrollspy for the rail nav ----
-  const links = [...document.querySelectorAll("nav.rail li a")];
+  const links = [...document.querySelectorAll("nav.rail li a")].filter(a => a.getAttribute("href").startsWith("#"));
   const byId = Object.fromEntries(links.map(a => [a.getAttribute("href").slice(1), a]));
   const observer = new IntersectionObserver(entries => {
     for (const e of entries) {
