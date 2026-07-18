@@ -218,7 +218,7 @@ pub struct QueryResponse {
 #[serde(rename_all = "camelCase")]
 pub struct ExecuteResponse {
     pub changes: u64,
-    pub last_insert_row_id: i64,
+    pub last_insert_row_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
