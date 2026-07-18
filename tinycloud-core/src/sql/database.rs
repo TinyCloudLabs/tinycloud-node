@@ -259,22 +259,15 @@ fn handle_message(
                 write_targets.extend(parsed.write_targets);
             }
 
-            let auth =
-                authorizer::create_authorizer(caveats.clone(), ability.to_string(), is_admin);
-            conn.authorizer(Some(auth));
-
             let mut results = Vec::new();
             for (stmt, is_insert) in statements.iter().zip(insert_statements) {
-                match execute_statement(conn, &stmt.sql, &stmt.params, is_insert) {
-                    Ok(result) => results.push(result),
-                    Err(e) => {
-                        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
-                        return Err(e);
-                    }
-                }
+                let auth =
+                    authorizer::create_authorizer(caveats.clone(), ability.to_string(), is_admin);
+                conn.authorizer(Some(auth));
+                let result = execute_statement(conn, &stmt.sql, &stmt.params, is_insert);
+                conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+                results.push(result?);
             }
-
-            conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
 
             Ok(SqlExecutionResult {
                 response: SqlResponse::Batch(BatchResponse { results }),
@@ -607,6 +600,45 @@ mod tests {
             panic!("expected execute response");
         };
         assert_eq!(prepared.last_insert_row_id, None);
+    }
+
+    #[test]
+    fn batch_does_not_reuse_schema_authorizer_state_between_statements() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE source (id INTEGER); INSERT INTO source VALUES (1)")
+            .unwrap();
+
+        let error = handle_message(
+            &conn,
+            &SqlRequest::Batch {
+                statements: vec![
+                    SqlStatement {
+                        sql: "CREATE INDEX source_idx ON source(id)".to_string(),
+                        params: vec![],
+                    },
+                    SqlStatement {
+                        sql: "CREATE TABLE copied AS SELECT id FROM source".to_string(),
+                        params: vec![],
+                    },
+                ],
+            },
+            &None,
+            "tinycloud.sql/schema",
+        )
+        .expect_err("a prior DDL statement must not authorize a later CTAS source read");
+        assert!(
+            error.to_string().contains("not authorized")
+                || error.to_string().contains("is prohibited"),
+            "expected an authorization error, got: {error}"
+        );
+        let copied_tables: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'copied'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(copied_tables, 0, "failed CTAS must not leave its table");
     }
 
     #[test]
