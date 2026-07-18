@@ -1,9 +1,6 @@
 #[macro_use]
 extern crate rocket;
 extern crate anyhow;
-#[cfg(test)]
-#[macro_use]
-extern crate tokio;
 
 use anyhow::{Context, Result};
 use rocket::{fairing::AdHoc, figment::Figment, http::Header, Build, Rocket};
@@ -12,23 +9,43 @@ use std::{path::Path, sync::Arc};
 pub mod allow_list;
 pub mod auth_guards;
 pub mod authorization;
+pub mod cli;
 pub mod config;
 #[cfg(feature = "dstack")]
 pub mod dstack;
 pub mod hooks;
 pub mod invocation_replay;
+pub mod node_control;
 pub mod prometheus;
 pub mod quota;
 pub mod routes;
+pub mod runtime;
 pub mod signed_urls;
 pub mod storage;
 pub mod tee;
 mod tracing;
 pub mod webhook_dispatcher;
 
-use config::{BlockStorage, Config, Keys, StagingStorage};
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+pub(crate) mod test_support {
+    use std::sync::{Mutex, OnceLock};
+
+    pub fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+    }
+}
+
+use config::{BlockStorage, Config, StagingStorage};
 use hooks::HookRuntime;
 use invocation_replay::InvocationReplayCache;
+use node_control::{
+    control::ControlPlaneHandle,
+    key_provider::{self, IdentityPurpose},
+};
 use quota::QuotaCache;
 use routes::{
     admin::{delete_quota, get_quota, get_usage, list_quotas, set_quota},
@@ -107,10 +124,11 @@ impl From<BlockStage> for StagingStorage {
 
 pub type TinyCloud = SpaceDatabase<DatabaseConnection, BlockStores, StaticSecret>;
 
-pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
-    let mut tinycloud_config: Config = config.extract::<Config>()?;
-    tinycloud_config.storage.resolve();
-
+pub async fn app(
+    config: &Figment,
+    tinycloud_config: &Config,
+    control: Option<ControlPlaneHandle>,
+) -> Result<Rocket<Build>> {
     // Ensure local storage directories exist.
     // SQLite file paths and local dirs are resources the server owns — auto-create them.
     // Remote backends (Postgres, S3) are left alone; connection errors surface naturally.
@@ -155,7 +173,19 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         revoke_encryption_network,
     ];
 
-    let key_setup: StaticSecret = resolve_keys(&tinycloud_config.keys).await?;
+    let identity_state = key_provider::resolve_identity_state(
+        Some(&tinycloud_config.keys),
+        &tinycloud_config.storage.datadir,
+        IdentityPurpose::Serve,
+    )?;
+    if let Some(control) = control.as_ref() {
+        control
+            .set_identity_snapshot(key_provider::identity_snapshot(&identity_state))
+            .await;
+    }
+    let key_setup = identity_state
+        .secret
+        .ok_or_else(|| anyhow::anyhow!("node identity is not ready"))?;
     let webhook_encryption =
         ColumnEncryption::new(key_setup.derive_key(b"tinycloud/hooks/webhook-secrets"));
     let hook_runtime = HookRuntime::new(
@@ -299,7 +329,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         .mount("/", routes)
         .attach(AdHoc::config::<Config>())
         .attach(tracing::TracingFairing {
-            header_name: tinycloud_config.log.tracing.traceheader,
+            header_name: tinycloud_config.log.tracing.traceheader.clone(),
         })
         .manage(tinycloud)
         .manage(sql_service);
@@ -315,6 +345,26 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         .manage(tee_context)
         .manage(encryption_service)
         .manage(tinycloud_config.storage.staging.open().await?);
+
+    let rocket = if let Some(control) = control {
+        let control_running = control.clone();
+        let control_stopping = control.clone();
+        rocket
+            .attach(AdHoc::on_liftoff("control-plane-running", move |_| {
+                let control = control_running.clone();
+                Box::pin(async move {
+                    control.mark_running();
+                })
+            }))
+            .attach(AdHoc::on_shutdown("control-plane-stopping", move |_| {
+                let control = control_stopping.clone();
+                Box::pin(async move {
+                    control.mark_stopping();
+                })
+            }))
+    } else {
+        rocket
+    };
 
     if tinycloud_config.cors {
         Ok(rocket.attach(AdHoc::on_response("CORS", |_, resp| {
@@ -340,52 +390,6 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         })))
     } else {
         Ok(rocket)
-    }
-}
-
-async fn resolve_keys(keys: &Keys) -> Result<StaticSecret> {
-    match keys {
-        Keys::Static(s) => Ok(s.clone().try_into()?),
-        #[cfg(feature = "dstack")]
-        Keys::Dstack => {
-            let key_bytes = dstack::get_key("tinycloud/keys/primary").await?;
-            StaticSecret::new(key_bytes)
-                .map_err(|v| anyhow::anyhow!("dstack key too short: {} bytes", v.len()))
-        }
-        Keys::Auto => {
-            // Check TINYCLOUD_TEE_MODE env var first
-            match std::env::var("TINYCLOUD_TEE_MODE").ok().as_deref() {
-                #[cfg(feature = "dstack")]
-                Some("dstack") => {
-                    let key_bytes = dstack::get_key("tinycloud/keys/primary").await?;
-                    StaticSecret::new(key_bytes)
-                        .map_err(|v| anyhow::anyhow!("dstack key too short: {} bytes", v.len()))
-                }
-                Some("off") => {
-                    anyhow::bail!(
-                        "TEE mode disabled but no static key configured. \
-                         Set TINYCLOUD_KEYS_SECRET or configure [keys] in config."
-                    )
-                }
-                _ => {
-                    // Auto-detect: check for dstack socket
-                    #[cfg(feature = "dstack")]
-                    if dstack::is_available() {
-                        ::tracing::info!("dstack socket detected, using TEE key derivation");
-                        let key_bytes = dstack::get_key("tinycloud/keys/primary").await?;
-                        return StaticSecret::new(key_bytes).map_err(|v| {
-                            anyhow::anyhow!("dstack key too short: {} bytes", v.len())
-                        });
-                    }
-                    anyhow::bail!(
-                        "No key source configured. Either:\n  \
-                         - Set TINYCLOUD_KEYS_SECRET environment variable\n  \
-                         - Configure [keys] section in tinycloud.toml\n  \
-                         - Run inside a dstack TEE (with 'dstack' feature enabled)"
-                    )
-                }
-            }
-        }
     }
 }
 

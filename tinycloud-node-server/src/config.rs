@@ -25,6 +25,7 @@ pub struct Config {
     pub telemetry: Telemetry,
     pub prometheus: Prometheus,
     pub cors: bool,
+    #[serde(default)]
     pub keys: Keys,
     #[serde(default)]
     pub tee: TeeConfig,
@@ -128,11 +129,16 @@ impl Default for HooksConfig {
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, Default)]
 #[serde(tag = "type")]
 pub enum Keys {
+    #[serde(rename = "static", alias = "Static")]
     Static(Static),
     #[cfg(feature = "dstack")]
+    #[serde(rename = "dstack", alias = "Dstack")]
     Dstack,
     #[default]
+    #[serde(rename = "auto", alias = "Auto")]
     Auto,
+    #[serde(rename = "provider", alias = "Provider")]
+    Provider,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
@@ -318,6 +324,10 @@ impl Storage {
             if fs.path().as_os_str().is_empty() {
                 self.blocks = BlockConfig::B(FileSystemConfig::new(dir.join("blocks")));
             }
+        }
+
+        if self.limit.map(|limit| limit.as_u64()) == Some(0) {
+            self.limit = None;
         }
     }
 

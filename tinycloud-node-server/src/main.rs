@@ -1,55 +1,16 @@
-use hyper::{
-    service::{make_service_fn, service_fn},
-    Server,
-};
-use rocket::{
-    figment::providers::{Env, Format, Serialized, Toml},
-    tokio,
-};
-use tinycloud::{app, config, prometheus};
-
-fn build_config_figment() -> rocket::figment::Figment {
-    rocket::figment::Figment::from(rocket::Config::default())
-        .merge(Serialized::defaults(config::Config::default()))
-        .merge(Toml::file("tinycloud.toml").nested())
-        // Legacy env style: single underscore as nesting separator.
-        .merge(Env::prefixed("TINYCLOUD_").split("_").global())
-        // Canonical env style: double underscore as nesting separator.
-        // Loaded second so canonical values win when both are present.
-        .merge(Env::prefixed("TINYCLOUD_").split("__").global())
-        .merge(Env::prefixed("ROCKET_").global())
+fn main() {
+    if let Err(e) = tinycloud::cli::run() {
+        eprintln!("\n✗ tinycloud-node failed:\n");
+        for cause in e.chain() {
+            eprintln!("  {cause}");
+        }
+        std::process::exit(1);
+    }
 }
 
-#[rocket::main]
-async fn main() {
-    let config = build_config_figment(); // That's just for easy access to ROCKET_LOG_LEVEL
-    let tinycloud_config = config.extract::<config::Config>().unwrap();
-
-    let rocket = match app(&config).await {
-        Ok(r) => r.ignite().await.unwrap(),
-        Err(e) => {
-            eprintln!("\n✗ Failed to start tinycloud-node:\n");
-            for cause in e.chain() {
-                eprintln!("  {cause}");
-            }
-            eprintln!("\nCheck your tinycloud.toml or TINYCLOUD_ environment variables.");
-            std::process::exit(1);
-        }
-    };
-
-    if tinycloud_config.telemetry.enabled {
-        let prom_addr = (rocket.config().address, tinycloud_config.prometheus.port).into();
-        let prometheus = Server::bind(&prom_addr).serve(make_service_fn(|_| async {
-            Ok::<_, hyper::Error>(service_fn(prometheus::serve_req))
-        }));
-
-        tokio::select! {
-            r = rocket.launch() => {let _ = r.unwrap();},
-            r = prometheus => r.unwrap()
-        };
-    } else {
-        let _ = rocket.launch().await.unwrap();
-    }
+#[cfg(test)]
+fn build_config_figment() -> rocket::figment::Figment {
+    tinycloud::runtime::legacy_config_figment()
 }
 
 #[cfg(test)]
@@ -93,14 +54,31 @@ mod tests {
             .expect("env lock should not be poisoned")
     }
 
+    fn clear_keys_env() -> (
+        EnvVarGuard,
+        EnvVarGuard,
+        EnvVarGuard,
+        EnvVarGuard,
+        EnvVarGuard,
+    ) {
+        (
+            EnvVarGuard::unset("TINYCLOUD_KEYS"),
+            EnvVarGuard::unset("TINYCLOUD_KEYS_TYPE"),
+            EnvVarGuard::unset("TINYCLOUD_KEYS__TYPE"),
+            EnvVarGuard::unset("TINYCLOUD_KEYS_SECRET"),
+            EnvVarGuard::unset("TINYCLOUD_KEYS__SECRET"),
+        )
+    }
+
     #[test]
     fn canonical_double_underscore_loads_hooks_max_ticket_ttl_seconds() {
         let _lock = lock_env();
+        let _keys_env = clear_keys_env();
         let _legacy = EnvVarGuard::unset("TINYCLOUD_HOOKS_MAX_TICKET_TTL_SECONDS");
         let _canonical = EnvVarGuard::set("TINYCLOUD_HOOKS__MAX_TICKET_TTL_SECONDS", "777");
 
         let cfg = build_config_figment()
-            .extract::<config::Config>()
+            .extract::<tinycloud::config::Config>()
             .expect("config should parse");
 
         assert_eq!(cfg.hooks.max_ticket_ttl_seconds, 777);
@@ -109,6 +87,7 @@ mod tests {
     #[test]
     fn canonical_double_underscore_loads_storage_database() {
         let _lock = lock_env();
+        let _keys_env = clear_keys_env();
         let _legacy = EnvVarGuard::unset("TINYCLOUD_STORAGE_DATABASE");
         let _canonical = EnvVarGuard::set(
             "TINYCLOUD_STORAGE__DATABASE",
@@ -116,7 +95,7 @@ mod tests {
         );
 
         let cfg = build_config_figment()
-            .extract::<config::Config>()
+            .extract::<tinycloud::config::Config>()
             .expect("config should parse");
 
         assert_eq!(
@@ -128,11 +107,12 @@ mod tests {
     #[test]
     fn telemetry_defaults_to_disabled() {
         let _lock = lock_env();
+        let _keys_env = clear_keys_env();
         let _legacy = EnvVarGuard::unset("TINYCLOUD_TELEMETRY_ENABLED");
         let _canonical = EnvVarGuard::unset("TINYCLOUD_TELEMETRY__ENABLED");
 
         let cfg = build_config_figment()
-            .extract::<config::Config>()
+            .extract::<tinycloud::config::Config>()
             .expect("config should parse");
 
         assert!(!cfg.telemetry.enabled);
@@ -141,11 +121,12 @@ mod tests {
     #[test]
     fn canonical_double_underscore_loads_telemetry_enabled() {
         let _lock = lock_env();
+        let _keys_env = clear_keys_env();
         let _legacy = EnvVarGuard::unset("TINYCLOUD_TELEMETRY_ENABLED");
         let _canonical = EnvVarGuard::set("TINYCLOUD_TELEMETRY__ENABLED", "true");
 
         let cfg = build_config_figment()
-            .extract::<config::Config>()
+            .extract::<tinycloud::config::Config>()
             .expect("config should parse");
 
         assert!(cfg.telemetry.enabled);
@@ -154,12 +135,13 @@ mod tests {
     #[test]
     fn canonical_double_underscore_wins_for_storage_database_when_both_are_set() {
         let _lock = lock_env();
+        let _keys_env = clear_keys_env();
         let _legacy = EnvVarGuard::set("TINYCLOUD_STORAGE_DATABASE", "sqlite:/tmp/legacy.db");
         let _canonical =
             EnvVarGuard::set("TINYCLOUD_STORAGE__DATABASE", "sqlite:/tmp/canonical.db");
 
         let cfg = build_config_figment()
-            .extract::<config::Config>()
+            .extract::<tinycloud::config::Config>()
             .expect("config should parse");
 
         assert_eq!(
