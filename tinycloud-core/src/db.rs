@@ -262,6 +262,26 @@ impl<C, B, K> SpaceDatabase<C, B, K>
 where
     C: ConnectionTrait,
 {
+    /// Return the hashes of every LIVE (not directly-revoked) delegation
+    /// whose delegatee matches `delegatee`. Used by the compute re-deploy
+    /// hygiene path (compute-service.md §5.1) to find the superseded `D_fn`(s)
+    /// bound to a now-dormant routine identity and revoke them; "cite-all"
+    /// (§5.1/F5) is why this returns a `Vec` rather than one.
+    #[cfg(feature = "compute")]
+    pub async fn delegations_by_delegatee(&self, delegatee: &str) -> Result<Vec<Hash>, DbErr> {
+        let rows = delegation::Entity::find()
+            .filter(delegation::Column::Delegatee.eq(delegatee))
+            .all(&self.conn)
+            .await?;
+        let mut out = Vec::new();
+        for row in rows {
+            if !revocation::is_revoked(&self.conn, &row.id).await? {
+                out.push(row.id);
+            }
+        }
+        Ok(out)
+    }
+
     /// List every space id known to this node (the full `space` table).
     /// Used by the admin usage endpoint to enumerate spaces without touching
     /// SQL directly.

@@ -13,6 +13,8 @@ pub mod allow_list;
 pub mod auth_guards;
 pub mod authorization;
 pub mod cli;
+#[cfg(feature = "compute")]
+pub mod compute;
 pub mod config;
 #[cfg(feature = "dstack")]
 pub mod dstack;
@@ -316,11 +318,13 @@ pub async fn app(
         database_artifact_repository,
     );
 
-    // P0 walking skeleton: a stateless stub. The artifact repository,
-    // backend registry, and routine-key derivation handle are P1/P2
-    // additions (compute-service.md §11.1).
+    // P1 (compute-service.md §11.1): construct the compute service with an
+    // injected `RoutineKeyDeriver` -- dstack (TEE-internal derivation) when
+    // the socket is reachable, classic (node static secret) otherwise. The
+    // backend registry (wasmtime + optional cloudflare) is a P2 addition.
     #[cfg(feature = "compute")]
-    let compute_service = ComputeService::new();
+    let compute_service =
+        ComputeService::new(crate::compute::build_routine_key_deriver(&key_setup));
 
     let quota_cache = QuotaCache::new(
         tinycloud_config.storage.limit,

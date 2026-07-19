@@ -30,6 +30,8 @@ use crate::{
 };
 #[cfg(feature = "compute")]
 use tinycloud_core::compute::{ComputeRequest, ComputeService};
+#[cfg(feature = "compute")]
+use tinycloud_core::events::Delegation;
 #[cfg(feature = "duckdb")]
 use tinycloud_core::duckdb::{
     DuckDbCaveats, DuckDbError, DuckDbRequest, DuckDbResponse, DuckDbService,
@@ -1260,9 +1262,16 @@ async fn invoke_impl(
                 .collect();
 
             if !compute_caps.is_empty() {
-                let result =
-                    handle_compute_invoke(i, data, tinycloud, compute_service, &compute_caps)
-                        .await;
+                let result = handle_compute_invoke(
+                    i,
+                    data,
+                    tinycloud,
+                    compute_service,
+                    config,
+                    quota_cache,
+                    &compute_caps,
+                )
+                .await;
                 if let Some(timer) = timer {
                     timer.observe_duration();
                 }
@@ -2192,84 +2201,458 @@ fn duckdb_request_is_write(
     }
 }
 
-/// P0 walking skeleton for the compute service dispatch
-/// (compute-service.md §7.1, plan P0). Mirrors `handle_sql_invoke` /
-/// `handle_duckdb_invoke`'s shape: prove the delegation chain via
-/// `verify_auth` (the same `resource.extends() && ability_matches()` chain
-/// walk every other service relies on), then apply the NORMATIVE
-/// request-variant -> required-ability mapping (Codex C1) before dispatching
-/// on the parsed body. No variant has a live handler yet: every branch below
-/// returns `501 Not Implemented` once the ability-mapping gate passes.
-/// `List` has no server-side handler planned at all (§12.1/C9) and stays
-/// reserved.
+/// Compute helper: the compute-service resource `<space>/compute/<path>`
+/// (compute-service.md §4). `path` is the function-path (or the content CID
+/// for `RoutineDid`, whose resource is `<space>/compute/<content_cid>`, §6.2).
 #[cfg(feature = "compute")]
+fn compute_resource(
+    space: &tinycloud_auth::resource::SpaceId,
+    path: Option<&str>,
+) -> Result<Resource, (Status, String)> {
+    let path = match path {
+        Some(p) => Some(
+            p.parse::<Path>()
+                .map_err(|e| (Status::BadRequest, format!("invalid compute path: {e:?}")))?,
+        ),
+        None => None,
+    };
+    Ok(Resource::TinyCloud(space.clone().to_resource(
+        "compute"
+            .parse()
+            .expect("`compute` is a valid service segment"),
+        path,
+        None,
+        None,
+    )))
+}
+
+/// **Judge finding (security): scope selection.** Select the SINGLE
+/// `(space, function-path)` scope the request BODY targets and prove the
+/// presented compute capabilities cover exactly that resource -- analogous
+/// to `select_database_scope`. This REPLACES the P0
+/// `compute_caps.iter().any(...)` aggregation, which is a confused-deputy
+/// risk once a live handler exists: `.any()` authorizes a `Deploy` body as
+/// long as ANY presented cap satisfies `compute/deploy`, even a cap for a
+/// DIFFERENT space or a DIFFERENT function than the body names. Here we
+/// instead:
+///   1. reject requests whose compute caps span multiple spaces (ambiguous);
+///   2. build the body's target resource `<space>/compute/<function-path>`;
+///   3. require a presented cap that BOTH `extends`-covers that resource AND
+///      `ability_matches` the variant's required ability (§7.1 erratum, C1).
+/// A cap that satisfies the ability but does not cover the body's function
+/// resource (wrong function, wrong space) fails closed with `403`.
+#[cfg(feature = "compute")]
+fn select_compute_scope<'a>(
+    request: &ComputeRequest,
+    caps: &'a [(tinycloud_auth::resource::SpaceId, Option<String>, String)],
+    required_ability: &str,
+) -> Result<(&'a tinycloud_auth::resource::SpaceId, Option<String>), (Status, String)> {
+    let Some((space, _, _)) = caps.first() else {
+        return Err((
+            Status::BadRequest,
+            "No compute capabilities found".to_string(),
+        ));
+    };
+
+    // (1) single-space invariant -- a compute request targets exactly one
+    // space; caps spanning spaces are ambiguous and rejected (mirrors
+    // `select_database_scope`'s multi-space guard).
+    if !caps.iter().all(|(candidate, _, _)| candidate == space) {
+        return Err((
+            Status::BadRequest,
+            "Ambiguous compute capabilities span multiple spaces".to_string(),
+        ));
+    }
+
+    // (2) the body's target function-path. `RoutineDid` targets the content
+    // CID as its resource path (§6.2); `List` targets no path (space-wide).
+    let target_path: Option<String> = match request {
+        ComputeRequest::Deploy { function, .. } | ComputeRequest::Execute { function, .. } => {
+            Some(function.clone())
+        }
+        ComputeRequest::RoutineDid { content_cid } => Some(content_cid.clone()),
+        ComputeRequest::List => None,
+    };
+
+    let target_resource = compute_resource(space, target_path.as_deref())?;
+
+    // (3) require a presented cap that covers the target resource AND
+    // satisfies the variant's required ability. This is the confused-deputy
+    // fix: coverage is checked against THIS body's resource, not aggregated
+    // across every presented cap.
+    let covered = caps.iter().try_fold(false, |acc, (cap_space, cap_path, ability)| {
+        if acc {
+            return Ok(true);
+        }
+        let cap_resource = compute_resource(cap_space, cap_path.as_deref())?;
+        let ability_ok =
+            tinycloud_core::policy_capability::ability_matches(ability.as_str(), required_ability);
+        let resource_ok = match (&target_resource, &cap_resource) {
+            (Resource::TinyCloud(t), Resource::TinyCloud(c)) => t.extends(c).is_ok(),
+            _ => false,
+        };
+        Ok::<bool, (Status, String)>(ability_ok && resource_ok)
+    })?;
+
+    if !covered {
+        // Mirror the node's established "Unauthorized Action: {resource} /
+        // {ability}" phrasing so every ability/scope rejection reads the same
+        // on the wire.
+        let ability = Ability::try_from(required_ability.to_string())
+            .map_err(|e| (Status::InternalServerError, format!("{e:?}")))?;
+        return Err((
+            Status::Forbidden,
+            format!("Unauthorized Action: {target_resource} / {ability}"),
+        ));
+    }
+
+    Ok((space, target_path))
+}
+
+/// P1 compute dispatch (compute-service.md §7, plan P1). Mirrors
+/// `handle_sql_invoke`'s shape: prove the delegation chain via `verify_auth`
+/// (layer (a), §6.1), select the single body-targeted scope (the security
+/// fix above), then dispatch. P1 wires the two read/write handlers --
+/// `RoutineDid` (read-only handshake, §6.2/F2) and `Deploy` (the atomic
+/// transaction seam, §5.1/F4). `Execute` lands in P2; `List` has no
+/// server-side handler at all (§12.1/C9) and stays reserved.
+#[cfg(feature = "compute")]
+#[allow(clippy::too_many_arguments)]
 async fn handle_compute_invoke(
     i: AuthHeaderGetter<InvocationInfo>,
     data: DataIn<'_>,
     tinycloud: &State<TinyCloud>,
-    _compute_service: &State<ComputeService>,
+    compute_service: &State<ComputeService>,
+    config: &State<Config>,
+    quota_cache: &State<QuotaCache>,
     compute_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
     // Layer (a) invoker authorization (compute-service.md §6.1): the same
-    // delegation-chain walk sql/duckdb use. This is what actually proves
-    // `compute_caps` are backed by a real, unrevoked delegation chain back
-    // to the space owner -- the capability filter in `invoke_impl` only
-    // looked at the invocation's self-declared attenuation. The
-    // ability-mapping check below decides which VARIANT the (already
-    // chain-proven) capability set may exercise.
+    // delegation-chain walk sql/duckdb use. Proves `compute_caps` are backed
+    // by a real, unrevoked delegation chain back to the space owner -- the
+    // capability filter in `invoke_impl` only inspected the invocation's
+    // self-declared attenuation.
     verify_auth("server.compute.auth", i.0, tinycloud).await?;
 
     let body_str = read_json_body(data).await?;
     let request: ComputeRequest =
         serde_json::from_str(&body_str).map_err(|e| (Status::BadRequest, e.to_string()))?;
 
-    // NORMATIVE request-variant -> ability mapping (compute-service.md §7.1
-    // erratum, Codex C1). Without this a holder of `compute/execute` (or
-    // `compute/list`) could submit a `Deploy` body -- exactly why the SQL
-    // path carries `require_sql_admin_for_request`; compute mirrors it.
+    // Judge finding (security): select the single (space, function-path)
+    // scope the BODY targets and prove the presented caps cover exactly it,
+    // enforcing the §7.1-erratum ability mapping in the process. Replaces the
+    // P0 `.any()` aggregation.
     let required_ability = request.required_ability();
-    let holds_required = compute_caps.iter().any(|(_, _, ability)| {
-        tinycloud_core::policy_capability::ability_matches(ability.as_str(), required_ability)
+    let (space, function_path) = select_compute_scope(&request, compute_caps, required_ability)?;
+
+    match request {
+        ComputeRequest::RoutineDid { content_cid } => {
+            handle_compute_routine_did(compute_service, space, &content_cid).await
+        }
+        ComputeRequest::Deploy {
+            function,
+            wasm_b64,
+            grant,
+            caveats: _,
+        } => {
+            handle_compute_deploy(
+                tinycloud,
+                compute_service,
+                config,
+                quota_cache,
+                space,
+                function_path.as_deref().unwrap_or(function.as_str()),
+                wasm_b64,
+                grant,
+            )
+            .await
+        }
+        ComputeRequest::Execute { .. } => Err((
+            Status::NotImplemented,
+            "compute execute is not implemented yet (lands in P2)".to_string(),
+        )),
+        ComputeRequest::List => Err((
+            Status::NotImplemented,
+            "tinycloud.compute/list has no server-side handler (reserved)".to_string(),
+        )),
+    }
+}
+
+/// The `RoutineDid` handshake (compute-service.md §7.2/§6.2/F2): a read-only,
+/// side-effect-free, idempotent derive-and-return of the PUBLIC `routine_did`
+/// for `(space, content_cid)`. NO secret is exposed (the private key never
+/// leaves the deriver). Re-running after a CVM redeploy is the
+/// dstack-stability probe (§6.2/F1.5).
+#[cfg(feature = "compute")]
+async fn handle_compute_routine_did(
+    compute_service: &State<ComputeService>,
+    space: &tinycloud_auth::resource::SpaceId,
+    content_cid: &str,
+) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
+    let routine_did = compute_service
+        .routine_key_deriver()
+        .derive_routine_did(space, content_cid)
+        .await
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+
+    let ack = serde_json::json!({
+        "routine_did": routine_did,
+        "content_cid": content_cid,
+        "space": space.to_string(),
     });
-    if !holds_required {
-        // Mirror the node's established "Unauthorized Action: {resource} /
-        // {ability}" phrasing (see `missing_database_admin_capability_error`,
-        // `InvocationError::UnauthorizedAction`) instead of a bespoke string,
-        // so every ability-mismatch rejection across services reads the same
-        // way on the wire.
-        let (space, path, _held_ability) = &compute_caps[0];
-        let resource = Resource::TinyCloud(space.clone().to_resource(
-            "compute".parse().unwrap(),
-            path.as_deref().map(|p| p.parse().unwrap()),
-            None,
-            None,
-        ));
-        let ability = Ability::try_from(required_ability.to_string()).unwrap();
-        return Err((
-            Status::Forbidden,
-            format!("Unauthorized Action: {resource} / {ability}"),
-        ));
+    Ok(DataOut::One(InvOut(InvocationOutcome::ComputeResult(ack))))
+}
+
+/// The atomic deploy primitive (compute-service.md §5.1/F4, plan P1). MVP
+/// transport (§7.2/C7): JSON body + base64 `wasm_b64` + an INLINE encoded
+/// `D_fn` grant only. The `D_fn` is processed through the STANDARD delegation
+/// verification/persistence path AND the WASM artifact is saved
+/// transaction-aware, in ONE core transaction (`deploy_compute_function`);
+/// the `SqlSizes` mirror is updated after commit (§5/F8). Deploy is a
+/// write-class request, gated by the same `staged_batch_remaining` quota
+/// pre-check the sql/duckdb write paths use. On re-deploy the superseded
+/// `D_fn` is revoked (§5.1 "re-deploy hygiene").
+#[cfg(feature = "compute")]
+#[allow(clippy::too_many_arguments)]
+async fn handle_compute_deploy(
+    tinycloud: &State<TinyCloud>,
+    compute_service: &State<ComputeService>,
+    config: &State<Config>,
+    quota_cache: &State<QuotaCache>,
+    space: &tinycloud_auth::resource::SpaceId,
+    function: &str,
+    wasm_b64: Option<String>,
+    grant: Option<String>,
+) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
+    // MVP transport (§7.2/C7): both the WASM and the D_fn ride INLINE. Raw
+    // streaming and pre-submitted grant CIDs are deferred (P4) -- reject them
+    // loudly rather than silently accepting a half-specified deploy.
+    let wasm_b64 = wasm_b64.ok_or((
+        Status::BadRequest,
+        "deploy requires an inline base64 `wasm_b64` (MVP transport, §7.2)".to_string(),
+    ))?;
+    let grant = grant.ok_or((
+        Status::BadRequest,
+        "deploy requires an inline encoded `grant` (D_fn) (MVP transport, §7.2)".to_string(),
+    ))?;
+    let wasm_bytes = base64::decode(wasm_b64.as_bytes())
+        .map_err(|e| (Status::BadRequest, format!("invalid base64 wasm_b64: {e}")))?;
+
+    // Storage quota pre-check (§5/F8): deploy is write-class. `store_size`
+    // folds the compute artifact bytes via the `SqlSizes` mirror, so an
+    // already-over-quota space 402s here, and a payload that would exceed the
+    // remaining budget is rejected BEFORE the transaction (we know the size
+    // up-front, so -- unlike SQL's post-execute overshoot -- deploy enforces
+    // precisely).
+    if let Some((remaining, current_size, limit_bytes)) =
+        staged_batch_remaining(space, tinycloud, config, quota_cache).await?
+    {
+        let wasm_len = u64::try_from(wasm_bytes.len())
+            .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+        if wasm_len > remaining {
+            return Err((
+                Status::new(402),
+                format!(
+                    "Storage quota exceeded. Deploy needs {} bytes, remaining {} (used {} of {}).",
+                    wasm_len, remaining, current_size, limit_bytes
+                ),
+            ));
+        }
     }
 
-    // P0 walking skeleton: the mapping + rejection above is the real,
-    // enforced gate. No variant has a live handler yet -- P1 wires Deploy /
-    // RoutineDid, P2 wires Execute. `List` has no server-side handler at all
-    // in this plan (compute-service.md §12.1/C9) and stays reserved.
-    let message = match &request {
-        ComputeRequest::List => {
-            "tinycloud.compute/list has no server-side handler (reserved)".to_string()
+    // Decode the inline D_fn through the SAME path `/delegate` uses -- an
+    // ordinary `SerializedEvent<DelegationInfo>` (signature is verified, the
+    // chain is authorized, and per-ability caveats -- including the
+    // `computeFunctionBinding` -- are persisted, all inside the transaction).
+    let delegation = Delegation::from_header_ser::<
+        tinycloud_auth::authorization::TinyCloudDelegation,
+    >(&grant)
+    .map_err(|e| (Status::BadRequest, format!("invalid D_fn grant: {e}")))?;
+
+    let space_id = space.to_string();
+    let (_result, artifact, previous_content_hash) = tinycloud
+        .deploy_compute_function(delegation, &space_id, function, wasm_bytes)
+        .await
+        .map_err(compute_deploy_error_to_status)?;
+
+    // Re-deploy hygiene (§5.1): a re-deploy with NEW bytes yields a new CID ->
+    // a new routine_did, leaving the OLD `D_fn` a live-looking delegation to
+    // an identity that can no longer act (the old bytes are gone, so the old
+    // routine key is never derived again). Revoke the superseded `D_fn` so the
+    // event graph does not accumulate dormant grants. This is a post-commit
+    // SHOULD, deliberately OUTSIDE the deploy transaction.
+    if let Some(previous_hash) = previous_content_hash {
+        if previous_hash != artifact.content_hash {
+            revoke_superseded_compute_grant(tinycloud, compute_service, space, &previous_hash)
+                .await;
         }
-        ComputeRequest::Execute { .. } => {
-            "compute execute is not implemented yet (lands in P2)".to_string()
+    }
+
+    // Deploy ack (§7.2/§7.3): the minimal response the SDK needs -- the
+    // function CID, the routine_did the deployer should have bound `D_fn` to,
+    // and the artifact revision.
+    let routine_did = compute_service
+        .routine_key_deriver()
+        .derive_routine_did(space, &artifact.content_hash)
+        .await
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+
+    let ack = serde_json::json!({
+        "function": function,
+        "content_cid": artifact.content_hash,
+        "routine_did": routine_did,
+        "revision": artifact.revision,
+    });
+    Ok(DataOut::One(InvOut(InvocationOutcome::ComputeResult(ack))))
+}
+
+/// Map the core `ComputeDeployError` to an HTTP status. A `D_fn`
+/// verification/authorization failure is a client error (`401`/`404`); an
+/// artifact-persistence failure is a server error -- either way the
+/// transaction rolled back, so NEITHER the delegation NOR the artifact is
+/// observable (compute-service.md §5.1/F4).
+#[cfg(feature = "compute")]
+fn compute_deploy_error_to_status(
+    error: tinycloud_core::ComputeDeployError<BlockStores, tinycloud_core::keys::StaticSecret>,
+) -> (Status, String) {
+    use tinycloud_core::ComputeDeployError;
+    match error {
+        ComputeDeployError::Tx(TxError::SpaceNotFound) => {
+            (Status::NotFound, "Space not found".to_string())
         }
-        ComputeRequest::Deploy { .. } => {
-            "compute deploy is not implemented yet (lands in P1)".to_string()
+        ComputeDeployError::Tx(TxError::Db(ref e) | TxError::EpochInsert(ref e)) => {
+            (database_error_status(e), error.to_string())
         }
-        ComputeRequest::RoutineDid { .. } => {
-            "compute routine-did handshake is not implemented yet (lands in P1)".to_string()
-        }
+        ComputeDeployError::Tx(_) => (Status::Unauthorized, error.to_string()),
+        ComputeDeployError::Artifact(_) => (Status::InternalServerError, error.to_string()),
+        // `ComputeDeployError` is `#[non_exhaustive]`; a future variant
+        // defaults to a server error rather than being silently miscategorized.
+        _ => (Status::InternalServerError, error.to_string()),
+    }
+}
+
+/// Revoke a superseded `D_fn` on re-deploy (compute-service.md §5.1). The
+/// routine IS the delegatee of `D_fn` (delegatee == the derived routine_did),
+/// and `models/revocation::revoker_is_authorized` accepts a delegatee
+/// self-revoke, so the node -- which holds the derived routine key -- signs
+/// the revocation AS the superseded routine, needing no external proof. This
+/// is best-effort hygiene (a SHOULD): a failure to revoke is logged, not
+/// surfaced, so it never fails an otherwise-successful deploy.
+#[cfg(feature = "compute")]
+async fn revoke_superseded_compute_grant(
+    tinycloud: &State<TinyCloud>,
+    compute_service: &State<ComputeService>,
+    space: &tinycloud_auth::resource::SpaceId,
+    previous_content_hash: &str,
+) {
+    if let Err(error) =
+        try_revoke_superseded_compute_grant(tinycloud, compute_service, space, previous_content_hash)
+            .await
+    {
+        ::tracing::warn!(
+            previous_content_hash,
+            error = %error,
+            "failed to revoke superseded compute D_fn on re-deploy (best-effort hygiene)"
+        );
+    }
+}
+
+#[cfg(feature = "compute")]
+async fn try_revoke_superseded_compute_grant(
+    tinycloud: &State<TinyCloud>,
+    compute_service: &State<ComputeService>,
+    space: &tinycloud_auth::resource::SpaceId,
+    previous_content_hash: &str,
+) -> Result<(), String> {
+    use tinycloud_auth::authorization::{Cid as AuthCid, TinyCloudRevocation};
+    use tinycloud_auth::ssi::{
+        claims::jwt::NumericDate,
+        dids::{DIDBuf, DIDURLBuf},
+        ucan::Payload,
     };
-    Err((Status::NotImplemented, message))
+    use tinycloud_auth::ucan_capabilities_object::{Ability as UcanAbility, Capabilities};
+
+    // Derive the superseded routine's key -- it is the delegatee of the old
+    // `D_fn`, and only this node running this exact (space, old-CID) can
+    // derive it (compute-service.md §6.2).
+    let seed = compute_service
+        .routine_key_deriver()
+        .derive_routine_seed(space, previous_content_hash)
+        .await
+        .map_err(|e| e.to_string())?;
+    let routine_did = tinycloud_core::compute::routine_did_from_seed(seed)
+        .map_err(|e| e.to_string())?;
+    let routine_jwk =
+        tinycloud_core::compute::routine_jwk_from_seed(seed).map_err(|e| e.to_string())?;
+    let routine_vm = format!(
+        "{routine_did}#{}",
+        routine_did
+            .rsplit_once(':')
+            .map(|(_, frag)| frag)
+            .unwrap_or_default()
+    );
+
+    // Find every live (unrevoked) `D_fn` whose delegatee is this superseded
+    // routine_did in this space, and revoke each. Cite-all: a re-mint after a
+    // seed rotation, or two deployers, may leave more than one.
+    let grants = tinycloud
+        .delegations_by_delegatee(&routine_did)
+        .await
+        .map_err(|e| e.to_string())?;
+    if grants.is_empty() {
+        return Ok(());
+    }
+
+    for grant_hash in grants {
+        let target_cid: AuthCid = grant_hash.to_cid(0x55);
+        // Self-revoke: the revocation UCAN carries NO proof, so
+        // `control_proof_decision` short-circuits to `DirectSigner(routine_did)`
+        // and `revoker_is_authorized` accepts it as the delegatee of `D_fn`.
+        // The revoked target is resolved from the explicit `urn:cid:<D_fn>`
+        // attenuation resource (`RevocationInfo::try_from` walks the
+        // attenuation before the empty proof list).
+        let mut capabilities = Capabilities::new();
+        capabilities.with_action(
+            format!("urn:cid:{target_cid}")
+                .parse()
+                .map_err(|e| format!("{e:?}"))?,
+            "tinycloud.delegation/revoke"
+                .parse::<UcanAbility>()
+                .map_err(|e| format!("{e:?}"))?,
+            [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+        );
+        let nonce = format!("compute-supersede-{target_cid}");
+        let encoded = Payload {
+            issuer: routine_vm
+                .parse::<DIDURLBuf>()
+                .map_err(|e| format!("{e:?}"))?,
+            audience: routine_did.parse::<DIDBuf>().map_err(|e| format!("{e:?}"))?,
+            not_before: None,
+            expiration: NumericDate::try_from_seconds(4_102_444_800.0)
+                .map_err(|e| format!("{e:?}"))?,
+            nonce: Some(nonce),
+            facts: Some(Vec::<serde_json::Value>::new()),
+            proof: Vec::new(),
+            attenuation: capabilities,
+        }
+        .sign(
+            routine_jwk.get_algorithm().unwrap_or_default(),
+            &routine_jwk,
+        )
+        .map_err(|e| format!("{e:?}"))?
+        .encode()
+        .map_err(|e| format!("{e:?}"))?;
+
+        let revocation_event =
+            tinycloud_core::events::Revocation::from_header_ser::<TinyCloudRevocation>(&encoded)
+                .map_err(|e| format!("{e:?}"))?;
+        tinycloud
+            .revoke(revocation_event)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
 }
 
 #[cfg(feature = "duckdb")]
@@ -3864,7 +4247,11 @@ mod tests {
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
         #[cfg(feature = "compute")]
-        let rocket = rocket.manage(tinycloud_core::compute::ComputeService::new());
+        let rocket = rocket.manage(tinycloud_core::compute::ComputeService::new(std::sync::Arc::new(
+            tinycloud_core::compute::ClassicRoutineKeyDeriver::new(
+                tinycloud_core::keys::StaticSecret::new(vec![9u8; 32]).unwrap(),
+            ),
+        )));
 
         let client = Client::tracked(rocket).await?;
         let response = client
@@ -4121,7 +4508,11 @@ mod tests {
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
         #[cfg(feature = "compute")]
-        let rocket = rocket.manage(tinycloud_core::compute::ComputeService::new());
+        let rocket = rocket.manage(tinycloud_core::compute::ComputeService::new(std::sync::Arc::new(
+            tinycloud_core::compute::ClassicRoutineKeyDeriver::new(
+                tinycloud_core::keys::StaticSecret::new(vec![9u8; 32]).unwrap(),
+            ),
+        )));
 
         let client = Client::tracked(rocket).await?;
         let response = client
@@ -5530,7 +5921,11 @@ mod tests {
             .manage(HookRuntime::new(HooksConfig::default(), [9u8; 32]))
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
         #[cfg(feature = "compute")]
-        let rocket = rocket.manage(tinycloud_core::compute::ComputeService::new());
+        let rocket = rocket.manage(tinycloud_core::compute::ComputeService::new(std::sync::Arc::new(
+            tinycloud_core::compute::ClassicRoutineKeyDeriver::new(
+                tinycloud_core::keys::StaticSecret::new(vec![9u8; 32]).unwrap(),
+            ),
+        )));
         rocket
     }
 
