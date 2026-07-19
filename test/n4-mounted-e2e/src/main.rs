@@ -337,11 +337,6 @@ fn build_case(
         &not_before,
         &parent_expires,
     )?;
-    let policy_parent_cid = authority_parent["delegationCid"].as_str().expect("cid");
-    enforcement.insert(
-        "xyz.tinycloud.policy/policyDelegationCid".into(),
-        policy_parent_cid.into(),
-    );
     let enforcement_parent = signed_parent(
         "policy-enforcement",
         &node_did,
@@ -368,6 +363,7 @@ fn build_case(
     let enrollment = json!({"targetOrigin":TARGET_ORIGIN,"nodeAudience":NODE_AUDIENCE,"invitationKid":INVITATION_KID,"invitationPublicKey":b64(&invitation_public),"keyVersion":1,"enabled":true});
     let status_now = canonical_time(now);
     let status_fresh = canonical_time(now + time::Duration::seconds(240));
+    let policy_parent_cid = authority_parent["delegationCid"].as_str().expect("cid");
     let enforcement_parent_cid = enforcement_parent["delegationCid"].as_str().expect("cid");
     let authority_status = status(
         policy_parent_cid,

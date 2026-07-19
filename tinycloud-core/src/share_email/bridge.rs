@@ -854,6 +854,18 @@ impl DatabaseAuthorityBridge117 {
             .artifact_in_transaction(tx, delegation_cid.as_str())
             .await
             .map_err(map_authority_error)?;
+        let paired_authority_roots = delegation.role
+            == crate::policy_authority::DelegationRole::PolicyEnforcement
+            && delegation.issuer_did == policy.issuer_did
+            && delegation.capabilities == policy.capabilities
+            && ["ownerDid", "policyId", "policyDigestHex"]
+                .iter()
+                .all(|name| {
+                    delegation
+                        .facts
+                        .get(&format!("xyz.tinycloud.policy/{name}"))
+                        == policy.facts.get(&format!("xyz.tinycloud.policy/{name}"))
+                });
         if delegation_cid.as_str() != policy_cid.as_str()
             && !delegation
                 .proof_cids
@@ -864,6 +876,7 @@ impl DatabaseAuthorityBridge117 {
                 .get("policyDelegationCid")
                 .map(String::as_str)
                 != Some(policy_cid.as_str())
+            && !paired_authority_roots
         {
             return Err(PortError::Denied);
         }
