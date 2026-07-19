@@ -9594,6 +9594,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "dashmap",
+ "data-encoding",
  "duckdb",
  "futures",
  "hex",
@@ -9626,6 +9627,7 @@ name = "tinycloud-node"
 version = "1.7.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "aws-config",
  "aws-sdk-dynamodb",
  "aws-sdk-s3",

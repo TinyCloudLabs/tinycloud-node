@@ -175,6 +175,10 @@ where
                 .header(ContentType::new("application", "vnd.apache.arrow.stream"))
                 .sized_body(data.len(), std::io::Cursor::new(data))
                 .ok(),
+            // compute-service.md §7.3: the RoutineDid handshake / Deploy ack
+            // (P1), and a function's inline execute result (P2).
+            #[cfg(feature = "compute")]
+            InvocationOutcome::ComputeResult(json) => Json(json).respond_to(request),
         }
     }
 }

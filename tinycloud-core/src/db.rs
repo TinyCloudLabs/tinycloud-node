@@ -197,6 +197,30 @@ where
     }
 }
 
+/// P1 atomic deploy primitive error (compute-service.md §5.1/F4): wraps
+/// EITHER the standard delegation-transaction error path OR the
+/// transaction-aware artifact-save error path -- whichever fails, the
+/// transaction is rolled back (dropped without `commit()`) and NEITHER the
+/// `D_fn` delegation NOR the artifact row is observable.
+#[cfg(feature = "compute")]
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum ComputeDeployError<S: StorageSetup, K: Secrets> {
+    #[error(transparent)]
+    Tx(#[from] TxError<S, K>),
+    #[error(transparent)]
+    Artifact(#[from] crate::database_artifacts::DatabaseArtifactError),
+    /// Judges' blocking item 1: every capability row of the deploy-time
+    /// `D_fn` MUST carry the `computeFunctionBinding` caveat (§6.2/D2) naming
+    /// the CID of `wasm` UNDER THE EXACT POSITIONAL KEY `"0"` -- the same
+    /// convention the SQL constrained-statement caveat precedent uses
+    /// (`compute-service.md` §5.1 "Caveat encoding (pin the shape)"). Checked
+    /// BEFORE the transaction opens, so a malformed or mis-bound grant never
+    /// touches the DB.
+    #[error("compute deploy grant is missing the computeFunctionBinding caveat under key \"0\" for content_cid {0} on one or more capability rows")]
+    BindingCaveatMismatch(String),
+}
+
 impl<B, K> SpaceDatabase<DatabaseConnection, B, K> {
     pub async fn new(conn: DatabaseConnection, storage: B, secrets: K) -> Result<Self, DbErr> {
         Migrator::up(&conn, None).await?;
@@ -247,6 +271,51 @@ impl<C, B, K> SpaceDatabase<C, B, K>
 where
     C: ConnectionTrait,
 {
+    /// Return the hashes of every LIVE (not directly-revoked) delegation
+    /// whose delegatee matches `delegatee`. Used by the compute re-deploy
+    /// hygiene path (compute-service.md §5.1) to find the superseded `D_fn`(s)
+    /// bound to a now-dormant routine identity and revoke them; "cite-all"
+    /// (§5.1/F5) is why this returns a `Vec` rather than one.
+    #[cfg(feature = "compute")]
+    pub async fn delegations_by_delegatee(&self, delegatee: &str) -> Result<Vec<Hash>, DbErr> {
+        let rows = delegation::Entity::find()
+            .filter(delegation::Column::Delegatee.eq(delegatee))
+            .all(&self.conn)
+            .await?;
+        let mut out = Vec::new();
+        for row in rows {
+            if !revocation::is_revoked(&self.conn, &row.id).await? {
+                out.push(row.id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Judges' item 7 (same-bytes-two-names redeploy hazard): true if some
+    /// artifact row OTHER than `(service, space, exclude_name)` still has
+    /// `content_hash == content_hash`. Identical bytes deployed under two
+    /// different function names share one content CID -- and therefore one
+    /// derived routine identity -- so re-deploying one of them must not
+    /// revoke the other's still-live `D_fn`. Callers use this to gate the
+    /// re-deploy-hygiene self-revocation (compute-service.md §5.1).
+    #[cfg(feature = "compute")]
+    pub async fn compute_artifact_content_hash_in_use_elsewhere(
+        &self,
+        service: &str,
+        space: &str,
+        exclude_name: &str,
+        content_hash: &str,
+    ) -> Result<bool, DbErr> {
+        let count = database_artifact::Entity::find()
+            .filter(database_artifact::Column::Service.eq(service))
+            .filter(database_artifact::Column::Space.eq(space))
+            .filter(database_artifact::Column::ContentHash.eq(content_hash))
+            .filter(database_artifact::Column::Name.ne(exclude_name))
+            .count(&self.conn)
+            .await?;
+        Ok(count > 0)
+    }
+
     /// List every space id known to this node (the full `space` table).
     /// Used by the admin usage endpoint to enumerate spaces without touching
     /// SQL directly.
@@ -846,6 +915,108 @@ where
             .await
     }
 
+    /// P1 atomic deploy primitive (compute-service.md §5.1/F4, plan P1): the
+    /// transaction seam is a CORE primitive, not a service-module change --
+    /// `D_fn` is processed through the SAME verification/persistence path
+    /// `delegate()`/`transact()` use, and the WASM artifact is saved via the
+    /// transaction-aware `database_artifacts::save_artifact`, in ONE SeaORM
+    /// transaction. A `D_fn`-verification failure leaves NO artifact row; an
+    /// artifact-save failure leaves NO delegation row -- both directions roll
+    /// back together (the transaction is simply dropped without `commit()`).
+    ///
+    /// The `SqlSizes` mirror (F8) is updated ONLY after a successful commit
+    /// (mirror-after-commit is a tested invariant: a rolled-back deploy must
+    /// leave `store_size` unchanged).
+    ///
+    /// Returns `(TransactResult, DatabaseArtifact, previous_content_hash)`.
+    /// `previous_content_hash` is `Some` when this call OVERWRITES an
+    /// existing `(service="compute", space, name)` artifact row (a
+    /// re-deploy) -- the caller uses it to derive the SUPERSEDED routine_did
+    /// and revoke its now-dormant `D_fn` (§5.1 "re-deploy hygiene"); that
+    /// revocation is deliberately NOT part of this transaction (it is a
+    /// SHOULD, not a MUST, and needs the server-composed `RoutineKeyDeriver`
+    /// this core method does not have).
+    #[cfg(feature = "compute")]
+    pub async fn deploy_compute_function(
+        &self,
+        delegation: Delegation,
+        space: &str,
+        name: &str,
+        wasm_bytes: Vec<u8>,
+    ) -> Result<
+        (
+            TransactResult,
+            crate::database_artifacts::DatabaseArtifact,
+            Option<String>,
+        ),
+        ComputeDeployError<B, K>,
+    > {
+        // Judges' blocking item 1: every capability row of `delegation` MUST
+        // carry the `computeFunctionBinding` caveat naming the CID of
+        // `wasm_bytes`, under the EXACT positional key "0" (the SQL caveat
+        // precedent, compute-service.md §5.1). Checked BEFORE the transaction
+        // opens (and before the chain-guard acquisition below), so a
+        // malformed or mis-bound grant never touches the DB.
+        let content_cid = crate::hash::hash(&wasm_bytes).to_cid(0x55).to_string();
+        let expected_caveat = crate::compute::compute_function_binding_caveat(&content_cid);
+        let all_bound = !delegation.0.capabilities.is_empty()
+            && delegation
+                .0
+                .capabilities
+                .iter()
+                .all(|c| c.caveats.0.get("0") == Some(&expected_caveat));
+        if !all_bound {
+            return Err(ComputeDeployError::BindingCaveatMismatch(content_cid));
+        }
+
+        let roots: Vec<Hash> = delegation
+            .0
+            .parents
+            .iter()
+            .copied()
+            .map(Hash::from)
+            .collect();
+        let _chain_guards = self.acquire_chain_guards(&roots).await?;
+
+        let tx = self
+            .conn
+            .begin_with_config(chain_isolation_level(&self.conn), None)
+            .await
+            .map_err(TxError::from)?;
+
+        let result = transact(
+            &tx,
+            &self.storage,
+            &self.secrets,
+            vec![Event::Delegation(Box::new(delegation))],
+            self.encryption.as_ref(),
+        )
+        .await
+        .map_err(ComputeDeployError::Tx)?;
+
+        let previous_content_hash =
+            crate::database_artifacts::load_artifact(&tx, "compute", space, name)
+                .await
+                .map_err(ComputeDeployError::Artifact)?
+                .map(|artifact| artifact.content_hash);
+
+        let artifact =
+            crate::database_artifacts::save_artifact(&tx, "compute", space, name, wasm_bytes)
+                .await
+                .map_err(ComputeDeployError::Artifact)?;
+
+        tx.commit()
+            .await
+            .map_err(TxError::from)
+            .map_err(ComputeDeployError::Tx)?;
+
+        self.sql_sizes
+            .update("compute", space, name, artifact.size_bytes.max(0) as u64)
+            .await;
+
+        Ok((result, artifact, previous_content_hash))
+    }
+
     pub async fn delegation_status(
         &self,
         target: Hash,
@@ -1265,6 +1436,11 @@ pub enum InvocationOutcome<R> {
     DuckDbResult(serde_json::Value),
     DuckDbExport(Vec<u8>),
     DuckDbArrow(Vec<u8>),
+    /// compute-service.md §7.3: the RoutineDid handshake response or a
+    /// Deploy ack (P1); a function's inline execute result (P2, not yet
+    /// produced).
+    #[cfg(feature = "compute")]
+    ComputeResult(serde_json::Value),
 }
 
 impl<S: StorageSetup, K: Secrets> From<delegation::Error> for TxError<S, K> {

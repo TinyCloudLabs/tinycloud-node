@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
 aws-config = "0.49"
 aws-sdk-dynamodb = "0.19"
 aws-sdk-s3 = "0.19"
@@ -99,6 +100,34 @@ x509-parser = "0.16"
 default = []
 dstack = []
 duckdb = ["tinycloud-core/duckdb"]
+compute = ["tinycloud-core/compute"]
+
+# P0 (compute-service-implementation-plan.md): this target only makes sense
+# with the compute feature enabled -- ComputeRequest/ComputeService don't
+# exist without it. `required-features` makes cargo SKIP (not build) this
+# target on a plain `cargo test`, and ERROR if it's explicitly requested
+# (`--test compute_skeleton`) without `--features compute`, instead of
+# silently reporting zero tests (the C5 failure mode the plan bans).
+[[test]]
+name = "compute_skeleton"
+path = "tests/compute_skeleton.rs"
+required-features = ["compute"]
+
+# P1 (compute-service-implementation-plan.md): the deploy-path gate --
+# atomic transaction seam, RoutineDid handshake, quota, scope-selection.
+[[test]]
+name = "compute_deploy"
+path = "tests/compute_deploy.rs"
+required-features = ["compute"]
+
+# P1: the dstack-simulator routine-key determinism test. Needs BOTH features
+# (the dstack adapter lives behind `dstack`, the compute types behind
+# `compute`) so a bare `--test compute_routine_key` without both errors
+# instead of silently reporting zero tests (C5).
+[[test]]
+name = "compute_routine_key"
+path = "tests/compute_routine_key.rs"
+required-features = ["compute", "dstack"]
 
 # cargo-binstall support: allows `cargo binstall tinycloud-node`
 [package.metadata.binstall]
