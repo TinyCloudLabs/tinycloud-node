@@ -384,6 +384,14 @@ async fn execute_capability_rejects_routine_did_body() -> Result<()> {
 
 #[tokio::test]
 async fn deploy_capability_reaches_handler_for_routine_did() -> Result<()> {
+    // P1 made `RoutineDid` a LIVE, read-only handshake (was 501 in P0). The
+    // `grant_compute_ability` fixture grants `compute/deploy` on the function
+    // path `hello`, so the handshake's target function resource
+    // (`<space>/compute/<content_cid>`) must use `content_cid = "hello"` to be
+    // covered by the granted scope (P1 scope selection). A mismatched
+    // `content_cid` is correctly rejected 403 (see the P1 `compute_deploy`
+    // scope-selection tests); here we exercise the successful handshake and
+    // assert it returns a public `did:key` routine DID.
     let (rocket, conn, _tempdir) = boot().await?;
     let fixture = grant_compute_ability(
         &conn,
@@ -402,20 +410,19 @@ async fn deploy_capability_reaches_handler_for_routine_did() -> Result<()> {
         .post("/invoke")
         .header(Header::new("Authorization", auth_header))
         .header(ContentType::JSON)
-        .body(r#"{"action":"routine_did","content_cid":"bafyexample"}"#)
+        .body(r#"{"action":"routine_did","content_cid":"hello"}"#)
         .dispatch()
         .await;
 
     let status = response.status();
     let body = response.into_string().await.unwrap_or_default();
-    assert_eq!(
-        status,
-        Status::NotImplemented,
-        "unexpected response: {body}"
-    );
+    assert_eq!(status, Status::Ok, "unexpected response: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body)?;
     assert!(
-        body.contains("not implemented yet"),
-        "expected a reached-the-handler message, got {body:?}"
+        json["routine_did"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("did:key:z")),
+        "expected a did:key routine DID, got {body:?}"
     );
     Ok(())
 }
