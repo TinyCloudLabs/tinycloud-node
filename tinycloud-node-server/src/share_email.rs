@@ -489,9 +489,15 @@ impl ConstrainedNamedSqlStore for SqlNamedStore {
                 Some(caveats),
                 "tinycloud.sql/read".to_owned(),
             )
-            .await
-            .map_err(|_| PortError::Storage)?;
+            .await;
+        #[cfg(feature = "mounted-fixture")]
+        if let Err(error) = &result {
+            eprintln!("mounted SQL store query rejected: {error:?}");
+        }
+        let result = result.map_err(|_| PortError::Storage)?;
         let SqlResponse::Query(query) = result.response else {
+            #[cfg(feature = "mounted-fixture")]
+            eprintln!("mounted SQL store returned a non-query response");
             return Err(PortError::Denied);
         };
         Ok(NamedSqlRows {
