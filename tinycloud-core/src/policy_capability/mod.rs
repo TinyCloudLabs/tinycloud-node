@@ -768,6 +768,15 @@ mod tests {
         );
         // vfs stays accepted (reserved) so it never regresses to unknown-service.
         assert!(accepted_actions("tinycloud.vfs").is_some());
+        // compute (P0 skeleton) is reserved the same way: accepted at the
+        // policy boundary, but the wildcard carries no implies yet (C1 —
+        // gen-capabilities.mjs only lets a wildcard imply *active* concretes).
+        assert!(accepted_actions("tinycloud.compute").is_some());
+        assert_eq!(
+            generated::implied_actions("tinycloud.compute/*"),
+            &[] as &[&str],
+            "compute/* must carry no implies while its concretes are reserved"
+        );
 
         // Per-service wildcards expand (via implication) to every concrete
         // action for the service, so a wildcard grant authorizes any request.

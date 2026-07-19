@@ -1,0 +1,830 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TinyCloud Compute Service — Implementation Plan</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,500;9..144,600&family=Source+Serif+4:opsz,ital,wght@8..60,0,400;8..60,0,600;8..60,1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ink: #0e1116;
+    --ink-raised: #141922;
+    --ink-panel: #10151d;
+    --hairline: #232b37;
+    --hairline-strong: #313c4b;
+    --paper: #e6e1d3;
+    --paper-dim: #a8a396;
+    --paper-faint: #6e6f6c;
+    --l1: #e2a144;          /* amber — human approval gates */
+    --l1-dim: #8a6626;
+    --l1-wash: rgba(226, 161, 68, 0.07);
+    --l2: #45c2a8;          /* teal — machine verify gates */
+    --l2-dim: #2b7a6a;
+    --l2-wash: rgba(69, 194, 168, 0.06);
+    --danger: #d4726a;
+    --display: "Fraunces", Georgia, serif;
+    --body: "Source Serif 4", Georgia, serif;
+    --mono: "IBM Plex Mono", "SF Mono", Menlo, monospace;
+    --rail-w: 248px;
+    --measure: 74ch;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+
+  body {
+    background: var(--ink);
+    color: var(--paper);
+    font-family: var(--body);
+    font-size: 17px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 1000;
+    opacity: 0.35;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3CfeColorMatrix values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.04 0'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+
+  ::selection { background: var(--l1); color: var(--ink); }
+
+  a { color: var(--l2); text-decoration: none; border-bottom: 1px solid var(--l2-dim); }
+  a:hover { color: var(--paper); border-bottom-color: var(--paper); }
+
+  .frame { display: flex; min-height: 100vh; }
+
+  nav.rail {
+    width: var(--rail-w);
+    flex: 0 0 var(--rail-w);
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow-y: auto;
+    border-right: 1px solid var(--hairline);
+    padding: 2.2rem 0 3rem 0;
+    scrollbar-width: thin;
+  }
+  .rail .brand {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--paper-dim);
+    padding: 0 1.6rem 1.6rem;
+    border-bottom: 1px solid var(--hairline);
+    margin-bottom: 1.2rem;
+  }
+  .rail .brand b { color: var(--l1); font-weight: 600; display: block; margin-top: 2px; }
+  .rail ol { list-style: none; }
+  .rail li a {
+    display: flex;
+    gap: 0.7em;
+    padding: 0.34rem 1.6rem;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--paper-dim);
+    border-bottom: none;
+    border-left: 2px solid transparent;
+    transition: color 120ms, border-color 120ms, background 120ms;
+  }
+  .rail li a .n { color: var(--paper-faint); min-width: 2ch; }
+  .rail li a:hover { color: var(--paper); }
+  .rail li a.active {
+    color: var(--l1);
+    border-left-color: var(--l1);
+    background: var(--l1-wash);
+  }
+  .rail li a.active .n { color: var(--l1-dim); }
+  .rail .xlink {
+    margin-top: 1.2rem;
+    padding-top: 1.2rem;
+    border-top: 1px solid var(--hairline);
+  }
+  .rail .xlink a { color: var(--l2); }
+
+  main {
+    flex: 1;
+    min-width: 0;
+    padding: 0 clamp(1.4rem, 5vw, 5rem) 8rem;
+  }
+
+  @media (max-width: 900px) {
+    nav.rail { display: none; }
+  }
+
+  header.hero {
+    padding: clamp(2.6rem, 7vh, 5rem) 0 3rem;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .hero .meta {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--paper-dim);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.8em 1.8em;
+    margin-bottom: 2rem;
+  }
+  .hero .meta .tag {
+    color: var(--l1);
+    border: 1px solid var(--l1-dim);
+    padding: 2px 10px;
+    border-radius: 999px;
+  }
+  .hero h1 {
+    font-family: var(--display);
+    font-weight: 340;
+    font-size: clamp(2.3rem, 5.4vw, 4rem);
+    line-height: 1.06;
+    letter-spacing: -0.015em;
+    max-width: 22ch;
+  }
+  .hero h1 em { font-style: italic; font-weight: 400; color: var(--l2); }
+  .hero p.dek {
+    margin-top: 1.5rem;
+    max-width: var(--measure);
+    font-size: 1.14rem;
+    line-height: 1.6;
+    color: var(--paper-dim);
+  }
+  .hero p.dek strong { color: var(--paper); font-weight: 600; }
+
+  section { padding-top: 4rem; }
+  section > .kicker {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--paper-faint);
+    margin-bottom: 0.7rem;
+  }
+  section > .kicker .num { color: var(--l1); margin-right: 0.9em; }
+  section h2 {
+    font-family: var(--display);
+    font-weight: 400;
+    font-size: clamp(1.6rem, 3.2vw, 2.2rem);
+    line-height: 1.15;
+    letter-spacing: -0.01em;
+    margin-bottom: 1.3rem;
+    max-width: 30ch;
+  }
+  section h3 {
+    font-family: var(--display);
+    font-weight: 500;
+    font-size: 1.2rem;
+    margin: 2.2rem 0 0.8rem;
+    color: var(--paper);
+  }
+  section p { max-width: var(--measure); margin-bottom: 1.05rem; }
+  section p.lead { font-size: 1.06rem; }
+  section ul, section ol { max-width: var(--measure); margin: 0 0 1.05rem 1.3rem; }
+  section li { margin-bottom: 0.45rem; }
+  .dim { color: var(--paper-dim); }
+
+  code {
+    font-family: var(--mono);
+    font-size: 0.82em;
+    background: var(--ink-raised);
+    border: 1px solid var(--hairline);
+    border-radius: 4px;
+    padding: 0.1em 0.42em;
+    color: var(--paper);
+    white-space: nowrap;
+  }
+
+  pre {
+    background: var(--ink-panel);
+    border: 1px solid var(--hairline);
+    border-left: 3px solid var(--hairline-strong);
+    padding: 1.1rem 1.3rem;
+    overflow-x: auto;
+    margin: 1.2rem 0 1.5rem;
+    max-width: 860px;
+  }
+  pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: 13px;
+    line-height: 1.6;
+    color: var(--paper);
+    white-space: pre;
+  }
+  pre .cm { color: var(--paper-faint); }
+  pre .k1 { color: var(--l1); }
+  pre .k2 { color: var(--l2); }
+
+  .pill {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    padding: 2px 10px 3px;
+    border-radius: 999px;
+    vertical-align: 2px;
+    margin-left: 0.6em;
+  }
+  .pill.l1 { color: var(--l1); border: 1px solid var(--l1-dim); background: var(--l1-wash); }
+  .pill.l2 { color: var(--l2); border: 1px solid var(--l2-dim); background: var(--l2-wash); }
+  .pill.warn { color: var(--danger); border: 1px solid #6d3b36; background: rgba(212, 114, 106, 0.07); }
+  .pill.dimp { color: var(--paper-dim); border: 1px solid var(--hairline-strong); }
+
+  /* Smithers node cards */
+  .node-card {
+    max-width: 920px;
+    border: 1px solid var(--hairline);
+    background: var(--ink-panel);
+    margin: 1.4rem 0 1.8rem;
+  }
+  .node-card .row {
+    display: grid;
+    grid-template-columns: 110px 1fr;
+    gap: 1rem;
+    padding: 0.85rem 1.3rem;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .node-card .row:last-child { border-bottom: none; }
+  .node-card .k {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    font-weight: 600;
+    padding-top: 3px;
+  }
+  .node-card .row.task .k { color: var(--paper-dim); }
+  .node-card .row.verify .k { color: var(--l2); }
+  .node-card .row.verify { background: var(--l2-wash); }
+  .node-card .row.gate .k { color: var(--l2); }
+  .node-card .row.approve .k { color: var(--l1); }
+  .node-card .row.approve { background: var(--l1-wash); }
+  .node-card .v { font-size: 0.95rem; color: var(--paper-dim); }
+  .node-card .v code { white-space: normal; }
+  .node-card .v ul { margin: 0 0 0 1.1rem; }
+  .node-card .v li { margin-bottom: 0.3rem; }
+  .node-card .v em { color: var(--paper); }
+
+  .callout {
+    max-width: 860px;
+    border: 1px solid var(--hairline);
+    background: var(--ink-panel);
+    padding: 1.1rem 1.4rem;
+    margin: 1.4rem 0;
+  }
+  .callout .t {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    margin-bottom: 0.5rem;
+  }
+  .callout p { margin-bottom: 0.4rem; font-size: 0.97rem; }
+  .callout p:last-child { margin-bottom: 0; }
+  .callout.note { border-left: 3px solid var(--l2-dim); }
+  .callout.note .t { color: var(--l2); }
+  .callout.trust { border-left: 3px solid var(--l1-dim); }
+  .callout.trust .t { color: var(--l1); }
+  .callout.decision { border-left: 3px solid var(--danger); }
+  .callout.decision .t { color: var(--danger); }
+
+  figure.diagram {
+    margin: 1.8rem 0 2.2rem;
+    border: 1px solid var(--hairline);
+    background:
+      radial-gradient(ellipse 120% 90% at 20% 0%, rgba(69,194,168,0.035), transparent 55%),
+      var(--ink-panel);
+    padding: 1.6rem 1.2rem 1rem;
+    max-width: 1040px;
+    overflow-x: auto;
+  }
+  figure.diagram figcaption {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--paper-faint);
+    padding: 0.9rem 0.4rem 0.2rem;
+    border-top: 1px solid var(--hairline);
+    margin-top: 1rem;
+  }
+  figure.diagram figcaption b { color: var(--paper-dim); font-weight: 600; }
+  .mermaid { display: flex; justify-content: center; min-height: 120px; }
+  .mermaid svg { max-width: 100%; height: auto; }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5em 1.4em;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--paper-dim);
+    margin: -0.9rem 0 1.6rem;
+    max-width: 1040px;
+  }
+  .legend .chip::before {
+    content: "";
+    display: inline-block;
+    width: 10px; height: 10px;
+    border-radius: 2px;
+    margin-right: 0.55em;
+    vertical-align: -1px;
+  }
+  .legend .c1::before { background: var(--l1); }
+  .legend .c2::before { background: var(--l2); }
+
+  footer {
+    margin-top: 5rem;
+    padding-top: 2rem;
+    border-top: 1px solid var(--hairline);
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--paper-faint);
+    line-height: 2;
+    max-width: var(--measure);
+  }
+  footer .src { color: var(--paper-dim); }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .hero > * { animation: rise 0.7s cubic-bezier(0.22, 1, 0.36, 1) both; }
+    .hero .meta { animation-delay: 0.05s; }
+    .hero h1 { animation-delay: 0.14s; }
+    .hero p.dek { animation-delay: 0.26s; }
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(14px); }
+      to { opacity: 1; transform: none; }
+    }
+  }
+</style>
+</head>
+<body>
+<div class="frame">
+
+<nav class="rail" aria-label="Sections">
+  <div class="brand">TinyCloud Protocol<b>Compute · Impl Plan</b></div>
+  <ol>
+    <li><a href="#model"><span class="n">01</span>Execution Model</a></li>
+    <li><a href="#pipeline"><span class="n">02</span>Phase Pipeline</a></li>
+    <li><a href="#p0"><span class="n">P0</span>Walking Skeleton</a></li>
+    <li><a href="#p1"><span class="n">P1</span>Deploy Path</a></li>
+    <li><a href="#p2"><span class="n">P2</span>Wasmtime Execute</a></li>
+    <li><a href="#p4"><span class="n">P4</span>Deferred</a></li>
+    <li><a href="#gates"><span class="n">03</span>Cross-Cutting Gates</a></li>
+    <li class="xlink"><a href="index.html">← Spec</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<header class="hero">
+  <div class="meta">
+    <span class="tag">Implementation Plan</span>
+    <span>tinycloud-node</span>
+    <span>specs/compute-service-implementation-plan.md</span>
+    <span>smithers execution</span>
+    <span>codex-reviewed · <a href="../compute-service-plan-codex-review.md">C1–C12 applied</a></span>
+  </div>
+  <h1>Smallest vertical slice first. <em>One human gate; every other check asserts.</em></h1>
+  <p class="dek">
+    The lean Smithers plan for landing the compute service: three executed phases —
+    <strong>P0 walking skeleton → P1 deploy → P2 wasmtime execute</strong> — and node work
+    <strong>ends at P2</strong>. Each phase is a single durable Smithers node with a task,
+    <strong>named machine-verifiable gates</strong>, and a bounded fix loop. Exactly
+    <strong>one human gate</strong> remains: a security review after the full P2 slice.
+    SDK work, Cloudflare, ZK, and containers are explicitly out of this plan's execution
+    (P4). No phase does speculative work for a later phase. Section references (§N) point
+    at the <a href="index.html">design spec</a>.
+  </p>
+</header>
+
+<!-- ================================================================ -->
+<section id="model">
+  <div class="kicker"><span class="num">01</span>Execution Model</div>
+  <h2>One Smithers node per phase</h2>
+  <p>
+    Every phase instantiates the same durable
+    plan&nbsp;→&nbsp;implement&nbsp;→&nbsp;review&nbsp;→&nbsp;fix&nbsp;→&nbsp;verify template;
+    only the per-phase <code>task</code> and <code>verify</code> commands differ.
+    All <code>cargo</code> commands run from the worktree root.
+  </p>
+  <pre><code>node &lt;phase&gt;:
+  task:     &lt;one-line implementer prompt&gt;                  <span class="cm"># plan → implement</span>
+  <span class="k2">verify</span>:   &lt;named commands; each MUST exist and exit 0&gt;   <span class="cm"># machine gate</span>
+  <span class="k2">suffix</span>:   cargo fmt -- --check                           <span class="cm"># runs on EVERY node</span>
+            cargo clippy --features compute -- -D warnings
+            cargo test                                     <span class="cm"># feature OFF stays green</span>
+            cargo test -p tinycloud-node --test compute_disabled   <span class="cm"># named 501 gate (C5)</span>
+  fix_loop: on verify fail → review diff + error → patch → re-verify
+            (max 3 iterations, then escalate)</code></pre>
+  <p>
+    Gates are <strong>executable commands, not prose</strong> (C5): <code>--test</code>
+    targets are <strong>named files</strong>, never name filters —
+    <code>cargo test … compute::x</code> passes when zero tests match, so it is
+    <strong>banned</strong> as a gate. Use
+    <code>cargo test -p &lt;crate&gt; --test &lt;file&gt; --features compute</code>, which errors
+    if the test file is absent.
+  </p>
+  <div class="legend">
+    <span class="chip c2">verify / suffix — machine gate (non-zero exit = fail)</span>
+    <span class="chip c1">the single human gate — security review after the full P2 slice (C12)</span>
+  </div>
+</section>
+
+<!-- ================================================================ -->
+<section id="pipeline">
+  <div class="kicker"><span class="num">02</span>Overview</div>
+  <h2>The phase pipeline</h2>
+  <p>
+    P0&nbsp;→&nbsp;P1&nbsp;→&nbsp;P2 is a strict chain — each gate is the next phase's
+    precondition — and node work ends at P2. The registry <strong>flip to
+    <code>active</code></strong> for <code>execute</code>&nbsp;+&nbsp;<code>deploy</code>
+    happens at the <em>end of P2</em> (C10), per the spec's "flip when the handler ships"
+    rule: reserved URNs are <em>already exercisable</em> by any caller
+    (<code>accepted_actions</code> includes reserved), so the old deny-by-default rationale
+    for delaying was wrong. <code>list</code> stays reserved. Exactly <strong>one human
+    gate</strong> remains — a security review after the full P2 slice; every other former
+    approval is now a machine assertion (C12).
+  </p>
+  <figure class="diagram">
+    <div class="mermaid" data-diagram="fig-pipeline"></div>
+    <script type="text/mermaid" id="fig-pipeline">
+flowchart TD
+  P0["P0 — Walking skeleton<br/>reserved registry entries + codegen regen,<br/>compute cargo feature + stub ComputeService,<br/>dispatch branch + 501-disabled path,<br/>request-variant → ability mapping (§7.1 erratum)"]
+  G0{{"verify — gen-capabilities --check · drift guards ·<br/>--test compute_skeleton: dispatch · wrong-ability 403 ·<br/>List-reject · --test compute_disabled: 501 · suffix"}}
+
+  P1["P1 — Deploy path<br/>RoutineKeyDeriver seam (dstack | classic),<br/>hashed-space derivation, RoutineDid handshake,<br/>atomic core deploy txn (mirror-after-commit),<br/>transport: JSON/base64 + inline D_fn only"]
+  G1{{"verify — cargo check --features compute,dstack ·<br/>--test compute_deploy: rollback both directions ·<br/>quota 402 · handshake · hashed-space collisions ·<br/>--test routine_key_deriver + compute_routine_key · suffix"}}
+
+  P2["P2 — Wasmtime execute (KV-read-only slice)<br/>pinned minimal WASM ABI + WAT fixture,<br/>caveat-echo mediator + (space, cid) cite-all,<br/>full caveat enforcement, rotation tripwire,<br/>execution manifest, ComputeResult"]
+  G2{{"verify — --test compute_execute: every advertised<br/>control · --test compute_abi: WAT fixture ·<br/>--test compute_e2e: granted read OK, ungranted<br/>DENIED, invoker holds no data caps · suffix"}}
+
+  FLIP["registry flips ACTIVE for execute + deploy —<br/>END of P2, when the handler ships;<br/>list stays reserved · drift-guard lock extended"]
+
+  SEC(["HUMAN GATE — the only one (C12):<br/>security review of the full P2 slice —<br/>ability mapping · caveat-echo enforcement ·<br/>cross-space isolation · active-flip diff"])
+
+  P4["P4 — DEFERRED, not executed<br/>compute/list · KV writes / SQL host calls ·<br/>streaming deploy transport · TS SDK<br/>(separate js-sdk workflow) · global Name<br/>hardening · Cloudflare / ZK / containers"]
+
+  P0 --> G0 --> P1 --> G1 --> P2 --> G2 --> FLIP --> SEC
+  SEC -.-> P4
+
+  classDef phase fill:#1a212b,stroke:#4d5a6c,stroke-width:1.5px
+  classDef vgate fill:#12201d,stroke:#2b7a6a,stroke-width:1.5px
+  classDef agate fill:#231c10,stroke:#8a6626,stroke-width:1.5px
+  classDef deferred fill:#151a22,stroke:#4d5a6c,stroke-width:1.5px,stroke-dasharray:6 5
+  classDef flip fill:#151a22,stroke:#313c4b,stroke-width:1px
+
+  class P0,P1,P2 phase
+  class G0,G1,G2 vgate
+  class SEC agate
+  class P4 deferred
+  class FLIP flip
+  linkStyle 7 stroke-dasharray:6 5
+    </script>
+    <figcaption><b>Fig. 1</b> — The Smithers pipeline: phase → machine verify gate
+    <span style="color:var(--l2)">(teal)</span> → next phase. Node work ends at P2;
+    the active-flip is P2's final step, then the single human gate
+    <span style="color:var(--l1)">(amber)</span> — a security review of the full slice.
+    P4 hangs off the end, dashed: deferred, not executed. Each gate carries the standard
+    fix loop (max 3 iterations, then escalate).</figcaption>
+  </figure>
+  <div class="legend">
+    <span class="chip c2">machine verify gate</span>
+    <span class="chip c1">human gate — security review (the only one)</span>
+  </div>
+</section>
+
+<!-- ================================================================ -->
+<section id="p0">
+  <div class="kicker"><span class="num">P0</span>Phase 0</div>
+  <h2>Walking skeleton <span class="pill dimp">service exists, disabled by default</span></h2>
+  <p>
+    The thinnest slice that compiles, gates on the feature flag, and passes the drift
+    guards. No execution logic.
+  </p>
+  <ul>
+    <li><code>capabilities.json</code> reserved entries for
+      <code>compute/{execute,deploy,list,*}</code> (§3.1, reserved-first; the wildcard
+      carries <strong>no</strong> <code>implies</code> while reserved).</li>
+    <li><code>node scripts/gen-capabilities.mjs</code> regen of <code>generated.rs</code> +
+      <code>capabilities.ts</code>.</li>
+    <li><code>compute</code> cargo feature; empty <code>ComputeService</code> managed under
+      <code>#[cfg(feature="compute")]</code> (§11.1).</li>
+    <li>Dispatch branch + 501-when-disabled path (§7.1); <code>/version</code> feature flag
+      (§11.2).</li>
+    <li><strong>Request-variant → ability mapping</strong> as a first-class deliverable
+      (§7.1 erratum, C1): <code>RoutineDid</code>/<code>Deploy</code> →
+      <code>compute/deploy</code>, <code>Execute</code> → <code>compute/execute</code>,
+      <code>List</code> → <code>compute/list</code>, via <code>ability_matches</code>. Lands
+      here as the enforced gate even though only the enabled variants exist yet.</li>
+  </ul>
+  <div class="node-card">
+    <div class="row task"><div class="k">task</div><div class="v">"Add compute reserved
+      registry entries + regen codegen; add the <code>compute</code> cargo feature, a stub
+      <code>ComputeService</code>, the invoke dispatch branch, the 501-disabled path, and
+      the request-variant → ability mapping per §3.1/§7.1/§11."</div></div>
+    <div class="row verify"><div class="k">verify</div><div class="v"><ul>
+      <li><code>node scripts/gen-capabilities.mjs --check</code></li>
+      <li><code>cargo test -p tinycloud-core policy_capability</code> — drift guards
+        <code>generated_module_matches_registry</code>,
+        <code>canonical_decisions_are_locked</code></li>
+      <li><code>cargo test -p tinycloud-node --test compute_skeleton --features compute</code>
+        — asserts: <code>/version</code> lists <code>compute</code>; an enabled dispatch
+        reaches the handler; <em>a wrong-ability request is rejected</em> (an
+        <code>Execute</code> capability presenting a <code>Deploy</code> body → 403, and
+        vice-versa); <em>a <code>List</code> body is rejected while reserved</em> (no
+        server-side listing handler exists in the MVP — assert the reject path, C1)</li>
+      <li><code>cargo test -p tinycloud-node --test compute_disabled</code> — the named
+        feature-off gate: with <code>compute</code> off, a <code>tinycloud.compute/*</code>
+        request returns 501/not-supported (C5). Also runs in the shared suffix.</li>
+      <li>suffix</li>
+    </ul></div></div>
+    <div class="row gate"><div class="k">assert</div><div class="v">Machine assertions only:
+      registry entries are <em>reserved</em> (drift-guard-locked) and mismatched bodies are
+      rejected — no human review at this boundary.</div></div>
+  </div>
+</section>
+
+<!-- ================================================================ -->
+<section id="p1">
+  <div class="kicker"><span class="num">P1</span>Phase 1</div>
+  <h2>Deploy path <span class="pill dimp">transaction seam + handshake + hashed-space identity</span></h2>
+  <p>
+    The transaction seam is a <strong>core primitive, not a service-module change</strong>
+    (C2): <code>TinyCloud::delegate</code> opens its own txn
+    (<code>db.rs:513-535</code>), <code>DatabaseArtifactRepository::save</code> owns a bare
+    <code>DatabaseConnection</code> with no txn param
+    (<code>database_artifacts.rs:28-53</code>), and <code>SqlSizes</code> is an infallible
+    in-memory mirror (<code>sql_sizes.rs:108-120</code>). So P1 must:
+  </p>
+  <ul>
+    <li>Add a <strong><code>RoutineKeyDeriver</code></strong> interface in
+      <code>tinycloud-core</code> (C11), injected from the server crate with
+      <code>dstack</code> (<code>dstack.rs:106-119</code>) and classic
+      (<code>keys.rs:57-74</code> <code>StaticSecret::derive_key</code>) impls —
+      <code>dstack::get_key</code> is server-only, so core cannot call it directly.
+      Derivation <strong>hashes the space component</strong> (§6.2 erratum, C8):
+      <code>get_key("tinycloud/compute-key/v1/" + base32(blake3(‹space›)) + "/compute/" + ‹cid›)</code>
+      — fixed-width, lowercase base32, delimiter-free. No global <code>Name</code> change
+      (deferred, P4).</li>
+    <li><code>RoutineDid { content_cid }</code> handshake → returns the
+      <strong>public</strong> <code>routine_did</code> (§7.2/F2). Gated by the C1 mapping
+      (needs <code>compute/deploy</code>).</li>
+    <li>A dedicated <strong>core deploy primitive</strong>: one SeaORM transaction that runs
+      delegation validation/persistence + <strong>transaction-aware</strong> artifact
+      persistence, commits, then updates the infallible <code>SqlSizes</code> mirror
+      (<em>mirror-after-commit</em>). Revoke the superseded <code>D_fn</code> on re-deploy
+      (§5.1).</li>
+    <li><strong>Transport (C7):</strong> JSON body + base64 WASM + <strong>inline</strong>
+      encoded <code>D_fn</code> only. Raw streaming and pre-submitted grant CIDs are
+      deferred (P4).</li>
+  </ul>
+  <div class="node-card">
+    <div class="row task"><div class="k">task</div><div class="v">"Add the
+      <code>RoutineKeyDeriver</code> seam (dstack + classic impls, hashed-space derivation),
+      the <code>RoutineDid</code> handshake, and the atomic core deploy primitive (one txn:
+      delegation + artifact, mirror-after-commit, superseded-grant revocation) per
+      §5.1/§6.2/§7.2."</div></div>
+    <div class="row verify"><div class="k">verify</div><div class="v"><ul>
+      <li><code>cargo check --features compute,dstack</code> — the feature combo compiles
+        (C11)</li>
+      <li><code>cargo test -p tinycloud-node --test compute_deploy --features compute</code>
+        — asserts: <em>atomic rollback</em> (D_fn-verify-fails ⇒ no artifact row
+        <em>and</em> no <code>SqlSizes</code> delta; artifact-persist-fails ⇒ no delegation
+        row); <em>mirror only after commit</em>; <em>superseded-grant revocation</em> on
+        re-deploy; <em>quota</em> (deploy bumps <code>store_size</code>, over-quota deploy
+        → 402); <em>handshake</em> returns a stable public <code>routine_did</code>;
+        <em><code>RoutineDid</code> body with the wrong ability is rejected</em> (a
+        non-<code>compute/deploy</code> capability presenting a <code>RoutineDid</code>
+        body → 403, C1); <em>hashed-space collision-freedom</em> (two delimiter-laden
+        space names never collide, §13.1)</li>
+      <li><code>cargo test -p tinycloud-core --test routine_key_deriver</code> — the
+        <code>RoutineKeyDeriver</code> <em>trait</em> unit test with the <em>classic</em>
+        impl only (core has no dstack adapter)</li>
+      <li><code>cargo test -p tinycloud-node --test compute_routine_key --features compute,dstack</code>
+        (with <code>DSTACK_SIMULATOR_ENDPOINT</code> set) — the dstack-<em>simulator</em>
+        adapter lives in the server crate, so its machine-checked determinism test lands
+        there (C11)</li>
+      <li>suffix</li>
+    </ul></div></div>
+    <div class="row gate"><div class="k">assert</div><div class="v">Rollback in both failure
+      directions is machine-asserted in <code>compute_deploy</code> — no human review of the
+      atomicity tests.</div></div>
+  </div>
+  <div class="callout decision">
+    <div class="t">Deployment-readiness gate — NOT a test (C11)</div>
+    <p>Real cross-CVM-redeploy <code>routine_did</code> equality must be verified
+    <strong>empirically on the target CVM</strong> (§6.2 box). The simulator unit test does
+    not prove it. Recorded as a <em>release precondition</em>, separate from the phase's
+    machine gate.</p>
+  </div>
+</section>
+
+<!-- ================================================================ -->
+<section id="p2">
+  <div class="kicker"><span class="num">P2</span>Phase 2</div>
+  <h2>Wasmtime execute <span class="pill l2">KV-read-only slice — node work ends here</span></h2>
+  <p>
+    The first end-to-end "run a function over space data under least privilege" —
+    deliberately narrow (C3/C4): a routine reads granted KV data and returns inline output.
+  </p>
+  <ul>
+    <li><strong>Pinned minimal WASM ABI (C3) — stated, not "TBD":</strong> a
+      <em>core module</em> (not a component); guest exports
+      <code>alloc(len: i32) -&gt; ptr: i32</code> (guest owns its linear memory; the host
+      writes args in via <code>alloc</code>) and
+      <code>run(ptr: i32, len: i32) -&gt; (ptr: i32, len: i32)</code> (the single
+      entrypoint); one host import, module <code>"tinycloud"</code>, function
+      <code>storage_get(ptr: i32, len: i32) -&gt; (ptr: i32, len: i32)</code>; <em>all
+      payloads are JSON bytes</em> in guest memory. The rest of the host-import surface is
+      deferred. Gated by a <strong>checked-in WAT fixture that exercises exactly this
+      contract</strong>.</li>
+    <li><strong>KV-read-only, inline output (C4):</strong> the injected
+      <strong>internal-invocation executor</strong> (named seam) reads through
+      <code>SpaceDatabase::invoke</code> (<code>db.rs:620-720</code>); a bare
+      <code>process()</code> only persists and returns a hash
+      (<code>invocation.rs:105-118</code>) and cannot return KV data. <em>KV writes and SQL
+      host calls move to P4.</em></li>
+    <li>Host mediator: caveat-echo verbatim (§6.2/F1); <code>(space, functionCid)</code>
+      cite-all <code>D_fn</code> selection (§5.1/F3/F5).</li>
+    <li>Full caveat enforcement (§10.1): fuel, epoch, <code>StoreLimits</code>,
+      chain-derived <code>functions</code> allowlist, input schema, numeric ceilings,
+      forbidden imports.</li>
+    <li><code>routine-identity-rotated</code> tripwire (§6.2/F1.5); execution manifest in
+      outcome metadata (§9.1.1).</li>
+    <li><code>InvocationOutcome::ComputeResult</code> + responder arm (§7.3).
+      (<code>ComputeList</code> NOT here — C9, deferred.)</li>
+    <li><strong>Registry active-flip for <code>execute</code>+<code>deploy</code></strong>
+      at the END of P2 (C10), per the spec's "when the handler ships" rule — reserved URNs
+      are already exercisable by any caller (<code>accepted_actions</code> includes
+      reserved, <code>gen-capabilities.mjs:121-127</code>), so the old deny-by-default
+      rationale was wrong. <code>list</code> stays reserved. Extend
+      <code>canonical_decisions_are_locked</code>.</li>
+  </ul>
+  <div class="node-card">
+    <div class="row task"><div class="k">task</div><div class="v">"Implement the KV-read-only
+      wasmtime execute slice: pinned ABI + WAT fixture, caveat-echo mediator with
+      (space,cid) cite-all selection, full caveat enforcement, rotation tripwire, execution
+      manifest, ComputeResult arm, and the end-of-phase active-flip, per
+      §6.2/§9.1.1/§10.1."</div></div>
+    <div class="row verify"><div class="k">verify</div><div class="v">
+      <p style="margin:0 0 0.5rem; font-size:inherit; max-width:none">Every advertised
+      control gets a focused test (C6):</p><ul>
+      <li><code>cargo test -p tinycloud-node --test compute_execute --features compute</code>
+        — asserts EACH: <em>caveat-echo reject</em>
+        (<code>invocation-caveats-not-subset-of-chain</code>) + invoker-side echo reject;
+        <em>cross-space isolation</em>; <em>rotation</em>
+        (<code>routine-identity-rotated</code>, not 403); <code>functions</code> allowlist;
+        <em>fuel exhaustion</em> trap; <em>epoch/timeout</em> trap; <em>memory-growth</em>
+        failure (<code>StoreLimits</code>); <em>input-schema</em> reject;
+        <em>numeric-ceiling</em> reject; <em>forbidden-import</em> reject; <em>full manifest
+        shape</em> (per-call <code>(resource, ability, bytes_in/out, destination)</code>
+        fields + granted-vs-exercised, incl. a granted-but-unexercised case, §9.1.1)</li>
+      <li><code>cargo test -p tinycloud-node --test compute_abi --features compute</code> —
+        the WAT fixture executes against the pinned ABI (export called,
+        <code>storage.get</code> mediated)</li>
+      <li><strong>E2E</strong> (real server, the P2 acceptance gate — C6):
+        <code>cargo test -p tinycloud-node --test compute_e2e --features compute</code> —
+        boots a node on an ephemeral port, health-waits, a routine reads a
+        <em>granted</em> KV path (succeeds, manifest shows it exercised) and is
+        <em>denied</em> on an <em>ungranted</em> path (host call fails closed), invoker
+        holds NO data caps throughout; tears the node down (timeout 60s)</li>
+      <li><code>node scripts/gen-capabilities.mjs --check</code> — active-flip regen
+        committed</li>
+      <li>suffix</li>
+    </ul></div></div>
+    <div class="row approve"><div class="k">approve</div><div class="v"><strong>HUMAN GATE —
+      the only one (C12):</strong> a security review of the completed P2 slice — the
+      ability mapping, the caveat-echo enforcement, cross-space isolation, and the
+      active-flip diff. All other checks above are assertions, not reviews.</div></div>
+  </div>
+</section>
+
+<!-- ================================================================ -->
+<section id="p4">
+  <div class="kicker"><span class="num">P4</span>Phase 4</div>
+  <h2>Explicitly deferred <span class="pill warn">not executed in this plan</span></h2>
+  <p>One line each on <em>why</em>:</p>
+  <ul>
+    <li><strong><code>compute/list</code></strong> (C9) — no server-side listing exists
+      (<code>DatabaseArtifactRepository</code> has only <code>load</code>/<code>save</code>,
+      <code>database_artifacts.rs:28-44</code>); stays reserved.</li>
+    <li><strong>KV-write / SQL host calls</strong> (C4) — need cross-layer executor wiring
+      beyond the read-only <code>SpaceDatabase::invoke</code> slice.</li>
+    <li><strong>Streaming / multipart deploy transport + pre-submitted grant CIDs</strong>
+      (C7) — contradicts inline atomic grant persistence; JSON/base64 suffices first.</li>
+    <li><strong>TS SDK (execute/list, session grant, privileged deploy)</strong> (C10) — the
+      TS SDK is <strong>not a member of this workspace</strong> (only the generated TS
+      mirror lives here, <code>gen-capabilities.mjs:31-34</code>). Runs as a
+      <strong>separate js-sdk worktree/workflow</strong> with its own commands and release
+      coordination — the session grant there MUST enumerate <code>compute/execute</code>
+      (+<code>list</code> when it ships) and NEVER <code>compute/*</code> (§3/F9).</li>
+    <li><strong>Global <code>Name</code> hardening</strong> (C8) — a compatibility-sensitive
+      auth-wide task, independent of compute (compute uses hashed-space derivation
+      instead).</li>
+    <li><strong>Cloudflare backend / ZK verification / container-VM backend</strong>
+      (§9.2/§12.2/§9.4) — second trust models; land the in-node wasmtime slice first.</li>
+  </ul>
+</section>
+
+<!-- ================================================================ -->
+<section id="gates">
+  <div class="kicker"><span class="num">03</span>Invariants</div>
+  <h2>Cross-cutting gates &amp; sequencing</h2>
+  <h3>Every phase — the shared suffix</h3>
+  <ul>
+    <li><code>cargo fmt -- --check</code> and
+      <code>cargo clippy --features compute -- -D warnings</code> — no new warnings.</li>
+    <li><code>cargo test</code> with the feature <strong>off</strong> stays green in every
+      phase — the 501 path and gating must never regress.</li>
+    <li><code>--test</code> targets are <strong>named files</strong> that error when absent;
+      name filters (which pass on zero matches) are banned as gates (C5).</li>
+    <li>No phase edits <code>generated.rs</code> by hand; registry changes go through
+      <code>gen-capabilities.mjs</code> and the drift guards.</li>
+  </ul>
+  <h3>Sequencing</h3>
+  <p>
+    P0&nbsp;→&nbsp;P1&nbsp;→&nbsp;P2 is a strict precondition chain (each gate is the next
+    phase's precondition), and node work ends at P2. The active-flip for
+    <code>execute</code>+<code>deploy</code> is <strong>P2's final step</strong> — "flip
+    when the handler ships" — followed by the plan's single human gate, the security
+    review. Everything else (SDK included) is P4: deferred, not executed.
+  </p>
+
+  <footer>
+    <div class="src">Sources</div>
+    <div>specs/compute-service-implementation-plan.md — this plan (rev 2026-07-18)</div>
+    <div><a href="../compute-service-plan-codex-review.md">specs/compute-service-plan-codex-review.md — codex review (C1–C12, all accepted)</a></div>
+    <div><a href="index.html">specs/compute-service-site/index.html — the design spec</a></div>
+    <div>specs/compute-service.md — the design (all §N references)</div>
+    <div style="margin-top:1.2rem">TinyCloud Labs · implementation plan · rendered with Mermaid</div>
+  </footer>
+</section>
+
+</main>
+</div>
+
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+
+  mermaid.initialize({
+    startOnLoad: false,
+    theme: "base",
+    fontFamily: "'IBM Plex Mono', Menlo, monospace",
+    themeVariables: {
+      background: "transparent",
+      fontFamily: "'IBM Plex Mono', Menlo, monospace",
+      fontSize: "13.5px",
+      primaryColor: "#1a212b",
+      primaryTextColor: "#e6e1d3",
+      primaryBorderColor: "#435061",
+      secondaryColor: "#232b37",
+      tertiaryColor: "#151a22",
+      lineColor: "#7e8794",
+      textColor: "#c9c4b6",
+      nodeBorder: "#4d5a6c",
+      clusterBkg: "#151a22",
+      clusterBorder: "#313c4b",
+      edgeLabelBackground: "#151a22",
+    },
+    flowchart: { useMaxWidth: true, curve: "basis", nodeSpacing: 40, rankSpacing: 34 },
+  });
+
+  for (const target of document.querySelectorAll("div.mermaid[data-diagram]")) {
+    const src = document.getElementById(target.dataset.diagram);
+    if (!src) continue;
+    try {
+      const { svg } = await mermaid.render("svg-" + target.dataset.diagram, src.textContent.trim());
+      target.innerHTML = svg;
+    } catch (err) {
+      target.innerHTML = '<pre style="color:#d4726a;font-size:12px;white-space:pre-wrap">' +
+        "diagram failed to render: " + String(err) + "</pre>";
+    }
+  }
+
+  // scrollspy
+  const links = [...document.querySelectorAll("nav.rail li a")].filter(a => a.getAttribute("href").startsWith("#"));
+  const byId = Object.fromEntries(links.map(a => [a.getAttribute("href").slice(1), a]));
+  const observer = new IntersectionObserver(entries => {
+    for (const e of entries) {
+      if (e.isIntersecting) {
+        links.forEach(a => a.classList.remove("active"));
+        const link = byId[e.target.id];
+        if (link) link.classList.add("active");
+      }
+    }
+  }, { rootMargin: "-15% 0px -70% 0px" });
+  document.querySelectorAll("main section[id]").forEach(s => observer.observe(s));
+</script>
+</body>
+</html>

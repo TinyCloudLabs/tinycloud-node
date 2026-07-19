@@ -11,6 +11,7 @@ sqlite = ["sea-orm/sqlx-sqlite"]
 postgres = ["sea-orm/sqlx-postgres"]
 mysql = ["sea-orm/sqlx-mysql"]
 duckdb = ["dep:arrow", "dep:duckdb"]
+compute = []
 
 tokio = ["sea-orm/runtime-tokio-rustls"]
 async-std = ["sea-orm/runtime-async-std-rustls"]
@@ -44,6 +45,9 @@ x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 hex.workspace = true
 base64.workspace = true
 sha2 = "0.10"
+# Compute routine-key derivation (compute-service.md §6.2, C8): fixed-width,
+# delimiter-free, lowercase base32 of the hashed space component.
+data-encoding = "2"
 # W1 (audit P1): full Unicode NFC normalization for policy capability path
 # canonicalization. Replaces the hand-coded subset that only composed a
 # narrow Latin precomposed-pair table.
@@ -54,3 +58,20 @@ sea-orm = { version = "1.1", features = ["runtime-tokio-rustls", "sqlx-sqlite"] 
 async-std = { version = "1", features = ["attributes"] }
 tokio.workspace = true
 iri-string.workspace = true
+
+# P1 (compute-service-implementation-plan.md): the `RoutineKeyDeriver`
+# trait's classic-impl unit test (core has no dstack adapter -- that lives
+# in tinycloud-node-server). `required-features` makes a plain `cargo test`
+# skip this target instead of silently reporting zero tests (C5).
+[[test]]
+name = "routine_key_deriver"
+path = "tests/routine_key_deriver.rs"
+required-features = ["compute"]
+
+# P1: the atomic-deploy-primitive rollback direction B (artifact failure ->
+# delegation rolled back) + mirror-after-commit, exercised against the core
+# `deploy_compute_function` seam with an injected artifact I/O failure.
+[[test]]
+name = "compute_deploy_atomicity"
+path = "tests/compute_deploy_atomicity.rs"
+required-features = ["compute"]

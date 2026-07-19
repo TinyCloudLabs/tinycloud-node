@@ -1,3 +1,5 @@
+#[cfg(feature = "compute")]
+pub mod compute;
 pub mod database_artifacts;
 pub mod db;
 #[cfg(feature = "duckdb")]
@@ -19,6 +21,8 @@ pub mod types;
 pub mod util;
 pub mod write_hooks;
 
+#[cfg(feature = "compute")]
+pub use db::ComputeDeployError;
 pub use db::{
     Commit, DelegationStatus, InvocationOutcome, KvInvokeOptions, KvPrecondition, SpaceDatabase,
     TransactResult, TxError, TxStoreError,
