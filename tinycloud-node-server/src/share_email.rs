@@ -1311,7 +1311,11 @@ pub async fn policy_session(
         .bridge
         .establish_session(session_request, now)
         .await
-        .map_err(|_| error(Status::Forbidden, "policy_denied"))?;
+        .map_err(|failure| {
+            #[cfg(feature = "mounted-fixture")]
+            eprintln!("mounted policy session: establish {failure:?}");
+            error(Status::Forbidden, "policy_denied")
+        })?;
     let session_wire = PolicySession {
         artifact_type: "TinyCloudSharePolicySession".to_owned(),
         version: 1,
