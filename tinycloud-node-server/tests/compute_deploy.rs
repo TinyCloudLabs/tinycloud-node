@@ -208,22 +208,43 @@ fn mint_d_fn_signed_by(
     content_cid: &str,
     nonce: &str,
 ) -> Result<String> {
+    mint_d_fn_with_binding(owner, signer_jwk, routine_did, Some(content_cid), nonce)
+}
+
+/// Judges' blocking item 1 negative-test helper: mint a D_fn whose
+/// `computeFunctionBinding` caveat is bound to `binding_cid`, or OMITTED
+/// entirely when `None` -- independent of whatever WASM bytes are actually
+/// deployed alongside it. Used to construct a D_fn missing the binding
+/// caveat, or one bound to the WRONG content CID.
+fn mint_d_fn_with_binding(
+    owner: &Owner,
+    signer_jwk: &JWK,
+    routine_did: &str,
+    binding_cid: Option<&str>,
+    nonce: &str,
+) -> Result<String> {
     let kv_resource: ResourceId = owner.space.clone().to_resource(
         "kv".parse::<Service>()?,
         Some("in/".parse::<AuthPath>()?),
         None,
         None,
     );
-    let mut binding = std::collections::BTreeMap::<String, serde_json::Value>::new();
-    binding.insert(
-        "computeFunctionBinding".to_string(),
-        serde_json::json!({ "functionCid": content_cid }),
-    );
+    let notabene = match binding_cid {
+        Some(cid) => {
+            let mut binding = std::collections::BTreeMap::<String, serde_json::Value>::new();
+            binding.insert(
+                "computeFunctionBinding".to_string(),
+                serde_json::json!({ "functionCid": cid }),
+            );
+            binding
+        }
+        None => std::collections::BTreeMap::<String, serde_json::Value>::new(),
+    };
     let mut caps = Capabilities::new();
     caps.with_action(
         kv_resource.as_uri(),
         "tinycloud.kv/get".parse::<UcanAbility>()?,
-        [binding],
+        [notabene],
     );
     let ucan = Payload {
         issuer: owner.vm.parse::<DIDURLBuf>()?,
@@ -422,6 +443,178 @@ async fn deploy_with_unverifiable_grant_rolls_back_no_artifact() -> Result<()> {
     assert!(
         dfn.is_none(),
         "a failed deploy must leave no delegation row"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Judges' blocking item 1: binding-caveat enforcement at deploy. Neither P1
+// branch wrote this negative test -- a D_fn missing the
+// `computeFunctionBinding` caveat (or bound to the WRONG content CID) must be
+// rejected 400 with nothing persisted.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn deploy_rejects_dfn_missing_binding_caveat() -> Result<()> {
+    let (rocket, conn, _tempdir) = boot().await?;
+    let owner = make_owner("deploy-no-binding")?;
+    seed_space_and_actors(&conn, &owner.space, &[]).await?;
+
+    let wasm = b"\x00asm\x01\x00\x00\x00no-binding".to_vec();
+    let cid = content_cid(&wasm);
+    let client = Client::tracked(rocket).await?;
+    let rdid = handshake_routine_did(&client, &owner, &cid, "urn:uuid:hs-nb").await?;
+    // No `computeFunctionBinding` caveat at all.
+    let grant = mint_d_fn_with_binding(&owner, &owner.jwk, &rdid, None, "urn:uuid:dfn-nb")?;
+    let auth = owner_compute_invocation(
+        &owner,
+        "hello",
+        "tinycloud.compute/deploy",
+        "urn:uuid:inv-nb",
+    )?;
+
+    let (status, body) = post_invoke(&client, &auth, deploy_body("hello", &wasm, &grant)).await;
+    assert_eq!(
+        status,
+        Status::BadRequest,
+        "a D_fn missing the computeFunctionBinding caveat must be rejected: {body}"
+    );
+
+    let artifact = database_artifact::Entity::find_by_id((
+        "compute".to_string(),
+        owner.space.to_string(),
+        "hello".to_string(),
+    ))
+    .one(&conn)
+    .await?;
+    assert!(
+        artifact.is_none(),
+        "a missing-binding-caveat deploy must not persist an artifact"
+    );
+    let dfn = deleg_model::Entity::find()
+        .filter(deleg_model::Column::Delegatee.eq(rdid))
+        .one(&conn)
+        .await?;
+    assert!(
+        dfn.is_none(),
+        "a missing-binding-caveat deploy must not persist a delegation"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn deploy_rejects_dfn_bound_to_wrong_content_cid() -> Result<()> {
+    let (rocket, conn, _tempdir) = boot().await?;
+    let owner = make_owner("deploy-wrong-cid")?;
+    seed_space_and_actors(&conn, &owner.space, &[]).await?;
+
+    let wasm = b"\x00asm\x01\x00\x00\x00wrong-cid".to_vec();
+    let cid = content_cid(&wasm);
+    let other_cid = content_cid(b"\x00asm\x01\x00\x00\x00some-other-bytes");
+    assert_ne!(cid, other_cid);
+    let client = Client::tracked(rocket).await?;
+    let rdid = handshake_routine_did(&client, &owner, &cid, "urn:uuid:hs-wc").await?;
+    // The caveat names `other_cid`, NOT the CID of the WASM actually deployed.
+    let grant = mint_d_fn_with_binding(
+        &owner,
+        &owner.jwk,
+        &rdid,
+        Some(&other_cid),
+        "urn:uuid:dfn-wc",
+    )?;
+    let auth = owner_compute_invocation(
+        &owner,
+        "hello",
+        "tinycloud.compute/deploy",
+        "urn:uuid:inv-wc",
+    )?;
+
+    let (status, body) = post_invoke(&client, &auth, deploy_body("hello", &wasm, &grant)).await;
+    assert_eq!(
+        status,
+        Status::BadRequest,
+        "a D_fn bound to the wrong content CID must be rejected: {body}"
+    );
+
+    let artifact = database_artifact::Entity::find_by_id((
+        "compute".to_string(),
+        owner.space.to_string(),
+        "hello".to_string(),
+    ))
+    .one(&conn)
+    .await?;
+    assert!(
+        artifact.is_none(),
+        "a wrong-CID-binding deploy must not persist an artifact"
+    );
+    let dfn = deleg_model::Entity::find()
+        .filter(deleg_model::Column::Delegatee.eq(rdid))
+        .one(&conn)
+        .await?;
+    assert!(
+        dfn.is_none(),
+        "a wrong-CID-binding deploy must not persist a delegation"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Judges' blocking item 2: delegatee verification at deploy. A D_fn whose
+// delegatee does not match the derived routine DID for (space, content_cid)
+// must be rejected 400 with nothing persisted.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn deploy_rejects_dfn_with_typoed_delegatee() -> Result<()> {
+    let (rocket, conn, _tempdir) = boot().await?;
+    let owner = make_owner("deploy-typo-delegatee")?;
+    seed_space_and_actors(&conn, &owner.space, &[]).await?;
+
+    let wasm = b"\x00asm\x01\x00\x00\x00typo-delegatee".to_vec();
+    let cid = content_cid(&wasm);
+    let client = Client::tracked(rocket).await?;
+    let rdid = handshake_routine_did(&client, &owner, &cid, "urn:uuid:hs-td").await?;
+
+    // Typo the routine DID: flip the last character. Still a syntactically
+    // valid did:key (so it parses and signs cleanly) but the WRONG identity.
+    let mut typoed = rdid.clone();
+    let last = typoed.pop().context("routine_did must be non-empty")?;
+    typoed.push(if last == 'a' { 'b' } else { 'a' });
+    assert_ne!(typoed, rdid);
+
+    let grant = mint_d_fn(&owner, &typoed, &cid, "urn:uuid:dfn-td")?;
+    let auth = owner_compute_invocation(
+        &owner,
+        "hello",
+        "tinycloud.compute/deploy",
+        "urn:uuid:inv-td",
+    )?;
+
+    let (status, body) = post_invoke(&client, &auth, deploy_body("hello", &wasm, &grant)).await;
+    assert_eq!(
+        status,
+        Status::BadRequest,
+        "a D_fn with a typo'd delegatee must be rejected: {body}"
+    );
+
+    let artifact = database_artifact::Entity::find_by_id((
+        "compute".to_string(),
+        owner.space.to_string(),
+        "hello".to_string(),
+    ))
+    .one(&conn)
+    .await?;
+    assert!(
+        artifact.is_none(),
+        "a typo'd-delegatee deploy must not persist an artifact"
+    );
+    let dfn = deleg_model::Entity::find()
+        .filter(deleg_model::Column::Delegatee.eq(typoed))
+        .one(&conn)
+        .await?;
+    assert!(
+        dfn.is_none(),
+        "a typo'd-delegatee deploy must not persist a delegation"
     );
     Ok(())
 }
