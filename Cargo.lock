@@ -9489,6 +9489,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "dashmap",
+ "data-encoding",
  "duckdb",
  "futures",
  "hex",

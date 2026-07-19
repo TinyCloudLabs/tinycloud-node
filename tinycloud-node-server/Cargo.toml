@@ -101,6 +101,22 @@ name = "compute_skeleton"
 path = "tests/compute_skeleton.rs"
 required-features = ["compute"]
 
+# P1 (compute-service-implementation-plan.md): the deploy-path gate --
+# atomic transaction seam, RoutineDid handshake, quota, scope-selection.
+[[test]]
+name = "compute_deploy"
+path = "tests/compute_deploy.rs"
+required-features = ["compute"]
+
+# P1: the dstack-simulator routine-key determinism test. Needs BOTH features
+# (the dstack adapter lives behind `dstack`, the compute types behind
+# `compute`) so a bare `--test compute_routine_key` without both errors
+# instead of silently reporting zero tests (C5).
+[[test]]
+name = "compute_routine_key"
+path = "tests/compute_routine_key.rs"
+required-features = ["compute", "dstack"]
+
 # cargo-binstall support: allows `cargo binstall tinycloud-node`
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/{ name }-v{ version }/{ name }-{ target }{ archive-suffix }"

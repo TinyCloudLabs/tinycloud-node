@@ -197,6 +197,21 @@ where
     }
 }
 
+/// P1 atomic deploy primitive error (compute-service.md §5.1/F4): wraps
+/// EITHER the standard delegation-transaction error path OR the
+/// transaction-aware artifact-save error path -- whichever fails, the
+/// transaction is rolled back (dropped without `commit()`) and NEITHER the
+/// `D_fn` delegation NOR the artifact row is observable.
+#[cfg(feature = "compute")]
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum ComputeDeployError<S: StorageSetup, K: Secrets> {
+    #[error(transparent)]
+    Tx(#[from] TxError<S, K>),
+    #[error(transparent)]
+    Artifact(#[from] crate::database_artifacts::DatabaseArtifactError),
+}
+
 impl<B, K> SpaceDatabase<DatabaseConnection, B, K> {
     pub async fn new(conn: DatabaseConnection, storage: B, secrets: K) -> Result<Self, DbErr> {
         Migrator::up(&conn, None).await?;
@@ -846,6 +861,90 @@ where
             .await
     }
 
+    /// P1 atomic deploy primitive (compute-service.md §5.1/F4, plan P1): the
+    /// transaction seam is a CORE primitive, not a service-module change --
+    /// `D_fn` is processed through the SAME verification/persistence path
+    /// `delegate()`/`transact()` use, and the WASM artifact is saved via the
+    /// transaction-aware `database_artifacts::save_artifact`, in ONE SeaORM
+    /// transaction. A `D_fn`-verification failure leaves NO artifact row; an
+    /// artifact-save failure leaves NO delegation row -- both directions roll
+    /// back together (the transaction is simply dropped without `commit()`).
+    ///
+    /// The `SqlSizes` mirror (F8) is updated ONLY after a successful commit
+    /// (mirror-after-commit is a tested invariant: a rolled-back deploy must
+    /// leave `store_size` unchanged).
+    ///
+    /// Returns `(TransactResult, DatabaseArtifact, previous_content_hash)`.
+    /// `previous_content_hash` is `Some` when this call OVERWRITES an
+    /// existing `(service="compute", space, name)` artifact row (a
+    /// re-deploy) -- the caller uses it to derive the SUPERSEDED routine_did
+    /// and revoke its now-dormant `D_fn` (§5.1 "re-deploy hygiene"); that
+    /// revocation is deliberately NOT part of this transaction (it is a
+    /// SHOULD, not a MUST, and needs the server-composed `RoutineKeyDeriver`
+    /// this core method does not have).
+    #[cfg(feature = "compute")]
+    pub async fn deploy_compute_function(
+        &self,
+        delegation: Delegation,
+        space: &str,
+        name: &str,
+        wasm_bytes: Vec<u8>,
+    ) -> Result<
+        (
+            TransactResult,
+            crate::database_artifacts::DatabaseArtifact,
+            Option<String>,
+        ),
+        ComputeDeployError<B, K>,
+    > {
+        let roots: Vec<Hash> = delegation
+            .0
+            .parents
+            .iter()
+            .copied()
+            .map(Hash::from)
+            .collect();
+        let _chain_guards = self.acquire_chain_guards(&roots).await?;
+
+        let tx = self
+            .conn
+            .begin_with_config(chain_isolation_level(&self.conn), None)
+            .await
+            .map_err(TxError::from)?;
+
+        let result = transact(
+            &tx,
+            &self.storage,
+            &self.secrets,
+            vec![Event::Delegation(Box::new(delegation))],
+            self.encryption.as_ref(),
+        )
+        .await
+        .map_err(ComputeDeployError::Tx)?;
+
+        let previous_content_hash =
+            crate::database_artifacts::load_artifact(&tx, "compute", space, name)
+                .await
+                .map_err(ComputeDeployError::Artifact)?
+                .map(|artifact| artifact.content_hash);
+
+        let artifact =
+            crate::database_artifacts::save_artifact(&tx, "compute", space, name, wasm_bytes)
+                .await
+                .map_err(ComputeDeployError::Artifact)?;
+
+        tx.commit()
+            .await
+            .map_err(TxError::from)
+            .map_err(ComputeDeployError::Tx)?;
+
+        self.sql_sizes
+            .update("compute", space, name, artifact.size_bytes.max(0) as u64)
+            .await;
+
+        Ok((result, artifact, previous_content_hash))
+    }
+
     pub async fn delegation_status(
         &self,
         target: Hash,
@@ -1265,6 +1364,11 @@ pub enum InvocationOutcome<R> {
     DuckDbResult(serde_json::Value),
     DuckDbExport(Vec<u8>),
     DuckDbArrow(Vec<u8>),
+    /// compute-service.md §7.3: the RoutineDid handshake response or a
+    /// Deploy ack (P1); a function's inline execute result (P2, not yet
+    /// produced).
+    #[cfg(feature = "compute")]
+    ComputeResult(serde_json::Value),
 }
 
 impl<S: StorageSetup, K: Secrets> From<delegation::Error> for TxError<S, K> {
