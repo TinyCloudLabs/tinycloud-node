@@ -673,6 +673,10 @@ fn digest(value: &Value) -> tinycloud_core::share_email::Sha256Digest {
     )
 }
 
+fn digest_text(value: &str) -> tinycloud_core::share_email::Sha256Digest {
+    tinycloud_core::share_email::Sha256Digest::from_bytes(Sha256::digest(value.as_bytes()).into())
+}
+
 /// Compute a binding from the frozen canonical preimage. The digest field is
 /// an output of the preimage, never an input to its own digest.
 fn verify_canonical_body_digest(
@@ -1182,7 +1186,7 @@ pub async fn policy_challenge(
     let origin_digest = digest(&json!(scope.target_origin.as_str()));
     let ip_digest = digest(&json!(client_ip.0.to_string()));
     let share_digest = digest(&json!(scope.share_cid.as_str()));
-    let nonce_hash = digest(&json!(nonce.as_str()));
+    let nonce_hash = digest_text(nonce.as_str());
     runtime
         .state
         .create_anonymous_challenge(
@@ -1274,9 +1278,9 @@ pub async fn policy_session(
             now,
         )
         .await
-        .map_err(|failure| {
+        .map_err(|_failure| {
             #[cfg(feature = "mounted-fixture")]
-            eprintln!("mounted policy session: policy metadata {failure:?}");
+            eprintln!("mounted policy session: policy metadata {_failure:?}");
             error(Status::Forbidden, "policy_denied")
         })?;
     let evidence = runtime
@@ -1289,9 +1293,9 @@ pub async fn policy_session(
             &policy_email,
             policy_expiry.unix_timestamp(),
         )
-        .map_err(|failure| {
+        .map_err(|_failure| {
             #[cfg(feature = "mounted-fixture")]
-            eprintln!("mounted policy session: credential {failure:?}");
+            eprintln!("mounted policy session: credential {_failure:?}");
             error(Status::Forbidden, "invalid_credential_profile")
         })?;
     if evidence.credential_digest != p.credential_digest {
@@ -1308,16 +1312,16 @@ pub async fn policy_session(
         challenge_id: p.challenge_id.as_str().to_owned(),
         challenge_request_digest: challenge_digest,
         challenge_binding,
-        policy_recipient_digest: digest(&json!(policy_email)),
+        policy_recipient_digest: digest_text(&policy_email),
         credential_expires_at: evidence.expires_at,
     };
     let session = runtime
         .bridge
         .establish_session(session_request, now)
         .await
-        .map_err(|failure| {
+        .map_err(|_failure| {
             #[cfg(feature = "mounted-fixture")]
-            eprintln!("mounted policy session: establish {failure:?}");
+            eprintln!("mounted policy session: establish {_failure:?}");
             error(Status::Forbidden, "policy_denied")
         })?;
     let session_wire = PolicySession {
@@ -1613,6 +1617,13 @@ mod tests {
         valid["requestBodyDigest"] = json!(read_digest.as_str());
         valid["invocation"]["requestBodyDigest"] = json!(read_digest.as_str());
         assert!(verify_read_request_body_digest(&valid, &read_digest, &read_digest).is_ok());
+    }
+
+    #[tokio::test]
+    async fn policy_recipient_digest_hashes_email_bytes_without_json_quotes() {
+        let email = "Alice+Notes@example.com";
+        assert_ne!(digest_text(email), digest(&json!(email)));
+        assert_eq!(digest_text(email), digest_text(email));
     }
 
     #[tokio::test]

@@ -441,13 +441,11 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
             .await?;
         let recipient_digest = digest_string(&policy_recipient);
         if recipient_digest != request.policy_recipient_digest {
-            eprintln!("mounted session: recipient digest mismatch");
             return Err(PortError::Denied);
         }
         let credential_expiry = OffsetDateTime::from_unix_timestamp(request.credential_expires_at)
             .map_err(|_| PortError::Denied)?;
         if credential_expiry != policy_expiry {
-            eprintln!("mounted session: credential expiry mismatch");
             return Err(PortError::Denied);
         }
         ProtocolStateRepository::consume_anonymous_challenge_in_transaction(
@@ -459,10 +457,7 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
             now,
         )
         .await
-        .map_err(|failure| {
-            eprintln!("mounted session: challenge consume {failure:?}");
-            map_state_error(failure)
-        })?;
+        .map_err(map_state_error)?;
 
         let already_used =
             share_policy_presentation_jti::Entity::find_by_id(request.presentation_jti.as_str())
@@ -477,17 +472,12 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
                     .map_err(|_| PortError::Storage)?
                     .is_some();
         if already_used {
-            eprintln!("mounted session: presentation replay");
             return Err(PortError::Replay);
         }
 
         let authority_session_cid = self
             .issue_root_in_transaction(&tx, &request, now, policy_expiry, credential_expiry)
-            .await
-            .map_err(|failure| {
-                eprintln!("mounted session: root issuance {failure:?}");
-                failure
-            })?;
+            .await?;
 
         let mut handle_bytes = [0u8; 16];
         OsRng.fill_bytes(&mut handle_bytes);
@@ -496,7 +486,6 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
             .min(credential_expiry)
             .min(policy_expiry);
         if expires_at <= now {
-            eprintln!("mounted session: expired session");
             return Err(PortError::Denied);
         }
 
@@ -510,10 +499,7 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
         }
         .insert(&tx)
         .await
-        .map_err(|failure| {
-            eprintln!("mounted session: jti insert {failure:?}");
-            PortError::Replay
-        })?;
+        .map_err(|_| PortError::Replay)?;
 
         let binding = SessionBinding {
             scope_digest: scope_digest(&request.scope),
@@ -549,10 +535,7 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
 
         ProtocolStateRepository::commit_session_in_transaction(&tx, mapping, audit, now)
             .await
-            .map_err(|failure| {
-                eprintln!("mounted session: session commit {failure:?}");
-                map_state_error(failure)
-            })?;
+            .map_err(map_state_error)?;
 
         tx.commit().await.map_err(|_| PortError::Storage)?;
 
