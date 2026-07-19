@@ -652,7 +652,9 @@ async fn run() -> Result<()> {
         }
     }
     let sender = ed_key([0x44; 32]);
-    let now = OffsetDateTime::now_utc();
+    let now = OffsetDateTime::now_utc()
+        .replace_second(0)
+        .and_then(|value| value.replace_nanosecond(0))?;
     let cases = vec![
         build_case("kv", &sender, &node, now)?,
         build_case("sql", &sender, &node, now)?,
