@@ -772,19 +772,31 @@ impl DatabaseAuthorityBridge117 {
                 &scope.authority_material_handle,
                 &scope.authority_material_digest,
             )
-            .await?;
-        validate_share_policy_state(&bundle.policy_state, scope)?;
+            .await
+            .map_err(|error| {
+                eprintln!("mounted scope: material {error:?}");
+                error
+            })?;
+        validate_share_policy_state(&bundle.policy_state, scope).map_err(|error| {
+            eprintln!("mounted scope: policy state {error:?}");
+            error
+        })?;
         let verifier = AuthorityArtifactVerifier;
-        let signed_policy = verifier
-            .verify(&bundle.policy_authority)
-            .map_err(map_authority_error)?;
+        let signed_policy = verifier.verify(&bundle.policy_authority).map_err(|error| {
+            eprintln!("mounted scope: policy verify {error:?}");
+            map_authority_error(error)
+        })?;
         let signed_enforcement = verifier
             .verify(&bundle.policy_enforcement)
-            .map_err(map_authority_error)?;
+            .map_err(|error| {
+                eprintln!("mounted scope: enforcement verify {error:?}");
+                map_authority_error(error)
+            })?;
         if signed_policy.artifact().delegation_cid != bundle.internal_policy_authority_cid.as_str()
             || signed_enforcement.artifact().delegation_cid
                 != bundle.internal_policy_enforcement_cid.as_str()
         {
+            eprintln!("mounted scope: authority CID mismatch");
             return Err(PortError::Denied);
         }
         let enforcer = DidKey::parse(
@@ -793,23 +805,45 @@ impl DatabaseAuthorityBridge117 {
                 .fact_value("enforcerDid")
                 .map_err(|_| PortError::Denied)?,
         )
-        .map_err(|_| PortError::Denied)?;
+        .map_err(|error| {
+            eprintln!("mounted scope: enforcer {error:?}");
+            PortError::Denied
+        })?;
         let status_bytes = status_provider
             .refresh(&bundle.internal_policy_authority_cid)
-            .await?;
-        let status = parse_status(&status_bytes, &bundle.internal_policy_authority_cid, now)?;
+            .await
+            .map_err(|error| {
+                eprintln!("mounted scope: policy status {error:?}");
+                error
+            })?;
+        let status = parse_status(&status_bytes, &bundle.internal_policy_authority_cid, now)
+            .map_err(|error| {
+                eprintln!("mounted scope: policy status parse {error:?}");
+                error
+            })?;
         self.authority
             .admit_verified_authority_in_transaction(tx, signed_policy.clone(), &status, now)
             .await
-            .map_err(map_authority_error)?;
+            .map_err(|error| {
+                eprintln!("mounted scope: policy admit {error:?}");
+                map_authority_error(error)
+            })?;
         let enforcement_status_bytes = status_provider
             .refresh(&bundle.internal_policy_enforcement_cid)
-            .await?;
+            .await
+            .map_err(|error| {
+                eprintln!("mounted scope: enforcement status {error:?}");
+                error
+            })?;
         let enforcement_status = parse_status(
             &enforcement_status_bytes,
             &bundle.internal_policy_enforcement_cid,
             now,
-        )?;
+        )
+        .map_err(|error| {
+            eprintln!("mounted scope: enforcement status parse {error:?}");
+            error
+        })?;
         self.authority
             .admit_verified_authority_in_transaction(
                 tx,
@@ -818,10 +852,17 @@ impl DatabaseAuthorityBridge117 {
                 now,
             )
             .await
-            .map_err(map_authority_error)?;
+            .map_err(|error| {
+                eprintln!("mounted scope: enforcement admit {error:?}");
+                map_authority_error(error)
+            })?;
         let attestation = attestation_provider
             .attest(&scope.node_audience, &enforcer)
-            .await?;
+            .await
+            .map_err(|error| {
+                eprintln!("mounted scope: attestation {error:?}");
+                error
+            })?;
         validate_attestation(
             &attestation,
             &scope.target_origin,
@@ -833,27 +874,43 @@ impl DatabaseAuthorityBridge117 {
                 .map_err(|_| PortError::Denied)?,
             &signed_enforcement.artifact().expires_at,
             now,
-        )?;
+        )
+        .map_err(|error| {
+            eprintln!("mounted scope: attestation validation {error:?}");
+            error
+        })?;
         let policy_cid = bundle.internal_policy_authority_cid;
         let delegation_cid = bundle.internal_delegation_cid.clone();
         self.authority
             .validate_for_invocation_in_transaction(tx, policy_cid.as_str(), now)
             .await
-            .map_err(map_authority_error)?;
+            .map_err(|error| {
+                eprintln!("mounted scope: policy invocation {error:?}");
+                map_authority_error(error)
+            })?;
         self.authority
             .validate_for_invocation_in_transaction(tx, delegation_cid.as_str(), now)
             .await
-            .map_err(map_authority_error)?;
+            .map_err(|error| {
+                eprintln!("mounted scope: enforcement invocation {error:?}");
+                map_authority_error(error)
+            })?;
         let policy = self
             .authority
             .artifact_in_transaction(tx, policy_cid.as_str())
             .await
-            .map_err(map_authority_error)?;
+            .map_err(|error| {
+                eprintln!("mounted scope: policy artifact {error:?}");
+                map_authority_error(error)
+            })?;
         let delegation = self
             .authority
             .artifact_in_transaction(tx, delegation_cid.as_str())
             .await
-            .map_err(map_authority_error)?;
+            .map_err(|error| {
+                eprintln!("mounted scope: enforcement artifact {error:?}");
+                map_authority_error(error)
+            })?;
         let paired_authority_roots = delegation.role
             == crate::policy_authority::DelegationRole::PolicyEnforcement
             && delegation.issuer_did == policy.issuer_did
@@ -878,11 +935,18 @@ impl DatabaseAuthorityBridge117 {
                 != Some(policy_cid.as_str())
             && !paired_authority_roots
         {
+            eprintln!("mounted scope: authority pair mismatch");
             return Err(PortError::Denied);
         }
         let (recipient, expiry) =
-            policy_metadata(&policy, Some(&bundle.policy_state)).map_err(|_| PortError::Denied)?;
-        let statement = authorized_statement(scope, &policy, &delegation)?;
+            policy_metadata(&policy, Some(&bundle.policy_state)).map_err(|error| {
+                eprintln!("mounted scope: policy metadata {error:?}");
+                PortError::Denied
+            })?;
+        let statement = authorized_statement(scope, &policy, &delegation).map_err(|error| {
+            eprintln!("mounted scope: statement {error:?}");
+            error
+        })?;
         Ok((expiry, recipient, statement, bundle.internal_delegation_cid))
     }
 }
