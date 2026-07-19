@@ -73,6 +73,30 @@ pub struct ServiceStatus {
     pub node_did: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub control_api: Option<ControlApiAnnotation>,
+    // v1-link additions — see docs/specs/node-control-plane-v1.md §3.9.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cert_not_after: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_listener: Option<LinkListenerState>,
+    /// Set when the LAN TLS listener's last bind attempt failed — sourced
+    /// from the on-disk listener-state marker `serve` writes, not inferred
+    /// from process state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_listener_error: Option<String>,
+}
+
+/// v1-link — the observed state of the LAN TLS terminator surfaced through
+/// `service status --json`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LinkListenerState {
+    Disabled,
+    Stopped,
+    Running,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -194,6 +218,11 @@ pub fn default_service_status() -> ServiceStatus {
         identity_ready: false,
         node_did: None,
         control_api: None,
+        link_name: None,
+        local_url: None,
+        cert_not_after: None,
+        link_listener: None,
+        link_listener_error: None,
     }
 }
 
@@ -266,6 +295,35 @@ pub fn node_key_backup(passphrase: &[u8], output: Option<PathBuf>) -> Result<Bac
         passphrase,
         output,
     )
+}
+
+/// Enable link for this installed node — claim the name, request a cert, and
+/// persist state. Signs canonical service payloads with the node's Ed25519
+/// identity (same trust boundary as `node_key_backup`).
+pub fn node_link_enable(
+    args: crate::link::commands::EnableArgs,
+) -> Result<crate::link::commands::LinkStatusReport> {
+    let paths = installed_or_current_paths()?;
+    let config = effective_config(&paths)?;
+    crate::link::commands::enable(&config.storage.datadir, Some(&config.keys), args)
+}
+
+pub fn node_link_disable() -> Result<crate::link::commands::LinkStatusReport> {
+    let paths = installed_or_current_paths()?;
+    let config = effective_config(&paths)?;
+    crate::link::commands::disable(&config.storage.datadir, Some(&config.keys))
+}
+
+pub fn node_link_status() -> Result<crate::link::commands::LinkStatusReport> {
+    let paths = installed_or_current_paths()?;
+    let config = effective_config(&paths)?;
+    crate::link::commands::status(&config.storage.datadir)
+}
+
+pub fn node_link_renew() -> Result<crate::link::commands::LinkStatusReport> {
+    let paths = installed_or_current_paths()?;
+    let config = effective_config(&paths)?;
+    crate::link::commands::renew(&config.storage.datadir, Some(&config.keys))
 }
 
 pub fn node_key_export_body() -> Result<String> {
@@ -550,6 +608,26 @@ pub fn service_status_for_installed(installed: DiscoveredService) -> ServiceStat
     let key_backend = control.key_backend.or(Some(manifest.key_backend));
     let (state, pid, control_api) = derive_state(&manifest, &paths, &control);
 
+    // v1-link: surface the link name / URL / cert-notAfter and listener state
+    // from disk state (`state.json`) so `service status --json` can show them
+    // regardless of whether the node is currently running. The listener
+    // state itself is sourced from the on-disk marker `serve` writes after
+    // its actual bind attempt (see `link::state::ListenerState`) rather than
+    // inferred purely from `ServiceState::Running` — a bind failure inside a
+    // running node process must still show up as not-running here.
+    let link_from_disk = read_link_disk_snapshot(&paths);
+    let link_listener = match (state.clone(), &link_from_disk) {
+        (_, None) => Some(LinkListenerState::Disabled),
+        (ServiceState::Running, Some(snapshot)) => {
+            if snapshot.listener_bound == Some(true) {
+                Some(LinkListenerState::Running)
+            } else {
+                Some(LinkListenerState::Stopped)
+            }
+        }
+        (_, Some(_)) => Some(LinkListenerState::Stopped),
+    };
+
     ServiceStatus {
         contract_version,
         profile: manifest.profile,
@@ -567,7 +645,53 @@ pub fn service_status_for_installed(installed: DiscoveredService) -> ServiceStat
         identity_ready,
         node_did,
         control_api,
+        link_name: link_from_disk.as_ref().map(|s| s.name.clone()),
+        local_url: link_from_disk.as_ref().map(|s| s.local_url.clone()),
+        cert_not_after: link_from_disk
+            .as_ref()
+            .and_then(|s| s.cert_not_after.clone()),
+        link_listener,
+        link_listener_error: link_from_disk
+            .as_ref()
+            .and_then(|s| s.listener_error.clone()),
     }
+}
+
+/// A compact view of link state used to enrich `service status --json`.
+#[derive(Debug, Clone)]
+struct LinkDiskSnapshot {
+    name: String,
+    local_url: String,
+    cert_not_after: Option<String>,
+    /// `None` if `serve` has never recorded a bind attempt (e.g. link was
+    /// just enabled and `serve` hasn't restarted yet).
+    listener_bound: Option<bool>,
+    listener_error: Option<String>,
+}
+
+fn read_link_disk_snapshot(paths: &ProfilePaths) -> Option<LinkDiskSnapshot> {
+    let state = crate::link::commands::load_state(&paths.data_root)
+        .ok()
+        .flatten()?;
+    let bind_port = state
+        .bind
+        .as_deref()
+        .and_then(|bind| {
+            bind.rsplit_once(':')
+                .and_then(|(_, port)| port.parse().ok())
+        })
+        .unwrap_or(8443);
+    let link_paths = crate::link::state::LinkPaths::from_data_root(&paths.data_root);
+    let listener_state = crate::link::state::read_listener_state(&link_paths)
+        .ok()
+        .flatten();
+    Some(LinkDiskSnapshot {
+        name: state.name.clone(),
+        local_url: crate::link::local_url(&state.name, bind_port),
+        cert_not_after: state.cert_not_after,
+        listener_bound: listener_state.as_ref().map(|s| s.bound),
+        listener_error: listener_state.and_then(|s| s.error),
+    })
 }
 
 fn derive_state(
@@ -2323,6 +2447,11 @@ printf '%s\n' "${FAKE_PS_AGE:-29}"
             identity_ready: true,
             node_did: Some("did:key:z6Mk...".into()),
             control_api: Some(ControlApiAnnotation::Unavailable),
+            link_name: Some("mynode".into()),
+            local_url: Some("https://mynode.local.tinycloud.link:8443".into()),
+            cert_not_after: Some("2026-08-15T00:00:00Z".into()),
+            link_listener: Some(LinkListenerState::Running),
+            link_listener_error: None,
         };
 
         let value = serde_json::to_value(status).unwrap();
@@ -2338,6 +2467,13 @@ printf '%s\n' "${FAKE_PS_AGE:-29}"
         assert_eq!(value["identityReady"], true);
         assert_eq!(value["nodeDid"], "did:key:z6Mk...");
         assert_eq!(value["controlApi"], "unavailable");
+        assert_eq!(value["linkName"], "mynode");
+        assert_eq!(
+            value["localUrl"],
+            "https://mynode.local.tinycloud.link:8443"
+        );
+        assert_eq!(value["certNotAfter"], "2026-08-15T00:00:00Z");
+        assert_eq!(value["linkListener"], "running");
     }
 
     #[test]
