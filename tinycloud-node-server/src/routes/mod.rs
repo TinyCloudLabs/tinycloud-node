@@ -947,11 +947,66 @@ fn field_metadata(field: &multer::Field<'_>) -> Metadata {
     Metadata(metadata)
 }
 
+/// How `staged_batch_remaining` should treat a `None` `store_size` (a space
+/// with no block/artifact bytes yet).
+#[derive(Clone, Copy)]
+enum MissingStoreSize {
+    /// SQL/DuckDB: a `None` means the space itself was not found -- 404.
+    NotFound,
+    /// Compute deploy (judges' item 6): a deploy may be a space's FIRST
+    /// write, so `None` means "zero bytes used so far", not "space missing"
+    /// -- `verify_auth` has already proven the space exists before this
+    /// runs, so 404-ing here would spuriously reject a legitimate first
+    /// deploy.
+    #[cfg(feature = "compute")]
+    TreatAsZero,
+}
+
 async fn staged_batch_remaining(
     space: &SpaceId,
     tinycloud: &State<TinyCloud>,
     config: &State<Config>,
     quota_cache: &State<QuotaCache>,
+) -> Result<Option<(u64, u64, u64)>, (Status, String)> {
+    staged_batch_remaining_inner(
+        space,
+        tinycloud,
+        config,
+        quota_cache,
+        MissingStoreSize::NotFound,
+    )
+    .await
+}
+
+/// Compute-deploy variant of `staged_batch_remaining` (judges' item 6): same
+/// limit resolution and over-quota semantics, but a missing `store_size` is
+/// treated as zero-used rather than 404. Extracted as a named variant of the
+/// shared helper -- rather than the previously inlined near-copy in
+/// `handle_compute_deploy` -- so a third write-class caller can't drift from
+/// either semantics independently.
+#[cfg(feature = "compute")]
+async fn staged_batch_remaining_allow_first_write(
+    space: &SpaceId,
+    tinycloud: &State<TinyCloud>,
+    config: &State<Config>,
+    quota_cache: &State<QuotaCache>,
+) -> Result<Option<(u64, u64, u64)>, (Status, String)> {
+    staged_batch_remaining_inner(
+        space,
+        tinycloud,
+        config,
+        quota_cache,
+        MissingStoreSize::TreatAsZero,
+    )
+    .await
+}
+
+async fn staged_batch_remaining_inner(
+    space: &SpaceId,
+    tinycloud: &State<TinyCloud>,
+    config: &State<Config>,
+    quota_cache: &State<QuotaCache>,
+    missing_store_size: MissingStoreSize,
 ) -> Result<Option<(u64, u64, u64)>, (Status, String)> {
     let effective_limit = if is_public_space(space) {
         Some(config.public_spaces.storage_limit)
@@ -964,11 +1019,18 @@ async fn staged_batch_remaining(
     };
 
     let limit_bytes = limit.as_u64();
-    let current_size = tinycloud
+    let store_size = tinycloud
         .store_size(space)
         .await
-        .map_err(|e| (Status::InternalServerError, e.to_string()))?
-        .ok_or_else(|| (Status::NotFound, "space not found".to_string()))?;
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+    let current_size = match (store_size, missing_store_size) {
+        (Some(size), _) => size,
+        #[cfg(feature = "compute")]
+        (None, MissingStoreSize::TreatAsZero) => 0,
+        (None, MissingStoreSize::NotFound) => {
+            return Err((Status::NotFound, "space not found".to_string()))
+        }
+    };
     let remaining = match limit_bytes.checked_sub(current_size) {
         None | Some(0) => {
             return Err((
@@ -2462,35 +2524,22 @@ async fn handle_compute_deploy(
     let wasm_bytes = base64::decode(wasm_b64.as_bytes())
         .map_err(|e| (Status::BadRequest, format!("invalid base64 wasm_b64: {e}")))?;
 
-    // Storage quota pre-check (§5/F8): deploy is write-class. `store_size`
-    // folds the compute artifact bytes via the `SqlSizes` mirror, so an
-    // already-over-quota space 402s here, and a payload that would exceed the
-    // remaining budget is rejected BEFORE the transaction (we know the size
-    // up-front, so -- unlike SQL's post-execute overshoot -- deploy enforces
-    // precisely). NOTE (drift resolved): this mirrors `staged_batch_remaining`'s
-    // limit resolution and 402 semantics, BUT treats an unknown (`None`)
-    // `store_size` as 0-used rather than 404. A deploy may be a space's FIRST
-    // write, so it has no block/artifact bytes yet -- and `verify_auth` has
-    // already proven the space EXISTS (a non-existent space fails the outer
-    // invocation with 404 before we get here), so the shared helper's
-    // `None -> "space not found"` would spuriously reject a legitimate first
-    // deploy. Reads never reach this path.
-    let effective_limit = if is_public_space(space) {
-        Some(config.public_spaces.storage_limit)
-    } else {
-        quota_cache.get_limit(space).await
-    };
-    if let Some(limit) = effective_limit {
-        let limit_bytes = limit.as_u64();
-        let current_size = tinycloud
-            .store_size(space)
-            .await
-            .map_err(|e| (Status::InternalServerError, e.to_string()))?
-            .unwrap_or(0);
+    // Storage quota pre-check (§5/F8): deploy is write-class. Uses the
+    // first-write-tolerant variant of the shared quota helper (judges' item
+    // 6) -- a deploy may be a space's FIRST write, so a missing `store_size`
+    // must not 404 (`verify_auth` has already proven the space EXISTS before
+    // we get here). We know the payload size up-front, so -- unlike SQL's
+    // post-execute overshoot -- deploy enforces precisely, before the
+    // transaction.
+    let content_cid = tinycloud_core::hash::hash(&wasm_bytes)
+        .to_cid(0x55)
+        .to_string();
+    if let Some((remaining, current_size, limit_bytes)) =
+        staged_batch_remaining_allow_first_write(space, tinycloud, config, quota_cache).await?
+    {
         let wasm_len = u64::try_from(wasm_bytes.len())
             .map_err(|e| (Status::InternalServerError, e.to_string()))?;
-        let remaining = limit_bytes.saturating_sub(current_size);
-        if current_size >= limit_bytes || wasm_len > remaining {
+        if wasm_len > remaining {
             return Err((
                 Status::new(402),
                 format!(
@@ -2515,9 +2564,6 @@ async fn handle_compute_deploy(
     // commit) doubles as judges' item 4 (ack ordering): the SAME
     // `routine_did` is reused for the ack below, so a derivation failure can
     // never 500 an already-committed deploy.
-    let content_cid = tinycloud_core::hash::hash(&wasm_bytes)
-        .to_cid(0x55)
-        .to_string();
     let expected_routine_did = compute_service
         .routine_key_deriver()
         .derive_routine_did(space, &content_cid)
@@ -2545,22 +2591,59 @@ async fn handle_compute_deploy(
     // routine key is never derived again). Revoke the superseded `D_fn` so the
     // event graph does not accumulate dormant grants. This is a post-commit
     // SHOULD, deliberately OUTSIDE the deploy transaction.
+    //
+    // Judges' item 7 (same-bytes-two-names hazard): identical bytes deployed
+    // under two different function names share one content CID -- and
+    // therefore one derived routine identity. Before revoking, confirm no
+    // OTHER artifact row in this space still references the old content CID;
+    // if one does, that function's `D_fn` is still live and must NOT be
+    // revoked as a side effect of this unrelated re-deploy.
+    let mut superseded_content_cid: Option<String> = None;
+    let mut superseded_grant: Option<String> = None;
     if let Some(previous_hash) = previous_content_hash {
         if previous_hash != artifact.content_hash {
-            revoke_superseded_compute_grant(tinycloud, compute_service, space, &previous_hash)
+            let still_referenced = tinycloud
+                .compute_artifact_content_hash_in_use_elsewhere(
+                    "compute",
+                    &space_id,
+                    function,
+                    &previous_hash,
+                )
+                .await
+                .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+            if !still_referenced {
+                let revoked_grants = revoke_superseded_compute_grant(
+                    tinycloud,
+                    compute_service,
+                    space,
+                    &previous_hash,
+                )
                 .await;
+                if !revoked_grants.is_empty() {
+                    superseded_content_cid = Some(previous_hash);
+                    // Judges' item 8 (optional ack field, ported from A):
+                    // A's core-level revoke is scoped to one delegation; B's
+                    // is cite-all (may revoke more than one live D_fn for the
+                    // same superseded routine identity). Surface the first
+                    // for ack-shape parity with A.
+                    superseded_grant = revoked_grants.into_iter().next();
+                }
+            }
         }
     }
 
     // Deploy ack (§7.2/§7.3): the minimal response the SDK needs -- the
     // function CID, the routine_did the deployer bound `D_fn` to (derived and
-    // verified pre-commit above, per judges' item 4), and the artifact
-    // revision.
+    // verified pre-commit above, per judges' item 4), the artifact revision,
+    // and (judges' item 8, optional) the superseded content CID/grant when a
+    // re-deploy revoked a prior `D_fn`.
     let ack = serde_json::json!({
         "function": function,
         "content_cid": artifact.content_hash,
         "routine_did": expected_routine_did,
         "revision": artifact.revision,
+        "superseded_content_cid": superseded_content_cid,
+        "superseded_grant": superseded_grant,
     });
     Ok(DataOut::One(InvOut(InvocationOutcome::ComputeResult(ack))))
 }
@@ -2580,6 +2663,9 @@ fn compute_deploy_error_to_status(
         // wrong CID under) the `computeFunctionBinding` caveat is a client
         // error, not a server error.
         ComputeDeployError::BindingCaveatMismatch(_) => (Status::BadRequest, error.to_string()),
+        ComputeDeployError::Artifact(
+            tinycloud_core::database_artifacts::DatabaseArtifactError::PayloadTooLarge(_),
+        ) => (Status::PayloadTooLarge, error.to_string()),
         ComputeDeployError::Tx(TxError::SpaceNotFound) => {
             (Status::NotFound, "Space not found".to_string())
         }
@@ -2600,15 +2686,17 @@ fn compute_deploy_error_to_status(
 /// self-revoke, so the node -- which holds the derived routine key -- signs
 /// the revocation AS the superseded routine, needing no external proof. This
 /// is best-effort hygiene (a SHOULD): a failure to revoke is logged, not
-/// surfaced, so it never fails an otherwise-successful deploy.
+/// surfaced, so it never fails an otherwise-successful deploy. Returns the
+/// CIDs of the grants actually revoked (empty on failure) -- judges' item 8:
+/// the caller surfaces these in the deploy ack.
 #[cfg(feature = "compute")]
 async fn revoke_superseded_compute_grant(
     tinycloud: &State<TinyCloud>,
     compute_service: &State<ComputeService>,
     space: &tinycloud_auth::resource::SpaceId,
     previous_content_hash: &str,
-) {
-    if let Err(error) = try_revoke_superseded_compute_grant(
+) -> Vec<String> {
+    match try_revoke_superseded_compute_grant(
         tinycloud,
         compute_service,
         space,
@@ -2616,11 +2704,15 @@ async fn revoke_superseded_compute_grant(
     )
     .await
     {
-        ::tracing::warn!(
-            previous_content_hash,
-            error = %error,
-            "failed to revoke superseded compute D_fn on re-deploy (best-effort hygiene)"
-        );
+        Ok(revoked) => revoked,
+        Err(error) => {
+            ::tracing::warn!(
+                previous_content_hash,
+                error = %error,
+                "failed to revoke superseded compute D_fn on re-deploy (best-effort hygiene)"
+            );
+            Vec::new()
+        }
     }
 }
 
@@ -2630,7 +2722,7 @@ async fn try_revoke_superseded_compute_grant(
     compute_service: &State<ComputeService>,
     space: &tinycloud_auth::resource::SpaceId,
     previous_content_hash: &str,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     use tinycloud_auth::authorization::{Cid as AuthCid, TinyCloudRevocation};
     use tinycloud_auth::ssi::{
         claims::jwt::NumericDate,
@@ -2667,9 +2759,10 @@ async fn try_revoke_superseded_compute_grant(
         .await
         .map_err(|e| e.to_string())?;
     if grants.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
+    let mut revoked = Vec::new();
     for grant_hash in grants {
         let target_cid: AuthCid = grant_hash.to_cid(0x55);
         // Self-revoke: the revocation UCAN carries NO proof, so
@@ -2719,9 +2812,10 @@ async fn try_revoke_superseded_compute_grant(
             .revoke(revocation_event)
             .await
             .map_err(|e| e.to_string())?;
+        revoked.push(target_cid.to_string());
     }
 
-    Ok(())
+    Ok(revoked)
 }
 
 #[cfg(feature = "duckdb")]

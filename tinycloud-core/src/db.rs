@@ -291,6 +291,31 @@ where
         Ok(out)
     }
 
+    /// Judges' item 7 (same-bytes-two-names redeploy hazard): true if some
+    /// artifact row OTHER than `(service, space, exclude_name)` still has
+    /// `content_hash == content_hash`. Identical bytes deployed under two
+    /// different function names share one content CID -- and therefore one
+    /// derived routine identity -- so re-deploying one of them must not
+    /// revoke the other's still-live `D_fn`. Callers use this to gate the
+    /// re-deploy-hygiene self-revocation (compute-service.md §5.1).
+    #[cfg(feature = "compute")]
+    pub async fn compute_artifact_content_hash_in_use_elsewhere(
+        &self,
+        service: &str,
+        space: &str,
+        exclude_name: &str,
+        content_hash: &str,
+    ) -> Result<bool, DbErr> {
+        let count = database_artifact::Entity::find()
+            .filter(database_artifact::Column::Service.eq(service))
+            .filter(database_artifact::Column::Space.eq(space))
+            .filter(database_artifact::Column::ContentHash.eq(content_hash))
+            .filter(database_artifact::Column::Name.ne(exclude_name))
+            .count(&self.conn)
+            .await?;
+        Ok(count > 0)
+    }
+
     /// List every space id known to this node (the full `space` table).
     /// Used by the admin usage endpoint to enumerate spaces without touching
     /// SQL directly.

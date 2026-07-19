@@ -57,7 +57,7 @@ use tinycloud_core::{
         space as space_model,
     },
     sea_orm::{
-        ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions, Database,
+        ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions, ConnectionTrait, Database,
         DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
     },
     types::{Ability, Caveats, Resource, SpaceIdWrap},
@@ -620,6 +620,196 @@ async fn deploy_rejects_dfn_with_typoed_delegatee() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Judges' item 3: rollback direction B (artifact-save failure rolls back the
+// already-processed D_fn), ported from compute-p1-a, extended with a
+// mirror-unchanged-on-rollback assertion.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rollback_no_delegation_when_artifact_save_fails() -> Result<()> {
+    // A small limit so we can prove the mirror was NOT bumped by the failed
+    // deploy: a second, independent deploy of the same size only fits if the
+    // rolled-back deploy's bytes were never folded into `store_size`.
+    let (rocket, conn, _tempdir) = boot_with_limit(Some("50 B")).await?;
+    let owner = make_owner("rollback-artifact")?;
+    seed_space_and_actors(&conn, &owner.space, &[]).await?;
+    let client = Client::tracked(rocket).await?;
+
+    let wasm = vec![9u8; 30];
+    let cid = content_cid(&wasm);
+
+    // Injected artifact-save failure: a UNIQUE index on content_hash plus a
+    // pre-existing row carrying the SAME content_hash under a DIFFERENT PK.
+    // The deploy's artifact INSERT (new PK, duplicate content_hash) then
+    // violates the index mid-transaction, AFTER the D_fn was processed in the
+    // same tx -- so the delegation must roll back.
+    conn.execute_unprepared(
+        "CREATE UNIQUE INDEX test_unique_content_hash ON database_artifact(content_hash)",
+    )
+    .await?;
+    database_artifact::ActiveModel {
+        service: Set("other".to_string()),
+        space: Set(owner.space.to_string()),
+        name: Set("decoy".to_string()),
+        revision: Set(1),
+        content_hash: Set(cid.clone()),
+        payload: Set(vec![1, 2, 3]),
+        size_bytes: Set(3),
+        backend: Set("storage.database".to_string()),
+        storage_mode: Set("database-blob".to_string()),
+        created_at: Set("2020-01-01T00:00:00Z".to_string()),
+        updated_at: Set("2020-01-01T00:00:00Z".to_string()),
+    }
+    .insert(&conn)
+    .await?;
+
+    let rdid = handshake_routine_did(&client, &owner, &cid, "urn:uuid:hs-rb").await?;
+    let grant = mint_d_fn(&owner, &rdid, &cid, "urn:uuid:dfn-rb")?;
+    let auth = owner_compute_invocation(
+        &owner,
+        "report",
+        "tinycloud.compute/deploy",
+        "urn:uuid:inv-rb",
+    )?;
+    let (status, body) = post_invoke(&client, &auth, deploy_body("report", &wasm, &grant)).await;
+    assert_ne!(
+        status,
+        Status::Ok,
+        "artifact-insert failure must fail the deploy: {body}"
+    );
+
+    // The D_fn delegation row rolled back with the failed artifact insert.
+    let dfn = deleg_model::Entity::find()
+        .filter(deleg_model::Column::Delegatee.eq(rdid))
+        .one(&conn)
+        .await?;
+    assert!(
+        dfn.is_none(),
+        "the D_fn delegation must roll back when the artifact save fails"
+    );
+    // No compute artifact row for (compute, space, report).
+    let artifact = database_artifact::Entity::find_by_id((
+        "compute".to_string(),
+        owner.space.to_string(),
+        "report".to_string(),
+    ))
+    .one(&conn)
+    .await?;
+    assert!(
+        artifact.is_none(),
+        "no compute artifact row after a failed deploy"
+    );
+
+    // Mirror-unchanged-on-rollback: an independent, differently-named 30-byte
+    // deploy must still fit under the 50-byte limit. If the rolled-back
+    // deploy had incorrectly bumped `store_size`, remaining budget would be
+    // 20 bytes and this would 402.
+    let wasm2 = vec![7u8; 30];
+    let cid2 = content_cid(&wasm2);
+    let rdid2 = handshake_routine_did(&client, &owner, &cid2, "urn:uuid:hs-rb2").await?;
+    let grant2 = mint_d_fn(&owner, &rdid2, &cid2, "urn:uuid:dfn-rb2")?;
+    let auth2 =
+        owner_compute_invocation(&owner, "ok", "tinycloud.compute/deploy", "urn:uuid:inv-rb2")?;
+    let (status2, body2) = post_invoke(&client, &auth2, deploy_body("ok", &wasm2, &grant2)).await;
+    assert_eq!(
+        status2,
+        Status::Ok,
+        "a follow-up deploy must still fit under quota, proving the failed \
+         deploy above left the store_size mirror unchanged: {body2}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Judges' item 7: same-bytes-two-names redeploy hazard. Identical bytes
+// deployed under two function names share one content CID (and therefore one
+// derived routine identity) -- re-deploying one must not revoke the other's
+// still-live D_fn.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn redeploy_does_not_revoke_a_different_functions_grant_sharing_content_cid() -> Result<()> {
+    let (rocket, conn, _tempdir) = boot().await?;
+    let owner = make_owner("redeploy-shared-bytes")?;
+    seed_space_and_actors(&conn, &owner.space, &[]).await?;
+    let client = Client::tracked(rocket).await?;
+
+    // Deploy the SAME bytes under two different function names, "a" and "b".
+    // Both share one content CID -> one routine_did -> two D_fns to that
+    // SAME delegatee.
+    let shared_wasm = b"\x00asm\x01\x00\x00\x00shared-bytes".to_vec();
+    let shared_cid = content_cid(&shared_wasm);
+    let shared_rdid = handshake_routine_did(&client, &owner, &shared_cid, "urn:uuid:hs-sa").await?;
+
+    let grant_a = mint_d_fn(&owner, &shared_rdid, &shared_cid, "urn:uuid:dfn-sa")?;
+    let auth_a =
+        owner_compute_invocation(&owner, "a", "tinycloud.compute/deploy", "urn:uuid:inv-sa")?;
+    let (sa, ba) = post_invoke(&client, &auth_a, deploy_body("a", &shared_wasm, &grant_a)).await;
+    assert_eq!(sa, Status::Ok, "deploy of fn a must succeed: {ba}");
+
+    let grant_b = mint_d_fn(&owner, &shared_rdid, &shared_cid, "urn:uuid:dfn-sb")?;
+    let auth_b =
+        owner_compute_invocation(&owner, "b", "tinycloud.compute/deploy", "urn:uuid:inv-sb")?;
+    let (sb, bb) = post_invoke(&client, &auth_b, deploy_body("b", &shared_wasm, &grant_b)).await;
+    assert_eq!(sb, Status::Ok, "deploy of fn b must succeed: {bb}");
+
+    // Both D_fns (a and b) share the same delegatee (same shared_cid ->
+    // same routine_did) AND the same capabilities (same kv resource + the
+    // same binding caveat), so they are indistinguishable by DB content --
+    // disambiguate by the delegation id, which is `hash(grant.as_bytes())`
+    // (the raw encoded D_fn string), exactly as the transact pipeline
+    // computes it (`events::SerializedEvent::content_hash`).
+    let dfn_b_id = tinycloud_core::hash::hash(grant_b.as_bytes());
+    let dfn_b = deleg_model::Entity::find_by_id(dfn_b_id)
+        .one(&conn)
+        .await?
+        .context("fn b's D_fn must exist")?;
+    assert_eq!(
+        revo_model::Entity::find()
+            .filter(revo_model::Column::Revoked.eq(dfn_b.id))
+            .count(&conn)
+            .await?,
+        0,
+        "fn b's D_fn must be live before fn a is re-deployed"
+    );
+
+    // Re-deploy "a" with NEW bytes -> a's old content_cid (== shared_cid) is
+    // superseded. Re-deploy hygiene must revoke the OLD D_fn for "a" only --
+    // it must NOT revoke "b"'s D_fn, which still references shared_cid.
+    let wasm_a2 = b"\x00asm\x01\x00\x00\x00a-v2-different".to_vec();
+    let cid_a2 = content_cid(&wasm_a2);
+    assert_ne!(cid_a2, shared_cid);
+    let rdid_a2 = handshake_routine_did(&client, &owner, &cid_a2, "urn:uuid:hs-sa2").await?;
+    let grant_a2 = mint_d_fn(&owner, &rdid_a2, &cid_a2, "urn:uuid:dfn-sa2")?;
+    let auth_a2 =
+        owner_compute_invocation(&owner, "a", "tinycloud.compute/deploy", "urn:uuid:inv-sa2")?;
+    let (sa2, ba2) = post_invoke(&client, &auth_a2, deploy_body("a", &wasm_a2, &grant_a2)).await;
+    assert_eq!(sa2, Status::Ok, "re-deploy of fn a must succeed: {ba2}");
+
+    // fn b's D_fn (same delegatee, same content CID) must still be LIVE.
+    assert_eq!(
+        revo_model::Entity::find()
+            .filter(revo_model::Column::Revoked.eq(dfn_b.id))
+            .count(&conn)
+            .await?,
+        0,
+        "re-deploying fn a must NOT revoke fn b's D_fn, which still \
+         references the shared content CID"
+    );
+    // fn b's artifact row must be untouched.
+    let artifact_b = database_artifact::Entity::find_by_id((
+        "compute".to_string(),
+        owner.space.to_string(),
+        "b".to_string(),
+    ))
+    .one(&conn)
+    .await?
+    .context("fn b's artifact row must still exist")?;
+    assert_eq!(artifact_b.content_hash, shared_cid);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Quota: deploy bumps store_size; over-limit deploy -> 402
 // ---------------------------------------------------------------------------
 
@@ -828,6 +1018,18 @@ async fn redeploy_revokes_the_superseded_grant() -> Result<()> {
         .count(&conn)
         .await?;
     assert!(revoked >= 1, "re-deploy must revoke the superseded v1 D_fn");
+
+    // Judges' item 8 (optional ack fields): the ack surfaces the superseded
+    // content CID and the revoked grant CID.
+    let ack: serde_json::Value = serde_json::from_str(&b2)?;
+    assert_eq!(
+        ack["superseded_content_cid"], cid_v1,
+        "ack must surface the superseded content CID: {b2}"
+    );
+    assert!(
+        ack["superseded_grant"].is_string(),
+        "ack must surface the superseded grant CID: {b2}"
+    );
     Ok(())
 }
 
