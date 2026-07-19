@@ -979,7 +979,7 @@ pub async fn authorize_invitation(
     };
     let scope = scope_from_request(&scope_request, &runtime.config).map_err(|_| {
         #[cfg(feature = "mounted-fixture")]
-        eprintln!("mounted authorize scope rejected action={} handle={} sourceDigest={} requestSource={}", request.action, request.authority_material_handle.as_str(), request.content_source_digest.as_str(), serde_json::to_string(&request.content_source).unwrap_or_else(|_| "invalid".to_owned()));
+        eprintln!("mounted authorize scope rejected handle={} sourceDigest={} requestSource={}", request.authority_material_handle.as_str(), request.content_source_digest.as_str(), serde_json::to_string(&request.content_source).unwrap_or_else(|_| "invalid".to_owned()));
         error(Status::Forbidden, "invitation_authorization_invalid")
     })?;
     let now = OffsetDateTime::now_utc();
