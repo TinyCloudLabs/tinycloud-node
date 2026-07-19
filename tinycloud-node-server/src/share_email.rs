@@ -1387,13 +1387,21 @@ pub async fn read(
         },
         &runtime.config,
     )
-    .map_err(|_| generic("read_denied"))?;
+    .map_err(|_| {
+        #[cfg(feature = "mounted-fixture")]
+        eprintln!("mounted read: scope reconstruction");
+        generic("read_denied")
+    })?;
     verify_read_request_body_digest(
         &request_value,
         &request.request_body_digest,
         &i.request_body_digest,
     )
-    .map_err(|_| generic("read_denied"))?;
+    .map_err(|_| {
+        #[cfg(feature = "mounted-fixture")]
+        eprintln!("mounted read: body digest");
+        generic("read_denied")
+    })?;
     if request.session_id != i.session_id
         || request.delegation_cid != i.delegation_cid
         || request.authority_material_handle != i.authority_material_handle
