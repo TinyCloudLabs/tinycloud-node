@@ -1,5 +1,10 @@
 # TinyCloud Node share-email deployment
 
+This deployment consumes Share contract commit
+`36f6c4303eca3bee917692c77237c264b4dfa342` and manifest digest
+`pl8-1Rpx_DYCBjOpK3hRrLfrSVDINNFssZDfFw6BMTs`. A different digest or an
+ancestor-only pin is a release failure.
+
 `tinycloud.toml.example` is the checked-in, non-secret configuration shape for
 an enabled exact-email node. Copy it out of the repository, fill in the
 operator-delivered paths and public trust values, and mount it with

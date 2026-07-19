@@ -1,5 +1,11 @@
 # Email-claim N4 Share manifest adapter
 
+The converged Share contract is owned by commit
+`36f6c4303eca3bee917692c77237c264b4dfa342` and manifest digest
+`pl8-1Rpx_DYCBjOpK3hRrLfrSVDINNFssZDfFw6BMTs`. This lane must consume that
+exact pair; an ancestor or a different digest is not an acceptable release
+input.
+
 This Node lane intentionally consumes a narrow, operator-authenticated
 authority-material record. It does not derive authority from a Share object,
 request fields, or a pre-seeded positive database row.
