@@ -36,10 +36,10 @@ use tinycloud_core::{
             NamedSqlRows, PinnedNamedStatement, SqlReadSource,
         },
         invitation::{
-            decode_share_url_token, issue_invitation_authorization_for,
-            verify_invitation_authorization_for, CanonicalEmail, DocumentName,
-            Ed25519InvitationSigner, Ed25519InvitationVerifier, InvitationAuthorizationInput,
-            InvitationAuthorizationReceipt, InvitationSigner, SenderTrust,
+            issue_invitation_authorization_for, verify_invitation_authorization_for,
+            CanonicalEmail, DocumentName, Ed25519InvitationSigner, Ed25519InvitationVerifier,
+            InvitationAuthorizationInput, InvitationAuthorizationReceipt, InvitationSigner,
+            SenderTrust,
         },
         state::{AnonymousChallengeRequest, ProtocolStateRepository},
         types::{
@@ -59,6 +59,7 @@ use crate::{config::ShareEmailConfig, TinyCloud};
 
 const POLICY_CHALLENGE_DOMAIN: &[u8] = b"xyz.tinycloud.share/policy-challenge/v1\0";
 const POLICY_SESSION_DOMAIN: &[u8] = b"xyz.tinycloud.share/policy-session/v1\0";
+pub const READ_RESPONSE_DOMAIN: &[u8] = b"xyz.tinycloud.share/read-response/v1\0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -296,13 +297,31 @@ pub struct ReadRequest {
     pub proof: DetachedProof,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ReadResponse {
+    #[serde(rename = "type")]
+    pub artifact_type: String,
+    pub version: u8,
+    pub session_id: SessionHandle,
+    pub request_jti: ProtocolJti,
+    pub read_jti: ProtocolJti,
+    pub audience: Did,
+    pub holder_did: DidKey,
+    pub credential_digest: tinycloud_core::share_email::Sha256Digest,
+    pub issued_at: String,
+    pub expires_at: String,
     #[serde(rename = "mediaType")]
     pub media_type: &'static str,
     pub content: String,
+    #[serde(rename = "contentSource")]
+    pub content_source: ContentSource,
     #[serde(rename = "contentSourceDigest")]
     pub content_source_digest: tinycloud_core::share_email::Sha256Digest,
+    pub action: ShareAction,
+    pub resource: Path,
+    #[serde(rename = "requestBodyDigest")]
+    pub request_body_digest: tinycloud_core::share_email::Sha256Digest,
     #[serde(rename = "bodyDigest")]
     pub body_digest: tinycloud_core::share_email::Sha256Digest,
     #[serde(rename = "delegationCid")]
@@ -311,6 +330,7 @@ pub struct ReadResponse {
     pub authority_material_handle: AuthorityMaterialHandle,
     #[serde(rename = "authorityMaterialDigest")]
     pub authority_material_digest: tinycloud_core::share_email::Sha256Digest,
+    pub proof: DetachedProof,
 }
 
 pub struct NoStoreJson<T>(pub T);
@@ -645,6 +665,75 @@ fn digest(value: &Value) -> tinycloud_core::share_email::Sha256Digest {
     )
 }
 
+/// Compute a binding from the frozen canonical preimage. The digest field is
+/// an output of the preimage, never an input to its own digest.
+fn verify_canonical_body_digest(
+    preimage: &Value,
+    claimed: &tinycloud_core::share_email::Sha256Digest,
+) -> Result<(), ()> {
+    if digest(preimage) != *claimed {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn verify_request_body_digest(
+    request: &Value,
+    claimed: &tinycloud_core::share_email::Sha256Digest,
+) -> Result<(), ()> {
+    let mut preimage = request.clone();
+    preimage
+        .as_object_mut()
+        .ok_or(())?
+        .remove("requestBodyDigest")
+        .ok_or(())?;
+    verify_canonical_body_digest(&preimage, claimed)
+}
+
+fn invitation_request_body(request: &NodeInvitationAuthorizationRequest) -> Value {
+    let (action, resource) = match &request.content_source {
+        ContentSource::Kv { path, .. } => ("tinycloud.kv/get", path.clone()),
+        ContentSource::Sql { path, .. } => ("tinycloud.sql/read", path.clone()),
+    };
+    json!({
+        "shareCid": request.share_cid,
+        "shareId": request.share_id,
+        "policyCid": request.policy_cid,
+        "delegationCid": request.delegation_cid,
+        "authorityMaterialHandle": request.authority_material_handle,
+        "authorityMaterialDigest": request.authority_material_digest,
+        "recipientEmail": request.recipient_email,
+        "targetOrigin": request.target_origin,
+        "nodeAudience": request.node_audience,
+        "action": action,
+        "resource": resource,
+    })
+}
+
+/// Read requests carry the body binding both at the HTTP wrapper and inside
+/// the signed invocation.  Recompute it from the complete frozen preimage so
+/// changing both caller copies cannot create a new authorized binding.
+fn verify_read_request_body_digest(
+    request: &Value,
+    outer_claimed: &tinycloud_core::share_email::Sha256Digest,
+    invocation_claimed: &tinycloud_core::share_email::Sha256Digest,
+) -> Result<(), ()> {
+    let mut preimage = request.clone();
+    let object = preimage.as_object_mut().ok_or(())?;
+    object.remove("proof");
+    object.remove("requestBodyDigest").ok_or(())?;
+    let invocation = object
+        .get_mut("invocation")
+        .and_then(Value::as_object_mut)
+        .ok_or(())?;
+    invocation.remove("requestBodyDigest").ok_or(())?;
+    let computed = digest(&preimage);
+    if computed != *outer_claimed || computed != *invocation_claimed {
+        return Err(());
+    }
+    Ok(())
+}
+
 fn timestamp(value: OffsetDateTime) -> String {
     let format = time::format_description::parse(
         "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z",
@@ -797,7 +886,7 @@ fn scope_from_presentation(
     )
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct NodeInvitationAuthorizationRequest {
     pub jti: ProtocolJti,
@@ -820,7 +909,12 @@ struct NodeInvitationAuthorizationRequest {
     pub content_source_digest: tinycloud_core::share_email::Sha256Digest,
     pub share_expires_at: String,
     pub request_body_digest: tinycloud_core::share_email::Sha256Digest,
-    pub share_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NodeInvitationAuthorizationEnvelope {
+    pub request: NodeInvitationAuthorizationRequest,
     pub proof: DetachedProof,
 }
 
@@ -834,23 +928,21 @@ pub async fn authorize_invitation(
         .inner()
         .as_ref()
         .ok_or(error(Status::ServiceUnavailable, "capability_unavailable"))?;
-    let request: NodeInvitationAuthorizationRequest = serde_json::from_value(value.clone())
+    let envelope: NodeInvitationAuthorizationEnvelope = serde_json::from_value(value.clone())
         .map_err(|_| error(Status::BadRequest, "invitation_authorization_invalid"))?;
-    let mut signed_value = value;
-    signed_value
-        .as_object_mut()
-        .ok_or(error(
-            Status::BadRequest,
-            "invitation_authorization_invalid",
-        ))?
-        .remove("proof");
+    let request = envelope.request;
+    let signed_value = serde_json::to_value(&request)
+        .map_err(|_| error(Status::BadRequest, "invitation_authorization_invalid"))?;
     verify_did_key_signature(
         &request.sender_did,
-        &request.proof,
+        &envelope.proof,
         b"xyz.tinycloud.share/invite-authorization/v1\0",
         &signed_value,
     )
     .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
+    let authorization_body = invitation_request_body(&request);
+    verify_canonical_body_digest(&authorization_body, &request.request_body_digest)
+        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
     let scope_request = PolicyChallengeRequest {
         share_cid: request.share_cid.clone(),
         share_id: request.share_id.clone(),
@@ -874,17 +966,6 @@ pub async fn authorize_invitation(
         request_body_digest: request.request_body_digest.clone(),
     };
     let scope = scope_from_request(&scope_request, &runtime.config)
-        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
-    let share_prefix = format!(
-        "{}/s/{}#k=",
-        runtime.config.return_origin,
-        request.share_cid.as_str()
-    );
-    let token = request
-        .share_url
-        .strip_prefix(&share_prefix)
-        .ok_or(error(Status::Forbidden, "invitation_authorization_invalid"))?;
-    decode_share_url_token(token)
         .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
     let now = OffsetDateTime::now_utc();
     runtime
@@ -1044,6 +1125,10 @@ pub async fn policy_challenge(
     if request_body_bytes > tinycloud_core::share_email::state::MAX_REQUEST_BODY_BYTES {
         return Err(error(Status::PayloadTooLarge, "invalid_content_source"));
     }
+    let request_value =
+        serde_json::to_value(&request).map_err(|_| generic("invalid_content_source"))?;
+    verify_request_body_digest(&request_value, &request.request_body_digest)
+        .map_err(|_| generic("invalid_content_source"))?;
     let scope = scope_from_request(&request, &runtime.config)
         .map_err(|_| generic("invalid_content_source"))?;
     let now = OffsetDateTime::now_utc();
@@ -1055,9 +1140,10 @@ pub async fn policy_challenge(
     let challenge_id = tinycloud_core::share_email::invitation::random_protocol_nonce();
     let nonce = tinycloud_core::share_email::invitation::random_protocol_nonce();
     let expires = now + Duration::seconds(runtime.config.challenge_ttl_seconds as i64);
-    let full_binding =
-        serde_json::to_value(&request).map_err(|_| generic("invalid_content_source"))?;
-    let request_digest = digest(&full_binding);
+    // The challenge state binds the digest of the frozen challenge request
+    // preimage. Presentation reuses this value and the transactional bridge
+    // checks it against the one-time challenge row.
+    let request_digest = request.request_body_digest.clone();
     let binding = json!({"requestDigest": request_digest.as_str()});
     let challenge = PolicyChallenge {
         artifact_type: "TinyCloudSharePolicyChallenge".to_owned(),
@@ -1147,7 +1233,9 @@ pub async fn policy_session(
     let now = OffsetDateTime::now_utc();
     let scope = scope_from_presentation(p, &runtime.config)
         .map_err(|_| generic("invalid_content_source"))?;
-    let value = serde_json::to_value(p).map_err(|_| generic("invalid_holder_proof"))?;
+    let presentation_value =
+        serde_json::to_value(p).map_err(|_| generic("invalid_holder_proof"))?;
+    let value = presentation_value;
     verify_did_key_signature(
         &p.holder_did,
         &request.proof,
@@ -1193,25 +1281,7 @@ pub async fn policy_session(
     if evidence.credential_digest != p.credential_digest {
         return Err(error(Status::Forbidden, "policy_denied"));
     }
-    let challenge_binding = PolicyChallengeRequest {
-        share_cid: p.share_cid.clone(),
-        share_id: p.share_id.clone(),
-        delegation_cid: p.delegation_cid.clone(),
-        authority_material_handle: p.authority_material_handle.clone(),
-        authority_material_digest: p.authority_material_digest.clone(),
-        policy_cid: p.policy_cid.clone(),
-        content_source: p.content_source.clone(),
-        content_source_digest: p.content_source_digest.clone(),
-        holder_did: p.holder_did.clone(),
-        target_origin: p.target_origin.clone(),
-        node_audience: p.node_audience.clone(),
-        action: p.action,
-        resource: p.resource.clone(),
-        request_body_digest: p.request_body_digest.clone(),
-    };
-    let challenge_full_binding = serde_json::to_value(&challenge_binding)
-        .map_err(|_| error(Status::Forbidden, "policy_denied"))?;
-    let challenge_digest = digest(&challenge_full_binding);
+    let challenge_digest = p.request_body_digest.clone();
     let challenge_binding = json!({"requestDigest": challenge_digest.as_str()});
     let session_request = AuthorityPolicySessionRequest {
         scope: scope.clone(),
@@ -1272,7 +1342,8 @@ pub async fn read(
         .inner()
         .as_ref()
         .ok_or(error(Status::ServiceUnavailable, "capability_unavailable"))?;
-    let request: ReadRequest = serde_json::from_value(read_bounded_json(data).await?)
+    let request_value = read_bounded_json(data).await?;
+    let request: ReadRequest = serde_json::from_value(request_value.clone())
         .map_err(|_| error(Status::BadRequest, "read_denied"))?;
     if !body_is_bounded(&request) {
         return Err(error(Status::PayloadTooLarge, "read_denied"));
@@ -1299,6 +1370,12 @@ pub async fn read(
             request_body_digest: i.request_body_digest.clone(),
         },
         &runtime.config,
+    )
+    .map_err(|_| generic("read_denied"))?;
+    verify_read_request_body_digest(
+        &request_value,
+        &request.request_body_digest,
+        &i.request_body_digest,
     )
     .map_err(|_| generic("read_denied"))?;
     if request.session_id != i.session_id
@@ -1337,6 +1414,14 @@ pub async fn read(
         signer: i.holder_did.clone(),
         signature,
     };
+    let response_session_id = i.session_id.clone();
+    let response_jti = i.jti.clone();
+    let response_audience = i.node_audience.clone();
+    let response_holder = i.holder_did.clone();
+    let response_source = i.content_source.clone();
+    let response_action = i.action;
+    let response_resource = i.resource.clone();
+    let response_request_digest = i.request_body_digest.clone();
     let expected_source_digest = i.content_source_digest.clone();
     let read_request = HolderReadRequest {
         session: i.session_id,
@@ -1357,15 +1442,49 @@ pub async fn read(
         })?;
     let content = String::from_utf8(response.document.as_bytes().to_vec())
         .map_err(|_| error(Status::Forbidden, "read_denied"))?;
-    Ok(NoStoreJson(ReadResponse {
+    let now = OffsetDateTime::now_utc();
+    let invocation_expires = expires;
+    let response_expires = (now + Duration::seconds(60)).min(invocation_expires);
+    if response_expires <= now {
+        return Err(error(Status::Forbidden, "read_denied"));
+    }
+    let mut response_body = ReadResponse {
+        artifact_type: "TinyCloudShareReadResponse".to_owned(),
+        version: 1,
+        session_id: response_session_id,
+        request_jti: response_jti.clone(),
+        read_jti: response_jti,
+        audience: response_audience,
+        holder_did: response_holder,
+        credential_digest: response.credential_digest,
+        issued_at: timestamp(now),
+        expires_at: timestamp(response_expires),
         media_type: response.media_type,
         content,
+        content_source: response_source,
         content_source_digest: expected_source_digest,
+        action: response_action,
+        resource: response_resource,
+        request_body_digest: response_request_digest,
         body_digest: response.body_digest,
         delegation_cid: request.delegation_cid,
         authority_material_handle: request.authority_material_handle,
         authority_material_digest: request.authority_material_digest,
-    }))
+        proof: DetachedProof {
+            alg: String::new(),
+            kid: String::new(),
+            signature: String::new(),
+        },
+    };
+    let mut response_value = serde_json::to_value(&response_body)
+        .map_err(|_| error(Status::InternalServerError, "capability_unavailable"))?;
+    response_value
+        .as_object_mut()
+        .ok_or(error(Status::InternalServerError, "capability_unavailable"))?
+        .remove("proof");
+    response_body.proof = sign(&runtime.signer, READ_RESPONSE_DOMAIN, &response_value)
+        .map_err(|_| error(Status::InternalServerError, "capability_unavailable"))?;
+    Ok(NoStoreJson(response_body))
 }
 
 trait ScopeEmail {
@@ -1421,5 +1540,58 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::PayloadTooLarge);
+    }
+
+    #[tokio::test]
+    async fn invitation_authorization_has_one_strict_outer_envelope() {
+        let flattened = json!({
+            "senderDid": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+            "proof": {"alg":"EdDSA","kid":"did:web:node.example#k","signature":"x"}
+        });
+        assert!(serde_json::from_value::<NodeInvitationAuthorizationEnvelope>(flattened).is_err());
+
+        let unknown = json!({
+            "request": {},
+            "proof": {"alg":"EdDSA","kid":"did:web:node.example#k","signature":"x"},
+            "policyOwnerDid": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw"
+        });
+        assert!(serde_json::from_value::<NodeInvitationAuthorizationEnvelope>(unknown).is_err());
+    }
+
+    #[tokio::test]
+    async fn body_bindings_are_recomputed_from_their_frozen_preimage() {
+        let mut body = json!({"resource":"documents/plan.md"});
+        let expected = digest(&body);
+        body["requestBodyDigest"] = json!(expected.as_str());
+        assert!(verify_request_body_digest(&body, &expected).is_ok());
+
+        let mut altered = body.clone();
+        altered["resource"] = json!("documents/other.md");
+        assert!(verify_request_body_digest(&altered, &expected).is_err());
+
+        let read = json!({
+            "sessionId":"AAECAwQFBgcICQoLDA0ODw",
+            "contentSource": {"kind":"kv","space":"did:pkh:eip155:1:0xabc","path":"documents/plan.md","action":"tinycloud.kv/get"},
+            "contentSourceDigest":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "action":"tinycloud.kv/get",
+            "resource":"documents/plan.md",
+            "invocation": {"requestBodyDigest":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+            "proof": {"alg":"EdDSA","kid":"did:web:node.example#k","signature":"x"},
+            "requestBodyDigest":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        });
+        let mut preimage = read.clone();
+        let object = preimage.as_object_mut().unwrap();
+        object.remove("proof");
+        object.remove("requestBodyDigest");
+        object
+            .get_mut("invocation")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .remove("requestBodyDigest");
+        let read_digest = digest(&preimage);
+        let mut valid = read;
+        valid["requestBodyDigest"] = json!(read_digest.as_str());
+        valid["invocation"]["requestBodyDigest"] = json!(read_digest.as_str());
+        assert!(verify_read_request_body_digest(&valid, &read_digest, &read_digest).is_ok());
     }
 }

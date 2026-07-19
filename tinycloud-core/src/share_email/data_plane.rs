@@ -138,6 +138,7 @@ impl HolderReadRequest {
 pub struct MarkdownResponse {
     pub document: MarkdownDocument,
     pub body_digest: Sha256Digest,
+    pub credential_digest: Sha256Digest,
     pub media_type: &'static str,
     pub cache_control: &'static str,
 }
@@ -382,6 +383,7 @@ where
         {
             return Err(DataPlaneError::Denied);
         }
+        let credential_digest = authorized.session().credential_digest.clone();
         let document = match request.scope.content_source {
             ContentSource::Kv { .. } => self
                 .kv
@@ -394,7 +396,11 @@ where
                 .await
                 .map_err(DataPlaneError::from)?,
         };
-        response(document, &request.scope.content_source_digest)
+        response(
+            document,
+            &request.scope.content_source_digest,
+            credential_digest,
+        )
     }
 }
 
@@ -514,6 +520,7 @@ fn signed_read_bytes(request: &HolderReadRequest) -> Result<Vec<u8>, DataPlaneEr
 fn response(
     document: MarkdownDocument,
     expected_source: &Sha256Digest,
+    credential_digest: Sha256Digest,
 ) -> Result<MarkdownResponse, DataPlaneError> {
     let body = document.as_bytes();
     if body.len() > MAX_MARKDOWN_BYTES {
@@ -529,6 +536,7 @@ fn response(
     Ok(MarkdownResponse {
         document,
         body_digest,
+        credential_digest,
         media_type: MARKDOWN_MEDIA_TYPE,
         cache_control: MARKDOWN_CACHE_CONTROL,
     })
