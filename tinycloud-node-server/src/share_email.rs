@@ -977,14 +977,21 @@ pub async fn authorize_invitation(
         },
         request_body_digest: request.request_body_digest.clone(),
     };
-    let scope = scope_from_request(&scope_request, &runtime.config)
-        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
+    let scope = scope_from_request(&scope_request, &runtime.config).map_err(|_| {
+        #[cfg(feature = "mounted-fixture")]
+        eprintln!("mounted authorize scope rejected action={} handle={} sourceDigest={} requestSource={}", request.action, request.authority_material_handle.as_str(), request.content_source_digest.as_str(), serde_json::to_string(&request.content_source).unwrap_or_else(|_| "invalid".to_owned()));
+        error(Status::Forbidden, "invitation_authorization_invalid")
+    })?;
     let now = OffsetDateTime::now_utc();
     runtime
         .bridge
         .validate_scope(&scope, now)
         .await
-        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
+        .map_err(|_| {
+            #[cfg(feature = "mounted-fixture")]
+            eprintln!("mounted authorize scope validation rejected handle={} policy={} sourceDigest={}", request.authority_material_handle.as_str(), request.policy_cid.as_str(), request.content_source_digest.as_str());
+            error(Status::Forbidden, "invitation_authorization_invalid")
+        })?;
     runtime
         .bridge
         .validate_sender_for_policy(
@@ -995,7 +1002,11 @@ pub async fn authorize_invitation(
             request.sender_did.as_str(),
         )
         .await
-        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
+        .map_err(|_| {
+            #[cfg(feature = "mounted-fixture")]
+            eprintln!("mounted authorize sender validation rejected handle={} policy={} delegation={}", request.authority_material_handle.as_str(), request.policy_cid.as_str(), request.delegation_cid.as_str());
+            error(Status::Forbidden, "invitation_authorization_invalid")
+        })?;
     let (policy_email, policy_expiry) = runtime
         .bridge
         .policy_recipient_and_expiry(
@@ -1006,7 +1017,11 @@ pub async fn authorize_invitation(
             now,
         )
         .await
-        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
+        .map_err(|_| {
+            #[cfg(feature = "mounted-fixture")]
+            eprintln!("mounted authorize policy metadata rejected handle={} policy={}", request.authority_material_handle.as_str(), request.policy_cid.as_str());
+            error(Status::Forbidden, "invitation_authorization_invalid")
+        })?;
     if policy_email != request.recipient_email.as_str()
         || request.target_origin.as_str() != runtime.config.target_origin
         || request.node_audience.as_str() != runtime.config.node_audience
