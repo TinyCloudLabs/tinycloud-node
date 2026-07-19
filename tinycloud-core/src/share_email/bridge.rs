@@ -1169,7 +1169,7 @@ fn validate_attestation(
         "keyVersion": attestation.key_version,
     });
     let actual_binding_digest = URL_SAFE_NO_PAD.encode(Sha256::digest(jcs::canonicalize(&binding)));
-    if attestation.kind != "PolicyEnforcerAttestation"
+    if attestation.kind != "TinyCloudShareEnrollmentRuntimeAttestation"
         || attestation.version != 1
         || attestation.target_origin != origin.as_str()
         || attestation.node_audience != audience.as_str()
