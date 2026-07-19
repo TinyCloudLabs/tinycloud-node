@@ -334,7 +334,10 @@ impl DatabaseAuthorityBridge117 {
         let signer = self.root_signer.as_ref().ok_or(PortError::Unavailable)?;
         let preview = verifier
             .sign_and_verify_root(root.clone(), signer.as_ref())
-            .map_err(map_authority_error)?;
+            .map_err(|failure| {
+                eprintln!("mounted session: root signature failure {failure:?}");
+                map_authority_error(failure)
+            })?;
         DatabaseAuthorityKernel::new(
             self.authority.clone(),
             enforcement.artifact().audience_did.clone(),
