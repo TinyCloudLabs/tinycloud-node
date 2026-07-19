@@ -9,9 +9,11 @@ use rocket::{
 use tinycloud::{app, config, prometheus};
 
 fn build_config_figment() -> rocket::figment::Figment {
+    let config_file =
+        std::env::var("TINYCLOUD_CONFIG_FILE").unwrap_or_else(|_| "tinycloud.toml".to_owned());
     rocket::figment::Figment::from(rocket::Config::default())
         .merge(Serialized::defaults(config::Config::default()))
-        .merge(Toml::file("tinycloud.toml").nested())
+        .merge(Toml::file(config_file).nested())
         // Legacy env style: single underscore as nesting separator.
         .merge(Env::prefixed("TINYCLOUD_").split("_").global())
         // Canonical env style: double underscore as nesting separator.
@@ -166,5 +168,29 @@ mod tests {
             cfg.storage.database.as_deref(),
             Some("sqlite:/tmp/canonical.db")
         );
+    }
+
+    #[test]
+    fn configured_toml_file_is_loaded_before_environment_overrides() {
+        let _lock = lock_env();
+        let file = tempfile::NamedTempFile::new().expect("temporary config");
+        std::fs::write(
+            file.path(),
+            "[global.share_email]\nreadiness_max_age_seconds = 42\n",
+        )
+        .expect("write temporary config");
+        let _config_file = EnvVarGuard::set(
+            "TINYCLOUD_CONFIG_FILE",
+            file.path().to_str().expect("temporary config path"),
+        );
+        let _readiness = EnvVarGuard::unset("TINYCLOUD_SHARE_EMAIL_READINESS_MAX_AGE_SECONDS");
+        let _canonical_readiness =
+            EnvVarGuard::unset("TINYCLOUD_SHARE_EMAIL__READINESS_MAX_AGE_SECONDS");
+
+        let cfg = build_config_figment()
+            .extract::<config::Config>()
+            .expect("config should parse");
+
+        assert_eq!(cfg.share_email.readiness_max_age_seconds, 42);
     }
 }

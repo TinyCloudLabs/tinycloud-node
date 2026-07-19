@@ -24,7 +24,7 @@ use std::sync::Arc;
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 use tokio::io::AsyncReadExt as TokioAsyncReadExt;
 
-use tinycloud_auth::share_email_evidence::{IssuerKey, IssuerTrustRegistry, EMAIL_VCT};
+use tinycloud_auth::share_email_evidence::{IssuerKey, IssuerTrustRegistry};
 use tinycloud_core::{
     policy_authority::DatabaseAuthorityStore,
     policy_capability::jcs,
@@ -554,7 +554,7 @@ pub fn compose(
     let issuer_public_key = decode_key32(issuer_bytes)?;
     let issuer = IssuerKey::new(
         config.issuer_did.clone(),
-        EMAIL_VCT,
+        config.issuer_vct.clone(),
         config.issuer_key_version,
         config.issuer_kid.clone(),
         issuer_public_key,
@@ -579,14 +579,6 @@ pub fn compose(
     let invitation_verifier =
         Ed25519InvitationVerifier::new(config.invitation_kid.clone(), invite_key.into())
             .map_err(|e| anyhow::anyhow!("invitation verifier: {e}"))?;
-    #[cfg(feature = "mounted-fixture")]
-    let signing_seed = config
-        .invitation_private_key
-        .as_deref()
-        .map(decode_key32)
-        .transpose()?
-        .unwrap_or_else(|| key_setup.derive_key(b"tinycloud/share-email/invitation-signing"));
-    #[cfg(not(feature = "mounted-fixture"))]
     let signing_seed = key_setup.derive_key(b"tinycloud/share-email/invitation-signing");
     let signing_secret =
         tinycloud_core::libp2p::identity::ed25519::SecretKey::try_from_bytes(signing_seed)
@@ -629,11 +621,13 @@ pub fn compose(
             )),
     );
     // Sequence C supplies authenticated authority material, fresh status, and
-    // attestation/enrollment providers. Until all three are injected and
-    // healthy, the capability is absent and every protocol route stays
-    // fail-closed.
+    // attestation/enrollment providers. An enabled deployment with incomplete
+    // evidence is a startup error; silently advertising an otherwise healthy
+    // node without the share capability would hide a partial deployment.
     if !bridge.ready() {
-        return Ok(None);
+        return Err(anyhow::anyhow!(
+            "share email authority, status, attestation, or signer material is not ready"
+        ));
     }
     let kv = TinyCloudKvStore {
         tinycloud,

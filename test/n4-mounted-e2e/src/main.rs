@@ -427,7 +427,6 @@ fn figment(
     material: &Path,
     issuer_public: &str,
     invitation_public: &str,
-    invitation_private: &str,
     port: u16,
 ) -> Figment {
     let secret = b64(secret);
@@ -448,7 +447,6 @@ fn figment(
         node_signing_kid = "{INVITATION_KID}"
         invitation_kid = "{INVITATION_KID}"
         invitation_public_key = "{invitation_public}"
-        invitation_private_key = "{invitation_private}"
         issuer_did = "{ISSUER_DID}"
         issuer_kid = "{ISSUER_KID}"
         issuer_key_version = 1
@@ -633,9 +631,9 @@ async fn run() -> Result<()> {
     if secret.len() < 32 {
         bail!("--keys-secret must decode to at least 32 bytes");
     }
-    let _node_secret = tinycloud_core::keys::StaticSecret::new(secret.clone())
+    let node_secret = tinycloud_core::keys::StaticSecret::new(secret.clone())
         .map_err(|_| anyhow::anyhow!("invalid key secret"))?;
-    let signing = [0x42u8; 32];
+    let signing = node_secret.derive_key(b"tinycloud/share-email/invitation-signing");
     let node = ed_key(signing);
     if let Some(expected) = args
         .windows(2)
@@ -685,7 +683,6 @@ async fn run() -> Result<()> {
         &material_path,
         &issuer_public,
         &invitation_public,
-        &b64(&signing),
         port,
     );
     let rocket = app(&figment)

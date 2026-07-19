@@ -1,0 +1,48 @@
+# TinyCloud Node exact-email production/staging configuration.
+#
+# This is a non-secret template. Mount a filled copy at the path supplied by
+# TINYCLOUD_CONFIG_FILE. The node validates every enabled share-email trust,
+# evidence, database, and origin setting before it opens a listener. Do not
+# put private keys or database passwords in this file.
+
+[global]
+cors = false
+
+[global.share_email]
+enabled = true
+target_origin = "https://node.example"
+node_audience = "did:web:node.example"
+return_origin = "https://share.tinycloud.xyz"
+allowed_origins = ["https://share.tinycloud.xyz"]
+node_signing_kid = "did:web:node.example#invitation-key-1"
+invitation_kid = "did:web:node.example#invitation-key-1"
+
+# The issuer DID, VCT, key id, and key version are an exact trust tuple. The
+# public key is supplied through TINYCLOUD_SHARE_EMAIL__ISSUER_PUBLIC_KEY.
+issuer_did = "did:web:issuer.credentials.org"
+issuer_vct = "opencredentials.email/v1"
+issuer_kid = "did:web:issuer.credentials.org#email-signing-key-1"
+issuer_key_version = 1
+
+# This signed bundle contains the policy/enforcement authority artifacts,
+# enrollment, fresh status observations, and runtime attestation. It is read
+# and cryptographically verified before the capability is advertised.
+authority_material_path = "/run/tinycloud/authority-material.json"
+readiness_max_age_seconds = 300
+challenge_ttl_seconds = 120
+space_name = "documents"
+
+[global.share_email.postgres_tls]
+sslmode = "verify-full"
+root_cert_path = "/run/tinycloud/postgres-ca.pem"
+
+[global.storage]
+# Supplied by TINYCLOUD_STORAGE__DATABASE. Production must be a PostgreSQL
+# URL containing exactly sslmode=verify-full.
+staging = "FileSystem"
+
+[global.keys]
+# The secret is supplied out of band as TINYCLOUD_KEYS_SECRET. Static key
+# derivation is shown only as a configuration shape; never commit its value.
+type = "Static"
+

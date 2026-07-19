@@ -76,11 +76,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 default = []
 dstack = []
 duckdb = ["tinycloud-core/duckdb"]
-# Enables the deterministic mounted integration fixture's private signing-key
-# injection. This feature is only selected by test/n4-mounted-e2e and is not
-# part of the production default feature set.
-mounted-fixture = []
-
 # cargo-binstall support: allows `cargo binstall tinycloud-node`
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/{ name }-v{ version }/{ name }-{ target }{ archive-suffix }"

@@ -111,6 +111,10 @@ pub type TinyCloud = SpaceDatabase<DatabaseConnection, BlockStores, StaticSecret
 pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     let mut tinycloud_config: Config = config.extract::<Config>()?;
     tinycloud_config.storage.resolve();
+    tinycloud_config
+        .share_email
+        .validate_for_database(tinycloud_config.storage.database())
+        .map_err(|error| anyhow::anyhow!(error))?;
 
     // Ensure local storage directories exist.
     // SQLite file paths and local dirs are resources the server owns — auto-create them.
@@ -220,6 +224,17 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         });
     } else {
         connect_opts.max_connections(100);
+        if let Some(root_cert_path) = tinycloud_config
+            .share_email
+            .postgres_tls
+            .root_cert_path
+            .as_deref()
+        {
+            let root_cert_path = root_cert_path.to_owned();
+            connect_opts.map_sqlx_postgres_opts(move |options| {
+                options.ssl_root_cert(root_cert_path.clone())
+            });
+        }
     }
 
     let database_connection = Database::connect(connect_opts).await?;
@@ -276,6 +291,13 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         Arc::new(tinycloud.clone()),
         Arc::new(sql_service.clone()),
     )?;
+    if let Some(runtime) = share_email_runtime.as_ref() {
+        if !runtime.bridge.self_check().await {
+            anyhow::bail!(
+                "share email readiness failed: authority, fresh status, attestation, or database is unavailable"
+            );
+        }
+    }
     if let Some(runtime) = share_email_runtime.as_ref() {
         let state = runtime.state.clone();
         tokio::spawn(async move {
@@ -346,11 +368,16 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         .manage(encryption_service)
         .manage(tinycloud_config.storage.staging.open().await?);
 
-    let share_return_origin = tinycloud_config.share_email.return_origin.clone();
+    let share_allowed_origin = tinycloud_config
+        .share_email
+        .allowed_origins
+        .first()
+        .cloned()
+        .unwrap_or_else(|| tinycloud_config.share_email.return_origin.clone());
     let rocket = rocket.attach(AdHoc::on_response(
         "share-email-security-headers",
         move |request, response| {
-            let share_return_origin = share_return_origin.clone();
+            let share_allowed_origin = share_allowed_origin.clone();
             Box::pin(async move {
                 if request.uri().path().starts_with("/share/v1/") {
                     response.set_header(Header::new("Cache-Control", "no-store"));
@@ -358,7 +385,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
                     response.set_header(Header::new("Referrer-Policy", "no-referrer"));
                     response.set_header(Header::new(
                         "Access-Control-Allow-Origin",
-                        share_return_origin,
+                        share_allowed_origin,
                     ));
                     response.set_header(Header::new("Access-Control-Allow-Methods", "POST"));
                     response
