@@ -2230,20 +2230,32 @@ fn compute_resource(
 
 /// **Judge finding (security): scope selection.** Select the SINGLE
 /// `(space, function-path)` scope the request BODY targets and prove the
-/// presented compute capabilities cover exactly that resource -- analogous
-/// to `select_database_scope`. This REPLACES the P0
-/// `compute_caps.iter().any(...)` aggregation, which is a confused-deputy
-/// risk once a live handler exists: `.any()` authorizes a `Deploy` body as
-/// long as ANY presented cap satisfies `compute/deploy`, even a cap for a
-/// DIFFERENT space or a DIFFERENT function than the body names. Here we
-/// instead:
-///   1. reject requests whose compute caps span multiple spaces (ambiguous);
-///   2. build the body's target resource `<space>/compute/<function-path>`;
-///   3. require a presented cap that BOTH `extends`-covers that resource AND
-///      `ability_matches` the variant's required ability (§7.1 erratum, C1).
+/// presented compute capabilities cover exactly that scope -- analogous to
+/// `select_database_scope`. This REPLACES the P0 `compute_caps.iter().any(...)`
+/// aggregation, which is a confused-deputy risk once a live handler exists:
+/// `.any()` authorizes a `Deploy` body as long as ANY presented cap satisfies
+/// `compute/deploy`, even a cap for a DIFFERENT space or a DIFFERENT function
+/// than the body names.
 ///
-/// A cap that satisfies the ability but does not cover the body's function
-/// resource (wrong function, wrong space) fails closed with `403`.
+/// The single-space invariant is enforced for ALL variants. Resource-path
+/// coverage differs by variant:
+///
+///   * `Deploy` / `Execute` target a SPECIFIC function -- the presented cap
+///     MUST `extends`-cover `<space>/compute/<function>` (a cap for another
+///     function, or a wrong space, fails closed with `403`). This is the
+///     load-bearing part of the fix: the state-changing ops are pinned to the
+///     exact function resource the body names.
+///   * `RoutineDid` / `List` are SPACE-SCOPED reads -- `RoutineDid`'s target
+///     (a content CID) is NOT a granted function-path (§6.2: the deployer
+///     holds `compute/deploy` on a function NAME or space-wide, then hashes
+///     arbitrary bytes to a CID before deploying), and `List` enumerates the
+///     whole space. Requiring per-CID path coverage would break the intended
+///     handshake flow AND buys no security -- the handshake is a read-only,
+///     side-effect-free derive-and-return of a PUBLIC did. So these require
+///     only the variant's ability present in the single space.
+///
+/// Returns the resolved space and (for `Deploy`/`Execute`) the target
+/// function-path.
 #[cfg(feature = "compute")]
 fn select_compute_scope<'a>(
     request: &ComputeRequest,
@@ -2259,7 +2271,7 @@ fn select_compute_scope<'a>(
 
     // (1) single-space invariant -- a compute request targets exactly one
     // space; caps spanning spaces are ambiguous and rejected (mirrors
-    // `select_database_scope`'s multi-space guard).
+    // `select_database_scope`'s multi-space guard). Applies to EVERY variant.
     if !caps.iter().all(|(candidate, _, _)| candidate == space) {
         return Err((
             Status::BadRequest,
@@ -2267,49 +2279,54 @@ fn select_compute_scope<'a>(
         ));
     }
 
-    // (2) the body's target function-path. `RoutineDid` targets the content
-    // CID as its resource path (§6.2); `List` targets no path (space-wide).
-    let target_path: Option<String> = match request {
+    // (2) function-path + coverage rule by variant.
+    let (target_path, require_resource_coverage): (Option<String>, bool) = match request {
         ComputeRequest::Deploy { function, .. } | ComputeRequest::Execute { function, .. } => {
-            Some(function.clone())
+            (Some(function.clone()), true)
         }
-        ComputeRequest::RoutineDid { content_cid } => Some(content_cid.clone()),
-        ComputeRequest::List => None,
+        // Space-scoped reads: no per-CID/whole-space path coverage required.
+        ComputeRequest::RoutineDid { .. } | ComputeRequest::List => (None, false),
     };
 
-    let target_resource = compute_resource(space, target_path.as_deref())?;
-
-    // (3) require a presented cap that covers the target resource AND
-    // satisfies the variant's required ability. This is the confused-deputy
-    // fix: coverage is checked against THIS body's resource, not aggregated
-    // across every presented cap.
-    let covered = caps
-        .iter()
-        .try_fold(false, |acc, (cap_space, cap_path, ability)| {
-            if acc {
-                return Ok(true);
-            }
-            let cap_resource = compute_resource(cap_space, cap_path.as_deref())?;
-            let ability_ok = tinycloud_core::policy_capability::ability_matches(
-                ability.as_str(),
-                required_ability,
-            );
-            let resource_ok = match (&target_resource, &cap_resource) {
-                (Resource::TinyCloud(t), Resource::TinyCloud(c)) => t.extends(c).is_ok(),
-                _ => false,
-            };
-            Ok::<bool, (Status, String)>(ability_ok && resource_ok)
-        })?;
+    let covered = if require_resource_coverage {
+        // Deploy/Execute: a presented cap must BOTH `extends`-cover the body's
+        // exact function resource AND satisfy the ability. Coverage is checked
+        // against THIS body's resource, never aggregated across caps.
+        let target_resource = compute_resource(space, target_path.as_deref())?;
+        caps.iter()
+            .try_fold(false, |acc, (cap_space, cap_path, ability)| {
+                if acc {
+                    return Ok(true);
+                }
+                let cap_resource = compute_resource(cap_space, cap_path.as_deref())?;
+                let ability_ok = tinycloud_core::policy_capability::ability_matches(
+                    ability.as_str(),
+                    required_ability,
+                );
+                let resource_ok = match (&target_resource, &cap_resource) {
+                    (Resource::TinyCloud(t), Resource::TinyCloud(c)) => t.extends(c).is_ok(),
+                    _ => false,
+                };
+                Ok::<bool, (Status, String)>(ability_ok && resource_ok)
+            })?
+    } else {
+        // RoutineDid/List: the variant's ability present in the (already
+        // single) space suffices.
+        caps.iter().any(|(_, _, ability)| {
+            tinycloud_core::policy_capability::ability_matches(ability.as_str(), required_ability)
+        })
+    };
 
     if !covered {
         // Mirror the node's established "Unauthorized Action: {resource} /
         // {ability}" phrasing so every ability/scope rejection reads the same
         // on the wire.
+        let resource = compute_resource(space, target_path.as_deref())?;
         let ability = Ability::try_from(required_ability.to_string())
             .map_err(|e| (Status::InternalServerError, format!("{e:?}")))?;
         return Err((
             Status::Forbidden,
-            format!("Unauthorized Action: {target_resource} / {ability}"),
+            format!("Unauthorized Action: {resource} / {ability}"),
         ));
     }
 

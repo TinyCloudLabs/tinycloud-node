@@ -384,6 +384,12 @@ async fn execute_capability_rejects_routine_did_body() -> Result<()> {
 
 #[tokio::test]
 async fn deploy_capability_reaches_handler_for_routine_did() -> Result<()> {
+    // P1 update: `RoutineDid` is now a LIVE handler (the read-only F2
+    // handshake), so a `compute/deploy` holder gets a `200` with the derived
+    // routine DID -- no longer the P0 `501 not implemented yet`. This asserts
+    // the space-scoped `compute/deploy` cap reaches AND satisfies the live
+    // handshake (the content CID need not match the granted function-path,
+    // §6.2). The wrong-ability rejections above still guard the mapping.
     let (rocket, conn, _tempdir) = boot().await?;
     let fixture = grant_compute_ability(
         &conn,
@@ -408,15 +414,15 @@ async fn deploy_capability_reaches_handler_for_routine_did() -> Result<()> {
 
     let status = response.status();
     let body = response.into_string().await.unwrap_or_default();
-    assert_eq!(
-        status,
-        Status::NotImplemented,
-        "unexpected response: {body}"
-    );
+    assert_eq!(status, Status::Ok, "unexpected response: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body)?;
     assert!(
-        body.contains("not implemented yet"),
-        "expected a reached-the-handler message, got {body:?}"
+        json["routine_did"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("did:key:")),
+        "handshake must return a did:key routine_did, got {body:?}"
     );
+    assert_eq!(json["content_cid"], "bafyexample");
     Ok(())
 }
 
