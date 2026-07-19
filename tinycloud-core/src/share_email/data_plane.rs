@@ -703,6 +703,39 @@ mod tests {
     }
 
     #[test]
+    fn named_sql_scope_denies_wrong_arguments_digest() {
+        let mut changed = scope();
+        let space = Did::parse("did:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7").unwrap();
+        let database = DatabaseName::parse("documents").unwrap();
+        let path = Path::parse("shared/plan").unwrap();
+        let statement = NamedStatement::parse("shared_document_by_id").unwrap();
+        let arguments = BTreeMap::from([(
+            "document_id".to_owned(),
+            SafeJsonInteger::parse(123).unwrap(),
+        )]);
+        let source = ContentSource::Sql {
+            action: SqlReadAction::Read,
+            space,
+            database: database.clone(),
+            path: path.clone(),
+            statement: statement.clone(),
+            arguments,
+            arguments_digest: Sha256Digest::from_bytes([7; 32]),
+        };
+        changed.action = ShareAction::SqlRead;
+        changed.resource = ExactResource::Sql {
+            database,
+            path,
+            statement,
+        };
+        changed.content_source = source;
+        changed.content_source_digest = sha256_digest(&jcs::canonicalize(
+            &serde_json::to_value(&changed.content_source).unwrap(),
+        ));
+        assert_eq!(validate_scope(&changed), Err(DataPlaneError::InvalidSource));
+    }
+
+    #[test]
     fn timestamp_matches_frozen_millisecond_shape() {
         let value = OffsetDateTime::from_unix_timestamp(1_784_203_200).unwrap();
         assert_eq!(timestamp(value).unwrap(), "2026-07-16T12:00:00.000Z");

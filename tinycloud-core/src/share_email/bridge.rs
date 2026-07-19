@@ -1326,7 +1326,8 @@ mod tests {
     use super::*;
     use sea_orm::Database;
     use sea_orm_migration::MigratorTrait;
-    use serde_json::json;
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
 
     fn scope(policy_cid: &str) -> ShareScope {
         ShareScope {
@@ -1356,6 +1357,129 @@ mod tests {
 
     fn holder() -> DidKey {
         DidKey::parse("did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw").unwrap()
+    }
+
+    fn source_digest(value: &Value) -> Sha256Digest {
+        Sha256Digest::from_bytes(Sha256::digest(jcs::canonicalize(value)).into())
+    }
+
+    fn sql_scope(statement: &str, argument: i64, valid_digest: bool) -> ShareScope {
+        let space = Did::parse("did:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7").unwrap();
+        let path = Path::parse("shared/plan").unwrap();
+        let statement = NamedStatement::parse(statement).unwrap();
+        let database = DatabaseName::parse("documents").unwrap();
+        let arguments = BTreeMap::from([(
+            String::from("document_id"),
+            SafeJsonInteger::parse(argument).unwrap(),
+        )]);
+        let source = ContentSource::Sql {
+            action: SqlReadAction::Read,
+            space,
+            database: database.clone(),
+            path: path.clone(),
+            statement: statement.clone(),
+            arguments: arguments.clone(),
+            arguments_digest: if valid_digest {
+                source_digest(&serde_json::to_value(&arguments).unwrap())
+            } else {
+                Sha256Digest::from_bytes([7; 32])
+            },
+        };
+        ShareScope {
+            share_cid: ShareCid::parse(KV_SHARE_CID).unwrap(),
+            share_id: ShareId::parse("share-sql-001").unwrap(),
+            delegation_cid: Some(ShareDelegationCid::parse(KV_POLICY_CID).unwrap()),
+            authority_material_handle: AuthorityMaterialHandle::parse("amh_sql_001").unwrap(),
+            authority_material_digest: Sha256Digest::from_bytes([0; 32]),
+            policy_cid: PolicyCid::parse(KV_POLICY_CID).unwrap(),
+            node_audience: Did::parse("did:web:node.example").unwrap(),
+            target_origin: TargetOrigin::parse("https://node.example").unwrap(),
+            action: ShareAction::SqlRead,
+            resource: ExactResource::Sql {
+                database,
+                path,
+                statement,
+            },
+            content_source: source.clone(),
+            content_source_digest: source_digest(&serde_json::to_value(source).unwrap()),
+        }
+    }
+
+    fn sql_capability(index: i64, value: i64, statement: &str) -> Value {
+        json!({
+            "service": "tinycloud.sql",
+            "space": "did:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7",
+            "path": "shared/plan",
+            "actions": ["tinycloud.sql/read"],
+            "caveats": {
+                "mode": "constrained-statements",
+                "readOnly": true,
+                "statements": [{
+                    "name": statement,
+                    "sql": "SELECT markdown FROM shared_documents WHERE document_id = ?",
+                    "fixedParams": [{"index": index, "value": value}]
+                }]
+            }
+        })
+    }
+
+    fn sql_delegation(capability: Value, enforcement: bool) -> PolicyDelegation {
+        PolicyDelegation {
+            schema: "xyz.tinycloud.policy/enforcement-delegation/v1".into(),
+            role: if enforcement {
+                DelegationRole::PolicyEnforcement
+            } else {
+                DelegationRole::PolicyAuthority
+            },
+            delegation_cid: "bafkreihhkhfgdqltz6ivbwcj7pq4idmzv7nsrbz6atilby3ymovnfquwam".into(),
+            issuer_did: "did:pkh:eip155:1:0x1111111111111111111111111111111111111111".into(),
+            audience_did: "did:web:node.example".into(),
+            capabilities: vec![capability],
+            proof_cids: vec![],
+            not_before: "2026-07-19T00:00:00Z".into(),
+            expires_at: "2026-07-20T00:00:00Z".into(),
+            delegation_mode: if enforcement {
+                DelegationMode::ConditionalMint
+            } else {
+                DelegationMode::PolicySource
+            },
+            facts: BTreeMap::new(),
+            signature: DelegationSignature {
+                suite: "eip191-secp256k1-sha256-jcs-v1".into(),
+                value: String::new(),
+            },
+        }
+    }
+
+    fn authorized_sql(scope: &ShareScope, capability: Value) -> Result<(), PortError> {
+        let policy = sql_delegation(capability.clone(), false);
+        let delegation = sql_delegation(capability, true);
+        authorized_statement(scope, &policy, &delegation)
+            .map(|statement| assert!(statement.is_some()))
+    }
+
+    #[test]
+    fn named_sql_scope_accepts_exact_statement_and_fixed_parameter() {
+        let scope = sql_scope("shared_document_by_id", 123, true);
+        assert!(authorized_sql(&scope, sql_capability(0, 123, "shared_document_by_id")).is_ok());
+    }
+
+    #[test]
+    fn named_sql_scope_denies_wrong_statement_or_parameter() {
+        let scope = sql_scope("shared_document_by_id", 123, true);
+        assert!(authorized_sql(&scope, sql_capability(0, 123, "other_statement")).is_err());
+        let wrong_parameter = sql_scope("shared_document_by_id", 456, true);
+        assert!(authorized_sql(
+            &wrong_parameter,
+            sql_capability(0, 123, "shared_document_by_id")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn named_sql_scope_denies_wrong_fixed_parameter_index() {
+        let scope = sql_scope("shared_document_by_id", 123, true);
+        assert!(authorized_sql(&scope, sql_capability(1, 123, "shared_document_by_id")).is_err());
     }
 
     async fn bridge_with_root(root_cid: &str, now: OffsetDateTime) -> DatabaseAuthorityBridge117 {

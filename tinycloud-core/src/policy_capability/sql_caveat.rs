@@ -14,6 +14,7 @@ pub struct FixedParam {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConstrainedStatement {
     pub name: String,
     pub sql: String,
