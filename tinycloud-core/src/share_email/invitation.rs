@@ -131,7 +131,7 @@ impl fmt::Debug for DocumentName {
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InvitationAuthorization {
     #[serde(rename = "type")]
     pub artifact_type: String,
