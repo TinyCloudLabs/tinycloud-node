@@ -579,10 +579,18 @@ pub fn compose(
     let invitation_verifier =
         Ed25519InvitationVerifier::new(config.invitation_kid.clone(), invite_key.into())
             .map_err(|e| anyhow::anyhow!("invitation verifier: {e}"))?;
-    let signing_secret = tinycloud_core::libp2p::identity::ed25519::SecretKey::try_from_bytes(
-        key_setup.derive_key(b"tinycloud/share-email/invitation-signing"),
-    )
-    .map_err(|_| anyhow::anyhow!("invalid share email signing key"))?;
+    #[cfg(feature = "mounted-fixture")]
+    let signing_seed = config
+        .invitation_private_key
+        .as_deref()
+        .map(decode_key32)
+        .transpose()?
+        .unwrap_or_else(|| key_setup.derive_key(b"tinycloud/share-email/invitation-signing"));
+    #[cfg(not(feature = "mounted-fixture"))]
+    let signing_seed = key_setup.derive_key(b"tinycloud/share-email/invitation-signing");
+    let signing_secret =
+        tinycloud_core::libp2p::identity::ed25519::SecretKey::try_from_bytes(signing_seed)
+            .map_err(|_| anyhow::anyhow!("invalid share email signing key"))?;
     let signing_ed25519 = tinycloud_core::libp2p::identity::ed25519::Keypair::from(signing_secret);
     let signing_keypair: tinycloud_core::libp2p::identity::Keypair = signing_ed25519.clone().into();
     let signing_public = signing_keypair

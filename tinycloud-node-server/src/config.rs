@@ -53,6 +53,11 @@ pub struct ShareEmailConfig {
     pub invitation_kid: String,
     #[serde(default)]
     pub invitation_public_key: Option<String>,
+    /// Test-only direct signer seed used by the mounted fixture. Production
+    /// composition always derives this key from `keys.secret`.
+    #[cfg(feature = "mounted-fixture")]
+    #[serde(default)]
+    pub invitation_private_key: Option<String>,
     #[serde(default = "default_share_issuer_did")]
     pub issuer_did: String,
     #[serde(default = "default_share_issuer_kid")]
@@ -117,6 +122,8 @@ impl Default for ShareEmailConfig {
             node_signing_kid: default_share_node_signing_kid(),
             invitation_kid: default_share_invitation_kid(),
             invitation_public_key: None,
+            #[cfg(feature = "mounted-fixture")]
+            invitation_private_key: None,
             issuer_did: default_share_issuer_did(),
             issuer_kid: default_share_issuer_kid(),
             issuer_key_version: default_share_issuer_key_version(),
