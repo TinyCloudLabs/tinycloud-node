@@ -175,6 +175,10 @@ where
                 .header(ContentType::new("application", "vnd.apache.arrow.stream"))
                 .sized_body(data.len(), std::io::Cursor::new(data))
                 .ok(),
+            #[cfg(feature = "compute")]
+            InvocationOutcome::ComputeResult(json) => Json(json).respond_to(request),
+            #[cfg(feature = "compute")]
+            InvocationOutcome::ComputeList(json) => Json(json).respond_to(request),
         }
     }
 }

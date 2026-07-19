@@ -993,6 +993,17 @@ where
 
         tx.commit().await?;
 
+        // Mirror-after-commit (§5/F8): update the infallible in-memory
+        // `SqlSizes` mirror so `store_size` folds the deploy into the space's
+        // usage. Deliberately AFTER `tx.commit()` -- a rollback (any `?`
+        // above) never reaches this, so a failed deploy leaves NO mirror
+        // delta. The transaction-aware `save_artifact_conn` bypasses the
+        // `SizeTrackingArtifactRepository` decorator (which only wraps the
+        // non-transactional repo), so this explicit update is required.
+        self.sql_sizes
+            .update(service, &space_str, name, artifact.size_bytes.max(0) as u64)
+            .await;
+
         Ok(ComputeDeployOutcome {
             content_cid: artifact.content_hash,
             revision: artifact.revision,
@@ -1487,6 +1498,16 @@ pub enum InvocationOutcome<R> {
     DuckDbResult(serde_json::Value),
     DuckDbExport(Vec<u8>),
     DuckDbArrow(Vec<u8>),
+    /// Inline compute function result (execute) OR a deploy/handshake ack
+    /// (compute-service.md §7.3). P1 uses this for the `Deploy` ack and the
+    /// `RoutineDid` handshake response; P2 adds the `Execute` result.
+    #[cfg(feature = "compute")]
+    ComputeResult(serde_json::Value),
+    /// List of deployed functions (compute-service.md §7.3). Reserved — no
+    /// server-side listing handler ships in this plan (§12.1/C9); the
+    /// variant exists so the responder arm and the outcome enum are complete.
+    #[cfg(feature = "compute")]
+    ComputeList(serde_json::Value),
 }
 
 impl<S: StorageSetup, K: Secrets> From<delegation::Error> for TxError<S, K> {
