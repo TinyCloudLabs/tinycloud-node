@@ -24,7 +24,7 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     models::{share_policy_presentation_jti, share_session_handle},
@@ -76,6 +76,7 @@ impl DatabaseAuthorityBridge117 {
         policy_expiry: OffsetDateTime,
         credential_expiry: OffsetDateTime,
     ) -> Result<String, PortError> {
+        let authority_now = authority_timestamp_value(now)?;
         let policy_cid = request
             .scope
             .delegation_cid
@@ -139,7 +140,7 @@ impl DatabaseAuthorityBridge117 {
             .map_err(|_| PortError::Denied)?;
         let nonce_hash = digest_string(request.nonce.as_str());
         let claimant = request.holder.as_str().to_owned();
-        let challenge_expires = now + SESSION_TTL;
+        let challenge_expires = authority_now + SESSION_TTL;
         let challenge = crate::policy_authority::ChallengeState::from_verified(
             request.challenge_id.clone(),
             nonce_hash.as_str(),
@@ -161,7 +162,7 @@ impl DatabaseAuthorityBridge117 {
             audience,
             claimant.clone(),
             capability_hash.clone(),
-            now,
+            authority_now,
             challenge_expires,
         )
         .map_err(map_authority_error)?;
@@ -199,12 +200,15 @@ impl DatabaseAuthorityBridge117 {
             claim_invocation_digest_hex: request.challenge_request_digest.as_str().to_owned(),
             vp_digest_hex: request.credential_digest.as_str().to_owned(),
         };
-        let decision =
-            TrustedPolicyDecision::allow_from_verified(decision_context, now, now + SESSION_TTL)
-                .map_err(map_authority_error)?;
+        let decision = TrustedPolicyDecision::allow_from_verified(
+            decision_context,
+            authority_now,
+            authority_now + SESSION_TTL,
+        )
+        .map_err(map_authority_error)?;
         let bindings = IssuanceBindings::from_verified(
-            now,
-            now,
+            authority_now,
+            authority_now,
             credential_expiry,
             request.challenge_id.clone(),
             nonce_hash.as_str(),
@@ -240,7 +244,7 @@ impl DatabaseAuthorityBridge117 {
         .into_iter()
         .min()
         .ok_or(PortError::Denied)?;
-        let root_not_before = authority_not_before_value(now)?;
+        let root_not_before = authority_now;
         let root_expires_at = authority_timestamp_value(expires_at)?;
         let audit = IssuanceAudit::build_verified(
             issuance_id.clone(),
@@ -927,15 +931,6 @@ fn authority_timestamp(value: OffsetDateTime) -> Result<String, PortError> {
 
 fn authority_timestamp_value(value: OffsetDateTime) -> Result<OffsetDateTime, PortError> {
     value.replace_nanosecond(0).map_err(|_| PortError::Denied)
-}
-
-fn authority_not_before_value(value: OffsetDateTime) -> Result<OffsetDateTime, PortError> {
-    let rounded = value.replace_nanosecond(0).map_err(|_| PortError::Denied)?;
-    Ok(if value.nanosecond() == 0 {
-        rounded
-    } else {
-        rounded + Duration::seconds(1)
-    })
 }
 
 fn policy_metadata(
