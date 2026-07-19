@@ -969,6 +969,14 @@ service so LAN clients can reach the node over browser-trusted HTTPS at
 not change the localhost-only public API listener — the LAN TLS listener is
 only bound when link is explicitly enabled.
 
+Verified first-run ordering: `link enable` derives the node's `did:key` from
+an existing node identity and fails with "node identity is not ready" if none
+exists yet. On a brand-new install the identity is only generated on a node's
+first `serve` boot, so the real first-run order is `serve` (first boot
+generates the identity) → `link enable` → restart `serve` so it picks up the
+LAN TLS listener from the state written by `enable`. Running `link enable`
+before the node has ever been served fails outright.
+
 Commands:
 
 - `tinycloud node link enable <name> [--service-url <url>] [--bind <addr:port>]`

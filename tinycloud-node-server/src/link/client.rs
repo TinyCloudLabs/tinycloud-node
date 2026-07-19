@@ -28,6 +28,17 @@ pub struct CertIssuanceResponse {
     pub not_after: String,
 }
 
+/// Default per-request timeout for claim/delete calls, which are simple
+/// key-value writes against the tinycloud.link service.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Per-request timeout override for cert issuance. `POST /v1/certs/:name`
+/// drives a live ACME order end-to-end; staging issuance was measured at
+/// 18-23s, which routinely exceeded `DEFAULT_REQUEST_TIMEOUT` and made the
+/// first `link enable` attempt coin-flip on a false-negative timeout even
+/// though the cert was issued successfully.
+const CERT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
 pub struct LinkClient {
     http: Client,
     base_url: String,
@@ -36,7 +47,7 @@ pub struct LinkClient {
 impl LinkClient {
     pub fn new(base_url: impl Into<String>) -> Result<Self, LinkError> {
         let http = Client::builder()
-            .timeout(Duration::from_secs(20))
+            .timeout(DEFAULT_REQUEST_TIMEOUT)
             .build()
             .map_err(|err| LinkError::Http(err.to_string()))?;
         Ok(Self {
@@ -110,6 +121,7 @@ impl LinkClient {
                     percent_encoding::NON_ALPHANUMERIC,
                 )
             )))
+            .timeout(CERT_REQUEST_TIMEOUT)
             .json(body)
             .send()
             .map_err(|err| LinkError::Http(err.to_string()))?;
@@ -182,5 +194,21 @@ fn classify_conflict(name: &str, body: String) -> LinkError {
             name: name.to_string(),
             body,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The cert request needs enough headroom to survive a real ACME order
+    // (staging measured at 18-23s end-to-end) without falsely timing out,
+    // while claim/delete stay on the tighter client default since they're
+    // plain key-value writes against tinycloud.link.
+    #[test]
+    fn cert_request_timeout_has_headroom_over_measured_acme_latency() {
+        let measured_worst_case_acme_latency = Duration::from_secs(23);
+        assert!(CERT_REQUEST_TIMEOUT > measured_worst_case_acme_latency);
+        assert!(CERT_REQUEST_TIMEOUT > DEFAULT_REQUEST_TIMEOUT);
     }
 }
