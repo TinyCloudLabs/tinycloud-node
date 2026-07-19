@@ -284,7 +284,7 @@ fn build_case(
     let capability = if kind == "kv" {
         json!({"service":"tinycloud.kv","space":SPACE,"path":"documents/plan.md","actions":["tinycloud.kv/get"]})
     } else {
-        json!({"service":"tinycloud.sql","space":SPACE,"path":"shared/plan","actions":["tinycloud.sql/read"],"caveats":{"mode":"constrained-statements","readOnly":true,"statements":[{"name":"shared_document_by_id","sql":"SELECT markdown FROM shared_documents WHERE document_id = ?","fixedParams":[{"index":1,"value":123}]}]}})
+        json!({"service":"tinycloud.sql","space":SPACE,"path":"shared/plan","actions":["tinycloud.sql/read"],"caveats":{"mode":"constrained-statements","readOnly":true,"statements":[{"name":"shared_document_by_id","sql":"SELECT markdown FROM shared_documents WHERE document_id = ?","fixedParams":[{"index":0,"value":123}]}]}})
     };
     let parsed =
         parse_capability(&capability).map_err(|error| anyhow::anyhow!("capability: {error:?}"))?;
