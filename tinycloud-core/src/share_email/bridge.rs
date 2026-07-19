@@ -24,7 +24,7 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
 use crate::{
     models::{share_policy_presentation_jti, share_session_handle},
@@ -311,7 +311,7 @@ impl DatabaseAuthorityBridge117 {
                 policy.artifact().delegation_cid.clone(),
                 enforcement.artifact().delegation_cid.clone(),
             ],
-            not_before: authority_timestamp(now)?,
+            not_before: authority_not_before(now)?,
             expires_at: authority_timestamp(expires_at)?,
             delegation_mode: if enforcement
                 .artifact()
@@ -916,6 +916,15 @@ fn authority_timestamp(value: OffsetDateTime) -> Result<String, PortError> {
         .map_err(|_| PortError::Denied)?
         .format(&Rfc3339)
         .map_err(|_| PortError::Denied)
+}
+
+fn authority_not_before(value: OffsetDateTime) -> Result<String, PortError> {
+    let rounded = value.replace_nanosecond(0).map_err(|_| PortError::Denied)?;
+    authority_timestamp(if value.nanosecond() == 0 {
+        rounded
+    } else {
+        rounded + Duration::seconds(1)
+    })
 }
 
 fn policy_metadata(
