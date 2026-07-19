@@ -8,6 +8,18 @@
 //!   3. Sign canonical payloads and call the link service HTTP client.
 //!   4. Persist the resulting sequence, cert-notAfter, and TLS material under
 //!      `dataPath/link/`.
+//!
+//! Sequence handling: every signed action consumes `link_state.next_sequence()`
+//! and persists it to `state.json` *before* the network round-trip (see
+//! `send_with_sequence`) — the service commits its own sequence bump as soon
+//! as the underlying write lands, which can be before a later step fails
+//! (e.g. the ACME round-trip for `POST /v1/certs/:name` in `server.ts`), so a
+//! failure on our side must never leave the client behind the service's
+//! record. If the service reports a stale-sequence 409 anyway, we resync by
+//! jumping the local counter forward and retrying once (`GET
+//! /v1/names/:name` doesn't expose the service's stored sequence, so an
+//! exact resync isn't possible — see docs/specs/node-control-plane-v1.md
+//! §3.9).
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use std::path::Path;
@@ -16,7 +28,7 @@ use crate::link::{
     client::{CertIssuanceResponse, LinkClient},
     csr, ip,
     payload::{self, CertRequestBody, NameClaimBody, NameDeleteBody},
-    state::{self, LinkPaths, LinkState},
+    state::{self, LinkPaths, LinkState, StateLock},
     LinkError, DEFAULT_BIND_ADDR,
 };
 use crate::node_control::key_provider::{self, IdentityPurpose};
@@ -68,7 +80,11 @@ pub fn enable(
     args: EnableArgs,
 ) -> Result<LinkStatusReport> {
     let paths = LinkPaths::from_data_root(data_root);
-    state::ensure_link_dirs(&paths)?;
+    let _lock = StateLock::acquire(&paths)?;
+
+    // 0. Normalize the name the same way the service does before it's used
+    // in anything we sign or embed in the CSR — see `normalize_name_label`.
+    let name = crate::link::normalize_name_label(&args.name).map_err(anyhow::Error::from)?;
 
     // 1. Trust boundary: derive the node identity in-process.
     let identity_state =
@@ -89,46 +105,35 @@ pub fn enable(
     let service_url = args.service_url.unwrap_or_else(state::default_service_url);
     let bind = args.bind.unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string());
 
-    let mut link_state = state::read_state(&paths)?.unwrap_or_else(|| {
-        LinkState::new(args.name.clone(), service_url.clone(), Some(bind.clone()))
-    });
-    link_state.name = args.name.clone();
+    let mut link_state = state::read_state(&paths)?
+        .unwrap_or_else(|| LinkState::new(name.clone(), service_url.clone(), Some(bind.clone())));
+    link_state.name = name.clone();
     link_state.service_url = service_url.clone();
     link_state.bind = Some(bind.clone());
 
     let client = LinkClient::new(service_url.clone()).map_err(anyhow::Error::from)?;
 
     // 4. Claim the name.
-    let claim_sequence = link_state.next_sequence();
-    let canonical_claim =
-        payload::canonical_claim_payload(&args.name, &node_did, &lan_ip_strings, claim_sequence);
-    let claim_signature =
-        payload::sign_ed25519(&keypair, &canonical_claim).map_err(anyhow::Error::from)?;
-    let claim = NameClaimBody {
-        version: payload::VERSION,
-        action: "claim",
-        name: args.name.clone(),
-        subject: node_did.clone(),
-        lan_ips: lan_ip_strings.clone(),
-        sequence: claim_sequence,
-        signature: claim_signature,
-    };
-    client
-        .put_name_claim(&claim)
-        .map_err(|err| link_error_context(err, "PUT /v1/names/:name"))?;
-    link_state.sequence = claim_sequence;
+    send_with_sequence(&mut link_state, &paths, "PUT /v1/names/:name", |sequence| {
+        let canonical =
+            payload::canonical_claim_payload(&name, &node_did, &lan_ip_strings, sequence);
+        let signature = payload::sign_ed25519(&keypair, &canonical)?;
+        let claim = NameClaimBody {
+            version: payload::VERSION,
+            action: "claim",
+            name: name.clone(),
+            subject: node_did.clone(),
+            lan_ips: lan_ip_strings.clone(),
+            sequence,
+            signature,
+        };
+        client.put_name_claim(&claim)
+    })?;
     link_state.last_lan_ips = lan_ip_strings.clone();
     state::write_state(&paths, &link_state)?;
 
     // 5. Issue cert.
-    let issuance = request_cert(
-        &client,
-        &keypair,
-        &args.name,
-        &node_did,
-        &mut link_state,
-        &paths,
-    )?;
+    let issuance = request_cert(&client, &keypair, &name, &node_did, &mut link_state, &paths)?;
 
     // 6. Compute a status report to hand back to the CLI.
     build_status(&paths, &link_state, Some(&issuance))
@@ -136,17 +141,9 @@ pub fn enable(
 
 pub fn disable(data_root: &Path, keys: Option<&crate::config::Keys>) -> Result<LinkStatusReport> {
     let paths = LinkPaths::from_data_root(data_root);
+    let _lock = StateLock::acquire(&paths)?;
     let Some(mut link_state) = state::read_state(&paths)? else {
-        return Ok(LinkStatusReport {
-            enabled: false,
-            link_name: None,
-            local_url: None,
-            cert_not_after: None,
-            service_url: None,
-            bind: None,
-            sequence: None,
-            link_listener: LinkListenerState::Disabled,
-        });
+        return Ok(disabled_report());
     };
 
     let identity_state =
@@ -160,27 +157,47 @@ pub fn disable(data_root: &Path, keys: Option<&crate::config::Keys>) -> Result<L
     let keypair = secret.node_keypair();
 
     let client = LinkClient::new(link_state.service_url.clone()).map_err(anyhow::Error::from)?;
-    let delete_sequence = link_state.next_sequence();
-    let canonical = payload::canonical_delete_payload(&link_state.name, &node_did, delete_sequence);
-    let signature = payload::sign_ed25519(&keypair, &canonical).map_err(anyhow::Error::from)?;
-    let body = NameDeleteBody {
-        version: payload::VERSION,
-        action: "delete",
-        name: link_state.name.clone(),
-        subject: node_did.clone(),
-        sequence: delete_sequence,
-        signature,
-    };
-    // Even if the service returns 404 (name never existed), we clean up locally.
-    match client.delete_name(&body) {
-        Ok(()) | Err(LinkError::UnexpectedStatus { status: 404, .. }) => {}
-        Err(err) => return Err(link_error_context(err, "DELETE /v1/names/:name")),
-    }
-    link_state.sequence = delete_sequence;
-    // Best-effort cleanup: remove the whole link/ dir.
+    let name = link_state.name.clone();
+    let delete_result = send_with_sequence(
+        &mut link_state,
+        &paths,
+        "DELETE /v1/names/:name",
+        |sequence| {
+            let canonical = payload::canonical_delete_payload(&name, &node_did, sequence);
+            let signature = payload::sign_ed25519(&keypair, &canonical)?;
+            let body = NameDeleteBody {
+                version: payload::VERSION,
+                action: "delete",
+                name: name.clone(),
+                subject: node_did.clone(),
+                sequence,
+                signature,
+            };
+            // The name never existing at all is not a failure worth
+            // retrying/reporting — treat it the same as a successful delete.
+            match client.delete_name(&body) {
+                Ok(()) | Err(LinkError::UnexpectedStatus { status: 404, .. }) => Ok(()),
+                Err(err) => Err(err),
+            }
+        },
+    );
+
+    // Clean up local state regardless of the outcome above: keeping it
+    // around after a failed delete wedges the node under a name/cert it no
+    // longer controls on the service side (see
+    // docs/specs/node-control-plane-v1.md §3.9).
     state::remove_link_dir(&paths)?;
 
-    Ok(LinkStatusReport {
+    if let Err(err) = delete_result {
+        tracing::warn!(%err, %name, "link disable: service delete failed; local state removed anyway");
+        return Err(err);
+    }
+
+    Ok(disabled_report())
+}
+
+fn disabled_report() -> LinkStatusReport {
+    LinkStatusReport {
         enabled: false,
         link_name: None,
         local_url: None,
@@ -189,28 +206,20 @@ pub fn disable(data_root: &Path, keys: Option<&crate::config::Keys>) -> Result<L
         bind: None,
         sequence: None,
         link_listener: LinkListenerState::Disabled,
-    })
+    }
 }
 
 pub fn status(data_root: &Path) -> Result<LinkStatusReport> {
     let paths = LinkPaths::from_data_root(data_root);
     let Some(link_state) = state::read_state(&paths)? else {
-        return Ok(LinkStatusReport {
-            enabled: false,
-            link_name: None,
-            local_url: None,
-            cert_not_after: None,
-            service_url: None,
-            bind: None,
-            sequence: None,
-            link_listener: LinkListenerState::Disabled,
-        });
+        return Ok(disabled_report());
     };
     build_status(&paths, &link_state, None)
 }
 
 pub fn renew(data_root: &Path, keys: Option<&crate::config::Keys>) -> Result<LinkStatusReport> {
     let paths = LinkPaths::from_data_root(data_root);
+    let _lock = StateLock::acquire(&paths)?;
     let mut link_state = state::read_state(&paths)?
         .ok_or_else(|| anyhow!("link is not enabled — run `tinycloud node link enable <name>`"))?;
 
@@ -230,27 +239,22 @@ pub fn renew(data_root: &Path, keys: Option<&crate::config::Keys>) -> Result<Lin
     let current_ips = ip::discover_lan_ips().map_err(anyhow::Error::from)?;
     let current_ip_strings = ip::format_lan_ips(&current_ips);
     if current_ip_strings != link_state.last_lan_ips {
-        let claim_sequence = link_state.next_sequence();
-        let canonical = payload::canonical_claim_payload(
-            &link_state.name,
-            &node_did,
-            &current_ip_strings,
-            claim_sequence,
-        );
-        let signature = payload::sign_ed25519(&keypair, &canonical).map_err(anyhow::Error::from)?;
-        let body = NameClaimBody {
-            version: payload::VERSION,
-            action: "claim",
-            name: link_state.name.clone(),
-            subject: node_did.clone(),
-            lan_ips: current_ip_strings.clone(),
-            sequence: claim_sequence,
-            signature,
-        };
-        client
-            .put_name_claim(&body)
-            .map_err(|err| link_error_context(err, "PUT /v1/names/:name"))?;
-        link_state.sequence = claim_sequence;
+        let name = link_state.name.clone();
+        send_with_sequence(&mut link_state, &paths, "PUT /v1/names/:name", |sequence| {
+            let canonical =
+                payload::canonical_claim_payload(&name, &node_did, &current_ip_strings, sequence);
+            let signature = payload::sign_ed25519(&keypair, &canonical)?;
+            let body = NameClaimBody {
+                version: payload::VERSION,
+                action: "claim",
+                name: name.clone(),
+                subject: node_did.clone(),
+                lan_ips: current_ip_strings.clone(),
+                sequence,
+                signature,
+            };
+            client.put_name_claim(&body)
+        })?;
         link_state.last_lan_ips = current_ip_strings;
         state::write_state(&paths, &link_state)?;
     }
@@ -266,12 +270,50 @@ pub fn renew(data_root: &Path, keys: Option<&crate::config::Keys>) -> Result<Lin
     build_status(&paths, &link_state, Some(&issuance))
 }
 
-/// Request a fresh cert for `name` and persist the resulting key/cert/notAfter.
+/// How far to jump the local sequence counter when recovering from a
+/// stale-sequence 409. The link service does not expose its stored sequence
+/// via `GET /v1/names/:name` (see `tinycloud-link/src/server.ts`), so an
+/// exact resync isn't possible — jumping forward and retrying once is the
+/// documented recovery path (docs/specs/node-control-plane-v1.md §3.9).
+const SEQUENCE_RESYNC_JUMP: u64 = 100;
+
+/// Run a signed action against the link service using `link_state`'s next
+/// sequence value.
 ///
-/// The sequence used for the cert request MUST be greater than the sequence
-/// stored on the name — the service enforces `existing.sequence >= request.sequence => 409`
-/// even for cert requests, so we advance to the next value and only persist
-/// after success.
+/// The sequence consumed for this attempt is persisted to `state.json`
+/// *before* `send` runs (see the module doc for why). If the service comes
+/// back with a stale-sequence 409 anyway, the local counter has fallen
+/// behind the service's record (e.g. `state.json` was restored from a
+/// backup, or a previous attempt crashed after the service's write landed
+/// but before we could see the response) — jump the counter forward by
+/// [`SEQUENCE_RESYNC_JUMP`] and retry once. A second failure is surfaced to
+/// the caller.
+fn send_with_sequence<T>(
+    link_state: &mut LinkState,
+    paths: &LinkPaths,
+    ctx: &'static str,
+    mut send: impl FnMut(u64) -> Result<T, LinkError>,
+) -> Result<(u64, T)> {
+    let sequence = link_state.next_sequence();
+    link_state.sequence = sequence;
+    state::write_state(paths, link_state)?;
+
+    match send(sequence) {
+        Ok(value) => Ok((sequence, value)),
+        Err(LinkError::StaleSequence { .. }) => {
+            let resynced = link_state.sequence.saturating_add(SEQUENCE_RESYNC_JUMP);
+            link_state.sequence = resynced;
+            state::write_state(paths, link_state)?;
+            match send(resynced) {
+                Ok(value) => Ok((resynced, value)),
+                Err(err) => Err(link_error_context(err, ctx)),
+            }
+        }
+        Err(err) => Err(link_error_context(err, ctx)),
+    }
+}
+
+/// Request a fresh cert for `name` and persist the resulting key/cert/notAfter.
 fn request_cert(
     client: &LinkClient,
     keypair: &tinycloud_core::keys::Keypair,
@@ -281,25 +323,24 @@ fn request_cert(
     paths: &LinkPaths,
 ) -> Result<CertIssuanceResponse> {
     let bundle = csr::generate_csr(name).map_err(anyhow::Error::from)?;
-    let sequence = link_state.next_sequence();
-    let canonical =
-        payload::canonical_cert_request_payload(name, node_did, &bundle.csr_pem, sequence);
-    let signature = payload::sign_ed25519(keypair, &canonical).map_err(anyhow::Error::from)?;
-    let body = CertRequestBody {
-        version: payload::VERSION,
-        action: "cert",
-        name: name.to_string(),
-        subject: node_did.to_string(),
-        csr: bundle.csr_pem.clone(),
-        sequence,
-        signature,
-    };
-    let issuance = client
-        .post_cert_request(&body)
-        .map_err(|err| link_error_context(err, "POST /v1/certs/:name"))?;
+    let (_sequence, issuance) =
+        send_with_sequence(link_state, paths, "POST /v1/certs/:name", |sequence| {
+            let canonical =
+                payload::canonical_cert_request_payload(name, node_did, &bundle.csr_pem, sequence);
+            let signature = payload::sign_ed25519(keypair, &canonical)?;
+            let body = CertRequestBody {
+                version: payload::VERSION,
+                action: "cert",
+                name: name.to_string(),
+                subject: node_did.to_string(),
+                csr: bundle.csr_pem.clone(),
+                sequence,
+                signature,
+            };
+            client.post_cert_request(&body)
+        })?;
 
     state::write_tls_material(paths, &bundle.private_key_pem, &issuance.cert_chain_pem)?;
-    link_state.sequence = sequence;
     link_state.cert_not_after = Some(issuance.not_after.clone());
     state::write_state(paths, link_state)?;
     Ok(issuance)

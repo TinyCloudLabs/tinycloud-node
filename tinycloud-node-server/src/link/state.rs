@@ -1,14 +1,18 @@
 //! Persistence for link state (`state.json`) and TLS artifacts.
 //!
 //! Layout (all under `dataPath/link/`):
-//!   - `state.json`        — {name, serviceUrl, sequence, lastLanIps, certNotAfter, bind}
-//!   - `tls/key.pem`       — CSR private key (0600)
-//!   - `tls/cert.pem`      — signed cert chain from the service (0600)
+//!   - `state.json`          — {name, serviceUrl, sequence, lastLanIps, certNotAfter, bind}
+//!   - `tls/key.pem`         — CSR private key (0600)
+//!   - `tls/cert.pem`        — signed cert chain from the service (0600)
+//!   - `listener-state.json` — last-observed LAN TLS listener bind result (see `ListenerState`)
+//!   - `state.lock`          — advisory lock guarding `state.json`'s sequence counter
 //!
 //! `sequence` is monotonic: `next_sequence` returns the next unused value and
-//! callers persist it back with `commit_sequence` after a successful action.
-//! This mirrors the server-side "existing.sequence >= request.sequence => 409"
-//! semantics in `server.ts`.
+//! callers write it back into `state.json` (via `write_state`) once it has
+//! been consumed. This mirrors the server-side
+//! "existing.sequence >= request.sequence => 409" semantics in `server.ts`.
+//! See `commands::send_with_sequence` for where that value is persisted
+//! *before* the network round-trip.
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -23,6 +27,8 @@ pub const STATE_FILE: &str = "state.json";
 pub const TLS_DIR: &str = "tls";
 pub const TLS_KEY_FILE: &str = "key.pem";
 pub const TLS_CERT_FILE: &str = "cert.pem";
+pub const LISTENER_STATE_FILE: &str = "listener-state.json";
+pub const LOCK_FILE: &str = "state.lock";
 
 /// Persistent state.json shape written to disk with 0600 perms.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -74,6 +80,8 @@ pub struct LinkPaths {
     pub tls_dir: PathBuf,
     pub key_path: PathBuf,
     pub cert_path: PathBuf,
+    pub listener_state_path: PathBuf,
+    pub lock_path: PathBuf,
 }
 
 impl LinkPaths {
@@ -83,12 +91,16 @@ impl LinkPaths {
         let key_path = tls_dir.join(TLS_KEY_FILE);
         let cert_path = tls_dir.join(TLS_CERT_FILE);
         let state_path = root.join(STATE_FILE);
+        let listener_state_path = root.join(LISTENER_STATE_FILE);
+        let lock_path = root.join(LOCK_FILE);
         Self {
             root,
             state_path,
             tls_dir,
             key_path,
             cert_path,
+            listener_state_path,
+            lock_path,
         }
     }
 }
@@ -118,20 +130,13 @@ pub fn read_state(paths: &LinkPaths) -> Result<Option<LinkState>> {
 pub fn write_state(paths: &LinkPaths, state: &LinkState) -> Result<()> {
     ensure_link_dirs(paths)?;
     let rendered = serde_json::to_vec_pretty(state)?;
-    fs::write(&paths.state_path, rendered)
-        .with_context(|| format!("failed to write {}", paths.state_path.display()))?;
-    set_private_permissions(&paths.state_path)?;
-    Ok(())
+    write_private_file(&paths.state_path, &rendered)
 }
 
 pub fn write_tls_material(paths: &LinkPaths, key_pem: &str, cert_pem: &str) -> Result<()> {
     ensure_link_dirs(paths)?;
-    fs::write(&paths.key_path, key_pem)
-        .with_context(|| format!("failed to write {}", paths.key_path.display()))?;
-    set_private_permissions(&paths.key_path)?;
-    fs::write(&paths.cert_path, cert_pem)
-        .with_context(|| format!("failed to write {}", paths.cert_path.display()))?;
-    set_private_permissions(&paths.cert_path)?;
+    write_private_file(&paths.key_path, key_pem.as_bytes())?;
+    write_private_file(&paths.cert_path, cert_pem.as_bytes())?;
     Ok(())
 }
 
@@ -147,20 +152,105 @@ pub fn default_service_url() -> String {
     DEFAULT_SERVICE_URL.to_string()
 }
 
+/// Write `contents` to `path` with mode `0600` from the moment the file is
+/// created — no separate `chmod` call, so there is no window where the file
+/// exists with the platform-default (typically world-readable) permissions.
 #[cfg(unix)]
-fn set_private_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut permissions = fs::metadata(path)
-        .with_context(|| format!("failed to stat {}", path.display()))?
-        .permissions();
-    permissions.set_mode(0o600);
-    fs::set_permissions(path, permissions)
-        .with_context(|| format!("failed to chmod {}", path.display()))
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.write_all(contents)
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 #[cfg(not(unix))]
-fn set_private_permissions(_path: &Path) -> Result<()> {
-    Ok(())
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+    fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// Observed bind result for the LAN TLS listener, written by `serve` and read
+/// by `service status --json` so the reported `linkListener` state reflects
+/// what actually happened (a failed bind) rather than being inferred purely
+/// from whether the node process is running.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ListenerState {
+    pub bound: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bind_addr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+pub fn write_listener_state(paths: &LinkPaths, state: &ListenerState) -> Result<()> {
+    ensure_link_dirs(paths)?;
+    let rendered = serde_json::to_vec_pretty(state)?;
+    fs::write(&paths.listener_state_path, rendered)
+        .with_context(|| format!("failed to write {}", paths.listener_state_path.display()))
+}
+
+pub fn read_listener_state(paths: &LinkPaths) -> Result<Option<ListenerState>> {
+    match fs::read(&paths.listener_state_path) {
+        Ok(bytes) => {
+            let state: ListenerState = serde_json::from_slice(&bytes).with_context(|| {
+                format!("failed to parse {}", paths.listener_state_path.display())
+            })?;
+            Ok(Some(state))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to read {}", paths.listener_state_path.display())),
+    }
+}
+
+/// Advisory exclusive lock over `state.json`'s sequence counter, held for the
+/// duration of a `link enable`/`disable`/`renew` call. Guards against two
+/// races: the CLI and the in-process auto-renew loop mutating `state.json`
+/// concurrently, and two overlapping CLI invocations doing the same.
+#[cfg(unix)]
+pub struct StateLock {
+    _file: fs::File,
+}
+
+#[cfg(unix)]
+impl StateLock {
+    pub fn acquire(paths: &LinkPaths) -> Result<Self> {
+        ensure_link_dirs(paths)?;
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            // The lock file's contents are never read — only its existence
+            // and the `flock` held on it matter — so there's nothing to
+            // preserve across opens.
+            .truncate(false)
+            .open(&paths.lock_path)
+            .with_context(|| format!("failed to open {}", paths.lock_path.display()))?;
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: `file` stays alive for the lifetime of the returned lock,
+        // so `fd` remains valid for the `flock` call.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to lock {}", paths.lock_path.display()));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+#[cfg(not(unix))]
+pub struct StateLock;
+
+#[cfg(not(unix))]
+impl StateLock {
+    pub fn acquire(_paths: &LinkPaths) -> Result<Self> {
+        Ok(Self)
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -234,5 +324,32 @@ mod tests {
         let tmp = tempdir().unwrap();
         let paths = LinkPaths::from_data_root(tmp.path());
         assert!(read_state(&paths).unwrap().is_none());
+    }
+
+    #[test]
+    fn listener_state_roundtrips() {
+        let tmp = tempdir().unwrap();
+        let paths = LinkPaths::from_data_root(tmp.path());
+        assert!(read_listener_state(&paths).unwrap().is_none());
+
+        let state = ListenerState {
+            bound: false,
+            bind_addr: Some("0.0.0.0:8443".to_string()),
+            error: Some("address already in use".to_string()),
+        };
+        write_listener_state(&paths, &state).unwrap();
+        assert_eq!(read_listener_state(&paths).unwrap().unwrap(), state);
+    }
+
+    #[test]
+    fn state_lock_can_be_reacquired_after_release() {
+        let tmp = tempdir().unwrap();
+        let paths = LinkPaths::from_data_root(tmp.path());
+        {
+            let _lock = StateLock::acquire(&paths).unwrap();
+        }
+        // Dropping the first lock must release it — acquiring again must not
+        // deadlock.
+        let _lock = StateLock::acquire(&paths).unwrap();
     }
 }

@@ -14,6 +14,14 @@
 //!     unwrapped and classified by their embedded IPv4 — they fall through to
 //!     "not private". `if_addrs` does not surface these forms from OS
 //!     interface enumeration, so this gap is not currently reachable.
+//!
+//! `is_private_lan_address` above is the general "is this usable at all"
+//! predicate (still matches the TS `isPrivateAddress` shape, including
+//! `fe80::/10`). `discover_lan_ips` — the function that actually decides what
+//! gets published in a claim — applies a stricter policy on top: it prefers
+//! RFC1918/ULA addresses over IPv4 link-local when truncating to
+//! `MAX_LAN_IPS`, and excludes IPv6 link-local (`fe80::/10`) entirely, since
+//! a scope-less AAAA record for one is unreachable from other hosts.
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::LinkError;
@@ -53,28 +61,60 @@ fn is_private_ipv6(addr: Ipv6Addr) -> bool {
     false
 }
 
-/// Enumerate this host's non-loopback private LAN IPs. Preserves discovery
-/// order but drops duplicates, and caps the returned set at `MAX_LAN_IPS` so
-/// callers stay under the service's `lanIps.length <= MAX_LAN_IPS` cap.
+/// True for `fe80::/10` IPv6 link-local addresses.
+fn is_ipv6_link_local(addr: Ipv6Addr) -> bool {
+    (addr.segments()[0] & 0xffc0) == 0xfe80
+}
+
+/// True for RFC1918 (IPv4) or unique-local (IPv6 ULA `fc00::/7`) addresses —
+/// the preferred address classes for published records, since (unlike
+/// link-local addresses) they're routable within the LAN and don't need a
+/// zone/scope ID to be reachable.
+fn is_preferred_lan_address(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(v4) => v4.is_private(),
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00,
+    }
+}
+
+/// Enumerate this host's non-loopback private LAN IPs to publish in a claim.
+///
+/// RFC1918/ULA addresses are preferred over IPv4 link-local (`169.254.0.0/16`)
+/// when the set has to be truncated to `MAX_LAN_IPS`. IPv6 link-local
+/// (`fe80::/10`) addresses are excluded outright: they require a zone/scope
+/// ID to be reachable, which a plain AAAA record can't carry, so publishing
+/// one would produce an address LAN clients can't actually connect to (see
+/// docs/specs/node-control-plane-v1.md §3.9).
 pub fn discover_lan_ips() -> Result<Vec<IpAddr>, LinkError> {
     let addrs = if_addrs::get_if_addrs().map_err(|err| LinkError::Interface(err.to_string()))?;
-    let mut ips = Vec::new();
+    let mut preferred = Vec::new();
+    let mut fallback = Vec::new();
     for iface in addrs {
         if iface.is_loopback() {
             continue;
         }
         let ip = iface.ip();
+        if let IpAddr::V6(v6) = ip {
+            if is_ipv6_link_local(v6) {
+                continue;
+            }
+        }
         if !is_private_lan_address(ip) {
             continue;
         }
-        if ips.contains(&ip) {
+        let bucket = if is_preferred_lan_address(ip) {
+            &mut preferred
+        } else {
+            &mut fallback
+        };
+        if bucket.contains(&ip) {
             continue;
         }
-        ips.push(ip);
-        if ips.len() >= MAX_LAN_IPS {
-            break;
-        }
+        bucket.push(ip);
     }
+    let mut ips = preferred;
+    ips.extend(fallback);
+    ips.truncate(MAX_LAN_IPS);
     if ips.is_empty() {
         return Err(LinkError::NoLanIps);
     }
@@ -127,6 +167,23 @@ mod tests {
         assert!(!is_private_lan_address("::".parse().unwrap()));
         assert!(!is_private_lan_address("ff02::1".parse().unwrap())); // multicast
         assert!(!is_private_lan_address("fec0::1".parse().unwrap())); // deprecated site-local
+    }
+
+    #[test]
+    fn ipv6_link_local_is_flagged_for_exclusion_from_published_records() {
+        assert!(is_ipv6_link_local("fe80::1".parse().unwrap()));
+        assert!(is_ipv6_link_local("febf::1234".parse().unwrap()));
+        assert!(!is_ipv6_link_local("fd00::1".parse().unwrap()));
+        assert!(!is_ipv6_link_local("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn rfc1918_and_ula_are_preferred_over_link_local() {
+        assert!(is_preferred_lan_address("192.168.1.5".parse().unwrap()));
+        assert!(is_preferred_lan_address("10.0.0.1".parse().unwrap()));
+        assert!(is_preferred_lan_address("fd00::1".parse().unwrap()));
+        assert!(!is_preferred_lan_address("169.254.1.1".parse().unwrap()));
+        assert!(!is_preferred_lan_address("fe80::1".parse().unwrap()));
     }
 
     #[test]

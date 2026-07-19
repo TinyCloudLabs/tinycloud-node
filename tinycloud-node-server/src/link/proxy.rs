@@ -3,21 +3,61 @@
 //!
 //! `serve` starts this listener only when link is enabled (there is a valid
 //! `state.json` and a matching `tls/{key,cert}.pem`). It participates in the
-//! same graceful shutdown as the Rocket app via a `CancellationToken` passed
-//! in by the caller.
+//! same graceful shutdown as the Rocket app via a `watch::Receiver<bool>`
+//! passed in by the caller.
 use anyhow::{Context, Result};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
 use rustls::ServerConfig;
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, sync::RwLock};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::watch,
 };
 use tokio_rustls::TlsAcceptor;
 
-/// Build a rustls `ServerConfig` from PEM key + cert-chain material.
-pub fn build_rustls_config(key_pem: &str, cert_chain_pem: &str) -> Result<Arc<ServerConfig>> {
+/// Holds the LAN TLS listener's active certificate/key and implements
+/// [`ResolvesServerCert`] so a renewed cert can be swapped in without
+/// restarting the listener or dropping in-flight connections — see
+/// `docs/specs/node-control-plane-v1.md` §3.9.
+#[derive(Debug)]
+pub struct LinkCertResolver {
+    current: RwLock<Arc<CertifiedKey>>,
+}
+
+impl LinkCertResolver {
+    fn new(certified_key: CertifiedKey) -> Arc<Self> {
+        Arc::new(Self {
+            current: RwLock::new(Arc::new(certified_key)),
+        })
+    }
+
+    /// Swap in a freshly issued cert/key pair. Only handshakes that start
+    /// after this call see the new cert; already-established connections are
+    /// unaffected.
+    pub fn update(&self, key_pem: &str, cert_chain_pem: &str) -> Result<()> {
+        let certified_key = parse_certified_key(key_pem, cert_chain_pem)?;
+        *self
+            .current
+            .write()
+            .expect("link cert resolver lock poisoned") = Arc::new(certified_key);
+        Ok(())
+    }
+}
+
+impl ResolvesServerCert for LinkCertResolver {
+    fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(
+            self.current
+                .read()
+                .expect("link cert resolver lock poisoned")
+                .clone(),
+        )
+    }
+}
+
+fn parse_certified_key(key_pem: &str, cert_chain_pem: &str) -> Result<CertifiedKey> {
     let mut certs_reader = std::io::Cursor::new(cert_chain_pem.as_bytes());
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut certs_reader)
         .collect::<std::io::Result<Vec<_>>>()
@@ -35,14 +75,30 @@ pub fn build_rustls_config(key_pem: &str, cert_chain_pem: &str) -> Result<Arc<Se
     let provider = rustls::crypto::CryptoProvider::get_default()
         .cloned()
         .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+    CertifiedKey::from_der(certs, key, &provider)
+        .map_err(|err| anyhow::anyhow!("failed to build certified key: {err}"))
+}
+
+/// Build a rustls `ServerConfig` backed by a [`LinkCertResolver`] from PEM
+/// key + cert-chain material. The returned resolver lets the caller refresh
+/// the served cert in place after a renew.
+pub fn build_rustls_config(
+    key_pem: &str,
+    cert_chain_pem: &str,
+) -> Result<(Arc<ServerConfig>, Arc<LinkCertResolver>)> {
+    let certified_key = parse_certified_key(key_pem, cert_chain_pem)?;
+    let resolver = LinkCertResolver::new(certified_key);
+
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
     let config = ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .context("failed to select rustls protocol versions")?
         .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("failed to build rustls server config")?;
+        .with_cert_resolver(resolver.clone());
 
-    Ok(Arc::new(config))
+    Ok((Arc::new(config), resolver))
 }
 
 /// Synchronously bind the LAN TLS listener socket.
@@ -111,42 +167,15 @@ async fn handle_connection(
     upstream_addr: SocketAddr,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
-    let tls = acceptor.accept(tcp).await.context("TLS handshake failed")?;
+    let mut tls = acceptor.accept(tcp).await.context("TLS handshake failed")?;
     let mut upstream = TcpStream::connect(upstream_addr)
         .await
         .with_context(|| format!("failed to connect to loopback API at {upstream_addr}"))?;
 
-    let (mut client_read, mut client_write) = tokio::io::split(tls);
-    let (mut upstream_read, mut upstream_write) = upstream.split();
-
-    let client_to_upstream = async { copy_stream(&mut client_read, &mut upstream_write).await };
-    let upstream_to_client = async { copy_stream(&mut upstream_read, &mut client_write).await };
-
     tokio::select! {
         _ = shutdown.changed() => Ok(()),
-        result = client_to_upstream => result,
-        result = upstream_to_client => result,
-    }
-}
-
-async fn copy_stream<R, W>(reader: &mut R, writer: &mut W) -> Result<()>
-where
-    R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    let mut buf = [0u8; 16 * 1024];
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .await
-            .context("read from stream failed")?;
-        if n == 0 {
-            let _ = writer.shutdown().await;
-            return Ok(());
+        result = tokio::io::copy_bidirectional(&mut tls, &mut upstream) => {
+            result.map(|_| ()).context("proxy copy failed")
         }
-        writer
-            .write_all(&buf[..n])
-            .await
-            .context("write to stream failed")?;
     }
 }

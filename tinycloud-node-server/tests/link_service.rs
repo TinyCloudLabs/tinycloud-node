@@ -1,15 +1,21 @@
 // Integration tests for the `link` module:
 //   1. Enable happy path against a mock link service (claim + cert issuance).
-//   2. 409 name-taken surfaces as `LinkError::NameConflict` with the name.
+//   2. 409 name-taken and 409 stale-sequence surface as distinct `LinkError`
+//      variants (`NameConflict` vs `StaleSequence`).
 //   3. TLS proxy roundtrip: bytes sent to the TLS listener come out the far
 //      side of an internal loopback echo server unchanged.
+//   4. Sequence-desync recovery: a cert request that fails after the service
+//      has already bumped its stored sequence (mirroring `server.ts`'s
+//      "bump before the ACME round-trip") must not strand a later `disable`;
+//      and a `disable` that hits a stale-sequence 409 must recover via the
+//      resync-jump retry.
 //
-// Neither of these tests touches the network — the mock link service and the
+// None of these tests touch the network — the mock link service and the
 // echo server run on 127.0.0.1 with OS-assigned ports.
 use std::{
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -28,8 +34,10 @@ use tempfile::tempdir;
 use tinycloud::{
     config::Keys,
     link::{
-        commands::{enable, EnableArgs},
-        proxy, state,
+        client::LinkClient,
+        commands::{disable, enable, EnableArgs},
+        payload::NameClaimBody,
+        proxy, state, LinkError,
     },
 };
 use tinycloud_core::keys::StaticSecret;
@@ -38,6 +46,21 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::watch,
 };
+
+/// Serializes tests that mutate the process-wide `TINYCLOUD_KEYS_SECRET` env
+/// var. `cargo test` runs `#[tokio::test]` functions concurrently on separate
+/// threads, and `std::env::set_var`/`remove_var` racing across threads is
+/// undefined behavior on some platforms and flaky at best — every test that
+/// touches that env var must hold this lock for its whole body. This is a
+/// `tokio::sync::Mutex` (not `std::sync::Mutex`) specifically so the guard
+/// can be held across `.await` points without tripping
+/// `clippy::await_holding_lock`.
+async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -55,9 +78,27 @@ struct AnyClaim {
     csr: String,
 }
 
+/// A stored name record, mirroring `NameStore`'s shape in
+/// `tinycloud-link/src/storage.ts`.
+#[derive(Debug, Clone)]
+struct StoredName {
+    subject: String,
+    sequence: u64,
+}
+
 #[derive(Default)]
 struct MockService {
     behavior: Behavior,
+    /// Tracks the name's committed sequence the same way the real service
+    /// does, so PUT/DELETE/POST enforce genuine
+    /// `existing.sequence >= request.sequence => 409` semantics instead of
+    /// always succeeding.
+    stored: Option<StoredName>,
+    /// When set, `POST /v1/certs/:name` bumps `stored.sequence` (mirroring
+    /// the real service's bump-before-ACME-round-trip) and then always
+    /// fails, simulating an ACME failure after the sequence has already
+    /// landed.
+    cert_should_fail: bool,
     seen_claims: Vec<AnyClaim>,
     seen_certs: Vec<AnyClaim>,
     seen_deletes: Vec<AnyClaim>,
@@ -93,6 +134,26 @@ async fn put_name(
         )
             .into_response();
     }
+    if let Some(stored) = svc.stored.clone() {
+        if stored.subject != claim.subject {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "name already claimed by a different subject"})),
+            )
+                .into_response();
+        }
+        if stored.sequence >= claim.sequence {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "stale record sequence"})),
+            )
+                .into_response();
+        }
+    }
+    svc.stored = Some(StoredName {
+        subject: claim.subject.clone(),
+        sequence: claim.sequence,
+    });
     svc.seen_claims.push(claim);
     (
         StatusCode::CREATED,
@@ -108,6 +169,28 @@ async fn delete_name(
 ) -> impl IntoResponse {
     let claim: AnyClaim = serde_json::from_slice(&body).unwrap();
     let mut svc = state.lock().unwrap();
+    let Some(stored) = svc.stored.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "name not found"})),
+        )
+            .into_response();
+    };
+    if stored.subject != claim.subject {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "subject does not own this name"})),
+        )
+            .into_response();
+    }
+    if stored.sequence >= claim.sequence {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "stale record sequence"})),
+        )
+            .into_response();
+    }
+    svc.stored = None;
     svc.seen_deletes.push(claim);
     (StatusCode::OK, Json(json!({"status": "deleted"}))).into_response()
 }
@@ -118,11 +201,47 @@ async fn post_cert(
     body: Bytes,
 ) -> impl IntoResponse {
     let cert_req: AnyClaim = serde_json::from_slice(&body).unwrap();
+    let mut svc = state.lock().unwrap();
+    let Some(stored) = svc.stored.clone() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "name not found"})),
+        )
+            .into_response();
+    };
+    if stored.subject != cert_req.subject {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "subject does not own this name"})),
+        )
+            .into_response();
+    }
+    if stored.sequence >= cert_req.sequence {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "stale record sequence"})),
+        )
+            .into_response();
+    }
+    // Mirrors the real service: bump the stored sequence before the ACME
+    // round-trip so a stale/replayed request against the same sequence can't
+    // trigger a second order — see `server.ts`.
+    svc.stored = Some(StoredName {
+        sequence: cert_req.sequence,
+        ..stored
+    });
+    if svc.cert_should_fail {
+        svc.seen_certs.push(cert_req);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "acme issuance failed"})),
+        )
+            .into_response();
+    }
     // Sign the CSR with a fresh CA-style keypair so we hand back a real cert
     // chain. The mock does not validate the CSR contents beyond the parse.
     let issuance_pem = mock_issue(&cert_req.csr);
     let not_after = "2027-06-01T00:00:00Z";
-    let mut svc = state.lock().unwrap();
     svc.seen_certs.push(cert_req);
     (
         StatusCode::OK,
@@ -195,6 +314,7 @@ fn install_env_secret() -> String {
 
 #[tokio::test]
 async fn enable_happy_path_claims_and_issues_cert() {
+    let _env_lock = env_lock().await;
     let _ = install_env_secret();
     // Use Keys::Auto so the resolver picks up TINYCLOUD_KEYS_SECRET.
     let keys = Keys::Auto;
@@ -249,6 +369,7 @@ async fn enable_happy_path_claims_and_issues_cert() {
 
 #[tokio::test]
 async fn enable_surfaces_409_name_conflict_with_named_error() {
+    let _env_lock = env_lock().await;
     let _ = install_env_secret();
     let keys = Keys::Auto;
     let data_root = tempdir().unwrap();
@@ -279,6 +400,7 @@ async fn enable_surfaces_409_name_conflict_with_named_error() {
 
 #[tokio::test]
 async fn enable_surfaces_429_rate_limited_with_retry_after() {
+    let _env_lock = env_lock().await;
     let _ = install_env_secret();
     let keys = Keys::Auto;
     let data_root = tempdir().unwrap();
@@ -314,8 +436,185 @@ async fn enable_surfaces_429_rate_limited_with_retry_after() {
     );
 }
 
+/// TC-242 fix 2: a 409 must be disambiguated by its error message, not
+/// treated as a single generic conflict. Drives `LinkClient` directly against
+/// the mock's real stored-sequence tracking so both causes are exercised.
+///
+/// `LinkClient` uses blocking `reqwest` under the hood (see `client.rs`), so
+/// every call runs inside `spawn_blocking` — calling it directly from this
+/// `#[tokio::test]`'s async context panics ("cannot drop a runtime in a
+/// context where blocking is not allowed") the same way `run_enable` avoids
+/// it for `enable()`.
+#[tokio::test]
+async fn client_distinguishes_name_conflict_from_stale_sequence_on_409() {
+    let (base_url, _service) = start_mock_service(Behavior::Ok).await;
+
+    let first = NameClaimBody {
+        version: 1,
+        action: "claim",
+        name: "shared".to_string(),
+        subject: "did:key:zSubjectA".to_string(),
+        lan_ips: vec!["192.168.1.5".to_string()],
+        sequence: 1,
+        signature: "test-signature".to_string(),
+    };
+    let stale = NameClaimBody {
+        sequence: 1,
+        ..first.clone()
+    };
+    let conflicting = NameClaimBody {
+        subject: "did:key:zSubjectB".to_string(),
+        sequence: 2,
+        ..first.clone()
+    };
+
+    let (stale_err, conflict_err) = tokio::task::spawn_blocking(move || {
+        let client = LinkClient::new(base_url).unwrap();
+        client
+            .put_name_claim(&first)
+            .expect("first claim should succeed");
+
+        // Same subject, non-advancing sequence -> stale, not a name conflict.
+        let stale_err = client
+            .put_name_claim(&stale)
+            .expect_err("stale sequence must fail");
+
+        // Different subject -> name conflict, not stale.
+        let conflict_err = client
+            .put_name_claim(&conflicting)
+            .expect_err("conflicting subject must fail");
+
+        (stale_err, conflict_err)
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        matches!(stale_err, LinkError::StaleSequence { .. }),
+        "expected StaleSequence, got: {stale_err:?}"
+    );
+    assert!(
+        matches!(conflict_err, LinkError::NameConflict { .. }),
+        "expected NameConflict, got: {conflict_err:?}"
+    );
+}
+
+/// TC-242 fix 1 (blocker): the service bumps its stored sequence before the
+/// ACME round-trip, so a cert request that fails after that bump must not
+/// leave the client behind — `disable` afterward must still succeed.
+#[tokio::test]
+async fn failed_cert_then_disable_succeeds_despite_bumped_service_sequence() {
+    let _env_lock = env_lock().await;
+    let _ = install_env_secret();
+    let keys = Keys::Auto;
+    let data_root = tempdir().unwrap();
+    let data_root_path = data_root.path().to_path_buf();
+    let (base_url, service) = start_mock_service(Behavior::Ok).await;
+    service.lock().unwrap().cert_should_fail = true;
+
+    let args = EnableArgs {
+        name: "certfail".to_string(),
+        service_url: Some(base_url),
+        bind: Some("127.0.0.1:0".to_string()),
+    };
+
+    let err = match run_enable(data_root_path.clone(), keys.clone(), args).await {
+        Ok(_) => panic!("enable should have failed once cert issuance fails"),
+        Err(err) => err,
+    };
+    let rendered = format!("{err:#}");
+    if rendered.contains("no private-range LAN IPs were found on this host") {
+        eprintln!("skipping: host has no private LAN interface");
+        return;
+    }
+    assert!(
+        rendered.contains("acme issuance failed"),
+        "expected the cert POST to fail, got: {rendered}"
+    );
+
+    // The service already bumped its stored sequence before "failing" the
+    // ACME step. Persist-before-send means our local state.json must already
+    // reflect that same sequence.
+    let paths = state::LinkPaths::from_data_root(&data_root_path);
+    let persisted = state::read_state(&paths).unwrap().unwrap();
+    let server_sequence = service
+        .lock()
+        .unwrap()
+        .stored
+        .as_ref()
+        .expect("service should still have a stored record")
+        .sequence;
+    assert_eq!(
+        persisted.sequence, server_sequence,
+        "local state must not fall behind the service's already-bumped sequence"
+    );
+
+    // ... so `disable`'s DELETE (using persisted+1) must not hit a stale 409
+    // even though the service already advanced past the claim's sequence.
+    let keys_for_disable = keys.clone();
+    let data_root_for_disable = data_root_path.clone();
+    let report = tokio::task::spawn_blocking(move || {
+        disable(&data_root_for_disable, Some(&keys_for_disable))
+    })
+    .await
+    .unwrap()
+    .expect("disable must succeed even after a failed cert issuance");
+    assert!(!report.enabled);
+    assert!(!paths.state_path.exists());
+    assert!(service.lock().unwrap().stored.is_none());
+}
+
+/// TC-242 fix 1: a genuine desync (local sequence behind the service's,
+/// e.g. from a restored `state.json` backup) must be recoverable — `disable`
+/// retries once with a jumped-forward sequence after a stale-sequence 409.
+#[tokio::test]
+async fn disable_recovers_from_desynced_local_sequence_via_resync_retry() {
+    let _env_lock = env_lock().await;
+    let _ = install_env_secret();
+    let keys = Keys::Auto;
+    let data_root = tempdir().unwrap();
+    let data_root_path = data_root.path().to_path_buf();
+    let (base_url, service) = start_mock_service(Behavior::Ok).await;
+
+    let args = EnableArgs {
+        name: "desyncnode".to_string(),
+        service_url: Some(base_url),
+        bind: Some("127.0.0.1:0".to_string()),
+    };
+    let report = match run_enable(data_root_path.clone(), keys.clone(), args).await {
+        Ok(report) => report,
+        Err(err)
+            if format!("{err:#}").contains("no private-range LAN IPs were found on this host") =>
+        {
+            eprintln!("skipping: host has no private LAN interface");
+            return;
+        }
+        Err(err) => panic!("enable failed: {err:#}"),
+    };
+    assert!(report.enabled);
+
+    // Simulate desync: something (e.g. a restored backup of state.json)
+    // rewound the client's local sequence counter far behind what the
+    // service already committed.
+    let paths = state::LinkPaths::from_data_root(&data_root_path);
+    let mut stale_state = state::read_state(&paths).unwrap().unwrap();
+    stale_state.sequence = 1;
+    state::write_state(&paths, &stale_state).unwrap();
+
+    let report = tokio::task::spawn_blocking(move || disable(&data_root_path, Some(&keys)))
+        .await
+        .unwrap()
+        .expect("disable should recover from a stale-sequence 409 via the resync-jump retry");
+    assert!(!report.enabled);
+    assert!(
+        service.lock().unwrap().stored.is_none(),
+        "the resynced DELETE must still reach and clear the service's record"
+    );
+}
+
 #[tokio::test]
 async fn tls_proxy_round_trips_bytes_to_the_upstream_echo() {
+    let _env_lock = env_lock().await;
     // Upstream: a simple echo server the proxy will forward bytes into.
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_addr = echo_listener.local_addr().unwrap();
@@ -342,7 +641,7 @@ async fn tls_proxy_round_trips_bytes_to_the_upstream_echo() {
     let cert = params.self_signed(&key).unwrap();
     let cert_pem = cert.pem();
     let key_pem = key.serialize_pem();
-    let server_config = proxy::build_rustls_config(&key_pem, &cert_pem).unwrap();
+    let (server_config, _cert_resolver) = proxy::build_rustls_config(&key_pem, &cert_pem).unwrap();
 
     // Pick a bind address for the proxy.
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

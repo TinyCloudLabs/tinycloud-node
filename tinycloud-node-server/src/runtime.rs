@@ -10,6 +10,7 @@ use rocket::{
 use std::{
     net::Ipv4Addr,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use tokio::sync::watch;
 
@@ -167,6 +168,7 @@ fn spawn_link_task(
     public_api_port: u16,
     shutdown: watch::Receiver<bool>,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    let link_paths = link::state::LinkPaths::from_data_root(data_root);
     let material = match link::commands::load_tls_material(data_root) {
         Ok(Some(material)) => material,
         Ok(None) => {
@@ -183,6 +185,7 @@ fn spawn_link_task(
     let bind_addr: std::net::SocketAddr = match bind.parse() {
         Ok(addr) => addr,
         Err(err) => {
+            record_listener_bind_failure(&link_paths, &bind, &err);
             tracing::warn!(%err, %bind, "invalid link bind address; LAN listener not started");
             return None;
         }
@@ -190,13 +193,16 @@ fn spawn_link_task(
     let upstream_addr: std::net::SocketAddr = match format!("127.0.0.1:{public_api_port}").parse() {
         Ok(addr) => addr,
         Err(err) => {
+            record_listener_bind_failure(&link_paths, &bind, &err);
             tracing::warn!(%err, "invalid loopback API address; LAN listener not started");
             return None;
         }
     };
-    let server_config = match link::proxy::build_rustls_config(&key_pem, &cert_pem) {
-        Ok(cfg) => cfg,
+    let (server_config, cert_resolver) = match link::proxy::build_rustls_config(&key_pem, &cert_pem)
+    {
+        Ok(result) => result,
         Err(err) => {
+            record_listener_bind_failure(&link_paths, &bind, &err);
             tracing::warn!(%err, "failed to build TLS config; LAN listener not started");
             return None;
         }
@@ -207,10 +213,25 @@ fn spawn_link_task(
     let listener = match link::proxy::bind(bind_addr) {
         Ok(listener) => listener,
         Err(err) => {
+            record_listener_bind_failure(&link_paths, &bind, &err);
             tracing::warn!(%err, %bind_addr, "failed to bind link LAN listener; LAN listener not started");
             return None;
         }
     };
+    // Record the successful bind so `service status --json` reports the LAN
+    // listener's real state rather than inferring it from the node process
+    // being up (see docs/specs/node-control-plane-v1.md §3.9).
+    if let Err(err) = link::state::write_listener_state(
+        &link_paths,
+        &link::state::ListenerState {
+            bound: true,
+            bind_addr: Some(bind_addr.to_string()),
+            error: None,
+        },
+    ) {
+        tracing::warn!(%err, "failed to record link listener bind state");
+    }
+
     let listener_shutdown = shutdown.clone();
     let listener_task = tokio::spawn(async move {
         if let Err(err) =
@@ -225,13 +246,37 @@ fn spawn_link_task(
     let renew_data_root = data_root.to_path_buf();
     let renew_shutdown = shutdown.clone();
     tokio::spawn(async move {
-        run_link_renew_loop(renew_data_root, renew_shutdown).await;
+        run_link_renew_loop(renew_data_root, renew_shutdown, cert_resolver).await;
     });
 
     Some(listener_task)
 }
 
-async fn run_link_renew_loop(data_root: PathBuf, mut shutdown: watch::Receiver<bool>) {
+/// Record a failed bind attempt so `service status --json` can surface it
+/// instead of only ever reporting `stopped`/`running` inferred from process
+/// state.
+fn record_listener_bind_failure(
+    paths: &link::state::LinkPaths,
+    bind: &str,
+    err: &impl std::fmt::Display,
+) {
+    if let Err(write_err) = link::state::write_listener_state(
+        paths,
+        &link::state::ListenerState {
+            bound: false,
+            bind_addr: Some(bind.to_string()),
+            error: Some(err.to_string()),
+        },
+    ) {
+        tracing::warn!(%write_err, "failed to record link listener bind failure");
+    }
+}
+
+async fn run_link_renew_loop(
+    data_root: PathBuf,
+    mut shutdown: watch::Receiver<bool>,
+    cert_resolver: Arc<link::proxy::LinkCertResolver>,
+) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
     // First tick fires immediately — skip that so we don't renew on boot.
     ticker.tick().await;
@@ -245,7 +290,7 @@ async fn run_link_renew_loop(data_root: PathBuf, mut shutdown: watch::Receiver<b
                 if should_renew {
                     // Off the async runtime because commands::renew uses blocking reqwest.
                     let cloned = data_root.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
+                    let renewed = tokio::task::spawn_blocking(move || {
                         let paths = match crate::node_control::paths::Profile::discovery_order_for_host()
                             .into_iter()
                             .map(|p| p.paths())
@@ -260,15 +305,39 @@ async fn run_link_renew_loop(data_root: PathBuf, mut shutdown: watch::Receiver<b
                             Ok(cfg) => cfg,
                             Err(err) => {
                                 tracing::warn!(%err, "failed to load config for auto-renew");
-                                return;
+                                return false;
                             }
                         };
-                        if let Err(err) = crate::link::commands::renew(&cloned, Some(&config.keys)) {
-                            tracing::warn!(%err, "link auto-renew failed");
-                        } else {
-                            tracing::info!("link auto-renew succeeded");
+                        match crate::link::commands::renew(&cloned, Some(&config.keys)) {
+                            Ok(_) => {
+                                tracing::info!("link auto-renew succeeded");
+                                true
+                            }
+                            Err(err) => {
+                                tracing::warn!(%err, "link auto-renew failed");
+                                false
+                            }
                         }
                     }).await;
+
+                    // Hot-reload the LAN listener's served cert in place —
+                    // no restart required (see docs/specs/node-control-plane-v1.md §3.9).
+                    if matches!(renewed, Ok(true)) {
+                        match link::commands::load_tls_material(&data_root) {
+                            Ok(Some((_, key_pem, cert_pem))) => {
+                                match cert_resolver.update(&key_pem, &cert_pem) {
+                                    Ok(()) => tracing::info!("link LAN listener hot-reloaded renewed cert"),
+                                    Err(err) => tracing::warn!(%err, "failed to hot-reload renewed link cert"),
+                                }
+                            }
+                            Ok(None) => {
+                                tracing::warn!("link auto-renew succeeded but no state.json found; skipping cert hot-reload");
+                            }
+                            Err(err) => {
+                                tracing::warn!(%err, "failed to reload TLS material after link auto-renew");
+                            }
+                        }
+                    }
                 }
             }
         }

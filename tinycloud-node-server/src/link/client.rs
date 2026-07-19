@@ -5,8 +5,13 @@
 //!   - DELETE /v1/names/:name    delete
 //!   - POST   /v1/certs/:name    issue cert
 //!
-//! 409 name-taken and 429 rate-limited responses are surfaced as their own
-//! error variants so callers can log/return actionable messages.
+//! 409 responses are disambiguated by parsing the service's JSON error body
+//! (`{"error": "..."}`, see `names.ts`/`server.ts`) rather than treated as a
+//! single generic conflict: a 409 means either "name already claimed by a
+//! different subject" (`NameConflict`) or "stale record sequence"
+//! (`StaleSequence`) — the two have very different remediations, so callers
+//! need to be able to tell them apart. 429 rate-limited responses are
+//! likewise surfaced as their own variant.
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -140,14 +145,42 @@ fn map_error_status(
     let body = response.text().unwrap_or_default();
 
     match status {
-        StatusCode::CONFLICT => LinkError::NameConflict {
-            name: name.to_string(),
-            body,
-        },
+        StatusCode::CONFLICT => classify_conflict(name, body),
         StatusCode::TOO_MANY_REQUESTS => LinkError::RateLimited { retry_after, body },
         _ => LinkError::UnexpectedStatus {
             status: status.as_u16(),
             body,
         },
+    }
+}
+
+/// Error body shape used by every `NameError`/stale-sequence response in
+/// `server.ts`: `{"error": "<message>"}`.
+#[derive(Debug, Deserialize)]
+struct ErrorBody {
+    #[serde(default)]
+    error: String,
+}
+
+/// Disambiguate a 409 by its error message. The service only ever returns
+/// two distinct 409 causes on the endpoints this client calls: "name already
+/// claimed by a different subject" (`PUT`) and "stale record sequence"
+/// (`PUT`/`DELETE`/`POST`) — see `server.ts`. Anything else we don't
+/// recognize falls back to `NameConflict` so callers still get an actionable
+/// name-scoped error rather than a bare unexpected-status.
+fn classify_conflict(name: &str, body: String) -> LinkError {
+    let message = serde_json::from_str::<ErrorBody>(&body)
+        .map(|parsed| parsed.error)
+        .unwrap_or_default();
+    if message.contains("stale") {
+        LinkError::StaleSequence {
+            name: name.to_string(),
+            body,
+        }
+    } else {
+        LinkError::NameConflict {
+            name: name.to_string(),
+            body,
+        }
     }
 }

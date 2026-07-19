@@ -62,6 +62,11 @@ pub enum LinkError {
     NameConflict { name: String, body: String },
 
     #[error(
+        "link service rejected `{name}` for a stale sequence — local state has fallen behind the service's record: {body}"
+    )]
+    StaleSequence { name: String, body: String },
+
+    #[error(
         "link service rate-limited the request{}",
         retry_after
             .as_deref()
@@ -75,6 +80,45 @@ pub enum LinkError {
 
     #[error("link service returned unexpected status {status}: {body}")]
     UnexpectedStatus { status: u16, body: String },
+
+    #[error("{0}")]
+    InvalidName(String),
+}
+
+/// Client-side mirror of `validateNameLabel` in
+/// `tinycloud-link/src/names.ts`: lowercases and checks the DNS-label shape
+/// the service enforces. Catching this locally avoids two failure modes: a
+/// wasted round trip for an obviously-bad name, and a mixed-case name
+/// producing a CSR whose CN/SAN (built from the as-typed name) don't match
+/// what the service actually stores (it lowercases before persisting) —
+/// which `assertCsrMatchesDomain` in `names.ts` then rejects.
+///
+/// This intentionally does not port the service's reserved-name list; an
+/// attempt to claim a reserved name still fails, just remotely instead of
+/// locally.
+pub fn normalize_name_label(name: &str) -> Result<String, LinkError> {
+    let lower = name.to_ascii_lowercase();
+    if lower.len() < 3 || lower.len() > 32 {
+        return Err(LinkError::InvalidName(format!(
+            "name `{name}` must be 3-32 characters"
+        )));
+    }
+    let bytes = lower.as_bytes();
+    let is_label_char = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-';
+    let valid_shape = bytes.iter().all(|&b| is_label_char(b))
+        && bytes.first().is_some_and(|&b| b != b'-')
+        && bytes.last().is_some_and(|&b| b != b'-');
+    if !valid_shape {
+        return Err(LinkError::InvalidName(format!(
+            "name `{name}` must be a dns-safe label (lowercase letters, digits, hyphens; cannot start or end with a hyphen)"
+        )));
+    }
+    if lower.starts_with("xn--") {
+        return Err(LinkError::InvalidName(format!(
+            "name `{name}` must not be a punycode (\"xn--\") label"
+        )));
+    }
+    Ok(lower)
 }
 
 /// The client-facing FQDN a link-managed node is reachable at over LAN.
@@ -110,5 +154,30 @@ mod tests {
             body: "slow down".to_string(),
         };
         assert_eq!(err.to_string(), "link service rate-limited the request");
+    }
+
+    #[test]
+    fn normalize_name_label_lowercases_valid_names() {
+        assert_eq!(normalize_name_label("MyNode").unwrap(), "mynode");
+        assert_eq!(normalize_name_label("living-room").unwrap(), "living-room");
+    }
+
+    #[test]
+    fn normalize_name_label_rejects_bad_length() {
+        assert!(normalize_name_label("ab").is_err());
+        assert!(normalize_name_label(&"a".repeat(33)).is_err());
+    }
+
+    #[test]
+    fn normalize_name_label_rejects_bad_shape() {
+        assert!(normalize_name_label("-leading").is_err());
+        assert!(normalize_name_label("trailing-").is_err());
+        assert!(normalize_name_label("has_underscore").is_err());
+        assert!(normalize_name_label("has a space").is_err());
+    }
+
+    #[test]
+    fn normalize_name_label_rejects_punycode_prefix() {
+        assert!(normalize_name_label("xn--abc").is_err());
     }
 }

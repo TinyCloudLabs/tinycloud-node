@@ -82,6 +82,11 @@ pub struct ServiceStatus {
     pub cert_not_after: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_listener: Option<LinkListenerState>,
+    /// Set when the LAN TLS listener's last bind attempt failed — sourced
+    /// from the on-disk listener-state marker `serve` writes, not inferred
+    /// from process state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_listener_error: Option<String>,
 }
 
 /// v1-link — the observed state of the LAN TLS terminator surfaced through
@@ -217,6 +222,7 @@ pub fn default_service_status() -> ServiceStatus {
         local_url: None,
         cert_not_after: None,
         link_listener: None,
+        link_listener_error: None,
     }
 }
 
@@ -604,11 +610,21 @@ pub fn service_status_for_installed(installed: DiscoveredService) -> ServiceStat
 
     // v1-link: surface the link name / URL / cert-notAfter and listener state
     // from disk state (`state.json`) so `service status --json` can show them
-    // regardless of whether the node is currently running.
+    // regardless of whether the node is currently running. The listener
+    // state itself is sourced from the on-disk marker `serve` writes after
+    // its actual bind attempt (see `link::state::ListenerState`) rather than
+    // inferred purely from `ServiceState::Running` — a bind failure inside a
+    // running node process must still show up as not-running here.
     let link_from_disk = read_link_disk_snapshot(&paths);
     let link_listener = match (state.clone(), &link_from_disk) {
         (_, None) => Some(LinkListenerState::Disabled),
-        (ServiceState::Running, Some(_)) => Some(LinkListenerState::Running),
+        (ServiceState::Running, Some(snapshot)) => {
+            if snapshot.listener_bound == Some(true) {
+                Some(LinkListenerState::Running)
+            } else {
+                Some(LinkListenerState::Stopped)
+            }
+        }
         (_, Some(_)) => Some(LinkListenerState::Stopped),
     };
 
@@ -635,6 +651,9 @@ pub fn service_status_for_installed(installed: DiscoveredService) -> ServiceStat
             .as_ref()
             .and_then(|s| s.cert_not_after.clone()),
         link_listener,
+        link_listener_error: link_from_disk
+            .as_ref()
+            .and_then(|s| s.listener_error.clone()),
     }
 }
 
@@ -644,6 +663,10 @@ struct LinkDiskSnapshot {
     name: String,
     local_url: String,
     cert_not_after: Option<String>,
+    /// `None` if `serve` has never recorded a bind attempt (e.g. link was
+    /// just enabled and `serve` hasn't restarted yet).
+    listener_bound: Option<bool>,
+    listener_error: Option<String>,
 }
 
 fn read_link_disk_snapshot(paths: &ProfilePaths) -> Option<LinkDiskSnapshot> {
@@ -658,10 +681,16 @@ fn read_link_disk_snapshot(paths: &ProfilePaths) -> Option<LinkDiskSnapshot> {
                 .and_then(|(_, port)| port.parse().ok())
         })
         .unwrap_or(8443);
+    let link_paths = crate::link::state::LinkPaths::from_data_root(&paths.data_root);
+    let listener_state = crate::link::state::read_listener_state(&link_paths)
+        .ok()
+        .flatten();
     Some(LinkDiskSnapshot {
         name: state.name.clone(),
         local_url: crate::link::local_url(&state.name, bind_port),
         cert_not_after: state.cert_not_after,
+        listener_bound: listener_state.as_ref().map(|s| s.bound),
+        listener_error: listener_state.and_then(|s| s.error),
     })
 }
 
@@ -2422,6 +2451,7 @@ printf '%s\n' "${FAKE_PS_AGE:-29}"
             local_url: Some("https://mynode.local.tinycloud.link:8443".into()),
             cert_not_after: Some("2026-08-15T00:00:00Z".into()),
             link_listener: Some(LinkListenerState::Running),
+            link_listener_error: None,
         };
 
         let value = serde_json::to_value(status).unwrap();
