@@ -74,6 +74,7 @@ mod tests {
         ShareScope {
             share_cid: ShareCid::parse(KV_SHARE_CID).unwrap(),
             share_id: ShareId::parse("share-1").unwrap(),
+            delegation_cid: None,
             policy_cid: PolicyCid::parse(KV_POLICY_CID).unwrap(),
             node_audience: Did::parse("did:web:node.example").unwrap(),
             target_origin: TargetOrigin::parse("https://node.example").unwrap(),
@@ -98,6 +99,7 @@ mod tests {
         ShareScope {
             share_cid: ShareCid::parse(SQL_SHARE_CID).unwrap(),
             share_id: ShareId::parse("share-1").unwrap(),
+            delegation_cid: None,
             policy_cid: PolicyCid::parse(SQL_POLICY_CID).unwrap(),
             node_audience: Did::parse("did:web:node.example").unwrap(),
             target_origin: TargetOrigin::parse("https://node.example").unwrap(),
@@ -132,6 +134,7 @@ mod tests {
             scope: kv_scope(),
             holder: holder.clone(),
             credential_digest: Sha256Digest::from_bytes([0; 32]),
+            sql_statement: None,
         };
         AuthorizedRead::from_parts(
             session.clone(),
@@ -170,6 +173,11 @@ mod tests {
                         credential_digest: Sha256Digest::from_bytes([0; 32]),
                         nonce: ProtocolNonce::from_bytes([0; 32]),
                         presentation_jti: ProtocolJti::from_bytes([1; 16]),
+                        challenge_id: String::new(),
+                        challenge_request_digest: Sha256Digest::from_bytes([0; 32]),
+                        challenge_binding: serde_json::Value::Null,
+                        policy_recipient_digest: Sha256Digest::from_bytes([0; 32]),
+                        credential_expires_at: 0,
                     },
                     OffsetDateTime::UNIX_EPOCH,
                 )
@@ -249,6 +257,11 @@ mod tests {
             credential_digest: Sha256Digest::from_bytes([1; 32]),
             nonce: ProtocolNonce::from_bytes([2; 32]),
             presentation_jti: ProtocolJti::from_bytes([3; 16]),
+            challenge_id: String::new(),
+            challenge_request_digest: Sha256Digest::from_bytes([0; 32]),
+            challenge_binding: serde_json::Value::Null,
+            policy_recipient_digest: Sha256Digest::from_bytes([0; 32]),
+            credential_expires_at: 0,
         };
         assert_eq!(
             probe

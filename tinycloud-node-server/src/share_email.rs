@@ -8,12 +8,19 @@
 use async_trait::async_trait;
 use base64::{decode_config, encode_config, URL_SAFE_NO_PAD};
 use futures::io::AsyncReadExt;
-use rocket::{http::Status, response::status::Custom, serde::json::Json, State};
+use rocket::{
+    data::{Data, ToByteUnit},
+    http::Status,
+    response::status::Custom,
+    serde::json::Json,
+    State,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
+use tokio::io::AsyncReadExt as TokioAsyncReadExt;
 
 use tinycloud_auth::share_email_evidence::{IssuerKey, IssuerTrustRegistry, EMAIL_VCT};
 use tinycloud_core::{
@@ -27,14 +34,16 @@ use tinycloud_core::{
             NamedSqlRows, PinnedNamedStatement, SqlReadSource,
         },
         invitation::{
-            verify_invitation_authorization, Ed25519InvitationSigner, Ed25519InvitationVerifier,
-            InvitationSigner,
+            decode_share_url_token, issue_invitation_authorization_for,
+            verify_invitation_authorization_for, CanonicalEmail, DocumentName,
+            Ed25519InvitationSigner, Ed25519InvitationVerifier, InvitationAuthorizationInput,
+            InvitationAuthorizationReceipt, InvitationSigner, SenderTrust,
         },
         state::{AnonymousChallengeRequest, ProtocolStateRepository},
         types::{
             ContentSource, Did, DidKey, ExactResource, Path, PolicyCid,
             PolicySessionRequest as AuthorityPolicySessionRequest, ProtocolJti, ProtocolNonce,
-            SessionHandle, ShareAction, ShareScope, TargetOrigin,
+            SessionHandle, ShareAction, ShareCid, ShareId, ShareScope, TargetOrigin,
         },
         verifier::ExactEmailVerifier,
         DatabaseAuthorityBridge117, PolicyAuthorityTransaction117, PortError,
@@ -273,8 +282,11 @@ pub struct CapabilityDescriptor {
     pub origin: String,
     #[serde(rename = "returnOrigin")]
     pub return_origin: String,
-    pub routes: [&'static str; 4],
+    pub routes: [&'static str; 5],
+    #[serde(rename = "contentKinds")]
     pub content_kinds: [&'static str; 2],
+    #[serde(rename = "mailProvider")]
+    pub mail_provider: &'static str,
     pub status: &'static str,
 }
 
@@ -307,6 +319,20 @@ fn body_is_bounded<T: Serialize>(value: &T) -> bool {
     serde_json::to_vec(value)
         .map(|bytes| bytes.len() <= tinycloud_core::share_email::state::MAX_REQUEST_BODY_BYTES)
         .unwrap_or(false)
+}
+
+async fn read_bounded_json(data: Data<'_>) -> Result<Value, Custom<Json<ApiErrorBody>>> {
+    let mut bytes = Vec::new();
+    let mut reader =
+        data.open((tinycloud_core::share_email::state::MAX_REQUEST_BODY_BYTES + 1).bytes());
+    reader
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|_| error(Status::BadRequest, "invalid_content_source"))?;
+    if bytes.len() > tinycloud_core::share_email::state::MAX_REQUEST_BODY_BYTES {
+        return Err(error(Status::PayloadTooLarge, "invalid_content_source"));
+    }
+    serde_json::from_slice(&bytes).map_err(|_| error(Status::BadRequest, "invalid_content_source"))
 }
 
 #[derive(Clone)]
@@ -347,7 +373,6 @@ impl ExactKvStore for TinyCloudKvStore {
 pub struct SqlNamedStore {
     pub service: Arc<SqlService>,
     pub space_name: String,
-    pub pinned: PinnedNamedStatement,
 }
 
 #[async_trait]
@@ -357,7 +382,10 @@ impl ConstrainedNamedSqlStore for SqlNamedStore {
         source: &SqlReadSource,
         statement: &PinnedNamedStatement,
     ) -> Result<NamedSqlRows, PortError> {
-        if statement != &self.pinned || source.statement.as_str() != self.pinned.statement.name {
+        if source.statement.as_str() != statement.statement.name
+            || source.database != statement.database
+            || source.path != statement.path
+        {
             return Err(PortError::Denied);
         }
         let did = source
@@ -375,8 +403,8 @@ impl ConstrainedNamedSqlStore for SqlNamedStore {
             tables: None,
             columns: None,
             statements: Some(vec![PreparedStatement {
-                name: self.pinned.statement.name.clone(),
-                sql: self.pinned.statement.sql.clone(),
+                name: statement.statement.name.clone(),
+                sql: statement.statement.sql.clone(),
             }]),
             read_only: Some(true),
         };
@@ -427,11 +455,13 @@ impl ShareEmailRuntime {
             return_origin: self.config.return_origin.clone(),
             routes: [
                 "/share/v1/invitations/authorize",
+                "/share/v1/invitations/consume",
                 "/share/v1/policy/challenges",
                 "/share/v1/policy/session",
                 "/share/v1/read",
             ],
             content_kinds: ["kv", "sql"],
+            mail_provider: "resend",
             status: "ready",
         }
     }
@@ -464,7 +494,7 @@ pub fn compose(
         .map_err(|e| anyhow::anyhow!("issuer trust configuration: {e}"))?;
     let verifier = ExactEmailVerifier::new(
         trust,
-        config.expected_email.clone(),
+        config.issuer_did.clone(),
         OffsetDateTime::now_utc().unix_timestamp(),
         config.clock_skew_seconds,
     );
@@ -509,15 +539,11 @@ pub fn compose(
     let sql = SqlNamedStore {
         service: sql_service,
         space_name: config.space_name.clone(),
-        pinned: config.pinned_statement()?,
     };
     let data_plane = HolderBoundDataPlane::new(
         bridge.clone(),
         Arc::new(MarkdownKvAdapter::new(Arc::new(kv))),
-        Arc::new(MarkdownSqlAdapter::new(
-            Arc::new(sql.clone()),
-            sql.pinned.clone(),
-        )?),
+        Arc::new(MarkdownSqlAdapter::new(Arc::new(sql.clone()))),
     );
     Ok(Some(ShareEmailRuntime {
         state: ProtocolStateRepository::new(conn),
@@ -592,7 +618,10 @@ fn verify_did_key_signature(
     }
 }
 
-fn scope_from_request(request: &PolicyChallengeRequest) -> Result<ShareScope, ()> {
+fn scope_from_request(
+    request: &PolicyChallengeRequest,
+    config: &ShareEmailConfig,
+) -> Result<ShareScope, ()> {
     let resource = match &request.content_source {
         ContentSource::Kv { path, .. } => ExactResource::Kv { path: path.clone() },
         ContentSource::Sql {
@@ -607,6 +636,16 @@ fn scope_from_request(request: &PolicyChallengeRequest) -> Result<ShareScope, ()
         },
     };
     let expected = digest(&serde_json::to_value(&request.content_source).map_err(|_| ())?);
+    if let ContentSource::Sql {
+        arguments,
+        arguments_digest,
+        ..
+    } = &request.content_source
+    {
+        if digest(&serde_json::to_value(arguments).map_err(|_| ())?) != *arguments_digest {
+            return Err(());
+        }
+    }
     let resource_matches = match &request.content_source {
         ContentSource::Kv { path, .. } => {
             matches!(&resource, ExactResource::Kv { path: resource_path } if resource_path == path)
@@ -632,8 +671,8 @@ fn scope_from_request(request: &PolicyChallengeRequest) -> Result<ShareScope, ()
     };
     if expected != request.content_source_digest
         || !resource_matches
-        || request.target_origin.as_str() != "https://node.example"
-        || request.node_audience.as_str() != "did:web:node.example"
+        || request.target_origin.as_str() != config.target_origin
+        || request.node_audience.as_str() != config.node_audience
         || !matches!(
             (&request.action, &request.content_source),
             (ShareAction::KvGet, ContentSource::Kv { .. })
@@ -645,6 +684,7 @@ fn scope_from_request(request: &PolicyChallengeRequest) -> Result<ShareScope, ()
     Ok(ShareScope {
         share_cid: request.share_cid.clone(),
         share_id: request.share_id.clone(),
+        delegation_cid: Some(request.delegation_cid.clone()),
         policy_cid: request.policy_cid.clone(),
         node_audience: request.node_audience.clone(),
         target_origin: request.target_origin.clone(),
@@ -655,87 +695,240 @@ fn scope_from_request(request: &PolicyChallengeRequest) -> Result<ShareScope, ()
     })
 }
 
-fn scope_from_presentation(p: &PolicyPresentation) -> Result<ShareScope, ()> {
-    scope_from_request(&PolicyChallengeRequest {
-        share_cid: p.share_cid.clone(),
-        share_id: p.share_id.clone(),
-        delegation_cid: p.delegation_cid.clone(),
-        policy_cid: p.policy_cid.clone(),
-        content_source: p.content_source.clone(),
-        content_source_digest: p.content_source_digest.clone(),
-        holder_did: p.holder_did.clone(),
-        target_origin: p.target_origin.clone(),
-        node_audience: p.node_audience.clone(),
-        action: p.action,
-        resource: p.resource.clone(),
-        request_body_digest: p.request_body_digest.clone(),
-    })
+fn scope_from_presentation(
+    p: &PolicyPresentation,
+    config: &ShareEmailConfig,
+) -> Result<ShareScope, ()> {
+    scope_from_request(
+        &PolicyChallengeRequest {
+            share_cid: p.share_cid.clone(),
+            share_id: p.share_id.clone(),
+            delegation_cid: p.delegation_cid.clone(),
+            policy_cid: p.policy_cid.clone(),
+            content_source: p.content_source.clone(),
+            content_source_digest: p.content_source_digest.clone(),
+            holder_did: p.holder_did.clone(),
+            target_origin: p.target_origin.clone(),
+            node_audience: p.node_audience.clone(),
+            action: p.action,
+            resource: p.resource.clone(),
+            request_body_digest: p.request_body_digest.clone(),
+        },
+        config,
+    )
 }
 
-#[post("/share/v1/invitations/authorize", format = "json", data = "<request>")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct NodeInvitationAuthorizationRequest {
+    pub jti: ProtocolJti,
+    pub report_abuse_token: ProtocolJti,
+    pub sender_did: DidKey,
+    pub share_cid: ShareCid,
+    pub share_id: ShareId,
+    pub delegation_cid: ShareCid,
+    pub policy_cid: PolicyCid,
+    pub recipient_email: CanonicalEmail,
+    pub target_origin: TargetOrigin,
+    pub node_audience: Did,
+    pub document_name: DocumentName,
+    pub sender_trust: SenderTrust,
+    pub content_source: ContentSource,
+    pub content_source_digest: tinycloud_core::share_email::Sha256Digest,
+    pub share_expires_at: String,
+    pub request_body_digest: tinycloud_core::share_email::Sha256Digest,
+    pub share_url: String,
+    pub proof: DetachedProof,
+}
+
+#[post("/share/v1/invitations/authorize", format = "json", data = "<data>")]
 pub async fn authorize_invitation(
-    request: Json<Value>,
+    data: Data<'_>,
+    runtime: &State<Option<ShareEmailRuntime>>,
+) -> ApiResult<Value> {
+    let value = read_bounded_json(data).await?;
+    let runtime = runtime
+        .inner()
+        .as_ref()
+        .ok_or(error(Status::ServiceUnavailable, "capability_unavailable"))?;
+    let request: NodeInvitationAuthorizationRequest = serde_json::from_value(value.clone())
+        .map_err(|_| error(Status::BadRequest, "invitation_authorization_invalid"))?;
+    let mut signed_value = value;
+    signed_value
+        .as_object_mut()
+        .ok_or(error(
+            Status::BadRequest,
+            "invitation_authorization_invalid",
+        ))?
+        .remove("proof");
+    verify_did_key_signature(
+        &request.sender_did,
+        &request.proof,
+        b"xyz.tinycloud.share/invite-authorization/v1\0",
+        &signed_value,
+    )
+    .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
+    let scope_request = PolicyChallengeRequest {
+        share_cid: request.share_cid.clone(),
+        share_id: request.share_id.clone(),
+        delegation_cid: request.delegation_cid.clone(),
+        policy_cid: request.policy_cid.clone(),
+        content_source: request.content_source.clone(),
+        content_source_digest: request.content_source_digest.clone(),
+        holder_did: request.sender_did.clone(),
+        target_origin: request.target_origin.clone(),
+        node_audience: request.node_audience.clone(),
+        action: if matches!(request.content_source, ContentSource::Kv { .. }) {
+            ShareAction::KvGet
+        } else {
+            ShareAction::SqlRead
+        },
+        resource: match &request.content_source {
+            ContentSource::Kv { path, .. } | ContentSource::Sql { path, .. } => path.clone(),
+        },
+        request_body_digest: request.request_body_digest.clone(),
+    };
+    let scope = scope_from_request(&scope_request, &runtime.config)
+        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
+    let share_prefix = format!(
+        "{}/s/{}#k=",
+        runtime.config.return_origin,
+        request.share_cid.as_str()
+    );
+    let token = request
+        .share_url
+        .strip_prefix(&share_prefix)
+        .ok_or(error(Status::Forbidden, "invitation_authorization_invalid"))?;
+    decode_share_url_token(token)
+        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
+    let now = OffsetDateTime::now_utc();
+    runtime
+        .bridge
+        .validate_scope(&scope, now)
+        .await
+        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
+    runtime
+        .bridge
+        .validate_sender_for_policy(request.policy_cid.as_str(), request.sender_did.as_str())
+        .await
+        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
+    let (policy_email, policy_expiry) = runtime
+        .bridge
+        .policy_recipient_and_expiry(request.policy_cid.as_str(), now)
+        .await
+        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
+    if policy_email != request.recipient_email.as_str()
+        || request.target_origin.as_str() != runtime.config.target_origin
+        || request.node_audience.as_str() != runtime.config.node_audience
+        || OffsetDateTime::parse(&request.share_expires_at, &Rfc3339).ok() != Some(policy_expiry)
+    {
+        return Err(error(Status::Forbidden, "invitation_authorization_invalid"));
+    }
+    let receipt = issue_invitation_authorization_for(
+        InvitationAuthorizationInput {
+            jti: request.jti,
+            report_abuse_token: request.report_abuse_token,
+            sender_did: Did::parse(request.sender_did.as_str())
+                .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?,
+            share_cid: request.share_cid,
+            share_id: request.share_id,
+            policy_cid: request.policy_cid,
+            recipient_email: request.recipient_email,
+            target_origin: request.target_origin,
+            node_audience: request.node_audience,
+            document_name: request.document_name,
+            sender_trust: request.sender_trust,
+            content_source: request.content_source,
+            content_source_digest: request.content_source_digest,
+            share_expires_at: request.share_expires_at,
+            request_body_digest: request.request_body_digest,
+        },
+        &runtime.signer,
+        now,
+        TargetOrigin::parse(&runtime.config.target_origin)
+            .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?,
+        Did::parse(&runtime.config.node_audience)
+            .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?,
+        TargetOrigin::parse(&runtime.config.return_origin)
+            .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?,
+    )
+    .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
+    let auth_digest = tinycloud_core::share_email::invitation::authorization_digest(&receipt)
+        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
+    let binding = json!({
+        "authorizationDigest": auth_digest.as_str(),
+        "shareDigest": digest(&json!(receipt.authorization.share_cid.as_str())).as_str(),
+    });
+    runtime
+        .state
+        .reserve_invitation_authorization(&receipt, binding, &auth_digest, now)
+        .await
+        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
+    Ok(Json(serde_json::to_value(receipt).map_err(|_| {
+        error(Status::InternalServerError, "capability_unavailable")
+    })?))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct InvitationAuthorizationConsumption {
+    pub receipt: InvitationAuthorizationReceipt,
+}
+
+/// Consume the sender-authorized receipt after the delivery service has
+/// linked it to the invitation.  The receipt is verified against deployment
+/// configuration and the durable reservation is atomically one-use; no
+/// caller-provided binding is accepted here.
+#[post("/share/v1/invitations/consume", format = "json", data = "<data>")]
+pub async fn consume_invitation(
+    data: Data<'_>,
     runtime: &State<Option<ShareEmailRuntime>>,
 ) -> ApiResult<Value> {
     let runtime = runtime
         .inner()
         .as_ref()
         .ok_or(error(Status::ServiceUnavailable, "capability_unavailable"))?;
-    let value = request.into_inner();
-    if !body_is_bounded(&value) {
-        return Err(error(
-            Status::PayloadTooLarge,
-            "invitation_authorization_invalid",
-        ));
-    }
-    let authorization = value.get("authorization").cloned().ok_or(error(
-        Status::BadRequest,
-        "invitation_authorization_invalid",
-    ))?;
-    let outer_proof = value.get("proof").cloned().ok_or(error(
-        Status::BadRequest,
-        "invitation_authorization_invalid",
-    ))?;
-    let share_url = value.get("shareUrl").and_then(Value::as_str).ok_or(error(
-        Status::BadRequest,
-        "invitation_authorization_invalid",
-    ))?;
-    let receipt: tinycloud_core::share_email::invitation::InvitationAuthorizationReceipt =
-        serde_json::from_value(json!({"authorization": authorization, "proof": outer_proof}))
-            .map_err(|_| error(Status::BadRequest, "invitation_authorization_invalid"))?;
-    let expected_prefix = format!(
-        "https://share.tinycloud.xyz/s/{}#k=",
-        receipt.authorization.share_cid.as_str()
-    );
-    if !share_url.starts_with(&expected_prefix)
-        || share_url.len() != expected_prefix.len() + 43
-        || !share_url[expected_prefix.len()..]
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-    {
-        return Err(error(
-            Status::BadRequest,
-            "invitation_authorization_invalid",
-        ));
-    }
+    let value = read_bounded_json(data).await?;
+    let request: InvitationAuthorizationConsumption = serde_json::from_value(value)
+        .map_err(|_| error(Status::BadRequest, "invitation_authorization_invalid"))?;
     let now = OffsetDateTime::now_utc();
-    let digest = verify_invitation_authorization(&receipt, &runtime.invitation_verifier, now)
-        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
+    let target_origin = TargetOrigin::parse(runtime.config.target_origin.clone())
+        .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?;
+    let node_audience = Did::parse(runtime.config.node_audience.clone())
+        .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?;
+    let return_origin = TargetOrigin::parse(runtime.config.return_origin.clone())
+        .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?;
+    let authorization_digest_value = verify_invitation_authorization_for(
+        &request.receipt,
+        &runtime.invitation_verifier,
+        now,
+        &target_origin,
+        &node_audience,
+        &return_origin,
+    )
+    .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
     let binding = json!({
-        "authorization": &receipt.authorization,
-        "shareUrl": share_url,
+        "authorizationDigest": authorization_digest_value.as_str(),
+        "shareDigest": digest(&json!(request.receipt.authorization.share_cid.as_str())).as_str(),
     });
     runtime
         .state
-        .reserve_invitation_authorization(&receipt, binding, &digest, now)
+        .consume_invitation_authorization(
+            &request.receipt,
+            binding,
+            &authorization_digest_value,
+            now,
+        )
         .await
         .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
-    Ok(Json(json!({"status":"accepted","retryAfterSeconds":20})))
+    Ok(Json(
+        json!({"authorizationDigest": authorization_digest_value.as_str()}),
+    ))
 }
 
-#[post("/share/v1/policy/challenges", format = "json", data = "<request>")]
+#[post("/share/v1/policy/challenges", format = "json", data = "<data>")]
 pub async fn policy_challenge(
-    request: Json<PolicyChallengeRequest>,
+    data: Data<'_>,
     runtime: &State<Option<ShareEmailRuntime>>,
     client_ip: crate::routes::public::ClientIp,
 ) -> ApiResult<Value> {
@@ -743,19 +936,29 @@ pub async fn policy_challenge(
         .inner()
         .as_ref()
         .ok_or(error(Status::ServiceUnavailable, "capability_unavailable"))?;
-    let request = request.into_inner();
+    let request: PolicyChallengeRequest = serde_json::from_value(read_bounded_json(data).await?)
+        .map_err(|_| error(Status::BadRequest, "invalid_content_source"))?;
     let request_body_bytes = serde_json::to_vec(&request)
         .map_err(|_| generic("invalid_content_source"))?
         .len();
     if request_body_bytes > tinycloud_core::share_email::state::MAX_REQUEST_BODY_BYTES {
         return Err(error(Status::PayloadTooLarge, "invalid_content_source"));
     }
-    let scope = scope_from_request(&request).map_err(|_| generic("invalid_content_source"))?;
+    let scope = scope_from_request(&request, &runtime.config)
+        .map_err(|_| generic("invalid_content_source"))?;
     let now = OffsetDateTime::now_utc();
+    runtime
+        .bridge
+        .validate_scope(&scope, now)
+        .await
+        .map_err(|_| generic("policy_denied"))?;
     let challenge_id = tinycloud_core::share_email::invitation::random_protocol_nonce();
     let nonce = tinycloud_core::share_email::invitation::random_protocol_nonce();
     let expires = now + Duration::seconds(runtime.config.challenge_ttl_seconds as i64);
-    let binding = serde_json::to_value(&request).map_err(|_| generic("invalid_content_source"))?;
+    let full_binding =
+        serde_json::to_value(&request).map_err(|_| generic("invalid_content_source"))?;
+    let request_digest = digest(&full_binding);
+    let binding = json!({"requestDigest": request_digest.as_str()});
     let challenge = PolicyChallenge {
         artifact_type: "TinyCloudSharePolicyChallenge".to_owned(),
         version: 1,
@@ -780,7 +983,6 @@ pub async fn policy_challenge(
         .map_err(|_| error(Status::InternalServerError, "capability_unavailable"))?;
     let proof = sign(&runtime.signer, POLICY_CHALLENGE_DOMAIN, &challenge_value)
         .map_err(|_| error(Status::InternalServerError, "capability_unavailable"))?;
-    let request_digest = digest(&binding);
     let origin_digest = digest(&json!(scope.target_origin.as_str()));
     let ip_digest = digest(&json!(client_ip.0.to_string()));
     let share_digest = digest(&json!(scope.share_cid.as_str()));
@@ -825,22 +1027,24 @@ fn sign(
     })
 }
 
-#[post("/share/v1/policy/session", format = "json", data = "<request>")]
+#[post("/share/v1/policy/session", format = "json", data = "<data>")]
 pub async fn policy_session(
-    request: Json<PolicySessionRequest>,
+    data: Data<'_>,
     runtime: &State<Option<ShareEmailRuntime>>,
 ) -> ApiResult<Value> {
     let runtime = runtime
         .inner()
         .as_ref()
         .ok_or(error(Status::ServiceUnavailable, "capability_unavailable"))?;
-    let request = request.into_inner();
+    let request: PolicySessionRequest = serde_json::from_value(read_bounded_json(data).await?)
+        .map_err(|_| error(Status::BadRequest, "policy_denied"))?;
     if !body_is_bounded(&request) {
         return Err(error(Status::PayloadTooLarge, "policy_denied"));
     }
     let p = &request.presentation;
     let now = OffsetDateTime::now_utc();
-    let scope = scope_from_presentation(p).map_err(|_| generic("invalid_content_source"))?;
+    let scope = scope_from_presentation(p, &runtime.config)
+        .map_err(|_| generic("invalid_content_source"))?;
     let value = serde_json::to_value(p).map_err(|_| generic("invalid_holder_proof"))?;
     verify_did_key_signature(
         &p.holder_did,
@@ -862,13 +1066,20 @@ pub async fn policy_session(
     {
         return Err(error(Status::Forbidden, "policy_denied"));
     }
+    let (policy_email, policy_expiry) = runtime
+        .bridge
+        .policy_recipient_and_expiry(p.policy_cid.as_str(), now)
+        .await
+        .map_err(|_| error(Status::Forbidden, "policy_denied"))?;
     let evidence = runtime
         .verifier
         .at_time(now.unix_timestamp())
-        .verify_exact_email(
+        .verify_exact_email_for(
             request.credential.as_bytes(),
             scope.share_scope(),
             &p.holder_did,
+            &policy_email,
+            policy_expiry.unix_timestamp(),
         )
         .map_err(|_| error(Status::Forbidden, "invalid_credential_profile"))?;
     if evidence.credential_digest != p.credential_digest {
@@ -888,26 +1099,21 @@ pub async fn policy_session(
         resource: p.resource.clone(),
         request_body_digest: p.request_body_digest.clone(),
     };
-    let challenge_binding = serde_json::to_value(&challenge_binding)
+    let challenge_full_binding = serde_json::to_value(&challenge_binding)
         .map_err(|_| error(Status::Forbidden, "policy_denied"))?;
-    let challenge_digest = digest(&challenge_binding);
-    runtime
-        .state
-        .consume_anonymous_challenge_checked(
-            p.challenge_id.as_str(),
-            challenge_digest.as_str(),
-            &challenge_binding,
-            Some(digest(&json!(p.nonce.as_str())).as_str()),
-            now,
-        )
-        .await
-        .map_err(|_| error(Status::Forbidden, "policy_denied"))?;
+    let challenge_digest = digest(&challenge_full_binding);
+    let challenge_binding = json!({"requestDigest": challenge_digest.as_str()});
     let session_request = AuthorityPolicySessionRequest {
         scope: scope.clone(),
         holder: p.holder_did.clone(),
         credential_digest: p.credential_digest.clone(),
         nonce: p.nonce.clone(),
         presentation_jti: p.jti.clone(),
+        challenge_id: p.challenge_id.as_str().to_owned(),
+        challenge_request_digest: challenge_digest,
+        challenge_binding,
+        policy_recipient_digest: digest(&json!(policy_email)),
+        credential_expires_at: evidence.expires_at,
     };
     let session = runtime
         .bridge
@@ -931,7 +1137,12 @@ pub async fn policy_session(
         resource: p.resource.clone(),
         credential_digest: p.credential_digest.clone(),
         issued_at: timestamp(now),
-        expires_at: timestamp(now + Duration::seconds(300)),
+        expires_at: timestamp(
+            (now + Duration::seconds(300)).min(policy_expiry).min(
+                OffsetDateTime::from_unix_timestamp(evidence.expires_at)
+                    .map_err(|_| error(Status::Forbidden, "policy_denied"))?,
+            ),
+        ),
     };
     let session_value = serde_json::to_value(&session_wire)
         .map_err(|_| error(Status::InternalServerError, "capability_unavailable"))?;
@@ -940,16 +1151,17 @@ pub async fn policy_session(
     Ok(Json(json!({"session":session_value,"proof":proof})))
 }
 
-#[post("/share/v1/read", format = "json", data = "<request>")]
+#[post("/share/v1/read", format = "json", data = "<data>")]
 pub async fn read(
-    request: Json<ReadRequest>,
+    data: Data<'_>,
     runtime: &State<Option<ShareEmailRuntime>>,
 ) -> ApiResult<ReadResponse> {
     let runtime = runtime
         .inner()
         .as_ref()
         .ok_or(error(Status::ServiceUnavailable, "capability_unavailable"))?;
-    let request = request.into_inner();
+    let request: ReadRequest = serde_json::from_value(read_bounded_json(data).await?)
+        .map_err(|_| error(Status::BadRequest, "read_denied"))?;
     if !body_is_bounded(&request) {
         return Err(error(Status::PayloadTooLarge, "read_denied"));
     }
@@ -957,22 +1169,26 @@ pub async fn read(
     if i.artifact_type != "TinyCloudShareReadInvocation" || i.version != 1 {
         return Err(error(Status::Forbidden, "read_denied"));
     }
-    let scope = scope_from_request(&PolicyChallengeRequest {
-        share_cid: i.share_cid.clone(),
-        share_id: i.share_id.clone(),
-        delegation_cid: tinycloud_core::share_email::ShareCid::parse(i.policy_cid.as_str())
-            .map_err(|_| generic("read_denied"))?,
-        policy_cid: i.policy_cid.clone(),
-        content_source: i.content_source.clone(),
-        content_source_digest: i.content_source_digest.clone(),
-        holder_did: i.holder_did.clone(),
-        target_origin: i.target_origin.clone(),
-        node_audience: i.node_audience.clone(),
-        action: i.action,
-        resource: i.resource.clone(),
-        request_body_digest: i.request_body_digest.clone(),
-    })
+    let mut scope = scope_from_request(
+        &PolicyChallengeRequest {
+            share_cid: i.share_cid.clone(),
+            share_id: i.share_id.clone(),
+            delegation_cid: tinycloud_core::share_email::ShareCid::parse(i.policy_cid.as_str())
+                .map_err(|_| generic("read_denied"))?,
+            policy_cid: i.policy_cid.clone(),
+            content_source: i.content_source.clone(),
+            content_source_digest: i.content_source_digest.clone(),
+            holder_did: i.holder_did.clone(),
+            target_origin: i.target_origin.clone(),
+            node_audience: i.node_audience.clone(),
+            action: i.action,
+            resource: i.resource.clone(),
+            request_body_digest: i.request_body_digest.clone(),
+        },
+        &runtime.config,
+    )
     .map_err(|_| generic("read_denied"))?;
+    scope.delegation_cid = None;
     if request.session_id != i.session_id
         || request.content_source != i.content_source
         || request.content_source_digest != i.content_source_digest
@@ -1068,5 +1284,24 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::ServiceUnavailable);
+    }
+
+    #[tokio::test]
+    async fn raw_oversize_body_is_rejected_before_json_or_runtime_state() {
+        let rocket = rocket::build()
+            .mount("/", rocket::routes![authorize_invitation])
+            .manage(None::<ShareEmailRuntime>);
+        let client = Client::tracked(rocket).await.expect("Rocket client");
+        let body = format!(
+            "{}{{",
+            " ".repeat(tinycloud_core::share_email::state::MAX_REQUEST_BODY_BYTES)
+        );
+        let response = client
+            .post("/share/v1/invitations/authorize")
+            .header(rocket::http::ContentType::JSON)
+            .body(body)
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::PayloadTooLarge);
     }
 }

@@ -245,6 +245,7 @@ pub fn verify_sd_jwt(
     expected_scope: &CredentialScope<'_>,
     expected_holder: &str,
     expected_email: &str,
+    expected_issuer: &str,
     time: VerificationTime,
 ) -> Result<VerifiedEmailEvidence, EvidenceError> {
     if credential.is_empty() || credential.len() > MAX_CREDENTIAL_BYTES {
@@ -275,7 +276,7 @@ pub fn verify_sd_jwt(
     if vct != EMAIL_VCT {
         return Err(EvidenceError::Invalid);
     }
-    if issuer != OPEN_CREDENTIALS_ISSUER_DID {
+    if issuer != expected_issuer {
         return Err(EvidenceError::UntrustedIssuer);
     }
     let issuer_key = registry.active_key(issuer, vct)?;

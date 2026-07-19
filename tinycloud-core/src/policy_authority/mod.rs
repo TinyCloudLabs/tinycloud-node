@@ -68,6 +68,7 @@ const SESSION_FACTS: &[&str] = &[
     "issuanceId",
     "remainingRedelegationDepth",
     "auditProfile",
+    "recipientEmail",
 ];
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

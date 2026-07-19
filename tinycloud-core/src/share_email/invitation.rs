@@ -21,6 +21,16 @@ pub const INVITATION_AUTHORIZATION_TTL: Duration = Duration::seconds(300);
 pub const RETURN_ORIGIN: &str = "https://share.tinycloud.xyz";
 pub const MAX_INVITATION_BODY_BYTES: usize = 65_536;
 
+/// Decode the opaque share-link token without accepting alternate encodings,
+/// padding, or truncated/extended secrets.  The URL layer may add routing
+/// metadata, but this token is always exactly the frozen 32-byte value.
+pub fn decode_share_url_token(value: &str) -> Result<[u8; 32], InvitationError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value.as_bytes())
+        .map_err(|_| InvitationError::Invalid)?;
+    bytes.try_into().map_err(|_| InvitationError::Invalid)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum InvitationError {
     #[error("invalid invitation authorization")]
@@ -263,10 +273,31 @@ pub fn issue_invitation_authorization(
     signer: &dyn InvitationSigner,
     now: OffsetDateTime,
 ) -> Result<InvitationAuthorizationReceipt, InvitationError> {
+    issue_invitation_authorization_for(
+        input,
+        signer,
+        now,
+        TargetOrigin::parse("https://node.example").map_err(|_| InvitationError::Invalid)?,
+        Did::parse("did:web:node.example").map_err(|_| InvitationError::Invalid)?,
+        TargetOrigin::parse(RETURN_ORIGIN).map_err(|_| InvitationError::Invalid)?,
+    )
+}
+
+pub fn issue_invitation_authorization_for(
+    input: InvitationAuthorizationInput,
+    signer: &dyn InvitationSigner,
+    now: OffsetDateTime,
+    target_origin: TargetOrigin,
+    node_audience: Did,
+    return_origin: TargetOrigin,
+) -> Result<InvitationAuthorizationReceipt, InvitationError> {
     let issued_at = canonical_timestamp(now)?;
     let share_expires_at = parse_timestamp(&input.share_expires_at)?;
     let expires_at = (now + INVITATION_AUTHORIZATION_TTL).min(share_expires_at);
-    if expires_at <= now || input.target_origin.as_str() != "https://node.example" {
+    if expires_at <= now
+        || input.target_origin != target_origin
+        || input.node_audience != node_audience
+    {
         return Err(InvitationError::Invalid);
     }
     let authorization = InvitationAuthorization {
@@ -278,9 +309,9 @@ pub fn issue_invitation_authorization(
         share_id: input.share_id,
         policy_cid: input.policy_cid,
         recipient_email: input.recipient_email,
-        target_origin: input.target_origin,
-        node_audience: input.node_audience,
-        return_origin: TargetOrigin::parse(RETURN_ORIGIN).map_err(|_| InvitationError::Invalid)?,
+        target_origin,
+        node_audience,
+        return_origin,
         document_name: input.document_name,
         sender_trust: input.sender_trust,
         content_source: input.content_source,
@@ -290,7 +321,13 @@ pub fn issue_invitation_authorization(
         expires_at: canonical_timestamp(expires_at)?,
         report_abuse_token: input.report_abuse_token,
     };
-    validate_authorization(&authorization, now)?;
+    validate_authorization_for(
+        &authorization,
+        now,
+        &authorization.target_origin,
+        &authorization.node_audience,
+        &authorization.return_origin,
+    )?;
     let message = signed_bytes(&authorization)?;
     let signature = signer.sign(&message)?;
     if signature.len() != 64 {
@@ -311,7 +348,31 @@ pub fn verify_invitation_authorization(
     verifier: &dyn InvitationVerifier,
     now: OffsetDateTime,
 ) -> Result<Sha256Digest, InvitationError> {
-    validate_authorization(&receipt.authorization, now)?;
+    verify_invitation_authorization_for(
+        receipt,
+        verifier,
+        now,
+        &TargetOrigin::parse("https://node.example").map_err(|_| InvitationError::Invalid)?,
+        &Did::parse("did:web:node.example").map_err(|_| InvitationError::Invalid)?,
+        &TargetOrigin::parse(RETURN_ORIGIN).map_err(|_| InvitationError::Invalid)?,
+    )
+}
+
+pub fn verify_invitation_authorization_for(
+    receipt: &InvitationAuthorizationReceipt,
+    verifier: &dyn InvitationVerifier,
+    now: OffsetDateTime,
+    target_origin: &TargetOrigin,
+    node_audience: &Did,
+    return_origin: &TargetOrigin,
+) -> Result<Sha256Digest, InvitationError> {
+    validate_authorization_for(
+        &receipt.authorization,
+        now,
+        target_origin,
+        node_audience,
+        return_origin,
+    )?;
     if receipt.proof.alg != "EdDSA" {
         return Err(InvitationError::Signature);
     }
@@ -348,15 +409,18 @@ pub fn signed_bytes(value: &InvitationAuthorization) -> Result<Vec<u8>, Invitati
     Ok(bytes)
 }
 
-fn validate_authorization(
+fn validate_authorization_for(
     authorization: &InvitationAuthorization,
     now: OffsetDateTime,
+    expected_target_origin: &TargetOrigin,
+    expected_node_audience: &Did,
+    expected_return_origin: &TargetOrigin,
 ) -> Result<(), InvitationError> {
     if authorization.artifact_type != "TinyCloudShareInviteAuthorization"
         || authorization.version != 1
-        || authorization.return_origin.as_str() != RETURN_ORIGIN
-        || authorization.target_origin.as_str() != "https://node.example"
-        || authorization.node_audience.as_str() != "did:web:node.example"
+        || authorization.return_origin != *expected_return_origin
+        || authorization.target_origin != *expected_target_origin
+        || authorization.node_audience != *expected_node_audience
         || authorization.jti == authorization.report_abuse_token
     {
         return Err(InvitationError::Invalid);
@@ -373,6 +437,14 @@ fn validate_authorization(
         return Err(InvitationError::Expired);
     }
     validate_source(&authorization.content_source)?;
+    let source = serde_json::to_value(&authorization.content_source)
+        .map_err(|_| InvitationError::Invalid)?;
+    let expected_digest = Sha256Digest::from_bytes(
+        Sha256::digest(crate::policy_capability::jcs::canonicalize(&source)).into(),
+    );
+    if authorization.content_source_digest != expected_digest {
+        return Err(InvitationError::Invalid);
+    }
     Ok(())
 }
 
@@ -488,6 +560,14 @@ mod tests {
     }
 
     #[test]
+    fn share_url_token_is_exactly_32_unpadded_bytes() {
+        let token = URL_SAFE_NO_PAD.encode([7u8; 32]);
+        assert_eq!(decode_share_url_token(&token).unwrap(), [7u8; 32]);
+        assert!(decode_share_url_token(&URL_SAFE_NO_PAD.encode([7u8; 31])).is_err());
+        assert!(decode_share_url_token(&format!("{}=", token)).is_err());
+    }
+
+    #[test]
     fn authorization_signature_is_domain_separated_and_redacted() {
         let keypair = Keypair::generate_ed25519();
         let signer =
@@ -511,7 +591,20 @@ mod tests {
                     .unwrap(),
                 path: super::super::types::Path::parse("documents/plan.md").unwrap(),
             },
-            content_source_digest: Sha256Digest::from_bytes([3; 32]),
+            content_source_digest: Sha256Digest::from_bytes(
+                Sha256::digest(crate::policy_capability::jcs::canonicalize(
+                    &serde_json::to_value(&ContentSource::Kv {
+                        action: super::super::types::KvGetAction::Get,
+                        space: Did::parse(
+                            "did:pkh:eip155:1:0x1111111111111111111111111111111111111111",
+                        )
+                        .unwrap(),
+                        path: super::super::types::Path::parse("documents/plan.md").unwrap(),
+                    })
+                    .unwrap(),
+                ))
+                .into(),
+            ),
             share_expires_at: "2030-01-01T00:00:00.000Z".to_owned(),
             request_body_digest: Sha256Digest::from_bytes([4; 32]),
         };

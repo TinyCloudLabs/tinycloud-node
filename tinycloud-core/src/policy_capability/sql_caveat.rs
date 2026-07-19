@@ -4,15 +4,16 @@
 // vectors in `policy-engine/test-vectors/sql-caveat/`.
 
 use super::RejectionCode;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FixedParam {
     pub index: i64,
     pub value: Value,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConstrainedStatement {
     pub name: String,
     pub sql: String,

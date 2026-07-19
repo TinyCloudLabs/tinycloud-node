@@ -328,6 +328,41 @@ impl ProtocolStateRepository {
         Self::commit_session_body(tx, session, audit, now).await
     }
 
+    pub(crate) async fn consume_anonymous_challenge_in_transaction(
+        tx: &DatabaseTransaction,
+        challenge_id: &str,
+        request_digest: &str,
+        binding_json: &Value,
+        nonce_hash: &str,
+        now: OffsetDateTime,
+    ) -> Result<(), StateError> {
+        let row = share_anonymous_challenge::Entity::find_by_id(challenge_id)
+            .one(tx)
+            .await?
+            .ok_or(StateError::Replay)?;
+        if row.request_digest != request_digest
+            || row.binding_json != *binding_json
+            || row.nonce_hash != nonce_hash
+            || row.consumed_at.is_some()
+            || parse_timestamp(&row.expires_at)? <= now
+        {
+            return Err(StateError::Replay);
+        }
+        let changed = share_anonymous_challenge::Entity::update_many()
+            .col_expr(
+                share_anonymous_challenge::Column::ConsumedAt,
+                Expr::value(timestamp(now)?),
+            )
+            .filter(share_anonymous_challenge::Column::ChallengeId.eq(challenge_id))
+            .filter(share_anonymous_challenge::Column::ConsumedAt.is_null())
+            .exec(tx)
+            .await?;
+        if changed.rows_affected != 1 {
+            return Err(StateError::Replay);
+        }
+        Ok(())
+    }
+
     async fn commit_session_body(
         tx: &DatabaseTransaction,
         session: SessionHandleMapping,
@@ -477,6 +512,10 @@ impl ProtocolStateRepository {
             .filter(share_holder_read_jti::Column::ExpiresAt.lt(&now))
             .exec(&tx)
             .await?;
+        share_session_handle::Entity::delete_many()
+            .filter(share_session_handle::Column::ExpiresAt.lt(&now))
+            .exec(&tx)
+            .await?;
         share_email_quota::Entity::delete_many()
             .filter(share_email_quota::Column::ExpiresAt.lt(&now))
             .exec(&tx)
@@ -593,8 +632,16 @@ async fn increment_quota(
     if quota.scope_digest.is_empty() || quota.limit <= 0 {
         return Err(StateError::Invalid);
     }
-    let bucket_start = timestamp(now - QUOTA_WINDOW)?;
-    let expires_at = timestamp(now + QUOTA_WINDOW)?;
+    let bucket_seconds = QUOTA_WINDOW.whole_seconds();
+    let bucket_start = OffsetDateTime::from_unix_timestamp(
+        now.unix_timestamp().div_euclid(bucket_seconds) * bucket_seconds,
+    )
+    .map_err(|_| StateError::Invalid)?;
+    let bucket_start = timestamp(bucket_start)?;
+    let expires_at = timestamp(
+        OffsetDateTime::parse(&bucket_start, &Rfc3339).map_err(|_| StateError::Invalid)?
+            + QUOTA_WINDOW,
+    )?;
     let model = share_email_quota::ActiveModel {
         bucket_kind: Set(quota.kind.to_owned()),
         bucket_start: Set(bucket_start.clone()),

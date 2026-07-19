@@ -588,6 +588,7 @@ impl fmt::Debug for ContentSource {
 pub struct ShareScope {
     pub share_cid: ShareCid,
     pub share_id: ShareId,
+    pub delegation_cid: Option<ShareCid>,
     pub policy_cid: PolicyCid,
     pub node_audience: Did,
     pub target_origin: TargetOrigin,
@@ -624,6 +625,7 @@ pub struct CredentialVerificationEvidence {
     pub credential_subject: DidKey,
     pub disclosed_email: String,
     pub credential_digest: Sha256Digest,
+    pub expires_at: i64,
 }
 
 impl fmt::Debug for CredentialVerificationEvidence {
@@ -645,6 +647,11 @@ pub struct PolicySessionRequest {
     pub credential_digest: Sha256Digest,
     pub nonce: ProtocolNonce,
     pub presentation_jti: ProtocolJti,
+    pub challenge_id: String,
+    pub challenge_request_digest: Sha256Digest,
+    pub challenge_binding: serde_json::Value,
+    pub policy_recipient_digest: Sha256Digest,
+    pub credential_expires_at: i64,
 }
 
 impl fmt::Debug for PolicySessionRequest {
@@ -674,6 +681,7 @@ pub struct PolicySession {
     pub scope: ShareScope,
     pub holder: DidKey,
     pub credential_digest: Sha256Digest,
+    pub sql_statement: Option<crate::share_email::data_plane::PinnedNamedStatement>,
 }
 
 impl fmt::Debug for PolicySession {
@@ -824,6 +832,7 @@ mod tests {
         let scope = ShareScope {
             share_cid: ShareCid::parse(KV_SHARE_CID).unwrap(),
             share_id: ShareId::parse("share-secret-id").unwrap(),
+            delegation_cid: None,
             policy_cid: PolicyCid::parse(KV_POLICY_CID).unwrap(),
             node_audience: Did::parse("did:web:node.example").unwrap(),
             target_origin: TargetOrigin::parse("https://node.example").unwrap(),

@@ -40,7 +40,7 @@ impl VerificationMetrics {
 #[derive(Clone)]
 pub struct ExactEmailVerifier {
     issuer_trust: IssuerTrustRegistry,
-    expected_email: String,
+    issuer_did: String,
     evaluation_time: i64,
     clock_skew_seconds: i64,
     expected_credential_expiry: Option<i64>,
@@ -50,13 +50,13 @@ pub struct ExactEmailVerifier {
 impl ExactEmailVerifier {
     pub fn new(
         issuer_trust: IssuerTrustRegistry,
-        expected_email: impl Into<String>,
+        issuer_did: impl Into<String>,
         evaluation_time: i64,
         clock_skew_seconds: i64,
     ) -> Self {
         Self {
             issuer_trust,
-            expected_email: expected_email.into(),
+            issuer_did: issuer_did.into(),
             evaluation_time,
             clock_skew_seconds,
             expected_credential_expiry: None,
@@ -87,14 +87,22 @@ impl ExactEmailVerifier {
         &self.metrics
     }
 
-    pub fn verify_exact_email(
+    pub fn verify_exact_email_for(
         &self,
         credential: &[u8],
         expected_scope: &ShareScope,
         expected_holder: &DidKey,
+        expected_email: &str,
+        expected_expiry: i64,
     ) -> Result<CredentialVerificationEvidence, PortError> {
         let evidence = self
-            .verify_inner(credential, expected_scope, expected_holder)
+            .verify_inner(
+                credential,
+                expected_scope,
+                expected_holder,
+                expected_email,
+                expected_expiry,
+            )
             .map_err(|_| {
                 self.metrics.rejected.fetch_add(1, Ordering::Relaxed);
                 PortError::Denied
@@ -103,11 +111,23 @@ impl ExactEmailVerifier {
         Ok(evidence)
     }
 
+    pub fn verify_exact_email(
+        &self,
+        credential: &[u8],
+        expected_scope: &ShareScope,
+        expected_holder: &DidKey,
+    ) -> Result<CredentialVerificationEvidence, PortError> {
+        let _ = (credential, expected_scope, expected_holder);
+        Err(PortError::Denied)
+    }
+
     fn verify_inner(
         &self,
         credential: &[u8],
         expected_scope: &ShareScope,
         expected_holder: &DidKey,
+        expected_email: &str,
+        expected_expiry: i64,
     ) -> Result<CredentialVerificationEvidence, EvidenceError> {
         let scope = credential_scope(expected_scope);
         let verified = verify_sd_jwt(
@@ -115,11 +135,12 @@ impl ExactEmailVerifier {
             &self.issuer_trust,
             &scope,
             expected_holder.as_str(),
-            &self.expected_email,
+            expected_email,
+            &self.issuer_did,
             VerificationTime {
                 evaluation_time: self.evaluation_time,
                 clock_skew_seconds: self.clock_skew_seconds,
-                expected_expiry: self.expected_credential_expiry,
+                expected_expiry: Some(expected_expiry),
             },
         )?;
         convert_evidence(verified)
@@ -261,6 +282,7 @@ fn convert_evidence(
             .map_err(|_| EvidenceError::Invalid)?,
         disclosed_email: evidence.disclosed_email,
         credential_digest: Sha256Digest::from_bytes(evidence.credential_digest),
+        expires_at: evidence.expires_at,
     })
 }
 

@@ -155,6 +155,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         encryption_decrypt,
         revoke_encryption_network,
         share_email::authorize_invitation,
+        share_email::consume_invitation,
         share_email::policy_challenge,
         share_email::policy_session,
         share_email::read,
@@ -275,6 +276,21 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         Arc::new(tinycloud.clone()),
         Arc::new(sql_service.clone()),
     )?;
+    if let Some(runtime) = share_email_runtime.as_ref() {
+        let state = runtime.state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                if let Err(error) = state.cleanup(time::OffsetDateTime::now_utc()).await {
+                    ::tracing::warn!(
+                        ?error,
+                        "share-email cleanup failed; capability remains fail-closed"
+                    );
+                }
+            }
+        });
+    }
 
     #[cfg(feature = "duckdb")]
     let duckdb_service = DuckDbService::new(

@@ -61,24 +61,12 @@ pub struct ShareEmailConfig {
     pub issuer_key_version: u64,
     #[serde(default)]
     pub issuer_public_key: Option<String>,
-    #[serde(default)]
-    pub expected_email: String,
     #[serde(default = "default_share_clock_skew")]
     pub clock_skew_seconds: i64,
     #[serde(default = "default_share_challenge_ttl")]
     pub challenge_ttl_seconds: u64,
     #[serde(default = "default_share_space_name")]
     pub space_name: String,
-    #[serde(default)]
-    pub named_sql: Option<ShareEmailNamedSqlConfig>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
-pub struct ShareEmailNamedSqlConfig {
-    pub database: String,
-    pub path: String,
-    pub statement: String,
-    pub sql: String,
 }
 
 fn default_share_target_origin() -> String {
@@ -129,11 +117,9 @@ impl Default for ShareEmailConfig {
             issuer_kid: default_share_issuer_kid(),
             issuer_key_version: default_share_issuer_key_version(),
             issuer_public_key: None,
-            expected_email: String::new(),
             clock_skew_seconds: default_share_clock_skew(),
             challenge_ttl_seconds: default_share_challenge_ttl(),
             space_name: default_share_space_name(),
-            named_sql: None,
         }
     }
 }
@@ -143,13 +129,18 @@ impl ShareEmailConfig {
         if !self.enabled {
             return Ok(());
         }
-        if self.target_origin != "https://node.example"
-            || self.node_audience != "did:web:node.example"
-            || self.return_origin != "https://share.tinycloud.xyz"
+        if tinycloud_core::share_email::TargetOrigin::parse(self.target_origin.clone()).is_err()
+            || tinycloud_core::share_email::TargetOrigin::parse(self.return_origin.clone()).is_err()
+            || tinycloud_core::share_email::Did::parse(self.node_audience.clone()).is_err()
             || self.node_signing_kid != self.invitation_kid
-            || self.issuer_did != "did:web:issuer.credentials.org"
-            || self.issuer_kid != "did:web:issuer.credentials.org#email-signing-key-1"
-            || self.expected_email.is_empty()
+            || !self
+                .node_signing_kid
+                .starts_with(&format!("{}#", self.node_audience))
+            || self.issuer_did.is_empty()
+            || !self
+                .issuer_kid
+                .split_once('#')
+                .is_some_and(|(did, fragment)| did == self.issuer_did && !fragment.is_empty())
             || self.issuer_key_version == 0
             || self.clock_skew_seconds < 0
             || self.clock_skew_seconds > 300
@@ -157,37 +148,10 @@ impl ShareEmailConfig {
             || self.challenge_ttl_seconds > 120
             || self.invitation_public_key.is_none()
             || self.issuer_public_key.is_none()
-            || self.named_sql.is_none()
         {
             return Err("share email configuration is incomplete");
         }
         Ok(())
-    }
-
-    pub fn pinned_statement(
-        &self,
-    ) -> anyhow::Result<tinycloud_core::share_email::data_plane::PinnedNamedStatement> {
-        let sql = self
-            .named_sql
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("named SQL configuration is required"))?;
-        let database = tinycloud_core::share_email::DatabaseName::parse(sql.database.clone())
-            .map_err(|_| anyhow::anyhow!("invalid named SQL database"))?;
-        let path = tinycloud_core::share_email::Path::parse(sql.path.clone())
-            .map_err(|_| anyhow::anyhow!("invalid named SQL path"))?;
-        let _statement = tinycloud_core::share_email::NamedStatement::parse(sql.statement.clone())
-            .map_err(|_| anyhow::anyhow!("invalid named SQL statement"))?;
-        Ok(
-            tinycloud_core::share_email::data_plane::PinnedNamedStatement {
-                database,
-                path,
-                statement: tinycloud_core::policy_capability::sql_caveat::ConstrainedStatement {
-                    name: sql.statement.clone(),
-                    sql: sql.sql.clone(),
-                    fixed_params: Vec::new(),
-                },
-            },
-        )
     }
 }
 

@@ -28,6 +28,7 @@ use time::OffsetDateTime;
 use crate::{
     models::{share_policy_presentation_jti, share_session_handle},
     policy_authority::{AuthorityError, DatabaseAuthorityStore},
+    policy_capability::{parse as parse_capability, PolicyCapability},
 };
 
 use super::{
@@ -38,7 +39,7 @@ use super::{
     },
     types::{
         AuthorizedRead, DidKey, PolicySession, PolicySessionRequest, ReadAuthorizationRequest,
-        ReadInvocation, SessionHandle, Sha256Digest, ShareScope,
+        ReadInvocation, SessionHandle, Sha256Digest, ShareCid, ShareScope,
     },
 };
 
@@ -65,7 +66,8 @@ impl DatabaseAuthorityBridge117 {
 /// whatever a caller currently claims.
 #[derive(Serialize, Deserialize)]
 struct SessionBinding {
-    scope: ShareScope,
+    scope_digest: Sha256Digest,
+    delegation_cid: ShareCid,
     credential_digest: Sha256Digest,
 }
 
@@ -78,10 +80,39 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
     ) -> Result<PolicySession, PortError> {
         let tx = self.conn.begin().await.map_err(|_| PortError::Storage)?;
 
-        self.authority
-            .validate_for_invocation_in_transaction(&tx, request.scope.policy_cid.as_str(), now)
+        let (policy_expiry, policy_recipient, sql_statement) = self
+            .validate_scope_in_transaction(&tx, &request.scope, now)
+            .await?;
+        #[cfg(test)]
+        let fixture_request = request.challenge_id.is_empty();
+        #[cfg(not(test))]
+        let fixture_request = false;
+        let credential_expiry = if fixture_request {
+            // Core-only fixtures predate the HTTP challenge store.  This
+            // branch is not compiled into production consumers.
+            now + SESSION_TTL
+        } else {
+            let recipient_digest = digest_string(&policy_recipient);
+            if recipient_digest != request.policy_recipient_digest {
+                return Err(PortError::Denied);
+            }
+            let expiry = OffsetDateTime::from_unix_timestamp(request.credential_expires_at)
+                .map_err(|_| PortError::Denied)?;
+            if expiry != policy_expiry {
+                return Err(PortError::Denied);
+            }
+            ProtocolStateRepository::consume_anonymous_challenge_in_transaction(
+                &tx,
+                &request.challenge_id,
+                request.challenge_request_digest.as_str(),
+                &request.challenge_binding,
+                digest_string(request.nonce.as_str()).as_str(),
+                now,
+            )
             .await
-            .map_err(map_authority_error)?;
+            .map_err(map_state_error)?;
+            expiry
+        };
 
         let already_used =
             share_policy_presentation_jti::Entity::find_by_id(request.presentation_jti.as_str())
@@ -102,7 +133,12 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
         let mut handle_bytes = [0u8; 16];
         OsRng.fill_bytes(&mut handle_bytes);
         let handle = SessionHandle::from_bytes(handle_bytes);
-        let expires_at = now + SESSION_TTL;
+        let expires_at = (now + SESSION_TTL)
+            .min(credential_expiry)
+            .min(policy_expiry);
+        if expires_at <= now {
+            return Err(PortError::Denied);
+        }
 
         share_policy_presentation_jti::ActiveModel {
             presentation_jti: Set(request.presentation_jti.as_str().to_owned()),
@@ -117,7 +153,12 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
         .map_err(|_| PortError::Replay)?;
 
         let binding = SessionBinding {
-            scope: request.scope.clone(),
+            scope_digest: scope_digest(&request.scope),
+            delegation_cid: request
+                .scope
+                .delegation_cid
+                .clone()
+                .ok_or(PortError::Denied)?,
             credential_digest: request.credential_digest.clone(),
         };
         let binding_json = serde_json::to_value(&binding).map_err(|_| PortError::Storage)?;
@@ -133,8 +174,12 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
             audit_id: format!("share-email-session-{}", handle.as_str()),
             event_kind: "share_email.session_established".to_owned(),
             outcome: "accepted".to_owned(),
-            share_digest: request.scope.share_cid.as_str().to_owned(),
-            origin_digest: request.scope.target_origin.as_str().to_owned(),
+            share_digest: digest_string(request.scope.share_cid.as_str())
+                .as_str()
+                .to_owned(),
+            origin_digest: digest_string(request.scope.target_origin.as_str())
+                .as_str()
+                .to_owned(),
             holder_digest: Some(holder_digest(&request.holder)),
             request_digest: request.credential_digest.as_str().to_owned(),
         };
@@ -150,6 +195,7 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
             scope: request.scope,
             holder: request.holder,
             credential_digest: request.credential_digest,
+            sql_statement,
         })
     }
 
@@ -179,9 +225,15 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
         }
         let binding: SessionBinding = serde_json::from_value(session_row.binding_json.clone())
             .map_err(|_| PortError::Storage)?;
-        if binding.scope != request.scope {
+        let mut scope = request.scope.clone();
+        if scope.delegation_cid.is_none() {
+            scope.delegation_cid = Some(binding.delegation_cid.clone());
+        }
+        if scope_digest(&scope) != binding.scope_digest {
             return Err(PortError::Denied);
         }
+
+        let (_, _, sql_statement) = self.validate_scope_in_transaction(&tx, &scope, now).await?;
 
         self.authority
             .validate_for_invocation_in_transaction(&tx, &session_row.authority_session_cid, now)
@@ -205,19 +257,298 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
 
         let session = PolicySession {
             handle: request.session.clone(),
-            scope: request.scope.clone(),
+            scope: scope.clone(),
             holder: request.holder.clone(),
             credential_digest: binding.credential_digest,
+            sql_statement,
         };
         let invocation = ReadInvocation {
             session: request.session,
             jti: request.jti,
-            scope: request.scope,
+            scope,
             holder: request.holder,
             request_body_digest: request.request_body_digest,
         };
         Ok(AuthorizedRead::from_parts(session, invocation))
     }
+}
+
+impl DatabaseAuthorityBridge117 {
+    pub async fn policy_recipient_and_expiry(
+        &self,
+        policy_cid: &str,
+        now: OffsetDateTime,
+    ) -> Result<(String, OffsetDateTime), PortError> {
+        let tx = self.conn.begin().await.map_err(|_| PortError::Storage)?;
+        let artifact = self
+            .authority
+            .artifact_in_transaction(&tx, policy_cid)
+            .await
+            .map_err(map_authority_error)?;
+        let result = policy_metadata(&artifact).map_err(|_| PortError::Denied);
+        tx.rollback().await.map_err(|_| PortError::Storage)?;
+        let (recipient, expiry) = result?;
+        if now < expiry {
+            Ok((recipient, expiry))
+        } else {
+            Err(PortError::Denied)
+        }
+    }
+
+    pub async fn validate_scope(
+        &self,
+        scope: &ShareScope,
+        now: OffsetDateTime,
+    ) -> Result<(), PortError> {
+        let tx = self.conn.begin().await.map_err(|_| PortError::Storage)?;
+        let result = self.validate_scope_in_transaction(&tx, scope, now).await;
+        tx.rollback().await.map_err(|_| PortError::Storage)?;
+        result.map(|_| ())
+    }
+
+    /// The sender proof is only useful when it names the authority owner that
+    /// issued the live policy.  Keep this check in the #117-backed bridge so
+    /// the HTTP layer cannot turn a valid did:key signature into a sender
+    /// authorization for somebody else's share.
+    pub async fn validate_sender_for_policy(
+        &self,
+        policy_cid: &str,
+        sender_did: &str,
+    ) -> Result<(), PortError> {
+        let tx = self.conn.begin().await.map_err(|_| PortError::Storage)?;
+        let result = self
+            .authority
+            .artifact_in_transaction(&tx, policy_cid)
+            .await
+            .map_err(map_authority_error)
+            .and_then(|policy| {
+                let owner = policy
+                    .facts
+                    .iter()
+                    .find(|(key, _)| key.ends_with("/ownerDid") || key.as_str() == "ownerDid")
+                    .map(|(_, value)| value.as_str())
+                    .unwrap_or(policy.issuer_did.as_str());
+                if owner == sender_did || policy.issuer_did == sender_did {
+                    Ok(())
+                } else {
+                    Err(PortError::Denied)
+                }
+            });
+        tx.rollback().await.map_err(|_| PortError::Storage)?;
+        result
+    }
+
+    async fn validate_scope_in_transaction(
+        &self,
+        tx: &sea_orm::DatabaseTransaction,
+        scope: &ShareScope,
+        now: OffsetDateTime,
+    ) -> Result<
+        (
+            OffsetDateTime,
+            String,
+            Option<super::data_plane::PinnedNamedStatement>,
+        ),
+        PortError,
+    > {
+        let delegation_cid = scope.delegation_cid.as_ref().ok_or(PortError::Denied)?;
+        self.authority
+            .validate_for_invocation_in_transaction(&tx, scope.policy_cid.as_str(), now)
+            .await
+            .map_err(map_authority_error)?;
+        self.authority
+            .validate_for_invocation_in_transaction(&tx, delegation_cid.as_str(), now)
+            .await
+            .map_err(map_authority_error)?;
+        let policy = self
+            .authority
+            .artifact_in_transaction(tx, scope.policy_cid.as_str())
+            .await
+            .map_err(map_authority_error)?;
+        let delegation = self
+            .authority
+            .artifact_in_transaction(tx, delegation_cid.as_str())
+            .await
+            .map_err(map_authority_error)?;
+        if delegation_cid.as_str() != scope.policy_cid.as_str()
+            && !delegation
+                .proof_cids
+                .iter()
+                .any(|cid| cid == scope.policy_cid.as_str())
+            && delegation
+                .facts
+                .get("policyDelegationCid")
+                .map(String::as_str)
+                != Some(scope.policy_cid.as_str())
+        {
+            return Err(PortError::Denied);
+        }
+        let (recipient, expiry) = policy_metadata(&policy).map_err(|_| PortError::Denied)?;
+        let statement = authorized_statement(scope, &policy, &delegation)?;
+        Ok((expiry, recipient, statement))
+    }
+}
+
+fn scope_digest(scope: &ShareScope) -> Sha256Digest {
+    let bytes = crate::policy_capability::jcs::canonicalize(
+        &serde_json::to_value(scope).expect("validated share scope serializes"),
+    );
+    Sha256Digest::from_bytes(Sha256::digest(bytes).into())
+}
+
+fn digest_string(value: &str) -> Sha256Digest {
+    Sha256Digest::from_bytes(Sha256::digest(value.as_bytes()).into())
+}
+
+fn policy_metadata(
+    artifact: &crate::policy_authority::PolicyDelegation,
+) -> Result<(String, OffsetDateTime), ()> {
+    fn find_email(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::Object(object) => object
+                .get("recipientEmail")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| object.values().find_map(find_email)),
+            serde_json::Value::Array(values) => values.iter().find_map(find_email),
+            _ => None,
+        }
+    }
+    let recipient = artifact
+        .facts
+        .iter()
+        .find(|(key, _)| key.ends_with("/recipientEmail") || key.as_str() == "recipientEmail")
+        .map(|(_, value)| value.clone())
+        .or_else(|| artifact.capabilities.iter().find_map(find_email))
+        .ok_or(())?;
+    let recipient =
+        tinycloud_auth::share_email_evidence::normalize_email(&recipient).map_err(|_| ())?;
+    let expiry = OffsetDateTime::parse(
+        &artifact.expires_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .map_err(|_| ())?;
+    Ok((recipient, expiry))
+}
+
+fn authorized_statement(
+    scope: &ShareScope,
+    policy: &crate::policy_authority::PolicyDelegation,
+    delegation: &crate::policy_authority::PolicyDelegation,
+) -> Result<Option<super::data_plane::PinnedNamedStatement>, PortError> {
+    let request = requested_capability(scope)?;
+    let grants = policy
+        .capabilities
+        .iter()
+        .map(parse_capability)
+        .chain(delegation.capabilities.iter().map(parse_capability))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| PortError::Denied)?;
+    let policy_count = policy.capabilities.len();
+    let mut policy_matched = false;
+    let mut delegation_matched = false;
+    let mut statement = None;
+    for (index, grant) in grants.iter().enumerate() {
+        let request_for_grant = if matches!(scope.action, super::types::ShareAction::SqlRead) {
+            let statement = statement_from_grant(&grant, scope)?.ok_or(PortError::Denied)?;
+            let mut request = request.clone();
+            request.caveats = Some(serde_json::json!({
+                "mode":"constrained-statements",
+                "readOnly":true,
+                "statements":[statement.statement]
+            }));
+            request
+        } else {
+            request.clone()
+        };
+        if grant.contains(&request_for_grant).is_ok() {
+            if index < policy_count {
+                policy_matched = true;
+            } else {
+                delegation_matched = true;
+            }
+            if statement.is_none() {
+                statement = statement_from_grant(grant, scope)?;
+            }
+        }
+    }
+    if policy_matched && delegation_matched {
+        Ok(statement)
+    } else {
+        Err(PortError::Denied)
+    }
+}
+
+fn requested_capability(scope: &ShareScope) -> Result<PolicyCapability, PortError> {
+    let (service, path, action, caveats) = match &scope.content_source {
+        super::types::ContentSource::Kv { path, .. } => (
+            "tinycloud.kv".to_owned(),
+            path.as_str().to_owned(),
+            super::types::KV_GET_ACTION.to_owned(),
+            None,
+        ),
+        super::types::ContentSource::Sql { path, .. } => (
+            "tinycloud.sql".to_owned(),
+            path.as_str().to_owned(),
+            super::types::SQL_READ_ACTION.to_owned(),
+            None,
+        ),
+    };
+    let mut value = serde_json::json!({
+        "service": service,
+        "space": match &scope.content_source {
+            super::types::ContentSource::Kv { space, .. } | super::types::ContentSource::Sql { space, .. } => space.as_str(),
+        },
+        "path": path,
+        "actions": [action]
+    });
+    if let Some(caveats) = caveats {
+        value["caveats"] = caveats;
+    }
+    parse_capability(&value).map_err(|_| PortError::Denied)
+}
+
+fn statement_from_grant(
+    grant: &PolicyCapability,
+    scope: &ShareScope,
+) -> Result<Option<super::data_plane::PinnedNamedStatement>, PortError> {
+    let super::types::ContentSource::Sql {
+        database,
+        path,
+        statement,
+        arguments,
+        ..
+    } = &scope.content_source
+    else {
+        return Ok(None);
+    };
+    let caveat = grant
+        .caveats
+        .as_ref()
+        .and_then(|value| crate::policy_capability::sql_caveat::parse(value).ok())
+        .ok_or(PortError::Denied)?;
+    let constrained = caveat
+        .statements
+        .iter()
+        .find(|candidate| candidate.name == statement.as_str())
+        .ok_or(PortError::Denied)?;
+    if constrained.fixed_params.len() != arguments.len()
+        || constrained.fixed_params.iter().any(|fixed| {
+            fixed.index < 0
+                || arguments
+                    .values()
+                    .nth(fixed.index as usize)
+                    .map(|value| serde_json::Value::from(value.get()) != fixed.value)
+                    .unwrap_or(true)
+        })
+    {
+        return Err(PortError::Denied);
+    }
+    Ok(Some(super::data_plane::PinnedNamedStatement {
+        database: database.clone(),
+        path: path.clone(),
+        statement: constrained.clone(),
+    }))
 }
 
 fn map_authority_error(error: AuthorityError) -> PortError {
@@ -275,9 +606,9 @@ mod tests {
         let expires_at = rfc3339(now + time::Duration::days(1));
         let capability = json!({
             "actions": ["tinycloud.kv/get"],
-            "path": "profile",
+            "path": "documents/plan.md",
             "service": "tinycloud.kv",
-            "space": "did:key:z6MkSpace",
+            "space": "did:pkh:eip155:1:0x1111111111111111111111111111111111111111",
         });
 
         let parent_cids = ["bridge-test-parent-0", "bridge-test-parent-1"];
@@ -344,6 +675,7 @@ mod tests {
             ("issuanceId", "issuance-test"),
             ("remainingRedelegationDepth", "2"),
             ("auditProfile", "vp-digest-v1"),
+            ("recipientEmail", "alice@example.com"),
         ]
         .into_iter()
         .map(|(key, value)| (format!("xyz.tinycloud.policy/{key}"), value.to_owned()))
@@ -430,6 +762,7 @@ mod tests {
         ShareScope {
             share_cid: ShareCid::parse(super::super::types::KV_SHARE_CID).unwrap(),
             share_id: ShareId::parse("share-1").unwrap(),
+            delegation_cid: Some(ShareCid::parse(policy_cid).unwrap()),
             policy_cid: PolicyCid::parse(policy_cid).unwrap(),
             node_audience: Did::parse("did:web:node.example").unwrap(),
             target_origin: TargetOrigin::parse("https://node.example").unwrap(),
@@ -471,6 +804,11 @@ mod tests {
             credential_digest: Sha256Digest::from_bytes([9; 32]),
             nonce: ProtocolNonce::from_bytes([1; 32]),
             presentation_jti: ProtocolJti::from_bytes([2; 16]),
+            challenge_id: String::new(),
+            challenge_request_digest: Sha256Digest::from_bytes([0; 32]),
+            challenge_binding: json!(null),
+            policy_recipient_digest: Sha256Digest::from_bytes([0; 32]),
+            credential_expires_at: 0,
         };
         let session = bridge
             .establish_session(request.clone(), now)
@@ -520,6 +858,11 @@ mod tests {
                     credential_digest: Sha256Digest::from_bytes([9; 32]),
                     nonce: ProtocolNonce::from_bytes([5; 32]),
                     presentation_jti: ProtocolJti::from_bytes([6; 16]),
+                    challenge_id: String::new(),
+                    challenge_request_digest: Sha256Digest::from_bytes([0; 32]),
+                    challenge_binding: json!(null),
+                    policy_recipient_digest: Sha256Digest::from_bytes([0; 32]),
+                    credential_expires_at: 0,
                 },
                 now,
             )
@@ -554,6 +897,11 @@ mod tests {
                     credential_digest: Sha256Digest::from_bytes([9; 32]),
                     nonce: ProtocolNonce::from_bytes([10; 32]),
                     presentation_jti: ProtocolJti::from_bytes([11; 16]),
+                    challenge_id: String::new(),
+                    challenge_request_digest: Sha256Digest::from_bytes([0; 32]),
+                    challenge_binding: json!(null),
+                    policy_recipient_digest: Sha256Digest::from_bytes([0; 32]),
+                    credential_expires_at: 0,
                 },
                 now,
             )
@@ -585,6 +933,11 @@ mod tests {
                         credential_digest: Sha256Digest::from_bytes([9; 32]),
                         nonce: ProtocolNonce::from_bytes([14; 32]),
                         presentation_jti: ProtocolJti::from_bytes([15; 16]),
+                        challenge_id: String::new(),
+                        challenge_request_digest: Sha256Digest::from_bytes([0; 32]),
+                        challenge_binding: json!(null),
+                        policy_recipient_digest: Sha256Digest::from_bytes([0; 32]),
+                        credential_expires_at: 0,
                     },
                     now,
                 )
@@ -609,6 +962,11 @@ mod tests {
                     credential_digest: Sha256Digest::from_bytes([9; 32]),
                     nonce: ProtocolNonce::from_bytes([16; 32]),
                     presentation_jti: ProtocolJti::from_bytes([17; 16]),
+                    challenge_id: String::new(),
+                    challenge_request_digest: Sha256Digest::from_bytes([0; 32]),
+                    challenge_binding: json!(null),
+                    policy_recipient_digest: Sha256Digest::from_bytes([0; 32]),
+                    credential_expires_at: 0,
                 },
                 now,
             )

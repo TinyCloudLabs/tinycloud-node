@@ -10,6 +10,7 @@
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use libp2p::identity::PublicKey;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fmt, sync::Arc};
@@ -150,7 +151,7 @@ impl fmt::Debug for MarkdownResponse {
 /// A single immutable statement binding supplied by the #117 integration.
 /// There is intentionally no map or mutator here: a process may compose one
 /// adapter per exact source, but N3 never looks up caller-controlled SQL.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PinnedNamedStatement {
     pub database: DatabaseName,
     pub path: Path,
@@ -248,34 +249,19 @@ impl<S: ExactKvStore> KvReadAdapter for MarkdownKvAdapter<S> {
 /// one-row/one-column Markdown result shape.
 pub struct MarkdownSqlAdapter<S> {
     store: Arc<S>,
-    pinned: PinnedNamedStatement,
 }
 
 impl<S> Clone for MarkdownSqlAdapter<S> {
     fn clone(&self) -> Self {
         Self {
             store: Arc::clone(&self.store),
-            pinned: self.pinned.clone(),
         }
     }
 }
 
 impl<S> MarkdownSqlAdapter<S> {
-    pub fn new(store: Arc<S>, pinned: PinnedNamedStatement) -> Result<Self, DataPlaneError> {
-        if !pinned
-            .statement
-            .fixed_params
-            .iter()
-            .all(|param| param.index >= 0)
-            || !pinned.statement.fixed_params.iter().all(|param| {
-                !sql_caveat::looks_like_escape(param.value.as_str().unwrap_or_default())
-            })
-            || sql_caveat::contains_write_keyword(&pinned.statement.sql)
-            || sql_caveat::is_multistatement(&pinned.statement.sql)
-        {
-            return Err(DataPlaneError::InvalidSource);
-        }
-        Ok(Self { store, pinned })
+    pub fn new(store: Arc<S>) -> Self {
+        Self { store }
     }
 }
 
@@ -304,9 +290,13 @@ impl<S: ConstrainedNamedSqlStore> NamedSqlReadAdapter for MarkdownSqlAdapter<S> 
                 ExactResource::Sql { database: d, path: p, statement: s }
                     if d == database && p == path && s == statement
             )
-            || database != &self.pinned.database
-            || path != &self.pinned.path
-            || statement.as_str() != self.pinned.statement.name
+            || statement.as_str()
+                != authorized
+                    .session()
+                    .sql_statement
+                    .as_ref()
+                    .map(|s| s.statement.name.as_str())
+                    .unwrap_or_default()
         {
             return Err(PortError::Denied);
         }
@@ -321,7 +311,12 @@ impl<S: ConstrainedNamedSqlStore> NamedSqlReadAdapter for MarkdownSqlAdapter<S> 
             arguments: arguments.clone(),
             arguments_digest: arguments_digest.clone(),
         };
-        let result = self.store.execute_named(&source, &self.pinned).await?;
+        let pinned = authorized
+            .session()
+            .sql_statement
+            .as_ref()
+            .ok_or(PortError::Denied)?;
+        let result = self.store.execute_named(&source, pinned).await?;
         let [row] = result.rows.as_slice() else {
             return Err(PortError::Denied);
         };
@@ -380,7 +375,7 @@ where
             .authorize_read(request.authorization(), now)
             .await
             .map_err(DataPlaneError::from)?;
-        if authorized.session().scope != request.scope
+        if !same_scope_except_delegation(&authorized.session().scope, &request.scope)
             || authorized.session().holder != request.holder
             || authorized.invocation().jti != request.jti
             || authorized.invocation().request_body_digest != request.request_body_digest
@@ -401,6 +396,14 @@ where
         };
         response(document, &request.scope.content_source_digest)
     }
+}
+
+fn same_scope_except_delegation(left: &ShareScope, right: &ShareScope) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.delegation_cid = None;
+    right.delegation_cid = None;
+    left == right
 }
 
 fn verify_request(request: &HolderReadRequest, now: OffsetDateTime) -> Result<(), DataPlaneError> {
@@ -607,6 +610,7 @@ mod tests {
         ShareScope {
             share_cid: ShareCid::parse(KV_SHARE_CID).unwrap(),
             share_id: ShareId::parse("share-kv-001").unwrap(),
+            delegation_cid: None,
             policy_cid: PolicyCid::parse(KV_POLICY_CID).unwrap(),
             node_audience: Did::parse("did:web:node.example").unwrap(),
             target_origin: TargetOrigin::parse("https://node.example").unwrap(),

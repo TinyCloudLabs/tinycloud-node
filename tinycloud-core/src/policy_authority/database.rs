@@ -200,6 +200,15 @@ impl DatabaseAuthorityStore {
         artifact_from_model(&row)
     }
 
+    pub async fn artifact_in_transaction(
+        &self,
+        transaction: &DatabaseTransaction,
+        cid: &str,
+    ) -> Result<PolicyDelegation, AuthorityError> {
+        let row = delegation_row(transaction, cid, true).await?;
+        artifact_from_model(&row)
+    }
+
     pub async fn edges(&self, cid: &str) -> Result<Vec<VerifiedEdge>, AuthorityError> {
         policy_edge::Entity::find()
             .filter(policy_edge::Column::ChildCid.eq(cid))
