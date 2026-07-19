@@ -68,6 +68,15 @@ tracing-log = "0.2"
 tracing-opentelemetry = "0.30"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
 
+# P2 (compute-service-implementation-plan.md): the in-node WASM execution
+# backend (compute-service.md §9.1). `wat` lets the checked-in `.wat` text
+# fixtures load directly at test/run time (deterministic source, no opaque
+# binaries, no separate build step). Host functions are SYNC (no `async`
+# feature) -- host imports reach async node machinery via
+# `tokio::task::spawn_blocking` + `Handle::block_on` around the whole
+# execution, so the wasmtime call graph itself stays synchronous.
+wasmtime = { version = "27", optional = true, features = ["wat", "cranelift"] }
+
 [target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
 # Release builds cross-compile aarch64 Linux from x86_64 Linux. Vendoring
 # OpenSSL avoids needing target OpenSSL headers/libs in the runner image.
@@ -100,7 +109,7 @@ x509-parser = "0.16"
 default = []
 dstack = []
 duckdb = ["tinycloud-core/duckdb"]
-compute = ["tinycloud-core/compute"]
+compute = ["tinycloud-core/compute", "dep:wasmtime"]
 
 # P0 (compute-service-implementation-plan.md): this target only makes sense
 # with the compute feature enabled -- ComputeRequest/ComputeService don't
@@ -128,6 +137,28 @@ required-features = ["compute"]
 name = "compute_routine_key"
 path = "tests/compute_routine_key.rs"
 required-features = ["compute", "dstack"]
+
+# P2 (compute-service-implementation-plan.md): the enforcement matrix --
+# per-import allow/deny, caveat-echo, cite-all selection, allowlist, fuel,
+# epoch, memory limits, input schema, rotation tripwire, invoker-side echo.
+[[test]]
+name = "compute_execute"
+path = "tests/compute_execute.rs"
+required-features = ["compute"]
+
+# P2: the Appendix A conformance fixture end-to-end (WAT ABI, manifest,
+# denial envelope) plus the forbidden-import link-error fixture.
+[[test]]
+name = "compute_abi"
+path = "tests/compute_abi.rs"
+required-features = ["compute"]
+
+# P2: full HTTP E2E -- real deploy, invoker executes with only
+# compute/execute, asserts result + manifest + a denial + zero data caps.
+[[test]]
+name = "compute_e2e"
+path = "tests/compute_e2e.rs"
+required-features = ["compute"]
 
 # cargo-binstall support: allows `cargo binstall tinycloud-node`
 [package.metadata.binstall]

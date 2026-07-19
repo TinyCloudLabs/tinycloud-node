@@ -291,6 +291,84 @@ where
         Ok(out)
     }
 
+    /// P2 (compute-service.md §5.1/F3/F5): resolve every LIVE `D_fn` bound to
+    /// `function_cid` for `routine_did` in `space` -- "cite-all": more than
+    /// one may be valid at once (a re-mint after key rotation, two
+    /// deployers, a re-grant with wider caps). A candidate is included only
+    /// when (a) it is not directly or ancestor-revoked, (b) it is valid at
+    /// `now` (expiry/not_before window), (c) at least one ability row's
+    /// caveat names `function_cid` under `computeFunctionBinding` (§6.2/D2),
+    /// and (d) EVERY ability row's resource lives in `space` -- a resource
+    /// outside `space` on an otherwise-matching delegation is defense-in-
+    /// depth against the cross-space confused deputy (§6.2/F3) and excludes
+    /// the whole delegation, not just the offending row. Returns the
+    /// delegation hash (for the internal invocation's `parents`) paired with
+    /// its full capability list (for the manifest's "granted" set and the
+    /// authorization chain walk).
+    #[cfg(feature = "compute")]
+    pub async fn compute_select_d_fns(
+        &self,
+        space: &SpaceId,
+        routine_did: &str,
+        function_cid: &str,
+    ) -> Result<Vec<(Hash, Vec<Capability>)>, DbErr> {
+        let rows = delegation::Entity::find()
+            .filter(delegation::Column::Delegatee.eq(routine_did))
+            .find_with_related(abilities::Entity)
+            .all(&self.conn)
+            .await?;
+
+        let now = OffsetDateTime::now_utc();
+        let mut out = Vec::new();
+        for (deleg, ability_rows) in rows {
+            if deleg.expiry.map(|e| now >= e).unwrap_or(false) {
+                continue;
+            }
+            if deleg.not_before.map(|nb| now < nb).unwrap_or(false) {
+                continue;
+            }
+            if revocation::is_revoked(&self.conn, &deleg.id).await? {
+                continue;
+            }
+            match revocation::first_revoked_ancestor(&self.conn, &deleg.id).await {
+                Ok(Some(_)) => continue,
+                Ok(None) => {}
+                Err(revocation::ChainTraversalError::LimitExceeded) => continue,
+                Err(revocation::ChainTraversalError::Db(e)) => return Err(e),
+            }
+
+            let has_binding = ability_rows.iter().any(|row| {
+                row.caveats.0.values().any(|v| {
+                    v.get("computeFunctionBinding")
+                        .and_then(|b| b.get("functionCid"))
+                        .and_then(|fc| fc.as_str())
+                        == Some(function_cid)
+                })
+            });
+            if !has_binding {
+                continue;
+            }
+
+            let all_in_space = ability_rows
+                .iter()
+                .all(|row| row.resource.space().map(|s| s == space).unwrap_or(false));
+            if !all_in_space {
+                continue;
+            }
+
+            let capabilities = ability_rows
+                .into_iter()
+                .map(|row| Capability {
+                    resource: row.resource,
+                    ability: row.ability,
+                    caveats: row.caveats,
+                })
+                .collect();
+            out.push((deleg.id, capabilities));
+        }
+        Ok(out)
+    }
+
     /// Judges' item 7 (same-bytes-two-names redeploy hazard): true if some
     /// artifact row OTHER than `(service, space, exclude_name)` still has
     /// `content_hash == content_hash`. Identical bytes deployed under two

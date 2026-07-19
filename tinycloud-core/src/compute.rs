@@ -131,6 +131,67 @@ pub struct ComputeCaveats {
     pub inputs: Option<serde_json::Value>,
 }
 
+/// A single host-call journal entry (compute-service.md §9.1.1, NORMATIVE).
+/// The mediator appends one of these per host import call, successful or
+/// denied -- on the wasmtime backend the guest has no unmediated egress, so
+/// this journal IS the complete execution manifest (ground truth, not a
+/// lower bound).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManifestEntry {
+    pub resource: String,
+    pub ability: String,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    /// `"inline"` for reads/SQL, or the KV path written/deleted.
+    pub destination: String,
+    pub granted: bool,
+}
+
+/// The full execution manifest (compute-service.md §9.1.1): the per-call
+/// journal plus the granted-vs-exercised capability sets -- the concrete
+/// scope-down signal a deployer uses to tighten `D_fn` on the next deploy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Manifest {
+    pub calls: Vec<ManifestEntry>,
+    /// Distinct ability URNs granted by the selected `D_fn`(s), regardless of
+    /// whether they were ever exercised.
+    pub granted: std::collections::BTreeSet<String>,
+    /// Distinct ability URNs that appeared in at least one SUCCESSFUL
+    /// (`granted: true`) call.
+    pub exercised: std::collections::BTreeSet<String>,
+}
+
+impl Manifest {
+    pub fn record(
+        &mut self,
+        resource: String,
+        ability: String,
+        bytes_in: u64,
+        bytes_out: u64,
+        destination: String,
+        granted: bool,
+    ) {
+        if granted {
+            self.exercised.insert(ability.clone());
+        }
+        self.calls.push(ManifestEntry {
+            resource,
+            ability,
+            bytes_in,
+            bytes_out,
+            destination,
+            granted,
+        });
+    }
+
+    /// The granted-but-unexercised set (§9.1.1): the scope-down signal.
+    pub fn granted_but_unexercised(&self) -> std::collections::BTreeSet<String> {
+        self.granted.difference(&self.exercised).cloned().collect()
+    }
+}
+
 /// The self-describing `D_fn` binding caveat (compute-service.md §5.1/§6.2,
 /// DECIDED D2): `{ "computeFunctionBinding": { "functionCid": "<cid>" } }`.
 /// Pinned as a function (not inlined per call site) because the exact JSON
