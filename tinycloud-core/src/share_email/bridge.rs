@@ -241,6 +241,7 @@ impl DatabaseAuthorityBridge117 {
         .min()
         .ok_or(PortError::Denied)?;
         let root_not_before = authority_not_before_value(now)?;
+        let root_expires_at = authority_timestamp_value(expires_at)?;
         let audit = IssuanceAudit::build_verified(
             issuance_id.clone(),
             policy.artifact(),
@@ -253,7 +254,7 @@ impl DatabaseAuthorityBridge117 {
             request.credential_digest.as_str(),
             decision.decision_context_digest_hex(),
             root_not_before,
-            expires_at,
+            root_expires_at,
         )
         .map_err(map_authority_error)?;
         let mut facts = policy.artifact().facts.clone();
@@ -313,7 +314,7 @@ impl DatabaseAuthorityBridge117 {
                 enforcement.artifact().delegation_cid.clone(),
             ],
             not_before: authority_timestamp(root_not_before)?,
-            expires_at: authority_timestamp(expires_at)?,
+            expires_at: authority_timestamp(root_expires_at)?,
             delegation_mode: if enforcement
                 .artifact()
                 .fact_value("maxRedelegationDepth")
@@ -903,11 +904,13 @@ fn digest_string(value: &str) -> Sha256Digest {
 }
 
 fn authority_timestamp(value: OffsetDateTime) -> Result<String, PortError> {
-    value
-        .replace_nanosecond(0)
-        .map_err(|_| PortError::Denied)?
+    authority_timestamp_value(value)?
         .format(&Rfc3339)
         .map_err(|_| PortError::Denied)
+}
+
+fn authority_timestamp_value(value: OffsetDateTime) -> Result<OffsetDateTime, PortError> {
+    value.replace_nanosecond(0).map_err(|_| PortError::Denied)
 }
 
 fn authority_not_before_value(value: OffsetDateTime) -> Result<OffsetDateTime, PortError> {
