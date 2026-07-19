@@ -947,10 +947,19 @@ pub async fn authorize_invitation(
         b"xyz.tinycloud.share/invite-authorization/v1\0",
         &signed_value,
     )
-    .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
+    .map_err(|_| {
+        #[cfg(feature = "mounted-fixture")]
+        eprintln!("mounted authorize rejected: sender signature");
+        error(Status::Forbidden, "invitation_authorization_invalid")
+    })?;
     let authorization_body = invitation_request_body(&request);
-    verify_canonical_body_digest(&authorization_body, &request.request_body_digest)
-        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
+    verify_canonical_body_digest(&authorization_body, &request.request_body_digest).map_err(
+        |_| {
+            #[cfg(feature = "mounted-fixture")]
+            eprintln!("mounted authorize rejected: request body digest");
+            error(Status::Forbidden, "invitation_authorization_invalid")
+        },
+    )?;
     let scope_request = PolicyChallengeRequest {
         share_cid: request.share_cid.clone(),
         share_id: request.share_id.clone(),
@@ -973,14 +982,21 @@ pub async fn authorize_invitation(
         },
         request_body_digest: request.request_body_digest.clone(),
     };
-    let scope = scope_from_request(&scope_request, &runtime.config)
-        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
+    let scope = scope_from_request(&scope_request, &runtime.config).map_err(|_| {
+        #[cfg(feature = "mounted-fixture")]
+        eprintln!("mounted authorize rejected: scope");
+        error(Status::Forbidden, "invitation_authorization_invalid")
+    })?;
     let now = OffsetDateTime::now_utc();
     runtime
         .bridge
         .validate_scope(&scope, now)
         .await
-        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
+        .map_err(|error| {
+            #[cfg(feature = "mounted-fixture")]
+            eprintln!("mounted authorize rejected: bridge scope: {error:?}");
+            error(Status::Forbidden, "invitation_authorization_invalid")
+        })?;
     runtime
         .bridge
         .validate_sender_for_policy(
@@ -991,7 +1007,11 @@ pub async fn authorize_invitation(
             request.sender_did.as_str(),
         )
         .await
-        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
+        .map_err(|error| {
+            #[cfg(feature = "mounted-fixture")]
+            eprintln!("mounted authorize rejected: sender policy: {error:?}");
+            error(Status::Forbidden, "invitation_authorization_invalid")
+        })?;
     let (policy_email, policy_expiry) = runtime
         .bridge
         .policy_recipient_and_expiry(
@@ -1002,12 +1022,18 @@ pub async fn authorize_invitation(
             now,
         )
         .await
-        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
+        .map_err(|error| {
+            #[cfg(feature = "mounted-fixture")]
+            eprintln!("mounted authorize rejected: policy metadata: {error:?}");
+            error(Status::Forbidden, "invitation_authorization_invalid")
+        })?;
     if policy_email != request.recipient_email.as_str()
         || request.target_origin.as_str() != runtime.config.target_origin
         || request.node_audience.as_str() != runtime.config.node_audience
         || OffsetDateTime::parse(&request.share_expires_at, &Rfc3339).ok() != Some(policy_expiry)
     {
+        #[cfg(feature = "mounted-fixture")]
+        eprintln!("mounted authorize rejected: policy tuple");
         return Err(error(Status::Forbidden, "invitation_authorization_invalid"));
     }
     let receipt = issue_invitation_authorization_for(
