@@ -21,12 +21,12 @@ pub mod types;
 pub mod util;
 pub mod write_hooks;
 
+#[cfg(feature = "compute")]
+pub use db::ComputeDeployError;
 pub use db::{
     Commit, DelegationStatus, InvocationOutcome, KvInvokeOptions, KvPrecondition, SpaceDatabase,
     TransactResult, TxError, TxStoreError,
 };
-#[cfg(feature = "compute")]
-pub use db::ComputeDeployError;
 pub use encryption::ColumnEncryption;
 pub use libp2p;
 pub use sea_orm;

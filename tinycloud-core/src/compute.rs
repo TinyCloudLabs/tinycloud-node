@@ -71,9 +71,9 @@ pub enum ComputeRequest {
         function: String,
         #[serde(default)]
         wasm_b64: Option<String>,
-        /// Encoded D_fn delegation header (MVP transport, §7.2/C7: JSON body
-        /// + base64 WASM + an INLINE encoded `D_fn` only -- raw streaming
-        /// and pre-submitted grant CIDs are deferred).
+        /// Encoded D_fn delegation header. MVP transport (§7.2/C7): a JSON
+        /// body carrying base64 WASM and an INLINE encoded `D_fn` only; raw
+        /// streaming and pre-submitted grant CIDs are deferred.
         #[serde(default)]
         grant: Option<String>,
         /// Caveats for the deployed function -- the normative, fielded
@@ -278,7 +278,9 @@ pub struct ComputeService {
 
 impl ComputeService {
     pub fn new(routine_key_deriver: Arc<dyn RoutineKeyDeriver>) -> Self {
-        Self { routine_key_deriver }
+        Self {
+            routine_key_deriver,
+        }
     }
 
     pub fn routine_key_deriver(&self) -> &Arc<dyn RoutineKeyDeriver> {
@@ -354,14 +356,18 @@ mod tests {
 
     #[test]
     fn compute_service_holds_an_injected_routine_key_deriver() {
-        let deriver: Arc<dyn RoutineKeyDeriver> =
-            Arc::new(ClassicRoutineKeyDeriver::new(StaticSecret::new(vec![7u8; 32]).unwrap()));
+        let deriver: Arc<dyn RoutineKeyDeriver> = Arc::new(ClassicRoutineKeyDeriver::new(
+            StaticSecret::new(vec![7u8; 32]).unwrap(),
+        ));
         let service = ComputeService::new(deriver);
         let _ = service.routine_key_deriver();
     }
 
     fn test_space_id(name: &str) -> SpaceId {
-        use tinycloud_auth::{resolver::DID_METHODS, ssi::{dids::DIDBuf, jwk::JWK}};
+        use tinycloud_auth::{
+            resolver::DID_METHODS,
+            ssi::{dids::DIDBuf, jwk::JWK},
+        };
         let jwk = JWK::generate_ed25519().unwrap();
         let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
         SpaceId::new(did, name.parse().unwrap())
@@ -373,9 +379,18 @@ mod tests {
         let deriver = ClassicRoutineKeyDeriver::new(secret);
         let space = test_space_id("routine-key-determinism");
 
-        let did1 = deriver.derive_routine_did(&space, "bafyfunctioncid").await.unwrap();
-        let did2 = deriver.derive_routine_did(&space, "bafyfunctioncid").await.unwrap();
-        assert_eq!(did1, did2, "same (space, function_cid) must derive the same routine_did");
+        let did1 = deriver
+            .derive_routine_did(&space, "bafyfunctioncid")
+            .await
+            .unwrap();
+        let did2 = deriver
+            .derive_routine_did(&space, "bafyfunctioncid")
+            .await
+            .unwrap();
+        assert_eq!(
+            did1, did2,
+            "same (space, function_cid) must derive the same routine_did"
+        );
         assert!(did1.starts_with("did:key:"));
     }
 
@@ -406,7 +421,10 @@ mod tests {
         // naive concat: space_a + "/" + "space" + cid == space_b + cid
         let naive_a = format!("{space_a}/space{cid}");
         let naive_b = format!("{space_b}{cid}");
-        assert_eq!(naive_a, naive_b, "sanity: the naive concatenation DOES collide");
+        assert_eq!(
+            naive_a, naive_b,
+            "sanity: the naive concatenation DOES collide"
+        );
 
         let hash_a = super::hash(space_a.as_bytes());
         let hash_b = super::hash(space_b.as_bytes());

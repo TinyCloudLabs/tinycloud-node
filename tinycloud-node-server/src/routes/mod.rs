@@ -30,12 +30,12 @@ use crate::{
 };
 #[cfg(feature = "compute")]
 use tinycloud_core::compute::{ComputeRequest, ComputeService};
-#[cfg(feature = "compute")]
-use tinycloud_core::events::Delegation;
 #[cfg(feature = "duckdb")]
 use tinycloud_core::duckdb::{
     DuckDbCaveats, DuckDbError, DuckDbRequest, DuckDbResponse, DuckDbService,
 };
+#[cfg(feature = "compute")]
+use tinycloud_core::events::Delegation;
 use tinycloud_core::{
     encryption_network::EncryptionService,
     events::Invocation,
@@ -2216,14 +2216,16 @@ fn compute_resource(
         ),
         None => None,
     };
-    Ok(Resource::TinyCloud(space.clone().to_resource(
-        "compute"
-            .parse()
-            .expect("`compute` is a valid service segment"),
-        path,
-        None,
-        None,
-    )))
+    Ok(Resource::TinyCloud(
+        space.clone().to_resource(
+            "compute"
+                .parse()
+                .expect("`compute` is a valid service segment"),
+            path,
+            None,
+            None,
+        ),
+    ))
 }
 
 /// **Judge finding (security): scope selection.** Select the SINGLE
@@ -2239,6 +2241,7 @@ fn compute_resource(
 ///   2. build the body's target resource `<space>/compute/<function-path>`;
 ///   3. require a presented cap that BOTH `extends`-covers that resource AND
 ///      `ability_matches` the variant's required ability (§7.1 erratum, C1).
+///
 /// A cap that satisfies the ability but does not cover the body's function
 /// resource (wrong function, wrong space) fails closed with `403`.
 #[cfg(feature = "compute")]
@@ -2280,19 +2283,23 @@ fn select_compute_scope<'a>(
     // satisfies the variant's required ability. This is the confused-deputy
     // fix: coverage is checked against THIS body's resource, not aggregated
     // across every presented cap.
-    let covered = caps.iter().try_fold(false, |acc, (cap_space, cap_path, ability)| {
-        if acc {
-            return Ok(true);
-        }
-        let cap_resource = compute_resource(cap_space, cap_path.as_deref())?;
-        let ability_ok =
-            tinycloud_core::policy_capability::ability_matches(ability.as_str(), required_ability);
-        let resource_ok = match (&target_resource, &cap_resource) {
-            (Resource::TinyCloud(t), Resource::TinyCloud(c)) => t.extends(c).is_ok(),
-            _ => false,
-        };
-        Ok::<bool, (Status, String)>(ability_ok && resource_ok)
-    })?;
+    let covered = caps
+        .iter()
+        .try_fold(false, |acc, (cap_space, cap_path, ability)| {
+            if acc {
+                return Ok(true);
+            }
+            let cap_resource = compute_resource(cap_space, cap_path.as_deref())?;
+            let ability_ok = tinycloud_core::policy_capability::ability_matches(
+                ability.as_str(),
+                required_ability,
+            );
+            let resource_ok = match (&target_resource, &cap_resource) {
+                (Resource::TinyCloud(t), Resource::TinyCloud(c)) => t.extends(c).is_ok(),
+                _ => false,
+            };
+            Ok::<bool, (Status, String)>(ability_ok && resource_ok)
+        })?;
 
     if !covered {
         // Mirror the node's established "Unauthorized Action: {resource} /
@@ -2480,10 +2487,9 @@ async fn handle_compute_deploy(
     // ordinary `SerializedEvent<DelegationInfo>` (signature is verified, the
     // chain is authorized, and per-ability caveats -- including the
     // `computeFunctionBinding` -- are persisted, all inside the transaction).
-    let delegation = Delegation::from_header_ser::<
-        tinycloud_auth::authorization::TinyCloudDelegation,
-    >(&grant)
-    .map_err(|e| (Status::BadRequest, format!("invalid D_fn grant: {e}")))?;
+    let delegation =
+        Delegation::from_header_ser::<tinycloud_auth::authorization::TinyCloudDelegation>(&grant)
+            .map_err(|e| (Status::BadRequest, format!("invalid D_fn grant: {e}")))?;
 
     let space_id = space.to_string();
     let (_result, artifact, previous_content_hash) = tinycloud
@@ -2561,9 +2567,13 @@ async fn revoke_superseded_compute_grant(
     space: &tinycloud_auth::resource::SpaceId,
     previous_content_hash: &str,
 ) {
-    if let Err(error) =
-        try_revoke_superseded_compute_grant(tinycloud, compute_service, space, previous_content_hash)
-            .await
+    if let Err(error) = try_revoke_superseded_compute_grant(
+        tinycloud,
+        compute_service,
+        space,
+        previous_content_hash,
+    )
+    .await
     {
         ::tracing::warn!(
             previous_content_hash,
@@ -2596,8 +2606,8 @@ async fn try_revoke_superseded_compute_grant(
         .derive_routine_seed(space, previous_content_hash)
         .await
         .map_err(|e| e.to_string())?;
-    let routine_did = tinycloud_core::compute::routine_did_from_seed(seed)
-        .map_err(|e| e.to_string())?;
+    let routine_did =
+        tinycloud_core::compute::routine_did_from_seed(seed).map_err(|e| e.to_string())?;
     let routine_jwk =
         tinycloud_core::compute::routine_jwk_from_seed(seed).map_err(|e| e.to_string())?;
     let routine_vm = format!(
@@ -2642,7 +2652,9 @@ async fn try_revoke_superseded_compute_grant(
             issuer: routine_vm
                 .parse::<DIDURLBuf>()
                 .map_err(|e| format!("{e:?}"))?,
-            audience: routine_did.parse::<DIDBuf>().map_err(|e| format!("{e:?}"))?,
+            audience: routine_did
+                .parse::<DIDBuf>()
+                .map_err(|e| format!("{e:?}"))?,
             not_before: None,
             expiration: NumericDate::try_from_seconds(4_102_444_800.0)
                 .map_err(|e| format!("{e:?}"))?,
@@ -4263,11 +4275,11 @@ mod tests {
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
         #[cfg(feature = "compute")]
-        let rocket = rocket.manage(tinycloud_core::compute::ComputeService::new(std::sync::Arc::new(
-            tinycloud_core::compute::ClassicRoutineKeyDeriver::new(
+        let rocket = rocket.manage(tinycloud_core::compute::ComputeService::new(
+            std::sync::Arc::new(tinycloud_core::compute::ClassicRoutineKeyDeriver::new(
                 tinycloud_core::keys::StaticSecret::new(vec![9u8; 32]).unwrap(),
-            ),
-        )));
+            )),
+        ));
 
         let client = Client::tracked(rocket).await?;
         let response = client
@@ -4524,11 +4536,11 @@ mod tests {
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
         #[cfg(feature = "compute")]
-        let rocket = rocket.manage(tinycloud_core::compute::ComputeService::new(std::sync::Arc::new(
-            tinycloud_core::compute::ClassicRoutineKeyDeriver::new(
+        let rocket = rocket.manage(tinycloud_core::compute::ComputeService::new(
+            std::sync::Arc::new(tinycloud_core::compute::ClassicRoutineKeyDeriver::new(
                 tinycloud_core::keys::StaticSecret::new(vec![9u8; 32]).unwrap(),
-            ),
-        )));
+            )),
+        ));
 
         let client = Client::tracked(rocket).await?;
         let response = client
@@ -5937,11 +5949,11 @@ mod tests {
             .manage(HookRuntime::new(HooksConfig::default(), [9u8; 32]))
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
         #[cfg(feature = "compute")]
-        let rocket = rocket.manage(tinycloud_core::compute::ComputeService::new(std::sync::Arc::new(
-            tinycloud_core::compute::ClassicRoutineKeyDeriver::new(
+        let rocket = rocket.manage(tinycloud_core::compute::ComputeService::new(
+            std::sync::Arc::new(tinycloud_core::compute::ClassicRoutineKeyDeriver::new(
                 tinycloud_core::keys::StaticSecret::new(vec![9u8; 32]).unwrap(),
-            ),
-        )));
+            )),
+        ));
         rocket
     }
 

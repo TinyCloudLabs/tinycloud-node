@@ -29,8 +29,7 @@ use tinycloud_auth::{
     ssi::{dids::DIDBuf, jwk::JWK},
 };
 use tinycloud_core::compute::{
-    routine_did_from_seed, routine_key_derivation_path, ClassicRoutineKeyDeriver,
-    RoutineKeyDeriver,
+    routine_did_from_seed, routine_key_derivation_path, ClassicRoutineKeyDeriver, RoutineKeyDeriver,
 };
 use tinycloud_core::keys::StaticSecret;
 
@@ -65,7 +64,10 @@ async fn did_differs_by_function_cid_within_one_space() {
     let s = space("per-function");
     let a = d.derive_routine_did(&s, "bafyAAA").await.unwrap();
     let b = d.derive_routine_did(&s, "bafyBBB").await.unwrap();
-    assert_ne!(a, b, "distinct function CIDs must derive distinct routine dids");
+    assert_ne!(
+        a, b,
+        "distinct function CIDs must derive distinct routine dids"
+    );
 }
 
 #[tokio::test]
@@ -76,8 +78,14 @@ async fn did_differs_by_space_for_one_function_cid() {
     let d = deriver();
     let space_a = space("space-a");
     let space_b = space("space-b");
-    let did_a = d.derive_routine_did(&space_a, "bafySharedCID").await.unwrap();
-    let did_b = d.derive_routine_did(&space_b, "bafySharedCID").await.unwrap();
+    let did_a = d
+        .derive_routine_did(&space_a, "bafySharedCID")
+        .await
+        .unwrap();
+    let did_b = d
+        .derive_routine_did(&space_b, "bafySharedCID")
+        .await
+        .unwrap();
     assert_ne!(did_a, did_b);
 }
 
@@ -105,7 +113,10 @@ async fn hashed_space_never_collides_with_adversarial_delimiters() {
     );
     // And the derived dids differ.
     let did1 = d.derive_routine_did(&s1, "y").await.unwrap();
-    let did2 = d.derive_routine_did(&s2, "compute/x/compute/y").await.unwrap();
+    let did2 = d
+        .derive_routine_did(&s2, "compute/x/compute/y")
+        .await
+        .unwrap();
     assert_ne!(did1, did2);
 }
 

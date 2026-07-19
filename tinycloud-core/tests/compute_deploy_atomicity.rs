@@ -104,22 +104,26 @@ async fn make_db(sizes: SqlSizes) -> (Db, DatabaseConnection) {
     // File-backed sqlite so the test's cloned connection and the
     // SpaceDatabase share one on-disk DB (an injected `DROP TABLE` on one is
     // visible to the other). `sqlite::memory:` would give separate DBs.
-    let tempfile = std::env::temp_dir().join(format!(
-        "tc-compute-atomicity-{}.db",
-        uuid_like()
-    ));
+    let tempfile = std::env::temp_dir().join(format!("tc-compute-atomicity-{}.db", uuid_like()));
     let url = format!("sqlite:{}?mode=rwc", tempfile.display());
     let conn = Database::connect(&url).await.unwrap();
-    let db = SpaceDatabase::new(conn.clone(), MemoryStore::default(), StaticSecret::new(vec![5u8; 32]).unwrap())
-        .await
-        .unwrap()
-        .with_sql_sizes(sizes);
+    let db = SpaceDatabase::new(
+        conn.clone(),
+        MemoryStore::default(),
+        StaticSecret::new(vec![5u8; 32]).unwrap(),
+    )
+    .await
+    .unwrap()
+    .with_sql_sizes(sizes);
     (db, conn)
 }
 
 fn uuid_like() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     format!("{n}")
 }
 
@@ -137,11 +141,13 @@ async fn artifact_failure_rolls_back_the_delegation_and_leaves_mirror_untouched(
     let dfn1 = mint_d_fn(&owner, &routine1, &cid1, "urn:uuid:atom-1");
     // NB: `ComputeDeployError` cannot be `{:?}`-formatted (its `K = StaticSecret`
     // deliberately has no `Debug`), so we match rather than `.expect(...)`.
-    let (_result, artifact, previous) =
-        match db.deploy_compute_function(dfn1, &space_str, "fn", wasm1.clone()).await {
-            Ok(ok) => ok,
-            Err(_) => panic!("baseline deploy must succeed"),
-        };
+    let (_result, artifact, previous) = match db
+        .deploy_compute_function(dfn1, &space_str, "fn", wasm1.clone())
+        .await
+    {
+        Ok(ok) => ok,
+        Err(_) => panic!("baseline deploy must succeed"),
+    };
     assert!(previous.is_none(), "first deploy has no predecessor");
 
     let baseline = db
@@ -170,7 +176,10 @@ async fn artifact_failure_rolls_back_the_delegation_and_leaves_mirror_untouched(
     let cid2 = tinycloud_core::hash::hash(&wasm2).to_cid(0x55).to_string();
     let routine2 = random_did();
     let dfn2 = mint_d_fn(&owner, &routine2, &cid2, "urn:uuid:atom-2");
-    match db.deploy_compute_function(dfn2, &space_str, "fn2", wasm2).await {
+    match db
+        .deploy_compute_function(dfn2, &space_str, "fn2", wasm2)
+        .await
+    {
         Err(ComputeDeployError::Artifact(_)) => {}
         Err(_) => panic!("expected an artifact error, got a different ComputeDeployError"),
         Ok(_) => panic!("artifact save must fail with the table dropped"),
@@ -194,5 +203,8 @@ async fn artifact_failure_rolls_back_the_delegation_and_leaves_mirror_untouched(
         .await
         .unwrap()
         .expect("store_size still reflects the baseline");
-    assert_eq!(after, baseline, "a rolled-back deploy must not bump the size mirror");
+    assert_eq!(
+        after, baseline,
+        "a rolled-back deploy must not bump the size mirror"
+    );
 }

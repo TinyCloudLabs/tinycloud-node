@@ -24,9 +24,11 @@
 //! owner's root authority, or an owner->holder delegation), so layer-(a)
 //! authorization runs for real, not against self-declared attenuation.
 //!
-//! The deploy `D_fn`s are minted here exactly as a client would: the routine
-//! DID is derived with the SAME classic secret the booted node uses
-//! (`[11u8; 32]`), so `D_fn.delegatee == routine_did`.
+//! The deploy `D_fn`s are minted here exactly as a client would: `routine_did`
+//! is obtained from the node via the read-only `RoutineDid` handshake (the F2
+//! flow), NOT re-derived client-side -- the node's secret comes from
+//! `TINYCLOUD_KEYS_SECRET` in this environment, so the handshake is the only
+//! correct way to learn it before binding `D_fn.delegatee`.
 
 use anyhow::{Context, Result};
 use base64::{encode_config, URL_SAFE_NO_PAD};
@@ -124,7 +126,10 @@ fn make_owner(name: &str) -> Result<Owner> {
     let did = DID_METHODS.generate(&jwk, "key")?.to_string();
     let fragment = did.rsplit_once(':').context("did fragment")?.1.to_string();
     let vm = format!("{did}#{fragment}");
-    let space = SpaceId::new(did.parse::<DIDBuf>()?, name.parse().map_err(|e| anyhow::anyhow!("{e:?}"))?);
+    let space = SpaceId::new(
+        did.parse::<DIDBuf>()?,
+        name.parse().map_err(|e| anyhow::anyhow!("{e:?}"))?,
+    );
     // Sanity: the space's base DID is the owner DID (root authority).
     assert_eq!(space.did().to_string(), did);
     Ok(Owner {
@@ -306,7 +311,12 @@ async fn deploy_persists_artifact_delegation_and_binding_caveat() -> Result<()> 
     let client = Client::tracked(rocket).await?;
     let rdid = handshake_routine_did(&client, &owner, &cid, "urn:uuid:hs-happy").await?;
     let grant = mint_d_fn(&owner, &rdid, &cid, "urn:uuid:dfn-happy")?;
-    let auth = owner_compute_invocation(&owner, "hello", "tinycloud.compute/deploy", "urn:uuid:inv-happy")?;
+    let auth = owner_compute_invocation(
+        &owner,
+        "hello",
+        "tinycloud.compute/deploy",
+        "urn:uuid:inv-happy",
+    )?;
 
     let (status, body) = post_invoke(&client, &auth, deploy_body("hello", &wasm, &grant)).await;
     assert_eq!(status, Status::Ok, "deploy must succeed: {body}");
@@ -327,7 +337,10 @@ async fn deploy_persists_artifact_delegation_and_binding_caveat() -> Result<()> 
     .await?
     .context("artifact row must exist after deploy")?;
     assert_eq!(artifact.content_hash, cid);
-    assert_eq!(artifact.payload, wasm, "stored payload must equal the deployed bytes");
+    assert_eq!(
+        artifact.payload, wasm,
+        "stored payload must equal the deployed bytes"
+    );
 
     // D_fn persisted through the standard delegation path, with the binding
     // caveat on its ability row.
@@ -349,7 +362,10 @@ async fn deploy_persists_artifact_delegation_and_binding_caveat() -> Result<()> 
                 .unwrap_or(false)
         })
     });
-    assert!(has_binding, "D_fn ability rows must carry the computeFunctionBinding caveat");
+    assert!(
+        has_binding,
+        "D_fn ability rows must carry the computeFunctionBinding caveat"
+    );
     Ok(())
 }
 
@@ -373,10 +389,19 @@ async fn deploy_with_unverifiable_grant_rolls_back_no_artifact() -> Result<()> {
     let mut wrong_signer = JWK::generate_ed25519()?;
     wrong_signer.algorithm = Some(Algorithm::EdDSA);
     let grant = mint_d_fn_signed_by(&owner, &wrong_signer, &rdid, &cid, "urn:uuid:dfn-bad")?;
-    let auth = owner_compute_invocation(&owner, "hello", "tinycloud.compute/deploy", "urn:uuid:inv-bad")?;
+    let auth = owner_compute_invocation(
+        &owner,
+        "hello",
+        "tinycloud.compute/deploy",
+        "urn:uuid:inv-bad",
+    )?;
 
     let (status, body) = post_invoke(&client, &auth, deploy_body("hello", &wasm, &grant)).await;
-    assert_ne!(status, Status::Ok, "a tampered D_fn must not deploy: {body}");
+    assert_ne!(
+        status,
+        Status::Ok,
+        "a tampered D_fn must not deploy: {body}"
+    );
 
     // The transaction rolled back: NO artifact row, NO delegation row.
     let artifact = database_artifact::Entity::find_by_id((
@@ -386,12 +411,18 @@ async fn deploy_with_unverifiable_grant_rolls_back_no_artifact() -> Result<()> {
     ))
     .one(&conn)
     .await?;
-    assert!(artifact.is_none(), "a failed D_fn must leave no artifact row");
+    assert!(
+        artifact.is_none(),
+        "a failed D_fn must leave no artifact row"
+    );
     let dfn = deleg_model::Entity::find()
         .filter(deleg_model::Column::Delegatee.eq(rdid))
         .one(&conn)
         .await?;
-    assert!(dfn.is_none(), "a failed deploy must leave no delegation row");
+    assert!(
+        dfn.is_none(),
+        "a failed deploy must leave no delegation row"
+    );
     Ok(())
 }
 
@@ -415,9 +446,15 @@ async fn deploy_enforces_quota_and_mirror_updates_after_commit() -> Result<()> {
     let cid_a = content_cid(&wasm_a);
     let rdid_a = handshake_routine_did(&client, &owner, &cid_a, "urn:uuid:hs-qa").await?;
     let grant_a = mint_d_fn(&owner, &rdid_a, &cid_a, "urn:uuid:dfn-qa")?;
-    let auth_a = owner_compute_invocation(&owner, "a", "tinycloud.compute/deploy", "urn:uuid:inv-qa")?;
-    let (status_a, body_a) = post_invoke(&client, &auth_a, deploy_body("a", &wasm_a, &grant_a)).await;
-    assert_eq!(status_a, Status::Ok, "first deploy must fit under quota: {body_a}");
+    let auth_a =
+        owner_compute_invocation(&owner, "a", "tinycloud.compute/deploy", "urn:uuid:inv-qa")?;
+    let (status_a, body_a) =
+        post_invoke(&client, &auth_a, deploy_body("a", &wasm_a, &grant_a)).await;
+    assert_eq!(
+        status_a,
+        Status::Ok,
+        "first deploy must fit under quota: {body_a}"
+    );
 
     // Second deploy: another 100-byte payload. Mirror now holds 100, limit is
     // 140, remaining 40 < 100 -> 402.
@@ -425,8 +462,10 @@ async fn deploy_enforces_quota_and_mirror_updates_after_commit() -> Result<()> {
     let cid_b = content_cid(&wasm_b);
     let rdid_b = handshake_routine_did(&client, &owner, &cid_b, "urn:uuid:hs-qb").await?;
     let grant_b = mint_d_fn(&owner, &rdid_b, &cid_b, "urn:uuid:dfn-qb")?;
-    let auth_b = owner_compute_invocation(&owner, "b", "tinycloud.compute/deploy", "urn:uuid:inv-qb")?;
-    let (status_b, body_b) = post_invoke(&client, &auth_b, deploy_body("b", &wasm_b, &grant_b)).await;
+    let auth_b =
+        owner_compute_invocation(&owner, "b", "tinycloud.compute/deploy", "urn:uuid:inv-qb")?;
+    let (status_b, body_b) =
+        post_invoke(&client, &auth_b, deploy_body("b", &wasm_b, &grant_b)).await;
     assert_eq!(
         status_b,
         Status::new(402),
@@ -441,7 +480,10 @@ async fn deploy_enforces_quota_and_mirror_updates_after_commit() -> Result<()> {
     ))
     .one(&conn)
     .await?;
-    assert!(artifact_b.is_none(), "an over-quota deploy must not persist an artifact");
+    assert!(
+        artifact_b.is_none(),
+        "an over-quota deploy must not persist an artifact"
+    );
     Ok(())
 }
 
@@ -471,7 +513,10 @@ async fn routine_did_handshake_is_deterministic_and_side_effect_free() -> Result
     assert_eq!(s2, Status::Ok);
     let v1: serde_json::Value = serde_json::from_str(&b1)?;
     let v2: serde_json::Value = serde_json::from_str(&b2)?;
-    assert_eq!(v1["routine_did"], v2["routine_did"], "same (space, CID) must return the same DID");
+    assert_eq!(
+        v1["routine_did"], v2["routine_did"],
+        "same (space, CID) must return the same DID"
+    );
     assert!(
         v1["routine_did"].as_str().unwrap().starts_with("did:key:"),
         "routine_did must be a did:key"
@@ -480,7 +525,8 @@ async fn routine_did_handshake_is_deterministic_and_side_effect_free() -> Result
 
     // Different CID -> different routine_did (per-(space, function) identity).
     let cid2 = content_cid(b"other-wasm-bytes");
-    let auth = owner_compute_invocation(&owner, &cid2, "tinycloud.compute/deploy", "urn:uuid:rd-3")?;
+    let auth =
+        owner_compute_invocation(&owner, &cid2, "tinycloud.compute/deploy", "urn:uuid:rd-3")?;
     let body = serde_json::json!({ "action": "routine_did", "content_cid": cid2 }).to_string();
     let (s3, b3) = post_invoke(&client, &auth, body).await;
     assert_eq!(s3, Status::Ok);
@@ -516,11 +562,23 @@ async fn routine_did_body_under_execute_ability_is_rejected() -> Result<()> {
     // Present a compute/EXECUTE capability with a RoutineDid body (requires
     // compute/deploy). Scope selection must reject: the covering-cap search
     // fails ability_matches(execute, deploy).
-    let auth = owner_compute_invocation(&owner, &cid, "tinycloud.compute/execute", "urn:uuid:rd-wrong")?;
+    let auth = owner_compute_invocation(
+        &owner,
+        &cid,
+        "tinycloud.compute/execute",
+        "urn:uuid:rd-wrong",
+    )?;
     let body = serde_json::json!({ "action": "routine_did", "content_cid": cid }).to_string();
     let (status, body) = post_invoke(&client, &auth, body).await;
-    assert_eq!(status, Status::Forbidden, "execute cap must not authorize a RoutineDid body: {body}");
-    assert!(body.starts_with("Unauthorized Action:"), "expected the standard prefix, got: {body}");
+    assert_eq!(
+        status,
+        Status::Forbidden,
+        "execute cap must not authorize a RoutineDid body: {body}"
+    );
+    assert!(
+        body.starts_with("Unauthorized Action:"),
+        "expected the standard prefix, got: {body}"
+    );
     Ok(())
 }
 
@@ -540,7 +598,8 @@ async fn redeploy_revokes_the_superseded_grant() -> Result<()> {
     let cid_v1 = content_cid(&wasm_v1);
     let rdid_v1 = handshake_routine_did(&client, &owner, &cid_v1, "urn:uuid:hs-v1").await?;
     let grant_v1 = mint_d_fn(&owner, &rdid_v1, &cid_v1, "urn:uuid:dfn-v1")?;
-    let auth_v1 = owner_compute_invocation(&owner, "app", "tinycloud.compute/deploy", "urn:uuid:inv-v1")?;
+    let auth_v1 =
+        owner_compute_invocation(&owner, "app", "tinycloud.compute/deploy", "urn:uuid:inv-v1")?;
     let (s1, b1) = post_invoke(&client, &auth_v1, deploy_body("app", &wasm_v1, &grant_v1)).await;
     assert_eq!(s1, Status::Ok, "v1 deploy must succeed: {b1}");
 
@@ -565,7 +624,8 @@ async fn redeploy_revokes_the_superseded_grant() -> Result<()> {
     assert_ne!(cid_v1, cid_v2);
     let rdid_v2 = handshake_routine_did(&client, &owner, &cid_v2, "urn:uuid:hs-v2").await?;
     let grant_v2 = mint_d_fn(&owner, &rdid_v2, &cid_v2, "urn:uuid:dfn-v2")?;
-    let auth_v2 = owner_compute_invocation(&owner, "app", "tinycloud.compute/deploy", "urn:uuid:inv-v2")?;
+    let auth_v2 =
+        owner_compute_invocation(&owner, "app", "tinycloud.compute/deploy", "urn:uuid:inv-v2")?;
     let (s2, b2) = post_invoke(&client, &auth_v2, deploy_body("app", &wasm_v2, &grant_v2)).await;
     assert_eq!(s2, Status::Ok, "v2 re-deploy must succeed: {b2}");
 
@@ -614,7 +674,8 @@ async fn delegate_compute_deploy(
     abilities::ActiveModel {
         delegation: Set(parent_hash),
         resource: Set(Resource::TinyCloud(resource)),
-        ability: Set(Ability::try_from("tinycloud.compute/deploy".to_string()).map_err(|e| anyhow::anyhow!("{e:?}"))?),
+        ability: Set(Ability::try_from("tinycloud.compute/deploy".to_string())
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?),
         caveats: Set(Caveats(std::collections::BTreeMap::new())),
     }
     .insert(conn)
@@ -636,20 +697,22 @@ async fn scope_selection_rejects_caps_spanning_multiple_spaces() -> Result<()> {
     let holder_frag = holder_did.rsplit_once(':').context("frag")?.1.to_string();
     let holder_vm = format!("{holder_did}#{holder_frag}");
 
-    seed_space_and_actors(&conn, &owner_a.space, &[holder_did.clone()]).await?;
-    seed_space_and_actors(&conn, &owner_b.space, &[holder_did.clone()]).await?;
+    seed_space_and_actors(&conn, &owner_a.space, std::slice::from_ref(&holder_did)).await?;
+    seed_space_and_actors(&conn, &owner_b.space, std::slice::from_ref(&holder_did)).await?;
     let parent_a = delegate_compute_deploy(&conn, &owner_a, &holder_did, "fn", "multi-a").await?;
     let parent_b = delegate_compute_deploy(&conn, &owner_b, &holder_did, "fn", "multi-b").await?;
 
     // Invocation citing BOTH parents, attenuation covering both spaces.
-    let res_a: ResourceId = owner_a
-        .space
-        .clone()
-        .to_resource("compute".parse()?, Some("fn".parse()?), None, None);
-    let res_b: ResourceId = owner_b
-        .space
-        .clone()
-        .to_resource("compute".parse()?, Some("fn".parse()?), None, None);
+    let res_a: ResourceId =
+        owner_a
+            .space
+            .clone()
+            .to_resource("compute".parse()?, Some("fn".parse()?), None, None);
+    let res_b: ResourceId =
+        owner_b
+            .space
+            .clone()
+            .to_resource("compute".parse()?, Some("fn".parse()?), None, None);
     let mut caps = Capabilities::new();
     caps.with_action(
         res_a.as_uri(),
@@ -678,7 +741,9 @@ async fn scope_selection_rejects_caps_spanning_multiple_spaces() -> Result<()> {
     // is irrelevant here -- a throwaway did:key suffices.
     let wasm = b"\x00asm\x01\x00\x00\x00multi".to_vec();
     let cid = content_cid(&wasm);
-    let dummy_did = DID_METHODS.generate(&JWK::generate_ed25519()?, "key")?.to_string();
+    let dummy_did = DID_METHODS
+        .generate(&JWK::generate_ed25519()?, "key")?
+        .to_string();
     let grant = mint_d_fn(&owner_a, &dummy_did, &cid, "urn:uuid:dfn-multi")?;
 
     let client = Client::tracked(rocket).await?;
@@ -688,7 +753,10 @@ async fn scope_selection_rejects_caps_spanning_multiple_spaces() -> Result<()> {
         Status::BadRequest,
         "compute caps spanning multiple spaces must be rejected: {body}"
     );
-    assert!(body.contains("multiple spaces"), "expected the multi-space message, got: {body}");
+    assert!(
+        body.contains("multiple spaces"),
+        "expected the multi-space message, got: {body}"
+    );
     Ok(())
 }
 
@@ -702,14 +770,15 @@ async fn scope_selection_rejects_body_targeting_uncovered_function() -> Result<(
     let holder_did = DID_METHODS.generate(&holder_jwk, "key")?.to_string();
     let holder_frag = holder_did.rsplit_once(':').context("frag")?.1.to_string();
     let holder_vm = format!("{holder_did}#{holder_frag}");
-    seed_space_and_actors(&conn, &owner.space, &[holder_did.clone()]).await?;
+    seed_space_and_actors(&conn, &owner.space, std::slice::from_ref(&holder_did)).await?;
 
     // Holder is granted compute/deploy ONLY on function "x".
     let parent = delegate_compute_deploy(&conn, &owner, &holder_did, "x", "uncovered").await?;
-    let res_x: ResourceId = owner
-        .space
-        .clone()
-        .to_resource("compute".parse()?, Some("x".parse()?), None, None);
+    let res_x: ResourceId =
+        owner
+            .space
+            .clone()
+            .to_resource("compute".parse()?, Some("x".parse()?), None, None);
     let mut caps = Capabilities::new();
     caps.with_action(
         res_x.as_uri(),
@@ -733,7 +802,9 @@ async fn scope_selection_rejects_body_targeting_uncovered_function() -> Result<(
     // Scope selection rejects before the D_fn is processed; delegatee is moot.
     let wasm = b"\x00asm\x01\x00\x00\x00uncovered".to_vec();
     let cid = content_cid(&wasm);
-    let dummy_did = DID_METHODS.generate(&JWK::generate_ed25519()?, "key")?.to_string();
+    let dummy_did = DID_METHODS
+        .generate(&JWK::generate_ed25519()?, "key")?
+        .to_string();
     let grant = mint_d_fn(&owner, &dummy_did, &cid, "urn:uuid:dfn-uncovered")?;
 
     let client = Client::tracked(rocket).await?;
@@ -743,6 +814,9 @@ async fn scope_selection_rejects_body_targeting_uncovered_function() -> Result<(
         Status::Forbidden,
         "a cap for function x must not authorize a deploy of function y: {body}"
     );
-    assert!(body.starts_with("Unauthorized Action:"), "expected the standard prefix, got: {body}");
+    assert!(
+        body.starts_with("Unauthorized Action:"),
+        "expected the standard prefix, got: {body}"
+    );
     Ok(())
 }
