@@ -238,7 +238,7 @@ fn attestation(
     signer: &tinycloud_core::libp2p::identity::Keypair,
 ) -> Value {
     let message = json!({
-        "type":"TinyCloudShareEnrollmentRuntimeAttestation","version":1,"targetOrigin":TARGET_ORIGIN,"nodeAudience":NODE_AUDIENCE,
+        "type":"PolicyEnforcerAttestation","version":1,"targetOrigin":TARGET_ORIGIN,"nodeAudience":NODE_AUDIENCE,
         "enforcerDid":enforcer_did,"enforcerKid":"did:web:node.example#enforcement-key-1","publicKey":enrollment["invitationPublicKey"],"keyVersion":1,
         "localSignerDid":enforcer_did,"localSignerKid":canonical_kid(enforcer_did),"measurement":"tinycloud-node-n4-mounted-fixture-v1",
         "measurementDigest":sha256_b64(&value_bytes(&json!({"measurement":"tinycloud-node-n4-mounted-fixture-v1"}))),"expiresAt":expires_at,
