@@ -13,6 +13,8 @@ pub mod allow_list;
 pub mod auth_guards;
 pub mod authorization;
 pub mod cli;
+#[cfg(all(feature = "compute", feature = "dstack"))]
+pub mod compute_keys;
 pub mod config;
 #[cfg(feature = "dstack")]
 pub mod dstack;
@@ -316,11 +318,28 @@ pub async fn app(
         database_artifact_repository,
     );
 
-    // P0 walking skeleton: a stateless stub. The artifact repository,
-    // backend registry, and routine-key derivation handle are P1/P2
-    // additions (compute-service.md §11.1).
+    // P1 (compute-service-implementation-plan.md): routine-key derivation
+    // handle -- dstack-TEE-backed when the `dstack` feature is compiled AND
+    // the socket is actually reachable at boot, classic (`StaticSecret`)
+    // otherwise (compute-service.md §6.2, "Non-TEE / classic mode"). The
+    // backend registry (wasmtime + optional cloudflare) is a P2 addition.
     #[cfg(feature = "compute")]
-    let compute_service = ComputeService::new();
+    let compute_service = {
+        #[cfg(feature = "dstack")]
+        let routine_key_deriver: Arc<dyn tinycloud_core::compute::RoutineKeyDeriver> =
+            if dstack::is_available() {
+                Arc::new(compute_keys::DstackRoutineKeyDeriver)
+            } else {
+                Arc::new(tinycloud_core::compute::ClassicRoutineKeyDeriver::new(
+                    key_setup.clone(),
+                ))
+            };
+        #[cfg(not(feature = "dstack"))]
+        let routine_key_deriver: Arc<dyn tinycloud_core::compute::RoutineKeyDeriver> = Arc::new(
+            tinycloud_core::compute::ClassicRoutineKeyDeriver::new(key_setup.clone()),
+        );
+        ComputeService::new(routine_key_deriver)
+    };
 
     let quota_cache = QuotaCache::new(
         tinycloud_config.storage.limit,

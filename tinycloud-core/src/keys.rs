@@ -91,6 +91,20 @@ impl StaticSecret {
     }
 }
 
+/// Derive an ed25519 `did:key` from a raw 32-byte seed.
+///
+/// Used by routine-key derivation (compute-service.md §6.2): both the
+/// classic (`StaticSecret`) and dstack-TEE routine key derivers reduce their
+/// respective secret material to a 32-byte seed and call this to produce the
+/// public `routine_did`. Factored out here (rather than inlined per-caller)
+/// so the server-crate dstack adapter can turn derived key material into a
+/// did:key without depending on `libp2p` directly.
+pub fn ed25519_did_from_seed(seed: [u8; 32]) -> Result<String, DecodingError> {
+    let secret = SecretKey::try_from_bytes(seed)?;
+    let keypair: Keypair = EdKP::from(secret).into();
+    Ok(public_key_to_did_key(keypair.public()))
+}
+
 #[async_trait]
 impl Secrets for StaticSecret {
     type Error = DecodingError;

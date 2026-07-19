@@ -3864,7 +3864,11 @@ mod tests {
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
         #[cfg(feature = "compute")]
-        let rocket = rocket.manage(tinycloud_core::compute::ComputeService::new());
+        let rocket = rocket.manage(tinycloud_core::compute::ComputeService::new(
+            std::sync::Arc::new(tinycloud_core::compute::ClassicRoutineKeyDeriver::new(
+                tinycloud_core::keys::StaticSecret::new(vec![0u8; 32]).unwrap(),
+            )),
+        ));
 
         let client = Client::tracked(rocket).await?;
         let response = client
@@ -4121,7 +4125,11 @@ mod tests {
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
         #[cfg(feature = "compute")]
-        let rocket = rocket.manage(tinycloud_core::compute::ComputeService::new());
+        let rocket = rocket.manage(tinycloud_core::compute::ComputeService::new(
+            std::sync::Arc::new(tinycloud_core::compute::ClassicRoutineKeyDeriver::new(
+                tinycloud_core::keys::StaticSecret::new(vec![0u8; 32]).unwrap(),
+            )),
+        ));
 
         let client = Client::tracked(rocket).await?;
         let response = client
@@ -5530,7 +5538,11 @@ mod tests {
             .manage(HookRuntime::new(HooksConfig::default(), [9u8; 32]))
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
         #[cfg(feature = "compute")]
-        let rocket = rocket.manage(tinycloud_core::compute::ComputeService::new());
+        let rocket = rocket.manage(tinycloud_core::compute::ComputeService::new(
+            std::sync::Arc::new(tinycloud_core::compute::ClassicRoutineKeyDeriver::new(
+                tinycloud_core::keys::StaticSecret::new(vec![0u8; 32]).unwrap(),
+            )),
+        ));
         rocket
     }
 

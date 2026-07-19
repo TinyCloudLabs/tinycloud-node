@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+async-trait.workspace = true
 aws-config = "0.49"
 aws-sdk-dynamodb = "0.19"
 aws-sdk-s3 = "0.19"
@@ -100,6 +101,21 @@ compute = ["tinycloud-core/compute"]
 name = "compute_skeleton"
 path = "tests/compute_skeleton.rs"
 required-features = ["compute"]
+
+# P1 (compute-service-implementation-plan.md): the deploy-path gate --
+# atomic deploy, handshake, scope selection, quota, re-deploy revocation.
+[[test]]
+name = "compute_deploy"
+path = "tests/compute_deploy.rs"
+required-features = ["compute"]
+
+# P1: the dstack-simulator routine-key determinism test. Requires BOTH
+# `compute` and `dstack` -- the dstack adapter (`compute_keys.rs`) only
+# compiles under `dstack`.
+[[test]]
+name = "compute_routine_key"
+path = "tests/compute_routine_key.rs"
+required-features = ["compute", "dstack"]
 
 # cargo-binstall support: allows `cargo binstall tinycloud-node`
 [package.metadata.binstall]

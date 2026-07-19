@@ -197,6 +197,42 @@ where
     }
 }
 
+/// Error type for `SpaceDatabase::compute_deploy` (P1 atomic deploy
+/// primitive, compute-service.md §5.1/F4).
+#[cfg(feature = "compute")]
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum ComputeDeployError<B: StorageSetup, K: Secrets> {
+    #[error(transparent)]
+    Tx(#[from] TxError<B, K>),
+    #[error(transparent)]
+    Artifact(#[from] crate::database_artifacts::DatabaseArtifactError),
+    #[error("compute deploy grant is missing the computeFunctionBinding caveat for content_cid {0} on one or more capability rows")]
+    BindingCaveatMismatch(String),
+}
+
+#[cfg(feature = "compute")]
+impl<B: StorageSetup, K: Secrets> From<DbErr> for ComputeDeployError<B, K> {
+    fn from(e: DbErr) -> Self {
+        ComputeDeployError::Tx(TxError::Db(e))
+    }
+}
+
+/// Result of a successful `SpaceDatabase::compute_deploy` (P1).
+#[cfg(feature = "compute")]
+#[derive(Debug, Clone)]
+pub struct ComputeDeployOutcome {
+    pub content_cid: String,
+    pub revision: i64,
+    pub size_bytes: i64,
+    pub delegation_cid: String,
+    /// Set when a prior artifact at the same `(service, space, name)` had a
+    /// DIFFERENT content hash and its bound `D_fn` was found and revoked
+    /// (re-deploy hygiene, §5.1).
+    pub superseded_content_cid: Option<String>,
+    pub superseded_delegation_cid: Option<String>,
+}
+
 impl<B, K> SpaceDatabase<DatabaseConnection, B, K> {
     pub async fn new(conn: DatabaseConnection, storage: B, secrets: K) -> Result<Self, DbErr> {
         Migrator::up(&conn, None).await?;
@@ -846,6 +882,127 @@ where
             .await
     }
 
+    /// Atomic compute deploy primitive (compute-service.md §5.1/F4, plan
+    /// P1). ONE SeaORM transaction that:
+    ///
+    ///   (a) processes `grant` (the deploy-time `D_fn`) through the
+    ///       STANDARD delegation verification/persistence path -- the same
+    ///       `transact()`/`delegation::process` pipeline `delegate()` above
+    ///       uses (signature check, delegation-side containment, per-
+    ///       ability caveat persistence) -- and
+    ///   (b) saves the WASM artifact via the transaction-aware
+    ///       `database_artifacts::save_artifact_conn` (service tag
+    ///       `"compute"`, identity = content CID, against the SAME `tx`).
+    ///
+    /// Commits only if both succeed (a `D_fn`-verification failure leaves NO
+    /// artifact row; an artifact-persist failure leaves NO delegation row).
+    /// The caller MUST update the `SqlSizes` mirror AFTER this returns `Ok`
+    /// (mirror-after-commit, §5/F8) -- this method does not touch
+    /// `self.sql_sizes` itself so the mirror write provably only happens
+    /// once the transaction is durable.
+    ///
+    /// Every capability row of `grant` MUST carry the `computeFunctionBinding`
+    /// caveat (§6.2/D2) naming the content CID computed here from `wasm` --
+    /// checked BEFORE the transaction opens, so a malformed grant never
+    /// touches the DB.
+    ///
+    /// Re-deploy hygiene (§5.1, "SHOULD"): when a prior artifact exists at
+    /// `(service, space, name)` with a DIFFERENT content hash, this looks
+    /// for a still-active delegation from the SAME delegator whose binding
+    /// caveat names the OLD content hash and revokes it in the same
+    /// transaction. This is a NODE-INTERNAL bookkeeping revocation, not the
+    /// signed `/revoke` path (`revocation::process` requires a fresh
+    /// signature the deploy request does not carry) -- it is authorized
+    /// because the identity performing it (`grant`'s delegator) was JUST
+    /// cryptographically verified as the signer of the NEW `D_fn` earlier in
+    /// this same transaction, and the search is scoped to that delegator's
+    /// own prior grants for this exact function only.
+    #[cfg(feature = "compute")]
+    pub async fn compute_deploy(
+        &self,
+        grant: Delegation,
+        service: &str,
+        space: &SpaceId,
+        name: &str,
+        wasm: Vec<u8>,
+    ) -> Result<ComputeDeployOutcome, ComputeDeployError<B, K>> {
+        let content_cid = crate::hash::hash(&wasm).to_cid(0x55).to_string();
+
+        let expected_caveat = crate::compute::compute_function_binding_caveat(&content_cid);
+        let all_bound = !grant.0.capabilities.is_empty()
+            && grant
+                .0
+                .capabilities
+                .iter()
+                .all(|c| c.caveats.0.values().any(|v| *v == expected_caveat));
+        if !all_bound {
+            return Err(ComputeDeployError::BindingCaveatMismatch(content_cid));
+        }
+
+        let delegator = grant.0.delegator.clone();
+        let space_str = space.to_string();
+
+        let roots: Vec<Hash> = grant.0.parents.iter().copied().map(Hash::from).collect();
+        let _chain_guards = self.acquire_chain_guards(&roots).await?;
+
+        let tx = self
+            .conn
+            .begin_with_config(chain_isolation_level(&self.conn), None)
+            .await?;
+
+        // Read the prior artifact (if any) BEFORE it is overwritten below,
+        // to drive re-deploy hygiene.
+        let existing =
+            crate::database_artifacts::load_artifact_conn(&tx, service, &space_str, name).await?;
+
+        // (a) process the new D_fn through the standard delegation path.
+        let result = transact(
+            &tx,
+            &self.storage,
+            &self.secrets,
+            vec![Event::Delegation(Box::new(grant))],
+            self.encryption.as_ref(),
+        )
+        .await?;
+        let delegation_hash = *result
+            .delegation_cids
+            .first()
+            .ok_or_else(|| TxError::InvalidCid("compute deploy: missing D_fn CID".to_string()))?;
+
+        // Re-deploy hygiene: revoke a superseded D_fn bound to the OLD
+        // content hash, scoped to the same delegator.
+        let mut superseded_content_cid = None;
+        let mut superseded_delegation_cid = None;
+        if let Some(existing) = &existing {
+            if existing.content_hash != content_cid {
+                if let Some(superseded_hash) =
+                    find_superseded_compute_delegation(&tx, &delegator, &existing.content_hash)
+                        .await?
+                {
+                    superseded_content_cid = Some(existing.content_hash.clone());
+                    superseded_delegation_cid = Some(superseded_hash.to_cid(0x55).to_string());
+                    insert_internal_revocation(&tx, &delegator, superseded_hash).await?;
+                }
+            }
+        }
+
+        // (b) transaction-aware artifact save, in the SAME `tx`.
+        let artifact =
+            crate::database_artifacts::save_artifact_conn(&tx, service, &space_str, name, wasm)
+                .await?;
+
+        tx.commit().await?;
+
+        Ok(ComputeDeployOutcome {
+            content_cid: artifact.content_hash,
+            revision: artifact.revision,
+            size_bytes: artifact.size_bytes,
+            delegation_cid: delegation_hash.to_cid(0x55).to_string(),
+            superseded_content_cid,
+            superseded_delegation_cid,
+        })
+    }
+
     pub async fn delegation_status(
         &self,
         target: Hash,
@@ -1211,6 +1368,71 @@ fn chain_isolation_level<C: ConnectionTrait>(db: &C) -> Option<sea_orm::Isolatio
             // on the shared epoch-tip read/write path, producing routine 40001
             // aborts for every authenticated operation class.
             Some(sea_orm::IsolationLevel::ReadCommitted)
+        }
+    }
+}
+
+/// Find an active (non-revoked) delegation from `delegator` whose bound
+/// `computeFunctionBinding` caveat names `old_content_cid`, for
+/// `SpaceDatabase::compute_deploy`'s re-deploy hygiene step (§5.1). Scoped
+/// to `delegator` so this can never surface (let alone revoke) another
+/// principal's delegation.
+#[cfg(feature = "compute")]
+async fn find_superseded_compute_delegation<C: ConnectionTrait>(
+    db: &C,
+    delegator: &str,
+    old_content_cid: &str,
+) -> Result<Option<Hash>, DbErr> {
+    let expected = crate::compute::compute_function_binding_caveat(old_content_cid);
+    let candidates = delegation::Entity::find()
+        .filter(delegation::Column::Delegator.eq(delegator.to_string()))
+        .find_with_related(abilities::Entity)
+        .all(db)
+        .await?;
+    for (candidate, caps) in candidates {
+        if revocation::is_revoked(db, &candidate.id).await? {
+            continue;
+        }
+        if caps
+            .iter()
+            .any(|c| c.caveats.0.values().any(|v| *v == expected))
+        {
+            return Ok(Some(candidate.id));
+        }
+    }
+    Ok(None)
+}
+
+/// Insert a NODE-INTERNAL revocation row directly (bypassing the signed
+/// `/revoke` path -- see `compute_deploy`'s doc comment for why this is
+/// safe here). Idempotent: a repeat call for the same `revoked` hash is a
+/// no-op (`OnConflict::do_nothing`).
+#[cfg(feature = "compute")]
+async fn insert_internal_revocation<C: ConnectionTrait>(
+    db: &C,
+    revoker: &str,
+    revoked: Hash,
+) -> Result<(), DbErr> {
+    let marker = format!(
+        "compute/superseded-redeploy-revocation/{}",
+        revoked.to_cid(0x55)
+    );
+    let id = crate::hash::hash(marker.as_bytes());
+    match revocation::Entity::insert(revocation::ActiveModel {
+        id: Set(id),
+        revoker: Set(revoker.to_string()),
+        revoked: Set(revoked),
+        serialization: Set(marker.into_bytes()),
+        revoked_at: Set(Some(OffsetDateTime::now_utc())),
+    })
+    .on_conflict(OnConflict::column(revocation::Column::Id).do_nothing().to_owned())
+    .exec(db)
+    .await
+    {
+        Err(DbErr::RecordNotInserted) => Ok(()),
+        r => {
+            r?;
+            Ok(())
         }
     }
 }
