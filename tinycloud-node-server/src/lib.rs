@@ -301,6 +301,9 @@ pub async fn app(
         database_artifact_repository.clone(),
     );
 
+    #[cfg(feature = "compute")]
+    let compute_artifact_repository = database_artifact_repository.clone();
+
     #[cfg(feature = "duckdb")]
     let duckdb_service = DuckDbService::new(
         tinycloud_config
@@ -324,8 +327,10 @@ pub async fn app(
     // the socket is reachable, classic (node static secret) otherwise. The
     // backend registry (wasmtime + optional cloudflare) is a P2 addition.
     #[cfg(feature = "compute")]
-    let compute_service =
-        ComputeService::new(crate::compute::build_routine_key_deriver(&key_setup));
+    let compute_service = ComputeService::new(
+        crate::compute::build_routine_key_deriver(&key_setup),
+        compute_artifact_repository,
+    );
 
     let quota_cache = QuotaCache::new(
         tinycloud_config.storage.limit,

@@ -340,22 +340,37 @@ impl RoutineKeyDeriver for ClassicRoutineKeyDeriver {
 
 /// `.manage()`d by the server under `#[cfg(feature = "compute")]`, exactly
 /// like `DuckDbService` (compute-service.md §11.1). Holds the injected
-/// `RoutineKeyDeriver` (classic or dstack, chosen server-side at startup);
-/// the backend registry (wasmtime + optional cloudflare) is a P2 addition.
+/// `RoutineKeyDeriver` (classic or dstack, chosen server-side at startup) and
+/// the artifact repository P2's execute path loads deployed WASM bytes from
+/// (the same `(service="compute", space, name)` store the deploy path
+/// writes, §5); the backend registry (wasmtime) is composed server-side
+/// (`tinycloud-node-server/src/compute_exec.rs`) because it also needs
+/// `SqlService`, which is not reachable from `ComputeService` alone.
 #[derive(Clone)]
 pub struct ComputeService {
     routine_key_deriver: Arc<dyn RoutineKeyDeriver>,
+    artifact_repository: Arc<dyn crate::database_artifacts::DatabaseArtifactRepository>,
 }
 
 impl ComputeService {
-    pub fn new(routine_key_deriver: Arc<dyn RoutineKeyDeriver>) -> Self {
+    pub fn new(
+        routine_key_deriver: Arc<dyn RoutineKeyDeriver>,
+        artifact_repository: Arc<dyn crate::database_artifacts::DatabaseArtifactRepository>,
+    ) -> Self {
         Self {
             routine_key_deriver,
+            artifact_repository,
         }
     }
 
     pub fn routine_key_deriver(&self) -> &Arc<dyn RoutineKeyDeriver> {
         &self.routine_key_deriver
+    }
+
+    pub fn artifact_repository(
+        &self,
+    ) -> &Arc<dyn crate::database_artifacts::DatabaseArtifactRepository> {
+        &self.artifact_repository
     }
 }
 
@@ -434,13 +449,44 @@ mod tests {
         );
     }
 
+    struct StubArtifactRepository;
+
+    #[async_trait::async_trait]
+    impl crate::database_artifacts::DatabaseArtifactRepository for StubArtifactRepository {
+        async fn load(
+            &self,
+            _service: &str,
+            _space: &str,
+            _name: &str,
+        ) -> Result<
+            Option<crate::database_artifacts::DatabaseArtifact>,
+            crate::database_artifacts::DatabaseArtifactError,
+        > {
+            Ok(None)
+        }
+
+        async fn save(
+            &self,
+            _service: &str,
+            _space: &str,
+            _name: &str,
+            _payload: Vec<u8>,
+        ) -> Result<
+            crate::database_artifacts::DatabaseArtifact,
+            crate::database_artifacts::DatabaseArtifactError,
+        > {
+            unimplemented!("not exercised by this unit test")
+        }
+    }
+
     #[test]
     fn compute_service_holds_an_injected_routine_key_deriver() {
         let deriver: Arc<dyn RoutineKeyDeriver> = Arc::new(ClassicRoutineKeyDeriver::new(
             StaticSecret::new(vec![7u8; 32]).unwrap(),
         ));
-        let service = ComputeService::new(deriver);
+        let service = ComputeService::new(deriver, Arc::new(StubArtifactRepository));
         let _ = service.routine_key_deriver();
+        let _ = service.artifact_repository();
     }
 
     fn test_space_id(name: &str) -> SpaceId {

@@ -3358,6 +3358,46 @@ mod tests {
     };
     use tokio::time::{timeout, Duration};
 
+    /// A trivial artifact repository for SQL/duckdb-focused test rockets
+    /// that only need SOME `ComputeService` managed (so `#[cfg(feature =
+    /// "compute")]` dispatch code compiles/runs) without exercising the
+    /// compute deploy/execute paths themselves. `load` -> `None` (P2's
+    /// rotation check treats that as "never deployed", not an error);
+    /// `save` is never called by these tests.
+    #[cfg(feature = "compute")]
+    struct StubComputeArtifactRepository;
+
+    #[cfg(feature = "compute")]
+    #[async_trait::async_trait]
+    impl tinycloud_core::database_artifacts::DatabaseArtifactRepository
+        for StubComputeArtifactRepository
+    {
+        async fn load(
+            &self,
+            _service: &str,
+            _space: &str,
+            _name: &str,
+        ) -> Result<
+            Option<tinycloud_core::database_artifacts::DatabaseArtifact>,
+            tinycloud_core::database_artifacts::DatabaseArtifactError,
+        > {
+            Ok(None)
+        }
+
+        async fn save(
+            &self,
+            _service: &str,
+            _space: &str,
+            _name: &str,
+            _payload: Vec<u8>,
+        ) -> Result<
+            tinycloud_core::database_artifacts::DatabaseArtifact,
+            tinycloud_core::database_artifacts::DatabaseArtifactError,
+        > {
+            unimplemented!("not exercised by SQL/duckdb-focused test rockets")
+        }
+    }
+
     #[derive(Debug)]
     struct TestDatabaseError {
         code: &'static str,
@@ -4414,6 +4454,7 @@ mod tests {
             std::sync::Arc::new(tinycloud_core::compute::ClassicRoutineKeyDeriver::new(
                 tinycloud_core::keys::StaticSecret::new(vec![9u8; 32]).unwrap(),
             )),
+            std::sync::Arc::new(StubComputeArtifactRepository),
         ));
 
         let client = Client::tracked(rocket).await?;
@@ -4675,6 +4716,7 @@ mod tests {
             std::sync::Arc::new(tinycloud_core::compute::ClassicRoutineKeyDeriver::new(
                 tinycloud_core::keys::StaticSecret::new(vec![9u8; 32]).unwrap(),
             )),
+            std::sync::Arc::new(StubComputeArtifactRepository),
         ));
 
         let client = Client::tracked(rocket).await?;
@@ -6088,6 +6130,7 @@ mod tests {
             std::sync::Arc::new(tinycloud_core::compute::ClassicRoutineKeyDeriver::new(
                 tinycloud_core::keys::StaticSecret::new(vec![9u8; 32]).unwrap(),
             )),
+            std::sync::Arc::new(StubComputeArtifactRepository),
         ));
         rocket
     }
