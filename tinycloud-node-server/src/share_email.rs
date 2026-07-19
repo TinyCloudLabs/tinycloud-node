@@ -992,9 +992,9 @@ pub async fn authorize_invitation(
         .bridge
         .validate_scope(&scope, now)
         .await
-        .map_err(|error| {
+        .map_err(|bridge_error| {
             #[cfg(feature = "mounted-fixture")]
-            eprintln!("mounted authorize rejected: bridge scope: {error:?}");
+            eprintln!("mounted authorize rejected: bridge scope: {bridge_error:?}");
             error(Status::Forbidden, "invitation_authorization_invalid")
         })?;
     runtime
@@ -1007,9 +1007,9 @@ pub async fn authorize_invitation(
             request.sender_did.as_str(),
         )
         .await
-        .map_err(|error| {
+        .map_err(|bridge_error| {
             #[cfg(feature = "mounted-fixture")]
-            eprintln!("mounted authorize rejected: sender policy: {error:?}");
+            eprintln!("mounted authorize rejected: sender policy: {bridge_error:?}");
             error(Status::Forbidden, "invitation_authorization_invalid")
         })?;
     let (policy_email, policy_expiry) = runtime
@@ -1022,9 +1022,9 @@ pub async fn authorize_invitation(
             now,
         )
         .await
-        .map_err(|error| {
+        .map_err(|bridge_error| {
             #[cfg(feature = "mounted-fixture")]
-            eprintln!("mounted authorize rejected: policy metadata: {error:?}");
+            eprintln!("mounted authorize rejected: policy metadata: {bridge_error:?}");
             error(Status::Forbidden, "invitation_authorization_invalid")
         })?;
     if policy_email != request.recipient_email.as_str()
