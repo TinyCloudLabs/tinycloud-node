@@ -256,14 +256,15 @@ mod tests {
                 .await,
             Err(PortError::Denied)
         );
-        let session_calls = probe.session_calls.lock().unwrap();
-        assert_eq!(session_calls.len(), 1);
-        assert_eq!(session_calls[0].nonce, ProtocolNonce::from_bytes([2; 32]));
-        assert_eq!(
-            session_calls[0].presentation_jti,
-            ProtocolJti::from_bytes([3; 16])
-        );
-        drop(session_calls);
+        {
+            let session_calls = probe.session_calls.lock().unwrap();
+            assert_eq!(session_calls.len(), 1);
+            assert_eq!(session_calls[0].nonce, ProtocolNonce::from_bytes([2; 32]));
+            assert_eq!(
+                session_calls[0].presentation_jti,
+                ProtocolJti::from_bytes([3; 16])
+            );
+        }
         let read_request = ReadAuthorizationRequest {
             session: SessionHandle::from_bytes([5; 16]),
             jti: ProtocolJti::from_bytes([6; 16]),

@@ -8,12 +8,12 @@
 //! #117 constrained named-statement paths without adding a second registry.
 
 use async_trait::async_trait;
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use libp2p::identity::PublicKey;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fmt, sync::Arc};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     policy_capability::{jcs, sql_caveat},

@@ -13,6 +13,7 @@ pub mod models;
 pub mod policy_authority;
 pub mod policy_capability;
 pub mod relationships;
+pub mod share_email;
 pub mod sql;
 pub mod sql_sizes;
 pub mod storage;

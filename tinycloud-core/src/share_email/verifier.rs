@@ -118,6 +118,7 @@ impl ExactEmailVerifier {
 
     /// Verify the domain-separated, canonical holder binding before handing
     /// the equality result to the authority transaction.
+    #[allow(clippy::too_many_arguments)]
     pub fn verify_holder_binding(
         &self,
         artifact: &[u8],
@@ -211,7 +212,11 @@ where
             .verifier
             .verify_credential(credential, &request.scope, expected_holder)
             .await?;
-        if DidKey::parse(evidence.credential_subject.as_str()).ok().as_ref() != Some(expected_holder) {
+        if DidKey::parse(evidence.credential_subject.as_str())
+            .ok()
+            .as_ref()
+            != Some(expected_holder)
+        {
             return Err(PortError::Denied);
         }
         self.authority.establish_session(request, now).await
@@ -238,7 +243,9 @@ fn credential_scope(scope: &ShareScope) -> CredentialScope<'_> {
     }
 }
 
-fn convert_evidence(evidence: VerifiedEmailEvidence) -> Result<CredentialVerificationEvidence, EvidenceError> {
+fn convert_evidence(
+    evidence: VerifiedEmailEvidence,
+) -> Result<CredentialVerificationEvidence, EvidenceError> {
     Ok(CredentialVerificationEvidence {
         issuer_did: Did::parse(evidence.issuer_did).map_err(|_| EvidenceError::Invalid)?,
         credential_subject: DidKey::parse(evidence.credential_subject)
@@ -254,7 +261,9 @@ fn validate_holder_binding_message(
     expected_email_hash: &str,
     expected_holder: &DidKey,
 ) -> Result<(), EvidenceError> {
-    let object = message.as_object().ok_or(EvidenceError::InvalidHolderProof)?;
+    let object = message
+        .as_object()
+        .ok_or(EvidenceError::InvalidHolderProof)?;
     let expected = [
         "type",
         "version",
@@ -275,7 +284,8 @@ fn validate_holder_binding_message(
         "expiresAt",
         "jti",
     ];
-    if object.len() != expected.len() || object.keys().any(|key| !expected.contains(&key.as_str())) {
+    if object.len() != expected.len() || object.keys().any(|key| !expected.contains(&key.as_str()))
+    {
         return Err(EvidenceError::InvalidHolderProof);
     }
     if object.get("type").and_then(Value::as_str) != Some(HOLDER_BINDING_TYPE)
@@ -289,7 +299,11 @@ fn validate_holder_binding_message(
         || object.get("emailHash").and_then(Value::as_str) != Some(expected_email_hash)
         || object.get("targetOrigin").and_then(Value::as_str) != Some(scope.target_origin.as_str())
         || object.get("nodeAudience").and_then(Value::as_str) != Some(scope.node_audience.as_str())
-        || object.get("contentSource") != Some(&serde_json::to_value(&scope.content_source).map_err(|_| EvidenceError::InvalidHolderProof)?)
+        || object.get("contentSource")
+            != Some(
+                &serde_json::to_value(&scope.content_source)
+                    .map_err(|_| EvidenceError::InvalidHolderProof)?,
+            )
     {
         return Err(EvidenceError::ScopeMismatch);
     }

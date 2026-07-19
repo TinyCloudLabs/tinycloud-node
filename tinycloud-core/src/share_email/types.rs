@@ -311,7 +311,7 @@ fn valid_cid(value: &str) -> bool {
         && value
             .bytes()
             .skip(7)
-            .all(|byte| (b'a'..=b'z').contains(&byte) || (b'2'..=b'7').contains(&byte))
+            .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte))
 }
 
 fn valid_share_id(value: &str) -> bool {
@@ -584,7 +584,7 @@ impl fmt::Debug for ContentSource {
 }
 
 /// Independently bound identity, target origin, policy action, and exact resource.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareScope {
     pub share_cid: ShareCid,
     pub share_id: ShareId,
@@ -783,18 +783,18 @@ mod tests {
         assert!(PolicyCid::parse(SQL_POLICY_CID).is_ok());
         assert!(ShareCid::parse(&KV_SHARE_CID[..58]).is_err());
         assert!(ShareCid::parse(&overlong_cid).is_err());
-        assert!(ShareCid::parse(&KV_SHARE_CID.to_ascii_uppercase()).is_err());
+        assert!(ShareCid::parse(KV_SHARE_CID.to_ascii_uppercase()).is_err());
         assert!(FROZEN_CID_PATTERN.starts_with("^bafkrei"));
         assert!(ShareCid::parse(&noncanonical_cid).is_err());
         assert!(ShareId::parse("share-01").is_ok());
         assert!(ShareId::parse("9.share_~-").is_ok());
         assert!(ShareId::parse("share/01").is_err());
-        assert!(ShareId::parse(&"s".repeat(128)).is_ok());
-        assert!(ShareId::parse(&"s".repeat(129)).is_err());
-        assert!(DatabaseName::parse(&"9".repeat(128)).is_ok());
-        assert!(DatabaseName::parse(&"9".repeat(129)).is_err());
-        assert!(NamedStatement::parse(&format!("a{}", "_".repeat(127))).is_ok());
-        assert!(NamedStatement::parse(&format!("a{}", "_".repeat(128))).is_err());
+        assert!(ShareId::parse("s".repeat(128)).is_ok());
+        assert!(ShareId::parse("s".repeat(129)).is_err());
+        assert!(DatabaseName::parse("9".repeat(128)).is_ok());
+        assert!(DatabaseName::parse("9".repeat(129)).is_err());
+        assert!(NamedStatement::parse(format!("a{}", "_".repeat(127))).is_ok());
+        assert!(NamedStatement::parse(format!("a{}", "_".repeat(128))).is_err());
         assert!(NamedStatement::parse("9read").is_err());
         assert!(PolicyCid::parse(&overlong_cid).is_err());
         assert!(TargetOrigin::parse("https://node.example:8443").is_ok());

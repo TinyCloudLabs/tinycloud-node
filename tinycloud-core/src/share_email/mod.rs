@@ -1,13 +1,21 @@
-//! Exact-email N0a seam.
+//! Exact-email protocol module.
 //!
-//! This leaf declares no routes, storage schema, configuration, or authority
-//! composition.  The integration owner wires it from `lib.rs` after N1/N2/N3
-//! provide their implementations.
+//! `bridge` is the N4 integration owner's sole concrete implementation of
+//! [`ports::PolicyAuthorityTransaction117`]; every other leaf here is owned
+//! by its originating lane (N1 `invitation`/`state`, N2 `verifier`, N3
+//! `data_plane`). This module still declares no HTTP routes, configuration,
+//! or app-state composition; that remains `lib.rs`'s responsibility.
 
+pub mod bridge;
+pub mod data_plane;
 pub mod fakes;
+pub mod invitation;
 pub mod ports;
+pub mod state;
 pub mod types;
+pub mod verifier;
 
+pub use bridge::DatabaseAuthorityBridge117;
 pub use ports::{
     CredentialVerifier, KvReadAdapter, NamedSqlReadAdapter, PolicyAuthorityBridge117,
     PolicyAuthorityTransaction117, PortError,

@@ -282,15 +282,38 @@ impl ProtocolStateRepository {
         audit: AuditEvent,
         now: OffsetDateTime,
     ) -> Result<SessionHandleMapping, StateError> {
+        let tx = self.conn.begin().await?;
+        let result = Self::commit_session_body(&tx, session, audit, now).await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    /// Transaction-scoped variant of [`Self::commit_session`] for callers
+    /// (the #117 bridge) that must revalidate authority and persist this
+    /// session's replay/audit effects in one shared transaction.
+    pub(crate) async fn commit_session_in_transaction(
+        tx: &DatabaseTransaction,
+        session: SessionHandleMapping,
+        audit: AuditEvent,
+        now: OffsetDateTime,
+    ) -> Result<SessionHandleMapping, StateError> {
+        Self::commit_session_body(tx, session, audit, now).await
+    }
+
+    async fn commit_session_body(
+        tx: &DatabaseTransaction,
+        session: SessionHandleMapping,
+        audit: AuditEvent,
+        now: OffsetDateTime,
+    ) -> Result<SessionHandleMapping, StateError> {
         if session.expires_at <= now || session.expires_at > now + SESSION_TTL {
             return Err(StateError::Invalid);
         }
         if session.authority_session_cid.is_empty() {
             return Err(StateError::Invalid);
         }
-        let tx = self.conn.begin().await?;
         let existed = share_session_handle::Entity::find_by_id(&session.handle)
-            .one(&tx)
+            .one(tx)
             .await?
             .is_some();
         share_session_handle::Entity::insert(share_session_handle::ActiveModel {
@@ -307,11 +330,11 @@ impl ProtocolStateRepository {
                 .do_nothing()
                 .to_owned(),
         )
-        .exec(&tx)
+        .exec(tx)
         .await?;
         if existed {
             let existing = share_session_handle::Entity::find_by_id(&session.handle)
-                .one(&tx)
+                .one(tx)
                 .await?
                 .ok_or(StateError::Storage)?;
             if existing.authority_session_cid != session.authority_session_cid
@@ -319,11 +342,10 @@ impl ProtocolStateRepository {
             {
                 return Err(StateError::Replay);
             }
-            tx.commit().await?;
             return Ok(session);
         }
         let existing = share_session_handle::Entity::find_by_id(&session.handle)
-            .one(&tx)
+            .one(tx)
             .await?
             .ok_or(StateError::Storage)?;
         if existing.authority_session_cid != session.authority_session_cid
@@ -346,9 +368,8 @@ impl ProtocolStateRepository {
                 .do_nothing()
                 .to_owned(),
         )
-        .exec(&tx)
+        .exec(tx)
         .await?;
-        tx.commit().await?;
         Ok(session)
     }
 
@@ -359,15 +380,43 @@ impl ProtocolStateRepository {
         read: HolderReadJti,
         now: OffsetDateTime,
     ) -> Result<(), StateError> {
+        let tx = self.conn.begin().await?;
+        Self::consume_holder_read_jti_body(&tx, read, now).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Transaction-scoped variant of [`Self::consume_holder_read_jti`] for
+    /// callers (the #117 bridge) that must revalidate authority and consume
+    /// this read's JTI in one shared transaction.
+    pub(crate) async fn consume_holder_read_jti_in_transaction(
+        tx: &DatabaseTransaction,
+        read: HolderReadJti,
+        now: OffsetDateTime,
+    ) -> Result<(), StateError> {
+        Self::consume_holder_read_jti_body(tx, read, now).await
+    }
+
+    async fn consume_holder_read_jti_body(
+        tx: &DatabaseTransaction,
+        read: HolderReadJti,
+        now: OffsetDateTime,
+    ) -> Result<(), StateError> {
         if read.expires_at <= now || read.expires_at > now + READ_JTI_TTL {
             return Err(StateError::Invalid);
         }
-        let tx = self.conn.begin().await?;
         let session = share_session_handle::Entity::find_by_id(&read.session_handle)
-            .one(&tx)
+            .one(tx)
             .await?
             .ok_or(StateError::Replay)?;
         if session.revoked_at.is_some() || parse_timestamp(&session.expires_at)? <= now {
+            return Err(StateError::Replay);
+        }
+        if share_holder_read_jti::Entity::find_by_id(&read.jti)
+            .one(tx)
+            .await?
+            .is_some()
+        {
             return Err(StateError::Replay);
         }
         share_holder_read_jti::ActiveModel {
@@ -379,13 +428,9 @@ impl ProtocolStateRepository {
             expires_at: Set(timestamp(read.expires_at)?),
             consumed_at: Set(Some(timestamp(now)?)),
         }
-        .insert(&tx)
+        .insert(tx)
         .await
-        .map_err(|error| match error {
-            DbErr::RecordNotInserted | DbErr::RecordNotUpdated => StateError::Replay,
-            _ => StateError::Storage,
-        })?;
-        tx.commit().await?;
+        .map_err(|_| StateError::Replay)?;
         Ok(())
     }
 
@@ -558,11 +603,11 @@ async fn increment_quota(
     Ok(())
 }
 
-fn timestamp(value: OffsetDateTime) -> Result<String, StateError> {
+pub(crate) fn timestamp(value: OffsetDateTime) -> Result<String, StateError> {
     value.format(&Rfc3339).map_err(|_| StateError::Invalid)
 }
 
-fn parse_timestamp(value: &str) -> Result<OffsetDateTime, StateError> {
+pub(crate) fn parse_timestamp(value: &str) -> Result<OffsetDateTime, StateError> {
     OffsetDateTime::parse(value, &Rfc3339).map_err(|_| StateError::Storage)
 }
 
