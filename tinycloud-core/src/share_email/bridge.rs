@@ -353,10 +353,7 @@ impl DatabaseAuthorityBridge117 {
             &bindings,
         )
         .await
-        .map_err(|failure| {
-            eprintln!("mounted session: authority issuance failure {failure:?}");
-            map_authority_error(failure)
-        })?;
+        .map_err(map_authority_error)?;
         Ok(preview.artifact().delegation_cid.clone())
     }
 

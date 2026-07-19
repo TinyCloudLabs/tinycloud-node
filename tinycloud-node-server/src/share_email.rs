@@ -1311,11 +1311,7 @@ pub async fn policy_session(
         .bridge
         .establish_session(session_request, now)
         .await
-        .map_err(|failure| {
-            #[cfg(feature = "mounted-fixture")]
-            eprintln!("mounted policy session: establish {failure:?}");
-            error(Status::Forbidden, "policy_denied")
-        })?;
+        .map_err(|_| error(Status::Forbidden, "policy_denied"))?;
     let session_wire = PolicySession {
         artifact_type: "TinyCloudSharePolicySession".to_owned(),
         version: 1,
@@ -1387,21 +1383,13 @@ pub async fn read(
         },
         &runtime.config,
     )
-    .map_err(|_| {
-        #[cfg(feature = "mounted-fixture")]
-        eprintln!("mounted read: scope reconstruction");
-        generic("read_denied")
-    })?;
+    .map_err(|_| generic("read_denied"))?;
     verify_read_request_body_digest(
         &request_value,
         &request.request_body_digest,
         &i.request_body_digest,
     )
-    .map_err(|_| {
-        #[cfg(feature = "mounted-fixture")]
-        eprintln!("mounted read: body digest");
-        generic("read_denied")
-    })?;
+    .map_err(|_| generic("read_denied"))?;
     if request.session_id != i.session_id
         || request.delegation_cid != i.delegation_cid
         || request.authority_material_handle != i.authority_material_handle
@@ -1459,16 +1447,10 @@ pub async fn read(
         .data_plane
         .read(read_request, OffsetDateTime::now_utc())
         .await
-        .map_err(|e| {
-            #[cfg(feature = "mounted-fixture")]
-            eprintln!("mounted read: data plane {e:?}");
-            match e {
-                DataPlaneError::Storage => {
-                    error(Status::ServiceUnavailable, "capability_unavailable")
-                }
-                DataPlaneError::Replay => error(Status::Forbidden, "read_denied"),
-                _ => error(Status::Forbidden, "read_denied"),
-            }
+        .map_err(|e| match e {
+            DataPlaneError::Storage => error(Status::ServiceUnavailable, "capability_unavailable"),
+            DataPlaneError::Replay => error(Status::Forbidden, "read_denied"),
+            _ => error(Status::Forbidden, "read_denied"),
         })?;
     let content = String::from_utf8(response.document.as_bytes().to_vec())
         .map_err(|_| error(Status::Forbidden, "read_denied"))?;
