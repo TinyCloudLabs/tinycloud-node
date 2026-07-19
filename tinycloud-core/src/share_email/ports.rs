@@ -7,6 +7,48 @@ use time::OffsetDateTime;
 
 use super::types::*;
 
+/// Opaque bytes supplied by an authenticated operator/provider. Request
+/// fields are never promoted to authority material by the node.
+#[derive(Debug, Clone)]
+pub struct AuthorityMaterialBundle {
+    pub policy_authority: Vec<u8>,
+    pub policy_enforcement: Vec<u8>,
+    pub policy_state: Vec<u8>,
+    pub internal_policy_authority_cid: NodeDelegationCid,
+    pub internal_policy_enforcement_cid: NodeDelegationCid,
+    pub internal_delegation_cid: NodeDelegationCid,
+}
+
+/// Resolves Share-domain identifiers to signed #117 authority artifacts.
+#[async_trait]
+pub trait AuthorityMaterialProvider: Send + Sync {
+    async fn resolve(
+        &self,
+        policy: &PolicyCid,
+        delegation: &ShareDelegationCid,
+    ) -> Result<AuthorityMaterialBundle, PortError>;
+
+    fn healthy(&self) -> bool;
+}
+
+/// Supplies a fresh, authenticated, monotonic status statement for #117.
+#[async_trait]
+pub trait FreshAuthenticatedStatusProvider: Send + Sync {
+    async fn refresh(&self, delegation: &NodeDelegationCid) -> Result<Vec<u8>, PortError>;
+
+    fn healthy(&self) -> bool;
+}
+
+/// Supplies attestation/enrollment evidence binding this node to the
+/// configured enforcer key and audience. No request-field implementation is
+/// provided here.
+#[async_trait]
+pub trait AttestationEnrollmentProvider: Send + Sync {
+    async fn attest(&self, audience: &Did, enforcer: &DidKey) -> Result<Vec<u8>, PortError>;
+
+    fn healthy(&self) -> bool;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PortError {
     #[error("share-email capability unavailable")]

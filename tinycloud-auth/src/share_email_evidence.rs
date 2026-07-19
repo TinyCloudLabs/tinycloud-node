@@ -477,6 +477,18 @@ fn verify_ed25519(
     .map_err(|_| EvidenceError::InvalidSignature)
 }
 
+/// Verify an Ed25519 signature for a caller-selected, already
+/// domain-separated byte string. This reuses the same canonical signature and
+/// SSI verification path as the holder-binding verifier.
+pub fn verify_detached_ed25519(
+    signer_did: &str,
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), EvidenceError> {
+    let public_key = did_key_public_key(signer_did)?;
+    verify_ed25519(&public_key, message, signature)
+}
+
 fn did_key_public_key(did: &str) -> Result<[u8; 32], EvidenceError> {
     let encoded = did
         .strip_prefix("did:key:z")

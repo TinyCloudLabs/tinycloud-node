@@ -17,16 +17,17 @@ pub mod verifier;
 
 pub use bridge::DatabaseAuthorityBridge117;
 pub use ports::{
-    CredentialVerifier, KvReadAdapter, NamedSqlReadAdapter, PolicyAuthorityBridge117,
-    PolicyAuthorityTransaction117, PortError,
+    AttestationEnrollmentProvider, AuthorityMaterialBundle, AuthorityMaterialProvider,
+    CredentialVerifier, FreshAuthenticatedStatusProvider, KvReadAdapter, NamedSqlReadAdapter,
+    PolicyAuthorityBridge117, PolicyAuthorityTransaction117, PortError,
 };
 pub use types::{
     Action, AuthorizedRead, ContentSource, CredentialVerificationEvidence, DatabaseName, Did,
-    DidKey, ExactResource, HolderEquation, KvGetAction, MarkdownDocument, NamedStatement, Origin,
-    Path, PolicyCid, PolicySession, PolicySessionRequest, ProtocolJti, ProtocolNonce,
-    ReadAuthorizationRequest, ReadInvocation, Resource, SafeJsonInteger, SessionHandle,
-    Sha256Digest, ShareAction, ShareCid, ShareId, ShareScope, SqlReadAction, TargetOrigin,
-    TypeError, KV_GET_ACTION, KV_POLICY_CID, KV_SHARE_CID, MARKDOWN_MEDIA_TYPE, MAX_CID_BYTES,
-    MAX_DATABASE_NAME_BYTES, MAX_MARKDOWN_BYTES, MAX_SHARE_ID_BYTES, SQL_POLICY_CID,
-    SQL_READ_ACTION, SQL_SHARE_CID,
+    DidKey, ExactResource, HolderEquation, KvGetAction, MarkdownDocument, NamedStatement,
+    NodeDelegationCid, Origin, Path, PolicyCid, PolicySession, PolicySessionRequest, ProtocolJti,
+    ProtocolNonce, ReadAuthorizationRequest, ReadInvocation, Resource, SafeJsonInteger,
+    SessionHandle, Sha256Digest, ShareAction, ShareCid, ShareDelegationCid, ShareId, ShareScope,
+    SqlReadAction, TargetOrigin, TypeError, KV_GET_ACTION, KV_POLICY_CID, KV_SHARE_CID,
+    MARKDOWN_MEDIA_TYPE, MAX_CID_BYTES, MAX_DATABASE_NAME_BYTES, MAX_MARKDOWN_BYTES,
+    MAX_SHARE_ID_BYTES, SQL_POLICY_CID, SQL_READ_ACTION, SQL_SHARE_CID,
 };

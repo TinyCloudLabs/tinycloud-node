@@ -6,8 +6,10 @@
 //! attenuation rules, revocation traversal, and atomic persistence contract.
 
 mod database;
+mod verifier;
 
 pub use database::{DatabaseAuthorityKernel, DatabaseAuthorityStore};
+pub use verifier::{AuthorityArtifactVerifier, ConfiguredNodeRootSigner, NodeRootSigner};
 
 use crate::policy_capability::{
     parse as parse_capability, requested_capabilities_hash_hex, PolicyCapability,
@@ -68,7 +70,6 @@ const SESSION_FACTS: &[&str] = &[
     "issuanceId",
     "remainingRedelegationDepth",
     "auditProfile",
-    "recipientEmail",
 ];
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -202,6 +203,10 @@ impl PolicyDelegation {
             .get(&format!("{POLICY_PREFIX}{name}"))
             .map(String::as_str)
             .ok_or(AuthorityError::FactsMismatch)
+    }
+
+    pub(crate) fn fact_value(&self, name: &'static str) -> Result<&str, AuthorityError> {
+        self.fact(name)
     }
 
     fn depth(&self) -> Result<u8, AuthorityError> {
@@ -351,6 +356,10 @@ fn strict_json_value(bytes: &[u8]) -> Result<Value, AuthorityError> {
 pub struct VerifiedDelegation(PolicyDelegation);
 
 impl VerifiedDelegation {
+    pub(crate) fn from_verified(artifact: PolicyDelegation) -> Self {
+        Self(artifact)
+    }
+
     pub fn artifact(&self) -> &PolicyDelegation {
         &self.0
     }
@@ -2102,7 +2111,7 @@ mod tests {
             assert!(schema.has_table(table).await.unwrap(), "missing {table}");
         }
 
-        crate::migrations::Migrator::down(&db, Some(1))
+        crate::migrations::Migrator::down(&db, Some(3))
             .await
             .unwrap();
         for table in [

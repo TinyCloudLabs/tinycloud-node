@@ -43,7 +43,8 @@ use tinycloud_core::{
         types::{
             ContentSource, Did, DidKey, ExactResource, Path, PolicyCid,
             PolicySessionRequest as AuthorityPolicySessionRequest, ProtocolJti, ProtocolNonce,
-            SessionHandle, ShareAction, ShareCid, ShareId, ShareScope, TargetOrigin,
+            SessionHandle, ShareAction, ShareCid, ShareDelegationCid, ShareId, ShareScope,
+            TargetOrigin,
         },
         verifier::ExactEmailVerifier,
         DatabaseAuthorityBridge117, PolicyAuthorityTransaction117, PortError,
@@ -72,7 +73,7 @@ pub struct PolicyChallengeRequest {
     #[serde(rename = "shareId")]
     pub share_id: tinycloud_core::share_email::ShareId,
     #[serde(rename = "delegationCid")]
-    pub delegation_cid: tinycloud_core::share_email::ShareCid,
+    pub delegation_cid: ShareDelegationCid,
     #[serde(rename = "policyCid")]
     pub policy_cid: PolicyCid,
     #[serde(rename = "contentSource")]
@@ -105,7 +106,7 @@ pub struct PolicyChallenge {
     #[serde(rename = "shareId")]
     pub share_id: tinycloud_core::share_email::ShareId,
     #[serde(rename = "delegationCid")]
-    pub delegation_cid: tinycloud_core::share_email::ShareCid,
+    pub delegation_cid: ShareDelegationCid,
     #[serde(rename = "policyCid")]
     pub policy_cid: PolicyCid,
     #[serde(rename = "contentSource")]
@@ -142,7 +143,7 @@ pub struct PolicyPresentation {
     #[serde(rename = "shareId")]
     pub share_id: tinycloud_core::share_email::ShareId,
     #[serde(rename = "delegationCid")]
-    pub delegation_cid: tinycloud_core::share_email::ShareCid,
+    pub delegation_cid: ShareDelegationCid,
     #[serde(rename = "policyCid")]
     pub policy_cid: PolicyCid,
     #[serde(rename = "contentSource")]
@@ -189,7 +190,7 @@ pub struct PolicySession {
     #[serde(rename = "shareId")]
     pub share_id: tinycloud_core::share_email::ShareId,
     #[serde(rename = "delegationCid")]
-    pub delegation_cid: tinycloud_core::share_email::ShareCid,
+    pub delegation_cid: ShareDelegationCid,
     #[serde(rename = "policyCid")]
     pub policy_cid: PolicyCid,
     #[serde(rename = "contentSource")]
@@ -532,6 +533,13 @@ pub fn compose(
         conn.clone(),
         DatabaseAuthorityStore::new(conn.clone()),
     ));
+    // Sequence C supplies authenticated authority material, fresh status, and
+    // attestation/enrollment providers. Until all three are injected and
+    // healthy, the capability is absent and every protocol route stays
+    // fail-closed.
+    if !bridge.ready() {
+        return Ok(None);
+    }
     let kv = TinyCloudKvStore {
         tinycloud,
         space_name: config.space_name.clone(),
@@ -726,7 +734,7 @@ struct NodeInvitationAuthorizationRequest {
     pub sender_did: DidKey,
     pub share_cid: ShareCid,
     pub share_id: ShareId,
-    pub delegation_cid: ShareCid,
+    pub delegation_cid: ShareDelegationCid,
     pub policy_cid: PolicyCid,
     pub recipient_email: CanonicalEmail,
     pub target_origin: TargetOrigin,
@@ -809,12 +817,20 @@ pub async fn authorize_invitation(
         .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
     runtime
         .bridge
-        .validate_sender_for_policy(request.policy_cid.as_str(), request.sender_did.as_str())
+        .validate_sender_for_policy(
+            request.policy_cid.as_str(),
+            request.delegation_cid.as_str(),
+            request.sender_did.as_str(),
+        )
         .await
         .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
     let (policy_email, policy_expiry) = runtime
         .bridge
-        .policy_recipient_and_expiry(request.policy_cid.as_str(), now)
+        .policy_recipient_and_expiry(
+            request.policy_cid.as_str(),
+            request.delegation_cid.as_str(),
+            now,
+        )
         .await
         .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
     if policy_email != request.recipient_email.as_str()
@@ -1068,7 +1084,7 @@ pub async fn policy_session(
     }
     let (policy_email, policy_expiry) = runtime
         .bridge
-        .policy_recipient_and_expiry(p.policy_cid.as_str(), now)
+        .policy_recipient_and_expiry(p.policy_cid.as_str(), p.delegation_cid.as_str(), now)
         .await
         .map_err(|_| error(Status::Forbidden, "policy_denied"))?;
     let evidence = runtime
@@ -1173,7 +1189,7 @@ pub async fn read(
         &PolicyChallengeRequest {
             share_cid: i.share_cid.clone(),
             share_id: i.share_id.clone(),
-            delegation_cid: tinycloud_core::share_email::ShareCid::parse(i.policy_cid.as_str())
+            delegation_cid: ShareDelegationCid::parse(i.policy_cid.as_str())
                 .map_err(|_| generic("read_denied"))?,
             policy_cid: i.policy_cid.clone(),
             content_source: i.content_source.clone(),

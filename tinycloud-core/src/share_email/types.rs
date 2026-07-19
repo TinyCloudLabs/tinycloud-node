@@ -41,6 +41,10 @@ pub enum TypeError {
     InvalidShareId,
     #[error("invalid policy CID")]
     InvalidPolicyCid,
+    #[error("invalid share delegation CID")]
+    InvalidShareDelegationCid,
+    #[error("invalid node delegation CID")]
+    InvalidNodeDelegationCid,
     #[error("invalid safe JSON integer")]
     InvalidSafeJsonInteger,
 }
@@ -403,6 +407,8 @@ validated_string!(TargetOrigin, InvalidTargetOrigin, valid_target_origin);
 validated_string!(ShareCid, InvalidShareCid, valid_cid);
 validated_string!(ShareId, InvalidShareId, valid_share_id);
 validated_string!(PolicyCid, InvalidPolicyCid, valid_cid);
+validated_string!(ShareDelegationCid, InvalidShareDelegationCid, valid_cid);
+validated_string!(NodeDelegationCid, InvalidNodeDelegationCid, valid_cid);
 pub type Origin = TargetOrigin;
 
 #[derive(Clone, PartialEq, Eq, Hash, Serialize)]
@@ -588,7 +594,7 @@ impl fmt::Debug for ContentSource {
 pub struct ShareScope {
     pub share_cid: ShareCid,
     pub share_id: ShareId,
-    pub delegation_cid: Option<ShareCid>,
+    pub delegation_cid: Option<ShareDelegationCid>,
     pub policy_cid: PolicyCid,
     pub node_audience: Did,
     pub target_origin: TargetOrigin,

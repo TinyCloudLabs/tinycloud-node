@@ -347,78 +347,9 @@ impl DatabaseAuthorityStore {
             .begin_with_config(policy_isolation_level(&self.db), None)
             .await
             .map_err(|_| AuthorityError::TransactionFailed)?;
-        let operation = async {
-            let mut authority_cids = artifact.0.proof_cids.clone();
-            authority_cids.sort();
-            authority_cids.dedup();
-            if authority_cids.len() != 2 {
-                return Err(AuthorityError::ProofSetUnmatched);
-            }
-            for cid in authority_cids {
-                self.ensure_live_on(&transaction, &cid, consumed_at, false, true)
-                    .await?;
-            }
-            #[cfg(test)]
-            self.wait_at_race_barrier().await;
-            let challenge = policy_challenge::Entity::find_by_id(challenge_id.clone())
-                .one(&transaction)
-                .await
-                .map_err(|_| AuthorityError::TransactionFailed)?
-                .ok_or(AuthorityError::ChallengeNotFound)?;
-            if challenge.consumed_at.is_some() {
-                return Err(AuthorityError::ChallengeConsumed);
-            }
-            let challenge = challenge_from_model(challenge)?;
-            if consumed_at < challenge.issued_at || consumed_at >= challenge.expires_at {
-                return Err(AuthorityError::ChallengeExpired);
-            }
-            let consumed = policy_challenge::Entity::update_many()
-                .col_expr(
-                    policy_challenge::Column::ConsumedAt,
-                    Expr::value(db_time(consumed_at)?),
-                )
-                .filter(policy_challenge::Column::ChallengeId.eq(challenge_id))
-                .filter(policy_challenge::Column::ConsumedAt.is_null())
-                .exec(&transaction)
-                .await
-                .map_err(|_| AuthorityError::TransactionFailed)?;
-            if consumed.rows_affected != 1 {
-                return Err(AuthorityError::ChallengeConsumed);
-            }
-
-            let status = AuthorityStatus {
-                checked_at: consumed_at,
-                sequence: 0,
-                revoked_at: None,
-            };
-            policy_delegation::Entity::insert(artifact_model(&artifact, &status)?)
-                .exec(&transaction)
-                .await
-                .map_err(|_| AuthorityError::TransactionFailed)?;
-            policy_issuance_audit::ActiveModel {
-                issuance_id: Set(audit.issuance_id.clone()),
-                session_delegation_cid: Set(audit.session_delegation_cid.clone()),
-                audit_json: Set(
-                    serde_json::to_value(&audit).map_err(|_| AuthorityError::TransactionFailed)?
-                ),
-            }
-            .insert(&transaction)
-            .await
-            .map_err(|_| AuthorityError::TransactionFailed)?;
-            for (position, parent_cid) in artifact.0.proof_cids.iter().enumerate() {
-                policy_edge::ActiveModel {
-                    child_cid: Set(artifact.0.delegation_cid.clone()),
-                    position: Set(position as i32),
-                    parent_cid: Set(parent_cid.clone()),
-                    edge_kind: Set("authority".to_string()),
-                }
-                .insert(&transaction)
-                .await
-                .map_err(|_| AuthorityError::TransactionFailed)?;
-            }
-            Ok(())
-        }
-        .await;
+        let operation = self
+            .persist_root_in_transaction(&transaction, artifact, audit, challenge_id, consumed_at)
+            .await;
         match operation {
             Ok(()) => transaction
                 .commit()
@@ -432,6 +363,88 @@ impl DatabaseAuthorityStore {
                 Err(error)
             }
         }
+    }
+
+    /// Persist a verified root, its status/edges/audit, and consume its
+    /// challenge on the caller's transaction. The caller owns the final
+    /// commit so protocol JTI/handle effects can be atomic with #117.
+    pub async fn persist_root_in_transaction(
+        &self,
+        transaction: &DatabaseTransaction,
+        artifact: VerifiedDelegation,
+        audit: IssuanceAudit,
+        challenge_id: String,
+        consumed_at: OffsetDateTime,
+    ) -> Result<(), AuthorityError> {
+        let mut authority_cids = artifact.0.proof_cids.clone();
+        authority_cids.sort();
+        authority_cids.dedup();
+        if authority_cids.len() != 2 {
+            return Err(AuthorityError::ProofSetUnmatched);
+        }
+        for cid in authority_cids {
+            self.ensure_live_on(transaction, &cid, consumed_at, false, true)
+                .await?;
+        }
+        #[cfg(test)]
+        self.wait_at_race_barrier().await;
+        let challenge = policy_challenge::Entity::find_by_id(challenge_id.clone())
+            .one(transaction)
+            .await
+            .map_err(|_| AuthorityError::TransactionFailed)?
+            .ok_or(AuthorityError::ChallengeNotFound)?;
+        if challenge.consumed_at.is_some() {
+            return Err(AuthorityError::ChallengeConsumed);
+        }
+        let challenge = challenge_from_model(challenge)?;
+        if consumed_at < challenge.issued_at || consumed_at >= challenge.expires_at {
+            return Err(AuthorityError::ChallengeExpired);
+        }
+        let consumed = policy_challenge::Entity::update_many()
+            .col_expr(
+                policy_challenge::Column::ConsumedAt,
+                Expr::value(db_time(consumed_at)?),
+            )
+            .filter(policy_challenge::Column::ChallengeId.eq(challenge_id))
+            .filter(policy_challenge::Column::ConsumedAt.is_null())
+            .exec(transaction)
+            .await
+            .map_err(|_| AuthorityError::TransactionFailed)?;
+        if consumed.rows_affected != 1 {
+            return Err(AuthorityError::ChallengeConsumed);
+        }
+
+        let status = AuthorityStatus {
+            checked_at: consumed_at,
+            sequence: 0,
+            revoked_at: None,
+        };
+        policy_delegation::Entity::insert(artifact_model(&artifact, &status)?)
+            .exec(transaction)
+            .await
+            .map_err(|_| AuthorityError::TransactionFailed)?;
+        policy_issuance_audit::ActiveModel {
+            issuance_id: Set(audit.issuance_id.clone()),
+            session_delegation_cid: Set(audit.session_delegation_cid.clone()),
+            audit_json: Set(
+                serde_json::to_value(&audit).map_err(|_| AuthorityError::TransactionFailed)?
+            ),
+        }
+        .insert(transaction)
+        .await
+        .map_err(|_| AuthorityError::TransactionFailed)?;
+        for (position, parent_cid) in artifact.0.proof_cids.iter().enumerate() {
+            policy_edge::ActiveModel {
+                child_cid: Set(artifact.0.delegation_cid.clone()),
+                position: Set(position as i32),
+                parent_cid: Set(parent_cid.clone()),
+                edge_kind: Set("authority".to_string()),
+            }
+            .insert(transaction)
+            .await
+            .map_err(|_| AuthorityError::TransactionFailed)?;
+        }
+        Ok(())
     }
 
     async fn persist_descendant_atomic(
@@ -508,6 +521,103 @@ impl DatabaseAuthorityKernel {
             store,
             running_node_did: running_node_did.into(),
         }
+    }
+
+    /// Validate and persist a verified root on an existing transaction. This
+    /// is the transaction boundary used by a composing protocol: root,
+    /// status, ordered authority edges, issuance audit, and challenge
+    /// consumption are committed by the caller together with its JTI/handle
+    /// records.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn issue_root_in_transaction(
+        &self,
+        transaction: &DatabaseTransaction,
+        policy_authority: &VerifiedDelegation,
+        policy_enforcement: &VerifiedDelegation,
+        policy_state: &VerifiedPolicyState,
+        root: VerifiedDelegation,
+        binding: &VerifiedAttestedEnforcerBinding,
+        decision: &TrustedPolicyDecision,
+        bindings: &IssuanceBindings,
+    ) -> Result<(), AuthorityError> {
+        validate_authority_pair(
+            &policy_authority.0,
+            &policy_enforcement.0,
+            policy_state,
+            &self.running_node_did,
+        )?;
+        self.store
+            .validate_for_invocation_in_transaction(
+                transaction,
+                &policy_authority.0.delegation_cid,
+                bindings.now,
+            )
+            .await?;
+        self.store
+            .validate_for_invocation_in_transaction(
+                transaction,
+                &policy_enforcement.0.delegation_cid,
+                bindings.now,
+            )
+            .await?;
+        let challenge = policy_challenge::Entity::find_by_id(bindings.challenge_id.clone())
+            .one(transaction)
+            .await
+            .map_err(|_| AuthorityError::TransactionFailed)?
+            .ok_or(AuthorityError::ChallengeNotFound)?;
+        let challenge = challenge_from_model(challenge)?;
+        if challenge.consumed_at.is_some() {
+            return Err(AuthorityError::ChallengeConsumed);
+        }
+        let audit = validate_root(
+            &policy_authority.0,
+            &policy_enforcement.0,
+            policy_state,
+            &challenge,
+            &root.0,
+            binding,
+            decision,
+            bindings,
+            &self.running_node_did,
+        )?;
+        self.store
+            .persist_root_in_transaction(
+                transaction,
+                root,
+                audit,
+                bindings.challenge_id.clone(),
+                bindings.now,
+            )
+            .await
+    }
+
+    /// Sign a node root with configured key material, re-verify its signature
+    /// and CID, then issue it on the caller's transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn sign_and_issue_root_in_transaction(
+        &self,
+        transaction: &DatabaseTransaction,
+        policy_authority: &VerifiedDelegation,
+        policy_enforcement: &VerifiedDelegation,
+        policy_state: &VerifiedPolicyState,
+        root: PolicyDelegation,
+        signer: &dyn NodeRootSigner,
+        binding: &VerifiedAttestedEnforcerBinding,
+        decision: &TrustedPolicyDecision,
+        bindings: &IssuanceBindings,
+    ) -> Result<(), AuthorityError> {
+        let verified = AuthorityArtifactVerifier.sign_and_verify_root(root, signer)?;
+        self.issue_root_in_transaction(
+            transaction,
+            policy_authority,
+            policy_enforcement,
+            policy_state,
+            verified,
+            binding,
+            decision,
+            bindings,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
