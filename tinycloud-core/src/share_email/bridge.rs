@@ -477,7 +477,11 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
 
         let authority_session_cid = self
             .issue_root_in_transaction(&tx, &request, now, policy_expiry, credential_expiry)
-            .await?;
+            .await
+            .map_err(|failure| {
+                eprintln!("mounted session: root issuance {failure:?}");
+                failure
+            })?;
 
         let mut handle_bytes = [0u8; 16];
         OsRng.fill_bytes(&mut handle_bytes);
