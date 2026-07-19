@@ -311,8 +311,8 @@ impl DatabaseAuthorityBridge117 {
                 policy.artifact().delegation_cid.clone(),
                 enforcement.artifact().delegation_cid.clone(),
             ],
-            not_before: timestamp(now).map_err(|_| PortError::Denied)?,
-            expires_at: timestamp(expires_at).map_err(|_| PortError::Denied)?,
+            not_before: authority_timestamp(now)?,
+            expires_at: authority_timestamp(expires_at)?,
             delegation_mode: if enforcement
                 .artifact()
                 .fact_value("maxRedelegationDepth")
@@ -908,6 +908,14 @@ fn scope_digest(scope: &ShareScope) -> Sha256Digest {
 
 fn digest_string(value: &str) -> Sha256Digest {
     Sha256Digest::from_bytes(Sha256::digest(value.as_bytes()).into())
+}
+
+fn authority_timestamp(value: OffsetDateTime) -> Result<String, PortError> {
+    value
+        .replace_nanosecond(0)
+        .map_err(|_| PortError::Denied)?
+        .format(&Rfc3339)
+        .map_err(|_| PortError::Denied)
 }
 
 fn policy_metadata(
