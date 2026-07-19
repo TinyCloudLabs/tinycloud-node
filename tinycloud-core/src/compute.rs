@@ -131,6 +131,16 @@ pub struct ComputeCaveats {
     pub inputs: Option<serde_json::Value>,
 }
 
+/// The self-describing `D_fn` binding caveat (compute-service.md §5.1/§6.2,
+/// DECIDED D2): `{ "computeFunctionBinding": { "functionCid": "<cid>" } }`.
+/// Pinned as a function (not inlined per call site) because the exact JSON
+/// shape is load-bearing -- the containment engine compares raw maps
+/// byte-for-byte (§6.2/F1), so any drift between the deploy-time check and
+/// the execute-time echo check fails closed.
+pub fn compute_function_binding_caveat(function_cid: &str) -> serde_json::Value {
+    serde_json::json!({ "computeFunctionBinding": { "functionCid": function_cid } })
+}
+
 /// Routine-key derivation error (P1, plan P1/Codex C11). Deliberately a
 /// single, non-generic variant (rather than mirroring each backend's native
 /// error type) so `RoutineKeyDeriver` stays dyn-compatible --
@@ -352,6 +362,15 @@ mod tests {
 
         let list: ComputeRequest = serde_json::from_str(r#"{"action":"list"}"#).unwrap();
         assert_eq!(list, ComputeRequest::List);
+    }
+
+    #[test]
+    fn compute_function_binding_caveat_shape_matches_spec_5_1() {
+        let caveat = compute_function_binding_caveat("bafyfunctioncid");
+        assert_eq!(
+            caveat,
+            serde_json::json!({ "computeFunctionBinding": { "functionCid": "bafyfunctioncid" } })
+        );
     }
 
     #[test]
