@@ -2443,18 +2443,34 @@ async fn handle_compute_deploy(
     // already-over-quota space 402s here, and a payload that would exceed the
     // remaining budget is rejected BEFORE the transaction (we know the size
     // up-front, so -- unlike SQL's post-execute overshoot -- deploy enforces
-    // precisely).
-    if let Some((remaining, current_size, limit_bytes)) =
-        staged_batch_remaining(space, tinycloud, config, quota_cache).await?
-    {
+    // precisely). NOTE (drift resolved): this mirrors `staged_batch_remaining`'s
+    // limit resolution and 402 semantics, BUT treats an unknown (`None`)
+    // `store_size` as 0-used rather than 404. A deploy may be a space's FIRST
+    // write, so it has no block/artifact bytes yet -- and `verify_auth` has
+    // already proven the space EXISTS (a non-existent space fails the outer
+    // invocation with 404 before we get here), so the shared helper's
+    // `None -> "space not found"` would spuriously reject a legitimate first
+    // deploy. Reads never reach this path.
+    let effective_limit = if is_public_space(space) {
+        Some(config.public_spaces.storage_limit)
+    } else {
+        quota_cache.get_limit(space).await
+    };
+    if let Some(limit) = effective_limit {
+        let limit_bytes = limit.as_u64();
+        let current_size = tinycloud
+            .store_size(space)
+            .await
+            .map_err(|e| (Status::InternalServerError, e.to_string()))?
+            .unwrap_or(0);
         let wasm_len = u64::try_from(wasm_bytes.len())
             .map_err(|e| (Status::InternalServerError, e.to_string()))?;
-        if wasm_len > remaining {
+        let remaining = limit_bytes.saturating_sub(current_size);
+        if current_size >= limit_bytes || wasm_len > remaining {
             return Err((
                 Status::new(402),
                 format!(
-                    "Storage quota exceeded. Deploy needs {} bytes, remaining {} (used {} of {}).",
-                    wasm_len, remaining, current_size, limit_bytes
+                    "Storage quota exceeded. Deploy needs {wasm_len} bytes, remaining {remaining} (used {current_size} of {limit_bytes})."
                 ),
             ));
         }

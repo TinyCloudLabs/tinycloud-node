@@ -189,14 +189,16 @@ fn ed25519_keypair_from_seed(
 pub fn routine_jwk_from_seed(
     seed: [u8; 32],
 ) -> Result<tinycloud_auth::ssi::jwk::JWK, RoutineKeyError> {
-    use tinycloud_auth::ssi::jwk::{Base64urlUInt, Params, JWK};
+    use tinycloud_auth::ssi::jwk::{Algorithm, Base64urlUInt, Params, JWK};
     let keypair = ed25519_keypair_from_seed(seed)?;
     let public_bytes = keypair.public().to_bytes();
-    Ok(JWK::from(Params::OKP(tinycloud_auth::ssi::jwk::OctetParams {
+    let mut jwk = JWK::from(Params::OKP(tinycloud_auth::ssi::jwk::OctetParams {
         curve: "Ed25519".to_string(),
         public_key: Base64urlUInt(public_bytes.to_vec()),
         private_key: Some(Base64urlUInt(seed.to_vec())),
-    })))
+    }));
+    jwk.algorithm = Some(Algorithm::EdDSA);
+    Ok(jwk)
 }
 
 /// P1 (plan P1, Codex C11): derives a routine's ed25519 seed for
