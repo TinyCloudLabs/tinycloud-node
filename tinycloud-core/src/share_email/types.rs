@@ -43,6 +43,8 @@ pub enum TypeError {
     InvalidPolicyCid,
     #[error("invalid share delegation CID")]
     InvalidShareDelegationCid,
+    #[error("invalid authority material handle")]
+    InvalidAuthorityMaterialHandle,
     #[error("invalid node delegation CID")]
     InvalidNodeDelegationCid,
     #[error("invalid safe JSON integer")]
@@ -408,6 +410,17 @@ validated_string!(ShareCid, InvalidShareCid, valid_cid);
 validated_string!(ShareId, InvalidShareId, valid_share_id);
 validated_string!(PolicyCid, InvalidPolicyCid, valid_cid);
 validated_string!(ShareDelegationCid, InvalidShareDelegationCid, valid_cid);
+validated_string!(
+    AuthorityMaterialHandle,
+    InvalidAuthorityMaterialHandle,
+    |value: &str| {
+        (1..=128).contains(&value.len())
+            && value.starts_with("amh_")
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    }
+);
 validated_string!(NodeDelegationCid, InvalidNodeDelegationCid, valid_cid);
 pub type Origin = TargetOrigin;
 
@@ -595,6 +608,8 @@ pub struct ShareScope {
     pub share_cid: ShareCid,
     pub share_id: ShareId,
     pub delegation_cid: Option<ShareDelegationCid>,
+    pub authority_material_handle: AuthorityMaterialHandle,
+    pub authority_material_digest: Sha256Digest,
     pub policy_cid: PolicyCid,
     pub node_audience: Did,
     pub target_origin: TargetOrigin,
@@ -839,6 +854,8 @@ mod tests {
             share_cid: ShareCid::parse(KV_SHARE_CID).unwrap(),
             share_id: ShareId::parse("share-secret-id").unwrap(),
             delegation_cid: None,
+            authority_material_handle: AuthorityMaterialHandle::parse("amh_kv_001").unwrap(),
+            authority_material_digest: Sha256Digest::from_bytes([0; 32]),
             policy_cid: PolicyCid::parse(KV_POLICY_CID).unwrap(),
             node_audience: Did::parse("did:web:node.example").unwrap(),
             target_origin: TargetOrigin::parse("https://node.example").unwrap(),

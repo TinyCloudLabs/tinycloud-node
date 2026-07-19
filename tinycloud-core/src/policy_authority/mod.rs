@@ -194,7 +194,7 @@ impl PolicyDelegation {
         canonical_time(&self.not_before)
     }
 
-    fn expires_at(&self) -> Result<OffsetDateTime, AuthorityError> {
+    pub(crate) fn expires_at(&self) -> Result<OffsetDateTime, AuthorityError> {
         canonical_time(&self.expires_at)
     }
 
@@ -379,6 +379,23 @@ pub struct VerifiedAttestedEnforcerBinding {
 }
 
 impl VerifiedAttestedEnforcerBinding {
+    pub(crate) fn binding_digest_hex(&self) -> &str {
+        &self.binding_digest_hex
+    }
+    pub fn from_verified(
+        binding_digest_hex: impl Into<String>,
+        enforcer_did: impl Into<String>,
+        node_audience: impl Into<String>,
+        expires_at: OffsetDateTime,
+    ) -> Self {
+        Self {
+            binding_digest_hex: binding_digest_hex.into(),
+            enforcer_did: enforcer_did.into(),
+            node_audience: node_audience.into(),
+            expires_at,
+        }
+    }
+
     #[cfg(test)]
     fn for_test(
         binding_digest_hex: impl Into<String>,
@@ -411,6 +428,29 @@ pub struct VerifiedPolicyState {
 }
 
 impl VerifiedPolicyState {
+    pub fn from_verified(
+        policy: &PolicyDelegation,
+        enforcement: &PolicyDelegation,
+        status_checked_at: OffsetDateTime,
+        expires_at: OffsetDateTime,
+    ) -> Result<Self, AuthorityError> {
+        let grant_mode = match enforcement.fact("sessionMode")? {
+            "attenuable" => PolicyGrantMode::Attenuable,
+            "terminal" => PolicyGrantMode::Terminal,
+            _ => return Err(AuthorityError::FactsMismatch),
+        };
+        Ok(Self {
+            owner_did: policy.fact("ownerDid")?.to_owned(),
+            policy_id: policy.fact("policyId")?.to_owned(),
+            policy_digest_hex: policy.fact("policyDigestHex")?.to_owned(),
+            capability_ceiling_hash_hex: policy.fact("capabilityCeilingHashHex")?.to_owned(),
+            grant_mode,
+            max_ttl_seconds: decimal_fact(enforcement, "maxSessionTtlSeconds")?,
+            status_checked_at,
+            expires_at,
+        })
+    }
+
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn for_test(
@@ -488,6 +528,23 @@ pub struct TrustedPolicyDecision {
 }
 
 impl TrustedPolicyDecision {
+    pub(crate) fn decision_context_digest_hex(&self) -> &str {
+        &self.decision_context_digest_hex
+    }
+    pub fn allow_from_verified(
+        context: DecisionContext,
+        evaluated_at: OffsetDateTime,
+        valid_until: OffsetDateTime,
+    ) -> Result<Self, AuthorityError> {
+        let decision_context_digest_hex = context.digest_hex()?;
+        Ok(Self {
+            context,
+            decision_context_digest_hex,
+            evaluated_at,
+            valid_until,
+        })
+    }
+
     #[cfg(test)]
     fn allow_for_test(
         context: DecisionContext,
@@ -523,6 +580,44 @@ pub struct ChallengeState {
     consumed_at: Option<OffsetDateTime>,
 }
 
+impl ChallengeState {
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_verified(
+        challenge_id: impl Into<String>,
+        nonce_hash_hex: impl Into<String>,
+        owner_did: impl Into<String>,
+        policy_id: impl Into<String>,
+        policy_digest_hex: impl Into<String>,
+        policy_delegation_cid: impl Into<String>,
+        enforcement_delegation_cid: impl Into<String>,
+        enforcer_did: impl Into<String>,
+        node_audience: impl Into<String>,
+        claimant_did: impl Into<String>,
+        requested_capabilities_hash_hex: impl Into<String>,
+        issued_at: OffsetDateTime,
+        expires_at: OffsetDateTime,
+    ) -> Result<Self, AuthorityError> {
+        let challenge = Self {
+            challenge_id: challenge_id.into(),
+            nonce_hash_hex: nonce_hash_hex.into(),
+            owner_did: owner_did.into(),
+            policy_id: policy_id.into(),
+            policy_digest_hex: policy_digest_hex.into(),
+            policy_delegation_cid: policy_delegation_cid.into(),
+            enforcement_delegation_cid: enforcement_delegation_cid.into(),
+            enforcer_did: enforcer_did.into(),
+            node_audience: node_audience.into(),
+            claimant_did: claimant_did.into(),
+            requested_capabilities_hash_hex: requested_capabilities_hash_hex.into(),
+            issued_at,
+            expires_at,
+            consumed_at: None,
+        };
+        validate_challenge_lifetime(&challenge)?;
+        Ok(challenge)
+    }
+}
+
 /// Inputs bound by the future claim/challenge verifier adapter. Private fields
 /// prevent production callers from fabricating a verified issuance context.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -536,6 +631,33 @@ pub struct IssuanceBindings {
     requested_capabilities_hash_hex: String,
     claim_invocation_digest_hex: String,
     vp_digest_hex: String,
+}
+
+impl IssuanceBindings {
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_verified(
+        now: OffsetDateTime,
+        claim_issued_at: OffsetDateTime,
+        claim_expires_at: OffsetDateTime,
+        challenge_id: impl Into<String>,
+        challenge_nonce_hash_hex: impl Into<String>,
+        claimant_did: impl Into<String>,
+        requested_capabilities_hash_hex: impl Into<String>,
+        claim_invocation_digest_hex: impl Into<String>,
+        vp_digest_hex: impl Into<String>,
+    ) -> Self {
+        Self {
+            now,
+            claim_issued_at,
+            claim_expires_at,
+            challenge_id: challenge_id.into(),
+            challenge_nonce_hash_hex: challenge_nonce_hash_hex.into(),
+            claimant_did: claimant_did.into(),
+            requested_capabilities_hash_hex: requested_capabilities_hash_hex.into(),
+            claim_invocation_digest_hex: claim_invocation_digest_hex.into(),
+            vp_digest_hex: vp_digest_hex.into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -565,6 +687,52 @@ pub struct IssuanceAudit {
 }
 
 impl IssuanceAudit {
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_verified(
+        issuance_id: impl Into<String>,
+        policy: &PolicyDelegation,
+        enforcement: &PolicyDelegation,
+        claimant_did: impl Into<String>,
+        capability_hash_hex: impl Into<String>,
+        challenge_id: impl Into<String>,
+        challenge_nonce_hash_hex: impl Into<String>,
+        claim_invocation_digest_hex: impl Into<String>,
+        vp_digest_hex: impl Into<String>,
+        decision_context_digest_hex: impl Into<String>,
+        issued_at: OffsetDateTime,
+        expires_at: OffsetDateTime,
+    ) -> Result<Self, AuthorityError> {
+        let mut audit = Self {
+            schema: "xyz.tinycloud.policy/issuance-audit/v1".to_owned(),
+            issuance_id: issuance_id.into(),
+            owner_did: policy.fact("ownerDid")?.to_owned(),
+            policy_id: policy.fact("policyId")?.to_owned(),
+            policy_digest_hex: policy.fact("policyDigestHex")?.to_owned(),
+            policy_delegation_cid: policy.delegation_cid.clone(),
+            enforcement_delegation_cid: enforcement.delegation_cid.clone(),
+            enforcer_did: enforcement.audience_did.clone(),
+            node_audience: enforcement.audience_did.clone(),
+            claimant_did: claimant_did.into(),
+            capability_hash_hex: capability_hash_hex.into(),
+            challenge_id: challenge_id.into(),
+            challenge_nonce_hash_hex: challenge_nonce_hash_hex.into(),
+            claim_invocation_digest_hex: claim_invocation_digest_hex.into(),
+            vp_digest_hex: vp_digest_hex.into(),
+            decision_context_digest_hex: decision_context_digest_hex.into(),
+            decision: "allow".to_owned(),
+            issued_at: canonical_time_string(issued_at),
+            expires_at: canonical_time_string(expires_at),
+            audit_digest_hex: String::new(),
+            session_delegation_cid: String::new(),
+        };
+        audit.audit_digest_hex = audit.recompute_digest_hex()?;
+        Ok(audit)
+    }
+
+    pub fn audit_digest_hex(&self) -> &str {
+        &self.audit_digest_hex
+    }
+
     fn recompute_digest_hex(&self) -> Result<String, AuthorityError> {
         let mut value = serde_json::to_value(self).map_err(|_| AuthorityError::SchemaInvalid)?;
         let object = value.as_object_mut().ok_or(AuthorityError::SchemaInvalid)?;
@@ -594,6 +762,7 @@ pub struct VerifiedEdge {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorityStatus {
     checked_at: OffsetDateTime,
+    fresh_until: OffsetDateTime,
     sequence: u64,
     revoked_at: Option<OffsetDateTime>,
 }
@@ -614,6 +783,7 @@ impl AuthorityStatus {
     fn active_for_test(checked_at: OffsetDateTime, sequence: u64) -> Self {
         Self {
             checked_at,
+            fresh_until: checked_at + time::Duration::seconds(MAX_STATUS_AGE_SECONDS),
             sequence,
             revoked_at: None,
         }
@@ -623,6 +793,7 @@ impl AuthorityStatus {
     fn revoked_for_test(checked_at: OffsetDateTime, sequence: u64) -> Self {
         Self {
             checked_at,
+            fresh_until: checked_at + time::Duration::seconds(MAX_STATUS_AGE_SECONDS),
             sequence,
             revoked_at: Some(checked_at),
         }
@@ -919,6 +1090,7 @@ impl AuthorityKernel {
             cid.clone(),
             AuthorityStatus {
                 checked_at: bindings.now,
+                fresh_until: bindings.now + time::Duration::seconds(MAX_STATUS_AGE_SECONDS),
                 sequence: 0,
                 revoked_at: None,
             },
@@ -987,6 +1159,7 @@ impl AuthorityKernel {
             cid.clone(),
             AuthorityStatus {
                 checked_at: now,
+                fresh_until: now + time::Duration::seconds(MAX_STATUS_AGE_SECONDS),
                 sequence: 0,
                 revoked_at: None,
             },
@@ -1029,6 +1202,9 @@ impl AuthorityKernel {
             .ok_or(AuthorityError::AuthorityStateUnavailable)?;
         if now - status.checked_at > time::Duration::seconds(MAX_STATUS_AGE_SECONDS)
             || status.checked_at > now
+            || status.fresh_until <= now
+            || status.fresh_until - status.checked_at
+                > time::Duration::seconds(MAX_STATUS_AGE_SECONDS)
             || status
                 .revoked_at
                 .is_some_and(|revoked_at| revoked_at > status.checked_at)
@@ -1120,6 +1296,8 @@ fn ensure_live_in_memory(
         .ok_or(AuthorityError::AuthorityStateUnavailable)?;
     if now - status.checked_at > time::Duration::seconds(MAX_STATUS_AGE_SECONDS)
         || status.checked_at > now
+        || status.fresh_until <= now
+        || status.fresh_until - status.checked_at > time::Duration::seconds(MAX_STATUS_AGE_SECONDS)
         || status
             .revoked_at
             .is_some_and(|revoked_at| revoked_at > status.checked_at)
@@ -1663,6 +1841,13 @@ fn canonical_time(value: &str) -> Result<OffsetDateTime, AuthorityError> {
     OffsetDateTime::parse(value, &Rfc3339).map_err(|_| AuthorityError::TimestampNoncanonical)
 }
 
+fn canonical_time_string(value: OffsetDateTime) -> String {
+    value
+        .to_offset(time::UtcOffset::UTC)
+        .format(&Rfc3339)
+        .expect("UTC timestamp formatting is infallible")
+}
+
 fn decimal_fact(delegation: &PolicyDelegation, name: &'static str) -> Result<u64, AuthorityError> {
     let value = delegation.fact(name)?;
     if value != "0" && value.starts_with('0') {
@@ -2122,7 +2307,7 @@ mod tests {
             assert!(schema.has_table(table).await.unwrap(), "missing {table}");
         }
 
-        crate::migrations::Migrator::down(&db, Some(3))
+        crate::migrations::Migrator::down(&db, Some(4))
             .await
             .unwrap();
         for table in [

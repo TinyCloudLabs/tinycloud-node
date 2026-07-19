@@ -12,9 +12,11 @@ use rocket::{
     data::{Data, ToByteUnit},
     http::Status,
     response::status::Custom,
+    response::Responder,
     serde::json::Json,
     State,
 };
+use rocket::{http::Header, Request};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -41,7 +43,7 @@ use tinycloud_core::{
         },
         state::{AnonymousChallengeRequest, ProtocolStateRepository},
         types::{
-            ContentSource, Did, DidKey, ExactResource, Path, PolicyCid,
+            AuthorityMaterialHandle, ContentSource, Did, DidKey, ExactResource, Path, PolicyCid,
             PolicySessionRequest as AuthorityPolicySessionRequest, ProtocolJti, ProtocolNonce,
             SessionHandle, ShareAction, ShareCid, ShareDelegationCid, ShareId, ShareScope,
             TargetOrigin,
@@ -75,6 +77,10 @@ pub struct PolicyChallengeRequest {
     pub share_id: tinycloud_core::share_email::ShareId,
     #[serde(rename = "delegationCid")]
     pub delegation_cid: ShareDelegationCid,
+    #[serde(rename = "authorityMaterialHandle")]
+    pub authority_material_handle: AuthorityMaterialHandle,
+    #[serde(rename = "authorityMaterialDigest")]
+    pub authority_material_digest: tinycloud_core::share_email::Sha256Digest,
     #[serde(rename = "policyCid")]
     pub policy_cid: PolicyCid,
     #[serde(rename = "contentSource")]
@@ -108,6 +114,10 @@ pub struct PolicyChallenge {
     pub share_id: tinycloud_core::share_email::ShareId,
     #[serde(rename = "delegationCid")]
     pub delegation_cid: ShareDelegationCid,
+    #[serde(rename = "authorityMaterialHandle")]
+    pub authority_material_handle: AuthorityMaterialHandle,
+    #[serde(rename = "authorityMaterialDigest")]
+    pub authority_material_digest: tinycloud_core::share_email::Sha256Digest,
     #[serde(rename = "policyCid")]
     pub policy_cid: PolicyCid,
     #[serde(rename = "contentSource")]
@@ -145,6 +155,10 @@ pub struct PolicyPresentation {
     pub share_id: tinycloud_core::share_email::ShareId,
     #[serde(rename = "delegationCid")]
     pub delegation_cid: ShareDelegationCid,
+    #[serde(rename = "authorityMaterialHandle")]
+    pub authority_material_handle: AuthorityMaterialHandle,
+    #[serde(rename = "authorityMaterialDigest")]
+    pub authority_material_digest: tinycloud_core::share_email::Sha256Digest,
     #[serde(rename = "policyCid")]
     pub policy_cid: PolicyCid,
     #[serde(rename = "contentSource")]
@@ -192,6 +206,10 @@ pub struct PolicySession {
     pub share_id: tinycloud_core::share_email::ShareId,
     #[serde(rename = "delegationCid")]
     pub delegation_cid: ShareDelegationCid,
+    #[serde(rename = "authorityMaterialHandle")]
+    pub authority_material_handle: AuthorityMaterialHandle,
+    #[serde(rename = "authorityMaterialDigest")]
+    pub authority_material_digest: tinycloud_core::share_email::Sha256Digest,
     #[serde(rename = "policyCid")]
     pub policy_cid: PolicyCid,
     #[serde(rename = "contentSource")]
@@ -228,6 +246,12 @@ pub struct ReadInvocation {
     pub share_id: tinycloud_core::share_email::ShareId,
     #[serde(rename = "policyCid")]
     pub policy_cid: PolicyCid,
+    #[serde(rename = "delegationCid")]
+    pub delegation_cid: ShareDelegationCid,
+    #[serde(rename = "authorityMaterialHandle")]
+    pub authority_material_handle: AuthorityMaterialHandle,
+    #[serde(rename = "authorityMaterialDigest")]
+    pub authority_material_digest: tinycloud_core::share_email::Sha256Digest,
     #[serde(rename = "contentSource")]
     pub content_source: ContentSource,
     #[serde(rename = "contentSourceDigest")]
@@ -254,6 +278,12 @@ pub struct ReadInvocation {
 pub struct ReadRequest {
     #[serde(rename = "sessionId")]
     pub session_id: SessionHandle,
+    #[serde(rename = "delegationCid")]
+    pub delegation_cid: ShareDelegationCid,
+    #[serde(rename = "authorityMaterialHandle")]
+    pub authority_material_handle: AuthorityMaterialHandle,
+    #[serde(rename = "authorityMaterialDigest")]
+    pub authority_material_digest: tinycloud_core::share_email::Sha256Digest,
     #[serde(rename = "contentSource")]
     pub content_source: ContentSource,
     #[serde(rename = "contentSourceDigest")]
@@ -275,6 +305,17 @@ pub struct ReadResponse {
     pub content_source_digest: tinycloud_core::share_email::Sha256Digest,
     #[serde(rename = "bodyDigest")]
     pub body_digest: tinycloud_core::share_email::Sha256Digest,
+}
+
+pub struct NoStoreJson<T>(pub T);
+
+impl<'r, T: Serialize + 'static> Responder<'r, 'static> for NoStoreJson<T> {
+    fn respond_to(self, request: &'r Request<'_>) -> rocket::response::Result<'static> {
+        let mut response = Json(self.0).respond_to(request)?;
+        response.set_header(Header::new("Cache-Control", "no-store"));
+        response.set_header(Header::new("Pragma", "no-cache"));
+        Ok(response)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -540,9 +581,21 @@ pub fn compose(
     );
     let status_provider = Arc::new(material.status_provider());
     let attestation_provider = Arc::new(material.attestation_provider());
+    let root_secret = tinycloud_core::libp2p::identity::ed25519::SecretKey::try_from_bytes(
+        key_setup.derive_key(b"tinycloud/share-email/root-signing"),
+    )
+    .map_err(|_| anyhow::anyhow!("invalid root signing key"))?;
+    let root_keypair = tinycloud_core::libp2p::identity::ed25519::Keypair::from(root_secret);
+    let root_did = tinycloud_core::keys::public_key_to_did_key(root_keypair.public().into());
     let bridge = Arc::new(
         DatabaseAuthorityBridge117::new(conn.clone(), DatabaseAuthorityStore::new(conn.clone()))
-            .with_authority_providers(material, status_provider, attestation_provider),
+            .with_authority_providers(material, status_provider, attestation_provider)
+            .with_root_signer(Arc::new(
+                tinycloud_core::policy_authority::ConfiguredNodeRootSigner::new(
+                    root_did,
+                    root_keypair,
+                ),
+            )),
     );
     // Sequence C supplies authenticated authority material, fresh status, and
     // attestation/enrollment providers. Until all three are injected and
@@ -704,6 +757,8 @@ fn scope_from_request(
         share_cid: request.share_cid.clone(),
         share_id: request.share_id.clone(),
         delegation_cid: Some(request.delegation_cid.clone()),
+        authority_material_handle: request.authority_material_handle.clone(),
+        authority_material_digest: request.authority_material_digest.clone(),
         policy_cid: request.policy_cid.clone(),
         node_audience: request.node_audience.clone(),
         target_origin: request.target_origin.clone(),
@@ -723,6 +778,8 @@ fn scope_from_presentation(
             share_cid: p.share_cid.clone(),
             share_id: p.share_id.clone(),
             delegation_cid: p.delegation_cid.clone(),
+            authority_material_handle: p.authority_material_handle.clone(),
+            authority_material_digest: p.authority_material_digest.clone(),
             policy_cid: p.policy_cid.clone(),
             content_source: p.content_source.clone(),
             content_source_digest: p.content_source_digest.clone(),
@@ -746,6 +803,10 @@ struct NodeInvitationAuthorizationRequest {
     pub share_cid: ShareCid,
     pub share_id: ShareId,
     pub delegation_cid: ShareDelegationCid,
+    #[serde(rename = "authorityMaterialHandle")]
+    pub authority_material_handle: AuthorityMaterialHandle,
+    #[serde(rename = "authorityMaterialDigest")]
+    pub authority_material_digest: tinycloud_core::share_email::Sha256Digest,
     pub policy_cid: PolicyCid,
     pub recipient_email: CanonicalEmail,
     pub target_origin: TargetOrigin,
@@ -791,6 +852,8 @@ pub async fn authorize_invitation(
         share_cid: request.share_cid.clone(),
         share_id: request.share_id.clone(),
         delegation_cid: request.delegation_cid.clone(),
+        authority_material_handle: request.authority_material_handle.clone(),
+        authority_material_digest: request.authority_material_digest.clone(),
         policy_cid: request.policy_cid.clone(),
         content_source: request.content_source.clone(),
         content_source_digest: request.content_source_digest.clone(),
@@ -831,6 +894,8 @@ pub async fn authorize_invitation(
         .validate_sender_for_policy(
             request.policy_cid.as_str(),
             request.delegation_cid.as_str(),
+            &request.authority_material_handle,
+            &request.authority_material_digest,
             request.sender_did.as_str(),
         )
         .await
@@ -840,6 +905,8 @@ pub async fn authorize_invitation(
         .policy_recipient_and_expiry(
             request.policy_cid.as_str(),
             request.delegation_cid.as_str(),
+            &request.authority_material_handle,
+            &request.authority_material_digest,
             now,
         )
         .await
@@ -994,6 +1061,8 @@ pub async fn policy_challenge(
         share_cid: request.share_cid,
         share_id: request.share_id,
         delegation_cid: request.delegation_cid,
+        authority_material_handle: request.authority_material_handle,
+        authority_material_digest: request.authority_material_digest,
         policy_cid: request.policy_cid,
         content_source: request.content_source,
         content_source_digest: request.content_source_digest,
@@ -1095,7 +1164,13 @@ pub async fn policy_session(
     }
     let (policy_email, policy_expiry) = runtime
         .bridge
-        .policy_recipient_and_expiry(p.policy_cid.as_str(), p.delegation_cid.as_str(), now)
+        .policy_recipient_and_expiry(
+            p.policy_cid.as_str(),
+            p.delegation_cid.as_str(),
+            &p.authority_material_handle,
+            &p.authority_material_digest,
+            now,
+        )
         .await
         .map_err(|_| error(Status::Forbidden, "policy_denied"))?;
     let evidence = runtime
@@ -1116,6 +1191,8 @@ pub async fn policy_session(
         share_cid: p.share_cid.clone(),
         share_id: p.share_id.clone(),
         delegation_cid: p.delegation_cid.clone(),
+        authority_material_handle: p.authority_material_handle.clone(),
+        authority_material_digest: p.authority_material_digest.clone(),
         policy_cid: p.policy_cid.clone(),
         content_source: p.content_source.clone(),
         content_source_digest: p.content_source_digest.clone(),
@@ -1154,6 +1231,8 @@ pub async fn policy_session(
         share_cid: p.share_cid.clone(),
         share_id: p.share_id.clone(),
         delegation_cid: p.delegation_cid.clone(),
+        authority_material_handle: p.authority_material_handle.clone(),
+        authority_material_digest: p.authority_material_digest.clone(),
         policy_cid: p.policy_cid.clone(),
         content_source: p.content_source.clone(),
         content_source_digest: p.content_source_digest.clone(),
@@ -1182,7 +1261,7 @@ pub async fn policy_session(
 pub async fn read(
     data: Data<'_>,
     runtime: &State<Option<ShareEmailRuntime>>,
-) -> ApiResult<ReadResponse> {
+) -> Result<NoStoreJson<ReadResponse>, Custom<Json<ApiErrorBody>>> {
     let runtime = runtime
         .inner()
         .as_ref()
@@ -1196,12 +1275,13 @@ pub async fn read(
     if i.artifact_type != "TinyCloudShareReadInvocation" || i.version != 1 {
         return Err(error(Status::Forbidden, "read_denied"));
     }
-    let mut scope = scope_from_request(
+    let scope = scope_from_request(
         &PolicyChallengeRequest {
             share_cid: i.share_cid.clone(),
             share_id: i.share_id.clone(),
-            delegation_cid: ShareDelegationCid::parse(i.policy_cid.as_str())
-                .map_err(|_| generic("read_denied"))?,
+            delegation_cid: i.delegation_cid.clone(),
+            authority_material_handle: request.authority_material_handle.clone(),
+            authority_material_digest: request.authority_material_digest.clone(),
             policy_cid: i.policy_cid.clone(),
             content_source: i.content_source.clone(),
             content_source_digest: i.content_source_digest.clone(),
@@ -1215,8 +1295,10 @@ pub async fn read(
         &runtime.config,
     )
     .map_err(|_| generic("read_denied"))?;
-    scope.delegation_cid = None;
     if request.session_id != i.session_id
+        || request.delegation_cid != i.delegation_cid
+        || request.authority_material_handle != i.authority_material_handle
+        || request.authority_material_digest != i.authority_material_digest
         || request.content_source != i.content_source
         || request.content_source_digest != i.content_source_digest
         || request.action != i.action
@@ -1269,7 +1351,7 @@ pub async fn read(
         })?;
     let content = String::from_utf8(response.document.as_bytes().to_vec())
         .map_err(|_| error(Status::Forbidden, "read_denied"))?;
-    Ok(Json(ReadResponse {
+    Ok(NoStoreJson(ReadResponse {
         media_type: response.media_type,
         content,
         content_source_digest: expected_source_digest,

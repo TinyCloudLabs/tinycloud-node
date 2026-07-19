@@ -11,6 +11,8 @@ use super::types::*;
 /// fields are never promoted to authority material by the node.
 #[derive(Debug, Clone)]
 pub struct AuthorityMaterialBundle {
+    pub handle: AuthorityMaterialHandle,
+    pub digest: Sha256Digest,
     pub policy_authority: Vec<u8>,
     pub policy_enforcement: Vec<u8>,
     pub policy_state: Vec<u8>,
@@ -28,7 +30,26 @@ pub trait AuthorityMaterialProvider: Send + Sync {
         delegation: &ShareDelegationCid,
     ) -> Result<AuthorityMaterialBundle, PortError>;
 
+    async fn resolve_exact(
+        &self,
+        policy: &PolicyCid,
+        delegation: &ShareDelegationCid,
+        handle: &AuthorityMaterialHandle,
+        digest: &Sha256Digest,
+    ) -> Result<AuthorityMaterialBundle, PortError> {
+        let bundle = self.resolve(policy, delegation).await?;
+        if &bundle.handle == handle && &bundle.digest == digest {
+            Ok(bundle)
+        } else {
+            Err(PortError::Denied)
+        }
+    }
+
     fn healthy(&self) -> bool;
+
+    fn healthy_at(&self, _now: OffsetDateTime) -> bool {
+        self.healthy()
+    }
 }
 
 /// Supplies a fresh, authenticated, monotonic status statement for #117.
@@ -37,6 +58,10 @@ pub trait FreshAuthenticatedStatusProvider: Send + Sync {
     async fn refresh(&self, delegation: &NodeDelegationCid) -> Result<Vec<u8>, PortError>;
 
     fn healthy(&self) -> bool;
+
+    fn healthy_at(&self, _now: OffsetDateTime) -> bool {
+        self.healthy()
+    }
 }
 
 /// Supplies attestation/enrollment evidence binding this node to the
@@ -47,6 +72,10 @@ pub trait AttestationEnrollmentProvider: Send + Sync {
     async fn attest(&self, audience: &Did, enforcer: &DidKey) -> Result<Vec<u8>, PortError>;
 
     fn healthy(&self) -> bool;
+
+    fn healthy_at(&self, _now: OffsetDateTime) -> bool {
+        self.healthy()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

@@ -28,7 +28,7 @@ pub const READ_INVOCATION_DOMAIN: &[u8] = b"xyz.tinycloud.share/read-invocation/
 /// The response media type is intentionally not negotiated or inferred.
 pub const MARKDOWN_CACHE_CONTROL: &str = "no-store";
 /// Holder read signatures are short-lived even when the share itself lives longer.
-pub const MAX_READ_TTL_SECONDS: i64 = 300;
+pub const MAX_READ_TTL_SECONDS: i64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum DataPlaneError {
@@ -485,7 +485,15 @@ fn signed_read_bytes(request: &HolderReadRequest) -> Result<Vec<u8>, DataPlaneEr
         "sessionId": request.session.as_str(),
         "shareCid": request.scope.share_cid.as_str(),
         "shareId": request.scope.share_id.as_str(),
+        "delegationCid": request
+            .scope
+            .delegation_cid
+            .as_ref()
+            .map(|cid| cid.as_str())
+            .unwrap_or_default(),
         "policyCid": request.scope.policy_cid.as_str(),
+        "authorityMaterialHandle": request.scope.authority_material_handle.as_str(),
+        "authorityMaterialDigest": request.scope.authority_material_digest.as_str(),
         "contentSource": source,
         "contentSourceDigest": request.scope.content_source_digest.as_str(),
         "holderDid": request.holder.as_str(),
@@ -611,6 +619,8 @@ mod tests {
             share_cid: ShareCid::parse(KV_SHARE_CID).unwrap(),
             share_id: ShareId::parse("share-kv-001").unwrap(),
             delegation_cid: None,
+            authority_material_handle: AuthorityMaterialHandle::parse("amh_kv_001").unwrap(),
+            authority_material_digest: Sha256Digest::from_bytes([0; 32]),
             policy_cid: PolicyCid::parse(KV_POLICY_CID).unwrap(),
             node_audience: Did::parse("did:web:node.example").unwrap(),
             target_origin: TargetOrigin::parse("https://node.example").unwrap(),

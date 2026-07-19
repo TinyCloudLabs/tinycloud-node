@@ -9,14 +9,19 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{path::Path, sync::Arc};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use super::{
     ports::{
         AttestationEnrollmentProvider, AuthorityMaterialBundle, AuthorityMaterialProvider,
         FreshAuthenticatedStatusProvider, PortError,
     },
-    types::{Did, DidKey, NodeDelegationCid, PolicyCid, ShareDelegationCid},
+    types::{
+        AuthorityMaterialHandle, Did, DidKey, NodeDelegationCid, PolicyCid, Sha256Digest,
+        ShareDelegationCid,
+    },
 };
 use crate::policy_authority::AuthorityArtifactVerifier;
 use crate::policy_capability::jcs;
@@ -88,11 +93,16 @@ impl AuthenticatedAuthorityMaterialProvider {
         &self,
         policy: &PolicyCid,
         delegation: &ShareDelegationCid,
+        handle: &AuthorityMaterialHandle,
+        digest: &Sha256Digest,
     ) -> Result<&LoadedMaterial, PortError> {
         self.records
             .iter()
             .find(|record| {
-                &record.share_policy_cid == policy && &record.share_delegation_cid == delegation
+                &record.share_policy_cid == policy
+                    && &record.share_delegation_cid == delegation
+                    && &record.bundle.handle == handle
+                    && &record.bundle.digest == digest
             })
             .ok_or(PortError::Denied)
     }
@@ -117,11 +127,36 @@ impl AuthorityMaterialProvider for AuthenticatedAuthorityMaterialProvider {
         policy: &PolicyCid,
         delegation: &ShareDelegationCid,
     ) -> Result<AuthorityMaterialBundle, PortError> {
-        Ok(self.record(policy, delegation)?.bundle.clone())
+        self.records
+            .iter()
+            .find(|record| {
+                &record.share_policy_cid == policy && &record.share_delegation_cid == delegation
+            })
+            .map(|record| record.bundle.clone())
+            .ok_or(PortError::Denied)
+    }
+
+    async fn resolve_exact(
+        &self,
+        policy: &PolicyCid,
+        delegation: &ShareDelegationCid,
+        handle: &AuthorityMaterialHandle,
+        digest: &Sha256Digest,
+    ) -> Result<AuthorityMaterialBundle, PortError> {
+        Ok(self
+            .record(policy, delegation, handle, digest)?
+            .bundle
+            .clone())
     }
 
     fn healthy(&self) -> bool {
         !self.records.is_empty()
+    }
+
+    fn healthy_at(&self, now: OffsetDateTime) -> bool {
+        self.records
+            .iter()
+            .any(|record| record_is_current(record, now))
     }
 }
 
@@ -139,12 +174,30 @@ impl FreshAuthenticatedStatusProvider for AuthenticatedStatusProvider {
                 record.bundle.internal_policy_authority_cid == *delegation
                     || record.bundle.internal_policy_enforcement_cid == *delegation
             })
-            .map(|record| record.status.clone())
+            .and_then(|record| {
+                let value: Value = serde_json::from_slice(&record.status).ok()?;
+                if value.get("authorityCid").and_then(Value::as_str) == Some(delegation.as_str()) {
+                    return Some(record.status.clone());
+                }
+                let key = if record.bundle.internal_policy_authority_cid == *delegation {
+                    "policyAuthority"
+                } else {
+                    "policyEnforcement"
+                };
+                let selected = value.get(key)?;
+                serde_json::to_vec(selected).ok()
+            })
             .ok_or(PortError::Denied)
     }
 
     fn healthy(&self) -> bool {
         !self.records.is_empty()
+    }
+
+    fn healthy_at(&self, now: OffsetDateTime) -> bool {
+        self.records
+            .iter()
+            .any(|record| record_is_current(record, now))
     }
 }
 
@@ -174,6 +227,56 @@ impl AttestationEnrollmentProvider for AuthenticatedAttestationProvider {
     fn healthy(&self) -> bool {
         !self.records.is_empty()
     }
+
+    fn healthy_at(&self, now: OffsetDateTime) -> bool {
+        self.records
+            .iter()
+            .any(|record| record_is_current(record, now))
+    }
+}
+
+fn record_is_current(record: &LoadedMaterial, now: OffsetDateTime) -> bool {
+    let status_ok = serde_json::from_slice::<Value>(&record.status)
+        .ok()
+        .is_some_and(|value| {
+            let statuses = current_statuses(&value);
+            !statuses.is_empty()
+                && statuses
+                    .iter()
+                    .all(|(fresh_until, state)| *fresh_until > now && state != "revoked")
+        });
+    let attestation_ok = record
+        .attestation_value()
+        .ok()
+        .and_then(|value| {
+            value
+                .get("expiresAt")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .and_then(|value| OffsetDateTime::parse(&value, &Rfc3339).ok())
+        .is_some_and(|expires_at| expires_at > now);
+    status_ok && attestation_ok
+}
+
+fn current_statuses(value: &Value) -> Vec<(OffsetDateTime, String)> {
+    if let (Some(fresh_until), Some(state)) = (
+        value.get("freshUntil").and_then(Value::as_str),
+        value
+            .get("state")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("status").and_then(Value::as_str)),
+    ) {
+        return OffsetDateTime::parse(fresh_until, &Rfc3339)
+            .ok()
+            .map(|fresh_until| vec![(fresh_until, state.to_owned())])
+            .unwrap_or_default();
+    }
+    value
+        .as_object()
+        .into_iter()
+        .flat_map(|object| object.values().flat_map(current_statuses))
+        .collect()
 }
 
 impl LoadedMaterial {
@@ -307,6 +410,9 @@ fn load_record(mut value: Value) -> Result<LoadedMaterial, AuthorityProviderErro
         share_policy_cid: share_policy_cid.clone(),
         share_delegation_cid: share_delegation_cid.clone(),
         bundle: AuthorityMaterialBundle {
+            handle: AuthorityMaterialHandle::parse(required_string(&signed_bundle, "handle")?)
+                .map_err(|_| AuthorityProviderError::Schema)?,
+            digest: Sha256Digest::from_bytes(Sha256::digest(&bytes).into()),
             policy_authority: policy_bytes,
             policy_enforcement: enforcement_bytes,
             policy_state,

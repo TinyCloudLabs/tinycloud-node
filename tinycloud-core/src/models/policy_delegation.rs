@@ -11,6 +11,7 @@ pub struct Model {
     pub not_before: String,
     pub expires_at: String,
     pub status_checked_at: String,
+    pub status_fresh_until: Option<String>,
     pub status_sequence: i64,
     pub revoked_at: Option<String>,
 }

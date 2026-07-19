@@ -24,13 +24,16 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use time::OffsetDateTime;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     models::{share_policy_presentation_jti, share_session_handle},
     policy_authority::{
         AuthorityArtifactVerifier, AuthorityError, AuthorityStatusObservation,
-        DatabaseAuthorityStore,
+        DatabaseAuthorityKernel, DatabaseAuthorityStore, DecisionContext, DelegationMode,
+        DelegationRole, DelegationSignature, IssuanceAudit, IssuanceBindings, NodeRootSigner,
+        PolicyDelegation, TrustedPolicyDecision, VerifiedAttestedEnforcerBinding,
+        VerifiedPolicyState,
     },
     policy_capability::{jcs, parse as parse_capability, PolicyCapability},
 };
@@ -61,9 +64,297 @@ pub struct DatabaseAuthorityBridge117 {
     authority_material: Option<Arc<dyn AuthorityMaterialProvider>>,
     status_provider: Option<Arc<dyn FreshAuthenticatedStatusProvider>>,
     attestation_provider: Option<Arc<dyn AttestationEnrollmentProvider>>,
+    root_signer: Option<Arc<dyn NodeRootSigner>>,
 }
 
 impl DatabaseAuthorityBridge117 {
+    async fn issue_root_in_transaction(
+        &self,
+        tx: &sea_orm::DatabaseTransaction,
+        request: &PolicySessionRequest,
+        now: OffsetDateTime,
+        policy_expiry: OffsetDateTime,
+        credential_expiry: OffsetDateTime,
+    ) -> Result<String, PortError> {
+        let policy_cid = request
+            .scope
+            .delegation_cid
+            .as_ref()
+            .ok_or(PortError::Denied)?;
+        let provider = self
+            .authority_material
+            .as_ref()
+            .filter(|provider| provider.healthy())
+            .ok_or(PortError::Unavailable)?;
+        let bundle = provider
+            .resolve_exact(
+                &request.scope.policy_cid,
+                policy_cid,
+                &request.scope.authority_material_handle,
+                &request.scope.authority_material_digest,
+            )
+            .await?;
+        let verifier = AuthorityArtifactVerifier;
+        let policy = verifier
+            .verify(&bundle.policy_authority)
+            .map_err(map_authority_error)?;
+        let enforcement = verifier
+            .verify(&bundle.policy_enforcement)
+            .map_err(map_authority_error)?;
+        let status_provider = self
+            .status_provider
+            .as_ref()
+            .filter(|provider| provider.healthy())
+            .ok_or(PortError::Unavailable)?;
+        let status = parse_status(
+            &status_provider
+                .refresh(&bundle.internal_policy_authority_cid)
+                .await?,
+            &bundle.internal_policy_authority_cid,
+            now,
+        )?;
+        let policy_state = VerifiedPolicyState::from_verified(
+            policy.artifact(),
+            enforcement.artifact(),
+            status.checked_at,
+            policy_expiry.min(credential_expiry),
+        )
+        .map_err(map_authority_error)?;
+        let parsed_capabilities = policy
+            .artifact()
+            .capabilities
+            .iter()
+            .map(parse_capability)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| PortError::Denied)?;
+        let capability_hash =
+            crate::policy_capability::requested_capabilities_hash_hex(&parsed_capabilities);
+        let enforcer = enforcement
+            .artifact()
+            .fact_value("enforcerDid")
+            .map_err(|_| PortError::Denied)?;
+        let audience = enforcement
+            .artifact()
+            .fact_value("nodeAudience")
+            .map_err(|_| PortError::Denied)?;
+        let nonce_hash = digest_string(request.nonce.as_str());
+        let claimant = request.holder.as_str().to_owned();
+        let challenge_expires = now + SESSION_TTL;
+        let challenge = crate::policy_authority::ChallengeState::from_verified(
+            request.challenge_id.clone(),
+            nonce_hash.as_str(),
+            policy
+                .artifact()
+                .fact_value("ownerDid")
+                .map_err(|_| PortError::Denied)?,
+            policy
+                .artifact()
+                .fact_value("policyId")
+                .map_err(|_| PortError::Denied)?,
+            policy
+                .artifact()
+                .fact_value("policyDigestHex")
+                .map_err(|_| PortError::Denied)?,
+            policy.artifact().delegation_cid.clone(),
+            enforcement.artifact().delegation_cid.clone(),
+            enforcer,
+            audience,
+            claimant.clone(),
+            capability_hash.clone(),
+            now,
+            challenge_expires,
+        )
+        .map_err(map_authority_error)?;
+        self.authority
+            .insert_challenge_in_transaction(tx, challenge)
+            .await
+            .map_err(map_authority_error)?;
+        let decision_context = DecisionContext {
+            owner_did: policy
+                .artifact()
+                .fact_value("ownerDid")
+                .map_err(|_| PortError::Denied)?
+                .to_owned(),
+            policy_id: policy
+                .artifact()
+                .fact_value("policyId")
+                .map_err(|_| PortError::Denied)?
+                .to_owned(),
+            policy_digest_hex: policy
+                .artifact()
+                .fact_value("policyDigestHex")
+                .map_err(|_| PortError::Denied)?
+                .to_owned(),
+            capability_ceiling_hash_hex: policy
+                .artifact()
+                .fact_value("capabilityCeilingHashHex")
+                .map_err(|_| PortError::Denied)?
+                .to_owned(),
+            enforcer_did: enforcer.to_owned(),
+            node_audience: audience.to_owned(),
+            claimant_did: claimant.clone(),
+            challenge_id: request.challenge_id.clone(),
+            challenge_nonce_hash_hex: nonce_hash.as_str().to_owned(),
+            requested_capabilities_hash_hex: capability_hash.clone(),
+            claim_invocation_digest_hex: request.challenge_request_digest.as_str().to_owned(),
+            vp_digest_hex: request.credential_digest.as_str().to_owned(),
+        };
+        let decision =
+            TrustedPolicyDecision::allow_from_verified(decision_context, now, now + SESSION_TTL)
+                .map_err(map_authority_error)?;
+        let bindings = IssuanceBindings::from_verified(
+            now,
+            now,
+            credential_expiry,
+            request.challenge_id.clone(),
+            nonce_hash.as_str(),
+            claimant.clone(),
+            capability_hash.clone(),
+            request.challenge_request_digest.as_str(),
+            request.credential_digest.as_str(),
+        );
+        let binding = VerifiedAttestedEnforcerBinding::from_verified(
+            enforcement
+                .artifact()
+                .fact_value("attestationBindingDigestHex")
+                .map_err(|_| PortError::Denied)?,
+            enforcer,
+            audience,
+            policy_expiry.min(
+                enforcement
+                    .artifact()
+                    .expires_at()
+                    .map_err(map_authority_error)?,
+            ),
+        );
+        let issuance_id = next_issuance_id();
+        let expires_at = [
+            now + SESSION_TTL,
+            policy_expiry,
+            credential_expiry,
+            enforcement
+                .artifact()
+                .expires_at()
+                .map_err(map_authority_error)?,
+        ]
+        .into_iter()
+        .min()
+        .ok_or(PortError::Denied)?;
+        let audit = IssuanceAudit::build_verified(
+            issuance_id.clone(),
+            policy.artifact(),
+            enforcement.artifact(),
+            claimant.clone(),
+            capability_hash.clone(),
+            request.challenge_id.clone(),
+            nonce_hash.as_str(),
+            request.challenge_request_digest.as_str(),
+            request.credential_digest.as_str(),
+            decision.decision_context_digest_hex(),
+            now,
+            expires_at,
+        )
+        .map_err(map_authority_error)?;
+        let mut facts = policy.artifact().facts.clone();
+        for (name, value) in [
+            ("capabilityHashHex", capability_hash),
+            ("enforcerDid", enforcer.to_owned()),
+            ("nodeAudience", audience.to_owned()),
+            ("rootClaimantDid", claimant.clone()),
+            ("sessionSubjectDid", claimant),
+            (
+                "policyDelegationCid",
+                policy.artifact().delegation_cid.clone(),
+            ),
+            (
+                "enforcementDelegationCid",
+                enforcement.artifact().delegation_cid.clone(),
+            ),
+            (
+                "attestationBindingDigestHex",
+                binding.binding_digest_hex().to_owned(),
+            ),
+            (
+                "claimInvocationDigestHex",
+                request.challenge_request_digest.as_str().to_owned(),
+            ),
+            ("vpDigestHex", request.credential_digest.as_str().to_owned()),
+            (
+                "decisionContextDigestHex",
+                decision.decision_context_digest_hex().to_owned(),
+            ),
+            (
+                "issuanceAuditDigestHex",
+                audit.audit_digest_hex().to_owned(),
+            ),
+            ("issuanceId", issuance_id),
+            (
+                "remainingRedelegationDepth",
+                enforcement
+                    .artifact()
+                    .fact_value("maxRedelegationDepth")
+                    .map_err(|_| PortError::Denied)?
+                    .to_owned(),
+            ),
+            ("auditProfile", "vp-digest-v1".to_owned()),
+        ] {
+            facts.insert(format!("xyz.tinycloud.policy/{name}"), value);
+        }
+        let root = PolicyDelegation {
+            schema: "xyz.tinycloud.policy/enforcement-delegation/v1".to_owned(),
+            role: DelegationRole::PolicySessionRoot,
+            delegation_cid: String::new(),
+            issuer_did: enforcer.to_owned(),
+            audience_did: request.holder.as_str().to_owned(),
+            capabilities: enforcement.artifact().capabilities.clone(),
+            proof_cids: vec![
+                policy.artifact().delegation_cid.clone(),
+                enforcement.artifact().delegation_cid.clone(),
+            ],
+            not_before: timestamp(now).map_err(|_| PortError::Denied)?,
+            expires_at: timestamp(expires_at).map_err(|_| PortError::Denied)?,
+            delegation_mode: if enforcement
+                .artifact()
+                .fact_value("maxRedelegationDepth")
+                .map_err(|_| PortError::Denied)?
+                .parse::<u8>()
+                .map_err(|_| PortError::Denied)?
+                > 0
+            {
+                DelegationMode::Attenuable
+            } else {
+                DelegationMode::Terminal
+            },
+            facts,
+            signature: DelegationSignature {
+                suite: "eddsa-ed25519-sha256-jcs-v1".to_owned(),
+                value: String::new(),
+            },
+        };
+        let signer = self.root_signer.as_ref().ok_or(PortError::Unavailable)?;
+        let preview = verifier
+            .sign_and_verify_root(root.clone(), signer.as_ref())
+            .map_err(map_authority_error)?;
+        DatabaseAuthorityKernel::new(
+            self.authority.clone(),
+            enforcement.artifact().audience_did.clone(),
+        )
+        .sign_and_issue_root_in_transaction(
+            tx,
+            &policy,
+            &enforcement,
+            &policy_state,
+            root,
+            signer.as_ref(),
+            &binding,
+            &decision,
+            &bindings,
+        )
+        .await
+        .map_err(map_authority_error)?;
+        Ok(preview.artifact().delegation_cid.clone())
+    }
+
     /// `conn` and `authority` must share the same underlying database so a
     /// transaction begun on `conn` is visible to `authority`'s row locks.
     pub fn new(conn: DatabaseConnection, authority: DatabaseAuthorityStore) -> Self {
@@ -73,6 +364,7 @@ impl DatabaseAuthorityBridge117 {
             authority_material: None,
             status_provider: None,
             attestation_provider: None,
+            root_signer: None,
         }
     }
 
@@ -88,18 +380,39 @@ impl DatabaseAuthorityBridge117 {
         self
     }
 
+    pub fn with_root_signer(mut self, signer: Arc<dyn NodeRootSigner>) -> Self {
+        self.root_signer = Some(signer);
+        self
+    }
+
     pub fn ready(&self) -> bool {
+        let now = OffsetDateTime::now_utc();
         self.authority_material
             .as_ref()
-            .is_some_and(|provider| provider.healthy())
+            .is_some_and(|provider| provider.healthy_at(now))
             && self
                 .status_provider
                 .as_ref()
-                .is_some_and(|provider| provider.healthy())
+                .is_some_and(|provider| provider.healthy_at(now))
             && self
                 .attestation_provider
                 .as_ref()
-                .is_some_and(|provider| provider.healthy())
+                .is_some_and(|provider| provider.healthy_at(now))
+            && self.root_signer.is_some()
+    }
+
+    /// Performs the cheap end-to-end readiness probe used by mounted callers:
+    /// all authenticated inputs are current and the shared authority database
+    /// can open and close a transaction.  No request data participates.
+    pub async fn self_check(&self) -> bool {
+        if !self.ready() {
+            return false;
+        }
+        let transaction = match self.conn.begin().await {
+            Ok(transaction) => transaction,
+            Err(_) => return false,
+        };
+        transaction.rollback().await.is_ok()
     }
 }
 
@@ -123,39 +436,28 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
     ) -> Result<PolicySession, PortError> {
         let tx = self.conn.begin().await.map_err(|_| PortError::Storage)?;
 
-        let (policy_expiry, policy_recipient, sql_statement, internal_delegation_cid) = self
+        let (policy_expiry, policy_recipient, sql_statement, _internal_delegation_cid) = self
             .validate_scope_in_transaction(&tx, &request.scope, now)
             .await?;
-        #[cfg(test)]
-        let fixture_request = request.challenge_id.is_empty();
-        #[cfg(not(test))]
-        let fixture_request = false;
-        let credential_expiry = if fixture_request {
-            // Core-only fixtures predate the HTTP challenge store.  This
-            // branch is not compiled into production consumers.
-            now + SESSION_TTL
-        } else {
-            let recipient_digest = digest_string(&policy_recipient);
-            if recipient_digest != request.policy_recipient_digest {
-                return Err(PortError::Denied);
-            }
-            let expiry = OffsetDateTime::from_unix_timestamp(request.credential_expires_at)
-                .map_err(|_| PortError::Denied)?;
-            if expiry != policy_expiry {
-                return Err(PortError::Denied);
-            }
-            ProtocolStateRepository::consume_anonymous_challenge_in_transaction(
-                &tx,
-                &request.challenge_id,
-                request.challenge_request_digest.as_str(),
-                &request.challenge_binding,
-                digest_string(request.nonce.as_str()).as_str(),
-                now,
-            )
-            .await
-            .map_err(map_state_error)?;
-            expiry
-        };
+        let recipient_digest = digest_string(&policy_recipient);
+        if recipient_digest != request.policy_recipient_digest {
+            return Err(PortError::Denied);
+        }
+        let credential_expiry = OffsetDateTime::from_unix_timestamp(request.credential_expires_at)
+            .map_err(|_| PortError::Denied)?;
+        if credential_expiry != policy_expiry {
+            return Err(PortError::Denied);
+        }
+        ProtocolStateRepository::consume_anonymous_challenge_in_transaction(
+            &tx,
+            &request.challenge_id,
+            request.challenge_request_digest.as_str(),
+            &request.challenge_binding,
+            digest_string(request.nonce.as_str()).as_str(),
+            now,
+        )
+        .await
+        .map_err(map_state_error)?;
 
         let already_used =
             share_policy_presentation_jti::Entity::find_by_id(request.presentation_jti.as_str())
@@ -172,6 +474,10 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
         if already_used {
             return Err(PortError::Replay);
         }
+
+        let authority_session_cid = self
+            .issue_root_in_transaction(&tx, &request, now, policy_expiry, credential_expiry)
+            .await?;
 
         let mut handle_bytes = [0u8; 16];
         OsRng.fill_bytes(&mut handle_bytes);
@@ -207,7 +513,7 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
         let binding_json = serde_json::to_value(&binding).map_err(|_| PortError::Storage)?;
         let mapping = SessionHandleMapping {
             handle: handle.as_str().to_owned(),
-            authority_session_cid: internal_delegation_cid.as_str().to_owned(),
+            authority_session_cid,
             binding_json,
             holder_digest: holder_digest(&request.holder),
             issued_at: now,
@@ -321,6 +627,8 @@ impl DatabaseAuthorityBridge117 {
         &self,
         policy_cid: &str,
         delegation_cid: &str,
+        handle: &super::types::AuthorityMaterialHandle,
+        material_digest: &Sha256Digest,
         now: OffsetDateTime,
     ) -> Result<(String, OffsetDateTime), PortError> {
         let policy = super::types::PolicyCid::parse(policy_cid).map_err(|_| PortError::Denied)?;
@@ -331,7 +639,9 @@ impl DatabaseAuthorityBridge117 {
             .as_ref()
             .filter(|provider| provider.healthy())
             .ok_or(PortError::Unavailable)?;
-        let bundle = provider.resolve(&policy, &delegation).await?;
+        let bundle = provider
+            .resolve_exact(&policy, &delegation, handle, material_digest)
+            .await?;
         let signed_policy = AuthorityArtifactVerifier
             .verify(&bundle.policy_authority)
             .map_err(map_authority_error)?;
@@ -365,8 +675,16 @@ impl DatabaseAuthorityBridge117 {
     ) -> Result<(), PortError> {
         let tx = self.conn.begin().await.map_err(|_| PortError::Storage)?;
         let result = self.validate_scope_in_transaction(&tx, scope, now).await;
-        tx.rollback().await.map_err(|_| PortError::Storage)?;
-        result.map(|_| ())
+        match result {
+            Ok(_) => {
+                tx.commit().await.map_err(|_| PortError::Storage)?;
+                Ok(())
+            }
+            Err(error) => {
+                tx.rollback().await.map_err(|_| PortError::Storage)?;
+                Err(error)
+            }
+        }
     }
 
     /// The sender proof is only useful when it names the authority owner that
@@ -377,6 +695,8 @@ impl DatabaseAuthorityBridge117 {
         &self,
         policy_cid: &str,
         delegation_cid: &str,
+        handle: &super::types::AuthorityMaterialHandle,
+        material_digest: &Sha256Digest,
         sender_did: &str,
     ) -> Result<(), PortError> {
         let policy = super::types::PolicyCid::parse(policy_cid).map_err(|_| PortError::Denied)?;
@@ -387,7 +707,9 @@ impl DatabaseAuthorityBridge117 {
             .as_ref()
             .filter(|provider| provider.healthy())
             .ok_or(PortError::Unavailable)?;
-        let bundle = provider.resolve(&policy, &delegation).await?;
+        let bundle = provider
+            .resolve_exact(&policy, &delegation, handle, material_digest)
+            .await?;
         let signed_policy = AuthorityArtifactVerifier
             .verify(&bundle.policy_authority)
             .map_err(map_authority_error)?;
@@ -440,7 +762,12 @@ impl DatabaseAuthorityBridge117 {
             .filter(|provider| provider.healthy())
             .ok_or(PortError::Unavailable)?;
         let bundle = material_provider
-            .resolve(&scope.policy_cid, share_delegation_cid)
+            .resolve_exact(
+                &scope.policy_cid,
+                share_delegation_cid,
+                &scope.authority_material_handle,
+                &scope.authority_material_digest,
+            )
             .await?;
         validate_share_policy_state(&bundle.policy_state, scope)?;
         let verifier = AuthorityArtifactVerifier;
@@ -468,19 +795,22 @@ impl DatabaseAuthorityBridge117 {
             .await?;
         let status = parse_status(&status_bytes, &bundle.internal_policy_authority_cid, now)?;
         self.authority
-            .apply_status_in_transaction(
-                tx,
-                bundle.internal_policy_authority_cid.as_str(),
-                &status,
-                now,
-            )
+            .admit_verified_authority_in_transaction(tx, signed_policy.clone(), &status, now)
             .await
             .map_err(map_authority_error)?;
+        let enforcement_status_bytes = status_provider
+            .refresh(&bundle.internal_policy_enforcement_cid)
+            .await?;
+        let enforcement_status = parse_status(
+            &enforcement_status_bytes,
+            &bundle.internal_policy_enforcement_cid,
+            now,
+        )?;
         self.authority
-            .apply_status_in_transaction(
+            .admit_verified_authority_in_transaction(
                 tx,
-                bundle.internal_policy_enforcement_cid.as_str(),
-                &status,
+                signed_enforcement.clone(),
+                &enforcement_status,
                 now,
             )
             .await
@@ -654,7 +984,7 @@ fn parse_status(
     if status.kind != "PolicyAuthorityStatus"
         || status.version != 1
         || status.authority_cid != expected_cid.as_str()
-        || status.state != "active"
+        || !matches!(status.state.as_str(), "active" | "revoked")
     {
         return Err(PortError::Denied);
     }
@@ -668,13 +998,23 @@ fn parse_status(
         &time::format_description::well_known::Rfc3339,
     )
     .map_err(|_| PortError::Denied)?;
-    if status.revoked_at.is_some() || checked_at > now || fresh_until <= now {
+    let revoked_at = status
+        .revoked_at
+        .as_deref()
+        .map(|value| OffsetDateTime::parse(value, &Rfc3339))
+        .transpose()
+        .map_err(|_| PortError::Denied)?;
+    if (status.state == "revoked") != revoked_at.is_some()
+        || checked_at > now
+        || fresh_until <= now
+        || revoked_at.is_some_and(|value| value < checked_at || value > now)
+    {
         return Err(PortError::Denied);
     }
     Ok(AuthorityStatusObservation {
         checked_at,
         sequence: status.sequence,
-        revoked_at: None,
+        revoked_at,
         fresh_until,
     })
 }
@@ -891,6 +1231,27 @@ fn holder_digest(holder: &DidKey) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(holder.as_str().as_bytes()))
 }
 
+fn next_issuance_id() -> String {
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    let mut output = String::from("peiss_");
+    let mut buffer = 0u32;
+    let mut bits = 0u8;
+    for byte in bytes {
+        buffer = (buffer << 8) | u32::from(byte);
+        bits += 8;
+        while bits >= 5 && output.len() < 32 {
+            bits -= 5;
+            output.push(ALPHABET[((buffer >> bits) & 31) as usize] as char);
+        }
+    }
+    while output.len() < 32 {
+        output.push('a');
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::types::*;
@@ -906,6 +1267,8 @@ mod tests {
             delegation_cid: Some(
                 super::super::types::ShareDelegationCid::parse(policy_cid).unwrap(),
             ),
+            authority_material_handle: AuthorityMaterialHandle::parse("amh_kv_001").unwrap(),
+            authority_material_digest: Sha256Digest::from_bytes([0; 32]),
             policy_cid: PolicyCid::parse(policy_cid).unwrap(),
             node_audience: Did::parse("did:web:node.example").unwrap(),
             target_origin: TargetOrigin::parse("https://node.example").unwrap(),

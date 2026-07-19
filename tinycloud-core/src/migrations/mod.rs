@@ -10,6 +10,7 @@ pub mod m20260715_000000_policy_authority;
 pub mod m20260715_000000_revocation_timestamp;
 pub mod m20260719_000000_share_email_protocol;
 pub mod m20260719_000001_share_policy_presentation_jti;
+pub mod m20260719_000002_policy_status_freshness;
 
 pub struct Migrator;
 
@@ -28,6 +29,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260715_000000_policy_authority::Migration),
             Box::new(m20260719_000000_share_email_protocol::Migration),
             Box::new(m20260719_000001_share_policy_presentation_jti::Migration),
+            Box::new(m20260719_000002_policy_status_freshness::Migration),
         ]
     }
 }

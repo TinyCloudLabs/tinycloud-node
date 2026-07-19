@@ -51,6 +51,48 @@ impl DatabaseAuthorityStore {
         Ok(())
     }
 
+    /// Admit one cryptographically verified parent on the caller's
+    /// transaction. Re-admission is idempotent only for byte-identical
+    /// artifacts; a CID collision or a different artifact is a hard failure.
+    pub async fn admit_verified_authority_in_transaction(
+        &self,
+        transaction: &DatabaseTransaction,
+        artifact: VerifiedDelegation,
+        observation: &AuthorityStatusObservation,
+        now: OffsetDateTime,
+    ) -> Result<(), AuthorityError> {
+        let cid = artifact.0.delegation_cid.clone();
+        if let Some(row) = policy_delegation::Entity::find_by_id(cid.clone())
+            .one(transaction)
+            .await
+            .map_err(|_| AuthorityError::TransactionFailed)?
+        {
+            if artifact_from_model(&row)? != artifact.0 {
+                return Err(AuthorityError::AuthorityStateUnavailable);
+            }
+            return self
+                .apply_status_in_transaction(transaction, &cid, observation, now)
+                .await;
+        }
+        if observation.checked_at > now
+            || observation.fresh_until <= now
+            || now - observation.checked_at > time::Duration::seconds(MAX_STATUS_AGE_SECONDS)
+        {
+            return Err(AuthorityError::AuthorityStateUnavailable);
+        }
+        let status = AuthorityStatus {
+            checked_at: observation.checked_at,
+            fresh_until: observation.fresh_until,
+            sequence: observation.sequence,
+            revoked_at: observation.revoked_at,
+        };
+        policy_delegation::Entity::insert(artifact_model(&artifact, &status)?)
+            .exec(transaction)
+            .await
+            .map_err(|_| AuthorityError::TransactionFailed)?;
+        Ok(())
+    }
+
     pub async fn insert_challenge(&self, challenge: ChallengeState) -> Result<(), AuthorityError> {
         validate_challenge_lifetime(&challenge)?;
         let stored = StoredChallenge::try_from(&challenge)?;
@@ -65,6 +107,29 @@ impl DatabaseAuthorityStore {
             consumed_at: Set(challenge.consumed_at.map(db_time).transpose()?),
         }
         .insert(&self.db)
+        .await
+        .map_err(|_| AuthorityError::TransactionFailed)?;
+        Ok(())
+    }
+
+    pub async fn insert_challenge_in_transaction(
+        &self,
+        transaction: &DatabaseTransaction,
+        challenge: ChallengeState,
+    ) -> Result<(), AuthorityError> {
+        validate_challenge_lifetime(&challenge)?;
+        let stored = StoredChallenge::try_from(&challenge)?;
+        policy_challenge::ActiveModel {
+            challenge_id: Set(challenge.challenge_id),
+            challenge_json: Set(
+                serde_json::to_value(stored).map_err(|_| AuthorityError::SchemaInvalid)?
+            ),
+            nonce_hash_hex: Set(challenge.nonce_hash_hex),
+            issued_at: Set(db_time(challenge.issued_at)?),
+            expires_at: Set(db_time(challenge.expires_at)?),
+            consumed_at: Set(None),
+        }
+        .insert(transaction)
         .await
         .map_err(|_| AuthorityError::TransactionFailed)?;
         Ok(())
@@ -87,6 +152,7 @@ impl DatabaseAuthorityStore {
             let previous = status_from_model(&row)?;
             validate_status_transition(&previous, &status)?;
             let previous_checked_at = row.status_checked_at.clone();
+            let previous_fresh_until = row.status_fresh_until.clone();
             let previous_sequence = row.status_sequence;
             let previous_revoked_at = row.revoked_at.clone();
             #[cfg(test)]
@@ -97,6 +163,10 @@ impl DatabaseAuthorityStore {
                 .col_expr(
                     policy_delegation::Column::StatusCheckedAt,
                     Expr::value(db_time(status.checked_at)?),
+                )
+                .col_expr(
+                    policy_delegation::Column::StatusFreshUntil,
+                    Expr::value(db_time(status.fresh_until)?),
                 )
                 .col_expr(
                     policy_delegation::Column::StatusSequence,
@@ -111,7 +181,8 @@ impl DatabaseAuthorityStore {
                 )
                 .filter(policy_delegation::Column::DelegationCid.eq(cid))
                 .filter(policy_delegation::Column::StatusSequence.eq(previous_sequence))
-                .filter(policy_delegation::Column::StatusCheckedAt.eq(previous_checked_at));
+                .filter(policy_delegation::Column::StatusCheckedAt.eq(previous_checked_at))
+                .filter(policy_delegation::Column::StatusFreshUntil.eq(previous_fresh_until));
             update = match previous_revoked_at {
                 Some(revoked_at) => {
                     update.filter(policy_delegation::Column::RevokedAt.eq(revoked_at))
@@ -178,6 +249,7 @@ impl DatabaseAuthorityStore {
         let previous = status_from_model(&row)?;
         let next = AuthorityStatus {
             checked_at: observation.checked_at,
+            fresh_until: observation.fresh_until,
             sequence: observation.sequence,
             revoked_at: observation.revoked_at,
         };
@@ -189,6 +261,10 @@ impl DatabaseAuthorityStore {
             .col_expr(
                 policy_delegation::Column::StatusCheckedAt,
                 Expr::value(db_time(next.checked_at)?),
+            )
+            .col_expr(
+                policy_delegation::Column::StatusFreshUntil,
+                Expr::value(db_time(next.fresh_until)?),
             )
             .col_expr(
                 policy_delegation::Column::StatusSequence,
@@ -203,6 +279,7 @@ impl DatabaseAuthorityStore {
             .filter(policy_delegation::Column::DelegationCid.eq(cid))
             .filter(policy_delegation::Column::StatusSequence.eq(previous.sequence as i64))
             .filter(policy_delegation::Column::StatusCheckedAt.eq(row.status_checked_at))
+            .filter(policy_delegation::Column::StatusFreshUntil.eq(row.status_fresh_until))
             .exec(transaction)
             .await
             .map_err(|_| AuthorityError::TransactionFailed)?;
@@ -472,6 +549,7 @@ impl DatabaseAuthorityStore {
 
         let status = AuthorityStatus {
             checked_at: consumed_at,
+            fresh_until: consumed_at + time::Duration::seconds(MAX_STATUS_AGE_SECONDS),
             sequence: 0,
             revoked_at: None,
         };
@@ -531,6 +609,7 @@ impl DatabaseAuthorityStore {
                 &artifact,
                 &AuthorityStatus {
                     checked_at: verified_at,
+                    fresh_until: verified_at + time::Duration::seconds(MAX_STATUS_AGE_SECONDS),
                     sequence: 0,
                     revoked_at: None,
                 },
@@ -871,6 +950,8 @@ fn ensure_live_model(
     let status = status_from_model(row)?;
     if status.checked_at > now
         || now - status.checked_at > time::Duration::seconds(MAX_STATUS_AGE_SECONDS)
+        || status.fresh_until <= now
+        || status.fresh_until - status.checked_at > time::Duration::seconds(MAX_STATUS_AGE_SECONDS)
     {
         return Err(AuthorityError::AuthorityStateUnavailable);
     }
@@ -920,6 +1001,7 @@ fn artifact_model(
         not_before: Set(artifact.0.not_before.clone()),
         expires_at: Set(artifact.0.expires_at.clone()),
         status_checked_at: Set(db_time(status.checked_at)?),
+        status_fresh_until: Set(Some(db_time(status.fresh_until)?)),
         status_sequence: Set(
             i64::try_from(status.sequence).map_err(|_| AuthorityError::SchemaInvalid)?
         ),
@@ -1028,12 +1110,24 @@ impl TryFrom<StoredChallenge> for ChallengeState {
 }
 
 fn status_from_model(model: &policy_delegation::Model) -> Result<AuthorityStatus, AuthorityError> {
+    let checked_at = db_time_parse(&model.status_checked_at)?;
     let status = AuthorityStatus {
-        checked_at: db_time_parse(&model.status_checked_at)?,
+        checked_at,
+        fresh_until: model
+            .status_fresh_until
+            .as_deref()
+            .map(db_time_parse)
+            .transpose()?
+            .unwrap_or(checked_at + time::Duration::seconds(MAX_STATUS_AGE_SECONDS)),
         sequence: u64::try_from(model.status_sequence)
             .map_err(|_| AuthorityError::AuthorityStateUnavailable)?,
         revoked_at: model.revoked_at.as_deref().map(db_time_parse).transpose()?,
     };
+    if status.fresh_until <= status.checked_at
+        || status.fresh_until - status.checked_at > time::Duration::seconds(MAX_STATUS_AGE_SECONDS)
+    {
+        return Err(AuthorityError::AuthorityStateUnavailable);
+    }
     if status
         .revoked_at
         .is_some_and(|revoked_at| revoked_at > status.checked_at)
