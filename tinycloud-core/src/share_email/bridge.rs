@@ -449,6 +449,7 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
         let credential_expiry = OffsetDateTime::from_unix_timestamp(request.credential_expires_at)
             .map_err(|_| PortError::Denied)?;
         if credential_expiry != policy_expiry {
+            eprintln!("mounted session: expiry mismatch credential={} policy={}", credential_expiry, policy_expiry);
             return Err(PortError::Denied);
         }
         ProtocolStateRepository::consume_anonymous_challenge_in_transaction(
@@ -493,6 +494,7 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
             .min(credential_expiry)
             .min(policy_expiry);
         if expires_at <= now {
+            eprintln!("mounted session: calculated expiry {} is not after now {}", expires_at, now);
             return Err(PortError::Denied);
         }
 
