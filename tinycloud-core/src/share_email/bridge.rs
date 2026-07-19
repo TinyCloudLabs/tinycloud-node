@@ -28,8 +28,11 @@ use time::OffsetDateTime;
 
 use crate::{
     models::{share_policy_presentation_jti, share_session_handle},
-    policy_authority::{AuthorityArtifactVerifier, AuthorityError, DatabaseAuthorityStore},
-    policy_capability::{parse as parse_capability, PolicyCapability},
+    policy_authority::{
+        AuthorityArtifactVerifier, AuthorityError, AuthorityStatusObservation,
+        DatabaseAuthorityStore,
+    },
+    policy_capability::{jcs, parse as parse_capability, PolicyCapability},
 };
 
 use super::{
@@ -42,8 +45,9 @@ use super::{
         SessionHandleMapping, StateError, READ_JTI_TTL, SESSION_TTL,
     },
     types::{
-        AuthorizedRead, DidKey, NodeDelegationCid, PolicySession, PolicySessionRequest,
+        AuthorizedRead, Did, DidKey, NodeDelegationCid, PolicySession, PolicySessionRequest,
         ReadAuthorizationRequest, ReadInvocation, SessionHandle, Sha256Digest, ShareScope,
+        TargetOrigin,
     },
 };
 
@@ -342,8 +346,8 @@ impl DatabaseAuthorityBridge117 {
             .await
             .map_err(map_authority_error)
             .and_then(|artifact| {
-                let (recipient, expiry) =
-                    policy_metadata(&artifact).map_err(|_| PortError::Denied)?;
+                let (recipient, expiry) = policy_metadata(&artifact, Some(&bundle.policy_state))
+                    .map_err(|_| PortError::Denied)?;
                 if now < expiry {
                     Ok((recipient, expiry))
                 } else {
@@ -438,6 +442,7 @@ impl DatabaseAuthorityBridge117 {
         let bundle = material_provider
             .resolve(&scope.policy_cid, share_delegation_cid)
             .await?;
+        validate_share_policy_state(&bundle.policy_state, scope)?;
         let verifier = AuthorityArtifactVerifier;
         let signed_policy = verifier
             .verify(&bundle.policy_authority)
@@ -458,12 +463,43 @@ impl DatabaseAuthorityBridge117 {
                 .map_err(|_| PortError::Denied)?,
         )
         .map_err(|_| PortError::Denied)?;
-        let _status = status_provider
-            .refresh(&bundle.internal_policy_enforcement_cid)
+        let status_bytes = status_provider
+            .refresh(&bundle.internal_policy_authority_cid)
             .await?;
-        let _attestation = attestation_provider
+        let status = parse_status(&status_bytes, &bundle.internal_policy_authority_cid, now)?;
+        self.authority
+            .apply_status_in_transaction(
+                tx,
+                bundle.internal_policy_authority_cid.as_str(),
+                &status,
+                now,
+            )
+            .await
+            .map_err(map_authority_error)?;
+        self.authority
+            .apply_status_in_transaction(
+                tx,
+                bundle.internal_policy_enforcement_cid.as_str(),
+                &status,
+                now,
+            )
+            .await
+            .map_err(map_authority_error)?;
+        let attestation = attestation_provider
             .attest(&scope.node_audience, &enforcer)
             .await?;
+        validate_attestation(
+            &attestation,
+            &scope.target_origin,
+            &scope.node_audience,
+            &enforcer,
+            signed_enforcement
+                .artifact()
+                .fact_value("attestationBindingDigestHex")
+                .map_err(|_| PortError::Denied)?,
+            &signed_enforcement.artifact().expires_at,
+            now,
+        )?;
         let policy_cid = bundle.internal_policy_authority_cid;
         let delegation_cid = bundle.internal_delegation_cid.clone();
         self.authority
@@ -497,7 +533,8 @@ impl DatabaseAuthorityBridge117 {
         {
             return Err(PortError::Denied);
         }
-        let (recipient, expiry) = policy_metadata(&policy).map_err(|_| PortError::Denied)?;
+        let (recipient, expiry) =
+            policy_metadata(&policy, Some(&bundle.policy_state)).map_err(|_| PortError::Denied)?;
         let statement = authorized_statement(scope, &policy, &delegation)?;
         Ok((expiry, recipient, statement, bundle.internal_delegation_cid))
     }
@@ -516,6 +553,7 @@ fn digest_string(value: &str) -> Sha256Digest {
 
 fn policy_metadata(
     artifact: &crate::policy_authority::PolicyDelegation,
+    share_policy: Option<&[u8]>,
 ) -> Result<(String, OffsetDateTime), ()> {
     fn find_email(value: &serde_json::Value) -> Option<String> {
         match value {
@@ -528,12 +566,19 @@ fn policy_metadata(
             _ => None,
         }
     }
-    let recipient = artifact
-        .facts
-        .iter()
-        .find(|(key, _)| key.ends_with("/recipientEmail") || key.as_str() == "recipientEmail")
-        .map(|(_, value)| value.clone())
-        .or_else(|| artifact.capabilities.iter().find_map(find_email))
+    let recipient = share_policy
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+        .and_then(|value| find_email(&value))
+        .or_else(|| {
+            artifact
+                .facts
+                .iter()
+                .find(|(key, _)| {
+                    key.ends_with("/recipientEmail") || key.as_str() == "recipientEmail"
+                })
+                .map(|(_, value)| value.clone())
+                .or_else(|| artifact.capabilities.iter().find_map(find_email))
+        })
         .ok_or(())?;
     let recipient =
         tinycloud_auth::share_email_evidence::normalize_email(&recipient).map_err(|_| ())?;
@@ -542,7 +587,164 @@ fn policy_metadata(
         &time::format_description::well_known::Rfc3339,
     )
     .map_err(|_| ())?;
-    Ok((recipient, expiry))
+    let share_expiry = share_policy
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+        .and_then(|value| {
+            value
+                .get("expiresAt")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .and_then(|value| {
+            OffsetDateTime::parse(&value, &time::format_description::well_known::Rfc3339).ok()
+        });
+    Ok((
+        recipient,
+        share_expiry.map_or(expiry, |value| value.min(expiry)),
+    ))
+}
+
+fn validate_share_policy_state(bytes: &[u8], scope: &ShareScope) -> Result<(), PortError> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| PortError::Denied)?;
+    let source = serde_json::to_value(&scope.content_source).map_err(|_| PortError::Denied)?;
+    let action = match scope.action {
+        super::types::ShareAction::KvGet => super::types::KV_GET_ACTION,
+        super::types::ShareAction::SqlRead => super::types::SQL_READ_ACTION,
+    };
+    let resource = match &scope.resource {
+        super::types::ExactResource::Kv { path }
+        | super::types::ExactResource::Sql { path, .. } => path.as_str(),
+    };
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("TinyCloudSharePolicy")
+        || value.get("version").and_then(serde_json::Value::as_u64) != Some(1)
+        || value.get("contentSource") != Some(&source)
+        || value
+            .get("contentSourceDigest")
+            .and_then(serde_json::Value::as_str)
+            != Some(scope.content_source_digest.as_str())
+        || value.get("action").and_then(serde_json::Value::as_str) != Some(action)
+        || value.get("resource").and_then(serde_json::Value::as_str) != Some(resource)
+    {
+        return Err(PortError::Denied);
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct AuthorityStatusWire {
+    #[serde(rename = "type")]
+    kind: String,
+    version: u8,
+    authority_cid: String,
+    sequence: u64,
+    state: String,
+    issued_at: String,
+    fresh_until: String,
+    revoked_at: Option<String>,
+}
+
+fn parse_status(
+    bytes: &[u8],
+    expected_cid: &NodeDelegationCid,
+    now: OffsetDateTime,
+) -> Result<AuthorityStatusObservation, PortError> {
+    let status: AuthorityStatusWire =
+        serde_json::from_slice(bytes).map_err(|_| PortError::Denied)?;
+    if status.kind != "PolicyAuthorityStatus"
+        || status.version != 1
+        || status.authority_cid != expected_cid.as_str()
+        || status.state != "active"
+    {
+        return Err(PortError::Denied);
+    }
+    let checked_at = OffsetDateTime::parse(
+        &status.issued_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .map_err(|_| PortError::Denied)?;
+    let fresh_until = OffsetDateTime::parse(
+        &status.fresh_until,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .map_err(|_| PortError::Denied)?;
+    if status.revoked_at.is_some() || checked_at > now || fresh_until <= now {
+        return Err(PortError::Denied);
+    }
+    Ok(AuthorityStatusObservation {
+        checked_at,
+        sequence: status.sequence,
+        revoked_at: None,
+        fresh_until,
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct AttestationWire {
+    #[serde(rename = "type")]
+    kind: String,
+    version: u8,
+    origin: String,
+    audience: String,
+    enforcer_kid: String,
+    key_version: u64,
+    measurement: String,
+    digest: String,
+    issued_at: String,
+    expires_at: String,
+    enrollment_digest: String,
+}
+
+fn validate_attestation(
+    bytes: &[u8],
+    origin: &TargetOrigin,
+    audience: &Did,
+    enforcer: &DidKey,
+    expected_binding_digest_hex: &str,
+    enforcement_expires_at: &str,
+    now: OffsetDateTime,
+) -> Result<(), PortError> {
+    let attestation: AttestationWire =
+        serde_json::from_slice(bytes).map_err(|_| PortError::Denied)?;
+    let issued_at = OffsetDateTime::parse(
+        &attestation.issued_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .map_err(|_| PortError::Denied)?;
+    let expires_at = OffsetDateTime::parse(
+        &attestation.expires_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .map_err(|_| PortError::Denied)?;
+    let enforcement_expires_at = OffsetDateTime::parse(
+        enforcement_expires_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .map_err(|_| PortError::Denied)?;
+    let canonical = jcs::canonicalize(
+        &serde_json::from_slice::<serde_json::Value>(bytes).map_err(|_| PortError::Denied)?,
+    );
+    let actual_binding_digest = hex::encode(Sha256::digest(canonical));
+    if attestation.kind != "PolicyEnforcerAttestation"
+        || attestation.version != 1
+        || attestation.origin != origin.as_str()
+        || attestation.audience != audience.as_str()
+        || !attestation.enforcer_kid.starts_with(enforcer.as_str())
+        || attestation.key_version == 0
+        || attestation.measurement.is_empty()
+        || attestation.digest.is_empty()
+        || attestation.enrollment_digest.is_empty()
+        || actual_binding_digest != expected_binding_digest_hex
+        || issued_at > now
+        || expires_at <= now
+        || expires_at > enforcement_expires_at
+        || expires_at <= issued_at
+        || expires_at - issued_at > time::Duration::seconds(300)
+    {
+        return Err(PortError::Denied);
+    }
+    Ok(())
 }
 
 fn authorized_statement(

@@ -47,7 +47,8 @@ use tinycloud_core::{
             TargetOrigin,
         },
         verifier::ExactEmailVerifier,
-        DatabaseAuthorityBridge117, PolicyAuthorityTransaction117, PortError,
+        AuthenticatedAuthorityMaterialProvider, DatabaseAuthorityBridge117,
+        PolicyAuthorityTransaction117, PortError,
     },
     sql::{caveats::PreparedStatement, SqlCaveats, SqlRequest, SqlResponse, SqlService, SqlValue},
 };
@@ -529,10 +530,20 @@ pub fn compose(
     let signer =
         Ed25519InvitationSigner::new(config.node_signing_kid.clone(), signing_ed25519.into())
             .map_err(|e| anyhow::anyhow!("share email signer: {e}"))?;
-    let bridge = Arc::new(DatabaseAuthorityBridge117::new(
-        conn.clone(),
-        DatabaseAuthorityStore::new(conn.clone()),
-    ));
+    let material_path = config
+        .authority_material_path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("share email authority material is required"))?;
+    let material = Arc::new(
+        AuthenticatedAuthorityMaterialProvider::from_path(material_path)
+            .map_err(|_| anyhow::anyhow!("share email authority material is invalid"))?,
+    );
+    let status_provider = Arc::new(material.status_provider());
+    let attestation_provider = Arc::new(material.attestation_provider());
+    let bridge = Arc::new(
+        DatabaseAuthorityBridge117::new(conn.clone(), DatabaseAuthorityStore::new(conn.clone()))
+            .with_authority_providers(material, status_provider, attestation_provider),
+    );
     // Sequence C supplies authenticated authority material, fresh status, and
     // attestation/enrollment providers. Until all three are injected and
     // healthy, the capability is absent and every protocol route stays

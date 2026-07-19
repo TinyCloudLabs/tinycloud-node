@@ -156,6 +156,62 @@ impl DatabaseAuthorityStore {
         Err(AuthorityError::AuthorityStateUnavailable)
     }
 
+    /// Apply an authenticated status observation while the composing caller's
+    /// transaction is open. Equal observations are idempotent; rollback,
+    /// stale observations, and resurrection after revocation are rejected.
+    pub async fn apply_status_in_transaction(
+        &self,
+        transaction: &DatabaseTransaction,
+        cid: &str,
+        observation: &AuthorityStatusObservation,
+        now: OffsetDateTime,
+    ) -> Result<(), AuthorityError> {
+        if observation.checked_at > now
+            || observation.fresh_until <= now
+            || now - observation.checked_at > time::Duration::seconds(MAX_STATUS_AGE_SECONDS)
+            || observation.fresh_until - observation.checked_at
+                > time::Duration::seconds(MAX_STATUS_AGE_SECONDS)
+        {
+            return Err(AuthorityError::AuthorityStateUnavailable);
+        }
+        let row = delegation_row(transaction, cid, true).await?;
+        let previous = status_from_model(&row)?;
+        let next = AuthorityStatus {
+            checked_at: observation.checked_at,
+            sequence: observation.sequence,
+            revoked_at: observation.revoked_at,
+        };
+        if next == previous {
+            return Ok(());
+        }
+        validate_status_transition(&previous, &next)?;
+        let updated = policy_delegation::Entity::update_many()
+            .col_expr(
+                policy_delegation::Column::StatusCheckedAt,
+                Expr::value(db_time(next.checked_at)?),
+            )
+            .col_expr(
+                policy_delegation::Column::StatusSequence,
+                Expr::value(
+                    i64::try_from(next.sequence).map_err(|_| AuthorityError::SchemaInvalid)?,
+                ),
+            )
+            .col_expr(
+                policy_delegation::Column::RevokedAt,
+                Expr::value(next.revoked_at.map(db_time).transpose()?),
+            )
+            .filter(policy_delegation::Column::DelegationCid.eq(cid))
+            .filter(policy_delegation::Column::StatusSequence.eq(previous.sequence as i64))
+            .filter(policy_delegation::Column::StatusCheckedAt.eq(row.status_checked_at))
+            .exec(transaction)
+            .await
+            .map_err(|_| AuthorityError::TransactionFailed)?;
+        if updated.rows_affected != 1 {
+            return Err(AuthorityError::AuthorityStateUnavailable);
+        }
+        Ok(())
+    }
+
     async fn acquire_chain_guards(&self, cids: &[String]) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
         let mut keys = cids.to_vec();
         keys.sort();

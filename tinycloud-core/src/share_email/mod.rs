@@ -6,6 +6,7 @@
 //! `data_plane`). This module still declares no HTTP routes, configuration,
 //! or app-state composition; that remains `lib.rs`'s responsibility.
 
+pub mod authority;
 pub mod bridge;
 pub mod data_plane;
 pub mod fakes;
@@ -15,6 +16,10 @@ pub mod state;
 pub mod types;
 pub mod verifier;
 
+pub use authority::{
+    AuthenticatedAttestationProvider, AuthenticatedAuthorityMaterialProvider,
+    AuthenticatedStatusProvider,
+};
 pub use bridge::DatabaseAuthorityBridge117;
 pub use ports::{
     AttestationEnrollmentProvider, AuthorityMaterialBundle, AuthorityMaterialProvider,

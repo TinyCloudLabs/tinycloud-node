@@ -598,6 +598,17 @@ pub struct AuthorityStatus {
     revoked_at: Option<OffsetDateTime>,
 }
 
+/// A status observation authenticated by the configured authority provider.
+/// The database store is the monotonic commit point; callers cannot construct
+/// an `AuthorityStatus` directly on a production path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorityStatusObservation {
+    pub checked_at: OffsetDateTime,
+    pub sequence: u64,
+    pub revoked_at: Option<OffsetDateTime>,
+    pub fresh_until: OffsetDateTime,
+}
+
 impl AuthorityStatus {
     #[cfg(test)]
     fn active_for_test(checked_at: OffsetDateTime, sequence: u64) -> Self {

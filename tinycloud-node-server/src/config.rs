@@ -61,6 +61,10 @@ pub struct ShareEmailConfig {
     pub issuer_key_version: u64,
     #[serde(default)]
     pub issuer_public_key: Option<String>,
+    /// Operator-delivered owner-signed authority material. A missing or
+    /// unreadable source keeps the capability unavailable.
+    #[serde(default)]
+    pub authority_material_path: Option<String>,
     #[serde(default = "default_share_clock_skew")]
     pub clock_skew_seconds: i64,
     #[serde(default = "default_share_challenge_ttl")]
@@ -117,6 +121,7 @@ impl Default for ShareEmailConfig {
             issuer_kid: default_share_issuer_kid(),
             issuer_key_version: default_share_issuer_key_version(),
             issuer_public_key: None,
+            authority_material_path: None,
             clock_skew_seconds: default_share_clock_skew(),
             challenge_ttl_seconds: default_share_challenge_ttl(),
             space_name: default_share_space_name(),
@@ -148,6 +153,7 @@ impl ShareEmailConfig {
             || self.challenge_ttl_seconds > 120
             || self.invitation_public_key.is_none()
             || self.issuer_public_key.is_none()
+            || self.authority_material_path.is_none()
         {
             return Err("share email configuration is incomplete");
         }
