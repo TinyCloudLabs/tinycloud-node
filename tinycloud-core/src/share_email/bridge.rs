@@ -561,17 +561,23 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
             .one(&tx)
             .await
             .map_err(|_| PortError::Storage)?
-            .ok_or(PortError::Denied)?;
+            .ok_or_else(|| {
+                eprintln!("mounted authorize: session missing");
+                PortError::Denied
+            })?;
 
         if session_row.revoked_at.is_some() {
+            eprintln!("mounted authorize: revoked");
             return Err(PortError::Denied);
         }
         let session_expires_at =
             parse_timestamp(&session_row.expires_at).map_err(map_state_error)?;
         if session_expires_at <= now {
+            eprintln!("mounted authorize: expired");
             return Err(PortError::Denied);
         }
         if session_row.holder_digest != holder_digest(&request.holder) {
+            eprintln!("mounted authorize: holder mismatch");
             return Err(PortError::Denied);
         }
         let binding: SessionBinding = serde_json::from_value(session_row.binding_json.clone())
@@ -581,15 +587,25 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
             scope.delegation_cid = Some(binding.delegation_cid.clone());
         }
         if scope_digest(&scope) != binding.scope_digest {
+            eprintln!("mounted authorize: scope mismatch");
             return Err(PortError::Denied);
         }
 
-        let (_, _, sql_statement, _) = self.validate_scope_in_transaction(&tx, &scope, now).await?;
+        let (_, _, sql_statement, _) = self
+            .validate_scope_in_transaction(&tx, &scope, now)
+            .await
+            .map_err(|error| {
+            eprintln!("mounted authorize: scope validation {error:?}");
+            error
+        })?;
 
         self.authority
             .validate_for_invocation_in_transaction(&tx, &session_row.authority_session_cid, now)
             .await
-            .map_err(map_authority_error)?;
+            .map_err(|error| {
+                eprintln!("mounted authorize: authority {error:?}");
+                map_authority_error(error)
+            })?;
 
         let read = HolderReadJti {
             jti: request.jti.as_str().to_owned(),
@@ -602,7 +618,10 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
 
         ProtocolStateRepository::consume_holder_read_jti_in_transaction(&tx, read, now)
             .await
-            .map_err(map_state_error)?;
+            .map_err(|error| {
+                eprintln!("mounted authorize: read jti {error:?}");
+                map_state_error(error)
+            })?;
 
         tx.commit().await.map_err(|_| PortError::Storage)?;
 
