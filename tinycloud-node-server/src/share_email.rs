@@ -873,25 +873,25 @@ fn scope_from_presentation(
     p: &PolicyPresentation,
     config: &ShareEmailConfig,
 ) -> Result<ShareScope, ()> {
-    scope_from_request(
-        &PolicyChallengeRequest {
-            share_cid: p.share_cid.clone(),
-            share_id: p.share_id.clone(),
-            delegation_cid: p.delegation_cid.clone(),
-            authority_material_handle: p.authority_material_handle.clone(),
-            authority_material_digest: p.authority_material_digest.clone(),
-            policy_cid: p.policy_cid.clone(),
-            content_source: p.content_source.clone(),
-            content_source_digest: p.content_source_digest.clone(),
-            holder_did: p.holder_did.clone(),
-            target_origin: p.target_origin.clone(),
-            node_audience: p.node_audience.clone(),
-            action: p.action,
-            resource: p.resource.clone(),
-            request_body_digest: p.request_body_digest.clone(),
-        },
-        config,
-    )
+    let request = PolicyChallengeRequest {
+        share_cid: p.share_cid.clone(),
+        share_id: p.share_id.clone(),
+        delegation_cid: p.delegation_cid.clone(),
+        authority_material_handle: p.authority_material_handle.clone(),
+        authority_material_digest: p.authority_material_digest.clone(),
+        policy_cid: p.policy_cid.clone(),
+        content_source: p.content_source.clone(),
+        content_source_digest: p.content_source_digest.clone(),
+        holder_did: p.holder_did.clone(),
+        target_origin: p.target_origin.clone(),
+        node_audience: p.node_audience.clone(),
+        action: p.action,
+        resource: p.resource.clone(),
+        request_body_digest: p.request_body_digest.clone(),
+    };
+    let request_value = serde_json::to_value(&request).map_err(|_| ())?;
+    verify_request_body_digest(&request_value, &p.request_body_digest)?;
+    scope_from_request(&request, config)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -947,19 +947,10 @@ pub async fn authorize_invitation(
         b"xyz.tinycloud.share/invite-authorization/v1\0",
         &signed_value,
     )
-    .map_err(|_| {
-        #[cfg(feature = "mounted-fixture")]
-        eprintln!("mounted authorize rejected: sender signature");
-        error(Status::Forbidden, "invitation_authorization_invalid")
-    })?;
+    .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
     let authorization_body = invitation_request_body(&request);
-    verify_canonical_body_digest(&authorization_body, &request.request_body_digest).map_err(
-        |_| {
-            #[cfg(feature = "mounted-fixture")]
-            eprintln!("mounted authorize rejected: request body digest");
-            error(Status::Forbidden, "invitation_authorization_invalid")
-        },
-    )?;
+    verify_canonical_body_digest(&authorization_body, &request.request_body_digest)
+        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
     let scope_request = PolicyChallengeRequest {
         share_cid: request.share_cid.clone(),
         share_id: request.share_id.clone(),
@@ -982,21 +973,14 @@ pub async fn authorize_invitation(
         },
         request_body_digest: request.request_body_digest.clone(),
     };
-    let scope = scope_from_request(&scope_request, &runtime.config).map_err(|_| {
-        #[cfg(feature = "mounted-fixture")]
-        eprintln!("mounted authorize rejected: scope");
-        error(Status::Forbidden, "invitation_authorization_invalid")
-    })?;
+    let scope = scope_from_request(&scope_request, &runtime.config)
+        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
     let now = OffsetDateTime::now_utc();
     runtime
         .bridge
         .validate_scope(&scope, now)
         .await
-        .map_err(|_bridge_error| {
-            #[cfg(feature = "mounted-fixture")]
-            eprintln!("mounted authorize rejected: bridge scope: {_bridge_error:?}");
-            error(Status::Forbidden, "invitation_authorization_invalid")
-        })?;
+        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
     runtime
         .bridge
         .validate_sender_for_policy(
@@ -1007,11 +991,7 @@ pub async fn authorize_invitation(
             request.sender_did.as_str(),
         )
         .await
-        .map_err(|_bridge_error| {
-            #[cfg(feature = "mounted-fixture")]
-            eprintln!("mounted authorize rejected: sender policy: {_bridge_error:?}");
-            error(Status::Forbidden, "invitation_authorization_invalid")
-        })?;
+        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
     let (policy_email, policy_expiry) = runtime
         .bridge
         .policy_recipient_and_expiry(
@@ -1022,18 +1002,12 @@ pub async fn authorize_invitation(
             now,
         )
         .await
-        .map_err(|_bridge_error| {
-            #[cfg(feature = "mounted-fixture")]
-            eprintln!("mounted authorize rejected: policy metadata: {_bridge_error:?}");
-            error(Status::Forbidden, "invitation_authorization_invalid")
-        })?;
+        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
     if policy_email != request.recipient_email.as_str()
         || request.target_origin.as_str() != runtime.config.target_origin
         || request.node_audience.as_str() != runtime.config.node_audience
         || OffsetDateTime::parse(&request.share_expires_at, &Rfc3339).ok() != Some(policy_expiry)
     {
-        #[cfg(feature = "mounted-fixture")]
-        eprintln!("mounted authorize rejected: policy tuple");
         return Err(error(Status::Forbidden, "invitation_authorization_invalid"));
     }
     let receipt = issue_invitation_authorization_for(
@@ -1627,5 +1601,48 @@ mod tests {
         valid["requestBodyDigest"] = json!(read_digest.as_str());
         valid["invocation"]["requestBodyDigest"] = json!(read_digest.as_str());
         assert!(verify_read_request_body_digest(&valid, &read_digest, &read_digest).is_ok());
+    }
+
+    #[tokio::test]
+    async fn policy_presentation_reuses_only_the_original_challenge_body() {
+        let source = json!({
+            "action": "tinycloud.kv/get",
+            "kind": "kv",
+            "path": "documents/plan.md",
+            "space": "did:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7"
+        });
+        let source_digest = digest(&source);
+        let request = json!({
+            "shareCid": "bafkreigvcvtxbo4zv5ysyet4pm2y3rhclbizfjfyj4wzhmtjg2us4oy25a",
+            "shareId": "shr_n4-mounted-kv",
+            "delegationCid": "bafkreihhkhfgdqltz6ivbwcj7pq4idmzv7nsrbz6atilby3ymovnfquwam",
+            "authorityMaterialHandle": "amh_kv_001",
+            "authorityMaterialDigest": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "policyCid": "bafkreigvcvtxbo4zv5ysyet4pm2y3rhclbizfjfyj4wzhmtjg2us4oy25a",
+            "contentSource": source,
+            "contentSourceDigest": source_digest.as_str(),
+            "holderDid": "did:key:z6MkghLt1e8m1fmANsdJJco3aCLV8Xnigr5UWwC3u5iZFPd3",
+            "targetOrigin": "https://node.example",
+            "nodeAudience": "did:web:node.example",
+            "action": "tinycloud.kv/get",
+            "resource": "documents/plan.md"
+        });
+        let request_digest = digest(&request);
+        let mut presentation = request;
+        presentation["type"] = json!("TinyCloudSharePolicyPresentation");
+        presentation["version"] = json!(1);
+        presentation["challengeId"] = json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        presentation["nonce"] = json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        presentation["credentialDigest"] = json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        presentation["requestBodyDigest"] = json!(request_digest.as_str());
+        presentation["issuedAt"] = json!("2026-07-19T17:00:00.000Z");
+        presentation["expiresAt"] = json!("2026-07-19T17:02:00.000Z");
+        presentation["jti"] = json!("AAAAAAAAAAAAAAAAAAAAAA");
+        let presentation: PolicyPresentation = serde_json::from_value(presentation).unwrap();
+        assert!(scope_from_presentation(&presentation, &ShareEmailConfig::default()).is_ok());
+
+        let mut altered = presentation.clone();
+        altered.resource = Path::parse("documents/other.md").unwrap();
+        assert!(scope_from_presentation(&altered, &ShareEmailConfig::default()).is_err());
     }
 }
