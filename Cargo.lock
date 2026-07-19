@@ -9310,6 +9310,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinycloud-node-n4-mounted-fixture"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "futures",
+ "k256",
+ "rocket",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sha3",
+ "tempfile",
+ "time",
+ "tinycloud-auth",
+ "tinycloud-core",
+ "tinycloud-node",
+ "tokio",
+]
+
+[[package]]
 name = "tinycloud-sdk-rs"
 version = "1.3.0"
 dependencies = [
