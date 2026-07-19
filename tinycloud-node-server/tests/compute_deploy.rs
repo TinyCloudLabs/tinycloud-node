@@ -123,10 +123,17 @@ fn keypair() -> Result<(JWK, String, String)> {
 /// Create the space, seed actors, and seed an owner->holder
 /// `compute/deploy` grant on `<space>/compute/` (space-wide, so it covers any
 /// concrete function path).
-async fn setup(conn: &DatabaseConnection, space_name: &str, holder_ability: &str) -> Result<Fixture> {
+async fn setup(
+    conn: &DatabaseConnection,
+    space_name: &str,
+    holder_ability: &str,
+) -> Result<Fixture> {
     let (owner_jwk, owner_did, owner_vm) = keypair()?;
     let owner_key_did = DID_METHODS.generate(&owner_jwk, "key")?;
-    let space = SpaceId::new(owner_key_did, space_name.parse().map_err(|e| anyhow::anyhow!("{e:?}"))?);
+    let space = SpaceId::new(
+        owner_key_did,
+        space_name.parse().map_err(|e| anyhow::anyhow!("{e:?}"))?,
+    );
     let space_str = space.to_string();
     // The space DID must equal the owner DID so the owner is root authority.
     assert_eq!(space.did().to_string(), owner_did);
@@ -150,7 +157,9 @@ async fn setup(conn: &DatabaseConnection, space_name: &str, holder_ability: &str
     // (`<space>/compute`, path = None) so it authorizes any concrete function
     // path (a None-path base extends to any child path in `ResourceId::extends`).
     let grant_resource: ResourceId =
-        space.clone().to_resource("compute".parse::<Service>()?, None, None, None);
+        space
+            .clone()
+            .to_resource("compute".parse::<Service>()?, None, None, None);
     let parent_hash = hash(format!("compute-deploy-parent:{space_name}").as_bytes());
     deleg_model::ActiveModel {
         id: Set(parent_hash),
@@ -167,7 +176,9 @@ async fn setup(conn: &DatabaseConnection, space_name: &str, holder_ability: &str
     abilities::ActiveModel {
         delegation: Set(parent_hash),
         resource: Set(Resource::TinyCloud(grant_resource)),
-        ability: Set(Ability::try_from(holder_ability.to_string()).map_err(|e| anyhow::anyhow!("{e:?}"))?),
+        ability: Set(
+            Ability::try_from(holder_ability.to_string()).map_err(|e| anyhow::anyhow!("{e:?}"))?
+        ),
         caveats: Set(Caveats(BTreeMap::new())),
     }
     .insert(conn)
@@ -187,7 +198,12 @@ async fn setup(conn: &DatabaseConnection, space_name: &str, holder_ability: &str
 
 /// Sign a compute invocation by the holder, citing the seeded parent grant,
 /// declaring `ability` on `<space>/compute/<function_path>`.
-fn sign_invocation(fx: &Fixture, ability: &str, function_path: &str, nonce: &str) -> Result<String> {
+fn sign_invocation(
+    fx: &Fixture,
+    ability: &str,
+    function_path: &str,
+    nonce: &str,
+) -> Result<String> {
     let resource: ResourceId = fx.space.clone().to_resource(
         "compute".parse::<Service>()?,
         Some(function_path.parse::<AuthPath>()?),
@@ -210,7 +226,10 @@ fn sign_invocation(fx: &Fixture, ability: &str, function_path: &str, nonce: &str
         proof: vec![fx.parent_cid],
         attenuation: caps,
     }
-    .sign(fx.holder_jwk.get_algorithm().unwrap_or_default(), &fx.holder_jwk)?;
+    .sign(
+        fx.holder_jwk.get_algorithm().unwrap_or_default(),
+        &fx.holder_jwk,
+    )?;
     Ok(invocation.encode()?)
 }
 
@@ -254,7 +273,10 @@ fn build_dfn(
         proof: vec![],
         attenuation: caps,
     }
-    .sign(fx.owner_jwk.get_algorithm().unwrap_or_default(), &fx.owner_jwk)?;
+    .sign(
+        fx.owner_jwk.get_algorithm().unwrap_or_default(),
+        &fx.owner_jwk,
+    )?;
     Ok(dfn.encode()?)
 }
 
@@ -272,7 +294,7 @@ async fn post_invoke(client: &Client, auth: &str, body: &str) -> (Status, String
         .post("/invoke")
         .header(Header::new("Authorization", auth.to_string()))
         .header(ContentType::JSON)
-        .body(body.to_string())
+        .body(body)
         .dispatch()
         .await;
     let status = response.status();
@@ -281,13 +303,21 @@ async fn post_invoke(client: &Client, auth: &str, body: &str) -> (Status, String
 }
 
 /// Fetch the routine DID for (space, content_cid) via the read-only handshake.
-async fn handshake(client: &Client, fx: &Fixture, content_cid: &str, nonce: &str) -> Result<String> {
+async fn handshake(
+    client: &Client,
+    fx: &Fixture,
+    content_cid: &str,
+    nonce: &str,
+) -> Result<String> {
     let auth = sign_invocation(fx, "tinycloud.compute/deploy", content_cid, nonce)?;
     let body = format!(r#"{{"action":"routine_did","content_cid":"{content_cid}"}}"#);
     let (status, resp) = post_invoke(client, &auth, &body).await;
     assert_eq!(status, Status::Ok, "handshake failed: {resp}");
     let json: serde_json::Value = serde_json::from_str(&resp)?;
-    Ok(json["routine_did"].as_str().context("no routine_did")?.to_string())
+    Ok(json["routine_did"]
+        .as_str()
+        .context("no routine_did")?
+        .to_string())
 }
 
 // --- Tests -----------------------------------------------------------------
@@ -306,7 +336,12 @@ async fn successful_deploy_persists_artifact_delegation_and_quota_mirror() -> Re
     let wasm = b"\0asm-fixture-v1".to_vec();
     let content_cid = content_cid_of(&wasm);
     let routine_did = handshake(&client, &fx, &content_cid, "urn:uuid:hs-1").await?;
-    let dfn = build_dfn(&fx, &routine_did, &content_cid, &[("tinycloud.kv/get", "in/")])?;
+    let dfn = build_dfn(
+        &fx,
+        &routine_did,
+        &content_cid,
+        &[("tinycloud.kv/get", "in/")],
+    )?;
 
     let auth = sign_invocation(&fx, "tinycloud.compute/deploy", "report", "urn:uuid:dep-1")?;
     let body = format!(
@@ -318,7 +353,10 @@ async fn successful_deploy_persists_artifact_delegation_and_quota_mirror() -> Re
     assert_eq!(status, Status::Ok, "deploy failed: {resp}");
     let ack: serde_json::Value = serde_json::from_str(&resp)?;
     assert_eq!(ack["content_cid"].as_str(), Some(content_cid.as_str()));
-    let grant_cid = ack["routine_did_grant"].as_str().context("grant cid")?.to_string();
+    let grant_cid = ack["routine_did_grant"]
+        .as_str()
+        .context("grant cid")?
+        .to_string();
 
     // Artifact row persisted (service tag "compute", name = function).
     let artifact = database_artifact::Entity::find_by_id((
@@ -364,7 +402,12 @@ async fn rollback_no_artifact_when_dfn_verification_fails() -> Result<()> {
     let wasm = b"\0asm-rollback-dfn".to_vec();
     let content_cid = content_cid_of(&wasm);
     let routine_did = handshake(&client, &fx, &content_cid, "urn:uuid:hs-r1").await?;
-    let mut dfn = build_dfn(&fx, &routine_did, &content_cid, &[("tinycloud.kv/get", "in/")])?;
+    let mut dfn = build_dfn(
+        &fx,
+        &routine_did,
+        &content_cid,
+        &[("tinycloud.kv/get", "in/")],
+    )?;
     // Corrupt the JWT signature (last char) so verify() fails mid-transaction.
     let last = dfn.pop().unwrap();
     dfn.push(if last == 'A' { 'B' } else { 'A' });
@@ -376,7 +419,11 @@ async fn rollback_no_artifact_when_dfn_verification_fails() -> Result<()> {
         dfn
     );
     let (status, resp) = post_invoke(&client, &auth, &body).await;
-    assert_ne!(status, Status::Ok, "a bad-signature D_fn must not deploy: {resp}");
+    assert_ne!(
+        status,
+        Status::Ok,
+        "a bad-signature D_fn must not deploy: {resp}"
+    );
 
     // No artifact row, no D_fn delegation row.
     assert!(
@@ -437,7 +484,12 @@ async fn rollback_no_delegation_when_artifact_save_fails() -> Result<()> {
 
     let client = Client::tracked(env.rocket).await?;
     let routine_did = handshake(&client, &fx, &content_cid, "urn:uuid:hs-r2").await?;
-    let dfn = build_dfn(&fx, &routine_did, &content_cid, &[("tinycloud.kv/get", "in/")])?;
+    let dfn = build_dfn(
+        &fx,
+        &routine_did,
+        &content_cid,
+        &[("tinycloud.kv/get", "in/")],
+    )?;
     let dfn_hash = hash(dfn.as_bytes());
 
     let auth = sign_invocation(&fx, "tinycloud.compute/deploy", "report", "urn:uuid:dep-r2")?;
@@ -447,7 +499,11 @@ async fn rollback_no_delegation_when_artifact_save_fails() -> Result<()> {
         dfn
     );
     let (status, resp) = post_invoke(&client, &auth, &body).await;
-    assert_ne!(status, Status::Ok, "artifact-insert failure must fail the deploy: {resp}");
+    assert_ne!(
+        status,
+        Status::Ok,
+        "artifact-insert failure must fail the deploy: {resp}"
+    );
 
     // The D_fn delegation row rolled back with the failed artifact insert.
     assert!(
@@ -533,11 +589,20 @@ async fn handshake_is_deterministic_and_side_effect_free() -> Result<()> {
     let content_cid = content_cid_of(b"\0asm-handshake");
     let a = handshake(&client, &fx, &content_cid, "urn:uuid:hd-1").await?;
     let b = handshake(&client, &fx, &content_cid, "urn:uuid:hd-2").await?;
-    assert_eq!(a, b, "same (space, content_cid) must return the same routine_did");
+    assert_eq!(
+        a, b,
+        "same (space, content_cid) must return the same routine_did"
+    );
     assert!(a.starts_with("did:key:z"), "expected a did:key, got {a}");
 
     // A different CID yields a different DID.
-    let other = handshake(&client, &fx, &content_cid_of(b"\0asm-other"), "urn:uuid:hd-3").await?;
+    let other = handshake(
+        &client,
+        &fx,
+        &content_cid_of(b"\0asm-other"),
+        "urn:uuid:hd-3",
+    )
+    .await?;
     assert_ne!(a, other);
 
     // No artifact row was created by the read-only handshake.
@@ -556,13 +621,23 @@ async fn handshake_is_deterministic_and_side_effect_free() -> Result<()> {
 async fn routine_did_rejects_non_deploy_ability() -> Result<()> {
     let env = boot().await?;
     // Holder is granted compute/execute ONLY.
-    let fx = setup(&env.conn, "routine-did-wrong-ability", "tinycloud.compute/execute").await?;
+    let fx = setup(
+        &env.conn,
+        "routine-did-wrong-ability",
+        "tinycloud.compute/execute",
+    )
+    .await?;
     let client = Client::tracked(env.rocket).await?;
 
     let content_cid = content_cid_of(b"\0asm-wrong-ability");
     // Present a compute/execute capability with a RoutineDid body (requires
     // compute/deploy).
-    let auth = sign_invocation(&fx, "tinycloud.compute/execute", &content_cid, "urn:uuid:wa-1")?;
+    let auth = sign_invocation(
+        &fx,
+        "tinycloud.compute/execute",
+        &content_cid,
+        "urn:uuid:wa-1",
+    )?;
     let body = format!(r#"{{"action":"routine_did","content_cid":"{content_cid}"}}"#);
     let (status, resp) = post_invoke(&client, &auth, &body).await;
     assert_eq!(
@@ -597,7 +672,10 @@ async fn superseded_dfn_is_revoked_on_redeploy() -> Result<()> {
     .await;
     assert_eq!(s1, Status::Ok, "deploy v1: {r1}");
     let ack1: serde_json::Value = serde_json::from_str(&r1)?;
-    let grant1_cid = ack1["routine_did_grant"].as_str().context("grant1")?.to_string();
+    let grant1_cid = ack1["routine_did_grant"]
+        .as_str()
+        .context("grant1")?
+        .to_string();
     let grant1_hash = hash_from_cid(&grant1_cid)?;
 
     // Deploy v2 (different bytes -> different CID) to the SAME function name.
@@ -634,7 +712,10 @@ async fn superseded_dfn_is_revoked_on_redeploy() -> Result<()> {
         .filter(revoc_model::Column::Revoked.eq(grant1_hash))
         .one(&env.conn)
         .await?;
-    assert!(revoked.is_some(), "the superseded v1 D_fn must be revoked after re-deploy");
+    assert!(
+        revoked.is_some(),
+        "the superseded v1 D_fn must be revoked after re-deploy"
+    );
     Ok(())
 }
 
@@ -652,8 +733,10 @@ async fn scope_selection_rejects_multi_space_capabilities() -> Result<()> {
     let seed_space = |name: &str| -> Result<(SpaceId, String)> {
         let (owner_jwk, owner_did, _vm) = keypair()?;
         let owner_key_did = DID_METHODS.generate(&owner_jwk, "key")?;
-        let space =
-            SpaceId::new(owner_key_did, name.parse().map_err(|e| anyhow::anyhow!("{e:?}"))?);
+        let space = SpaceId::new(
+            owner_key_did,
+            name.parse().map_err(|e| anyhow::anyhow!("{e:?}"))?,
+        );
         Ok((space, owner_did))
     };
 
@@ -678,7 +761,9 @@ async fn scope_selection_rejects_multi_space_capabilities() -> Result<()> {
     let mut parents = Vec::new();
     for (space, owner_did, tag) in [(&space_a, &owner_a, "a"), (&space_b, &owner_b, "b")] {
         let grant_resource: ResourceId =
-            space.clone().to_resource("compute".parse()?, None, None, None);
+            space
+                .clone()
+                .to_resource("compute".parse()?, None, None, None);
         let parent_hash = hash(format!("multi-space-parent-{tag}").as_bytes());
         deleg_model::ActiveModel {
             id: Set(parent_hash),
@@ -707,9 +792,13 @@ async fn scope_selection_rejects_multi_space_capabilities() -> Result<()> {
     let client = Client::tracked(env.rocket).await?;
 
     let res_a: ResourceId =
-        space_a.clone().to_resource("compute".parse()?, Some("report".parse()?), None, None);
+        space_a
+            .clone()
+            .to_resource("compute".parse()?, Some("report".parse()?), None, None);
     let res_b: ResourceId =
-        space_b.clone().to_resource("compute".parse()?, Some("report".parse()?), None, None);
+        space_b
+            .clone()
+            .to_resource("compute".parse()?, Some("report".parse()?), None, None);
     let mut caps = Capabilities::new();
     caps.with_action(
         res_a.as_uri(),
@@ -752,7 +841,12 @@ async fn scope_selection_rejects_uncovered_function_resource() -> Result<()> {
     // space-wide.
     let (owner_jwk, owner_did, _owner_vm) = keypair()?;
     let owner_key_did = DID_METHODS.generate(&owner_jwk, "key")?;
-    let space = SpaceId::new(owner_key_did, "scope-uncovered".parse().map_err(|e| anyhow::anyhow!("{e:?}"))?);
+    let space = SpaceId::new(
+        owner_key_did,
+        "scope-uncovered"
+            .parse()
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?,
+    );
     space_model::ActiveModel {
         id: Set(SpaceIdWrap(space.clone())),
     }
@@ -767,7 +861,9 @@ async fn scope_selection_rejects_uncovered_function_resource() -> Result<()> {
         .await?;
     }
     let grant_resource: ResourceId =
-        space.clone().to_resource("compute".parse()?, Some("alpha".parse()?), None, None);
+        space
+            .clone()
+            .to_resource("compute".parse()?, Some("alpha".parse()?), None, None);
     let parent_hash = hash(b"scope-uncovered-parent");
     deleg_model::ActiveModel {
         id: Set(parent_hash),
@@ -784,7 +880,8 @@ async fn scope_selection_rejects_uncovered_function_resource() -> Result<()> {
     abilities::ActiveModel {
         delegation: Set(parent_hash),
         resource: Set(Resource::TinyCloud(grant_resource)),
-        ability: Set(Ability::try_from("tinycloud.compute/deploy".to_string()).map_err(|e| anyhow::anyhow!("{e:?}"))?),
+        ability: Set(Ability::try_from("tinycloud.compute/deploy".to_string())
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?),
         caveats: Set(Caveats(BTreeMap::new())),
     }
     .insert(&env.conn)
@@ -797,7 +894,9 @@ async fn scope_selection_rejects_uncovered_function_resource() -> Result<()> {
     // but the deploy BODY targets function "beta" -- the held cap does not
     // cover beta, so scope selection must reject it.
     let res_alpha: ResourceId =
-        space.clone().to_resource("compute".parse()?, Some("alpha".parse()?), None, None);
+        space
+            .clone()
+            .to_resource("compute".parse()?, Some("alpha".parse()?), None, None);
     let mut caps = Capabilities::new();
     caps.with_action(
         res_alpha.as_uri(),

@@ -2338,7 +2338,10 @@ fn select_compute_scope<'a>(
     target_path: &str,
 ) -> Result<(&'a SpaceId, Vec<&'a (SpaceId, Option<String>, String)>), (Status, String)> {
     let Some((space, _, _)) = caps.first() else {
-        return Err((Status::BadRequest, "No compute capabilities found".to_string()));
+        return Err((
+            Status::BadRequest,
+            "No compute capabilities found".to_string(),
+        ));
     };
 
     if !caps.iter().all(|(candidate, _, _)| candidate == space) {
@@ -2413,7 +2416,12 @@ async fn handle_compute_deploy(
     let grant_delegation = tinycloud_core::events::Delegation::from_header_ser::<
         tinycloud_auth::authorization::TinyCloudDelegation,
     >(&grant_str)
-    .map_err(|e| (Status::BadRequest, format!("invalid deploy grant (D_fn): {e}")))?;
+    .map_err(|e| {
+        (
+            Status::BadRequest,
+            format!("invalid deploy grant (D_fn): {e}"),
+        )
+    })?;
 
     // Storage quota pre-check (§5/F8, §10.1): a write-class request gated by
     // the same helper the sql/duckdb write paths use. Reads never 402; a
@@ -2463,7 +2471,9 @@ fn compute_deploy_error_to_status(
         ) => (Status::PayloadTooLarge, e.to_string()),
         ComputeDeployError::Artifact(_) => (Status::InternalServerError, e.to_string()),
         ComputeDeployError::Tx(TxError::SpaceNotFound) => (Status::NotFound, e.to_string()),
-        ComputeDeployError::Tx(TxError::InvalidDelegation(_)) => (Status::Unauthorized, e.to_string()),
+        ComputeDeployError::Tx(TxError::InvalidDelegation(_)) => {
+            (Status::Unauthorized, e.to_string())
+        }
         ComputeDeployError::Tx(TxError::Db(ref db) | TxError::EpochInsert(ref db)) => {
             (database_error_status(db), e.to_string())
         }

@@ -216,7 +216,9 @@ pub struct ComputeService {
 
 impl ComputeService {
     pub fn new(routine_key_deriver: Arc<dyn RoutineKeyDeriver>) -> Self {
-        Self { routine_key_deriver }
+        Self {
+            routine_key_deriver,
+        }
     }
 
     pub fn routine_key_deriver(&self) -> &Arc<dyn RoutineKeyDeriver> {
@@ -301,7 +303,10 @@ mod tests {
     fn compute_caveats_round_trip_camel_case() {
         let json = r#"{"functions":["a","b"],"maxDuration":5000,"maxMemory":134217728,"inputs":{"type":"object"}}"#;
         let caveats: ComputeCaveats = serde_json::from_str(json).unwrap();
-        assert_eq!(caveats.functions, Some(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(
+            caveats.functions,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
         assert_eq!(caveats.max_duration, Some(5000));
         assert_eq!(caveats.max_memory, Some(134217728));
         assert!(caveats.inputs.is_some());
@@ -314,7 +319,9 @@ mod tests {
         )
         .unwrap();
         match deploy {
-            ComputeRequest::Deploy { caveats: Some(c), .. } => {
+            ComputeRequest::Deploy {
+                caveats: Some(c), ..
+            } => {
                 assert_eq!(c.max_duration, Some(1000));
             }
             other => panic!("expected Deploy with typed caveats, got {other:?}"),

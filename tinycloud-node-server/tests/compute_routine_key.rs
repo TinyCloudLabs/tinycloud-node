@@ -23,8 +23,8 @@
 //! flagged message rather than silently passing (the simulator is not
 //! available in every CI/dev environment).
 
-use tinycloud_auth::{resolver::DID_METHODS, resource::SpaceId, ssi::dids::DIDBuf, ssi::jwk::JWK};
 use tinycloud::compute_keys::DstackRoutineKeyDeriver;
+use tinycloud_auth::{resolver::DID_METHODS, resource::SpaceId, ssi::dids::DIDBuf, ssi::jwk::JWK};
 use tinycloud_core::compute::RoutineKeyDeriver;
 
 fn test_space(name: &str) -> SpaceId {
@@ -70,7 +70,10 @@ async fn dstack_routine_did_is_deterministic() {
         first, second,
         "the dstack adapter must derive the same routine_did for the same (space, cid)"
     );
-    assert!(first.starts_with("did:key:z"), "expected a did:key, got {first}");
+    assert!(
+        first.starts_with("did:key:z"),
+        "expected a did:key, got {first}"
+    );
 
     // Distinct CIDs must derive distinct DIDs.
     let other = deriver

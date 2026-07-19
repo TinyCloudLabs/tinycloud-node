@@ -1436,7 +1436,11 @@ async fn insert_internal_revocation<C: ConnectionTrait>(
         serialization: Set(marker.into_bytes()),
         revoked_at: Set(Some(OffsetDateTime::now_utc())),
     })
-    .on_conflict(OnConflict::column(revocation::Column::Id).do_nothing().to_owned())
+    .on_conflict(
+        OnConflict::column(revocation::Column::Id)
+            .do_nothing()
+            .to_owned(),
+    )
     .exec(db)
     .await
     {

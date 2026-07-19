@@ -34,8 +34,14 @@ async fn derivation_is_deterministic_for_same_space_and_cid() {
     let d = deriver(1);
     let first = d.derive_routine_did(&space, "bafyfixedcid").await.unwrap();
     let second = d.derive_routine_did(&space, "bafyfixedcid").await.unwrap();
-    assert_eq!(first, second, "same (space, function_cid) must derive the same routine_did");
-    assert!(first.starts_with("did:key:z"), "expected a did:key, got {first}");
+    assert_eq!(
+        first, second,
+        "same (space, function_cid) must derive the same routine_did"
+    );
+    assert!(
+        first.starts_with("did:key:z"),
+        "expected a did:key, got {first}"
+    );
 }
 
 #[tokio::test]
@@ -107,15 +113,26 @@ async fn space_hashing_prevents_delimiter_confusion_collisions() {
     // padding, plus the multibase prefix char).
     let t = token(&short);
     assert!(!t.contains('/') && !t.contains(':'));
-    assert!(t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+    assert!(t
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
 }
 
 #[tokio::test]
 async fn distinct_secrets_derive_distinct_dids() {
     let space = test_space("distinct-secret");
-    let a = deriver(9).derive_routine_did(&space, "bafyfixedcid").await.unwrap();
-    let b = deriver(10).derive_routine_did(&space, "bafyfixedcid").await.unwrap();
-    assert_ne!(a, b, "different node secret material must derive different routine DIDs");
+    let a = deriver(9)
+        .derive_routine_did(&space, "bafyfixedcid")
+        .await
+        .unwrap();
+    let b = deriver(10)
+        .derive_routine_did(&space, "bafyfixedcid")
+        .await
+        .unwrap();
+    assert_ne!(
+        a, b,
+        "different node secret material must derive different routine DIDs"
+    );
 }
 
 #[tokio::test]
