@@ -67,3 +67,11 @@ iri-string.workspace = true
 name = "routine_key_deriver"
 path = "tests/routine_key_deriver.rs"
 required-features = ["compute"]
+
+# P1: the atomic-deploy-primitive rollback direction B (artifact failure ->
+# delegation rolled back) + mirror-after-commit, exercised against the core
+# `deploy_compute_function` seam with an injected artifact I/O failure.
+[[test]]
+name = "compute_deploy_atomicity"
+path = "tests/compute_deploy_atomicity.rs"
+required-features = ["compute"]
