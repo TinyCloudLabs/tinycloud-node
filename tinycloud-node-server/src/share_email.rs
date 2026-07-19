@@ -1278,11 +1278,7 @@ pub async fn policy_session(
             now,
         )
         .await
-        .map_err(|_failure| {
-            #[cfg(feature = "mounted-fixture")]
-            eprintln!("mounted policy session: policy metadata {_failure:?}");
-            error(Status::Forbidden, "policy_denied")
-        })?;
+        .map_err(|_| error(Status::Forbidden, "policy_denied"))?;
     let evidence = runtime
         .verifier
         .at_time(now.unix_timestamp())
@@ -1293,11 +1289,7 @@ pub async fn policy_session(
             &policy_email,
             policy_expiry.unix_timestamp(),
         )
-        .map_err(|_failure| {
-            #[cfg(feature = "mounted-fixture")]
-            eprintln!("mounted policy session: credential {_failure:?}");
-            error(Status::Forbidden, "invalid_credential_profile")
-        })?;
+        .map_err(|_| error(Status::Forbidden, "invalid_credential_profile"))?;
     if evidence.credential_digest != p.credential_digest {
         return Err(error(Status::Forbidden, "policy_denied"));
     }
@@ -1319,11 +1311,7 @@ pub async fn policy_session(
         .bridge
         .establish_session(session_request, now)
         .await
-        .map_err(|_failure| {
-            #[cfg(feature = "mounted-fixture")]
-            eprintln!("mounted policy session: establish {_failure:?}");
-            error(Status::Forbidden, "policy_denied")
-        })?;
+        .map_err(|_| error(Status::Forbidden, "policy_denied"))?;
     let session_wire = PolicySession {
         artifact_type: "TinyCloudSharePolicySession".to_owned(),
         version: 1,

@@ -240,6 +240,7 @@ impl DatabaseAuthorityBridge117 {
         .into_iter()
         .min()
         .ok_or(PortError::Denied)?;
+        let root_not_before = authority_not_before_value(now)?;
         let audit = IssuanceAudit::build_verified(
             issuance_id.clone(),
             policy.artifact(),
@@ -251,7 +252,7 @@ impl DatabaseAuthorityBridge117 {
             request.challenge_request_digest.as_str(),
             request.credential_digest.as_str(),
             decision.decision_context_digest_hex(),
-            now,
+            root_not_before,
             expires_at,
         )
         .map_err(map_authority_error)?;
@@ -311,7 +312,7 @@ impl DatabaseAuthorityBridge117 {
                 policy.artifact().delegation_cid.clone(),
                 enforcement.artifact().delegation_cid.clone(),
             ],
-            not_before: authority_not_before(now)?,
+            not_before: authority_timestamp(root_not_before)?,
             expires_at: authority_timestamp(expires_at)?,
             delegation_mode: if enforcement
                 .artifact()
@@ -334,10 +335,7 @@ impl DatabaseAuthorityBridge117 {
         let signer = self.root_signer.as_ref().ok_or(PortError::Unavailable)?;
         let preview = verifier
             .sign_and_verify_root(root.clone(), signer.as_ref())
-            .map_err(|failure| {
-                eprintln!("mounted session: root signature failure {failure:?}");
-                map_authority_error(failure)
-            })?;
+            .map_err(map_authority_error)?;
         DatabaseAuthorityKernel::new(
             self.authority.clone(),
             enforcement.artifact().audience_did.clone(),
@@ -354,10 +352,7 @@ impl DatabaseAuthorityBridge117 {
             &bindings,
         )
         .await
-        .map_err(|failure| {
-            eprintln!("mounted session: authority issuance failure {failure:?}");
-            map_authority_error(failure)
-        })?;
+        .map_err(map_authority_error)?;
         Ok(preview.artifact().delegation_cid.clone())
     }
 
@@ -452,7 +447,6 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
         let credential_expiry = OffsetDateTime::from_unix_timestamp(request.credential_expires_at)
             .map_err(|_| PortError::Denied)?;
         if credential_expiry != policy_expiry {
-            eprintln!("mounted session: expiry mismatch credential={} policy={}", credential_expiry, policy_expiry);
             return Err(PortError::Denied);
         }
         ProtocolStateRepository::consume_anonymous_challenge_in_transaction(
@@ -484,11 +478,7 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
 
         let authority_session_cid = self
             .issue_root_in_transaction(&tx, &request, now, policy_expiry, credential_expiry)
-            .await
-            .map_err(|failure| {
-                eprintln!("mounted session: root issuance {failure:?}");
-                failure
-            })?;
+            .await?;
 
         let mut handle_bytes = [0u8; 16];
         OsRng.fill_bytes(&mut handle_bytes);
@@ -497,7 +487,6 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
             .min(credential_expiry)
             .min(policy_expiry);
         if expires_at <= now {
-            eprintln!("mounted session: calculated expiry {} is not after now {}", expires_at, now);
             return Err(PortError::Denied);
         }
 
@@ -918,9 +907,9 @@ fn authority_timestamp(value: OffsetDateTime) -> Result<String, PortError> {
         .map_err(|_| PortError::Denied)
 }
 
-fn authority_not_before(value: OffsetDateTime) -> Result<String, PortError> {
+fn authority_not_before_value(value: OffsetDateTime) -> Result<OffsetDateTime, PortError> {
     let rounded = value.replace_nanosecond(0).map_err(|_| PortError::Denied)?;
-    authority_timestamp(if value.nanosecond() == 0 {
+    Ok(if value.nanosecond() == 0 {
         rounded
     } else {
         rounded + Duration::seconds(1)
