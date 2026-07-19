@@ -305,6 +305,12 @@ pub struct ReadResponse {
     pub content_source_digest: tinycloud_core::share_email::Sha256Digest,
     #[serde(rename = "bodyDigest")]
     pub body_digest: tinycloud_core::share_email::Sha256Digest,
+    #[serde(rename = "delegationCid")]
+    pub delegation_cid: ShareDelegationCid,
+    #[serde(rename = "authorityMaterialHandle")]
+    pub authority_material_handle: AuthorityMaterialHandle,
+    #[serde(rename = "authorityMaterialDigest")]
+    pub authority_material_digest: tinycloud_core::share_email::Sha256Digest,
 }
 
 pub struct NoStoreJson<T>(pub T);
@@ -924,6 +930,9 @@ pub async fn authorize_invitation(
             share_cid: request.share_cid,
             share_id: request.share_id,
             policy_cid: request.policy_cid,
+            delegation_cid: request.delegation_cid,
+            authority_material_handle: request.authority_material_handle,
+            authority_material_digest: request.authority_material_digest,
             recipient_email: request.recipient_email,
             target_origin: request.target_origin,
             node_audience: request.node_audience,
@@ -1353,6 +1362,9 @@ pub async fn read(
         content,
         content_source_digest: expected_source_digest,
         body_digest: response.body_digest,
+        delegation_cid: request.delegation_cid,
+        authority_material_handle: request.authority_material_handle,
+        authority_material_digest: request.authority_material_digest,
     }))
 }
 

@@ -13,7 +13,7 @@ fn pinned_email_claim_manifest_runs_all_negative_rows() {
         });
     let manifest = std::fs::read_to_string(vector_root.join("manifest.json"))
         .expect("pinned email-claim manifest must be present");
-    assert!(manifest.contains("igffN_rZVLK-AeeHdQoBEeQAvlJZCZVg9smOq-IbRWk"));
+    assert!(manifest.contains("0KhpZQqEm2N01I3fNOSN0LclCbR3uw_EK8CoBtqua2g"));
     let output = std::process::Command::new("node")
         .arg(vector_root.join("validate.mjs"))
         .current_dir(&vector_root)
@@ -27,5 +27,5 @@ fn pinned_email_claim_manifest_runs_all_negative_rows() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("118 negative rows dispatched"));
-    assert!(stdout.contains("manifestDigest: igffN_rZVLK-AeeHdQoBEeQAvlJZCZVg9smOq-IbRWk"));
+    assert!(stdout.contains("manifestDigest: 0KhpZQqEm2N01I3fNOSN0LclCbR3uw_EK8CoBtqua2g"));
 }

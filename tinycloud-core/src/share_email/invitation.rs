@@ -5,7 +5,8 @@
 //! authority effects belong to [`super::state`].
 
 use super::types::{
-    ContentSource, Did, PolicyCid, ProtocolJti, Sha256Digest, ShareCid, ShareId, TargetOrigin,
+    AuthorityMaterialHandle, ContentSource, Did, PolicyCid, ProtocolJti, Sha256Digest, ShareCid,
+    ShareDelegationCid, ShareId, TargetOrigin,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use libp2p::identity::{Keypair, PublicKey};
@@ -140,6 +141,12 @@ pub struct InvitationAuthorization {
     pub share_cid: ShareCid,
     pub share_id: ShareId,
     pub policy_cid: PolicyCid,
+    #[serde(rename = "delegationCid")]
+    pub delegation_cid: ShareDelegationCid,
+    #[serde(rename = "authorityMaterialHandle")]
+    pub authority_material_handle: AuthorityMaterialHandle,
+    #[serde(rename = "authorityMaterialDigest")]
+    pub authority_material_digest: Sha256Digest,
     pub recipient_email: CanonicalEmail,
     pub target_origin: TargetOrigin,
     pub node_audience: Did,
@@ -195,6 +202,9 @@ pub struct InvitationAuthorizationInput {
     pub share_cid: ShareCid,
     pub share_id: ShareId,
     pub policy_cid: PolicyCid,
+    pub delegation_cid: ShareDelegationCid,
+    pub authority_material_handle: AuthorityMaterialHandle,
+    pub authority_material_digest: Sha256Digest,
     pub recipient_email: CanonicalEmail,
     pub target_origin: TargetOrigin,
     pub node_audience: Did,
@@ -308,6 +318,9 @@ pub fn issue_invitation_authorization_for(
         share_cid: input.share_cid,
         share_id: input.share_id,
         policy_cid: input.policy_cid,
+        delegation_cid: input.delegation_cid,
+        authority_material_handle: input.authority_material_handle,
+        authority_material_digest: input.authority_material_digest,
         recipient_email: input.recipient_email,
         target_origin,
         node_audience,
@@ -580,6 +593,12 @@ mod tests {
             share_cid: ShareCid::parse(super::super::types::KV_SHARE_CID).unwrap(),
             share_id: ShareId::parse("share-1").unwrap(),
             policy_cid: PolicyCid::parse(super::super::types::KV_POLICY_CID).unwrap(),
+            delegation_cid: ShareDelegationCid::parse(
+                "bafkreiehcdfj3fkj6xnkwsiwteiqdoa5nwkcfz5gcpijuew2wsdimly67q",
+            )
+            .unwrap(),
+            authority_material_handle: AuthorityMaterialHandle::parse("amh_kv_001").unwrap(),
+            authority_material_digest: Sha256Digest::from_bytes([3; 32]),
             recipient_email: CanonicalEmail::parse("Alice@example.com").unwrap(),
             target_origin: TargetOrigin::parse("https://node.example").unwrap(),
             node_audience: Did::parse("did:web:node.example").unwrap(),

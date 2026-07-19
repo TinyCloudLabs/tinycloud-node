@@ -294,6 +294,7 @@ secret = "{}"
         revoker: Set(owner_did),
         revoked: Set(delegation_hash),
         serialization: Set(b"w5-runtime-node-revocation".to_vec()),
+        revoked_at: Set(Some(time::OffsetDateTime::now_utc())),
     }
     .insert(&conn)
     .await?;
