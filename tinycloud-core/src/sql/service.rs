@@ -14,6 +14,7 @@ use super::{
     types::*,
 };
 
+#[derive(Clone)]
 pub struct SqlService {
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
     base_path: String,

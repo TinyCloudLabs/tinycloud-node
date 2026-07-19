@@ -115,6 +115,12 @@ impl ProtocolStateRepository {
             {
                 return Err(StateError::Replay);
             }
+            if existing.consumed_at.is_some() {
+                return Err(StateError::Replay);
+            }
+            if parse_timestamp(&existing.expires_at)? <= now {
+                return Err(StateError::Expired);
+            }
             tx.commit().await?;
             return Ok(());
         }
@@ -245,6 +251,27 @@ impl ProtocolStateRepository {
         binding_json: &Value,
         now: OffsetDateTime,
     ) -> Result<(), StateError> {
+        self.consume_anonymous_challenge_checked(
+            challenge_id,
+            request_digest,
+            binding_json,
+            None,
+            now,
+        )
+        .await
+    }
+
+    /// Consume a challenge while also binding the one-time nonce returned in
+    /// its response.  The legacy method above remains available to existing
+    /// callers that do not carry the nonce at this boundary.
+    pub async fn consume_anonymous_challenge_checked(
+        &self,
+        challenge_id: &str,
+        request_digest: &str,
+        binding_json: &Value,
+        nonce_hash: Option<&str>,
+        now: OffsetDateTime,
+    ) -> Result<(), StateError> {
         let tx = self.conn.begin().await?;
         let row = share_anonymous_challenge::Entity::find_by_id(challenge_id)
             .one(&tx)
@@ -252,6 +279,7 @@ impl ProtocolStateRepository {
             .ok_or(StateError::Replay)?;
         if row.request_digest != request_digest
             || row.binding_json != *binding_json
+            || nonce_hash.is_some_and(|expected| row.nonce_hash != expected)
             || row.consumed_at.is_some()
             || parse_timestamp(&row.expires_at)? <= now
         {

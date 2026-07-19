@@ -95,18 +95,24 @@ pub struct NodeInfo {
     pub in_tee: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota_url: Option<String>,
+    #[serde(rename = "shareEmail", skip_serializing_if = "Option::is_none")]
+    pub share_email: Option<crate::share_email::CapabilityDescriptor>,
 }
 
 fn build_info(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
     encryption: &State<EncryptionService>,
+    share_email: &State<Option<crate::share_email::ShareEmailRuntime>>,
 ) -> NodeInfo {
     #[allow(unused_mut)]
     let mut features = vec!["kv", "delegation", "sharing", "sql"];
     #[cfg(feature = "duckdb")]
     features.push("duckdb");
     features.extend(["hooks", "signed-urls", "encryption"]);
+    if share_email.inner().is_some() {
+        features.push("share-email-claim");
+    }
     #[cfg(feature = "dstack")]
     features.push("tee");
     NodeInfo {
@@ -116,6 +122,10 @@ fn build_info(
         node_id: encryption.node_did().to_string(),
         in_tee: tee.inner().is_some(),
         quota_url: quota_cache.quota_url().map(|s| s.to_string()),
+        share_email: share_email
+            .inner()
+            .as_ref()
+            .map(|runtime| runtime.capability()),
     }
 }
 
@@ -124,8 +134,9 @@ pub fn info(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
     encryption: &State<EncryptionService>,
+    share_email: &State<Option<crate::share_email::ShareEmailRuntime>>,
 ) -> Json<NodeInfo> {
-    Json(build_info(tee, quota_cache, encryption))
+    Json(build_info(tee, quota_cache, encryption, share_email))
 }
 
 #[get("/version")]
@@ -133,8 +144,9 @@ pub fn version(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
     encryption: &State<EncryptionService>,
+    share_email: &State<Option<crate::share_email::ShareEmailRuntime>>,
 ) -> Json<NodeInfo> {
-    Json(build_info(tee, quota_cache, encryption))
+    Json(build_info(tee, quota_cache, encryption, share_email))
 }
 
 #[allow(clippy::let_unit_value)]

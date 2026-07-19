@@ -69,6 +69,15 @@ impl ExactEmailVerifier {
         self
     }
 
+    /// Return the same trust policy evaluated at the supplied request time.
+    /// Production HTTP composition must not freeze credential freshness at
+    /// process startup.
+    pub fn at_time(&self, evaluation_time: i64) -> Self {
+        let mut verifier = self.clone();
+        verifier.evaluation_time = evaluation_time;
+        verifier
+    }
+
     pub fn with_metrics(mut self, metrics: std::sync::Arc<VerificationMetrics>) -> Self {
         self.metrics = metrics;
         self

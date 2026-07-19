@@ -20,6 +20,7 @@ pub mod invocation_replay;
 pub mod prometheus;
 pub mod quota;
 pub mod routes;
+pub mod share_email;
 pub mod signed_urls;
 pub mod storage;
 pub mod tee;
@@ -153,6 +154,10 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         encryption_well_known,
         encryption_decrypt,
         revoke_encryption_network,
+        share_email::authorize_invitation,
+        share_email::policy_challenge,
+        share_email::policy_session,
+        share_email::read,
     ];
 
     let key_setup: StaticSecret = resolve_keys(&tinycloud_config.keys).await?;
@@ -263,6 +268,14 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         database_artifact_repository.clone(),
     );
 
+    let share_email_runtime = share_email::compose(
+        tinycloud_config.share_email.clone(),
+        seed_conn.clone(),
+        &key_setup,
+        Arc::new(tinycloud.clone()),
+        Arc::new(sql_service.clone()),
+    )?;
+
     #[cfg(feature = "duckdb")]
     let duckdb_service = DuckDbService::new(
         tinycloud_config
@@ -312,13 +325,39 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         .manage(signed_url_runtime)
         .manage(webhook_encryption)
         .manage(rate_limiter)
+        .manage(share_email_runtime)
         .manage(tee_context)
         .manage(encryption_service)
         .manage(tinycloud_config.storage.staging.open().await?);
 
-    if tinycloud_config.cors {
-        Ok(rocket.attach(AdHoc::on_response("CORS", |_, resp| {
+    let share_return_origin = tinycloud_config.share_email.return_origin.clone();
+    let rocket = rocket.attach(AdHoc::on_response(
+        "share-email-security-headers",
+        move |request, response| {
+            let share_return_origin = share_return_origin.clone();
             Box::pin(async move {
+                if request.uri().path().starts_with("/share/v1/") {
+                    response.set_header(Header::new("Cache-Control", "no-store"));
+                    response.set_header(Header::new("X-Content-Type-Options", "nosniff"));
+                    response.set_header(Header::new("Referrer-Policy", "no-referrer"));
+                    response.set_header(Header::new(
+                        "Access-Control-Allow-Origin",
+                        share_return_origin,
+                    ));
+                    response.set_header(Header::new("Access-Control-Allow-Methods", "POST"));
+                    response
+                        .set_header(Header::new("Access-Control-Allow-Headers", "Content-Type"));
+                }
+            })
+        },
+    ));
+
+    if tinycloud_config.cors {
+        Ok(rocket.attach(AdHoc::on_response("CORS", |request, resp| {
+            Box::pin(async move {
+                if request.uri().path().starts_with("/share/v1/") {
+                    return;
+                }
                 resp.set_header(Header::new("Access-Control-Allow-Origin", "*"));
                 resp.set_header(Header::new(
                     // allow these methods for requests
