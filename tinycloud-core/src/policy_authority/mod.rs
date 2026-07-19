@@ -711,7 +711,7 @@ impl IssuanceAudit {
             policy_delegation_cid: policy.delegation_cid.clone(),
             enforcement_delegation_cid: enforcement.delegation_cid.clone(),
             enforcer_did: enforcement.audience_did.clone(),
-            node_audience: enforcement.audience_did.clone(),
+            node_audience: enforcement.fact("nodeAudience")?.to_owned(),
             claimant_did: claimant_did.into(),
             capability_hash_hex: capability_hash_hex.into(),
             challenge_id: challenge_id.into(),
@@ -1433,12 +1433,9 @@ fn validate_authority_pair(
     {
         return Err(AuthorityError::OwnerMismatch);
     }
-    let policy_suffix = policy
-        .fact("policyId")?
-        .strip_prefix("pol_")
-        .filter(|suffix| suffix.len() == 52)
-        .ok_or(AuthorityError::PolicyMismatch)?;
-    if policy.audience_did != format!("did:tinycloud:policy:{policy_suffix}") {
+    if !policy.fact("policyId")?.starts_with("pol_")
+        || policy.audience_did != enforcement.fact("nodeAudience")?
+    {
         return Err(AuthorityError::PolicyMismatch);
     }
     for fact in ["policyId", "policyDigestHex", "capabilityCeilingHashHex"] {
@@ -1459,7 +1456,6 @@ fn validate_authority_pair(
         return Err(AuthorityError::PolicyMismatch);
     }
     if enforcement.audience_did != enforcement.fact("enforcerDid")?
-        || enforcement.audience_did != enforcement.fact("nodeAudience")?
         || enforcement.audience_did != running_node_did
     {
         return Err(AuthorityError::WrongEnforcer);
@@ -1526,9 +1522,7 @@ fn validate_root(
     {
         return Err(AuthorityError::WrongEnforcer);
     }
-    if root.fact("nodeAudience")? != enforcement.fact("nodeAudience")?
-        || root.fact("nodeAudience")? != running_node_did
-    {
+    if root.fact("nodeAudience")? != enforcement.fact("nodeAudience")? {
         return Err(AuthorityError::WrongAudience);
     }
     if root.audience_did != bindings.claimant_did
@@ -1572,7 +1566,6 @@ fn validate_root(
     if binding.enforcer_did != enforcement.audience_did
         || binding.node_audience != enforcement.fact("nodeAudience")?
         || binding.enforcer_did != running_node_did
-        || binding.node_audience != running_node_did
         || binding.binding_digest_hex != enforcement.fact("attestationBindingDigestHex")?
     {
         return Err(AuthorityError::AttestationBindingMismatch);
@@ -1586,7 +1579,7 @@ fn validate_root(
         policy_digest_hex: policy.fact("policyDigestHex")?.to_string(),
         capability_ceiling_hash_hex: policy.fact("capabilityCeilingHashHex")?.to_string(),
         enforcer_did: running_node_did.to_string(),
-        node_audience: running_node_did.to_string(),
+        node_audience: enforcement.fact("nodeAudience")?.to_string(),
         claimant_did: bindings.claimant_did.clone(),
         challenge_id: bindings.challenge_id.clone(),
         challenge_nonce_hash_hex: bindings.challenge_nonce_hash_hex.clone(),
@@ -1642,7 +1635,7 @@ fn validate_root(
         policy_delegation_cid: policy.delegation_cid.clone(),
         enforcement_delegation_cid: enforcement.delegation_cid.clone(),
         enforcer_did: running_node_did.into(),
-        node_audience: running_node_did.into(),
+        node_audience: enforcement.fact("nodeAudience")?.into(),
         claimant_did: bindings.claimant_did.clone(),
         capability_hash_hex: root.fact("capabilityHashHex")?.into(),
         challenge_id: challenge.challenge_id.clone(),
@@ -1683,7 +1676,7 @@ fn validate_challenge(
         || challenge.policy_delegation_cid != policy.delegation_cid
         || challenge.enforcement_delegation_cid != enforcement.delegation_cid
         || challenge.enforcer_did != running_node_did
-        || challenge.node_audience != running_node_did
+        || challenge.node_audience != enforcement.fact("nodeAudience")?
         || challenge.claimant_did != bindings.claimant_did
         || challenge.requested_capabilities_hash_hex != bindings.requested_capabilities_hash_hex
     {
@@ -1863,6 +1856,7 @@ mod tests {
 
     const OWNER: &str = "did:pkh:eip155:1:0x0000000000000000000000000000000000000001";
     const ENFORCER: &str = "did:key:z6MkEnforcer";
+    const NODE_AUDIENCE: &str = "did:web:node.example";
     const CLAIMANT: &str = "did:key:z6MkClaimant";
     const POLICY_CID: &str = "bafkr4policy";
     const ENFORCE_CID: &str = "bafkr4enforce";
@@ -1960,7 +1954,7 @@ mod tests {
             DelegationRole::PolicyAuthority,
             POLICY_CID,
             OWNER,
-            "did:tinycloud:policy:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            NODE_AUDIENCE,
             DelegationMode::PolicySource,
             vec![],
             caps.clone(),
@@ -1971,7 +1965,7 @@ mod tests {
         let mut enforcement_facts = facts(&common);
         enforcement_facts.extend(facts(&[
             ("enforcerDid", ENFORCER),
-            ("nodeAudience", ENFORCER),
+            ("nodeAudience", NODE_AUDIENCE),
             ("attestationBindingDigestHex", &"2".repeat(64)),
             ("maxSessionTtlSeconds", "300"),
             ("sessionMode", "attenuable"),
@@ -2000,7 +1994,7 @@ mod tests {
             policy_digest_hex: common[2].1.into(),
             capability_ceiling_hash_hex: ceiling_hash.clone(),
             enforcer_did: ENFORCER.into(),
-            node_audience: ENFORCER.into(),
+            node_audience: NODE_AUDIENCE.into(),
             claimant_did: CLAIMANT.into(),
             challenge_id: CHALLENGE_ID.into(),
             challenge_nonce_hash_hex: "3".repeat(64),
@@ -2019,7 +2013,7 @@ mod tests {
             policy_delegation_cid: POLICY_CID.into(),
             enforcement_delegation_cid: ENFORCE_CID.into(),
             enforcer_did: ENFORCER.into(),
-            node_audience: ENFORCER.into(),
+            node_audience: NODE_AUDIENCE.into(),
             claimant_did: CLAIMANT.into(),
             capability_hash_hex: root_hash.clone(),
             challenge_id: CHALLENGE_ID.into(),
@@ -2038,7 +2032,7 @@ mod tests {
         root_facts.extend(facts(&[
             ("capabilityHashHex", &root_hash),
             ("enforcerDid", ENFORCER),
-            ("nodeAudience", ENFORCER),
+            ("nodeAudience", NODE_AUDIENCE),
             ("rootClaimantDid", CLAIMANT),
             ("sessionSubjectDid", CLAIMANT),
             ("policyDelegationCid", POLICY_CID),
@@ -2085,7 +2079,7 @@ mod tests {
                 policy_delegation_cid: POLICY_CID.into(),
                 enforcement_delegation_cid: ENFORCE_CID.into(),
                 enforcer_did: ENFORCER.into(),
-                node_audience: ENFORCER.into(),
+                node_audience: NODE_AUDIENCE.into(),
                 claimant_did: CLAIMANT.into(),
                 requested_capabilities_hash_hex: root_hash.clone(),
                 issued_at: now,
@@ -2096,7 +2090,7 @@ mod tests {
         let binding = VerifiedAttestedEnforcerBinding::for_test(
             "2".repeat(64),
             ENFORCER,
-            ENFORCER,
+            NODE_AUDIENCE,
             t("2026-06-01T00:05:00Z"),
         );
         let policy_state = VerifiedPolicyState::for_test(

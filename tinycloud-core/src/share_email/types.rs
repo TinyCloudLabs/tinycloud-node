@@ -320,6 +320,15 @@ fn valid_cid(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte))
 }
 
+fn valid_node_cid(value: &str) -> bool {
+    value.len() == MAX_CID_BYTES
+        && (value.starts_with("bafkrei") || value.starts_with("bafkr4"))
+        && value
+            .bytes()
+            .skip(if value.starts_with("bafkrei") { 7 } else { 6 })
+            .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte))
+}
+
 fn valid_share_id(value: &str) -> bool {
     (1..=MAX_SHARE_ID_BYTES).contains(&value.len())
         && value
@@ -421,7 +430,7 @@ validated_string!(
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
     }
 );
-validated_string!(NodeDelegationCid, InvalidNodeDelegationCid, valid_cid);
+validated_string!(NodeDelegationCid, InvalidNodeDelegationCid, valid_node_cid);
 pub type Origin = TargetOrigin;
 
 #[derive(Clone, PartialEq, Eq, Hash, Serialize)]

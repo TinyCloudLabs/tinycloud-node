@@ -568,6 +568,7 @@ pub fn compose(
             "configured invitation public key does not match the derived node signing key"
         ));
     }
+    let root_signing_ed25519 = signing_ed25519.clone();
     let signer =
         Ed25519InvitationSigner::new(config.node_signing_kid.clone(), signing_ed25519.into())
             .map_err(|e| anyhow::anyhow!("share email signer: {e}"))?;
@@ -581,19 +582,15 @@ pub fn compose(
     );
     let status_provider = Arc::new(material.status_provider());
     let attestation_provider = Arc::new(material.attestation_provider());
-    let root_secret = tinycloud_core::libp2p::identity::ed25519::SecretKey::try_from_bytes(
-        key_setup.derive_key(b"tinycloud/share-email/root-signing"),
-    )
-    .map_err(|_| anyhow::anyhow!("invalid root signing key"))?;
-    let root_keypair = tinycloud_core::libp2p::identity::ed25519::Keypair::from(root_secret);
-    let root_did = tinycloud_core::keys::public_key_to_did_key(root_keypair.public().into());
+    let root_did =
+        tinycloud_core::keys::public_key_to_did_key(root_signing_ed25519.public().into());
     let bridge = Arc::new(
         DatabaseAuthorityBridge117::new(conn.clone(), DatabaseAuthorityStore::new(conn.clone()))
             .with_authority_providers(material, status_provider, attestation_provider)
             .with_root_signer(Arc::new(
                 tinycloud_core::policy_authority::ConfiguredNodeRootSigner::new(
                     root_did,
-                    root_keypair,
+                    root_signing_ed25519,
                 ),
             )),
     );

@@ -717,14 +717,18 @@ impl DatabaseAuthorityBridge117 {
         {
             return Err(PortError::Denied);
         }
-        let owner = signed_policy
-            .artifact()
-            .facts
-            .iter()
-            .find(|(key, _)| key.ends_with("/ownerDid") || key.as_str() == "ownerDid")
-            .map(|(_, value)| value.as_str())
-            .unwrap_or(signed_policy.artifact().issuer_did.as_str());
-        if owner == sender_did || signed_policy.artifact().issuer_did == sender_did {
+        let policy_state: serde_json::Value =
+            serde_json::from_slice(&bundle.policy_state).map_err(|_| PortError::Denied)?;
+        if policy_state
+            .get("issuerDid")
+            .and_then(serde_json::Value::as_str)
+            == Some(sender_did)
+            && signed_policy.artifact().issuer_did
+                == signed_policy
+                    .artifact()
+                    .fact_value("ownerDid")
+                    .map_err(map_authority_error)?
+        {
             Ok(())
         } else {
             Err(PortError::Denied)
@@ -966,12 +970,23 @@ struct AuthorityStatusWire {
     #[serde(rename = "type")]
     kind: String,
     version: u8,
-    authority_cid: String,
+    parent_cid: String,
     sequence: u64,
     state: String,
-    issued_at: String,
+    checked_at: String,
     fresh_until: String,
     revoked_at: Option<String>,
+    signer_kid: String,
+    signer_version: u64,
+    signature: AuthoritySignatureWire,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct AuthoritySignatureWire {
+    alg: String,
+    kid: String,
+    value: String,
 }
 
 fn parse_status(
@@ -981,15 +996,23 @@ fn parse_status(
 ) -> Result<AuthorityStatusObservation, PortError> {
     let status: AuthorityStatusWire =
         serde_json::from_slice(bytes).map_err(|_| PortError::Denied)?;
-    if status.kind != "PolicyAuthorityStatus"
+    if status.kind != "TinyCloudShareAuthorityStatusObservation"
         || status.version != 1
-        || status.authority_cid != expected_cid.as_str()
+        || status.parent_cid != expected_cid.as_str()
         || !matches!(status.state.as_str(), "active" | "revoked")
+        || status.signer_version == 0
+        || status.signature.alg != "EdDSA"
+        || status.signature.kid != status.signer_kid
+        || URL_SAFE_NO_PAD
+            .decode(status.signature.value.as_bytes())
+            .map_or(true, |value| {
+                value.len() != 64 || URL_SAFE_NO_PAD.encode(value) != status.signature.value
+            })
     {
         return Err(PortError::Denied);
     }
     let checked_at = OffsetDateTime::parse(
-        &status.issued_at,
+        &status.checked_at,
         &time::format_description::well_known::Rfc3339,
     )
     .map_err(|_| PortError::Denied)?;
@@ -1025,15 +1048,19 @@ struct AttestationWire {
     #[serde(rename = "type")]
     kind: String,
     version: u8,
-    origin: String,
-    audience: String,
+    target_origin: String,
+    node_audience: String,
+    enforcer_did: String,
     enforcer_kid: String,
+    public_key: String,
     key_version: u64,
+    local_signer_did: String,
+    local_signer_kid: String,
     measurement: String,
-    digest: String,
-    issued_at: String,
+    measurement_digest: String,
     expires_at: String,
     enrollment_digest: String,
+    signature: AuthoritySignatureWire,
 }
 
 fn validate_attestation(
@@ -1047,11 +1074,6 @@ fn validate_attestation(
 ) -> Result<(), PortError> {
     let attestation: AttestationWire =
         serde_json::from_slice(bytes).map_err(|_| PortError::Denied)?;
-    let issued_at = OffsetDateTime::parse(
-        &attestation.issued_at,
-        &time::format_description::well_known::Rfc3339,
-    )
-    .map_err(|_| PortError::Denied)?;
     let expires_at = OffsetDateTime::parse(
         &attestation.expires_at,
         &time::format_description::well_known::Rfc3339,
@@ -1062,25 +1084,42 @@ fn validate_attestation(
         &time::format_description::well_known::Rfc3339,
     )
     .map_err(|_| PortError::Denied)?;
-    let canonical = jcs::canonicalize(
-        &serde_json::from_slice::<serde_json::Value>(bytes).map_err(|_| PortError::Denied)?,
-    );
-    let actual_binding_digest = hex::encode(Sha256::digest(canonical));
+    let binding = serde_json::json!({
+        "targetOrigin": attestation.target_origin,
+        "nodeAudience": attestation.node_audience,
+        "enforcerDid": attestation.enforcer_did,
+        "enforcerKid": attestation.enforcer_kid,
+        "keyVersion": attestation.key_version,
+    });
+    let actual_binding_digest = URL_SAFE_NO_PAD.encode(Sha256::digest(jcs::canonicalize(&binding)));
     if attestation.kind != "PolicyEnforcerAttestation"
         || attestation.version != 1
-        || attestation.origin != origin.as_str()
-        || attestation.audience != audience.as_str()
-        || !attestation.enforcer_kid.starts_with(enforcer.as_str())
+        || attestation.target_origin != origin.as_str()
+        || attestation.node_audience != audience.as_str()
+        || attestation.enforcer_did != enforcer.as_str()
+        || !attestation.enforcer_kid.starts_with(audience.as_str())
+        || attestation.local_signer_did != enforcer.as_str()
+        || attestation.local_signer_kid
+            != format!(
+                "{}#{}",
+                enforcer.as_str(),
+                enforcer.as_str().trim_start_matches("did:key:")
+            )
+        || attestation.public_key.is_empty()
         || attestation.key_version == 0
         || attestation.measurement.is_empty()
-        || attestation.digest.is_empty()
+        || attestation.measurement_digest.is_empty()
         || attestation.enrollment_digest.is_empty()
+        || attestation.signature.alg != "EdDSA"
+        || attestation.signature.kid != attestation.local_signer_kid
+        || URL_SAFE_NO_PAD
+            .decode(attestation.signature.value.as_bytes())
+            .map_or(true, |value| {
+                value.len() != 64 || URL_SAFE_NO_PAD.encode(value) != attestation.signature.value
+            })
         || actual_binding_digest != expected_binding_digest_hex
-        || issued_at > now
         || expires_at <= now
         || expires_at > enforcement_expires_at
-        || expires_at <= issued_at
-        || expires_at - issued_at > time::Duration::seconds(300)
     {
         return Err(PortError::Denied);
     }

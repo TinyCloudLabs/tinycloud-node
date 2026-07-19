@@ -161,7 +161,7 @@ fn verify_eip191(
     }
     .map_err(|_| super::AuthorityError::SchemaInvalid)?;
     let digest = Sha256::digest([ROOT_DOMAIN, unsigned].concat());
-    let mut preimage = b"\x19Ethereum Signed Message:\n32".to_vec();
+    let mut preimage = b"\\x19Ethereum Signed Message:\\n32".to_vec();
     preimage.extend_from_slice(&digest);
     let hash = Keccak256::digest(preimage);
     let sig = Signature::from_slice(&signature[..64])
