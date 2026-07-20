@@ -784,8 +784,9 @@ mod tests {
         );
         // `list` remains reserved: accepted at the boundary but NOT pulled in
         // by the wildcard implication.
-        assert!(!generated::implied_actions("tinycloud.compute/*")
-            .contains(&"tinycloud.compute/list"));
+        assert!(
+            !generated::implied_actions("tinycloud.compute/*").contains(&"tinycloud.compute/list")
+        );
         let compute_star_grant = ["tinycloud.compute/*".to_string()];
         let compute_star = expand_granted_actions(&compute_star_grant);
         for a in ["tinycloud.compute/execute", "tinycloud.compute/deploy"] {

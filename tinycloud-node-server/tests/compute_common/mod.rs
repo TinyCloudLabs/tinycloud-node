@@ -36,9 +36,7 @@ use tinycloud_auth::{
 };
 use tinycloud_core::{
     models::{actor, space as space_model},
-    sea_orm::{
-        ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database, DatabaseConnection,
-    },
+    sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database, DatabaseConnection},
     types::SpaceIdWrap,
 };
 
@@ -271,7 +269,11 @@ pub fn owner_compute_invocation_with_caveats(
         None => BTreeMap::new(),
     };
     let mut caps = Capabilities::new();
-    caps.with_action(resource.as_uri(), ability.parse::<UcanAbility>()?, [notabene]);
+    caps.with_action(
+        resource.as_uri(),
+        ability.parse::<UcanAbility>()?,
+        [notabene],
+    );
     let ucan = Payload {
         issuer: owner.vm.parse::<DIDURLBuf>()?,
         audience: owner.did.parse::<DIDBuf>()?,
@@ -502,5 +504,8 @@ pub async fn delegate_and_get_cid(client: &Client, grant: &str) -> Result<String
     let (status, text) = post_delegate(client, grant).await;
     anyhow::ensure!(status == Status::Ok, "delegate failed ({status}): {text}");
     let v: serde_json::Value = serde_json::from_str(&text)?;
-    Ok(v["cid"].as_str().context("delegate cid missing")?.to_string())
+    Ok(v["cid"]
+        .as_str()
+        .context("delegate cid missing")?
+        .to_string())
 }

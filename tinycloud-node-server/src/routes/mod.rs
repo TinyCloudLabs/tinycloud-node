@@ -2661,8 +2661,8 @@ async fn handle_compute_execute(
     // we attach it as a `manifest` field on the result object (a `Metadata`-
     // carried block is the alternative the spec allows; the inline field
     // keeps the single-JSON transport with no new header machinery).
-    let manifest_json =
-        serde_json::to_value(&manifest).map_err(|e| (Status::InternalServerError, e.to_string()))?;
+    let manifest_json = serde_json::to_value(&manifest)
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
     let response = serde_json::json!({
         "result": result,
         "manifest": manifest_json,

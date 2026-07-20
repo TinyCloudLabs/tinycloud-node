@@ -109,11 +109,7 @@ impl ExecutionManifest {
     }
 
     fn finalize(mut self) -> Self {
-        self.granted_but_unexercised = self
-            .granted
-            .difference(&self.exercised)
-            .cloned()
-            .collect();
+        self.granted_but_unexercised = self.granted.difference(&self.exercised).cloned().collect();
         self
     }
 }
@@ -360,8 +356,7 @@ pub async fn execute(
     };
 
     if let Some(schema) = &caveats.inputs {
-        validate_input_schema(schema, &input)
-            .map_err(ComputeExecError::InputSchemaInvalid)?;
+        validate_input_schema(schema, &input).map_err(ComputeExecError::InputSchemaInvalid)?;
     }
 
     let granted_abilities: BTreeSet<String> = resolved
@@ -422,7 +417,9 @@ pub async fn execute(
         .set_fuel(cfg.max_fuel_ceiling)
         .map_err(|e| ComputeExecError::Internal(e.to_string()))?;
     // Epoch deadline: one tick per ~EPOCH_TICK of wall time, rounded up.
-    let deadline_ticks = max_duration_ms.div_ceil(EPOCH_TICK.as_millis() as u64).max(1);
+    let deadline_ticks = max_duration_ms
+        .div_ceil(EPOCH_TICK.as_millis() as u64)
+        .max(1);
     store.set_epoch_deadline(deadline_ticks);
 
     let instance = linker
@@ -440,7 +437,8 @@ pub async fn execute(
         .get_memory(&mut store, "memory")
         .ok_or_else(|| ComputeExecError::Module("guest is missing the \"memory\" export".into()))?;
 
-    let input_bytes = serde_json::to_vec(&input).map_err(|e| ComputeExecError::Internal(e.to_string()))?;
+    let input_bytes =
+        serde_json::to_vec(&input).map_err(|e| ComputeExecError::Internal(e.to_string()))?;
     let input_ptr = call_alloc(&mut store, alloc, input_bytes.len())
         .await
         .map_err(map_trap)?;
@@ -463,8 +461,8 @@ pub async fn execute(
     memory
         .read(&mut store, result_ptr, &mut result_bytes)
         .map_err(|e| ComputeExecError::Internal(e.to_string()))?;
-    let result: serde_json::Value =
-        serde_json::from_slice(&result_bytes).map_err(|e| ComputeExecError::Internal(e.to_string()))?;
+    let result: serde_json::Value = serde_json::from_slice(&result_bytes)
+        .map_err(|e| ComputeExecError::Internal(e.to_string()))?;
 
     // §8 option 2: write the result to a KV path under the routine's OWN
     // `D_fn` grant (which must include `kv/put` on that prefix). This is a
@@ -647,9 +645,8 @@ async fn handle_host_call(
                 HostCall::Del => KV_DEL,
                 HostCall::Sql => unreachable!(),
             };
-            let put_bytes = matches!(call, HostCall::Put).then(|| {
-                arg.value.clone().unwrap_or_default().into_bytes()
-            });
+            let put_bytes = matches!(call, HostCall::Put)
+                .then(|| arg.value.clone().unwrap_or_default().into_bytes());
             let outcome = mediate_kv_call(ctx, ability, &arg.key, put_bytes)
                 .await
                 .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
@@ -664,16 +661,8 @@ async fn handle_host_call(
                     true,
                     "inline".to_string(),
                 ),
-                KvOutcome::WriteOk => (
-                    serde_json::json!({"ok": true}),
-                    true,
-                    arg.key.clone(),
-                ),
-                KvOutcome::DeleteOk => (
-                    serde_json::json!({"ok": true}),
-                    true,
-                    arg.key.clone(),
-                ),
+                KvOutcome::WriteOk => (serde_json::json!({"ok": true}), true, arg.key.clone()),
+                KvOutcome::DeleteOk => (serde_json::json!({"ok": true}), true, arg.key.clone()),
                 KvOutcome::NotFound => (
                     serde_json::json!({"ok": false, "error": {"code": "no-such-key"}}),
                     true,
@@ -692,8 +681,8 @@ async fn handle_host_call(
                     String::new(),
                 ),
             };
-            let response_bytes = serde_json::to_vec(&envelope)
-                .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+            let response_bytes =
+                serde_json::to_vec(&envelope).map_err(|e| wasmtime::Error::msg(e.to_string()))?;
             let resource_str = kv_resource_string(&ctx.space, &arg.key);
             let entry = ManifestEntry {
                 resource: resource_str,
@@ -714,7 +703,8 @@ async fn handle_host_call(
                 .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
             let (envelope, granted) = match outcome {
                 SqlOutcome::Ok(response) => (
-                    serde_json::to_value(response).map_err(|e| wasmtime::Error::msg(e.to_string()))?,
+                    serde_json::to_value(response)
+                        .map_err(|e| wasmtime::Error::msg(e.to_string()))?,
                     true,
                 ),
                 SqlOutcome::AbilityDenied { ability, resource } => (
@@ -744,8 +734,8 @@ async fn handle_host_call(
                     true,
                 ),
             };
-            let response_bytes = serde_json::to_vec(&envelope)
-                .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+            let response_bytes =
+                serde_json::to_vec(&envelope).map_err(|e| wasmtime::Error::msg(e.to_string()))?;
             let resource_str = format!("{}/sql/{}", ctx.space, COMPUTE_SQL_DB_NAME);
             let entry = ManifestEntry {
                 resource: resource_str,
@@ -763,9 +753,9 @@ async fn handle_host_call(
 fn sql_ability(request: &SqlRequest) -> &'static str {
     match request {
         SqlRequest::Query { .. } | SqlRequest::Export => SQL_READ,
-        SqlRequest::Execute { .. } | SqlRequest::Batch { .. } | SqlRequest::ExecuteStatement { .. } => {
-            SQL_WRITE
-        }
+        SqlRequest::Execute { .. }
+        | SqlRequest::Batch { .. }
+        | SqlRequest::ExecuteStatement { .. } => SQL_WRITE,
     }
 }
 
@@ -782,7 +772,10 @@ enum KvOutcome {
     /// the guest as an observable, non-fatal envelope (NOT a trap) -- the
     /// same fail-observable philosophy as the A.4 denial contract.
     NotFound,
-    Denied { ability: String, resource: String },
+    Denied {
+        ability: String,
+        resource: String,
+    },
 }
 
 enum SqlOutcome {
@@ -810,22 +803,23 @@ async fn mediate_kv_call(
         .map_err(|e: tinycloud_auth::resource::KRIParseError| {
             ComputeExecError::Internal(format!("invalid kv key {key}: {e:?}"))
         })?;
-    let resource_id = ctx
-        .space
-        .clone()
-        .to_resource(
-            "kv".parse::<AuthService>().expect("\"kv\" is a valid service"),
-            Some(path.clone()),
-            None,
-            None,
-        );
+    let resource_id = ctx.space.clone().to_resource(
+        "kv".parse::<AuthService>()
+            .expect("\"kv\" is a valid service"),
+        Some(path.clone()),
+        None,
+        None,
+    );
     let resource_str = resource_id.to_string();
 
     let invocation = mint_internal_invocation(ctx, &resource_id, ability)?;
 
     let mut inputs: std::collections::HashMap<
         (SpaceId, AuthPath),
-        (Metadata, tinycloud_core::storage::HashBuffer<<BlockStage as ImmutableStaging>::Writable>),
+        (
+            Metadata,
+            tinycloud_core::storage::HashBuffer<<BlockStage as ImmutableStaging>::Writable>,
+        ),
     > = std::collections::HashMap::new();
     if let Some(bytes) = &put_bytes {
         let mut stage = ctx
@@ -837,7 +831,10 @@ async fn mediate_kv_call(
             .write_all(bytes)
             .await
             .map_err(|e| ComputeExecError::Internal(e.to_string()))?;
-        inputs.insert((ctx.space.clone(), path.clone()), (Metadata(BTreeMap::new()), stage));
+        inputs.insert(
+            (ctx.space.clone(), path.clone()),
+            (Metadata(BTreeMap::new()), stage),
+        );
     }
 
     match ctx
@@ -873,7 +870,9 @@ async fn mediate_sql_call(
     request: SqlRequest,
 ) -> Result<SqlOutcome, ComputeExecError> {
     let resource_id = ctx.space.clone().to_resource(
-        "sql".parse::<AuthService>().expect("\"sql\" is a valid service"),
+        "sql"
+            .parse::<AuthService>()
+            .expect("\"sql\" is a valid service"),
         Some(
             COMPUTE_SQL_DB_NAME
                 .parse::<AuthPath>()
@@ -1005,7 +1004,10 @@ fn mint_internal_invocation(
 /// `properties`, `items`, and `enum` -- the practical subset used by the
 /// P2 test matrix -- rather than pulling in a full external JSON-schema
 /// crate for one caveat field.
-pub fn validate_input_schema(schema: &serde_json::Value, input: &serde_json::Value) -> Result<(), String> {
+pub fn validate_input_schema(
+    schema: &serde_json::Value,
+    input: &serde_json::Value,
+) -> Result<(), String> {
     let Some(schema_obj) = schema.as_object() else {
         return Ok(());
     };

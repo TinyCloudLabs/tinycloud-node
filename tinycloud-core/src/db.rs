@@ -11,7 +11,7 @@ use crate::storage::{
     ImmutableWriteStore, StorageSetup, StoreSize,
 };
 use crate::types::{
-    AccountDelegationRecord, Ability, CapabilitiesReadParams, Caveats, DelegationQuery,
+    Ability, AccountDelegationRecord, CapabilitiesReadParams, Caveats, DelegationQuery,
     DelegationQueryDirection, DelegationQueryPage, DelegationQueryStatus, DelegationResource,
     ListFilters, Metadata, Resource, SpaceIdWrap,
 };

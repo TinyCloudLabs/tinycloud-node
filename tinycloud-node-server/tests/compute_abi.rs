@@ -99,7 +99,12 @@ async fn conformance_fixture_runs_and_matches_appendix_a() -> Result<()> {
         "tinycloud.compute/execute",
         "urn:uuid:exec-conf",
     )?;
-    let (status, body) = post_invoke(&client, &auth, execute_body("fixture", serde_json::json!({}))).await;
+    let (status, body) = post_invoke(
+        &client,
+        &auth,
+        execute_body("fixture", serde_json::json!({})),
+    )
+    .await;
     assert_eq!(status, Status::Ok, "execute must return 200: {body}");
 
     let v: serde_json::Value = serde_json::from_str(&body)?;
@@ -127,11 +132,36 @@ async fn conformance_fixture_runs_and_matches_appendix_a() -> Result<()> {
     // Expected per-entry (resource, ability, destination, granted). bytes are
     // asserted structurally below (canonical byte lengths of A.3 payloads).
     let expected: [(&str, &str, &str, bool); 5] = [
-        (&format!("{space}/kv/in/x"), "tinycloud.kv/get", "inline", true),
-        (&format!("{space}/kv/out/y"), "tinycloud.kv/put", "out/y", true),
-        (&format!("{space}/sql/db"), "tinycloud.sql/read", "inline", true),
-        (&format!("{space}/kv/out/y"), "tinycloud.kv/del", "out/y", true),
-        (&format!("{space}/kv/secret/z"), "tinycloud.kv/put", "", false),
+        (
+            &format!("{space}/kv/in/x"),
+            "tinycloud.kv/get",
+            "inline",
+            true,
+        ),
+        (
+            &format!("{space}/kv/out/y"),
+            "tinycloud.kv/put",
+            "out/y",
+            true,
+        ),
+        (
+            &format!("{space}/sql/db"),
+            "tinycloud.sql/read",
+            "inline",
+            true,
+        ),
+        (
+            &format!("{space}/kv/out/y"),
+            "tinycloud.kv/del",
+            "out/y",
+            true,
+        ),
+        (
+            &format!("{space}/kv/secret/z"),
+            "tinycloud.kv/put",
+            "",
+            false,
+        ),
     ];
     for (i, (res, ab, dest, granted)) in expected.iter().enumerate() {
         let c = &calls[i];
@@ -153,7 +183,7 @@ async fn conformance_fixture_runs_and_matches_appendix_a() -> Result<()> {
     assert_eq!(calls[2]["bytesIn"], serde_json::json!(52)); // sql request
     assert_eq!(calls[3]["bytesIn"], serde_json::json!(15)); // {"key":"out/y"}
     assert_eq!(calls[4]["bytesIn"], serde_json::json!(30)); // {"key":"secret/z","value":"x"}
-    // Response byte lengths for the fixed (space-independent) responses.
+                                                            // Response byte lengths for the fixed (space-independent) responses.
     assert_eq!(calls[0]["bytesOut"], serde_json::json!(24)); // {"ok":true,"value":"42"}
     assert_eq!(calls[1]["bytesOut"], serde_json::json!(11)); // {"ok":true}
     assert_eq!(calls[2]["bytesOut"], serde_json::json!(43)); // sql response
@@ -231,8 +261,12 @@ async fn conformance_fixture_is_deterministic() -> Result<()> {
             "tinycloud.compute/execute",
             &format!("urn:uuid:exec-det-{i}"),
         )?;
-        let (status, body) =
-            post_invoke(&client, &auth, execute_body("fixture", serde_json::json!({}))).await;
+        let (status, body) = post_invoke(
+            &client,
+            &auth,
+            execute_body("fixture", serde_json::json!({})),
+        )
+        .await;
         assert_eq!(status, Status::Ok, "run {i}: {body}");
         let v: serde_json::Value = serde_json::from_str(&body)?;
         // Compare result + manifest structurally (canonical).
@@ -241,7 +275,10 @@ async fn conformance_fixture_is_deterministic() -> Result<()> {
             "manifest": v["manifest"],
         }))?);
     }
-    assert_eq!(bodies[0], bodies[1], "result+manifest must be byte-identical across runs");
+    assert_eq!(
+        bodies[0], bodies[1],
+        "result+manifest must be byte-identical across runs"
+    );
     Ok(())
 }
 
@@ -276,8 +313,12 @@ async fn forbidden_import_fails_at_instantiation() -> Result<()> {
         "tinycloud.compute/execute",
         "urn:uuid:exec-forb",
     )?;
-    let (status, body) =
-        post_invoke(&client, &auth, execute_body("forbidden", serde_json::json!({}))).await;
+    let (status, body) = post_invoke(
+        &client,
+        &auth,
+        execute_body("forbidden", serde_json::json!({})),
+    )
+    .await;
     // A module/link error is a client-side module problem -> 400, and it is
     // NOT a 200-with-denial-envelope (that is only the A.4 ability case).
     assert_eq!(
@@ -285,6 +326,10 @@ async fn forbidden_import_fails_at_instantiation() -> Result<()> {
         Status::BadRequest,
         "forbidden import must fail at instantiation (link error -> 400): {body}"
     );
-    assert_ne!(status, Status::Ok, "must NOT be a 200 ability-denial envelope");
+    assert_ne!(
+        status,
+        Status::Ok,
+        "must NOT be a 200 ability-denial envelope"
+    );
     Ok(())
 }

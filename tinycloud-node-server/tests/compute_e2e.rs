@@ -87,7 +87,8 @@ async fn e2e_deploy_execute_manifest_and_denial_with_zero_data_caps() -> Result<
     // compute/execute (and NOTHING else -- no kv, no sql) from owner to the
     // invoker, then the invoker runs the routine.
     let invoker = make_holder()?;
-    let deleg = mint_execute_delegation(&owner, &invoker.did, "report", None, "urn:uuid:e2e-deleg")?;
+    let deleg =
+        mint_execute_delegation(&owner, &invoker.did, "report", None, "urn:uuid:e2e-deleg")?;
     let parent = delegate_and_get_cid(&client, &deleg).await?;
 
     // Sanity (F9 posture, client-side): the invoker's ONLY compute grant is
@@ -98,8 +99,16 @@ async fn e2e_deploy_execute_manifest_and_denial_with_zero_data_caps() -> Result<
         "invoker delegation must carry ONLY compute/execute, zero data caps"
     );
 
-    let inv = holder_execute_invocation(&invoker, &owner, "report", &parent, None, "urn:uuid:e2e-exec")?;
-    let (status, body) = post_invoke(&client, &inv, execute_body("report", serde_json::json!({}))).await;
+    let inv = holder_execute_invocation(
+        &invoker,
+        &owner,
+        "report",
+        &parent,
+        None,
+        "urn:uuid:e2e-exec",
+    )?;
+    let (status, body) =
+        post_invoke(&client, &inv, execute_body("report", serde_json::json!({}))).await;
     assert_eq!(status, Status::Ok, "invoker execute must 200: {body}");
 
     let v: serde_json::Value = serde_json::from_str(&body)?;
@@ -133,7 +142,10 @@ async fn e2e_deploy_execute_manifest_and_denial_with_zero_data_caps() -> Result<
         "tinycloud.kv/del",
         "tinycloud.sql/read",
     ] {
-        assert!(exercised.contains(&a.to_string()), "exercised must include {a}");
+        assert!(
+            exercised.contains(&a.to_string()),
+            "exercised must include {a}"
+        );
     }
     // The denial entry (step 5) is present and fails closed.
     let denial = &calls[4];
