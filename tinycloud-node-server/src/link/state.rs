@@ -1,10 +1,11 @@
 //! Persistence for link state (`state.json`) and TLS artifacts.
 //!
 //! Layout (all under `dataPath/link/`):
-//!   - `state.json`          — {name, serviceUrl, sequence, lastLanIps, certNotAfter, bind}
+//!   - `state.json`          — {name, serviceUrl, sequence, lastLanIps, certNotAfter, bind, tunnelEnabled, tunnelServiceUrl}
 //!   - `tls/key.pem`         — CSR private key (0600)
 //!   - `tls/cert.pem`        — signed cert chain from the service (0600)
 //!   - `listener-state.json` — last-observed LAN TLS listener bind result (see `ListenerState`)
+//!   - `tunnel-state.json`   — last-observed tunnel connection state (see `TunnelRuntimeState`)
 //!   - `state.lock`          — advisory lock guarding `state.json`'s sequence counter
 //!
 //! `sequence` is monotonic: `next_sequence` returns the next unused value and
@@ -13,6 +14,15 @@
 //! "existing.sequence >= request.sequence => 409" semantics in `server.ts`.
 //! See `commands::send_with_sequence` for where that value is persisted
 //! *before* the network round-trip.
+//!
+//! `tunnelEnabled`/`tunnelServiceUrl` live on this same `state.json` (rather
+//! than a separate file) deliberately: `tinycloud node tunnel` (TC-252)
+//! reuses the name claimed by `link enable` and the exact same `sequence`
+//! counter — claim/delete/cert/tunnel all bump one shared per-name sequence
+//! (see the tinycloud-link README's "Sequence coordination is per-name, not
+//! per-operation"). Keeping the flag on the same file under the same
+//! `state.lock` means there is only ever one lock to acquire and one
+//! sequence to reason about.
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -28,6 +38,7 @@ pub const TLS_DIR: &str = "tls";
 pub const TLS_KEY_FILE: &str = "key.pem";
 pub const TLS_CERT_FILE: &str = "cert.pem";
 pub const LISTENER_STATE_FILE: &str = "listener-state.json";
+pub const TUNNEL_STATE_FILE: &str = "tunnel-state.json";
 pub const LOCK_FILE: &str = "state.lock";
 
 /// Persistent state.json shape written to disk with 0600 perms.
@@ -53,6 +64,18 @@ pub struct LinkState {
     /// Bind address the LAN TLS listener should use when `serve` starts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bind: Option<String>,
+    /// Whether `tinycloud node tunnel enable` has been run for this name.
+    /// Requires a name already claimed via `link enable` (this same
+    /// `state.json`) — the tunnel auth frame reuses `name`/`sequence` above.
+    /// Old `state.json` files without this field default to `false` via
+    /// `#[serde(default)]`.
+    #[serde(default)]
+    pub tunnel_enabled: bool,
+    /// Override for the tunnel relay base URL. `None` means "use
+    /// `service_url` above" (the common case — the same tinycloud.link
+    /// deployment handles `/v1/names`, `/v1/certs`, and `/v1/tunnel`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tunnel_service_url: Option<String>,
 }
 
 impl LinkState {
@@ -65,12 +88,24 @@ impl LinkState {
             last_lan_ips: Vec::new(),
             cert_not_after: None,
             bind,
+            tunnel_enabled: false,
+            tunnel_service_url: None,
         }
     }
 
-    /// Next monotonic sequence to send with a signed request.
+    /// Next monotonic sequence to send with a signed request. Shared across
+    /// every action type for this name (claim, delete, cert, tunnel) — see
+    /// the module doc.
     pub fn next_sequence(&self) -> u64 {
         self.sequence.saturating_add(1)
+    }
+
+    /// The tunnel relay base URL to use: `tunnel_service_url` if set,
+    /// otherwise the same `service_url` used for claim/cert.
+    pub fn effective_tunnel_service_url(&self) -> String {
+        self.tunnel_service_url
+            .clone()
+            .unwrap_or_else(|| self.service_url.clone())
     }
 }
 
@@ -81,6 +116,7 @@ pub struct LinkPaths {
     pub key_path: PathBuf,
     pub cert_path: PathBuf,
     pub listener_state_path: PathBuf,
+    pub tunnel_state_path: PathBuf,
     pub lock_path: PathBuf,
 }
 
@@ -92,6 +128,7 @@ impl LinkPaths {
         let cert_path = tls_dir.join(TLS_CERT_FILE);
         let state_path = root.join(STATE_FILE);
         let listener_state_path = root.join(LISTENER_STATE_FILE);
+        let tunnel_state_path = root.join(TUNNEL_STATE_FILE);
         let lock_path = root.join(LOCK_FILE);
         Self {
             root,
@@ -100,6 +137,7 @@ impl LinkPaths {
             key_path,
             cert_path,
             listener_state_path,
+            tunnel_state_path,
             lock_path,
         }
     }
@@ -209,6 +247,50 @@ pub fn read_listener_state(paths: &LinkPaths) -> Result<Option<ListenerState>> {
     }
 }
 
+/// Observed state of the outbound tunnel WebSocket, written by the `serve`
+/// tunnel task and read by `service status --json` / `tunnel status --json`
+/// so the reported connection state reflects what actually happened rather
+/// than being inferred purely from whether the node process is running.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TunnelRuntimeState {
+    pub connected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+pub fn write_tunnel_runtime_state(paths: &LinkPaths, state: &TunnelRuntimeState) -> Result<()> {
+    ensure_link_dirs(paths)?;
+    let rendered = serde_json::to_vec_pretty(state)?;
+    fs::write(&paths.tunnel_state_path, rendered)
+        .with_context(|| format!("failed to write {}", paths.tunnel_state_path.display()))
+}
+
+pub fn read_tunnel_runtime_state(paths: &LinkPaths) -> Result<Option<TunnelRuntimeState>> {
+    match fs::read(&paths.tunnel_state_path) {
+        Ok(bytes) => {
+            let state: TunnelRuntimeState = serde_json::from_slice(&bytes).with_context(|| {
+                format!("failed to parse {}", paths.tunnel_state_path.display())
+            })?;
+            Ok(Some(state))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to read {}", paths.tunnel_state_path.display())),
+    }
+}
+
+/// Remove the tunnel runtime marker (used by `tunnel disable` so a stale
+/// `connected: true` doesn't linger after the tunnel task stops).
+pub fn remove_tunnel_runtime_state(paths: &LinkPaths) -> Result<()> {
+    match fs::remove_file(&paths.tunnel_state_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to remove {}", paths.tunnel_state_path.display())),
+    }
+}
+
 /// Advisory exclusive lock over `state.json`'s sequence counter, held for the
 /// duration of a `link enable`/`disable`/`renew` call. Guards against two
 /// races: the CLI and the in-process auto-renew loop mutating `state.json`
@@ -271,6 +353,8 @@ mod tests {
             last_lan_ips: vec!["192.168.1.5".to_string()],
             cert_not_after: Some("2026-08-15T00:00:00Z".to_string()),
             bind: Some("0.0.0.0:8443".to_string()),
+            tunnel_enabled: false,
+            tunnel_service_url: None,
         };
 
         write_state(&paths, &state).unwrap();
@@ -351,5 +435,59 @@ mod tests {
         // Dropping the first lock must release it — acquiring again must not
         // deadlock.
         let _lock = StateLock::acquire(&paths).unwrap();
+    }
+
+    #[test]
+    fn tunnel_runtime_state_roundtrips_and_removes() {
+        let tmp = tempdir().unwrap();
+        let paths = LinkPaths::from_data_root(tmp.path());
+        assert!(read_tunnel_runtime_state(&paths).unwrap().is_none());
+
+        let state = TunnelRuntimeState {
+            connected: true,
+            last_error: None,
+        };
+        write_tunnel_runtime_state(&paths, &state).unwrap();
+        assert_eq!(read_tunnel_runtime_state(&paths).unwrap().unwrap(), state);
+
+        remove_tunnel_runtime_state(&paths).unwrap();
+        assert!(read_tunnel_runtime_state(&paths).unwrap().is_none());
+    }
+
+    #[test]
+    fn old_state_json_without_tunnel_fields_defaults_to_disabled() {
+        let tmp = tempdir().unwrap();
+        let paths = LinkPaths::from_data_root(tmp.path());
+        ensure_link_dirs(&paths).unwrap();
+        // Simulate a state.json written before TC-252 added the tunnel
+        // fields — no tunnelEnabled/tunnelServiceUrl keys at all.
+        fs::write(
+            &paths.state_path,
+            r#"{"version":1,"name":"office","serviceUrl":"https://api.tinycloud.link","sequence":2,"lastLanIps":["192.168.1.5"]}"#,
+        )
+        .unwrap();
+
+        let state = read_state(&paths).unwrap().unwrap();
+        assert!(!state.tunnel_enabled);
+        assert_eq!(state.tunnel_service_url, None);
+        assert_eq!(state.effective_tunnel_service_url(), state.service_url);
+    }
+
+    #[test]
+    fn effective_tunnel_service_url_prefers_override() {
+        let mut state = LinkState::new(
+            "office".to_string(),
+            "https://api.tinycloud.link".to_string(),
+            None,
+        );
+        assert_eq!(
+            state.effective_tunnel_service_url(),
+            "https://api.tinycloud.link"
+        );
+        state.tunnel_service_url = Some("https://staging.tinycloud.link".to_string());
+        assert_eq!(
+            state.effective_tunnel_service_url(),
+            "https://staging.tinycloud.link"
+        );
     }
 }
