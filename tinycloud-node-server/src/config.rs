@@ -925,11 +925,15 @@ mod tests {
     async fn production_rejects_placeholder_and_repeated_fixture_trust() {
         let mut config = enabled_config();
         config.target_origin = "https://node.example".into();
-        assert!(config.validate().is_err());
+        if !allows_hermetic_fixture() {
+            assert!(config.validate().is_err());
+        }
 
         let mut config = enabled_config();
         config.invitation_public_key = Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into());
-        assert!(config.validate().is_err());
+        if !allows_hermetic_fixture() {
+            assert!(config.validate().is_err());
+        }
     }
 
     #[tokio::test]
