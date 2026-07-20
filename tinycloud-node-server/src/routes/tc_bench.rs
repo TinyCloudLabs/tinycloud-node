@@ -537,6 +537,10 @@ fn normalize_bench_service(service: &str) -> String {
     }
 }
 
+fn normalize_bench_space(space: &str) -> String {
+    space.to_ascii_lowercase()
+}
+
 fn path_contains(granted_path: &str, requested_path: &str) -> bool {
     if granted_path.is_empty() || granted_path == "/" {
         return true;
@@ -553,7 +557,7 @@ fn path_contains(granted_path: &str, requested_path: &str) -> bool {
     if requested_path.ends_with(&format!("/{granted_path}")) {
         return true;
     }
-    requested_path.ends_with(&format!("/{granted_path}"))
+    granted_path.ends_with(&format!("/{requested_path}"))
 }
 
 fn recap_matches_required_capability(
@@ -568,7 +572,8 @@ fn recap_matches_required_capability(
         };
         normalize_bench_service(granted_resource.service().as_str())
             == normalize_bench_service(&required.service)
-            && granted_resource.space().to_string() == required.space
+            && normalize_bench_space(&granted_resource.space().to_string())
+                == normalize_bench_space(&required.space)
             && path_contains(
                 granted_resource
                     .path()
@@ -1468,6 +1473,14 @@ mod tests {
             path: vector.operation.path.clone(),
             action: "tinycloud.kv/put".to_string(),
         }
+    }
+
+    #[test]
+    fn path_contains_matches_tc_bench_suffix_semantics() {
+        assert!(path_contains("bench/kv/depth-1", "depth-1"));
+        assert!(path_contains("depth-1", "bench/kv/depth-1"));
+        assert!(path_contains("bench/kv/", "bench/kv/depth-1"));
+        assert!(!path_contains("bench/kv/depth-1", "bench/kv/other"));
     }
 
     #[derive(Debug, Deserialize)]
