@@ -10,18 +10,20 @@ cors = false
 
 [global.share_email]
 enabled = true
-target_origin = "https://node.example"
-node_audience = "did:web:node.example"
+# Required environment-owned values. Empty values intentionally fail closed
+# until the operator injects the enrolled production trust tuple.
+target_origin = ""
+node_audience = ""
 return_origin = "https://share.tinycloud.xyz"
 allowed_origins = ["https://share.tinycloud.xyz"]
-node_signing_kid = "did:web:node.example#invitation-key-1"
-invitation_kid = "did:web:node.example#invitation-key-1"
+node_signing_kid = ""
+invitation_kid = ""
 
 # The issuer DID, VCT, key id, and key version are an exact trust tuple. The
 # public key is supplied through TINYCLOUD_SHARE_EMAIL__ISSUER_PUBLIC_KEY.
-issuer_did = "did:web:issuer.credentials.org"
+issuer_did = ""
 issuer_vct = "opencredentials.email/v1"
-issuer_kid = "did:web:issuer.credentials.org#email-signing-key-1"
+issuer_kid = ""
 issuer_key_version = 1
 
 # This signed bundle contains the policy/enforcement authority artifacts,
@@ -45,4 +47,3 @@ staging = "FileSystem"
 # The secret is supplied out of band as TINYCLOUD_KEYS_SECRET. Static key
 # derivation is shown only as a configuration shape; never commit its value.
 type = "Static"
-

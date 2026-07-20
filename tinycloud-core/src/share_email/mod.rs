@@ -18,7 +18,7 @@ pub mod verifier;
 
 pub use authority::{
     AuthenticatedAttestationProvider, AuthenticatedAuthorityMaterialProvider,
-    AuthenticatedStatusProvider,
+    AuthenticatedStatusProvider, AuthorityTrustDescriptor,
 };
 pub use bridge::DatabaseAuthorityBridge117;
 pub use ports::{

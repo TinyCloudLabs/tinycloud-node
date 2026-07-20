@@ -7,6 +7,7 @@
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{path::Path, sync::Arc};
@@ -53,6 +54,34 @@ struct LoadedMaterial {
     bundle: AuthorityMaterialBundle,
     statuses: Vec<(NodeDelegationCid, Vec<u8>)>,
     attestation: Vec<u8>,
+    target_origin: String,
+    node_audience: String,
+    invitation_kid: String,
+    invitation_public_key: String,
+    enrollment_digest: Sha256Digest,
+}
+
+/// Public trust metadata derived from an authenticated authority record.
+///
+/// This descriptor is safe to pass across the host/configuration boundary:
+/// it contains public keys and content digests, but never a signing seed,
+/// policy secret, claim secret, or credential.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AuthorityTrustDescriptor {
+    #[serde(rename = "targetOrigin")]
+    pub target_origin: String,
+    #[serde(rename = "nodeAudience")]
+    pub node_audience: String,
+    #[serde(rename = "invitationKid")]
+    pub invitation_kid: String,
+    #[serde(rename = "invitationPublicKey")]
+    pub invitation_public_key: String,
+    #[serde(rename = "authorityMaterialHandle")]
+    pub authority_material_handle: AuthorityMaterialHandle,
+    #[serde(rename = "authorityMaterialDigest")]
+    pub authority_material_digest: Sha256Digest,
+    #[serde(rename = "enrollmentDigest")]
+    pub enrollment_digest: Sha256Digest,
 }
 
 #[derive(Clone)]
@@ -126,6 +155,46 @@ impl AuthenticatedAuthorityMaterialProvider {
         AuthenticatedAttestationProvider {
             records: Arc::clone(&self.records),
         }
+    }
+
+    /// Return only authenticated public trust metadata for the configured
+    /// authority records. No private signing material is included.
+    pub fn trust_descriptors(&self) -> Vec<AuthorityTrustDescriptor> {
+        self.records
+            .iter()
+            .map(|record| AuthorityTrustDescriptor {
+                target_origin: record.target_origin.clone(),
+                node_audience: record.node_audience.clone(),
+                invitation_kid: record.invitation_kid.clone(),
+                invitation_public_key: record.invitation_public_key.clone(),
+                authority_material_handle: record.bundle.handle.clone(),
+                authority_material_digest: record.bundle.digest.clone(),
+                enrollment_digest: record.enrollment_digest.clone(),
+            })
+            .collect()
+    }
+
+    /// Cross-check every authenticated record against the environment-owned
+    /// node trust tuple before the capability can be advertised.
+    pub fn validate_node_trust(
+        &self,
+        target_origin: &str,
+        node_audience: &str,
+        invitation_kid: &str,
+        invitation_public_key: &[u8; 32],
+    ) -> Result<(), AuthorityProviderError> {
+        let invitation_public_key = URL_SAFE_NO_PAD.encode(invitation_public_key);
+        if self.records.is_empty()
+            || self.records.iter().any(|record| {
+                record.target_origin != target_origin
+                    || record.node_audience != node_audience
+                    || record.invitation_kid != invitation_kid
+                    || record.invitation_public_key != invitation_public_key
+            })
+        {
+            return Err(AuthorityProviderError::Artifact);
+        }
+        Ok(())
     }
 }
 
@@ -357,6 +426,12 @@ fn load_record(value: Value) -> Result<LoadedMaterial, AuthorityProviderError> {
     )?;
     let enrollment = object_field(&authority, "enrollment")?;
     validate_enrollment(enrollment)?;
+    let target_origin = string_field(enrollment, "targetOrigin")?.to_owned();
+    let node_audience = string_field(enrollment, "nodeAudience")?.to_owned();
+    let invitation_kid = string_field(enrollment, "invitationKid")?.to_owned();
+    let invitation_public_key = string_field(enrollment, "invitationPublicKey")?.to_owned();
+    let enrollment_digest =
+        Sha256Digest::from_bytes(Sha256::digest(jcs::canonicalize(enrollment)).into());
     let attestation = object_field(&authority, "attestation")?;
     validate_attestation(attestation, enrollment, &enforcement_parent)?;
     Ok(LoadedMaterial {
@@ -375,6 +450,11 @@ fn load_record(value: Value) -> Result<LoadedMaterial, AuthorityProviderError> {
         },
         statuses,
         attestation: serde_json::to_vec(attestation).map_err(|_| AuthorityProviderError::Schema)?,
+        target_origin,
+        node_audience,
+        invitation_kid,
+        invitation_public_key,
+        enrollment_digest,
     })
 }
 
@@ -522,12 +602,34 @@ fn validate_enrollment(value: &Value) -> Result<(), AuthorityProviderError> {
             "enabled",
         ],
     )?;
-    if value.get("enabled") != Some(&Value::Bool(true))
+    let target_origin = string_field(value, "targetOrigin")?;
+    let node_audience = string_field(value, "nodeAudience")?;
+    let invitation_kid = string_field(value, "invitationKid")?;
+    let invitation_public_key = string_field(value, "invitationPublicKey")?;
+    let key = URL_SAFE_NO_PAD
+        .decode(invitation_public_key)
+        .map_err(|_| AuthorityProviderError::Schema)?;
+    if URL_SAFE_NO_PAD.encode(&key) != invitation_public_key
+        || key.len() != 32
+        || super::types::TargetOrigin::parse(target_origin.to_owned()).is_err()
+        || Did::parse(node_audience.to_owned()).is_err()
+        || !canonical_web_kid(invitation_kid, node_audience)
+        || value.get("enabled") != Some(&Value::Bool(true))
         || value.get("keyVersion").and_then(Value::as_u64) == Some(0)
     {
         return Err(AuthorityProviderError::Artifact);
     }
     Ok(())
+}
+
+fn canonical_web_kid(kid: &str, did: &str) -> bool {
+    let Some((kid_did, fragment)) = kid.split_once('#') else {
+        return false;
+    };
+    kid_did == did
+        && !fragment.is_empty()
+        && !fragment.contains('#')
+        && !fragment.chars().any(char::is_whitespace)
 }
 
 fn validate_attestation(
@@ -734,5 +836,35 @@ mod tests {
         assert!(runtime
             .block_on(provider.resolve_exact(&share_policy, &share_delegation, &handle, &digest))
             .is_ok());
+
+        let descriptor = provider
+            .trust_descriptors()
+            .into_iter()
+            .next()
+            .expect("public trust descriptor");
+        let public_key: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(&descriptor.invitation_public_key)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert!(provider
+            .validate_node_trust(
+                &descriptor.target_origin,
+                &descriptor.node_audience,
+                &descriptor.invitation_kid,
+                &public_key,
+            )
+            .is_ok());
+        assert!(provider
+            .validate_node_trust(
+                "https://mismatch.example",
+                &descriptor.node_audience,
+                &descriptor.invitation_kid,
+                &public_key,
+            )
+            .is_err());
+        let serialized = serde_json::to_string(&descriptor).unwrap();
+        assert!(!serialized.contains("private"));
+        assert!(!serialized.contains("senderSeed"));
     }
 }

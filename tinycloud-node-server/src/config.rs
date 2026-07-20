@@ -3,6 +3,7 @@ use crate::{
     storage::{file_system::FileSystemConfig, s3::S3BlockConfig},
     BlockConfig, BlockStage,
 };
+use base64::{decode_config, URL_SAFE_NO_PAD};
 use rocket::data::ByteUnit;
 use serde::{Deserialize, Serialize};
 use serde_with::{
@@ -85,10 +86,10 @@ pub struct ShareEmailConfig {
 }
 
 fn default_share_target_origin() -> String {
-    "https://node.example".to_owned()
+    String::new()
 }
 fn default_share_node_audience() -> String {
-    "did:web:node.example".to_owned()
+    String::new()
 }
 fn default_share_return_origin() -> String {
     "https://share.tinycloud.xyz".to_owned()
@@ -97,19 +98,19 @@ fn default_share_allowed_origins() -> Vec<String> {
     vec![default_share_return_origin()]
 }
 fn default_share_node_signing_kid() -> String {
-    "did:web:node.example#invitation-key-1".to_owned()
+    String::new()
 }
 fn default_share_invitation_kid() -> String {
-    "did:web:node.example#invitation-key-1".to_owned()
+    String::new()
 }
 fn default_share_issuer_did() -> String {
-    "did:web:issuer.credentials.org".to_owned()
+    String::new()
 }
 fn default_share_issuer_vct() -> String {
     tinycloud_auth::share_email_evidence::EMAIL_VCT.to_owned()
 }
 fn default_share_issuer_kid() -> String {
-    "did:web:issuer.credentials.org#email-signing-key-1".to_owned()
+    String::new()
 }
 fn default_share_issuer_key_version() -> u64 {
     1
@@ -183,6 +184,9 @@ impl ShareEmailConfig {
         if !self.enabled {
             return Ok(());
         }
+        if !allows_hermetic_fixture() && uses_fixture_identity(self) {
+            return Err("share email production trust bundle contains a fixture identity");
+        }
         if tinycloud_core::share_email::TargetOrigin::parse(self.target_origin.clone()).is_err()
             || tinycloud_core::share_email::TargetOrigin::parse(self.return_origin.clone()).is_err()
             || self.allowed_origins.len() != 1
@@ -192,17 +196,13 @@ impl ShareEmailConfig {
                     || tinycloud_core::share_email::TargetOrigin::parse(origin.clone()).is_err()
             })
             || tinycloud_core::share_email::Did::parse(self.node_audience.clone()).is_err()
+            || !origin_audience_matches(&self.target_origin, &self.node_audience)
             || self.node_signing_kid != self.invitation_kid
-            || !self
-                .node_signing_kid
-                .starts_with(&format!("{}#", self.node_audience))
+            || !canonical_kid_matches(&self.node_signing_kid, &self.node_audience)
             || self.issuer_did.is_empty()
             || self.issuer_did != tinycloud_auth::share_email_evidence::OPEN_CREDENTIALS_ISSUER_DID
             || self.issuer_vct != tinycloud_auth::share_email_evidence::EMAIL_VCT
-            || !self
-                .issuer_kid
-                .split_once('#')
-                .is_some_and(|(did, fragment)| did == self.issuer_did && !fragment.is_empty())
+            || !canonical_kid_matches(&self.issuer_kid, &self.issuer_did)
             || self.issuer_key_version == 0
             || self.clock_skew_seconds < 0
             || self.clock_skew_seconds > 300
@@ -259,6 +259,77 @@ impl ShareEmailConfig {
         }
         Ok(())
     }
+}
+
+#[cfg(feature = "mounted-fixture")]
+fn allows_hermetic_fixture() -> bool {
+    true
+}
+
+#[cfg(not(feature = "mounted-fixture"))]
+fn allows_hermetic_fixture() -> bool {
+    false
+}
+
+fn uses_fixture_identity(config: &ShareEmailConfig) -> bool {
+    const FROZEN_NODE_PUBLIC_KEY: &str = "IVL40Zt5HSRFMkLhXy6rbLfP-ntqXtMAl5YOBpiB2xI";
+    const FROZEN_ISSUER_PUBLIC_KEY: &str = "Ivwpd5Lwtv_Av8_bftsMCqFOAlo2XsDjQuhuOCnLdLY";
+    is_placeholder_domain(&config.target_origin)
+        || is_placeholder_domain(&config.node_audience)
+        || is_placeholder_domain(&config.issuer_did)
+        || config.target_origin == "https://node.example"
+        || config.node_audience == "did:web:node.example"
+        || config.node_signing_kid.starts_with("did:web:node.example#")
+        || config.invitation_kid.starts_with("did:web:node.example#")
+        || config.invitation_public_key.as_deref() == Some(FROZEN_NODE_PUBLIC_KEY)
+        || config.issuer_public_key.as_deref() == Some(FROZEN_ISSUER_PUBLIC_KEY)
+        || is_repeated_test_key(config.invitation_public_key.as_deref())
+        || is_repeated_test_key(config.issuer_public_key.as_deref())
+}
+
+fn is_placeholder_domain(value: &str) -> bool {
+    let host = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("did:web:"))
+        .unwrap_or(value)
+        .split(['/', ':'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    host == "localhost"
+        || host.ends_with(".example")
+        || host.ends_with(".invalid")
+        || host.ends_with(".test")
+}
+
+fn is_repeated_test_key(value: Option<&str>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let Ok(bytes) = decode_config(value, URL_SAFE_NO_PAD) else {
+        return false;
+    };
+    bytes.len() == 32 && bytes.windows(2).all(|pair| pair[0] == pair[1])
+}
+
+fn canonical_kid_matches(kid: &str, did: &str) -> bool {
+    let Some((prefix, fragment)) = kid.split_once('#') else {
+        return false;
+    };
+    prefix == did
+        && !fragment.is_empty()
+        && !fragment.contains('#')
+        && !fragment.chars().any(char::is_whitespace)
+}
+
+fn origin_audience_matches(origin: &str, audience: &str) -> bool {
+    let Some(host) = origin
+        .strip_prefix("https://")
+        .and_then(|value| value.split_once(':').map(|(host, _)| host).or(Some(value)))
+    else {
+        return false;
+    };
+    audience == format!("did:web:{host}")
 }
 
 fn is_postgres_database(database: &str) -> bool {
@@ -687,8 +758,14 @@ mod tests {
     fn enabled_config() -> ShareEmailConfig {
         ShareEmailConfig {
             enabled: true,
-            invitation_public_key: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into()),
-            issuer_public_key: Some("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE".into()),
+            target_origin: "https://node.internal.tinycloud".into(),
+            node_audience: "did:web:node.internal.tinycloud".into(),
+            node_signing_kid: "did:web:node.internal.tinycloud#invitation-key-1".into(),
+            invitation_kid: "did:web:node.internal.tinycloud#invitation-key-1".into(),
+            invitation_public_key: Some("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".into()),
+            issuer_did: "did:web:issuer.credentials.org".into(),
+            issuer_kid: "did:web:issuer.credentials.org#test-key".into(),
+            issuer_public_key: Some("AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA".into()),
             authority_material_path: Some("/run/tinycloud/authority-material.json".into()),
             ..ShareEmailConfig::default()
         }
@@ -700,10 +777,7 @@ mod tests {
             enabled: true,
             ..ShareEmailConfig::default()
         };
-        assert_eq!(
-            config.validate(),
-            Err("share email configuration is incomplete")
-        );
+        assert!(config.validate().is_err());
     }
 
     #[tokio::test]
@@ -720,6 +794,17 @@ mod tests {
     async fn issuer_vct_is_pinned_to_the_frozen_opencredentials_profile() {
         let mut config = enabled_config();
         config.issuer_vct = "opencredentials.email/test".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn production_rejects_placeholder_and_repeated_fixture_trust() {
+        let mut config = enabled_config();
+        config.target_origin = "https://node.example".into();
+        assert!(config.validate().is_err());
+
+        let mut config = enabled_config();
+        config.invitation_public_key = Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into());
         assert!(config.validate().is_err());
     }
 

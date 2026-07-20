@@ -11,6 +11,7 @@ use futures::io::AsyncReadExt;
 use rocket::{
     data::{Data, ToByteUnit},
     http::Status,
+    request::{FromRequest, Outcome},
     response::status::Custom,
     response::Responder,
     serde::json::Json,
@@ -48,8 +49,8 @@ use tinycloud_core::{
             TargetOrigin,
         },
         verifier::ExactEmailVerifier,
-        AuthenticatedAuthorityMaterialProvider, DatabaseAuthorityBridge117,
-        PolicyAuthorityTransaction117, PortError,
+        AuthenticatedAuthorityMaterialProvider, AuthorityTrustDescriptor,
+        DatabaseAuthorityBridge117, PolicyAuthorityTransaction117, PortError,
     },
     sql::{caveats::PreparedStatement, SqlCaveats, SqlRequest, SqlResponse, SqlService, SqlValue},
 };
@@ -358,6 +359,24 @@ pub struct CapabilityDescriptor {
     pub status: &'static str,
 }
 
+/// Public trust metadata passed from Node composition to a real Share host.
+/// This is intentionally separate from the frozen capability descriptor: the
+/// four-route public profile is immutable, while host setup still needs the
+/// authenticated issuer and authority trust tuple. No private key material is
+/// present here.
+#[derive(Debug, Clone, Serialize)]
+pub struct ShareEmailHostTrustDescriptor {
+    pub authority: AuthorityTrustDescriptor,
+    #[serde(rename = "issuerDid")]
+    pub issuer_did: String,
+    #[serde(rename = "issuerVct")]
+    pub issuer_vct: String,
+    #[serde(rename = "issuerKid")]
+    pub issuer_kid: String,
+    #[serde(rename = "issuerPublicKey")]
+    pub issuer_public_key: String,
+}
+
 /// The public Node capability is deliberately identical to the frozen Share
 /// node profile. Delivery finalization is an OpenCredentials transaction; it
 /// is not a fifth Node protocol operation.
@@ -386,6 +405,32 @@ pub struct ApiError {
 }
 
 pub type ApiResult<T> = Result<Json<T>, Custom<Json<ApiErrorBody>>>;
+
+/// Enforce the environment-owned browser host boundary when a browser sends
+/// an Origin header. Server-to-server callers may omit Origin, but a supplied
+/// origin must be the one authenticated by configuration.
+pub struct ShareOriginGuard;
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for ShareOriginGuard {
+    type Error = ();
+
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        let Some(origin) = request.headers().get_one("Origin") else {
+            return Outcome::Success(Self);
+        };
+        let allowed = request
+            .rocket()
+            .state::<Option<ShareEmailRuntime>>()
+            .and_then(|runtime| runtime.as_ref())
+            .and_then(|runtime| runtime.config.allowed_origins.first());
+        if allowed.is_some_and(|allowed| allowed == origin) {
+            Outcome::Success(Self)
+        } else {
+            Outcome::Error((Status::Forbidden, ()))
+        }
+    }
+}
 
 fn error(status: Status, code: &'static str) -> Custom<Json<ApiErrorBody>> {
     Custom(
@@ -519,6 +564,10 @@ impl ConstrainedNamedSqlStore for SqlNamedStore {
 
 pub struct ShareEmailRuntime {
     pub config: ShareEmailConfig,
+    /// Public trust metadata derived from the authenticated authority bundle.
+    /// It never contains signing material.
+    pub trust_descriptors: Vec<AuthorityTrustDescriptor>,
+    pub host_trust_descriptors: Vec<ShareEmailHostTrustDescriptor>,
     pub state: ProtocolStateRepository,
     pub bridge: Arc<DatabaseAuthorityBridge117>,
     pub verifier: ExactEmailVerifier,
@@ -532,6 +581,14 @@ pub struct ShareEmailRuntime {
 }
 
 impl ShareEmailRuntime {
+    pub fn host_trust_descriptors(&self) -> &[AuthorityTrustDescriptor] {
+        &self.trust_descriptors
+    }
+
+    pub fn host_trust_bundle(&self) -> &[ShareEmailHostTrustDescriptor] {
+        &self.host_trust_descriptors
+    }
+
     pub fn capability(&self) -> CapabilityDescriptor {
         CapabilityDescriptor {
             id: "tinycloud.node-policy-email-v1",
@@ -616,6 +673,26 @@ pub fn compose(
         AuthenticatedAuthorityMaterialProvider::from_path(material_path)
             .map_err(|_| anyhow::anyhow!("share email authority material is invalid"))?,
     );
+    material
+        .validate_node_trust(
+            &config.target_origin,
+            &config.node_audience,
+            &config.invitation_kid,
+            &invite_public_key,
+        )
+        .map_err(|_| anyhow::anyhow!("authority enrollment does not match node trust bundle"))?;
+    let trust_descriptors = material.trust_descriptors();
+    let host_trust_descriptors = trust_descriptors
+        .iter()
+        .cloned()
+        .map(|authority| ShareEmailHostTrustDescriptor {
+            authority,
+            issuer_did: config.issuer_did.clone(),
+            issuer_vct: config.issuer_vct.clone(),
+            issuer_kid: config.issuer_kid.clone(),
+            issuer_public_key: issuer_bytes.to_owned(),
+        })
+        .collect();
     let status_provider = Arc::new(material.status_provider());
     let attestation_provider = Arc::new(material.attestation_provider());
     let root_did =
@@ -655,6 +732,8 @@ pub fn compose(
     Ok(Some(ShareEmailRuntime {
         state: ProtocolStateRepository::new(conn),
         config,
+        trust_descriptors,
+        host_trust_descriptors,
         bridge,
         verifier,
         invitation_verifier,
@@ -938,6 +1017,7 @@ struct NodeInvitationAuthorizationEnvelope {
 pub async fn authorize_invitation(
     data: Data<'_>,
     runtime: &State<Option<ShareEmailRuntime>>,
+    _origin: ShareOriginGuard,
 ) -> ApiResult<Value> {
     let value = read_bounded_json(data).await?;
     let runtime = runtime
@@ -1070,6 +1150,7 @@ pub async fn authorize_invitation(
 pub async fn policy_challenge(
     data: Data<'_>,
     runtime: &State<Option<ShareEmailRuntime>>,
+    _origin: ShareOriginGuard,
     client_ip: crate::routes::public::ClientIp,
 ) -> ApiResult<Value> {
     let runtime = runtime
@@ -1178,6 +1259,7 @@ fn sign(
 pub async fn policy_session(
     data: Data<'_>,
     runtime: &State<Option<ShareEmailRuntime>>,
+    _origin: ShareOriginGuard,
 ) -> ApiResult<Value> {
     let runtime = runtime
         .inner()
@@ -1296,6 +1378,7 @@ pub async fn policy_session(
 pub async fn read(
     data: Data<'_>,
     runtime: &State<Option<ShareEmailRuntime>>,
+    _origin: ShareOriginGuard,
 ) -> Result<NoStoreJson<ReadResponse>, Custom<Json<ApiErrorBody>>> {
     let runtime = runtime
         .inner()
@@ -1483,6 +1566,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_origin_mismatch_is_rejected_before_protocol_state() {
+        let rocket = rocket::build()
+            .mount("/", rocket::routes![authorize_invitation])
+            .manage(None::<ShareEmailRuntime>);
+        let client = Client::tracked(rocket).await.expect("Rocket client");
+        let response = client
+            .post("/share/v1/invitations/authorize")
+            .header(rocket::http::ContentType::JSON)
+            .header(rocket::http::Header::new("Origin", "https://evil.example"))
+            .body("{}")
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Forbidden);
+    }
+
+    #[tokio::test]
+    async fn browser_origin_must_match_the_single_configured_allowlist_entry() {
+        let config = ShareEmailConfig {
+            enabled: true,
+            allowed_origins: vec!["https://share.tinycloud.xyz".to_owned()],
+            ..ShareEmailConfig::default()
+        };
+        assert_eq!(config.allowed_origins.len(), 1);
+        assert!(!config.allowed_origins.iter().any(|origin| origin == "*"));
+    }
+
+    #[tokio::test]
     async fn mounted_surface_is_exactly_the_four_frozen_node_routes() {
         let rocket = rocket::build()
             .mount("/", public_routes())
@@ -1623,10 +1733,15 @@ mod tests {
         presentation["expiresAt"] = json!("2026-07-19T17:02:00.000Z");
         presentation["jti"] = json!("AAAAAAAAAAAAAAAAAAAAAA");
         let presentation: PolicyPresentation = serde_json::from_value(presentation).unwrap();
-        assert!(scope_from_presentation(&presentation, &ShareEmailConfig::default()).is_ok());
+        let config = ShareEmailConfig {
+            target_origin: "https://node.example".to_owned(),
+            node_audience: "did:web:node.example".to_owned(),
+            ..ShareEmailConfig::default()
+        };
+        assert!(scope_from_presentation(&presentation, &config).is_ok());
 
         let mut altered = presentation.clone();
         altered.resource = Path::parse("documents/other.md").unwrap();
-        assert!(scope_from_presentation(&altered, &ShareEmailConfig::default()).is_err());
+        assert!(scope_from_presentation(&altered, &config).is_err());
     }
 }

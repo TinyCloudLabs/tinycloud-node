@@ -5,13 +5,12 @@ This deployment consumes Share contract commit
 `pl8-1Rpx_DYCBjOpK3hRrLfrSVDINNFssZDfFw6BMTs`. A different digest or an
 ancestor-only pin is a release failure.
 
-`tinycloud.toml.example` is the checked-in, non-secret configuration shape for
+tinycloud.toml.example is the checked-in, non-secret configuration shape for
 an enabled exact-email node. Copy it out of the repository, fill in the
 operator-delivered paths and public trust values, and mount it with
-`TINYCLOUD_CONFIG_FILE`. The staging compose file additionally requires the
-actual node origin, audience, and signer kids as environment overrides; the
-`node.example` values in this template are not production identity. Never put
-a private key, database password, claim, credential, or token in the file.
+TINYCLOUD_CONFIG_FILE. Its empty trust fields intentionally fail closed until
+the environment-owned production tuple is injected. Never put a private key,
+database password, claim, credential, or token in the file.
 
 The staging compose file consumes that mounted config and has no development
 or test fallback. It requires an immutable image reference, a PostgreSQL URL,

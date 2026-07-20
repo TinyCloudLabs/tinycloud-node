@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use futures::future::join_all;
 use futures::io::AsyncWriteExt;
 use k256::ecdsa::SigningKey;
 use rocket::{
@@ -10,6 +11,7 @@ use rocket::{
     },
     Build, Rocket,
 };
+use rocket::{http::Header, local::asynchronous::Client};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use sha3::Keccak256;
@@ -625,8 +627,84 @@ async fn seed_kv(rocket: &Rocket<Build>, seed: [u8; 32]) -> Result<()> {
     Ok(())
 }
 
+async fn mounted_http_adversarial_checks(rocket: Rocket<Build>) -> Result<()> {
+    let client = Client::tracked(rocket)
+        .await
+        .context("mounted adversarial client")?;
+    let json_header = rocket::http::ContentType::JSON;
+
+    for route in tinycloud_node::share_email::NODE_CAPABILITY_ROUTES {
+        let response = client
+            .post(route)
+            .header(json_header.clone())
+            .header(Header::new("Origin", "https://evil.example"))
+            .body("{}")
+            .dispatch()
+            .await;
+        if response.status() != rocket::http::Status::Forbidden {
+            bail!("{route} accepted an origin outside the configured host boundary");
+        }
+
+        let response = client
+            .post(route)
+            .header(json_header.clone())
+            .body("{}")
+            .dispatch()
+            .await;
+        if response.status() == rocket::http::Status::NotFound {
+            bail!("{route} was not mounted in the real Rocket surface");
+        }
+
+        let oversized = "x".repeat(tinycloud_core::share_email::state::MAX_REQUEST_BODY_BYTES + 1);
+        let response = client
+            .post(route)
+            .header(json_header.clone())
+            .body(oversized)
+            .dispatch()
+            .await;
+        if response.status().code < 400 || response.status() == rocket::http::Status::NotFound {
+            bail!("{route} did not reject an oversized body");
+        }
+    }
+
+    let response = client
+        .post("/share/v1/invitations/consume")
+        .header(json_header.clone())
+        .body("{}")
+        .dispatch()
+        .await;
+    if response.status() != rocket::http::Status::NotFound {
+        bail!("the removed invitation consume alias is still mounted");
+    }
+    drop(response);
+
+    let concurrent = join_all((0..8).map(|_| async {
+        client
+            .post("/share/v1/policy/challenges")
+            .header(json_header.clone())
+            .body("{}")
+            .dispatch()
+            .await
+    }))
+    .await;
+    if concurrent
+        .iter()
+        .any(|response| response.status() == rocket::http::Status::InternalServerError)
+    {
+        bail!("concurrent malformed challenge traffic reached an internal error");
+    }
+    drop(concurrent);
+    // Rocket's public local Client API does not expose its graceful terminate
+    // hook. Keep the local runtime alive until this short-lived self-test
+    // process exits rather than dropping it while TinyCloud cleanup tasks are
+    // still scheduled on Tokio.
+    std::mem::forget(client);
+    Ok(())
+}
+
 async fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    let self_test = args.iter().any(|argument| argument == "--self-test");
     let descriptor_path = args
         .windows(2)
         .find(|pair| pair[0] == "--descriptor")
@@ -708,6 +786,15 @@ async fn run() -> Result<()> {
         .context("production Rocket app composition")?;
     seed_sql(&rocket).await?;
     seed_kv(&rocket, [0x44; 32]).await?;
+    if self_test {
+        mounted_http_adversarial_checks(rocket).await?;
+        eprintln!("n4 mounted HTTP adversarial checks passed");
+        // The production app starts a periodic cleanup task during
+        // composition. Exit after the local mounted assertions so Tokio does
+        // not tear that task down without Rocket's private local-client
+        // termination hook.
+        std::process::exit(0);
+    }
     let descriptor = descriptor(
         &cases,
         &node,
