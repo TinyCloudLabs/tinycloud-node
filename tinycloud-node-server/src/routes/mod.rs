@@ -652,6 +652,13 @@ type ComputeInvokeState<'a> = &'a State<ComputeService>;
 #[cfg(not(feature = "compute"))]
 type ComputeInvokeState<'a> = ();
 
+/// P2: the wasmtime `ExecutionBackend` state, threaded alongside
+/// `ComputeInvokeState` (P1, routine-key derivation only).
+#[cfg(feature = "compute")]
+type ComputeExecutorInvokeState<'a> = &'a State<crate::compute_exec::ComputeExecutor>;
+#[cfg(not(feature = "compute"))]
+type ComputeExecutorInvokeState<'a> = ();
+
 type KvInputMap = HashMap<
     (SpaceId, Path),
     (

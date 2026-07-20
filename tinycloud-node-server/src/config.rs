@@ -274,6 +274,68 @@ impl Default for DuckDbStorageConfig {
     }
 }
 
+/// P2 (compute-service.md §11.4, plan P2 "numeric ceilings config-capped"):
+/// `[storage.compute]`. Distinct from `[storage.sql]`/`[storage.duckdb]`
+/// (their `path`/`memory_threshold` govern a per-space actor's on-disk
+/// cache) -- `path` here is UNUSED for the in-node wasmtime backend
+/// (artifacts live in the DB blob store via `DatabaseArtifactRepository`,
+/// exactly like sql/duckdb), kept only for a future on-disk WASM cache
+/// (§11.4). The four `*_ceiling`/`default_*` fields are the WasmtimeBackend
+/// enforcement inputs (§10.1): a chain-derived `ComputeCaveats.max_duration`/
+/// `max_memory` above its ceiling is rejected on ingest (no silent
+/// truncation); when a caveat is absent, the `default_*` value applies.
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct ComputeStorageConfig {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default = "default_compute_max_duration_ms_ceiling")]
+    pub max_duration_ms_ceiling: u64,
+    #[serde(default = "default_compute_default_max_duration_ms")]
+    pub default_max_duration_ms: u64,
+    #[serde(default = "default_compute_max_memory_bytes_ceiling")]
+    pub max_memory_bytes_ceiling: u64,
+    #[serde(default = "default_compute_default_max_memory_bytes")]
+    pub default_max_memory_bytes: u64,
+    #[serde(default = "default_compute_max_fuel_ceiling")]
+    pub max_fuel_ceiling: u64,
+    #[serde(default)]
+    pub persist_manifest: bool,
+}
+
+fn default_compute_max_duration_ms_ceiling() -> u64 {
+    30_000
+}
+
+fn default_compute_default_max_duration_ms() -> u64 {
+    5_000
+}
+
+fn default_compute_max_memory_bytes_ceiling() -> u64 {
+    256 * 1024 * 1024
+}
+
+fn default_compute_default_max_memory_bytes() -> u64 {
+    128 * 1024 * 1024
+}
+
+fn default_compute_max_fuel_ceiling() -> u64 {
+    2_000_000_000
+}
+
+impl Default for ComputeStorageConfig {
+    fn default() -> Self {
+        Self {
+            path: None,
+            max_duration_ms_ceiling: default_compute_max_duration_ms_ceiling(),
+            default_max_duration_ms: default_compute_default_max_duration_ms(),
+            max_memory_bytes_ceiling: default_compute_max_memory_bytes_ceiling(),
+            default_max_memory_bytes: default_compute_default_max_memory_bytes(),
+            max_fuel_ceiling: default_compute_max_fuel_ceiling(),
+            persist_manifest: false,
+        }
+    }
+}
+
 #[serde_as]
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Storage {
@@ -294,6 +356,8 @@ pub struct Storage {
     pub sql: SqlStorageConfig,
     #[serde(default)]
     pub duckdb: DuckDbStorageConfig,
+    #[serde(default)]
+    pub compute: ComputeStorageConfig,
 }
 
 fn default_datadir() -> PathBuf {

@@ -14,6 +14,12 @@ use super::{
     types::*,
 };
 
+/// P2 (compute-service.md §9.1, plan P2): `Clone` so the compute host
+/// mediator can hold an owned handle (moved into `'static` wasmtime host
+/// import closures) reaching the SAME actor registry the SQL route uses --
+/// every field is already `Arc`-backed or trivially cheap, so this is a
+/// handle clone, not a deep copy.
+#[derive(Clone)]
 pub struct SqlService {
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
     base_path: String,

@@ -15,6 +15,8 @@ pub mod authorization;
 pub mod cli;
 #[cfg(feature = "compute")]
 pub mod compute;
+#[cfg(feature = "compute")]
+pub mod compute_exec;
 pub mod config;
 #[cfg(feature = "dstack")]
 pub mod dstack;
@@ -327,6 +329,14 @@ pub async fn app(
     let compute_service =
         ComputeService::new(crate::compute::build_routine_key_deriver(&key_setup));
 
+    // P2 (compute-service.md §9.1, plan P2): the wasmtime `ExecutionBackend`.
+    // Separate Rocket-managed state from `ComputeService` (which only holds
+    // routine-key derivation, P1) -- `ComputeExecutor` owns the wasmtime
+    // `Engine` (fuel + epoch interruption) and the numeric-ceiling config.
+    #[cfg(feature = "compute")]
+    let compute_executor =
+        crate::compute_exec::ComputeExecutor::new(tinycloud_config.storage.compute.clone())?;
+
     let quota_cache = QuotaCache::new(
         tinycloud_config.storage.limit,
         std::env::var("TINYCLOUD_QUOTA_URL").ok(),
@@ -353,6 +363,8 @@ pub async fn app(
     let rocket = rocket.manage(duckdb_service);
     #[cfg(feature = "compute")]
     let rocket = rocket.manage(compute_service);
+    #[cfg(feature = "compute")]
+    let rocket = rocket.manage(compute_executor);
     let rocket = rocket
         .manage(quota_cache)
         .manage(invocation_replay_cache)

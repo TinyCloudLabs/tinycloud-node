@@ -11,9 +11,9 @@ use crate::storage::{
     ImmutableWriteStore, StorageSetup, StoreSize,
 };
 use crate::types::{
-    AccountDelegationRecord, CapabilitiesReadParams, DelegationQuery, DelegationQueryDirection,
-    DelegationQueryPage, DelegationQueryStatus, DelegationResource, ListFilters, Metadata,
-    Resource, SpaceIdWrap,
+    AccountDelegationRecord, Ability, CapabilitiesReadParams, Caveats, DelegationQuery,
+    DelegationQueryDirection, DelegationQueryPage, DelegationQueryStatus, DelegationResource,
+    ListFilters, Metadata, Resource, SpaceIdWrap,
 };
 use crate::util::{Capability, DelegationInfo, DelegationMode};
 use sea_orm::{
@@ -221,6 +221,18 @@ pub enum ComputeDeployError<S: StorageSetup, K: Secrets> {
     BindingCaveatMismatch(String),
 }
 
+/// P2 (compute-service.md §5.1/F3/F5, §9.1.1): one granted `D_fn` ability row,
+/// as returned by `SpaceDatabase::compute_granted_abilities`. See that
+/// method's docs for the cite-all / space-scoping semantics.
+#[cfg(feature = "compute")]
+#[derive(Debug, Clone)]
+pub struct ComputeGrantedAbility {
+    pub delegation: Hash,
+    pub resource: Resource,
+    pub ability: Ability,
+    pub caveats: Caveats,
+}
+
 impl<B, K> SpaceDatabase<DatabaseConnection, B, K> {
     pub async fn new(conn: DatabaseConnection, storage: B, secrets: K) -> Result<Self, DbErr> {
         Migrator::up(&conn, None).await?;
@@ -314,6 +326,113 @@ where
             .count(&self.conn)
             .await?;
         Ok(count > 0)
+    }
+
+    /// P2 (compute-service.md §5.1/F3/F5, §9.1.1): enumerate every LIVE
+    /// ability row of every LIVE (unrevoked, currently time-valid) delegation
+    /// whose delegatee is `delegatee` and whose resource lives in `space`.
+    /// This is BOTH (a) the "cite-all" `D_fn` candidate set the host
+    /// mediator selects invocation parents from (F5) -- callers cite every
+    /// distinct `delegation` hash present in the returned rows -- AND (b)
+    /// the "granted" capability set the execution manifest reports
+    /// (§9.1.1). The space filter is the F3 defense-in-depth check ("verify
+    /// every capability resource in the selected D_fn lives in that
+    /// space") -- identical WASM deployed in two spaces shares one CID and
+    /// thus one derived routine identity, so this filter is what makes a
+    /// cross-space citation impossible even if a caller passed the wrong
+    /// `space`.
+    #[cfg(feature = "compute")]
+    pub async fn compute_granted_abilities(
+        &self,
+        delegatee: &str,
+        space: &SpaceId,
+    ) -> Result<Vec<ComputeGrantedAbility>, DbErr> {
+        let now = OffsetDateTime::now_utc();
+        let rows = delegation::Entity::find()
+            .filter(delegation::Column::Delegatee.eq(delegatee))
+            .find_with_related(abilities::Entity)
+            .all(&self.conn)
+            .await?;
+        let mut out = Vec::new();
+        for (d, ability_rows) in rows {
+            if revocation::is_revoked(&self.conn, &d.id).await? {
+                continue;
+            }
+            if d.expiry.map(|expiry| now >= expiry).unwrap_or(false) {
+                continue;
+            }
+            if d.not_before.map(|nbf| now < nbf).unwrap_or(false) {
+                continue;
+            }
+            for a in ability_rows {
+                if a.resource.space() == Some(space) {
+                    out.push(ComputeGrantedAbility {
+                        delegation: d.id,
+                        resource: a.resource,
+                        ability: a.ability,
+                        caveats: a.caveats,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// P2 (compute-service.md §6.2/F1.5, the rotation tripwire): find the
+    /// delegatee of ANY delegation (regardless of whether it currently
+    /// matches the freshly re-derived routine DID) whose ability rows carry
+    /// the `computeFunctionBinding` caveat for `function_cid`, scoped to
+    /// `space`. Used ONLY on the tripwire's slow path -- when
+    /// `compute_granted_abilities(current_derived_did, space)` comes back
+    /// empty despite a deployed artifact -- to disambiguate "no D_fn was
+    /// ever deployed for this function" from "a D_fn WAS deployed, but under
+    /// an identity a dstack seed rotation has since changed" (the deployer
+    /// already guaranteed `D_fn.delegatee == derived_did` AT DEPLOY TIME,
+    /// `deploy_compute_function`'s `BindingCaveatMismatch` check -- so a
+    /// binding match under a DIFFERENT current delegatee is exactly the
+    /// rotation signature). Deliberately unindexed (a full ability-table
+    /// caveat scan): this is a rare, out-of-band diagnostic path, not the
+    /// per-call hot path.
+    #[cfg(feature = "compute")]
+    pub async fn compute_delegatee_for_binding(
+        &self,
+        space: &SpaceId,
+        function_cid: &str,
+    ) -> Result<Option<String>, DbErr> {
+        let expected = crate::compute::compute_function_binding_caveat(function_cid);
+        let space_prefix = format!("{space}/");
+        let rows = abilities::Entity::find()
+            .find_also_related(delegation::Entity)
+            .all(&self.conn)
+            .await?;
+        for (a, d) in rows {
+            if !a.resource.to_string().starts_with(&space_prefix) {
+                continue;
+            }
+            if a.caveats.0.get("0") == Some(&expected) {
+                if let Some(d) = d {
+                    return Ok(Some(d.delegatee));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// P2 read-only artifact load (compute-service.md §5, execute path):
+    /// loads the deployed WASM bytes + content hash for `(space, name)`.
+    /// Thin wrapper around the free function `database_artifacts::load_artifact`
+    /// (used transaction-aware by deploy, §5.1/F4) exposed here because
+    /// `SpaceDatabase::conn` is private to this module.
+    #[cfg(feature = "compute")]
+    pub async fn load_compute_artifact(
+        &self,
+        space: &str,
+        name: &str,
+    ) -> Result<
+        Option<crate::database_artifacts::DatabaseArtifact>,
+        crate::database_artifacts::DatabaseArtifactError,
+    > {
+        crate::database_artifacts::load_artifact(&self.conn, "compute", space, name).await
     }
 
     /// List every space id known to this node (the full `space` table).

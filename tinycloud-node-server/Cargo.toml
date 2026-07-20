@@ -67,6 +67,17 @@ tracing = "0.1"
 tracing-log = "0.2"
 tracing-opentelemetry = "0.30"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
+# P2 (compute-service.md §9.1/§9.1.1): the in-node WasmtimeBackend. Optional,
+# gated behind the `compute` feature -- the node builds and runs with zero
+# WASM runtime cost when compute is disabled (§11.1 "following the duckdb
+# precedent precisely").
+wasmtime = { version = "26", optional = true, default-features = false, features = [
+    "cranelift",
+    "runtime",
+    "std",
+    "async",
+    "wat",
+] }
 
 [target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
 # Release builds cross-compile aarch64 Linux from x86_64 Linux. Vendoring
@@ -100,7 +111,7 @@ x509-parser = "0.16"
 default = []
 dstack = []
 duckdb = ["tinycloud-core/duckdb"]
-compute = ["tinycloud-core/compute"]
+compute = ["tinycloud-core/compute", "dep:wasmtime"]
 
 # P0 (compute-service-implementation-plan.md): this target only makes sense
 # with the compute feature enabled -- ComputeRequest/ComputeService don't

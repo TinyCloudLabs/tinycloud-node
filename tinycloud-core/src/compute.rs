@@ -141,6 +141,27 @@ pub fn compute_function_binding_caveat(function_cid: &str) -> serde_json::Value 
     serde_json::json!({ "computeFunctionBinding": { "functionCid": function_cid } })
 }
 
+/// P2 (compute-service.md §6.2/F1, the caveat-ECHO obligation): the
+/// `computeFunctionBinding` caveat, as the `BTreeMap<String, Value>`
+/// "notabene" shape `ucan_capabilities_object::Capabilities::with_action`
+/// expects. Passing `[compute_function_binding_notabene(cid)]` as the
+/// single-element notabene array produces the SAME persisted caveats shape
+/// deploy requires (`caveats.0["0"] == compute_function_binding_caveat(cid)`,
+/// checked in `deploy_compute_function`) -- so an internal invocation the
+/// host mediator mints with this notabene byte-matches `D_fn`'s caveat map,
+/// satisfying `caveats_contain_child`'s byte-equality rule instead of
+/// failing closed on every host call.
+pub fn compute_function_binding_notabene(
+    function_cid: &str,
+) -> std::collections::BTreeMap<String, serde_json::Value> {
+    let mut map = std::collections::BTreeMap::new();
+    map.insert(
+        "computeFunctionBinding".to_string(),
+        serde_json::json!({ "functionCid": function_cid }),
+    );
+    map
+}
+
 /// Routine-key derivation error (P1, plan P1/Codex C11). Deliberately a
 /// single, non-generic variant (rather than mirroring each backend's native
 /// error type) so `RoutineKeyDeriver` stays dyn-compatible --
@@ -371,6 +392,17 @@ mod tests {
             caveat,
             serde_json::json!({ "computeFunctionBinding": { "functionCid": "bafyfunctioncid" } })
         );
+    }
+
+    #[test]
+    fn compute_function_binding_notabene_matches_the_persisted_caveat_shape() {
+        // §6.2/F1: the notabene map, once wrapped at positional key "0" by
+        // `Capabilities::with_action`, MUST serialize to exactly
+        // `compute_function_binding_caveat` -- this is the byte-equality the
+        // echo rule depends on.
+        let notabene = compute_function_binding_notabene("bafyfunctioncid");
+        let as_value = serde_json::to_value(&notabene).unwrap();
+        assert_eq!(as_value, compute_function_binding_caveat("bafyfunctioncid"));
     }
 
     #[test]

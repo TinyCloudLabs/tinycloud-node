@@ -22,7 +22,7 @@ pub mod util;
 pub mod write_hooks;
 
 #[cfg(feature = "compute")]
-pub use db::ComputeDeployError;
+pub use db::{ComputeDeployError, ComputeGrantedAbility};
 pub use db::{
     Commit, DelegationStatus, InvocationOutcome, KvInvokeOptions, KvPrecondition, SpaceDatabase,
     TransactResult, TxError, TxStoreError,
