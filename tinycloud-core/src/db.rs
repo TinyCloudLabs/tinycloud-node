@@ -369,6 +369,34 @@ where
         Ok(out)
     }
 
+    /// P2 (compute-service.md §6.2/F1.5): true if ANY delegation (regardless
+    /// of delegatee, validity, or revocation status) carries a
+    /// `computeFunctionBinding` caveat naming `function_cid` on an ability
+    /// row scoped to `space`. Used ONLY to distinguish the two "no live
+    /// D_fn" cases at execute time: if this is true but
+    /// `compute_select_d_fns` (delegatee-filtered) found nothing, the
+    /// node's re-derived routine identity no longer matches what any
+    /// binding-caveat-carrying delegation was minted for -- the
+    /// `routine-identity-rotated` tripwire (F1.5). If this is false, the
+    /// function was simply never granted a routine data delegation.
+    #[cfg(feature = "compute")]
+    pub async fn compute_any_d_fn_bound(
+        &self,
+        space: &SpaceId,
+        function_cid: &str,
+    ) -> Result<bool, DbErr> {
+        let rows = abilities::Entity::find().all(&self.conn).await?;
+        Ok(rows.iter().any(|row| {
+            row.resource.space().map(|s| s == space).unwrap_or(false)
+                && row.caveats.0.values().any(|v| {
+                    v.get("computeFunctionBinding")
+                        .and_then(|b| b.get("functionCid"))
+                        .and_then(|fc| fc.as_str())
+                        == Some(function_cid)
+                })
+        }))
+    }
+
     /// Judges' item 7 (same-bytes-two-names redeploy hazard): true if some
     /// artifact row OTHER than `(service, space, exclude_name)` still has
     /// `content_hash == content_hash`. Identical bytes deployed under two
