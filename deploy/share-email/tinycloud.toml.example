@@ -10,21 +10,11 @@ cors = false
 
 [global.share_email]
 enabled = true
-# Required environment-owned values. Empty values intentionally fail closed
-# until the operator injects the enrolled production trust tuple.
-target_origin = ""
-node_audience = ""
-return_origin = "https://share.tinycloud.xyz"
-allowed_origins = ["https://share.tinycloud.xyz"]
-node_signing_kid = ""
-invitation_kid = ""
-
-# The issuer DID, VCT, key id, and key version are an exact trust tuple. The
-# public key is supplied through TINYCLOUD_SHARE_EMAIL__ISSUER_PUBLIC_KEY.
-issuer_did = ""
-issuer_vct = "opencredentials.email/v1"
-issuer_kid = ""
-issuer_key_version = 1
+# One strict public bundle is shared with Share and OpenCredentials. It is
+# mounted read-only and supplies all origin, audience, enrollment, issuer,
+# version, and public-key fields below. No split trust environment variables
+# are accepted by the production compose file.
+trust_bundle_path = "/run/tinycloud/share-email-trust-bundle.json"
 
 # This signed bundle contains the policy/enforcement authority artifacts,
 # enrollment, fresh status observations, and runtime attestation. It is read

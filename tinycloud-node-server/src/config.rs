@@ -73,6 +73,11 @@ pub struct ShareEmailConfig {
     /// unreadable source keeps the capability unavailable.
     #[serde(default)]
     pub authority_material_path: Option<String>,
+    /// The mounted, public environment trust bundle shared with Share and
+    /// OpenCredentials. Individual trust fields are legacy test overrides;
+    /// production composition resolves them from this file.
+    #[serde(default)]
+    pub trust_bundle_path: Option<String>,
     #[serde(default)]
     pub postgres_tls: ShareEmailPostgresTlsConfig,
     #[serde(default = "default_share_readiness_max_age")]
@@ -170,6 +175,7 @@ impl Default for ShareEmailConfig {
             issuer_key_version: default_share_issuer_key_version(),
             issuer_public_key: None,
             authority_material_path: None,
+            trust_bundle_path: None,
             postgres_tls: ShareEmailPostgresTlsConfig::default(),
             readiness_max_age_seconds: default_share_readiness_max_age(),
             clock_skew_seconds: default_share_clock_skew(),
@@ -180,10 +186,44 @@ impl Default for ShareEmailConfig {
 }
 
 impl ShareEmailConfig {
+    pub fn resolve_trust_bundle(&self) -> Result<Self, &'static str> {
+        let Some(path) = self.trust_bundle_path.as_deref() else {
+            return Ok(self.clone());
+        };
+        let bytes = fs::read(path).map_err(|_| "share email trust bundle is unreadable")?;
+        if bytes.len() > 64 * 1024 {
+            return Err("share email trust bundle is too large");
+        }
+        let bundle: ShareEmailTrustBundle =
+            serde_json::from_slice(&bytes).map_err(|_| "share email trust bundle is invalid")?;
+        bundle.validate()?;
+        let mut resolved = self.clone();
+        resolved.target_origin = bundle.node_origin;
+        resolved.node_audience = bundle.node_audience;
+        resolved.return_origin = bundle.return_origin.clone();
+        resolved.allowed_origins = vec![bundle.return_origin];
+        resolved.node_signing_kid = bundle.node_invitation_kid.clone();
+        resolved.invitation_kid = bundle.node_invitation_kid;
+        resolved.invitation_public_key = Some(bundle.node_invitation_public_key);
+        resolved.issuer_did = bundle.issuer_did;
+        resolved.issuer_vct = bundle.issuer_vct;
+        resolved.issuer_kid = bundle.issuer_kid;
+        resolved.issuer_key_version = bundle.issuer_key_version as u64;
+        resolved.issuer_public_key = Some(bundle.issuer_public_key);
+        Ok(resolved)
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         if !self.enabled {
             return Ok(());
         }
+        if self.trust_bundle_path.is_some() {
+            return self.resolve_trust_bundle()?.validate_fields();
+        }
+        self.validate_fields()
+    }
+
+    fn validate_fields(&self) -> Result<(), &'static str> {
         if !allows_hermetic_fixture() && uses_fixture_identity(self) {
             return Err("share email production trust bundle contains a fixture identity");
         }
@@ -261,6 +301,98 @@ impl ShareEmailConfig {
     }
 }
 
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct ShareEmailTrustBundle {
+    version: String,
+    share_origin: String,
+    return_origin: String,
+    registry_origin: String,
+    credentials_origin: String,
+    node_origin: String,
+    node_audience: String,
+    node_invitation_kid: String,
+    node_invitation_public_key: String,
+    node_key_version: u32,
+    node_enabled: bool,
+    issuer_did: String,
+    issuer_vct: String,
+    issuer_kid: String,
+    issuer_public_key: String,
+    issuer_key_version: u32,
+    issuer_enabled: bool,
+}
+
+impl ShareEmailTrustBundle {
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.version != "tinycloud.share-email-trust-bundle/v1"
+            || self.share_origin != "https://share.tinycloud.xyz"
+            || self.return_origin != self.share_origin
+            || !canonical_https_origin(&self.registry_origin)
+            || self.credentials_origin != "https://witness.credentials.org"
+            || !canonical_https_origin(&self.node_origin)
+            || self.node_audience
+                != format!(
+                    "did:web:{}",
+                    host_of(&self.node_origin).ok_or("trust bundle node origin")?
+                )
+            || self.node_invitation_kid
+                != format!(
+                    "{}#invitation-key-{}",
+                    self.node_audience, self.node_key_version
+                )
+            || self.node_key_version == 0
+            || !self.node_enabled
+            || self.issuer_did != "did:web:issuer.credentials.org"
+            || self.issuer_vct != "opencredentials.email/v1"
+            || !self
+                .issuer_kid
+                .starts_with(&format!("{}#", self.issuer_did))
+            || self.issuer_key_version == 0
+            || !self.issuer_enabled
+            || !canonical_key(&self.node_invitation_public_key)
+            || !canonical_key(&self.issuer_public_key)
+            || contains_placeholder(&self.node_origin)
+            || contains_placeholder(&self.node_audience)
+        {
+            return Err("share email trust bundle is inconsistent");
+        }
+        Ok(())
+    }
+}
+
+fn canonical_https_origin(value: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.origin().ascii_serialization() == value
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+}
+
+fn host_of(value: &str) -> Option<String> {
+    Some(reqwest::Url::parse(value).ok()?.host_str()?.to_owned())
+}
+
+fn canonical_key(value: &str) -> bool {
+    let Ok(bytes) = decode_config(value, URL_SAFE_NO_PAD) else {
+        return false;
+    };
+    bytes.len() == 32 && base64::encode_config(bytes, URL_SAFE_NO_PAD) == value
+}
+
+fn contains_placeholder(value: &str) -> bool {
+    value.to_ascii_lowercase().contains("example")
+        || value.to_ascii_lowercase().contains("localhost")
+        || value.to_ascii_lowercase().contains("127.0.0.1")
+}
+
 #[cfg(feature = "mounted-fixture")]
 fn allows_hermetic_fixture() -> bool {
     true
@@ -272,17 +404,9 @@ fn allows_hermetic_fixture() -> bool {
 }
 
 fn uses_fixture_identity(config: &ShareEmailConfig) -> bool {
-    const FROZEN_NODE_PUBLIC_KEY: &str = "IVL40Zt5HSRFMkLhXy6rbLfP-ntqXtMAl5YOBpiB2xI";
-    const FROZEN_ISSUER_PUBLIC_KEY: &str = "Ivwpd5Lwtv_Av8_bftsMCqFOAlo2XsDjQuhuOCnLdLY";
     is_placeholder_domain(&config.target_origin)
         || is_placeholder_domain(&config.node_audience)
         || is_placeholder_domain(&config.issuer_did)
-        || config.target_origin == "https://node.example"
-        || config.node_audience == "did:web:node.example"
-        || config.node_signing_kid.starts_with("did:web:node.example#")
-        || config.invitation_kid.starts_with("did:web:node.example#")
-        || config.invitation_public_key.as_deref() == Some(FROZEN_NODE_PUBLIC_KEY)
-        || config.issuer_public_key.as_deref() == Some(FROZEN_ISSUER_PUBLIC_KEY)
         || is_repeated_test_key(config.invitation_public_key.as_deref())
         || is_repeated_test_key(config.issuer_public_key.as_deref())
 }

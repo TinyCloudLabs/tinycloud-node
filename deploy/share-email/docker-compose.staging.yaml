@@ -16,15 +16,7 @@ services:
       TINYCLOUD_CONFIG_FILE: /run/tinycloud/tinycloud.toml
       TINYCLOUD_STORAGE__DATABASE: ${TINYCLOUD_STORAGE_DATABASE:?set a PostgreSQL URL with sslmode=verify-full}
       TINYCLOUD_KEYS_SECRET: ${TINYCLOUD_KEYS_SECRET:?set the node key source out of band}
-      TINYCLOUD_SHARE_EMAIL__TARGET_ORIGIN: ${TINYCLOUD_SHARE_EMAIL_TARGET_ORIGIN:?set the exact public node origin}
-      TINYCLOUD_SHARE_EMAIL__NODE_AUDIENCE: ${TINYCLOUD_SHARE_EMAIL_NODE_AUDIENCE:?set the exact node audience DID}
-      TINYCLOUD_SHARE_EMAIL__NODE_SIGNING_KID: ${TINYCLOUD_SHARE_EMAIL_NODE_SIGNING_KID:?set the enrolled node signer kid}
-      TINYCLOUD_SHARE_EMAIL__INVITATION_KID: ${TINYCLOUD_SHARE_EMAIL_INVITATION_KID:?set the enrolled invitation kid}
-      TINYCLOUD_SHARE_EMAIL__ISSUER_DID: ${TINYCLOUD_SHARE_EMAIL_ISSUER_DID:?set the enrolled OpenCredentials issuer DID}
-      TINYCLOUD_SHARE_EMAIL__ISSUER_KID: ${TINYCLOUD_SHARE_EMAIL_ISSUER_KID:?set the enrolled OpenCredentials issuer kid}
-      TINYCLOUD_SHARE_EMAIL__ISSUER_VCT: opencredentials.email/v1
-      TINYCLOUD_SHARE_EMAIL__ISSUER_PUBLIC_KEY: ${TINYCLOUD_SHARE_EMAIL_ISSUER_PUBLIC_KEY:?set the pinned OpenCredentials issuer public key}
-      TINYCLOUD_SHARE_EMAIL__INVITATION_PUBLIC_KEY: ${TINYCLOUD_SHARE_EMAIL_INVITATION_PUBLIC_KEY:?set the enrolled node invitation public key}
+      TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_PATH: /run/tinycloud/share-email-trust-bundle.json
       TINYCLOUD_SHARE_EMAIL__POSTGRES_TLS__SSLMODE: verify-full
       TINYCLOUD_SHARE_EMAIL__POSTGRES_TLS__ROOT_CERT_PATH: /run/tinycloud/postgres-ca.pem
       TINYCLOUD_CORS: "false"
@@ -37,6 +29,10 @@ services:
       - type: bind
         source: ${TINYCLOUD_SHARE_EMAIL_AUTHORITY_MATERIAL:?set the operator-signed authority material bundle}
         target: /run/tinycloud/authority-material.json
+        read_only: true
+      - type: bind
+        source: ${TINYCLOUD_SHARE_EMAIL_TRUST_BUNDLE:?set the environment-owned trust bundle}
+        target: /run/tinycloud/share-email-trust-bundle.json
         read_only: true
       - type: bind
         source: ${TINYCLOUD_POSTGRES_CA_CERT:?set the PostgreSQL CA bundle}

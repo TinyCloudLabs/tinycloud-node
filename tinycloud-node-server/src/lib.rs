@@ -111,6 +111,10 @@ pub type TinyCloud = SpaceDatabase<DatabaseConnection, BlockStores, StaticSecret
 pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     let mut tinycloud_config: Config = config.extract::<Config>()?;
     tinycloud_config.storage.resolve();
+    tinycloud_config.share_email = tinycloud_config
+        .share_email
+        .resolve_trust_bundle()
+        .map_err(|error| anyhow::anyhow!(error))?;
     tinycloud_config
         .share_email
         .validate_for_database(tinycloud_config.storage.database())
