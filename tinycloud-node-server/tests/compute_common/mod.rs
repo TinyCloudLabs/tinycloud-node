@@ -45,33 +45,36 @@ pub fn far_future() -> f64 {
 /// ceilings, and `max_memory` let individual tests exercise the fuel /
 /// epoch / memory-limit traps deterministically without a wall-clock
 /// dependency in the ASSERTION (the guest loops; the limit fires).
+#[derive(Default)]
 pub struct BootOptions {
     pub max_fuel: Option<u64>,
     pub max_duration_ceiling_ms: Option<u64>,
     pub default_max_duration_ms: Option<u64>,
     pub max_memory: Option<String>,
     pub max_memory_ceiling: Option<String>,
-}
-
-impl Default for BootOptions {
-    fn default() -> Self {
-        Self {
-            max_fuel: None,
-            max_duration_ceiling_ms: None,
-            default_max_duration_ms: None,
-            max_memory: None,
-            max_memory_ceiling: None,
-        }
-    }
+    /// Override the node identity secret (rotation tests boot the SAME
+    /// datadir twice with DIFFERENT secrets to simulate a dstack seed
+    /// rotation, §6.2/F1.5).
+    pub secret: Option<[u8; 32]>,
 }
 
 pub async fn boot_with(
     opts: BootOptions,
 ) -> Result<(rocket::Rocket<rocket::Build>, DatabaseConnection, TempDir)> {
     let tempdir = TempDir::new()?;
-    let datadir = tempdir.path().join("data");
+    let (rocket, conn) = boot_at(tempdir.path(), opts).await?;
+    Ok((rocket, conn, tempdir))
+}
+
+/// Boot at an explicit base dir (so a test can reboot the SAME datadir with a
+/// different secret -- the rotation-tripwire simulation).
+pub async fn boot_at(
+    base: &std::path::Path,
+    opts: BootOptions,
+) -> Result<(rocket::Rocket<rocket::Build>, DatabaseConnection)> {
+    let datadir = base.join("data");
     let db_url = format!("sqlite:{}", datadir.join("caps.db").display());
-    let secret = encode_config(NODE_SECRET, URL_SAFE_NO_PAD);
+    let secret = encode_config(opts.secret.unwrap_or(NODE_SECRET), URL_SAFE_NO_PAD);
 
     let mut compute_lines = String::new();
     if let Some(f) = opts.max_fuel {
@@ -111,7 +114,7 @@ secret = "{}"
     tinycloud_config.storage.resolve();
     let rocket = tinycloud::app(&figment, &tinycloud_config, None).await?;
     let conn = Database::connect(ConnectOptions::new(db_url)).await?;
-    Ok((rocket, conn, tempdir))
+    Ok((rocket, conn))
 }
 
 pub async fn boot() -> Result<(rocket::Rocket<rocket::Build>, DatabaseConnection, TempDir)> {
@@ -327,6 +330,7 @@ pub async fn handshake_routine_did(
 }
 
 /// One (service, path, ability) grant line for a `D_fn`.
+#[derive(Clone, Copy)]
 pub struct GrantSpec {
     pub service: &'static str,
     pub path: &'static str,
