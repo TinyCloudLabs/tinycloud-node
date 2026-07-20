@@ -768,14 +768,30 @@ mod tests {
         );
         // vfs stays accepted (reserved) so it never regresses to unknown-service.
         assert!(accepted_actions("tinycloud.vfs").is_some());
-        // compute (P0 skeleton) is reserved the same way: accepted at the
-        // policy boundary, but the wildcard carries no implies yet (C1 —
-        // gen-capabilities.mjs only lets a wildcard imply *active* concretes).
+        // compute: P2 flipped execute+deploy to `active` (their handlers
+        // ship); `list` stays reserved (no server-side listing handler,
+        // §12.1/C9). So the wildcard implies EXACTLY the two active
+        // concretes — deploy + execute — and NOT list. This assertion was
+        // deliberately designed to fail on the P2 active-flip; updating it
+        // (reserved-no-implies -> active-two-implies) is the conscious act
+        // of landing the flip.
         assert!(accepted_actions("tinycloud.compute").is_some());
         assert_eq!(
             generated::implied_actions("tinycloud.compute/*"),
-            &[] as &[&str],
-            "compute/* must carry no implies while its concretes are reserved"
+            &["tinycloud.compute/deploy", "tinycloud.compute/execute"],
+            "compute/* must imply exactly its two active concretes (deploy, execute); list stays reserved"
+        );
+        let compute_star_grant = ["tinycloud.compute/*".to_string()];
+        let compute_star = expand_granted_actions(&compute_star_grant);
+        for a in ["tinycloud.compute/deploy", "tinycloud.compute/execute"] {
+            assert!(
+                compute_star.contains(a),
+                "compute/* should expand to include {a}"
+            );
+        }
+        assert!(
+            !compute_star.contains("tinycloud.compute/list"),
+            "compute/* must NOT confer the still-reserved list action"
         );
 
         // Per-service wildcards expand (via implication) to every concrete

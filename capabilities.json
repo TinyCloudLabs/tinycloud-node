@@ -109,12 +109,12 @@
     {
       "urn": "tinycloud.compute/execute",
       "service": "tinycloud.compute",
-      "status": "reserved"
+      "status": "active"
     },
     {
       "urn": "tinycloud.compute/deploy",
       "service": "tinycloud.compute",
-      "status": "reserved"
+      "status": "active"
     },
     {
       "urn": "tinycloud.compute/list",
@@ -124,8 +124,9 @@
     {
       "urn": "tinycloud.compute/*",
       "service": "tinycloud.compute",
-      "status": "reserved",
-      "notes": "Per-service wildcard. While the concrete actions are reserved this MUST carry no `implies` (gen-capabilities.mjs requires a wildcard to imply exactly the *active* concrete actions of its service). When execute/deploy/list flip to active, add: \"implies\": [\"tinycloud.compute/deploy\", \"tinycloud.compute/execute\", \"tinycloud.compute/list\"]."
+      "status": "active",
+      "implies": ["tinycloud.compute/deploy", "tinycloud.compute/execute"],
+      "notes": "Per-service wildcard. P2 flipped execute+deploy to active (the handlers ship); `list` stays reserved (no server-side listing handler, §12.1/C9), so the wildcard implies ONLY the two active concretes (gen-capabilities.mjs requires a wildcard to imply exactly the *active* concrete actions of its service). F9 (SDK): the standard session grant MUST enumerate compute/execute (+ compute/list once it ships) and NEVER compute/* -- the wildcard confers deploy, which standard sessions must not hold."
     },
     {
       "urn": "tinycloud.capabilities/read",

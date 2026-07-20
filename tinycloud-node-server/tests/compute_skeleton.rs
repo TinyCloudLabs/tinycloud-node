@@ -248,16 +248,15 @@ async fn enabled_dispatch_reaches_the_handler_for_execute() -> Result<()> {
     let status = response.status();
     let body = response.into_string().await.unwrap_or_default();
     // Reaching the handler means: NOT the service-disabled 501, and NOT a
-    // 403 ability-mismatch. It is still 501 in P0 (no live Execute handler
-    // until P2), but with a message that proves the ability gate passed.
-    assert_eq!(
-        status,
-        Status::NotImplemented,
-        "unexpected response: {body}"
-    );
+    // 403 ability-mismatch. P2 ships the live Execute handler, so an
+    // UNDEPLOYED function ("hello") now reaches it and 404s
+    // (function-not-deployed) -- which itself proves the ability gate passed
+    // and dispatch reached the real handler. (P0 asserted the 501 stub here;
+    // updating this to the 404 is the conscious act of landing Execute.)
+    assert_eq!(status, Status::NotFound, "unexpected response: {body}");
     assert!(
-        body.contains("not implemented yet"),
-        "expected a reached-the-handler message, got {body:?}"
+        body.contains("not deployed"),
+        "expected the reached-the-handler function-not-deployed message, got {body:?}"
     );
     assert_ne!(
         body, "Compute support is not enabled on this node",
