@@ -413,25 +413,27 @@ fn descriptor(
     let sender_seed = [0x44u8; 32];
     let sender = ed_key(sender_seed);
     let case_values = cases.iter().enumerate().map(|(index, case)| {
-        let share_id = format!("share-00000000-0000-4000-8000-{:012}", index + 1);
-        let authoritative_binding = json!({
-            "shareId": share_id,
-            "policyCid": case.policy_cid,
-            "recipientEmail": "Alice+Notes@example.com",
-            "expiry": case.expires_at,
-            "delegationCid": case.delegation_cid,
-            "authorityMaterialHandle": format!("amh_{}_001", case.kind),
-            "authorityMaterialDigest": case.authority_digest,
-            "contentSource": case.source,
-            "contentSourceDigest": sha256_b64(&value_bytes(&case.source)),
-            "action": case.source["action"],
-            "resource": case.source["path"]
-        });
+        let authoritative_bindings = (0..2).map(|attempt| {
+            let share_id = format!("share-00000000-0000-4000-8000-{:012}", index + 1 + attempt * cases.len());
+            json!({
+                "shareId": share_id,
+                "policyCid": case.policy_cid,
+                "recipientEmail": "Alice+Notes@example.com",
+                "expiry": case.expires_at,
+                "delegationCid": case.delegation_cid,
+                "authorityMaterialHandle": format!("amh_{}_001", case.kind),
+                "authorityMaterialDigest": case.authority_digest,
+                "contentSource": case.source,
+                "contentSourceDigest": sha256_b64(&value_bytes(&case.source)),
+                "action": case.source["action"],
+                "resource": case.source["path"]
+            })
+        }).collect::<Vec<_>>();
         json!({
         "kind":case.kind,"source":case.source,"expectedContentSourceDigest":sha256_b64(&value_bytes(&case.source)),"expectedRecipientEmail":"Alice+Notes@example.com","expiresAt":case.expires_at,
         "policyCid":case.policy_cid,"delegationCid":case.delegation_cid,"authorityMaterialHandle":format!("amh_{}_001",case.kind),"authorityMaterialDigest":case.authority_digest,
         "policyOwnerDid":case.authority["policyOwnerDid"],"senderDid":case.authority["senderDid"],"senderPrivateKey":b64(&sender_seed),"delegation":format!("uCAESA.n4-mounted.{}",case.kind),"spaceId":SPACE,"documentName":"Project plan.md","senderTrust":"verified","authorityMaterial":case.authority,"targetOrigin":TARGET_ORIGIN,"nodeAudience":NODE_AUDIENCE,
-        "trustedNode":{"targetOrigin":TARGET_ORIGIN,"nodeAudience":NODE_AUDIENCE,"invitationKid":INVITATION_KID,"invitationPublicKey":b64(&node_public),"keyVersion":1,"enabled":true},"authoritativeBinding":authoritative_binding,"expectedContent":case.content
+        "trustedNode":{"targetOrigin":TARGET_ORIGIN,"nodeAudience":NODE_AUDIENCE,"invitationKid":INVITATION_KID,"invitationPublicKey":b64(&node_public),"keyVersion":1,"enabled":true},"authoritativeBinding":authoritative_bindings[0],"authoritativeBindings":authoritative_bindings,"expectedContent":case.content
         })
     }).collect::<Vec<_>>();
     json!({"testOnly":true,"service":"tinycloud-node-n4-mounted-fixture","url":url,"healthUrl":format!("{url}/healthz"),"issuerDid":ISSUER_DID,"issuerKid":ISSUER_KID,"issuerPublicKey":issuer_public,"capability":{"id":"tinycloud.node-policy-email-v1","version":1,"origin":TARGET_ORIGIN,"routes":tinycloud_node::share_email::NODE_CAPABILITY_ROUTES,"contentKinds":["kv","sql"],"status":"ready"},"trustedNode":{"targetOrigin":TARGET_ORIGIN,"nodeAudience":NODE_AUDIENCE,"invitationKid":INVITATION_KID,"invitationPublicKey":b64(&node_public),"keyVersion":1,"enabled":true},"senderDid":did_key(&sender),"cases":case_values})
