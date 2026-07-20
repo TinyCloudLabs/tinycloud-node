@@ -1,5 +1,5 @@
 [package]
-name = "tinycloud-node-n4-mounted-fixture"
+name = "tinycloud-node-production-e2e"
 version = "0.1.0"
 edition = "2021"
 publish = false
@@ -19,4 +19,4 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tinycloud-auth = { path = "../../tinycloud-auth" }
 tinycloud-core = { path = "../../tinycloud-core", default-features = false, features = ["sqlite", "tokio"] }
-tinycloud-node = { package = "tinycloud-node", path = "../../tinycloud-node-server", features = ["mounted-fixture"] }
+tinycloud-node = { package = "tinycloud-node", path = "../../tinycloud-node-server" }

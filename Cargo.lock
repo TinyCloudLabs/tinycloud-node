@@ -9310,7 +9310,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tinycloud-node-n4-mounted-fixture"
+name = "tinycloud-node-production-e2e"
 version = "0.1.0"
 dependencies = [
  "anyhow",

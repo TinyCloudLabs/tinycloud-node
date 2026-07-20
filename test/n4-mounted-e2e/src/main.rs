@@ -242,8 +242,8 @@ fn attestation(
     let message = json!({
         "type":"TinyCloudShareEnrollmentRuntimeAttestation","version":1,"targetOrigin":TARGET_ORIGIN,"nodeAudience":NODE_AUDIENCE,
         "enforcerDid":enforcer_did,"enforcerKid":"did:web:node.tinycloud.xyz#enforcement-key-1","publicKey":enrollment["invitationPublicKey"],"keyVersion":1,
-        "localSignerDid":enforcer_did,"localSignerKid":canonical_kid(enforcer_did),"measurement":"tinycloud-node-n4-mounted-fixture-v1",
-        "measurementDigest":sha256_b64(&value_bytes(&json!({"measurement":"tinycloud-node-n4-mounted-fixture-v1"}))),"expiresAt":expires_at,
+        "localSignerDid":enforcer_did,"localSignerKid":canonical_kid(enforcer_did),"measurement":"tinycloud-node-production-e2e-v1",
+        "measurementDigest":sha256_b64(&value_bytes(&json!({"measurement":"tinycloud-node-production-e2e-v1"}))),"expiresAt":expires_at,
         "enrollmentDigest":sha256_b64(&value_bytes(enrollment))
     });
     let mut signed = b"xyz.tinycloud.share/enrollment-attestation/v1\0".to_vec();
@@ -281,7 +281,7 @@ fn build_case(
     let delegation_cid = cid(
         0x55,
         Code::Sha2_256,
-        format!("n4-mounted-delegation-{kind}").as_bytes(),
+        format!("n4-production-delegation-{kind}").as_bytes(),
     );
     let capability = if kind == "kv" {
         json!({"service":"tinycloud.kv","space":SPACE,"path":"documents/plan.md","actions":["tinycloud.kv/get"]})
@@ -292,7 +292,7 @@ fn build_case(
         parse_capability(&capability).map_err(|error| anyhow::anyhow!("capability: {error:?}"))?;
     let capability_hash = requested_capabilities_hash_hex(&[parsed]);
     let policy_digest = sha256_hex(&policy_bytes);
-    let policy_id = format!("pol_n4-mounted-{kind}");
+    let policy_id = format!("pol_n4-production-{kind}");
     let mut common = BTreeMap::new();
     common.insert("xyz.tinycloud.policy/ownerDid".into(), owner.clone());
     common.insert("xyz.tinycloud.policy/policyId".into(), policy_id.clone());
@@ -394,9 +394,9 @@ fn build_case(
         authority_digest,
         expires_at,
         content: if kind == "kv" {
-            "# KV mounted plan\n"
+            "# KV production plan\n"
         } else {
-            "# SQL mounted plan\n"
+            "# SQL production plan\n"
         },
     })
 }
@@ -405,6 +405,7 @@ fn descriptor(
     cases: &[Case],
     node: &tinycloud_core::libp2p::identity::Keypair,
     issuer_public: &str,
+    trust_bundle: &Value,
     url: &str,
 ) -> Value {
     let node_public = node
@@ -434,11 +435,11 @@ fn descriptor(
         json!({
         "kind":case.kind,"source":case.source,"expectedContentSourceDigest":sha256_b64(&value_bytes(&case.source)),"expectedRecipientEmail":"Alice+Notes@example.com","expiresAt":case.expires_at,
         "policyCid":case.policy_cid,"delegationCid":case.delegation_cid,"authorityMaterialHandle":format!("amh_{}_001",case.kind),"authorityMaterialDigest":case.authority_digest,
-        "policyOwnerDid":case.authority["policyOwnerDid"],"senderDid":case.authority["senderDid"],"senderPrivateKey":b64(&sender_seed),"delegation":format!("uCAESA.n4-mounted.{}",case.kind),"spaceId":SPACE,"documentName":"Project plan.md","senderTrust":"verified","authorityMaterial":case.authority,"targetOrigin":TARGET_ORIGIN,"nodeAudience":NODE_AUDIENCE,
+        "policyOwnerDid":case.authority["policyOwnerDid"],"senderDid":case.authority["senderDid"],"senderPrivateKey":b64(&sender_seed),"delegation":format!("uCAESA.n4-production.{}",case.kind),"spaceId":SPACE,"documentName":"Project plan.md","senderTrust":"verified","authorityMaterial":case.authority,"targetOrigin":TARGET_ORIGIN,"nodeAudience":NODE_AUDIENCE,
         "trustedNode":{"targetOrigin":TARGET_ORIGIN,"nodeAudience":NODE_AUDIENCE,"invitationKid":INVITATION_KID,"invitationPublicKey":b64(&node_public),"keyVersion":1,"enabled":true},"authoritativeBinding":authoritative_bindings[0],"authoritativeBindings":authoritative_bindings,"expectedContent":case.content
         })
     }).collect::<Vec<_>>();
-    json!({"testOnly":true,"service":"tinycloud-node-n4-mounted-fixture","url":url,"healthUrl":format!("{url}/healthz"),"issuerDid":ISSUER_DID,"issuerKid":ISSUER_KID,"issuerPublicKey":issuer_public,"capability":{"id":"tinycloud.node-policy-email-v1","version":1,"origin":TARGET_ORIGIN,"routes":tinycloud_node::share_email::NODE_CAPABILITY_ROUTES,"contentKinds":["kv","sql"],"status":"ready"},"trustedNode":{"targetOrigin":TARGET_ORIGIN,"nodeAudience":NODE_AUDIENCE,"invitationKid":INVITATION_KID,"invitationPublicKey":b64(&node_public),"keyVersion":1,"enabled":true},"senderDid":did_key(&sender),"cases":case_values})
+    json!({"production":true,"service":"tinycloud-node-production-e2e","url":url,"healthUrl":format!("{url}/healthz"),"issuerDid":ISSUER_DID,"issuerKid":ISSUER_KID,"issuerPublicKey":issuer_public,"trustBundle":trust_bundle,"capability":{"id":"tinycloud.node-policy-email-v1","version":1,"origin":TARGET_ORIGIN,"routes":tinycloud_node::share_email::NODE_CAPABILITY_ROUTES,"contentKinds":["kv","sql"],"status":"ready"},"trustedNode":{"targetOrigin":TARGET_ORIGIN,"nodeAudience":NODE_AUDIENCE,"invitationKid":INVITATION_KID,"invitationPublicKey":b64(&node_public),"keyVersion":1,"enabled":true},"senderDid":did_key(&sender),"cases":case_values})
 }
 
 fn figment(
@@ -795,12 +796,12 @@ async fn run() -> Result<()> {
     );
     let rocket = app(&figment)
         .await
-        .context("production Rocket app composition")?;
+        .context("default-feature production Rocket app composition")?;
     seed_sql(&rocket).await?;
     seed_kv(&rocket, [0x44; 32]).await?;
     if self_test {
         mounted_http_adversarial_checks(rocket).await?;
-        eprintln!("n4 mounted HTTP adversarial checks passed");
+        eprintln!("production HTTP adversarial checks passed");
         // The production app starts a periodic cleanup task during
         // composition. Exit after the local mounted assertions so Tokio does
         // not tear that task down without Rocket's private local-client
@@ -811,21 +812,22 @@ async fn run() -> Result<()> {
         &cases,
         &node,
         &issuer_public,
+        &trust_bundle,
         &format!("http://127.0.0.1:{port}"),
     );
     let descriptor_path_for_fairing = descriptor_path.clone();
     let descriptor_bytes = serde_json::to_vec_pretty(&descriptor)?;
-    let rocket = rocket.attach(AdHoc::on_liftoff("n4-mounted-descriptor", move |_| {
+    let rocket = rocket.attach(AdHoc::on_liftoff("production-e2e-descriptor", move |_| {
         let descriptor_bytes = descriptor_bytes.clone();
         let descriptor_path = descriptor_path_for_fairing.clone();
         Box::pin(async move {
             if let Some(path) = descriptor_path {
                 if let Err(error) = fs::write(&path, &descriptor_bytes) {
-                    eprintln!("n4-mounted fixture descriptor write failed: {error}");
+                    eprintln!("production descriptor write failed: {error}");
                 }
             }
             println!("{}", String::from_utf8_lossy(&descriptor_bytes));
-            eprintln!("tinycloud-node-n4-mounted-fixture listening on http://127.0.0.1:{port}");
+            eprintln!("tinycloud-node-production-e2e listening on http://127.0.0.1:{port}");
         })
     }));
     rocket.launch().await.context("production Rocket launch")?;
@@ -836,7 +838,7 @@ async fn run() -> Result<()> {
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
-        eprintln!("tinycloud-node-n4-mounted-fixture: {error:#}");
+        eprintln!("tinycloud-node-production-e2e: {error:#}");
         std::process::exit(1);
     }
 }
