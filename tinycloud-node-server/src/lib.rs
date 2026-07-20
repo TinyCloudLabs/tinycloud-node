@@ -28,6 +28,7 @@ pub mod signed_urls;
 pub mod storage;
 pub mod tee;
 mod tracing;
+pub mod tunnel;
 pub mod webhook_dispatcher;
 
 #[cfg(test)]
