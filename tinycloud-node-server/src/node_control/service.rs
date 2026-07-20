@@ -615,17 +615,24 @@ pub fn service_status_for_installed(installed: DiscoveredService) -> ServiceStat
     // its actual bind attempt (see `link::state::ListenerState`) rather than
     // inferred purely from `ServiceState::Running` — a bind failure inside a
     // running node process must still show up as not-running here.
+    //
+    // Gate on `pid.is_some()` (the process manager's view of whether a
+    // process is alive) rather than `ServiceState::Running`: the latter also
+    // requires the separate control-plane RPC socket to be reachable, which
+    // is unrelated to whether the LAN TLS listener bound successfully. A
+    // node whose control API is slow to come up (or briefly unreachable)
+    // must not have its already-bound LAN listener misreported as `stopped`.
     let link_from_disk = read_link_disk_snapshot(&paths);
-    let link_listener = match (state.clone(), &link_from_disk) {
+    let link_listener = match (pid, &link_from_disk) {
         (_, None) => Some(LinkListenerState::Disabled),
-        (ServiceState::Running, Some(snapshot)) => {
+        (Some(_), Some(snapshot)) => {
             if snapshot.listener_bound == Some(true) {
                 Some(LinkListenerState::Running)
             } else {
                 Some(LinkListenerState::Stopped)
             }
         }
-        (_, Some(_)) => Some(LinkListenerState::Stopped),
+        (None, Some(_)) => Some(LinkListenerState::Stopped),
     };
 
     ServiceStatus {
@@ -2342,6 +2349,115 @@ printf '%s\n' "${FAKE_PS_AGE:-29}"
         assert_eq!(state, ServiceState::Error);
         assert_eq!(pid, Some(4242));
         assert_eq!(control_api, None);
+    }
+
+    /// Regression test for TC-250: `service status --json` used to gate the
+    /// reported `linkListener` on the composite `ServiceState::Running`,
+    /// which also requires the separate control-plane RPC socket to be
+    /// reachable. A node whose control API never came up (no `control.json`
+    /// was ever written) falls into `ServiceState::Error` once past the
+    /// 30s grace period even though the LAN TLS listener genuinely bound —
+    /// `linkListener` must still report `running` in that case, sourced only
+    /// from the on-disk listener-state marker, not from control-API health.
+    #[test]
+    fn service_status_reports_link_listener_running_even_when_control_api_is_unavailable() {
+        let _lock = env_lock();
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        let config_home = temp.path().join("config");
+        let data_home = temp.path().join("data");
+        let state_home = temp.path().join("state");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&config_home).unwrap();
+        fs::create_dir_all(&data_home).unwrap();
+        fs::create_dir_all(&state_home).unwrap();
+        let _home = EnvGuard::set("HOME", &home);
+        let _config = EnvGuard::set("XDG_CONFIG_HOME", &config_home);
+        let _data = EnvGuard::set("XDG_DATA_HOME", &data_home);
+        let _state = EnvGuard::set("XDG_STATE_HOME", &state_home);
+
+        let bin = temp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        write_script(
+            &bin,
+            "systemctl",
+            r#"#!/bin/sh
+while [ "${1#-}" != "$1" ]; do
+  shift
+done
+case "$1" in
+  show)
+    echo "MainPID=4242"
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+"#,
+        );
+        write_script(
+            &bin,
+            "ps",
+            r#"#!/bin/sh
+printf '%s\n' "31536000"
+"#,
+        );
+        let _path = prepend_path(&bin);
+
+        let paths = ProfilePaths::resolve(Profile::LinuxUser);
+        fs::create_dir_all(paths.service_manifest_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(paths.service_unit_path.parent().unwrap()).unwrap();
+        fs::write(&paths.service_unit_path, "").unwrap();
+        fs::create_dir_all(&paths.data_root).unwrap();
+
+        // The LAN listener genuinely bound — write the on-disk marker `serve`
+        // would have written after a successful synchronous bind.
+        let link_paths = crate::link::state::LinkPaths::from_data_root(&paths.data_root);
+        crate::link::state::write_state(
+            &link_paths,
+            &crate::link::state::LinkState::new(
+                "mynode".to_string(),
+                "https://api.tinycloud.link".to_string(),
+                Some("0.0.0.0:8443".to_string()),
+            ),
+        )
+        .unwrap();
+        crate::link::state::write_listener_state(
+            &link_paths,
+            &crate::link::state::ListenerState {
+                bound: true,
+                bind_addr: Some("0.0.0.0:8443".to_string()),
+                error: None,
+            },
+        )
+        .unwrap();
+
+        let manifest = ServiceManifest {
+            contract_version: CONTROL_CONTRACT_VERSION.into(),
+            profile: Profile::LinuxUser,
+            platform: Platform::Linux,
+            manager: Manager::SystemdUser,
+            version: "1.4.2".into(),
+            config_path: paths.config_path_json(),
+            data_path: paths.data_root_json(),
+            log_mode: LogMode::File,
+            key_backend: KeyBackend::EncryptedFile,
+        };
+
+        let installed = DiscoveredService {
+            manifest,
+            paths: paths.clone(),
+        };
+        let status = service_status_for_installed(installed);
+
+        // No control.json was ever written, so the control API probe is
+        // unavailable; the process is well past the 30s grace period.
+        assert_eq!(status.state, ServiceState::Error);
+        assert_eq!(status.pid, Some(4242));
+        // ...but the LAN listener really is up, so `linkListener` must say so.
+        assert_eq!(status.link_listener, Some(LinkListenerState::Running));
+        assert_eq!(status.link_listener_error, None);
     }
 
     #[test]
