@@ -11,9 +11,9 @@ use crate::storage::{
     ImmutableWriteStore, StorageSetup, StoreSize,
 };
 use crate::types::{
-    Ability, AccountDelegationRecord, CapabilitiesReadParams, Caveats, DelegationQuery,
-    DelegationQueryDirection, DelegationQueryPage, DelegationQueryStatus, DelegationResource,
-    ListFilters, Metadata, Resource, SpaceIdWrap,
+    AccountDelegationRecord, CapabilitiesReadParams, DelegationQuery, DelegationQueryDirection,
+    DelegationQueryPage, DelegationQueryStatus, DelegationResource, ListFilters, Metadata, Resource,
+    SpaceIdWrap,
 };
 use crate::util::{Capability, DelegationInfo, DelegationMode};
 use sea_orm::{
@@ -229,8 +229,8 @@ pub enum ComputeDeployError<S: StorageSetup, K: Secrets> {
 pub struct ComputeGrantedAbility {
     pub delegation: Hash,
     pub resource: Resource,
-    pub ability: Ability,
-    pub caveats: Caveats,
+    pub ability: crate::types::Ability,
+    pub caveats: crate::types::Caveats,
 }
 
 impl<B, K> SpaceDatabase<DatabaseConnection, B, K> {

@@ -11,6 +11,7 @@
 //!     (granted-but-unexercised is EXACTLY `{sql/write}`);
 //!   * A.4: step 5 is denied (envelope + op-not-performed + manifest
 //!     `granted:false`), the request itself returns 200.
+//!
 //! Plus the DISTINCT forbidden-import case: a guest importing outside the
 //! four-function surface fails at INSTANTIATION (a link error), NOT as an
 //! ability denial.
@@ -66,7 +67,7 @@ async fn seed_in_x(client: &Client, owner: &Owner) -> Result<()> {
         .post("/invoke")
         .header(rocket::http::Header::new("Authorization", auth))
         .header(rocket::http::ContentType::Bytes)
-        .body(b"42".to_vec())
+        .body(b"42")
         .dispatch()
         .await;
     anyhow::ensure!(

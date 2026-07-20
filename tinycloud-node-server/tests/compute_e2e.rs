@@ -59,7 +59,7 @@ async fn owner_kv_put(client: &Client, owner: &Owner, key: &str, value: &[u8]) -
         .post("/invoke")
         .header(rocket::http::Header::new("Authorization", ucan.encode()?))
         .header(rocket::http::ContentType::Bytes)
-        .body(value.to_vec())
+        .body(value)
         .dispatch()
         .await;
     anyhow::ensure!(response.status() == Status::Ok, "owner kv put {key} failed");
@@ -175,9 +175,7 @@ fn deleg_grants_only_execute(header: &str) -> Result<bool> {
         TinyCloudDelegation::Ucan(u) => u
             .payload()
             .attenuation
-            .abilities()
-            .iter()
-            .flat_map(|(_r, abmap)| abmap.iter().map(|(a, _)| a.to_string()))
+            .abilities().values().flat_map(|abmap| abmap.keys().map(|a| a.to_string()))
             .collect(),
         TinyCloudDelegation::Cacao(_) => anyhow::bail!("expected a UCAN delegation"),
     };

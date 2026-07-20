@@ -84,7 +84,7 @@ async fn seed_kv(client: &Client, owner: &Owner, key: &str, value: &[u8]) -> Res
         .post("/invoke")
         .header(rocket::http::Header::new("Authorization", ucan.encode()?))
         .header(rocket::http::ContentType::Bytes)
-        .body(value.to_vec())
+        .body(value)
         .dispatch()
         .await;
     anyhow::ensure!(

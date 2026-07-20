@@ -73,6 +73,16 @@ const SQL_WRITE: &str = "tinycloud.sql/write";
 /// calls), matching the pinned conformance fixture exactly.
 const COMPUTE_SQL_DB_NAME: &str = "db";
 
+/// The staged-input map `SpaceDatabase::invoke` expects for a `kv/put`
+/// (empty for reads/deletes). Aliased to keep the mediator signatures legible.
+type KvInputs = std::collections::HashMap<
+    (SpaceId, AuthPath),
+    (
+        Metadata,
+        tinycloud_core::storage::HashBuffer<<BlockStage as ImmutableStaging>::Writable>,
+    ),
+>;
+
 /// One journal entry (compute-service.md §9.1.1). `bytes_in`/`bytes_out` are
 /// the JSON byte lengths AT THE ABI BOUNDARY (the host import's argument and
 /// return bytes) -- NOT the underlying KV value size -- so they are
@@ -814,13 +824,7 @@ async fn mediate_kv_call(
 
     let invocation = mint_internal_invocation(ctx, &resource_id, ability)?;
 
-    let mut inputs: std::collections::HashMap<
-        (SpaceId, AuthPath),
-        (
-            Metadata,
-            tinycloud_core::storage::HashBuffer<<BlockStage as ImmutableStaging>::Writable>,
-        ),
-    > = std::collections::HashMap::new();
+    let mut inputs: KvInputs = std::collections::HashMap::new();
     if let Some(bytes) = &put_bytes {
         let mut stage = ctx
             .staging
