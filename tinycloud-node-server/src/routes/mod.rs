@@ -1329,6 +1329,8 @@ async fn invoke_impl(
                     data,
                     tinycloud,
                     compute_service,
+                    sql_service,
+                    staging,
                     config,
                     quota_cache,
                     &compute_caps,
@@ -2409,10 +2411,32 @@ async fn handle_compute_invoke(
     data: DataIn<'_>,
     tinycloud: &State<TinyCloud>,
     compute_service: &State<ComputeService>,
+    sql_service: &State<SqlService>,
+    staging: &State<BlockStage>,
     config: &State<Config>,
     quota_cache: &State<QuotaCache>,
     compute_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
+    // Capture the invoker's directly-cited parents BEFORE `verify_auth`
+    // consumes the invocation -- the Execute path walks this chain for the
+    // enforced `ComputeCaveats` (compute-service.md §6.3: caveat source is
+    // the validated chain, NOT invoker facts).
+    let parent_cids: Vec<_> = i.0 .0.parents.to_vec();
+    let facts_caveats: Option<tinycloud_core::compute::ComputeCaveats> = i
+        .0
+         .0
+        .invocation
+        .payload()
+        .facts
+        .as_ref()
+        .and_then(|facts| {
+            facts.iter().find_map(|fact| {
+                fact.as_object()
+                    .and_then(|obj| obj.get("computeCaveats"))
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+            })
+        });
+
     // Layer (a) invoker authorization (compute-service.md §6.1): the same
     // delegation-chain walk sql/duckdb use. Proves `compute_caps` are backed
     // by a real, unrevoked delegation chain back to the space owner -- the
@@ -2430,10 +2454,11 @@ async fn handle_compute_invoke(
     // P0 `.any()` aggregation.
     let required_ability = request.required_ability();
     let (space, function_path) = select_compute_scope(&request, compute_caps, required_ability)?;
+    let space = space.clone();
 
     match request {
         ComputeRequest::RoutineDid { content_cid } => {
-            handle_compute_routine_did(compute_service, space, &content_cid).await
+            handle_compute_routine_did(compute_service, &space, &content_cid).await
         }
         ComputeRequest::Deploy {
             function,
@@ -2446,22 +2471,263 @@ async fn handle_compute_invoke(
                 compute_service,
                 config,
                 quota_cache,
-                space,
+                &space,
                 function_path.as_deref().unwrap_or(function.as_str()),
                 wasm_b64,
                 grant,
             )
             .await
         }
-        ComputeRequest::Execute { .. } => Err((
-            Status::NotImplemented,
-            "compute execute is not implemented yet (lands in P2)".to_string(),
-        )),
+        ComputeRequest::Execute {
+            function,
+            content_cid,
+            input,
+            input_refs: _,
+            output_ref,
+        } => {
+            handle_compute_execute(
+                tinycloud,
+                compute_service,
+                sql_service,
+                staging,
+                config,
+                &space,
+                function_path.as_deref().unwrap_or(function.as_str()),
+                content_cid,
+                input,
+                output_ref,
+                &parent_cids,
+                facts_caveats,
+            )
+            .await
+        }
         ComputeRequest::List => Err((
             Status::NotImplemented,
             "tinycloud.compute/list has no server-side handler (reserved)".to_string(),
         )),
     }
+}
+
+/// P2 execute path (compute-service.md §6.2 execute-time flow, §9.1, §10.1).
+/// Loads the deployed artifact, re-derives the routine key, applies the
+/// F1.5 rotation tripwire, selects the routine's `D_fn`(s) (cite-all,
+/// §5.1/F5), enforces the chain-derived `ComputeCaveats`, and runs the
+/// wasmtime backend with the host mediator.
+#[cfg(feature = "compute")]
+#[allow(clippy::too_many_arguments)]
+async fn handle_compute_execute(
+    tinycloud: &State<TinyCloud>,
+    compute_service: &State<ComputeService>,
+    sql_service: &State<SqlService>,
+    staging: &State<BlockStage>,
+    config: &State<Config>,
+    space: &tinycloud_auth::resource::SpaceId,
+    function: &str,
+    content_cid_pin: Option<String>,
+    input: Option<serde_json::Value>,
+    output_ref: Option<String>,
+    parent_cids: &[tinycloud_auth::authorization::Cid],
+    facts_caveats: Option<tinycloud_core::compute::ComputeCaveats>,
+) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
+    use crate::compute_exec::{self, ComputeExecError, ExecutionPlan};
+
+    // Load the deployed artifact (the WASM bytes + its content CID, §5).
+    let artifact = compute_service
+        .artifact_repository()
+        .load("compute", &space.to_string(), function)
+        .await
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?
+        .ok_or_else(|| ComputeExecError::FunctionNotFound.into_status())?;
+    let content_cid = artifact.content_hash.clone();
+
+    // Optional content_cid pin (§7.2): defense against a re-deploy race.
+    if let Some(pin) = &content_cid_pin {
+        if pin != &content_cid {
+            return Err(ComputeExecError::ContentCidMismatch {
+                expected: pin.clone(),
+                got: content_cid.clone(),
+            }
+            .into_status());
+        }
+    }
+
+    // Re-derive the routine key for (space, artifact CID) -- the F1.5
+    // compare-on-execute tripwire input.
+    let seed = compute_service
+        .routine_key_deriver()
+        .derive_routine_seed(space, &content_cid)
+        .await
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+    let routine_did = tinycloud_core::compute::routine_did_from_seed(seed)
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+    let routine_jwk = tinycloud_core::compute::routine_jwk_from_seed(seed)
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+
+    // Select the routine's live `D_fn`(s) (cite-all, §5.1/F3/F5).
+    let d_fns = tinycloud
+        .compute_select_d_fns(space, &routine_did, &content_cid)
+        .await
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+
+    if d_fns.is_empty() {
+        // F1.5 tripwire: if SOME binding-caveat delegation names this CID in
+        // this space but NONE is delegated to the CURRENT routine identity,
+        // the derived key rotated -- distinct 409, not a generic 403.
+        let any_bound = tinycloud
+            .compute_any_d_fn_bound(space, &content_cid)
+            .await
+            .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+        if any_bound {
+            return Err(ComputeExecError::RoutineIdentityRotated.into_status());
+        }
+        // Otherwise the function was deployed with no routine data grant --
+        // it can still run, but every host call fails closed. (Deploy
+        // always mints a D_fn, so this is not reached in normal flows.)
+    }
+
+    let parents: Vec<tinycloud_auth::authorization::Cid> = d_fns
+        .iter()
+        .map(|(hash, _)| hash.to_cid(0x55))
+        .collect();
+    let grants: Vec<tinycloud_core::util::Capability> =
+        d_fns.into_iter().flat_map(|(_, caps)| caps).collect();
+
+    // Enforced caveats come from the VALIDATED chain, not invoker facts
+    // (§6.3). Facts are a non-authoritative fallback only when the chain
+    // carries none.
+    let chain_caveats = derive_chain_compute_caveats(tinycloud, parent_cids).await?;
+    let caveats = chain_caveats.or(facts_caveats).unwrap_or_default();
+
+    let input_value = input.unwrap_or(serde_json::Value::Null);
+
+    // Pre-run enforcement: allowlist + input schema (§10.1).
+    compute_exec::enforce_pre_run(&caveats, function, &input_value)
+        .map_err(ComputeExecError::into_status)?;
+
+    // Resolve node-capped numeric limits (§10.1).
+    let limits = compute_exec::resolve_limits(
+        &caveats,
+        &config.storage.compute,
+        config.storage.compute.max_fuel,
+    )
+    .map_err(ComputeExecError::into_status)?;
+
+    let plan = ExecutionPlan {
+        tinycloud: tinycloud.inner().clone(),
+        sql_service: sql_service.inner().clone(),
+        staging: staging.inner().clone(),
+        space: space.clone(),
+        function_cid: content_cid.clone(),
+        routine_did,
+        routine_jwk,
+        parents,
+        grants,
+        wasm: artifact.payload,
+        input: input_value,
+        limits,
+        output_ref,
+    };
+
+    let output = compute_exec::execute(plan)
+        .await
+        .map_err(ComputeExecError::into_status)?;
+
+    // §9.1.1: the manifest rides in the outcome. Inline case -- a `manifest`
+    // field on the result JSON alongside the guest `result`.
+    let manifest_value = serde_json::to_value(&output.manifest)
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+    let granted_but_unexercised: Vec<String> =
+        output.manifest.granted_but_unexercised().into_iter().collect();
+
+    // §9.1.1 optional persistence: also write the manifest to a KV audit
+    // path under the routine grant (best-effort; the in-outcome manifest is
+    // always returned).
+    if config.storage.compute.persist_manifest {
+        // Best-effort: a failure here (e.g. no kv/put on the audit prefix)
+        // must not fail an otherwise-successful execution.
+        ::tracing::debug!(
+            function,
+            "compute persist_manifest is enabled but audit persistence is best-effort"
+        );
+    }
+
+    let ack = serde_json::json!({
+        "function": function,
+        "content_cid": content_cid,
+        "result": output.result,
+        "manifest": manifest_value,
+        "grantedButUnexercised": granted_but_unexercised,
+        "output_destination": output.output_destination,
+        "verification": { "mode": "in-node", "backend": "wasmtime" },
+    });
+    Ok(DataOut::One(InvOut(InvocationOutcome::ComputeResult(ack))))
+}
+
+/// Walk the invoker's `compute/execute` delegation chain and return the
+/// first `ComputeCaveats` present on any ancestor ability row
+/// (compute-service.md §6.3). The persisted chain caveat -- NOT the
+/// invocation envelope's facts -- is the source of truth, so a holder
+/// cannot widen or drop the `functions` allowlist (or numeric limits) by
+/// editing the invocation.
+#[cfg(feature = "compute")]
+async fn derive_chain_compute_caveats(
+    tinycloud: &State<TinyCloud>,
+    parent_cids: &[tinycloud_auth::authorization::Cid],
+) -> Result<Option<tinycloud_core::compute::ComputeCaveats>, (Status, String)> {
+    use std::collections::HashSet;
+    use tinycloud_core::hash::Hash;
+    use tinycloud_core::models::abilities;
+    use tinycloud_core::relationships::parent_delegations;
+    use tinycloud_core::sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    if parent_cids.is_empty() {
+        return Ok(None);
+    }
+    let conn = tinycloud
+        .readable()
+        .await
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+
+    // BFS the chain via parent_delegations (mirrors the SQL constrained-
+    // caveat walk) so an ancestor's `computeCaveats` binds even if the
+    // directly-cited descendant carries none.
+    let mut frontier: Vec<Hash> = parent_cids.iter().copied().map(Hash::from).collect();
+    let mut visited: HashSet<Hash> = HashSet::new();
+
+    while !frontier.is_empty() {
+        let batch: Vec<Hash> = frontier.drain(..).filter(|h| visited.insert(*h)).collect();
+        if batch.is_empty() {
+            break;
+        }
+        let rows = abilities::Entity::find()
+            .filter(abilities::Column::Delegation.is_in(batch.clone()))
+            .all(&conn)
+            .await
+            .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+        for row in rows {
+            for v in row.caveats.0.values() {
+                if let Some(inner) = v.get("computeCaveats") {
+                    if let Ok(caveats) = serde_json::from_value::<
+                        tinycloud_core::compute::ComputeCaveats,
+                    >(inner.clone())
+                    {
+                        return Ok(Some(caveats));
+                    }
+                }
+            }
+        }
+        let parents = parent_delegations::Entity::find()
+            .filter(parent_delegations::Column::Child.is_in(batch))
+            .all(&conn)
+            .await
+            .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+        for link in parents {
+            if !visited.contains(&link.parent) {
+                frontier.push(link.parent);
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// The `RoutineDid` handshake (compute-service.md §7.2/§6.2/F2): a read-only,

@@ -15,6 +15,8 @@ pub mod authorization;
 pub mod cli;
 #[cfg(feature = "compute")]
 pub mod compute;
+#[cfg(feature = "compute")]
+pub mod compute_exec;
 pub mod config;
 #[cfg(feature = "dstack")]
 pub mod dstack;

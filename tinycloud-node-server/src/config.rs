@@ -292,6 +292,12 @@ pub struct ComputeStorageConfig {
     pub default_max_memory: ByteUnit,
     #[serde(default = "default_compute_max_memory_ceiling")]
     pub max_memory_ceiling: ByteUnit,
+    /// §10.1 CPU→fuel: the wasmtime fuel budget granted to each execution.
+    /// `ComputeCaveats` has no CPU field, so this is a node-level ceiling
+    /// (belt-and-braces with `maxDuration`→epoch). Large default; lower it
+    /// in tests to exercise the fuel-exhaustion trap.
+    #[serde(default = "default_compute_max_fuel")]
+    pub max_fuel: u64,
     /// §9.1.1: also persist the execution manifest to a KV audit path under
     /// the routine's own `D_fn` grant. The in-outcome manifest is always
     /// returned regardless of this setting.
@@ -315,6 +321,10 @@ fn default_compute_max_memory_ceiling() -> ByteUnit {
     ByteUnit::Mebibyte(512)
 }
 
+fn default_compute_max_fuel() -> u64 {
+    1_000_000_000
+}
+
 impl Default for ComputeStorageConfig {
     fn default() -> Self {
         Self {
@@ -322,6 +332,7 @@ impl Default for ComputeStorageConfig {
             max_duration_ceiling_ms: default_compute_max_duration_ceiling_ms(),
             default_max_memory: default_compute_max_memory(),
             max_memory_ceiling: default_compute_max_memory_ceiling(),
+            max_fuel: default_compute_max_fuel(),
             persist_manifest: false,
         }
     }
