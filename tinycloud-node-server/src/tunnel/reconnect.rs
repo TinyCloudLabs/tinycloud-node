@@ -23,6 +23,14 @@ const BACKOFF_BASE: Duration = Duration::from_millis(500);
 /// push the retry interval out indefinitely.
 const BACKOFF_CAP: Duration = Duration::from_secs(60);
 
+/// How many consecutive stale-sequence (4409) closes to resync-and-retry
+/// immediately before giving up on that strategy and falling back to normal
+/// exponential backoff. If the relay keeps rejecting the resynced sequence
+/// over and over, the resync isn't converging (e.g. the relay's stored
+/// sequence is itself stuck) and retrying with no delay in between would
+/// hammer the relay in a tight loop forever.
+const MAX_CONSECUTIVE_STALE_RESYNCS: u32 = 3;
+
 /// The outcome of one connect+auth attempt, as observed by the connection
 /// loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,21 +66,30 @@ pub enum ReconnectAction {
 
 /// Tracks backoff state across repeated connection attempts. `attempt` is
 /// the number of consecutive non-`Ack` outcomes since the last successful
-/// `Ack` (or since the loop started).
+/// `Ack` (or since the loop started). `stale_streak` is the number of
+/// consecutive stale-sequence (4409) closes since the last `Ack` or the last
+/// non-stale outcome, tracked separately so a run of 4409s doesn't also
+/// escalate the ordinary backoff delay (a resync-and-retry is deliberately
+/// not itself a backoff escalation) — see `MAX_CONSECUTIVE_STALE_RESYNCS`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BackoffState {
     attempt: u32,
+    stale_streak: u32,
 }
 
 impl BackoffState {
     pub fn new() -> Self {
-        Self { attempt: 0 }
+        Self {
+            attempt: 0,
+            stale_streak: 0,
+        }
     }
 
     /// Reset backoff after a successful auth — the next failure starts from
     /// the base delay again rather than continuing to escalate.
     pub fn reset(&mut self) {
         self.attempt = 0;
+        self.stale_streak = 0;
     }
 
     /// Decide what to do given the outcome of the most recent attempt.
@@ -85,10 +102,20 @@ impl BackoffState {
                 ReconnectAction::Serve
             }
             AttemptOutcome::Closed(CLOSE_SUPERSEDED) => ReconnectAction::Stop,
-            AttemptOutcome::Closed(CLOSE_STALE_SEQUENCE) => ReconnectAction::ResyncAndRetry {
-                jump: SEQUENCE_RESYNC_JUMP,
-            },
+            AttemptOutcome::Closed(CLOSE_STALE_SEQUENCE) => {
+                self.stale_streak = self.stale_streak.saturating_add(1);
+                if self.stale_streak > MAX_CONSECUTIVE_STALE_RESYNCS {
+                    let delay = self.backoff_delay(jitter);
+                    self.attempt = self.attempt.saturating_add(1);
+                    ReconnectAction::Backoff { delay }
+                } else {
+                    ReconnectAction::ResyncAndRetry {
+                        jump: SEQUENCE_RESYNC_JUMP,
+                    }
+                }
+            }
             AttemptOutcome::Closed(_) | AttemptOutcome::TransportError => {
+                self.stale_streak = 0;
                 let delay = self.backoff_delay(jitter);
                 self.attempt = self.attempt.saturating_add(1);
                 ReconnectAction::Backoff { delay }
@@ -183,6 +210,59 @@ mod tests {
         }
         // Eventually reaches the cap.
         assert!(delays.last().unwrap().as_secs_f64() >= BACKOFF_CAP.as_secs_f64() * 0.5);
+    }
+
+    #[test]
+    fn stale_sequence_resyncs_without_backoff_up_to_the_cap() {
+        let mut state = BackoffState::new();
+        for n in 1..=MAX_CONSECUTIVE_STALE_RESYNCS {
+            let action = state.next_action(AttemptOutcome::Closed(CLOSE_STALE_SEQUENCE), 0.0);
+            assert_eq!(
+                action,
+                ReconnectAction::ResyncAndRetry {
+                    jump: SEQUENCE_RESYNC_JUMP
+                },
+                "expected resync (not backoff) on consecutive stale-sequence #{n}"
+            );
+            // Still not counted as a backoff escalation while under the cap.
+            assert_eq!(state.attempt, 0);
+        }
+    }
+
+    #[test]
+    fn stale_sequence_escalates_to_backoff_after_the_cap() {
+        let mut state = BackoffState::new();
+        for _ in 0..MAX_CONSECUTIVE_STALE_RESYNCS {
+            state.next_action(AttemptOutcome::Closed(CLOSE_STALE_SEQUENCE), 0.0);
+        }
+        // One more consecutive stale-sequence close beyond the cap must stop
+        // the tight resync-and-retry loop and fall back to backoff.
+        let action = state.next_action(AttemptOutcome::Closed(CLOSE_STALE_SEQUENCE), 0.0);
+        match action {
+            ReconnectAction::Backoff { delay } => {
+                assert!(delay >= BACKOFF_BASE.mul_f64(0.5));
+            }
+            other => panic!("expected Backoff after exceeding the stale-resync cap, got {other:?}"),
+        }
+        assert_eq!(state.attempt, 1);
+    }
+
+    #[test]
+    fn ack_between_stale_sequences_resets_the_stale_streak() {
+        let mut state = BackoffState::new();
+        for _ in 0..MAX_CONSECUTIVE_STALE_RESYNCS {
+            state.next_action(AttemptOutcome::Closed(CLOSE_STALE_SEQUENCE), 0.0);
+        }
+        // A successful ack in between must reset the streak so a fresh run
+        // of stale-sequence closes gets the full resync allowance again.
+        state.next_action(AttemptOutcome::Ack, 0.0);
+        let action = state.next_action(AttemptOutcome::Closed(CLOSE_STALE_SEQUENCE), 0.0);
+        assert_eq!(
+            action,
+            ReconnectAction::ResyncAndRetry {
+                jump: SEQUENCE_RESYNC_JUMP
+            }
+        );
     }
 
     #[test]
