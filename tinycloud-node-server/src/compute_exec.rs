@@ -202,7 +202,11 @@ struct HostState {
 impl HostState {
     fn next_nonce(&mut self) -> String {
         self.nonce_seq += 1;
-        format!("urn:uuid:compute-internal-{}-{}", self.routine_vm_fragment(), self.nonce_seq)
+        format!(
+            "urn:uuid:compute-internal-{}-{}",
+            self.routine_vm_fragment(),
+            self.nonce_seq
+        )
     }
 
     fn routine_vm_fragment(&self) -> String {
@@ -309,7 +313,10 @@ impl HostState {
             attenuation: caps,
         };
         let encoded = payload
-            .sign(self.routine_jwk.get_algorithm().unwrap_or_default(), &self.routine_jwk)
+            .sign(
+                self.routine_jwk.get_algorithm().unwrap_or_default(),
+                &self.routine_jwk,
+            )
             .map_err(|e| format!("sign internal invocation: {e:?}"))?
             .encode()
             .map_err(|e| format!("encode internal invocation: {e:?}"))?;
@@ -342,8 +349,14 @@ impl HostState {
         };
 
         let bytes_out = response.len() as u64;
-        self.manifest
-            .record(resource_str, ability, bytes_in, bytes_out, destination, granted);
+        self.manifest.record(
+            resource_str,
+            ability,
+            bytes_in,
+            bytes_out,
+            destination,
+            granted,
+        );
         response
     }
 
@@ -426,34 +439,49 @@ impl HostState {
         let key_path = key.clone();
         let handle = self.handle.clone();
 
-        let result: Result<Vec<InvocationOutcome<<BlockStores as tinycloud_core::storage::ImmutableReadStore>::Readable>>, String> =
-            handle.block_on(async move {
-                use tinycloud_core::storage::ImmutableStaging;
-                let mut inputs = std::collections::HashMap::new();
-                if let Some(bytes) = value_bytes {
-                    let mut stage = staging
-                        .stage(&space)
-                        .await
-                        .map_err(|e| format!("stage: {e}"))?;
-                    use futures::io::AsyncWriteExt;
-                    stage.write_all(&bytes).await.map_err(|e| format!("stage write: {e}"))?;
-                    stage.flush().await.map_err(|e| format!("stage flush: {e}"))?;
-                    let path: AuthPath = key_path.parse().map_err(|e| format!("{e:?}"))?;
-                    inputs.insert(
-                        (space.clone(), path),
-                        (tinycloud_core::types::Metadata(std::collections::BTreeMap::new()), stage),
-                    );
-                }
-                tinycloud
-                    .invoke_with_options::<BlockStage>(
-                        invocation,
-                        inputs,
-                        tinycloud_core::db::KvInvokeOptions::default(),
-                    )
+        let result: Result<
+            Vec<
+                InvocationOutcome<
+                    <BlockStores as tinycloud_core::storage::ImmutableReadStore>::Readable,
+                >,
+            >,
+            String,
+        > = handle.block_on(async move {
+            use tinycloud_core::storage::ImmutableStaging;
+            let mut inputs = std::collections::HashMap::new();
+            if let Some(bytes) = value_bytes {
+                let mut stage = staging
+                    .stage(&space)
                     .await
-                    .map(|(_tx, outcomes)| outcomes)
-                    .map_err(|e| format!("{e}"))
-            });
+                    .map_err(|e| format!("stage: {e}"))?;
+                use futures::io::AsyncWriteExt;
+                stage
+                    .write_all(&bytes)
+                    .await
+                    .map_err(|e| format!("stage write: {e}"))?;
+                stage
+                    .flush()
+                    .await
+                    .map_err(|e| format!("stage flush: {e}"))?;
+                let path: AuthPath = key_path.parse().map_err(|e| format!("{e:?}"))?;
+                inputs.insert(
+                    (space.clone(), path),
+                    (
+                        tinycloud_core::types::Metadata(std::collections::BTreeMap::new()),
+                        stage,
+                    ),
+                );
+            }
+            tinycloud
+                .invoke_with_options::<BlockStage>(
+                    invocation,
+                    inputs,
+                    tinycloud_core::db::KvInvokeOptions::default(),
+                )
+                .await
+                .map(|(_tx, outcomes)| outcomes)
+                .map_err(|e| format!("{e}"))
+        });
 
         match result {
             Ok(outcomes) => {
@@ -482,7 +510,11 @@ impl HostState {
         &mut self,
         import: Import,
         _key: &str,
-        outcomes: Vec<InvocationOutcome<<BlockStores as tinycloud_core::storage::ImmutableReadStore>::Readable>>,
+        outcomes: Vec<
+            InvocationOutcome<
+                <BlockStores as tinycloud_core::storage::ImmutableReadStore>::Readable,
+            >,
+        >,
         handle: &tokio::runtime::Handle,
     ) -> Vec<u8> {
         match import {
@@ -504,7 +536,9 @@ impl HostState {
                         let value = String::from_utf8_lossy(&bytes).to_string();
                         serde_json::to_vec(&json!({ "ok": true, "value": value })).unwrap()
                     }
-                    None => serde_json::to_vec(&json!({ "ok": true, "value": Value::Null })).unwrap(),
+                    None => {
+                        serde_json::to_vec(&json!({ "ok": true, "value": Value::Null })).unwrap()
+                    }
                 }
             }
             Import::StoragePut | Import::StorageDel => {
@@ -525,11 +559,21 @@ impl HostState {
                     "ok": false, "error": { "code": "bad-request", "message": e.to_string() }
                 }))
                 .unwrap();
-                return (String::new(), "tinycloud.sql/read".to_string(), String::new(), false, resp);
+                return (
+                    String::new(),
+                    "tinycloud.sql/read".to_string(),
+                    String::new(),
+                    false,
+                    resp,
+                );
             }
         };
         let write = sql_request_is_write(&sql_request);
-        let required_ability = if write { "tinycloud.sql/write" } else { "tinycloud.sql/read" };
+        let required_ability = if write {
+            "tinycloud.sql/write"
+        } else {
+            "tinycloud.sql/read"
+        };
 
         // The routine operates on the db named by its SQL grant's resource
         // path. Find a grant of the needed tier in this space.
@@ -555,10 +599,19 @@ impl HostState {
                     .map(|r| r.to_string())
                     .unwrap_or_else(|| format!("{}/sql", self.space));
                 let resp = denial_envelope(required_ability, &resource_str);
-                return (resource_str, required_ability.to_string(), String::new(), false, resp);
+                return (
+                    resource_str,
+                    required_ability.to_string(),
+                    String::new(),
+                    false,
+                    resp,
+                );
             }
         };
-        let grant_res = grant.resource.tinycloud_resource().expect("sql grant is tinycloud");
+        let grant_res = grant
+            .resource
+            .tinycloud_resource()
+            .expect("sql grant is tinycloud");
         let db_name = SqlService::db_name_from_path(grant_res.path().map(|p| p.as_str()));
         let target = grant_res.clone();
         let resource_str = target.to_string();
@@ -569,19 +622,37 @@ impl HostState {
             Ok(i) => i,
             Err(e) => {
                 self.fatal = Some(format!("mint internal SQL invocation: {e}"));
-                let resp = serde_json::to_vec(&json!({ "ok": false, "error": { "code": "internal" } })).unwrap();
-                return (resource_str, required_ability.to_string(), String::new(), false, resp);
+                let resp =
+                    serde_json::to_vec(&json!({ "ok": false, "error": { "code": "internal" } }))
+                        .unwrap();
+                return (
+                    resource_str,
+                    required_ability.to_string(),
+                    String::new(),
+                    false,
+                    resp,
+                );
             }
         };
         let tinycloud = self.tinycloud.clone();
-        let auth = self
-            .handle
-            .clone()
-            .block_on(async move { tinycloud.invoke::<BlockStage>(invocation, std::collections::HashMap::new()).await.map(|_| ()).map_err(|e| e.to_string()) });
+        let auth = self.handle.clone().block_on(async move {
+            tinycloud
+                .invoke::<BlockStage>(invocation, std::collections::HashMap::new())
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
         if let Err(e) = auth {
             self.fatal = Some(format!("authorize internal SQL invocation: {e}"));
-            let resp = serde_json::to_vec(&json!({ "ok": false, "error": { "code": "internal" } })).unwrap();
-            return (resource_str, required_ability.to_string(), String::new(), false, resp);
+            let resp = serde_json::to_vec(&json!({ "ok": false, "error": { "code": "internal" } }))
+                .unwrap();
+            return (
+                resource_str,
+                required_ability.to_string(),
+                String::new(),
+                false,
+                resp,
+            );
         }
 
         // (2) Execute via SqlService — statement-level authorizer applies.
@@ -596,7 +667,13 @@ impl HostState {
         match exec {
             Ok(result) => {
                 let json = serde_json::to_vec(&sql_response_shape(&result.response)).unwrap();
-                (resource_str, required_ability.to_string(), "inline".to_string(), true, json)
+                (
+                    resource_str,
+                    required_ability.to_string(),
+                    "inline".to_string(),
+                    true,
+                    json,
+                )
             }
             Err(e) => {
                 // A statement-level authorizer rejection (or any SQL error)
@@ -607,7 +684,13 @@ impl HostState {
                     "error": { "code": "sql-denied", "message": e.to_string() }
                 }))
                 .unwrap();
-                (resource_str, required_ability.to_string(), String::new(), false, resp)
+                (
+                    resource_str,
+                    required_ability.to_string(),
+                    String::new(),
+                    false,
+                    resp,
+                )
             }
         }
     }
@@ -675,9 +758,10 @@ fn validate_input_schema(schema: &Value, input: &Value) -> Result<(), String> {
             }
         }
     }
-    if let (Some(props), Some(input_obj)) =
-        (obj.get("properties").and_then(|v| v.as_object()), input.as_object())
-    {
+    if let (Some(props), Some(input_obj)) = (
+        obj.get("properties").and_then(|v| v.as_object()),
+        input.as_object(),
+    ) {
         for (key, subschema) in props {
             if let Some(value) = input_obj.get(key) {
                 validate_input_schema(subschema, value)?;
@@ -696,7 +780,9 @@ pub fn resolve_limits(
     max_fuel: u64,
 ) -> Result<EnforcedLimits, ComputeExecError> {
     let ceiling_ms = config.max_duration_ceiling_ms;
-    let duration_ms = caveats.max_duration.unwrap_or(config.default_max_duration_ms);
+    let duration_ms = caveats
+        .max_duration
+        .unwrap_or(config.default_max_duration_ms);
     if duration_ms > ceiling_ms {
         return Err(ComputeExecError::CaveatCeiling(format!(
             "maxDuration {duration_ms}ms exceeds ceiling {ceiling_ms}ms"
@@ -704,7 +790,9 @@ pub fn resolve_limits(
     }
 
     let mem_ceiling = config.max_memory_ceiling.as_u64();
-    let mem_bytes = caveats.max_memory.unwrap_or_else(|| config.default_max_memory.as_u64());
+    let mem_bytes = caveats
+        .max_memory
+        .unwrap_or_else(|| config.default_max_memory.as_u64());
     if mem_bytes > mem_ceiling {
         return Err(ComputeExecError::CaveatCeiling(format!(
             "maxMemory {mem_bytes} exceeds ceiling {mem_ceiling}"
@@ -794,8 +882,8 @@ fn run_blocking(
     // Determinism: no SIMD/threads surface, no floats-in/out mattering for
     // the fixture; keep the default cranelift settings (the plan uses
     // fuel — not wall clock — as the determinism-relevant budget).
-    let engine = Engine::new(&config)
-        .map_err(|e| ComputeExecError::Backend(format!("engine: {e}")))?;
+    let engine =
+        Engine::new(&config).map_err(|e| ComputeExecError::Backend(format!("engine: {e}")))?;
 
     // Instantiation: a forbidden import (outside the four "tinycloud"
     // functions) fails to link HERE — deterministic, distinct from the A.4
@@ -806,7 +894,10 @@ fn run_blocking(
     let routine_vm = format!(
         "{}#{}",
         plan.routine_did,
-        plan.routine_did.rsplit_once(':').map(|(_, f)| f).unwrap_or_default()
+        plan.routine_did
+            .rsplit_once(':')
+            .map(|(_, f)| f)
+            .unwrap_or_default()
     );
 
     let limits = StoreLimitsBuilder::new()
@@ -970,7 +1061,12 @@ fn register_import(
 /// response, write it, and return `(ptr, len)`. NEVER traps on a mediated
 /// denial or an internal error (those surface via the envelope + `fatal`),
 /// so wasmtime does not unwind through FFI.
-fn host_import(caller: &mut Caller<'_, HostState>, import: Import, ptr: i32, len: i32) -> (i32, i32) {
+fn host_import(
+    caller: &mut Caller<'_, HostState>,
+    import: Import,
+    ptr: i32,
+    len: i32,
+) -> (i32, i32) {
     let memory = match caller.get_export("memory") {
         Some(Extern::Memory(m)) => m,
         _ => {
@@ -1007,8 +1103,12 @@ fn host_import(caller: &mut Caller<'_, HostState>, import: Import, ptr: i32, len
             return (0, 0);
         }
     };
-    if memory.write(&mut *caller, out_ptr as usize, &response).is_err() {
-        caller.data_mut().fatal = Some("host could not write response into guest memory".to_string());
+    if memory
+        .write(&mut *caller, out_ptr as usize, &response)
+        .is_err()
+    {
+        caller.data_mut().fatal =
+            Some("host could not write response into guest memory".to_string());
         return (0, 0);
     }
     (out_ptr, response.len() as i32)
@@ -1051,9 +1151,10 @@ mod tests {
             serde_json::from_value(json!({ "action": "query", "sql": "SELECT 1", "params": [] }))
                 .unwrap();
         assert!(!sql_request_is_write(&q));
-        let e: SqlRequest =
-            serde_json::from_value(json!({ "action": "execute", "sql": "CREATE TABLE t(a)", "params": [] }))
-                .unwrap();
+        let e: SqlRequest = serde_json::from_value(
+            json!({ "action": "execute", "sql": "CREATE TABLE t(a)", "params": [] }),
+        )
+        .unwrap();
         assert!(sql_request_is_write(&e));
     }
 }

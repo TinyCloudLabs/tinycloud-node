@@ -67,35 +67,71 @@ async fn each_import_allowed_with_grant_denied_without() -> Result<()> {
     seed_kv(&client, &owner, "in/x", b"42", "urn:uuid:seed-in").await?;
     seed_kv(&client, &owner, "out/y", b"84", "urn:uuid:seed-out").await?;
 
-    let get = GrantSpec { service: "kv", path: "in/", ability: "tinycloud.kv/get" };
-    let put = GrantSpec { service: "kv", path: "out/", ability: "tinycloud.kv/put" };
-    let del = GrantSpec { service: "kv", path: "out/", ability: "tinycloud.kv/del" };
-    let sql_r = GrantSpec { service: "sql", path: "db", ability: "tinycloud.sql/read" };
+    let get = GrantSpec {
+        service: "kv",
+        path: "in/",
+        ability: "tinycloud.kv/get",
+    };
+    let put = GrantSpec {
+        service: "kv",
+        path: "out/",
+        ability: "tinycloud.kv/put",
+    };
+    let del = GrantSpec {
+        service: "kv",
+        path: "out/",
+        ability: "tinycloud.kv/del",
+    };
+    let sql_r = GrantSpec {
+        service: "sql",
+        path: "db",
+        ability: "tinycloud.sql/read",
+    };
     // An unrelated grant so the "denied" deploys still have a non-empty,
     // bound D_fn -- the denial is a MISSING ability, not a missing D_fn.
-    let filler = GrantSpec { service: "kv", path: "misc/", ability: "tinycloud.kv/get" };
+    let filler = GrantSpec {
+        service: "kv",
+        path: "misc/",
+        ability: "tinycloud.kv/get",
+    };
 
     let (s, granted) = probe(&client, &owner, "g-yes", "probe_get.wat", &[get], "g-yes").await?;
     assert_eq!(s, Status::Ok);
     assert_eq!(only_call(&granted)["granted"], true, "get granted");
     let (s, denied) = probe(&client, &owner, "g-no", "probe_get.wat", &[filler], "g-no").await?;
     assert_eq!(s, Status::Ok, "a denied host call does NOT fail the run");
-    assert_eq!(only_call(&denied)["granted"], false, "get denied without grant");
+    assert_eq!(
+        only_call(&denied)["granted"],
+        false,
+        "get denied without grant"
+    );
 
     let (_s, granted) = probe(&client, &owner, "p-yes", "probe_put.wat", &[put], "p-yes").await?;
     assert_eq!(only_call(&granted)["granted"], true, "put granted");
     let (_s, denied) = probe(&client, &owner, "p-no", "probe_put.wat", &[filler], "p-no").await?;
-    assert_eq!(only_call(&denied)["granted"], false, "put denied without grant");
+    assert_eq!(
+        only_call(&denied)["granted"],
+        false,
+        "put denied without grant"
+    );
 
     let (_s, granted) = probe(&client, &owner, "d-yes", "probe_del.wat", &[del], "d-yes").await?;
     assert_eq!(only_call(&granted)["granted"], true, "del granted");
     let (_s, denied) = probe(&client, &owner, "d-no", "probe_del.wat", &[filler], "d-no").await?;
-    assert_eq!(only_call(&denied)["granted"], false, "del denied without grant");
+    assert_eq!(
+        only_call(&denied)["granted"],
+        false,
+        "del denied without grant"
+    );
 
     let (_s, granted) = probe(&client, &owner, "s-yes", "probe_sql.wat", &[sql_r], "s-yes").await?;
     assert_eq!(only_call(&granted)["granted"], true, "sql granted");
     let (_s, denied) = probe(&client, &owner, "s-no", "probe_sql.wat", &[filler], "s-no").await?;
-    assert_eq!(only_call(&denied)["granted"], false, "sql denied without grant");
+    assert_eq!(
+        only_call(&denied)["granted"],
+        false,
+        "sql denied without grant"
+    );
 
     Ok(())
 }
@@ -112,9 +148,20 @@ async fn sql_statement_authorizer_rejects_attach_even_with_write_grant() -> Resu
     ensure_space_storage(&tempdir, &owner.space)?;
     let client = Client::tracked(rocket).await?;
 
-    let sql_w = GrantSpec { service: "sql", path: "db", ability: "tinycloud.sql/write" };
-    let (status, ack) =
-        probe(&client, &owner, "attack", "probe_sql_attach.wat", &[sql_w], "attach").await?;
+    let sql_w = GrantSpec {
+        service: "sql",
+        path: "db",
+        ability: "tinycloud.sql/write",
+    };
+    let (status, ack) = probe(
+        &client,
+        &owner,
+        "attack",
+        "probe_sql_attach.wat",
+        &[sql_w],
+        "attach",
+    )
+    .await?;
     assert_eq!(status, Status::Ok, "the run itself does not fail: {ack}");
     assert_eq!(
         only_call(&ack)["granted"],
@@ -145,17 +192,29 @@ async fn cite_all_second_d_fn_supplies_missing_ability() -> Result<()> {
         &owner,
         "citeput",
         &wasm,
-        &[GrantSpec { service: "kv", path: "misc/", ability: "tinycloud.kv/get" }],
+        &[GrantSpec {
+            service: "kv",
+            path: "misc/",
+            ability: "tinycloud.kv/get",
+        }],
         "citeall",
     )
     .await?;
     let rdid = ack["routine_did"].as_str().unwrap().to_string();
     assert_eq!(ack["content_cid"], cid);
 
-    let auth =
-        owner_compute_invocation(&owner, "citeput", "tinycloud.compute/execute", "urn:uuid:c1")?;
-    let (_s, before) =
-        post_invoke(&client, &auth, execute_body("citeput", serde_json::json!({}))).await;
+    let auth = owner_compute_invocation(
+        &owner,
+        "citeput",
+        "tinycloud.compute/execute",
+        "urn:uuid:c1",
+    )?;
+    let (_s, before) = post_invoke(
+        &client,
+        &auth,
+        execute_body("citeput", serde_json::json!({})),
+    )
+    .await;
     let before: serde_json::Value = serde_json::from_str(&before)?;
     assert_eq!(
         before["manifest"]["calls"][0]["granted"], false,
@@ -166,15 +225,27 @@ async fn cite_all_second_d_fn_supplies_missing_ability() -> Result<()> {
         &owner,
         &rdid,
         &cid,
-        &[GrantSpec { service: "kv", path: "out/", ability: "tinycloud.kv/put" }],
+        &[GrantSpec {
+            service: "kv",
+            path: "out/",
+            ability: "tinycloud.kv/put",
+        }],
         "urn:uuid:dfn2",
     )?;
     submit_delegation(&client, &second).await?;
 
-    let auth2 =
-        owner_compute_invocation(&owner, "citeput", "tinycloud.compute/execute", "urn:uuid:c2")?;
-    let (_s, after) =
-        post_invoke(&client, &auth2, execute_body("citeput", serde_json::json!({}))).await;
+    let auth2 = owner_compute_invocation(
+        &owner,
+        "citeput",
+        "tinycloud.compute/execute",
+        "urn:uuid:c2",
+    )?;
+    let (_s, after) = post_invoke(
+        &client,
+        &auth2,
+        execute_body("citeput", serde_json::json!({})),
+    )
+    .await;
     let after: serde_json::Value = serde_json::from_str(&after)?;
     assert_eq!(
         after["manifest"]["calls"][0]["granted"], true,
@@ -192,7 +263,7 @@ async fn functions_allowlist_enforced_from_chain() -> Result<()> {
     let (rocket, conn, tempdir) = boot().await?;
     let owner = make_owner("allowlist")?;
     let holder = make_holder()?;
-    seed_space_and_actors(&conn, &owner.space, &[holder.did.clone()]).await?;
+    seed_space_and_actors(&conn, &owner.space, std::slice::from_ref(&holder.did)).await?;
     ensure_space_storage(&tempdir, &owner.space)?;
     let client = Client::tracked(rocket).await?;
     seed_kv(&client, &owner, "in/x", b"42", "urn:uuid:seed-in").await?;
@@ -202,7 +273,11 @@ async fn functions_allowlist_enforced_from_chain() -> Result<()> {
         &owner,
         "allowed",
         &load_fixture("probe_get.wat"),
-        &[GrantSpec { service: "kv", path: "in/", ability: "tinycloud.kv/get" }],
+        &[GrantSpec {
+            service: "kv",
+            path: "in/",
+            ability: "tinycloud.kv/get",
+        }],
         "allow",
     )
     .await?;
@@ -227,10 +302,21 @@ async fn functions_allowlist_enforced_from_chain() -> Result<()> {
         Some(cid),
         "urn:uuid:al-exec",
     )?;
-    let (status, body) =
-        post_invoke(&client, &inv, execute_body("allowed", serde_json::json!({}))).await;
-    assert_eq!(status, Status::Forbidden, "function not in allowlist must 403: {body}");
-    assert!(body.contains("allowlist"), "error names the allowlist: {body}");
+    let (status, body) = post_invoke(
+        &client,
+        &inv,
+        execute_body("allowed", serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        Status::Forbidden,
+        "function not in allowlist must 403: {body}"
+    );
+    assert!(
+        body.contains("allowlist"),
+        "error names the allowlist: {body}"
+    );
 
     let ok_caveat = serde_json::json!({ "functions": ["allowed"] });
     let (deleg2, cid2) = delegate_compute_execute(
@@ -251,9 +337,17 @@ async fn functions_allowlist_enforced_from_chain() -> Result<()> {
         Some(cid2),
         "urn:uuid:al-exec2",
     )?;
-    let (status2, body2) =
-        post_invoke(&client, &inv2, execute_body("allowed", serde_json::json!({}))).await;
-    assert_eq!(status2, Status::Ok, "allowlisted function must run: {body2}");
+    let (status2, body2) = post_invoke(
+        &client,
+        &inv2,
+        execute_body("allowed", serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(
+        status2,
+        Status::Ok,
+        "allowlisted function must run: {body2}"
+    );
     Ok(())
 }
 
@@ -266,7 +360,7 @@ async fn invoker_side_echo_required() -> Result<()> {
     let (rocket, conn, tempdir) = boot().await?;
     let owner = make_owner("invoker-echo")?;
     let holder = make_holder()?;
-    seed_space_and_actors(&conn, &owner.space, &[holder.did.clone()]).await?;
+    seed_space_and_actors(&conn, &owner.space, std::slice::from_ref(&holder.did)).await?;
     ensure_space_storage(&tempdir, &owner.space)?;
     let client = Client::tracked(rocket).await?;
     seed_kv(&client, &owner, "in/x", b"42", "urn:uuid:seed-in").await?;
@@ -276,7 +370,11 @@ async fn invoker_side_echo_required() -> Result<()> {
         &owner,
         "echofn",
         &load_fixture("probe_get.wat"),
-        &[GrantSpec { service: "kv", path: "in/", ability: "tinycloud.kv/get" }],
+        &[GrantSpec {
+            service: "kv",
+            path: "in/",
+            ability: "tinycloud.kv/get",
+        }],
         "echo",
     )
     .await?;
@@ -303,9 +401,17 @@ async fn invoker_side_echo_required() -> Result<()> {
         Some(cid),
         "urn:uuid:ie-noecho",
     )?;
-    let (status, body) =
-        post_invoke(&client, &no_echo, execute_body("echofn", serde_json::json!({}))).await;
-    assert_ne!(status, Status::Ok, "omitting the echoed caveat must be rejected: {body}");
+    let (status, body) = post_invoke(
+        &client,
+        &no_echo,
+        execute_body("echofn", serde_json::json!({})),
+    )
+    .await;
+    assert_ne!(
+        status,
+        Status::Ok,
+        "omitting the echoed caveat must be rejected: {body}"
+    );
 
     let (deleg2, cid2) = delegate_compute_execute(
         &owner,
@@ -325,8 +431,12 @@ async fn invoker_side_echo_required() -> Result<()> {
         Some(cid2),
         "urn:uuid:ie-echo",
     )?;
-    let (status2, body2) =
-        post_invoke(&client, &echo, execute_body("echofn", serde_json::json!({}))).await;
+    let (status2, body2) = post_invoke(
+        &client,
+        &echo,
+        execute_body("echofn", serde_json::json!({})),
+    )
+    .await;
     assert_eq!(status2, Status::Ok, "echoed caveat must pass: {body2}");
     Ok(())
 }
@@ -352,7 +462,11 @@ async fn fuel_exhaustion_traps() -> Result<()> {
         &owner,
         "loop",
         &load_fixture("infinite_loop.wat"),
-        &[GrantSpec { service: "kv", path: "misc/", ability: "tinycloud.kv/get" }],
+        &[GrantSpec {
+            service: "kv",
+            path: "misc/",
+            ability: "tinycloud.kv/get",
+        }],
         "fuel",
     )
     .await?;
@@ -360,7 +474,11 @@ async fn fuel_exhaustion_traps() -> Result<()> {
         owner_compute_invocation(&owner, "loop", "tinycloud.compute/execute", "urn:uuid:fuel")?;
     let (status, body) =
         post_invoke(&client, &auth, execute_body("loop", serde_json::json!({}))).await;
-    assert_eq!(status, Status::UnprocessableEntity, "fuel exhaustion must 422: {body}");
+    assert_eq!(
+        status,
+        Status::UnprocessableEntity,
+        "fuel exhaustion must 422: {body}"
+    );
     assert!(body.contains("fuel"), "error names fuel: {body}");
     Ok(())
 }
@@ -379,7 +497,7 @@ async fn epoch_timeout_traps() -> Result<()> {
     .await?;
     let owner = make_owner("epoch")?;
     let holder = make_holder()?;
-    seed_space_and_actors(&conn, &owner.space, &[holder.did.clone()]).await?;
+    seed_space_and_actors(&conn, &owner.space, std::slice::from_ref(&holder.did)).await?;
     ensure_space_storage(&tempdir, &owner.space)?;
     let client = Client::tracked(rocket).await?;
 
@@ -388,14 +506,23 @@ async fn epoch_timeout_traps() -> Result<()> {
         &owner,
         "loop",
         &load_fixture("infinite_loop.wat"),
-        &[GrantSpec { service: "kv", path: "misc/", ability: "tinycloud.kv/get" }],
+        &[GrantSpec {
+            service: "kv",
+            path: "misc/",
+            ability: "tinycloud.kv/get",
+        }],
         "epoch",
     )
     .await?;
 
     let caveat = serde_json::json!({ "maxDuration": 1 });
-    let (deleg, cid) =
-        delegate_compute_execute(&owner, &holder.did, "loop", Some(caveat.clone()), "urn:uuid:ep1")?;
+    let (deleg, cid) = delegate_compute_execute(
+        &owner,
+        &holder.did,
+        "loop",
+        Some(caveat.clone()),
+        "urn:uuid:ep1",
+    )?;
     submit_delegation(&client, &deleg).await?;
     let inv = compute_execute_invocation(
         &holder.vm,
@@ -409,8 +536,15 @@ async fn epoch_timeout_traps() -> Result<()> {
     )?;
     let (status, body) =
         post_invoke(&client, &inv, execute_body("loop", serde_json::json!({}))).await;
-    assert_eq!(status, Status::UnprocessableEntity, "epoch timeout must 422: {body}");
-    assert!(body.contains("maxDuration"), "error names maxDuration: {body}");
+    assert_eq!(
+        status,
+        Status::UnprocessableEntity,
+        "epoch timeout must 422: {body}"
+    );
+    assert!(
+        body.contains("maxDuration"),
+        "error names maxDuration: {body}"
+    );
     Ok(())
 }
 
@@ -436,7 +570,11 @@ async fn memory_growth_capped_by_store_limits() -> Result<()> {
         &owner,
         "grow",
         &load_fixture("memory_grower.wat"),
-        &[GrantSpec { service: "kv", path: "misc/", ability: "tinycloud.kv/get" }],
+        &[GrantSpec {
+            service: "kv",
+            path: "misc/",
+            ability: "tinycloud.kv/get",
+        }],
         "mem",
     )
     .await?;
@@ -462,7 +600,7 @@ async fn input_schema_rejected_from_chain() -> Result<()> {
     let (rocket, conn, tempdir) = boot().await?;
     let owner = make_owner("inschema")?;
     let holder = make_holder()?;
-    seed_space_and_actors(&conn, &owner.space, &[holder.did.clone()]).await?;
+    seed_space_and_actors(&conn, &owner.space, std::slice::from_ref(&holder.did)).await?;
     ensure_space_storage(&tempdir, &owner.space)?;
     let client = Client::tracked(rocket).await?;
     seed_kv(&client, &owner, "in/x", b"42", "urn:uuid:seed-in").await?;
@@ -472,7 +610,11 @@ async fn input_schema_rejected_from_chain() -> Result<()> {
         &owner,
         "schemafn",
         &load_fixture("probe_get.wat"),
-        &[GrantSpec { service: "kv", path: "in/", ability: "tinycloud.kv/get" }],
+        &[GrantSpec {
+            service: "kv",
+            path: "in/",
+            ability: "tinycloud.kv/get",
+        }],
         "schema",
     )
     .await?;
@@ -501,7 +643,11 @@ async fn input_schema_rejected_from_chain() -> Result<()> {
         serde_json::json!({ "action": "execute", "function": "schemafn", "input": { "y": 1 } })
             .to_string();
     let (status, body) = post_invoke(&client, &inv, body_bad).await;
-    assert_eq!(status, Status::BadRequest, "missing required input must 400: {body}");
+    assert_eq!(
+        status,
+        Status::BadRequest,
+        "missing required input must 400: {body}"
+    );
     assert!(body.contains("schema"), "error names the schema: {body}");
 
     let (deleg2, cid2) = delegate_compute_execute(
@@ -543,7 +689,7 @@ async fn numeric_ceiling_rejected() -> Result<()> {
     .await?;
     let owner = make_owner("ceiling")?;
     let holder = make_holder()?;
-    seed_space_and_actors(&conn, &owner.space, &[holder.did.clone()]).await?;
+    seed_space_and_actors(&conn, &owner.space, std::slice::from_ref(&holder.did)).await?;
     ensure_space_storage(&tempdir, &owner.space)?;
     let client = Client::tracked(rocket).await?;
 
@@ -552,14 +698,23 @@ async fn numeric_ceiling_rejected() -> Result<()> {
         &owner,
         "noop",
         &load_fixture("noop.wat"),
-        &[GrantSpec { service: "kv", path: "misc/", ability: "tinycloud.kv/get" }],
+        &[GrantSpec {
+            service: "kv",
+            path: "misc/",
+            ability: "tinycloud.kv/get",
+        }],
         "ceil",
     )
     .await?;
 
     let caveat = serde_json::json!({ "maxDuration": 999_999 });
-    let (deleg, cid) =
-        delegate_compute_execute(&owner, &holder.did, "noop", Some(caveat.clone()), "urn:uuid:ce1")?;
+    let (deleg, cid) = delegate_compute_execute(
+        &owner,
+        &holder.did,
+        "noop",
+        Some(caveat.clone()),
+        "urn:uuid:ce1",
+    )?;
     submit_delegation(&client, &deleg).await?;
     let inv = compute_execute_invocation(
         &holder.vm,
@@ -573,7 +728,11 @@ async fn numeric_ceiling_rejected() -> Result<()> {
     )?;
     let (status, body) =
         post_invoke(&client, &inv, execute_body("noop", serde_json::json!({}))).await;
-    assert_eq!(status, Status::BadRequest, "over-ceiling caveat must 400: {body}");
+    assert_eq!(
+        status,
+        Status::BadRequest,
+        "over-ceiling caveat must 400: {body}"
+    );
     assert!(body.contains("ceiling"), "error names the ceiling: {body}");
     Ok(())
 }
@@ -605,7 +764,11 @@ async fn rotation_tripwire_distinct_error() -> Result<()> {
         &owner,
         "rot",
         &load_fixture("probe_get.wat"),
-        &[GrantSpec { service: "kv", path: "in/", ability: "tinycloud.kv/get" }],
+        &[GrantSpec {
+            service: "kv",
+            path: "in/",
+            ability: "tinycloud.kv/get",
+        }],
         "rot",
     )
     .await?;
@@ -620,8 +783,12 @@ async fn rotation_tripwire_distinct_error() -> Result<()> {
     )
     .await?;
     let client_b = Client::tracked(rocket_b).await?;
-    let auth =
-        owner_compute_invocation(&owner, "rot", "tinycloud.compute/execute", "urn:uuid:rot-exec")?;
+    let auth = owner_compute_invocation(
+        &owner,
+        "rot",
+        "tinycloud.compute/execute",
+        "urn:uuid:rot-exec",
+    )?;
     let (status, body) =
         post_invoke(&client_b, &auth, execute_body("rot", serde_json::json!({}))).await;
     assert_eq!(

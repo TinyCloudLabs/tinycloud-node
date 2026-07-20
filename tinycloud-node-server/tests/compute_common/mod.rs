@@ -269,12 +269,7 @@ pub fn owner_compute_invocation(
 }
 
 /// Sign a KV invocation (used to seed values as the owner).
-pub fn owner_kv_invocation(
-    owner: &Owner,
-    key: &str,
-    ability: &str,
-    nonce: &str,
-) -> Result<String> {
+pub fn owner_kv_invocation(owner: &Owner, key: &str, ability: &str, nonce: &str) -> Result<String> {
     let resource: ResourceId = owner.space.clone().to_resource(
         "kv".parse::<Service>()?,
         Some(key.parse::<AuthPath>()?),
@@ -486,7 +481,13 @@ pub fn compute_execute_invocation(
         None => Vec::new(),
     };
     sign_invocation(
-        signer_vm, signer_did, signer_jwk, resource, "tinycloud.compute/execute", nota_bene, parent,
+        signer_vm,
+        signer_did,
+        signer_jwk,
+        resource,
+        "tinycloud.compute/execute",
+        nota_bene,
+        parent,
         nonce,
     )
 }
@@ -588,9 +589,8 @@ pub async fn submit_delegation(client: &Client, encoded: &str) -> Result<()> {
 /// use as an invocation `proof`.
 pub fn delegation_cid(encoded: &str) -> Result<tinycloud_auth::authorization::Cid> {
     use tinycloud_core::events::Delegation;
-    let del = Delegation::from_header_ser::<tinycloud_auth::authorization::TinyCloudDelegation>(
-        encoded,
-    )
-    .map_err(|e| anyhow::anyhow!("decode delegation: {e:?}"))?;
+    let del =
+        Delegation::from_header_ser::<tinycloud_auth::authorization::TinyCloudDelegation>(encoded)
+            .map_err(|e| anyhow::anyhow!("decode delegation: {e:?}"))?;
     Ok(del.content_hash().to_cid(0x55))
 }

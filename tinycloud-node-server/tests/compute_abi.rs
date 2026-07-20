@@ -42,7 +42,12 @@ async fn deploy_and_seed(client: &Client, owner: &Owner) -> Result<()> {
 async fn run_execute(client: &Client, owner: &Owner, nonce: &str) -> (Status, String) {
     let auth = owner_compute_invocation(owner, "fixture", "tinycloud.compute/execute", nonce)
         .expect("sign execute");
-    post_invoke(client, &auth, execute_body("fixture", serde_json::json!({}))).await
+    post_invoke(
+        client,
+        &auth,
+        execute_body("fixture", serde_json::json!({})),
+    )
+    .await
 }
 
 #[tokio::test]
@@ -175,8 +180,12 @@ async fn appendix_a_conformance_fixture_end_to_end() -> Result<()> {
     // --- A.4: the denial did NOT perform the op. out/y was written (step 2)
     // then deleted (step 4); secret/z must NEVER exist. Read it back as the
     // owner and assert absent. ---
-    let read_auth =
-        owner_kv_invocation(&owner, "secret/z", "tinycloud.kv/get", "urn:uuid:read-secret")?;
+    let read_auth = owner_kv_invocation(
+        &owner,
+        "secret/z",
+        "tinycloud.kv/get",
+        "urn:uuid:read-secret",
+    )?;
     let (read_status, _read_body) = post_invoke(&client, &read_auth, String::new()).await;
     assert_eq!(
         read_status,
@@ -188,7 +197,10 @@ async fn appendix_a_conformance_fixture_end_to_end() -> Result<()> {
     let (status2, body2) = run_execute(&client, &owner, "urn:uuid:exec-abi-2").await;
     assert_eq!(status2, Status::Ok, "second execute must 200: {body2}");
     let ack2: serde_json::Value = serde_json::from_str(&body2)?;
-    assert_eq!(ack2["result"], ack["result"], "result must be deterministic");
+    assert_eq!(
+        ack2["result"], ack["result"],
+        "result must be deterministic"
+    );
     assert_eq!(
         ack2["manifest"], ack["manifest"],
         "manifest must be byte-identical across runs (fuel-metered, no wall-clock field)"
@@ -224,8 +236,12 @@ async fn forbidden_import_fails_at_instantiation() -> Result<()> {
         "tinycloud.compute/execute",
         "urn:uuid:exec-forbidden",
     )?;
-    let (status, body) = post_invoke(&client, &auth, execute_body("forbidden", serde_json::json!({})))
-        .await;
+    let (status, body) = post_invoke(
+        &client,
+        &auth,
+        execute_body("forbidden", serde_json::json!({})),
+    )
+    .await;
     assert_ne!(status, Status::Ok, "a forbidden import must not execute");
     assert!(
         body.contains("outside the tinycloud host surface") || body.contains("import"),

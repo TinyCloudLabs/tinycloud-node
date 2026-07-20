@@ -2422,20 +2422,19 @@ async fn handle_compute_invoke(
     // enforced `ComputeCaveats` (compute-service.md §6.3: caveat source is
     // the validated chain, NOT invoker facts).
     let parent_cids: Vec<_> = i.0 .0.parents.to_vec();
-    let facts_caveats: Option<tinycloud_core::compute::ComputeCaveats> = i
-        .0
-         .0
-        .invocation
-        .payload()
-        .facts
-        .as_ref()
-        .and_then(|facts| {
-            facts.iter().find_map(|fact| {
-                fact.as_object()
-                    .and_then(|obj| obj.get("computeCaveats"))
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-            })
-        });
+    let facts_caveats: Option<tinycloud_core::compute::ComputeCaveats> =
+        i.0 .0
+            .invocation
+            .payload()
+            .facts
+            .as_ref()
+            .and_then(|facts| {
+                facts.iter().find_map(|fact| {
+                    fact.as_object()
+                        .and_then(|obj| obj.get("computeCaveats"))
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                })
+            });
 
     // Layer (a) invoker authorization (compute-service.md §6.1): the same
     // delegation-chain walk sql/duckdb use. Proves `compute_caps` are backed
@@ -2585,10 +2584,8 @@ async fn handle_compute_execute(
         // always mints a D_fn, so this is not reached in normal flows.)
     }
 
-    let parents: Vec<tinycloud_auth::authorization::Cid> = d_fns
-        .iter()
-        .map(|(hash, _)| hash.to_cid(0x55))
-        .collect();
+    let parents: Vec<tinycloud_auth::authorization::Cid> =
+        d_fns.iter().map(|(hash, _)| hash.to_cid(0x55)).collect();
     let grants: Vec<tinycloud_core::util::Capability> =
         d_fns.into_iter().flat_map(|(_, caps)| caps).collect();
 
@@ -2636,8 +2633,11 @@ async fn handle_compute_execute(
     // field on the result JSON alongside the guest `result`.
     let manifest_value = serde_json::to_value(&output.manifest)
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
-    let granted_but_unexercised: Vec<String> =
-        output.manifest.granted_but_unexercised().into_iter().collect();
+    let granted_but_unexercised: Vec<String> = output
+        .manifest
+        .granted_but_unexercised()
+        .into_iter()
+        .collect();
 
     // §9.1.1 optional persistence: also write the manifest to a KV audit
     // path under the routine grant (best-effort; the in-outcome manifest is

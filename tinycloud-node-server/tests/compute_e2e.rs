@@ -24,7 +24,7 @@ async fn least_privilege_invoker_executes_over_data_it_cannot_touch() -> Result<
     let (rocket, conn, tempdir) = boot().await?;
     let owner = make_owner("e2e")?;
     let invoker = make_holder()?;
-    seed_space_and_actors(&conn, &owner.space, &[invoker.did.clone()]).await?;
+    seed_space_and_actors(&conn, &owner.space, std::slice::from_ref(&invoker.did)).await?;
     ensure_space_storage(&tempdir, &owner.space)?;
     let client = Client::tracked(rocket).await?;
 
@@ -83,7 +83,11 @@ async fn least_privilege_invoker_executes_over_data_it_cannot_touch() -> Result<
     )?;
     let (status, body) =
         post_invoke(&client, &inv, execute_body("report", serde_json::json!({}))).await;
-    assert_eq!(status, Status::Ok, "least-privilege execute must succeed: {body}");
+    assert_eq!(
+        status,
+        Status::Ok,
+        "least-privilege execute must succeed: {body}"
+    );
     let ack: serde_json::Value = serde_json::from_str(&body)?;
 
     // Result matches the A.3 scenario.
@@ -110,7 +114,10 @@ async fn least_privilege_invoker_executes_over_data_it_cannot_touch() -> Result<
         "tinycloud.kv/del",
         "tinycloud.sql/read",
     ] {
-        assert!(exercised.contains(ability), "manifest must show {ability} exercised");
+        assert!(
+            exercised.contains(ability),
+            "manifest must show {ability} exercised"
+        );
     }
     // The denial: the fifth call (kv/put on secret/) is NOT granted.
     assert_eq!(
