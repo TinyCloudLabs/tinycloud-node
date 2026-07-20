@@ -361,7 +361,30 @@ pub fn node_tunnel_disable() -> Result<crate::tunnel::commands::TunnelStatusRepo
 pub fn node_tunnel_status() -> Result<crate::tunnel::commands::TunnelStatusReport> {
     let paths = installed_or_current_paths()?;
     let config = effective_config(&paths)?;
-    crate::tunnel::commands::status(&config.storage.datadir)
+    let mut report = crate::tunnel::commands::status(&config.storage.datadir)?;
+    // Mirror the `tunnelConnected` pid-gate in `service_status_for_installed`
+    // (see docs/specs/node-control-plane-v1.md §3.10): this standalone
+    // invocation reads the same on-disk marker a possibly-dead `serve`
+    // process last wrote, so an unclean exit must not be reported as
+    // connected just because the marker predates the crash.
+    if report.connected && !installed_service_process_is_alive()? {
+        report.connected = false;
+    }
+    Ok(report)
+}
+
+/// Whether the process manager reports a live process for the installed
+/// service, without probing the control API (that would require a network
+/// round trip this status check shouldn't depend on). Returns `false` if no
+/// service is installed at all.
+fn installed_service_process_is_alive() -> Result<bool> {
+    Ok(match discover_installed_service()? {
+        Some(installed) => matches!(
+            current_manager_state(&installed.paths, &installed.manifest),
+            ManagerState::Running { .. }
+        ),
+        None => false,
+    })
 }
 
 pub fn node_key_export_body() -> Result<String> {
@@ -673,6 +696,18 @@ pub fn service_status_for_installed(installed: DiscoveredService) -> ServiceStat
         (None, Some(_)) => Some(LinkListenerState::Stopped),
     };
 
+    // TC-252 follow-up: `tunnelConnected` must be gated on `pid.is_some()`
+    // the same way `link_listener` is above — the on-disk tunnel-runtime
+    // marker (`dataPath/link/tunnel-state.json`) is written by `serve`'s
+    // tunnel task and is never cleaned up on an unclean exit (crash, `kill
+    // -9`), so trusting it unconditionally reports `connected: true` forever
+    // after the process that wrote it is gone.
+    let tunnel_connected = match (pid, &link_from_disk) {
+        (_, None) => None,
+        (Some(_), Some(snapshot)) => Some(snapshot.tunnel_connected),
+        (None, Some(_)) => Some(false),
+    };
+
     ServiceStatus {
         contract_version,
         profile: manifest.profile,
@@ -700,7 +735,7 @@ pub fn service_status_for_installed(installed: DiscoveredService) -> ServiceStat
             .as_ref()
             .and_then(|s| s.listener_error.clone()),
         tunnel_enabled: link_from_disk.as_ref().map(|s| s.tunnel_enabled),
-        tunnel_connected: link_from_disk.as_ref().map(|s| s.tunnel_connected),
+        tunnel_connected,
         tunnel_remote_url: link_from_disk
             .as_ref()
             .and_then(|s| s.tunnel_remote_url.clone()),

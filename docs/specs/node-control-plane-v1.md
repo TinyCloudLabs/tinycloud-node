@@ -1186,12 +1186,25 @@ extra fields (v1-tunnel, all optional):
 
 `tunnelConnected` and `tunnelLastError` are sourced from an on-disk
 connection-state marker (`dataPath/link/tunnel-state.json`) the running
-`serve` tunnel task writes after each connect/auth/disconnect event, not
-inferred from whether the node process is up — the same pattern §3.9 uses
-for `linkListener`/`linkListenerError`. `tunnel status --json` run from a
-separate CLI invocation (not from inside `serve`) cannot observe the live
-socket and always reports `tunnelConnected: false` when the tunnel is
-enabled but not actually serving from that invocation's perspective.
+`serve` tunnel task writes after each connect/auth/disconnect event. Both
+`service status --json` and `tunnel status --json` gate `tunnelConnected` on
+process-manager liveness (pid presence) before trusting that marker — the
+same pattern §3.9 uses for `linkListener`. The marker is never cleaned up on
+an unclean exit (crash, `kill -9`, power loss), so trusting it
+unconditionally would report `connected: true` forever after the process
+that wrote it is gone; if the process manager reports no live process,
+`tunnelConnected` is forced to `false` regardless of the marker's contents.
+A disconnect the tunnel task itself observes (a clean drop, a superseding
+connection, `tunnel disable`) is reflected promptly because the task rewrites
+the marker itself at each of those events.
+
+The reconnect loop also treats `tunnel disable` as terminal, not
+retry-worthy: if `serve`'s tunnel task notices the flag flipped off (checked
+before dialing each new attempt, including reconnects), it stops
+reconnecting and removes the marker itself rather than resurrecting it on
+its next scheduled write. A socket already live at the moment `disable` runs
+is not torn down proactively — it keeps serving until its next reconnect or
+a `serve` restart, at which point the disabled check applies.
 
 ## 4. Platform Paths
 
