@@ -166,6 +166,35 @@ pub fn wat_to_wasm(wat: &str) -> Result<Vec<u8>> {
     Ok(wat::parse_str(wat)?)
 }
 
+/// Compile a `.wat` fixture with a unique data-segment `salt` injected, so
+/// the resulting WASM has a DISTINCT content CID (and therefore a distinct
+/// derived routine identity) from the same fixture with a different salt.
+/// Needed whenever two functions in one space must NOT share a routine
+/// identity -- e.g. a granting vs a non-granting deploy of the same guest
+/// (identical bytes share one CID -> one routine_did -> one pooled D_fn set,
+/// the same-bytes hazard, §5.1).
+pub fn wat_to_wasm_salted(wat: &str, salt: &str) -> Result<Vec<u8>> {
+    // Inject a unique, unused data segment right after the memory declaration.
+    let needle_2 = "(memory (export \"memory\") 2)";
+    let needle_1 = "(memory (export \"memory\") 1)";
+    let injected = if wat.contains(needle_2) {
+        wat.replacen(
+            needle_2,
+            &format!("{needle_2}\n  (data (i32.const 0x9000) \"salt-{salt}\")"),
+            1,
+        )
+    } else if wat.contains(needle_1) {
+        wat.replacen(
+            needle_1,
+            &format!("{needle_1}\n  (data (i32.const 0x9000) \"salt-{salt}\")"),
+            1,
+        )
+    } else {
+        anyhow::bail!("fixture has no recognized memory declaration to salt");
+    };
+    Ok(wat::parse_str(injected)?)
+}
+
 fn binding_notabene(content_cid: &str) -> BTreeMap<String, serde_json::Value> {
     let mut binding = BTreeMap::new();
     binding.insert(
@@ -355,4 +384,123 @@ pub fn execute_body(function: &str, input: serde_json::Value) -> String {
         "input": input,
     })
     .to_string()
+}
+
+/// A non-owner principal that holds a `compute/execute` delegation (used to
+/// test chain-derived `ComputeCaveats` §6.3 and the invoker-side echo).
+pub struct Holder {
+    pub jwk: JWK,
+    pub vm: String,
+    pub did: String,
+}
+
+pub fn make_holder() -> Result<Holder> {
+    let mut jwk = JWK::generate_ed25519()?;
+    jwk.algorithm = Some(Algorithm::EdDSA);
+    let did = DID_METHODS.generate(&jwk, "key")?.to_string();
+    let fragment = did.rsplit_once(':').context("did fragment")?.1.to_string();
+    let vm = format!("{did}#{fragment}");
+    Ok(Holder { jwk, vm, did })
+}
+
+/// Owner delegates `compute/execute` on `<space>/compute/<function>` to the
+/// holder, optionally attaching a `computeCaveats` caveat map (§6.3 -- the
+/// chain SSOT for the enforced allowlist/ceilings). Returns the encoded
+/// delegation header for POST /delegate.
+pub fn mint_execute_delegation(
+    owner: &Owner,
+    holder_did: &str,
+    function: &str,
+    compute_caveats: Option<&serde_json::Value>,
+    nonce: &str,
+) -> Result<String> {
+    let resource: ResourceId = owner.space.clone().to_resource(
+        "compute".parse::<Service>()?,
+        Some(function.parse::<AuthPath>()?),
+        None,
+        None,
+    );
+    let notabene = match compute_caveats {
+        Some(cv) => {
+            let mut m = BTreeMap::new();
+            m.insert("computeCaveats".to_string(), cv.clone());
+            m
+        }
+        None => BTreeMap::new(),
+    };
+    let mut caps = Capabilities::new();
+    caps.with_action(
+        resource.as_uri(),
+        "tinycloud.compute/execute".parse::<UcanAbility>()?,
+        [notabene],
+    );
+    let ucan = Payload {
+        issuer: owner.vm.parse::<DIDURLBuf>()?,
+        audience: holder_did.parse::<DIDBuf>()?,
+        not_before: None,
+        expiration: NumericDate::try_from_seconds(far_future())?,
+        nonce: Some(nonce.to_string()),
+        facts: Some(Vec::<serde_json::Value>::new()),
+        proof: Vec::new(),
+        attenuation: caps,
+    }
+    .sign(owner.jwk.get_algorithm().unwrap_or_default(), &owner.jwk)?;
+    Ok(ucan.encode()?)
+}
+
+/// The holder invokes `compute/execute`, citing `parent_cid` (the
+/// owner->holder delegation) as proof. Optionally echoes a `computeCaveats`
+/// map onto the invocation capability (the F1 invoker-side echo, §6.3): the
+/// containment check rejects the invocation if the chain caveat is not
+/// echoed verbatim.
+pub fn holder_execute_invocation(
+    holder: &Holder,
+    owner: &Owner,
+    function: &str,
+    parent_cid: &str,
+    echo_caveats: Option<&serde_json::Value>,
+    nonce: &str,
+) -> Result<String> {
+    use tinycloud_auth::authorization::Cid as AuthCid;
+    let resource: ResourceId = owner.space.clone().to_resource(
+        "compute".parse::<Service>()?,
+        Some(function.parse::<AuthPath>()?),
+        None,
+        None,
+    );
+    let notabene = match echo_caveats {
+        Some(cv) => {
+            let mut m = BTreeMap::new();
+            m.insert("computeCaveats".to_string(), cv.clone());
+            m
+        }
+        None => BTreeMap::new(),
+    };
+    let mut caps = Capabilities::new();
+    caps.with_action(
+        resource.as_uri(),
+        "tinycloud.compute/execute".parse::<UcanAbility>()?,
+        [notabene],
+    );
+    let proof: AuthCid = parent_cid.parse().context("parse parent cid")?;
+    let ucan = Payload {
+        issuer: holder.vm.parse::<DIDURLBuf>()?,
+        audience: holder.did.parse::<DIDBuf>()?,
+        not_before: None,
+        expiration: NumericDate::try_from_seconds(far_future())?,
+        nonce: Some(nonce.to_string()),
+        facts: Some(Vec::<serde_json::Value>::new()),
+        proof: vec![proof],
+        attenuation: caps,
+    }
+    .sign(holder.jwk.get_algorithm().unwrap_or_default(), &holder.jwk)?;
+    Ok(ucan.encode()?)
+}
+
+/// POST a delegation and return its CID (from the DelegateResponse).
+pub async fn delegate_and_get_cid(client: &Client, grant: &str) -> Result<String> {
+    let (status, text) = post_delegate(client, grant).await;
+    anyhow::ensure!(status == Status::Ok, "delegate failed ({status}): {text}");
+    let v: serde_json::Value = serde_json::from_str(&text)?;
+    Ok(v["cid"].as_str().context("delegate cid missing")?.to_string())
 }

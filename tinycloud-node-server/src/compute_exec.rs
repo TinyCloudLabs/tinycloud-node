@@ -674,6 +674,11 @@ async fn handle_host_call(
                     true,
                     arg.key.clone(),
                 ),
+                KvOutcome::NotFound => (
+                    serde_json::json!({"ok": false, "error": {"code": "no-such-key"}}),
+                    true,
+                    arg.key.clone(),
+                ),
                 KvOutcome::Denied { ability, resource } => (
                     serde_json::json!({
                         "ok": false,
@@ -772,6 +777,11 @@ enum KvOutcome {
     ReadOk(Option<Vec<u8>>),
     WriteOk,
     DeleteOk,
+    /// A `kv/del` of a key with no live value. The ability WAS granted; the
+    /// core raises `MissingKvWrite` for this, which the mediator surfaces to
+    /// the guest as an observable, non-fatal envelope (NOT a trap) -- the
+    /// same fail-observable philosophy as the A.4 denial contract.
+    NotFound,
     Denied { ability: String, resource: String },
 }
 
@@ -934,6 +944,10 @@ fn denial_or_internal(
             ability: ability.to_string(),
             resource: resource.to_string(),
         }),
+        // A `kv/del` of a key with no live value: observable, non-fatal.
+        TxStoreError::Tx(TxError::InvalidInvocation(InvocationError::MissingKvWrite(_))) => {
+            Ok(KvOutcome::NotFound)
+        }
         other => Err(ComputeExecError::Internal(other.to_string())),
     }
 }
