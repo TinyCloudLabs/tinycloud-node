@@ -20,7 +20,7 @@ use crate::{
         control::{self, ControlPlaneServer},
         paths::Profile,
     },
-    prometheus,
+    prometheus, tunnel,
 };
 
 fn with_serve_env(figment: rocket::figment::Figment) -> rocket::figment::Figment {
@@ -108,6 +108,7 @@ pub async fn launch_with_figment(
         tinycloud_config.prometheus.port,
         control,
         tinycloud_config.storage.datadir.clone(),
+        tinycloud_config.keys.clone(),
         public_api_port,
     )
     .await
@@ -119,11 +120,13 @@ async fn launch_rocket(
     prometheus_port: u16,
     control: ControlPlaneServer,
     data_root: PathBuf,
+    keys: config::Keys,
     public_api_port: u16,
 ) -> Result<()> {
     let shutdown = rocket.shutdown();
     let control_for_signal = control.handle();
     let (link_shutdown_tx, link_shutdown_rx) = watch::channel(false);
+    let (tunnel_shutdown_tx, tunnel_shutdown_rx) = watch::channel(false);
 
     tokio::spawn(async move {
         wait_for_shutdown_signal(control_for_signal, shutdown).await;
@@ -132,6 +135,11 @@ async fn launch_rocket(
     // Spawn the LAN TLS terminator + auto-renew task if link is enabled.
     // Not enabled -> no listener bound, exactly as spec'd.
     let link_task = spawn_link_task(&data_root, public_api_port, link_shutdown_rx);
+
+    // Spawn the outbound tunnel task if it was enabled (TC-252). Not
+    // enabled, or link itself not enabled -> no task, no outbound
+    // connection — mirrors spawn_link_task's "not configured" early return.
+    let tunnel_task = spawn_tunnel_task(&data_root, &keys, public_api_port, tunnel_shutdown_rx);
 
     let launch_result = if telemetry_enabled {
         let prom_addr = (rocket.config().address, prometheus_port).into();
@@ -157,10 +165,57 @@ async fn launch_rocket(
         let _ = handle.await;
     }
 
+    // Signal the tunnel task and let it close the socket cleanly.
+    let _ = tunnel_shutdown_tx.send(true);
+    if let Some(handle) = tunnel_task {
+        let _ = handle.await;
+    }
+
     control.shutdown().await?;
     launch_result?;
 
     Ok(())
+}
+
+/// Spawn the outbound tunnel connection task if `tinycloud node tunnel
+/// enable` has been run for this data root (TC-252). Reads
+/// `link/state.json` once at boot, exactly like `spawn_link_task` does for
+/// the LAN listener — toggling the tunnel while `serve` is already running
+/// takes effect on the next (re)start, not live.
+fn spawn_tunnel_task(
+    data_root: &Path,
+    keys: &config::Keys,
+    public_api_port: u16,
+    shutdown: watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    match tunnel::commands::load_enabled_state(data_root) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            tracing::info!(
+                "tunnel is disabled: no state.json or tunnel not enabled — not starting"
+            );
+            return None;
+        }
+        Err(err) => {
+            tracing::warn!(%err, "failed to load tunnel state; tunnel not started");
+            return None;
+        }
+    }
+
+    let upstream_addr: std::net::SocketAddr = match format!("127.0.0.1:{public_api_port}").parse() {
+        Ok(addr) => addr,
+        Err(err) => {
+            tracing::warn!(%err, "invalid loopback API address; tunnel not started");
+            return None;
+        }
+    };
+
+    let ctx = tunnel::connection::TunnelContext {
+        data_root: data_root.to_path_buf(),
+        keys: Some(keys.clone()),
+        upstream_addr,
+    };
+    Some(tokio::spawn(tunnel::connection::run(ctx, shutdown)))
 }
 
 fn spawn_link_task(

@@ -12,6 +12,7 @@ use crate::{
     link::commands::{EnableArgs, LinkStatusReport},
     node_control::{paths::Profile, service},
     runtime,
+    tunnel::commands::{TunnelEnableArgs, TunnelStatusReport},
 };
 
 #[derive(Debug, Parser)]
@@ -52,6 +53,9 @@ enum NodeCommand {
     /// LAN HTTPS via tinycloud.link (claim a `<name>.local.tinycloud.link`
     /// name and manage the LAN TLS listener).
     Link(LinkArgs),
+    /// Remote HTTPS via the tinycloud.link tunnel relay (requires an
+    /// existing `link enable`d name).
+    Tunnel(TunnelArgs),
 }
 
 #[derive(Debug, Args)]
@@ -112,6 +116,34 @@ struct LinkEnableArgs {
     /// Bind address for the LAN TLS listener (default: 0.0.0.0:8443).
     #[arg(long)]
     bind: Option<String>,
+
+    #[command(flatten)]
+    json: JsonArgs,
+}
+
+#[derive(Debug, Args)]
+struct TunnelArgs {
+    #[command(subcommand)]
+    command: TunnelCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum TunnelCommand {
+    /// Enable the outbound tunnel for the name already claimed via `link
+    /// enable`.
+    Enable(TunnelEnableCliArgs),
+    /// Disable the tunnel (the `link` name claim itself is untouched).
+    Disable(JsonArgs),
+    /// Show the current tunnel state.
+    Status(JsonArgs),
+}
+
+#[derive(Debug, Args, Default)]
+struct TunnelEnableCliArgs {
+    /// Override the tunnel relay base URL (default: the link service's own
+    /// `--service-url`, usually https://api.tinycloud.link).
+    #[arg(long = "service-url")]
+    service_url: Option<String>,
 
     #[command(flatten)]
     json: JsonArgs,
@@ -194,6 +226,7 @@ fn run_node(args: NodeArgs) -> Result<()> {
         NodeCommand::Doctor(args) => emit_json(&service::node_doctor()?, args.json),
         NodeCommand::Key(args) => run_key(args.command),
         NodeCommand::Link(args) => run_link(args.command),
+        NodeCommand::Tunnel(args) => run_tunnel(args.command),
     }
 }
 
@@ -226,6 +259,33 @@ fn run_link(command: LinkCommand) -> Result<()> {
 }
 
 fn emit_link_status(report: &LinkStatusReport, json: bool) -> Result<()> {
+    emit_json(report, json)
+}
+
+/// Route tunnel subcommands. Unlike `link`, these don't dial the relay
+/// themselves — they persist config on the same `link/state.json` (under
+/// its existing lock) that `serve`'s tunnel task reads on (re)start. See
+/// `tunnel::commands`.
+fn run_tunnel(command: TunnelCommand) -> Result<()> {
+    match command {
+        TunnelCommand::Enable(args) => {
+            let report = service::node_tunnel_enable(TunnelEnableArgs {
+                service_url: args.service_url,
+            })?;
+            emit_tunnel_status(&report, args.json.json)
+        }
+        TunnelCommand::Disable(args) => {
+            let report = service::node_tunnel_disable()?;
+            emit_tunnel_status(&report, args.json)
+        }
+        TunnelCommand::Status(args) => {
+            let report = service::node_tunnel_status()?;
+            emit_tunnel_status(&report, args.json)
+        }
+    }
+}
+
+fn emit_tunnel_status(report: &TunnelStatusReport, json: bool) -> Result<()> {
     emit_json(report, json)
 }
 

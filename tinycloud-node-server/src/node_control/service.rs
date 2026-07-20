@@ -87,6 +87,18 @@ pub struct ServiceStatus {
     /// from process state.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_listener_error: Option<String>,
+    // TC-252 additions — see docs/specs/node-control-plane-v1.md §3.10.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tunnel_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tunnel_connected: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tunnel_remote_url: Option<String>,
+    /// Set when the tunnel connection's last attempt failed — sourced from
+    /// the on-disk tunnel-state marker `serve` writes, not inferred from
+    /// process state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tunnel_last_error: Option<String>,
 }
 
 /// v1-link — the observed state of the LAN TLS terminator surfaced through
@@ -223,6 +235,10 @@ pub fn default_service_status() -> ServiceStatus {
         cert_not_after: None,
         link_listener: None,
         link_listener_error: None,
+        tunnel_enabled: None,
+        tunnel_connected: None,
+        tunnel_remote_url: None,
+        tunnel_last_error: None,
     }
 }
 
@@ -324,6 +340,28 @@ pub fn node_link_renew() -> Result<crate::link::commands::LinkStatusReport> {
     let paths = installed_or_current_paths()?;
     let config = effective_config(&paths)?;
     crate::link::commands::renew(&config.storage.datadir, Some(&config.keys))
+}
+
+/// Enable the tunnel for this installed node. Requires an existing `link
+/// enable`d name claim — see `tunnel::commands::enable`.
+pub fn node_tunnel_enable(
+    args: crate::tunnel::commands::TunnelEnableArgs,
+) -> Result<crate::tunnel::commands::TunnelStatusReport> {
+    let paths = installed_or_current_paths()?;
+    let config = effective_config(&paths)?;
+    crate::tunnel::commands::enable(&config.storage.datadir, args)
+}
+
+pub fn node_tunnel_disable() -> Result<crate::tunnel::commands::TunnelStatusReport> {
+    let paths = installed_or_current_paths()?;
+    let config = effective_config(&paths)?;
+    crate::tunnel::commands::disable(&config.storage.datadir)
+}
+
+pub fn node_tunnel_status() -> Result<crate::tunnel::commands::TunnelStatusReport> {
+    let paths = installed_or_current_paths()?;
+    let config = effective_config(&paths)?;
+    crate::tunnel::commands::status(&config.storage.datadir)
 }
 
 pub fn node_key_export_body() -> Result<String> {
@@ -654,6 +692,14 @@ pub fn service_status_for_installed(installed: DiscoveredService) -> ServiceStat
         link_listener_error: link_from_disk
             .as_ref()
             .and_then(|s| s.listener_error.clone()),
+        tunnel_enabled: link_from_disk.as_ref().map(|s| s.tunnel_enabled),
+        tunnel_connected: link_from_disk.as_ref().map(|s| s.tunnel_connected),
+        tunnel_remote_url: link_from_disk
+            .as_ref()
+            .and_then(|s| s.tunnel_remote_url.clone()),
+        tunnel_last_error: link_from_disk
+            .as_ref()
+            .and_then(|s| s.tunnel_last_error.clone()),
     }
 }
 
@@ -667,6 +713,15 @@ struct LinkDiskSnapshot {
     /// just enabled and `serve` hasn't restarted yet).
     listener_bound: Option<bool>,
     listener_error: Option<String>,
+    /// Whether `tinycloud node tunnel enable` has been run for this name
+    /// (independent of whether the tunnel is currently connected).
+    tunnel_enabled: bool,
+    /// Sourced from the on-disk tunnel-runtime marker `serve`'s tunnel task
+    /// writes; `false` whenever `tunnel_enabled` is `false` or `serve` has
+    /// never recorded a connection attempt.
+    tunnel_connected: bool,
+    tunnel_remote_url: Option<String>,
+    tunnel_last_error: Option<String>,
 }
 
 fn read_link_disk_snapshot(paths: &ProfilePaths) -> Option<LinkDiskSnapshot> {
@@ -685,12 +740,22 @@ fn read_link_disk_snapshot(paths: &ProfilePaths) -> Option<LinkDiskSnapshot> {
     let listener_state = crate::link::state::read_listener_state(&link_paths)
         .ok()
         .flatten();
+    let tunnel_runtime = crate::link::state::read_tunnel_runtime_state(&link_paths)
+        .ok()
+        .flatten();
     Some(LinkDiskSnapshot {
         name: state.name.clone(),
         local_url: crate::link::local_url(&state.name, bind_port),
         cert_not_after: state.cert_not_after,
         listener_bound: listener_state.as_ref().map(|s| s.bound),
         listener_error: listener_state.and_then(|s| s.error),
+        tunnel_enabled: state.tunnel_enabled,
+        tunnel_connected: state.tunnel_enabled
+            && tunnel_runtime.as_ref().is_some_and(|s| s.connected),
+        tunnel_remote_url: state
+            .tunnel_enabled
+            .then(|| crate::tunnel::commands::remote_url(&state.name)),
+        tunnel_last_error: tunnel_runtime.and_then(|s| s.last_error),
     })
 }
 
@@ -2452,6 +2517,10 @@ printf '%s\n' "${FAKE_PS_AGE:-29}"
             cert_not_after: Some("2026-08-15T00:00:00Z".into()),
             link_listener: Some(LinkListenerState::Running),
             link_listener_error: None,
+            tunnel_enabled: Some(true),
+            tunnel_connected: Some(true),
+            tunnel_remote_url: Some("https://mynode.tinycloud.link".into()),
+            tunnel_last_error: None,
         };
 
         let value = serde_json::to_value(status).unwrap();
@@ -2474,6 +2543,9 @@ printf '%s\n' "${FAKE_PS_AGE:-29}"
         );
         assert_eq!(value["certNotAfter"], "2026-08-15T00:00:00Z");
         assert_eq!(value["linkListener"], "running");
+        assert_eq!(value["tunnelEnabled"], true);
+        assert_eq!(value["tunnelConnected"], true);
+        assert_eq!(value["tunnelRemoteUrl"], "https://mynode.tinycloud.link");
     }
 
     #[test]
