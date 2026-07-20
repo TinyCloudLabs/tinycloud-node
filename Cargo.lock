@@ -9977,6 +9977,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "wasmtime",
+ "wat",
  "x509-parser 0.16.0",
 ]
 

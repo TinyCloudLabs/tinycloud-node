@@ -712,7 +712,7 @@ async fn handle_host_call(
                     serde_json::to_value(response).map_err(|e| wasmtime::Error::msg(e.to_string()))?,
                     true,
                 ),
-                SqlOutcome::Denied { ability, resource } => (
+                SqlOutcome::AbilityDenied { ability, resource } => (
                     serde_json::json!({
                         "ok": false,
                         "error": {
@@ -722,6 +722,21 @@ async fn handle_host_call(
                         }
                     }),
                     false,
+                ),
+                // Statement-level rejection (the EXISTING create_authorizer
+                // still applies, §9.1): the ability WAS granted, but the SQL
+                // engine refused the specific statement/table. A guest-visible
+                // error envelope (not a trap, not an ability-denial) --
+                // `granted: true` because the D_fn ability check passed.
+                SqlOutcome::StatementError(message) => (
+                    serde_json::json!({
+                        "ok": false,
+                        "error": {
+                            "code": "sql-denied",
+                            "message": message,
+                        }
+                    }),
+                    true,
                 ),
             };
             let response_bytes = serde_json::to_vec(&envelope)
@@ -762,7 +777,8 @@ enum KvOutcome {
 
 enum SqlOutcome {
     Ok(SqlResponse),
-    Denied { ability: String, resource: String },
+    AbilityDenied { ability: String, resource: String },
+    StatementError(String),
 }
 
 /// Mint an internal invocation SIGNED BY THE ROUTINE KEY, citing every
@@ -870,7 +886,12 @@ async fn mediate_sql_call(
         .await
     {
         Ok(_) => {
-            let result = ctx
+            // The ability check passed; run the statement. A SQL-engine
+            // rejection (the statement-level authorizer, or a plain SQL
+            // error) is surfaced to the GUEST as an error envelope, not a
+            // trap -- a routine hitting a SQL error should observe it and
+            // continue, exactly like the A.4 KV denial contract.
+            match ctx
                 .sql_service
                 .execute(
                     &ctx.space,
@@ -880,11 +901,15 @@ async fn mediate_sql_call(
                     ability.to_string(),
                 )
                 .await
-                .map_err(|e| ComputeExecError::Internal(e.to_string()))?;
-            Ok(SqlOutcome::Ok(result.response))
+            {
+                Ok(result) => Ok(SqlOutcome::Ok(result.response)),
+                Err(e) => Ok(SqlOutcome::StatementError(e.to_string())),
+            }
         }
         Err(err) => match denial_or_internal(err, &resource_str, ability)? {
-            KvOutcome::Denied { ability, resource } => Ok(SqlOutcome::Denied { ability, resource }),
+            KvOutcome::Denied { ability, resource } => {
+                Ok(SqlOutcome::AbilityDenied { ability, resource })
+            }
             _ => unreachable!("denial_or_internal only ever returns Denied on the Err arm"),
         },
     }

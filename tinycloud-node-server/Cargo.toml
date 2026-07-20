@@ -106,6 +106,9 @@ hyper = { version = "0.14", features = ["http1", "server", "tcp"] }
 libp2p-identity = { version = "0.2", features = ["ed25519"] }
 pem = "3"
 x509-parser = "0.16"
+# P2 compute fixtures: compile checked-in `.wat` source to wasm in tests
+# (deterministic, reproducible -- no opaque binaries).
+wat = "1"
 
 [features]
 default = []

@@ -40,7 +40,10 @@
   ;; --- expected fixed responses (A.3 return column, space-independent) ---
   (data (i32.const 0x00e0) "{\"ok\":true,\"value\":\"42\"}")
   (data (i32.const 0x0100) "{\"ok\":true}")
-  (data (i32.const 0x0110) "{\"columns\":[\"n\"],\"rows\":[[1]],\"rowCount\":1}")
+  ;; canonical JSON = SORTED keys (A.3 conventions): columns < rowCount < rows.
+  ;; Same 43 bytes as the A.3 illustrative form, reordered to the on-wire
+  ;; serialization serde_json produces (no `preserve_order`).
+  (data (i32.const 0x0110) "{\"columns\":[\"n\"],\"rowCount\":1,\"rows\":[[1]]}")
   ;; --- denial signal (A.4) ---
   (data (i32.const 0x0140) "\"ok\":false")
   ;; --- outputs ---
