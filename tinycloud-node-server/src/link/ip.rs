@@ -77,6 +77,28 @@ fn is_preferred_lan_address(addr: IpAddr) -> bool {
     }
 }
 
+/// Name prefixes for interfaces that are virtual bridges/tunnels rather than
+/// a host's real physical LAN connection: VM hypervisor bridges (Lima,
+/// Docker Desktop, VirtualBox, `vmnet`), macOS's private relay / per-app VPN
+/// `utun` tunnels, AirDrop/AWDL, and low-latency WLAN (`llw`) on macOS; and
+/// Docker/libvirt/veth/bridge devices on Linux. Addresses on these
+/// interfaces are technically "private range" but aren't reachable from
+/// other devices on the actual LAN, so publishing them alongside (or instead
+/// of) the real interface's address produces a claim clients can't connect
+/// to — see the `192.168.64.1` (Lima bridge) case in TC-250.
+const VIRTUAL_INTERFACE_PREFIXES: &[&str] = &[
+    "bridge", "vmnet", "utun", "awdl", "llw", // macOS
+    "docker", "virbr", "veth", "br-", // Linux
+];
+
+/// True if `name` looks like a virtual/VM-bridge interface rather than a
+/// host's real physical (`en*`/`eth*`/`wlan*`) network interface.
+fn is_virtual_bridge_interface(name: &str) -> bool {
+    VIRTUAL_INTERFACE_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
 /// Enumerate this host's non-loopback private LAN IPs to publish in a claim.
 ///
 /// RFC1918/ULA addresses are preferred over IPv4 link-local (`169.254.0.0/16`)
@@ -87,8 +109,17 @@ fn is_preferred_lan_address(addr: IpAddr) -> bool {
 /// docs/specs/node-control-plane-v1.md §3.9).
 pub fn discover_lan_ips() -> Result<Vec<IpAddr>, LinkError> {
     let addrs = if_addrs::get_if_addrs().map_err(|err| LinkError::Interface(err.to_string()))?;
-    let mut preferred = Vec::new();
-    let mut fallback = Vec::new();
+    select_lan_ips(addrs)
+}
+
+/// The filtering/selection logic behind [`discover_lan_ips`], split out so
+/// tests can drive it with a fabricated interface list instead of this
+/// host's real interfaces.
+fn select_lan_ips(addrs: Vec<if_addrs::Interface>) -> Result<Vec<IpAddr>, LinkError> {
+    // Each entry also records whether it came from a virtual bridge/tunnel
+    // interface, so those can be deprioritized below.
+    let mut preferred: Vec<(IpAddr, bool)> = Vec::new();
+    let mut fallback: Vec<(IpAddr, bool)> = Vec::new();
     for iface in addrs {
         if iface.is_loopback() {
             continue;
@@ -102,18 +133,36 @@ pub fn discover_lan_ips() -> Result<Vec<IpAddr>, LinkError> {
         if !is_private_lan_address(ip) {
             continue;
         }
+        let is_virtual = is_virtual_bridge_interface(&iface.name);
         let bucket = if is_preferred_lan_address(ip) {
             &mut preferred
         } else {
             &mut fallback
         };
-        if bucket.contains(&ip) {
+        if bucket.iter().any(|(existing, _)| *existing == ip) {
             continue;
         }
-        bucket.push(ip);
+        bucket.push((ip, is_virtual));
     }
-    let mut ips = preferred;
-    ips.extend(fallback);
+    let mut all = preferred;
+    all.extend(fallback);
+
+    // Exclude known VM-bridge/tunnel interfaces (Lima/Docker/VirtualBox
+    // bridges, `utun`/`awdl`/`llw` on macOS, `docker`/`virbr`/`veth`/`br-` on
+    // Linux) in favor of real physical interfaces — but never publish
+    // nothing when something private exists, so fall back to the unfiltered
+    // set if that filtering would leave it empty.
+    let physical: Vec<IpAddr> = all
+        .iter()
+        .filter(|(_, is_virtual)| !is_virtual)
+        .map(|(ip, _)| *ip)
+        .collect();
+
+    let mut ips = if physical.is_empty() {
+        all.into_iter().map(|(ip, _)| ip).collect()
+    } else {
+        physical
+    };
     ips.truncate(MAX_LAN_IPS);
     if ips.is_empty() {
         return Err(LinkError::NoLanIps);
@@ -191,5 +240,71 @@ mod tests {
         let ips: Vec<IpAddr> = vec!["192.168.1.10".parse().unwrap(), "fd00::1".parse().unwrap()];
         let rendered = format_lan_ips(&ips);
         assert_eq!(rendered, vec!["192.168.1.10", "fd00::1"]);
+    }
+
+    #[test]
+    fn virtual_bridge_prefixes_are_recognized() {
+        for name in [
+            "bridge100",
+            "vmnet1",
+            "utun0",
+            "awdl0",
+            "llw0",
+            "docker0",
+            "virbr0",
+            "veth1234",
+            "br-abcdef",
+        ] {
+            assert!(
+                is_virtual_bridge_interface(name),
+                "{name} should be recognized as virtual"
+            );
+        }
+        for name in ["en0", "en1", "eth0", "wlan0"] {
+            assert!(
+                !is_virtual_bridge_interface(name),
+                "{name} should not be recognized as virtual"
+            );
+        }
+    }
+
+    fn v4_iface(name: &str, ip: Ipv4Addr) -> if_addrs::Interface {
+        if_addrs::Interface {
+            name: name.to_string(),
+            addr: if_addrs::IfAddr::V4(if_addrs::Ifv4Addr {
+                ip,
+                netmask: Ipv4Addr::new(255, 255, 255, 0),
+                prefixlen: 24,
+                broadcast: None,
+            }),
+            index: None,
+        }
+    }
+
+    #[test]
+    fn lan_ip_selection_excludes_vm_bridge_when_a_physical_interface_exists() {
+        // Reproduces the live TC-250 case: Lima's `bridge100` publishing
+        // 192.168.64.1 alongside the real `en0` LAN address 192.168.1.195.
+        let addrs = vec![
+            v4_iface("en0", "192.168.1.195".parse().unwrap()),
+            v4_iface("bridge100", "192.168.64.1".parse().unwrap()),
+        ];
+        let ips = select_lan_ips(addrs).unwrap();
+        assert_eq!(ips, vec!["192.168.1.195".parse::<IpAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn lan_ip_selection_falls_back_to_virtual_interface_when_nothing_physical_exists() {
+        // Never publish nothing when a private-range address exists at all —
+        // even if every interface we found looks virtual.
+        let addrs = vec![v4_iface("bridge100", "192.168.64.1".parse().unwrap())];
+        let ips = select_lan_ips(addrs).unwrap();
+        assert_eq!(ips, vec!["192.168.64.1".parse::<IpAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn lan_ip_selection_errors_when_no_private_addresses_exist() {
+        let addrs = vec![v4_iface("en0", "8.8.8.8".parse().unwrap())];
+        assert!(select_lan_ips(addrs).is_err());
     }
 }
