@@ -52,6 +52,81 @@ const AUTH_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 /// heartbeats are tolerated before we give up on the socket.
 const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Default cap on the number of requests concurrently being reassembled
+/// (head received, body not yet complete) per tunnel connection. Bounds
+/// `pending`'s memory usage against a relay that opens many requests without
+/// ever finishing their bodies. Override via
+/// `TINYCLOUD_TUNNEL_MAX_PENDING_REQUESTS`.
+const DEFAULT_MAX_PENDING_REQUESTS: usize = 64;
+
+/// Resolves the effective in-flight request cap, reading
+/// `TINYCLOUD_TUNNEL_MAX_PENDING_REQUESTS` once per connection.
+fn max_pending_requests() -> usize {
+    effective_max_pending(std::env::var("TINYCLOUD_TUNNEL_MAX_PENDING_REQUESTS").ok())
+}
+
+/// Pure helper behind [`max_pending_requests`] so it can be unit-tested
+/// without touching the real process environment (env vars are process-wide
+/// global state, which would otherwise race other tests running in
+/// parallel).
+fn effective_max_pending(env_value: Option<String>) -> usize {
+    env_value
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_PENDING_REQUESTS)
+}
+
+/// Rejects any relay-supplied request path that isn't a plain absolute path
+/// on the loopback upstream. `serve_request` builds the forwarded URL as
+/// `format!("http://{upstream_addr}{path}")` — a path that doesn't start
+/// with `/` (e.g. `@evil.com/x`, which reads as URL userinfo, redirecting
+/// the request to host `evil.com`) or that itself embeds a scheme (e.g.
+/// `http://evil.com/`) can retarget the request to an arbitrary host
+/// reachable from the node, entirely bypassing the intended
+/// loopback-only upstream. Whitespace/control characters are rejected too
+/// since they have no legitimate place in a path and can be used to smuggle
+/// header-like content into the request line on some HTTP stacks.
+fn validate_request_path(path: &str) -> Result<(), String> {
+    if !path.starts_with('/') {
+        return Err(format!(
+            "rejected request: path must start with '/': {path:?}"
+        ));
+    }
+    if path.contains("://") {
+        return Err(format!(
+            "rejected request: path must not embed a scheme: {path:?}"
+        ));
+    }
+    if path.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!(
+            "rejected request: path contains whitespace/control characters: {path:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Headers that must never be forwarded verbatim across the tunnel's proxy
+/// boundary: RFC 7230 §6.1 hop-by-hop headers (connection-management state
+/// meaningful only to one physical leg of the proxy, never the other), plus
+/// `content-length`/`transfer-encoding`, which describe framing for a body
+/// this proxy has already fully reassembled (request side) or buffered and
+/// re-chunked into `responseBody` frames (response side) — forwarding a
+/// stale value here can desync the receiving side's framing rather than
+/// merely being redundant.
+fn should_strip_forwarded_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "connection"
+            | "keep-alive"
+            | "transfer-encoding"
+            | "upgrade"
+            | "te"
+            | "trailer"
+            | "content-length"
+    ) || lower.starts_with("proxy-")
+}
+
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = futures::stream::SplitSink<WsStream, Message>;
 type SharedSink = Arc<Mutex<WsSink>>;
@@ -66,9 +141,10 @@ pub struct TunnelContext {
     pub upstream_addr: SocketAddr,
 }
 
-/// Run the tunnel connection loop until `shutdown` fires or the relay
-/// supersedes this connection (4410). Never panics on a bad frame or a dead
-/// socket — those are reconnect-worthy events, not task failures.
+/// Run the tunnel connection loop until `shutdown` fires, the relay
+/// supersedes this connection (4410), or the tunnel is disabled (`tunnel
+/// disable`) while this loop is running. Never panics on a bad frame or a
+/// dead socket — those are reconnect-worthy events, not task failures.
 pub async fn run(ctx: TunnelContext, mut shutdown: watch::Receiver<bool>) {
     let mut backoff = BackoffState::new();
     let mut extra_sequence_jump: u64 = 0;
@@ -80,6 +156,19 @@ pub async fn run(ctx: TunnelContext, mut shutdown: watch::Receiver<bool>) {
 
         let attempt = match prepare_attempt(&ctx, extra_sequence_jump).await {
             Ok(attempt) => attempt,
+            Err(err) if is_tunnel_disabled_error(&err) => {
+                // `tunnel disable` flipped the flag off (concurrently with
+                // this loop, e.g. while it was mid-retry). This is terminal,
+                // not one more thing to retry past: stop reconnecting and
+                // remove the runtime marker so `disable`'s own cleanup isn't
+                // resurrected by our next scheduled attempt. This check only
+                // runs before dialing a *new* connection — a socket already
+                // live from a prior attempt is unaffected and keeps serving
+                // until its next reconnect or a `serve` restart.
+                tracing::info!("tunnel: disabled; stopping the connection loop");
+                clear_state(&ctx.data_root);
+                return;
+            }
             Err(err) => {
                 tracing::warn!(%err, "tunnel: failed to prepare connection attempt");
                 record_state(
@@ -98,8 +187,9 @@ pub async fn run(ctx: TunnelContext, mut shutdown: watch::Receiver<bool>) {
         };
         extra_sequence_jump = 0;
 
-        match connect_and_serve(&ctx, &attempt, &mut shutdown).await {
-            AttemptResult::Stopped => break,
+        match connect_and_serve(&ctx, &attempt, &mut backoff, &mut shutdown).await {
+            AttemptResult::ShutdownRequested => break,
+            AttemptResult::Superseded => return,
             AttemptResult::Outcome(outcome) => {
                 let jitter = rand::random::<f64>();
                 match backoff.next_action(outcome, jitter) {
@@ -187,15 +277,24 @@ async fn prepare_attempt(ctx: &TunnelContext, extra_sequence_jump: u64) -> Resul
 }
 
 enum AttemptResult {
-    /// Shutdown fired, or the relay superseded this connection (4410) — the
-    /// task must not reconnect.
-    Stopped,
+    /// Shutdown fired — the task must not reconnect. `run`'s final cleanup
+    /// clears any prior error state, since a deliberate stop isn't an error
+    /// worth preserving.
+    ShutdownRequested,
+    /// Another connection for this name has taken over (WS close code
+    /// 4410, "superseded"). The task must not reconnect-fight with the
+    /// socket that superseded it. The descriptive "superseded by a newer
+    /// connection" message has already been recorded to the on-disk marker
+    /// at the site that detected this — `run`'s final cleanup must not
+    /// clobber it with a generic reset.
+    Superseded,
     Outcome(AttemptOutcome),
 }
 
 async fn connect_and_serve(
     ctx: &TunnelContext,
     attempt: &PreparedAttempt,
+    backoff: &mut BackoffState,
     shutdown: &mut watch::Receiver<bool>,
 ) -> AttemptResult {
     let url = to_ws_url(&attempt.service_url, &attempt.name);
@@ -232,7 +331,11 @@ async fn connect_and_serve(
     match wait_for_ack(&mut stream).await {
         AckOutcome::Ack => {}
         AckOutcome::Closed(code, reason) => {
-            let message = format!("tunnel auth rejected (close code {code}): {reason}");
+            let message = if code == CLOSE_SUPERSEDED {
+                format!("superseded by a newer connection (close code {code}): {reason}")
+            } else {
+                format!("tunnel auth rejected (close code {code}): {reason}")
+            };
             if code == CLOSE_SUPERSEDED {
                 tracing::info!(%message, "tunnel: superseded by a newer connection; not reconnecting");
                 record_state(
@@ -242,7 +345,7 @@ async fn connect_and_serve(
                         last_error: Some(message),
                     },
                 );
-                return AttemptResult::Stopped;
+                return AttemptResult::Superseded;
             }
             tracing::warn!(%message);
             record_state(
@@ -266,6 +369,15 @@ async fn connect_and_serve(
         }
     }
 
+    // Auth succeeded: reset backoff here (not via `BackoffState::next_action`,
+    // which the run loop only calls with the outcome of a *finished*
+    // attempt — an `Ack` never reaches it, since this function consumes the
+    // ack itself and moves straight into serving). Without this, a
+    // long-lived connection's eventual failure resumes escalating from
+    // wherever backoff had reached before this success, instead of starting
+    // fresh from the base delay.
+    backoff.reset();
+
     record_state(
         &ctx.data_root,
         TunnelRuntimeState {
@@ -278,7 +390,7 @@ async fn connect_and_serve(
     let outcome = serve_requests(ctx, sink.clone(), stream, shutdown).await;
 
     match &outcome {
-        AttemptResult::Stopped => {}
+        AttemptResult::ShutdownRequested | AttemptResult::Superseded => {}
         AttemptResult::Outcome(_) => {
             record_state(
                 &ctx.data_root,
@@ -344,13 +456,14 @@ async fn serve_requests(
     let mut pending: HashMap<String, PendingRequest> = HashMap::new();
     let upstream_addr = ctx.upstream_addr;
     let http_client = reqwest::Client::new();
+    let max_pending = max_pending_requests();
 
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     let _ = sink.lock().await.close().await;
-                    return AttemptResult::Stopped;
+                    return AttemptResult::ShutdownRequested;
                 }
             }
             next = tokio::time::timeout(IDLE_READ_TIMEOUT, stream.next()) => {
@@ -368,9 +481,20 @@ async fn serve_requests(
                         return AttemptResult::Outcome(AttemptOutcome::TransportError);
                     }
                     Some(Ok(Message::Close(frame))) => {
-                        let (code, _reason) = close_code_and_reason(frame);
+                        let (code, reason) = close_code_and_reason(frame);
                         if code == CLOSE_SUPERSEDED {
-                            return AttemptResult::Stopped;
+                            let message = format!(
+                                "tunnel closed (close code {code}): superseded by a newer connection: {reason}"
+                            );
+                            tracing::info!(%message, "tunnel: superseded by a newer connection; not reconnecting");
+                            record_state(
+                                &ctx.data_root,
+                                TunnelRuntimeState {
+                                    connected: false,
+                                    last_error: Some(message),
+                                },
+                            );
+                            return AttemptResult::Superseded;
                         }
                         return AttemptResult::Outcome(AttemptOutcome::Closed(code));
                     }
@@ -381,6 +505,7 @@ async fn serve_requests(
                             sink.clone(),
                             upstream_addr,
                             http_client.clone(),
+                            max_pending,
                         );
                     }
                     // Pings are auto-ponged by tungstenite; Pong/Binary/Frame
@@ -400,6 +525,7 @@ fn handle_frame(
     sink: SharedSink,
     upstream_addr: SocketAddr,
     http_client: reqwest::Client,
+    max_pending: usize,
 ) {
     let frame = match TunnelFrame::parse(text) {
         Ok(frame) => frame,
@@ -416,6 +542,14 @@ fn handle_frame(
             path,
             headers,
         } => {
+            if let Err(reason) = validate_request_path(&path) {
+                spawn_send_error(sink, id, reason);
+                return;
+            }
+            if pending.len() >= max_pending {
+                spawn_send_error(sink, id, "too many in-flight requests".to_string());
+                return;
+            }
             pending.insert(
                 id,
                 PendingRequest {
@@ -517,6 +651,9 @@ async fn serve_request(
     let url = format!("http://{upstream_addr}{}", req.path);
     let mut header_map = reqwest::header::HeaderMap::new();
     for (name, value) in &req.headers {
+        if should_strip_forwarded_header(name) {
+            continue;
+        }
         if let (Ok(name), Ok(value)) = (
             reqwest::header::HeaderName::from_bytes(name.as_bytes()),
             reqwest::header::HeaderValue::from_str(value),
@@ -564,6 +701,7 @@ async fn serve_request(
     let headers: Vec<(String, String)> = response
         .headers()
         .iter()
+        .filter(|(name, _)| !should_strip_forwarded_header(name.as_str()))
         .map(|(name, value)| {
             (
                 name.to_string(),
@@ -646,6 +784,25 @@ fn record_state(data_root: &std::path::Path, state: TunnelRuntimeState) {
     }
 }
 
+/// Whether `err` is the sentinel `prepare_attempt`/`bump_sequence_for_tunnel`
+/// returns when the tunnel has been disabled (see
+/// [`tunnel_commands::TUNNEL_DISABLED_ERROR`]) — distinguishes "stop
+/// reconnecting, this is permanent until re-enabled" from an ordinary
+/// retry-worthy failure (network error, identity not ready, ...).
+fn is_tunnel_disabled_error(err: &anyhow::Error) -> bool {
+    err.to_string() == tunnel_commands::TUNNEL_DISABLED_ERROR
+}
+
+/// Removes the on-disk tunnel-runtime marker, mirroring `tunnel disable`'s
+/// own cleanup — used when the run loop detects mid-flight that the tunnel
+/// was disabled, so its own next scheduled write doesn't resurrect the
+/// marker `disable` already removed.
+fn clear_state(data_root: &std::path::Path) {
+    if let Err(err) = tunnel_commands::clear_runtime_state(data_root) {
+        tracing::warn!(%err, "tunnel: failed to clear runtime state after disable");
+    }
+}
+
 /// Convert the tunnel relay's HTTP(S) base URL into the WebSocket URL for
 /// `name`, e.g. `https://api.tinycloud.link` ->
 /// `wss://api.tinycloud.link/v1/tunnel/office`.
@@ -690,5 +847,80 @@ mod tests {
             to_ws_url("https://api.tinycloud.link", "weird name"),
             "wss://api.tinycloud.link/v1/tunnel/weird%20name"
         );
+    }
+
+    #[test]
+    fn validate_request_path_accepts_a_plain_absolute_path() {
+        assert!(validate_request_path("/").is_ok());
+        assert!(validate_request_path("/foo/bar?x=1").is_ok());
+    }
+
+    #[test]
+    fn validate_request_path_rejects_userinfo_host_confusion() {
+        // Concatenated onto `http://{upstream_addr}`, this reads as
+        // userinfo@host, redirecting the request to `evil.com`.
+        assert!(validate_request_path("@evil.com/x").is_err());
+    }
+
+    #[test]
+    fn validate_request_path_rejects_an_embedded_scheme() {
+        assert!(validate_request_path("http://evil.com/").is_err());
+        assert!(validate_request_path("/redirect").is_ok()); // sanity: no false positive
+    }
+
+    #[test]
+    fn validate_request_path_rejects_whitespace_and_control_characters() {
+        assert!(validate_request_path("/foo bar").is_err());
+        assert!(validate_request_path("/foo\r\nX-Injected: 1").is_err());
+        assert!(validate_request_path("/foo\0bar").is_err());
+    }
+
+    #[test]
+    fn should_strip_forwarded_header_covers_hop_by_hop_and_framing_headers() {
+        for name in [
+            "Connection",
+            "connection",
+            "Keep-Alive",
+            "Transfer-Encoding",
+            "Upgrade",
+            "TE",
+            "Trailer",
+            "Content-Length",
+            "Proxy-Authorization",
+            "proxy-connection",
+        ] {
+            assert!(
+                should_strip_forwarded_header(name),
+                "expected {name} to be stripped"
+            );
+        }
+    }
+
+    #[test]
+    fn should_strip_forwarded_header_leaves_ordinary_headers_alone() {
+        for name in ["Content-Type", "X-Custom", "Set-Cookie", "Authorization"] {
+            assert!(
+                !should_strip_forwarded_header(name),
+                "did not expect {name} to be stripped"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_max_pending_uses_the_default_when_unset_or_invalid() {
+        assert_eq!(effective_max_pending(None), DEFAULT_MAX_PENDING_REQUESTS);
+        assert_eq!(
+            effective_max_pending(Some("not-a-number".to_string())),
+            DEFAULT_MAX_PENDING_REQUESTS
+        );
+        assert_eq!(
+            effective_max_pending(Some("0".to_string())),
+            DEFAULT_MAX_PENDING_REQUESTS
+        );
+    }
+
+    #[test]
+    fn effective_max_pending_honors_a_valid_override() {
+        assert_eq!(effective_max_pending(Some("8".to_string())), 8);
     }
 }

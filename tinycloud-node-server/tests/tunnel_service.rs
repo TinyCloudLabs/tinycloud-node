@@ -23,8 +23,11 @@
 // OS-assigned ports, mirroring `tests/link_service.rs`'s approach.
 use std::{
     net::SocketAddr,
-    sync::{Arc, Mutex, OnceLock},
-    time::Duration,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
+    },
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -33,7 +36,7 @@ use axum::{
         ws::{CloseFrame, Message as WsMessage, WebSocket, WebSocketUpgrade},
         Path,
     },
-    http::{StatusCode, Uri},
+    http::{HeaderMap, StatusCode, Uri},
     response::{AppendHeaders, IntoResponse},
     routing::{any, get},
     Router,
@@ -43,7 +46,7 @@ use tinycloud::{
     config::Keys,
     link::state::{self as link_state, LinkPaths, LinkState},
     tunnel::{
-        commands::{enable as tunnel_enable, TunnelEnableArgs},
+        commands::{disable as tunnel_disable, enable as tunnel_enable, TunnelEnableArgs},
         connection::{run as run_tunnel, TunnelContext},
         protocol::{TunnelFrame, BODY_CHUNK_BYTES, CLOSE_STALE_SEQUENCE, CLOSE_SUPERSEDED},
     },
@@ -577,4 +580,668 @@ async fn relay_ping_is_answered_with_a_pong_automatically() {
     );
 
     stop_and_join(shutdown_tx, handle).await;
+}
+
+/// Regression test for the tunnel SSRF fix: `serve_request` builds the
+/// forwarded URL as `format!("http://{upstream_addr}{path}")`. A relay
+/// (hostile or buggy) that sends a `request` frame whose `path` doesn't
+/// start with `/` — e.g. `@evil.com/x`, which reads as
+/// `userinfo@host` when concatenated onto the authority, retargeting the
+/// request to `evil.com` — or that embeds its own scheme (`http://evil.com/`)
+/// must get an immediate per-request `error` frame and must never cause an
+/// outbound HTTP request to be made at all, to any host.
+#[tokio::test]
+async fn malicious_request_paths_are_rejected_without_reaching_any_upstream() {
+    let _env_lock = env_lock().await;
+    install_env_secret(36);
+
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let counter_for_upstream = request_count.clone();
+    let upstream_app = Router::new().fallback(any(move || {
+        let counter = counter_for_upstream.clone();
+        async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            StatusCode::OK
+        }
+    }));
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(upstream_listener, upstream_app).await;
+    });
+
+    let observations = Arc::new(Mutex::new(RelayObservations::default()));
+    let (result_tx, result_rx) = oneshot::channel::<Vec<(Option<String>, String)>>();
+    let result_tx = Arc::new(Mutex::new(Some(result_tx)));
+
+    let obs_for_ws = observations.clone();
+    let ws_handler = move |ws: WebSocketUpgrade, Path(_name): Path<String>| {
+        let obs = obs_for_ws.clone();
+        let result_tx = result_tx.clone();
+        async move {
+            ws.on_upgrade(move |mut socket| async move {
+                recv_auth_frame(&mut socket, &obs).await;
+                send_ack(&mut socket).await;
+
+                let malicious_paths = [("req-a", "@evil.com/x"), ("req-b", "http://evil.com/")];
+                for (id, path) in malicious_paths {
+                    socket
+                        .send(WsMessage::Text(
+                            TunnelFrame::Request {
+                                id: id.to_string(),
+                                method: "GET".to_string(),
+                                path: path.to_string(),
+                                headers: vec![],
+                            }
+                            .encode(),
+                        ))
+                        .await
+                        .unwrap();
+                    socket
+                        .send(WsMessage::Text(
+                            TunnelFrame::RequestBody {
+                                id: id.to_string(),
+                                chunk: String::new(),
+                                done: true,
+                            }
+                            .encode(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+
+                let mut errors = Vec::new();
+                while errors.len() < malicious_paths.len() {
+                    let Some(Ok(WsMessage::Text(text))) = socket.recv().await else {
+                        break;
+                    };
+                    if let Ok(TunnelFrame::Error { id, message }) = TunnelFrame::parse(&text) {
+                        errors.push((id, message));
+                    }
+                }
+                if let Some(tx) = result_tx.lock().unwrap().take() {
+                    let _ = tx.send(errors);
+                }
+            })
+        }
+    };
+
+    let app = Router::new().route("/v1/tunnel/:name", get(ws_handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let data_root = tempdir().unwrap();
+    seed_enabled_tunnel_state(
+        data_root.path(),
+        "ssrfnode",
+        &format!("http://{relay_addr}"),
+    );
+    let (shutdown_tx, handle) = spawn_tunnel_client(data_root.path(), upstream_addr).await;
+
+    let errors = tokio::time::timeout(Duration::from_secs(10), result_rx)
+        .await
+        .expect("expected an error frame for each malicious path")
+        .expect("relay task dropped its result sender");
+
+    assert_eq!(
+        errors.len(),
+        2,
+        "expected exactly one error frame per rejected request"
+    );
+    assert_eq!(errors[0].0.as_deref(), Some("req-a"));
+    assert_eq!(errors[1].0.as_deref(), Some("req-b"));
+
+    stop_and_join(shutdown_tx, handle).await;
+
+    assert_eq!(
+        request_count.load(Ordering::SeqCst),
+        0,
+        "a malicious path must never reach any upstream, real or otherwise"
+    );
+}
+
+/// Regression test for the dead `BackoffState::reset` bug: the run loop
+/// never routed a successful `Ack` back through `BackoffState::next_action`,
+/// so `reset` was never called and backoff kept escalating for the process
+/// lifetime even across successful connections. Three consecutive
+/// pre-connect failures push the backoff delay up to ~2-4s (2^3 * 500ms,
+/// jittered to [0.5, 1.0)); a fourth attempt then acks and briefly serves
+/// before being dropped. If backoff correctly reset on that ack, the
+/// following (fifth) failure's delay is back near the ~250-500ms base rather
+/// than continuing to escalate — the two are separated by roughly an order
+/// of magnitude, wide enough margin to not be timing-flaky.
+#[tokio::test]
+async fn backoff_resets_after_a_successful_ack_so_a_later_failure_is_not_escalated() {
+    let _env_lock = env_lock().await;
+    install_env_secret(37);
+
+    let upstream_addr = spawn_upstream().await;
+    let observations = Arc::new(Mutex::new(RelayObservations::default()));
+    let attempt_times: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
+    const PRE_ACK_FAILURES: usize = 3;
+
+    let obs_for_ws = observations.clone();
+    let times_for_ws = attempt_times.clone();
+    let ws_handler = move |ws: WebSocketUpgrade, Path(_name): Path<String>| {
+        let obs = obs_for_ws.clone();
+        let times = times_for_ws.clone();
+        async move {
+            ws.on_upgrade(move |mut socket| async move {
+                recv_auth_frame(&mut socket, &obs).await;
+                times.lock().unwrap().push(Instant::now());
+                let attempt_number = obs.lock().unwrap().attempts;
+
+                if attempt_number <= PRE_ACK_FAILURES {
+                    // Escalate the ordinary backoff delay with repeated
+                    // rejections before the connection ever succeeds.
+                    send_close(&mut socket, 4400).await;
+                    return;
+                }
+                if attempt_number == PRE_ACK_FAILURES + 1 {
+                    // Succeed once — this must reset backoff — then drop the
+                    // live connection so the *next* failure's delay can be
+                    // observed.
+                    send_ack(&mut socket).await;
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    send_close(&mut socket, 4400).await;
+                    return;
+                }
+                // Final attempt: ack and hold so the test can shut down
+                // cleanly without a further reconnect.
+                send_ack(&mut socket).await;
+                let _ = socket.recv().await;
+            })
+        }
+    };
+
+    let app = Router::new().route("/v1/tunnel/:name", get(ws_handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let data_root = tempdir().unwrap();
+    seed_enabled_tunnel_state(
+        data_root.path(),
+        "backoffnode",
+        &format!("http://{relay_addr}"),
+    );
+    let (shutdown_tx, handle) = spawn_tunnel_client(data_root.path(), upstream_addr).await;
+
+    let target_attempts = PRE_ACK_FAILURES + 2;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if attempt_times.lock().unwrap().len() >= target_attempts {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("expected the reconnect loop to reach the post-reset attempt in time");
+
+    stop_and_join(shutdown_tx, handle).await;
+
+    let times = attempt_times.lock().unwrap().clone();
+    assert_eq!(times.len(), target_attempts);
+
+    // Gap before the 4th (ack) attempt, i.e. after 3 consecutive pre-ack
+    // failures: backoff's internal `attempt` counter is 2 by then, so the
+    // unjittered delay is 500ms * 2^2 = 2000ms — at least 1000ms even at the
+    // minimum 0.5x jitter, confirming backoff really did escalate going into
+    // the successful attempt.
+    let escalated_gap = times[PRE_ACK_FAILURES] - times[PRE_ACK_FAILURES - 1];
+    assert!(
+        escalated_gap >= Duration::from_millis(900),
+        "expected backoff to have escalated before the ack, got {escalated_gap:?}"
+    );
+
+    // Gap after the successful ack (between the ack+drop attempt and the
+    // next attempt): if `reset` fires, attempt=0 there, so the delay is back
+    // near the ~250-500ms base — nowhere close to the escalated gap above.
+    let post_reset_gap = times[PRE_ACK_FAILURES + 1] - times[PRE_ACK_FAILURES];
+    assert!(
+        post_reset_gap < Duration::from_millis(1500),
+        "backoff must reset after a successful ack; got {post_reset_gap:?} \
+         (an unreset backoff would be several seconds by this point)"
+    );
+}
+
+/// Regression test for the "tunnel disable while serve runs" bug: the
+/// connection loop used to treat the "tunnel: disabled" bump-sequence error
+/// as an ordinary retryable failure, so `tunnel disable` (which flips
+/// `tunnelEnabled` off and removes the on-disk runtime marker) racing a live
+/// retry loop got its cleanup undone on the loop's very next backoff-write,
+/// and the loop itself never stopped. Disabling mid-retry must make the loop
+/// exit on its own (no shutdown signal needed) and the marker must stay gone
+/// afterward.
+#[tokio::test]
+async fn disable_during_retry_loop_stops_the_task_and_does_not_resurrect_the_marker() {
+    let _env_lock = env_lock().await;
+    install_env_secret(38);
+
+    let upstream_addr = spawn_upstream().await;
+    let observations = Arc::new(Mutex::new(RelayObservations::default()));
+    let obs_for_ws = observations.clone();
+
+    // Always reject the auth attempt so the client stays in the retry loop
+    // until we disable it out from under it.
+    let ws_handler = move |ws: WebSocketUpgrade, Path(_name): Path<String>| {
+        let obs = obs_for_ws.clone();
+        async move {
+            ws.on_upgrade(move |mut socket| async move {
+                recv_auth_frame(&mut socket, &obs).await;
+                send_close(&mut socket, 4400).await;
+            })
+        }
+    };
+
+    let app = Router::new().route("/v1/tunnel/:name", get(ws_handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let data_root = tempdir().unwrap();
+    seed_enabled_tunnel_state(
+        data_root.path(),
+        "disablenode",
+        &format!("http://{relay_addr}"),
+    );
+
+    let (_shutdown_tx, handle) = spawn_tunnel_client(data_root.path(), upstream_addr).await;
+
+    // Wait for at least one failed attempt so the retry loop is definitely
+    // running (and mid-backoff) before we disable underneath it.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if observations.lock().unwrap().attempts >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("expected at least one connection attempt before disabling");
+
+    // Simulate `tinycloud node tunnel disable` running concurrently with the
+    // live retry loop.
+    tunnel_disable(data_root.path()).unwrap();
+
+    // The loop must notice on its next attempt and exit on its own.
+    tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("tunnel task did not stop after tunnel disable")
+        .expect("tunnel task panicked");
+
+    let link_paths = LinkPaths::from_data_root(data_root.path());
+    assert!(
+        link_state::read_tunnel_runtime_state(&link_paths)
+            .unwrap()
+            .is_none(),
+        "the runtime marker must be gone once the loop notices it's disabled"
+    );
+
+    // No resurrection: give any stray scheduled write a chance to run, then
+    // re-check.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        link_state::read_tunnel_runtime_state(&link_paths)
+            .unwrap()
+            .is_none(),
+        "the marker must not be resurrected after the loop has stopped"
+    );
+}
+
+/// Regression test for hop-by-hop/framing header leakage: headers that must
+/// never cross the proxy boundary verbatim (RFC 7230 §6.1 hop-by-hop headers
+/// plus `content-length`/`transfer-encoding`, whose values describe framing
+/// for a body this proxy has already reassembled/re-chunked itself) must be
+/// stripped both from the frame headers forwarded to the loopback upstream
+/// and from the upstream response headers forwarded back as a `response`
+/// frame.
+#[tokio::test]
+async fn hop_by_hop_and_framing_headers_are_stripped_in_both_directions() {
+    let _env_lock = env_lock().await;
+    install_env_secret(39);
+
+    let received_headers: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+    let headers_for_upstream = received_headers.clone();
+    let upstream_app = Router::new().fallback(any(move |headers: HeaderMap| {
+        let store = headers_for_upstream.clone();
+        async move {
+            *store.lock().unwrap() = Some(headers);
+            // A single safe extra header ("connection") — deliberately not
+            // also setting `transfer-encoding`/`content-length` by hand
+            // here, since combining those with axum's own auto-computed
+            // framing produces an actually malformed HTTP/1.1 response and
+            // would test transport brokenness rather than header stripping.
+            // axum still auto-computes an accurate `Content-Length` for this
+            // body, which is exactly what we assert gets stripped below.
+            (
+                StatusCode::OK,
+                [("connection", "close"), ("content-type", "text/plain")],
+                "ok",
+            )
+                .into_response()
+        }
+    }));
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(upstream_listener, upstream_app).await;
+    });
+
+    let observations = Arc::new(Mutex::new(RelayObservations::default()));
+    let (result_tx, result_rx) = oneshot::channel::<Vec<(String, String)>>();
+    let result_tx = Arc::new(Mutex::new(Some(result_tx)));
+
+    let obs_for_ws = observations.clone();
+    let ws_handler = move |ws: WebSocketUpgrade, Path(_name): Path<String>| {
+        let obs = obs_for_ws.clone();
+        let result_tx = result_tx.clone();
+        async move {
+            ws.on_upgrade(move |mut socket| async move {
+                recv_auth_frame(&mut socket, &obs).await;
+                send_ack(&mut socket).await;
+
+                socket
+                    .send(WsMessage::Text(
+                        TunnelFrame::Request {
+                            id: "req-1".to_string(),
+                            method: "GET".to_string(),
+                            path: "/echo".to_string(),
+                            headers: vec![
+                                ("connection".to_string(), "keep-alive".to_string()),
+                                ("keep-alive".to_string(), "timeout=5".to_string()),
+                                ("transfer-encoding".to_string(), "chunked".to_string()),
+                                ("content-length".to_string(), "999".to_string()),
+                                ("x-custom".to_string(), "hello".to_string()),
+                            ],
+                        }
+                        .encode(),
+                    ))
+                    .await
+                    .unwrap();
+                socket
+                    .send(WsMessage::Text(
+                        TunnelFrame::RequestBody {
+                            id: "req-1".to_string(),
+                            chunk: String::new(),
+                            done: true,
+                        }
+                        .encode(),
+                    ))
+                    .await
+                    .unwrap();
+
+                let mut response_headers = Vec::new();
+                loop {
+                    let Some(Ok(WsMessage::Text(text))) = socket.recv().await else {
+                        break;
+                    };
+                    match TunnelFrame::parse(&text).unwrap() {
+                        TunnelFrame::Response { headers, .. } => response_headers = headers,
+                        TunnelFrame::ResponseBody { done, .. } => {
+                            if done {
+                                break;
+                            }
+                        }
+                        other => panic!("unexpected frame from node: {other:?}"),
+                    }
+                }
+                if let Some(tx) = result_tx.lock().unwrap().take() {
+                    let _ = tx.send(response_headers);
+                }
+            })
+        }
+    };
+
+    let app = Router::new().route("/v1/tunnel/:name", get(ws_handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let data_root = tempdir().unwrap();
+    seed_enabled_tunnel_state(
+        data_root.path(),
+        "headernode",
+        &format!("http://{relay_addr}"),
+    );
+    let (shutdown_tx, handle) = spawn_tunnel_client(data_root.path(), upstream_addr).await;
+
+    let response_headers = tokio::time::timeout(Duration::from_secs(10), result_rx)
+        .await
+        .expect("relay-side assertions timed out")
+        .expect("relay task dropped its result sender");
+
+    stop_and_join(shutdown_tx, handle).await;
+
+    // Request side: none of the hop-by-hop/framing headers reached upstream,
+    // but the ordinary header did.
+    let upstream_headers = received_headers
+        .lock()
+        .unwrap()
+        .take()
+        .expect("upstream never received the request");
+    for stripped in [
+        "connection",
+        "keep-alive",
+        "transfer-encoding",
+        "content-length",
+    ] {
+        assert!(
+            !upstream_headers.contains_key(stripped),
+            "expected {stripped} to be stripped before reaching upstream, headers: {upstream_headers:?}"
+        );
+    }
+    assert_eq!(
+        upstream_headers
+            .get("x-custom")
+            .map(|v| v.to_str().unwrap()),
+        Some("hello")
+    );
+
+    // Response side: none of the hop-by-hop/framing headers the upstream
+    // sent back made it into the `response` frame, but the ordinary header
+    // did. `content-length` here is axum's own accurately-computed value
+    // (not an artificial one) — its absence confirms the strip is
+    // unconditional, not merely a no-op on an already-missing header.
+    for stripped in ["connection", "content-length"] {
+        assert!(
+            !response_headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case(stripped)),
+            "expected {stripped} to be stripped from the response frame, got {response_headers:?}"
+        );
+    }
+    assert!(response_headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v == "text/plain"));
+}
+
+/// Regression test for the 4410 last_error-clobbering bug: the run loop's
+/// generic tail cleanup used to unconditionally overwrite the on-disk
+/// `last_error` with `None` after any `Stopped` exit, discarding the
+/// descriptive "superseded by a newer connection" message the detecting
+/// site had just recorded.
+#[tokio::test]
+async fn superseded_close_preserves_the_descriptive_last_error() {
+    let _env_lock = env_lock().await;
+    install_env_secret(40);
+
+    let upstream_addr = spawn_upstream().await;
+    let observations = Arc::new(Mutex::new(RelayObservations::default()));
+    let obs_for_ws = observations.clone();
+
+    let ws_handler = move |ws: WebSocketUpgrade, Path(_name): Path<String>| {
+        let obs = obs_for_ws.clone();
+        async move {
+            ws.on_upgrade(move |mut socket| async move {
+                recv_auth_frame(&mut socket, &obs).await;
+                send_close(&mut socket, CLOSE_SUPERSEDED).await;
+            })
+        }
+    };
+
+    let app = Router::new().route("/v1/tunnel/:name", get(ws_handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let data_root = tempdir().unwrap();
+    seed_enabled_tunnel_state(
+        data_root.path(),
+        "supersedederrornode",
+        &format!("http://{relay_addr}"),
+    );
+    let (_shutdown_tx, handle) = spawn_tunnel_client(data_root.path(), upstream_addr).await;
+
+    tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("tunnel task did not stop after a 4410 close")
+        .expect("tunnel task panicked");
+
+    let link_paths = LinkPaths::from_data_root(data_root.path());
+    let runtime = link_state::read_tunnel_runtime_state(&link_paths)
+        .unwrap()
+        .expect("expected a runtime marker to have been written");
+    assert!(!runtime.connected);
+    let last_error = runtime
+        .last_error
+        .expect("expected the superseded message to survive the run loop's final cleanup");
+    assert!(
+        last_error.contains("superseded"),
+        "expected a descriptive superseded message, got {last_error:?}"
+    );
+}
+
+/// Regression test for the unbounded pending-request map: a relay that opens
+/// many requests without ever finishing their bodies must not be able to
+/// grow the node's in-flight tracking table without limit. Requests beyond
+/// `TINYCLOUD_TUNNEL_MAX_PENDING_REQUESTS` must get an immediate `error`
+/// frame instead.
+#[tokio::test]
+async fn requests_beyond_the_pending_cap_get_an_immediate_error_frame() {
+    let _env_lock = env_lock().await;
+    install_env_secret(41);
+    const CAP: usize = 2;
+    let _cap_guard = EnvVarGuard::set("TINYCLOUD_TUNNEL_MAX_PENDING_REQUESTS", &CAP.to_string());
+
+    let upstream_addr = spawn_upstream().await;
+    let observations = Arc::new(Mutex::new(RelayObservations::default()));
+    let (result_tx, result_rx) = oneshot::channel::<Vec<Option<String>>>();
+    let result_tx = Arc::new(Mutex::new(Some(result_tx)));
+
+    let obs_for_ws = observations.clone();
+    let ws_handler = move |ws: WebSocketUpgrade, Path(_name): Path<String>| {
+        let obs = obs_for_ws.clone();
+        let result_tx = result_tx.clone();
+        async move {
+            ws.on_upgrade(move |mut socket| async move {
+                recv_auth_frame(&mut socket, &obs).await;
+                send_ack(&mut socket).await;
+
+                // Open CAP + 1 requests, never completing their bodies, so
+                // they all remain in the pending/reassembly map.
+                for i in 0..(CAP + 1) {
+                    socket
+                        .send(WsMessage::Text(
+                            TunnelFrame::Request {
+                                id: format!("req-{i}"),
+                                method: "GET".to_string(),
+                                path: "/never-finishes".to_string(),
+                                headers: vec![],
+                            }
+                            .encode(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+
+                // Exactly one of the CAP+1 requests must be rejected
+                // immediately with an error frame (the map only has room for
+                // CAP, and none of these ever complete on their own).
+                let mut errors = Vec::new();
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+                loop {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match tokio::time::timeout(remaining, socket.recv()).await {
+                        Ok(Some(Ok(WsMessage::Text(text)))) => {
+                            if let Ok(TunnelFrame::Error { id, .. }) = TunnelFrame::parse(&text) {
+                                errors.push(id);
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                if let Some(tx) = result_tx.lock().unwrap().take() {
+                    let _ = tx.send(errors);
+                }
+            })
+        }
+    };
+
+    let app = Router::new().route("/v1/tunnel/:name", get(ws_handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let data_root = tempdir().unwrap();
+    seed_enabled_tunnel_state(data_root.path(), "capnode", &format!("http://{relay_addr}"));
+    let (shutdown_tx, handle) = spawn_tunnel_client(data_root.path(), upstream_addr).await;
+
+    let errors = tokio::time::timeout(Duration::from_secs(10), result_rx)
+        .await
+        .expect("relay-side assertions timed out")
+        .expect("relay task dropped its result sender");
+
+    stop_and_join(shutdown_tx, handle).await;
+
+    assert_eq!(
+        errors.len(),
+        1,
+        "expected exactly one rejection once the pending cap is exceeded, got {errors:?}"
+    );
+    assert_eq!(errors[0].as_deref(), Some(format!("req-{CAP}").as_str()));
+}
+
+/// Sets a process env var for the duration of the guard, restoring (or
+/// removing) the previous value on drop. Combined with `env_lock`, this
+/// serializes tests that mutate process-wide env state so they don't race
+/// other tests running in parallel.
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
 }
