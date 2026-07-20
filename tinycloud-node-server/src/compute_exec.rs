@@ -164,11 +164,6 @@ pub struct ComputeExecutor {
 /// How often the epoch ticker increments the engine's epoch. `maxDuration`
 /// caveats are quantized to this granularity.
 const EPOCH_TICK: Duration = Duration::from_millis(20);
-/// Fuel units consumed per millisecond of `maxDuration`, used to derive a
-/// fuel budget from the duration caveat as belt-and-braces CPU metering
-/// (§10.1 "CPU budget ... bound total work (belt-and-braces with
-/// maxDuration)"). `ComputeCaveats` has no standalone CPU field.
-const FUEL_PER_MS: u64 = 5_000_000;
 
 impl ComputeExecutor {
     pub fn new(config: ComputeStorageConfig) -> anyhow::Result<Self> {
@@ -417,12 +412,17 @@ pub async fn execute(
     );
     store.limiter(|state| &mut state.limits);
 
-    let fuel_budget = max_duration_ms.saturating_mul(FUEL_PER_MS).min(cfg.max_fuel_ceiling);
+    // Two INDEPENDENT budgets (§10.1 distinct rows): fuel bounds CPU work
+    // (config ceiling -- `ComputeCaveats` has no per-invoker CPU field, so it
+    // is a node-wide cap, belt-and-braces with the deadline), epoch bounds
+    // WALL-CLOCK time from `maxDuration`. Decoupled so each is separately
+    // enforceable: a tiny `max_fuel_ceiling` trips fuel; a tiny `maxDuration`
+    // trips the epoch deadline.
     store
-        .set_fuel(fuel_budget)
+        .set_fuel(cfg.max_fuel_ceiling)
         .map_err(|e| ComputeExecError::Internal(e.to_string()))?;
     // Epoch deadline: one tick per ~EPOCH_TICK of wall time, rounded up.
-    let deadline_ticks = (max_duration_ms / EPOCH_TICK.as_millis() as u64).max(1);
+    let deadline_ticks = max_duration_ms.div_ceil(EPOCH_TICK.as_millis() as u64).max(1);
     store.set_epoch_deadline(deadline_ticks);
 
     let instance = linker

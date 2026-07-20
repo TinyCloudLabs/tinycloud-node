@@ -768,14 +768,35 @@ mod tests {
         );
         // vfs stays accepted (reserved) so it never regresses to unknown-service.
         assert!(accepted_actions("tinycloud.vfs").is_some());
-        // compute (P0 skeleton) is reserved the same way: accepted at the
-        // policy boundary, but the wildcard carries no implies yet (C1 —
-        // gen-capabilities.mjs only lets a wildcard imply *active* concretes).
+        // compute: the P2 active-flip (compute-service-implementation-plan.md
+        // P2, C10). `execute` and `deploy` are ACTIVE (their handlers ship);
+        // `list` stays RESERVED (no listing handler, §12.1/C9). The wildcard
+        // now implies EXACTLY the two active concretes (gen-capabilities.mjs
+        // invariant: a wildcard implies exactly the active concretes of its
+        // service). Updating this assertion is the conscious act that records
+        // the flip -- the reserved-no-implies pin it replaces was DESIGNED to
+        // fail here on activation.
         assert!(accepted_actions("tinycloud.compute").is_some());
         assert_eq!(
             generated::implied_actions("tinycloud.compute/*"),
-            &[] as &[&str],
-            "compute/* must carry no implies while its concretes are reserved"
+            &["tinycloud.compute/deploy", "tinycloud.compute/execute"],
+            "compute/* must imply exactly the ACTIVE concretes (execute+deploy); list stays reserved"
+        );
+        // `list` remains reserved: accepted at the boundary but NOT pulled in
+        // by the wildcard implication.
+        assert!(!generated::implied_actions("tinycloud.compute/*")
+            .contains(&"tinycloud.compute/list"));
+        let compute_star_grant = ["tinycloud.compute/*".to_string()];
+        let compute_star = expand_granted_actions(&compute_star_grant);
+        for a in ["tinycloud.compute/execute", "tinycloud.compute/deploy"] {
+            assert!(
+                compute_star.contains(a),
+                "compute/* should expand to include {a}"
+            );
+        }
+        assert!(
+            !compute_star.contains("tinycloud.compute/list"),
+            "compute/* must NOT expand to the still-reserved list action"
         );
 
         // Per-service wildcards expand (via implication) to every concrete

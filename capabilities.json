@@ -109,23 +109,27 @@
     {
       "urn": "tinycloud.compute/execute",
       "service": "tinycloud.compute",
-      "status": "reserved"
+      "status": "active",
+      "notes": "P2 (compute-service-implementation-plan.md): flipped reserved->active when the execute handler shipped (routes/mod.rs::handle_compute_execute). Required ability for the `Execute` request variant (§7.1 erratum)."
     },
     {
       "urn": "tinycloud.compute/deploy",
       "service": "tinycloud.compute",
-      "status": "reserved"
+      "status": "active",
+      "notes": "P2: flipped reserved->active alongside execute -- the deploy handler shipped in P1 (routes/mod.rs::handle_compute_deploy) and is the required ability for the `RoutineDid`/`Deploy` request variants (§7.1 erratum). Reachable only via an explicit privileged flow; NEVER enumerated in the standard session grant (F9)."
     },
     {
       "urn": "tinycloud.compute/list",
       "service": "tinycloud.compute",
-      "status": "reserved"
+      "status": "reserved",
+      "notes": "Stays reserved (§12.1/C9): no server-side listing handler exists (DatabaseArtifactRepository has only load/save). The SDK `list` waits for it."
     },
     {
       "urn": "tinycloud.compute/*",
       "service": "tinycloud.compute",
-      "status": "reserved",
-      "notes": "Per-service wildcard. While the concrete actions are reserved this MUST carry no `implies` (gen-capabilities.mjs requires a wildcard to imply exactly the *active* concrete actions of its service). When execute/deploy/list flip to active, add: \"implies\": [\"tinycloud.compute/deploy\", \"tinycloud.compute/execute\", \"tinycloud.compute/list\"]."
+      "status": "active",
+      "implies": ["tinycloud.compute/deploy", "tinycloud.compute/execute"],
+      "notes": "Per-service wildcard. Implies exactly the ACTIVE concrete actions of the service (gen-capabilities.mjs invariant): execute+deploy are active; `list` stays reserved and so is intentionally absent from `implies`. Add `tinycloud.compute/list` here only when it ships."
     },
     {
       "urn": "tinycloud.capabilities/read",

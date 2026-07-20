@@ -140,6 +140,29 @@ name = "compute_routine_key"
 path = "tests/compute_routine_key.rs"
 required-features = ["compute", "dstack"]
 
+# P2 (compute-service-implementation-plan.md): the enforcement matrix --
+# per-import allowed/denied, caveat-echo, cite-all, allowlist, fuel/epoch/
+# memory limits, input-schema, rotation tripwire, invoker-side echo.
+[[test]]
+name = "compute_execute"
+path = "tests/compute_execute.rs"
+required-features = ["compute"]
+
+# P2: the Appendix A conformance fixture end-to-end (exact A.3 JSON, A.4
+# denial envelope, A.5 manifest byte-for-byte) + the forbidden-import link
+# error.
+[[test]]
+name = "compute_abi"
+path = "tests/compute_abi.rs"
+required-features = ["compute"]
+
+# P2: full HTTP E2E -- deploy via the real deploy path, invoker executes with
+# only compute/execute, asserts result + manifest + a denial + zero data caps.
+[[test]]
+name = "compute_e2e"
+path = "tests/compute_e2e.rs"
+required-features = ["compute"]
+
 # cargo-binstall support: allows `cargo binstall tinycloud-node`
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/{ name }-v{ version }/{ name }-{ target }{ archive-suffix }"
