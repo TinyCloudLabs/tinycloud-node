@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::io::AsyncWriteExt;
-use wasmtime::{Caller, Config as WasmConfig, Engine, FuncType, Linker, Module, Store, Val, ValType};
+use wasmtime::{Config as WasmConfig, Engine, FuncType, Linker, Module, Store, Val, ValType};
 
 use tinycloud_auth::{
     authorization::{Cid as AuthCid, TinyCloudInvocation},
@@ -53,7 +53,7 @@ use tinycloud_core::{
     models::invocation::InvocationError,
     sql::{SqlRequest, SqlResponse, SqlService},
     storage::ImmutableStaging,
-    types::{Metadata, Resource},
+    types::Metadata,
     ComputeGrantedAbility, InvocationOutcome, KvInvokeOptions, TxStoreError,
 };
 
@@ -131,8 +131,6 @@ pub enum ComputeExecError {
     ContentCidMismatch { expected: String, actual: String },
     #[error("routine-identity-rotated: re-derived routine DID does not match the deployed D_fn's delegatee for content_cid {0}; re-deploy to re-mint D_fn")]
     RoutineIdentityRotated(String),
-    #[error("function \"{0}\" is not in the caller's functions allowlist")]
-    FunctionNotAllowed(String),
     #[error("input failed schema validation: {0}")]
     InputSchemaInvalid(String),
     #[error("caveat {name} = {value} exceeds the configured ceiling {ceiling}")]
@@ -337,6 +335,7 @@ pub async fn execute(
     resolved: ResolvedFunction,
     space: &SpaceId,
     input: serde_json::Value,
+    output_ref: Option<String>,
     caveats: &tinycloud_core::compute::ComputeCaveats,
 ) -> Result<(serde_json::Value, ExecutionManifest), ComputeExecError> {
     // §10.1 numeric ceilings: reject (not silently clamp) an absurd caveat on
@@ -431,17 +430,6 @@ pub async fn execute(
         .await
         .map_err(|e| ComputeExecError::Module(e.to_string()))?;
 
-    let functions_allowed = caveats
-        .functions
-        .as_ref()
-        .map(|allowlist| allowlist.iter().any(|f| f == &resolved_function_name(&ctx)))
-        .unwrap_or(true);
-    if !functions_allowed {
-        return Err(ComputeExecError::FunctionNotAllowed(
-            resolved_function_name(&ctx),
-        ));
-    }
-
     let alloc = instance
         .get_func(&mut store, "alloc")
         .ok_or_else(|| ComputeExecError::Module("guest is missing the \"alloc\" export".into()))?;
@@ -478,19 +466,71 @@ pub async fn execute(
     let result: serde_json::Value =
         serde_json::from_slice(&result_bytes).map_err(|e| ComputeExecError::Internal(e.to_string()))?;
 
-    let manifest = std::mem::take(&mut store.data_mut().manifest).finalize();
-    Ok((result, manifest))
-}
+    // §8 option 2: write the result to a KV path under the routine's OWN
+    // `D_fn` grant (which must include `kv/put` on that prefix). This is a
+    // mediated host call exactly like the guest's own puts -- journaled in
+    // the manifest, subject to the same fail-closed authorization -- so an
+    // `output_ref` under an ungranted prefix surfaces as a denial entry, not
+    // a silent drop. When present, the inline body carries a small ack; the
+    // result itself lives at the KV path (governed by ordinary kv/get
+    // grants downstream).
+    let final_result = if let Some(output_path) = &output_ref {
+        let put_bytes =
+            serde_json::to_vec(&result).map_err(|e| ComputeExecError::Internal(e.to_string()))?;
+        let bytes_in = put_bytes.len() as u64;
+        let outcome = mediate_kv_call(&ctx, KV_PUT, output_path, Some(put_bytes)).await?;
+        let (ack, granted) = match &outcome {
+            KvOutcome::WriteOk => (
+                serde_json::json!({"outputRef": output_path, "written": true}),
+                true,
+            ),
+            KvOutcome::Denied { .. } => (
+                serde_json::json!({"outputRef": output_path, "written": false, "denied": true}),
+                false,
+            ),
+            _ => (
+                serde_json::json!({"outputRef": output_path, "written": false}),
+                false,
+            ),
+        };
+        let ack_bytes =
+            serde_json::to_vec(&ack).map_err(|e| ComputeExecError::Internal(e.to_string()))?;
+        store.data_mut().manifest.record(ManifestEntry {
+            resource: kv_resource_string(&ctx.space, output_path),
+            ability: KV_PUT.to_string(),
+            bytes_in,
+            bytes_out: ack_bytes.len() as u64,
+            destination: output_path.clone(),
+            granted,
+        });
+        ack
+    } else {
+        result
+    };
 
-fn resolved_function_name(ctx: &ExecutionCtx) -> String {
-    // The allowlist is keyed on the `<function-path>` name; the mediator
-    // only ever has the content CID in hand at this layer, so callers that
-    // need name-based allowlisting pass it through `caveats.functions`
-    // against the ORIGINAL request's `function` field (checked by the
-    // route handler, not here, when the name is available). This helper
-    // exists so `execute`'s allowlist check has a stable, single call site
-    // to extend if/when the name is threaded into `ExecutionCtx`.
-    ctx.content_cid.clone()
+    let manifest = std::mem::take(&mut store.data_mut().manifest).finalize();
+
+    // §9.1.1 opt-in KV audit persistence (behind `persist_manifest`). Written
+    // under the routine's OWN `D_fn` grant to `audit/compute/<cid>/<nonce>`,
+    // the same mediated KV-put mechanism as §8 -- so audit records are
+    // governed by ordinary KV read delegations. Best-effort and DELIBERATELY
+    // NOT recorded into the returned manifest (it is meta-observability, and
+    // recording it would perturb the byte-exact manifest the conformance
+    // fixture asserts). A failure/denial here never fails the execution.
+    if cfg.persist_manifest {
+        let audit_path = format!(
+            "audit/compute/{}/{:032x}",
+            ctx.content_cid,
+            rand::random::<u128>()
+        );
+        if let Ok(bytes) = serde_json::to_vec(&manifest) {
+            if let Err(err) = mediate_kv_call(&ctx, KV_PUT, &audit_path, Some(bytes)).await {
+                ::tracing::warn!(error = %err, "compute manifest audit-persist failed (best-effort)");
+            }
+        }
+    }
+
+    Ok((final_result, manifest))
 }
 
 async fn call_alloc(

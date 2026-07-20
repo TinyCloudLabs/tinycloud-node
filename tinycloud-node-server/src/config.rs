@@ -413,6 +413,7 @@ impl Default for Storage {
             limit: None,
             sql: SqlStorageConfig::default(),
             duckdb: DuckDbStorageConfig::default(),
+            compute: ComputeStorageConfig::default(),
         }
     }
 }

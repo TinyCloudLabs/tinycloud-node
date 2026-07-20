@@ -518,6 +518,7 @@ pub async fn invoke(
     sql_service: &State<SqlService>,
     duckdb_service: &State<DuckDbService>,
     compute_service: &State<ComputeService>,
+    compute_executor: &State<crate::compute_exec::ComputeExecutor>,
     hook_runtime: &State<HookRuntime>,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
     invoke_impl(
@@ -533,6 +534,7 @@ pub async fn invoke(
         sql_service,
         duckdb_service,
         compute_service,
+        compute_executor,
         hook_runtime,
     )
     .await
@@ -568,6 +570,7 @@ pub async fn invoke(
         sql_service,
         duckdb_service,
         (),
+        (),
         hook_runtime,
     )
     .await
@@ -588,6 +591,7 @@ pub async fn invoke(
     invocation_replay_cache: &State<InvocationReplayCache>,
     sql_service: &State<SqlService>,
     compute_service: &State<ComputeService>,
+    compute_executor: &State<crate::compute_exec::ComputeExecutor>,
     hook_runtime: &State<HookRuntime>,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
     invoke_impl(
@@ -603,6 +607,7 @@ pub async fn invoke(
         sql_service,
         (),
         compute_service,
+        compute_executor,
         hook_runtime,
     )
     .await
@@ -635,6 +640,7 @@ pub async fn invoke(
         quota_cache,
         invocation_replay_cache,
         sql_service,
+        (),
         (),
         (),
         hook_runtime,
@@ -1191,6 +1197,8 @@ async fn invoke_impl(
     >,
     #[cfg_attr(not(feature = "compute"), allow(unused_variables))]
     compute_service: ComputeInvokeState<'_>,
+    #[cfg_attr(not(feature = "compute"), allow(unused_variables))]
+    compute_executor: ComputeExecutorInvokeState<'_>,
     hook_runtime: &State<HookRuntime>,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
     let action_label = "invocation";
@@ -1334,8 +1342,11 @@ async fn invoke_impl(
                 let result = handle_compute_invoke(
                     i,
                     data,
+                    staging,
                     tinycloud,
                     compute_service,
+                    compute_executor,
+                    sql_service,
                     config,
                     quota_cache,
                     &compute_caps,
@@ -2009,6 +2020,71 @@ async fn derive_chain_constrained_caveat_with_conn<C: tinycloud_core::sea_orm::C
     Ok(None)
 }
 
+/// P2 (compute-service.md §6.3): derive the enforced `ComputeCaveats` from
+/// the VALIDATED delegation chain, NOT from the invoker's own invocation
+/// facts. Mirrors `derive_chain_constrained_caveat` (the SQL W1 pattern): an
+/// invoker cannot widen or drop the `functions` allowlist (or the resource
+/// ceilings) by editing the invocation envelope. A caveat is recognized ONLY
+/// when it carries the explicit `computeCaveats` wrapper key (§7.2) -- so the
+/// `computeFunctionBinding` binding caveat (which would otherwise deserialize
+/// into an all-`None` `ComputeCaveats` because every field is
+/// `#[serde(default)]`) is NOT mistaken for a compute-caveat. Returns the
+/// FIRST such caveat found walking leaf->root; `None` when the chain carries
+/// no compute caveat (the unconstrained case).
+#[cfg(feature = "compute")]
+async fn derive_chain_compute_caveats(
+    tinycloud: &State<TinyCloud>,
+    parent_cids: &[tinycloud_auth::authorization::Cid],
+) -> Result<Option<tinycloud_core::compute::ComputeCaveats>, (Status, String)> {
+    use std::collections::HashSet;
+    use tinycloud_core::hash::Hash;
+    use tinycloud_core::models::abilities;
+    use tinycloud_core::relationships::parent_delegations;
+
+    if parent_cids.is_empty() {
+        return Ok(None);
+    }
+    let conn = tinycloud
+        .readable()
+        .await
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+
+    let mut frontier: Vec<Hash> = parent_cids.iter().copied().map(Hash::from).collect();
+    let mut visited: HashSet<Hash> = HashSet::new();
+    while !frontier.is_empty() {
+        let batch: Vec<Hash> = frontier.drain(..).filter(|h| visited.insert(*h)).collect();
+        if batch.is_empty() {
+            break;
+        }
+        let rows = abilities::Entity::find()
+            .filter(abilities::Column::Delegation.is_in(batch.clone()))
+            .all(&conn)
+            .await
+            .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+        for row in rows {
+            for v in row.caveats.0.values() {
+                if let Some(inner) = v.as_object().and_then(|o| o.get("computeCaveats")) {
+                    let caveats: tinycloud_core::compute::ComputeCaveats =
+                        serde_json::from_value(inner.clone())
+                            .map_err(|e| (Status::BadRequest, e.to_string()))?;
+                    return Ok(Some(caveats));
+                }
+            }
+        }
+        let parents = parent_delegations::Entity::find()
+            .filter(parent_delegations::Column::Child.is_in(batch))
+            .all(&conn)
+            .await
+            .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+        for link in parents {
+            if !visited.contains(&link.parent) {
+                frontier.push(link.parent);
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// W1 (D): translate the chain-derived constrained-statements caveat into
 /// the SQL service's `SqlCaveats` shape. This is what binds execution to the
 /// validated chain — the SQL service will only honor the named statements
@@ -2414,17 +2490,30 @@ fn select_compute_scope<'a>(
 async fn handle_compute_invoke(
     i: AuthHeaderGetter<InvocationInfo>,
     data: DataIn<'_>,
+    staging: &State<BlockStage>,
     tinycloud: &State<TinyCloud>,
     compute_service: &State<ComputeService>,
+    compute_executor: &State<crate::compute_exec::ComputeExecutor>,
+    sql_service: &State<SqlService>,
     config: &State<Config>,
     quota_cache: &State<QuotaCache>,
     compute_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
+    // Capture the invocation's cited parent delegations BEFORE `verify_auth`
+    // consumes `i.0` -- the chain-derived `ComputeCaveats` (§6.3) is read
+    // from these, NOT from the invoker's own facts.
+    let parent_cids: Vec<_> = i.0 .0.parents.to_vec();
+
     // Layer (a) invoker authorization (compute-service.md §6.1): the same
     // delegation-chain walk sql/duckdb use. Proves `compute_caps` are backed
     // by a real, unrevoked delegation chain back to the space owner -- the
     // capability filter in `invoke_impl` only inspected the invocation's
-    // self-declared attenuation.
+    // self-declared attenuation. This ALSO enforces the invoker-side caveat
+    // echo (§6.3): if the invoker's `compute/execute` delegation carries a
+    // non-SQL `computeCaveats` map, `validate()` here rejects the invocation
+    // unless it echoes that map verbatim (the byte-equality containment
+    // rule) -- so a caveated grant cannot be exercised without honoring its
+    // caveats, with no compute-specific code.
     verify_auth("server.compute.auth", i.0, tinycloud).await?;
 
     let body_str = read_json_body(data).await?;
@@ -2460,14 +2549,156 @@ async fn handle_compute_invoke(
             )
             .await
         }
-        ComputeRequest::Execute { .. } => Err((
-            Status::NotImplemented,
-            "compute execute is not implemented yet (lands in P2)".to_string(),
-        )),
+        ComputeRequest::Execute {
+            function,
+            content_cid,
+            input,
+            input_refs,
+            output_ref,
+        } => {
+            handle_compute_execute(
+                tinycloud,
+                compute_service,
+                compute_executor,
+                sql_service,
+                staging,
+                space,
+                function_path.as_deref().unwrap_or(function.as_str()),
+                content_cid,
+                input,
+                input_refs,
+                output_ref,
+                &parent_cids,
+            )
+            .await
+        }
         ComputeRequest::List => Err((
             Status::NotImplemented,
             "tinycloud.compute/list has no server-side handler (reserved)".to_string(),
         )),
+    }
+}
+
+/// P2 execute handler (compute-service.md §6/§8/§9/§10). Resolves the
+/// function (with the F1.5 rotation tripwire), reads the enforced
+/// `ComputeCaveats` from the VALIDATED chain (§6.3 -- NOT invoker facts),
+/// enforces the `functions` allowlist against the function NAME (available
+/// here, unlike inside the backend which only sees the content CID), runs the
+/// wasmtime backend, and returns the guest result + execution manifest
+/// (§9.1.1) as `ComputeResult`.
+#[cfg(feature = "compute")]
+#[allow(clippy::too_many_arguments)]
+async fn handle_compute_execute(
+    tinycloud: &State<TinyCloud>,
+    compute_service: &State<ComputeService>,
+    compute_executor: &State<crate::compute_exec::ComputeExecutor>,
+    sql_service: &State<SqlService>,
+    staging: &State<BlockStage>,
+    space: &tinycloud_auth::resource::SpaceId,
+    function: &str,
+    content_cid: Option<String>,
+    input: Option<serde_json::Value>,
+    input_refs: Option<Vec<String>>,
+    output_ref: Option<String>,
+    parent_cids: &[tinycloud_auth::authorization::Cid],
+) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
+    // §7.2: host-side pre-reading of `input_refs` is a §8 composability
+    // extension NOT in the MVP surface (the fixture guest reads its own
+    // inputs via `storage_get`). Reject loudly rather than silently ignoring
+    // a caller-supplied field.
+    if input_refs.as_ref().map(|r| !r.is_empty()).unwrap_or(false) {
+        return Err((
+            Status::BadRequest,
+            "`input_refs` (host-side input pre-read) is not supported in the MVP; the routine reads its own inputs via storage_get (§8)".to_string(),
+        ));
+    }
+
+    // §6.3: enforced ComputeCaveats come from the validated chain.
+    let chain_caveats = derive_chain_compute_caveats(tinycloud, parent_cids)
+        .await?
+        .unwrap_or_default();
+
+    // §10.1 `functions` allowlist: enforced HERE against the function NAME
+    // (the backend only sees the content CID). Chain-derived, so an invoker
+    // cannot widen it.
+    if let Some(allowlist) = &chain_caveats.functions {
+        if !allowlist.iter().any(|f| f == function) {
+            let resource = compute_resource(space, Some(function))?;
+            let ability = Ability::try_from("tinycloud.compute/execute".to_string())
+                .map_err(|e| (Status::InternalServerError, format!("{e:?}")))?;
+            return Err((
+                Status::Forbidden,
+                format!("Unauthorized Action: {resource} / {ability}"),
+            ));
+        }
+    }
+
+    let resolved = crate::compute_exec::resolve_function(
+        tinycloud,
+        compute_service,
+        space,
+        function,
+        content_cid.as_deref(),
+    )
+    .await
+    .map_err(compute_exec_error_to_status)?;
+
+    let (result, manifest) = crate::compute_exec::execute(
+        compute_executor,
+        tinycloud,
+        sql_service,
+        staging,
+        resolved,
+        space,
+        input.unwrap_or_else(|| serde_json::json!({})),
+        output_ref,
+        &chain_caveats,
+    )
+    .await
+    .map_err(compute_exec_error_to_status)?;
+
+    // §9.1.1: the manifest rides in the outcome. For the inline JSON case
+    // we attach it as a `manifest` field on the result object (a `Metadata`-
+    // carried block is the alternative the spec allows; the inline field
+    // keeps the single-JSON transport with no new header machinery).
+    let manifest_json =
+        serde_json::to_value(&manifest).map_err(|e| (Status::InternalServerError, e.to_string()))?;
+    let response = serde_json::json!({
+        "result": result,
+        "manifest": manifest_json,
+    });
+
+    // Optional KV audit persistence (§9.1.1, behind persist_manifest) is
+    // handled inside the backend (`compute_exec::execute`), where the routine
+    // key is in scope; the in-outcome manifest returned here is ALWAYS
+    // present regardless.
+    Ok(DataOut::One(InvOut(InvocationOutcome::ComputeResult(
+        response,
+    ))))
+}
+
+/// Map a `ComputeExecError` to an HTTP status. CRITICAL (compute-service.md
+/// §6.2/F1.5): `RoutineIdentityRotated` maps to 409 (a distinct, retriable
+/// "re-mint D_fn" signal) -- NEVER a generic 403 -- so a dstack seed rotation
+/// is diagnosable instead of surfacing as an opaque authorization failure.
+/// Note a per-HOST-CALL authorization denial NEVER reaches this function: it
+/// is the A.4 in-guest error envelope (the request still returns 200), not a
+/// `ComputeExecError`.
+#[cfg(feature = "compute")]
+fn compute_exec_error_to_status(error: crate::compute_exec::ComputeExecError) -> (Status, String) {
+    use crate::compute_exec::ComputeExecError;
+    match error {
+        ComputeExecError::FunctionNotFound(_) => (Status::NotFound, error.to_string()),
+        ComputeExecError::ContentCidMismatch { .. } => (Status::Conflict, error.to_string()),
+        // F1.5: 409, distinct from a 403. (409 == Conflict.)
+        ComputeExecError::RoutineIdentityRotated(_) => (Status::Conflict, error.to_string()),
+        ComputeExecError::InputSchemaInvalid(_) => (Status::BadRequest, error.to_string()),
+        ComputeExecError::CaveatCeilingExceeded { .. } => (Status::BadRequest, error.to_string()),
+        ComputeExecError::Module(_) => (Status::BadRequest, error.to_string()),
+        ComputeExecError::Trap(_) => (Status::UnprocessableEntity, error.to_string()),
+        ComputeExecError::Db(ref e) => (database_error_status(e), error.to_string()),
+        ComputeExecError::Artifact(_) => (Status::InternalServerError, error.to_string()),
+        ComputeExecError::Internal(_) => (Status::InternalServerError, error.to_string()),
     }
 }
 
