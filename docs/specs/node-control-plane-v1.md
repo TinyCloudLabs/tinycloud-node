@@ -1102,6 +1102,97 @@ listener and always reports `stopped` when link is enabled.
 staging, self-hosted, or air-gapped deployments. `--bind` defaults to
 `0.0.0.0:8443`.
 
+### 3.10 `tinycloud node tunnel` (TC-252)
+
+`tunnel` subcommands connect the node to the tinycloud.link tunnel relay
+(TC-85 service-side) so it is reachable from anywhere on the internet at
+`https://<name>.tinycloud.link` — no inbound port, public IP, or NAT
+configuration required. The node dials **out** to the relay and keeps one
+WebSocket open; the relay proxies each HTTPS request for that hostname down
+the socket and the node relays it to its own loopback public API.
+
+A tunnel requires a name already claimed via `link enable` (§3.9) — it reuses
+that name's `did:key` subject and the exact same shared `sequence` counter in
+`dataPath/link/state.json` (claim, delete, cert-request, and tunnel-auth all
+bump one counter per name, never a separate one per action type).
+
+Commands:
+
+- `tinycloud node tunnel enable [--service-url <url>] [--json]`
+- `tinycloud node tunnel disable [--json]`
+- `tinycloud node tunnel status [--json]`
+
+`enable` behavior:
+
+- Fails with "link is not enabled" if `dataPath/link/state.json` doesn't
+  exist yet — `link enable <name>` must run first.
+- Does **not** itself dial the relay. It sets `tunnelEnabled: true` (and,
+  if `--service-url` was given, `tunnelServiceUrl`) on the existing
+  `state.json`, under the same advisory lock `link enable`/`disable`/`renew`
+  use. The outbound connection starts on the next `serve` (re)start, exactly
+  like `link enable`'s LAN TLS listener — toggling the tunnel while `serve`
+  is already running takes effect on the next restart, not live.
+- `--service-url` overrides only the tunnel relay base URL; it defaults to
+  the link name's own `serviceUrl` (the common case: one tinycloud.link
+  deployment serves `/v1/names`, `/v1/certs`, and `/v1/tunnel`).
+
+`disable` behavior:
+
+- Clears `tunnelEnabled` (and the on-disk tunnel-runtime marker described
+  below) on `state.json`. The `link` name claim itself is untouched — only
+  `link disable` removes that.
+
+Connection lifecycle (owned by `serve`, not the CLI):
+
+- Bump-before-connect: before every connect attempt (including reconnects),
+  the tunnel task consumes the name's next shared `sequence` value and
+  persists it to `state.json` *before* dialing the relay — the same ordering
+  discipline as `link`'s claim/cert calls (see §3.9's "Sequence and error
+  handling"), because the relay commits its own sequence bump as soon as
+  auth succeeds.
+- Dials `wss://<service>/v1/tunnel/<name>` and sends the signed tunnel-auth
+  frame (`{version, action: "tunnel", name, subject, sequence, signature}`,
+  canonicalized and signed exactly like the claim/delete/cert payloads) as
+  the first WebSocket message, then waits for `{"type":"ack"}`.
+- On ack, the socket is multiplexed: each proxied `request` +
+  `requestBody...` sequence is reassembled (bodies capped at 25MB, split
+  across `requestBody`/`responseBody` frames of at most 256KB each per the
+  relay's wire protocol), forwarded to `127.0.0.1:<public API port>`, and the
+  response streamed back as `response` + `responseBody...` frames. A
+  per-request failure sends an `error` frame for that request's `id` only —
+  it never closes the socket.
+- The relay pings every 30s; the underlying WebSocket library answers pings
+  automatically. If no frame (data, ping, or close) arrives for an extended
+  idle window, the node treats the connection as dead and reconnects.
+- Reconnect policy on disconnect: close code `4409` (stale sequence) resyncs
+  the local sequence forward and retries immediately, mirroring `link`'s
+  resync-and-retry recovery; close code `4410` (superseded — a newer
+  connection for this name has taken over) stops the tunnel task entirely
+  and does **not** reconnect-fight with the socket that superseded it; any
+  other close code or transport error backs off exponentially (capped, with
+  jitter) before retrying with a fresh sequence.
+
+`tunnel status --json` and `service status --json` return the following
+extra fields (v1-tunnel, all optional):
+
+```json
+{
+  "tunnelEnabled": true,
+  "tunnelConnected": true,
+  "tunnelRemoteUrl": "https://mynode.tinycloud.link",
+  "tunnelLastError": null
+}
+```
+
+`tunnelConnected` and `tunnelLastError` are sourced from an on-disk
+connection-state marker (`dataPath/link/tunnel-state.json`) the running
+`serve` tunnel task writes after each connect/auth/disconnect event, not
+inferred from whether the node process is up — the same pattern §3.9 uses
+for `linkListener`/`linkListenerError`. `tunnel status --json` run from a
+separate CLI invocation (not from inside `serve`) cannot observe the live
+socket and always reports `tunnelConnected: false` when the tunnel is
+enabled but not actually serving from that invocation's perspective.
+
 ## 4. Platform Paths
 
 The node has a config root, a data root, and a logs root. The runtime files live
