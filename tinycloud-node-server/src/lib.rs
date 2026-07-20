@@ -150,43 +150,43 @@ pub async fn app(
     tracing::tracing_try_init(&tinycloud_config.log)?;
 
     let routes = {
-        let mut routes = routes![
-            healthcheck,
-            cors,
-            info,
-            version,
-            open_host_key,
-            invoke,
-            delegate,
-            delegation_query,
-            delegation_status,
-            revoke,
-            create_signed_kv_url,
-            signed_kv_get,
-            create_hook_ticket,
-            hook_events,
-            create_webhook,
-            list_webhooks,
-            delete_webhook,
-            public_kv_get,
-            public_kv_head,
-            public_kv_list,
-            public_kv_options,
-            attestation,
-            set_quota,
-            delete_quota,
-            get_quota,
-            list_quotas,
-            get_usage,
-            create_encryption_network,
-            get_encryption_network,
-            encryption_well_known,
-            encryption_decrypt,
-            revoke_encryption_network,
-        ];
-
         #[cfg(feature = "tc-bench-v1")]
         {
+            let mut routes = routes![
+                healthcheck,
+                cors,
+                info,
+                version,
+                open_host_key,
+                invoke,
+                delegate,
+                delegation_query,
+                delegation_status,
+                revoke,
+                create_signed_kv_url,
+                signed_kv_get,
+                create_hook_ticket,
+                hook_events,
+                create_webhook,
+                list_webhooks,
+                delete_webhook,
+                public_kv_get,
+                public_kv_head,
+                public_kv_list,
+                public_kv_options,
+                attestation,
+                set_quota,
+                delete_quota,
+                get_quota,
+                list_quotas,
+                get_usage,
+                create_encryption_network,
+                get_encryption_network,
+                encryption_well_known,
+                encryption_decrypt,
+                revoke_encryption_network,
+            ];
+
             routes.extend(routes![
                 tc_bench_auth_verify,
                 tc_bench_kv_put,
@@ -195,9 +195,47 @@ pub async fn app(
                 tc_bench_block_get,
                 tc_bench_health,
             ]);
+
+            routes
         }
 
-        routes
+        #[cfg(not(feature = "tc-bench-v1"))]
+        {
+            routes![
+                healthcheck,
+                cors,
+                info,
+                version,
+                open_host_key,
+                invoke,
+                delegate,
+                delegation_query,
+                delegation_status,
+                revoke,
+                create_signed_kv_url,
+                signed_kv_get,
+                create_hook_ticket,
+                hook_events,
+                create_webhook,
+                list_webhooks,
+                delete_webhook,
+                public_kv_get,
+                public_kv_head,
+                public_kv_list,
+                public_kv_options,
+                attestation,
+                set_quota,
+                delete_quota,
+                get_quota,
+                list_quotas,
+                get_usage,
+                create_encryption_network,
+                get_encryption_network,
+                encryption_well_known,
+                encryption_decrypt,
+                revoke_encryption_network,
+            ]
+        }
     };
 
     let identity_state = key_provider::resolve_identity_state(

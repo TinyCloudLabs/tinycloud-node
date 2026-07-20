@@ -2476,6 +2476,8 @@ mod tests {
             "request body.publicApi"
         );
 
+        let _ = wait_for_status(&client, &base_url, &token).await;
+
         let service_status = tokio::task::spawn_blocking(service::service_status)
             .await
             .unwrap()
