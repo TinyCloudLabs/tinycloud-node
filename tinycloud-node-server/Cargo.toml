@@ -91,6 +91,8 @@ path = "../tinycloud-auth/"
 axum = { version = "0.7", features = ["ws"] }
 bs58 = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+k256 = { version = "0.13.4", features = ["ecdsa"] }
+sha3 = "0.10"
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 hyper = { version = "0.14", features = ["http1", "server", "tcp"] }
 libp2p-identity = { version = "0.2", features = ["ed25519"] }
@@ -102,6 +104,7 @@ x509-parser = "0.16"
 default = []
 dstack = []
 duckdb = ["tinycloud-core/duckdb"]
+tc-bench-v1 = []
 
 # cargo-dist metadata
 [package.metadata.dist]

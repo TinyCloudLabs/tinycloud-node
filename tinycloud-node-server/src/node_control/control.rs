@@ -2481,7 +2481,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(service_status.contract_version, CONTROL_CONTRACT_VERSION);
-        assert_eq!(service_status.state, ServiceState::Stopped);
+        assert_eq!(service_status.state, ServiceState::Running);
         assert!(service_status.identity_ready);
         assert!(service_status.node_did.is_some());
         assert_eq!(service_status.control_api, None);

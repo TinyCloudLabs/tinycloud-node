@@ -52,6 +52,12 @@ use node_control::{
     key_provider::{self, IdentityPurpose},
 };
 use quota::QuotaCache;
+#[cfg(feature = "tc-bench-v1")]
+use routes::tc_bench::{
+    auth_verify as tc_bench_auth_verify, block_get as tc_bench_block_get,
+    block_put as tc_bench_block_put, health as tc_bench_health, kv_get as tc_bench_kv_get,
+    kv_put as tc_bench_kv_put, BenchState,
+};
 use routes::{
     admin::{delete_quota, get_quota, get_usage, list_quotas, set_quota},
     attestation::attestation,
@@ -143,40 +149,56 @@ pub async fn app(
 
     tracing::tracing_try_init(&tinycloud_config.log)?;
 
-    let routes = routes![
-        healthcheck,
-        cors,
-        info,
-        version,
-        open_host_key,
-        invoke,
-        delegate,
-        delegation_query,
-        delegation_status,
-        revoke,
-        create_signed_kv_url,
-        signed_kv_get,
-        create_hook_ticket,
-        hook_events,
-        create_webhook,
-        list_webhooks,
-        delete_webhook,
-        public_kv_get,
-        public_kv_head,
-        public_kv_list,
-        public_kv_options,
-        attestation,
-        set_quota,
-        delete_quota,
-        get_quota,
-        list_quotas,
-        get_usage,
-        create_encryption_network,
-        get_encryption_network,
-        encryption_well_known,
-        encryption_decrypt,
-        revoke_encryption_network,
-    ];
+    let routes = {
+        let mut routes = routes![
+            healthcheck,
+            cors,
+            info,
+            version,
+            open_host_key,
+            invoke,
+            delegate,
+            delegation_query,
+            delegation_status,
+            revoke,
+            create_signed_kv_url,
+            signed_kv_get,
+            create_hook_ticket,
+            hook_events,
+            create_webhook,
+            list_webhooks,
+            delete_webhook,
+            public_kv_get,
+            public_kv_head,
+            public_kv_list,
+            public_kv_options,
+            attestation,
+            set_quota,
+            delete_quota,
+            get_quota,
+            list_quotas,
+            get_usage,
+            create_encryption_network,
+            get_encryption_network,
+            encryption_well_known,
+            encryption_decrypt,
+            revoke_encryption_network,
+        ];
+
+        #[cfg(feature = "tc-bench-v1")]
+        {
+            routes.extend(routes![
+                tc_bench_auth_verify,
+                tc_bench_kv_put,
+                tc_bench_kv_get,
+                tc_bench_block_put,
+                tc_bench_block_get,
+                tc_bench_health,
+            ]);
+        }
+
+        routes
+    };
 
     let identity_state = key_provider::resolve_identity_state(
         Some(&tinycloud_config.keys),
@@ -277,6 +299,8 @@ pub async fn app(
         node_keypair,
         encryption_backend,
     );
+    #[cfg(feature = "tc-bench-v1")]
+    let bench_database_connection = database_connection.clone();
 
     let tinycloud = TinyCloud::new(
         database_connection,
@@ -286,6 +310,14 @@ pub async fn app(
     .await?
     .with_encryption(Some(webhook_encryption.clone()))
     .with_sql_sizes(sql_sizes.clone());
+
+    #[cfg(feature = "tc-bench-v1")]
+    let bench_state = BenchState::new(
+        &tinycloud_config.tc_bench,
+        bench_database_connection,
+        if is_sqlite { 1 } else { 100 },
+    )
+    .await?;
 
     // Seed the SQL-size mirror AFTER `TinyCloud::new` ran migrations — the
     // `database_artifact` table now exists (seeding before migrations would
@@ -338,6 +370,8 @@ pub async fn app(
         })
         .manage(tinycloud)
         .manage(sql_service);
+    #[cfg(feature = "tc-bench-v1")]
+    let rocket = rocket.manage(bench_state);
     #[cfg(feature = "duckdb")]
     let rocket = rocket.manage(duckdb_service);
     let rocket = rocket

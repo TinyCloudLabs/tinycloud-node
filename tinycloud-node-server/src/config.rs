@@ -20,6 +20,8 @@ pub struct Config {
     pub spaces: SpacesConfig,
     #[serde(default)]
     pub hooks: HooksConfig,
+    #[serde(default)]
+    pub tc_bench: TcBenchConfig,
     pub relay: Relay,
     #[serde(default)]
     pub telemetry: Telemetry,
@@ -61,6 +63,30 @@ impl Default for PublicSpacesConfig {
             rate_limit_per_minute: default_rate_limit_per_minute(),
             rate_limit_burst: default_rate_limit_burst(),
             storage_limit: default_public_storage_limit(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct TcBenchConfig {
+    #[serde(default = "default_tc_bench_region")]
+    pub region: String,
+    #[serde(default)]
+    pub worker_bundle_sha256: Option<String>,
+    #[serde(default)]
+    pub wasm_bundle_sha256: Option<String>,
+}
+
+fn default_tc_bench_region() -> String {
+    "phala-cvm".to_string()
+}
+
+impl Default for TcBenchConfig {
+    fn default() -> Self {
+        Self {
+            region: default_tc_bench_region(),
+            worker_bundle_sha256: None,
+            wasm_bundle_sha256: None,
         }
     }
 }
