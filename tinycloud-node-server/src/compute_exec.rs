@@ -909,8 +909,12 @@ fn run_blocking(
     memory
         .read(&store, out_ptr as usize, &mut out)
         .map_err(|e| ComputeExecError::Backend(format!("read result: {e}")))?;
-    let result: Value = serde_json::from_slice(&out)
-        .map_err(|e| ComputeExecError::Backend(format!("guest result is not JSON: {e}")))?;
+    let result: Value = serde_json::from_slice(&out).map_err(|e| {
+        ComputeExecError::Backend(format!(
+            "guest result is not JSON: {e}; raw={:?}",
+            String::from_utf8_lossy(&out)
+        ))
+    })?;
 
     let mut host = store.into_data();
     // Optional KV output (§8 option 2): write the result under the routine

@@ -87,10 +87,13 @@
     (call $sql (i32.const 96) (i32.const 52))
     (local.set $r3l)
     (local.set $r3p)
-    ;; Response is {"columns":["n"],"rows":[[1]],"rowCount":1}; the row
-    ;; value digit '1' sits at byte offset 26, length 1. Overwrite the
-    ;; template's "sql_n" placeholder (offset 287, 1 byte).
-    (call $copy (i32.const 287) (i32.add (local.get $r3p) (i32.const 26)) (i32.const 1))
+    ;; The host serializes SqlResponse through serde_json::to_value, whose
+    ;; Value::Object is a SORTED map, so the response is
+    ;; {"columns":["n"],"rowCount":1,"rows":[[1]]} (sorted keys; same 43
+    ;; bytes as the spec's A.3 illustration, which shows insertion order for
+    ;; readability). The "rowCount" digit '1' sits at byte offset 28,
+    ;; length 1. Overwrite the template's "sql_n" placeholder (offset 287).
+    (call $copy (i32.const 287) (i32.add (local.get $r3p) (i32.const 28)) (i32.const 1))
 
     ;; Step 4: storage_del {"key":"out/y"}  (offset 160, len 15)
     (call $del (i32.const 160) (i32.const 15))
