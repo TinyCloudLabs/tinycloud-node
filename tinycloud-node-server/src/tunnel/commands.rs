@@ -15,6 +15,13 @@ use std::path::Path;
 
 use crate::link::state::{self, LinkPaths, StateLock, TunnelRuntimeState};
 
+/// Sentinel error message `bump_sequence_for_tunnel` returns when the tunnel
+/// flag has been turned off (e.g. a concurrent `tunnel disable`). The
+/// connection loop (`tunnel::connection::run`) matches on this exact string
+/// to distinguish "stop reconnecting, this is permanent until re-enabled"
+/// from an ordinary retry-worthy failure.
+pub const TUNNEL_DISABLED_ERROR: &str = "tunnel: disabled";
+
 /// JSON emitted from `tunnel enable`, `tunnel disable`, and `tunnel status`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -71,9 +78,15 @@ pub fn disable(data_root: &Path) -> Result<TunnelStatusReport> {
 
     link_state.tunnel_enabled = false;
     state::write_state(&paths, &link_state)?;
-    // Clear the runtime marker so a stale `connected: true` doesn't linger
-    // after the tunnel task in `serve` stops (it observes tunnel_enabled
-    // flipping to false and shuts itself down — see runtime.rs).
+    // Clear the runtime marker so a stale `connected: true` doesn't linger.
+    // If a tunnel task is running inside `serve`, it only notices the flag
+    // flipping off on its *next* connection attempt (`bump_sequence_for_tunnel`
+    // returns the `TUNNEL_DISABLED_ERROR` sentinel), at which point it stops
+    // reconnecting and clears this same marker itself — see
+    // `tunnel::connection::run`. A socket already live at the moment of this
+    // call keeps serving until its next reconnect or a `serve` restart; this
+    // call's removal here covers the window before that loop notices, and
+    // the case where no `serve` process is running at all.
     state::remove_tunnel_runtime_state(&paths)?;
 
     Ok(disabled_report())
@@ -133,6 +146,14 @@ pub fn record_runtime_state(data_root: &Path, state: &TunnelRuntimeState) -> Res
     state::write_tunnel_runtime_state(&paths, state)
 }
 
+/// Removes the on-disk tunnel-runtime marker. Called from the connection
+/// loop when it detects mid-flight that the tunnel was disabled, so its own
+/// state doesn't resurrect the marker `tunnel disable` already removed.
+pub fn clear_runtime_state(data_root: &Path) -> Result<()> {
+    let paths = LinkPaths::from_data_root(data_root);
+    state::remove_tunnel_runtime_state(&paths)
+}
+
 /// Bump-before-connect: consume the name's next shared sequence value
 /// (plus `extra_jump`, used only when resyncing after a stale-sequence
 /// close) and persist it to `state.json` *before* the caller dials the
@@ -154,7 +175,7 @@ pub fn bump_sequence_for_tunnel(
     let mut link_state =
         state::read_state(&paths)?.ok_or_else(|| anyhow!("tunnel: link state.json is missing"))?;
     if !link_state.tunnel_enabled {
-        return Err(anyhow!("tunnel: disabled"));
+        return Err(anyhow!(TUNNEL_DISABLED_ERROR));
     }
 
     let sequence = link_state.next_sequence().saturating_add(extra_jump);
