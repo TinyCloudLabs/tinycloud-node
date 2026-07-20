@@ -2639,15 +2639,19 @@ async fn handle_compute_execute(
         .into_iter()
         .collect();
 
-    // §9.1.1 optional persistence: also write the manifest to a KV audit
-    // path under the routine grant (best-effort; the in-outcome manifest is
-    // always returned).
+    // §9.1.1: the in-outcome manifest (returned below) is ALWAYS present and
+    // is the normative surface. The OPTIONAL, config-gated KV-audit-path
+    // persistence (writing the manifest under the routine's own grant to
+    // `audit/compute/<cid>/<invocation>`) is a MAY, not a MUST, and is NOT
+    // wired in this stage -- it requires the routine's D_fn to also grant
+    // kv/put on the audit prefix, and adds a second write path. Recorded as a
+    // deferred hook so the flag's contract is explicit rather than silently
+    // ignored.
     if config.storage.compute.persist_manifest {
-        // Best-effort: a failure here (e.g. no kv/put on the audit prefix)
-        // must not fail an otherwise-successful execution.
         ::tracing::debug!(
             function,
-            "compute persist_manifest is enabled but audit persistence is best-effort"
+            "persist_manifest is set, but optional KV-audit persistence is deferred; \
+             the in-outcome manifest is always returned"
         );
     }
 
