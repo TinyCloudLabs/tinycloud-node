@@ -18,6 +18,7 @@ pub mod config;
 pub mod dstack;
 pub mod hooks;
 pub mod invocation_replay;
+pub mod link;
 pub mod node_control;
 pub mod prometheus;
 pub mod quota;
@@ -27,6 +28,7 @@ pub mod signed_urls;
 pub mod storage;
 pub mod tee;
 mod tracing;
+pub mod tunnel;
 pub mod webhook_dispatcher;
 
 #[cfg(test)]
@@ -148,7 +150,7 @@ pub async fn app(
     tracing::tracing_try_init(&tinycloud_config.log)?;
 
     let routes = {
-        let routes = routes![
+        let mut routes = routes![
             healthcheck,
             cors,
             info,

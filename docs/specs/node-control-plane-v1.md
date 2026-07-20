@@ -961,6 +961,251 @@ Contract:
 - It MUST never expose the private key.
 - In `--json` mode, it emits the exact `/v1/identity` response body.
 
+### 3.9 `tinycloud node link` (v1-link)
+
+`link` subcommands integrate the node with the tinycloud.link name+cert
+service so LAN clients can reach the node over browser-trusted HTTPS at
+`https://<name>.local.tinycloud.link[:<port>]`. Adding the link module does
+not change the localhost-only public API listener — the LAN TLS listener is
+only bound when link is explicitly enabled.
+
+Verified first-run ordering: `link enable` derives the node's `did:key` from
+an existing node identity and fails with "node identity is not ready" if none
+exists yet. On a brand-new install the identity is only generated on a node's
+first `serve` boot, so the real first-run order is `serve` (first boot
+generates the identity) → `link enable` → restart `serve` so it picks up the
+LAN TLS listener from the state written by `enable`. Running `link enable`
+before the node has ever been served fails outright.
+
+Commands:
+
+- `tinycloud node link enable <name> [--service-url <url>] [--bind <addr:port>]`
+- `tinycloud node link disable`
+- `tinycloud node link status [--json]`
+- `tinycloud node link renew`
+
+`enable` behavior (v1-link):
+
+- Links the KeyProvider library in-process (same trust boundary as `node key
+  backup` — see §3.7) to derive the node's `did:key` and Ed25519 signing
+  keypair. Private key material is used only long enough to sign the service
+  payloads and never transits the control API.
+- Enumerates the host's private-range LAN IPs (RFC1918 IPv4, ULA `fc00::/7`,
+  IPv4 link-local `169.254.0.0/16`; public and loopback addresses are
+  excluded) and caps the set at 8 addresses. RFC1918/ULA addresses are
+  preferred over IPv4 link-local when truncating to the cap. IPv6 link-local
+  (`fe80::/10`) addresses are excluded from published records entirely: they
+  require a zone/scope ID to be reachable, which a plain AAAA record can't
+  carry.
+- `PUT /v1/names/:name` on the link service with a signed claim payload and
+  a monotonically increasing `sequence` persisted at
+  `dataPath/link/state.json`.
+- Generates a fresh RSA-2048 keypair + PKCS#10 CSR whose CN and single
+  dNSName SAN are both exactly `<name>.local.tinycloud.link` (RSA, not ECDSA,
+  because the service parses submitted CSRs with `node-forge`, which only
+  understands RSA `SubjectPublicKeyInfo`s). Sends the CSR via
+  `POST /v1/certs/:name`. Stores the private key and returned cert chain
+  under `dataPath/link/tls/{key,cert}.pem` with mode `0600`.
+- Writes `dataPath/link/state.json` (mode `0600`) with `{name, serviceUrl,
+  sequence, lastLanIps, certNotAfter, bind}`. The LAN listener activates on
+  next `serve` (re)start if it isn't already running; if it is running (an
+  earlier `enable`/`renew` already started it), the renewed cert is
+  hot-reloaded into the running listener in place — see "Cert hot-reload"
+  below.
+
+`disable` behavior (v1-link):
+
+- Signs `DELETE /v1/names/:name` with the next sequence and removes the
+  `dataPath/link/` directory regardless of whether the service call
+  succeeded. Keeping local state after a failed delete would wedge the node
+  under a name/cert it no longer controls on the service side, so cleanup
+  always happens; a genuine service-side failure is still surfaced as an
+  error to the caller after cleanup runs.
+
+`renew` behavior (v1-link):
+
+- If the current LAN IP set differs from `lastLanIps` in `state.json`,
+  re-claims the name (`PUT`) so DNS points at the current addresses.
+- Requests a fresh cert (`POST`), stores the new key + cert chain, and
+  refreshes `certNotAfter`.
+
+Auto-renew (v1-link):
+
+- `serve` starts a background task alongside the Rocket app that wakes daily,
+  re-claims when the LAN IP set changes, and issues a fresh cert when the
+  stored `certNotAfter` is less than 30 days away.
+
+Cert hot-reload (v1-link):
+
+- The LAN TLS listener's `rustls::ServerConfig` is backed by a custom
+  `ResolvesServerCert` (`link::proxy::LinkCertResolver`) rather than a single
+  static cert. After the auto-renew loop (or a foreground `link renew`
+  while `serve` is already running) writes a new key/cert pair to
+  `dataPath/link/tls/`, it calls the resolver's `update` to swap the served
+  cert in place. Only TLS handshakes that start after the swap see the new
+  cert; already-established connections are unaffected. No listener restart
+  and no dropped connections.
+
+Sequence and error handling (v1-link):
+
+- Every signed action consumes `state.json`'s next sequence value and
+  persists it *before* the network round-trip, not after a successful
+  response. The service commits its own sequence bump as soon as the
+  underlying write lands — for `POST /v1/certs/:name` specifically, this
+  happens before the ACME round-trip (see `server.ts`) — so a client that
+  only persists on success can end up behind the service's record if a later
+  step fails. Persisting first mirrors the service's ordering and closes
+  that gap.
+- If the service still returns a stale-sequence 409 (e.g. `state.json` was
+  restored from a backup), the client resyncs by jumping the local sequence
+  forward and retrying once. `GET /v1/names/:name` does not expose the
+  service's stored sequence, so this is a best-effort recovery, not an exact
+  resync; a second failure is surfaced to the caller.
+- 409 responses are disambiguated by the service's JSON error body rather
+  than treated as one generic conflict: "name already claimed by a different
+  subject" surfaces as a name-conflict error naming the conflicting name and
+  does not modify local state; "stale record sequence" surfaces as a
+  stale-sequence error and triggers the resync-and-retry above.
+- A 429 rate-limited response surfaces the `Retry-After` header value to the
+  caller and to the logs.
+- `enable`/`disable`/`renew` hold an advisory lock over `state.json` for
+  their duration, so the CLI and the in-process auto-renew loop can't race
+  on the sequence counter.
+
+`link status --json` and `service status --json` return the following extra
+fields (v1-link, all optional):
+
+```json
+{
+  "linkName": "mynode",
+  "localUrl": "https://mynode.local.tinycloud.link:8443",
+  "certNotAfter": "2027-06-01T00:00:00Z",
+  "linkListener": "running",
+  "linkListenerError": "address already in use (os error 48)"
+}
+```
+
+`localUrl` omits the port when it is 443. `linkListener` is one of `disabled`
+(link is not enabled), `stopped` (state.json exists but `serve` is not
+running the listener, or the listener's last bind attempt failed), or
+`running` (LAN TLS terminator is bound and accepting connections).
+`service status --json` derives this from an on-disk listener-state marker
+`serve` writes after its actual bind attempt
+(`dataPath/link/listener-state.json`), not merely from whether the node
+process is up — a bind failure (bad address, port in use, permission denied)
+inside an otherwise-running node process is reported as `stopped`, with
+`linkListenerError` set to the bind error. `link status --json` (run from a
+separate CLI invocation, not from inside `serve`) cannot observe the running
+listener and always reports `stopped` when link is enabled.
+
+`--service-url` defaults to `https://api.tinycloud.link` and is intended for
+staging, self-hosted, or air-gapped deployments. `--bind` defaults to
+`0.0.0.0:8443`.
+
+### 3.10 `tinycloud node tunnel` (TC-252)
+
+`tunnel` subcommands connect the node to the tinycloud.link tunnel relay
+(TC-85 service-side) so it is reachable from anywhere on the internet at
+`https://<name>.tinycloud.link` — no inbound port, public IP, or NAT
+configuration required. The node dials **out** to the relay and keeps one
+WebSocket open; the relay proxies each HTTPS request for that hostname down
+the socket and the node relays it to its own loopback public API.
+
+A tunnel requires a name already claimed via `link enable` (§3.9) — it reuses
+that name's `did:key` subject and the exact same shared `sequence` counter in
+`dataPath/link/state.json` (claim, delete, cert-request, and tunnel-auth all
+bump one counter per name, never a separate one per action type).
+
+Commands:
+
+- `tinycloud node tunnel enable [--service-url <url>] [--json]`
+- `tinycloud node tunnel disable [--json]`
+- `tinycloud node tunnel status [--json]`
+
+`enable` behavior:
+
+- Fails with "link is not enabled" if `dataPath/link/state.json` doesn't
+  exist yet — `link enable <name>` must run first.
+- Does **not** itself dial the relay. It sets `tunnelEnabled: true` (and,
+  if `--service-url` was given, `tunnelServiceUrl`) on the existing
+  `state.json`, under the same advisory lock `link enable`/`disable`/`renew`
+  use. The outbound connection starts on the next `serve` (re)start, exactly
+  like `link enable`'s LAN TLS listener — toggling the tunnel while `serve`
+  is already running takes effect on the next restart, not live.
+- `--service-url` overrides only the tunnel relay base URL; it defaults to
+  the link name's own `serviceUrl` (the common case: one tinycloud.link
+  deployment serves `/v1/names`, `/v1/certs`, and `/v1/tunnel`).
+
+`disable` behavior:
+
+- Clears `tunnelEnabled` (and the on-disk tunnel-runtime marker described
+  below) on `state.json`. The `link` name claim itself is untouched — only
+  `link disable` removes that.
+
+Connection lifecycle (owned by `serve`, not the CLI):
+
+- Bump-before-connect: before every connect attempt (including reconnects),
+  the tunnel task consumes the name's next shared `sequence` value and
+  persists it to `state.json` *before* dialing the relay — the same ordering
+  discipline as `link`'s claim/cert calls (see §3.9's "Sequence and error
+  handling"), because the relay commits its own sequence bump as soon as
+  auth succeeds.
+- Dials `wss://<service>/v1/tunnel/<name>` and sends the signed tunnel-auth
+  frame (`{version, action: "tunnel", name, subject, sequence, signature}`,
+  canonicalized and signed exactly like the claim/delete/cert payloads) as
+  the first WebSocket message, then waits for `{"type":"ack"}`.
+- On ack, the socket is multiplexed: each proxied `request` +
+  `requestBody...` sequence is reassembled (bodies capped at 25MB, split
+  across `requestBody`/`responseBody` frames of at most 256KB each per the
+  relay's wire protocol), forwarded to `127.0.0.1:<public API port>`, and the
+  response streamed back as `response` + `responseBody...` frames. A
+  per-request failure sends an `error` frame for that request's `id` only —
+  it never closes the socket.
+- The relay pings every 30s; the underlying WebSocket library answers pings
+  automatically. If no frame (data, ping, or close) arrives for an extended
+  idle window, the node treats the connection as dead and reconnects.
+- Reconnect policy on disconnect: close code `4409` (stale sequence) resyncs
+  the local sequence forward and retries immediately, mirroring `link`'s
+  resync-and-retry recovery; close code `4410` (superseded — a newer
+  connection for this name has taken over) stops the tunnel task entirely
+  and does **not** reconnect-fight with the socket that superseded it; any
+  other close code or transport error backs off exponentially (capped, with
+  jitter) before retrying with a fresh sequence.
+
+`tunnel status --json` and `service status --json` return the following
+extra fields (v1-tunnel, all optional):
+
+```json
+{
+  "tunnelEnabled": true,
+  "tunnelConnected": true,
+  "tunnelRemoteUrl": "https://mynode.tinycloud.link",
+  "tunnelLastError": null
+}
+```
+
+`tunnelConnected` and `tunnelLastError` are sourced from an on-disk
+connection-state marker (`dataPath/link/tunnel-state.json`) the running
+`serve` tunnel task writes after each connect/auth/disconnect event. Both
+`service status --json` and `tunnel status --json` gate `tunnelConnected` on
+process-manager liveness (pid presence) before trusting that marker — the
+same pattern §3.9 uses for `linkListener`. The marker is never cleaned up on
+an unclean exit (crash, `kill -9`, power loss), so trusting it
+unconditionally would report `connected: true` forever after the process
+that wrote it is gone; if the process manager reports no live process,
+`tunnelConnected` is forced to `false` regardless of the marker's contents.
+A disconnect the tunnel task itself observes (a clean drop, a superseding
+connection, `tunnel disable`) is reflected promptly because the task rewrites
+the marker itself at each of those events.
+
+The reconnect loop also treats `tunnel disable` as terminal, not
+retry-worthy: if `serve`'s tunnel task notices the flag flipped off (checked
+before dialing each new attempt, including reconnects), it stops
+reconnecting and removes the marker itself rather than resurrecting it on
+its next scheduled write. A socket already live at the moment `disable` runs
+is not torn down proactively — it keeps serving until its next reconnect or
+a `serve` restart, at which point the disabled check applies.
+
 ## 4. Platform Paths
 
 The node has a config root, a data root, and a logs root. The runtime files live

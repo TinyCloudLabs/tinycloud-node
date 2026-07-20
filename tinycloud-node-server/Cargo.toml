@@ -1,6 +1,6 @@
 [package]
 name = "tinycloud-node"
-version = "1.5.0"
+version = "1.8.0"
 authors = ["TinyCloud Protocol"]
 edition = "2021"
 description = "TinyCloud Protocol Node"
@@ -53,9 +53,16 @@ toml = "0.8"
 thiserror = "2.0"
 time.workspace = true
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread", "signal", "net", "sync"] }
+tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread", "signal", "net", "sync", "time", "io-util"] }
 tokio-stream = { version = "0.1", features = ["fs"] }
 tokio-util = { version = "0.7", features = ["compat"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2"
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+rsa = "0.9"
+if-addrs = "0.13"
 tracing = "0.1"
 tracing-log = "0.2"
 tracing-opentelemetry = "0.30"
@@ -81,22 +88,23 @@ features = ["sqlite", "postgres", "mysql", "tokio"]
 path = "../tinycloud-auth/"
 
 [dev-dependencies]
+axum = { version = "0.7", features = ["ws"] }
 bs58 = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 k256 = { version = "0.13.4", features = ["ecdsa"] }
 sha3 = "0.10"
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+hyper = { version = "0.14", features = ["http1", "server", "tcp"] }
+libp2p-identity = { version = "0.2", features = ["ed25519"] }
+pem = "3"
+uuid = { version = "1", features = ["v4"] }
+x509-parser = "0.16"
 
 [features]
 default = []
 dstack = []
 duckdb = ["tinycloud-core/duckdb"]
 tc-bench-v1 = []
-
-# cargo-binstall support: allows `cargo binstall tinycloud-node`
-[package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/{ name }-v{ version }/{ name }-{ target }{ archive-suffix }"
-bin-dir = "{ name }-{ target }/{ bin }{ binary-ext }"
-pkg-fmt = "tgz"
 
 # cargo-dist metadata
 [package.metadata.dist]

@@ -73,6 +73,42 @@ pub struct ServiceStatus {
     pub node_did: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub control_api: Option<ControlApiAnnotation>,
+    // v1-link additions — see docs/specs/node-control-plane-v1.md §3.9.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cert_not_after: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_listener: Option<LinkListenerState>,
+    /// Set when the LAN TLS listener's last bind attempt failed — sourced
+    /// from the on-disk listener-state marker `serve` writes, not inferred
+    /// from process state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_listener_error: Option<String>,
+    // TC-252 additions — see docs/specs/node-control-plane-v1.md §3.10.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tunnel_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tunnel_connected: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tunnel_remote_url: Option<String>,
+    /// Set when the tunnel connection's last attempt failed — sourced from
+    /// the on-disk tunnel-state marker `serve` writes, not inferred from
+    /// process state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tunnel_last_error: Option<String>,
+}
+
+/// v1-link — the observed state of the LAN TLS terminator surfaced through
+/// `service status --json`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LinkListenerState {
+    Disabled,
+    Stopped,
+    Running,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -194,6 +230,15 @@ pub fn default_service_status() -> ServiceStatus {
         identity_ready: false,
         node_did: None,
         control_api: None,
+        link_name: None,
+        local_url: None,
+        cert_not_after: None,
+        link_listener: None,
+        link_listener_error: None,
+        tunnel_enabled: None,
+        tunnel_connected: None,
+        tunnel_remote_url: None,
+        tunnel_last_error: None,
     }
 }
 
@@ -266,6 +311,80 @@ pub fn node_key_backup(passphrase: &[u8], output: Option<PathBuf>) -> Result<Bac
         passphrase,
         output,
     )
+}
+
+/// Enable link for this installed node — claim the name, request a cert, and
+/// persist state. Signs canonical service payloads with the node's Ed25519
+/// identity (same trust boundary as `node_key_backup`).
+pub fn node_link_enable(
+    args: crate::link::commands::EnableArgs,
+) -> Result<crate::link::commands::LinkStatusReport> {
+    let paths = installed_or_current_paths()?;
+    let config = effective_config(&paths)?;
+    crate::link::commands::enable(&config.storage.datadir, Some(&config.keys), args)
+}
+
+pub fn node_link_disable() -> Result<crate::link::commands::LinkStatusReport> {
+    let paths = installed_or_current_paths()?;
+    let config = effective_config(&paths)?;
+    crate::link::commands::disable(&config.storage.datadir, Some(&config.keys))
+}
+
+pub fn node_link_status() -> Result<crate::link::commands::LinkStatusReport> {
+    let paths = installed_or_current_paths()?;
+    let config = effective_config(&paths)?;
+    crate::link::commands::status(&config.storage.datadir)
+}
+
+pub fn node_link_renew() -> Result<crate::link::commands::LinkStatusReport> {
+    let paths = installed_or_current_paths()?;
+    let config = effective_config(&paths)?;
+    crate::link::commands::renew(&config.storage.datadir, Some(&config.keys))
+}
+
+/// Enable the tunnel for this installed node. Requires an existing `link
+/// enable`d name claim — see `tunnel::commands::enable`.
+pub fn node_tunnel_enable(
+    args: crate::tunnel::commands::TunnelEnableArgs,
+) -> Result<crate::tunnel::commands::TunnelStatusReport> {
+    let paths = installed_or_current_paths()?;
+    let config = effective_config(&paths)?;
+    crate::tunnel::commands::enable(&config.storage.datadir, args)
+}
+
+pub fn node_tunnel_disable() -> Result<crate::tunnel::commands::TunnelStatusReport> {
+    let paths = installed_or_current_paths()?;
+    let config = effective_config(&paths)?;
+    crate::tunnel::commands::disable(&config.storage.datadir)
+}
+
+pub fn node_tunnel_status() -> Result<crate::tunnel::commands::TunnelStatusReport> {
+    let paths = installed_or_current_paths()?;
+    let config = effective_config(&paths)?;
+    let mut report = crate::tunnel::commands::status(&config.storage.datadir)?;
+    // Mirror the `tunnelConnected` pid-gate in `service_status_for_installed`
+    // (see docs/specs/node-control-plane-v1.md §3.10): this standalone
+    // invocation reads the same on-disk marker a possibly-dead `serve`
+    // process last wrote, so an unclean exit must not be reported as
+    // connected just because the marker predates the crash.
+    if report.connected && !installed_service_process_is_alive()? {
+        report.connected = false;
+    }
+    Ok(report)
+}
+
+/// Whether the process manager reports a live process for the installed
+/// service, without probing the control API (that would require a network
+/// round trip this status check shouldn't depend on). Returns `false` if no
+/// service is installed at all.
+fn installed_service_process_is_alive() -> Result<bool> {
+    Ok(match discover_installed_service()? {
+        Some(installed) => matches!(
+            current_manager_state(&installed.paths, &installed.manifest),
+            ManagerState::Running { .. }
+        ),
+        None => false,
+    })
 }
 
 pub fn node_key_export_body() -> Result<String> {
@@ -550,6 +669,45 @@ pub fn service_status_for_installed(installed: DiscoveredService) -> ServiceStat
     let key_backend = control.key_backend.or(Some(manifest.key_backend));
     let (state, pid, control_api) = derive_state(&manifest, &paths, &control);
 
+    // v1-link: surface the link name / URL / cert-notAfter and listener state
+    // from disk state (`state.json`) so `service status --json` can show them
+    // regardless of whether the node is currently running. The listener
+    // state itself is sourced from the on-disk marker `serve` writes after
+    // its actual bind attempt (see `link::state::ListenerState`) rather than
+    // inferred purely from `ServiceState::Running` — a bind failure inside a
+    // running node process must still show up as not-running here.
+    //
+    // Gate on `pid.is_some()` (the process manager's view of whether a
+    // process is alive) rather than `ServiceState::Running`: the latter also
+    // requires the separate control-plane RPC socket to be reachable, which
+    // is unrelated to whether the LAN TLS listener bound successfully. A
+    // node whose control API is slow to come up (or briefly unreachable)
+    // must not have its already-bound LAN listener misreported as `stopped`.
+    let link_from_disk = read_link_disk_snapshot(&paths);
+    let link_listener = match (pid, &link_from_disk) {
+        (_, None) => Some(LinkListenerState::Disabled),
+        (Some(_), Some(snapshot)) => {
+            if snapshot.listener_bound == Some(true) {
+                Some(LinkListenerState::Running)
+            } else {
+                Some(LinkListenerState::Stopped)
+            }
+        }
+        (None, Some(_)) => Some(LinkListenerState::Stopped),
+    };
+
+    // TC-252 follow-up: `tunnelConnected` must be gated on `pid.is_some()`
+    // the same way `link_listener` is above — the on-disk tunnel-runtime
+    // marker (`dataPath/link/tunnel-state.json`) is written by `serve`'s
+    // tunnel task and is never cleaned up on an unclean exit (crash, `kill
+    // -9`), so trusting it unconditionally reports `connected: true` forever
+    // after the process that wrote it is gone.
+    let tunnel_connected = match (pid, &link_from_disk) {
+        (_, None) => None,
+        (Some(_), Some(snapshot)) => Some(snapshot.tunnel_connected),
+        (None, Some(_)) => Some(false),
+    };
+
     ServiceStatus {
         contract_version,
         profile: manifest.profile,
@@ -567,7 +725,80 @@ pub fn service_status_for_installed(installed: DiscoveredService) -> ServiceStat
         identity_ready,
         node_did,
         control_api,
+        link_name: link_from_disk.as_ref().map(|s| s.name.clone()),
+        local_url: link_from_disk.as_ref().map(|s| s.local_url.clone()),
+        cert_not_after: link_from_disk
+            .as_ref()
+            .and_then(|s| s.cert_not_after.clone()),
+        link_listener,
+        link_listener_error: link_from_disk
+            .as_ref()
+            .and_then(|s| s.listener_error.clone()),
+        tunnel_enabled: link_from_disk.as_ref().map(|s| s.tunnel_enabled),
+        tunnel_connected,
+        tunnel_remote_url: link_from_disk
+            .as_ref()
+            .and_then(|s| s.tunnel_remote_url.clone()),
+        tunnel_last_error: link_from_disk
+            .as_ref()
+            .and_then(|s| s.tunnel_last_error.clone()),
     }
+}
+
+/// A compact view of link state used to enrich `service status --json`.
+#[derive(Debug, Clone)]
+struct LinkDiskSnapshot {
+    name: String,
+    local_url: String,
+    cert_not_after: Option<String>,
+    /// `None` if `serve` has never recorded a bind attempt (e.g. link was
+    /// just enabled and `serve` hasn't restarted yet).
+    listener_bound: Option<bool>,
+    listener_error: Option<String>,
+    /// Whether `tinycloud node tunnel enable` has been run for this name
+    /// (independent of whether the tunnel is currently connected).
+    tunnel_enabled: bool,
+    /// Sourced from the on-disk tunnel-runtime marker `serve`'s tunnel task
+    /// writes; `false` whenever `tunnel_enabled` is `false` or `serve` has
+    /// never recorded a connection attempt.
+    tunnel_connected: bool,
+    tunnel_remote_url: Option<String>,
+    tunnel_last_error: Option<String>,
+}
+
+fn read_link_disk_snapshot(paths: &ProfilePaths) -> Option<LinkDiskSnapshot> {
+    let state = crate::link::commands::load_state(&paths.data_root)
+        .ok()
+        .flatten()?;
+    let bind_port = state
+        .bind
+        .as_deref()
+        .and_then(|bind| {
+            bind.rsplit_once(':')
+                .and_then(|(_, port)| port.parse().ok())
+        })
+        .unwrap_or(8443);
+    let link_paths = crate::link::state::LinkPaths::from_data_root(&paths.data_root);
+    let listener_state = crate::link::state::read_listener_state(&link_paths)
+        .ok()
+        .flatten();
+    let tunnel_runtime = crate::link::state::read_tunnel_runtime_state(&link_paths)
+        .ok()
+        .flatten();
+    Some(LinkDiskSnapshot {
+        name: state.name.clone(),
+        local_url: crate::link::local_url(&state.name, bind_port),
+        cert_not_after: state.cert_not_after,
+        listener_bound: listener_state.as_ref().map(|s| s.bound),
+        listener_error: listener_state.and_then(|s| s.error),
+        tunnel_enabled: state.tunnel_enabled,
+        tunnel_connected: state.tunnel_enabled
+            && tunnel_runtime.as_ref().is_some_and(|s| s.connected),
+        tunnel_remote_url: state
+            .tunnel_enabled
+            .then(|| crate::tunnel::commands::remote_url(&state.name)),
+        tunnel_last_error: tunnel_runtime.and_then(|s| s.last_error),
+    })
 }
 
 fn derive_state(
@@ -2220,6 +2451,115 @@ printf '%s\n' "${FAKE_PS_AGE:-29}"
         assert_eq!(control_api, None);
     }
 
+    /// Regression test for TC-250: `service status --json` used to gate the
+    /// reported `linkListener` on the composite `ServiceState::Running`,
+    /// which also requires the separate control-plane RPC socket to be
+    /// reachable. A node whose control API never came up (no `control.json`
+    /// was ever written) falls into `ServiceState::Error` once past the
+    /// 30s grace period even though the LAN TLS listener genuinely bound —
+    /// `linkListener` must still report `running` in that case, sourced only
+    /// from the on-disk listener-state marker, not from control-API health.
+    #[test]
+    fn service_status_reports_link_listener_running_even_when_control_api_is_unavailable() {
+        let _lock = env_lock();
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        let config_home = temp.path().join("config");
+        let data_home = temp.path().join("data");
+        let state_home = temp.path().join("state");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&config_home).unwrap();
+        fs::create_dir_all(&data_home).unwrap();
+        fs::create_dir_all(&state_home).unwrap();
+        let _home = EnvGuard::set("HOME", &home);
+        let _config = EnvGuard::set("XDG_CONFIG_HOME", &config_home);
+        let _data = EnvGuard::set("XDG_DATA_HOME", &data_home);
+        let _state = EnvGuard::set("XDG_STATE_HOME", &state_home);
+
+        let bin = temp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        write_script(
+            &bin,
+            "systemctl",
+            r#"#!/bin/sh
+while [ "${1#-}" != "$1" ]; do
+  shift
+done
+case "$1" in
+  show)
+    echo "MainPID=4242"
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+"#,
+        );
+        write_script(
+            &bin,
+            "ps",
+            r#"#!/bin/sh
+printf '%s\n' "31536000"
+"#,
+        );
+        let _path = prepend_path(&bin);
+
+        let paths = ProfilePaths::resolve(Profile::LinuxUser);
+        fs::create_dir_all(paths.service_manifest_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(paths.service_unit_path.parent().unwrap()).unwrap();
+        fs::write(&paths.service_unit_path, "").unwrap();
+        fs::create_dir_all(&paths.data_root).unwrap();
+
+        // The LAN listener genuinely bound — write the on-disk marker `serve`
+        // would have written after a successful synchronous bind.
+        let link_paths = crate::link::state::LinkPaths::from_data_root(&paths.data_root);
+        crate::link::state::write_state(
+            &link_paths,
+            &crate::link::state::LinkState::new(
+                "mynode".to_string(),
+                "https://api.tinycloud.link".to_string(),
+                Some("0.0.0.0:8443".to_string()),
+            ),
+        )
+        .unwrap();
+        crate::link::state::write_listener_state(
+            &link_paths,
+            &crate::link::state::ListenerState {
+                bound: true,
+                bind_addr: Some("0.0.0.0:8443".to_string()),
+                error: None,
+            },
+        )
+        .unwrap();
+
+        let manifest = ServiceManifest {
+            contract_version: CONTROL_CONTRACT_VERSION.into(),
+            profile: Profile::LinuxUser,
+            platform: Platform::Linux,
+            manager: Manager::SystemdUser,
+            version: "1.4.2".into(),
+            config_path: paths.config_path_json(),
+            data_path: paths.data_root_json(),
+            log_mode: LogMode::File,
+            key_backend: KeyBackend::EncryptedFile,
+        };
+
+        let installed = DiscoveredService {
+            manifest,
+            paths: paths.clone(),
+        };
+        let status = service_status_for_installed(installed);
+
+        // No control.json was ever written, so the control API probe is
+        // unavailable; the process is well past the 30s grace period.
+        assert_eq!(status.state, ServiceState::Error);
+        assert_eq!(status.pid, Some(4242));
+        // ...but the LAN listener really is up, so `linkListener` must say so.
+        assert_eq!(status.link_listener, Some(LinkListenerState::Running));
+        assert_eq!(status.link_listener_error, None);
+    }
+
     #[test]
     fn parse_process_age_accepts_ps_elapsed_formats() {
         assert_eq!(parse_process_age("29"), Some(29));
@@ -2323,6 +2663,15 @@ printf '%s\n' "${FAKE_PS_AGE:-29}"
             identity_ready: true,
             node_did: Some("did:key:z6Mk...".into()),
             control_api: Some(ControlApiAnnotation::Unavailable),
+            link_name: Some("mynode".into()),
+            local_url: Some("https://mynode.local.tinycloud.link:8443".into()),
+            cert_not_after: Some("2026-08-15T00:00:00Z".into()),
+            link_listener: Some(LinkListenerState::Running),
+            link_listener_error: None,
+            tunnel_enabled: Some(true),
+            tunnel_connected: Some(true),
+            tunnel_remote_url: Some("https://mynode.tinycloud.link".into()),
+            tunnel_last_error: None,
         };
 
         let value = serde_json::to_value(status).unwrap();
@@ -2338,6 +2687,16 @@ printf '%s\n' "${FAKE_PS_AGE:-29}"
         assert_eq!(value["identityReady"], true);
         assert_eq!(value["nodeDid"], "did:key:z6Mk...");
         assert_eq!(value["controlApi"], "unavailable");
+        assert_eq!(value["linkName"], "mynode");
+        assert_eq!(
+            value["localUrl"],
+            "https://mynode.local.tinycloud.link:8443"
+        );
+        assert_eq!(value["certNotAfter"], "2026-08-15T00:00:00Z");
+        assert_eq!(value["linkListener"], "running");
+        assert_eq!(value["tunnelEnabled"], true);
+        assert_eq!(value["tunnelConnected"], true);
+        assert_eq!(value["tunnelRemoteUrl"], "https://mynode.tinycloud.link");
     }
 
     #[test]

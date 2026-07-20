@@ -10,6 +10,10 @@ pub enum SqlRequest {
         sql: String,
         #[serde(default)]
         params: Vec<SqlValue>,
+        #[serde(default, rename = "maxRows")]
+        max_rows: Option<usize>,
+        #[serde(default, rename = "maxBytes")]
+        max_bytes: Option<usize>,
     },
     #[serde(rename = "execute")]
     Execute {
@@ -94,7 +98,9 @@ impl<'de> Deserialize<'de> for SqlValue {
             }
 
             fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<SqlValue, E> {
-                Ok(SqlValue::Integer(v as i64))
+                i64::try_from(v)
+                    .map(SqlValue::Integer)
+                    .map_err(|_| E::custom("SQLite integers must fit in signed 64 bits"))
             }
 
             fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<SqlValue, E> {
@@ -157,6 +163,41 @@ impl From<&SqlValue> for rusqlite::types::Value {
     }
 }
 
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    #[test]
+    fn query_deserializes_optional_camel_case_bounds() {
+        let request: SqlRequest = serde_json::from_str(
+            r#"{"action":"query","sql":"SELECT 1","maxRows":100,"maxBytes":1024}"#,
+        )
+        .unwrap();
+
+        match request {
+            SqlRequest::Query {
+                max_rows,
+                max_bytes,
+                ..
+            } => {
+                assert_eq!(max_rows, Some(100));
+                assert_eq!(max_bytes, Some(1024));
+            }
+            _ => panic!("expected query request"),
+        }
+    }
+
+    #[test]
+    fn request_rejects_unsigned_integer_overflow() {
+        let error = serde_json::from_str::<SqlRequest>(
+            r#"{"action":"query","sql":"SELECT ?","params":[18446744073709551615]}"#,
+        )
+        .expect_err("u64 values above SQLite's signed integer range must fail");
+
+        assert!(error.to_string().contains("signed 64 bits"));
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SqlResponse {
@@ -177,7 +218,7 @@ pub struct QueryResponse {
 #[serde(rename_all = "camelCase")]
 pub struct ExecuteResponse {
     pub changes: u64,
-    pub last_insert_row_id: i64,
+    pub last_insert_row_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

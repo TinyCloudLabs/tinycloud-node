@@ -109,6 +109,8 @@ fn invocation_to_sql_request(value: &Value) -> Option<SqlRequest> {
             Some(SqlRequest::Query {
                 sql,
                 params: Vec::new(),
+                max_rows: None,
+                max_bytes: None,
             })
         }
         "execute" => {
