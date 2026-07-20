@@ -33,11 +33,11 @@ use crate::routes::public::RawKeyPath;
 
 const MAX_BLOCK_BYTES: u64 = 8 * 1024 * 1024;
 const CONTRACT_BLAKE3: &str =
-    "1e208a8e069e914faf6463582745dc75d2b06c349564aa158b21d9d6a501e4aa7105";
+    "1e205ad6e946aa0531e1b0eace481d37f6e8eab41f306ae9930728fa2200e562d2e2";
 const GOLDEN_VECTORS_BLAKE3: &str =
-    "1e20e75cc06a1a2cf0c75940af750742d6252d093ff004e6842c4ac56a5f42816ed9";
+    "1e2096624e1af33369aad3a0d2b0b57d157062f44cbe3bfdce3298c3cb762171bce4";
 const BLOCK_FIXTURES_BLAKE3: &str =
-    "1e20fd380eb6142753252ea5bd71cc90300dfcc13794c4044eca16e458ca5566a403";
+    "1e205f04e79a84c3456b69170bdf1d2542ab6f7c4d0774f6ba7892283e7eee5c78ea";
 
 const BLOCK_GET_ACTIONS: &[&str] = &["tinycloud.kv/get", "tinycloud.kv/put"];
 
@@ -423,11 +423,14 @@ fn response_with_headers(
     body: Vec<u8>,
     timings: &BenchTimings,
 ) -> BenchResponder {
+    let request_id = random_token();
     let mut response = Response::build();
     response.status(status);
     response.header(content_type);
     response.header(Header::new("Cache-Control", "no-store"));
     response.header(Header::new("Server-Timing", timings.header_value()));
+    response.header(Header::new("X-TC-Request-ID", request_id.clone()));
+    response.header(Header::new("X-TC-Executed", request_id));
     response.sized_body(body.len(), Cursor::new(body));
     BenchResponder::new(response.finalize())
 }
@@ -524,6 +527,57 @@ fn required_resource(required: &RequiredCapability) -> Result<ResourceId, BenchE
     let path = TinyPath::from_str(&required.path)
         .map_err(|_| BenchError::bad_request("invalid requiredCapability.path"))?;
     Ok(space.to_resource(service, Some(path), None, None))
+}
+
+fn normalize_bench_service(service: &str) -> String {
+    if service.starts_with("tinycloud.") {
+        service.to_string()
+    } else {
+        format!("tinycloud.{service}")
+    }
+}
+
+fn path_contains(granted_path: &str, requested_path: &str) -> bool {
+    if granted_path.is_empty() || granted_path == "/" {
+        return true;
+    }
+    if granted_path == requested_path {
+        return true;
+    }
+    if granted_path.ends_with('/') {
+        return requested_path.starts_with(granted_path);
+    }
+    if requested_path.ends_with('/') {
+        return granted_path.starts_with(requested_path);
+    }
+    if requested_path.ends_with(&format!("/{granted_path}")) {
+        return true;
+    }
+    requested_path.ends_with(&format!("/{granted_path}"))
+}
+
+fn recap_matches_required_capability(
+    recap: &RecapCapability<()>,
+    required: &RequiredCapability,
+    _required_resource: &ResourceId,
+    required_action: &RecapAbility,
+) -> bool {
+    recap.abilities().iter().any(|(resource_uri, actions)| {
+        let Ok(granted_resource) = ResourceId::from_str(resource_uri.as_str()) else {
+            return false;
+        };
+        normalize_bench_service(granted_resource.service().as_str())
+            == normalize_bench_service(&required.service)
+            && granted_resource.space().to_string() == required.space
+            && path_contains(
+                granted_resource
+                    .path()
+                    .map(|path| path.as_str())
+                    .unwrap_or(""),
+                &required.path,
+            )
+            && actions.keys().any(|ability| ability == required_action)
+    })
 }
 
 fn session_expired(expires_at: &str) -> Result<bool, BenchError> {
@@ -855,10 +909,12 @@ pub async fn auth_verify(body: String, state: &State<BenchState>) -> BenchRespon
         Err(e) => return response_json_error(BenchError::bad_request(e.to_string()), &timings),
     };
 
-    if recap
-        .can_do(&required_resource.as_uri(), &required_action)
-        .is_none()
-    {
+    if !recap_matches_required_capability(
+        &recap,
+        &request.required_capability,
+        &required_resource,
+        &required_action,
+    ) {
         return response_json_error(
             BenchError::ability_denied("required capability not covered by the recap"),
             &timings,
@@ -1298,6 +1354,7 @@ mod tests {
     use k256::ecdsa::SigningKey;
     use rocket::http::{ContentType, Header, Status};
     use rocket::local::asynchronous::Client;
+    use serde::Deserialize;
     use serde_json::{json, Value};
     use sha3::{Digest, Keccak256};
     use tempfile::TempDir;
@@ -1380,6 +1437,90 @@ mod tests {
         })?)
     }
 
+    fn tc_bench_fixture_path(relative: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../../repositories/tc-bench")
+            .join(relative)
+    }
+
+    fn load_frozen_golden_vectors() -> Result<FrozenGoldenVectors> {
+        let path = tc_bench_fixture_path("fixtures/golden-vectors.json").canonicalize()?;
+        Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+    }
+
+    fn load_frozen_runtime_artifacts() -> Result<Value> {
+        let path = tc_bench_fixture_path("artifacts/runtime-artifacts.json").canonicalize()?;
+        Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+    }
+
+    fn auth_verify_request_body(vector: &FrozenVector) -> Result<String> {
+        Ok(serde_json::to_string(&AuthVerifyRequest {
+            siwe: vector.siwe.clone(),
+            signature: vector.signature.clone(),
+            required_capability: vector.operation.clone(),
+        })?)
+    }
+
+    fn block_put_capability(vector: &FrozenVector) -> RequiredCapability {
+        RequiredCapability {
+            service: vector.operation.service.clone(),
+            space: vector.operation.space.clone(),
+            path: vector.operation.path.clone(),
+            action: "tinycloud.kv/put".to_string(),
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct FrozenGoldenVectors {
+        valid: Vec<FrozenVector>,
+        invalid: Vec<FrozenVector>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct FrozenVector {
+        case: String,
+        endpoint: String,
+        #[serde(default)]
+        proof_cids: Vec<String>,
+        #[serde(default)]
+        replay_of: Option<Box<FrozenVector>>,
+        #[serde(default)]
+        digest: Option<FrozenDigest>,
+        #[serde(default)]
+        block: Option<FrozenBlock>,
+        siwe: String,
+        signature: String,
+        operation: RequiredCapability,
+        expected: FrozenExpected,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct FrozenExpected {
+        status: u16,
+        code: String,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct FrozenDigest {
+        claimed: String,
+        actual: String,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct FrozenBlock {
+        fixture: String,
+        size_bytes: usize,
+        path: String,
+        content_type: String,
+        claimed_multihash: String,
+        actual_multihash: String,
+    }
+
     async fn bench_client() -> Result<(TempDir, Client)> {
         let tempdir = TempDir::new()?;
         let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
@@ -1428,6 +1569,179 @@ mod tests {
 
     fn bearer(token: &str) -> Header<'static> {
         Header::new("Authorization", format!("Bearer {token}"))
+    }
+
+    #[tokio::test]
+    async fn tc_bench_frozen_vectors_match_contract() -> Result<()> {
+        let frozen = load_frozen_golden_vectors()?;
+
+        for vector in &frozen.valid {
+            assert_eq!(
+                vector.endpoint.as_str(),
+                "POST /auth/verify",
+                "unexpected valid endpoint"
+            );
+            let (_tempdir, client) = bench_client().await?;
+            let response = client
+                .post("/auth/verify")
+                .header(ContentType::JSON)
+                .body(auth_verify_request_body(vector)?)
+                .dispatch()
+                .await;
+            let status = response.status();
+            let body = response.into_string().await.unwrap_or_default();
+            assert_eq!(
+                status,
+                Status::Ok,
+                "unexpected response for valid case {}: {body}",
+                vector.case
+            );
+            let json: Value = serde_json::from_str(&body)?;
+            assert_eq!(json["ok"], true);
+            assert_eq!(
+                json["recapDepth"].as_u64(),
+                Some(vector.proof_cids.len() as u64)
+            );
+            assert_eq!(
+                json["session"]["token"].as_str().unwrap_or_default().len(),
+                64
+            );
+        }
+
+        for vector in &frozen.invalid {
+            let (_tempdir, client) = bench_client().await?;
+            match vector.endpoint.as_str() {
+                "POST /auth/verify" => {
+                    if let Some(replay_of) = &vector.replay_of {
+                        let replay_first = client
+                            .post("/auth/verify")
+                            .header(ContentType::JSON)
+                            .body(auth_verify_request_body(replay_of)?)
+                            .dispatch()
+                            .await;
+                        assert_eq!(
+                            replay_first.status(),
+                            Status::Ok,
+                            "replay seed request failed for {}",
+                            vector.case
+                        );
+                    }
+
+                    let response = client
+                        .post("/auth/verify")
+                        .header(ContentType::JSON)
+                        .body(auth_verify_request_body(vector)?)
+                        .dispatch()
+                        .await;
+                    let status = response.status();
+                    let body = response.into_string().await.unwrap_or_default();
+                    assert_eq!(
+                        status,
+                        Status::from_code(vector.expected.status)
+                            .unwrap_or(Status::InternalServerError),
+                        "unexpected response for invalid case {}: {body}",
+                        vector.case
+                    );
+                    let json: Value = serde_json::from_str(&body)?;
+                    assert_eq!(json["error"]["code"], vector.expected.code);
+                }
+                "PUT /block/:multihash" => {
+                    let block = vector
+                        .block
+                        .as_ref()
+                        .expect("digest mismatch block fixture");
+                    assert_eq!(block.fixture.as_str(), "64KiB");
+                    assert_eq!(block.content_type.as_str(), "application/octet-stream");
+                    let body = std::fs::read(tc_bench_fixture_path(&block.path).canonicalize()?)?;
+                    let actual = hex::encode(Vec::<u8>::from(hash(&body)));
+                    assert_eq!(
+                        actual, block.actual_multihash,
+                        "frozen block fixture hash mismatch"
+                    );
+                    assert_eq!(
+                        body.len(),
+                        block.size_bytes,
+                        "frozen block fixture size mismatch"
+                    );
+                    assert_eq!(
+                        vector.digest.as_ref().map(|digest| digest.claimed.as_str()),
+                        Some(block.claimed_multihash.as_str())
+                    );
+                    assert_eq!(
+                        vector.digest.as_ref().map(|digest| digest.actual.as_str()),
+                        Some(block.actual_multihash.as_str())
+                    );
+
+                    let session_token = issue_session(
+                        &client,
+                        block_put_capability(vector),
+                        &bench_signing_key(),
+                        "urn:uuid:00000000-0000-4000-8000-000000000030",
+                    )
+                    .await?;
+                    let response = client
+                        .put(format!("/block/{}", block.claimed_multihash))
+                        .header(bearer(&session_token))
+                        .header(ContentType::new("application", "octet-stream"))
+                        .body(body)
+                        .dispatch()
+                        .await;
+                    let status = response.status();
+                    let body = response.into_string().await.unwrap_or_default();
+                    assert_eq!(
+                        status,
+                        Status::from_code(vector.expected.status)
+                            .unwrap_or(Status::InternalServerError),
+                        "unexpected response for invalid case {}: {body}",
+                        vector.case
+                    );
+                    let json: Value = serde_json::from_str(&body)?;
+                    assert_eq!(json["error"]["code"], vector.expected.code);
+                }
+                other => panic!("unexpected frozen endpoint: {other}"),
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc_bench_health_emits_trace_headers_and_frozen_contract_hash() -> Result<()> {
+        let (_tempdir, client) = bench_client().await?;
+        let frozen_runtime_artifacts = load_frozen_runtime_artifacts()?;
+        let response = client.get("/health").dispatch().await;
+        let status = response.status();
+        let request_id = response
+            .headers()
+            .get_one("X-TC-Request-ID")
+            .unwrap_or_default()
+            .to_string();
+        let executed_id = response
+            .headers()
+            .get_one("X-TC-Executed")
+            .unwrap_or_default()
+            .to_string();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(status, Status::Ok, "unexpected health response: {body}");
+
+        assert!(!request_id.is_empty(), "missing X-TC-Request-ID");
+        assert_eq!(request_id, executed_id, "trace headers must match");
+
+        let json: Value = serde_json::from_str(&body)?;
+        assert_eq!(
+            json["artifactHashes"]["contractBlake3"],
+            frozen_runtime_artifacts["contractBlake3"]
+        );
+        assert_eq!(
+            json["artifactHashes"]["goldenVectorsBlake3"],
+            frozen_runtime_artifacts["goldenVectorsBlake3"]
+        );
+        assert_eq!(
+            json["artifactHashes"]["blockFixturesBlake3"],
+            frozen_runtime_artifacts["blockFixturesBlake3"]
+        );
+
+        Ok(())
     }
 
     #[tokio::test]
