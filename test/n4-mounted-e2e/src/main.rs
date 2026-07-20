@@ -445,8 +445,7 @@ fn figment(
     datadir: &Path,
     secret: &[u8],
     material: &Path,
-    issuer_public: &str,
-    invitation_public: &str,
+    trust_bundle: &Path,
     port: u16,
 ) -> Figment {
     let secret = b64(secret);
@@ -461,21 +460,13 @@ fn figment(
         datadir = "{}"
         [share_email]
         enabled = true
-        target_origin = "{TARGET_ORIGIN}"
-        node_audience = "{NODE_AUDIENCE}"
-        return_origin = "{RETURN_ORIGIN}"
-        node_signing_kid = "{INVITATION_KID}"
-        invitation_kid = "{INVITATION_KID}"
-        invitation_public_key = "{invitation_public}"
-        issuer_did = "{ISSUER_DID}"
-        issuer_kid = "{ISSUER_KID}"
-        issuer_key_version = 1
-        issuer_public_key = "{issuer_public}"
+        trust_bundle_path = "{}"
         authority_material_path = "{}"
         challenge_ttl_seconds = 120
         space_name = "documents"
     "#,
         datadir.display(),
+        trust_bundle.display(),
         material.display()
     );
     rocket::Config::figment()
@@ -773,12 +764,33 @@ async fn run() -> Result<()> {
         .try_into_ed25519()
         .expect("node key")
         .to_bytes());
+    let trust_bundle_path = temp.path().join("share-email-trust-bundle.json");
+    let trust_bundle = json!({
+        "version": "tinycloud.share-email-trust-bundle/v1",
+        "shareOrigin": RETURN_ORIGIN,
+        "returnOrigin": RETURN_ORIGIN,
+        "registryOrigin": "https://registry.tinycloud.xyz",
+        "credentialsOrigin": "https://witness.credentials.org",
+        "nodeOrigin": TARGET_ORIGIN,
+        "nodeAudience": NODE_AUDIENCE,
+        "nodeInvitationKid": INVITATION_KID,
+        "nodeInvitationPublicKey": invitation_public,
+        "nodeKeyVersion": 1,
+        "nodeEnabled": true,
+        "issuerDid": ISSUER_DID,
+        "issuerVct": "opencredentials.email/v1",
+        "issuerKid": ISSUER_KID,
+        "issuerPublicKey": issuer_public,
+        "issuerKeyVersion": 1,
+        "issuerEnabled": true
+    });
+    fs::write(&trust_bundle_path, serde_json::to_vec(&trust_bundle)?)
+        .context("trust bundle write")?;
     let figment = figment(
         temp.path(),
         &secret,
         &material_path,
-        &issuer_public,
-        &invitation_public,
+        &trust_bundle_path,
         port,
     );
     let rocket = app(&figment)

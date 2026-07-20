@@ -7,10 +7,10 @@ ancestor-only pin is a release failure.
 
 tinycloud.toml.example is the checked-in, non-secret configuration shape for
 an enabled exact-email node. Copy it out of the repository, fill in the
-operator-delivered paths and public trust values, and mount it with
-TINYCLOUD_CONFIG_FILE. Its empty trust fields intentionally fail closed until
-the environment-owned production tuple is injected. Never put a private key,
-database password, claim, credential, or token in the file.
+operator-delivered paths and mount it with TINYCLOUD_CONFIG_FILE. The single
+mounted trust-bundle path is the only production source for the public trust
+tuple; missing or inconsistent legacy field overrides fail closed. Never put a
+private key, database password, claim, credential, or token in the file.
 
 The staging compose file consumes that mounted config and has no development
 or test fallback. It requires an immutable image reference, a PostgreSQL URL,

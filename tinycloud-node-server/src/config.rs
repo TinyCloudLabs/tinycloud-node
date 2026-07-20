@@ -78,6 +78,14 @@ pub struct ShareEmailConfig {
     /// production composition resolves them from this file.
     #[serde(default)]
     pub trust_bundle_path: Option<String>,
+    /// Optional legacy assertions for the shared bundle's service origins.
+    /// They are never a source of production trust.
+    #[serde(default)]
+    pub share_origin: Option<String>,
+    #[serde(default)]
+    pub registry_origin: Option<String>,
+    #[serde(default)]
+    pub credentials_origin: Option<String>,
     #[serde(default)]
     pub postgres_tls: ShareEmailPostgresTlsConfig,
     #[serde(default = "default_share_readiness_max_age")]
@@ -176,6 +184,9 @@ impl Default for ShareEmailConfig {
             issuer_public_key: None,
             authority_material_path: None,
             trust_bundle_path: None,
+            share_origin: None,
+            registry_origin: None,
+            credentials_origin: None,
             postgres_tls: ShareEmailPostgresTlsConfig::default(),
             readiness_max_age_seconds: default_share_readiness_max_age(),
             clock_skew_seconds: default_share_clock_skew(),
@@ -187,8 +198,14 @@ impl Default for ShareEmailConfig {
 
 impl ShareEmailConfig {
     pub fn resolve_trust_bundle(&self) -> Result<Self, &'static str> {
-        let Some(path) = self.trust_bundle_path.as_deref() else {
+        if !self.enabled {
             return Ok(self.clone());
+        }
+        let Some(path) = self.trust_bundle_path.as_deref() else {
+            if allows_hermetic_fixture() {
+                return Ok(self.clone());
+            }
+            return Err("share email trust bundle is required");
         };
         let bytes = fs::read(path).map_err(|_| "share email trust bundle is unreadable")?;
         if bytes.len() > 64 * 1024 {
@@ -197,6 +214,7 @@ impl ShareEmailConfig {
         let bundle: ShareEmailTrustBundle =
             serde_json::from_slice(&bytes).map_err(|_| "share email trust bundle is invalid")?;
         bundle.validate()?;
+        bundle.matches_config(self)?;
         let mut resolved = self.clone();
         resolved.target_origin = bundle.node_origin;
         resolved.node_audience = bundle.node_audience;
@@ -217,10 +235,7 @@ impl ShareEmailConfig {
         if !self.enabled {
             return Ok(());
         }
-        if self.trust_bundle_path.is_some() {
-            return self.resolve_trust_bundle()?.validate_fields();
-        }
-        self.validate_fields()
+        self.resolve_trust_bundle()?.validate_fields()
     }
 
     fn validate_fields(&self) -> Result<(), &'static str> {
@@ -346,19 +361,76 @@ impl ShareEmailTrustBundle {
             || !self.node_enabled
             || self.issuer_did != "did:web:issuer.credentials.org"
             || self.issuer_vct != "opencredentials.email/v1"
-            || !self
-                .issuer_kid
-                .starts_with(&format!("{}#", self.issuer_did))
+            || !canonical_kid_matches(&self.issuer_kid, &self.issuer_did)
             || self.issuer_key_version == 0
             || !self.issuer_enabled
             || !canonical_key(&self.node_invitation_public_key)
             || !canonical_key(&self.issuer_public_key)
-            || contains_placeholder(&self.node_origin)
-            || contains_placeholder(&self.node_audience)
+            || (!allows_hermetic_fixture() && self.contains_fixture_material())
         {
             return Err("share email trust bundle is inconsistent");
         }
         Ok(())
+    }
+
+    fn matches_config(&self, config: &ShareEmailConfig) -> Result<(), &'static str> {
+        let matches = config.target_origin.is_empty() || config.target_origin == self.node_origin;
+        let matches = matches
+            && (config.node_audience.is_empty() || config.node_audience == self.node_audience)
+            && (config.return_origin == default_share_return_origin()
+                || config.return_origin == self.return_origin)
+            && (config.allowed_origins == default_share_allowed_origins()
+                || config.allowed_origins == vec![self.return_origin.clone()])
+            && (config.node_signing_kid.is_empty()
+                || config.node_signing_kid == self.node_invitation_kid)
+            && (config.invitation_kid.is_empty()
+                || config.invitation_kid == self.node_invitation_kid)
+            && (config.invitation_public_key.is_none()
+                || config.invitation_public_key.as_deref()
+                    == Some(self.node_invitation_public_key.as_str()))
+            && (config.issuer_did.is_empty() || config.issuer_did == self.issuer_did)
+            && config.issuer_vct == self.issuer_vct
+            && (config.issuer_kid.is_empty() || config.issuer_kid == self.issuer_kid)
+            && (config.issuer_key_version == default_share_issuer_key_version()
+                || config.issuer_key_version == self.issuer_key_version as u64)
+            && (config.issuer_public_key.is_none()
+                || config.issuer_public_key.as_deref() == Some(self.issuer_public_key.as_str()))
+            && config
+                .share_origin
+                .as_deref()
+                .is_none_or(|value| value == self.share_origin)
+            && config
+                .registry_origin
+                .as_deref()
+                .is_none_or(|value| value == self.registry_origin)
+            && config
+                .credentials_origin
+                .as_deref()
+                .is_none_or(|value| value == self.credentials_origin);
+        if matches {
+            Ok(())
+        } else {
+            Err("share email trust bundle disagrees with configured trust")
+        }
+    }
+
+    fn contains_fixture_material(&self) -> bool {
+        [
+            &self.share_origin,
+            &self.return_origin,
+            &self.registry_origin,
+            &self.credentials_origin,
+            &self.node_origin,
+            &self.node_audience,
+            &self.node_invitation_kid,
+            &self.issuer_did,
+            &self.issuer_vct,
+            &self.issuer_kid,
+        ]
+        .into_iter()
+        .any(|value| contains_placeholder(value))
+            || is_fixture_public_key(&self.node_invitation_public_key)
+            || is_fixture_public_key(&self.issuer_public_key)
     }
 }
 
@@ -391,6 +463,10 @@ fn contains_placeholder(value: &str) -> bool {
     value.to_ascii_lowercase().contains("example")
         || value.to_ascii_lowercase().contains("localhost")
         || value.to_ascii_lowercase().contains("127.0.0.1")
+        || value.to_ascii_lowercase().contains("fixture")
+        || value.to_ascii_lowercase().contains("placeholder")
+        || value.to_ascii_lowercase().contains("seed")
+        || value.to_ascii_lowercase().contains("test")
 }
 
 #[cfg(feature = "mounted-fixture")]
@@ -407,8 +483,14 @@ fn uses_fixture_identity(config: &ShareEmailConfig) -> bool {
     is_placeholder_domain(&config.target_origin)
         || is_placeholder_domain(&config.node_audience)
         || is_placeholder_domain(&config.issuer_did)
-        || is_repeated_test_key(config.invitation_public_key.as_deref())
-        || is_repeated_test_key(config.issuer_public_key.as_deref())
+        || config
+            .invitation_public_key
+            .as_deref()
+            .is_some_and(is_fixture_public_key)
+        || config
+            .issuer_public_key
+            .as_deref()
+            .is_some_and(is_fixture_public_key)
 }
 
 fn is_placeholder_domain(value: &str) -> bool {
@@ -434,6 +516,14 @@ fn is_repeated_test_key(value: Option<&str>) -> bool {
         return false;
     };
     bytes.len() == 32 && bytes.windows(2).all(|pair| pair[0] == pair[1])
+}
+
+fn is_fixture_public_key(value: &str) -> bool {
+    const FROZEN_NODE_PUBLIC_KEY: &str = "IVL40Zt5HSRFMkLhXy6rbLfP-ntqXtMAl5YOBpiB2xI";
+    const FROZEN_ISSUER_PUBLIC_KEY: &str = "Ivwpd5Lwtv_Av8_bftsMCqFOAlo2XsDjQuhuOCnLdLY";
+    value == FROZEN_NODE_PUBLIC_KEY
+        || value == FROZEN_ISSUER_PUBLIC_KEY
+        || is_repeated_test_key(Some(value))
 }
 
 fn canonical_kid_matches(kid: &str, did: &str) -> bool {
@@ -878,6 +968,8 @@ impl Default for Prometheus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
 
     fn enabled_config() -> ShareEmailConfig {
         ShareEmailConfig {
@@ -888,11 +980,39 @@ mod tests {
             invitation_kid: "did:web:node.internal.tinycloud#invitation-key-1".into(),
             invitation_public_key: Some("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".into()),
             issuer_did: "did:web:issuer.credentials.org".into(),
-            issuer_kid: "did:web:issuer.credentials.org#test-key".into(),
+            issuer_kid: "did:web:issuer.credentials.org#email-signing-key-1".into(),
             issuer_public_key: Some("AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA".into()),
             authority_material_path: Some("/run/tinycloud/authority-material.json".into()),
             ..ShareEmailConfig::default()
         }
+    }
+
+    fn install_bundle(config: &mut ShareEmailConfig) -> NamedTempFile {
+        let file = NamedTempFile::new().expect("temporary trust bundle");
+        let bundle = serde_json::json!({
+            "version": "tinycloud.share-email-trust-bundle/v1",
+            "shareOrigin": "https://share.tinycloud.xyz",
+            "returnOrigin": config.return_origin.clone(),
+            "registryOrigin": "https://registry.tinycloud.xyz",
+            "credentialsOrigin": "https://witness.credentials.org",
+            "nodeOrigin": config.target_origin.clone(),
+            "nodeAudience": config.node_audience.clone(),
+            "nodeInvitationKid": config.invitation_kid.clone(),
+            "nodeInvitationPublicKey": config.invitation_public_key.clone(),
+            "nodeKeyVersion": 1,
+            "nodeEnabled": true,
+            "issuerDid": config.issuer_did.clone(),
+            "issuerVct": config.issuer_vct.clone(),
+            "issuerKid": config.issuer_kid.clone(),
+            "issuerPublicKey": config.issuer_public_key.clone(),
+            "issuerKeyVersion": config.issuer_key_version,
+            "issuerEnabled": true
+        });
+        file.as_file()
+            .write_all(serde_json::to_string(&bundle).unwrap().as_bytes())
+            .expect("trust bundle write");
+        config.trust_bundle_path = Some(file.path().display().to_string());
+        file
     }
 
     #[tokio::test]
@@ -902,6 +1022,83 @@ mod tests {
             ..ShareEmailConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[cfg(not(feature = "mounted-fixture"))]
+    #[tokio::test]
+    async fn production_requires_the_authoritative_trust_bundle() {
+        let config = enabled_config();
+        assert_eq!(
+            config.resolve_trust_bundle(),
+            Err("share email trust bundle is required")
+        );
+    }
+
+    #[cfg(not(feature = "mounted-fixture"))]
+    #[tokio::test]
+    async fn production_rejects_unreadable_and_malformed_trust_bundles() {
+        let mut config = enabled_config();
+        config.trust_bundle_path = Some("/tmp/tinycloud-share-email-missing-bundle".into());
+        assert_eq!(
+            config.resolve_trust_bundle(),
+            Err("share email trust bundle is unreadable")
+        );
+
+        let mut config = enabled_config();
+        let file = NamedTempFile::new().expect("temporary malformed bundle");
+        file.as_file()
+            .write_all(b"not-json")
+            .expect("malformed bundle write");
+        config.trust_bundle_path = Some(file.path().display().to_string());
+        assert_eq!(
+            config.resolve_trust_bundle(),
+            Err("share email trust bundle is invalid")
+        );
+    }
+
+    #[cfg(not(feature = "mounted-fixture"))]
+    #[tokio::test]
+    async fn production_rejects_trust_bundle_conflicts_and_fixture_identities() {
+        let mut config = enabled_config();
+        let _file = install_bundle(&mut config);
+        config.target_origin = "https://different.internal.tinycloud".into();
+        assert_eq!(
+            config.resolve_trust_bundle(),
+            Err("share email trust bundle disagrees with configured trust")
+        );
+
+        let mut config = enabled_config();
+        let file = install_bundle(&mut config);
+        let bundle = serde_json::json!({
+            "version": "tinycloud.share-email-trust-bundle/v1",
+            "shareOrigin": "https://share.tinycloud.xyz",
+            "returnOrigin": "https://share.tinycloud.xyz",
+            "registryOrigin": "https://registry.tinycloud.xyz",
+            "credentialsOrigin": "https://witness.credentials.org",
+            "nodeOrigin": "https://node.example",
+            "nodeAudience": "did:web:node.example",
+            "nodeInvitationKid": "did:web:node.example#invitation-key-1",
+            "nodeInvitationPublicKey": config.invitation_public_key,
+            "nodeKeyVersion": 1,
+            "nodeEnabled": true,
+            "issuerDid": "did:web:issuer.credentials.org",
+            "issuerVct": "opencredentials.email/v1",
+            "issuerKid": "did:web:issuer.credentials.org#email-signing-key-1",
+            "issuerPublicKey": config.issuer_public_key,
+            "issuerKeyVersion": 1,
+            "issuerEnabled": true
+        });
+        fs::write(file.path(), serde_json::to_vec(&bundle).unwrap()).expect("fixture bundle write");
+        config.target_origin.clear();
+        config.node_audience.clear();
+        config.node_signing_kid.clear();
+        config.invitation_kid.clear();
+        config.issuer_did.clear();
+        config.issuer_kid.clear();
+        assert_eq!(
+            config.resolve_trust_bundle(),
+            Err("share email trust bundle is inconsistent")
+        );
     }
 
     #[tokio::test]
@@ -955,6 +1152,7 @@ mod tests {
     async fn postgres_tls_validation_accepts_only_the_configured_ca_bundle() {
         let file = tempfile::NamedTempFile::new().expect("temporary CA bundle");
         let mut config = enabled_config();
+        let _trust_bundle = install_bundle(&mut config);
         config.postgres_tls.sslmode = "verify-full".into();
         config.postgres_tls.root_cert_path = Some(file.path().display().to_string());
 
