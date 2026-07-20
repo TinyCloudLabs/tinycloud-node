@@ -47,10 +47,10 @@ use tinycloud_core::{
 };
 use tinycloud_node::{app, config::Config, BlockStage, TinyCloud};
 
-const TARGET_ORIGIN: &str = "https://node.example";
-const NODE_AUDIENCE: &str = "did:web:node.example";
+const TARGET_ORIGIN: &str = "https://node.tinycloud.xyz";
+const NODE_AUDIENCE: &str = "did:web:node.tinycloud.xyz";
 const RETURN_ORIGIN: &str = "https://share.tinycloud.xyz";
-const INVITATION_KID: &str = "did:web:node.example#invitation-key-1";
+const INVITATION_KID: &str = "did:web:node.tinycloud.xyz#invitation-key-1";
 const ISSUER_DID: &str = "did:web:issuer.credentials.org";
 const ISSUER_KID: &str = "did:web:issuer.credentials.org#email-signing-key-1";
 const DEFAULT_ISSUER_KEY: &str = "Ivwpd5Lwtv_Av8_bftsMCqFOAlo2XsDjQuhuOCnLdLY";
@@ -241,7 +241,7 @@ fn attestation(
 ) -> Value {
     let message = json!({
         "type":"TinyCloudShareEnrollmentRuntimeAttestation","version":1,"targetOrigin":TARGET_ORIGIN,"nodeAudience":NODE_AUDIENCE,
-        "enforcerDid":enforcer_did,"enforcerKid":"did:web:node.example#enforcement-key-1","publicKey":enrollment["invitationPublicKey"],"keyVersion":1,
+        "enforcerDid":enforcer_did,"enforcerKid":"did:web:node.tinycloud.xyz#enforcement-key-1","publicKey":enrollment["invitationPublicKey"],"keyVersion":1,
         "localSignerDid":enforcer_did,"localSignerKid":canonical_kid(enforcer_did),"measurement":"tinycloud-node-n4-mounted-fixture-v1",
         "measurementDigest":sha256_b64(&value_bytes(&json!({"measurement":"tinycloud-node-n4-mounted-fixture-v1"}))),"expiresAt":expires_at,
         "enrollmentDigest":sha256_b64(&value_bytes(enrollment))
@@ -310,7 +310,7 @@ fn build_case(
         "xyz.tinycloud.policy/nodeAudience".into(),
         NODE_AUDIENCE.into(),
     );
-    enforcement.insert("xyz.tinycloud.policy/attestationBindingDigestHex".into(), sha256_b64(&value_bytes(&json!({"targetOrigin":TARGET_ORIGIN,"nodeAudience":NODE_AUDIENCE,"enforcerDid":node_did,"enforcerKid":"did:web:node.example#enforcement-key-1","keyVersion":1}))));
+    enforcement.insert("xyz.tinycloud.policy/attestationBindingDigestHex".into(), sha256_b64(&value_bytes(&json!({"targetOrigin":TARGET_ORIGIN,"nodeAudience":NODE_AUDIENCE,"enforcerDid":node_did,"enforcerKid":"did:web:node.tinycloud.xyz#enforcement-key-1","keyVersion":1}))));
     enforcement.insert(
         "xyz.tinycloud.policy/maxSessionTtlSeconds".into(),
         "300".into(),
