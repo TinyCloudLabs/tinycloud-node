@@ -36,10 +36,9 @@ use tinycloud_core::{
             NamedSqlRows, PinnedNamedStatement, SqlReadSource,
         },
         invitation::{
-            issue_invitation_authorization_for, verify_invitation_authorization_for,
-            CanonicalEmail, DocumentName, Ed25519InvitationSigner, Ed25519InvitationVerifier,
-            InvitationAuthorizationInput, InvitationAuthorizationReceipt, InvitationSigner,
-            SenderTrust,
+            issue_invitation_authorization_for, CanonicalEmail, DocumentName,
+            Ed25519InvitationSigner, Ed25519InvitationVerifier, InvitationAuthorizationInput,
+            InvitationSigner, SenderTrust,
         },
         state::{AnonymousChallengeRequest, ProtocolStateRepository},
         types::{
@@ -351,12 +350,29 @@ pub struct CapabilityDescriptor {
     pub origin: String,
     #[serde(rename = "returnOrigin")]
     pub return_origin: String,
-    pub routes: [&'static str; 5],
+    pub routes: [&'static str; 4],
     #[serde(rename = "contentKinds")]
     pub content_kinds: [&'static str; 2],
     #[serde(rename = "mailProvider")]
     pub mail_provider: &'static str,
     pub status: &'static str,
+}
+
+/// The public Node capability is deliberately identical to the frozen Share
+/// node profile. Delivery finalization is an OpenCredentials transaction; it
+/// is not a fifth Node protocol operation.
+pub const NODE_CAPABILITY_ROUTES: [&str; 4] = [
+    "/share/v1/invitations/authorize",
+    "/share/v1/policy/challenges",
+    "/share/v1/policy/session",
+    "/share/v1/read",
+];
+
+/// Mount the complete public Node protocol surface from one composition point.
+/// Invitation authorization is a reservation boundary; there is no public
+/// receipt-consume callback for delivery workers to invoke.
+pub fn public_routes() -> Vec<rocket::Route> {
+    rocket::routes![authorize_invitation, policy_challenge, policy_session, read]
 }
 
 #[derive(Debug, Serialize)]
@@ -522,13 +538,7 @@ impl ShareEmailRuntime {
             version: 1,
             origin: self.config.target_origin.clone(),
             return_origin: self.config.return_origin.clone(),
-            routes: [
-                "/share/v1/invitations/authorize",
-                "/share/v1/invitations/consume",
-                "/share/v1/policy/challenges",
-                "/share/v1/policy/session",
-                "/share/v1/read",
-            ],
+            routes: NODE_CAPABILITY_ROUTES,
             content_kinds: ["kv", "sql"],
             mail_provider: "resend",
             status: "ready",
@@ -1056,63 +1066,6 @@ pub async fn authorize_invitation(
     })?))
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct InvitationAuthorizationConsumption {
-    pub receipt: InvitationAuthorizationReceipt,
-}
-
-/// Consume the sender-authorized receipt after the delivery service has
-/// linked it to the invitation.  The receipt is verified against deployment
-/// configuration and the durable reservation is atomically one-use; no
-/// caller-provided binding is accepted here.
-#[post("/share/v1/invitations/consume", format = "json", data = "<data>")]
-pub async fn consume_invitation(
-    data: Data<'_>,
-    runtime: &State<Option<ShareEmailRuntime>>,
-) -> ApiResult<Value> {
-    let runtime = runtime
-        .inner()
-        .as_ref()
-        .ok_or(error(Status::ServiceUnavailable, "capability_unavailable"))?;
-    let value = read_bounded_json(data).await?;
-    let request: InvitationAuthorizationConsumption = serde_json::from_value(value)
-        .map_err(|_| error(Status::BadRequest, "invitation_authorization_invalid"))?;
-    let now = OffsetDateTime::now_utc();
-    let target_origin = TargetOrigin::parse(runtime.config.target_origin.clone())
-        .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?;
-    let node_audience = Did::parse(runtime.config.node_audience.clone())
-        .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?;
-    let return_origin = TargetOrigin::parse(runtime.config.return_origin.clone())
-        .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?;
-    let authorization_digest_value = verify_invitation_authorization_for(
-        &request.receipt,
-        &runtime.invitation_verifier,
-        now,
-        &target_origin,
-        &node_audience,
-        &return_origin,
-    )
-    .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
-    let binding = json!({
-        "authorizationDigest": authorization_digest_value.as_str(),
-        "shareDigest": digest(&json!(request.receipt.authorization.share_cid.as_str())).as_str(),
-    });
-    runtime
-        .state
-        .consume_invitation_authorization(
-            &request.receipt,
-            binding,
-            &authorization_digest_value,
-            now,
-        )
-        .await
-        .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
-    Ok(Json(
-        json!({"authorizationDigest": authorization_digest_value.as_str()}),
-    ))
-}
-
 #[post("/share/v1/policy/challenges", format = "json", data = "<data>")]
 pub async fn policy_challenge(
     data: Data<'_>,
@@ -1527,6 +1480,32 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::ServiceUnavailable);
+    }
+
+    #[tokio::test]
+    async fn mounted_surface_is_exactly_the_four_frozen_node_routes() {
+        let rocket = rocket::build()
+            .mount("/", public_routes())
+            .manage(None::<ShareEmailRuntime>);
+        let client = Client::tracked(rocket).await.expect("Rocket client");
+
+        for route in NODE_CAPABILITY_ROUTES {
+            let response = client
+                .post(route)
+                .header(rocket::http::ContentType::JSON)
+                .body("{}")
+                .dispatch()
+                .await;
+            assert_ne!(response.status(), Status::NotFound, "{route}");
+        }
+
+        let response = client
+            .post("/share/v1/invitations/consume")
+            .header(rocket::http::ContentType::JSON)
+            .body("{}")
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::NotFound);
     }
 
     #[tokio::test]

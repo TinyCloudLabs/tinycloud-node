@@ -125,7 +125,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
 
     tracing::tracing_try_init(&tinycloud_config.log)?;
 
-    let routes = routes![
+    let mut routes = routes![
         healthcheck,
         cors,
         info,
@@ -158,12 +158,8 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         encryption_well_known,
         encryption_decrypt,
         revoke_encryption_network,
-        share_email::authorize_invitation,
-        share_email::consume_invitation,
-        share_email::policy_challenge,
-        share_email::policy_session,
-        share_email::read,
     ];
+    routes.extend(share_email::public_routes());
 
     let key_setup: StaticSecret = resolve_keys(&tinycloud_config.keys).await?;
     let webhook_encryption =

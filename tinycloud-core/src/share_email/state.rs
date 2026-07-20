@@ -140,45 +140,6 @@ impl ProtocolStateRepository {
         Ok(())
     }
 
-    /// Atomically revalidates and consumes an authorization JTI.  Signature
-    /// verification must have completed before this method is called.
-    pub async fn consume_invitation_authorization(
-        &self,
-        receipt: &InvitationAuthorizationReceipt,
-        binding_json: Value,
-        authorization_digest: &Sha256Digest,
-        now: OffsetDateTime,
-    ) -> Result<(), StateError> {
-        let tx = self.conn.begin().await?;
-        let jti = receipt.authorization.jti.as_str().to_owned();
-        let row = share_invitation_authorization_jti::Entity::find_by_id(jti.clone())
-            .one(&tx)
-            .await?
-            .ok_or(StateError::Replay)?;
-        if row.authorization_digest != authorization_digest.as_str()
-            || row.binding_json != binding_json
-            || row.consumed_at.is_some()
-            || parse_timestamp(&row.expires_at)? <= now
-        {
-            return Err(StateError::Replay);
-        }
-        let consumed_at = timestamp(now)?;
-        let changed = share_invitation_authorization_jti::Entity::update_many()
-            .col_expr(
-                share_invitation_authorization_jti::Column::ConsumedAt,
-                Expr::value(consumed_at),
-            )
-            .filter(share_invitation_authorization_jti::Column::Jti.eq(jti))
-            .filter(share_invitation_authorization_jti::Column::ConsumedAt.is_null())
-            .exec(&tx)
-            .await?;
-        if changed.rows_affected != 1 {
-            return Err(StateError::Replay);
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
     pub async fn create_anonymous_challenge(
         &self,
         request: AnonymousChallengeRequest,
