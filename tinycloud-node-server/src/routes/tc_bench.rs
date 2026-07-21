@@ -538,12 +538,21 @@ fn normalize_bench_service(service: &str) -> String {
 }
 
 fn normalize_bench_space(space: &str) -> String {
-    space.to_ascii_lowercase()
+    let Some((prefix, rest)) = space.split_once(":0x") else {
+        return space.to_string();
+    };
+    let Some((addr, suffix)) = rest.split_once(':') else {
+        return space.to_string();
+    };
+    format!("{prefix}:0x{}:{suffix}", addr.to_ascii_lowercase())
 }
 
 fn path_contains(granted_path: &str, requested_path: &str) -> bool {
-    if granted_path.is_empty() || granted_path == "/" {
-        return true;
+    if granted_path.is_empty() {
+        return !requested_path.is_empty();
+    }
+    if requested_path.is_empty() {
+        return false;
     }
     if granted_path == requested_path {
         return true;
@@ -554,10 +563,7 @@ fn path_contains(granted_path: &str, requested_path: &str) -> bool {
     if requested_path.ends_with('/') {
         return granted_path.starts_with(requested_path);
     }
-    if requested_path.ends_with(&format!("/{granted_path}")) {
-        return true;
-    }
-    granted_path.ends_with(&format!("/{requested_path}"))
+    requested_path.ends_with(&format!("/{granted_path}"))
 }
 
 fn recap_matches_required_capability(
@@ -1391,16 +1397,16 @@ mod tests {
 
     fn signed_siwe_payload(
         signing_key: &SigningKey,
-        required_capability: &RequiredCapability,
+        granted_capability: &RequiredCapability,
         nonce: &str,
     ) -> Result<(String, String)> {
         let address = ethereum_address(signing_key);
         let resource =
-            required_resource(required_capability).map_err(|err| anyhow::anyhow!(err.message))?;
+            required_resource(granted_capability).map_err(|err| anyhow::anyhow!(err.message))?;
         let mut recap = RecapCapability::<Value>::new();
         recap.with_action(
             resource.as_uri().clone(),
-            RecapAbility::try_from(required_capability.action.clone())?,
+            RecapAbility::try_from(granted_capability.action.clone())?,
             [std::collections::BTreeMap::<String, Value>::new()],
         );
         let message = recap.build_message(Message {
@@ -1442,6 +1448,20 @@ mod tests {
         })?)
     }
 
+    fn auth_verify_body_for_pair(
+        granted_capability: &RequiredCapability,
+        required_capability: RequiredCapability,
+        signing_key: &SigningKey,
+        nonce: &str,
+    ) -> Result<String> {
+        let (siwe, signature) = signed_siwe_payload(signing_key, granted_capability, nonce)?;
+        Ok(serde_json::to_string(&AuthVerifyRequest {
+            siwe,
+            signature,
+            required_capability,
+        })?)
+    }
+
     fn tc_bench_fixture_path(relative: &str) -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../../../../repositories/tc-bench")
@@ -1476,11 +1496,119 @@ mod tests {
     }
 
     #[test]
-    fn path_contains_matches_tc_bench_suffix_semantics() {
-        assert!(path_contains("bench/kv/depth-1", "depth-1"));
-        assert!(path_contains("depth-1", "bench/kv/depth-1"));
-        assert!(path_contains("bench/kv/", "bench/kv/depth-1"));
-        assert!(!path_contains("bench/kv/depth-1", "bench/kv/other"));
+    fn path_contains_matches_reference_boundary_rules() {
+        assert!(path_contains("depth-0", "bench/kv/depth-0"));
+        assert!(path_contains("bench/kv/", "bench/kv/depth-0"));
+        assert!(!path_contains("bench/kv/depth-0", "bench/kv/other"));
+        assert!(!path_contains("foo", "foobar"));
+        assert!(path_contains("", "/foo"));
+        assert!(!path_contains("/foo", ""));
+        assert!(!path_contains("", ""));
+    }
+
+    fn uppercased_space_name(space: &str) -> String {
+        let Some((prefix, name)) = space.rsplit_once(':') else {
+            return space.to_ascii_uppercase();
+        };
+        format!("{prefix}:{}", name.to_ascii_uppercase())
+    }
+
+    #[tokio::test]
+    async fn tc_bench_rejects_path_prefix_collisions_like_wasm_reference() -> Result<()> {
+        let (_tempdir, client) = bench_client().await?;
+        let signing_key = bench_signing_key();
+        let space = test_space_id("bench-path");
+        let granted_capability = RequiredCapability {
+            service: "tinycloud.kv".to_string(),
+            space: space.to_string(),
+            path: "/foo".to_string(),
+            action: "tinycloud.kv/get".to_string(),
+        };
+        let required_capability = RequiredCapability {
+            path: "/foobar".to_string(),
+            ..granted_capability.clone()
+        };
+
+        let granted_resource =
+            required_resource(&granted_capability).map_err(|err| anyhow::anyhow!(err.message))?;
+        let required_resource =
+            required_resource(&required_capability).map_err(|err| anyhow::anyhow!(err.message))?;
+        assert!(
+            required_resource.extends(&granted_resource).is_err(),
+            "reference matcher must reject prefix collisions"
+        );
+
+        let response = client
+            .post("/auth/verify")
+            .header(ContentType::JSON)
+            .body(auth_verify_body_for_pair(
+                &granted_capability,
+                required_capability,
+                &signing_key,
+                "urn:uuid:00000000-0000-4000-8000-000000000011",
+            )?)
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            Status::Forbidden,
+            "unexpected prefix-collision response: {body}"
+        );
+        let json: Value = serde_json::from_str(&body)?;
+        assert_eq!(json["error"]["code"], "ABILITY_DENIED");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc_bench_rejects_space_case_mismatches_like_wasm_reference() -> Result<()> {
+        let (_tempdir, client) = bench_client().await?;
+        let signing_key = bench_signing_key();
+        let space = test_space_id("bench-case");
+        let granted_capability = RequiredCapability {
+            service: "tinycloud.kv".to_string(),
+            space: space.to_string(),
+            path: "bench/kv/depth-1".to_string(),
+            action: "tinycloud.kv/get".to_string(),
+        };
+        let required_capability = RequiredCapability {
+            space: uppercased_space_name(&granted_capability.space),
+            ..granted_capability.clone()
+        };
+
+        let granted_resource =
+            required_resource(&granted_capability).map_err(|err| anyhow::anyhow!(err.message))?;
+        let required_resource =
+            required_resource(&required_capability).map_err(|err| anyhow::anyhow!(err.message))?;
+        assert!(
+            required_resource.extends(&granted_resource).is_err(),
+            "reference matcher must reject space case mismatches"
+        );
+
+        let response = client
+            .post("/auth/verify")
+            .header(ContentType::JSON)
+            .body(auth_verify_body_for_pair(
+                &granted_capability,
+                required_capability,
+                &signing_key,
+                "urn:uuid:00000000-0000-4000-8000-000000000012",
+            )?)
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            Status::Forbidden,
+            "unexpected case-mismatch response: {body}"
+        );
+        let json: Value = serde_json::from_str(&body)?;
+        assert_eq!(json["error"]["code"], "ABILITY_DENIED");
+
+        Ok(())
     }
 
     #[derive(Debug, Deserialize)]
