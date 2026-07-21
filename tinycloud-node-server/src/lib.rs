@@ -150,7 +150,7 @@ pub async fn app(
     tracing::tracing_try_init(&tinycloud_config.log)?;
 
     let routes = {
-        let mut routes = routes![
+        let routes = routes![
             healthcheck,
             cors,
             info,
@@ -185,6 +185,8 @@ pub async fn app(
             revoke_encryption_network,
         ];
 
+        #[cfg(feature = "tc-bench-v1")]
+        let mut routes = routes;
         #[cfg(feature = "tc-bench-v1")]
         {
             routes.extend(routes![
