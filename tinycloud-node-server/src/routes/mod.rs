@@ -4653,6 +4653,13 @@ mod tests {
                 tinycloud_core::keys::StaticSecret::new(vec![9u8; 32]).unwrap(),
             )),
         ));
+        #[cfg(feature = "compute")]
+        let rocket = rocket.manage(
+            crate::compute_exec::ComputeExecutor::new(
+                crate::config::ComputeStorageConfig::default(),
+            )
+            .expect("compute executor for test"),
+        );
 
         let client = Client::tracked(rocket).await?;
         let response = client
@@ -4914,6 +4921,13 @@ mod tests {
                 tinycloud_core::keys::StaticSecret::new(vec![9u8; 32]).unwrap(),
             )),
         ));
+        #[cfg(feature = "compute")]
+        let rocket = rocket.manage(
+            crate::compute_exec::ComputeExecutor::new(
+                crate::config::ComputeStorageConfig::default(),
+            )
+            .expect("compute executor for test"),
+        );
 
         let client = Client::tracked(rocket).await?;
         let response = client
@@ -6327,6 +6341,13 @@ mod tests {
                 tinycloud_core::keys::StaticSecret::new(vec![9u8; 32]).unwrap(),
             )),
         ));
+        #[cfg(feature = "compute")]
+        let rocket = rocket.manage(
+            crate::compute_exec::ComputeExecutor::new(
+                crate::config::ComputeStorageConfig::default(),
+            )
+            .expect("compute executor for test"),
+        );
         rocket
     }
 
