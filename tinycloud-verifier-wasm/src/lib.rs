@@ -7,6 +7,7 @@ use alloc::{
 };
 use core::str::FromStr;
 use futures::executor::block_on;
+use multibase::decode as multibase_decode;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tinycloud_auth::{
@@ -15,10 +16,13 @@ use tinycloud_auth::{
     identity::principal_did,
     ipld_core::cid::{multibase::Base, Cid},
     multihash_codetable::{Code, MultihashDigest},
-    resolver::DID_METHODS,
     resource::ResourceId,
     siwe_recap::Capability as SiweRecapCapability,
-    ssi::ucan::TimeInvalid,
+    ssi::{
+        claims::jws::verify_bytes,
+        jwk::{Base64urlUInt, OctetParams, Params, JWK},
+        ucan::TimeInvalid,
+    },
 };
 use wasm_bindgen::prelude::*;
 
@@ -100,8 +104,9 @@ fn js_value<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
 }
 
 fn js_error(error: &VerificationError) -> JsValue {
-    serde_wasm_bindgen::to_value(error)
-        .unwrap_or_else(|_| JsValue::from_str(&format!("{}: {}", error.kind.as_str(), error.message)))
+    serde_wasm_bindgen::to_value(error).unwrap_or_else(|_| {
+        JsValue::from_str(&format!("{}: {}", error.kind.as_str(), error.message))
+    })
 }
 
 impl VerificationErrorKind {
@@ -116,8 +121,7 @@ impl VerificationErrorKind {
 }
 
 fn canonical_principal_or_uri(value: &str) -> String {
-    principal_did(value)
-        .unwrap_or_else(|_| value.split('#').next().unwrap_or(value).to_string())
+    principal_did(value).unwrap_or_else(|_| value.split('#').next().unwrap_or(value).to_string())
 }
 
 fn offset_datetime_from_seconds(seconds: f64) -> Result<OffsetDateTime, VerificationError> {
@@ -132,7 +136,9 @@ fn offset_datetime_to_rfc3339(datetime: &OffsetDateTime) -> String {
 }
 
 fn numeric_date_to_rfc3339(seconds: f64) -> Result<String, VerificationError> {
-    Ok(offset_datetime_to_rfc3339(&offset_datetime_from_seconds(seconds)?))
+    Ok(offset_datetime_to_rfc3339(&offset_datetime_from_seconds(
+        seconds,
+    )?))
 }
 
 fn time_to_rfc3339(time: &OffsetDateTime) -> String {
@@ -155,7 +161,8 @@ fn resource_extends(granted: &str, required: &str) -> bool {
 }
 
 fn verify_header_bytes(bytes: &[u8]) -> Result<TinyCloudDelegation, VerificationError> {
-    TinyCloudDelegation::from_bytes(bytes).map_err(|error| VerificationError::decode(error.to_string()))
+    TinyCloudDelegation::from_bytes(bytes)
+        .map_err(|error| VerificationError::decode(error.to_string()))
 }
 
 fn verify_header_text(encoded: &str) -> Result<TinyCloudDelegation, VerificationError> {
@@ -164,9 +171,9 @@ fn verify_header_text(encoded: &str) -> Result<TinyCloudDelegation, Verification
         .map_err(|error| VerificationError::decode(error.to_string()))
 }
 
-fn extract_ucan_capabilities(capabilities: &tinycloud_auth::ucan_capabilities_object::Capabilities<
-    serde_json::Value,
->) -> Result<Vec<CapabilityGrant>, VerificationError> {
+fn extract_ucan_capabilities(
+    capabilities: &tinycloud_auth::ucan_capabilities_object::Capabilities<serde_json::Value>,
+) -> Result<Vec<CapabilityGrant>, VerificationError> {
     let mut grants = Vec::new();
     for (resource, abilities) in capabilities.abilities() {
         let resource = ResourceId::from_str(resource.as_str())
@@ -213,8 +220,7 @@ fn verify_ucan(
     ucan: &TinyCloudInvocation,
     now_seconds: f64,
 ) -> Result<DelegationVerdict, VerificationError> {
-    block_on(ucan.verify_signature(&*DID_METHODS))
-        .map_err(|error| VerificationError::invalid_signature(error.to_string()))?;
+    verify_ucan_signature_offline(ucan)?;
     ucan.payload()
         .validate_time(Some(now_seconds))
         .map_err(|error| match error {
@@ -242,6 +248,55 @@ fn verify_ucan(
     })
 }
 
+fn did_key_ed25519_jwk(did: &str) -> Result<JWK, VerificationError> {
+    let did = canonical_principal_or_uri(did);
+    let method_specific_id = did
+        .strip_prefix("did:key:")
+        .ok_or_else(|| VerificationError::invalid_signature("UCAN issuer must be did:key"))?;
+    let (_base, data) = multibase_decode(method_specific_id)
+        .map_err(|error| VerificationError::invalid_signature(error.to_string()))?;
+    if data.len() != 34 || data[0] != 0xed || data[1] != 0x01 {
+        return Err(VerificationError::invalid_signature(
+            "UCAN issuer must be a did:key Ed25519 public key",
+        ));
+    }
+
+    Ok(JWK {
+        params: Params::OKP(OctetParams {
+            curve: "Ed25519".to_string(),
+            public_key: Base64urlUInt(data[2..].to_vec()),
+            private_key: None,
+        }),
+        public_key_use: None,
+        key_operations: None,
+        algorithm: None,
+        key_id: None,
+        x509_url: None,
+        x509_certificate_chain: None,
+        x509_thumbprint_sha1: None,
+        x509_thumbprint_sha256: None,
+    })
+}
+
+fn verify_ucan_signature_offline(ucan: &TinyCloudInvocation) -> Result<(), VerificationError> {
+    let key = did_key_ed25519_jwk(ucan.payload().issuer.as_str())?;
+    let encoded = ucan
+        .encode()
+        .map_err(|error| VerificationError::decode(error.to_string()))?;
+    let signing_input = encoded
+        .rsplit_once('.')
+        .ok_or_else(|| VerificationError::decode("invalid UCAN JWT encoding"))?
+        .0;
+
+    verify_bytes(
+        ucan.header().algorithm,
+        signing_input.as_bytes(),
+        &key,
+        ucan.signature(),
+    )
+    .map_err(|error| VerificationError::invalid_signature(error.to_string()))
+}
+
 fn verify_cacao(
     cacao: &SiweCacao,
     now_seconds: f64,
@@ -259,7 +314,9 @@ fn verify_cacao(
         .payload()
         .clone()
         .try_into()
-        .map_err(|error: SIWEPayloadConversionError| VerificationError::decode(error.to_string()))?;
+        .map_err(|error: SIWEPayloadConversionError| {
+            VerificationError::decode(error.to_string())
+        })?;
     let maybe_recap = SiweRecapCapability::<serde_json::Value>::extract_and_verify(&message)
         .map_err(|error| VerificationError::invalid_statement(error.to_string()))?;
     let (capabilities, proofs) = match maybe_recap {
@@ -319,10 +376,7 @@ pub fn extract_capabilities_bytes(
     Ok(verify_delegation_bytes(bytes, now_seconds)?.capabilities)
 }
 
-pub fn canonical_issuer_bytes(
-    bytes: &[u8],
-    now_seconds: f64,
-) -> Result<String, VerificationError> {
+pub fn canonical_issuer_bytes(bytes: &[u8], now_seconds: f64) -> Result<String, VerificationError> {
     Ok(verify_delegation_bytes(bytes, now_seconds)?.issuer)
 }
 
@@ -483,8 +537,11 @@ mod tests {
     #[test]
     fn verifiable_cacao_vectors_match_frozen_golden_vectors() {
         let golden = parse_golden();
-        let now = OffsetDateTime::parse("2025-01-01T00:00:00.000Z", &time::format_description::well_known::Rfc3339)
-            .expect("frozen clock");
+        let now = OffsetDateTime::parse(
+            "2025-01-01T00:00:00.000Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("frozen clock");
 
         for vector in &golden.valid {
             let cacao = build_cacao(vector);
@@ -494,13 +551,22 @@ mod tests {
 
             assert!(verdict.ok);
             assert_eq!(verdict.kind, DelegationKind::Cacao);
-            assert_eq!(verdict.issuer, canonical_principal_or_uri(cacao.payload().iss.as_ref()));
-            assert_eq!(verdict.audience, canonical_principal_or_uri(cacao.payload().aud.as_ref()));
+            assert_eq!(
+                verdict.issuer,
+                canonical_principal_or_uri(cacao.payload().iss.as_ref())
+            );
+            assert_eq!(
+                verdict.audience,
+                canonical_principal_or_uri(cacao.payload().aud.as_ref())
+            );
             assert_eq!(verdict.capabilities.len(), 1, "{}", vector.case);
             assert_eq!(verdict.proof_cids, vector.proofCids, "{}", vector.case);
 
             let capability = &verdict.capabilities[0];
-            assert_eq!(capability.resource, *vector.recap.att.keys().next().expect("recap resource"));
+            assert_eq!(
+                capability.resource,
+                *vector.recap.att.keys().next().expect("recap resource")
+            );
             assert_eq!(capability.action, vector.operation.action);
             assert_eq!(vector.recap.prf, vector.proofCids);
             assert!(vector.recap.statement.contains(&vector.operation.path));
@@ -514,7 +580,12 @@ mod tests {
         for vector in &golden.valid {
             for (index, proof_cid) in vector.proofCids.iter().enumerate() {
                 let seed = format!("tc-bench-v1:{}:proof:{}", vector.case, index);
-                assert_eq!(compute_proof_cid(seed.as_bytes()), proof_cid.as_str(), "{}", vector.case);
+                assert_eq!(
+                    compute_proof_cid(seed.as_bytes()),
+                    proof_cid.as_str(),
+                    "{}",
+                    vector.case
+                );
             }
         }
     }
@@ -522,8 +593,16 @@ mod tests {
     #[test]
     fn rejects_wrong_signature_and_expiry() {
         let golden = parse_golden();
-        let valid = golden.valid.iter().find(|vector| vector.case == "depth-1").expect("depth-1 vector");
-        let expired = golden.invalid.iter().find(|vector| vector.case == "expired").expect("expired vector");
+        let valid = golden
+            .valid
+            .iter()
+            .find(|vector| vector.case == "depth-1")
+            .expect("depth-1 vector");
+        let expired = golden
+            .invalid
+            .iter()
+            .find(|vector| vector.case == "expired")
+            .expect("expired vector");
 
         let cacao = build_cacao(valid);
         let raw = serde_ipld_dagcbor::to_vec(&cacao).expect("cacao encodes");
@@ -534,14 +613,20 @@ mod tests {
         let bad_cacao = build_cacao(&bad);
         let bad_raw = serde_ipld_dagcbor::to_vec(&bad_cacao).expect("bad cacao encodes");
 
-        let now = OffsetDateTime::parse("2025-01-01T00:00:00.000Z", &time::format_description::well_known::Rfc3339)
-            .expect("frozen clock");
-        let err = verify_delegation_bytes(&bad_raw, now.unix_timestamp() as f64).expect_err("wrong signature");
+        let now = OffsetDateTime::parse(
+            "2025-01-01T00:00:00.000Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("frozen clock");
+        let err = verify_delegation_bytes(&bad_raw, now.unix_timestamp() as f64)
+            .expect_err("wrong signature");
         assert_eq!(err.kind, VerificationErrorKind::InvalidSignature);
 
         let expired_cacao = build_cacao(expired);
-        let expired_raw = serde_ipld_dagcbor::to_vec(&expired_cacao).expect("expired cacao encodes");
-        let err = verify_delegation_bytes(&expired_raw, now.unix_timestamp() as f64).expect_err("expired");
+        let expired_raw =
+            serde_ipld_dagcbor::to_vec(&expired_cacao).expect("expired cacao encodes");
+        let err = verify_delegation_bytes(&expired_raw, now.unix_timestamp() as f64)
+            .expect_err("expired");
         assert_eq!(err.kind, VerificationErrorKind::InvalidTime);
 
         let _ = raw;
@@ -550,11 +635,18 @@ mod tests {
     #[test]
     fn resource_and_action_authorization_matches_core_semantics() {
         let golden = parse_golden();
-        let vector = golden.valid.iter().find(|vector| vector.case == "depth-1").expect("depth-1 vector");
+        let vector = golden
+            .valid
+            .iter()
+            .find(|vector| vector.case == "depth-1")
+            .expect("depth-1 vector");
         let cacao = build_cacao(vector);
         let raw = serde_ipld_dagcbor::to_vec(&cacao).expect("cacao encodes");
-        let now = OffsetDateTime::parse("2025-01-01T00:00:00.000Z", &time::format_description::well_known::Rfc3339)
-            .expect("frozen clock");
+        let now = OffsetDateTime::parse(
+            "2025-01-01T00:00:00.000Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("frozen clock");
         let verdict = verify_delegation_bytes(&raw, now.unix_timestamp() as f64).expect("verdict");
         let grant = &verdict.capabilities[0];
 
@@ -601,7 +693,9 @@ mod tests {
         assert_eq!(verdict.capabilities.len(), 1);
         assert_eq!(
             verdict.proof_cids,
-            vec![proof.to_string_of_base(CidBase::Base58Btc).expect("cid base58btc")]
+            vec![proof
+                .to_string_of_base(CidBase::Base58Btc)
+                .expect("cid base58btc")]
         );
 
         let wrong_jwk = JWK::generate_ed25519().expect("wrong jwk");
@@ -620,7 +714,8 @@ mod tests {
         )
         .expect("wrong ucan");
         let wrong_jwt = wrong_ucan.encode().expect("wrong jwt");
-        let err = verify_delegation_text(wrong_jwt.as_str(), 1_700_000_000.0).expect_err("tampered jwt");
+        let err =
+            verify_delegation_text(wrong_jwt.as_str(), 1_700_000_000.0).expect_err("tampered jwt");
         assert_eq!(err.kind, VerificationErrorKind::InvalidSignature);
     }
 }
