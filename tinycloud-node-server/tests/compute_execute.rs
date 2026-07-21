@@ -11,10 +11,9 @@
 mod compute_common;
 use compute_common::*;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rocket::http::Status;
 use rocket::local::asynchronous::Client;
-use tempfile::TempDir;
 
 /// Deploy a single-import probe with a chosen grant set and run it once,
 /// returning the run status and the parsed ack JSON.
@@ -738,29 +737,40 @@ async fn numeric_ceiling_rejected() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Rotation tripwire (§6.2/F1.5): reboot the SAME datadir with a DIFFERENT
-// node secret so the re-derived routine key no longer matches the bound
-// D_fn's delegatee -> the DISTINCT `routine-identity-rotated` (409).
+// Rotation tripwire (§6.2/F1.5): a D_fn is bound to the CID (its ability rows
+// carry the binding caveat) but its DELEGATEE is no longer the currently-
+// derived routine identity -- exactly what a dstack seed rotation produces.
+// The node MUST fail with the DISTINCT `routine-identity-rotated` (409), NOT
+// a generic 403.
+//
+// Hermetic construction: deploy normally (creating the correct D_fn), then
+// mutate that D_fn's persisted `delegatee` to a DIFFERENT valid did:key. Now
+// the delegatee-filtered selection (`compute_select_d_fns`) finds nothing for
+// the re-derived routine_did, while the CID-binding scan
+// (`compute_any_d_fn_bound`, delegatee-agnostic) still sees the binding ->
+// rotation. This is independent of the node secret (which the test harness'
+// TINYCLOUD_KEYS_SECRET env var would otherwise pin, defeating a
+// two-secret-boot approach).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn rotation_tripwire_distinct_error() -> Result<()> {
-    let base = TempDir::new()?;
+    use tinycloud_core::models::delegation as deleg_model;
+    use tinycloud_core::sea_orm::{
+        ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter,
+    };
 
-    let (rocket_a, conn_a) = boot_at(
-        base.path(),
-        BootOptions {
-            secret: Some([11u8; 32]),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let (rocket, conn, tempdir) = boot().await?;
     let owner = make_owner("rotation")?;
-    seed_space_and_actors(&conn_a, &owner.space, &[]).await?;
-    ensure_space_storage(&base, &owner.space)?;
-    let client_a = Client::tracked(rocket_a).await?;
-    deploy_fixture(
-        &client_a,
+    // The bogus delegatee must exist as an actor (delegation.delegatee is a
+    // FK into the actor table).
+    let bogus = make_holder()?.did;
+    seed_space_and_actors(&conn, &owner.space, std::slice::from_ref(&bogus)).await?;
+    ensure_space_storage(&tempdir, &owner.space)?;
+    let client = Client::tracked(rocket).await?;
+
+    let ack = deploy_fixture(
+        &client,
         &owner,
         "rot",
         &load_fixture("probe_get.wat"),
@@ -772,17 +782,19 @@ async fn rotation_tripwire_distinct_error() -> Result<()> {
         "rot",
     )
     .await?;
-    drop(client_a);
+    let rdid = ack["routine_did"].as_str().unwrap().to_string();
 
-    let (rocket_b, _conn_b) = boot_at(
-        base.path(),
-        BootOptions {
-            secret: Some([22u8; 32]),
-            ..Default::default()
-        },
-    )
-    .await?;
-    let client_b = Client::tracked(rocket_b).await?;
+    // Rotate: repoint the D_fn's delegatee to a DIFFERENT valid did:key. The
+    // ability rows (which carry the CID-binding caveat) are untouched.
+    let dfn = deleg_model::Entity::find()
+        .filter(deleg_model::Column::Delegatee.eq(rdid.clone()))
+        .one(&conn)
+        .await?
+        .context("D_fn must exist after deploy")?;
+    let mut active = dfn.into_active_model();
+    active.delegatee = Set(bogus);
+    active.update(&conn).await?;
+
     let auth = owner_compute_invocation(
         &owner,
         "rot",
@@ -790,7 +802,7 @@ async fn rotation_tripwire_distinct_error() -> Result<()> {
         "urn:uuid:rot-exec",
     )?;
     let (status, body) =
-        post_invoke(&client_b, &auth, execute_body("rot", serde_json::json!({}))).await;
+        post_invoke(&client, &auth, execute_body("rot", serde_json::json!({}))).await;
     assert_eq!(
         status,
         Status::Conflict,
