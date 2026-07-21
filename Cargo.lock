@@ -9750,6 +9750,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinycloud-verifier-wasm"
+version = "1.0.0"
+dependencies = [
+ "futures",
+ "hex",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_ipld_dagcbor 0.6.4",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
+ "tinycloud-auth",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "tinystr"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

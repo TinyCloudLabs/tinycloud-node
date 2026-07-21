@@ -41,6 +41,11 @@ release = false
 publish = false
 
 [[package]]
+name = "tinycloud-verifier-wasm"
+release = false
+publish = false
+
+[[package]]
 name = "siwe"
 release = false
 publish = false

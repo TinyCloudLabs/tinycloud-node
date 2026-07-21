@@ -5,6 +5,7 @@ members = [
     "tinycloud-auth",
     "tinycloud-node-server",
     "tinycloud-sdk-wasm",
+    "tinycloud-verifier-wasm",
     "tinycloud-sdk-rs",
     "tinycloud-core",
     "dependencies/siwe",
