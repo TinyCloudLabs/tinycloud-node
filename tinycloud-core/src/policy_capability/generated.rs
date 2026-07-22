@@ -13,7 +13,7 @@ pub const REGISTRY_SOURCE_REPO: &str = "TinyCloudLabs/tinycloud-node";
 /// Git commit the artifact was generated from. Authoritative when generated
 /// in CI (GITHUB_SHA); approximate when generated locally, where it names
 /// the parent of the commit that will contain this artifact.
-pub const REGISTRY_SOURCE_GIT_SHA: &str = "86bf2a2cc63b69996ad08ebf2a8bce8bca457ca4";
+pub const REGISTRY_SOURCE_GIT_SHA: &str = "b95f0847c237ddc83fbc994f226a3ee833e35eb8";
 
 /// Every action URN accepted at the policy boundary for `service`
 /// (active, deprecated-alias, and reserved), sorted. `None` if the

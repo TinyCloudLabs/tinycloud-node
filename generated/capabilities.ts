@@ -14,7 +14,7 @@ export const REGISTRY_SOURCE_REPO = "TinyCloudLabs/tinycloud-node" as const;
  * in CI (GITHUB_SHA); approximate when generated locally, where it names
  * the parent of the commit that will contain this artifact.
  */
-export const REGISTRY_SOURCE_GIT_SHA = "86bf2a2cc63b69996ad08ebf2a8bce8bca457ca4" as const;
+export const REGISTRY_SOURCE_GIT_SHA = "b95f0847c237ddc83fbc994f226a3ee833e35eb8" as const;
 
 export type CapabilityStatus = "active" | "deprecated-alias" | "reserved";
 
