@@ -14,13 +14,13 @@ use tinycloud_auth::{
     authorization::{HeaderEncode, TinyCloudDelegation, TinyCloudInvocation},
     cacaos::siwe_cacao::{SIWEPayloadConversionError, SiweCacao},
     identity::principal_did,
-    ipld_core::cid::{multibase::Base, Cid},
+    ipld_core::cid::{Cid, multibase::Base},
     multihash_codetable::{Code, MultihashDigest},
     resource::ResourceId,
     siwe_recap::Capability as SiweRecapCapability,
     ssi::{
         claims::jws::verify_bytes,
-        jwk::{Base64urlUInt, OctetParams, Params, JWK},
+        jwk::{Base64urlUInt, JWK, OctetParams, Params},
         ucan::TimeInvalid,
     },
 };
@@ -53,6 +53,15 @@ pub struct DelegationVerdict {
     pub issued_at: Option<String>,
     pub not_before: Option<String>,
     pub expires_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvocationVerdict {
+    pub authorized: bool,
+    pub delegation: DelegationVerdict,
+    pub expected_resource: String,
+    pub expected_action: String,
+    pub matched_capability: CapabilityGrant,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -355,6 +364,36 @@ fn verify_delegation_inner(
     }
 }
 
+fn verify_invocation_inner(
+    delegation: TinyCloudDelegation,
+    expected_resource: &str,
+    expected_action: &str,
+    now_seconds: f64,
+) -> Result<InvocationVerdict, VerificationError> {
+    let verdict = verify_delegation_inner(delegation, now_seconds)?;
+    let matched_capability = verdict
+        .capabilities
+        .iter()
+        .find(|capability| {
+            resource_path_contains(&capability.resource, expected_resource)
+                && action_matches(&capability.action, expected_action)
+        })
+        .cloned()
+        .ok_or_else(|| {
+            VerificationError::invalid_statement(format!(
+                "expected capability {expected_action} on {expected_resource} was not authorized"
+            ))
+        })?;
+
+    Ok(InvocationVerdict {
+        authorized: true,
+        delegation: verdict,
+        expected_resource: expected_resource.to_string(),
+        expected_action: expected_action.to_string(),
+        matched_capability,
+    })
+}
+
 pub fn verify_delegation_bytes(
     bytes: &[u8],
     now_seconds: f64,
@@ -367,6 +406,20 @@ pub fn verify_delegation_text(
     now_seconds: f64,
 ) -> Result<DelegationVerdict, VerificationError> {
     verify_delegation_inner(verify_header_text(encoded)?, now_seconds)
+}
+
+pub fn verify_invocation_bytes(
+    bytes: &[u8],
+    expected_resource: &str,
+    expected_action: &str,
+    now_seconds: f64,
+) -> Result<InvocationVerdict, VerificationError> {
+    verify_invocation_inner(
+        verify_header_bytes(bytes)?,
+        expected_resource,
+        expected_action,
+        now_seconds,
+    )
 }
 
 pub fn extract_capabilities_bytes(
@@ -405,6 +458,19 @@ pub fn action_matches(held: &str, required: &str) -> bool {
 #[wasm_bindgen(js_name = verifyDelegation)]
 pub fn verify_delegation_wasm(bytes: &[u8], now_seconds: f64) -> Result<JsValue, JsValue> {
     match verify_delegation_bytes(bytes, now_seconds) {
+        Ok(value) => js_value(&value),
+        Err(error) => Err(js_error(&error)),
+    }
+}
+
+#[wasm_bindgen(js_name = verifyInvocation)]
+pub fn verify_invocation_wasm(
+    bytes: &[u8],
+    expected_resource: &str,
+    expected_action: &str,
+    now_seconds: f64,
+) -> Result<JsValue, JsValue> {
+    match verify_invocation_bytes(bytes, expected_resource, expected_action, now_seconds) {
         Ok(value) => js_value(&value),
         Err(error) => Err(js_error(&error)),
     }
@@ -458,7 +524,7 @@ mod tests {
     use serde::Deserialize;
     use std::iter::once;
     use tinycloud_auth::{
-        authorization::{make_invocation_from_uris, InvocationOptions},
+        authorization::{InvocationOptions, make_invocation_from_uris},
         cacaos::siwe_cacao::{Header as SiweHeader, Payload as SiwePayload},
         ipld_core::cid::multibase::Base as CidBase,
         resolver::DID_METHODS,
@@ -657,6 +723,26 @@ mod tests {
         assert!(!resource_path_contains(&grant.resource, &widened_resource));
         assert!(action_matches(&grant.action, &grant.action));
         assert!(!action_matches(&grant.action, "tinycloud.kv/put"));
+
+        let expected_resource = vector.recap.att.keys().next().expect("recap resource");
+        let invocation_verdict = verify_invocation_bytes(
+            &raw,
+            expected_resource,
+            &vector.operation.action,
+            now.unix_timestamp() as f64,
+        )
+        .expect("invocation verdict");
+        assert!(invocation_verdict.authorized);
+        assert_eq!(invocation_verdict.expected_resource, *expected_resource);
+        assert_eq!(invocation_verdict.expected_action, vector.operation.action);
+        assert_eq!(
+            invocation_verdict.matched_capability.resource,
+            *expected_resource
+        );
+        assert_eq!(
+            invocation_verdict.matched_capability.action,
+            vector.operation.action
+        );
     }
 
     #[test]
@@ -693,9 +779,11 @@ mod tests {
         assert_eq!(verdict.capabilities.len(), 1);
         assert_eq!(
             verdict.proof_cids,
-            vec![proof
-                .to_string_of_base(CidBase::Base58Btc)
-                .expect("cid base58btc")]
+            vec![
+                proof
+                    .to_string_of_base(CidBase::Base58Btc)
+                    .expect("cid base58btc")
+            ]
         );
 
         let wrong_jwk = JWK::generate_ed25519().expect("wrong jwk");
@@ -717,5 +805,26 @@ mod tests {
         let err =
             verify_delegation_text(wrong_jwt.as_str(), 1_700_000_000.0).expect_err("tampered jwt");
         assert_eq!(err.kind, VerificationErrorKind::InvalidSignature);
+    }
+
+    #[test]
+    fn invocation_verifier_rejects_unauthorized_action() {
+        let golden = parse_golden();
+        let vector = golden
+            .invalid
+            .iter()
+            .find(|vector| vector.case == "wrong-ability")
+            .expect("wrong-ability vector");
+        let cacao = build_cacao(vector);
+        let raw = serde_ipld_dagcbor::to_vec(&cacao).expect("cacao encodes");
+        let expected_resource = vector.recap.att.keys().next().expect("recap resource");
+        let err = verify_invocation_bytes(
+            &raw,
+            expected_resource,
+            &vector.operation.action,
+            1_700_000_000.0,
+        )
+        .expect_err("unauthorized action");
+        assert_eq!(err.kind, VerificationErrorKind::InvalidStatement);
     }
 }
