@@ -20,7 +20,7 @@ on:
         type: boolean
         default: false
       image_version:
-        description: 'Manual image version to tag/deploy. On the DNS-AID rollout branch, use dns-aid-dry-run or dns-aid-apply.'
+        description: 'Manual image version to tag/deploy. On the DNS-AID rollout branch, use dns-aid-dry-run, dns-aid-apply, or dns-aid-verify.'
         required: false
         type: string
         default: ''
@@ -31,7 +31,7 @@ env:
 
 jobs:
   dns-aid:
-    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/skgbafa/dns-aid-rollout' && github.actor == 'skgbafa' && (inputs.image_version == 'dns-aid-dry-run' || inputs.image_version == 'dns-aid-apply') }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/skgbafa/dns-aid-rollout' && github.actor == 'skgbafa' && (inputs.image_version == 'dns-aid-dry-run' || inputs.image_version == 'dns-aid-apply' || inputs.image_version == 'dns-aid-verify') }}
     runs-on: ubuntu-latest
     environment: production-dns
     concurrency:
@@ -66,6 +66,10 @@ jobs:
           AUTHORITATIVE_NAMESERVERS=(
             'candy.ns.cloudflare.com'
             'james.ns.cloudflare.com'
+          )
+          RECURSIVE_RESOLVERS=(
+            '1.1.1.1'
+            '8.8.8.8'
           )
           SVCB_VALUE='mandatory=alpn,port alpn="h2,h3" port=443'
           RESPONSE_FILE="$(mktemp)"
@@ -138,8 +142,10 @@ jobs:
               if set(params) != {"mandatory", "alpn", "port"}:
                   fail("SVCB parameters do not match mandatory, alpn, and port")
 
-              mandatory_values = [item.lower() for item in params["mandatory"].split(",") if item]
-              alpn_values = [item.lower() for item in params["alpn"].split(",") if item]
+              mandatory_values = params["mandatory"].split(",")
+              alpn_values = params["alpn"].split(",")
+              if any(not item for item in mandatory_values + alpn_values):
+                  fail("SVCB mandatory and ALPN lists cannot contain empty elements")
               if len(mandatory_values) != 2 or set(mandatory_values) != {"alpn", "port"}:
                   fail("SVCB mandatory keys do not match alpn and port")
               if len(alpn_values) != 2 or set(alpn_values) != {"h2", "h3"}:
@@ -172,9 +178,11 @@ jobs:
               except (TypeError, ValueError) as error:
                   fail(f"Could not parse SVCB parameters: {error}")
               parse_params(params)
-          elif source == "dns":
+          elif source in {"dns", "recursive"}:
               with open(input_file, encoding="utf-8") as handle:
                   answers = [line.strip() for line in handle if line.strip() and not line.startswith(";")]
+              if source == "recursive":
+                  answers = [line for line in answers if len(line.split()) >= 4 and line.split()[3] == "SVCB"]
               if len(answers) != 1:
                   fail("Authoritative DNS did not return exactly one DNS-AID record")
               fields = answers[0].split(None, 5)
@@ -183,8 +191,12 @@ jobs:
               owner, ttl, dns_class, rr_type, priority, rdata = fields
               if dns_name(owner) != dns_name(expected_name):
                   fail("Authoritative DNS record owner does not match")
-              if ttl != "300" or dns_class != "IN" or rr_type != "SVCB":
+              if dns_class != "IN" or rr_type != "SVCB":
                   fail("Authoritative DNS record metadata does not match")
+              if source == "dns" and ttl != "300":
+                  fail("Authoritative DNS record TTL is not 300")
+              if source == "recursive" and not (ttl.isdigit() and 0 < int(ttl) <= 300):
+                  fail("Recursive DNS record TTL is outside the expected range")
               try:
                   rdata_fields = shlex.split(rdata)
               except ValueError as error:
@@ -211,6 +223,148 @@ jobs:
               echo "::error::DNSSEC is not active with complete public DS fields"
               exit 1
             fi
+          }
+
+          validate_enabled_dnssec() {
+            if ! jq -e '
+              (.result.status == "pending" or .result.status == "active") and
+              .result.key_tag != null and
+              .result.algorithm != null and
+              .result.digest_type != null and
+              ((.result.digest // "") | length > 0) and
+              ((.result.ds // "") | length > 0)
+            ' "$RESPONSE_FILE" >/dev/null; then
+              echo "::error::DNSSEC is not pending or active with complete public DS fields"
+              exit 1
+            fi
+          }
+
+          validate_parent_ds() {
+            local expected_ds="$1"
+            local input_file="$2"
+
+            python3 - "$ZONE_NAME" "$expected_ds" "$input_file" <<'PY'
+          import sys
+
+          expected_name, expected_ds, input_file = sys.argv[1:]
+
+          def fail(message):
+              print(f"::error::{message}", file=sys.stderr)
+              raise SystemExit(1)
+
+          with open(input_file, encoding="utf-8") as handle:
+              answers = [line.strip() for line in handle if line.strip() and not line.startswith(";")]
+          if len(answers) != 1:
+              fail("Parent zone did not return exactly one DS record")
+          fields = answers[0].split(None, 4)
+          if len(fields) != 5:
+              fail("Parent zone returned an invalid DS answer")
+          owner, ttl, dns_class, rr_type, actual_ds = fields
+          if owner.lower().rstrip(".") != expected_name.lower().rstrip("."):
+              fail("Parent DS owner does not match")
+          if not ttl.isdigit() or dns_class != "IN" or rr_type != "DS":
+              fail("Parent DS metadata does not match")
+
+          expected = expected_ds.split()
+          actual = actual_ds.split()
+          if len(expected) != 4 or len(actual) != 4:
+              fail("DS record does not contain four fields")
+          expected[3] = expected[3].upper()
+          actual[3] = actual[3].upper()
+          if actual != expected:
+              fail("Public parent DS does not exactly match the Cloudflare DS")
+          PY
+          }
+
+          verify_authoritative_svcb() {
+            local attempts="$1"
+            local index name target nameserver authoritative_answer attempt
+
+            for index in "${!DNS_AID_NAMES[@]}"; do
+              name="${DNS_AID_NAMES[$index]}"
+              target="${DNS_AID_TARGETS[$index]}"
+              for nameserver in "${AUTHORITATIVE_NAMESERVERS[@]}"; do
+                authoritative_answer=false
+                for ((attempt = 1; attempt <= attempts; attempt++)); do
+                  if dig +time=5 +tries=2 +norecurse +noall +comments +answer "@${nameserver}" "$name" SVCB > "$DNS_RESPONSE_FILE" && \
+                    grep -q 'status: NOERROR' "$DNS_RESPONSE_FILE" && \
+                    awk '!/^;/ && NF { found = 1 } END { exit !found }' "$DNS_RESPONSE_FILE"; then
+                    authoritative_answer=true
+                    break
+                  fi
+                  if [ "$attempt" -lt "$attempts" ]; then
+                    sleep 3
+                  fi
+                done
+                if [ "$authoritative_answer" != "true" ]; then
+                  echo "::error::Authoritative nameserver did not publish ${name}"
+                  exit 1
+                fi
+                validate_svcb dns "$name" "$target" "$DNS_RESPONSE_FILE"
+                echo "Authoritative DNS-AID record verified on ${nameserver}: ${name}"
+              done
+            done
+          }
+
+          verify_authoritative_dnssec() {
+            local verify_records="${1:-true}"
+            local nameserver name
+
+            for nameserver in "${AUTHORITATIVE_NAMESERVERS[@]}"; do
+              if ! dig +time=5 +tries=2 +norecurse +dnssec +noall +comments +answer "@${nameserver}" "$ZONE_NAME" DNSKEY > "$DNS_RESPONSE_FILE" || \
+                ! grep -q 'status: NOERROR' "$DNS_RESPONSE_FILE" || \
+                ! awk '$4 == "DNSKEY" { key = 1 } $4 == "RRSIG" && $5 == "DNSKEY" { signature = 1 } END { exit !(key && signature) }' "$DNS_RESPONSE_FILE"; then
+                echo "::error::Authoritative DNSKEY and RRSIG are not both visible"
+                exit 1
+              fi
+              if [ "$verify_records" = "true" ]; then
+                for name in "${DNS_AID_NAMES[@]}"; do
+                  if ! dig +time=5 +tries=2 +norecurse +dnssec +noall +comments +answer "@${nameserver}" "$name" SVCB > "$DNS_RESPONSE_FILE" || \
+                    ! grep -q 'status: NOERROR' "$DNS_RESPONSE_FILE" || \
+                    ! awk '$4 == "SVCB" { record = 1 } $4 == "RRSIG" && $5 == "SVCB" { signature = 1 } END { exit !(record && signature) }' "$DNS_RESPONSE_FILE"; then
+                    echo "::error::Authoritative SVCB and RRSIG are not both visible for ${name}"
+                    exit 1
+                  fi
+                done
+                echo "Authoritative DNSKEY and signed DNS-AID records verified on ${nameserver}."
+              else
+                echo "Authoritative DNSKEY and RRSIG verified on ${nameserver}."
+              fi
+            done
+          }
+
+          verify_recursive_ad() {
+            local resolver index name target
+
+            for resolver in "${RECURSIVE_RESOLVERS[@]}"; do
+              for index in "${!DNS_AID_NAMES[@]}"; do
+                name="${DNS_AID_NAMES[$index]}"
+                target="${DNS_AID_TARGETS[$index]}"
+                if ! dig +time=5 +tries=2 +dnssec +noall +comments +answer "@${resolver}" "$name" SVCB > "$DNS_RESPONSE_FILE" || \
+                  ! grep -q 'status: NOERROR' "$DNS_RESPONSE_FILE" || \
+                  ! grep -Eq 'flags:.*[[:space:]]ad([[:space:]]|;)' "$DNS_RESPONSE_FILE"; then
+                  echo "::error::Recursive resolver did not return an authenticated answer for ${name}"
+                  exit 1
+                fi
+                validate_svcb recursive "$name" "$target" "$DNS_RESPONSE_FILE"
+                echo "Recursive DNSSEC validation passed on ${resolver}: ${name}"
+              done
+            done
+          }
+
+          verify_parent_ds_match() {
+            local expected_ds="$1"
+            local nameserver
+
+            for nameserver in "${PARENT_NAMESERVERS[@]}"; do
+              if ! dig +time=5 +tries=2 +norecurse +noall +comments +answer "@${nameserver}" "$ZONE_NAME" DS > "$DNS_RESPONSE_FILE" || \
+                ! grep -q 'status: NOERROR' "$DNS_RESPONSE_FILE"; then
+                echo "::error::Failed to query the parent zone for DS records"
+                exit 1
+              fi
+              validate_parent_ds "$expected_ds" "$DNS_RESPONSE_FILE"
+              echo "Cloudflare DS matches the public parent DS on ${nameserver}."
+            done
           }
 
           cloudflare_request GET "/zones?name=${ZONE_NAME}&status=active&per_page=50"
@@ -247,49 +401,111 @@ jobs:
             fi
           done
 
-          if [ "$DNS_AID_MODE" = "dns-aid-dry-run" ]; then
-            for index in "${MISSING_RECORDS[@]}"; do
-              echo "DNS-AID dry run would create: ${DNS_AID_NAMES[$index]}"
-            done
-            echo "DNS-AID dry run completed without changes."
-            exit 0
-          fi
-          if [ "$DNS_AID_MODE" != "dns-aid-apply" ]; then
-            echo "::error::Unsupported DNS-AID mode"
-            exit 1
-          fi
-
           if ! command -v dig >/dev/null; then
             sudo apt-get update
             sudo apt-get install --yes dnsutils
           fi
 
-          if [ "$DNSSEC_STATUS" != "disabled" ] && [ "$DNSSEC_STATUS" != "active" ]; then
-            echo "::error::DNSSEC must be disabled or active before apply; current status is ${DNSSEC_STATUS}"
+          mapfile -t PARENT_NAMESERVERS < <(dig +short NS xyz.)
+          if [ "${#PARENT_NAMESERVERS[@]}" -eq 0 ]; then
+            echo "::error::Could not discover authoritative nameservers for the xyz parent zone"
             exit 1
           fi
 
-          if [ "$DNSSEC_STATUS" = "disabled" ]; then
-            mapfile -t PARENT_NAMESERVERS < <(dig +short NS xyz.)
-            if [ "${#PARENT_NAMESERVERS[@]}" -eq 0 ]; then
-              echo "::error::Could not discover authoritative nameservers for the xyz parent zone"
+          PARENT_DS_PRESENT=false
+          for nameserver in "${PARENT_NAMESERVERS[@]}"; do
+            if ! dig +time=5 +tries=2 +norecurse +noall +comments +answer "@${nameserver}" "$ZONE_NAME" DS > "$DNS_RESPONSE_FILE" || \
+              ! grep -q 'status: NOERROR' "$DNS_RESPONSE_FILE"; then
+              echo "::error::Failed to query the parent zone for DS records"
               exit 1
             fi
-            for nameserver in "${PARENT_NAMESERVERS[@]}"; do
-              if ! dig +time=5 +tries=2 +norecurse +noall +comments +answer "@${nameserver}" "$ZONE_NAME" DS > "$DNS_RESPONSE_FILE"; then
-                echo "::error::Failed to query the parent zone for DS records"
-                exit 1
+            while IFS= read -r answer; do
+              if [[ -n "$answer" && "$answer" != \;* ]]; then
+                PARENT_DS_PRESENT=true
+                echo "Public parent DS on ${nameserver}: ${answer}"
               fi
-              if ! grep -q 'status: NOERROR' "$DNS_RESPONSE_FILE"; then
-                echo "::error::Parent-zone DS query did not return NOERROR"
-                exit 1
-              fi
-              if awk '!/^;/ && NF { found = 1 } END { exit !found }' "$DNS_RESPONSE_FILE"; then
-                echo "::error::A public parent DS record exists while Cloudflare DNSSEC is disabled"
-                exit 1
-              fi
+            done < "$DNS_RESPONSE_FILE"
+          done
+
+          if [ "$DNS_AID_MODE" = "dns-aid-dry-run" ]; then
+            for index in "${MISSING_RECORDS[@]}"; do
+              echo "DNS-AID dry run would create: ${DNS_AID_NAMES[$index]}"
             done
-            echo "Public parent DS is absent on every xyz authoritative nameserver."
+            if [ "${#MISSING_RECORDS[@]}" -eq 0 ]; then
+              verify_authoritative_svcb 1
+            else
+              echo "Dry run skipped authoritative DNS-AID expectations because records are not yet present."
+            fi
+
+            if [ "$DNSSEC_STATUS" = "disabled" ]; then
+              if [ "$PARENT_DS_PRESENT" = "true" ]; then
+                echo "::error::A public parent DS exists while Cloudflare DNSSEC is disabled"
+                exit 1
+              fi
+              echo "Dry run would enable Cloudflare DNSSEC and emit DS fields; parent DS is currently absent."
+            elif [ "$DNSSEC_STATUS" = "pending" ] || [ "$DNSSEC_STATUS" = "active" ]; then
+              cloudflare_request GET "/zones/${ZONE_ID}/dnssec"
+              validate_enabled_dnssec
+              CLOUDFLARE_DS="$(jq -r '[.result.key_tag, .result.algorithm, .result.digest_type, .result.digest] | map(tostring) | join(" ")' "$RESPONSE_FILE")"
+              if [ "$PARENT_DS_PRESENT" = "true" ]; then
+                verify_parent_ds_match "$CLOUDFLARE_DS"
+              else
+                echo "Public parent DS is not present yet."
+              fi
+              if [ "${#MISSING_RECORDS[@]}" -eq 0 ]; then
+                verify_authoritative_dnssec true
+                if [ "$DNSSEC_STATUS" = "active" ] && [ "$PARENT_DS_PRESENT" = "true" ]; then
+                  verify_recursive_ad
+                else
+                  echo "Dry run skipped recursive AD expectations until DNSSEC and the parent DS are active."
+                fi
+              else
+                verify_authoritative_dnssec false
+              fi
+            else
+              echo "::error::Cloudflare DNSSEC is in unsupported state ${DNSSEC_STATUS}"
+              exit 1
+            fi
+            echo "DNS-AID dry run completed without changes."
+            exit 0
+          fi
+
+          if [ "$DNS_AID_MODE" = "dns-aid-verify" ]; then
+            if [ "${#MISSING_RECORDS[@]}" -ne 0 ]; then
+              echo "::error::DNS-AID verify requires both exact SVCB records"
+              exit 1
+            fi
+            cloudflare_request GET "/zones/${ZONE_ID}/dnssec"
+            validate_active_dnssec
+            CLOUDFLARE_DS="$(jq -r '[.result.key_tag, .result.algorithm, .result.digest_type, .result.digest] | map(tostring) | join(" ")' "$RESPONSE_FILE")"
+            verify_parent_ds_match "$CLOUDFLARE_DS"
+            verify_authoritative_svcb 1
+            verify_authoritative_dnssec true
+            verify_recursive_ad
+            jq '{dnssec: (.result | {status, key_tag, algorithm, digest_type, digest, ds})}' "$RESPONSE_FILE"
+            echo "DNS-AID and DNSSEC verification completed successfully."
+            exit 0
+          fi
+
+          if [ "$DNS_AID_MODE" != "dns-aid-apply" ]; then
+            echo "::error::Unsupported DNS-AID mode"
+            exit 1
+          fi
+          if [ "$DNSSEC_STATUS" != "disabled" ] && [ "$DNSSEC_STATUS" != "pending" ] && [ "$DNSSEC_STATUS" != "active" ]; then
+            echo "::error::DNSSEC must be disabled, pending, or active before apply; current status is ${DNSSEC_STATUS}"
+            exit 1
+          fi
+          if [ "$DNSSEC_STATUS" = "disabled" ] && [ "$PARENT_DS_PRESENT" = "true" ]; then
+            echo "::error::A public parent DS exists while Cloudflare DNSSEC is disabled"
+            exit 1
+          fi
+          if [ "$DNSSEC_STATUS" = "pending" ] || [ "$DNSSEC_STATUS" = "active" ]; then
+            cloudflare_request GET "/zones/${ZONE_ID}/dnssec"
+            validate_enabled_dnssec
+            CLOUDFLARE_DS="$(jq -r '[.result.key_tag, .result.algorithm, .result.digest_type, .result.digest] | map(tostring) | join(" ")' "$RESPONSE_FILE")"
+            if [ "$PARENT_DS_PRESENT" = "true" ]; then
+              verify_parent_ds_match "$CLOUDFLARE_DS"
+            fi
           fi
 
           for index in "${MISSING_RECORDS[@]}"; do
@@ -313,37 +529,48 @@ jobs:
               exit 1
             fi
             validate_svcb api "$name" "$target" "$RESPONSE_FILE"
-
-            for nameserver in "${AUTHORITATIVE_NAMESERVERS[@]}"; do
-              authoritative_answer=false
-              for _ in {1..10}; do
-                if dig +time=5 +tries=2 +norecurse +noall +comments +answer "@${nameserver}" "$name" SVCB > "$DNS_RESPONSE_FILE" && \
-                  grep -q 'status: NOERROR' "$DNS_RESPONSE_FILE" && \
-                  awk '!/^;/ && NF { found = 1 } END { exit !found }' "$DNS_RESPONSE_FILE"; then
-                  authoritative_answer=true
-                  break
-                fi
-                sleep 3
-              done
-              if [ "$authoritative_answer" != "true" ]; then
-                echo "::error::Authoritative nameserver did not publish ${name}"
-                exit 1
-              fi
-              validate_svcb dns "$name" "$target" "$DNS_RESPONSE_FILE"
-              echo "Authoritative DNS-AID record verified on ${nameserver}: ${name}"
-            done
           done
+          verify_authoritative_svcb 10
 
           if [ "$DNSSEC_STATUS" = "disabled" ]; then
             cloudflare_request PATCH "/zones/${ZONE_ID}/dnssec" '{"status":"active"}'
-            validate_active_dnssec
+            if ! jq -e '.result.status == "pending" or .result.status == "active"' "$RESPONSE_FILE" >/dev/null; then
+              echo "::error::Cloudflare did not accept the DNSSEC enable request"
+              exit 1
+            fi
           else
-            echo "DNSSEC is already active; no DNSSEC mutation needed."
+            echo "Cloudflare DNSSEC is already ${DNSSEC_STATUS}; no DNSSEC mutation needed."
           fi
 
-          cloudflare_request GET "/zones/${ZONE_ID}/dnssec"
-          validate_active_dnssec
+          DNSSEC_READY=false
+          for attempt in {1..10}; do
+            cloudflare_request GET "/zones/${ZONE_ID}/dnssec"
+            if jq -e '
+              (.result.status == "pending" or .result.status == "active") and
+              .result.key_tag != null and
+              .result.algorithm != null and
+              .result.digest_type != null and
+              ((.result.digest // "") | length > 0) and
+              ((.result.ds // "") | length > 0)
+            ' "$RESPONSE_FILE" >/dev/null; then
+              DNSSEC_READY=true
+              break
+            fi
+            if [ "$attempt" -lt 10 ]; then
+              sleep 3
+            fi
+          done
+          if [ "$DNSSEC_READY" != "true" ]; then
+            echo "::error::Cloudflare DNSSEC did not expose complete DS fields"
+            exit 1
+          fi
+          validate_enabled_dnssec
           jq '{dnssec: (.result | {status, key_tag, algorithm, digest_type, digest, ds})}' "$RESPONSE_FILE"
+          if [ "$(jq -r '.result.status' "$RESPONSE_FILE")" = "pending" ]; then
+            echo "Cloudflare DNSSEC is pending external registrar DS publication; no registrar mutation was attempted."
+          else
+            echo "Cloudflare DNSSEC is active."
+          fi
 
   build:
     if: ${{ github.ref != 'refs/heads/skgbafa/dns-aid-rollout' }}
