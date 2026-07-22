@@ -1,5 +1,5 @@
 //! The node lane runs the immutable cross-language contract program rather
-//! than copying its 115 MB generated vectors into this repository.
+//! using the small checked-in contract fixture rather than a sibling worktree.
 
 use serde_json::Value;
 use std::path::PathBuf;
@@ -9,8 +9,7 @@ fn pinned_email_claim_manifest_runs_all_negative_rows() {
     let vector_root = std::env::var_os("TINYCLOUD_EMAIL_CLAIM_VECTOR_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../../../share/feat/email-claim-e1-e2e/test/vectors/email-claim-v1")
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/email-claim-v1")
         });
     let manifest = std::fs::read_to_string(vector_root.join("manifest.json"))
         .expect("pinned email-claim manifest must be present");

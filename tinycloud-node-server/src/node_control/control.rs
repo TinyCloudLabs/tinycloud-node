@@ -1726,7 +1726,7 @@ mod tests {
     use crate::{
         node_control::{
             paths::{Profile, ProfilePaths},
-            service::{self, DoctorCheckStatus, ServiceManifest},
+            service::{self, DoctorCheckStatus, ServiceManifest, ServiceState},
         },
         runtime,
         test_support::env_lock,
@@ -2475,6 +2475,19 @@ mod tests {
             invalid_body["error"]["details"]["field"],
             "request body.publicApi"
         );
+
+        let service_status = tokio::task::spawn_blocking(service::service_status)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(service_status.contract_version, CONTROL_CONTRACT_VERSION);
+        assert_eq!(service_status.state, ServiceState::Running);
+        assert!(service_status.identity_ready);
+        assert!(service_status.node_did.is_some());
+        assert_eq!(service_status.control_api, None);
+        assert_eq!(service_status.version, Some(APP_VERSION.to_string()));
+        assert_eq!(service_status.manager, setup.profile.manager());
+        assert!(setup.paths.service_manifest_path.is_file());
 
         let node_status = tokio::task::spawn_blocking(service::node_status)
             .await

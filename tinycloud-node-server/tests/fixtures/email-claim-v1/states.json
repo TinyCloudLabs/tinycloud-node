@@ -1,0 +1,1 @@
+{"operations":["create_persist_outbox","provider_accept","resend_persist_v2","crash_after_provider_accept","retry_same_provider_idempotency","same_redemption_idempotent","different_redemption_rejected","scanner_get_no_state_change"],"delivery":[{"name":"resend-accepted"},{"name":"resend-provider-failure"},{"name":"crash-after-provider-accept"}]}
