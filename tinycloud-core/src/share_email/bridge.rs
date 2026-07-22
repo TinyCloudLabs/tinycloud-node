@@ -951,7 +951,7 @@ impl DatabaseAuthorityBridge117 {
             return Err(PortError::Denied);
         }
         let (recipient, expiry) =
-            policy_metadata(&signed_policy.artifact(), Some(&policy_state_bytes))
+            policy_metadata(signed_policy.artifact(), Some(&policy_state_bytes))
                 .map_err(|_| PortError::Denied)?;
         if signed_policy.artifact().audience_did != scope.node_audience.as_str()
             || signed_enforcement

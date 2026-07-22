@@ -322,6 +322,7 @@ impl<A> AuthorityBridge117<A, ExactEmailVerifier>
 where
     A: PolicyAuthorityTransaction117,
 {
+    #[allow(clippy::too_many_arguments)]
     pub async fn establish_session_from_credential(
         &self,
         credential: &[u8],
@@ -383,6 +384,7 @@ fn convert_evidence(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_holder_binding_message(
     message: &Value,
     scope: &ShareScope,
@@ -503,7 +505,7 @@ fn validate_holder_binding_time(
         || message
             .get("jti")
             .and_then(Value::as_str)
-            .map_or(true, str::is_empty)
+            .is_none_or(str::is_empty)
     {
         return Err(EvidenceError::InvalidHolderProof);
     }

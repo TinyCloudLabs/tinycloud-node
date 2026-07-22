@@ -16,6 +16,7 @@ COPY ./tinycloud-auth/ ./tinycloud-auth/
 COPY ./tinycloud-core/ ./tinycloud-core/
 COPY ./tinycloud-sdk-rs/ ./tinycloud-sdk-rs/
 COPY ./tinycloud-sdk-wasm/ ./tinycloud-sdk-wasm/
+COPY ./tinycloud-verifier-wasm/ ./tinycloud-verifier-wasm/
 COPY ./dependencies/siwe/ ./dependencies/siwe/
 COPY ./dependencies/siwe-recap/ ./dependencies/siwe-recap/
 COPY ./dependencies/cacao/ ./dependencies/cacao/

@@ -230,9 +230,7 @@ secret = "{}"
     let figment = rocket::Config::figment()
         .merge(Serialized::defaults(tinycloud::config::Config::default()))
         .merge(Toml::string(&overlay));
-    let mut tinycloud_config = figment.extract::<tinycloud::config::Config>()?;
-    tinycloud_config.storage.resolve();
-    let rocket = tinycloud::app(&figment, &tinycloud_config, None).await?;
+    let rocket = tinycloud::app(&figment).await?;
     let client = Client::tracked(rocket).await?;
     let sql_service = client
         .rocket()

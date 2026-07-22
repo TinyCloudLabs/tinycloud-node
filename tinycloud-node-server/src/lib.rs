@@ -468,6 +468,9 @@ async fn resolve_keys(keys: &Keys) -> Result<StaticSecret> {
                 }
             }
         }
+        Keys::Provider => anyhow::bail!(
+            "provider key mode must be resolved through the node control key-provider path"
+        ),
     }
 }
 
