@@ -939,7 +939,11 @@ async fn output_ref_write_is_journaled_in_manifest() -> Result<()> {
         execute_body_with_output_ref("outref", serde_json::json!({}), "out/result"),
     )
     .await;
-    assert_eq!(status, Status::Ok, "execute with output_ref must 200: {body}");
+    assert_eq!(
+        status,
+        Status::Ok,
+        "execute with output_ref must 200: {body}"
+    );
     let ack: serde_json::Value = serde_json::from_str(&body)?;
     assert_eq!(
         ack["output_destination"], "out/result",
@@ -1075,7 +1079,14 @@ async fn cross_space_isolation_same_bytes_two_spaces() -> Result<()> {
     // Only space A's own "in/x" is seeded. Space B's is deliberately left
     // absent -- if a bug ever let space B's execution reach space A's data,
     // this test would observe A's secret instead of null.
-    seed_kv(&client, &owner_a, "in/x", b"space-a-secret", "urn:uuid:seed-a").await?;
+    seed_kv(
+        &client,
+        &owner_a,
+        "in/x",
+        b"space-a-secret",
+        "urn:uuid:seed-a",
+    )
+    .await?;
 
     let wasm = load_fixture("echo_get.wat");
     let cid_a = content_cid(&wasm);
@@ -1111,7 +1122,10 @@ async fn cross_space_isolation_same_bytes_two_spaces() -> Result<()> {
 
     // Same content CID (same bytes) ...
     assert_eq!(ack_a["content_cid"], cid_a);
-    assert_eq!(ack_b["content_cid"], cid_a, "both deploys are the identical bytes");
+    assert_eq!(
+        ack_b["content_cid"], cid_a,
+        "both deploys are the identical bytes"
+    );
     // ... but the routine identity is derived from (space, content_cid), so
     // the two spaces get DISTINCT routine DIDs even for identical bytes.
     let routine_a = ack_a["routine_did"].as_str().unwrap();
@@ -1137,7 +1151,11 @@ async fn cross_space_isolation_same_bytes_two_spaces() -> Result<()> {
         execute_body("echofn", serde_json::json!({})),
     )
     .await;
-    assert_eq!(status_b, Status::Ok, "space B execution must succeed: {body_b}");
+    assert_eq!(
+        status_b,
+        Status::Ok,
+        "space B execution must succeed: {body_b}"
+    );
     let ack_b_exec: serde_json::Value = serde_json::from_str(&body_b)?;
     assert_eq!(
         ack_b_exec["result"],
@@ -1150,7 +1168,10 @@ async fn cross_space_isolation_same_bytes_two_spaces() -> Result<()> {
         format!("{}/kv/in/x", owner_b.space),
         "the mediated read must target space B's own resource"
     );
-    assert_eq!(call_b["granted"], true, "space B's own D_fn must grant the read");
+    assert_eq!(
+        call_b["granted"], true,
+        "space B's own D_fn must grant the read"
+    );
 
     // Positive control: space A's execution DOES see its own secret --
     // proving the isolation above is real scoping, not "reads always fail".
@@ -1166,7 +1187,11 @@ async fn cross_space_isolation_same_bytes_two_spaces() -> Result<()> {
         execute_body("echofn", serde_json::json!({})),
     )
     .await;
-    assert_eq!(status_a, Status::Ok, "space A execution must succeed: {body_a}");
+    assert_eq!(
+        status_a,
+        Status::Ok,
+        "space A execution must succeed: {body_a}"
+    );
     let ack_a_exec: serde_json::Value = serde_json::from_str(&body_a)?;
     assert_eq!(
         ack_a_exec["result"],

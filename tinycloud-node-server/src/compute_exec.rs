@@ -185,11 +185,7 @@ enum KvOpError {
     Internal(String),
     /// The invocation was submitted; the store rejected or failed it.
     Store(
-        tinycloud_core::TxStoreError<
-            BlockStores,
-            BlockStage,
-            tinycloud_core::keys::StaticSecret,
-        >,
+        tinycloud_core::TxStoreError<BlockStores, BlockStage, tinycloud_core::keys::StaticSecret>,
     ),
 }
 
