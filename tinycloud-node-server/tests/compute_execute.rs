@@ -814,3 +814,100 @@ async fn rotation_tripwire_distinct_error() -> Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Memory safety (Codex P2 finding): a guest-controlled length crossing the
+// ABI boundary must be bounds-checked BEFORE the host allocates a buffer
+// sized by it -- a bogus negative/huge length must be rejected cleanly
+// (a defined, bounded error), never attempted as a host allocation.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn bogus_host_call_length_rejected_cleanly() -> Result<()> {
+    let (rocket, conn, tempdir) = boot().await?;
+    let owner = make_owner("mem-hostcall")?;
+    seed_space_and_actors(&conn, &owner.space, &[]).await?;
+    ensure_space_storage(&tempdir, &owner.space)?;
+    let client = Client::tracked(rocket).await?;
+
+    deploy_fixture(
+        &client,
+        &owner,
+        "bogushc",
+        &load_fixture("bogus_host_call_length.wat"),
+        &[GrantSpec {
+            service: "kv",
+            path: "in/",
+            ability: "tinycloud.kv/get",
+        }],
+        "bogushc",
+    )
+    .await?;
+    let auth = owner_compute_invocation(
+        &owner,
+        "bogushc",
+        "tinycloud.compute/execute",
+        "urn:uuid:bogushc",
+    )?;
+    let (status, body) = post_invoke(
+        &client,
+        &auth,
+        execute_body("bogushc", serde_json::json!({})),
+    )
+    .await;
+    assert_ne!(
+        status,
+        Status::Ok,
+        "a bogus ~2GB host-call length must not be honored: {body}"
+    );
+    assert!(
+        body.contains("out of bounds") || body.contains("ceiling"),
+        "error must name the length ceiling: {body}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn bogus_run_output_length_rejected_cleanly() -> Result<()> {
+    let (rocket, conn, tempdir) = boot().await?;
+    let owner = make_owner("mem-runlen")?;
+    seed_space_and_actors(&conn, &owner.space, &[]).await?;
+    ensure_space_storage(&tempdir, &owner.space)?;
+    let client = Client::tracked(rocket).await?;
+
+    deploy_fixture(
+        &client,
+        &owner,
+        "bogusrl",
+        &load_fixture("bogus_run_output_length.wat"),
+        &[GrantSpec {
+            service: "kv",
+            path: "in/",
+            ability: "tinycloud.kv/get",
+        }],
+        "bogusrl",
+    )
+    .await?;
+    let auth = owner_compute_invocation(
+        &owner,
+        "bogusrl",
+        "tinycloud.compute/execute",
+        "urn:uuid:bogusrl",
+    )?;
+    let (status, body) = post_invoke(
+        &client,
+        &auth,
+        execute_body("bogusrl", serde_json::json!({})),
+    )
+    .await;
+    assert_ne!(
+        status,
+        Status::Ok,
+        "a negative run() result length must not be honored: {body}"
+    );
+    assert!(
+        body.contains("out of bounds") || body.contains("ceiling"),
+        "error must name the length ceiling: {body}"
+    );
+    Ok(())
+}

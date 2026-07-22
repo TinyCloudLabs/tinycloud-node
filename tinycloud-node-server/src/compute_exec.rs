@@ -159,6 +159,11 @@ pub struct EnforcedLimits {
     pub fuel: u64,
     pub epoch_deadline_ticks: u64,
     pub max_memory_bytes: usize,
+    /// Memory-safety ceiling (Codex P2 finding): the max byte length trusted
+    /// for any guest-controlled length at the ABI boundary (a host-call
+    /// request/response, or the `run()` result). A fixed node config value,
+    /// never derived from a caveat -- see `ComputeStorageConfig::max_abi_message_bytes`.
+    pub max_message_bytes: u64,
 }
 
 /// Which host import fired — selects the ability and op.
@@ -190,6 +195,12 @@ struct HostState {
 
     manifest: Manifest,
     limits: StoreLimits,
+    /// Memory-safety ceiling (Codex P2 finding): the max byte length trusted
+    /// for a guest-controlled length at the ABI boundary. Enforced in
+    /// `host_import` (the request length) and in `run_blocking` (the
+    /// `run()` result length) BEFORE either allocates a host buffer sized
+    /// by that value.
+    max_message_bytes: u64,
     /// A per-execution nonce counter — internal invocations use fresh
     /// nonces so they never collide across host calls or executions (§8.2).
     nonce_seq: u64,
@@ -809,6 +820,10 @@ pub fn resolve_limits(
         fuel: max_fuel,
         epoch_deadline_ticks,
         max_memory_bytes,
+        // A fixed node invariant (never caveat-derived, never a "ceiling" a
+        // caveat could be rejected against -- there is no corresponding
+        // caveat field to validate here, unlike maxDuration/maxMemory above).
+        max_message_bytes: config.max_abi_message_bytes,
     })
 }
 
@@ -920,6 +935,7 @@ fn run_blocking(
             calls: Vec::new(),
         },
         limits,
+        max_message_bytes: plan.limits.max_message_bytes,
         nonce_seq: 0,
         fatal: None,
     };
@@ -996,6 +1012,19 @@ fn run_blocking(
         return Err(ComputeExecError::Internal(fatal));
     }
 
+    // Memory safety (Codex P2 finding): `out_len` is the guest's OWN `run()`
+    // return value -- fully guest-controlled. Reject a negative or
+    // out-of-ceiling length BEFORE casting it into a host allocation size
+    // (a negative i32 cast to `usize` wraps to an enormous value; a huge
+    // positive value would attempt a multi-gigabyte allocation before the
+    // subsequent bounds-checked `memory.read` ever runs).
+    let max_message_bytes = store.data().max_message_bytes;
+    if out_len < 0 || (out_len as u64) > max_message_bytes {
+        return Err(ComputeExecError::Backend(format!(
+            "guest run() returned an out-of-bounds result length {out_len} (ceiling {max_message_bytes} bytes)"
+        )));
+    }
+
     let mut out = vec![0u8; out_len as usize];
     memory
         .read(&store, out_ptr as usize, &mut out)
@@ -1067,6 +1096,20 @@ fn host_import(
     ptr: i32,
     len: i32,
 ) -> (i32, i32) {
+    // Memory safety (Codex P2 finding): `len` is fully guest-controlled --
+    // the wasm code chooses both args to its own host-import call. A
+    // negative value would wrap to an enormous `usize` on cast; a huge
+    // positive value (unrelated to the guest's own, much smaller, declared
+    // memory) would still attempt a multi-gigabyte host allocation BEFORE
+    // wasmtime ever bounds-checks the read against actual guest memory.
+    // Reject cleanly against the node-configured ceiling BEFORE allocating.
+    let max_message_bytes = caller.data().max_message_bytes;
+    if len < 0 || (len as u64) > max_message_bytes {
+        caller.data_mut().fatal = Some(format!(
+            "host-call request length {len} is out of bounds (ceiling {max_message_bytes} bytes)"
+        ));
+        return (0, 0);
+    }
     let memory = match caller.get_export("memory") {
         Some(Extern::Memory(m)) => m,
         _ => {
@@ -1074,7 +1117,7 @@ fn host_import(
             return (0, 0);
         }
     };
-    let mut req = vec![0u8; len.max(0) as usize];
+    let mut req = vec![0u8; len as usize];
     if memory.read(&caller, ptr as usize, &mut req).is_err() {
         caller.data_mut().fatal = Some("host could not read request from guest memory".to_string());
         return (0, 0);

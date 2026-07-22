@@ -303,6 +303,15 @@ pub struct ComputeStorageConfig {
     /// returned regardless of this setting.
     #[serde(default)]
     pub persist_manifest: bool,
+    /// Memory-safety ceiling (Codex P2 finding): the maximum byte length the
+    /// executor will trust for ANY guest-controlled length crossing the ABI
+    /// boundary -- a host-import request and the `run()` result length. A
+    /// hard NODE invariant, not caveat-tunable: a guest that claims a length
+    /// beyond it is rejected BEFORE the host allocates a buffer sized by
+    /// that untrusted value, so a bogus negative/huge length can never
+    /// trigger an out-of-control host allocation.
+    #[serde(default = "default_compute_max_abi_message_bytes")]
+    pub max_abi_message_bytes: u64,
 }
 
 fn default_compute_max_duration_ms() -> u64 {
@@ -325,6 +334,10 @@ fn default_compute_max_fuel() -> u64 {
     1_000_000_000
 }
 
+fn default_compute_max_abi_message_bytes() -> u64 {
+    8 * 1024 * 1024 // 8 MiB
+}
+
 impl Default for ComputeStorageConfig {
     fn default() -> Self {
         Self {
@@ -334,6 +347,7 @@ impl Default for ComputeStorageConfig {
             max_memory_ceiling: default_compute_max_memory_ceiling(),
             max_fuel: default_compute_max_fuel(),
             persist_manifest: false,
+            max_abi_message_bytes: default_compute_max_abi_message_bytes(),
         }
     }
 }
