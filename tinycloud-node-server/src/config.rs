@@ -341,12 +341,16 @@ struct ShareEmailTrustBundle {
 
 impl ShareEmailTrustBundle {
     fn validate(&self) -> Result<(), &'static str> {
+        let fixture_origin = allows_hermetic_fixture()
+            && canonical_https_origin_with_optional_port(&self.share_origin);
+        let fixture_node_origin = allows_hermetic_fixture()
+            && canonical_https_origin_with_optional_port(&self.node_origin);
         if self.version != "tinycloud.share-email-trust-bundle/v1"
-            || self.share_origin != "https://share.tinycloud.xyz"
+            || (!fixture_origin && self.share_origin != "https://share.tinycloud.xyz")
             || self.return_origin != self.share_origin
             || !canonical_https_origin(&self.registry_origin)
             || self.credentials_origin != "https://witness.credentials.org"
-            || !canonical_https_origin(&self.node_origin)
+            || (!canonical_https_origin(&self.node_origin) && !fixture_node_origin)
             || self.node_audience
                 != format!(
                     "did:web:{}",
@@ -446,6 +450,19 @@ fn canonical_https_origin(value: &str) -> bool {
         && url.username().is_empty()
         && url.password().is_none()
         && url.port().is_none()
+}
+
+fn canonical_https_origin_with_optional_port(value: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.origin().ascii_serialization() == value
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
 }
 
 fn host_of(value: &str) -> Option<String> {

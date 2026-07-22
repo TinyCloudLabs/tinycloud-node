@@ -10,11 +10,13 @@ pub struct UnavailableCredentialVerifier;
 
 #[async_trait]
 impl CredentialVerifier for UnavailableCredentialVerifier {
-    async fn verify_credential(
+    async fn verify_credential_for(
         &self,
         _: &[u8],
         _: &ShareScope,
         _: &DidKey,
+        _: &str,
+        _: i64,
     ) -> Result<CredentialVerificationEvidence, PortError> {
         Err(PortError::Unavailable)
     }
@@ -27,7 +29,7 @@ pub struct UnavailablePolicyAuthorityBridge;
 impl PolicyAuthorityTransaction117 for UnavailablePolicyAuthorityBridge {
     async fn establish_session(
         &self,
-        _: PolicySessionRequest,
+        _: VerifiedSessionAdmission,
         _: OffsetDateTime,
     ) -> Result<PolicySession, PortError> {
         Err(PortError::Unavailable)
@@ -138,6 +140,7 @@ mod tests {
             scope: kv_scope(),
             holder: holder.clone(),
             credential_digest: Sha256Digest::from_bytes([0; 32]),
+            expires_at: time::OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(5),
             sql_statement: None,
         };
         AuthorizedRead::from_parts(
@@ -156,11 +159,13 @@ mod tests {
     async fn every_default_is_fail_closed() {
         assert_eq!(
             UnavailableCredentialVerifier
-                .verify_credential(
+                .verify_credential_for(
                     b"credential",
                     &kv_scope(),
                     &DidKey::parse("did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",)
-                        .unwrap()
+                        .unwrap(),
+                    "holder@example.com",
+                    1,
                 )
                 .await,
             Err(PortError::Unavailable)
@@ -168,21 +173,24 @@ mod tests {
         assert_eq!(
             UnavailablePolicyAuthorityBridge
                 .establish_session(
-                    PolicySessionRequest {
-                        scope: kv_scope(),
-                        holder: DidKey::parse(
-                            "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
-                        )
-                        .unwrap(),
-                        credential_digest: Sha256Digest::from_bytes([0; 32]),
-                        nonce: ProtocolNonce::from_bytes([0; 32]),
-                        presentation_jti: ProtocolJti::from_bytes([1; 16]),
-                        challenge_id: String::new(),
-                        challenge_request_digest: Sha256Digest::from_bytes([0; 32]),
-                        challenge_binding: serde_json::Value::Null,
-                        policy_recipient_digest: Sha256Digest::from_bytes([0; 32]),
-                        credential_expires_at: 0,
-                    },
+                    VerifiedSessionAdmission::for_test(
+                        PolicySessionRequest {
+                            scope: kv_scope(),
+                            holder: DidKey::parse(
+                                "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+                            )
+                            .unwrap(),
+                            nonce: ProtocolNonce::from_bytes([0; 32]),
+                            presentation_jti: ProtocolJti::from_bytes([1; 16]),
+                            challenge_id: String::new(),
+                            challenge_request_digest: Sha256Digest::from_bytes([0; 32]),
+                            challenge_binding: serde_json::Value::Null,
+                            policy_recipient_digest: Sha256Digest::from_bytes([0; 32]),
+                            credential_expires_at: 0,
+                        },
+                        DidKey::parse("did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",)
+                            .unwrap()
+                    ),
                     OffsetDateTime::UNIX_EPOCH,
                 )
                 .await,
@@ -230,10 +238,13 @@ mod tests {
     impl PolicyAuthorityTransaction117 for AtomicProbe {
         async fn establish_session(
             &self,
-            request: PolicySessionRequest,
+            admission: VerifiedSessionAdmission,
             _: OffsetDateTime,
         ) -> Result<PolicySession, PortError> {
-            self.session_calls.lock().unwrap().push(request);
+            self.session_calls
+                .lock()
+                .unwrap()
+                .push(admission.request().clone());
             Err(PortError::Denied)
         }
 
@@ -258,7 +269,6 @@ mod tests {
         let session_request = PolicySessionRequest {
             scope: kv_scope(),
             holder: holder.clone(),
-            credential_digest: Sha256Digest::from_bytes([1; 32]),
             nonce: ProtocolNonce::from_bytes([2; 32]),
             presentation_jti: ProtocolJti::from_bytes([3; 16]),
             challenge_id: String::new(),
@@ -269,7 +279,10 @@ mod tests {
         };
         assert_eq!(
             probe
-                .establish_session(session_request, OffsetDateTime::UNIX_EPOCH)
+                .establish_session(
+                    VerifiedSessionAdmission::for_test(session_request, holder.clone()),
+                    OffsetDateTime::UNIX_EPOCH,
+                )
                 .await,
             Err(PortError::Denied)
         );

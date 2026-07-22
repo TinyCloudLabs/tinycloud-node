@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+mounted-fixture = ["tinycloud-node/mounted-fixture"]
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"

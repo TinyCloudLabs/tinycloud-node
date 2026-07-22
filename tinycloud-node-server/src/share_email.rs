@@ -131,6 +131,8 @@ pub struct PolicyChallenge {
     pub target_origin: TargetOrigin,
     #[serde(rename = "nodeAudience")]
     pub node_audience: Did,
+    #[serde(rename = "enforcerDid")]
+    pub enforcer_did: DidKey,
     pub action: ShareAction,
     pub resource: Path,
     #[serde(rename = "requestBodyDigest")]
@@ -172,6 +174,8 @@ pub struct PolicyPresentation {
     pub target_origin: TargetOrigin,
     #[serde(rename = "nodeAudience")]
     pub node_audience: Did,
+    #[serde(rename = "enforcerDid")]
+    pub enforcer_did: DidKey,
     #[serde(rename = "credentialDigest")]
     pub credential_digest: tinycloud_core::share_email::Sha256Digest,
     pub action: ShareAction,
@@ -191,6 +195,10 @@ pub struct PolicySessionRequest {
     pub presentation: PolicyPresentation,
     pub credential: String,
     pub proof: DetachedProof,
+    #[serde(rename = "holderBinding")]
+    pub holder_binding: Value,
+    #[serde(rename = "readSignerDid")]
+    pub read_signer_did: DidKey,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1080,9 +1088,9 @@ pub async fn authorize_invitation(
         )
         .await
         .map_err(|_| error(Status::Forbidden, "invitation_authorization_invalid"))?;
-    let (policy_email, policy_expiry) = runtime
+    let (_policy_sender, policy_email, policy_expiry) = runtime
         .bridge
-        .policy_recipient_and_expiry(
+        .policy_sender_recipient_and_expiry(
             request.policy_cid.as_str(),
             request.delegation_cid.as_str(),
             &request.authority_material_handle,
@@ -1177,6 +1185,17 @@ pub async fn policy_challenge(
         .validate_scope(&scope, now)
         .await
         .map_err(|_| generic("policy_denied"))?;
+    let enforcer_did = runtime
+        .bridge
+        .enforcer_did_for(
+            request.policy_cid.as_str(),
+            request.delegation_cid.as_str(),
+            &request.authority_material_handle,
+            &request.authority_material_digest,
+            &scope.node_audience,
+        )
+        .await
+        .map_err(|_| error(Status::Forbidden, "policy_denied"))?;
     let challenge_id = tinycloud_core::share_email::invitation::random_protocol_nonce();
     let nonce = tinycloud_core::share_email::invitation::random_protocol_nonce();
     let expires = now + Duration::seconds(runtime.config.challenge_ttl_seconds as i64);
@@ -1201,6 +1220,7 @@ pub async fn policy_challenge(
         holder_did: request.holder_did,
         target_origin: request.target_origin,
         node_audience: request.node_audience,
+        enforcer_did,
         action: request.action,
         resource: request.resource,
         request_body_digest: request.request_body_digest,
@@ -1297,9 +1317,9 @@ pub async fn policy_session(
     {
         return Err(error(Status::Forbidden, "policy_denied"));
     }
-    let (policy_email, policy_expiry) = runtime
+    let (_policy_sender, policy_email, policy_expiry) = runtime
         .bridge
-        .policy_recipient_and_expiry(
+        .policy_sender_recipient_and_expiry(
             p.policy_cid.as_str(),
             p.delegation_cid.as_str(),
             &p.authority_material_handle,
@@ -1308,37 +1328,51 @@ pub async fn policy_session(
         )
         .await
         .map_err(|_| error(Status::Forbidden, "policy_denied"))?;
-    let evidence = runtime
-        .verifier
-        .at_time(now.unix_timestamp())
-        .verify_exact_email_for(
-            request.credential.as_bytes(),
-            scope.share_scope(),
-            &p.holder_did,
-            &policy_email,
-            policy_expiry.unix_timestamp(),
+    let enforcer_did = runtime
+        .bridge
+        .enforcer_did_for(
+            p.policy_cid.as_str(),
+            p.delegation_cid.as_str(),
+            &p.authority_material_handle,
+            &p.authority_material_digest,
+            &scope.node_audience,
         )
-        .map_err(|_| error(Status::Forbidden, "invalid_credential_profile"))?;
-    if evidence.credential_digest != p.credential_digest {
+        .await
+        .map_err(|_| error(Status::Forbidden, "policy_denied"))?;
+    if p.enforcer_did != enforcer_did {
         return Err(error(Status::Forbidden, "policy_denied"));
     }
-    let challenge_digest = p.request_body_digest.clone();
-    let challenge_binding = json!({"requestDigest": challenge_digest.as_str()});
-    let session_request = AuthorityPolicySessionRequest {
+    let credential_request = AuthorityPolicySessionRequest {
         scope: scope.clone(),
         holder: p.holder_did.clone(),
-        credential_digest: p.credential_digest.clone(),
         nonce: p.nonce.clone(),
         presentation_jti: p.jti.clone(),
         challenge_id: p.challenge_id.as_str().to_owned(),
-        challenge_request_digest: challenge_digest,
-        challenge_binding,
+        challenge_request_digest: p.request_body_digest.clone(),
+        challenge_binding: json!({"requestDigest": p.request_body_digest.as_str()}),
         policy_recipient_digest: digest_text(&policy_email),
-        credential_expires_at: evidence.expires_at,
+        credential_expires_at: policy_expiry.unix_timestamp(),
     };
+    let holder_binding = serde_json::to_vec(&request.holder_binding)
+        .map_err(|_| error(Status::Forbidden, "invalid_holder_proof"))?;
+    let admission = runtime
+        .verifier
+        .at_time(now.unix_timestamp())
+        .verify_session_admission(
+            request.credential.as_bytes(),
+            credential_request,
+            &p.credential_digest,
+            &holder_binding,
+            &policy_email,
+            policy_expiry.unix_timestamp(),
+            &enforcer_did,
+            &p.holder_did,
+            &request.read_signer_did,
+        )
+        .map_err(|_| error(Status::Forbidden, "invalid_holder_proof"))?;
     let session = runtime
         .bridge
-        .establish_session(session_request, now)
+        .establish_session(admission, now)
         .await
         .map_err(|_| error(Status::Forbidden, "policy_denied"))?;
     let session_wire = PolicySession {
@@ -1358,14 +1392,9 @@ pub async fn policy_session(
         node_audience: p.node_audience.clone(),
         action: p.action,
         resource: p.resource.clone(),
-        credential_digest: p.credential_digest.clone(),
+        credential_digest: session.credential_digest,
         issued_at: timestamp(now),
-        expires_at: timestamp(
-            (now + Duration::seconds(300)).min(policy_expiry).min(
-                OffsetDateTime::from_unix_timestamp(evidence.expires_at)
-                    .map_err(|_| error(Status::Forbidden, "policy_denied"))?,
-            ),
-        ),
+        expires_at: timestamp(session.expires_at),
     };
     let session_value = serde_json::to_value(&session_wire)
         .map_err(|_| error(Status::InternalServerError, "capability_unavailable"))?;
@@ -1727,12 +1756,18 @@ mod tests {
         presentation["version"] = json!(1);
         presentation["challengeId"] = json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
         presentation["nonce"] = json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        presentation["enforcerDid"] =
+            json!("did:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7");
         presentation["credentialDigest"] = json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
         presentation["requestBodyDigest"] = json!(request_digest.as_str());
         presentation["issuedAt"] = json!("2026-07-19T17:00:00.000Z");
         presentation["expiresAt"] = json!("2026-07-19T17:02:00.000Z");
         presentation["jti"] = json!("AAAAAAAAAAAAAAAAAAAAAA");
         let presentation: PolicyPresentation = serde_json::from_value(presentation).unwrap();
+        assert_eq!(
+            serde_json::to_value(&presentation).unwrap()["enforcerDid"],
+            "did:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7"
+        );
         let config = ShareEmailConfig {
             target_origin: "https://node.example".to_owned(),
             node_audience: "did:web:node.example".to_owned(),

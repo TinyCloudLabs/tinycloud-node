@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures::future::join_all;
 use futures::io::AsyncWriteExt;
-use k256::ecdsa::SigningKey;
+use k256::ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey};
 use rocket::{
     fairing::AdHoc,
     figment::{
@@ -56,6 +56,14 @@ const ISSUER_KID: &str = "did:web:issuer.credentials.org#email-signing-key-1";
 const DEFAULT_ISSUER_KEY: &str = "Ivwpd5Lwtv_Av8_bftsMCqFOAlo2XsDjQuhuOCnLdLY";
 const SPACE: &str = "did:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7";
 const ROOT_DOMAIN: &[u8] = b"xyz.tinycloud.policy/enforcement-delegation/v1\0";
+
+#[derive(Clone)]
+struct FixtureConfig {
+    target_origin: String,
+    node_audience: String,
+    return_origin: String,
+    invitation_kid: String,
+}
 
 #[derive(Clone)]
 struct Case {
@@ -149,6 +157,34 @@ fn owner_did(seed: &[u8; 32]) -> String {
     format!("did:pkh:eip155:1:0x{}", hex(&address[12..]))
 }
 
+fn recovered_owner_did(parent: &Value) -> Result<String> {
+    let signature = URL_SAFE_NO_PAD.decode(
+        parent["signature"]["value"]
+            .as_str()
+            .context("parent signature")?,
+    )?;
+    if signature.len() != 65 {
+        bail!("parent signature must contain 64 signature bytes and a recovery byte");
+    }
+    let recovery = RecoveryId::try_from(signature[64])?;
+    let signature = Signature::try_from(&signature[..64])?;
+    let mut unsigned = parent.as_object().cloned().context("parent object")?;
+    unsigned.remove("signature");
+    unsigned.remove("delegationCid");
+    let unsigned_bytes = value_bytes(&Value::Object(unsigned));
+    let digest = Sha256::digest([ROOT_DOMAIN, unsigned_bytes.as_slice()].concat());
+    let preimage = [
+        b"\x19Ethereum Signed Message:\n32".as_slice(),
+        digest.as_ref(),
+    ]
+    .concat();
+    let hash = Keccak256::digest(preimage);
+    let key = VerifyingKey::recover_from_prehash(&hash, &signature, recovery)?;
+    let point = key.to_encoded_point(false);
+    let address = Keccak256::digest(&point.as_bytes()[1..]);
+    Ok(format!("did:pkh:eip155:1:0x{}", hex(&address[12..])))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn signed_parent(
     role: &str,
@@ -185,7 +221,7 @@ fn signed_parent(
     let unsigned_bytes = value_bytes(&unsigned_value);
     let digest = Sha256::digest([ROOT_DOMAIN, unsigned_bytes.as_slice()].concat());
     let preimage = [
-        b"\\x19Ethereum Signed Message:\\n32".as_slice(),
+        b"\x19Ethereum Signed Message:\n32".as_slice(),
         digest.as_ref(),
     ]
     .concat();
@@ -234,14 +270,15 @@ fn status(
 }
 
 fn attestation(
+    config: &FixtureConfig,
     enrollment: &Value,
     enforcer_did: &str,
     expires_at: &str,
     signer: &tinycloud_core::libp2p::identity::Keypair,
 ) -> Value {
     let message = json!({
-        "type":"TinyCloudShareEnrollmentRuntimeAttestation","version":1,"targetOrigin":TARGET_ORIGIN,"nodeAudience":NODE_AUDIENCE,
-        "enforcerDid":enforcer_did,"enforcerKid":"did:web:node.tinycloud.xyz#enforcement-key-1","publicKey":enrollment["invitationPublicKey"],"keyVersion":1,
+        "type":"TinyCloudShareEnrollmentRuntimeAttestation","version":1,"targetOrigin":config.target_origin,"nodeAudience":config.node_audience,
+        "enforcerDid":enforcer_did,"enforcerKid":format!("{}#enforcement-key-1", config.node_audience),"publicKey":enrollment["invitationPublicKey"],"keyVersion":1,
         "localSignerDid":enforcer_did,"localSignerKid":canonical_kid(enforcer_did),"measurement":"tinycloud-node-production-e2e-v1",
         "measurementDigest":sha256_b64(&value_bytes(&json!({"measurement":"tinycloud-node-production-e2e-v1"}))),"expiresAt":expires_at,
         "enrollmentDigest":sha256_b64(&value_bytes(enrollment))
@@ -258,6 +295,7 @@ fn attestation(
 }
 
 fn build_case(
+    config: &FixtureConfig,
     kind: &'static str,
     sender: &tinycloud_core::libp2p::identity::Keypair,
     node: &tinycloud_core::libp2p::identity::Keypair,
@@ -267,15 +305,15 @@ fn build_case(
     let node_did = did_key(node);
     let owner_seed = [0x55u8; 32];
     let owner = owner_did(&owner_seed);
-    let expires_at = millis_time(now + time::Duration::hours(1));
+    let expires_at = millis_time(now + time::Duration::hours(24));
     let source = if kind == "kv" {
-        json!({"kind":"kv","space":SPACE,"path":"documents/plan.md","action":"tinycloud.kv/get"})
+        json!({"kind":"kv","space":SPACE,"path":"documents/policy-payload.md","action":"tinycloud.kv/get"})
     } else {
         let arguments = json!({"document_id":123});
         json!({"kind":"sql","space":SPACE,"database":"documents","path":"shared/plan","statement":"shared_document_by_id","arguments":arguments,"argumentsDigest":sha256_b64(&value_bytes(&arguments)),"action":"tinycloud.sql/read"})
     };
     let source_digest = sha256_b64(&value_bytes(&source));
-    let policy = json!({"type":"TinyCloudSharePolicy","version":1,"recipientEmail":"Alice+Notes@example.com","contentSource":source,"contentSourceDigest":source_digest,"action":source["action"],"resource":source["path"],"expiresAt":expires_at,"issuerDid":sender_did});
+    let policy = json!({"type":"TinyCloudSharePolicy","version":1,"recipientEmail":"sam@tinycloud.xyz","contentSource":source,"contentSourceDigest":source_digest,"action":source["action"],"resource":source["path"],"expiresAt":expires_at,"issuerDid":sender_did});
     let policy_bytes = value_bytes(&policy);
     let policy_cid = cid(0x55, Code::Sha2_256, &policy_bytes);
     let delegation_cid = cid(
@@ -284,7 +322,7 @@ fn build_case(
         format!("n4-production-delegation-{kind}").as_bytes(),
     );
     let capability = if kind == "kv" {
-        json!({"service":"tinycloud.kv","space":SPACE,"path":"documents/plan.md","actions":["tinycloud.kv/get"]})
+        json!({"service":"tinycloud.kv","space":SPACE,"path":"documents/policy-payload.md","actions":["tinycloud.kv/get"]})
     } else {
         json!({"service":"tinycloud.sql","space":SPACE,"path":"shared/plan","actions":["tinycloud.sql/read"],"caveats":{"mode":"constrained-statements","readOnly":true,"statements":[{"name":"shared_document_by_id","sql":"SELECT markdown FROM shared_documents WHERE document_id = ?","fixedParams":[{"index":0,"value":123}]}]}})
     };
@@ -308,9 +346,9 @@ fn build_case(
     enforcement.insert("xyz.tinycloud.policy/enforcerDid".into(), node_did.clone());
     enforcement.insert(
         "xyz.tinycloud.policy/nodeAudience".into(),
-        NODE_AUDIENCE.into(),
+        config.node_audience.clone(),
     );
-    enforcement.insert("xyz.tinycloud.policy/attestationBindingDigestHex".into(), sha256_b64(&value_bytes(&json!({"targetOrigin":TARGET_ORIGIN,"nodeAudience":NODE_AUDIENCE,"enforcerDid":node_did,"enforcerKid":"did:web:node.tinycloud.xyz#enforcement-key-1","keyVersion":1}))));
+    enforcement.insert("xyz.tinycloud.policy/attestationBindingDigestHex".into(), sha256_b64(&value_bytes(&json!({"targetOrigin":config.target_origin,"nodeAudience":config.node_audience,"enforcerDid":node_did,"enforcerKid":format!("{}#enforcement-key-1", config.node_audience),"keyVersion":1}))));
     enforcement.insert(
         "xyz.tinycloud.policy/maxSessionTtlSeconds".into(),
         "300".into(),
@@ -328,10 +366,10 @@ fn build_case(
         "vp-digest-v1".into(),
     );
     let not_before = canonical_time(now - time::Duration::seconds(30));
-    let parent_expires = canonical_time(now + time::Duration::hours(1));
+    let parent_expires = canonical_time(now + time::Duration::hours(24));
     let authority_parent = signed_parent(
         "policy-authority",
-        NODE_AUDIENCE,
+        &config.node_audience,
         std::slice::from_ref(&capability),
         &common,
         &owner_seed,
@@ -354,15 +392,21 @@ fn build_case(
     tinycloud_core::policy_authority::AuthorityArtifactVerifier
         .verify(&authority_parent_bytes)
         .map_err(|error| anyhow::anyhow!("authority parent validation: {error:?}"))?;
+    if recovered_owner_did(&authority_parent)? != owner {
+        bail!("authority parent owner recovery did not match issuerDid");
+    }
     tinycloud_core::policy_authority::AuthorityArtifactVerifier
         .verify(&enforcement_parent_bytes)
         .map_err(|error| anyhow::anyhow!("enforcement parent validation: {error:?}"))?;
+    if recovered_owner_did(&enforcement_parent)? != owner {
+        bail!("enforcement parent owner recovery did not match issuerDid");
+    }
     let invitation_public = node
         .public()
         .try_into_ed25519()
         .expect("node key")
         .to_bytes();
-    let enrollment = json!({"targetOrigin":TARGET_ORIGIN,"nodeAudience":NODE_AUDIENCE,"invitationKid":INVITATION_KID,"invitationPublicKey":b64(&invitation_public),"keyVersion":1,"enabled":true});
+    let enrollment = json!({"targetOrigin":config.target_origin,"nodeAudience":config.node_audience,"invitationKid":config.invitation_kid,"invitationPublicKey":b64(&invitation_public),"keyVersion":1,"enabled":true});
     let status_now = canonical_time(now);
     let status_fresh = canonical_time(now + time::Duration::seconds(240));
     let policy_parent_cid = authority_parent["delegationCid"].as_str().expect("cid");
@@ -381,7 +425,7 @@ fn build_case(
         node,
         &node_did,
     );
-    let attestation = attestation(&enrollment, &node_did, &status_fresh, node);
+    let attestation = attestation(config, &enrollment, &node_did, &status_fresh, node);
     let authority = json!({"type":"TinyCloudShareAuthorityMaterial","version":1,"handle":format!("amh_{kind}_001"),"policyOwnerDid":owner,"senderDid":sender_did,"relationship":{"policyOwnerDid":owner,"senderDid":sender_did,"authenticated":true},"mapping":{"sharePolicyCid":policy_cid,"shareDelegationCid":delegation_cid,"policyAuthorityCid":policy_parent_cid,"policyEnforcementCid":enforcement_parent_cid},"policyAuthorityBytes":b64(&authority_parent_bytes),"policyAuthorityCid":policy_parent_cid,"policyEnforcementBytes":b64(&enforcement_parent_bytes),"policyEnforcementCid":enforcement_parent_cid,"statusObservations":[authority_status,enforcement_status],"enrollment":enrollment,"attestation":attestation});
     let authority_digest = sha256_b64(&value_bytes(&authority));
     Ok(Case {
@@ -394,7 +438,7 @@ fn build_case(
         authority_digest,
         expires_at,
         content: if kind == "kv" {
-            "# KV production plan\n"
+            "# TinyCloud policy payload test\n\nPolicy-authorized payload consumption succeeded."
         } else {
             "# SQL production plan\n"
         },
@@ -402,6 +446,7 @@ fn build_case(
 }
 
 fn descriptor(
+    config: &FixtureConfig,
     cases: &[Case],
     node: &tinycloud_core::libp2p::identity::Keypair,
     issuer_public: &str,
@@ -421,7 +466,7 @@ fn descriptor(
             json!({
                 "shareId": share_id,
                 "policyCid": case.policy_cid,
-                "recipientEmail": "Alice+Notes@example.com",
+                "recipientEmail": "sam@tinycloud.xyz",
                 "expiry": case.expires_at,
                 "delegationCid": case.delegation_cid,
                 "authorityMaterialHandle": format!("amh_{}_001", case.kind),
@@ -433,13 +478,13 @@ fn descriptor(
             })
         }).collect::<Vec<_>>();
         json!({
-        "kind":case.kind,"source":case.source,"expectedContentSourceDigest":sha256_b64(&value_bytes(&case.source)),"expectedRecipientEmail":"Alice+Notes@example.com","expiresAt":case.expires_at,
+        "kind":case.kind,"source":case.source,"policy":case.policy,"expectedContentSourceDigest":sha256_b64(&value_bytes(&case.source)),"expectedRecipientEmail":"sam@tinycloud.xyz","expiresAt":case.expires_at,
         "policyCid":case.policy_cid,"delegationCid":case.delegation_cid,"authorityMaterialHandle":format!("amh_{}_001",case.kind),"authorityMaterialDigest":case.authority_digest,
-        "policyOwnerDid":case.authority["policyOwnerDid"],"senderDid":case.authority["senderDid"],"senderPrivateKey":b64(&sender_seed),"delegation":format!("uCAESA.n4-production.{}",case.kind),"spaceId":SPACE,"documentName":"Project plan.md","senderTrust":"verified","authorityMaterial":case.authority,"targetOrigin":TARGET_ORIGIN,"nodeAudience":NODE_AUDIENCE,
-        "trustedNode":{"targetOrigin":TARGET_ORIGIN,"nodeAudience":NODE_AUDIENCE,"invitationKid":INVITATION_KID,"invitationPublicKey":b64(&node_public),"keyVersion":1,"enabled":true},"authoritativeBinding":authoritative_bindings[0],"authoritativeBindings":authoritative_bindings,"expectedContent":case.content
+        "policyOwnerDid":case.authority["policyOwnerDid"],"senderDid":case.authority["senderDid"],"senderPrivateKey":b64(&sender_seed),"delegation":format!("uCAESA.n4-production.{}",case.kind),"spaceId":SPACE,"documentName":if case.kind == "kv" { "TinyCloud share test" } else { "Project plan.md" },"senderTrust":"verified","authorityMaterial":case.authority,"targetOrigin":config.target_origin,"nodeAudience":config.node_audience,
+        "trustedNode":{"targetOrigin":config.target_origin,"nodeAudience":config.node_audience,"invitationKid":config.invitation_kid,"invitationPublicKey":b64(&node_public),"keyVersion":1,"enabled":true},"authoritativeBinding":authoritative_bindings[0],"authoritativeBindings":authoritative_bindings,"expectedContent":case.content
         })
     }).collect::<Vec<_>>();
-    json!({"production":true,"service":"tinycloud-node-production-e2e","url":url,"healthUrl":format!("{url}/healthz"),"issuerDid":ISSUER_DID,"issuerKid":ISSUER_KID,"issuerPublicKey":issuer_public,"trustBundle":trust_bundle,"capability":{"id":"tinycloud.node-policy-email-v1","version":1,"origin":TARGET_ORIGIN,"routes":tinycloud_node::share_email::NODE_CAPABILITY_ROUTES,"contentKinds":["kv","sql"],"status":"ready"},"trustedNode":{"targetOrigin":TARGET_ORIGIN,"nodeAudience":NODE_AUDIENCE,"invitationKid":INVITATION_KID,"invitationPublicKey":b64(&node_public),"keyVersion":1,"enabled":true},"senderDid":did_key(&sender),"cases":case_values})
+    json!({"production":true,"service":"tinycloud-node-production-e2e","url":url,"healthUrl":format!("{url}/healthz"),"issuerDid":ISSUER_DID,"issuerKid":ISSUER_KID,"issuerPublicKey":issuer_public,"trustBundle":trust_bundle,"capability":{"id":"tinycloud.node-policy-email-v1","version":1,"origin":config.target_origin,"routes":tinycloud_node::share_email::NODE_CAPABILITY_ROUTES,"contentKinds":["kv","sql"],"status":"ready"},"trustedNode":{"targetOrigin":config.target_origin,"nodeAudience":config.node_audience,"invitationKid":config.invitation_kid,"invitationPublicKey":b64(&node_public),"keyVersion":1,"enabled":true},"senderDid":did_key(&sender),"cases":case_values})
 }
 
 fn figment(
@@ -512,7 +557,7 @@ async fn seed_kv(rocket: &Rocket<Build>, seed: [u8; 32]) -> Result<()> {
     )?;
     let resource = space.clone().to_resource(
         "kv".parse::<Service>()?,
-        Some("documents/plan.md".parse::<ResourcePath>()?),
+        Some("documents/policy-payload.md".parse::<ResourcePath>()?),
         None,
         None,
     );
@@ -599,7 +644,11 @@ async fn seed_kv(rocket: &Rocket<Build>, seed: [u8; 32]) -> Result<()> {
         )?;
     let staging = rocket.state::<BlockStage>().context("staging missing")?;
     let mut buffer: HashBuffer<_> = staging.stage(&space).await?;
-    buffer.write_all(b"# KV mounted plan\n").await?;
+    buffer
+        .write_all(
+            b"# TinyCloud policy payload test\n\nPolicy-authorized payload consumption succeeded.",
+        )
+        .await?;
     buffer.flush().await?;
     let mut inputs: std::collections::HashMap<
         (_, _),
@@ -609,7 +658,10 @@ async fn seed_kv(rocket: &Rocket<Build>, seed: [u8; 32]) -> Result<()> {
         ),
     > = std::collections::HashMap::new();
     inputs.insert(
-        (space.clone(), "documents/plan.md".parse::<ResourcePath>()?),
+        (
+            space.clone(),
+            "documents/policy-payload.md".parse::<ResourcePath>()?,
+        ),
         (Metadata(BTreeMap::new()), buffer),
     );
     tinycloud
@@ -697,6 +749,59 @@ async fn mounted_http_adversarial_checks(rocket: Rocket<Build>) -> Result<()> {
 async fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let self_test = args.iter().any(|argument| argument == "--self-test");
+    let target_origin = args
+        .windows(2)
+        .find(|pair| pair[0] == "--target-origin")
+        .map(|pair| pair[1].clone())
+        .unwrap_or_else(|| TARGET_ORIGIN.into());
+    let target_host_port = target_origin
+        .strip_prefix("https://")
+        .filter(|value| {
+            !value.is_empty()
+                && !value.contains('/')
+                && !value.contains('?')
+                && !value.contains('#')
+        })
+        .context("--target-origin must be a canonical HTTPS origin")?;
+    let target_host = target_host_port
+        .rsplit_once(':')
+        .filter(|(_, port)| {
+            !port.is_empty() && port.chars().all(|character| character.is_ascii_digit())
+        })
+        .map(|(host, _)| host)
+        .unwrap_or(target_host_port);
+    let node_audience = args
+        .windows(2)
+        .find(|pair| pair[0] == "--node-audience")
+        .map(|pair| pair[1].clone())
+        .unwrap_or_else(|| format!("did:web:{target_host}"));
+    if node_audience != format!("did:web:{target_host}") {
+        bail!("--node-audience must equal did:web:<target-origin-hostname>");
+    }
+    let return_origin = args
+        .windows(2)
+        .find(|pair| pair[0] == "--return-origin")
+        .map(|pair| pair[1].clone())
+        .unwrap_or_else(|| RETURN_ORIGIN.into());
+    if !return_origin.starts_with("https://")
+        || return_origin.contains('/') && return_origin.matches('/').count() > 2
+    {
+        bail!("--return-origin must be a canonical HTTPS origin");
+    }
+    let invitation_kid = args
+        .windows(2)
+        .find(|pair| pair[0] == "--invitation-kid")
+        .map(|pair| pair[1].clone())
+        .unwrap_or_else(|| format!("{node_audience}#invitation-key-1"));
+    if !invitation_kid.starts_with(&format!("{node_audience}#")) {
+        bail!("--invitation-kid must be enrolled under --node-audience");
+    }
+    let fixture_config = FixtureConfig {
+        target_origin,
+        node_audience,
+        return_origin,
+        invitation_kid,
+    };
     let descriptor_path = args
         .windows(2)
         .find(|pair| pair[0] == "--descriptor")
@@ -742,8 +847,8 @@ async fn run() -> Result<()> {
         .replace_second(0)
         .and_then(|value| value.replace_nanosecond(0))?;
     let cases = vec![
-        build_case("kv", &sender, &node, now)?,
-        build_case("sql", &sender, &node, now)?,
+        build_case(&fixture_config, "kv", &sender, &node, now)?,
+        build_case(&fixture_config, "sql", &sender, &node, now)?,
     ];
     let temp = TempDir::new().context("temporary fixture directory")?;
     let material_path = temp.path().join("authority-material.json");
@@ -768,13 +873,13 @@ async fn run() -> Result<()> {
     let trust_bundle_path = temp.path().join("share-email-trust-bundle.json");
     let trust_bundle = json!({
         "version": "tinycloud.share-email-trust-bundle/v1",
-        "shareOrigin": RETURN_ORIGIN,
-        "returnOrigin": RETURN_ORIGIN,
+        "shareOrigin": fixture_config.return_origin.clone(),
+        "returnOrigin": fixture_config.return_origin.clone(),
         "registryOrigin": "https://registry.tinycloud.xyz",
         "credentialsOrigin": "https://witness.credentials.org",
-        "nodeOrigin": TARGET_ORIGIN,
-        "nodeAudience": NODE_AUDIENCE,
-        "nodeInvitationKid": INVITATION_KID,
+        "nodeOrigin": fixture_config.target_origin.clone(),
+        "nodeAudience": fixture_config.node_audience.clone(),
+        "nodeInvitationKid": fixture_config.invitation_kid.clone(),
         "nodeInvitationPublicKey": invitation_public,
         "nodeKeyVersion": 1,
         "nodeEnabled": true,
@@ -809,6 +914,7 @@ async fn run() -> Result<()> {
         std::process::exit(0);
     }
     let descriptor = descriptor(
+        &fixture_config,
         &cases,
         &node,
         &issuer_public,

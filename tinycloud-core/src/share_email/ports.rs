@@ -93,11 +93,13 @@ pub enum PortError {
 /// N2 verifies the OpenCredentials credential and returns checked evidence.
 #[async_trait]
 pub trait CredentialVerifier: Send + Sync {
-    async fn verify_credential(
+    async fn verify_credential_for(
         &self,
         credential: &[u8],
         expected_scope: &ShareScope,
         expected_holder: &DidKey,
+        expected_email: &str,
+        expected_expiry: i64,
     ) -> Result<CredentialVerificationEvidence, PortError>;
 }
 
@@ -111,7 +113,7 @@ pub trait PolicyAuthorityTransaction117: Send + Sync {
     /// presentation JTI, and persist the #117 session atomically.
     async fn establish_session(
         &self,
-        request: PolicySessionRequest,
+        admission: VerifiedSessionAdmission,
         now: OffsetDateTime,
     ) -> Result<PolicySession, PortError>;
 

@@ -4,6 +4,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use std::{collections::BTreeMap, fmt};
 use thiserror::Error;
+use time::OffsetDateTime;
 
 pub const KV_GET_ACTION: &str = "tinycloud.kv/get";
 pub const SQL_READ_ACTION: &str = "tinycloud.sql/read";
@@ -641,6 +642,8 @@ pub struct HolderEquation {
     pub presentation_signer: DidKey,
     pub policy_session_holder: DidKey,
     pub read_signer: DidKey,
+    pub holder_binding_jti: ProtocolJti,
+    pub holder_binding_expires_at: i64,
 }
 
 impl fmt::Debug for HolderEquation {
@@ -674,7 +677,6 @@ impl fmt::Debug for CredentialVerificationEvidence {
 pub struct PolicySessionRequest {
     pub scope: ShareScope,
     pub holder: DidKey,
-    pub credential_digest: Sha256Digest,
     pub nonce: ProtocolNonce,
     pub presentation_jti: ProtocolJti,
     pub challenge_id: String,
@@ -687,6 +689,72 @@ pub struct PolicySessionRequest {
 impl fmt::Debug for PolicySessionRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("PolicySessionRequest { [REDACTED] }")
+    }
+}
+
+/// The only admission value accepted by the authority transaction. Its
+/// fields can be populated only by the concrete verifier after exact-email
+/// and holder-binding checks have succeeded.
+pub struct VerifiedSessionAdmission {
+    request: PolicySessionRequest,
+    verified_email: String,
+    verified_credential_digest: Sha256Digest,
+    holder_equation: HolderEquation,
+}
+
+impl VerifiedSessionAdmission {
+    pub(crate) fn from_verified(
+        request: PolicySessionRequest,
+        verified_email: String,
+        verified_credential_digest: Sha256Digest,
+        holder_equation: HolderEquation,
+    ) -> Self {
+        Self {
+            request,
+            verified_email,
+            verified_credential_digest,
+            holder_equation,
+        }
+    }
+
+    pub(crate) fn request(&self) -> &PolicySessionRequest {
+        &self.request
+    }
+
+    pub(crate) fn verified_email(&self) -> &str {
+        &self.verified_email
+    }
+
+    pub(crate) fn verified_credential_digest(&self) -> &Sha256Digest {
+        &self.verified_credential_digest
+    }
+
+    pub(crate) fn holder_equation(&self) -> &HolderEquation {
+        &self.holder_equation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(request: PolicySessionRequest, holder: DidKey) -> Self {
+        Self::from_verified(
+            request,
+            "holder@example.com".to_owned(),
+            Sha256Digest::from_bytes([9; 32]),
+            HolderEquation {
+                credential_subject: holder.clone(),
+                presentation_holder: holder.clone(),
+                presentation_signer: holder.clone(),
+                policy_session_holder: holder.clone(),
+                read_signer: holder,
+                holder_binding_jti: ProtocolJti::from_bytes([8; 16]),
+                holder_binding_expires_at: i64::MAX,
+            },
+        )
+    }
+}
+
+impl fmt::Debug for VerifiedSessionAdmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VerifiedSessionAdmission { [REDACTED] }")
     }
 }
 
@@ -711,6 +779,7 @@ pub struct PolicySession {
     pub scope: ShareScope,
     pub holder: DidKey,
     pub credential_digest: Sha256Digest,
+    pub expires_at: OffsetDateTime,
     pub sql_statement: Option<crate::share_email::data_plane::PinnedNamedStatement>,
 }
 

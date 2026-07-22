@@ -17,6 +17,7 @@
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::{rngs::OsRng, RngCore};
+use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
     TransactionTrait,
@@ -25,15 +26,19 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use tinycloud_auth::{
+    ipld_core::cid::Cid,
+    multihash_codetable::{Code, MultihashDigest},
+};
 
 use crate::{
     models::{share_policy_presentation_jti, share_session_handle},
     policy_authority::{
-        AuthorityArtifactVerifier, AuthorityError, AuthorityStatusObservation,
-        DatabaseAuthorityKernel, DatabaseAuthorityStore, DecisionContext, DelegationMode,
-        DelegationRole, DelegationSignature, IssuanceAudit, IssuanceBindings, NodeRootSigner,
-        PolicyDelegation, TrustedPolicyDecision, VerifiedAttestedEnforcerBinding,
-        VerifiedPolicyState,
+        evaluate_exact_email_policy, AuthorityArtifactVerifier, AuthorityError,
+        AuthorityStatusObservation, DatabaseAuthorityKernel, DatabaseAuthorityStore,
+        DecisionContext, DelegationMode, DelegationRole, DelegationSignature,
+        ExactEmailPolicyEvaluation, IssuanceAudit, IssuanceBindings, NodeRootSigner,
+        PolicyDelegation, VerifiedAttestedEnforcerBinding, VerifiedPolicyState,
     },
     policy_capability::{jcs, parse as parse_capability, PolicyCapability},
 };
@@ -48,9 +53,8 @@ use super::{
         SessionHandleMapping, StateError, READ_JTI_TTL, SESSION_TTL,
     },
     types::{
-        AuthorizedRead, Did, DidKey, NodeDelegationCid, PolicySession, PolicySessionRequest,
-        ReadAuthorizationRequest, ReadInvocation, SessionHandle, Sha256Digest, ShareScope,
-        TargetOrigin,
+        AuthorizedRead, Did, DidKey, NodeDelegationCid, PolicySession, ReadAuthorizationRequest,
+        ReadInvocation, SessionHandle, Sha256Digest, ShareScope, TargetOrigin,
     },
 };
 
@@ -71,11 +75,22 @@ impl DatabaseAuthorityBridge117 {
     async fn issue_root_in_transaction(
         &self,
         tx: &sea_orm::DatabaseTransaction,
-        request: &PolicySessionRequest,
+        admission: &super::types::VerifiedSessionAdmission,
         now: OffsetDateTime,
         policy_expiry: OffsetDateTime,
         credential_expiry: OffsetDateTime,
-    ) -> Result<String, PortError> {
+    ) -> Result<(String, OffsetDateTime), PortError> {
+        let request = admission.request();
+        let verified_credential_digest = admission.verified_credential_digest();
+        let holder_equation = admission.holder_equation();
+        if holder_equation.credential_subject != request.holder
+            || holder_equation.presentation_holder != request.holder
+            || holder_equation.presentation_signer != request.holder
+            || holder_equation.policy_session_holder != request.holder
+            || holder_equation.read_signer != request.holder
+        {
+            return Err(PortError::Denied);
+        }
         let authority_now = authority_timestamp_value(now)?;
         let policy_cid = request
             .scope
@@ -198,13 +213,39 @@ impl DatabaseAuthorityBridge117 {
             challenge_nonce_hash_hex: nonce_hash.as_str().to_owned(),
             requested_capabilities_hash_hex: capability_hash.clone(),
             claim_invocation_digest_hex: request.challenge_request_digest.as_str().to_owned(),
-            vp_digest_hex: request.credential_digest.as_str().to_owned(),
+            vp_digest_hex: verified_credential_digest.as_str().to_owned(),
         };
-        let decision = TrustedPolicyDecision::allow_from_verified(
-            decision_context,
-            authority_now,
-            authority_now + SESSION_TTL,
-        )
+        let policy_state_value: serde_json::Value =
+            serde_json::from_slice(&bundle.policy_state).map_err(|_| PortError::Denied)?;
+        let decision = evaluate_exact_email_policy(ExactEmailPolicyEvaluation {
+            policy: policy.artifact(),
+            enforcement: enforcement.artifact(),
+            policy_state: &policy_state_value,
+            sender_did: policy_state_value
+                .get("issuerDid")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(PortError::Denied)?,
+            verified_email: admission.verified_email(),
+            holder_did: request.holder.as_str(),
+            source: &serde_json::to_value(&request.scope.content_source)
+                .map_err(|_| PortError::Denied)?,
+            source_digest: request.scope.content_source_digest.as_str(),
+            action: match request.scope.action {
+                super::types::ShareAction::KvGet => super::types::KV_GET_ACTION,
+                super::types::ShareAction::SqlRead => super::types::SQL_READ_ACTION,
+            },
+            resource: match &request.scope.resource {
+                super::types::ExactResource::Kv { path }
+                | super::types::ExactResource::Sql { path, .. } => path.as_str(),
+            },
+            owner_did: decision_context.owner_did.as_str(),
+            enforcer_did: decision_context.enforcer_did.as_str(),
+            node_audience: decision_context.node_audience.as_str(),
+            context: decision_context.clone(),
+            now: authority_now,
+            credential_expires_at: credential_expiry,
+            policy_expires_at: policy_expiry,
+        })
         .map_err(map_authority_error)?;
         let bindings = IssuanceBindings::from_verified(
             authority_now,
@@ -215,7 +256,7 @@ impl DatabaseAuthorityBridge117 {
             claimant.clone(),
             capability_hash.clone(),
             request.challenge_request_digest.as_str(),
-            request.credential_digest.as_str(),
+            verified_credential_digest.as_str(),
         );
         let binding = VerifiedAttestedEnforcerBinding::from_verified(
             enforcement
@@ -236,10 +277,20 @@ impl DatabaseAuthorityBridge117 {
             now + SESSION_TTL,
             policy_expiry,
             credential_expiry,
+            OffsetDateTime::from_unix_timestamp(holder_equation.holder_binding_expires_at)
+                .map_err(|_| PortError::Denied)?,
             enforcement
                 .artifact()
                 .expires_at()
                 .map_err(map_authority_error)?,
+            now + time::Duration::seconds(
+                enforcement
+                    .artifact()
+                    .fact_value("maxSessionTtlSeconds")
+                    .map_err(|_| PortError::Denied)?
+                    .parse::<i64>()
+                    .map_err(|_| PortError::Denied)?,
+            ),
         ]
         .into_iter()
         .min()
@@ -255,7 +306,7 @@ impl DatabaseAuthorityBridge117 {
             request.challenge_id.clone(),
             nonce_hash.as_str(),
             request.challenge_request_digest.as_str(),
-            request.credential_digest.as_str(),
+            verified_credential_digest.as_str(),
             decision.decision_context_digest_hex(),
             root_not_before,
             root_expires_at,
@@ -284,7 +335,10 @@ impl DatabaseAuthorityBridge117 {
                 "claimInvocationDigestHex",
                 request.challenge_request_digest.as_str().to_owned(),
             ),
-            ("vpDigestHex", request.credential_digest.as_str().to_owned()),
+            (
+                "vpDigestHex",
+                verified_credential_digest.as_str().to_owned(),
+            ),
             (
                 "decisionContextDigestHex",
                 decision.decision_context_digest_hex().to_owned(),
@@ -338,27 +392,31 @@ impl DatabaseAuthorityBridge117 {
             },
         };
         let signer = self.root_signer.as_ref().ok_or(PortError::Unavailable)?;
-        let preview = verifier
-            .sign_and_verify_root(root.clone(), signer.as_ref())
+        let verified_root = verifier
+            .sign_and_verify_root(root, signer.as_ref())
+            .map_err(map_authority_error)?;
+        let authority_session_cid = verified_root.artifact().delegation_cid.clone();
+        let verified_root_expires_at = verified_root
+            .artifact()
+            .expires_at()
             .map_err(map_authority_error)?;
         DatabaseAuthorityKernel::new(
             self.authority.clone(),
             enforcement.artifact().audience_did.clone(),
         )
-        .sign_and_issue_root_in_transaction(
+        .issue_root_in_transaction(
             tx,
             &policy,
             &enforcement,
             &policy_state,
-            root,
-            signer.as_ref(),
+            verified_root,
             &binding,
             &decision,
             &bindings,
         )
         .await
         .map_err(map_authority_error)?;
-        Ok(preview.artifact().delegation_cid.clone())
+        Ok((authority_session_cid, verified_root_expires_at))
     }
 
     /// `conn` and `authority` must share the same underlying database so a
@@ -437,9 +495,10 @@ struct SessionBinding {
 impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
     async fn establish_session(
         &self,
-        request: PolicySessionRequest,
+        admission: super::types::VerifiedSessionAdmission,
         now: OffsetDateTime,
     ) -> Result<PolicySession, PortError> {
+        let request = admission.request();
         let tx = self.conn.begin().await.map_err(|_| PortError::Storage)?;
 
         let (policy_expiry, policy_recipient, sql_statement, _internal_delegation_cid) = self
@@ -465,35 +524,23 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
         .await
         .map_err(map_state_error)?;
 
-        let already_used =
-            share_policy_presentation_jti::Entity::find_by_id(request.presentation_jti.as_str())
-                .one(&tx)
-                .await
-                .map_err(|_| PortError::Storage)?
-                .is_some()
-                || share_policy_presentation_jti::Entity::find()
-                    .filter(share_policy_presentation_jti::Column::Nonce.eq(request.nonce.as_str()))
-                    .one(&tx)
-                    .await
-                    .map_err(|_| PortError::Storage)?
-                    .is_some();
-        if already_used {
-            return Err(PortError::Replay);
-        }
-
-        let authority_session_cid = self
-            .issue_root_in_transaction(&tx, &request, now, policy_expiry, credential_expiry)
-            .await?;
-
         let mut handle_bytes = [0u8; 16];
         OsRng.fill_bytes(&mut handle_bytes);
         let handle = SessionHandle::from_bytes(handle_bytes);
-        let expires_at = (now + SESSION_TTL)
-            .min(credential_expiry)
-            .min(policy_expiry);
-        if expires_at <= now {
-            return Err(PortError::Denied);
-        }
+        // Reserve both replay identities before any authority-root signing.
+        // These inserts share the transaction with root/session persistence,
+        // so any later failure rolls both reservations back atomically.
+        let reservation_expires_at = now + SESSION_TTL;
+        ProtocolStateRepository::consume_holder_binding_jti_in_transaction(
+            &tx,
+            admission.holder_equation().holder_binding_jti.as_str(),
+            request.scope.policy_cid.as_str(),
+            handle.as_str(),
+            now,
+            reservation_expires_at,
+        )
+        .await
+        .map_err(map_state_error)?;
 
         share_policy_presentation_jti::ActiveModel {
             presentation_jti: Set(request.presentation_jti.as_str().to_owned()),
@@ -501,11 +548,40 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
             policy_cid: Set(request.scope.policy_cid.as_str().to_owned()),
             session_handle: Set(handle.as_str().to_owned()),
             issued_at: Set(timestamp(now).map_err(map_state_error)?),
-            expires_at: Set(timestamp(expires_at).map_err(map_state_error)?),
+            expires_at: Set(timestamp(reservation_expires_at).map_err(map_state_error)?),
         }
         .insert(&tx)
         .await
         .map_err(|_| PortError::Replay)?;
+
+        let (authority_session_cid, expires_at) = self
+            .issue_root_in_transaction(&tx, &admission, now, policy_expiry, credential_expiry)
+            .await?;
+
+        // The root verifier is the single authority for the effective expiry.
+        // Align both replay rows with that verified result before committing
+        // the shared transaction.
+        let expires_at_wire = timestamp(expires_at).map_err(map_state_error)?;
+        for replay_key in [
+            format!(
+                "holder-binding:{}",
+                admission.holder_equation().holder_binding_jti.as_str()
+            ),
+            request.presentation_jti.as_str().to_owned(),
+        ] {
+            let updated = share_policy_presentation_jti::Entity::update_many()
+                .col_expr(
+                    share_policy_presentation_jti::Column::ExpiresAt,
+                    Expr::value(expires_at_wire.clone()),
+                )
+                .filter(share_policy_presentation_jti::Column::PresentationJti.eq(replay_key))
+                .exec(&tx)
+                .await
+                .map_err(|_| PortError::Storage)?;
+            if updated.rows_affected != 1 {
+                return Err(PortError::Storage);
+            }
+        }
 
         let binding = SessionBinding {
             scope_digest: scope_digest(&request.scope),
@@ -514,7 +590,7 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
                 .delegation_cid
                 .clone()
                 .ok_or(PortError::Denied)?,
-            credential_digest: request.credential_digest.clone(),
+            credential_digest: admission.verified_credential_digest().clone(),
         };
         let binding_json = serde_json::to_value(&binding).map_err(|_| PortError::Storage)?;
         let mapping = SessionHandleMapping {
@@ -536,7 +612,7 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
                 .as_str()
                 .to_owned(),
             holder_digest: Some(holder_digest(&request.holder)),
-            request_digest: request.credential_digest.as_str().to_owned(),
+            request_digest: admission.verified_credential_digest().as_str().to_owned(),
         };
 
         ProtocolStateRepository::commit_session_in_transaction(&tx, mapping, audit, now)
@@ -547,9 +623,10 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
 
         Ok(PolicySession {
             handle,
-            scope: request.scope,
-            holder: request.holder,
-            credential_digest: request.credential_digest,
+            scope: request.scope.clone(),
+            holder: request.holder.clone(),
+            credential_digest: admission.verified_credential_digest().clone(),
+            expires_at,
             sql_statement,
         })
     }
@@ -615,6 +692,7 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
             scope: scope.clone(),
             holder: request.holder.clone(),
             credential_digest: binding.credential_digest,
+            expires_at: session_expires_at,
             sql_statement,
         };
         let invocation = ReadInvocation {
@@ -629,14 +707,56 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
 }
 
 impl DatabaseAuthorityBridge117 {
-    pub async fn policy_recipient_and_expiry(
+    /// Resolve the enforcer from the authenticated authority material. The
+    /// holder proof is not allowed to select this value from its own claims.
+    pub async fn enforcer_did_for(
+        &self,
+        policy_cid: &str,
+        delegation_cid: &str,
+        handle: &super::types::AuthorityMaterialHandle,
+        material_digest: &Sha256Digest,
+        node_audience: &Did,
+    ) -> Result<DidKey, PortError> {
+        let policy = super::types::PolicyCid::parse(policy_cid).map_err(|_| PortError::Denied)?;
+        let delegation = super::types::ShareDelegationCid::parse(delegation_cid)
+            .map_err(|_| PortError::Denied)?;
+        let provider = self
+            .authority_material
+            .as_ref()
+            .filter(|provider| provider.healthy())
+            .ok_or(PortError::Unavailable)?;
+        let bundle = provider
+            .resolve_exact(&policy, &delegation, handle, material_digest)
+            .await?;
+        let enforcement = AuthorityArtifactVerifier
+            .verify(&bundle.policy_enforcement)
+            .map_err(map_authority_error)?;
+        if enforcement.artifact().delegation_cid != bundle.internal_policy_enforcement_cid.as_str()
+            || enforcement
+                .artifact()
+                .fact_value("nodeAudience")
+                .map_err(|_| PortError::Denied)?
+                != node_audience.as_str()
+        {
+            return Err(PortError::Denied);
+        }
+        DidKey::parse(
+            enforcement
+                .artifact()
+                .fact_value("enforcerDid")
+                .map_err(|_| PortError::Denied)?,
+        )
+        .map_err(|_| PortError::Denied)
+    }
+
+    pub async fn policy_sender_recipient_and_expiry(
         &self,
         policy_cid: &str,
         delegation_cid: &str,
         handle: &super::types::AuthorityMaterialHandle,
         material_digest: &Sha256Digest,
         now: OffsetDateTime,
-    ) -> Result<(String, OffsetDateTime), PortError> {
+    ) -> Result<(String, String, OffsetDateTime), PortError> {
         let policy = super::types::PolicyCid::parse(policy_cid).map_err(|_| PortError::Denied)?;
         let delegation = super::types::ShareDelegationCid::parse(delegation_cid)
             .map_err(|_| PortError::Denied)?;
@@ -655,6 +775,22 @@ impl DatabaseAuthorityBridge117 {
         {
             return Err(PortError::Denied);
         }
+        let policy_state: serde_json::Value =
+            serde_json::from_slice(&bundle.policy_state).map_err(|_| PortError::Denied)?;
+        let policy_state_bytes = jcs::canonicalize(&policy_state);
+        if policy_state_bytes != bundle.policy_state {
+            return Err(PortError::Denied);
+        }
+        if Cid::new_v1(0x55, Code::Sha2_256.digest(&policy_state_bytes)).to_string()
+            != policy.as_str()
+            || signed_policy
+                .artifact()
+                .fact_value("policyDigestHex")
+                .map_err(|_| PortError::Denied)?
+                != hex::encode(Sha256::digest(&policy_state_bytes))
+        {
+            return Err(PortError::Denied);
+        }
         let tx = self.conn.begin().await.map_err(|_| PortError::Storage)?;
         let result = self
             .authority
@@ -662,10 +798,15 @@ impl DatabaseAuthorityBridge117 {
             .await
             .map_err(map_authority_error)
             .and_then(|artifact| {
-                let (recipient, expiry) = policy_metadata(&artifact, Some(&bundle.policy_state))
+                let (recipient, expiry) = policy_metadata(&artifact, Some(&policy_state_bytes))
                     .map_err(|_| PortError::Denied)?;
                 if now < expiry {
-                    Ok((recipient, expiry))
+                    let sender = policy_state
+                        .get("issuerDid")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or(PortError::Denied)?
+                        .to_owned();
+                    Ok((sender, recipient, expiry))
                 } else {
                     Err(PortError::Denied)
                 }
@@ -793,6 +934,34 @@ impl DatabaseAuthorityBridge117 {
         {
             return Err(PortError::Denied);
         }
+        let policy_state_value: serde_json::Value =
+            serde_json::from_slice(&bundle.policy_state).map_err(|_| PortError::Denied)?;
+        let policy_state_bytes = jcs::canonicalize(&policy_state_value);
+        if policy_state_bytes != bundle.policy_state {
+            return Err(PortError::Denied);
+        }
+        if Cid::new_v1(0x55, Code::Sha2_256.digest(&policy_state_bytes)).to_string()
+            != scope.policy_cid.as_str()
+            || signed_policy
+                .artifact()
+                .fact_value("policyDigestHex")
+                .map_err(|_| PortError::Denied)?
+                != hex::encode(Sha256::digest(&policy_state_bytes))
+        {
+            return Err(PortError::Denied);
+        }
+        let (recipient, expiry) =
+            policy_metadata(&signed_policy.artifact(), Some(&policy_state_bytes))
+                .map_err(|_| PortError::Denied)?;
+        if signed_policy.artifact().audience_did != scope.node_audience.as_str()
+            || signed_enforcement
+                .artifact()
+                .fact_value("nodeAudience")
+                .map_err(|_| PortError::Denied)?
+                != scope.node_audience.as_str()
+        {
+            return Err(PortError::Denied);
+        }
         let enforcer = DidKey::parse(
             signed_enforcement
                 .artifact()
@@ -804,6 +973,20 @@ impl DatabaseAuthorityBridge117 {
             .refresh(&bundle.internal_policy_authority_cid)
             .await?;
         let status = parse_status(&status_bytes, &bundle.internal_policy_authority_cid, now)?;
+        let policy_state = VerifiedPolicyState::from_verified(
+            signed_policy.artifact(),
+            signed_enforcement.artifact(),
+            status.checked_at,
+            expiry,
+        )
+        .map_err(map_authority_error)?;
+        crate::policy_authority::validate_authority_pair(
+            signed_policy.artifact(),
+            signed_enforcement.artifact(),
+            &policy_state,
+            enforcer.as_str(),
+        )
+        .map_err(map_authority_error)?;
         self.authority
             .admit_verified_authority_in_transaction(tx, signed_policy.clone(), &status, now)
             .await
@@ -886,8 +1069,6 @@ impl DatabaseAuthorityBridge117 {
         {
             return Err(PortError::Denied);
         }
-        let (recipient, expiry) =
-            policy_metadata(&policy, Some(&bundle.policy_state)).map_err(|_| PortError::Denied)?;
         let statement = authorized_statement(scope, &policy, &delegation)?;
         Ok((expiry, recipient, statement, bundle.internal_delegation_cid))
     }
@@ -918,31 +1099,14 @@ fn policy_metadata(
     artifact: &crate::policy_authority::PolicyDelegation,
     share_policy: Option<&[u8]>,
 ) -> Result<(String, OffsetDateTime), ()> {
-    fn find_email(value: &serde_json::Value) -> Option<String> {
-        match value {
-            serde_json::Value::Object(object) => object
-                .get("recipientEmail")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-                .or_else(|| object.values().find_map(find_email)),
-            serde_json::Value::Array(values) => values.iter().find_map(find_email),
-            _ => None,
-        }
-    }
-    let recipient = share_policy
+    let policy = share_policy
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
-        .and_then(|value| find_email(&value))
-        .or_else(|| {
-            artifact
-                .facts
-                .iter()
-                .find(|(key, _)| {
-                    key.ends_with("/recipientEmail") || key.as_str() == "recipientEmail"
-                })
-                .map(|(_, value)| value.clone())
-                .or_else(|| artifact.capabilities.iter().find_map(find_email))
-        })
         .ok_or(())?;
+    let recipient = policy
+        .get("recipientEmail")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(())?
+        .to_owned();
     let recipient =
         tinycloud_auth::share_email_evidence::normalize_email(&recipient).map_err(|_| ())?;
     let expiry = OffsetDateTime::parse(
@@ -950,14 +1114,10 @@ fn policy_metadata(
         &time::format_description::well_known::Rfc3339,
     )
     .map_err(|_| ())?;
-    let share_expiry = share_policy
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
-        .and_then(|value| {
-            value
-                .get("expiresAt")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
+    let share_expiry = policy
+        .get("expiresAt")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
         .and_then(|value| {
             OffsetDateTime::parse(&value, &time::format_description::well_known::Rfc3339).ok()
         });
@@ -1359,6 +1519,10 @@ mod tests {
         DidKey::parse("did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw").unwrap()
     }
 
+    fn admission(request: PolicySessionRequest) -> VerifiedSessionAdmission {
+        VerifiedSessionAdmission::for_test(request, holder())
+    }
+
     fn source_digest(value: &Value) -> Sha256Digest {
         Sha256Digest::from_bytes(Sha256::digest(jcs::canonicalize(value)).into())
     }
@@ -1499,7 +1663,6 @@ mod tests {
         let request = PolicySessionRequest {
             scope: scope(root_cid),
             holder: holder(),
-            credential_digest: Sha256Digest::from_bytes([9; 32]),
             nonce: ProtocolNonce::from_bytes([1; 32]),
             presentation_jti: ProtocolJti::from_bytes([2; 16]),
             challenge_id: String::new(),
@@ -1509,7 +1672,7 @@ mod tests {
             credential_expires_at: 0,
         };
         assert_eq!(
-            bridge.establish_session(request, now).await,
+            bridge.establish_session(admission(request), now).await,
             Err(PortError::Unavailable)
         );
     }
@@ -1522,10 +1685,9 @@ mod tests {
         assert_eq!(
             bridge
                 .establish_session(
-                    PolicySessionRequest {
+                    admission(PolicySessionRequest {
                         scope: scope(root_cid),
                         holder: holder(),
-                        credential_digest: Sha256Digest::from_bytes([9; 32]),
                         nonce: ProtocolNonce::from_bytes([5; 32]),
                         presentation_jti: ProtocolJti::from_bytes([6; 16]),
                         challenge_id: String::new(),
@@ -1533,7 +1695,7 @@ mod tests {
                         challenge_binding: json!(null),
                         policy_recipient_digest: Sha256Digest::from_bytes([0; 32]),
                         credential_expires_at: 0,
-                    },
+                    }),
                     now,
                 )
                 .await,
@@ -1549,10 +1711,9 @@ mod tests {
         assert_eq!(
             bridge
                 .establish_session(
-                    PolicySessionRequest {
+                    admission(PolicySessionRequest {
                         scope: scope(root_cid),
                         holder: holder(),
-                        credential_digest: Sha256Digest::from_bytes([9; 32]),
                         nonce: ProtocolNonce::from_bytes([14; 32]),
                         presentation_jti: ProtocolJti::from_bytes([15; 16]),
                         challenge_id: String::new(),
@@ -1560,7 +1721,7 @@ mod tests {
                         challenge_binding: json!(null),
                         policy_recipient_digest: Sha256Digest::from_bytes([0; 32]),
                         credential_expires_at: 0,
-                    },
+                    }),
                     now,
                 )
                 .await,
@@ -1578,10 +1739,9 @@ mod tests {
 
         let result = bridge
             .establish_session(
-                PolicySessionRequest {
+                admission(PolicySessionRequest {
                     scope: scope("bafkreiaqkcd56bhbn3zwcx7r5xdkle2nukcrhkvwwrcg4qqehk6q5hlwi4"),
                     holder: holder(),
-                    credential_digest: Sha256Digest::from_bytes([9; 32]),
                     nonce: ProtocolNonce::from_bytes([16; 32]),
                     presentation_jti: ProtocolJti::from_bytes([17; 16]),
                     challenge_id: String::new(),
@@ -1589,7 +1749,7 @@ mod tests {
                     challenge_binding: json!(null),
                     policy_recipient_digest: Sha256Digest::from_bytes([0; 32]),
                     credential_expires_at: 0,
-                },
+                }),
                 now,
             )
             .await;

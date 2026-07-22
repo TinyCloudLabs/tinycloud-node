@@ -10,7 +10,7 @@ use super::{
 };
 use crate::models::{
     share_anonymous_challenge, share_email_audit, share_email_quota, share_holder_read_jti,
-    share_invitation_authorization_jti, share_session_handle,
+    share_invitation_authorization_jti, share_policy_presentation_jti, share_session_handle,
 };
 use sea_orm::{
     sea_query::{Expr, OnConflict},
@@ -321,6 +321,42 @@ impl ProtocolStateRepository {
         if changed.rows_affected != 1 {
             return Err(StateError::Replay);
         }
+        Ok(())
+    }
+
+    /// Consume a holder-binding JTI durably. The existing policy-session
+    /// replay table is deliberately reused so admission replay is committed
+    /// atomically with the authority root and opaque session.
+    pub(crate) async fn consume_holder_binding_jti_in_transaction(
+        tx: &DatabaseTransaction,
+        jti: &str,
+        policy_cid: &str,
+        session_handle: &str,
+        issued_at: OffsetDateTime,
+        expires_at: OffsetDateTime,
+    ) -> Result<(), StateError> {
+        if jti.is_empty() || expires_at <= issued_at {
+            return Err(StateError::Invalid);
+        }
+        let replay_key = format!("holder-binding:{jti}");
+        if share_policy_presentation_jti::Entity::find_by_id(&replay_key)
+            .one(tx)
+            .await?
+            .is_some()
+        {
+            return Err(StateError::Replay);
+        }
+        share_policy_presentation_jti::ActiveModel {
+            presentation_jti: Set(replay_key),
+            nonce: Set(format!("holder-binding-nonce:{jti}")),
+            policy_cid: Set(policy_cid.to_owned()),
+            session_handle: Set(session_handle.to_owned()),
+            issued_at: Set(timestamp(issued_at)?),
+            expires_at: Set(timestamp(expires_at)?),
+        }
+        .insert(tx)
+        .await
+        .map_err(|_| StateError::Replay)?;
         Ok(())
     }
 
@@ -650,6 +686,8 @@ pub(crate) fn parse_timestamp(value: &str) -> Result<OffsetDateTime, StateError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::Database;
+    use sea_orm_migration::MigratorTrait;
 
     #[test]
     fn public_state_debug_does_not_contain_bindings() {
@@ -670,5 +708,41 @@ mod tests {
     fn limits_are_five_minute_session_and_bounded_body() {
         assert_eq!(SESSION_TTL, Duration::seconds(300));
         assert_eq!(MAX_REQUEST_BODY_BYTES, 65_536);
+    }
+
+    #[tokio::test]
+    async fn holder_binding_jti_is_durable_and_single_use() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        crate::migrations::Migrator::up(&db, None).await.unwrap();
+        let now = OffsetDateTime::now_utc();
+        let expires_at = now + Duration::minutes(5);
+
+        let tx = db.begin().await.unwrap();
+        ProtocolStateRepository::consume_holder_binding_jti_in_transaction(
+            &tx,
+            "holder-jti",
+            "policy-cid",
+            "session-one",
+            now,
+            expires_at,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let tx = db.begin().await.unwrap();
+        assert_eq!(
+            ProtocolStateRepository::consume_holder_binding_jti_in_transaction(
+                &tx,
+                "holder-jti",
+                "policy-cid",
+                "session-two",
+                now,
+                expires_at,
+            )
+            .await,
+            Err(StateError::Replay)
+        );
+        tx.rollback().await.unwrap();
     }
 }

@@ -32,7 +32,8 @@ pub use types::{
     NamedStatement, NodeDelegationCid, Origin, Path, PolicyCid, PolicySession,
     PolicySessionRequest, ProtocolJti, ProtocolNonce, ReadAuthorizationRequest, ReadInvocation,
     Resource, SafeJsonInteger, SessionHandle, Sha256Digest, ShareAction, ShareCid,
-    ShareDelegationCid, ShareId, ShareScope, SqlReadAction, TargetOrigin, TypeError, KV_GET_ACTION,
-    KV_POLICY_CID, KV_SHARE_CID, MARKDOWN_MEDIA_TYPE, MAX_CID_BYTES, MAX_DATABASE_NAME_BYTES,
-    MAX_MARKDOWN_BYTES, MAX_SHARE_ID_BYTES, SQL_POLICY_CID, SQL_READ_ACTION, SQL_SHARE_CID,
+    ShareDelegationCid, ShareId, ShareScope, SqlReadAction, TargetOrigin, TypeError,
+    VerifiedSessionAdmission, KV_GET_ACTION, KV_POLICY_CID, KV_SHARE_CID, MARKDOWN_MEDIA_TYPE,
+    MAX_CID_BYTES, MAX_DATABASE_NAME_BYTES, MAX_MARKDOWN_BYTES, MAX_SHARE_ID_BYTES, SQL_POLICY_CID,
+    SQL_READ_ACTION, SQL_SHARE_CID,
 };

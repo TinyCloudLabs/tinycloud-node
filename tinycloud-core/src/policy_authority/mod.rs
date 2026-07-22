@@ -382,7 +382,7 @@ impl VerifiedAttestedEnforcerBinding {
     pub(crate) fn binding_digest_hex(&self) -> &str {
         &self.binding_digest_hex
     }
-    pub fn from_verified(
+    pub(crate) fn from_verified(
         binding_digest_hex: impl Into<String>,
         enforcer_did: impl Into<String>,
         node_audience: impl Into<String>,
@@ -428,7 +428,7 @@ pub struct VerifiedPolicyState {
 }
 
 impl VerifiedPolicyState {
-    pub fn from_verified(
+    pub(crate) fn from_verified(
         policy: &PolicyDelegation,
         enforcement: &PolicyDelegation,
         status_checked_at: OffsetDateTime,
@@ -531,7 +531,7 @@ impl TrustedPolicyDecision {
     pub(crate) fn decision_context_digest_hex(&self) -> &str {
         &self.decision_context_digest_hex
     }
-    pub fn allow_from_verified(
+    fn from_evaluation(
         context: DecisionContext,
         evaluated_at: OffsetDateTime,
         valid_until: OffsetDateTime,
@@ -561,6 +561,121 @@ impl TrustedPolicyDecision {
     }
 }
 
+/// Inputs that have already crossed the cryptographic and persistence trust
+/// boundaries. The evaluator still checks every binding before it can create
+/// the opaque decision consumed by the authority kernel.
+pub(crate) struct ExactEmailPolicyEvaluation<'a> {
+    pub policy: &'a PolicyDelegation,
+    pub enforcement: &'a PolicyDelegation,
+    pub policy_state: &'a Value,
+    pub sender_did: &'a str,
+    pub verified_email: &'a str,
+    pub holder_did: &'a str,
+    pub source: &'a Value,
+    pub source_digest: &'a str,
+    pub action: &'a str,
+    pub resource: &'a str,
+    pub owner_did: &'a str,
+    pub enforcer_did: &'a str,
+    pub node_audience: &'a str,
+    pub context: DecisionContext,
+    pub now: OffsetDateTime,
+    pub credential_expires_at: OffsetDateTime,
+    pub policy_expires_at: OffsetDateTime,
+}
+
+/// Evaluate the registered canonical exact-email policy. This is deliberately
+/// the only production constructor for a trusted allow decision.
+pub(crate) fn evaluate_exact_email_policy(
+    input: ExactEmailPolicyEvaluation<'_>,
+) -> Result<TrustedPolicyDecision, AuthorityError> {
+    let object = input
+        .policy_state
+        .as_object()
+        .ok_or(AuthorityError::SchemaInvalid)?;
+    let expected_keys = [
+        "type",
+        "version",
+        "recipientEmail",
+        "contentSource",
+        "contentSourceDigest",
+        "action",
+        "resource",
+        "expiresAt",
+        "issuerDid",
+    ];
+    if object.len() != expected_keys.len()
+        || object
+            .keys()
+            .any(|key| !expected_keys.contains(&key.as_str()))
+        || object.get("type").and_then(Value::as_str) != Some("TinyCloudSharePolicy")
+        || object.get("version").and_then(Value::as_u64) != Some(1)
+    {
+        return Err(AuthorityError::SchemaInvalid);
+    }
+    let recipient = object
+        .get("recipientEmail")
+        .and_then(Value::as_str)
+        .ok_or(AuthorityError::PolicyMismatch)?;
+    let normalized_recipient = tinycloud_auth::share_email_evidence::normalize_email(recipient)
+        .map_err(|_| AuthorityError::PolicyMismatch)?;
+    if normalized_recipient != input.verified_email
+        || object.get("contentSource") != Some(input.source)
+        || object.get("contentSourceDigest").and_then(Value::as_str) != Some(input.source_digest)
+        || object.get("action").and_then(Value::as_str) != Some(input.action)
+        || object.get("resource").and_then(Value::as_str) != Some(input.resource)
+        || object.get("issuerDid").and_then(Value::as_str) != Some(input.sender_did)
+    {
+        return Err(AuthorityError::PolicyMismatch);
+    }
+    let policy_expiry = OffsetDateTime::parse(
+        object
+            .get("expiresAt")
+            .and_then(Value::as_str)
+            .ok_or(AuthorityError::PolicyDecisionExpired)?,
+        &Rfc3339,
+    )
+    .map_err(|_| AuthorityError::PolicyDecisionExpired)?;
+    if policy_expiry < input.policy_expires_at
+        || input.now >= policy_expiry
+        || input.credential_expires_at <= input.now
+        || input.credential_expires_at < policy_expiry
+    {
+        return Err(AuthorityError::PolicyDecisionExpired);
+    }
+    if input.context.claimant_did != input.holder_did
+        || input.context.owner_did != input.owner_did
+        || input.context.enforcer_did != input.enforcer_did
+        || input.context.node_audience != input.node_audience
+        || input.policy.audience_did != input.node_audience
+        || input.enforcement.audience_did != input.enforcer_did
+        || input
+            .enforcement
+            .fact("nodeAudience")
+            .map_err(|_| AuthorityError::FactsMismatch)?
+            != input.node_audience
+        || input
+            .enforcement
+            .fact("enforcerDid")
+            .map_err(|_| AuthorityError::FactsMismatch)?
+            != input.enforcer_did
+    {
+        return Err(AuthorityError::PolicyMismatch);
+    }
+    validate_authority_pair(
+        input.policy,
+        input.enforcement,
+        &VerifiedPolicyState::from_verified(
+            input.policy,
+            input.enforcement,
+            input.now,
+            policy_expiry,
+        )?,
+        input.enforcer_did,
+    )?;
+    TrustedPolicyDecision::from_evaluation(input.context, input.now, policy_expiry)
+}
+
 /// Opaque verified signed challenge plus its durable consumption state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChallengeState {
@@ -582,7 +697,7 @@ pub struct ChallengeState {
 
 impl ChallengeState {
     #[allow(clippy::too_many_arguments)]
-    pub fn from_verified(
+    pub(crate) fn from_verified(
         challenge_id: impl Into<String>,
         nonce_hash_hex: impl Into<String>,
         owner_did: impl Into<String>,
@@ -635,7 +750,7 @@ pub struct IssuanceBindings {
 
 impl IssuanceBindings {
     #[allow(clippy::too_many_arguments)]
-    pub fn from_verified(
+    pub(crate) fn from_verified(
         now: OffsetDateTime,
         claim_issued_at: OffsetDateTime,
         claim_expires_at: OffsetDateTime,
@@ -1410,7 +1525,7 @@ fn validate_challenge_lifetime_for_read(challenge: &ChallengeState) -> Result<()
     }
 }
 
-fn validate_authority_pair(
+pub(crate) fn validate_authority_pair(
     policy: &PolicyDelegation,
     enforcement: &PolicyDelegation,
     policy_state: &VerifiedPolicyState,
@@ -1855,6 +1970,7 @@ mod tests {
     use serde_json::json;
 
     const OWNER: &str = "did:pkh:eip155:1:0x0000000000000000000000000000000000000001";
+    const SENDER: &str = "did:key:z6MkPolicySender";
     const ENFORCER: &str = "did:key:z6MkEnforcer";
     const NODE_AUDIENCE: &str = "did:web:node.example";
     const CLAIMANT: &str = "did:key:z6MkClaimant";
@@ -2126,6 +2242,144 @@ mod tests {
             bindings,
             audit,
         }
+    }
+
+    fn exact_email_policy_state() -> Value {
+        json!({
+            "type": "TinyCloudSharePolicy",
+            "version": 1,
+            "recipientEmail": "Alice@example.com",
+            "contentSource": {"kind": "kv", "space": "did:key:z6MkSpace", "path": "profile", "action": "tinycloud.kv/get"},
+            "contentSourceDigest": "digest",
+            "action": "tinycloud.kv/get",
+            "resource": "profile",
+            "expiresAt": "2027-01-01T00:00:00Z",
+            "issuerDid": OWNER
+        })
+    }
+
+    fn evaluate_exact_fixture(
+        fixture: &Fixture,
+        policy_state: &Value,
+        context: DecisionContext,
+        verified_email: &str,
+        holder: &str,
+        enforcer: &str,
+        audience: &str,
+    ) -> Result<TrustedPolicyDecision, AuthorityError> {
+        let source = policy_state.get("contentSource").unwrap();
+        evaluate_exact_email_policy(ExactEmailPolicyEvaluation {
+            policy: fixture.policy.artifact(),
+            enforcement: fixture.enforcement.artifact(),
+            policy_state,
+            sender_did: policy_state
+                .get("issuerDid")
+                .and_then(Value::as_str)
+                .unwrap(),
+            verified_email,
+            holder_did: holder,
+            source,
+            source_digest: "digest",
+            action: "tinycloud.kv/get",
+            resource: "profile",
+            owner_did: OWNER,
+            enforcer_did: enforcer,
+            node_audience: audience,
+            context,
+            now: t("2026-06-01T00:00:00Z"),
+            credential_expires_at: t("2027-01-01T00:00:00Z"),
+            policy_expires_at: t("2027-01-01T00:00:00Z"),
+        })
+    }
+
+    #[test]
+    fn exact_email_policy_evaluator_denies_bound_mutations() {
+        let fixture = fixture();
+        let policy = exact_email_policy_state();
+        let context = fixture.decision.context.clone();
+        assert!(evaluate_exact_fixture(
+            &fixture,
+            &policy,
+            context.clone(),
+            "Alice@example.com",
+            CLAIMANT,
+            ENFORCER,
+            NODE_AUDIENCE,
+        )
+        .is_ok());
+
+        let mut sender_split = policy.clone();
+        sender_split["issuerDid"] = json!(SENDER);
+        assert!(evaluate_exact_fixture(
+            &fixture,
+            &sender_split,
+            context.clone(),
+            "Alice@example.com",
+            CLAIMANT,
+            ENFORCER,
+            NODE_AUDIENCE,
+        )
+        .is_ok());
+
+        for (field, value) in [
+            ("recipientEmail", json!("other@example.com")),
+            ("action", json!("tinycloud.kv/list")),
+            ("resource", json!("other-profile")),
+        ] {
+            let mut denied = policy.clone();
+            denied[field] = value;
+            assert!(evaluate_exact_fixture(
+                &fixture,
+                &denied,
+                context.clone(),
+                "Alice@example.com",
+                CLAIMANT,
+                ENFORCER,
+                NODE_AUDIENCE,
+            )
+            .is_err());
+        }
+
+        assert!(evaluate_exact_fixture(
+            &fixture,
+            &policy,
+            context.clone(),
+            "wrong@example.com",
+            CLAIMANT,
+            ENFORCER,
+            NODE_AUDIENCE,
+        )
+        .is_err());
+        assert!(evaluate_exact_fixture(
+            &fixture,
+            &policy,
+            context.clone(),
+            "Alice@example.com",
+            "did:key:z6MkOtherClaimant",
+            ENFORCER,
+            NODE_AUDIENCE,
+        )
+        .is_err());
+        assert!(evaluate_exact_fixture(
+            &fixture,
+            &policy,
+            context.clone(),
+            "Alice@example.com",
+            CLAIMANT,
+            "did:key:z6MkOtherEnforcer",
+            NODE_AUDIENCE,
+        )
+        .is_err());
+        assert!(evaluate_exact_fixture(
+            &fixture,
+            &policy,
+            context,
+            "Alice@example.com",
+            CLAIMANT,
+            ENFORCER,
+            "did:web:other.example",
+        )
+        .is_err());
     }
 
     fn issue(f: &Fixture) -> Result<(), AuthorityError> {

@@ -239,6 +239,10 @@ pub fn normalize_email(input: &str) -> Result<String, EvidenceError> {
     Ok(format!("{local}@{}", domain.to_ascii_lowercase()))
 }
 
+pub fn normalized_email_hash(input: &str) -> Result<String, EvidenceError> {
+    Ok(URL_SAFE_NO_PAD.encode(sha256(normalize_email(input)?.as_bytes())))
+}
+
 pub fn verify_sd_jwt(
     credential: &[u8],
     registry: &IssuerTrustRegistry,
