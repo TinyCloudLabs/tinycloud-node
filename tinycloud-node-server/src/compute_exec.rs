@@ -405,6 +405,18 @@ impl HostState {
 
     /// Run one host import synchronously (via `block_on`), journal it, and
     /// return the JSON response bytes to write back into guest memory.
+    ///
+    /// D-QUOTA (KNOWN MVP LIMITATION — decision D-QUOTA, deferred by lead):
+    /// the mediated write paths below (`kv/put`, `kv/del`, and the SQL write
+    /// tier via `sql_op`) do NOT run the per-space storage-quota pre-check
+    /// (`staged_batch_remaining` → 402) that the normal `/invoke` KV and SQL
+    /// routes apply. A compute routine can therefore write past a space's
+    /// storage limit through its `D_fn`, bypassing the 402 the same write
+    /// would hit on the direct route. Left as-is for the P2 MVP; tracked as a
+    /// follow-up (see `specs/compute-service-discussion.md` → "lead — P2 MVP
+    /// follow-ups"). Wiring the quota check here means threading the
+    /// `QuotaCache` + `Config` into `HostState` and 402-mapping a mid-run host
+    /// call, which is a P3 concern.
     fn dispatch(&mut self, import: Import, req: &[u8]) -> Vec<u8> {
         let bytes_in = req.len() as u64;
         let request: Value = match serde_json::from_slice(req) {

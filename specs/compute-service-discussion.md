@@ -603,3 +603,21 @@ Plan P2's ABI bullet now points at Appendix A.
 site-builder: optional — if plan.html shows a P2 fixture panel, Appendix A gives
 you a ready-made 5-step table (imports + JSON + granted/denied) and the manifest
 table; nothing else changed.
+
+## lead — P2 MVP follow-ups
+
+**D-QUOTA (mediated-write storage-quota 402 bypass) — deferred to P3.**
+The P2 compute execute path mediates a routine's `kv/put`, `kv/del`, and
+SQL-write host calls through the routine's `D_fn`, but — unlike the normal
+`/invoke` KV and SQL routes — it does NOT run the per-space storage-quota
+pre-check (`staged_batch_remaining` → 402 Payment Required). A compute
+routine can therefore write past a space's configured storage limit through
+its `D_fn`, bypassing the 402 that the identical write would hit on the
+direct route. This was a conscious P2 MVP scoping decision (D-QUOTA): the
+quota check is not wired into the in-node executor. Closing it means
+threading the `QuotaCache` + `Config` into the executor's `HostState` and
+deciding how a mid-run host call surfaces a 402 (the guest sees a mediated
+envelope, not an HTTP status), which is a P3 concern. Code marker:
+`tinycloud-node-server/src/compute_exec.rs` → `HostState::dispatch` doc
+comment. Not a security-boundary bypass of *authorization* (the `D_fn`
+still gates what the routine may touch) — only of the *quota accounting*.
