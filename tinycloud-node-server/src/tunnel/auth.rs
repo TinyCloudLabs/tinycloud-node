@@ -117,7 +117,7 @@ mod tests {
     // Test vector ported from `names.test.ts`'s tunnel-auth canonicalization:
     // fixed key order `version, action, name, subject, sequence`, signature
     // excluded from the signed bytes.
-    #[test]
+    #[::core::prelude::v1::test]
     fn canonical_tunnel_auth_matches_ts_vector() {
         let json = canonical_tunnel_auth_payload("tunnelnode", "did:key:z6MkiFake", 2);
         assert_eq!(
@@ -129,7 +129,7 @@ mod tests {
     // Port of names.test.ts: "validates and verifies a tunnel auth record" —
     // the byte-for-byte parity gate: if canonicalization or signing here
     // drifts from the TS implementation, this test fails.
-    #[test]
+    #[::core::prelude::v1::test]
     fn tunnel_auth_signature_verifies_with_did_key_pubkey() {
         let (kp, did) = did_key_signer(21);
         let frame = build_auth_frame(&kp, "tunnelnode", &did, 2).unwrap();
@@ -155,7 +155,7 @@ mod tests {
     // Port of names.test.ts: "rejects a tunnel auth record signed by the
     // wrong key" — same canonical bytes signed by a different key must not
     // verify against the claimed subject's public key.
-    #[test]
+    #[::core::prelude::v1::test]
     fn tunnel_auth_signature_does_not_verify_for_wrong_signer() {
         let (_owner_kp, owner_did) = did_key_signer(22);
         let (forger_kp, _forger_did) = did_key_signer(23);

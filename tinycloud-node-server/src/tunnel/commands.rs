@@ -205,14 +205,14 @@ mod tests {
         state::write_state(&paths, &link_state).unwrap();
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn enable_fails_without_an_existing_link_claim() {
         let tmp = tempdir().unwrap();
         let err = enable(tmp.path(), TunnelEnableArgs::default()).unwrap_err();
         assert!(err.to_string().contains("link is not enabled"));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn enable_persists_flag_on_the_shared_link_state_file() {
         let tmp = tempdir().unwrap();
         seed_link_state(tmp.path(), "office");
@@ -234,7 +234,7 @@ mod tests {
         assert_eq!(reloaded.name, "office");
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn enable_respects_service_url_override() {
         let tmp = tempdir().unwrap();
         seed_link_state(tmp.path(), "office");
@@ -251,7 +251,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn disable_clears_flag_and_runtime_marker() {
         let tmp = tempdir().unwrap();
         seed_link_state(tmp.path(), "office");
@@ -279,14 +279,14 @@ mod tests {
         assert!(!reloaded.tunnel_enabled);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn disable_without_any_state_is_a_no_op() {
         let tmp = tempdir().unwrap();
         let report = disable(tmp.path()).unwrap();
         assert!(!report.tunnel_enabled);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn status_reports_disabled_when_link_is_not_enabled() {
         let tmp = tempdir().unwrap();
         let report = status(tmp.path()).unwrap();
@@ -294,7 +294,7 @@ mod tests {
         assert!(!report.connected);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn status_surfaces_runtime_connection_state() {
         let tmp = tempdir().unwrap();
         seed_link_state(tmp.path(), "office");
@@ -316,7 +316,7 @@ mod tests {
         assert_eq!(report.last_error.as_deref(), Some("stale sequence"));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn bump_sequence_for_tunnel_requires_tunnel_enabled() {
         let tmp = tempdir().unwrap();
         seed_link_state(tmp.path(), "office");
@@ -324,7 +324,7 @@ mod tests {
         assert!(bump_sequence_for_tunnel(tmp.path(), 0).is_err());
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn bump_sequence_for_tunnel_persists_before_returning() {
         let tmp = tempdir().unwrap();
         seed_link_state(tmp.path(), "office");
@@ -346,7 +346,7 @@ mod tests {
         assert_eq!(next, 2);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn bump_sequence_for_tunnel_applies_resync_jump() {
         let tmp = tempdir().unwrap();
         seed_link_state(tmp.path(), "office");
@@ -356,7 +356,7 @@ mod tests {
         assert_eq!(sequence, 101);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn load_enabled_state_is_none_when_tunnel_disabled() {
         let tmp = tempdir().unwrap();
         seed_link_state(tmp.path(), "office");

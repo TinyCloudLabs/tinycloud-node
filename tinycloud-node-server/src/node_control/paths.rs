@@ -356,7 +356,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn macos_user_manager_stays_launchd_user_under_homebrew() {
         let _guard = EnvGuard::set("HOMEBREW_PREFIX", "/opt/homebrew");
 

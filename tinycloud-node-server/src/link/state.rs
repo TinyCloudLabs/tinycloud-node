@@ -341,7 +341,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn state_roundtrip_and_permissions_are_0600() {
         let tmp = tempdir().unwrap();
         let paths = LinkPaths::from_data_root(tmp.path());
@@ -369,7 +369,7 @@ mod tests {
         assert_eq!(reloaded, state);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn tls_material_written_with_0600_permissions() {
         let tmp = tempdir().unwrap();
         let paths = LinkPaths::from_data_root(tmp.path());
@@ -381,7 +381,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn sequence_is_monotonic_across_restarts() {
         let tmp = tempdir().unwrap();
         let paths = LinkPaths::from_data_root(tmp.path());
@@ -403,14 +403,14 @@ mod tests {
         assert_eq!(reloaded.next_sequence(), 2);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn missing_state_returns_none() {
         let tmp = tempdir().unwrap();
         let paths = LinkPaths::from_data_root(tmp.path());
         assert!(read_state(&paths).unwrap().is_none());
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn listener_state_roundtrips() {
         let tmp = tempdir().unwrap();
         let paths = LinkPaths::from_data_root(tmp.path());
@@ -425,7 +425,7 @@ mod tests {
         assert_eq!(read_listener_state(&paths).unwrap().unwrap(), state);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn state_lock_can_be_reacquired_after_release() {
         let tmp = tempdir().unwrap();
         let paths = LinkPaths::from_data_root(tmp.path());
@@ -437,7 +437,7 @@ mod tests {
         let _lock = StateLock::acquire(&paths).unwrap();
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn tunnel_runtime_state_roundtrips_and_removes() {
         let tmp = tempdir().unwrap();
         let paths = LinkPaths::from_data_root(tmp.path());
@@ -454,7 +454,7 @@ mod tests {
         assert!(read_tunnel_runtime_state(&paths).unwrap().is_none());
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn old_state_json_without_tunnel_fields_defaults_to_disabled() {
         let tmp = tempdir().unwrap();
         let paths = LinkPaths::from_data_root(tmp.path());
@@ -473,7 +473,7 @@ mod tests {
         assert_eq!(state.effective_tunnel_service_url(), state.service_url);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn effective_tunnel_service_url_prefers_override() {
         let mut state = LinkState::new(
             "office".to_string(),

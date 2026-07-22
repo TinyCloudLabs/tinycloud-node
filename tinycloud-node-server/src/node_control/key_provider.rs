@@ -1139,7 +1139,7 @@ mod tests {
         base64::encode_config(secret, base64::URL_SAFE_NO_PAD)
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn encrypted_file_roundtrip_and_wrong_kek_fails() {
         let temp = tempdir().unwrap();
         let provider = EncryptedFileProvider::new(temp.path());
@@ -1155,7 +1155,7 @@ mod tests {
         assert!(rendered.contains("decrypt") || rendered.contains("failed"));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn provider_selection_prefers_static_env() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
@@ -1169,7 +1169,7 @@ mod tests {
         assert!(state.node_did.is_some());
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn provider_selection_prefers_static_config() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
@@ -1190,7 +1190,7 @@ mod tests {
         assert!(state.node_did.is_some());
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn first_run_generation_uses_auto_provider_backend() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
@@ -1218,7 +1218,7 @@ mod tests {
         assert!(state.node_did.is_some());
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn backup_bundle_seals_and_verifies() {
         let secret = StaticSecret::new(vec![3u8; FILE_KEY_LEN]).unwrap();
         let bundle = build_backup_bundle(
@@ -1237,7 +1237,7 @@ mod tests {
         assert!(rendered.contains("failed") || rendered.contains("decrypt"));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn encrypted_file_provider_is_gated_by_provider_config() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
@@ -1289,7 +1289,7 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    #[test]
+    #[::core::prelude::v1::test]
     fn keychain_roundtrip_uses_namespaced_item_and_deletes_it() {
         let temp = tempdir().unwrap();
         let random = rand::random::<u64>();

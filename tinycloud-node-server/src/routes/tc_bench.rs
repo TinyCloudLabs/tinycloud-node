@@ -1674,7 +1674,7 @@ mod tests {
         let rocket = rocket::build()
             .mount(
                 "/",
-                routes![auth_verify, kv_put, kv_get, block_put, block_get, health],
+                rocket::routes![auth_verify, kv_put, kv_get, block_put, block_get, health],
             )
             .manage(state);
         let client = Client::tracked(rocket).await?;

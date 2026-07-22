@@ -1960,7 +1960,7 @@ mod tests {
         drop(handle);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn runtime_access_modes_follow_the_install_profile() {
         assert_eq!(runtime_dir_mode(Profile::MacosUser), 0o700);
         assert_eq!(runtime_dir_mode(Profile::LinuxUser), 0o700);
@@ -1972,7 +1972,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
+    #[::core::prelude::v1::test]
     fn runtime_ownership_follows_the_install_profile() {
         assert_eq!(runtime_ownership(Profile::MacosUser).unwrap(), None);
         assert_eq!(runtime_ownership(Profile::LinuxUser).unwrap(), None);

@@ -3643,7 +3643,7 @@ mod tests {
         let auth_header = make_auth_header("urn:uuid:00000000-0000-4000-8000-000000000001")?;
 
         let rocket = rocket::build()
-            .mount("/", routes![invoke])
+            .mount("/", rocket::routes![invoke])
             .attach(crate::tracing::TracingFairing {
                 header_name: Config::default().log.tracing.traceheader,
             })
@@ -3898,7 +3898,7 @@ mod tests {
         let auth_header = make_auth_header("urn:uuid:00000000-0000-4000-8000-0000000000w5")?;
 
         let rocket = rocket::build()
-            .mount("/", routes![invoke])
+            .mount("/", rocket::routes![invoke])
             .attach(crate::tracing::TracingFairing {
                 header_name: Config::default().log.tracing.traceheader,
             })
@@ -4553,7 +4553,10 @@ mod tests {
         conn.commit().await?;
 
         let rocket = rocket::build()
-            .mount("/", routes![delegation_status, delegation_query, revoke])
+            .mount(
+                "/",
+                rocket::routes![delegation_status, delegation_query, revoke],
+            )
             .attach(crate::tracing::TracingFairing {
                 header_name: Config::default().log.tracing.traceheader,
             })
@@ -5305,7 +5308,7 @@ mod tests {
         limit: rocket::data::ByteUnit,
     ) -> rocket::Rocket<rocket::Build> {
         rocket::build()
-            .mount("/", routes![invoke])
+            .mount("/", rocket::routes![invoke])
             .attach(crate::tracing::TracingFairing {
                 header_name: Config::default().log.tracing.traceheader,
             })

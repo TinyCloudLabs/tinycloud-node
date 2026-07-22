@@ -191,7 +191,7 @@ mod tests {
 
     // Test vector ported from `names.test.ts`:
     //   "canonical claim payload excludes signature and preserves field order"
-    #[test]
+    #[::core::prelude::v1::test]
     fn canonical_claim_matches_ts_vector() {
         let json = canonical_claim_payload(
             "office",
@@ -207,7 +207,7 @@ mod tests {
 
     // Test vector ported from `names.test.ts`:
     //   "canonical delete payload excludes signature and preserves field order"
-    #[test]
+    #[::core::prelude::v1::test]
     fn canonical_delete_matches_ts_vector() {
         let json = canonical_delete_payload("office", "did:key:z6MkiFake", 5);
         assert_eq!(
@@ -220,7 +220,7 @@ mod tests {
     // but we exercise the same field-ordering discipline by asserting the exact
     // string output for a small vector — this is the byte format the service's
     // `verifyCertRequest` will run signature verification against.
-    #[test]
+    #[::core::prelude::v1::test]
     fn canonical_cert_request_matches_ts_shape() {
         let json = canonical_cert_request_payload(
             "certnode",
@@ -237,7 +237,7 @@ mod tests {
     // TDD-style port of `names.test.ts` — "validates and verifies a did:key
     // name claim". This is the byte-for-byte parity gate: if canonicalization
     // or signing here drifts from the TS implementation, this test fails.
-    #[test]
+    #[::core::prelude::v1::test]
     fn claim_signature_verifies_with_did_key_pubkey() {
         let (kp, did) = did_key_signer(7);
         let lan_ips = vec!["192.168.1.20".to_string()];
@@ -256,7 +256,7 @@ mod tests {
     }
 
     // Port of "validates and verifies a name delete record".
-    #[test]
+    #[::core::prelude::v1::test]
     fn delete_signature_verifies_with_did_key_pubkey() {
         let (kp, did) = did_key_signer(11);
         let canonical = canonical_delete_payload("gone-node", &did, 2);
@@ -272,7 +272,7 @@ mod tests {
 
     // Port of "validates and verifies a cert request record". Sanity-checks
     // that signing across the canonical cert-request layout is round-trippable.
-    #[test]
+    #[::core::prelude::v1::test]
     fn cert_request_signature_verifies_with_did_key_pubkey() {
         let (kp, did) = did_key_signer(13);
         let canonical = canonical_cert_request_payload(

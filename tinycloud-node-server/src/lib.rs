@@ -1,8 +1,11 @@
+extern crate anyhow;
+#[allow(unused_imports)]
 #[macro_use]
 extern crate rocket;
-extern crate anyhow;
-#[cfg(test)]
 #[macro_use]
+#[allow(unused_imports)]
+extern crate async_trait;
+#[cfg(test)]
 extern crate tokio;
 
 use anyhow::{Context, Result};
@@ -17,19 +20,37 @@ pub mod config;
 pub mod dstack;
 pub mod hooks;
 pub mod invocation_replay;
+pub mod link;
+pub mod node_control;
 pub mod prometheus;
 pub mod quota;
 pub mod routes;
+pub mod runtime;
 pub mod share_email;
 pub mod signed_urls;
 pub mod storage;
 pub mod tee;
 mod tracing;
+pub mod tunnel;
 pub mod webhook_dispatcher;
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+pub(crate) mod test_support {
+    use std::sync::{Mutex, OnceLock};
+
+    pub fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+    }
+}
 
 use config::{BlockStorage, Config, Keys, StagingStorage};
 use hooks::HookRuntime;
 use invocation_replay::InvocationReplayCache;
+use node_control::control::ControlPlaneHandle;
 use quota::QuotaCache;
 use routes::{
     admin::{delete_quota, get_quota, get_usage, list_quotas, set_quota},
@@ -109,7 +130,16 @@ impl From<BlockStage> for StagingStorage {
 pub type TinyCloud = SpaceDatabase<DatabaseConnection, BlockStores, StaticSecret>;
 
 pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
-    let mut tinycloud_config: Config = config.extract::<Config>()?;
+    let tinycloud_config = config.extract::<Config>()?;
+    app_with_control(config, &tinycloud_config, None).await
+}
+
+pub async fn app_with_control(
+    config: &Figment,
+    tinycloud_config: &Config,
+    control: Option<ControlPlaneHandle>,
+) -> Result<Rocket<Build>> {
+    let mut tinycloud_config = tinycloud_config.clone();
     tinycloud_config.storage.resolve();
     tinycloud_config.share_email = tinycloud_config
         .share_email
@@ -129,7 +159,7 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
 
     tracing::tracing_try_init(&tinycloud_config.log)?;
 
-    let mut routes = routes![
+    let mut routes = rocket::routes![
         healthcheck,
         cors,
         info,
@@ -367,6 +397,26 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
         .manage(tee_context)
         .manage(encryption_service)
         .manage(tinycloud_config.storage.staging.open().await?);
+
+    let rocket = if let Some(control) = control {
+        let control_running = control.clone();
+        let control_stopping = control.clone();
+        rocket
+            .attach(AdHoc::on_liftoff("control-plane-running", move |_| {
+                let control = control_running.clone();
+                Box::pin(async move {
+                    control.mark_running();
+                })
+            }))
+            .attach(AdHoc::on_shutdown("control-plane-stopping", move |_| {
+                let control = control_stopping.clone();
+                Box::pin(async move {
+                    control.mark_stopping();
+                })
+            }))
+    } else {
+        rocket
+    };
 
     let share_allowed_origin = tinycloud_config
         .share_email

@@ -1811,7 +1811,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn macos_paths_use_override_root() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
@@ -1834,7 +1834,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn linux_user_paths_respect_xdg() {
         let _lock = env_lock();
         let config = tempdir().unwrap();
@@ -1856,7 +1856,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn linux_system_paths_use_system_roots_and_journald() {
         let _lock = env_lock();
         let _override = EnvGuard::unset("TINYCLOUD_NODE_CONFIG_ROOT");
@@ -1874,7 +1874,7 @@ mod tests {
         assert_eq!(paths.manager, Manager::SystemdSystem);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn service_manifest_roundtrip() {
         let temp = tempdir().unwrap();
         let path = temp.path().join("service.json");
@@ -1896,7 +1896,7 @@ mod tests {
         assert_eq!(decoded, manifest);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn public_api_from_config_uses_effective_rocket_bind() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
@@ -1927,7 +1927,7 @@ mod tests {
         assert_eq!(public_api.port, 18098);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn install_writes_bootstrap_config_and_uninstall_keeps_it() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
@@ -1998,7 +1998,7 @@ esac
         assert!(paths.config_path.exists());
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn node_identity_body_requires_control_session() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
@@ -2042,7 +2042,7 @@ esac
         assert!(rendered.contains("service is not installed"));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn node_doctor_does_not_use_local_identity_without_control() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
@@ -2099,7 +2099,7 @@ esac
         assert!(report.warnings.is_empty());
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn service_status_does_not_use_local_identity_when_control_is_unavailable() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
@@ -2219,7 +2219,7 @@ esac
         assert_eq!(status.control_api, None);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn bootstrap_config_parses_through_rocket_config() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
@@ -2250,7 +2250,7 @@ esac
         assert_eq!(config.keys, crate::config::Keys::Provider);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn node_doctor_warns_for_static_key_install_without_control() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
@@ -2299,7 +2299,7 @@ esac
         ));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn node_doctor_warns_for_static_env_install_without_control() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
@@ -2351,7 +2351,7 @@ esac
         ));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn derive_state_respects_thirty_second_grace_boundary() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
@@ -2459,7 +2459,7 @@ printf '%s\n' "${FAKE_PS_AGE:-29}"
     /// 30s grace period even though the LAN TLS listener genuinely bound —
     /// `linkListener` must still report `running` in that case, sourced only
     /// from the on-disk listener-state marker, not from control-API health.
-    #[test]
+    #[::core::prelude::v1::test]
     fn service_status_reports_link_listener_running_even_when_control_api_is_unavailable() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
@@ -2560,7 +2560,7 @@ printf '%s\n' "31536000"
         assert_eq!(status.link_listener_error, None);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn parse_process_age_accepts_ps_elapsed_formats() {
         assert_eq!(parse_process_age("29"), Some(29));
         assert_eq!(parse_process_age("00:29"), Some(29));
@@ -2569,18 +2569,18 @@ printf '%s\n' "31536000"
     }
 
     #[cfg(target_os = "macos")]
-    #[test]
+    #[::core::prelude::v1::test]
     fn process_age_uses_etime_on_macos() {
         assert_eq!(ps_elapsed_field(), "etime=");
     }
 
     #[cfg(not(target_os = "macos"))]
-    #[test]
+    #[::core::prelude::v1::test]
     fn process_age_uses_etimes_elsewhere() {
         assert_eq!(ps_elapsed_field(), "etimes=");
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn systemd_system_group_install_step_matches_profile_and_privilege() {
         assert_eq!(
             systemd_system_group_install_step(Profile::MacosUser, 0, false),
@@ -2604,7 +2604,7 @@ printf '%s\n' "31536000"
         );
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn systemd_unit_does_not_quote_append_paths() {
         let unit = systemd_unit(
             Path::new("/Applications/TinyCloud Node/bin/tinycloud"),
@@ -2624,7 +2624,7 @@ printf '%s\n' "31536000"
         ));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn systemd_system_unit_uses_root_tinycloud_credentials() {
         let unit = systemd_unit(
             Path::new("/usr/bin/tinycloud"),
@@ -2640,7 +2640,7 @@ printf '%s\n' "31536000"
         assert!(unit.contains("StandardError=journal"));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn status_json_shape_serializes_expected_fields() {
         let status = ServiceStatus {
             contract_version: CONTROL_CONTRACT_VERSION.into(),
@@ -2699,7 +2699,7 @@ printf '%s\n' "31536000"
         assert_eq!(value["tunnelRemoteUrl"], "https://mynode.tinycloud.link");
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn launchd_enabled_at_login_parser_reads_label_state() {
         let stdout = r#"
 disabled services = {
@@ -2710,7 +2710,7 @@ disabled services = {
         assert_eq!(launchd_enabled_at_login_from_stdout(stdout), Some(true));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn launchd_enabled_at_login_parser_reads_enabled_state() {
         let stdout = r#"
 disabled services = {
@@ -2721,7 +2721,7 @@ disabled services = {
         assert_eq!(launchd_enabled_at_login_from_stdout(stdout), Some(true));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn systemd_enabled_at_login_parser_accepts_enabled_states() {
         assert!(systemd_enabled_at_login_from_stdout("enabled\n"));
         assert!(!systemd_enabled_at_login_from_stdout("disabled\n"));

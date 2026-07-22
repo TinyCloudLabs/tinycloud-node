@@ -135,7 +135,7 @@ pub fn local_url(name: &str, bind_port: u16) -> String {
 mod tests {
     use super::*;
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn rate_limited_display_includes_retry_after_cleanly() {
         let err = LinkError::RateLimited {
             retry_after: Some("120".to_string()),
@@ -147,7 +147,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn rate_limited_display_omits_suffix_when_retry_after_is_absent() {
         let err = LinkError::RateLimited {
             retry_after: None,
@@ -156,19 +156,19 @@ mod tests {
         assert_eq!(err.to_string(), "link service rate-limited the request");
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn normalize_name_label_lowercases_valid_names() {
         assert_eq!(normalize_name_label("MyNode").unwrap(), "mynode");
         assert_eq!(normalize_name_label("living-room").unwrap(), "living-room");
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn normalize_name_label_rejects_bad_length() {
         assert!(normalize_name_label("ab").is_err());
         assert!(normalize_name_label(&"a".repeat(33)).is_err());
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn normalize_name_label_rejects_bad_shape() {
         assert!(normalize_name_label("-leading").is_err());
         assert!(normalize_name_label("trailing-").is_err());
@@ -176,7 +176,7 @@ mod tests {
         assert!(normalize_name_label("has a space").is_err());
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn normalize_name_label_rejects_punycode_prefix() {
         assert!(normalize_name_label("xn--abc").is_err());
     }
