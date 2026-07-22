@@ -816,6 +816,76 @@ async fn rotation_tripwire_distinct_error() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Fail-closed on a malformed chain-derived `computeCaveats` (both judges,
+// security): the old `if let Ok(..)` silently fell through to the
+// unconstrained case on a parse failure -- a fail-open. A malformed
+// `computeCaveats` payload on the authorizing ability row must hard-400.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn malformed_chain_compute_caveats_rejected_with_400() -> Result<()> {
+    let (rocket, conn, tempdir) = boot().await?;
+    let owner = make_owner("malformed-caveats")?;
+    let holder = make_holder()?;
+    seed_space_and_actors(&conn, &owner.space, std::slice::from_ref(&holder.did)).await?;
+    ensure_space_storage(&tempdir, &owner.space)?;
+    let client = Client::tracked(rocket).await?;
+
+    deploy_fixture(
+        &client,
+        &owner,
+        "malformed",
+        &load_fixture("noop.wat"),
+        &[GrantSpec {
+            service: "kv",
+            path: "misc/",
+            ability: "tinycloud.kv/get",
+        }],
+        "malformed",
+    )
+    .await?;
+
+    // `maxDuration` must be a number (u64); a string fails to deserialize
+    // into `ComputeCaveats`.
+    let bogus_caveat = serde_json::json!({ "maxDuration": "oops" });
+    let (deleg, cid) = delegate_compute_execute(
+        &owner,
+        &holder.did,
+        "malformed",
+        Some(bogus_caveat.clone()),
+        "urn:uuid:mc1",
+    )?;
+    submit_delegation(&client, &deleg).await?;
+
+    let inv = compute_execute_invocation(
+        &holder.vm,
+        &holder.did,
+        &holder.jwk,
+        &owner.space,
+        "malformed",
+        Some(bogus_caveat),
+        Some(cid),
+        "urn:uuid:mc-exec",
+    )?;
+    let (status, body) = post_invoke(
+        &client,
+        &inv,
+        execute_body("malformed", serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        Status::BadRequest,
+        "a malformed chain computeCaveats must hard-400, never fail open: {body}"
+    );
+    assert!(
+        body.contains("computeCaveats") || body.contains("malformed"),
+        "error must name the malformed caveat: {body}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Memory safety (Codex P2 finding): a guest-controlled length crossing the
 // ABI boundary must be bounds-checked BEFORE the host allocates a buffer
 // sized by it -- a bogus negative/huge length must be rejected cleanly

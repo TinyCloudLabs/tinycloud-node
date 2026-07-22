@@ -2420,21 +2420,11 @@ async fn handle_compute_invoke(
     // Capture the invoker's directly-cited parents BEFORE `verify_auth`
     // consumes the invocation -- the Execute path walks this chain for the
     // enforced `ComputeCaveats` (compute-service.md §6.3: caveat source is
-    // the validated chain, NOT invoker facts).
+    // the validated chain, NOT invoker facts -- there is no facts-based
+    // fallback: when the chain carries no `computeCaveats`, execution is
+    // unconstrained-by-chain, but it is never WIDENED from the invocation
+    // envelope's self-declared facts).
     let parent_cids: Vec<_> = i.0 .0.parents.to_vec();
-    let facts_caveats: Option<tinycloud_core::compute::ComputeCaveats> =
-        i.0 .0
-            .invocation
-            .payload()
-            .facts
-            .as_ref()
-            .and_then(|facts| {
-                facts.iter().find_map(|fact| {
-                    fact.as_object()
-                        .and_then(|obj| obj.get("computeCaveats"))
-                        .and_then(|v| serde_json::from_value(v.clone()).ok())
-                })
-            });
 
     // Layer (a) invoker authorization (compute-service.md §6.1): the same
     // delegation-chain walk sql/duckdb use. Proves `compute_caps` are backed
@@ -2496,7 +2486,6 @@ async fn handle_compute_invoke(
                 input,
                 output_ref,
                 &parent_cids,
-                facts_caveats,
             )
             .await
         }
@@ -2526,7 +2515,6 @@ async fn handle_compute_execute(
     input: Option<serde_json::Value>,
     output_ref: Option<String>,
     parent_cids: &[tinycloud_auth::authorization::Cid],
-    facts_caveats: Option<tinycloud_core::compute::ComputeCaveats>,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
     use crate::compute_exec::{self, ComputeExecError, ExecutionPlan};
 
@@ -2590,10 +2578,11 @@ async fn handle_compute_execute(
         d_fns.into_iter().flat_map(|(_, caps)| caps).collect();
 
     // Enforced caveats come from the VALIDATED chain, not invoker facts
-    // (§6.3). Facts are a non-authoritative fallback only when the chain
-    // carries none.
+    // (§6.3). No facts-based fallback: when the chain carries no
+    // `computeCaveats`, execution is unconstrained-by-chain -- but it is
+    // never widened by anything the invoker's own request claims.
     let chain_caveats = derive_chain_compute_caveats(tinycloud, parent_cids).await?;
-    let caveats = chain_caveats.or(facts_caveats).unwrap_or_default();
+    let caveats = chain_caveats.unwrap_or_default();
 
     let input_value = input.unwrap_or(serde_json::Value::Null);
 
@@ -2667,12 +2656,29 @@ async fn handle_compute_execute(
     Ok(DataOut::One(InvOut(InvocationOutcome::ComputeResult(ack))))
 }
 
+/// The ability that alone may authorize a chain-derived `computeCaveats`
+/// binding for the execute path (see `derive_chain_compute_caveats`).
+#[cfg(feature = "compute")]
+const COMPUTE_EXECUTE_ABILITY: &str = "tinycloud.compute/execute";
+
 /// Walk the invoker's `compute/execute` delegation chain and return the
-/// first `ComputeCaveats` present on any ancestor ability row
-/// (compute-service.md §6.3). The persisted chain caveat -- NOT the
-/// invocation envelope's facts -- is the source of truth, so a holder
-/// cannot widen or drop the `functions` allowlist (or numeric limits) by
-/// editing the invocation.
+/// first `ComputeCaveats` present on an ancestor ability row that ACTUALLY
+/// authorizes `tinycloud.compute/execute` (compute-service.md §6.3). The
+/// persisted chain caveat -- NOT the invocation envelope's facts -- is the
+/// source of truth, so a holder cannot widen or drop the `functions`
+/// allowlist (or numeric limits) by editing the invocation.
+///
+/// Security (judge finding, fail-open -> fail-closed):
+///   * a malformed `computeCaveats` payload MUST hard-reject (400), never
+///     silently fall through to the unconstrained case -- the previous
+///     `if let Ok(..)` swallowed a parse failure and kept walking as though
+///     no caveat were present at all;
+///   * only an ability row whose OWN ability authorizes `compute/execute`
+///     (registry-aware, via `ability_matches`) may supply the caveat -- a
+///     delegation that bundles an unrelated ability (e.g. `kv/put`,
+///     `compute/deploy`) alongside `compute/execute` must never have that
+///     unrelated row's `computeCaveats` value picked up instead of (or
+///     absent) the execute-authorizing row's own.
 #[cfg(feature = "compute")]
 async fn derive_chain_compute_caveats(
     tinycloud: &State<TinyCloud>,
@@ -2709,14 +2715,24 @@ async fn derive_chain_compute_caveats(
             .await
             .map_err(|e| (Status::InternalServerError, e.to_string()))?;
         for row in rows {
+            // Filter to the exact authorizing capability: a caveat on any
+            // OTHER bundled ability must never be mistaken for this one's.
+            if !tinycloud_core::policy_capability::ability_matches(
+                row.ability.as_ref().as_ref(),
+                COMPUTE_EXECUTE_ABILITY,
+            ) {
+                continue;
+            }
             for v in row.caveats.0.values() {
                 if let Some(inner) = v.get("computeCaveats") {
-                    if let Ok(caveats) = serde_json::from_value::<
-                        tinycloud_core::compute::ComputeCaveats,
-                    >(inner.clone())
-                    {
-                        return Ok(Some(caveats));
-                    }
+                    let caveats: tinycloud_core::compute::ComputeCaveats =
+                        serde_json::from_value(inner.clone()).map_err(|e| {
+                            (
+                                Status::BadRequest,
+                                format!("malformed computeCaveats on the delegation chain: {e}"),
+                            )
+                        })?;
+                    return Ok(Some(caveats));
                 }
             }
         }
