@@ -752,11 +752,12 @@ async fn numeric_ceiling_rejected() -> Result<()> {
 // Hermetic construction: deploy normally (creating the correct D_fn), then
 // mutate that D_fn's persisted `delegatee` to a DIFFERENT valid did:key. Now
 // the delegatee-filtered selection (`compute_select_d_fns`) finds nothing for
-// the re-derived routine_did, while the CID-binding scan
-// (`compute_any_d_fn_bound`, delegatee-agnostic) still sees the binding ->
-// rotation. This is independent of the node secret (which the test harness'
-// TINYCLOUD_KEYS_SECRET env var would otherwise pin, defeating a
-// two-secret-boot approach).
+// the re-derived routine_did, and the classifier
+// (`compute_classify_routine_grant`) sees a binding D_fn whose delegatee no
+// longer matches -> `Rotated`. This is independent of the node secret (which
+// the test harness' TINYCLOUD_KEYS_SECRET env var would otherwise pin,
+// defeating a two-secret-boot approach). The expired/revoked-but-identity-
+// matching cases are pinned by the two tests immediately following.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
