@@ -750,9 +750,15 @@ impl HostState {
                 )
             }
             Err(e) => {
-                // A statement-level authorizer rejection (or any SQL error)
-                // fails closed as a denial envelope (op not performed),
-                // journaled granted=false — NOT a fatal run error.
+                // A statement-level authorizer rejection (or any other SQL
+                // engine error): the D_fn ABILITY check already passed (step
+                // (1) above authorized this exact ability/resource) -- only
+                // the specific statement was refused by the EXISTING
+                // create_authorizer on the connection. That is a granted,
+                // exercised call that happened to error, not an ability
+                // denial: journaled granted=true (the scope-down signal is
+                // about which ABILITIES were exercised, and this one was),
+                // NOT a fatal run error either.
                 let resp = serde_json::to_vec(&json!({
                     "ok": false,
                     "error": { "code": "sql-denied", "message": e.to_string() }
@@ -761,8 +767,8 @@ impl HostState {
                 (
                     resource_str,
                     required_ability.to_string(),
-                    String::new(),
-                    false,
+                    "inline".to_string(),
+                    true,
                     resp,
                 )
             }

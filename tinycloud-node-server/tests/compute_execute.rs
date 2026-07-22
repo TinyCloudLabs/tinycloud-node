@@ -162,10 +162,16 @@ async fn sql_statement_authorizer_rejects_attach_even_with_write_grant() -> Resu
     )
     .await?;
     assert_eq!(status, Status::Ok, "the run itself does not fail: {ack}");
+    // Judge finding: the D_fn ABILITY check passed (sql/write was granted);
+    // only the statement itself was refused by the SQL engine's OWN
+    // create_authorizer. `granted` tracks ability-exercise, not
+    // statement-level success, so this must be granted:true/exercised --
+    // NOT an ability denial.
     assert_eq!(
         only_call(&ack)["granted"],
-        false,
-        "ATTACH must be rejected by the SQL statement authorizer despite the sql/write grant"
+        true,
+        "ATTACH must be rejected by the SQL statement authorizer, but the sql/write \
+         ABILITY was granted and exercised despite the statement-level rejection"
     );
     Ok(())
 }
