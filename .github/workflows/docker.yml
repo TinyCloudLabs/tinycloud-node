@@ -75,12 +75,12 @@ jobs:
 
             status="$(curl "${args[@]}" "${API_BASE}${path}")"
             if [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
-              echo "::error::Cloudflare API ${method} ${path%%\?*} failed with HTTP ${status}"
+              echo "::error::Cloudflare API ${method} request failed with HTTP ${status}"
               jq -r '.errors[]? | "::error::Cloudflare error \(.code): \(.message)"' "$RESPONSE_FILE" || true
               exit 1
             fi
             if ! jq -e '.success == true and ((.errors // []) | length == 0)' "$RESPONSE_FILE" >/dev/null; then
-              echo "::error::Cloudflare API ${method} ${path%%\?*} returned an unsuccessful response"
+              echo "::error::Cloudflare API ${method} request returned an unsuccessful response"
               jq -r '.errors[]? | "::error::Cloudflare error \(.code): \(.message)"' "$RESPONSE_FILE" || true
               exit 1
             fi
