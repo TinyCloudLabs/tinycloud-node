@@ -725,13 +725,50 @@ impl HostState {
             );
         }
 
+        // D-SQL: when the selected `D_fn` constrains SQL to a named-statement
+        // profile, enforce it on the compute-mediated path EXACTLY as the
+        // normal SQL route does -- block raw query/execute/batch/export,
+        // pin/substitute fixedParams, and pass the derived `SqlCaveats` to
+        // `SqlService::execute` so the statement-level authorizer honors the
+        // allowlist. Previously the compute path passed `caveats: None`, so a
+        // constrained `D_fn` was containment-checked at the invocation layer
+        // but NOT enforced at statement execution (a routine could run any
+        // raw SQL its sql tier allowed). A profile rejection here is a
+        // statement-level refusal, NOT an ability denial: the D_fn's ability
+        // WAS granted -- journaled granted=true, guest-visible envelope
+        // (matching the SQL-engine rejection accounting below).
+        let constrained = grant_constrained_caveat(&grant);
+        let (sql_request, exec_caveats) = match &constrained {
+            Some(caveat) => match crate::routes::enforce_constrained_profile(caveat, sql_request) {
+                Ok(req) => (
+                    req,
+                    Some(crate::routes::constrained_caveat_to_sql_caveats(caveat)),
+                ),
+                Err((_status, message)) => {
+                    let resp = serde_json::to_vec(&json!({
+                        "ok": false,
+                        "error": { "code": "sql-denied", "message": message }
+                    }))
+                    .unwrap();
+                    return (
+                        resource_str,
+                        required_ability.to_string(),
+                        "inline".to_string(),
+                        true,
+                        resp,
+                    );
+                }
+            },
+            None => (sql_request, None),
+        };
+
         // (2) Execute via SqlService — statement-level authorizer applies.
         let sql_service = self.sql_service.clone();
         let space = self.space.clone();
         let ability_owned = required_ability.to_string();
         let exec = self.handle.clone().block_on(async move {
             sql_service
-                .execute(&space, &db_name, sql_request, None, ability_owned)
+                .execute(&space, &db_name, sql_request, exec_caveats, ability_owned)
                 .await
         });
         match exec {
@@ -778,6 +815,32 @@ impl HostState {
             })
         })
     }
+}
+
+/// D-SQL: extract a validated constrained-statements SQL caveat from the
+/// SELECTED `D_fn` grant's own ability-row caveats (the same caveat map
+/// `echo_nota_bene` echoes, so the internal invocation already carries it
+/// verbatim and containment holds). Mirrors the normal SQL route's
+/// chain-caveat recognition (`derive_chain_constrained_caveat`): a caveat is
+/// recognized either directly (`{"mode":"constrained-statements",...}`) or
+/// under the explicit `constrained-statements` wrapper key. Returns the
+/// first such caveat; `None` (the unconstrained case) when the grant carries
+/// no constrained-statements caveat.
+fn grant_constrained_caveat(
+    grant: &Capability,
+) -> Option<tinycloud_core::policy_capability::SqlConstrainedStatementCaveat> {
+    use tinycloud_core::policy_capability::sql_caveat;
+    for v in grant.caveats.0.values() {
+        if let Ok(caveat) = sql_caveat::parse(v) {
+            return Some(caveat);
+        }
+        if let Some(inner) = v.as_object().and_then(|o| o.get("constrained-statements")) {
+            if let Ok(caveat) = sql_caveat::parse(inner) {
+                return Some(caveat);
+            }
+        }
+    }
+    None
 }
 
 /// Serialize a `SqlResponse` to the host-import wire shape (§9.1): the raw

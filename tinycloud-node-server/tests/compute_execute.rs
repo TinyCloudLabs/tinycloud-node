@@ -1057,6 +1057,129 @@ async fn non_empty_input_refs_rejected_with_400() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// D-SQL: a constrained-statements SQL caveat on the routine's D_fn is
+// enforced at statement EXECUTION on the compute path (not merely
+// containment-checked). The allowed named statement runs; a disallowed one
+// is refused (granted:true -- the ability WAS granted, the statement-level
+// profile refused it).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn constrained_statements_sql_caveat_enforced_on_compute_path() -> Result<()> {
+    let (rocket, conn, tempdir) = boot().await?;
+    let owner = make_owner("sql-constrained")?;
+    seed_space_and_actors(&conn, &owner.space, &[]).await?;
+    ensure_space_storage(&tempdir, &owner.space)?;
+    let client = Client::tracked(rocket).await?;
+
+    // The constrained-statements profile: only "allowed" (SELECT 1 AS n) may
+    // run; everything else is refused. ExecuteStatement classifies as the
+    // write tier in the compute host, so the D_fn grants sql/write.
+    let constrained = serde_json::json!({
+        "mode": "constrained-statements",
+        "readOnly": true,
+        "statements": [
+            { "name": "allowed", "sql": "SELECT 1 AS n", "fixedParams": [] }
+        ]
+    });
+    let sql_grant = GrantSpec {
+        service: "sql",
+        path: "db",
+        ability: "tinycloud.sql/write",
+    };
+
+    // --- allowed statement path ---
+    let wasm_ok = load_fixture("sql_stmt_allowed.wat");
+    let cid_ok = content_cid(&wasm_ok);
+    let rdid_ok = handshake_routine_did(&client, &owner, &cid_ok, "urn:uuid:hs-sqlc-ok").await?;
+    let grant_ok = mint_d_fn_with_extra_caveat(
+        &owner,
+        &rdid_ok,
+        &cid_ok,
+        &[sql_grant],
+        &constrained,
+        "urn:uuid:dfn-sqlc-ok",
+    )?;
+    deploy_fixture_with_grant(&client, &owner, "sqlc_ok", &wasm_ok, &grant_ok, "sqlc-ok").await?;
+
+    let auth_ok = owner_compute_invocation(
+        &owner,
+        "sqlc_ok",
+        "tinycloud.compute/execute",
+        "urn:uuid:sqlc-ok-exec",
+    )?;
+    let (status_ok, body_ok) = post_invoke(
+        &client,
+        &auth_ok,
+        execute_body("sqlc_ok", serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(
+        status_ok,
+        Status::Ok,
+        "allowed statement run must 200: {body_ok}"
+    );
+    let ack_ok: serde_json::Value = serde_json::from_str(&body_ok)?;
+    // The routine echoes the host's raw sql_query response: the SELECT ran.
+    assert_eq!(
+        ack_ok["result"],
+        serde_json::json!({ "columns": ["n"], "rows": [[1]], "rowCount": 1 }),
+        "the allowed constrained statement must actually execute: {body_ok}"
+    );
+    let call_ok = only_call(&ack_ok);
+    assert_eq!(call_ok["ability"], "tinycloud.sql/write");
+    assert_eq!(call_ok["granted"], true, "allowed statement is granted");
+
+    // --- disallowed statement path ---
+    let wasm_no = load_fixture("sql_stmt_forbidden.wat");
+    let cid_no = content_cid(&wasm_no);
+    let rdid_no = handshake_routine_did(&client, &owner, &cid_no, "urn:uuid:hs-sqlc-no").await?;
+    let grant_no = mint_d_fn_with_extra_caveat(
+        &owner,
+        &rdid_no,
+        &cid_no,
+        &[sql_grant],
+        &constrained,
+        "urn:uuid:dfn-sqlc-no",
+    )?;
+    deploy_fixture_with_grant(&client, &owner, "sqlc_no", &wasm_no, &grant_no, "sqlc-no").await?;
+
+    let auth_no = owner_compute_invocation(
+        &owner,
+        "sqlc_no",
+        "tinycloud.compute/execute",
+        "urn:uuid:sqlc-no-exec",
+    )?;
+    let (status_no, body_no) = post_invoke(
+        &client,
+        &auth_no,
+        execute_body("sqlc_no", serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(
+        status_no,
+        Status::Ok,
+        "a disallowed statement must not fail the whole run: {body_no}"
+    );
+    let ack_no: serde_json::Value = serde_json::from_str(&body_no)?;
+    // The routine echoes the host response: a sql-denied envelope.
+    assert_eq!(
+        ack_no["result"]["ok"], false,
+        "the disallowed statement must be refused: {body_no}"
+    );
+    assert_eq!(
+        ack_no["result"]["error"]["code"], "sql-denied",
+        "refusal is a statement-level sql-denied, not an ability denial: {body_no}"
+    );
+    let call_no = only_call(&ack_no);
+    assert_eq!(
+        call_no["granted"], true,
+        "the sql/write ABILITY was granted; only the specific statement was refused"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Cross-space isolation (both judges' single most-wanted missing test): the
 // F3 confused-deputy property under EXECUTION. Deploy the SAME wasm bytes
 // (same content CID -> same routine BYTES) in two DIFFERENT spaces, each

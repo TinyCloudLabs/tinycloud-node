@@ -376,6 +376,83 @@ pub fn mint_d_fn(
     Ok(ucan.encode()?)
 }
 
+/// Mint a `D_fn` where EVERY granted ability row carries the
+/// `computeFunctionBinding` caveat AND an additional `extra_caveat` object
+/// (e.g. a `constrained-statements` SQL caveat). Used by the D-SQL test to
+/// prove the compute path enforces a constrained-statements profile at
+/// statement execution.
+pub fn mint_d_fn_with_extra_caveat(
+    owner: &Owner,
+    routine_did: &str,
+    content_cid: &str,
+    grants: &[GrantSpec],
+    extra_caveat: &serde_json::Value,
+    nonce: &str,
+) -> Result<String> {
+    let mut binding = BTreeMap::<String, serde_json::Value>::new();
+    binding.insert(
+        "computeFunctionBinding".to_string(),
+        serde_json::json!({ "functionCid": content_cid }),
+    );
+    // The extra caveat is a whole object (e.g. the constrained-statements
+    // caveat) placed at its own positional key alongside the binding.
+    let extra_map: BTreeMap<String, serde_json::Value> = extra_caveat
+        .as_object()
+        .expect("extra caveat must be a JSON object")
+        .clone()
+        .into_iter()
+        .collect();
+
+    let mut caps = Capabilities::new();
+    for g in grants {
+        let resource: ResourceId = owner.space.clone().to_resource(
+            g.service.parse::<Service>()?,
+            Some(g.path.parse::<AuthPath>()?),
+            None,
+            None,
+        );
+        caps.with_action(
+            resource.as_uri(),
+            g.ability.parse::<UcanAbility>()?,
+            [binding.clone(), extra_map.clone()],
+        );
+    }
+    let ucan = Payload {
+        issuer: owner.vm.parse::<DIDURLBuf>()?,
+        audience: routine_did.parse::<DIDBuf>()?,
+        not_before: None,
+        expiration: NumericDate::try_from_seconds(far_future())?,
+        nonce: Some(nonce.to_string()),
+        facts: Some(Vec::<serde_json::Value>::new()),
+        proof: Vec::new(),
+        attenuation: caps,
+    }
+    .sign(owner.jwk.get_algorithm().unwrap_or_default(), &owner.jwk)?;
+    Ok(ucan.encode()?)
+}
+
+/// Deploy `wasm` under `function` with a PRE-MINTED encoded `D_fn` grant
+/// (bound to the routine identity derived for `wasm`'s content CID). Returns
+/// the deploy ack.
+pub async fn deploy_fixture_with_grant(
+    client: &Client,
+    owner: &Owner,
+    function: &str,
+    wasm: &[u8],
+    grant: &str,
+    tag: &str,
+) -> Result<serde_json::Value> {
+    let auth = owner_compute_invocation(
+        owner,
+        function,
+        "tinycloud.compute/deploy",
+        &format!("urn:uuid:dep-{tag}"),
+    )?;
+    let (status, body) = post_invoke(client, &auth, deploy_body(function, wasm, grant)).await;
+    anyhow::ensure!(status == Status::Ok, "deploy failed ({status}): {body}");
+    Ok(serde_json::from_str(&body)?)
+}
+
 /// The A.1 fixture grant: kv/get in/, kv/put out/, kv/del out/, sql/read db,
 /// sql/write db (granted, never exercised).
 pub fn fixture_grants() -> Vec<GrantSpec> {

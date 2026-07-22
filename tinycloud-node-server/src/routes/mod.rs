@@ -2008,7 +2008,7 @@ async fn derive_chain_constrained_caveat_with_conn<C: tinycloud_core::sea_orm::C
 /// the SQL service's `SqlCaveats` shape. This is what binds execution to the
 /// validated chain — the SQL service will only honor the named statements
 /// declared on the chain and will refuse writes when `read_only` is set.
-fn constrained_caveat_to_sql_caveats(
+pub(crate) fn constrained_caveat_to_sql_caveats(
     caveat: &tinycloud_core::policy_capability::SqlConstrainedStatementCaveat,
 ) -> SqlCaveats {
     use tinycloud_core::sql::caveats::PreparedStatement;
@@ -2033,7 +2033,7 @@ fn constrained_caveat_to_sql_caveats(
 /// touch the SQL execution path. fixedParams are substituted server-side
 /// into the params vector that is forwarded to the SQL service (audit P0
 /// finding 4) so row-pinning actually holds.
-fn enforce_constrained_profile(
+pub(crate) fn enforce_constrained_profile(
     caveat: &tinycloud_core::policy_capability::SqlConstrainedStatementCaveat,
     request: SqlRequest,
 ) -> Result<SqlRequest, (Status, String)> {
