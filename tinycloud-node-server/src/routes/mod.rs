@@ -2648,8 +2648,8 @@ mod tests {
         ))))
     }
 
-    #[test]
-    fn conditional_kv_etags_are_strong_blake3_etags() {
+    #[tokio::test]
+    async fn conditional_kv_etags_are_strong_blake3_etags() {
         let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         assert_eq!(
             parse_strong_blake3_etag(&format!("\"blake3-{digest}\"")).unwrap(),
@@ -2669,8 +2669,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn bounded_kv_headers_are_positive_and_removed_from_object_metadata() {
+    #[tokio::test]
+    async fn bounded_kv_headers_are_positive_and_removed_from_object_metadata() {
         let mut metadata = Metadata(BTreeMap::from([
             (
                 "X-TinyCloud-Max-Response-Bytes".to_string(),
@@ -2702,8 +2702,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn kv_create_and_replace_headers_build_exact_key_preconditions() {
+    #[tokio::test]
+    async fn kv_create_and_replace_headers_build_exact_key_preconditions() {
         let space = test_space_id("conditional-kv-options");
         let capability = kv_put_capability(&space, "files/report.txt");
 
@@ -2741,8 +2741,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn kv_condition_headers_reject_ambiguous_or_batch_mutations() {
+    #[tokio::test]
+    async fn kv_condition_headers_reject_ambiguous_or_batch_mutations() {
         let space = test_space_id("conditional-kv-invalid");
         let capabilities = [
             kv_put_capability(&space, "a"),

@@ -1558,16 +1558,6 @@ pub async fn read(
     Ok(NoStoreJson(response_body))
 }
 
-trait ScopeEmail {
-    fn share_scope(&self) -> &ShareScope;
-}
-
-impl ScopeEmail for ShareScope {
-    fn share_scope(&self) -> &ShareScope {
-        self
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
