@@ -175,6 +175,49 @@ enum Import {
     SqlQuery,
 }
 
+/// The error side of a mediated KV op's `invoke_with_options` call, kept as
+/// the STRUCTURED store error (not stringified) so the caller can
+/// distinguish the expected `MissingKvWrite` case (a `kv/del` of an already-
+/// absent key) from a genuine infrastructure failure.
+enum KvOpError {
+    /// A local failure before the invocation was ever submitted (staging
+    /// I/O, an unparseable key path).
+    Internal(String),
+    /// The invocation was submitted; the store rejected or failed it.
+    Store(
+        tinycloud_core::TxStoreError<
+            BlockStores,
+            BlockStage,
+            tinycloud_core::keys::StaticSecret,
+        >,
+    ),
+}
+
+impl std::fmt::Display for KvOpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KvOpError::Internal(msg) => write!(f, "{msg}"),
+            KvOpError::Store(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+/// True iff `err` is a `kv/del` of a key with no live value (§9.1.1's
+/// fail-observable philosophy): the ability WAS granted and the internal
+/// invocation authorized fine, but the core had nothing to delete. This is
+/// the ONLY store error the mediator treats as non-fatal; everything else
+/// aborts the run.
+fn is_missing_kv_write(
+    err: &tinycloud_core::TxStoreError<BlockStores, BlockStage, tinycloud_core::keys::StaticSecret>,
+) -> bool {
+    matches!(
+        err,
+        tinycloud_core::TxStoreError::Tx(tinycloud_core::TxError::InvalidInvocation(
+            tinycloud_core::models::invocation::InvocationError::MissingKvWrite(_)
+        ))
+    )
+}
+
 /// The store data for a single execution: the mediator's mutable state plus
 /// the cloned async handles the sync host callbacks reach through
 /// `block_on`.
@@ -456,7 +499,7 @@ impl HostState {
                     <BlockStores as tinycloud_core::storage::ImmutableReadStore>::Readable,
                 >,
             >,
-            String,
+            KvOpError,
         > = handle.block_on(async move {
             use tinycloud_core::storage::ImmutableStaging;
             let mut inputs = std::collections::HashMap::new();
@@ -464,17 +507,19 @@ impl HostState {
                 let mut stage = staging
                     .stage(&space)
                     .await
-                    .map_err(|e| format!("stage: {e}"))?;
+                    .map_err(|e| KvOpError::Internal(format!("stage: {e}")))?;
                 use futures::io::AsyncWriteExt;
                 stage
                     .write_all(&bytes)
                     .await
-                    .map_err(|e| format!("stage write: {e}"))?;
+                    .map_err(|e| KvOpError::Internal(format!("stage write: {e}")))?;
                 stage
                     .flush()
                     .await
-                    .map_err(|e| format!("stage flush: {e}"))?;
-                let path: AuthPath = key_path.parse().map_err(|e| format!("{e:?}"))?;
+                    .map_err(|e| KvOpError::Internal(format!("stage flush: {e}")))?;
+                let path: AuthPath = key_path
+                    .parse()
+                    .map_err(|e| KvOpError::Internal(format!("{e:?}")))?;
                 inputs.insert(
                     (space.clone(), path),
                     (
@@ -491,7 +536,7 @@ impl HostState {
                 )
                 .await
                 .map(|(_tx, outcomes)| outcomes)
-                .map_err(|e| format!("{e}"))
+                .map_err(KvOpError::Store)
         });
 
         match result {
@@ -502,6 +547,22 @@ impl HostState {
                     _ => "inline".to_string(),
                 };
                 (resource_str, ability_canon, destination, true, response)
+            }
+            // A `kv/del` of a key with no live value: the ability WAS
+            // granted (we already found a matching D_fn grant above) and
+            // the internal invocation authorized fine -- the core simply
+            // has nothing to delete. Observable, non-fatal (§9.1.1's
+            // fail-observable philosophy, same as the A.4 denial contract):
+            // the guest sees an error envelope and continues, and the
+            // manifest records `granted: true` because the ability check
+            // passed. Judge finding: this previously fell into the generic
+            // Err(_) arm below and aborted the WHOLE run as a 500.
+            Err(KvOpError::Store(err)) if is_missing_kv_write(&err) => {
+                let resp = serde_json::to_vec(&json!({
+                    "ok": false, "error": { "code": "no-such-key" }
+                }))
+                .unwrap();
+                (resource_str, ability_canon, key, true, resp)
             }
             Err(e) => {
                 // Grant was present but the op failed — a real error, not a

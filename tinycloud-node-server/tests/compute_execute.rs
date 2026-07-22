@@ -816,6 +816,75 @@ async fn rotation_tripwire_distinct_error() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// kv/del of a key with no live value must be a non-fatal, observable
+// envelope (granted:true, `no-such-key`), not a 500 that aborts the whole
+// run -- the ability WAS granted; the core simply had nothing to delete.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn kv_del_of_missing_key_is_non_fatal() -> Result<()> {
+    let (rocket, conn, tempdir) = boot().await?;
+    let owner = make_owner("del-missing")?;
+    seed_space_and_actors(&conn, &owner.space, &[]).await?;
+    ensure_space_storage(&tempdir, &owner.space)?;
+    let client = Client::tracked(rocket).await?;
+
+    // Deliberately do NOT seed "out/y" -- probe_del.wat deletes exactly this
+    // key, so the delete targets a key with no live value.
+    deploy_fixture(
+        &client,
+        &owner,
+        "delmissing",
+        &load_fixture("probe_del.wat"),
+        &[GrantSpec {
+            service: "kv",
+            path: "out/",
+            ability: "tinycloud.kv/del",
+        }],
+        "delmissing",
+    )
+    .await?;
+
+    let auth = owner_compute_invocation(
+        &owner,
+        "delmissing",
+        "tinycloud.compute/execute",
+        "urn:uuid:delmissing-exec",
+    )?;
+    let (status, body) = post_invoke(
+        &client,
+        &auth,
+        execute_body("delmissing", serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        Status::Ok,
+        "a kv/del of a missing key must NOT abort the whole run: {body}"
+    );
+    let ack: serde_json::Value = serde_json::from_str(&body)?;
+    let call = only_call(&ack);
+    assert_eq!(call["ability"], "tinycloud.kv/del");
+    assert_eq!(call["destination"], "out/y");
+    assert_eq!(
+        call["granted"], true,
+        "the ability WAS granted; only the underlying delete had nothing to do"
+    );
+    let expected_envelope_len = serde_json::to_vec(&serde_json::json!({
+        "ok": false,
+        "error": { "code": "no-such-key" }
+    }))
+    .unwrap()
+    .len() as u64;
+    assert_eq!(
+        call["bytesOut"].as_u64(),
+        Some(expected_envelope_len),
+        "the response bytes must be the no-such-key envelope"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // output_ref's KV write must be journaled (§9.1.1 "journal every host
 // call"): `write_output` bypassed `dispatch` and dropped the manifest entry
 // on the floor even though the op itself was actually performed.
