@@ -1,5 +1,6 @@
 pub mod authorization;
 pub mod identity;
+pub mod policy_capability;
 pub mod protocol;
 pub mod resolver;
 pub mod resource;
