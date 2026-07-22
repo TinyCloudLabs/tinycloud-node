@@ -175,7 +175,9 @@ fn deleg_grants_only_execute(header: &str) -> Result<bool> {
         TinyCloudDelegation::Ucan(u) => u
             .payload()
             .attenuation
-            .abilities().values().flat_map(|abmap| abmap.keys().map(|a| a.to_string()))
+            .abilities()
+            .values()
+            .flat_map(|abmap| abmap.keys().map(|a| a.to_string()))
             .collect(),
         TinyCloudDelegation::Cacao(_) => anyhow::bail!("expected a UCAN delegation"),
     };

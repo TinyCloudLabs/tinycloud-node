@@ -12,8 +12,8 @@ use crate::storage::{
 };
 use crate::types::{
     AccountDelegationRecord, CapabilitiesReadParams, DelegationQuery, DelegationQueryDirection,
-    DelegationQueryPage, DelegationQueryStatus, DelegationResource, ListFilters, Metadata, Resource,
-    SpaceIdWrap,
+    DelegationQueryPage, DelegationQueryStatus, DelegationResource, ListFilters, Metadata,
+    Resource, SpaceIdWrap,
 };
 use crate::util::{Capability, DelegationInfo, DelegationMode};
 use sea_orm::{
