@@ -904,6 +904,80 @@ async fn output_ref_write_is_journaled_in_manifest() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// input_refs (§8 host-side input pre-read) is not implemented in the MVP; a
+// non-empty input_refs must be rejected loudly (400), not silently ignored.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn non_empty_input_refs_rejected_with_400() -> Result<()> {
+    let (rocket, conn, tempdir) = boot().await?;
+    let owner = make_owner("input-refs")?;
+    seed_space_and_actors(&conn, &owner.space, &[]).await?;
+    ensure_space_storage(&tempdir, &owner.space)?;
+    let client = Client::tracked(rocket).await?;
+
+    deploy_fixture(
+        &client,
+        &owner,
+        "inputrefs",
+        &load_fixture("probe_get.wat"),
+        &[GrantSpec {
+            service: "kv",
+            path: "in/",
+            ability: "tinycloud.kv/get",
+        }],
+        "inputrefs",
+    )
+    .await?;
+
+    let auth = owner_compute_invocation(
+        &owner,
+        "inputrefs",
+        "tinycloud.compute/execute",
+        "urn:uuid:inputrefs-exec",
+    )?;
+    let body = serde_json::json!({
+        "action": "execute",
+        "function": "inputrefs",
+        "input": {},
+        "input_refs": ["in/x"],
+    })
+    .to_string();
+    let (status, resp_body) = post_invoke(&client, &auth, body).await;
+    assert_eq!(
+        status,
+        Status::BadRequest,
+        "a non-empty input_refs must 400, not be silently ignored: {resp_body}"
+    );
+    assert!(
+        resp_body.contains("input_refs"),
+        "error must name input_refs: {resp_body}"
+    );
+
+    // An EMPTY input_refs (or its absence) is unaffected -- execution runs.
+    let auth2 = owner_compute_invocation(
+        &owner,
+        "inputrefs",
+        "tinycloud.compute/execute",
+        "urn:uuid:inputrefs-exec2",
+    )?;
+    let body2 = serde_json::json!({
+        "action": "execute",
+        "function": "inputrefs",
+        "input": {},
+        "input_refs": [],
+    })
+    .to_string();
+    let (status2, resp_body2) = post_invoke(&client, &auth2, body2).await;
+    assert_eq!(
+        status2,
+        Status::Ok,
+        "an empty input_refs must not be rejected: {resp_body2}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Fail-closed on a malformed chain-derived `computeCaveats` (both judges,
 // security): the old `if let Ok(..)` silently fell through to the
 // unconstrained case on a parse failure -- a fail-open. A malformed

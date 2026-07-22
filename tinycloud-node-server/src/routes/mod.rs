@@ -2471,9 +2471,20 @@ async fn handle_compute_invoke(
             function,
             content_cid,
             input,
-            input_refs: _,
+            input_refs,
             output_ref,
         } => {
+            // §8: host-side pre-reading of `input_refs` is not implemented in
+            // the MVP -- the routine reads its own inputs via storage_get.
+            // Silently ignoring a non-empty `input_refs` would let a caller
+            // believe the node pre-read inputs it never touched; reject
+            // loudly instead.
+            if input_refs.as_ref().map(|r| !r.is_empty()).unwrap_or(false) {
+                return Err((
+                    Status::BadRequest,
+                    "input_refs (host-side input pre-read) is not supported; the routine reads its own inputs via storage_get (§8)".to_string(),
+                ));
+            }
             handle_compute_execute(
                 tinycloud,
                 compute_service,
