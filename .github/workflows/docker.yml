@@ -20,7 +20,7 @@ on:
         type: boolean
         default: false
       image_version:
-        description: 'Manual image version to tag/deploy, without leading v. Defaults to the selected ref name.'
+        description: 'Manual image version to tag/deploy. On the DNS-AID rollout branch, use dns-aid-dry-run or dns-aid-apply.'
         required: false
         type: string
         default: ''
@@ -30,7 +30,146 @@ env:
   IMAGE_NAME: tinycloudlabs/tinycloud-node
 
 jobs:
+  dns-aid:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/skgbafa/dns-aid-rollout' && (inputs.image_version == 'dns-aid-dry-run' || inputs.image_version == 'dns-aid-apply') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.PROD_TINYCLOUD_CLOUDFLARE_API_TOKEN }}
+      DNS_AID_MODE: ${{ inputs.image_version }}
+    steps:
+      - name: Inspect or apply DNS-AID records and DNSSEC
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+            echo "::error::PROD_TINYCLOUD_CLOUDFLARE_API_TOKEN is not configured"
+            exit 1
+          fi
+
+          API_BASE="https://api.cloudflare.com/client/v4"
+          ZONE_NAME="tinycloud.xyz"
+          RESPONSE_FILE="$(mktemp)"
+          trap 'rm -f "$RESPONSE_FILE"' EXIT
+
+          cloudflare_request() {
+            local method="$1"
+            local path="$2"
+            local payload="${3:-}"
+            local status
+            local -a args=(
+              --silent
+              --show-error
+              --output "$RESPONSE_FILE"
+              --write-out '%{http_code}'
+              --request "$method"
+              --header "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}"
+              --header 'Content-Type: application/json'
+            )
+
+            if [ -n "$payload" ]; then
+              args+=(--data "$payload")
+            fi
+
+            status="$(curl "${args[@]}" "${API_BASE}${path}")"
+            if [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
+              echo "::error::Cloudflare API ${method} ${path%%\?*} failed with HTTP ${status}"
+              jq -r '.errors[]? | "::error::Cloudflare error \(.code): \(.message)"' "$RESPONSE_FILE" || true
+              exit 1
+            fi
+            if ! jq -e '.success == true and ((.errors // []) | length == 0)' "$RESPONSE_FILE" >/dev/null; then
+              echo "::error::Cloudflare API ${method} ${path%%\?*} returned an unsuccessful response"
+              jq -r '.errors[]? | "::error::Cloudflare error \(.code): \(.message)"' "$RESPONSE_FILE" || true
+              exit 1
+            fi
+          }
+
+          cloudflare_request GET "/zones?name=${ZONE_NAME}&status=active&per_page=50"
+          if [ "$(jq '.result | length' "$RESPONSE_FILE")" -ne 1 ]; then
+            echo "::error::Expected exactly one active ${ZONE_NAME} zone"
+            exit 1
+          fi
+          ZONE_ID="$(jq -r '.result[0].id' "$RESPONSE_FILE")"
+          jq '{zone: (.result[0] | {name, status})}' "$RESPONSE_FILE"
+
+          cloudflare_request GET "/zones/${ZONE_ID}/dns_records?type=SVCB&name.contains=_agents&per_page=100"
+          jq '{dns_aid_records: [.result[] | {type, name, ttl, proxied, data}]}' "$RESPONSE_FILE"
+
+          cloudflare_request GET "/zones/${ZONE_ID}/dnssec"
+          jq '{dnssec: (.result | {status, key_tag, algorithm, digest_type, digest, ds})}' "$RESPONSE_FILE"
+
+          if [ "$DNS_AID_MODE" = "dns-aid-dry-run" ]; then
+            echo "DNS-AID dry run completed without changes."
+            exit 0
+          fi
+          if [ "$DNS_AID_MODE" != "dns-aid-apply" ]; then
+            echo "::error::Unsupported DNS-AID mode"
+            exit 1
+          fi
+
+          SVCB_VALUE='mandatory=alpn,port alpn="h2,h3" port=443'
+          DNS_AID_NAMES=(
+            '_a2a._agents.tinycloud.xyz'
+            '_a2a._agents.protocol.tinycloud.xyz'
+          )
+          DNS_AID_TARGETS=(
+            'tinycloud.xyz.'
+            'protocol.tinycloud.xyz.'
+          )
+          MISSING_RECORDS=()
+
+          for index in "${!DNS_AID_NAMES[@]}"; do
+            name="${DNS_AID_NAMES[$index]}"
+            target="${DNS_AID_TARGETS[$index]}"
+            cloudflare_request GET "/zones/${ZONE_ID}/dns_records?type=SVCB&name=${name}&per_page=100"
+            count="$(jq '.result | length' "$RESPONSE_FILE")"
+            if [ "$count" -gt 1 ]; then
+              echo "::error::Found multiple SVCB records for ${name}; refusing to continue"
+              exit 1
+            fi
+            if [ "$count" -eq 1 ]; then
+              if ! jq -e \
+                --arg name "$name" \
+                --arg target "$target" \
+                --arg value "$SVCB_VALUE" \
+                '.result[0] | .type == "SVCB" and .name == $name and .ttl == 300 and .proxied == false and .data.priority == 1 and .data.target == $target and .data.value == $value' \
+                "$RESPONSE_FILE" >/dev/null; then
+                echo "::error::Existing SVCB record for ${name} differs from the required DNS-AID record; refusing to overwrite it"
+                exit 1
+              fi
+              echo "SVCB record already matches: ${name}"
+            else
+              MISSING_RECORDS+=("$index")
+            fi
+          done
+
+          for index in "${MISSING_RECORDS[@]}"; do
+            name="${DNS_AID_NAMES[$index]}"
+            target="${DNS_AID_TARGETS[$index]}"
+            payload="$(jq -cn \
+              --arg name "$name" \
+              --arg target "$target" \
+              --arg value "$SVCB_VALUE" \
+              '{type: "SVCB", name: $name, ttl: 300, proxied: false, data: {priority: 1, target: $target, value: $value}}')"
+            cloudflare_request POST "/zones/${ZONE_ID}/dns_records" "$payload"
+            jq '{created_dns_aid_record: (.result | {type, name, ttl, proxied, data})}' "$RESPONSE_FILE"
+          done
+
+          for name in "${DNS_AID_NAMES[@]}"; do
+            cloudflare_request GET "/zones/${ZONE_ID}/dns_records?type=SVCB&name=${name}&per_page=100"
+            if [ "$(jq '.result | length' "$RESPONSE_FILE")" -ne 1 ]; then
+              echo "::error::Expected exactly one SVCB record for ${name} after apply"
+              exit 1
+            fi
+          done
+
+          cloudflare_request PATCH "/zones/${ZONE_ID}/dnssec" '{"status":"active"}'
+          jq '{dnssec: (.result | {status, key_tag, algorithm, digest_type, digest, ds})}' "$RESPONSE_FILE"
+
   build:
+    if: ${{ github.ref != 'refs/heads/skgbafa/dns-aid-rollout' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -88,7 +227,7 @@ jobs:
 
   build-dstack:
     runs-on: ubuntu-latest
-    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: ${{ github.ref != 'refs/heads/skgbafa/dns-aid-rollout' && (github.event_name == 'release' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) }}
     permissions:
       contents: read
       packages: write
@@ -148,7 +287,7 @@ jobs:
   deploy-phala:
     runs-on: ubuntu-latest
     needs: [build, build-dstack]
-    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.deploy_phala)
+    if: ${{ github.ref != 'refs/heads/skgbafa/dns-aid-rollout' && (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.deploy_phala)) }}
     steps:
       - uses: actions/checkout@v4
 
