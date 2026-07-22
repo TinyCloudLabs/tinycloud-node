@@ -31,8 +31,12 @@ env:
 
 jobs:
   dns-aid:
-    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/skgbafa/dns-aid-rollout' && (inputs.image_version == 'dns-aid-dry-run' || inputs.image_version == 'dns-aid-apply') }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/skgbafa/dns-aid-rollout' && github.actor == 'skgbafa' && (inputs.image_version == 'dns-aid-dry-run' || inputs.image_version == 'dns-aid-apply') }}
     runs-on: ubuntu-latest
+    environment: production-dns
+    concurrency:
+      group: production-dns-tinycloud-xyz
+      cancel-in-progress: false
     permissions:
       contents: read
     env:
@@ -51,8 +55,22 @@ jobs:
 
           API_BASE="https://api.cloudflare.com/client/v4"
           ZONE_NAME="tinycloud.xyz"
+          DNS_AID_NAMES=(
+            '_a2a._agents.tinycloud.xyz'
+            '_a2a._agents.protocol.tinycloud.xyz'
+          )
+          DNS_AID_TARGETS=(
+            'tinycloud.xyz.'
+            'protocol.tinycloud.xyz.'
+          )
+          AUTHORITATIVE_NAMESERVERS=(
+            'candy.ns.cloudflare.com'
+            'james.ns.cloudflare.com'
+          )
+          SVCB_VALUE='mandatory=alpn,port alpn="h2,h3" port=443'
           RESPONSE_FILE="$(mktemp)"
-          trap 'rm -f "$RESPONSE_FILE"' EXIT
+          DNS_RESPONSE_FILE="$(mktemp)"
+          trap 'rm -f "$RESPONSE_FILE" "$DNS_RESPONSE_FILE"' EXIT
 
           cloudflare_request() {
             local method="$1"
@@ -86,6 +104,115 @@ jobs:
             fi
           }
 
+          validate_svcb() {
+            local source="$1"
+            local expected_name="$2"
+            local expected_target="$3"
+            local input_file="$4"
+
+            python3 - "$source" "$expected_name" "$expected_target" "$input_file" <<'PY'
+          import json
+          import shlex
+          import sys
+
+          source, expected_name, expected_target, input_file = sys.argv[1:]
+
+          def fail(message):
+              print(f"::error::{message}", file=sys.stderr)
+              raise SystemExit(1)
+
+          def dns_name(value):
+              return str(value).lower().rstrip(".")
+
+          def parse_params(tokens):
+              params = {}
+              for token in tokens:
+                  if "=" not in token:
+                      fail("SVCB parameter is missing a value")
+                  key, value = token.split("=", 1)
+                  key = key.lower()
+                  value = value.strip("\"'")
+                  if key in params:
+                      fail(f"SVCB parameter {key} is duplicated")
+                  params[key] = value
+              if set(params) != {"mandatory", "alpn", "port"}:
+                  fail("SVCB parameters do not match mandatory, alpn, and port")
+
+              mandatory_values = [item.lower() for item in params["mandatory"].split(",") if item]
+              alpn_values = [item.lower() for item in params["alpn"].split(",") if item]
+              if len(mandatory_values) != 2 or set(mandatory_values) != {"alpn", "port"}:
+                  fail("SVCB mandatory keys do not match alpn and port")
+              if len(alpn_values) != 2 or set(alpn_values) != {"h2", "h3"}:
+                  fail("SVCB ALPN values do not match h2 and h3")
+              if params["port"] != "443":
+                  fail("SVCB port is not 443")
+
+          if source == "api":
+              with open(input_file, encoding="utf-8") as handle:
+                  response = json.load(handle)
+              records = response.get("result", [])
+              if len(records) != 1:
+                  fail("Cloudflare API did not return exactly one DNS-AID record")
+              record = records[0]
+              if dns_name(record.get("name", "")) != dns_name(expected_name):
+                  fail("DNS-AID record owner does not match")
+              if record.get("type") != "SVCB":
+                  fail("DNS-AID owner has an unexpected RR type")
+              if record.get("ttl") != 300:
+                  fail("DNS-AID record TTL is not 300")
+              if record.get("proxied") is not False:
+                  fail("DNS-AID record is not DNS-only")
+              data = record.get("data") or {}
+              if data.get("priority") != 1:
+                  fail("SVCB priority is not 1")
+              if dns_name(data.get("target", "")) != dns_name(expected_target):
+                  fail("SVCB target does not match")
+              try:
+                  params = shlex.split(data.get("value", ""))
+              except (TypeError, ValueError) as error:
+                  fail(f"Could not parse SVCB parameters: {error}")
+              parse_params(params)
+          elif source == "dns":
+              with open(input_file, encoding="utf-8") as handle:
+                  answers = [line.strip() for line in handle if line.strip() and not line.startswith(";")]
+              if len(answers) != 1:
+                  fail("Authoritative DNS did not return exactly one DNS-AID record")
+              fields = answers[0].split(None, 5)
+              if len(fields) != 6:
+                  fail("Authoritative DNS returned an invalid SVCB answer")
+              owner, ttl, dns_class, rr_type, priority, rdata = fields
+              if dns_name(owner) != dns_name(expected_name):
+                  fail("Authoritative DNS record owner does not match")
+              if ttl != "300" or dns_class != "IN" or rr_type != "SVCB":
+                  fail("Authoritative DNS record metadata does not match")
+              try:
+                  rdata_fields = shlex.split(rdata)
+              except ValueError as error:
+                  fail(f"Could not parse authoritative SVCB answer: {error}")
+              if priority != "1":
+                  fail("Authoritative SVCB priority is not 1")
+              if len(rdata_fields) < 2 or dns_name(rdata_fields[0]) != dns_name(expected_target):
+                  fail("Authoritative SVCB target does not match")
+              parse_params(rdata_fields[1:])
+          else:
+              fail("Unknown SVCB validation source")
+          PY
+          }
+
+          validate_active_dnssec() {
+            if ! jq -e '
+              .result.status == "active" and
+              .result.key_tag != null and
+              .result.algorithm != null and
+              .result.digest_type != null and
+              ((.result.digest // "") | length > 0) and
+              ((.result.ds // "") | length > 0)
+            ' "$RESPONSE_FILE" >/dev/null; then
+              echo "::error::DNSSEC is not active with complete public DS fields"
+              exit 1
+            fi
+          }
+
           cloudflare_request GET "/zones?name=${ZONE_NAME}&status=active&per_page=50"
           if [ "$(jq '.result | length' "$RESPONSE_FILE")" -ne 1 ]; then
             echo "::error::Expected exactly one active ${ZONE_NAME} zone"
@@ -98,9 +225,32 @@ jobs:
           jq '{dns_aid_records: [.result[] | {type, name, ttl, proxied, data}]}' "$RESPONSE_FILE"
 
           cloudflare_request GET "/zones/${ZONE_ID}/dnssec"
+          DNSSEC_STATUS="$(jq -r '.result.status' "$RESPONSE_FILE")"
           jq '{dnssec: (.result | {status, key_tag, algorithm, digest_type, digest, ds})}' "$RESPONSE_FILE"
 
+          MISSING_RECORDS=()
+
+          for index in "${!DNS_AID_NAMES[@]}"; do
+            name="${DNS_AID_NAMES[$index]}"
+            target="${DNS_AID_TARGETS[$index]}"
+            cloudflare_request GET "/zones/${ZONE_ID}/dns_records?name=${name}&per_page=100"
+            count="$(jq '.result | length' "$RESPONSE_FILE")"
+            if [ "$count" -gt 1 ]; then
+              echo "::error::Found multiple DNS records at ${name}; refusing to continue"
+              exit 1
+            fi
+            if [ "$count" -eq 1 ]; then
+              validate_svcb api "$name" "$target" "$RESPONSE_FILE"
+              echo "DNS-AID record already matches semantically: ${name}"
+            else
+              MISSING_RECORDS+=("$index")
+            fi
+          done
+
           if [ "$DNS_AID_MODE" = "dns-aid-dry-run" ]; then
+            for index in "${MISSING_RECORDS[@]}"; do
+              echo "DNS-AID dry run would create: ${DNS_AID_NAMES[$index]}"
+            done
             echo "DNS-AID dry run completed without changes."
             exit 0
           fi
@@ -109,41 +259,38 @@ jobs:
             exit 1
           fi
 
-          SVCB_VALUE='mandatory=alpn,port alpn="h2,h3" port=443'
-          DNS_AID_NAMES=(
-            '_a2a._agents.tinycloud.xyz'
-            '_a2a._agents.protocol.tinycloud.xyz'
-          )
-          DNS_AID_TARGETS=(
-            'tinycloud.xyz.'
-            'protocol.tinycloud.xyz.'
-          )
-          MISSING_RECORDS=()
+          if ! command -v dig >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install --yes dnsutils
+          fi
 
-          for index in "${!DNS_AID_NAMES[@]}"; do
-            name="${DNS_AID_NAMES[$index]}"
-            target="${DNS_AID_TARGETS[$index]}"
-            cloudflare_request GET "/zones/${ZONE_ID}/dns_records?type=SVCB&name=${name}&per_page=100"
-            count="$(jq '.result | length' "$RESPONSE_FILE")"
-            if [ "$count" -gt 1 ]; then
-              echo "::error::Found multiple SVCB records for ${name}; refusing to continue"
+          if [ "$DNSSEC_STATUS" != "disabled" ] && [ "$DNSSEC_STATUS" != "active" ]; then
+            echo "::error::DNSSEC must be disabled or active before apply; current status is ${DNSSEC_STATUS}"
+            exit 1
+          fi
+
+          if [ "$DNSSEC_STATUS" = "disabled" ]; then
+            mapfile -t PARENT_NAMESERVERS < <(dig +short NS xyz.)
+            if [ "${#PARENT_NAMESERVERS[@]}" -eq 0 ]; then
+              echo "::error::Could not discover authoritative nameservers for the xyz parent zone"
               exit 1
             fi
-            if [ "$count" -eq 1 ]; then
-              if ! jq -e \
-                --arg name "$name" \
-                --arg target "$target" \
-                --arg value "$SVCB_VALUE" \
-                '.result[0] | .type == "SVCB" and .name == $name and .ttl == 300 and .proxied == false and .data.priority == 1 and .data.target == $target and .data.value == $value' \
-                "$RESPONSE_FILE" >/dev/null; then
-                echo "::error::Existing SVCB record for ${name} differs from the required DNS-AID record; refusing to overwrite it"
+            for nameserver in "${PARENT_NAMESERVERS[@]}"; do
+              if ! dig +time=5 +tries=2 +norecurse +noall +comments +answer "@${nameserver}" "$ZONE_NAME" DS > "$DNS_RESPONSE_FILE"; then
+                echo "::error::Failed to query the parent zone for DS records"
                 exit 1
               fi
-              echo "SVCB record already matches: ${name}"
-            else
-              MISSING_RECORDS+=("$index")
-            fi
-          done
+              if ! grep -q 'status: NOERROR' "$DNS_RESPONSE_FILE"; then
+                echo "::error::Parent-zone DS query did not return NOERROR"
+                exit 1
+              fi
+              if awk '!/^;/ && NF { found = 1 } END { exit !found }' "$DNS_RESPONSE_FILE"; then
+                echo "::error::A public parent DS record exists while Cloudflare DNSSEC is disabled"
+                exit 1
+              fi
+            done
+            echo "Public parent DS is absent on every xyz authoritative nameserver."
+          fi
 
           for index in "${MISSING_RECORDS[@]}"; do
             name="${DNS_AID_NAMES[$index]}"
@@ -157,15 +304,45 @@ jobs:
             jq '{created_dns_aid_record: (.result | {type, name, ttl, proxied, data})}' "$RESPONSE_FILE"
           done
 
-          for name in "${DNS_AID_NAMES[@]}"; do
-            cloudflare_request GET "/zones/${ZONE_ID}/dns_records?type=SVCB&name=${name}&per_page=100"
+          for index in "${!DNS_AID_NAMES[@]}"; do
+            name="${DNS_AID_NAMES[$index]}"
+            target="${DNS_AID_TARGETS[$index]}"
+            cloudflare_request GET "/zones/${ZONE_ID}/dns_records?name=${name}&per_page=100"
             if [ "$(jq '.result | length' "$RESPONSE_FILE")" -ne 1 ]; then
-              echo "::error::Expected exactly one SVCB record for ${name} after apply"
+              echo "::error::Expected exactly one DNS-AID record for ${name} after apply"
               exit 1
             fi
+            validate_svcb api "$name" "$target" "$RESPONSE_FILE"
+
+            for nameserver in "${AUTHORITATIVE_NAMESERVERS[@]}"; do
+              authoritative_answer=false
+              for _ in {1..10}; do
+                if dig +time=5 +tries=2 +norecurse +noall +comments +answer "@${nameserver}" "$name" SVCB > "$DNS_RESPONSE_FILE" && \
+                  grep -q 'status: NOERROR' "$DNS_RESPONSE_FILE" && \
+                  awk '!/^;/ && NF { found = 1 } END { exit !found }' "$DNS_RESPONSE_FILE"; then
+                  authoritative_answer=true
+                  break
+                fi
+                sleep 3
+              done
+              if [ "$authoritative_answer" != "true" ]; then
+                echo "::error::Authoritative nameserver did not publish ${name}"
+                exit 1
+              fi
+              validate_svcb dns "$name" "$target" "$DNS_RESPONSE_FILE"
+              echo "Authoritative DNS-AID record verified on ${nameserver}: ${name}"
+            done
           done
 
-          cloudflare_request PATCH "/zones/${ZONE_ID}/dnssec" '{"status":"active"}'
+          if [ "$DNSSEC_STATUS" = "disabled" ]; then
+            cloudflare_request PATCH "/zones/${ZONE_ID}/dnssec" '{"status":"active"}'
+            validate_active_dnssec
+          else
+            echo "DNSSEC is already active; no DNSSEC mutation needed."
+          fi
+
+          cloudflare_request GET "/zones/${ZONE_ID}/dnssec"
+          validate_active_dnssec
           jq '{dnssec: (.result | {status, key_tag, algorithm, digest_type, digest, ds})}' "$RESPONSE_FILE"
 
   build:
