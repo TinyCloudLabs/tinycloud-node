@@ -2568,19 +2568,36 @@ async fn handle_compute_execute(
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
 
     if d_fns.is_empty() {
-        // F1.5 tripwire: if SOME binding-caveat delegation names this CID in
-        // this space but NONE is delegated to the CURRENT routine identity,
-        // the derived key rotated -- distinct 409, not a generic 403.
-        let any_bound = tinycloud
-            .compute_any_d_fn_bound(space, &content_cid)
+        // D-ROTATION (§6.2/F1.5, refined): classify WHY no live D_fn matched,
+        // so the caller gets an accurate error rather than always seeing a
+        // rotation. A true rotation (a binding D_fn whose delegatee no longer
+        // matches the re-derived identity) is a distinct 409; a merely
+        // expired/revoked/unusable grant whose identity STILL matches is a
+        // 403-class error (the identity is stable — re-mint the D_fn).
+        use tinycloud_core::ComputeGrantStatus;
+        let status = tinycloud
+            .compute_classify_routine_grant(space, &routine_did, &content_cid)
             .await
             .map_err(|e| (Status::InternalServerError, e.to_string()))?;
-        if any_bound {
-            return Err(ComputeExecError::RoutineIdentityRotated.into_status());
+        match status {
+            ComputeGrantStatus::Rotated => {
+                return Err(ComputeExecError::RoutineIdentityRotated.into_status());
+            }
+            ComputeGrantStatus::IdentityExpired => {
+                return Err(ComputeExecError::RoutineGrantExpired.into_status());
+            }
+            ComputeGrantStatus::IdentityRevoked => {
+                return Err(ComputeExecError::RoutineGrantRevoked.into_status());
+            }
+            ComputeGrantStatus::IdentityUnusable => {
+                return Err(ComputeExecError::RoutineGrantUnavailable.into_status());
+            }
+            ComputeGrantStatus::NoBinding => {
+                // The function was deployed with no routine data grant -- it
+                // can still run, but every host call fails closed. (Deploy
+                // always mints a D_fn, so this is not reached in normal flows.)
+            }
         }
-        // Otherwise the function was deployed with no routine data grant --
-        // it can still run, but every host call fails closed. (Deploy
-        // always mints a D_fn, so this is not reached in normal flows.)
     }
 
     let parents: Vec<tinycloud_auth::authorization::Cid> =

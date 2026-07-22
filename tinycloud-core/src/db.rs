@@ -123,6 +123,32 @@ pub enum DelegationStatus {
     Unavailable,
 }
 
+/// D-ROTATION (compute-service.md §6.2/F1.5): why `compute_select_d_fns`
+/// found no LIVE `D_fn` for the re-derived routine identity. Distinguishes a
+/// true dstack-seed rotation (`Rotated`) from a merely expired/revoked grant
+/// whose delegatee still matches the current identity -- so the execute path
+/// reports an accurate error instead of always reporting a rotation.
+#[cfg(feature = "compute")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputeGrantStatus {
+    /// A binding `D_fn` for THIS identity exists but has been revoked (or has
+    /// a revoked ancestor).
+    IdentityRevoked,
+    /// A binding `D_fn` for THIS identity exists but is expired or not yet
+    /// valid.
+    IdentityExpired,
+    /// A binding `D_fn` for THIS identity exists, is in-window and unrevoked,
+    /// but `compute_select_d_fns` still dropped it (e.g. a cross-space
+    /// ability row). NOT a rotation.
+    IdentityUnusable,
+    /// Binding `D_fn`(s) exist for this content CID, but NONE is delegated to
+    /// the re-derived routine DID -- the dstack-seed-rotation signature.
+    Rotated,
+    /// No binding `D_fn` names this content CID in this space at all (the
+    /// function was deployed with no routine data grant).
+    NoBinding,
+}
+
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum TxError<S: StorageSetup, K: Secrets> {
@@ -395,6 +421,97 @@ where
                         == Some(function_cid)
                 })
         }))
+    }
+
+    /// D-ROTATION (compute-service.md §6.2/F1.5, refined): when
+    /// `compute_select_d_fns` finds NO live `D_fn` for the re-derived
+    /// `routine_did`, classify WHY, so the execute path reports an accurate
+    /// error instead of always crying `routine-identity-rotated`. A merely
+    /// EXPIRED or REVOKED `D_fn` whose delegatee still matches the current
+    /// identity is NOT a rotation -- the identity is stable; the grant just
+    /// needs re-minting. A true rotation is a binding `D_fn` whose delegatee
+    /// no longer matches the re-derived DID (the dstack-seed-rotation
+    /// signature). Priority when multiple binding `D_fn`s exist for the
+    /// identity: revoked > expired > unusable (an in-window, unrevoked grant
+    /// that `compute_select_d_fns` still dropped, e.g. a cross-space ability
+    /// row); a delegatee mismatch is only reported when NO identity-matching
+    /// binding `D_fn` exists at all.
+    #[cfg(feature = "compute")]
+    pub async fn compute_classify_routine_grant(
+        &self,
+        space: &SpaceId,
+        routine_did: &str,
+        function_cid: &str,
+    ) -> Result<ComputeGrantStatus, DbErr> {
+        let rows = delegation::Entity::find()
+            .find_with_related(abilities::Entity)
+            .all(&self.conn)
+            .await?;
+
+        let now = OffsetDateTime::now_utc();
+        let mut saw_binding_other_delegatee = false;
+        let mut identity_revoked = false;
+        let mut identity_expired = false;
+        let mut identity_unusable = false;
+
+        for (deleg, ability_rows) in rows {
+            let has_binding = ability_rows.iter().any(|row| {
+                row.resource.space().map(|s| s == space).unwrap_or(false)
+                    && row.caveats.0.values().any(|v| {
+                        v.get("computeFunctionBinding")
+                            .and_then(|b| b.get("functionCid"))
+                            .and_then(|fc| fc.as_str())
+                            == Some(function_cid)
+                    })
+            });
+            if !has_binding {
+                continue;
+            }
+            if deleg.delegatee != routine_did {
+                saw_binding_other_delegatee = true;
+                continue;
+            }
+
+            // A binding D_fn for the CURRENT identity exists -- classify why
+            // `compute_select_d_fns` (same filters) dropped it.
+            if revocation::is_revoked(&self.conn, &deleg.id).await? {
+                identity_revoked = true;
+                continue;
+            }
+            match revocation::first_revoked_ancestor(&self.conn, &deleg.id).await {
+                Ok(Some(_)) => {
+                    identity_revoked = true;
+                    continue;
+                }
+                Ok(None) => {}
+                Err(revocation::ChainTraversalError::LimitExceeded) => {
+                    identity_revoked = true;
+                    continue;
+                }
+                Err(revocation::ChainTraversalError::Db(e)) => return Err(e),
+            }
+            if deleg.expiry.map(|e| now >= e).unwrap_or(false)
+                || deleg.not_before.map(|nb| now < nb).unwrap_or(false)
+            {
+                identity_expired = true;
+                continue;
+            }
+            // Present, in-window, unrevoked -- but select() still dropped it
+            // (e.g. an ability row outside `space`). Not a rotation.
+            identity_unusable = true;
+        }
+
+        if identity_revoked {
+            Ok(ComputeGrantStatus::IdentityRevoked)
+        } else if identity_expired {
+            Ok(ComputeGrantStatus::IdentityExpired)
+        } else if identity_unusable {
+            Ok(ComputeGrantStatus::IdentityUnusable)
+        } else if saw_binding_other_delegatee {
+            Ok(ComputeGrantStatus::Rotated)
+        } else {
+            Ok(ComputeGrantStatus::NoBinding)
+        }
     }
 
     /// Judges' item 7 (same-bytes-two-names redeploy hazard): true if some

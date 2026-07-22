@@ -822,6 +822,154 @@ async fn rotation_tripwire_distinct_error() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// D-ROTATION: a D_fn whose delegatee STILL matches the re-derived identity
+// but is merely EXPIRED must NOT be misreported as a rotation. It gets a
+// distinct 403 routine-grant-expired (the identity is stable; re-mint).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn expired_grant_reports_grant_expired_not_rotated() -> Result<()> {
+    use tinycloud_core::models::delegation as deleg_model;
+    use tinycloud_core::sea_orm::{
+        ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter,
+    };
+
+    let (rocket, conn, tempdir) = boot().await?;
+    let owner = make_owner("grant-expired")?;
+    seed_space_and_actors(&conn, &owner.space, &[]).await?;
+    ensure_space_storage(&tempdir, &owner.space)?;
+    let client = Client::tracked(rocket).await?;
+
+    let ack = deploy_fixture(
+        &client,
+        &owner,
+        "exp",
+        &load_fixture("probe_get.wat"),
+        &[GrantSpec {
+            service: "kv",
+            path: "in/",
+            ability: "tinycloud.kv/get",
+        }],
+        "exp",
+    )
+    .await?;
+    let rdid = ack["routine_did"].as_str().unwrap().to_string();
+
+    // Expire the D_fn IN PLACE: set its expiry to the past. Its delegatee
+    // (== rdid) is untouched, so the identity still matches -- this is NOT a
+    // rotation.
+    let dfn = deleg_model::Entity::find()
+        .filter(deleg_model::Column::Delegatee.eq(rdid.clone()))
+        .one(&conn)
+        .await?
+        .context("D_fn must exist after deploy")?;
+    let mut active = dfn.into_active_model();
+    active.expiry = Set(Some(
+        time::OffsetDateTime::now_utc() - time::Duration::hours(1),
+    ));
+    active.update(&conn).await?;
+
+    let auth = owner_compute_invocation(
+        &owner,
+        "exp",
+        "tinycloud.compute/execute",
+        "urn:uuid:exp-exec",
+    )?;
+    let (status, body) =
+        post_invoke(&client, &auth, execute_body("exp", serde_json::json!({}))).await;
+    assert_eq!(
+        status,
+        Status::Forbidden,
+        "an expired-but-identity-matching D_fn must be a 403, not the 409 rotation: {body}"
+    );
+    assert!(
+        body.contains("routine-grant-expired"),
+        "error must carry the distinct expired-grant code: {body}"
+    );
+    assert!(
+        !body.contains("routine-identity-rotated"),
+        "an expired grant must NOT be misreported as a rotation: {body}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// D-ROTATION: a D_fn whose delegatee STILL matches the re-derived identity
+// but has been REVOKED must NOT be misreported as a rotation. It gets a
+// distinct 403 routine-grant-revoked.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn revoked_grant_reports_grant_revoked_not_rotated() -> Result<()> {
+    use tinycloud_core::models::{delegation as deleg_model, revocation as revoc_model};
+    use tinycloud_core::sea_orm::{
+        ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter,
+    };
+
+    let (rocket, conn, tempdir) = boot().await?;
+    let owner = make_owner("grant-revoked")?;
+    seed_space_and_actors(&conn, &owner.space, &[]).await?;
+    ensure_space_storage(&tempdir, &owner.space)?;
+    let client = Client::tracked(rocket).await?;
+
+    let ack = deploy_fixture(
+        &client,
+        &owner,
+        "rev",
+        &load_fixture("probe_get.wat"),
+        &[GrantSpec {
+            service: "kv",
+            path: "in/",
+            ability: "tinycloud.kv/get",
+        }],
+        "rev",
+    )
+    .await?;
+    let rdid = ack["routine_did"].as_str().unwrap().to_string();
+
+    // Revoke the D_fn IN PLACE by inserting a revocation row keyed on its id.
+    // The delegatee (== rdid) is untouched -- the identity still matches, so
+    // this is NOT a rotation.
+    let dfn = deleg_model::Entity::find()
+        .filter(deleg_model::Column::Delegatee.eq(rdid.clone()))
+        .one(&conn)
+        .await?
+        .context("D_fn must exist after deploy")?;
+    revoc_model::ActiveModel {
+        id: Set(tinycloud_core::hash::hash(b"test-revocation-rev")),
+        revoker: Set(owner.did.clone()),
+        revoked: Set(dfn.id),
+        serialization: Set(Vec::new()),
+        revoked_at: Set(Some(time::OffsetDateTime::now_utc())),
+    }
+    .insert(&conn)
+    .await?;
+
+    let auth = owner_compute_invocation(
+        &owner,
+        "rev",
+        "tinycloud.compute/execute",
+        "urn:uuid:rev-exec",
+    )?;
+    let (status, body) =
+        post_invoke(&client, &auth, execute_body("rev", serde_json::json!({}))).await;
+    assert_eq!(
+        status,
+        Status::Forbidden,
+        "a revoked-but-identity-matching D_fn must be a 403, not the 409 rotation: {body}"
+    );
+    assert!(
+        body.contains("routine-grant-revoked"),
+        "error must carry the distinct revoked-grant code: {body}"
+    );
+    assert!(
+        !body.contains("routine-identity-rotated"),
+        "a revoked grant must NOT be misreported as a rotation: {body}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // kv/del of a key with no live value must be a non-fatal, observable
 // envelope (granted:true, `no-such-key`), not a 500 that aborts the whole
 // run -- the ability WAS granted; the core simply had nothing to delete.

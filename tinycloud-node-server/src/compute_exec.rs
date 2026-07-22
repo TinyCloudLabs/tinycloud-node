@@ -85,8 +85,22 @@ pub enum ComputeExecError {
     ContentCidMismatch { expected: String, got: String },
     /// F1.5 tripwire: the re-derived routine key ≠ any bound `D_fn`'s
     /// delegatee — a dstack seed rotation. DISTINCT code, 409 (NOT a
-    /// generic 403), telling the deployer to re-mint `D_fn`.
+    /// generic 403), telling the deployer to re-mint `D_fn`. D-ROTATION:
+    /// reported ONLY for a genuine delegatee mismatch, never for a merely
+    /// expired/revoked grant whose identity still matches.
     RoutineIdentityRotated,
+    /// D-ROTATION: a binding `D_fn` for the CURRENT routine identity exists
+    /// but is expired / not-yet-valid. NOT a rotation — the identity is
+    /// stable; the deployer must re-mint the `D_fn`. 403-class.
+    RoutineGrantExpired,
+    /// D-ROTATION: a binding `D_fn` for the CURRENT routine identity exists
+    /// but has been revoked (directly or via a revoked ancestor). NOT a
+    /// rotation. 403-class.
+    RoutineGrantRevoked,
+    /// D-ROTATION: a binding `D_fn` for the CURRENT routine identity exists,
+    /// is in-window and unrevoked, but was still not selectable (e.g. it
+    /// carries an ability row outside this space). NOT a rotation. 403-class.
+    RoutineGrantUnavailable,
     /// The function is not in the chain-derived `functions` allowlist (§10.1).
     FunctionNotAllowed(String),
     /// The input failed the chain-derived `inputs` schema (§10.1).
@@ -123,6 +137,19 @@ impl ComputeExecError {
                 // 409 per §6.2/F1.5 — a distinct, non-403 signal.
                 Status::Conflict,
                 "routine-identity-rotated: the derived routine key no longer matches the bound D_fn delegatee; re-mint D_fn".to_string(),
+            ),
+            ComputeExecError::RoutineGrantExpired => (
+                // 403-class: the identity is stable, the grant just expired.
+                Status::Forbidden,
+                "routine-grant-expired: the routine's D_fn for this identity has expired or is not yet valid; re-mint D_fn".to_string(),
+            ),
+            ComputeExecError::RoutineGrantRevoked => (
+                Status::Forbidden,
+                "routine-grant-revoked: the routine's D_fn for this identity has been revoked; re-mint D_fn".to_string(),
+            ),
+            ComputeExecError::RoutineGrantUnavailable => (
+                Status::Forbidden,
+                "routine-grant-unavailable: the routine's D_fn for this identity is not usable (e.g. it spans another space); re-mint D_fn".to_string(),
             ),
             ComputeExecError::FunctionNotAllowed(f) => (
                 Status::Forbidden,
