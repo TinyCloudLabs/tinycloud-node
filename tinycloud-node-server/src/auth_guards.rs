@@ -43,6 +43,42 @@ struct KvBatchWriteResponse {
     count: usize,
 }
 
+struct KvListResponse(Vec<tinycloud_auth::resource::Path>, bool);
+
+impl<'r> Responder<'r, 'static> for KvListResponse {
+    fn respond_to(self, request: &'r Request<'_>) -> rocket::response::Result<'static> {
+        let mut response = Json(self.0).respond_to(request)?;
+        response.set_header(Header::new("x-tinycloud-truncated", self.1.to_string()));
+        Ok(response)
+    }
+}
+
+struct KvMutationResponse(Option<Hash>);
+
+fn kv_etag(hash: Hash) -> String {
+    format!("\"blake3-{}\"", hex::encode(hash.as_ref()))
+}
+
+impl<'r> Responder<'r, 'static> for KvMutationResponse {
+    fn respond_to(self, request: &'r Request<'_>) -> rocket::response::Result<'static> {
+        let mut response = ().respond_to(request)?;
+        if let Some(hash) = self.0 {
+            response.set_header(Header::new("ETag", kv_etag(hash)));
+        }
+        Ok(response)
+    }
+}
+
+struct KvMetadataResponse(Metadata, Hash);
+
+impl<'r> Responder<'r, 'static> for KvMetadataResponse {
+    fn respond_to(self, request: &'r Request<'_>) -> rocket::response::Result<'static> {
+        let mut response = ObjectHeaders(self.0).respond_to(request)?;
+        response.set_header(Header::new("ETag", kv_etag(self.1)));
+        Ok(response)
+    }
+}
+
 #[async_trait]
 impl<'r> FromData<'r> for DataIn<'r> {
     type Error = anyhow::Error;
@@ -82,10 +118,14 @@ where
 {
     fn respond_to(self, request: &'r Request<'_>) -> rocket::response::Result<'static> {
         match self.0 {
-            InvocationOutcome::KvList(list) => Json(list).respond_to(request),
-            InvocationOutcome::KvDelete => ().respond_to(request),
-            InvocationOutcome::KvMetadata(meta) => meta.map(ObjectHeaders).respond_to(request),
-            InvocationOutcome::KvWrite => ().respond_to(request),
+            InvocationOutcome::KvList(list, truncated) => {
+                KvListResponse(list, truncated).respond_to(request)
+            }
+            InvocationOutcome::KvDelete(hash) => KvMutationResponse(hash).respond_to(request),
+            InvocationOutcome::KvMetadata(meta) => meta
+                .map(|(metadata, hash)| KvMetadataResponse(metadata, hash))
+                .respond_to(request),
+            InvocationOutcome::KvWrite(hash) => KvMutationResponse(Some(hash)).respond_to(request),
             InvocationOutcome::KvBatchWrite(written) => {
                 let written = written
                     .into_iter()
@@ -213,7 +253,7 @@ where
     R: 'static + AsyncRead + Send,
 {
     fn respond_to(self, r: &'r Request<'_>) -> rocket::response::Result<'static> {
-        let etag = format!("\"blake3-{}\"", hex::encode(self.2.as_ref()));
+        let etag = kv_etag(self.2);
         Ok(Response::build_from(ObjectHeaders(self.1).respond_to(r)?)
             .header(Header::new("ETag", etag))
             // must ensure that Metadata::respond_to does not set the body of the response

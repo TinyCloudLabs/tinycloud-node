@@ -5,6 +5,7 @@ members = [
     "tinycloud-auth",
     "tinycloud-node-server",
     "tinycloud-sdk-wasm",
+    "tinycloud-verifier-wasm",
     "tinycloud-sdk-rs",
     "tinycloud-core",
     "dependencies/siwe",
@@ -56,20 +57,34 @@ cacaos = { path = "dependencies/cacao", version = "1.0.0" }
 # Fix RUSTSEC-2025-0047: Out-of-bounds access in get_disjoint_mut (0.4.10 -> 0.4.11)
 slab = { git = "https://github.com/tokio-rs/slab", tag = "v0.4.11" }
 
-# Config for cargo-dist — binary distribution
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+# Config for 'dist'
 [workspace.metadata.dist]
-# CI to generate
+# CI backends to support
 ci = "github"
-# Targets to build
-targets = [
-    "x86_64-unknown-linux-gnu",
-    "aarch64-unknown-linux-gnu",
-    "x86_64-apple-darwin",
-    "aarch64-apple-darwin",
-]
-# Installers to generate
-installers = ["shell", "powershell"]
-# Whether to auto-include README/LICENSE/CHANGELOG
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# The installers to generate for each app
+installers = ["shell", "powershell", "homebrew"]
+# Whether to auto-include files like READMEs, LICENSEs, and CHANGELOGs (default true)
 auto-includes = true
-# Enable cargo-binstall support (generates binstall metadata in GitHub releases)
+# Whether to install an updater program
 install-updater = false
+# A GitHub repo to push Homebrew formulas to
+# NOTE: on the first tagged release cargo-dist will OVERWRITE Formula/tinycloud-node.rb
+# in the tap with a generated binary formula (no head/service/test blocks) — accepted:
+# the CLI (`tinycloud node service ...`) is the primary service path, brew-services
+# fallback is best-effort.
+tap = "TinyCloudLabs/homebrew-tap"
+# Customize the Homebrew formula name
+formula = "tinycloud-node"
+# Publish jobs to run in CI
+publish-jobs = ["homebrew"]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"

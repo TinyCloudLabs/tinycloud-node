@@ -384,6 +384,8 @@ mod tests {
                 SqlRequest::Query {
                     sql: "SELECT name FROM items ORDER BY id".to_string(),
                     params: Vec::new(),
+                    max_rows: None,
+                    max_bytes: None,
                 },
                 None,
                 "tinycloud.sql/read".to_string(),

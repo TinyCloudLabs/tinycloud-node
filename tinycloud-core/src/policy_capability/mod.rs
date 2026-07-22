@@ -32,7 +32,7 @@ pub const REQUESTED_CAPABILITIES_DOMAIN: &[u8] = b"xyz.tinycloud.policy/Requeste
 /// registry (`capabilities.json`) via generated code (TC-112) — do not
 /// hand-edit; change the registry and rerun `scripts/gen-capabilities.mjs`.
 pub fn accepted_actions(service: &str) -> Option<&'static [&'static str]> {
-    generated::accepted_actions(service)
+    tinycloud_auth::policy_capability::accepted_actions(service)
 }
 
 /// Resolve a deprecated-alias action URN to its canonical form (registry
@@ -41,7 +41,7 @@ pub fn accepted_actions(service: &str) -> Option<&'static [&'static str]> {
 /// dispatch, exact-tier authorization gates) resolve aliases the *same* way
 /// the containment engine does, instead of hand-maintaining alias lists.
 pub fn resolve_alias(action: &str) -> &str {
-    generated::resolve_alias(action)
+    tinycloud_auth::policy_capability::resolve_alias(action)
 }
 
 /// Does holding `held` satisfy a requirement for `required`, accounting for
@@ -65,7 +65,7 @@ pub fn resolve_alias(action: &str) -> &str {
 /// never rewritten; only the comparison is registry-aware, so persisted
 /// capability rows, hashes, and serialized formats are unaffected.
 pub fn ability_matches(held: &str, required: &str) -> bool {
-    expand_actions(std::iter::once(held)).contains(generated::resolve_alias(required))
+    tinycloud_auth::policy_capability::ability_matches(held, required)
 }
 
 /// PolicyCapability — resolved authority shape used by ceilings, requested

@@ -21,11 +21,14 @@ pub struct Config {
     pub spaces: SpacesConfig,
     #[serde(default)]
     pub hooks: HooksConfig,
+    #[serde(default)]
+    pub tc_bench: TcBenchConfig,
     pub relay: Relay,
     #[serde(default)]
     pub telemetry: Telemetry,
     pub prometheus: Prometheus,
     pub cors: bool,
+    #[serde(default)]
     pub keys: Keys,
     #[serde(default)]
     pub tee: TeeConfig,
@@ -636,6 +639,30 @@ impl Default for PublicSpacesConfig {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct TcBenchConfig {
+    #[serde(default = "default_tc_bench_region")]
+    pub region: String,
+    #[serde(default)]
+    pub worker_bundle_sha256: Option<String>,
+    #[serde(default)]
+    pub wasm_bundle_sha256: Option<String>,
+}
+
+fn default_tc_bench_region() -> String {
+    "phala-cvm".to_string()
+}
+
+impl Default for TcBenchConfig {
+    fn default() -> Self {
+        Self {
+            region: default_tc_bench_region(),
+            worker_bundle_sha256: None,
+            wasm_bundle_sha256: None,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct HooksConfig {
     #[serde(default = "default_hooks_max_ticket_ttl_seconds")]
     pub max_ticket_ttl_seconds: u64,
@@ -699,11 +726,16 @@ impl Default for HooksConfig {
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, Default)]
 #[serde(tag = "type")]
 pub enum Keys {
+    #[serde(rename = "static", alias = "Static")]
     Static(Static),
     #[cfg(feature = "dstack")]
+    #[serde(rename = "dstack", alias = "Dstack")]
     Dstack,
     #[default]
+    #[serde(rename = "auto", alias = "Auto")]
     Auto,
+    #[serde(rename = "provider", alias = "Provider")]
+    Provider,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
@@ -889,6 +921,10 @@ impl Storage {
             if fs.path().as_os_str().is_empty() {
                 self.blocks = BlockConfig::B(FileSystemConfig::new(dir.join("blocks")));
             }
+        }
+
+        if self.limit.map(|limit| limit.as_u64()) == Some(0) {
+            self.limit = None;
         }
     }
 

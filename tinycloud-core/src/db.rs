@@ -7,8 +7,8 @@ use crate::models::*;
 use crate::relationships::*;
 use crate::sql_sizes::SqlSizes;
 use crate::storage::{
-    either::EitherError, Content, HashBuffer, ImmutableDeleteStore, ImmutableReadStore,
-    ImmutableStaging, ImmutableWriteStore, StorageSetup, StoreSize,
+    either::EitherError, Content, HashBuffer, ImmutableReadStore, ImmutableStaging,
+    ImmutableWriteStore, StorageSetup, StoreSize,
 };
 use crate::types::{
     AccountDelegationRecord, CapabilitiesReadParams, DelegationQuery, DelegationQueryDirection,
@@ -20,7 +20,7 @@ use sea_orm::{
     entity::prelude::*,
     error::{DbErr, RuntimeErr, SqlxError},
     query::*,
-    sea_query::OnConflict,
+    sea_query::{Alias, Expr, LikeExpr, OnConflict, Query},
     ActiveValue::Set,
     ConnectionTrait, DatabaseTransaction, IntoActiveModel, TransactionTrait,
 };
@@ -38,6 +38,10 @@ pub const HOOK_DELIVERY_STATUS_PENDING: &str = "pending";
 pub const HOOK_DELIVERY_STATUS_RETRYING: &str = "retrying";
 pub const HOOK_DELIVERY_STATUS_DELIVERED: &str = "delivered";
 pub const HOOK_DELIVERY_STATUS_DEAD_LETTER: &str = "dead_letter";
+
+type KvObjectKey = (SpaceId, Path);
+type KvObjectLock = tokio::sync::Mutex<()>;
+type KvObjectLockRegistry = Arc<tokio::sync::Mutex<HashMap<KvObjectKey, Weak<KvObjectLock>>>>;
 
 #[derive(Debug, Clone)]
 pub struct PendingWebhookDelivery {
@@ -68,6 +72,30 @@ pub struct SpaceDatabase<C, B, S> {
     encryption: Option<ColumnEncryption>,
     sql_sizes: SqlSizes,
     revocation_chain_locks: Arc<tokio::sync::Mutex<HashMap<Hash, Weak<tokio::sync::Mutex<()>>>>>,
+    kv_object_locks: KvObjectLockRegistry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvPrecondition {
+    /// The key must not have a live value.
+    DoesNotExist,
+    /// The live value must have this BLAKE3 digest.
+    Matches([u8; 32]),
+}
+
+fn kv_precondition_matches(precondition: KvPrecondition, current: Option<Hash>) -> bool {
+    match (precondition, current) {
+        (KvPrecondition::DoesNotExist, None) => true,
+        (KvPrecondition::Matches(expected), Some(actual)) => actual.as_ref() == expected,
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct KvInvokeOptions {
+    pub preconditions: HashMap<(SpaceId, Path), KvPrecondition>,
+    pub max_response_bytes: Option<u64>,
+    pub list_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -134,7 +162,7 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
 #[derive(Debug, thiserror::Error)]
 pub enum TxStoreError<B, S, K>
 where
-    B: ImmutableReadStore + ImmutableWriteStore<S> + ImmutableDeleteStore + StorageSetup,
+    B: ImmutableReadStore + ImmutableWriteStore<S> + StorageSetup,
     S: ImmutableStaging,
     S::Writable: 'static + Unpin,
     K: Secrets,
@@ -146,16 +174,20 @@ where
     #[error(transparent)]
     StoreWrite(<B as ImmutableWriteStore<S>>::Error),
     #[error(transparent)]
-    StoreDelete(<B as ImmutableDeleteStore>::Error),
-    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("Missing Input for requested action")]
     MissingInput,
+    #[error("KV precondition failed")]
+    KvPreconditionFailed,
+    #[error("conditional KV transaction conflicted; retry the request")]
+    KvSerializationConflict,
+    #[error("KV response is {size} bytes, exceeding the requested limit of {limit} bytes")]
+    KvResponseTooLarge { size: u64, limit: u64 },
 }
 
 impl<B, S, K> From<DbErr> for TxStoreError<B, S, K>
 where
-    B: ImmutableReadStore + ImmutableWriteStore<S> + ImmutableDeleteStore + StorageSetup,
+    B: ImmutableReadStore + ImmutableWriteStore<S> + StorageSetup,
     S: ImmutableStaging,
     S::Writable: 'static + Unpin,
     K: Secrets,
@@ -175,6 +207,7 @@ impl<B, K> SpaceDatabase<DatabaseConnection, B, K> {
             encryption: None,
             sql_sizes: SqlSizes::default(),
             revocation_chain_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            kv_object_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -736,6 +769,42 @@ where
         Ok(guards)
     }
 
+    async fn acquire_kv_object_guards(
+        &self,
+        keys: &[(SpaceId, Path)],
+    ) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+        let mut keys = keys.to_vec();
+        keys.sort_by(|(left_space, left_path), (right_space, right_path)| {
+            left_space
+                .to_string()
+                .cmp(&right_space.to_string())
+                .then_with(|| left_path.as_str().cmp(right_path.as_str()))
+        });
+        keys.dedup();
+
+        let locks = {
+            let mut registry = self.kv_object_locks.lock().await;
+            registry.retain(|_, lock| lock.strong_count() > 0);
+            keys.into_iter()
+                .map(|key| {
+                    if let Some(lock) = registry.get(&key).and_then(Weak::upgrade) {
+                        lock
+                    } else {
+                        let lock = Arc::new(tokio::sync::Mutex::new(()));
+                        registry.insert(key, Arc::downgrade(&lock));
+                        lock
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut guards = Vec::with_capacity(locks.len());
+        for lock in locks {
+            guards.push(lock.lock_owned().await);
+        }
+        guards
+    }
+
     async fn transact(&self, events: Vec<Event>) -> Result<TransactResult, TxError<B, K>> {
         let tx = self
             .conn
@@ -866,10 +935,25 @@ where
     pub async fn invoke<S>(
         &self,
         invocation: Invocation,
-        mut inputs: InvocationInputs<S::Writable>,
+        inputs: InvocationInputs<S::Writable>,
     ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
     where
-        B: ImmutableWriteStore<S> + ImmutableDeleteStore + ImmutableReadStore,
+        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
+        self.invoke_with_options(invocation, inputs, KvInvokeOptions::default())
+            .await
+    }
+
+    pub async fn invoke_with_options<S>(
+        &self,
+        invocation: Invocation,
+        mut inputs: InvocationInputs<S::Writable>,
+        options: KvInvokeOptions,
+    ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
+    where
+        B: ImmutableWriteStore<S> + ImmutableReadStore,
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
@@ -881,8 +965,26 @@ where
             .map(Hash::from)
             .collect();
         let _chain_guards = self.acquire_chain_guards(&roots).await?;
+        let mutation_keys = invocation
+            .0
+            .capabilities
+            .iter()
+            .filter_map(|cap| {
+                let resource = cap.resource.tinycloud_resource()?;
+                let ability =
+                    crate::policy_capability::resolve_alias(cap.ability.as_ref().as_ref());
+                if resource.service().as_str() != "kv"
+                    || !matches!(ability, "tinycloud.kv/put" | "tinycloud.kv/del")
+                {
+                    return None;
+                }
+                Some((resource.space().clone(), resource.path()?.clone()))
+            })
+            .collect::<Vec<_>>();
+        let _kv_object_guards = self.acquire_kv_object_guards(&mutation_keys).await;
         let mut stages = HashMap::new();
         let mut ops = Vec::new();
+        let mut write_hashes = HashMap::new();
         // for each capability being invoked
         for cap in invocation.0.capabilities.iter() {
             match cap.resource.tinycloud_resource().and_then(|r| {
@@ -906,6 +1008,7 @@ where
                     let value = stage.hash();
 
                     stages.insert((space.clone(), path.clone()), stage);
+                    write_hashes.insert((space.clone(), path.clone()), value);
                     // add write for tx
                     ops.push(Operation::KvWrite {
                         space: space.clone(),
@@ -926,10 +1029,27 @@ where
             }
         }
 
-        let tx = self
-            .conn
-            .begin_with_config(chain_isolation_level(&self.conn), None)
-            .await?;
+        let has_preconditions = !options.preconditions.is_empty();
+        let isolation_level = if has_preconditions {
+            conditional_kv_isolation_level(&self.conn)
+        } else {
+            chain_isolation_level(&self.conn)
+        };
+        let tx = self.conn.begin_with_config(isolation_level, None).await?;
+        let mut deleted_hashes = HashMap::new();
+        for key @ (space, path) in &mutation_keys {
+            let current = get_kv_entity(&tx, space, path)
+                .await?
+                .map(|entry| entry.value);
+            if let Some(precondition) = options.preconditions.get(key) {
+                if !kv_precondition_matches(*precondition, current) {
+                    return Err(TxStoreError::KvPreconditionFailed);
+                }
+            }
+            if let Some(hash) = current {
+                deleted_hashes.insert(key.clone(), hash);
+            }
+        }
         let caps = invocation.0.capabilities.clone();
         let invoker = invocation.0.invoker.clone();
         // Extract capabilities read params from UCAN facts field
@@ -955,7 +1075,14 @@ where
             vec![Event::Invocation(Box::new(invocation), ops)],
             self.encryption.as_ref(),
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            if has_preconditions && is_serialization_failure(&error) {
+                TxStoreError::KvSerializationConflict
+            } else {
+                TxStoreError::Tx(error)
+            }
+        })?;
 
         let mut results = Vec::new();
         // perform and record side effects
@@ -972,26 +1099,37 @@ where
             })
         }) {
             match cap {
-                (space, "kv", "tinycloud.kv/get", path) => results.push(InvocationOutcome::KvRead(
-                    get_kv(&tx, &self.storage, space, path)
-                        .await
-                        .map_err(|e| match e {
-                            EitherError::A(e) => TxStoreError::Tx(e.into()),
-                            EitherError::B(e) => TxStoreError::StoreRead(e),
-                        })?,
-                )),
+                (space, "kv", "tinycloud.kv/get", path) => {
+                    let data =
+                        get_kv(&tx, &self.storage, space, path)
+                            .await
+                            .map_err(|e| match e {
+                                EitherError::A(e) => TxStoreError::Tx(e.into()),
+                                EitherError::B(e) => TxStoreError::StoreRead(e),
+                            })?;
+                    if let (Some(limit), Some((_, _, content))) =
+                        (options.max_response_bytes, data.as_ref())
+                    {
+                        if content.len() > limit {
+                            return Err(TxStoreError::KvResponseTooLarge {
+                                size: content.len(),
+                                limit,
+                            });
+                        }
+                    }
+                    results.push(InvocationOutcome::KvRead(data));
+                }
                 (space, "kv", "tinycloud.kv/list", path) => {
-                    results.push(InvocationOutcome::KvList(list(&tx, space, path).await?))
+                    let (list, truncated) =
+                        list_bounded(&tx, space, path, options.list_limit).await?;
+                    results.push(InvocationOutcome::KvList(list, truncated))
                 }
                 (space, "kv", "tinycloud.kv/del", path) => {
-                    let kv = get_kv_entity(&tx, space, path).await?;
-                    if let Some(kv) = kv {
-                        self.storage
-                            .remove(space, &kv.value)
-                            .await
-                            .map_err(TxStoreError::StoreDelete)?;
-                    }
-                    results.push(InvocationOutcome::KvDelete)
+                    // KV deletion is logical. Blobs are content-addressed and may be
+                    // shared by live sibling keys or retained version history.
+                    results.push(InvocationOutcome::KvDelete(
+                        deleted_hashes.get(&(space.clone(), path.clone())).copied(),
+                    ))
                 }
                 (space, "kv", "tinycloud.kv/put", path) => {
                     if let Some(stage) = stages.remove(&(space.clone(), path.clone())) {
@@ -999,11 +1137,15 @@ where
                             .persist(space, stage)
                             .await
                             .map_err(TxStoreError::StoreWrite)?;
-                        results.push(InvocationOutcome::KvWrite)
+                        let hash = write_hashes
+                            .get(&(space.clone(), path.clone()))
+                            .copied()
+                            .expect("staged KV writes have a content hash");
+                        results.push(InvocationOutcome::KvWrite(hash))
                     }
                 }
                 (space, "kv", "tinycloud.kv/metadata", path) => results.push(
-                    InvocationOutcome::KvMetadata(metadata(&tx, space, path).await?),
+                    InvocationOutcome::KvMetadata(metadata_with_hash(&tx, space, path).await?),
                 ),
                 (space, "capabilities", "tinycloud.capabilities/read", path)
                     if path.as_str() == "all" =>
@@ -1047,7 +1189,13 @@ where
         }
 
         // commit tx if all side effects worked
-        tx.commit().await?;
+        tx.commit().await.map_err(|error| {
+            if has_preconditions && is_serialization_db_error(&error) {
+                TxStoreError::KvSerializationConflict
+            } else {
+                TxStoreError::Tx(error.into())
+            }
+        })?;
         Ok((commit, results))
     }
 }
@@ -1067,12 +1215,46 @@ fn chain_isolation_level<C: ConnectionTrait>(db: &C) -> Option<sea_orm::Isolatio
     }
 }
 
+fn conditional_kv_isolation_level<C: ConnectionTrait>(db: &C) -> Option<sea_orm::IsolationLevel> {
+    conditional_kv_isolation_for_backend(db.get_database_backend())
+}
+
+fn conditional_kv_isolation_for_backend(
+    backend: sea_orm::DatabaseBackend,
+) -> Option<sea_orm::IsolationLevel> {
+    match backend {
+        sea_orm::DatabaseBackend::Sqlite => None,
+        sea_orm::DatabaseBackend::Postgres | sea_orm::DatabaseBackend::MySql => {
+            Some(sea_orm::IsolationLevel::Serializable)
+        }
+    }
+}
+
+fn is_serialization_failure<S: StorageSetup, K: Secrets>(error: &TxError<S, K>) -> bool {
+    match error {
+        TxError::Db(error) | TxError::EpochInsert(error) => is_serialization_db_error(error),
+        _ => false,
+    }
+}
+
+fn is_serialization_db_error(error: &DbErr) -> bool {
+    matches!(
+        error,
+        DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(database_error)))
+        | DbErr::Query(RuntimeErr::SqlxError(SqlxError::Database(database_error)))
+            if matches!(
+                database_error.code().as_deref(),
+                Some("40001" | "40P01" | "1213" | "5" | "6" | "SQLITE_BUSY" | "SQLITE_LOCKED")
+            )
+    )
+}
+
 #[derive(Debug)]
 pub enum InvocationOutcome<R> {
-    KvList(Vec<Path>),
-    KvDelete,
-    KvMetadata(Option<Metadata>),
-    KvWrite,
+    KvList(Vec<Path>, bool),
+    KvDelete(Option<Hash>),
+    KvMetadata(Option<(Metadata, Hash)>),
+    KvWrite(Hash),
     KvBatchWrite(Vec<Path>),
     KvRead(Option<(Metadata, Hash, Content<R>)>),
     OpenSessions(HashMap<Hash, DelegationInfo>),
@@ -1539,22 +1721,122 @@ async fn list<C: ConnectionTrait>(
     space_id: &SpaceId,
     prefix: &Path,
 ) -> Result<Vec<Path>, DbErr> {
-    // get content id for key from db
-    let mut list = kv_write::Entity::find()
-        .filter(
-            Condition::all()
-                .add(kv_write::Column::Key.starts_with(prefix.as_str()))
-                .add(kv_write::Column::Space.eq(SpaceIdWrap(space_id.clone()))),
+    list_bounded(db, space_id, prefix, None)
+        .await
+        .map(|(paths, _)| paths)
+}
+
+async fn list_bounded<C: ConnectionTrait>(
+    db: &C,
+    space_id: &SpaceId,
+    prefix: &Path,
+    limit: Option<usize>,
+) -> Result<(Vec<Path>, bool), DbErr> {
+    let newer = Alias::new("newer_kv_write");
+    let newer_order = Condition::any()
+        .add(
+            Expr::col((newer.clone(), kv_write::Column::Seq))
+                .gt(Expr::col((kv_write::Entity, kv_write::Column::Seq))),
         )
-        .find_also_related(kv_delete::Entity)
-        .filter(kv_delete::Column::InvocationId.is_null())
-        .all(db)
+        .add(
+            Condition::all()
+                .add(
+                    Expr::col((newer.clone(), kv_write::Column::Seq))
+                        .equals((kv_write::Entity, kv_write::Column::Seq)),
+                )
+                .add(
+                    Expr::col((newer.clone(), kv_write::Column::Epoch))
+                        .gt(Expr::col((kv_write::Entity, kv_write::Column::Epoch))),
+                ),
+        )
+        .add(
+            Condition::all()
+                .add(
+                    Expr::col((newer.clone(), kv_write::Column::Seq))
+                        .equals((kv_write::Entity, kv_write::Column::Seq)),
+                )
+                .add(
+                    Expr::col((newer.clone(), kv_write::Column::Epoch))
+                        .equals((kv_write::Entity, kv_write::Column::Epoch)),
+                )
+                .add(
+                    Expr::col((newer.clone(), kv_write::Column::EpochSeq))
+                        .gt(Expr::col((kv_write::Entity, kv_write::Column::EpochSeq))),
+                ),
+        );
+    let newer_write = Query::select()
+        .expr(Expr::val(1))
+        .from_as(kv_write::Entity, newer.clone())
+        .cond_where(
+            Condition::all()
+                .add(
+                    Expr::col((newer.clone(), kv_write::Column::Space))
+                        .equals((kv_write::Entity, kv_write::Column::Space)),
+                )
+                .add(
+                    Expr::col((newer.clone(), kv_write::Column::Key))
+                        .equals((kv_write::Entity, kv_write::Column::Key)),
+                )
+                .add(newer_order),
+        )
+        .to_owned();
+    let escaped_prefix = prefix
+        .as_str()
+        .replace('!', "!!")
+        .replace('%', "!%")
+        .replace('_', "!_");
+    let mut query = Query::select();
+    query
+        .column((kv_write::Entity, kv_write::Column::Key))
+        .from(kv_write::Entity)
+        .left_join(
+            kv_delete::Entity,
+            Condition::all()
+                .add(
+                    Expr::col((kv_write::Entity, kv_write::Column::Space))
+                        .equals((kv_delete::Entity, kv_delete::Column::Space)),
+                )
+                .add(
+                    Expr::col((kv_write::Entity, kv_write::Column::Key))
+                        .equals((kv_delete::Entity, kv_delete::Column::Key)),
+                )
+                .add(
+                    Expr::col((kv_write::Entity, kv_write::Column::Invocation))
+                        .equals((kv_delete::Entity, kv_delete::Column::DeletedInvocationId)),
+                ),
+        )
+        .cond_where(
+            Condition::all()
+                .add(
+                    Expr::col((kv_write::Entity, kv_write::Column::Key))
+                        .like(LikeExpr::new(format!("{escaped_prefix}%")).escape('!')),
+                )
+                .add(
+                    Expr::col((kv_write::Entity, kv_write::Column::Space))
+                        .eq(SpaceIdWrap(space_id.clone())),
+                )
+                .add(Expr::col((kv_delete::Entity, kv_delete::Column::InvocationId)).is_null())
+                .add(Condition::all().not().add(Expr::exists(newer_write))),
+        )
+        .order_by((kv_write::Entity, kv_write::Column::Key), Order::Asc);
+    if let Some(limit) = limit {
+        query.limit(limit.saturating_add(1) as u64);
+    }
+    let mut list = db
+        .query_all(db.get_database_backend().build(&query))
         .await?
         .into_iter()
-        .map(|(kv, _)| kv.key.0)
-        .collect::<Vec<Path>>();
-    list.dedup();
-    Ok(list)
+        .map(|row| row.try_get::<String>("", kv_write::Column::Key.as_str()))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|key| key.parse())
+        .collect::<Result<Vec<Path>, _>>()
+        .map_err(|error| DbErr::Custom(format!("invalid persisted KV path: {error}")))?;
+    let truncated = limit.map(|limit| list.len() > limit).unwrap_or(false);
+    if let Some(limit) = limit {
+        list.truncate(limit);
+    }
+    Ok((list, truncated))
 }
 
 async fn metadata<C: ConnectionTrait>(
@@ -1563,8 +1845,18 @@ async fn metadata<C: ConnectionTrait>(
     key: &Path,
     // TODO version: Option<(i64, Hash, i64)>,
 ) -> Result<Option<Metadata>, DbErr> {
+    Ok(metadata_with_hash(db, space_id, key)
+        .await?
+        .map(|(metadata, _)| metadata))
+}
+
+async fn metadata_with_hash<C: ConnectionTrait>(
+    db: &C,
+    space_id: &SpaceId,
+    key: &Path,
+) -> Result<Option<(Metadata, Hash)>, DbErr> {
     match get_kv_entity(db, space_id, key).await? {
-        Some(entry) => Ok(Some(entry.metadata)),
+        Some(entry) => Ok(Some((entry.metadata, entry.value))),
         None => Ok(None),
     }
 }
@@ -1615,21 +1907,26 @@ async fn get_kv_entity<C: ConnectionTrait>(
     //         .await?
     //         .map(|(kv, _)| kv)
     // } else {
-    // we want to find the latest kv_write which is not deleted
-    Ok(kv_write::Entity::find()
-        .filter(
-            Condition::all()
-                .add(kv_write::Column::Key.eq(key.as_str()))
-                .add(kv_write::Column::Space.eq(SpaceIdWrap(space_id.clone()))),
-        )
-        .order_by_desc(kv_write::Column::Seq)
-        .order_by_desc(kv_write::Column::Epoch)
-        .order_by_desc(kv_write::Column::EpochSeq)
-        .find_also_related(kv_delete::Entity)
-        .filter(kv_delete::Column::InvocationId.is_null())
-        .one(db)
-        .await?
-        .map(|(kv, _)| kv))
+    // A delete tombstones the latest write. Select that write before checking
+    // its tombstone so older versions cannot reappear after deletion.
+    Ok(
+        match kv_write::Entity::find()
+            .filter(
+                Condition::all()
+                    .add(kv_write::Column::Key.eq(key.as_str()))
+                    .add(kv_write::Column::Space.eq(SpaceIdWrap(space_id.clone()))),
+            )
+            .order_by_desc(kv_write::Column::Seq)
+            .order_by_desc(kv_write::Column::Epoch)
+            .order_by_desc(kv_write::Column::EpochSeq)
+            .find_also_related(kv_delete::Entity)
+            .one(db)
+            .await?
+        {
+            Some((_, Some(_))) | None => None,
+            Some((kv, None)) => Some(kv),
+        },
+    )
 }
 
 async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
@@ -2271,6 +2568,225 @@ mod test {
     #[tokio::test]
     async fn basic() {
         let _db = get_db().await.unwrap();
+    }
+
+    #[test]
+    fn kv_preconditions_require_the_expected_object_state() {
+        let current = crate::hash::hash(b"current");
+        let other = crate::hash::hash(b"other");
+
+        assert!(kv_precondition_matches(KvPrecondition::DoesNotExist, None));
+        assert!(!kv_precondition_matches(
+            KvPrecondition::DoesNotExist,
+            Some(current)
+        ));
+        assert!(kv_precondition_matches(
+            KvPrecondition::Matches(current.as_ref().try_into().unwrap()),
+            Some(current)
+        ));
+        assert!(!kv_precondition_matches(
+            KvPrecondition::Matches(other.as_ref().try_into().unwrap()),
+            Some(current)
+        ));
+        assert!(!kv_precondition_matches(
+            KvPrecondition::Matches(current.as_ref().try_into().unwrap()),
+            None
+        ));
+    }
+
+    #[test]
+    fn conditional_kv_uses_cross_process_serializable_transactions() {
+        assert_eq!(
+            conditional_kv_isolation_for_backend(sea_orm::DatabaseBackend::Sqlite),
+            None
+        );
+        for backend in [
+            sea_orm::DatabaseBackend::Postgres,
+            sea_orm::DatabaseBackend::MySql,
+        ] {
+            assert_eq!(
+                conditional_kv_isolation_for_backend(backend),
+                Some(sea_orm::IsolationLevel::Serializable)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kv_object_guards_serialize_the_same_key() {
+        let db = get_db().await.unwrap();
+        let space = test_space_id("conditional-kv-lock");
+        let key: Path = "files/report.txt".parse().unwrap();
+        let first = db
+            .acquire_kv_object_guards(&[(space.clone(), key.clone())])
+            .await;
+
+        let contender_db = db.clone();
+        let contender_space = space.clone();
+        let contender_key = key.clone();
+        let contender = tokio::spawn(async move {
+            contender_db
+                .acquire_kv_object_guards(&[(contender_space, contender_key)])
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!contender.is_finished());
+
+        let unrelated = db
+            .acquire_kv_object_guards(&[(space, "files/other.txt".parse().unwrap())])
+            .await;
+        assert_eq!(unrelated.len(), 1);
+
+        drop(first);
+        assert_eq!(contender.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_kv_list_counts_distinct_keys_in_order() {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        let db = get_db().await.unwrap();
+        let space = test_space_id("bounded-kv-list");
+        let actor_id = "did:key:bounded-kv-list";
+        actor::ActiveModel {
+            id: Set(actor_id.to_string()),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        let shared_value = crate::hash::hash(b"shared-value");
+        for (index, key) in ["a", "a", "b", "c", "literal%key", "literalXkey"]
+            .into_iter()
+            .enumerate()
+        {
+            let invocation_id = crate::hash::hash(format!("invocation-{index}").as_bytes());
+            let epoch_id = crate::hash::hash(format!("epoch-{index}").as_bytes());
+            invocation::ActiveModel {
+                id: Set(invocation_id),
+                invoker: Set(actor_id.to_string()),
+                issued_at: Set(OffsetDateTime::now_utc()),
+                facts: Set(None),
+                serialization: Set(vec![index as u8]),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+            epoch::ActiveModel {
+                seq: Set(index as i64),
+                id: Set(epoch_id),
+                space: Set(SpaceIdWrap(space.clone())),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+            event_order::ActiveModel {
+                seq: Set(index as i64),
+                epoch: Set(epoch_id),
+                epoch_seq: Set(0),
+                event: Set(invocation_id),
+                space: Set(SpaceIdWrap(space.clone())),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+            kv_write::ActiveModel {
+                space: Set(SpaceIdWrap(space.clone())),
+                key: Set(key.parse::<Path>().unwrap().into()),
+                invocation: Set(invocation_id),
+                seq: Set(index as i64),
+                epoch: Set(epoch_id),
+                epoch_seq: Set(0),
+                value: Set(shared_value),
+                metadata: Set(Metadata(std::collections::BTreeMap::new())),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+        }
+
+        let (paths, truncated) = list_bounded(&db.conn, &space, &"".parse().unwrap(), Some(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            paths.iter().map(Path::as_str).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert!(truncated);
+
+        let (paths, truncated) = list_bounded(&db.conn, &space, &"".parse().unwrap(), Some(3))
+            .await
+            .unwrap();
+        assert_eq!(
+            paths.iter().map(Path::as_str).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        assert!(truncated);
+        assert_eq!(
+            get_kv_entity(&db.conn, &space, &"b".parse().unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            shared_value
+        );
+        assert_eq!(
+            get_kv_entity(&db.conn, &space, &"c".parse().unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .value,
+            shared_value
+        );
+
+        let (paths, truncated) =
+            list_bounded(&db.conn, &space, &"literal%".parse().unwrap(), Some(10))
+                .await
+                .unwrap();
+        assert_eq!(
+            paths.iter().map(Path::as_str).collect::<Vec<_>>(),
+            vec!["literal%key"]
+        );
+        assert!(!truncated);
+
+        let delete_invocation = crate::hash::hash(b"delete-invocation");
+        invocation::ActiveModel {
+            id: Set(delete_invocation),
+            invoker: Set(actor_id.to_string()),
+            issued_at: Set(OffsetDateTime::now_utc()),
+            facts: Set(None),
+            serialization: Set(vec![6]),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        kv_delete::ActiveModel {
+            invocation_id: Set(delete_invocation),
+            space: Set(SpaceIdWrap(space.clone())),
+            key: Set("a".parse::<Path>().unwrap().into()),
+            deleted_invocation_id: Set(crate::hash::hash(b"invocation-1")),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        assert!(get_kv_entity(&db.conn, &space, &"a".parse().unwrap())
+            .await
+            .unwrap()
+            .is_none());
+        let (paths, truncated) = list_bounded(&db.conn, &space, &"".parse().unwrap(), Some(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            paths.iter().map(Path::as_str).collect::<Vec<_>>(),
+            vec!["b", "c", "literal%key", "literalXkey"]
+        );
+        assert!(!truncated);
     }
 
     #[tokio::test]

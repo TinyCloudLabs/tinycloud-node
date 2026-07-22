@@ -338,7 +338,7 @@ mod test {
     use super::*;
     use futures::io::AsyncReadExt;
 
-    #[test]
+    #[tokio::test]
     async fn test_file_system_store() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = FileSystemConfig::new(dir.path());

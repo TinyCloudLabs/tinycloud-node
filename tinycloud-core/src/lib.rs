@@ -22,8 +22,8 @@ pub mod util;
 pub mod write_hooks;
 
 pub use db::{
-    Commit, DelegationStatus, InvocationOutcome, SpaceDatabase, TransactResult, TxError,
-    TxStoreError,
+    Commit, DelegationStatus, InvocationOutcome, KvInvokeOptions, KvPrecondition, SpaceDatabase,
+    TransactResult, TxError, TxStoreError,
 };
 pub use encryption::ColumnEncryption;
 pub use libp2p;

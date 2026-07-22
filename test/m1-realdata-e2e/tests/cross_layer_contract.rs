@@ -230,7 +230,9 @@ secret = "{}"
     let figment = rocket::Config::figment()
         .merge(Serialized::defaults(tinycloud::config::Config::default()))
         .merge(Toml::string(&overlay));
-    let rocket = tinycloud::app(&figment).await?;
+    let mut tinycloud_config = figment.extract::<tinycloud::config::Config>()?;
+    tinycloud_config.storage.resolve();
+    let rocket = tinycloud::app(&figment, &tinycloud_config, None).await?;
     let client = Client::tracked(rocket).await?;
     let sql_service = client
         .rocket()
@@ -459,6 +461,8 @@ secret = "{}"
             SqlRequest::Query {
                 sql: "SELECT * FROM conversation".to_string(),
                 params: vec![],
+                max_rows: None,
+                max_bytes: None,
             },
             "sql-raw-query-blocked",
         ),
