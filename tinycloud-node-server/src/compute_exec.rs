@@ -1050,16 +1050,30 @@ fn run_blocking(
 }
 
 /// §8 option 2: write the JSON result to a KV path under the routine's own
-/// `kv/put` grant (reusing the same mediated internal-invocation path). A
-/// missing grant is a hard error here (the caller asked for KV output but
-/// the routine cannot write it).
+/// `kv/put` grant. Judge finding (§9.1.1 "journal every host call"): this
+/// MUST go through `dispatch` -- the same entry point every guest-initiated
+/// host call uses -- so the write is journaled into the manifest exactly
+/// like any other call, instead of calling `kv_op` directly and dropping the
+/// journal entry on the floor. A missing grant is a hard error here (the
+/// caller asked for KV output but the routine cannot write it) -- the
+/// manifest entry (journaled with `granted: false`) still records the
+/// attempt before the error is raised.
 fn write_output(host: &mut HostState, path: &str, result: &Value) -> Result<(), ComputeExecError> {
-    let req = json!({ "key": path, "value": serde_json::to_string(result).unwrap_or_default() });
-    let (_res, _ability, _dest, granted, _resp) =
-        host.kv_op(Import::StoragePut, &req, "tinycloud.kv/put");
+    let req_bytes = serde_json::to_vec(&json!({
+        "key": path,
+        "value": serde_json::to_string(result).unwrap_or_default()
+    }))
+    .expect("output_ref request serializes");
+    host.dispatch(Import::StoragePut, &req_bytes);
     if let Some(fatal) = host.fatal.clone() {
         return Err(ComputeExecError::Internal(fatal));
     }
+    let granted = host
+        .manifest
+        .calls
+        .last()
+        .map(|entry| entry.granted)
+        .unwrap_or(false);
     if !granted {
         return Err(ComputeExecError::Backend(format!(
             "output_ref {path} is not covered by the routine's kv/put grant"

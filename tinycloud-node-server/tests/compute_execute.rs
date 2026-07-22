@@ -816,6 +816,94 @@ async fn rotation_tripwire_distinct_error() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// output_ref's KV write must be journaled (§9.1.1 "journal every host
+// call"): `write_output` bypassed `dispatch` and dropped the manifest entry
+// on the floor even though the op itself was actually performed.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn output_ref_write_is_journaled_in_manifest() -> Result<()> {
+    let (rocket, conn, tempdir) = boot().await?;
+    let owner = make_owner("output-ref")?;
+    seed_space_and_actors(&conn, &owner.space, &[]).await?;
+    ensure_space_storage(&tempdir, &owner.space)?;
+    let client = Client::tracked(rocket).await?;
+
+    seed_kv(&client, &owner, "in/x", b"42", "urn:uuid:seed-in").await?;
+
+    deploy_fixture(
+        &client,
+        &owner,
+        "outref",
+        &load_fixture("probe_get.wat"),
+        &[
+            GrantSpec {
+                service: "kv",
+                path: "in/",
+                ability: "tinycloud.kv/get",
+            },
+            GrantSpec {
+                service: "kv",
+                path: "out/",
+                ability: "tinycloud.kv/put",
+            },
+        ],
+        "outref",
+    )
+    .await?;
+
+    let auth = owner_compute_invocation(
+        &owner,
+        "outref",
+        "tinycloud.compute/execute",
+        "urn:uuid:outref-exec",
+    )?;
+    let (status, body) = post_invoke(
+        &client,
+        &auth,
+        execute_body_with_output_ref("outref", serde_json::json!({}), "out/result"),
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "execute with output_ref must 200: {body}");
+    let ack: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(
+        ack["output_destination"], "out/result",
+        "ack must report the output_ref destination"
+    );
+
+    let calls = ack["manifest"]["calls"].as_array().expect("calls array");
+    assert_eq!(
+        calls.len(),
+        2,
+        "manifest must journal BOTH the guest's own storage_get AND the \
+         output_ref's storage_put: {calls:?}"
+    );
+    let output_write = &calls[1];
+    assert_eq!(output_write["ability"], "tinycloud.kv/put");
+    assert_eq!(
+        output_write["resource"],
+        format!("{}/kv/out/result", owner.space)
+    );
+    assert_eq!(output_write["destination"], "out/result");
+    assert_eq!(output_write["granted"], true);
+
+    // The write actually landed: read it back as the owner.
+    let read_auth = owner_kv_invocation(
+        &owner,
+        "out/result",
+        "tinycloud.kv/get",
+        "urn:uuid:read-outref",
+    )?;
+    let (read_status, _) = post_invoke(&client, &read_auth, String::new()).await;
+    assert_eq!(
+        read_status,
+        Status::Ok,
+        "the journaled output_ref write must have actually happened"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Fail-closed on a malformed chain-derived `computeCaveats` (both judges,
 // security): the old `if let Ok(..)` silently fell through to the
 // unconstrained case on a parse failure -- a fail-open. A malformed

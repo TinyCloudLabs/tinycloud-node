@@ -452,6 +452,23 @@ pub fn execute_body(function: &str, input: serde_json::Value) -> String {
     .to_string()
 }
 
+/// Build an `execute` request body with an `output_ref` (§8 option 2): the
+/// result is written to this KV path under the routine's own grant instead
+/// of returned inline.
+pub fn execute_body_with_output_ref(
+    function: &str,
+    input: serde_json::Value,
+    output_ref: &str,
+) -> String {
+    serde_json::json!({
+        "action": "execute",
+        "function": function,
+        "input": input,
+        "output_ref": output_ref,
+    })
+    .to_string()
+}
+
 /// Sign a compute/execute invocation for `function`, optionally echoing a
 /// `computeCaveats` nota-bene (invoker-side echo, §6.3) and optionally citing
 /// a parent delegation CID (for a holder delegated compute/execute).
