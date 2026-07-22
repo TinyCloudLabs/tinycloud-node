@@ -205,7 +205,7 @@ mod tests {
     // (staging measured at 18-23s end-to-end) without falsely timing out,
     // while claim/delete stay on the tighter client default since they're
     // plain key-value writes against tinycloud.link.
-    #[test]
+    #[::core::prelude::v1::test]
     fn cert_request_timeout_has_headroom_over_measured_acme_latency() {
         let measured_worst_case_acme_latency = Duration::from_secs(23);
         assert!(CERT_REQUEST_TIMEOUT > measured_worst_case_acme_latency);

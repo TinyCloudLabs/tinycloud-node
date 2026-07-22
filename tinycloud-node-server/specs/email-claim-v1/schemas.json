@@ -1,0 +1,1717 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://share.tinycloud.xyz/specs/email-claim-v1/schemas.json",
+  "title": "TinyCloud exact-email claim v1 strict schemas",
+  "$defs": {
+    "b64": {
+      "x-base64url": true,
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 87384,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "b64_16": {
+      "x-base64url": true,
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{21}[AQgw]$"
+    },
+    "b64_32": {
+      "x-base64url": true,
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
+    },
+    "b64_64": {
+      "x-base64url": true,
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{85}[AQgw]$"
+    },
+    "digest": { "$ref": "#/$defs/b64_32" },
+    "time": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$"
+    },
+    "origin": {
+      "type": "string",
+      "pattern": "^https://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*(?::[1-9][0-9]{0,4})?$"
+    },
+    "did": {
+      "type": "string",
+      "pattern": "^did:(?:web:[A-Za-z0-9.:%_-]+|pkh:[A-Za-z0-9:._-]+|key:z[1-9A-HJ-NP-Za-km-z]+)$"
+    },
+    "didKey": {
+      "type": "string",
+      "pattern": "^did:key:z[1-9A-HJ-NP-Za-km-z]+$"
+    },
+    "kid": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 256,
+      "pattern": "^did:(?:web:[A-Za-z0-9.:%_-]+|key:z[1-9A-HJ-NP-Za-km-z]+)#[^#\\s]+$"
+    },
+    "email": {
+      "type": "string",
+      "pattern": "^(?=[\\x00-\\x7F]{3,254}$)(?=[^@]{1,64}@[^@]{1,253}$)[A-Za-z0-9!#$%&'*+\\-/=?^_`{|}~]+(?:\\.[A-Za-z0-9!#$%&'*+\\-/=?^_`{|}~]+)*@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
+    },
+    "documentName": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^\\u0000-\\u001F\\u007F]+$",
+      "x-utf8-max-bytes": 200
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!/)(?!.*//)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*[\\u0000-\\u001F\\u007F\\\\?#])[^/]+(?:/[^/]+)*$"
+    },
+    "jsonValue": {
+      "oneOf": [
+        { "type": "null" },
+        { "type": "boolean" },
+        { "type": "string" },
+        {
+          "type": "integer",
+          "minimum": -9007199254740991,
+          "maximum": 9007199254740991
+        },
+        { "type": "array", "items": { "$ref": "#/$defs/jsonValue" } },
+        {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/jsonValue" }
+        }
+      ]
+    },
+    "sqlArgument": {
+      "type": "integer",
+      "minimum": -9007199254740991,
+      "maximum": 9007199254740991,
+      "x-safe-json-integer": true,
+      "description": "A flat SQL v1 argument value: a safe JSON integer, never fractional, string-valued, or negative zero."
+    },
+    "proof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alg", "kid", "signature"],
+      "properties": {
+        "alg": { "const": "EdDSA" },
+        "kid": { "$ref": "#/$defs/kid" },
+        "signature": { "$ref": "#/$defs/b64_64" }
+      }
+    },
+    "sourceKv": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "space", "path", "action"],
+      "properties": {
+        "kind": { "const": "kv" },
+        "space": { "$ref": "#/$defs/did" },
+        "path": { "$ref": "#/$defs/path" },
+        "action": { "const": "tinycloud.kv/get" }
+      }
+    },
+    "sourceSql": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "space",
+        "database",
+        "path",
+        "statement",
+        "arguments",
+        "argumentsDigest",
+        "action"
+      ],
+      "properties": {
+        "kind": { "const": "sql" },
+        "space": { "$ref": "#/$defs/did" },
+        "database": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "path": { "$ref": "#/$defs/path" },
+        "statement": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$"
+        },
+        "arguments": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/sqlArgument" },
+          "maxProperties": 32
+        },
+        "argumentsDigest": { "$ref": "#/$defs/digest" },
+        "action": { "const": "tinycloud.sql/read" }
+      }
+    },
+    "contentSource": {
+      "oneOf": [{ "$ref": "#/$defs/sourceKv" }, { "$ref": "#/$defs/sourceSql" }]
+    },
+    "cid": { "type": "string", "pattern": "^bafkrei[a-z2-7]{52}$" },
+    "shareUrl": {
+      "type": "string",
+      "pattern": "^https://share\\.tinycloud\\.xyz/s/bafkrei[a-z2-7]{52}#k=[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
+      "x-share-url": true
+    },
+    "shareId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._~-]+$"
+    },
+    "authorizationTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "policyCid", "policyBytes"],
+      "properties": {
+        "kind": { "const": "policy" },
+        "policyCid": { "$ref": "#/$defs/cid" },
+        "policyBytes": { "$ref": "#/$defs/b64" }
+      }
+    },
+    "envelopeTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["origin", "nodeAudience", "spaceId", "resource"],
+      "properties": {
+        "origin": { "$ref": "#/$defs/origin" },
+        "nodeAudience": { "$ref": "#/$defs/did" },
+        "spaceId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[^/\\\\?#\\u0000-\\u001F\\u007F]+$"
+        },
+        "resource": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "path"],
+          "properties": {
+            "kind": { "const": "exact" },
+            "path": { "$ref": "#/$defs/path" }
+          }
+        }
+      }
+    },
+    "display": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "senderName": { "type": "string", "maxLength": 200 },
+        "filename": { "type": "string", "maxLength": 200 },
+        "recipientHint": { "type": "string", "maxLength": 200 },
+        "mode": { "enum": ["document", "source", "folder"] }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["signerDid", "algorithm", "value"],
+      "properties": {
+        "signerDid": { "$ref": "#/$defs/didKey" },
+        "algorithm": { "const": "Ed25519" },
+        "value": { "$ref": "#/$defs/b64_64" }
+      }
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error"],
+      "properties": {
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code"],
+          "properties": {
+            "code": {
+              "enum": [
+                "invalid_or_expired_claim",
+                "claim_already_used",
+                "invitation_authorization_invalid",
+                "untrusted_node",
+                "invalid_content_source",
+                "invalid_holder_proof",
+                "invalid_credential_profile",
+                "policy_denied",
+                "nonce_already_used",
+                "read_denied",
+                "capability_unavailable"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "failure": { "$ref": "#/$defs/error" },
+    "rejectionStage": {
+      "type": "string",
+      "enum": [
+        "contract-validation",
+        "share-url-lexical",
+        "share-url-scheme",
+        "share-url-origin",
+        "share-url-port",
+        "share-url-path",
+        "share-url-query",
+        "share-url-fragment",
+        "share-url-fragment-encoding",
+        "share-url-key",
+        "scanner-fragment-lexical",
+        "scanner-fragment-scheme",
+        "scanner-fragment-origin",
+        "scanner-fragment-path",
+        "scanner-fragment-query",
+        "scanner-fragment-fields",
+        "scanner-fragment-encoding",
+        "scanner-fragment-material",
+        "document-name-bytes",
+        "credential-time",
+        "issuer-trust",
+        "issuer-key",
+        "credential-vct",
+        "credential-holder",
+        "credential-scope",
+        "cross-artifact-holder",
+        "node-enrollment",
+        "node-authority",
+        "node-key-retirement",
+        "node-key-rotation",
+        "signature-encoding",
+        "jcs",
+        "encoding"
+      ]
+    },
+    "stateCommand": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "operands"],
+          "properties": {
+            "name": { "const": "create_invitation" },
+            "operands": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["version", "outboxKey", "claimMaterial"],
+              "properties": {
+                "version": { "const": 1 },
+                "outboxKey": { "const": "invite:create:auth-kv-001" },
+                "claimMaterial": { "const": "encrypted" }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "operands"],
+          "properties": {
+            "name": { "const": "provider_accept" },
+            "operands": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["version", "claimMaterialAfter"],
+              "properties": {
+                "version": { "const": 1 },
+                "claimMaterialAfter": { "const": "deleted" }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "operands"],
+          "properties": {
+            "name": { "const": "invalidate_old_version" },
+            "operands": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["version", "onlyAfter"],
+              "properties": {
+                "version": { "const": 1 },
+                "onlyAfter": { "const": "provider_acceptance" }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "operands"],
+          "properties": {
+            "name": { "const": "prepare_resend" },
+            "operands": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["fromVersion", "toVersion", "replacementMaterial"],
+              "properties": {
+                "fromVersion": { "const": 1 },
+                "toVersion": { "const": 2 },
+                "replacementMaterial": { "const": "encrypted" }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "operands"],
+          "properties": {
+            "name": { "const": "provider_reject" },
+            "operands": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "pendingVersion",
+                "restoreVersion",
+                "replacementMaterialAfter"
+              ],
+              "properties": {
+                "pendingVersion": { "const": 2 },
+                "restoreVersion": { "const": 1 },
+                "replacementMaterialAfter": { "const": "discarded" }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "operands"],
+          "properties": {
+            "name": { "const": "provider_accept_then_crash" },
+            "operands": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["version", "idempotencyKey", "sendCount"],
+              "properties": {
+                "version": { "const": 2 },
+                "idempotencyKey": {
+                  "const": "invite:resend:invitation-001:v2"
+                },
+                "sendCount": { "const": 1 }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "operands"],
+          "properties": {
+            "name": { "const": "reconcile_provider_acceptance" },
+            "operands": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "version",
+                "idempotencyKey",
+                "sendCount",
+                "retireVersion"
+              ],
+              "properties": {
+                "version": { "const": 2 },
+                "idempotencyKey": {
+                  "const": "invite:resend:invitation-001:v2"
+                },
+                "sendCount": { "const": 1 },
+                "retireVersion": { "const": 1 }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "operands"],
+          "properties": {
+            "name": { "const": "resolve_issuance" },
+            "operands": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["redemptionId", "outcome", "result", "seedAfter"],
+              "properties": {
+                "redemptionId": {
+                  "enum": ["redemption-001", "redemption-002"]
+                },
+                "outcome": { "enum": ["success", "failure"] },
+                "result": { "enum": ["persisted", "terminal-error"] },
+                "seedAfter": { "const": "deleted" }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "operands"],
+          "properties": {
+            "name": { "const": "atomic_write" },
+            "operands": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["writes", "requireAtomic"],
+              "properties": {
+                "writes": { "const": ["result", "consumed"] },
+                "requireAtomic": { "const": true }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "operands"],
+          "properties": {
+            "name": { "const": "cleanup_seed" },
+            "operands": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["pendingSeedAction", "requiresDurableCompletion"],
+              "properties": {
+                "pendingSeedAction": { "const": "refuse" },
+                "requiresDurableCompletion": { "const": true }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "operands"],
+          "properties": {
+            "name": { "const": "redeem_if_active" },
+            "operands": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["redemptionId", "attempts", "result"],
+              "properties": {
+                "redemptionId": {
+                  "enum": ["redemption-001", "redemption-002"]
+                },
+                "attempts": { "enum": [1, 20] },
+                "result": { "enum": ["same-result", "different-result"] },
+                "cachedOutcome": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["status", "result"],
+                  "properties": {
+                    "status": { "const": "issued" },
+                    "result": { "type": "string", "minLength": 1 }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "operands"],
+          "properties": {
+            "name": { "const": "wrong_otp_attempts" },
+            "operands": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["attempts", "lockAt", "invalidMagicAttempts"],
+              "properties": {
+                "attempts": { "const": 5 },
+                "lockAt": { "const": 5 },
+                "invalidMagicAttempts": { "const": 0 }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "operands"],
+          "properties": {
+            "name": { "const": "consume_nonce" },
+            "operands": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["requiredState"],
+              "properties": { "requiredState": { "const": "VERIFYING" } }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "operands"],
+          "properties": {
+            "name": { "const": "reserve_jti" },
+            "operands": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["jti", "digest"],
+              "properties": {
+                "jti": { "const": "authorization-jti-001" },
+                "digest": { "const": "digest-b" }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "operands"],
+          "properties": {
+            "name": { "const": "scanner_get" },
+            "operands": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["method", "mutate"],
+              "properties": {
+                "method": { "const": "GET" },
+                "mutate": { "const": false }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "stateRows": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "invitation": { "type": "string" },
+        "outbox": { "type": ["string", "null"] },
+        "claimMaterial": { "type": "string" },
+        "providerAccepted": { "type": "boolean" },
+        "activeVersion": { "type": "integer" },
+        "pendingVersion": { "type": ["integer", "null"] },
+        "oldSecret": { "type": "string" },
+        "replacementMaterial": { "type": "string" },
+        "crashObserved": { "type": "boolean" },
+        "providerSendCount": { "type": "integer" },
+        "seed": { "type": "string" },
+        "result": { "type": ["string", "null"] },
+        "consumed": { "type": "boolean" },
+        "redemptionId": { "type": "string" },
+        "issuanceCount": { "type": "integer" },
+        "otpAttempts": { "type": "integer" },
+        "invalidMagicOtpAttempts": { "type": "integer" },
+        "nonce": { "type": "string" },
+        "jti": { "type": "string" },
+        "digest": { "type": "string" }
+      }
+    },
+    "operationProgramRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "operation", "pre", "commands", "expected"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "operation": {
+          "enum": ["transaction", "crash", "retry", "reject", "read-only"]
+        },
+        "pre": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["durableRows"],
+          "properties": { "durableRows": { "$ref": "#/$defs/stateRows" } }
+        },
+        "commands": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/stateCommand" }
+        },
+        "expected": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["durableRows"],
+          "properties": { "durableRows": { "$ref": "#/$defs/stateRows" } }
+        }
+      }
+    },
+    "negativeCase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "target",
+        "mutation",
+        "mutationData",
+        "appliesTo",
+        "expected",
+        "rejectionStage"
+      ],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "kind": { "type": "string", "minLength": 1 },
+        "target": { "type": "string", "minLength": 1 },
+        "mutation": { "type": "string", "minLength": 1 },
+        "mutationData": { "type": "object" },
+        "appliesTo": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "enum": ["kv", "sql"] }
+        },
+        "expected": { "const": "reject" },
+        "rejectionStage": { "$ref": "#/$defs/rejectionStage" }
+      }
+    }
+  },
+  "schemas": {
+    "authorityMaterial": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "version",
+        "handle",
+        "policyOwnerDid",
+        "senderDid",
+        "relationship",
+        "mapping",
+        "policyAuthorityBytes",
+        "policyAuthorityCid",
+        "policyEnforcementBytes",
+        "policyEnforcementCid",
+        "statusObservations",
+        "enrollment",
+        "attestation"
+      ],
+      "properties": {
+        "type": { "const": "TinyCloudShareAuthorityMaterial" },
+        "version": { "const": 1 },
+        "handle": { "type": "string", "pattern": "^amh_(?:kv|sql)_001$" },
+        "policyOwnerDid": { "type": "string", "pattern": "^did:pkh:" },
+        "senderDid": { "$ref": "#/$defs/didKey" },
+        "relationship": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["policyOwnerDid", "senderDid", "authenticated"],
+          "properties": {
+            "policyOwnerDid": { "type": "string" },
+            "senderDid": { "$ref": "#/$defs/didKey" },
+            "authenticated": { "const": true }
+          }
+        },
+        "mapping": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "sharePolicyCid",
+            "shareDelegationCid",
+            "policyAuthorityCid",
+            "policyEnforcementCid"
+          ],
+          "properties": {
+            "sharePolicyCid": { "$ref": "#/$defs/cid" },
+            "shareDelegationCid": { "$ref": "#/$defs/cid" },
+            "policyAuthorityCid": { "type": "string", "pattern": "^bafkr4i" },
+            "policyEnforcementCid": { "type": "string", "pattern": "^bafkr4i" }
+          }
+        },
+        "policyAuthorityBytes": { "$ref": "#/$defs/b64" },
+        "policyAuthorityCid": { "type": "string", "pattern": "^bafkr4i" },
+        "policyEnforcementBytes": { "$ref": "#/$defs/b64" },
+        "policyEnforcementCid": { "type": "string", "pattern": "^bafkr4i" },
+        "statusObservations": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "type",
+              "version",
+              "parentCid",
+              "state",
+              "sequence",
+              "checkedAt",
+              "freshUntil",
+              "revokedAt",
+              "signerKid",
+              "signerVersion",
+              "signature"
+            ],
+            "properties": {
+              "type": { "const": "TinyCloudShareAuthorityStatusObservation" },
+              "version": { "const": 1 },
+              "parentCid": { "type": "string", "pattern": "^bafkr4i" },
+              "state": { "enum": ["active", "revoked"] },
+              "sequence": { "type": "integer", "minimum": 0 },
+              "checkedAt": { "$ref": "#/$defs/time" },
+              "freshUntil": { "$ref": "#/$defs/time" },
+              "revokedAt": {},
+              "signerKid": { "type": "string", "minLength": 1 },
+              "signerVersion": { "type": "integer", "minimum": 1 },
+              "signature": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["alg", "kid", "value"],
+                "properties": { "alg": { "const": "EdDSA" }, "kid": { "$ref": "#/$defs/kid" }, "value": { "$ref": "#/$defs/b64_64" } }
+              }
+            }
+          }
+        },
+        "enrollment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["targetOrigin", "nodeAudience", "invitationKid", "invitationPublicKey", "keyVersion", "enabled"],
+          "properties": {
+            "targetOrigin": { "$ref": "#/$defs/origin" }, "nodeAudience": { "$ref": "#/$defs/did" },
+            "invitationKid": { "type": "string" }, "invitationPublicKey": { "$ref": "#/$defs/b64_32" },
+            "keyVersion": { "type": "integer", "minimum": 1 }, "enabled": { "const": true }
+          }
+        },
+        "attestation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type", "version", "targetOrigin", "nodeAudience", "enforcerDid", "enforcerKid", "publicKey", "keyVersion", "localSignerDid", "localSignerKid", "measurement", "measurementDigest", "expiresAt", "enrollmentDigest", "signature"
+          ],
+          "properties": {
+            "type": { "const": "TinyCloudShareEnrollmentRuntimeAttestation" }, "version": { "const": 1 },
+            "targetOrigin": { "$ref": "#/$defs/origin" }, "nodeAudience": { "$ref": "#/$defs/did" }, "enforcerDid": { "$ref": "#/$defs/didKey" },
+            "enforcerKid": { "$ref": "#/$defs/kid" }, "publicKey": { "$ref": "#/$defs/b64_32" }, "keyVersion": { "type": "integer", "minimum": 1 },
+            "localSignerDid": { "$ref": "#/$defs/didKey" }, "localSignerKid": { "$ref": "#/$defs/kid" }, "measurement": { "type": "string" },
+            "measurementDigest": { "$ref": "#/$defs/digest" }, "expiresAt": { "$ref": "#/$defs/time" }, "enrollmentDigest": { "$ref": "#/$defs/digest" },
+            "signature": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["alg", "kid", "value"],
+              "properties": { "alg": { "const": "EdDSA" }, "kid": { "$ref": "#/$defs/kid" }, "value": { "$ref": "#/$defs/b64_64" } }
+            }
+          }
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "version",
+        "recipientEmail",
+        "contentSource",
+        "contentSourceDigest",
+        "action",
+        "resource",
+        "expiresAt",
+        "issuerDid"
+      ],
+      "properties": {
+        "type": { "const": "TinyCloudSharePolicy" },
+        "version": { "const": 1 },
+        "recipientEmail": { "$ref": "#/$defs/email" },
+        "contentSource": { "$ref": "#/$defs/contentSource" },
+        "contentSourceDigest": { "$ref": "#/$defs/digest" },
+        "action": { "enum": ["tinycloud.kv/get", "tinycloud.sql/read"] },
+        "resource": { "$ref": "#/$defs/path" },
+        "expiresAt": { "$ref": "#/$defs/time" },
+        "issuerDid": { "$ref": "#/$defs/did" }
+      }
+    },
+    "envelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "shareId",
+        "delegation",
+        "authorizationTarget",
+        "target",
+        "display",
+        "expiry"
+      ],
+      "properties": {
+        "version": { "const": 1 },
+        "shareId": { "$ref": "#/$defs/shareId" },
+        "delegation": { "type": "string", "minLength": 1, "maxLength": 65536 },
+        "authorizationTarget": { "$ref": "#/$defs/authorizationTarget" },
+        "target": { "$ref": "#/$defs/envelopeTarget" },
+        "display": { "$ref": "#/$defs/display" },
+        "expiry": { "$ref": "#/$defs/time" },
+        "content": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cid", "key"],
+          "properties": {
+            "cid": { "$ref": "#/$defs/cid" },
+            "key": { "$ref": "#/$defs/b64_32" }
+          }
+        },
+        "signature": { "$ref": "#/$defs/signature" }
+      }
+    },
+    "envelopeSigned": {
+      "allOf": [
+        { "$ref": "#/schemas/envelope" },
+        { "type": "object", "required": ["signature"] }
+      ]
+    },
+    "inviteAuthorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "version",
+        "jti",
+        "senderDid",
+        "shareCid",
+        "shareId",
+        "policyCid",
+        "delegationCid",
+        "authorityMaterialHandle",
+        "authorityMaterialDigest",
+        "recipientEmail",
+        "targetOrigin",
+        "nodeAudience",
+        "returnOrigin",
+        "documentName",
+        "senderTrust",
+        "contentSource",
+        "contentSourceDigest",
+        "shareExpiresAt",
+        "issuedAt",
+        "expiresAt",
+        "reportAbuseToken"
+      ],
+      "properties": {
+        "type": { "const": "TinyCloudShareInviteAuthorization" },
+        "version": { "const": 1 },
+        "jti": { "$ref": "#/$defs/b64_16" },
+        "senderDid": { "$ref": "#/$defs/did" },
+        "shareCid": { "$ref": "#/$defs/cid" },
+        "shareId": { "$ref": "#/$defs/shareId" },
+        "policyCid": { "$ref": "#/$defs/cid" },
+        "delegationCid": { "$ref": "#/$defs/cid" },
+        "authorityMaterialHandle": {
+          "type": "string",
+          "pattern": "^amh_(?:kv|sql)_001$"
+        },
+        "authorityMaterialDigest": { "$ref": "#/$defs/digest" },
+        "recipientEmail": { "$ref": "#/$defs/email" },
+        "targetOrigin": { "$ref": "#/$defs/origin" },
+        "nodeAudience": { "$ref": "#/$defs/did" },
+        "returnOrigin": { "const": "https://share.tinycloud.xyz" },
+        "documentName": { "$ref": "#/$defs/documentName" },
+        "senderTrust": { "enum": ["verified", "unverified"] },
+        "contentSource": { "$ref": "#/$defs/contentSource" },
+        "contentSourceDigest": { "$ref": "#/$defs/digest" },
+        "shareExpiresAt": { "$ref": "#/$defs/time" },
+        "issuedAt": { "$ref": "#/$defs/time" },
+        "expiresAt": { "$ref": "#/$defs/time" },
+        "reportAbuseToken": { "$ref": "#/$defs/b64_16" }
+      }
+    },
+    "holderBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "version",
+        "redemptionId",
+        "invitationId",
+        "claimNonce",
+        "shareCid",
+        "shareId",
+        "policyCid",
+        "delegationCid",
+        "authorityMaterialHandle",
+        "authorityMaterialDigest",
+        "contentSource",
+        "contentSourceDigest",
+        "emailHash",
+        "holderDid",
+        "targetOrigin",
+        "nodeAudience",
+        "requestOrigin",
+        "issuedAt",
+        "expiresAt",
+        "jti"
+      ],
+      "properties": {
+        "type": { "const": "TinyCloudEmailClaimHolderBinding" },
+        "version": { "const": 1 },
+        "redemptionId": { "$ref": "#/$defs/b64_16" },
+        "invitationId": { "$ref": "#/$defs/b64_16" },
+        "claimNonce": { "$ref": "#/$defs/b64_32" },
+        "shareCid": { "$ref": "#/$defs/cid" },
+        "shareId": { "$ref": "#/$defs/shareId" },
+        "policyCid": { "$ref": "#/$defs/cid" },
+        "delegationCid": { "$ref": "#/$defs/cid" },
+        "authorityMaterialHandle": {
+          "type": "string",
+          "pattern": "^amh_(?:kv|sql)_001$"
+        },
+        "authorityMaterialDigest": { "$ref": "#/$defs/digest" },
+        "contentSource": { "$ref": "#/$defs/contentSource" },
+        "contentSourceDigest": { "$ref": "#/$defs/digest" },
+        "emailHash": { "$ref": "#/$defs/digest" },
+        "holderDid": { "$ref": "#/$defs/didKey" },
+        "targetOrigin": { "$ref": "#/$defs/origin" },
+        "nodeAudience": { "$ref": "#/$defs/did" },
+        "requestOrigin": { "const": "https://share.tinycloud.xyz" },
+        "issuedAt": { "$ref": "#/$defs/time" },
+        "expiresAt": { "$ref": "#/$defs/time" },
+        "jti": { "$ref": "#/$defs/b64_16" }
+      }
+    },
+    "policyChallenge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "version",
+        "challengeId",
+        "nonce",
+        "shareCid",
+        "shareId",
+        "delegationCid",
+        "policyCid",
+        "authorityMaterialHandle",
+        "authorityMaterialDigest",
+        "contentSource",
+        "contentSourceDigest",
+        "holderDid",
+        "targetOrigin",
+        "nodeAudience",
+        "action",
+        "resource",
+        "requestBodyDigest",
+        "issuedAt",
+        "expiresAt"
+      ],
+      "properties": {
+        "type": { "const": "TinyCloudSharePolicyChallenge" },
+        "version": { "const": 1 },
+        "challengeId": { "$ref": "#/$defs/b64_32" },
+        "nonce": { "$ref": "#/$defs/b64_32" },
+        "shareCid": { "$ref": "#/$defs/cid" },
+        "shareId": { "$ref": "#/$defs/shareId" },
+        "delegationCid": { "$ref": "#/$defs/cid" },
+        "policyCid": { "$ref": "#/$defs/cid" },
+        "authorityMaterialHandle": {
+          "type": "string",
+          "pattern": "^amh_(?:kv|sql)_001$"
+        },
+        "authorityMaterialDigest": { "$ref": "#/$defs/digest" },
+        "contentSource": { "$ref": "#/$defs/contentSource" },
+        "contentSourceDigest": { "$ref": "#/$defs/digest" },
+        "holderDid": { "$ref": "#/$defs/didKey" },
+        "targetOrigin": { "$ref": "#/$defs/origin" },
+        "nodeAudience": { "$ref": "#/$defs/did" },
+        "action": { "enum": ["tinycloud.kv/get", "tinycloud.sql/read"] },
+        "resource": { "$ref": "#/$defs/path" },
+        "requestBodyDigest": { "$ref": "#/$defs/digest" },
+        "issuedAt": { "$ref": "#/$defs/time" },
+        "expiresAt": { "$ref": "#/$defs/time" }
+      }
+    },
+    "policyPresentation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "version",
+        "challengeId",
+        "nonce",
+        "shareCid",
+        "shareId",
+        "delegationCid",
+        "policyCid",
+        "authorityMaterialHandle",
+        "authorityMaterialDigest",
+        "contentSource",
+        "contentSourceDigest",
+        "holderDid",
+        "targetOrigin",
+        "nodeAudience",
+        "credentialDigest",
+        "action",
+        "resource",
+        "requestBodyDigest",
+        "issuedAt",
+        "expiresAt",
+        "jti"
+      ],
+      "properties": {
+        "type": { "const": "TinyCloudSharePolicyPresentation" },
+        "version": { "const": 1 },
+        "challengeId": { "$ref": "#/$defs/b64_32" },
+        "nonce": { "$ref": "#/$defs/b64_32" },
+        "shareCid": { "$ref": "#/$defs/cid" },
+        "shareId": { "$ref": "#/$defs/shareId" },
+        "delegationCid": { "$ref": "#/$defs/cid" },
+        "policyCid": { "$ref": "#/$defs/cid" },
+        "authorityMaterialHandle": {
+          "type": "string",
+          "pattern": "^amh_(?:kv|sql)_001$"
+        },
+        "authorityMaterialDigest": { "$ref": "#/$defs/digest" },
+        "contentSource": { "$ref": "#/$defs/contentSource" },
+        "contentSourceDigest": { "$ref": "#/$defs/digest" },
+        "holderDid": { "$ref": "#/$defs/didKey" },
+        "targetOrigin": { "$ref": "#/$defs/origin" },
+        "nodeAudience": { "$ref": "#/$defs/did" },
+        "credentialDigest": { "$ref": "#/$defs/digest" },
+        "action": { "enum": ["tinycloud.kv/get", "tinycloud.sql/read"] },
+        "resource": { "$ref": "#/$defs/path" },
+        "requestBodyDigest": { "$ref": "#/$defs/digest" },
+        "issuedAt": { "$ref": "#/$defs/time" },
+        "expiresAt": { "$ref": "#/$defs/time" },
+        "jti": { "$ref": "#/$defs/b64_16" }
+      }
+    },
+    "policySession": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "version",
+        "sessionId",
+        "shareCid",
+        "shareId",
+        "delegationCid",
+        "policyCid",
+        "authorityMaterialHandle",
+        "authorityMaterialDigest",
+        "contentSource",
+        "contentSourceDigest",
+        "holderDid",
+        "targetOrigin",
+        "nodeAudience",
+        "action",
+        "resource",
+        "credentialDigest",
+        "issuedAt",
+        "expiresAt"
+      ],
+      "properties": {
+        "type": { "const": "TinyCloudSharePolicySession" },
+        "version": { "const": 1 },
+        "sessionId": { "$ref": "#/$defs/b64_16" },
+        "shareCid": { "$ref": "#/$defs/cid" },
+        "shareId": { "$ref": "#/$defs/shareId" },
+        "delegationCid": { "$ref": "#/$defs/cid" },
+        "policyCid": { "$ref": "#/$defs/cid" },
+        "authorityMaterialHandle": {
+          "type": "string",
+          "pattern": "^amh_(?:kv|sql)_001$"
+        },
+        "authorityMaterialDigest": { "$ref": "#/$defs/digest" },
+        "contentSource": { "$ref": "#/$defs/contentSource" },
+        "contentSourceDigest": { "$ref": "#/$defs/digest" },
+        "holderDid": { "$ref": "#/$defs/didKey" },
+        "targetOrigin": { "$ref": "#/$defs/origin" },
+        "nodeAudience": { "$ref": "#/$defs/did" },
+        "action": { "enum": ["tinycloud.kv/get", "tinycloud.sql/read"] },
+        "resource": { "$ref": "#/$defs/path" },
+        "credentialDigest": { "$ref": "#/$defs/digest" },
+        "issuedAt": { "$ref": "#/$defs/time" },
+        "expiresAt": { "$ref": "#/$defs/time" }
+      }
+    },
+    "readInvocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "version",
+        "sessionId",
+        "shareCid",
+        "shareId",
+        "policyCid",
+        "delegationCid",
+        "authorityMaterialHandle",
+        "authorityMaterialDigest",
+        "contentSource",
+        "contentSourceDigest",
+        "holderDid",
+        "targetOrigin",
+        "nodeAudience",
+        "action",
+        "resource",
+        "requestBodyDigest",
+        "issuedAt",
+        "expiresAt",
+        "jti"
+      ],
+      "properties": {
+        "type": { "const": "TinyCloudShareReadInvocation" },
+        "version": { "const": 1 },
+        "sessionId": { "$ref": "#/$defs/b64_16" },
+        "shareCid": { "$ref": "#/$defs/cid" },
+        "shareId": { "$ref": "#/$defs/shareId" },
+        "policyCid": { "$ref": "#/$defs/cid" },
+        "delegationCid": { "$ref": "#/$defs/cid" },
+        "authorityMaterialHandle": {
+          "type": "string",
+          "pattern": "^amh_(?:kv|sql)_001$"
+        },
+        "authorityMaterialDigest": { "$ref": "#/$defs/digest" },
+        "contentSource": { "$ref": "#/$defs/contentSource" },
+        "contentSourceDigest": { "$ref": "#/$defs/digest" },
+        "holderDid": { "$ref": "#/$defs/didKey" },
+        "targetOrigin": { "$ref": "#/$defs/origin" },
+        "nodeAudience": { "$ref": "#/$defs/did" },
+        "action": { "enum": ["tinycloud.kv/get", "tinycloud.sql/read"] },
+        "resource": { "$ref": "#/$defs/path" },
+        "requestBodyDigest": { "$ref": "#/$defs/digest" },
+        "issuedAt": { "$ref": "#/$defs/time" },
+        "expiresAt": { "$ref": "#/$defs/time" },
+        "jti": { "$ref": "#/$defs/b64_16" }
+      }
+    },
+    "credential": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "credential",
+        "holderDid",
+        "expiresAt",
+        "issuerDid",
+        "vct",
+        "claims",
+        "disclosures",
+        "credentialDigest",
+        "issuerJws"
+      ],
+      "properties": {
+        "format": { "const": "vc+sd-jwt" },
+        "credential": { "type": "string", "minLength": 1, "maxLength": 65536 },
+        "holderDid": { "$ref": "#/$defs/didKey" },
+        "expiresAt": { "$ref": "#/$defs/time" },
+        "issuerDid": { "$ref": "#/$defs/did" },
+        "vct": { "const": "opencredentials.email/v1" },
+        "claims": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "iss",
+            "sub",
+            "iat",
+            "nbf",
+            "exp",
+            "jti",
+            "vct",
+            "tinycloud_share",
+            "_sd_alg",
+            "_sd"
+          ],
+          "properties": {
+            "iss": { "$ref": "#/$defs/did" },
+            "sub": { "$ref": "#/$defs/didKey" },
+            "iat": { "type": "integer", "minimum": 0 },
+            "nbf": { "type": "integer", "minimum": 0 },
+            "exp": { "type": "integer", "minimum": 0 },
+            "jti": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "vct": { "const": "opencredentials.email/v1" },
+            "tinycloud_share": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "share_cid",
+                "share_id",
+                "policy_cid",
+                "node_audience"
+              ],
+              "properties": {
+                "share_cid": { "$ref": "#/$defs/cid" },
+                "share_id": { "$ref": "#/$defs/shareId" },
+                "policy_cid": { "$ref": "#/$defs/cid" },
+                "node_audience": { "$ref": "#/$defs/did" }
+              }
+            },
+            "_sd_alg": { "const": "sha-256" },
+            "_sd": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 1,
+              "items": { "$ref": "#/$defs/digest" }
+            }
+          }
+        },
+        "disclosures": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "salt", "encoded", "digest", "value"],
+            "properties": {
+              "path": { "const": "/email" },
+              "salt": { "$ref": "#/$defs/b64_16" },
+              "encoded": { "$ref": "#/$defs/b64" },
+              "digest": { "$ref": "#/$defs/digest" },
+              "value": { "$ref": "#/$defs/email" }
+            }
+          }
+        },
+        "credentialDigest": { "$ref": "#/$defs/digest" },
+        "issuerJws": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["signingInput", "signingInputDigest", "signature"],
+          "properties": {
+            "signingInput": { "type": "string", "minLength": 1 },
+            "signingInputDigest": { "$ref": "#/$defs/digest" },
+            "signature": { "$ref": "#/$defs/b64_64" }
+          }
+        }
+      }
+    },
+    "authorizationRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "jti",
+        "reportAbuseToken",
+        "senderDid",
+        "shareCid",
+        "shareId",
+        "policyCid",
+        "delegationCid",
+        "authorityMaterialHandle",
+        "authorityMaterialDigest",
+        "recipientEmail",
+        "targetOrigin",
+        "nodeAudience",
+        "documentName",
+        "senderTrust",
+        "contentSource",
+        "contentSourceDigest",
+        "shareExpiresAt",
+        "requestBodyDigest"
+      ],
+      "properties": {
+        "jti": { "$ref": "#/$defs/b64_16" },
+        "reportAbuseToken": { "$ref": "#/$defs/b64_16" },
+        "senderDid": { "$ref": "#/$defs/didKey" },
+        "shareCid": { "$ref": "#/$defs/cid" },
+        "shareId": { "$ref": "#/$defs/shareId" },
+        "policyCid": { "$ref": "#/$defs/cid" },
+        "delegationCid": { "$ref": "#/$defs/cid" },
+        "authorityMaterialHandle": {
+          "type": "string",
+          "pattern": "^amh_(?:kv|sql)_001$"
+        },
+        "authorityMaterialDigest": { "$ref": "#/$defs/digest" },
+        "recipientEmail": { "$ref": "#/$defs/email" },
+        "targetOrigin": { "$ref": "#/$defs/origin" },
+        "nodeAudience": { "$ref": "#/$defs/did" },
+        "documentName": { "$ref": "#/$defs/documentName" },
+        "senderTrust": { "enum": ["verified", "unverified"] },
+        "contentSource": { "$ref": "#/$defs/contentSource" },
+        "contentSourceDigest": { "$ref": "#/$defs/digest" },
+        "shareExpiresAt": { "$ref": "#/$defs/time" },
+        "requestBodyDigest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "authorizationResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["authorization", "proof"],
+      "properties": {
+        "authorization": { "$ref": "#/schemas/inviteAuthorization" },
+        "proof": { "$ref": "#/$defs/proof" }
+      }
+    },
+    "createInvitationRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["authorization", "proof", "shareUrl"],
+      "properties": {
+        "authorization": { "$ref": "#/schemas/inviteAuthorization" },
+        "proof": { "$ref": "#/$defs/proof" },
+        "shareUrl": { "$ref": "#/$defs/shareUrl" }
+      }
+    },
+    "createInvitationResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "retryAfterSeconds", "delegationCid", "authorityMaterialHandle", "authorityMaterialDigest"],
+      "properties": {
+        "status": { "const": "accepted" },
+        "retryAfterSeconds": { "const": 20 },
+        "delegationCid": { "$ref": "#/$defs/cid" },
+        "authorityMaterialHandle": { "type": "string", "pattern": "^amh_(?:kv|sql)_001$" },
+        "authorityMaterialDigest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "resendRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["invitationId", "claimSecret"],
+      "properties": {
+        "invitationId": { "$ref": "#/$defs/b64_16" },
+        "claimSecret": { "$ref": "#/$defs/b64_32" }
+      }
+    },
+    "resendResponse": { "$ref": "#/schemas/createInvitationResponse" },
+    "claimChallengeMagicRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["invitationId", "method", "activationId"],
+      "properties": {
+        "invitationId": { "$ref": "#/$defs/b64_16" },
+        "method": { "const": "magic" },
+        "activationId": { "$ref": "#/$defs/b64_16" }
+      }
+    },
+    "activationRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["invitationId", "claimSecret"],
+      "properties": {
+        "invitationId": { "$ref": "#/$defs/b64_16" },
+        "claimSecret": { "$ref": "#/$defs/b64_32" }
+      }
+    },
+    "activationResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "retryAfterSeconds", "activationId"],
+      "properties": {
+        "status": { "const": "accepted" },
+        "retryAfterSeconds": { "type": "integer", "minimum": 0, "maximum": 3600 },
+        "activationId": { "$ref": "#/$defs/b64_16" }
+      }
+    },
+    "claimChallengeOtpRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["invitationId", "method", "otp"],
+      "properties": {
+        "invitationId": { "$ref": "#/$defs/b64_16" },
+        "method": { "const": "otp" },
+        "otp": { "type": "string", "pattern": "^[0-9]{6}$" }
+      }
+    },
+    "claimChallengeResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "claimNonce",
+        "shareCid",
+        "shareId",
+        "policyCid",
+        "delegationCid",
+        "authorityMaterialHandle",
+        "authorityMaterialDigest",
+        "contentSource",
+        "contentSourceDigest",
+        "emailHash",
+        "targetOrigin",
+        "nodeAudience",
+        "expiresAt"
+      ],
+      "properties": {
+        "claimNonce": { "$ref": "#/$defs/b64_32" },
+        "shareCid": { "$ref": "#/$defs/cid" },
+        "shareId": { "$ref": "#/$defs/shareId" },
+        "policyCid": { "$ref": "#/$defs/cid" },
+        "delegationCid": { "$ref": "#/$defs/cid" },
+        "authorityMaterialHandle": {
+          "type": "string",
+          "pattern": "^amh_(?:kv|sql)_001$"
+        },
+        "authorityMaterialDigest": { "$ref": "#/$defs/digest" },
+        "contentSource": { "$ref": "#/$defs/contentSource" },
+        "contentSourceDigest": { "$ref": "#/$defs/digest" },
+        "emailHash": { "$ref": "#/$defs/digest" },
+        "targetOrigin": { "$ref": "#/$defs/origin" },
+        "nodeAudience": { "$ref": "#/$defs/did" },
+        "expiresAt": { "$ref": "#/$defs/time" }
+      }
+    },
+    "claimRedeemRequest": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "version",
+            "redemptionId",
+            "invitationId",
+            "method",
+            "mailboxProof",
+            "binding",
+            "holderProof"
+          ],
+          "properties": {
+            "version": { "const": "tinycloud.share-email-claim/v1" },
+            "redemptionId": { "$ref": "#/$defs/b64_16" },
+            "invitationId": { "$ref": "#/$defs/b64_16" },
+            "method": { "const": "magic" },
+            "mailboxProof": { "$ref": "#/$defs/b64_32" },
+            "binding": { "$ref": "#/schemas/holderBinding" },
+            "holderProof": { "$ref": "#/$defs/proof" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "version",
+            "redemptionId",
+            "invitationId",
+            "method",
+            "mailboxProof",
+            "binding",
+            "holderProof"
+          ],
+          "properties": {
+            "version": { "const": "tinycloud.share-email-claim/v1" },
+            "redemptionId": { "$ref": "#/$defs/b64_16" },
+            "invitationId": { "$ref": "#/$defs/b64_16" },
+            "method": { "const": "otp" },
+            "mailboxProof": { "type": "string", "pattern": "^[0-9]{6}$" },
+            "binding": { "$ref": "#/schemas/holderBinding" },
+            "holderProof": { "$ref": "#/$defs/proof" }
+          }
+        }
+      ]
+    },
+    "claimRedeemResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "credential", "holderDid", "expiresAt"],
+      "properties": {
+        "format": { "const": "vc+sd-jwt" },
+        "credential": { "type": "string", "minLength": 1, "maxLength": 65536 },
+        "holderDid": { "$ref": "#/$defs/didKey" },
+        "expiresAt": { "$ref": "#/$defs/time" }
+      }
+    },
+    "policyChallengeRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "shareCid",
+        "shareId",
+        "delegationCid",
+        "policyCid",
+        "authorityMaterialHandle",
+        "authorityMaterialDigest",
+        "contentSource",
+        "contentSourceDigest",
+        "holderDid",
+        "targetOrigin",
+        "nodeAudience",
+        "action",
+        "resource",
+        "requestBodyDigest"
+      ],
+      "properties": {
+        "shareCid": { "$ref": "#/$defs/cid" },
+        "shareId": { "$ref": "#/$defs/shareId" },
+        "delegationCid": { "$ref": "#/$defs/cid" },
+        "policyCid": { "$ref": "#/$defs/cid" },
+        "authorityMaterialHandle": {
+          "type": "string",
+          "pattern": "^amh_(?:kv|sql)_001$"
+        },
+        "authorityMaterialDigest": { "$ref": "#/$defs/digest" },
+        "contentSource": { "$ref": "#/$defs/contentSource" },
+        "contentSourceDigest": { "$ref": "#/$defs/digest" },
+        "holderDid": { "$ref": "#/$defs/didKey" },
+        "targetOrigin": { "$ref": "#/$defs/origin" },
+        "nodeAudience": { "$ref": "#/$defs/did" },
+        "action": { "enum": ["tinycloud.kv/get", "tinycloud.sql/read"] },
+        "resource": { "$ref": "#/$defs/path" },
+        "requestBodyDigest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "policyChallengeResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["challenge", "proof"],
+      "properties": {
+        "challenge": { "$ref": "#/schemas/policyChallenge" },
+        "proof": { "$ref": "#/$defs/proof" }
+      }
+    },
+    "policySessionRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["presentation", "credential", "proof"],
+      "properties": {
+        "presentation": { "$ref": "#/schemas/policyPresentation" },
+        "credential": { "type": "string", "minLength": 1, "maxLength": 65536 },
+        "proof": { "$ref": "#/$defs/proof" }
+      }
+    },
+    "policySessionResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session", "proof"],
+      "properties": {
+        "session": { "$ref": "#/schemas/policySession" },
+        "proof": { "$ref": "#/$defs/proof" }
+      }
+    },
+    "kvReadRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "delegationCid",
+        "authorityMaterialHandle",
+        "authorityMaterialDigest",
+        "contentSource",
+        "contentSourceDigest",
+        "action",
+        "resource",
+        "requestBodyDigest",
+        "invocation",
+        "proof"
+      ],
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/b64_16" },
+        "delegationCid": { "$ref": "#/$defs/cid" },
+        "authorityMaterialHandle": { "type": "string", "pattern": "^amh_(?:kv|sql)_001$" },
+        "authorityMaterialDigest": { "$ref": "#/$defs/digest" },
+        "contentSource": { "$ref": "#/$defs/sourceKv" },
+        "contentSourceDigest": { "$ref": "#/$defs/digest" },
+        "action": { "const": "tinycloud.kv/get" },
+        "resource": { "$ref": "#/$defs/path" },
+        "requestBodyDigest": { "$ref": "#/$defs/digest" },
+        "invocation": { "$ref": "#/schemas/readInvocation" },
+        "proof": { "$ref": "#/$defs/proof" }
+      }
+    },
+    "sqlReadRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sessionId",
+        "delegationCid",
+        "authorityMaterialHandle",
+        "authorityMaterialDigest",
+        "contentSource",
+        "contentSourceDigest",
+        "action",
+        "resource",
+        "requestBodyDigest",
+        "invocation",
+        "proof"
+      ],
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/b64_16" },
+        "delegationCid": { "$ref": "#/$defs/cid" },
+        "authorityMaterialHandle": { "type": "string", "pattern": "^amh_(?:kv|sql)_001$" },
+        "authorityMaterialDigest": { "$ref": "#/$defs/digest" },
+        "contentSource": { "$ref": "#/$defs/sourceSql" },
+        "contentSourceDigest": { "$ref": "#/$defs/digest" },
+        "action": { "const": "tinycloud.sql/read" },
+        "resource": { "$ref": "#/$defs/path" },
+        "requestBodyDigest": { "$ref": "#/$defs/digest" },
+        "invocation": { "$ref": "#/schemas/readInvocation" },
+        "proof": { "$ref": "#/$defs/proof" }
+      }
+    },
+    "readResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "version", "sessionId", "requestJti", "readJti", "audience", "holderDid", "credentialDigest", "issuedAt", "expiresAt", "mediaType", "content", "contentSource", "contentSourceDigest", "action", "resource", "requestBodyDigest", "bodyDigest", "delegationCid", "authorityMaterialHandle", "authorityMaterialDigest", "proof"],
+      "properties": {
+        "type": { "const": "TinyCloudShareReadResponse" },
+        "version": { "const": 1 },
+        "sessionId": { "$ref": "#/$defs/b64_16" },
+        "requestJti": { "$ref": "#/$defs/b64_16" },
+        "readJti": { "$ref": "#/$defs/b64_16" },
+        "audience": { "$ref": "#/$defs/did" },
+        "holderDid": { "$ref": "#/$defs/didKey" },
+        "credentialDigest": { "$ref": "#/$defs/digest" },
+        "issuedAt": { "$ref": "#/$defs/time" },
+        "expiresAt": { "$ref": "#/$defs/time" },
+        "mediaType": { "const": "text/markdown; charset=utf-8" },
+        "content": { "type": "string", "maxLength": 1048576 },
+        "contentSource": { "$ref": "#/$defs/contentSource" },
+        "contentSourceDigest": { "$ref": "#/$defs/digest" },
+        "action": { "enum": ["tinycloud.kv/get", "tinycloud.sql/read"] },
+        "resource": { "$ref": "#/$defs/path" },
+        "requestBodyDigest": { "$ref": "#/$defs/digest" },
+        "bodyDigest": { "$ref": "#/$defs/digest" },
+        "delegationCid": { "$ref": "#/$defs/cid" },
+        "authorityMaterialHandle": { "type": "string", "pattern": "^amh_(?:kv|sql)_001$" },
+        "authorityMaterialDigest": { "$ref": "#/$defs/digest" },
+        "proof": { "$ref": "#/$defs/proof" }
+      }
+    },
+    "failure": { "$ref": "#/$defs/failure" },
+    "trustedNodeEnrollment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "targetOrigin",
+        "nodeAudience",
+        "invitationKid",
+        "invitationPublicKey",
+        "keyVersion",
+        "enabled"
+      ],
+      "properties": {
+        "targetOrigin": { "$ref": "#/$defs/origin" },
+        "nodeAudience": { "$ref": "#/$defs/did" },
+        "invitationKid": {
+          "type": "string",
+          "pattern": "^did:web:[^#\\s]+#[^#\\s]+$"
+        },
+        "invitationPublicKey": { "$ref": "#/$defs/b64_32" },
+        "keyVersion": { "type": "integer", "minimum": 1 },
+        "enabled": { "type": "boolean" }
+      }
+    },
+    "fragmentFields": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["k", "i", "c"],
+      "properties": {
+        "k": { "$ref": "#/$defs/b64_32" },
+        "i": { "$ref": "#/$defs/b64_16" },
+        "c": { "$ref": "#/$defs/b64_32" }
+      }
+    },
+    "capabilityDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "origin", "routes", "status"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "pattern": "^[a-z0-9._-]+$" },
+        "version": { "const": 1 },
+        "origin": { "$ref": "#/$defs/origin" },
+        "returnOrigin": { "$ref": "#/$defs/origin" },
+        "routes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^/[A-Za-z0-9._/-]+$" }
+        },
+        "contentKinds": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["kv", "sql"] }
+        },
+        "mailProvider": { "const": "resend" },
+        "status": {
+          "enum": [
+            "disabled-until-real-provider",
+            "disabled-until-authority-ready",
+            "ready"
+          ]
+        }
+      }
+    },
+    "operationProgram": {
+      "type": "array",
+      "minItems": 17,
+      "items": { "$ref": "#/$defs/operationProgramRow" }
+    }
+  }
+}

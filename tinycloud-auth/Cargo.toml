@@ -7,7 +7,7 @@ edition = "2021"
 async-trait.workspace = true
 iri-string.workspace = true
 ipld-core.workspace = true
-multihash-codetable = { version = "0.1", features = ["blake2b", "blake3"] }
+multihash-codetable = { version = "0.1", features = ["blake2b", "blake3", "sha2"] }
 serde_ipld_dagcbor.workspace = true
 serde.workspace = true
 serde_json.workspace = true

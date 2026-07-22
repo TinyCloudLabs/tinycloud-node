@@ -139,7 +139,7 @@ impl BackoffState {
 mod tests {
     use super::*;
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn ack_resets_backoff_and_serves() {
         let mut state = BackoffState::new();
         state.attempt = 5;
@@ -148,7 +148,7 @@ mod tests {
         assert_eq!(state.attempt, 0);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn stale_sequence_close_resyncs_without_backoff() {
         let mut state = BackoffState::new();
         let action = state.next_action(AttemptOutcome::Closed(CLOSE_STALE_SEQUENCE), 0.0);
@@ -162,14 +162,14 @@ mod tests {
         assert_eq!(state.attempt, 0);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn superseded_close_stops_and_does_not_reconnect() {
         let mut state = BackoffState::new();
         let action = state.next_action(AttemptOutcome::Closed(CLOSE_SUPERSEDED), 0.0);
         assert_eq!(action, ReconnectAction::Stop);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn other_close_codes_apply_backoff() {
         let mut state = BackoffState::new();
         let action = state.next_action(AttemptOutcome::Closed(4400), 0.0);
@@ -182,7 +182,7 @@ mod tests {
         assert_eq!(state.attempt, 1);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn transport_error_applies_backoff() {
         let mut state = BackoffState::new();
         let action = state.next_action(AttemptOutcome::TransportError, 0.0);
@@ -190,7 +190,7 @@ mod tests {
         assert_eq!(state.attempt, 1);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn backoff_escalates_and_caps() {
         let mut state = BackoffState::new();
         let mut delays = Vec::new();
@@ -212,7 +212,7 @@ mod tests {
         assert!(delays.last().unwrap().as_secs_f64() >= BACKOFF_CAP.as_secs_f64() * 0.5);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn stale_sequence_resyncs_without_backoff_up_to_the_cap() {
         let mut state = BackoffState::new();
         for n in 1..=MAX_CONSECUTIVE_STALE_RESYNCS {
@@ -229,7 +229,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn stale_sequence_escalates_to_backoff_after_the_cap() {
         let mut state = BackoffState::new();
         for _ in 0..MAX_CONSECUTIVE_STALE_RESYNCS {
@@ -247,7 +247,7 @@ mod tests {
         assert_eq!(state.attempt, 1);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn ack_between_stale_sequences_resets_the_stale_streak() {
         let mut state = BackoffState::new();
         for _ in 0..MAX_CONSECUTIVE_STALE_RESYNCS {
@@ -265,7 +265,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn jitter_scales_delay_between_half_and_full() {
         let mut low = BackoffState::new();
         low.attempt = 3;

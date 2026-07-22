@@ -42,6 +42,7 @@ pub struct TracingFairing {
 #[serde(rename_all = "camelCase")]
 pub struct LogEntry {
     #[serde(skip)]
+    #[allow(dead_code)]
     seq: u64,
     timestamp: String,
     level: String,
@@ -50,6 +51,7 @@ pub struct LogEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     fields: Option<Value>,
     #[serde(skip)]
+    #[allow(dead_code)]
     timestamp_nanos: i128,
 }
 
@@ -114,6 +116,7 @@ impl LogBuffer {
         format!("{seq}")
     }
 
+    #[allow(dead_code)]
     pub fn tail(
         &self,
         lines: usize,
@@ -168,6 +171,7 @@ impl LogBuffer {
     }
 }
 
+#[allow(dead_code)]
 fn newest_window(entries: Vec<LogEntry>, lines: usize) -> Vec<LogEntry> {
     if entries.len() <= lines {
         entries

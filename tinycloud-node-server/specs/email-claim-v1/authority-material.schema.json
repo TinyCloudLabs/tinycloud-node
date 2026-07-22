@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://spec.tinycloud.xyz/email-claim-v1/authority-material.schema.json",
+  "title": "TinyCloud exact Node #117 authority material",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "type",
+    "version",
+    "handle",
+    "policyOwnerDid",
+    "senderDid",
+    "relationship",
+    "mapping",
+    "policyAuthorityBytes",
+    "policyAuthorityCid",
+    "policyEnforcementBytes",
+    "policyEnforcementCid",
+    "statusObservations",
+    "enrollment",
+    "attestation"
+  ],
+  "properties": {
+    "type": { "const": "TinyCloudShareAuthorityMaterial" },
+    "version": { "const": 1 },
+    "handle": { "pattern": "^amh_(kv|sql)_001$" },
+    "policyOwnerDid": { "pattern": "^did:pkh:" },
+    "senderDid": { "pattern": "^did:key:z" },
+    "relationship": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policyOwnerDid", "senderDid", "authenticated"],
+      "properties": {
+        "policyOwnerDid": { "type": "string" },
+        "senderDid": { "type": "string" },
+        "authenticated": { "const": true }
+      }
+    },
+    "mapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sharePolicyCid",
+        "shareDelegationCid",
+        "policyAuthorityCid",
+        "policyEnforcementCid"
+      ],
+      "properties": {
+        "sharePolicyCid": { "pattern": "^bafk" },
+        "shareDelegationCid": { "pattern": "^bafk" },
+        "policyAuthorityCid": { "pattern": "^bafkr4i" },
+        "policyEnforcementCid": { "pattern": "^bafkr4i" }
+      }
+    },
+    "policyAuthorityBytes": { "type": "string", "minLength": 1 },
+    "policyAuthorityCid": { "pattern": "^bafkr4i" },
+    "policyEnforcementBytes": { "type": "string", "minLength": 1 },
+    "policyEnforcementCid": { "pattern": "^bafkr4i" },
+    "statusObservations": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": { "$ref": "#/$defs/statusObservation" }
+    },
+    "enrollment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["targetOrigin", "nodeAudience", "invitationKid", "invitationPublicKey", "keyVersion", "enabled"],
+      "properties": {
+        "targetOrigin": { "type": "string" },
+        "nodeAudience": { "type": "string" },
+        "invitationKid": { "type": "string" },
+        "invitationPublicKey": { "type": "string" },
+        "keyVersion": { "type": "integer", "minimum": 1 },
+        "enabled": { "const": true }
+      }
+    },
+    "attestation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "version", "targetOrigin", "nodeAudience", "enforcerDid", "enforcerKid", "publicKey", "keyVersion", "localSignerDid", "localSignerKid", "measurement", "measurementDigest", "expiresAt", "enrollmentDigest", "signature"],
+      "properties": {
+        "type": { "const": "TinyCloudShareEnrollmentRuntimeAttestation" },
+        "version": { "const": 1 },
+        "targetOrigin": { "type": "string" },
+        "nodeAudience": { "type": "string" },
+        "enforcerDid": { "type": "string" },
+        "enforcerKid": { "type": "string" },
+        "publicKey": { "type": "string" },
+        "keyVersion": { "type": "integer", "minimum": 1 },
+        "localSignerDid": { "type": "string" },
+        "localSignerKid": { "type": "string" },
+        "measurement": { "type": "string" },
+        "measurementDigest": { "type": "string" },
+        "expiresAt": { "type": "string" },
+        "enrollmentDigest": { "type": "string" },
+        "signature": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["alg", "kid", "value"],
+          "properties": { "alg": { "const": "EdDSA" }, "kid": { "type": "string" }, "value": { "type": "string" } }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "statusObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "version",
+        "parentCid",
+        "state",
+        "sequence",
+        "checkedAt",
+        "freshUntil",
+        "revokedAt",
+        "signerKid",
+        "signerVersion",
+        "signature"
+      ],
+      "properties": {
+        "type": { "const": "TinyCloudShareAuthorityStatusObservation" },
+        "version": { "const": 1 },
+        "parentCid": { "pattern": "^bafkr4i" },
+        "state": { "enum": ["active", "revoked"] },
+        "sequence": { "type": "integer", "minimum": 0 },
+        "checkedAt": { "type": "string" },
+        "freshUntil": { "type": "string" },
+        "revokedAt": { "type": "null" },
+        "signerKid": { "type": "string" },
+        "signerVersion": { "type": "integer", "minimum": 1 },
+        "signature": { "$ref": "#/$defs/proof" }
+      }
+    },
+    "proof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alg", "kid", "value"],
+      "properties": {
+        "alg": { "const": "EdDSA" },
+        "kid": { "type": "string" },
+        "value": { "type": "string" }
+      }
+    }
+  }
+}

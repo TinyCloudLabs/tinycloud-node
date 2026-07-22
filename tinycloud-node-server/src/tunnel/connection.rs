@@ -825,7 +825,7 @@ fn to_ws_url(service_url: &str, name: &str) -> String {
 mod tests {
     use super::*;
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn to_ws_url_converts_https_to_wss() {
         assert_eq!(
             to_ws_url("https://api.tinycloud.link", "office"),
@@ -833,7 +833,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn to_ws_url_converts_http_to_ws_for_local_dev() {
         assert_eq!(
             to_ws_url("http://127.0.0.1:4000/", "office"),
@@ -841,7 +841,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn to_ws_url_percent_encodes_name() {
         assert_eq!(
             to_ws_url("https://api.tinycloud.link", "weird name"),
@@ -849,33 +849,33 @@ mod tests {
         );
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn validate_request_path_accepts_a_plain_absolute_path() {
         assert!(validate_request_path("/").is_ok());
         assert!(validate_request_path("/foo/bar?x=1").is_ok());
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn validate_request_path_rejects_userinfo_host_confusion() {
         // Concatenated onto `http://{upstream_addr}`, this reads as
         // userinfo@host, redirecting the request to `evil.com`.
         assert!(validate_request_path("@evil.com/x").is_err());
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn validate_request_path_rejects_an_embedded_scheme() {
         assert!(validate_request_path("http://evil.com/").is_err());
         assert!(validate_request_path("/redirect").is_ok()); // sanity: no false positive
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn validate_request_path_rejects_whitespace_and_control_characters() {
         assert!(validate_request_path("/foo bar").is_err());
         assert!(validate_request_path("/foo\r\nX-Injected: 1").is_err());
         assert!(validate_request_path("/foo\0bar").is_err());
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn should_strip_forwarded_header_covers_hop_by_hop_and_framing_headers() {
         for name in [
             "Connection",
@@ -896,7 +896,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn should_strip_forwarded_header_leaves_ordinary_headers_alone() {
         for name in ["Content-Type", "X-Custom", "Set-Cookie", "Authorization"] {
             assert!(
@@ -906,7 +906,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn effective_max_pending_uses_the_default_when_unset_or_invalid() {
         assert_eq!(effective_max_pending(None), DEFAULT_MAX_PENDING_REQUESTS);
         assert_eq!(
@@ -919,7 +919,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn effective_max_pending_honors_a_valid_override() {
         assert_eq!(effective_max_pending(Some("8".to_string())), 8);
     }

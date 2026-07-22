@@ -1,0 +1,615 @@
+{
+  "version": "tinycloud.share-email-claim/v1",
+  "testOnly": true,
+  "delivery": [
+    {
+      "name": "create-accepted",
+      "events": [
+        [
+          "ABSENT",
+          "PENDING_DELIVERY(v1)"
+        ],
+        [
+          "PENDING_DELIVERY(v1)",
+          "ACTIVE(v1)"
+        ],
+        [
+          "ACTIVE(v1)",
+          "REDEEMING(v1,redemption-001)"
+        ],
+        [
+          "REDEEMING(v1,redemption-001)",
+          "CONSUMED(v1)"
+        ]
+      ],
+      "providerIdempotencyKey": "invite:create:auth-kv-001"
+    },
+    {
+      "name": "resend-accepted",
+      "events": [
+        [
+          "ACTIVE(v1)",
+          "PENDING_DELIVERY(v2)"
+        ],
+        [
+          "PENDING_DELIVERY(v2)",
+          "ACTIVE(v2)"
+        ],
+        [
+          "ACTIVE(v2)",
+          "REDEEMING(v2,redemption-002)"
+        ],
+        [
+          "REDEEMING(v2,redemption-002)",
+          "CONSUMED(v2)"
+        ]
+      ],
+      "providerIdempotencyKey": "invite:resend:invitation-001:v2"
+    },
+    {
+      "name": "resend-provider-failure",
+      "events": [
+        [
+          "ACTIVE(v1)",
+          "PENDING_DELIVERY(v2)"
+        ],
+        [
+          "PENDING_DELIVERY(v2)",
+          "ACTIVE(v1)"
+        ],
+        [
+          "ACTIVE(v1)",
+          "REDEEMING(v1,redemption-003)"
+        ],
+        [
+          "REDEEMING(v1,redemption-003)",
+          "CONSUMED(v1)"
+        ]
+      ],
+      "providerIdempotencyKey": "invite:resend:invitation-001:v2"
+    },
+    {
+      "name": "crash-after-provider-accept",
+      "events": [
+        [
+          "ACTIVE(v1)",
+          "PENDING_DELIVERY(v2)"
+        ],
+        [
+          "PENDING_DELIVERY(v2)",
+          "RECOVERING_PROVIDER_ACCEPT(v2)"
+        ],
+        [
+          "RECOVERING_PROVIDER_ACCEPT(v2)",
+          "ACTIVE(v2)"
+        ]
+      ]
+    }
+  ],
+  "invitation": [
+    "ABSENT",
+    "ACTIVE(v1)",
+    "REDEEMING(v1,redemption-001)",
+    "CONSUMED(v1)"
+  ],
+  "nonce": [
+    "ISSUED",
+    "VERIFYING",
+    "CONSUMED"
+  ],
+  "session": [
+    "ACTIVE",
+    "EXPIRED",
+    "REVOKED"
+  ],
+  "operations": [
+    "create_persist_outbox",
+    "provider_accept",
+    "activate_v1",
+    "wrong_otp_x5",
+    "lock_v1",
+    "resend_persist_v2",
+    "provider_accept_v2",
+    "invalidate_v1",
+    "claim_v2",
+    "consume_nonce",
+    "crash_after_provider_accept",
+    "retry_same_provider_idempotency",
+    "same_redemption_idempotent",
+    "different_redemption_rejected",
+    "scanner_get_no_state_change"
+  ],
+  "operationProgram": [
+    {
+      "id": "create-persist-outbox",
+      "operation": "transaction",
+      "pre": {
+        "durableRows": {
+          "invitation": "ABSENT",
+          "outbox": null,
+          "claimMaterial": "encrypted"
+        }
+      },
+      "commands": [
+        {
+          "name": "create_invitation",
+          "operands": {
+            "version": 1,
+            "outboxKey": "invite:create:auth-kv-001",
+            "claimMaterial": "encrypted"
+          }
+        }
+      ],
+      "expected": {
+        "durableRows": {
+          "invitation": "PENDING_DELIVERY(v1)",
+          "outbox": "invite:create:auth-kv-001",
+          "claimMaterial": "encrypted"
+        }
+      }
+    },
+    {
+      "id": "provider-accept-v1",
+      "operation": "transaction",
+      "pre": {
+        "durableRows": {
+          "invitation": "PENDING_DELIVERY(v1)",
+          "providerAccepted": false,
+          "claimMaterial": "encrypted"
+        }
+      },
+      "commands": [
+        {
+          "name": "provider_accept",
+          "operands": {
+            "version": 1,
+            "claimMaterialAfter": "deleted"
+          }
+        }
+      ],
+      "expected": {
+        "durableRows": {
+          "invitation": "ACTIVE(v1)",
+          "providerAccepted": true,
+          "claimMaterial": "deleted"
+        }
+      }
+    },
+    {
+      "id": "premature-resend-invalidation",
+      "operation": "reject",
+      "pre": {
+        "durableRows": {
+          "invitation": "PENDING_DELIVERY(v2)",
+          "activeVersion": 1,
+          "pendingVersion": 2,
+          "oldSecret": "present"
+        }
+      },
+      "commands": [
+        {
+          "name": "invalidate_old_version",
+          "operands": {
+            "version": 1,
+            "onlyAfter": "provider_acceptance"
+          }
+        }
+      ],
+      "expected": {
+        "durableRows": {
+          "invitation": "PENDING_DELIVERY(v2)",
+          "activeVersion": 1,
+          "pendingVersion": 2,
+          "oldSecret": "present"
+        }
+      }
+    },
+    {
+      "id": "resend-persist-v2",
+      "operation": "transaction",
+      "pre": {
+        "durableRows": {
+          "invitation": "ACTIVE(v1)",
+          "activeVersion": 1,
+          "pendingVersion": null,
+          "oldSecret": "present"
+        }
+      },
+      "commands": [
+        {
+          "name": "prepare_resend",
+          "operands": {
+            "fromVersion": 1,
+            "toVersion": 2,
+            "replacementMaterial": "encrypted"
+          }
+        }
+      ],
+      "expected": {
+        "durableRows": {
+          "invitation": "PENDING_DELIVERY(v2)",
+          "activeVersion": 1,
+          "pendingVersion": 2,
+          "oldSecret": "present",
+          "replacementMaterial": "encrypted"
+        }
+      }
+    },
+    {
+      "id": "provider-failure-recovery",
+      "operation": "transaction",
+      "pre": {
+        "durableRows": {
+          "invitation": "PENDING_DELIVERY(v2)",
+          "activeVersion": 1,
+          "pendingVersion": 2,
+          "oldSecret": "present",
+          "replacementMaterial": "encrypted"
+        }
+      },
+      "commands": [
+        {
+          "name": "provider_reject",
+          "operands": {
+            "pendingVersion": 2,
+            "restoreVersion": 1,
+            "replacementMaterialAfter": "discarded"
+          }
+        }
+      ],
+      "expected": {
+        "durableRows": {
+          "invitation": "ACTIVE(v1)",
+          "activeVersion": 1,
+          "pendingVersion": null,
+          "oldSecret": "present",
+          "replacementMaterial": "discarded"
+        }
+      }
+    },
+    {
+      "id": "provider-accept-crash",
+      "operation": "crash",
+      "pre": {
+        "durableRows": {
+          "invitation": "PENDING_DELIVERY(v2)",
+          "activeVersion": 1,
+          "pendingVersion": 2,
+          "providerAccepted": false
+        }
+      },
+      "commands": [
+        {
+          "name": "provider_accept_then_crash",
+          "operands": {
+            "version": 2,
+            "idempotencyKey": "invite:resend:invitation-001:v2",
+            "sendCount": 1
+          }
+        }
+      ],
+      "expected": {
+        "durableRows": {
+          "invitation": "PENDING_DELIVERY(v2)",
+          "activeVersion": 1,
+          "pendingVersion": 2,
+          "providerAccepted": true,
+          "crashObserved": true
+        }
+      }
+    },
+    {
+      "id": "provider-accept-retry",
+      "operation": "retry",
+      "pre": {
+        "durableRows": {
+          "invitation": "PENDING_DELIVERY(v2)",
+          "activeVersion": 1,
+          "pendingVersion": 2,
+          "providerAccepted": true,
+          "crashObserved": true
+        }
+      },
+      "commands": [
+        {
+          "name": "reconcile_provider_acceptance",
+          "operands": {
+            "version": 2,
+            "idempotencyKey": "invite:resend:invitation-001:v2",
+            "sendCount": 1,
+            "retireVersion": 1
+          }
+        }
+      ],
+      "expected": {
+        "durableRows": {
+          "invitation": "ACTIVE(v2)",
+          "activeVersion": 2,
+          "pendingVersion": null,
+          "oldSecret": "retired",
+          "providerSendCount": 1
+        }
+      }
+    },
+    {
+      "id": "atomic-issuance-success",
+      "operation": "transaction",
+      "pre": {
+        "durableRows": {
+          "invitation": "REDEEMING(v1,redemption-001)",
+          "seed": "encrypted",
+          "result": null,
+          "consumed": false
+        }
+      },
+      "commands": [
+        {
+          "name": "resolve_issuance",
+          "operands": {
+            "redemptionId": "redemption-001",
+            "outcome": "success",
+            "result": "persisted",
+            "seedAfter": "deleted"
+          }
+        }
+      ],
+      "expected": {
+        "durableRows": {
+          "invitation": "CONSUMED(v1)",
+          "seed": "deleted",
+          "result": "persisted",
+          "consumed": true
+        }
+      }
+    },
+    {
+      "id": "atomic-issuance-failure",
+      "operation": "transaction",
+      "pre": {
+        "durableRows": {
+          "invitation": "REDEEMING(v1,redemption-002)",
+          "seed": "encrypted",
+          "result": null,
+          "consumed": false
+        }
+      },
+      "commands": [
+        {
+          "name": "resolve_issuance",
+          "operands": {
+            "redemptionId": "redemption-002",
+            "outcome": "failure",
+            "result": "terminal-error",
+            "seedAfter": "deleted"
+          }
+        }
+      ],
+      "expected": {
+        "durableRows": {
+          "invitation": "TERMINAL_ERROR",
+          "seed": "deleted",
+          "result": "terminal-error",
+          "consumed": true
+        }
+      }
+    },
+    {
+      "id": "atomic-partial-write-rejected",
+      "operation": "reject",
+      "pre": {
+        "durableRows": {
+          "invitation": "REDEEMING(v1,redemption-003)",
+          "seed": "encrypted",
+          "result": null,
+          "consumed": false
+        }
+      },
+      "commands": [
+        {
+          "name": "atomic_write",
+          "operands": {
+            "writes": [
+              "result",
+              "consumed"
+            ],
+            "requireAtomic": true
+          }
+        }
+      ],
+      "expected": {
+        "durableRows": {
+          "invitation": "REDEEMING(v1,redemption-003)",
+          "seed": "encrypted",
+          "result": null,
+          "consumed": false
+        }
+      }
+    },
+    {
+      "id": "cleanup-pending-seed-refused",
+      "operation": "reject",
+      "pre": {
+        "durableRows": {
+          "invitation": "REDEEMING(v1,redemption-004)",
+          "seed": "encrypted"
+        }
+      },
+      "commands": [
+        {
+          "name": "cleanup_seed",
+          "operands": {
+            "pendingSeedAction": "refuse",
+            "requiresDurableCompletion": true
+          }
+        }
+      ],
+      "expected": {
+        "durableRows": {
+          "invitation": "REDEEMING(v1,redemption-004)",
+          "seed": "encrypted"
+        }
+      }
+    },
+    {
+      "id": "same-redemption-contenders",
+      "operation": "transaction",
+      "pre": {
+        "durableRows": {
+          "invitation": "ACTIVE(v1)",
+          "redemptionId": "redemption-001",
+          "issuanceCount": 0
+        }
+      },
+      "commands": [
+        {
+          "name": "redeem_if_active",
+          "operands": {
+            "redemptionId": "redemption-001",
+            "attempts": 20,
+            "result": "same-result",
+            "cachedOutcome": {
+              "status": "issued",
+              "result": "same-result"
+            }
+          }
+        }
+      ],
+      "expected": {
+        "durableRows": {
+          "invitation": "CONSUMED(v1)",
+          "redemptionId": "redemption-001",
+          "issuanceCount": 1,
+          "result": "same-result"
+        }
+      }
+    },
+    {
+      "id": "different-redemption-rejected",
+      "operation": "reject",
+      "pre": {
+        "durableRows": {
+          "invitation": "CONSUMED(v1)",
+          "redemptionId": "redemption-001",
+          "issuanceCount": 1
+        }
+      },
+      "commands": [
+        {
+          "name": "redeem_if_active",
+          "operands": {
+            "redemptionId": "redemption-002",
+            "attempts": 1,
+            "result": "different-result"
+          }
+        }
+      ],
+      "expected": {
+        "durableRows": {
+          "invitation": "CONSUMED(v1)",
+          "redemptionId": "redemption-001",
+          "issuanceCount": 1
+        }
+      }
+    },
+    {
+      "id": "otp-wrong-vs-invalid-magic",
+      "operation": "transaction",
+      "pre": {
+        "durableRows": {
+          "invitation": "ACTIVE(v1)",
+          "otpAttempts": 0,
+          "invalidMagicOtpAttempts": 0
+        }
+      },
+      "commands": [
+        {
+          "name": "wrong_otp_attempts",
+          "operands": {
+            "attempts": 5,
+            "lockAt": 5,
+            "invalidMagicAttempts": 0
+          }
+        }
+      ],
+      "expected": {
+        "durableRows": {
+          "invitation": "LOCKED(v1)",
+          "otpAttempts": 5,
+          "invalidMagicOtpAttempts": 0
+        }
+      }
+    },
+    {
+      "id": "nonce-replay-rejected",
+      "operation": "reject",
+      "pre": {
+        "durableRows": {
+          "nonce": "CONSUMED"
+        }
+      },
+      "commands": [
+        {
+          "name": "consume_nonce",
+          "operands": {
+            "requiredState": "VERIFYING"
+          }
+        }
+      ],
+      "expected": {
+        "durableRows": {
+          "nonce": "CONSUMED"
+        }
+      }
+    },
+    {
+      "id": "jti-replay-rejected",
+      "operation": "reject",
+      "pre": {
+        "durableRows": {
+          "jti": "authorization-jti-001",
+          "digest": "digest-a"
+        }
+      },
+      "commands": [
+        {
+          "name": "reserve_jti",
+          "operands": {
+            "jti": "authorization-jti-001",
+            "digest": "digest-b"
+          }
+        }
+      ],
+      "expected": {
+        "durableRows": {
+          "jti": "authorization-jti-001",
+          "digest": "digest-a"
+        }
+      }
+    },
+    {
+      "id": "scanner-get-no-mutation",
+      "operation": "read-only",
+      "pre": {
+        "durableRows": {
+          "invitation": "ACTIVE(v1)",
+          "consumed": false
+        }
+      },
+      "commands": [
+        {
+          "name": "scanner_get",
+          "operands": {
+            "method": "GET",
+            "mutate": false
+          }
+        }
+      ],
+      "expected": {
+        "durableRows": {
+          "invitation": "ACTIVE(v1)",
+          "consumed": false
+        }
+      }
+    }
+  ]
+}

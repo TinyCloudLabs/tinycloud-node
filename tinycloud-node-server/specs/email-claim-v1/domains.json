@@ -1,0 +1,157 @@
+{
+  "version": "tinycloud.share-email-claim/v1",
+  "signedByteFormat": "UTF8(registry.domain) || UTF8(JCS(message))",
+  "encoding": { "binary": "base64url-unpadded", "digest": "sha256" },
+  "domains": {
+    "envelope": "xyz.tinycloud.share/envelope/v1\u0000",
+    "policy": "xyz.tinycloud.share/policy/v1\u0000",
+    "inviteAuthorization": "xyz.tinycloud.share/invite-authorization/v1\u0000",
+    "holderBinding": "xyz.tinycloud.share/email-claim-holder-binding/v1\u0000",
+    "policyChallenge": "xyz.tinycloud.share/policy-challenge/v1\u0000",
+    "policyPresentation": "xyz.tinycloud.share/policy-presentation/v1\u0000",
+    "policySession": "xyz.tinycloud.share/policy-session/v1\u0000",
+    "readInvocation": "xyz.tinycloud.share/read-invocation/v1\u0000",
+    "readResponse": "xyz.tinycloud.share/read-response/v1\u0000",
+    "authorityMaterial": "xyz.tinycloud.share/authority-material-bundle/v1\u0000",
+    "authorityStatus": "xyz.tinycloud.share/authority-status-observation/v1\u0000",
+    "enrollmentAttestation": "xyz.tinycloud.share/enrollment-runtime-attestation/v1\u0000",
+    "tokenHash": "tinycloud-share-email-claim/v1\u0000",
+    "otpHash": "tinycloud-share-email-otp/v1\u0000",
+    "issuanceKdf": "tinycloud-share-email-issuance-seed/v1\u0000"
+  },
+  "envelopeSigning": "UTF8(domains.envelope) || UTF8(JCS(unsigned envelope))",
+  "authorityMaterialProfile": {
+    "version": 1,
+    "bundleType": "TinyCloudShareAuthorityMaterial",
+    "signatureDomain": "authorityMaterial",
+    "signedPreimage": "UTF8(domains.authorityMaterial) || UTF8(JCS(bundle))",
+    "cid": "CIDv1/raw/BLAKE3-256 over exact Node #117 signed artifact bytes; delegationCid is excluded from the CID preimage and signature remains included",
+    "producer": "policyOwnerDid signs exact Node #117 PolicyAuthority and PolicyEnforcement artifacts; invitation senderDid remains a separate did:key identity",
+    "handle": "opaque authenticated amh_<source>_001; handle is not authority",
+    "shareMapping": "mapping.sharePolicyCid == Share policyCid; mapping.shareDelegationCid == Share delegationCid; mapping.policyAuthorityCid and mapping.policyEnforcementCid are exact Node #117 CIDs",
+    "status": "each parent has a separately signed active/revoked observation with signer kid/version, monotonic sequence, checkedAt/freshUntil <= 300 seconds, and irreversible revocation",
+    "attestation": "separately signed runtime attestation binds target origin, node audience, enforcer DID/kid/public key/version, local signer identity, measurement/digest, expiry, and enrollment digest",
+    "keySelection": "owner key is canonical did:key kid; node invitation key remains enrollment-selected; enforcer key/version is explicit"
+  },
+  "nodeAuthority": {
+    "origin": "https://node.example",
+    "nodeAudience": "did:web:node.example",
+    "activeKeyVersion": 1,
+    "keyVersions": [
+      {
+        "keyVersion": 1,
+        "invitationKid": "did:web:node.example#invitation-key-1",
+        "publicKey": "IVL40Zt5HSRFMkLhXy6rbLfP-ntqXtMAl5YOBpiB2xI",
+        "state": "active"
+      },
+      {
+        "keyVersion": 2,
+        "invitationKid": "did:web:node.example#invitation-key-2",
+        "publicKey": "Y1VpHBeKj_kQB6dHivuVXvc1LGPnslcDmEz3iybiGlY",
+        "state": "retired"
+      }
+    ],
+    "rules": {
+      "originAudienceImmutable": true,
+      "enabledRequired": true,
+      "rotationRequiresHigherVersion": true,
+      "retiredVersionsReject": true
+    }
+  },
+  "issuerTrust": {
+    "issuerDid": "did:web:issuer.credentials.org",
+    "vct": "opencredentials.email/v1",
+    "keyVersion": 1,
+    "kid": "did:web:issuer.credentials.org#email-signing-key-1",
+    "publicKey": "Ivwpd5Lwtv_Av8_bftsMCqFOAlo2XsDjQuhuOCnLdLY",
+    "enabled": true
+  },
+  "ttlSeconds": {
+    "inviteAuthorization": 300,
+    "magicClaim": 604800,
+    "otp": 600,
+    "claimNonce": 300,
+    "holderBinding": 120,
+    "credential": 2592000,
+    "policyNonce": 120,
+    "policySession": 300,
+    "readInvocation": 60
+  },
+  "limits": {
+    "emailBytes": 254,
+    "emailLocalBytes": 64,
+    "emailDomainBytes": 253,
+    "dnsLabelBytes": 63,
+    "documentNameBytes": 200,
+    "shareIdBytes": 128,
+    "delegationBytes": 65536,
+    "policyBytes": 65536,
+    "resourceBytes": 1024,
+    "markdownBytes": 1048576,
+    "credentialBytes": 65536,
+    "sqlArgumentsBytes": 4096,
+    "otpAttempts": 5,
+    "resendCooldownSeconds": 20,
+    "resendsPerShareHour": 3,
+    "resendsPerEmailDay": 5,
+    "resendsPerIpDay": 20
+  },
+  "errors": [
+    "invalid_or_expired_claim",
+    "claim_already_used",
+    "invitation_authorization_invalid",
+    "untrusted_node",
+    "invalid_content_source",
+    "invalid_holder_proof",
+    "invalid_credential_profile",
+    "policy_denied",
+    "nonce_already_used",
+    "read_denied",
+    "capability_unavailable"
+  ],
+  "capabilities": {
+    "witness": {
+      "id": "tinycloud.share-email-claim",
+      "version": 1,
+      "origin": "https://witness.credentials.org",
+      "returnOrigin": "https://share.tinycloud.xyz",
+      "routes": [
+        "/v1/share-email/invitations",
+        "/v1/share-email/invitations/resend",
+        "/v1/share-email/claims/activate",
+        "/v1/share-email/claims/challenge",
+        "/v1/share-email/claims/redeem"
+      ],
+      "mailProvider": "resend",
+      "status": "disabled-until-real-provider"
+    },
+    "node": {
+      "id": "tinycloud.node-policy-email-v1",
+      "version": 1,
+      "origin": "https://node.example",
+      "routes": [
+        "/share/v1/invitations/authorize",
+        "/share/v1/policy/challenges",
+        "/share/v1/policy/session",
+        "/share/v1/read"
+      ],
+      "contentKinds": ["kv", "sql"],
+      "status": "disabled-until-authority-ready"
+    }
+  },
+  "keySeparationLabels": [
+    "issuer-signing",
+    "pii-envelope-encryption",
+    "otp-pepper",
+    "delivery-material",
+    "issuance-seed-wrapping",
+    "daily-log-correlation"
+  ],
+  "testKeys": {
+    "warning": "NON-PRODUCTION TEST VECTORS ONLY",
+    "senderSeedHex": "4444444444444444444444444444444444444444444444444444444444444444",
+    "nodeSeedHex": "4242424242424242424242424242424242424242424242424242424242424242",
+    "issuerSeedHex": "4343434343434343434343434343434343434343434343434343434343434343",
+    "holderSeedHex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+  }
+}

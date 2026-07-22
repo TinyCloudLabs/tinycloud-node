@@ -1180,6 +1180,7 @@ dependencies = [
  "blocking",
  "futures-lite 2.6.1",
  "once_cell",
+ "tokio",
 ]
 
 [[package]]
@@ -7585,6 +7586,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "sea-orm-cli"
+version = "1.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da80ebcdb44571e86f03a2bdcb5532136a87397f366f38bbce64673fc5e6a450"
+dependencies = [
+ "async-std",
+ "chrono",
+ "glob",
+ "regex",
+ "sea-schema",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "sea-orm-macros"
 version = "1.1.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7606,6 +7625,7 @@ checksum = "7315c0cadb7e60fb17ee2bb282aa27d01911fc2a7e5836ec1d4ac37d19250bb4"
 dependencies = [
  "async-trait",
  "sea-orm",
+ "sea-orm-cli",
  "sea-schema",
  "tracing",
  "tracing-subscriber",
@@ -7666,7 +7686,9 @@ checksum = "2239ff574c04858ca77485f112afea1a15e53135d3097d0c86509cef1def1338"
 dependencies = [
  "futures",
  "sea-query",
+ "sea-query-binder",
  "sea-schema-derive",
+ "sqlx",
 ]
 
 [[package]]
@@ -9608,17 +9630,20 @@ dependencies = [
  "futures",
  "hex",
  "iri-string",
+ "k256",
  "libp2p",
  "multihash-derive 0.9.1",
  "pin-project",
  "rand 0.8.5",
  "rusqlite",
+ "ryu-js",
  "sea-orm",
  "sea-orm-migration",
  "serde",
  "serde_ipld_dagcbor 0.3.0",
  "serde_json",
  "sha2 0.10.9",
+ "sha3",
  "sqlparser",
  "tempfile",
  "thiserror 2.0.18",
@@ -9636,6 +9661,7 @@ name = "tinycloud-node"
 version = "1.8.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "aws-config",
  "aws-sdk-dynamodb",
  "aws-sdk-s3",
@@ -9702,6 +9728,27 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "x509-parser 0.16.0",
+]
+
+[[package]]
+name = "tinycloud-node-production-e2e"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "futures",
+ "k256",
+ "rocket",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sha3",
+ "tempfile",
+ "time",
+ "tinycloud-auth",
+ "tinycloud-core",
+ "tinycloud-node",
+ "tokio",
 ]
 
 [[package]]

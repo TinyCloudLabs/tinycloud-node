@@ -80,7 +80,7 @@ pub fn generate_csr(name: &str) -> Result<CsrBundle, LinkError> {
 mod tests {
     use super::*;
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn fqdn_uses_local_tinycloud_link_suffix() {
         assert_eq!(fqdn_for_name("office"), "office.local.tinycloud.link");
         assert_eq!(
@@ -89,7 +89,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn generated_csr_carries_expected_domain_in_cn_and_single_san_dns() {
         use x509_parser::prelude::FromDer;
         let bundle = generate_csr("mynode").expect("CSR generated");
@@ -149,7 +149,7 @@ mod tests {
     // throws "Cannot read public key. OID is not RSA." for EC keys). If this
     // ever drifts back to an EC keypair, every `link enable`/`renew` cert
     // request will be rejected with a 400 from the live service.
-    #[test]
+    #[::core::prelude::v1::test]
     fn generated_csr_public_key_is_rsa() {
         use x509_parser::prelude::FromDer;
         const RSA_ENCRYPTION_OID: &str = "1.2.840.113549.1.1.1";

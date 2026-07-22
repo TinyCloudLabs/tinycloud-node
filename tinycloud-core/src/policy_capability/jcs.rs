@@ -23,12 +23,7 @@ fn write_value(v: &Value, out: &mut Vec<u8>) {
     match v {
         Value::Null => out.extend_from_slice(b"null"),
         Value::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
-        Value::Number(n) => {
-            // serde_json's default Display matches JCS for integers, and for
-            // floats it uses Ryū which matches RFC 8785's ES6 number
-            // representation in the cases our vectors use.
-            out.extend_from_slice(n.to_string().as_bytes());
-        }
+        Value::Number(n) => write_number(n, out),
         Value::String(s) => write_string(s, out),
         Value::Array(arr) => {
             out.push(b'[');
@@ -56,6 +51,22 @@ fn write_value(v: &Value, out: &mut Vec<u8>) {
             out.push(b'}');
         }
     }
+}
+
+fn write_number(value: &serde_json::Number, out: &mut Vec<u8>) {
+    if let Some(value) = value.as_i64() {
+        out.extend_from_slice(value.to_string().as_bytes());
+        return;
+    }
+    if let Some(value) = value.as_u64() {
+        out.extend_from_slice(value.to_string().as_bytes());
+        return;
+    }
+    let Some(value) = value.as_f64() else {
+        return;
+    };
+    let mut buffer = ryu_js::Buffer::new();
+    out.extend_from_slice(buffer.format(value).as_bytes());
 }
 
 fn cmp_utf16(a: &str, b: &str) -> std::cmp::Ordering {
@@ -123,5 +134,23 @@ mod tests {
         let canon = canonicalize(&v);
         let want: Vec<u8> = b"{\"x\":\"caf\xc3\xa9\"}".to_vec();
         assert_eq!(canon, want);
+    }
+
+    #[test]
+    fn canonicalizes_numbers_at_ecmascript_thresholds() {
+        for (raw, expected) in [
+            ("-0.0", "0"),
+            ("100000000000000000000", "100000000000000000000"),
+            ("1000000000000000000000", "1e+21"),
+            ("0.000001", "0.000001"),
+            ("0.0000001", "1e-7"),
+            ("333333333.33333329", "333333333.3333333"),
+        ] {
+            let value: Value = serde_json::from_str(raw).unwrap();
+            assert_eq!(
+                std::str::from_utf8(&canonicalize(&value)).unwrap(),
+                expected
+            );
+        }
     }
 }

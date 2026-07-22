@@ -15,7 +15,7 @@ use std::{
 use tokio::sync::watch;
 
 use crate::{
-    app, config, link,
+    config, link,
     node_control::{
         control::{self, ControlPlaneServer},
         paths::Profile,
@@ -88,18 +88,19 @@ pub async fn launch_with_figment(
         Profile::default_for_host(),
     )
     .await?;
-    let rocket = match app(&figment, &tinycloud_config, Some(control.handle())).await {
-        Ok(r) => r.ignite().await?,
-        Err(e) => {
-            eprintln!("\n✗ Failed to start tinycloud-node:\n");
-            for cause in e.chain() {
-                eprintln!("  {cause}");
+    let rocket =
+        match crate::app_with_control(&figment, &tinycloud_config, Some(control.handle())).await {
+            Ok(r) => r.ignite().await?,
+            Err(e) => {
+                eprintln!("\n✗ Failed to start tinycloud-node:\n");
+                for cause in e.chain() {
+                    eprintln!("  {cause}");
+                }
+                eprintln!("\nCheck your tinycloud.toml or TINYCLOUD_ environment variables.");
+                let _ = control.shutdown().await;
+                std::process::exit(1);
             }
-            eprintln!("\nCheck your tinycloud.toml or TINYCLOUD_ environment variables.");
-            let _ = control.shutdown().await;
-            std::process::exit(1);
-        }
-    };
+        };
 
     let public_api_port = rocket.config().port;
     launch_rocket(
@@ -525,7 +526,7 @@ mod tests {
         )
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn serve_config_figment_uses_env_resolved_datadir_for_overlay() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
@@ -564,7 +565,7 @@ mod tests {
         assert!(cfg.telemetry.enabled);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn serve_config_figment_defaults_to_spec_bind_without_config_file() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
@@ -591,7 +592,7 @@ mod tests {
         assert_eq!(cfg.keys, config::Keys::Auto);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn legacy_config_figment_defaults_to_spec_bind_without_config_file() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
@@ -619,7 +620,7 @@ mod tests {
     }
 
     #[cfg(feature = "dstack")]
-    #[test]
+    #[::core::prelude::v1::test]
     fn serve_config_figment_loads_keys_type_from_env() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
@@ -644,7 +645,7 @@ mod tests {
     }
 
     #[cfg(feature = "dstack")]
-    #[test]
+    #[::core::prelude::v1::test]
     fn legacy_config_figment_loads_keys_type_from_env() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();

@@ -1,9 +1,12 @@
-//! TinyCloud node server: public API (Rocket), local control plane, and the
-//! `tinycloud node service ...` CLI for desktop/local installs.
-
+extern crate anyhow;
+#[allow(unused_imports)]
 #[macro_use]
 extern crate rocket;
-extern crate anyhow;
+#[macro_use]
+#[allow(unused_imports)]
+extern crate async_trait;
+#[cfg(test)]
+extern crate tokio;
 
 use anyhow::{Context, Result};
 use rocket::{fairing::AdHoc, figment::Figment, http::Header, Build, Rocket};
@@ -12,7 +15,6 @@ use std::{path::Path, sync::Arc};
 pub mod allow_list;
 pub mod auth_guards;
 pub mod authorization;
-pub mod cli;
 pub mod config;
 #[cfg(feature = "dstack")]
 pub mod dstack;
@@ -24,6 +26,7 @@ pub mod prometheus;
 pub mod quota;
 pub mod routes;
 pub mod runtime;
+pub mod share_email;
 pub mod signed_urls;
 pub mod storage;
 pub mod tee;
@@ -44,20 +47,11 @@ pub(crate) mod test_support {
     }
 }
 
-use config::{BlockStorage, Config, StagingStorage};
+use config::{BlockStorage, Config, Keys, StagingStorage};
 use hooks::HookRuntime;
 use invocation_replay::InvocationReplayCache;
-use node_control::{
-    control::ControlPlaneHandle,
-    key_provider::{self, IdentityPurpose},
-};
+use node_control::control::ControlPlaneHandle;
 use quota::QuotaCache;
-#[cfg(feature = "tc-bench-v1")]
-use routes::tc_bench::{
-    auth_verify as tc_bench_auth_verify, block_get as tc_bench_block_get,
-    block_put as tc_bench_block_put, health as tc_bench_health, kv_get as tc_bench_kv_get,
-    kv_put as tc_bench_kv_put, BenchState,
-};
 use routes::{
     admin::{delete_quota, get_quota, get_usage, list_quotas, set_quota},
     attestation::attestation,
@@ -135,11 +129,27 @@ impl From<BlockStage> for StagingStorage {
 
 pub type TinyCloud = SpaceDatabase<DatabaseConnection, BlockStores, StaticSecret>;
 
-pub async fn app(
+pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
+    let tinycloud_config = config.extract::<Config>()?;
+    app_with_control(config, &tinycloud_config, None).await
+}
+
+pub async fn app_with_control(
     config: &Figment,
     tinycloud_config: &Config,
     control: Option<ControlPlaneHandle>,
 ) -> Result<Rocket<Build>> {
+    let mut tinycloud_config = tinycloud_config.clone();
+    tinycloud_config.storage.resolve();
+    tinycloud_config.share_email = tinycloud_config
+        .share_email
+        .resolve_trust_bundle()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    tinycloud_config
+        .share_email
+        .validate_for_database(tinycloud_config.storage.database())
+        .map_err(|error| anyhow::anyhow!(error))?;
+
     // Ensure local storage directories exist.
     // SQLite file paths and local dirs are resources the server owns — auto-create them.
     // Remote backends (Postgres, S3) are left alone; connection errors surface naturally.
@@ -149,72 +159,43 @@ pub async fn app(
 
     tracing::tracing_try_init(&tinycloud_config.log)?;
 
-    let routes = {
-        let routes = routes![
-            healthcheck,
-            cors,
-            info,
-            version,
-            open_host_key,
-            invoke,
-            delegate,
-            delegation_query,
-            delegation_status,
-            revoke,
-            create_signed_kv_url,
-            signed_kv_get,
-            create_hook_ticket,
-            hook_events,
-            create_webhook,
-            list_webhooks,
-            delete_webhook,
-            public_kv_get,
-            public_kv_head,
-            public_kv_list,
-            public_kv_options,
-            attestation,
-            set_quota,
-            delete_quota,
-            get_quota,
-            list_quotas,
-            get_usage,
-            create_encryption_network,
-            get_encryption_network,
-            encryption_well_known,
-            encryption_decrypt,
-            revoke_encryption_network,
-        ];
+    let mut routes = rocket::routes![
+        healthcheck,
+        cors,
+        info,
+        version,
+        open_host_key,
+        invoke,
+        delegate,
+        delegation_query,
+        delegation_status,
+        revoke,
+        create_signed_kv_url,
+        signed_kv_get,
+        create_hook_ticket,
+        hook_events,
+        create_webhook,
+        list_webhooks,
+        delete_webhook,
+        public_kv_get,
+        public_kv_head,
+        public_kv_list,
+        public_kv_options,
+        attestation,
+        set_quota,
+        delete_quota,
+        get_quota,
+        list_quotas,
+        get_usage,
+        create_encryption_network,
+        get_encryption_network,
+        encryption_well_known,
+        encryption_decrypt,
+        revoke_encryption_network,
+    ];
+    routes.extend(share_email::public_routes());
 
-        #[cfg(feature = "tc-bench-v1")]
-        let mut routes = routes;
-        #[cfg(feature = "tc-bench-v1")]
-        {
-            routes.extend(routes![
-                tc_bench_auth_verify,
-                tc_bench_kv_put,
-                tc_bench_kv_get,
-                tc_bench_block_put,
-                tc_bench_block_get,
-                tc_bench_health,
-            ]);
-        }
-
-        routes
-    };
-
-    let identity_state = key_provider::resolve_identity_state(
-        Some(&tinycloud_config.keys),
-        &tinycloud_config.storage.datadir,
-        IdentityPurpose::Serve,
-    )?;
-    if let Some(control) = control.as_ref() {
-        control
-            .set_identity_snapshot(key_provider::identity_snapshot(&identity_state))
-            .await;
-    }
-    let key_setup = identity_state
-        .secret
-        .ok_or_else(|| anyhow::anyhow!("node identity is not ready"))?;
+    let key_setup: StaticSecret = resolve_keys(&tinycloud_config.keys).await?;
     let webhook_encryption =
         ColumnEncryption::new(key_setup.derive_key(b"tinycloud/hooks/webhook-secrets"));
     let hook_runtime = HookRuntime::new(
@@ -273,6 +254,17 @@ pub async fn app(
         });
     } else {
         connect_opts.max_connections(100);
+        if let Some(root_cert_path) = tinycloud_config
+            .share_email
+            .postgres_tls
+            .root_cert_path
+            .as_deref()
+        {
+            let root_cert_path = root_cert_path.to_owned();
+            connect_opts.map_sqlx_postgres_opts(move |options| {
+                options.ssl_root_cert(root_cert_path.clone())
+            });
+        }
     }
 
     let database_connection = Database::connect(connect_opts).await?;
@@ -301,8 +293,6 @@ pub async fn app(
         node_keypair,
         encryption_backend,
     );
-    #[cfg(feature = "tc-bench-v1")]
-    let bench_database_connection = database_connection.clone();
 
     let tinycloud = TinyCloud::new(
         database_connection,
@@ -312,14 +302,6 @@ pub async fn app(
     .await?
     .with_encryption(Some(webhook_encryption.clone()))
     .with_sql_sizes(sql_sizes.clone());
-
-    #[cfg(feature = "tc-bench-v1")]
-    let bench_state = BenchState::new(
-        &tinycloud_config.tc_bench,
-        bench_database_connection,
-        if is_sqlite { 1 } else { 100 },
-    )
-    .await?;
 
     // Seed the SQL-size mirror AFTER `TinyCloud::new` ran migrations — the
     // `database_artifact` table now exists (seeding before migrations would
@@ -331,6 +313,36 @@ pub async fn app(
         tinycloud_config.storage.sql.memory_threshold.as_u64(),
         database_artifact_repository.clone(),
     );
+
+    let share_email_runtime = share_email::compose(
+        tinycloud_config.share_email.clone(),
+        seed_conn.clone(),
+        &key_setup,
+        Arc::new(tinycloud.clone()),
+        Arc::new(sql_service.clone()),
+    )?;
+    if let Some(runtime) = share_email_runtime.as_ref() {
+        if !runtime.bridge.self_check().await {
+            anyhow::bail!(
+                "share email readiness failed: authority, fresh status, attestation, or database is unavailable"
+            );
+        }
+    }
+    if let Some(runtime) = share_email_runtime.as_ref() {
+        let state = runtime.state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                if let Err(error) = state.cleanup(time::OffsetDateTime::now_utc()).await {
+                    ::tracing::warn!(
+                        ?error,
+                        "share-email cleanup failed; capability remains fail-closed"
+                    );
+                }
+            }
+        });
+    }
 
     #[cfg(feature = "duckdb")]
     let duckdb_service = DuckDbService::new(
@@ -368,12 +380,10 @@ pub async fn app(
         .mount("/", routes)
         .attach(AdHoc::config::<Config>())
         .attach(tracing::TracingFairing {
-            header_name: tinycloud_config.log.tracing.traceheader.clone(),
+            header_name: tinycloud_config.log.tracing.traceheader,
         })
         .manage(tinycloud)
         .manage(sql_service);
-    #[cfg(feature = "tc-bench-v1")]
-    let rocket = rocket.manage(bench_state);
     #[cfg(feature = "duckdb")]
     let rocket = rocket.manage(duckdb_service);
     let rocket = rocket
@@ -383,6 +393,7 @@ pub async fn app(
         .manage(signed_url_runtime)
         .manage(webhook_encryption)
         .manage(rate_limiter)
+        .manage(share_email_runtime)
         .manage(tee_context)
         .manage(encryption_service)
         .manage(tinycloud_config.storage.staging.open().await?);
@@ -407,9 +418,39 @@ pub async fn app(
         rocket
     };
 
-    if tinycloud_config.cors {
-        Ok(rocket.attach(AdHoc::on_response("CORS", |_, resp| {
+    let share_allowed_origin = tinycloud_config
+        .share_email
+        .allowed_origins
+        .first()
+        .cloned()
+        .unwrap_or_else(|| tinycloud_config.share_email.return_origin.clone());
+    let rocket = rocket.attach(AdHoc::on_response(
+        "share-email-security-headers",
+        move |request, response| {
+            let share_allowed_origin = share_allowed_origin.clone();
             Box::pin(async move {
+                if request.uri().path().starts_with("/share/v1/") {
+                    response.set_header(Header::new("Cache-Control", "no-store"));
+                    response.set_header(Header::new("X-Content-Type-Options", "nosniff"));
+                    response.set_header(Header::new("Referrer-Policy", "no-referrer"));
+                    response.set_header(Header::new(
+                        "Access-Control-Allow-Origin",
+                        share_allowed_origin,
+                    ));
+                    response.set_header(Header::new("Access-Control-Allow-Methods", "POST"));
+                    response
+                        .set_header(Header::new("Access-Control-Allow-Headers", "Content-Type"));
+                }
+            })
+        },
+    ));
+
+    if tinycloud_config.cors {
+        Ok(rocket.attach(AdHoc::on_response("CORS", |request, resp| {
+            Box::pin(async move {
+                if request.uri().path().starts_with("/share/v1/") {
+                    return;
+                }
                 resp.set_header(Header::new("Access-Control-Allow-Origin", "*"));
                 resp.set_header(Header::new(
                     // allow these methods for requests
@@ -431,6 +472,55 @@ pub async fn app(
         })))
     } else {
         Ok(rocket)
+    }
+}
+
+async fn resolve_keys(keys: &Keys) -> Result<StaticSecret> {
+    match keys {
+        Keys::Static(s) => Ok(s.clone().try_into()?),
+        #[cfg(feature = "dstack")]
+        Keys::Dstack => {
+            let key_bytes = dstack::get_key("tinycloud/keys/primary").await?;
+            StaticSecret::new(key_bytes)
+                .map_err(|v| anyhow::anyhow!("dstack key too short: {} bytes", v.len()))
+        }
+        Keys::Auto => {
+            // Check TINYCLOUD_TEE_MODE env var first
+            match std::env::var("TINYCLOUD_TEE_MODE").ok().as_deref() {
+                #[cfg(feature = "dstack")]
+                Some("dstack") => {
+                    let key_bytes = dstack::get_key("tinycloud/keys/primary").await?;
+                    StaticSecret::new(key_bytes)
+                        .map_err(|v| anyhow::anyhow!("dstack key too short: {} bytes", v.len()))
+                }
+                Some("off") => {
+                    anyhow::bail!(
+                        "TEE mode disabled but no static key configured. \
+                         Set TINYCLOUD_KEYS_SECRET or configure [keys] in config."
+                    )
+                }
+                _ => {
+                    // Auto-detect: check for dstack socket
+                    #[cfg(feature = "dstack")]
+                    if dstack::is_available() {
+                        ::tracing::info!("dstack socket detected, using TEE key derivation");
+                        let key_bytes = dstack::get_key("tinycloud/keys/primary").await?;
+                        return StaticSecret::new(key_bytes).map_err(|v| {
+                            anyhow::anyhow!("dstack key too short: {} bytes", v.len())
+                        });
+                    }
+                    anyhow::bail!(
+                        "No key source configured. Either:\n  \
+                         - Set TINYCLOUD_KEYS_SECRET environment variable\n  \
+                         - Configure [keys] section in tinycloud.toml\n  \
+                         - Run inside a dstack TEE (with 'dstack' feature enabled)"
+                    )
+                }
+            }
+        }
+        Keys::Provider => anyhow::bail!(
+            "provider key mode must be resolved through the node control key-provider path"
+        ),
     }
 }
 

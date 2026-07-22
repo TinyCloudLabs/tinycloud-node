@@ -1,0 +1,21 @@
+{
+  "manifestVersion": 1,
+  "contractVersion": "tinycloud.share-email-claim/v1",
+  "files": {
+    "positive.json": "LeUBRvznxoSqHsaSms_mGWoJiMN_LTRcgS0EpE35oWA",
+    "negative.json": "HU6oz7nYywuR9_pdPGJHr_WGhClPNVz63_-ATfHs4oI",
+    "states.json": "I5vwcw3UyGqnLUZFMONW3Mz4NB9fMYV4n8VxpjyeKDI",
+    "build.mjs": "m4fYop89RBL9cHHj268A5z1B7DqIcu7B8yZ0NttfCjk",
+    "validate.mjs": "bM9YFXiEWrTzXdLxUt33bf5_LiV40iF-QX86_fxD-9g",
+    "loader.ts": "_N-1_IjNOXrm_4p6ObsyFjWvXHcFieixqqFntyWkVkg",
+    "rust/Cargo.toml": "NMdpBiBPFtiy1N9yBltyPtR6UPUwV-WFTNf2s_dnnIU",
+    "rust/Cargo.lock": "rWXLVvO1r531D1y3-SZjjqoknzpkOb6wjqTmhcFBZ-U",
+    "rust/src/main.rs": "p5uAJFLsgCl_2oJelsCZmRqFDD-rjgwBXHEygmm7W1g",
+    "domains.json": "HIIBpz9hDgnN28isDQv9nYcq20VnhETcS3Ph6D2_uvg",
+    "schemas.json": "KfbG7RiXhkMr1C2q3BZhlaxDV4KWxhGMzoIMZ-tGyoc",
+    "authority-material.schema.json": "EYIzrAtgNmICrvYABSOssEfYXhX778ula7y9htWZ1ys",
+    "README.md": "sXnqXpmFo99s1xgyk95r1lN5v8Q7XdhW12qz7X5wgbk"
+  },
+  "testOnly": true,
+  "manifestDigest": "pl8-1Rpx_DYCBjOpK3hRrLfrSVDINNFssZDfFw6BMTs"
+}

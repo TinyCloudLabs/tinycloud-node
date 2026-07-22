@@ -158,14 +158,14 @@ pub fn chunk_body(body: &[u8]) -> Vec<String> {
 mod tests {
     use super::*;
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn ack_frame_round_trips_with_ts_shape() {
         let frame = TunnelFrame::Ack;
         assert_eq!(frame.encode(), r#"{"type":"ack"}"#);
         assert_eq!(TunnelFrame::parse(r#"{"type":"ack"}"#).unwrap(), frame);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn request_frame_headers_serialize_as_ordered_pair_arrays() {
         let frame = TunnelFrame::Request {
             id: "req-1".into(),
@@ -185,7 +185,7 @@ mod tests {
         assert_eq!(TunnelFrame::parse(&json).unwrap(), frame);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn error_frame_omits_id_when_absent() {
         let frame = TunnelFrame::Error {
             id: None,
@@ -194,7 +194,7 @@ mod tests {
         assert_eq!(frame.encode(), r#"{"type":"error","message":"boom"}"#);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn error_frame_includes_id_when_present() {
         let frame = TunnelFrame::Error {
             id: Some("req-1".into()),
@@ -206,7 +206,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn request_id_accessor_covers_every_variant() {
         assert_eq!(TunnelFrame::Ack.request_id(), None);
         assert_eq!(
@@ -228,7 +228,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn chunk_body_splits_at_body_chunk_bytes() {
         let body = vec![b'x'; 2 * BODY_CHUNK_BYTES + 10];
         let chunks = chunk_body(&body);
@@ -240,12 +240,12 @@ mod tests {
         assert_eq!(reassembled, body);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn chunk_body_of_empty_body_yields_one_empty_chunk() {
         assert_eq!(chunk_body(&[]), vec![String::new()]);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn parse_rejects_unknown_type() {
         assert!(TunnelFrame::parse(r#"{"type":"bogus"}"#).is_err());
     }

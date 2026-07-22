@@ -1,0 +1,40 @@
+# TinyCloud Node share-email staging container.
+#
+# This file deliberately has no fallback values for image, database URL,
+# config, CA, trust key, or node secret. Compose refuses to interpolate a
+# partial deployment; the node performs the second, cryptographic readiness
+# check before serving the share-email routes.
+
+services:
+  tinycloud:
+    image: ${TINYCLOUD_IMAGE:?set an immutable TinyCloud image reference}
+    restart: unless-stopped
+    read_only: true
+    ports:
+      - "${TINYCLOUD_BIND_PORT:-8000}:8000"
+    environment:
+      TINYCLOUD_CONFIG_FILE: /run/tinycloud/tinycloud.toml
+      TINYCLOUD_STORAGE__DATABASE: ${TINYCLOUD_STORAGE_DATABASE:?set a PostgreSQL URL with sslmode=verify-full}
+      TINYCLOUD_KEYS_SECRET: ${TINYCLOUD_KEYS_SECRET:?set the node key source out of band}
+      TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_PATH: /run/tinycloud/share-email-trust-bundle.json
+      TINYCLOUD_SHARE_EMAIL__POSTGRES_TLS__SSLMODE: verify-full
+      TINYCLOUD_SHARE_EMAIL__POSTGRES_TLS__ROOT_CERT_PATH: /run/tinycloud/postgres-ca.pem
+      TINYCLOUD_CORS: "false"
+      ROCKET_ADDRESS: 0.0.0.0
+    volumes:
+      - type: bind
+        source: ${TINYCLOUD_SHARE_EMAIL_CONFIG:?set a filled copy of tinycloud.toml.example}
+        target: /run/tinycloud/tinycloud.toml
+        read_only: true
+      - type: bind
+        source: ${TINYCLOUD_SHARE_EMAIL_AUTHORITY_MATERIAL:?set the operator-signed authority material bundle}
+        target: /run/tinycloud/authority-material.json
+        read_only: true
+      - type: bind
+        source: ${TINYCLOUD_SHARE_EMAIL_TRUST_BUNDLE:?set the environment-owned trust bundle}
+        target: /run/tinycloud/share-email-trust-bundle.json
+        read_only: true
+      - type: bind
+        source: ${TINYCLOUD_POSTGRES_CA_CERT:?set the PostgreSQL CA bundle}
+        target: /run/tinycloud/postgres-ca.pem
+        read_only: true

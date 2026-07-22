@@ -1,0 +1,2847 @@
+{
+  "version": "tinycloud.share-email-claim/v1",
+  "testOnly": true,
+  "cases": [
+    {
+      "id": "leading-space",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": " Alice@example.com"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": " Alice@example.com"
+    },
+    {
+      "id": "trailing-space",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": "Alice@example.com "
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": "Alice@example.com "
+    },
+    {
+      "id": "tab",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": "Alice@\texample.com"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": "Alice@\texample.com"
+    },
+    {
+      "id": "newline",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": "Alice@example.com\n"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": "Alice@example.com\n"
+    },
+    {
+      "id": "inner-space",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": "Alice Notes@example.com"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": "Alice Notes@example.com"
+    },
+    {
+      "id": "leading-dot-local",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": ".Alice@example.com"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": ".Alice@example.com"
+    },
+    {
+      "id": "trailing-dot-local",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": "Alice.@example.com"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": "Alice.@example.com"
+    },
+    {
+      "id": "repeated-dot-local",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": "Alice..Notes@example.com"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": "Alice..Notes@example.com"
+    },
+    {
+      "id": "empty-local",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": "@example.com"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": "@example.com"
+    },
+    {
+      "id": "empty-domain",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": "Alice@"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": "Alice@"
+    },
+    {
+      "id": "multiple-at",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": "Alice@gmail.com@example.com"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": "Alice@gmail.com@example.com"
+    },
+    {
+      "id": "quoted-local",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": "\"Alice\"@example.com"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": "\"Alice\"@example.com"
+    },
+    {
+      "id": "comment-local",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": "Alice(comment)@example.com"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": "Alice(comment)@example.com"
+    },
+    {
+      "id": "backslash-local",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": "Alice\\Bob@example.com"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": "Alice\\Bob@example.com"
+    },
+    {
+      "id": "angle-form",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": "Alice <alice@example.com>"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": "Alice <alice@example.com>"
+    },
+    {
+      "id": "unicode-local",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": "álíce@example.com"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": "álíce@example.com"
+    },
+    {
+      "id": "unicode-domain",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": "Alice@bücher.example"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": "Alice@bücher.example"
+    },
+    {
+      "id": "local-over-64",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@example.com"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@example.com"
+    },
+    {
+      "id": "label-over-63",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": "Alice@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": "Alice@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com"
+    },
+    {
+      "id": "empty-domain-label",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": "Alice@example..com"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": "Alice@example..com"
+    },
+    {
+      "id": "trailing-domain-dot",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": "Alice@example.com."
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": "Alice@example.com."
+    },
+    {
+      "id": "leading-hyphen",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": "Alice@-example.com"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": "Alice@-example.com"
+    },
+    {
+      "id": "trailing-hyphen",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": "Alice@example-.com"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": "Alice@example-.com"
+    },
+    {
+      "id": "domain-over-253",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": "a@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd.eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeex"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": "a@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd.eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeex"
+    },
+    {
+      "id": "total-over-254",
+      "kind": "email",
+      "target": "canonicalEmail",
+      "mutation": "reject-input",
+      "mutationData": {
+        "operation": "reject-input",
+        "input": "aa@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd.eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation",
+      "input": "aa@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd.eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    },
+    {
+      "id": "policy-cid-is-real",
+      "kind": "cid",
+      "target": "policyBytes",
+      "mutation": "replace-policy-bytes-with-other-bytes",
+      "mutationData": {
+        "operation": "replace",
+        "replacement": "other policy bytes"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "policy-bytes-self-policy-cid",
+      "kind": "policy",
+      "target": "policyBytes",
+      "mutation": "insert-policyCid-self-reference",
+      "mutationData": {
+        "operation": "insert-property",
+        "property": "policyCid",
+        "value": "bafkreihepz3bwuubhhm3q4beispxxy2edi6i3dolefyfu6jbwl6ofzgaom"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "share-cid-is-real",
+      "kind": "cid",
+      "target": "sealedBlob",
+      "mutation": "flip-one-blob-byte",
+      "mutationData": {
+        "operation": "flip-byte",
+        "offset": "last",
+        "replacementCid": "bafkreibhhiniz46x63wrrqghm7ypjix7ow5jybnydczju34z3i3smgu5xe"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "sealed-blob-aead-tamper",
+      "kind": "aead",
+      "target": "sealedBlob",
+      "mutation": "flip-authenticated-byte",
+      "mutationData": {
+        "operation": "flip-byte",
+        "offset": "last"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "envelope-policy-target-missing-kind",
+      "kind": "schema",
+      "target": "envelope.authorizationTarget.kind",
+      "mutation": "delete-kind",
+      "mutationData": {
+        "operation": "delete"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "envelope-policy-target-missing-bytes",
+      "kind": "schema",
+      "target": "envelope.authorizationTarget.policyBytes",
+      "mutation": "delete-policyBytes",
+      "mutationData": {
+        "operation": "delete"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "envelope-policy-target-mismatch",
+      "kind": "envelope",
+      "target": "envelope.authorizationTarget",
+      "mutation": "re-sign-policyCid-with-other-policyBytes",
+      "mutationData": {
+        "operation": "replace-pair",
+        "policyCid": "bafkreihepz3bwuubhhm3q4beispxxy2edi6i3dolefyfu6jbwl6ofzgaom",
+        "policyBytes": "eyJhY3Rpb24iOiJ0aW55Y2xvdWQua3YvZ2V0IiwiY29udGVudFNvdXJjZSI6eyJhY3Rpb24iOiJ0aW55Y2xvdWQua3YvZ2V0Iiwia2luZCI6Imt2IiwicGF0aCI6ImRvY3VtZW50cy9wbGFuLm1kIiwic3BhY2UiOiJkaWQ6cGtoOmVpcDE1NToxOjB4MTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMSJ9LCJjb250ZW50U291cmNlRGlnZXN0IjoiQi1PNzVnSG1JeDJDeU9tOWNPZEhKaXZQLWt1cFJ0TldjVVBYdVpiRW5aNCIsImV4cGlyZXNBdCI6IjIwMjYtMDctMjNUMTI6MDA6MDAuMDAwWiIsImlzc3VlckRpZCI6ImRpZDprZXk6ejZNa3R3dHFBenVENUY3N3RBTUJNd05zMUt5YlplZmY2MUVlaFY5eEIxWnBYUUc3IiwicmVjaXBpZW50RW1haWwiOiJCb2JAZXhhbXBsZS5jb20iLCJyZXNvdXJjZSI6ImRvY3VtZW50cy9wbGFuLm1kIiwidHlwZSI6IlRpbnlDbG91ZFNoYXJlUG9saWN5IiwidmVyc2lvbiI6MX0"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "envelope-origin-mismatch",
+      "kind": "envelope",
+      "target": "envelope.target.origin",
+      "mutation": "re-sign-origin",
+      "mutationData": {
+        "operation": "replace",
+        "value": "https://evil.example"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "share-url-userinfo",
+      "kind": "share-url",
+      "target": "createInvitationRequest.shareUrl",
+      "mutation": "reject-userinfo",
+      "mutationData": {
+        "operation": "replace",
+        "valueByKind": {
+          "kv": "https://user:pass@share.tinycloud.xyz/s/bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4#k=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+          "sql": "https://user:pass@share.tinycloud.xyz/s/bafkreif2kris7mo5etetu5jleg2noejza34ptwmpjhdm5jernutik6baqu#k=QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8"
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "share-url-origin"
+    },
+    {
+      "id": "share-url-query",
+      "kind": "share-url",
+      "target": "createInvitationRequest.shareUrl",
+      "mutation": "reject-query",
+      "mutationData": {
+        "operation": "replace",
+        "valueByKind": {
+          "kv": "https://share.tinycloud.xyz/s/bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4?x=1#k=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+          "sql": "https://share.tinycloud.xyz/s/bafkreif2kris7mo5etetu5jleg2noejza34ptwmpjhdm5jernutik6baqu?x=1#k=QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8"
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "share-url-query"
+    },
+    {
+      "id": "share-url-query-missing-fragment",
+      "kind": "share-url",
+      "target": "createInvitationRequest.shareUrl",
+      "mutation": "reject-query-before-missing-fragment",
+      "mutationData": {
+        "operation": "replace",
+        "valueByKind": {
+          "kv": "https://share.tinycloud.xyz/s/bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4?x=1",
+          "sql": "https://share.tinycloud.xyz/s/bafkreif2kris7mo5etetu5jleg2noejza34ptwmpjhdm5jernutik6baqu?x=1"
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "share-url-query"
+    },
+    {
+      "id": "share-url-duplicate-k",
+      "kind": "share-url",
+      "target": "createInvitationRequest.shareUrl",
+      "mutation": "reject-duplicate-fragment-key",
+      "mutationData": {
+        "operation": "replace",
+        "valueByKind": {
+          "kv": "https://share.tinycloud.xyz/s/bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4#k=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&k=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+          "sql": "https://share.tinycloud.xyz/s/bafkreif2kris7mo5etetu5jleg2noejza34ptwmpjhdm5jernutik6baqu#k=QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8&k=QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8"
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "share-url-fragment"
+    },
+    {
+      "id": "share-url-unknown-fragment",
+      "kind": "share-url",
+      "target": "createInvitationRequest.shareUrl",
+      "mutation": "reject-unknown-fragment-key",
+      "mutationData": {
+        "operation": "replace",
+        "valueByKind": {
+          "kv": "https://share.tinycloud.xyz/s/bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4#k=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&x=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+          "sql": "https://share.tinycloud.xyz/s/bafkreif2kris7mo5etetu5jleg2noejza34ptwmpjhdm5jernutik6baqu#k=QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8&x=QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8"
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "share-url-fragment"
+    },
+    {
+      "id": "share-url-noncanonical-k",
+      "kind": "share-url",
+      "target": "createInvitationRequest.shareUrl",
+      "mutation": "reject-noncanonical-k",
+      "mutationData": {
+        "operation": "replace",
+        "valueByKind": {
+          "kv": "https://share.tinycloud.xyz/s/bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4#k=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHhB",
+          "sql": "https://share.tinycloud.xyz/s/bafkreif2kris7mo5etetu5jleg2noejza34ptwmpjhdm5jernutik6baqu#k=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHhB"
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "share-url-key"
+    },
+    {
+      "id": "share-url-wrong-origin",
+      "kind": "share-url",
+      "target": "createInvitationRequest.shareUrl",
+      "mutation": "reject-wrong-origin",
+      "mutationData": {
+        "operation": "replace",
+        "valueByKind": {
+          "kv": "https://evil.example/s/bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4#k=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+          "sql": "https://evil.example/s/bafkreif2kris7mo5etetu5jleg2noejza34ptwmpjhdm5jernutik6baqu#k=QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8"
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "share-url-origin"
+    },
+    {
+      "id": "share-url-wrong-path",
+      "kind": "share-url",
+      "target": "createInvitationRequest.shareUrl",
+      "mutation": "reject-wrong-path",
+      "mutationData": {
+        "operation": "replace",
+        "valueByKind": {
+          "kv": "https://share.tinycloud.xyz/share/bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4#k=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+          "sql": "https://share.tinycloud.xyz/share/bafkreif2kris7mo5etetu5jleg2noejza34ptwmpjhdm5jernutik6baqu#k=QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8"
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "share-url-path"
+    },
+    {
+      "id": "share-url-http-scheme",
+      "kind": "share-url",
+      "target": "createInvitationRequest.shareUrl",
+      "mutation": "reject-http-scheme",
+      "mutationData": {
+        "operation": "replace",
+        "valueByKind": {
+          "kv": "http://share.tinycloud.xyz/s/bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4#k=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+          "sql": "http://share.tinycloud.xyz/s/bafkreif2kris7mo5etetu5jleg2noejza34ptwmpjhdm5jernutik6baqu#k=QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8"
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "share-url-scheme"
+    },
+    {
+      "id": "share-url-explicit-port",
+      "kind": "share-url",
+      "target": "createInvitationRequest.shareUrl",
+      "mutation": "reject-explicit-port",
+      "mutationData": {
+        "operation": "replace",
+        "valueByKind": {
+          "kv": "https://share.tinycloud.xyz:443/s/bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4#k=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+          "sql": "https://share.tinycloud.xyz:443/s/bafkreif2kris7mo5etetu5jleg2noejza34ptwmpjhdm5jernutik6baqu#k=QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8"
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "share-url-port"
+    },
+    {
+      "id": "share-url-percent-encoded-fragment",
+      "kind": "share-url",
+      "target": "createInvitationRequest.shareUrl",
+      "mutation": "reject-percent-encoded-fragment-material",
+      "mutationData": {
+        "operation": "replace",
+        "valueByKind": {
+          "kv": "https://share.tinycloud.xyz/s/bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4#k=%41AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+          "sql": "https://share.tinycloud.xyz/s/bafkreif2kris7mo5etetu5jleg2noejza34ptwmpjhdm5jernutik6baqu#k=%41QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8"
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "share-url-fragment-encoding"
+    },
+    {
+      "id": "document-name-over-200-utf8",
+      "kind": "schema",
+      "target": "inviteAuthorization.documentName",
+      "mutation": "reject-over-200-utf8-bytes",
+      "mutationData": {
+        "operation": "replace-and-resign",
+        "candidateArtifactByKind": {
+          "kv": {
+            "name": "inviteAuthorization",
+            "domain": "xyz.tinycloud.share/invite-authorization/v1\u0000",
+            "signerDid": "did:web:node.example",
+            "message": {
+              "type": "TinyCloudShareInviteAuthorization",
+              "version": 1,
+              "jti": "AQIDBAUGBwgJCgsMDQ4PEA",
+              "senderDid": "did:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7",
+              "shareCid": "bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4",
+              "shareId": "share-kv-001",
+              "policyCid": "bafkreiaqkcd56bhbn3zwcx7r5xdkle2nukcrhkvwwrcg4qqehk6q5hlwi4",
+              "delegationCid": "bafkreiehcdfj3fkj6xnkwsiwteiqdoa5nwkcfz5gcpijuew2wsdimly67q",
+              "authorityMaterialHandle": "amh_kv_001",
+              "authorityMaterialDigest": "wb_iHVMXQmueiWhcQeCIyIxBWHZGN6fQPS8JKyU7jq8",
+              "recipientEmail": "Alice+Notes@example.com",
+              "targetOrigin": "https://node.example",
+              "nodeAudience": "did:web:node.example",
+              "returnOrigin": "https://share.tinycloud.xyz",
+              "documentName": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa😀",
+              "senderTrust": "verified",
+              "contentSource": {
+                "kind": "kv",
+                "space": "did:pkh:eip155:1:0x1111111111111111111111111111111111111111",
+                "path": "documents/plan.md",
+                "action": "tinycloud.kv/get"
+              },
+              "contentSourceDigest": "B-O75gHmIx2CyOm9cOdHJivP-kupRtNWcUPXuZbEnZ4",
+              "shareExpiresAt": "2026-07-23T12:00:00.000Z",
+              "issuedAt": "2026-07-16T12:00:00.000Z",
+              "expiresAt": "2026-07-16T12:05:00.000Z",
+              "reportAbuseToken": "4OHi4-Tl5ufo6err7O3u7w"
+            },
+            "jcs": "{\"authorityMaterialDigest\":\"wb_iHVMXQmueiWhcQeCIyIxBWHZGN6fQPS8JKyU7jq8\",\"authorityMaterialHandle\":\"amh_kv_001\",\"contentSource\":{\"action\":\"tinycloud.kv/get\",\"kind\":\"kv\",\"path\":\"documents/plan.md\",\"space\":\"did:pkh:eip155:1:0x1111111111111111111111111111111111111111\"},\"contentSourceDigest\":\"B-O75gHmIx2CyOm9cOdHJivP-kupRtNWcUPXuZbEnZ4\",\"delegationCid\":\"bafkreiehcdfj3fkj6xnkwsiwteiqdoa5nwkcfz5gcpijuew2wsdimly67q\",\"documentName\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa😀\",\"expiresAt\":\"2026-07-16T12:05:00.000Z\",\"issuedAt\":\"2026-07-16T12:00:00.000Z\",\"jti\":\"AQIDBAUGBwgJCgsMDQ4PEA\",\"nodeAudience\":\"did:web:node.example\",\"policyCid\":\"bafkreiaqkcd56bhbn3zwcx7r5xdkle2nukcrhkvwwrcg4qqehk6q5hlwi4\",\"recipientEmail\":\"Alice+Notes@example.com\",\"reportAbuseToken\":\"4OHi4-Tl5ufo6err7O3u7w\",\"returnOrigin\":\"https://share.tinycloud.xyz\",\"senderDid\":\"did:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7\",\"senderTrust\":\"verified\",\"shareCid\":\"bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4\",\"shareExpiresAt\":\"2026-07-23T12:00:00.000Z\",\"shareId\":\"share-kv-001\",\"targetOrigin\":\"https://node.example\",\"type\":\"TinyCloudShareInviteAuthorization\",\"version\":1}",
+            "messageDigest": "ijscAuuXqN7tjNNSM-_XHnqx9mhZ1dIzpa1bJcCgrFs",
+            "signedBytesDigest": "3BdQs2dd_vJ4il2RgG_V-Q18hLJO2OIVZ_0tJHu6Edo",
+            "signatureDigest": "WzvY6Jf8SxKBqiY7EjL7OK7r5USawn-FfIOtgZ5byE0",
+            "signature": {
+              "alg": "EdDSA",
+              "kid": "did:web:node.example#invitation-key-1",
+              "value": "95IH1K5kYuHKCSmXlCsY9YJDuExl5toDfGW1L5bvWyap75-98-eRmUHfzTInpnSxnet2LJFLirS6rNuuXCEaBA"
+            }
+          },
+          "sql": {
+            "name": "inviteAuthorization",
+            "domain": "xyz.tinycloud.share/invite-authorization/v1\u0000",
+            "signerDid": "did:web:node.example",
+            "message": {
+              "type": "TinyCloudShareInviteAuthorization",
+              "version": 1,
+              "jti": "AgMEBQYHCAkKCwwNDg8QEQ",
+              "senderDid": "did:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7",
+              "shareCid": "bafkreif2kris7mo5etetu5jleg2noejza34ptwmpjhdm5jernutik6baqu",
+              "shareId": "share-sql-001",
+              "policyCid": "bafkreic6xkbiqtsv2wotzor7vjy6ri73ix5ntuwz4likrm3zhmxlpaajmq",
+              "delegationCid": "bafkreigqjdavi3uobywsvm7bq3hufqmq4qgahabaadgcfvu6gn57xzvuzq",
+              "authorityMaterialHandle": "amh_sql_001",
+              "authorityMaterialDigest": "XUetYzxiMqAEDbvGxzzLMSP1MMvBEQt8pH_8ME3ssdI",
+              "recipientEmail": "Alice+Notes@example.com",
+              "targetOrigin": "https://node.example",
+              "nodeAudience": "did:web:node.example",
+              "returnOrigin": "https://share.tinycloud.xyz",
+              "documentName": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa😀",
+              "senderTrust": "verified",
+              "contentSource": {
+                "kind": "sql",
+                "space": "did:pkh:eip155:1:0x1111111111111111111111111111111111111111",
+                "database": "documents",
+                "path": "shared/plan",
+                "statement": "shared_document_by_id",
+                "arguments": {
+                  "document_id": 123
+                },
+                "argumentsDigest": "Wvt9ycf107Id2Qe58i0BnWykVBsdjhyS03P2psS0bSg",
+                "action": "tinycloud.sql/read"
+              },
+              "contentSourceDigest": "OmF5ZcmUhf6D3372Toi6tvaibZ7kpamg4oFe89d_xwU",
+              "shareExpiresAt": "2026-07-23T12:00:00.000Z",
+              "issuedAt": "2026-07-16T12:00:00.000Z",
+              "expiresAt": "2026-07-16T12:05:00.000Z",
+              "reportAbuseToken": "4OHi4-Tl5ufo6err7O3u7w"
+            },
+            "jcs": "{\"authorityMaterialDigest\":\"XUetYzxiMqAEDbvGxzzLMSP1MMvBEQt8pH_8ME3ssdI\",\"authorityMaterialHandle\":\"amh_sql_001\",\"contentSource\":{\"action\":\"tinycloud.sql/read\",\"arguments\":{\"document_id\":123},\"argumentsDigest\":\"Wvt9ycf107Id2Qe58i0BnWykVBsdjhyS03P2psS0bSg\",\"database\":\"documents\",\"kind\":\"sql\",\"path\":\"shared/plan\",\"space\":\"did:pkh:eip155:1:0x1111111111111111111111111111111111111111\",\"statement\":\"shared_document_by_id\"},\"contentSourceDigest\":\"OmF5ZcmUhf6D3372Toi6tvaibZ7kpamg4oFe89d_xwU\",\"delegationCid\":\"bafkreigqjdavi3uobywsvm7bq3hufqmq4qgahabaadgcfvu6gn57xzvuzq\",\"documentName\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa😀\",\"expiresAt\":\"2026-07-16T12:05:00.000Z\",\"issuedAt\":\"2026-07-16T12:00:00.000Z\",\"jti\":\"AgMEBQYHCAkKCwwNDg8QEQ\",\"nodeAudience\":\"did:web:node.example\",\"policyCid\":\"bafkreic6xkbiqtsv2wotzor7vjy6ri73ix5ntuwz4likrm3zhmxlpaajmq\",\"recipientEmail\":\"Alice+Notes@example.com\",\"reportAbuseToken\":\"4OHi4-Tl5ufo6err7O3u7w\",\"returnOrigin\":\"https://share.tinycloud.xyz\",\"senderDid\":\"did:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7\",\"senderTrust\":\"verified\",\"shareCid\":\"bafkreif2kris7mo5etetu5jleg2noejza34ptwmpjhdm5jernutik6baqu\",\"shareExpiresAt\":\"2026-07-23T12:00:00.000Z\",\"shareId\":\"share-sql-001\",\"targetOrigin\":\"https://node.example\",\"type\":\"TinyCloudShareInviteAuthorization\",\"version\":1}",
+            "messageDigest": "p-P41RU1V3fkuvDl4RrQTsds8lbDlHhFCnPmeCkpEtE",
+            "signedBytesDigest": "s2SIfDVsaQqeUCqXEsxZTLf5lsKqZgmo6VzmbfUYxEU",
+            "signatureDigest": "8n_XtaneXhwH8ihVnLl59D-zf5MVXBudrqtjAUeh_20",
+            "signature": {
+              "alg": "EdDSA",
+              "kid": "did:web:node.example#invitation-key-1",
+              "value": "L-lvvW1nziT_TazSDkqG0rNndlxyGqVZcY90lf8xbQpK_JUdTvZJVUZSV1aCAYi2vSjBo_Ml_OE-F9hlxBp3Ag"
+            }
+          }
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "document-name-bytes"
+    },
+    {
+      "id": "authorization-recipient-email-mismatch",
+      "kind": "binding",
+      "target": "inviteAuthorization.recipientEmail",
+      "mutation": "re-sign-recipient-email",
+      "mutationData": {
+        "operation": "replace-and-resign",
+        "value": "Bob@example.com",
+        "signer": "did:web:node.example"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "redeem-redemption-id-mismatch",
+      "kind": "binding",
+      "target": "holderBinding.redemptionId",
+      "mutation": "re-sign-redemption-id",
+      "mutationData": {
+        "operation": "replace-and-resign",
+        "value": "QUJDREVGR0hJSktMTU5PUA",
+        "signer": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "redeem-invitation-id-mismatch",
+      "kind": "binding",
+      "target": "holderBinding.invitationId",
+      "mutation": "re-sign-invitation-id",
+      "mutationData": {
+        "operation": "replace-and-resign",
+        "value": "ISIjJCUmJygpKissLS4vMA",
+        "signer": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "share-id-propagation",
+      "kind": "binding",
+      "target": "policyPresentation.shareId",
+      "mutation": "re-sign-share-id",
+      "mutationData": {
+        "operation": "replace-and-resign",
+        "value": "share-mutated-001",
+        "signer": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "share-cid-propagation",
+      "kind": "binding",
+      "target": "policyPresentation.shareCid",
+      "mutation": "re-sign-share-cid",
+      "mutationData": {
+        "operation": "replace-and-resign",
+        "value": "bafkreibhhiniz46x63wrrqghm7ypjix7ow5jybnydczju34z3i3smgu5xe",
+        "signer": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "policy-cid-propagation",
+      "kind": "binding",
+      "target": "policyPresentation.policyCid",
+      "mutation": "re-sign-policy-cid",
+      "mutationData": {
+        "operation": "replace-and-resign",
+        "value": "bafkreihepz3bwuubhhm3q4beispxxy2edi6i3dolefyfu6jbwl6ofzgaom",
+        "signer": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "target-origin-propagation",
+      "kind": "binding",
+      "target": "policyPresentation.targetOrigin",
+      "mutation": "re-sign-target-origin",
+      "mutationData": {
+        "operation": "replace-and-resign",
+        "value": "https://evil.example",
+        "signer": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "node-audience-propagation",
+      "kind": "binding",
+      "target": "policyPresentation.nodeAudience",
+      "mutation": "re-sign-node-audience",
+      "mutationData": {
+        "operation": "replace-and-resign",
+        "value": "did:web:evil.example",
+        "signer": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "holder-did-propagation",
+      "kind": "binding",
+      "target": "policyPresentation.holderDid",
+      "mutation": "re-sign-holder-did",
+      "mutationData": {
+        "operation": "replace-and-resign",
+        "value": "did:web:other-holder.example",
+        "signer": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "content-source-digest-propagation",
+      "kind": "binding",
+      "target": "policyPresentation.contentSourceDigest",
+      "mutation": "re-sign-content-source-digest",
+      "mutationData": {
+        "operation": "replace-and-resign",
+        "value": "aFfa136AIBdUuYO5b7kWQ2QgUyBl39KTfAtUHi_8y7A",
+        "signer": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "action-propagation",
+      "kind": "binding",
+      "target": "policyPresentation.action",
+      "mutation": "re-sign-action",
+      "mutationData": {
+        "operation": "replace-and-resign",
+        "valueByKind": {
+          "kv": "tinycloud.sql/read",
+          "sql": "tinycloud.kv/get"
+        },
+        "signer": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "resource-propagation",
+      "kind": "binding",
+      "target": "policyPresentation.resource",
+      "mutation": "re-sign-resource",
+      "mutationData": {
+        "operation": "replace-and-resign",
+        "value": "other/resource",
+        "signer": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "envelope-domain-from-unregistered-label",
+      "kind": "signature",
+      "target": "envelope.domain",
+      "mutation": "verify-with-nonregistry-domain",
+      "mutationData": {
+        "operation": "replace",
+        "value": "unregistered.example\u0000"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "jcs-lone-surrogate",
+      "kind": "jcs",
+      "target": "value",
+      "mutation": "insert-lone-surrogate",
+      "mutationData": {
+        "operation": "insert",
+        "jsonLiteral": "\\ud800"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "jcs-unsafe-number",
+      "kind": "jcs",
+      "target": "value",
+      "mutation": "insert-unsafe-number",
+      "mutationData": {
+        "operation": "insert",
+        "jsonLiteral": "9007199254740992",
+        "numberKind": "unsafe-integer",
+        "value": 9007199254740992
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "jcs-fractional-number",
+      "kind": "jcs",
+      "target": "value",
+      "mutation": "insert-fractional-number",
+      "mutationData": {
+        "operation": "insert",
+        "jsonLiteral": "1.5",
+        "numberKind": "fractional",
+        "value": 1.5
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "jcs-negative-zero",
+      "kind": "jcs",
+      "target": "value",
+      "mutation": "insert-negative-zero",
+      "mutationData": {
+        "operation": "insert",
+        "jsonLiteral": "-0",
+        "numberKind": "negative-zero",
+        "value": "-0"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "jcs-undefined",
+      "kind": "jcs",
+      "target": "value",
+      "mutation": "insert-undefined",
+      "mutationData": {
+        "operation": "insert",
+        "jsonLiteral": "undefined"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "noncanonical-b64url-16-tail",
+      "kind": "encoding",
+      "target": "invitationId",
+      "mutation": "set-nonzero-trailing-bits",
+      "mutationData": {
+        "operation": "replace",
+        "value": "AAECAwQFBgcICQoLDA0ODB"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "noncanonical-b64url-64-tail",
+      "kind": "encoding",
+      "target": "signature",
+      "mutation": "set-nonzero-trailing-bits",
+      "mutationData": {
+        "operation": "replace",
+        "value": "wNbPCBjzMzSg48FIISfFD--J_QeDtiudsVUyhi8GbGgi09k6T25DLoNEpb6XpWMIdJ3KByyf2yelg4_ljb3rDB"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "noncanonical-holder-kid",
+      "kind": "signature",
+      "target": "holderBinding.signature.kid",
+      "mutation": "use-did-key-with-wrong-fragment",
+      "mutationData": {
+        "operation": "replace",
+        "value": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw#wrong"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "small-order-did-key",
+      "kind": "did-key",
+      "target": "holderBinding.holderDid",
+      "mutation": "identity-public-key",
+      "mutationData": {
+        "operation": "replace",
+        "value": "did:key:z6MkeXATEjyXENzBXBxgC5EHk2JE5aqd7qMGGtDpLUH1e2Sj"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "noncanonical-ed25519-s",
+      "kind": "signature",
+      "target": "holderBinding.signature.value",
+      "mutation": "set-s-to-group-order",
+      "mutationData": {
+        "operation": "replace",
+        "value": "cVZv2hQwGF3eoawSDPdnZR4Us-rS-h8LBwBH1qvzXSvt0_VcGmMSWNac96Le-d4UAAAAAAAAAAAAAAAAAAAAEA"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "signature-encoding"
+    },
+    {
+      "id": "short-signature",
+      "kind": "signature",
+      "target": "readInvocation.signature.value",
+      "mutation": "truncate-signature",
+      "mutationData": {
+        "operation": "truncate",
+        "bytes": 63
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "wrong-source-digest",
+      "kind": "source",
+      "target": "sql.argumentsDigest",
+      "mutation": "change-one-argument",
+      "mutationData": {
+        "operation": "change",
+        "field": "arguments.document_id",
+        "value": 456
+      },
+      "appliesTo": [
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "sql-string-argument",
+      "kind": "source",
+      "target": "sql.arguments",
+      "mutation": "insert-non-integer-argument",
+      "mutationData": {
+        "operation": "insert-property",
+        "field": "label",
+        "value": "doc_456",
+        "valueType": "string"
+      },
+      "appliesTo": [
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "sql-fractional-argument",
+      "kind": "source",
+      "target": "sql.arguments",
+      "mutation": "insert-non-integer-argument",
+      "mutationData": {
+        "operation": "insert-property",
+        "field": "revision",
+        "value": 1.5,
+        "valueType": "fractional"
+      },
+      "appliesTo": [
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "sql-negative-zero-argument",
+      "kind": "source",
+      "target": "sql.arguments",
+      "mutation": "insert-non-integer-argument",
+      "mutationData": {
+        "operation": "insert-property",
+        "field": "offset",
+        "jsonLiteral": "-0",
+        "value": "-0",
+        "valueType": "negative-zero"
+      },
+      "appliesTo": [
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "sql-arguments-too-large",
+      "kind": "source",
+      "target": "sql.arguments",
+      "mutation": "replace-with-over-32-properties",
+      "mutationData": {
+        "operation": "replace-object",
+        "field": "arguments",
+        "value": {
+          "argument_00": 0,
+          "argument_01": 1,
+          "argument_02": 2,
+          "argument_03": 3,
+          "argument_04": 4,
+          "argument_05": 5,
+          "argument_06": 6,
+          "argument_07": 7,
+          "argument_08": 8,
+          "argument_09": 9,
+          "argument_10": 10,
+          "argument_11": 11,
+          "argument_12": 12,
+          "argument_13": 13,
+          "argument_14": 14,
+          "argument_15": 15,
+          "argument_16": 16,
+          "argument_17": 17,
+          "argument_18": 18,
+          "argument_19": 19,
+          "argument_20": 20,
+          "argument_21": 21,
+          "argument_22": 22,
+          "argument_23": 23,
+          "argument_24": 24,
+          "argument_25": 25,
+          "argument_26": 26,
+          "argument_27": 27,
+          "argument_28": 28,
+          "argument_29": 29,
+          "argument_30": 30,
+          "argument_31": 31,
+          "argument_32": 32
+        },
+        "propertyCount": 33,
+        "valueType": "safe-json-integers"
+      },
+      "appliesTo": [
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "sql-arbitrary-query-field",
+      "kind": "schema",
+      "target": "sqlSource.query",
+      "mutation": "add-query",
+      "mutationData": {
+        "operation": "add-property",
+        "field": "query",
+        "value": "select *"
+      },
+      "appliesTo": [
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "policy-action-source-mismatch",
+      "kind": "binding",
+      "target": "policy.action",
+      "mutation": "change-action-only",
+      "mutationData": {
+        "operation": "replace",
+        "valueByKind": {
+          "kv": "tinycloud.sql/read",
+          "sql": "tinycloud.kv/get"
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "content-source-propagation",
+      "kind": "binding",
+      "target": "policyPresentation.contentSource.path",
+      "mutation": "change-path-one-field",
+      "mutationData": {
+        "operation": "replace",
+        "value": "other.md"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "credential-sub-mismatch",
+      "kind": "credential",
+      "target": "credential.claims.sub",
+      "mutation": "sender-did",
+      "mutationData": {
+        "operation": "replace",
+        "value": "did:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "credential-legacy-email-path",
+      "kind": "credential",
+      "target": "credential.disclosures[0].path",
+      "mutation": "email-address-path",
+      "mutationData": {
+        "operation": "replace",
+        "value": "/email/address"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "credential-unsupported-status",
+      "kind": "credential",
+      "target": "credential.claims.status",
+      "mutation": "add-status",
+      "mutationData": {
+        "operation": "add-property",
+        "value": {
+          "list": "unsupported"
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "credential-expired-resigned",
+      "kind": "credential",
+      "target": "credential.claims.exp",
+      "mutation": "re-sign-expired-credential",
+      "mutationData": {
+        "operation": "replace-and-resign",
+        "credentialByKind": {
+          "kv": {
+            "format": "vc+sd-jwt",
+            "credential": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiVzFqajRkMDFGQm9YcGgtNlFLUUdONXRmWDBHTmYxbWhCajFwcEIxcm5NbyJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDIwMzE5OSwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmlzc3Vlci5jcmVkZW50aWFscy5vcmciLCJqdGkiOiJ1cm46dXVpZDprdi1jcmVkZW50aWFsLTAwMSIsIm5iZiI6MTc4NDIwMzIwMCwic3ViIjoiZGlkOmtleTp6Nk1rdHd1cGRtTFhWVnFUekN3NGk0NnI0dUd5b3NHWFJuUjNYak40WnE3b01Nc3ciLCJ0aW55Y2xvdWRfc2hhcmUiOnsibm9kZV9hdWRpZW5jZSI6ImRpZDp3ZWI6bm9kZS5leGFtcGxlIiwicG9saWN5X2NpZCI6ImJhZmtyZWlhcWtjZDU2YmhibjN6d2N4N3I1eGRrbGUybnVrY3Joa3Z3d3JjZzRxcWVoazZxNWhsd2k0Iiwic2hhcmVfY2lkIjoiYmFma3JlaWVraHRneHBiNXhoeWtkNnB5dGFscGttZzUydHJyeXJvcjJncml0dDdyNTZqdjJ0NzVmbDQiLCJzaGFyZV9pZCI6InNoYXJlLWt2LTAwMSJ9LCJ2Y3QiOiJvcGVuY3JlZGVudGlhbHMuZW1haWwvdjEifQ.SSsayJIdBlijUT6Ji-umibnjqEdufIfYDPdNPz6jUQzyXCQj71KFInWkXm6faE9aVzdOzPu_IVbo2P-6lposCQ~WyJNREV5TXpRMU5qYzRPVG83UEQwLVB3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd~",
+            "holderDid": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+            "expiresAt": "2026-07-23T12:00:00.000Z",
+            "issuerDid": "did:web:issuer.credentials.org",
+            "vct": "opencredentials.email/v1",
+            "claims": {
+              "iss": "did:web:issuer.credentials.org",
+              "sub": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+              "iat": 1784203200,
+              "nbf": 1784203200,
+              "exp": 1784203199,
+              "jti": "urn:uuid:kv-credential-001",
+              "vct": "opencredentials.email/v1",
+              "tinycloud_share": {
+                "share_cid": "bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4",
+                "share_id": "share-kv-001",
+                "policy_cid": "bafkreiaqkcd56bhbn3zwcx7r5xdkle2nukcrhkvwwrcg4qqehk6q5hlwi4",
+                "node_audience": "did:web:node.example"
+              },
+              "_sd_alg": "sha-256",
+              "_sd": [
+                "W1jj4d01FBoXph-6QKQGN5tfX0GNf1mhBj1ppB1rnMo"
+              ]
+            },
+            "disclosures": [
+              {
+                "path": "/email",
+                "salt": "MDEyMzQ1Njc4OTo7PD0-Pw",
+                "encoded": "WyJNREV5TXpRMU5qYzRPVG83UEQwLVB3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd",
+                "digest": "W1jj4d01FBoXph-6QKQGN5tfX0GNf1mhBj1ppB1rnMo",
+                "value": "Alice+Notes@example.com"
+              }
+            ],
+            "credentialDigest": "1X1qRUkTv6lOLG6qP1y3KKlkBYzK-3bSXfZRV0ePkag",
+            "issuerJws": {
+              "signingInput": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiVzFqajRkMDFGQm9YcGgtNlFLUUdONXRmWDBHTmYxbWhCajFwcEIxcm5NbyJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDIwMzE5OSwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmlzc3Vlci5jcmVkZW50aWFscy5vcmciLCJqdGkiOiJ1cm46dXVpZDprdi1jcmVkZW50aWFsLTAwMSIsIm5iZiI6MTc4NDIwMzIwMCwic3ViIjoiZGlkOmtleTp6Nk1rdHd1cGRtTFhWVnFUekN3NGk0NnI0dUd5b3NHWFJuUjNYak40WnE3b01Nc3ciLCJ0aW55Y2xvdWRfc2hhcmUiOnsibm9kZV9hdWRpZW5jZSI6ImRpZDp3ZWI6bm9kZS5leGFtcGxlIiwicG9saWN5X2NpZCI6ImJhZmtyZWlhcWtjZDU2YmhibjN6d2N4N3I1eGRrbGUybnVrY3Joa3Z3d3JjZzRxcWVoazZxNWhsd2k0Iiwic2hhcmVfY2lkIjoiYmFma3JlaWVraHRneHBiNXhoeWtkNnB5dGFscGttZzUydHJyeXJvcjJncml0dDdyNTZqdjJ0NzVmbDQiLCJzaGFyZV9pZCI6InNoYXJlLWt2LTAwMSJ9LCJ2Y3QiOiJvcGVuY3JlZGVudGlhbHMuZW1haWwvdjEifQ",
+              "signingInputDigest": "90hVhsqpzX-s7c__OmnoSbfP7N7t--8bLJnDEYPCc0Y",
+              "signature": "SSsayJIdBlijUT6Ji-umibnjqEdufIfYDPdNPz6jUQzyXCQj71KFInWkXm6faE9aVzdOzPu_IVbo2P-6lposCQ"
+            }
+          },
+          "sql": {
+            "format": "vc+sd-jwt",
+            "credential": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiUlJmODBmcXRCU1Z5MDhURDd2ZmQ5NnN1NEFKY3oyYnFGR0pDdGZoQkZjQSJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDIwMzE5OSwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmlzc3Vlci5jcmVkZW50aWFscy5vcmciLCJqdGkiOiJ1cm46dXVpZDpzcWwtY3JlZGVudGlhbC0wMDEiLCJuYmYiOjE3ODQyMDMyMDAsInN1YiI6ImRpZDprZXk6ejZNa3R3dXBkbUxYVlZxVHpDdzRpNDZyNHVHeW9zR1hSblIzWGpONFpxN29NTXN3IiwidGlueWNsb3VkX3NoYXJlIjp7Im5vZGVfYXVkaWVuY2UiOiJkaWQ6d2ViOm5vZGUuZXhhbXBsZSIsInBvbGljeV9jaWQiOiJiYWZrcmVpYzZ4a2JpcXRzdjJ3b3R6b3I3dmp5NnJpNzNpeDVudHV3ejRsaWtybTN6aG14bHBhYWptcSIsInNoYXJlX2NpZCI6ImJhZmtyZWlmMmtyaXM3bW81ZXRldHU1amxlZzJub2VqemEzNHB0d21wamhkbTVqZXJudXRpazZiYXF1Iiwic2hhcmVfaWQiOiJzaGFyZS1zcWwtMDAxIn0sInZjdCI6Im9wZW5jcmVkZW50aWFscy5lbWFpbC92MSJ9.VphnFJsyIcA--xsc895CQwET7-IRnk2eUTTEED43ogDMxfFqricI3IGScmmVAfSoQldYgm4W3Xkf6tPQ422VCA~WyJRRUZDUTBSRlJrZElTVXBMVEUxT1R3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd~",
+            "holderDid": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+            "expiresAt": "2026-07-23T12:00:00.000Z",
+            "issuerDid": "did:web:issuer.credentials.org",
+            "vct": "opencredentials.email/v1",
+            "claims": {
+              "iss": "did:web:issuer.credentials.org",
+              "sub": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+              "iat": 1784203200,
+              "nbf": 1784203200,
+              "exp": 1784203199,
+              "jti": "urn:uuid:sql-credential-001",
+              "vct": "opencredentials.email/v1",
+              "tinycloud_share": {
+                "share_cid": "bafkreif2kris7mo5etetu5jleg2noejza34ptwmpjhdm5jernutik6baqu",
+                "share_id": "share-sql-001",
+                "policy_cid": "bafkreic6xkbiqtsv2wotzor7vjy6ri73ix5ntuwz4likrm3zhmxlpaajmq",
+                "node_audience": "did:web:node.example"
+              },
+              "_sd_alg": "sha-256",
+              "_sd": [
+                "RRf80fqtBSVy08TD7vfd96su4AJcz2bqFGJCtfhBFcA"
+              ]
+            },
+            "disclosures": [
+              {
+                "path": "/email",
+                "salt": "QEFCQ0RFRkdISUpLTE1OTw",
+                "encoded": "WyJRRUZDUTBSRlJrZElTVXBMVEUxT1R3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd",
+                "digest": "RRf80fqtBSVy08TD7vfd96su4AJcz2bqFGJCtfhBFcA",
+                "value": "Alice+Notes@example.com"
+              }
+            ],
+            "credentialDigest": "oeC3aFTGvH-785qMbxHAb0INLRT-pSZrUb1HNzqxROU",
+            "issuerJws": {
+              "signingInput": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiUlJmODBmcXRCU1Z5MDhURDd2ZmQ5NnN1NEFKY3oyYnFGR0pDdGZoQkZjQSJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDIwMzE5OSwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmlzc3Vlci5jcmVkZW50aWFscy5vcmciLCJqdGkiOiJ1cm46dXVpZDpzcWwtY3JlZGVudGlhbC0wMDEiLCJuYmYiOjE3ODQyMDMyMDAsInN1YiI6ImRpZDprZXk6ejZNa3R3dXBkbUxYVlZxVHpDdzRpNDZyNHVHeW9zR1hSblIzWGpONFpxN29NTXN3IiwidGlueWNsb3VkX3NoYXJlIjp7Im5vZGVfYXVkaWVuY2UiOiJkaWQ6d2ViOm5vZGUuZXhhbXBsZSIsInBvbGljeV9jaWQiOiJiYWZrcmVpYzZ4a2JpcXRzdjJ3b3R6b3I3dmp5NnJpNzNpeDVudHV3ejRsaWtybTN6aG14bHBhYWptcSIsInNoYXJlX2NpZCI6ImJhZmtyZWlmMmtyaXM3bW81ZXRldHU1amxlZzJub2VqemEzNHB0d21wamhkbTVqZXJudXRpazZiYXF1Iiwic2hhcmVfaWQiOiJzaGFyZS1zcWwtMDAxIn0sInZjdCI6Im9wZW5jcmVkZW50aWFscy5lbWFpbC92MSJ9",
+              "signingInputDigest": "l3KUN8xysQJinEMDQbhESWNeKz05UiwyGKHmwvi6_IY",
+              "signature": "VphnFJsyIcA--xsc895CQwET7-IRnk2eUTTEED43ogDMxfFqricI3IGScmmVAfSoQldYgm4W3Xkf6tPQ422VCA"
+            }
+          }
+        },
+        "candidateSigningPublicKeyByKind": {
+          "kv": "Ivwpd5Lwtv_Av8_bftsMCqFOAlo2XsDjQuhuOCnLdLY",
+          "sql": "Ivwpd5Lwtv_Av8_bftsMCqFOAlo2XsDjQuhuOCnLdLY"
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "credential-time"
+    },
+    {
+      "id": "credential-expiry-boundary-resigned",
+      "kind": "credential",
+      "target": "credential.claims.exp",
+      "mutation": "re-sign-expiry-at-evaluation-minus-skew",
+      "mutationData": {
+        "operation": "replace-and-resign",
+        "credentialByKind": {
+          "kv": {
+            "format": "vc+sd-jwt",
+            "credential": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiVzFqajRkMDFGQm9YcGgtNlFLUUdONXRmWDBHTmYxbWhCajFwcEIxcm5NbyJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDIwMzIwMCwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmlzc3Vlci5jcmVkZW50aWFscy5vcmciLCJqdGkiOiJ1cm46dXVpZDprdi1jcmVkZW50aWFsLTAwMSIsIm5iZiI6MTc4NDIwMzIwMCwic3ViIjoiZGlkOmtleTp6Nk1rdHd1cGRtTFhWVnFUekN3NGk0NnI0dUd5b3NHWFJuUjNYak40WnE3b01Nc3ciLCJ0aW55Y2xvdWRfc2hhcmUiOnsibm9kZV9hdWRpZW5jZSI6ImRpZDp3ZWI6bm9kZS5leGFtcGxlIiwicG9saWN5X2NpZCI6ImJhZmtyZWlhcWtjZDU2YmhibjN6d2N4N3I1eGRrbGUybnVrY3Joa3Z3d3JjZzRxcWVoazZxNWhsd2k0Iiwic2hhcmVfY2lkIjoiYmFma3JlaWVraHRneHBiNXhoeWtkNnB5dGFscGttZzUydHJyeXJvcjJncml0dDdyNTZqdjJ0NzVmbDQiLCJzaGFyZV9pZCI6InNoYXJlLWt2LTAwMSJ9LCJ2Y3QiOiJvcGVuY3JlZGVudGlhbHMuZW1haWwvdjEifQ.G155G3vI2xW6t_jeT6EuF3FP841o7HewPBo-YnvQXD_6nA3uR6cT6XKmay9zIPCMY5juE1lF3aZ8N95IvMZTBQ~WyJNREV5TXpRMU5qYzRPVG83UEQwLVB3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd~",
+            "holderDid": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+            "expiresAt": "2026-07-23T12:00:00.000Z",
+            "issuerDid": "did:web:issuer.credentials.org",
+            "vct": "opencredentials.email/v1",
+            "claims": {
+              "iss": "did:web:issuer.credentials.org",
+              "sub": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+              "iat": 1784203200,
+              "nbf": 1784203200,
+              "exp": 1784203200,
+              "jti": "urn:uuid:kv-credential-001",
+              "vct": "opencredentials.email/v1",
+              "tinycloud_share": {
+                "share_cid": "bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4",
+                "share_id": "share-kv-001",
+                "policy_cid": "bafkreiaqkcd56bhbn3zwcx7r5xdkle2nukcrhkvwwrcg4qqehk6q5hlwi4",
+                "node_audience": "did:web:node.example"
+              },
+              "_sd_alg": "sha-256",
+              "_sd": [
+                "W1jj4d01FBoXph-6QKQGN5tfX0GNf1mhBj1ppB1rnMo"
+              ]
+            },
+            "disclosures": [
+              {
+                "path": "/email",
+                "salt": "MDEyMzQ1Njc4OTo7PD0-Pw",
+                "encoded": "WyJNREV5TXpRMU5qYzRPVG83UEQwLVB3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd",
+                "digest": "W1jj4d01FBoXph-6QKQGN5tfX0GNf1mhBj1ppB1rnMo",
+                "value": "Alice+Notes@example.com"
+              }
+            ],
+            "credentialDigest": "h8PyT39i6m0chLqx9BZgKYAwhU_AQF94OK0pL80fhdE",
+            "issuerJws": {
+              "signingInput": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiVzFqajRkMDFGQm9YcGgtNlFLUUdONXRmWDBHTmYxbWhCajFwcEIxcm5NbyJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDIwMzIwMCwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmlzc3Vlci5jcmVkZW50aWFscy5vcmciLCJqdGkiOiJ1cm46dXVpZDprdi1jcmVkZW50aWFsLTAwMSIsIm5iZiI6MTc4NDIwMzIwMCwic3ViIjoiZGlkOmtleTp6Nk1rdHd1cGRtTFhWVnFUekN3NGk0NnI0dUd5b3NHWFJuUjNYak40WnE3b01Nc3ciLCJ0aW55Y2xvdWRfc2hhcmUiOnsibm9kZV9hdWRpZW5jZSI6ImRpZDp3ZWI6bm9kZS5leGFtcGxlIiwicG9saWN5X2NpZCI6ImJhZmtyZWlhcWtjZDU2YmhibjN6d2N4N3I1eGRrbGUybnVrY3Joa3Z3d3JjZzRxcWVoazZxNWhsd2k0Iiwic2hhcmVfY2lkIjoiYmFma3JlaWVraHRneHBiNXhoeWtkNnB5dGFscGttZzUydHJyeXJvcjJncml0dDdyNTZqdjJ0NzVmbDQiLCJzaGFyZV9pZCI6InNoYXJlLWt2LTAwMSJ9LCJ2Y3QiOiJvcGVuY3JlZGVudGlhbHMuZW1haWwvdjEifQ",
+              "signingInputDigest": "yu_60qxJLPwjW5qUo26NsluFnUwexAo0n1E0AfKpOW0",
+              "signature": "G155G3vI2xW6t_jeT6EuF3FP841o7HewPBo-YnvQXD_6nA3uR6cT6XKmay9zIPCMY5juE1lF3aZ8N95IvMZTBQ"
+            }
+          },
+          "sql": {
+            "format": "vc+sd-jwt",
+            "credential": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiUlJmODBmcXRCU1Z5MDhURDd2ZmQ5NnN1NEFKY3oyYnFGR0pDdGZoQkZjQSJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDIwMzIwMCwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmlzc3Vlci5jcmVkZW50aWFscy5vcmciLCJqdGkiOiJ1cm46dXVpZDpzcWwtY3JlZGVudGlhbC0wMDEiLCJuYmYiOjE3ODQyMDMyMDAsInN1YiI6ImRpZDprZXk6ejZNa3R3dXBkbUxYVlZxVHpDdzRpNDZyNHVHeW9zR1hSblIzWGpONFpxN29NTXN3IiwidGlueWNsb3VkX3NoYXJlIjp7Im5vZGVfYXVkaWVuY2UiOiJkaWQ6d2ViOm5vZGUuZXhhbXBsZSIsInBvbGljeV9jaWQiOiJiYWZrcmVpYzZ4a2JpcXRzdjJ3b3R6b3I3dmp5NnJpNzNpeDVudHV3ejRsaWtybTN6aG14bHBhYWptcSIsInNoYXJlX2NpZCI6ImJhZmtyZWlmMmtyaXM3bW81ZXRldHU1amxlZzJub2VqemEzNHB0d21wamhkbTVqZXJudXRpazZiYXF1Iiwic2hhcmVfaWQiOiJzaGFyZS1zcWwtMDAxIn0sInZjdCI6Im9wZW5jcmVkZW50aWFscy5lbWFpbC92MSJ9.qXQPERvttsQzCS8ShEE1a60k4-E-jLaw5O19TlOAIaAwjmFdQMVvgbGytYgMTsws4FxA0N-aqODoDsIWOc_qAQ~WyJRRUZDUTBSRlJrZElTVXBMVEUxT1R3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd~",
+            "holderDid": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+            "expiresAt": "2026-07-23T12:00:00.000Z",
+            "issuerDid": "did:web:issuer.credentials.org",
+            "vct": "opencredentials.email/v1",
+            "claims": {
+              "iss": "did:web:issuer.credentials.org",
+              "sub": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+              "iat": 1784203200,
+              "nbf": 1784203200,
+              "exp": 1784203200,
+              "jti": "urn:uuid:sql-credential-001",
+              "vct": "opencredentials.email/v1",
+              "tinycloud_share": {
+                "share_cid": "bafkreif2kris7mo5etetu5jleg2noejza34ptwmpjhdm5jernutik6baqu",
+                "share_id": "share-sql-001",
+                "policy_cid": "bafkreic6xkbiqtsv2wotzor7vjy6ri73ix5ntuwz4likrm3zhmxlpaajmq",
+                "node_audience": "did:web:node.example"
+              },
+              "_sd_alg": "sha-256",
+              "_sd": [
+                "RRf80fqtBSVy08TD7vfd96su4AJcz2bqFGJCtfhBFcA"
+              ]
+            },
+            "disclosures": [
+              {
+                "path": "/email",
+                "salt": "QEFCQ0RFRkdISUpLTE1OTw",
+                "encoded": "WyJRRUZDUTBSRlJrZElTVXBMVEUxT1R3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd",
+                "digest": "RRf80fqtBSVy08TD7vfd96su4AJcz2bqFGJCtfhBFcA",
+                "value": "Alice+Notes@example.com"
+              }
+            ],
+            "credentialDigest": "OpjJP7oKz7-33LYwkjg7mx2d75k13OO0Aix1_zsj9lI",
+            "issuerJws": {
+              "signingInput": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiUlJmODBmcXRCU1Z5MDhURDd2ZmQ5NnN1NEFKY3oyYnFGR0pDdGZoQkZjQSJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDIwMzIwMCwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmlzc3Vlci5jcmVkZW50aWFscy5vcmciLCJqdGkiOiJ1cm46dXVpZDpzcWwtY3JlZGVudGlhbC0wMDEiLCJuYmYiOjE3ODQyMDMyMDAsInN1YiI6ImRpZDprZXk6ejZNa3R3dXBkbUxYVlZxVHpDdzRpNDZyNHVHeW9zR1hSblIzWGpONFpxN29NTXN3IiwidGlueWNsb3VkX3NoYXJlIjp7Im5vZGVfYXVkaWVuY2UiOiJkaWQ6d2ViOm5vZGUuZXhhbXBsZSIsInBvbGljeV9jaWQiOiJiYWZrcmVpYzZ4a2JpcXRzdjJ3b3R6b3I3dmp5NnJpNzNpeDVudHV3ejRsaWtybTN6aG14bHBhYWptcSIsInNoYXJlX2NpZCI6ImJhZmtyZWlmMmtyaXM3bW81ZXRldHU1amxlZzJub2VqemEzNHB0d21wamhkbTVqZXJudXRpazZiYXF1Iiwic2hhcmVfaWQiOiJzaGFyZS1zcWwtMDAxIn0sInZjdCI6Im9wZW5jcmVkZW50aWFscy5lbWFpbC92MSJ9",
+              "signingInputDigest": "jYEd0VXErv0ex6sjxhQAtN3NirTTQV0GMh_gTq66Uc8",
+              "signature": "qXQPERvttsQzCS8ShEE1a60k4-E-jLaw5O19TlOAIaAwjmFdQMVvgbGytYgMTsws4FxA0N-aqODoDsIWOc_qAQ"
+            }
+          }
+        },
+        "candidateSigningPublicKeyByKind": {
+          "kv": "Ivwpd5Lwtv_Av8_bftsMCqFOAlo2XsDjQuhuOCnLdLY",
+          "sql": "Ivwpd5Lwtv_Av8_bftsMCqFOAlo2XsDjQuhuOCnLdLY"
+        },
+        "expEquation": "evaluationTime - clockSkewSeconds"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "credential-time"
+    },
+    {
+      "id": "credential-issuer-did-resigned",
+      "kind": "credential",
+      "target": "credential.claims.iss",
+      "mutation": "re-sign-untrusted-issuer-did",
+      "mutationData": {
+        "operation": "replace-and-resign",
+        "credentialByKind": {
+          "kv": {
+            "format": "vc+sd-jwt",
+            "credential": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiVzFqajRkMDFGQm9YcGgtNlFLUUdONXRmWDBHTmYxbWhCajFwcEIxcm5NbyJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDgwODAwMCwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmV2aWwuY3JlZGVudGlhbHMub3JnIiwianRpIjoidXJuOnV1aWQ6a3YtY3JlZGVudGlhbC0wMDEiLCJuYmYiOjE3ODQyMDMyMDAsInN1YiI6ImRpZDprZXk6ejZNa3R3dXBkbUxYVlZxVHpDdzRpNDZyNHVHeW9zR1hSblIzWGpONFpxN29NTXN3IiwidGlueWNsb3VkX3NoYXJlIjp7Im5vZGVfYXVkaWVuY2UiOiJkaWQ6d2ViOm5vZGUuZXhhbXBsZSIsInBvbGljeV9jaWQiOiJiYWZrcmVpYXFrY2Q1NmJoYm4zendjeDdyNXhka2xlMm51a2NyaGt2d3dyY2c0cXFlaGs2cTVobHdpNCIsInNoYXJlX2NpZCI6ImJhZmtyZWlla2h0Z3hwYjV4aHlrZDZweXRhbHBrbWc1MnRycnlyb3IyZ3JpdHQ3cjU2anYydDc1Zmw0Iiwic2hhcmVfaWQiOiJzaGFyZS1rdi0wMDEifSwidmN0Ijoib3BlbmNyZWRlbnRpYWxzLmVtYWlsL3YxIn0.X6MZ8ArFk6nwTO0wRYbvDEYxJjzGE-VI6jXlIEacP6F6rCCJDKxR5_1WdWsNOXrYRkAOjw2ZUCorIUn0EWK6AQ~WyJNREV5TXpRMU5qYzRPVG83UEQwLVB3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd~",
+            "holderDid": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+            "expiresAt": "2026-07-23T12:00:00.000Z",
+            "issuerDid": "did:web:evil.credentials.org",
+            "vct": "opencredentials.email/v1",
+            "claims": {
+              "iss": "did:web:evil.credentials.org",
+              "sub": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+              "iat": 1784203200,
+              "nbf": 1784203200,
+              "exp": 1784808000,
+              "jti": "urn:uuid:kv-credential-001",
+              "vct": "opencredentials.email/v1",
+              "tinycloud_share": {
+                "share_cid": "bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4",
+                "share_id": "share-kv-001",
+                "policy_cid": "bafkreiaqkcd56bhbn3zwcx7r5xdkle2nukcrhkvwwrcg4qqehk6q5hlwi4",
+                "node_audience": "did:web:node.example"
+              },
+              "_sd_alg": "sha-256",
+              "_sd": [
+                "W1jj4d01FBoXph-6QKQGN5tfX0GNf1mhBj1ppB1rnMo"
+              ]
+            },
+            "disclosures": [
+              {
+                "path": "/email",
+                "salt": "MDEyMzQ1Njc4OTo7PD0-Pw",
+                "encoded": "WyJNREV5TXpRMU5qYzRPVG83UEQwLVB3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd",
+                "digest": "W1jj4d01FBoXph-6QKQGN5tfX0GNf1mhBj1ppB1rnMo",
+                "value": "Alice+Notes@example.com"
+              }
+            ],
+            "credentialDigest": "05aimb4MC1uTmENZjKtsapI0Clrs9vrq7X1WtaFga1E",
+            "issuerJws": {
+              "signingInput": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiVzFqajRkMDFGQm9YcGgtNlFLUUdONXRmWDBHTmYxbWhCajFwcEIxcm5NbyJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDgwODAwMCwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmV2aWwuY3JlZGVudGlhbHMub3JnIiwianRpIjoidXJuOnV1aWQ6a3YtY3JlZGVudGlhbC0wMDEiLCJuYmYiOjE3ODQyMDMyMDAsInN1YiI6ImRpZDprZXk6ejZNa3R3dXBkbUxYVlZxVHpDdzRpNDZyNHVHeW9zR1hSblIzWGpONFpxN29NTXN3IiwidGlueWNsb3VkX3NoYXJlIjp7Im5vZGVfYXVkaWVuY2UiOiJkaWQ6d2ViOm5vZGUuZXhhbXBsZSIsInBvbGljeV9jaWQiOiJiYWZrcmVpYXFrY2Q1NmJoYm4zendjeDdyNXhka2xlMm51a2NyaGt2d3dyY2c0cXFlaGs2cTVobHdpNCIsInNoYXJlX2NpZCI6ImJhZmtyZWlla2h0Z3hwYjV4aHlrZDZweXRhbHBrbWc1MnRycnlyb3IyZ3JpdHQ3cjU2anYydDc1Zmw0Iiwic2hhcmVfaWQiOiJzaGFyZS1rdi0wMDEifSwidmN0Ijoib3BlbmNyZWRlbnRpYWxzLmVtYWlsL3YxIn0",
+              "signingInputDigest": "k_LQb37R0rkQ2n-LyIjbX9bloY5CwyB5I69N4yRp_ew",
+              "signature": "X6MZ8ArFk6nwTO0wRYbvDEYxJjzGE-VI6jXlIEacP6F6rCCJDKxR5_1WdWsNOXrYRkAOjw2ZUCorIUn0EWK6AQ"
+            }
+          },
+          "sql": {
+            "format": "vc+sd-jwt",
+            "credential": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiUlJmODBmcXRCU1Z5MDhURDd2ZmQ5NnN1NEFKY3oyYnFGR0pDdGZoQkZjQSJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDgwODAwMCwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmV2aWwuY3JlZGVudGlhbHMub3JnIiwianRpIjoidXJuOnV1aWQ6c3FsLWNyZWRlbnRpYWwtMDAxIiwibmJmIjoxNzg0MjAzMjAwLCJzdWIiOiJkaWQ6a2V5Ono2TWt0d3VwZG1MWFZWcVR6Q3c0aTQ2cjR1R3lvc0dYUm5SM1hqTjRacTdvTU1zdyIsInRpbnljbG91ZF9zaGFyZSI6eyJub2RlX2F1ZGllbmNlIjoiZGlkOndlYjpub2RlLmV4YW1wbGUiLCJwb2xpY3lfY2lkIjoiYmFma3JlaWM2eGtiaXF0c3Yyd290em9yN3ZqeTZyaTczaXg1bnR1d3o0bGlrcm0zemhteGxwYWFqbXEiLCJzaGFyZV9jaWQiOiJiYWZrcmVpZjJrcmlzN21vNWV0ZXR1NWpsZWcybm9lanphMzRwdHdtcGpoZG01amVybnV0aWs2YmFxdSIsInNoYXJlX2lkIjoic2hhcmUtc3FsLTAwMSJ9LCJ2Y3QiOiJvcGVuY3JlZGVudGlhbHMuZW1haWwvdjEifQ.P2Rdf_oin-kj9Z9bGo8_vJMGgpts_k7UqWNSVSdNIjf6ixtXP1QRtsWVy1AWM1HcxeDUvL_NM24gy_7Un3ktCg~WyJRRUZDUTBSRlJrZElTVXBMVEUxT1R3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd~",
+            "holderDid": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+            "expiresAt": "2026-07-23T12:00:00.000Z",
+            "issuerDid": "did:web:evil.credentials.org",
+            "vct": "opencredentials.email/v1",
+            "claims": {
+              "iss": "did:web:evil.credentials.org",
+              "sub": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+              "iat": 1784203200,
+              "nbf": 1784203200,
+              "exp": 1784808000,
+              "jti": "urn:uuid:sql-credential-001",
+              "vct": "opencredentials.email/v1",
+              "tinycloud_share": {
+                "share_cid": "bafkreif2kris7mo5etetu5jleg2noejza34ptwmpjhdm5jernutik6baqu",
+                "share_id": "share-sql-001",
+                "policy_cid": "bafkreic6xkbiqtsv2wotzor7vjy6ri73ix5ntuwz4likrm3zhmxlpaajmq",
+                "node_audience": "did:web:node.example"
+              },
+              "_sd_alg": "sha-256",
+              "_sd": [
+                "RRf80fqtBSVy08TD7vfd96su4AJcz2bqFGJCtfhBFcA"
+              ]
+            },
+            "disclosures": [
+              {
+                "path": "/email",
+                "salt": "QEFCQ0RFRkdISUpLTE1OTw",
+                "encoded": "WyJRRUZDUTBSRlJrZElTVXBMVEUxT1R3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd",
+                "digest": "RRf80fqtBSVy08TD7vfd96su4AJcz2bqFGJCtfhBFcA",
+                "value": "Alice+Notes@example.com"
+              }
+            ],
+            "credentialDigest": "cp8CtcK1qJZoqQvdm367wg0u5Wl1hN6vXe2Vehd5pz4",
+            "issuerJws": {
+              "signingInput": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiUlJmODBmcXRCU1Z5MDhURDd2ZmQ5NnN1NEFKY3oyYnFGR0pDdGZoQkZjQSJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDgwODAwMCwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmV2aWwuY3JlZGVudGlhbHMub3JnIiwianRpIjoidXJuOnV1aWQ6c3FsLWNyZWRlbnRpYWwtMDAxIiwibmJmIjoxNzg0MjAzMjAwLCJzdWIiOiJkaWQ6a2V5Ono2TWt0d3VwZG1MWFZWcVR6Q3c0aTQ2cjR1R3lvc0dYUm5SM1hqTjRacTdvTU1zdyIsInRpbnljbG91ZF9zaGFyZSI6eyJub2RlX2F1ZGllbmNlIjoiZGlkOndlYjpub2RlLmV4YW1wbGUiLCJwb2xpY3lfY2lkIjoiYmFma3JlaWM2eGtiaXF0c3Yyd290em9yN3ZqeTZyaTczaXg1bnR1d3o0bGlrcm0zemhteGxwYWFqbXEiLCJzaGFyZV9jaWQiOiJiYWZrcmVpZjJrcmlzN21vNWV0ZXR1NWpsZWcybm9lanphMzRwdHdtcGpoZG01amVybnV0aWs2YmFxdSIsInNoYXJlX2lkIjoic2hhcmUtc3FsLTAwMSJ9LCJ2Y3QiOiJvcGVuY3JlZGVudGlhbHMuZW1haWwvdjEifQ",
+              "signingInputDigest": "9OwG3Z1r8pLTBwa6jmhCBTPW4mHBtuJrMrIPJ2GkuY0",
+              "signature": "P2Rdf_oin-kj9Z9bGo8_vJMGgpts_k7UqWNSVSdNIjf6ixtXP1QRtsWVy1AWM1HcxeDUvL_NM24gy_7Un3ktCg"
+            }
+          }
+        },
+        "candidateSigningPublicKeyByKind": {
+          "kv": "11l5O7wTooGagnx2rbb7qKSa7gB_SfLQmS2ZuCWtLEg",
+          "sql": "11l5O7wTooGagnx2rbb7qKSa7gB_SfLQmS2ZuCWtLEg"
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "issuer-trust"
+    },
+    {
+      "id": "credential-issuer-key-resigned",
+      "kind": "credential",
+      "target": "credential.issuerJws.signature",
+      "mutation": "re-sign-with-untrusted-key",
+      "mutationData": {
+        "operation": "replace-and-resign",
+        "credentialByKind": {
+          "kv": {
+            "format": "vc+sd-jwt",
+            "credential": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiVzFqajRkMDFGQm9YcGgtNlFLUUdONXRmWDBHTmYxbWhCajFwcEIxcm5NbyJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDgwODAwMCwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmlzc3Vlci5jcmVkZW50aWFscy5vcmciLCJqdGkiOiJ1cm46dXVpZDprdi1jcmVkZW50aWFsLTAwMSIsIm5iZiI6MTc4NDIwMzIwMCwic3ViIjoiZGlkOmtleTp6Nk1rdHd1cGRtTFhWVnFUekN3NGk0NnI0dUd5b3NHWFJuUjNYak40WnE3b01Nc3ciLCJ0aW55Y2xvdWRfc2hhcmUiOnsibm9kZV9hdWRpZW5jZSI6ImRpZDp3ZWI6bm9kZS5leGFtcGxlIiwicG9saWN5X2NpZCI6ImJhZmtyZWlhcWtjZDU2YmhibjN6d2N4N3I1eGRrbGUybnVrY3Joa3Z3d3JjZzRxcWVoazZxNWhsd2k0Iiwic2hhcmVfY2lkIjoiYmFma3JlaWVraHRneHBiNXhoeWtkNnB5dGFscGttZzUydHJyeXJvcjJncml0dDdyNTZqdjJ0NzVmbDQiLCJzaGFyZV9pZCI6InNoYXJlLWt2LTAwMSJ9LCJ2Y3QiOiJvcGVuY3JlZGVudGlhbHMuZW1haWwvdjEifQ.YeEOXMJK5ObWlZtYER9rF1vHCxo1dknHG0vuWI8OFWLGqPB6AhwrYz0UoPeomoYW5RZYwkt6tl7_zCVcEOcmBw~WyJNREV5TXpRMU5qYzRPVG83UEQwLVB3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd~",
+            "holderDid": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+            "expiresAt": "2026-07-23T12:00:00.000Z",
+            "issuerDid": "did:web:issuer.credentials.org",
+            "vct": "opencredentials.email/v1",
+            "claims": {
+              "iss": "did:web:issuer.credentials.org",
+              "sub": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+              "iat": 1784203200,
+              "nbf": 1784203200,
+              "exp": 1784808000,
+              "jti": "urn:uuid:kv-credential-001",
+              "vct": "opencredentials.email/v1",
+              "tinycloud_share": {
+                "share_cid": "bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4",
+                "share_id": "share-kv-001",
+                "policy_cid": "bafkreiaqkcd56bhbn3zwcx7r5xdkle2nukcrhkvwwrcg4qqehk6q5hlwi4",
+                "node_audience": "did:web:node.example"
+              },
+              "_sd_alg": "sha-256",
+              "_sd": [
+                "W1jj4d01FBoXph-6QKQGN5tfX0GNf1mhBj1ppB1rnMo"
+              ]
+            },
+            "disclosures": [
+              {
+                "path": "/email",
+                "salt": "MDEyMzQ1Njc4OTo7PD0-Pw",
+                "encoded": "WyJNREV5TXpRMU5qYzRPVG83UEQwLVB3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd",
+                "digest": "W1jj4d01FBoXph-6QKQGN5tfX0GNf1mhBj1ppB1rnMo",
+                "value": "Alice+Notes@example.com"
+              }
+            ],
+            "credentialDigest": "5RFh3Kz7flrksDKaUMcynZzNcpg_CCBx5oh0kq2mpMA",
+            "issuerJws": {
+              "signingInput": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiVzFqajRkMDFGQm9YcGgtNlFLUUdONXRmWDBHTmYxbWhCajFwcEIxcm5NbyJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDgwODAwMCwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmlzc3Vlci5jcmVkZW50aWFscy5vcmciLCJqdGkiOiJ1cm46dXVpZDprdi1jcmVkZW50aWFsLTAwMSIsIm5iZiI6MTc4NDIwMzIwMCwic3ViIjoiZGlkOmtleTp6Nk1rdHd1cGRtTFhWVnFUekN3NGk0NnI0dUd5b3NHWFJuUjNYak40WnE3b01Nc3ciLCJ0aW55Y2xvdWRfc2hhcmUiOnsibm9kZV9hdWRpZW5jZSI6ImRpZDp3ZWI6bm9kZS5leGFtcGxlIiwicG9saWN5X2NpZCI6ImJhZmtyZWlhcWtjZDU2YmhibjN6d2N4N3I1eGRrbGUybnVrY3Joa3Z3d3JjZzRxcWVoazZxNWhsd2k0Iiwic2hhcmVfY2lkIjoiYmFma3JlaWVraHRneHBiNXhoeWtkNnB5dGFscGttZzUydHJyeXJvcjJncml0dDdyNTZqdjJ0NzVmbDQiLCJzaGFyZV9pZCI6InNoYXJlLWt2LTAwMSJ9LCJ2Y3QiOiJvcGVuY3JlZGVudGlhbHMuZW1haWwvdjEifQ",
+              "signingInputDigest": "Jjxq_jZzz1JbYPO-3NugcUH4UBCDopn2CZ7h18eYzqY",
+              "signature": "YeEOXMJK5ObWlZtYER9rF1vHCxo1dknHG0vuWI8OFWLGqPB6AhwrYz0UoPeomoYW5RZYwkt6tl7_zCVcEOcmBw"
+            }
+          },
+          "sql": {
+            "format": "vc+sd-jwt",
+            "credential": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiUlJmODBmcXRCU1Z5MDhURDd2ZmQ5NnN1NEFKY3oyYnFGR0pDdGZoQkZjQSJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDgwODAwMCwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmlzc3Vlci5jcmVkZW50aWFscy5vcmciLCJqdGkiOiJ1cm46dXVpZDpzcWwtY3JlZGVudGlhbC0wMDEiLCJuYmYiOjE3ODQyMDMyMDAsInN1YiI6ImRpZDprZXk6ejZNa3R3dXBkbUxYVlZxVHpDdzRpNDZyNHVHeW9zR1hSblIzWGpONFpxN29NTXN3IiwidGlueWNsb3VkX3NoYXJlIjp7Im5vZGVfYXVkaWVuY2UiOiJkaWQ6d2ViOm5vZGUuZXhhbXBsZSIsInBvbGljeV9jaWQiOiJiYWZrcmVpYzZ4a2JpcXRzdjJ3b3R6b3I3dmp5NnJpNzNpeDVudHV3ejRsaWtybTN6aG14bHBhYWptcSIsInNoYXJlX2NpZCI6ImJhZmtyZWlmMmtyaXM3bW81ZXRldHU1amxlZzJub2VqemEzNHB0d21wamhkbTVqZXJudXRpazZiYXF1Iiwic2hhcmVfaWQiOiJzaGFyZS1zcWwtMDAxIn0sInZjdCI6Im9wZW5jcmVkZW50aWFscy5lbWFpbC92MSJ9.nOFjYcT9NLp9eVPdgmI0FF3FQho47SAV82NXhnCb7Mxk85ctSQOBTl15oSl47ImripmQ5EMn7ZQa3Ao1xbn1Bw~WyJRRUZDUTBSRlJrZElTVXBMVEUxT1R3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd~",
+            "holderDid": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+            "expiresAt": "2026-07-23T12:00:00.000Z",
+            "issuerDid": "did:web:issuer.credentials.org",
+            "vct": "opencredentials.email/v1",
+            "claims": {
+              "iss": "did:web:issuer.credentials.org",
+              "sub": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+              "iat": 1784203200,
+              "nbf": 1784203200,
+              "exp": 1784808000,
+              "jti": "urn:uuid:sql-credential-001",
+              "vct": "opencredentials.email/v1",
+              "tinycloud_share": {
+                "share_cid": "bafkreif2kris7mo5etetu5jleg2noejza34ptwmpjhdm5jernutik6baqu",
+                "share_id": "share-sql-001",
+                "policy_cid": "bafkreic6xkbiqtsv2wotzor7vjy6ri73ix5ntuwz4likrm3zhmxlpaajmq",
+                "node_audience": "did:web:node.example"
+              },
+              "_sd_alg": "sha-256",
+              "_sd": [
+                "RRf80fqtBSVy08TD7vfd96su4AJcz2bqFGJCtfhBFcA"
+              ]
+            },
+            "disclosures": [
+              {
+                "path": "/email",
+                "salt": "QEFCQ0RFRkdISUpLTE1OTw",
+                "encoded": "WyJRRUZDUTBSRlJrZElTVXBMVEUxT1R3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd",
+                "digest": "RRf80fqtBSVy08TD7vfd96su4AJcz2bqFGJCtfhBFcA",
+                "value": "Alice+Notes@example.com"
+              }
+            ],
+            "credentialDigest": "07LhRo5c_EN9y9TIwiRNW3D-DfjMbGuly26ACAJugJg",
+            "issuerJws": {
+              "signingInput": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiUlJmODBmcXRCU1Z5MDhURDd2ZmQ5NnN1NEFKY3oyYnFGR0pDdGZoQkZjQSJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDgwODAwMCwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmlzc3Vlci5jcmVkZW50aWFscy5vcmciLCJqdGkiOiJ1cm46dXVpZDpzcWwtY3JlZGVudGlhbC0wMDEiLCJuYmYiOjE3ODQyMDMyMDAsInN1YiI6ImRpZDprZXk6ejZNa3R3dXBkbUxYVlZxVHpDdzRpNDZyNHVHeW9zR1hSblIzWGpONFpxN29NTXN3IiwidGlueWNsb3VkX3NoYXJlIjp7Im5vZGVfYXVkaWVuY2UiOiJkaWQ6d2ViOm5vZGUuZXhhbXBsZSIsInBvbGljeV9jaWQiOiJiYWZrcmVpYzZ4a2JpcXRzdjJ3b3R6b3I3dmp5NnJpNzNpeDVudHV3ejRsaWtybTN6aG14bHBhYWptcSIsInNoYXJlX2NpZCI6ImJhZmtyZWlmMmtyaXM3bW81ZXRldHU1amxlZzJub2VqemEzNHB0d21wamhkbTVqZXJudXRpazZiYXF1Iiwic2hhcmVfaWQiOiJzaGFyZS1zcWwtMDAxIn0sInZjdCI6Im9wZW5jcmVkZW50aWFscy5lbWFpbC92MSJ9",
+              "signingInputDigest": "1bmNARdkJMFxsjwa5s7InEbqcTJljhvITn6WeYwzeN8",
+              "signature": "nOFjYcT9NLp9eVPdgmI0FF3FQho47SAV82NXhnCb7Mxk85ctSQOBTl15oSl47ImripmQ5EMn7ZQa3Ao1xbn1Bw"
+            }
+          }
+        },
+        "candidateSigningPublicKeyByKind": {
+          "kv": "11l5O7wTooGagnx2rbb7qKSa7gB_SfLQmS2ZuCWtLEg",
+          "sql": "11l5O7wTooGagnx2rbb7qKSa7gB_SfLQmS2ZuCWtLEg"
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "issuer-key"
+    },
+    {
+      "id": "credential-vct-resigned",
+      "kind": "credential",
+      "target": "credential.vct",
+      "mutation": "re-sign-wrong-vct",
+      "mutationData": {
+        "operation": "replace-and-resign",
+        "credentialByKind": {
+          "kv": {
+            "format": "vc+sd-jwt",
+            "credential": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiVzFqajRkMDFGQm9YcGgtNlFLUUdONXRmWDBHTmYxbWhCajFwcEIxcm5NbyJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDgwODAwMCwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmlzc3Vlci5jcmVkZW50aWFscy5vcmciLCJqdGkiOiJ1cm46dXVpZDprdi1jcmVkZW50aWFsLTAwMSIsIm5iZiI6MTc4NDIwMzIwMCwic3ViIjoiZGlkOmtleTp6Nk1rdHd1cGRtTFhWVnFUekN3NGk0NnI0dUd5b3NHWFJuUjNYak40WnE3b01Nc3ciLCJ0aW55Y2xvdWRfc2hhcmUiOnsibm9kZV9hdWRpZW5jZSI6ImRpZDp3ZWI6bm9kZS5leGFtcGxlIiwicG9saWN5X2NpZCI6ImJhZmtyZWlhcWtjZDU2YmhibjN6d2N4N3I1eGRrbGUybnVrY3Joa3Z3d3JjZzRxcWVoazZxNWhsd2k0Iiwic2hhcmVfY2lkIjoiYmFma3JlaWVraHRneHBiNXhoeWtkNnB5dGFscGttZzUydHJyeXJvcjJncml0dDdyNTZqdjJ0NzVmbDQiLCJzaGFyZV9pZCI6InNoYXJlLWt2LTAwMSJ9LCJ2Y3QiOiJvcGVuY3JlZGVudGlhbHMuZW1haWwvdjIifQ.mtNtKjB0jOlWjxo3ie-C3Sl4apPBZpGFjSFfQcHZbQVgsxzUId5DBp8iXLus1zVxOEsRLz2wTmXSoJ-Ju4FDDw~WyJNREV5TXpRMU5qYzRPVG83UEQwLVB3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd~",
+            "holderDid": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+            "expiresAt": "2026-07-23T12:00:00.000Z",
+            "issuerDid": "did:web:issuer.credentials.org",
+            "vct": "opencredentials.email/v2",
+            "claims": {
+              "iss": "did:web:issuer.credentials.org",
+              "sub": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+              "iat": 1784203200,
+              "nbf": 1784203200,
+              "exp": 1784808000,
+              "jti": "urn:uuid:kv-credential-001",
+              "vct": "opencredentials.email/v2",
+              "tinycloud_share": {
+                "share_cid": "bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4",
+                "share_id": "share-kv-001",
+                "policy_cid": "bafkreiaqkcd56bhbn3zwcx7r5xdkle2nukcrhkvwwrcg4qqehk6q5hlwi4",
+                "node_audience": "did:web:node.example"
+              },
+              "_sd_alg": "sha-256",
+              "_sd": [
+                "W1jj4d01FBoXph-6QKQGN5tfX0GNf1mhBj1ppB1rnMo"
+              ]
+            },
+            "disclosures": [
+              {
+                "path": "/email",
+                "salt": "MDEyMzQ1Njc4OTo7PD0-Pw",
+                "encoded": "WyJNREV5TXpRMU5qYzRPVG83UEQwLVB3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd",
+                "digest": "W1jj4d01FBoXph-6QKQGN5tfX0GNf1mhBj1ppB1rnMo",
+                "value": "Alice+Notes@example.com"
+              }
+            ],
+            "credentialDigest": "IrX2yLrz2xSIHcezXvi-XkKBqIGSulOoj3fCd0n9a0g",
+            "issuerJws": {
+              "signingInput": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiVzFqajRkMDFGQm9YcGgtNlFLUUdONXRmWDBHTmYxbWhCajFwcEIxcm5NbyJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDgwODAwMCwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmlzc3Vlci5jcmVkZW50aWFscy5vcmciLCJqdGkiOiJ1cm46dXVpZDprdi1jcmVkZW50aWFsLTAwMSIsIm5iZiI6MTc4NDIwMzIwMCwic3ViIjoiZGlkOmtleTp6Nk1rdHd1cGRtTFhWVnFUekN3NGk0NnI0dUd5b3NHWFJuUjNYak40WnE3b01Nc3ciLCJ0aW55Y2xvdWRfc2hhcmUiOnsibm9kZV9hdWRpZW5jZSI6ImRpZDp3ZWI6bm9kZS5leGFtcGxlIiwicG9saWN5X2NpZCI6ImJhZmtyZWlhcWtjZDU2YmhibjN6d2N4N3I1eGRrbGUybnVrY3Joa3Z3d3JjZzRxcWVoazZxNWhsd2k0Iiwic2hhcmVfY2lkIjoiYmFma3JlaWVraHRneHBiNXhoeWtkNnB5dGFscGttZzUydHJyeXJvcjJncml0dDdyNTZqdjJ0NzVmbDQiLCJzaGFyZV9pZCI6InNoYXJlLWt2LTAwMSJ9LCJ2Y3QiOiJvcGVuY3JlZGVudGlhbHMuZW1haWwvdjIifQ",
+              "signingInputDigest": "B4uTZiuG56iadO6Z-UX6ztX8nuwUgGXN-yUsqZUmMus",
+              "signature": "mtNtKjB0jOlWjxo3ie-C3Sl4apPBZpGFjSFfQcHZbQVgsxzUId5DBp8iXLus1zVxOEsRLz2wTmXSoJ-Ju4FDDw"
+            }
+          },
+          "sql": {
+            "format": "vc+sd-jwt",
+            "credential": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiUlJmODBmcXRCU1Z5MDhURDd2ZmQ5NnN1NEFKY3oyYnFGR0pDdGZoQkZjQSJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDgwODAwMCwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmlzc3Vlci5jcmVkZW50aWFscy5vcmciLCJqdGkiOiJ1cm46dXVpZDpzcWwtY3JlZGVudGlhbC0wMDEiLCJuYmYiOjE3ODQyMDMyMDAsInN1YiI6ImRpZDprZXk6ejZNa3R3dXBkbUxYVlZxVHpDdzRpNDZyNHVHeW9zR1hSblIzWGpONFpxN29NTXN3IiwidGlueWNsb3VkX3NoYXJlIjp7Im5vZGVfYXVkaWVuY2UiOiJkaWQ6d2ViOm5vZGUuZXhhbXBsZSIsInBvbGljeV9jaWQiOiJiYWZrcmVpYzZ4a2JpcXRzdjJ3b3R6b3I3dmp5NnJpNzNpeDVudHV3ejRsaWtybTN6aG14bHBhYWptcSIsInNoYXJlX2NpZCI6ImJhZmtyZWlmMmtyaXM3bW81ZXRldHU1amxlZzJub2VqemEzNHB0d21wamhkbTVqZXJudXRpazZiYXF1Iiwic2hhcmVfaWQiOiJzaGFyZS1zcWwtMDAxIn0sInZjdCI6Im9wZW5jcmVkZW50aWFscy5lbWFpbC92MiJ9.eEkYot4XgF57PKIxR47M09Crkrczm8yf7kcINCZPzh58QW23tB43ZdFmMY2piEOmiqDXctO-QymQTEciKGVVBw~WyJRRUZDUTBSRlJrZElTVXBMVEUxT1R3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd~",
+            "holderDid": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+            "expiresAt": "2026-07-23T12:00:00.000Z",
+            "issuerDid": "did:web:issuer.credentials.org",
+            "vct": "opencredentials.email/v2",
+            "claims": {
+              "iss": "did:web:issuer.credentials.org",
+              "sub": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+              "iat": 1784203200,
+              "nbf": 1784203200,
+              "exp": 1784808000,
+              "jti": "urn:uuid:sql-credential-001",
+              "vct": "opencredentials.email/v2",
+              "tinycloud_share": {
+                "share_cid": "bafkreif2kris7mo5etetu5jleg2noejza34ptwmpjhdm5jernutik6baqu",
+                "share_id": "share-sql-001",
+                "policy_cid": "bafkreic6xkbiqtsv2wotzor7vjy6ri73ix5ntuwz4likrm3zhmxlpaajmq",
+                "node_audience": "did:web:node.example"
+              },
+              "_sd_alg": "sha-256",
+              "_sd": [
+                "RRf80fqtBSVy08TD7vfd96su4AJcz2bqFGJCtfhBFcA"
+              ]
+            },
+            "disclosures": [
+              {
+                "path": "/email",
+                "salt": "QEFCQ0RFRkdISUpLTE1OTw",
+                "encoded": "WyJRRUZDUTBSRlJrZElTVXBMVEUxT1R3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd",
+                "digest": "RRf80fqtBSVy08TD7vfd96su4AJcz2bqFGJCtfhBFcA",
+                "value": "Alice+Notes@example.com"
+              }
+            ],
+            "credentialDigest": "j4JUIGvY_rUK0XKJdXyhksRgmMBtZjwgSfyQOpbEiaU",
+            "issuerJws": {
+              "signingInput": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiUlJmODBmcXRCU1Z5MDhURDd2ZmQ5NnN1NEFKY3oyYnFGR0pDdGZoQkZjQSJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDgwODAwMCwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmlzc3Vlci5jcmVkZW50aWFscy5vcmciLCJqdGkiOiJ1cm46dXVpZDpzcWwtY3JlZGVudGlhbC0wMDEiLCJuYmYiOjE3ODQyMDMyMDAsInN1YiI6ImRpZDprZXk6ejZNa3R3dXBkbUxYVlZxVHpDdzRpNDZyNHVHeW9zR1hSblIzWGpONFpxN29NTXN3IiwidGlueWNsb3VkX3NoYXJlIjp7Im5vZGVfYXVkaWVuY2UiOiJkaWQ6d2ViOm5vZGUuZXhhbXBsZSIsInBvbGljeV9jaWQiOiJiYWZrcmVpYzZ4a2JpcXRzdjJ3b3R6b3I3dmp5NnJpNzNpeDVudHV3ejRsaWtybTN6aG14bHBhYWptcSIsInNoYXJlX2NpZCI6ImJhZmtyZWlmMmtyaXM3bW81ZXRldHU1amxlZzJub2VqemEzNHB0d21wamhkbTVqZXJudXRpazZiYXF1Iiwic2hhcmVfaWQiOiJzaGFyZS1zcWwtMDAxIn0sInZjdCI6Im9wZW5jcmVkZW50aWFscy5lbWFpbC92MiJ9",
+              "signingInputDigest": "K0hvoC_1IDg8AyT4CulUy1FpOFIDdUtk08QnsBR2qlw",
+              "signature": "eEkYot4XgF57PKIxR47M09Crkrczm8yf7kcINCZPzh58QW23tB43ZdFmMY2piEOmiqDXctO-QymQTEciKGVVBw"
+            }
+          }
+        },
+        "candidateSigningPublicKeyByKind": {
+          "kv": "Ivwpd5Lwtv_Av8_bftsMCqFOAlo2XsDjQuhuOCnLdLY",
+          "sql": "Ivwpd5Lwtv_Av8_bftsMCqFOAlo2XsDjQuhuOCnLdLY"
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "credential-vct"
+    },
+    {
+      "id": "credential-holder-resigned",
+      "kind": "credential",
+      "target": "credential.holderDid",
+      "mutation": "re-sign-different-holder",
+      "mutationData": {
+        "operation": "replace-and-resign",
+        "credentialByKind": {
+          "kv": {
+            "format": "vc+sd-jwt",
+            "credential": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiVzFqajRkMDFGQm9YcGgtNlFLUUdONXRmWDBHTmYxbWhCajFwcEIxcm5NbyJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDgwODAwMCwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmlzc3Vlci5jcmVkZW50aWFscy5vcmciLCJqdGkiOiJ1cm46dXVpZDprdi1jcmVkZW50aWFsLTAwMSIsIm5iZiI6MTc4NDIwMzIwMCwic3ViIjoiZGlkOmtleTp6Nk1rdHd0cUF6dUQ1Rjc3dEFNQk13TnMxS3liWmVmZjYxRWVoVjl4QjFacFhRRzciLCJ0aW55Y2xvdWRfc2hhcmUiOnsibm9kZV9hdWRpZW5jZSI6ImRpZDp3ZWI6bm9kZS5leGFtcGxlIiwicG9saWN5X2NpZCI6ImJhZmtyZWlhcWtjZDU2YmhibjN6d2N4N3I1eGRrbGUybnVrY3Joa3Z3d3JjZzRxcWVoazZxNWhsd2k0Iiwic2hhcmVfY2lkIjoiYmFma3JlaWVraHRneHBiNXhoeWtkNnB5dGFscGttZzUydHJyeXJvcjJncml0dDdyNTZqdjJ0NzVmbDQiLCJzaGFyZV9pZCI6InNoYXJlLWt2LTAwMSJ9LCJ2Y3QiOiJvcGVuY3JlZGVudGlhbHMuZW1haWwvdjEifQ.NNdbHDrI-Kzm7rZaMchxixQfmm6QVimG6vDV_0ECP_fISzj1MHu0exgMG6MTi8u74X3gX2nwXvNEfQLuJhzBBg~WyJNREV5TXpRMU5qYzRPVG83UEQwLVB3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd~",
+            "holderDid": "did:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7",
+            "expiresAt": "2026-07-23T12:00:00.000Z",
+            "issuerDid": "did:web:issuer.credentials.org",
+            "vct": "opencredentials.email/v1",
+            "claims": {
+              "iss": "did:web:issuer.credentials.org",
+              "sub": "did:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7",
+              "iat": 1784203200,
+              "nbf": 1784203200,
+              "exp": 1784808000,
+              "jti": "urn:uuid:kv-credential-001",
+              "vct": "opencredentials.email/v1",
+              "tinycloud_share": {
+                "share_cid": "bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4",
+                "share_id": "share-kv-001",
+                "policy_cid": "bafkreiaqkcd56bhbn3zwcx7r5xdkle2nukcrhkvwwrcg4qqehk6q5hlwi4",
+                "node_audience": "did:web:node.example"
+              },
+              "_sd_alg": "sha-256",
+              "_sd": [
+                "W1jj4d01FBoXph-6QKQGN5tfX0GNf1mhBj1ppB1rnMo"
+              ]
+            },
+            "disclosures": [
+              {
+                "path": "/email",
+                "salt": "MDEyMzQ1Njc4OTo7PD0-Pw",
+                "encoded": "WyJNREV5TXpRMU5qYzRPVG83UEQwLVB3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd",
+                "digest": "W1jj4d01FBoXph-6QKQGN5tfX0GNf1mhBj1ppB1rnMo",
+                "value": "Alice+Notes@example.com"
+              }
+            ],
+            "credentialDigest": "_4TOJnSirjjXKQXXFaISOYATqeWFk6g4H9bXc93PfbQ",
+            "issuerJws": {
+              "signingInput": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiVzFqajRkMDFGQm9YcGgtNlFLUUdONXRmWDBHTmYxbWhCajFwcEIxcm5NbyJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDgwODAwMCwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmlzc3Vlci5jcmVkZW50aWFscy5vcmciLCJqdGkiOiJ1cm46dXVpZDprdi1jcmVkZW50aWFsLTAwMSIsIm5iZiI6MTc4NDIwMzIwMCwic3ViIjoiZGlkOmtleTp6Nk1rdHd0cUF6dUQ1Rjc3dEFNQk13TnMxS3liWmVmZjYxRWVoVjl4QjFacFhRRzciLCJ0aW55Y2xvdWRfc2hhcmUiOnsibm9kZV9hdWRpZW5jZSI6ImRpZDp3ZWI6bm9kZS5leGFtcGxlIiwicG9saWN5X2NpZCI6ImJhZmtyZWlhcWtjZDU2YmhibjN6d2N4N3I1eGRrbGUybnVrY3Joa3Z3d3JjZzRxcWVoazZxNWhsd2k0Iiwic2hhcmVfY2lkIjoiYmFma3JlaWVraHRneHBiNXhoeWtkNnB5dGFscGttZzUydHJyeXJvcjJncml0dDdyNTZqdjJ0NzVmbDQiLCJzaGFyZV9pZCI6InNoYXJlLWt2LTAwMSJ9LCJ2Y3QiOiJvcGVuY3JlZGVudGlhbHMuZW1haWwvdjEifQ",
+              "signingInputDigest": "Z0aNW7wfJBrnRzK6dX-3dK0B0ySLEg5k0rtftunT-vo",
+              "signature": "NNdbHDrI-Kzm7rZaMchxixQfmm6QVimG6vDV_0ECP_fISzj1MHu0exgMG6MTi8u74X3gX2nwXvNEfQLuJhzBBg"
+            }
+          },
+          "sql": {
+            "format": "vc+sd-jwt",
+            "credential": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiUlJmODBmcXRCU1Z5MDhURDd2ZmQ5NnN1NEFKY3oyYnFGR0pDdGZoQkZjQSJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDgwODAwMCwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmlzc3Vlci5jcmVkZW50aWFscy5vcmciLCJqdGkiOiJ1cm46dXVpZDpzcWwtY3JlZGVudGlhbC0wMDEiLCJuYmYiOjE3ODQyMDMyMDAsInN1YiI6ImRpZDprZXk6ejZNa3R3dHFBenVENUY3N3RBTUJNd05zMUt5YlplZmY2MUVlaFY5eEIxWnBYUUc3IiwidGlueWNsb3VkX3NoYXJlIjp7Im5vZGVfYXVkaWVuY2UiOiJkaWQ6d2ViOm5vZGUuZXhhbXBsZSIsInBvbGljeV9jaWQiOiJiYWZrcmVpYzZ4a2JpcXRzdjJ3b3R6b3I3dmp5NnJpNzNpeDVudHV3ejRsaWtybTN6aG14bHBhYWptcSIsInNoYXJlX2NpZCI6ImJhZmtyZWlmMmtyaXM3bW81ZXRldHU1amxlZzJub2VqemEzNHB0d21wamhkbTVqZXJudXRpazZiYXF1Iiwic2hhcmVfaWQiOiJzaGFyZS1zcWwtMDAxIn0sInZjdCI6Im9wZW5jcmVkZW50aWFscy5lbWFpbC92MSJ9.dsUaSftW2rdXUQ1RlUsJwm7_JTHrLp5N_Lm4HUgVf2LrMUd3EIG9CYSMzER9KBiYvTvNXdsHM7DmUv6mkX54Cg~WyJRRUZDUTBSRlJrZElTVXBMVEUxT1R3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd~",
+            "holderDid": "did:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7",
+            "expiresAt": "2026-07-23T12:00:00.000Z",
+            "issuerDid": "did:web:issuer.credentials.org",
+            "vct": "opencredentials.email/v1",
+            "claims": {
+              "iss": "did:web:issuer.credentials.org",
+              "sub": "did:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7",
+              "iat": 1784203200,
+              "nbf": 1784203200,
+              "exp": 1784808000,
+              "jti": "urn:uuid:sql-credential-001",
+              "vct": "opencredentials.email/v1",
+              "tinycloud_share": {
+                "share_cid": "bafkreif2kris7mo5etetu5jleg2noejza34ptwmpjhdm5jernutik6baqu",
+                "share_id": "share-sql-001",
+                "policy_cid": "bafkreic6xkbiqtsv2wotzor7vjy6ri73ix5ntuwz4likrm3zhmxlpaajmq",
+                "node_audience": "did:web:node.example"
+              },
+              "_sd_alg": "sha-256",
+              "_sd": [
+                "RRf80fqtBSVy08TD7vfd96su4AJcz2bqFGJCtfhBFcA"
+              ]
+            },
+            "disclosures": [
+              {
+                "path": "/email",
+                "salt": "QEFCQ0RFRkdISUpLTE1OTw",
+                "encoded": "WyJRRUZDUTBSRlJrZElTVXBMVEUxT1R3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd",
+                "digest": "RRf80fqtBSVy08TD7vfd96su4AJcz2bqFGJCtfhBFcA",
+                "value": "Alice+Notes@example.com"
+              }
+            ],
+            "credentialDigest": "adTQaXum3MGzE_6VwGLgLB_k5hHVRWHP7g-FZhFuEBA",
+            "issuerJws": {
+              "signingInput": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiUlJmODBmcXRCU1Z5MDhURDd2ZmQ5NnN1NEFKY3oyYnFGR0pDdGZoQkZjQSJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDgwODAwMCwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmlzc3Vlci5jcmVkZW50aWFscy5vcmciLCJqdGkiOiJ1cm46dXVpZDpzcWwtY3JlZGVudGlhbC0wMDEiLCJuYmYiOjE3ODQyMDMyMDAsInN1YiI6ImRpZDprZXk6ejZNa3R3dHFBenVENUY3N3RBTUJNd05zMUt5YlplZmY2MUVlaFY5eEIxWnBYUUc3IiwidGlueWNsb3VkX3NoYXJlIjp7Im5vZGVfYXVkaWVuY2UiOiJkaWQ6d2ViOm5vZGUuZXhhbXBsZSIsInBvbGljeV9jaWQiOiJiYWZrcmVpYzZ4a2JpcXRzdjJ3b3R6b3I3dmp5NnJpNzNpeDVudHV3ejRsaWtybTN6aG14bHBhYWptcSIsInNoYXJlX2NpZCI6ImJhZmtyZWlmMmtyaXM3bW81ZXRldHU1amxlZzJub2VqemEzNHB0d21wamhkbTVqZXJudXRpazZiYXF1Iiwic2hhcmVfaWQiOiJzaGFyZS1zcWwtMDAxIn0sInZjdCI6Im9wZW5jcmVkZW50aWFscy5lbWFpbC92MSJ9",
+              "signingInputDigest": "8Jhf-yWGFSwtUlm3jq64FUA0UUVQug3jaZ3vtOP9ejg",
+              "signature": "dsUaSftW2rdXUQ1RlUsJwm7_JTHrLp5N_Lm4HUgVf2LrMUd3EIG9CYSMzER9KBiYvTvNXdsHM7DmUv6mkX54Cg"
+            }
+          }
+        },
+        "candidateSigningPublicKeyByKind": {
+          "kv": "Ivwpd5Lwtv_Av8_bftsMCqFOAlo2XsDjQuhuOCnLdLY",
+          "sql": "Ivwpd5Lwtv_Av8_bftsMCqFOAlo2XsDjQuhuOCnLdLY"
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "credential-holder"
+    },
+    {
+      "id": "credential-scope-resigned",
+      "kind": "credential",
+      "target": "credential.claims.tinycloud_share.share_id",
+      "mutation": "re-sign-different-scope",
+      "mutationData": {
+        "operation": "replace-and-resign",
+        "credentialByKind": {
+          "kv": {
+            "format": "vc+sd-jwt",
+            "credential": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiVzFqajRkMDFGQm9YcGgtNlFLUUdONXRmWDBHTmYxbWhCajFwcEIxcm5NbyJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDgwODAwMCwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmlzc3Vlci5jcmVkZW50aWFscy5vcmciLCJqdGkiOiJ1cm46dXVpZDprdi1jcmVkZW50aWFsLTAwMSIsIm5iZiI6MTc4NDIwMzIwMCwic3ViIjoiZGlkOmtleTp6Nk1rdHd1cGRtTFhWVnFUekN3NGk0NnI0dUd5b3NHWFJuUjNYak40WnE3b01Nc3ciLCJ0aW55Y2xvdWRfc2hhcmUiOnsibm9kZV9hdWRpZW5jZSI6ImRpZDp3ZWI6bm9kZS5leGFtcGxlIiwicG9saWN5X2NpZCI6ImJhZmtyZWlhcWtjZDU2YmhibjN6d2N4N3I1eGRrbGUybnVrY3Joa3Z3d3JjZzRxcWVoazZxNWhsd2k0Iiwic2hhcmVfY2lkIjoiYmFma3JlaWVraHRneHBiNXhoeWtkNnB5dGFscGttZzUydHJyeXJvcjJncml0dDdyNTZqdjJ0NzVmbDQiLCJzaGFyZV9pZCI6InNoYXJlLW11dGF0ZWQtMDAxIn0sInZjdCI6Im9wZW5jcmVkZW50aWFscy5lbWFpbC92MSJ9.gPj8jfPIecgnzmP5ZZwd25pI0XambeRfRnnhp99kehAz_OhI74KFAAtyHUhRzdW4uSp1z7dMwBLz3WCg7e-hAA~WyJNREV5TXpRMU5qYzRPVG83UEQwLVB3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd~",
+            "holderDid": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+            "expiresAt": "2026-07-23T12:00:00.000Z",
+            "issuerDid": "did:web:issuer.credentials.org",
+            "vct": "opencredentials.email/v1",
+            "claims": {
+              "iss": "did:web:issuer.credentials.org",
+              "sub": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+              "iat": 1784203200,
+              "nbf": 1784203200,
+              "exp": 1784808000,
+              "jti": "urn:uuid:kv-credential-001",
+              "vct": "opencredentials.email/v1",
+              "tinycloud_share": {
+                "share_cid": "bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4",
+                "share_id": "share-mutated-001",
+                "policy_cid": "bafkreiaqkcd56bhbn3zwcx7r5xdkle2nukcrhkvwwrcg4qqehk6q5hlwi4",
+                "node_audience": "did:web:node.example"
+              },
+              "_sd_alg": "sha-256",
+              "_sd": [
+                "W1jj4d01FBoXph-6QKQGN5tfX0GNf1mhBj1ppB1rnMo"
+              ]
+            },
+            "disclosures": [
+              {
+                "path": "/email",
+                "salt": "MDEyMzQ1Njc4OTo7PD0-Pw",
+                "encoded": "WyJNREV5TXpRMU5qYzRPVG83UEQwLVB3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd",
+                "digest": "W1jj4d01FBoXph-6QKQGN5tfX0GNf1mhBj1ppB1rnMo",
+                "value": "Alice+Notes@example.com"
+              }
+            ],
+            "credentialDigest": "WeyJOLLOyKoArk8_jbNfcIQ4H4iAxyR_h55gY2ITYPM",
+            "issuerJws": {
+              "signingInput": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiVzFqajRkMDFGQm9YcGgtNlFLUUdONXRmWDBHTmYxbWhCajFwcEIxcm5NbyJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDgwODAwMCwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmlzc3Vlci5jcmVkZW50aWFscy5vcmciLCJqdGkiOiJ1cm46dXVpZDprdi1jcmVkZW50aWFsLTAwMSIsIm5iZiI6MTc4NDIwMzIwMCwic3ViIjoiZGlkOmtleTp6Nk1rdHd1cGRtTFhWVnFUekN3NGk0NnI0dUd5b3NHWFJuUjNYak40WnE3b01Nc3ciLCJ0aW55Y2xvdWRfc2hhcmUiOnsibm9kZV9hdWRpZW5jZSI6ImRpZDp3ZWI6bm9kZS5leGFtcGxlIiwicG9saWN5X2NpZCI6ImJhZmtyZWlhcWtjZDU2YmhibjN6d2N4N3I1eGRrbGUybnVrY3Joa3Z3d3JjZzRxcWVoazZxNWhsd2k0Iiwic2hhcmVfY2lkIjoiYmFma3JlaWVraHRneHBiNXhoeWtkNnB5dGFscGttZzUydHJyeXJvcjJncml0dDdyNTZqdjJ0NzVmbDQiLCJzaGFyZV9pZCI6InNoYXJlLW11dGF0ZWQtMDAxIn0sInZjdCI6Im9wZW5jcmVkZW50aWFscy5lbWFpbC92MSJ9",
+              "signingInputDigest": "OB9-_xrJ3YYz05t0xmpiT7_nVo1mg_MlfvGqvlrS12I",
+              "signature": "gPj8jfPIecgnzmP5ZZwd25pI0XambeRfRnnhp99kehAz_OhI74KFAAtyHUhRzdW4uSp1z7dMwBLz3WCg7e-hAA"
+            }
+          },
+          "sql": {
+            "format": "vc+sd-jwt",
+            "credential": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiUlJmODBmcXRCU1Z5MDhURDd2ZmQ5NnN1NEFKY3oyYnFGR0pDdGZoQkZjQSJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDgwODAwMCwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmlzc3Vlci5jcmVkZW50aWFscy5vcmciLCJqdGkiOiJ1cm46dXVpZDpzcWwtY3JlZGVudGlhbC0wMDEiLCJuYmYiOjE3ODQyMDMyMDAsInN1YiI6ImRpZDprZXk6ejZNa3R3dXBkbUxYVlZxVHpDdzRpNDZyNHVHeW9zR1hSblIzWGpONFpxN29NTXN3IiwidGlueWNsb3VkX3NoYXJlIjp7Im5vZGVfYXVkaWVuY2UiOiJkaWQ6d2ViOm5vZGUuZXhhbXBsZSIsInBvbGljeV9jaWQiOiJiYWZrcmVpYzZ4a2JpcXRzdjJ3b3R6b3I3dmp5NnJpNzNpeDVudHV3ejRsaWtybTN6aG14bHBhYWptcSIsInNoYXJlX2NpZCI6ImJhZmtyZWlmMmtyaXM3bW81ZXRldHU1amxlZzJub2VqemEzNHB0d21wamhkbTVqZXJudXRpazZiYXF1Iiwic2hhcmVfaWQiOiJzaGFyZS1tdXRhdGVkLTAwMSJ9LCJ2Y3QiOiJvcGVuY3JlZGVudGlhbHMuZW1haWwvdjEifQ.yIAcY5v7qYBHMGc4XLlEhj_sY6ZnSz_pvvyjQv0l668kbk9HuSDjTnxrpHwsmOZBsNYaqfHvNz7Zyk9cTuEkBQ~WyJRRUZDUTBSRlJrZElTVXBMVEUxT1R3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd~",
+            "holderDid": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+            "expiresAt": "2026-07-23T12:00:00.000Z",
+            "issuerDid": "did:web:issuer.credentials.org",
+            "vct": "opencredentials.email/v1",
+            "claims": {
+              "iss": "did:web:issuer.credentials.org",
+              "sub": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+              "iat": 1784203200,
+              "nbf": 1784203200,
+              "exp": 1784808000,
+              "jti": "urn:uuid:sql-credential-001",
+              "vct": "opencredentials.email/v1",
+              "tinycloud_share": {
+                "share_cid": "bafkreif2kris7mo5etetu5jleg2noejza34ptwmpjhdm5jernutik6baqu",
+                "share_id": "share-mutated-001",
+                "policy_cid": "bafkreic6xkbiqtsv2wotzor7vjy6ri73ix5ntuwz4likrm3zhmxlpaajmq",
+                "node_audience": "did:web:node.example"
+              },
+              "_sd_alg": "sha-256",
+              "_sd": [
+                "RRf80fqtBSVy08TD7vfd96su4AJcz2bqFGJCtfhBFcA"
+              ]
+            },
+            "disclosures": [
+              {
+                "path": "/email",
+                "salt": "QEFCQ0RFRkdISUpLTE1OTw",
+                "encoded": "WyJRRUZDUTBSRlJrZElTVXBMVEUxT1R3IiwiZW1haWwiLCJBbGljZStOb3Rlc0BleGFtcGxlLmNvbSJd",
+                "digest": "RRf80fqtBSVy08TD7vfd96su4AJcz2bqFGJCtfhBFcA",
+                "value": "Alice+Notes@example.com"
+              }
+            ],
+            "credentialDigest": "gvgY7ono7VZp0EhjummwieI9q2zvtZwJ9lCrQjI2gUM",
+            "issuerJws": {
+              "signingInput": "eyJhbGciOiJFZERTQSJ9.eyJfc2QiOlsiUlJmODBmcXRCU1Z5MDhURDd2ZmQ5NnN1NEFKY3oyYnFGR0pDdGZoQkZjQSJdLCJfc2RfYWxnIjoic2hhLTI1NiIsImV4cCI6MTc4NDgwODAwMCwiaWF0IjoxNzg0MjAzMjAwLCJpc3MiOiJkaWQ6d2ViOmlzc3Vlci5jcmVkZW50aWFscy5vcmciLCJqdGkiOiJ1cm46dXVpZDpzcWwtY3JlZGVudGlhbC0wMDEiLCJuYmYiOjE3ODQyMDMyMDAsInN1YiI6ImRpZDprZXk6ejZNa3R3dXBkbUxYVlZxVHpDdzRpNDZyNHVHeW9zR1hSblIzWGpONFpxN29NTXN3IiwidGlueWNsb3VkX3NoYXJlIjp7Im5vZGVfYXVkaWVuY2UiOiJkaWQ6d2ViOm5vZGUuZXhhbXBsZSIsInBvbGljeV9jaWQiOiJiYWZrcmVpYzZ4a2JpcXRzdjJ3b3R6b3I3dmp5NnJpNzNpeDVudHV3ejRsaWtybTN6aG14bHBhYWptcSIsInNoYXJlX2NpZCI6ImJhZmtyZWlmMmtyaXM3bW81ZXRldHU1amxlZzJub2VqemEzNHB0d21wamhkbTVqZXJudXRpazZiYXF1Iiwic2hhcmVfaWQiOiJzaGFyZS1tdXRhdGVkLTAwMSJ9LCJ2Y3QiOiJvcGVuY3JlZGVudGlhbHMuZW1haWwvdjEifQ",
+              "signingInputDigest": "sq4g1Dn-NGgZ3_-7nYmiC_czAi8er03y9jugVEUfY7c",
+              "signature": "yIAcY5v7qYBHMGc4XLlEhj_sY6ZnSz_pvvyjQv0l668kbk9HuSDjTnxrpHwsmOZBsNYaqfHvNz7Zyk9cTuEkBQ"
+            }
+          }
+        },
+        "candidateSigningPublicKeyByKind": {
+          "kv": "Ivwpd5Lwtv_Av8_bftsMCqFOAlo2XsDjQuhuOCnLdLY",
+          "sql": "Ivwpd5Lwtv_Av8_bftsMCqFOAlo2XsDjQuhuOCnLdLY"
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "credential-scope"
+    },
+    {
+      "id": "different-holder-valid-signature",
+      "kind": "signature",
+      "target": "holderBinding.holderDid",
+      "mutation": "replace-holder-and-resign",
+      "mutationData": {
+        "operation": "replace-and-resign",
+        "candidateArtifact": {
+          "name": "holderBinding",
+          "domain": "xyz.tinycloud.share/email-claim-holder-binding/v1\u0000",
+          "signerDid": "did:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7",
+          "message": {
+            "type": "TinyCloudEmailClaimHolderBinding",
+            "version": 1,
+            "redemptionId": "QEFCQ0RFRkdISUpLTE1OTw",
+            "invitationId": "AAECAwQFBgcICQoLDA0ODw",
+            "claimNonce": "oKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr8",
+            "shareCid": "bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4",
+            "shareId": "share-kv-001",
+            "policyCid": "bafkreiaqkcd56bhbn3zwcx7r5xdkle2nukcrhkvwwrcg4qqehk6q5hlwi4",
+            "delegationCid": "bafkreiehcdfj3fkj6xnkwsiwteiqdoa5nwkcfz5gcpijuew2wsdimly67q",
+            "authorityMaterialHandle": "amh_kv_001",
+            "authorityMaterialDigest": "wb_iHVMXQmueiWhcQeCIyIxBWHZGN6fQPS8JKyU7jq8",
+            "contentSource": {
+              "kind": "kv",
+              "space": "did:pkh:eip155:1:0x1111111111111111111111111111111111111111",
+              "path": "documents/plan.md",
+              "action": "tinycloud.kv/get"
+            },
+            "contentSourceDigest": "B-O75gHmIx2CyOm9cOdHJivP-kupRtNWcUPXuZbEnZ4",
+            "emailHash": "qKV4ujaQfxW8jcrRXh3yk9KQw4ZJH1ebe5CKCItXRuo",
+            "holderDid": "did:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7",
+            "targetOrigin": "https://node.example",
+            "nodeAudience": "did:web:node.example",
+            "requestOrigin": "https://share.tinycloud.xyz",
+            "issuedAt": "2026-07-16T12:00:00.000Z",
+            "expiresAt": "2026-07-16T12:02:00.000Z",
+            "jti": "wMHCw8TFxsfIycrLzM3Ozw"
+          },
+          "jcs": "{\"authorityMaterialDigest\":\"wb_iHVMXQmueiWhcQeCIyIxBWHZGN6fQPS8JKyU7jq8\",\"authorityMaterialHandle\":\"amh_kv_001\",\"claimNonce\":\"oKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr8\",\"contentSource\":{\"action\":\"tinycloud.kv/get\",\"kind\":\"kv\",\"path\":\"documents/plan.md\",\"space\":\"did:pkh:eip155:1:0x1111111111111111111111111111111111111111\"},\"contentSourceDigest\":\"B-O75gHmIx2CyOm9cOdHJivP-kupRtNWcUPXuZbEnZ4\",\"delegationCid\":\"bafkreiehcdfj3fkj6xnkwsiwteiqdoa5nwkcfz5gcpijuew2wsdimly67q\",\"emailHash\":\"qKV4ujaQfxW8jcrRXh3yk9KQw4ZJH1ebe5CKCItXRuo\",\"expiresAt\":\"2026-07-16T12:02:00.000Z\",\"holderDid\":\"did:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7\",\"invitationId\":\"AAECAwQFBgcICQoLDA0ODw\",\"issuedAt\":\"2026-07-16T12:00:00.000Z\",\"jti\":\"wMHCw8TFxsfIycrLzM3Ozw\",\"nodeAudience\":\"did:web:node.example\",\"policyCid\":\"bafkreiaqkcd56bhbn3zwcx7r5xdkle2nukcrhkvwwrcg4qqehk6q5hlwi4\",\"redemptionId\":\"QEFCQ0RFRkdISUpLTE1OTw\",\"requestOrigin\":\"https://share.tinycloud.xyz\",\"shareCid\":\"bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4\",\"shareId\":\"share-kv-001\",\"targetOrigin\":\"https://node.example\",\"type\":\"TinyCloudEmailClaimHolderBinding\",\"version\":1}",
+          "messageDigest": "6ofltOYqYXBEhnPT-NeBo8mxnHomLYk65UiGf0Lgznw",
+          "signedBytesDigest": "xFHfZ5QbSWp2d5vKTr8shG05UV2lQR_JkAPlKg5NLP8",
+          "signatureDigest": "T2YxVjkaISRLn1Ujhv0PFo6cGkomPic2lWV6fcTXExk",
+          "signature": {
+            "alg": "EdDSA",
+            "kid": "did:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7#z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7",
+            "value": "4XAllnIvcDrKZ4ggKJDwCZS1REBHV8yrtjKqngChNTEj4aoq4MpZLeeHLpBgZ9eJmgrsNpqQMyS-R19YW8v5Aw"
+          }
+        },
+        "signerDid": "did:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7",
+        "keyId": "did:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7#z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "cross-artifact-holder"
+    },
+    {
+      "id": "policy-challenge-replay",
+      "kind": "state",
+      "target": "nonce.state",
+      "mutation": "consume-twice",
+      "mutationData": {
+        "operation": "transition",
+        "from": "CONSUMED",
+        "to": "CONSUMED"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "session-token-only",
+      "kind": "state",
+      "target": "read.proof",
+      "mutation": "omit-holder-proof",
+      "mutationData": {
+        "operation": "delete"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "old-secret-after-resend",
+      "kind": "state",
+      "target": "invitation.version",
+      "mutation": "use-v1-after-v2-accepted",
+      "mutationData": {
+        "operation": "replace",
+        "value": 1
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "otp-after-five-wrong",
+      "kind": "state",
+      "target": "otp.attempts",
+      "mutation": "correct-code-after-lock",
+      "mutationData": {
+        "operation": "replace",
+        "value": 5
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "scanner-get",
+      "kind": "state",
+      "target": "fragment",
+      "mutation": "GET-consumes-claim",
+      "mutationData": {
+        "operation": "consume-on-GET",
+        "valueByKind": {
+          "kv": "https://share.tinycloud.xyz/s/bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4#k=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&i=AAECAwQFBgcICQoLDA0ODw&c=ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+          "sql": "https://share.tinycloud.xyz/s/bafkreif2kris7mo5etetu5jleg2noejza34ptwmpjhdm5jernutik6baqu#k=QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8&i=AAECAwQFBgcICQoLDA0ODw&c=ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "scanner-fragment-percent-encoded",
+      "kind": "share-url",
+      "target": "scanner.fragment",
+      "mutation": "reject-percent-encoded-fragment-material",
+      "mutationData": {
+        "operation": "replace",
+        "valueByKind": {
+          "kv": "https://share.tinycloud.xyz/s/bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4#k=%41AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&i=AAECAwQFBgcICQoLDA0ODw&c=ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+          "sql": "https://share.tinycloud.xyz/s/bafkreif2kris7mo5etetu5jleg2noejza34ptwmpjhdm5jernutik6baqu#k=%41QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8&i=AAECAwQFBgcICQoLDA0ODw&c=ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "scanner-fragment-encoding"
+    },
+    {
+      "id": "resend-recipient-supplied-email",
+      "kind": "schema",
+      "target": "resendRequest.email",
+      "mutation": "add-email",
+      "mutationData": {
+        "operation": "add-property",
+        "field": "email",
+        "value": "Alice+Notes@example.com"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "capability-extra-route",
+      "kind": "capability",
+      "target": "witness.routes",
+      "mutation": "add-route",
+      "mutationData": {
+        "operation": "append",
+        "value": "/v1/extra"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "capability-wildcard-origin",
+      "kind": "capability",
+      "target": "node.origin",
+      "mutation": "wildcard-origin",
+      "mutationData": {
+        "operation": "replace",
+        "value": "https://*.example"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "node-enrollment-disabled",
+      "kind": "enrollment",
+      "target": "enrollment.enabled",
+      "mutation": "reject-disabled-enrollment",
+      "mutationData": {
+        "operation": "replace",
+        "enrollment": {
+          "targetOrigin": "https://node.example",
+          "nodeAudience": "did:web:node.example",
+          "invitationKid": "did:web:node.example#invitation-key-1",
+          "invitationPublicKey": "IVL40Zt5HSRFMkLhXy6rbLfP-ntqXtMAl5YOBpiB2xI",
+          "keyVersion": 1,
+          "enabled": false
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "node-enrollment"
+    },
+    {
+      "id": "node-enrollment-origin-audience",
+      "kind": "enrollment",
+      "target": "enrollment.targetOrigin",
+      "mutation": "reject-authority-mismatch",
+      "mutationData": {
+        "operation": "replace",
+        "enrollment": {
+          "targetOrigin": "https://evil.example",
+          "nodeAudience": "did:web:node.example",
+          "invitationKid": "did:web:node.example#invitation-key-1",
+          "invitationPublicKey": "IVL40Zt5HSRFMkLhXy6rbLfP-ntqXtMAl5YOBpiB2xI",
+          "keyVersion": 1,
+          "enabled": true
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "node-authority"
+    },
+    {
+      "id": "node-enrollment-audience-origin",
+      "kind": "enrollment",
+      "target": "enrollment.nodeAudience",
+      "mutation": "reject-authority-mismatch",
+      "mutationData": {
+        "operation": "replace",
+        "enrollment": {
+          "targetOrigin": "https://node.example",
+          "nodeAudience": "did:web:evil.example",
+          "invitationKid": "did:web:node.example#invitation-key-1",
+          "invitationPublicKey": "IVL40Zt5HSRFMkLhXy6rbLfP-ntqXtMAl5YOBpiB2xI",
+          "keyVersion": 1,
+          "enabled": true
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "node-authority"
+    },
+    {
+      "id": "node-enrollment-retired-key",
+      "kind": "enrollment",
+      "target": "enrollment.keyVersion",
+      "mutation": "reject-retired-key-version",
+      "mutationData": {
+        "operation": "replace",
+        "enrollment": {
+          "targetOrigin": "https://node.example",
+          "nodeAudience": "did:web:node.example",
+          "invitationKid": "did:web:node.example#invitation-key-2",
+          "invitationPublicKey": "IVL40Zt5HSRFMkLhXy6rbLfP-ntqXtMAl5YOBpiB2xI",
+          "keyVersion": 2,
+          "enabled": true
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "node-key-retirement"
+    },
+    {
+      "id": "node-enrollment-kid-version-mismatch",
+      "kind": "enrollment",
+      "target": "enrollment.invitationKid",
+      "mutation": "reject-kid-version-mismatch",
+      "mutationData": {
+        "operation": "replace",
+        "enrollment": {
+          "targetOrigin": "https://node.example",
+          "nodeAudience": "did:web:node.example",
+          "invitationKid": "did:web:node.example#invitation-key-2",
+          "invitationPublicKey": "IVL40Zt5HSRFMkLhXy6rbLfP-ntqXtMAl5YOBpiB2xI",
+          "keyVersion": 1,
+          "enabled": true
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "node-key-rotation"
+    },
+    {
+      "id": "read-body-one-field-mutation",
+      "kind": "preimage",
+      "target": "sqlReadRequest.resource",
+      "mutation": "change-one-argument",
+      "mutationData": {
+        "operation": "replace",
+        "value": "other"
+      },
+      "appliesTo": [
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "claim-redeem-magic-with-otp",
+      "kind": "method",
+      "target": "claimRedeemRequest.mailboxProof",
+      "mutation": "magic-method-with-otp-proof",
+      "mutationData": {
+        "operation": "replace",
+        "method": "magic",
+        "field": "mailboxProof",
+        "value": "042731"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "claim-redeem-otp-with-magic",
+      "kind": "method",
+      "target": "claimRedeemRequest.mailboxProof",
+      "mutation": "otp-method-with-magic-proof",
+      "mutationData": {
+        "operation": "replace",
+        "method": "otp",
+        "field": "mailboxProof",
+        "value": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "policy-challenge-response-proof",
+      "kind": "proof",
+      "target": "policyChallengeResponse.proof",
+      "mutation": "use-holder-proof-for-node-artifact",
+      "mutationData": {
+        "operation": "replace",
+        "artifact": "policyChallenge",
+        "signer": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "policy-session-response-proof",
+      "kind": "proof",
+      "target": "policySessionResponse.proof",
+      "mutation": "use-holder-proof-for-node-artifact",
+      "mutationData": {
+        "operation": "replace",
+        "artifact": "policySession",
+        "signer": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "authority-material-signature",
+      "kind": "authority",
+      "target": "authorityMaterial.signature.value",
+      "mutation": "flip-authority-signature",
+      "mutationData": {
+        "operation": "flip-byte",
+        "field": "signature"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "authority-material-policy-mapping",
+      "kind": "authority",
+      "target": "authorityMaterial.mapping",
+      "mutation": "replace-share-policy-cid",
+      "mutationData": {
+        "operation": "replace",
+        "field": "mapping",
+        "value": {
+          "sharePolicyCid": "bafkreihepz3bwuubhhm3q4beispxxy2edi6i3dolefyfu6jbwl6ofzgaom",
+          "shareDelegationCid": "bafkreiehcdfj3fkj6xnkwsiwteiqdoa5nwkcfz5gcpijuew2wsdimly67q",
+          "policyAuthorityCid": "bafkr4ihpnxv3ndmi7npuia4w6wvpmf5wy7esppd6uvsnrwkyptml6tig3q",
+          "policyEnforcementCid": "bafkr4iggfdbutb76sce2hjbb6gonj22o3zkdrku7cxgrlebjq6xjnft7fe"
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "authority-status-rollback",
+      "kind": "authority",
+      "target": "authorityMaterial.statusObservations",
+      "mutation": "decrease-status-sequence",
+      "mutationData": {
+        "operation": "replace",
+        "field": "statusObservations",
+        "value": []
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "authority-status-stale",
+      "kind": "authority",
+      "target": "authorityMaterial.statusObservations",
+      "mutation": "stale-status",
+      "mutationData": {
+        "operation": "replace",
+        "field": "statusObservations",
+        "value": []
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "authority-status-revoked",
+      "kind": "authority",
+      "target": "authorityMaterial.statusObservations",
+      "mutation": "revoke-active-authority",
+      "mutationData": {
+        "operation": "replace",
+        "field": "statusObservations",
+        "value": []
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "authority-key-version",
+      "kind": "authority",
+      "target": "authorityMaterial.attestation",
+      "mutation": "wrong-enforcer-key-version",
+      "mutationData": {
+        "operation": "replace",
+        "field": "attestation",
+        "value": {}
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "authority-attestation-binding",
+      "kind": "authority",
+      "target": "authorityMaterial.attestation",
+      "mutation": "wrong-attestation-audience",
+      "mutationData": {
+        "operation": "replace",
+        "field": "attestation",
+        "value": {}
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "authority-measurement-digest-expiry",
+      "kind": "authority",
+      "target": "authorityMaterial.attestation",
+      "mutation": "wrong-measurement-digest-expiry",
+      "mutationData": {
+        "operation": "replace",
+        "field": "attestation",
+        "value": {}
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "authority-identifier-domain-confusion",
+      "kind": "authority",
+      "target": "authorityMaterial.mapping",
+      "mutation": "use-policy-cid-as-delegation-cid",
+      "mutationData": {
+        "operation": "replace",
+        "field": "mapping",
+        "value": {
+          "sharePolicyCid": "bafkreiaqkcd56bhbn3zwcx7r5xdkle2nukcrhkvwwrcg4qqehk6q5hlwi4",
+          "shareDelegationCid": "bafkreiaqkcd56bhbn3zwcx7r5xdkle2nukcrhkvwwrcg4qqehk6q5hlwi4",
+          "policyAuthorityCid": "bafkr4ihpnxv3ndmi7npuia4w6wvpmf5wy7esppd6uvsnrwkyptml6tig3q",
+          "policyEnforcementCid": "bafkr4iggfdbutb76sce2hjbb6gonj22o3zkdrku7cxgrlebjq6xjnft7fe"
+        }
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "sd-jwt-missing-alg",
+      "kind": "sd-jwt",
+      "target": "credential.claims._sd_alg",
+      "mutation": "delete-sd-alg",
+      "mutationData": {
+        "operation": "delete",
+        "expected": "sha-256"
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    },
+    {
+      "id": "sd-jwt-two-element-disclosure",
+      "kind": "sd-jwt",
+      "target": "credential.disclosures[0].encoded",
+      "mutation": "replace-disclosure-with-two-elements",
+      "mutationData": {
+        "operation": "replace",
+        "arrayShape": [
+          "email",
+          "Alice+Notes@example.com"
+        ]
+      },
+      "appliesTo": [
+        "kv",
+        "sql"
+      ],
+      "expected": "reject",
+      "rejectionStage": "contract-validation"
+    }
+  ]
+}

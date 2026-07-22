@@ -98,18 +98,24 @@ pub struct NodeInfo {
     pub in_tee: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota_url: Option<String>,
+    #[serde(rename = "shareEmail", skip_serializing_if = "Option::is_none")]
+    pub share_email: Option<crate::share_email::CapabilityDescriptor>,
 }
 
 fn build_info(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
     encryption: &State<EncryptionService>,
+    share_email: &State<Option<crate::share_email::ShareEmailRuntime>>,
 ) -> NodeInfo {
     #[allow(unused_mut)]
     let mut features = vec!["kv", "delegation", "sharing", "sql"];
     #[cfg(feature = "duckdb")]
     features.push("duckdb");
     features.extend(["hooks", "signed-urls", "encryption"]);
+    if share_email.inner().is_some() {
+        features.push("share-email-claim");
+    }
     #[cfg(feature = "dstack")]
     features.push("tee");
     NodeInfo {
@@ -119,6 +125,10 @@ fn build_info(
         node_id: encryption.node_did().to_string(),
         in_tee: tee.inner().is_some(),
         quota_url: quota_cache.quota_url().map(|s| s.to_string()),
+        share_email: share_email
+            .inner()
+            .as_ref()
+            .map(|runtime| runtime.capability()),
     }
 }
 
@@ -127,8 +137,9 @@ pub fn info(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
     encryption: &State<EncryptionService>,
+    share_email: &State<Option<crate::share_email::ShareEmailRuntime>>,
 ) -> Json<NodeInfo> {
-    Json(build_info(tee, quota_cache, encryption))
+    Json(build_info(tee, quota_cache, encryption, share_email))
 }
 
 #[get("/version")]
@@ -136,8 +147,9 @@ pub fn version(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
     encryption: &State<EncryptionService>,
+    share_email: &State<Option<crate::share_email::ShareEmailRuntime>>,
 ) -> Json<NodeInfo> {
-    Json(build_info(tee, quota_cache, encryption))
+    Json(build_info(tee, quota_cache, encryption, share_email))
 }
 
 #[allow(clippy::let_unit_value)]
@@ -2636,8 +2648,8 @@ mod tests {
         ))))
     }
 
-    #[test]
-    fn conditional_kv_etags_are_strong_blake3_etags() {
+    #[tokio::test]
+    async fn conditional_kv_etags_are_strong_blake3_etags() {
         let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         assert_eq!(
             parse_strong_blake3_etag(&format!("\"blake3-{digest}\"")).unwrap(),
@@ -2657,8 +2669,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn bounded_kv_headers_are_positive_and_removed_from_object_metadata() {
+    #[tokio::test]
+    async fn bounded_kv_headers_are_positive_and_removed_from_object_metadata() {
         let mut metadata = Metadata(BTreeMap::from([
             (
                 "X-TinyCloud-Max-Response-Bytes".to_string(),
@@ -2690,8 +2702,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn kv_create_and_replace_headers_build_exact_key_preconditions() {
+    #[tokio::test]
+    async fn kv_create_and_replace_headers_build_exact_key_preconditions() {
         let space = test_space_id("conditional-kv-options");
         let capability = kv_put_capability(&space, "files/report.txt");
 
@@ -2729,8 +2741,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn kv_condition_headers_reject_ambiguous_or_batch_mutations() {
+    #[tokio::test]
+    async fn kv_condition_headers_reject_ambiguous_or_batch_mutations() {
         let space = test_space_id("conditional-kv-invalid");
         let capabilities = [
             kv_put_capability(&space, "a"),
@@ -3631,7 +3643,7 @@ mod tests {
         let auth_header = make_auth_header("urn:uuid:00000000-0000-4000-8000-000000000001")?;
 
         let rocket = rocket::build()
-            .mount("/", routes![invoke])
+            .mount("/", rocket::routes![invoke])
             .attach(crate::tracing::TracingFairing {
                 header_name: Config::default().log.tracing.traceheader,
             })
@@ -3886,7 +3898,7 @@ mod tests {
         let auth_header = make_auth_header("urn:uuid:00000000-0000-4000-8000-0000000000w5")?;
 
         let rocket = rocket::build()
-            .mount("/", routes![invoke])
+            .mount("/", rocket::routes![invoke])
             .attach(crate::tracing::TracingFairing {
                 header_name: Config::default().log.tracing.traceheader,
             })
@@ -4541,7 +4553,10 @@ mod tests {
         conn.commit().await?;
 
         let rocket = rocket::build()
-            .mount("/", routes![delegation_status, delegation_query, revoke])
+            .mount(
+                "/",
+                rocket::routes![delegation_status, delegation_query, revoke],
+            )
             .attach(crate::tracing::TracingFairing {
                 header_name: Config::default().log.tracing.traceheader,
             })
@@ -5293,7 +5308,7 @@ mod tests {
         limit: rocket::data::ByteUnit,
     ) -> rocket::Rocket<rocket::Build> {
         rocket::build()
-            .mount("/", routes![invoke])
+            .mount("/", rocket::routes![invoke])
             .attach(crate::tracing::TracingFairing {
                 header_name: Config::default().log.tracing.traceheader,
             })

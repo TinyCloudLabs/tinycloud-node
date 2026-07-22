@@ -1,0 +1,39 @@
+# TinyCloud Node exact-email production/staging configuration.
+#
+# This is a non-secret template. Mount a filled copy at the path supplied by
+# TINYCLOUD_CONFIG_FILE. The node validates every enabled share-email trust,
+# evidence, database, and origin setting before it opens a listener. Do not
+# put private keys or database passwords in this file.
+
+[global]
+cors = false
+
+[global.share_email]
+enabled = true
+# One strict public bundle is shared with Share and OpenCredentials. It is
+# mounted read-only and supplies all origin, audience, enrollment, issuer,
+# version, and public-key fields below. No split trust environment variables
+# are accepted by the production compose file.
+trust_bundle_path = "/run/tinycloud/share-email-trust-bundle.json"
+
+# This signed bundle contains the policy/enforcement authority artifacts,
+# enrollment, fresh status observations, and runtime attestation. It is read
+# and cryptographically verified before the capability is advertised.
+authority_material_path = "/run/tinycloud/authority-material.json"
+readiness_max_age_seconds = 300
+challenge_ttl_seconds = 120
+space_name = "documents"
+
+[global.share_email.postgres_tls]
+sslmode = "verify-full"
+root_cert_path = "/run/tinycloud/postgres-ca.pem"
+
+[global.storage]
+# Supplied by TINYCLOUD_STORAGE__DATABASE. Production must be a PostgreSQL
+# URL containing exactly sslmode=verify-full.
+staging = "FileSystem"
+
+[global.keys]
+# The secret is supplied out of band as TINYCLOUD_KEYS_SECRET. Static key
+# derivation is shown only as a configuration shape; never commit its value.
+type = "Static"

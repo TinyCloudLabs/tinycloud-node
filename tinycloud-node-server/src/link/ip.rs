@@ -178,7 +178,7 @@ pub fn format_lan_ips(ips: &[IpAddr]) -> Vec<String> {
 mod tests {
     use super::*;
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn ipv4_private_ranges_are_included() {
         assert!(is_private_lan_address("10.0.0.1".parse().unwrap()));
         assert!(is_private_lan_address("10.255.255.254".parse().unwrap()));
@@ -188,7 +188,7 @@ mod tests {
         assert!(is_private_lan_address("169.254.10.20".parse().unwrap()));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn ipv4_public_and_loopback_are_excluded() {
         assert!(!is_private_lan_address("8.8.8.8".parse().unwrap()));
         assert!(!is_private_lan_address("1.1.1.1".parse().unwrap()));
@@ -199,7 +199,7 @@ mod tests {
         assert!(!is_private_lan_address("0.0.0.0".parse().unwrap()));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn ipv6_ula_and_link_local_are_included() {
         assert!(is_private_lan_address("fd00::1".parse().unwrap()));
         assert!(is_private_lan_address("fdff::abcd".parse().unwrap()));
@@ -208,7 +208,7 @@ mod tests {
         assert!(is_private_lan_address("febf::1234".parse().unwrap()));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn ipv6_public_and_loopback_are_excluded() {
         assert!(!is_private_lan_address("2001:db8::1".parse().unwrap()));
         assert!(!is_private_lan_address("2606:4700::1".parse().unwrap()));
@@ -218,7 +218,7 @@ mod tests {
         assert!(!is_private_lan_address("fec0::1".parse().unwrap())); // deprecated site-local
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn ipv6_link_local_is_flagged_for_exclusion_from_published_records() {
         assert!(is_ipv6_link_local("fe80::1".parse().unwrap()));
         assert!(is_ipv6_link_local("febf::1234".parse().unwrap()));
@@ -226,7 +226,7 @@ mod tests {
         assert!(!is_ipv6_link_local("2001:db8::1".parse().unwrap()));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn rfc1918_and_ula_are_preferred_over_link_local() {
         assert!(is_preferred_lan_address("192.168.1.5".parse().unwrap()));
         assert!(is_preferred_lan_address("10.0.0.1".parse().unwrap()));
@@ -235,14 +235,14 @@ mod tests {
         assert!(!is_preferred_lan_address("fe80::1".parse().unwrap()));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn format_lan_ips_stringifies_addresses() {
         let ips: Vec<IpAddr> = vec!["192.168.1.10".parse().unwrap(), "fd00::1".parse().unwrap()];
         let rendered = format_lan_ips(&ips);
         assert_eq!(rendered, vec!["192.168.1.10", "fd00::1"]);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn virtual_bridge_prefixes_are_recognized() {
         for name in [
             "bridge100",
@@ -281,7 +281,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn lan_ip_selection_excludes_vm_bridge_when_a_physical_interface_exists() {
         // Reproduces the live TC-250 case: Lima's `bridge100` publishing
         // 192.168.64.1 alongside the real `en0` LAN address 192.168.1.195.
@@ -293,7 +293,7 @@ mod tests {
         assert_eq!(ips, vec!["192.168.1.195".parse::<IpAddr>().unwrap()]);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn lan_ip_selection_falls_back_to_virtual_interface_when_nothing_physical_exists() {
         // Never publish nothing when a private-range address exists at all —
         // even if every interface we found looks virtual.
@@ -302,7 +302,7 @@ mod tests {
         assert_eq!(ips, vec!["192.168.64.1".parse::<IpAddr>().unwrap()]);
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn lan_ip_selection_errors_when_no_private_addresses_exist() {
         let addrs = vec![v4_iface("en0", "8.8.8.8".parse().unwrap())];
         assert!(select_lan_ips(addrs).is_err());

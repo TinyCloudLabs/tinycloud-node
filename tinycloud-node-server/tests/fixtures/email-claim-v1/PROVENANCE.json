@@ -1,0 +1,31 @@
+{
+  "sourceRepository": "https://github.com/TinyCloudLabs/share",
+  "sourceCommit": "3fa222a4e797af6a8192957e59ac41e2a7d805fd",
+  "sourcePath": "test/vectors/email-claim-v1",
+  "specSourcePath": "specs/email-claim-v1",
+  "contractVersion": "tinycloud.share-email-claim/v1",
+  "manifestVersion": 1,
+  "manifestDigest": "pl8-1Rpx_DYCBjOpK3hRrLfrSVDINNFssZDfFw6BMTs",
+  "manifestSha256": "3e6b8975938693be08847b86286030cd7920cb89774d673126f44ac2c4e2ce2f",
+  "runtimeDependencies": [
+    {
+      "name": "@noble/hashes",
+      "version": "1.8.0",
+      "integrity": "sha512-jCs9ldd7NwzpgXDIf6P3+NrHh9/sD6CQdxHyjQI+h/6rDNo88ypBxxz45UDuZHz9r3tNz7N/VInSVoVdtXEI4A==",
+      "license": "MIT",
+      "vendoredSubset": [
+        "LICENSE",
+        "package.json",
+        "esm/package.json",
+        "esm/blake3.js",
+        "esm/blake2.js",
+        "esm/_blake.js",
+        "esm/_md.js",
+        "esm/_u64.js",
+        "esm/utils.js",
+        "esm/crypto.js",
+        "esm/cryptoNode.js"
+      ]
+    }
+  ]
+}
