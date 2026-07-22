@@ -1,24 +1,14 @@
+mod common;
+
 use serde_json::Value;
-use std::{path::PathBuf, sync::OnceLock};
+
+use common::email_claim_fixture_root;
 use tinycloud::share_email::{CapabilityDescriptor, NODE_CAPABILITY_ROUTES};
 
 const FROZEN_MANIFEST_DIGEST: &str = "pl8-1Rpx_DYCBjOpK3hRrLfrSVDINNFssZDfFw6BMTs";
 
-fn vector_root() -> PathBuf {
-    static ROOT: OnceLock<PathBuf> = OnceLock::new();
-    ROOT.get_or_init(|| {
-        std::env::var_os("TINYCLOUD_EMAIL_CLAIM_VECTOR_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../../../share/feat/email-claim-e1-e2e/test/vectors/email-claim-v1")
-            })
-    })
-    .clone()
-}
-
 fn frozen_node_routes() -> Value {
-    let root = vector_root();
+    let root = email_claim_fixture_root();
     let manifest: Value = serde_json::from_slice(
         &std::fs::read(root.join("manifest.json")).expect("frozen manifest must be present"),
     )
@@ -28,8 +18,11 @@ fn frozen_node_routes() -> Value {
         "route parity must use the immutable Share contract"
     );
     serde_json::from_slice(
-        &std::fs::read(root.join("../../../specs/email-claim-v1/domains.json"))
-            .expect("frozen domains must be present"),
+        &std::fs::read(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("specs/email-claim-v1/domains.json"),
+        )
+        .expect("frozen domains must be present"),
     )
     .expect("frozen domains must be JSON")
 }

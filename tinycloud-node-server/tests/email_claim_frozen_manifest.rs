@@ -1,13 +1,15 @@
 //! The node lane runs the immutable cross-language contract program from the
 //! checked-in fixture rather than depending on a sibling worktree.
 
+mod common;
+
 use serde_json::Value;
-use std::path::PathBuf;
+
+use common::email_claim_fixture_root;
 
 #[test]
 fn pinned_email_claim_manifest_runs_all_negative_rows() {
-    let vector_root =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/email-claim-v1");
+    let vector_root = email_claim_fixture_root();
     let manifest: Value = serde_json::from_slice(
         &std::fs::read(vector_root.join("manifest.json"))
             .expect("pinned email-claim manifest must be present"),
