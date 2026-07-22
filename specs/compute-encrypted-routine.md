@@ -115,10 +115,18 @@ host call in the same execution (no re-derivation per call), and let it drop
 with `HostState` at the end of `run_blocking`, the same point `routine_jwk`
 already goes out of scope. It is never: returned to the guest, included in a
 response body, logged, cloned into a second field, or persisted.
-`x25519_dalek::StaticSecret` (crate `2.0`, no `zeroize` feature enabled) does
-not zero its memory on drop; this spec does not add that — the same posture
-already accepted for `routine_jwk`'s Ed25519 material and the credentials
-`HostState` already carries.
+*Correction (zeroize):* an earlier draft claimed `x25519_dalek::StaticSecret`
+does not zero its memory on drop because "no `zeroize` feature [is] enabled."
+That is backwards: `tinycloud-core/Cargo.toml:44`'s `x25519-dalek = { version
+= "2.0", features = ["static_secrets"] }` does not set
+`default-features = false`, so x25519-dalek 2.0's DEFAULT features — which
+include `zeroize` — remain active (confirmed independently: `Cargo.lock`
+resolves `zeroize` as a direct dependency edge of the `x25519-dalek` package).
+With that feature active, `StaticSecret` derives `Zeroize`/`ZeroizeOnDrop`, so
+the scalar bytes ARE zeroed automatically when `HostState` (and the
+`routine_x25519` field inside it) drops at the end of `run_blocking` — this
+spec does not need to add anything for that; it is a property already granted
+by the resolved dependency tree, not an accepted gap.
 
 **D-ER3 — the internal invocation authorizing the routine's decrypt is
 audience = node_did (not `space.did()`), sourced from the routine's own
@@ -165,9 +173,10 @@ memory (after the mediator's ECIES unwrap and its own exact-length check,
 §4.2/§5.2 step 6); the guest WASM module runs AES-256-GCM itself. The host
 mediator never touches the payload bytes — it only ever handles the (much
 smaller) wrapped/unwrapped *key* and the (non-secret, already
-storage-readable) AAD bytes plus their hash (§6, §5.2 step 3a — needed to
-bind the guest's real AAD into the routine's signed intent, corrected in this
-revision to actually be verifiable). This keeps the
+storage-readable) AAD bytes plus their hash (§6, §5.2 step 3a — binds the
+AAD the guest DECLARED TO THE HOST in this call into the routine's signed
+intent; §9 invariant 9 scopes exactly what this does and does not prove
+about the guest's separate in-WASM AEAD call). This keeps the
 host-import surface symmetric with the existing four (thin, JSON/bytes-in-out)
 and keeps "what the host can read" minimal. Re-encryption of the SAME payload
 using the SAME already-unwrapped symmetric key is IN SCOPE (§6, needed for the
@@ -270,24 +279,43 @@ security boundary.
 
 **DECIDED fix.** Narrow the predicate to treat `Resource::TinyCloud` rows
 exactly as today, and admit `Resource::Other` rows **only** when their URI
-matches the encryption-network URN prefix:
+parses as a well-formed `NetworkId` — NOT merely when it starts with the
+reserved prefix:
 
 ```rust
 let all_in_space = ability_rows.iter().all(|row| match &row.resource {
     Resource::TinyCloud(_) => row.resource.space().map(|s| s == space).unwrap_or(false),
-    Resource::Other(uri) => uri.as_str().starts_with(ENCRYPTION_NETWORK_PREFIX),
+    Resource::Other(uri) => uri.as_str().parse::<NetworkId>().is_ok(),
 });
 ```
+
+*Correction (selector must fail closed on malformed reserved-prefix URIs, not
+just prefix-match):* an earlier draft admitted any `Resource::Other` row whose
+URI merely `starts_with(ENCRYPTION_NETWORK_PREFIX)`, which is broader than a
+valid network resource — it would also admit malformed values inside the
+reserved namespace (missing owner DID or name, a name containing `:`/`/`,
+anything `NetworkId::from_str` (`tinycloud-core/src/encryption_network/network_id.rs:78-...`)
+rejects with `NetworkIdError`). `Resource::extends`'s own `Other, Other` arm
+(`resource.rs:33-48`) already treats this correctly: it parses BOTH sides as
+`NetworkId` and only falls back to a raw prefix comparison when NEITHER side
+parses AND NEITHER side is inside the reserved prefix, deliberately returning
+`false` (fail closed) the moment either side is a malformed reserved-prefix
+value (`resource.rs:39-43`). The `all_in_space` carve-out now mirrors that
+same fail-closed rule instead of a strictly weaker prefix check — a `D_fn`
+carrying a malformed `Resource::Other` row that merely LOOKS like an
+encryption-network URI (e.g. `urn:tinycloud:encryption:` with no owner/name,
+or a name containing `/`) is REJECTED (whole delegation unselectable), not
+silently admitted.
 
 *Correction (constant name/visibility):* the constant already exists as
 `ENCRYPTION_NETWORK_PREFIX` (**not** `ENCRYPTION_NETWORK_URN_PREFIX`, an
 earlier draft's typo/invention) at `tinycloud-core/src/types/resource.rs:13`,
-and is **module-private** (no `pub` qualifier at all — not `pub(crate)`),
-already used by `Resource::extends`'s `Other, Other` arm (`resource.rs:33-48`,
-the two `starts_with(ENCRYPTION_NETWORK_PREFIX)` checks around lines 41-42).
-Mark it `pub(crate)` (a strictly widening, non-breaking visibility change) so
-`db.rs` can reuse it, rather than duplicating the string literal or inventing
-a second constant.
+and is **module-private** (no `pub` qualifier at all — not `pub(crate)`). The
+fixed selector above does not need it at all — `uri.as_str().parse::<NetworkId>()`
+is sufficient and requires only `use crate::encryption_network::NetworkId;` in
+`db.rs` (the module is unconditionally public, not gated behind the `compute`
+feature — `tinycloud-core/src/lib.rs:8`, `pub mod encryption_network;`), so no
+visibility change to `ENCRYPTION_NETWORK_PREFIX` is needed for this fix.
 
 The real authorization boundary for the encryption row is unchanged and
 enforced elsewhere, twice: (a) the deployer could not have minted this row
@@ -480,8 +508,8 @@ storage_get, storage_put, storage_del, sql_query, encryption_decrypt
   "keyVersion": 1,
   "encryptedSymmetricKey": "<base64, from the InlineEnvelope the guest already read via storage_get>",
   "encryptedSymmetricKeyHash": "<hex, ditto>",
-  "aad": "<base64, the RAW InlineEnvelope.aad bytes the guest already holds from storage_get — NOT secret, see §6>",
-  "aadHash": "<hex, the guest's own canonical_hash(base64(aad)) declaration — RECOMPUTED from `aad` and verified by the mediator before use, never trusted as-supplied; see §5.2 step 3a/§6>"
+  "aad": "<base64 (STANDARD engine, canonical encoding required), the RAW InlineEnvelope.aad bytes the guest already holds from storage_get — NOT secret, see §6; decoded and validated by the mediator, FATAL on invalid/non-canonical base64, §5.2 step 3a.1>",
+  "aadHash": "<hex, the guest's own canonical_hash(base64(aad)) declaration — a REQUEST SELF-CONSISTENCY check only; the mediator always computes and signs its OWN hash from the decoded `aad` regardless of this field, see §5.2 step 3a.2-3/§6/§9 invariant 9>"
 }
 ```
 
@@ -490,7 +518,9 @@ This is the **minimum guest-supplied subset** of `DecryptRequestBody`
 everything a guest reading an `InlineEnvelope` (`types.rs:138-155`) already
 has in hand after a normal `storage_get` (the raw `aad` bytes), plus a hash
 it computes locally over those same bytes as a self-consistency declaration
-the mediator independently verifies (§5.2 step 3a, §6). The guest does NOT supply `targetNode` or a `receiverPublicKey` — the
+the mediator cross-checks against its OWN recomputed hash before proceeding
+(§5.2 step 3a, §6 — the mediator's own hash, not the guest's, is what
+actually gets signed; §9 invariant 9). The guest does NOT supply `targetNode` or a `receiverPublicKey` — the
 host fills both in (target_node = this node's own DID, via
 `EncryptionService::node_did()`; receiver_public_key = the routine's derived
 X25519 public key, D-ER2) — neither is guest-controllable data, they are
@@ -565,16 +595,46 @@ the same `self.manifest.record` call site, no new plumbing.
 3. **Recompute+verify `aadHash`, mint the node-audience internal invocation
    (D-ER3), and clone `InvocationInfo` before the invocation moves (fixes two
    round-2 gaps: a detached AAD hash and a non-compiling ownership flow).**
-   - **3a — AAD binding (closes the gap).** The mediator now receives the RAW
-     `aad` bytes (§5.1), not just a guest-declared hash. Compute
-     `computed_aad_hash = canonical_hash(&Value::String(request.aad.clone()))`
-     — the SAME `canonical_hash`-of-base64-string convention
-     `encryptedSymmetricKeyHash`/`receiverPublicKeyHash` already use
-     (`service.rs:671-672, 683-684`). If `computed_aad_hash !=
-     request.aad_hash`, FATAL immediately (`self.fatal = Some("aadHash does
-     not match recomputed hash of aad")`) and return the standard FATAL
-     envelope here — no invocation is minted or signed for this failure; it
-     journals `granted: false` the same way every other pre-mint fatal does
+   - **3a — AAD binding, scoped to what the host actually observes.** The
+     mediator receives the RAW `aad` bytes (§5.1, base64). *Correction: an
+     earlier draft hashed `request.aad` as an opaque STRING, with no decode
+     step at all — it never confirmed `aad` was valid base64 before that
+     string participated in a signed hash, and comparing the mediator's
+     recomputation against the guest's OWN `aad_hash` (computed the same way,
+     over the same request the guest just sent) is pure self-consistency: it
+     proves nothing beyond "the guest can compute a hash correctly," since
+     the mediator has no way to observe what AAD bytes the guest's SEPARATE,
+     later in-WASM AEAD call actually uses (§9 invariant 9 already concedes
+     this).* Fixed sequence:
+     1. Decode `request.aad` with the STANDARD base64 engine (`decode_base64`,
+        `service.rs:1015-1017` — the SAME engine/helper `receiverPublicKey`/
+        `encryptedSymmetricKey` already decode with). If decode fails
+        (invalid or non-canonical base64 — e.g. bad alphabet, wrong padding,
+        trailing bits the engine rejects), FATAL immediately (`self.fatal =
+        Some("aad is not valid base64")`) BEFORE touching `aad_hash` at all —
+        this is a NEW validation step; nothing decoded `aad` before this
+        revision.
+     2. Compute `computed_aad_hash = canonical_hash(&Value::String(request.aad.clone()))`
+        on the NOW-VALIDATED string — the SAME `canonical_hash`-of-base64-string
+        convention `encryptedSymmetricKeyHash`/`receiverPublicKeyHash` already
+        use (`service.rs:671-672, 683-684`) — **entirely host-side**: this is
+        the value that goes into the signed invocation (step 3b); the guest's
+        own `aad_hash` field is used ONLY as an early-exit self-consistency
+        check (below), never as the value that gets signed.
+     3. If the guest-declared `request.aad_hash` does not equal
+        `computed_aad_hash`, FATAL immediately (`self.fatal = Some("aadHash
+        does not match recomputed hash of aad")`) — this is a
+        request-self-consistency check ONLY (catches a guest client-code bug
+        early, at the cheapest possible point), NOT an "independent
+        verification of the guest's real AAD": both values in this
+        comparison are derived from data the guest supplied in THIS SAME
+        request, and the mediator has no visibility into the SEPARATE,
+        later in-WASM AEAD call the guest's own code makes (§9 invariant 9).
+        The value that actually gets signed (step 3b) is always
+        `computed_aad_hash`, never the guest-declared field — so this check
+        gates WHEN the mediator proceeds, but the guest-declared value never
+        itself flows into the signed intent. It journals `granted: false`
+        the same way every other pre-mint fatal does
      (§7). This closes a round-2 gap: an earlier draft let the guest declare
      `aadHash` with no raw bytes for the mediator to check it against, so a
      guest could sign one hash while using a DIFFERENT `aad` locally for its
@@ -583,12 +643,25 @@ the same `self.manifest.record` call site, no new plumbing.
      one the mediator derived itself from bytes it directly received in this
      same call. (§6 explains why seeing `aad` server-side is not a new
      exposure — it is not secret payload data.)
-   - **3b — build `body_value` and mint.** Construct `DecryptRequestBody`
-     (network_id, alg, key_version, encrypted_symmetric_key/_hash passed
-     through verbatim from the guest request, receiver_public_key = base64 of
-     the routine's X25519 public key from step 2, receiver_public_key_hash =
-     `canonical_hash(Value::String(receiver_public_key))`), serialize it to a
-     `serde_json::Value`, then insert an EXTRA top-level `"aadHash"` key onto
+   - **3b — build `body_value` and mint.** Construct the COMPLETE
+     `DecryptRequestBody` (`protocol.rs:26-46`) — every field below is
+     REQUIRED, `serde` rejects a partial struct on deserialize into
+     `decrypt_authorized` (`service.rs:440-444`):
+     ```rust
+     let receiver_public_key = base64_encode(routine_x25519_public.as_bytes()); // step 2's derived PublicKey
+     let body = DecryptRequestBody {
+         ty: DECRYPT_REQUEST_TYPE.to_string(),                          // "type" — service.rs:444 rejects any other value
+         target_node: self.encryption_service.node_did().to_string(),   // "targetNode" — mediator-owned, never guest-supplied (§5.1)
+         network_id: network_id.clone(),
+         alg: request.alg.clone(),
+         key_version: request.key_version,
+         encrypted_symmetric_key: request.encrypted_symmetric_key.clone(),
+         encrypted_symmetric_key_hash: request.encrypted_symmetric_key_hash.clone(),
+         receiver_public_key: receiver_public_key.clone(),
+         receiver_public_key_hash: canonical_hash(&Value::String(receiver_public_key)),
+     };
+     ```
+     Serialize `body` to a `serde_json::Value`, then insert an EXTRA top-level `"aadHash"` key onto
      that `Value` holding `computed_aad_hash` from 3a — NEVER the raw
      guest-declared value (they are equal by construction once 3a has
      passed, but the mediator always writes its OWN computed value, as a
@@ -718,22 +791,30 @@ version/nonce/tag byte convention for layout consistency, not a promise of
 cross-decodability — nothing in this spec relies on `ColumnEncryption`
 decoding a guest-produced envelope.
 
-**AAD binding into the routine's signed intent, without touching core
-types.** The guest sends the RAW `aad` bytes (base64, §5.1) alongside its own
-`aadHash = canonical_hash(&Value::String(base64_standard_encode(&envelope.aad)))`
-declaration — the SAME convention `encryptedSymmetricKeyHash`/
-`receiverPublicKeyHash` already use (`canonical_hash` of the base64-encoded
-STRING, not `hash_hex` of raw bytes — `service.rs:671-672`, `683-684`). The
-mediator INDEPENDENTLY recomputes this same hash from the `aad` bytes it
-received and REJECTS, fatally, before minting any invocation, if the two
-disagree (§5.2 step 3a) — this closes a round-2 gap: an earlier draft let the
-guest declare `aadHash` with no raw bytes for the mediator to check it
-against, so a guest could sign one hash while using a DIFFERENT `aad` locally
-for its own AES-GCM call, and the mismatch was undetectable; the named
-tamper test (§10) could not actually establish any property about the
-mediator. Only the mediator's OWN recomputed value is ever written into
-`body_value`'s extra top-level `"aadHash"` key (§5.2 step 3b), BEFORE
-computing `canonical_hash(body_value)` for the signed invocation's
+**AAD binding into the routine's signed intent, scoped to what the host
+observes, without touching core types.** The guest sends the RAW `aad` bytes
+(base64, §5.1), which the mediator DECODES and validates (§5.2 step 3a.1 —
+FATAL on invalid/non-canonical base64, a NEW check) before ever hashing
+anything. The mediator then computes `computed_aad_hash =
+canonical_hash(&Value::String(request.aad.clone()))` **itself, entirely
+host-side**, from those validated bytes — the SAME convention
+`encryptedSymmetricKeyHash`/`receiverPublicKeyHash` already use
+(`canonical_hash` of the base64-encoded STRING, not `hash_hex` of raw bytes —
+`service.rs:671-672`, `683-684`). *Correction (scope of the guarantee): an
+earlier draft described this as the mediator "independently verifying" the
+guest's AAD and closing a binding gap. That overstates it — the mediator can
+only observe and bind the `aad` bytes DECLARED TO THE HOST in THIS
+`encryption_decrypt` call; it has no visibility into the guest's SEPARATE,
+later in-WASM AEAD call and cannot confirm those bytes match (§9 invariant 9
+already concedes this). The guest-supplied `aad_hash` field (§5.2 step 3a.3)
+adds no independent verification beyond that — both it and
+`computed_aad_hash` are derived from data the guest supplied in the SAME
+request, so comparing them only catches a guest client-code
+self-inconsistency bug early; it is a debuggability convenience, not a
+security boundary.* What IS real and worth stating precisely: only the
+mediator's OWN `computed_aad_hash` — never the guest-declared field — is ever
+written into `body_value`'s extra top-level `"aadHash"` key (§5.2 step 3b),
+BEFORE computing `canonical_hash(body_value)` for the signed invocation's
 `facts.body_hash` AND before passing that SAME `Value` into
 `decrypt_authorized(..., &body_value)` (§5.2 step 5). This works with **zero
 changes** to `DecryptRequestBody`/`DecryptFacts`/`decrypt_authorized` because:
@@ -742,18 +823,20 @@ changes** to `DecryptRequestBody`/`DecryptFacts`/`decrypt_authorized` because:
 has no `#[serde(deny_unknown_fields)]`; and (2) `expected_body_hash =
 canonical_hash(body_value)` (`service.rs:695`) hashes the RAW `Value` the
 caller passed in, not a re-serialization of the typed struct, so the extra
-key participates in the hash. Net effect: `aadHash` is now cryptographically
-bound to bytes the mediator itself observed in THIS call, and that binding is
-verified server-side (§5.2 step 3a) BEFORE it ever reaches a signed
-invocation — closing the detached-binding gap. Seeing raw `aad` bytes
-server-side is NOT a new exposure: `InlineEnvelope.aad` is associated
-(non-secret) metadata stored in-clear alongside the ciphertext, already fully
-readable by anything with the routine's existing `kv/get` grant (including,
-trivially, the node's own storage backend) — this spec does not extend host
-visibility into payload PLAINTEXT or the symmetric KEY (D-ER4/D-ER5,
-invariant 2 unchanged), only into a field that was never secret to begin
-with. `EncryptionService` itself still never validates `aad`/`aadHash`
-against anything beyond the existing `facts.body_hash` equality check
+key participates in the hash. Net effect: the `aad` value declared to the
+HOST in this call is cryptographically bound into the routine's signed
+intent (`facts.body_hash`) — a real, useful property for auditing what the
+routine told the node — but this is NOT a proof that the guest's own AEAD
+call later used the identical bytes; that remains a guest-self-sabotage risk
+outside this spec's boundary (invariant 9). Seeing raw `aad` bytes server-side
+is NOT a new exposure: `InlineEnvelope.aad` is associated (non-secret)
+metadata stored in-clear alongside the ciphertext, already fully readable by
+anything with the routine's existing `kv/get` grant (including, trivially,
+the node's own storage backend) — this spec does not extend host visibility
+into payload PLAINTEXT or the symmetric KEY (D-ER4/D-ER5, invariant 2
+unchanged), only into a field that was never secret to begin with.
+`EncryptionService` itself still never validates `aad`/`aadHash` against
+anything beyond the existing `facts.body_hash` equality check
 (`service.rs:695-700`, `HashMismatch("bodyHash")` on any tamper AFTER the
 mediator has minted) — this only guards signature integrity in transit, not
 the 3a gate itself, which is a mediator-side, pre-mint check; this is
@@ -804,15 +887,32 @@ abilities already produce.
 
 ## 8. Error / Denial Contract Summary
 
-| condition | guest-visible? | HTTP status if surfaced | source |
+Two DIFFERENT things can be "visible" here and must not be conflated
+(this table previously collapsed them into one "guest-visible?" column,
+which read as self-contradictory against §4.2/§5.1's step-by-step prose):
+**(a) the host-call return** — the JSON `dispatch` hands back into guest
+memory for THIS SPECIFIC `encryption_decrypt` call, always present, always
+read by the guest's own WASM code, and **(b) the external HTTP response** —
+what `compute/execute`'s HTTP caller sees once `run()` returns, driven
+entirely by `run_blocking`'s post-`run()` `self.fatal` check
+(`compute_exec.rs:1177-1179`), independent of any single call's return value.
+A FATAL condition's host-call return is guest-visible (the triggering call
+itself always gets an `{"ok":false,...}` envelope back — no call ever traps
+mid-execution); what's true instead is that the SPECIFIC ERROR REASON is
+never part of the EXTERNAL response — the outside caller only ever sees a
+uniform 500, never "aadHash mismatch" or "network revoked" (§8's uniform-500
+rationale below).
+
+| condition | host-call return (to guest, this call only) | external HTTP response (once `run()` returns) | source |
 |---|---|---|---|
-| no `D_fn` grant for `tinycloud.encryption/decrypt` on this network | yes — `{"ok":false,"error":{"code":"ability-denied",...}}`, op not performed, no trap | n/a (200 w/ envelope in `run` result) | A.4 pattern, §5.2 step 1 |
-| guest-declared `aadHash` does not match the mediator's recomputed hash of guest-supplied `aad` | no — FATAL, journaled | 500 | §5.2 step 3a (occurs BEFORE any invocation is minted or signed — earliest of all fatal triggers) |
-| chain `validate()` rejects the internal invocation | no — FATAL, journaled | 500 | §5.2 step 4 |
-| ANY `EncryptionServiceError` variant (network not-found/revoked/not-active, alg/key-version mismatch, hash mismatch, nonce replay, expired/not-yet-valid, audience/target-node/network mismatch, wrong invocation type, unauthorized, signature invalid, or infra `Db`/`Backend`/`Signing`) | no — FATAL, journaled | **500, uniformly.** This spec deliberately does NOT reuse `map_service_err`'s (`routes/encryption.rs:262-287`) finer per-variant classification (401/404/409/400/...). That function is `fn`-private and, more fundamentally, `HostState.fatal: Option<String>` (`compute_exec.rs:273`) is untyped exactly like the existing `kv_op`/`sql_op` fatal path (`compute_exec.rs:608, 733`) — preserving `EncryptionServiceError`'s distinct HTTP classes through the mediator would require making `HostState.fatal` carry a typed error/status, a real design change out of scope here. Uniform 500 is least-complex-secure: it doesn't weaken anything (500 is already what `kv_op`/`sql_op` return for every non-A.4 failure today) and leaks no MORE information through the compute path than the direct HTTP path's 401/404/409 classes already leak (if anything, less — conservative, not a regression). | §5.2 step 5 |
-| mediator's own post-unwrap check: rewrapped key does not decode to exactly 32 bytes (§6) | no — FATAL, journaled | 500 | §5.2 step 6 |
-| malformed guest request JSON | yes — `{"ok":false,"error":{"code":"bad-request",...}}` | n/a | matches existing `dispatch`'s malformed-request handling, `compute_exec.rs:422-433` |
-| ANY host call (any import) made after `self.fatal` is already set (§4.2) | yes — `{"ok":false,"error":{"code":"aborted"}}`, op not performed, NOT journaled | n/a (200 w/ envelope; the ORIGINAL triggering failure is what surfaces as 500 once `run()` returns) | §4.2 |
+| no `D_fn` grant for `tinycloud.encryption/decrypt` on this network | `{"ok":false,"error":{"code":"ability-denied",...}}`, op not performed, no trap | n/a — 200 w/ this envelope in `run`'s result; not a FATAL condition | A.4 pattern, §5.2 step 1 |
+| `request.aad` does not decode as valid (canonical) STANDARD base64 | `{"ok":false,"error":{"code":"internal"}}` (FATAL, journaled `granted: false`) | 500 (once `run()` returns) | §5.2 step 3a.1 (earliest of all fatal triggers) |
+| guest-declared `aad_hash` does not match the mediator's own `computed_aad_hash` (self-consistency only, §9 invariant 9) | `{"ok":false,"error":{"code":"internal"}}` (FATAL, journaled `granted: false`) | 500 | §5.2 step 3a.3 (occurs BEFORE any invocation is minted or signed) |
+| chain `validate()` rejects the internal invocation | `{"ok":false,"error":{"code":"internal"}}` (FATAL, journaled `granted: false`) | 500 | §5.2 step 4 |
+| ANY `EncryptionServiceError` variant (network not-found/revoked/not-active, alg/key-version mismatch, hash mismatch, nonce replay, expired/not-yet-valid, audience/target-node/network mismatch, wrong invocation type, unauthorized, signature invalid, or infra `Db`/`Backend`/`Signing`) | `{"ok":false,"error":{"code":"internal"}}` (FATAL, journaled `granted: false`) | **500, uniformly.** This spec deliberately does NOT reuse `map_service_err`'s (`routes/encryption.rs:262-287`) finer per-variant classification (401/404/409/400/...) for the EXTERNAL response. That function is `fn`-private and, more fundamentally, `HostState.fatal: Option<String>` (`compute_exec.rs:273`) is untyped exactly like the existing `kv_op`/`sql_op` fatal path (`compute_exec.rs:608, 733`) — preserving `EncryptionServiceError`'s distinct HTTP classes through the mediator would require making `HostState.fatal` carry a typed error/status, a real design change out of scope here. Uniform 500 is least-complex-secure: it doesn't weaken anything (500 is already what `kv_op`/`sql_op` return for every non-A.4 failure today) and leaks no MORE information through the compute path than the direct HTTP path's 401/404/409 classes already leak (if anything, less — conservative, not a regression). | §5.2 step 5 |
+| mediator's own post-unwrap check: rewrapped key does not decode to exactly 32 bytes (§6) | `{"ok":false,"error":{"code":"internal"}}` (FATAL, journaled `granted: false`) — no `symmetricKey` field is ever emitted | 500 | §5.2 step 6 |
+| malformed guest request JSON | `{"ok":false,"error":{"code":"bad-request",...}}` — NOT fatal, op not performed | n/a | matches existing `dispatch`'s malformed-request handling, `compute_exec.rs:422-433` |
+| ANY host call (any import) made after `self.fatal` is already set (§4.2) | `{"ok":false,"error":{"code":"aborted"}}`, op not performed, NOT journaled | n/a for THIS call — the ORIGINAL triggering failure (one of the FATAL rows above) is what actually drives the 500 once `run()` returns | §4.2 |
 
 ---
 
@@ -841,10 +941,46 @@ abilities already produce.
    the payload symmetric key is exactly what "decrypt this payload" means.
    What must NOT cross into guest memory is the routine's X25519 private
    scalar (invariant 3).
-5. **Replay/TTL is enforced twice, independently.** The mediator's fresh
-   random nonce + short expiry (D-ER3) is one layer; `EncryptionService`'s
-   own `consume_nonce`/`validate_invocation_time` (`service.rs:664, 706-711`)
-   is a second, independent layer the mediator does not and cannot bypass.
+5. **Nonce-replay, duplicate-invocation, and TTL are three DIFFERENT controls,
+   not one control enforced twice.** *Correction:* an earlier draft
+   conflated these into "replay/TTL enforced twice, independently," treating
+   the mediator's fresh random nonce (D-ER3) as itself an independent
+   enforcement layer. It is not — generating a fresh nonce is entropy, not
+   enforcement; a nonce only prevents replay once something rejects its
+   reuse.
+   - **Nonce-replay has exactly ONE gate on this path:**
+     `EncryptionService::consume_nonce` (`service.rs:706-711` inside
+     `decrypt_authorized`; persistent, DB-backed, keyed on `(invoker, nonce)`,
+     `service.rs:834-856`). The mediator's per-call `self.next_nonce()`
+     (D-ER3) only supplies the entropy `consume_nonce` checks; it is not a
+     second gate.
+   - **The HTTP-layer `InvocationReplayCache`
+     (`tinycloud-node-server/src/invocation_replay.rs`, in-memory,
+     content-hash-keyed) does NOT cover this path at all** — it is only
+     invoked from the `/invoke` Rocket route (`routes/mod.rs:1201`, inside a
+     request guard). The mediator's internal invocation is minted and
+     consumed entirely in-process (§5.2 steps 3b-5, `self.tinycloud.invoke`
+     called directly, no HTTP round trip), so it never reaches that guard.
+     This is not a gap: the HTTP cache exists to dedupe attacker-submitted
+     requests, a threat that does not apply to an invocation the mediator
+     itself mints and immediately consumes within the same execution.
+   - **TTL is checked twice, but against two DIFFERENT objects, not
+     redundantly:** the generic chain-walk (§5.2 step 4,
+     `tinycloud-core/src/models/invocation.rs`'s `validate`) enforces the
+     cited DELEGATION chain's own `expiry`/`not_before` window (unrelated to
+     this spec, pre-existing for every invocation type); `EncryptionService::
+     validate_invocation_time` (§5.2 step 5, `service.rs:664`,
+     `DEFAULT_INVOCATION_TTL_SECONDS = 300`) separately enforces the
+     INVOCATION's own short D-ER3 expiry (`now + 240`). Both must pass; they
+     are not two copies of the same check.
+   - **Test gate (§10):**
+     `encryption_decrypt_replayed_nonce_is_rejected_by_consume_nonce` proves
+     the actual mechanism — mint and successfully consume one internal
+     invocation, then replay the SAME `(invoker, nonce)` pair on a second
+     mediator call and assert it is rejected specifically via
+     `EncryptionServiceError::NonceReplay` (not a generic auth failure, not
+     an HTTP-layer duplicate-invocation rejection, since no such rejection
+     is reachable on this path).
 6. **Space isolation is preserved.** §4.1's core fix narrows, it does not
    remove, the space-scope defense-in-depth; the primary boundary
    (space-hashed `routine_did`) is untouched.
@@ -860,25 +996,35 @@ abilities already produce.
    (each `kv_op`/`sql_op`/`encryption_decrypt` call that reaches a core
    `invoke_with_options` commits independently and immediately; there is no
    cross-call transaction to roll back), unchanged by this spec.
-9. **`aadHash` is bound into the routine's signed intent, and IS
-   independently verified — by the mediator, not by `EncryptionService`.**
-   (§6, §5.2 step 3a) The mediator recomputes `aadHash` from the RAW `aad`
-   bytes it receives in the same call and rejects, fatally, before minting
-   any invocation, if the guest's declared `aadHash` disagrees — this closes
-   a round-2 gap where an undetectable guest-declared hash could diverge from
-   the guest's own later AES-GCM call. `EncryptionService` itself still never
-   independently checks `aad`/`aadHash` against anything (it has no way to —
-   it never sees raw `aad`; it only re-verifies `facts.body_hash` equality
-   against whatever `body_value` the mediator submitted, `service.rs:695-700`)
-   — this is intentional (D-ER4 boundary unchanged). A compromised or buggy
-   routine could still supply a locally-used AAD that diverges from BOTH the
-   real `InlineEnvelope.aad` on disk AND its own signed `aadHash`, if it lies
-   consistently across both fields it controls — that only self-sabotages the
-   routine's own later AES-GCM decrypt (a wrong AAD fails AEAD
-   authentication) or produces a signed intent that doesn't match the actual
-   stored envelope; it never grants access to a key or payload the routine
-   wasn't already authorized for via D-ER1's grant, and never crosses an
-   authority boundary.
+9. **The `aad` value DECLARED TO THE HOST is bound into the routine's signed
+   intent by the mediator's OWN computation — this is scoped self-consistency
+   plus provenance, NOT independent verification of what the guest's later
+   AEAD call actually uses.** *Correction: an earlier draft claimed the
+   mediator "independently verifies" `aadHash`, implying it establishes that
+   the guest's own subsequent AES-GCM call uses the same AAD. It cannot — the
+   mediator only ever sees bytes the guest chooses to hand it in THIS
+   `encryption_decrypt` request; it has no way to observe the guest's
+   separate, later in-WASM `Aead::decrypt`/`encrypt` call.* What actually
+   happens (§6, §5.2 step 3a): the mediator DECODES `request.aad` from base64
+   (FATAL if invalid/non-canonical — a real, new validation), computes
+   `computed_aad_hash` itself from those decoded bytes, and is the SOLE
+   source of the `aadHash` value that ends up in the signed
+   `facts.body_hash` — the guest-declared `aad_hash` field, if present, is
+   compared only for early self-consistency (catches a guest client-code bug
+   before minting) and never itself flows into what gets signed.
+   `EncryptionService` itself still never independently checks `aad`/`aadHash`
+   against anything (it has no way to — it never sees raw `aad`; it only
+   re-verifies `facts.body_hash` equality against whatever `body_value` the
+   mediator submitted, `service.rs:695-700`) — this is intentional (D-ER4
+   boundary unchanged). A compromised or buggy routine can still supply a
+   locally-used AAD in its own in-WASM AEAD call that diverges from BOTH the
+   real `InlineEnvelope.aad` on disk AND the `aad` it declared to the host in
+   this call — nothing in this spec can prevent that. That only
+   self-sabotages the routine's own later AES-GCM decrypt (a wrong AAD fails
+   AEAD authentication) or produces a signed intent that doesn't match the
+   actual stored envelope; it never grants access to a key or payload the
+   routine wasn't already authorized for via D-ER1's grant, and never crosses
+   an authority boundary.
 10. **`reencryptNonce` reuse is a guest-code correctness bug, not a boundary
     this spec's mediator polices.** (§6) The host issues a fresh nonce per
     `encryption_decrypt` call; a guest that reuses one nonce across multiple
@@ -902,13 +1048,28 @@ abilities already produce.
   for that seed — proves the two implementations use the identical
   conversion, not just "similar."
 - `compute_select_d_fns_admits_encryption_row_alongside_in_space_kv_row` (`tinycloud-core/src/db.rs`)
-  — a `D_fn` with one `Resource::Other` encryption-network row (URN-prefix
-  match) and one in-space `Resource::TinyCloud` row IS selected (regression
-  test for the §4.1 bug).
+  — a `D_fn` with one `Resource::Other` encryption-network row (a
+  well-formed `NetworkId`) and one in-space `Resource::TinyCloud` row IS
+  selected (regression test for the §4.1 bug).
 - `compute_select_d_fns_rejects_other_resource_outside_prefix` — a
-  `Resource::Other` row whose URI does NOT match `ENCRYPTION_NETWORK_PREFIX`
-  makes the `D_fn` UNSELECTED (proves the carve-out is prefix-scoped, not a
-  blanket bypass).
+  `Resource::Other` row whose URI does NOT start with
+  `ENCRYPTION_NETWORK_PREFIX` at all makes the `D_fn` UNSELECTED (proves the
+  carve-out is not a blanket `Resource::Other` bypass).
+- `compute_select_d_fns_rejects_malformed_network_id_inside_prefix` — a
+  `Resource::Other` row whose URI starts with `ENCRYPTION_NETWORK_PREFIX` but
+  does NOT parse as a valid `NetworkId` makes the `D_fn` UNSELECTED. Table
+  cases, each its own assertion: (a) missing owner DID
+  (`urn:tinycloud:encryption::name`, `NetworkIdError::EmptyOwnerDid`), (b)
+  missing name (`urn:tinycloud:encryption:did:key:z6Mk...:`,
+  `NetworkIdError::EmptyName`), (c) no `:` anywhere after the prefix, so
+  `rsplit_once(':')` itself fails (`urn:tinycloud:encryption:nocolonhere`,
+  `NetworkIdError::MissingSeparator` — NOT a DID-shaped value, since
+  `did:key:...`-style owners always contain a colon and would instead split
+  into an owner/name pair, however malformed), (d) forbidden separator inside
+  the name
+  (`urn:tinycloud:encryption:did:key:z6Mk...:na/me`,
+  `NetworkIdError::InvalidName`) — proves the selector fails closed exactly
+  like `Resource::extends`'s `Other, Other` arm, not merely prefix-matching.
 - `compute_select_d_fns_still_rejects_out_of_space_tinycloud_row` — an
   out-of-space `Resource::TinyCloud` row is still REJECTED unchanged
   (regression guard on the untouched arm).
@@ -927,6 +1088,25 @@ so the test asserts on the mediator's output directly):*
   network, `D_fn` grants the network row, seed an `InlineEnvelope`; asserts
   `symmetricKey` decodes to exactly 32 bytes and `reencryptNonce` decodes to
   exactly 12 bytes; manifest row has `granted: true`.
+- `encryption_decrypt_rejects_non_32_byte_unwrapped_key` — the NEGATIVE
+  counterpart to the test above, closing the §5.2 step 6 gap the happy-path
+  test alone cannot prove (a network-wide grant only proves the happy shape
+  succeeds, not that a malformed shape is actually rejected before reaching
+  guest memory). Seed an `InlineEnvelope` whose `encryptedSymmetricKey` wraps
+  a deliberately WRONG-LENGTH plaintext (e.g. 16 bytes) to the routine's
+  derived X25519 public key using the SAME `wrap_to_public_key` primitive
+  (`backend.rs:64-77`) real clients use — this is a valid, correctly-wrapped
+  envelope; only the plaintext length inside it is wrong. `D_fn` grants the
+  matching network row (a real grant, not an A.4 case). Assert: the
+  compute-execute HTTP response is fatal 500 (§8); the manifest row for this
+  call is journaled with `granted: false`; the host-call return to the guest
+  is `{"ok":false,"error":{"code":"internal"}}` with NO `symmetricKey` field
+  present anywhere in that JSON; and no subsequent host call in the same
+  `run()` performs any mutation (proven the same way
+  `host_call_after_fatal_is_aborted_and_not_journaled` below proves it, by
+  chaining a second `storage_put` call after this one and asserting it comes
+  back `{"ok":false,"error":{"code":"aborted"}}`, not journaled, storage
+  unchanged).
 - `encryption_decrypt_denied_without_grant` — network row omitted from
   `D_fn`; asserts the A.4 `ability-denied` envelope, op not performed, no
   trap, `granted: false` journaled.
@@ -957,22 +1137,27 @@ so the test asserts on the mediator's output directly):*
   SAME 403 + `"routine-grant-expired"` body — proving the encryption row's
   presence doesn't change this pre-existing, route-level classification. No
   WAT guest fixture is exercised.
+- `encryption_decrypt_invalid_base64_aad_is_rejected_before_hashing` (§5.2
+  step 3a.1) — construct the guest request with `aad` set to a value that is
+  NOT valid STANDARD base64 (table cases: illegal alphabet character,
+  incorrect padding, trailing non-zero bits the engine rejects as
+  non-canonical); assert the mediator rejects with `self.fatal = Some("aad
+  is not valid base64")` BEFORE `aad_hash` is even inspected and BEFORE any
+  internal invocation is minted, the compute-execute HTTP response is 500,
+  the manifest row has `granted: false`, and no `storage_put` occurs — proves
+  the base64-decode gate exists and runs first.
 - `encryption_decrypt_mismatched_aad_hash_is_rejected_before_mint` —
-  construct the guest request with `aad` (raw bytes, §5.1) and a
-  DELIBERATELY WRONG `aadHash` that does not equal
-  `canonical_hash(base64(aad))`; assert the mediator rejects at §5.2 step 3a
-  BEFORE any internal invocation is minted or signed (no
-  `mint_internal_for_node` call, no `invoke()` call), the compute-execute
-  HTTP response is 500 (fatal, §8), the manifest row for this call has
-  `granted: false`, and no `storage_put` occurs. *Correction:* an earlier
-  draft named this test `..._fails_signature_and_leaves_storage_unchanged`
-  and asserted only a LATER guest-side AEAD failure (invariant 9's weaker
-  self-sabotage fallback), because the prior request shape gave the mediator
-  no raw `aad` to check the guest's `aadHash` against. §5.2 step 3a now
-  makes this a real mediator-side rejection, not merely a guest-side
-  AEAD-authentication failure.
+  construct the guest request with valid-base64 `aad` and a DELIBERATELY
+  WRONG `aad_hash` that does not equal `canonical_hash(base64(aad))`; assert
+  the mediator rejects at §5.2 step 3a.3 BEFORE any internal invocation is
+  minted or signed (no `mint_internal_for_node` call, no `invoke()` call),
+  the compute-execute HTTP response is 500 (fatal, §8), the manifest row for
+  this call has `granted: false`, and no `storage_put` occurs. Scope note
+  (§9 invariant 9): this test proves the mediator catches a
+  self-inconsistent request early, NOT that it "independently verifies" the
+  guest's real AAD — an earlier draft's framing overstated this.
 - `encryption_decrypt_consistent_aad_hash_binds_into_signed_body_hash` — the
-  guest sends `aad`/`aadHash` that DO match; assert the call succeeds
+  guest sends `aad`/`aad_hash` that DO match; assert the call succeeds
   end-to-end AND that the value inside the internal invocation's
   `facts.body_hash` preimage is the mediator's OWN recomputed
   `computed_aad_hash` (constructed test-side by re-running `canonical_hash`
@@ -984,6 +1169,16 @@ so the test asserts on the mediator's output directly):*
   succeed and both unwrap correctly (proxy for "same `StaticSecret` reused,"
   since the raw scalar is never observable directly — D-ER2's repeated-call
   test).
+- `encryption_decrypt_replayed_nonce_is_rejected_by_consume_nonce`
+  (invariant 5) — drive the mediator to mint and successfully consume one
+  internal invocation's `(invoker, nonce)` pair, then force a second
+  mediator-side call to reuse that SAME nonce (test-only hook or a
+  deterministic seam on `next_nonce()`); assert the second call fails with
+  `EncryptionServiceError::NonceReplay` specifically (via
+  `EncryptionService::consume_nonce`, `service.rs:834-856`), is journaled
+  `granted: false`, and returns the standard FATAL envelope — proving
+  nonce-replay is enforced by `consume_nonce`, not by nonce freshness or the
+  HTTP `InvocationReplayCache` (which this path never reaches).
 - `host_call_after_fatal_is_aborted_and_not_journaled` (D-ER7/§4.2) — a
   fixture with a `D_fn` grant that NAMES a real (matching) encryption-network
   resource whose network is seeded in `Revoked` state — the SAME
