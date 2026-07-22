@@ -437,6 +437,154 @@ impl Session {
             resources,
         })
     }
+
+    /// Create a multi-resource delegation UCAN where every (service, path,
+    /// ability) row carries the SAME caveat map.
+    ///
+    /// **Minimal, additive binding (added on
+    /// `skgbafa/compute-p2-a-wasm-caveat`, off `skgbafa/compute-p2-a`) for the
+    /// compute service's deploy-time `D_fn` grant.** `compute-service.md`
+    /// §5.1/§6.2 (decision D2) requires every capability row of `D_fn` to
+    /// carry a self-describing `computeFunctionBinding` caveat naming the
+    /// deployed function's content CID — see the node-side test helper
+    /// `tinycloud-node-server/tests/compute_common/mod.rs::mint_d_fn`, which
+    /// this method mirrors exactly (one caveat map, applied to every granted
+    /// ability row, `proof` chained through the calling session exactly like
+    /// [`Session::create_delegation`]).
+    ///
+    /// [`Session::create_delegation`] intentionally hard-codes empty caveats
+    /// (`Capabilities<[(); 0]>`) — every existing caller relies on that empty
+    /// shape. Rather than widen that signature (which would touch every
+    /// existing call site and test), this is a **new, separate method** for
+    /// the one case that needs a non-empty caveat. It does not modify
+    /// `create_delegation` or any of its existing behavior.
+    ///
+    /// # Arguments
+    /// * `delegate_did` - The recipient DID (audience of the UCAN) — for the
+    ///   compute use case, the routine DID derived by the node's `RoutineDid`
+    ///   handshake (§6.2).
+    /// * `space_id` - The TinyCloud user space the delegation targets.
+    /// * `abilities` - Service → path → actions map, same shape as
+    ///   `create_delegation`.
+    /// * `expiration_secs` / `not_before_secs` - Same as `create_delegation`.
+    /// * `caveat` - A single JSON object (e.g.
+    ///   `{"computeFunctionBinding": {"functionCid": "<cid>"}}`) attached
+    ///   identically to every granted (service, path, ability) row.
+    pub fn create_delegation_with_caveat(
+        &self,
+        delegate_did: &str,
+        space_id: &SpaceId,
+        abilities: HashMap<Service, HashMap<Path, Vec<Ability>>>,
+        expiration_secs: f64,
+        not_before_secs: Option<f64>,
+        caveat: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<DelegationResult, DelegationError> {
+        use std::str::FromStr;
+
+        if abilities.is_empty() {
+            return Err(DelegationError::EmptyAbilities);
+        }
+
+        // Same walk as `create_delegation`, but the caveat type parameter is
+        // `serde_json::Value` (not `[(); 0]`) and every ability's nota-bene
+        // list carries one clone of `caveat`.
+        let mut caps =
+            tinycloud_auth::ucan_capabilities_object::Capabilities::<serde_json::Value>::new();
+        let mut resources: Vec<DelegatedResource> = Vec::new();
+
+        let mut services: Vec<(Service, HashMap<Path, Vec<Ability>>)> =
+            abilities.into_iter().collect();
+        services.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+
+        for (service, paths_map) in services {
+            if paths_map.is_empty() {
+                return Err(DelegationError::EmptyPathsForService(service.to_string()));
+            }
+
+            let mut paths: Vec<(Path, Vec<Ability>)> = paths_map.into_iter().collect();
+            paths.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+
+            for (path, path_actions) in paths {
+                if path_actions.is_empty() {
+                    return Err(DelegationError::EmptyActionsForPath {
+                        service: service.to_string(),
+                        path: path.to_string(),
+                    });
+                }
+
+                let path_opt = if path.as_str().is_empty() {
+                    None
+                } else {
+                    Some(path.clone())
+                };
+
+                let is_raw_encryption_resource = service.as_str() == "encryption"
+                    && path.as_str().starts_with("urn:tinycloud:encryption:");
+                let resource_uri: UriString = if is_raw_encryption_resource {
+                    path.as_str()
+                        .parse()
+                        .map_err(|err| DelegationError::InvalidRawResource(format!("{err}")))?
+                } else {
+                    space_id
+                        .clone()
+                        .to_resource(service.clone(), path_opt, None, None)
+                        .as_uri()
+                };
+
+                let action_strings: Vec<String> =
+                    path_actions.iter().map(|a| a.to_string()).collect();
+
+                caps.with_actions(
+                    resource_uri,
+                    path_actions.into_iter().map(|a| (a, [caveat.clone()])),
+                );
+
+                resources.push(DelegatedResource {
+                    service: service.to_string(),
+                    space: if is_raw_encryption_resource {
+                        "encryption".to_string()
+                    } else {
+                        space_id.to_string()
+                    },
+                    path: path.to_string(),
+                    actions: action_strings,
+                });
+            }
+        }
+
+        let payload: Payload<serde_json::Value, serde_json::Value> = Payload {
+            issuer: DIDURLBuf::from_str(&self.verification_method)
+                .map_err(DelegationError::InvalidIssuer)?,
+            audience: DIDBuf::from_str(delegate_did).map_err(DelegationError::InvalidAudience)?,
+            not_before: not_before_secs
+                .map(NumericDate::try_from_seconds)
+                .transpose()
+                .map_err(DelegationError::InvalidNotBefore)?,
+            expiration: NumericDate::try_from_seconds(expiration_secs)
+                .map_err(DelegationError::InvalidExpiration)?,
+            nonce: Some(format!("urn:uuid:{}", uuid::Uuid::new_v4())),
+            facts: None,
+            proof: vec![self.delegation_cid],
+            attenuation: caps,
+        };
+
+        let ucan = payload
+            .sign(self.jwk.get_algorithm().unwrap_or_default(), &self.jwk)
+            .map_err(DelegationError::SigningError)?;
+
+        let delegation_str = ucan.encode().map_err(DelegationError::EncodingError)?;
+
+        let hash = Code::Blake3_256.digest(delegation_str.as_bytes());
+        let cid = Cid::new_v1(0x55, hash);
+
+        Ok(DelegationResult {
+            delegation: delegation_str,
+            cid: cid.to_string(),
+            delegate_did: delegate_did.to_string(),
+            expiry: expiration_secs,
+            resources,
+        })
+    }
 }
 
 /// A single (service, space, path, actions) entry inside a delegation result.

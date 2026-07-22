@@ -300,6 +300,84 @@ impl Default for DuckDbStorageConfig {
     }
 }
 
+// P2 (compute-service.md §11.4, §10.1): numeric ceilings for the wasmtime
+// backend's caveat enforcement. `default_*` are the fallback applied when a
+// `D_fn`/invocation carries no explicit `ComputeCaveats` value;
+// `*_ceiling_*` are hard, config-capped maximums a caveat can never exceed
+// (§10.1 "numeric caveats are validated against sane ceilings on ingest").
+// Present unconditionally (not `#[cfg(feature = "compute")]`) so a
+// `[storage.compute]` TOML block always parses, mirroring the existing
+// `sql`/`duckdb` sections that are not feature-gated either.
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct ComputeStorageConfig {
+    #[serde(default = "default_compute_max_duration_ms")]
+    pub default_max_duration_ms: u64,
+    #[serde(default = "default_compute_max_duration_ceiling_ms")]
+    pub max_duration_ceiling_ms: u64,
+    #[serde(default = "default_compute_max_memory")]
+    pub default_max_memory: ByteUnit,
+    #[serde(default = "default_compute_max_memory_ceiling")]
+    pub max_memory_ceiling: ByteUnit,
+    /// §10.1 CPU→fuel: the wasmtime fuel budget granted to each execution.
+    /// `ComputeCaveats` has no CPU field, so this is a node-level ceiling
+    /// (belt-and-braces with `maxDuration`→epoch). Large default; lower it
+    /// in tests to exercise the fuel-exhaustion trap.
+    #[serde(default = "default_compute_max_fuel")]
+    pub max_fuel: u64,
+    /// §9.1.1: also persist the execution manifest to a KV audit path under
+    /// the routine's own `D_fn` grant. The in-outcome manifest is always
+    /// returned regardless of this setting.
+    #[serde(default)]
+    pub persist_manifest: bool,
+    /// Memory-safety ceiling (Codex P2 finding): the maximum byte length the
+    /// executor will trust for ANY guest-controlled length crossing the ABI
+    /// boundary -- a host-import request and the `run()` result length. A
+    /// hard NODE invariant, not caveat-tunable: a guest that claims a length
+    /// beyond it is rejected BEFORE the host allocates a buffer sized by
+    /// that untrusted value, so a bogus negative/huge length can never
+    /// trigger an out-of-control host allocation.
+    #[serde(default = "default_compute_max_abi_message_bytes")]
+    pub max_abi_message_bytes: u64,
+}
+
+fn default_compute_max_duration_ms() -> u64 {
+    5_000
+}
+
+fn default_compute_max_duration_ceiling_ms() -> u64 {
+    60_000
+}
+
+fn default_compute_max_memory() -> ByteUnit {
+    ByteUnit::Mebibyte(128)
+}
+
+fn default_compute_max_memory_ceiling() -> ByteUnit {
+    ByteUnit::Mebibyte(512)
+}
+
+fn default_compute_max_fuel() -> u64 {
+    1_000_000_000
+}
+
+fn default_compute_max_abi_message_bytes() -> u64 {
+    8 * 1024 * 1024 // 8 MiB
+}
+
+impl Default for ComputeStorageConfig {
+    fn default() -> Self {
+        Self {
+            default_max_duration_ms: default_compute_max_duration_ms(),
+            max_duration_ceiling_ms: default_compute_max_duration_ceiling_ms(),
+            default_max_memory: default_compute_max_memory(),
+            max_memory_ceiling: default_compute_max_memory_ceiling(),
+            max_fuel: default_compute_max_fuel(),
+            persist_manifest: false,
+            max_abi_message_bytes: default_compute_max_abi_message_bytes(),
+        }
+    }
+}
+
 #[serde_as]
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Storage {
@@ -320,6 +398,8 @@ pub struct Storage {
     pub sql: SqlStorageConfig,
     #[serde(default)]
     pub duckdb: DuckDbStorageConfig,
+    #[serde(default)]
+    pub compute: ComputeStorageConfig,
 }
 
 fn default_datadir() -> PathBuf {
@@ -375,6 +455,7 @@ impl Default for Storage {
             limit: None,
             sql: SqlStorageConfig::default(),
             duckdb: DuckDbStorageConfig::default(),
+            compute: ComputeStorageConfig::default(),
         }
     }
 }

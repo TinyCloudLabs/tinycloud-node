@@ -14,6 +14,12 @@ use super::{
     types::*,
 };
 
+// Clone: P2 compute (compute-service.md §8.2) runs the internal-invocation
+// executor inside `tokio::task::spawn_blocking`, which needs an owned
+// (`'static`) handle -- all fields are already cheaply cloneable (`Arc`,
+// `String`, `u64`), so this is a shallow, shared-state clone, exactly like
+// `SpaceDatabase`'s existing `#[derive(Clone)]` (`tinycloud-core/src/db.rs`).
+#[derive(Clone)]
 pub struct SqlService {
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
     base_path: String,

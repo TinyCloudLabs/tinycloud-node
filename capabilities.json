@@ -107,6 +107,28 @@
       "notes": "Per-service wildcard. Matched node-side as admin-equivalent (routes/mod.rs:2140, duckdb/parser.rs:29) and as write+admin in validate_sql; recognized by preferred_database_ability (routes/mod.rs:2118). Live in the SDK root delegation grant (TinyCloudNode.ts ~2279). Implies every concrete active duckdb action."
     },
     {
+      "urn": "tinycloud.compute/execute",
+      "service": "tinycloud.compute",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.compute/deploy",
+      "service": "tinycloud.compute",
+      "status": "active"
+    },
+    {
+      "urn": "tinycloud.compute/list",
+      "service": "tinycloud.compute",
+      "status": "reserved"
+    },
+    {
+      "urn": "tinycloud.compute/*",
+      "service": "tinycloud.compute",
+      "status": "active",
+      "implies": ["tinycloud.compute/deploy", "tinycloud.compute/execute"],
+      "notes": "Per-service wildcard. P2 flipped execute+deploy to active (the handlers ship); `list` stays reserved (no server-side listing handler, §12.1/C9), so the wildcard implies ONLY the two active concretes (gen-capabilities.mjs requires a wildcard to imply exactly the *active* concrete actions of its service). F9 (SDK): the standard session grant MUST enumerate compute/execute (+ compute/list once it ships) and NEVER compute/* -- the wildcard confers deploy, which standard sessions must not hold."
+    },
+    {
       "urn": "tinycloud.capabilities/read",
       "service": "tinycloud.capabilities",
       "status": "active"

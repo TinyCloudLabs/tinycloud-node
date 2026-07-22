@@ -13,6 +13,10 @@ pub mod allow_list;
 pub mod auth_guards;
 pub mod authorization;
 pub mod cli;
+#[cfg(feature = "compute")]
+pub mod compute;
+#[cfg(feature = "compute")]
+pub mod compute_exec;
 pub mod config;
 #[cfg(feature = "dstack")]
 pub mod dstack;
@@ -79,6 +83,8 @@ use storage::{
     s3::{S3BlockConfig, S3BlockStore},
 };
 use tee::TeeContext;
+#[cfg(feature = "compute")]
+use tinycloud_core::compute::ComputeService;
 #[cfg(feature = "duckdb")]
 use tinycloud_core::duckdb::DuckDbService;
 use tinycloud_core::{
@@ -332,6 +338,9 @@ pub async fn app(
         database_artifact_repository.clone(),
     );
 
+    #[cfg(feature = "compute")]
+    let compute_artifact_repository = database_artifact_repository.clone();
+
     #[cfg(feature = "duckdb")]
     let duckdb_service = DuckDbService::new(
         tinycloud_config
@@ -348,6 +357,16 @@ pub async fn app(
             .max_memory_per_connection
             .clone(),
         database_artifact_repository,
+    );
+
+    // P1 (compute-service.md §11.1): construct the compute service with an
+    // injected `RoutineKeyDeriver` -- dstack (TEE-internal derivation) when
+    // the socket is reachable, classic (node static secret) otherwise. The
+    // backend registry (wasmtime + optional cloudflare) is a P2 addition.
+    #[cfg(feature = "compute")]
+    let compute_service = ComputeService::new(
+        crate::compute::build_routine_key_deriver(&key_setup),
+        compute_artifact_repository,
     );
 
     let quota_cache = QuotaCache::new(
@@ -376,6 +395,8 @@ pub async fn app(
     let rocket = rocket.manage(bench_state);
     #[cfg(feature = "duckdb")]
     let rocket = rocket.manage(duckdb_service);
+    #[cfg(feature = "compute")]
+    let rocket = rocket.manage(compute_service);
     let rocket = rocket
         .manage(quota_cache)
         .manage(invocation_replay_cache)

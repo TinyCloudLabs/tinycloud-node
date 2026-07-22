@@ -198,6 +198,75 @@ pub fn createDelegation(
     Ok(serde_wasm_bindgen::to_value(&result)?)
 }
 
+/// Create a multi-resource delegation UCAN where every (service, path,
+/// ability) row carries the SAME caveat object.
+///
+/// **Minimal, additive binding (added on `skgbafa/compute-p2-a-wasm-caveat`)
+/// for the compute service's deploy-time `D_fn` grant** — see
+/// `session::Session::create_delegation_with_caveat` for the full rationale.
+/// `createDelegation` above intentionally has no caveat parameter; this is a
+/// separate function so `createDelegation`'s existing behavior and callers
+/// are untouched.
+///
+/// # Arguments
+/// * `session` - The current session (with JWK and delegation info).
+/// * `delegateDID` - The recipient DID (audience of the UCAN) — e.g. a
+///   compute routine DID from the node's `RoutineDid` handshake.
+/// * `spaceId` - The TinyCloud user space the delegation targets.
+/// * `abilities` - Same shape as `createDelegation`'s `abilities` argument.
+/// * `expirationSecs` / `notBeforeSecs` - Same as `createDelegation`.
+/// * `caveat` - A JS object (e.g.
+///   `{ computeFunctionBinding: { functionCid: "<cid>" } }`) attached
+///   identically to every granted (service, path, ability) row.
+///
+/// # Returns
+/// A [`session::DelegationResult`], same shape as `createDelegation`'s return.
+#[wasm_bindgen]
+#[allow(non_snake_case)]
+pub fn createDelegationWithCaveat(
+    session: JsValue,
+    delegateDID: String,
+    spaceId: String,
+    abilities: JsValue,
+    expirationSecs: f64,
+    notBeforeSecs: JsValue,
+    caveat: JsValue,
+) -> Result<JsValue, JsValue> {
+    let session: session::Session = serde_wasm_bindgen::from_value(session)?;
+
+    let space_id: tinycloud_auth::resource::SpaceId = spaceId.parse().map_err(map_jserr)?;
+
+    let abilities_map: std::collections::HashMap<
+        tinycloud_auth::resource::Service,
+        std::collections::HashMap<
+            tinycloud_auth::resource::Path,
+            Vec<tinycloud_auth::siwe_recap::Ability>,
+        >,
+    > = serde_wasm_bindgen::from_value(abilities)?;
+
+    let not_before: Option<f64> = if notBeforeSecs.is_undefined() || notBeforeSecs.is_null() {
+        None
+    } else {
+        Some(serde_wasm_bindgen::from_value(notBeforeSecs)?)
+    };
+
+    let caveat_map: std::collections::BTreeMap<String, serde_json::Value> =
+        serde_wasm_bindgen::from_value(caveat)?;
+
+    let result = session
+        .create_delegation_with_caveat(
+            &delegateDID,
+            &space_id,
+            abilities_map,
+            expirationSecs,
+            not_before,
+            caveat_map,
+        )
+        .map_err(map_jserr)?;
+
+    Ok(serde_wasm_bindgen::to_value(&result)?)
+}
+
 /// Parse a signed SIWE message and extract its recap capabilities.
 ///
 /// This is the inverse of what `prepareSession` + `completeSessionSetup`
