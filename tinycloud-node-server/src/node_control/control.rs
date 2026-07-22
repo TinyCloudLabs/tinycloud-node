@@ -1855,6 +1855,36 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(unix)]
+    fn install_service_manager_fixture(setup: &mut ProfileSetup) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin_dir = setup._temp.path().join("service-manager-bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+
+        #[cfg(target_os = "macos")]
+        let (program, script) = (
+            "launchctl",
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n  print) printf 'pid = {}\\n' ;;\n  print-disabled) printf '\"xyz.tinycloud.node\" => false\\n' ;;\n  *) exit 64 ;;\nesac\n",
+                std::process::id()
+            ),
+        );
+        #[cfg(target_os = "linux")]
+        let (program, script) = (
+            "systemctl",
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *is-enabled*) printf 'enabled\\n' ;;\n  *show*) printf 'MainPID={}\\n' ;;\n  *) exit 64 ;;\nesac\n",
+                std::process::id()
+            ),
+        );
+
+        let manager = bin_dir.join(program);
+        fs::write(&manager, script).unwrap();
+        fs::set_permissions(&manager, fs::Permissions::from_mode(0o755)).unwrap();
+        setup._guards.push(EnvGuard::set("PATH", &bin_dir));
+    }
+
     fn assert_keys_exact(value: &Value, expected: &[&str]) {
         let actual = value
             .as_object()
@@ -2326,8 +2356,9 @@ mod tests {
     async fn control_config_patch_whitelist_and_cli_paths_work_live() {
         let _lock = env_lock();
         let temp = tempdir().unwrap();
-        let setup = setup_profile(temp);
+        let mut setup = setup_profile(temp);
         write_service_manifest(&setup.paths, setup.profile);
+        install_service_manager_fixture(&mut setup);
 
         #[cfg(target_os = "macos")]
         let _cors = EnvGuard::set("TINYCLOUD_CORS", "true");
@@ -2482,6 +2513,8 @@ mod tests {
             .unwrap();
         assert_eq!(service_status.contract_version, CONTROL_CONTRACT_VERSION);
         assert_eq!(service_status.state, ServiceState::Running);
+        assert_eq!(service_status.pid, Some(std::process::id()));
+        assert!(service_status.enabled_at_login);
         assert!(service_status.identity_ready);
         assert!(service_status.node_did.is_some());
         assert_eq!(service_status.control_api, None);

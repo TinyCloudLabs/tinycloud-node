@@ -1,19 +1,50 @@
-//! The node lane runs the immutable cross-language contract program rather
-//! using the small checked-in contract fixture rather than a sibling worktree.
+//! The node lane runs the immutable cross-language contract program from the
+//! checked-in fixture rather than depending on a sibling worktree.
 
 use serde_json::Value;
 use std::path::PathBuf;
 
 #[test]
 fn pinned_email_claim_manifest_runs_all_negative_rows() {
-    let vector_root = std::env::var_os("TINYCLOUD_EMAIL_CLAIM_VECTOR_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/email-claim-v1")
-        });
-    let manifest = std::fs::read_to_string(vector_root.join("manifest.json"))
-        .expect("pinned email-claim manifest must be present");
-    assert!(manifest.contains("pl8-1Rpx_DYCBjOpK3hRrLfrSVDINNFssZDfFw6BMTs"));
+    let vector_root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/email-claim-v1");
+    let manifest: Value = serde_json::from_slice(
+        &std::fs::read(vector_root.join("manifest.json"))
+            .expect("pinned email-claim manifest must be present"),
+    )
+    .expect("pinned email-claim manifest must be JSON");
+    assert_eq!(manifest["manifestVersion"], 1);
+    assert_eq!(
+        manifest["contractVersion"],
+        "tinycloud.share-email-claim/v1"
+    );
+    assert_eq!(
+        manifest["manifestDigest"],
+        "pl8-1Rpx_DYCBjOpK3hRrLfrSVDINNFssZDfFw6BMTs"
+    );
+
+    let negative: Value = serde_json::from_slice(
+        &std::fs::read(vector_root.join("negative.json"))
+            .expect("frozen negative rows must be present"),
+    )
+    .expect("frozen negative rows must be JSON");
+    let negative_rows = negative["cases"]
+        .as_array()
+        .expect("frozen negative cases")
+        .len();
+    assert_eq!(negative_rows, 118);
+
+    let provenance: Value = serde_json::from_slice(
+        &std::fs::read(vector_root.join("PROVENANCE.json"))
+            .expect("frozen fixture provenance must be present"),
+    )
+    .expect("frozen fixture provenance must be JSON");
+    assert_eq!(
+        provenance["sourceCommit"],
+        "3fa222a4e797af6a8192957e59ac41e2a7d805fd"
+    );
+    assert_eq!(provenance["manifestDigest"], manifest["manifestDigest"]);
+
     let output = std::process::Command::new("node")
         .arg(vector_root.join("validate.mjs"))
         .current_dir(&vector_root)
@@ -26,8 +57,11 @@ fn pinned_email_claim_manifest_runs_all_negative_rows() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("118 negative rows dispatched"));
-    assert!(stdout.contains("manifestDigest: pl8-1Rpx_DYCBjOpK3hRrLfrSVDINNFssZDfFw6BMTs"));
+    assert!(stdout.contains(&format!("{negative_rows} negative rows dispatched")));
+    assert!(stdout.contains(&format!(
+        "manifestDigest: {}",
+        manifest["manifestDigest"].as_str().unwrap()
+    )));
 
     let states: Value = serde_json::from_slice(
         &std::fs::read(vector_root.join("states.json")).expect("frozen lifecycle states present"),
