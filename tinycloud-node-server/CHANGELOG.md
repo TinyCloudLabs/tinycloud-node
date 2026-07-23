@@ -7,6 +7,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.0](https://github.com/TinyCloudLabs/tinycloud-node/compare/v0.0.1...v1.8.0) - 2026-07-20
+
+### Added
+
+- *(kv)* add bounded conditional CRUD primitives ([#128](https://github.com/TinyCloudLabs/tinycloud-node/pull/128))
+- *(sql)* enforce bounded single-statement queries ([#127](https://github.com/TinyCloudLabs/tinycloud-node/pull/127))
+- *(node)* local node CLI, control plane, keychain keys, and Homebrew packaging
+- add account delegation history query (TC-178)
+- *(policy-capability)* wire capability registry into live invoke/delegate paths (TC-119) ([#102](https://github.com/TinyCloudLabs/tinycloud-node/pull/102))
+- meter SQL/DuckDB artifact bytes in store_size + enforce storage quota on write-class database requests ([#89](https://github.com/TinyCloudLabs/tinycloud-node/pull/89))
+- add telemetry spans ([#76](https://github.com/TinyCloudLabs/tinycloud-node/pull/76))
+- *(node)* support KV batch put invocations
+- make DuckDB support opt-in ([#68](https://github.com/TinyCloudLabs/tinycloud-node/pull/68))
+- add encryption network module
+- TC-1368 Add signed KV URLs  ([#60](https://github.com/TinyCloudLabs/tinycloud-node/pull/60))
+- add write hooks server support through phase 4 ([#44](https://github.com/TinyCloudLabs/tinycloud-node/pull/44))
+- add per-space storage quotas with admin API ([#32](https://github.com/TinyCloudLabs/tinycloud-node/pull/32))
+
+### Fixed
+
+- *(node)* package LICENSE.md inside the crate so cargo-dist asset copy works
+- *(db)* avoid epoch serialization conflicts (TC-212) ([#110](https://github.com/TinyCloudLabs/tinycloud-node/pull/110))
+- *(quota)* add timeouts to sidecar quota client; bump 1.4.3 ([#91](https://github.com/TinyCloudLabs/tinycloud-node/pull/91))
+- distinguish epoch-insert DB errors from missing spaces ([#90](https://github.com/TinyCloudLabs/tinycloud-node/pull/90))
+- vendor openssl for aarch64 release builds ([#72](https://github.com/TinyCloudLabs/tinycloud-node/pull/72))
+- update dstack GetKey response to match new API format ([#35](https://github.com/TinyCloudLabs/tinycloud-node/pull/35))
+
+### Other
+
+- *(release)* tinycloud-node 1.8.0
+- gate tunnelConnected on process liveness like linkListener
+- fix tunnel client SSRF, dead backoff reset, and reconnect-loop bugs
+- make the tunnel-disabled sentinel a shared constant
+- cap consecutive stale-sequence resyncs before backing off
+- Merge main to pick up TC-250 link_listener pid-gating fix
+- add tunnel integration tests against a mock relay
+- wire tunnel enable/disable/status into the CLI and serve
+- add the outbound tunnel WebSocket client
+- add tunnel enable/disable/status commands
+- extend link state.json with tunnel config + runtime marker
+- add tunnel wire protocol, auth canonicalization, and reconnect policy
+- add tokio-tungstenite dependency for the tunnel client
+- align binstall metadata with cargo-dist artifacts
+- *(release)* tinycloud-node 1.7.0
+- Merge pull request #133 from TinyCloudLabs/skgbafa/tc-87-node-link
+- 120s cert-request timeout + first-run ordering doc
+- fix sequence protocol, 409 disambiguation, cert hot-reload + review polish
+- fix link LAN listener bind wiring and CSR key algorithm
+- tinycloud node link — LAN HTTPS via tinycloud.link
+- *(tinycloud-node)* release v1.6.0 ([#124](https://github.com/TinyCloudLabs/tinycloud-node/pull/124))
+- *(release)* tinycloud-node 1.5.0
+- fix linting and homebrew audit blockers
+- reconcile control plane permissions and contract
+- harden system profile install and permissions
+- reconcile control plane snapshot and logs
+- Merge remote-tracking branch 'origin/main' into skgbafa/tc-58-node-service
+- include delegation history in v1.4.10 changelog
+- Merge branch 'main' into release-plz-2026-07-16T04-32-31Z
+- *(tinycloud-node)* release v1.4.9
+- never block writes on the quota service (stale-while-revalidate) ([#104](https://github.com/TinyCloudLabs/tinycloud-node/pull/104)) ([#105](https://github.com/TinyCloudLabs/tinycloud-node/pull/105))
+- *(tinycloud-node)* release v1.4.8
+- *(tinycloud-node)* release v1.4.7
+- Merge branch 'main' into release-plz-2026-07-13T19-02-35Z
+- *(tinycloud-node)* release v1.4.6
+- *(tinycloud-node)* release v1.4.5 ([#99](https://github.com/TinyCloudLabs/tinycloud-node/pull/99))
+- *(tinycloud-node)* release v1.4.3 ([#95](https://github.com/TinyCloudLabs/tinycloud-node/pull/95))
+- Add admin GET /admin/usage aggregate space usage endpoint (TC-108) ([#97](https://github.com/TinyCloudLabs/tinycloud-node/pull/97))
+- Move database webhook delivery off write path
+- Drop SQL DDL permission ([#84](https://github.com/TinyCloudLabs/tinycloud-node/pull/84))
+- Accept sql schema permission ([#83](https://github.com/TinyCloudLabs/tinycloud-node/pull/83))
+- Support SQL DDL capability ([#82](https://github.com/TinyCloudLabs/tinycloud-node/pull/82))
+- Suppress duplicate invoke requests ([#81](https://github.com/TinyCloudLabs/tinycloud-node/pull/81))
+- *(node)* cover policy runtime issued native read cutoff
+- Close W1 native enforcement audit residuals ([#79](https://github.com/TinyCloudLabs/tinycloud-node/pull/79))
+- Require SQL admin for PRAGMA ([#77](https://github.com/TinyCloudLabs/tinycloud-node/pull/77))
+- *(tinycloud-node)* release v1.4.2 ([#73](https://github.com/TinyCloudLabs/tinycloud-node/pull/73))
+- align owner DID terminology ([#69](https://github.com/TinyCloudLabs/tinycloud-node/pull/69))
+- *(tinycloud-node)* release v1.4.1 ([#67](https://github.com/TinyCloudLabs/tinycloud-node/pull/67))
+- *(tinycloud-node)* release v1.4.0
+- *(tinycloud-node)* release v1.3.5
+- *(tinycloud-node)* release v1.3.4 ([#64](https://github.com/TinyCloudLabs/tinycloud-node/pull/64))
+- Persist SQL and DuckDB artifacts in storage database ([#62](https://github.com/TinyCloudLabs/tinycloud-node/pull/62))
+- *(tinycloud-node)* release v1.3.3 ([#59](https://github.com/TinyCloudLabs/tinycloud-node/pull/59))
+- *(tinycloud-node)* release v1.3.2 ([#57](https://github.com/TinyCloudLabs/tinycloud-node/pull/57))
+- *(tinycloud-node)* release v1.3.1 ([#55](https://github.com/TinyCloudLabs/tinycloud-node/pull/55))
+- *(tinycloud-node)* release v1.3.0 ([#51](https://github.com/TinyCloudLabs/tinycloud-node/pull/51))
+- replace changesets with release-plz + cargo-dist ([#49](https://github.com/TinyCloudLabs/tinycloud-node/pull/49))
+- version packages ([#46](https://github.com/TinyCloudLabs/tinycloud-node/pull/46))
+- version packages ([#41](https://github.com/TinyCloudLabs/tinycloud-node/pull/41))
+- version packages ([#30](https://github.com/TinyCloudLabs/tinycloud-node/pull/30))
+- rename crates and reorganize workspace ([#31](https://github.com/TinyCloudLabs/tinycloud-node/pull/31))
+
 ## [1.6.1](https://github.com/TinyCloudLabs/tinycloud-node/compare/v1.6.0...v1.6.1) - 2026-07-18
 
 ### Fixed
