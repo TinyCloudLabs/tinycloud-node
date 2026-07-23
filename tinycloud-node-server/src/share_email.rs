@@ -659,12 +659,7 @@ pub fn compose(
         tinycloud_core::libp2p::identity::ed25519::SecretKey::try_from_bytes(signing_seed)
             .map_err(|_| anyhow::anyhow!("invalid share email signing key"))?;
     let signing_ed25519 = tinycloud_core::libp2p::identity::ed25519::Keypair::from(signing_secret);
-    let signing_keypair: tinycloud_core::libp2p::identity::Keypair = signing_ed25519.clone().into();
-    let signing_public = signing_keypair
-        .public()
-        .try_into_ed25519()
-        .map_err(|_| anyhow::anyhow!("invalid share email signing public key"))?;
-    if signing_public.to_bytes() != invite_public_key {
+    if key_setup.share_invitation_public_key() != invite_public_key {
         return Err(anyhow::anyhow!(
             "configured invitation public key does not match the derived node signing key"
         ));

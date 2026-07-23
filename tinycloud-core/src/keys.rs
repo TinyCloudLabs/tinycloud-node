@@ -89,6 +89,13 @@ impl StaticSecret {
         let secret = SecretKey::try_from_bytes(derived).expect("32 bytes");
         EdKP::from(secret).into()
     }
+
+    /// Derive the public half of the node's Share invitation signing key.
+    pub fn share_invitation_public_key(&self) -> [u8; 32] {
+        let derived = self.derive_key(b"tinycloud/share-email/invitation-signing");
+        let secret = SecretKey::try_from_bytes(derived).expect("32 bytes");
+        EdKP::from(secret).public().to_bytes()
+    }
 }
 
 #[async_trait]
