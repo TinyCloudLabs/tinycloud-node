@@ -1,0 +1,53 @@
+name: Export production Share invitation descriptor
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test the public descriptor exporter
+        run: cargo test -p tinycloud-node --bin export-share-invitation-descriptor
+
+      - name: Derive the public descriptor
+        env:
+          TINYCLOUD_KEYS_SECRET: ${{ secrets.PROD_TINYCLOUD_KEYS_SECRET }}
+        run: |
+          set -euo pipefail
+          test -n "$TINYCLOUD_KEYS_SECRET"
+          umask 077
+          descriptor="$RUNNER_TEMP/share-invitation-descriptor.json"
+          cargo run --quiet -p tinycloud-node --bin export-share-invitation-descriptor > "$descriptor"
+          jq -e '
+            keys == [
+              "nodeAudience",
+              "nodeInvitationKid",
+              "nodeInvitationPublicKey",
+              "nodeKeyVersion",
+              "nodeOrigin"
+            ] and
+            .nodeOrigin == "https://tee.node.tinycloud.xyz" and
+            .nodeAudience == "did:web:tee.node.tinycloud.xyz" and
+            .nodeInvitationKid == "did:web:tee.node.tinycloud.xyz#invitation-key-1" and
+            (.nodeInvitationPublicKey | test("^[A-Za-z0-9_-]{43}$")) and
+            .nodeKeyVersion == 1
+          ' "$descriptor" >/dev/null
+          if grep -Fq "$TINYCLOUD_KEYS_SECRET" "$descriptor"; then
+            echo "::error::Descriptor contains private input"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: share-invitation-descriptor
+          path: ${{ runner.temp }}/share-invitation-descriptor.json
+          if-no-files-found: error
+          retention-days: 1
