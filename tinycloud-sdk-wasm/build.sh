@@ -14,6 +14,17 @@ fi
 wasm-pack build $DEVMODE --out-dir $PKG_DIR/web
 wasm-pack build $DEVMODE --target nodejs --out-dir $PKG_DIR/node
 
+RECIPIENT_DID_DECL='export function verifyRecipientDidDelegationBundleV2(bundle: RecipientDidDelegationBundleV2, nowUnixSeconds: bigint): NativeVerifiedRecipientDidDelegationBundleV2;'
+for TARGET in web node
+do
+    DTS="$PKG_DIR/$TARGET/$PKG_NAME.d.ts"
+    if ! grep -Fqx "$RECIPIENT_DID_DECL" "$DTS"
+    then
+        echo "recipient-DID verifier declaration is missing or imprecise in $DTS" >&2
+        exit 1
+    fi
+done
+
 mv $PKG_DIR/web/package.json $PKG_DIR/
 rm $PKG_DIR/node/package.json
 

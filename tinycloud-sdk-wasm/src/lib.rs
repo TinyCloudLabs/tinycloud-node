@@ -7,6 +7,7 @@ use hex::FromHex;
 use tinycloud_auth::{
     ipld_core::cid::Cid,
     multihash_codetable::{Code, MultihashDigest},
+    recipient_did::{verify_recipient_did_delegation_bundle_v2, RecipientDidDelegationBundleV2},
 };
 use tinycloud_sdk_rs::{authorization::InvocationHeaders, util};
 use wasm_bindgen::prelude::*;
@@ -240,4 +241,21 @@ pub fn computeCid(data: &[u8], codec: u64) -> String {
     let hash = Code::Blake3_256.digest(data);
     let cid = Cid::new_v1(codec, hash);
     cid.to_string()
+}
+
+/// Atomically verify a complete recipient-DID delegation bundle.
+///
+/// This operation is deterministic and performs no network, registry, node,
+/// resolver, status, or database I/O. It returns only after the complete
+/// root-to-grant authority graph has passed native verification.
+#[wasm_bindgen]
+#[allow(non_snake_case)]
+pub fn verifyRecipientDidDelegationBundleV2(
+    bundle: definitions::JsRecipientDidDelegationBundleV2,
+    nowUnixSeconds: u64,
+) -> Result<definitions::JsNativeVerifiedRecipientDidDelegationBundleV2, JsValue> {
+    let bundle: RecipientDidDelegationBundleV2 = serde_wasm_bindgen::from_value(bundle.into())?;
+    let verified =
+        verify_recipient_did_delegation_bundle_v2(bundle, nowUnixSeconds).map_err(map_jserr)?;
+    Ok(serde_wasm_bindgen::to_value(&verified)?.unchecked_into())
 }

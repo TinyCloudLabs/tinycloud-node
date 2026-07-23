@@ -2,6 +2,7 @@ pub mod authorization;
 pub mod identity;
 pub mod policy_capability;
 pub mod protocol;
+pub mod recipient_did;
 pub mod resolver;
 pub mod resource;
 pub mod share_email_evidence;

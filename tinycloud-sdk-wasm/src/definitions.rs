@@ -32,6 +32,45 @@ export type SessionConfig = {
 "#;
 
 #[wasm_bindgen(typescript_custom_section)]
+const RECIPIENT_DID_DELEGATION_V2: &'static str = r#"
+export type RecipientDidDelegationBundleV2 = {
+  format: "tinycloud-recipient-delegation-v2",
+  routing: { origin: string, nodeAudience: string },
+  grant: { kind: "ucan", cid: string, encoding: "jwt", value: string },
+  issuerProofs: Array<
+    | { kind: "cacao", cid: string, encoding: "dag-cbor-base64url-pad", value: string }
+    | { kind: "ucan", cid: string, encoding: "jwt", value: string }
+  >,
+};
+
+export type NativeVerifiedRecipientDidDelegationBundleV2 = {
+  verification: "tinycloud-native-authority-v1",
+  ownerDid: string,
+  sessionPrincipalDid: string,
+  sessionVerificationMethod: string,
+  recipientDid: string,
+  grantCid: string,
+  proofCids: string[],
+  scope: {
+    spaceId: string,
+    resource: { kind: "exact", path: string },
+    actions: string[],
+  },
+  notBefore?: string,
+  expiry: string,
+};
+"#;
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(typescript_type = "RecipientDidDelegationBundleV2")]
+    pub type JsRecipientDidDelegationBundleV2;
+
+    #[wasm_bindgen(typescript_type = "NativeVerifiedRecipientDidDelegationBundleV2")]
+    pub type JsNativeVerifiedRecipientDidDelegationBundleV2;
+}
+
+#[wasm_bindgen(typescript_custom_section)]
 const TS_DEF: &'static str = r#"
 /**
  * A TinyCloud session.
