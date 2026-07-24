@@ -220,31 +220,96 @@ pub async fn auth_reconcile(
         )
     })?;
     let peer_url = request.peer_url.trim_end_matches('/');
-    let export = reqwest::Client::new()
-        .post(format!("{peer_url}/replication/auth/export"))
-        .header("Replication-Session", peer_token.0)
-        .json(&AuthReplicationExportRequest {
+    let local_inventory = tinycloud
+        .export_auth_replication(&AuthReplicationExportRequest {
             space_id: request.space_id.clone(),
+            inventory_only: false,
+            known_fingerprint: None,
+            known_delegation_ids: Vec::new(),
+            known_revocation_ids: Vec::new(),
         })
-        .send()
         .await
-        .map_err(|error| (Status::BadGateway, error.to_string()))?;
+        .map_err(map_replication_error)?;
+    let client = reqwest::Client::new();
+    let (probe, probe_bytes) = fetch_peer_auth_export(
+        &client,
+        peer_url,
+        &peer_token.0,
+        &AuthReplicationExportRequest {
+            space_id: request.space_id.clone(),
+            inventory_only: true,
+            known_fingerprint: Some(local_inventory.fingerprint.clone()),
+            known_delegation_ids: Vec::new(),
+            known_revocation_ids: Vec::new(),
+        },
+    )
+    .await?;
 
-    if !export.status().is_success() {
-        return Err(map_peer_error("peer auth export failed", export).await);
-    }
-
-    let export = export
-        .json::<AuthReplicationExportResponse>()
-        .await
-        .map_err(|error| (Status::BadGateway, error.to_string()))?;
+    let (export, transferred_bytes) = if probe.matches || probe.fingerprint.is_empty() {
+        (probe, probe_bytes)
+    } else {
+        let (export, export_bytes) = fetch_peer_auth_export(
+            &client,
+            peer_url,
+            &peer_token.0,
+            &AuthReplicationExportRequest {
+                space_id: request.space_id.clone(),
+                inventory_only: false,
+                known_fingerprint: Some(local_inventory.fingerprint.clone()),
+                known_delegation_ids: local_inventory.delegation_ids.clone(),
+                known_revocation_ids: local_inventory.revocation_ids.clone(),
+            },
+        )
+        .await?;
+        (export, probe_bytes.saturating_add(export_bytes))
+    };
 
     let mut applied = tinycloud
         .apply_auth_replication(&export)
         .await
         .map_err(map_auth_tx_error)?;
     applied.peer_url = Some(request.peer_url.clone());
+    applied.local_fingerprint = Some(local_inventory.fingerprint);
+    applied.transferred_bytes = transferred_bytes;
+    crate::prometheus::REPLICATION_TRANSFER_BYTES_TOTAL
+        .with_label_values(&["auth", "wire"])
+        .inc_by(transferred_bytes as u64);
+    crate::prometheus::REPLICATION_TRANSFER_BYTES_TOTAL
+        .with_label_values(&["auth", "material"])
+        .inc_by(applied.transferred_material_bytes as u64);
     Ok(Json(applied))
+}
+
+async fn fetch_peer_auth_export(
+    client: &reqwest::Client,
+    peer_url: &str,
+    peer_token: &str,
+    request: &AuthReplicationExportRequest,
+) -> Result<(AuthReplicationExportResponse, usize), (Status, String)> {
+    let request_body = serde_json::to_vec(request)
+        .map_err(|error| (Status::InternalServerError, error.to_string()))?;
+    let request_bytes = request_body.len();
+    let response = client
+        .post(format!("{peer_url}/replication/auth/export"))
+        .header("Replication-Session", peer_token)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(request_body)
+        .send()
+        .await
+        .map_err(|error| (Status::BadGateway, error.to_string()))?;
+
+    if !response.status().is_success() {
+        return Err(map_peer_error("peer auth export failed", response).await);
+    }
+
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| (Status::BadGateway, error.to_string()))?;
+    let transferred_bytes = request_bytes.saturating_add(body.len());
+    let export =
+        serde_json::from_slice(&body).map_err(|error| (Status::BadGateway, error.to_string()))?;
+    Ok((export, transferred_bytes))
 }
 
 #[post("/replication/export", format = "json", data = "<request>")]

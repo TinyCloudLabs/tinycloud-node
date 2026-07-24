@@ -442,6 +442,14 @@ pub struct KvReconCompareResponse {
 #[serde(rename_all = "camelCase")]
 pub struct AuthReplicationExportRequest {
     pub space_id: String,
+    #[serde(default)]
+    pub inventory_only: bool,
+    #[serde(default)]
+    pub known_fingerprint: Option<String>,
+    #[serde(default)]
+    pub known_delegation_ids: Vec<String>,
+    #[serde(default)]
+    pub known_revocation_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -452,20 +460,34 @@ pub struct AuthReplicationReconcileRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct AuthReplicationExportResponse {
     pub space_id: String,
+    pub fingerprint: String,
+    pub matches: bool,
+    pub total_delegations: usize,
+    pub total_revocations: usize,
+    pub total_material_bytes: usize,
+    pub material_bytes: usize,
+    pub delegation_ids: Vec<String>,
     pub delegations: Vec<String>,
+    pub revocation_ids: Vec<String>,
     pub revocations: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct AuthReplicationApplyResponse {
     pub space_id: String,
     pub peer_url: Option<String>,
     pub imported_delegations: usize,
     pub imported_revocations: usize,
+    pub matched: bool,
+    pub local_fingerprint: Option<String>,
+    pub peer_fingerprint: Option<String>,
+    pub transferred_bytes: usize,
+    pub transferred_material_bytes: usize,
+    pub peer_total_material_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -592,4 +614,26 @@ pub enum KvReplicationOperation {
 #[serde(rename_all = "camelCase")]
 pub struct ReplicationErrorResponse {
     pub message: String,
+}
+
+#[cfg(test)]
+mod auth_replication_tests {
+    use super::AuthReplicationExportResponse;
+
+    #[test]
+    fn auth_export_response_accepts_legacy_full_exports() {
+        let response: AuthReplicationExportResponse = serde_json::from_str(
+            r#"{
+                "spaceId": "did:pkh:eip155:1:0x1",
+                "delegations": ["delegation"],
+                "revocations": ["revocation"]
+            }"#,
+        )
+        .unwrap();
+
+        assert!(response.fingerprint.is_empty());
+        assert!(!response.matches);
+        assert_eq!(response.delegations, ["delegation"]);
+        assert_eq!(response.revocations, ["revocation"]);
+    }
 }

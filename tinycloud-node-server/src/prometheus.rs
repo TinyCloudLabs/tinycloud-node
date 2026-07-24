@@ -1,6 +1,9 @@
 use hyper::{header::CONTENT_TYPE, Body, Request, Response};
 use lazy_static::lazy_static;
-use prometheus::{register_histogram_vec, Encoder, HistogramVec, TextEncoder};
+use prometheus::{
+    register_histogram_vec, register_int_counter_vec, Encoder, HistogramVec, IntCounterVec,
+    TextEncoder,
+};
 
 lazy_static! {
     pub static ref AUTHORIZED_INVOKE_HISTOGRAM: HistogramVec = register_histogram_vec!(
@@ -13,6 +16,12 @@ lazy_static! {
         "tinycloud_authorization_duration_seconds",
         "The authorization latencies in seconds.",
         &["request"]
+    )
+    .unwrap();
+    pub static ref REPLICATION_TRANSFER_BYTES_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "tinycloud_replication_transfer_bytes_total",
+        "Bytes received during replication reconciliation.",
+        &["plane", "measure"]
     )
     .unwrap();
 }
