@@ -422,21 +422,27 @@ pub async fn delegate(
                 )
             })
             .and_then(|result: TransactResult| {
-                let activated: Vec<String> = result.commits.keys().map(|s| s.to_string()).collect();
-                let skipped: Vec<String> = result
-                    .skipped_spaces
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
+                let TransactResult {
+                    commits,
+                    skipped_spaces,
+                    delegation_cids,
+                } = result;
+                let activated: Vec<String> = commits.keys().map(|s| s.to_string()).collect();
+                let skipped: Vec<String> = skipped_spaces.iter().map(|s| s.to_string()).collect();
 
-                // Get CID from the first committed event, or fall back to
-                // the delegation CID when all spaces were skipped
-                let cid = result
-                    .commits
-                    .into_values()
+                // The persisted delegation CID is the address consumed by
+                // the later policy/session/invoke chain. Prefer it over a
+                // space commit event so delegation-only and multi-space
+                // transactions return the same addressed object.
+                let cid = delegation_cids
+                    .into_iter()
                     .next()
-                    .and_then(|c| c.committed_events.into_iter().next())
-                    .or_else(|| result.delegation_cids.into_iter().next())
+                    .or_else(|| {
+                        commits
+                            .into_values()
+                            .next()
+                            .and_then(|commit| commit.committed_events.into_iter().next())
+                    })
                     .map(|h| h.to_cid(0x55).to_string())
                     .ok_or_else(|| {
                         (Status::Unauthorized, "Delegation not committed".to_string())
@@ -503,7 +509,7 @@ pub struct RevokeResponse {
     pub cid: String,
 }
 
-#[post("/invoke", data = "<data>")]
+#[post("/invoke", format = "application/json", data = "<data>")]
 #[cfg(feature = "duckdb")]
 #[allow(clippy::too_many_arguments)]
 pub async fn invoke(
@@ -537,7 +543,7 @@ pub async fn invoke(
     .await
 }
 
-#[post("/invoke", data = "<data>")]
+#[post("/invoke", format = "application/json", data = "<data>")]
 #[cfg(not(feature = "duckdb"))]
 #[allow(clippy::too_many_arguments)]
 pub async fn invoke(
@@ -671,10 +677,20 @@ fn kv_invoke_options_for_capabilities(
 ) -> Result<KvInvokeOptions, (Status, String)> {
     let if_match = take_metadata_header(&mut headers.0, "if-match");
     let if_none_match = take_metadata_header(&mut headers.0, "if-none-match");
-    if if_match.is_some() && if_none_match.is_some() {
+    let expected_version = take_metadata_header(&mut headers.0, "x-tinycloud-expected-version");
+    if expected_version.is_some() {
         return Err((
             Status::BadRequest,
-            "If-Match and If-None-Match cannot be combined".to_string(),
+            "x-tinycloud-expected-version is not a production precondition; use If-Match"
+                .to_string(),
+        ));
+    }
+    if (if_match.is_some() && if_none_match.is_some())
+        || (expected_version.is_some() && (if_match.is_some() || if_none_match.is_some()))
+    {
+        return Err((
+            Status::BadRequest,
+            "KV preconditions cannot be combined".to_string(),
         ));
     }
 

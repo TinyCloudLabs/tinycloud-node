@@ -28,8 +28,9 @@ use sea_orm_migration::MigratorTrait;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use tinycloud_auth::multihash_codetable::MultihashDigest;
 use tinycloud_auth::{
-    authorization::{EncodingError, TinyCloudDelegation},
+    authorization::{make_invocation, EncodingError, InvocationOptions, TinyCloudDelegation},
     identity::{canonicalize_did, did_principal_matches},
     resource::{Path, SpaceId},
 };
@@ -710,6 +711,20 @@ where
     ) -> Result<Vec<Path>, DbErr> {
         list(&self.conn, space_id, prefix).await
     }
+
+    /// Return only immediate KV children, with a bounded keyset page. Share
+    /// authorization calls this method after the authority bridge has checked
+    /// the holder, prefix, action, and cursor binding; the database method does
+    /// not make an authorization decision itself.
+    pub async fn list_direct_children_bounded(
+        &self,
+        space_id: &SpaceId,
+        prefix: &Path,
+        limit: usize,
+        after: Option<&Path>,
+    ) -> Result<(Vec<Path>, bool, Option<Path>), DbErr> {
+        list_direct_children_bounded(&self.conn, space_id, prefix, limit, after).await
+    }
 }
 
 impl<C, B, K> SpaceDatabase<C, B, K>
@@ -823,6 +838,92 @@ where
         tx.commit().await?;
 
         Ok(result)
+    }
+
+    /// Commit a KV edit after a separate policy authority transaction has
+    /// authenticated and attenuated the request. This is intentionally an
+    /// internal Node composition seam: it creates a local invocation record
+    /// for the normal KV transaction machinery, but is not exposed as a
+    /// public authorization mechanism or a second policy engine.
+    pub async fn invoke_internal_kv_put<S>(
+        &self,
+        space: SpaceId,
+        path: Path,
+        metadata: Metadata,
+        stage: HashBuffer<S::Writable>,
+        precondition: Option<KvPrecondition>,
+    ) -> Result<Hash, TxStoreError<B, S, K>>
+    where
+        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
+        let jwk = tinycloud_auth::ssi::jwk::JWK::generate_ed25519()
+            .map_err(|_| TxStoreError::MissingInput)?;
+        let mut verification_method = tinycloud_auth::resolver::DID_METHODS
+            .generate(&jwk, "key")
+            .map_err(|_| TxStoreError::MissingInput)?
+            .to_string();
+        let fragment = verification_method
+            .rsplit_once(':')
+            .map(|(_, fragment)| fragment.to_owned())
+            .ok_or(TxStoreError::MissingInput)?;
+        verification_method.push('#');
+        verification_method.push_str(&fragment);
+        let resource = space.clone().to_resource(
+            "kv".parse().map_err(|_| TxStoreError::MissingInput)?,
+            Some(path.clone()),
+            None,
+            None,
+        );
+        let delegation = tinycloud_auth::ipld_core::cid::Cid::new_v1(
+            0x55,
+            tinycloud_auth::multihash_codetable::Code::Blake3_256
+                .digest(b"tinycloud/native-share-internal-delegation"),
+        );
+        let invocation = make_invocation(
+            vec![(
+                resource,
+                vec!["tinycloud.kv/put"
+                    .parse::<tinycloud_auth::ucan_capabilities_object::Ability>()
+                    .map_err(|_| TxStoreError::MissingInput)?],
+            )],
+            &delegation,
+            &jwk,
+            &verification_method,
+            (OffsetDateTime::now_utc() + time::Duration::minutes(5)).unix_timestamp() as f64,
+            InvocationOptions::default(),
+        )
+        .map_err(|_| TxStoreError::MissingInput)?;
+        let info = crate::util::InvocationInfo::try_from(invocation.clone())
+            .map_err(|_| TxStoreError::MissingInput)?;
+        let serialized = invocation
+            .encode()
+            .map_err(|_| TxStoreError::MissingInput)?
+            .into_bytes();
+        let invocation = crate::events::SerializedEvent(info, serialized);
+        let mut inputs = HashMap::new();
+        inputs.insert((space, path), (metadata, stage));
+        let mut options = KvInvokeOptions::default();
+        if let Some(precondition) = precondition {
+            let key = inputs
+                .keys()
+                .next()
+                .cloned()
+                .ok_or(TxStoreError::MissingInput)?;
+            options.preconditions.insert(key, precondition);
+        }
+        let (_, mut outcomes) = self
+            .invoke_with_options(invocation, inputs, options)
+            .await?;
+        let result = outcomes
+            .drain(..)
+            .find_map(|outcome| match outcome {
+                InvocationOutcome::KvWrite(hash) => Some(hash),
+                _ => None,
+            })
+            .ok_or(TxStoreError::MissingInput);
+        result
     }
 
     pub async fn delegate(&self, delegation: Delegation) -> Result<TransactResult, TxError<B, K>> {
@@ -1038,16 +1139,18 @@ where
         let tx = self.conn.begin_with_config(isolation_level, None).await?;
         let mut deleted_hashes = HashMap::new();
         for key @ (space, path) in &mutation_keys {
-            let current = get_kv_entity(&tx, space, path)
-                .await?
-                .map(|entry| entry.value);
+            let current = get_kv_entity(&tx, space, path).await?;
             if let Some(precondition) = options.preconditions.get(key) {
-                if !kv_precondition_matches(*precondition, current) {
+                let matches = kv_precondition_matches(
+                    *precondition,
+                    current.as_ref().map(|entry| entry.value),
+                );
+                if !matches {
                     return Err(TxStoreError::KvPreconditionFailed);
                 }
             }
-            if let Some(hash) = current {
-                deleted_hashes.insert(key.clone(), hash);
+            if let Some(entry) = current {
+                deleted_hashes.insert(key.clone(), entry.value);
             }
         }
         let caps = invocation.0.capabilities.clone();
@@ -1837,6 +1940,59 @@ async fn list_bounded<C: ConnectionTrait>(
         list.truncate(limit);
     }
     Ok((list, truncated))
+}
+
+/// Return stable direct children of a KV folder. Unlike list_bounded, this
+/// never exposes descendants as if they were children and de-duplicates keys
+/// that share the same folder prefix. after is an exclusive lexical keyset
+/// cursor, so immutable fixtures cannot produce duplicates or skips between
+/// pages.
+pub async fn list_direct_children_bounded<C: ConnectionTrait>(
+    db: &C,
+    space_id: &SpaceId,
+    prefix: &Path,
+    limit: usize,
+    after: Option<&Path>,
+) -> Result<(Vec<Path>, bool, Option<Path>), DbErr> {
+    if limit == 0 {
+        return Ok((Vec::new(), false, None));
+    }
+    let (descendants, _) = list_bounded(db, space_id, prefix, None).await?;
+    let base = if prefix.as_str().is_empty() {
+        String::new()
+    } else {
+        format!("{}/", prefix.as_str())
+    };
+    let mut children = std::collections::BTreeSet::new();
+    for path in descendants {
+        let Some(remainder) = path.as_str().strip_prefix(&base) else {
+            continue;
+        };
+        if remainder.is_empty() {
+            continue;
+        }
+        let child = remainder
+            .split_once('/')
+            .map_or(remainder, |(name, _)| name);
+        let child = if base.is_empty() {
+            child.to_owned()
+        } else {
+            format!("{base}{child}")
+        };
+        let child = child
+            .parse::<Path>()
+            .map_err(|error| DbErr::Custom(format!("invalid persisted KV path: {error}")))?;
+        if after.is_none_or(|cursor| child.as_str() > cursor.as_str()) {
+            children.insert(child);
+        }
+    }
+    let mut children = children.into_iter().collect::<Vec<_>>();
+    let truncated = children.len() > limit;
+    if truncated {
+        children.truncate(limit);
+    }
+    let next = truncated.then(|| children.last().cloned()).flatten();
+    Ok((children, truncated, next))
 }
 
 async fn metadata<C: ConnectionTrait>(
@@ -2725,6 +2881,25 @@ mod test {
         assert_eq!(
             paths.iter().map(Path::as_str).collect::<Vec<_>>(),
             vec!["a", "b", "c"]
+        );
+        assert!(truncated);
+        let (children, truncated, next) =
+            list_direct_children_bounded(&db.conn, &space, &"".parse().unwrap(), 2, None)
+                .await
+                .unwrap();
+        assert_eq!(
+            children.iter().map(Path::as_str).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert!(truncated);
+        assert_eq!(next.as_ref().map(Path::as_str), Some("b"));
+        let (children, truncated, _) =
+            list_direct_children_bounded(&db.conn, &space, &"".parse().unwrap(), 2, next.as_ref())
+                .await
+                .unwrap();
+        assert_eq!(
+            children.iter().map(Path::as_str).collect::<Vec<_>>(),
+            vec!["c", "literal%key"]
         );
         assert!(truncated);
         assert_eq!(

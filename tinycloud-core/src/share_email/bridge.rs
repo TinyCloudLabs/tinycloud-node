@@ -34,11 +34,11 @@ use tinycloud_auth::{
 use crate::{
     models::{share_policy_presentation_jti, share_session_handle},
     policy_authority::{
-        evaluate_exact_email_policy, AuthorityArtifactVerifier, AuthorityError,
+        evaluate_share_recipient_policy, AuthorityArtifactVerifier, AuthorityError,
         AuthorityStatusObservation, DatabaseAuthorityKernel, DatabaseAuthorityStore,
-        DecisionContext, DelegationMode, DelegationRole, DelegationSignature,
-        ExactEmailPolicyEvaluation, IssuanceAudit, IssuanceBindings, NodeRootSigner,
-        PolicyDelegation, VerifiedAttestedEnforcerBinding, VerifiedPolicyState,
+        DecisionContext, DelegationMode, DelegationRole, DelegationSignature, IssuanceAudit,
+        IssuanceBindings, NodeRootSigner, PolicyDelegation, ShareRecipientPolicyEvaluation,
+        VerifiedAttestedEnforcerBinding, VerifiedPolicyState,
     },
     policy_capability::{jcs, parse as parse_capability, PolicyCapability},
 };
@@ -53,8 +53,9 @@ use super::{
         SessionHandleMapping, StateError, READ_JTI_TTL, SESSION_TTL,
     },
     types::{
-        AuthorizedRead, Did, DidKey, NodeDelegationCid, PolicySession, ReadAuthorizationRequest,
-        ReadInvocation, SessionHandle, Sha256Digest, ShareScope, TargetOrigin,
+        validate_share_path, AuthorizedRead, Did, DidKey, NodeDelegationCid, PolicySession,
+        ReadAuthorizationRequest, ReadInvocation, RecipientMatcher, SessionHandle, Sha256Digest,
+        ShareScope, TargetOrigin,
     },
 };
 
@@ -217,7 +218,17 @@ impl DatabaseAuthorityBridge117 {
         };
         let policy_state_value: serde_json::Value =
             serde_json::from_slice(&bundle.policy_state).map_err(|_| PortError::Denied)?;
-        let decision = evaluate_exact_email_policy(ExactEmailPolicyEvaluation {
+        let (recipient_matcher, _) = policy_metadata(policy.artifact(), Some(&bundle.policy_state))
+            .map_err(|_| PortError::Denied)?;
+        let matcher_digest = digest_string(
+            &recipient_matcher
+                .digest_material()
+                .map_err(|_| PortError::Denied)?,
+        );
+        if request.policy_recipient_digest != matcher_digest {
+            return Err(PortError::Denied);
+        }
+        let decision = evaluate_share_recipient_policy(ShareRecipientPolicyEvaluation {
             policy: policy.artifact(),
             enforcement: enforcement.artifact(),
             policy_state: &policy_state_value,
@@ -230,12 +241,10 @@ impl DatabaseAuthorityBridge117 {
             source: &serde_json::to_value(&request.scope.content_source)
                 .map_err(|_| PortError::Denied)?,
             source_digest: request.scope.content_source_digest.as_str(),
-            action: match request.scope.action {
-                super::types::ShareAction::KvGet => super::types::KV_GET_ACTION,
-                super::types::ShareAction::SqlRead => super::types::SQL_READ_ACTION,
-            },
+            action: request.scope.action.as_str(),
             resource: match &request.scope.resource {
                 super::types::ExactResource::Kv { path }
+                | super::types::ExactResource::KvPrefix { path }
                 | super::types::ExactResource::Sql { path, .. } => path.as_str(),
             },
             owner_did: decision_context.owner_did.as_str(),
@@ -504,7 +513,11 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
         let (policy_expiry, policy_recipient, sql_statement, _internal_delegation_cid) = self
             .validate_scope_in_transaction(&tx, &request.scope, now)
             .await?;
-        let recipient_digest = digest_string(&policy_recipient);
+        let recipient_digest = digest_string(
+            &policy_recipient
+                .digest_material()
+                .map_err(|_| PortError::Denied)?,
+        );
         if recipient_digest != request.policy_recipient_digest {
             return Err(PortError::Denied);
         }
@@ -756,7 +769,7 @@ impl DatabaseAuthorityBridge117 {
         handle: &super::types::AuthorityMaterialHandle,
         material_digest: &Sha256Digest,
         now: OffsetDateTime,
-    ) -> Result<(String, String, OffsetDateTime), PortError> {
+    ) -> Result<(String, RecipientMatcher, OffsetDateTime), PortError> {
         let policy = super::types::PolicyCid::parse(policy_cid).map_err(|_| PortError::Denied)?;
         let delegation = super::types::ShareDelegationCid::parse(delegation_cid)
             .map_err(|_| PortError::Denied)?;
@@ -890,12 +903,38 @@ impl DatabaseAuthorityBridge117 {
     ) -> Result<
         (
             OffsetDateTime,
-            String,
+            RecipientMatcher,
             Option<super::data_plane::PinnedNamedStatement>,
             NodeDelegationCid,
         ),
         PortError,
     > {
+        let source_path = match &scope.content_source {
+            super::types::ContentSource::Kv { path, .. }
+            | super::types::ContentSource::Sql { path, .. } => path,
+        };
+        // A v2 source is an immutable ceiling and may be the space root even
+        // when the requested resource is an exact child.
+        validate_share_path(source_path, true).map_err(|_| PortError::Denied)?;
+        validate_share_path(
+            match &scope.resource {
+                super::types::ExactResource::Kv { path }
+                | super::types::ExactResource::KvPrefix { path }
+                | super::types::ExactResource::Sql { path, .. } => path,
+            },
+            scope.action.is_list(),
+        )
+        .map_err(|_| PortError::Denied)?;
+        if matches!(scope.action, super::types::ShareAction::KvList)
+            && !matches!(scope.resource, super::types::ExactResource::KvPrefix { .. })
+        {
+            return Err(PortError::Denied);
+        }
+        if !scope.action.is_list()
+            && matches!(scope.resource, super::types::ExactResource::KvPrefix { .. })
+        {
+            return Err(PortError::Denied);
+        }
         let share_delegation_cid = scope.delegation_cid.as_ref().ok_or(PortError::Denied)?;
         let material_provider = self
             .authority_material
@@ -950,7 +989,7 @@ impl DatabaseAuthorityBridge117 {
         {
             return Err(PortError::Denied);
         }
-        let (recipient, expiry) =
+        let (matcher, expiry) =
             policy_metadata(signed_policy.artifact(), Some(&policy_state_bytes))
                 .map_err(|_| PortError::Denied)?;
         if signed_policy.artifact().audience_did != scope.node_audience.as_str()
@@ -1070,7 +1109,7 @@ impl DatabaseAuthorityBridge117 {
             return Err(PortError::Denied);
         }
         let statement = authorized_statement(scope, &policy, &delegation)?;
-        Ok((expiry, recipient, statement, bundle.internal_delegation_cid))
+        Ok((expiry, matcher, statement, bundle.internal_delegation_cid))
     }
 }
 
@@ -1098,17 +1137,27 @@ fn authority_timestamp_value(value: OffsetDateTime) -> Result<OffsetDateTime, Po
 fn policy_metadata(
     artifact: &crate::policy_authority::PolicyDelegation,
     share_policy: Option<&[u8]>,
-) -> Result<(String, OffsetDateTime), ()> {
+) -> Result<(RecipientMatcher, OffsetDateTime), ()> {
     let policy = share_policy
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
         .ok_or(())?;
-    let recipient = policy
-        .get("recipientEmail")
-        .and_then(serde_json::Value::as_str)
-        .ok_or(())?
-        .to_owned();
-    let recipient =
-        tinycloud_auth::share_email_evidence::normalize_email(&recipient).map_err(|_| ())?;
+    let recipient = match policy.get("version").and_then(serde_json::Value::as_u64) {
+        Some(2) => {
+            let policy_v2: super::types::SharePolicyV2 =
+                serde_json::from_value(policy.clone()).map_err(|_| ())?;
+            policy_v2.validate().map_err(|_| ())?;
+            policy_v2.recipient_matcher
+        }
+        Some(1) => RecipientMatcher::ExactEmail(
+            policy
+                .get("recipientEmail")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(())?
+                .to_owned(),
+        ),
+        _ => return Err(()),
+    };
+    recipient.canonical().map_err(|_| ())?;
     let expiry = OffsetDateTime::parse(
         &artifact.expires_at,
         &time::format_description::well_known::Rfc3339,
@@ -1130,25 +1179,52 @@ fn policy_metadata(
 fn validate_share_policy_state(bytes: &[u8], scope: &ShareScope) -> Result<(), PortError> {
     let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| PortError::Denied)?;
     let source = serde_json::to_value(&scope.content_source).map_err(|_| PortError::Denied)?;
-    let action = match scope.action {
-        super::types::ShareAction::KvGet => super::types::KV_GET_ACTION,
-        super::types::ShareAction::SqlRead => super::types::SQL_READ_ACTION,
-    };
+    let action = scope.action.as_str();
     let resource = match &scope.resource {
         super::types::ExactResource::Kv { path }
+        | super::types::ExactResource::KvPrefix { path }
         | super::types::ExactResource::Sql { path, .. } => path.as_str(),
     };
     if value.get("type").and_then(serde_json::Value::as_str) != Some("TinyCloudSharePolicy")
-        || value.get("version").and_then(serde_json::Value::as_u64) != Some(1)
         || value.get("contentSource") != Some(&source)
         || value
             .get("contentSourceDigest")
             .and_then(serde_json::Value::as_str)
             != Some(scope.content_source_digest.as_str())
-        || value.get("action").and_then(serde_json::Value::as_str) != Some(action)
-        || value.get("resource").and_then(serde_json::Value::as_str) != Some(resource)
     {
         return Err(PortError::Denied);
+    }
+    match value.get("version").and_then(serde_json::Value::as_u64) {
+        Some(1)
+            if value.get("action").and_then(serde_json::Value::as_str) == Some(action)
+                && value.get("resource").and_then(serde_json::Value::as_str) == Some(resource) => {}
+        Some(2) => {
+            let policy: super::types::SharePolicyV2 =
+                serde_json::from_value(value.clone()).map_err(|_| PortError::Denied)?;
+            policy.validate().map_err(|_| PortError::Denied)?;
+            if !policy.actions.iter().any(|item| item.as_str() == action) {
+                return Err(PortError::Denied);
+            }
+            let (kind, prefix) = match policy.resource.kind {
+                super::types::SharePolicyResourceKind::Exact => ("exact", policy.resource.value),
+                super::types::SharePolicyResourceKind::Prefix => ("prefix", policy.resource.value),
+            };
+            if (kind == "exact" && prefix != resource)
+                || (kind == "prefix"
+                    && resource != prefix
+                    && !(prefix.is_empty()
+                        || resource
+                            .strip_prefix(&prefix)
+                            .is_some_and(|suffix| suffix.starts_with('/'))))
+            {
+                return Err(PortError::Denied);
+            }
+            policy
+                .recipient_matcher
+                .canonical()
+                .map_err(|_| PortError::Denied)?;
+        }
+        _ => return Err(PortError::Denied),
     }
     Ok(())
 }
@@ -1365,10 +1441,14 @@ fn authorized_statement(
 
 fn requested_capability(scope: &ShareScope) -> Result<PolicyCapability, PortError> {
     let (service, path, action, caveats) = match &scope.content_source {
-        super::types::ContentSource::Kv { path, .. } => (
+        super::types::ContentSource::Kv { .. } => (
             "tinycloud.kv".to_owned(),
-            path.as_str().to_owned(),
-            super::types::KV_GET_ACTION.to_owned(),
+            match &scope.resource {
+                super::types::ExactResource::Kv { path }
+                | super::types::ExactResource::KvPrefix { path } => path.as_str().to_owned(),
+                _ => return Err(PortError::Denied),
+            },
+            scope.action.as_str().to_owned(),
             None,
         ),
         super::types::ContentSource::Sql { path, .. } => (

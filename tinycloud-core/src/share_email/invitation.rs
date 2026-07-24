@@ -5,8 +5,8 @@
 //! authority effects belong to [`super::state`].
 
 use super::types::{
-    AuthorityMaterialHandle, ContentSource, Did, PolicyCid, ProtocolJti, Sha256Digest, ShareCid,
-    ShareDelegationCid, ShareId, TargetOrigin,
+    AuthorityMaterialHandle, ContentSource, Did, Path, PolicyCid, ProtocolJti, RecipientMatcher,
+    Sha256Digest, ShareAction, ShareCid, ShareDelegationCid, ShareId, TargetOrigin,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use libp2p::identity::{Keypair, PublicKey};
@@ -147,7 +147,24 @@ pub struct InvitationAuthorization {
     pub authority_material_handle: AuthorityMaterialHandle,
     #[serde(rename = "authorityMaterialDigest")]
     pub authority_material_digest: Sha256Digest,
-    pub recipient_email: CanonicalEmail,
+    /// Present only on the legacy v1 exact-email authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient_email: Option<CanonicalEmail>,
+    /// Present on v2 authorizations.  The matcher is the policy recipient
+    /// authority; it is never inferred from the delivery address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient_matcher: Option<RecipientMatcher>,
+    /// Present only on v2 authorizations and used by the post-link delivery
+    /// path.  It is deliberately not an authorization matcher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_email: Option<CanonicalEmail>,
+    /// Explicit v2 attenuation set.  Legacy v1 leaves this absent so its
+    /// signed envelope remains byte-for-byte compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actions: Option<Vec<ShareAction>>,
+    /// Explicit v2 resource ceiling/request.  Legacy v1 leaves this absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<Path>,
     pub target_origin: TargetOrigin,
     pub node_audience: Did,
     pub return_origin: TargetOrigin,
@@ -205,7 +222,13 @@ pub struct InvitationAuthorizationInput {
     pub delegation_cid: ShareDelegationCid,
     pub authority_material_handle: AuthorityMaterialHandle,
     pub authority_material_digest: Sha256Digest,
-    pub recipient_email: CanonicalEmail,
+    /// Legacy v1 exact-email input.  A v2 request supplies `recipient_matcher`
+    /// and `delivery_email` instead.
+    pub recipient_email: Option<CanonicalEmail>,
+    pub recipient_matcher: Option<RecipientMatcher>,
+    pub delivery_email: Option<CanonicalEmail>,
+    pub actions: Option<Vec<ShareAction>>,
+    pub resource: Option<Path>,
     pub target_origin: TargetOrigin,
     pub node_audience: Did,
     pub document_name: DocumentName,
@@ -310,9 +333,40 @@ pub fn issue_invitation_authorization_for(
     {
         return Err(InvitationError::Invalid);
     }
+    let (version, recipient_email, recipient_matcher, delivery_email) =
+        match (input.recipient_email, input.recipient_matcher) {
+            (Some(email), None) => (1, Some(email), None, None),
+            (None, Some(matcher)) => {
+                matcher.canonical().map_err(|_| InvitationError::Invalid)?;
+                let delivery_email = input.delivery_email.ok_or(InvitationError::Invalid)?;
+                (2, None, Some(matcher), Some(delivery_email))
+            }
+            _ => return Err(InvitationError::Invalid),
+        };
+    let (actions, resource) = if version == 2 {
+        let actions = input.actions.or_else(|| {
+            Some(vec![match &input.content_source {
+                ContentSource::Kv { action, .. } => match action {
+                    super::types::KvGetAction::Get => ShareAction::KvGet,
+                    super::types::KvGetAction::List => ShareAction::KvList,
+                    super::types::KvGetAction::Put => ShareAction::KvPut,
+                },
+                ContentSource::Sql { .. } => ShareAction::SqlRead,
+            }])
+        });
+        let resource = input.resource.or_else(|| {
+            Some(match &input.content_source {
+                ContentSource::Kv { path, .. } | ContentSource::Sql { path, .. } => path.clone(),
+            })
+        });
+        validate_actions(actions.as_deref(), resource.as_ref(), &input.content_source)?;
+        (actions, resource)
+    } else {
+        (None, None)
+    };
     let authorization = InvitationAuthorization {
         artifact_type: "TinyCloudShareInviteAuthorization".to_owned(),
-        version: 1,
+        version,
         jti: input.jti,
         sender_did: input.sender_did,
         share_cid: input.share_cid,
@@ -321,7 +375,11 @@ pub fn issue_invitation_authorization_for(
         delegation_cid: input.delegation_cid,
         authority_material_handle: input.authority_material_handle,
         authority_material_digest: input.authority_material_digest,
-        recipient_email: input.recipient_email,
+        recipient_email,
+        recipient_matcher,
+        delivery_email,
+        actions,
+        resource,
         target_origin,
         node_audience,
         return_origin,
@@ -354,6 +412,32 @@ pub fn issue_invitation_authorization_for(
             signature: URL_SAFE_NO_PAD.encode(signature),
         },
     })
+}
+
+fn validate_actions(
+    actions: Option<&[ShareAction]>,
+    resource: Option<&Path>,
+    source: &ContentSource,
+) -> Result<(), InvitationError> {
+    let actions = actions.ok_or(InvitationError::Invalid)?;
+    if actions.is_empty()
+        || actions
+            .windows(2)
+            .any(|pair| pair[0].as_str() >= pair[1].as_str())
+        || actions.iter().any(|action| {
+            !matches!(
+                (action, source),
+                (
+                    ShareAction::KvGet | ShareAction::KvList | ShareAction::KvPut,
+                    ContentSource::Kv { .. }
+                ) | (ShareAction::SqlRead, ContentSource::Sql { .. })
+            )
+        })
+        || resource.is_none()
+    {
+        return Err(InvitationError::Invalid);
+    }
+    Ok(())
 }
 
 pub fn verify_invitation_authorization(
@@ -430,13 +514,24 @@ fn validate_authorization_for(
     expected_return_origin: &TargetOrigin,
 ) -> Result<(), InvitationError> {
     if authorization.artifact_type != "TinyCloudShareInviteAuthorization"
-        || authorization.version != 1
         || authorization.return_origin != *expected_return_origin
         || authorization.target_origin != *expected_target_origin
         || authorization.node_audience != *expected_node_audience
         || authorization.jti == authorization.report_abuse_token
     {
         return Err(InvitationError::Invalid);
+    }
+    match authorization.version {
+        1 if authorization.recipient_email.is_some()
+            && authorization.recipient_matcher.is_none()
+            && authorization.delivery_email.is_none() => {}
+        2 if authorization.recipient_email.is_none()
+            && authorization
+                .recipient_matcher
+                .as_ref()
+                .is_some_and(|matcher| matcher.canonical().is_ok())
+            && authorization.delivery_email.is_some() => {}
+        _ => return Err(InvitationError::Invalid),
     }
     let issued_at = parse_timestamp(&authorization.issued_at)?;
     let expires_at = parse_timestamp(&authorization.expires_at)?;
@@ -463,7 +558,13 @@ fn validate_authorization_for(
 
 fn validate_source(source: &ContentSource) -> Result<(), InvitationError> {
     match source {
-        ContentSource::Kv { action, .. } if *action == super::types::KvGetAction::Get => Ok(()),
+        ContentSource::Kv {
+            action:
+                super::types::KvGetAction::Get
+                | super::types::KvGetAction::List
+                | super::types::KvGetAction::Put,
+            ..
+        } => Ok(()),
         ContentSource::Sql {
             action, arguments, ..
         } if *action == super::types::SqlReadAction::Read && arguments.len() <= 32 => Ok(()),
@@ -599,7 +700,11 @@ mod tests {
             .unwrap(),
             authority_material_handle: AuthorityMaterialHandle::parse("amh_kv_001").unwrap(),
             authority_material_digest: Sha256Digest::from_bytes([3; 32]),
-            recipient_email: CanonicalEmail::parse("Alice@example.com").unwrap(),
+            recipient_email: Some(CanonicalEmail::parse("Alice@example.com").unwrap()),
+            recipient_matcher: None,
+            delivery_email: None,
+            actions: None,
+            resource: None,
             target_origin: TargetOrigin::parse("https://node.example").unwrap(),
             node_audience: Did::parse("did:web:node.example").unwrap(),
             document_name: DocumentName::parse("plan.md").unwrap(),
@@ -628,7 +733,7 @@ mod tests {
             request_body_digest: Sha256Digest::from_bytes([4; 32]),
         };
         let now = OffsetDateTime::parse("2029-01-01T00:00:00Z", &Rfc3339).unwrap();
-        let receipt = issue_invitation_authorization(input, &signer, now).unwrap();
+        let receipt = issue_invitation_authorization(input.clone(), &signer, now).unwrap();
         let verifier = Ed25519InvitationVerifier::new(
             "did:web:node.example#invitation-key-1",
             keypair.public(),
@@ -640,5 +745,46 @@ mod tests {
         assert!(signed_bytes(&receipt.authorization)
             .unwrap()
             .starts_with(INVITATION_AUTHORIZATION_DOMAIN));
+
+        let v2 = issue_invitation_authorization_for(
+            InvitationAuthorizationInput {
+                recipient_email: None,
+                recipient_matcher: Some(RecipientMatcher::EmailDomain("EXAMPLE.COM".to_owned())),
+                delivery_email: Some(CanonicalEmail::parse("notify@example.com").unwrap()),
+                ..input.clone()
+            },
+            &signer,
+            now,
+            TargetOrigin::parse("https://node.example").unwrap(),
+            Did::parse("did:web:node.example").unwrap(),
+            TargetOrigin::parse(RETURN_ORIGIN).unwrap(),
+        )
+        .unwrap();
+        let v2_value = serde_json::to_value(&v2.authorization).unwrap();
+        assert_eq!(v2.authorization.version, 2);
+        assert_eq!(
+            v2_value["recipientMatcher"],
+            serde_json::json!({"kind":"emailDomain","value":"EXAMPLE.COM"})
+        );
+        assert_eq!(v2_value["deliveryEmail"], "notify@example.com");
+        assert_eq!(v2_value["actions"], serde_json::json!(["tinycloud.kv/get"]));
+        assert_eq!(v2_value["resource"], "documents/plan.md");
+        assert!(v2_value.get("recipientEmail").is_none());
+        verify_invitation_authorization(&v2, &verifier, now).unwrap();
+
+        let mut missing_delivery = input.clone();
+        missing_delivery.recipient_email = None;
+        missing_delivery.recipient_matcher =
+            Some(RecipientMatcher::EmailDomain("example.com".to_owned()));
+        missing_delivery.delivery_email = None;
+        assert!(issue_invitation_authorization_for(
+            missing_delivery,
+            &signer,
+            now,
+            TargetOrigin::parse("https://node.example").unwrap(),
+            Did::parse("did:web:node.example").unwrap(),
+            TargetOrigin::parse(RETURN_ORIGIN).unwrap(),
+        )
+        .is_err());
     }
 }

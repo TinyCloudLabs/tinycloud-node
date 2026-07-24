@@ -121,7 +121,7 @@ impl fmt::Debug for HolderReadRequest {
 }
 
 impl HolderReadRequest {
-    fn authorization(&self) -> ReadAuthorizationRequest {
+    pub fn authorization(&self) -> ReadAuthorizationRequest {
         ReadAuthorizationRequest {
             session: self.session.clone(),
             jti: self.jti.clone(),
@@ -230,13 +230,20 @@ impl<S: ExactKvStore> KvReadAdapter for MarkdownKvAdapter<S> {
         else {
             return Err(PortError::Denied);
         };
-        if !matches!(action, KvGetAction::Get)
-            || authorized.session().scope.action != ShareAction::KvGet
-            || !matches!(&authorized.session().scope.resource, ExactResource::Kv { path: p } if p == path)
+        let resource_path = match &authorized.session().scope.resource {
+            ExactResource::Kv { path } => path,
+            _ => return Err(PortError::Denied),
+        };
+        if !matches!(action, KvGetAction::Get | KvGetAction::Put)
+            || !matches!(
+                authorized.session().scope.action,
+                ShareAction::KvGet | ShareAction::KvPut
+            )
+            || !same_or_descendant(path, resource_path)
         {
             return Err(PortError::Denied);
         }
-        let Some(bytes) = self.store.get_exact(space, path).await? else {
+        let Some(bytes) = self.store.get_exact(space, resource_path).await? else {
             return Err(PortError::Denied);
         };
         markdown_document(bytes).map_err(|error| match error {
@@ -365,11 +372,15 @@ where
     K: KvReadAdapter,
     S: NamedSqlReadAdapter,
 {
-    pub async fn read(
+    /// Verify the holder proof and consume the bounded invocation JTI through
+    /// the sole authority bridge without touching content storage. Native
+    /// list/edit adapters use this method so authorization cannot be bypassed
+    /// or consumed twice by a read-only adapter.
+    pub async fn authorize(
         &self,
         request: HolderReadRequest,
         now: OffsetDateTime,
-    ) -> Result<MarkdownResponse, DataPlaneError> {
+    ) -> Result<AuthorizedRead, DataPlaneError> {
         verify_request(&request, now)?;
         let authorized = self
             .authority
@@ -383,6 +394,15 @@ where
         {
             return Err(DataPlaneError::Denied);
         }
+        Ok(authorized)
+    }
+
+    pub async fn read(
+        &self,
+        request: HolderReadRequest,
+        now: OffsetDateTime,
+    ) -> Result<MarkdownResponse, DataPlaneError> {
+        let authorized = self.authorize(request.clone(), now).await?;
         let credential_digest = authorized.session().credential_digest.clone();
         let document = match request.scope.content_source {
             ContentSource::Kv { .. } => self
@@ -449,12 +469,40 @@ fn validate_scope(scope: &ShareScope) -> Result<(), DataPlaneError> {
             ExactResource::Kv {
                 path: resource_path,
             },
-            ContentSource::Kv {
-                action: KvGetAction::Get,
-                path,
-                ..
+            ContentSource::Kv { action, path, .. },
+        ) if matches!(
+            action,
+            KvGetAction::Get | KvGetAction::List | KvGetAction::Put
+        ) && same_or_descendant(path, resource_path) =>
+        {
+            Ok(())
+        }
+        (
+            ShareAction::KvList,
+            ExactResource::KvPrefix {
+                path: resource_path,
             },
-        ) if resource_path == path => Ok(()),
+            ContentSource::Kv { action, path, .. },
+        ) if matches!(
+            action,
+            KvGetAction::Get | KvGetAction::List | KvGetAction::Put
+        ) && resource_path == path =>
+        {
+            Ok(())
+        }
+        (
+            ShareAction::KvPut,
+            ExactResource::Kv {
+                path: resource_path,
+            },
+            ContentSource::Kv { action, path, .. },
+        ) if matches!(
+            action,
+            KvGetAction::Get | KvGetAction::List | KvGetAction::Put
+        ) && same_or_descendant(path, resource_path) =>
+        {
+            Ok(())
+        }
         (
             ShareAction::SqlRead,
             ExactResource::Sql {
@@ -480,6 +528,15 @@ fn validate_scope(scope: &ShareScope) -> Result<(), DataPlaneError> {
         }
         _ => Err(DataPlaneError::InvalidSource),
     }
+}
+
+fn same_or_descendant(prefix: &Path, candidate: &Path) -> bool {
+    prefix.as_str().is_empty()
+        || candidate.as_str() == prefix.as_str()
+        || candidate
+            .as_str()
+            .strip_prefix(prefix.as_str())
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn signed_read_bytes(request: &HolderReadRequest) -> Result<Vec<u8>, DataPlaneError> {
@@ -562,15 +619,13 @@ fn sha256_digest(bytes: &[u8]) -> Sha256Digest {
 }
 
 fn action_name(action: ShareAction) -> &'static str {
-    match action {
-        ShareAction::KvGet => KV_GET_ACTION,
-        ShareAction::SqlRead => SQL_READ_ACTION,
-    }
+    action.as_str()
 }
 
 fn resource_name(resource: &ExactResource) -> &str {
     match resource {
         ExactResource::Kv { path } => path.as_str(),
+        ExactResource::KvPrefix { path } => path.as_str(),
         ExactResource::Sql { path, .. } => path.as_str(),
     }
 }
