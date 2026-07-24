@@ -2555,7 +2555,7 @@ mod tests {
             assert!(schema.has_table(table).await.unwrap(), "missing {table}");
         }
 
-        crate::migrations::Migrator::down(&db, Some(4))
+        crate::migrations::Migrator::down(&db, Some(5))
             .await
             .unwrap();
         for table in [

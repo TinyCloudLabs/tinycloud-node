@@ -27,6 +27,8 @@ pub fn open_connection(mode: &StorageMode) -> Result<Connection, SqlError> {
     if matches!(mode, StorageMode::File(_)) {
         conn.pragma_update(None, "journal_mode", "wal")
             .map_err(|e| SqlError::Internal(e.to_string()))?;
+        conn.pragma_update(None, "wal_autocheckpoint", 0)
+            .map_err(|e| SqlError::Internal(e.to_string()))?;
     }
 
     // Enable foreign keys
@@ -69,6 +71,9 @@ pub fn promote_to_file(conn: &Connection, path: &PathBuf) -> Result<Connection, 
     // Enable WAL on the new file
     file_conn
         .pragma_update(None, "journal_mode", "wal")
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    file_conn
+        .pragma_update(None, "wal_autocheckpoint", 0)
         .map_err(|e| SqlError::Internal(e.to_string()))?;
     file_conn
         .pragma_update(None, "foreign_keys", "ON")
