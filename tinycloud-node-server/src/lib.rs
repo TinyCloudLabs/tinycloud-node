@@ -242,11 +242,10 @@ pub async fn app_with_control(
     let mut connect_opts = ConnectOptions::from(database);
     let is_sqlite = database.starts_with("sqlite");
     if is_sqlite {
-        // SQLite cannot handle concurrent write transactions — two DEFERRED
-        // transactions deadlock when both try to upgrade to writers.  Use a
-        // single connection to serialize writes, and enable WAL mode so reads
-        // outside transactions remain concurrent.
-        connect_opts.max_connections(1);
+        // WAL permits readers to progress while the core's shared writer lock
+        // serializes mutations and durable read-audit batches. A one-connection
+        // pool made every authenticated read wait behind audit writes.
+        connect_opts.max_connections(16);
         connect_opts.map_sqlx_sqlite_opts(|opts| {
             opts.create_if_missing(true)
                 .pragma("journal_mode", "WAL")

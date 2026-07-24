@@ -4,6 +4,7 @@ use crate::hash::Hash;
 use crate::keys::{get_did_key, Secrets};
 use crate::migrations::Migrator;
 use crate::models::*;
+use crate::read_audit::ReadAuditPipeline;
 use crate::relationships::*;
 use crate::sql_sizes::SqlSizes;
 use crate::storage::{
@@ -73,6 +74,8 @@ pub struct SpaceDatabase<C, B, S> {
     sql_sizes: SqlSizes,
     revocation_chain_locks: Arc<tokio::sync::Mutex<HashMap<Hash, Weak<tokio::sync::Mutex<()>>>>>,
     kv_object_locks: KvObjectLockRegistry,
+    writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
+    read_audit: ReadAuditPipeline,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +203,9 @@ where
 impl<B, K> SpaceDatabase<DatabaseConnection, B, K> {
     pub async fn new(conn: DatabaseConnection, storage: B, secrets: K) -> Result<Self, DbErr> {
         Migrator::up(&conn, None).await?;
+        let writer_lock = (conn.get_database_backend() == sea_orm::DatabaseBackend::Sqlite)
+            .then(|| Arc::new(tokio::sync::Mutex::new(())));
+        let read_audit = ReadAuditPipeline::start(conn.clone(), writer_lock.clone());
         Ok(Self {
             conn,
             storage,
@@ -208,6 +214,8 @@ impl<B, K> SpaceDatabase<DatabaseConnection, B, K> {
             sql_sizes: SqlSizes::default(),
             revocation_chain_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             kv_object_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            writer_lock,
+            read_audit,
         })
     }
 
@@ -226,6 +234,11 @@ impl<C, B, K> SpaceDatabase<C, B, K>
 where
     K: Secrets,
 {
+    /// Number of durable read-audit records and group commits completed.
+    pub fn read_audit_commit_stats(&self) -> (u64, u64) {
+        self.read_audit.stats()
+    }
+
     pub async fn stage_key(&self, space_id: &SpaceId) -> Result<String, K::Error> {
         self.secrets.stage_keypair(space_id).await.map(get_did_key)
     }
@@ -806,6 +819,10 @@ where
     }
 
     async fn transact(&self, events: Vec<Event>) -> Result<TransactResult, TxError<B, K>> {
+        let _writer = match &self.writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         let tx = self
             .conn
             .begin_with_config(chain_isolation_level(&self.conn), None)
@@ -981,6 +998,9 @@ where
                 Some((resource.space().clone(), resource.path()?.clone()))
             })
             .collect::<Vec<_>>();
+        if mutation_keys.is_empty() {
+            return self.invoke_read_only::<S>(invocation, options).await;
+        }
         let _kv_object_guards = self.acquire_kv_object_guards(&mutation_keys).await;
         let mut stages = HashMap::new();
         let mut ops = Vec::new();
@@ -1034,6 +1054,10 @@ where
             conditional_kv_isolation_level(&self.conn)
         } else {
             chain_isolation_level(&self.conn)
+        };
+        let _writer = match &self.writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
         };
         let tx = self.conn.begin_with_config(isolation_level, None).await?;
         let mut deleted_hashes = HashMap::new();
@@ -1197,6 +1221,143 @@ where
             }
         })?;
         Ok((commit, results))
+    }
+
+    /// Execute a successful non-mutating invocation without entering the
+    /// single-writer transaction. Authorization and data access remain under
+    /// the chain guard; the response waits for the grouped audit commit.
+    async fn invoke_read_only<S>(
+        &self,
+        invocation: Invocation,
+        options: KvInvokeOptions,
+    ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
+    where
+        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
+        invocation::verify_and_authorize(&self.conn, &invocation.0, OffsetDateTime::now_utc())
+            .await
+            .map_err(TxError::<B, K>::from)?;
+
+        let requested_spaces = invocation.0.spaces().cloned().collect::<HashSet<_>>();
+        if !requested_spaces.is_empty() {
+            let hosted = space::Entity::find()
+                .filter(space::Column::Id.is_in(requested_spaces.iter().cloned().map(SpaceIdWrap)))
+                .count(&self.conn)
+                .await?;
+            if hosted != requested_spaces.len() as u64 {
+                return Err(TxError::SpaceNotFound.into());
+            }
+        }
+
+        let caps_read_params: Option<CapabilitiesReadParams> = invocation
+            .0
+            .invocation
+            .payload()
+            .facts
+            .as_ref()
+            .and_then(|facts| {
+                facts.iter().find_map(|fact| {
+                    fact.as_object()
+                        .and_then(|object| object.get("capabilitiesReadParams"))
+                        .and_then(|value| serde_json::from_value(value.clone()).ok())
+                })
+            });
+        let mut results = Vec::new();
+        for cap in invocation.0.capabilities.iter().filter_map(|capability| {
+            capability
+                .resource
+                .tinycloud_resource()
+                .and_then(|resource| {
+                    Some((
+                        resource.space(),
+                        resource.service().as_str(),
+                        crate::policy_capability::resolve_alias(
+                            capability.ability.as_ref().as_ref(),
+                        ),
+                        resource.path()?,
+                    ))
+                })
+        }) {
+            match cap {
+                (space, "kv", "tinycloud.kv/get", path) => {
+                    let data = get_kv(&self.conn, &self.storage, space, path)
+                        .await
+                        .map_err(|error| match error {
+                            EitherError::A(error) => TxStoreError::Tx(error.into()),
+                            EitherError::B(error) => TxStoreError::StoreRead(error),
+                        })?;
+                    if let (Some(limit), Some((_, _, content))) =
+                        (options.max_response_bytes, data.as_ref())
+                    {
+                        if content.len() > limit {
+                            return Err(TxStoreError::KvResponseTooLarge {
+                                size: content.len(),
+                                limit,
+                            });
+                        }
+                    }
+                    results.push(InvocationOutcome::KvRead(data));
+                }
+                (space, "kv", "tinycloud.kv/list", path) => {
+                    let (list, truncated) =
+                        list_bounded(&self.conn, space, path, options.list_limit).await?;
+                    results.push(InvocationOutcome::KvList(list, truncated));
+                }
+                (space, "kv", "tinycloud.kv/metadata", path) => {
+                    results.push(InvocationOutcome::KvMetadata(
+                        metadata_with_hash(&self.conn, space, path).await?,
+                    ));
+                }
+                (space, "capabilities", "tinycloud.capabilities/read", path)
+                    if path.as_str() == "all" =>
+                {
+                    let outcome = match &caps_read_params {
+                        None => {
+                            get_valid_delegations(&self.conn, space, self.encryption.as_ref())
+                                .await?
+                        }
+                        Some(CapabilitiesReadParams::List { filters }) => {
+                            get_filtered_delegations(
+                                &self.conn,
+                                space,
+                                &invocation.0.invoker,
+                                filters.as_ref(),
+                                self.encryption.as_ref(),
+                            )
+                            .await?
+                        }
+                        Some(CapabilitiesReadParams::Chain { delegation_cid }) => {
+                            results.push(InvocationOutcome::DelegationChain(
+                                get_delegation_chain(
+                                    &self.conn,
+                                    space,
+                                    delegation_cid,
+                                    self.encryption.as_ref(),
+                                )
+                                .await?,
+                            ));
+                            continue;
+                        }
+                    };
+                    results.push(InvocationOutcome::OpenSessions(outcome));
+                }
+                _ => {}
+            }
+        }
+
+        self.read_audit
+            .record(&invocation, self.encryption.as_ref())
+            .await?;
+        Ok((
+            TransactResult {
+                commits: HashMap::new(),
+                skipped_spaces: Vec::new(),
+                delegation_cids: Vec::new(),
+            },
+            results,
+        ))
     }
 }
 
