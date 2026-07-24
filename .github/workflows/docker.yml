@@ -14,6 +14,11 @@ on:
         required: false
         type: boolean
         default: false
+      include_tc_bench_v1:
+        description: 'Build images with the tc-bench-v1 endpoints enabled'
+        required: false
+        type: boolean
+        default: false
       deploy_phala:
         description: 'Deploy the dstack image to Phala after build'
         required: false
@@ -57,6 +62,10 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.include_duckdb }}" = "true" ]; then
             FEATURES="duckdb"
             IMAGE_SUFFIX="-duckdb"
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.include_tc_bench_v1 }}" = "true" ]; then
+            FEATURES="${FEATURES:+$FEATURES }tc-bench-v1"
+            IMAGE_SUFFIX="${IMAGE_SUFFIX}-tc-bench-v1"
           fi
           echo "cargo_features=${FEATURES}" >> "$GITHUB_OUTPUT"
           echo "image_suffix=${IMAGE_SUFFIX}" >> "$GITHUB_OUTPUT"
@@ -115,6 +124,11 @@ jobs:
             FEATURES="dstack duckdb"
             IMAGE_SUFFIX="-duckdb"
             SHA_PREFIX="dstack-duckdb-"
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.include_tc_bench_v1 }}" = "true" ]; then
+            FEATURES="$FEATURES tc-bench-v1"
+            IMAGE_SUFFIX="${IMAGE_SUFFIX}-tc-bench-v1"
+            SHA_PREFIX="${SHA_PREFIX}tc-bench-v1-"
           fi
           echo "cargo_features=${FEATURES}" >> "$GITHUB_OUTPUT"
           echo "image_suffix=${IMAGE_SUFFIX}" >> "$GITHUB_OUTPUT"
