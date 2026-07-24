@@ -1,5 +1,5 @@
 use anyhow::Result;
-use futures::io::AsyncWriteExt;
+use futures::io::{AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt};
 use percent_encoding::percent_decode_str;
 use rocket::{data::ToByteUnit, http::Status, response::status::Custom, serde::json::Json, State};
 use serde::{Deserialize, Serialize};
@@ -47,8 +47,8 @@ use tinycloud_core::{
     types::{Ability, DelegationQuery, DelegationQueryPage, Metadata, Resource},
     util::{Capability, DelegationInfo, InvocationInfo, RevocationInfo},
     write_hooks::{db_table_path, hook_delivery_id, subscription_matches_event, TouchedTables},
-    DelegationStatus, InvocationOutcome, KvInvokeOptions, KvPrecondition, TransactResult, TxError,
-    TxStoreError,
+    DelegationStatus, InvocationOutcome, KvBatchReadItem, KvBatchReadValue, KvInvokeOptions,
+    KvPrecondition, TransactResult, TxError, TxStoreError,
 };
 
 pub mod admin;
@@ -60,6 +60,8 @@ pub mod public;
 pub mod tc_bench;
 pub mod util;
 use util::LimitedReader;
+
+const MAX_KV_BATCH_READ_ITEMS: usize = 100;
 
 fn retryable_sqlstate(code: &str) -> bool {
     matches!(code, "40001" | "40P01")
@@ -1319,6 +1321,83 @@ async fn invoke_impl(
                     } else {
                         Ok(DataOut::One(InvOut(InvocationOutcome::KvBatchWrite(
                             written_paths,
+                        ))))
+                    }
+                } else if outcomes.len() > 1 {
+                    if outcomes.len() > MAX_KV_BATCH_READ_ITEMS {
+                        return Err((
+                            Status::BadRequest,
+                            format!(
+                                "KV batch reads accept at most {MAX_KV_BATCH_READ_ITEMS} keys"
+                            ),
+                        ));
+                    }
+                    let batch_specs = invocation_info
+                        .capabilities
+                        .iter()
+                        .filter_map(|capability| {
+                            let resource = capability.resource.tinycloud_resource()?;
+                            let action = capability.ability.as_ref().as_ref();
+                            if resource.service().as_str() != "kv"
+                                || !matches!(
+                                    action,
+                                    "tinycloud.kv/get" | "tinycloud.kv/metadata"
+                                )
+                            {
+                                return None;
+                            }
+                            Some((resource.path()?.clone(), action == "tinycloud.kv/get"))
+                        })
+                        .collect::<Vec<_>>();
+                    let homogeneous = batch_specs
+                        .first()
+                        .is_some_and(|(_, read)| batch_specs.iter().all(|(_, next)| next == read));
+                    if batch_specs.len() != outcomes.len() || !homogeneous {
+                        Err((
+                            Status::NotImplemented,
+                            "Multiple invocation outcomes require a homogeneous KV get or metadata batch"
+                                .to_string(),
+                        ))
+                    } else {
+                        let mut results = Vec::with_capacity(outcomes.len());
+                        for ((path, is_read), outcome) in
+                            batch_specs.into_iter().zip(outcomes.into_iter())
+                        {
+                            let value = match (is_read, outcome) {
+                                (true, InvocationOutcome::KvRead(Some((metadata, hash, mut data)))) => {
+                                    let mut bytes = Vec::with_capacity(data.len() as usize);
+                                    FuturesAsyncReadExt::read_to_end(&mut data, &mut bytes)
+                                        .await
+                                        .map_err(|error| {
+                                            (Status::InternalServerError, error.to_string())
+                                        })?;
+                                    Some(KvBatchReadValue {
+                                        metadata,
+                                        hash,
+                                        data: Some(bytes),
+                                    })
+                                }
+                                (true, InvocationOutcome::KvRead(None))
+                                | (false, InvocationOutcome::KvMetadata(None)) => None,
+                                (
+                                    false,
+                                    InvocationOutcome::KvMetadata(Some((metadata, hash))),
+                                ) => Some(KvBatchReadValue {
+                                    metadata,
+                                    hash,
+                                    data: None,
+                                }),
+                                _ => {
+                                    return Err((
+                                        Status::InternalServerError,
+                                        "KV batch produced an unexpected outcome".to_string(),
+                                    ))
+                                }
+                            };
+                            results.push(KvBatchReadItem { path, value });
+                        }
+                        Ok(DataOut::One(InvOut(InvocationOutcome::KvBatchRead(
+                            results,
                         ))))
                     }
                 } else {
