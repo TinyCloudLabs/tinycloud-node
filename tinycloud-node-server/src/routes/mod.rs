@@ -3694,7 +3694,7 @@ mod tests {
             .manage(sql_service)
             .manage(Config::default())
             .manage(QuotaCache::new(None, None))
-            .manage(InvocationReplayCache::new())
+            .manage(InvocationReplayCache::new(conn.clone()))
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
 
@@ -3949,7 +3949,7 @@ mod tests {
             .manage(sql_service)
             .manage(Config::default())
             .manage(QuotaCache::new(None, None))
-            .manage(InvocationReplayCache::new())
+            .manage(InvocationReplayCache::new(conn.clone()))
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
 
@@ -5149,6 +5149,7 @@ mod tests {
     struct MeteredSqlHttp {
         tinycloud: TinyCloud,
         sql_service: SqlService,
+        replay_db: tinycloud_core::sea_orm::DatabaseConnection,
         space: SpaceId,
         resource: ResourceId,
         jwk: JWK,
@@ -5296,6 +5297,7 @@ mod tests {
         Ok(MeteredSqlHttp {
             tinycloud,
             sql_service,
+            replay_db: conn,
             space,
             resource,
             jwk,
@@ -5359,7 +5361,7 @@ mod tests {
             .manage(setup.sql_service)
             .manage(Config::default())
             .manage(QuotaCache::new(Some(limit), None))
-            .manage(InvocationReplayCache::new())
+            .manage(InvocationReplayCache::new(setup.replay_db))
             .manage(HookRuntime::new(HooksConfig::default(), [9u8; 32]))
             .manage(BlockStage::from(crate::config::StagingStorage::Memory))
     }
