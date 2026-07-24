@@ -1,6 +1,9 @@
 use hyper::{header::CONTENT_TYPE, Body, Request, Response};
 use lazy_static::lazy_static;
-use prometheus::{register_histogram_vec, Encoder, HistogramVec, TextEncoder};
+use prometheus::{
+    register_histogram_vec, register_int_counter_vec, Encoder, HistogramVec, IntCounterVec,
+    TextEncoder,
+};
 use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
@@ -33,6 +36,12 @@ lazy_static! {
         &["span", "outcome"]
     )
     .unwrap();
+    pub static ref SIGNED_KV_BYTES: IntCounterVec = register_int_counter_vec!(
+        "tinycloud_signed_kv_bytes_total",
+        "Object and response bytes for successful signed KV reads.",
+        &["measure"]
+    )
+    .unwrap();
 }
 
 pub fn set_enabled(enabled: bool) {
@@ -48,6 +57,17 @@ pub fn observe_span(span: &'static str, outcome: &'static str, duration: Duratio
         SPAN_HISTOGRAM
             .with_label_values(&[span, outcome])
             .observe(duration.as_secs_f64());
+    }
+}
+
+pub fn observe_signed_kv_transfer(object_bytes: u64, served_bytes: u64) {
+    if enabled() {
+        SIGNED_KV_BYTES
+            .with_label_values(&["object"])
+            .inc_by(object_bytes);
+        SIGNED_KV_BYTES
+            .with_label_values(&["served"])
+            .inc_by(served_bytes);
     }
 }
 

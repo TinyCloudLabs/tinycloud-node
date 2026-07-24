@@ -14,7 +14,7 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{info_span, Instrument};
 
 use crate::{
-    auth_guards::{DataIn, DataOut, InvOut, KVResponse, ObjectHeaders},
+    auth_guards::{DataIn, DataOut, InvOut, ObjectHeaders},
     authorization::AuthHeaderGetter,
     config::Config,
     hooks::{HookRuntime, WriteEvent},
@@ -22,8 +22,10 @@ use crate::{
     quota::QuotaCache,
     routes::public::is_public_space,
     signed_urls::{
-        load_signed_kv_ticket, mint_signed_kv_url, validate_signed_kv_hash_binding,
-        validate_signed_kv_ticket, SignedKvUrlRequest, SignedKvUrlResponse, SignedUrlRuntime,
+        if_range_allows_range, load_signed_kv_ticket, mint_signed_kv_url,
+        validate_signed_kv_hash_binding, validate_signed_kv_ticket, SignedKvIfRangeHeader,
+        SignedKvRangeHeader, SignedKvReadResponse, SignedKvUrlRequest, SignedKvUrlResponse,
+        SignedUrlRuntime,
     },
     tracing::TracingSpan,
     BlockStage, BlockStores, TinyCloud,
@@ -217,11 +219,10 @@ pub async fn create_signed_kv_url(
 #[get("/signed/kv/<ticket_id>")]
 pub async fn signed_kv_get(
     ticket_id: &str,
+    range: Option<SignedKvRangeHeader>,
+    if_range: Option<SignedKvIfRangeHeader>,
     tinycloud: &State<TinyCloud>,
-) -> Result<
-    KVResponse<tinycloud_core::storage::Content<<BlockStores as ImmutableReadStore>::Readable>>,
-    (Status, String),
-> {
+) -> Result<SignedKvReadResponse<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
     let load_start = Instant::now();
     let load_result = load_signed_kv_ticket(tinycloud.inner(), ticket_id).await;
     crate::prometheus::observe_span(
@@ -232,7 +233,34 @@ pub async fn signed_kv_get(
     let ticket = load_result?;
     let (space_id, key) = validate_signed_kv_ticket(&ticket)?;
 
+    let range = range.and_then(|range| {
+        if if_range_allows_range(
+            ticket.etag.as_deref(),
+            if_range.as_ref().map(|if_range| if_range.0.as_str()),
+        ) {
+            Some(range.0)
+        } else {
+            None
+        }
+    });
+
     let kv_start = Instant::now();
+    if let Some(range) = range {
+        let kv_result = tinycloud.kv_get_range(&space_id, &key, range).await;
+        crate::prometheus::observe_span(
+            "server.signed_kv.kv_get_range",
+            if kv_result.is_ok() { "ok" } else { "error" },
+            kv_start.elapsed(),
+        );
+        return match kv_result.map_err(|e| (Status::InternalServerError, e.to_string()))? {
+            Some((metadata, hash, content)) => {
+                validate_signed_kv_hash_binding(&ticket, &hash)?;
+                Ok(SignedKvReadResponse::from_range(metadata, hash, content))
+            }
+            None => Err((Status::NotFound, "Key not found".to_string())),
+        };
+    }
+
     let kv_result = tinycloud.kv_get(&space_id, &key).await;
     crate::prometheus::observe_span(
         "server.signed_kv.kv_get",
@@ -242,7 +270,11 @@ pub async fn signed_kv_get(
     match kv_result.map_err(|e| (Status::InternalServerError, e.to_string()))? {
         Some((md, hash, content)) => {
             validate_signed_kv_hash_binding(&ticket, &hash)?;
-            Ok(KVResponse::new(md, hash, content))
+            Ok(SignedKvReadResponse::Full {
+                metadata: md,
+                hash,
+                content,
+            })
         }
         None => Err((Status::NotFound, "Key not found".to_string())),
     }

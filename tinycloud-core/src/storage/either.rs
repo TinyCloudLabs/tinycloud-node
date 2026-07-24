@@ -59,6 +59,62 @@ where
                 .map_err(Self::Error::B),
         }
     }
+
+    async fn read_range(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        range: ByteRangeSpec,
+    ) -> Result<Option<RangeRead<Self::Readable>>, Self::Error> {
+        match self {
+            Self::A(store) => store
+                .read_range(space, id, range)
+                .await
+                .map(|read| {
+                    read.map(|read| match read {
+                        RangeRead::Content {
+                            total_size,
+                            range,
+                            content,
+                        } => {
+                            let (size, reader) = content.into_inner();
+                            RangeRead::Content {
+                                total_size,
+                                range,
+                                content: Content::new(size, AsyncEither::Left(reader)),
+                            }
+                        }
+                        RangeRead::Unsatisfiable { total_size } => {
+                            RangeRead::Unsatisfiable { total_size }
+                        }
+                    })
+                })
+                .map_err(Self::Error::A),
+            Self::B(store) => store
+                .read_range(space, id, range)
+                .await
+                .map(|read| {
+                    read.map(|read| match read {
+                        RangeRead::Content {
+                            total_size,
+                            range,
+                            content,
+                        } => {
+                            let (size, reader) = content.into_inner();
+                            RangeRead::Content {
+                                total_size,
+                                range,
+                                content: Content::new(size, AsyncEither::Right(reader)),
+                            }
+                        }
+                        RangeRead::Unsatisfiable { total_size } => {
+                            RangeRead::Unsatisfiable { total_size }
+                        }
+                    })
+                })
+                .map_err(Self::Error::B),
+        }
+    }
 }
 
 #[async_trait]
