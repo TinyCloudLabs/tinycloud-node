@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Instant;
 
 use rocket::http::Status;
 use time::{Duration, OffsetDateTime};
@@ -27,10 +28,17 @@ impl InvocationReplayCache {
         &self,
         invocation: &Invocation,
     ) -> Result<(), InvocationReplayError> {
+        let start = Instant::now();
         let now = OffsetDateTime::now_utc();
         let key = invocation.content_hash();
         let expires_at = invocation_expires_at(invocation, now);
-        self.check_and_insert_key(key, expires_at, now).await
+        let result = self.check_and_insert_key(key, expires_at, now).await;
+        crate::prometheus::observe_stage(
+            crate::prometheus::InvocationStage::ReplayCheck,
+            crate::prometheus::StageOutcome::from(result.is_ok()),
+            start.elapsed(),
+        );
+        result
     }
 
     async fn check_and_insert_key(

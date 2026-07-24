@@ -10,6 +10,7 @@ use rocket::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::time::Instant;
 use tinycloud_auth::{
     authorization::{EncodingError, HeaderEncode},
     ipld_core::cid::Cid,
@@ -184,11 +185,18 @@ where
     R: 'static + AsyncRead + Send,
 {
     fn respond_to(self, request: &'r Request<'_>) -> rocket::response::Result<'static> {
-        match self {
+        let start = Instant::now();
+        let response = match self {
             DataHolder::None => ().respond_to(request),
             DataHolder::One(inv) => inv.respond_to(request),
             DataHolder::Many(_invs) => Err(Status::NotImplemented),
-        }
+        };
+        crate::prometheus::observe_stage(
+            crate::prometheus::InvocationStage::ResponseHandling,
+            crate::prometheus::StageOutcome::from(response.is_ok()),
+            start.elapsed(),
+        );
+        response
     }
 }
 

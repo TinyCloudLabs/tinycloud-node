@@ -970,62 +970,71 @@ async fn build_batch_kv_inputs(
         .next()
         .expect("non-empty KV batch inputs have a target space");
     let mut remaining = staged_batch_remaining(space, tinycloud, config, quota_cache).await?;
-
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| (Status::BadRequest, e.to_string()))?
-    {
-        let encoded_path = field
-            .name()
-            .ok_or_else(|| {
-                (
+    let decode_start = Instant::now();
+    let result = async {
+        while let Some(field) = multipart
+            .next_field()
+            .await
+            .map_err(|e| (Status::BadRequest, e.to_string()))?
+        {
+            let encoded_path = field
+                .name()
+                .ok_or_else(|| {
+                    (
+                        Status::BadRequest,
+                        "Multipart KV part is missing a field name".to_string(),
+                    )
+                })?
+                .to_string();
+            let path = decode_multipart_path_field_name(&encoded_path)?;
+            let Some((space, typed_path)) = expected.get(&path) else {
+                return Err((
                     Status::BadRequest,
-                    "Multipart KV part is missing a field name".to_string(),
-                )
-            })?
-            .to_string();
-        let path = decode_multipart_path_field_name(&encoded_path)?;
-        let Some((space, typed_path)) = expected.get(&path) else {
+                    format!("Multipart KV part {path} is not authorized by the invocation"),
+                ));
+            };
+            if inputs.contains_key(&(space.clone(), typed_path.clone())) {
+                return Err((
+                    Status::BadRequest,
+                    format!("Duplicate multipart KV part for path {path}"),
+                ));
+            }
+
+            let metadata = field_metadata(&field);
+            let mut stage = staging
+                .stage(space)
+                .await
+                .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+            copy_multipart_field_to_stage(field, &mut stage, &mut remaining).await?;
+            inputs.insert((space.clone(), typed_path.clone()), (metadata, stage));
+        }
+
+        if inputs.len() != expected.len() {
+            let missing = expected
+                .keys()
+                .filter(|path| {
+                    !inputs
+                        .keys()
+                        .any(|(_, input_path)| input_path.as_str() == path.as_str())
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err((
                 Status::BadRequest,
-                format!("Multipart KV part {path} is not authorized by the invocation"),
-            ));
-        };
-        if inputs.contains_key(&(space.clone(), typed_path.clone())) {
-            return Err((
-                Status::BadRequest,
-                format!("Duplicate multipart KV part for path {path}"),
+                format!("Missing multipart KV parts for signed paths: {missing}"),
             ));
         }
 
-        let metadata = field_metadata(&field);
-        let mut stage = staging
-            .stage(space)
-            .await
-            .map_err(|e| (Status::InternalServerError, e.to_string()))?;
-        copy_multipart_field_to_stage(field, &mut stage, &mut remaining).await?;
-        inputs.insert((space.clone(), typed_path.clone()), (metadata, stage));
+        Ok(inputs)
     }
-
-    if inputs.len() != expected.len() {
-        let missing = expected
-            .keys()
-            .filter(|path| {
-                !inputs
-                    .keys()
-                    .any(|(_, input_path)| input_path.as_str() == path.as_str())
-            })
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err((
-            Status::BadRequest,
-            format!("Missing multipart KV parts for signed paths: {missing}"),
-        ));
-    }
-
-    Ok(inputs)
+    .await;
+    crate::prometheus::observe_stage(
+        crate::prometheus::InvocationStage::RequestDecode,
+        crate::prometheus::StageOutcome::from(result.is_ok()),
+        decode_start.elapsed(),
+    );
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1174,73 +1183,92 @@ async fn invoke_impl(
                 .collect::<Vec<_>>()
         });
 
-        let staging_start = Instant::now();
+        let stage_inputs_start = Instant::now();
         let inputs_result: Result<KvInputMap, (Status, String)> =
             match (data, put_caps.as_slice(), is_multipart_request) {
                 (DataIn::None | DataIn::One(_), [], _) => Ok(HashMap::new()),
-            (DataIn::One(d), [(space, path)], false) => {
-                let mut stage = staging
-                    .stage(space)
-                    .await
-                    .map_err(|e| (Status::InternalServerError, e.to_string()))?;
-                let open_data = d.open(1u8.gigabytes()).compat();
-
-                // Use public space storage limit if applicable, otherwise per-space quota
-                let effective_limit = if is_public_space(space) {
-                    Some(config.public_spaces.storage_limit)
-                } else {
-                    quota_cache.get_limit(space).await
-                };
-
-                if let Some(limit) = effective_limit {
-                    let current_size = tinycloud
-                        .store_size(space)
-                        .await
-                        .map_err(|e| (Status::InternalServerError, e.to_string()))?
-                        .ok_or_else(|| (Status::NotFound, "space not found".to_string()))?;
-                    // get the remaining allocated space for the given space storage
-                    match limit.as_u64().checked_sub(current_size) {
-                        // the current size is already equal or greater than the limit
-                        None | Some(0) => {
-                            return Err((
-                                Status::new(402),
-                                format!(
-                                    "Storage quota exceeded. Used: {} bytes, Limit: {} bytes",
-                                    current_size,
-                                    limit.as_u64()
-                                ),
-                            ))
-                        }
-                        Some(remaining) => {
-                            futures::io::copy(LimitedReader::new(open_data, remaining), &mut stage)
-                                .await
-                                .map_err(|e| {
-                                    if e.to_string().contains("storage limit") {
-                                        (
-                                            Status::PayloadTooLarge,
-                                            format!(
-                                                "Write exceeds remaining storage. Used: {} bytes, Limit: {} bytes",
-                                                current_size,
-                                                limit.as_u64()
-                                            ),
-                                        )
-                                    } else {
-                                        (Status::InternalServerError, e.to_string())
-                                    }
-                                })?;
-                        }
-                    }
-                } else {
-                    // no limit on storage, just use the data as is
-                    futures::io::copy(open_data, &mut stage)
+                (DataIn::One(d), [(space, path)], false) => {
+                    let mut stage = staging
+                        .stage(space)
                         .await
                         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
-                };
+                    let open_data = d.open(1u8.gigabytes()).compat();
 
-                let mut inputs = HashMap::new();
-                inputs.insert((space.clone(), path.clone()), (headers.0, stage));
-                Ok(inputs)
-            }
+                    // Use public space storage limit if applicable, otherwise per-space quota
+                    let effective_limit = if is_public_space(space) {
+                        Some(config.public_spaces.storage_limit)
+                    } else {
+                        quota_cache.get_limit(space).await
+                    };
+
+                    let copy_result = if let Some(limit) = effective_limit {
+                        let current_size = tinycloud
+                            .store_size(space)
+                            .await
+                            .map_err(|e| (Status::InternalServerError, e.to_string()))?
+                            .ok_or_else(|| (Status::NotFound, "space not found".to_string()))?;
+                        // get the remaining allocated space for the given space storage
+                        match limit.as_u64().checked_sub(current_size) {
+                            // the current size is already equal or greater than the limit
+                            None | Some(0) => {
+                                return Err((
+                                    Status::new(402),
+                                    format!(
+                                        "Storage quota exceeded. Used: {} bytes, Limit: {} bytes",
+                                        current_size,
+                                        limit.as_u64()
+                                    ),
+                                ))
+                            }
+                            Some(remaining) => {
+                                let decode_start = Instant::now();
+                                let result = futures::io::copy(
+                                    LimitedReader::new(open_data, remaining),
+                                    &mut stage,
+                                )
+                                    .await
+                                    .map_err(|e| {
+                                        if e.to_string().contains("storage limit") {
+                                            (
+                                                Status::PayloadTooLarge,
+                                                format!(
+                                                    "Write exceeds remaining storage. Used: {} bytes, Limit: {} bytes",
+                                                    current_size,
+                                                    limit.as_u64()
+                                                ),
+                                            )
+                                        } else {
+                                            (Status::InternalServerError, e.to_string())
+                                        }
+                                    })
+                                ;
+                                crate::prometheus::observe_stage(
+                                    crate::prometheus::InvocationStage::RequestDecode,
+                                    crate::prometheus::StageOutcome::from(result.is_ok()),
+                                    decode_start.elapsed(),
+                                );
+                                result
+                            }
+                        }
+                    } else {
+                        // no limit on storage, just use the data as is
+                        let decode_start = Instant::now();
+                        let result = futures::io::copy(open_data, &mut stage)
+                            .await
+                            .map_err(|e| (Status::InternalServerError, e.to_string()));
+                        crate::prometheus::observe_stage(
+                            crate::prometheus::InvocationStage::RequestDecode,
+                            crate::prometheus::StageOutcome::from(result.is_ok()),
+                            decode_start.elapsed(),
+                        );
+                        result
+                    };
+                    copy_result?;
+
+                    let mut inputs = HashMap::new();
+                    inputs.insert((space.clone(), path.clone()), (headers.0, stage));
+                    Ok(inputs)
+                }
                 (DataIn::One(d), [_, ..], true) => build_batch_kv_inputs(
                     d,
                     &headers,
@@ -1258,11 +1286,11 @@ async fn invoke_impl(
                     "KV batch put requires multipart/form-data".to_string(),
                 )),
                 _ => Err((Status::BadRequest, "Invalid inputs".to_string())),
-            };
+        };
         crate::prometheus::observe_span(
             "server.kv.stage_inputs",
             if inputs_result.is_ok() { "ok" } else { "error" },
-            staging_start.elapsed(),
+            stage_inputs_start.elapsed(),
         );
         let inputs = inputs_result?;
         let invocation_info = i.0 .0.clone();
@@ -1484,6 +1512,7 @@ async fn emit_kv_hook_events(
 
 /// Read the request body as a JSON string.
 async fn read_json_body(data: DataIn<'_>) -> Result<String, (Status, String)> {
+    let start = Instant::now();
     match data {
         DataIn::One(d) => {
             let mut buf = Vec::new();
@@ -1492,9 +1521,23 @@ async fn read_json_body(data: DataIn<'_>) -> Result<String, (Status, String)> {
                 .read_to_end(&mut buf)
                 .await
                 .map_err(|e| (Status::BadRequest, e.to_string()))?;
-            String::from_utf8(buf).map_err(|e| (Status::BadRequest, e.to_string()))
+            let result = String::from_utf8(buf).map_err(|e| (Status::BadRequest, e.to_string()));
+            crate::prometheus::observe_stage(
+                crate::prometheus::InvocationStage::RequestDecode,
+                crate::prometheus::StageOutcome::from(result.is_ok()),
+                start.elapsed(),
+            );
+            result
         }
-        _ => Err((Status::BadRequest, "Expected JSON body".to_string())),
+        _ => {
+            let result = Err((Status::BadRequest, "Expected JSON body".to_string()));
+            crate::prometheus::observe_stage(
+                crate::prometheus::InvocationStage::RequestDecode,
+                crate::prometheus::StageOutcome::from(false),
+                start.elapsed(),
+            );
+            result
+        }
     }
 }
 
