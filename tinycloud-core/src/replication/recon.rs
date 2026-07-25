@@ -16,6 +16,28 @@ pub struct ReconInterest {
     pub range: String,
 }
 
+pub fn auth_recon_fingerprint(delegation_ids: &[String], revocation_ids: &[String]) -> String {
+    let mut delegation_ids = delegation_ids.to_vec();
+    let mut revocation_ids = revocation_ids.to_vec();
+    delegation_ids.sort();
+    revocation_ids.sort();
+
+    let mut hasher = Blake3Hasher::new();
+    for id in delegation_ids {
+        hasher.update(b"delegation");
+        hasher.update(&[0]);
+        hasher.update(id.as_bytes());
+        hasher.update(&[0xff]);
+    }
+    for id in revocation_ids {
+        hasher.update(b"revocation");
+        hasher.update(&[0]);
+        hasher.update(id.as_bytes());
+        hasher.update(&[0xff]);
+    }
+    encode_hash(hasher.finalize())
+}
+
 pub fn kv_recon_item(commit: &canonical_commit::Model) -> KvReconItem {
     let recon_key = KvReconKey::new(&commit.key, commit.invocation_id);
     KvReconItem {
@@ -263,5 +285,37 @@ fn split_child_status_label(status: &KvReconSplitChildStatus) -> &'static str {
         KvReconSplitChildStatus::LocalMissing => "local-missing",
         KvReconSplitChildStatus::PeerMissing => "peer-missing",
         KvReconSplitChildStatus::Mismatch => "mismatch",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::auth_recon_fingerprint;
+
+    #[test]
+    fn auth_fingerprint_is_order_independent_and_content_sensitive() {
+        let first = auth_recon_fingerprint(
+            &["delegation-b".to_string(), "delegation-a".to_string()],
+            &["revocation-a".to_string()],
+        );
+        let reordered = auth_recon_fingerprint(
+            &["delegation-a".to_string(), "delegation-b".to_string()],
+            &["revocation-a".to_string()],
+        );
+        let changed = auth_recon_fingerprint(
+            &["delegation-a".to_string(), "delegation-c".to_string()],
+            &["revocation-a".to_string()],
+        );
+
+        assert_eq!(first, reordered);
+        assert_ne!(first, changed);
+    }
+
+    #[test]
+    fn auth_fingerprint_separates_delegations_from_revocations() {
+        assert_ne!(
+            auth_recon_fingerprint(&["same-id".to_string()], &[]),
+            auth_recon_fingerprint(&[], &["same-id".to_string()])
+        );
     }
 }

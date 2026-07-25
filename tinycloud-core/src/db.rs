@@ -9,8 +9,8 @@ use crate::migrations::Migrator;
 use crate::models::*;
 use crate::relationships::*;
 use crate::replication::recon::{
-    kv_recon_fingerprint, kv_recon_item, sort_kv_recon_items, split_kv_recon_items,
-    window_kv_recon_items, window_kv_recon_split_children,
+    auth_recon_fingerprint, kv_recon_fingerprint, kv_recon_item, sort_kv_recon_items,
+    split_kv_recon_items, window_kv_recon_items, window_kv_recon_split_children,
 };
 use crate::replication::{
     decode_hash, encode_hash, AuthReplicationApplyResponse, AuthReplicationExportRequest,
@@ -1071,16 +1071,64 @@ where
                 .all(&self.conn)
                 .await?
                 .into_iter()
-                .map(|revocation| URL_SAFE.encode(&revocation.serialization))
+                .map(|revocation| {
+                    (
+                        encode_hash(revocation.id),
+                        URL_SAFE.encode(&revocation.serialization),
+                    )
+                })
                 .collect()
         };
+        let delegations = delegations
+            .into_iter()
+            .map(|(id, serialization)| (encode_hash(id), serialization))
+            .collect::<Vec<_>>();
+        let delegation_ids = delegations
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let revocation_ids = revocations
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let total_delegations = delegation_ids.len();
+        let total_revocations = revocation_ids.len();
+        let fingerprint = auth_recon_fingerprint(&delegation_ids, &revocation_ids);
+        let matches = request.known_fingerprint.as_deref() == Some(fingerprint.as_str());
+        let total_material_bytes = auth_material_bytes(&delegations, &revocations);
+        let known_delegation_ids = request
+            .known_delegation_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let known_revocation_ids = request
+            .known_revocation_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let (delegations, revocations) = if matches || request.inventory_only {
+            (Vec::new(), Vec::new())
+        } else {
+            (
+                auth_missing_material(delegations, &known_delegation_ids),
+                auth_missing_material(revocations, &known_revocation_ids),
+            )
+        };
+        let material_bytes = auth_material_bytes(&delegations, &revocations);
+        let (delegation_ids, delegations): (Vec<_>, Vec<_>) = delegations.into_iter().unzip();
+        let (revocation_ids, revocations): (Vec<_>, Vec<_>) = revocations.into_iter().unzip();
 
         Ok(AuthReplicationExportResponse {
             space_id: request.space_id.clone(),
-            delegations: delegations
-                .into_iter()
-                .map(|(_, delegation)| delegation)
-                .collect(),
+            fingerprint,
+            matches,
+            total_delegations,
+            total_revocations,
+            total_material_bytes,
+            material_bytes,
+            delegation_ids,
+            delegations,
+            revocation_ids,
             revocations,
         })
     }
@@ -1154,6 +1202,12 @@ where
             peer_url: None,
             imported_delegations,
             imported_revocations,
+            matched: export.matches,
+            local_fingerprint: None,
+            peer_fingerprint: (!export.fingerprint.is_empty()).then(|| export.fingerprint.clone()),
+            transferred_bytes: 0,
+            transferred_material_bytes: export.material_bytes,
+            peer_total_material_bytes: export.total_material_bytes,
         })
     }
 
@@ -2177,6 +2231,27 @@ fn delegation_matches_space(abilities: &[abilities::Model], space_id: &SpaceId) 
         .any(|ability| auth_resource_matches_space(&ability.resource, space_id))
 }
 
+fn auth_missing_material(
+    material: Vec<(String, String)>,
+    known_ids: &HashSet<&str>,
+) -> Vec<(String, String)> {
+    material
+        .into_iter()
+        .filter(|(id, _)| !known_ids.contains(id.as_str()))
+        .collect()
+}
+
+fn auth_material_bytes(
+    delegations: &[(String, String)],
+    revocations: &[(String, String)],
+) -> usize {
+    delegations
+        .iter()
+        .chain(revocations)
+        .map(|(_, serialization)| serialization.len())
+        .sum()
+}
+
 fn auth_resource_matches_space(resource: &Resource, space_id: &SpaceId) -> bool {
     let Some(resource) = resource.tinycloud_resource() else {
         return false;
@@ -3095,5 +3170,28 @@ mod test {
     #[tokio::test]
     async fn basic() {
         let _db = get_db().await.unwrap();
+    }
+
+    #[test]
+    fn auth_missing_material_only_returns_unknown_facts_in_dependency_order() {
+        let material = vec![
+            ("parent".to_string(), "parent-header".to_string()),
+            ("child".to_string(), "child-header".to_string()),
+            ("new-child".to_string(), "new-child-header".to_string()),
+        ];
+        let known = HashSet::from(["parent", "child"]);
+
+        assert_eq!(
+            auth_missing_material(material, &known),
+            vec![("new-child".to_string(), "new-child-header".to_string())]
+        );
+    }
+
+    #[test]
+    fn auth_material_bytes_counts_serialized_facts_only() {
+        let delegations = vec![("delegation".to_string(), "1234".to_string())];
+        let revocations = vec![("revocation".to_string(), "567".to_string())];
+
+        assert_eq!(auth_material_bytes(&delegations, &revocations), 7);
     }
 }
