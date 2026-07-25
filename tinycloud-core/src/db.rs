@@ -8,8 +8,8 @@ use crate::read_audit::ReadAuditPipeline;
 use crate::relationships::*;
 use crate::sql_sizes::SqlSizes;
 use crate::storage::{
-    either::EitherError, Content, HashBuffer, ImmutableReadStore, ImmutableStaging,
-    ImmutableWriteStore, StorageSetup, StoreSize,
+    either::EitherError, ByteRangeSpec, Content, HashBuffer, ImmutableReadStore, ImmutableStaging,
+    ImmutableWriteStore, RangeRead, StorageSetup, StoreSize,
 };
 use crate::types::{
     AccountDelegationRecord, CapabilitiesReadParams, DelegationQuery, DelegationQueryDirection,
@@ -707,6 +707,38 @@ where
         key: &Path,
     ) -> Result<Option<(Metadata, Hash, Content<B::Readable>)>, EitherError<DbErr, B::Error>> {
         get_kv(&self.conn, &self.storage, space_id, key).await
+    }
+
+    pub async fn kv_get_range(
+        &self,
+        space_id: &SpaceId,
+        key: &Path,
+        range: ByteRangeSpec,
+    ) -> Result<Option<(Metadata, Hash, RangeRead<B::Readable>)>, EitherError<DbErr, B::Error>>
+    {
+        let Some((metadata, hash)) = metadata_with_hash(&self.conn, space_id, key)
+            .await
+            .map_err(EitherError::A)?
+        else {
+            return Ok(None);
+        };
+        let Some(content) = self
+            .storage
+            .read_range(space_id, &hash, range)
+            .await
+            .map_err(EitherError::B)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((metadata, hash, content)))
+    }
+
+    pub async fn kv_metadata_with_hash(
+        &self,
+        space_id: &SpaceId,
+        key: &Path,
+    ) -> Result<Option<(Metadata, Hash)>, DbErr> {
+        metadata_with_hash(&self.conn, space_id, key).await
     }
 
     pub async fn public_kv_metadata(

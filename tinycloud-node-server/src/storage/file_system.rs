@@ -10,14 +10,17 @@ use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    io::{Error as IoError, ErrorKind},
+    io::{Error as IoError, ErrorKind, SeekFrom},
     path::{Path, PathBuf},
     time::Instant,
 };
 use tempfile::{NamedTempFile, PathPersistError};
 use tinycloud_auth::{resource::SpaceId, ssi::dids::DIDBuf};
 use tinycloud_core::{hash::Hash, storage::*};
-use tokio::fs::{create_dir_all, metadata, remove_file, File};
+use tokio::{
+    fs::{create_dir_all, metadata, remove_file, File},
+    io::{AsyncReadExt, AsyncSeekExt},
+};
 use tokio_stream::wrappers::ReadDirStream;
 
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
@@ -109,7 +112,7 @@ pub enum FileSystemStoreError {
 #[async_trait]
 impl ImmutableReadStore for FileSystemStore {
     type Error = FileSystemStoreError;
-    type Readable = Compat<File>;
+    type Readable = Compat<tokio::io::Take<File>>;
     async fn contains(&self, space: &SpaceId, id: &Hash) -> Result<bool, Self::Error> {
         Ok(self.get_path(space, id).exists())
     }
@@ -120,7 +123,10 @@ impl ImmutableReadStore for FileSystemStore {
     ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
         let start = Instant::now();
         let result = match File::open(self.get_path(space, id)).await {
-            Ok(f) => Ok(Some(Content::new(f.metadata().await?.len(), f.compat()))),
+            Ok(file) => {
+                let size = file.metadata().await?.len();
+                Ok(Some(Content::new(size, file.take(size).compat())))
+            }
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         };
@@ -130,6 +136,31 @@ impl ImmutableReadStore for FileSystemStore {
             start.elapsed(),
         );
         result
+    }
+
+    async fn read_range(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        range: ByteRangeSpec,
+    ) -> Result<Option<RangeRead<Self::Readable>>, Self::Error> {
+        match File::open(self.get_path(space, id)).await {
+            Ok(mut file) => {
+                let total_size = file.metadata().await?.len();
+                let Some(range) = range.resolve(total_size) else {
+                    return Ok(Some(RangeRead::Unsatisfiable { total_size }));
+                };
+                file.seek(SeekFrom::Start(range.start())).await?;
+                let content = Content::new(range.len(), file.take(range.len()).compat());
+                Ok(Some(RangeRead::Content {
+                    total_size,
+                    range,
+                    content,
+                }))
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -414,6 +445,44 @@ mod test {
             store.read_to_vec(&space_id, &hash).await.unwrap().unwrap(),
             data
         );
+
+        let range_read = store
+            .read_range(
+                &space_id,
+                &hash,
+                ByteRangeSpec::Inclusive { start: 6, end: 10 },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let RangeRead::Content {
+            total_size,
+            range,
+            mut content,
+        } = range_read
+        else {
+            panic!("expected satisfiable range");
+        };
+        let mut range_buf = Vec::new();
+        content.read_to_end(&mut range_buf).await.unwrap();
+        assert_eq!(total_size, data.len() as u64);
+        assert_eq!(
+            range,
+            ByteRangeSpec::Inclusive { start: 6, end: 10 }
+                .resolve(data.len() as u64)
+                .unwrap()
+        );
+        assert_eq!(range_buf, b"world");
+
+        assert!(matches!(
+            store
+                .read_range(&space_id, &hash, ByteRangeSpec::From { start: 99 })
+                .await
+                .unwrap()
+                .unwrap(),
+            RangeRead::Unsatisfiable { total_size: 11 }
+        ));
+
         assert_eq!(store.remove(&space_id, &hash).await.unwrap(), Some(()));
         assert_eq!(store.remove(&space_id, &hash).await.unwrap(), None);
         assert!(!store.contains(&space_id, &hash).await.unwrap());

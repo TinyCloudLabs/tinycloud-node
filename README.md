@@ -34,7 +34,7 @@ The SDK checks this endpoint during sign-in and requires an exact protocol versi
 | `GET` | `/version` | No | Protocol version and feature discovery |
 | `POST` | `/invoke` | Yes | Execute KV operations (get, put, list, delete) |
 | `POST` | `/signed/kv` | Yes | Create an expiring signed URL for an exact KV object read |
-| `GET` | `/signed/kv/<ticketId>` | Signed URL ticket | Fetch a KV object through a signed URL |
+| `GET` | `/signed/kv/<ticketId>` | Signed URL ticket | Fetch a KV object, including single byte ranges |
 | `POST` | `/delegate` | Yes | Create capability delegations |
 | `GET` | `/peer/generate/<space>` | No | Generate space host key pair |
 | `GET` | `/healthz` | No | Health check |
@@ -61,9 +61,21 @@ The response includes a short relative `url`, opaque `ticketId`, and RFC3339 `ex
 }
 ```
 
-The node stores the ticket durably in its database with the exact KV scope, issuer/subject DID, ability, service, creation and expiry timestamps, parent expiry metadata, optional hash/ETag binding, and proof metadata. The bearer URL does not contain the space, path, or signed claims. Reads load the ticket, validate expiry and scope, then perform a private KV read; signed KV URLs are not limited to public spaces.
+The node stores the ticket durably in its database with the exact KV scope, issuer/subject DID, ability, service, creation and expiry timestamps, content hash/ETag binding, parent expiry metadata, and proof metadata. If the request omits `contentHash` and `etag`, the node binds the ticket to the current object hash. The bearer URL does not contain the space, path, or signed claims. Reads load the ticket, validate expiry and scope, then perform a private KV read; signed KV URLs are not limited to public spaces.
 
 Ticket expiry is the earliest of the requested TTL, node maximum TTL, invocation expiry, and parent delegation expiry when known. `maxUses` is rejected in v1 because limited-use URLs need durable counters and replay protection to stay correct across restarts and multi-node deployments.
+
+Signed KV reads support one standard HTTP byte range at a time:
+
+```http
+GET /signed/kv/JUWkXuA4mqnxDVXcaxXoVME8uYUTumgmuwbllQFxHnQ
+Range: bytes=1048576-2097151
+If-Range: "blake3-<64 hex characters>"
+```
+
+A satisfiable range returns `206 Partial Content` with `Accept-Ranges: bytes`, `Content-Range`, `Content-Length`, and the strong TinyCloud `ETag`. An out-of-bounds range returns `416 Range Not Satisfiable`. If `If-Range` does not match, the node returns the full object. Filesystem reads seek to the requested offset and S3 reads use an object-store range request, so the node does not read or proxy the omitted bytes.
+
+With telemetry enabled, backend time-to-first-byte is recorded under the `server.signed_kv.kv_get_range` span. `tinycloud_signed_kv_bytes_total{measure="object"}` and `{measure="served"}` expose the transfer reduction from range reads.
 
 ## Quickstart
 
