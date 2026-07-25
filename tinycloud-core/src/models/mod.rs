@@ -1,5 +1,6 @@
 pub mod abilities;
 pub mod actor;
+pub mod current_kv;
 pub mod database_artifact;
 pub mod delegation;
 pub(crate) mod did_resolution;
