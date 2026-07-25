@@ -4,6 +4,7 @@ use crate::hash::Hash;
 use crate::keys::{get_did_key, Secrets};
 use crate::migrations::Migrator;
 use crate::models::*;
+use crate::read_audit::ReadAuditPipeline;
 use crate::relationships::*;
 use crate::sql_sizes::SqlSizes;
 use crate::storage::{
@@ -20,13 +21,14 @@ use sea_orm::{
     entity::prelude::*,
     error::{DbErr, RuntimeErr, SqlxError},
     query::*,
-    sea_query::{Alias, Expr, LikeExpr, OnConflict, Query},
+    sea_query::{Expr, LikeExpr, OnConflict, Query},
     ActiveValue::Set,
     ConnectionTrait, DatabaseTransaction, IntoActiveModel, TransactionTrait,
 };
 use sea_orm_migration::MigratorTrait;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_auth::{
     authorization::{EncodingError, TinyCloudDelegation},
@@ -73,6 +75,8 @@ pub struct SpaceDatabase<C, B, S> {
     sql_sizes: SqlSizes,
     revocation_chain_locks: Arc<tokio::sync::Mutex<HashMap<Hash, Weak<tokio::sync::Mutex<()>>>>>,
     kv_object_locks: KvObjectLockRegistry,
+    writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
+    read_audit: ReadAuditPipeline,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +204,9 @@ where
 impl<B, K> SpaceDatabase<DatabaseConnection, B, K> {
     pub async fn new(conn: DatabaseConnection, storage: B, secrets: K) -> Result<Self, DbErr> {
         Migrator::up(&conn, None).await?;
+        let writer_lock = (conn.get_database_backend() == sea_orm::DatabaseBackend::Sqlite)
+            .then(|| Arc::new(tokio::sync::Mutex::new(())));
+        let read_audit = ReadAuditPipeline::start(conn.clone(), writer_lock.clone());
         Ok(Self {
             conn,
             storage,
@@ -208,6 +215,8 @@ impl<B, K> SpaceDatabase<DatabaseConnection, B, K> {
             sql_sizes: SqlSizes::default(),
             revocation_chain_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             kv_object_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            writer_lock,
+            read_audit,
         })
     }
 
@@ -226,6 +235,11 @@ impl<C, B, K> SpaceDatabase<C, B, K>
 where
     K: Secrets,
 {
+    /// Number of durable read-audit records and group commits completed.
+    pub fn read_audit_commit_stats(&self) -> (u64, u64) {
+        self.read_audit.stats()
+    }
+
     pub async fn stage_key(&self, space_id: &SpaceId) -> Result<String, K::Error> {
         self.secrets.stage_keypair(space_id).await.map(get_did_key)
     }
@@ -735,7 +749,7 @@ where
         &self,
         roots: &[Hash],
     ) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>, TxError<B, K>> {
-        let mut keys = revocation::ancestor_chain_ids_for_roots(&self.conn, roots)
+        let keys = revocation::ancestor_chain_ids_for_roots(&self.conn, roots)
             .await
             .map_err(|error| match error {
                 revocation::ChainTraversalError::Db(error) => TxError::Db(error),
@@ -743,6 +757,13 @@ where
                     TxError::ChainTraversalLimitExceeded
                 }
             })?;
+        Ok(self.acquire_chain_guards_for_keys(keys).await)
+    }
+
+    async fn acquire_chain_guards_for_keys(
+        &self,
+        mut keys: Vec<Hash>,
+    ) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
         keys.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
         keys.dedup();
 
@@ -766,7 +787,7 @@ where
         for lock in locks {
             guards.push(lock.lock_owned().await);
         }
-        Ok(guards)
+        guards
     }
 
     async fn acquire_kv_object_guards(
@@ -806,6 +827,10 @@ where
     }
 
     async fn transact(&self, events: Vec<Event>) -> Result<TransactResult, TxError<B, K>> {
+        let _writer = match &self.writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         let tx = self
             .conn
             .begin_with_config(chain_isolation_level(&self.conn), None)
@@ -817,10 +842,18 @@ where
             &self.secrets,
             events,
             self.encryption.as_ref(),
+            None,
         )
         .await?;
 
-        tx.commit().await?;
+        let start = Instant::now();
+        let commit_result = tx.commit().await;
+        crate::telemetry::observe_stage(
+            crate::telemetry::InvocationStage::EpochPersist,
+            crate::telemetry::StageOutcome::from(commit_result.is_ok()),
+            start.elapsed(),
+        );
+        commit_result?;
 
         Ok(result)
     }
@@ -833,7 +866,14 @@ where
             .copied()
             .map(Hash::from)
             .collect();
-        let _chain_guards = self.acquire_chain_guards(&roots).await?;
+        let authz_start = Instant::now();
+        let chain_guards = self.acquire_chain_guards(&roots).await;
+        crate::telemetry::observe_stage(
+            crate::telemetry::InvocationStage::AuthorizationGraphLoad,
+            crate::telemetry::StageOutcome::from(chain_guards.is_ok()),
+            authz_start.elapsed(),
+        );
+        let _chain_guards = chain_guards?;
         self.transact(vec![Event::Delegation(Box::new(delegation))])
             .await
     }
@@ -841,7 +881,14 @@ where
     pub async fn revoke(&self, revocation: Revocation) -> Result<TransactResult, TxError<B, K>> {
         let mut roots = vec![Hash::from(revocation.0.revoked)];
         roots.extend(revocation.0.parents.iter().copied().map(Hash::from));
-        let _chain_guards = self.acquire_chain_guards(&roots).await?;
+        let revocation_start = Instant::now();
+        let chain_guards = self.acquire_chain_guards(&roots).await;
+        crate::telemetry::observe_stage(
+            crate::telemetry::InvocationStage::RevocationWork,
+            crate::telemetry::StageOutcome::from(chain_guards.is_ok()),
+            revocation_start.elapsed(),
+        );
+        let _chain_guards = chain_guards?;
         self.transact(vec![Event::Revocation(Box::new(revocation))])
             .await
     }
@@ -964,7 +1011,28 @@ where
             .copied()
             .map(Hash::from)
             .collect();
-        let _chain_guards = self.acquire_chain_guards(&roots).await?;
+        let authz_start = Instant::now();
+        let lock_keys = crate::auth_graph::load_closure_edges(&self.conn, &roots)
+            .await
+            .map(|(keys, _)| keys)
+            .map_err(|error| match error {
+                revocation::ChainTraversalError::Db(error) => TxError::Db(error),
+                revocation::ChainTraversalError::LimitExceeded => {
+                    TxError::ChainTraversalLimitExceeded
+                }
+            });
+        let lock_keys = match lock_keys {
+            Ok(keys) => keys,
+            Err(error) => {
+                crate::telemetry::observe_stage(
+                    crate::telemetry::InvocationStage::AuthorizationGraphLoad,
+                    crate::telemetry::StageOutcome::Error,
+                    authz_start.elapsed(),
+                );
+                return Err(TxStoreError::Tx(error));
+            }
+        };
+        let _chain_guards = self.acquire_chain_guards_for_keys(lock_keys).await;
         let mutation_keys = invocation
             .0
             .capabilities
@@ -981,6 +1049,9 @@ where
                 Some((resource.space().clone(), resource.path()?.clone()))
             })
             .collect::<Vec<_>>();
+        if mutation_keys.is_empty() {
+            return self.invoke_read_only::<S>(invocation, options).await;
+        }
         let _kv_object_guards = self.acquire_kv_object_guards(&mutation_keys).await;
         let mut stages = HashMap::new();
         let mut ops = Vec::new();
@@ -1035,7 +1106,32 @@ where
         } else {
             chain_isolation_level(&self.conn)
         };
+        let _writer = match &self.writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         let tx = self.conn.begin_with_config(isolation_level, None).await?;
+        let auth_graph = match crate::auth_graph::AuthGraphSnapshot::load(&tx, &roots).await {
+            Ok(graph) => graph,
+            Err(error) => {
+                crate::telemetry::observe_stage(
+                    crate::telemetry::InvocationStage::AuthorizationGraphLoad,
+                    crate::telemetry::StageOutcome::Error,
+                    authz_start.elapsed(),
+                );
+                return Err(TxStoreError::Tx(match error {
+                    revocation::ChainTraversalError::Db(error) => TxError::Db(error),
+                    revocation::ChainTraversalError::LimitExceeded => {
+                        TxError::ChainTraversalLimitExceeded
+                    }
+                }));
+            }
+        };
+        crate::telemetry::observe_stage(
+            crate::telemetry::InvocationStage::AuthorizationGraphLoad,
+            crate::telemetry::StageOutcome::Ok,
+            authz_start.elapsed(),
+        );
         let mut deleted_hashes = HashMap::new();
         for key @ (space, path) in &mutation_keys {
             let current = get_kv_entity(&tx, space, path)
@@ -1074,6 +1170,7 @@ where
             &self.secrets,
             vec![Event::Invocation(Box::new(invocation), ops)],
             self.encryption.as_ref(),
+            Some(&auth_graph),
         )
         .await
         .map_err(|error| {
@@ -1198,6 +1295,143 @@ where
         })?;
         Ok((commit, results))
     }
+
+    /// Execute a successful non-mutating invocation without entering the
+    /// single-writer transaction. Authorization and data access remain under
+    /// the chain guard; the response waits for the grouped audit commit.
+    async fn invoke_read_only<S>(
+        &self,
+        invocation: Invocation,
+        options: KvInvokeOptions,
+    ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
+    where
+        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
+        invocation::verify_and_authorize(&self.conn, &invocation.0, OffsetDateTime::now_utc())
+            .await
+            .map_err(TxError::<B, K>::from)?;
+
+        let requested_spaces = invocation.0.spaces().cloned().collect::<HashSet<_>>();
+        if !requested_spaces.is_empty() {
+            let hosted = space::Entity::find()
+                .filter(space::Column::Id.is_in(requested_spaces.iter().cloned().map(SpaceIdWrap)))
+                .count(&self.conn)
+                .await?;
+            if hosted != requested_spaces.len() as u64 {
+                return Err(TxError::SpaceNotFound.into());
+            }
+        }
+
+        let caps_read_params: Option<CapabilitiesReadParams> = invocation
+            .0
+            .invocation
+            .payload()
+            .facts
+            .as_ref()
+            .and_then(|facts| {
+                facts.iter().find_map(|fact| {
+                    fact.as_object()
+                        .and_then(|object| object.get("capabilitiesReadParams"))
+                        .and_then(|value| serde_json::from_value(value.clone()).ok())
+                })
+            });
+        let mut results = Vec::new();
+        for cap in invocation.0.capabilities.iter().filter_map(|capability| {
+            capability
+                .resource
+                .tinycloud_resource()
+                .and_then(|resource| {
+                    Some((
+                        resource.space(),
+                        resource.service().as_str(),
+                        crate::policy_capability::resolve_alias(
+                            capability.ability.as_ref().as_ref(),
+                        ),
+                        resource.path()?,
+                    ))
+                })
+        }) {
+            match cap {
+                (space, "kv", "tinycloud.kv/get", path) => {
+                    let data = get_kv(&self.conn, &self.storage, space, path)
+                        .await
+                        .map_err(|error| match error {
+                            EitherError::A(error) => TxStoreError::Tx(error.into()),
+                            EitherError::B(error) => TxStoreError::StoreRead(error),
+                        })?;
+                    if let (Some(limit), Some((_, _, content))) =
+                        (options.max_response_bytes, data.as_ref())
+                    {
+                        if content.len() > limit {
+                            return Err(TxStoreError::KvResponseTooLarge {
+                                size: content.len(),
+                                limit,
+                            });
+                        }
+                    }
+                    results.push(InvocationOutcome::KvRead(data));
+                }
+                (space, "kv", "tinycloud.kv/list", path) => {
+                    let (list, truncated) =
+                        list_bounded(&self.conn, space, path, options.list_limit).await?;
+                    results.push(InvocationOutcome::KvList(list, truncated));
+                }
+                (space, "kv", "tinycloud.kv/metadata", path) => {
+                    results.push(InvocationOutcome::KvMetadata(
+                        metadata_with_hash(&self.conn, space, path).await?,
+                    ));
+                }
+                (space, "capabilities", "tinycloud.capabilities/read", path)
+                    if path.as_str() == "all" =>
+                {
+                    let outcome = match &caps_read_params {
+                        None => {
+                            get_valid_delegations(&self.conn, space, self.encryption.as_ref())
+                                .await?
+                        }
+                        Some(CapabilitiesReadParams::List { filters }) => {
+                            get_filtered_delegations(
+                                &self.conn,
+                                space,
+                                &invocation.0.invoker,
+                                filters.as_ref(),
+                                self.encryption.as_ref(),
+                            )
+                            .await?
+                        }
+                        Some(CapabilitiesReadParams::Chain { delegation_cid }) => {
+                            results.push(InvocationOutcome::DelegationChain(
+                                get_delegation_chain(
+                                    &self.conn,
+                                    space,
+                                    delegation_cid,
+                                    self.encryption.as_ref(),
+                                )
+                                .await?,
+                            ));
+                            continue;
+                        }
+                    };
+                    results.push(InvocationOutcome::OpenSessions(outcome));
+                }
+                _ => {}
+            }
+        }
+
+        self.read_audit
+            .record(&invocation, self.encryption.as_ref())
+            .await?;
+        Ok((
+            TransactResult {
+                commits: HashMap::new(),
+                skipped_spaces: Vec::new(),
+                delegation_cids: Vec::new(),
+            },
+            results,
+        ))
+    }
 }
 
 fn chain_isolation_level<C: ConnectionTrait>(db: &C) -> Option<sea_orm::IsolationLevel> {
@@ -1256,6 +1490,7 @@ pub enum InvocationOutcome<R> {
     KvMetadata(Option<(Metadata, Hash)>),
     KvWrite(Hash),
     KvBatchWrite(Vec<Path>),
+    KvBatchRead(Vec<KvBatchReadItem>),
     KvRead(Option<(Metadata, Hash, Content<R>)>),
     OpenSessions(HashMap<Hash, DelegationInfo>),
     /// Ordered delegation chain from leaf to root
@@ -1265,6 +1500,19 @@ pub enum InvocationOutcome<R> {
     DuckDbResult(serde_json::Value),
     DuckDbExport(Vec<u8>),
     DuckDbArrow(Vec<u8>),
+}
+
+#[derive(Debug)]
+pub struct KvBatchReadItem {
+    pub path: Path,
+    pub value: Option<KvBatchReadValue>,
+}
+
+#[derive(Debug)]
+pub struct KvBatchReadValue {
+    pub metadata: Metadata,
+    pub hash: Hash,
+    pub data: Option<Vec<u8>>,
 }
 
 impl<S: StorageSetup, K: Secrets> From<delegation::Error> for TxError<S, K> {
@@ -1349,6 +1597,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     secrets: &K,
     events: Vec<Event>,
     encryption: Option<&ColumnEncryption>,
+    auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
 ) -> Result<TransactResult, TxError<S, K>> {
     // for each event, get the hash and the relevent space(s)
     let event_hashes = events
@@ -1640,6 +1889,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                             })
                             .collect(),
                         encryption,
+                        auth_graph,
                     )
                     .await?;
                 }
@@ -1689,7 +1939,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                     delegation_cids.push(cid);
                 }
                 Event::Invocation(i, _ops) => {
-                    invocation::process(db, *i, Vec::new(), encryption).await?;
+                    invocation::process(db, *i, Vec::new(), encryption, auth_graph).await?;
                 }
                 Event::Revocation(r) => {
                     revocation::process(db, *r).await?;
@@ -1732,54 +1982,6 @@ async fn list_bounded<C: ConnectionTrait>(
     prefix: &Path,
     limit: Option<usize>,
 ) -> Result<(Vec<Path>, bool), DbErr> {
-    let newer = Alias::new("newer_kv_write");
-    let newer_order = Condition::any()
-        .add(
-            Expr::col((newer.clone(), kv_write::Column::Seq))
-                .gt(Expr::col((kv_write::Entity, kv_write::Column::Seq))),
-        )
-        .add(
-            Condition::all()
-                .add(
-                    Expr::col((newer.clone(), kv_write::Column::Seq))
-                        .equals((kv_write::Entity, kv_write::Column::Seq)),
-                )
-                .add(
-                    Expr::col((newer.clone(), kv_write::Column::Epoch))
-                        .gt(Expr::col((kv_write::Entity, kv_write::Column::Epoch))),
-                ),
-        )
-        .add(
-            Condition::all()
-                .add(
-                    Expr::col((newer.clone(), kv_write::Column::Seq))
-                        .equals((kv_write::Entity, kv_write::Column::Seq)),
-                )
-                .add(
-                    Expr::col((newer.clone(), kv_write::Column::Epoch))
-                        .equals((kv_write::Entity, kv_write::Column::Epoch)),
-                )
-                .add(
-                    Expr::col((newer.clone(), kv_write::Column::EpochSeq))
-                        .gt(Expr::col((kv_write::Entity, kv_write::Column::EpochSeq))),
-                ),
-        );
-    let newer_write = Query::select()
-        .expr(Expr::val(1))
-        .from_as(kv_write::Entity, newer.clone())
-        .cond_where(
-            Condition::all()
-                .add(
-                    Expr::col((newer.clone(), kv_write::Column::Space))
-                        .equals((kv_write::Entity, kv_write::Column::Space)),
-                )
-                .add(
-                    Expr::col((newer.clone(), kv_write::Column::Key))
-                        .equals((kv_write::Entity, kv_write::Column::Key)),
-                )
-                .add(newer_order),
-        )
-        .to_owned();
     let escaped_prefix = prefix
         .as_str()
         .replace('!', "!!")
@@ -1787,38 +1989,21 @@ async fn list_bounded<C: ConnectionTrait>(
         .replace('_', "!_");
     let mut query = Query::select();
     query
-        .column((kv_write::Entity, kv_write::Column::Key))
-        .from(kv_write::Entity)
-        .left_join(
-            kv_delete::Entity,
-            Condition::all()
-                .add(
-                    Expr::col((kv_write::Entity, kv_write::Column::Space))
-                        .equals((kv_delete::Entity, kv_delete::Column::Space)),
-                )
-                .add(
-                    Expr::col((kv_write::Entity, kv_write::Column::Key))
-                        .equals((kv_delete::Entity, kv_delete::Column::Key)),
-                )
-                .add(
-                    Expr::col((kv_write::Entity, kv_write::Column::Invocation))
-                        .equals((kv_delete::Entity, kv_delete::Column::DeletedInvocationId)),
-                ),
-        )
+        .column((current_kv::Entity, current_kv::Column::Key))
+        .from(current_kv::Entity)
         .cond_where(
             Condition::all()
+                .add(Expr::col(current_kv::Column::Deleted).eq(false))
                 .add(
-                    Expr::col((kv_write::Entity, kv_write::Column::Key))
+                    Expr::col((current_kv::Entity, current_kv::Column::Key))
                         .like(LikeExpr::new(format!("{escaped_prefix}%")).escape('!')),
                 )
                 .add(
-                    Expr::col((kv_write::Entity, kv_write::Column::Space))
+                    Expr::col((current_kv::Entity, current_kv::Column::Space))
                         .eq(SpaceIdWrap(space_id.clone())),
-                )
-                .add(Expr::col((kv_delete::Entity, kv_delete::Column::InvocationId)).is_null())
-                .add(Condition::all().not().add(Expr::exists(newer_write))),
+                ),
         )
-        .order_by((kv_write::Entity, kv_write::Column::Key), Order::Asc);
+        .order_by((current_kv::Entity, current_kv::Column::Key), Order::Asc);
     if let Some(limit) = limit {
         query.limit(limit.saturating_add(1) as u64);
     }
@@ -1826,7 +2011,7 @@ async fn list_bounded<C: ConnectionTrait>(
         .query_all(db.get_database_backend().build(&query))
         .await?
         .into_iter()
-        .map(|row| row.try_get::<String>("", kv_write::Column::Key.as_str()))
+        .map(|row| row.try_get::<String>("", current_kv::Column::Key.as_str()))
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .map(|key| key.parse())
@@ -1892,41 +2077,32 @@ async fn get_kv_entity<C: ConnectionTrait>(
     space_id: &SpaceId,
     key: &Path,
     // TODO version: Option<(i64, Hash, i64)>,
-) -> Result<Option<kv_write::Model>, DbErr> {
-    // Ok(if let Some((seq, epoch, epoch_seq)) = version {
-    //     event_order::Entity::find_by_id((epoch, epoch_seq, space_id.clone().into()))
-    //         .reverse_join(kv_write::Entity)
-    //         .find_also_related(kv_delete::Entity)
-    //         .filter(
-    //             Condition::all()
-    //                 .add(kv_write::Column::Key.eq(key))
-    //                 .add(kv_write::Column::Space.eq(space_id.clone().into()))
-    //                 .add(kv_delete::Column::InvocationId.is_null()),
-    //         )
-    //         .one(db)
-    //         .await?
-    //         .map(|(kv, _)| kv)
-    // } else {
-    // A delete tombstones the latest write. Select that write before checking
-    // its tombstone so older versions cannot reappear after deletion.
-    Ok(
-        match kv_write::Entity::find()
-            .filter(
-                Condition::all()
-                    .add(kv_write::Column::Key.eq(key.as_str()))
-                    .add(kv_write::Column::Space.eq(SpaceIdWrap(space_id.clone()))),
-            )
-            .order_by_desc(kv_write::Column::Seq)
-            .order_by_desc(kv_write::Column::Epoch)
-            .order_by_desc(kv_write::Column::EpochSeq)
-            .find_also_related(kv_delete::Entity)
-            .one(db)
-            .await?
-        {
-            Some((_, Some(_))) | None => None,
-            Some((kv, None)) => Some(kv),
-        },
-    )
+) -> Result<Option<current_kv::Model>, DbErr> {
+    let start = Instant::now();
+    let query_result = current_kv::Entity::find_by_id((
+        SpaceIdWrap(space_id.clone()),
+        crate::types::Path(key.clone()),
+    ))
+    .filter(current_kv::Column::Deleted.eq(false))
+    .one(db)
+    .await;
+    let result = match query_result {
+        Ok(entry) => entry,
+        Err(error) => {
+            crate::telemetry::observe_stage(
+                crate::telemetry::InvocationStage::KvIndexLookup,
+                crate::telemetry::StageOutcome::Error,
+                start.elapsed(),
+            );
+            return Err(error);
+        }
+    };
+    crate::telemetry::observe_stage(
+        crate::telemetry::InvocationStage::KvIndexLookup,
+        crate::telemetry::StageOutcome::Ok,
+        start.elapsed(),
+    );
+    Ok(result)
 }
 
 async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
@@ -2642,7 +2818,7 @@ mod test {
 
     #[tokio::test]
     async fn bounded_kv_list_counts_distinct_keys_in_order() {
-        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+        use sea_orm::ActiveValue::Set;
 
         let db = get_db().await.unwrap();
         let space = test_space_id("bounded-kv-list");
@@ -2661,9 +2837,19 @@ mod test {
         .unwrap();
 
         let shared_value = crate::hash::hash(b"shared-value");
-        for (index, key) in ["a", "a", "b", "c", "literal%key", "literalXkey"]
-            .into_iter()
-            .enumerate()
+        for (index, key) in [
+            "a",
+            "a",
+            "b",
+            "c",
+            "literal%key",
+            "literalXkey",
+            "literal_key",
+            "bang!key",
+            "bangXkey",
+        ]
+        .into_iter()
+        .enumerate()
         {
             let invocation_id = crate::hash::hash(format!("invocation-{index}").as_bytes());
             let epoch_id = crate::hash::hash(format!("epoch-{index}").as_bytes());
@@ -2695,19 +2881,23 @@ mod test {
             .insert(&db.conn)
             .await
             .unwrap();
-            kv_write::ActiveModel {
-                space: Set(SpaceIdWrap(space.clone())),
-                key: Set(key.parse::<Path>().unwrap().into()),
-                invocation: Set(invocation_id),
-                seq: Set(index as i64),
-                epoch: Set(epoch_id),
-                epoch_seq: Set(0),
-                value: Set(shared_value),
-                metadata: Set(Metadata(std::collections::BTreeMap::new())),
-            }
-            .insert(&db.conn)
-            .await
-            .unwrap();
+            let write = kv_write::Model {
+                space: SpaceIdWrap(space.clone()),
+                key: key.parse::<Path>().unwrap().into(),
+                invocation: invocation_id,
+                seq: index as i64,
+                epoch: epoch_id,
+                epoch_seq: 0,
+                value: shared_value,
+                metadata: Metadata(std::collections::BTreeMap::new()),
+            };
+            kv_write::ActiveModel::from(write.clone())
+                .insert(&db.conn)
+                .await
+                .unwrap();
+            invocation::upsert_current_kv(&db.conn, write)
+                .await
+                .unwrap();
         }
 
         let (paths, truncated) = list_bounded(&db.conn, &space, &"".parse().unwrap(), Some(2))
@@ -2724,7 +2914,7 @@ mod test {
             .unwrap();
         assert_eq!(
             paths.iter().map(Path::as_str).collect::<Vec<_>>(),
-            vec!["a", "b", "c"]
+            vec!["a", "b", "bang!key"]
         );
         assert!(truncated);
         assert_eq!(
@@ -2754,6 +2944,18 @@ mod test {
         );
         assert!(!truncated);
 
+        for (prefix, expected) in [
+            ("literal_", vec!["literal_key"]),
+            ("bang!", vec!["bang!key"]),
+        ] {
+            let (paths, truncated) =
+                list_bounded(&db.conn, &space, &prefix.parse().unwrap(), Some(10))
+                    .await
+                    .unwrap();
+            assert_eq!(paths.iter().map(Path::as_str).collect::<Vec<_>>(), expected);
+            assert!(!truncated);
+        }
+
         let delete_invocation = crate::hash::hash(b"delete-invocation");
         invocation::ActiveModel {
             id: Set(delete_invocation),
@@ -2763,6 +2965,14 @@ mod test {
             serialization: Set(vec![6]),
         }
         .insert(&db.conn)
+        .await
+        .unwrap();
+        invocation::delete_current_kv_if_invocation(
+            &db.conn,
+            &SpaceIdWrap(space.clone()),
+            "a",
+            crate::hash::hash(b"invocation-1"),
+        )
         .await
         .unwrap();
         kv_delete::ActiveModel {
@@ -2784,9 +2994,122 @@ mod test {
             .unwrap();
         assert_eq!(
             paths.iter().map(Path::as_str).collect::<Vec<_>>(),
-            vec!["b", "c", "literal%key", "literalXkey"]
+            vec![
+                "b",
+                "bang!key",
+                "bangXkey",
+                "c",
+                "literal%key",
+                "literalXkey",
+                "literal_key"
+            ]
         );
         assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn current_reads_use_projection_indexes_with_large_history() {
+        use sea_orm::ActiveValue::Set;
+
+        let db = get_db().await.unwrap();
+        db.conn
+            .execute(Statement::from_string(
+                DbBackend::Sqlite,
+                "PRAGMA foreign_keys = OFF".to_string(),
+            ))
+            .await
+            .unwrap();
+        let space = test_space_id("projection-query-plan");
+        let key: Path = "needle".parse().unwrap();
+        let mut writes = Vec::with_capacity(5_000);
+        for seq in 0..5_000 {
+            writes.push(kv_write::ActiveModel {
+                space: Set(SpaceIdWrap(space.clone())),
+                key: Set(key.clone().into()),
+                invocation: Set(crate::hash::hash(format!("history-{seq}").as_bytes())),
+                seq: Set(seq),
+                epoch: Set(crate::hash::hash(b"query-plan-epoch")),
+                epoch_seq: Set(0),
+                value: Set(crate::hash::hash(format!("value-{seq}").as_bytes())),
+                metadata: Set(Metadata(std::collections::BTreeMap::new())),
+            });
+        }
+        for chunk in writes.chunks(50) {
+            kv_write::Entity::insert_many(chunk.iter().cloned())
+                .exec(&db.conn)
+                .await
+                .unwrap();
+        }
+        let winner = kv_write::Entity::find()
+            .filter(kv_write::Column::Space.eq(SpaceIdWrap(space.clone())))
+            .filter(kv_write::Column::Key.eq(key.as_str()))
+            .order_by_desc(kv_write::Column::Seq)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        invocation::upsert_current_kv(&db.conn, winner)
+            .await
+            .unwrap();
+
+        async fn explain(conn: &sea_orm::DatabaseConnection, sql: String) -> Vec<String> {
+            conn.query_all(Statement::from_string(
+                DbBackend::Sqlite,
+                format!("EXPLAIN QUERY PLAN {sql}"),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get::<String>("", "detail").unwrap())
+            .collect()
+        }
+
+        let space_sql = space.to_string().replace('\'', "''");
+        let legacy_exact = explain(
+            &db.conn,
+            format!(
+                "SELECT w.* FROM kv_write w LEFT JOIN kv_delete d ON w.space=d.space AND w.key=d.key AND w.invocation=d.deleted_invocation_id WHERE w.space='{space_sql}' AND w.key='needle' ORDER BY w.seq DESC,w.epoch DESC,w.epoch_seq DESC LIMIT 1"
+            ),
+        )
+        .await;
+        let current_exact = explain(
+            &db.conn,
+            format!("SELECT * FROM current_kv WHERE space='{space_sql}' AND key='needle' LIMIT 1"),
+        )
+        .await;
+        let legacy_list = explain(
+            &db.conn,
+            format!(
+                "SELECT w.key FROM kv_write w LEFT JOIN kv_delete d ON w.space=d.space AND w.key=d.key AND w.invocation=d.deleted_invocation_id WHERE w.space='{space_sql}' AND w.key LIKE 'need%' ESCAPE '!' AND d.invocation_id IS NULL AND NOT EXISTS (SELECT 1 FROM kv_write newer WHERE newer.space=w.space AND newer.key=w.key AND (newer.seq>w.seq OR (newer.seq=w.seq AND newer.epoch>w.epoch) OR (newer.seq=w.seq AND newer.epoch=w.epoch AND newer.epoch_seq>w.epoch_seq))) ORDER BY w.key LIMIT 11"
+            ),
+        )
+        .await;
+        let current_list = explain(
+            &db.conn,
+            format!(
+                "SELECT key FROM current_kv WHERE space='{space_sql}' AND deleted=0 AND key LIKE 'need%' ESCAPE '!' ORDER BY key LIMIT 11"
+            ),
+        )
+        .await;
+
+        println!(
+            "TC-271 query-plan evidence: history_rows=5000 projection_rows=1 legacy_exact={legacy_exact:?} current_exact={current_exact:?} legacy_list={legacy_list:?} current_list={current_list:?}"
+        );
+        assert!(legacy_exact.iter().any(|line| line.contains("kv_write")));
+        assert!(legacy_list.iter().any(|line| line.contains("kv_write")));
+        for plan in [&current_exact, &current_list] {
+            assert!(plan.iter().any(|line| {
+                line.contains("current_kv") && (line.contains("INDEX") || line.contains("PRIMARY"))
+            }));
+            assert!(plan
+                .iter()
+                .all(|line| !line.contains("kv_write") && !line.contains("kv_delete")));
+        }
+        assert_eq!(
+            kv_write::Entity::find().count(&db.conn).await.unwrap(),
+            5_000
+        );
+        assert_eq!(current_kv::Entity::find().count(&db.conn).await.unwrap(), 1);
     }
 
     #[tokio::test]

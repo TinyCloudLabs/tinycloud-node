@@ -2555,7 +2555,12 @@ mod tests {
             assert!(schema.has_table(table).await.unwrap(), "missing {table}");
         }
 
-        crate::migrations::Migrator::down(&db, Some(5))
+        let migrations = crate::migrations::Migrator::migrations();
+        let policy_index = migrations
+            .iter()
+            .position(|migration| migration.name() == "m20260715_000000_policy_authority")
+            .unwrap();
+        crate::migrations::Migrator::down(&db, Some((migrations.len() - policy_index) as u32))
             .await
             .unwrap();
         for table in [

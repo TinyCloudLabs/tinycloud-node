@@ -12,6 +12,8 @@ pub mod m20260719_000000_share_email_protocol;
 pub mod m20260719_000001_share_policy_presentation_jti;
 pub mod m20260719_000002_policy_status_freshness;
 pub mod m20260724_000000_database_artifact_deltas;
+pub mod m20260724_000000_invocation_replay;
+pub mod m20260724_010000_current_kv;
 
 pub struct Migrator;
 
@@ -31,6 +33,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260719_000000_share_email_protocol::Migration),
             Box::new(m20260719_000001_share_policy_presentation_jti::Migration),
             Box::new(m20260719_000002_policy_status_freshness::Migration),
+            Box::new(m20260724_000000_invocation_replay::Migration),
+            Box::new(m20260724_010000_current_kv::Migration),
             Box::new(m20260724_000000_database_artifact_deltas::Migration),
         ]
     }

@@ -16,7 +16,7 @@ use futures::{
 use rocket::{async_trait, http::hyper::Uri};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
-use std::{collections::HashMap, io::Error as IoError, ops::AddAssign};
+use std::{collections::HashMap, io::Error as IoError, ops::AddAssign, time::Instant};
 use tinycloud_auth::resource::SpaceId;
 use tinycloud_core::{hash::Hash, storage::*};
 
@@ -168,6 +168,7 @@ impl ImmutableReadStore for S3BlockStore {
         space: &SpaceId,
         id: &Hash,
     ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
+        let start = Instant::now();
         let res = self
             .client
             .get_object()
@@ -175,7 +176,7 @@ impl ImmutableReadStore for S3BlockStore {
             .key(self.key(space, id))
             .send()
             .await;
-        match res {
+        let result = match res {
             Ok(o) => Ok(Some(Content::new(
                 o.content_length().try_into()?,
                 o.body
@@ -191,7 +192,13 @@ impl ImmutableReadStore for S3BlockStore {
                 ..
             }) => Ok(None),
             Err(e) => Err(S3Error::from(e).into()),
-        }
+        };
+        crate::prometheus::observe_stage(
+            crate::prometheus::InvocationStage::BlockRead,
+            crate::prometheus::StageOutcome::from(result.is_ok()),
+            start.elapsed(),
+        );
+        result
     }
 }
 
@@ -203,22 +210,32 @@ impl ImmutableWriteStore<memory::MemoryStaging> for S3BlockStore {
         space: &SpaceId,
         staged: HashBuffer<<memory::MemoryStaging as ImmutableStaging>::Writable>,
     ) -> Result<Hash, Self::Error> {
-        let (mut h, f) = staged.into_inner();
-        let hash = h.finalize();
+        let start = Instant::now();
+        let result = async move {
+            let (mut h, f) = staged.into_inner();
+            let hash = h.finalize();
 
-        if !self.contains(space, &hash).await? {
-            let size = f.len() as u64;
-            self.client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(self.key(space, &hash))
-                .body(ByteStream::from(f))
-                .send()
-                .await
-                .map_err(S3Error::from)?;
-            self.increment_size(space, size).await;
+            if !self.contains(space, &hash).await? {
+                let size = f.len() as u64;
+                self.client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(self.key(space, &hash))
+                    .body(ByteStream::from(f))
+                    .send()
+                    .await
+                    .map_err(S3Error::from)?;
+                self.increment_size(space, size).await;
+            }
+            Ok(hash)
         }
-        Ok(hash)
+        .await;
+        crate::prometheus::observe_stage(
+            crate::prometheus::InvocationStage::BlockWrite,
+            crate::prometheus::StageOutcome::from(result.is_ok()),
+            start.elapsed(),
+        );
+        result
     }
 }
 
@@ -230,24 +247,34 @@ impl ImmutableWriteStore<file_system::TempFileSystemStage> for S3BlockStore {
         space: &SpaceId,
         staged: HashBuffer<<file_system::TempFileSystemStage as ImmutableStaging>::Writable>,
     ) -> Result<Hash, Self::Error> {
-        let (mut h, f) = staged.into_inner();
-        let hash = h.finalize();
+        let start = Instant::now();
+        let result = async move {
+            let (mut h, f) = staged.into_inner();
+            let hash = h.finalize();
 
-        if !self.contains(space, &hash).await? {
-            let size = f.size().await?;
-            let (_file, path) = f.into_inner();
+            if !self.contains(space, &hash).await? {
+                let size = f.size().await?;
+                let (_file, path) = f.into_inner();
 
-            self.client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(self.key(space, &hash))
-                .body(ByteStream::from_path(&path).await?)
-                .send()
-                .await
-                .map_err(S3Error::from)?;
-            self.increment_size(space, size).await;
+                self.client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(self.key(space, &hash))
+                    .body(ByteStream::from_path(&path).await?)
+                    .send()
+                    .await
+                    .map_err(S3Error::from)?;
+                self.increment_size(space, size).await;
+            }
+            Ok(hash)
         }
-        Ok(hash)
+        .await;
+        crate::prometheus::observe_stage(
+            crate::prometheus::InvocationStage::BlockWrite,
+            crate::prometheus::StageOutcome::from(result.is_ok()),
+            start.elapsed(),
+        );
+        result
     }
 }
 
@@ -261,39 +288,49 @@ impl ImmutableWriteStore<either::Either<file_system::TempFileSystemStage, memory
         space: &SpaceId,
         staged: HashBuffer<<either::Either<file_system::TempFileSystemStage, memory::MemoryStaging> as ImmutableStaging>::Writable>,
     ) -> Result<Hash, Self::Error> {
-        let (mut h, f) = staged.into_inner();
-        let hash = h.finalize();
+        let start = Instant::now();
+        let result = async move {
+            let (mut h, f) = staged.into_inner();
+            let hash = h.finalize();
 
-        if !self.contains(space, &hash).await? {
-            match f {
-                AsyncEither::Left(t_file) => {
-                    let size = t_file.size().await?;
-                    let (_file, path) = t_file.into_inner();
-                    self.client
-                        .put_object()
-                        .bucket(&self.bucket)
-                        .key(self.key(space, &hash))
-                        .body(ByteStream::from_path(&path).await?)
-                        .send()
-                        .await
-                        .map_err(S3Error::from)?;
-                    self.increment_size(space, size).await;
+            if !self.contains(space, &hash).await? {
+                match f {
+                    AsyncEither::Left(t_file) => {
+                        let size = t_file.size().await?;
+                        let (_file, path) = t_file.into_inner();
+                        self.client
+                            .put_object()
+                            .bucket(&self.bucket)
+                            .key(self.key(space, &hash))
+                            .body(ByteStream::from_path(&path).await?)
+                            .send()
+                            .await
+                            .map_err(S3Error::from)?;
+                        self.increment_size(space, size).await;
+                    }
+                    AsyncEither::Right(b) => {
+                        let size = b.len() as u64;
+                        self.client
+                            .put_object()
+                            .bucket(&self.bucket)
+                            .key(self.key(space, &hash))
+                            .body(ByteStream::from(b))
+                            .send()
+                            .await
+                            .map_err(S3Error::from)?;
+                        self.increment_size(space, size).await;
+                    }
                 }
-                AsyncEither::Right(b) => {
-                    let size = b.len() as u64;
-                    self.client
-                        .put_object()
-                        .bucket(&self.bucket)
-                        .key(self.key(space, &hash))
-                        .body(ByteStream::from(b))
-                        .send()
-                        .await
-                        .map_err(S3Error::from)?;
-                    self.increment_size(space, size).await;
-                }
-            }
-        };
-        Ok(hash)
+            };
+            Ok(hash)
+        }
+        .await;
+        crate::prometheus::observe_stage(
+            crate::prometheus::InvocationStage::BlockWrite,
+            crate::prometheus::StageOutcome::from(result.is_ok()),
+            start.elapsed(),
+        );
+        result
     }
 }
 
