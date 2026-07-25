@@ -736,7 +736,7 @@ where
         &self,
         roots: &[Hash],
     ) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>, TxError<B, K>> {
-        let mut keys = revocation::ancestor_chain_ids_for_roots(&self.conn, roots)
+        let keys = revocation::ancestor_chain_ids_for_roots(&self.conn, roots)
             .await
             .map_err(|error| match error {
                 revocation::ChainTraversalError::Db(error) => TxError::Db(error),
@@ -744,6 +744,13 @@ where
                     TxError::ChainTraversalLimitExceeded
                 }
             })?;
+        Ok(self.acquire_chain_guards_for_keys(keys).await)
+    }
+
+    async fn acquire_chain_guards_for_keys(
+        &self,
+        mut keys: Vec<Hash>,
+    ) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
         keys.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
         keys.dedup();
 
@@ -767,7 +774,7 @@ where
         for lock in locks {
             guards.push(lock.lock_owned().await);
         }
-        Ok(guards)
+        guards
     }
 
     async fn acquire_kv_object_guards(
@@ -818,6 +825,7 @@ where
             &self.secrets,
             events,
             self.encryption.as_ref(),
+            None,
         )
         .await?;
 
@@ -987,13 +995,27 @@ where
             .map(Hash::from)
             .collect();
         let authz_start = Instant::now();
-        let chain_guards = self.acquire_chain_guards(&roots).await;
-        crate::telemetry::observe_stage(
-            crate::telemetry::InvocationStage::AuthorizationGraphLoad,
-            crate::telemetry::StageOutcome::from(chain_guards.is_ok()),
-            authz_start.elapsed(),
-        );
-        let _chain_guards = chain_guards?;
+        let lock_keys = crate::auth_graph::load_closure_edges(&self.conn, &roots)
+            .await
+            .map(|(keys, _)| keys)
+            .map_err(|error| match error {
+                revocation::ChainTraversalError::Db(error) => TxError::Db(error),
+                revocation::ChainTraversalError::LimitExceeded => {
+                    TxError::ChainTraversalLimitExceeded
+                }
+            });
+        let lock_keys = match lock_keys {
+            Ok(keys) => keys,
+            Err(error) => {
+                crate::telemetry::observe_stage(
+                    crate::telemetry::InvocationStage::AuthorizationGraphLoad,
+                    crate::telemetry::StageOutcome::Error,
+                    authz_start.elapsed(),
+                );
+                return Err(TxStoreError::Tx(error));
+            }
+        };
+        let _chain_guards = self.acquire_chain_guards_for_keys(lock_keys).await;
         let mutation_keys = invocation
             .0
             .capabilities
@@ -1065,6 +1087,27 @@ where
             chain_isolation_level(&self.conn)
         };
         let tx = self.conn.begin_with_config(isolation_level, None).await?;
+        let auth_graph = match crate::auth_graph::AuthGraphSnapshot::load(&tx, &roots).await {
+            Ok(graph) => graph,
+            Err(error) => {
+                crate::telemetry::observe_stage(
+                    crate::telemetry::InvocationStage::AuthorizationGraphLoad,
+                    crate::telemetry::StageOutcome::Error,
+                    authz_start.elapsed(),
+                );
+                return Err(TxStoreError::Tx(match error {
+                    revocation::ChainTraversalError::Db(error) => TxError::Db(error),
+                    revocation::ChainTraversalError::LimitExceeded => {
+                        TxError::ChainTraversalLimitExceeded
+                    }
+                }));
+            }
+        };
+        crate::telemetry::observe_stage(
+            crate::telemetry::InvocationStage::AuthorizationGraphLoad,
+            crate::telemetry::StageOutcome::Ok,
+            authz_start.elapsed(),
+        );
         let mut deleted_hashes = HashMap::new();
         for key @ (space, path) in &mutation_keys {
             let current = get_kv_entity(&tx, space, path)
@@ -1103,6 +1146,7 @@ where
             &self.secrets,
             vec![Event::Invocation(Box::new(invocation), ops)],
             self.encryption.as_ref(),
+            Some(&auth_graph),
         )
         .await
         .map_err(|error| {
@@ -1378,6 +1422,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     secrets: &K,
     events: Vec<Event>,
     encryption: Option<&ColumnEncryption>,
+    auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
 ) -> Result<TransactResult, TxError<S, K>> {
     // for each event, get the hash and the relevent space(s)
     let event_hashes = events
@@ -1669,6 +1714,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                             })
                             .collect(),
                         encryption,
+                        auth_graph,
                     )
                     .await?;
                 }
@@ -1718,7 +1764,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                     delegation_cids.push(cid);
                 }
                 Event::Invocation(i, _ops) => {
-                    invocation::process(db, *i, Vec::new(), encryption).await?;
+                    invocation::process(db, *i, Vec::new(), encryption, auth_graph).await?;
                 }
                 Event::Revocation(r) => {
                     revocation::process(db, *r).await?;

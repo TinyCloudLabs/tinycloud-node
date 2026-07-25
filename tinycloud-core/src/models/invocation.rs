@@ -109,12 +109,13 @@ pub(crate) async fn process<C: ConnectionTrait>(
     invocation: Invocation,
     ops: Vec<VersionedOperation>,
     encryption: Option<&ColumnEncryption>,
+    auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
 ) -> Result<Hash, Error> {
     let (i, serialized) = (invocation.0, invocation.1);
     verify_invocation(&i.invocation).await?;
 
     let now = OffsetDateTime::now_utc();
-    validate(db, &i, Some(now)).await?;
+    validate(db, &i, Some(now), auth_graph).await?;
 
     save(db, i, Some(now), serialized, ops, encryption).await
 }
@@ -144,7 +145,7 @@ pub async fn verify_and_authorize<C: ConnectionTrait>(
     now: OffsetDateTime,
 ) -> Result<(), Error> {
     verify_invocation(&invocation.invocation).await?;
-    validate(db, invocation, Some(now)).await
+    validate(db, invocation, Some(now), None).await
 }
 
 // verify parenthood and authorization
@@ -152,6 +153,7 @@ async fn validate<C: ConnectionTrait>(
     db: &C,
     invocation: &util::InvocationInfo,
     time: Option<OffsetDateTime>,
+    auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
 ) -> Result<(), Error> {
     // get caps which rely on delegated caps
     let dependant_caps: Vec<_> = invocation
@@ -170,19 +172,38 @@ async fn validate<C: ConnectionTrait>(
         (false, true) => Err(InvocationError::MissingParents.into()),
         // dependant caps, parents, check parents
         (false, false) => {
-            // get parents which have
-            let parents = delegation::Entity::find()
-                // the correct id
-                .filter(
-                    delegation::Column::Id.is_in(invocation.parents.iter().map(|c| Hash::from(*c))),
-                )
-                // and also get their abilities
-                .find_with_related(abilities::Entity)
-                .all(db)
-                .await?;
+            // TC-269: batch-load the whole authorization graph once inside
+            // the invocation transaction (parent edges, delegation rows,
+            // cited abilities/caveats, revocations) and run every chain
+            // check against that single consistent snapshot instead of
+            // re-walking the database per parent and per ancestor.
+            let root_ids: Vec<Hash> = invocation.parents.iter().map(|c| Hash::from(*c)).collect();
+            let loaded_graph;
+            let graph = match auth_graph {
+                Some(graph) => graph,
+                None => {
+                    loaded_graph = crate::auth_graph::AuthGraphSnapshot::load(db, &root_ids)
+                        .await
+                        .map_err(|error| match error {
+                            crate::auth_graph::ChainTraversalError::Db(error) => Error::Db(error),
+                            crate::auth_graph::ChainTraversalError::LimitExceeded => {
+                                Error::InvalidInvocation(
+                                    InvocationError::ChainTraversalLimitExceeded,
+                                )
+                            }
+                        })?;
+                    &loaded_graph
+                }
+            };
 
-            if parents.len() != invocation.parents.len() {
-                return Err(InvocationError::MissingParents.into());
+            // every cited parent must resolve to a distinct persisted row
+            let mut cited = std::collections::HashSet::new();
+            let mut parents = Vec::with_capacity(root_ids.len());
+            for id in &root_ids {
+                match graph.delegation(id) {
+                    Some(row) if cited.insert(*id) => parents.push((row, graph.abilities(id))),
+                    _ => return Err(InvocationError::MissingParents.into()),
+                }
             }
 
             // check parent identifies correct invoker
@@ -196,24 +217,16 @@ async fn validate<C: ConnectionTrait>(
 
             // W1 (C): fail-closed on revocation. A revoked leaf rejects the
             // invocation outright; a revoked ANCESTOR in the cited chain
-            // rejects descendants. Walked on every invocation — we must
+            // rejects descendants. Loaded on every invocation — we must
             // NOT cache "chain ok" across the revocation event
             // (revocation.md §2.3).
             for (p, _) in &parents {
-                if revocation::is_revoked(db, &p.id).await? {
+                if graph.is_revoked(&p.id) {
                     return Err(
                         InvocationError::DelegationRevoked(p.id.to_cid(0x55).to_string()).into(),
                     );
                 }
-                let revoked_ancestor = revocation::first_revoked_ancestor(db, &p.id)
-                    .await
-                    .map_err(|error| match error {
-                        revocation::ChainTraversalError::Db(error) => Error::Db(error),
-                        revocation::ChainTraversalError::LimitExceeded => {
-                            Error::InvalidInvocation(InvocationError::ChainTraversalLimitExceeded)
-                        }
-                    })?;
-                if let Some(ancestor_cid) = revoked_ancestor {
+                if let Some(ancestor_cid) = graph.first_revoked_ancestor(&p.id) {
                     return Err(InvocationError::DelegationAncestorRevoked {
                         ancestor_cid,
                         invoked_cid: p.id.to_cid(0x55).to_string(),
@@ -223,25 +236,15 @@ async fn validate<C: ConnectionTrait>(
 
                 // A child capability cannot outlive or predate any delegation
                 // in the chain that authorizes it. Validate the effective
-                // chain window, not only the directly cited leaf.
-                let chain_ids = revocation::ancestor_chain_ids(db, &p.id).await.map_err(
-                    |error| match error {
-                        revocation::ChainTraversalError::Db(error) => Error::Db(error),
-                        revocation::ChainTraversalError::LimitExceeded => {
-                            Error::InvalidInvocation(InvocationError::ChainTraversalLimitExceeded)
-                        }
-                    },
-                )?;
-                let chain = delegation::Entity::find()
-                    .filter(delegation::Column::Id.is_in(chain_ids.iter().copied()))
-                    .all(db)
-                    .await?;
-                if chain.len() != chain_ids.len() {
-                    return Err(InvocationError::MissingParents.into());
-                }
+                // chain window, not only the directly cited leaf. A chain
+                // node without a persisted delegation row (malformed graph)
+                // fails closed as a missing parent.
                 let chain_now = time.unwrap_or_else(OffsetDateTime::now_utc);
-                if chain.iter().any(|ancestor| {
-                    ancestor
+                for chain_id in graph.chain_ids_from(&p.id) {
+                    let Some(ancestor) = graph.delegation(&chain_id) else {
+                        return Err(InvocationError::MissingParents.into());
+                    };
+                    if ancestor
                         .expiry
                         .map(|expiry| chain_now >= expiry)
                         .unwrap_or(false)
@@ -249,15 +252,16 @@ async fn validate<C: ConnectionTrait>(
                             .not_before
                             .map(|not_before| chain_now < not_before)
                             .unwrap_or(false)
-                }) {
-                    return match dependant_caps.first() {
-                        Some(capability) => Err(InvocationError::UnauthorizedAction(
-                            capability.resource.clone(),
-                            capability.ability.clone(),
-                        )
-                        .into()),
-                        None => Err(InvocationError::MissingParents.into()),
-                    };
+                    {
+                        return match dependant_caps.first() {
+                            Some(capability) => Err(InvocationError::UnauthorizedAction(
+                                capability.resource.clone(),
+                                capability.ability.clone(),
+                            )
+                            .into()),
+                            None => Err(InvocationError::MissingParents.into()),
+                        };
+                    }
                 }
             }
 
@@ -289,7 +293,7 @@ async fn validate<C: ConnectionTrait>(
                 // alias/implication pairs are added.
                 let mut candidates = parents
                     .iter()
-                    .flat_map(|(_, a)| a)
+                    .flat_map(|(_, a)| a.iter())
                     .filter(|pc| {
                         c.resource.extends(&pc.resource)
                             && crate::policy_capability::ability_matches(

@@ -1,3 +1,4 @@
+pub(crate) mod auth_graph;
 pub mod database_artifacts;
 pub mod db;
 #[cfg(feature = "duckdb")]
