@@ -14,6 +14,8 @@ use super::{
     types::*,
 };
 
+const MAX_WAL_DELTA_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct SqlService {
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
@@ -62,20 +64,9 @@ impl SqlService {
         }?;
 
         if !result.write_targets.is_empty() {
-            let payload = match handle.export().await {
-                Ok(payload) => payload,
-                Err(e) => {
-                    let _ = self.discard_local_state(&key).await;
-                    return Err(e);
-                }
-            };
-            if let Err(e) = self
-                .artifact_repository
-                .save("sql", &space.to_string(), db_name, payload)
-                .await
-            {
+            if let Err(e) = self.persist_write(space, db_name, &handle).await {
                 let _ = self.discard_local_state(&key).await;
-                return Err(artifact_error_to_sql(e));
+                return Err(e);
             }
         }
 
@@ -99,19 +90,16 @@ impl SqlService {
             }
         }
 
-        match self
+        if self
             .artifact_repository
             .load("sql", &space.to_string(), db_name)
             .await
             .map_err(artifact_error_to_sql)?
+            .is_none()
         {
-            Some(artifact) => {
-                remove_sql_cache_files(&self.cache_path(space, db_name)).await?;
-                write_cache_file(&self.cache_path(space, db_name), &artifact.payload).await?;
-                Ok(artifact.payload)
-            }
-            None => Err(SqlError::DatabaseNotFound),
+            return Err(SqlError::DatabaseNotFound);
         }
+        self.handle(space, db_name).await?.export().await
     }
 
     pub fn db_name_from_path(path: Option<&str>) -> String {
@@ -152,7 +140,11 @@ impl SqlService {
         {
             Some(artifact) => {
                 remove_sql_cache_files(&cache_path).await?;
-                write_cache_file(&cache_path, &artifact.payload).await
+                write_cache_file(&cache_path, &artifact.payload).await?;
+                if let Some(delta) = artifact.delta_payload {
+                    write_cache_file(&sql_wal_path(&cache_path), &delta).await?;
+                }
+                Ok(())
             }
             None => remove_sql_cache_files(&cache_path).await,
         }
@@ -170,6 +162,63 @@ impl SqlService {
             .join(&key.0)
             .join(format!("{}.db", key.1));
         remove_sql_cache_files(&cache_path).await
+    }
+
+    async fn persist_write(
+        &self,
+        space: &SpaceId,
+        db_name: &str,
+        handle: &DatabaseHandle,
+    ) -> Result<(), SqlError> {
+        if let Some(wal) = handle
+            .wal()
+            .await?
+            .filter(|wal| wal.len() < MAX_WAL_DELTA_BYTES)
+        {
+            match self
+                .artifact_repository
+                .save_delta("sql", &space.to_string(), db_name, wal)
+                .await
+            {
+                Ok(saved) => {
+                    tracing::info!(
+                        service = "sql",
+                        space = %space,
+                        db = db_name,
+                        mode = "wal",
+                        bytes = saved.delta_size_bytes,
+                        logical_bytes = saved.size_bytes,
+                        revision = saved.revision,
+                        "Persisted incremental database artifact"
+                    );
+                    return Ok(());
+                }
+                Err(
+                    DatabaseArtifactError::MissingCheckpoint
+                    | DatabaseArtifactError::IncrementalPersistenceUnsupported,
+                ) => {}
+                Err(error) => return Err(artifact_error_to_sql(error)),
+            }
+        }
+
+        let payload = handle.checkpoint().await?;
+        let bytes = payload.len();
+        let saved = self
+            .artifact_repository
+            .save("sql", &space.to_string(), db_name, payload)
+            .await
+            .map_err(artifact_error_to_sql)?;
+        tracing::info!(
+            service = "sql",
+            space = %space,
+            db = db_name,
+            mode = "checkpoint",
+            bytes,
+            logical_bytes = saved.size_bytes,
+            revision = saved.revision,
+            "Persisted database checkpoint"
+        );
+        Ok(())
     }
 }
 
@@ -202,6 +251,10 @@ async fn remove_sql_cache_files(path: &Path) -> Result<(), SqlError> {
         }
     }
     Ok(())
+}
+
+fn sql_wal_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}-wal", path.display()))
 }
 
 fn artifact_error_to_sql(err: DatabaseArtifactError) -> SqlError {
@@ -407,6 +460,109 @@ mod tests {
             hydrated_path.exists(),
             "durable artifact should hydrate cache"
         );
+    }
+
+    #[tokio::test]
+    async fn file_backed_small_writes_persist_wal_not_full_database() {
+        let repo = artifact_repository().await;
+        let cache_one = TempDir::new().unwrap();
+        let cache_two = TempDir::new().unwrap();
+        let space = test_space_id("sql-wal-delta");
+        let service = SqlService::new(
+            cache_one.path().to_string_lossy().to_string(),
+            0,
+            repo.clone(),
+        );
+
+        service
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: None,
+                    sql: "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
+                        .to_string(),
+                    params: Vec::new(),
+                },
+                None,
+                "tinycloud.sql/schema".to_string(),
+            )
+            .await
+            .unwrap();
+        service
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: None,
+                    sql: "INSERT INTO items (name) VALUES ('one')".to_string(),
+                    params: Vec::new(),
+                },
+                None,
+                "tinycloud.sql/write".to_string(),
+            )
+            .await
+            .unwrap();
+
+        let artifact = repo
+            .load("sql", &space.to_string(), "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(artifact.storage_mode, "checkpoint+wal");
+        assert!(artifact.delta_size_bytes > 0);
+        println!(
+            "sql artifact persistence: checkpoint={} delta={}",
+            artifact.payload.len(),
+            artifact.delta_size_bytes
+        );
+        assert!(
+            artifact.delta_size_bytes < artifact.payload.len() as i64,
+            "a small write should transfer fewer bytes than the checkpoint"
+        );
+
+        // User-facing export must not reset the WAL baseline. A later delta
+        // still has to contain both acknowledged writes.
+        service.export(&space, "main").await.unwrap();
+        service
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Execute {
+                    schema: None,
+                    sql: "INSERT INTO items (name) VALUES ('two')".to_string(),
+                    params: Vec::new(),
+                },
+                None,
+                "tinycloud.sql/write".to_string(),
+            )
+            .await
+            .unwrap();
+
+        let recreated = SqlService::new(cache_two.path().to_string_lossy().to_string(), 0, repo);
+        let result = recreated
+            .execute(
+                &space,
+                "main",
+                SqlRequest::Query {
+                    sql: "SELECT name FROM items ORDER BY id".to_string(),
+                    params: Vec::new(),
+                    max_rows: None,
+                    max_bytes: None,
+                },
+                None,
+                "tinycloud.sql/read".to_string(),
+            )
+            .await
+            .unwrap();
+        match result.response {
+            SqlResponse::Query(query) => {
+                assert_eq!(query.row_count, 2);
+                assert_eq!(query.rows[0][0], SqlValue::Text("one".to_string()));
+                assert_eq!(query.rows[1][0], SqlValue::Text("two".to_string()));
+            }
+            other => panic!("expected query response, got {other:?}"),
+        }
     }
 
     struct FailingArtifactRepository;

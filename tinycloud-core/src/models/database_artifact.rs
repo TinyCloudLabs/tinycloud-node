@@ -17,6 +17,11 @@ pub struct Model {
     pub storage_mode: String,
     pub created_at: String,
     pub updated_at: String,
+    pub checkpoint_size_bytes: i64,
+    pub checkpoint_content_hash: String,
+    pub delta_payload: Option<Vec<u8>>,
+    pub delta_content_hash: Option<String>,
+    pub delta_size_bytes: i64,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
