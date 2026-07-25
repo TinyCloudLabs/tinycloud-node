@@ -17,6 +17,7 @@ pub mod share_email;
 pub mod sql;
 pub mod sql_sizes;
 pub mod storage;
+pub mod telemetry;
 pub mod types;
 pub mod util;
 pub mod write_hooks;

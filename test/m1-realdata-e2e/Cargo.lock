@@ -7708,6 +7708,7 @@ dependencies = [
  "libp2p",
  "multihash-derive 0.9.1",
  "pin-project",
+ "prometheus",
  "rand 0.8.5",
  "rusqlite",
  "ryu-js",

@@ -27,6 +27,7 @@ use sea_orm::{
 use sea_orm_migration::MigratorTrait;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_auth::{
     authorization::{EncodingError, TinyCloudDelegation},
@@ -820,7 +821,14 @@ where
         )
         .await?;
 
-        tx.commit().await?;
+        let start = Instant::now();
+        let commit_result = tx.commit().await;
+        crate::telemetry::observe_stage(
+            crate::telemetry::InvocationStage::EpochPersist,
+            crate::telemetry::StageOutcome::from(commit_result.is_ok()),
+            start.elapsed(),
+        );
+        commit_result?;
 
         Ok(result)
     }
@@ -833,7 +841,14 @@ where
             .copied()
             .map(Hash::from)
             .collect();
-        let _chain_guards = self.acquire_chain_guards(&roots).await?;
+        let authz_start = Instant::now();
+        let chain_guards = self.acquire_chain_guards(&roots).await;
+        crate::telemetry::observe_stage(
+            crate::telemetry::InvocationStage::AuthorizationGraphLoad,
+            crate::telemetry::StageOutcome::from(chain_guards.is_ok()),
+            authz_start.elapsed(),
+        );
+        let _chain_guards = chain_guards?;
         self.transact(vec![Event::Delegation(Box::new(delegation))])
             .await
     }
@@ -841,7 +856,14 @@ where
     pub async fn revoke(&self, revocation: Revocation) -> Result<TransactResult, TxError<B, K>> {
         let mut roots = vec![Hash::from(revocation.0.revoked)];
         roots.extend(revocation.0.parents.iter().copied().map(Hash::from));
-        let _chain_guards = self.acquire_chain_guards(&roots).await?;
+        let revocation_start = Instant::now();
+        let chain_guards = self.acquire_chain_guards(&roots).await;
+        crate::telemetry::observe_stage(
+            crate::telemetry::InvocationStage::RevocationWork,
+            crate::telemetry::StageOutcome::from(chain_guards.is_ok()),
+            revocation_start.elapsed(),
+        );
+        let _chain_guards = chain_guards?;
         self.transact(vec![Event::Revocation(Box::new(revocation))])
             .await
     }
@@ -964,7 +986,14 @@ where
             .copied()
             .map(Hash::from)
             .collect();
-        let _chain_guards = self.acquire_chain_guards(&roots).await?;
+        let authz_start = Instant::now();
+        let chain_guards = self.acquire_chain_guards(&roots).await;
+        crate::telemetry::observe_stage(
+            crate::telemetry::InvocationStage::AuthorizationGraphLoad,
+            crate::telemetry::StageOutcome::from(chain_guards.is_ok()),
+            authz_start.elapsed(),
+        );
+        let _chain_guards = chain_guards?;
         let mutation_keys = invocation
             .0
             .capabilities
@@ -1909,24 +1938,37 @@ async fn get_kv_entity<C: ConnectionTrait>(
     // } else {
     // A delete tombstones the latest write. Select that write before checking
     // its tombstone so older versions cannot reappear after deletion.
-    Ok(
-        match kv_write::Entity::find()
-            .filter(
-                Condition::all()
-                    .add(kv_write::Column::Key.eq(key.as_str()))
-                    .add(kv_write::Column::Space.eq(SpaceIdWrap(space_id.clone()))),
-            )
-            .order_by_desc(kv_write::Column::Seq)
-            .order_by_desc(kv_write::Column::Epoch)
-            .order_by_desc(kv_write::Column::EpochSeq)
-            .find_also_related(kv_delete::Entity)
-            .one(db)
-            .await?
-        {
-            Some((_, Some(_))) | None => None,
-            Some((kv, None)) => Some(kv),
-        },
-    )
+    let start = Instant::now();
+    let query_result = kv_write::Entity::find()
+        .filter(
+            Condition::all()
+                .add(kv_write::Column::Key.eq(key.as_str()))
+                .add(kv_write::Column::Space.eq(SpaceIdWrap(space_id.clone()))),
+        )
+        .order_by_desc(kv_write::Column::Seq)
+        .order_by_desc(kv_write::Column::Epoch)
+        .order_by_desc(kv_write::Column::EpochSeq)
+        .find_also_related(kv_delete::Entity)
+        .one(db)
+        .await;
+    let result = match query_result {
+        Ok(Some((_, Some(_)))) | Ok(None) => None,
+        Ok(Some((kv, None))) => Some(kv),
+        Err(error) => {
+            crate::telemetry::observe_stage(
+                crate::telemetry::InvocationStage::KvIndexLookup,
+                crate::telemetry::StageOutcome::Error,
+                start.elapsed(),
+            );
+            return Err(error);
+        }
+    };
+    crate::telemetry::observe_stage(
+        crate::telemetry::InvocationStage::KvIndexLookup,
+        crate::telemetry::StageOutcome::Ok,
+        start.elapsed(),
+    );
+    Ok(result)
 }
 
 async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(

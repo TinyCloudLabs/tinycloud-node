@@ -17,66 +17,102 @@ use tinycloud_auth::{
 };
 use tinycloud_sdk_rs::{
     authorization::{DelegationHeaders, InvocationHeaders},
-    session::{complete_session_setup, prepare_session, Session, SessionConfig, SignedSession},
-    siwe_utils::{
-        generate_host_siwe_message, siwe_to_delegation_headers, HostConfig, SignedMessage,
-    },
+};
+use tinycloud_sdk_wasm::session::{
+    complete_session_setup, prepare_session, Session, SessionConfig, SignedSession,
+};
+use tinycloud_sdk_wasm::host::{
+    generate_host_siwe_message, siwe_to_delegation_headers, HostConfig, SignedMessage,
 };
 use tokio::sync::RwLock;
 
 #[derive(Clone)]
 struct User {
     wallet: LocalWallet,
-    session: Session,
+    root_session: Session,
     session_config: SessionConfig,
+}
+
+async fn sign_session(wallet: &LocalWallet, session_config: SessionConfig) -> Session {
+    let prepared_session = prepare_session(session_config.clone()).unwrap();
+    let signature = wallet
+        .sign_message(prepared_session.siwe.to_string())
+        .await
+        .unwrap();
+    complete_session_setup(SignedSession {
+        session: prepared_session,
+        signature: signature.to_vec().try_into().unwrap(),
+    })
+    .unwrap()
 }
 
 async fn new_user(wallet: LocalWallet, jwk: JWK) -> User {
     let address = to_checksum(&wallet.address(), None);
     let did = format!("did:pkh:eip155:1:{address}");
-    let space_id = SpaceId::new(DIDBuf::from_str(&did).unwrap(), "default".try_into().unwrap());
+    let space_id = SpaceId::new(
+        DIDBuf::from_str(&did).unwrap(),
+        "default".to_string().try_into().unwrap(),
+    );
 
     let session_config = SessionConfig {
-        actions: [(
-            "kv".into(),
-            [(
-                "".into(),
+        abilities: HashMap::from([(
+            "kv".parse().unwrap(),
+            HashMap::from([(
+                "".parse().unwrap(),
                 vec![
-                    "put".into(),
-                    "get".into(),
-                    "del".into(),
-                    "metadata".into(),
-                    "list".into(),
+                    "tinycloud.kv/put".parse().unwrap(),
+                    "tinycloud.kv/get".parse().unwrap(),
+                    "tinycloud.kv/del".parse().unwrap(),
+                    "tinycloud.kv/metadata".parse().unwrap(),
+                    "tinycloud.kv/list".parse().unwrap(),
                 ],
-            )]
-            .into(),
-        )]
-        .into(),
+            )]),
+        )]),
+        space_abilities: None,
+        raw_abilities: HashMap::new(),
         address: wallet.address().into(),
         chain_id: 1,
         domain: "localhost".try_into().unwrap(),
         space_id,
+        additional_spaces: None,
         not_before: None,
         parents: None,
         jwk: Some(jwk),
+        delegate_uri: None,
+        nonce: None,
         issued_at: TimeStamp::from_str("1985-04-12T23:20:50.52Z").unwrap(),
         expiration_time: TimeStamp::from_str("2985-04-12T23:20:50.52Z").unwrap(),
     };
-    let prepared_session = prepare_session(session_config.clone()).await.unwrap();
-    let signature = wallet
-        .sign_message(prepared_session.siwe.to_string())
-        .await
-        .unwrap();
-    let session = complete_session_setup(SignedSession {
-        session: prepared_session,
-        signature: signature.to_vec().try_into().unwrap(),
-    })
-    .unwrap();
+    let root_session = sign_session(&wallet, session_config.clone()).await;
 
     User {
         wallet,
-        session,
+        root_session: root_session.clone(),
         session_config,
+    }
+}
+
+impl User {
+    async fn session_chain(&self, depth: u32) -> Vec<Session> {
+        let mut chain = vec![self.root_session.clone()];
+        if depth == 0 {
+            return chain;
+        }
+
+        let mut previous = self.root_session.clone();
+        for _ in 0..depth {
+            let mut config = self.session_config.clone();
+            config.parents = Some(vec![previous.delegation_cid]);
+            let next = sign_session(&self.wallet, config).await;
+            previous = next.clone();
+            chain.push(next);
+        }
+
+        chain
+    }
+
+    async fn leaf_session(&self, depth: u32) -> Session {
+        self.session_chain(depth).await.into_iter().last().unwrap()
     }
 }
 
@@ -84,6 +120,14 @@ async fn new_user(wallet: LocalWallet, jwk: JWK) -> User {
 struct InvokeParams {
     name: String,
     action: String,
+    #[serde(default)]
+    depth: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SessionParams {
+    #[serde(default)]
+    depth: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -135,17 +179,19 @@ async fn get_space_id(
 
 async fn create_session(
     Path(id): Path<u128>,
+    Json(params): Json<SessionParams>,
     Extension(users): Extension<Arc<RwLock<HashMap<u128, User>>>>,
-) -> Json<DelegationHeaders> {
+) -> Json<Vec<DelegationHeaders>> {
+    let user = {
+        let reader = users.read().await;
+        reader.get(&id).cloned().unwrap()
+    };
+    let chain = user.session_chain(params.depth).await;
     Json(
-        users
-            .read()
-            .await
-            .get(&id)
-            .unwrap()
-            .session
-            .delegation_header
-            .clone(),
+        chain
+            .into_iter()
+            .map(|session| session.delegation_header)
+            .collect(),
     )
 }
 async fn invoke_session(
@@ -153,12 +199,25 @@ async fn invoke_session(
     Json(params): Json<InvokeParams>,
     Extension(users): Extension<Arc<RwLock<HashMap<u128, User>>>>,
 ) -> Json<InvocationHeaders> {
-    let headers = InvocationHeaders::from(
-        users.read().await.get(&id).unwrap().session.clone(),
-        vec![("kv".into(), params.name, params.action)],
-    )
-    .await
-    .unwrap();
+    let user = {
+        let reader = users.read().await;
+        reader.get(&id).cloned().unwrap()
+    };
+    let invocation = user
+        .leaf_session(params.depth)
+        .await
+        .invoke(
+            [(
+                "kv".parse().unwrap(),
+                params.name.parse().unwrap(),
+                None,
+                None,
+                [format!("tinycloud.kv/{}", params.action).parse().unwrap()],
+            )],
+            None,
+        )
+        .unwrap();
+    let headers = InvocationHeaders::new(invocation);
     Json(headers)
 }
 
@@ -170,6 +229,7 @@ async fn main() {
     let users: HashMap<u128, User> = HashMap::new();
     let app = Router::new()
         .route("/space_id/:id", get(get_space_id))
+        .route("/namespace_id/:id", get(get_space_id))
         .route("/spaces/:id", post(create_space))
         .route("/sessions/:id/create", post(create_session))
         .route("/sessions/:id/invoke", post(invoke_session))
@@ -182,4 +242,103 @@ async fn main() {
         .serve(app.into_make_service())
         .await
         .unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ethers::prelude::rand::{prelude::StdRng, SeedableRng};
+    use std::collections::HashSet;
+
+    async fn test_user() -> User {
+        let mut rng = StdRng::seed_from_u64(7);
+        let wallet = LocalWallet::new(&mut rng);
+        let jwk = JWK::generate_ed25519().unwrap();
+        new_user(wallet, jwk).await
+    }
+
+    #[tokio::test]
+    async fn session_chain_depth_changes_the_signed_delegation_chain() {
+        let user = test_user().await;
+        let depth0 = user.session_chain(0).await;
+        let depth1 = user.session_chain(1).await;
+        let depth4 = user.session_chain(4).await;
+
+        assert_eq!(depth0.len(), 1);
+        assert_eq!(depth1.len(), 2);
+        assert_eq!(depth4.len(), 5);
+
+        let depth4_cids: HashSet<_> = depth4
+            .iter()
+            .map(|session| session.delegation_cid)
+            .collect();
+        assert_eq!(depth4_cids.len(), 5);
+        assert_ne!(depth0.last().unwrap().delegation_cid, depth1.last().unwrap().delegation_cid);
+        assert_ne!(depth1.last().unwrap().delegation_cid, depth4.last().unwrap().delegation_cid);
+
+        let depth1_json = serde_json::to_string(&depth1.last().unwrap().delegation_header).unwrap();
+        let depth4_json = serde_json::to_string(&depth4.last().unwrap().delegation_header).unwrap();
+        assert_ne!(depth1_json, depth4_json);
+    }
+
+    #[tokio::test]
+    async fn leaf_session_depth_tracks_the_requested_authorization_chain() {
+        let user = test_user().await;
+        let leaf = user.leaf_session(4).await;
+        let root = user.leaf_session(0).await;
+
+        assert_ne!(leaf.delegation_cid, root.delegation_cid);
+        assert!(serde_json::to_value(&leaf.delegation_header).unwrap().is_object());
+    }
+
+    #[tokio::test]
+    async fn invocations_cite_the_leaf_session_cid_for_each_requested_depth() {
+        let user = test_user().await;
+        let root = user.leaf_session(0).await;
+        let depth1 = user.leaf_session(1).await;
+        let depth4 = user.leaf_session(4).await;
+
+        let root_invocation = root
+            .invoke(
+                [(
+                    "kv".parse().unwrap(),
+                    "depth-0".parse().unwrap(),
+                    None,
+                    None,
+                    ["tinycloud.kv/get".parse().unwrap()],
+                )],
+                None,
+            )
+            .expect("depth-0 invocation");
+        let depth1_invocation = depth1
+            .invoke(
+                [(
+                    "kv".parse().unwrap(),
+                    "depth-1".parse().unwrap(),
+                    None,
+                    None,
+                    ["tinycloud.kv/get".parse().unwrap()],
+                )],
+                None,
+            )
+            .expect("depth-1 invocation");
+        let depth4_invocation = depth4
+            .invoke(
+                [(
+                    "kv".parse().unwrap(),
+                    "depth-4".parse().unwrap(),
+                    None,
+                    None,
+                    ["tinycloud.kv/get".parse().unwrap()],
+                )],
+                None,
+            )
+            .expect("depth-4 invocation");
+
+        assert_eq!(root_invocation.payload().proof, vec![root.delegation_cid]);
+        assert_eq!(depth1_invocation.payload().proof, vec![depth1.delegation_cid]);
+        assert_eq!(depth4_invocation.payload().proof, vec![depth4.delegation_cid]);
+        assert_ne!(root_invocation.payload().proof, depth1_invocation.payload().proof);
+        assert_ne!(depth1_invocation.payload().proof, depth4_invocation.payload().proof);
+    }
 }
