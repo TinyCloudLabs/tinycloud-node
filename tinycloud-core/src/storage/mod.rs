@@ -9,6 +9,86 @@ mod util;
 pub use memory::{MemoryStore, MemoryStoreConfig};
 pub use util::{Content, HashBuffer};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ByteRangeSpec {
+    Inclusive { start: u64, end: u64 },
+    From { start: u64 },
+    Suffix { length: u64 },
+}
+
+impl ByteRangeSpec {
+    pub fn to_http_value(self) -> String {
+        match self {
+            Self::Inclusive { start, end } => format!("bytes={start}-{end}"),
+            Self::From { start } => format!("bytes={start}-"),
+            Self::Suffix { length } => format!("bytes=-{length}"),
+        }
+    }
+
+    pub fn resolve(self, total_size: u64) -> Option<ResolvedByteRange> {
+        if total_size == 0 {
+            return None;
+        }
+
+        let last = total_size - 1;
+        match self {
+            Self::Inclusive { start, end } if start <= end && start < total_size => {
+                Some(ResolvedByteRange {
+                    start,
+                    end: end.min(last),
+                })
+            }
+            Self::From { start } if start < total_size => {
+                Some(ResolvedByteRange { start, end: last })
+            }
+            Self::Suffix { length } if length > 0 => {
+                let length = length.min(total_size);
+                Some(ResolvedByteRange {
+                    start: total_size - length,
+                    end: last,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedByteRange {
+    start: u64,
+    end: u64,
+}
+
+impl ResolvedByteRange {
+    pub fn start(self) -> u64 {
+        self.start
+    }
+
+    pub fn end(self) -> u64 {
+        self.end
+    }
+
+    pub fn len(self) -> u64 {
+        self.end - self.start + 1
+    }
+
+    pub fn is_empty(self) -> bool {
+        false
+    }
+}
+
+#[derive(Debug)]
+pub enum RangeRead<R> {
+    Content {
+        total_size: u64,
+        range: ResolvedByteRange,
+        content: Content<R>,
+    },
+    Unsatisfiable {
+        total_size: u64,
+    },
+}
+
 #[async_trait]
 pub trait StorageConfig<S> {
     type Error: StdError;
@@ -50,6 +130,12 @@ pub trait ImmutableReadStore: Send + Sync {
         space: &SpaceId,
         id: &Hash,
     ) -> Result<Option<Content<Self::Readable>>, Self::Error>;
+    async fn read_range(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        range: ByteRangeSpec,
+    ) -> Result<Option<RangeRead<Self::Readable>>, Self::Error>;
     async fn read_to_vec(
         &self,
         space: &SpaceId,
@@ -137,6 +223,14 @@ where
     ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
         self.read(space, id).await
     }
+    async fn read_range(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        range: ByteRangeSpec,
+    ) -> Result<Option<RangeRead<Self::Readable>>, Self::Error> {
+        self.read_range(space, id, range).await
+    }
     async fn read_to_vec(
         &self,
         space: &SpaceId,
@@ -146,6 +240,38 @@ where
         Self::Readable: Send,
     {
         self.read_to_vec(space, id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_http_byte_range_shapes() {
+        assert_eq!(
+            ByteRangeSpec::Inclusive { start: 2, end: 5 }.resolve(10),
+            Some(ResolvedByteRange { start: 2, end: 5 })
+        );
+        assert_eq!(
+            ByteRangeSpec::Inclusive { start: 8, end: 50 }.resolve(10),
+            Some(ResolvedByteRange { start: 8, end: 9 })
+        );
+        assert_eq!(
+            ByteRangeSpec::From { start: 7 }.resolve(10),
+            Some(ResolvedByteRange { start: 7, end: 9 })
+        );
+        assert_eq!(
+            ByteRangeSpec::Suffix { length: 3 }.resolve(10),
+            Some(ResolvedByteRange { start: 7, end: 9 })
+        );
+        assert_eq!(
+            ByteRangeSpec::Suffix { length: 50 }.resolve(10),
+            Some(ResolvedByteRange { start: 0, end: 9 })
+        );
+        assert_eq!(ByteRangeSpec::From { start: 10 }.resolve(10), None);
+        assert_eq!(ByteRangeSpec::Suffix { length: 0 }.resolve(10), None);
+        assert_eq!(ByteRangeSpec::From { start: 0 }.resolve(0), None);
     }
 }
 

@@ -1,7 +1,8 @@
 use crate::hash::Hash;
 use crate::storage::{
-    Content, HashBuffer, ImmutableDeleteStore, ImmutableReadStore, ImmutableStaging,
-    ImmutableWriteStore, KeyedWriteError, StorageConfig, StorageSetup, StoreSize, VecReadError,
+    ByteRangeSpec, Content, HashBuffer, ImmutableDeleteStore, ImmutableReadStore, ImmutableStaging,
+    ImmutableWriteStore, KeyedWriteError, RangeRead, StorageConfig, StorageSetup, StoreSize,
+    VecReadError,
 };
 use dashmap::DashMap;
 use futures::io::Cursor;
@@ -95,6 +96,30 @@ impl ImmutableReadStore for MemoryStore {
             start.elapsed(),
         );
         result
+    }
+
+    async fn read_range(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        range: ByteRangeSpec,
+    ) -> Result<Option<RangeRead<Self::Readable>>, Self::Error> {
+        let Some(space) = self.spaces.get(space) else {
+            return Ok(None);
+        };
+        let Some(data) = space.get(id) else {
+            return Ok(None);
+        };
+        let total_size = data.len() as u64;
+        let Some(range) = range.resolve(total_size) else {
+            return Ok(Some(RangeRead::Unsatisfiable { total_size }));
+        };
+        let bytes = data[range.start() as usize..=range.end() as usize].to_vec();
+        Ok(Some(RangeRead::Content {
+            total_size,
+            range,
+            content: Content::new(bytes.len() as u64, Cursor::new(bytes)),
+        }))
     }
 
     async fn read_to_vec(

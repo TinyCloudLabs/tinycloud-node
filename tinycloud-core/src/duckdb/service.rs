@@ -15,6 +15,8 @@ use super::{
     types::*,
 };
 
+const MAX_WAL_DELTA_BYTES: usize = 8 * 1024 * 1024;
+
 pub struct DuckDbService {
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
     base_path: String,
@@ -75,20 +77,9 @@ impl DuckDbService {
             .await?;
 
         if !result.write_targets.is_empty() {
-            let payload = match handle.export().await {
-                Ok(payload) => payload,
-                Err(e) => {
-                    let _ = self.discard_local_state(&key).await;
-                    return Err(e);
-                }
-            };
-            if let Err(e) = self
-                .artifact_repository
-                .save("duckdb", &space.to_string(), db_name, payload)
-                .await
-            {
+            if let Err(e) = self.persist_write(space, db_name, &handle).await {
                 let _ = self.discard_local_state(&key).await;
-                return Err(artifact_error_to_duckdb(e));
+                return Err(e);
             }
         }
 
@@ -102,22 +93,20 @@ impl DuckDbService {
 
         // If there's a live actor, route through it (handles both in-memory and file-backed)
         if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
-            return handle.export().await;
+            return self.checkpoint(space, db_name, &handle).await;
         }
 
-        match self
+        if self
             .artifact_repository
             .load("duckdb", &space.to_string(), db_name)
             .await
             .map_err(artifact_error_to_duckdb)?
+            .is_none()
         {
-            Some(artifact) => {
-                remove_duckdb_cache_files(&self.cache_path(space, db_name)).await?;
-                write_cache_file(&self.cache_path(space, db_name), &artifact.payload).await?;
-                Ok(artifact.payload)
-            }
-            None => Err(DuckDbError::DatabaseNotFound),
+            return Err(DuckDbError::DatabaseNotFound);
         }
+        let handle = self.handle(space, db_name).await?;
+        self.checkpoint(space, db_name, &handle).await
     }
 
     pub async fn import_db(
@@ -230,7 +219,11 @@ impl DuckDbService {
         {
             Some(artifact) => {
                 remove_duckdb_cache_files(&cache_path).await?;
-                write_cache_file(&cache_path, &artifact.payload).await
+                write_cache_file(&cache_path, &artifact.payload).await?;
+                if let Some(delta) = artifact.delta_payload {
+                    write_cache_file(&duckdb_wal_path(&cache_path), &delta).await?;
+                }
+                Ok(())
             }
             None => remove_duckdb_cache_files(&cache_path).await,
         }
@@ -248,6 +241,72 @@ impl DuckDbService {
             .join(&key.0)
             .join(format!("{}.duckdb", key.1));
         remove_duckdb_cache_files(&cache_path).await
+    }
+
+    async fn persist_write(
+        &self,
+        space: &SpaceId,
+        db_name: &str,
+        handle: &DatabaseHandle,
+    ) -> Result<(), DuckDbError> {
+        if let Some(wal) = handle
+            .wal()
+            .await?
+            .filter(|wal| wal.len() < MAX_WAL_DELTA_BYTES)
+        {
+            match self
+                .artifact_repository
+                .save_delta("duckdb", &space.to_string(), db_name, wal)
+                .await
+            {
+                Ok(saved) => {
+                    tracing::info!(
+                        service = "duckdb",
+                        space = %space,
+                        db = db_name,
+                        mode = "wal",
+                        bytes = saved.delta_size_bytes,
+                        logical_bytes = saved.size_bytes,
+                        revision = saved.revision,
+                        "Persisted incremental database artifact"
+                    );
+                    return Ok(());
+                }
+                Err(
+                    DatabaseArtifactError::MissingCheckpoint
+                    | DatabaseArtifactError::IncrementalPersistenceUnsupported,
+                ) => {}
+                Err(error) => return Err(artifact_error_to_duckdb(error)),
+            }
+        }
+
+        self.checkpoint(space, db_name, handle).await.map(|_| ())
+    }
+
+    async fn checkpoint(
+        &self,
+        space: &SpaceId,
+        db_name: &str,
+        handle: &DatabaseHandle,
+    ) -> Result<Vec<u8>, DuckDbError> {
+        let payload = handle.export().await?;
+        let bytes = payload.len();
+        let saved = self
+            .artifact_repository
+            .save("duckdb", &space.to_string(), db_name, payload.clone())
+            .await
+            .map_err(artifact_error_to_duckdb)?;
+        tracing::info!(
+            service = "duckdb",
+            space = %space,
+            db = db_name,
+            mode = "checkpoint",
+            bytes,
+            logical_bytes = saved.size_bytes,
+            revision = saved.revision,
+            "Persisted database checkpoint"
+        );
+        Ok(payload)
     }
 }
 
@@ -280,6 +339,10 @@ async fn remove_duckdb_cache_files(path: &Path) -> Result<(), DuckDbError> {
         }
     }
     Ok(())
+}
+
+fn duckdb_wal_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.wal", path.display()))
 }
 
 fn artifact_error_to_duckdb(err: DatabaseArtifactError) -> DuckDbError {
@@ -319,6 +382,16 @@ mod tests {
         DuckDbService::new(
             cache.path().to_string_lossy().to_string(),
             u64::MAX,
+            300,
+            "128MB".to_string(),
+            repo,
+        )
+    }
+
+    fn file_service(cache: &TempDir, repo: Arc<SeaOrmDatabaseArtifactRepository>) -> DuckDbService {
+        DuckDbService::new(
+            cache.path().to_string_lossy().to_string(),
+            0,
             300,
             "128MB".to_string(),
             repo,
@@ -385,6 +458,125 @@ mod tests {
             hydrated_path.exists(),
             "durable artifact should hydrate cache"
         );
+    }
+
+    #[tokio::test]
+    async fn duckdb_file_backed_small_writes_persist_wal_not_full_database() {
+        let repo = artifact_repository().await;
+        let source_cache = TempDir::new().unwrap();
+        let file_cache = TempDir::new().unwrap();
+        let recovery_cache = TempDir::new().unwrap();
+        let space = test_space_id("duckdb-wal-delta");
+        let source = service(&source_cache, repo.clone());
+
+        source
+            .execute(
+                &space,
+                "analytics",
+                DuckDbRequest::Execute {
+                    schema: None,
+                    sql: "CREATE TABLE events (id INTEGER, name VARCHAR)".to_string(),
+                    params: Vec::new(),
+                },
+                None,
+                "tinycloud.duckdb/write".to_string(),
+                false,
+            )
+            .await
+            .unwrap();
+        source
+            .execute(
+                &space,
+                "analytics",
+                DuckDbRequest::Execute {
+                    schema: None,
+                    sql: "INSERT INTO events VALUES (0, repeat('x', 1000000))".to_string(),
+                    params: Vec::new(),
+                },
+                None,
+                "tinycloud.duckdb/write".to_string(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Hydrating a fresh cache from the durable checkpoint starts the actor
+        // file-backed, matching a heavy production database after restart.
+        let service = file_service(&file_cache, repo.clone());
+        service
+            .execute(
+                &space,
+                "analytics",
+                DuckDbRequest::Execute {
+                    schema: None,
+                    sql: "INSERT INTO events VALUES (1, 'one')".to_string(),
+                    params: Vec::new(),
+                },
+                None,
+                "tinycloud.duckdb/write".to_string(),
+                false,
+            )
+            .await
+            .unwrap();
+        let artifact = repo
+            .load("duckdb", &space.to_string(), "analytics")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(artifact.storage_mode, "checkpoint+wal");
+        assert!(artifact.delta_size_bytes > 0);
+        println!(
+            "duckdb artifact persistence: checkpoint={} delta={}",
+            artifact.payload.len(),
+            artifact.delta_size_bytes
+        );
+        assert!(
+            artifact.delta_size_bytes < artifact.payload.len() as i64,
+            "a small write should transfer fewer bytes than the checkpoint"
+        );
+
+        // DuckDB export checkpoints the engine, so the exported checkpoint is
+        // durably installed before a subsequent WAL replaces the old delta.
+        service.export(&space, "analytics").await.unwrap();
+        service
+            .execute(
+                &space,
+                "analytics",
+                DuckDbRequest::Execute {
+                    schema: None,
+                    sql: "INSERT INTO events VALUES (2, 'two')".to_string(),
+                    params: Vec::new(),
+                },
+                None,
+                "tinycloud.duckdb/write".to_string(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let recreated = file_service(&recovery_cache, repo);
+        let result = recreated
+            .execute(
+                &space,
+                "analytics",
+                DuckDbRequest::Query {
+                    sql: "SELECT name FROM events WHERE id > 0 ORDER BY id".to_string(),
+                    params: Vec::new(),
+                },
+                None,
+                "tinycloud.duckdb/read".to_string(),
+                false,
+            )
+            .await
+            .unwrap();
+        match result.response {
+            DuckDbResponse::Query(query) => {
+                assert_eq!(query.row_count, 2);
+                assert_eq!(query.rows[0][0], DuckDbValue::Text("one".to_string()));
+                assert_eq!(query.rows[1][0], DuckDbValue::Text("two".to_string()));
+            }
+            other => panic!("expected query response, got {other:?}"),
+        }
     }
 
     #[tokio::test]

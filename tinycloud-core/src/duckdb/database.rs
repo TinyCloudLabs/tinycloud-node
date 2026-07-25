@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -23,6 +23,9 @@ enum DbMessage {
     },
     Export {
         response_tx: oneshot::Sender<Result<Vec<u8>, DuckDbError>>,
+    },
+    Wal {
+        response_tx: oneshot::Sender<Result<Option<Vec<u8>>, DuckDbError>>,
     },
 }
 
@@ -59,6 +62,17 @@ impl DatabaseHandle {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
             .send(DbMessage::Export { response_tx })
+            .await
+            .map_err(|_| DuckDbError::Internal("Database actor not available".to_string()))?;
+        response_rx
+            .await
+            .map_err(|_| DuckDbError::Internal("Database actor dropped response".to_string()))?
+    }
+
+    pub async fn wal(&self) -> Result<Option<Vec<u8>>, DuckDbError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send(DbMessage::Wal { response_tx })
             .await
             .map_err(|_| DuckDbError::Internal("Database actor not available".to_string()))?;
         response_rx
@@ -103,6 +117,10 @@ pub fn spawn_actor(
                                 .send(Err(DuckDbError::Internal(format!("Failed to open: {}", e))));
                         }
                         DbMessage::Export { response_tx } => {
+                            let _ = response_tx
+                                .send(Err(DuckDbError::Internal(format!("Failed to open: {}", e))));
+                        }
+                        DbMessage::Wal { response_tx } => {
                             let _ = response_tx
                                 .send(Err(DuckDbError::Internal(format!("Failed to open: {}", e))));
                         }
@@ -160,6 +178,10 @@ pub fn spawn_actor(
                     let result = handle_export(&conn, &mode, &file_path);
                     let _ = response_tx.send(result);
                 }
+                DbMessage::Wal { response_tx } => {
+                    let result = handle_wal(&mode, &file_path);
+                    let _ = response_tx.send(result);
+                }
             }
         }
 
@@ -168,6 +190,18 @@ pub fn spawn_actor(
     });
 
     DatabaseHandle { tx }
+}
+
+fn handle_wal(mode: &StorageMode, file_path: &Path) -> Result<Option<Vec<u8>>, DuckDbError> {
+    if !matches!(mode, StorageMode::File(_)) {
+        return Ok(None);
+    }
+    match std::fs::read(format!("{}.wal", file_path.display())) {
+        Ok(wal) if !wal.is_empty() => Ok(Some(wal)),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(DuckDbError::Internal(error.to_string())),
+    }
 }
 
 fn handle_export(
