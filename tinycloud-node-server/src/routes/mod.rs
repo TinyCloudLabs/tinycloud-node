@@ -1393,7 +1393,7 @@ async fn invoke_impl(
                     } else {
                         let mut results = Vec::with_capacity(outcomes.len());
                         for ((path, is_read), outcome) in
-                            batch_specs.into_iter().zip(outcomes.into_iter())
+                            batch_specs.into_iter().zip(outcomes)
                         {
                             let value = match (is_read, outcome) {
                                 (true, InvocationOutcome::KvRead(Some((metadata, hash, mut data)))) => {
