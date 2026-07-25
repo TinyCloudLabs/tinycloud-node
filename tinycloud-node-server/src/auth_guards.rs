@@ -44,6 +44,64 @@ struct KvBatchWriteResponse {
     count: usize,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KvBatchReadResponse {
+    results: Vec<KvBatchReadResponseItem>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KvBatchReadResponseItem {
+    key: String,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    headers: Option<BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<KvBatchReadError>,
+}
+
+#[derive(Serialize)]
+struct KvBatchReadError {
+    code: &'static str,
+    message: String,
+}
+
+fn kv_batch_read_response(items: Vec<tinycloud_core::KvBatchReadItem>) -> KvBatchReadResponse {
+    let results = items
+        .into_iter()
+        .map(|item| match item.value {
+            Some(value) => {
+                let mut headers = value.metadata.0;
+                headers.insert("etag".to_string(), kv_etag(value.hash));
+                if let Some(data) = value.data.as_ref() {
+                    headers.insert("content-length".to_string(), data.len().to_string());
+                }
+                KvBatchReadResponseItem {
+                    key: item.path.to_string(),
+                    ok: true,
+                    data_base64: value.data.map(base64::encode),
+                    headers: Some(headers),
+                    error: None,
+                }
+            }
+            None => KvBatchReadResponseItem {
+                key: item.path.to_string(),
+                ok: false,
+                data_base64: None,
+                headers: None,
+                error: Some(KvBatchReadError {
+                    code: "KV_NOT_FOUND",
+                    message: format!("Key not found: {}", item.path),
+                }),
+            },
+        })
+        .collect();
+    KvBatchReadResponse { results }
+}
+
 struct KvListResponse(Vec<tinycloud_auth::resource::Path>, bool);
 
 impl<'r> Responder<'r, 'static> for KvListResponse {
@@ -138,6 +196,9 @@ where
                 })
                 .respond_to(request)
             }
+            InvocationOutcome::KvBatchRead(items) => {
+                Json(kv_batch_read_response(items)).respond_to(request)
+            }
             InvocationOutcome::KvRead(data) => data
                 .map(|(md, hash, c)| KVResponse(c, md, hash))
                 .respond_to(request),
@@ -177,6 +238,42 @@ where
                 .sized_body(data.len(), std::io::Cursor::new(data))
                 .ok(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tinycloud_core::{hash::hash, KvBatchReadItem, KvBatchReadValue};
+
+    #[test]
+    fn batch_read_response_keeps_successes_and_missing_keys_in_order() {
+        let response = kv_batch_read_response(vec![
+            KvBatchReadItem {
+                path: "found".parse().unwrap(),
+                value: Some(KvBatchReadValue {
+                    metadata: Metadata(BTreeMap::from([(
+                        "content-type".to_string(),
+                        "text/plain".to_string(),
+                    )])),
+                    hash: hash(b"hello"),
+                    data: Some(b"hello".to_vec()),
+                }),
+            },
+            KvBatchReadItem {
+                path: "missing".parse().unwrap(),
+                value: None,
+            },
+        ]);
+
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["results"][0]["key"], "found");
+        assert_eq!(json["results"][0]["ok"], true);
+        assert_eq!(json["results"][0]["dataBase64"], "aGVsbG8=");
+        assert_eq!(json["results"][0]["headers"]["content-length"], "5");
+        assert_eq!(json["results"][1]["key"], "missing");
+        assert_eq!(json["results"][1]["ok"], false);
+        assert_eq!(json["results"][1]["error"]["code"], "KV_NOT_FOUND");
     }
 }
 

@@ -1329,6 +1329,7 @@ pub enum InvocationOutcome<R> {
     KvMetadata(Option<(Metadata, Hash)>),
     KvWrite(Hash),
     KvBatchWrite(Vec<Path>),
+    KvBatchRead(Vec<KvBatchReadItem>),
     KvRead(Option<(Metadata, Hash, Content<R>)>),
     OpenSessions(HashMap<Hash, DelegationInfo>),
     /// Ordered delegation chain from leaf to root
@@ -1338,6 +1339,19 @@ pub enum InvocationOutcome<R> {
     DuckDbResult(serde_json::Value),
     DuckDbExport(Vec<u8>),
     DuckDbArrow(Vec<u8>),
+}
+
+#[derive(Debug)]
+pub struct KvBatchReadItem {
+    pub path: Path,
+    pub value: Option<KvBatchReadValue>,
+}
+
+#[derive(Debug)]
+pub struct KvBatchReadValue {
+    pub metadata: Metadata,
+    pub hash: Hash,
+    pub data: Option<Vec<u8>>,
 }
 
 impl<S: StorageSetup, K: Secrets> From<delegation::Error> for TxError<S, K> {
