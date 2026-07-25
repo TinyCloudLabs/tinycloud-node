@@ -3798,9 +3798,9 @@ mod tests {
 
         let rocket = rocket::build()
             .mount("/", rocket::routes![invoke])
-            .attach(crate::tracing::TracingFairing {
-                header_name: Config::default().log.tracing.traceheader,
-            })
+            .attach(crate::tracing::TracingFairing::new(
+                &Config::default().log.tracing,
+            ))
             .manage(tinycloud)
             .manage(sql_service)
             .manage(Config::default())
@@ -4053,9 +4053,9 @@ mod tests {
 
         let rocket = rocket::build()
             .mount("/", rocket::routes![invoke])
-            .attach(crate::tracing::TracingFairing {
-                header_name: Config::default().log.tracing.traceheader,
-            })
+            .attach(crate::tracing::TracingFairing::new(
+                &Config::default().log.tracing,
+            ))
             .manage(tinycloud)
             .manage(sql_service)
             .manage(Config::default())
@@ -4711,9 +4711,9 @@ mod tests {
                 "/",
                 rocket::routes![delegation_status, delegation_query, revoke],
             )
-            .attach(crate::tracing::TracingFairing {
-                header_name: Config::default().log.tracing.traceheader,
-            })
+            .attach(crate::tracing::TracingFairing::new(
+                &Config::default().log.tracing,
+            ))
             .manage(tinycloud);
         let client = Client::tracked(rocket).await?;
         let child_cid = child_id.to_cid(0x55).to_string();
@@ -5465,9 +5465,9 @@ mod tests {
     ) -> rocket::Rocket<rocket::Build> {
         rocket::build()
             .mount("/", rocket::routes![invoke])
-            .attach(crate::tracing::TracingFairing {
-                header_name: Config::default().log.tracing.traceheader,
-            })
+            .attach(crate::tracing::TracingFairing::new(
+                &Config::default().log.tracing,
+            ))
             .manage(setup.tinycloud)
             .manage(setup.sql_service)
             .manage(Config::default())
