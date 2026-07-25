@@ -7,65 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.8.0](https://github.com/TinyCloudLabs/tinycloud-node/compare/v0.0.1...v1.8.0) - 2026-07-25
+## [1.9.0](https://github.com/TinyCloudLabs/tinycloud-node/compare/v1.8.0...v1.9.0) - 2026-07-25
 
 ### Added
 
-- export production Share invitation descriptor
-- expose production share policy runtime
-- integrate node share email trust bundle
-- converge node email claim authority path
-- inject authenticated share authority providers
-- close node authority seam
+- Add a reproducible production invoke performance baseline and stage-level
+  instrumentation ([#147](https://github.com/TinyCloudLabs/tinycloud-node/pull/147))
+- Execute KV batch reads in one authenticated invocation
+  ([#151](https://github.com/TinyCloudLabs/tinycloud-node/pull/151))
+- Add range-capable signed blob reads
+  ([#155](https://github.com/TinyCloudLabs/tinycloud-node/pull/155))
+- Add a benchmark-enabled node container image
+  ([#154](https://github.com/TinyCloudLabs/tinycloud-node/pull/154))
 
-### Fixed
+### Changed
 
-- *(TC-274)* satisfy current node clippy
-- use vendored email claim test paths
-- make node CI contract fixtures deterministic
-- fix CI control assertions and hermetic email fixture
-- fix CI server module and test compilation
-- fix CI async tests and server clippy
-- fix CI for verifier wasm and share email runtime
-- include mounted n4 crate in Docker planner
-- require shared trust bundle in node production
-- mount shared email trust bundle
-- restore frozen node share route surface
-- harden share email node deployment
-- align authority audit with canonical root time
-- bind policy recipient digest to email bytes
-- bind holder session to challenge body
-- avoid release diagnostic warnings
-- keep mounted authorization diagnostics compilable
-- pin node email vectors to authoritative manifest
-- align email claim wire responses
-- reconcile node email claim authority bridge
-- close email claim node review blockers
-
-### Other
-
-- Merge pull request #155 from TinyCloudLabs/skgbafa/tc-275-blob-data-plane
-- Merge pull request #154 from TinyCloudLabs/skgbafa/tc-277-bench-image
-- Merge pull request #152 from TinyCloudLabs/skgbafa/tc-273-concurrent-read-audit
-- *(TC-273)* group-commit authenticated read audits
-- keep live control status separate from service manager
-- keep fixture trust exception test-scoped
-- repin email claim contract
-- remove mounted SQL diagnostics
-- trace mounted SQL read failure
-- fix mounted invitation trace
-- trace mounted invitation rejection
-- remove mounted authorization diagnostics
-- trace mounted read authorization
-- remove mounted boundary diagnostics
-- trace mounted read preflight
-- trace mounted read denial
-- trace mounted authority denial
-- diagnose mounted policy session denial
-- diagnose mounted authorization stage
-- align mounted signer with frozen enrollment
-- Harden email claim Node bindings and read responses
-- Compose exact-email share authorization routes
+- Snapshot the authorization graph once per invocation
+  ([#148](https://github.com/TinyCloudLabs/tinycloud-node/pull/148))
+- Persist replay protection across restarts
+  ([#150](https://github.com/TinyCloudLabs/tinycloud-node/pull/150))
+- Materialize current KV state for direct reads
+  ([#149](https://github.com/TinyCloudLabs/tinycloud-node/pull/149))
+- Group-commit authenticated read audits
+  ([#152](https://github.com/TinyCloudLabs/tinycloud-node/pull/152))
+- Persist incremental SQL and DuckDB WAL artifacts
+  ([#153](https://github.com/TinyCloudLabs/tinycloud-node/pull/153))
 
 ## [1.6.1](https://github.com/TinyCloudLabs/tinycloud-node/compare/v1.6.0...v1.6.1) - 2026-07-18
 
