@@ -12,6 +12,7 @@ use std::{
     collections::HashMap,
     io::{Error as IoError, ErrorKind, SeekFrom},
     path::{Path, PathBuf},
+    time::Instant,
 };
 use tempfile::{NamedTempFile, PathPersistError};
 use tinycloud_auth::{resource::SpaceId, ssi::dids::DIDBuf};
@@ -120,14 +121,21 @@ impl ImmutableReadStore for FileSystemStore {
         space: &SpaceId,
         id: &Hash,
     ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
-        match File::open(self.get_path(space, id)).await {
+        let start = Instant::now();
+        let result = match File::open(self.get_path(space, id)).await {
             Ok(file) => {
                 let size = file.metadata().await?.len();
                 Ok(Some(Content::new(size, file.take(size).compat())))
             }
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
-        }
+        };
+        crate::prometheus::observe_stage(
+            crate::prometheus::InvocationStage::BlockRead,
+            crate::prometheus::StageOutcome::from(result.is_ok()),
+            start.elapsed(),
+        );
+        result
     }
 
     async fn read_range(
@@ -265,16 +273,25 @@ impl ImmutableWriteStore<TempFileSystemStage> for FileSystemStore {
         space: &SpaceId,
         staged: HashBuffer<<TempFileSystemStage as ImmutableStaging>::Writable>,
     ) -> Result<Hash, Self::Error> {
-        let (mut h, f) = staged.into_inner();
-
-        let hash = h.finalize();
-        if !self.contains(space, &hash).await? {
-            let size = f.size().await?;
-            let (_, path) = f.into_inner();
-            path.persist(self.get_path(space, &hash))?;
-            self.increment_size(space, size).await;
+        let start = Instant::now();
+        let result = async move {
+            let (mut h, f) = staged.into_inner();
+            let hash = h.finalize();
+            if !self.contains(space, &hash).await? {
+                let size = f.size().await?;
+                let (_, path) = f.into_inner();
+                path.persist(self.get_path(space, &hash))?;
+                self.increment_size(space, size).await;
+            }
+            Ok(hash)
         }
-        Ok(hash)
+        .await;
+        crate::prometheus::observe_stage(
+            crate::prometheus::InvocationStage::BlockWrite,
+            crate::prometheus::StageOutcome::from(result.is_ok()),
+            start.elapsed(),
+        );
+        result
     }
 }
 
@@ -286,17 +303,27 @@ impl ImmutableWriteStore<memory::MemoryStaging> for FileSystemStore {
         space: &SpaceId,
         staged: HashBuffer<<memory::MemoryStaging as ImmutableStaging>::Writable>,
     ) -> Result<Hash, Self::Error> {
-        let (mut h, v) = staged.into_inner();
-        let hash = h.finalize();
-        if !self.contains(space, &hash).await? {
-            let file = File::create(self.get_path(space, &hash)).await?;
-            let size = v.len() as u64;
-            let mut writer = futures::io::BufWriter::new(file.compat());
-            writer.write_all(&v).await?;
-            writer.flush().await?;
-            self.increment_size(space, size).await;
+        let start = Instant::now();
+        let result = async move {
+            let (mut h, v) = staged.into_inner();
+            let hash = h.finalize();
+            if !self.contains(space, &hash).await? {
+                let file = File::create(self.get_path(space, &hash)).await?;
+                let size = v.len() as u64;
+                let mut writer = futures::io::BufWriter::new(file.compat());
+                writer.write_all(&v).await?;
+                writer.flush().await?;
+                self.increment_size(space, size).await;
+            }
+            Ok(hash)
         }
-        Ok(hash)
+        .await;
+        crate::prometheus::observe_stage(
+            crate::prometheus::InvocationStage::BlockWrite,
+            crate::prometheus::StageOutcome::from(result.is_ok()),
+            start.elapsed(),
+        );
+        result
     }
 }
 
@@ -310,28 +337,38 @@ impl ImmutableWriteStore<either::Either<TempFileSystemStage, memory::MemoryStagi
         space: &SpaceId,
         staged: HashBuffer<<either::Either<TempFileSystemStage, memory::MemoryStaging> as ImmutableStaging>::Writable>,
     ) -> Result<Hash, Self::Error> {
-        let (mut h, f) = staged.into_inner();
-        let hash = h.finalize();
+        let start = Instant::now();
+        let result = async move {
+            let (mut h, f) = staged.into_inner();
+            let hash = h.finalize();
 
-        if !self.contains(space, &hash).await? {
-            match f {
-                AsyncEither::Left(t_file) => {
-                    let size = t_file.size().await?;
-                    let (_, path) = t_file.into_inner();
-                    path.persist(self.get_path(space, &hash))?;
-                    self.increment_size(space, size).await;
+            if !self.contains(space, &hash).await? {
+                match f {
+                    AsyncEither::Left(t_file) => {
+                        let size = t_file.size().await?;
+                        let (_, path) = t_file.into_inner();
+                        path.persist(self.get_path(space, &hash))?;
+                        self.increment_size(space, size).await;
+                    }
+                    AsyncEither::Right(v) => {
+                        let file = File::create(self.get_path(space, &hash)).await?;
+                        let size = v.len() as u64;
+                        let mut writer = futures::io::BufWriter::new(file.compat());
+                        writer.write_all(&v).await?;
+                        writer.flush().await?;
+                        self.increment_size(space, size).await;
+                    }
                 }
-                AsyncEither::Right(v) => {
-                    let file = File::create(self.get_path(space, &hash)).await?;
-                    let size = v.len() as u64;
-                    let mut writer = futures::io::BufWriter::new(file.compat());
-                    writer.write_all(&v).await?;
-                    writer.flush().await?;
-                    self.increment_size(space, size).await;
-                }
-            }
-        };
-        Ok(hash)
+            };
+            Ok(hash)
+        }
+        .await;
+        crate::prometheus::observe_stage(
+            crate::prometheus::InvocationStage::BlockWrite,
+            crate::prometheus::StageOutcome::from(result.is_ok()),
+            start.elapsed(),
+        );
+        result
     }
 }
 
