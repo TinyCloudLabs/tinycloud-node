@@ -52,6 +52,12 @@ use hooks::HookRuntime;
 use invocation_replay::InvocationReplayCache;
 use node_control::control::ControlPlaneHandle;
 use quota::QuotaCache;
+#[cfg(feature = "tc-bench-v1")]
+use routes::tc_bench::{
+    auth_verify as tc_bench_auth_verify, block_get as tc_bench_block_get,
+    block_put as tc_bench_block_put, health as tc_bench_health, kv_get as tc_bench_kv_get,
+    kv_put as tc_bench_kv_put, BenchState,
+};
 use routes::{
     admin::{delete_quota, get_quota, get_usage, list_quotas, set_quota},
     attestation::attestation,
@@ -194,6 +200,15 @@ pub async fn app_with_control(
         revoke_encryption_network,
     ];
     routes.extend(share_email::public_routes());
+    #[cfg(feature = "tc-bench-v1")]
+    routes.extend(rocket::routes![
+        tc_bench_auth_verify,
+        tc_bench_kv_put,
+        tc_bench_kv_get,
+        tc_bench_block_put,
+        tc_bench_block_get,
+        tc_bench_health,
+    ]);
 
     let key_setup: StaticSecret = resolve_keys(&tinycloud_config.keys).await?;
     let webhook_encryption =
@@ -306,6 +321,13 @@ pub async fn app_with_control(
     // `database_artifact` table now exists (seeding before migrations would
     // fail boot on a fresh datadir). Runs before Rocket serves any request.
     sql_sizes.seed_from(&seed_conn).await?;
+    #[cfg(feature = "tc-bench-v1")]
+    let bench_state = BenchState::new(
+        &tinycloud_config.tc_bench,
+        seed_conn.clone(),
+        if is_sqlite { 1 } else { 100 },
+    )
+    .await?;
 
     let sql_service = SqlService::new(
         tinycloud_config.storage.sql.path.clone().expect("resolved"),
@@ -412,6 +434,8 @@ pub async fn app_with_control(
         ))
         .manage(tinycloud)
         .manage(sql_service);
+    #[cfg(feature = "tc-bench-v1")]
+    let rocket = rocket.manage(bench_state);
     #[cfg(feature = "duckdb")]
     let rocket = rocket.manage(duckdb_service);
     let rocket = rocket
