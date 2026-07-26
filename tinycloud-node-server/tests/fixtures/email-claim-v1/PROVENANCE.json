@@ -5,8 +5,8 @@
   "specSourcePath": "specs/email-claim-v1",
   "contractVersion": "tinycloud.share-email-claim/v1",
   "manifestVersion": 1,
-  "manifestDigest": "pl8-1Rpx_DYCBjOpK3hRrLfrSVDINNFssZDfFw6BMTs",
-  "manifestSha256": "3e6b8975938693be08847b86286030cd7920cb89774d673126f44ac2c4e2ce2f",
+  "manifestDigest": "KHBPOKKpXASbdfMxDbc_R7iH55b-uuaW45Vw4RouTr4",
+  "manifestSha256": "2ae35075e3a00a8a9bd6ce4d50c0ce173b632d06c896b1423d45e302fc81d077",
   "runtimeDependencies": [
     {
       "name": "@noble/hashes",
