@@ -27,6 +27,7 @@ pub mod quota;
 pub mod routes;
 pub mod runtime;
 pub mod share_email;
+pub mod share_v2;
 pub mod signed_urls;
 pub mod storage;
 pub mod tee;
@@ -230,6 +231,7 @@ pub async fn app_with_control(
         revoke_encryption_network,
     ];
     routes.extend(share_email::public_routes());
+    routes.extend(share_v2::public_routes());
     #[cfg(feature = "tc-bench-v1")]
     routes.extend(rocket::routes![
         tc_bench_auth_verify,
@@ -369,6 +371,13 @@ pub async fn app_with_control(
         Arc::new(tinycloud.clone()),
         Arc::new(sql_service.clone()),
     )?;
+    let share_v2_runtime = share_v2::compose(
+        seed_conn.clone(),
+        &key_setup,
+        tinycloud_config.share_email.clone(),
+        tee_context.clone(),
+    )
+    .await?;
     if let Some(runtime) = share_email_runtime.as_ref() {
         if !runtime.bridge.self_check().await {
             anyhow::bail!(
@@ -471,6 +480,7 @@ pub async fn app_with_control(
         .manage(webhook_encryption)
         .manage(rate_limiter)
         .manage(share_email_runtime)
+        .manage(Some(share_v2_runtime))
         .manage(tee_context)
         .manage(encryption_service)
         .manage(tinycloud_config.storage.staging.open().await?);
@@ -506,7 +516,9 @@ pub async fn app_with_control(
         move |request, response| {
             let share_allowed_origin = share_allowed_origin.clone();
             Box::pin(async move {
-                if request.uri().path().starts_with("/share/v1/") {
+                if request.uri().path().starts_with("/share/v1/")
+                    || request.uri().path().starts_with("/share/v2/")
+                {
                     response.set_header(Header::new("Cache-Control", "no-store"));
                     response.set_header(Header::new("X-Content-Type-Options", "nosniff"));
                     response.set_header(Header::new("Referrer-Policy", "no-referrer"));
@@ -514,7 +526,7 @@ pub async fn app_with_control(
                         "Access-Control-Allow-Origin",
                         share_allowed_origin,
                     ));
-                    response.set_header(Header::new("Access-Control-Allow-Methods", "POST"));
+                    response.set_header(Header::new("Access-Control-Allow-Methods", "GET, POST"));
                     response
                         .set_header(Header::new("Access-Control-Allow-Headers", "Content-Type"));
                 }
@@ -525,7 +537,9 @@ pub async fn app_with_control(
     if tinycloud_config.cors {
         Ok(rocket.attach(AdHoc::on_response("CORS", |request, resp| {
             Box::pin(async move {
-                if request.uri().path().starts_with("/share/v1/") {
+                if request.uri().path().starts_with("/share/v1/")
+                    || request.uri().path().starts_with("/share/v2/")
+                {
                     return;
                 }
                 resp.set_header(Header::new("Access-Control-Allow-Origin", "*"));

@@ -120,6 +120,8 @@ pub struct NodeInfo {
     pub quota_url: Option<String>,
     #[serde(rename = "shareEmail", skip_serializing_if = "Option::is_none")]
     pub share_email: Option<crate::share_email::CapabilityDescriptor>,
+    #[serde(rename = "shareV2", skip_serializing_if = "Option::is_none")]
+    pub share_v2: Option<crate::share_v2::CapabilityDescriptor>,
 }
 
 fn build_info(
@@ -127,6 +129,7 @@ fn build_info(
     quota_cache: &State<QuotaCache>,
     encryption: &State<EncryptionService>,
     share_email: &State<Option<crate::share_email::ShareEmailRuntime>>,
+    share_v2: &State<Option<crate::share_v2::ShareV2Runtime>>,
 ) -> NodeInfo {
     #[allow(unused_mut)]
     let mut features = vec!["kv", "delegation", "sharing", "sql"];
@@ -135,6 +138,14 @@ fn build_info(
     features.extend(["hooks", "signed-urls", "encryption"]);
     if share_email.inner().is_some() {
         features.push("share-email-claim");
+    }
+    if share_v2
+        .inner()
+        .as_ref()
+        .and_then(|runtime| runtime.capability())
+        .is_some()
+    {
+        features.push("share-v2");
     }
     #[cfg(feature = "dstack")]
     features.push("tee");
@@ -149,6 +160,10 @@ fn build_info(
             .inner()
             .as_ref()
             .map(|runtime| runtime.capability()),
+        share_v2: share_v2
+            .inner()
+            .as_ref()
+            .and_then(|runtime| runtime.capability()),
     }
 }
 
@@ -158,8 +173,15 @@ pub fn info(
     quota_cache: &State<QuotaCache>,
     encryption: &State<EncryptionService>,
     share_email: &State<Option<crate::share_email::ShareEmailRuntime>>,
+    share_v2: &State<Option<crate::share_v2::ShareV2Runtime>>,
 ) -> Json<NodeInfo> {
-    Json(build_info(tee, quota_cache, encryption, share_email))
+    Json(build_info(
+        tee,
+        quota_cache,
+        encryption,
+        share_email,
+        share_v2,
+    ))
 }
 
 #[get("/version")]
@@ -168,8 +190,15 @@ pub fn version(
     quota_cache: &State<QuotaCache>,
     encryption: &State<EncryptionService>,
     share_email: &State<Option<crate::share_email::ShareEmailRuntime>>,
+    share_v2: &State<Option<crate::share_v2::ShareV2Runtime>>,
 ) -> Json<NodeInfo> {
-    Json(build_info(tee, quota_cache, encryption, share_email))
+    Json(build_info(
+        tee,
+        quota_cache,
+        encryption,
+        share_email,
+        share_v2,
+    ))
 }
 
 #[allow(clippy::let_unit_value)]

@@ -50,6 +50,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_with = { version = "3.0", features = ["base64", "hex"] }
 sha2 = "0.10"
+serde_ipld_dagcbor.workspace = true
 toml = "0.8"
 thiserror = "2.0"
 time.workspace = true
