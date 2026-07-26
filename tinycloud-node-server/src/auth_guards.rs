@@ -247,6 +247,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::io::Cursor;
+    use rocket::local::asynchronous::Client;
     use tinycloud_core::{hash::hash, KvBatchReadItem, KvBatchReadValue};
 
     #[test]
@@ -277,6 +279,80 @@ mod tests {
         assert_eq!(json["results"][1]["key"], "missing");
         assert_eq!(json["results"][1]["ok"], false);
         assert_eq!(json["results"][1]["error"]["code"], "KV_NOT_FOUND");
+    }
+
+    #[test]
+    fn object_response_drops_hop_by_hop_headers() {
+        for header in NON_REPLAYABLE_OBJECT_HEADERS {
+            assert!(!is_replayable_object_header(header));
+        }
+        assert!(is_replayable_object_header("content-type"));
+    }
+
+    #[get("/")]
+    fn authenticated_stream() -> KVResponse<Cursor<Vec<u8>>> {
+        let body = vec![b'a'; 32 * 1024 * 1024];
+        KVResponse(
+            tinycloud_core::storage::Content::new(body.len() as u64, Cursor::new(body)),
+            Metadata(
+                [
+                    (
+                        "content-type".to_string(),
+                        "application/octet-stream".to_string(),
+                    ),
+                    ("transfer-encoding".to_string(), "chunked".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            hash(b"authenticated-stream"),
+        )
+    }
+
+    #[tokio::test]
+    async fn authenticated_response_headers_and_body_are_observed() -> Result<()> {
+        let client =
+            Client::tracked(rocket::build().mount("/", rocket::routes![authenticated_stream]))
+                .await?;
+        let response = client.get("/").dispatch().await;
+
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            response.headers().get_one("Content-Length"),
+            Some("33554432")
+        );
+        assert!(response.headers().get_one("Transfer-Encoding").is_none());
+        assert_eq!(response.into_bytes().await.unwrap().len(), 32 * 1024 * 1024);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kv_responder_sets_streaming_postconditions() -> Result<()> {
+        let client = Client::tracked(rocket::build()).await?;
+        let request = client.get("/");
+        let body = vec![b'k'; 32 * 1024];
+        let response = KVResponse::new(
+            Metadata(
+                [
+                    (
+                        "content-type".to_string(),
+                        "application/octet-stream".to_string(),
+                    ),
+                    ("transfer-encoding".to_string(), "chunked".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            hash(b"direct-authenticated-stream"),
+            tinycloud_core::storage::Content::new(body.len() as u64, Cursor::new(body)),
+        )
+        .respond_to(request.inner())
+        .map_err(|status| anyhow::anyhow!("KVResponse failed: {status}"))?;
+
+        assert_eq!(response.body().max_chunk_size(), STREAM_MAX_CHUNK_SIZE);
+        assert_eq!(response.headers().get_one("Content-Length"), Some("32768"));
+        assert!(response.headers().get_one("Transfer-Encoding").is_none());
+        Ok(())
     }
 }
 
@@ -323,6 +399,26 @@ impl CapJsonRep {
 
 pub struct ObjectHeaders(pub Metadata);
 
+pub(crate) const STREAM_MAX_CHUNK_SIZE: usize = 256 * 1024;
+
+const NON_REPLAYABLE_OBJECT_HEADERS: &[&str] = &[
+    "connection",
+    "content-length",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+pub(crate) fn is_replayable_object_header(name: &str) -> bool {
+    !NON_REPLAYABLE_OBJECT_HEADERS
+        .iter()
+        .any(|header| name.eq_ignore_ascii_case(header))
+}
+
 #[async_trait]
 impl<'r> FromRequest<'r> for ObjectHeaders {
     type Error = anyhow::Error;
@@ -340,7 +436,7 @@ impl<'r> Responder<'r, 'static> for ObjectHeaders {
     fn respond_to(self, _: &'r Request<'_>) -> rocket::response::Result<'static> {
         let mut r = Response::build();
         for (k, v) in self.0 .0 {
-            if k != "content-length" {
+            if is_replayable_object_header(&k) {
                 r.header(Header::new(k, v));
             }
         }
@@ -348,10 +444,10 @@ impl<'r> Responder<'r, 'static> for ObjectHeaders {
     }
 }
 
-pub struct KVResponse<R>(R, pub Metadata, pub Hash);
+pub struct KVResponse<R>(tinycloud_core::storage::Content<R>, pub Metadata, pub Hash);
 
 impl<R> KVResponse<R> {
-    pub fn new(md: Metadata, hash: Hash, reader: R) -> Self {
+    pub fn new(md: Metadata, hash: Hash, reader: tinycloud_core::storage::Content<R>) -> Self {
         Self(reader, md, hash)
     }
 }
@@ -361,11 +457,15 @@ where
     R: 'static + AsyncRead + Send,
 {
     fn respond_to(self, r: &'r Request<'_>) -> rocket::response::Result<'static> {
-        let etag = kv_etag(self.2);
-        Ok(Response::build_from(ObjectHeaders(self.1).respond_to(r)?)
+        let KVResponse(content, metadata, hash) = self;
+        let content_length = content.len();
+        let etag = kv_etag(hash);
+        Ok(Response::build_from(ObjectHeaders(metadata).respond_to(r)?)
             .header(Header::new("ETag", etag))
+            .header(Header::new("Content-Length", content_length.to_string()))
             // must ensure that Metadata::respond_to does not set the body of the response
-            .streamed_body(self.0.compat())
+            .streamed_body(content.compat())
+            .max_chunk_size(STREAM_MAX_CHUNK_SIZE)
             .finalize())
     }
 }
