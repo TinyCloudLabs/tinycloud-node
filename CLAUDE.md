@@ -133,7 +133,7 @@ Validate Capability → Check Resource Permission → Execute Operation
 
 ```toml
 [global]
-log_level = "debug"              # Logging verbosity: trace, debug, info, warn, error
+log_level = "normal"              # Rocket log verbosity: off, debug, normal, critical (NOT trace/info/warn/error)
 port = 8000                       # HTTP server port
 cors = true                       # Enable CORS headers
 
@@ -161,7 +161,8 @@ All use the `TINYCLOUD_` prefix:
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `TINYCLOUD_LOG_LEVEL` | Log verbosity | `debug` |
+| `TINYCLOUD_LOG_LEVEL` | Rocket's own log verbosity (off/debug/normal/critical). Does **not** control application log output — see `RUST_LOG` below. | `normal` |
+| `RUST_LOG` | The actual verbosity control for the `tracing`/`EnvFilter` subscriber that emits all application log lines. Defaults to `info` if unset. | `debug`, `tinycloud=debug` |
 | `TINYCLOUD_PORT` | Server port | `8000` |
 | `TINYCLOUD_STORAGE_DATADIR` | Root data directory | `./data` |
 | `TINYCLOUD_STORAGE_DATABASE` | Database URL (override) | `sqlite:./data/caps.db` |
@@ -172,6 +173,7 @@ All use the `TINYCLOUD_` prefix:
 | `TINYCLOUD_STORAGE_LIMIT` | Storage quota | `10 MiB` |
 | `TINYCLOUD_KEYS_SECRET` | Key derivation secret | Base64URL string |
 | `TINYCLOUD_SPACES_ALLOWLIST` | Allowlist endpoint | `http://localhost:10000` |
+| `ROCKET_MAX_BLOCKING` | Rocket's blocking-thread-pool cap (default 512). `ROCKET_`-prefixed, not `TINYCLOUD_`, because Rocket builds its tokio runtime from its own Figment before TinyCloud's config is loaded — `TINYCLOUD_MAX_BLOCKING` is silently ignored for this setting. | `1024` |
 
 ### Database Support
 
@@ -309,7 +311,10 @@ docker run -d \
 
 ### Debug Logging
 
-Set log level for verbose output:
+Application log verbosity is controlled by `RUST_LOG` (a `tracing`
+`EnvFilter`), not `TINYCLOUD_LOG_LEVEL` (which only affects Rocket's own
+internal logger and is not the mechanism used to filter application logs).
+Set it for verbose output:
 ```bash
-TINYCLOUD_LOG_LEVEL=trace cargo run
+RUST_LOG=debug cargo run
 ```
