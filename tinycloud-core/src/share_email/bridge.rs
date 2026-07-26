@@ -1041,9 +1041,8 @@ impl DatabaseAuthorityBridge117 {
                 &scope.authority_material_digest,
             )
             .await?;
-        validate_share_policy_state(&bundle.policy_state, scope).map_err(|failure| {
+        validate_share_policy_state(&bundle.policy_state, scope).inspect_err(|&failure| {
             tracing::error!(failure = ?failure, stage = "validate_share_policy_state", "share scope validation failed");
-            failure
         })?;
         let verifier = AuthorityArtifactVerifier;
         let signed_policy = verifier
@@ -1193,9 +1192,8 @@ impl DatabaseAuthorityBridge117 {
         {
             return Err(PortError::Denied);
         }
-        let statement = authorized_statement(scope, &policy, &delegation).map_err(|failure| {
+        let statement = authorized_statement(scope, &policy, &delegation).inspect_err(|&failure| {
             tracing::error!(failure = ?failure, stage = "authorized_statement", "share scope validation failed");
-            failure
         })?;
         Ok((expiry, matcher, statement, bundle.internal_delegation_cid))
     }

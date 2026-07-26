@@ -542,7 +542,7 @@ pub async fn addressed_delegate(
     {
         ShareAction::KvList
     } else {
-        source_action.clone()
+        source_action
     };
     validate_action_set(Some(&request.actions), validation_action)
         .map_err(|_| error(Status::BadRequest, "delegation_authorization_invalid"))?;
@@ -1476,7 +1476,7 @@ fn validate_invitation_recipient(
         (None, Some(matcher), delivery)
             if matcher.canonical().is_ok()
                 && matcher.canonical().ok() == policy_matcher.canonical().ok()
-                && delivery.map_or(true, |email| {
+                && delivery.is_none_or(|email| {
                     policy_matcher.matches_verified_email(email.as_str())
                 }) =>
         {

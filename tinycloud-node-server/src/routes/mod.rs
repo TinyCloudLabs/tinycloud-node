@@ -546,7 +546,7 @@ pub struct RevokeResponse {
     pub cid: String,
 }
 
-#[post("/invoke", format = "application/json", data = "<data>")]
+#[post("/invoke", data = "<data>")]
 #[cfg(feature = "duckdb")]
 #[allow(clippy::too_many_arguments)]
 pub async fn invoke(
@@ -580,7 +580,7 @@ pub async fn invoke(
     .await
 }
 
-#[post("/invoke", format = "application/json", data = "<data>")]
+#[post("/invoke", data = "<data>")]
 #[cfg(not(feature = "duckdb"))]
 #[allow(clippy::too_many_arguments)]
 pub async fn invoke(
@@ -821,6 +821,7 @@ fn kv_invoke_options(
     )
 }
 
+#[cfg(test)]
 fn kv_invoke_options_for_capabilities(
     capabilities: &[Capability],
     headers: &mut ObjectHeaders,
