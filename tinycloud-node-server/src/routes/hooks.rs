@@ -474,7 +474,7 @@ fn validate_webhook_url_shape(url: &reqwest::Url) -> Result<(), (Status, String)
             "callbackUrl host is not canonical".to_string(),
         ));
     }
-    if let Some(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>().ok() {
+    if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
         if blocked_webhook_ip(ip) {
             return Err((
                 Status::BadRequest,
