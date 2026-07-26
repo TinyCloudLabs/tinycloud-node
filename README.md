@@ -116,7 +116,8 @@ The following common options are available:
 
 | Option              | env var                      | description                                                                |
 |:--------------------|:-----------------------------|:---------------------------------------------------------------------------|
-| log_level           | TINYCLOUD_LOG_LEVEL           | Set the level of logging output, options are "normal", "debug"             |
+| log_level           | TINYCLOUD_LOG_LEVEL           | Set Rocket's own log verbosity, options are "off", "debug", "normal", "critical". Does **not** control application log output (see `RUST_LOG`) |
+| (n/a)               | RUST_LOG                      | Set the verbosity of application log output (a `tracing` `EnvFilter`), e.g. `debug` or `tinycloud=debug`. Defaults to `info` |
 | address             | TINYCLOUD_ADDRESS             | Set the listening address of the TinyCloud Protocol instance                           |
 | port                | TINYCLOUD_PORT                | Set the listening TCP port for the TinyCloud Protocol instance                         |
 | storage.blocks.type | TINYCLOUD_STORAGE_BLOCKS_TYPE | Set the mode of block storage, options are "Local" and "S3"                |
@@ -126,6 +127,7 @@ The following common options are available:
 | keys.type           | TINYCLOUD_KEYS_TYPE           | Set the type of host key store, options are "Static"                       |
 | spaces.allowlist    | TINYCLOUD_SPACES_ALLOWLIST    | Set the URL of an allowlist service for gating the creation of Space Peers |
 | telemetry.enabled   | TINYCLOUD_TELEMETRY__ENABLED  | Enable Prometheus latency metrics on the configured Prometheus port        |
+| (n/a)               | ROCKET_MAX_BLOCKING           | Set Rocket's blocking-thread-pool cap (default 512). Note the `ROCKET_` prefix, not `TINYCLOUD_` — Rocket builds its tokio runtime from its own Figment before TinyCloud's config is loaded, so `TINYCLOUD_MAX_BLOCKING` is silently ignored for this setting |
 
 ### Database Config
 

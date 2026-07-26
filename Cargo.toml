@@ -57,6 +57,20 @@ cacaos = { path = "dependencies/cacao", version = "1.0.0" }
 # Fix RUSTSEC-2025-0047: Out-of-bounds access in get_disjoint_mut (0.4.10 -> 0.4.11)
 slab = { git = "https://github.com/tokio-rs/slab", tag = "v0.4.11" }
 
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
+# `-C strip=symbols` makes wasm-ld drop the `target_features` custom section,
+# after which wasm-opt rejects the bulk-memory ops rustc emits by default for
+# wasm32-unknown-unknown. Keep symbols for the wasm cdylibs so wasm-pack builds.
+[profile.release.package.tinycloud-sdk-wasm]
+strip = "none"
+
+[profile.release.package.tinycloud-verifier-wasm]
+strip = "none"
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"

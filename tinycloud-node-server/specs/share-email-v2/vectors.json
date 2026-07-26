@@ -1,0 +1,37 @@
+{
+  "algorithm": "sha256(jcs-utf8)",
+  "encoding": "base64url-unpadded",
+  "vectors": {
+    "addressedDelegationRequest": {
+      "body": {
+        "actions": ["tinycloud.kv/get", "tinycloud.kv/list", "tinycloud.kv/put"],
+        "authorityMaterialDigest": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "authorityMaterialHandle": "amh_kv_001",
+        "contentSource": {
+          "action": "tinycloud.kv/list",
+          "kind": "kv",
+          "path": "documents",
+          "space": "did:pkh:eip155:1:0x1111111111111111111111111111111111111111"
+        },
+        "contentSourceDigest": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "expiresAt": "2030-01-01T00:00:00.000Z",
+        "jti": "ERITFBUWFxgZGhscHR4fIA",
+        "nodeAudience": "did:web:node.example",
+        "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "recipientMatcher": {"kind": "emailDomain", "value": "example.com"},
+        "resource": {"kind": "prefix", "value": "documents"},
+        "senderDid": "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+        "shareCid": "bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4",
+        "shareId": "share-v2-vector",
+        "targetOrigin": "https://node.example",
+        "version": 2
+      },
+      "canonicalJson": "{\"actions\":[\"tinycloud.kv/get\",\"tinycloud.kv/list\",\"tinycloud.kv/put\"],\"authorityMaterialDigest\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"authorityMaterialHandle\":\"amh_kv_001\",\"contentSource\":{\"action\":\"tinycloud.kv/list\",\"kind\":\"kv\",\"path\":\"documents\",\"space\":\"did:pkh:eip155:1:0x1111111111111111111111111111111111111111\"},\"contentSourceDigest\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"expiresAt\":\"2030-01-01T00:00:00.000Z\",\"jti\":\"ERITFBUWFxgZGhscHR4fIA\",\"nodeAudience\":\"did:web:node.example\",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"recipientMatcher\":{\"kind\":\"emailDomain\",\"value\":\"example.com\"},\"resource\":{\"kind\":\"prefix\",\"value\":\"documents\"},\"senderDid\":\"did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw\",\"shareCid\":\"bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4\",\"shareId\":\"share-v2-vector\",\"targetOrigin\":\"https://node.example\",\"version\":2}",
+      "requestBodyDigest": "iF03mZdFJi6Fxt9dvBoKPPv1DaXsdRlNKnPAopOUTWM"
+    },
+    "invitationAuthorizationRequest": {
+      "canonicalJson": "{\"actions\":[\"tinycloud.kv/get\",\"tinycloud.kv/list\",\"tinycloud.kv/put\"],\"authorityMaterialDigest\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"authorityMaterialHandle\":\"amh_kv_001\",\"contentSource\":{\"action\":\"tinycloud.kv/list\",\"kind\":\"kv\",\"path\":\"documents\",\"space\":\"did:pkh:eip155:1:0x1111111111111111111111111111111111111111\"},\"contentSourceDigest\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"deliveryEmail\":\"notify@example.com\",\"deliveryProvenance\":\"resend:message-001\",\"documentName\":\"Project plan.md\",\"idempotencyKey\":\"invite:vector:001\",\"jti\":\"ERITFBUWFxgZGhscHR4fIA\",\"nodeAudience\":\"did:web:node.example\",\"policyCid\":\"bafkreiaqkcd56bhbn3zwcx7r5xdkle2nukcrhkvwwrcg4qqehk6q5hlwi4\",\"recipientMatcher\":{\"kind\":\"emailDomain\",\"value\":\"example.com\"},\"reportAbuseToken\":\"AAAAAAAAAAAAAAAAAAAAAA\",\"resource\":\"documents\",\"senderDid\":\"did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw\",\"senderTrust\":\"verified\",\"shareCid\":\"bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4\",\"shareExpiresAt\":\"2030-01-01T00:00:00.000Z\",\"shareId\":\"share-v2-vector\",\"shareUrl\":\"https://share.tinycloud.xyz/s/bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4#k=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"targetOrigin\":\"https://node.example\",\"version\":2}",
+      "requestBodyDigest": "mobC6-49XpLkgYnzn9UpyWIAOljzSS0xO7iMswMXxv0"
+    }
+  }
+}

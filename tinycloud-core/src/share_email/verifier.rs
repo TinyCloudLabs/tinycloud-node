@@ -12,9 +12,9 @@ use time::OffsetDateTime;
 
 use super::{ports::*, types::*};
 use tinycloud_auth::share_email_evidence::{
-    enforce_holder_equation, normalized_email_hash, verify_holder_binding_artifact, verify_sd_jwt,
-    CredentialScope, EvidenceError, IssuerTrustRegistry, VerificationTime, VerifiedEmailEvidence,
-    HOLDER_BINDING_TYPE,
+    enforce_holder_equation, normalized_email_hash, verify_holder_binding_artifact,
+    verify_sd_jwt_with_matcher, CredentialScope, EmailMatcher, EvidenceError, IssuerTrustRegistry,
+    VerificationTime, VerifiedEmailEvidence, HOLDER_BINDING_TYPE,
 };
 
 pub const EMAIL_VCT: &str = "opencredentials.email/v1";
@@ -100,7 +100,7 @@ impl ExactEmailVerifier {
                 credential,
                 expected_scope,
                 expected_holder,
-                expected_email,
+                EmailMatcher::Exact(expected_email),
                 expected_expiry,
             )
             .map_err(|_| {
@@ -116,7 +116,7 @@ impl ExactEmailVerifier {
         credential: &[u8],
         expected_scope: &ShareScope,
         expected_holder: &DidKey,
-        expected_email: &str,
+        matcher: EmailMatcher<'_>,
         expected_expiry: i64,
     ) -> Result<CredentialVerificationEvidence, EvidenceError> {
         let scope = credential_scope(expected_scope);
@@ -126,12 +126,12 @@ impl ExactEmailVerifier {
         {
             return Err(EvidenceError::CredentialExpired);
         }
-        let verified = verify_sd_jwt(
+        let verified = verify_sd_jwt_with_matcher(
             credential,
             &self.issuer_trust,
             &scope,
             expected_holder.as_str(),
-            expected_email,
+            matcher,
             &self.issuer_did,
             VerificationTime {
                 evaluation_time: self.evaluation_time,
@@ -140,6 +140,34 @@ impl ExactEmailVerifier {
             },
         )?;
         convert_evidence(verified)
+    }
+
+    pub fn verify_matcher_for(
+        &self,
+        credential: &[u8],
+        expected_scope: &ShareScope,
+        expected_holder: &DidKey,
+        matcher: &RecipientMatcher,
+        expected_expiry: i64,
+    ) -> Result<CredentialVerificationEvidence, PortError> {
+        let matcher = match matcher {
+            RecipientMatcher::ExactEmail(value) => EmailMatcher::Exact(value),
+            RecipientMatcher::EmailDomain(value) => EmailMatcher::Domain(value),
+        };
+        let evidence = self
+            .verify_inner(
+                credential,
+                expected_scope,
+                expected_holder,
+                matcher,
+                expected_expiry,
+            )
+            .map_err(|_| {
+                self.metrics.rejected.fetch_add(1, Ordering::Relaxed);
+                PortError::Denied
+            })?;
+        self.metrics.accepted.fetch_add(1, Ordering::Relaxed);
+        Ok(evidence)
     }
 
     /// Verify the domain-separated, canonical holder binding before handing
@@ -221,11 +249,37 @@ impl ExactEmailVerifier {
         presentation_signer: &DidKey,
         read_signer: &DidKey,
     ) -> Result<VerifiedSessionAdmission, PortError> {
-        let evidence = self.verify_exact_email_for(
+        self.verify_session_admission_for_matcher(
+            credential,
+            request,
+            claimed_credential_digest,
+            holder_binding,
+            &RecipientMatcher::ExactEmail(expected_email.to_owned()),
+            expected_expiry,
+            expected_enforcer,
+            presentation_signer,
+            read_signer,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_session_admission_for_matcher(
+        &self,
+        credential: &[u8],
+        request: PolicySessionRequest,
+        claimed_credential_digest: &Sha256Digest,
+        holder_binding: &[u8],
+        matcher: &RecipientMatcher,
+        expected_expiry: i64,
+        expected_enforcer: &DidKey,
+        presentation_signer: &DidKey,
+        read_signer: &DidKey,
+    ) -> Result<VerifiedSessionAdmission, PortError> {
+        let evidence = self.verify_matcher_for(
             credential,
             &request.scope,
             &request.holder,
-            expected_email,
+            matcher,
             expected_expiry,
         )?;
         if evidence.credential_subject != request.holder || evidence.expires_at != expected_expiry {
@@ -544,6 +598,7 @@ mod tests {
             node_audience: Did::parse("did:web:node.example").unwrap(),
             target_origin: TargetOrigin::parse("https://node.example").unwrap(),
             action: ShareAction::KvGet,
+            allowed_actions: vec![ShareAction::KvGet],
             resource: ExactResource::Kv { path },
             content_source: source,
             content_source_digest: Sha256Digest::from_bytes([2; 32]),

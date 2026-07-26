@@ -135,6 +135,36 @@ impl From<BlockStage> for StagingStorage {
 
 pub type TinyCloud = SpaceDatabase<DatabaseConnection, BlockStores, StaticSecret>;
 
+/// Size of the SQLite connection pool used for the capability database.
+const SQLITE_MAX_CONNECTIONS: u32 = 16;
+
+/// SQLite tuning for the capability database. Extracted into a free function
+/// so it can be exercised directly by a test that reads the pragmas back off
+/// a live pooled connection, rather than only asserting that the builder was
+/// called.
+///
+/// NOTE: `synchronous = "NORMAL"` is a durability trade-off under WAL mode —
+/// it cannot corrupt the database, but it can lose the last committed
+/// transaction(s) on power loss / host crash, which weakens the "commits
+/// before acknowledgment" contract documented in
+/// docs/read-audit-durability.md. This must be reviewed by a human before
+/// merging; see the PR description.
+fn sqlite_connect_options(database: &str) -> ConnectOptions {
+    let mut connect_opts = ConnectOptions::from(database);
+    connect_opts.max_connections(SQLITE_MAX_CONNECTIONS);
+    connect_opts.map_sqlx_sqlite_opts(|opts| {
+        opts.create_if_missing(true)
+            .pragma("journal_mode", "WAL")
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .pragma("synchronous", "NORMAL") // durability trade-off, see above
+            .pragma("cache_size", "-65536") // 64 MiB page cache per connection
+            .pragma("mmap_size", "268435456") // 256 MiB mmap per connection
+            .pragma("temp_store", "MEMORY")
+            .pragma("wal_autocheckpoint", "1000") // explicit; matches SQLite's compiled-in default
+    });
+    connect_opts
+}
+
 pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     let tinycloud_config = config.extract::<Config>()?;
     app_with_control(config, &tinycloud_config, None).await
@@ -254,19 +284,16 @@ pub async fn app_with_control(
     };
 
     let database = tinycloud_config.storage.database();
-    let mut connect_opts = ConnectOptions::from(database);
     let is_sqlite = database.starts_with("sqlite");
-    if is_sqlite {
+    let mut connect_opts = if is_sqlite {
         // WAL permits readers to progress while the core's shared writer lock
         // serializes mutations and durable read-audit batches. A one-connection
         // pool made every authenticated read wait behind audit writes.
-        connect_opts.max_connections(16);
-        connect_opts.map_sqlx_sqlite_opts(|opts| {
-            opts.create_if_missing(true)
-                .pragma("journal_mode", "WAL")
-                .busy_timeout(std::time::Duration::from_secs(5))
-        });
+        sqlite_connect_options(database)
     } else {
+        ConnectOptions::from(database)
+    };
+    if !is_sqlite {
         connect_opts.max_connections(100);
         if let Some(root_cert_path) = tinycloud_config
             .share_email
@@ -401,9 +428,7 @@ pub async fn app_with_control(
     let rocket = rocket::custom(config)
         .mount("/", routes)
         .attach(AdHoc::config::<Config>())
-        .attach(tracing::TracingFairing {
-            header_name: tinycloud_config.log.tracing.traceheader,
-        })
+        .attach(tracing::TracingFairing::new(&tinycloud_config.log.tracing))
         .attach(AdHoc::on_liftoff(
             "invocation-replay-cleanup",
             move |rocket| {
@@ -614,4 +639,45 @@ async fn ensure_local_dirs(storage: &config::Storage) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod sqlite_tuning_tests {
+    use super::*;
+    use tinycloud_core::sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    async fn pragma(db: &DatabaseConnection, name: &str) -> String {
+        let row = db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                format!("PRAGMA {name}"),
+            ))
+            .await
+            .unwrap()
+            .expect("pragma returns a row");
+        row.try_get_by_index::<i64>(0)
+            .map(|v| v.to_string())
+            .or_else(|_| row.try_get_by_index::<String>(0))
+            .unwrap()
+    }
+
+    /// Asserts the SQLite tuning pragmas as read back off a real, live pooled
+    /// connection handed out by `sqlite_connect_options` — not merely that the
+    /// builder was called. Run against unmodified `sqlite_connect_options` (no
+    /// `synchronous`/`cache_size`/`mmap_size`/`temp_store` pragmas) this test
+    /// failed with `synchronous == "2"` (FULL), which is the empirical proof
+    /// that FULL was the shipped default before this change.
+    #[tokio::test]
+    async fn sqlite_pragmas_are_applied_on_live_pooled_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", dir.path().join("caps.db").display());
+        let db = Database::connect(sqlite_connect_options(&url))
+            .await
+            .unwrap();
+        assert_eq!(pragma(&db, "journal_mode").await, "wal");
+        assert_eq!(pragma(&db, "synchronous").await, "1"); // 1 = NORMAL, 2 = FULL
+        assert_eq!(pragma(&db, "cache_size").await, "-65536");
+        assert_eq!(pragma(&db, "temp_store").await, "2"); // 2 = MEMORY
+        assert_eq!(pragma(&db, "mmap_size").await, "268435456");
+    }
 }

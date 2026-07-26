@@ -239,6 +239,19 @@ pub fn normalize_email(input: &str) -> Result<String, EvidenceError> {
     Ok(format!("{local}@{}", domain.to_ascii_lowercase()))
 }
 
+/// Return the authenticated domain portion of a complete email address.
+///
+/// This deliberately accepts only the same ASCII mailbox grammar as
+/// [`normalize_email`].  Callers must pass the complete, cryptographically
+/// verified `/email` disclosure; a domain claim by itself is not evidence.
+pub fn normalize_email_domain(input: &str) -> Result<String, EvidenceError> {
+    let normalized = normalize_email(input)?;
+    normalized
+        .rsplit_once('@')
+        .map(|(_, domain)| domain.to_owned())
+        .ok_or(EvidenceError::Invalid)
+}
+
 pub fn normalized_email_hash(input: &str) -> Result<String, EvidenceError> {
     Ok(URL_SAFE_NO_PAD.encode(sha256(normalize_email(input)?.as_bytes())))
 }
@@ -249,6 +262,36 @@ pub fn verify_sd_jwt(
     expected_scope: &CredentialScope<'_>,
     expected_holder: &str,
     expected_email: &str,
+    expected_issuer: &str,
+    time: VerificationTime,
+) -> Result<VerifiedEmailEvidence, EvidenceError> {
+    verify_sd_jwt_with_matcher(
+        credential,
+        registry,
+        expected_scope,
+        expected_holder,
+        EmailMatcher::Exact(expected_email),
+        expected_issuer,
+        time,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmailMatcher<'a> {
+    Exact(&'a str),
+    Domain(&'a str),
+}
+
+/// Verify a holder-bound SD-JWT and match the complete selectively disclosed
+/// `/email` claim against either an exact mailbox or an exact ASCII domain.
+/// The disclosure is always parsed and normalized as a full email before the
+/// matcher runs, so `/emailDomain` can never authorize a domain share.
+pub fn verify_sd_jwt_with_matcher(
+    credential: &[u8],
+    registry: &IssuerTrustRegistry,
+    expected_scope: &CredentialScope<'_>,
+    expected_holder: &str,
+    matcher: EmailMatcher<'_>,
     expected_issuer: &str,
     time: VerificationTime,
 ) -> Result<VerifiedEmailEvidence, EvidenceError> {
@@ -343,9 +386,19 @@ pub fn verify_sd_jwt(
         return Err(EvidenceError::Invalid);
     }
     let normalized_disclosed = normalize_email(disclosed)?;
-    let normalized_expected = normalize_email(expected_email)?;
-    if normalized_disclosed != normalized_expected {
-        return Err(EvidenceError::EmailMismatch);
+    match matcher {
+        EmailMatcher::Exact(expected_email) => {
+            if normalized_disclosed != normalize_email(expected_email)? {
+                return Err(EvidenceError::EmailMismatch);
+            }
+        }
+        EmailMatcher::Domain(expected_domain) => {
+            if normalize_email_domain(&normalized_disclosed)?
+                != normalize_policy_domain(expected_domain)?
+            {
+                return Err(EvidenceError::EmailMismatch);
+            }
+        }
     }
     let iat = required_integer(payload, "iat")?;
     let nbf = required_integer(payload, "nbf")?;
@@ -378,6 +431,27 @@ pub fn verify_sd_jwt(
         credential_digest: sha256(credential),
         expires_at: exp,
     })
+}
+
+/// Canonicalize the policy-side domain without accepting a mailbox, a
+/// wildcard, a subdomain suffix, or non-ASCII DNS labels.
+pub fn normalize_policy_domain(input: &str) -> Result<String, EvidenceError> {
+    if !input.is_ascii() || input.is_empty() || input.len() > 253 {
+        return Err(EvidenceError::Invalid);
+    }
+    for label in input.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(EvidenceError::Invalid);
+        }
+    }
+    Ok(input.to_ascii_lowercase())
 }
 
 /// Verify a frozen `holderBinding` artifact and return its authenticated
@@ -736,6 +810,30 @@ mod tests {
         assert!(normalize_email(" Alice@example.com").is_err());
         assert!(normalize_email("a..b@example.com").is_err());
         assert!(normalize_email("a@example..com").is_err());
+    }
+
+    #[test]
+    fn email_domain_normalization_is_strict_and_ascii() {
+        assert_eq!(
+            normalize_email_domain("Alice@MAILINATOR.COM").unwrap(),
+            "mailinator.com"
+        );
+        assert_eq!(
+            normalize_policy_domain("MAILINATOR.COM").unwrap(),
+            "mailinator.com"
+        );
+        for value in [
+            "alice@@mailinator.com",
+            "alice@-mailinator.com",
+            "alice@mailinator-.com",
+            "alice@mailinator..com",
+            "alice@mañana.example",
+        ] {
+            assert!(normalize_email_domain(value).is_err(), "{value}");
+        }
+        for value in [".mailinator.com", "mailinator..com", "mailinator.com/"] {
+            assert!(normalize_policy_domain(value).is_err(), "{value}");
+        }
     }
 
     #[test]

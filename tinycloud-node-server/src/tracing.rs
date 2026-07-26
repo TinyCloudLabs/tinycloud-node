@@ -9,6 +9,7 @@ use rocket::{
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::{
+    borrow::Cow,
     collections::VecDeque,
     sync::{Arc, Mutex, OnceLock},
     time::Instant,
@@ -26,6 +27,13 @@ use tracing_subscriber::{layer::Context, layer::SubscriberExt, Layer, Registry};
 
 use crate::config;
 
+/// Fallback `route` label for `REQUEST_HISTOGRAM` when a request matches no
+/// Rocket route (e.g. scanner traffic to `/.env`, `/wp-login.php`, ...).
+/// Using a fixed sentinel instead of the raw request path keeps the metric's
+/// cardinality bounded to the set of mounted route templates plus this one
+/// value, regardless of how many distinct unmatched paths are probed.
+const UNMATCHED_ROUTE_LABEL: &str = "<unmatched>";
+
 #[derive(Clone)]
 pub struct TracingSpan(pub Span);
 
@@ -36,6 +44,16 @@ struct RequestTelemetry {
 
 pub struct TracingFairing {
     pub header_name: String,
+    pub tracing_enabled: bool,
+}
+
+impl TracingFairing {
+    pub fn new(cfg: &config::Tracing) -> Self {
+        Self {
+            header_name: cfg.traceheader.clone(),
+            tracing_enabled: cfg.enabled,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -332,10 +350,17 @@ impl Fairing for TracingFairing {
     }
     async fn on_request(&self, req: &mut Request<'_>, _data: &mut Data<'_>) {
         let span = info_span!(parent: None, "request", trace_id = tracing::field::Empty);
-        span.record(
-            "trace_id",
-            tracing::field::display(&span.context().span().span_context().trace_id()),
-        );
+        // Resolving the OTel context (and recording it onto the span) is only
+        // meaningful when tracing is enabled and an OTel layer is installed
+        // (tracing_try_init only attaches one in that case); skip the work
+        // otherwise. The span itself is still created and cached below since
+        // `TracingSpan` is a hard `FromRequest` dependency for several routes.
+        if self.tracing_enabled {
+            span.record(
+                "trace_id",
+                tracing::field::display(&span.context().span().span_context().trace_id()),
+            );
+        }
         req.local_cache(|| Some(TracingSpan(span)));
         if crate::prometheus::enabled() {
             req.local_cache(|| {
@@ -349,7 +374,15 @@ impl Fairing for TracingFairing {
     async fn on_response<'r>(&self, req: &'r Request<'_>, res: &mut Response<'r>) {
         if let Some(TracingSpan(span)) = req.local_cache(|| Option::<TracingSpan>::None).to_owned()
         {
-            let trace_id = span.context().span().span_context().trace_id();
+            // Only resolve the real OTel trace id when tracing is enabled;
+            // otherwise the context downcast can never succeed (no OTel layer
+            // installed) and always resolves to the invalid all-zero id, so
+            // use that constant directly instead of paying for the lookup.
+            let trace_id = if self.tracing_enabled {
+                span.context().span().span_context().trace_id()
+            } else {
+                opentelemetry::trace::TraceId::INVALID
+            };
             res.set_raw_header(self.header_name.clone(), format!("{trace_id}"));
         }
         if crate::prometheus::enabled() {
@@ -357,14 +390,19 @@ impl Fairing for TracingFairing {
                 .local_cache(|| Option::<RequestTelemetry>::None)
                 .to_owned()
             {
-                let route = req
-                    .route()
-                    .map(|route| route.uri.to_string())
-                    .unwrap_or_else(|| req.uri().path().to_string());
+                // Unmatched requests (404s from scanner traffic, e.g. `/.env`,
+                // `/wp-login.php`) have no `Route`, so fall back to a fixed
+                // sentinel rather than the raw request path -- otherwise every
+                // distinct probed path would create its own permanent
+                // histogram series (TC-286).
+                let route = match req.route() {
+                    Some(route) => Cow::Owned(route.uri.to_string()),
+                    None => Cow::Borrowed(UNMATCHED_ROUTE_LABEL),
+                };
                 crate::prometheus::REQUEST_HISTOGRAM
                     .with_label_values(&[
                         req.method().as_str(),
-                        route.as_str(),
+                        route.as_ref(),
                         res.status().code.to_string().as_str(),
                     ])
                     .observe(telemetry.start.elapsed().as_secs_f64());
@@ -382,5 +420,102 @@ impl<'r> FromRequest<'r> for TracingSpan {
             Some(TracingSpan(span)) => Outcome::Success(TracingSpan(span.to_owned())),
             None => Outcome::Error((Status::InternalServerError, ())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rocket::local::asynchronous::Client;
+
+    #[rocket::get("/tc286-known")]
+    fn known() -> &'static str {
+        "ok"
+    }
+
+    #[rocket::get("/tc286-span-guard")]
+    fn span_guard(_span: TracingSpan) -> &'static str {
+        "ok"
+    }
+
+    fn disabled_fairing() -> TracingFairing {
+        TracingFairing {
+            header_name: "TinyCloud-Trace-Id".to_string(),
+            tracing_enabled: false,
+        }
+    }
+
+    /// Regression test for TC-286: unmatched requests must collapse into a
+    /// single bounded `route` label rather than leaking the raw request path
+    /// (which would let scanner traffic create unbounded histogram series).
+    #[tokio::test]
+    async fn unmatched_routes_collapse_into_a_bounded_sentinel_label() {
+        let was_enabled = crate::prometheus::enabled();
+        crate::prometheus::set_enabled(true);
+
+        let rocket = rocket::build()
+            .mount("/", rocket::routes![known])
+            .attach(disabled_fairing());
+        let client = Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        for path in ["/tc286-scan-a", "/tc286-scan-b", "/tc286-scan-c"] {
+            let response = client.get(path).dispatch().await;
+            assert_eq!(response.status(), Status::NotFound);
+        }
+
+        let known_response = client.get("/tc286-known").dispatch().await;
+        assert_eq!(known_response.status(), Status::Ok);
+
+        let route_labels: Vec<String> = ::prometheus::gather()
+            .into_iter()
+            .find(|family| family.get_name() == "tinycloud_http_request_duration_seconds")
+            .expect("request histogram should be registered")
+            .get_metric()
+            .iter()
+            .flat_map(|metric| metric.get_label())
+            .filter(|label| label.get_name() == "route")
+            .map(|label| label.get_value().to_string())
+            .collect();
+
+        assert!(
+            route_labels
+                .iter()
+                .all(|value| !value.starts_with("/tc286-scan")),
+            "unmatched scanner paths must not leak into the route label: {route_labels:?}"
+        );
+        assert!(
+            route_labels
+                .iter()
+                .any(|value| value == UNMATCHED_ROUTE_LABEL),
+            "expected the sentinel route label to be present: {route_labels:?}"
+        );
+        assert!(
+            route_labels.iter().any(|value| value == "/tc286-known"),
+            "matched routes must still report their own route label: {route_labels:?}"
+        );
+
+        crate::prometheus::set_enabled(was_enabled);
+    }
+
+    /// Regression test: disabling the tracing gate must not stop
+    /// `TracingSpan` from being cached, since it is a hard `FromRequest`
+    /// dependency for several routes (e.g. /invoke, /delegate).
+    #[tokio::test]
+    async fn tracing_disabled_still_caches_a_span_for_the_request_guard() {
+        let rocket = rocket::build()
+            .mount("/", rocket::routes![span_guard])
+            .attach(disabled_fairing());
+        let client = Client::tracked(rocket)
+            .await
+            .expect("valid rocket instance");
+
+        let response = client.get("/tc286-span-guard").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+        assert!(
+            response.headers().get_one("TinyCloud-Trace-Id").is_some(),
+            "trace header should still be set (as the all-zero id) when tracing is disabled"
+        );
     }
 }

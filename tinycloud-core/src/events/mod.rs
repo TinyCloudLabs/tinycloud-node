@@ -129,6 +129,10 @@ pub(crate) enum VersionedOperation {
 #[derive(Debug)]
 pub(crate) enum Event {
     Invocation(Box<Invocation>, Vec<Operation>),
+    /// A KV mutation that has already been authorized by the enclosing
+    /// application protocol. This is private to the database composition
+    /// layer; public invocations continue through the full UCAN validator.
+    InternalInvocation(Box<Invocation>, Vec<Operation>),
     Delegation(Box<Delegation>),
     Revocation(Box<Revocation>),
 }
@@ -138,6 +142,7 @@ impl Event {
         match self {
             Event::Delegation(d) => hash(&d.1),
             Event::Invocation(i, _) => hash(&i.1),
+            Event::InternalInvocation(i, _) => hash(&i.1),
             Event::Revocation(r) => hash(&r.1),
         }
     }
@@ -175,6 +180,7 @@ pub(crate) fn epoch_hash(
             .map(|(h, e)| {
                 Ok(match e {
                     Event::Invocation(_, ops) => hash_inv(h, space, ops)?,
+                    Event::InternalInvocation(_, ops) => hash_inv(h, space, ops)?,
                     Event::Delegation(_) => OneOrMany::One(h.to_cid(RAW_CODEC)),
                     Event::Revocation(_) => OneOrMany::One(h.to_cid(RAW_CODEC)),
                 })

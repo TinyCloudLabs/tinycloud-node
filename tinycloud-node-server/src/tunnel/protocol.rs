@@ -27,7 +27,9 @@ pub const MAX_FRAME_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub const BODY_CHUNK_BYTES: usize = 256 * 1024;
 
 /// Default cap (bytes) on a full reassembled request or response body.
-pub const DEFAULT_MAX_BODY_BYTES: usize = 25 * 1024 * 1024;
+/// Native Share KV uploads carry base64url content in a signed JSON envelope;
+/// use the same encoded ceiling as the production `/invoke` route.
+pub const DEFAULT_MAX_BODY_BYTES: usize = tinycloud_core::share_email::MAX_NATIVE_RESPONSE_BYTES;
 
 // Close codes the relay uses to reject/terminate a tunnel WebSocket, in the
 // RFC 6455 private-use range. Mirrors `tinycloud-link/src/tunnel/upgrade.ts`
