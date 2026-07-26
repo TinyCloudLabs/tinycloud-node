@@ -67,9 +67,9 @@ use tinycloud_core::{
 use crate::{authorization::AuthHeaderGetter, config::ShareEmailConfig, tee::TeeContext};
 
 pub const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
-const MAX_REQUEST_BYTES: usize = MAX_BODY_BYTES + (MAX_BODY_BYTES / 3) + 4096;
-const POLICY_DOMAIN: &str = "xyz.tinycloud.share/policy/v2\\0";
-const ENFORCEMENT_DOMAIN: &str = "xyz.tinycloud.share/policy-enforcement/v2\\0";
+const MAX_REQUEST_BYTES: usize = MAX_BODY_BYTES;
+const POLICY_DOMAIN: &str = "xyz.tinycloud.share/policy/v2\0";
+const ENFORCEMENT_DOMAIN: &str = "xyz.tinycloud.share/policy-enforcement/v2\0";
 const MAX_POLICY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_GRAPH_NODES: usize = 64;
 
@@ -996,11 +996,12 @@ fn validate_policy(
     }
     let expected_actions = [
         "tinycloud.kv/get",
+        "tinycloud.kv/list",
         "tinycloud.kv/metadata",
         "tinycloud.kv/put",
     ];
     if policy.actions.is_empty()
-        || policy.actions.len() > 3
+        || policy.actions.len() > 4
         || policy
             .actions
             .iter()
@@ -1010,10 +1011,6 @@ fn validate_policy(
             .actions
             .iter()
             .any(|action| action == "tinycloud.kv/get")
-        || !policy
-            .actions
-            .iter()
-            .any(|action| action == "tinycloud.kv/metadata")
     {
         return Err(());
     }
@@ -1238,7 +1235,7 @@ const V2_CHALLENGE_DOMAIN: &[u8] = b"xyz.tinycloud.share/policy-challenge/v2\0";
 const V2_SESSION_DOMAIN: &[u8] = b"xyz.tinycloud.share/policy-session/v2\0";
 const V2_INVOCATION_DOMAIN: &[u8] = b"xyz.tinycloud.share/invocation/v2\0";
 const V2_DELIVERY_DOMAIN: &[u8] = b"xyz.tinycloud.share/delivery-authorization/v2\0";
-const RUNTIME_DELEGATION_DOMAIN: &str = "xyz.tinycloud.share/runtime-delegation/v2\\0";
+const RUNTIME_DELEGATION_DOMAIN: &str = "xyz.tinycloud.share/runtime-delegation/v2\0";
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -2640,7 +2637,47 @@ pub async fn invoke_v2(
         return Ok(Json(serde_json::json!({
             "type": "TinyCloudShareInvokeResponse", "version": 2,
             "action": action, "resource": invocation.resource,
-            "etag": etag, "bodyDigest": b64_digest(&body)
+            "etag": etag, "bodyDigest": b64_digest(&body), "contentType": invocation.content_type
+        })));
+    }
+    if action == "tinycloud.kv/list" {
+        insert_invocation_replay(
+            runtime,
+            invocation,
+            &envelope.request.request_body_digest,
+            expires,
+        )
+        .await
+        .map_err(|_| share_error("invoke_replayed"))?;
+        let prefix: tinycloud_auth::resource::Path = invocation
+            .resource
+            .parse()
+            .map_err(|_| share_error("invoke_denied"))?;
+        let (paths, _truncated, next) = runtime
+            .tinycloud
+            .list_direct_children_bounded(&space, &prefix, 100, None)
+            .await
+            .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?;
+        let mut entries = Vec::with_capacity(paths.len());
+        for path in paths {
+            let kind = if runtime
+                .tinycloud
+                .kv_get(&space, &path)
+                .await
+                .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?
+                .is_some()
+            {
+                "file"
+            } else {
+                "folder"
+            };
+            entries.push(serde_json::json!({ "path": path.as_str(), "kind": kind }));
+        }
+        return Ok(Json(serde_json::json!({
+            "type": "TinyCloudShareInvokeResponse", "version": 2,
+            "action": action, "resource": invocation.resource,
+            "entries": entries,
+            "nextCursor": next.map(|path| path.as_str().to_owned())
         })));
     }
     insert_invocation_replay(
@@ -2679,6 +2716,7 @@ pub async fn invoke_v2(
     Ok(Json(serde_json::json!({
         "type": "TinyCloudShareInvokeResponse", "version": 2,
         "action": action, "resource": invocation.resource,
+        "mediaType": metadata.0.get("content-type").map(String::as_str).unwrap_or("application/octet-stream"),
         "content": encode_config(&body, URL_SAFE_NO_PAD),
         "bodyDigest": b64_digest(&body), "etag": etag
     })))
@@ -2848,16 +2886,16 @@ mod tests {
 
     #[test]
     fn policy_domain_matches_the_sdk_wire_contract() {
-        assert_eq!(POLICY_DOMAIN, "xyz.tinycloud.share/policy/v2\\0");
+        assert_eq!(POLICY_DOMAIN, "xyz.tinycloud.share/policy/v2\0");
         assert_eq!(
             ENFORCEMENT_DOMAIN,
-            "xyz.tinycloud.share/policy-enforcement/v2\\0"
+            "xyz.tinycloud.share/policy-enforcement/v2\0"
         );
     }
 
     #[test]
     fn policy_cid_is_raw_sha256_and_not_a_fixture() {
-        let bytes = br#"{"domain":"xyz.tinycloud.share/policy/v2\\0","policy":{}}"#;
+        let bytes = br#"{"domain":"xyz.tinycloud.share/policy/v2\u0000","policy":{}}"#;
         assert!(raw_sha256_cid(bytes).starts_with("bafkre"));
     }
 
