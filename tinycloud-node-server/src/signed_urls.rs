@@ -26,6 +26,7 @@ type TicketIdMac = Hmac<Sha256>;
 
 const SIGNED_KV_SERVICE: &str = "kv";
 const SIGNED_KV_ABILITY: &str = "tinycloud.kv/get";
+const SIGNED_KV_CACHE_CONTROL: &str = "private, no-cache";
 
 #[derive(Debug)]
 pub struct SignedUrlRuntime {
@@ -199,10 +200,7 @@ where
     fn respond_to(self, request: &'r Request<'_>) -> rocket::response::Result<'static> {
         let mut response = Response::build();
         response.header(Header::new("Accept-Ranges", "bytes"));
-        response.header(Header::new(
-            "Cache-Control",
-            "public, max-age=31536000, immutable",
-        ));
+        response.header(Header::new("Cache-Control", SIGNED_KV_CACHE_CONTROL));
 
         match self {
             Self::Full {
@@ -585,6 +583,7 @@ mod tests {
     use anyhow::Result;
     use futures::io::Cursor;
     use rocket::local::asynchronous::Client;
+    use std::collections::BTreeMap;
     use tempfile::TempDir;
     use tinycloud_auth::{
         authorization::{make_invocation, InvocationOptions},
@@ -745,6 +744,24 @@ mod tests {
         }
     }
 
+    #[get("/full")]
+    fn full_response() -> SignedKvReadResponse<Cursor<Vec<u8>>> {
+        let bytes = b"hello".to_vec();
+        SignedKvReadResponse::Full {
+            metadata: Metadata(BTreeMap::new()),
+            hash: hash(&bytes),
+            content: Content::new(bytes.len() as u64, Cursor::new(bytes)),
+        }
+    }
+
+    #[get("/unsatisfiable")]
+    fn unsatisfiable_response() -> SignedKvReadResponse<Cursor<Vec<u8>>> {
+        SignedKvReadResponse::Unsatisfiable {
+            hash: hash(b"hello"),
+            total_size: 5,
+        }
+    }
+
     #[test]
     fn parses_single_http_byte_ranges() {
         assert_eq!(
@@ -778,6 +795,10 @@ mod tests {
         let client = Client::tracked(rocket::build().mount("/", routes![partial_response])).await?;
         let response = client.get("/partial").dispatch().await;
         assert_eq!(response.status(), Status::PartialContent);
+        assert_eq!(
+            response.headers().get_one("Cache-Control"),
+            Some(SIGNED_KV_CACHE_CONTROL)
+        );
         assert_eq!(response.headers().get_one("Accept-Ranges"), Some("bytes"));
         assert_eq!(
             response.headers().get_one("Content-Range"),
@@ -793,6 +814,23 @@ mod tests {
             Some(etag(&hash(b"hello world")).as_str())
         );
         assert_eq!(response.into_bytes().await.unwrap(), b"world");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signed_kv_responses_are_never_publicly_cacheable() -> Result<()> {
+        let client = Client::tracked(rocket::build().mount(
+            "/",
+            routes![full_response, partial_response, unsatisfiable_response],
+        ))
+        .await?;
+
+        for path in ["/full", "/partial", "/unsatisfiable"] {
+            let response = client.get(path).dispatch().await;
+            let cache_control = response.headers().get_one("Cache-Control");
+            assert_eq!(cache_control, Some(SIGNED_KV_CACHE_CONTROL), "{path}");
+            assert!(!cache_control.is_some_and(|value| value.contains("public")));
+        }
         Ok(())
     }
 
