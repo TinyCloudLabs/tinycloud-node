@@ -17,6 +17,7 @@ pub mod m20260724_010000_current_kv;
 pub mod m20260725_000000_request_path_indexes;
 pub mod m20260726_000000_owner_share_policy;
 pub mod m20260726_000001_owner_share_policy_proof;
+pub mod m20260726_000002_owner_share_enforcement_bytes;
 
 pub struct Migrator;
 
@@ -42,6 +43,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260725_000000_request_path_indexes::Migration),
             Box::new(m20260726_000000_owner_share_policy::Migration),
             Box::new(m20260726_000001_owner_share_policy_proof::Migration),
+            Box::new(m20260726_000002_owner_share_enforcement_bytes::Migration),
         ]
     }
 }

@@ -268,6 +268,7 @@ pub async fn app_with_control(
                             app_id: info.app_id,
                             compose_hash: info.compose_hash,
                             instance_id: info.instance_id,
+                            enforcer_did: key_setup.node_did(),
                         })
                     }
                     Err(e) => {
@@ -376,6 +377,13 @@ pub async fn app_with_control(
         &key_setup,
         tinycloud_config.share_email.clone(),
         tee_context.clone(),
+        #[cfg(feature = "dstack")]
+        {
+            matches!(tinycloud_config.keys, config::Keys::Dstack)
+                || matches!(tinycloud_config.keys, config::Keys::Auto) && dstack::is_available()
+        },
+        #[cfg(not(feature = "dstack"))]
+        false,
         Arc::new(tinycloud.clone()),
     )
     .await?;

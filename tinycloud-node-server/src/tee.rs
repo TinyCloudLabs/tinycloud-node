@@ -15,6 +15,8 @@ pub struct TeeContext {
     pub compose_hash: String,
     /// Unique instance identifier
     pub instance_id: String,
+    /// DID derived from the dstack key source used by the node.
+    pub enforcer_did: String,
 }
 
 /// Attestation response returned by the /attestation endpoint.
@@ -32,6 +34,10 @@ pub enum AttestationResponse {
         compose_hash: String,
         /// dstack app identifier
         app_id: String,
+        /// DID whose public key is bound to this attested instance.
+        enforcer_did: String,
+        /// The report-data binding input used for the quote.
+        key_binding: String,
         /// ISO 8601 timestamp
         timestamp: String,
     },

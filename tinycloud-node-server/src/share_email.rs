@@ -1088,7 +1088,11 @@ pub fn compose(
     tinycloud: Arc<TinyCloud>,
     sql_service: Arc<SqlService>,
 ) -> anyhow::Result<Option<ShareEmailRuntime>> {
-    if !config.enabled {
+    // v2 policy sharing is deliberately independent of the legacy v1
+    // authority-material provider.  A v2-only node has no reason to load the
+    // static tuple at all; leaving this surface absent keeps v1 compatibility
+    // opt-in without making it a startup prerequisite for v2.
+    if !config.enabled || config.authority_material_path.is_none() {
         return Ok(None);
     }
     config.validate().map_err(|e| anyhow::anyhow!(e))?;

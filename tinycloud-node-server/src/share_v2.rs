@@ -18,7 +18,13 @@ use rocket::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::io::AsyncReadExt;
 
@@ -26,7 +32,7 @@ use tinycloud_auth::{
     authorization::TinyCloudDelegation,
     identity::did_principal_matches,
     multihash_codetable::{Code, MultihashDigest},
-    share_email_evidence::verify_detached_ed25519,
+    share_email_evidence::{normalized_email_hash, verify_detached_ed25519},
 };
 use tinycloud_core::{
     encryption::{maybe_decrypt, ColumnEncryption},
@@ -50,6 +56,7 @@ use tinycloud_core::{
             ShareId, ShareScope, TargetOrigin,
         },
         verifier::ExactEmailVerifier,
+        ProtocolNonce, Sha256Digest,
     },
     storage::ImmutableStaging,
     types::{Metadata, Resource},
@@ -60,6 +67,7 @@ use tinycloud_core::{
 use crate::{authorization::AuthHeaderGetter, config::ShareEmailConfig, tee::TeeContext};
 
 pub const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
+const MAX_REQUEST_BYTES: usize = MAX_BODY_BYTES + (MAX_BODY_BYTES / 3) + 4096;
 const POLICY_DOMAIN: &str = "xyz.tinycloud.share/policy/v2\\0";
 const ENFORCEMENT_DOMAIN: &str = "xyz.tinycloud.share/policy-enforcement/v2\\0";
 const MAX_POLICY_BYTES: usize = 2 * 1024 * 1024;
@@ -75,6 +83,7 @@ pub struct CapabilityDescriptor {
     pub target_origin: String,
     pub node_audience: String,
     pub enforcer_did: String,
+    pub tee_binding_digest: String,
     pub status: &'static str,
 }
 
@@ -132,6 +141,8 @@ pub struct ShareV2Runtime {
     enforcer_did: String,
     config: ShareEmailConfig,
     tee_ready: bool,
+    tee_binding_digest: Option<String>,
+    live_ready: Arc<AtomicBool>,
     migration_ready: bool,
     graph_ready: bool,
     verifier: Option<ExactEmailVerifier>,
@@ -144,17 +155,19 @@ impl ShareV2Runtime {
             && !self.config.node_audience.is_empty()
             && self.config.node_audience.starts_with("did:")
             && self.tee_ready
+            && self.tee_binding_digest.is_some()
             && !self.signer_did.is_empty()
             && !self.enforcer_did.is_empty()
             && self.migration_ready
             && self.graph_ready
             && self.verifier.is_some()
+            && self.live_ready.load(Ordering::Acquire)
     }
 
     fn checks(&self, migration: bool, graph: bool) -> ReadinessChecks {
         ReadinessChecks {
             migration,
-            encrypted_storage: true,
+            encrypted_storage: self.encryption_probe(),
             delegation_revocation_lookup: graph,
             tee_identity: self.tee_ready,
             signer: !self.signer_did.is_empty(),
@@ -162,6 +175,13 @@ impl ShareV2Runtime {
             body_limit: MAX_BODY_BYTES == 104_857_600,
             credential_verifier: self.verifier.is_some(),
         }
+    }
+
+    fn encryption_probe(&self) -> bool {
+        let plaintext = b"tinycloud-share-v2-readiness";
+        let encrypted = self.policy_encryption.encrypt(plaintext);
+        maybe_decrypt(Some(&self.policy_encryption), &encrypted)
+            .is_ok_and(|decrypted| decrypted == plaintext)
     }
 
     pub fn capability(&self) -> Option<CapabilityDescriptor> {
@@ -180,18 +200,18 @@ impl ShareV2Runtime {
             target_origin: self.config.target_origin.clone(),
             node_audience: self.config.node_audience.clone(),
             enforcer_did: self.enforcer_did.clone(),
+            tee_binding_digest: self.tee_binding_digest.clone().unwrap_or_default(),
             status: "ready",
         })
     }
 
     async fn readiness(&self) -> ReadinessResponse {
         let migration = owner_share_policy::Entity::find()
-            .select_only()
-            .column(owner_share_policy::Column::PolicyCid)
             .limit(1)
             .all(&self.conn)
             .await
-            .is_ok();
+            .is_ok()
+            && self.encryption_probe();
         let graph = delegation::Entity::find()
             .select_only()
             .column(delegation::Column::Id)
@@ -216,6 +236,7 @@ impl ShareV2Runtime {
             && checks.body_limit
             && checks.credential_verifier
             && self.config.enabled;
+        self.live_ready.store(ready, Ordering::Release);
         ReadinessResponse {
             ready,
             version: 2,
@@ -234,6 +255,7 @@ pub async fn compose(
     key_setup: &StaticSecret,
     config: ShareEmailConfig,
     tee_context: Option<TeeContext>,
+    tee_key_derived: bool,
     tinycloud: Arc<crate::TinyCloud>,
 ) -> anyhow::Result<ShareV2Runtime> {
     let migration_ready = owner_share_policy::Entity::find()
@@ -291,7 +313,31 @@ pub async fn compose(
                     )
                 })
         });
-    Ok(ShareV2Runtime {
+    let tee_ready = tee_key_derived
+        && tee_context.as_ref().is_some_and(|context| {
+            !context.app_id.is_empty()
+                && !context.compose_hash.is_empty()
+                && context.enforcer_did == key_setup.node_did()
+                && context.enforcer_did == config.node_audience
+        });
+    let tee_binding_digest = tee_ready.then(|| {
+        b64_digest(
+            format!(
+                "{}:{}:{}",
+                tee_context
+                    .as_ref()
+                    .map(|context| context.app_id.as_str())
+                    .unwrap_or_default(),
+                tee_context
+                    .as_ref()
+                    .map(|context| context.compose_hash.as_str())
+                    .unwrap_or_default(),
+                key_setup.node_did()
+            )
+            .as_bytes(),
+        )
+    });
+    let runtime = ShareV2Runtime {
         conn,
         tinycloud,
         policy_encryption: ColumnEncryption::new(
@@ -302,11 +348,22 @@ pub async fn compose(
         signer_did,
         enforcer_did,
         config,
-        tee_ready: tee_context.is_some(),
+        tee_ready,
+        tee_binding_digest,
+        live_ready: Arc::new(AtomicBool::new(false)),
         migration_ready,
         graph_ready,
         verifier,
-    })
+    };
+    let probe = runtime.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            let _ = probe.readiness().await;
+        }
+    });
+    Ok(runtime)
 }
 
 pub fn public_routes() -> Vec<rocket::Route> {
@@ -510,7 +567,7 @@ struct RecipientMatcher {
     value: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyTarget {
     origin: String,
@@ -529,7 +586,7 @@ struct ExactResource {
     path: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ContentSource {
     kind: String,
@@ -628,6 +685,12 @@ pub async fn register_policy(
         &request.policy.proof,
     )
     .map_err(|_| error(Status::Forbidden, "policy_registration_invalid"))?;
+    if cid_revoked(&runtime.conn, &request.enforcement_delegation.cid)
+        .await
+        .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?
+    {
+        return Err(error(Status::Forbidden, "policy_registration_invalid"));
+    }
 
     verify_owner_delegation(runtime, &policy.policy, &request.owner_delegation)
         .await
@@ -689,6 +752,8 @@ pub async fn register_policy(
         .sign(&jcs::canonicalize(&core_value))
         .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?;
 
+    let enforcement_record = serde_json::to_vec(&request.enforcement_delegation)
+        .map_err(|_| error(Status::Forbidden, "policy_registration_invalid"))?;
     let matcher = serde_json::to_value(&policy.policy.recipient_matcher)
         .map_err(|_| error(Status::Forbidden, "policy_registration_invalid"))?;
     let actions = serde_json::to_value(&policy.policy.actions)
@@ -699,6 +764,7 @@ pub async fn register_policy(
         owner_delegation_cid: Set(request.owner_delegation.cid.clone()),
         enforcement_delegation_cid: Set(request.enforcement_delegation.cid.clone()),
         policy_bytes: Set(runtime.policy_encryption.encrypt(&policy_bytes)),
+        enforcement_delegation_bytes: Set(runtime.policy_encryption.encrypt(&enforcement_record)),
         policy_proof: Set(request.policy.proof.clone()),
         policy_digest: Set(b64_digest(&policy_bytes)),
         matcher_digest: Set(b64_digest(&jcs::canonicalize(&matcher))),
@@ -745,11 +811,11 @@ pub async fn register_policy(
 
 async fn read_body(data: Data<'_>) -> Result<Vec<u8>, ApiErrorResponse> {
     let mut bytes = Vec::new();
-    data.open((MAX_BODY_BYTES + 1).bytes())
+    data.open((MAX_REQUEST_BYTES + 1).bytes())
         .read_to_end(&mut bytes)
         .await
         .map_err(|_| error(Status::BadRequest, "policy_registration_invalid"))?;
-    if bytes.len() > MAX_BODY_BYTES {
+    if bytes.len() > MAX_REQUEST_BYTES {
         return Err(error(
             Status::PayloadTooLarge,
             "policy_registration_invalid",
@@ -873,6 +939,14 @@ fn validate_policy(
     {
         return Err(());
     }
+    let source = serde_json::to_value(&policy.content_source).map_err(|_| ())?;
+    if b64_digest(&jcs::canonicalize(&source)) != policy.content_source_digest
+        || policy.content_source_digest != request.content_source_digest
+        || decode_canonical_b64(&policy.content_source_digest, 32)
+            .map_or(true, |digest| digest.len() != 32)
+    {
+        return Err(());
+    }
     if policy.share_id.is_empty()
         || policy.share_id.len() > 200
         || policy.owner_did.is_empty()
@@ -900,8 +974,11 @@ fn validate_policy(
     if canonical_matcher != policy.recipient_matcher.value {
         return Err(());
     }
-    if !policy.resource.path.starts_with("shares/")
-        || policy.resource.path.split('/').count() < 3
+    let path_parts: Vec<&str> = policy.resource.path.split('/').collect();
+    if path_parts.len() != 3
+        || path_parts[0] != "shares"
+        || path_parts[1] != policy.share_id
+        || policy.resource.path.ends_with('/')
         || policy
             .resource
             .path
@@ -1005,6 +1082,9 @@ async fn verify_owner_delegation(
         .all(&runtime.conn)
         .await
         .map_err(|_| ())?;
+    if abilities.len() != policy.actions.len() {
+        return Err(());
+    }
     for action in &policy.actions {
         let has_exact = abilities.iter().any(|ability| {
             ability.ability.to_string() == *action
@@ -1150,6 +1230,7 @@ fn verify_enforcement_delegation(
 const V2_CHALLENGE_DOMAIN: &[u8] = b"xyz.tinycloud.share/policy-challenge/v2\0";
 const V2_SESSION_DOMAIN: &[u8] = b"xyz.tinycloud.share/policy-session/v2\0";
 const V2_INVOCATION_DOMAIN: &[u8] = b"xyz.tinycloud.share/invocation/v2\0";
+const V2_DELIVERY_DOMAIN: &[u8] = b"xyz.tinycloud.share/delivery-authorization/v2\0";
 const RUNTIME_DELEGATION_DOMAIN: &str = "xyz.tinycloud.share/runtime-delegation/v2\\0";
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1297,9 +1378,12 @@ struct V2Invocation {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct V2DeliveryRequest {
     envelope_cid: String,
+    share_cid: String,
     share_id: String,
     registration_cid: String,
     policy_cid: String,
+    delegation_cid: String,
+    enforcement_delegation_cid: String,
     jti: String,
     expires_at: String,
     request_body_digest: String,
@@ -1351,8 +1435,31 @@ fn verify_v2_proof(
     verify_detached_ed25519(holder_did, &bytes, &signature).map_err(|_| ())
 }
 
-fn outer_target(outer: &Value) -> &Value {
-    outer.get("envelope").unwrap_or(outer)
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct V2EnvelopeSignature {
+    signer_did: String,
+    algorithm: String,
+    value: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct V2OuterEnvelope {
+    schema: String,
+    version: u8,
+    envelope_cid: String,
+    share_cid: String,
+    share_id: String,
+    delegation_cid: String,
+    policy_cid: String,
+    target: PolicyTarget,
+    resource: ExactResource,
+    actions: Vec<String>,
+    content_source: Value,
+    content_source_digest: String,
+    expires_at: String,
+    signature: V2EnvelopeSignature,
 }
 
 fn verify_outer_envelope(
@@ -1360,155 +1467,51 @@ fn verify_outer_envelope(
     request: &V2ChallengeRequest,
     share_key_did: &str,
 ) -> Result<OffsetDateTime, ()> {
-    let envelope = outer_target(outer);
-    let signature = envelope.get("signature").ok_or(())?;
-    let (signer_did, signature_value) = if let Some(object) = signature.as_object() {
-        (
-            object
-                .get("signerDid")
-                .or_else(|| envelope.get("signer").and_then(|v| v.get("did")))
-                .and_then(Value::as_str)
-                .ok_or(())?,
-            object.get("value").or_else(|| object.get("signature")),
-        )
-    } else {
-        (
-            envelope
-                .get("signer")
-                .and_then(|v| v.get("did"))
-                .and_then(Value::as_str)
-                .ok_or(())?,
-            Some(signature),
-        )
-    };
-    if let Some(algorithm) = signature.get("algorithm").and_then(Value::as_str) {
-        if algorithm != "Ed25519" {
-            return Err(());
-        }
-    }
-    if let Some(algorithm) = signature.get("alg").and_then(Value::as_str) {
-        if algorithm != "EdDSA" {
-            return Err(());
-        }
-    }
-    if signer_did != share_key_did {
+    let envelope: V2OuterEnvelope = serde_json::from_value(outer.clone()).map_err(|_| ())?;
+    let normalized = serde_json::to_value(&envelope).map_err(|_| ())?;
+    if jcs::canonicalize(outer) != jcs::canonicalize(&normalized) {
         return Err(());
     }
-    let signature_value = signature_value.and_then(Value::as_str).ok_or(())?;
-    let signature_bytes = decode_canonical_b64(signature_value, 64).map_err(|_| ())?;
-    let mut unsigned = envelope.clone();
+    if envelope.schema != "xyz.tinycloud.share/envelope/v2"
+        || envelope.version != 2
+        || envelope.signature.algorithm != "Ed25519"
+        || envelope.signature.signer_did != share_key_did
+        || envelope.envelope_cid != request.envelope_cid
+        || envelope.share_cid != request.share_cid
+        || envelope.share_id != request.share_id
+        || envelope.delegation_cid != request.delegation_cid
+        || envelope.policy_cid != request.policy_cid
+        || envelope.target.origin != request.target_origin
+        || envelope.target.node_audience != request.node_audience
+        || envelope.target.enforcer_did.is_empty()
+        || envelope.target.space_id
+            != request
+                .content_source
+                .get("space")
+                .and_then(Value::as_str)
+                .ok_or(())?
+        || envelope.resource.kind != "exact"
+        || envelope.resource.path != request.resource
+        || envelope.actions != request.actions
+        || envelope.content_source != request.content_source
+        || envelope.content_source_digest != request.content_source_digest
+    {
+        return Err(());
+    }
+    let mut unsigned = serde_json::to_value(&envelope).map_err(|_| ())?;
     unsigned.as_object_mut().ok_or(())?.remove("signature");
-    let mut signed =
-        if envelope.get("schema").and_then(Value::as_str) == Some("xyz.tinycloud.share/envelope") {
-            Vec::new()
-        } else {
-            b"xyz.tinycloud.share/envelope/v2\0".to_vec()
-        };
+    let mut signed = b"xyz.tinycloud.share/envelope/v2\0".to_vec();
     signed.extend(jcs::canonicalize(&unsigned));
-    verify_detached_ed25519(signer_did, &signed, &signature_bytes).map_err(|_| ())?;
-
-    let target = outer
-        .get("target")
-        .or_else(|| envelope.get("target"))
-        .unwrap_or(envelope);
-    let target_origin = target
-        .get("origin")
-        .or_else(|| target.get("targetOrigin"))
-        .and_then(Value::as_str)
-        .ok_or(())?;
-    let node_audience = target
-        .get("nodeAudience")
-        .or_else(|| target.get("node_audience"))
-        .and_then(Value::as_str)
-        .ok_or(())?;
-    let binding = outer;
-    let envelope_share_id = binding
-        .get("shareId")
-        .or_else(|| envelope.get("shareId"))
-        .and_then(Value::as_str)
-        .ok_or(())?;
-    if let Some(envelope_cid) = binding
-        .get("envelopeCid")
-        .or_else(|| envelope.get("envelopeCid"))
-        .or_else(|| envelope.get("cid"))
-        .and_then(Value::as_str)
-    {
-        if envelope_cid != request.envelope_cid {
-            return Err(());
-        }
-    } else {
-        return Err(());
-    }
-    let envelope_delegation = binding
-        .get("delegationCid")
-        .or_else(|| envelope.get("delegationCid"))
-        .or_else(|| envelope.get("delegation"))
-        .and_then(Value::as_str)
-        .ok_or(())?;
-    let envelope_policy = binding
-        .get("policyCid")
-        .or_else(|| envelope.get("policyCid"))
-        .or_else(|| {
-            envelope
-                .get("authorizationTarget")
-                .and_then(|v| v.get("policyCid"))
-        })
-        .and_then(Value::as_str)
-        .ok_or(())?;
-    let envelope_source_digest = binding
-        .get("contentSourceDigest")
-        .or_else(|| envelope.get("contentSourceDigest"))
-        .or_else(|| envelope.get("content-source-digest"))
-        .and_then(Value::as_str)
-        .ok_or(())?;
-    let envelope_expiry = binding
-        .get("expiresAt")
-        .or_else(|| envelope.get("expiresAt"))
-        .or_else(|| envelope.get("expiry"))
-        .and_then(Value::as_str)
-        .ok_or(())?;
-    if envelope_share_id != request.share_id
-        || envelope_delegation != request.delegation_cid
-        || envelope_policy != request.policy_cid
-        || envelope_source_digest != request.content_source_digest
-        || target_origin != request.target_origin
-        || node_audience != request.node_audience
-        || envelope_expiry.is_empty()
+    let signature = decode_canonical_b64(&envelope.signature.value, 64)?;
+    if signature.len() != 64 || verify_detached_ed25519(share_key_did, &signed, &signature).is_err()
     {
         return Err(());
     }
-    if let Some(space_id) = envelope.get("spaceId").and_then(Value::as_str) {
-        let source_space = request
-            .content_source
-            .get("space")
-            .and_then(Value::as_str)
-            .ok_or(())?;
-        if space_id != source_space {
-            return Err(());
-        }
+    let expiry = OffsetDateTime::parse(&envelope.expires_at, &Rfc3339).map_err(|_| ())?;
+    if timestamp(expiry) != envelope.expires_at || expiry <= OffsetDateTime::now_utc() {
+        return Err(());
     }
-    if let Some(resource) = envelope.get("resource").and_then(Value::as_object) {
-        if resource.get("kind").and_then(Value::as_str) != Some("exact")
-            || resource.get("path").and_then(Value::as_str) != Some(request.resource.as_str())
-        {
-            return Err(());
-        }
-    }
-    if let Some(actions) = envelope.get("actions").and_then(Value::as_array) {
-        let required = if request.action == "tinycloud.kv/put" {
-            "edit"
-        } else {
-            "read"
-        };
-        if !actions
-            .iter()
-            .any(|action| action.as_str() == Some(required))
-        {
-            return Err(());
-        }
-    }
-    let expiry = OffsetDateTime::parse(envelope_expiry, &Rfc3339).map_err(|_| ())?;
-    if timestamp(expiry) != envelope_expiry || expiry <= OffsetDateTime::now_utc() {
+    if b64_digest(&jcs::canonicalize(&envelope.content_source)) != envelope.content_source_digest {
         return Err(());
     }
     Ok(expiry)
@@ -1650,7 +1653,7 @@ async fn registered_policy(
 async fn verify_registered_ancestors(
     runtime: &ShareV2Runtime,
     registered: &RegisteredPolicy,
-    enforcement: &EnforcementDelegationInput,
+    supplied_enforcement: Option<&EnforcementDelegationInput>,
 ) -> Result<(), ()> {
     let id: tinycloud_core::hash::Hash = registered
         .row
@@ -1670,12 +1673,40 @@ async fn verify_registered_ancestors(
         dag_cbor: encode_config(bytes, URL_SAFE_NO_PAD),
     };
     verify_owner_delegation(runtime, &registered.envelope.policy, &owner).await?;
+    let enforcement = if let Some(enforcement) = supplied_enforcement {
+        enforcement.clone()
+    } else {
+        let stored = maybe_decrypt(
+            Some(&runtime.policy_encryption),
+            &registered.row.enforcement_delegation_bytes,
+        )
+        .map_err(|_| ())?;
+        serde_json::from_slice(&stored).map_err(|_| ())?
+    };
+    if enforcement.cid != registered.row.enforcement_delegation_cid
+        || cid_revoked(&runtime.conn, &enforcement.cid).await?
+    {
+        return Err(());
+    }
     verify_enforcement_delegation(
         runtime,
         &registered.envelope,
         &registered.row.policy_cid,
-        enforcement,
+        &enforcement,
     )
+}
+
+async fn cid_revoked<C: ConnectionTrait>(db: &C, cid: &str) -> Result<bool, ()> {
+    let id: tinycloud_core::hash::Hash = cid
+        .parse::<tinycloud_auth::ipld_core::cid::Cid>()
+        .map_err(|_| ())?
+        .into();
+    Ok(revocation::Entity::find()
+        .filter(revocation::Column::Revoked.eq(id))
+        .count(db)
+        .await
+        .map_err(|_| ())?
+        > 0)
 }
 
 fn typed_scope(
@@ -1744,10 +1775,9 @@ fn typed_scope(
     })
 }
 
-fn exact_content_source(registered: &RegisteredPolicy, request: &V2ChallengeRequest) -> Value {
+fn exact_content_source(registered: &RegisteredPolicy, _request: &V2ChallengeRequest) -> Value {
     serde_json::json!({
         "kind": "kv",
-        "action": request.action,
         "space": registered.row.space_id,
         "path": registered.row.resource_path,
     })
@@ -1789,6 +1819,10 @@ fn verify_policy_presentation(
                 request.actions.iter().cloned().map(Value::String).collect(),
             ))
         || presentation.get("resource").and_then(Value::as_str) != Some(request.resource.as_str())
+        || presentation
+            .get("requestBodyDigest")
+            .and_then(Value::as_str)
+            != Some(request.request_body_digest.as_str())
         || presentation.get("credentialDigest").and_then(Value::as_str) != Some(credential_digest)
     {
         return Err(());
@@ -1801,6 +1835,7 @@ fn runtime_delegation_facts(
     request: &V2ChallengeRequest,
     holder_did: &str,
     credential_digest: &str,
+    vp_digest: &str,
     expires_at: &str,
 ) -> Value {
     serde_json::json!({
@@ -1808,7 +1843,8 @@ fn runtime_delegation_facts(
         "policyCid": registered.row.policy_cid,
         "registrationCid": registered.row.registration_cid,
         "enforcementDelegationCid": registered.row.enforcement_delegation_cid,
-        "envelopeCid": request.envelope_cid,
+        "envelopeCid": request.envelope_cid.clone(),
+        "shareCid": request.share_cid,
         "shareId": request.share_id,
         "shareKeyDid": registered.row.share_key_did,
         "enforcerDid": registered.row.enforcer_did,
@@ -1819,6 +1855,7 @@ fn runtime_delegation_facts(
         "actions": request.actions,
         "contentSourceDigest": registered.row.content_source_digest,
         "credentialDigest": credential_digest,
+        "vpDigest": vp_digest,
         "expiresAt": expires_at,
     })
 }
@@ -1829,6 +1866,7 @@ async fn create_runtime_delegation(
     request: &V2ChallengeRequest,
     holder_did: &str,
     credential_digest: &str,
+    vp_digest: &str,
     expires_at: &str,
 ) -> Result<Value, ()> {
     let facts = runtime_delegation_facts(
@@ -1836,6 +1874,7 @@ async fn create_runtime_delegation(
         request,
         holder_did,
         credential_digest,
+        vp_digest,
         expires_at,
     );
     let unsigned = serde_json::json!({
@@ -1864,6 +1903,7 @@ async fn create_runtime_delegation(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_runtime_delegation(
     runtime: &ShareV2Runtime,
     value: &Value,
@@ -1871,6 +1911,7 @@ fn verify_runtime_delegation(
     request: &V2ChallengeRequest,
     holder_did: &str,
     credential_digest: &str,
+    vp_digest: &str,
     session_expires_at: &str,
 ) -> Result<(), ()> {
     let object = value.as_object().ok_or(())?;
@@ -1908,6 +1949,7 @@ fn verify_runtime_delegation(
                 request,
                 holder_did,
                 credential_digest,
+                vp_digest,
                 session_expires_at,
             ))
         || object.get("facts") != dag_value.get("unsigned").and_then(|v| v.get("facts"))
@@ -1983,12 +2025,16 @@ pub async fn policy_challenge_v2(
         || request.node_audience != runtime.config.node_audience
         || request.content_source_digest != registered.row.content_source_digest
         || request.content_source != exact_content_source(&registered, &request)
+        || b64_digest(&jcs::canonicalize(&request.content_source)) != request.content_source_digest
         || request.resource != registered.row.resource_path
         || request.actions.is_empty()
+        || !request.actions.contains(&request.action)
+        || request.actions.windows(2).any(|pair| pair[0] >= pair[1])
         || request
             .actions
             .iter()
             .any(|action| !registered.envelope.policy.actions.contains(action))
+        || !registered.envelope.policy.actions.contains(&request.action)
     {
         return Err(share_error("policy_denied"));
     }
@@ -2001,7 +2047,7 @@ pub async fn policy_challenge_v2(
     if outer_expiry > registered.expiry {
         return Err(share_error("policy_expired"));
     }
-    verify_registered_ancestors(runtime, &registered, &request.enforcement_delegation)
+    verify_registered_ancestors(runtime, &registered, Some(&request.enforcement_delegation))
         .await
         .map_err(|_| share_error("policy_denied"))?;
     let scope = typed_scope(&registered, &request).map_err(|_| share_error("policy_denied"))?;
@@ -2015,10 +2061,25 @@ pub async fn policy_challenge_v2(
     if expires <= now {
         return Err(share_error("policy_expired"));
     }
-    let binding = serde_json::json!({
-        "request": raw,
-        "enforcementDelegation": serde_json::to_value(&request.enforcement_delegation).map_err(|_| share_error("policy_challenge_invalid"))?
+    let mut redacted_request = raw.clone();
+    let redacted_outer = serde_json::json!({
+        "envelopeCid": request.envelope_cid,
+        "digest": b64_digest(&jcs::canonicalize(&request.outer_envelope)),
     });
+    let redacted_enforcement = serde_json::json!({
+        "cid": request.enforcement_delegation.cid.clone(),
+        "dagCbor": "",
+        "issuerDid": request.enforcement_delegation.issuer_did.clone(),
+        "audienceDid": request.enforcement_delegation.audience_did.clone(),
+        "facts": request.enforcement_delegation.facts.clone(),
+        "signature": "",
+    });
+    let redacted_object = redacted_request
+        .as_object_mut()
+        .ok_or_else(|| share_error("policy_challenge_invalid"))?;
+    redacted_object.insert("outerEnvelope".to_owned(), redacted_outer);
+    redacted_object.insert("enforcementDelegation".to_owned(), redacted_enforcement);
+    let binding = serde_json::json!({ "request": redacted_request });
     share_anonymous_challenge::ActiveModel {
         challenge_id: Set(challenge_id.as_str().to_owned()),
         request_digest: Set(request.request_body_digest.clone()),
@@ -2110,25 +2171,15 @@ pub async fn policy_session_v2(
     )
     .await
     .map_err(|_| share_error("policy_denied"))?;
-    if challenge_request.content_source != exact_content_source(&registered, &challenge_request) {
+    if challenge_request.content_source != exact_content_source(&registered, &challenge_request)
+        || b64_digest(&jcs::canonicalize(&challenge_request.content_source))
+            != challenge_request.content_source_digest
+    {
         return Err(share_error("policy_denied"));
     }
-    let outer_expiry = verify_outer_envelope(
-        &challenge_request.outer_envelope,
-        &challenge_request,
-        &registered.row.share_key_did,
-    )
-    .map_err(|_| share_error("policy_denied"))?;
-    if outer_expiry > registered.expiry {
-        return Err(share_error("policy_expired"));
-    }
-    verify_registered_ancestors(
-        runtime,
-        &registered,
-        &challenge_request.enforcement_delegation,
-    )
-    .await
-    .map_err(|_| share_error("policy_denied"))?;
+    verify_registered_ancestors(runtime, &registered, None)
+        .await
+        .map_err(|_| share_error("policy_denied"))?;
     let presentation: V2PolicyPresentation = serde_json::from_value(request.presentation.clone())
         .map_err(|_| share_error("invalid_holder_proof"))?;
     let presentation_value =
@@ -2180,15 +2231,12 @@ pub async fn policy_session_v2(
     )
     .map_err(|_| share_error("invalid_holder_proof"))?;
     if binding_message.get("holderDid").and_then(Value::as_str) != Some(presentation_holder)
-        || binding_message
-            .get("registrationCid")
-            .and_then(Value::as_str)
-            != Some(challenge_request.registration_cid.as_str())
-        || binding_message.get("envelopeCid").and_then(Value::as_str)
-            != Some(challenge_request.envelope_cid.as_str())
         || binding_message.get("challengeId").and_then(Value::as_str)
             != Some(request.challenge_id.as_str())
-        || binding_message.get("nonce").and_then(Value::as_str) != Some(request.nonce.as_str())
+        || binding_message
+            .get("challengeNonce")
+            .and_then(Value::as_str)
+            != Some(request.nonce.as_str())
         || binding_message.get("shareId").and_then(Value::as_str)
             != Some(challenge_request.share_id.as_str())
         || binding_message.get("policyCid").and_then(Value::as_str)
@@ -2222,6 +2270,32 @@ pub async fn policy_session_v2(
     if evidence.credential_digest.as_str() != credential_digest {
         return Err(share_error("policy_denied"));
     }
+    let expected_email_hash = normalized_email_hash(&evidence.disclosed_email)
+        .map_err(|_| share_error("policy_denied"))?;
+    let challenge_nonce = ProtocolNonce::parse(request.nonce.clone())
+        .map_err(|_| share_error("invalid_holder_proof"))?;
+    let challenge_id = ProtocolNonce::parse(request.challenge_id.clone())
+        .map_err(|_| share_error("invalid_holder_proof"))?;
+    let request_digest = Sha256Digest::parse(challenge_request.request_body_digest.clone())
+        .map_err(|_| share_error("invalid_holder_proof"))?;
+    let enforcer = DidKey::parse(runtime.enforcer_did.clone())
+        .map_err(|_| share_error("invalid_holder_proof"))?;
+    verifier
+        .verify_holder_binding(
+            &holder_binding,
+            &scope,
+            &expected_email_hash,
+            &evidence.credential_digest,
+            challenge_id.as_str(),
+            &challenge_nonce,
+            &request_digest,
+            &enforcer,
+            &holder,
+            &holder,
+            &holder,
+            &holder,
+        )
+        .map_err(|_| share_error("invalid_holder_proof"))?;
     let session_id = tinycloud_core::share_email::invitation::random_protocol_nonce();
     let session_expires = (now + time::Duration::minutes(5)).min(registered.expiry);
     let runtime_delegation = create_runtime_delegation(
@@ -2230,6 +2304,7 @@ pub async fn policy_session_v2(
         &challenge_request,
         presentation_holder,
         &credential_digest,
+        &b64_digest(&jcs::canonicalize(&presentation_value)),
         &timestamp(session_expires),
     )
     .await
@@ -2238,7 +2313,7 @@ pub async fn policy_session_v2(
         "challenge": serde_json::to_value(&challenge_request).map_err(|_| share_error("policy_session_invalid"))?,
         "holderDid": presentation_holder,
         "credentialDigest": credential_digest,
-        "enforcementDelegation": challenge.binding_json.get("enforcementDelegation").cloned().ok_or_else(|| share_error("policy_session_invalid"))?,
+        "vpDigest": b64_digest(&jcs::canonicalize(&presentation_value)),
         "runtimeDelegation": runtime_delegation.clone(),
     });
     let session_model = share_session_handle::ActiveModel {
@@ -2388,12 +2463,17 @@ pub async fn invoke_v2(
     let registered = registered_policy(runtime, &challenge.registration_cid, &challenge.policy_cid)
         .await
         .map_err(|_| share_error("invoke_denied"))?;
-    verify_registered_ancestors(runtime, &registered, &challenge.enforcement_delegation)
+    verify_registered_ancestors(runtime, &registered, None)
         .await
         .map_err(|_| share_error("invoke_denied"))?;
     let credential_digest = session
         .binding_json
         .get("credentialDigest")
+        .and_then(Value::as_str)
+        .ok_or_else(|| share_error("invoke_denied"))?;
+    let vp_digest = session
+        .binding_json
+        .get("vpDigest")
         .and_then(Value::as_str)
         .ok_or_else(|| share_error("invoke_denied"))?;
     verify_runtime_delegation(
@@ -2406,6 +2486,7 @@ pub async fn invoke_v2(
         &challenge,
         &challenge.holder_did,
         credential_digest,
+        vp_digest,
         &session.expires_at,
     )
     .map_err(|_| share_error("invoke_denied"))?;
@@ -2509,6 +2590,14 @@ pub async fn invoke_v2(
         }
         let expected =
             parse_v2_etag(if_match).map_err(|_| error(Status::BadRequest, "invalid_if_match"))?;
+        insert_invocation_replay(
+            runtime,
+            invocation,
+            &envelope.request.request_body_digest,
+            expires,
+        )
+        .await
+        .map_err(|_| share_error("invoke_replayed"))?;
         let mut stage = staging
             .stage(&space)
             .await
@@ -2541,14 +2630,6 @@ pub async fn invoke_v2(
             .await
             .map_err(|_| error(Status::PreconditionFailed, "edit_conflict"))?;
         let etag = format!("\"blake3-{}\"", hex::encode(hash.as_ref()));
-        insert_invocation_replay(
-            runtime,
-            invocation,
-            &envelope.request.request_body_digest,
-            expires,
-        )
-        .await
-        .map_err(|_| share_error("invoke_replayed"))?;
         return Ok(Json(serde_json::json!({
             "type": "TinyCloudShareInvokeResponse", "version": 2,
             "action": action, "resource": invocation.resource,
@@ -2669,9 +2750,13 @@ pub async fn authorize_delivery_v2(
     if !runtime.live().await {
         return Err(error(Status::ServiceUnavailable, "capability_unavailable"));
     }
-    invocation_model::verify_invocation(&invocation.0 .0.invocation)
-        .await
-        .map_err(|_| error(Status::Unauthorized, "delivery_authorization_invalid"))?;
+    invocation_model::verify_and_authorize(
+        &runtime.conn,
+        &invocation.0 .0,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .map_err(|_| error(Status::Unauthorized, "delivery_authorization_invalid"))?;
     let raw = read_body(data).await?;
     let request: V2DeliveryRequest = serde_json::from_slice(&raw)
         .map_err(|_| error(Status::BadRequest, "delivery_authorization_invalid"))?;
@@ -2689,14 +2774,23 @@ pub async fn authorize_delivery_v2(
     let registered = registered_policy(runtime, &request.registration_cid, &request.policy_cid)
         .await
         .map_err(|_| share_error("delivery_authorization_invalid"))?;
+    verify_registered_ancestors(runtime, &registered, None)
+        .await
+        .map_err(|_| share_error("delivery_authorization_invalid"))?;
     let expires = OffsetDateTime::parse(&request.expires_at, &Rfc3339)
         .map_err(|_| share_error("delivery_authorization_invalid"))?;
     let now = OffsetDateTime::now_utc();
-    if expires <= now || expires > now + time::Duration::minutes(5) {
+    if expires <= now
+        || expires > now + time::Duration::minutes(5)
+        || decode_canonical_b64(&request.jti, 16).map_or(true, |value| value.len() != 16)
+    {
         return Err(share_error("delivery_authorization_invalid"));
     }
     if request.envelope_cid == request.registration_cid
+        || request.share_cid == request.envelope_cid
         || request.share_id != registered.envelope.policy.share_id
+        || request.delegation_cid != registered.row.owner_delegation_cid
+        || request.enforcement_delegation_cid != registered.row.enforcement_delegation_cid
         || !normal_invocation_allows_delivery(&invocation.0 .0, &registered)
     {
         return Err(share_error("delivery_authorization_invalid"));
@@ -2717,16 +2811,27 @@ pub async fn authorize_delivery_v2(
     .insert(&runtime.conn)
     .await
     .map_err(|_| share_error("delivery_authorization_replayed"))?;
-    Ok(Json(serde_json::json!({
+    let authorization = serde_json::json!({
         "type": "TinyCloudShareDeliveryAuthorization",
         "version": 2,
         "jti": request.jti,
+        "shareCid": request.share_cid,
+        "shareId": request.share_id,
         "registrationCid": request.registration_cid,
+        "delegationCid": request.delegation_cid,
+        "enforcementDelegationCid": request.enforcement_delegation_cid,
         "envelopeCid": request.envelope_cid,
         "policyCid": request.policy_cid,
+        "nodeAudience": registered.row.node_audience,
+        "targetOrigin": registered.row.target_origin,
         "expiresAt": request.expires_at,
         "dataAuthority": false
-    })))
+    });
+    let proof = signed_value(runtime.signer.as_ref(), V2_DELIVERY_DOMAIN, &authorization)
+        .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?;
+    Ok(Json(
+        serde_json::json!({ "authorization": authorization, "proof": proof }),
+    ))
 }
 
 #[cfg(test)]
@@ -2768,7 +2873,7 @@ mod tests {
     fn sample_policy() -> (PolicyEnvelope, RegisterRequest, ShareEmailConfig) {
         let config = ShareEmailConfig::default();
         let expires_at = timestamp(OffsetDateTime::now_utc() + Duration::days(1));
-        let envelope = serde_json::from_value(serde_json::json!({
+        let mut envelope: PolicyEnvelope = serde_json::from_value(serde_json::json!({
             "domain": POLICY_DOMAIN,
             "policy": {
                 "type": "TinyCloudSharePolicy",
@@ -2792,7 +2897,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let request = serde_json::from_value(serde_json::json!({
+        let mut request: RegisterRequest = serde_json::from_value(serde_json::json!({
             "policy": {"bytes": "bytes", "cid": "bafy-policy", "proof": "proof"},
             "ownerDelegation": {"cid": "bafy-owner", "dagCbor": "dag"},
             "enforcementDelegation": {
@@ -2818,6 +2923,11 @@ mod tests {
             "contentSourceDigest": "digest"
         }))
         .unwrap();
+        let source = serde_json::to_value(&envelope.policy.content_source).unwrap();
+        let source_digest = b64_digest(&jcs::canonicalize(&source));
+        envelope.policy.content_source_digest = source_digest.clone();
+        request.content_source_digest = source_digest.clone();
+        request.enforcement_delegation.facts.content_source_digest = source_digest;
         (envelope, request, config)
     }
 
@@ -2837,6 +2947,59 @@ mod tests {
         let (mut envelope, request, config) = sample_policy();
         envelope.policy.actions.push("tinycloud.kv/list".to_owned());
         assert!(validate_policy(&envelope, &request, &config, "did:key:z6MkEnforcer").is_err());
+    }
+
+    #[test]
+    fn policy_validation_rejects_share_path_mismatch_and_digest_mutation() {
+        let (mut envelope, request, config) = sample_policy();
+        envelope.policy.resource.path = "shares/other/document.md".to_owned();
+        envelope.policy.content_source.path = "shares/other/document.md".to_owned();
+        assert!(validate_policy(&envelope, &request, &config, "did:key:z6MkEnforcer").is_err());
+
+        let (mut envelope, request, config) = sample_policy();
+        envelope.policy.content_source_digest =
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned();
+        assert!(validate_policy(&envelope, &request, &config, "did:key:z6MkEnforcer").is_err());
+    }
+
+    #[test]
+    fn outer_envelope_rejects_unsigned_wrappers_and_unknown_fields() {
+        let request = sample_v2_challenge();
+        assert!(verify_outer_envelope(
+            &serde_json::json!({"envelope": {}}),
+            &request,
+            "did:key:z6MkShare"
+        )
+        .is_err());
+        let mut value = serde_json::json!({
+            "schema": "xyz.tinycloud.share/envelope/v2",
+            "version": 2,
+            "envelopeCid": "bafy-envelope",
+            "shareCid": "bafy-share",
+            "shareId": "share-1",
+            "delegationCid": "bafy-owner",
+            "policyCid": "bafy-policy",
+            "target": {"origin": "https://share.tinycloud.xyz", "nodeAudience": "did:web:node.example", "enforcerDid": "did:key:z6MkEnforcer", "spaceId": "applications"},
+            "resource": {"kind": "exact", "path": "shares/share-1/document.md"},
+            "actions": ["tinycloud.kv/get", "tinycloud.kv/metadata"],
+            "contentSource": {"kind": "kv", "space": "applications", "path": "shares/share-1/document.md"},
+            "contentSourceDigest": "digest",
+            "expiresAt": "2099-01-01T00:00:00.000Z",
+            "signature": {"signerDid": "did:key:z6MkShare", "algorithm": "Ed25519", "value": "signature"},
+            "unsignedExtra": true
+        });
+        assert!(verify_outer_envelope(&value, &request, "did:key:z6MkShare").is_err());
+        value.as_object_mut().unwrap().remove("unsignedExtra");
+        assert!(verify_outer_envelope(&value, &request, "did:key:z6MkShare").is_err());
+    }
+
+    #[test]
+    fn runtime_delegation_facts_include_share_and_presentation_digests() {
+        let request = sample_v2_challenge();
+        assert_eq!(request.share_cid, "bafy-share");
+        let presentation = serde_json::json!({"holderDid": request.holder_did});
+        let digest = b64_digest(&jcs::canonicalize(&presentation));
+        assert_eq!(digest.len(), 43);
     }
 
     fn sample_v2_challenge() -> V2ChallengeRequest {
@@ -2908,7 +3071,8 @@ mod tests {
             "credentialDigest": "credential",
             "action": "tinycloud.kv/get",
             "actions": ["tinycloud.kv/get", "tinycloud.kv/metadata"],
-            "resource": "shares/share-1/document.md"
+            "resource": "shares/share-1/document.md",
+            "requestBodyDigest": "digest"
         });
         assert!(verify_policy_presentation(
             &presentation,
