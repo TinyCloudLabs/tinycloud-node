@@ -17,7 +17,7 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{info_span, Instrument};
 
 use crate::{
-    auth_guards::{DataIn, DataOut, InvOut, KVResponse, ObjectHeaders},
+    auth_guards::{DataIn, DataOut, InvOut, ObjectHeaders},
     authorization::AuthHeaderGetter,
     config::Config,
     hooks::{HookRuntime, WriteEvent},
