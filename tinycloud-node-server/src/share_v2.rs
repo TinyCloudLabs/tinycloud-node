@@ -73,6 +73,10 @@ const ENFORCEMENT_DOMAIN: &str = "xyz.tinycloud.share/policy-enforcement/v2\\0";
 const MAX_POLICY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_GRAPH_NODES: usize = 64;
 
+fn canonical_did_key_kid(did: &str) -> String {
+    format!("{did}#{}", did.strip_prefix("did:key:").unwrap_or(did))
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CapabilityDescriptor {
@@ -285,10 +289,13 @@ pub async fn compose(
             .map_err(|_| anyhow::anyhow!("invalid share v2 signing key"))?;
     let signing_keypair = tinycloud_core::libp2p::identity::ed25519::Keypair::from(signing_secret);
     let signer_did = tinycloud_core::keys::public_key_to_did_key(signing_keypair.public().into());
-    let signer = Ed25519InvitationSigner::new(signer_did.clone(), signing_keypair.into())?;
+    let signer =
+        Ed25519InvitationSigner::new(canonical_did_key_kid(&signer_did), signing_keypair.into())?;
     let enforcer_did = key_setup.node_did();
-    let enforcer_signer =
-        Ed25519InvitationSigner::new(enforcer_did.clone(), key_setup.node_keypair())?;
+    let enforcer_signer = Ed25519InvitationSigner::new(
+        canonical_did_key_kid(&enforcer_did),
+        key_setup.node_keypair(),
+    )?;
     let verifier = config
         .issuer_public_key
         .as_deref()

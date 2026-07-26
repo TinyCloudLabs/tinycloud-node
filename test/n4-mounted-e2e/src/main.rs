@@ -497,7 +497,7 @@ fn descriptor(
             })
         }).collect::<Vec<_>>();
         json!({
-        "kind":case.kind,"source":case.source,"policy":case.policy,"expectedContentSourceDigest":sha256_b64(&value_bytes(&case.source)),"expectedRecipientEmail":"sam@tinycloud.xyz","expiresAt":case.expires_at,
+        "kind":case.kind,"source":case.source,"policy":case.policy,"expectedContentSourceDigest":sha256_b64(&value_bytes(&case.source)),"expectedRecipientEmail":if case.kind == "kv-domain" || case.kind == "kv-folder-domain" { "sam@mailinator.com" } else { "sam@tinycloud.xyz" },"expiresAt":case.expires_at,
         "policyCid":case.policy_cid,"delegationCid":case.delegation_cid,"authorityMaterialHandle":case.authority["handle"].clone(),"authorityMaterialDigest":case.authority_digest,
         "policyOwnerDid":case.authority["policyOwnerDid"],"senderDid":case.authority["senderDid"],"senderPrivateKey":b64(&sender_seed),"delegation":format!("uCAESA.n4-production.{}",case.kind),"spaceId":SPACE,"documentName":if case.kind == "kv" { "TinyCloud share test" } else { "Project plan.md" },"senderTrust":"verified","authorityMaterial":case.authority,"targetOrigin":config.target_origin,"nodeAudience":config.node_audience,
         "trustedNode":{"targetOrigin":config.target_origin,"nodeAudience":config.node_audience,"invitationKid":config.invitation_kid,"invitationPublicKey":b64(&node_public),"keyVersion":1,"enabled":true},"authoritativeBinding":authoritative_bindings[0],"authoritativeBindings":authoritative_bindings,"expectedContent":case.content
