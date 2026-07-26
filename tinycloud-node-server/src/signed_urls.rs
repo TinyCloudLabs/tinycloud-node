@@ -199,8 +199,6 @@ where
 {
     fn respond_to(self, request: &'r Request<'_>) -> rocket::response::Result<'static> {
         let mut response = Response::build();
-        response.header(Header::new("Accept-Ranges", "bytes"));
-        response.header(Header::new("Cache-Control", SIGNED_KV_CACHE_CONTROL));
 
         match self {
             Self::Full {
@@ -251,13 +249,18 @@ where
                 ));
             }
         }
+        response.header(Header::new("Accept-Ranges", "bytes"));
+        response.header(Header::new("Cache-Control", SIGNED_KV_CACHE_CONTROL));
         Ok(response.finalize())
     }
 }
 
 fn add_object_headers(response: &mut rocket::response::Builder<'_>, metadata: Metadata) {
     for (key, value) in metadata.0 {
-        if !key.eq_ignore_ascii_case("content-length") {
+        if !key.eq_ignore_ascii_case("cache-control")
+            && !key.eq_ignore_ascii_case("content-length")
+            && !key.eq_ignore_ascii_case("content-range")
+        {
             response.header(Header::new(key, value));
         }
     }
@@ -754,6 +757,23 @@ mod tests {
         }
     }
 
+    #[get("/hostile-metadata")]
+    fn hostile_metadata_response() -> SignedKvReadResponse<Cursor<Vec<u8>>> {
+        let bytes = b"hello".to_vec();
+        SignedKvReadResponse::Full {
+            metadata: Metadata(BTreeMap::from([
+                (
+                    "Cache-Control".to_string(),
+                    "public, max-age=31536000".to_string(),
+                ),
+                ("Accept-Ranges".to_string(), "none".to_string()),
+                ("Content-Range".to_string(), "bytes 0-0/1".to_string()),
+            ])),
+            hash: hash(&bytes),
+            content: Content::new(bytes.len() as u64, Cursor::new(bytes)),
+        }
+    }
+
     #[get("/unsatisfiable")]
     fn unsatisfiable_response() -> SignedKvReadResponse<Cursor<Vec<u8>>> {
         SignedKvReadResponse::Unsatisfiable {
@@ -831,6 +851,23 @@ mod tests {
             assert_eq!(cache_control, Some(SIGNED_KV_CACHE_CONTROL), "{path}");
             assert!(!cache_control.is_some_and(|value| value.contains("public")));
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signed_kv_policy_headers_override_stored_metadata() -> Result<()> {
+        let client =
+            Client::tracked(rocket::build().mount("/", routes![hostile_metadata_response])).await?;
+
+        let response = client.get("/hostile-metadata").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            response.headers().get_one("Cache-Control"),
+            Some(SIGNED_KV_CACHE_CONTROL)
+        );
+        assert_eq!(response.headers().get_one("Accept-Ranges"), Some("bytes"));
+        assert!(response.headers().get_one("Content-Range").is_none());
+        assert_eq!(response.into_bytes().await.unwrap(), b"hello");
         Ok(())
     }
 
