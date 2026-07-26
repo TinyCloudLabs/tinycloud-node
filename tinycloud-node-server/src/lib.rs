@@ -376,6 +376,7 @@ pub async fn app_with_control(
         &key_setup,
         tinycloud_config.share_email.clone(),
         tee_context.clone(),
+        Arc::new(tinycloud.clone()),
     )
     .await?;
     if let Some(runtime) = share_email_runtime.as_ref() {
