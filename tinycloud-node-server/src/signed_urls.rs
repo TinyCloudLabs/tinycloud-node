@@ -1,4 +1,4 @@
-use crate::TinyCloud;
+use crate::{auth_guards::if_none_match_matches, TinyCloud};
 use base64::{encode_config, URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
@@ -196,10 +196,13 @@ impl<'r, R> Responder<'r, 'static> for SignedKvReadResponse<R>
 where
     R: 'static + AsyncRead + Send,
 {
-    fn respond_to(self, _: &'r Request<'_>) -> rocket::response::Result<'static> {
+    fn respond_to(self, request: &'r Request<'_>) -> rocket::response::Result<'static> {
         let mut response = Response::build();
         response.header(Header::new("Accept-Ranges", "bytes"));
-        response.header(Header::new("Cache-Control", "private, no-store"));
+        response.header(Header::new(
+            "Cache-Control",
+            "public, max-age=31536000, immutable",
+        ));
 
         match self {
             Self::Full {
@@ -209,9 +212,14 @@ where
             } => {
                 crate::prometheus::observe_signed_kv_transfer(content.len(), content.len());
                 add_object_headers(&mut response, metadata);
-                response.header(Header::new("ETag", etag(&hash)));
-                response.header(Header::new("Content-Length", content.len().to_string()));
-                response.streamed_body(content.compat());
+                let etag = etag(&hash);
+                response.header(Header::new("ETag", etag.clone()));
+                if if_none_match_matches(request.headers().get_one("If-None-Match"), &etag) {
+                    response.status(Status::NotModified);
+                } else {
+                    response.header(Header::new("Content-Length", content.len().to_string()));
+                    response.streamed_body(content.compat());
+                }
             }
             Self::Partial {
                 metadata,
@@ -223,13 +231,18 @@ where
                 crate::prometheus::observe_signed_kv_transfer(total_size, content.len());
                 add_object_headers(&mut response, metadata);
                 response.status(Status::PartialContent);
-                response.header(Header::new("ETag", etag(&hash)));
-                response.header(Header::new(
-                    "Content-Range",
-                    format!("bytes {}-{}/{}", range.start(), range.end(), total_size),
-                ));
-                response.header(Header::new("Content-Length", content.len().to_string()));
-                response.streamed_body(content.compat());
+                let etag = etag(&hash);
+                response.header(Header::new("ETag", etag.clone()));
+                if if_none_match_matches(request.headers().get_one("If-None-Match"), &etag) {
+                    response.status(Status::NotModified);
+                } else {
+                    response.header(Header::new(
+                        "Content-Range",
+                        format!("bytes {}-{}/{}", range.start(), range.end(), total_size),
+                    ));
+                    response.header(Header::new("Content-Length", content.len().to_string()));
+                    response.streamed_body(content.compat());
+                }
             }
             Self::Unsatisfiable { hash, total_size } => {
                 response.status(Status::RangeNotSatisfiable);

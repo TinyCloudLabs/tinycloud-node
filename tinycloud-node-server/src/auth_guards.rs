@@ -118,6 +118,12 @@ fn kv_etag(hash: Hash) -> String {
     format!("\"blake3-{}\"", hex::encode(hash.as_ref()))
 }
 
+pub(crate) fn if_none_match_matches(value: Option<&str>, etag: &str) -> bool {
+    value.is_some_and(|value| {
+        value.trim() == "*" || value.split(',').any(|candidate| candidate.trim() == etag)
+    })
+}
+
 impl<'r> Responder<'r, 'static> for KvMutationResponse {
     fn respond_to(self, request: &'r Request<'_>) -> rocket::response::Result<'static> {
         let mut response = ().respond_to(request)?;
@@ -244,7 +250,44 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::io::Cursor;
+    use rocket::{get, http::Header, local::asynchronous::Client, routes};
     use tinycloud_core::{hash::hash, KvBatchReadItem, KvBatchReadValue};
+
+    #[get("/")]
+    fn conditional_kv_response() -> KVResponse<Cursor<Vec<u8>>> {
+        let content = b"hello".to_vec();
+        KVResponse::new(
+            Metadata(BTreeMap::new()),
+            hash(&content),
+            Cursor::new(content),
+        )
+    }
+
+    #[tokio::test]
+    async fn matching_kv_etag_returns_a_bodyless_304() {
+        let client = Client::tracked(rocket::build().mount("/", routes![conditional_kv_response]))
+            .await
+            .unwrap();
+
+        let first = client.get("/").dispatch().await;
+        assert_eq!(first.status(), Status::Ok);
+        let etag = first.headers().get_one("ETag").unwrap().to_string();
+        assert_eq!(
+            first.headers().get_one("Cache-Control"),
+            Some("private, no-cache")
+        );
+        assert_eq!(first.into_string().await.as_deref(), Some("hello"));
+
+        let second = client
+            .get("/")
+            .header(Header::new("If-None-Match", etag))
+            .dispatch()
+            .await;
+        assert_eq!(second.status(), Status::NotModified);
+        assert!(second.headers().get_one("Content-Length").is_none());
+        assert!(second.into_string().await.is_none());
+    }
 
     #[test]
     fn batch_read_response_keeps_successes_and_missing_keys_in_order() {
@@ -337,7 +380,8 @@ impl<'r> Responder<'r, 'static> for ObjectHeaders {
     fn respond_to(self, _: &'r Request<'_>) -> rocket::response::Result<'static> {
         let mut r = Response::build();
         for (k, v) in self.0 .0 {
-            if k != "content-length" {
+            if !k.eq_ignore_ascii_case("content-length") && !k.eq_ignore_ascii_case("if-none-match")
+            {
                 r.header(Header::new(k, v));
             }
         }
@@ -358,11 +402,19 @@ where
     R: 'static + AsyncRead + Send,
 {
     fn respond_to(self, r: &'r Request<'_>) -> rocket::response::Result<'static> {
-        let etag = kv_etag(self.2);
-        Ok(Response::build_from(ObjectHeaders(self.1).respond_to(r)?)
-            .header(Header::new("ETag", etag))
-            // must ensure that Metadata::respond_to does not set the body of the response
-            .streamed_body(self.0.compat())
-            .finalize())
+        let KVResponse(content, metadata, hash) = self;
+        let etag = kv_etag(hash);
+        let not_modified = if_none_match_matches(r.headers().get_one("If-None-Match"), &etag);
+        let mut response = Response::build_from(ObjectHeaders(metadata).respond_to(r)?);
+        response.header(Header::new("ETag", etag));
+        response.header(Header::new("Cache-Control", "private, no-cache"));
+        if not_modified {
+            response.status(Status::NotModified);
+        } else {
+            response
+                // must ensure that Metadata::respond_to does not set the body of the response
+                .streamed_body(content.compat());
+        }
+        Ok(response.finalize())
     }
 }
