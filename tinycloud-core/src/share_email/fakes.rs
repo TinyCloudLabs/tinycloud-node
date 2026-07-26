@@ -83,6 +83,7 @@ mod tests {
             node_audience: Did::parse("did:web:node.example").unwrap(),
             target_origin: TargetOrigin::parse("https://node.example").unwrap(),
             action: ShareAction::KvGet,
+            allowed_actions: vec![ShareAction::KvGet],
             resource: ExactResource::Kv {
                 path: Path::parse("documents/plan.md").unwrap(),
             },
@@ -110,6 +111,7 @@ mod tests {
             node_audience: Did::parse("did:web:node.example").unwrap(),
             target_origin: TargetOrigin::parse("https://node.example").unwrap(),
             action: ShareAction::SqlRead,
+            allowed_actions: vec![ShareAction::SqlRead],
             resource: ExactResource::Sql {
                 database: database.clone(),
                 path: path.clone(),

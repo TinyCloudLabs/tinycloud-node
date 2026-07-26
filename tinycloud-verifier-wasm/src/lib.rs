@@ -14,13 +14,13 @@ use tinycloud_auth::{
     authorization::{HeaderEncode, TinyCloudDelegation, TinyCloudInvocation},
     cacaos::siwe_cacao::{SIWEPayloadConversionError, SiweCacao},
     identity::principal_did,
-    ipld_core::cid::{Cid, multibase::Base},
+    ipld_core::cid::{multibase::Base, Cid},
     multihash_codetable::{Code, MultihashDigest},
     resource::ResourceId,
     siwe_recap::Capability as SiweRecapCapability,
     ssi::{
         claims::jws::verify_bytes,
-        jwk::{Base64urlUInt, JWK, OctetParams, Params},
+        jwk::{Base64urlUInt, OctetParams, Params, JWK},
         ucan::TimeInvalid,
     },
 };
@@ -524,7 +524,7 @@ mod tests {
     use serde::Deserialize;
     use std::iter::once;
     use tinycloud_auth::{
-        authorization::{InvocationOptions, make_invocation_from_uris},
+        authorization::{make_invocation_from_uris, InvocationOptions},
         cacaos::siwe_cacao::{Header as SiweHeader, Payload as SiwePayload},
         ipld_core::cid::multibase::Base as CidBase,
         resolver::DID_METHODS,
@@ -779,11 +779,9 @@ mod tests {
         assert_eq!(verdict.capabilities.len(), 1);
         assert_eq!(
             verdict.proof_cids,
-            vec![
-                proof
-                    .to_string_of_base(CidBase::Base58Btc)
-                    .expect("cid base58btc")
-            ]
+            vec![proof
+                .to_string_of_base(CidBase::Base58Btc)
+                .expect("cid base58btc")]
         );
 
         let wrong_jwk = JWK::generate_ed25519().expect("wrong jwk");

@@ -106,11 +106,17 @@ impl HolderReadProof {
 /// constructor: callers must provide the holder signature and its unique JTI.
 #[derive(Clone, PartialEq, Eq)]
 pub struct HolderReadRequest {
+    pub version: u8,
     pub session: SessionHandle,
     pub jti: ProtocolJti,
     pub scope: ShareScope,
     pub holder: DidKey,
     pub request_body_digest: Sha256Digest,
+    pub limit: Option<usize>,
+    pub cursor: Option<String>,
+    pub body_digest: Option<Sha256Digest>,
+    pub if_match: Option<String>,
+    pub content_type: Option<String>,
     pub proof: HolderReadProof,
 }
 
@@ -121,7 +127,7 @@ impl fmt::Debug for HolderReadRequest {
 }
 
 impl HolderReadRequest {
-    fn authorization(&self) -> ReadAuthorizationRequest {
+    pub fn authorization(&self) -> ReadAuthorizationRequest {
         ReadAuthorizationRequest {
             session: self.session.clone(),
             jti: self.jti.clone(),
@@ -230,13 +236,20 @@ impl<S: ExactKvStore> KvReadAdapter for MarkdownKvAdapter<S> {
         else {
             return Err(PortError::Denied);
         };
-        if !matches!(action, KvGetAction::Get)
-            || authorized.session().scope.action != ShareAction::KvGet
-            || !matches!(&authorized.session().scope.resource, ExactResource::Kv { path: p } if p == path)
+        let resource_path = match &authorized.session().scope.resource {
+            ExactResource::Kv { path } => path,
+            _ => return Err(PortError::Denied),
+        };
+        if !matches!(action, KvGetAction::Get | KvGetAction::Put)
+            || !matches!(
+                authorized.session().scope.action,
+                ShareAction::KvGet | ShareAction::KvPut
+            )
+            || !same_or_descendant(path, resource_path)
         {
             return Err(PortError::Denied);
         }
-        let Some(bytes) = self.store.get_exact(space, path).await? else {
+        let Some(bytes) = self.store.get_exact(space, resource_path).await? else {
             return Err(PortError::Denied);
         };
         markdown_document(bytes).map_err(|error| match error {
@@ -365,11 +378,15 @@ where
     K: KvReadAdapter,
     S: NamedSqlReadAdapter,
 {
-    pub async fn read(
+    /// Verify the holder proof and consume the bounded invocation JTI through
+    /// the sole authority bridge without touching content storage. Native
+    /// list/edit adapters use this method so authorization cannot be bypassed
+    /// or consumed twice by a read-only adapter.
+    pub async fn authorize(
         &self,
         request: HolderReadRequest,
         now: OffsetDateTime,
-    ) -> Result<MarkdownResponse, DataPlaneError> {
+    ) -> Result<AuthorizedRead, DataPlaneError> {
         verify_request(&request, now)?;
         let authorized = self
             .authority
@@ -383,6 +400,15 @@ where
         {
             return Err(DataPlaneError::Denied);
         }
+        Ok(authorized)
+    }
+
+    pub async fn read(
+        &self,
+        request: HolderReadRequest,
+        now: OffsetDateTime,
+    ) -> Result<MarkdownResponse, DataPlaneError> {
+        let authorized = self.authorize(request.clone(), now).await?;
         let credential_digest = authorized.session().credential_digest.clone();
         let document = match request.scope.content_source {
             ContentSource::Kv { .. } => self
@@ -413,7 +439,8 @@ fn same_scope_except_delegation(left: &ShareScope, right: &ShareScope) -> bool {
 }
 
 fn verify_request(request: &HolderReadRequest, now: OffsetDateTime) -> Result<(), DataPlaneError> {
-    if request.jti != request.proof.jti
+    if !matches!(request.version, 1 | 2)
+        || request.jti != request.proof.jti
         || request.holder != request.proof.signer
         || request.proof.expires_at <= request.proof.issued_at
         || request.proof.expires_at - request.proof.issued_at
@@ -429,7 +456,7 @@ fn verify_request(request: &HolderReadRequest, now: OffsetDateTime) -> Result<()
     }
     validate_scope(&request.scope)?;
     let signer = did_key_public_key(request.proof.signer.as_str())?;
-    let message = signed_read_bytes(request)?;
+    let message = signed_read_invocation_bytes(request)?;
     if !signer.verify(&message, &request.proof.signature) {
         return Err(DataPlaneError::InvalidProof);
     }
@@ -449,12 +476,43 @@ fn validate_scope(scope: &ShareScope) -> Result<(), DataPlaneError> {
             ExactResource::Kv {
                 path: resource_path,
             },
-            ContentSource::Kv {
-                action: KvGetAction::Get,
-                path,
-                ..
+            ContentSource::Kv { action, path, .. },
+        ) if matches!(
+            action,
+            KvGetAction::Get | KvGetAction::List | KvGetAction::Put
+        ) && scope_action_allowed(scope)
+            && same_or_descendant(path, resource_path) =>
+        {
+            Ok(())
+        }
+        (
+            ShareAction::KvList,
+            ExactResource::KvPrefix {
+                path: resource_path,
             },
-        ) if resource_path == path => Ok(()),
+            ContentSource::Kv { action, path, .. },
+        ) if matches!(
+            action,
+            KvGetAction::Get | KvGetAction::List | KvGetAction::Put
+        ) && scope_action_allowed(scope)
+            && same_or_descendant(path, resource_path) =>
+        {
+            Ok(())
+        }
+        (
+            ShareAction::KvPut,
+            ExactResource::Kv {
+                path: resource_path,
+            },
+            ContentSource::Kv { action, path, .. },
+        ) if matches!(
+            action,
+            KvGetAction::Get | KvGetAction::List | KvGetAction::Put
+        ) && scope_action_allowed(scope)
+            && same_or_descendant(path, resource_path) =>
+        {
+            Ok(())
+        }
         (
             ShareAction::SqlRead,
             ExactResource::Sql {
@@ -482,12 +540,36 @@ fn validate_scope(scope: &ShareScope) -> Result<(), DataPlaneError> {
     }
 }
 
-fn signed_read_bytes(request: &HolderReadRequest) -> Result<Vec<u8>, DataPlaneError> {
+fn scope_action_allowed(scope: &ShareScope) -> bool {
+    !scope.allowed_actions.is_empty()
+        && scope.allowed_actions.contains(&scope.action)
+        && !scope
+            .allowed_actions
+            .windows(2)
+            .any(|pair| pair[0].as_str() >= pair[1].as_str())
+}
+
+fn same_or_descendant(prefix: &Path, candidate: &Path) -> bool {
+    prefix.as_str().is_empty()
+        || candidate.as_str() == prefix.as_str()
+        || candidate
+            .as_str()
+            .strip_prefix(prefix.as_str())
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+/// Build the exact holder-signature preimage for a v1/v2 read request.
+///
+/// This is public so the HTTP adapter can compare the typed preimage with the
+/// wire invocation while diagnosing protocol drift without logging payloads.
+pub fn signed_read_invocation_bytes(
+    request: &HolderReadRequest,
+) -> Result<Vec<u8>, DataPlaneError> {
     let source = serde_json::to_value(&request.scope.content_source)
         .map_err(|_| DataPlaneError::InvalidProof)?;
-    let value = json!({
+    let mut value = json!({
         "type": "TinyCloudShareReadInvocation",
-        "version": 1,
+        "version": request.version,
         "sessionId": request.session.as_str(),
         "shareCid": request.scope.share_cid.as_str(),
         "shareId": request.scope.share_id.as_str(),
@@ -512,6 +594,33 @@ fn signed_read_bytes(request: &HolderReadRequest) -> Result<Vec<u8>, DataPlaneEr
         "expiresAt": timestamp(request.proof.expires_at)?,
         "jti": request.jti.as_str(),
     });
+    // V2 attenuates a session with an ordered action ceiling. Include that
+    // ceiling in the holder-signature preimage so the browser, Node, and
+    // authority cannot disagree about the signed operation set. V1 keeps its
+    // historical preimage unchanged for compatibility.
+    if request.version >= 2 {
+        value["actions"] = json!(request
+            .scope
+            .allowed_actions
+            .iter()
+            .map(|action| action_name(*action))
+            .collect::<Vec<_>>());
+        if let Some(limit) = request.limit {
+            value["limit"] = json!(limit);
+        }
+        if let Some(cursor) = &request.cursor {
+            value["cursor"] = json!(cursor);
+        }
+        if let Some(body_digest) = &request.body_digest {
+            value["bodyDigest"] = json!(body_digest.as_str());
+        }
+        if let Some(if_match) = &request.if_match {
+            value["ifMatch"] = json!(if_match);
+        }
+        if let Some(content_type) = &request.content_type {
+            value["contentType"] = json!(content_type);
+        }
+    }
     let mut signed = READ_INVOCATION_DOMAIN.to_vec();
     signed.extend(jcs::canonicalize(&value));
     Ok(signed)
@@ -562,32 +671,30 @@ fn sha256_digest(bytes: &[u8]) -> Sha256Digest {
 }
 
 fn action_name(action: ShareAction) -> &'static str {
-    match action {
-        ShareAction::KvGet => KV_GET_ACTION,
-        ShareAction::SqlRead => SQL_READ_ACTION,
-    }
+    action.as_str()
 }
 
 fn resource_name(resource: &ExactResource) -> &str {
     match resource {
         ExactResource::Kv { path } => path.as_str(),
+        ExactResource::KvPrefix { path } => path.as_str(),
         ExactResource::Sql { path, .. } => path.as_str(),
     }
 }
 
 fn timestamp(value: OffsetDateTime) -> Result<String, DataPlaneError> {
     let rendered = value
+        .replace_nanosecond(0)
+        .map_err(|_| DataPlaneError::InvalidProof)?
         .format(&Rfc3339)
         .map_err(|_| DataPlaneError::InvalidProof)?;
-    if rendered.ends_with('Z') && !rendered[..rendered.len() - 1].contains('.') {
-        Ok(format!(
-            "{}.{:03}Z",
-            &rendered[..rendered.len() - 1],
-            value.nanosecond() / 1_000_000
-        ))
-    } else {
-        Ok(rendered)
-    }
+    let base = rendered
+        .strip_suffix('Z')
+        .unwrap_or(&rendered)
+        .split_once('.')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or_else(|| rendered.strip_suffix('Z').unwrap_or(&rendered));
+    Ok(format!("{base}.{:03}Z", value.nanosecond() / 1_000_000))
 }
 
 fn did_key_public_key(did: &str) -> Result<PublicKey, DataPlaneError> {
@@ -633,6 +740,7 @@ mod tests {
             node_audience: Did::parse("did:web:node.example").unwrap(),
             target_origin: TargetOrigin::parse("https://node.example").unwrap(),
             action: ShareAction::KvGet,
+            allowed_actions: vec![ShareAction::KvGet],
             resource: ExactResource::Kv { path },
             content_source: source,
             content_source_digest: digest,
@@ -655,6 +763,16 @@ mod tests {
             sha256_digest(b"# Project plan\n").as_str(),
             "I5g9jFq8hn03TSW-98W-Df2kP5KiNmyR1r-I9ZfPd4s"
         );
+    }
+
+    #[test]
+    fn webcrypto_ed25519_signature_verifies_through_did_key_decoder() {
+        let key =
+            did_key_public_key("did:key:z6Mkr71Netw7Qr3993aLgd2sGscF2ueB35NCzMYhsVd449Zz").unwrap();
+        let signature = URL_SAFE_NO_PAD
+            .decode("27prA0J_TWanloThSIBxYj0Fw8z7EtRNjZMQ0e7OxjfGafndeQJDOodnWrdincRoDXtkY6sP4sY_O7Thl8uxDg")
+            .unwrap();
+        assert!(key.verify(b"xyz.tinycloud.share/read-invocation/v1\0{}", &signature));
     }
 
     #[test]
@@ -756,11 +874,17 @@ mod tests {
     #[test]
     fn public_request_cannot_be_authorized_without_a_signature() {
         let request = HolderReadRequest {
+            version: 1,
             session: SessionHandle::from_bytes([1; 16]),
             jti: ProtocolJti::from_bytes([2; 16]),
             scope: scope(),
             holder: DidKey::parse(HOLDER).unwrap(),
             request_body_digest: Sha256Digest::from_bytes([3; 32]),
+            limit: None,
+            cursor: None,
+            body_digest: None,
+            if_match: None,
+            content_type: None,
             proof: HolderReadProof {
                 issued_at: OffsetDateTime::UNIX_EPOCH,
                 expires_at: OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(1),
@@ -778,11 +902,17 @@ mod tests {
     #[test]
     fn expired_and_rebound_body_or_jti_proofs_fail_before_authority() {
         let mut request = HolderReadRequest {
+            version: 1,
             session: SessionHandle::from_bytes([1; 16]),
             jti: ProtocolJti::from_bytes([2; 16]),
             scope: scope(),
             holder: DidKey::parse(HOLDER).unwrap(),
             request_body_digest: Sha256Digest::from_bytes([3; 32]),
+            limit: None,
+            cursor: None,
+            body_digest: None,
+            if_match: None,
+            content_type: None,
             proof: HolderReadProof {
                 issued_at: OffsetDateTime::UNIX_EPOCH,
                 expires_at: OffsetDateTime::UNIX_EPOCH + time::Duration::minutes(1),

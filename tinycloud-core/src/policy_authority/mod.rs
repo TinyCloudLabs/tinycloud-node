@@ -564,6 +564,7 @@ impl TrustedPolicyDecision {
 /// Inputs that have already crossed the cryptographic and persistence trust
 /// boundaries. The evaluator still checks every binding before it can create
 /// the opaque decision consumed by the authority kernel.
+#[allow(dead_code)]
 pub(crate) struct ExactEmailPolicyEvaluation<'a> {
     pub policy: &'a PolicyDelegation,
     pub enforcement: &'a PolicyDelegation,
@@ -586,6 +587,7 @@ pub(crate) struct ExactEmailPolicyEvaluation<'a> {
 
 /// Evaluate the registered canonical exact-email policy. This is deliberately
 /// the only production constructor for a trusted allow decision.
+#[allow(dead_code)]
 pub(crate) fn evaluate_exact_email_policy(
     input: ExactEmailPolicyEvaluation<'_>,
 ) -> Result<TrustedPolicyDecision, AuthorityError> {
@@ -636,6 +638,169 @@ pub(crate) fn evaluate_exact_email_policy(
         &Rfc3339,
     )
     .map_err(|_| AuthorityError::PolicyDecisionExpired)?;
+    if policy_expiry < input.policy_expires_at
+        || input.now >= policy_expiry
+        || input.credential_expires_at <= input.now
+        || input.credential_expires_at < policy_expiry
+    {
+        return Err(AuthorityError::PolicyDecisionExpired);
+    }
+    if input.context.claimant_did != input.holder_did
+        || input.context.owner_did != input.owner_did
+        || input.context.enforcer_did != input.enforcer_did
+        || input.context.node_audience != input.node_audience
+        || input.policy.audience_did != input.node_audience
+        || input.enforcement.audience_did != input.enforcer_did
+        || input
+            .enforcement
+            .fact("nodeAudience")
+            .map_err(|_| AuthorityError::FactsMismatch)?
+            != input.node_audience
+        || input
+            .enforcement
+            .fact("enforcerDid")
+            .map_err(|_| AuthorityError::FactsMismatch)?
+            != input.enforcer_did
+    {
+        return Err(AuthorityError::PolicyMismatch);
+    }
+    validate_authority_pair(
+        input.policy,
+        input.enforcement,
+        &VerifiedPolicyState::from_verified(
+            input.policy,
+            input.enforcement,
+            input.now,
+            policy_expiry,
+        )?,
+        input.enforcer_did,
+    )?;
+    TrustedPolicyDecision::from_evaluation(input.context, input.now, policy_expiry)
+}
+
+/// Generic recipient-policy input used by the native share capability path.
+/// The credential verifier has already authenticated `verified_email`; this
+/// kernel performs the policy matcher and capability attenuation checks.
+pub(crate) struct ShareRecipientPolicyEvaluation<'a> {
+    pub policy: &'a PolicyDelegation,
+    pub enforcement: &'a PolicyDelegation,
+    pub policy_state: &'a Value,
+    pub sender_did: &'a str,
+    pub verified_email: &'a str,
+    pub holder_did: &'a str,
+    pub source: &'a Value,
+    pub source_digest: &'a str,
+    pub action: &'a str,
+    pub resource: &'a str,
+    pub owner_did: &'a str,
+    pub enforcer_did: &'a str,
+    pub node_audience: &'a str,
+    pub context: DecisionContext,
+    pub now: OffsetDateTime,
+    pub credential_expires_at: OffsetDateTime,
+    pub policy_expires_at: OffsetDateTime,
+}
+
+/// Evaluate exact-email and email-domain policies without treating a claimed
+/// `emailDomain` disclosure as evidence. Version 1 exact policies remain
+/// accepted losslessly; version 2 carries a strict matcher and an action set.
+pub(crate) fn evaluate_share_recipient_policy(
+    input: ShareRecipientPolicyEvaluation<'_>,
+) -> Result<TrustedPolicyDecision, AuthorityError> {
+    let object = input
+        .policy_state
+        .as_object()
+        .ok_or(AuthorityError::SchemaInvalid)?;
+    let (matcher, actions, resource_kind, resource_value, policy_expiry) =
+        match object.get("version").and_then(Value::as_u64) {
+            Some(1) => {
+                let expected = [
+                    "type",
+                    "version",
+                    "recipientEmail",
+                    "contentSource",
+                    "contentSourceDigest",
+                    "action",
+                    "resource",
+                    "expiresAt",
+                    "issuerDid",
+                ];
+                if object.len() != expected.len()
+                    || object.keys().any(|key| !expected.contains(&key.as_str()))
+                    || object.get("type").and_then(Value::as_str) != Some("TinyCloudSharePolicy")
+                {
+                    return Err(AuthorityError::SchemaInvalid);
+                }
+                let email = object
+                    .get("recipientEmail")
+                    .and_then(Value::as_str)
+                    .ok_or(AuthorityError::PolicyMismatch)?;
+                let matcher =
+                    crate::share_email::types::RecipientMatcher::ExactEmail(email.to_owned());
+                let action = object
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .ok_or(AuthorityError::PolicyMismatch)?;
+                let resource = object
+                    .get("resource")
+                    .and_then(Value::as_str)
+                    .ok_or(AuthorityError::PolicyMismatch)?;
+                let expiry = canonical_time(
+                    object
+                        .get("expiresAt")
+                        .and_then(Value::as_str)
+                        .ok_or(AuthorityError::PolicyDecisionExpired)?,
+                )?;
+                (
+                    matcher,
+                    vec![action.to_owned()],
+                    "exact",
+                    resource.to_owned(),
+                    expiry,
+                )
+            }
+            Some(2) => {
+                let policy: crate::share_email::types::SharePolicyV2 =
+                    serde_json::from_value(input.policy_state.clone())
+                        .map_err(|_| AuthorityError::SchemaInvalid)?;
+                policy
+                    .validate()
+                    .map_err(|_| AuthorityError::PolicyMismatch)?;
+                let matcher = policy.recipient_matcher;
+                let actions = policy
+                    .actions
+                    .iter()
+                    .map(|action| action.as_str().to_owned())
+                    .collect::<Vec<_>>();
+                let resource_kind = match policy.resource.kind {
+                    crate::share_email::types::SharePolicyResourceKind::Exact => "exact",
+                    crate::share_email::types::SharePolicyResourceKind::Prefix => "prefix",
+                };
+                let resource_value = policy.resource.value;
+                let expiry = canonical_share_policy_time(&policy.expires_at)?;
+                (matcher, actions, resource_kind, resource_value, expiry)
+            }
+            _ => return Err(AuthorityError::SchemaInvalid),
+        };
+    if object.get("contentSource") != Some(input.source)
+        || object.get("contentSourceDigest").and_then(Value::as_str) != Some(input.source_digest)
+        || object.get("issuerDid").and_then(Value::as_str) != Some(input.sender_did)
+        || !actions.iter().any(|action| action == input.action)
+        || !matcher.matches_verified_email(input.verified_email)
+        || !match resource_kind {
+            "exact" => resource_value == input.resource,
+            "prefix" => {
+                input.resource == resource_value
+                    || input
+                        .resource
+                        .strip_prefix(&resource_value)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            }
+            _ => false,
+        }
+    {
+        return Err(AuthorityError::PolicyMismatch);
+    }
     if policy_expiry < input.policy_expires_at
         || input.now >= policy_expiry
         || input.credential_expires_at <= input.now
@@ -1949,6 +2114,17 @@ fn canonical_time(value: &str) -> Result<OffsetDateTime, AuthorityError> {
     OffsetDateTime::parse(value, &Rfc3339).map_err(|_| AuthorityError::TimestampNoncanonical)
 }
 
+/// Share policy v2 preserves the existing browser-facing millisecond form
+/// (`.000Z`) while the authority delegation timestamps remain strict seconds.
+/// Accept both canonical wire forms at the policy-evaluation boundary.
+fn canonical_share_policy_time(value: &str) -> Result<OffsetDateTime, AuthorityError> {
+    if value.len() == 24 && value.ends_with(".000Z") {
+        let seconds = format!("{}Z", &value[..value.len() - 5]);
+        return canonical_time(&seconds);
+    }
+    canonical_time(value)
+}
+
 fn canonical_time_string(value: OffsetDateTime) -> String {
     value
         .to_offset(time::UtcOffset::UTC)
@@ -1967,6 +2143,7 @@ fn decimal_fact(delegation: &PolicyDelegation, name: &'static str) -> Result<u64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{policy_capability::jcs, share_email::Sha256Digest};
     use serde_json::json;
 
     const OWNER: &str = "did:pkh:eip155:1:0x0000000000000000000000000000000000000001";
@@ -2380,6 +2557,53 @@ mod tests {
             "did:web:other.example",
         )
         .is_err());
+    }
+
+    #[test]
+    fn recipient_policy_matches_verified_full_email_domain_and_attenuates_prefix() {
+        let fixture = fixture();
+        let mut policy = exact_email_policy_state();
+        policy["version"] = json!(2);
+        policy["recipientMatcher"] = json!({"kind": "emailDomain", "value": "mailinator.com"});
+        policy["actions"] = json!(["tinycloud.kv/get"]);
+        policy["resource"] = json!({"kind": "prefix", "value": "profile"});
+        policy.as_object_mut().unwrap().remove("recipientEmail");
+        policy.as_object_mut().unwrap().remove("action");
+        let source_value = policy["contentSource"].clone();
+        let source_digest =
+            Sha256Digest::from_bytes(Sha256::digest(jcs::canonicalize(&source_value)).into());
+        policy["contentSourceDigest"] = json!(source_digest.as_str());
+        let source = policy.get("contentSource").unwrap();
+        let context = fixture.decision.context.clone();
+        let evaluate = |email: &str, resource: &str, state: &Value| {
+            evaluate_share_recipient_policy(ShareRecipientPolicyEvaluation {
+                policy: fixture.policy.artifact(),
+                enforcement: fixture.enforcement.artifact(),
+                policy_state: state,
+                sender_did: OWNER,
+                verified_email: email,
+                holder_did: CLAIMANT,
+                source,
+                source_digest: source_digest.as_str(),
+                action: "tinycloud.kv/get",
+                resource,
+                owner_did: OWNER,
+                enforcer_did: ENFORCER,
+                node_audience: NODE_AUDIENCE,
+                context: context.clone(),
+                now: t("2026-06-01T00:00:00Z"),
+                credential_expires_at: t("2027-01-01T00:00:00Z"),
+                policy_expires_at: t("2027-01-01T00:00:00Z"),
+            })
+        };
+        assert!(evaluate("alice@mailinator.com", "profile/notes", &policy).is_ok());
+        assert!(evaluate("alice@gmail.com", "profile/notes", &policy).is_err());
+        assert!(evaluate("alice@sub.mailinator.com", "profile/notes", &policy).is_err());
+        assert!(evaluate("alice@mailinator.com", "profiles/notes", &policy).is_err());
+
+        let mut forged = policy.clone();
+        forged["recipientMatcher"] = json!({"kind": "emailDomain", "value": "mailinator.com"});
+        assert!(evaluate("alice@gmail.com", "profile/notes", &forged).is_err());
     }
 
     fn issue(f: &Fixture) -> Result<(), AuthorityError> {

@@ -1,8 +1,11 @@
 use anyhow::Result;
+use base64::{decode_config, encode_config, URL_SAFE_NO_PAD};
 use futures::io::{AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt};
+use hmac::{Hmac, Mac};
 use percent_encoding::percent_decode_str;
 use rocket::{data::ToByteUnit, http::Status, response::status::Custom, serde::json::Json, State};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     time::Instant,
@@ -456,21 +459,27 @@ pub async fn delegate(
                 )
             })
             .and_then(|result: TransactResult| {
-                let activated: Vec<String> = result.commits.keys().map(|s| s.to_string()).collect();
-                let skipped: Vec<String> = result
-                    .skipped_spaces
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
+                let TransactResult {
+                    commits,
+                    skipped_spaces,
+                    delegation_cids,
+                } = result;
+                let activated: Vec<String> = commits.keys().map(|s| s.to_string()).collect();
+                let skipped: Vec<String> = skipped_spaces.iter().map(|s| s.to_string()).collect();
 
-                // Get CID from the first committed event, or fall back to
-                // the delegation CID when all spaces were skipped
-                let cid = result
-                    .commits
-                    .into_values()
+                // The persisted delegation CID is the address consumed by
+                // the later policy/session/invoke chain. Prefer it over a
+                // space commit event so delegation-only and multi-space
+                // transactions return the same addressed object.
+                let cid = delegation_cids
+                    .into_iter()
                     .next()
-                    .and_then(|c| c.committed_events.into_iter().next())
-                    .or_else(|| result.delegation_cids.into_iter().next())
+                    .or_else(|| {
+                        commits
+                            .into_values()
+                            .next()
+                            .and_then(|commit| commit.committed_events.into_iter().next())
+                    })
                     .map(|h| h.to_cid(0x55).to_string())
                     .ok_or_else(|| {
                         (Status::Unauthorized, "Delegation not committed".to_string())
@@ -690,25 +699,160 @@ fn parse_positive_u64_header(
         .transpose()
 }
 
+type KvCursorMac = Hmac<Sha256>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct KvListCursorPayload {
+    version: u8,
+    subject_digest: String,
+    space: String,
+    prefix: String,
+    action: String,
+    limit: usize,
+    last: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct KvListCursorWire {
+    payload: KvListCursorPayload,
+    mac: String,
+}
+
+fn kv_subject_digest(subject: &str) -> String {
+    hex::encode(Sha256::digest(subject.as_bytes()))
+}
+
+fn kv_cursor_mac(key: &[u8; 32], payload: &KvListCursorPayload) -> Result<String, ()> {
+    let bytes = serde_json::to_vec(payload).map_err(|_| ())?;
+    let mut mac = KvCursorMac::new_from_slice(key).map_err(|_| ())?;
+    mac.update(&bytes);
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+fn encode_kv_cursor(
+    key: &[u8; 32],
+    subject: &str,
+    space: &SpaceId,
+    prefix: &Path,
+    limit: usize,
+    last: &Path,
+) -> Result<String, ()> {
+    let payload = KvListCursorPayload {
+        version: 1,
+        subject_digest: kv_subject_digest(subject),
+        space: space.to_string(),
+        prefix: prefix.to_string(),
+        action: "tinycloud.kv/list".to_string(),
+        limit,
+        last: last.to_string(),
+    };
+    let wire = KvListCursorWire {
+        mac: kv_cursor_mac(key, &payload)?,
+        payload,
+    };
+    let bytes = serde_json::to_vec(&wire).map_err(|_| ())?;
+    Ok(encode_config(bytes, URL_SAFE_NO_PAD))
+}
+
+fn decode_kv_cursor(
+    key: &[u8; 32],
+    value: &str,
+    subject: &str,
+    space: &SpaceId,
+    prefix: &Path,
+    limit: usize,
+) -> Result<Path, ()> {
+    if value.len() > 4096 {
+        return Err(());
+    }
+    let bytes = decode_config(value, URL_SAFE_NO_PAD).map_err(|_| ())?;
+    let wire: KvListCursorWire = serde_json::from_slice(&bytes).map_err(|_| ())?;
+    if wire.payload.version != 1
+        || wire.payload.subject_digest != kv_subject_digest(subject)
+        || wire.payload.space != space.to_string()
+        || wire.payload.prefix != prefix.to_string()
+        || wire.payload.action != "tinycloud.kv/list"
+        || wire.payload.limit != limit
+    {
+        return Err(());
+    }
+    let expected = kv_cursor_mac(key, &wire.payload)?;
+    if !constant_time_eq(expected.as_bytes(), wire.mac.as_bytes()) {
+        return Err(());
+    }
+    wire.payload.last.parse().map_err(|_| ())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
+}
+
+fn kv_list_target(capabilities: &[Capability]) -> Option<(SpaceId, Path)> {
+    capabilities.iter().find_map(|capability| {
+        match (&capability.resource, capability.ability.as_ref().as_ref()) {
+            (Resource::TinyCloud(resource), "tinycloud.kv/list")
+                if resource.service().as_str() == "kv" && resource.path().is_some() =>
+            {
+                Some((resource.space().clone(), resource.path()?.clone()))
+            }
+            _ => None,
+        }
+    })
+}
+
 fn kv_invoke_options(
     invocation: &InvocationInfo,
     headers: &mut ObjectHeaders,
     multipart: bool,
+    cursor_key: &[u8; 32],
 ) -> Result<KvInvokeOptions, (Status, String)> {
-    kv_invoke_options_for_capabilities(&invocation.capabilities, headers, multipart)
+    kv_invoke_options_for_capabilities_with_cursor(
+        &invocation.capabilities,
+        headers,
+        multipart,
+        Some(cursor_key),
+        Some(&invocation.invoker),
+    )
 }
 
+#[cfg(test)]
 fn kv_invoke_options_for_capabilities(
     capabilities: &[Capability],
     headers: &mut ObjectHeaders,
     multipart: bool,
 ) -> Result<KvInvokeOptions, (Status, String)> {
+    kv_invoke_options_for_capabilities_with_cursor(capabilities, headers, multipart, None, None)
+}
+
+fn kv_invoke_options_for_capabilities_with_cursor(
+    capabilities: &[Capability],
+    headers: &mut ObjectHeaders,
+    multipart: bool,
+    cursor_key: Option<&[u8; 32]>,
+    cursor_subject: Option<&str>,
+) -> Result<KvInvokeOptions, (Status, String)> {
     let if_match = take_metadata_header(&mut headers.0, "if-match");
     let if_none_match = take_metadata_header(&mut headers.0, "if-none-match");
-    if if_match.is_some() && if_none_match.is_some() {
+    let expected_version = take_metadata_header(&mut headers.0, "x-tinycloud-expected-version");
+    if expected_version.is_some() {
         return Err((
             Status::BadRequest,
-            "If-Match and If-None-Match cannot be combined".to_string(),
+            "x-tinycloud-expected-version is not a production precondition; use If-Match"
+                .to_string(),
+        ));
+    }
+    if (if_match.is_some() && if_none_match.is_some())
+        || (expected_version.is_some() && (if_match.is_some() || if_none_match.is_some()))
+    {
+        return Err((
+            Status::BadRequest,
+            "KV preconditions cannot be combined".to_string(),
         ));
     }
 
@@ -779,11 +923,26 @@ fn kv_invoke_options_for_capabilities(
             }
         })
         .transpose()?;
+    let list_cursor = take_metadata_header(&mut headers.0, "x-tinycloud-cursor")
+        .map(|value| {
+            let key = cursor_key
+                .ok_or_else(|| (Status::BadRequest, "Invalid KV list cursor".to_string()))?;
+            let subject = cursor_subject
+                .ok_or_else(|| (Status::BadRequest, "Invalid KV list cursor".to_string()))?;
+            let (space, prefix) = kv_list_target(capabilities)
+                .ok_or_else(|| (Status::BadRequest, "Invalid KV list cursor".to_string()))?;
+            let limit = list_limit
+                .ok_or_else(|| (Status::BadRequest, "Invalid KV list cursor".to_string()))?;
+            decode_kv_cursor(key, &value, subject, &space, &prefix, limit)
+                .map_err(|_| (Status::BadRequest, "Invalid KV list cursor".to_string()))
+        })
+        .transpose()?;
 
     Ok(KvInvokeOptions {
         preconditions,
         max_response_bytes,
         list_limit,
+        list_cursor,
     })
 }
 
@@ -1204,7 +1363,7 @@ async fn invoke_impl(
 
         let put_caps = kv_put_capabilities(&i.0 .0);
         let is_multipart_request = is_multipart(&headers);
-        let kv_options = kv_invoke_options(&i.0 .0, &mut headers, is_multipart_request)?;
+        let kv_options = kv_invoke_options(&i.0 .0, &mut headers, is_multipart_request, &tinycloud.kv_cursor_key())?;
         let expected_batch_inputs = if is_multipart_request && !put_caps.is_empty() {
             Some(validate_kv_batch_capabilities(&i.0 .0, &put_caps)?)
         } else {
@@ -1328,6 +1487,9 @@ async fn invoke_impl(
         );
         let inputs = inputs_result?;
         let invocation_info = i.0 .0.clone();
+        let cursor_limit = kv_options.list_limit;
+        let cursor_target = kv_list_target(&invocation_info.capabilities);
+        let cursor_key = tinycloud.kv_cursor_key();
         let invoke_start = Instant::now();
         let invoke_result = tinycloud
             .invoke_with_options::<BlockStage>(i.0, inputs, kv_options)
@@ -1340,6 +1502,16 @@ async fn invoke_impl(
         let res = match invoke_result {
             Ok((tx_result, mut outcomes)) => {
                 emit_kv_hook_events(hook_runtime, tinycloud, &invocation_info, &tx_result).await;
+                for outcome in &mut outcomes {
+                    if let InvocationOutcome::KvList(paths, truncated, next_cursor) = outcome {
+                        *next_cursor = if *truncated {
+                            match (cursor_limit, cursor_target.as_ref(), paths.last()) {
+                                (Some(limit), Some((space, prefix)), Some(last)) => encode_kv_cursor(&cursor_key, &invocation_info.invoker, space, prefix, limit, last).ok(),
+                                _ => None,
+                            }
+                        } else { None };
+                    }
+                }
                 if let Some(written_paths) = batch_written_paths {
                     if outcomes.len() != written_paths.len()
                         || !outcomes.iter().all(|outcome| {

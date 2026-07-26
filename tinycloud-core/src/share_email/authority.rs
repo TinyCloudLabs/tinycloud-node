@@ -24,7 +24,7 @@ use super::{
     },
     types::{
         AuthorityMaterialHandle, Did, DidKey, NodeDelegationCid, PolicyCid, Sha256Digest,
-        ShareDelegationCid,
+        ShareDelegationCid, SharePolicyV2,
     },
 };
 use crate::policy_authority::{AuthorityArtifactVerifier, VerifiedDelegation};
@@ -407,11 +407,20 @@ fn load_record(value: Value) -> Result<LoadedMaterial, AuthorityProviderError> {
     if policy_parent.artifact().delegation_cid != policy_cid.as_str()
         || enforcement_parent.artifact().delegation_cid != enforcement_cid.as_str()
         || policy_parent.artifact().issuer_did != enforcement_parent.artifact().issuer_did
-        || string_field(&policy, "type")? != "TinyCloudSharePolicy"
-        || policy.get("version").and_then(Value::as_u64) != Some(1)
         || string_field(&policy, "issuerDid")? != sender_did
     {
         return Err(AuthorityProviderError::Artifact);
+    }
+    match policy.get("version").and_then(Value::as_u64) {
+        Some(1) if string_field(&policy, "type")? == "TinyCloudSharePolicy" => {}
+        Some(2) => {
+            let policy_v2: SharePolicyV2 = serde_json::from_value(policy.clone())
+                .map_err(|_| AuthorityProviderError::Schema)?;
+            policy_v2
+                .validate()
+                .map_err(|_| AuthorityProviderError::Artifact)?;
+        }
+        _ => return Err(AuthorityProviderError::Artifact),
     }
     let policy_state = jcs::canonicalize(&policy);
     if Cid::new_v1(0x55, Code::Sha2_256.digest(&policy_state)).to_string()
@@ -799,7 +808,7 @@ mod tests {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
                 std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../../../share/feat/email-claim-e1-e2e/test/vectors/email-claim-v1")
+                    .join("../tinycloud-node-server/tests/fixtures/email-claim-v1")
             });
         let positive: Value =
             serde_json::from_slice(&std::fs::read(root.join("positive.json")).unwrap()).unwrap();

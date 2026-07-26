@@ -6,7 +6,7 @@
 
 use super::{
     invitation::{InvitationAuthorizationReceipt, InvitationError},
-    types::Sha256Digest,
+    types::{ProtocolJti, Sha256Digest},
 };
 use crate::models::{
     share_anonymous_challenge, share_email_audit, share_email_quota, share_holder_read_jti,
@@ -90,7 +90,10 @@ impl ProtocolStateRepository {
             binding_json: Set(binding_json.clone()),
             issued_at: Set(issued_at),
             expires_at: Set(expires_at),
-            consumed_at: Set(None),
+            // Authorization is a one-shot reservation. Delivery has its own
+            // signed receipt; this endpoint must not mint a second receipt
+            // for a replayed JTI.
+            consumed_at: Set(Some(timestamp(now)?)),
         };
         let tx = self.conn.begin().await?;
         let existed = share_invitation_authorization_jti::Entity::find_by_id(&jti)
@@ -138,6 +141,46 @@ impl ProtocolStateRepository {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Consume the addressed-authoring JTI in the same durable replay table
+    /// used by invitation authorization.  A native authoring request is
+    /// single-use even when its body and idempotency key are replayed.
+    pub async fn reserve_authoring_jti(
+        &self,
+        jti: &ProtocolJti,
+        request_digest: &Sha256Digest,
+        binding_json: Value,
+        issued_at: OffsetDateTime,
+        expires_at: OffsetDateTime,
+    ) -> Result<(), StateError> {
+        if expires_at <= issued_at || expires_at <= OffsetDateTime::now_utc() {
+            return Err(StateError::Expired);
+        }
+        let model = share_invitation_authorization_jti::ActiveModel {
+            jti: Set(jti.as_str().to_owned()),
+            authorization_digest: Set(request_digest.as_str().to_owned()),
+            binding_json: Set(binding_json),
+            issued_at: Set(timestamp(issued_at)?),
+            expires_at: Set(timestamp(expires_at)?),
+            consumed_at: Set(Some(timestamp(issued_at)?)),
+        };
+        let tx = self.conn.begin().await?;
+        let result = share_invitation_authorization_jti::Entity::insert(model)
+            .exec(&tx)
+            .await
+            .map(|_| ())
+            .map_err(|_| StateError::Replay);
+        match result {
+            Ok(()) => {
+                tx.commit().await?;
+                Ok(())
+            }
+            Err(error) => {
+                tx.rollback().await?;
+                Err(error)
+            }
+        }
     }
 
     pub async fn create_anonymous_challenge(
