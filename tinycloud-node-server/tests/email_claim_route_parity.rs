@@ -5,7 +5,7 @@ use serde_json::Value;
 use common::email_claim_fixture_root;
 use tinycloud::share_email::{CapabilityDescriptor, NODE_CAPABILITY_ROUTES};
 
-const FROZEN_MANIFEST_DIGEST: &str = "pl8-1Rpx_DYCBjOpK3hRrLfrSVDINNFssZDfFw6BMTs";
+const FROZEN_MANIFEST_DIGEST: &str = "KHBPOKKpXASbdfMxDbc_R7iH55b-uuaW45Vw4RouTr4";
 
 fn frozen_node_routes() -> Value {
     let root = email_claim_fixture_root();

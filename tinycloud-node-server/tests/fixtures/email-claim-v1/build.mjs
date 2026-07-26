@@ -76,7 +76,7 @@ function exactNodeParent(role, audienceDid, capabilities, facts, seed, signerDid
   };
   const unsignedJcs = jcs(unsigned);
   const digestBytes = sha256(Buffer.concat([utf8("xyz.tinycloud.policy/enforcement-delegation/v1\0"), utf8(unsignedJcs)]));
-  const eip191 = Buffer.concat([Buffer.from("\\x19Ethereum Signed Message:\\n32"), Buffer.from(digestBytes)]);
+  const eip191 = Buffer.concat([Buffer.from("\x19Ethereum Signed Message:\n32"), Buffer.from(digestBytes)]);
   const signature = secp256k1.sign(keccak_256(eip191), seed, { lowS: true });
   const value = b64(Buffer.concat([Buffer.from(signature.toCompactRawBytes()), Buffer.from([signature.recovery])]));
   const withSignature = { ...unsigned, signature: { suite: "eip191-secp256k1-sha256-jcs-v1", value } };

@@ -2,10 +2,10 @@
   "manifestVersion": 1,
   "contractVersion": "tinycloud.share-email-claim/v1",
   "files": {
-    "positive.json": "LeUBRvznxoSqHsaSms_mGWoJiMN_LTRcgS0EpE35oWA",
-    "negative.json": "HU6oz7nYywuR9_pdPGJHr_WGhClPNVz63_-ATfHs4oI",
+    "positive.json": "UgBFKv7TsLr6l07fN_k2p5x9cQNxIGLhUTzqWs8sQBI",
+    "negative.json": "7tIsZfgiSHDBfl8pvT1QZo93xqD1wS5EB-XL0DU3rAU",
     "states.json": "I5vwcw3UyGqnLUZFMONW3Mz4NB9fMYV4n8VxpjyeKDI",
-    "build.mjs": "m4fYop89RBL9cHHj268A5z1B7DqIcu7B8yZ0NttfCjk",
+    "build.mjs": "HkAp9IxC4FUoDUMVEgmvmfNUl36qlWKHapRux0wfPIs",
     "validate.mjs": "bM9YFXiEWrTzXdLxUt33bf5_LiV40iF-QX86_fxD-9g",
     "loader.ts": "_N-1_IjNOXrm_4p6ObsyFjWvXHcFieixqqFntyWkVkg",
     "rust/Cargo.toml": "NMdpBiBPFtiy1N9yBltyPtR6UPUwV-WFTNf2s_dnnIU",
@@ -17,5 +17,5 @@
     "README.md": "sXnqXpmFo99s1xgyk95r1lN5v8Q7XdhW12qz7X5wgbk"
   },
   "testOnly": true,
-  "manifestDigest": "pl8-1Rpx_DYCBjOpK3hRrLfrSVDINNFssZDfFw6BMTs"
+  "manifestDigest": "KHBPOKKpXASbdfMxDbc_R7iH55b-uuaW45Vw4RouTr4"
 }
