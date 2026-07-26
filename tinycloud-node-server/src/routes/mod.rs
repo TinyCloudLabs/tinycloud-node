@@ -17,7 +17,10 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{info_span, Instrument};
 
 use crate::{
-    auth_guards::{DataIn, DataOut, InvOut, ObjectHeaders},
+    auth_guards::{
+        filter_stored_object_metadata, is_storable_object_header, DataIn, DataOut, InvOut,
+        ObjectHeaders,
+    },
     authorization::AuthHeaderGetter,
     config::Config,
     hooks::{HookRuntime, WriteEvent},
@@ -1046,9 +1049,7 @@ fn field_metadata(field: &multer::Field<'_>) -> Metadata {
     let mut metadata = BTreeMap::new();
     for (name, value) in field.headers().iter() {
         let key = name.as_str();
-        if key.eq_ignore_ascii_case("content-disposition")
-            || key.eq_ignore_ascii_case("content-length")
-        {
+        if key.eq_ignore_ascii_case("content-disposition") || !is_storable_object_header(key) {
             continue;
         }
         if let Ok(value) = value.to_str() {
@@ -1459,7 +1460,10 @@ async fn invoke_impl(
                     copy_result?;
 
                     let mut inputs = HashMap::new();
-                    inputs.insert((space.clone(), path.clone()), (headers.0, stage));
+                    inputs.insert(
+                        (space.clone(), path.clone()),
+                        (filter_stored_object_metadata(headers.0), stage),
+                    );
                     Ok(inputs)
                 }
                 (DataIn::One(d), [_, ..], true) => build_batch_kv_inputs(

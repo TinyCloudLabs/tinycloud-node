@@ -74,7 +74,7 @@ fn kv_batch_read_response(items: Vec<tinycloud_core::KvBatchReadItem>) -> KvBatc
         .into_iter()
         .map(|item| match item.value {
             Some(value) => {
-                let mut headers = value.metadata.0;
+                let mut headers = filter_stored_object_metadata(value.metadata).0;
                 headers.insert("etag".to_string(), kv_etag(value.hash));
                 if let Some(data) = value.data.as_ref() {
                     headers.insert("content-length".to_string(), data.len().to_string());
@@ -289,6 +289,41 @@ mod tests {
         assert!(is_replayable_object_header("content-type"));
     }
 
+    #[test]
+    fn stored_object_metadata_allows_only_safe_headers() {
+        let metadata = filter_stored_object_metadata(Metadata(BTreeMap::from([
+            ("content-type".to_string(), "text/plain".to_string()),
+            ("content-encoding".to_string(), "gzip".to_string()),
+            ("content-language".to_string(), "en".to_string()),
+            ("content-disposition".to_string(), "inline".to_string()),
+            ("x-tinycloud-meta-owner".to_string(), "alice".to_string()),
+            ("authorization".to_string(), "Bearer secret".to_string()),
+            ("cookie".to_string(), "session=secret".to_string()),
+            ("user-agent".to_string(), "client".to_string()),
+            ("content-length".to_string(), "999".to_string()),
+            ("transfer-encoding".to_string(), "chunked".to_string()),
+            (
+                "cache-control".to_string(),
+                "public, max-age=31536000".to_string(),
+            ),
+            (
+                "cdn-cache-control".to_string(),
+                "public, max-age=31536000".to_string(),
+            ),
+        ])));
+
+        assert_eq!(
+            metadata.0,
+            BTreeMap::from([
+                ("content-type".to_string(), "text/plain".to_string()),
+                ("content-encoding".to_string(), "gzip".to_string()),
+                ("content-language".to_string(), "en".to_string()),
+                ("content-disposition".to_string(), "inline".to_string()),
+                ("x-tinycloud-meta-owner".to_string(), "alice".to_string()),
+            ])
+        );
+    }
+
     #[get("/")]
     fn authenticated_stream() -> KVResponse<Cursor<Vec<u8>>> {
         let body = vec![b'a'; 32 * 1024 * 1024];
@@ -401,6 +436,28 @@ pub struct ObjectHeaders(pub Metadata);
 
 pub(crate) const STREAM_MAX_CHUNK_SIZE: usize = 256 * 1024;
 
+const STORED_OBJECT_HEADERS: &[&str] = &[
+    "content-type",
+    "content-encoding",
+    "content-language",
+    "content-disposition",
+];
+
+pub(crate) fn is_storable_object_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    STORED_OBJECT_HEADERS.contains(&name.as_str()) || name.starts_with("x-tinycloud-meta-")
+}
+
+pub(crate) fn filter_stored_object_metadata(metadata: Metadata) -> Metadata {
+    Metadata(
+        metadata
+            .0
+            .into_iter()
+            .filter(|(key, _)| is_storable_object_header(key))
+            .collect(),
+    )
+}
+
 const NON_REPLAYABLE_OBJECT_HEADERS: &[&str] = &[
     "connection",
     "content-length",
@@ -414,9 +471,10 @@ const NON_REPLAYABLE_OBJECT_HEADERS: &[&str] = &[
 ];
 
 pub(crate) fn is_replayable_object_header(name: &str) -> bool {
-    !NON_REPLAYABLE_OBJECT_HEADERS
-        .iter()
-        .any(|header| name.eq_ignore_ascii_case(header))
+    is_storable_object_header(name)
+        && !NON_REPLAYABLE_OBJECT_HEADERS
+            .iter()
+            .any(|header| name.eq_ignore_ascii_case(header))
 }
 
 #[async_trait]
