@@ -46,14 +46,86 @@ where
         buf: &[u8],
     ) -> Poll<Result<usize, IoError>> {
         let p = self.project();
-        p.hasher.update(buf);
-        p.buffer.poll_write(cx, buf)
+        match p.buffer.poll_write(cx, buf) {
+            Poll::Ready(Ok(written)) => {
+                p.hasher.update(&buf[..written]);
+                Poll::Ready(Ok(written))
+            }
+            result => result,
+        }
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), IoError>> {
         self.project().buffer.poll_flush(cx)
     }
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), IoError>> {
         self.project().buffer.poll_close(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HashBuffer;
+    use futures::{
+        io::{AsyncWrite, AsyncWriteExt, BufReader},
+        task::{Context, Poll},
+    };
+    use std::{io, pin::Pin};
+
+    #[derive(Debug, Default)]
+    struct HostileWriter {
+        bytes: Vec<u8>,
+        calls: usize,
+    }
+
+    impl AsyncWrite for HostileWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            this.calls += 1;
+            if this.calls.is_multiple_of(3) {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
+            let written = buf.len().min(7);
+            this.bytes.extend_from_slice(&buf[..written]);
+            Poll::Ready(Ok(written))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn hashes_only_bytes_accepted_by_inner_writer() {
+        let data: Vec<_> = (0..16_384).map(|index| (index % 251) as u8).collect();
+
+        let mut expected = HashBuffer::new(Vec::new());
+        expected.write_all(&data).await.unwrap();
+        let expected_hash = expected.hash();
+
+        for capacity in [1, 17, 4096, 1024 * 1024] {
+            let mut buffered = HashBuffer::new(HostileWriter::default());
+            futures::io::copy_buf(
+                BufReader::with_capacity(capacity, data.as_slice()),
+                &mut buffered,
+            )
+            .await
+            .unwrap();
+            let hash = buffered.hash();
+            let (_, writer) = buffered.into_inner();
+
+            assert_eq!(writer.bytes, data, "buffer capacity: {capacity}");
+            assert_eq!(hash, expected_hash, "buffer capacity: {capacity}");
+        }
     }
 }
 

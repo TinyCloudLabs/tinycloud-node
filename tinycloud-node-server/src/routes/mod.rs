@@ -1,6 +1,6 @@
 use anyhow::Result;
 use base64::{decode_config, encode_config, URL_SAFE_NO_PAD};
-use futures::io::{AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt};
+use futures::io::{AsyncRead, AsyncReadExt as FuturesAsyncReadExt, AsyncWrite, AsyncWriteExt};
 use hmac::{Hmac, Mac};
 use percent_encoding::percent_decode_str;
 use rocket::{data::ToByteUnit, http::Status, response::status::Custom, serde::json::Json, State};
@@ -67,6 +67,19 @@ pub mod util;
 use util::LimitedReader;
 
 const MAX_KV_BATCH_READ_ITEMS: usize = 100;
+const UPLOAD_COPY_BUFFER_SIZE: usize = 1024 * 1024;
+
+async fn copy_upload<R, W>(reader: R, writer: &mut W) -> std::io::Result<u64>
+where
+    R: AsyncRead,
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    futures::io::copy_buf(
+        futures::io::BufReader::with_capacity(UPLOAD_COPY_BUFFER_SIZE, reader),
+        writer,
+    )
+    .await
+}
 
 fn retryable_sqlstate(code: &str) -> bool {
     matches!(code, "40001" | "40P01")
@@ -1415,7 +1428,7 @@ async fn invoke_impl(
                             }
                             Some(remaining) => {
                                 let decode_start = Instant::now();
-                                let result = futures::io::copy(
+                                let result = copy_upload(
                                     LimitedReader::new(open_data, remaining),
                                     &mut stage,
                                 )
@@ -1446,7 +1459,7 @@ async fn invoke_impl(
                     } else {
                         // no limit on storage, just use the data as is
                         let decode_start = Instant::now();
-                        let result = futures::io::copy(open_data, &mut stage)
+                        let result = copy_upload(open_data, &mut stage)
                             .await
                             .map_err(|e| (Status::InternalServerError, e.to_string()));
                         crate::prometheus::observe_stage(
@@ -2993,6 +3006,28 @@ mod tests {
                 Status::BadRequest
             );
         }
+    }
+
+    #[tokio::test]
+    async fn upload_copy_buffer_preserves_bytes_and_hash() {
+        let data: Vec<_> = (0..UPLOAD_COPY_BUFFER_SIZE + 37)
+            .map(|index| (index % 251) as u8)
+            .collect();
+
+        let mut original = HashBuffer::new(Vec::new());
+        futures::io::copy(data.as_slice(), &mut original)
+            .await
+            .unwrap();
+        let original_hash = original.hash();
+        let (_, original_bytes) = original.into_inner();
+
+        let mut buffered = HashBuffer::new(Vec::new());
+        copy_upload(data.as_slice(), &mut buffered).await.unwrap();
+        let buffered_hash = buffered.hash();
+        let (_, buffered_bytes) = buffered.into_inner();
+
+        assert_eq!(buffered_bytes, original_bytes);
+        assert_eq!(buffered_hash, original_hash);
     }
 
     #[tokio::test]
