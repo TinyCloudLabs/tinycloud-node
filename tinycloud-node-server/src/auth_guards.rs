@@ -275,6 +275,24 @@ mod tests {
         assert_eq!(json["results"][1]["ok"], false);
         assert_eq!(json["results"][1]["error"]["code"], "KV_NOT_FOUND");
     }
+
+    #[test]
+    fn streamed_response_uses_configured_max_chunk_size() {
+        let response = Response::build()
+            .streamed_body(tokio::io::empty())
+            .max_chunk_size(256 * 1024)
+            .finalize();
+
+        assert_eq!(response.body().max_chunk_size(), 256 * 1024);
+    }
+
+    #[test]
+    fn object_response_drops_hop_by_hop_headers() {
+        for header in NON_REPLAYABLE_OBJECT_HEADERS {
+            assert!(!is_replayable_object_header(header));
+        }
+        assert!(is_replayable_object_header("content-type"));
+    }
 }
 
 impl<'r, R> Responder<'r, 'static> for DataOut<R>
@@ -320,6 +338,24 @@ impl CapJsonRep {
 
 pub struct ObjectHeaders(pub Metadata);
 
+const NON_REPLAYABLE_OBJECT_HEADERS: &[&str] = &[
+    "connection",
+    "content-length",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+pub(crate) fn is_replayable_object_header(name: &str) -> bool {
+    !NON_REPLAYABLE_OBJECT_HEADERS
+        .iter()
+        .any(|header| name.eq_ignore_ascii_case(header))
+}
+
 #[async_trait]
 impl<'r> FromRequest<'r> for ObjectHeaders {
     type Error = anyhow::Error;
@@ -337,7 +373,7 @@ impl<'r> Responder<'r, 'static> for ObjectHeaders {
     fn respond_to(self, _: &'r Request<'_>) -> rocket::response::Result<'static> {
         let mut r = Response::build();
         for (k, v) in self.0 .0 {
-            if !k.eq_ignore_ascii_case("content-length") {
+            if is_replayable_object_header(&k) {
                 r.header(Header::new(k, v));
             }
         }
@@ -364,9 +400,9 @@ where
         Ok(Response::build_from(ObjectHeaders(metadata).respond_to(r)?)
             .header(Header::new("ETag", etag))
             .header(Header::new("Content-Length", content_length.to_string()))
-            .max_chunk_size(256 * 1024)
             // must ensure that Metadata::respond_to does not set the body of the response
             .streamed_body(content.compat())
+            .max_chunk_size(256 * 1024)
             .finalize())
     }
 }

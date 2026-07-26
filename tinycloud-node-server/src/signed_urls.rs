@@ -1,4 +1,4 @@
-use crate::TinyCloud;
+use crate::{auth_guards::is_replayable_object_header, TinyCloud};
 use base64::{encode_config, URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
@@ -211,8 +211,8 @@ where
                 add_object_headers(&mut response, metadata);
                 response.header(Header::new("ETag", etag(&hash)));
                 response.header(Header::new("Content-Length", content.len().to_string()));
-                response.max_chunk_size(256 * 1024);
                 response.streamed_body(content.compat());
+                response.max_chunk_size(256 * 1024);
             }
             Self::Partial {
                 metadata,
@@ -230,8 +230,8 @@ where
                     format!("bytes {}-{}/{}", range.start(), range.end(), total_size),
                 ));
                 response.header(Header::new("Content-Length", content.len().to_string()));
-                response.max_chunk_size(256 * 1024);
                 response.streamed_body(content.compat());
+                response.max_chunk_size(256 * 1024);
             }
             Self::Unsatisfiable { hash, total_size } => {
                 response.status(Status::RangeNotSatisfiable);
@@ -248,7 +248,7 @@ where
 
 fn add_object_headers(response: &mut rocket::response::Builder<'_>, metadata: Metadata) {
     for (key, value) in metadata.0 {
-        if !key.eq_ignore_ascii_case("content-length") {
+        if is_replayable_object_header(&key) {
             response.header(Header::new(key, value));
         }
     }
@@ -783,6 +783,31 @@ mod tests {
         );
         assert_eq!(response.into_bytes().await.unwrap(), b"world");
         Ok(())
+    }
+
+    #[test]
+    fn signed_response_drops_hop_by_hop_object_headers() {
+        let mut response = Response::build();
+        add_object_headers(
+            &mut response,
+            Metadata(
+                [
+                    ("Content-Type".to_string(), "text/plain".to_string()),
+                    ("Transfer-Encoding".to_string(), "chunked".to_string()),
+                    ("Connection".to_string(), "keep-alive".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        );
+        let response = response.finalize();
+
+        assert_eq!(
+            response.headers().get_one("Content-Type"),
+            Some("text/plain")
+        );
+        assert!(response.headers().get_one("Transfer-Encoding").is_none());
+        assert!(response.headers().get_one("Connection").is_none());
     }
 
     #[tokio::test]

@@ -156,8 +156,8 @@ where
         let PublicKVResponse(content, metadata, etag) = self;
         let content_length = content.len();
         let mut response = Response::build()
-            .max_chunk_size(256 * 1024)
             .streamed_body(content.compat())
+            .max_chunk_size(256 * 1024)
             .finalize();
         for (k, v) in sanitized_metadata(&metadata) {
             response.set_header(Header::new(k.clone(), v.clone()));
