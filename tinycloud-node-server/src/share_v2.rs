@@ -503,7 +503,7 @@ pub async fn register_policy(
     }
     let policy: PolicyEnvelope = serde_json::from_value(policy_value)
         .map_err(|_| error(Status::BadRequest, "policy_registration_invalid"))?;
-    validate_policy(&policy, &request, runtime)
+    validate_policy(&policy, &request, &runtime.config, &runtime.enforcer_did)
         .map_err(|_| error(Status::Forbidden, "policy_registration_invalid"))?;
     if request.policy.cid == request.owner_delegation.cid
         || request.policy.cid == request.enforcement_delegation.cid
@@ -682,7 +682,8 @@ fn timestamp(value: OffsetDateTime) -> String {
 fn validate_policy(
     envelope: &PolicyEnvelope,
     request: &RegisterRequest,
-    runtime: &ShareV2Runtime,
+    config: &ShareEmailConfig,
+    enforcer_did: &str,
 ) -> Result<(), ()> {
     if envelope.domain != POLICY_DOMAIN {
         return Err(());
@@ -690,9 +691,9 @@ fn validate_policy(
     let policy = &envelope.policy;
     if policy.artifact_type != "TinyCloudSharePolicy"
         || policy.version != 2
-        || policy.target.origin != runtime.config.target_origin
-        || policy.target.node_audience != runtime.config.node_audience
-        || policy.target.enforcer_did != runtime.enforcer_did
+        || policy.target.origin != config.target_origin
+        || policy.target.node_audience != config.node_audience
+        || policy.target.enforcer_did != enforcer_did
         || policy.content_source_digest != request.content_source_digest
         || policy.owner_delegation_cid != request.owner_delegation.cid
         || policy.resource.kind != "exact"
@@ -965,6 +966,7 @@ fn verify_enforcement_delegation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use time::Duration;
 
     #[test]
     fn policy_domain_matches_the_sdk_wire_contract() {
@@ -995,5 +997,79 @@ mod tests {
             b64_digest(b"owner-rooted-share"),
             "1P94n7BpYl9ftisD56vWnBlC36pXiktWRZxMBT1Bsd0"
         );
+    }
+
+    fn sample_policy() -> (PolicyEnvelope, RegisterRequest, ShareEmailConfig) {
+        let config = ShareEmailConfig::default();
+        let expires_at = timestamp(OffsetDateTime::now_utc() + Duration::days(1));
+        let envelope = serde_json::from_value(serde_json::json!({
+            "domain": POLICY_DOMAIN,
+            "policy": {
+                "type": "TinyCloudSharePolicy",
+                "version": 2,
+                "shareId": "share-1",
+                "ownerDid": "did:pkh:eip155:1:0xowner",
+                "shareKeyDid": "did:key:z6MkShare",
+                "recipientMatcher": {"kind": "exactEmail", "value": "alice@example.com"},
+                "target": {
+                    "origin": config.target_origin.clone(),
+                    "nodeAudience": config.node_audience.clone(),
+                    "enforcerDid": "did:key:z6MkEnforcer",
+                    "spaceId": "applications"
+                },
+                "resource": {"kind": "exact", "path": "shares/share-1/document.md"},
+                "actions": ["tinycloud.kv/get", "tinycloud.kv/metadata"],
+                "contentSource": {"kind": "kv", "space": "applications", "path": "shares/share-1/document.md"},
+                "contentSourceDigest": "digest",
+                "ownerDelegationCid": "bafy-owner",
+                "expiresAt": expires_at.clone()
+            }
+        }))
+        .unwrap();
+        let request = serde_json::from_value(serde_json::json!({
+            "policy": {"bytes": "bytes", "cid": "bafy-policy", "proof": "proof"},
+            "ownerDelegation": {"cid": "bafy-owner", "dagCbor": "dag"},
+            "enforcementDelegation": {
+                "cid": "bafy-enforcement",
+                "dagCbor": "dag",
+                "issuerDid": "did:key:z6MkShare",
+                "audienceDid": "did:key:z6MkEnforcer",
+                "facts": {
+                    "ownerDelegationCid": "bafy-owner",
+                    "policyCid": "bafy-policy",
+                    "shareId": "share-1",
+                    "shareKeyDid": "did:key:z6MkShare",
+                    "enforcerDid": "did:key:z6MkEnforcer",
+                    "nodeAudience": config.node_audience.clone(),
+                    "spaceId": "applications",
+                    "path": "shares/share-1/document.md",
+                    "actions": ["tinycloud.kv/get", "tinycloud.kv/metadata"],
+                    "contentSourceDigest": "digest",
+                    "expiresAt": expires_at
+                },
+                "signature": "signature"
+            },
+            "contentSourceDigest": "digest"
+        }))
+        .unwrap();
+        (envelope, request, config)
+    }
+
+    #[test]
+    fn policy_validation_accepts_arbitrary_exact_email_matchers() {
+        let (mut envelope, request, config) = sample_policy();
+        envelope.policy.recipient_matcher.value = "person+tag@any.example".to_owned();
+        assert!(validate_policy(&envelope, &request, &config, "did:key:z6MkEnforcer").is_ok());
+    }
+
+    #[test]
+    fn policy_validation_rejects_path_and_action_widening() {
+        let (mut envelope, request, config) = sample_policy();
+        envelope.policy.resource.path = "shares/share-1/../other.md".to_owned();
+        assert!(validate_policy(&envelope, &request, &config, "did:key:z6MkEnforcer").is_err());
+
+        let (mut envelope, request, config) = sample_policy();
+        envelope.policy.actions.push("tinycloud.kv/list".to_owned());
+        assert!(validate_policy(&envelope, &request, &config, "did:key:z6MkEnforcer").is_err());
     }
 }
