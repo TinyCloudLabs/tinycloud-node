@@ -724,9 +724,12 @@ mod tests {
         let bytes = b"world".to_vec();
         SignedKvReadResponse::Partial {
             metadata: Metadata(
-                [("content-type".to_string(), "audio/wav".to_string())]
-                    .into_iter()
-                    .collect(),
+                [
+                    ("content-type".to_string(), "audio/wav".to_string()),
+                    ("transfer-encoding".to_string(), "chunked".to_string()),
+                ]
+                .into_iter()
+                .collect(),
             ),
             hash: hash(b"hello world"),
             total_size: 11,
@@ -786,6 +789,45 @@ mod tests {
             Some(etag(&hash(b"hello world")).as_str())
         );
         assert_eq!(response.into_bytes().await.unwrap(), b"world");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signed_responder_sets_full_and_partial_streaming_postconditions() -> Result<()> {
+        let client = Client::tracked(rocket::build()).await?;
+
+        let full_request = client.get("/full");
+        let full_response = full_response()
+            .respond_to(full_request.inner())
+            .map_err(|status| anyhow::anyhow!("full SignedKvReadResponse failed: {status}"))?;
+        assert_eq!(full_response.status(), Status::Ok);
+        assert_eq!(full_response.body().max_chunk_size(), STREAM_MAX_CHUNK_SIZE);
+        assert_eq!(
+            full_response.headers().get_one("Content-Length"),
+            Some("33554432")
+        );
+        assert!(full_response
+            .headers()
+            .get_one("Transfer-Encoding")
+            .is_none());
+
+        let partial_request = client.get("/partial");
+        let partial_response = partial_response()
+            .respond_to(partial_request.inner())
+            .map_err(|status| anyhow::anyhow!("partial SignedKvReadResponse failed: {status}"))?;
+        assert_eq!(partial_response.status(), Status::PartialContent);
+        assert_eq!(
+            partial_response.body().max_chunk_size(),
+            STREAM_MAX_CHUNK_SIZE
+        );
+        assert_eq!(
+            partial_response.headers().get_one("Content-Length"),
+            Some("5")
+        );
+        assert!(partial_response
+            .headers()
+            .get_one("Transfer-Encoding")
+            .is_none());
         Ok(())
     }
 

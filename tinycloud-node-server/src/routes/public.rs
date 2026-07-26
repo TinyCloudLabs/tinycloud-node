@@ -382,4 +382,33 @@ mod tests {
         assert_eq!(response.into_bytes().await.unwrap().len(), 32 * 1024 * 1024);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn public_responder_sets_streaming_postconditions() -> anyhow::Result<()> {
+        let client = Client::tracked(rocket::build()).await?;
+        let request = client.get("/");
+        let body = vec![b'p'; 32 * 1024];
+        let response = PublicKVResponse(
+            Content::new(body.len() as u64, Cursor::new(body)),
+            Metadata(
+                [
+                    (
+                        "content-type".to_string(),
+                        "application/octet-stream".to_string(),
+                    ),
+                    ("transfer-encoding".to_string(), "chunked".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            "\"direct-public-stream\"".to_string(),
+        )
+        .respond_to(request.inner())
+        .map_err(|status| anyhow::anyhow!("PublicKVResponse failed: {status}"))?;
+
+        assert_eq!(response.body().max_chunk_size(), STREAM_MAX_CHUNK_SIZE);
+        assert_eq!(response.headers().get_one("Content-Length"), Some("32768"));
+        assert!(response.headers().get_one("Transfer-Encoding").is_none());
+        Ok(())
+    }
 }

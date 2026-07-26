@@ -3,19 +3,16 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use rocket::{
-    get,
-    http::{Header, Status},
-    request::Request,
-    response::{Responder, Response},
-    routes, State,
-};
-use tokio::io::{AsyncRead, ReadBuf};
+use futures::io::AsyncRead;
+use rocket::{get, routes, State};
+use tinycloud::auth_guards::KVResponse;
+use tinycloud_core::{hash::hash, storage::Content, types::Metadata};
 
 const BODY_SIZE: usize = 32 * 1024 * 1024;
+const CONFIGURED_MAX_CHUNK_SIZE: usize = 256 * 1024;
 
 struct RecordingReader {
     remaining: usize,
@@ -26,40 +23,32 @@ impl AsyncRead for RecordingReader {
     fn poll_read(
         mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
         if self.remaining == 0 {
-            return Poll::Ready(Ok(()));
+            return Poll::Ready(Ok(0));
         }
 
-        let size = self.remaining.min(buf.remaining());
-        buf.put_slice(&vec![0; size]);
+        let size = self.remaining.min(buf.len());
+        buf[..size].fill(0);
         self.remaining -= size;
         self.reads.lock().unwrap().push(size);
-        Poll::Ready(Ok(()))
+        Poll::Ready(Ok(size))
     }
 }
 
-struct MeasuredResponse(Response<'static>);
-
-impl<'r> Responder<'r, 'static> for MeasuredResponse {
-    fn respond_to(self, _request: &'r Request<'_>) -> rocket::response::Result<'static> {
-        Ok(self.0)
-    }
-}
-
-#[get("/<chunk_size>")]
-fn measured_stream(chunk_size: usize, reads: &State<Arc<Mutex<Vec<usize>>>>) -> MeasuredResponse {
-    MeasuredResponse(
-        Response::build()
-            .status(Status::Ok)
-            .header(Header::new("Content-Length", BODY_SIZE.to_string()))
-            .streamed_body(RecordingReader {
+#[get("/")]
+fn measured_stream(reads: &State<Arc<Mutex<Vec<usize>>>>) -> KVResponse<RecordingReader> {
+    KVResponse::new(
+        Metadata(Default::default()),
+        hash(b"wire-stream"),
+        Content::new(
+            BODY_SIZE as u64,
+            RecordingReader {
                 remaining: BODY_SIZE,
                 reads: reads.inner().clone(),
-            })
-            .max_chunk_size(chunk_size)
-            .finalize(),
+            },
+        ),
     )
 }
 
@@ -102,43 +91,30 @@ async fn observed_wire_streaming_has_content_length_and_useful_frames() -> anyho
     let base_url = format!("http://127.0.0.1:{port}");
     wait_for_server(&client, &format!("{base_url}/health")).await?;
 
-    let mut measurements = Vec::new();
-    for chunk_size in [64 * 1024, 256 * 1024, 1024 * 1024] {
-        reads.lock().unwrap().clear();
-        let started = Instant::now();
-        let response = client
-            .get(format!("{base_url}/{chunk_size}"))
-            .send()
-            .await?;
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-        assert_eq!(
-            response
-                .headers()
-                .get("content-length")
-                .unwrap()
-                .to_str()?
-                .parse::<usize>()?,
-            BODY_SIZE
-        );
-        assert!(response.headers().get("transfer-encoding").is_none());
-        assert_eq!(response.bytes().await?.len(), BODY_SIZE);
-        let elapsed = started.elapsed();
-        let frames = reads.lock().unwrap().clone();
-        assert!(!frames.is_empty());
-        assert!(frames.iter().all(|size| *size <= chunk_size));
-        assert!(frames.iter().any(|size| *size > 4096));
-        measurements.push((chunk_size, elapsed, frames));
-    }
-
-    for (chunk_size, elapsed, frames) in &measurements {
-        eprintln!(
-            "TC-285 observed wire stream: chunk_size={} bytes, frames={}, max_frame={} bytes, throughput={:.1} MiB/s",
-            chunk_size,
-            frames.len(),
-            frames.iter().copied().max().unwrap_or_default(),
-            BODY_SIZE as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0),
-        );
-    }
+    reads.lock().unwrap().clear();
+    let response = client.get(format!("{base_url}/")).send().await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-length")
+            .unwrap()
+            .to_str()?
+            .parse::<usize>()?,
+        BODY_SIZE
+    );
+    assert!(response.headers().get("transfer-encoding").is_none());
+    assert_eq!(response.bytes().await?.len(), BODY_SIZE);
+    let frames = reads.lock().unwrap().clone();
+    assert!(!frames.is_empty());
+    assert!(frames.iter().all(|size| *size <= CONFIGURED_MAX_CHUNK_SIZE));
+    assert!(frames.iter().any(|size| *size > 4096));
+    eprintln!(
+        "TC-285 observed real KVResponse wire stream: configured_chunk_size={} bytes, frames={}, max_frame={} bytes",
+        CONFIGURED_MAX_CHUNK_SIZE,
+        frames.len(),
+        frames.iter().copied().max().unwrap_or_default(),
+    );
 
     shutdown.notify();
     server.await??;
