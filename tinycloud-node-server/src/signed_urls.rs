@@ -211,6 +211,7 @@ where
                 add_object_headers(&mut response, metadata);
                 response.header(Header::new("ETag", etag(&hash)));
                 response.header(Header::new("Content-Length", content.len().to_string()));
+                response.max_chunk_size(256 * 1024);
                 response.streamed_body(content.compat());
             }
             Self::Partial {
@@ -229,6 +230,7 @@ where
                     format!("bytes {}-{}/{}", range.start(), range.end(), total_size),
                 ));
                 response.header(Header::new("Content-Length", content.len().to_string()));
+                response.max_chunk_size(256 * 1024);
                 response.streamed_body(content.compat());
             }
             Self::Unsatisfiable { hash, total_size } => {

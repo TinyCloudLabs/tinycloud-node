@@ -337,7 +337,7 @@ impl<'r> Responder<'r, 'static> for ObjectHeaders {
     fn respond_to(self, _: &'r Request<'_>) -> rocket::response::Result<'static> {
         let mut r = Response::build();
         for (k, v) in self.0 .0 {
-            if k != "content-length" {
+            if !k.eq_ignore_ascii_case("content-length") {
                 r.header(Header::new(k, v));
             }
         }
@@ -345,10 +345,10 @@ impl<'r> Responder<'r, 'static> for ObjectHeaders {
     }
 }
 
-pub struct KVResponse<R>(R, pub Metadata, pub Hash);
+pub struct KVResponse<R>(tinycloud_core::storage::Content<R>, pub Metadata, pub Hash);
 
 impl<R> KVResponse<R> {
-    pub fn new(md: Metadata, hash: Hash, reader: R) -> Self {
+    pub fn new(md: Metadata, hash: Hash, reader: tinycloud_core::storage::Content<R>) -> Self {
         Self(reader, md, hash)
     }
 }
@@ -358,11 +358,15 @@ where
     R: 'static + AsyncRead + Send,
 {
     fn respond_to(self, r: &'r Request<'_>) -> rocket::response::Result<'static> {
-        let etag = kv_etag(self.2);
-        Ok(Response::build_from(ObjectHeaders(self.1).respond_to(r)?)
+        let KVResponse(content, metadata, hash) = self;
+        let content_length = content.len();
+        let etag = kv_etag(hash);
+        Ok(Response::build_from(ObjectHeaders(metadata).respond_to(r)?)
             .header(Header::new("ETag", etag))
+            .header(Header::new("Content-Length", content_length.to_string()))
+            .max_chunk_size(256 * 1024)
             // must ensure that Metadata::respond_to does not set the body of the response
-            .streamed_body(self.0.compat())
+            .streamed_body(content.compat())
             .finalize())
     }
 }

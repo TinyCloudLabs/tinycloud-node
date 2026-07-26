@@ -153,11 +153,17 @@ where
     R: 'static + AsyncRead + Send,
 {
     fn respond_to(self, _: &'r Request<'_>) -> rocket::response::Result<'static> {
-        let mut response = Response::build().streamed_body(self.0.compat()).finalize();
-        for (k, v) in sanitized_metadata(&self.1) {
+        let PublicKVResponse(content, metadata, etag) = self;
+        let content_length = content.len();
+        let mut response = Response::build()
+            .max_chunk_size(256 * 1024)
+            .streamed_body(content.compat())
+            .finalize();
+        for (k, v) in sanitized_metadata(&metadata) {
             response.set_header(Header::new(k.clone(), v.clone()));
         }
-        add_public_headers(&mut response, Some(&self.2));
+        response.set_header(Header::new("Content-Length", content_length.to_string()));
+        add_public_headers(&mut response, Some(&etag));
         Ok(response)
     }
 }
