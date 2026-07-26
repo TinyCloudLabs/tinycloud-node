@@ -1,4 +1,7 @@
-use crate::{auth_guards::is_replayable_object_header, TinyCloud};
+use crate::{
+    auth_guards::{is_replayable_object_header, STREAM_MAX_CHUNK_SIZE},
+    TinyCloud,
+};
 use base64::{encode_config, URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
@@ -212,7 +215,7 @@ where
                 response.header(Header::new("ETag", etag(&hash)));
                 response.header(Header::new("Content-Length", content.len().to_string()));
                 response.streamed_body(content.compat());
-                response.max_chunk_size(256 * 1024);
+                response.max_chunk_size(STREAM_MAX_CHUNK_SIZE);
             }
             Self::Partial {
                 metadata,
@@ -231,7 +234,7 @@ where
                 ));
                 response.header(Header::new("Content-Length", content.len().to_string()));
                 response.streamed_body(content.compat());
-                response.max_chunk_size(256 * 1024);
+                response.max_chunk_size(STREAM_MAX_CHUNK_SIZE);
             }
             Self::Unsatisfiable { hash, total_size } => {
                 response.status(Status::RangeNotSatisfiable);
@@ -777,11 +780,47 @@ mod tests {
             response.headers().get_one("Content-Type"),
             Some("audio/wav")
         );
+        assert!(response.headers().get_one("Transfer-Encoding").is_none());
         assert_eq!(
             response.headers().get_one("ETag"),
             Some(etag(&hash(b"hello world")).as_str())
         );
         assert_eq!(response.into_bytes().await.unwrap(), b"world");
+        Ok(())
+    }
+
+    #[get("/full")]
+    fn full_response() -> SignedKvReadResponse<Cursor<Vec<u8>>> {
+        let bytes = vec![b'f'; 32 * 1024 * 1024];
+        SignedKvReadResponse::Full {
+            metadata: Metadata(
+                [
+                    (
+                        "content-type".to_string(),
+                        "application/octet-stream".to_string(),
+                    ),
+                    ("transfer-encoding".to_string(), "chunked".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            hash: hash(b"full-stream"),
+            content: Content::new(bytes.len() as u64, Cursor::new(bytes)),
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_full_response_headers_and_body_are_observed() -> Result<()> {
+        let client = Client::tracked(rocket::build().mount("/", routes![full_response])).await?;
+        let response = client.get("/full").dispatch().await;
+
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            response.headers().get_one("Content-Length"),
+            Some("33554432")
+        );
+        assert!(response.headers().get_one("Transfer-Encoding").is_none());
+        assert_eq!(response.into_bytes().await.unwrap().len(), 32 * 1024 * 1024);
         Ok(())
     }
 

@@ -244,6 +244,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::io::Cursor;
+    use rocket::local::asynchronous::Client;
     use tinycloud_core::{hash::hash, KvBatchReadItem, KvBatchReadValue};
 
     #[test]
@@ -280,10 +282,10 @@ mod tests {
     fn streamed_response_uses_configured_max_chunk_size() {
         let response = Response::build()
             .streamed_body(tokio::io::empty())
-            .max_chunk_size(256 * 1024)
+            .max_chunk_size(STREAM_MAX_CHUNK_SIZE)
             .finalize();
 
-        assert_eq!(response.body().max_chunk_size(), 256 * 1024);
+        assert_eq!(response.body().max_chunk_size(), STREAM_MAX_CHUNK_SIZE);
     }
 
     #[test]
@@ -292,6 +294,43 @@ mod tests {
             assert!(!is_replayable_object_header(header));
         }
         assert!(is_replayable_object_header("content-type"));
+    }
+
+    #[get("/")]
+    fn authenticated_stream() -> KVResponse<Cursor<Vec<u8>>> {
+        let body = vec![b'a'; 32 * 1024 * 1024];
+        KVResponse(
+            tinycloud_core::storage::Content::new(body.len() as u64, Cursor::new(body)),
+            Metadata(
+                [
+                    (
+                        "content-type".to_string(),
+                        "application/octet-stream".to_string(),
+                    ),
+                    ("transfer-encoding".to_string(), "chunked".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            hash(b"authenticated-stream"),
+        )
+    }
+
+    #[tokio::test]
+    async fn authenticated_response_headers_and_body_are_observed() -> Result<()> {
+        let client =
+            Client::tracked(rocket::build().mount("/", rocket::routes![authenticated_stream]))
+                .await?;
+        let response = client.get("/").dispatch().await;
+
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            response.headers().get_one("Content-Length"),
+            Some("33554432")
+        );
+        assert!(response.headers().get_one("Transfer-Encoding").is_none());
+        assert_eq!(response.into_bytes().await.unwrap().len(), 32 * 1024 * 1024);
+        Ok(())
     }
 }
 
@@ -337,6 +376,8 @@ impl CapJsonRep {
 }
 
 pub struct ObjectHeaders(pub Metadata);
+
+pub(crate) const STREAM_MAX_CHUNK_SIZE: usize = 256 * 1024;
 
 const NON_REPLAYABLE_OBJECT_HEADERS: &[&str] = &[
     "connection",
@@ -402,7 +443,7 @@ where
             .header(Header::new("Content-Length", content_length.to_string()))
             // must ensure that Metadata::respond_to does not set the body of the response
             .streamed_body(content.compat())
-            .max_chunk_size(256 * 1024)
+            .max_chunk_size(STREAM_MAX_CHUNK_SIZE)
             .finalize())
     }
 }

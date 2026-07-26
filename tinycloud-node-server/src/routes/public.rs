@@ -11,7 +11,9 @@ use tinycloud_auth::resource::{Path, SpaceId};
 use tinycloud_core::storage::{Content, ImmutableReadStore};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-use crate::{config::PublicSpacesConfig, BlockStores, TinyCloud};
+use crate::{
+    auth_guards::STREAM_MAX_CHUNK_SIZE, config::PublicSpacesConfig, BlockStores, TinyCloud,
+};
 use tinycloud_core::types::Metadata;
 
 /// A key path that allows dot-prefixed segments like `.well-known/profile`.
@@ -157,7 +159,7 @@ where
         let content_length = content.len();
         let mut response = Response::build()
             .streamed_body(content.compat())
-            .max_chunk_size(256 * 1024)
+            .max_chunk_size(STREAM_MAX_CHUNK_SIZE)
             .finalize();
         for (k, v) in sanitized_metadata(&metadata) {
             response.set_header(Header::new(k.clone(), v.clone()));
@@ -336,4 +338,48 @@ pub async fn public_kv_list(
 #[options("/public/<_space_id>/kv/<_key..>")]
 pub async fn public_kv_options(_space_id: &str, _key: RawKeyPath) -> Status {
     Status::NoContent
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::io::Cursor;
+    use rocket::local::asynchronous::Client;
+    use tinycloud_core::storage::Content;
+
+    #[get("/")]
+    fn public_stream() -> PublicKVResponse<Cursor<Vec<u8>>> {
+        let body = vec![b'p'; 32 * 1024 * 1024];
+        PublicKVResponse(
+            Content::new(body.len() as u64, Cursor::new(body)),
+            Metadata(
+                [
+                    (
+                        "content-type".to_string(),
+                        "application/octet-stream".to_string(),
+                    ),
+                    ("transfer-encoding".to_string(), "chunked".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            "\"public-stream\"".to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn public_response_headers_and_body_are_observed() -> anyhow::Result<()> {
+        let client =
+            Client::tracked(rocket::build().mount("/", rocket::routes![public_stream])).await?;
+        let response = client.get("/").dispatch().await;
+
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            response.headers().get_one("Content-Length"),
+            Some("33554432")
+        );
+        assert!(response.headers().get_one("Transfer-Encoding").is_none());
+        assert_eq!(response.into_bytes().await.unwrap().len(), 32 * 1024 * 1024);
+        Ok(())
+    }
 }
