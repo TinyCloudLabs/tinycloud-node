@@ -1,12 +1,13 @@
 use hyper::{header::CONTENT_TYPE, Body, Request, Response};
 use lazy_static::lazy_static;
-use prometheus::{register_histogram_vec, Encoder, HistogramVec, TextEncoder};
-use std::{
-    sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
+use prometheus::{
+    register_histogram_vec, register_int_counter_vec, Encoder, HistogramVec, IntCounterVec,
+    TextEncoder,
 };
 
-static TELEMETRY_ENABLED: AtomicBool = AtomicBool::new(false);
+pub use tinycloud_core::telemetry::{
+    enabled, observe_span, observe_stage, set_enabled, InvocationStage, StageOutcome,
+};
 
 lazy_static! {
     pub static ref REQUEST_HISTOGRAM: HistogramVec = register_histogram_vec!(
@@ -27,27 +28,22 @@ lazy_static! {
         &["request"]
     )
     .unwrap();
-    pub static ref SPAN_HISTOGRAM: HistogramVec = register_histogram_vec!(
-        "tinycloud_span_duration_seconds",
-        "Named internal operation latencies in seconds.",
-        &["span", "outcome"]
+    pub static ref SIGNED_KV_BYTES: IntCounterVec = register_int_counter_vec!(
+        "tinycloud_signed_kv_bytes_total",
+        "Object and response bytes for successful signed KV reads.",
+        &["measure"]
     )
     .unwrap();
 }
 
-pub fn set_enabled(enabled: bool) {
-    TELEMETRY_ENABLED.store(enabled, Ordering::Relaxed);
-}
-
-pub fn enabled() -> bool {
-    TELEMETRY_ENABLED.load(Ordering::Relaxed)
-}
-
-pub fn observe_span(span: &'static str, outcome: &'static str, duration: Duration) {
+pub fn observe_signed_kv_transfer(object_bytes: u64, served_bytes: u64) {
     if enabled() {
-        SPAN_HISTOGRAM
-            .with_label_values(&[span, outcome])
-            .observe(duration.as_secs_f64());
+        SIGNED_KV_BYTES
+            .with_label_values(&["object"])
+            .inc_by(object_bytes);
+        SIGNED_KV_BYTES
+            .with_label_values(&["served"])
+            .inc_by(served_bytes);
     }
 }
 
@@ -64,4 +60,79 @@ pub async fn serve_req(_req: Request<Body>) -> Result<Response<Body>, hyper::Err
         .body(Body::from(buffer))
         .unwrap();
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    #[test]
+    fn invocation_stage_labels_are_static_and_bounded() {
+        let labels: Vec<&'static str> = InvocationStage::ALL
+            .into_iter()
+            .map(InvocationStage::as_str)
+            .collect();
+        let expected = vec![
+            "request_decode",
+            "invocation_signature_verify",
+            "replay_check",
+            "authorization_graph_load",
+            "revocation_work",
+            "kv_index_lookup",
+            "block_read",
+            "block_write",
+            "epoch_persist",
+            "response_handling",
+        ];
+
+        assert_eq!(labels, expected);
+        assert_eq!(labels.iter().collect::<HashSet<_>>().len(), labels.len());
+        for label in labels {
+            assert!(!label.contains(' '), "{label} must not contain spaces");
+            assert!(!label.contains('/'), "{label} must not contain paths");
+            assert!(!label.contains(':'), "{label} must not contain DIDs/CIDs");
+            assert!(
+                !label.contains("trace"),
+                "{label} must not contain trace IDs"
+            );
+            assert!(
+                !label.contains("space"),
+                "{label} must not contain space IDs"
+            );
+            assert!(!label.contains("did"), "{label} must not contain DIDs");
+            assert!(!label.contains("cid"), "{label} must not contain CIDs");
+            assert!(!label.contains("path"), "{label} must not contain paths");
+        }
+    }
+
+    #[test]
+    fn stage_histogram_registers_static_labels() {
+        set_enabled(true);
+        observe_stage(
+            InvocationStage::RequestDecode,
+            StageOutcome::Ok,
+            Duration::from_millis(1),
+        );
+
+        let metric = prometheus::gather()
+            .into_iter()
+            .find(|family| family.get_name() == "tinycloud_span_duration_seconds")
+            .expect("span histogram should be registered");
+        let sample = metric
+            .get_metric()
+            .iter()
+            .find(|entry| {
+                let labels = entry.get_label();
+                labels.iter().any(|label| {
+                    label.get_name() == "span" && label.get_value() == "request_decode"
+                }) && labels
+                    .iter()
+                    .any(|label| label.get_name() == "outcome" && label.get_value() == "ok")
+            })
+            .expect("static stage labels should be observable");
+
+        assert!(sample.get_histogram().get_sample_count() > 0);
+    }
 }

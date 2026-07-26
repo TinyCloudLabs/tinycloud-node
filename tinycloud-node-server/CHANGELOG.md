@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.0](https://github.com/TinyCloudLabs/tinycloud-node/compare/v1.8.0...v1.9.0) - 2026-07-25
+
+### Added
+
+- Add a reproducible production invoke performance baseline and stage-level
+  instrumentation ([#147](https://github.com/TinyCloudLabs/tinycloud-node/pull/147))
+- Execute KV batch reads in one authenticated invocation
+  ([#151](https://github.com/TinyCloudLabs/tinycloud-node/pull/151))
+- Add range-capable signed blob reads
+  ([#155](https://github.com/TinyCloudLabs/tinycloud-node/pull/155))
+- Add a benchmark-enabled node container image
+  ([#154](https://github.com/TinyCloudLabs/tinycloud-node/pull/154))
+
+### Changed
+
+- Snapshot the authorization graph once per invocation
+  ([#148](https://github.com/TinyCloudLabs/tinycloud-node/pull/148))
+- Persist replay protection across restarts
+  ([#150](https://github.com/TinyCloudLabs/tinycloud-node/pull/150))
+- Materialize current KV state for direct reads
+  ([#149](https://github.com/TinyCloudLabs/tinycloud-node/pull/149))
+- Group-commit authenticated read audits
+  ([#152](https://github.com/TinyCloudLabs/tinycloud-node/pull/152))
+- Persist incremental SQL and DuckDB WAL artifacts
+  ([#153](https://github.com/TinyCloudLabs/tinycloud-node/pull/153))
+
 ## [1.6.1](https://github.com/TinyCloudLabs/tinycloud-node/compare/v1.6.0...v1.6.1) - 2026-07-18
 
 ### Fixed

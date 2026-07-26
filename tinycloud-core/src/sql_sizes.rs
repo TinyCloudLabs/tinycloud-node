@@ -5,7 +5,7 @@ use tinycloud_auth::resource::SpaceId;
 use tokio::sync::RwLock;
 
 use crate::database_artifacts::{
-    DatabaseArtifact, DatabaseArtifactError, DatabaseArtifactRepository,
+    DatabaseArtifact, DatabaseArtifactError, DatabaseArtifactRepository, DeltaSave,
 };
 
 /// Process-local mirror of durable SQL artifact sizes, keyed by space then
@@ -117,6 +117,20 @@ impl DatabaseArtifactRepository for SizeTrackingArtifactRepository {
             .update(service, space, name, artifact.size_bytes.max(0) as u64)
             .await;
         Ok(artifact)
+    }
+
+    async fn save_delta(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        payload: Vec<u8>,
+    ) -> Result<DeltaSave, DatabaseArtifactError> {
+        let saved = self.inner.save_delta(service, space, name, payload).await?;
+        self.sizes
+            .update(service, space, name, saved.size_bytes.max(0) as u64)
+            .await;
+        Ok(saved)
     }
 }
 

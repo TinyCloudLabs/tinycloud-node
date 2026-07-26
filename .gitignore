@@ -1,5 +1,7 @@
 /**/target
 /**/**/node_modules
+!tinycloud-node-server/tests/fixtures/email-claim-v1/node_modules/
+!tinycloud-node-server/tests/fixtures/email-claim-v1/node_modules/**
 .env
 bun.lockb
 bun.lock

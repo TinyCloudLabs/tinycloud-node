@@ -12,7 +12,9 @@ use crate::types::{Caveats, Facts, Resource, SpaceIdWrap};
 use crate::write_hooks::{hook_delivery_id, subscription_matches_event};
 use crate::{hash::Hash, types::Ability};
 use sea_orm::{
-    entity::prelude::*, sea_query::OnConflict, Condition, ConnectionTrait, QueryFilter, QueryOrder,
+    entity::prelude::*,
+    sea_query::{Alias, Expr, OnConflict},
+    Condition, ConnectionTrait, DatabaseBackend, QueryFilter, QueryOrder,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -109,12 +111,13 @@ pub(crate) async fn process<C: ConnectionTrait>(
     invocation: Invocation,
     ops: Vec<VersionedOperation>,
     encryption: Option<&ColumnEncryption>,
+    auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
 ) -> Result<Hash, Error> {
     let (i, serialized) = (invocation.0, invocation.1);
     verify_invocation(&i.invocation).await?;
 
     let now = OffsetDateTime::now_utc();
-    validate(db, &i, Some(now)).await?;
+    validate(db, &i, Some(now), auth_graph).await?;
 
     save(db, i, Some(now), serialized, ops, encryption).await
 }
@@ -166,7 +169,7 @@ pub async fn verify_and_authorize<C: ConnectionTrait>(
     now: OffsetDateTime,
 ) -> Result<(), Error> {
     verify_invocation(&invocation.invocation).await?;
-    validate(db, invocation, Some(now)).await
+    validate(db, invocation, Some(now), None).await
 }
 
 // verify parenthood and authorization
@@ -174,6 +177,7 @@ async fn validate<C: ConnectionTrait>(
     db: &C,
     invocation: &util::InvocationInfo,
     time: Option<OffsetDateTime>,
+    auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
 ) -> Result<(), Error> {
     // get caps which rely on delegated caps
     let dependant_caps: Vec<_> = invocation
@@ -192,19 +196,38 @@ async fn validate<C: ConnectionTrait>(
         (false, true) => Err(InvocationError::MissingParents.into()),
         // dependant caps, parents, check parents
         (false, false) => {
-            // get parents which have
-            let parents = delegation::Entity::find()
-                // the correct id
-                .filter(
-                    delegation::Column::Id.is_in(invocation.parents.iter().map(|c| Hash::from(*c))),
-                )
-                // and also get their abilities
-                .find_with_related(abilities::Entity)
-                .all(db)
-                .await?;
+            // TC-269: batch-load the whole authorization graph once inside
+            // the invocation transaction (parent edges, delegation rows,
+            // cited abilities/caveats, revocations) and run every chain
+            // check against that single consistent snapshot instead of
+            // re-walking the database per parent and per ancestor.
+            let root_ids: Vec<Hash> = invocation.parents.iter().map(|c| Hash::from(*c)).collect();
+            let loaded_graph;
+            let graph = match auth_graph {
+                Some(graph) => graph,
+                None => {
+                    loaded_graph = crate::auth_graph::AuthGraphSnapshot::load(db, &root_ids)
+                        .await
+                        .map_err(|error| match error {
+                            crate::auth_graph::ChainTraversalError::Db(error) => Error::Db(error),
+                            crate::auth_graph::ChainTraversalError::LimitExceeded => {
+                                Error::InvalidInvocation(
+                                    InvocationError::ChainTraversalLimitExceeded,
+                                )
+                            }
+                        })?;
+                    &loaded_graph
+                }
+            };
 
-            if parents.len() != invocation.parents.len() {
-                return Err(InvocationError::MissingParents.into());
+            // every cited parent must resolve to a distinct persisted row
+            let mut cited = std::collections::HashSet::new();
+            let mut parents = Vec::with_capacity(root_ids.len());
+            for id in &root_ids {
+                match graph.delegation(id) {
+                    Some(row) if cited.insert(*id) => parents.push((row, graph.abilities(id))),
+                    _ => return Err(InvocationError::MissingParents.into()),
+                }
             }
 
             // check parent identifies correct invoker
@@ -218,24 +241,16 @@ async fn validate<C: ConnectionTrait>(
 
             // W1 (C): fail-closed on revocation. A revoked leaf rejects the
             // invocation outright; a revoked ANCESTOR in the cited chain
-            // rejects descendants. Walked on every invocation — we must
+            // rejects descendants. Loaded on every invocation — we must
             // NOT cache "chain ok" across the revocation event
             // (revocation.md §2.3).
             for (p, _) in &parents {
-                if revocation::is_revoked(db, &p.id).await? {
+                if graph.is_revoked(&p.id) {
                     return Err(
                         InvocationError::DelegationRevoked(p.id.to_cid(0x55).to_string()).into(),
                     );
                 }
-                let revoked_ancestor = revocation::first_revoked_ancestor(db, &p.id)
-                    .await
-                    .map_err(|error| match error {
-                        revocation::ChainTraversalError::Db(error) => Error::Db(error),
-                        revocation::ChainTraversalError::LimitExceeded => {
-                            Error::InvalidInvocation(InvocationError::ChainTraversalLimitExceeded)
-                        }
-                    })?;
-                if let Some(ancestor_cid) = revoked_ancestor {
+                if let Some(ancestor_cid) = graph.first_revoked_ancestor(&p.id) {
                     return Err(InvocationError::DelegationAncestorRevoked {
                         ancestor_cid,
                         invoked_cid: p.id.to_cid(0x55).to_string(),
@@ -245,25 +260,15 @@ async fn validate<C: ConnectionTrait>(
 
                 // A child capability cannot outlive or predate any delegation
                 // in the chain that authorizes it. Validate the effective
-                // chain window, not only the directly cited leaf.
-                let chain_ids = revocation::ancestor_chain_ids(db, &p.id).await.map_err(
-                    |error| match error {
-                        revocation::ChainTraversalError::Db(error) => Error::Db(error),
-                        revocation::ChainTraversalError::LimitExceeded => {
-                            Error::InvalidInvocation(InvocationError::ChainTraversalLimitExceeded)
-                        }
-                    },
-                )?;
-                let chain = delegation::Entity::find()
-                    .filter(delegation::Column::Id.is_in(chain_ids.iter().copied()))
-                    .all(db)
-                    .await?;
-                if chain.len() != chain_ids.len() {
-                    return Err(InvocationError::MissingParents.into());
-                }
+                // chain window, not only the directly cited leaf. A chain
+                // node without a persisted delegation row (malformed graph)
+                // fails closed as a missing parent.
                 let chain_now = time.unwrap_or_else(OffsetDateTime::now_utc);
-                if chain.iter().any(|ancestor| {
-                    ancestor
+                for chain_id in graph.chain_ids_from(&p.id) {
+                    let Some(ancestor) = graph.delegation(&chain_id) else {
+                        return Err(InvocationError::MissingParents.into());
+                    };
+                    if ancestor
                         .expiry
                         .map(|expiry| chain_now >= expiry)
                         .unwrap_or(false)
@@ -271,15 +276,16 @@ async fn validate<C: ConnectionTrait>(
                             .not_before
                             .map(|not_before| chain_now < not_before)
                             .unwrap_or(false)
-                }) {
-                    return match dependant_caps.first() {
-                        Some(capability) => Err(InvocationError::UnauthorizedAction(
-                            capability.resource.clone(),
-                            capability.ability.clone(),
-                        )
-                        .into()),
-                        None => Err(InvocationError::MissingParents.into()),
-                    };
+                    {
+                        return match dependant_caps.first() {
+                            Some(capability) => Err(InvocationError::UnauthorizedAction(
+                                capability.resource.clone(),
+                                capability.ability.clone(),
+                            )
+                            .into()),
+                            None => Err(InvocationError::MissingParents.into()),
+                        };
+                    }
                 }
             }
 
@@ -311,7 +317,7 @@ async fn validate<C: ConnectionTrait>(
                 // alias/implication pairs are added.
                 let mut candidates = parents
                     .iter()
-                    .flat_map(|(_, a)| a)
+                    .flat_map(|(_, a)| a.iter())
                     .filter(|pc| {
                         c.resource.extends(&pc.resource)
                             && crate::policy_capability::ability_matches(
@@ -496,7 +502,7 @@ async fn save<C: ConnectionTrait>(
                 epoch,
                 epoch_seq,
             } => {
-                kv_write::Entity::insert(kv_write::ActiveModel::from(kv_write::Model {
+                let write = kv_write::Model {
                     invocation: hash,
                     key: key.clone().into(),
                     value: *value,
@@ -505,9 +511,11 @@ async fn save<C: ConnectionTrait>(
                     seq: *seq,
                     epoch: *epoch,
                     epoch_seq: *epoch_seq,
-                }))
-                .exec(db)
-                .await?;
+                };
+                kv_write::Entity::insert(kv_write::ActiveModel::from(write.clone()))
+                    .exec(db)
+                    .await?;
+                upsert_current_kv(db, write).await?;
             }
             VersionedOperation::KvDelete {
                 key,
@@ -546,6 +554,13 @@ async fn save<C: ConnectionTrait>(
                 }))
                 .exec(db)
                 .await?;
+                delete_current_kv_if_invocation(
+                    db,
+                    &SpaceIdWrap(space.clone()),
+                    key.as_str(),
+                    deleted_invocation_id,
+                )
+                .await?;
             }
         }
     }
@@ -553,6 +568,119 @@ async fn save<C: ConnectionTrait>(
     enqueue_kv_webhook_deliveries(db, hash, &invocation.invoker, issued_at, &parameters).await?;
 
     Ok(hash)
+}
+
+fn incoming_is_newer(existing: current_kv::Entity, incoming: Alias) -> Condition {
+    Condition::any()
+        .add(
+            Expr::col((incoming.clone(), current_kv::Column::Seq))
+                .gt(Expr::col((existing, current_kv::Column::Seq))),
+        )
+        .add(
+            Condition::all()
+                .add(
+                    Expr::col((incoming.clone(), current_kv::Column::Seq))
+                        .equals((existing, current_kv::Column::Seq)),
+                )
+                .add(
+                    Expr::col((incoming.clone(), current_kv::Column::Epoch))
+                        .gt(Expr::col((existing, current_kv::Column::Epoch))),
+                ),
+        )
+        .add(
+            Condition::all()
+                .add(
+                    Expr::col((incoming.clone(), current_kv::Column::Seq))
+                        .equals((existing, current_kv::Column::Seq)),
+                )
+                .add(
+                    Expr::col((incoming.clone(), current_kv::Column::Epoch))
+                        .equals((existing, current_kv::Column::Epoch)),
+                )
+                .add(
+                    Expr::col((incoming, current_kv::Column::EpochSeq))
+                        .gt(Expr::col((existing, current_kv::Column::EpochSeq))),
+                ),
+        )
+}
+
+pub(crate) async fn upsert_current_kv<C: ConnectionTrait>(
+    db: &C,
+    write: kv_write::Model,
+) -> Result<(), DbErr> {
+    let current = current_kv::Model {
+        space: write.space,
+        key: write.key,
+        invocation: write.invocation,
+        seq: write.seq,
+        epoch: write.epoch,
+        epoch_seq: write.epoch_seq,
+        value: write.value,
+        metadata: write.metadata,
+        deleted: false,
+    };
+    let mut conflict = OnConflict::columns([current_kv::Column::Space, current_kv::Column::Key]);
+    if db.get_database_backend() == DatabaseBackend::MySql {
+        // MySQL ignores ON CONFLICT's action WHERE. Keep the ordering fields
+        // until last because ON DUPLICATE KEY assignments are evaluated left
+        // to right.
+        const NEWER: &str = "VALUES(`seq`) > `seq` OR (VALUES(`seq`) = `seq` AND VALUES(`epoch`) > `epoch`) OR (VALUES(`seq`) = `seq` AND VALUES(`epoch`) = `epoch` AND VALUES(`epoch_seq`) > `epoch_seq`)";
+        for (column, incoming) in [
+            (current_kv::Column::Invocation, "invocation"),
+            (current_kv::Column::Value, "value"),
+            (current_kv::Column::Metadata, "metadata"),
+            (current_kv::Column::Deleted, "deleted"),
+            (current_kv::Column::EpochSeq, "epoch_seq"),
+            (current_kv::Column::Epoch, "epoch"),
+            (current_kv::Column::Seq, "seq"),
+        ] {
+            conflict.value(
+                column,
+                Expr::cust(format!(
+                    "CASE WHEN {NEWER} THEN VALUES(`{incoming}`) ELSE `{incoming}` END"
+                )),
+            );
+        }
+    } else {
+        conflict
+            .update_columns([
+                current_kv::Column::Invocation,
+                current_kv::Column::Seq,
+                current_kv::Column::Epoch,
+                current_kv::Column::EpochSeq,
+                current_kv::Column::Value,
+                current_kv::Column::Metadata,
+                current_kv::Column::Deleted,
+            ])
+            .action_cond_where(incoming_is_newer(
+                current_kv::Entity,
+                Alias::new("excluded"),
+            ));
+    }
+    match current_kv::Entity::insert(current_kv::ActiveModel::from(current))
+        .on_conflict(conflict.to_owned())
+        .exec(db)
+        .await
+    {
+        Ok(_) | Err(DbErr::RecordNotInserted) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) async fn delete_current_kv_if_invocation<C: ConnectionTrait>(
+    db: &C,
+    space: &SpaceIdWrap,
+    key: &str,
+    invocation: Hash,
+) -> Result<(), DbErr> {
+    current_kv::Entity::update_many()
+        .col_expr(current_kv::Column::Deleted, Expr::value(true))
+        .filter(current_kv::Column::Space.eq(space.clone()))
+        .filter(current_kv::Column::Key.eq(key))
+        .filter(current_kv::Column::Invocation.eq(invocation))
+        .exec(db)
+        .await
+        .map(|_| ())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -678,9 +806,244 @@ async fn enqueue_kv_webhook_deliveries<C: ConnectionTrait>(
 mod tests {
     use super::*;
     use crate::migrations::Migrator;
-    use sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database};
+    use sea_orm::{
+        ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database, Statement, TransactionTrait,
+    };
     use sea_orm_migration::MigratorTrait;
     use std::collections::BTreeMap;
+    use tinycloud_auth::{
+        resolver::DID_METHODS,
+        resource::SpaceId,
+        ssi::{dids::DIDBuf, jwk::JWK},
+    };
+
+    fn test_space(name: &str) -> SpaceId {
+        let did: DIDBuf = DID_METHODS
+            .generate(&JWK::generate_ed25519().unwrap(), "key")
+            .unwrap();
+        SpaceId::new(did, name.parse().unwrap())
+    }
+
+    fn test_write(space: &SpaceId, key: &str, label: &str, seq: i64) -> kv_write::Model {
+        kv_write::Model {
+            space: SpaceIdWrap(space.clone()),
+            key: key.parse::<Path>().unwrap().into(),
+            invocation: crate::hash::hash(format!("invocation-{label}").as_bytes()),
+            seq,
+            epoch: crate::hash::hash(format!("epoch-{label}").as_bytes()),
+            epoch_seq: 0,
+            value: crate::hash::hash(format!("value-{label}").as_bytes()),
+            metadata: crate::types::Metadata(BTreeMap::from([(
+                "label".to_string(),
+                label.to_string(),
+            )])),
+        }
+    }
+
+    #[tokio::test]
+    async fn projection_updates_are_atomic_ordered_and_version_safe() {
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        db.execute(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "PRAGMA foreign_keys = OFF".to_string(),
+        ))
+        .await
+        .unwrap();
+        let space = test_space("projection-atomic");
+        let newer = test_write(&space, "ordered", "newer", 2);
+        let older = test_write(&space, "ordered", "older", 1);
+
+        for write in [newer.clone(), older.clone()] {
+            let tx = db.begin().await.unwrap();
+            kv_write::ActiveModel::from(write.clone())
+                .insert(&tx)
+                .await
+                .unwrap();
+            upsert_current_kv(&tx, write).await.unwrap();
+            tx.commit().await.unwrap();
+        }
+
+        let current = current_kv::Entity::find_by_id((
+            SpaceIdWrap(space.clone()),
+            "ordered".parse::<Path>().unwrap().into(),
+        ))
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(current.invocation, newer.invocation);
+        assert_eq!(kv_write::Entity::find().count(&db).await.unwrap(), 2);
+
+        for (label, deleted) in [("delete-older", &older), ("delete-newer", &newer)] {
+            let delete_invocation = crate::hash::hash(label.as_bytes());
+            let tx = db.begin().await.unwrap();
+            kv_delete::ActiveModel {
+                invocation_id: Set(delete_invocation),
+                space: Set(SpaceIdWrap(space.clone())),
+                key: Set("ordered".parse::<Path>().unwrap().into()),
+                deleted_invocation_id: Set(deleted.invocation),
+            }
+            .insert(&tx)
+            .await
+            .unwrap();
+            delete_current_kv_if_invocation(
+                &tx,
+                &SpaceIdWrap(space.clone()),
+                "ordered",
+                deleted.invocation,
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+
+            let current = current_kv::Entity::find_by_id((
+                SpaceIdWrap(space.clone()),
+                "ordered".parse::<Path>().unwrap().into(),
+            ))
+            .one(&db)
+            .await
+            .unwrap();
+            if label == "delete-older" {
+                assert_eq!(current.unwrap().invocation, newer.invocation);
+            } else {
+                let watermark = current.unwrap();
+                assert!(watermark.deleted);
+                assert_eq!(watermark.invocation, newer.invocation);
+            }
+        }
+        assert_eq!(kv_write::Entity::find().count(&db).await.unwrap(), 2);
+        assert_eq!(kv_delete::Entity::find().count(&db).await.unwrap(), 2);
+
+        let rolled_back = test_write(&space, "ordered", "rolled-back", 3);
+        let tx = db.begin().await.unwrap();
+        kv_write::ActiveModel::from(rolled_back.clone())
+            .insert(&tx)
+            .await
+            .unwrap();
+        upsert_current_kv(&tx, rolled_back).await.unwrap();
+        tx.rollback().await.unwrap();
+        assert_eq!(kv_write::Entity::find().count(&db).await.unwrap(), 2);
+        let watermark = current_kv::Entity::find_by_id((
+            SpaceIdWrap(space),
+            "ordered".parse::<Path>().unwrap().into(),
+        ))
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(watermark.deleted);
+        assert_eq!(watermark.invocation, newer.invocation);
+    }
+
+    #[tokio::test]
+    async fn older_write_cannot_resurrect_a_deleted_newer_version() {
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        db.execute(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "PRAGMA foreign_keys = OFF".to_string(),
+        ))
+        .await
+        .unwrap();
+        let space = test_space("projection-deleted-watermark");
+        let newer = test_write(&space, "ordered", "newer-deleted", 2);
+        let older = test_write(&space, "ordered", "older-late", 1);
+
+        kv_write::ActiveModel::from(newer.clone())
+            .insert(&db)
+            .await
+            .unwrap();
+        upsert_current_kv(&db, newer.clone()).await.unwrap();
+        kv_delete::ActiveModel {
+            invocation_id: Set(crate::hash::hash(b"delete-newer")),
+            space: Set(SpaceIdWrap(space.clone())),
+            key: Set("ordered".parse::<Path>().unwrap().into()),
+            deleted_invocation_id: Set(newer.invocation),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        delete_current_kv_if_invocation(
+            &db,
+            &SpaceIdWrap(space.clone()),
+            "ordered",
+            newer.invocation,
+        )
+        .await
+        .unwrap();
+
+        kv_write::ActiveModel::from(older.clone())
+            .insert(&db)
+            .await
+            .unwrap();
+        upsert_current_kv(&db, older).await.unwrap();
+
+        let watermark = current_kv::Entity::find_by_id((
+            SpaceIdWrap(space),
+            "ordered".parse::<Path>().unwrap().into(),
+        ))
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(watermark.deleted);
+        assert_eq!(watermark.invocation, newer.invocation);
+    }
+
+    #[tokio::test]
+    async fn conditional_upsert_uses_full_lexicographic_order() {
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let space = test_space("projection-order");
+
+        let seq_newer = test_write(&space, "by-seq", "seq-newer", 2);
+        let seq_older = test_write(&space, "by-seq", "seq-older", 1);
+        for write in [seq_newer.clone(), seq_older] {
+            upsert_current_kv(&db, write).await.unwrap();
+        }
+
+        let mut epoch_a = test_write(&space, "by-epoch", "epoch-a", 3);
+        let mut epoch_b = test_write(&space, "by-epoch", "epoch-b", 3);
+        let (epoch_newer, epoch_older) = if epoch_a.epoch > epoch_b.epoch {
+            (epoch_a.clone(), epoch_b.clone())
+        } else {
+            (epoch_b.clone(), epoch_a.clone())
+        };
+        upsert_current_kv(&db, epoch_newer.clone()).await.unwrap();
+        upsert_current_kv(&db, epoch_older).await.unwrap();
+
+        epoch_a.key = "by-epoch-seq".parse::<Path>().unwrap().into();
+        epoch_b.key = epoch_a.key.clone();
+        epoch_a.epoch = crate::hash::hash(b"same-epoch");
+        epoch_b.epoch = epoch_a.epoch;
+        epoch_a.epoch_seq = 2;
+        epoch_b.epoch_seq = 1;
+        upsert_current_kv(&db, epoch_a.clone()).await.unwrap();
+        upsert_current_kv(&db, epoch_b).await.unwrap();
+
+        for (key, invocation) in [
+            ("by-seq", seq_newer.invocation),
+            ("by-epoch", epoch_newer.invocation),
+            ("by-epoch-seq", epoch_a.invocation),
+        ] {
+            let current = current_kv::Entity::find_by_id((
+                SpaceIdWrap(space.clone()),
+                key.parse::<Path>().unwrap().into(),
+            ))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(current.invocation, invocation);
+        }
+    }
 
     #[tokio::test]
     async fn existing_child_chain_is_rejected_after_parent_revocation() {

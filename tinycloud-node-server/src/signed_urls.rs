@@ -2,7 +2,12 @@ use crate::TinyCloud;
 use base64::{encode_config, URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
-use rocket::http::Status;
+use rocket::{
+    futures::io::AsyncRead,
+    http::{Header, Status},
+    request::{FromRequest, Outcome, Request},
+    response::{Responder, Response},
+};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -11,9 +16,11 @@ use tinycloud_core::{
     hash::Hash,
     models::{delegation, signed_kv_ticket},
     sea_orm::{ColumnTrait, EntityTrait, QueryFilter},
-    types::Resource,
+    storage::{ByteRangeSpec, Content, RangeRead},
+    types::{Metadata, Resource},
     util::InvocationInfo,
 };
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 type TicketIdMac = Hmac<Sha256>;
 
@@ -70,6 +77,185 @@ pub struct SignedKvUrlResponse {
     pub expires_at: String,
 }
 
+pub struct SignedKvRangeHeader(pub ByteRangeSpec);
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for SignedKvRangeHeader {
+    type Error = String;
+
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        match request.headers().get_one("Range") {
+            Some(value) => match parse_byte_range(value) {
+                Ok(range) => Outcome::Success(Self(range)),
+                Err(error) => Outcome::Error((Status::BadRequest, error)),
+            },
+            None => Outcome::Forward(Status::NotFound),
+        }
+    }
+}
+
+pub struct SignedKvIfRangeHeader(pub String);
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for SignedKvIfRangeHeader {
+    type Error = std::convert::Infallible;
+
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        match request.headers().get_one("If-Range") {
+            Some(value) => Outcome::Success(Self(value.trim().to_string())),
+            None => Outcome::Forward(Status::NotFound),
+        }
+    }
+}
+
+pub fn parse_byte_range(value: &str) -> Result<ByteRangeSpec, String> {
+    let range = value
+        .trim()
+        .strip_prefix("bytes=")
+        .ok_or_else(|| "Range must use bytes".to_string())?;
+    if range.contains(',') {
+        return Err("multiple byte ranges are not supported".to_string());
+    }
+    let (start, end) = range
+        .split_once('-')
+        .ok_or_else(|| "Range must contain '-'".to_string())?;
+    match (start.trim(), end.trim()) {
+        ("", "") => Err("Range must include a start or suffix length".to_string()),
+        ("", suffix) => {
+            let length = suffix
+                .parse::<u64>()
+                .map_err(|_| "invalid byte range suffix".to_string())?;
+            if length == 0 {
+                return Err("byte range suffix must be greater than zero".to_string());
+            }
+            Ok(ByteRangeSpec::Suffix { length })
+        }
+        (start, "") => Ok(ByteRangeSpec::From {
+            start: start
+                .parse::<u64>()
+                .map_err(|_| "invalid byte range start".to_string())?,
+        }),
+        (start, end) => {
+            let start = start
+                .parse::<u64>()
+                .map_err(|_| "invalid byte range start".to_string())?;
+            let end = end
+                .parse::<u64>()
+                .map_err(|_| "invalid byte range end".to_string())?;
+            if start > end {
+                return Err("byte range start must not exceed end".to_string());
+            }
+            Ok(ByteRangeSpec::Inclusive { start, end })
+        }
+    }
+}
+
+pub fn if_range_allows_range(ticket_etag: Option<&str>, if_range: Option<&str>) -> bool {
+    if_range.is_none_or(|if_range| ticket_etag == Some(if_range))
+}
+
+pub enum SignedKvReadResponse<R> {
+    Full {
+        metadata: Metadata,
+        hash: Hash,
+        content: Content<R>,
+    },
+    Partial {
+        metadata: Metadata,
+        hash: Hash,
+        total_size: u64,
+        range: tinycloud_core::storage::ResolvedByteRange,
+        content: Content<R>,
+    },
+    Unsatisfiable {
+        hash: Hash,
+        total_size: u64,
+    },
+}
+
+impl<R> SignedKvReadResponse<R> {
+    pub fn from_range(metadata: Metadata, hash: Hash, read: RangeRead<R>) -> Self {
+        match read {
+            RangeRead::Content {
+                total_size,
+                range,
+                content,
+            } => Self::Partial {
+                metadata,
+                hash,
+                total_size,
+                range,
+                content,
+            },
+            RangeRead::Unsatisfiable { total_size } => Self::Unsatisfiable { hash, total_size },
+        }
+    }
+}
+
+impl<'r, R> Responder<'r, 'static> for SignedKvReadResponse<R>
+where
+    R: 'static + AsyncRead + Send,
+{
+    fn respond_to(self, _: &'r Request<'_>) -> rocket::response::Result<'static> {
+        let mut response = Response::build();
+        response.header(Header::new("Accept-Ranges", "bytes"));
+        response.header(Header::new("Cache-Control", "private, no-store"));
+
+        match self {
+            Self::Full {
+                metadata,
+                hash,
+                content,
+            } => {
+                crate::prometheus::observe_signed_kv_transfer(content.len(), content.len());
+                add_object_headers(&mut response, metadata);
+                response.header(Header::new("ETag", etag(&hash)));
+                response.header(Header::new("Content-Length", content.len().to_string()));
+                response.streamed_body(content.compat());
+            }
+            Self::Partial {
+                metadata,
+                hash,
+                total_size,
+                range,
+                content,
+            } => {
+                crate::prometheus::observe_signed_kv_transfer(total_size, content.len());
+                add_object_headers(&mut response, metadata);
+                response.status(Status::PartialContent);
+                response.header(Header::new("ETag", etag(&hash)));
+                response.header(Header::new(
+                    "Content-Range",
+                    format!("bytes {}-{}/{}", range.start(), range.end(), total_size),
+                ));
+                response.header(Header::new("Content-Length", content.len().to_string()));
+                response.streamed_body(content.compat());
+            }
+            Self::Unsatisfiable { hash, total_size } => {
+                response.status(Status::RangeNotSatisfiable);
+                response.header(Header::new("ETag", etag(&hash)));
+                response.header(Header::new(
+                    "Content-Range",
+                    format!("bytes */{total_size}"),
+                ));
+            }
+        }
+        Ok(response.finalize())
+    }
+}
+
+fn add_object_headers(response: &mut rocket::response::Builder<'_>, metadata: Metadata) {
+    for (key, value) in metadata.0 {
+        if !key.eq_ignore_ascii_case("content-length") {
+            response.header(Header::new(key, value));
+        }
+    }
+}
+
+fn etag(hash: &Hash) -> String {
+    format!("\"blake3-{}\"", hex::encode(hash.as_ref()))
+}
+
 pub async fn mint_signed_kv_url(
     invocation: &InvocationInfo,
     request: SignedKvUrlRequest,
@@ -99,6 +285,35 @@ pub async fn mint_signed_kv_url(
         ));
     }
 
+    let requested_hash = request
+        .content_hash
+        .as_deref()
+        .map(normalize_content_hash)
+        .transpose()?;
+    let etag_hash = request
+        .etag
+        .as_deref()
+        .map(normalize_content_hash)
+        .transpose()?;
+    if let (Some(requested_hash), Some(etag_hash)) = (&requested_hash, &etag_hash) {
+        if requested_hash != etag_hash {
+            return Err((
+                Status::BadRequest,
+                "contentHash and ETag must identify the same object".to_string(),
+            ));
+        }
+    }
+    let content_hash = match requested_hash.or(etag_hash) {
+        Some(hash) => hash,
+        None => tinycloud
+            .kv_metadata_with_hash(&space, &path)
+            .await
+            .map_err(|e| (Status::InternalServerError, e.to_string()))?
+            .map(|(_, hash)| hex::encode(hash.as_ref()))
+            .ok_or_else(|| (Status::NotFound, "Key not found".to_string()))?,
+    };
+    let etag = format!("\"blake3-{content_hash}\"");
+
     let now = OffsetDateTime::now_utc();
     let invocation_exp = invocation_expiry(invocation);
     let parent_expiry = find_parent_expiry(invocation, tinycloud).await?;
@@ -127,12 +342,6 @@ pub async fn mint_signed_kv_url(
     let parent_expires_at = parent_expiry
         .map(|expiry| unix_timestamp(expiry).and_then(format_timestamp))
         .transpose()?;
-    let content_hash = request
-        .content_hash
-        .as_deref()
-        .map(normalize_content_hash)
-        .transpose()?;
-    let etag = request.etag.map(|etag| etag.trim().to_string());
     let parent_cids_json = if invocation.parents.is_empty() {
         None
     } else {
@@ -160,8 +369,8 @@ pub async fn mint_signed_kv_url(
         expires_at: expires_at.clone(),
         invocation_expires_at,
         parent_expires_at,
-        content_hash,
-        etag,
+        content_hash: Some(content_hash),
+        etag: Some(etag),
         parent_cids_json,
     };
     tinycloud
@@ -361,6 +570,8 @@ async fn find_parent_expiry(
 mod tests {
     use super::*;
     use anyhow::Result;
+    use futures::io::Cursor;
+    use rocket::local::asynchronous::Client;
     use tempfile::TempDir;
     use tinycloud_auth::{
         authorization::{make_invocation, InvocationOptions},
@@ -503,6 +714,75 @@ mod tests {
         }
     }
 
+    #[get("/partial")]
+    fn partial_response() -> SignedKvReadResponse<Cursor<Vec<u8>>> {
+        let bytes = b"world".to_vec();
+        SignedKvReadResponse::Partial {
+            metadata: Metadata(
+                [("content-type".to_string(), "audio/wav".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            hash: hash(b"hello world"),
+            total_size: 11,
+            range: ByteRangeSpec::Inclusive { start: 6, end: 10 }
+                .resolve(11)
+                .unwrap(),
+            content: Content::new(bytes.len() as u64, Cursor::new(bytes)),
+        }
+    }
+
+    #[test]
+    fn parses_single_http_byte_ranges() {
+        assert_eq!(
+            parse_byte_range("bytes=10-19").unwrap(),
+            ByteRangeSpec::Inclusive { start: 10, end: 19 }
+        );
+        assert_eq!(
+            parse_byte_range("bytes=10-").unwrap(),
+            ByteRangeSpec::From { start: 10 }
+        );
+        assert_eq!(
+            parse_byte_range("bytes=-10").unwrap(),
+            ByteRangeSpec::Suffix { length: 10 }
+        );
+        assert!(parse_byte_range("bytes=0-1,4-5").is_err());
+        assert!(parse_byte_range("items=0-1").is_err());
+        assert!(parse_byte_range("bytes=20-10").is_err());
+    }
+
+    #[test]
+    fn if_range_requires_the_bound_etag() {
+        let etag = "\"blake3-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"";
+        assert!(if_range_allows_range(Some(etag), None));
+        assert!(if_range_allows_range(Some(etag), Some(etag)));
+        assert!(!if_range_allows_range(Some(etag), Some("\"other\"")));
+        assert!(!if_range_allows_range(None, Some(etag)));
+    }
+
+    #[tokio::test]
+    async fn partial_response_has_range_etag_and_exact_body_length() -> Result<()> {
+        let client = Client::tracked(rocket::build().mount("/", routes![partial_response])).await?;
+        let response = client.get("/partial").dispatch().await;
+        assert_eq!(response.status(), Status::PartialContent);
+        assert_eq!(response.headers().get_one("Accept-Ranges"), Some("bytes"));
+        assert_eq!(
+            response.headers().get_one("Content-Range"),
+            Some("bytes 6-10/11")
+        );
+        assert_eq!(response.headers().get_one("Content-Length"), Some("5"));
+        assert_eq!(
+            response.headers().get_one("Content-Type"),
+            Some("audio/wav")
+        );
+        assert_eq!(
+            response.headers().get_one("ETag"),
+            Some(etag(&hash(b"hello world")).as_str())
+        );
+        assert_eq!(response.into_bytes().await.unwrap(), b"world");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn signed_kv_ticket_rejects_expired_ticket() -> Result<()> {
         let (_invocation, space) = test_invocation("documents/audio.wav")?;
@@ -530,7 +810,7 @@ mod tests {
                 path: "documents/audio.wav".to_string(),
                 ttl_seconds: Some(60),
                 max_uses: None,
-                content_hash: None,
+                content_hash: Some(hex::encode(hash(b"object bytes").as_ref())),
                 etag: None,
             },
             &runtime,
@@ -550,6 +830,12 @@ mod tests {
             validate_signed_kv_ticket(&ticket).expect("persisted ticket should validate");
         assert_eq!(ticket_space, space);
         assert_eq!(ticket_path.as_str(), "documents/audio.wav");
+        let expected_hash = hex::encode(hash(b"object bytes").as_ref());
+        assert_eq!(ticket.content_hash.as_deref(), Some(expected_hash.as_str()));
+        assert_eq!(
+            ticket.etag.as_deref(),
+            Some(format!("\"blake3-{expected_hash}\"").as_str())
+        );
         Ok(())
     }
 
@@ -568,7 +854,7 @@ mod tests {
                 path: "documents/audio.wav".to_string(),
                 ttl_seconds: Some(60),
                 max_uses: None,
-                content_hash: None,
+                content_hash: Some(hex::encode(hash(b"object bytes").as_ref())),
                 etag: None,
             },
             &runtime,
@@ -631,6 +917,35 @@ mod tests {
         )
         .await
         .expect_err("maxUses should be rejected");
+
+        assert_eq!(err.0, Status::BadRequest);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_mismatched_content_hash_and_etag() -> Result<()> {
+        let tinycloud = test_tinycloud().await?;
+        let runtime = SignedUrlRuntime::new([7u8; 32]);
+        let (invocation, space) = test_invocation("documents/audio.wav")?;
+
+        let err = mint_signed_kv_url(
+            &invocation,
+            SignedKvUrlRequest {
+                space: space.to_string(),
+                path: "documents/audio.wav".to_string(),
+                ttl_seconds: Some(60),
+                max_uses: None,
+                content_hash: Some(hex::encode(hash(b"object bytes").as_ref())),
+                etag: Some(format!(
+                    "\"blake3-{}\"",
+                    hex::encode(hash(b"other").as_ref())
+                )),
+            },
+            &runtime,
+            &tinycloud,
+        )
+        .await
+        .expect_err("mismatched object bindings must be rejected");
 
         assert_eq!(err.0, Status::BadRequest);
         Ok(())

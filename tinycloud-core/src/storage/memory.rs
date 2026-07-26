@@ -1,11 +1,13 @@
 use crate::hash::Hash;
 use crate::storage::{
-    Content, HashBuffer, ImmutableDeleteStore, ImmutableReadStore, ImmutableStaging,
-    ImmutableWriteStore, KeyedWriteError, StorageConfig, StorageSetup, StoreSize, VecReadError,
+    ByteRangeSpec, Content, HashBuffer, ImmutableDeleteStore, ImmutableReadStore, ImmutableStaging,
+    ImmutableWriteStore, KeyedWriteError, RangeRead, StorageConfig, StorageSetup, StoreSize,
+    VecReadError,
 };
 use dashmap::DashMap;
 use futures::io::Cursor;
 use sea_orm_migration::async_trait::async_trait;
+use std::time::Instant;
 use std::{io, sync::Arc};
 use tinycloud_auth::resource::SpaceId;
 
@@ -76,7 +78,8 @@ impl ImmutableReadStore for MemoryStore {
         space: &SpaceId,
         id: &Hash,
     ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
-        match self.spaces.get(space) {
+        let start = Instant::now();
+        let result = match self.spaces.get(space) {
             Some(o) => match o.get(id) {
                 Some(data) => {
                     let len = data.len() as u64;
@@ -86,7 +89,37 @@ impl ImmutableReadStore for MemoryStore {
                 None => Ok(None),
             },
             None => Ok(None),
-        }
+        };
+        crate::telemetry::observe_stage(
+            crate::telemetry::InvocationStage::BlockRead,
+            crate::telemetry::StageOutcome::from(result.is_ok()),
+            start.elapsed(),
+        );
+        result
+    }
+
+    async fn read_range(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        range: ByteRangeSpec,
+    ) -> Result<Option<RangeRead<Self::Readable>>, Self::Error> {
+        let Some(space) = self.spaces.get(space) else {
+            return Ok(None);
+        };
+        let Some(data) = space.get(id) else {
+            return Ok(None);
+        };
+        let total_size = data.len() as u64;
+        let Some(range) = range.resolve(total_size) else {
+            return Ok(Some(RangeRead::Unsatisfiable { total_size }));
+        };
+        let bytes = data[range.start() as usize..=range.end() as usize].to_vec();
+        Ok(Some(RangeRead::Content {
+            total_size,
+            range,
+            content: Content::new(bytes.len() as u64, Cursor::new(bytes)),
+        }))
     }
 
     async fn read_to_vec(
@@ -110,6 +143,7 @@ impl ImmutableWriteStore<MemoryStaging> for MemoryStore {
         space: &SpaceId,
         mut staged: HashBuffer<Vec<u8>>,
     ) -> Result<Hash, Self::Error> {
+        let start = Instant::now();
         let hash = staged.hash();
         let (_hasher, staging_buffer) = staged.into_inner();
         let data = staging_buffer;
@@ -121,6 +155,11 @@ impl ImmutableWriteStore<MemoryStaging> for MemoryStore {
             .clone();
 
         space_storage.insert(hash, data);
+        crate::telemetry::observe_stage(
+            crate::telemetry::InvocationStage::BlockWrite,
+            crate::telemetry::StageOutcome::Ok,
+            start.elapsed(),
+        );
         Ok(hash)
     }
 
@@ -130,7 +169,13 @@ impl ImmutableWriteStore<MemoryStaging> for MemoryStore {
         mut staged: HashBuffer<Vec<u8>>,
         hash: &Hash,
     ) -> Result<(), KeyedWriteError<Self::Error>> {
+        let start = Instant::now();
         if hash != &staged.hash() {
+            crate::telemetry::observe_stage(
+                crate::telemetry::InvocationStage::BlockWrite,
+                crate::telemetry::StageOutcome::Error,
+                start.elapsed(),
+            );
             return Err(KeyedWriteError::IncorrectHash);
         };
         let (_hasher, staging_buffer) = staged.into_inner();
@@ -143,6 +188,11 @@ impl ImmutableWriteStore<MemoryStaging> for MemoryStore {
             .clone();
 
         space_storage.insert(*hash, data);
+        crate::telemetry::observe_stage(
+            crate::telemetry::InvocationStage::BlockWrite,
+            crate::telemetry::StageOutcome::Ok,
+            start.elapsed(),
+        );
         Ok(())
     }
 }

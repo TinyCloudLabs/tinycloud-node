@@ -52,6 +52,12 @@ use hooks::HookRuntime;
 use invocation_replay::InvocationReplayCache;
 use node_control::control::ControlPlaneHandle;
 use quota::QuotaCache;
+#[cfg(feature = "tc-bench-v1")]
+use routes::tc_bench::{
+    auth_verify as tc_bench_auth_verify, block_get as tc_bench_block_get,
+    block_put as tc_bench_block_put, health as tc_bench_health, kv_get as tc_bench_kv_get,
+    kv_put as tc_bench_kv_put, BenchState,
+};
 use routes::{
     admin::{delete_quota, get_quota, get_usage, list_quotas, set_quota},
     attestation::attestation,
@@ -194,6 +200,15 @@ pub async fn app_with_control(
         revoke_encryption_network,
     ];
     routes.extend(share_email::public_routes());
+    #[cfg(feature = "tc-bench-v1")]
+    routes.extend(rocket::routes![
+        tc_bench_auth_verify,
+        tc_bench_kv_put,
+        tc_bench_kv_get,
+        tc_bench_block_put,
+        tc_bench_block_get,
+        tc_bench_health,
+    ]);
 
     let key_setup: StaticSecret = resolve_keys(&tinycloud_config.keys).await?;
     let webhook_encryption =
@@ -242,11 +257,10 @@ pub async fn app_with_control(
     let mut connect_opts = ConnectOptions::from(database);
     let is_sqlite = database.starts_with("sqlite");
     if is_sqlite {
-        // SQLite cannot handle concurrent write transactions — two DEFERRED
-        // transactions deadlock when both try to upgrade to writers.  Use a
-        // single connection to serialize writes, and enable WAL mode so reads
-        // outside transactions remain concurrent.
-        connect_opts.max_connections(1);
+        // WAL permits readers to progress while the core's shared writer lock
+        // serializes mutations and durable read-audit batches. A one-connection
+        // pool made every authenticated read wait behind audit writes.
+        connect_opts.max_connections(16);
         connect_opts.map_sqlx_sqlite_opts(|opts| {
             opts.create_if_missing(true)
                 .pragma("journal_mode", "WAL")
@@ -307,6 +321,13 @@ pub async fn app_with_control(
     // `database_artifact` table now exists (seeding before migrations would
     // fail boot on a fresh datadir). Runs before Rocket serves any request.
     sql_sizes.seed_from(&seed_conn).await?;
+    #[cfg(feature = "tc-bench-v1")]
+    let bench_state = BenchState::new(
+        &tinycloud_config.tc_bench,
+        seed_conn.clone(),
+        if is_sqlite { 1 } else { 100 },
+    )
+    .await?;
 
     let sql_service = SqlService::new(
         tinycloud_config.storage.sql.path.clone().expect("resolved"),
@@ -366,7 +387,8 @@ pub async fn app_with_control(
         tinycloud_config.storage.limit,
         std::env::var("TINYCLOUD_QUOTA_URL").ok(),
     );
-    let invocation_replay_cache = InvocationReplayCache::new();
+    let invocation_replay_cache = InvocationReplayCache::new(seed_conn.clone());
+    let replay_cleanup = invocation_replay_cache.clone();
 
     let rate_limiter = RateLimiter::new(&tinycloud_config.public_spaces);
     let webhook_dispatcher = WebhookDispatcher::new(
@@ -382,8 +404,38 @@ pub async fn app_with_control(
         .attach(tracing::TracingFairing {
             header_name: tinycloud_config.log.tracing.traceheader,
         })
+        .attach(AdHoc::on_liftoff(
+            "invocation-replay-cleanup",
+            move |rocket| {
+                let replay_cleanup = replay_cleanup.clone();
+                let shutdown = rocket.shutdown();
+                Box::pin(async move {
+                    tokio::spawn(async move {
+                        let _ = replay_cleanup
+                            .cleanup_expired(time::OffsetDateTime::now_utc())
+                            .await;
+                        let period = std::time::Duration::from_secs(60);
+                        let mut interval =
+                            tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+                        tokio::pin!(shutdown);
+                        loop {
+                            tokio::select! {
+                                _ = interval.tick() => {
+                                    let _ = replay_cleanup
+                                        .cleanup_expired(time::OffsetDateTime::now_utc())
+                                        .await;
+                                }
+                                _ = &mut shutdown => break,
+                            }
+                        }
+                    });
+                })
+            },
+        ))
         .manage(tinycloud)
         .manage(sql_service);
+    #[cfg(feature = "tc-bench-v1")]
+    let rocket = rocket.manage(bench_state);
     #[cfg(feature = "duckdb")]
     let rocket = rocket.manage(duckdb_service);
     let rocket = rocket

@@ -16,7 +16,7 @@ use futures::{
 use rocket::{async_trait, http::hyper::Uri};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
-use std::{collections::HashMap, io::Error as IoError, ops::AddAssign};
+use std::{collections::HashMap, io::Error as IoError, ops::AddAssign, time::Instant};
 use tinycloud_auth::resource::SpaceId;
 use tinycloud_core::{hash::Hash, storage::*};
 
@@ -135,6 +135,8 @@ pub enum S3StoreError {
     Bytestream(#[from] ByteStreamError),
     #[error(transparent)]
     Length(#[from] std::num::TryFromIntError),
+    #[error("invalid S3 Content-Range response: {0}")]
+    InvalidContentRange(String),
 }
 
 #[async_trait]
@@ -168,6 +170,7 @@ impl ImmutableReadStore for S3BlockStore {
         space: &SpaceId,
         id: &Hash,
     ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
+        let start = Instant::now();
         let res = self
             .client
             .get_object()
@@ -175,7 +178,7 @@ impl ImmutableReadStore for S3BlockStore {
             .key(self.key(space, id))
             .send()
             .await;
-        match res {
+        let result = match res {
             Ok(o) => Ok(Some(Content::new(
                 o.content_length().try_into()?,
                 o.body
@@ -191,8 +194,109 @@ impl ImmutableReadStore for S3BlockStore {
                 ..
             }) => Ok(None),
             Err(e) => Err(S3Error::from(e).into()),
+        };
+        crate::prometheus::observe_stage(
+            crate::prometheus::InvocationStage::BlockRead,
+            crate::prometheus::StageOutcome::from(result.is_ok()),
+            start.elapsed(),
+        );
+        result
+    }
+
+    async fn read_range(
+        &self,
+        space: &SpaceId,
+        id: &Hash,
+        range: ByteRangeSpec,
+    ) -> Result<Option<RangeRead<Self::Readable>>, Self::Error> {
+        let key = self.key(space, id);
+        let output = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .range(range.to_http_value())
+            .send()
+            .await;
+        match output {
+            Ok(output) => {
+                let content_range = output.content_range().ok_or_else(|| {
+                    S3StoreError::InvalidContentRange("missing header".to_string())
+                })?;
+                let (range, total_size) = parse_content_range(content_range)?;
+                let content = Content::new(
+                    range.len(),
+                    output
+                        .body
+                        .map_err(convert as fn(ByteStreamError) -> IoError)
+                        .into_async_read(),
+                );
+                Ok(Some(RangeRead::Content {
+                    total_size,
+                    range,
+                    content,
+                }))
+            }
+            Err(SdkError::ServiceError {
+                err:
+                    GetObjectError {
+                        kind: GetObjectErrorKind::NoSuchKey(_),
+                        ..
+                    },
+                ..
+            }) => return Ok(None),
+            Err(SdkError::ServiceError { err, .. }) if err.code() == Some("InvalidRange") => {
+                let head = self
+                    .client
+                    .head_object()
+                    .bucket(&self.bucket)
+                    .key(self.key(space, id))
+                    .send()
+                    .await;
+                match head {
+                    Ok(output) => Ok(Some(RangeRead::Unsatisfiable {
+                        total_size: output.content_length().try_into()?,
+                    })),
+                    Err(SdkError::ServiceError {
+                        err:
+                            HeadObjectError {
+                                kind: HeadObjectErrorKind::NotFound(_),
+                                ..
+                            },
+                        ..
+                    }) => Ok(None),
+                    Err(error) => Err(S3Error::from(error).into()),
+                }
+            }
+            Err(error) => Err(S3Error::from(error).into()),
         }
     }
+}
+
+fn parse_content_range(value: &str) -> Result<(ResolvedByteRange, u64), S3StoreError> {
+    let value = value
+        .strip_prefix("bytes ")
+        .ok_or_else(|| S3StoreError::InvalidContentRange(format!("unsupported value {value:?}")))?;
+    let (bounds, total_size) = value
+        .split_once('/')
+        .ok_or_else(|| S3StoreError::InvalidContentRange(format!("missing total in {value:?}")))?;
+    let (start, end) = bounds
+        .split_once('-')
+        .ok_or_else(|| S3StoreError::InvalidContentRange(format!("missing bounds in {value:?}")))?;
+    let start = start
+        .parse::<u64>()
+        .map_err(|_| S3StoreError::InvalidContentRange(format!("invalid start in {value:?}")))?;
+    let end = end
+        .parse::<u64>()
+        .map_err(|_| S3StoreError::InvalidContentRange(format!("invalid end in {value:?}")))?;
+    let total_size = total_size
+        .parse::<u64>()
+        .map_err(|_| S3StoreError::InvalidContentRange(format!("invalid total in {value:?}")))?;
+    let range = ByteRangeSpec::Inclusive { start, end }
+        .resolve(total_size)
+        .filter(|range| range.start() == start && range.end() == end)
+        .ok_or_else(|| S3StoreError::InvalidContentRange(format!("invalid range in {value:?}")))?;
+    Ok((range, total_size))
 }
 
 #[async_trait]
@@ -203,22 +307,32 @@ impl ImmutableWriteStore<memory::MemoryStaging> for S3BlockStore {
         space: &SpaceId,
         staged: HashBuffer<<memory::MemoryStaging as ImmutableStaging>::Writable>,
     ) -> Result<Hash, Self::Error> {
-        let (mut h, f) = staged.into_inner();
-        let hash = h.finalize();
+        let start = Instant::now();
+        let result = async move {
+            let (mut h, f) = staged.into_inner();
+            let hash = h.finalize();
 
-        if !self.contains(space, &hash).await? {
-            let size = f.len() as u64;
-            self.client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(self.key(space, &hash))
-                .body(ByteStream::from(f))
-                .send()
-                .await
-                .map_err(S3Error::from)?;
-            self.increment_size(space, size).await;
+            if !self.contains(space, &hash).await? {
+                let size = f.len() as u64;
+                self.client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(self.key(space, &hash))
+                    .body(ByteStream::from(f))
+                    .send()
+                    .await
+                    .map_err(S3Error::from)?;
+                self.increment_size(space, size).await;
+            }
+            Ok(hash)
         }
-        Ok(hash)
+        .await;
+        crate::prometheus::observe_stage(
+            crate::prometheus::InvocationStage::BlockWrite,
+            crate::prometheus::StageOutcome::from(result.is_ok()),
+            start.elapsed(),
+        );
+        result
     }
 }
 
@@ -230,24 +344,34 @@ impl ImmutableWriteStore<file_system::TempFileSystemStage> for S3BlockStore {
         space: &SpaceId,
         staged: HashBuffer<<file_system::TempFileSystemStage as ImmutableStaging>::Writable>,
     ) -> Result<Hash, Self::Error> {
-        let (mut h, f) = staged.into_inner();
-        let hash = h.finalize();
+        let start = Instant::now();
+        let result = async move {
+            let (mut h, f) = staged.into_inner();
+            let hash = h.finalize();
 
-        if !self.contains(space, &hash).await? {
-            let size = f.size().await?;
-            let (_file, path) = f.into_inner();
+            if !self.contains(space, &hash).await? {
+                let size = f.size().await?;
+                let (_file, path) = f.into_inner();
 
-            self.client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(self.key(space, &hash))
-                .body(ByteStream::from_path(&path).await?)
-                .send()
-                .await
-                .map_err(S3Error::from)?;
-            self.increment_size(space, size).await;
+                self.client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(self.key(space, &hash))
+                    .body(ByteStream::from_path(&path).await?)
+                    .send()
+                    .await
+                    .map_err(S3Error::from)?;
+                self.increment_size(space, size).await;
+            }
+            Ok(hash)
         }
-        Ok(hash)
+        .await;
+        crate::prometheus::observe_stage(
+            crate::prometheus::InvocationStage::BlockWrite,
+            crate::prometheus::StageOutcome::from(result.is_ok()),
+            start.elapsed(),
+        );
+        result
     }
 }
 
@@ -261,39 +385,49 @@ impl ImmutableWriteStore<either::Either<file_system::TempFileSystemStage, memory
         space: &SpaceId,
         staged: HashBuffer<<either::Either<file_system::TempFileSystemStage, memory::MemoryStaging> as ImmutableStaging>::Writable>,
     ) -> Result<Hash, Self::Error> {
-        let (mut h, f) = staged.into_inner();
-        let hash = h.finalize();
+        let start = Instant::now();
+        let result = async move {
+            let (mut h, f) = staged.into_inner();
+            let hash = h.finalize();
 
-        if !self.contains(space, &hash).await? {
-            match f {
-                AsyncEither::Left(t_file) => {
-                    let size = t_file.size().await?;
-                    let (_file, path) = t_file.into_inner();
-                    self.client
-                        .put_object()
-                        .bucket(&self.bucket)
-                        .key(self.key(space, &hash))
-                        .body(ByteStream::from_path(&path).await?)
-                        .send()
-                        .await
-                        .map_err(S3Error::from)?;
-                    self.increment_size(space, size).await;
+            if !self.contains(space, &hash).await? {
+                match f {
+                    AsyncEither::Left(t_file) => {
+                        let size = t_file.size().await?;
+                        let (_file, path) = t_file.into_inner();
+                        self.client
+                            .put_object()
+                            .bucket(&self.bucket)
+                            .key(self.key(space, &hash))
+                            .body(ByteStream::from_path(&path).await?)
+                            .send()
+                            .await
+                            .map_err(S3Error::from)?;
+                        self.increment_size(space, size).await;
+                    }
+                    AsyncEither::Right(b) => {
+                        let size = b.len() as u64;
+                        self.client
+                            .put_object()
+                            .bucket(&self.bucket)
+                            .key(self.key(space, &hash))
+                            .body(ByteStream::from(b))
+                            .send()
+                            .await
+                            .map_err(S3Error::from)?;
+                        self.increment_size(space, size).await;
+                    }
                 }
-                AsyncEither::Right(b) => {
-                    let size = b.len() as u64;
-                    self.client
-                        .put_object()
-                        .bucket(&self.bucket)
-                        .key(self.key(space, &hash))
-                        .body(ByteStream::from(b))
-                        .send()
-                        .await
-                        .map_err(S3Error::from)?;
-                    self.increment_size(space, size).await;
-                }
-            }
-        };
-        Ok(hash)
+            };
+            Ok(hash)
+        }
+        .await;
+        crate::prometheus::observe_stage(
+            crate::prometheus::InvocationStage::BlockWrite,
+            crate::prometheus::StageOutcome::from(result.is_ok()),
+            start.elapsed(),
+        );
+        result
     }
 }
 
@@ -344,5 +478,20 @@ impl StoreSize for S3BlockStore {
     type Error = S3StoreError;
     async fn total_size(&self, space: &SpaceId) -> Result<Option<u64>, Self::Error> {
         Ok(self.sizes.get_size(space).await)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_s3_content_range() {
+        let (range, total_size) = parse_content_range("bytes 1048576-2097151/67108864").unwrap();
+        assert_eq!(range.start(), 1_048_576);
+        assert_eq!(range.end(), 2_097_151);
+        assert_eq!(range.len(), 1_048_576);
+        assert_eq!(total_size, 67_108_864);
+        assert!(parse_content_range("bytes */67108864").is_err());
     }
 }

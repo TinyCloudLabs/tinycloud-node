@@ -1,6 +1,6 @@
 use anyhow::Result;
 use base64::{decode_config, encode_config, URL_SAFE_NO_PAD};
-use futures::io::AsyncWriteExt;
+use futures::io::{AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt};
 use hmac::{Hmac, Mac};
 use percent_encoding::percent_decode_str;
 use rocket::{data::ToByteUnit, http::Status, response::status::Custom, serde::json::Json, State};
@@ -25,8 +25,10 @@ use crate::{
     quota::QuotaCache,
     routes::public::is_public_space,
     signed_urls::{
-        load_signed_kv_ticket, mint_signed_kv_url, validate_signed_kv_hash_binding,
-        validate_signed_kv_ticket, SignedKvUrlRequest, SignedKvUrlResponse, SignedUrlRuntime,
+        if_range_allows_range, load_signed_kv_ticket, mint_signed_kv_url,
+        validate_signed_kv_hash_binding, validate_signed_kv_ticket, SignedKvIfRangeHeader,
+        SignedKvRangeHeader, SignedKvReadResponse, SignedKvUrlRequest, SignedKvUrlResponse,
+        SignedUrlRuntime,
     },
     tracing::TracingSpan,
     BlockStage, BlockStores, TinyCloud,
@@ -50,8 +52,8 @@ use tinycloud_core::{
     types::{Ability, DelegationQuery, DelegationQueryPage, Metadata, Resource},
     util::{Capability, DelegationInfo, InvocationInfo, RevocationInfo},
     write_hooks::{db_table_path, hook_delivery_id, subscription_matches_event, TouchedTables},
-    DelegationStatus, InvocationOutcome, KvInvokeOptions, KvPrecondition, TransactResult, TxError,
-    TxStoreError,
+    DelegationStatus, InvocationOutcome, KvBatchReadItem, KvBatchReadValue, KvInvokeOptions,
+    KvPrecondition, TransactResult, TxError, TxStoreError,
 };
 
 pub mod admin;
@@ -63,6 +65,8 @@ pub mod public;
 pub mod tc_bench;
 pub mod util;
 use util::LimitedReader;
+
+const MAX_KV_BATCH_READ_ITEMS: usize = 100;
 
 fn retryable_sqlstate(code: &str) -> bool {
     matches!(code, "40001" | "40P01")
@@ -220,11 +224,10 @@ pub async fn create_signed_kv_url(
 #[get("/signed/kv/<ticket_id>")]
 pub async fn signed_kv_get(
     ticket_id: &str,
+    range: Option<SignedKvRangeHeader>,
+    if_range: Option<SignedKvIfRangeHeader>,
     tinycloud: &State<TinyCloud>,
-) -> Result<
-    KVResponse<tinycloud_core::storage::Content<<BlockStores as ImmutableReadStore>::Readable>>,
-    (Status, String),
-> {
+) -> Result<SignedKvReadResponse<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
     let load_start = Instant::now();
     let load_result = load_signed_kv_ticket(tinycloud.inner(), ticket_id).await;
     crate::prometheus::observe_span(
@@ -235,7 +238,34 @@ pub async fn signed_kv_get(
     let ticket = load_result?;
     let (space_id, key) = validate_signed_kv_ticket(&ticket)?;
 
+    let range = range.and_then(|range| {
+        if if_range_allows_range(
+            ticket.etag.as_deref(),
+            if_range.as_ref().map(|if_range| if_range.0.as_str()),
+        ) {
+            Some(range.0)
+        } else {
+            None
+        }
+    });
+
     let kv_start = Instant::now();
+    if let Some(range) = range {
+        let kv_result = tinycloud.kv_get_range(&space_id, &key, range).await;
+        crate::prometheus::observe_span(
+            "server.signed_kv.kv_get_range",
+            if kv_result.is_ok() { "ok" } else { "error" },
+            kv_start.elapsed(),
+        );
+        return match kv_result.map_err(|e| (Status::InternalServerError, e.to_string()))? {
+            Some((metadata, hash, content)) => {
+                validate_signed_kv_hash_binding(&ticket, &hash)?;
+                Ok(SignedKvReadResponse::from_range(metadata, hash, content))
+            }
+            None => Err((Status::NotFound, "Key not found".to_string())),
+        };
+    }
+
     let kv_result = tinycloud.kv_get(&space_id, &key).await;
     crate::prometheus::observe_span(
         "server.signed_kv.kv_get",
@@ -245,7 +275,11 @@ pub async fn signed_kv_get(
     match kv_result.map_err(|e| (Status::InternalServerError, e.to_string()))? {
         Some((md, hash, content)) => {
             validate_signed_kv_hash_binding(&ticket, &hash)?;
-            Ok(KVResponse::new(md, hash, content))
+            Ok(SignedKvReadResponse::Full {
+                metadata: md,
+                hash,
+                content,
+            })
         }
         None => Err((Status::NotFound, "Key not found".to_string())),
     }
@@ -1128,62 +1162,71 @@ async fn build_batch_kv_inputs(
         .next()
         .expect("non-empty KV batch inputs have a target space");
     let mut remaining = staged_batch_remaining(space, tinycloud, config, quota_cache).await?;
-
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| (Status::BadRequest, e.to_string()))?
-    {
-        let encoded_path = field
-            .name()
-            .ok_or_else(|| {
-                (
+    let decode_start = Instant::now();
+    let result = async {
+        while let Some(field) = multipart
+            .next_field()
+            .await
+            .map_err(|e| (Status::BadRequest, e.to_string()))?
+        {
+            let encoded_path = field
+                .name()
+                .ok_or_else(|| {
+                    (
+                        Status::BadRequest,
+                        "Multipart KV part is missing a field name".to_string(),
+                    )
+                })?
+                .to_string();
+            let path = decode_multipart_path_field_name(&encoded_path)?;
+            let Some((space, typed_path)) = expected.get(&path) else {
+                return Err((
                     Status::BadRequest,
-                    "Multipart KV part is missing a field name".to_string(),
-                )
-            })?
-            .to_string();
-        let path = decode_multipart_path_field_name(&encoded_path)?;
-        let Some((space, typed_path)) = expected.get(&path) else {
+                    format!("Multipart KV part {path} is not authorized by the invocation"),
+                ));
+            };
+            if inputs.contains_key(&(space.clone(), typed_path.clone())) {
+                return Err((
+                    Status::BadRequest,
+                    format!("Duplicate multipart KV part for path {path}"),
+                ));
+            }
+
+            let metadata = field_metadata(&field);
+            let mut stage = staging
+                .stage(space)
+                .await
+                .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+            copy_multipart_field_to_stage(field, &mut stage, &mut remaining).await?;
+            inputs.insert((space.clone(), typed_path.clone()), (metadata, stage));
+        }
+
+        if inputs.len() != expected.len() {
+            let missing = expected
+                .keys()
+                .filter(|path| {
+                    !inputs
+                        .keys()
+                        .any(|(_, input_path)| input_path.as_str() == path.as_str())
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err((
                 Status::BadRequest,
-                format!("Multipart KV part {path} is not authorized by the invocation"),
-            ));
-        };
-        if inputs.contains_key(&(space.clone(), typed_path.clone())) {
-            return Err((
-                Status::BadRequest,
-                format!("Duplicate multipart KV part for path {path}"),
+                format!("Missing multipart KV parts for signed paths: {missing}"),
             ));
         }
 
-        let metadata = field_metadata(&field);
-        let mut stage = staging
-            .stage(space)
-            .await
-            .map_err(|e| (Status::InternalServerError, e.to_string()))?;
-        copy_multipart_field_to_stage(field, &mut stage, &mut remaining).await?;
-        inputs.insert((space.clone(), typed_path.clone()), (metadata, stage));
+        Ok(inputs)
     }
-
-    if inputs.len() != expected.len() {
-        let missing = expected
-            .keys()
-            .filter(|path| {
-                !inputs
-                    .keys()
-                    .any(|(_, input_path)| input_path.as_str() == path.as_str())
-            })
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err((
-            Status::BadRequest,
-            format!("Missing multipart KV parts for signed paths: {missing}"),
-        ));
-    }
-
-    Ok(inputs)
+    .await;
+    crate::prometheus::observe_stage(
+        crate::prometheus::InvocationStage::RequestDecode,
+        crate::prometheus::StageOutcome::from(result.is_ok()),
+        decode_start.elapsed(),
+    );
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1332,73 +1375,92 @@ async fn invoke_impl(
                 .collect::<Vec<_>>()
         });
 
-        let staging_start = Instant::now();
+        let stage_inputs_start = Instant::now();
         let inputs_result: Result<KvInputMap, (Status, String)> =
             match (data, put_caps.as_slice(), is_multipart_request) {
                 (DataIn::None | DataIn::One(_), [], _) => Ok(HashMap::new()),
-            (DataIn::One(d), [(space, path)], false) => {
-                let mut stage = staging
-                    .stage(space)
-                    .await
-                    .map_err(|e| (Status::InternalServerError, e.to_string()))?;
-                let open_data = d.open(1u8.gigabytes()).compat();
-
-                // Use public space storage limit if applicable, otherwise per-space quota
-                let effective_limit = if is_public_space(space) {
-                    Some(config.public_spaces.storage_limit)
-                } else {
-                    quota_cache.get_limit(space).await
-                };
-
-                if let Some(limit) = effective_limit {
-                    let current_size = tinycloud
-                        .store_size(space)
-                        .await
-                        .map_err(|e| (Status::InternalServerError, e.to_string()))?
-                        .ok_or_else(|| (Status::NotFound, "space not found".to_string()))?;
-                    // get the remaining allocated space for the given space storage
-                    match limit.as_u64().checked_sub(current_size) {
-                        // the current size is already equal or greater than the limit
-                        None | Some(0) => {
-                            return Err((
-                                Status::new(402),
-                                format!(
-                                    "Storage quota exceeded. Used: {} bytes, Limit: {} bytes",
-                                    current_size,
-                                    limit.as_u64()
-                                ),
-                            ))
-                        }
-                        Some(remaining) => {
-                            futures::io::copy(LimitedReader::new(open_data, remaining), &mut stage)
-                                .await
-                                .map_err(|e| {
-                                    if e.to_string().contains("storage limit") {
-                                        (
-                                            Status::PayloadTooLarge,
-                                            format!(
-                                                "Write exceeds remaining storage. Used: {} bytes, Limit: {} bytes",
-                                                current_size,
-                                                limit.as_u64()
-                                            ),
-                                        )
-                                    } else {
-                                        (Status::InternalServerError, e.to_string())
-                                    }
-                                })?;
-                        }
-                    }
-                } else {
-                    // no limit on storage, just use the data as is
-                    futures::io::copy(open_data, &mut stage)
+                (DataIn::One(d), [(space, path)], false) => {
+                    let mut stage = staging
+                        .stage(space)
                         .await
                         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
-                };
+                    let open_data = d.open(1u8.gigabytes()).compat();
 
-                let mut inputs = HashMap::new();
-                inputs.insert((space.clone(), path.clone()), (headers.0, stage));
-                Ok(inputs)
-            }
+                    // Use public space storage limit if applicable, otherwise per-space quota
+                    let effective_limit = if is_public_space(space) {
+                        Some(config.public_spaces.storage_limit)
+                    } else {
+                        quota_cache.get_limit(space).await
+                    };
+
+                    let copy_result = if let Some(limit) = effective_limit {
+                        let current_size = tinycloud
+                            .store_size(space)
+                            .await
+                            .map_err(|e| (Status::InternalServerError, e.to_string()))?
+                            .ok_or_else(|| (Status::NotFound, "space not found".to_string()))?;
+                        // get the remaining allocated space for the given space storage
+                        match limit.as_u64().checked_sub(current_size) {
+                            // the current size is already equal or greater than the limit
+                            None | Some(0) => {
+                                return Err((
+                                    Status::new(402),
+                                    format!(
+                                        "Storage quota exceeded. Used: {} bytes, Limit: {} bytes",
+                                        current_size,
+                                        limit.as_u64()
+                                    ),
+                                ))
+                            }
+                            Some(remaining) => {
+                                let decode_start = Instant::now();
+                                let result = futures::io::copy(
+                                    LimitedReader::new(open_data, remaining),
+                                    &mut stage,
+                                )
+                                    .await
+                                    .map_err(|e| {
+                                        if e.to_string().contains("storage limit") {
+                                            (
+                                                Status::PayloadTooLarge,
+                                                format!(
+                                                    "Write exceeds remaining storage. Used: {} bytes, Limit: {} bytes",
+                                                    current_size,
+                                                    limit.as_u64()
+                                                ),
+                                            )
+                                        } else {
+                                            (Status::InternalServerError, e.to_string())
+                                        }
+                                    })
+                                ;
+                                crate::prometheus::observe_stage(
+                                    crate::prometheus::InvocationStage::RequestDecode,
+                                    crate::prometheus::StageOutcome::from(result.is_ok()),
+                                    decode_start.elapsed(),
+                                );
+                                result
+                            }
+                        }
+                    } else {
+                        // no limit on storage, just use the data as is
+                        let decode_start = Instant::now();
+                        let result = futures::io::copy(open_data, &mut stage)
+                            .await
+                            .map_err(|e| (Status::InternalServerError, e.to_string()));
+                        crate::prometheus::observe_stage(
+                            crate::prometheus::InvocationStage::RequestDecode,
+                            crate::prometheus::StageOutcome::from(result.is_ok()),
+                            decode_start.elapsed(),
+                        );
+                        result
+                    };
+                    copy_result?;
+
+                    let mut inputs = HashMap::new();
+                    inputs.insert((space.clone(), path.clone()), (headers.0, stage));
+                    Ok(inputs)
+                }
                 (DataIn::One(d), [_, ..], true) => build_batch_kv_inputs(
                     d,
                     &headers,
@@ -1416,11 +1478,11 @@ async fn invoke_impl(
                     "KV batch put requires multipart/form-data".to_string(),
                 )),
                 _ => Err((Status::BadRequest, "Invalid inputs".to_string())),
-            };
+        };
         crate::prometheus::observe_span(
             "server.kv.stage_inputs",
             if inputs_result.is_ok() { "ok" } else { "error" },
-            staging_start.elapsed(),
+            stage_inputs_start.elapsed(),
         );
         let inputs = inputs_result?;
         let invocation_info = i.0 .0.clone();
@@ -1462,6 +1524,83 @@ async fn invoke_impl(
                     } else {
                         Ok(DataOut::One(InvOut(InvocationOutcome::KvBatchWrite(
                             written_paths,
+                        ))))
+                    }
+                } else if outcomes.len() > 1 {
+                    if outcomes.len() > MAX_KV_BATCH_READ_ITEMS {
+                        return Err((
+                            Status::BadRequest,
+                            format!(
+                                "KV batch reads accept at most {MAX_KV_BATCH_READ_ITEMS} keys"
+                            ),
+                        ));
+                    }
+                    let batch_specs = invocation_info
+                        .capabilities
+                        .iter()
+                        .filter_map(|capability| {
+                            let resource = capability.resource.tinycloud_resource()?;
+                            let action = capability.ability.as_ref().as_ref();
+                            if resource.service().as_str() != "kv"
+                                || !matches!(
+                                    action,
+                                    "tinycloud.kv/get" | "tinycloud.kv/metadata"
+                                )
+                            {
+                                return None;
+                            }
+                            Some((resource.path()?.clone(), action == "tinycloud.kv/get"))
+                        })
+                        .collect::<Vec<_>>();
+                    let homogeneous = batch_specs
+                        .first()
+                        .is_some_and(|(_, read)| batch_specs.iter().all(|(_, next)| next == read));
+                    if batch_specs.len() != outcomes.len() || !homogeneous {
+                        Err((
+                            Status::NotImplemented,
+                            "Multiple invocation outcomes require a homogeneous KV get or metadata batch"
+                                .to_string(),
+                        ))
+                    } else {
+                        let mut results = Vec::with_capacity(outcomes.len());
+                        for ((path, is_read), outcome) in
+                            batch_specs.into_iter().zip(outcomes)
+                        {
+                            let value = match (is_read, outcome) {
+                                (true, InvocationOutcome::KvRead(Some((metadata, hash, mut data)))) => {
+                                    let mut bytes = Vec::with_capacity(data.len() as usize);
+                                    FuturesAsyncReadExt::read_to_end(&mut data, &mut bytes)
+                                        .await
+                                        .map_err(|error| {
+                                            (Status::InternalServerError, error.to_string())
+                                        })?;
+                                    Some(KvBatchReadValue {
+                                        metadata,
+                                        hash,
+                                        data: Some(bytes),
+                                    })
+                                }
+                                (true, InvocationOutcome::KvRead(None))
+                                | (false, InvocationOutcome::KvMetadata(None)) => None,
+                                (
+                                    false,
+                                    InvocationOutcome::KvMetadata(Some((metadata, hash))),
+                                ) => Some(KvBatchReadValue {
+                                    metadata,
+                                    hash,
+                                    data: None,
+                                }),
+                                _ => {
+                                    return Err((
+                                        Status::InternalServerError,
+                                        "KV batch produced an unexpected outcome".to_string(),
+                                    ))
+                                }
+                            };
+                            results.push(KvBatchReadItem { path, value });
+                        }
+                        Ok(DataOut::One(InvOut(InvocationOutcome::KvBatchRead(
+                            results,
                         ))))
                     }
                 } else {
@@ -1655,6 +1794,7 @@ async fn emit_kv_hook_events(
 
 /// Read the request body as a JSON string.
 async fn read_json_body(data: DataIn<'_>) -> Result<String, (Status, String)> {
+    let start = Instant::now();
     match data {
         DataIn::One(d) => {
             let mut buf = Vec::new();
@@ -1663,9 +1803,23 @@ async fn read_json_body(data: DataIn<'_>) -> Result<String, (Status, String)> {
                 .read_to_end(&mut buf)
                 .await
                 .map_err(|e| (Status::BadRequest, e.to_string()))?;
-            String::from_utf8(buf).map_err(|e| (Status::BadRequest, e.to_string()))
+            let result = String::from_utf8(buf).map_err(|e| (Status::BadRequest, e.to_string()));
+            crate::prometheus::observe_stage(
+                crate::prometheus::InvocationStage::RequestDecode,
+                crate::prometheus::StageOutcome::from(result.is_ok()),
+                start.elapsed(),
+            );
+            result
         }
-        _ => Err((Status::BadRequest, "Expected JSON body".to_string())),
+        _ => {
+            let result = Err((Status::BadRequest, "Expected JSON body".to_string()));
+            crate::prometheus::observe_stage(
+                crate::prometheus::InvocationStage::RequestDecode,
+                crate::prometheus::StageOutcome::from(false),
+                start.elapsed(),
+            );
+            result
+        }
     }
 }
 
@@ -3822,7 +3976,7 @@ mod tests {
             .manage(sql_service)
             .manage(Config::default())
             .manage(QuotaCache::new(None, None))
-            .manage(InvocationReplayCache::new())
+            .manage(InvocationReplayCache::new(conn.clone()))
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
 
@@ -4077,7 +4231,7 @@ mod tests {
             .manage(sql_service)
             .manage(Config::default())
             .manage(QuotaCache::new(None, None))
-            .manage(InvocationReplayCache::new())
+            .manage(InvocationReplayCache::new(conn.clone()))
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
 
@@ -5277,6 +5431,7 @@ mod tests {
     struct MeteredSqlHttp {
         tinycloud: TinyCloud,
         sql_service: SqlService,
+        replay_db: tinycloud_core::sea_orm::DatabaseConnection,
         space: SpaceId,
         resource: ResourceId,
         jwk: JWK,
@@ -5424,6 +5579,7 @@ mod tests {
         Ok(MeteredSqlHttp {
             tinycloud,
             sql_service,
+            replay_db: conn,
             space,
             resource,
             jwk,
@@ -5487,7 +5643,7 @@ mod tests {
             .manage(setup.sql_service)
             .manage(Config::default())
             .manage(QuotaCache::new(Some(limit), None))
-            .manage(InvocationReplayCache::new())
+            .manage(InvocationReplayCache::new(setup.replay_db))
             .manage(HookRuntime::new(HooksConfig::default(), [9u8; 32]))
             .manage(BlockStage::from(crate::config::StagingStorage::Memory))
     }

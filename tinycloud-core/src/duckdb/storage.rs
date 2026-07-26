@@ -55,6 +55,7 @@ pub fn apply_security_settings(conn: &Connection, max_memory: &str) -> Result<()
     conn.execute_batch(&format!(
         "SET enable_external_access = false;\
          SET allow_unsigned_extensions = false;\
+         SET checkpoint_threshold = '1TB';\
          SET max_memory = '{}';",
         max_memory
     ))

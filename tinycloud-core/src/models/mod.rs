@@ -1,5 +1,6 @@
 pub mod abilities;
 pub mod actor;
+pub mod current_kv;
 pub mod database_artifact;
 pub mod delegation;
 pub(crate) mod did_resolution;
@@ -12,6 +13,7 @@ pub mod epoch;
 pub mod hook_delivery;
 pub mod hook_subscription;
 pub mod invocation;
+pub mod invocation_replay;
 pub mod kv_delete;
 pub mod kv_write;
 pub mod policy_challenge;

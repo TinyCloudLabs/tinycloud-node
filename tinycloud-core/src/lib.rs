@@ -1,3 +1,4 @@
+pub(crate) mod auth_graph;
 pub mod database_artifacts;
 pub mod db;
 #[cfg(feature = "duckdb")]
@@ -12,18 +13,20 @@ pub mod migrations;
 pub mod models;
 pub mod policy_authority;
 pub mod policy_capability;
+mod read_audit;
 pub mod relationships;
 pub mod share_email;
 pub mod sql;
 pub mod sql_sizes;
 pub mod storage;
+pub mod telemetry;
 pub mod types;
 pub mod util;
 pub mod write_hooks;
 
 pub use db::{
-    Commit, DelegationStatus, InvocationOutcome, KvInvokeOptions, KvPrecondition, SpaceDatabase,
-    TransactResult, TxError, TxStoreError,
+    Commit, DelegationStatus, InvocationOutcome, KvBatchReadItem, KvBatchReadValue,
+    KvInvokeOptions, KvPrecondition, SpaceDatabase, TransactResult, TxError, TxStoreError,
 };
 pub use encryption::ColumnEncryption;
 pub use libp2p;

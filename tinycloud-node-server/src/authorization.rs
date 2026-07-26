@@ -3,6 +3,7 @@ use rocket::{
     request::{FromRequest, Outcome, Request},
 };
 use std::convert::TryFrom;
+use std::time::Instant;
 use tinycloud_auth::authorization::{
     TinyCloudDelegation, TinyCloudInvocation, TinyCloudRevocation,
 };
@@ -19,7 +20,8 @@ macro_rules! impl_fromreq {
         impl<'r> FromRequest<'r> for AuthHeaderGetter<$type> {
             type Error = FromReqErr<<$type as TryFrom<$inter>>::Error>;
             async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-                match request
+                let start = Instant::now();
+                let result = match request
                     .headers()
                     .get_one($name)
                     .map(SerializedEvent::<$type>::from_header_ser::<$inter>)
@@ -27,7 +29,13 @@ macro_rules! impl_fromreq {
                     Some(Ok(e)) => Outcome::Success(AuthHeaderGetter(e)),
                     Some(Err(e)) => Outcome::Error((Status::Unauthorized, e)), // Revert back to Failure variant
                     None => Outcome::Forward(Status::Unauthorized),
-                }
+                };
+                crate::prometheus::observe_stage(
+                    crate::prometheus::InvocationStage::InvocationSignatureVerify,
+                    crate::prometheus::StageOutcome::from(matches!(result, Outcome::Success(_))),
+                    start.elapsed(),
+                );
+                result
             }
         }
     };
