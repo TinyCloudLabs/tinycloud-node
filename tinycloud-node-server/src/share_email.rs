@@ -1476,9 +1476,8 @@ fn validate_invitation_recipient(
         (None, Some(matcher), delivery)
             if matcher.canonical().is_ok()
                 && matcher.canonical().ok() == policy_matcher.canonical().ok()
-                && delivery.is_none_or(|email| {
-                    policy_matcher.matches_verified_email(email.as_str())
-                }) =>
+                && delivery
+                    .is_none_or(|email| policy_matcher.matches_verified_email(email.as_str())) =>
         {
             Ok(())
         }
