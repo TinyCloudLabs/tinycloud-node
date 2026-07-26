@@ -777,7 +777,7 @@ pub(crate) fn evaluate_share_recipient_policy(
                     crate::share_email::types::SharePolicyResourceKind::Prefix => "prefix",
                 };
                 let resource_value = policy.resource.value;
-                let expiry = canonical_time(&policy.expires_at)?;
+                let expiry = canonical_share_policy_time(&policy.expires_at)?;
                 (matcher, actions, resource_kind, resource_value, expiry)
             }
             _ => return Err(AuthorityError::SchemaInvalid),
@@ -2114,6 +2114,17 @@ fn canonical_time(value: &str) -> Result<OffsetDateTime, AuthorityError> {
     OffsetDateTime::parse(value, &Rfc3339).map_err(|_| AuthorityError::TimestampNoncanonical)
 }
 
+/// Share policy v2 preserves the existing browser-facing millisecond form
+/// (`.000Z`) while the authority delegation timestamps remain strict seconds.
+/// Accept both canonical wire forms at the policy-evaluation boundary.
+fn canonical_share_policy_time(value: &str) -> Result<OffsetDateTime, AuthorityError> {
+    if value.len() == 24 && value.ends_with(".000Z") {
+        let seconds = format!("{}Z", &value[..value.len() - 5]);
+        return canonical_time(&seconds);
+    }
+    canonical_time(value)
+}
+
 fn canonical_time_string(value: OffsetDateTime) -> String {
     value
         .to_offset(time::UtcOffset::UTC)
@@ -2553,7 +2564,7 @@ mod tests {
         let fixture = fixture();
         let mut policy = exact_email_policy_state();
         policy["version"] = json!(2);
-        policy["recipientMatcher"] = json!({"kind": "emailDomain", "value": "MAILINATOR.COM"});
+        policy["recipientMatcher"] = json!({"kind": "emailDomain", "value": "mailinator.com"});
         policy["actions"] = json!(["tinycloud.kv/get"]);
         policy["resource"] = json!({"kind": "prefix", "value": "profile"});
         policy.as_object_mut().unwrap().remove("recipientEmail");

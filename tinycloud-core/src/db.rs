@@ -1,7 +1,7 @@
 use crate::encryption::ColumnEncryption;
 use crate::events::{epoch_hash, Delegation, Event, HashError, Invocation, Operation, Revocation};
 use crate::hash::Hash;
-use crate::keys::{get_did_key, Secrets};
+use crate::keys::{get_did_key, Secrets, StaticSecret};
 use crate::migrations::Migrator;
 use crate::models::*;
 use crate::relationships::*;
@@ -97,6 +97,7 @@ pub struct KvInvokeOptions {
     pub preconditions: HashMap<(SpaceId, Path), KvPrecondition>,
     pub max_response_bytes: Option<u64>,
     pub list_limit: Option<usize>,
+    pub list_cursor: Option<Path>,
 }
 
 #[derive(Debug, Clone)]
@@ -229,6 +230,14 @@ where
 {
     pub async fn stage_key(&self, space_id: &SpaceId) -> Result<String, K::Error> {
         self.secrets.stage_keypair(space_id).await.map(get_did_key)
+    }
+}
+
+impl<C, B> SpaceDatabase<C, B, StaticSecret> {
+    /// Node-local MAC key for opaque generic KV list cursors. The key never
+    /// leaves the process and is derived from the configured node secret.
+    pub fn kv_cursor_key(&self) -> [u8; 32] {
+        self.secrets.derive_key(b"tinycloud/kv/list-cursor")
     }
 }
 
@@ -892,7 +901,10 @@ where
             &jwk,
             &verification_method,
             (OffsetDateTime::now_utc() + time::Duration::minutes(5)).unix_timestamp() as f64,
-            InvocationOptions::default(),
+            InvocationOptions {
+                proof: Some(Vec::new()),
+                ..InvocationOptions::default()
+            },
         )
         .map_err(|_| TxStoreError::MissingInput)?;
         let info = crate::util::InvocationInfo::try_from(invocation.clone())
@@ -914,7 +926,7 @@ where
             options.preconditions.insert(key, precondition);
         }
         let (_, mut outcomes) = self
-            .invoke_with_options(invocation, inputs, options)
+            .invoke_with_options_internal(invocation, inputs, options)
             .await?;
         let result = outcomes
             .drain(..)
@@ -1050,8 +1062,39 @@ where
     pub async fn invoke_with_options<S>(
         &self,
         invocation: Invocation,
+        inputs: InvocationInputs<S::Writable>,
+        options: KvInvokeOptions,
+    ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
+    where
+        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
+        self.invoke_with_options_mode(invocation, inputs, options, false)
+            .await
+    }
+
+    async fn invoke_with_options_internal<S>(
+        &self,
+        invocation: Invocation,
+        inputs: InvocationInputs<S::Writable>,
+        options: KvInvokeOptions,
+    ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
+    where
+        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
+        self.invoke_with_options_mode(invocation, inputs, options, true)
+            .await
+    }
+
+    async fn invoke_with_options_mode<S>(
+        &self,
+        invocation: Invocation,
         mut inputs: InvocationInputs<S::Writable>,
         options: KvInvokeOptions,
+        internal: bool,
     ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
     where
         B: ImmutableWriteStore<S> + ImmutableReadStore,
@@ -1171,11 +1214,16 @@ where
                 })
             });
         //  verify and commit invocation and kv operations
+        let event = if internal {
+            Event::InternalInvocation(Box::new(invocation), ops)
+        } else {
+            Event::Invocation(Box::new(invocation), ops)
+        };
         let commit = transact(
             &tx,
             &self.storage,
             &self.secrets,
-            vec![Event::Invocation(Box::new(invocation), ops)],
+            vec![event],
             self.encryption.as_ref(),
         )
         .await
@@ -1223,9 +1271,15 @@ where
                     results.push(InvocationOutcome::KvRead(data));
                 }
                 (space, "kv", "tinycloud.kv/list", path) => {
-                    let (list, truncated) =
-                        list_bounded(&tx, space, path, options.list_limit).await?;
-                    results.push(InvocationOutcome::KvList(list, truncated))
+                    let (list, truncated) = list_bounded_after(
+                        &tx,
+                        space,
+                        path,
+                        options.list_limit,
+                        options.list_cursor.as_ref(),
+                    )
+                    .await?;
+                    results.push(InvocationOutcome::KvList(list, truncated, None))
                 }
                 (space, "kv", "tinycloud.kv/del", path) => {
                     // KV deletion is logical. Blobs are content-addressed and may be
@@ -1354,7 +1408,7 @@ fn is_serialization_db_error(error: &DbErr) -> bool {
 
 #[derive(Debug)]
 pub enum InvocationOutcome<R> {
-    KvList(Vec<Path>, bool),
+    KvList(Vec<Path>, bool, Option<String>),
     KvDelete(Option<Hash>),
     KvMetadata(Option<(Metadata, Hash)>),
     KvWrite(Hash),
@@ -1423,6 +1477,14 @@ async fn event_spaces<'a, C: ConnectionTrait>(
                 }
             }
             Event::Invocation(i, _) => {
+                for space in i.0.spaces() {
+                    let entry = spaces.entry(space.clone()).or_default();
+                    if !entry.iter().any(|(h, _)| h == &e.0) {
+                        entry.push(e);
+                    }
+                }
+            }
+            Event::InternalInvocation(i, _) => {
                 for space in i.0.spaces() {
                     let entry = spaces.entry(space.clone()).or_default();
                     if !entry.iter().any(|(h, _)| h == &e.0) {
@@ -1572,6 +1634,11 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                 .keys()
                 .any(|s| !new_space_ids.contains(s) && !existing.contains(s))
             {
+                tracing::error!(
+                    requested_spaces = ?event_spaces.keys().collect::<Vec<_>>(),
+                    existing_spaces = ?existing,
+                    "invocation referenced a space absent from the database"
+                );
                 return Err(TxError::SpaceNotFound);
             }
         }
@@ -1746,6 +1813,23 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                     )
                     .await?;
                 }
+                Event::InternalInvocation(i, ops) => {
+                    invocation::process_internal(
+                        db,
+                        *i,
+                        ops.into_iter()
+                            .map(|op| {
+                                let v = space_order
+                                    .get(op.space())
+                                    .and_then(|(s, e, _, h)| Some((s, e, h.get(&hash)?)))
+                                    .unwrap();
+                                op.version(*v.0, *v.1, *v.2)
+                            })
+                            .collect(),
+                        encryption,
+                    )
+                    .await?;
+                }
                 Event::Revocation(r) => {
                     revocation::process(db, *r).await?;
                 }
@@ -1794,6 +1878,9 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                 Event::Invocation(i, _ops) => {
                     invocation::process(db, *i, Vec::new(), encryption).await?;
                 }
+                Event::InternalInvocation(i, _ops) => {
+                    invocation::process_internal(db, *i, Vec::new(), encryption).await?;
+                }
                 Event::Revocation(r) => {
                     revocation::process(db, *r).await?;
                 }
@@ -1835,6 +1922,30 @@ async fn list_bounded<C: ConnectionTrait>(
     prefix: &Path,
     limit: Option<usize>,
 ) -> Result<(Vec<Path>, bool), DbErr> {
+    list_bounded_after(db, space_id, prefix, limit, None).await
+}
+
+async fn list_bounded_after<C: ConnectionTrait>(
+    db: &C,
+    space_id: &SpaceId,
+    prefix: &Path,
+    limit: Option<usize>,
+    after: Option<&Path>,
+) -> Result<(Vec<Path>, bool), DbErr> {
+    if let Some(after) = after {
+        let prefix = prefix.as_str();
+        let valid = after.as_str() == prefix
+            || (prefix.is_empty() && !after.as_str().is_empty())
+            || after
+                .as_str()
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/'));
+        if !valid {
+            return Err(DbErr::Custom(
+                "KV list cursor is outside the requested prefix".to_string(),
+            ));
+        }
+    }
     let newer = Alias::new("newer_kv_write");
     let newer_order = Condition::any()
         .add(
@@ -1920,8 +2031,11 @@ async fn list_bounded<C: ConnectionTrait>(
                 )
                 .add(Expr::col((kv_delete::Entity, kv_delete::Column::InvocationId)).is_null())
                 .add(Condition::all().not().add(Expr::exists(newer_write))),
-        )
-        .order_by((kv_write::Entity, kv_write::Column::Key), Order::Asc);
+        );
+    if let Some(after) = after {
+        query.cond_where(Expr::col((kv_write::Entity, kv_write::Column::Key)).gt(after.as_str()));
+    }
+    query.order_by((kv_write::Entity, kv_write::Column::Key), Order::Asc);
     if let Some(limit) = limit {
         query.limit(limit.saturating_add(1) as u64);
     }
@@ -1935,6 +2049,9 @@ async fn list_bounded<C: ConnectionTrait>(
         .map(|key| key.parse())
         .collect::<Result<Vec<Path>, _>>()
         .map_err(|error| DbErr::Custom(format!("invalid persisted KV path: {error}")))?;
+    if let Some(after) = after {
+        list.retain(|path| path.as_str() > after.as_str());
+    }
     let truncated = limit.map(|limit| list.len() > limit).unwrap_or(false);
     if let Some(limit) = limit {
         list.truncate(limit);

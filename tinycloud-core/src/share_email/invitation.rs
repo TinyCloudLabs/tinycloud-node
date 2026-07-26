@@ -158,6 +158,13 @@ pub struct InvitationAuthorization {
     /// path.  It is deliberately not an authorization matcher.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_email: Option<CanonicalEmail>,
+    /// Optional authenticated delivery provenance (for example a provider
+    /// address or transaction reference). It is signed when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_provenance: Option<String>,
+    /// The exact generated link is part of the signed v2 authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_url: Option<String>,
     /// Explicit v2 attenuation set.  Legacy v1 leaves this absent so its
     /// signed envelope remains byte-for-byte compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -176,6 +183,22 @@ pub struct InvitationAuthorization {
     pub issued_at: String,
     pub expires_at: String,
     pub report_abuse_token: ProtocolJti,
+    /// V2 binds the exact addressed-authoring request that produced this
+    /// receipt.  It is absent from v1 receipts for wire compatibility.
+    #[serde(
+        rename = "requestBodyDigest",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub request_body_digest: Option<Sha256Digest>,
+    /// The Share/OpenCredentials delivery transaction key.  It is carried in
+    /// the signed receipt and reserved together with the JTI by Node.
+    #[serde(
+        rename = "idempotencyKey",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub idempotency_key: Option<String>,
 }
 
 impl fmt::Debug for InvitationAuthorization {
@@ -227,6 +250,8 @@ pub struct InvitationAuthorizationInput {
     pub recipient_email: Option<CanonicalEmail>,
     pub recipient_matcher: Option<RecipientMatcher>,
     pub delivery_email: Option<CanonicalEmail>,
+    pub delivery_provenance: Option<String>,
+    pub share_url: Option<String>,
     pub actions: Option<Vec<ShareAction>>,
     pub resource: Option<Path>,
     pub target_origin: TargetOrigin,
@@ -237,6 +262,7 @@ pub struct InvitationAuthorizationInput {
     pub content_source_digest: Sha256Digest,
     pub share_expires_at: String,
     pub request_body_digest: Sha256Digest,
+    pub idempotency_key: Option<String>,
 }
 
 impl fmt::Debug for InvitationAuthorizationInput {
@@ -344,26 +370,27 @@ pub fn issue_invitation_authorization_for(
             _ => return Err(InvitationError::Invalid),
         };
     let (actions, resource) = if version == 2 {
-        let actions = input.actions.or_else(|| {
-            Some(vec![match &input.content_source {
-                ContentSource::Kv { action, .. } => match action {
-                    super::types::KvGetAction::Get => ShareAction::KvGet,
-                    super::types::KvGetAction::List => ShareAction::KvList,
-                    super::types::KvGetAction::Put => ShareAction::KvPut,
-                },
-                ContentSource::Sql { .. } => ShareAction::SqlRead,
-            }])
-        });
-        let resource = input.resource.or_else(|| {
-            Some(match &input.content_source {
-                ContentSource::Kv { path, .. } | ContentSource::Sql { path, .. } => path.clone(),
-            })
-        });
+        let actions = input.actions;
+        let resource = input.resource;
         validate_actions(actions.as_deref(), resource.as_ref(), &input.content_source)?;
         (actions, resource)
     } else {
         (None, None)
     };
+    let idempotency_key = input
+        .idempotency_key
+        .filter(|value| valid_idempotency_key(value));
+    if version == 2 && idempotency_key.is_none() {
+        return Err(InvitationError::Invalid);
+    }
+    if version == 2
+        && input
+            .delivery_provenance
+            .as_deref()
+            .is_some_and(|value| !valid_delivery_provenance(value))
+    {
+        return Err(InvitationError::Invalid);
+    }
     let authorization = InvitationAuthorization {
         artifact_type: "TinyCloudShareInviteAuthorization".to_owned(),
         version,
@@ -378,6 +405,8 @@ pub fn issue_invitation_authorization_for(
         recipient_email,
         recipient_matcher,
         delivery_email,
+        delivery_provenance: input.delivery_provenance,
+        share_url: input.share_url,
         actions,
         resource,
         target_origin,
@@ -391,6 +420,8 @@ pub fn issue_invitation_authorization_for(
         issued_at,
         expires_at: canonical_timestamp(expires_at)?,
         report_abuse_token: input.report_abuse_token,
+        request_body_digest: (version == 2).then_some(input.request_body_digest),
+        idempotency_key,
     };
     validate_authorization_for(
         &authorization,
@@ -529,8 +560,31 @@ fn validate_authorization_for(
             && authorization
                 .recipient_matcher
                 .as_ref()
-                .is_some_and(|matcher| matcher.canonical().is_ok())
-            && authorization.delivery_email.is_some() => {}
+                .is_some_and(|matcher| matcher.is_canonical())
+            && authorization.delivery_email.is_some()
+            && authorization
+                .recipient_matcher
+                .as_ref()
+                .zip(authorization.delivery_email.as_ref())
+                .is_some_and(|(matcher, delivery)| {
+                    matcher.matches_verified_email(delivery.as_str())
+                })
+            && authorization
+                .delivery_provenance
+                .as_deref()
+                .is_none_or(valid_delivery_provenance)
+            && authorization.actions.is_some()
+            && authorization.resource.is_some()
+            && authorization.share_url.as_deref().is_some_and(|value| {
+                validate_share_url(value, &authorization.share_cid, expected_return_origin)
+            }) =>
+        {
+            validate_actions(
+                authorization.actions.as_deref(),
+                authorization.resource.as_ref(),
+                &authorization.content_source,
+            )?;
+        }
         _ => return Err(InvitationError::Invalid),
     }
     let issued_at = parse_timestamp(&authorization.issued_at)?;
@@ -553,7 +607,45 @@ fn validate_authorization_for(
     if authorization.content_source_digest != expected_digest {
         return Err(InvitationError::Invalid);
     }
+    match authorization.version {
+        1 if authorization.request_body_digest.is_none()
+            && authorization.idempotency_key.is_none() => {}
+        2 if authorization.request_body_digest.as_ref().is_some_and(|_| {
+            authorization
+                .idempotency_key
+                .as_deref()
+                .is_some_and(valid_idempotency_key)
+        }) && authorization.sender_trust == SenderTrust::Verified
+            && authorization.share_url.as_deref().is_some_and(|value| {
+                validate_share_url(value, &authorization.share_cid, expected_return_origin)
+            }) => {}
+        _ => return Err(InvitationError::Invalid),
+    }
     Ok(())
+}
+
+fn valid_idempotency_key(value: &str) -> bool {
+    (1..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+}
+
+fn valid_delivery_provenance(value: &str) -> bool {
+    (1..=256).contains(&value.len())
+        && value.is_ascii()
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+}
+
+fn validate_share_url(value: &str, share_cid: &ShareCid, return_origin: &TargetOrigin) -> bool {
+    let prefix = format!("{}/s/{}#k=", return_origin.as_str(), share_cid.as_str());
+    let Some(token) = value.strip_prefix(&prefix) else {
+        return false;
+    };
+    !token.is_empty()
+        && !token.contains(['?', '#', '/', '@', '&', '='])
+        && !value.chars().any(char::is_whitespace)
+        && decode_share_url_token(token).is_ok()
 }
 
 fn validate_source(source: &ContentSource) -> Result<(), InvitationError> {
@@ -731,6 +823,9 @@ mod tests {
             ),
             share_expires_at: "2030-01-01T00:00:00.000Z".to_owned(),
             request_body_digest: Sha256Digest::from_bytes([4; 32]),
+            share_url: None,
+            delivery_provenance: None,
+            idempotency_key: None,
         };
         let now = OffsetDateTime::parse("2029-01-01T00:00:00Z", &Rfc3339).unwrap();
         let receipt = issue_invitation_authorization(input.clone(), &signer, now).unwrap();
@@ -749,8 +844,12 @@ mod tests {
         let v2 = issue_invitation_authorization_for(
             InvitationAuthorizationInput {
                 recipient_email: None,
-                recipient_matcher: Some(RecipientMatcher::EmailDomain("EXAMPLE.COM".to_owned())),
+                recipient_matcher: Some(RecipientMatcher::EmailDomain("example.com".to_owned())),
                 delivery_email: Some(CanonicalEmail::parse("notify@example.com").unwrap()),
+                share_url: Some("https://share.tinycloud.xyz/s/bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4#k=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned()),
+                actions: Some(vec![ShareAction::KvGet]),
+                resource: Some(super::super::types::Path::parse("documents/plan.md").unwrap()),
+                idempotency_key: Some("invite:test:v2".to_owned()),
                 ..input.clone()
             },
             &signer,
@@ -764,13 +863,29 @@ mod tests {
         assert_eq!(v2.authorization.version, 2);
         assert_eq!(
             v2_value["recipientMatcher"],
-            serde_json::json!({"kind":"emailDomain","value":"EXAMPLE.COM"})
+            serde_json::json!({"kind":"emailDomain","value":"example.com"})
         );
         assert_eq!(v2_value["deliveryEmail"], "notify@example.com");
         assert_eq!(v2_value["actions"], serde_json::json!(["tinycloud.kv/get"]));
         assert_eq!(v2_value["resource"], "documents/plan.md");
         assert!(v2_value.get("recipientEmail").is_none());
         verify_invitation_authorization(&v2, &verifier, now).unwrap();
+
+        let mut noncanonical = input.clone();
+        noncanonical.recipient_email = None;
+        noncanonical.recipient_matcher =
+            Some(RecipientMatcher::EmailDomain("EXAMPLE.COM".to_owned()));
+        noncanonical.delivery_email = Some(CanonicalEmail::parse("notify@example.com").unwrap());
+        noncanonical.idempotency_key = Some("invite:noncanonical".to_owned());
+        assert!(issue_invitation_authorization_for(
+            noncanonical,
+            &signer,
+            now,
+            TargetOrigin::parse("https://node.example").unwrap(),
+            Did::parse("did:web:node.example").unwrap(),
+            TargetOrigin::parse(RETURN_ORIGIN).unwrap(),
+        )
+        .is_err());
 
         let mut missing_delivery = input.clone();
         missing_delivery.recipient_email = None;

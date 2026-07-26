@@ -43,12 +43,15 @@ struct KvBatchWriteResponse {
     count: usize,
 }
 
-struct KvListResponse(Vec<tinycloud_auth::resource::Path>, bool);
+struct KvListResponse(Vec<tinycloud_auth::resource::Path>, bool, Option<String>);
 
 impl<'r> Responder<'r, 'static> for KvListResponse {
     fn respond_to(self, request: &'r Request<'_>) -> rocket::response::Result<'static> {
         let mut response = Json(self.0).respond_to(request)?;
         response.set_header(Header::new("x-tinycloud-truncated", self.1.to_string()));
+        if let Some(next_cursor) = self.2 {
+            response.set_header(Header::new("x-tinycloud-next-cursor", next_cursor));
+        }
         Ok(response)
     }
 }
@@ -118,8 +121,8 @@ where
 {
     fn respond_to(self, request: &'r Request<'_>) -> rocket::response::Result<'static> {
         match self.0 {
-            InvocationOutcome::KvList(list, truncated) => {
-                KvListResponse(list, truncated).respond_to(request)
+            InvocationOutcome::KvList(list, truncated, next_cursor) => {
+                KvListResponse(list, truncated, next_cursor).respond_to(request)
             }
             InvocationOutcome::KvDelete(hash) => KvMutationResponse(hash).respond_to(request),
             InvocationOutcome::KvMetadata(meta) => meta

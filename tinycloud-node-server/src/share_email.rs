@@ -22,10 +22,14 @@ use rocket::{http::Header, Request};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 use tokio::io::AsyncReadExt as TokioAsyncReadExt;
 
+use tinycloud_auth::multihash_codetable::MultihashDigest;
 use tinycloud_auth::share_email_evidence::{IssuerKey, IssuerTrustRegistry};
 use tinycloud_core::{
     policy_authority::DatabaseAuthorityStore,
@@ -42,12 +46,13 @@ use tinycloud_core::{
             Ed25519InvitationSigner, Ed25519InvitationVerifier, InvitationAuthorizationInput,
             InvitationSigner, SenderTrust,
         },
-        state::{AnonymousChallengeRequest, ProtocolStateRepository},
+        state::{AnonymousChallengeRequest, ProtocolStateRepository, StateError},
         types::{
             validate_share_path, AuthorityMaterialHandle, ContentSource, Did, DidKey,
             ExactResource, Path, PolicyCid, PolicySessionRequest as AuthorityPolicySessionRequest,
             ProtocolJti, ProtocolNonce, RecipientMatcher, SessionHandle, ShareAction, ShareCid,
-            ShareCursor, ShareDelegationCid, ShareId, ShareScope, TargetOrigin,
+            ShareCursor, ShareDelegationCid, ShareId, SharePolicyResource, SharePolicyV2,
+            ShareScope, TargetOrigin,
         },
         verifier::ExactEmailVerifier,
         AuthenticatedAuthorityMaterialProvider, AuthorityTrustDescriptor,
@@ -464,12 +469,241 @@ pub const NODE_CAPABILITY_ROUTES: [&str; 4] = [
 /// receipt-consume callback for delivery workers to invoke.
 pub fn public_routes() -> Vec<rocket::Route> {
     rocket::routes![
+        addressed_delegate,
         authorize_invitation,
         policy_challenge,
         policy_session,
         read,
         native_invoke
     ]
+}
+
+/// Authenticated Node-native addressed delegation authoring on the existing
+/// `/delegate` address.  Legacy callers continue to use the ordinary
+/// Authorization header route; the media type selects this closed v2
+/// contract.  The authority bundle remains the source of persisted policy
+/// truth, so this route never creates a second policy service.
+#[post(
+    "/delegate",
+    rank = 2,
+    format = "application/vnd.tinycloud.delegation+json",
+    data = "<data>"
+)]
+pub async fn addressed_delegate(
+    data: Data<'_>,
+    runtime: &State<Option<ShareEmailRuntime>>,
+    _origin: ShareOriginGuard,
+) -> ApiResult<Value> {
+    let runtime = runtime
+        .inner()
+        .as_ref()
+        .ok_or(error(Status::ServiceUnavailable, "capability_unavailable"))?;
+    let value = read_bounded_json(data).await?;
+    let envelope: AddressedDelegationAuthoringEnvelope = serde_json::from_value(value)
+        .map_err(|_| error(Status::BadRequest, "delegation_authorization_invalid"))?;
+    let request = envelope.request;
+    if request.version != 2
+        || request.target_origin.as_str() != runtime.config.target_origin
+        || request.node_audience.as_str() != runtime.config.node_audience
+        || !request.recipient_matcher.is_canonical()
+    {
+        return Err(error(Status::Forbidden, "delegation_authorization_invalid"));
+    }
+    let request_value = serde_json::to_value(&request)
+        .map_err(|_| error(Status::BadRequest, "delegation_authorization_invalid"))?;
+    verify_request_body_digest(&request_value, &request.request_body_digest)
+        .map_err(|failure| {
+            tracing::error!(failure = ?failure, stage = "authority_material_for", "addressed delegation authorization failed");
+            error(Status::Forbidden, "delegation_authorization_invalid")
+        })?;
+    verify_did_key_signature(
+        &request.sender_did,
+        &envelope.proof,
+        b"xyz.tinycloud.share/delegation-authoring/v2\0",
+        &request_value,
+    )
+    .map_err(|_| error(Status::Forbidden, "delegation_authorization_invalid"))?;
+
+    let source_action = match &request.content_source {
+        ContentSource::Kv { action, .. } => match action {
+            tinycloud_core::share_email::types::KvGetAction::Get => ShareAction::KvGet,
+            tinycloud_core::share_email::types::KvGetAction::List => ShareAction::KvList,
+            tinycloud_core::share_email::types::KvGetAction::Put => ShareAction::KvPut,
+        },
+        ContentSource::Sql { .. } => ShareAction::SqlRead,
+    };
+    let resource_is_prefix = matches!(
+        request.resource.kind,
+        tinycloud_core::share_email::types::SharePolicyResourceKind::Prefix
+    );
+    let validation_action = if resource_is_prefix
+        && matches!(source_action, ShareAction::KvGet)
+        && request.actions.contains(&ShareAction::KvList)
+    {
+        ShareAction::KvList
+    } else {
+        source_action.clone()
+    };
+    validate_action_set(Some(&request.actions), validation_action)
+        .map_err(|_| error(Status::BadRequest, "delegation_authorization_invalid"))?;
+    if matches!(validation_action, ShareAction::KvList) != resource_is_prefix {
+        return Err(error(
+            Status::BadRequest,
+            "delegation_authorization_invalid",
+        ));
+    }
+    let sender = Did::parse(request.sender_did.as_str())
+        .map_err(|failure| {
+            tracing::error!(failure = ?failure, stage = "validate_sender_for_policy", "addressed delegation authorization failed");
+            error(Status::Forbidden, "delegation_authorization_invalid")
+        })?;
+    let policy = SharePolicyV2 {
+        artifact_type: "TinyCloudSharePolicy".to_owned(),
+        version: 2,
+        recipient_matcher: request.recipient_matcher.clone(),
+        content_source: request.content_source.clone(),
+        content_source_digest: request.content_source_digest.clone(),
+        actions: request.actions.clone(),
+        resource: request.resource.clone(),
+        expires_at: request.expires_at.clone(),
+        issuer_did: sender,
+    };
+    policy
+        .validate()
+        .map_err(|_| error(Status::BadRequest, "delegation_authorization_invalid"))?;
+    let policy_value = serde_json::to_value(&policy)
+        .map_err(|_| error(Status::BadRequest, "delegation_authorization_invalid"))?;
+    let policy_bytes = jcs::canonicalize(&policy_value);
+    let policy_digest = digest_bytes(&policy_bytes);
+    let policy_cid = PolicyCid::parse(
+        tinycloud_auth::ipld_core::cid::Cid::new_v1(
+            0x55,
+            tinycloud_auth::multihash_codetable::Code::Sha2_256.digest(&policy_bytes),
+        )
+        .to_string(),
+    )
+    .map_err(|_| error(Status::InternalServerError, "capability_unavailable"))?;
+
+    let bundle = runtime
+        .bridge
+        .authority_material_for(
+            &policy_cid,
+            &request.delegation_cid,
+            &request.authority_material_handle,
+            &request.authority_material_digest,
+        )
+        .await
+        .map_err(|failure| {
+            tracing::error!(failure = ?failure, stage = "validate_scope", "addressed delegation authorization failed");
+            error(Status::Forbidden, "delegation_authorization_invalid")
+        })?;
+    if bundle.policy_state != policy_bytes {
+        return Err(error(Status::Forbidden, "delegation_authorization_invalid"));
+    }
+    runtime
+        .bridge
+        .validate_sender_for_policy(
+            policy_cid.as_str(),
+            request.delegation_cid.as_str(),
+            &request.authority_material_handle,
+            &request.authority_material_digest,
+            request.sender_did.as_str(),
+        )
+        .await
+        .map_err(|_| error(Status::Forbidden, "delegation_authorization_invalid"))?;
+    let resource = Path::parse(request.resource.value.clone())
+        .map_err(|_| error(Status::BadRequest, "delegation_authorization_invalid"))?;
+    let scope = scope_from_request(
+        &PolicyChallengeRequest {
+            share_cid: request.share_cid.clone(),
+            share_id: request.share_id.clone(),
+            delegation_cid: request.delegation_cid.clone(),
+            authority_material_handle: request.authority_material_handle.clone(),
+            authority_material_digest: request.authority_material_digest.clone(),
+            policy_cid: policy_cid.clone(),
+            content_source: request.content_source.clone(),
+            content_source_digest: request.content_source_digest.clone(),
+            holder_did: request.sender_did.clone(),
+            target_origin: request.target_origin.clone(),
+            node_audience: request.node_audience.clone(),
+            action: validation_action,
+            actions: Some(request.actions.clone()),
+            resource,
+            request_body_digest: request.request_body_digest.clone(),
+        },
+        &runtime.config,
+    )
+    .map_err(|_| error(Status::Forbidden, "delegation_authorization_invalid"))?;
+    let now = OffsetDateTime::now_utc();
+    let expires_at = OffsetDateTime::parse(&request.expires_at, &Rfc3339)
+        .map_err(|_| error(Status::BadRequest, "delegation_authorization_invalid"))?;
+    if expires_at <= now {
+        return Err(error(Status::Forbidden, "delegation_authorization_invalid"));
+    }
+    let authoring_expires_at = expires_at.min(now + Duration::seconds(300));
+    runtime
+        .bridge
+        .validate_scope(&scope, now)
+        .await
+        .map_err(|_| error(Status::Forbidden, "delegation_authorization_invalid"))?;
+    runtime
+        .state
+        .reserve_authoring_jti(
+            &request.jti,
+            &request.request_body_digest,
+            json!({
+                "policyCid": scope.policy_cid.as_str(),
+                "delegationCid": scope
+                    .delegation_cid
+                    .as_ref()
+                    .map(|cid| cid.as_str()),
+                "authorityMaterialHandle": scope.authority_material_handle.as_str(),
+                "authorityMaterialDigest": scope.authority_material_digest.as_str(),
+                "nonce": request.nonce.as_str(),
+            }),
+            now,
+            authoring_expires_at,
+        )
+        .await
+        .map_err(|_| error(Status::Forbidden, "delegation_authorization_invalid"))?;
+
+    let mut response = AddressedDelegationAuthoringResponse {
+        artifact_type: "TinyCloudShareAddressedDelegation",
+        version: 2,
+        nonce: request.nonce,
+        jti: request.jti,
+        policy_cid,
+        policy_bytes: encode_config(&policy_bytes, URL_SAFE_NO_PAD),
+        policy_digest,
+        delegation_cid: request.delegation_cid,
+        delegation_bytes: encode_config(&bundle.policy_enforcement, URL_SAFE_NO_PAD),
+        delegation_digest: digest_bytes(&bundle.policy_enforcement),
+        authority_material_handle: request.authority_material_handle,
+        authority_material_digest: request.authority_material_digest,
+        actions: request.actions,
+        resource: request.resource,
+        expires_at: request.expires_at,
+        proof: DetachedProof {
+            alg: String::new(),
+            kid: String::new(),
+            signature: String::new(),
+        },
+    };
+    let mut response_value = serde_json::to_value(&response)
+        .map_err(|_| error(Status::InternalServerError, "capability_unavailable"))?;
+    response_value
+        .as_object_mut()
+        .ok_or(error(Status::InternalServerError, "capability_unavailable"))?
+        .remove("proof");
+    response.proof = sign(
+        &runtime.signer,
+        b"xyz.tinycloud.share/delegation-authoring-response/v2\0",
+        &response_value,
+    )
+    .map_err(|_| error(Status::InternalServerError, "capability_unavailable"))?;
+    Ok(Json(serde_json::to_value(response).map_err(|_| {
+        error(Status::InternalServerError, "capability_unavailable")
+    })?))
 }
 
 #[derive(Debug, Serialize)]
@@ -559,14 +793,24 @@ fn body_is_bounded<T: Serialize>(value: &T) -> bool {
 }
 
 async fn read_bounded_json(data: Data<'_>) -> Result<Value, Custom<Json<ApiErrorBody>>> {
+    read_bounded_json_with_limit(
+        data,
+        tinycloud_core::share_email::state::MAX_REQUEST_BODY_BYTES,
+    )
+    .await
+}
+
+async fn read_bounded_json_with_limit(
+    data: Data<'_>,
+    limit: usize,
+) -> Result<Value, Custom<Json<ApiErrorBody>>> {
     let mut bytes = Vec::new();
-    let mut reader =
-        data.open((tinycloud_core::share_email::state::MAX_REQUEST_BODY_BYTES + 1).bytes());
+    let mut reader = data.open((limit + 1).bytes());
     reader
         .read_to_end(&mut bytes)
         .await
         .map_err(|_| error(Status::BadRequest, "invalid_content_source"))?;
-    if bytes.len() > tinycloud_core::share_email::state::MAX_REQUEST_BODY_BYTES {
+    if bytes.len() > limit {
         return Err(error(Status::PayloadTooLarge, "invalid_content_source"));
     }
     serde_json::from_slice(&bytes).map_err(|_| error(Status::BadRequest, "invalid_content_source"))
@@ -606,7 +850,7 @@ impl ExactKvStore for TinyCloudKvStore {
             .read_to_end(&mut bytes)
             .await
             .map_err(|_| PortError::Storage)?;
-        if bytes.len() > tinycloud_core::share_email::MAX_MARKDOWN_BYTES {
+        if bytes.len() > tinycloud_core::share_email::MAX_NATIVE_SHARE_CONTENT_BYTES {
             return Err(PortError::Denied);
         }
         Ok(Some(bytes))
@@ -637,14 +881,17 @@ impl TinyCloudKvStore {
             .read_to_end(&mut bytes)
             .await
             .map_err(|_| PortError::Storage)?;
-        if bytes.len() > tinycloud_core::share_email::MAX_MARKDOWN_BYTES {
+        if bytes.len() > tinycloud_core::share_email::MAX_NATIVE_SHARE_CONTENT_BYTES {
             return Err(PortError::Denied);
         }
         let media_type = metadata
             .0
             .get("content-type")
             .cloned()
-            .unwrap_or_else(|| "application/octet-stream".to_owned());
+            // Exact-email shares are Markdown-only. Existing persisted KV
+            // entries may predate content-type metadata, so the constrained
+            // share boundary supplies the only safe default here.
+            .unwrap_or_else(|| "text/markdown; charset=utf-8".to_owned());
         if media_type.is_empty()
             || media_type.len() > 128
             || !media_type.is_ascii()
@@ -1053,6 +1300,7 @@ fn valid_signed_content_type(value: &str) -> bool {
                 | "text/plain; charset=utf-8"
                 | "text/markdown"
                 | "text/markdown; charset=utf-8"
+                | "application/octet-stream"
         )
 }
 
@@ -1064,6 +1312,23 @@ fn parse_share_etag(value: &str) -> Result<[u8; 32], ()> {
         .ok_or(())?;
     let bytes = hex::decode(digest).map_err(|_| ())?;
     bytes.try_into().map_err(|_| ())
+}
+
+fn valid_delivery_provenance(value: &str) -> bool {
+    (1..=256).contains(&value.len())
+        && value.is_ascii()
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+}
+
+fn validate_share_url(value: &str, share_cid: &ShareCid, return_origin: &str) -> bool {
+    let prefix = format!("{return_origin}/s/{}#k=", share_cid.as_str());
+    let Some(token) = value.strip_prefix(&prefix) else {
+        return false;
+    };
+    !token.is_empty()
+        && !token.contains(['?', '#', '/', '@', '&', '='])
+        && !value.chars().any(char::is_whitespace)
+        && decode_config(token, URL_SAFE_NO_PAD).is_ok_and(|bytes| bytes.len() == 32)
 }
 
 /// Compute a binding from the frozen canonical preimage. The digest field is
@@ -1092,6 +1357,15 @@ fn verify_request_body_digest(
 }
 
 fn invitation_request_body(request: &NodeInvitationAuthorizationRequest) -> Value {
+    // V2 binds every request field. Keep the old compact preimage only for
+    // legacy v1 exact-email callers; changing it would invalidate old links.
+    if request.recipient_email.is_none() {
+        let mut body = serde_json::to_value(request).expect("invitation request serializes");
+        body.as_object_mut()
+            .expect("invitation request is an object")
+            .remove("requestBodyDigest");
+        return body;
+    }
     let (action, resource) = match &request.content_source {
         ContentSource::Kv { action, path, .. } => (action.as_str(), path.clone()),
         ContentSource::Sql { path, .. } => ("tinycloud.sql/read", path.clone()),
@@ -1120,11 +1394,67 @@ fn invitation_request_body(request: &NodeInvitationAuthorizationRequest) -> Valu
         if let Some(email) = &request.delivery_email {
             object.insert("deliveryEmail".to_owned(), json!(email));
         }
+        if let Some(share_url) = &request.share_url {
+            object.insert("shareUrl".to_owned(), json!(share_url));
+        }
     }
     if let Some(actions) = &request.actions {
         object.insert("actions".to_owned(), json!(actions));
     }
     body
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct AddressedDelegationAuthoringRequest {
+    pub version: u8,
+    pub nonce: ProtocolNonce,
+    pub jti: ProtocolJti,
+    pub sender_did: DidKey,
+    pub recipient_matcher: RecipientMatcher,
+    pub target_origin: TargetOrigin,
+    pub node_audience: Did,
+    pub share_cid: ShareCid,
+    pub share_id: ShareId,
+    pub delegation_cid: ShareDelegationCid,
+    pub authority_material_handle: AuthorityMaterialHandle,
+    pub authority_material_digest: tinycloud_core::share_email::Sha256Digest,
+    pub content_source: ContentSource,
+    pub content_source_digest: tinycloud_core::share_email::Sha256Digest,
+    pub actions: Vec<ShareAction>,
+    pub resource: SharePolicyResource,
+    pub expires_at: String,
+    #[serde(rename = "requestBodyDigest")]
+    pub request_body_digest: tinycloud_core::share_email::Sha256Digest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct AddressedDelegationAuthoringEnvelope {
+    pub request: AddressedDelegationAuthoringRequest,
+    pub proof: DetachedProof,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AddressedDelegationAuthoringResponse {
+    #[serde(rename = "type")]
+    pub artifact_type: &'static str,
+    pub version: u8,
+    pub nonce: ProtocolNonce,
+    pub jti: ProtocolJti,
+    pub policy_cid: PolicyCid,
+    pub policy_bytes: String,
+    pub policy_digest: tinycloud_core::share_email::Sha256Digest,
+    pub delegation_cid: ShareDelegationCid,
+    pub delegation_bytes: String,
+    pub delegation_digest: tinycloud_core::share_email::Sha256Digest,
+    pub authority_material_handle: AuthorityMaterialHandle,
+    pub authority_material_digest: tinycloud_core::share_email::Sha256Digest,
+    pub actions: Vec<ShareAction>,
+    pub resource: SharePolicyResource,
+    pub expires_at: String,
+    pub proof: DetachedProof,
 }
 
 /// Keep legacy exact-email invitations wire-compatible while requiring the
@@ -1143,15 +1473,14 @@ fn validate_invitation_recipient(
         {
             Ok(())
         }
-        (None, Some(matcher), Some(delivery))
+        (None, Some(matcher), delivery)
             if matcher.canonical().is_ok()
-                && matcher.canonical().ok() == policy_matcher.canonical().ok() =>
+                && matcher.canonical().ok() == policy_matcher.canonical().ok()
+                && delivery.map_or(true, |email| {
+                    policy_matcher.matches_verified_email(email.as_str())
+                }) =>
         {
-            if policy_matcher.matches_verified_email(delivery.as_str()) {
-                Ok(())
-            } else {
-                Err(())
-            }
+            Ok(())
         }
         _ => Err(()),
     }
@@ -1258,37 +1587,35 @@ fn scope_from_request(
     // v1 binds action and resource directly to the source.  v2 keeps the
     // source as an immutable ceiling and signs the requested action/resource
     // independently, so a child can be read or edited after listing.
-    if !legacy_exact_shape
-        && !matches!(
-            request.content_source,
-            ContentSource::Kv {
-                action: tinycloud_core::share_email::types::KvGetAction::Get
-                    | tinycloud_core::share_email::types::KvGetAction::List
-                    | tinycloud_core::share_email::types::KvGetAction::Put,
-                ..
-            }
-        )
-    {
+    if !legacy_exact_shape && !matches!(request.content_source, ContentSource::Kv { .. }) {
         return Err(());
     }
     validate_share_path(source_path, true).map_err(|_| ())?;
-    validate_share_path(&request.resource, request.action == ShareAction::KvList)
+    let requested_resource = if request.action == ShareAction::KvList {
+        Path::parse(request.resource.as_str().trim_end_matches('/').to_owned()).map_err(|_| ())?
+    } else {
+        request.resource.clone()
+    };
+    validate_share_path(&requested_resource, request.action == ShareAction::KvList)
         .map_err(|_| ())?;
     let resource = match &request.content_source {
         ContentSource::Kv { .. } if request.action == ShareAction::KvList => {
-            if request.resource != *source_path {
+            // V2 list attenuation is governed by the signed policy prefix.
+            // The content source identifies the space/source ceiling; it is
+            // not an implicit equality constraint on the requested folder.
+            if request.actions.is_none() && requested_resource != *source_path {
                 return Err(());
             }
             ExactResource::KvPrefix {
-                path: request.resource.clone(),
+                path: requested_resource.clone(),
             }
         }
         ContentSource::Kv { .. } => {
-            if !same_or_descendant(source_path, &request.resource) {
+            if !same_or_descendant(source_path, &requested_resource) {
                 return Err(());
             }
             ExactResource::Kv {
-                path: request.resource.clone(),
+                path: requested_resource.clone(),
             }
         }
         ContentSource::Sql {
@@ -1330,14 +1657,17 @@ fn scope_from_request(
                 } if resource_database == database
                     && resource_path == path
                     && resource_statement == statement
-            ) && request.resource == *path
+            ) && requested_resource == *path
         }
     };
     if expected != request.content_source_digest
         || !resource_matches
         || request.target_origin.as_str() != config.target_origin
         || request.node_audience.as_str() != config.node_audience
-        || (request.action == ShareAction::KvList && request.resource != *source_path)
+        || request
+            .actions
+            .as_deref()
+            .is_some_and(|actions| actions.is_empty())
     {
         return Err(());
     }
@@ -1351,6 +1681,10 @@ fn scope_from_request(
         node_audience: request.node_audience.clone(),
         target_origin: request.target_origin.clone(),
         action: request.action,
+        allowed_actions: request
+            .actions
+            .clone()
+            .unwrap_or_else(|| vec![request.action]),
         resource,
         content_source: request.content_source.clone(),
         content_source_digest: request.content_source_digest.clone(),
@@ -1405,7 +1739,7 @@ fn holder_request_from_wire(
     config: &ShareEmailConfig,
 ) -> Result<(HolderReadRequest, ShareScope), Custom<Json<ApiErrorBody>>> {
     let i = request.invocation.clone();
-    if i.artifact_type != "TinyCloudShareReadInvocation" || i.version != 1 {
+    if i.artifact_type != "TinyCloudShareReadInvocation" || i.version != 2 {
         return Err(error(Status::Forbidden, "read_denied"));
     }
     let scope = scope_from_request(
@@ -1476,11 +1810,17 @@ fn holder_request_from_wire(
     };
     Ok((
         HolderReadRequest {
+            version: i.version,
             session: i.session_id,
             jti: i.jti,
             scope: scope.clone(),
             holder: i.holder_did,
             request_body_digest: i.request_body_digest,
+            limit: i.limit,
+            cursor: i.cursor,
+            body_digest: i.body_digest,
+            if_match: i.if_match,
+            content_type: i.content_type,
             proof,
         },
         scope,
@@ -1492,6 +1832,7 @@ fn holder_request_from_wire(
 /// backward compatible while policy sessions use the same production path.
 #[post(
     "/invoke",
+    rank = 2,
     format = "application/vnd.tinycloud.share+json",
     data = "<data>"
 )]
@@ -1508,9 +1849,18 @@ pub async fn native_invoke(
         .inner()
         .as_ref()
         .ok_or(error(Status::ServiceUnavailable, "capability_unavailable"))?;
-    let envelope: NativeInvokeEnvelope = serde_json::from_value(read_bounded_json(data).await?)
-        .map_err(|_| error(Status::BadRequest, "read_denied"))?;
+    let envelope: NativeInvokeEnvelope = serde_json::from_value(
+        read_bounded_json_with_limit(
+            data,
+            tinycloud_core::share_email::MAX_NATIVE_ENCODED_REQUEST_BYTES,
+        )
+        .await?,
+    )
+    .map_err(|_| error(Status::BadRequest, "read_denied"))?;
     let invocation = &envelope.request.invocation;
+    if invocation.version != 2 || invocation.actions.is_none() {
+        return Err(error(Status::Forbidden, "read_denied"));
+    }
     if envelope.limit != invocation.limit
         || envelope.cursor != invocation.cursor
         || envelope.body_digest != invocation.body_digest
@@ -1545,7 +1895,10 @@ pub async fn native_invoke(
                 .data_plane
                 .authorize(holder_request, now)
                 .await
-                .map_err(|_| error(Status::Forbidden, "read_denied"))?;
+                .map_err(|failure| {
+                    tracing::error!(failure = ?failure, "native share authorization denied");
+                    error(Status::Forbidden, "read_denied")
+                })?;
             let (bytes, media_type) = match &scope.content_source {
                 ContentSource::Kv { space, .. } => runtime
                     .kv
@@ -1581,8 +1934,9 @@ pub async fn native_invoke(
             Ok(NativeJson(
                 json!({
                     "type": "TinyCloudShareInvokeResponse",
-                    "version": 1,
+                    "version": 2,
                     "action": ShareAction::KvGet,
+                    "resource": invocation.resource,
                     "mediaType": media_type,
                     "content": encode_config(&bytes, URL_SAFE_NO_PAD),
                     "bodyDigest": body_digest,
@@ -1635,6 +1989,16 @@ pub async fn native_invoke(
                 )
                 .await
                 .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?;
+            let mut seen = BTreeSet::new();
+            if paths.iter().any(|entry| {
+                !direct_child_of(prefix, &entry.path)
+                    || !seen.insert(entry.path.as_str().to_owned())
+            }) || next
+                .as_ref()
+                .is_some_and(|path| !direct_child_of(prefix, path))
+            {
+                return Err(error(Status::ServiceUnavailable, "capability_unavailable"));
+            }
             let next_cursor = truncated
                 .then_some(next)
                 .flatten()
@@ -1650,8 +2014,9 @@ pub async fn native_invoke(
             Ok(NativeJson(
                 json!({
                     "type": "TinyCloudShareInvokeResponse",
-                    "version": 1,
+                    "version": 2,
                     "action": ShareAction::KvList,
+                    "resource": invocation.resource,
                     "entries": paths,
                     "nextCursor": next_cursor.clone(),
                 }),
@@ -1670,11 +2035,35 @@ pub async fn native_invoke(
                 .ok_or(error(Status::BadRequest, "edit_body_missing"))?;
             let bytes = decode_config(encoded, URL_SAFE_NO_PAD)
                 .map_err(|_| error(Status::BadRequest, "edit_body_invalid"))?;
-            if bytes.len() > tinycloud_core::share_email::MAX_MARKDOWN_BYTES {
+            if bytes.len() > tinycloud_core::share_email::MAX_NATIVE_SHARE_CONTENT_BYTES {
                 return Err(error(Status::PayloadTooLarge, "edit_body_invalid"));
             }
             if invocation.body_digest.as_ref() != Some(&digest_bytes(&bytes)) {
                 return Err(error(Status::BadRequest, "edit_body_invalid"));
+            }
+            // Check a stale CAS before consuming the single-use holder JTI.
+            // A genuinely stale signed write must surface the storage
+            // precondition result (412), including when the harness or a
+            // client retries the captured request after a competing write;
+            // it must not be misreported as a replay denial.
+            let expected_wire = if_match_header
+                .0
+                .as_deref()
+                .or(invocation.if_match.as_deref())
+                .ok_or(error(Status::BadRequest, "if_match_required"))?;
+            if let ContentSource::Kv { space, .. } = &scope.content_source {
+                let path = match &scope.resource {
+                    ExactResource::Kv { path } => path,
+                    _ => return Err(error(Status::Forbidden, "read_denied")),
+                };
+                let current = runtime
+                    .kv
+                    .current_etag(space, path)
+                    .await
+                    .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?;
+                if current.as_deref() != Some(expected_wire) {
+                    return Err(error(Status::PreconditionFailed, "edit_conflict"));
+                }
             }
             if if_match_header.0.is_some()
                 && envelope.if_match.is_some()
@@ -1723,6 +2112,10 @@ pub async fn native_invoke(
                 .write_all(&bytes)
                 .await
                 .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?;
+            stage
+                .flush()
+                .await
+                .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?;
             let mut metadata = BTreeMap::new();
             metadata.insert(
                 "content-type".to_owned(),
@@ -1746,15 +2139,21 @@ pub async fn native_invoke(
                     tinycloud_core::TxStoreError::KvPreconditionFailed => {
                         error(Status::PreconditionFailed, "edit_conflict")
                     }
-                    _ => error(Status::ServiceUnavailable, "capability_unavailable"),
+                    other => {
+                        tracing::error!(failure = %other, "native share KV put failed");
+                        error(Status::ServiceUnavailable, "capability_unavailable")
+                    }
                 })?;
             let etag = format!("\"blake3-{}\"", hex::encode(hash.as_ref()));
             Ok(NativeJson(
                 json!({
                     "type": "TinyCloudShareInvokeResponse",
-                    "version": 1,
+                    "version": 2,
                     "action": ShareAction::KvPut,
+                    "resource": invocation.resource,
                     "etag": etag.clone(),
+                    "bodyDigest": digest_bytes(&bytes),
+                    "contentType": invocation.content_type,
                 }),
                 Some(Header::new("ETag", etag.clone())),
             ))
@@ -1773,6 +2172,8 @@ fn prefix_space(scope: &ShareScope) -> Result<&Did, Custom<Json<ApiErrorBody>>> 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct NodeInvitationAuthorizationRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u8>,
     pub jti: ProtocolJti,
     pub report_abuse_token: ProtocolJti,
     pub sender_did: DidKey,
@@ -1784,12 +2185,16 @@ struct NodeInvitationAuthorizationRequest {
     #[serde(rename = "authorityMaterialDigest")]
     pub authority_material_digest: tinycloud_core::share_email::Sha256Digest,
     pub policy_cid: PolicyCid,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipient_email: Option<CanonicalEmail>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipient_matcher: Option<RecipientMatcher>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_email: Option<CanonicalEmail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_provenance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actions: Option<Vec<ShareAction>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1802,6 +2207,8 @@ struct NodeInvitationAuthorizationRequest {
     pub content_source_digest: tinycloud_core::share_email::Sha256Digest,
     pub share_expires_at: String,
     pub request_body_digest: tinycloud_core::share_email::Sha256Digest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1825,6 +2232,28 @@ pub async fn authorize_invitation(
     let envelope: NodeInvitationAuthorizationEnvelope = serde_json::from_value(value.clone())
         .map_err(|_| error(Status::BadRequest, "invitation_authorization_invalid"))?;
     let request = envelope.request;
+    let is_v2 = request.recipient_matcher.is_some();
+    if (is_v2 && request.version != Some(2)) || (!is_v2 && request.version.is_some()) {
+        return Err(error(
+            Status::BadRequest,
+            "invitation_authorization_invalid",
+        ));
+    }
+    if request.recipient_matcher.is_none() != request.share_url.is_none()
+        || (is_v2 && (request.actions.is_none() || request.resource.is_none()))
+    {
+        return Err(error(Status::Forbidden, "invitation_authorization_invalid"));
+    }
+    if is_v2
+        && (!request.share_url.as_deref().is_some_and(|value| {
+            validate_share_url(value, &request.share_cid, &runtime.config.return_origin)
+        }) || request
+            .delivery_provenance
+            .as_deref()
+            .is_some_and(|value| !valid_delivery_provenance(value)))
+    {
+        return Err(error(Status::Forbidden, "invitation_authorization_invalid"));
+    }
     let signed_value = serde_json::to_value(&request)
         .map_err(|_| error(Status::BadRequest, "invitation_authorization_invalid"))?;
     verify_did_key_signature(
@@ -1850,7 +2279,16 @@ pub async fn authorize_invitation(
         target_origin: request.target_origin.clone(),
         node_audience: request.node_audience.clone(),
         action: match &request.content_source {
-            ContentSource::Kv { action, .. } => match action {
+            ContentSource::Kv { action, path, .. } => match action {
+                tinycloud_core::share_email::types::KvGetAction::Get
+                    if request
+                        .actions
+                        .as_ref()
+                        .is_some_and(|actions| actions.contains(&ShareAction::KvList))
+                        && request.resource.as_ref() == Some(path) =>
+                {
+                    ShareAction::KvList
+                }
                 tinycloud_core::share_email::types::KvGetAction::Get => ShareAction::KvGet,
                 tinycloud_core::share_email::types::KvGetAction::List => ShareAction::KvList,
                 tinycloud_core::share_email::types::KvGetAction::Put => ShareAction::KvPut,
@@ -1908,6 +2346,12 @@ pub async fn authorize_invitation(
     {
         return Err(error(Status::Forbidden, "invitation_authorization_invalid"));
     }
+    if request.recipient_email.is_none()
+        && (request.sender_trust != SenderTrust::Verified
+            || request.idempotency_key.as_deref().is_none())
+    {
+        return Err(error(Status::Forbidden, "invitation_authorization_invalid"));
+    }
     let receipt = issue_invitation_authorization_for(
         InvitationAuthorizationInput {
             jti: request.jti,
@@ -1923,6 +2367,8 @@ pub async fn authorize_invitation(
             recipient_email: request.recipient_email,
             recipient_matcher: request.recipient_matcher,
             delivery_email: request.delivery_email,
+            delivery_provenance: request.delivery_provenance,
+            share_url: request.share_url,
             actions: request.actions,
             resource: request.resource,
             target_origin: request.target_origin,
@@ -1933,6 +2379,7 @@ pub async fn authorize_invitation(
             content_source_digest: request.content_source_digest,
             share_expires_at: request.share_expires_at,
             request_body_digest: request.request_body_digest,
+            idempotency_key: request.idempotency_key,
         },
         &runtime.signer,
         now,
@@ -1949,6 +2396,7 @@ pub async fn authorize_invitation(
     let binding = json!({
         "authorizationDigest": auth_digest.as_str(),
         "shareDigest": digest(&json!(receipt.authorization.share_cid.as_str())).as_str(),
+        "idempotencyKey": receipt.authorization.idempotency_key,
     });
     runtime
         .state
@@ -2063,7 +2511,14 @@ pub async fn policy_challenge(
             now,
         )
         .await
-        .map_err(|_| error(Status::TooManyRequests, "capability_unavailable"))?;
+        .map_err(|state_error| match state_error {
+            StateError::Storage => error(Status::ServiceUnavailable, "capability_unavailable"),
+            StateError::Invalid => error(Status::BadRequest, "invalid_content_source"),
+            StateError::BodyTooLarge => error(Status::PayloadTooLarge, "invalid_content_source"),
+            StateError::QuotaExceeded => error(Status::TooManyRequests, "rate_limited"),
+            StateError::Replay => error(Status::Conflict, "policy_challenge_replayed"),
+            StateError::Expired => error(Status::Gone, "policy_challenge_expired"),
+        })?;
     Ok(Json(json!({"challenge":challenge_value,"proof":proof})))
 }
 
@@ -2185,7 +2640,13 @@ pub async fn policy_session(
         .bridge
         .establish_session(admission, now)
         .await
-        .map_err(|_| error(Status::Forbidden, "policy_denied"))?;
+        .map_err(|failure| match failure {
+            PortError::Unavailable | PortError::Storage => {
+                error(Status::ServiceUnavailable, "capability_unavailable")
+            }
+            PortError::Replay => error(Status::Conflict, "policy_session_replayed"),
+            PortError::Denied => error(Status::Forbidden, "policy_denied"),
+        })?;
     let session_wire = PolicySession {
         artifact_type: "TinyCloudSharePolicySession".to_owned(),
         version: 1,
@@ -2309,11 +2770,17 @@ pub async fn read(
     let response_request_digest = i.request_body_digest.clone();
     let expected_source_digest = i.content_source_digest.clone();
     let read_request = HolderReadRequest {
+        version: 1,
         session: i.session_id,
         jti: i.jti,
         scope,
         holder: i.holder_did,
         request_body_digest: i.request_body_digest,
+        limit: None,
+        cursor: None,
+        body_digest: None,
+        if_match: None,
+        content_type: None,
         proof,
     };
     let response = runtime
@@ -2430,6 +2897,12 @@ mod tests {
     async fn mounted_surface_includes_the_frozen_node_routes_and_native_invoke() {
         let routes = public_routes();
         assert!(routes.iter().any(|route| {
+            route.uri.path() == "/delegate"
+                && route.format.as_ref().is_some_and(|format| {
+                    format.to_string() == "application/vnd.tinycloud.delegation+json"
+                })
+        }));
+        assert!(routes.iter().any(|route| {
             route.uri.path() == "/invoke"
                 && route.format.as_ref().is_some_and(|format| {
                     format.to_string() == "application/vnd.tinycloud.share+json"
@@ -2516,6 +2989,10 @@ mod tests {
             &domain_matcher,
         )
         .is_ok());
+        assert!(
+            validate_invitation_recipient(None, Some(&domain_matcher), None, &domain_matcher,)
+                .is_ok()
+        );
         let outside_domain = CanonicalEmail::parse("notify@other.example").unwrap();
         assert!(validate_invitation_recipient(
             None,
@@ -2531,10 +3008,6 @@ mod tests {
             &domain_matcher,
         )
         .is_err());
-        assert!(
-            validate_invitation_recipient(None, Some(&domain_matcher), None, &domain_matcher,)
-                .is_err()
-        );
     }
 
     #[test]
@@ -2582,8 +3055,67 @@ mod tests {
     fn signed_native_operation_fields_are_strictly_typed() {
         assert!(valid_signed_content_type("text/markdown; charset=utf-8"));
         assert!(valid_signed_content_type("text/plain"));
-        assert!(!valid_signed_content_type("application/octet-stream"));
+        assert!(valid_signed_content_type("application/octet-stream"));
         assert!(!valid_signed_content_type("text/markdown\r\nX-Leak: yes"));
+    }
+
+    #[test]
+    fn checked_in_v2_vectors_are_byte_for_byte_jcs_digests() {
+        let vectors: Value =
+            serde_json::from_str(include_str!("../specs/share-email-v2/vectors.json")).unwrap();
+        for name in [
+            "addressedDelegationRequest",
+            "invitationAuthorizationRequest",
+        ] {
+            let vector = &vectors["vectors"][name];
+            if let Some(body) = vector.get("body") {
+                assert_eq!(
+                    jcs::canonicalize(body),
+                    vector["canonicalJson"].as_str().unwrap().as_bytes()
+                );
+                assert_eq!(
+                    digest(body).as_str(),
+                    vector["requestBodyDigest"].as_str().unwrap()
+                );
+            } else {
+                let canonical = vector["canonicalJson"].as_str().unwrap();
+                let value: Value = serde_json::from_str(canonical).unwrap();
+                assert_eq!(jcs::canonicalize(&value), canonical.as_bytes());
+                assert_eq!(
+                    digest(&value).as_str(),
+                    vector["requestBodyDigest"].as_str().unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v2_share_url_is_exactly_bound_to_the_share_and_return_origin() {
+        let cid =
+            ShareCid::parse("bafkreiekhtgxpb5xhykd6pytalpkmg52trryror2gritt7r56jv2t75fl4").unwrap();
+        let url = format!(
+            "https://share.tinycloud.xyz/s/{}#k={}",
+            cid.as_str(),
+            "A".repeat(43)
+        );
+        assert!(validate_share_url(
+            &url,
+            &cid,
+            "https://share.tinycloud.xyz"
+        ));
+        assert!(!validate_share_url(
+            &url.replace("#k=", "?x=1#k="),
+            &cid,
+            "https://share.tinycloud.xyz"
+        ));
+        assert!(!validate_share_url(
+            &url.replace(
+                cid.as_str(),
+                "bafkreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            &cid,
+            "https://share.tinycloud.xyz"
+        ));
     }
 
     #[tokio::test]

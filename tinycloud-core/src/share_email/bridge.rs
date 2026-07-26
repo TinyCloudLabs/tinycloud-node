@@ -73,6 +73,25 @@ pub struct DatabaseAuthorityBridge117 {
 }
 
 impl DatabaseAuthorityBridge117 {
+    /// Resolve the exact authenticated authority record selected by a native
+    /// addressed-authoring request.  Callers receive only the already
+    /// verified public artifact bytes; the provider never exposes signing
+    /// material.
+    pub async fn authority_material_for(
+        &self,
+        policy_cid: &super::types::PolicyCid,
+        delegation_cid: &super::types::ShareDelegationCid,
+        handle: &super::types::AuthorityMaterialHandle,
+        material_digest: &Sha256Digest,
+    ) -> Result<super::ports::AuthorityMaterialBundle, PortError> {
+        self.authority_material
+            .as_ref()
+            .filter(|provider| provider.healthy())
+            .ok_or(PortError::Unavailable)?
+            .resolve_exact(policy_cid, delegation_cid, handle, material_digest)
+            .await
+    }
+
     async fn issue_root_in_transaction(
         &self,
         tx: &sea_orm::DatabaseTransaction,
@@ -496,6 +515,8 @@ impl DatabaseAuthorityBridge117 {
 #[derive(Serialize, Deserialize)]
 struct SessionBinding {
     scope_digest: Sha256Digest,
+    #[serde(default)]
+    scope: Option<ShareScope>,
     delegation_cid: super::types::ShareDelegationCid,
     credential_digest: Sha256Digest,
 }
@@ -598,6 +619,7 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
 
         let binding = SessionBinding {
             scope_digest: scope_digest(&request.scope),
+            scope: Some(request.scope.clone()),
             delegation_cid: request
                 .scope
                 .delegation_cid
@@ -674,7 +696,11 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
         if scope.delegation_cid.is_none() {
             scope.delegation_cid = Some(binding.delegation_cid.clone());
         }
-        if scope_digest(&scope) != binding.scope_digest {
+        if let Some(ceiling) = binding.scope.as_ref() {
+            if !scope_is_attenuation(ceiling, &scope) {
+                return Err(PortError::Denied);
+            }
+        } else if scope_digest(&scope) != binding.scope_digest {
             return Err(PortError::Denied);
         }
 
@@ -717,6 +743,53 @@ impl PolicyAuthorityTransaction117 for DatabaseAuthorityBridge117 {
         };
         Ok(AuthorizedRead::from_parts(session, invocation))
     }
+}
+
+fn scope_is_attenuation(ceiling: &ShareScope, request: &ShareScope) -> bool {
+    if ceiling.share_cid != request.share_cid
+        || ceiling.share_id != request.share_id
+        || ceiling.authority_material_handle != request.authority_material_handle
+        || ceiling.authority_material_digest != request.authority_material_digest
+        || ceiling.policy_cid != request.policy_cid
+        || ceiling.node_audience != request.node_audience
+        || ceiling.target_origin != request.target_origin
+        || ceiling.content_source != request.content_source
+        || ceiling.content_source_digest != request.content_source_digest
+        || request
+            .allowed_actions
+            .iter()
+            .any(|action| !ceiling.allowed_actions.contains(action))
+        || !ceiling.allowed_actions.contains(&request.action)
+    {
+        return false;
+    }
+    match (&ceiling.resource, &request.resource, request.action) {
+        (
+            super::types::ExactResource::KvPrefix { path: prefix },
+            super::types::ExactResource::KvPrefix { path: requested },
+            super::types::ShareAction::KvList,
+        ) => same_or_descendant_path(prefix, requested),
+        (
+            super::types::ExactResource::KvPrefix { path: prefix },
+            super::types::ExactResource::Kv { path: requested },
+            super::types::ShareAction::KvGet,
+        ) => same_or_descendant_path(prefix, requested),
+        (
+            super::types::ExactResource::KvPrefix { path: prefix },
+            super::types::ExactResource::Kv { path: requested },
+            super::types::ShareAction::KvPut,
+        ) => super::types::is_direct_child_path(prefix, requested),
+        (left, right, _) => left == right,
+    }
+}
+
+fn same_or_descendant_path(prefix: &super::types::Path, candidate: &super::types::Path) -> bool {
+    prefix.as_str().is_empty()
+        || prefix.as_str() == candidate.as_str()
+        || candidate
+            .as_str()
+            .strip_prefix(prefix.as_str())
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 impl DatabaseAuthorityBridge117 {
@@ -925,6 +998,15 @@ impl DatabaseAuthorityBridge117 {
             scope.action.is_list(),
         )
         .map_err(|_| PortError::Denied)?;
+        if scope.allowed_actions.is_empty()
+            || !scope.allowed_actions.contains(&scope.action)
+            || scope
+                .allowed_actions
+                .windows(2)
+                .any(|pair| pair[0].as_str() >= pair[1].as_str())
+        {
+            return Err(PortError::Denied);
+        }
         if matches!(scope.action, super::types::ShareAction::KvList)
             && !matches!(scope.resource, super::types::ExactResource::KvPrefix { .. })
         {
@@ -959,7 +1041,10 @@ impl DatabaseAuthorityBridge117 {
                 &scope.authority_material_digest,
             )
             .await?;
-        validate_share_policy_state(&bundle.policy_state, scope)?;
+        validate_share_policy_state(&bundle.policy_state, scope).map_err(|failure| {
+            tracing::error!(failure = ?failure, stage = "validate_share_policy_state", "share scope validation failed");
+            failure
+        })?;
         let verifier = AuthorityArtifactVerifier;
         let signed_policy = verifier
             .verify(&bundle.policy_authority)
@@ -1108,7 +1193,10 @@ impl DatabaseAuthorityBridge117 {
         {
             return Err(PortError::Denied);
         }
-        let statement = authorized_statement(scope, &policy, &delegation)?;
+        let statement = authorized_statement(scope, &policy, &delegation).map_err(|failure| {
+            tracing::error!(failure = ?failure, stage = "authorized_statement", "share scope validation failed");
+            failure
+        })?;
         Ok((expiry, matcher, statement, bundle.internal_delegation_cid))
     }
 }
@@ -1202,13 +1290,28 @@ fn validate_share_policy_state(bytes: &[u8], scope: &ShareScope) -> Result<(), P
             let policy: super::types::SharePolicyV2 =
                 serde_json::from_value(value.clone()).map_err(|_| PortError::Denied)?;
             policy.validate().map_err(|_| PortError::Denied)?;
-            if !policy.actions.iter().any(|item| item.as_str() == action) {
+            if !policy.actions.iter().any(|item| item.as_str() == action)
+                || scope
+                    .allowed_actions
+                    .iter()
+                    .any(|item| !policy.actions.contains(item))
+            {
                 return Err(PortError::Denied);
             }
             let (kind, prefix) = match policy.resource.kind {
                 super::types::SharePolicyResourceKind::Exact => ("exact", policy.resource.value),
                 super::types::SharePolicyResourceKind::Prefix => ("prefix", policy.resource.value),
             };
+            if kind == "prefix"
+                && action == super::types::ShareAction::KvPut.as_str()
+                && !super::types::is_direct_child_path(
+                    &super::types::Path::parse(prefix.clone()).map_err(|_| PortError::Denied)?,
+                    &super::types::Path::parse(resource.to_owned())
+                        .map_err(|_| PortError::Denied)?,
+                )
+            {
+                return Err(PortError::Denied);
+            }
             if (kind == "exact" && prefix != resource)
                 || (kind == "prefix"
                     && resource != prefix
@@ -1582,6 +1685,7 @@ mod tests {
             node_audience: Did::parse("did:web:node.example").unwrap(),
             target_origin: TargetOrigin::parse("https://node.example").unwrap(),
             action: ShareAction::KvGet,
+            allowed_actions: vec![ShareAction::KvGet],
             resource: ExactResource::Kv {
                 path: Path::parse("documents/plan.md").unwrap(),
             },
@@ -1639,6 +1743,7 @@ mod tests {
             node_audience: Did::parse("did:web:node.example").unwrap(),
             target_origin: TargetOrigin::parse("https://node.example").unwrap(),
             action: ShareAction::SqlRead,
+            allowed_actions: vec![ShareAction::SqlRead],
             resource: ExactResource::Sql {
                 database,
                 path,

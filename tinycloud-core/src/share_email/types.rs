@@ -13,6 +13,14 @@ pub const KV_PUT_ACTION: &str = "tinycloud.kv/put";
 pub const SQL_READ_ACTION: &str = "tinycloud.sql/read";
 pub const MARKDOWN_MEDIA_TYPE: &str = "text/markdown; charset=utf-8";
 pub const MAX_MARKDOWN_BYTES: usize = 1_048_576;
+/// Addressed native KV content has the product-wide sharing ceiling. The
+/// Markdown adapters intentionally retain their stricter validation boundary.
+pub const MAX_NATIVE_SHARE_CONTENT_BYTES: usize = 100 * 1024 * 1024;
+/// Native JSON carries content as base64url, so request and response ceilings
+/// are separate from the plaintext product limit.
+pub const MAX_NATIVE_ENCODED_REQUEST_BYTES: usize =
+    (MAX_NATIVE_SHARE_CONTENT_BYTES / 3) * 4 + 2_000_000;
+pub const MAX_NATIVE_RESPONSE_BYTES: usize = MAX_NATIVE_ENCODED_REQUEST_BYTES + 4_000_000;
 pub const MAX_CID_BYTES: usize = 59;
 pub const MAX_SHARE_ID_BYTES: usize = 128;
 pub const MAX_DATABASE_NAME_BYTES: usize = 128;
@@ -630,6 +638,20 @@ impl RecipientMatcher {
         }
     }
 
+    /// V2 policy and invitation artifacts carry the normalized matcher, not
+    /// merely a matcher that can be normalized later.  This keeps the signed
+    /// bytes and the value consumed by Share/OpenCredentials identical.
+    pub fn is_canonical(&self) -> bool {
+        match self {
+            Self::ExactEmail(value) => tinycloud_auth::share_email_evidence::normalize_email(value)
+                .is_ok_and(|normalized| normalized == *value),
+            Self::EmailDomain(value) => {
+                tinycloud_auth::share_email_evidence::normalize_policy_domain(value)
+                    .is_ok_and(|normalized| normalized == *value)
+            }
+        }
+    }
+
     pub fn matches_verified_email(&self, verified_email: &str) -> bool {
         match self {
             Self::ExactEmail(expected) => {
@@ -753,7 +775,9 @@ impl SharePolicyV2 {
         } {
             return Err(TypeError::InvalidRecipientMatcher);
         }
-        self.recipient_matcher.canonical()?;
+        if !self.recipient_matcher.is_canonical() {
+            return Err(TypeError::InvalidRecipientMatcher);
+        }
         let source_value = serde_json::to_value(&self.content_source)
             .map_err(|_| TypeError::InvalidRecipientMatcher)?;
         let source_digest = Sha256Digest::from_bytes(
@@ -767,11 +791,16 @@ impl SharePolicyV2 {
             &time::format_description::well_known::Rfc3339,
         )
         .map_err(|_| TypeError::InvalidRecipientMatcher)?;
-        if expiry
+        let canonical_expiry = expiry
             .format(&time::format_description::well_known::Rfc3339)
-            .map_err(|_| TypeError::InvalidRecipientMatcher)?
-            != self.expires_at
-        {
+            .map_err(|_| TypeError::InvalidRecipientMatcher)?;
+        let canonical_millis_expiry = format!(
+            "{}.000Z",
+            canonical_expiry
+                .strip_suffix('Z')
+                .ok_or(TypeError::InvalidRecipientMatcher)?
+        );
+        if self.expires_at != canonical_expiry && self.expires_at != canonical_millis_expiry {
             return Err(TypeError::InvalidRecipientMatcher);
         }
         if self.resource.value.is_empty() {
@@ -786,11 +815,6 @@ impl SharePolicyV2 {
             if !same_or_descendant_path(source_path, &path) {
                 return Err(TypeError::InvalidPath);
             }
-        }
-        if self.resource.kind == SharePolicyResourceKind::Prefix
-            && self.actions.iter().any(|action| action.is_edit())
-        {
-            return Err(TypeError::InvalidPath);
         }
         Ok(())
     }
@@ -904,9 +928,25 @@ pub struct ShareScope {
     pub node_audience: Did,
     pub target_origin: TargetOrigin,
     pub action: ShareAction,
+    /// The authenticated policy action ceiling. `action` is the operation
+    /// selected for this request; this set permits only bounded attenuation.
+    pub allowed_actions: Vec<ShareAction>,
     pub resource: ExactResource,
     pub content_source: ContentSource,
     pub content_source_digest: Sha256Digest,
+}
+
+/// Return true only when `candidate` is the immediate child of `prefix`.
+pub fn is_direct_child_path(prefix: &Path, candidate: &Path) -> bool {
+    let remainder = if prefix.as_str().is_empty() {
+        candidate.as_str()
+    } else {
+        candidate
+            .as_str()
+            .strip_prefix(&format!("{}/", prefix.as_str()))
+            .unwrap_or("")
+    };
+    !remainder.is_empty() && !remainder.contains('/')
 }
 
 /// Opaque, scope-bound direct-child cursor. It intentionally contains only
@@ -1351,6 +1391,7 @@ mod tests {
             node_audience: Did::parse("did:web:node.example").unwrap(),
             target_origin: TargetOrigin::parse("https://node.example").unwrap(),
             action: ShareAction::KvGet,
+            allowed_actions: vec![ShareAction::KvGet],
             resource: ExactResource::Kv {
                 path: Path::parse("documents/secret.md").unwrap(),
             },
