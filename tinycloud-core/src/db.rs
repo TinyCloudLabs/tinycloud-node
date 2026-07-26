@@ -1565,7 +1565,7 @@ where
                 (space, "kv", "tinycloud.kv/list", path) => {
                     let (list, truncated) =
                         list_bounded(&self.conn, space, path, options.list_limit).await?;
-                    results.push(InvocationOutcome::KvList(list, truncated));
+                    results.push(InvocationOutcome::KvList(list, truncated, None));
                 }
                 (space, "kv", "tinycloud.kv/metadata", path) => {
                     results.push(InvocationOutcome::KvMetadata(
