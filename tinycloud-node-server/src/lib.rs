@@ -401,9 +401,7 @@ pub async fn app_with_control(
     let rocket = rocket::custom(config)
         .mount("/", routes)
         .attach(AdHoc::config::<Config>())
-        .attach(tracing::TracingFairing {
-            header_name: tinycloud_config.log.tracing.traceheader,
-        })
+        .attach(tracing::TracingFairing::new(&tinycloud_config.log.tracing))
         .attach(AdHoc::on_liftoff(
             "invocation-replay-cleanup",
             move |rocket| {
