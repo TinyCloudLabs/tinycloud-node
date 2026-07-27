@@ -1702,8 +1702,10 @@ fn is_pk_epoch_conflict(error: &DbErr) -> bool {
             if code == Some("23505") && db_err.constraint() == Some("pk-epoch") {
                 return true;
             }
-            if matches!(code, Some("1555") | Some("2067")) && db_err.message().contains("pk-epoch")
-            {
+            // SQLite extended code 1555 = SQLITE_CONSTRAINT_PRIMARYKEY.
+            // The driver omits constraint() for SQLite; match on the table name
+            // in the message ("epoch.") to exclude other tables (e.g. epoch_order).
+            if matches!(code, Some("1555") | Some("2067")) && db_err.message().contains("epoch.") {
                 return true;
             }
             false
@@ -3906,6 +3908,56 @@ mod test {
 
         let listed: HashSet<SpaceId> = db.list_space_ids().await.unwrap().into_iter().collect();
         assert_eq!(listed, HashSet::from([a, b]));
+    }
+
+    #[tokio::test]
+    async fn sqlite_pk_epoch_conflict_matches_live_driver() {
+        let db = get_db().await.unwrap();
+        let space = test_space_id("pk-epoch-conflict");
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        let epoch_id = crate::hash::hash(b"sqlite-pk-epoch-conflict");
+        let model = epoch::ActiveModel {
+            seq: Set(0),
+            id: Set(epoch_id),
+            space: Set(SpaceIdWrap(space.clone())),
+        };
+
+        epoch::Entity::insert(model.clone())
+            .exec(&db.conn)
+            .await
+            .unwrap();
+
+        let error = epoch::Entity::insert(model)
+            .exec(&db.conn)
+            .await
+            .unwrap_err();
+
+        // Sanitized metadata only — never print the full message
+        if let DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(ref db_err)))
+        | DbErr::Query(RuntimeErr::SqlxError(SqlxError::Database(ref db_err))) = error
+        {
+            let code = db_err.code();
+            let constraint = db_err.constraint();
+            let msg_has_pk_epoch = db_err.message().contains("pk-epoch");
+            let msg_has_epoch = db_err.message().contains("epoch");
+            let msg_has_unique =
+                db_err.message().contains("unique") || db_err.message().contains("UNIQUE");
+            eprintln!(
+                "sqlite pk-epoch conflict: code={:?} constraint={:?} msg_has_pk_epoch={} msg_has_epoch={} msg_has_unique={}",
+                code, constraint, msg_has_pk_epoch, msg_has_epoch, msg_has_unique
+            );
+        }
+
+        assert!(
+            is_pk_epoch_conflict(&error),
+            "is_pk_epoch_conflict must return true for a duplicate pk-epoch insert"
+        );
     }
 
     #[tokio::test]
