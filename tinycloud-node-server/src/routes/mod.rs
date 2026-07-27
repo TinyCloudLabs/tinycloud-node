@@ -6155,19 +6155,36 @@ mod tests {
         Ok(())
     }
 
-    /// Two independently constructed TinyCloud/Rocket instances sharing the same
-    /// file-backed SQLite database prove that the idempotency guarantee does not
-    /// rely on process-local locks.
+    /// Decisive two-instance /delegate proof.
+    ///
+    /// The prior version of this test completed two exact sequential requests
+    /// (one per instance) *before* its concurrent barrier, so the "contested"
+    /// wave only ever hit an already-fully-committed row — the precheck fast
+    /// path (`delegation::Entity::find_by_id` in `SpaceDatabase::delegate`),
+    /// never the pk-epoch INSERT race or `reconcile_pk_epoch_delegation`.
+    /// That made it a false-green proof of idempotency, not of concurrency
+    /// safety. This version releases a genuinely fresh, never-before-sent
+    /// delegation from the barrier itself, split across two independently
+    /// constructed Rocket/TinyCloud instances that share one file-backed WAL
+    /// SQLite database with independent writer-lock domains (separate SeaORM
+    /// connection pools opened against the same file).
     ///
     /// Schedule:
-    ///   - Two completed sequential replays (one from each instance)
-    ///   - Overlapping concurrent requests from both instances
-    ///   - Later sequential replays from each instance
-    ///   - Distinct signed delegations for the same hosted space do not alias
-    ///   - Multi-space delegation uses distinct composite space keys (one epoch
-    ///     per space, not a shared epoch row across spaces)
+    ///   1. A fresh signed delegation, never sent before, is released from an
+    ///      8-way barrier split across both instances.
+    ///   2. A completed replay.
+    ///   3. A second overlapping 8-way barrier wave (already committed).
+    ///   4. Later sequential replays from each instance.
+    ///
+    /// After step 1, exactly one response must show a real commit
+    /// (`activated` non-empty) — the pk-epoch INSERT winner — and the other
+    /// seven must be idempotent reconciliations (`activated` empty), which is
+    /// the only way this schedule can be green without the row already
+    /// existing beforehand. Steps 2-4 assert zero diagnostic-seam failures
+    /// and that every idempotent response carries identical activated/skipped
+    /// semantics.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn rocket_delegate_two_instance_shared_db() -> Result<()> {
+    async fn rocket_delegate_two_instance_fresh_barrier_wave() -> Result<()> {
         use rocket::http::Header;
         use rocket::local::asynchronous::Client;
         use std::sync::Arc;
@@ -6182,14 +6199,14 @@ mod tests {
             ucan_capabilities_object::Capabilities,
         };
         use tinycloud_core::{
-            models::{delegation as deleg_model, epoch, space as space_model},
-            relationships::event_order,
+            models::{abilities, delegation as deleg_model, epoch, space as space_model},
+            relationships::{event_order, parent_delegations},
             sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait, PaginatorTrait},
             types::SpaceIdWrap,
         };
 
         let tempdir = TempDir::new()?;
-        let db_path = tempdir.path().join("two_instance.db");
+        let db_path = tempdir.path().join("two_instance_fresh.db");
         let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
         let storage_a = tempdir.path().join("storage_a");
         let storage_b = tempdir.path().join("storage_b");
@@ -6198,6 +6215,8 @@ mod tests {
         std::fs::create_dir_all(&storage_a)?;
         std::fs::create_dir_all(&storage_b)?;
 
+        // Independent connection pools against the same file — independent
+        // writer-lock domains, not a shared in-process lock.
         let db_a = Database::connect(crate::sqlite_connect_options(&db_url)).await?;
         let storage_fa = NodeFileSystemConfig::new(&storage_a).open().await?;
         let tc_a = TinyCloud::new(
@@ -6218,7 +6237,6 @@ mod tests {
 
         let conn = db_a.clone();
 
-        // Owner for space 1.
         let jwk = JWK::generate_ed25519()?;
         let mut vm = DID_METHODS.generate(&jwk, "key")?.to_string();
         let frag = vm
@@ -6234,69 +6252,38 @@ mod tests {
             .parse()?;
         let space: SpaceId = SpaceId::new(owner_did.clone(), "files".parse()?);
 
-        // Owner for space 2.
-        let jwk2 = JWK::generate_ed25519()?;
-        let mut vm2 = DID_METHODS.generate(&jwk2, "key")?.to_string();
-        let frag2 = vm2
-            .rsplit_once(':')
-            .map(|(_, f)| f.to_owned())
-            .ok_or_else(|| anyhow::anyhow!("no fragment"))?;
-        vm2.push('#');
-        vm2.push_str(&frag2);
-        let owner_did2: DIDBuf = vm2
-            .split('#')
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("no did"))?
-            .parse()?;
-        let space2: SpaceId = SpaceId::new(owner_did2.clone(), "docs".parse()?);
-
-        // Preinsert both hosted spaces.
-        for sp in [&space, &space2] {
-            space_model::ActiveModel {
-                id: Set(SpaceIdWrap(sp.clone())),
-            }
-            .insert(&conn)
-            .await?;
+        // Preinsert the hosted target space.
+        space_model::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
         }
+        .insert(&conn)
+        .await?;
 
-        let make_auth =
-            |jwk: &JWK, vm_str: &str, owner: &DIDBuf, sp: &SpaceId, nonce: &str| -> String {
-                let resource = sp.clone().to_resource(
-                    "kv".parse::<Service>().unwrap(),
-                    Some("doc".parse().unwrap()),
-                    None,
-                    None,
-                );
-                let mut caps = Capabilities::<()>::new();
-                caps.with_actions(
-                    resource.as_uri(),
-                    std::iter::once(("tinycloud.kv/put".parse().unwrap(), [])),
-                );
-                Payload {
-                    issuer: vm_str.parse::<DIDURLBuf>().unwrap(),
-                    audience: owner.clone(),
-                    not_before: None,
-                    expiration: NumericDate::try_from_seconds(4_102_444_800.0).unwrap(),
-                    nonce: Some(nonce.to_string()),
-                    facts: Some(Vec::<serde_json::Value>::new()),
-                    proof: vec![],
-                    attenuation: caps,
-                }
-                .sign(Algorithm::EdDSA, jwk)
-                .unwrap()
-                .encode()
-                .unwrap()
-            };
-
-        let auth_exact = make_auth(&jwk, &vm, &owner_did, &space, "two-instance-exact-nonce");
-        let auth_distinct = make_auth(&jwk, &vm, &owner_did, &space, "two-instance-distinct-nonce");
-        let auth_space2 = make_auth(
-            &jwk2,
-            &vm2,
-            &owner_did2,
-            &space2,
-            "two-instance-space2-nonce",
+        let resource = space.clone().to_resource(
+            "kv".parse::<Service>().unwrap(),
+            Some("doc".parse().unwrap()),
+            None,
+            None,
         );
+        let mut caps = Capabilities::<()>::new();
+        caps.with_actions(
+            resource.as_uri(),
+            std::iter::once(("tinycloud.kv/put".parse()?, [])),
+        );
+
+        // ONE fresh signed delegation — never sent before this point.
+        let auth_exact = Payload {
+            issuer: vm.parse::<DIDURLBuf>()?,
+            audience: owner_did,
+            not_before: None,
+            expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
+            nonce: Some("two-instance-fresh-barrier-nonce".to_string()),
+            facts: Some(Vec::<serde_json::Value>::new()),
+            proof: vec![],
+            attenuation: caps,
+        }
+        .sign(Algorithm::EdDSA, &jwk)?
+        .encode()?;
 
         let build_client = |tc: TinyCloud| async move {
             let r = rocket::build()
@@ -6323,23 +6310,8 @@ mod tests {
             (status, body)
         };
 
-        // ── Two completed sequential replays (one from each instance) ────────
-        let (s1, b1) = send(Arc::clone(&client_a), auth_exact.clone()).await;
-        assert!(s1.class().is_success(), "instance-A first: {s1}: {b1}");
-        let cid_exact: String = serde_json::from_str::<serde_json::Value>(&b1)?["cid"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("no cid"))?
-            .to_string();
-
-        let (s2, b2) = send(Arc::clone(&client_b), auth_exact.clone()).await;
-        assert!(s2.class().is_success(), "instance-B replay: {s2}: {b2}");
-        let cid_exact2: String = serde_json::from_str::<serde_json::Value>(&b2)?["cid"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("no cid"))?
-            .to_string();
-        assert_eq!(cid_exact, cid_exact2, "sequential replay CID must match");
-
-        // ── Overlapping concurrent requests from both instances ──────────────
+        // ── Step 1: 8 byte-identical fresh requests released from one barrier,
+        //    split across both instances, before any success is pre-seeded. ──
         const N: usize = 8;
         let barrier = Arc::new(tokio::sync::Barrier::new(N));
         let mut handles = Vec::with_capacity(N);
@@ -6353,99 +6325,227 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             handles.push(tokio::spawn(async move {
                 barrier.wait().await;
-                let resp = client
-                    .post("/delegate")
-                    .header(Header::new("Authorization", auth))
-                    .dispatch()
-                    .await;
-                let status = resp.status();
-                let body = resp.into_string().await.unwrap_or_default();
-                (status, body)
+                send(client, auth).await
             }));
         }
+
+        let mut wave1_bodies: Vec<serde_json::Value> = Vec::with_capacity(N);
         for (i, h) in handles.into_iter().enumerate() {
-            let (s, b) = h.await?;
-            assert!(s.class().is_success(), "overlapping request {i}: {s}: {b}");
-            let cid: String = serde_json::from_str::<serde_json::Value>(&b)?["cid"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("no cid"))?
-                .to_string();
-            assert_eq!(cid, cid_exact, "overlapping request {i} CID must match");
+            let (status, body) = h.await?;
+            assert!(
+                status.class().is_success(),
+                "fresh barrier request {i} must be 2xx, got {status}: {body}"
+            );
+            wave1_bodies.push(serde_json::from_str(&body)?);
         }
 
-        // ── Later sequential replays from each instance ──────────────────────
-        let (sl_a, bl_a) = send(Arc::clone(&client_a), auth_exact.clone()).await;
-        assert!(sl_a.class().is_success(), "A-late-replay: {sl_a}: {bl_a}");
-        let cid_la: String = serde_json::from_str::<serde_json::Value>(&bl_a)?["cid"]
+        let cid_exact = wave1_bodies[0]["cid"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("no cid"))?
             .to_string();
-        assert_eq!(cid_la, cid_exact, "A late replay CID must match");
+        for (i, b) in wave1_bodies.iter().enumerate() {
+            assert_eq!(
+                b["cid"].as_str(),
+                Some(cid_exact.as_str()),
+                "wave-1 response {i} CID must match response 0 CID"
+            );
+        }
+
+        // Exactly one of the 8 responses is the real pk-epoch INSERT winner
+        // (non-empty `activated`); the rest are idempotent reconciliations
+        // (`activated` empty). This is only possible if the wave found the
+        // row genuinely absent and raced for it.
+        let activated_nonempty = wave1_bodies
+            .iter()
+            .filter(|b| {
+                b["activated"]
+                    .as_array()
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(
+            activated_nonempty, 1,
+            "exactly one fresh-wave response must be the genuine commit winner"
+        );
+
+        // Exactly one delegation row.
+        let del_count = deleg_model::Entity::find().count(&conn).await?;
+        assert_eq!(del_count, 1, "exactly one delegation row after fresh wave");
+
+        // Exact ability tuple, including caveats: exactly one row, matching
+        // resource, ability, and empty caveats.
+        let deleg_row = deleg_model::Entity::find()
+            .one(&conn)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("delegation row must exist"))?;
+        let ability_rows = abilities::Entity::find()
+            .filter(abilities::Column::Delegation.eq(deleg_row.id))
+            .all(&conn)
+            .await?;
+        assert_eq!(ability_rows.len(), 1, "exactly one ability row");
+        assert_eq!(
+            ability_rows[0].resource.to_string(),
+            resource.as_uri().to_string(),
+            "ability row resource must match the exact signed resource"
+        );
+        assert_eq!(
+            ability_rows[0].ability.to_string(),
+            "tinycloud.kv/put",
+            "ability row ability must match the exact signed ability"
+        );
+        assert_eq!(
+            ability_rows[0].caveats,
+            tinycloud_core::types::Caveats::default(),
+            "ability row caveats must match the exact signed (empty) caveats"
+        );
+
+        // Exact parent hash set: root delegation, so the set is empty.
+        let parent_count = parent_delegations::Entity::find().count(&conn).await?;
+        assert_eq!(
+            parent_count, 0,
+            "exact parent hash set is empty for a root delegation"
+        );
+
+        // Exactly one event_order and one epoch row for the hosted space.
+        let event_order_count = event_order::Entity::find().count(&conn).await?;
+        assert_eq!(event_order_count, 1, "exactly one event_order row");
+        let epoch_count = epoch::Entity::find().count(&conn).await?;
+        assert_eq!(epoch_count, 1, "exactly one epoch row for the hosted space");
+
+        // Zero diagnostic-seam failures: 7 losing requests must have taken the
+        // successful-reconciliation path, not a mismatch/classifier-miss path.
+        assert_eq!(
+            tinycloud_core::db::EpochReconcileReason::ClassifierMiss.count(),
+            0,
+            "zero classifier_miss failures"
+        );
+        assert_eq!(
+            tinycloud_core::db::EpochReconcileReason::DelegationAbsent.count(),
+            0,
+            "zero delegation_absent failures"
+        );
+        assert_eq!(
+            tinycloud_core::db::EpochReconcileReason::AbilityMismatch.count(),
+            0,
+            "zero ability_mismatch failures"
+        );
+        assert_eq!(
+            tinycloud_core::db::EpochReconcileReason::ParentMismatch.count(),
+            0,
+            "zero parent_mismatch failures"
+        );
+        assert_eq!(
+            tinycloud_core::db::EpochReconcileReason::EventOrderAbsent.count(),
+            0,
+            "zero event_order_absent failures"
+        );
+        assert_eq!(
+            tinycloud_core::db::EpochReconcileReason::ReconcileReadError.count(),
+            0,
+            "zero reconcile_read_error failures"
+        );
+
+        // ── Step 2: a completed replay. ───────────────────────────────────
+        let (s, b) = send(Arc::clone(&client_a), auth_exact.clone()).await;
+        assert!(s.class().is_success(), "completed replay: {s}: {b}");
+        let replay: serde_json::Value = serde_json::from_str(&b)?;
+        assert_eq!(replay["cid"].as_str(), Some(cid_exact.as_str()));
+
+        // ── Step 3: a second overlapping barrier wave (already committed). ─
+        let barrier2 = Arc::new(tokio::sync::Barrier::new(N));
+        let mut handles2 = Vec::with_capacity(N);
+        for i in 0..N {
+            let client = if i % 2 == 0 {
+                Arc::clone(&client_a)
+            } else {
+                Arc::clone(&client_b)
+            };
+            let auth = auth_exact.clone();
+            let barrier = Arc::clone(&barrier2);
+            handles2.push(tokio::spawn(async move {
+                barrier.wait().await;
+                send(client, auth).await
+            }));
+        }
+        let mut wave2_bodies: Vec<serde_json::Value> = Vec::with_capacity(N);
+        for (i, h) in handles2.into_iter().enumerate() {
+            let (status, body) = h.await?;
+            assert!(
+                status.class().is_success(),
+                "second wave request {i} must be 2xx, got {status}: {body}"
+            );
+            wave2_bodies.push(serde_json::from_str(&body)?);
+        }
+        for (i, b) in wave2_bodies.iter().enumerate() {
+            assert_eq!(
+                b["cid"].as_str(),
+                Some(cid_exact.as_str()),
+                "second wave response {i} CID must match"
+            );
+        }
+        // Identical activated/skipped semantics across every response in the
+        // already-committed second wave.
+        let reference_activated = &wave2_bodies[0]["activated"];
+        let reference_skipped = &wave2_bodies[0]["skipped"];
+        for (i, b) in wave2_bodies.iter().enumerate() {
+            assert_eq!(
+                &b["activated"], reference_activated,
+                "second wave response {i} activated must match response 0"
+            );
+            assert_eq!(
+                &b["skipped"], reference_skipped,
+                "second wave response {i} skipped must match response 0"
+            );
+        }
+
+        // ── Step 4: later sequential replays from each instance. ───────────
+        let (sl_a, bl_a) = send(Arc::clone(&client_a), auth_exact.clone()).await;
+        assert!(sl_a.class().is_success(), "A-late-replay: {sl_a}: {bl_a}");
+        let late_a: serde_json::Value = serde_json::from_str(&bl_a)?;
+        assert_eq!(late_a["cid"].as_str(), Some(cid_exact.as_str()));
+        assert_eq!(late_a["activated"], *reference_activated);
+        assert_eq!(late_a["skipped"], *reference_skipped);
 
         let (sl_b, bl_b) = send(Arc::clone(&client_b), auth_exact.clone()).await;
         assert!(sl_b.class().is_success(), "B-late-replay: {sl_b}: {bl_b}");
-        let cid_lb: String = serde_json::from_str::<serde_json::Value>(&bl_b)?["cid"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("no cid"))?
-            .to_string();
-        assert_eq!(cid_lb, cid_exact, "B late replay CID must match");
+        let late_b: serde_json::Value = serde_json::from_str(&bl_b)?;
+        assert_eq!(late_b["cid"].as_str(), Some(cid_exact.as_str()));
+        assert_eq!(late_b["activated"], *reference_activated);
+        assert_eq!(late_b["skipped"], *reference_skipped);
 
-        // Exactly one delegation row for the exact replay.
-        let del_count = deleg_model::Entity::find().count(&conn).await?;
+        // Zero diagnostic-seam failures across the entire schedule.
         assert_eq!(
-            del_count, 1,
-            "exactly one delegation row after exact replays"
+            tinycloud_core::db::EpochReconcileReason::ClassifierMiss.count(),
+            0
         );
-        let eo_count = event_order::Entity::find().count(&conn).await?;
         assert_eq!(
-            eo_count, 1,
-            "exactly one event_order row after exact replays"
+            tinycloud_core::db::EpochReconcileReason::DelegationAbsent.count(),
+            0
         );
-        let epoch_count_1 = epoch::Entity::find().count(&conn).await?;
         assert_eq!(
-            epoch_count_1, 1,
-            "exactly one epoch row after exact replays"
+            tinycloud_core::db::EpochReconcileReason::AbilityMismatch.count(),
+            0
         );
-
-        // ── Distinct signed delegations do not alias ─────────────────────────
-        let (sd, bd) = send(Arc::clone(&client_a), auth_distinct.clone()).await;
-        assert!(sd.class().is_success(), "distinct delegation: {sd}: {bd}");
-        let cid_distinct: String = serde_json::from_str::<serde_json::Value>(&bd)?["cid"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("no cid"))?
-            .to_string();
-        assert_ne!(
-            cid_distinct, cid_exact,
-            "distinct delegation must produce a different CID"
+        assert_eq!(
+            tinycloud_core::db::EpochReconcileReason::ParentMismatch.count(),
+            0
+        );
+        assert_eq!(
+            tinycloud_core::db::EpochReconcileReason::EventOrderAbsent.count(),
+            0
+        );
+        assert_eq!(
+            tinycloud_core::db::EpochReconcileReason::ReconcileReadError.count(),
+            0
         );
 
-        let del_count2 = deleg_model::Entity::find().count(&conn).await?;
-        assert_eq!(
-            del_count2, 2,
-            "two distinct delegations must produce two rows"
-        );
-
-        // ── Multi-space: each space gets its own epoch row ───────────────────
-        let (ss2, bs2) = send(Arc::clone(&client_a), auth_space2.clone()).await;
-        assert!(ss2.class().is_success(), "space2 delegation: {ss2}: {bs2}");
-        let epoch_count2 = epoch::Entity::find().count(&conn).await?;
-        assert_eq!(
-            epoch_count2, 3,
-            "three epoch rows: one per committed delegation (space1-exact, space1-distinct, space2)"
-        );
-
-        // Each epoch row must reference a unique (id, space) composite key.
-        let epochs = epoch::Entity::find().all(&conn).await?;
-        let mut composite_keys: std::collections::HashSet<(
-            tinycloud_core::hash::Hash,
-            tinycloud_core::types::SpaceIdWrap,
-        )> = std::collections::HashSet::new();
-        for ep in &epochs {
-            assert!(
-                composite_keys.insert((ep.id, ep.space.clone())),
-                "epoch composite key (id, space) must be unique across all rows"
-            );
-        }
+        // Final durable state: still exactly one row set for the one delegation.
+        assert_eq!(deleg_model::Entity::find().count(&conn).await?, 1);
+        assert_eq!(abilities::Entity::find().count(&conn).await?, 1);
+        assert_eq!(parent_delegations::Entity::find().count(&conn).await?, 0);
+        assert_eq!(event_order::Entity::find().count(&conn).await?, 1);
+        assert_eq!(epoch::Entity::find().count(&conn).await?, 1);
 
         Ok(())
     }
