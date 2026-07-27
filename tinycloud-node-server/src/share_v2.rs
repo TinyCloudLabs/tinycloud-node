@@ -902,7 +902,8 @@ fn parse_sdk_policy(
     config: &ShareEmailConfig,
     enforcer_did: &str,
 ) -> Result<PolicyEnvelope, ()> {
-    let sdk: SdkPolicyDocument = serde_json::from_value(value.clone()).map_err(|_| ())?;
+    let sdk_value = sdk_policy_document_value(value)?;
+    let sdk: SdkPolicyDocument = serde_json::from_value(sdk_value.clone()).map_err(|_| ())?;
     let facts = &request.enforcement_delegation.facts;
     if sdk.artifact_type != "TinyCloudSharePolicy"
         || sdk.version != 2
@@ -961,6 +962,15 @@ fn parse_sdk_policy(
             expires_at: sdk.expires_at,
         },
     })
+}
+
+fn sdk_policy_document_value(value: &Value) -> Result<&Value, ()> {
+    let object = value.as_object().ok_or(())?;
+    if object.get("domain") == Some(&Value::String(POLICY_DOMAIN.to_owned())) {
+        object.get("policy").ok_or(())
+    } else {
+        Err(())
+    }
 }
 
 fn validate_policy(
@@ -1624,7 +1634,8 @@ async fn registered_policy(
     let policy = if let Ok(policy) = serde_json::from_value::<PolicyEnvelope>(value.clone()) {
         policy
     } else {
-        let sdk: SdkPolicyDocument = serde_json::from_value(value).map_err(|_| ())?;
+        let sdk_value = sdk_policy_document_value(&value)?;
+        let sdk: SdkPolicyDocument = serde_json::from_value(sdk_value.clone()).map_err(|_| ())?;
         let share_id = row.resource_path.split('/').nth(1).ok_or(())?.to_owned();
         PolicyEnvelope {
             domain: POLICY_DOMAIN.to_owned(),
