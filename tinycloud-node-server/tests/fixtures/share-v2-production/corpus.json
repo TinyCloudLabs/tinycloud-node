@@ -2,7 +2,7 @@
   "provenance": {
     "generator": "packages/sdk-core/src/delegations/fixtures/generate-share-v2-corpus.ts",
     "generatorVersion": "1.0.0",
-    "sdkCommit": "2495853a3cafb0d96a1f515f7de528d18ef15b50",
+    "sdkCommit": "45f79a612b942a838ce76614a673999a73cfe039",
     "algorithm": "sha256",
     "encoding": "base64url-unpadded",
     "canonicalization": "jcs-utf8-sorted-keys",
@@ -168,7 +168,7 @@
         "share-delivery.ts:validateShareDeliveryAuthorizationBytes"
       ],
       "value": {
-        "bodyBase64Url": "eyJhdXRob3JpemF0aW9uIjp7InR5cGUiOiJUaW55Q2xvdWRTaGFyZURlbGl2ZXJ5QXV0aG9yaXphdGlvbiIsInZlcnNpb24iOjIsImp0aSI6IkFRSURCQVVHQndnSkNnc01EUTRQRUEiLCJzaGFyZUNpZCI6ImJhZmtyZWljb3JwdXNzaGFyZWNpZHBsYWNlaG9sZGVyMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAiLCJzaGFyZUlkIjoic2hhcmUtdjItY29ycHVzLXJlZ2lzdHJhdGlvbiIsInJlZ2lzdHJhdGlvbkNpZCI6ImJhZmtyZWljejRlem9jc3k0emxvNjR0azMyaWR5cm93YmJkenZ4aTdsMmZ5d3VraHQyM2J6bmhxZHJhIiwiZGVsZWdhdGlvbkNpZCI6ImJhZnlvd25lcjRyZWdpc3RyYXRpb25jb3JwdXN2ZWN0b3IiLCJlbmZvcmNlbWVudERlbGVnYXRpb25DaWQiOiJiYWZrcmVpZWNnMmN5NG1rY3E3ZXVlb3JrdW16cGx2cWFubGZidXU2c29veGhlZHh0eXR6bDM3ZXhqNCIsImVudmVsb3BlQ2lkIjoiYmFma3JlaWNvcnB1c2VudmVsb3BlcGxhY2Vob2xkZXIwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwIiwicG9saWN5Q2lkIjoiYmFma3JlaWNvcnB1c3BvbGljeWNpZHBsYWNlaG9sZGVyMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMCIsIm5vZGVBdWRpZW5jZSI6ImRpZDp3ZWI6bm9kZS5leGFtcGxlLmNvcnB1cyIsInRhcmdldE9yaWdpbiI6Imh0dHBzOi8vbm9kZS5leGFtcGxlLmNvcnB1cyIsImhvbGRlciI6ImRpZDprZXk6ejZNa0NvcnB1c0hvbGRlciIsInJlY2lwaWVudE1hdGNoZXIiOnsia2luZCI6ImVtYWlsRG9tYWluIiwidmFsdWUiOiJleGFtcGxlLmNvbSJ9LCJkZWxpdmVyeUVtYWlsIjoicmVjaXBpZW50QGV4YW1wbGUuY29tIiwic2hhcmVVcmwiOiJodHRwczovL25vZGUuZXhhbXBsZS5jb3JwdXMvcy9iYWZrcmVpY29ycHVzc2hhcmVjaWRwbGFjZWhvbGRlcjAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwI2s9QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQSIsInJldHVybk9yaWdpbiI6Imh0dHBzOi8vbm9kZS5leGFtcGxlLmNvcnB1cyIsImRvY3VtZW50TmFtZSI6IlByb2plY3QgcGxhbi5tZCIsInNlbmRlckRpZCI6ImRpZDpwa2g6ZWlwMTU1OjE6MHgxMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExIiwic2VuZGVyVHJ1c3QiOiJ2ZXJpZmllZCIsImNvbnRlbnRTb3VyY2UiOnsia2luZCI6Imt2Iiwic3BhY2UiOiJ0aW55Y2xvdWQ6cGtoOmVpcDE1NToxOjB4MTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTpkZWZhdWx0IiwicGF0aCI6ImRvY3VtZW50cy9wbGFuLm1kIiwiYWN0aW9uIjoidGlueWNsb3VkLmt2L2dldCJ9LCJjb250ZW50U291cmNlRGlnZXN0IjoidjI2cmRGQ3dNY0xvTGd4d3JQNEl5TUR0cEtHNFpWX2ZwejNFc3lzdnRkZyIsInNoYXJlRXhwaXJlc0F0IjoiMjA5OS0wMS0wMVQwMDowMDowMC4wMDBaIiwiaXNzdWVkQXQiOiIyMDI0LTAxLTAxVDAwOjAwOjAwLjAwMFoiLCJyZXBvcnRBYnVzZVRva2VuIjoiQVFJREJBVUdCd2dKQ2dzTURRNFBFQSIsImFjdGlvbnMiOlsidGlueWNsb3VkLmt2L2dldCIsInRpbnljbG91ZC5rdi9tZXRhZGF0YSJdLCJyZXNvdXJjZSI6ImRvY3VtZW50cy9wbGFuLm1kIiwiYXV0aG9yaXR5TWF0ZXJpYWxIYW5kbGUiOiJiYWZrcmVpY3o0ZXpvY3N5NHpsbzY0dGszMmlkeXJvd2JiZHp2eGk3bDJmeXd1a2h0MjNiem5ocWRyYSIsImF1dGhvcml0eU1hdGVyaWFsRGlnZXN0IjoiLWVIM1VVcnEwdmwxejlGTU11ZWNGTzRFQ0tlZ2ZxRHZVMmZlRktabEExdyIsInJlcXVlc3RCb2R5RGlnZXN0IjoiaHJIV2VaRVlVWnN5eENmNHFER1pWQTAyemZodEpsLTdfZ0tfOUFpNm56byIsImlkZW1wb3RlbmN5S2V5IjoiQVFJREJBVUdCd2dKQ2dzTURRNFBFQSIsImV4cGlyZXNBdCI6IjIwOTktMDEtMDFUMDA6MDA6MDAuMDAwWiIsImRhdGFBdXRob3JpdHkiOmZhbHNlfSwicHJvb2YiOnsiYWxnIjoiRWREU0EiLCJraWQiOiJkaWQ6a2V5Ono2TWtnZ3RIVldRVUdKM0ZWakpLWGViNW9aVGhRdkxtSlZNVjhoZk5VejRlemNhdiN6Nk1rZ2d0SFZXUVVHSjNGVmpKS1hlYjVvWlRoUXZMbUpWTVY4aGZOVXo0ZXpjYXYiLCJzaWduYXR1cmUiOiJqemNVR2RRWXBQZW0yanlTTDNZOHRfdUlha3RwUnhZVW93Y2xBcDV5WlpWUlp6Q09rUzB4UVNlNTRSYlgzOGJHTnJnOXNhWmxqbEhxZ18xbGpfMFhCZyJ9fQ",
+        "bodyBase64Url": "eyJhdXRob3JpemF0aW9uIjp7InR5cGUiOiJUaW55Q2xvdWRTaGFyZURlbGl2ZXJ5QXV0aG9yaXphdGlvbiIsInZlcnNpb24iOjIsImp0aSI6IkFRSURCQVVHQndnSkNnc01EUTRQRUEiLCJzaGFyZUNpZCI6ImJhZmtyZWljb3JwdXNzaGFyZWNpZHBsYWNlaG9sZGVyMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAiLCJzaGFyZUlkIjoic2hhcmUtdjItY29ycHVzLXJlZ2lzdHJhdGlvbiIsInJlZ2lzdHJhdGlvbkNpZCI6ImJhZmtyZWljejRlem9jc3k0emxvNjR0azMyaWR5cm93YmJkenZ4aTdsMmZ5d3VraHQyM2J6bmhxZHJhIiwiZGVsZWdhdGlvbkNpZCI6ImJhZnlvd25lcjRyZWdpc3RyYXRpb25jb3JwdXN2ZWN0b3IiLCJlbmZvcmNlbWVudERlbGVnYXRpb25DaWQiOiJiYWZrcmVpZWNnMmN5NG1rY3E3ZXVlb3JrdW16cGx2cWFubGZidXU2c29veGhlZHh0eXR6bDM3ZXhqNCIsImVudmVsb3BlQ2lkIjoiYmFma3JlaWNvcnB1c2VudmVsb3BlcGxhY2Vob2xkZXIwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwIiwicG9saWN5Q2lkIjoiYmFma3JlaWNvcnB1c3BvbGljeWNpZHBsYWNlaG9sZGVyMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMCIsIm5vZGVBdWRpZW5jZSI6ImRpZDp3ZWI6bm9kZS5leGFtcGxlLmNvcnB1cyIsInRhcmdldE9yaWdpbiI6Imh0dHBzOi8vbm9kZS5leGFtcGxlLmNvcnB1cyIsIm9wZW5DcmVkZW50aWFsc0F1ZGllbmNlIjoiaHR0cHM6Ly93aXRuZXNzLmNyZWRlbnRpYWxzLm9yZyIsImhvbGRlciI6ImRpZDprZXk6ejZNa0NvcnB1c0hvbGRlciIsInJlY2lwaWVudE1hdGNoZXIiOnsia2luZCI6ImVtYWlsRG9tYWluIiwidmFsdWUiOiJleGFtcGxlLmNvbSJ9LCJkZWxpdmVyeUVtYWlsIjoicmVjaXBpZW50QGV4YW1wbGUuY29tIiwic2hhcmVVcmwiOiJodHRwczovL25vZGUuZXhhbXBsZS5jb3JwdXMvcy9iYWZrcmVpY29ycHVzc2hhcmVjaWRwbGFjZWhvbGRlcjAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwI2s9QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQSIsInJldHVybk9yaWdpbiI6Imh0dHBzOi8vbm9kZS5leGFtcGxlLmNvcnB1cyIsImRvY3VtZW50TmFtZSI6IlByb2plY3QgcGxhbi5tZCIsInNlbmRlckRpZCI6ImRpZDpwa2g6ZWlwMTU1OjE6MHgxMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExIiwic2VuZGVyVHJ1c3QiOiJ2ZXJpZmllZCIsImNvbnRlbnRTb3VyY2UiOnsia2luZCI6Imt2Iiwic3BhY2UiOiJ0aW55Y2xvdWQ6cGtoOmVpcDE1NToxOjB4MTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTpkZWZhdWx0IiwicGF0aCI6ImRvY3VtZW50cy9wbGFuLm1kIiwiYWN0aW9uIjoidGlueWNsb3VkLmt2L2dldCJ9LCJjb250ZW50U291cmNlRGlnZXN0IjoidjI2cmRGQ3dNY0xvTGd4d3JQNEl5TUR0cEtHNFpWX2ZwejNFc3lzdnRkZyIsInNoYXJlRXhwaXJlc0F0IjoiMjA5OS0wMS0wMVQwMDowMDowMC4wMDBaIiwiaXNzdWVkQXQiOiIyMDI0LTAxLTAxVDAwOjAwOjAwLjAwMFoiLCJyZXBvcnRBYnVzZVRva2VuIjoiQVFJREJBVUdCd2dKQ2dzTURRNFBFQSIsImFjdGlvbnMiOlsidGlueWNsb3VkLmt2L2dldCIsInRpbnljbG91ZC5rdi9tZXRhZGF0YSJdLCJyZXNvdXJjZSI6ImRvY3VtZW50cy9wbGFuLm1kIiwiYXV0aG9yaXR5TWF0ZXJpYWxIYW5kbGUiOiJiYWZrcmVpY3o0ZXpvY3N5NHpsbzY0dGszMmlkeXJvd2JiZHp2eGk3bDJmeXd1a2h0MjNiem5ocWRyYSIsImF1dGhvcml0eU1hdGVyaWFsRGlnZXN0IjoiLWVIM1VVcnEwdmwxejlGTU11ZWNGTzRFQ0tlZ2ZxRHZVMmZlRktabEExdyIsInJlcXVlc3RCb2R5RGlnZXN0IjoiaHJIV2VaRVlVWnN5eENmNHFER1pWQTAyemZodEpsLTdfZ0tfOUFpNm56byIsImlkZW1wb3RlbmN5S2V5IjoiQVFJREJBVUdCd2dKQ2dzTURRNFBFQSIsImV4cGlyZXNBdCI6IjIwOTktMDEtMDFUMDA6MDA6MDAuMDAwWiIsImRhdGFBdXRob3JpdHkiOmZhbHNlfSwicHJvb2YiOnsiYWxnIjoiRWREU0EiLCJraWQiOiJkaWQ6a2V5Ono2TWtnZ3RIVldRVUdKM0ZWakpLWGViNW9aVGhRdkxtSlZNVjhoZk5VejRlemNhdiN6Nk1rZ2d0SFZXUVVHSjNGVmpKS1hlYjVvWlRoUXZMbUpWTVY4aGZOVXo0ZXpjYXYiLCJzaWduYXR1cmUiOiJkaFQ3SG1LOE9XY1NzQVJIdEx4cS1xeEdKeklZZnNOZnRTdzFsZmNDTXRISjNzakVTTmtocnpRSWs1Q2FWTHFoWno0UWVRdS1xb3hNTzc4ai1LcDBDdyJ9fQ",
         "decoded": {
           "authorization": {
             "type": "TinyCloudShareDeliveryAuthorization",
@@ -183,6 +183,7 @@
             "policyCid": "bafkreicorpuspolicycidplaceholder0000000000000000000000000",
             "nodeAudience": "did:web:node.example.corpus",
             "targetOrigin": "https://node.example.corpus",
+            "openCredentialsAudience": "https://witness.credentials.org",
             "holder": "did:key:z6MkCorpusHolder",
             "recipientMatcher": {
               "kind": "emailDomain",
@@ -219,11 +220,11 @@
           "proof": {
             "alg": "EdDSA",
             "kid": "did:key:z6MkggtHVWQUGJ3FVjJKXeb5oZThQvLmJVMV8hfNUz4ezcav#z6MkggtHVWQUGJ3FVjJKXeb5oZThQvLmJVMV8hfNUz4ezcav",
-            "signature": "jzcUGdQYpPem2jySL3Y8t_uIaktpRxYUowclAp5yZZVRZzCOkS0xQSe54RbX38bGNrg9saZljlHqg_1lj_0XBg"
+            "signature": "dhT7HmK8OWcSsARHtLxq-qxGJzIYfsNftSw1lfcCMtHJ3sjESNkhrzQIk5CaVLqhZz4QeQu-qoxMO78j-Kp0Cw"
           }
         }
       },
-      "digest": "DfQwnOEkwhlrx4rdCYoqQlE84-pRQ12CO9nPXdGldIQ"
+      "digest": "fRlikM5SDNX0ENv8AsoXZrc7kO8s-tLDuJAo4FGPzYc"
     },
     "challengeRequest": {
       "description": "Exact POST body the production ShareRecipientClient sends to /share/v2/policy/challenges (ShareRecipientClient.buildChallengeRequest).",
@@ -778,6 +779,14 @@
       ],
       "expectedCode": "Error",
       "expectedMessageIncludes": "not bound to the submitted request"
+    },
+    "deliveryWrongOpenCredentialsAudience": {
+      "description": "A delivery authorization whose openCredentialsAudience collapses into nodeAudience must be rejected fail-closed, even with a valid signature over the mutated object.",
+      "producedBy": [
+        "share-delivery.ts:validateShareDeliveryAuthorizationBytes"
+      ],
+      "expectedCode": "Error",
+      "expectedMessageIncludes": "openCredentialsAudience is missing or untrusted"
     },
     "invokeResponseIntegrityMismatch": {
       "description": "A get response whose bodyDigest does not match its content must be rejected by the production client.",
