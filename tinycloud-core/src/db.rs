@@ -1004,7 +1004,7 @@ where
     }
 
     pub async fn delegate(&self, delegation: Delegation) -> Result<TransactResult, TxError<B, K>> {
-        let roots: Vec<Hash> = delegation
+        let parent_hashes: Vec<Hash> = delegation
             .0
             .parents
             .iter()
@@ -1012,6 +1012,7 @@ where
             .map(Hash::from)
             .collect();
         let retained_hash = delegation.content_hash();
+        let roots = delegation_guard_roots(retained_hash, &parent_hashes);
         let authz_start = Instant::now();
         let chain_guards = self.acquire_chain_guards(&roots).await;
         crate::telemetry::observe_stage(
@@ -1691,6 +1692,19 @@ fn is_serialization_db_error(error: &DbErr) -> bool {
                 Some("40001" | "40P01" | "1213" | "5" | "6" | "SQLITE_BUSY" | "SQLITE_LOCKED")
             )
     )
+}
+
+/// Returns the sorted, deduplicated set of roots to lock for a delegation.
+/// `retained_hash` (the delegation's own content hash) is always included so
+/// that concurrent identical root delegations — which have no parents and would
+/// otherwise produce an empty lock set — serialize on the same lock.
+fn delegation_guard_roots(retained_hash: Hash, parent_hashes: &[Hash]) -> Vec<Hash> {
+    let mut keys: Vec<Hash> = std::iter::once(retained_hash)
+        .chain(parent_hashes.iter().copied())
+        .collect();
+    keys.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+    keys.dedup();
+    keys
 }
 
 fn is_pk_epoch_conflict(error: &DbErr) -> bool {
@@ -4034,5 +4048,37 @@ mod test {
             }
             other => panic!("expected FK database error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn delegation_guard_roots_includes_self_and_deduplicates() {
+        let h = crate::hash::hash;
+        let retained = h(b"self");
+        let parent_a = h(b"parent_a");
+        let parent_b = h(b"parent_b");
+
+        // Empty parent list: exactly the retained hash.
+        let roots = delegation_guard_roots(retained, &[]);
+        assert_eq!(roots, vec![retained]);
+
+        // Existing parents: retained hash + both parents present.
+        let roots = delegation_guard_roots(retained, &[parent_a, parent_b]);
+        assert_eq!(roots.len(), 3);
+        assert!(roots.contains(&retained));
+        assert!(roots.contains(&parent_a));
+        assert!(roots.contains(&parent_b));
+
+        // Duplicate retained hash in parents is deduplicated.
+        let roots = delegation_guard_roots(retained, &[parent_a, retained, parent_b]);
+        assert_eq!(roots.len(), 3, "duplicate retained hash must be deduped");
+        assert!(roots.contains(&retained));
+        assert!(roots.contains(&parent_a));
+        assert!(roots.contains(&parent_b));
+
+        // Duplicate parent is deduplicated.
+        let roots = delegation_guard_roots(retained, &[parent_a, parent_a]);
+        assert_eq!(roots.len(), 2, "duplicate parent must be deduped");
+        assert!(roots.contains(&retained));
+        assert!(roots.contains(&parent_a));
     }
 }
