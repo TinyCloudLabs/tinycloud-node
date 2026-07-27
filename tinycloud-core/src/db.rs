@@ -3961,6 +3961,52 @@ mod test {
     }
 
     #[tokio::test]
+    async fn sqlite_pk_epoch_batch_conflict_matches_live_driver() {
+        let db = get_db().await.unwrap();
+        let space = test_space_id("pk-epoch-batch-conflict");
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        let epoch_id = crate::hash::hash(b"sqlite-pk-epoch-batch-conflict");
+        let model = epoch::ActiveModel {
+            seq: Set(0),
+            id: Set(epoch_id),
+            space: Set(SpaceIdWrap(space.clone())),
+        };
+
+        let error = epoch::Entity::insert_many([model.clone(), model])
+            .exec(&db.conn)
+            .await
+            .unwrap_err();
+
+        // Sanitized metadata only — never print the full message
+        if let DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(ref db_err)))
+        | DbErr::Query(RuntimeErr::SqlxError(SqlxError::Database(ref db_err))) = error
+        {
+            let code = db_err.code();
+            let constraint = db_err.constraint();
+            let msg_has_pk_epoch = db_err.message().contains("pk-epoch");
+            let msg_has_epoch_dot = db_err.message().contains("epoch.");
+            let msg_has_epoch = db_err.message().contains("epoch");
+            let msg_has_unique =
+                db_err.message().contains("unique") || db_err.message().contains("UNIQUE");
+            eprintln!(
+                "sqlite pk-epoch batch conflict: code={:?} constraint={:?} msg_has_pk_epoch={} msg_has_epoch_dot={} msg_has_epoch={} msg_has_unique={}",
+                code, constraint, msg_has_pk_epoch, msg_has_epoch_dot, msg_has_epoch, msg_has_unique
+            );
+        }
+
+        assert!(
+            is_pk_epoch_conflict(&error),
+            "is_pk_epoch_conflict must return true for a batch duplicate pk-epoch insert"
+        );
+    }
+
+    #[tokio::test]
     async fn epoch_insert_for_missing_space_is_fk_violation() {
         let db = get_db().await.unwrap();
         let space = test_space_id("ghost");
