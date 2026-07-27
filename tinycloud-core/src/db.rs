@@ -1011,6 +1011,7 @@ where
             .copied()
             .map(Hash::from)
             .collect();
+        let retained_hash = delegation.content_hash();
         let authz_start = Instant::now();
         let chain_guards = self.acquire_chain_guards(&roots).await;
         crate::telemetry::observe_stage(
@@ -1019,8 +1020,28 @@ where
             authz_start.elapsed(),
         );
         let _chain_guards = chain_guards?;
-        self.transact(vec![Event::Delegation(Box::new(delegation))])
-            .await
+        let result = self
+            .transact(vec![Event::Delegation(Box::new(delegation))])
+            .await;
+        if let Err(TxError::EpochInsert(ref e)) = result {
+            if is_pk_epoch_conflict(e) {
+                match delegation::Entity::find_by_id(retained_hash)
+                    .one(&self.conn)
+                    .await
+                {
+                    Ok(Some(_)) => {
+                        return Ok(TransactResult {
+                            commits: HashMap::new(),
+                            skipped_spaces: Vec::new(),
+                            delegation_cids: vec![retained_hash],
+                        })
+                    }
+                    Ok(None) => {}
+                    Err(db_err) => return Err(TxError::Db(db_err)),
+                }
+            }
+        }
+        result
     }
 
     pub async fn revoke(&self, revocation: Revocation) -> Result<TransactResult, TxError<B, K>> {
@@ -1670,6 +1691,16 @@ fn is_serialization_db_error(error: &DbErr) -> bool {
                 Some("40001" | "40P01" | "1213" | "5" | "6" | "SQLITE_BUSY" | "SQLITE_LOCKED")
             )
     )
+}
+
+fn is_pk_epoch_conflict(error: &DbErr) -> bool {
+    match error {
+        DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(db_err)))
+        | DbErr::Query(RuntimeErr::SqlxError(SqlxError::Database(db_err))) => {
+            db_err.code().as_deref() == Some("23505") && db_err.constraint() == Some("pk-epoch")
+        }
+        _ => false,
+    }
 }
 
 #[derive(Debug)]
