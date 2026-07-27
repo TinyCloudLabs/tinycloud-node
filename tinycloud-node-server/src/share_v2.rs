@@ -70,6 +70,7 @@ pub const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = MAX_BODY_BYTES;
 const POLICY_DOMAIN: &str = "xyz.tinycloud.share/policy/v2\0";
 const ENFORCEMENT_DOMAIN: &str = "xyz.tinycloud.share/policy-enforcement/v2\0";
+const REGISTRATION_DOMAIN: &str = "xyz.tinycloud.share/policy-registration/v2\0";
 const MAX_POLICY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_GRAPH_NODES: usize = 64;
 
@@ -525,8 +526,15 @@ struct SdkPolicyDocument {
     #[serde(rename = "type")]
     artifact_type: String,
     version: u8,
+    #[serde(rename = "shareId")]
+    share_id: String,
+    #[serde(rename = "ownerDid")]
+    owner_did: String,
+    #[serde(rename = "shareKeyDid")]
+    share_key_did: String,
     #[serde(rename = "recipientMatcher")]
     recipient_matcher: RecipientMatcher,
+    target: PolicyTarget,
     #[serde(rename = "contentSource")]
     content_source: SdkContentSource,
     #[serde(rename = "contentSourceDigest")]
@@ -535,8 +543,8 @@ struct SdkPolicyDocument {
     resource: SdkResource,
     #[serde(rename = "expiresAt")]
     expires_at: String,
-    #[serde(rename = "issuerDid")]
-    issuer_did: String,
+    #[serde(rename = "ownerDelegationCid")]
+    owner_delegation_cid: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -776,9 +784,11 @@ pub async fn register_policy(
         .as_object_mut()
         .expect("registration is an object")
         .remove("registrationCid");
+    let mut signed_registration = REGISTRATION_DOMAIN.as_bytes().to_vec();
+    signed_registration.extend(jcs::canonicalize(&core_value));
     let signature = runtime
         .signer
-        .sign(&jcs::canonicalize(&core_value))
+        .sign(&signed_registration)
         .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?;
 
     let enforcement_record = serde_json::to_vec(&request.enforcement_delegation)
@@ -829,7 +839,7 @@ pub async fn register_policy(
         registration,
         proof: ReceiptProof {
             alg: "EdDSA",
-            kid: runtime.signer_did.clone(),
+            kid: canonical_did_key_kid(&runtime.signer_did),
             signature: encode_config(signature, URL_SAFE_NO_PAD),
         },
     };
@@ -900,9 +910,16 @@ fn parse_sdk_policy(
         || sdk.content_source.action != "tinycloud.kv/get"
         || !matches!(sdk.resource.kind.as_str(), "exact" | "prefix")
         || sdk.content_source_digest != request.content_source_digest
-        || sdk.issuer_did.is_empty()
-        || facts.share_id.is_empty()
-        || facts.share_key_did.is_empty()
+        || sdk.owner_did.is_empty()
+        || sdk.share_key_did.is_empty()
+        || sdk.share_id.is_empty()
+        || sdk.owner_delegation_cid != request.owner_delegation.cid
+        || sdk.target.origin != config.target_origin
+        || sdk.target.node_audience != config.node_audience
+        || sdk.target.enforcer_did != enforcer_did
+        || sdk.target.space_id != sdk.content_source.space
+        || facts.share_id != sdk.share_id
+        || facts.share_key_did != sdk.share_key_did
         || facts.enforcer_did != enforcer_did
         || facts.node_audience != config.node_audience
         || facts.space_id != sdk.content_source.space
@@ -918,15 +935,15 @@ fn parse_sdk_policy(
         policy: PolicyDocument {
             artifact_type: sdk.artifact_type,
             version: sdk.version,
-            share_id: facts.share_id.clone(),
-            owner_did: sdk.issuer_did,
-            share_key_did: facts.share_key_did.clone(),
+            share_id: sdk.share_id,
+            owner_did: sdk.owner_did,
+            share_key_did: sdk.share_key_did,
             recipient_matcher: sdk.recipient_matcher,
             target: PolicyTarget {
-                origin: config.target_origin.clone(),
-                node_audience: config.node_audience.clone(),
-                enforcer_did: enforcer_did.to_owned(),
-                space_id: sdk.content_source.space.clone(),
+                origin: sdk.target.origin,
+                node_audience: sdk.target.node_audience,
+                enforcer_did: sdk.target.enforcer_did,
+                space_id: sdk.target.space_id,
             },
             resource: ExactResource {
                 kind: sdk.resource.kind,
@@ -940,7 +957,7 @@ fn parse_sdk_policy(
                 action: sdk.content_source.action,
             },
             content_source_digest: sdk.content_source_digest,
-            owner_delegation_cid: request.owner_delegation.cid.clone(),
+            owner_delegation_cid: sdk.owner_delegation_cid,
             expires_at: sdk.expires_at,
         },
     })
