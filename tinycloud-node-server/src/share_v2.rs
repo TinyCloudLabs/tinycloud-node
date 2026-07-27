@@ -296,7 +296,8 @@ pub async fn compose(
         tinycloud_core::libp2p::identity::ed25519::SecretKey::try_from_bytes(signing_seed)
             .map_err(|_| anyhow::anyhow!("invalid share v2 signing key"))?;
     let signing_keypair = tinycloud_core::libp2p::identity::ed25519::Keypair::from(signing_secret);
-    let receipt_signer_did = tinycloud_core::keys::public_key_to_did_key(signing_keypair.public().into());
+    let receipt_signer_did =
+        tinycloud_core::keys::public_key_to_did_key(signing_keypair.public().into());
     let signer =
         Ed25519InvitationSigner::new(config.invitation_kid.clone(), signing_keypair.into())?;
     let enforcer_did = key_setup.node_did();
@@ -409,7 +410,9 @@ impl<'r> FromRequest<'r> for ShareV2Origin {
             .rocket()
             .state::<Option<ShareV2Runtime>>()
             .and_then(|runtime| runtime.as_ref())
-            .is_some_and(|runtime| runtime.config.target_origin == origin || runtime.config.return_origin == origin);
+            .is_some_and(|runtime| {
+                runtime.config.target_origin == origin || runtime.config.return_origin == origin
+            });
         if allowed {
             Outcome::Success(Self)
         } else {
@@ -704,7 +707,7 @@ pub async fn register_policy(
         &policy_bytes,
         &request.policy.proof,
     )
-        .map_err(|_| error(Status::Forbidden, "policy_registration_invalid"))?;
+    .map_err(|_| error(Status::Forbidden, "policy_registration_invalid"))?;
     if cid_revoked(&runtime.conn, &request.enforcement_delegation.cid)
         .await
         .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?
