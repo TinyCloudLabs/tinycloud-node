@@ -1021,19 +1021,25 @@ where
             authz_start.elapsed(),
         );
         let _chain_guards = chain_guards?;
+        // Exact-byte registration idempotency: if this delegation is already
+        // durably stored, skip the epoch transaction entirely and acknowledge
+        // its existing address. Expiry and revocation are still enforced when
+        // the delegation is used; this only avoids re-running the write path.
+        match delegation::Entity::find_by_id(retained_hash)
+            .one(&self.conn)
+            .await
+        {
+            Ok(Some(_)) => return Ok(already_registered_result(retained_hash)),
+            Ok(None) => {}
+            Err(e) => return Err(TxError::Db(e)),
+        }
         let result = self
             .transact(vec![Event::Delegation(Box::new(delegation))])
             .await;
         if let Err(TxError::EpochInsert(ref e)) = result {
             if is_pk_epoch_conflict(e) {
                 match await_epoch_delegation(&self.conn, retained_hash).await {
-                    Ok(true) => {
-                        return Ok(TransactResult {
-                            commits: HashMap::new(),
-                            skipped_spaces: Vec::new(),
-                            delegation_cids: vec![retained_hash],
-                        })
-                    }
+                    Ok(true) => return Ok(already_registered_result(retained_hash)),
                     Ok(false) => {}
                     Err(db_err) => return Err(TxError::Db(db_err)),
                 }
@@ -1689,6 +1695,16 @@ fn is_serialization_db_error(error: &DbErr) -> bool {
                 Some("40001" | "40P01" | "1213" | "5" | "6" | "SQLITE_BUSY" | "SQLITE_LOCKED")
             )
     )
+}
+
+/// Returns a `TransactResult` that acknowledges a delegation already durably
+/// registered at `retained_hash` without creating new state.
+fn already_registered_result(retained_hash: Hash) -> TransactResult {
+    TransactResult {
+        commits: HashMap::new(),
+        skipped_spaces: Vec::new(),
+        delegation_cids: vec![retained_hash],
+    }
 }
 
 /// Returns the sorted, deduplicated set of roots to lock for a delegation.
@@ -4181,6 +4197,66 @@ mod test {
         assert!(
             !found,
             "a different hash must not match even though another row exists"
+        );
+    }
+
+    // --- already_registered_result precheck tests ---
+
+    /// A delegation row already in the database is returned as durable without
+    /// going through the epoch path: commits is empty, delegation_cids contains
+    /// exactly the retained hash.
+    #[tokio::test]
+    async fn precheck_exact_retained_hash_returns_durable_cid_without_epoch() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"precheck-exact-retained");
+        insert_delegation_row(&db.conn, hash).await;
+
+        // Simulate what delegate() does for the pre-check query.
+        let row = delegation::Entity::find_by_id(hash)
+            .one(&db.conn)
+            .await
+            .expect("query must not fail");
+        assert!(row.is_some(), "row must be present");
+
+        let result = already_registered_result(hash);
+        assert!(result.commits.is_empty(), "no epoch commits expected");
+        assert!(result.skipped_spaces.is_empty());
+        assert_eq!(result.delegation_cids, vec![hash]);
+    }
+
+    /// A hash that has no corresponding delegation row returns None, so the
+    /// pre-check falls through to the normal transact path.
+    #[tokio::test]
+    async fn precheck_absent_hash_does_not_short_circuit() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"precheck-absent");
+
+        let row = delegation::Entity::find_by_id(hash)
+            .one(&db.conn)
+            .await
+            .expect("query must not fail");
+        assert!(
+            row.is_none(),
+            "absent hash must return None — caller proceeds to transact"
+        );
+    }
+
+    /// A different hash that is present must not be confused with the retained
+    /// hash: the pre-check is an exact primary-key lookup.
+    #[tokio::test]
+    async fn precheck_different_hash_does_not_match_retained() {
+        let db = get_db().await.unwrap();
+        let present_hash = crate::hash::hash(b"precheck-different-present");
+        let retained_hash = crate::hash::hash(b"precheck-different-retained");
+        insert_delegation_row(&db.conn, present_hash).await;
+
+        let row = delegation::Entity::find_by_id(retained_hash)
+            .one(&db.conn)
+            .await
+            .expect("query must not fail");
+        assert!(
+            row.is_none(),
+            "a different hash in the table must not satisfy the retained-hash lookup"
         );
     }
 }
