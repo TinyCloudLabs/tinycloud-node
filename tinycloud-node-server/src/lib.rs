@@ -372,21 +372,28 @@ pub async fn app_with_control(
         Arc::new(tinycloud.clone()),
         Arc::new(sql_service.clone()),
     )?;
-    let share_v2_runtime = share_v2::compose(
-        seed_conn.clone(),
-        &key_setup,
-        tinycloud_config.share_email.clone(),
-        tee_context.clone(),
-        #[cfg(feature = "dstack")]
-        {
-            matches!(tinycloud_config.keys, config::Keys::Dstack)
-                || matches!(tinycloud_config.keys, config::Keys::Auto) && dstack::is_available()
-        },
-        #[cfg(not(feature = "dstack"))]
-        false,
-        Arc::new(tinycloud.clone()),
-    )
-    .await?;
+    let share_v2_runtime = if tinycloud_config.share_email.enabled {
+        Some(
+            share_v2::compose(
+                seed_conn.clone(),
+                &key_setup,
+                tinycloud_config.share_email.clone(),
+                tee_context.clone(),
+                #[cfg(feature = "dstack")]
+                {
+                    matches!(tinycloud_config.keys, config::Keys::Dstack)
+                        || matches!(tinycloud_config.keys, config::Keys::Auto)
+                            && dstack::is_available()
+                },
+                #[cfg(not(feature = "dstack"))]
+                false,
+                Arc::new(tinycloud.clone()),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     if let Some(runtime) = share_email_runtime.as_ref() {
         if !runtime.bridge.self_check().await {
             anyhow::bail!(
@@ -489,7 +496,7 @@ pub async fn app_with_control(
         .manage(webhook_encryption)
         .manage(rate_limiter)
         .manage(share_email_runtime)
-        .manage(Some(share_v2_runtime))
+        .manage(share_v2_runtime)
         .manage(tee_context)
         .manage(encryption_service)
         .manage(tinycloud_config.storage.staging.open().await?);

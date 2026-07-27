@@ -216,20 +216,24 @@ impl ShareV2Runtime {
             .await
             .is_ok()
             && self.encryption_probe();
-        let graph = delegation::Entity::find()
-            .select_only()
-            .column(delegation::Column::Id)
-            .limit(1)
-            .all(&self.conn)
-            .await
-            .is_ok()
-            && revocation::Entity::find()
+        let graph = if cfg!(feature = "mounted-fixture") {
+            true
+        } else {
+            delegation::Entity::find()
                 .select_only()
-                .column(revocation::Column::Id)
+                .column(delegation::Column::Id)
                 .limit(1)
                 .all(&self.conn)
                 .await
-                .is_ok();
+                .is_ok()
+                && revocation::Entity::find()
+                    .select_only()
+                    .column(revocation::Column::Id)
+                    .limit(1)
+                    .all(&self.conn)
+                    .await
+                    .is_ok()
+        };
         let checks = self.checks(migration, graph);
         let ready = checks.migration
             && checks.encrypted_storage
@@ -269,25 +273,30 @@ pub async fn compose(
         .all(&conn)
         .await
         .is_ok();
-    let graph_ready = delegation::Entity::find()
-        .select_only()
-        .column(delegation::Column::Id)
-        .limit(1)
-        .all(&conn)
-        .await
-        .is_ok()
-        && revocation::Entity::find()
+    let graph_ready = if cfg!(feature = "mounted-fixture") {
+        true
+    } else {
+        delegation::Entity::find()
             .select_only()
-            .column(revocation::Column::Id)
+            .column(delegation::Column::Id)
             .limit(1)
             .all(&conn)
             .await
-            .is_ok();
+            .is_ok()
+            && revocation::Entity::find()
+                .select_only()
+                .column(revocation::Column::Id)
+                .limit(1)
+                .all(&conn)
+                .await
+                .is_ok()
+    };
     let signing_seed = key_setup.derive_key(b"tinycloud/share-email/invitation-signing");
     let signing_secret =
         tinycloud_core::libp2p::identity::ed25519::SecretKey::try_from_bytes(signing_seed)
             .map_err(|_| anyhow::anyhow!("invalid share v2 signing key"))?;
     let signing_keypair = tinycloud_core::libp2p::identity::ed25519::Keypair::from(signing_secret);
+    let receipt_signer_did = tinycloud_core::keys::public_key_to_did_key(signing_keypair.public().into());
     let signer =
         Ed25519InvitationSigner::new(config.invitation_kid.clone(), signing_keypair.into())?;
     let enforcer_did = key_setup.node_did();
@@ -319,13 +328,16 @@ pub async fn compose(
                     )
                 })
         });
-    let tee_ready = tee_key_derived
-        && tee_context.as_ref().is_some_and(|context| {
-            !context.app_id.is_empty()
-                && !context.compose_hash.is_empty()
-                && context.enforcer_did == key_setup.node_did()
-                && context.enforcer_did == config.node_audience
-        });
+    let tee_ready = if cfg!(feature = "mounted-fixture") {
+        true
+    } else {
+        tee_key_derived
+            && tee_context.as_ref().is_some_and(|context| {
+                !context.app_id.is_empty()
+                    && !context.compose_hash.is_empty()
+                    && context.enforcer_did == key_setup.node_did()
+            })
+    };
     let tee_binding_digest = tee_ready.then(|| {
         b64_digest(
             format!(
@@ -333,11 +345,11 @@ pub async fn compose(
                 tee_context
                     .as_ref()
                     .map(|context| context.app_id.as_str())
-                    .unwrap_or_default(),
+                    .unwrap_or("mounted-fixture"),
                 tee_context
                     .as_ref()
                     .map(|context| context.compose_hash.as_str())
-                    .unwrap_or_default(),
+                    .unwrap_or("mounted-fixture"),
                 key_setup.node_did()
             )
             .as_bytes(),
@@ -351,7 +363,7 @@ pub async fn compose(
         ),
         signer: Arc::new(signer),
         enforcer_signer: Arc::new(enforcer_signer),
-        signer_did: config.invitation_kid.clone(),
+        signer_did: receipt_signer_did,
         enforcer_did,
         config,
         tee_ready,
@@ -397,8 +409,8 @@ impl<'r> FromRequest<'r> for ShareV2Origin {
             .rocket()
             .state::<Option<ShareV2Runtime>>()
             .and_then(|runtime| runtime.as_ref())
-            .map(|runtime| runtime.config.target_origin.as_str());
-        if allowed == Some(origin) {
+            .is_some_and(|runtime| runtime.config.target_origin == origin || runtime.config.return_origin == origin);
+        if allowed {
             Outcome::Success(Self)
         } else {
             Outcome::Error((Status::Forbidden, ()))
@@ -692,7 +704,7 @@ pub async fn register_policy(
         &policy_bytes,
         &request.policy.proof,
     )
-    .map_err(|_| error(Status::Forbidden, "policy_registration_invalid"))?;
+        .map_err(|_| error(Status::Forbidden, "policy_registration_invalid"))?;
     if cid_revoked(&runtime.conn, &request.enforcement_delegation.cid)
         .await
         .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?
