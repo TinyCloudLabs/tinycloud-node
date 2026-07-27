@@ -5982,4 +5982,157 @@ mod tests {
         );
         Ok(())
     }
+
+    /// Smallest Rocket /delegate regression:
+    /// - empty HTTP body, all auth in the Authorization header
+    /// - identical request sent twice (exact byte replay)
+    /// - both responses must be 2xx and return the same CID
+    /// - after both requests: exactly one delegation row and no duplicate
+    ///   ability or parent rows; the epoch key must not be duplicated
+    #[tokio::test]
+    async fn rocket_delegate_idempotent_replay_emits_one_row_set() -> Result<()> {
+        use rocket::http::{Header, Status};
+        use rocket::local::asynchronous::Client;
+        use tinycloud_auth::{
+            resource::{Service, SpaceId},
+            ssi::{
+                claims::jwt::NumericDate,
+                dids::{DIDBuf, DIDURLBuf},
+                jwk::Algorithm,
+                ucan::Payload,
+            },
+            ucan_capabilities_object::Capabilities,
+        };
+        use tinycloud_core::{
+            models::{abilities, delegation as deleg_model, epoch},
+            relationships::parent_delegations,
+            sea_orm::{EntityTrait, PaginatorTrait},
+        };
+
+        let tempdir = TempDir::new()?;
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
+        let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
+        let _persisted = tempdir.keep();
+        let tinycloud = TinyCloud::new(
+            db.clone(),
+            Either::B(storage),
+            StaticSecret::new(vec![0u8; 32]).unwrap(),
+        )
+        .await?;
+        let conn = db;
+
+        let jwk = JWK::generate_ed25519()?;
+        let mut verification_method = DID_METHODS.generate(&jwk, "key")?.to_string();
+        let fragment = verification_method
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("missing vm fragment"))?
+            .1
+            .to_string();
+        verification_method.push('#');
+        verification_method.push_str(&fragment);
+        let owner_did: DIDBuf = verification_method
+            .split('#')
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing did"))?
+            .parse()?;
+        let space: SpaceId = SpaceId::new(owner_did.clone(), "files".parse()?);
+
+        // Root delegation: owner self-delegates kv/put on their own space.
+        // No parent proof needed — the delegator IS the space owner.
+        let resource =
+            space
+                .clone()
+                .to_resource("kv".parse::<Service>()?, Some("doc".parse()?), None, None);
+        let mut caps = Capabilities::<()>::new();
+        caps.with_actions(
+            resource.as_uri(),
+            std::iter::once(("tinycloud.kv/put".parse()?, [])),
+        );
+
+        // sign() returns a Ucan<Value, ()>; encode() serializes it as a JWT
+        // string, which is the exact format expected by the Authorization header
+        // for a UCAN delegation.
+        let auth_header = Payload {
+            issuer: verification_method.parse::<DIDURLBuf>()?,
+            audience: owner_did,
+            not_before: None,
+            expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
+            nonce: Some("delegate-regression-nonce".to_string()),
+            facts: Some(Vec::<serde_json::Value>::new()),
+            proof: vec![],
+            attenuation: caps,
+        }
+        .sign(Algorithm::EdDSA, &jwk)?
+        .encode()?;
+
+        let rocket = rocket::build()
+            .mount("/", rocket::routes![delegate])
+            .attach(crate::tracing::TracingFairing::new(
+                &Config::default().log.tracing,
+            ))
+            .manage(tinycloud)
+            .manage(Config::default());
+
+        let client = Client::tracked(rocket).await?;
+
+        // First request — empty body, all auth in header.
+        let resp1 = client
+            .post("/delegate")
+            .header(Header::new("Authorization", auth_header.clone()))
+            .dispatch()
+            .await;
+        let status1 = resp1.status();
+        let body1 = resp1.into_string().await.unwrap_or_default();
+        assert!(
+            status1.class().is_success(),
+            "first /delegate must be 2xx, got {status1}: {body1}"
+        );
+        let json1: serde_json::Value = serde_json::from_str(&body1)?;
+        let cid1 = json1["cid"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing cid in first response"))?
+            .to_string();
+
+        // Second request — identical bytes (replay).
+        let resp2 = client
+            .post("/delegate")
+            .header(Header::new("Authorization", auth_header.clone()))
+            .dispatch()
+            .await;
+        let status2 = resp2.status();
+        let body2 = resp2.into_string().await.unwrap_or_default();
+        assert!(
+            status2.class().is_success(),
+            "replay /delegate must be 2xx, got {status2}: {body2}"
+        );
+        let json2: serde_json::Value = serde_json::from_str(&body2)?;
+        let cid2 = json2["cid"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing cid in second response"))?
+            .to_string();
+
+        assert_eq!(cid1, cid2, "both responses must return the same CID");
+
+        // Verify DB state: exactly one delegation row, no duplicate
+        // ability or parent rows, and no duplicate epoch keys.
+        let del_count = deleg_model::Entity::find().count(&conn).await?;
+        assert_eq!(
+            del_count, 1,
+            "exactly one delegation row after two identical requests"
+        );
+
+        let ability_count = abilities::Entity::find().count(&conn).await?;
+        assert_eq!(ability_count, 1, "exactly one ability row — no duplicates");
+
+        let parent_count = parent_delegations::Entity::find().count(&conn).await?;
+        assert_eq!(parent_count, 0, "no parent rows for a root delegation");
+
+        let epoch_count = epoch::Entity::find().count(&conn).await?;
+        assert!(
+            epoch_count <= 1,
+            "at most one epoch key — no duplicates (got {epoch_count})"
+        );
+
+        Ok(())
+    }
 }
