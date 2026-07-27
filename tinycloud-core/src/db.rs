@@ -1012,6 +1012,9 @@ where
             .map(Hash::from)
             .collect();
         let retained_hash = delegation.content_hash();
+        // Capture expected row counts before consuming the delegation.
+        let expected_ability_count = delegation.0.capabilities.len() as u64;
+        let expected_parent_count = parent_hashes.len() as u64;
         let roots = delegation_guard_roots(retained_hash, &parent_hashes);
         let authz_start = Instant::now();
         let chain_guards = self.acquire_chain_guards(&roots).await;
@@ -1033,8 +1036,21 @@ where
             Ok(None) => {}
             Err(e) => return Err(TxError::Db(e)),
         }
-        self.transact(vec![Event::Delegation(Box::new(delegation))])
+        match self
+            .transact(vec![Event::Delegation(Box::new(delegation))])
             .await
+        {
+            Err(TxError::EpochInsert(ref epoch_err)) if is_pk_epoch_conflict(epoch_err) => {
+                reconcile_pk_epoch_delegation(
+                    &self.conn,
+                    retained_hash,
+                    expected_ability_count,
+                    expected_parent_count,
+                )
+                .await
+            }
+            other => other,
+        }
     }
 
     pub async fn revoke(&self, revocation: Revocation) -> Result<TransactResult, TxError<B, K>> {
@@ -1696,6 +1712,88 @@ fn already_registered_result(retained_hash: Hash) -> TransactResult {
     }
 }
 
+/// Post-rollback reconciliation for a confirmed pk-epoch conflict.
+///
+/// After a failed epoch INSERT (pk-epoch unique violation), the transaction is
+/// fully rolled back. This does one bounded read-only pass to verify that the
+/// exact delegation is already durably complete — covering the delegation row,
+/// abilities, parent links, and event_order-to-epoch consistency. Returns the
+/// retained CID only when all invariants hold; otherwise preserves the original
+/// EpochInsert error. No writes, no retries, no sleep.
+async fn reconcile_pk_epoch_delegation<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
+    conn: &C,
+    retained_hash: Hash,
+    expected_ability_count: u64,
+    expected_parent_count: u64,
+) -> Result<TransactResult, TxError<S, K>> {
+    // 1. Delegation row must exist.
+    if delegation::Entity::find_by_id(retained_hash)
+        .one(conn)
+        .await
+        .map_err(TxError::Db)?
+        .is_none()
+    {
+        return Err(TxError::EpochInsert(DbErr::Custom(
+            "reconcile: delegation row absent after pk-epoch rollback".to_string(),
+        )));
+    }
+
+    // 2. Exact expected ability count.
+    let ability_count = abilities::Entity::find()
+        .filter(abilities::Column::Delegation.eq(retained_hash))
+        .count(conn)
+        .await
+        .map_err(TxError::Db)?;
+    if ability_count != expected_ability_count {
+        return Err(TxError::EpochInsert(DbErr::Custom(format!(
+            "reconcile: ability count mismatch: expected {expected_ability_count} got {ability_count}"
+        ))));
+    }
+
+    // 3. Exact expected parent link count.
+    let parent_count = parent_delegations::Entity::find()
+        .filter(parent_delegations::Column::Child.eq(retained_hash))
+        .count(conn)
+        .await
+        .map_err(TxError::Db)?;
+    if parent_count != expected_parent_count {
+        return Err(TxError::EpochInsert(DbErr::Custom(format!(
+            "reconcile: parent count mismatch: expected {expected_parent_count} got {parent_count}"
+        ))));
+    }
+
+    // 4. Every event_order row for this delegation must reference an existing
+    //    epoch row in the same space. At least one must exist.
+    let event_orders = event_order::Entity::find()
+        .filter(event_order::Column::Event.eq(retained_hash))
+        .all(conn)
+        .await
+        .map_err(TxError::Db)?;
+    if event_orders.is_empty() {
+        return Err(TxError::EpochInsert(DbErr::Custom(
+            "reconcile: no event_order rows after pk-epoch rollback".to_string(),
+        )));
+    }
+    for eo in &event_orders {
+        let ep = epoch::Entity::find()
+            .filter(
+                Condition::all()
+                    .add(epoch::Column::Id.eq(eo.epoch))
+                    .add(epoch::Column::Space.eq(eo.space.clone())),
+            )
+            .one(conn)
+            .await
+            .map_err(TxError::Db)?;
+        if ep.is_none() {
+            return Err(TxError::EpochInsert(DbErr::Custom(
+                "reconcile: epoch row absent for event_order after pk-epoch rollback".to_string(),
+            )));
+        }
+    }
+
+    Ok(already_registered_result(retained_hash))
+}
+
 /// Returns the sorted, deduplicated set of roots to lock for a delegation.
 /// `retained_hash` (the delegation's own content hash) is always included so
 /// that concurrent identical root delegations — which have no parents and would
@@ -1709,7 +1807,6 @@ fn delegation_guard_roots(retained_hash: Hash, parent_hashes: &[Hash]) -> Vec<Ha
     keys
 }
 
-#[cfg(test)]
 fn is_pk_epoch_conflict(error: &DbErr) -> bool {
     match error {
         DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(db_err)))
@@ -4439,6 +4536,469 @@ mod test {
         assert!(
             cross_lookup.is_none(),
             "hash_a must not satisfy hash_b's exact-hash predicate"
+        );
+    }
+
+    // ── Reconciliation tests ─────────────────────────────────────────────────
+
+    /// Build the complete durable state that reconcile_pk_epoch_delegation
+    /// expects for a delegation that was committed by a concurrent winner.
+    async fn insert_complete_delegation_state(
+        db: &sea_orm::DbConn,
+        retained_hash: Hash,
+        space: &crate::types::SpaceIdWrap,
+    ) {
+        // actors
+        for actor_id in ["did:key:rec-owner", "did:key:rec-delegate"] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(db)
+            .await
+            .ok();
+        }
+        // delegation row
+        delegation::Entity::insert(delegation::ActiveModel {
+            id: Set(retained_hash),
+            delegator: Set("did:key:rec-owner".to_string()),
+            delegatee: Set("did:key:rec-delegate".to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(retained_hash.as_ref().to_vec()),
+        })
+        .on_conflict(
+            OnConflict::column(delegation::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(db)
+        .await
+        .ok();
+        // one ability row
+        abilities::Entity::insert(abilities::ActiveModel {
+            delegation: Set(retained_hash),
+            resource: Set("tinycloud:did:key:rec-owner:files/kv/doc".parse().unwrap()),
+            ability: Set("tinycloud.kv/put".to_string().try_into().unwrap()),
+            caveats: Set(Default::default()),
+        })
+        .exec(db)
+        .await
+        .unwrap();
+        // space row
+        space::Entity::insert(space::ActiveModel::from(space::Model { id: space.clone() }))
+            .on_conflict(
+                OnConflict::column(space::Column::Id)
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec(db)
+            .await
+            .ok();
+        // epoch row
+        let epoch_id = crate::hash::hash(b"reconcile-epoch");
+        epoch::Entity::insert(epoch::ActiveModel {
+            seq: Set(0),
+            id: Set(epoch_id),
+            space: Set(space.clone()),
+        })
+        .on_conflict(
+            OnConflict::columns([epoch::Column::Id, epoch::Column::Space])
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(db)
+        .await
+        .ok();
+        // event_order row
+        event_order::Entity::insert(event_order::ActiveModel {
+            seq: Set(0),
+            epoch: Set(epoch_id),
+            epoch_seq: Set(0),
+            event: Set(retained_hash),
+            space: Set(space.clone()),
+        })
+        .exec(db)
+        .await
+        .unwrap();
+    }
+
+    /// Reconciliation succeeds when all rows are durably present and consistent.
+    #[tokio::test]
+    async fn reconcile_succeeds_when_state_is_complete_and_consistent() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"reconcile-complete-bytes");
+        let space = crate::types::SpaceIdWrap(test_space_id("reconcile-complete"));
+
+        insert_complete_delegation_state(&db.conn, hash, &space).await;
+
+        let result = reconcile_pk_epoch_delegation::<_, MemoryStore, StaticSecret>(
+            &db.conn, hash, 1, // one ability
+            0, // zero parents
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "reconciliation must succeed when state is complete"
+        );
+        let tr = result.unwrap_or_else(|_| panic!("must be ok"));
+        assert_eq!(
+            tr.delegation_cids,
+            vec![hash],
+            "must return the retained CID"
+        );
+    }
+
+    /// Reconciliation performs zero writes: calling it again after success still
+    /// observes the same single row set (no duplicates introduced).
+    #[tokio::test]
+    async fn reconcile_is_read_only_zero_writes() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"reconcile-zero-writes-bytes");
+        let space = crate::types::SpaceIdWrap(test_space_id("reconcile-zero-writes"));
+
+        insert_complete_delegation_state(&db.conn, hash, &space).await;
+
+        let del_before = delegation::Entity::find().count(&db.conn).await.unwrap();
+        let ab_before = abilities::Entity::find().count(&db.conn).await.unwrap();
+        let eo_before = event_order::Entity::find().count(&db.conn).await.unwrap();
+        let ep_before = epoch::Entity::find().count(&db.conn).await.unwrap();
+
+        let result =
+            reconcile_pk_epoch_delegation::<_, MemoryStore, StaticSecret>(&db.conn, hash, 1, 0)
+                .await;
+        assert!(result.is_ok(), "reconciliation must succeed");
+
+        assert_eq!(
+            delegation::Entity::find().count(&db.conn).await.unwrap(),
+            del_before,
+            "reconciliation must not write delegation rows"
+        );
+        assert_eq!(
+            abilities::Entity::find().count(&db.conn).await.unwrap(),
+            ab_before,
+            "reconciliation must not write ability rows"
+        );
+        assert_eq!(
+            event_order::Entity::find().count(&db.conn).await.unwrap(),
+            eo_before,
+            "reconciliation must not write event_order rows"
+        );
+        assert_eq!(
+            epoch::Entity::find().count(&db.conn).await.unwrap(),
+            ep_before,
+            "reconciliation must not write epoch rows"
+        );
+    }
+
+    /// Negative: delegation row absent → reconciliation returns EpochInsert error.
+    #[tokio::test]
+    async fn reconcile_fails_when_delegation_row_absent() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"reconcile-no-deleg");
+
+        let result =
+            reconcile_pk_epoch_delegation::<_, MemoryStore, StaticSecret>(&db.conn, hash, 0, 0)
+                .await;
+        assert!(
+            matches!(result, Err(TxError::EpochInsert(_))),
+            "absent delegation row must return EpochInsert",
+        );
+    }
+
+    /// Negative: delegation row present but ability count mismatches expected.
+    #[tokio::test]
+    async fn reconcile_fails_when_ability_count_wrong() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"reconcile-wrong-ability-count");
+        let space = crate::types::SpaceIdWrap(test_space_id("reconcile-wrong-ability"));
+
+        insert_complete_delegation_state(&db.conn, hash, &space).await;
+        // State has 1 ability; we claim 2 expected → mismatch.
+        let result = reconcile_pk_epoch_delegation::<_, MemoryStore, StaticSecret>(
+            &db.conn, hash, 2, // wrong
+            0,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(TxError::EpochInsert(_))),
+            "ability count mismatch must return EpochInsert",
+        );
+    }
+
+    /// Negative: delegation row present, ability count correct, but parent count
+    /// mismatches (state has no parents, we expect one).
+    #[tokio::test]
+    async fn reconcile_fails_when_parent_count_wrong() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"reconcile-wrong-parent-count");
+        let space = crate::types::SpaceIdWrap(test_space_id("reconcile-wrong-parent"));
+
+        insert_complete_delegation_state(&db.conn, hash, &space).await;
+        let result = reconcile_pk_epoch_delegation::<_, MemoryStore, StaticSecret>(
+            &db.conn, hash, 1, 1, // wrong: state has zero parents
+        )
+        .await;
+        assert!(
+            matches!(result, Err(TxError::EpochInsert(_))),
+            "parent count mismatch must return EpochInsert",
+        );
+    }
+
+    /// Negative: delegation row and ability present, but no event_order row.
+    #[tokio::test]
+    async fn reconcile_fails_when_event_order_absent() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"reconcile-no-event-order");
+
+        for actor_id in ["did:key:reo-owner", "did:key:reo-delegate"] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(&db.conn)
+            .await
+            .ok();
+        }
+        // Insert delegation and one ability — no event_order row.
+        delegation::Entity::insert(delegation::ActiveModel {
+            id: Set(hash),
+            delegator: Set("did:key:reo-owner".to_string()),
+            delegatee: Set("did:key:reo-delegate".to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(hash.as_ref().to_vec()),
+        })
+        .on_conflict(
+            OnConflict::column(delegation::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(&db.conn)
+        .await
+        .ok();
+        abilities::Entity::insert(abilities::ActiveModel {
+            delegation: Set(hash),
+            resource: Set("tinycloud:did:key:reo-owner:files/kv/doc".parse().unwrap()),
+            ability: Set("tinycloud.kv/put".to_string().try_into().unwrap()),
+            caveats: Set(Default::default()),
+        })
+        .exec(&db.conn)
+        .await
+        .unwrap();
+
+        let result =
+            reconcile_pk_epoch_delegation::<_, MemoryStore, StaticSecret>(&db.conn, hash, 1, 0)
+                .await;
+        assert!(
+            matches!(result, Err(TxError::EpochInsert(_))),
+            "absent event_order must return EpochInsert",
+        );
+    }
+
+    /// Negative: epoch committed for the space but no event_order for our
+    /// delegation hash — delegation and ability are committed but the epoch
+    /// record was not linked to our event (e.g. concurrent winner's epoch is
+    /// for a different set of events).
+    #[tokio::test]
+    async fn reconcile_fails_when_epoch_exists_but_no_event_order_for_our_hash() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"reconcile-epoch-exists-no-eo");
+        let other_hash = crate::hash::hash(b"reconcile-epoch-exists-other");
+        let space = crate::types::SpaceIdWrap(test_space_id("reconcile-epoch-exists-space"));
+
+        // Insert complete state for other_hash (epoch + event_order for other_hash).
+        insert_complete_delegation_state(&db.conn, other_hash, &space).await;
+
+        // Now insert delegation+ability for our hash — but no event_order.
+        for actor_id in ["did:key:ree-owner", "did:key:ree-delegate"] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(&db.conn)
+            .await
+            .ok();
+        }
+        delegation::Entity::insert(delegation::ActiveModel {
+            id: Set(hash),
+            delegator: Set("did:key:ree-owner".to_string()),
+            delegatee: Set("did:key:ree-delegate".to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(hash.as_ref().to_vec()),
+        })
+        .on_conflict(
+            OnConflict::column(delegation::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(&db.conn)
+        .await
+        .ok();
+        abilities::Entity::insert(abilities::ActiveModel {
+            delegation: Set(hash),
+            resource: Set("tinycloud:did:key:ree-owner:files/kv/doc".parse().unwrap()),
+            ability: Set("tinycloud.kv/put".to_string().try_into().unwrap()),
+            caveats: Set(Default::default()),
+        })
+        .exec(&db.conn)
+        .await
+        .unwrap();
+        // No event_order for our hash — only other_hash has one.
+
+        let result =
+            reconcile_pk_epoch_delegation::<_, MemoryStore, StaticSecret>(&db.conn, hash, 1, 0)
+                .await;
+        assert!(
+            matches!(result, Err(TxError::EpochInsert(_))),
+            "epoch present but event_order absent for our hash must return EpochInsert",
+        );
+    }
+
+    /// Negative: epoch-only partial state: epoch row present but no delegation row.
+    /// This is the inverse of the delegation-only case.
+    #[tokio::test]
+    async fn reconcile_fails_for_epoch_only_partial_state() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"reconcile-epoch-only");
+        // No delegation row inserted — only an epoch/space/event_order would be
+        // wrong but here we don't even insert those; we rely on the delegation-
+        // absent check being the first guard.
+        let result =
+            reconcile_pk_epoch_delegation::<_, MemoryStore, StaticSecret>(&db.conn, hash, 0, 0)
+                .await;
+        assert!(
+            matches!(result, Err(TxError::EpochInsert(_))),
+            "epoch-only partial state must return EpochInsert",
+        );
+    }
+
+    /// Negative: event_order exists in DB for our space but its `event` field
+    /// is a different hash — our retained_hash has no event_order row, so
+    /// reconciliation fails even though a matching epoch+event_order pair exists.
+    /// This models the "wrong event in event_order" / mismatched-event scenario:
+    /// a concurrent winner committed a different delegation into the same epoch
+    /// but our delegation was never linked into event_order.
+    #[tokio::test]
+    async fn reconcile_fails_when_event_order_is_for_different_hash_same_epoch() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"reconcile-wrong-eo-hash");
+        let other_hash = crate::hash::hash(b"reconcile-wrong-eo-other");
+        let space = crate::types::SpaceIdWrap(test_space_id("reconcile-wrong-eo-space"));
+
+        // Complete state for other_hash: same epoch, same space.
+        insert_complete_delegation_state(&db.conn, other_hash, &space).await;
+
+        // Delegation + ability for our hash but NO event_order.
+        for actor_id in ["did:key:rweo-owner", "did:key:rweo-delegate"] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(&db.conn)
+            .await
+            .ok();
+        }
+        delegation::Entity::insert(delegation::ActiveModel {
+            id: Set(hash),
+            delegator: Set("did:key:rweo-owner".to_string()),
+            delegatee: Set("did:key:rweo-delegate".to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(hash.as_ref().to_vec()),
+        })
+        .on_conflict(
+            OnConflict::column(delegation::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(&db.conn)
+        .await
+        .ok();
+        abilities::Entity::insert(abilities::ActiveModel {
+            delegation: Set(hash),
+            resource: Set("tinycloud:did:key:rweo-owner:files/kv/doc".parse().unwrap()),
+            ability: Set("tinycloud.kv/put".to_string().try_into().unwrap()),
+            caveats: Set(Default::default()),
+        })
+        .exec(&db.conn)
+        .await
+        .unwrap();
+        // other_hash has event_order; our hash does not.
+
+        let result =
+            reconcile_pk_epoch_delegation::<_, MemoryStore, StaticSecret>(&db.conn, hash, 1, 0)
+                .await;
+        assert!(
+            matches!(result, Err(TxError::EpochInsert(_))),
+            "event_order for different hash must not satisfy our reconciliation",
+        );
+    }
+
+    /// Negative: unrelated pk-epoch state (wrong event in event_order, not ours).
+    /// The delegation row exists, ability row exists, but event_order references
+    /// a different event hash — our retained_hash has no event_order rows.
+    #[tokio::test]
+    async fn reconcile_fails_for_unrelated_pk_epoch_state() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"reconcile-unrelated-pk-epoch");
+        let other_hash = crate::hash::hash(b"other-event-unrelated");
+        let space = crate::types::SpaceIdWrap(test_space_id("reconcile-unrelated-space"));
+
+        // Insert complete state for `other_hash`, not for `hash`.
+        insert_complete_delegation_state(&db.conn, other_hash, &space).await;
+
+        // Also insert delegation+ability for hash (so that check passes),
+        // but no event_order for hash.
+        for actor_id in ["did:key:rupe-owner", "did:key:rupe-delegate"] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(&db.conn)
+            .await
+            .ok();
+        }
+        delegation::Entity::insert(delegation::ActiveModel {
+            id: Set(hash),
+            delegator: Set("did:key:rupe-owner".to_string()),
+            delegatee: Set("did:key:rupe-delegate".to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(hash.as_ref().to_vec()),
+        })
+        .on_conflict(
+            OnConflict::column(delegation::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(&db.conn)
+        .await
+        .ok();
+        abilities::Entity::insert(abilities::ActiveModel {
+            delegation: Set(hash),
+            resource: Set("tinycloud:did:key:rupe-owner:files/kv/doc".parse().unwrap()),
+            ability: Set("tinycloud.kv/put".to_string().try_into().unwrap()),
+            caveats: Set(Default::default()),
+        })
+        .exec(&db.conn)
+        .await
+        .unwrap();
+
+        // No event_order for hash — the unrelated state for other_hash doesn't help.
+        let result =
+            reconcile_pk_epoch_delegation::<_, MemoryStore, StaticSecret>(&db.conn, hash, 1, 0)
+                .await;
+        assert!(
+            matches!(result, Err(TxError::EpochInsert(_))),
+            "unrelated pk-epoch state must return EpochInsert",
         );
     }
 }

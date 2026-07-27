@@ -5983,16 +5983,18 @@ mod tests {
         Ok(())
     }
 
-    /// Smallest Rocket /delegate regression:
-    /// - empty HTTP body, all auth in the Authorization header
-    /// - identical request sent twice (exact byte replay)
-    /// - both responses must be 2xx and return the same CID
-    /// - after both requests: exactly one delegation row and no duplicate
-    ///   ability or parent rows; the epoch key must not be duplicated
-    #[tokio::test]
-    async fn rocket_delegate_idempotent_replay_emits_one_row_set() -> Result<()> {
-        use rocket::http::{Header, Status};
+    /// Strong concurrent /delegate idempotency proof:
+    /// - file-backed SQLite with production WAL options
+    /// - preinserted hosted space so the first delegation necessarily creates an epoch
+    /// - 8 exact-same signed requests released concurrently from a barrier
+    /// - every response must be 2xx with the same CID
+    /// - exactly one delegation row, exactly one ability row, zero parent rows,
+    ///   exactly one event_order row, and exactly one epoch row
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rocket_delegate_concurrent_barrier_single_instance() -> Result<()> {
+        use rocket::http::Header;
         use rocket::local::asynchronous::Client;
+        use std::sync::Arc;
         use tinycloud_auth::{
             resource::{Service, SpaceId},
             ssi::{
@@ -6004,13 +6006,16 @@ mod tests {
             ucan_capabilities_object::Capabilities,
         };
         use tinycloud_core::{
-            models::{abilities, delegation as deleg_model, epoch},
-            relationships::parent_delegations,
-            sea_orm::{EntityTrait, PaginatorTrait},
+            models::{abilities, delegation as deleg_model, epoch, space as space_model},
+            relationships::{event_order, parent_delegations},
+            sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait, PaginatorTrait},
+            types::SpaceIdWrap,
         };
 
         let tempdir = TempDir::new()?;
-        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
+        let db_path = tempdir.path().join("delegate_concurrent.db");
+        let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+        let db = Database::connect(crate::sqlite_connect_options(&db_url)).await?;
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
         let _persisted = tempdir.keep();
         let tinycloud = TinyCloud::new(
@@ -6037,8 +6042,13 @@ mod tests {
             .parse()?;
         let space: SpaceId = SpaceId::new(owner_did.clone(), "files".parse()?);
 
-        // Root delegation: owner self-delegates kv/put on their own space.
-        // No parent proof needed — the delegator IS the space owner.
+        // Preinsert the hosted space so the first delegation creates an epoch.
+        space_model::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&conn)
+        .await?;
+
         let resource =
             space
                 .clone()
@@ -6049,15 +6059,12 @@ mod tests {
             std::iter::once(("tinycloud.kv/put".parse()?, [])),
         );
 
-        // sign() returns a Ucan<Value, ()>; encode() serializes it as a JWT
-        // string, which is the exact format expected by the Authorization header
-        // for a UCAN delegation.
         let auth_header = Payload {
             issuer: verification_method.parse::<DIDURLBuf>()?,
             audience: owner_did,
             not_before: None,
             expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
-            nonce: Some("delegate-regression-nonce".to_string()),
+            nonce: Some("concurrent-barrier-nonce".to_string()),
             facts: Some(Vec::<serde_json::Value>::new()),
             proof: vec![],
             attenuation: caps,
@@ -6073,65 +6080,372 @@ mod tests {
             .manage(tinycloud)
             .manage(Config::default());
 
-        let client = Client::tracked(rocket).await?;
+        let client = Arc::new(Client::tracked(rocket).await?);
+        let auth_header = Arc::new(auth_header);
 
-        // First request — empty body, all auth in header.
-        let resp1 = client
-            .post("/delegate")
-            .header(Header::new("Authorization", auth_header.clone()))
-            .dispatch()
-            .await;
-        let status1 = resp1.status();
-        let body1 = resp1.into_string().await.unwrap_or_default();
-        assert!(
-            status1.class().is_success(),
-            "first /delegate must be 2xx, got {status1}: {body1}"
-        );
-        let json1: serde_json::Value = serde_json::from_str(&body1)?;
-        let cid1 = json1["cid"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("missing cid in first response"))?
-            .to_string();
+        // Barrier: all 8 tasks wait until every task is ready, then release together.
+        const N: usize = 8;
+        let barrier = Arc::new(tokio::sync::Barrier::new(N));
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let client = Arc::clone(&client);
+            let auth_header = Arc::clone(&auth_header);
+            let barrier = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let resp = client
+                    .post("/delegate")
+                    .header(Header::new("Authorization", (*auth_header).clone()))
+                    .dispatch()
+                    .await;
+                let status = resp.status();
+                let body = resp.into_string().await.unwrap_or_default();
+                (status, body)
+            }));
+        }
 
-        // Second request — identical bytes (replay).
-        let resp2 = client
-            .post("/delegate")
-            .header(Header::new("Authorization", auth_header.clone()))
-            .dispatch()
-            .await;
-        let status2 = resp2.status();
-        let body2 = resp2.into_string().await.unwrap_or_default();
-        assert!(
-            status2.class().is_success(),
-            "replay /delegate must be 2xx, got {status2}: {body2}"
-        );
-        let json2: serde_json::Value = serde_json::from_str(&body2)?;
-        let cid2 = json2["cid"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("missing cid in second response"))?
-            .to_string();
+        let mut cids: Vec<String> = Vec::with_capacity(N);
+        for (i, handle) in handles.into_iter().enumerate() {
+            let (status, body) = handle.await?;
+            assert!(
+                status.class().is_success(),
+                "concurrent request {i} must be 2xx, got {status}: {body}"
+            );
+            let json: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| anyhow::anyhow!("request {i} body not JSON: {e}: {body}"))?;
+            let cid = json["cid"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("request {i} missing cid in: {body}"))?
+                .to_string();
+            cids.push(cid);
+        }
 
-        assert_eq!(cid1, cid2, "both responses must return the same CID");
+        // All 8 responses must return the same CID.
+        let reference_cid = &cids[0];
+        for (i, cid) in cids.iter().enumerate() {
+            assert_eq!(
+                cid, reference_cid,
+                "response {i} CID must match response 0 CID"
+            );
+        }
 
-        // Verify DB state: exactly one delegation row, no duplicate
-        // ability or parent rows, and no duplicate epoch keys.
+        // Exactly one delegation row.
         let del_count = deleg_model::Entity::find().count(&conn).await?;
         assert_eq!(
             del_count, 1,
-            "exactly one delegation row after two identical requests"
+            "exactly one delegation row after {N} concurrent requests"
         );
 
+        // Exactly one ability row (no duplicates).
         let ability_count = abilities::Entity::find().count(&conn).await?;
         assert_eq!(ability_count, 1, "exactly one ability row — no duplicates");
 
+        // Zero parent rows (root delegation).
         let parent_count = parent_delegations::Entity::find().count(&conn).await?;
-        assert_eq!(parent_count, 0, "no parent rows for a root delegation");
+        assert_eq!(parent_count, 0, "zero parent rows for a root delegation");
 
+        // Exactly one event_order row.
+        let event_order_count = event_order::Entity::find().count(&conn).await?;
+        assert_eq!(event_order_count, 1, "exactly one event_order row");
+
+        // Exactly one epoch row.
         let epoch_count = epoch::Entity::find().count(&conn).await?;
-        assert!(
-            epoch_count <= 1,
-            "at most one epoch key — no duplicates (got {epoch_count})"
+        assert_eq!(epoch_count, 1, "exactly one epoch row");
+
+        Ok(())
+    }
+
+    /// Two independently constructed TinyCloud/Rocket instances sharing the same
+    /// file-backed SQLite database prove that the idempotency guarantee does not
+    /// rely on process-local locks.
+    ///
+    /// Schedule:
+    ///   - Two completed sequential replays (one from each instance)
+    ///   - Overlapping concurrent requests from both instances
+    ///   - Later sequential replays from each instance
+    ///   - Distinct signed delegations for the same hosted space do not alias
+    ///   - Multi-space delegation uses distinct composite space keys (one epoch
+    ///     per space, not a shared epoch row across spaces)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rocket_delegate_two_instance_shared_db() -> Result<()> {
+        use rocket::http::Header;
+        use rocket::local::asynchronous::Client;
+        use std::sync::Arc;
+        use tinycloud_auth::{
+            resource::{Service, SpaceId},
+            ssi::{
+                claims::jwt::NumericDate,
+                dids::{DIDBuf, DIDURLBuf},
+                jwk::Algorithm,
+                ucan::Payload,
+            },
+            ucan_capabilities_object::Capabilities,
+        };
+        use tinycloud_core::{
+            models::{delegation as deleg_model, epoch, space as space_model},
+            relationships::event_order,
+            sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait, PaginatorTrait},
+            types::SpaceIdWrap,
+        };
+
+        let tempdir = TempDir::new()?;
+        let db_path = tempdir.path().join("two_instance.db");
+        let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+        let storage_a = tempdir.path().join("storage_a");
+        let storage_b = tempdir.path().join("storage_b");
+        let _persisted = tempdir.keep();
+
+        std::fs::create_dir_all(&storage_a)?;
+        std::fs::create_dir_all(&storage_b)?;
+
+        let db_a = Database::connect(crate::sqlite_connect_options(&db_url)).await?;
+        let storage_fa = NodeFileSystemConfig::new(&storage_a).open().await?;
+        let tc_a = TinyCloud::new(
+            db_a.clone(),
+            Either::B(storage_fa),
+            StaticSecret::new(vec![0u8; 32]).unwrap(),
+        )
+        .await?;
+
+        let db_b = Database::connect(crate::sqlite_connect_options(&db_url)).await?;
+        let storage_fb = NodeFileSystemConfig::new(&storage_b).open().await?;
+        let tc_b = TinyCloud::new(
+            db_b.clone(),
+            Either::B(storage_fb),
+            StaticSecret::new(vec![0u8; 32]).unwrap(),
+        )
+        .await?;
+
+        let conn = db_a.clone();
+
+        // Owner for space 1.
+        let jwk = JWK::generate_ed25519()?;
+        let mut vm = DID_METHODS.generate(&jwk, "key")?.to_string();
+        let frag = vm
+            .rsplit_once(':')
+            .map(|(_, f)| f.to_owned())
+            .ok_or_else(|| anyhow::anyhow!("no fragment"))?;
+        vm.push('#');
+        vm.push_str(&frag);
+        let owner_did: DIDBuf = vm
+            .split('#')
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no did"))?
+            .parse()?;
+        let space: SpaceId = SpaceId::new(owner_did.clone(), "files".parse()?);
+
+        // Owner for space 2.
+        let jwk2 = JWK::generate_ed25519()?;
+        let mut vm2 = DID_METHODS.generate(&jwk2, "key")?.to_string();
+        let frag2 = vm2
+            .rsplit_once(':')
+            .map(|(_, f)| f.to_owned())
+            .ok_or_else(|| anyhow::anyhow!("no fragment"))?;
+        vm2.push('#');
+        vm2.push_str(&frag2);
+        let owner_did2: DIDBuf = vm2
+            .split('#')
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no did"))?
+            .parse()?;
+        let space2: SpaceId = SpaceId::new(owner_did2.clone(), "docs".parse()?);
+
+        // Preinsert both hosted spaces.
+        for sp in [&space, &space2] {
+            space_model::ActiveModel {
+                id: Set(SpaceIdWrap(sp.clone())),
+            }
+            .insert(&conn)
+            .await?;
+        }
+
+        let make_auth =
+            |jwk: &JWK, vm_str: &str, owner: &DIDBuf, sp: &SpaceId, nonce: &str| -> String {
+                let resource = sp.clone().to_resource(
+                    "kv".parse::<Service>().unwrap(),
+                    Some("doc".parse().unwrap()),
+                    None,
+                    None,
+                );
+                let mut caps = Capabilities::<()>::new();
+                caps.with_actions(
+                    resource.as_uri(),
+                    std::iter::once(("tinycloud.kv/put".parse().unwrap(), [])),
+                );
+                Payload {
+                    issuer: vm_str.parse::<DIDURLBuf>().unwrap(),
+                    audience: owner.clone(),
+                    not_before: None,
+                    expiration: NumericDate::try_from_seconds(4_102_444_800.0).unwrap(),
+                    nonce: Some(nonce.to_string()),
+                    facts: Some(Vec::<serde_json::Value>::new()),
+                    proof: vec![],
+                    attenuation: caps,
+                }
+                .sign(Algorithm::EdDSA, jwk)
+                .unwrap()
+                .encode()
+                .unwrap()
+            };
+
+        let auth_exact = make_auth(&jwk, &vm, &owner_did, &space, "two-instance-exact-nonce");
+        let auth_distinct = make_auth(&jwk, &vm, &owner_did, &space, "two-instance-distinct-nonce");
+        let auth_space2 = make_auth(
+            &jwk2,
+            &vm2,
+            &owner_did2,
+            &space2,
+            "two-instance-space2-nonce",
         );
+
+        let build_client = |tc: TinyCloud| async move {
+            let r = rocket::build()
+                .mount("/", rocket::routes![delegate])
+                .attach(crate::tracing::TracingFairing::new(
+                    &Config::default().log.tracing,
+                ))
+                .manage(tc)
+                .manage(Config::default());
+            Client::tracked(r).await
+        };
+
+        let client_a = Arc::new(build_client(tc_a).await?);
+        let client_b = Arc::new(build_client(tc_b).await?);
+
+        let send = |client: Arc<Client>, hdr: String| async move {
+            let resp = client
+                .post("/delegate")
+                .header(Header::new("Authorization", hdr))
+                .dispatch()
+                .await;
+            let status = resp.status();
+            let body = resp.into_string().await.unwrap_or_default();
+            (status, body)
+        };
+
+        // ── Two completed sequential replays (one from each instance) ────────
+        let (s1, b1) = send(Arc::clone(&client_a), auth_exact.clone()).await;
+        assert!(s1.class().is_success(), "instance-A first: {s1}: {b1}");
+        let cid_exact: String = serde_json::from_str::<serde_json::Value>(&b1)?["cid"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("no cid"))?
+            .to_string();
+
+        let (s2, b2) = send(Arc::clone(&client_b), auth_exact.clone()).await;
+        assert!(s2.class().is_success(), "instance-B replay: {s2}: {b2}");
+        let cid_exact2: String = serde_json::from_str::<serde_json::Value>(&b2)?["cid"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("no cid"))?
+            .to_string();
+        assert_eq!(cid_exact, cid_exact2, "sequential replay CID must match");
+
+        // ── Overlapping concurrent requests from both instances ──────────────
+        const N: usize = 8;
+        let barrier = Arc::new(tokio::sync::Barrier::new(N));
+        let mut handles = Vec::with_capacity(N);
+        for i in 0..N {
+            let client = if i % 2 == 0 {
+                Arc::clone(&client_a)
+            } else {
+                Arc::clone(&client_b)
+            };
+            let auth = auth_exact.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let resp = client
+                    .post("/delegate")
+                    .header(Header::new("Authorization", auth))
+                    .dispatch()
+                    .await;
+                let status = resp.status();
+                let body = resp.into_string().await.unwrap_or_default();
+                (status, body)
+            }));
+        }
+        for (i, h) in handles.into_iter().enumerate() {
+            let (s, b) = h.await?;
+            assert!(s.class().is_success(), "overlapping request {i}: {s}: {b}");
+            let cid: String = serde_json::from_str::<serde_json::Value>(&b)?["cid"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("no cid"))?
+                .to_string();
+            assert_eq!(cid, cid_exact, "overlapping request {i} CID must match");
+        }
+
+        // ── Later sequential replays from each instance ──────────────────────
+        let (sl_a, bl_a) = send(Arc::clone(&client_a), auth_exact.clone()).await;
+        assert!(sl_a.class().is_success(), "A-late-replay: {sl_a}: {bl_a}");
+        let cid_la: String = serde_json::from_str::<serde_json::Value>(&bl_a)?["cid"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("no cid"))?
+            .to_string();
+        assert_eq!(cid_la, cid_exact, "A late replay CID must match");
+
+        let (sl_b, bl_b) = send(Arc::clone(&client_b), auth_exact.clone()).await;
+        assert!(sl_b.class().is_success(), "B-late-replay: {sl_b}: {bl_b}");
+        let cid_lb: String = serde_json::from_str::<serde_json::Value>(&bl_b)?["cid"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("no cid"))?
+            .to_string();
+        assert_eq!(cid_lb, cid_exact, "B late replay CID must match");
+
+        // Exactly one delegation row for the exact replay.
+        let del_count = deleg_model::Entity::find().count(&conn).await?;
+        assert_eq!(
+            del_count, 1,
+            "exactly one delegation row after exact replays"
+        );
+        let eo_count = event_order::Entity::find().count(&conn).await?;
+        assert_eq!(
+            eo_count, 1,
+            "exactly one event_order row after exact replays"
+        );
+        let epoch_count_1 = epoch::Entity::find().count(&conn).await?;
+        assert_eq!(
+            epoch_count_1, 1,
+            "exactly one epoch row after exact replays"
+        );
+
+        // ── Distinct signed delegations do not alias ─────────────────────────
+        let (sd, bd) = send(Arc::clone(&client_a), auth_distinct.clone()).await;
+        assert!(sd.class().is_success(), "distinct delegation: {sd}: {bd}");
+        let cid_distinct: String = serde_json::from_str::<serde_json::Value>(&bd)?["cid"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("no cid"))?
+            .to_string();
+        assert_ne!(
+            cid_distinct, cid_exact,
+            "distinct delegation must produce a different CID"
+        );
+
+        let del_count2 = deleg_model::Entity::find().count(&conn).await?;
+        assert_eq!(
+            del_count2, 2,
+            "two distinct delegations must produce two rows"
+        );
+
+        // ── Multi-space: each space gets its own epoch row ───────────────────
+        let (ss2, bs2) = send(Arc::clone(&client_a), auth_space2.clone()).await;
+        assert!(ss2.class().is_success(), "space2 delegation: {ss2}: {bs2}");
+        let epoch_count2 = epoch::Entity::find().count(&conn).await?;
+        assert_eq!(
+            epoch_count2, 3,
+            "three epoch rows: one per committed delegation (space1-exact, space1-distinct, space2)"
+        );
+
+        // Each epoch row must reference a unique (id, space) composite key.
+        let epochs = epoch::Entity::find().all(&conn).await?;
+        let mut composite_keys: std::collections::HashSet<(
+            tinycloud_core::hash::Hash,
+            tinycloud_core::types::SpaceIdWrap,
+        )> = std::collections::HashSet::new();
+        for ep in &epochs {
+            assert!(
+                composite_keys.insert((ep.id, ep.space.clone())),
+                "epoch composite key (id, space) must be unique across all rows"
+            );
+        }
 
         Ok(())
     }

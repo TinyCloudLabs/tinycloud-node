@@ -480,8 +480,6 @@ async fn save<C: ConnectionTrait>(
     serialization: Vec<u8>,
     encryption: Option<&ColumnEncryption>,
 ) -> Result<DelegationRegistration, Error> {
-    save_actors(&[&delegation.delegator, &delegation.delegate], db).await?;
-
     // Hash is always computed on plaintext (before encryption)
     let hash: Hash = crate::hash::hash(&serialization);
 
@@ -504,7 +502,15 @@ async fn save<C: ConnectionTrait>(
         }
     };
 
-    // save delegation
+    // Actors are FK prerequisites for the delegation row and must be inserted
+    // first. They use ON CONFLICT DO NOTHING so concurrent transactions writing
+    // the same actors are safe. This is the only write that precedes the
+    // idempotency gate below.
+    save_actors(&[&delegation.delegator, &delegation.delegate], db).await?;
+
+    // Idempotency gate: the delegation INSERT ON CONFLICT is the claim. If
+    // the row already exists (RecordNotInserted) we return Existing immediately
+    // — no abilities or parent rows are written.
     match Entity::insert(ActiveModel::from(Model {
         id: hash,
         delegator: delegation.delegator,
