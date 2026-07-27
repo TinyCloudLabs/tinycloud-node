@@ -1026,18 +1026,15 @@ where
             .await;
         if let Err(TxError::EpochInsert(ref e)) = result {
             if is_pk_epoch_conflict(e) {
-                match delegation::Entity::find_by_id(retained_hash)
-                    .one(&self.conn)
-                    .await
-                {
-                    Ok(Some(_)) => {
+                match await_epoch_delegation(&self.conn, retained_hash).await {
+                    Ok(true) => {
                         return Ok(TransactResult {
                             commits: HashMap::new(),
                             skipped_spaces: Vec::new(),
                             delegation_cids: vec![retained_hash],
                         })
                     }
-                    Ok(None) => {}
+                    Ok(false) => {}
                     Err(db_err) => return Err(TxError::Db(db_err)),
                 }
             }
@@ -1726,6 +1723,36 @@ fn is_pk_epoch_conflict(error: &DbErr) -> bool {
         }
         _ => false,
     }
+}
+
+/// Bounded wait for the exact delegation row after a pk-epoch conflict.
+///
+/// After a pk-epoch conflict, the winning transaction's row may not yet be
+/// visible in a snapshot taken by the loser. This function performs an
+/// immediate query plus at most four 10 ms sleeps (≤ 40 ms total added
+/// latency) to wait for the row. Returns `Ok(true)` when the row is present,
+/// `Ok(false)` if still absent after the bound, or propagates a real `DbErr`.
+async fn await_epoch_delegation<C: ConnectionTrait>(
+    conn: &C,
+    retained_hash: Hash,
+) -> Result<bool, DbErr> {
+    const SLEEP_MS: u64 = 10;
+    const MAX_RETRIES: usize = 4;
+
+    for attempt in 0..=MAX_RETRIES {
+        match delegation::Entity::find_by_id(retained_hash)
+            .one(conn)
+            .await
+        {
+            Ok(Some(_)) => return Ok(true),
+            Ok(None) => {}
+            Err(e) => return Err(e),
+        }
+        if attempt < MAX_RETRIES {
+            tokio::time::sleep(std::time::Duration::from_millis(SLEEP_MS)).await;
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Debug)]
@@ -4080,5 +4107,80 @@ mod test {
         assert_eq!(roots.len(), 2, "duplicate parent must be deduped");
         assert!(roots.contains(&retained));
         assert!(roots.contains(&parent_a));
+    }
+
+    // --- await_epoch_delegation helper tests ---
+
+    async fn insert_delegation_row(db: &sea_orm::DbConn, hash: Hash) {
+        use sea_orm::ActiveModelTrait;
+        for actor_id in ["did:key:a", "did:key:b"] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(db)
+            .await
+            .ok();
+        }
+        delegation::ActiveModel {
+            id: Set(hash),
+            delegator: Set("did:key:a".to_string()),
+            delegatee: Set("did:key:b".to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(hash.as_ref().to_vec()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn await_epoch_delegation_immediate_existing_row_succeeds() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"await-epoch-immediate");
+        insert_delegation_row(&db.conn, hash).await;
+        let found = await_epoch_delegation(&db.conn, hash).await.unwrap();
+        assert!(found, "row already present must return true immediately");
+    }
+
+    #[tokio::test]
+    async fn await_epoch_delegation_delayed_insertion_within_bound_succeeds() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"await-epoch-delayed");
+        let conn = db.conn.clone();
+        // Insert the row after a short delay (< 40 ms bound).
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            insert_delegation_row(&conn, hash).await;
+        });
+        let found = await_epoch_delegation(&db.conn, hash).await.unwrap();
+        assert!(found, "row inserted within bound must be found");
+    }
+
+    #[tokio::test]
+    async fn await_epoch_delegation_absent_hash_returns_false_after_bound() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"await-epoch-absent");
+        // Never insert the row.
+        let found = await_epoch_delegation(&db.conn, hash).await.unwrap();
+        assert!(!found, "absent row must return false after the bound");
+    }
+
+    #[tokio::test]
+    async fn await_epoch_delegation_different_hash_never_matches() {
+        let db = get_db().await.unwrap();
+        let inserted_hash = crate::hash::hash(b"await-epoch-present");
+        let queried_hash = crate::hash::hash(b"await-epoch-other");
+        insert_delegation_row(&db.conn, inserted_hash).await;
+        // Query for a different hash — must not match.
+        let found = await_epoch_delegation(&db.conn, queried_hash)
+            .await
+            .unwrap();
+        assert!(
+            !found,
+            "a different hash must not match even though another row exists"
+        );
     }
 }
