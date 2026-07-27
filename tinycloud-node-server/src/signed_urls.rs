@@ -201,8 +201,6 @@ where
 {
     fn respond_to(self, _: &'r Request<'_>) -> rocket::response::Result<'static> {
         let mut response = Response::build();
-        response.header(Header::new("Accept-Ranges", "bytes"));
-        response.header(Header::new("Cache-Control", "private, no-store"));
 
         match self {
             Self::Full {
@@ -245,6 +243,8 @@ where
                 ));
             }
         }
+        response.header(Header::new("Accept-Ranges", "bytes"));
+        response.header(Header::new("Cache-Control", "private, no-store"));
         Ok(response.finalize())
     }
 }
@@ -889,6 +889,47 @@ mod tests {
         );
         assert!(response.headers().get_one("Transfer-Encoding").is_none());
         assert!(response.headers().get_one("Connection").is_none());
+    }
+
+    #[tokio::test]
+    async fn signed_response_policy_headers_override_legacy_metadata() -> Result<()> {
+        let client = Client::tracked(rocket::build()).await?;
+        let response = SignedKvReadResponse::Full {
+            metadata: Metadata(
+                [
+                    ("content-type".to_string(), "text/plain".to_string()),
+                    (
+                        "cache-control".to_string(),
+                        "public, max-age=31536000".to_string(),
+                    ),
+                    (
+                        "cdn-cache-control".to_string(),
+                        "public, max-age=31536000".to_string(),
+                    ),
+                    ("content-length".to_string(), "999".to_string()),
+                    ("transfer-encoding".to_string(), "chunked".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            hash: hash(b"signed-policy"),
+            content: Content::new(5, Cursor::new(b"hello".to_vec())),
+        }
+        .respond_to(client.get("/").inner())
+        .map_err(|status| anyhow::anyhow!("signed response failed: {status}"))?;
+
+        assert_eq!(
+            response.headers().get_one("Content-Type"),
+            Some("text/plain")
+        );
+        assert_eq!(
+            response.headers().get_one("Cache-Control"),
+            Some("private, no-store")
+        );
+        assert_eq!(response.headers().get_one("Content-Length"), Some("5"));
+        assert!(response.headers().get_one("CDN-Cache-Control").is_none());
+        assert!(response.headers().get_one("Transfer-Encoding").is_none());
+        Ok(())
     }
 
     #[tokio::test]
