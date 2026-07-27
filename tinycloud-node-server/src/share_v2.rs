@@ -67,7 +67,8 @@ use tinycloud_core::{
 use crate::{authorization::AuthHeaderGetter, config::ShareEmailConfig, tee::TeeContext};
 
 pub const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
-const MAX_REQUEST_BYTES: usize = MAX_BODY_BYTES;
+const MAX_REQUEST_BYTES: usize =
+    tinycloud_core::share_email::types::MAX_NATIVE_ENCODED_REQUEST_BYTES;
 const POLICY_DOMAIN: &str = "xyz.tinycloud.share/policy/v2\0";
 const ENFORCEMENT_DOMAIN: &str = "xyz.tinycloud.share/policy-enforcement/v2\0";
 const REGISTRATION_DOMAIN: &str = "xyz.tinycloud.share/policy-registration/v2\0";
@@ -217,24 +218,20 @@ impl ShareV2Runtime {
             .await
             .is_ok()
             && self.encryption_probe();
-        let graph = if cfg!(feature = "mounted-fixture") {
-            true
-        } else {
-            delegation::Entity::find()
+        let graph = delegation::Entity::find()
+            .select_only()
+            .column(delegation::Column::Id)
+            .limit(1)
+            .all(&self.conn)
+            .await
+            .is_ok()
+            && revocation::Entity::find()
                 .select_only()
-                .column(delegation::Column::Id)
+                .column(revocation::Column::Id)
                 .limit(1)
                 .all(&self.conn)
                 .await
-                .is_ok()
-                && revocation::Entity::find()
-                    .select_only()
-                    .column(revocation::Column::Id)
-                    .limit(1)
-                    .all(&self.conn)
-                    .await
-                    .is_ok()
-        };
+                .is_ok();
         let checks = self.checks(migration, graph);
         let ready = checks.migration
             && checks.encrypted_storage
@@ -274,24 +271,20 @@ pub async fn compose(
         .all(&conn)
         .await
         .is_ok();
-    let graph_ready = if cfg!(feature = "mounted-fixture") {
-        true
-    } else {
-        delegation::Entity::find()
+    let graph_ready = delegation::Entity::find()
+        .select_only()
+        .column(delegation::Column::Id)
+        .limit(1)
+        .all(&conn)
+        .await
+        .is_ok()
+        && revocation::Entity::find()
             .select_only()
-            .column(delegation::Column::Id)
+            .column(revocation::Column::Id)
             .limit(1)
             .all(&conn)
             .await
-            .is_ok()
-            && revocation::Entity::find()
-                .select_only()
-                .column(revocation::Column::Id)
-                .limit(1)
-                .all(&conn)
-                .await
-                .is_ok()
-    };
+            .is_ok();
     let signing_seed = key_setup.derive_key(b"tinycloud/share-email/invitation-signing");
     let signing_secret =
         tinycloud_core::libp2p::identity::ed25519::SecretKey::try_from_bytes(signing_seed)
@@ -330,16 +323,12 @@ pub async fn compose(
                     )
                 })
         });
-    let tee_ready = if cfg!(feature = "mounted-fixture") {
-        true
-    } else {
-        tee_key_derived
-            && tee_context.as_ref().is_some_and(|context| {
-                !context.app_id.is_empty()
-                    && !context.compose_hash.is_empty()
-                    && context.enforcer_did == key_setup.node_did()
-            })
-    };
+    let tee_ready = tee_key_derived
+        && tee_context.as_ref().is_some_and(|context| {
+            !context.app_id.is_empty()
+                && !context.compose_hash.is_empty()
+                && context.enforcer_did == key_setup.node_did()
+        });
     let tee_binding_digest = tee_ready.then(|| {
         b64_digest(
             format!(
@@ -347,11 +336,11 @@ pub async fn compose(
                 tee_context
                     .as_ref()
                     .map(|context| context.app_id.as_str())
-                    .unwrap_or("mounted-fixture"),
+                    .unwrap_or_default(),
                 tee_context
                     .as_ref()
                     .map(|context| context.compose_hash.as_str())
-                    .unwrap_or("mounted-fixture"),
+                    .unwrap_or_default(),
                 key_setup.node_did()
             )
             .as_bytes(),
@@ -839,7 +828,11 @@ pub async fn register_policy(
         registration,
         proof: ReceiptProof {
             alg: "EdDSA",
-            kid: canonical_did_key_kid(&runtime.signer_did),
+            // Registration receipts use the same enrolled public key as the
+            // node invitation contract. The trust-bundle kid is the authority
+            // boundary; a self-describing did:key fallback is not accepted by
+            // production clients.
+            kid: runtime.config.invitation_kid.clone(),
             signature: encode_config(signature, URL_SAFE_NO_PAD),
         },
     };
@@ -1446,6 +1439,9 @@ struct V2DeliveryRequest {
     policy_cid: String,
     delegation_cid: String,
     enforcement_delegation_cid: String,
+    recipient_email: String,
+    share_url: String,
+    document_name: String,
     jti: String,
     expires_at: String,
     request_body_digest: String,
@@ -1804,7 +1800,7 @@ fn typed_scope(
 ) -> Result<ShareScope, ()> {
     let action = match request.action.as_str() {
         "tinycloud.kv/get" => ShareAction::KvGet,
-        "tinycloud.kv/metadata" => ShareAction::KvGet,
+        "tinycloud.kv/metadata" => ShareAction::KvMetadata,
         "tinycloud.kv/put" => ShareAction::KvPut,
         "tinycloud.kv/list" => ShareAction::KvList,
         _ => return Err(()),
@@ -1831,7 +1827,10 @@ fn typed_scope(
         action: match action {
             ShareAction::KvPut => tinycloud_core::share_email::types::KvGetAction::Put,
             ShareAction::KvList => tinycloud_core::share_email::types::KvGetAction::List,
-            _ => tinycloud_core::share_email::types::KvGetAction::Get,
+            ShareAction::KvMetadata | ShareAction::KvGet => {
+                tinycloud_core::share_email::types::KvGetAction::Get
+            }
+            ShareAction::SqlRead => return Err(()),
         },
     };
     let digest = decode_canonical_b64(&registered.row.content_source_digest, 64).map_err(|_| ())?;
@@ -1857,7 +1856,8 @@ fn typed_scope(
             .actions
             .iter()
             .map(|action| match action.as_str() {
-                "tinycloud.kv/get" | "tinycloud.kv/metadata" => Ok(ShareAction::KvGet),
+                "tinycloud.kv/get" => Ok(ShareAction::KvGet),
+                "tinycloud.kv/metadata" => Ok(ShareAction::KvMetadata),
                 "tinycloud.kv/list" => Ok(ShareAction::KvList),
                 "tinycloud.kv/put" => Ok(ShareAction::KvPut),
                 _ => Err(()),
@@ -2093,7 +2093,7 @@ fn share_error(code: &'static str) -> ApiErrorResponse {
 /// must name exactly one direct child.
 fn resource_scope_allows(kind: &str, scope: &str, requested: &str, action: &str) -> bool {
     if kind == "exact" {
-        return scope == requested;
+        return action != "tinycloud.kv/list" && scope == requested;
     }
     if kind != "prefix" || scope.is_empty() || scope.ends_with('/') {
         return false;
@@ -2818,6 +2818,22 @@ pub async fn invoke_v2(
     )
     .await
     .map_err(|_| share_error("invoke_replayed"))?;
+    if action == "tinycloud.kv/metadata" {
+        let Some((metadata, hash)) = runtime
+            .tinycloud
+            .kv_metadata_with_hash(&space, &path)
+            .await
+            .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?
+        else {
+            return Err(error(Status::NotFound, "content_not_found"));
+        };
+        let etag = format!("\"blake3-{}\"", hex::encode(hash.as_ref()));
+        return Ok(Json(serde_json::json!({
+            "type": "TinyCloudShareInvokeResponse", "version": 2,
+            "action": action, "resource": invocation.resource,
+            "metadata": metadata.0, "etag": etag
+        })));
+    }
     let Some((metadata, hash, content)) = runtime
         .tinycloud
         .kv_get(&space, &path)
@@ -2833,13 +2849,6 @@ pub async fn invoke_v2(
         .await
         .map_err(|_| error(Status::ServiceUnavailable, "capability_unavailable"))?;
     let etag = format!("\"blake3-{}\"", hex::encode(hash.as_ref()));
-    if action == "tinycloud.kv/metadata" {
-        return Ok(Json(serde_json::json!({
-            "type": "TinyCloudShareInvokeResponse", "version": 2,
-            "action": action, "resource": invocation.resource,
-            "metadata": metadata.0, "etag": etag
-        })));
-    }
     if action != "tinycloud.kv/get" {
         return Err(share_error("unsupported_action"));
     }
@@ -2966,6 +2975,11 @@ pub async fn authorize_delivery_v2(
         || request.share_id != registered.envelope.policy.share_id
         || request.delegation_cid != registered.row.owner_delegation_cid
         || request.enforcement_delegation_cid != registered.row.enforcement_delegation_cid
+        || !registered
+            .matcher
+            .matches_verified_email(&request.recipient_email)
+        || request.share_url.is_empty()
+        || request.document_name.is_empty()
         || !normal_invocation_allows_delivery(&invocation.0 .0, &registered)
     {
         return Err(share_error("delivery_authorization_invalid"));
@@ -2999,6 +3013,25 @@ pub async fn authorize_delivery_v2(
         "policyCid": request.policy_cid,
         "nodeAudience": registered.row.node_audience,
         "targetOrigin": registered.row.target_origin,
+        "holder": invocation.0 .0.invoker,
+        "recipientMatcher": serde_json::to_value(&registered.envelope.policy.recipient_matcher).map_err(|_| share_error("delivery_authorization_invalid"))?,
+        "deliveryEmail": request.recipient_email,
+        "shareUrl": request.share_url,
+        "returnOrigin": runtime.config.return_origin,
+        "documentName": request.document_name,
+        "senderDid": invocation.0 .0.invoker,
+        "senderTrust": "verified",
+        "contentSource": serde_json::to_value(&registered.envelope.policy.content_source).map_err(|_| share_error("delivery_authorization_invalid"))?,
+        "contentSourceDigest": registered.row.content_source_digest,
+        "shareExpiresAt": registered.row.expires_at,
+        "issuedAt": timestamp(now),
+        "reportAbuseToken": request.jti,
+        "actions": registered.envelope.policy.actions.clone(),
+        "resource": registered.envelope.policy.resource.path.clone(),
+        "authorityMaterialHandle": request.registration_cid,
+        "authorityMaterialDigest": b64_digest(request.registration_cid.as_bytes()),
+        "requestBodyDigest": request.request_body_digest,
+        "idempotencyKey": request.jti,
         "expiresAt": request.expires_at,
         "dataAuthority": false
     });

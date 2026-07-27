@@ -8,6 +8,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 
 pub const KV_GET_ACTION: &str = "tinycloud.kv/get";
+pub const KV_METADATA_ACTION: &str = "tinycloud.kv/metadata";
 pub const KV_LIST_ACTION: &str = "tinycloud.kv/list";
 pub const KV_PUT_ACTION: &str = "tinycloud.kv/put";
 pub const SQL_READ_ACTION: &str = "tinycloud.sql/read";
@@ -571,6 +572,8 @@ pub enum SqlReadAction {
 pub enum ShareAction {
     #[serde(rename = "tinycloud.kv/get")]
     KvGet,
+    #[serde(rename = "tinycloud.kv/metadata")]
+    KvMetadata,
     #[serde(rename = "tinycloud.kv/list")]
     KvList,
     #[serde(rename = "tinycloud.kv/put")]
@@ -583,6 +586,7 @@ impl ShareAction {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::KvGet => KV_GET_ACTION,
+            Self::KvMetadata => KV_METADATA_ACTION,
             Self::KvList => KV_LIST_ACTION,
             Self::KvPut => KV_PUT_ACTION,
             Self::SqlRead => SQL_READ_ACTION,
@@ -590,7 +594,10 @@ impl ShareAction {
     }
 
     pub const fn is_kv(self) -> bool {
-        matches!(self, Self::KvGet | Self::KvList | Self::KvPut)
+        matches!(
+            self,
+            Self::KvGet | Self::KvMetadata | Self::KvList | Self::KvPut
+        )
     }
 
     pub const fn is_list(self) -> bool {

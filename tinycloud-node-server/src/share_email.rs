@@ -2161,7 +2161,9 @@ pub async fn native_invoke(
                 Some(Header::new("ETag", etag.clone())),
             ))
         }
-        ShareAction::SqlRead => Err(error(Status::BadRequest, "unsupported_action")),
+        ShareAction::KvMetadata | ShareAction::SqlRead => {
+            Err(error(Status::BadRequest, "unsupported_action"))
+        }
     }
 }
 

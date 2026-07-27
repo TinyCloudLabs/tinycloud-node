@@ -459,7 +459,10 @@ fn validate_actions(
             !matches!(
                 (action, source),
                 (
-                    ShareAction::KvGet | ShareAction::KvList | ShareAction::KvPut,
+                    ShareAction::KvGet
+                        | ShareAction::KvMetadata
+                        | ShareAction::KvList
+                        | ShareAction::KvPut,
                     ContentSource::Kv { .. }
                 ) | (ShareAction::SqlRead, ContentSource::Sql { .. })
             )
