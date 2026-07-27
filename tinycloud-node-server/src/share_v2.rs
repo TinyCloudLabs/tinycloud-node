@@ -160,6 +160,13 @@ impl ShareV2Runtime {
             && TargetOrigin::parse(self.config.target_origin.clone()).is_ok()
             && !self.config.node_audience.is_empty()
             && self.config.node_audience.starts_with("did:")
+            && self
+                .config
+                .credentials_origin
+                .as_deref()
+                .is_some_and(|origin| TargetOrigin::parse(origin.to_owned()).is_ok())
+            && self.config.credentials_origin.as_deref() != Some(self.config.target_origin.as_str())
+            && self.config.credentials_origin.as_deref() != Some(self.config.return_origin.as_str())
             && self.tee_ready
             && self.tee_binding_digest.is_some()
             && !self.signer_did.is_empty()
@@ -2984,6 +2991,16 @@ pub async fn authorize_delivery_v2(
     {
         return Err(share_error("delivery_authorization_invalid"));
     }
+    // Sourced from the node's own trust-bundle-resolved credentials origin,
+    // never from the request. `static_ready()` already requires this to be a
+    // valid https origin distinct from `node_audience`/`return_origin`, so
+    // the runtime cannot reach this handler with a missing or degenerate
+    // value; the explicit check keeps this call site fail-closed on its own.
+    let open_credentials_audience = runtime
+        .config
+        .credentials_origin
+        .clone()
+        .ok_or_else(|| share_error("delivery_authorization_invalid"))?;
     share_invitation_authorization_jti::ActiveModel {
         jti: Set(request.jti.clone()),
         authorization_digest: Set(request.request_body_digest.clone()),
@@ -3013,6 +3030,7 @@ pub async fn authorize_delivery_v2(
         "policyCid": request.policy_cid,
         "nodeAudience": registered.row.node_audience,
         "targetOrigin": registered.row.target_origin,
+        "openCredentialsAudience": open_credentials_audience,
         "holder": invocation.0 .0.invoker,
         "recipientMatcher": serde_json::to_value(&registered.envelope.policy.recipient_matcher).map_err(|_| share_error("delivery_authorization_invalid"))?,
         "deliveryEmail": request.recipient_email,
@@ -3657,6 +3675,7 @@ mod tests {
             issuer_kid: "did:web:issuer.credentials.org#email-signing-key-1".into(),
             issuer_key_version: 1,
             issuer_public_key: Some("AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA".into()),
+            credentials_origin: Some("https://witness.credentials.org".into()),
             ..ShareEmailConfig::default()
         }
     }

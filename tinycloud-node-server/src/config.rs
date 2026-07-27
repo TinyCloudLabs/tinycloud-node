@@ -223,6 +223,7 @@ impl ShareEmailConfig {
         resolved.node_audience = bundle.node_audience;
         resolved.return_origin = bundle.return_origin.clone();
         resolved.allowed_origins = vec![bundle.return_origin];
+        resolved.credentials_origin = Some(bundle.credentials_origin.clone());
         resolved.node_signing_kid = bundle.node_invitation_kid.clone();
         resolved.invitation_kid = bundle.node_invitation_kid;
         resolved.invitation_public_key = Some(bundle.node_invitation_public_key);
@@ -275,6 +276,11 @@ impl ShareEmailConfig {
                 .is_some_and(|path| path.trim().is_empty())
             || self.readiness_max_age_seconds == 0
             || self.readiness_max_age_seconds > 300
+            || self.credentials_origin.as_deref().is_none_or(|origin| {
+                tinycloud_core::share_email::TargetOrigin::parse(origin.to_owned()).is_err()
+            })
+            || self.credentials_origin.as_deref() == Some(self.target_origin.as_str())
+            || self.credentials_origin.as_deref() == Some(self.return_origin.as_str())
         {
             return Err("share email configuration is incomplete");
         }
