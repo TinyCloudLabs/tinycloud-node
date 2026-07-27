@@ -3045,6 +3045,7 @@ pub async fn authorize_delivery_v2(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rocket::local::asynchronous::Client;
     use time::Duration;
 
     #[test]
@@ -3301,5 +3302,334 @@ mod tests {
             "did:key:z6MkEnforcer"
         )
         .is_err());
+    }
+
+    // --- HTTP/DB boundary and adversarial matrix -------------------------
+    //
+    // These exercise the real byte boundaries, real crypto verification,
+    // and real persistence layer used by the v2 owner-rooted routes rather
+    // than only the pure request-shape helpers above.
+
+    use tinycloud_core::hash::hash;
+    use tinycloud_core::keys::public_key_to_did_key;
+    use tinycloud_core::migrations::Migrator;
+    use tinycloud_core::models::actor;
+    use tinycloud_core::sea_orm::{ConnectOptions, Database};
+    use tinycloud_core::sea_orm_migration::MigratorTrait;
+
+    #[test]
+    fn decoded_content_boundary_is_exactly_100_mib_not_101() {
+        let at_limit = vec![7u8; MAX_BODY_BYTES];
+        let encoded_at_limit = encode_config(&at_limit, URL_SAFE_NO_PAD);
+        assert_eq!(
+            decode_canonical_b64(&encoded_at_limit, MAX_BODY_BYTES)
+                .expect("exactly 104857600 decoded bytes must be accepted")
+                .len(),
+            MAX_BODY_BYTES
+        );
+
+        let over_limit = vec![7u8; MAX_BODY_BYTES + 1];
+        let encoded_over_limit = encode_config(&over_limit, URL_SAFE_NO_PAD);
+        assert!(
+            decode_canonical_b64(&encoded_over_limit, MAX_BODY_BYTES).is_err(),
+            "104857601 decoded bytes must be rejected"
+        );
+    }
+
+    #[rocket::post("/test/read-body", data = "<data>")]
+    async fn read_body_probe(data: Data<'_>) -> Status {
+        match read_body(data).await {
+            Ok(_) => Status::Ok,
+            Err(response) => response.0,
+        }
+    }
+
+    #[rocket::async_test]
+    async fn request_wire_boundary_is_independent_of_the_decoded_body_boundary() {
+        let rocket = rocket::build().mount("/", rocket::routes![read_body_probe]);
+        let client = Client::tracked(rocket).await.expect("rocket local client");
+
+        let at_limit = vec![b'x'; MAX_REQUEST_BYTES];
+        let response = client
+            .post("/test/read-body")
+            .body(at_limit)
+            .dispatch()
+            .await;
+        assert_ne!(
+            response.status(),
+            Status::PayloadTooLarge,
+            "the exact wire boundary (MAX_REQUEST_BYTES) must not be rejected for size"
+        );
+
+        let over_limit = vec![b'x'; MAX_REQUEST_BYTES + 1];
+        let response = client
+            .post("/test/read-body")
+            .body(over_limit)
+            .dispatch()
+            .await;
+        assert_eq!(
+            response.status(),
+            Status::PayloadTooLarge,
+            "one byte past the wire boundary must be rejected"
+        );
+        assert_ne!(
+            MAX_REQUEST_BYTES, MAX_BODY_BYTES,
+            "the wire (base64) boundary and the decoded-body boundary must be independently defined"
+        );
+    }
+
+    fn tamper_keypair_and_did() -> (Ed25519InvitationSigner, String) {
+        let keypair = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
+        let did = public_key_to_did_key(
+            tinycloud_core::libp2p::identity::Keypair::from(keypair.clone()).public(),
+        );
+        let kid = canonical_did_key_kid(&did);
+        (
+            Ed25519InvitationSigner::new(kid, keypair.into()).expect("valid kid"),
+            did,
+        )
+    }
+
+    #[test]
+    fn v2_holder_proof_signature_tamper_is_rejected() {
+        let (signer, holder_did) = tamper_keypair_and_did();
+        let value = serde_json::json!({"resource": "shares/share-1/document.md"});
+        let mut proof = signed_value(&signer, b"xyz.tinycloud.share/test-tamper/v1\0", &value)
+            .expect("valid signature produced");
+        assert!(verify_v2_proof(
+            &holder_did,
+            &proof,
+            b"xyz.tinycloud.share/test-tamper/v1\0",
+            &value
+        )
+        .is_ok());
+
+        let mut signature_bytes = decode_config(&proof.signature, URL_SAFE_NO_PAD).unwrap();
+        signature_bytes[0] ^= 0x01;
+        proof.signature = encode_config(&signature_bytes, URL_SAFE_NO_PAD);
+        assert!(
+            verify_v2_proof(
+                &holder_did,
+                &proof,
+                b"xyz.tinycloud.share/test-tamper/v1\0",
+                &value
+            )
+            .is_err(),
+            "a single flipped signature byte must be rejected"
+        );
+    }
+
+    async fn migrated_memory_db() -> tinycloud_core::sea_orm::DatabaseConnection {
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .expect("in-memory sqlite connects");
+        Migrator::up(&db, None).await.expect("migrations apply");
+        db
+    }
+
+    #[tokio::test]
+    async fn revocation_in_ancestry_detects_transitive_revocation_on_the_real_chain_only() {
+        let db = migrated_memory_db().await;
+        actor::ActiveModel {
+            id: Set("did:key:actor".to_owned()),
+        }
+        .insert(&db)
+        .await
+        .expect("actor row");
+
+        let leaf = hash(b"v2-boundary-leaf");
+        let parent = hash(b"v2-boundary-parent");
+        let grandparent = hash(b"v2-boundary-grandparent");
+        let sibling = hash(b"v2-boundary-sibling");
+
+        for id in [leaf, parent, grandparent, sibling] {
+            delegation::ActiveModel {
+                id: Set(id),
+                delegator: Set("did:key:actor".to_owned()),
+                delegatee: Set("did:key:actor".to_owned()),
+                expiry: Set(None),
+                issued_at: Set(None),
+                not_before: Set(None),
+                facts: Set(None),
+                serialization: Set(id.as_ref().to_vec()),
+            }
+            .insert(&db)
+            .await
+            .expect("delegation row");
+        }
+        parent_delegations::ActiveModel {
+            parent: Set(parent),
+            child: Set(leaf),
+        }
+        .insert(&db)
+        .await
+        .expect("leaf->parent link");
+        parent_delegations::ActiveModel {
+            parent: Set(grandparent),
+            child: Set(parent),
+        }
+        .insert(&db)
+        .await
+        .expect("parent->grandparent link");
+
+        assert!(
+            !revocation_in_ancestry(&db, leaf).await.unwrap(),
+            "no revocation exists yet"
+        );
+
+        revocation::ActiveModel {
+            id: Set(hash(b"v2-boundary-revocation")),
+            revoker: Set("did:key:actor".to_owned()),
+            revoked: Set(grandparent),
+            serialization: Set(b"v2-boundary-revocation".to_vec()),
+            revoked_at: Set(Some(OffsetDateTime::now_utc())),
+        }
+        .insert(&db)
+        .await
+        .expect("revocation row");
+
+        assert!(
+            revocation_in_ancestry(&db, leaf).await.unwrap(),
+            "revoking the grandparent must be visible transitively to the leaf"
+        );
+        assert!(
+            !revocation_in_ancestry(&db, sibling).await.unwrap(),
+            "an unrelated chain must not be affected by the revocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn holder_read_jti_rejects_replay_and_the_rejection_survives_a_restart() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("share-v2-jti.sqlite").display()
+        );
+        async fn connect(url: &str) -> tinycloud_core::sea_orm::DatabaseConnection {
+            let mut options = ConnectOptions::new(url.to_owned());
+            options.max_connections(1);
+            Database::connect(options)
+                .await
+                .expect("file-backed sqlite connects")
+        }
+        async fn insert(
+            db: &tinycloud_core::sea_orm::DatabaseConnection,
+            jti: &str,
+        ) -> Result<(), tinycloud_core::sea_orm::DbErr> {
+            share_holder_read_jti::ActiveModel {
+                jti: Set(jti.to_owned()),
+                session_handle: Set("session".to_owned()),
+                invocation_digest: Set("digest".to_owned()),
+                binding_json: Set(serde_json::json!({})),
+                issued_at: Set(now_string()),
+                expires_at: Set(now_string()),
+                consumed_at: Set(Some(now_string())),
+            }
+            .insert(db)
+            .await
+            .map(|_| ())
+        }
+
+        let db = connect(&url).await;
+        Migrator::up(&db, None).await.expect("migrations apply");
+        insert(&db, "jti-restart-case")
+            .await
+            .expect("first use succeeds");
+        assert!(
+            insert(&db, "jti-restart-case").await.is_err(),
+            "replaying the same JTI in the same process must be rejected"
+        );
+        db.close().await.expect("clean close");
+
+        let restarted = connect(&url).await;
+        assert!(
+            insert(&restarted, "jti-restart-case").await.is_err(),
+            "the replay rejection must survive a process restart, not just an in-memory cache"
+        );
+        assert!(
+            insert(&restarted, "jti-fresh-after-restart").await.is_ok(),
+            "a genuinely new JTI must still be accepted after restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn invitation_authorization_jti_rejects_replay_and_the_rejection_survives_a_restart() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory
+                .path()
+                .join("share-v2-invitation-jti.sqlite")
+                .display()
+        );
+        async fn connect(url: &str) -> tinycloud_core::sea_orm::DatabaseConnection {
+            let mut options = ConnectOptions::new(url.to_owned());
+            options.max_connections(1);
+            Database::connect(options)
+                .await
+                .expect("file-backed sqlite connects")
+        }
+        async fn insert(
+            db: &tinycloud_core::sea_orm::DatabaseConnection,
+            jti: &str,
+        ) -> Result<(), tinycloud_core::sea_orm::DbErr> {
+            share_invitation_authorization_jti::ActiveModel {
+                jti: Set(jti.to_owned()),
+                authorization_digest: Set("digest".to_owned()),
+                binding_json: Set(serde_json::json!({})),
+                issued_at: Set(now_string()),
+                expires_at: Set(now_string()),
+                consumed_at: Set(Some(now_string())),
+            }
+            .insert(db)
+            .await
+            .map(|_| ())
+        }
+
+        let db = connect(&url).await;
+        Migrator::up(&db, None).await.expect("migrations apply");
+        insert(&db, "invitation-jti-restart-case")
+            .await
+            .expect("first use succeeds");
+        assert!(
+            insert(&db, "invitation-jti-restart-case").await.is_err(),
+            "replaying the same invitation JTI in the same process must be rejected"
+        );
+        db.close().await.expect("clean close");
+
+        let restarted = connect(&url).await;
+        assert!(
+            insert(&restarted, "invitation-jti-restart-case")
+                .await
+                .is_err(),
+            "the replay rejection must survive a process restart, not just an in-memory cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_jti_race_admits_exactly_one_winner() {
+        let db = std::sync::Arc::new(migrated_memory_db().await);
+        let attempts = futures::future::join_all((0..8).map(|_| {
+            let db = db.clone();
+            async move {
+                share_holder_read_jti::ActiveModel {
+                    jti: Set("race-jti".to_owned()),
+                    session_handle: Set("session".to_owned()),
+                    invocation_digest: Set("digest".to_owned()),
+                    binding_json: Set(serde_json::json!({})),
+                    issued_at: Set(now_string()),
+                    expires_at: Set(now_string()),
+                    consumed_at: Set(Some(now_string())),
+                }
+                .insert(db.as_ref())
+                .await
+            }
+        }))
+        .await;
+        let winners = attempts.iter().filter(|result| result.is_ok()).count();
+        assert_eq!(
+            winners, 1,
+            "exactly one concurrent claim of the same JTI must win"
+        );
     }
 }
