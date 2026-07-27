@@ -288,9 +288,8 @@ pub async fn compose(
         tinycloud_core::libp2p::identity::ed25519::SecretKey::try_from_bytes(signing_seed)
             .map_err(|_| anyhow::anyhow!("invalid share v2 signing key"))?;
     let signing_keypair = tinycloud_core::libp2p::identity::ed25519::Keypair::from(signing_secret);
-    let signer_did = tinycloud_core::keys::public_key_to_did_key(signing_keypair.public().into());
     let signer =
-        Ed25519InvitationSigner::new(canonical_did_key_kid(&signer_did), signing_keypair.into())?;
+        Ed25519InvitationSigner::new(config.invitation_kid.clone(), signing_keypair.into())?;
     let enforcer_did = key_setup.node_did();
     let enforcer_signer = Ed25519InvitationSigner::new(
         canonical_did_key_kid(&enforcer_did),
@@ -352,7 +351,7 @@ pub async fn compose(
         ),
         signer: Arc::new(signer),
         enforcer_signer: Arc::new(enforcer_signer),
-        signer_did,
+        signer_did: config.invitation_kid.clone(),
         enforcer_did,
         config,
         tee_ready,
@@ -531,6 +530,7 @@ struct SdkContentSource {
     kind: String,
     space: String,
     path: String,
+    action: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -574,7 +574,7 @@ struct RecipientMatcher {
     value: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 struct PolicyTarget {
     origin: String,
@@ -586,19 +586,20 @@ struct PolicyTarget {
     space_id: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 struct ExactResource {
     kind: String,
     path: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 struct ContentSource {
     kind: String,
     space: String,
     path: String,
+    action: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -875,6 +876,7 @@ fn parse_sdk_policy(
     if sdk.artifact_type != "TinyCloudSharePolicy"
         || sdk.version != 2
         || sdk.content_source.kind != "kv"
+        || sdk.content_source.action != "tinycloud.kv/get"
         || sdk.resource.kind != "exact"
         || sdk.content_source_digest != request.content_source_digest
         || sdk.issuer_did.is_empty()
@@ -914,6 +916,7 @@ fn parse_sdk_policy(
                 kind: sdk.content_source.kind,
                 space: sdk.content_source.space,
                 path: sdk.content_source.path,
+                action: sdk.content_source.action,
             },
             content_source_digest: sdk.content_source_digest,
             owner_delegation_cid: request.owner_delegation.cid.clone(),
@@ -941,6 +944,7 @@ fn validate_policy(
         || policy.owner_delegation_cid != request.owner_delegation.cid
         || policy.resource.kind != "exact"
         || policy.content_source.kind != "kv"
+        || policy.content_source.action != "tinycloud.kv/get"
         || policy.content_source.path != policy.resource.path
         || policy.content_source.space != policy.target.space_id
     {
@@ -1502,6 +1506,31 @@ fn verify_outer_envelope(
     {
         return Err(());
     }
+    let envelope_identity = serde_json::json!({
+        "schema": envelope.schema.clone(),
+        "version": envelope.version,
+        "shareId": envelope.share_id.clone(),
+        "delegationCid": envelope.delegation_cid.clone(),
+        "policyCid": envelope.policy_cid.clone(),
+        "target": envelope.target.clone(),
+        "resource": envelope.resource.clone(),
+        "actions": envelope.actions.clone(),
+        "contentSource": envelope.content_source.clone(),
+        "contentSourceDigest": envelope.content_source_digest.clone(),
+        "expiresAt": envelope.expires_at.clone(),
+    });
+    if raw_sha256_cid(&jcs::canonicalize(&envelope_identity)) != envelope.envelope_cid {
+        return Err(());
+    }
+    let share_identity = serde_json::json!({
+        "version": envelope.version,
+        "shareId": envelope.share_id.clone(),
+        "policyCid": envelope.policy_cid.clone(),
+        "envelopeCid": envelope.envelope_cid.clone(),
+    });
+    if raw_sha256_cid(&jcs::canonicalize(&share_identity)) != envelope.share_cid {
+        return Err(());
+    }
     let mut unsigned = serde_json::to_value(&envelope).map_err(|_| ())?;
     unsigned.as_object_mut().ok_or(())?.remove("signature");
     let mut signed = b"xyz.tinycloud.share/envelope/v2\0".to_vec();
@@ -1577,6 +1606,7 @@ async fn registered_policy(
                     kind: sdk.content_source.kind,
                     space: sdk.content_source.space,
                     path: sdk.content_source.path,
+                    action: sdk.content_source.action,
                 },
                 content_source_digest: sdk.content_source_digest,
                 owner_delegation_cid: row.owner_delegation_cid.clone(),
@@ -1784,6 +1814,7 @@ fn exact_content_source(registered: &RegisteredPolicy, _request: &V2ChallengeReq
         "kind": "kv",
         "space": registered.row.space_id,
         "path": registered.row.resource_path,
+        "action": "tinycloud.kv/get",
     })
 }
 
@@ -1796,7 +1827,7 @@ fn verify_policy_presentation(
     enforcer_did: &str,
 ) -> Result<(), ()> {
     if presentation.get("type").and_then(Value::as_str) != Some("TinyCloudSharePolicyPresentation")
-        || presentation.get("version").and_then(Value::as_u64) != Some(1)
+        || presentation.get("version").and_then(Value::as_u64) != Some(2)
         || presentation.get("challengeId").and_then(Value::as_str) != Some(challenge_id)
         || presentation.get("nonce").and_then(Value::as_str) != Some(nonce)
         || presentation.get("shareCid").and_then(Value::as_str) != Some(request.share_cid.as_str())
@@ -2935,7 +2966,7 @@ mod tests {
                 },
                 "resource": {"kind": "exact", "path": "shares/share-1/document.md"},
                 "actions": ["tinycloud.kv/get", "tinycloud.kv/metadata"],
-                "contentSource": {"kind": "kv", "space": "applications", "path": "shares/share-1/document.md"},
+                "contentSource": {"kind": "kv", "space": "applications", "path": "shares/share-1/document.md", "action": "tinycloud.kv/get"},
                 "contentSourceDigest": "digest",
                 "ownerDelegationCid": "bafy-owner",
                 "expiresAt": expires_at.clone()
@@ -3100,7 +3131,7 @@ mod tests {
         let request = sample_v2_challenge();
         let mut presentation = serde_json::json!({
             "type": "TinyCloudSharePolicyPresentation",
-            "version": 1,
+            "version": 2,
             "challengeId": "challenge",
             "nonce": "nonce",
             "shareCid": "bafy-share",
