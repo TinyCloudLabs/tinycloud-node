@@ -184,7 +184,7 @@ pub async fn app_with_control(
         .map_err(|error| anyhow::anyhow!(error))?;
     tinycloud_config
         .share_email
-        .validate_for_database(tinycloud_config.storage.database())
+        .validate_for_v2_database(tinycloud_config.storage.database())
         .map_err(|error| anyhow::anyhow!(error))?;
 
     // Ensure local storage directories exist.

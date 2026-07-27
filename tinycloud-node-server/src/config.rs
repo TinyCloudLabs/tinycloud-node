@@ -235,6 +235,10 @@ impl ShareEmailConfig {
         Ok(resolved)
     }
 
+    /// Full legacy v1 validation: everything the v2/database path checks,
+    /// plus the `authority_material_path` the v1 authority-material provider
+    /// (and `share_email::compose`) requires. The v2 policy-sharing path does
+    /// not load that provider, so it must not be gated on this method.
     pub fn validate(&self) -> Result<(), &'static str> {
         if !self.enabled {
             return Ok(());
@@ -242,7 +246,18 @@ impl ShareEmailConfig {
         self.resolve_trust_bundle()?.validate_fields()
     }
 
-    fn validate_fields(&self) -> Result<(), &'static str> {
+    /// Validation shared by both the legacy v1 authority-material provider
+    /// and the v2 policy-sharing path: trust bundle identity, origins, keys,
+    /// issuer pinning and timing bounds. Does not require
+    /// `authority_material_path`, which only the legacy v1 path needs.
+    pub fn validate_v2(&self) -> Result<(), &'static str> {
+        if !self.enabled {
+            return Ok(());
+        }
+        self.resolve_trust_bundle()?.validate_common_fields()
+    }
+
+    fn validate_common_fields(&self) -> Result<(), &'static str> {
         if !allows_hermetic_fixture() && uses_fixture_identity(self) {
             return Err("share email production trust bundle contains a fixture identity");
         }
@@ -269,11 +284,6 @@ impl ShareEmailConfig {
             || self.challenge_ttl_seconds > 120
             || self.invitation_public_key.is_none()
             || self.issuer_public_key.is_none()
-            || self.authority_material_path.is_none()
-            || self
-                .authority_material_path
-                .as_deref()
-                .is_some_and(|path| path.trim().is_empty())
             || self.readiness_max_age_seconds == 0
             || self.readiness_max_age_seconds > 300
             || self.credentials_origin.as_deref().is_none_or(|origin| {
@@ -287,12 +297,37 @@ impl ShareEmailConfig {
         Ok(())
     }
 
+    fn validate_fields(&self) -> Result<(), &'static str> {
+        self.validate_common_fields()?;
+        if self.authority_material_path.is_none()
+            || self
+                .authority_material_path
+                .as_deref()
+                .is_some_and(|path| path.trim().is_empty())
+        {
+            return Err("share email configuration is incomplete");
+        }
+        Ok(())
+    }
+
     /// Validate settings that depend on the resolved node database.  This is
     /// called before any connection is opened, so an enabled PostgreSQL
     /// deployment cannot accidentally start with an unauthenticated TLS mode
     /// or a missing CA bundle.
     pub fn validate_for_database(&self, database: &str) -> Result<(), &'static str> {
         self.validate()?;
+        self.validate_database_tls(database)
+    }
+
+    /// Validates settings that depend on the resolved node database for the
+    /// v2/database (policy-sharing) startup path, without requiring the
+    /// legacy v1 `authority_material_path`. See [`Self::validate_v2`].
+    pub fn validate_for_v2_database(&self, database: &str) -> Result<(), &'static str> {
+        self.validate_v2()?;
+        self.validate_database_tls(database)
+    }
+
+    fn validate_database_tls(&self, database: &str) -> Result<(), &'static str> {
         if !self.enabled {
             return Ok(());
         }
@@ -1239,5 +1274,24 @@ mod tests {
         assert!(config
             .validate_for_database("sqlite:/tmp/tinycloud-share-email.db")
             .is_err());
+    }
+
+    #[cfg(not(feature = "mounted-fixture"))]
+    #[tokio::test]
+    async fn v2_database_validation_succeeds_without_legacy_authority_material() {
+        let mut config = enabled_config();
+        config.authority_material_path = None;
+        let _trust_bundle = install_bundle(&mut config);
+
+        assert!(
+            config
+                .validate_for_v2_database("sqlite:/tmp/tinycloud-share-v2.db")
+                .is_ok(),
+            "v2/database validation must not require the legacy authority_material_path"
+        );
+        assert!(
+            config.validate().is_err(),
+            "full legacy v1 validation must still require authority_material_path"
+        );
     }
 }
