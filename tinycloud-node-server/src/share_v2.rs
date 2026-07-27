@@ -3793,6 +3793,94 @@ mod tests {
         );
     }
 
+    /// Mirrors `app_with_control`'s real composition order (`lib.rs`): v1's
+    /// `share_email::compose` always runs first against the same config, and
+    /// v2's `share_v2::compose` reuses the same connection/TinyCloud handle.
+    /// Proves an enabled v2-only deployment reaches `ready:true` with no
+    /// `authority_material_path` at all, that the legacy v1 runtime stays
+    /// unavailable (`None`, not an error) rather than being silently loaded,
+    /// and that ordinary non-TEE production composition stays fail-closed.
+    #[tokio::test]
+    async fn v2_only_composition_is_ready_without_the_legacy_v1_authority_material_while_v1_stays_unavailable(
+    ) {
+        use tinycloud_core::{
+            database_artifacts::SeaOrmDatabaseArtifactRepository, sql::SqlService,
+        };
+
+        let key_setup = StaticSecret::new(vec![0x7cu8; 32]).expect("32-byte test secret");
+        let mut config = local_tee_share_v2_config();
+        assert!(
+            config.authority_material_path.is_none(),
+            "this composition must exercise the v2-only shape with no legacy authority material file"
+        );
+        config.enabled = true;
+
+        let conn = migrated_memory_db().await;
+        let directory = tempfile::tempdir().expect("tempdir for local block store");
+        let blocks = crate::BlockConfig::B(crate::storage::file_system::FileSystemConfig::new(
+            directory.path(),
+        ))
+        .open()
+        .await
+        .expect("local block storage opens");
+        let tinycloud = crate::TinyCloud::new(conn.clone(), blocks, key_setup.clone())
+            .await
+            .expect("in-process TinyCloud composes");
+        let sql_root = tempfile::tempdir().expect("tempdir for sql store");
+        let artifact_repository: Arc<
+            dyn tinycloud_core::database_artifacts::DatabaseArtifactRepository,
+        > = Arc::new(SeaOrmDatabaseArtifactRepository::new(conn.clone()));
+        let sql_service = Arc::new(SqlService::new(
+            sql_root.path().display().to_string(),
+            0,
+            artifact_repository,
+        ));
+
+        let v1_runtime = crate::share_email::compose(
+            config.clone(),
+            conn.clone(),
+            &key_setup,
+            Arc::new(tinycloud.clone()),
+            sql_service,
+        )
+        .expect("v1 composition must not error when authority material is simply absent");
+        assert!(
+            v1_runtime.is_none(),
+            "the legacy v1 runtime must stay unavailable without authority_material_path, not be silently loaded"
+        );
+
+        let tee_context = TeeContext::derive_local(&key_setup);
+        let runtime = compose(
+            conn.clone(),
+            &key_setup,
+            config.clone(),
+            Some(tee_context),
+            true,
+            Arc::new(tinycloud.clone()),
+        )
+        .await
+        .expect("share v2 runtime composes without the legacy v1 authority material");
+        let response = runtime.readiness().await;
+        assert!(
+            response.ready,
+            "an enabled v2-only composition must reach ready:true without authority_material_path: {:?}",
+            response.checks
+        );
+
+        // Ordinary non-TEE production startup shape (no dstack, no
+        // local-tee-derived context) must stay fail-closed even with the
+        // exact same v2-only config.
+        let production_runtime =
+            compose(conn, &key_setup, config, None, false, Arc::new(tinycloud))
+                .await
+                .expect("share v2 runtime composes even without a TEE context");
+        let production_response = production_runtime.readiness().await;
+        assert!(
+            !production_response.ready,
+            "ordinary non-TEE production composition must not report ready:true"
+        );
+    }
+
     // ---- Share v2 production corpus (frozen, byte-exact js-sdk output) ----
     //
     // `tests/fixtures/share-v2-production/corpus.json` is an unedited copy of
