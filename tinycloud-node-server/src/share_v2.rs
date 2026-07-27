@@ -582,7 +582,7 @@ struct PolicyDocument {
     expires_at: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 struct RecipientMatcher {
     kind: String,
@@ -627,9 +627,12 @@ struct Registration {
     owner_did: String,
     share_key_did: String,
     enforcer_did: String,
+    share_id: String,
+    recipient_matcher: RecipientMatcher,
     target: RegistrationTarget,
     resource: ExactResource,
     actions: Vec<String>,
+    content_source: ContentSource,
     content_source_digest: String,
     registered_at: String,
     expires_at: String,
@@ -735,6 +738,8 @@ pub async fn register_policy(
         owner_did: policy.policy.owner_did.clone(),
         share_key_did: policy.policy.share_key_did.clone(),
         enforcer_did: policy.policy.target.enforcer_did.clone(),
+        share_id: policy.policy.share_id.clone(),
+        recipient_matcher: policy.policy.recipient_matcher.clone(),
         target: RegistrationTarget {
             origin: policy.policy.target.origin.clone(),
             node_audience: policy.policy.target.node_audience.clone(),
@@ -746,6 +751,7 @@ pub async fn register_policy(
             path: policy.policy.resource.path.clone(),
         },
         actions: policy.policy.actions.clone(),
+        content_source: policy.policy.content_source.clone(),
         content_source_digest: request.content_source_digest.clone(),
         registered_at,
         expires_at: policy.policy.expires_at.clone(),
@@ -892,7 +898,7 @@ fn parse_sdk_policy(
         || sdk.version != 2
         || sdk.content_source.kind != "kv"
         || sdk.content_source.action != "tinycloud.kv/get"
-        || sdk.resource.kind != "exact"
+        || !matches!(sdk.resource.kind.as_str(), "exact" | "prefix")
         || sdk.content_source_digest != request.content_source_digest
         || sdk.issuer_did.is_empty()
         || facts.share_id.is_empty()
@@ -957,7 +963,7 @@ fn validate_policy(
         || policy.target.enforcer_did != enforcer_did
         || policy.content_source_digest != request.content_source_digest
         || policy.owner_delegation_cid != request.owner_delegation.cid
-        || policy.resource.kind != "exact"
+        || !matches!(policy.resource.kind.as_str(), "exact" | "prefix")
         || policy.content_source.kind != "kv"
         || policy.content_source.action != "tinycloud.kv/get"
         || policy.content_source.path != policy.resource.path
@@ -1001,10 +1007,14 @@ fn validate_policy(
         return Err(());
     }
     let path_parts: Vec<&str> = policy.resource.path.split('/').collect();
-    if path_parts.len() != 3
+    let valid_shape = match policy.resource.kind.as_str() {
+        "exact" => path_parts.len() >= 3 && !policy.resource.path.ends_with('/'),
+        "prefix" => path_parts.len() >= 2 && !policy.resource.path.ends_with('/'),
+        _ => false,
+    };
+    if !valid_shape
         || path_parts[0] != "shares"
         || path_parts[1] != policy.share_id
-        || policy.resource.path.ends_with('/')
         || policy
             .resource
             .path
@@ -1116,9 +1126,11 @@ async fn verify_owner_delegation(
                     .tinycloud_resource()
                     .is_some_and(|resource| {
                         resource.service().as_str() == "kv"
-                            && resource
-                                .path()
-                                .is_some_and(|path| path.as_str() == policy.resource.path)
+                            && resource.path().is_some_and(|path| {
+                                path.as_str() == policy.resource.path
+                                    || policy.resource.kind == "prefix"
+                                        && path.as_str() == format!("{}/", policy.resource.path)
+                            })
                             && resource.space().to_string() == policy.target.space_id
                     })
         });
@@ -1513,7 +1525,7 @@ fn verify_outer_envelope(
                 .get("space")
                 .and_then(Value::as_str)
                 .ok_or(())?
-        || envelope.resource.kind != "exact"
+        || !matches!(envelope.resource.kind.as_str(), "exact" | "prefix")
         || envelope.resource.path != request.resource
         || envelope.actions != request.actions
         || envelope.content_source != request.content_source
@@ -1777,12 +1789,17 @@ fn typed_scope(
     let source_path =
         tinycloud_core::share_email::types::Path::parse(registered.row.resource_path.clone())
             .map_err(|_| ())?;
-    if path != source_path {
+    if !resource_scope_allows(
+        &registered.envelope.policy.resource.kind,
+        source_path.as_str(),
+        path.as_str(),
+        request.action.as_str(),
+    ) {
         return Err(());
     }
     let content_source = tinycloud_core::share_email::types::ContentSource::Kv {
         space: space.clone(),
-        path: source_path,
+        path: source_path.clone(),
         action: match action {
             ShareAction::KvPut => tinycloud_core::share_email::types::KvGetAction::Put,
             ShareAction::KvList => tinycloud_core::share_email::types::KvGetAction::List,
@@ -1818,7 +1835,12 @@ fn typed_scope(
                 _ => Err(()),
             })
             .collect::<Result<Vec<_>, _>>()?,
-        resource: tinycloud_core::share_email::types::ExactResource::Kv { path },
+        resource: match registered.envelope.policy.resource.kind.as_str() {
+            "prefix" => {
+                tinycloud_core::share_email::types::ExactResource::KvPrefix { path: source_path }
+            }
+            _ => tinycloud_core::share_email::types::ExactResource::Kv { path },
+        },
         content_source,
         content_source_digest: source_digest,
     })
@@ -2038,6 +2060,30 @@ fn share_error(code: &'static str) -> ApiErrorResponse {
     error(Status::Forbidden, code)
 }
 
+/// A prefix policy is intentionally a one-level capability, not a recursive
+/// filesystem grant.  Listing stays anchored at the prefix; file operations
+/// must name exactly one direct child.
+fn resource_scope_allows(kind: &str, scope: &str, requested: &str, action: &str) -> bool {
+    if kind == "exact" {
+        return scope == requested;
+    }
+    if kind != "prefix" || scope.is_empty() || scope.ends_with('/') {
+        return false;
+    }
+    if action == "tinycloud.kv/list" {
+        return requested == scope;
+    }
+    let Some(rest) = requested.strip_prefix(&format!("{scope}/")) else {
+        return false;
+    };
+    !rest.is_empty()
+        && !rest.contains('/')
+        && matches!(
+            action,
+            "tinycloud.kv/get" | "tinycloud.kv/metadata" | "tinycloud.kv/put"
+        )
+}
+
 #[post("/share/v2/policy/challenges", format = "json", data = "<data>")]
 pub async fn policy_challenge_v2(
     data: Data<'_>,
@@ -2076,7 +2122,12 @@ pub async fn policy_challenge_v2(
         || request.content_source_digest != registered.row.content_source_digest
         || request.content_source != exact_content_source(&registered, &request)
         || b64_digest(&jcs::canonicalize(&request.content_source)) != request.content_source_digest
-        || request.resource != registered.row.resource_path
+        || !resource_scope_allows(
+            &registered.envelope.policy.resource.kind,
+            &registered.row.resource_path,
+            &request.resource,
+            &request.action,
+        )
         || request.actions.is_empty()
         || !request.actions.contains(&request.action)
         || request.actions.windows(2).any(|pair| pair[0] >= pair[1])
@@ -2612,7 +2663,12 @@ pub async fn invoke_v2(
         .resource
         .parse()
         .map_err(|_| share_error("invoke_denied"))?;
-    if path.as_str() != registered.row.resource_path {
+    if !resource_scope_allows(
+        &registered.envelope.policy.resource.kind,
+        &registered.row.resource_path,
+        path.as_str(),
+        action,
+    ) {
         return Err(share_error("invoke_denied"));
     }
     if action == "tinycloud.kv/put" {
