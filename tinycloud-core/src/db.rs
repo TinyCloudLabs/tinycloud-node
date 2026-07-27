@@ -1697,7 +1697,16 @@ fn is_pk_epoch_conflict(error: &DbErr) -> bool {
     match error {
         DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(db_err)))
         | DbErr::Query(RuntimeErr::SqlxError(SqlxError::Database(db_err))) => {
-            db_err.code().as_deref() == Some("23505") && db_err.constraint() == Some("pk-epoch")
+            let code_owned = db_err.code();
+            let code = code_owned.as_deref();
+            if code == Some("23505") && db_err.constraint() == Some("pk-epoch") {
+                return true;
+            }
+            if matches!(code, Some("1555") | Some("2067")) && db_err.message().contains("pk-epoch")
+            {
+                return true;
+            }
+            false
         }
         _ => false,
     }
