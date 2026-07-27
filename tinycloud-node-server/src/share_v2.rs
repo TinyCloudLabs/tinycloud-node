@@ -3316,6 +3316,7 @@ mod tests {
     use tinycloud_core::models::actor;
     use tinycloud_core::sea_orm::{ConnectOptions, Database};
     use tinycloud_core::sea_orm_migration::MigratorTrait;
+    use tinycloud_core::storage::StorageConfig;
 
     #[test]
     fn decoded_content_boundary_is_exactly_100_mib_not_101() {
@@ -3630,6 +3631,146 @@ mod tests {
         assert_eq!(
             winners, 1,
             "exactly one concurrent claim of the same JTI must win"
+        );
+    }
+
+    // --- JOINED-TEE-READINESS ---------------------------------------------
+    //
+    // A deterministic local/test v2 bootstrap: a real migrated database, a
+    // real (temp-dir backed) block store, and a TeeContext derived from the
+    // node's own key material via `TeeContext::derive_local` rather than any
+    // mounted fixture, descriptor-derived sender authority or static
+    // capability. Proves the canonical local launch reaches ready:true and
+    // that ordinary production startup (no TEE context) stays fail-closed.
+
+    fn local_tee_share_v2_config() -> ShareEmailConfig {
+        ShareEmailConfig {
+            enabled: true,
+            target_origin: "https://node.internal.tinycloud".into(),
+            node_audience: "did:web:node.internal.tinycloud".into(),
+            return_origin: "https://share.tinycloud.xyz".into(),
+            allowed_origins: vec!["https://share.tinycloud.xyz".into()],
+            node_signing_kid: "did:web:node.internal.tinycloud#invitation-key-1".into(),
+            invitation_kid: "did:web:node.internal.tinycloud#invitation-key-1".into(),
+            invitation_public_key: Some("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".into()),
+            issuer_did: "did:web:issuer.credentials.org".into(),
+            issuer_kid: "did:web:issuer.credentials.org#email-signing-key-1".into(),
+            issuer_key_version: 1,
+            issuer_public_key: Some("AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA".into()),
+            ..ShareEmailConfig::default()
+        }
+    }
+
+    /// Boots a real `ShareV2Runtime` against a fresh migrated database and a
+    /// fresh temp-dir block store, mirroring the composition order `lib.rs`
+    /// uses in production (TinyCloud boots and migrates first, then
+    /// `share_v2::compose` reuses the same connection).
+    async fn compose_test_runtime(
+        key_setup: &StaticSecret,
+        tee_context: Option<TeeContext>,
+        tee_key_derived: bool,
+    ) -> ShareV2Runtime {
+        let conn = migrated_memory_db().await;
+        let directory = tempfile::tempdir().expect("tempdir for local block store");
+        let blocks = crate::BlockConfig::B(crate::storage::file_system::FileSystemConfig::new(
+            directory.path(),
+        ))
+        .open()
+        .await
+        .expect("local block storage opens");
+        let tinycloud = crate::TinyCloud::new(conn.clone(), blocks, key_setup.clone())
+            .await
+            .expect("in-process TinyCloud composes");
+        compose(
+            conn,
+            key_setup,
+            local_tee_share_v2_config(),
+            tee_context,
+            tee_key_derived,
+            Arc::new(tinycloud),
+        )
+        .await
+        .expect("share v2 runtime composes")
+    }
+
+    #[tokio::test]
+    async fn local_tee_bootstrap_reaches_ready_true_without_weakening_the_tee_check() {
+        let key_setup = StaticSecret::new(vec![0x42u8; 32]).expect("32-byte test secret");
+        let tee_context = TeeContext::derive_local(&key_setup);
+        assert_eq!(
+            tee_context.enforcer_did,
+            key_setup.node_did(),
+            "the local TEE context's enforcer DID must be the node's own derived DID, not a fixture"
+        );
+
+        let runtime = compose_test_runtime(&key_setup, Some(tee_context), true).await;
+        let response = runtime.readiness().await;
+
+        assert!(
+            response.ready,
+            "the canonical local bootstrap must reach ready:true"
+        );
+        assert!(response.checks.migration, "migration check must be true");
+        assert!(
+            response.checks.encrypted_storage,
+            "encrypted_storage check must be true"
+        );
+        assert!(
+            response.checks.delegation_revocation_lookup,
+            "the revocation lookup must be a real query against the delegation/revocation tables"
+        );
+        assert!(
+            response.checks.tee_identity,
+            "tee_identity check must be true"
+        );
+        assert!(response.checks.signer, "signer check must be true");
+        assert!(
+            response.checks.route_version,
+            "route_version check must be true"
+        );
+        assert!(response.checks.body_limit, "body_limit check must be true");
+        assert!(
+            response.checks.credential_verifier,
+            "credential_verifier check must be true"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_bootstrap_without_a_real_tee_context_stays_fail_closed() {
+        let key_setup = StaticSecret::new(vec![0x99u8; 32]).expect("32-byte test secret");
+        // Ordinary production startup shape: no TeeContext and no key-derived
+        // TEE identity, exactly as a non-dstack build without `local-tee`
+        // composes it.
+        let runtime = compose_test_runtime(&key_setup, None, false).await;
+        let response = runtime.readiness().await;
+
+        assert!(
+            !response.ready,
+            "readiness must stay fail-closed without a real TEE context"
+        );
+        assert!(
+            !response.checks.tee_identity,
+            "tee_identity must be false without a real or derived TEE context"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_tee_context_with_mismatched_enforcer_did_is_rejected() {
+        let key_setup = StaticSecret::new(vec![0x11u8; 32]).expect("32-byte test secret");
+        let mut tee_context = TeeContext::derive_local(&key_setup);
+        tee_context.enforcer_did =
+            "did:key:z6MkSomeoneElsesEnforcerDidNotOwnedByThisNode".to_owned();
+
+        let runtime = compose_test_runtime(&key_setup, Some(tee_context), true).await;
+        let response = runtime.readiness().await;
+
+        assert!(
+            !response.ready,
+            "a TeeContext whose enforcer DID does not match the node's own key must not be accepted"
+        );
+        assert!(
+            !response.checks.tee_identity,
+            "tee_identity must be false when the enforcer DID does not match the node key"
         );
     }
 }

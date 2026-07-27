@@ -122,6 +122,12 @@ tc-bench-v1 = []
 # Enables only the hermetic mounted fixture's placeholder trust identities.
 # This feature is never part of a production build.
 mounted-fixture = []
+# Enables a deterministic, key-derived TeeContext for /share/v2 on hosts with
+# no real dstack TEE (local dev, canonical local-launch harnesses). It never
+# reads fixture material or static capabilities — the identity is derived
+# from the same node key material real deployments use. This feature is
+# never part of a production build; see Dockerfile CARGO_FEATURES.
+local-tee = []
 
 # cargo-dist metadata
 [package.metadata.dist]

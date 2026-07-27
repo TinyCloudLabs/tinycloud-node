@@ -285,6 +285,17 @@ pub async fn app_with_control(
             None
         }
     };
+    // Test-only, key-derived fallback for hosts with no real dstack TEE
+    // (local dev, canonical local-launch harnesses). Gated by the
+    // `local-tee` feature, which is never part of a production build. It
+    // never overrides a real dstack-attested context above.
+    #[cfg(feature = "local-tee")]
+    let tee_context = tee_context.or_else(|| {
+        ::tracing::warn!(
+            "share-v2 local-tee feature active: deriving a deterministic, non-attested TEE identity from node key material"
+        );
+        Some(TeeContext::derive_local(&key_setup))
+    });
 
     let database = tinycloud_config.storage.database();
     let is_sqlite = database.starts_with("sqlite");
@@ -372,6 +383,14 @@ pub async fn app_with_control(
         Arc::new(tinycloud.clone()),
         Arc::new(sql_service.clone()),
     )?;
+    #[cfg(feature = "dstack")]
+    let dstack_tee_key_derived = matches!(tinycloud_config.keys, config::Keys::Dstack)
+        || matches!(tinycloud_config.keys, config::Keys::Auto) && dstack::is_available();
+    #[cfg(not(feature = "dstack"))]
+    let dstack_tee_key_derived = false;
+    // `local-tee` always derives its TeeContext from real node key material
+    // (see `TeeContext::derive_local`), so it is a derived identity too.
+    let tee_key_derived = dstack_tee_key_derived || cfg!(feature = "local-tee");
     let share_v2_runtime = if tinycloud_config.share_email.enabled {
         Some(
             share_v2::compose(
@@ -379,14 +398,7 @@ pub async fn app_with_control(
                 &key_setup,
                 tinycloud_config.share_email.clone(),
                 tee_context.clone(),
-                #[cfg(feature = "dstack")]
-                {
-                    matches!(tinycloud_config.keys, config::Keys::Dstack)
-                        || matches!(tinycloud_config.keys, config::Keys::Auto)
-                            && dstack::is_available()
-                },
-                #[cfg(not(feature = "dstack"))]
-                false,
+                tee_key_derived,
                 Arc::new(tinycloud.clone()),
             )
             .await?,
