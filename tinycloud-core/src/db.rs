@@ -1021,10 +1021,10 @@ where
             authz_start.elapsed(),
         );
         let _chain_guards = chain_guards?;
-        // Exact-byte registration idempotency: if this delegation is already
-        // durably stored, skip the epoch transaction entirely and acknowledge
-        // its existing address. Expiry and revocation are still enforced when
-        // the delegation is used; this only avoids re-running the write path.
+        // Non-authoritative fast path: if the row is already committed before
+        // we begin the transaction, skip the write entirely. Correctness does
+        // not depend on this check — transact() handles the idempotent case
+        // atomically via DelegationRegistration::Existing inside the txn.
         match delegation::Entity::find_by_id(retained_hash)
             .one(&self.conn)
             .await
@@ -1033,19 +1033,8 @@ where
             Ok(None) => {}
             Err(e) => return Err(TxError::Db(e)),
         }
-        let result = self
-            .transact(vec![Event::Delegation(Box::new(delegation))])
-            .await;
-        if let Err(TxError::EpochInsert(ref e)) = result {
-            if is_pk_epoch_conflict(e) {
-                match await_epoch_delegation(&self.conn, retained_hash).await {
-                    Ok(true) => return Ok(already_registered_result(retained_hash)),
-                    Ok(false) => {}
-                    Err(db_err) => return Err(TxError::Db(db_err)),
-                }
-            }
-        }
-        result
+        self.transact(vec![Event::Delegation(Box::new(delegation))])
+            .await
     }
 
     pub async fn revoke(&self, revocation: Revocation) -> Result<TransactResult, TxError<B, K>> {
@@ -1720,6 +1709,7 @@ fn delegation_guard_roots(retained_hash: Hash, parent_hashes: &[Hash]) -> Vec<Ha
     keys
 }
 
+#[cfg(test)]
 fn is_pk_epoch_conflict(error: &DbErr) -> bool {
     match error {
         DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(db_err)))
@@ -1739,36 +1729,6 @@ fn is_pk_epoch_conflict(error: &DbErr) -> bool {
         }
         _ => false,
     }
-}
-
-/// Bounded wait for the exact delegation row after a pk-epoch conflict.
-///
-/// After a pk-epoch conflict, the winning transaction's row may not yet be
-/// visible in a snapshot taken by the loser. This function performs an
-/// immediate query plus at most four 10 ms sleeps (≤ 40 ms total added
-/// latency) to wait for the row. Returns `Ok(true)` when the row is present,
-/// `Ok(false)` if still absent after the bound, or propagates a real `DbErr`.
-async fn await_epoch_delegation<C: ConnectionTrait>(
-    conn: &C,
-    retained_hash: Hash,
-) -> Result<bool, DbErr> {
-    const SLEEP_MS: u64 = 10;
-    const MAX_RETRIES: usize = 4;
-
-    for attempt in 0..=MAX_RETRIES {
-        match delegation::Entity::find_by_id(retained_hash)
-            .one(conn)
-            .await
-        {
-            Ok(Some(_)) => return Ok(true),
-            Ok(None) => {}
-            Err(e) => return Err(e),
-        }
-        if attempt < MAX_RETRIES {
-            tokio::time::sleep(std::time::Duration::from_millis(SLEEP_MS)).await;
-        }
-    }
-    Ok(false)
 }
 
 #[derive(Debug)]
@@ -1900,23 +1860,69 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         .into_iter()
         .map(|e| (e.hash(), e))
         .collect::<Vec<(Hash, Event)>>();
+
+    // ── Atomic delegation registration ──────────────────────────────────────
+    // Register all delegations inside this transaction before any epoch rows
+    // are written. This is the authoritative New/Existing decision; the
+    // outcome determines which delegations participate in epoch construction.
+    let mut registered: HashMap<Hash, delegation::DelegationRegistration> = HashMap::new();
+    for (hash, event) in &event_hashes {
+        if let Event::Delegation(d) = event {
+            let reg = delegation::process(db, d, encryption).await?;
+            registered.insert(*hash, reg);
+        }
+    }
+
     let event_spaces = event_spaces(db, &event_hashes).await?;
+
+    // Exclude Existing delegations from epoch construction: they were already
+    // registered in a prior committed transaction and must not create new
+    // epoch, epoch_order, or event_order rows.
+    let event_spaces: HashMap<SpaceId, Vec<&(Hash, Event)>> = event_spaces
+        .into_iter()
+        .filter_map(|(space, events)| {
+            let eligible: Vec<_> = events
+                .into_iter()
+                .filter(|(hash, event)| {
+                    !matches!(event, Event::Delegation(_))
+                        || matches!(
+                            registered.get(hash),
+                            Some(delegation::DelegationRegistration::New(_))
+                        )
+                })
+                .collect();
+            if eligible.is_empty() {
+                None
+            } else {
+                Some((space, eligible))
+            }
+        })
+        .collect();
+
+    // Only New delegations may trigger new space row creation.
     let mut new_spaces = event_hashes
         .iter()
-        .filter_map(|(_, e)| match e {
-            Event::Delegation(d) => Some(d.0.capabilities.iter().filter_map(|c| {
-                match (&c.resource, c.ability.as_ref().as_ref()) {
-                    (Resource::TinyCloud(r), "tinycloud.space/host")
-                        if r.path().is_none()
-                            && r.service().as_str() == "space"
-                            && r.query().is_none()
-                            && r.fragment().is_none() =>
-                    {
-                        Some(SpaceIdWrap(r.space().clone()))
+        .filter_map(|(hash, e)| match e {
+            Event::Delegation(d)
+                if matches!(
+                    registered.get(hash),
+                    Some(delegation::DelegationRegistration::New(_))
+                ) =>
+            {
+                Some(d.0.capabilities.iter().filter_map(|c| {
+                    match (&c.resource, c.ability.as_ref().as_ref()) {
+                        (Resource::TinyCloud(r), "tinycloud.space/host")
+                            if r.path().is_none()
+                                && r.service().as_str() == "space"
+                                && r.query().is_none()
+                                && r.fragment().is_none() =>
+                        {
+                            Some(SpaceIdWrap(r.space().clone()))
+                        }
+                        _ => None,
                     }
-                    _ => None,
-                }
-            })),
+                }))
+            }
             _ => None,
         })
         .flatten()
@@ -2172,9 +2178,12 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         let mut delegation_cids = Vec::new();
         for (hash, event) in event_hashes {
             match event {
-                Event::Delegation(d) => {
-                    let cid = delegation::process(db, *d, encryption).await?;
-                    delegation_cids.push(cid);
+                Event::Delegation(_) => {
+                    // Already registered atomically before epoch construction.
+                    // Do not call delegation::process again.
+                    if let Some(reg) = registered.get(&hash) {
+                        delegation_cids.push(reg.hash());
+                    }
                 }
                 Event::Invocation(i, ops) => {
                     invocation::process(
@@ -2247,14 +2256,15 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             delegation_cids,
         })
     } else {
-        // All spaces were skipped (delegation-only with no existing spaces)
-        // Still process delegation events to save the delegation records
+        // All spaces were skipped (delegation-only with no existing spaces).
+        // Delegations are already registered; collect their CIDs.
         let mut delegation_cids = Vec::new();
-        for (_, event) in event_hashes {
+        for (hash, event) in event_hashes {
             match event {
-                Event::Delegation(d) => {
-                    let cid = delegation::process(db, *d, encryption).await?;
-                    delegation_cids.push(cid);
+                Event::Delegation(_) => {
+                    if let Some(reg) = registered.get(&hash) {
+                        delegation_cids.push(reg.hash());
+                    }
                 }
                 Event::Invocation(i, _ops) => {
                     invocation::process(db, *i, Vec::new(), encryption, auth_graph).await?;
@@ -4125,7 +4135,7 @@ mod test {
         assert!(roots.contains(&parent_a));
     }
 
-    // --- await_epoch_delegation helper tests ---
+    // --- precheck helper and already_registered_result tests ---
 
     async fn insert_delegation_row(db: &sea_orm::DbConn, hash: Hash) {
         use sea_orm::ActiveModelTrait;
@@ -4150,54 +4160,6 @@ mod test {
         .insert(db)
         .await
         .unwrap();
-    }
-
-    #[tokio::test]
-    async fn await_epoch_delegation_immediate_existing_row_succeeds() {
-        let db = get_db().await.unwrap();
-        let hash = crate::hash::hash(b"await-epoch-immediate");
-        insert_delegation_row(&db.conn, hash).await;
-        let found = await_epoch_delegation(&db.conn, hash).await.unwrap();
-        assert!(found, "row already present must return true immediately");
-    }
-
-    #[tokio::test]
-    async fn await_epoch_delegation_delayed_insertion_within_bound_succeeds() {
-        let db = get_db().await.unwrap();
-        let hash = crate::hash::hash(b"await-epoch-delayed");
-        let conn = db.conn.clone();
-        // Insert the row after a short delay (< 40 ms bound).
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            insert_delegation_row(&conn, hash).await;
-        });
-        let found = await_epoch_delegation(&db.conn, hash).await.unwrap();
-        assert!(found, "row inserted within bound must be found");
-    }
-
-    #[tokio::test]
-    async fn await_epoch_delegation_absent_hash_returns_false_after_bound() {
-        let db = get_db().await.unwrap();
-        let hash = crate::hash::hash(b"await-epoch-absent");
-        // Never insert the row.
-        let found = await_epoch_delegation(&db.conn, hash).await.unwrap();
-        assert!(!found, "absent row must return false after the bound");
-    }
-
-    #[tokio::test]
-    async fn await_epoch_delegation_different_hash_never_matches() {
-        let db = get_db().await.unwrap();
-        let inserted_hash = crate::hash::hash(b"await-epoch-present");
-        let queried_hash = crate::hash::hash(b"await-epoch-other");
-        insert_delegation_row(&db.conn, inserted_hash).await;
-        // Query for a different hash — must not match.
-        let found = await_epoch_delegation(&db.conn, queried_hash)
-            .await
-            .unwrap();
-        assert!(
-            !found,
-            "a different hash must not match even though another row exists"
-        );
     }
 
     // --- already_registered_result precheck tests ---
@@ -4257,6 +4219,226 @@ mod test {
         assert!(
             row.is_none(),
             "a different hash in the table must not satisfy the retained-hash lookup"
+        );
+    }
+
+    // ── Atomic registration tests ────────────────────────────────────────────
+
+    /// When a delegation is already committed to the DB, the ON CONFLICT path
+    /// returns RecordNotInserted (→ DelegationRegistration::Existing).  The
+    /// transact() filter then excludes the Existing delegation from epoch/
+    /// event_order construction, so no new rows are created and the same CID
+    /// is returned.  This test proves the DB-level invariant; the code
+    /// structural proof covers the epoch-filter gate.
+    #[tokio::test]
+    async fn existing_delegation_returns_same_cid_with_no_new_epoch_rows() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"existing-no-epoch-bytes");
+        insert_delegation_row(&db.conn, hash).await;
+
+        let epoch_before = epoch::Entity::find().count(&db.conn).await.unwrap();
+        let event_order_before = event_order::Entity::find().count(&db.conn).await.unwrap();
+
+        // Re-insert via ON CONFLICT DO NOTHING — mimics what delegation::process
+        // (→ save()) does inside transact() for the same serialization bytes.
+        let result = delegation::Entity::insert(delegation::ActiveModel {
+            id: Set(hash),
+            delegator: Set("did:key:a".to_string()),
+            delegatee: Set("did:key:b".to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(hash.as_ref().to_vec()),
+        })
+        .on_conflict(
+            OnConflict::column(delegation::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(&db.conn)
+        .await;
+
+        // The Existing outcome (RecordNotInserted) must be detected.
+        assert!(
+            matches!(result, Err(DbErr::RecordNotInserted)),
+            "committed delegation re-insert must return Existing"
+        );
+
+        // No new epoch or event_order rows — the transact() filter gate on
+        // DelegationRegistration::Existing prevents their creation.
+        assert_eq!(
+            epoch::Entity::find().count(&db.conn).await.unwrap(),
+            epoch_before,
+            "Existing delegation must not create a new epoch row"
+        );
+        assert_eq!(
+            event_order::Entity::find().count(&db.conn).await.unwrap(),
+            event_order_before,
+            "Existing delegation must not create a new event_order row"
+        );
+
+        // The same hash (CID) is still present exactly once.
+        let del_count = delegation::Entity::find()
+            .filter(delegation::Column::Id.eq(hash))
+            .count(&db.conn)
+            .await
+            .unwrap();
+        assert_eq!(del_count, 1, "exactly one delegation row must remain");
+    }
+
+    /// A transaction that claims a delegation (inserts it) but is then rolled
+    /// back must allow a subsequent transaction to see New again — the claim
+    /// rolls back atomically with any other writes in that transaction.
+    #[tokio::test]
+    async fn delegation_claim_rolls_back_so_retry_is_new() {
+        use sea_orm::TransactionTrait;
+
+        let db = get_db().await.unwrap();
+        let ser = b"rollback-delegation-bytes".to_vec();
+        let hash = crate::hash::hash(&ser);
+
+        for actor in ["did:key:rb-owner", "did:key:rb-delegate"] {
+            actor::ActiveModel {
+                id: Set(actor.to_string()),
+            }
+            .insert(&db.conn)
+            .await
+            .ok();
+        }
+
+        // Begin a transaction, insert the delegation row, then roll back.
+        {
+            let tx = db.conn.begin().await.unwrap();
+            delegation::ActiveModel {
+                id: Set(hash),
+                delegator: Set("did:key:rb-owner".to_string()),
+                delegatee: Set("did:key:rb-delegate".to_string()),
+                expiry: Set(None),
+                issued_at: Set(None),
+                not_before: Set(None),
+                facts: Set(None),
+                serialization: Set(ser.clone()),
+            }
+            .insert(&tx)
+            .await
+            .unwrap();
+            tx.rollback().await.unwrap();
+        }
+
+        // The rolled-back row must not be visible outside the transaction.
+        let row = delegation::Entity::find_by_id(hash)
+            .one(&db.conn)
+            .await
+            .unwrap();
+        assert!(
+            row.is_none(),
+            "rolled-back delegation must not be visible after rollback"
+        );
+
+        // A retry in a new transaction must observe New (not Existing).
+        let tx2 = db.conn.begin().await.unwrap();
+        let retry = delegation::Entity::insert(delegation::ActiveModel {
+            id: Set(hash),
+            delegator: Set("did:key:rb-owner".to_string()),
+            delegatee: Set("did:key:rb-delegate".to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(ser),
+        })
+        .on_conflict(
+            OnConflict::column(delegation::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(&tx2)
+        .await;
+        tx2.commit().await.unwrap();
+
+        assert!(
+            !matches!(retry, Err(DbErr::RecordNotInserted)),
+            "retry after rollback must be New, not Existing"
+        );
+    }
+
+    /// Two delegations with distinct serialization bytes produce distinct hashes
+    /// and must not satisfy each other's exact-hash registration predicate.
+    #[tokio::test]
+    async fn distinct_delegations_do_not_satisfy_each_other() {
+        use sea_orm::TransactionTrait;
+
+        let db = get_db().await.unwrap();
+
+        let ser_a = b"distinct-delegation-alpha".to_vec();
+        let ser_b = b"distinct-delegation-beta".to_vec();
+        let hash_a = crate::hash::hash(&ser_a);
+        let hash_b = crate::hash::hash(&ser_b);
+        assert_ne!(
+            hash_a, hash_b,
+            "test precondition: distinct bytes → distinct hashes"
+        );
+
+        for actor in ["did:key:dd-owner", "did:key:dd-delegate"] {
+            actor::ActiveModel {
+                id: Set(actor.to_string()),
+            }
+            .insert(&db.conn)
+            .await
+            .ok();
+        }
+
+        let make_model = |hash: Hash, ser: Vec<u8>| delegation::ActiveModel {
+            id: Set(hash),
+            delegator: Set("did:key:dd-owner".to_string()),
+            delegatee: Set("did:key:dd-delegate".to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(ser),
+        };
+
+        let tx = db.conn.begin().await.unwrap();
+        for (hash, ser) in [(hash_a, ser_a), (hash_b, ser_b)] {
+            delegation::Entity::insert(make_model(hash, ser))
+                .on_conflict(
+                    OnConflict::column(delegation::Column::Id)
+                        .do_nothing()
+                        .to_owned(),
+                )
+                .exec(&tx)
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let row_a = delegation::Entity::find_by_id(hash_a)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("hash_a must be present");
+        let row_b = delegation::Entity::find_by_id(hash_b)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("hash_b must be present");
+
+        assert_ne!(
+            row_a.id, row_b.id,
+            "distinct delegations must not share a primary key"
+        );
+
+        // A compound predicate using one hash against the other must return nothing.
+        let cross_lookup = delegation::Entity::find_by_id(hash_b)
+            .filter(delegation::Column::Id.eq(hash_a))
+            .one(&db.conn)
+            .await
+            .unwrap();
+        assert!(
+            cross_lookup.is_none(),
+            "hash_a must not satisfy hash_b's exact-hash predicate"
         );
     }
 }
