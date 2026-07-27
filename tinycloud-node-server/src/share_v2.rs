@@ -3773,4 +3773,478 @@ mod tests {
             "tee_identity must be false when the enforcer DID does not match the node key"
         );
     }
+
+    // ---- Share v2 production corpus (frozen, byte-exact js-sdk output) ----
+    //
+    // `tests/fixtures/share-v2-production/corpus.json` is an unedited copy of
+    // js-sdk's `share-v2-corpus.json`, pinned by digest in the sibling
+    // `PROVENANCE.json`. Its SDK-authored vectors (policy bytes/proof,
+    // enforcement delegation dag-cbor/signature) are produced by driving the
+    // real production SDK encoders and signers, not hand-assembled. These
+    // tests gate Node's own hashing, canonicalization and signature
+    // verification against those exact unmodified bytes, and against
+    // one-byte/field mutations of them.
+
+    fn production_corpus() -> Value {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/share-v2-production/corpus.json");
+        let bytes =
+            std::fs::read(&path).expect("frozen share-v2 production corpus must be present");
+        serde_json::from_slice(&bytes).expect("frozen share-v2 production corpus must be JSON")
+    }
+
+    fn production_provenance() -> Value {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/share-v2-production/PROVENANCE.json");
+        let bytes = std::fs::read(&path)
+            .expect("frozen share-v2 production corpus provenance must be present");
+        serde_json::from_slice(&bytes)
+            .expect("frozen share-v2 production corpus provenance must be JSON")
+    }
+
+    fn b64u_decode(value: &str) -> Vec<u8> {
+        decode_config(value, URL_SAFE_NO_PAD).expect("corpus vector must be canonical base64url")
+    }
+
+    #[test]
+    fn production_corpus_is_pinned_to_its_exact_frozen_bytes() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/share-v2-production/corpus.json");
+        let raw = std::fs::read(&path).expect("frozen corpus present");
+        let provenance = production_provenance();
+        assert_eq!(
+            b64_digest(&raw),
+            provenance["corpusDigest"].as_str().unwrap(),
+            "the checked-in js-sdk production corpus must not drift from its pinned digest \
+             without a conscious re-pin of PROVENANCE.json"
+        );
+        let corpus = production_corpus();
+        assert_eq!(
+            corpus["provenance"]["sdkCommit"], provenance["sdkCommit"],
+            "the pinned sdkCommit in PROVENANCE.json must match the corpus's own provenance block"
+        );
+        assert_eq!(corpus["provenance"]["algorithm"], "sha256");
+        assert_eq!(corpus["provenance"]["encoding"], "base64url-unpadded");
+    }
+
+    #[test]
+    fn production_corpus_registration_policy_cid_and_digest_match_the_real_node_hash() {
+        let corpus = production_corpus();
+        let vector = &corpus["vectors"]["registrationPolicy"]["value"];
+        let bytes = b64u_decode(vector["canonicalBytesBase64Url"].as_str().unwrap());
+        assert_eq!(
+            raw_sha256_cid(&bytes),
+            vector["cid"].as_str().unwrap(),
+            "Node's raw sha256 CID over the unmodified SDK-signed policy bytes must match the pinned corpus cid"
+        );
+        assert_eq!(
+            b64_digest(&bytes),
+            vector["digest"].as_str().unwrap(),
+            "Node's sha256 digest over the unmodified SDK-signed policy bytes must match the pinned corpus digest"
+        );
+
+        let mut tampered = bytes.clone();
+        *tampered.last_mut().unwrap() ^= 0x01;
+        assert_ne!(
+            raw_sha256_cid(&tampered),
+            vector["cid"].as_str().unwrap(),
+            "a single flipped byte in the policy bytes must change the recomputed cid"
+        );
+    }
+
+    #[test]
+    fn production_corpus_registration_policy_proof_verifies_and_rejects_mutation() {
+        let corpus = production_corpus();
+        let vector = &corpus["vectors"]["registrationPolicy"]["value"];
+        let bytes = b64u_decode(vector["canonicalBytesBase64Url"].as_str().unwrap());
+        let share_key_did = vector["policy"]["shareKeyDid"].as_str().unwrap();
+        let proof = vector["proof"].as_str().unwrap();
+
+        verify_policy_proof(share_key_did, &bytes, proof).expect(
+            "the real production SDK signature over the real production canonical policy bytes must verify",
+        );
+
+        let mut tampered = bytes.clone();
+        *tampered.last_mut().unwrap() ^= 0x01;
+        assert!(
+            verify_policy_proof(share_key_did, &tampered, proof).is_err(),
+            "a single flipped byte in the signed policy bytes must be rejected"
+        );
+
+        let mut policy_value: Value = serde_json::from_slice(&bytes).unwrap();
+        policy_value["policy"]["shareId"] = Value::String("tampered-share-id".into());
+        let mutated_bytes = jcs::canonicalize(&policy_value);
+        assert!(
+            verify_policy_proof(share_key_did, &mutated_bytes, proof).is_err(),
+            "a mutated shareId field must invalidate the real production signature"
+        );
+    }
+
+    #[test]
+    fn production_corpus_enforcement_delegation_dag_cbor_and_signature_verify_and_reject_mutation()
+    {
+        let corpus = production_corpus();
+        let vector = &corpus["vectors"]["registrationEnforcementDelegation"]["value"];
+        let input: EnforcementDelegationInput = serde_json::from_value(serde_json::json!({
+            "cid": vector["cid"],
+            "dagCbor": vector["dagCbor"],
+            "issuerDid": vector["issuerDid"],
+            "audienceDid": vector["audienceDid"],
+            "facts": vector["facts"],
+            "signature": vector["signature"],
+        }))
+        .expect("corpus enforcement delegation matches the wire shape");
+
+        verify_dag_cbor_enforcement(&input).expect(
+            "the unmodified SDK-produced enforcement delegation dag-cbor must decode canonically and match its pinned cid",
+        );
+
+        let dag_cbor_bytes = b64u_decode(&input.dag_cbor);
+        let signature = decode_config(&input.signature, URL_SAFE_NO_PAD).unwrap();
+        verify_detached_ed25519(&input.issuer_did, &dag_cbor_bytes, &signature).expect(
+            "the real production Ed25519 signature over the real production dag-cbor bytes must verify",
+        );
+
+        let mut tampered_cbor = dag_cbor_bytes.clone();
+        *tampered_cbor.last_mut().unwrap() ^= 0x01;
+        assert!(
+            verify_detached_ed25519(&input.issuer_did, &tampered_cbor, &signature).is_err(),
+            "a single flipped byte in the enforcement delegation dag-cbor must invalidate the real production signature"
+        );
+
+        // Field mutation: change one signed fact (`facts.path`) in the decoded
+        // dag-cbor value, re-encode it canonically, and confirm the real
+        // signature no longer verifies over the mutated bytes.
+        let mut decoded_value = verify_dag_cbor_enforcement(&input).unwrap();
+        decoded_value["unsigned"]["facts"]["path"] = Value::String("tampered/path.md".into());
+        let mutated_dag_cbor_bytes =
+            serde_ipld_dagcbor::to_vec(&decoded_value).expect("mutated value re-encodes");
+        assert!(
+            verify_detached_ed25519(&input.issuer_did, &mutated_dag_cbor_bytes, &signature)
+                .is_err(),
+            "the real signature must not verify over dag-cbor bytes with a mutated fact"
+        );
+
+        let mut cid_mutated = input.clone();
+        cid_mutated.cid =
+            "bafkreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
+        assert!(
+            verify_dag_cbor_enforcement(&cid_mutated).is_err(),
+            "a mutated cid must not match the real unmodified dag-cbor bytes"
+        );
+    }
+
+    #[test]
+    fn production_corpus_registration_core_cid_matches_and_rejects_mutation() {
+        let corpus = production_corpus();
+        let receipt =
+            &corpus["vectors"]["registrationReceiptResponse"]["value"]["decoded"]["registration"];
+        let pinned_cid = receipt["registrationCid"].as_str().unwrap().to_owned();
+        let mut core = receipt.clone();
+        core.as_object_mut().unwrap().remove("registrationCid");
+        let bytes = jcs::canonicalize(&core);
+        assert_eq!(
+            raw_sha256_cid(&bytes),
+            pinned_cid,
+            "recomputing the registration-core cid over the real production registration fields \
+             (Node's own jcs canonicalization + raw sha256 cid) must match the pinned receipt"
+        );
+
+        let mut tampered_bytes = bytes.clone();
+        *tampered_bytes.last_mut().unwrap() ^= 0x01;
+        assert_ne!(
+            raw_sha256_cid(&tampered_bytes),
+            pinned_cid,
+            "a single flipped byte in the canonical registration core must change its cid"
+        );
+
+        let mut tampered_core = core.clone();
+        tampered_core["shareId"] = Value::String("tampered".into());
+        let tampered_core_bytes = jcs::canonicalize(&tampered_core);
+        assert_ne!(
+            raw_sha256_cid(&tampered_core_bytes),
+            pinned_cid,
+            "a mutated shareId field in the registration core must change its cid"
+        );
+    }
+
+    #[test]
+    fn v2_proof_domain_kid_and_key_mutations_are_all_rejected() {
+        let (signer, holder_did) = tamper_keypair_and_did();
+        let value = serde_json::json!({"resource": "shares/share-1/document.md"});
+        let domain = b"xyz.tinycloud.share/test-tamper/v1\0";
+        let proof = signed_value(&signer, domain, &value).expect("valid signature produced");
+        assert!(verify_v2_proof(&holder_did, &proof, domain, &value).is_ok());
+
+        let mut mutated_domain = domain.to_vec();
+        mutated_domain[0] ^= 0x01;
+        assert!(
+            verify_v2_proof(&holder_did, &proof, &mutated_domain, &value).is_err(),
+            "a one-byte mutated domain must invalidate an otherwise-valid proof"
+        );
+
+        let (_other_signer, other_did) = tamper_keypair_and_did();
+        let kid_mutated = DetachedProofV2 {
+            alg: proof.alg.clone(),
+            kid: format!("{}#{}", other_did, other_did.trim_start_matches("did:key:")),
+            signature: proof.signature.clone(),
+        };
+        assert!(
+            verify_v2_proof(&holder_did, &kid_mutated, domain, &value).is_err(),
+            "a proof kid pointing at a different holder's key must be rejected"
+        );
+
+        assert!(
+            verify_v2_proof(&other_did, &proof, domain, &value).is_err(),
+            "a proof signed by one key must not verify against a different holder's public key"
+        );
+
+        let mut signature_bytes = decode_config(&proof.signature, URL_SAFE_NO_PAD).unwrap();
+        signature_bytes[0] ^= 0x01;
+        let sig_mutated = DetachedProofV2 {
+            alg: proof.alg.clone(),
+            kid: proof.kid.clone(),
+            signature: encode_config(&signature_bytes, URL_SAFE_NO_PAD),
+        };
+        assert!(
+            verify_v2_proof(&holder_did, &sig_mutated, domain, &value).is_err(),
+            "a single flipped signature byte must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_corpus_registration_request_dispatches_through_a_real_rocket_route() {
+        let corpus = production_corpus();
+        let policy_vector = &corpus["vectors"]["registrationPolicy"]["value"];
+        let enforcement_vector = &corpus["vectors"]["registrationEnforcementDelegation"]["value"];
+
+        let key_setup = StaticSecret::new(vec![0x37u8; 32]).expect("32-byte test secret");
+        let tee_context = TeeContext::derive_local(&key_setup);
+        let runtime = compose_test_runtime(&key_setup, Some(tee_context), true).await;
+        assert!(
+            runtime.live().await,
+            "the composed runtime must be live before dispatching a real HTTP request at it"
+        );
+
+        // The policy/enforcement-delegation fields below are the corpus's
+        // exact, unmodified production SDK bytes. Only `ownerDelegation` is
+        // not a production artifact: the js-sdk corpus generator does not
+        // author a real owner delegation (see generate-share-v2-corpus.ts's
+        // module docstring), so `cid` is the corpus's own placeholder,
+        // unchanged, and `dagCbor` is an arbitrary well-formed filler that is
+        // never reached because this composed node's own origin/audience/
+        // enforcer identity does not match the frozen corpus's.
+        let body = serde_json::json!({
+            "policy": {
+                "bytes": policy_vector["canonicalBytesBase64Url"],
+                "cid": policy_vector["cid"],
+                "proof": policy_vector["proof"],
+            },
+            "ownerDelegation": {
+                "cid": policy_vector["policy"]["ownerDelegationCid"],
+                "dagCbor": "AA",
+            },
+            "enforcementDelegation": enforcement_vector,
+            "contentSourceDigest": policy_vector["policy"]["contentSourceDigest"],
+        });
+
+        let rocket = rocket::build()
+            .manage(Some(runtime))
+            .mount("/", rocket::routes![register_policy]);
+        let client = Client::tracked(rocket).await.expect("rocket local client");
+        let response = client
+            .post("/share/v2/policies")
+            .header(rocket::http::ContentType::JSON)
+            .body(serde_json::to_vec(&body).expect("request body serializes"))
+            .dispatch()
+            .await;
+
+        let status = response.status();
+        let raw_bytes = response
+            .into_bytes()
+            .await
+            .expect("a real HTTP response body must be readable as raw bytes");
+
+        assert_ne!(
+            status,
+            Status::Ok,
+            "the frozen corpus vector's target/audience/enforcer identity does not describe this \
+             test node's own composed identity, so registration must not succeed"
+        );
+        let error_body: Value = serde_json::from_slice(&raw_bytes)
+            .expect("the real raw response bytes must be the documented JSON error shape");
+        assert_eq!(error_body["error"]["code"], "policy_registration_invalid");
+    }
+
+    #[tokio::test]
+    async fn production_corpus_one_byte_and_field_mutations_of_the_registration_wire_are_denied() {
+        let corpus = production_corpus();
+        let policy_vector = &corpus["vectors"]["registrationPolicy"]["value"];
+        let enforcement_vector = &corpus["vectors"]["registrationEnforcementDelegation"]["value"];
+
+        let key_setup = StaticSecret::new(vec![0x38u8; 32]).expect("32-byte test secret");
+        let tee_context = TeeContext::derive_local(&key_setup);
+        let runtime = compose_test_runtime(&key_setup, Some(tee_context), true).await;
+        assert!(runtime.live().await);
+
+        let base_body = serde_json::json!({
+            "policy": {
+                "bytes": policy_vector["canonicalBytesBase64Url"],
+                "cid": policy_vector["cid"],
+                "proof": policy_vector["proof"],
+            },
+            "ownerDelegation": {
+                "cid": policy_vector["policy"]["ownerDelegationCid"],
+                "dagCbor": "AA",
+            },
+            "enforcementDelegation": enforcement_vector,
+            "contentSourceDigest": policy_vector["policy"]["contentSourceDigest"],
+        });
+
+        async fn dispatch(runtime: ShareV2Runtime, body: &Value) -> Status {
+            let rocket = rocket::build()
+                .manage(Some(runtime))
+                .mount("/", rocket::routes![register_policy]);
+            let client = Client::tracked(rocket).await.expect("rocket local client");
+            let response = client
+                .post("/share/v2/policies")
+                .header(rocket::http::ContentType::JSON)
+                .body(serde_json::to_vec(body).expect("request body serializes"))
+                .dispatch()
+                .await;
+            response.status()
+        }
+
+        let baseline = dispatch(runtime.clone(), &base_body).await;
+
+        // policy: one flipped byte in the base64url policy bytes wire field.
+        let mut policy_byte_flip = base_body.clone();
+        let mut policy_bytes_str = policy_vector["canonicalBytesBase64Url"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let last = policy_bytes_str.pop().unwrap();
+        policy_bytes_str.push(if last == 'A' { 'B' } else { 'A' });
+        policy_byte_flip["policy"]["bytes"] = Value::String(policy_bytes_str);
+        assert_eq!(
+            dispatch(runtime.clone(), &policy_byte_flip).await,
+            Status::Forbidden,
+            "a one-byte-mutated policy wire field must be denied"
+        );
+
+        // policy: field mutation (shareId) inside the policy JSON, cid unchanged.
+        let mut policy_field_mutation = base_body.clone();
+        let mut tampered_policy: Value = serde_json::from_slice(&b64u_decode(
+            policy_vector["canonicalBytesBase64Url"].as_str().unwrap(),
+        ))
+        .unwrap();
+        tampered_policy["policy"]["shareId"] = Value::String("mutated".into());
+        policy_field_mutation["policy"]["bytes"] = Value::String(encode_config(
+            jcs::canonicalize(&tampered_policy),
+            URL_SAFE_NO_PAD,
+        ));
+        assert_eq!(
+            dispatch(runtime.clone(), &policy_field_mutation).await,
+            Status::Forbidden,
+            "a mutated policy field must be denied even when it re-canonicalizes cleanly"
+        );
+
+        // delegations: one flipped byte in the enforcement delegation dag-cbor.
+        let mut delegation_byte_flip = base_body.clone();
+        let mut dag_cbor_str = enforcement_vector["dagCbor"].as_str().unwrap().to_owned();
+        let last = dag_cbor_str.pop().unwrap();
+        dag_cbor_str.push(if last == 'A' { 'B' } else { 'A' });
+        delegation_byte_flip["enforcementDelegation"]["dagCbor"] = Value::String(dag_cbor_str);
+        assert_eq!(
+            dispatch(runtime.clone(), &delegation_byte_flip).await,
+            Status::Forbidden,
+            "a one-byte-mutated enforcement delegation dag-cbor must be denied"
+        );
+
+        // delegations: field mutation (facts.path) without touching dagCbor.
+        let mut delegation_field_mutation = base_body.clone();
+        delegation_field_mutation["enforcementDelegation"]["facts"]["path"] =
+            Value::String("mutated/path.md".into());
+        assert_eq!(
+            dispatch(runtime.clone(), &delegation_field_mutation).await,
+            Status::Forbidden,
+            "a mutated enforcement delegation fact must be denied"
+        );
+
+        // registration core: mutated contentSourceDigest (part of the wire, not the signed policy bytes).
+        let mut core_field_mutation = base_body.clone();
+        core_field_mutation["contentSourceDigest"] =
+            Value::String("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned());
+        assert_eq!(
+            dispatch(runtime.clone(), &core_field_mutation).await,
+            Status::Forbidden,
+            "a contentSourceDigest that no longer matches the signed policy must be denied"
+        );
+
+        // domain: policy JSON with a mutated domain field, re-signed bytes rejected because the
+        // signature no longer covers the mutated canonical form.
+        let mut domain_mutation = base_body.clone();
+        let mut domain_tampered_policy: Value = serde_json::from_slice(&b64u_decode(
+            policy_vector["canonicalBytesBase64Url"].as_str().unwrap(),
+        ))
+        .unwrap();
+        domain_tampered_policy["domain"] =
+            Value::String("xyz.tinycloud.share/policy/v1\0".to_owned());
+        domain_mutation["policy"]["bytes"] = Value::String(encode_config(
+            jcs::canonicalize(&domain_tampered_policy),
+            URL_SAFE_NO_PAD,
+        ));
+        assert_eq!(
+            dispatch(runtime.clone(), &domain_mutation).await,
+            Status::Forbidden,
+            "a mutated policy domain must be denied"
+        );
+
+        // kid: enforcement delegation issuerDid mutated to a different (validly shaped) did:key.
+        let mut kid_mutation = base_body.clone();
+        kid_mutation["enforcementDelegation"]["issuerDid"] =
+            Value::String("did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned());
+        assert_eq!(
+            dispatch(runtime.clone(), &kid_mutation).await,
+            Status::Forbidden,
+            "an enforcement delegation issuer that no longer matches the policy's share key must be denied"
+        );
+
+        // key: policy shareKeyDid mutated to a different did:key (breaks the signed bytes' cid binding).
+        let mut key_mutation = base_body.clone();
+        let mut key_tampered_policy: Value = serde_json::from_slice(&b64u_decode(
+            policy_vector["canonicalBytesBase64Url"].as_str().unwrap(),
+        ))
+        .unwrap();
+        key_tampered_policy["policy"]["shareKeyDid"] =
+            Value::String("did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned());
+        key_mutation["policy"]["bytes"] = Value::String(encode_config(
+            jcs::canonicalize(&key_tampered_policy),
+            URL_SAFE_NO_PAD,
+        ));
+        assert_eq!(
+            dispatch(runtime.clone(), &key_mutation).await,
+            Status::Forbidden,
+            "a mutated policy shareKeyDid must be denied"
+        );
+
+        // signature: one flipped byte in the policy proof signature.
+        let mut signature_mutation = base_body.clone();
+        let mut proof_str = policy_vector["proof"].as_str().unwrap().to_owned();
+        let last = proof_str.pop().unwrap();
+        proof_str.push(if last == 'A' { 'B' } else { 'A' });
+        signature_mutation["policy"]["proof"] = Value::String(proof_str);
+        assert_eq!(
+            dispatch(runtime.clone(), &signature_mutation).await,
+            Status::Forbidden,
+            "a one-byte-mutated policy proof signature must be denied"
+        );
+
+        assert_eq!(
+            baseline,
+            Status::Forbidden,
+            "the unmutated corpus baseline must itself be a deterministic denial (its identity fields do not \
+             describe this test node's own composed identity), establishing the control for every mutation above"
+        );
+    }
 }

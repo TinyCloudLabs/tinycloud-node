@@ -1,0 +1,13 @@
+{
+  "sourceRepo": "TinyCloudLabs/js-sdk",
+  "sourceBranch": "feat/sharing-production-live",
+  "sourceCommit": "2495853a3cafb0d96a1f515f7de528d18ef15b50",
+  "sourcePath": "packages/sdk-core/src/delegations/fixtures/share-v2-corpus.json",
+  "sourceGenerator": "packages/sdk-core/src/delegations/fixtures/generate-share-v2-corpus.ts",
+  "sourceGeneratorVersion": "1.0.0",
+  "sdkCommit": "2495853a3cafb0d96a1f515f7de528d18ef15b50",
+  "corpusDigestAlgorithm": "sha256",
+  "corpusDigestEncoding": "base64url-unpadded",
+  "corpusDigest": "qj65gxo3r2-KMco_BEPoICHPxSSF6-HVQ6BTZ5GCtBU",
+  "note": "Byte-exact copy of the js-sdk-side Share v2 production corpus. corpus.json is frozen; changing it requires re-pinning corpusDigest here and in share_v2::tests::production_corpus_* tests. sdkCommit is the commit the corpus content itself was generated against, per corpus.provenance.sdkCommit; sourceCommit is the js-sdk worktree HEAD this file was copied from (equal here because the corpus was regenerated at HEAD)."
+}
