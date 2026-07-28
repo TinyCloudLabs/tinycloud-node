@@ -24,7 +24,12 @@ pub async fn attestation(
             // In TEE mode, get a fresh quote from dstack
             #[cfg(feature = "dstack")]
             {
-                let report_data = nonce.as_deref().unwrap_or("").as_bytes().to_vec();
+                let key_binding = format!(
+                    "xyz.tinycloud.share/tee-key/v1\\0:{}:{}",
+                    ctx.enforcer_did,
+                    nonce.as_deref().unwrap_or("")
+                );
+                let report_data = key_binding.as_bytes().to_vec();
 
                 match crate::dstack::get_quote(&report_data).await {
                     Ok(quote_resp) => Json(AttestationResponse::Dstack {
@@ -32,6 +37,8 @@ pub async fn attestation(
                         event_log: quote_resp.event_log,
                         compose_hash: ctx.compose_hash.clone(),
                         app_id: ctx.app_id.clone(),
+                        enforcer_did: ctx.enforcer_did.clone(),
+                        key_binding,
                         timestamp: time::OffsetDateTime::now_utc()
                             .format(&time::format_description::well_known::Rfc3339)
                             .unwrap_or_default(),

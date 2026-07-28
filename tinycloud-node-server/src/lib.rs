@@ -27,6 +27,7 @@ pub mod quota;
 pub mod routes;
 pub mod runtime;
 pub mod share_email;
+pub mod share_v2;
 pub mod signed_urls;
 pub mod storage;
 pub mod tee;
@@ -183,7 +184,7 @@ pub async fn app_with_control(
         .map_err(|error| anyhow::anyhow!(error))?;
     tinycloud_config
         .share_email
-        .validate_for_database(tinycloud_config.storage.database())
+        .validate_for_v2_database(tinycloud_config.storage.database())
         .map_err(|error| anyhow::anyhow!(error))?;
 
     // Ensure local storage directories exist.
@@ -230,6 +231,7 @@ pub async fn app_with_control(
         revoke_encryption_network,
     ];
     routes.extend(share_email::public_routes());
+    routes.extend(share_v2::public_routes());
     #[cfg(feature = "tc-bench-v1")]
     routes.extend(rocket::routes![
         tc_bench_auth_verify,
@@ -266,6 +268,7 @@ pub async fn app_with_control(
                             app_id: info.app_id,
                             compose_hash: info.compose_hash,
                             instance_id: info.instance_id,
+                            enforcer_did: key_setup.node_did(),
                         })
                     }
                     Err(e) => {
@@ -282,6 +285,17 @@ pub async fn app_with_control(
             None
         }
     };
+    // Test-only, key-derived fallback for hosts with no real dstack TEE
+    // (local dev, canonical local-launch harnesses). Gated by the
+    // `local-tee` feature, which is never part of a production build. It
+    // never overrides a real dstack-attested context above.
+    #[cfg(feature = "local-tee")]
+    let tee_context = tee_context.or_else(|| {
+        ::tracing::warn!(
+            "share-v2 local-tee feature active: deriving a deterministic, non-attested TEE identity from node key material"
+        );
+        Some(TeeContext::derive_local(&key_setup))
+    });
 
     let database = tinycloud_config.storage.database();
     let is_sqlite = database.starts_with("sqlite");
@@ -369,6 +383,29 @@ pub async fn app_with_control(
         Arc::new(tinycloud.clone()),
         Arc::new(sql_service.clone()),
     )?;
+    #[cfg(feature = "dstack")]
+    let dstack_tee_key_derived = matches!(tinycloud_config.keys, config::Keys::Dstack)
+        || matches!(tinycloud_config.keys, config::Keys::Auto) && dstack::is_available();
+    #[cfg(not(feature = "dstack"))]
+    let dstack_tee_key_derived = false;
+    // `local-tee` always derives its TeeContext from real node key material
+    // (see `TeeContext::derive_local`), so it is a derived identity too.
+    let tee_key_derived = dstack_tee_key_derived || cfg!(feature = "local-tee");
+    let share_v2_runtime = if tinycloud_config.share_email.enabled {
+        Some(
+            share_v2::compose(
+                seed_conn.clone(),
+                &key_setup,
+                tinycloud_config.share_email.clone(),
+                tee_context.clone(),
+                tee_key_derived,
+                Arc::new(tinycloud.clone()),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     if let Some(runtime) = share_email_runtime.as_ref() {
         if !runtime.bridge.self_check().await {
             anyhow::bail!(
@@ -471,6 +508,7 @@ pub async fn app_with_control(
         .manage(webhook_encryption)
         .manage(rate_limiter)
         .manage(share_email_runtime)
+        .manage(share_v2_runtime)
         .manage(tee_context)
         .manage(encryption_service)
         .manage(tinycloud_config.storage.staging.open().await?);
@@ -506,7 +544,9 @@ pub async fn app_with_control(
         move |request, response| {
             let share_allowed_origin = share_allowed_origin.clone();
             Box::pin(async move {
-                if request.uri().path().starts_with("/share/v1/") {
+                if request.uri().path().starts_with("/share/v1/")
+                    || request.uri().path().starts_with("/share/v2/")
+                {
                     response.set_header(Header::new("Cache-Control", "no-store"));
                     response.set_header(Header::new("X-Content-Type-Options", "nosniff"));
                     response.set_header(Header::new("Referrer-Policy", "no-referrer"));
@@ -514,7 +554,7 @@ pub async fn app_with_control(
                         "Access-Control-Allow-Origin",
                         share_allowed_origin,
                     ));
-                    response.set_header(Header::new("Access-Control-Allow-Methods", "POST"));
+                    response.set_header(Header::new("Access-Control-Allow-Methods", "GET, POST"));
                     response
                         .set_header(Header::new("Access-Control-Allow-Headers", "Content-Type"));
                 }
@@ -525,7 +565,9 @@ pub async fn app_with_control(
     if tinycloud_config.cors {
         Ok(rocket.attach(AdHoc::on_response("CORS", |request, resp| {
             Box::pin(async move {
-                if request.uri().path().starts_with("/share/v1/") {
+                if request.uri().path().starts_with("/share/v1/")
+                    || request.uri().path().starts_with("/share/v2/")
+                {
                     return;
                 }
                 resp.set_header(Header::new("Access-Control-Allow-Origin", "*"));

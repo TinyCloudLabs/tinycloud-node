@@ -468,6 +468,7 @@ fn descriptor(
     config: &FixtureConfig,
     cases: &[Case],
     node: &tinycloud_core::libp2p::identity::Keypair,
+    enforcer_did: &str,
     issuer_public: &str,
     trust_bundle: &Value,
     url: &str,
@@ -497,13 +498,13 @@ fn descriptor(
             })
         }).collect::<Vec<_>>();
         json!({
-        "kind":case.kind,"source":case.source,"policy":case.policy,"expectedContentSourceDigest":sha256_b64(&value_bytes(&case.source)),"expectedRecipientEmail":"sam@tinycloud.xyz","expiresAt":case.expires_at,
+        "kind":case.kind,"source":case.source,"policy":case.policy,"expectedContentSourceDigest":sha256_b64(&value_bytes(&case.source)),"expectedRecipientEmail":if case.kind == "kv-domain" || case.kind == "kv-folder-domain" { "sam@mailinator.com" } else { "sam@tinycloud.xyz" },"expiresAt":case.expires_at,
         "policyCid":case.policy_cid,"delegationCid":case.delegation_cid,"authorityMaterialHandle":case.authority["handle"].clone(),"authorityMaterialDigest":case.authority_digest,
         "policyOwnerDid":case.authority["policyOwnerDid"],"senderDid":case.authority["senderDid"],"senderPrivateKey":b64(&sender_seed),"delegation":format!("uCAESA.n4-production.{}",case.kind),"spaceId":SPACE,"documentName":if case.kind == "kv" { "TinyCloud share test" } else { "Project plan.md" },"senderTrust":"verified","authorityMaterial":case.authority,"targetOrigin":config.target_origin,"nodeAudience":config.node_audience,
         "trustedNode":{"targetOrigin":config.target_origin,"nodeAudience":config.node_audience,"invitationKid":config.invitation_kid,"invitationPublicKey":b64(&node_public),"keyVersion":1,"enabled":true},"authoritativeBinding":authoritative_bindings[0],"authoritativeBindings":authoritative_bindings,"expectedContent":case.content
         })
     }).collect::<Vec<_>>();
-    json!({"production":true,"service":"tinycloud-node-production-e2e","url":url,"healthUrl":format!("{url}/healthz"),"issuerDid":ISSUER_DID,"issuerKid":ISSUER_KID,"issuerPublicKey":issuer_public,"trustBundle":trust_bundle,"capability":{"id":"tinycloud.node-policy-email-v1","version":1,"origin":config.target_origin,"routes":tinycloud_node::share_email::NODE_CAPABILITY_ROUTES,"contentKinds":["kv","sql"],"status":"ready"},"trustedNode":{"targetOrigin":config.target_origin,"nodeAudience":config.node_audience,"invitationKid":config.invitation_kid,"invitationPublicKey":b64(&node_public),"keyVersion":1,"enabled":true},"senderDid":did_key(&sender),"cases":case_values})
+    json!({"production":true,"service":"tinycloud-node-production-e2e","url":url,"healthUrl":format!("{url}/healthz"),"issuerDid":ISSUER_DID,"issuerKid":ISSUER_KID,"issuerPublicKey":issuer_public,"nodeId":enforcer_did,"trustBundle":trust_bundle,"capability":{"id":"tinycloud.node-policy-email-v1","version":1,"origin":config.target_origin,"routes":tinycloud_node::share_email::NODE_CAPABILITY_ROUTES,"contentKinds":["kv","sql"],"status":"ready"},"trustedNode":{"targetOrigin":config.target_origin,"nodeAudience":config.node_audience,"invitationKid":config.invitation_kid,"invitationPublicKey":b64(&node_public),"keyVersion":1,"enabled":true},"senderDid":did_key(&sender),"cases":case_values})
 }
 
 fn figment(
@@ -845,6 +846,7 @@ async fn run() -> Result<()> {
     }
     let node_secret = tinycloud_core::keys::StaticSecret::new(secret.clone())
         .map_err(|_| anyhow::anyhow!("invalid key secret"))?;
+    let enforcer_did = node_secret.node_did();
     let signing = node_secret.derive_key(b"tinycloud/share-email/invitation-signing");
     let node = ed_key(signing);
     if let Some(expected) = args
@@ -938,6 +940,7 @@ async fn run() -> Result<()> {
         &fixture_config,
         &cases,
         &node,
+        &enforcer_did,
         &issuer_public,
         &trust_bundle,
         &format!("http://127.0.0.1:{port}"),

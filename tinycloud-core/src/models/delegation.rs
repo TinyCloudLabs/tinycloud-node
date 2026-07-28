@@ -111,6 +111,28 @@ pub enum Error {
     InvalidDelegation(#[from] DelegationError),
 }
 
+/// Outcome of a single delegation persistence attempt inside a transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegationRegistration {
+    /// The exact serialization was inserted now; dependent rows (actors,
+    /// abilities, parents) were also written.
+    New(Hash),
+    /// The exact serialization hash already existed; no rows were duplicated.
+    Existing(Hash),
+}
+
+impl DelegationRegistration {
+    pub fn hash(self) -> Hash {
+        match self {
+            DelegationRegistration::New(h) | DelegationRegistration::Existing(h) => h,
+        }
+    }
+
+    pub fn is_new(self) -> bool {
+        matches!(self, DelegationRegistration::New(_))
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DelegationError {
     #[error("Delegation expired or not yet valid")]
@@ -148,17 +170,19 @@ pub enum DelegationError {
     CaveatsNotContained(String),
 }
 
+/// Verify, validate, and register a delegation inside the caller's transaction.
+///
+/// Returns `New` when the exact serialization was inserted (and actors,
+/// abilities, and parents written). Returns `Existing` when the hash was
+/// already present; no dependent rows are duplicated in that case.
 pub(crate) async fn process<C: ConnectionTrait>(
     db: &C,
-    delegation: Delegation,
+    delegation: &Delegation,
     encryption: Option<&ColumnEncryption>,
-) -> Result<Hash, Error> {
-    let (d, ser) = (delegation.0, delegation.1);
-    verify(&d.delegation).await?;
-
-    validate(db, &d).await?;
-
-    save(db, d, ser, encryption).await
+) -> Result<DelegationRegistration, Error> {
+    verify(&delegation.0.delegation).await?;
+    validate(db, &delegation.0).await?;
+    save(db, delegation.0.clone(), delegation.1.clone(), encryption).await
 }
 
 // verify signatures and time
@@ -455,9 +479,7 @@ async fn save<C: ConnectionTrait>(
     delegation: util::DelegationInfo,
     serialization: Vec<u8>,
     encryption: Option<&ColumnEncryption>,
-) -> Result<Hash, Error> {
-    save_actors(&[&delegation.delegator, &delegation.delegate], db).await?;
-
+) -> Result<DelegationRegistration, Error> {
     // Hash is always computed on plaintext (before encryption)
     let hash: Hash = crate::hash::hash(&serialization);
 
@@ -480,7 +502,15 @@ async fn save<C: ConnectionTrait>(
         }
     };
 
-    // save delegation
+    // Actors are FK prerequisites for the delegation row and must be inserted
+    // first. They use ON CONFLICT DO NOTHING so concurrent transactions writing
+    // the same actors are safe. This is the only write that precedes the
+    // idempotency gate below.
+    save_actors(&[&delegation.delegator, &delegation.delegate], db).await?;
+
+    // Idempotency gate: the delegation INSERT ON CONFLICT is the claim. If
+    // the row already exists (RecordNotInserted) we return Existing immediately
+    // — no abilities or parent rows are written.
     match Entity::insert(ActiveModel::from(Model {
         id: hash,
         delegator: delegation.delegator,
@@ -495,7 +525,7 @@ async fn save<C: ConnectionTrait>(
     .exec(db)
     .await
     {
-        Err(DbErr::RecordNotInserted) => return Ok(hash),
+        Err(DbErr::RecordNotInserted) => return Ok(DelegationRegistration::Existing(hash)),
         r => {
             r?;
         }
@@ -530,7 +560,7 @@ async fn save<C: ConnectionTrait>(
         .await?;
     }
 
-    Ok(hash)
+    Ok(DelegationRegistration::New(hash))
 }
 
 async fn save_actors<C: ConnectionTrait>(actors: &[&str], db: &C) -> Result<(), DbErr> {
@@ -592,6 +622,149 @@ mod tests {
         .insert(db)
         .await
         .unwrap();
+    }
+
+    // ── DelegationRegistration New/Existing outcome tests ───────────────────
+
+    /// Tests the DB-level ON CONFLICT behaviour that backs DelegationRegistration:
+    /// first insert succeeds (→ New), second with same PK gets RecordNotInserted
+    /// (→ Existing), both operations produce the same content hash, and the
+    /// second insert does not duplicate the ability row.
+    #[tokio::test]
+    async fn delegation_row_first_insert_new_second_existing() {
+        let db = database().await;
+
+        let ser_a = b"delegation-new-existing-bytes-A".to_vec();
+        let hash_a = crate::hash::hash(&ser_a);
+
+        for actor in ["did:key:ne-delegator", "did:key:ne-delegatee"] {
+            actor::ActiveModel {
+                id: Set(actor.to_string()),
+            }
+            .insert(&db)
+            .await
+            .ok();
+        }
+
+        let model = || ActiveModel {
+            id: Set(hash_a),
+            delegator: Set("did:key:ne-delegator".to_string()),
+            delegatee: Set("did:key:ne-delegatee".to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(ser_a.clone()),
+        };
+
+        // First insert → row is new.
+        let first = Entity::insert(model())
+            .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned())
+            .exec(&db)
+            .await;
+        let first_reg = match first {
+            Ok(_) => DelegationRegistration::New(hash_a),
+            Err(DbErr::RecordNotInserted) => DelegationRegistration::Existing(hash_a),
+            Err(e) => panic!("unexpected error: {e}"),
+        };
+
+        // Ability row for the first insert.
+        abilities::Entity::insert(abilities::ActiveModel {
+            delegation: Set(hash_a),
+            resource: Set("tinycloud:did:key:ne-delegator:files/kv/doc"
+                .parse()
+                .unwrap()),
+            ability: Set("tinycloud.kv/get".to_string().try_into().unwrap()),
+            caveats: Set(Default::default()),
+        })
+        .exec(&db)
+        .await
+        .unwrap();
+
+        // Second insert → Existing (RecordNotInserted).
+        let second = Entity::insert(model())
+            .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned())
+            .exec(&db)
+            .await;
+        let second_reg = match second {
+            Ok(_) => DelegationRegistration::New(hash_a),
+            Err(DbErr::RecordNotInserted) => DelegationRegistration::Existing(hash_a),
+            Err(e) => panic!("unexpected error: {e}"),
+        };
+
+        assert!(first_reg.is_new(), "first insert must be New");
+        assert!(
+            matches!(second_reg, DelegationRegistration::Existing(_)),
+            "second insert must be Existing"
+        );
+        assert_eq!(
+            first_reg.hash(),
+            second_reg.hash(),
+            "both registrations must report the same hash"
+        );
+
+        // Exactly one ability row — second save must not duplicate.
+        let count = abilities::Entity::find()
+            .filter(abilities::Column::Delegation.eq(hash_a))
+            .count(&db)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "Existing must not insert duplicate ability rows");
+    }
+
+    /// Two delegations with distinct serialization bytes produce distinct hashes
+    /// and neither satisfies the other's exact-hash idempotency predicate.
+    #[tokio::test]
+    async fn distinct_delegations_yield_distinct_hashes() {
+        let db = database().await;
+
+        let ser_a = b"delegation-distinct-alpha".to_vec();
+        let ser_b = b"delegation-distinct-beta".to_vec();
+        let hash_a = crate::hash::hash(&ser_a);
+        let hash_b = crate::hash::hash(&ser_b);
+
+        assert_ne!(
+            hash_a, hash_b,
+            "distinct serialization bytes must produce distinct hashes"
+        );
+
+        for actor in ["did:key:dist-a", "did:key:dist-b"] {
+            actor::ActiveModel {
+                id: Set(actor.to_string()),
+            }
+            .insert(&db)
+            .await
+            .ok();
+        }
+
+        for (hash, ser) in [(hash_a, ser_a), (hash_b, ser_b)] {
+            Entity::insert(ActiveModel {
+                id: Set(hash),
+                delegator: Set("did:key:dist-a".to_string()),
+                delegatee: Set("did:key:dist-b".to_string()),
+                expiry: Set(None),
+                issued_at: Set(None),
+                not_before: Set(None),
+                facts: Set(None),
+                serialization: Set(ser),
+            })
+            .on_conflict(OnConflict::column(Column::Id).do_nothing().to_owned())
+            .exec(&db)
+            .await
+            .unwrap();
+        }
+
+        // hash_a row exists but hash_b lookup returns it — must not.
+        let row_for_a = Entity::find_by_id(hash_a).one(&db).await.unwrap();
+        let row_for_b = Entity::find_by_id(hash_b).one(&db).await.unwrap();
+        assert!(row_for_a.is_some());
+        assert!(row_for_b.is_some());
+        // Neither hash satisfies the other delegation's exact-byte predicate.
+        assert_ne!(
+            row_for_a.unwrap().id,
+            row_for_b.unwrap().id,
+            "distinct delegations must not share a primary key"
+        );
     }
 
     #[tokio::test]

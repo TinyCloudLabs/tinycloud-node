@@ -16,6 +16,7 @@ pub mod invocation;
 pub mod invocation_replay;
 pub mod kv_delete;
 pub mod kv_write;
+pub mod owner_share_policy;
 pub mod policy_challenge;
 pub mod policy_delegation;
 pub mod policy_edge;

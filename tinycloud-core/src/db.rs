@@ -27,6 +27,7 @@ use sea_orm::{
 };
 use sea_orm_migration::MigratorTrait;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -1004,13 +1005,18 @@ where
     }
 
     pub async fn delegate(&self, delegation: Delegation) -> Result<TransactResult, TxError<B, K>> {
-        let roots: Vec<Hash> = delegation
+        let parent_hashes: Vec<Hash> = delegation
             .0
             .parents
             .iter()
             .copied()
             .map(Hash::from)
             .collect();
+        let retained_hash = delegation.content_hash();
+        // Capture expected row counts before consuming the delegation.
+        let expected_ability_count = delegation.0.capabilities.len() as u64;
+        let expected_parent_count = parent_hashes.len() as u64;
+        let roots = delegation_guard_roots(retained_hash, &parent_hashes);
         let authz_start = Instant::now();
         let chain_guards = self.acquire_chain_guards(&roots).await;
         crate::telemetry::observe_stage(
@@ -1019,8 +1025,38 @@ where
             authz_start.elapsed(),
         );
         let _chain_guards = chain_guards?;
-        self.transact(vec![Event::Delegation(Box::new(delegation))])
+        // Non-authoritative fast path: if the row is already committed before
+        // we begin the transaction, skip the write entirely. Correctness does
+        // not depend on this check — transact() handles the idempotent case
+        // atomically via DelegationRegistration::Existing inside the txn.
+        match delegation::Entity::find_by_id(retained_hash)
+            .one(&self.conn)
             .await
+        {
+            Ok(Some(_)) => return Ok(already_registered_result(retained_hash)),
+            Ok(None) => {}
+            Err(e) => return Err(TxError::Db(e)),
+        }
+        match self
+            .transact(vec![Event::Delegation(Box::new(delegation))])
+            .await
+        {
+            Err(TxError::EpochInsert(epoch_err)) => {
+                if is_pk_epoch_conflict(&epoch_err) {
+                    reconcile_pk_epoch_delegation(
+                        &self.conn,
+                        retained_hash,
+                        expected_ability_count,
+                        expected_parent_count,
+                    )
+                    .await
+                } else {
+                    record_epoch_reconcile_failure(EpochReconcileReason::ClassifierMiss);
+                    Err(TxError::EpochInsert(epoch_err))
+                }
+            }
+            other => other,
+        }
     }
 
     pub async fn revoke(&self, revocation: Revocation) -> Result<TransactResult, TxError<B, K>> {
@@ -1672,6 +1708,202 @@ fn is_serialization_db_error(error: &DbErr) -> bool {
     )
 }
 
+/// Returns a `TransactResult` that acknowledges a delegation already durably
+/// registered at `retained_hash` without creating new state.
+fn already_registered_result(retained_hash: Hash) -> TransactResult {
+    TransactResult {
+        commits: HashMap::new(),
+        skipped_spaces: Vec::new(),
+        delegation_cids: vec![retained_hash],
+    }
+}
+
+/// Bounded, privacy-safe diagnostic reason for a failed `/delegate` epoch
+/// path. Never carries identifiers, hashes, database error text, or any
+/// other request/response content — only this fixed tag and an aggregate
+/// count are ever observable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpochReconcileReason {
+    /// The epoch INSERT failed but `is_pk_epoch_conflict` did not recognize
+    /// it as a pk-epoch race, so reconciliation was never attempted.
+    ClassifierMiss,
+    /// Reconciliation ran but found no delegation row for the retained hash.
+    DelegationAbsent,
+    /// Reconciliation ran but the ability row count did not match expected.
+    AbilityMismatch,
+    /// Reconciliation ran but the parent link count did not match expected.
+    ParentMismatch,
+    /// Reconciliation ran but no event_order row referenced the retained hash.
+    EventOrderAbsent,
+    /// A read performed during reconciliation itself returned a database error.
+    ReconcileReadError,
+}
+
+impl EpochReconcileReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ClassifierMiss => "classifier_miss",
+            Self::DelegationAbsent => "delegation_absent",
+            Self::AbilityMismatch => "ability_mismatch",
+            Self::ParentMismatch => "parent_mismatch",
+            Self::EventOrderAbsent => "event_order_absent",
+            Self::ReconcileReadError => "reconcile_read_error",
+        }
+    }
+
+    fn counter(self) -> &'static AtomicU64 {
+        static CLASSIFIER_MISS: AtomicU64 = AtomicU64::new(0);
+        static DELEGATION_ABSENT: AtomicU64 = AtomicU64::new(0);
+        static ABILITY_MISMATCH: AtomicU64 = AtomicU64::new(0);
+        static PARENT_MISMATCH: AtomicU64 = AtomicU64::new(0);
+        static EVENT_ORDER_ABSENT: AtomicU64 = AtomicU64::new(0);
+        static RECONCILE_READ_ERROR: AtomicU64 = AtomicU64::new(0);
+        match self {
+            Self::ClassifierMiss => &CLASSIFIER_MISS,
+            Self::DelegationAbsent => &DELEGATION_ABSENT,
+            Self::AbilityMismatch => &ABILITY_MISMATCH,
+            Self::ParentMismatch => &PARENT_MISMATCH,
+            Self::EventOrderAbsent => &EVENT_ORDER_ABSENT,
+            Self::ReconcileReadError => &RECONCILE_READ_ERROR,
+        }
+    }
+
+    /// Test-observable aggregate count for this reason. Never exposes any
+    /// per-request identifier — only the running total.
+    pub fn count(self) -> u64 {
+        self.counter().load(Ordering::Relaxed)
+    }
+}
+
+/// Emits the diagnostic seam for a failed `/delegate` epoch path: a stable
+/// bounded reason code via `tracing` plus an in-process aggregate count.
+/// Carries no identifiers, Authorization bytes, hashes, or database text.
+fn record_epoch_reconcile_failure(reason: EpochReconcileReason) {
+    reason.counter().fetch_add(1, Ordering::Relaxed);
+    tracing::warn!(reason = reason.as_str(), "delegate epoch path failed");
+}
+
+/// Post-rollback reconciliation for a confirmed pk-epoch conflict.
+///
+/// After a failed epoch INSERT (pk-epoch unique violation), the transaction is
+/// fully rolled back. This does one bounded read-only pass to verify that the
+/// exact delegation is already durably complete — covering the delegation row,
+/// abilities, parent links, and event_order presence. Returns the retained CID
+/// only when all invariants hold; otherwise preserves the original EpochInsert
+/// error. No writes, no retries, no sleep.
+async fn reconcile_pk_epoch_delegation<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
+    conn: &C,
+    retained_hash: Hash,
+    expected_ability_count: u64,
+    expected_parent_count: u64,
+) -> Result<TransactResult, TxError<S, K>> {
+    // 1. Delegation row must exist.
+    if delegation::Entity::find_by_id(retained_hash)
+        .one(conn)
+        .await
+        .map_err(|e| {
+            record_epoch_reconcile_failure(EpochReconcileReason::ReconcileReadError);
+            TxError::Db(e)
+        })?
+        .is_none()
+    {
+        record_epoch_reconcile_failure(EpochReconcileReason::DelegationAbsent);
+        return Err(TxError::EpochInsert(DbErr::Custom(
+            "reconcile: delegation row absent after pk-epoch rollback".to_string(),
+        )));
+    }
+
+    // 2. Exact expected ability count.
+    let ability_count = abilities::Entity::find()
+        .filter(abilities::Column::Delegation.eq(retained_hash))
+        .count(conn)
+        .await
+        .map_err(|e| {
+            record_epoch_reconcile_failure(EpochReconcileReason::ReconcileReadError);
+            TxError::Db(e)
+        })?;
+    if ability_count != expected_ability_count {
+        record_epoch_reconcile_failure(EpochReconcileReason::AbilityMismatch);
+        return Err(TxError::EpochInsert(DbErr::Custom(format!(
+            "reconcile: ability count mismatch: expected {expected_ability_count} got {ability_count}"
+        ))));
+    }
+
+    // 3. Exact expected parent link count.
+    let parent_count = parent_delegations::Entity::find()
+        .filter(parent_delegations::Column::Child.eq(retained_hash))
+        .count(conn)
+        .await
+        .map_err(|e| {
+            record_epoch_reconcile_failure(EpochReconcileReason::ReconcileReadError);
+            TxError::Db(e)
+        })?;
+    if parent_count != expected_parent_count {
+        record_epoch_reconcile_failure(EpochReconcileReason::ParentMismatch);
+        return Err(TxError::EpochInsert(DbErr::Custom(format!(
+            "reconcile: parent count mismatch: expected {expected_parent_count} got {parent_count}"
+        ))));
+    }
+
+    // 4. At least one event_order row must reference the retained hash. Its
+    //    epoch is not re-verified here: event_order.(epoch, space) carries a
+    //    composite foreign key to epoch.(id, space) (see event_order::Relation
+    //    in relationships/event_order.rs), so a durably committed event_order
+    //    row is schema-guaranteed to reference an existing epoch row — a
+    //    second read-based check here could never observe a different
+    //    outcome and would only be speculative.
+    let event_order_count = event_order::Entity::find()
+        .filter(event_order::Column::Event.eq(retained_hash))
+        .count(conn)
+        .await
+        .map_err(|e| {
+            record_epoch_reconcile_failure(EpochReconcileReason::ReconcileReadError);
+            TxError::Db(e)
+        })?;
+    if event_order_count == 0 {
+        record_epoch_reconcile_failure(EpochReconcileReason::EventOrderAbsent);
+        return Err(TxError::EpochInsert(DbErr::Custom(
+            "reconcile: no event_order rows after pk-epoch rollback".to_string(),
+        )));
+    }
+
+    Ok(already_registered_result(retained_hash))
+}
+
+/// Returns the sorted, deduplicated set of roots to lock for a delegation.
+/// `retained_hash` (the delegation's own content hash) is always included so
+/// that concurrent identical root delegations — which have no parents and would
+/// otherwise produce an empty lock set — serialize on the same lock.
+fn delegation_guard_roots(retained_hash: Hash, parent_hashes: &[Hash]) -> Vec<Hash> {
+    let mut keys: Vec<Hash> = std::iter::once(retained_hash)
+        .chain(parent_hashes.iter().copied())
+        .collect();
+    keys.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+    keys.dedup();
+    keys
+}
+
+fn is_pk_epoch_conflict(error: &DbErr) -> bool {
+    match error {
+        DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(db_err)))
+        | DbErr::Query(RuntimeErr::SqlxError(SqlxError::Database(db_err))) => {
+            let code_owned = db_err.code();
+            let code = code_owned.as_deref();
+            if code == Some("23505") && db_err.constraint() == Some("pk-epoch") {
+                return true;
+            }
+            // SQLite extended code 1555 = SQLITE_CONSTRAINT_PRIMARYKEY.
+            // The driver omits constraint() for SQLite; match on the table name
+            // in the message ("epoch.") to exclude other tables (e.g. epoch_order).
+            if matches!(code, Some("1555") | Some("2067")) && db_err.message().contains("epoch.") {
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 #[derive(Debug)]
 pub enum InvocationOutcome<R> {
     KvList(Vec<Path>, bool, Option<String>),
@@ -1801,23 +2033,69 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         .into_iter()
         .map(|e| (e.hash(), e))
         .collect::<Vec<(Hash, Event)>>();
+
+    // ── Atomic delegation registration ──────────────────────────────────────
+    // Register all delegations inside this transaction before any epoch rows
+    // are written. This is the authoritative New/Existing decision; the
+    // outcome determines which delegations participate in epoch construction.
+    let mut registered: HashMap<Hash, delegation::DelegationRegistration> = HashMap::new();
+    for (hash, event) in &event_hashes {
+        if let Event::Delegation(d) = event {
+            let reg = delegation::process(db, d, encryption).await?;
+            registered.insert(*hash, reg);
+        }
+    }
+
     let event_spaces = event_spaces(db, &event_hashes).await?;
+
+    // Exclude Existing delegations from epoch construction: they were already
+    // registered in a prior committed transaction and must not create new
+    // epoch, epoch_order, or event_order rows.
+    let event_spaces: HashMap<SpaceId, Vec<&(Hash, Event)>> = event_spaces
+        .into_iter()
+        .filter_map(|(space, events)| {
+            let eligible: Vec<_> = events
+                .into_iter()
+                .filter(|(hash, event)| {
+                    !matches!(event, Event::Delegation(_))
+                        || matches!(
+                            registered.get(hash),
+                            Some(delegation::DelegationRegistration::New(_))
+                        )
+                })
+                .collect();
+            if eligible.is_empty() {
+                None
+            } else {
+                Some((space, eligible))
+            }
+        })
+        .collect();
+
+    // Only New delegations may trigger new space row creation.
     let mut new_spaces = event_hashes
         .iter()
-        .filter_map(|(_, e)| match e {
-            Event::Delegation(d) => Some(d.0.capabilities.iter().filter_map(|c| {
-                match (&c.resource, c.ability.as_ref().as_ref()) {
-                    (Resource::TinyCloud(r), "tinycloud.space/host")
-                        if r.path().is_none()
-                            && r.service().as_str() == "space"
-                            && r.query().is_none()
-                            && r.fragment().is_none() =>
-                    {
-                        Some(SpaceIdWrap(r.space().clone()))
+        .filter_map(|(hash, e)| match e {
+            Event::Delegation(d)
+                if matches!(
+                    registered.get(hash),
+                    Some(delegation::DelegationRegistration::New(_))
+                ) =>
+            {
+                Some(d.0.capabilities.iter().filter_map(|c| {
+                    match (&c.resource, c.ability.as_ref().as_ref()) {
+                        (Resource::TinyCloud(r), "tinycloud.space/host")
+                            if r.path().is_none()
+                                && r.service().as_str() == "space"
+                                && r.query().is_none()
+                                && r.fragment().is_none() =>
+                        {
+                            Some(SpaceIdWrap(r.space().clone()))
+                        }
+                        _ => None,
                     }
-                    _ => None,
-                }
-            })),
+                }))
+            }
             _ => None,
         })
         .flatten()
@@ -2073,9 +2351,12 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         let mut delegation_cids = Vec::new();
         for (hash, event) in event_hashes {
             match event {
-                Event::Delegation(d) => {
-                    let cid = delegation::process(db, *d, encryption).await?;
-                    delegation_cids.push(cid);
+                Event::Delegation(_) => {
+                    // Already registered atomically before epoch construction.
+                    // Do not call delegation::process again.
+                    if let Some(reg) = registered.get(&hash) {
+                        delegation_cids.push(reg.hash());
+                    }
                 }
                 Event::Invocation(i, ops) => {
                     invocation::process(
@@ -2148,14 +2429,15 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             delegation_cids,
         })
     } else {
-        // All spaces were skipped (delegation-only with no existing spaces)
-        // Still process delegation events to save the delegation records
+        // All spaces were skipped (delegation-only with no existing spaces).
+        // Delegations are already registered; collect their CIDs.
         let mut delegation_cids = Vec::new();
-        for (_, event) in event_hashes {
+        for (hash, event) in event_hashes {
             match event {
-                Event::Delegation(d) => {
-                    let cid = delegation::process(db, *d, encryption).await?;
-                    delegation_cids.push(cid);
+                Event::Delegation(_) => {
+                    if let Some(reg) = registered.get(&hash) {
+                        delegation_cids.push(reg.hash());
+                    }
                 }
                 Event::Invocation(i, _ops) => {
                     invocation::process(db, *i, Vec::new(), encryption, auth_graph).await?;
@@ -3869,6 +4151,102 @@ mod test {
     }
 
     #[tokio::test]
+    async fn sqlite_pk_epoch_conflict_matches_live_driver() {
+        let db = get_db().await.unwrap();
+        let space = test_space_id("pk-epoch-conflict");
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        let epoch_id = crate::hash::hash(b"sqlite-pk-epoch-conflict");
+        let model = epoch::ActiveModel {
+            seq: Set(0),
+            id: Set(epoch_id),
+            space: Set(SpaceIdWrap(space.clone())),
+        };
+
+        epoch::Entity::insert(model.clone())
+            .exec(&db.conn)
+            .await
+            .unwrap();
+
+        let error = epoch::Entity::insert(model)
+            .exec(&db.conn)
+            .await
+            .unwrap_err();
+
+        // Sanitized metadata only — never print the full message
+        if let DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(ref db_err)))
+        | DbErr::Query(RuntimeErr::SqlxError(SqlxError::Database(ref db_err))) = error
+        {
+            let code = db_err.code();
+            let constraint = db_err.constraint();
+            let msg_has_pk_epoch = db_err.message().contains("pk-epoch");
+            let msg_has_epoch = db_err.message().contains("epoch");
+            let msg_has_unique =
+                db_err.message().contains("unique") || db_err.message().contains("UNIQUE");
+            eprintln!(
+                "sqlite pk-epoch conflict: code={:?} constraint={:?} msg_has_pk_epoch={} msg_has_epoch={} msg_has_unique={}",
+                code, constraint, msg_has_pk_epoch, msg_has_epoch, msg_has_unique
+            );
+        }
+
+        assert!(
+            is_pk_epoch_conflict(&error),
+            "is_pk_epoch_conflict must return true for a duplicate pk-epoch insert"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_pk_epoch_batch_conflict_matches_live_driver() {
+        let db = get_db().await.unwrap();
+        let space = test_space_id("pk-epoch-batch-conflict");
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        let epoch_id = crate::hash::hash(b"sqlite-pk-epoch-batch-conflict");
+        let model = epoch::ActiveModel {
+            seq: Set(0),
+            id: Set(epoch_id),
+            space: Set(SpaceIdWrap(space.clone())),
+        };
+
+        let error = epoch::Entity::insert_many([model.clone(), model])
+            .exec(&db.conn)
+            .await
+            .unwrap_err();
+
+        // Sanitized metadata only — never print the full message
+        if let DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(ref db_err)))
+        | DbErr::Query(RuntimeErr::SqlxError(SqlxError::Database(ref db_err))) = error
+        {
+            let code = db_err.code();
+            let constraint = db_err.constraint();
+            let msg_has_pk_epoch = db_err.message().contains("pk-epoch");
+            let msg_has_epoch_dot = db_err.message().contains("epoch.");
+            let msg_has_epoch = db_err.message().contains("epoch");
+            let msg_has_unique =
+                db_err.message().contains("unique") || db_err.message().contains("UNIQUE");
+            eprintln!(
+                "sqlite pk-epoch batch conflict: code={:?} constraint={:?} msg_has_pk_epoch={} msg_has_epoch_dot={} msg_has_epoch={} msg_has_unique={}",
+                code, constraint, msg_has_pk_epoch, msg_has_epoch_dot, msg_has_epoch, msg_has_unique
+            );
+        }
+
+        assert!(
+            is_pk_epoch_conflict(&error),
+            "is_pk_epoch_conflict must return true for a batch duplicate pk-epoch insert"
+        );
+    }
+
+    #[tokio::test]
     async fn epoch_insert_for_missing_space_is_fk_violation() {
         let db = get_db().await.unwrap();
         let space = test_space_id("ghost");
@@ -3880,6 +4258,716 @@ mod test {
             id: crate::hash::hash(b"ghost-epoch"),
             space: SpaceIdWrap(space),
         }))
+        .exec(&db.conn)
+        .await
+        .unwrap_err();
+
+        match err {
+            DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(db_err))) => {
+                assert_eq!(
+                    db_err.kind(),
+                    sea_orm::sqlx::error::ErrorKind::ForeignKeyViolation,
+                    "expected a foreign-key violation, got kind {:?} (code {:?})",
+                    db_err.kind(),
+                    db_err.code()
+                );
+            }
+            other => panic!("expected FK database error, got {other:?}"),
+        }
+    }
+
+    /// classifier_miss is the reason recorded when an EpochInsert error is
+    /// *not* recognized by `is_pk_epoch_conflict` — e.g. the FK violation
+    /// above, as opposed to an actual pk-epoch unique-constraint race.
+    #[tokio::test]
+    async fn classifier_miss_reason_recorded_for_non_pk_epoch_epoch_insert_error() {
+        let db = get_db().await.unwrap();
+        let space = test_space_id("classifier-miss-ghost");
+        let err = epoch::Entity::insert(epoch::ActiveModel::from(epoch::Model {
+            seq: 0,
+            id: crate::hash::hash(b"classifier-miss-ghost-epoch"),
+            space: SpaceIdWrap(space),
+        }))
+        .exec(&db.conn)
+        .await
+        .unwrap_err();
+
+        assert!(
+            !is_pk_epoch_conflict(&err),
+            "an FK violation must not be classified as a pk-epoch conflict"
+        );
+
+        let before = EpochReconcileReason::ClassifierMiss.count();
+        record_epoch_reconcile_failure(EpochReconcileReason::ClassifierMiss);
+        assert_eq!(
+            EpochReconcileReason::ClassifierMiss.count(),
+            before + 1,
+            "classifier_miss reason count must increment exactly once"
+        );
+    }
+
+    /// reconcile_read_error is the reason recorded when a read performed
+    /// during reconciliation itself fails at the database layer (as opposed
+    /// to succeeding but finding a state mismatch). A live connection failure
+    /// mid-reconciliation is not practical to reproduce deterministically in
+    /// a unit test, so this proves the counting seam in isolation.
+    #[test]
+    fn reconcile_read_error_reason_count_increments() {
+        let before = EpochReconcileReason::ReconcileReadError.count();
+        record_epoch_reconcile_failure(EpochReconcileReason::ReconcileReadError);
+        assert_eq!(
+            EpochReconcileReason::ReconcileReadError.count(),
+            before + 1,
+            "reconcile_read_error reason count must increment exactly once"
+        );
+    }
+
+    #[test]
+    fn delegation_guard_roots_includes_self_and_deduplicates() {
+        let h = crate::hash::hash;
+        let retained = h(b"self");
+        let parent_a = h(b"parent_a");
+        let parent_b = h(b"parent_b");
+
+        // Empty parent list: exactly the retained hash.
+        let roots = delegation_guard_roots(retained, &[]);
+        assert_eq!(roots, vec![retained]);
+
+        // Existing parents: retained hash + both parents present.
+        let roots = delegation_guard_roots(retained, &[parent_a, parent_b]);
+        assert_eq!(roots.len(), 3);
+        assert!(roots.contains(&retained));
+        assert!(roots.contains(&parent_a));
+        assert!(roots.contains(&parent_b));
+
+        // Duplicate retained hash in parents is deduplicated.
+        let roots = delegation_guard_roots(retained, &[parent_a, retained, parent_b]);
+        assert_eq!(roots.len(), 3, "duplicate retained hash must be deduped");
+        assert!(roots.contains(&retained));
+        assert!(roots.contains(&parent_a));
+        assert!(roots.contains(&parent_b));
+
+        // Duplicate parent is deduplicated.
+        let roots = delegation_guard_roots(retained, &[parent_a, parent_a]);
+        assert_eq!(roots.len(), 2, "duplicate parent must be deduped");
+        assert!(roots.contains(&retained));
+        assert!(roots.contains(&parent_a));
+    }
+
+    // --- precheck helper and already_registered_result tests ---
+
+    async fn insert_delegation_row(db: &sea_orm::DbConn, hash: Hash) {
+        use sea_orm::ActiveModelTrait;
+        for actor_id in ["did:key:a", "did:key:b"] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(db)
+            .await
+            .ok();
+        }
+        delegation::ActiveModel {
+            id: Set(hash),
+            delegator: Set("did:key:a".to_string()),
+            delegatee: Set("did:key:b".to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(hash.as_ref().to_vec()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    // --- already_registered_result precheck tests ---
+
+    /// A delegation row already in the database is returned as durable without
+    /// going through the epoch path: commits is empty, delegation_cids contains
+    /// exactly the retained hash.
+    #[tokio::test]
+    async fn precheck_exact_retained_hash_returns_durable_cid_without_epoch() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"precheck-exact-retained");
+        insert_delegation_row(&db.conn, hash).await;
+
+        // Simulate what delegate() does for the pre-check query.
+        let row = delegation::Entity::find_by_id(hash)
+            .one(&db.conn)
+            .await
+            .expect("query must not fail");
+        assert!(row.is_some(), "row must be present");
+
+        let result = already_registered_result(hash);
+        assert!(result.commits.is_empty(), "no epoch commits expected");
+        assert!(result.skipped_spaces.is_empty());
+        assert_eq!(result.delegation_cids, vec![hash]);
+    }
+
+    /// A hash that has no corresponding delegation row returns None, so the
+    /// pre-check falls through to the normal transact path.
+    #[tokio::test]
+    async fn precheck_absent_hash_does_not_short_circuit() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"precheck-absent");
+
+        let row = delegation::Entity::find_by_id(hash)
+            .one(&db.conn)
+            .await
+            .expect("query must not fail");
+        assert!(
+            row.is_none(),
+            "absent hash must return None — caller proceeds to transact"
+        );
+    }
+
+    /// A different hash that is present must not be confused with the retained
+    /// hash: the pre-check is an exact primary-key lookup.
+    #[tokio::test]
+    async fn precheck_different_hash_does_not_match_retained() {
+        let db = get_db().await.unwrap();
+        let present_hash = crate::hash::hash(b"precheck-different-present");
+        let retained_hash = crate::hash::hash(b"precheck-different-retained");
+        insert_delegation_row(&db.conn, present_hash).await;
+
+        let row = delegation::Entity::find_by_id(retained_hash)
+            .one(&db.conn)
+            .await
+            .expect("query must not fail");
+        assert!(
+            row.is_none(),
+            "a different hash in the table must not satisfy the retained-hash lookup"
+        );
+    }
+
+    // ── Atomic registration tests ────────────────────────────────────────────
+
+    /// When a delegation is already committed to the DB, the ON CONFLICT path
+    /// returns RecordNotInserted (→ DelegationRegistration::Existing).  The
+    /// transact() filter then excludes the Existing delegation from epoch/
+    /// event_order construction, so no new rows are created and the same CID
+    /// is returned.  This test proves the DB-level invariant; the code
+    /// structural proof covers the epoch-filter gate.
+    #[tokio::test]
+    async fn existing_delegation_returns_same_cid_with_no_new_epoch_rows() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"existing-no-epoch-bytes");
+        insert_delegation_row(&db.conn, hash).await;
+
+        let epoch_before = epoch::Entity::find().count(&db.conn).await.unwrap();
+        let event_order_before = event_order::Entity::find().count(&db.conn).await.unwrap();
+
+        // Re-insert via ON CONFLICT DO NOTHING — mimics what delegation::process
+        // (→ save()) does inside transact() for the same serialization bytes.
+        let result = delegation::Entity::insert(delegation::ActiveModel {
+            id: Set(hash),
+            delegator: Set("did:key:a".to_string()),
+            delegatee: Set("did:key:b".to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(hash.as_ref().to_vec()),
+        })
+        .on_conflict(
+            OnConflict::column(delegation::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(&db.conn)
+        .await;
+
+        // The Existing outcome (RecordNotInserted) must be detected.
+        assert!(
+            matches!(result, Err(DbErr::RecordNotInserted)),
+            "committed delegation re-insert must return Existing"
+        );
+
+        // No new epoch or event_order rows — the transact() filter gate on
+        // DelegationRegistration::Existing prevents their creation.
+        assert_eq!(
+            epoch::Entity::find().count(&db.conn).await.unwrap(),
+            epoch_before,
+            "Existing delegation must not create a new epoch row"
+        );
+        assert_eq!(
+            event_order::Entity::find().count(&db.conn).await.unwrap(),
+            event_order_before,
+            "Existing delegation must not create a new event_order row"
+        );
+
+        // The same hash (CID) is still present exactly once.
+        let del_count = delegation::Entity::find()
+            .filter(delegation::Column::Id.eq(hash))
+            .count(&db.conn)
+            .await
+            .unwrap();
+        assert_eq!(del_count, 1, "exactly one delegation row must remain");
+    }
+
+    /// A transaction that claims a delegation (inserts it) but is then rolled
+    /// back must allow a subsequent transaction to see New again — the claim
+    /// rolls back atomically with any other writes in that transaction.
+    #[tokio::test]
+    async fn delegation_claim_rolls_back_so_retry_is_new() {
+        use sea_orm::TransactionTrait;
+
+        let db = get_db().await.unwrap();
+        let ser = b"rollback-delegation-bytes".to_vec();
+        let hash = crate::hash::hash(&ser);
+
+        for actor in ["did:key:rb-owner", "did:key:rb-delegate"] {
+            actor::ActiveModel {
+                id: Set(actor.to_string()),
+            }
+            .insert(&db.conn)
+            .await
+            .ok();
+        }
+
+        // Begin a transaction, insert the delegation row, then roll back.
+        {
+            let tx = db.conn.begin().await.unwrap();
+            delegation::ActiveModel {
+                id: Set(hash),
+                delegator: Set("did:key:rb-owner".to_string()),
+                delegatee: Set("did:key:rb-delegate".to_string()),
+                expiry: Set(None),
+                issued_at: Set(None),
+                not_before: Set(None),
+                facts: Set(None),
+                serialization: Set(ser.clone()),
+            }
+            .insert(&tx)
+            .await
+            .unwrap();
+            tx.rollback().await.unwrap();
+        }
+
+        // The rolled-back row must not be visible outside the transaction.
+        let row = delegation::Entity::find_by_id(hash)
+            .one(&db.conn)
+            .await
+            .unwrap();
+        assert!(
+            row.is_none(),
+            "rolled-back delegation must not be visible after rollback"
+        );
+
+        // A retry in a new transaction must observe New (not Existing).
+        let tx2 = db.conn.begin().await.unwrap();
+        let retry = delegation::Entity::insert(delegation::ActiveModel {
+            id: Set(hash),
+            delegator: Set("did:key:rb-owner".to_string()),
+            delegatee: Set("did:key:rb-delegate".to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(ser),
+        })
+        .on_conflict(
+            OnConflict::column(delegation::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(&tx2)
+        .await;
+        tx2.commit().await.unwrap();
+
+        assert!(
+            !matches!(retry, Err(DbErr::RecordNotInserted)),
+            "retry after rollback must be New, not Existing"
+        );
+    }
+
+    /// Two delegations with distinct serialization bytes produce distinct hashes
+    /// and must not satisfy each other's exact-hash registration predicate.
+    #[tokio::test]
+    async fn distinct_delegations_do_not_satisfy_each_other() {
+        use sea_orm::TransactionTrait;
+
+        let db = get_db().await.unwrap();
+
+        let ser_a = b"distinct-delegation-alpha".to_vec();
+        let ser_b = b"distinct-delegation-beta".to_vec();
+        let hash_a = crate::hash::hash(&ser_a);
+        let hash_b = crate::hash::hash(&ser_b);
+        assert_ne!(
+            hash_a, hash_b,
+            "test precondition: distinct bytes → distinct hashes"
+        );
+
+        for actor in ["did:key:dd-owner", "did:key:dd-delegate"] {
+            actor::ActiveModel {
+                id: Set(actor.to_string()),
+            }
+            .insert(&db.conn)
+            .await
+            .ok();
+        }
+
+        let make_model = |hash: Hash, ser: Vec<u8>| delegation::ActiveModel {
+            id: Set(hash),
+            delegator: Set("did:key:dd-owner".to_string()),
+            delegatee: Set("did:key:dd-delegate".to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(ser),
+        };
+
+        let tx = db.conn.begin().await.unwrap();
+        for (hash, ser) in [(hash_a, ser_a), (hash_b, ser_b)] {
+            delegation::Entity::insert(make_model(hash, ser))
+                .on_conflict(
+                    OnConflict::column(delegation::Column::Id)
+                        .do_nothing()
+                        .to_owned(),
+                )
+                .exec(&tx)
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let row_a = delegation::Entity::find_by_id(hash_a)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("hash_a must be present");
+        let row_b = delegation::Entity::find_by_id(hash_b)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("hash_b must be present");
+
+        assert_ne!(
+            row_a.id, row_b.id,
+            "distinct delegations must not share a primary key"
+        );
+
+        // A compound predicate using one hash against the other must return nothing.
+        let cross_lookup = delegation::Entity::find_by_id(hash_b)
+            .filter(delegation::Column::Id.eq(hash_a))
+            .one(&db.conn)
+            .await
+            .unwrap();
+        assert!(
+            cross_lookup.is_none(),
+            "hash_a must not satisfy hash_b's exact-hash predicate"
+        );
+    }
+
+    // ── Reconciliation tests ─────────────────────────────────────────────────
+
+    /// Build the complete durable state that reconcile_pk_epoch_delegation
+    /// expects for a delegation that was committed by a concurrent winner.
+    async fn insert_complete_delegation_state(
+        db: &sea_orm::DbConn,
+        retained_hash: Hash,
+        space: &crate::types::SpaceIdWrap,
+    ) {
+        // actors
+        for actor_id in ["did:key:rec-owner", "did:key:rec-delegate"] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(db)
+            .await
+            .ok();
+        }
+        // delegation row
+        delegation::Entity::insert(delegation::ActiveModel {
+            id: Set(retained_hash),
+            delegator: Set("did:key:rec-owner".to_string()),
+            delegatee: Set("did:key:rec-delegate".to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(retained_hash.as_ref().to_vec()),
+        })
+        .on_conflict(
+            OnConflict::column(delegation::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(db)
+        .await
+        .ok();
+        // one ability row
+        abilities::Entity::insert(abilities::ActiveModel {
+            delegation: Set(retained_hash),
+            resource: Set("tinycloud:did:key:rec-owner:files/kv/doc".parse().unwrap()),
+            ability: Set("tinycloud.kv/put".to_string().try_into().unwrap()),
+            caveats: Set(Default::default()),
+        })
+        .exec(db)
+        .await
+        .unwrap();
+        // space row
+        space::Entity::insert(space::ActiveModel::from(space::Model { id: space.clone() }))
+            .on_conflict(
+                OnConflict::column(space::Column::Id)
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec(db)
+            .await
+            .ok();
+        // epoch row
+        let epoch_id = crate::hash::hash(b"reconcile-epoch");
+        epoch::Entity::insert(epoch::ActiveModel {
+            seq: Set(0),
+            id: Set(epoch_id),
+            space: Set(space.clone()),
+        })
+        .on_conflict(
+            OnConflict::columns([epoch::Column::Id, epoch::Column::Space])
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(db)
+        .await
+        .ok();
+        // event_order row
+        event_order::Entity::insert(event_order::ActiveModel {
+            seq: Set(0),
+            epoch: Set(epoch_id),
+            epoch_seq: Set(0),
+            event: Set(retained_hash),
+            space: Set(space.clone()),
+        })
+        .exec(db)
+        .await
+        .unwrap();
+    }
+
+    /// Reconciliation succeeds when all rows are durably present and consistent.
+    #[tokio::test]
+    async fn reconcile_succeeds_when_state_is_complete_and_consistent() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"reconcile-complete-bytes");
+        let space = crate::types::SpaceIdWrap(test_space_id("reconcile-complete"));
+
+        insert_complete_delegation_state(&db.conn, hash, &space).await;
+
+        let result = reconcile_pk_epoch_delegation::<_, MemoryStore, StaticSecret>(
+            &db.conn, hash, 1, // one ability
+            0, // zero parents
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "reconciliation must succeed when state is complete"
+        );
+        let tr = result.unwrap_or_else(|_| panic!("must be ok"));
+        assert_eq!(
+            tr.delegation_cids,
+            vec![hash],
+            "must return the retained CID"
+        );
+    }
+
+    /// Reconciliation performs zero writes: calling it again after success still
+    /// observes the same single row set (no duplicates introduced).
+    #[tokio::test]
+    async fn reconcile_is_read_only_zero_writes() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"reconcile-zero-writes-bytes");
+        let space = crate::types::SpaceIdWrap(test_space_id("reconcile-zero-writes"));
+
+        insert_complete_delegation_state(&db.conn, hash, &space).await;
+
+        let del_before = delegation::Entity::find().count(&db.conn).await.unwrap();
+        let ab_before = abilities::Entity::find().count(&db.conn).await.unwrap();
+        let eo_before = event_order::Entity::find().count(&db.conn).await.unwrap();
+        let ep_before = epoch::Entity::find().count(&db.conn).await.unwrap();
+
+        let result =
+            reconcile_pk_epoch_delegation::<_, MemoryStore, StaticSecret>(&db.conn, hash, 1, 0)
+                .await;
+        assert!(result.is_ok(), "reconciliation must succeed");
+
+        assert_eq!(
+            delegation::Entity::find().count(&db.conn).await.unwrap(),
+            del_before,
+            "reconciliation must not write delegation rows"
+        );
+        assert_eq!(
+            abilities::Entity::find().count(&db.conn).await.unwrap(),
+            ab_before,
+            "reconciliation must not write ability rows"
+        );
+        assert_eq!(
+            event_order::Entity::find().count(&db.conn).await.unwrap(),
+            eo_before,
+            "reconciliation must not write event_order rows"
+        );
+        assert_eq!(
+            epoch::Entity::find().count(&db.conn).await.unwrap(),
+            ep_before,
+            "reconciliation must not write epoch rows"
+        );
+    }
+
+    /// Negative: delegation row absent → reconciliation returns EpochInsert error.
+    #[tokio::test]
+    async fn reconcile_fails_when_delegation_row_absent() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"reconcile-no-deleg");
+        let before = EpochReconcileReason::DelegationAbsent.count();
+
+        let result =
+            reconcile_pk_epoch_delegation::<_, MemoryStore, StaticSecret>(&db.conn, hash, 0, 0)
+                .await;
+        assert!(
+            matches!(result, Err(TxError::EpochInsert(_))),
+            "absent delegation row must return EpochInsert",
+        );
+        assert_eq!(
+            EpochReconcileReason::DelegationAbsent.count(),
+            before + 1,
+            "delegation_absent reason count must increment exactly once"
+        );
+    }
+
+    /// Negative: delegation row present but ability count mismatches expected.
+    #[tokio::test]
+    async fn reconcile_fails_when_ability_count_wrong() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"reconcile-wrong-ability-count");
+        let space = crate::types::SpaceIdWrap(test_space_id("reconcile-wrong-ability"));
+
+        insert_complete_delegation_state(&db.conn, hash, &space).await;
+        let before = EpochReconcileReason::AbilityMismatch.count();
+        // State has 1 ability; we claim 2 expected → mismatch.
+        let result = reconcile_pk_epoch_delegation::<_, MemoryStore, StaticSecret>(
+            &db.conn, hash, 2, // wrong
+            0,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(TxError::EpochInsert(_))),
+            "ability count mismatch must return EpochInsert",
+        );
+        assert_eq!(
+            EpochReconcileReason::AbilityMismatch.count(),
+            before + 1,
+            "ability_mismatch reason count must increment exactly once"
+        );
+    }
+
+    /// Negative: delegation row present, ability count correct, but parent count
+    /// mismatches (state has no parents, we expect one).
+    #[tokio::test]
+    async fn reconcile_fails_when_parent_count_wrong() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"reconcile-wrong-parent-count");
+        let space = crate::types::SpaceIdWrap(test_space_id("reconcile-wrong-parent"));
+
+        insert_complete_delegation_state(&db.conn, hash, &space).await;
+        let before = EpochReconcileReason::ParentMismatch.count();
+        let result = reconcile_pk_epoch_delegation::<_, MemoryStore, StaticSecret>(
+            &db.conn, hash, 1, 1, // wrong: state has zero parents
+        )
+        .await;
+        assert!(
+            matches!(result, Err(TxError::EpochInsert(_))),
+            "parent count mismatch must return EpochInsert",
+        );
+        assert_eq!(
+            EpochReconcileReason::ParentMismatch.count(),
+            before + 1,
+            "parent_mismatch reason count must increment exactly once"
+        );
+    }
+
+    /// Negative: delegation row and ability present, but no event_order row.
+    #[tokio::test]
+    async fn reconcile_fails_when_event_order_absent() {
+        let db = get_db().await.unwrap();
+        let hash = crate::hash::hash(b"reconcile-no-event-order");
+
+        for actor_id in ["did:key:reo-owner", "did:key:reo-delegate"] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(&db.conn)
+            .await
+            .ok();
+        }
+        // Insert delegation and one ability — no event_order row.
+        delegation::Entity::insert(delegation::ActiveModel {
+            id: Set(hash),
+            delegator: Set("did:key:reo-owner".to_string()),
+            delegatee: Set("did:key:reo-delegate".to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(hash.as_ref().to_vec()),
+        })
+        .on_conflict(
+            OnConflict::column(delegation::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(&db.conn)
+        .await
+        .ok();
+        abilities::Entity::insert(abilities::ActiveModel {
+            delegation: Set(hash),
+            resource: Set("tinycloud:did:key:reo-owner:files/kv/doc".parse().unwrap()),
+            ability: Set("tinycloud.kv/put".to_string().try_into().unwrap()),
+            caveats: Set(Default::default()),
+        })
+        .exec(&db.conn)
+        .await
+        .unwrap();
+
+        let before = EpochReconcileReason::EventOrderAbsent.count();
+        let result =
+            reconcile_pk_epoch_delegation::<_, MemoryStore, StaticSecret>(&db.conn, hash, 1, 0)
+                .await;
+        assert!(
+            matches!(result, Err(TxError::EpochInsert(_))),
+            "absent event_order must return EpochInsert",
+        );
+        assert_eq!(
+            EpochReconcileReason::EventOrderAbsent.count(),
+            before + 1,
+            "event_order_absent reason count must increment exactly once"
+        );
+    }
+
+    /// Proves the schema invariant that reconcile_pk_epoch_delegation relies
+    /// on to skip a per-event_order epoch existence re-check: the composite
+    /// foreign key on event_order.(epoch, space) -> epoch.(id, space) makes
+    /// it impossible to durably commit an event_order row whose epoch is
+    /// absent for that space. If this test ever starts failing (the insert
+    /// below stops being rejected), the removed check must be restored.
+    #[tokio::test]
+    async fn event_order_epoch_space_fk_rejects_row_with_no_matching_epoch() {
+        let db = get_db().await.unwrap();
+        let space = crate::types::SpaceIdWrap(test_space_id("event-order-fk-space"));
+        space::Entity::insert(space::ActiveModel::from(space::Model { id: space.clone() }))
+            .exec(&db.conn)
+            .await
+            .unwrap();
+
+        let missing_epoch_id = crate::hash::hash(b"event-order-fk-missing-epoch");
+        let err = event_order::Entity::insert(event_order::ActiveModel {
+            seq: Set(0),
+            epoch: Set(missing_epoch_id),
+            epoch_seq: Set(0),
+            event: Set(crate::hash::hash(b"event-order-fk-event")),
+            space: Set(space),
+        })
         .exec(&db.conn)
         .await
         .unwrap_err();

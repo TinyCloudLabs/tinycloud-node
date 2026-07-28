@@ -17,7 +17,7 @@ use rocket::{
     State,
 };
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{net::IpAddr, time::Duration};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_core::{
     hash::Blake3Hasher,
@@ -220,6 +220,7 @@ pub async fn create_webhook(
     webhook_encryption: &State<ColumnEncryption>,
 ) -> Result<Json<HookWebhookResponse>, (Status, String)> {
     let normalized = normalize_webhook_request(&request)?;
+    let callback_url = validate_webhook_callback_url(&request.callback_url).await?;
     if !is_hook_action_authorized(&invocation.0 .0, &normalized, "tinycloud.hooks/register") {
         return Err((
             Status::Forbidden,
@@ -245,7 +246,7 @@ pub async fn create_webhook(
         id: hook_subscription_id(
             &invocation.0 .0.invoker,
             &normalized,
-            &request.callback_url,
+            callback_url.as_str(),
             &created_at,
         ),
         subscriber_did: invocation.0 .0.invoker.clone(),
@@ -253,7 +254,7 @@ pub async fn create_webhook(
         target_service: normalized.service.clone(),
         path_prefix: normalized.path_prefix.clone(),
         abilities_json: hook_subscription::Model::set_abilities(&normalized.abilities),
-        callback_url: request.callback_url.clone(),
+        callback_url: callback_url.to_string(),
         encrypted_secret: webhook_encryption.encrypt(request.secret.as_bytes()),
         secret_key_id: HOOK_WEBHOOK_SECRET_KEY_ID.to_string(),
         active: true,
@@ -441,10 +442,126 @@ pub fn normalize_webhook_request(
         return Err((Status::BadRequest, "secret is required".to_string()));
     }
 
-    reqwest::Url::parse(&request.callback_url)
+    let url = reqwest::Url::parse(&request.callback_url)
         .map_err(|e| (Status::BadRequest, format!("invalid callbackUrl: {e}")))?;
+    validate_webhook_url_shape(&url)?;
 
     Ok(subscription)
+}
+
+fn validate_webhook_url_shape(url: &reqwest::Url) -> Result<(), (Status, String)> {
+    if url.scheme() != "https"
+        || url.username() != ""
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.port_or_known_default() != Some(443)
+    {
+        return Err((
+            Status::BadRequest,
+            "callbackUrl must be canonical HTTPS on port 443 without userinfo or fragments"
+                .to_string(),
+        ));
+    }
+    let Some(host) = url.host_str() else {
+        return Err((
+            Status::BadRequest,
+            "callbackUrl host is required".to_string(),
+        ));
+    };
+    if host.is_empty() || host.contains('.') && host.ends_with('.') {
+        return Err((
+            Status::BadRequest,
+            "callbackUrl host is not canonical".to_string(),
+        ));
+    }
+    if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
+        if blocked_webhook_ip(ip) {
+            return Err((
+                Status::BadRequest,
+                "callbackUrl resolves to a reserved address".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn blocked_webhook_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            let first = octets[0];
+            let second = octets[1];
+            (first == 0)
+                || (first == 10)
+                || (first == 100 && (64..=127).contains(&second))
+                || (first == 127)
+                || (first == 169 && second == 254)
+                || (first == 172 && (16..=31).contains(&second))
+                || (first == 192 && (second == 0 || second == 2 || second == 168))
+                || (first == 192 && second == 88 && octets[2] == 99)
+                || (first == 198 && (second == 18 || second == 19 || second == 51))
+                || (first == 203 && second == 0 && octets[2] == 113)
+                || first >= 224
+        }
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_multicast()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| blocked_webhook_ip(mapped.into()))
+        }
+    }
+}
+
+pub async fn validate_webhook_callback_url(
+    callback_url: &str,
+) -> Result<reqwest::Url, (Status, String)> {
+    let url = reqwest::Url::parse(callback_url)
+        .map_err(|e| (Status::BadRequest, format!("invalid callbackUrl: {e}")))?;
+    #[cfg(test)]
+    if url.scheme() == "http"
+        && url
+            .host_str()
+            .and_then(|host| host.trim_matches(['[', ']']).parse::<IpAddr>().ok())
+            .is_some_and(|ip| ip.is_loopback())
+    {
+        return Ok(url);
+    }
+    validate_webhook_url_shape(&url)?;
+    let host = url.host_str().ok_or_else(|| {
+        (
+            Status::BadRequest,
+            "callbackUrl host is required".to_string(),
+        )
+    })?;
+    let port = url
+        .port_or_known_default()
+        .expect("HTTPS has a default port");
+    let addresses = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|_| {
+            (
+                Status::BadRequest,
+                "callbackUrl host cannot be resolved".to_string(),
+            )
+        })?
+        .collect::<Vec<_>>();
+    if addresses.is_empty()
+        || addresses
+            .iter()
+            .any(|address| blocked_webhook_ip(address.ip()))
+    {
+        return Err((
+            Status::BadRequest,
+            "callbackUrl resolves to a reserved address".to_string(),
+        ));
+    }
+    Ok(url)
 }
 
 pub fn webhook_response_from_model(
@@ -624,6 +741,48 @@ mod tests {
 
         let normalized = normalize_webhook_request(&request).expect("valid webhook request");
         assert_eq!(normalized.path_prefix.as_deref(), Some("documents"));
+    }
+
+    #[test]
+    fn rejects_webhook_urls_that_cross_the_egress_boundary() {
+        for callback_url in [
+            "http://example.com/hooks",
+            "https://user:password@example.com/hooks",
+            "https://example.com:8443/hooks",
+            "https://127.0.0.1/hooks",
+            "https://[::1]/hooks",
+            "https://example.com/hooks#fragment",
+        ] {
+            let request = HookWebhookRequest {
+                space: "tinycloud:space".to_string(),
+                service: "kv".to_string(),
+                path_prefix: None,
+                abilities: vec!["tinycloud.kv/put".to_string()],
+                callback_url: callback_url.to_string(),
+                secret: "dev-secret".to_string(),
+            };
+            assert!(
+                normalize_webhook_request(&request).is_err(),
+                "{callback_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_private_and_reserved_webhook_addresses() {
+        for address in [
+            "10.0.0.1",
+            "100.64.0.1",
+            "192.0.2.1",
+            "198.18.0.1",
+            "203.0.113.1",
+            "fc00::1",
+            "fe80::1",
+            "2001:db8::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(blocked_webhook_ip(address.parse().unwrap()), "{address}");
+        }
     }
 
     #[tokio::test]

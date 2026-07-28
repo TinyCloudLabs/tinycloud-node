@@ -486,6 +486,20 @@ fn validate_scope(scope: &ShareScope) -> Result<(), DataPlaneError> {
             Ok(())
         }
         (
+            ShareAction::KvMetadata,
+            ExactResource::Kv {
+                path: resource_path,
+            },
+            ContentSource::Kv { action, path, .. },
+        ) if matches!(
+            action,
+            KvGetAction::Get | KvGetAction::List | KvGetAction::Put
+        ) && scope_action_allowed(scope)
+            && same_or_descendant(path, resource_path) =>
+        {
+            Ok(())
+        }
+        (
             ShareAction::KvList,
             ExactResource::KvPrefix {
                 path: resource_path,

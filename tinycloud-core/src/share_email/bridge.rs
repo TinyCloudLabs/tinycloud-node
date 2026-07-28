@@ -768,28 +768,24 @@ fn scope_is_attenuation(ceiling: &ShareScope, request: &ShareScope) -> bool {
             super::types::ExactResource::KvPrefix { path: prefix },
             super::types::ExactResource::KvPrefix { path: requested },
             super::types::ShareAction::KvList,
-        ) => same_or_descendant_path(prefix, requested),
+        ) => prefix == requested,
         (
             super::types::ExactResource::KvPrefix { path: prefix },
             super::types::ExactResource::Kv { path: requested },
-            super::types::ShareAction::KvGet,
-        ) => same_or_descendant_path(prefix, requested),
+            super::types::ShareAction::KvGet | super::types::ShareAction::KvMetadata,
+        ) => super::types::is_direct_child_path(prefix, requested),
         (
             super::types::ExactResource::KvPrefix { path: prefix },
             super::types::ExactResource::Kv { path: requested },
             super::types::ShareAction::KvPut,
         ) => super::types::is_direct_child_path(prefix, requested),
+        (
+            super::types::ExactResource::Kv { path: left },
+            super::types::ExactResource::Kv { path: right },
+            action,
+        ) => !action.is_list() && left == right,
         (left, right, _) => left == right,
     }
-}
-
-fn same_or_descendant_path(prefix: &super::types::Path, candidate: &super::types::Path) -> bool {
-    prefix.as_str().is_empty()
-        || prefix.as_str() == candidate.as_str()
-        || candidate
-            .as_str()
-            .strip_prefix(prefix.as_str())
-            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 impl DatabaseAuthorityBridge117 {
