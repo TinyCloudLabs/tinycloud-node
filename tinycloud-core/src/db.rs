@@ -2207,21 +2207,27 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     // If all spaces were filtered out, we still process delegations below
     // but skip epoch/event ordering creation
     if !event_spaces.is_empty() {
-        // get max sequence for each of the spaces
-        let mut max_seqs = event_order::Entity::find()
-            .filter(event_order::Column::Space.is_in(event_spaces.keys().cloned().map(SpaceIdWrap)))
-            .select_only()
-            .column(event_order::Column::Space)
-            .column_as(event_order::Column::Seq.max(), "max_seq")
-            .group_by(event_order::Column::Space)
-            .into_tuple::<(SpaceIdWrap, i64)>()
-            .all(db)
-            .await?
-            .into_iter()
-            .fold(HashMap::new(), |mut m, (space, seq)| {
-                m.insert(space, seq + 1);
-                m
-            });
+        // Next per-space sequence: one ungrouped MAX(seq) query per space
+        // (spaces per commit are ~1). A grouped `GROUP BY space` aggregate gets
+        // no min/max index shortcut and scans the index range per write; the
+        // ungrouped form gets the O(log n) backward index probe on
+        // `idx_event_order_space_seq`. Spaces with no events yield NULL and stay
+        // absent from the map, so the later `.remove().unwrap_or(0)` still starts
+        // them at sequence 0 — matching the grouped query's empty-group behavior.
+        let mut max_seqs: HashMap<SpaceIdWrap, i64> = HashMap::new();
+        for space in event_spaces.keys() {
+            let max_seq = event_order::Entity::find()
+                .filter(event_order::Column::Space.eq(SpaceIdWrap(space.clone())))
+                .select_only()
+                .column_as(event_order::Column::Seq.max(), "max_seq")
+                .into_tuple::<Option<i64>>()
+                .one(db)
+                .await?
+                .flatten();
+            if let Some(seq) = max_seq {
+                max_seqs.insert(SpaceIdWrap(space.clone()), seq + 1);
+            }
+        }
 
         // get 'most recent' epochs for each of the spaces
         let mut most_recent = epoch::Entity::find()
