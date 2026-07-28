@@ -50,6 +50,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_with = { version = "3.0", features = ["base64", "hex"] }
 sha2 = "0.10"
+serde_ipld_dagcbor.workspace = true
 toml = "0.8"
 thiserror = "2.0"
 time.workspace = true
@@ -80,6 +81,14 @@ core-foundation-sys = "0.8.6"
 security-framework = { version = "2.11.1", features = ["OSX_10_15"] }
 security-framework-sys = { version = "2.11.1", features = ["OSX_10_15"] }
 
+[target.'cfg(target_env = "musl")'.dependencies]
+# musl's mallocng is a well-known multi-threaded throughput ceiling and the
+# shipped Docker image (rust:alpine, Dockerfile) is statically linked against
+# it. `default-features = false` drops `background_threads_runtime_support`,
+# which tikv-jemalloc-sys' build script explicitly lists as unsupported on
+# musl (NO_BG_THREAD_TARGETS).
+tikv-jemallocator = { version = "0.7", optional = true, default-features = false }
+
 [dependencies.tinycloud-core]
 path = "../tinycloud-core/"
 default-features = false
@@ -102,13 +111,23 @@ uuid = { version = "1", features = ["v4"] }
 x509-parser = "0.16"
 
 [features]
-default = []
+default = ["jemalloc"]
+# Global allocator swap for musl (see the target-scoped tikv-jemallocator dep
+# above). A no-op on targets where the dependency isn't in the graph (e.g.
+# macOS dev hosts, glibc Linux).
+jemalloc = ["dep:tikv-jemallocator"]
 dstack = []
 duckdb = ["tinycloud-core/duckdb"]
 tc-bench-v1 = []
 # Enables only the hermetic mounted fixture's placeholder trust identities.
 # This feature is never part of a production build.
 mounted-fixture = []
+# Enables a deterministic, key-derived TeeContext for /share/v2 on hosts with
+# no real dstack TEE (local dev, canonical local-launch harnesses). It never
+# reads fixture material or static capabilities — the identity is derived
+# from the same node key material real deployments use. This feature is
+# never part of a production build; see Dockerfile CARGO_FEATURES.
+local-tee = []
 
 # cargo-dist metadata
 [package.metadata.dist]

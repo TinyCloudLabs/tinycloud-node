@@ -1,0 +1,806 @@
+{
+  "provenance": {
+    "generator": "packages/sdk-core/src/delegations/fixtures/generate-share-v2-corpus.ts",
+    "generatorVersion": "1.0.0",
+    "sdkCommit": "45f79a612b942a838ce76614a673999a73cfe039",
+    "algorithm": "sha256",
+    "encoding": "base64url-unpadded",
+    "canonicalization": "jcs-utf8-sorted-keys",
+    "note": "Node-authored bytes (registration/delivery receipts, policy challenge/session, /invoke responses) are signed with a deterministic simulated Node key (see module docstring) and are gated by the real SDK production verifiers, not hand-reconstructed. Holder- and share-key-authored bytes are produced entirely by production SDK code."
+  },
+  "vectors": {
+    "registrationPolicy": {
+      "description": "Canonical owner-share policy bytes signed by the delegated share key (production canonicalOwnerSharePolicy).",
+      "producedBy": [
+        "owner-policy.ts:canonicalOwnerSharePolicy"
+      ],
+      "value": {
+        "policy": {
+          "type": "TinyCloudSharePolicy",
+          "version": 2,
+          "shareId": "share-v2-corpus-registration",
+          "ownerDid": "did:pkh:eip155:1:0x1111111111111111111111111111111111111111",
+          "shareKeyDid": "did:key:z6MkmHSmMcWJVnpJMuDvyRmH1eqVMjkEFiHTPc7SedEtjxan",
+          "recipientMatcher": {
+            "kind": "emailDomain",
+            "value": "example.com"
+          },
+          "target": {
+            "origin": "https://node.example.corpus",
+            "nodeAudience": "did:web:node.example.corpus",
+            "enforcerDid": "did:key:z6MkggtHVWQUGJ3FVjJKXeb5oZThQvLmJVMV8hfNUz4ezcav",
+            "spaceId": "tinycloud:pkh:eip155:1:0x1111111111111111111111111111111111111111:default"
+          },
+          "resource": {
+            "kind": "exact",
+            "path": "documents/plan.md"
+          },
+          "actions": [
+            "tinycloud.kv/get",
+            "tinycloud.kv/metadata"
+          ],
+          "contentSource": {
+            "kind": "kv",
+            "space": "tinycloud:pkh:eip155:1:0x1111111111111111111111111111111111111111:default",
+            "path": "documents/plan.md",
+            "action": "tinycloud.kv/get"
+          },
+          "contentSourceDigest": "v26rdFCwMcLoLgxwrP4IyMDtpKG4ZV_fpz3Esysvtdg",
+          "ownerDelegationCid": "bafyowner4registrationcorpusvector",
+          "expiresAt": "2099-01-01T00:00:00.000Z"
+        },
+        "canonicalBytesBase64Url": "eyJkb21haW4iOiJ4eXoudGlueWNsb3VkLnNoYXJlL3BvbGljeS92Mlx1MDAwMCIsInBvbGljeSI6eyJhY3Rpb25zIjpbInRpbnljbG91ZC5rdi9nZXQiLCJ0aW55Y2xvdWQua3YvbWV0YWRhdGEiXSwiY29udGVudFNvdXJjZSI6eyJhY3Rpb24iOiJ0aW55Y2xvdWQua3YvZ2V0Iiwia2luZCI6Imt2IiwicGF0aCI6ImRvY3VtZW50cy9wbGFuLm1kIiwic3BhY2UiOiJ0aW55Y2xvdWQ6cGtoOmVpcDE1NToxOjB4MTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTpkZWZhdWx0In0sImNvbnRlbnRTb3VyY2VEaWdlc3QiOiJ2MjZyZEZDd01jTG9MZ3h3clA0SXlNRHRwS0c0WlZfZnB6M0VzeXN2dGRnIiwiZXhwaXJlc0F0IjoiMjA5OS0wMS0wMVQwMDowMDowMC4wMDBaIiwib3duZXJEZWxlZ2F0aW9uQ2lkIjoiYmFmeW93bmVyNHJlZ2lzdHJhdGlvbmNvcnB1c3ZlY3RvciIsIm93bmVyRGlkIjoiZGlkOnBraDplaXAxNTU6MToweDExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTEiLCJyZWNpcGllbnRNYXRjaGVyIjp7ImtpbmQiOiJlbWFpbERvbWFpbiIsInZhbHVlIjoiZXhhbXBsZS5jb20ifSwicmVzb3VyY2UiOnsia2luZCI6ImV4YWN0IiwicGF0aCI6ImRvY3VtZW50cy9wbGFuLm1kIn0sInNoYXJlSWQiOiJzaGFyZS12Mi1jb3JwdXMtcmVnaXN0cmF0aW9uIiwic2hhcmVLZXlEaWQiOiJkaWQ6a2V5Ono2TWttSFNtTWNXSlZucEpNdUR2eVJtSDFlcVZNamtFRmlIVFBjN1NlZEV0anhhbiIsInRhcmdldCI6eyJlbmZvcmNlckRpZCI6ImRpZDprZXk6ejZNa2dndEhWV1FVR0ozRlZqSktYZWI1b1pUaFF2TG1KVk1WOGhmTlV6NGV6Y2F2Iiwibm9kZUF1ZGllbmNlIjoiZGlkOndlYjpub2RlLmV4YW1wbGUuY29ycHVzIiwib3JpZ2luIjoiaHR0cHM6Ly9ub2RlLmV4YW1wbGUuY29ycHVzIiwic3BhY2VJZCI6InRpbnljbG91ZDpwa2g6ZWlwMTU1OjE6MHgxMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExOmRlZmF1bHQifSwidHlwZSI6IlRpbnlDbG91ZFNoYXJlUG9saWN5IiwidmVyc2lvbiI6Mn19",
+        "cid": "bafkreif45ozprbpnssttbkugyu7hsju4qhmrcdi5d246ktxqugj7rgyeee",
+        "digest": "vOuy-IXtlKcwqobFPnkmnIHZEQ0dHrnlTvChk_ibBCE",
+        "proof": "a5yN9JPTsncELucgqxWbRP-LHwlJtJjkomlUaHKVyBLYLFF1IwqlwvAVMB9k2yhCJz-pRHWO_VcwuOA_NcWsAg"
+      },
+      "digest": "vyPxV6BNFmApfNxPqOOEMSb7DvH1u1DPHX-GyfM5j5M"
+    },
+    "registrationEnforcementDelegation": {
+      "description": "Runtime (enforcement) delegation issued live by the share key at share-creation time, binding the owner delegation to the enforcer (production createPolicyEnforcementDelegation).",
+      "producedBy": [
+        "owner-policy.ts:createPolicyEnforcementDelegation"
+      ],
+      "value": {
+        "cid": "bafkreiecg2cy4mkcq7eueorkumzplvqanlfbuu6sooxhedxtytzl37exj4",
+        "dagCbor": "omZkb21haW54Knh5ei50aW55Y2xvdWQuc2hhcmUvcG9saWN5LWVuZm9yY2VtZW50L3YyAGh1bnNpZ25lZKVkdHlwZXgfVGlueUNsb3VkU2hhcmVQb2xpY3lFbmZvcmNlbWVudGVmYWN0c6tkcGF0aHFkb2N1bWVudHMvcGxhbi5tZGdhY3Rpb25zgnB0aW55Y2xvdWQua3YvZ2V0dXRpbnljbG91ZC5rdi9tZXRhZGF0YWdzaGFyZUlkeBxzaGFyZS12Mi1jb3JwdXMtcmVnaXN0cmF0aW9uZ3NwYWNlSWR4SXRpbnljbG91ZDpwa2g6ZWlwMTU1OjE6MHgxMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExOmRlZmF1bHRpZXhwaXJlc0F0eBgyMDk5LTAxLTAxVDAwOjAwOjAwLjAwMFppcG9saWN5Q2lkeDtiYWZrcmVpZjQ1b3pwcmJwbnNzdHRia3VneXU3aHNqdTRxaG1yY2RpNWQyNDZrdHhxdWdqN3JneWVlZWtlbmZvcmNlckRpZHg4ZGlkOmtleTp6Nk1rZ2d0SFZXUVVHSjNGVmpKS1hlYjVvWlRoUXZMbUpWTVY4aGZOVXo0ZXpjYXZrc2hhcmVLZXlEaWR4OGRpZDprZXk6ejZNa21IU21NY1dKVm5wSk11RHZ5Um1IMWVxVk1qa0VGaUhUUGM3U2VkRXRqeGFubG5vZGVBdWRpZW5jZXgbZGlkOndlYjpub2RlLmV4YW1wbGUuY29ycHVzcm93bmVyRGVsZWdhdGlvbkNpZHgiYmFmeW93bmVyNHJlZ2lzdHJhdGlvbmNvcnB1c3ZlY3RvcnNjb250ZW50U291cmNlRGlnZXN0eCt2MjZyZEZDd01jTG9MZ3h3clA0SXlNRHRwS0c0WlZfZnB6M0VzeXN2dGRnZ3ZlcnNpb24CaWlzc3VlckRpZHg4ZGlkOmtleTp6Nk1rbUhTbU1jV0pWbnBKTXVEdnlSbUgxZXFWTWprRUZpSFRQYzdTZWRFdGp4YW5rYXVkaWVuY2VEaWR4OGRpZDprZXk6ejZNa2dndEhWV1FVR0ozRlZqSktYZWI1b1pUaFF2TG1KVk1WOGhmTlV6NGV6Y2F2",
+        "issuerDid": "did:key:z6MkmHSmMcWJVnpJMuDvyRmH1eqVMjkEFiHTPc7SedEtjxan",
+        "audienceDid": "did:key:z6MkggtHVWQUGJ3FVjJKXeb5oZThQvLmJVMV8hfNUz4ezcav",
+        "facts": {
+          "ownerDelegationCid": "bafyowner4registrationcorpusvector",
+          "policyCid": "bafkreif45ozprbpnssttbkugyu7hsju4qhmrcdi5d246ktxqugj7rgyeee",
+          "shareId": "share-v2-corpus-registration",
+          "shareKeyDid": "did:key:z6MkmHSmMcWJVnpJMuDvyRmH1eqVMjkEFiHTPc7SedEtjxan",
+          "enforcerDid": "did:key:z6MkggtHVWQUGJ3FVjJKXeb5oZThQvLmJVMV8hfNUz4ezcav",
+          "nodeAudience": "did:web:node.example.corpus",
+          "spaceId": "tinycloud:pkh:eip155:1:0x1111111111111111111111111111111111111111:default",
+          "path": "documents/plan.md",
+          "actions": [
+            "tinycloud.kv/get",
+            "tinycloud.kv/metadata"
+          ],
+          "contentSourceDigest": "v26rdFCwMcLoLgxwrP4IyMDtpKG4ZV_fpz3Esysvtdg",
+          "expiresAt": "2099-01-01T00:00:00.000Z"
+        },
+        "signature": "_eQD2rqS4xM2FoKG0aQQR_879Y6Bbz7funSZNHRYheePqbxnDmdMJeDZDJncG9aXYo2c4yrJzsbukv0KMHiqDw"
+      },
+      "digest": "MFx1vpODgShl0YdB8m0ouCP55bvUufA0dapVyooiE4Q"
+    },
+    "registrationReceiptResponse": {
+      "description": "Exact UTF-8 bytes of a POST /share/v2/policies response, accepted unchanged by the production verifier (validateOwnerSharePolicyRegistrationBytes).",
+      "producedBy": [
+        "owner-policy.ts:computeOwnerShareRegistrationCid",
+        "owner-policy.ts:validateOwnerSharePolicyRegistrationBytes"
+      ],
+      "value": {
+        "bodyBase64Url": "eyJyZWdpc3RyYXRpb24iOnsicmVnaXN0cmF0aW9uQ2lkIjoiYmFma3JlaWN6NGV6b2NzeTR6bG82NHRrMzJpZHlyb3diYmR6dnhpN2wyZnl3dWtodDIzYnpuaHFkcmEiLCJwb2xpY3lDaWQiOiJiYWZrcmVpZjQ1b3pwcmJwbnNzdHRia3VneXU3aHNqdTRxaG1yY2RpNWQyNDZrdHhxdWdqN3JneWVlZSIsIm93bmVyRGVsZWdhdGlvbkNpZCI6ImJhZnlvd25lcjRyZWdpc3RyYXRpb25jb3JwdXN2ZWN0b3IiLCJlbmZvcmNlbWVudERlbGVnYXRpb25DaWQiOiJiYWZrcmVpZWNnMmN5NG1rY3E3ZXVlb3JrdW16cGx2cWFubGZidXU2c29veGhlZHh0eXR6bDM3ZXhqNCIsIm93bmVyRGlkIjoiZGlkOnBraDplaXAxNTU6MToweDExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTEiLCJzaGFyZUtleURpZCI6ImRpZDprZXk6ejZNa21IU21NY1dKVm5wSk11RHZ5Um1IMWVxVk1qa0VGaUhUUGM3U2VkRXRqeGFuIiwiZW5mb3JjZXJEaWQiOiJkaWQ6a2V5Ono2TWtnZ3RIVldRVUdKM0ZWakpLWGViNW9aVGhRdkxtSlZNVjhoZk5VejRlemNhdiIsInNoYXJlSWQiOiJzaGFyZS12Mi1jb3JwdXMtcmVnaXN0cmF0aW9uIiwicmVjaXBpZW50TWF0Y2hlciI6eyJraW5kIjoiZW1haWxEb21haW4iLCJ2YWx1ZSI6ImV4YW1wbGUuY29tIn0sInRhcmdldCI6eyJvcmlnaW4iOiJodHRwczovL25vZGUuZXhhbXBsZS5jb3JwdXMiLCJub2RlQXVkaWVuY2UiOiJkaWQ6d2ViOm5vZGUuZXhhbXBsZS5jb3JwdXMiLCJzcGFjZUlkIjoidGlueWNsb3VkOnBraDplaXAxNTU6MToweDExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTE6ZGVmYXVsdCJ9LCJyZXNvdXJjZSI6eyJraW5kIjoiZXhhY3QiLCJwYXRoIjoiZG9jdW1lbnRzL3BsYW4ubWQifSwiYWN0aW9ucyI6WyJ0aW55Y2xvdWQua3YvZ2V0IiwidGlueWNsb3VkLmt2L21ldGFkYXRhIl0sImNvbnRlbnRTb3VyY2UiOnsia2luZCI6Imt2Iiwic3BhY2UiOiJ0aW55Y2xvdWQ6cGtoOmVpcDE1NToxOjB4MTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTpkZWZhdWx0IiwicGF0aCI6ImRvY3VtZW50cy9wbGFuLm1kIiwiYWN0aW9uIjoidGlueWNsb3VkLmt2L2dldCJ9LCJjb250ZW50U291cmNlRGlnZXN0IjoidjI2cmRGQ3dNY0xvTGd4d3JQNEl5TUR0cEtHNFpWX2ZwejNFc3lzdnRkZyIsInJlZ2lzdGVyZWRBdCI6IjIwMjQtMDEtMDFUMDA6MDA6MDAuMDAwWiIsImV4cGlyZXNBdCI6IjIwOTktMDEtMDFUMDA6MDA6MDAuMDAwWiJ9LCJwcm9vZiI6eyJhbGciOiJFZERTQSIsImtpZCI6ImRpZDprZXk6ejZNa2dndEhWV1FVR0ozRlZqSktYZWI1b1pUaFF2TG1KVk1WOGhmTlV6NGV6Y2F2I3o2TWtnZ3RIVldRVUdKM0ZWakpLWGViNW9aVGhRdkxtSlZNVjhoZk5VejRlemNhdiIsInNpZ25hdHVyZSI6IlZCc2hEcUZoZGE0RHBRS2V4YWhTR2FvajY4MjN4cjFxU1FrRTB6MEdwUVZQUTNtOFdQbTFHUHVNdWpBR1pfbW9IR1ctX3ZwUjR6N05tRHdUTlU4TkRnIn19",
+        "decoded": {
+          "registration": {
+            "registrationCid": "bafkreicz4ezocsy4zlo64tk32idyrowbbdzvxi7l2fywukht23bznhqdra",
+            "policyCid": "bafkreif45ozprbpnssttbkugyu7hsju4qhmrcdi5d246ktxqugj7rgyeee",
+            "ownerDelegationCid": "bafyowner4registrationcorpusvector",
+            "enforcementDelegationCid": "bafkreiecg2cy4mkcq7eueorkumzplvqanlfbuu6sooxhedxtytzl37exj4",
+            "ownerDid": "did:pkh:eip155:1:0x1111111111111111111111111111111111111111",
+            "shareKeyDid": "did:key:z6MkmHSmMcWJVnpJMuDvyRmH1eqVMjkEFiHTPc7SedEtjxan",
+            "enforcerDid": "did:key:z6MkggtHVWQUGJ3FVjJKXeb5oZThQvLmJVMV8hfNUz4ezcav",
+            "shareId": "share-v2-corpus-registration",
+            "recipientMatcher": {
+              "kind": "emailDomain",
+              "value": "example.com"
+            },
+            "target": {
+              "origin": "https://node.example.corpus",
+              "nodeAudience": "did:web:node.example.corpus",
+              "spaceId": "tinycloud:pkh:eip155:1:0x1111111111111111111111111111111111111111:default"
+            },
+            "resource": {
+              "kind": "exact",
+              "path": "documents/plan.md"
+            },
+            "actions": [
+              "tinycloud.kv/get",
+              "tinycloud.kv/metadata"
+            ],
+            "contentSource": {
+              "kind": "kv",
+              "space": "tinycloud:pkh:eip155:1:0x1111111111111111111111111111111111111111:default",
+              "path": "documents/plan.md",
+              "action": "tinycloud.kv/get"
+            },
+            "contentSourceDigest": "v26rdFCwMcLoLgxwrP4IyMDtpKG4ZV_fpz3Esysvtdg",
+            "registeredAt": "2024-01-01T00:00:00.000Z",
+            "expiresAt": "2099-01-01T00:00:00.000Z"
+          },
+          "proof": {
+            "alg": "EdDSA",
+            "kid": "did:key:z6MkggtHVWQUGJ3FVjJKXeb5oZThQvLmJVMV8hfNUz4ezcav#z6MkggtHVWQUGJ3FVjJKXeb5oZThQvLmJVMV8hfNUz4ezcav",
+            "signature": "VBshDqFhda4DpQKexahSGaoj6823xr1qSQkE0z0GpQVPQ3m8WPm1GPuMujAGZ_moHGW-_vpR4z7NmDwTNU8NDg"
+          }
+        }
+      },
+      "digest": "SJScFuOen4vCoOAxSRkm4iaYlOFty-ZM9QHocreoK4M"
+    },
+    "deliveryRequest": {
+      "description": "Exact camelCase mirror of the Rust V2DeliveryRequest the SDK POSTs to /share/v2/deliveries/authorize.",
+      "producedBy": [
+        "share-delivery.ts:ShareDeliveryAuthorizationRequest"
+      ],
+      "value": {
+        "envelopeCid": "bafkreicorpusenvelopeplaceholder0000000000000000000000000",
+        "shareCid": "bafkreicorpussharecidplaceholder00000000000000000000000000",
+        "shareId": "share-v2-corpus-registration",
+        "registrationCid": "bafkreicz4ezocsy4zlo64tk32idyrowbbdzvxi7l2fywukht23bznhqdra",
+        "policyCid": "bafkreicorpuspolicycidplaceholder0000000000000000000000000",
+        "delegationCid": "bafyowner4registrationcorpusvector",
+        "enforcementDelegationCid": "bafkreiecg2cy4mkcq7eueorkumzplvqanlfbuu6sooxhedxtytzl37exj4",
+        "recipientEmail": "recipient@example.com",
+        "shareUrl": "https://node.example.corpus/s/bafkreicorpussharecidplaceholder00000000000000000000000000#k=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "documentName": "Project plan.md",
+        "jti": "AQIDBAUGBwgJCgsMDQ4PEA",
+        "expiresAt": "2099-01-01T00:00:00.000Z",
+        "requestBodyDigest": "hrHWeZEYUZsyxCf4qDGZVA02zfhtJl-7_gK_9Ai6nzo"
+      },
+      "digest": "aQldjkeOfLioFsARlGhRKHZQKn5Heb_KIJrZQ2UGUpo"
+    },
+    "deliveryReceiptResponse": {
+      "description": "Exact UTF-8 response bytes accepted unchanged by the production verifier (validateShareDeliveryAuthorizationBytes).",
+      "producedBy": [
+        "share-delivery.ts:validateShareDeliveryAuthorizationBytes"
+      ],
+      "value": {
+        "bodyBase64Url": "eyJhdXRob3JpemF0aW9uIjp7InR5cGUiOiJUaW55Q2xvdWRTaGFyZURlbGl2ZXJ5QXV0aG9yaXphdGlvbiIsInZlcnNpb24iOjIsImp0aSI6IkFRSURCQVVHQndnSkNnc01EUTRQRUEiLCJzaGFyZUNpZCI6ImJhZmtyZWljb3JwdXNzaGFyZWNpZHBsYWNlaG9sZGVyMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAiLCJzaGFyZUlkIjoic2hhcmUtdjItY29ycHVzLXJlZ2lzdHJhdGlvbiIsInJlZ2lzdHJhdGlvbkNpZCI6ImJhZmtyZWljejRlem9jc3k0emxvNjR0azMyaWR5cm93YmJkenZ4aTdsMmZ5d3VraHQyM2J6bmhxZHJhIiwiZGVsZWdhdGlvbkNpZCI6ImJhZnlvd25lcjRyZWdpc3RyYXRpb25jb3JwdXN2ZWN0b3IiLCJlbmZvcmNlbWVudERlbGVnYXRpb25DaWQiOiJiYWZrcmVpZWNnMmN5NG1rY3E3ZXVlb3JrdW16cGx2cWFubGZidXU2c29veGhlZHh0eXR6bDM3ZXhqNCIsImVudmVsb3BlQ2lkIjoiYmFma3JlaWNvcnB1c2VudmVsb3BlcGxhY2Vob2xkZXIwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwIiwicG9saWN5Q2lkIjoiYmFma3JlaWNvcnB1c3BvbGljeWNpZHBsYWNlaG9sZGVyMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMCIsIm5vZGVBdWRpZW5jZSI6ImRpZDp3ZWI6bm9kZS5leGFtcGxlLmNvcnB1cyIsInRhcmdldE9yaWdpbiI6Imh0dHBzOi8vbm9kZS5leGFtcGxlLmNvcnB1cyIsIm9wZW5DcmVkZW50aWFsc0F1ZGllbmNlIjoiaHR0cHM6Ly93aXRuZXNzLmNyZWRlbnRpYWxzLm9yZyIsImhvbGRlciI6ImRpZDprZXk6ejZNa0NvcnB1c0hvbGRlciIsInJlY2lwaWVudE1hdGNoZXIiOnsia2luZCI6ImVtYWlsRG9tYWluIiwidmFsdWUiOiJleGFtcGxlLmNvbSJ9LCJkZWxpdmVyeUVtYWlsIjoicmVjaXBpZW50QGV4YW1wbGUuY29tIiwic2hhcmVVcmwiOiJodHRwczovL25vZGUuZXhhbXBsZS5jb3JwdXMvcy9iYWZrcmVpY29ycHVzc2hhcmVjaWRwbGFjZWhvbGRlcjAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwI2s9QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQSIsInJldHVybk9yaWdpbiI6Imh0dHBzOi8vbm9kZS5leGFtcGxlLmNvcnB1cyIsImRvY3VtZW50TmFtZSI6IlByb2plY3QgcGxhbi5tZCIsInNlbmRlckRpZCI6ImRpZDpwa2g6ZWlwMTU1OjE6MHgxMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExIiwic2VuZGVyVHJ1c3QiOiJ2ZXJpZmllZCIsImNvbnRlbnRTb3VyY2UiOnsia2luZCI6Imt2Iiwic3BhY2UiOiJ0aW55Y2xvdWQ6cGtoOmVpcDE1NToxOjB4MTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTpkZWZhdWx0IiwicGF0aCI6ImRvY3VtZW50cy9wbGFuLm1kIiwiYWN0aW9uIjoidGlueWNsb3VkLmt2L2dldCJ9LCJjb250ZW50U291cmNlRGlnZXN0IjoidjI2cmRGQ3dNY0xvTGd4d3JQNEl5TUR0cEtHNFpWX2ZwejNFc3lzdnRkZyIsInNoYXJlRXhwaXJlc0F0IjoiMjA5OS0wMS0wMVQwMDowMDowMC4wMDBaIiwiaXNzdWVkQXQiOiIyMDI0LTAxLTAxVDAwOjAwOjAwLjAwMFoiLCJyZXBvcnRBYnVzZVRva2VuIjoiQVFJREJBVUdCd2dKQ2dzTURRNFBFQSIsImFjdGlvbnMiOlsidGlueWNsb3VkLmt2L2dldCIsInRpbnljbG91ZC5rdi9tZXRhZGF0YSJdLCJyZXNvdXJjZSI6ImRvY3VtZW50cy9wbGFuLm1kIiwiYXV0aG9yaXR5TWF0ZXJpYWxIYW5kbGUiOiJiYWZrcmVpY3o0ZXpvY3N5NHpsbzY0dGszMmlkeXJvd2JiZHp2eGk3bDJmeXd1a2h0MjNiem5ocWRyYSIsImF1dGhvcml0eU1hdGVyaWFsRGlnZXN0IjoiLWVIM1VVcnEwdmwxejlGTU11ZWNGTzRFQ0tlZ2ZxRHZVMmZlRktabEExdyIsInJlcXVlc3RCb2R5RGlnZXN0IjoiaHJIV2VaRVlVWnN5eENmNHFER1pWQTAyemZodEpsLTdfZ0tfOUFpNm56byIsImlkZW1wb3RlbmN5S2V5IjoiQVFJREJBVUdCd2dKQ2dzTURRNFBFQSIsImV4cGlyZXNBdCI6IjIwOTktMDEtMDFUMDA6MDA6MDAuMDAwWiIsImRhdGFBdXRob3JpdHkiOmZhbHNlfSwicHJvb2YiOnsiYWxnIjoiRWREU0EiLCJraWQiOiJkaWQ6a2V5Ono2TWtnZ3RIVldRVUdKM0ZWakpLWGViNW9aVGhRdkxtSlZNVjhoZk5VejRlemNhdiN6Nk1rZ2d0SFZXUVVHSjNGVmpKS1hlYjVvWlRoUXZMbUpWTVY4aGZOVXo0ZXpjYXYiLCJzaWduYXR1cmUiOiJkaFQ3SG1LOE9XY1NzQVJIdEx4cS1xeEdKeklZZnNOZnRTdzFsZmNDTXRISjNzakVTTmtocnpRSWs1Q2FWTHFoWno0UWVRdS1xb3hNTzc4ai1LcDBDdyJ9fQ",
+        "decoded": {
+          "authorization": {
+            "type": "TinyCloudShareDeliveryAuthorization",
+            "version": 2,
+            "jti": "AQIDBAUGBwgJCgsMDQ4PEA",
+            "shareCid": "bafkreicorpussharecidplaceholder00000000000000000000000000",
+            "shareId": "share-v2-corpus-registration",
+            "registrationCid": "bafkreicz4ezocsy4zlo64tk32idyrowbbdzvxi7l2fywukht23bznhqdra",
+            "delegationCid": "bafyowner4registrationcorpusvector",
+            "enforcementDelegationCid": "bafkreiecg2cy4mkcq7eueorkumzplvqanlfbuu6sooxhedxtytzl37exj4",
+            "envelopeCid": "bafkreicorpusenvelopeplaceholder0000000000000000000000000",
+            "policyCid": "bafkreicorpuspolicycidplaceholder0000000000000000000000000",
+            "nodeAudience": "did:web:node.example.corpus",
+            "targetOrigin": "https://node.example.corpus",
+            "openCredentialsAudience": "https://witness.credentials.org",
+            "holder": "did:key:z6MkCorpusHolder",
+            "recipientMatcher": {
+              "kind": "emailDomain",
+              "value": "example.com"
+            },
+            "deliveryEmail": "recipient@example.com",
+            "shareUrl": "https://node.example.corpus/s/bafkreicorpussharecidplaceholder00000000000000000000000000#k=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "returnOrigin": "https://node.example.corpus",
+            "documentName": "Project plan.md",
+            "senderDid": "did:pkh:eip155:1:0x1111111111111111111111111111111111111111",
+            "senderTrust": "verified",
+            "contentSource": {
+              "kind": "kv",
+              "space": "tinycloud:pkh:eip155:1:0x1111111111111111111111111111111111111111:default",
+              "path": "documents/plan.md",
+              "action": "tinycloud.kv/get"
+            },
+            "contentSourceDigest": "v26rdFCwMcLoLgxwrP4IyMDtpKG4ZV_fpz3Esysvtdg",
+            "shareExpiresAt": "2099-01-01T00:00:00.000Z",
+            "issuedAt": "2024-01-01T00:00:00.000Z",
+            "reportAbuseToken": "AQIDBAUGBwgJCgsMDQ4PEA",
+            "actions": [
+              "tinycloud.kv/get",
+              "tinycloud.kv/metadata"
+            ],
+            "resource": "documents/plan.md",
+            "authorityMaterialHandle": "bafkreicz4ezocsy4zlo64tk32idyrowbbdzvxi7l2fywukht23bznhqdra",
+            "authorityMaterialDigest": "-eH3UUrq0vl1z9FMMuecFO4ECKegfqDvU2feFKZlA1w",
+            "requestBodyDigest": "hrHWeZEYUZsyxCf4qDGZVA02zfhtJl-7_gK_9Ai6nzo",
+            "idempotencyKey": "AQIDBAUGBwgJCgsMDQ4PEA",
+            "expiresAt": "2099-01-01T00:00:00.000Z",
+            "dataAuthority": false
+          },
+          "proof": {
+            "alg": "EdDSA",
+            "kid": "did:key:z6MkggtHVWQUGJ3FVjJKXeb5oZThQvLmJVMV8hfNUz4ezcav#z6MkggtHVWQUGJ3FVjJKXeb5oZThQvLmJVMV8hfNUz4ezcav",
+            "signature": "dhT7HmK8OWcSsARHtLxq-qxGJzIYfsNftSw1lfcCMtHJ3sjESNkhrzQIk5CaVLqhZz4QeQu-qoxMO78j-Kp0Cw"
+          }
+        }
+      },
+      "digest": "fRlikM5SDNX0ENv8AsoXZrc7kO8s-tLDuJAo4FGPzYc"
+    },
+    "challengeRequest": {
+      "description": "Exact POST body the production ShareRecipientClient sends to /share/v2/policy/challenges (ShareRecipientClient.buildChallengeRequest).",
+      "producedBy": [
+        "ShareRecipientClient.ts:buildChallengeRequest"
+      ],
+      "value": {
+        "envelopeCid": "bafkr4igymsbofgemembkwoicz5rrodd5httqnsgnayzxre74rr7lmibicq",
+        "shareCid": "bafkr4igymsbofgemembkwoicz5rrodd5httqnsgnayzxre74rr7lmibicq",
+        "shareId": "share-v2-corpus-registration",
+        "registrationCid": "bafkreicz4ezocsy4zlo64tk32idyrowbbdzvxi7l2fywukht23bznhqdra",
+        "delegationCid": "bafyowner4registrationcorpusvector",
+        "policyCid": "bafkreicorpuspolicycidplaceholder0000000000000000000000000",
+        "enforcementDelegationCid": "bafkreiecg2cy4mkcq7eueorkumzplvqanlfbuu6sooxhedxtytzl37exj4",
+        "enforcementDelegation": {
+          "cid": "bafkreiecg2cy4mkcq7eueorkumzplvqanlfbuu6sooxhedxtytzl37exj4"
+        },
+        "outerEnvelope": {
+          "cid": "bafkr4igymsbofgemembkwoicz5rrodd5httqnsgnayzxre74rr7lmibicq"
+        },
+        "contentSource": {
+          "kind": "kv",
+          "action": "tinycloud.kv/get",
+          "space": "tinycloud:pkh:eip155:1:0x1111111111111111111111111111111111111111:default",
+          "path": "documents"
+        },
+        "contentSourceDigest": "7fqQYsO4UnaGcR0wvqegCJDK0yhbCg_t1jcTnkMnjMo",
+        "holderDid": "did:key:z6MkkwkPX2eHiYAHpsG5a46pVaiux9wMcGX4AZuPZMkJJqAZ",
+        "targetOrigin": "https://node.example.corpus",
+        "nodeAudience": "did:web:node.example.corpus",
+        "action": "tinycloud.kv/get",
+        "actions": [
+          "tinycloud.kv/get",
+          "tinycloud.kv/metadata",
+          "tinycloud.kv/list",
+          "tinycloud.kv/put"
+        ],
+        "resource": "documents/",
+        "requestBodyDigest": "0iZPZn0XVo53MqNeUnbFWb3290vELTaqc_MDSiQhrlg"
+      },
+      "digest": "kQGy9SZjn8EGpgAyZ-9n0IScSNkzQH4uqfqGId0Cne4"
+    },
+    "challengeResponse": {
+      "description": "Node-signed challenge envelope consumed and verified by the production client (verifyNodeProof, domain xyz.tinycloud.share/policy-challenge/v2).",
+      "producedBy": [
+        "ShareRecipientClient.ts:verifyNodeProof"
+      ],
+      "value": {
+        "bodyBase64Url": "eyJkYXRhIjp7ImNoYWxsZW5nZSI6eyJ0eXBlIjoiVGlueUNsb3VkU2hhcmVQb2xpY3lDaGFsbGVuZ2UiLCJ2ZXJzaW9uIjoyLCJjaGFsbGVuZ2VJZCI6ImNoYWxsZW5nZS1jb3JwdXMtMDAxIiwibm9uY2UiOiJjb3JwdXMtbm9uY2UtMDEyMzQ1Njc4OWFiY2RlZiIsImF1ZGllbmNlIjoiaHR0cHM6Ly9ub2RlLmV4YW1wbGUuY29ycHVzIiwiZW5mb3JjZXJEaWQiOiJkaWQ6a2V5Ono2TWtnZ3RIVldRVUdKM0ZWakpLWGViNW9aVGhRdkxtSlZNVjhoZk5VejRlemNhdiIsImNoYWxsZW5nZUV4cGlyZXNBdCI6IjIwODAtMDEtMDFUMDA6MzA6MDAuMDAwWiIsImV4cGlyZXNBdCI6IjIwODAtMDEtMDFUMDA6MzA6MDAuMDAwWiIsInJlcXVlc3RCb2R5RGlnZXN0IjoiMGlaUFpuMFhWbzUzTXFOZVVuYkZXYjMyOTB2RUxUYXFjX01EU2lRaHJsZyJ9LCJwcm9vZiI6eyJhbGciOiJFZERTQSIsImtpZCI6ImRpZDprZXk6ejZNa2dndEhWV1FVR0ozRlZqSktYZWI1b1pUaFF2TG1KVk1WOGhmTlV6NGV6Y2F2I3o2TWtnZ3RIVldRVUdKM0ZWakpLWGViNW9aVGhRdkxtSlZNVjhoZk5VejRlemNhdiIsInNpZ25hdHVyZSI6IldWLU9ESG1YUnB1N0dkRjEzcS1WNEphOGZJbUh2YlVVR3pfdXZWbnZMSl9Kd1FWOEU4RHh2R0NneHlkZk1yeFkyYmRuV0NKcnRDTlBuQXlHMkRSb0NBIn19fQ"
+      },
+      "digest": "MvkKJZ2EOKhxPmRp4DyNTSpN1RrL7hD-y4Bqp-4BwKY"
+    },
+    "sessionRequest": {
+      "description": "Exact POST body the production client sends to /share/v2/policy/session after verifying the challenge (ShareRecipientClient.buildDefaultPolicySessionRequest).",
+      "producedBy": [
+        "ShareRecipientClient.ts:buildDefaultPolicySessionRequest"
+      ],
+      "value": {
+        "challengeId": "challenge-corpus-001",
+        "nonce": "corpus-nonce-0123456789abcdef",
+        "presentation": {
+          "type": "TinyCloudSharePolicyPresentation",
+          "version": 2,
+          "challengeId": "challenge-corpus-001",
+          "nonce": "corpus-nonce-0123456789abcdef",
+          "shareCid": "bafkr4igymsbofgemembkwoicz5rrodd5httqnsgnayzxre74rr7lmibicq",
+          "shareId": "share-v2-corpus-registration",
+          "delegationCid": "bafyowner4registrationcorpusvector",
+          "policyCid": "bafkreicorpuspolicycidplaceholder0000000000000000000000000",
+          "contentSource": {
+            "kind": "kv",
+            "action": "tinycloud.kv/get",
+            "space": "tinycloud:pkh:eip155:1:0x1111111111111111111111111111111111111111:default",
+            "path": "documents"
+          },
+          "contentSourceDigest": "7fqQYsO4UnaGcR0wvqegCJDK0yhbCg_t1jcTnkMnjMo",
+          "holderDid": "did:key:z6MkkwkPX2eHiYAHpsG5a46pVaiux9wMcGX4AZuPZMkJJqAZ",
+          "targetOrigin": "https://node.example.corpus",
+          "nodeAudience": "did:web:node.example.corpus",
+          "enforcerDid": "did:key:z6MkggtHVWQUGJ3FVjJKXeb5oZThQvLmJVMV8hfNUz4ezcav",
+          "credentialDigest": "s5PyaZGMJ_skzfR6kJazunpi5g1SBEDWhD1itFZp5a4",
+          "action": "tinycloud.kv/get",
+          "actions": [
+            "tinycloud.kv/get",
+            "tinycloud.kv/metadata",
+            "tinycloud.kv/list",
+            "tinycloud.kv/put"
+          ],
+          "resource": "documents/",
+          "requestBodyDigest": "0iZPZn0XVo53MqNeUnbFWb3290vELTaqc_MDSiQhrlg",
+          "issuedAt": "2080-01-01T00:00:00.000Z",
+          "expiresAt": "2080-01-01T00:30:00.000Z",
+          "jti": "QW7Wv6fZ_yB7mlcOh3PJ0A"
+        },
+        "credential": "corpus-verifiable-credential",
+        "proof": {
+          "alg": "EdDSA",
+          "kid": "did:key:z6MkkwkPX2eHiYAHpsG5a46pVaiux9wMcGX4AZuPZMkJJqAZ#z6MkkwkPX2eHiYAHpsG5a46pVaiux9wMcGX4AZuPZMkJJqAZ",
+          "signature": "l6IZdc2Rc_Ds2Bj_rRV1YQ2yM29Paut9QGNYMoakga5fKWDmRSMwOI_IEBD2W_Ze_77Cs1-Dm7Dx57gghPw8Bw"
+        },
+        "holderBinding": {
+          "holderDid": "did:key:z6MkkwkPX2eHiYAHpsG5a46pVaiux9wMcGX4AZuPZMkJJqAZ"
+        },
+        "readSignerDid": "did:key:z6MkkwkPX2eHiYAHpsG5a46pVaiux9wMcGX4AZuPZMkJJqAZ"
+      },
+      "digest": "7Y96V0xgZfJ9tx0sslW9SQjLJKIDN5p9BZpmDRx8wv0"
+    },
+    "sessionResponse": {
+      "description": "Node-signed policy session envelope consumed and verified by the production client (verifyNodeProof, domain xyz.tinycloud.share/policy-session/v2).",
+      "producedBy": [
+        "ShareRecipientClient.ts:verifyNodeProof"
+      ],
+      "value": {
+        "bodyBase64Url": "eyJyZXN1bHQiOnsic2Vzc2lvbiI6eyJ0eXBlIjoiVGlueUNsb3VkU2hhcmVQb2xpY3lTZXNzaW9uIiwidmVyc2lvbiI6Miwic2Vzc2lvbklkIjoic2Vzc2lvbi1jb3JwdXMtMDAxIiwiZW52ZWxvcGVDaWQiOiJiYWZrcjRpZ3ltc2JvZmdlbWVtYmt3b2ljejVycm9kZDVodHRxbnNnbmF5enhyZTc0cnI3bG1pYmljcSIsInNoYXJlQ2lkIjoiYmFma3I0aWd5bXNib2ZnZW1lbWJrd29pY3o1cnJvZGQ1aHR0cW5zZ25heXp4cmU3NHJyN2xtaWJpY3EiLCJzaGFyZUlkIjoic2hhcmUtdjItY29ycHVzLXJlZ2lzdHJhdGlvbiIsInJlZ2lzdHJhdGlvbkNpZCI6ImJhZmtyZWljejRlem9jc3k0emxvNjR0azMyaWR5cm93YmJkenZ4aTdsMmZ5d3VraHQyM2J6bmhxZHJhIiwiZGVsZWdhdGlvbkNpZCI6ImJhZnlvd25lcjRyZWdpc3RyYXRpb25jb3JwdXN2ZWN0b3IiLCJwb2xpY3lDaWQiOiJiYWZrcmVpY29ycHVzcG9saWN5Y2lkcGxhY2Vob2xkZXIwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwIiwiZW5mb3JjZW1lbnREZWxlZ2F0aW9uQ2lkIjoiYmFma3JlaWVjZzJjeTRta2NxN2V1ZW9ya3VtenBsdnFhbmxmYnV1NnNvb3hoZWR4dHl0emwzN2V4ajQiLCJjb250ZW50U291cmNlIjp7ImtpbmQiOiJrdiIsImFjdGlvbiI6InRpbnljbG91ZC5rdi9nZXQiLCJzcGFjZSI6InRpbnljbG91ZDpwa2g6ZWlwMTU1OjE6MHgxMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExOmRlZmF1bHQiLCJwYXRoIjoiZG9jdW1lbnRzIn0sImNvbnRlbnRTb3VyY2VEaWdlc3QiOiI3ZnFRWXNPNFVuYUdjUjB3dnFlZ0NKREsweWhiQ2dfdDFqY1Rua01uak1vIiwiaG9sZGVyRGlkIjoiZGlkOmtleTp6Nk1ra3drUFgyZUhpWUFIcHNHNWE0NnBWYWl1eDl3TWNHWDRBWnVQWk1rSkpxQVoiLCJ0YXJnZXRPcmlnaW4iOiJodHRwczovL25vZGUuZXhhbXBsZS5jb3JwdXMiLCJub2RlQXVkaWVuY2UiOiJkaWQ6d2ViOm5vZGUuZXhhbXBsZS5jb3JwdXMiLCJhY3Rpb24iOiJ0aW55Y2xvdWQua3YvZ2V0IiwiYWN0aW9ucyI6WyJ0aW55Y2xvdWQua3YvZ2V0IiwidGlueWNsb3VkLmt2L21ldGFkYXRhIiwidGlueWNsb3VkLmt2L2xpc3QiLCJ0aW55Y2xvdWQua3YvcHV0Il0sInJlc291cmNlIjoiZG9jdW1lbnRzLyIsImlzc3VlZEF0IjoiMjA4MC0wMS0wMVQwMDowMDowMC4wMDBaIiwiZXhwaXJlc0F0IjoiMjA4MC0wMS0wMVQwMDoyMDowMC4wMDBaIn0sInByb29mIjp7ImFsZyI6IkVkRFNBIiwia2lkIjoiZGlkOmtleTp6Nk1rZ2d0SFZXUVVHSjNGVmpKS1hlYjVvWlRoUXZMbUpWTVY4aGZOVXo0ZXpjYXYjejZNa2dndEhWV1FVR0ozRlZqSktYZWI1b1pUaFF2TG1KVk1WOGhmTlV6NGV6Y2F2Iiwic2lnbmF0dXJlIjoiRk1KU2JEN29IdEVobFBwNDROcnotZEhCOWdINGRTZlY2TFJSM3g1OVYyZU5ERWNhM1ZuUXNTQzRpdGZ1a2xhTE9jNkxqM2p6ZXMyZ2N0VE1YQk1HREEifX19"
+      },
+      "digest": "aLRgrBjBuzaXtTcwxe1kgCRXxxztr7Yl0nRUJO9r_2c"
+    },
+    "invokeGetRequest": {
+      "description": "Exact signed /share/v2/invoke request body for a get.",
+      "producedBy": [
+        "ShareRecipientClient.ts:invokeNative"
+      ],
+      "value": {
+        "request": {
+          "sessionId": "session-corpus-001",
+          "envelopeCid": "bafkr4igymsbofgemembkwoicz5rrodd5httqnsgnayzxre74rr7lmibicq",
+          "shareCid": "bafkr4igymsbofgemembkwoicz5rrodd5httqnsgnayzxre74rr7lmibicq",
+          "shareId": "share-v2-corpus-registration",
+          "registrationCid": "bafkreicz4ezocsy4zlo64tk32idyrowbbdzvxi7l2fywukht23bznhqdra",
+          "delegationCid": "bafyowner4registrationcorpusvector",
+          "policyCid": "bafkreicorpuspolicycidplaceholder0000000000000000000000000",
+          "enforcementDelegationCid": "bafkreiecg2cy4mkcq7eueorkumzplvqanlfbuu6sooxhedxtytzl37exj4",
+          "contentSource": {
+            "kind": "kv",
+            "action": "tinycloud.kv/get",
+            "space": "tinycloud:pkh:eip155:1:0x1111111111111111111111111111111111111111:default",
+            "path": "documents"
+          },
+          "contentSourceDigest": "7fqQYsO4UnaGcR0wvqegCJDK0yhbCg_t1jcTnkMnjMo",
+          "holderDid": "did:key:z6MkkwkPX2eHiYAHpsG5a46pVaiux9wMcGX4AZuPZMkJJqAZ",
+          "nodeAudience": "did:web:node.example.corpus",
+          "action": "tinycloud.kv/get",
+          "actions": [
+            "tinycloud.kv/get",
+            "tinycloud.kv/list",
+            "tinycloud.kv/metadata",
+            "tinycloud.kv/put"
+          ],
+          "resource": "documents/plan.md",
+          "requestBodyDigest": "5oW66kZIwOtOoi1nFc4PWKQGMcN630c491siakodEbc",
+          "invocation": {
+            "type": "TinyCloudShareReadInvocation",
+            "version": 2,
+            "sessionId": "session-corpus-001",
+            "shareCid": "bafkr4igymsbofgemembkwoicz5rrodd5httqnsgnayzxre74rr7lmibicq",
+            "shareId": "share-v2-corpus-registration",
+            "delegationCid": "bafyowner4registrationcorpusvector",
+            "policyCid": "bafkreicorpuspolicycidplaceholder0000000000000000000000000",
+            "envelopeCid": "bafkr4igymsbofgemembkwoicz5rrodd5httqnsgnayzxre74rr7lmibicq",
+            "registrationCid": "bafkreicz4ezocsy4zlo64tk32idyrowbbdzvxi7l2fywukht23bznhqdra",
+            "enforcementDelegationCid": "bafkreiecg2cy4mkcq7eueorkumzplvqanlfbuu6sooxhedxtytzl37exj4",
+            "contentSource": {
+              "kind": "kv",
+              "action": "tinycloud.kv/get",
+              "space": "tinycloud:pkh:eip155:1:0x1111111111111111111111111111111111111111:default",
+              "path": "documents"
+            },
+            "contentSourceDigest": "7fqQYsO4UnaGcR0wvqegCJDK0yhbCg_t1jcTnkMnjMo",
+            "holderDid": "did:key:z6MkkwkPX2eHiYAHpsG5a46pVaiux9wMcGX4AZuPZMkJJqAZ",
+            "nodeAudience": "did:web:node.example.corpus",
+            "action": "tinycloud.kv/get",
+            "actions": [
+              "tinycloud.kv/get",
+              "tinycloud.kv/list",
+              "tinycloud.kv/metadata",
+              "tinycloud.kv/put"
+            ],
+            "resource": "documents/plan.md",
+            "issuedAt": "2080-01-01T00:00:00.000Z",
+            "expiresAt": "2080-01-01T00:01:00.000Z",
+            "jti": "Dqg6rAtTCAPTSsSZipiJFw",
+            "requestBodyDigest": "5oW66kZIwOtOoi1nFc4PWKQGMcN630c491siakodEbc"
+          },
+          "proof": {
+            "alg": "EdDSA",
+            "kid": "did:key:z6MkkwkPX2eHiYAHpsG5a46pVaiux9wMcGX4AZuPZMkJJqAZ#z6MkkwkPX2eHiYAHpsG5a46pVaiux9wMcGX4AZuPZMkJJqAZ",
+            "signature": "jJIkfEZESuOn0JI49b_-jIx-vDK-UAbBQxqRCwEkSMRUCM7umcgJU2iL4o9b1zm-ABha302-UEUsmEfUpnIcCA"
+          }
+        }
+      },
+      "digest": "-u1cVn1PpUesbjh5k-u0TSSD21Za2JaGUFEVUowrHcA"
+    },
+    "invokeGetResponse": {
+      "description": "Node /share/v2/invoke get response consumed by the production client.",
+      "producedBy": [
+        "ShareRecipientClient.ts:invokeNative"
+      ],
+      "value": {
+        "type": "TinyCloudShareInvokeResponse",
+        "version": 2,
+        "action": "tinycloud.kv/get",
+        "resource": "documents/plan.md",
+        "mediaType": "text/markdown",
+        "content": "IyBjb3JwdXMgZG9jdW1lbnQgYm9keQ",
+        "bodyDigest": "Ze3PU5Jbhdg7ldpKM76AUkGOfCW8yPLP1J3bCOwGaSg",
+        "etag": "\"corpus-etag-1\""
+      },
+      "digest": "fUSpNoxmwlAM9aGO7juc5cJ_7__05duYnALuIprnl2Q"
+    },
+    "invokeMetadataRequest": {
+      "description": "Exact signed /share/v2/invoke request body for a metadata read.",
+      "producedBy": [
+        "ShareRecipientClient.ts:invokeNative"
+      ],
+      "value": {
+        "request": {
+          "sessionId": "session-corpus-001",
+          "envelopeCid": "bafkr4igymsbofgemembkwoicz5rrodd5httqnsgnayzxre74rr7lmibicq",
+          "shareCid": "bafkr4igymsbofgemembkwoicz5rrodd5httqnsgnayzxre74rr7lmibicq",
+          "shareId": "share-v2-corpus-registration",
+          "registrationCid": "bafkreicz4ezocsy4zlo64tk32idyrowbbdzvxi7l2fywukht23bznhqdra",
+          "delegationCid": "bafyowner4registrationcorpusvector",
+          "policyCid": "bafkreicorpuspolicycidplaceholder0000000000000000000000000",
+          "enforcementDelegationCid": "bafkreiecg2cy4mkcq7eueorkumzplvqanlfbuu6sooxhedxtytzl37exj4",
+          "contentSource": {
+            "kind": "kv",
+            "action": "tinycloud.kv/get",
+            "space": "tinycloud:pkh:eip155:1:0x1111111111111111111111111111111111111111:default",
+            "path": "documents"
+          },
+          "contentSourceDigest": "7fqQYsO4UnaGcR0wvqegCJDK0yhbCg_t1jcTnkMnjMo",
+          "holderDid": "did:key:z6MkkwkPX2eHiYAHpsG5a46pVaiux9wMcGX4AZuPZMkJJqAZ",
+          "nodeAudience": "did:web:node.example.corpus",
+          "action": "tinycloud.kv/metadata",
+          "actions": [
+            "tinycloud.kv/get",
+            "tinycloud.kv/list",
+            "tinycloud.kv/metadata",
+            "tinycloud.kv/put"
+          ],
+          "resource": "documents/plan.md",
+          "requestBodyDigest": "vASfmFFXmNf6VUCk_9KwoGnfXC3M91kfsXjwu3NQ88E",
+          "invocation": {
+            "type": "TinyCloudShareReadInvocation",
+            "version": 2,
+            "sessionId": "session-corpus-001",
+            "shareCid": "bafkr4igymsbofgemembkwoicz5rrodd5httqnsgnayzxre74rr7lmibicq",
+            "shareId": "share-v2-corpus-registration",
+            "delegationCid": "bafyowner4registrationcorpusvector",
+            "policyCid": "bafkreicorpuspolicycidplaceholder0000000000000000000000000",
+            "envelopeCid": "bafkr4igymsbofgemembkwoicz5rrodd5httqnsgnayzxre74rr7lmibicq",
+            "registrationCid": "bafkreicz4ezocsy4zlo64tk32idyrowbbdzvxi7l2fywukht23bznhqdra",
+            "enforcementDelegationCid": "bafkreiecg2cy4mkcq7eueorkumzplvqanlfbuu6sooxhedxtytzl37exj4",
+            "contentSource": {
+              "kind": "kv",
+              "action": "tinycloud.kv/get",
+              "space": "tinycloud:pkh:eip155:1:0x1111111111111111111111111111111111111111:default",
+              "path": "documents"
+            },
+            "contentSourceDigest": "7fqQYsO4UnaGcR0wvqegCJDK0yhbCg_t1jcTnkMnjMo",
+            "holderDid": "did:key:z6MkkwkPX2eHiYAHpsG5a46pVaiux9wMcGX4AZuPZMkJJqAZ",
+            "nodeAudience": "did:web:node.example.corpus",
+            "action": "tinycloud.kv/metadata",
+            "actions": [
+              "tinycloud.kv/get",
+              "tinycloud.kv/list",
+              "tinycloud.kv/metadata",
+              "tinycloud.kv/put"
+            ],
+            "resource": "documents/plan.md",
+            "issuedAt": "2080-01-01T00:00:00.000Z",
+            "expiresAt": "2080-01-01T00:01:00.000Z",
+            "jti": "WwH6sNTvN0gUZnn07_rUhQ",
+            "requestBodyDigest": "vASfmFFXmNf6VUCk_9KwoGnfXC3M91kfsXjwu3NQ88E"
+          },
+          "proof": {
+            "alg": "EdDSA",
+            "kid": "did:key:z6MkkwkPX2eHiYAHpsG5a46pVaiux9wMcGX4AZuPZMkJJqAZ#z6MkkwkPX2eHiYAHpsG5a46pVaiux9wMcGX4AZuPZMkJJqAZ",
+            "signature": "HxMCTQRd3RdyIh4QZZCZc0QuIZR89ZkibiUY4xFiROBJhlqmpbJymHFw7Z1jTHxTq2KNDxn3MKq1HVb_skmBCA"
+          }
+        }
+      },
+      "digest": "Wd5pEZpmXLCck4_5G_rn5l38AGKT2igr7cF9zPbUNu4"
+    },
+    "invokeMetadataResponse": {
+      "description": "Node /share/v2/invoke metadata response consumed by the production client.",
+      "producedBy": [
+        "ShareRecipientClient.ts:invokeNative"
+      ],
+      "value": {
+        "type": "TinyCloudShareInvokeResponse",
+        "version": 2,
+        "action": "tinycloud.kv/metadata",
+        "resource": "documents/plan.md",
+        "metadata": {
+          "size": "23",
+          "contentType": "text/markdown"
+        },
+        "etag": "\"corpus-etag-1\""
+      },
+      "digest": "oAVg1TggYIAFr8qsomkgIO1-LRWIEebTLD5g1dOFNcY"
+    },
+    "invokeListRequest": {
+      "description": "Exact signed /share/v2/invoke request body for a list.",
+      "producedBy": [
+        "ShareRecipientClient.ts:invokeNative"
+      ],
+      "value": {
+        "request": {
+          "sessionId": "session-corpus-001",
+          "envelopeCid": "bafkr4igymsbofgemembkwoicz5rrodd5httqnsgnayzxre74rr7lmibicq",
+          "shareCid": "bafkr4igymsbofgemembkwoicz5rrodd5httqnsgnayzxre74rr7lmibicq",
+          "shareId": "share-v2-corpus-registration",
+          "registrationCid": "bafkreicz4ezocsy4zlo64tk32idyrowbbdzvxi7l2fywukht23bznhqdra",
+          "delegationCid": "bafyowner4registrationcorpusvector",
+          "policyCid": "bafkreicorpuspolicycidplaceholder0000000000000000000000000",
+          "enforcementDelegationCid": "bafkreiecg2cy4mkcq7eueorkumzplvqanlfbuu6sooxhedxtytzl37exj4",
+          "contentSource": {
+            "kind": "kv",
+            "action": "tinycloud.kv/get",
+            "space": "tinycloud:pkh:eip155:1:0x1111111111111111111111111111111111111111:default",
+            "path": "documents"
+          },
+          "contentSourceDigest": "7fqQYsO4UnaGcR0wvqegCJDK0yhbCg_t1jcTnkMnjMo",
+          "holderDid": "did:key:z6MkkwkPX2eHiYAHpsG5a46pVaiux9wMcGX4AZuPZMkJJqAZ",
+          "nodeAudience": "did:web:node.example.corpus",
+          "action": "tinycloud.kv/list",
+          "actions": [
+            "tinycloud.kv/get",
+            "tinycloud.kv/list",
+            "tinycloud.kv/metadata",
+            "tinycloud.kv/put"
+          ],
+          "resource": "documents",
+          "requestBodyDigest": "U7BisD4dWZdbs1I0ITwsOyTJYr-TfyYtJ9OCRXpLyIk",
+          "invocation": {
+            "type": "TinyCloudShareReadInvocation",
+            "version": 2,
+            "sessionId": "session-corpus-001",
+            "shareCid": "bafkr4igymsbofgemembkwoicz5rrodd5httqnsgnayzxre74rr7lmibicq",
+            "shareId": "share-v2-corpus-registration",
+            "delegationCid": "bafyowner4registrationcorpusvector",
+            "policyCid": "bafkreicorpuspolicycidplaceholder0000000000000000000000000",
+            "envelopeCid": "bafkr4igymsbofgemembkwoicz5rrodd5httqnsgnayzxre74rr7lmibicq",
+            "registrationCid": "bafkreicz4ezocsy4zlo64tk32idyrowbbdzvxi7l2fywukht23bznhqdra",
+            "enforcementDelegationCid": "bafkreiecg2cy4mkcq7eueorkumzplvqanlfbuu6sooxhedxtytzl37exj4",
+            "contentSource": {
+              "kind": "kv",
+              "action": "tinycloud.kv/get",
+              "space": "tinycloud:pkh:eip155:1:0x1111111111111111111111111111111111111111:default",
+              "path": "documents"
+            },
+            "contentSourceDigest": "7fqQYsO4UnaGcR0wvqegCJDK0yhbCg_t1jcTnkMnjMo",
+            "holderDid": "did:key:z6MkkwkPX2eHiYAHpsG5a46pVaiux9wMcGX4AZuPZMkJJqAZ",
+            "nodeAudience": "did:web:node.example.corpus",
+            "action": "tinycloud.kv/list",
+            "actions": [
+              "tinycloud.kv/get",
+              "tinycloud.kv/list",
+              "tinycloud.kv/metadata",
+              "tinycloud.kv/put"
+            ],
+            "resource": "documents",
+            "issuedAt": "2080-01-01T00:00:00.000Z",
+            "expiresAt": "2080-01-01T00:01:00.000Z",
+            "jti": "omXex_9TGQjat-21fkxb4w",
+            "requestBodyDigest": "U7BisD4dWZdbs1I0ITwsOyTJYr-TfyYtJ9OCRXpLyIk"
+          },
+          "proof": {
+            "alg": "EdDSA",
+            "kid": "did:key:z6MkkwkPX2eHiYAHpsG5a46pVaiux9wMcGX4AZuPZMkJJqAZ#z6MkkwkPX2eHiYAHpsG5a46pVaiux9wMcGX4AZuPZMkJJqAZ",
+            "signature": "Kkh0XXuDLwqy7vo66W_aewvd_3ay0I6LTjg5uycbrkVGoIjqkdeFOO5kk04mu7AJRM4vdJITosSr34xP9azECw"
+          }
+        }
+      },
+      "digest": "C-mCPIpTg__vkxDM7VIyrNrD-g95PWELjvSU5nN9hac"
+    },
+    "invokeListResponse": {
+      "description": "Node /share/v2/invoke list response consumed by the production client.",
+      "producedBy": [
+        "ShareRecipientClient.ts:invokeNative"
+      ],
+      "value": {
+        "type": "TinyCloudShareInvokeResponse",
+        "version": 2,
+        "action": "tinycloud.kv/list",
+        "resource": "documents",
+        "entries": [
+          {
+            "path": "documents/plan.md",
+            "kind": "file"
+          },
+          {
+            "path": "documents/notes.md",
+            "kind": "file"
+          }
+        ],
+        "nextCursor": null
+      },
+      "digest": "g8-FJsDN2loZg-s085VxEiMzYRGoO756h7RYA4MUD7A"
+    },
+    "invokePutRequest": {
+      "description": "Exact signed /share/v2/invoke request body for a put.",
+      "producedBy": [
+        "ShareRecipientClient.ts:invokeNative"
+      ],
+      "value": {
+        "request": {
+          "sessionId": "session-corpus-001",
+          "envelopeCid": "bafkr4igymsbofgemembkwoicz5rrodd5httqnsgnayzxre74rr7lmibicq",
+          "shareCid": "bafkr4igymsbofgemembkwoicz5rrodd5httqnsgnayzxre74rr7lmibicq",
+          "shareId": "share-v2-corpus-registration",
+          "registrationCid": "bafkreicz4ezocsy4zlo64tk32idyrowbbdzvxi7l2fywukht23bznhqdra",
+          "delegationCid": "bafyowner4registrationcorpusvector",
+          "policyCid": "bafkreicorpuspolicycidplaceholder0000000000000000000000000",
+          "enforcementDelegationCid": "bafkreiecg2cy4mkcq7eueorkumzplvqanlfbuu6sooxhedxtytzl37exj4",
+          "contentSource": {
+            "kind": "kv",
+            "action": "tinycloud.kv/get",
+            "space": "tinycloud:pkh:eip155:1:0x1111111111111111111111111111111111111111:default",
+            "path": "documents"
+          },
+          "contentSourceDigest": "7fqQYsO4UnaGcR0wvqegCJDK0yhbCg_t1jcTnkMnjMo",
+          "holderDid": "did:key:z6MkkwkPX2eHiYAHpsG5a46pVaiux9wMcGX4AZuPZMkJJqAZ",
+          "nodeAudience": "did:web:node.example.corpus",
+          "action": "tinycloud.kv/put",
+          "actions": [
+            "tinycloud.kv/get",
+            "tinycloud.kv/list",
+            "tinycloud.kv/metadata",
+            "tinycloud.kv/put"
+          ],
+          "resource": "documents/plan.md",
+          "requestBodyDigest": "hAI_lcVies7ze84URlysLV84sMnjxGDZ3V6yLYDyi4w",
+          "invocation": {
+            "type": "TinyCloudShareReadInvocation",
+            "version": 2,
+            "sessionId": "session-corpus-001",
+            "shareCid": "bafkr4igymsbofgemembkwoicz5rrodd5httqnsgnayzxre74rr7lmibicq",
+            "shareId": "share-v2-corpus-registration",
+            "delegationCid": "bafyowner4registrationcorpusvector",
+            "policyCid": "bafkreicorpuspolicycidplaceholder0000000000000000000000000",
+            "envelopeCid": "bafkr4igymsbofgemembkwoicz5rrodd5httqnsgnayzxre74rr7lmibicq",
+            "registrationCid": "bafkreicz4ezocsy4zlo64tk32idyrowbbdzvxi7l2fywukht23bznhqdra",
+            "enforcementDelegationCid": "bafkreiecg2cy4mkcq7eueorkumzplvqanlfbuu6sooxhedxtytzl37exj4",
+            "contentSource": {
+              "kind": "kv",
+              "action": "tinycloud.kv/get",
+              "space": "tinycloud:pkh:eip155:1:0x1111111111111111111111111111111111111111:default",
+              "path": "documents"
+            },
+            "contentSourceDigest": "7fqQYsO4UnaGcR0wvqegCJDK0yhbCg_t1jcTnkMnjMo",
+            "holderDid": "did:key:z6MkkwkPX2eHiYAHpsG5a46pVaiux9wMcGX4AZuPZMkJJqAZ",
+            "nodeAudience": "did:web:node.example.corpus",
+            "action": "tinycloud.kv/put",
+            "actions": [
+              "tinycloud.kv/get",
+              "tinycloud.kv/list",
+              "tinycloud.kv/metadata",
+              "tinycloud.kv/put"
+            ],
+            "resource": "documents/plan.md",
+            "issuedAt": "2080-01-01T00:00:00.000Z",
+            "expiresAt": "2080-01-01T00:01:00.000Z",
+            "jti": "i7un5WFmzBFp3k41_sCACA",
+            "bodyDigest": "SjtdiC7UoCzghvH-PMhxOvyKN1WRKIydErpLPyv2fqw",
+            "ifMatch": "\"corpus-etag-1\"",
+            "contentType": "text/markdown",
+            "requestBodyDigest": "hAI_lcVies7ze84URlysLV84sMnjxGDZ3V6yLYDyi4w"
+          },
+          "proof": {
+            "alg": "EdDSA",
+            "kid": "did:key:z6MkkwkPX2eHiYAHpsG5a46pVaiux9wMcGX4AZuPZMkJJqAZ#z6MkkwkPX2eHiYAHpsG5a46pVaiux9wMcGX4AZuPZMkJJqAZ",
+            "signature": "62z4XEN1xWpyDTedFVtAQxDMnfcWV0mS03enNhRCdeKihlfXJ0Yt29prHqQXA-WovI-OWfSyVmrAkQ3t6XT5CA"
+          }
+        },
+        "body": "IyB1cGRhdGVkIGNvcnB1cyBib2R5",
+        "bodyDigest": "SjtdiC7UoCzghvH-PMhxOvyKN1WRKIydErpLPyv2fqw",
+        "ifMatch": "\"corpus-etag-1\"",
+        "contentType": "text/markdown"
+      },
+      "digest": "GwR91KmPfZRSE2ey724cOls06ONjcJlv_5n5I-3pa2s"
+    },
+    "invokePutResponse": {
+      "description": "Node /share/v2/invoke put response consumed by the production client.",
+      "producedBy": [
+        "ShareRecipientClient.ts:invokeNative"
+      ],
+      "value": {
+        "type": "TinyCloudShareInvokeResponse",
+        "version": 2,
+        "action": "tinycloud.kv/put",
+        "resource": "documents/plan.md",
+        "bodyDigest": "SjtdiC7UoCzghvH-PMhxOvyKN1WRKIydErpLPyv2fqw",
+        "etag": "\"corpus-etag-2\"",
+        "contentType": "text/markdown"
+      },
+      "digest": "A2irKAS94_GwZUmNhyJja3m8VQifgJqkMIibFGcSAI0"
+    },
+    "decodedResponses": {
+      "description": "Final decoded results the production client returns to the application for get/metadata/list/put.",
+      "producedBy": [
+        "ShareRecipientClient.ts:nativeGet/nativeMetadata/nativeList/nativeSave"
+      ],
+      "value": {
+        "get": {
+          "contentType": "application/json",
+          "size": 22,
+          "bytesBase64Url": "IyBjb3JwdXMgZG9jdW1lbnQgYm9keQ"
+        },
+        "metadata": {
+          "size": "23",
+          "contentType": "text/markdown"
+        },
+        "list": {
+          "keys": [
+            "documents/plan.md",
+            "documents/notes.md"
+          ],
+          "entries": [
+            {
+              "path": "documents/plan.md",
+              "kind": "file"
+            },
+            {
+              "path": "documents/notes.md",
+              "kind": "file"
+            }
+          ],
+          "truncated": false
+        },
+        "put": {
+          "etag": "\"corpus-etag-2\""
+        }
+      },
+      "digest": "-hXjrPhQ1AZFCjraJq6vPEJ1GAJ4Svy2gocRHXO3IL0"
+    }
+  },
+  "errors": {
+    "registrationTamperedCid": {
+      "description": "A one-byte-mutated registrationCid must be rejected by the production verifier.",
+      "producedBy": [
+        "owner-policy.ts:validateOwnerSharePolicyRegistrationBytes"
+      ],
+      "expectedCode": "Error",
+      "expectedMessageIncludes": "does not match its canonical core"
+    },
+    "deliveryTamperedDigest": {
+      "description": "A mutated requestBodyDigest in the delivery authorization must be rejected as unbound.",
+      "producedBy": [
+        "share-delivery.ts:validateShareDeliveryAuthorizationBytes"
+      ],
+      "expectedCode": "Error",
+      "expectedMessageIncludes": "not bound to the submitted request"
+    },
+    "deliveryWrongOpenCredentialsAudience": {
+      "description": "A delivery authorization whose openCredentialsAudience collapses into nodeAudience must be rejected fail-closed, even with a valid signature over the mutated object.",
+      "producedBy": [
+        "share-delivery.ts:validateShareDeliveryAuthorizationBytes"
+      ],
+      "expectedCode": "Error",
+      "expectedMessageIncludes": "openCredentialsAudience is missing or untrusted"
+    },
+    "invokeResponseIntegrityMismatch": {
+      "description": "A get response whose bodyDigest does not match its content must be rejected by the production client.",
+      "producedBy": [
+        "ShareRecipientClient.ts:invokeNative"
+      ],
+      "expectedCode": "SHARE_RESPONSE_INTEGRITY"
+    },
+    "challengeUntrustedSigner": {
+      "description": "A challenge/session proof signed by a key outside trustedSignerDids must be rejected before use.",
+      "producedBy": [
+        "ShareRecipientClient.ts:verifyNodeProof"
+      ],
+      "expectedCode": "SHARE_SIGNER_UNTRUSTED"
+    }
+  }
+}

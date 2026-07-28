@@ -14,6 +14,10 @@ pub mod m20260719_000002_policy_status_freshness;
 pub mod m20260724_000000_database_artifact_deltas;
 pub mod m20260724_000000_invocation_replay;
 pub mod m20260724_010000_current_kv;
+pub mod m20260725_000000_request_path_indexes;
+pub mod m20260726_000000_owner_share_policy;
+pub mod m20260726_000001_owner_share_policy_proof;
+pub mod m20260726_000002_owner_share_enforcement_bytes;
 
 pub struct Migrator;
 
@@ -36,6 +40,10 @@ impl MigratorTrait for Migrator {
             Box::new(m20260724_000000_invocation_replay::Migration),
             Box::new(m20260724_010000_current_kv::Migration),
             Box::new(m20260724_000000_database_artifact_deltas::Migration),
+            Box::new(m20260725_000000_request_path_indexes::Migration),
+            Box::new(m20260726_000000_owner_share_policy::Migration),
+            Box::new(m20260726_000001_owner_share_policy_proof::Migration),
+            Box::new(m20260726_000002_owner_share_enforcement_bytes::Migration),
         ]
     }
 }

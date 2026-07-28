@@ -58,6 +58,17 @@ COPY ./tinycloud.toml ./
 COPY --from=builder /scratch-tmp /tmp
 USER tinycloud:tinycloud
 ENV ROCKET_ADDRESS=0.0.0.0
+# Rocket's blocking-thread-pool cap (compiled-in default 512, from Rocket's
+# own Config::debug_default). Warm (space, db) SQL/DuckDB actors each park a
+# blocking thread for up to IDLE_TIMEOUT (300s); this must stay comfortably
+# above the observed peak warm-actor count, or new spawn_blocking work
+# (including tokio::fs) queues behind them instead of failing fast. NOTE:
+# ROCKET_-prefixed, not TINYCLOUD_-prefixed — Rocket builds its tokio runtime
+# from its own Figment before TinyCloud's config is loaded, so
+# TINYCLOUD_MAX_BLOCKING is silently ignored for this setting. Value picked
+# here is a conservative starting point pending real traffic data; flag for
+# reviewer sign-off.
+ENV ROCKET_MAX_BLOCKING=1024
 ENV TMPDIR=/data
 EXPOSE 8000
 EXPOSE 8001

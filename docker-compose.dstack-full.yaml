@@ -18,6 +18,7 @@ services:
       TINYCLOUD_LOG_LEVEL: normal
       TINYCLOUD_CORS: "true"
       ROCKET_ADDRESS: "0.0.0.0"
+      ROCKET_MAX_BLOCKING: "1024"
     depends_on:
       postgres:
         condition: service_healthy

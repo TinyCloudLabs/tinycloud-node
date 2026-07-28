@@ -1155,7 +1155,8 @@ Connection lifecycle (owned by `serve`, not the CLI):
   canonicalized and signed exactly like the claim/delete/cert payloads) as
   the first WebSocket message, then waits for `{"type":"ack"}`.
 - On ack, the socket is multiplexed: each proxied `request` +
-  `requestBody...` sequence is reassembled (bodies capped at 25MB, split
+  `requestBody...` sequence is reassembled (bodies capped at 100 MiB plus
+  sealed-blob framing, split
   across `requestBody`/`responseBody` frames of at most 256KB each per the
   relay's wire protocol), forwarded to `127.0.0.1:<public API port>`, and the
   response streamed back as `response` + `responseBody...` frames. A

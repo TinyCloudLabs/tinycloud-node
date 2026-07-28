@@ -306,14 +306,17 @@ fn build_case(
     let owner_seed = [0x55u8; 32];
     let owner = owner_did(&owner_seed);
     let expires_at = millis_time(now + time::Duration::hours(24));
-    let source = if kind == "kv" {
-        json!({"kind":"kv","space":SPACE,"path":"documents/policy-payload.md","action":"tinycloud.kv/get"})
+    let is_kv = kind.starts_with("kv");
+    let is_domain = kind == "kv-domain" || kind == "kv-folder-domain";
+    let is_folder = kind == "kv-folder-domain";
+    let source = if is_kv {
+        json!({"kind":"kv","space":SPACE,"path":if is_folder { "documents" } else { "documents/policy-payload.md" },"action":"tinycloud.kv/get"})
     } else {
         let arguments = json!({"document_id":123});
         json!({"kind":"sql","space":SPACE,"database":"documents","path":"shared/plan","statement":"shared_document_by_id","arguments":arguments,"argumentsDigest":sha256_b64(&value_bytes(&arguments)),"action":"tinycloud.sql/read"})
     };
     let source_digest = sha256_b64(&value_bytes(&source));
-    let policy = json!({"type":"TinyCloudSharePolicy","version":1,"recipientEmail":"sam@tinycloud.xyz","contentSource":source,"contentSourceDigest":source_digest,"action":source["action"],"resource":source["path"],"expiresAt":expires_at,"issuerDid":sender_did});
+    let policy = json!({"type":"TinyCloudSharePolicy","version":2,"recipientMatcher":if is_domain { json!({"kind":"emailDomain","value":"mailinator.com"}) } else { json!({"kind":"exactEmail","value":"sam@tinycloud.xyz"}) },"contentSource":source,"contentSourceDigest":source_digest,"actions":if is_folder { json!(["tinycloud.kv/get","tinycloud.kv/list","tinycloud.kv/put"]) } else if is_domain { json!(["tinycloud.kv/get"]) } else if is_kv { json!(["tinycloud.kv/get","tinycloud.kv/put"]) } else { json!([source["action"]]) },"resource":if is_folder { json!({"kind":"prefix","value":"documents"}) } else { json!({"kind":"exact","value":source["path"]}) },"expiresAt":expires_at,"issuerDid":sender_did});
     let policy_bytes = value_bytes(&policy);
     let policy_cid = cid(0x55, Code::Sha2_256, &policy_bytes);
     let delegation_cid = cid(
@@ -321,14 +324,26 @@ fn build_case(
         Code::Sha2_256,
         format!("n4-production-delegation-{kind}").as_bytes(),
     );
-    let capability = if kind == "kv" {
-        json!({"service":"tinycloud.kv","space":SPACE,"path":"documents/policy-payload.md","actions":["tinycloud.kv/get"]})
+    let capabilities = if is_folder {
+        vec![
+            json!({"service":"tinycloud.kv","space":SPACE,"path":"documents","actions":["tinycloud.kv/list"]}),
+            json!({"service":"tinycloud.kv","space":SPACE,"path":"documents/policy-payload.md","actions":["tinycloud.kv/get","tinycloud.kv/put"]}),
+        ]
+    } else if is_kv {
+        vec![
+            json!({"service":"tinycloud.kv","space":SPACE,"path":"documents/policy-payload.md","actions":["tinycloud.kv/get","tinycloud.kv/put"]}),
+        ]
     } else {
-        json!({"service":"tinycloud.sql","space":SPACE,"path":"shared/plan","actions":["tinycloud.sql/read"],"caveats":{"mode":"constrained-statements","readOnly":true,"statements":[{"name":"shared_document_by_id","sql":"SELECT markdown FROM shared_documents WHERE document_id = ?","fixedParams":[{"index":0,"value":123}]}]}})
+        vec![
+            json!({"service":"tinycloud.sql","space":SPACE,"path":"shared/plan","actions":["tinycloud.sql/read"],"caveats":{"mode":"constrained-statements","readOnly":true,"statements":[{"name":"shared_document_by_id","sql":"SELECT markdown FROM shared_documents WHERE document_id = ?","fixedParams":[{"index":0,"value":123}]}]}}),
+        ]
     };
-    let parsed =
-        parse_capability(&capability).map_err(|error| anyhow::anyhow!("capability: {error:?}"))?;
-    let capability_hash = requested_capabilities_hash_hex(&[parsed]);
+    let parsed = capabilities
+        .iter()
+        .map(parse_capability)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| anyhow::anyhow!("capability: {error:?}"))?;
+    let capability_hash = requested_capabilities_hash_hex(&parsed);
     let policy_digest = sha256_hex(&policy_bytes);
     let policy_id = format!("pol_n4-production-{kind}");
     let mut common = BTreeMap::new();
@@ -370,7 +385,7 @@ fn build_case(
     let authority_parent = signed_parent(
         "policy-authority",
         &config.node_audience,
-        std::slice::from_ref(&capability),
+        &capabilities,
         &common,
         &owner_seed,
         &owner,
@@ -380,7 +395,7 @@ fn build_case(
     let enforcement_parent = signed_parent(
         "policy-enforcement",
         &node_did,
-        &[capability],
+        &capabilities,
         &enforcement,
         &owner_seed,
         &owner,
@@ -408,7 +423,10 @@ fn build_case(
         .to_bytes();
     let enrollment = json!({"targetOrigin":config.target_origin,"nodeAudience":config.node_audience,"invitationKid":config.invitation_kid,"invitationPublicKey":b64(&invitation_public),"keyVersion":1,"enabled":true});
     let status_now = canonical_time(now);
-    let status_fresh = canonical_time(now + time::Duration::seconds(240));
+    // Authority observations deliberately use the production five-minute
+    // freshness bound; the browser gate must complete admission inside that
+    // window rather than bypassing revocation freshness in the fixture.
+    let status_fresh = canonical_time(now + time::Duration::seconds(300));
     let policy_parent_cid = authority_parent["delegationCid"].as_str().expect("cid");
     let enforcement_parent_cid = enforcement_parent["delegationCid"].as_str().expect("cid");
     let authority_status = status(
@@ -426,7 +444,8 @@ fn build_case(
         &node_did,
     );
     let attestation = attestation(config, &enrollment, &node_did, &status_fresh, node);
-    let authority = json!({"type":"TinyCloudShareAuthorityMaterial","version":1,"handle":format!("amh_{kind}_001"),"policyOwnerDid":owner,"senderDid":sender_did,"relationship":{"policyOwnerDid":owner,"senderDid":sender_did,"authenticated":true},"mapping":{"sharePolicyCid":policy_cid,"shareDelegationCid":delegation_cid,"policyAuthorityCid":policy_parent_cid,"policyEnforcementCid":enforcement_parent_cid},"policyAuthorityBytes":b64(&authority_parent_bytes),"policyAuthorityCid":policy_parent_cid,"policyEnforcementBytes":b64(&enforcement_parent_bytes),"policyEnforcementCid":enforcement_parent_cid,"statusObservations":[authority_status,enforcement_status],"enrollment":enrollment,"attestation":attestation});
+    let authority_handle = if is_kv { "amh_kv_001" } else { "amh_sql_001" };
+    let authority = json!({"type":"TinyCloudShareAuthorityMaterial","version":1,"handle":authority_handle,"policyOwnerDid":owner,"senderDid":sender_did,"relationship":{"policyOwnerDid":owner,"senderDid":sender_did,"authenticated":true},"mapping":{"sharePolicyCid":policy_cid,"shareDelegationCid":delegation_cid,"policyAuthorityCid":policy_parent_cid,"policyEnforcementCid":enforcement_parent_cid},"policyAuthorityBytes":b64(&authority_parent_bytes),"policyAuthorityCid":policy_parent_cid,"policyEnforcementBytes":b64(&enforcement_parent_bytes),"policyEnforcementCid":enforcement_parent_cid,"statusObservations":[authority_status,enforcement_status],"enrollment":enrollment,"attestation":attestation});
     let authority_digest = sha256_b64(&value_bytes(&authority));
     Ok(Case {
         kind,
@@ -437,7 +456,7 @@ fn build_case(
         authority,
         authority_digest,
         expires_at,
-        content: if kind == "kv" {
+        content: if is_kv {
             "# TinyCloud policy payload test\n\nPolicy-authorized payload consumption succeeded."
         } else {
             "# SQL production plan\n"
@@ -449,6 +468,7 @@ fn descriptor(
     config: &FixtureConfig,
     cases: &[Case],
     node: &tinycloud_core::libp2p::identity::Keypair,
+    enforcer_did: &str,
     issuer_public: &str,
     trust_bundle: &Value,
     url: &str,
@@ -466,10 +486,10 @@ fn descriptor(
             json!({
                 "shareId": share_id,
                 "policyCid": case.policy_cid,
-                "recipientEmail": "sam@tinycloud.xyz",
+                "recipientEmail": if case.kind == "kv-domain" || case.kind == "kv-folder-domain" { "sam@mailinator.com" } else { "sam@tinycloud.xyz" },
                 "expiry": case.expires_at,
                 "delegationCid": case.delegation_cid,
-                "authorityMaterialHandle": format!("amh_{}_001", case.kind),
+                "authorityMaterialHandle": case.authority["handle"].clone(),
                 "authorityMaterialDigest": case.authority_digest,
                 "contentSource": case.source,
                 "contentSourceDigest": sha256_b64(&value_bytes(&case.source)),
@@ -478,13 +498,13 @@ fn descriptor(
             })
         }).collect::<Vec<_>>();
         json!({
-        "kind":case.kind,"source":case.source,"policy":case.policy,"expectedContentSourceDigest":sha256_b64(&value_bytes(&case.source)),"expectedRecipientEmail":"sam@tinycloud.xyz","expiresAt":case.expires_at,
-        "policyCid":case.policy_cid,"delegationCid":case.delegation_cid,"authorityMaterialHandle":format!("amh_{}_001",case.kind),"authorityMaterialDigest":case.authority_digest,
+        "kind":case.kind,"source":case.source,"policy":case.policy,"expectedContentSourceDigest":sha256_b64(&value_bytes(&case.source)),"expectedRecipientEmail":if case.kind == "kv-domain" || case.kind == "kv-folder-domain" { "sam@mailinator.com" } else { "sam@tinycloud.xyz" },"expiresAt":case.expires_at,
+        "policyCid":case.policy_cid,"delegationCid":case.delegation_cid,"authorityMaterialHandle":case.authority["handle"].clone(),"authorityMaterialDigest":case.authority_digest,
         "policyOwnerDid":case.authority["policyOwnerDid"],"senderDid":case.authority["senderDid"],"senderPrivateKey":b64(&sender_seed),"delegation":format!("uCAESA.n4-production.{}",case.kind),"spaceId":SPACE,"documentName":if case.kind == "kv" { "TinyCloud share test" } else { "Project plan.md" },"senderTrust":"verified","authorityMaterial":case.authority,"targetOrigin":config.target_origin,"nodeAudience":config.node_audience,
         "trustedNode":{"targetOrigin":config.target_origin,"nodeAudience":config.node_audience,"invitationKid":config.invitation_kid,"invitationPublicKey":b64(&node_public),"keyVersion":1,"enabled":true},"authoritativeBinding":authoritative_bindings[0],"authoritativeBindings":authoritative_bindings,"expectedContent":case.content
         })
     }).collect::<Vec<_>>();
-    json!({"production":true,"service":"tinycloud-node-production-e2e","url":url,"healthUrl":format!("{url}/healthz"),"issuerDid":ISSUER_DID,"issuerKid":ISSUER_KID,"issuerPublicKey":issuer_public,"trustBundle":trust_bundle,"capability":{"id":"tinycloud.node-policy-email-v1","version":1,"origin":config.target_origin,"routes":tinycloud_node::share_email::NODE_CAPABILITY_ROUTES,"contentKinds":["kv","sql"],"status":"ready"},"trustedNode":{"targetOrigin":config.target_origin,"nodeAudience":config.node_audience,"invitationKid":config.invitation_kid,"invitationPublicKey":b64(&node_public),"keyVersion":1,"enabled":true},"senderDid":did_key(&sender),"cases":case_values})
+    json!({"production":true,"service":"tinycloud-node-production-e2e","url":url,"healthUrl":format!("{url}/healthz"),"issuerDid":ISSUER_DID,"issuerKid":ISSUER_KID,"issuerPublicKey":issuer_public,"nodeId":enforcer_did,"trustBundle":trust_bundle,"capability":{"id":"tinycloud.node-policy-email-v1","version":1,"origin":config.target_origin,"routes":tinycloud_node::share_email::NODE_CAPABILITY_ROUTES,"contentKinds":["kv","sql"],"status":"ready"},"trustedNode":{"targetOrigin":config.target_origin,"nodeAudience":config.node_audience,"invitationKid":config.invitation_kid,"invitationPublicKey":b64(&node_public),"keyVersion":1,"enabled":true},"senderDid":did_key(&sender),"cases":case_values})
 }
 
 fn figment(
@@ -826,6 +846,7 @@ async fn run() -> Result<()> {
     }
     let node_secret = tinycloud_core::keys::StaticSecret::new(secret.clone())
         .map_err(|_| anyhow::anyhow!("invalid key secret"))?;
+    let enforcer_did = node_secret.node_did();
     let signing = node_secret.derive_key(b"tinycloud/share-email/invitation-signing");
     let node = ed_key(signing);
     if let Some(expected) = args
@@ -848,6 +869,8 @@ async fn run() -> Result<()> {
         .and_then(|value| value.replace_nanosecond(0))?;
     let cases = vec![
         build_case(&fixture_config, "kv", &sender, &node, now)?,
+        build_case(&fixture_config, "kv-domain", &sender, &node, now)?,
+        build_case(&fixture_config, "kv-folder-domain", &sender, &node, now)?,
         build_case(&fixture_config, "sql", &sender, &node, now)?,
     ];
     let temp = TempDir::new().context("temporary fixture directory")?;
@@ -917,6 +940,7 @@ async fn run() -> Result<()> {
         &fixture_config,
         &cases,
         &node,
+        &enforcer_did,
         &issuer_public,
         &trust_bundle,
         &format!("http://127.0.0.1:{port}"),

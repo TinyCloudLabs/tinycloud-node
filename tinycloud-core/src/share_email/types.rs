@@ -2,14 +2,26 @@
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fmt};
 use thiserror::Error;
 use time::OffsetDateTime;
 
 pub const KV_GET_ACTION: &str = "tinycloud.kv/get";
+pub const KV_METADATA_ACTION: &str = "tinycloud.kv/metadata";
+pub const KV_LIST_ACTION: &str = "tinycloud.kv/list";
+pub const KV_PUT_ACTION: &str = "tinycloud.kv/put";
 pub const SQL_READ_ACTION: &str = "tinycloud.sql/read";
 pub const MARKDOWN_MEDIA_TYPE: &str = "text/markdown; charset=utf-8";
 pub const MAX_MARKDOWN_BYTES: usize = 1_048_576;
+/// Addressed native KV content has the product-wide sharing ceiling. The
+/// Markdown adapters intentionally retain their stricter validation boundary.
+pub const MAX_NATIVE_SHARE_CONTENT_BYTES: usize = 100 * 1024 * 1024;
+/// Native JSON carries content as base64url, so request and response ceilings
+/// are separate from the plaintext product limit.
+pub const MAX_NATIVE_ENCODED_REQUEST_BYTES: usize =
+    (MAX_NATIVE_SHARE_CONTENT_BYTES / 3) * 4 + 2_000_000;
+pub const MAX_NATIVE_RESPONSE_BYTES: usize = MAX_NATIVE_ENCODED_REQUEST_BYTES + 4_000_000;
 pub const MAX_CID_BYTES: usize = 59;
 pub const MAX_SHARE_ID_BYTES: usize = 128;
 pub const MAX_DATABASE_NAME_BYTES: usize = 128;
@@ -50,6 +62,8 @@ pub enum TypeError {
     InvalidNodeDelegationCid,
     #[error("invalid safe JSON integer")]
     InvalidSafeJsonInteger,
+    #[error("invalid recipient matcher")]
+    InvalidRecipientMatcher,
 }
 
 fn redact(formatter: &mut fmt::Formatter<'_>, name: &str) -> fmt::Result {
@@ -532,6 +546,20 @@ impl fmt::Debug for SafeJsonInteger {
 pub enum KvGetAction {
     #[serde(rename = "tinycloud.kv/get")]
     Get,
+    #[serde(rename = "tinycloud.kv/list")]
+    List,
+    #[serde(rename = "tinycloud.kv/put")]
+    Put,
+}
+
+impl KvGetAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => KV_GET_ACTION,
+            Self::List => KV_LIST_ACTION,
+            Self::Put => KV_PUT_ACTION,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -544,8 +572,127 @@ pub enum SqlReadAction {
 pub enum ShareAction {
     #[serde(rename = "tinycloud.kv/get")]
     KvGet,
+    #[serde(rename = "tinycloud.kv/metadata")]
+    KvMetadata,
+    #[serde(rename = "tinycloud.kv/list")]
+    KvList,
+    #[serde(rename = "tinycloud.kv/put")]
+    KvPut,
     #[serde(rename = "tinycloud.sql/read")]
     SqlRead,
+}
+
+impl ShareAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::KvGet => KV_GET_ACTION,
+            Self::KvMetadata => KV_METADATA_ACTION,
+            Self::KvList => KV_LIST_ACTION,
+            Self::KvPut => KV_PUT_ACTION,
+            Self::SqlRead => SQL_READ_ACTION,
+        }
+    }
+
+    pub const fn is_kv(self) -> bool {
+        matches!(
+            self,
+            Self::KvGet | Self::KvMetadata | Self::KvList | Self::KvPut
+        )
+    }
+
+    pub const fn is_list(self) -> bool {
+        matches!(self, Self::KvList)
+    }
+
+    pub const fn is_edit(self) -> bool {
+        matches!(self, Self::KvPut)
+    }
+}
+
+/// The recipient authorization matcher is deliberately separate from the
+/// delivery address.  A domain policy is matched only against the complete
+/// `/email` disclosure authenticated by the OpenCredentials verifier.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", deny_unknown_fields)]
+pub enum RecipientMatcher {
+    #[serde(rename = "exactEmail")]
+    ExactEmail(String),
+    #[serde(rename = "emailDomain")]
+    EmailDomain(String),
+}
+
+impl RecipientMatcher {
+    pub fn canonical(&self) -> Result<String, TypeError> {
+        match self {
+            Self::ExactEmail(value) => tinycloud_auth::share_email_evidence::normalize_email(value)
+                .map(|value| format!("exactEmail:{value}"))
+                .map_err(|_| TypeError::InvalidRecipientMatcher),
+            Self::EmailDomain(value) => {
+                tinycloud_auth::share_email_evidence::normalize_policy_domain(value)
+                    .map(|value| format!("emailDomain:{value}"))
+                    .map_err(|_| TypeError::InvalidRecipientMatcher)
+            }
+        }
+    }
+
+    /// Preserve the v1 exact-email digest preimage while giving v2 domain
+    /// matchers a distinct canonical preimage.
+    pub fn digest_material(&self) -> Result<String, TypeError> {
+        match self {
+            Self::ExactEmail(value) => tinycloud_auth::share_email_evidence::normalize_email(value)
+                .map_err(|_| TypeError::InvalidRecipientMatcher),
+            Self::EmailDomain(_) => self.canonical(),
+        }
+    }
+
+    /// V2 policy and invitation artifacts carry the normalized matcher, not
+    /// merely a matcher that can be normalized later.  This keeps the signed
+    /// bytes and the value consumed by Share/OpenCredentials identical.
+    pub fn is_canonical(&self) -> bool {
+        match self {
+            Self::ExactEmail(value) => tinycloud_auth::share_email_evidence::normalize_email(value)
+                .is_ok_and(|normalized| normalized == *value),
+            Self::EmailDomain(value) => {
+                tinycloud_auth::share_email_evidence::normalize_policy_domain(value)
+                    .is_ok_and(|normalized| normalized == *value)
+            }
+        }
+    }
+
+    pub fn matches_verified_email(&self, verified_email: &str) -> bool {
+        match self {
+            Self::ExactEmail(expected) => {
+                tinycloud_auth::share_email_evidence::normalize_email(expected)
+                    .ok()
+                    .zip(tinycloud_auth::share_email_evidence::normalize_email(verified_email).ok())
+                    .is_some_and(|(expected, actual)| expected == actual)
+            }
+            Self::EmailDomain(expected) => {
+                tinycloud_auth::share_email_evidence::normalize_email_domain(verified_email)
+                    .ok()
+                    .zip(
+                        tinycloud_auth::share_email_evidence::normalize_policy_domain(expected)
+                            .ok(),
+                    )
+                    .is_some_and(|(expected, actual)| expected == actual)
+            }
+        }
+    }
+
+    pub fn is_domain(&self) -> bool {
+        matches!(self, Self::EmailDomain(_))
+    }
+}
+
+impl fmt::Debug for RecipientMatcher {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ExactEmail(_) => formatter.write_str("RecipientMatcher::ExactEmail([REDACTED])"),
+            Self::EmailDomain(_) => {
+                formatter.write_str("RecipientMatcher::EmailDomain([REDACTED])")
+            }
+        }
+    }
 }
 
 impl fmt::Debug for ShareAction {
@@ -554,12 +701,148 @@ impl fmt::Debug for ShareAction {
     }
 }
 
+/// The canonical resource ceiling used by v2 share policy state.  Keeping
+/// this as a typed object prevents callers from smuggling the browser's
+/// `{kind,path}` shape (or an untyped string) into the authority CID.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SharePolicyResource {
+    pub kind: SharePolicyResourceKind,
+    pub value: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SharePolicyResourceKind {
+    Exact,
+    Prefix,
+}
+
+impl fmt::Debug for SharePolicyResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SharePolicyResource { [REDACTED] }")
+    }
+}
+
+impl fmt::Debug for SharePolicyResourceKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SharePolicyResourceKind([REDACTED])")
+    }
+}
+
+/// Canonical v2 policy state emitted by the Node authority boundary.
+///
+/// This is deliberately stricter than the v1 compatibility state: all keys
+/// are fixed, actions are typed, and resources use `{kind,value}`.  The
+/// canonical JSON bytes of this value are the Share policy CID preimage.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SharePolicyV2 {
+    #[serde(rename = "type")]
+    pub artifact_type: String,
+    pub version: u8,
+    pub recipient_matcher: RecipientMatcher,
+    pub content_source: ContentSource,
+    pub content_source_digest: Sha256Digest,
+    pub actions: Vec<ShareAction>,
+    pub resource: SharePolicyResource,
+    pub expires_at: String,
+    pub issuer_did: Did,
+}
+
+impl fmt::Debug for SharePolicyV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SharePolicyV2 { [REDACTED] }")
+    }
+}
+
+impl SharePolicyV2 {
+    pub fn validate(&self) -> Result<(), TypeError> {
+        if self.artifact_type != "TinyCloudSharePolicy"
+            || self.version != 2
+            || self.actions.is_empty()
+            || self
+                .actions
+                .windows(2)
+                .any(|pair| pair[0].as_str() >= pair[1].as_str())
+            || self
+                .actions
+                .iter()
+                .any(|action| matches!(action, ShareAction::SqlRead))
+                && self.actions.len() > 1
+        {
+            return Err(TypeError::InvalidRecipientMatcher);
+        }
+        let source_path = match &self.content_source {
+            ContentSource::Kv { path, .. } | ContentSource::Sql { path, .. } => path,
+        };
+        if match &self.content_source {
+            ContentSource::Kv { .. } => self.actions.iter().any(|action| !action.is_kv()),
+            ContentSource::Sql { .. } => self.actions != [ShareAction::SqlRead],
+        } {
+            return Err(TypeError::InvalidRecipientMatcher);
+        }
+        if !self.recipient_matcher.is_canonical() {
+            return Err(TypeError::InvalidRecipientMatcher);
+        }
+        let source_value = serde_json::to_value(&self.content_source)
+            .map_err(|_| TypeError::InvalidRecipientMatcher)?;
+        let source_digest = Sha256Digest::from_bytes(
+            Sha256::digest(crate::policy_capability::jcs::canonicalize(&source_value)).into(),
+        );
+        if source_digest != self.content_source_digest {
+            return Err(TypeError::InvalidRecipientMatcher);
+        }
+        let expiry = OffsetDateTime::parse(
+            &self.expires_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .map_err(|_| TypeError::InvalidRecipientMatcher)?;
+        let canonical_expiry = expiry
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|_| TypeError::InvalidRecipientMatcher)?;
+        let canonical_millis_expiry = format!(
+            "{}.000Z",
+            canonical_expiry
+                .strip_suffix('Z')
+                .ok_or(TypeError::InvalidRecipientMatcher)?
+        );
+        if self.expires_at != canonical_expiry && self.expires_at != canonical_millis_expiry {
+            return Err(TypeError::InvalidRecipientMatcher);
+        }
+        if self.resource.value.is_empty() {
+            if self.resource.kind != SharePolicyResourceKind::Prefix
+                || !source_path.as_str().is_empty()
+            {
+                return Err(TypeError::InvalidPath);
+            }
+        } else {
+            let path = Path::parse(self.resource.value.clone())?;
+            validate_share_path(&path, false)?;
+            if !same_or_descendant_path(source_path, &path) {
+                return Err(TypeError::InvalidPath);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn same_or_descendant_path(prefix: &Path, candidate: &Path) -> bool {
+    prefix.as_str() == candidate.as_str()
+        || candidate
+            .as_str()
+            .strip_prefix(prefix.as_str())
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 pub type Action = ShareAction;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExactResource {
     #[serde(rename = "kv")]
     Kv { path: Path },
+    #[serde(rename = "kvPrefix")]
+    KvPrefix { path: Path },
     #[serde(rename = "sql")]
     Sql {
         database: DatabaseName,
@@ -572,9 +855,37 @@ impl fmt::Debug for ExactResource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Kv { .. } => formatter.write_str("ExactResource::Kv { [REDACTED] }"),
+            Self::KvPrefix { .. } => formatter.write_str("ExactResource::KvPrefix { [REDACTED] }"),
             Self::Sql { .. } => formatter.write_str("ExactResource::Sql { [REDACTED] }"),
         }
     }
+}
+
+/// Validate the segment-aware path contract used by share scopes. The generic
+/// `Path` type intentionally remains permissive for legacy capability APIs;
+/// share authorization must reject traversal, empty segments, and ambiguous
+/// slash forms before a scope reaches the authority kernel.
+pub fn validate_share_path(path: &Path, allow_root: bool) -> Result<(), TypeError> {
+    let value = path.as_str();
+    if value.is_empty() {
+        return allow_root.then_some(()).ok_or(TypeError::InvalidPath);
+    }
+    if value.starts_with('/')
+        || value.ends_with('/')
+        || value.contains("//")
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b'\\')
+    {
+        return Err(TypeError::InvalidPath);
+    }
+    if value
+        .split('/')
+        .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+    {
+        return Err(TypeError::InvalidPath);
+    }
+    Ok(())
 }
 
 pub type Resource = ExactResource;
@@ -624,9 +935,117 @@ pub struct ShareScope {
     pub node_audience: Did,
     pub target_origin: TargetOrigin,
     pub action: ShareAction,
+    /// The authenticated policy action ceiling. `action` is the operation
+    /// selected for this request; this set permits only bounded attenuation.
+    pub allowed_actions: Vec<ShareAction>,
     pub resource: ExactResource,
     pub content_source: ContentSource,
     pub content_source_digest: Sha256Digest,
+}
+
+/// Return true only when `candidate` is the immediate child of `prefix`.
+pub fn is_direct_child_path(prefix: &Path, candidate: &Path) -> bool {
+    let remainder = if prefix.as_str().is_empty() {
+        candidate.as_str()
+    } else {
+        candidate
+            .as_str()
+            .strip_prefix(&format!("{}/", prefix.as_str()))
+            .unwrap_or("")
+    };
+    !remainder.is_empty() && !remainder.contains('/')
+}
+
+/// Opaque, scope-bound direct-child cursor. It intentionally contains only
+/// digests and a lexical position; decoding requires the caller to compare all
+/// binding fields with the currently verified session before using `last`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ShareCursor {
+    pub version: u8,
+    pub subject_digest: Sha256Digest,
+    pub scope_digest: Sha256Digest,
+    pub source_digest: Sha256Digest,
+    pub action: ShareAction,
+    pub prefix: Path,
+    pub limit: u16,
+    pub last: Path,
+    /// Node-authenticated cursors carry a MAC.  The optional form keeps the
+    /// legacy in-memory constructor usable for protocol fixtures; production
+    /// HTTP handlers must require and verify this field before using `last`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<Sha256Digest>,
+}
+
+impl fmt::Debug for ShareCursor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ShareCursor { [REDACTED] }")
+    }
+}
+
+impl ShareCursor {
+    pub fn new(scope: &ShareScope, holder: &DidKey, limit: usize, last: Path) -> Self {
+        let scope_bytes = crate::policy_capability::jcs::canonicalize(
+            &serde_json::to_value(scope).expect("share scope serializes"),
+        );
+        let scope_digest = Sha256Digest::from_bytes(Sha256::digest(scope_bytes).into());
+        let subject_digest = Sha256Digest::from_bytes(Sha256::digest(holder.as_str()).into());
+        Self {
+            version: 1,
+            subject_digest,
+            scope_digest,
+            source_digest: scope.content_source_digest.clone(),
+            action: scope.action,
+            prefix: match &scope.resource {
+                ExactResource::Kv { path }
+                | ExactResource::KvPrefix { path }
+                | ExactResource::Sql { path, .. } => path.clone(),
+            },
+            limit: limit.min(u16::MAX as usize) as u16,
+            last,
+            mac: None,
+        }
+    }
+
+    pub fn matches(&self, scope: &ShareScope, holder: &DidKey, limit: usize) -> bool {
+        let expected = Self::new(scope, holder, limit, self.last.clone());
+        self.version == 1
+            && self.subject_digest == expected.subject_digest
+            && self.scope_digest == expected.scope_digest
+            && self.source_digest == expected.source_digest
+            && self.action == expected.action
+            && self.prefix == expected.prefix
+            && self.limit == expected.limit
+            && validate_share_path(&self.last, false).is_ok()
+    }
+
+    pub fn encode(&self) -> Result<String, TypeError> {
+        let bytes = crate::policy_capability::jcs::canonicalize(
+            &serde_json::to_value(self).map_err(|_| TypeError::InvalidBase64("cursor"))?,
+        );
+        Ok(URL_SAFE_NO_PAD.encode(bytes))
+    }
+
+    pub fn decode(value: &str) -> Result<Self, TypeError> {
+        if value.len() > 4096 {
+            return Err(TypeError::InvalidBase64("cursor"));
+        }
+        let bytes = URL_SAFE_NO_PAD
+            .decode(value)
+            .map_err(|_| TypeError::InvalidBase64("cursor"))?;
+        let cursor: Self =
+            serde_json::from_slice(&bytes).map_err(|_| TypeError::InvalidBase64("cursor"))?;
+        let canonical = cursor.encode()?;
+        if cursor.version != 1
+            || cursor.limit == 0
+            || validate_share_path(&cursor.prefix, true).is_err()
+            || validate_share_path(&cursor.last, false).is_err()
+            || canonical != value
+        {
+            return Err(TypeError::InvalidBase64("cursor"));
+        }
+        Ok(cursor)
+    }
 }
 
 impl fmt::Debug for ShareScope {
@@ -879,6 +1298,10 @@ mod tests {
         assert!(Path::parse("documents/plan.md").is_ok());
         assert!(Path::parse("/documents/plan.md").is_err());
         assert!(Path::parse("documents/../plan.md").is_err());
+        assert!(validate_share_path(&Path::parse("folder").unwrap(), false).is_ok());
+        assert!(validate_share_path(&Path::parse("folder").unwrap(), true).is_ok());
+        assert!(Path::parse("folder/../secret").is_err());
+        assert!(Path::parse("folder//child").is_err());
         assert!(DatabaseName::parse("content_db").is_ok());
         assert!(DatabaseName::parse("9_content-db").is_ok());
         assert!(DatabaseName::parse("content.db").is_err());
@@ -927,6 +1350,43 @@ mod tests {
     }
 
     #[test]
+    fn v2_policy_is_canonical_and_rejects_browser_resource_shapes() {
+        let source = serde_json::json!({
+            "kind": "kv",
+            "action": "tinycloud.kv/get",
+            "space": "did:web:space.example",
+            "path": "documents"
+        });
+        let source_digest = Sha256Digest::from_bytes(
+            Sha256::digest(crate::policy_capability::jcs::canonicalize(&source)).into(),
+        );
+        let value = serde_json::json!({
+            "type": "TinyCloudSharePolicy",
+            "version": 2,
+            "recipientMatcher": {"kind": "emailDomain", "value": "example.com"},
+            "contentSource": source,
+            "contentSourceDigest": source_digest,
+            "actions": ["tinycloud.kv/get"],
+            "resource": {"kind": "prefix", "value": "documents"},
+            "expiresAt": "2027-01-01T00:00:00Z",
+            "issuerDid": "did:web:sender.example"
+        });
+        let policy: SharePolicyV2 = serde_json::from_value(value.clone()).unwrap();
+        assert!(policy.validate().is_ok());
+
+        let mut browser_shape = value;
+        browser_shape["resource"] = serde_json::json!({
+            "kind": "prefix",
+            "path": "documents"
+        });
+        assert!(serde_json::from_value::<SharePolicyV2>(browser_shape).is_err());
+
+        let mut unknown = serde_json::to_value(policy).unwrap();
+        unknown["target"] = serde_json::json!("https://share.example");
+        assert!(serde_json::from_value::<SharePolicyV2>(unknown).is_err());
+    }
+
+    #[test]
     fn stable_identifiers_are_redacted_from_debug() {
         let scope = ShareScope {
             share_cid: ShareCid::parse(KV_SHARE_CID).unwrap(),
@@ -938,6 +1398,7 @@ mod tests {
             node_audience: Did::parse("did:web:node.example").unwrap(),
             target_origin: TargetOrigin::parse("https://node.example").unwrap(),
             action: ShareAction::KvGet,
+            allowed_actions: vec![ShareAction::KvGet],
             resource: ExactResource::Kv {
                 path: Path::parse("documents/secret.md").unwrap(),
             },
@@ -959,6 +1420,21 @@ mod tests {
         ] {
             assert!(!debug.contains(secret), "debug leaked {secret}: {debug}");
         }
+        let holder = DidKey::parse(HOLDER).unwrap();
+        let cursor = ShareCursor::new(
+            &scope,
+            &holder,
+            25,
+            Path::parse("documents/secret.md").unwrap(),
+        );
+        let encoded = cursor.encode().unwrap();
+        assert!(!encoded.contains("documents"));
+        let decoded = ShareCursor::decode(&encoded).unwrap();
+        assert!(decoded.matches(&scope, &holder, 25));
+        let mut changed = scope.clone();
+        changed.action = ShareAction::KvPut;
+        assert!(!decoded.matches(&changed, &holder, 25));
+        assert!(ShareCursor::decode(&format!("{encoded}x")).is_err());
     }
 
     #[test]

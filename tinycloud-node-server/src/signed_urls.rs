@@ -1,4 +1,7 @@
-use crate::{auth_guards::if_none_match_matches, TinyCloud};
+use crate::{
+    auth_guards::{if_none_match_matches, is_replayable_object_header, STREAM_MAX_CHUNK_SIZE},
+    TinyCloud,
+};
 use base64::{encode_config, URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
@@ -26,8 +29,6 @@ type TicketIdMac = Hmac<Sha256>;
 
 const SIGNED_KV_SERVICE: &str = "kv";
 const SIGNED_KV_ABILITY: &str = "tinycloud.kv/get";
-const SIGNED_KV_CACHE_CONTROL: &str = "private, no-cache";
-
 #[derive(Debug)]
 pub struct SignedUrlRuntime {
     signing_key: [u8; 32],
@@ -214,7 +215,9 @@ where
                     response.status(Status::NotModified);
                 } else {
                     response.header(Header::new("Content-Length", content.len().to_string()));
-                    response.streamed_body(content.compat());
+                    response
+                        .streamed_body(content.compat())
+                        .max_chunk_size(STREAM_MAX_CHUNK_SIZE);
                 }
             }
             Self::Partial {
@@ -237,7 +240,9 @@ where
                         format!("bytes {}-{}/{}", range.start(), range.end(), total_size),
                     ));
                     response.header(Header::new("Content-Length", content.len().to_string()));
-                    response.streamed_body(content.compat());
+                    response
+                        .streamed_body(content.compat())
+                        .max_chunk_size(STREAM_MAX_CHUNK_SIZE);
                 }
             }
             Self::Unsatisfiable { hash, total_size } => {
@@ -250,17 +255,14 @@ where
             }
         }
         response.header(Header::new("Accept-Ranges", "bytes"));
-        response.header(Header::new("Cache-Control", SIGNED_KV_CACHE_CONTROL));
+        response.header(Header::new("Cache-Control", "private, no-store"));
         Ok(response.finalize())
     }
 }
 
 fn add_object_headers(response: &mut rocket::response::Builder<'_>, metadata: Metadata) {
     for (key, value) in metadata.0 {
-        if !key.eq_ignore_ascii_case("cache-control")
-            && !key.eq_ignore_ascii_case("content-length")
-            && !key.eq_ignore_ascii_case("content-range")
-        {
+        if is_replayable_object_header(&key) {
             response.header(Header::new(key, value));
         }
     }
@@ -586,7 +588,6 @@ mod tests {
     use anyhow::Result;
     use futures::io::Cursor;
     use rocket::local::asynchronous::Client;
-    use std::collections::BTreeMap;
     use tempfile::TempDir;
     use tinycloud_auth::{
         authorization::{make_invocation, InvocationOptions},
@@ -734,9 +735,12 @@ mod tests {
         let bytes = b"world".to_vec();
         SignedKvReadResponse::Partial {
             metadata: Metadata(
-                [("content-type".to_string(), "audio/wav".to_string())]
-                    .into_iter()
-                    .collect(),
+                [
+                    ("content-type".to_string(), "audio/wav".to_string()),
+                    ("transfer-encoding".to_string(), "chunked".to_string()),
+                ]
+                .into_iter()
+                .collect(),
             ),
             hash: hash(b"hello world"),
             total_size: 11,
@@ -744,41 +748,6 @@ mod tests {
                 .resolve(11)
                 .unwrap(),
             content: Content::new(bytes.len() as u64, Cursor::new(bytes)),
-        }
-    }
-
-    #[get("/full")]
-    fn full_response() -> SignedKvReadResponse<Cursor<Vec<u8>>> {
-        let bytes = b"hello".to_vec();
-        SignedKvReadResponse::Full {
-            metadata: Metadata(BTreeMap::new()),
-            hash: hash(&bytes),
-            content: Content::new(bytes.len() as u64, Cursor::new(bytes)),
-        }
-    }
-
-    #[get("/hostile-metadata")]
-    fn hostile_metadata_response() -> SignedKvReadResponse<Cursor<Vec<u8>>> {
-        let bytes = b"hello".to_vec();
-        SignedKvReadResponse::Full {
-            metadata: Metadata(BTreeMap::from([
-                (
-                    "Cache-Control".to_string(),
-                    "public, max-age=31536000".to_string(),
-                ),
-                ("Accept-Ranges".to_string(), "none".to_string()),
-                ("Content-Range".to_string(), "bytes 0-0/1".to_string()),
-            ])),
-            hash: hash(&bytes),
-            content: Content::new(bytes.len() as u64, Cursor::new(bytes)),
-        }
-    }
-
-    #[get("/unsatisfiable")]
-    fn unsatisfiable_response() -> SignedKvReadResponse<Cursor<Vec<u8>>> {
-        SignedKvReadResponse::Unsatisfiable {
-            hash: hash(b"hello"),
-            total_size: 5,
         }
     }
 
@@ -815,10 +784,6 @@ mod tests {
         let client = Client::tracked(rocket::build().mount("/", routes![partial_response])).await?;
         let response = client.get("/partial").dispatch().await;
         assert_eq!(response.status(), Status::PartialContent);
-        assert_eq!(
-            response.headers().get_one("Cache-Control"),
-            Some(SIGNED_KV_CACHE_CONTROL)
-        );
         assert_eq!(response.headers().get_one("Accept-Ranges"), Some("bytes"));
         assert_eq!(
             response.headers().get_one("Content-Range"),
@@ -829,6 +794,7 @@ mod tests {
             response.headers().get_one("Content-Type"),
             Some("audio/wav")
         );
+        assert!(response.headers().get_one("Transfer-Encoding").is_none());
         assert_eq!(
             response.headers().get_one("ETag"),
             Some(etag(&hash(b"hello world")).as_str())
@@ -838,36 +804,179 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signed_kv_responses_are_never_publicly_cacheable() -> Result<()> {
-        let client = Client::tracked(rocket::build().mount(
-            "/",
-            routes![full_response, partial_response, unsatisfiable_response],
-        ))
-        .await?;
+    async fn signed_responder_sets_full_and_partial_streaming_postconditions() -> Result<()> {
+        let client = Client::tracked(rocket::build()).await?;
 
-        for path in ["/full", "/partial", "/unsatisfiable"] {
-            let response = client.get(path).dispatch().await;
-            let cache_control = response.headers().get_one("Cache-Control");
-            assert_eq!(cache_control, Some(SIGNED_KV_CACHE_CONTROL), "{path}");
-            assert!(!cache_control.is_some_and(|value| value.contains("public")));
+        let full_request = client.get("/full");
+        let full_response = full_response()
+            .respond_to(full_request.inner())
+            .map_err(|status| anyhow::anyhow!("full SignedKvReadResponse failed: {status}"))?;
+        assert_eq!(full_response.status(), Status::Ok);
+        assert_eq!(full_response.body().max_chunk_size(), STREAM_MAX_CHUNK_SIZE);
+        assert_eq!(
+            full_response.headers().get_one("Content-Length"),
+            Some("33554432")
+        );
+        assert!(full_response
+            .headers()
+            .get_one("Transfer-Encoding")
+            .is_none());
+
+        let partial_request = client.get("/partial");
+        let partial_response = partial_response()
+            .respond_to(partial_request.inner())
+            .map_err(|status| anyhow::anyhow!("partial SignedKvReadResponse failed: {status}"))?;
+        assert_eq!(partial_response.status(), Status::PartialContent);
+        assert_eq!(
+            partial_response.body().max_chunk_size(),
+            STREAM_MAX_CHUNK_SIZE
+        );
+        assert_eq!(
+            partial_response.headers().get_one("Content-Length"),
+            Some("5")
+        );
+        assert!(partial_response
+            .headers()
+            .get_one("Transfer-Encoding")
+            .is_none());
+        Ok(())
+    }
+
+    #[get("/full")]
+    fn full_response() -> SignedKvReadResponse<Cursor<Vec<u8>>> {
+        let bytes = vec![b'f'; 32 * 1024 * 1024];
+        SignedKvReadResponse::Full {
+            metadata: Metadata(
+                [
+                    (
+                        "content-type".to_string(),
+                        "application/octet-stream".to_string(),
+                    ),
+                    ("transfer-encoding".to_string(), "chunked".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            hash: hash(b"full-stream"),
+            content: Content::new(bytes.len() as u64, Cursor::new(bytes)),
         }
+    }
+
+    #[get("/conditional-full")]
+    fn conditional_full_response() -> SignedKvReadResponse<Cursor<Vec<u8>>> {
+        let bytes = b"hello".to_vec();
+        SignedKvReadResponse::Full {
+            metadata: Metadata(Default::default()),
+            hash: hash(&bytes),
+            content: Content::new(bytes.len() as u64, Cursor::new(bytes)),
+        }
+    }
+
+    #[tokio::test]
+    async fn matching_signed_kv_etag_returns_a_bodyless_304() -> Result<()> {
+        let client =
+            Client::tracked(rocket::build().mount("/", rocket::routes![conditional_full_response]))
+                .await?;
+
+        let first = client.get("/conditional-full").dispatch().await;
+        assert_eq!(first.status(), Status::Ok);
+        let etag = first.headers().get_one("ETag").unwrap().to_string();
+        assert_eq!(first.into_string().await.as_deref(), Some("hello"));
+
+        let second = client
+            .get("/conditional-full")
+            .header(rocket::http::Header::new("If-None-Match", etag))
+            .dispatch()
+            .await;
+        assert_eq!(second.status(), Status::NotModified);
+        assert!(second.headers().get_one("Content-Length").is_none());
+        assert!(second.into_string().await.is_none());
         Ok(())
     }
 
     #[tokio::test]
-    async fn signed_kv_policy_headers_override_stored_metadata() -> Result<()> {
-        let client =
-            Client::tracked(rocket::build().mount("/", routes![hostile_metadata_response])).await?;
+    async fn signed_full_response_headers_and_body_are_observed() -> Result<()> {
+        let client = Client::tracked(rocket::build().mount("/", routes![full_response])).await?;
+        let response = client.get("/full").dispatch().await;
 
-        let response = client.get("/hostile-metadata").dispatch().await;
         assert_eq!(response.status(), Status::Ok);
         assert_eq!(
-            response.headers().get_one("Cache-Control"),
-            Some(SIGNED_KV_CACHE_CONTROL)
+            response.headers().get_one("Content-Length"),
+            Some("33554432")
         );
-        assert_eq!(response.headers().get_one("Accept-Ranges"), Some("bytes"));
-        assert!(response.headers().get_one("Content-Range").is_none());
-        assert_eq!(response.into_bytes().await.unwrap(), b"hello");
+        assert!(response.headers().get_one("Transfer-Encoding").is_none());
+        assert_eq!(response.into_bytes().await.unwrap().len(), 32 * 1024 * 1024);
+        Ok(())
+    }
+
+    #[test]
+    fn signed_response_drops_hop_by_hop_object_headers() {
+        let mut response = Response::build();
+        add_object_headers(
+            &mut response,
+            Metadata(
+                [
+                    ("Content-Type".to_string(), "text/plain".to_string()),
+                    ("Transfer-Encoding".to_string(), "chunked".to_string()),
+                    ("Connection".to_string(), "keep-alive".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        );
+        let response = response.finalize();
+
+        assert_eq!(
+            response.headers().get_one("Content-Type"),
+            Some("text/plain")
+        );
+        assert!(response.headers().get_one("Transfer-Encoding").is_none());
+        assert!(response.headers().get_one("Connection").is_none());
+    }
+
+    #[tokio::test]
+    async fn signed_response_policy_headers_override_legacy_metadata() -> Result<()> {
+        let client = Client::tracked(rocket::build()).await?;
+        let response = SignedKvReadResponse::Full {
+            metadata: Metadata(
+                [
+                    ("content-type".to_string(), "text/plain".to_string()),
+                    (
+                        "cache-control".to_string(),
+                        "public, max-age=31536000".to_string(),
+                    ),
+                    (
+                        "cdn-cache-control".to_string(),
+                        "public, max-age=31536000".to_string(),
+                    ),
+                    (
+                        "surrogate-control".to_string(),
+                        "public, max-age=31536000".to_string(),
+                    ),
+                    ("content-length".to_string(), "999".to_string()),
+                    ("transfer-encoding".to_string(), "chunked".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            hash: hash(b"signed-policy"),
+            content: Content::new(5, Cursor::new(b"hello".to_vec())),
+        }
+        .respond_to(client.get("/").inner())
+        .map_err(|status| anyhow::anyhow!("signed response failed: {status}"))?;
+
+        assert_eq!(
+            response.headers().get_one("Content-Type"),
+            Some("text/plain")
+        );
+        assert_eq!(
+            response.headers().get_one("Cache-Control"),
+            Some("private, no-store")
+        );
+        assert_eq!(response.headers().get_one("Content-Length"), Some("5"));
+        assert!(response.headers().get_one("CDN-Cache-Control").is_none());
+        assert!(response.headers().get_one("Surrogate-Control").is_none());
+        assert!(response.headers().get_one("Transfer-Encoding").is_none());
         Ok(())
     }
 

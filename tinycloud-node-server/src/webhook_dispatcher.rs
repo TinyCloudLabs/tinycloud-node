@@ -1,7 +1,7 @@
 use crate::{config::HooksConfig, TinyCloud};
 use anyhow::{Context, Result};
 use hmac::{Hmac, Mac};
-use reqwest::Client;
+use reqwest::{redirect::Policy, Client, Url};
 use sha2::Sha256;
 use std::time::Duration;
 use time::{Duration as TimeDuration, OffsetDateTime};
@@ -16,9 +16,9 @@ const DISPATCH_BATCH_SIZE: u64 = 32;
 #[derive(Clone)]
 pub struct WebhookDispatcher {
     tinycloud: TinyCloud,
-    client: Client,
     encryption: ColumnEncryption,
     max_attempts: i64,
+    timeout: Duration,
 }
 
 impl WebhookDispatcher {
@@ -27,16 +27,11 @@ impl WebhookDispatcher {
         config: HooksConfig,
         encryption: ColumnEncryption,
     ) -> Result<Self> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(config.webhook_timeout_seconds.max(1)))
-            .build()
-            .context("building webhook dispatcher HTTP client")?;
-
         Ok(Self {
             tinycloud,
-            client,
             encryption,
             max_attempts: config.webhook_max_attempts.max(1) as i64,
+            timeout: Duration::from_secs(config.webhook_timeout_seconds.max(1)),
         })
     }
 
@@ -95,8 +90,25 @@ impl WebhookDispatcher {
         };
         let signature = sign_payload(&secret, delivery.payload_json.as_bytes())?;
 
-        match self
-            .client
+        let url = crate::routes::hooks::validate_webhook_callback_url(&delivery.callback_url)
+            .await
+            .map_err(|(_, message)| anyhow::anyhow!(message));
+        let client = match url {
+            Ok(url) => self
+                .pinned_client(&url)
+                .context("building pinned webhook client")?,
+            Err(error) => {
+                self.record_terminal_failure(
+                    delivery.id,
+                    current_attempt,
+                    &format!("callback URL rejected: {error}"),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        match client
             .post(&delivery.callback_url)
             .header("Content-Type", "application/json")
             .header("X-TinyCloud-Delivery-Id", &delivery.id)
@@ -128,6 +140,26 @@ impl WebhookDispatcher {
         }
 
         Ok(())
+    }
+
+    fn pinned_client(&self, url: &Url) -> Result<Client> {
+        let host = url.host_str().context("callback URL host missing")?;
+        let port = url
+            .port_or_known_default()
+            .context("callback URL port missing")?;
+        let address = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+            .context("resolving callback URL")?
+            .find(|address| {
+                !crate::routes::hooks::blocked_webhook_ip(address.ip())
+                    || (cfg!(test) && address.ip().is_loopback())
+            })
+            .context("callback URL has no public address")?;
+        Client::builder()
+            .timeout(self.timeout)
+            .redirect(Policy::none())
+            .resolve(host, address)
+            .build()
+            .context("building pinned callback client")
     }
 
     async fn record_terminal_failure(

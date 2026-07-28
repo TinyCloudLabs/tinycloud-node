@@ -74,7 +74,7 @@ fn kv_batch_read_response(items: Vec<tinycloud_core::KvBatchReadItem>) -> KvBatc
         .into_iter()
         .map(|item| match item.value {
             Some(value) => {
-                let mut headers = value.metadata.0;
+                let mut headers = filter_stored_object_metadata(value.metadata).0;
                 headers.insert("etag".to_string(), kv_etag(value.hash));
                 if let Some(data) = value.data.as_ref() {
                     headers.insert("content-length".to_string(), data.len().to_string());
@@ -102,12 +102,15 @@ fn kv_batch_read_response(items: Vec<tinycloud_core::KvBatchReadItem>) -> KvBatc
     KvBatchReadResponse { results }
 }
 
-struct KvListResponse(Vec<tinycloud_auth::resource::Path>, bool);
+struct KvListResponse(Vec<tinycloud_auth::resource::Path>, bool, Option<String>);
 
 impl<'r> Responder<'r, 'static> for KvListResponse {
     fn respond_to(self, request: &'r Request<'_>) -> rocket::response::Result<'static> {
         let mut response = Json(self.0).respond_to(request)?;
         response.set_header(Header::new("x-tinycloud-truncated", self.1.to_string()));
+        if let Some(next_cursor) = self.2 {
+            response.set_header(Header::new("x-tinycloud-next-cursor", next_cursor));
+        }
         Ok(response)
     }
 }
@@ -183,8 +186,8 @@ where
 {
     fn respond_to(self, request: &'r Request<'_>) -> rocket::response::Result<'static> {
         match self.0 {
-            InvocationOutcome::KvList(list, truncated) => {
-                KvListResponse(list, truncated).respond_to(request)
+            InvocationOutcome::KvList(list, truncated, next_cursor) => {
+                KvListResponse(list, truncated, next_cursor).respond_to(request)
             }
             InvocationOutcome::KvDelete(hash) => KvMutationResponse(hash).respond_to(request),
             InvocationOutcome::KvMetadata(meta) => meta
@@ -258,9 +261,22 @@ mod tests {
     fn conditional_kv_response() -> KVResponse<Cursor<Vec<u8>>> {
         let content = b"hello".to_vec();
         KVResponse::new(
-            Metadata(BTreeMap::new()),
+            Metadata(BTreeMap::from([
+                (
+                    "Cache-Control".to_string(),
+                    "public, max-age=31536000".to_string(),
+                ),
+                (
+                    "CDN-Cache-Control".to_string(),
+                    "public, max-age=31536000".to_string(),
+                ),
+                (
+                    "Surrogate-Control".to_string(),
+                    "public, max-age=31536000".to_string(),
+                ),
+            ])),
             hash(&content),
-            Cursor::new(content),
+            tinycloud_core::storage::Content::new(content.len() as u64, Cursor::new(content)),
         )
     }
 
@@ -277,6 +293,8 @@ mod tests {
             first.headers().get_one("Cache-Control"),
             Some("private, no-cache")
         );
+        assert!(first.headers().get_one("CDN-Cache-Control").is_none());
+        assert!(first.headers().get_one("Surrogate-Control").is_none());
         assert_eq!(first.into_string().await.as_deref(), Some("hello"));
 
         let second = client
@@ -317,6 +335,119 @@ mod tests {
         assert_eq!(json["results"][1]["key"], "missing");
         assert_eq!(json["results"][1]["ok"], false);
         assert_eq!(json["results"][1]["error"]["code"], "KV_NOT_FOUND");
+    }
+
+    #[test]
+    fn object_response_drops_hop_by_hop_headers() {
+        for header in NON_REPLAYABLE_OBJECT_HEADERS {
+            assert!(!is_replayable_object_header(header));
+        }
+        assert!(is_replayable_object_header("content-type"));
+    }
+
+    #[test]
+    fn stored_object_metadata_allows_only_safe_headers() {
+        let metadata = filter_stored_object_metadata(Metadata(BTreeMap::from([
+            ("content-type".to_string(), "text/plain".to_string()),
+            ("content-encoding".to_string(), "gzip".to_string()),
+            ("content-language".to_string(), "en".to_string()),
+            ("content-disposition".to_string(), "inline".to_string()),
+            ("x-tinycloud-meta-owner".to_string(), "alice".to_string()),
+            ("authorization".to_string(), "Bearer secret".to_string()),
+            ("cookie".to_string(), "session=secret".to_string()),
+            ("user-agent".to_string(), "client".to_string()),
+            ("content-length".to_string(), "999".to_string()),
+            ("transfer-encoding".to_string(), "chunked".to_string()),
+            (
+                "cache-control".to_string(),
+                "public, max-age=31536000".to_string(),
+            ),
+            (
+                "cdn-cache-control".to_string(),
+                "public, max-age=31536000".to_string(),
+            ),
+            (
+                "surrogate-control".to_string(),
+                "public, max-age=31536000".to_string(),
+            ),
+        ])));
+
+        assert_eq!(
+            metadata.0,
+            BTreeMap::from([
+                ("content-type".to_string(), "text/plain".to_string()),
+                ("content-encoding".to_string(), "gzip".to_string()),
+                ("content-language".to_string(), "en".to_string()),
+                ("content-disposition".to_string(), "inline".to_string()),
+                ("x-tinycloud-meta-owner".to_string(), "alice".to_string()),
+            ])
+        );
+    }
+
+    #[get("/")]
+    fn authenticated_stream() -> KVResponse<Cursor<Vec<u8>>> {
+        let body = vec![b'a'; 32 * 1024 * 1024];
+        KVResponse(
+            tinycloud_core::storage::Content::new(body.len() as u64, Cursor::new(body)),
+            Metadata(
+                [
+                    (
+                        "content-type".to_string(),
+                        "application/octet-stream".to_string(),
+                    ),
+                    ("transfer-encoding".to_string(), "chunked".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            hash(b"authenticated-stream"),
+        )
+    }
+
+    #[tokio::test]
+    async fn authenticated_response_headers_and_body_are_observed() -> Result<()> {
+        let client =
+            Client::tracked(rocket::build().mount("/", rocket::routes![authenticated_stream]))
+                .await?;
+        let response = client.get("/").dispatch().await;
+
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            response.headers().get_one("Content-Length"),
+            Some("33554432")
+        );
+        assert!(response.headers().get_one("Transfer-Encoding").is_none());
+        assert_eq!(response.into_bytes().await.unwrap().len(), 32 * 1024 * 1024);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kv_responder_sets_streaming_postconditions() -> Result<()> {
+        let client = Client::tracked(rocket::build()).await?;
+        let request = client.get("/");
+        let body = vec![b'k'; 32 * 1024];
+        let response = KVResponse::new(
+            Metadata(
+                [
+                    (
+                        "content-type".to_string(),
+                        "application/octet-stream".to_string(),
+                    ),
+                    ("transfer-encoding".to_string(), "chunked".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            hash(b"direct-authenticated-stream"),
+            tinycloud_core::storage::Content::new(body.len() as u64, Cursor::new(body)),
+        )
+        .respond_to(request.inner())
+        .map_err(|status| anyhow::anyhow!("KVResponse failed: {status}"))?;
+
+        assert_eq!(response.body().max_chunk_size(), STREAM_MAX_CHUNK_SIZE);
+        assert_eq!(response.headers().get_one("Content-Length"), Some("32768"));
+        assert!(response.headers().get_one("Transfer-Encoding").is_none());
+        Ok(())
     }
 }
 
@@ -363,6 +494,49 @@ impl CapJsonRep {
 
 pub struct ObjectHeaders(pub Metadata);
 
+pub(crate) const STREAM_MAX_CHUNK_SIZE: usize = 256 * 1024;
+
+const STORED_OBJECT_HEADERS: &[&str] = &[
+    "content-type",
+    "content-encoding",
+    "content-language",
+    "content-disposition",
+];
+
+pub(crate) fn is_storable_object_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    STORED_OBJECT_HEADERS.contains(&name.as_str()) || name.starts_with("x-tinycloud-meta-")
+}
+
+pub(crate) fn filter_stored_object_metadata(metadata: Metadata) -> Metadata {
+    Metadata(
+        metadata
+            .0
+            .into_iter()
+            .filter(|(key, _)| is_storable_object_header(key))
+            .collect(),
+    )
+}
+
+const NON_REPLAYABLE_OBJECT_HEADERS: &[&str] = &[
+    "connection",
+    "content-length",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+pub(crate) fn is_replayable_object_header(name: &str) -> bool {
+    is_storable_object_header(name)
+        && !NON_REPLAYABLE_OBJECT_HEADERS
+            .iter()
+            .any(|header| name.eq_ignore_ascii_case(header))
+}
+
 #[async_trait]
 impl<'r> FromRequest<'r> for ObjectHeaders {
     type Error = anyhow::Error;
@@ -380,8 +554,7 @@ impl<'r> Responder<'r, 'static> for ObjectHeaders {
     fn respond_to(self, _: &'r Request<'_>) -> rocket::response::Result<'static> {
         let mut r = Response::build();
         for (k, v) in self.0 .0 {
-            if !k.eq_ignore_ascii_case("content-length") && !k.eq_ignore_ascii_case("if-none-match")
-            {
+            if is_replayable_object_header(&k) {
                 r.header(Header::new(k, v));
             }
         }
@@ -389,10 +562,10 @@ impl<'r> Responder<'r, 'static> for ObjectHeaders {
     }
 }
 
-pub struct KVResponse<R>(R, pub Metadata, pub Hash);
+pub struct KVResponse<R>(tinycloud_core::storage::Content<R>, pub Metadata, pub Hash);
 
 impl<R> KVResponse<R> {
-    pub fn new(md: Metadata, hash: Hash, reader: R) -> Self {
+    pub fn new(md: Metadata, hash: Hash, reader: tinycloud_core::storage::Content<R>) -> Self {
         Self(reader, md, hash)
     }
 }
@@ -403,6 +576,7 @@ where
 {
     fn respond_to(self, r: &'r Request<'_>) -> rocket::response::Result<'static> {
         let KVResponse(content, metadata, hash) = self;
+        let content_length = content.len();
         let etag = kv_etag(hash);
         let not_modified = if_none_match_matches(r.headers().get_one("If-None-Match"), &etag);
         let mut response = Response::build_from(ObjectHeaders(metadata).respond_to(r)?);
@@ -412,8 +586,10 @@ where
             response.status(Status::NotModified);
         } else {
             response
+                .header(Header::new("Content-Length", content_length.to_string()))
                 // must ensure that Metadata::respond_to does not set the body of the response
-                .streamed_body(content.compat());
+                .streamed_body(content.compat())
+                .max_chunk_size(STREAM_MAX_CHUNK_SIZE);
         }
         Ok(response.finalize())
     }

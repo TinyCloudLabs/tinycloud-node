@@ -22,7 +22,7 @@ fn pinned_email_claim_manifest_runs_all_negative_rows() {
     );
     assert_eq!(
         manifest["manifestDigest"],
-        "pl8-1Rpx_DYCBjOpK3hRrLfrSVDINNFssZDfFw6BMTs"
+        "KHBPOKKpXASbdfMxDbc_R7iH55b-uuaW45Vw4RouTr4"
     );
 
     let negative: Value = serde_json::from_slice(

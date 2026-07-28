@@ -124,6 +124,10 @@ pub struct InvocationOptions {
     pub not_before: Option<f64>,
     pub nonce: Option<String>,
     pub facts: Option<Vec<serde_json::Value>>,
+    /// Override the proof list for trusted internal composition paths.
+    /// Ordinary callers leave this unset and receive the supplied delegation
+    /// CID as the invocation proof.
+    pub proof: Option<Vec<Cid>>,
 }
 
 pub fn make_invocation<A: IntoIterator<Item = Ability>>(
@@ -174,7 +178,7 @@ pub fn make_invocation_from_uris<A: IntoIterator<Item = Ability>>(
                 .unwrap_or_else(|| format!("urn:uuid:{}", Uuid::new_v4())),
         ),
         facts: options.facts,
-        proof: vec![*delegation],
+        proof: options.proof.unwrap_or_else(|| vec![*delegation]),
         attenuation: {
             let mut caps = ucan_capabilities_object::Capabilities::new();
             for (resource, abilities) in invocation_target {
