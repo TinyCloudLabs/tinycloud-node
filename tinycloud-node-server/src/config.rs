@@ -153,11 +153,15 @@ fn default_share_readiness_max_age() -> u64 {
 /// PostgreSQL TLS settings used by the enabled share-email runtime.  The
 /// default is intentionally disabled so existing SQLite development nodes do
 /// not change behavior; a PostgreSQL-backed enabled deployment must set the
-/// exact `verify-full` mode and a CA bundle path.
+/// exact `verify-full` mode.
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct ShareEmailPostgresTlsConfig {
     #[serde(default = "default_share_postgres_sslmode")]
     pub sslmode: String,
+    /// Optional private CA bundle. When set it must resolve to an existing
+    /// file and the connection pins to it. When unset (TC-363) `verify-full`
+    /// is satisfied by sqlx's default public root set, which is what a managed
+    /// provider with a publicly chained certificate needs.
     #[serde(default)]
     pub root_cert_path: Option<String>,
 }
@@ -319,7 +323,7 @@ impl ShareEmailConfig {
     /// Validate settings that depend on the resolved node database.  This is
     /// called before any connection is opened, so an enabled PostgreSQL
     /// deployment cannot accidentally start with an unauthenticated TLS mode
-    /// or a missing CA bundle.
+    /// or a CA bundle path that does not resolve.
     pub fn validate_for_database(&self, database: &str) -> Result<(), &'static str> {
         self.validate()?;
         self.validate_database_tls(database)
@@ -333,6 +337,19 @@ impl ShareEmailConfig {
         self.validate_database_tls(database)
     }
 
+    /// TC-363: `verify-full` is still mandatory — nothing here accepts
+    /// `require`, `prefer` or a missing `sslmode`, so the server certificate
+    /// is always chain- *and* hostname-verified.
+    ///
+    /// What changed is the *source of the trust roots*. The validator used to
+    /// also require an explicit `root_cert_path` pointing at an existing file,
+    /// which made a managed provider whose certificate chains to a public CA
+    /// impossible to configure at all: there is no private bundle to point at.
+    /// With no path configured the connection verifies against sqlx's default
+    /// roots (the compiled-in webpki/Mozilla CA set), which is a strictly
+    /// larger, publicly audited trust anchor set — not a weaker check. An
+    /// explicitly configured bundle is still honoured, and still has to exist,
+    /// so private-CA deployments keep pinning to exactly one root.
     fn validate_database_tls(&self, database: &str) -> Result<(), &'static str> {
         if !self.enabled {
             return Ok(());
@@ -341,21 +358,17 @@ impl ShareEmailConfig {
             if self.postgres_tls.sslmode != "verify-full"
                 || !database_has_query(database, "sslmode", "verify-full")
                 || database_has_forbidden_query(database)
-                || self.postgres_tls.root_cert_path.is_none()
             {
-                return Err("share email PostgreSQL requires sslmode=verify-full and a CA bundle");
+                return Err("share email PostgreSQL requires sslmode=verify-full");
             }
-            let root_cert = self
-                .postgres_tls
-                .root_cert_path
-                .as_deref()
-                .unwrap_or_default();
-            if root_cert.trim().is_empty()
-                || !fs::metadata(root_cert)
-                    .map(|metadata| metadata.is_file())
-                    .unwrap_or(false)
-            {
-                return Err("share email PostgreSQL CA bundle is missing");
+            if let Some(root_cert) = self.postgres_tls.root_cert_path.as_deref() {
+                if root_cert.trim().is_empty()
+                    || !fs::metadata(root_cert)
+                        .map(|metadata| metadata.is_file())
+                        .unwrap_or(false)
+                {
+                    return Err("share email PostgreSQL CA bundle is missing");
+                }
             }
         } else if self.postgres_tls.sslmode != "disabled"
             || self.postgres_tls.root_cert_path.is_some()
@@ -1336,7 +1349,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn postgres_requires_verify_full_and_an_existing_ca_bundle() {
+    async fn postgres_requires_verify_full_in_both_the_config_and_the_url() {
         let config = enabled_config();
         assert!(config
             .validate_for_database("postgres://user:password@db.example/share")
@@ -1347,6 +1360,111 @@ mod tests {
         config.postgres_tls.root_cert_path = Some("/tmp/does-not-exist.pem".into());
         assert!(config
             .validate_for_database("postgres://user:password@db.example/share?sslmode=verify-full")
+            .is_err());
+    }
+
+    /// TC-363: `verify-full` may be satisfied by the default public root set.
+    /// The validator used to demand a private CA bundle file as well, which a
+    /// managed provider whose certificate chains to a public CA can never
+    /// supply — there is no such file to point at. Full verification is still
+    /// required; only the source of the trust roots may now be the default one.
+    #[tokio::test]
+    async fn verify_full_is_accepted_against_the_default_trust_roots() {
+        let mut config = enabled_config();
+        let _trust_bundle = install_bundle(&mut config);
+        config.postgres_tls.sslmode = "verify-full".into();
+        config.postgres_tls.root_cert_path = None;
+
+        assert_eq!(
+            config.validate_for_database(
+                "postgresql://user:password@db.example/share?sslmode=verify-full"
+            ),
+            Ok(()),
+            "verify-full with no private bundle must be accepted"
+        );
+    }
+
+    /// The relaxation above must not become a way in for a weaker mode. Each
+    /// of these is still a startup refusal.
+    #[tokio::test]
+    async fn weaker_tls_modes_are_still_rejected_without_a_ca_bundle() {
+        let mut config = enabled_config();
+        let _trust_bundle = install_bundle(&mut config);
+        config.postgres_tls.root_cert_path = None;
+
+        // `require` encrypts but verifies neither chain nor hostname.
+        config.postgres_tls.sslmode = "require".into();
+        assert!(config
+            .validate_for_database("postgresql://user:password@db.example/share?sslmode=require")
+            .is_err());
+        // ...including when only the URL is downgraded.
+        config.postgres_tls.sslmode = "verify-full".into();
+        assert!(config
+            .validate_for_database("postgresql://user:password@db.example/share?sslmode=require")
+            .is_err());
+        // ...or only the config.
+        config.postgres_tls.sslmode = "require".into();
+        assert!(config
+            .validate_for_database(
+                "postgresql://user:password@db.example/share?sslmode=verify-full"
+            )
+            .is_err());
+
+        // `verify-ca` skips the hostname check.
+        config.postgres_tls.sslmode = "verify-ca".into();
+        assert!(config
+            .validate_for_database("postgresql://user:password@db.example/share?sslmode=verify-ca")
+            .is_err());
+
+        // No TLS at all, expressed either way.
+        config.postgres_tls.sslmode = "disable".into();
+        assert!(config
+            .validate_for_database("postgresql://user:password@db.example/share?sslmode=disable")
+            .is_err());
+        config.postgres_tls.sslmode = "disabled".into();
+        assert!(config
+            .validate_for_database("postgresql://user:password@db.example/share")
+            .is_err());
+        config.postgres_tls.sslmode = "verify-full".into();
+        assert!(
+            config
+                .validate_for_database("postgresql://user:password@db.example/share")
+                .is_err(),
+            "a URL with no sslmode must not inherit verify-full from the config"
+        );
+    }
+
+    /// An explicitly configured private CA bundle is still honoured — and
+    /// still has to exist.
+    #[tokio::test]
+    async fn an_explicit_ca_bundle_is_still_honoured() {
+        let file = tempfile::NamedTempFile::new().expect("temporary CA bundle");
+        let mut config = enabled_config();
+        let _trust_bundle = install_bundle(&mut config);
+        config.postgres_tls.sslmode = "verify-full".into();
+        config.postgres_tls.root_cert_path = Some(file.path().display().to_string());
+
+        assert_eq!(
+            config.validate_for_database(
+                "postgresql://user:password@db.example/share?sslmode=verify-full"
+            ),
+            Ok(())
+        );
+
+        config.postgres_tls.root_cert_path = Some("/tmp/tinycloud-no-such-ca-bundle.pem".into());
+        assert_eq!(
+            config.validate_for_database(
+                "postgresql://user:password@db.example/share?sslmode=verify-full"
+            ),
+            Err("share email PostgreSQL CA bundle is missing"),
+            "a configured bundle that does not resolve must still be fatal"
+        );
+
+        config.postgres_tls.root_cert_path = Some("   ".into());
+        assert!(config
+            .validate_for_database(
+                "postgresql://user:password@db.example/share?sslmode=verify-full"
+            )
             .is_err());
     }
 

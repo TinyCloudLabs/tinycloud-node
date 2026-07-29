@@ -310,6 +310,63 @@ impl ShareV2Runtime {
     }
 }
 
+/// TC-359: refuse to compose when the configured invitation key is not the key
+/// this node derives and signs with.
+///
+/// `shareEmail.invitationPublicKey` is what every relying party — the share
+/// site, the witness, the recipient's browser — verifies invitation signatures
+/// against. The signing half is derived here from the node's own key material
+/// (the dstack KMS in production). Nothing downstream compared the two, so a
+/// mismatch produced no error anywhere: composition succeeded, readiness went
+/// `ready: true`, invitations were minted and signed — and every verifier
+/// silently rejected them. The only visible symptom was non-delivery.
+///
+/// A node that refuses to start with a wrong key is strictly better than one
+/// that advertises a capability it can never fulfil, so this is fail-closed.
+/// It only runs when `shareEmail.enabled` is set, so it cannot take down a
+/// node that is not serving shares.
+fn verify_configured_invitation_key(
+    config: &ShareEmailConfig,
+    key_setup: &StaticSecret,
+) -> anyhow::Result<()> {
+    let derived = key_setup.share_invitation_public_key();
+    let Some(encoded) = config.invitation_public_key.as_deref() else {
+        ::tracing::error!(
+            derived_invitation_public_key = %encode_config(derived, URL_SAFE_NO_PAD),
+            "share v2 is enabled but shareEmail.invitationPublicKey is unset"
+        );
+        anyhow::bail!(
+            "share v2 is enabled but shareEmail.invitationPublicKey is unset; this node derives \
+             {} — read it from GET /.well-known/tinycloud/node-keys",
+            encode_config(derived, URL_SAFE_NO_PAD)
+        );
+    };
+    let configured = decode_config(encoded, URL_SAFE_NO_PAD)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "shareEmail.invitationPublicKey must be 32 bytes of unpadded base64url, got {encoded:?}"
+            )
+        })?;
+    if configured != derived {
+        ::tracing::error!(
+            configured_invitation_public_key = %encode_config(configured, URL_SAFE_NO_PAD),
+            derived_invitation_public_key = %encode_config(derived, URL_SAFE_NO_PAD),
+            "configured share invitation key does not match the node's derived signing key"
+        );
+        anyhow::bail!(
+            "shareEmail.invitationPublicKey is {configured}, but this node signs share \
+             invitations with {derived}. Every relying party would reject this node's \
+             invitations and shares would silently never be delivered. Read the correct value \
+             from GET /.well-known/tinycloud/node-keys and repin the trust bundle.",
+            configured = encode_config(configured, URL_SAFE_NO_PAD),
+            derived = encode_config(derived, URL_SAFE_NO_PAD),
+        );
+    }
+    Ok(())
+}
+
 pub async fn compose(
     conn: DatabaseConnection,
     key_setup: &StaticSecret,
@@ -318,6 +375,7 @@ pub async fn compose(
     tee_key_derived: bool,
     tinycloud: Arc<crate::TinyCloud>,
 ) -> anyhow::Result<ShareV2Runtime> {
+    verify_configured_invitation_key(&config, key_setup)?;
     let migration_ready = report_probe("migration", probe_owner_share_policy_lookup(&conn).await);
     let graph_ready = report_probe(
         "delegation_revocation_lookup",
@@ -3692,7 +3750,11 @@ mod tests {
     // capability. Proves the canonical local launch reaches ready:true and
     // that ordinary production startup (no TEE context) stays fail-closed.
 
-    fn local_tee_share_v2_config() -> ShareEmailConfig {
+    /// TC-359: the invitation key is pinned to the key the node under test
+    /// actually derives, exactly as a correctly provisioned deployment pins
+    /// it. A hardcoded fixture key here would be the very misconfiguration
+    /// `verify_configured_invitation_key` exists to reject.
+    fn local_tee_share_v2_config(key_setup: &StaticSecret) -> ShareEmailConfig {
         ShareEmailConfig {
             enabled: true,
             target_origin: "https://node.internal.tinycloud".into(),
@@ -3701,7 +3763,10 @@ mod tests {
             allowed_origins: vec!["https://share.tinycloud.xyz".into()],
             node_signing_kid: "did:web:node.internal.tinycloud#invitation-key-1".into(),
             invitation_kid: "did:web:node.internal.tinycloud#invitation-key-1".into(),
-            invitation_public_key: Some("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".into()),
+            invitation_public_key: Some(encode_config(
+                key_setup.share_invitation_public_key(),
+                URL_SAFE_NO_PAD,
+            )),
             issuer_did: "did:web:issuer.credentials.org".into(),
             issuer_kid: "did:web:issuer.credentials.org#email-signing-key-1".into(),
             issuer_key_version: 1,
@@ -3734,13 +3799,118 @@ mod tests {
         compose(
             conn,
             key_setup,
-            local_tee_share_v2_config(),
+            local_tee_share_v2_config(key_setup),
             tee_context,
             tee_key_derived,
             Arc::new(tinycloud),
         )
         .await
         .expect("share v2 runtime composes")
+    }
+
+    /// TC-359. Production published `tv7Sn8LztrteJyVgwP9aQL6b1kuiDq9CePhTx19HyrI`
+    /// — a hardcoded development fixture — as `nodeInvitationPublicKey` while
+    /// the CVM signed with a dstack-derived key nobody could read. Composition
+    /// accepted it, readiness reported healthy, and shares silently never
+    /// arrived. Composition must now refuse.
+    #[tokio::test]
+    async fn a_mismatched_invitation_key_fails_composition_loudly() {
+        let key_setup = StaticSecret::new(vec![0x42u8; 32]).expect("32-byte test secret");
+        let mut config = local_tee_share_v2_config(&key_setup);
+        // The exact fixture string production shipped.
+        config.invitation_public_key = Some("tv7Sn8LztrteJyVgwP9aQL6b1kuiDq9CePhTx19HyrI".into());
+
+        let error = verify_configured_invitation_key(&config, &key_setup)
+            .expect_err("a wrong invitation key must fail composition");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("tv7Sn8LztrteJyVgwP9aQL6b1kuiDq9CePhTx19HyrI"),
+            "the error must name the configured key: {message}"
+        );
+        assert!(
+            message.contains(&encode_config(
+                key_setup.share_invitation_public_key(),
+                URL_SAFE_NO_PAD
+            )),
+            "the error must name the key the node actually signs with: {message}"
+        );
+        assert!(
+            message.contains("/.well-known/tinycloud/node-keys"),
+            "the error must say where to read the correct key: {message}"
+        );
+    }
+
+    /// A missing key is the same failure mode as a wrong one: nothing to
+    /// verify against, so nothing would ever be delivered.
+    #[tokio::test]
+    async fn a_missing_invitation_key_fails_composition() {
+        let key_setup = StaticSecret::new(vec![0x42u8; 32]).expect("32-byte test secret");
+        let mut config = local_tee_share_v2_config(&key_setup);
+        config.invitation_public_key = None;
+
+        assert!(verify_configured_invitation_key(&config, &key_setup).is_err());
+
+        let mut config = local_tee_share_v2_config(&key_setup);
+        config.invitation_public_key = Some("not-base64url!".into());
+        assert!(verify_configured_invitation_key(&config, &key_setup).is_err());
+    }
+
+    /// The correctly provisioned shape — the config pins exactly what the node
+    /// derives — still composes.
+    #[tokio::test]
+    async fn the_derived_invitation_key_is_accepted() {
+        let key_setup = StaticSecret::new(vec![0x42u8; 32]).expect("32-byte test secret");
+        let config = local_tee_share_v2_config(&key_setup);
+        assert_eq!(
+            config.invitation_public_key.as_deref(),
+            Some(encode_config(key_setup.share_invitation_public_key(), URL_SAFE_NO_PAD).as_str())
+        );
+
+        assert!(verify_configured_invitation_key(&config, &key_setup).is_ok());
+
+        // ...and a runtime composed from it reaches ready.
+        let tee_context = TeeContext::derive_local(&key_setup);
+        let runtime = compose_test_runtime(&key_setup, Some(tee_context), true).await;
+        assert!(runtime.readiness().await.ready);
+    }
+
+    /// The mismatch has to be fatal at the `compose` boundary, not just in the
+    /// helper: that is the boundary `lib.rs` calls.
+    #[tokio::test]
+    async fn compose_refuses_to_build_a_runtime_with_a_mismatched_key() {
+        let key_setup = StaticSecret::new(vec![0x42u8; 32]).expect("32-byte test secret");
+        let mut config = local_tee_share_v2_config(&key_setup);
+        config.invitation_public_key = Some("tv7Sn8LztrteJyVgwP9aQL6b1kuiDq9CePhTx19HyrI".into());
+
+        let conn = migrated_memory_db().await;
+        let directory = tempfile::tempdir().expect("tempdir for local block store");
+        let blocks = crate::BlockConfig::B(crate::storage::file_system::FileSystemConfig::new(
+            directory.path(),
+        ))
+        .open()
+        .await
+        .expect("local block storage opens");
+        let tinycloud = crate::TinyCloud::new(conn.clone(), blocks, key_setup.clone())
+            .await
+            .expect("in-process TinyCloud composes");
+
+        let composed = compose(
+            conn,
+            &key_setup,
+            config,
+            Some(TeeContext::derive_local(&key_setup)),
+            true,
+            Arc::new(tinycloud),
+        )
+        .await;
+
+        let Err(error) = composed else {
+            panic!("compose must fail closed on an invitation-key mismatch");
+        };
+        assert!(error
+            .to_string()
+            .contains("shareEmail.invitationPublicKey is"));
     }
 
     #[tokio::test]
@@ -3911,7 +4081,7 @@ mod tests {
         let restarted = compose(
             conn,
             &key_setup,
-            local_tee_share_v2_config(),
+            local_tee_share_v2_config(&key_setup),
             Some(tee_context),
             true,
             Arc::new(tinycloud),
@@ -3983,7 +4153,7 @@ mod tests {
         };
 
         let key_setup = StaticSecret::new(vec![0x7cu8; 32]).expect("32-byte test secret");
-        let mut config = local_tee_share_v2_config();
+        let mut config = local_tee_share_v2_config(&key_setup);
         assert!(
             config.authority_material_path.is_none(),
             "this composition must exercise the v2-only shape with no legacy authority material file"
