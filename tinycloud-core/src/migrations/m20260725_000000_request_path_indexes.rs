@@ -834,4 +834,62 @@ mod tests {
         // Sanity check: seeding actually produced the volumes we assumed.
         assert_eq!(delegation::Entity::find().count(&db).await.unwrap(), 301);
     }
+
+    /// TC-319: `transact` now computes the next per-space sequence with one
+    /// ungrouped `SELECT MAX(seq) FROM event_order WHERE space = ?` per space
+    /// (instead of a `GROUP BY space` aggregate). With `idx_event_order_space_seq`
+    /// present that query must resolve via a backward index seek (SEARCH), not a
+    /// table SCAN — the whole point of the rewrite.
+    #[tokio::test]
+    async fn ungrouped_per_space_max_seq_searches_event_order_index() {
+        let db = database().await;
+        Migrator::up(&db, None).await.unwrap();
+
+        // Two spaces with enough rows that the planner prefers a seek over a
+        // scan and the probed space's MAX(seq) genuinely skips the other's rows.
+        let space = test_space_id("tc319-space");
+        let other_space = test_space_id("tc319-other-space");
+        let epoch_id = hash(b"tc319-epoch");
+        for i in 0..300i64 {
+            event_order::ActiveModel {
+                seq: Set(i),
+                epoch: Set(epoch_id),
+                epoch_seq: Set(i),
+                event: Set(hash(format!("tc319-event-{i}").as_bytes())),
+                space: Set(SpaceIdWrap(if i % 2 == 0 {
+                    space.clone()
+                } else {
+                    other_space.clone()
+                })),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        db.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "ANALYZE".to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let plan = explain(
+            &db,
+            format!(
+                "SELECT MAX(seq) FROM event_order WHERE space = '{}'",
+                space.to_string().replace('\'', "''")
+            ),
+        )
+        .await;
+        println!("TC-319 ungrouped MAX(seq) plan: {plan:?}");
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("SEARCH") && line.contains("idx_event_order_space_seq")),
+            "ungrouped per-space MAX(seq) must SEARCH idx_event_order_space_seq, got {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|line| line.contains("SCAN")),
+            "ungrouped per-space MAX(seq) must not SCAN event_order, got {plan:?}"
+        );
+    }
 }
