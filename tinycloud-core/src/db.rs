@@ -681,6 +681,136 @@ fn normalize_hook_prefix(prefix: &str) -> Option<&str> {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Retention pruning (TC-287)
+//
+// Terminal `hook_delivery` rows and expired `signed_kv_ticket` rows accumulate
+// forever once a delivery reaches a terminal state or a ticket lapses. These
+// helpers delete them in bounded batches so a large backlog never turns into a
+// single unbounded DELETE that holds the writer for an unpredictable time.
+//
+// Both tables store timestamps as RFC3339 *strings* (see
+// `list_due_webhook_deliveries` and the `signed_kv_ticket` migration), so
+// callers pass a pre-formatted cutoff string and we compare lexicographically
+// in SQL — matching the existing string comparisons — rather than parsing per
+// row.
+// -----------------------------------------------------------------------------
+
+/// Delete `hook_delivery` rows matching `condition` in batches of `batch_rows`.
+///
+/// Each iteration selects a page of primary keys and deletes exactly those
+/// rows, so the statement count is bounded regardless of backlog size. The loop
+/// stops as soon as a page comes back shorter than `batch_rows` (or empty),
+/// which guarantees termination: every full page deletes `batch_rows` matching
+/// rows, monotonically shrinking the candidate set.
+async fn prune_hook_deliveries_in_batches<C: ConnectionTrait>(
+    conn: &C,
+    condition: Condition,
+    batch_rows: u64,
+) -> Result<u64, DbErr> {
+    if batch_rows == 0 {
+        return Ok(0);
+    }
+    let mut deleted = 0u64;
+    loop {
+        let ids: Vec<String> = hook_delivery::Entity::find()
+            .select_only()
+            .column(hook_delivery::Column::Id)
+            .filter(condition.clone())
+            .limit(batch_rows)
+            .into_tuple::<String>()
+            .all(conn)
+            .await?;
+        if ids.is_empty() {
+            break;
+        }
+        let page = ids.len() as u64;
+        deleted += hook_delivery::Entity::delete_many()
+            .filter(hook_delivery::Column::Id.is_in(ids))
+            .exec(conn)
+            .await?
+            .rows_affected;
+        if page < batch_rows {
+            break;
+        }
+    }
+    Ok(deleted)
+}
+
+/// Delete `hook_delivery` rows in the terminal `delivered` state whose
+/// `delivered_at` is older than `delivered_before` (RFC3339). Pending/retrying
+/// rows are never touched, and rows with a NULL `delivered_at` are excluded by
+/// the SQL comparison — only genuinely-delivered, aged rows are removed.
+pub async fn prune_delivered_hook_deliveries<C: ConnectionTrait>(
+    conn: &C,
+    delivered_before: &str,
+    batch_rows: u64,
+) -> Result<u64, DbErr> {
+    prune_hook_deliveries_in_batches(
+        conn,
+        Condition::all()
+            .add(hook_delivery::Column::Status.eq(HOOK_DELIVERY_STATUS_DELIVERED))
+            .add(hook_delivery::Column::DeliveredAt.lt(delivered_before)),
+        batch_rows,
+    )
+    .await
+}
+
+/// Delete `hook_delivery` rows in the terminal `dead_letter` state whose
+/// `created_at` is older than `created_before` (RFC3339). Dead-letter rows have
+/// exhausted their retries, so `created_at` is the stable age reference.
+pub async fn prune_dead_letter_hook_deliveries<C: ConnectionTrait>(
+    conn: &C,
+    created_before: &str,
+    batch_rows: u64,
+) -> Result<u64, DbErr> {
+    prune_hook_deliveries_in_batches(
+        conn,
+        Condition::all()
+            .add(hook_delivery::Column::Status.eq(HOOK_DELIVERY_STATUS_DEAD_LETTER))
+            .add(hook_delivery::Column::CreatedAt.lt(created_before)),
+        batch_rows,
+    )
+    .await
+}
+
+/// Delete `signed_kv_ticket` rows whose `expires_at` is older than
+/// `expired_before` (RFC3339), in batches of `batch_rows`. Same batched
+/// select-then-delete shape as the hook-delivery pruners.
+pub async fn prune_expired_signed_kv_tickets<C: ConnectionTrait>(
+    conn: &C,
+    expired_before: &str,
+    batch_rows: u64,
+) -> Result<u64, DbErr> {
+    if batch_rows == 0 {
+        return Ok(0);
+    }
+    let mut deleted = 0u64;
+    loop {
+        let ids: Vec<String> = signed_kv_ticket::Entity::find()
+            .select_only()
+            .column(signed_kv_ticket::Column::Id)
+            .filter(signed_kv_ticket::Column::ExpiresAt.lt(expired_before))
+            .limit(batch_rows)
+            .into_tuple::<String>()
+            .all(conn)
+            .await?;
+        if ids.is_empty() {
+            break;
+        }
+        let page = ids.len() as u64;
+        deleted += signed_kv_ticket::Entity::delete_many()
+            .filter(signed_kv_ticket::Column::Id.is_in(ids))
+            .exec(conn)
+            .await?
+            .rows_affected;
+        if page < batch_rows {
+            break;
+        }
+    }
+    Ok(deleted)
+}
+
 impl<C, B, K> SpaceDatabase<C, B, K>
 where
     B: StoreSize,
@@ -4990,5 +5120,281 @@ mod test {
             }
             other => panic!("expected FK database error, got {other:?}"),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Retention pruning (TC-287)
+    // -------------------------------------------------------------------------
+
+    async fn fresh_retention_db() -> DatabaseConnection {
+        let mut options = ConnectOptions::new("sqlite::memory:".to_string());
+        options.max_connections(1);
+        let conn = Database::connect(options).await.unwrap();
+        Migrator::up(&conn, None).await.unwrap();
+        conn
+    }
+
+    fn rfc3339(instant: OffsetDateTime) -> String {
+        instant.format(&Rfc3339).unwrap()
+    }
+
+    async fn insert_retention_subscription(conn: &DatabaseConnection) {
+        hook_subscription::Entity::insert(hook_subscription::ActiveModel::from(
+            hook_subscription::Model {
+                id: "sub".to_string(),
+                subscriber_did: "did:example:sub".to_string(),
+                space_id: "space".to_string(),
+                target_service: "kv".to_string(),
+                path_prefix: None,
+                abilities_json: None,
+                callback_url: "https://example.com/hook".to_string(),
+                encrypted_secret: vec![0u8; 4],
+                secret_key_id: "kid".to_string(),
+                active: true,
+                created_at: rfc3339(OffsetDateTime::now_utc()),
+            },
+        ))
+        .exec(conn)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_retention_delivery(
+        conn: &DatabaseConnection,
+        id: &str,
+        status: &str,
+        created_at: &str,
+        delivered_at: Option<&str>,
+    ) {
+        hook_delivery::Entity::insert(hook_delivery::ActiveModel::from(hook_delivery::Model {
+            id: id.to_string(),
+            subscription_id: "sub".to_string(),
+            event_id: "evt".to_string(),
+            payload_json: "{}".to_string(),
+            status: status.to_string(),
+            attempts: 0,
+            next_attempt_at: None,
+            last_error: None,
+            created_at: created_at.to_string(),
+            delivered_at: delivered_at.map(|value| value.to_string()),
+        }))
+        .exec(conn)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_retention_ticket(conn: &DatabaseConnection, id: &str, expires_at: &str) {
+        signed_kv_ticket::Entity::insert(signed_kv_ticket::ActiveModel::from(
+            signed_kv_ticket::Model {
+                id: id.to_string(),
+                issuer_did: "did:example:issuer".to_string(),
+                subject_did: "did:example:subject".to_string(),
+                space_id: "space".to_string(),
+                path: "path".to_string(),
+                service: "kv".to_string(),
+                ability: "tinycloud.kv/get".to_string(),
+                created_at: expires_at.to_string(),
+                expires_at: expires_at.to_string(),
+                invocation_expires_at: None,
+                parent_expires_at: None,
+                content_hash: None,
+                etag: None,
+                parent_cids_json: None,
+            },
+        ))
+        .exec(conn)
+        .await
+        .unwrap();
+    }
+
+    async fn remaining_delivery_ids(conn: &DatabaseConnection) -> Vec<String> {
+        let mut ids: Vec<String> = hook_delivery::Entity::find()
+            .all(conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn retention_prune_respects_status_and_age() {
+        let conn = fresh_retention_db().await;
+        insert_retention_subscription(&conn).await;
+
+        let now = OffsetDateTime::now_utc();
+        let stale = rfc3339(now - time::Duration::days(60));
+        let recent = rfc3339(now - time::Duration::hours(1));
+        let future = rfc3339(now + time::Duration::days(60));
+
+        // Terminal + aged: eligible for pruning.
+        insert_retention_delivery(
+            &conn,
+            "delivered_old",
+            HOOK_DELIVERY_STATUS_DELIVERED,
+            &stale,
+            Some(&stale),
+        )
+        .await;
+        insert_retention_delivery(
+            &conn,
+            "dead_letter_old",
+            HOOK_DELIVERY_STATUS_DEAD_LETTER,
+            &stale,
+            None,
+        )
+        .await;
+
+        // Terminal but recent: retained (age not met).
+        insert_retention_delivery(
+            &conn,
+            "delivered_recent",
+            HOOK_DELIVERY_STATUS_DELIVERED,
+            &recent,
+            Some(&recent),
+        )
+        .await;
+        insert_retention_delivery(
+            &conn,
+            "dead_letter_recent",
+            HOOK_DELIVERY_STATUS_DEAD_LETTER,
+            &recent,
+            None,
+        )
+        .await;
+
+        // Delivered status but no delivered_at timestamp: never matched by the
+        // NULL-excluding SQL comparison.
+        insert_retention_delivery(
+            &conn,
+            "delivered_no_ts",
+            HOOK_DELIVERY_STATUS_DELIVERED,
+            &stale,
+            None,
+        )
+        .await;
+
+        // Non-terminal rows: must never be touched regardless of age.
+        insert_retention_delivery(
+            &conn,
+            "pending_old",
+            HOOK_DELIVERY_STATUS_PENDING,
+            &stale,
+            None,
+        )
+        .await;
+        insert_retention_delivery(
+            &conn,
+            "retrying_old",
+            HOOK_DELIVERY_STATUS_RETRYING,
+            &stale,
+            None,
+        )
+        .await;
+
+        // Tickets: only those whose expiry is older than the grace cutoff go.
+        insert_retention_ticket(&conn, "ticket_stale", &stale).await;
+        insert_retention_ticket(&conn, "ticket_recent", &recent).await;
+        insert_retention_ticket(&conn, "ticket_future", &future).await;
+
+        let delivered_cutoff = rfc3339(now - time::Duration::days(7));
+        let dead_letter_cutoff = rfc3339(now - time::Duration::days(30));
+        let ticket_cutoff = rfc3339(now - time::Duration::days(7));
+
+        assert_eq!(
+            prune_delivered_hook_deliveries(&conn, &delivered_cutoff, 5000)
+                .await
+                .unwrap(),
+            1,
+            "only the aged delivered row should be pruned"
+        );
+        assert_eq!(
+            prune_dead_letter_hook_deliveries(&conn, &dead_letter_cutoff, 5000)
+                .await
+                .unwrap(),
+            1,
+            "only the aged dead_letter row should be pruned"
+        );
+        assert_eq!(
+            prune_expired_signed_kv_tickets(&conn, &ticket_cutoff, 5000)
+                .await
+                .unwrap(),
+            1,
+            "only the long-expired ticket should be pruned"
+        );
+
+        assert_eq!(
+            remaining_delivery_ids(&conn).await,
+            vec![
+                "dead_letter_recent".to_string(),
+                "delivered_no_ts".to_string(),
+                "delivered_recent".to_string(),
+                "pending_old".to_string(),
+                "retrying_old".to_string(),
+            ],
+            "pending/retrying rows and recent/timestamp-less terminal rows survive"
+        );
+
+        let mut ticket_ids: Vec<String> = signed_kv_ticket::Entity::find()
+            .all(&conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        ticket_ids.sort();
+        assert_eq!(
+            ticket_ids,
+            vec!["ticket_future".to_string(), "ticket_recent".to_string()],
+            "recently-expired and not-yet-expired tickets survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_prune_batches_terminate_and_delete_everything_eligible() {
+        let conn = fresh_retention_db().await;
+        insert_retention_subscription(&conn).await;
+
+        let now = OffsetDateTime::now_utc();
+        let stale = rfc3339(now - time::Duration::days(60));
+        for index in 0..12 {
+            insert_retention_delivery(
+                &conn,
+                &format!("delivered_{index}"),
+                HOOK_DELIVERY_STATUS_DELIVERED,
+                &stale,
+                Some(&stale),
+            )
+            .await;
+        }
+
+        let cutoff = rfc3339(now);
+
+        // batch_rows == 0 is a guarded no-op, never an infinite loop.
+        assert_eq!(
+            prune_delivered_hook_deliveries(&conn, &cutoff, 0)
+                .await
+                .unwrap(),
+            0
+        );
+
+        // batch_rows smaller than the backlog: the loop pages (5 + 5 + 2) and
+        // terminates once a short page is seen, deleting every eligible row.
+        assert_eq!(
+            prune_delivered_hook_deliveries(&conn, &cutoff, 5)
+                .await
+                .unwrap(),
+            12
+        );
+        assert!(
+            hook_delivery::Entity::find()
+                .all(&conn)
+                .await
+                .unwrap()
+                .is_empty(),
+            "all aged delivered rows should be gone after a batched sweep"
+        );
     }
 }

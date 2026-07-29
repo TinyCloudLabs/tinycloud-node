@@ -513,6 +513,38 @@ pub async fn app_with_control(
         .manage(encryption_service)
         .manage(tinycloud_config.storage.staging.open().await?);
 
+    // TC-287: opt-in retention sweeper. Mirrors the invocation-replay cleanup
+    // fairing above — an on-liftoff task that prunes terminal hook deliveries
+    // and expired signed KV tickets every 5 minutes and stops on shutdown.
+    let rocket = if tinycloud_config.retention.enabled {
+        let retention_conn = seed_conn.clone();
+        let retention_config = tinycloud_config.retention.clone();
+        rocket.attach(AdHoc::on_liftoff("retention-sweeper", move |rocket| {
+            let retention_conn = retention_conn.clone();
+            let retention_config = retention_config.clone();
+            let shutdown = rocket.shutdown();
+            Box::pin(async move {
+                tokio::spawn(async move {
+                    run_retention_sweep(&retention_conn, &retention_config).await;
+                    let period = std::time::Duration::from_secs(300);
+                    let mut interval =
+                        tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+                    tokio::pin!(shutdown);
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                run_retention_sweep(&retention_conn, &retention_config).await;
+                            }
+                            _ = &mut shutdown => break,
+                        }
+                    }
+                });
+            })
+        }))
+    } else {
+        rocket
+    };
+
     let rocket = if let Some(control) = control {
         let control_running = control.clone();
         let control_stopping = control.clone();
@@ -591,6 +623,69 @@ pub async fn app_with_control(
         })))
     } else {
         Ok(rocket)
+    }
+}
+
+/// Run one retention sweep: prune terminal hook deliveries and expired signed
+/// KV tickets older than the configured windows, in bounded batches. Errors are
+/// logged (not fatal) — this is a periodic background maintenance pass.
+async fn run_retention_sweep(conn: &DatabaseConnection, retention: &config::RetentionConfig) {
+    use time::format_description::well_known::Rfc3339;
+
+    let now = time::OffsetDateTime::now_utc();
+    let cutoff = |days: u32| {
+        (now - time::Duration::days(days as i64))
+            .format(&Rfc3339)
+            .expect("current timestamps should format as RFC3339")
+    };
+
+    let delivered_before = cutoff(retention.hook_delivered_days);
+    match tinycloud_core::db::prune_delivered_hook_deliveries(
+        conn,
+        &delivered_before,
+        retention.batch_rows,
+    )
+    .await
+    {
+        Ok(deleted) if deleted > 0 => {
+            ::tracing::info!(deleted, "retention: pruned delivered hook deliveries")
+        }
+        Ok(_) => {}
+        Err(error) => {
+            ::tracing::warn!(?error, "retention: delivered hook delivery prune failed")
+        }
+    }
+
+    let dead_letter_before = cutoff(retention.hook_dead_letter_days);
+    match tinycloud_core::db::prune_dead_letter_hook_deliveries(
+        conn,
+        &dead_letter_before,
+        retention.batch_rows,
+    )
+    .await
+    {
+        Ok(deleted) if deleted > 0 => {
+            ::tracing::info!(deleted, "retention: pruned dead-letter hook deliveries")
+        }
+        Ok(_) => {}
+        Err(error) => {
+            ::tracing::warn!(?error, "retention: dead-letter hook delivery prune failed")
+        }
+    }
+
+    let expired_before = cutoff(retention.ticket_expired_days);
+    match tinycloud_core::db::prune_expired_signed_kv_tickets(
+        conn,
+        &expired_before,
+        retention.batch_rows,
+    )
+    .await
+    {
+        Ok(deleted) if deleted > 0 => {
+            ::tracing::info!(deleted, "retention: pruned expired signed KV tickets")
+        }
+        Ok(_) => {}
+        Err(error) => ::tracing::warn!(?error, "retention: signed KV ticket prune failed"),
     }
 }
 

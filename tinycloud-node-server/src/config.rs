@@ -36,6 +36,8 @@ pub struct Config {
     pub public_spaces: PublicSpacesConfig,
     #[serde(default)]
     pub share_email: ShareEmailConfig,
+    #[serde(default)]
+    pub retention: RetentionConfig,
 }
 
 /// Production exact-email composition.  The capability remains unavailable
@@ -760,6 +762,55 @@ impl Default for HooksConfig {
             ),
             webhook_timeout_seconds: default_hooks_webhook_timeout_seconds(),
             webhook_max_attempts: default_hooks_webhook_max_attempts(),
+        }
+    }
+}
+
+/// Retention sweep policy for terminal `hook_delivery` rows and expired
+/// `signed_kv_ticket` rows (TC-287).
+///
+/// Disabled by default: no data is deleted unless an operator opts in. When
+/// `enabled`, a background sweeper prunes rows older than the per-category
+/// windows in bounded batches. All fields are `TINYCLOUD_RETENTION_*`
+/// env-overridable through the same Figment mechanism as the other sections.
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct RetentionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_retention_hook_delivered_days")]
+    pub hook_delivered_days: u32,
+    #[serde(default = "default_retention_hook_dead_letter_days")]
+    pub hook_dead_letter_days: u32,
+    #[serde(default = "default_retention_ticket_expired_days")]
+    pub ticket_expired_days: u32,
+    #[serde(default = "default_retention_batch_rows")]
+    pub batch_rows: u64,
+}
+
+fn default_retention_hook_delivered_days() -> u32 {
+    7
+}
+
+fn default_retention_hook_dead_letter_days() -> u32 {
+    30
+}
+
+fn default_retention_ticket_expired_days() -> u32 {
+    7
+}
+
+fn default_retention_batch_rows() -> u64 {
+    5000
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hook_delivered_days: default_retention_hook_delivered_days(),
+            hook_dead_letter_days: default_retention_hook_dead_letter_days(),
+            ticket_expired_days: default_retention_ticket_expired_days(),
+            batch_rows: default_retention_batch_rows(),
         }
     }
 }
