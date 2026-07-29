@@ -94,6 +94,19 @@ lazy_static! {
         "Cumulative durable read-audit commit batches."
     )
     .unwrap();
+    /// Invocation replay-cache rows inserted (first sighting of an invocation).
+    pub static ref REPLAY_ROWS_INSERTED: IntCounter = register_int_counter!(
+        "tinycloud_replay_rows_inserted_total",
+        "Invocation replay-cache rows inserted (first sighting of an invocation)."
+    )
+    .unwrap();
+    /// Invocation replay-cache inserts that conflicted with an existing row (a
+    /// replayed/duplicate invocation).
+    pub static ref REPLAY_ROWS_CONFLICTED: IntCounter = register_int_counter!(
+        "tinycloud_replay_rows_conflicted_total",
+        "Invocation replay-cache inserts that conflicted with an existing row."
+    )
+    .unwrap();
 }
 
 pub fn observe_signed_kv_transfer(object_bytes: u64, served_bytes: u64) {
@@ -129,6 +142,18 @@ pub fn observe_invocation_time_rejection(kind: TimeRejection) {
         INVOCATION_TIME_REJECTIONS
             .with_label_values(&[kind.as_str()])
             .inc();
+    }
+}
+
+/// Record the outcome of a replay-cache insert: a fresh insert vs. a conflict
+/// with an already-recorded invocation (TC-341 observability).
+pub fn observe_replay_insert(inserted: bool) {
+    if enabled() {
+        if inserted {
+            REPLAY_ROWS_INSERTED.inc();
+        } else {
+            REPLAY_ROWS_CONFLICTED.inc();
+        }
     }
 }
 

@@ -20,6 +20,8 @@ pub struct Config {
     pub storage: Storage,
     #[serde(default)]
     pub database: DatabaseConfig,
+    #[serde(default)]
+    pub invocation: InvocationConfig,
     pub spaces: SpacesConfig,
     #[serde(default)]
     pub hooks: HooksConfig,
@@ -1097,6 +1099,35 @@ impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
             max_connections: default_database_max_connections(),
+        }
+    }
+}
+
+/// Admission bounds for `/invoke` (TC-341). Env-overridable through the same
+/// Figment mechanism as the other sections; the canonical env form is
+/// `TINYCLOUD_INVOCATION__MAX_LIFETIME_SECS` (the double-underscore provider is
+/// the one that preserves the underscore inside the leaf key).
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct InvocationConfig {
+    /// Maximum accepted lifetime, in seconds, of an invocation's signed
+    /// expiration relative to now. Invocations claiming `exp > now +
+    /// max_lifetime_secs` are rejected before the durable replay-cache write,
+    /// and a persisted replay row can never outlive `now + max_lifetime_secs +
+    /// clock skew` regardless of the claimed expiration. This bounds the
+    /// durable `invocation_replay` table against an unverified sender pinning
+    /// rows arbitrarily far into the future.
+    #[serde(default = "default_invocation_max_lifetime_secs")]
+    pub max_lifetime_secs: u64,
+}
+
+fn default_invocation_max_lifetime_secs() -> u64 {
+    300
+}
+
+impl Default for InvocationConfig {
+    fn default() -> Self {
+        Self {
+            max_lifetime_secs: default_invocation_max_lifetime_secs(),
         }
     }
 }
