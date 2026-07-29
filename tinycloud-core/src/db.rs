@@ -21,9 +21,9 @@ use sea_orm::{
     entity::prelude::*,
     error::{DbErr, RuntimeErr, SqlxError},
     query::*,
-    sea_query::{Expr, LikeExpr, OnConflict, Query},
+    sea_query::{Expr, ExprTrait, LikeExpr, OnConflict, Query, SimpleExpr},
     ActiveValue::Set,
-    ConnectionTrait, DatabaseTransaction, IntoActiveModel, TransactionTrait,
+    ConnectionTrait, DatabaseTransaction, DbBackend, IntoActiveModel, TransactionTrait,
 };
 use sea_orm_migration::MigratorTrait;
 use std::collections::{HashMap, HashSet};
@@ -2870,6 +2870,96 @@ async fn get_kv_entity<C: ConnectionTrait>(
     Ok(result)
 }
 
+/// Half-open `[lower, upper)` bounds selecting every `ability.resource` that
+/// belongs to `space_id`.
+///
+/// `ability.resource` is persisted through `Resource`'s `Display` impl, and a
+/// TinyCloud resource always renders as
+/// `{space}/{service}[/{path}][?query][#fragment]` (see `ResourceId`'s
+/// `Display`). Both bounds are therefore derived from that same `Display`
+/// impl, so the SQL prefix cannot drift from what the column actually holds
+/// (address checksum canonicalisation, percent-encoding, and so on).
+///
+/// The upper bound appends U+10FFFD, the highest private-use code point.
+/// Stored resources are `UriStr`-validated and therefore pure ASCII, and
+/// U+10FFFD encodes as `F4 8F BF BD`, above every ASCII byte -- so under
+/// **byte ordering** no resource belonging to the space can fall outside the
+/// range. `byte_ordered_resource` is what guarantees the comparison actually
+/// is byte-ordered; these bounds are meaningless without it.
+///
+/// The range is a *superset* filter, never an exact one. Callers keep the
+/// exact `resource.space() == Some(space_id)` check in Rust to drop the rest.
+fn space_resource_bounds(space_id: &SpaceId) -> (String, String) {
+    let lower = format!("{space_id}/");
+    let upper = format!("{lower}\u{10FFFD}");
+    (lower, upper)
+}
+
+/// `ability.resource`, pinned to byte ordering.
+///
+/// Without this pin the bounds are compared using the *database's* collation,
+/// and the prefix range silently means something else. Production runs
+/// PostgreSQL with `en_US.UTF-8` (glibc), where U+10FFFD has no collation
+/// weight at all: `{space}/` and `{space}/\u{10FFFD}` collate EQUAL, so the
+/// half-open range is empty. Measured against the production database, the
+/// unpinned range returned **0 rows** for a space whose true answer was
+/// 55,568 -- every session would have activated with no delegations.
+///
+/// The byte-increment bound (`{space}0`) is no better: it fails the other way
+/// on the same database, because glibc orders punctuation below digits only
+/// at a lower weight level.
+///
+/// This is deliberately not conditional on the deployed collation. Byte
+/// ordering is the only ordering under which these bounds mean what they say,
+/// so it is stated unconditionally and the tests pin it.
+///
+/// Cost, on PostgreSQL: the pin also costs the index seek, and it does so
+/// even on a C-collated database. `COLLATE "C"` carries collation OID 950,
+/// while `pk-ability` was built with the column's default collation (OID
+/// 100), and PostgreSQL requires an exact collation match to use an index --
+/// so `ability` is scanned (measured on production: 68ms warm, 452ms cold).
+/// That is still far cheaper than loading and decoding every delegation blob,
+/// and it needs no migration. Recovering the seek needs an index on
+/// `ability(resource)` declared `COLLATE "C"` (or `text_pattern_ops`) so its
+/// OID matches, which is a migration and is deferred.
+///
+/// SQLite is unaffected: `COLLATE BINARY` there is the column's own
+/// collation, so the range still resolves as an index seek.
+fn byte_ordered_resource(backend: DbBackend) -> SimpleExpr {
+    let resource = Expr::col((abilities::Entity, abilities::Column::Resource));
+    // `$1` / `?` is sea-query's per-backend placeholder for the embedded
+    // expression above, not for a bound value.
+    match backend {
+        DbBackend::Postgres => Expr::cust_with_expr(r#"$1 COLLATE "C""#, resource),
+        // SQLite columns are BINARY (byte-ordered) by default; saying so
+        // explicitly keeps the predicate index-usable and self-documenting.
+        DbBackend::Sqlite => Expr::cust_with_expr("? COLLATE BINARY", resource),
+        // MySQL's binary collation name depends on the column's charset, so
+        // cast instead -- that is charset-independent.
+        DbBackend::MySql => Expr::cust_with_expr("CAST(? AS BINARY)", resource),
+    }
+}
+
+/// `delegation.id IN (SELECT delegation FROM ability WHERE <space range>)`.
+///
+/// A subquery rather than a predicate on the joined `ability` rows on purpose:
+/// filtering the join directly would also truncate each returned delegation's
+/// capability list, but callers need every capability a matching delegation
+/// carries -- including capabilities in other spaces. `resource` is the
+/// leading column of `ability`'s primary key, so on a byte-ordered database
+/// the range resolves as an index seek with no new index.
+fn delegations_touching_space(backend: DbBackend, space_id: &SpaceId) -> SimpleExpr {
+    let (lower, upper) = space_resource_bounds(space_id);
+    delegation::Column::Id.in_subquery(
+        Query::select()
+            .column(abilities::Column::Delegation)
+            .from(abilities::Entity)
+            .and_where(byte_ordered_resource(backend).gte(lower))
+            .and_where(byte_ordered_resource(backend).lt(upper))
+            .to_owned(),
+    )
+}
+
 async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     db: &C,
     space_id: &SpaceId,
@@ -2879,6 +2969,10 @@ async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         delegation::Entity::find()
             .left_join(revocation::Entity)
             .filter(revocation::Column::Id.is_null())
+            .filter(delegations_touching_space(
+                db.get_database_backend(),
+                space_id,
+            ))
             .find_with_related(abilities::Entity)
             .all(db)
             .await?
@@ -2890,6 +2984,9 @@ async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         .zip(abilities)
         .zip(parents)
         .filter_map(|((del, ability), parents)| {
+            // `delegations_touching_space` has already narrowed this to the
+            // delegations whose resources fall in the space's prefix range;
+            // the space check below is the exact filter over that superset.
             if del.expiry.map(|e| e > now).unwrap_or(true)
                 && del.not_before.map(|n| n <= now).unwrap_or(true)
                 && ability.iter().any(|a| a.resource.space() == Some(space_id))
@@ -3288,6 +3385,10 @@ async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secret
         delegation::Entity::find()
             .left_join(revocation::Entity)
             .filter(revocation::Column::Id.is_null())
+            .filter(delegations_touching_space(
+                db.get_database_backend(),
+                space_id,
+            ))
             .find_with_related(abilities::Entity)
             .all(db)
             .await?
@@ -3312,7 +3413,9 @@ async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secret
                 return None;
             }
 
-            // Space membership check
+            // Space membership check. `delegations_touching_space` has already
+            // narrowed this to the delegations whose resources fall in the
+            // space's prefix range; this is the exact filter over that superset.
             if !ability.iter().any(|a| a.resource.space() == Some(space_id)) {
                 return None;
             }
@@ -5436,5 +5539,884 @@ mod test {
                 .is_empty(),
             "all aged delivered rows should be gone after a batched sweep"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // TC-320: the SQL-side space filter on `ability.resource`.
+    // ---------------------------------------------------------------------
+
+    /// One delegation plus its abilities, and optionally a revocation.
+    /// Resources are given as strings so the rows go through exactly the
+    /// `Resource` parse/`Display` round-trip production uses.
+    async fn seed_delegation<C: ConnectionTrait>(
+        db: &C,
+        label: &str,
+        resources: &[String],
+        expiry: Option<OffsetDateTime>,
+        not_before: Option<OffsetDateTime>,
+        revoked: bool,
+    ) -> Hash {
+        use crate::types::{Ability, Caveats};
+        use std::collections::BTreeMap;
+
+        let id = crate::hash::hash(label.as_bytes());
+        // Actors are FK prerequisites for the delegation row.
+        for actor_id in [
+            format!("did:key:delegator-{label}"),
+            format!("did:key:delegatee-{label}"),
+        ] {
+            actor::ActiveModel { id: Set(actor_id) }
+                .insert(db)
+                .await
+                .ok();
+        }
+        delegation::ActiveModel {
+            id: Set(id),
+            delegator: Set(format!("did:key:delegator-{label}")),
+            delegatee: Set(format!("did:key:delegatee-{label}")),
+            expiry: Set(expiry),
+            issued_at: Set(None),
+            not_before: Set(not_before),
+            facts: Set(None),
+            serialization: Set(label.as_bytes().to_vec()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        for resource in resources {
+            abilities::ActiveModel {
+                resource: Set(resource.parse().unwrap()),
+                ability: Set(<Ability as TryFrom<String>>::try_from(
+                    "tinycloud.kv/get".to_string(),
+                )
+                .unwrap()),
+                delegation: Set(id),
+                caveats: Set(Caveats(BTreeMap::new())),
+            }
+            .insert(db)
+            .await
+            .unwrap();
+        }
+        if revoked {
+            revocation::ActiveModel {
+                id: Set(crate::hash::hash(format!("revocation-{label}").as_bytes())),
+                revoker: Set(format!("did:key:delegator-{label}")),
+                revoked: Set(id),
+                serialization: Set(label.as_bytes().to_vec()),
+                revoked_at: Set(Some(OffsetDateTime::now_utc())),
+            }
+            .insert(db)
+            .await
+            .unwrap();
+        }
+        id
+    }
+
+    /// Delegation id -> its full sorted resource list.
+    type Selection = HashMap<Hash, Vec<String>>;
+
+    fn summarize(rows: Vec<(delegation::Model, Vec<abilities::Model>)>) -> Selection {
+        rows.into_iter()
+            .map(|(del, abilities)| {
+                let mut resources: Vec<String> =
+                    abilities.iter().map(|a| a.resource.to_string()).collect();
+                resources.sort();
+                (del.id, resources)
+            })
+            .collect()
+    }
+
+    /// The pre-TC-320 selection, verbatim: load *every* unrevoked delegation
+    /// with its abilities, then filter by time and space in Rust. Kept as the
+    /// parity oracle.
+    async fn legacy_selection<C: ConnectionTrait>(
+        db: &C,
+        space_id: &SpaceId,
+        now: OffsetDateTime,
+    ) -> Selection {
+        let rows = delegation::Entity::find()
+            .left_join(revocation::Entity)
+            .filter(revocation::Column::Id.is_null())
+            .find_with_related(abilities::Entity)
+            .all(db)
+            .await
+            .unwrap();
+        summarize(
+            rows.into_iter()
+                .filter(|(del, ability)| {
+                    del.expiry.map(|e| e > now).unwrap_or(true)
+                        && del.not_before.map(|n| n <= now).unwrap_or(true)
+                        && ability.iter().any(|a| a.resource.space() == Some(space_id))
+                })
+                .collect(),
+        )
+    }
+
+    /// The TC-320 selection: the same thing, with the space prefix range
+    /// pushed into SQL ahead of the identical Rust-side filter.
+    async fn filtered_selection<C: ConnectionTrait>(
+        db: &C,
+        space_id: &SpaceId,
+        now: OffsetDateTime,
+    ) -> Selection {
+        let rows = delegation::Entity::find()
+            .left_join(revocation::Entity)
+            .filter(revocation::Column::Id.is_null())
+            .filter(delegations_touching_space(
+                db.get_database_backend(),
+                space_id,
+            ))
+            .find_with_related(abilities::Entity)
+            .all(db)
+            .await
+            .unwrap();
+        summarize(
+            rows.into_iter()
+                .filter(|(del, ability)| {
+                    del.expiry.map(|e| e > now).unwrap_or(true)
+                        && del.not_before.map(|n| n <= now).unwrap_or(true)
+                        && ability.iter().any(|a| a.resource.space() == Some(space_id))
+                })
+                .collect(),
+        )
+    }
+
+    /// Delegation ids the SQL range alone admits, with no Rust-side space
+    /// filter. Shows how tight the prefix bound really is.
+    async fn sql_range_only<C: ConnectionTrait>(db: &C, space_id: &SpaceId) -> HashSet<Hash> {
+        delegation::Entity::find()
+            .filter(delegations_touching_space(
+                db.get_database_backend(),
+                space_id,
+            ))
+            .all(db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|del| del.id)
+            .collect()
+    }
+
+    /// Pins the prefix-range scheme itself. The upper bound deliberately is
+    /// NOT the usual "increment the last byte" (`{space}0`) trick: resource
+    /// strings are ordered by the *database's* collation, and under a
+    /// punctuation-ignoring collation (glibc `en_US.utf8`, the `postgres:16`
+    /// image default) `{space}/kv/path` sorts after `{space}0`, which would
+    /// silently drop live delegations.
+    #[test]
+    fn space_resource_bounds_bracket_every_resource_in_the_space() {
+        let jwk = JWK::generate_ed25519().unwrap();
+        let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
+        let foo = SpaceId::new(did.clone(), "foo".parse().unwrap());
+        let foobar = SpaceId::new(did.clone(), "foobar".parse().unwrap());
+        let (lower, upper) = space_resource_bounds(&foo);
+
+        assert_eq!(lower, format!("{foo}/"));
+        assert_eq!(upper, format!("{foo}/\u{10FFFD}"));
+
+        // Every resource in the space renders as `{space}/...` and lands
+        // inside the range under byte ordering.
+        for suffix in ["kv/a", "kv/deep/path#list", "sql", "", "9svc", "~svc"] {
+            let resource: Resource = format!("{foo}/{suffix}").parse().unwrap();
+            let rendered = resource.to_string();
+            assert_eq!(resource.space(), Some(&foo));
+            assert!(
+                rendered.as_str() >= lower.as_str() && rendered.as_str() < upper.as_str(),
+                "`{rendered}` fell outside [{lower}, {upper})"
+            );
+        }
+
+        // The bound is derived from the same `Display` impl that writes the
+        // column, so a prefix sibling cannot be confused with the target.
+        let sibling: Resource = format!("{foobar}/kv/a").parse().unwrap();
+        assert_ne!(sibling.space(), Some(&foo));
+        assert!(
+            sibling.to_string().as_str() >= upper.as_str(),
+            "`foobar` must sort outside `foo`'s byte-ordered range"
+        );
+
+        // Both of these hold under byte ordering ONLY. The comparison is
+        // pinned to byte ordering by `byte_ordered_resource`; see
+        // `space_filter_pins_byte_ordering_in_every_backend_dialect`.
+    }
+
+    /// Regression guard for the production incident this scheme caused before
+    /// the collation pin existed.
+    ///
+    /// The bounds are byte-oriented, but SQL compares strings using the
+    /// *database's* collation. Production runs PostgreSQL under `en_US.UTF-8`
+    /// (glibc), where U+10FFFD carries no collation weight, so
+    /// `{space}/\u{10FFFD}` collates EQUAL to `{space}/` and the half-open
+    /// range matches nothing: the unpinned query returned 0 rows against a
+    /// space whose true answer was 55,568, which would have activated every
+    /// session with no delegations at all.
+    ///
+    /// So every dialect must state the byte ordering explicitly. Asserting on
+    /// the generated SQL catches this on any machine -- notably including CI,
+    /// whose `postgres:16-alpine` service is C-collated and therefore cannot
+    /// reproduce the failure by behaviour alone.
+    #[test]
+    fn space_filter_pins_byte_ordering_in_every_backend_dialect() {
+        let space = test_space_id("collation-pin");
+        for (backend, expected) in [
+            (DbBackend::Postgres, r#"COLLATE "C""#),
+            (DbBackend::Sqlite, "COLLATE BINARY"),
+            (DbBackend::MySql, "CAST("),
+        ] {
+            let sql = delegation::Entity::find()
+                .filter(delegations_touching_space(backend, &space))
+                .build(backend)
+                .sql;
+            println!("TC-320 {backend:?}: {sql}");
+            assert!(
+                sql.contains(expected),
+                "{backend:?} must pin the space range to byte ordering with `{expected}`, \
+                 got {sql}"
+            );
+            // Both bounds, not just one.
+            assert_eq!(
+                sql.matches(expected).count(),
+                2,
+                "{backend:?} must pin BOTH range bounds, got {sql}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn space_filtered_delegation_selection_matches_the_full_scan() {
+        let db = get_db().await.unwrap();
+        let conn = &db.conn;
+        let now = OffsetDateTime::now_utc();
+
+        // Prefix-sibling spaces have to share a base DID, otherwise the two
+        // space strings diverge long before the name and the range could
+        // never overlap in the first place.
+        let jwk = JWK::generate_ed25519().unwrap();
+        let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
+        let foo = SpaceId::new(did.clone(), "foo".parse().unwrap());
+        let foobar = SpaceId::new(did.clone(), "foobar".parse().unwrap());
+        let fo = SpaceId::new(did.clone(), "fo".parse().unwrap());
+        let bar = SpaceId::new(did.clone(), "bar".parse().unwrap());
+        // Same *name*, different controller.
+        let other_foo = test_space_id("foo");
+
+        let foo_live = seed_delegation(
+            conn,
+            "foo-live",
+            &[format!("{foo}/kv/a")],
+            None,
+            None,
+            false,
+        )
+        .await;
+        let foo_nested = seed_delegation(
+            conn,
+            "foo-nested",
+            &[format!("{foo}/kv/deep/path#list")],
+            None,
+            None,
+            false,
+        )
+        .await;
+        // Service with no path, and an empty-path service: both still render
+        // as `{space}/...` and must stay inside the range.
+        let foo_service_only = seed_delegation(
+            conn,
+            "foo-service-only",
+            &[format!("{foo}/sql")],
+            None,
+            None,
+            false,
+        )
+        .await;
+        let foo_expired = seed_delegation(
+            conn,
+            "foo-expired",
+            &[format!("{foo}/kv/b")],
+            Some(now - time::Duration::hours(1)),
+            None,
+            false,
+        )
+        .await;
+        let foo_future = seed_delegation(
+            conn,
+            "foo-future",
+            &[format!("{foo}/kv/c")],
+            None,
+            Some(now + time::Duration::hours(1)),
+            false,
+        )
+        .await;
+        let foo_revoked = seed_delegation(
+            conn,
+            "foo-revoked",
+            &[format!("{foo}/kv/d")],
+            None,
+            None,
+            true,
+        )
+        .await;
+        // Straddles two spaces: must appear for both, and must keep *both*
+        // capabilities either way.
+        let foo_and_bar = seed_delegation(
+            conn,
+            "foo-and-bar",
+            &[format!("{foo}/kv/e"), format!("{bar}/kv/e")],
+            None,
+            None,
+            false,
+        )
+        .await;
+        let foobar_live = seed_delegation(
+            conn,
+            "foobar-live",
+            &[format!("{foobar}/kv/a")],
+            None,
+            None,
+            false,
+        )
+        .await;
+        let fo_live =
+            seed_delegation(conn, "fo-live", &[format!("{fo}/kv/a")], None, None, false).await;
+        let other_foo_live = seed_delegation(
+            conn,
+            "other-foo-live",
+            &[format!("{other_foo}/kv/a")],
+            None,
+            None,
+            false,
+        )
+        .await;
+        // Non-TinyCloud resource (`Resource::Other`) -- has no space at all.
+        let urn_only = seed_delegation(
+            conn,
+            "urn-only",
+            &["urn:example:thing".to_string()],
+            None,
+            None,
+            false,
+        )
+        .await;
+        let no_abilities = seed_delegation(conn, "no-abilities", &[], None, None, false).await;
+
+        // Parity, space by space -- this is the contract: identical selection
+        // *and* identical per-delegation capability lists.
+        for (label, space) in [
+            ("foo", &foo),
+            ("foobar", &foobar),
+            ("fo", &fo),
+            ("bar", &bar),
+            ("other_foo", &other_foo),
+        ] {
+            let legacy = legacy_selection(conn, space, now).await;
+            let filtered = filtered_selection(conn, space, now).await;
+            assert_eq!(
+                legacy, filtered,
+                "TC-320 changed the delegation set returned for space {label}"
+            );
+        }
+
+        // ...and the parity is not vacuous.
+        let foo_set = filtered_selection(conn, &foo, now).await;
+        let foo_ids: HashSet<Hash> = foo_set.keys().copied().collect();
+        assert_eq!(
+            foo_ids,
+            HashSet::from([foo_live, foo_nested, foo_service_only, foo_and_bar]),
+            "unexpected delegation set for `foo`"
+        );
+        for (label, excluded) in [
+            ("prefix sibling `foobar`", foobar_live),
+            ("shorter prefix `fo`", fo_live),
+            ("same name, other controller", other_foo_live),
+            ("expired", foo_expired),
+            ("not yet valid", foo_future),
+            ("revoked", foo_revoked),
+            ("non-TinyCloud resource", urn_only),
+            ("no abilities", no_abilities),
+        ] {
+            assert!(!foo_ids.contains(&excluded), "{label} leaked into `foo`");
+        }
+
+        // A delegation spanning two spaces keeps its full capability list.
+        // Filtering the joined `ability` rows instead of using a subquery
+        // would silently truncate this to one resource.
+        assert_eq!(
+            foo_set.get(&foo_and_bar).map(|r| r.len()),
+            Some(2),
+            "cross-space delegation lost a capability when queried via `foo`"
+        );
+        assert_eq!(
+            filtered_selection(conn, &bar, now)
+                .await
+                .get(&foo_and_bar)
+                .map(|r| r.len()),
+            Some(2),
+            "cross-space delegation lost a capability when queried via `bar`"
+        );
+
+        // Under SQLite's byte-ordered collation the range is exact, so the
+        // prefix sibling never even reaches Rust. On a collation that ignores
+        // punctuation the range widens and the Rust-side space check above is
+        // what keeps the result correct.
+        let range_only = sql_range_only(conn, &foo).await;
+        assert!(
+            !range_only.contains(&foobar_live),
+            "`foobar` must not fall inside `foo`'s byte-ordered prefix range"
+        );
+        assert!(
+            range_only.contains(&foo_revoked),
+            "the range is a space filter only -- revocation is still handled by the join"
+        );
+    }
+
+    #[tokio::test]
+    async fn space_filtered_delegation_lookup_searches_the_ability_primary_key() {
+        let db = get_db().await.unwrap();
+        let conn = &db.conn;
+
+        // 300 delegations over 30 spaces under one controller, so the space
+        // strings share a long prefix and the planner is choosing between a
+        // real seek and a real scan.
+        let jwk = JWK::generate_ed25519().unwrap();
+        let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
+        for i in 0..300 {
+            let space = SpaceId::new(did.clone(), format!("space-{}", i % 30).parse().unwrap());
+            seed_delegation(
+                conn,
+                &format!("tc320-delegation-{i}"),
+                &[format!("{space}/kv/key-{i}")],
+                None,
+                None,
+                false,
+            )
+            .await;
+        }
+        conn.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "ANALYZE".to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let target = SpaceId::new(did.clone(), "space-7".parse().unwrap());
+        let explain = |space: Option<&SpaceId>| {
+            let mut query = delegation::Entity::find()
+                .left_join(revocation::Entity)
+                .filter(revocation::Column::Id.is_null());
+            if let Some(space) = space {
+                query = query.filter(delegations_touching_space(DbBackend::Sqlite, space));
+            }
+            let mut stmt = query
+                .find_with_related(abilities::Entity)
+                .build(DbBackend::Sqlite);
+            stmt.sql = format!("EXPLAIN QUERY PLAN {}", stmt.sql);
+            async {
+                conn.query_all(stmt)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| row.try_get::<String>("", "detail").unwrap())
+                    .collect::<Vec<String>>()
+            }
+        };
+
+        // Without the space filter this is the pre-TC-320 shape: a full scan
+        // of every delegation ever written.
+        let before = explain(None).await;
+        println!("TC-320 BEFORE (no space filter): {before:?}");
+        assert!(
+            before.iter().any(|line| line.contains("SCAN delegation")),
+            "the unfiltered capabilities-read query should scan `delegation`, got {before:?}"
+        );
+
+        let after = explain(Some(&target)).await;
+        println!("TC-320 AFTER  (space filter):    {after:?}");
+        assert!(
+            after
+                .iter()
+                .any(|line| line.contains("SEARCH") && line.contains("resource>")),
+            "the space filter must resolve as an indexed range seek on `resource`, got {after:?}"
+        );
+        assert!(
+            !after.iter().any(|line| line.contains("SCAN ability")),
+            "the space filter must not full-scan `ability`, got {after:?}"
+        );
+        assert!(
+            !after.iter().any(|line| line.contains("SCAN delegation")),
+            "the space filter must not full-scan `delegation`, got {after:?}"
+        );
+    }
+
+    /// The same parity contract on a real PostgreSQL server. SQLite cannot
+    /// prove any of the three things this covers: that the generated subquery
+    /// is valid PostgreSQL, that the U+10FFFD upper bound survives parameter
+    /// binding, and that the range resolves as an index scan on `ability`'s
+    /// primary key.
+    ///
+    /// The index assertion is gated on the database's collation on purpose.
+    /// A byte-ordered (`C`) database gets an index scan; on a linguistic
+    /// collation the range still filters correctly in SQL -- the Rust-side
+    /// space check keeps the result exact -- but the planner cannot use the
+    /// primary key for it without a `text_pattern_ops` index.
+    #[tokio::test]
+    async fn postgres_space_filtered_delegation_selection_matches_the_full_scan() {
+        let Ok(database_url) = std::env::var("TINYCLOUD_TEST_POSTGRES_URL") else {
+            eprintln!(
+                "skipping TC-320 PostgreSQL parity test: TINYCLOUD_TEST_POSTGRES_URL is unset"
+            );
+            return;
+        };
+
+        let admin = Database::connect(ConnectOptions::new(database_url.clone()))
+            .await
+            .expect("connect to PostgreSQL test database");
+        let schema = format!(
+            "tc320_{}_{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        admin
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("CREATE SCHEMA {schema}"),
+            ))
+            .await
+            .expect("create isolated TC-320 schema");
+
+        let mut options = ConnectOptions::new(database_url);
+        options
+            .max_connections(4)
+            .sqlx_logging(false)
+            .set_schema_search_path(schema.clone());
+        let conn = Database::connect(options)
+            .await
+            .expect("connect to isolated TC-320 schema");
+        Migrator::up(&conn, None)
+            .await
+            .expect("migrate isolated TC-320 schema");
+
+        let collation: String = admin
+            .query_one(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT datcollate FROM pg_database WHERE datname = current_database()".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "datcollate")
+            .unwrap();
+        println!("TC-320 PostgreSQL collation: {collation}");
+
+        let exercise: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+            let now = OffsetDateTime::now_utc();
+            let jwk = JWK::generate_ed25519().unwrap();
+            let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
+            let foo = SpaceId::new(did.clone(), "foo".parse().unwrap());
+            let foobar = SpaceId::new(did.clone(), "foobar".parse().unwrap());
+            let bar = SpaceId::new(did.clone(), "bar".parse().unwrap());
+
+            seed_delegation(
+                &conn,
+                "pg-foo-live",
+                &[format!("{foo}/kv/a")],
+                None,
+                None,
+                false,
+            )
+            .await;
+            seed_delegation(
+                &conn,
+                "pg-foo-and-bar",
+                &[format!("{foo}/kv/e"), format!("{bar}/kv/e")],
+                None,
+                None,
+                false,
+            )
+            .await;
+            seed_delegation(
+                &conn,
+                "pg-foobar-live",
+                &[format!("{foobar}/kv/a")],
+                None,
+                None,
+                false,
+            )
+            .await;
+            // Bulk filler, inserted as raw SQL: parity is only interesting at
+            // a volume where the space filter actually excludes something, and
+            // realistic statistics make the logged plan representative of what
+            // production does. 20k delegations across 500 spaces.
+            let suffix = foo.suffix().to_string();
+            conn.execute(Statement::from_string(
+                DbBackend::Postgres,
+                "INSERT INTO actor (id) VALUES ('did:key:tc320-bulk') \
+                 ON CONFLICT DO NOTHING"
+                    .to_string(),
+            ))
+            .await?;
+            conn.execute(Statement::from_string(
+                DbBackend::Postgres,
+                // `1e20` is the blake3-256 multihash prefix (code 0x1e,
+                // digest length 0x20); `Hash` rejects a bare 32-byte digest.
+                "INSERT INTO delegation (id, delegator, delegatee, serialization) \
+                 SELECT decode('1e20' || lpad(to_hex(i), 64, '0'), 'hex'), \
+                        'did:key:tc320-bulk', 'did:key:tc320-bulk', '\\x00'::bytea \
+                 FROM generate_series(1, 20000) i"
+                    .to_string(),
+            ))
+            .await?;
+            conn.execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!(
+                    "INSERT INTO ability (resource, ability, delegation, caveats) \
+                     SELECT 'tinycloud:{suffix}:bulk-' || (i % 500) || '/kv/key-' || i, \
+                            'tinycloud.kv/get', \
+                            decode('1e20' || lpad(to_hex(i), 64, '0'), 'hex'), \
+                            '{{}}'::json \
+                     FROM generate_series(1, 20000) i"
+                ),
+            ))
+            .await?;
+            conn.execute(Statement::from_string(
+                DbBackend::Postgres,
+                "ANALYZE".to_string(),
+            ))
+            .await?;
+
+            for (label, space) in [("foo", &foo), ("foobar", &foobar), ("bar", &bar)] {
+                assert_eq!(
+                    legacy_selection(&conn, space, now).await,
+                    filtered_selection(&conn, space, now).await,
+                    "TC-320 changed the delegation set returned for space {label} on PostgreSQL"
+                );
+            }
+            assert_eq!(
+                filtered_selection(&conn, &foo, now).await.len(),
+                2,
+                "expected exactly the two `foo` delegations on PostgreSQL"
+            );
+
+            let mut stmt = delegation::Entity::find()
+                .left_join(revocation::Entity)
+                .filter(revocation::Column::Id.is_null())
+                .filter(delegations_touching_space(DbBackend::Postgres, &foo))
+                .find_with_related(abilities::Entity)
+                .build(DbBackend::Postgres);
+            stmt.sql = format!("EXPLAIN {}", stmt.sql);
+            let plan: Vec<String> = conn
+                .query_all(stmt)
+                .await?
+                .into_iter()
+                .map(|row| row.try_get::<String>("", "QUERY PLAN").unwrap())
+                .collect();
+            println!("TC-320 PostgreSQL plan ({collation}): {plan:?}");
+
+            // What matters here is that the space range is evaluated by the
+            // database at all, rather than every delegation being shipped to
+            // Rust and filtered there. That is the whole point of TC-320 and
+            // it holds under any collation.
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("resource") && line.contains(">=")),
+                "the space range must reach the database, got {plan:?}"
+            );
+
+            // Note what is deliberately NOT asserted: an index seek.
+            // `COLLATE "C"` carries collation OID 950, while `pk-ability` was
+            // built with the column's default collation (OID 100) -- and
+            // PostgreSQL requires an exact collation match to use an index.
+            // So the pin that makes this query correct also costs the seek,
+            // even on a C-collated database. Measured on production: 68ms
+            // warm, 452ms cold, versus loading and decoding 28,300 delegation
+            // blobs. Recovering the seek needs an index declared
+            // `COLLATE "C"` (or `text_pattern_ops`) so its OID matches, which
+            // is a migration and is deliberately deferred.
+            // SQLite is unaffected: `COLLATE BINARY` is the column's own
+            // collation there, so that plan still seeks (see
+            // `space_filtered_delegation_lookup_searches_the_ability_primary_key`).
+            Ok(())
+        }
+        .await;
+
+        admin
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("DROP SCHEMA {schema} CASCADE"),
+            ))
+            .await
+            .expect("drop isolated TC-320 schema");
+        exercise.expect("TC-320 PostgreSQL parity");
+    }
+
+    /// End-to-end regression test for the production incident.
+    ///
+    /// With `ability.resource` under a collation that gives the upper-bound
+    /// sentinel no weight -- exactly what glibc `en_US.UTF-8` does, and what
+    /// production runs -- `{space}/\u{10FFFD}` collates EQUAL to `{space}/`,
+    /// the half-open range is empty, and the space filter returns nothing.
+    /// Against the production database the unpinned query returned 0 rows
+    /// where the correct answer was 55,568; every session would have activated
+    /// with no delegations.
+    ///
+    /// Without the `COLLATE "C"` pin in `byte_ordered_resource` this test
+    /// fails. CI's `postgres:16-alpine` service is C-collated and so cannot
+    /// reproduce the failure by behaviour alone, which is exactly why the
+    /// hostile collation is constructed here rather than assumed.
+    #[tokio::test]
+    async fn postgres_space_filter_survives_a_collation_that_ignores_the_sentinel() {
+        let Ok(database_url) = std::env::var("TINYCLOUD_TEST_POSTGRES_URL") else {
+            eprintln!(
+                "skipping TC-320 PostgreSQL collation test: TINYCLOUD_TEST_POSTGRES_URL is unset"
+            );
+            return;
+        };
+
+        let admin = Database::connect(ConnectOptions::new(database_url.clone()))
+            .await
+            .expect("connect to PostgreSQL test database");
+        let schema = format!(
+            "tc320_collation_{}_{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        admin
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("CREATE SCHEMA {schema}"),
+            ))
+            .await
+            .expect("create isolated TC-320 collation schema");
+
+        let mut options = ConnectOptions::new(database_url);
+        options
+            .max_connections(4)
+            .sqlx_logging(false)
+            .set_schema_search_path(schema.clone());
+        let conn = Database::connect(options)
+            .await
+            .expect("connect to isolated TC-320 collation schema");
+        Migrator::up(&conn, None)
+            .await
+            .expect("migrate isolated TC-320 collation schema");
+
+        let exercise: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+            // An ICU tailoring that makes U+10FFFD completely ignorable,
+            // reproducing glibc's behaviour (glibc simply has no weight entry
+            // for it, so it contributes nothing to the sort key).
+            conn.execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!(
+                    "CREATE COLLATION tc320_ignorable (provider = icu, locale = 'en', \
+                     rules = '&[last tertiary ignorable]={}', deterministic = true)",
+                    '\u{10FFFD}'
+                ),
+            ))
+            .await?;
+            conn.execute(Statement::from_string(
+                DbBackend::Postgres,
+                "ALTER TABLE ability ALTER COLUMN resource TYPE character varying \
+                 COLLATE tc320_ignorable"
+                    .to_string(),
+            ))
+            .await?;
+
+            let now = OffsetDateTime::now_utc();
+            let jwk = JWK::generate_ed25519().unwrap();
+            let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
+            let foo = SpaceId::new(did.clone(), "foo".parse().unwrap());
+            let bar = SpaceId::new(did.clone(), "bar".parse().unwrap());
+            seed_delegation(
+                &conn,
+                "cl-foo-a",
+                &[format!("{foo}/kv/a")],
+                None,
+                None,
+                false,
+            )
+            .await;
+            seed_delegation(
+                &conn,
+                "cl-foo-b",
+                &[format!("{foo}/sql")],
+                None,
+                None,
+                false,
+            )
+            .await;
+            seed_delegation(
+                &conn,
+                "cl-bar-a",
+                &[format!("{bar}/kv/a")],
+                None,
+                None,
+                false,
+            )
+            .await;
+
+            // Prove the hazard is actually live on this column: compared with
+            // the column's own collation the range is empty, exactly as it was
+            // in production.
+            let (lower, upper) = space_resource_bounds(&foo);
+            let (lo, hi) = (lower.replace('\'', "''"), upper.replace('\'', "''"));
+            let count = |sql: String| {
+                let conn = &conn;
+                async move {
+                    conn.query_one(Statement::from_string(DbBackend::Postgres, sql))
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .try_get::<i64>("", "count")
+                        .unwrap()
+                }
+            };
+            let unpinned = count(format!(
+                "SELECT count(*) FROM ability WHERE resource >= '{lo}' AND resource < '{hi}'"
+            ))
+            .await;
+            let pinned = count(format!(
+                "SELECT count(*) FROM ability WHERE resource COLLATE \"C\" >= '{lo}' \
+                 AND resource COLLATE \"C\" < '{hi}'"
+            ))
+            .await;
+            println!("TC-320 hostile collation: unpinned={unpinned} rows, pinned={pinned} rows");
+            assert_eq!(
+                unpinned, 0,
+                "the tailored collation must reproduce the production failure, \
+                 otherwise this test proves nothing"
+            );
+            assert_eq!(pinned, 2, "the byte-ordered range must still find `foo`");
+
+            // The real query must be unaffected by the column's collation.
+            let filtered = filtered_selection(&conn, &foo, now).await;
+            assert_eq!(
+                filtered,
+                legacy_selection(&conn, &foo, now).await,
+                "the space filter must match the full scan even under a collation that \
+                 ignores the upper-bound sentinel"
+            );
+            assert_eq!(
+                filtered.len(),
+                2,
+                "the space filter returned no delegations -- this is the production outage"
+            );
+            Ok(())
+        }
+        .await;
+
+        admin
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("DROP SCHEMA {schema} CASCADE"),
+            ))
+            .await
+            .expect("drop isolated TC-320 collation schema");
+        admin
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("DROP COLLATION IF EXISTS {schema}.tc320_ignorable"),
+            ))
+            .await
+            .ok();
+        exercise.expect("TC-320 PostgreSQL collation resilience");
     }
 }
