@@ -73,11 +73,40 @@ pub trait DatabaseArtifactRepository: Send + Sync {
 #[derive(Clone)]
 pub struct SeaOrmDatabaseArtifactRepository {
     conn: DatabaseConnection,
+    /// Test-only rendezvous seam (see [`wait_at_race_barrier`]) that lets two
+    /// writers read the same base revision before either commits, so the
+    /// full-checkpoint CAS conflict path can be exercised deterministically.
+    #[cfg(test)]
+    race_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
 }
 
 impl SeaOrmDatabaseArtifactRepository {
     pub fn new(conn: DatabaseConnection) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            #[cfg(test)]
+            race_barrier: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_race_barrier_for_test(mut self, barrier: std::sync::Arc<tokio::sync::Barrier>) -> Self {
+        self.race_barrier = Some(barrier);
+        self
+    }
+
+    /// Park at the shared test barrier (SQLite only, matching the other
+    /// CAS-conflict tests) after reading the current revision and before the
+    /// conditional update, so a concurrent writer can bump the revision in
+    /// between and drive this writer's compare-and-swap to zero rows.
+    #[cfg(test)]
+    async fn wait_at_race_barrier(&self) {
+        use sea_orm::ConnectionTrait;
+        if self.conn.get_database_backend() == sea_orm::DbBackend::Sqlite {
+            if let Some(barrier) = &self.race_barrier {
+                barrier.wait().await;
+            }
+        }
     }
 }
 
@@ -139,44 +168,109 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
             .as_ref()
             .map(|model| model.revision + 1)
             .unwrap_or(1);
-        let created_at = existing
-            .as_ref()
-            .map(|model| model.created_at.clone())
-            .unwrap_or_else(|| now.clone());
 
-        let active = database_artifact::ActiveModel {
-            service: Set(service.to_string()),
-            space: Set(space.to_string()),
-            name: Set(name.to_string()),
-            revision: Set(revision),
-            content_hash: Set(content_hash.clone()),
-            payload: Set(payload.clone()),
-            size_bytes: Set(size_bytes),
-            backend: Set("storage.database".to_string()),
-            storage_mode: Set("database-blob".to_string()),
-            created_at: Set(created_at),
-            updated_at: Set(now.clone()),
-            checkpoint_size_bytes: Set(size_bytes),
-            checkpoint_content_hash: Set(content_hash.clone()),
-            delta_payload: Set(None),
-            delta_content_hash: Set(None),
-            delta_size_bytes: Set(0),
-        };
+        // Barrier seam (tests only): lets a second writer observe the same base
+        // revision before either commits, exercising the CAS conflict path.
+        #[cfg(test)]
+        self.wait_at_race_barrier().await;
 
-        let model = if existing.is_some() {
-            active.update(&self.conn).await?
-        } else {
-            active.insert(&self.conn).await?
-        };
+        match existing.as_ref() {
+            Some(existing) => {
+                // Compare-and-swap on the revision this save read: a concurrent
+                // checkpoint/delta that bumped the revision in between makes this
+                // match zero rows, so a stale actor cannot clobber newer committed
+                // state (mirrors `save_delta`'s guard). Callers surface the
+                // conflict and force actor rehydration rather than retry.
+                let update = database_artifact::Entity::update_many()
+                    .col_expr(database_artifact::Column::Revision, Expr::value(revision))
+                    .col_expr(
+                        database_artifact::Column::ContentHash,
+                        Expr::value(content_hash.clone()),
+                    )
+                    .col_expr(
+                        database_artifact::Column::Payload,
+                        Expr::value(payload.clone()),
+                    )
+                    .col_expr(
+                        database_artifact::Column::SizeBytes,
+                        Expr::value(size_bytes),
+                    )
+                    .col_expr(
+                        database_artifact::Column::Backend,
+                        Expr::value("storage.database"),
+                    )
+                    .col_expr(
+                        database_artifact::Column::StorageMode,
+                        Expr::value("database-blob"),
+                    )
+                    .col_expr(
+                        database_artifact::Column::UpdatedAt,
+                        Expr::value(now.clone()),
+                    )
+                    .col_expr(
+                        database_artifact::Column::CheckpointSizeBytes,
+                        Expr::value(size_bytes),
+                    )
+                    .col_expr(
+                        database_artifact::Column::CheckpointContentHash,
+                        Expr::value(content_hash.clone()),
+                    )
+                    .col_expr(
+                        database_artifact::Column::DeltaPayload,
+                        Expr::value(Option::<Vec<u8>>::None),
+                    )
+                    .col_expr(
+                        database_artifact::Column::DeltaContentHash,
+                        Expr::value(Option::<String>::None),
+                    )
+                    .col_expr(
+                        database_artifact::Column::DeltaSizeBytes,
+                        Expr::value(0_i64),
+                    )
+                    .filter(database_artifact::Column::Service.eq(service))
+                    .filter(database_artifact::Column::Space.eq(space))
+                    .filter(database_artifact::Column::Name.eq(name))
+                    .filter(database_artifact::Column::Revision.eq(existing.revision))
+                    .exec(&self.conn)
+                    .await?;
+                if update.rows_affected != 1 {
+                    return Err(DatabaseArtifactError::Backend(
+                        "concurrent database artifact update".to_string(),
+                    ));
+                }
+            }
+            None => {
+                database_artifact::ActiveModel {
+                    service: Set(service.to_string()),
+                    space: Set(space.to_string()),
+                    name: Set(name.to_string()),
+                    revision: Set(revision),
+                    content_hash: Set(content_hash.clone()),
+                    payload: Set(payload.clone()),
+                    size_bytes: Set(size_bytes),
+                    backend: Set("storage.database".to_string()),
+                    storage_mode: Set("database-blob".to_string()),
+                    created_at: Set(now.clone()),
+                    updated_at: Set(now.clone()),
+                    checkpoint_size_bytes: Set(size_bytes),
+                    checkpoint_content_hash: Set(content_hash.clone()),
+                    delta_payload: Set(None),
+                    delta_content_hash: Set(None),
+                    delta_size_bytes: Set(0),
+                }
+                .insert(&self.conn)
+                .await?;
+            }
+        }
 
         Ok(DatabaseArtifact {
             payload,
             content_hash,
-            revision: model.revision,
-            size_bytes: model.size_bytes,
-            updated_at: model.updated_at,
-            backend: model.backend,
-            storage_mode: model.storage_mode,
+            revision,
+            size_bytes,
+            updated_at: now,
+            backend: "storage.database".to_string(),
+            storage_mode: "database-blob".to_string(),
             delta_payload: None,
             delta_content_hash: None,
             delta_size_bytes: 0,
@@ -305,5 +399,64 @@ mod tests {
         assert_eq!(checkpoint.size_bytes, 80);
         assert_eq!(checkpoint.delta_size_bytes, 0);
         assert_eq!(checkpoint.delta_payload, None);
+    }
+
+    #[tokio::test]
+    async fn stale_full_checkpoint_save_conflicts_and_preserves_newer_revision() {
+        // One shared in-memory database (single pooled connection) so two cloned
+        // repositories race against the same rows. Per-statement pool acquisition
+        // means neither holds the connection while parked at the barrier.
+        let mut options = ConnectOptions::new("sqlite::memory:".to_string());
+        options.max_connections(1);
+        let conn = Database::connect(options).await.unwrap();
+        Migrator::up(&conn, None).await.unwrap();
+        let repo = SeaOrmDatabaseArtifactRepository::new(conn);
+
+        // Seed the checkpoint both writers will read as their base (revision 1).
+        let seeded = repo
+            .save("sql", "space", "main", vec![1; 100])
+            .await
+            .unwrap();
+        assert_eq!(seeded.revision, 1);
+
+        // Both writers read revision 1, rendezvous at the barrier, then attempt
+        // the full-checkpoint update. Exactly one wins the compare-and-swap; the
+        // stale loser must fail without clobbering the winner's committed state.
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let first = repo
+            .clone()
+            .with_race_barrier_for_test(std::sync::Arc::clone(&barrier));
+        let second = repo
+            .clone()
+            .with_race_barrier_for_test(std::sync::Arc::clone(&barrier));
+
+        let (a, b) = tokio::join!(
+            first.save("sql", "space", "main", vec![2; 80]),
+            second.save("sql", "space", "main", vec![3; 60]),
+        );
+
+        let (winner, loser_err) = match (a, b) {
+            (Ok(win), Err(err)) => (win, err),
+            (Err(err), Ok(win)) => (win, err),
+            other => panic!("expected exactly one success and one conflict, got {other:?}"),
+        };
+        assert!(
+            matches!(&loser_err, DatabaseArtifactError::Backend(message)
+                if message == "concurrent database artifact update"),
+            "stale checkpoint must fail with the concurrent-update conflict, got {loser_err:?}"
+        );
+        assert_eq!(
+            winner.revision, 2,
+            "winner commits the single next revision"
+        );
+
+        // The stale writer must not have clobbered: durable state is the winner's
+        // payload at revision 2, never the loser's bytes.
+        let loaded = repo.load("sql", "space", "main").await.unwrap().unwrap();
+        assert_eq!(loaded.revision, 2);
+        assert_eq!(
+            loaded.payload, winner.payload,
+            "stale writer must not overwrite the winner's checkpoint"
+        );
     }
 }
