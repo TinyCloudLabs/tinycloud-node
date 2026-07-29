@@ -171,8 +171,13 @@ jobs:
         with:
           node-version: '20'
 
+      # Pinned deliberately. phala 1.1.20 (published 2026-07-26) fails against
+      # the existing centralized-KMS prod CVM with "CVM encrypted_env_pubkey is
+      # required for centralized KMS", which broke the 2026-07-28 deploy. The
+      # last green deploy (run 29953848846, 2026-07-22) ran on 1.1.19. Only
+      # unpin once the prod CVM is migrated or 1.1.20+ is verified against it.
       - name: Install Phala CLI
-        run: npm install -g phala
+        run: npm install -g phala@1.1.19
 
       - name: Update compose with release tag
         run: |
