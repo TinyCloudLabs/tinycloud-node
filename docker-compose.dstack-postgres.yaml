@@ -31,6 +31,15 @@ services:
       # not published here, so the unauthenticated /metrics endpoint stays
       # internal to the CVM.
       TINYCLOUD_TELEMETRY__ENABLED: "true"
+      # The managed Postgres instance allows max_connections = 25 (measured
+      # 2026-07-29, with some of those reserved for superuser roles). The pool
+      # default of 100 cannot be satisfied: the node opened and held slots
+      # until the instance ran out, and further requests failed with
+      # "Failed to acquire connection from pool: Connection pool timed out"
+      # after the 30s sqlx default. Keep this below the instance limit with
+      # headroom for admin/psql access, and raise it only alongside the
+      # instance's own max_connections.
+      TINYCLOUD_DATABASE__MAX_CONNECTIONS: "15"
       TINYCLOUD_CORS: "true"
       TINYCLOUD_QUOTA_URL: "${TINYCLOUD_QUOTA_URL}"
       TINYCLOUD_ADMIN_SECRET: "${TINYCLOUD_ADMIN_SECRET}"
