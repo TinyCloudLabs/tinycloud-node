@@ -8,83 +8,45 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+
+# TC-381: build/clippy/fmt used to run over a four-entry `pkg` matrix
+# ("tinycloud-auth", "tinycloud-node-server", "tinycloud-sdk-rs",
+# "tinycloud-sdk-wasm"), which covered 4 of the workspace's 10 members. The
+# uncovered six included tinycloud-core — the delegation/epoch crate — whose
+# only CI exposure was a single name-filtered `cargo test`. They also included
+# tinycloud-verifier-wasm, whose test target could not even compile, and the
+# vendored dependencies/siwe, which held a test broken by a repo-wide rename.
+# Every job below now runs over the whole workspace so that cannot recur.
+#
+# The matrix also carried `if: matrix.pkg == 'sdk-wasm'` in three places, which
+# never matched any matrix value and so never once ran; its inverse at the
+# `cargo test` step was therefore always true. The intent — build the wasm
+# crates for wasm32-unknown-unknown — is now a real, unconditional step in the
+# `build` job.
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        pkg: ["tinycloud-auth", "tinycloud-node-server", "tinycloud-sdk-rs", "tinycloud-sdk-wasm"]
+    name: build (workspace)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
     - name: Checkout TinyCloud repository
       uses: actions/checkout@v4
-    - name: Add WASM target
-      if: ${{ matrix.pkg == 'sdk-wasm' }}
-      run: |
-        rustup target add wasm32-unknown-unknown
 
-    - name: Build
-      working-directory: ${{ matrix.pkg }}
-      run: cargo build
+    - name: Add the wasm32 target
+      run: rustup target add wasm32-unknown-unknown
 
-    - name: Run tests
-      if: ${{ matrix.pkg != 'sdk-wasm' }}
-      working-directory: ${{ matrix.pkg }}
-      run: cargo test
+    - name: Build the workspace
+      run: cargo build --workspace --all-targets
 
-  clippy:
-    strategy:
-      fail-fast: false
-      matrix:
-        pkg: ["tinycloud-auth", "tinycloud-node-server", "tinycloud-sdk-rs", "tinycloud-sdk-wasm"]
+    # The wasm crates ship as wasm32 artifacts; building them only for the host
+    # target would not prove they still compile for the target they exist for.
+    - name: Build the wasm crates for wasm32-unknown-unknown
+      run: cargo build -p tinycloud-sdk-wasm -p tinycloud-verifier-wasm --target wasm32-unknown-unknown
+
+  test:
+    name: test (workspace, PostgreSQL-backed)
     runs-on: ubuntu-latest
-    steps:
-    - name: Checkout TinyCloud repository
-      uses: actions/checkout@v4
-    - name: Add WASM target
-      if: ${{ matrix.pkg == 'sdk-wasm' }}
-      run: |
-        rustup target add wasm32-unknown-unknown
-
-    - name: Clippy
-      working-directory: ${{ matrix.pkg }}
-      run: RUSTFLAGS="-Dwarnings" cargo clippy
-
-  fmt:
-    strategy:
-      fail-fast: false
-      matrix:
-        pkg: ["tinycloud-auth", "tinycloud-node-server", "tinycloud-sdk-rs", "tinycloud-sdk-wasm"]
-    runs-on: ubuntu-latest
-    steps:
-    - name: Checkout TinyCloud repository
-      uses: actions/checkout@v4
-    - name: Add WASM target
-      if: ${{ matrix.pkg == 'sdk-wasm' }}
-      run: |
-        rustup target add wasm32-unknown-unknown
-
-    - name: Fmt
-      working-directory: ${{ matrix.pkg }}
-      run: cargo fmt -- --check
-
-  capabilities:
-    runs-on: ubuntu-latest
-    steps:
-    - name: Checkout TinyCloud repository
-      uses: actions/checkout@v4
-    - name: Setup Node
-      uses: actions/setup-node@v4
-      with:
-        node-version: 20
-    - name: Ensure rustfmt is available
-      run: rustup component add rustfmt
-    - name: Verify generated capability artifacts match capabilities.json
-      run: node scripts/gen-capabilities.mjs --check
-
-  postgres-concurrency:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:16-alpine
@@ -102,9 +64,84 @@ jobs:
     steps:
     - name: Checkout TinyCloud repository
       uses: actions/checkout@v4
-    - name: Run PostgreSQL concurrency regressions
-      run: cargo test -p tinycloud-core postgres_ -- --nocapture
 
+    # TC-381: this job used to run `cargo test -p tinycloud-core postgres_`.
+    # libtest exits 0 when a name filter matches zero tests, and all four
+    # targets returned early when TINYCLOUD_TEST_POSTGRES_URL was unset — so
+    # renaming the tests, or dropping the env block, would have left the job
+    # green having asserted nothing, with nothing to say so. The name filter is
+    # gone (the whole workspace suite runs now) and the two remaining ways to
+    # silently execute nothing are both checked below.
+    - name: Assert PostgreSQL is reachable
+      run: |
+        set -euo pipefail
+        : "${TINYCLOUD_TEST_POSTGRES_URL:?must be set for the PostgreSQL regressions}"
+        pg_isready -h localhost -p 5432 -U postgres
+        psql "${TINYCLOUD_TEST_POSTGRES_URL}" -c 'SELECT version();'
+
+    - name: Assert the PostgreSQL regressions still exist
+      run: |
+        set -euo pipefail
+        # `|| true` so a zero match reaches the explicit check below rather
+        # than dying under `set -e` with no explanation.
+        count="$(cargo test -p tinycloud-core --lib -- --list \
+          | grep -cE '::postgres_[a-z0-9_]+: test$' || true)"
+        echo "PostgreSQL regressions discovered: ${count}"
+        if [ "${count}" -lt 4 ]; then
+          echo "::error::expected at least 4 postgres_* regressions in tinycloud-core, found ${count}. They were renamed or deleted — restore them, or update this guard deliberately (TC-381)."
+          exit 1
+        fi
+
+    # The four postgres_* regressions run as part of this suite, against the
+    # service container above. tinycloud-core's other ~300 tests — which no CI
+    # job had ever executed — run here too.
+    - name: Run the workspace test suite
+      run: cargo test --workspace
+
+  clippy:
+    name: clippy (workspace)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - name: Checkout TinyCloud repository
+      uses: actions/checkout@v4
+
+    - name: Add the wasm32 target
+      run: rustup target add wasm32-unknown-unknown
+
+    # --all-targets so test and bench targets are linted too, not just lib/bin.
+    - name: Clippy
+      run: RUSTFLAGS="-Dwarnings" cargo clippy --workspace --all-targets
+
+  fmt:
+    name: fmt (workspace)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - name: Checkout TinyCloud repository
+      uses: actions/checkout@v4
+
+    - name: Fmt
+      run: cargo fmt --all -- --check
+
+  capabilities:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout TinyCloud repository
+      uses: actions/checkout@v4
+    - name: Setup Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
+    - name: Ensure rustfmt is available
+      run: rustup component add rustfmt
+    - name: Verify generated capability artifacts match capabilities.json
+      run: node scripts/gen-capabilities.mjs --check
+
+  # test/m1-realdata-e2e, test/load/signer and test/w5-policy-runtime-node-e2e
+  # are `exclude`d from the workspace in Cargo.toml, so the workspace-wide jobs
+  # above do not reach them. m1-realdata-e2e is covered by this job; the other
+  # two are covered by no job at all — recorded here rather than left implicit.
   m1-realdata:
     runs-on: ubuntu-latest
     env:

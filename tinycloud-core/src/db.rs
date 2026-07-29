@@ -3879,9 +3879,16 @@ mod test {
             list_direct_children_bounded(&db.conn, &space, &"".parse().unwrap(), 2, next.as_ref())
                 .await
                 .unwrap();
+        // TC-381: the seed keys sort as
+        // a, b, bang!key, bangXkey, c, literal%key, literalXkey, literal_key,
+        // so the page after the "b" cursor is bang!key/bangXkey. This
+        // expectation still said c/literal%key: it was written before
+        // `bang!key`/`bangXkey` were added to the seed set on a parallel
+        // branch, and the two merged cleanly because nothing in CI ran
+        // tinycloud-core's tests.
         assert_eq!(
             children.iter().map(Path::as_str).collect::<Vec<_>>(),
-            vec!["c", "literal%key"]
+            vec!["bang!key", "bangXkey"]
         );
         assert!(truncated);
         assert_eq!(
@@ -4741,8 +4748,9 @@ mod test {
 
     #[tokio::test]
     async fn postgres_concurrent_epoch_appends_do_not_serialize() {
-        let Ok(database_url) = std::env::var("TINYCLOUD_TEST_POSTGRES_URL") else {
-            eprintln!("skipping PostgreSQL concurrency test: TINYCLOUD_TEST_POSTGRES_URL is unset");
+        let Some(database_url) = crate::test_support::postgres_test_url(
+            "postgres_concurrent_epoch_appends_do_not_serialize",
+        ) else {
             return;
         };
 
@@ -6543,10 +6551,9 @@ mod test {
     /// primary key for it without a `text_pattern_ops` index.
     #[tokio::test]
     async fn postgres_space_filtered_delegation_selection_matches_the_full_scan() {
-        let Ok(database_url) = std::env::var("TINYCLOUD_TEST_POSTGRES_URL") else {
-            eprintln!(
-                "skipping TC-320 PostgreSQL parity test: TINYCLOUD_TEST_POSTGRES_URL is unset"
-            );
+        let Some(database_url) = crate::test_support::postgres_test_url(
+            "postgres_space_filtered_delegation_selection_matches_the_full_scan",
+        ) else {
             return;
         };
 
@@ -6747,10 +6754,9 @@ mod test {
     /// hostile collation is constructed here rather than assumed.
     #[tokio::test]
     async fn postgres_space_filter_survives_a_collation_that_ignores_the_sentinel() {
-        let Ok(database_url) = std::env::var("TINYCLOUD_TEST_POSTGRES_URL") else {
-            eprintln!(
-                "skipping TC-320 PostgreSQL collation test: TINYCLOUD_TEST_POSTGRES_URL is unset"
-            );
+        let Some(database_url) = crate::test_support::postgres_test_url(
+            "postgres_space_filter_survives_a_collation_that_ignores_the_sentinel",
+        ) else {
             return;
         };
 

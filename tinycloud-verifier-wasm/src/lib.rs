@@ -537,24 +537,28 @@ mod tests {
         invalid: Vec<GoldenVector>,
     }
 
+    // Only the fields this offline verifier can actually evaluate are
+    // deserialized; serde ignores the rest. The fixture also carries `nonce`,
+    // `expected.status`, `expected.code` and `invalidReason`, which describe
+    // node-level HTTP conformance outcomes (nonce replay, block digest
+    // mismatch) that cannot be decided from a delegation alone — those belong
+    // to the tc-bench node suite, not here. Deserializing them and never
+    // asserting on them is exactly the unchecked-expectation pattern TC-381 is
+    // about, so they are left out rather than silently carried.
     #[derive(Deserialize, Clone)]
+    #[serde(rename_all = "camelCase")]
     struct GoldenVector {
         case: String,
-        delegationDepth: usize,
+        delegation_depth: usize,
         recap: Recap,
         operation: CapabilityOperation,
-        nonce: String,
-        proofCids: Vec<String>,
+        proof_cids: Vec<String>,
         siwe: String,
         signature: String,
-        expected: Expected,
-        invalidReason: Option<String>,
     }
 
     #[derive(Deserialize, Clone)]
     struct CapabilityOperation {
-        service: String,
-        space: String,
         path: String,
         action: String,
     }
@@ -567,16 +571,14 @@ mod tests {
         resource: String,
     }
 
-    #[derive(Deserialize, Clone)]
-    struct Expected {
-        status: u32,
-        code: String,
-    }
-
-    const GOLDEN_VECTORS: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../../../../repositories/tc-bench/fixtures/golden-vectors.json"
-    ));
+    // TC-381: this used to `include_str!` five directories above the crate root,
+    // into a sibling `tc-bench` checkout that only exists inside one particular
+    // monorepo layout. That made this whole test target uncompilable in CI and
+    // in a plain clone — and because `tinycloud-verifier-wasm` was absent from
+    // the CI matrix, nothing ever noticed. The vectors are frozen, so the frozen
+    // copy belongs beside the test that freezes them. Refresh by copying
+    // `fixtures/golden-vectors.json` from the tc-bench repository.
+    const GOLDEN_VECTORS: &str = include_str!("../tests/fixtures/golden-vectors.json");
 
     fn parse_golden() -> GoldenVectors {
         serde_json::from_str(GOLDEN_VECTORS).expect("golden vectors parse")
@@ -626,7 +628,16 @@ mod tests {
                 canonical_principal_or_uri(cacao.payload().aud.as_ref())
             );
             assert_eq!(verdict.capabilities.len(), 1, "{}", vector.case);
-            assert_eq!(verdict.proof_cids, vector.proofCids, "{}", vector.case);
+            assert_eq!(verdict.proof_cids, vector.proof_cids, "{}", vector.case);
+            // The proof chain the verifier recovers must be exactly as deep as
+            // the vector says it is, so a vector named "depth-8" cannot quietly
+            // become a depth-1 delegation.
+            assert_eq!(
+                verdict.proof_cids.len(),
+                vector.delegation_depth,
+                "{}",
+                vector.case
+            );
 
             let capability = &verdict.capabilities[0];
             assert_eq!(
@@ -634,7 +645,7 @@ mod tests {
                 *vector.recap.att.keys().next().expect("recap resource")
             );
             assert_eq!(capability.action, vector.operation.action);
-            assert_eq!(vector.recap.prf, vector.proofCids);
+            assert_eq!(vector.recap.prf, vector.proof_cids);
             assert!(vector.recap.statement.contains(&vector.operation.path));
             assert!(vector.recap.resource.starts_with("urn:recap:"));
         }
@@ -644,7 +655,7 @@ mod tests {
     fn proof_cid_helper_matches_tc_bench_fixture() {
         let golden = parse_golden();
         for vector in &golden.valid {
-            for (index, proof_cid) in vector.proofCids.iter().enumerate() {
+            for (index, proof_cid) in vector.proof_cids.iter().enumerate() {
                 let seed = format!("tc-bench-v1:{}:proof:{}", vector.case, index);
                 assert_eq!(
                     compute_proof_cid(seed.as_bytes()),

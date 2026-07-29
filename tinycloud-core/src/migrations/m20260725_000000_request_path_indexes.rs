@@ -724,8 +724,19 @@ mod tests {
 
         // Apply every migration up to (but not including) TC-282, seed
         // realistic data volumes, then observe the BEFORE plans.
+        //
+        // TC-381: this used to assume TC-282 was the last registered
+        // migration and stop at `migrations.len() - 1`. Three migrations have
+        // since been added after it, so the "BEFORE" phase was quietly running
+        // TC-282 itself and observing SEARCHes where it asserted SCANs. Locate
+        // this migration by name so the cutoff cannot drift again.
         let migrations = Migrator::migrations();
-        let before_this = (migrations.len() - 1) as u32;
+        let this_migration = Migration.name();
+        let before_this = migrations
+            .iter()
+            .position(|migration| migration.name() == this_migration)
+            .unwrap_or_else(|| panic!("{this_migration} must be registered in Migrator"))
+            as u32;
         Migrator::up(&db, Some(before_this)).await.unwrap();
         let seed = seed_representative_data(&db).await.unwrap();
 
@@ -807,7 +818,12 @@ mod tests {
 
         // down() drops all 11 and leaves the schema exactly as it was
         // before TC-282 ran.
-        Migrator::down(&db, Some(1)).await.unwrap();
+        //
+        // TC-381: `Some(1)` assumed TC-282 was the last applied migration and
+        // silently began rolling back an unrelated later migration instead.
+        // Roll back everything from the end down to and including TC-282.
+        let rollback = migrations.len() as u32 - before_this;
+        Migrator::down(&db, Some(rollback)).await.unwrap();
         for (_, table, index_name) in EXPECTED_INDEXES
             .iter()
             .map(|(name, table, _)| (*name, *table, *name))

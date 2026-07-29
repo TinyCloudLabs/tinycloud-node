@@ -243,38 +243,6 @@ where
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolves_http_byte_range_shapes() {
-        assert_eq!(
-            ByteRangeSpec::Inclusive { start: 2, end: 5 }.resolve(10),
-            Some(ResolvedByteRange { start: 2, end: 5 })
-        );
-        assert_eq!(
-            ByteRangeSpec::Inclusive { start: 8, end: 50 }.resolve(10),
-            Some(ResolvedByteRange { start: 8, end: 9 })
-        );
-        assert_eq!(
-            ByteRangeSpec::From { start: 7 }.resolve(10),
-            Some(ResolvedByteRange { start: 7, end: 9 })
-        );
-        assert_eq!(
-            ByteRangeSpec::Suffix { length: 3 }.resolve(10),
-            Some(ResolvedByteRange { start: 7, end: 9 })
-        );
-        assert_eq!(
-            ByteRangeSpec::Suffix { length: 50 }.resolve(10),
-            Some(ResolvedByteRange { start: 0, end: 9 })
-        );
-        assert_eq!(ByteRangeSpec::From { start: 10 }.resolve(10), None);
-        assert_eq!(ByteRangeSpec::Suffix { length: 0 }.resolve(10), None);
-        assert_eq!(ByteRangeSpec::From { start: 0 }.resolve(0), None);
-    }
-}
-
 #[async_trait]
 impl<S> ImmutableStaging for Box<S>
 where
@@ -331,5 +299,37 @@ where
     type Error = S::Error;
     async fn total_size(&self, space: &SpaceId) -> Result<Option<u64>, Self::Error> {
         (**self).total_size(space).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_http_byte_range_shapes() {
+        assert_eq!(
+            ByteRangeSpec::Inclusive { start: 2, end: 5 }.resolve(10),
+            Some(ResolvedByteRange { start: 2, end: 5 })
+        );
+        assert_eq!(
+            ByteRangeSpec::Inclusive { start: 8, end: 50 }.resolve(10),
+            Some(ResolvedByteRange { start: 8, end: 9 })
+        );
+        assert_eq!(
+            ByteRangeSpec::From { start: 7 }.resolve(10),
+            Some(ResolvedByteRange { start: 7, end: 9 })
+        );
+        assert_eq!(
+            ByteRangeSpec::Suffix { length: 3 }.resolve(10),
+            Some(ResolvedByteRange { start: 7, end: 9 })
+        );
+        assert_eq!(
+            ByteRangeSpec::Suffix { length: 50 }.resolve(10),
+            Some(ResolvedByteRange { start: 0, end: 9 })
+        );
+        assert_eq!(ByteRangeSpec::From { start: 10 }.resolve(10), None);
+        assert_eq!(ByteRangeSpec::Suffix { length: 0 }.resolve(10), None);
+        assert_eq!(ByteRangeSpec::From { start: 0 }.resolve(0), None);
     }
 }
