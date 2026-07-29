@@ -47,6 +47,18 @@ type KvObjectKey = (SpaceId, Path);
 type KvObjectLock = tokio::sync::Mutex<()>;
 type KvObjectLockRegistry = Arc<tokio::sync::Mutex<HashMap<KvObjectKey, Weak<KvObjectLock>>>>;
 
+/// Per-delegation guard protecting revocation ordering (TC-324).
+///
+/// Invocations take these SHARED, delegation registration and revocation take
+/// them EXCLUSIVE. See [`SpaceDatabase::acquire_shared_chain_guards_for_keys`]
+/// for the ordering argument this encodes.
+type ChainLock = tokio::sync::RwLock<()>;
+type ChainLockRegistry = Arc<tokio::sync::Mutex<HashMap<Hash, Weak<ChainLock>>>>;
+/// Exclusive chain guard: held by delegation registration and revocation.
+type ExclusiveChainGuard = tokio::sync::OwnedRwLockWriteGuard<()>;
+/// Shared chain guard: held by invocations, which only read chain state.
+type SharedChainGuard = tokio::sync::OwnedRwLockReadGuard<()>;
+
 #[derive(Debug, Clone)]
 pub struct PendingWebhookDelivery {
     pub id: String,
@@ -75,7 +87,7 @@ pub struct SpaceDatabase<C, B, S> {
     secrets: S,
     encryption: Option<ColumnEncryption>,
     sql_sizes: SqlSizes,
-    revocation_chain_locks: Arc<tokio::sync::Mutex<HashMap<Hash, Weak<tokio::sync::Mutex<()>>>>>,
+    revocation_chain_locks: ChainLockRegistry,
     kv_object_locks: KvObjectLockRegistry,
     writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
     read_audit: ReadAuditPipeline,
@@ -932,10 +944,15 @@ where
     B: StorageSetup,
     K: Secrets,
 {
+    /// Acquire EXCLUSIVE guards over the ancestor closure of `roots`.
+    ///
+    /// Used by the writers of chain state — delegation registration and
+    /// revocation. See [`Self::acquire_shared_chain_guards_for_keys`] for why
+    /// invocations may take the same guards shared instead.
     async fn acquire_chain_guards(
         &self,
         roots: &[Hash],
-    ) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>, TxError<B, K>> {
+    ) -> Result<Vec<ExclusiveChainGuard>, TxError<B, K>> {
         let keys = revocation::ancestor_chain_ids_for_roots(&self.conn, roots)
             .await
             .map_err(|error| match error {
@@ -944,40 +961,95 @@ where
                     TxError::ChainTraversalLimitExceeded
                 }
             })?;
-        Ok(self.acquire_chain_guards_for_keys(keys).await)
+        Ok(self.acquire_exclusive_chain_guards_for_keys(keys).await)
     }
 
-    async fn acquire_chain_guards_for_keys(
-        &self,
-        mut keys: Vec<Hash>,
-    ) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
-        // Single instrumentation point for chain-guard acquisition: every
-        // caller (delegate, revoke, and the invocation path) routes through
-        // here, so the ChainGuardWait span captures the mutex-contention wait
-        // across all of them without duplicating timing at each call site.
-        let guard_wait_start = Instant::now();
+    /// Resolve `keys` to their per-delegation locks in a stable global order.
+    ///
+    /// Sorting and deduplicating here is the deadlock discipline: every
+    /// acquisition — shared or exclusive — walks the key space in the same
+    /// ascending order, so a task can only ever wait on a key greater than
+    /// every key it already holds. That rules out a wait-for cycle regardless
+    /// of which mode each participant asked for, and it is why two requests
+    /// citing overlapping chains in opposite argument order cannot deadlock.
+    async fn chain_locks_for_keys(&self, mut keys: Vec<Hash>) -> Vec<Arc<ChainLock>> {
         keys.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
         keys.dedup();
 
-        let locks = {
-            let mut registry = self.revocation_chain_locks.lock().await;
-            registry.retain(|_, lock| lock.strong_count() > 0);
-            keys.into_iter()
-                .map(|key| {
-                    if let Some(lock) = registry.get(&key).and_then(Weak::upgrade) {
-                        lock
-                    } else {
-                        let lock = Arc::new(tokio::sync::Mutex::new(()));
-                        registry.insert(key, Arc::downgrade(&lock));
-                        lock
-                    }
-                })
-                .collect::<Vec<_>>()
-        };
+        let mut registry = self.revocation_chain_locks.lock().await;
+        registry.retain(|_, lock| lock.strong_count() > 0);
+        keys.into_iter()
+            .map(|key| {
+                if let Some(lock) = registry.get(&key).and_then(Weak::upgrade) {
+                    lock
+                } else {
+                    let lock = Arc::new(ChainLock::new(()));
+                    registry.insert(key, Arc::downgrade(&lock));
+                    lock
+                }
+            })
+            .collect()
+    }
 
+    /// Acquire EXCLUSIVE guards over `keys` (the full ancestor closure).
+    ///
+    /// Exclusion against the shared guards held by in-flight invocations is
+    /// what serializes a revocation against every authorization decision made
+    /// on the chain it revokes.
+    async fn acquire_exclusive_chain_guards_for_keys(
+        &self,
+        keys: Vec<Hash>,
+    ) -> Vec<ExclusiveChainGuard> {
+        // Single instrumentation point for exclusive chain-guard acquisition:
+        // delegate and revoke both route through here, so ChainGuardWait
+        // captures the contention wait without duplicating timing per call
+        // site.
+        let guard_wait_start = Instant::now();
+        let locks = self.chain_locks_for_keys(keys).await;
         let mut guards = Vec::with_capacity(locks.len());
         for lock in locks {
-            guards.push(lock.lock_owned().await);
+            guards.push(lock.write_owned().await);
+        }
+        crate::telemetry::observe_stage(
+            crate::telemetry::InvocationStage::ChainGuardWait,
+            crate::telemetry::StageOutcome::Ok,
+            guard_wait_start.elapsed(),
+        );
+        guards
+    }
+
+    /// Acquire SHARED guards over `keys` (the full ancestor closure) for an
+    /// invocation.
+    ///
+    /// An invocation only *reads* chain state: it evaluates the delegation
+    /// chain and the revocation set to make an authorization decision. The
+    /// rows it writes (its own invocation record and the `parent_delegations`
+    /// edges pointing at the delegations it cited) are leaves hanging off the
+    /// graph — they never alter any delegation's ancestor closure, and nothing
+    /// traverses the graph downward from parent to child. So two invocations
+    /// on the same chain never had to exclude one another; only a writer of
+    /// chain state does. That mutual exclusion between invocations was the
+    /// dominant source of `chain_guard_wait` in production, because a single
+    /// busy account funnels all of its traffic through one root delegation.
+    ///
+    /// The security invariant is unchanged: a revocation takes these same
+    /// guards EXCLUSIVE and holds them through commit, so it cannot commit
+    /// while an invocation is being authorized against the chain it revokes,
+    /// and an invocation that starts afterwards observes the revocation.
+    ///
+    /// Load-bearing detail: `tokio::sync::RwLock` is write-preferring (its
+    /// internal semaphore hands out permits fairly, in FIFO order). Once a
+    /// revocation is queued for the write guard, newly arriving invocations
+    /// queue behind it rather than joining the current read cohort. A
+    /// continuous stream of invocations therefore cannot starve a pending
+    /// revocation — which is what makes shared invocation guards safe as a
+    /// revocation-ordering mechanism rather than merely faster.
+    async fn acquire_shared_chain_guards_for_keys(&self, keys: Vec<Hash>) -> Vec<SharedChainGuard> {
+        let guard_wait_start = Instant::now();
+        let locks = self.chain_locks_for_keys(keys).await;
+        let mut guards = Vec::with_capacity(locks.len());
+        for lock in locks {
+            guards.push(lock.read_owned().await);
         }
         crate::telemetry::observe_stage(
             crate::telemetry::InvocationStage::ChainGuardWait,
@@ -1390,7 +1462,13 @@ where
                 return Err(TxStoreError::Tx(error));
             }
         };
-        let _chain_guards = self.acquire_chain_guards_for_keys(lock_keys).await;
+        // TC-324: invocations take the chain guards SHARED. The full ancestor
+        // closure is still guarded and the guards are still held through
+        // commit, so a revocation (which takes them exclusive) remains
+        // serialized against this authorization decision. What is dropped is
+        // invocation-vs-invocation exclusion, which the revocation-ordering
+        // invariant never depended on.
+        let _chain_guards = self.acquire_shared_chain_guards_for_keys(lock_keys).await;
         let mutation_keys = invocation
             .0
             .capabilities
@@ -1685,7 +1763,9 @@ where
 
     /// Execute a successful non-mutating invocation without entering the
     /// single-writer transaction. Authorization and data access remain under
-    /// the chain guard; the response waits for the grouped audit commit.
+    /// the caller's shared chain guards, which are held across this call and
+    /// released only after it returns; the response waits for the grouped
+    /// audit commit.
     async fn invoke_read_only<S>(
         &self,
         invocation: Invocation,
@@ -4254,6 +4334,409 @@ mod test {
 
         drop(second_guard);
         drop(first_guard);
+    }
+
+    // ── TC-324: shared chain guards for invocations ─────────────────────────
+    //
+    // Invocations take the chain guards SHARED; delegation registration and
+    // revocation take them EXCLUSIVE. The tests below pin both halves of that
+    // contract: the concurrency that was bought, and the revocation ordering
+    // that must survive buying it.
+
+    type TestDb = SpaceDatabase<sea_orm::DbConn, MemoryStore, StaticSecret>;
+
+    /// Insert a standalone delegation row and return its id.
+    async fn insert_test_delegation(db: &TestDb, label: &str) -> Hash {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        let id = crate::hash::hash(label.as_bytes());
+        delegation::ActiveModel {
+            id: Set(id),
+            delegator: Set("did:key:chain-guard-owner".to_string()),
+            delegatee: Set("did:key:chain-guard-holder".to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(label.as_bytes().to_vec()),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// Build `parent <- child`, the shape every chain-scoped guard walks.
+    async fn insert_test_chain(db: &TestDb, label: &str) -> (Hash, Hash) {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        let parent = insert_test_delegation(db, &format!("{label}-parent")).await;
+        let child = insert_test_delegation(db, &format!("{label}-child")).await;
+        parent_delegations::ActiveModel {
+            parent: Set(parent),
+            child: Set(child),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        (parent, child)
+    }
+
+    async fn insert_chain_guard_actors(db: &TestDb) {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        for actor_id in ["did:key:chain-guard-owner", "did:key:chain-guard-holder"] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+        }
+    }
+
+    /// Resolve the ancestor closure exactly as `invoke_with_options_mode`
+    /// does, then take the guards shared — the production invocation path.
+    async fn invocation_chain_keys(db: &TestDb, roots: &[Hash]) -> Vec<Hash> {
+        crate::auth_graph::load_closure_edges(&db.conn, roots)
+            .await
+            .map(|(keys, _)| keys)
+            .expect("chain closure query")
+    }
+
+    async fn acquire_invocation_guards(db: &TestDb, roots: &[Hash]) -> Vec<SharedChainGuard> {
+        let keys = invocation_chain_keys(db, roots).await;
+        db.acquire_shared_chain_guards_for_keys(keys).await
+    }
+
+    async fn insert_test_revocation(db: &TestDb, label: &str, revoked: Hash) {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        revocation::ActiveModel {
+            id: Set(crate::hash::hash(label.as_bytes())),
+            revoker: Set("did:key:chain-guard-owner".to_string()),
+            revoked: Set(revoked),
+            serialization: Set(label.as_bytes().to_vec()),
+            revoked_at: Set(Some(OffsetDateTime::now_utc())),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+    }
+
+    /// Let a spawned task run far enough to block on a contended guard.
+    async fn settle() {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+
+    /// TC-324 requirement 1: invocations sharing one root delegation must
+    /// hold the chain guard at the same time, not merely all succeed.
+    ///
+    /// The barrier is the proof of overlap: it can only be satisfied if every
+    /// task is inside the guarded section simultaneously. Under the previous
+    /// exclusive mutex this test would deadlock until the timeout, because
+    /// task 1 would hold the root guard while waiting for tasks that cannot
+    /// acquire it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn invocations_sharing_one_root_hold_the_chain_guard_concurrently() {
+        const INVOCATIONS: usize = 8;
+
+        let db = get_db().await.unwrap();
+        insert_chain_guard_actors(&db).await;
+        let (_parent, child) = insert_test_chain(&db, "shared-concurrency").await;
+
+        // Resolve the closure once so the test measures guard behaviour, not
+        // SQLite pool contention.
+        let keys = invocation_chain_keys(&db, &[child]).await;
+        assert_eq!(
+            keys.len(),
+            2,
+            "the full ancestor closure must still be guarded, not just the cited delegation"
+        );
+
+        let rendezvous = Arc::new(tokio::sync::Barrier::new(INVOCATIONS));
+        let mut handles = Vec::with_capacity(INVOCATIONS);
+        for _ in 0..INVOCATIONS {
+            let db = db.clone();
+            let keys = keys.clone();
+            let rendezvous = rendezvous.clone();
+            handles.push(tokio::spawn(async move {
+                let guards = db.acquire_shared_chain_guards_for_keys(keys).await;
+                // Unreachable unless every other invocation also holds the
+                // shared guards right now.
+                rendezvous.wait().await;
+                drop(guards);
+            }));
+        }
+
+        for handle in handles {
+            tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+                .await
+                .expect("invocations sharing a root delegation must overlap under the chain guard")
+                .unwrap();
+        }
+    }
+
+    /// TC-324 requirement 2: the revocation barrier survives shared guards,
+    /// in both directions.
+    ///
+    /// Direction A — a revocation cannot commit while an invocation holds
+    /// shared guards on the chain it revokes.
+    /// Direction B — an invocation that starts after the revocation commits
+    /// observes the revocation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn revocation_waits_for_in_flight_invocations_and_is_visible_after() {
+        let db = get_db().await.unwrap();
+        insert_chain_guard_actors(&db).await;
+        let (parent, child) = insert_test_chain(&db, "revocation-barrier").await;
+
+        // An invocation is in flight, authorizing against the chain.
+        let in_flight = acquire_invocation_guards(&db, &[child]).await;
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let revoke_db = db.clone();
+        let revoke = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            let guards = revoke_db
+                .acquire_chain_guards(&[parent])
+                .await
+                .ok()
+                .expect("revocation chain guards");
+            // The write happens under the exclusive guards, as `revoke` does.
+            insert_test_revocation(&revoke_db, "revocation-barrier-revocation", parent).await;
+            drop(guards);
+        });
+
+        started_rx.await.unwrap();
+        settle().await;
+
+        // Direction A. `is_finished` alone would only say the task is slow;
+        // the durable check is that the revocation has not become visible.
+        assert!(
+            !revoke.is_finished(),
+            "a revocation must wait for in-flight invocations holding shared guards on that chain"
+        );
+        assert!(
+            !crate::models::revocation::is_revoked(&db.conn, &parent)
+                .await
+                .unwrap(),
+            "a revocation must not commit while an invocation is being authorized against the chain"
+        );
+
+        // The in-flight invocation finishes and releases its shared guards.
+        drop(in_flight);
+        tokio::time::timeout(std::time::Duration::from_secs(10), revoke)
+            .await
+            .expect("the revocation must proceed once the shared guards are released")
+            .unwrap();
+
+        // Direction B: an invocation starting now is rejected by the chain.
+        let after = acquire_invocation_guards(&db, &[child]).await;
+        assert!(
+            crate::models::revocation::is_revoked(&db.conn, &parent)
+                .await
+                .unwrap(),
+            "an invocation starting after the revocation commits must observe it"
+        );
+        drop(after);
+    }
+
+    /// TC-324 requirement 3: delegation registration still mutually excludes
+    /// against invocations on the same chain, in both orders.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delegation_registration_excludes_invocations_on_the_same_chain() {
+        let db = get_db().await.unwrap();
+        insert_chain_guard_actors(&db).await;
+        let (parent, child) = insert_test_chain(&db, "registration-exclusion").await;
+
+        // Registration first: an invocation must not slip in beside it.
+        let registration = db
+            .acquire_chain_guards(&[parent])
+            .await
+            .ok()
+            .expect("delegation registration chain guards");
+
+        let keys = invocation_chain_keys(&db, &[child]).await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let invoke_db = db.clone();
+        let invoke_keys = keys.clone();
+        let invoke = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            invoke_db
+                .acquire_shared_chain_guards_for_keys(invoke_keys)
+                .await
+        });
+        started_rx.await.unwrap();
+        settle().await;
+        assert!(
+            !invoke.is_finished(),
+            "an invocation must not authorize against a chain while a delegation is being registered on it"
+        );
+        drop(registration);
+        let invocation_guards = tokio::time::timeout(std::time::Duration::from_secs(10), invoke)
+            .await
+            .expect("the invocation must proceed once registration releases the chain")
+            .unwrap();
+
+        // Reverse order: an in-flight invocation blocks registration.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let register_db = db.clone();
+        let register = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            register_db
+                .acquire_chain_guards(&[parent])
+                .await
+                .ok()
+                .expect("delegation registration chain guards")
+        });
+        started_rx.await.unwrap();
+        settle().await;
+        assert!(
+            !register.is_finished(),
+            "delegation registration must wait for in-flight invocations on the same chain"
+        );
+        drop(invocation_guards);
+        tokio::time::timeout(std::time::Duration::from_secs(10), register)
+            .await
+            .expect("registration must proceed once the shared guards are released")
+            .unwrap();
+    }
+
+    /// TC-324 requirement 4: `tokio::sync::RwLock` is write-preferring, so a
+    /// revocation queued behind a continuous stream of invocations still
+    /// acquires within a bounded time. This is the property that makes shared
+    /// invocation guards safe rather than merely fast — without it, a busy
+    /// account could hold a revocation off indefinitely.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_queued_revocation_is_not_starved_by_a_stream_of_invocations() {
+        const READERS: usize = 8;
+
+        let db = get_db().await.unwrap();
+        insert_chain_guard_actors(&db).await;
+        let (parent, child) = insert_test_chain(&db, "starvation").await;
+        let keys = invocation_chain_keys(&db, &[child]).await;
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut readers = Vec::with_capacity(READERS);
+        for _ in 0..READERS {
+            let db = db.clone();
+            let keys = keys.clone();
+            let stop = stop.clone();
+            readers.push(tokio::spawn(async move {
+                let mut acquisitions = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let guards = db.acquire_shared_chain_guards_for_keys(keys.clone()).await;
+                    acquisitions += 1;
+                    // Hold long enough that the reader cohorts overlap, so a
+                    // reader-preferring lock really would starve the writer.
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    drop(guards);
+                    tokio::task::yield_now().await;
+                }
+                acquisitions
+            }));
+        }
+
+        // Let the invocation stream saturate the chain before queueing behind it.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let queued_at = Instant::now();
+        let revocation_guards = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            db.acquire_chain_guards(&[parent]),
+        )
+        .await
+        .expect("a revocation must not be starved by a continuous stream of invocations")
+        .ok()
+        .expect("revocation chain guards");
+        let waited = queued_at.elapsed();
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(revocation_guards);
+
+        let mut total_acquisitions = 0u64;
+        for reader in readers {
+            total_acquisitions += reader.await.unwrap();
+        }
+
+        println!(
+            "TC-324 starvation evidence: {total_acquisitions} shared acquisitions across \
+             {READERS} concurrent invocation loops; queued revocation waited {waited:?}"
+        );
+        assert!(
+            total_acquisitions >= READERS as u64,
+            "the invocation stream must actually have been running (saw {total_acquisitions} acquisitions)"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(2),
+            "a queued revocation must acquire promptly; waited {waited:?}"
+        );
+    }
+
+    /// TC-324 requirement 5: multi-chain acquisitions requested in inverse
+    /// order must not deadlock, because every acquisition normalizes to the
+    /// same sorted key order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn inverse_order_multi_chain_acquisitions_do_not_deadlock() {
+        let db = get_db().await.unwrap();
+        insert_chain_guard_actors(&db).await;
+        let (_first_parent, first) = insert_test_chain(&db, "inverse-order-first").await;
+        let (_second_parent, second) = insert_test_chain(&db, "inverse-order-second").await;
+
+        // The discipline itself: inverse argument order resolves to the same
+        // lock sequence, so no participant can invert the acquisition order.
+        let forward = db.chain_locks_for_keys(vec![first, second]).await;
+        let reverse = db.chain_locks_for_keys(vec![second, first]).await;
+        assert_eq!(forward.len(), 2);
+        assert_eq!(reverse.len(), 2);
+        assert!(
+            forward
+                .iter()
+                .zip(reverse.iter())
+                .all(|(left, right)| Arc::ptr_eq(left, right)),
+            "inverse argument order must normalize to one global acquisition order"
+        );
+        drop(forward);
+        drop(reverse);
+
+        // And in anger: exclusive and shared acquisitions spanning both
+        // chains, requested in opposing orders, repeatedly interleaved.
+        let first_keys = invocation_chain_keys(&db, &[first, second]).await;
+        let second_keys = invocation_chain_keys(&db, &[second, first]).await;
+        for _ in 0..25 {
+            let exclusive_forward = {
+                let db = db.clone();
+                tokio::spawn(async move { drop(db.acquire_chain_guards(&[first, second]).await) })
+            };
+            let exclusive_reverse = {
+                let db = db.clone();
+                tokio::spawn(async move { drop(db.acquire_chain_guards(&[second, first]).await) })
+            };
+            let shared_forward = {
+                let db = db.clone();
+                let keys = first_keys.clone();
+                tokio::spawn(
+                    async move { drop(db.acquire_shared_chain_guards_for_keys(keys).await) },
+                )
+            };
+            let shared_reverse = {
+                let db = db.clone();
+                let keys = second_keys.clone();
+                tokio::spawn(
+                    async move { drop(db.acquire_shared_chain_guards_for_keys(keys).await) },
+                )
+            };
+
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                exclusive_forward.await.unwrap();
+                exclusive_reverse.await.unwrap();
+                shared_forward.await.unwrap();
+                shared_reverse.await.unwrap();
+            })
+            .await
+            .expect("sorted key order must prevent a multi-chain lock-order inversion");
+        }
     }
 
     #[tokio::test]
