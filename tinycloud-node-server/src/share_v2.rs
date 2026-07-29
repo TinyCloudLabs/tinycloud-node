@@ -36,6 +36,7 @@ use tinycloud_auth::{
 };
 use tinycloud_core::{
     encryption::{maybe_decrypt, ColumnEncryption},
+    hash::Hash,
     keys::StaticSecret,
     models::{
         abilities, delegation, invocation as invocation_model, owner_share_policy, revocation,
@@ -45,7 +46,7 @@ use tinycloud_core::{
     policy_capability::jcs,
     relationships::parent_delegations,
     sea_orm::{
-        sea_query::Expr, ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection,
+        sea_query::Expr, ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr,
         EntityTrait, PaginatorTrait, QueryFilter, QuerySelect, Set, TransactionTrait,
     },
     share_email::invitation::{Ed25519InvitationSigner, InvitationSigner},
@@ -154,6 +155,64 @@ pub struct ShareV2Runtime {
     verifier: Option<ExactEmailVerifier>,
 }
 
+/// Probes that the `owner_share_policy` table is queryable.
+///
+/// The projection and the deserialization target must agree: `select_only()`
+/// narrows the SQL projection to a single column, so the rows have to be read
+/// back as that column's type. Reading them back as the full entity `Model`
+/// makes the query succeed on an empty table and fail with
+/// `ColumnNotFound` the moment a single row exists (TC-349).
+async fn probe_owner_share_policy_lookup(conn: &DatabaseConnection) -> Result<(), DbErr> {
+    owner_share_policy::Entity::find()
+        .select_only()
+        .column(owner_share_policy::Column::PolicyCid)
+        .limit(1)
+        .into_tuple::<String>()
+        .all(conn)
+        .await
+        .map(|_| ())
+}
+
+/// Probes that the `delegation` and `revocation` tables are queryable.
+///
+/// See [`probe_owner_share_policy_lookup`] for why the rows are read back as
+/// the projected column's type rather than as the entity `Model`.
+async fn probe_delegation_revocation_lookup(conn: &DatabaseConnection) -> Result<(), DbErr> {
+    delegation::Entity::find()
+        .select_only()
+        .column(delegation::Column::Id)
+        .limit(1)
+        .into_tuple::<Hash>()
+        .all(conn)
+        .await?;
+    revocation::Entity::find()
+        .select_only()
+        .column(revocation::Column::Id)
+        .limit(1)
+        .into_tuple::<Hash>()
+        .all(conn)
+        .await?;
+    Ok(())
+}
+
+/// Runs a readiness probe and reports the underlying [`DbErr`] before it is
+/// collapsed into a boolean, so a failing check is diagnosable from the logs
+/// rather than only inferable from `ready: false`.
+fn report_probe(check: &str, result: Result<(), DbErr>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::error!(
+                check,
+                error = %error,
+                error_debug = ?error,
+                "share v2 readiness probe failed"
+            );
+            false
+        }
+    }
+}
+
 impl ShareV2Runtime {
     fn static_ready(&self) -> bool {
         self.config.enabled
@@ -219,26 +278,14 @@ impl ShareV2Runtime {
     }
 
     async fn readiness(&self) -> ReadinessResponse {
-        let migration = owner_share_policy::Entity::find()
-            .limit(1)
-            .all(&self.conn)
-            .await
-            .is_ok()
-            && self.encryption_probe();
-        let graph = delegation::Entity::find()
-            .select_only()
-            .column(delegation::Column::Id)
-            .limit(1)
-            .all(&self.conn)
-            .await
-            .is_ok()
-            && revocation::Entity::find()
-                .select_only()
-                .column(revocation::Column::Id)
-                .limit(1)
-                .all(&self.conn)
-                .await
-                .is_ok();
+        let migration = report_probe(
+            "migration",
+            probe_owner_share_policy_lookup(&self.conn).await,
+        ) && self.encryption_probe();
+        let graph = report_probe(
+            "delegation_revocation_lookup",
+            probe_delegation_revocation_lookup(&self.conn).await,
+        );
         let checks = self.checks(migration, graph);
         let ready = checks.migration
             && checks.encrypted_storage
@@ -271,27 +318,11 @@ pub async fn compose(
     tee_key_derived: bool,
     tinycloud: Arc<crate::TinyCloud>,
 ) -> anyhow::Result<ShareV2Runtime> {
-    let migration_ready = owner_share_policy::Entity::find()
-        .select_only()
-        .column(owner_share_policy::Column::PolicyCid)
-        .limit(1)
-        .all(&conn)
-        .await
-        .is_ok();
-    let graph_ready = delegation::Entity::find()
-        .select_only()
-        .column(delegation::Column::Id)
-        .limit(1)
-        .all(&conn)
-        .await
-        .is_ok()
-        && revocation::Entity::find()
-            .select_only()
-            .column(revocation::Column::Id)
-            .limit(1)
-            .all(&conn)
-            .await
-            .is_ok();
+    let migration_ready = report_probe("migration", probe_owner_share_policy_lookup(&conn).await);
+    let graph_ready = report_probe(
+        "delegation_revocation_lookup",
+        probe_delegation_revocation_lookup(&conn).await,
+    );
     let signing_seed = key_setup.derive_key(b"tinycloud/share-email/invitation-signing");
     let signing_secret =
         tinycloud_core::libp2p::identity::ed25519::SecretKey::try_from_bytes(signing_seed)
@@ -3751,6 +3782,150 @@ mod tests {
         assert!(
             response.checks.credential_verifier,
             "credential_verifier check must be true"
+        );
+    }
+
+    /// TC-349: the delegation/revocation readiness probe must survive the
+    /// tables being non-empty.
+    ///
+    /// The probe used to `select_only()` a single column and then read the
+    /// rows back as the full entity `Model`. That projection mismatch is
+    /// invisible on an empty table (no row is ever deserialized) and fails
+    /// with `Query(SqlxError(ColumnNotFound("delegator")))` as soon as one
+    /// delegation exists — which is what happens in the addressed-share flow
+    /// between startup and `POST /share/v2/policies`. The runtime then went
+    /// unready mid-run and 503'd with `capability_unavailable`.
+    #[tokio::test]
+    async fn readiness_survives_populated_delegation_and_revocation_tables() {
+        let key_setup = StaticSecret::new(vec![0x42u8; 32]).expect("32-byte test secret");
+        let tee_context = TeeContext::derive_local(&key_setup);
+        let runtime = compose_test_runtime(&key_setup, Some(tee_context), true).await;
+        let conn = runtime.conn.clone();
+
+        assert!(
+            runtime.readiness().await.ready,
+            "the runtime must start ready against empty tables"
+        );
+
+        actor::ActiveModel {
+            id: Set("did:key:tc349-actor".to_owned()),
+        }
+        .insert(&conn)
+        .await
+        .expect("actor row");
+        let delegation_id = hash(b"tc349-delegation");
+        delegation::ActiveModel {
+            id: Set(delegation_id),
+            delegator: Set("did:key:tc349-actor".to_owned()),
+            delegatee: Set("did:key:tc349-actor".to_owned()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(delegation_id.as_ref().to_vec()),
+        }
+        .insert(&conn)
+        .await
+        .expect("delegation row");
+
+        let after_delegation = runtime.readiness().await;
+        assert!(
+            after_delegation.checks.delegation_revocation_lookup,
+            "the lookup must stay green once a delegation row exists"
+        );
+        assert!(
+            after_delegation.ready,
+            "the runtime must stay ready once a delegation row exists"
+        );
+
+        revocation::ActiveModel {
+            id: Set(hash(b"tc349-revocation")),
+            revoker: Set("did:key:tc349-actor".to_owned()),
+            revoked: Set(delegation_id),
+            serialization: Set(b"tc349-revocation".to_vec()),
+            revoked_at: Set(Some(OffsetDateTime::now_utc())),
+        }
+        .insert(&conn)
+        .await
+        .expect("revocation row");
+
+        let after_revocation = runtime.readiness().await;
+        assert!(
+            after_revocation.checks.delegation_revocation_lookup,
+            "the lookup must stay green once a revocation row exists"
+        );
+        assert!(
+            after_revocation.ready,
+            "the runtime must stay ready once a revocation row exists"
+        );
+        assert!(
+            runtime.live().await,
+            "live() must stay true, so POST /share/v2/policies does not 503 capability_unavailable"
+        );
+    }
+
+    /// TC-349 companion: a node that boots against a database which already
+    /// holds registered policies must compose ready, not fail-closed. The
+    /// compose-time `migration` probe had the same projection mismatch, so a
+    /// restart after the first successful registration would have condemned
+    /// the runtime.
+    #[tokio::test]
+    async fn compose_is_ready_against_a_database_that_already_holds_rows() {
+        let key_setup = StaticSecret::new(vec![0x42u8; 32]).expect("32-byte test secret");
+        let tee_context = TeeContext::derive_local(&key_setup);
+        let runtime = compose_test_runtime(&key_setup, Some(tee_context.clone()), true).await;
+        let conn = runtime.conn.clone();
+
+        actor::ActiveModel {
+            id: Set("did:key:tc349-restart".to_owned()),
+        }
+        .insert(&conn)
+        .await
+        .expect("actor row");
+        let delegation_id = hash(b"tc349-restart-delegation");
+        delegation::ActiveModel {
+            id: Set(delegation_id),
+            delegator: Set("did:key:tc349-restart".to_owned()),
+            delegatee: Set("did:key:tc349-restart".to_owned()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(delegation_id.as_ref().to_vec()),
+        }
+        .insert(&conn)
+        .await
+        .expect("delegation row");
+
+        // Re-compose over the same, now-populated connection: the restart shape.
+        let directory = tempfile::tempdir().expect("tempdir for local block store");
+        let blocks = crate::BlockConfig::B(crate::storage::file_system::FileSystemConfig::new(
+            directory.path(),
+        ))
+        .open()
+        .await
+        .expect("local block storage opens");
+        let tinycloud = crate::TinyCloud::new(conn.clone(), blocks, key_setup.clone())
+            .await
+            .expect("in-process TinyCloud composes");
+        let restarted = compose(
+            conn,
+            &key_setup,
+            local_tee_share_v2_config(),
+            Some(tee_context),
+            true,
+            Arc::new(tinycloud),
+        )
+        .await
+        .expect("share v2 runtime composes against a populated database");
+
+        assert!(
+            restarted.readiness().await.ready,
+            "a restart against a populated database must reach ready:true"
+        );
+        assert!(
+            restarted.capability().is_some(),
+            "the capability descriptor must be advertised after a restart"
         );
     }
 
