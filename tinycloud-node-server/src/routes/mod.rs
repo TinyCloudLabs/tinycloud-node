@@ -1273,6 +1273,27 @@ async fn build_batch_kv_inputs(
     result
 }
 
+/// Remaining validity in seconds (`exp - now`) for an invocation whose time
+/// window has just been accepted.
+fn invocation_validity_slack_seconds(invocation: &InvocationInfo, now: OffsetDateTime) -> f64 {
+    invocation.invocation.payload().expiration.as_seconds() - now.unix_timestamp() as f64
+}
+
+/// Classify an [`invocation_model::InvocationError::InvalidTime`] rejection.
+/// The core error is a unit variant, so the reason is re-derived server-side
+/// from the signed window: past `exp` is `expired`, otherwise the window has
+/// not opened yet (`not_yet_valid`). This keeps core metric-free.
+fn classify_invocation_time_rejection(
+    invocation: &InvocationInfo,
+    now: OffsetDateTime,
+) -> crate::prometheus::TimeRejection {
+    if now.unix_timestamp() as f64 >= invocation.invocation.payload().expiration.as_seconds() {
+        crate::prometheus::TimeRejection::Expired
+    } else {
+        crate::prometheus::TimeRejection::NotYetValid
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn invoke_impl(
     i: AuthHeaderGetter<InvocationInfo>,
@@ -1547,6 +1568,12 @@ async fn invoke_impl(
         );
         let res = match invoke_result {
             Ok((tx_result, mut outcomes)) => {
+                // Server-side successful-validation site: the invocation passed
+                // its time window (and everything else), so record how much
+                // validity remained.
+                crate::prometheus::observe_invocation_validity_slack(
+                    invocation_validity_slack_seconds(&invocation_info, OffsetDateTime::now_utc()),
+                );
                 emit_kv_hook_events(hook_runtime, tinycloud, &invocation_info, &tx_result).await;
                 for outcome in &mut outcomes {
                     if let InvocationOutcome::KvList(paths, truncated, next_cursor) = outcome {
@@ -1663,22 +1690,40 @@ async fn invoke_impl(
                     })
                 }
             }
-            Err(e) => Err((
-                match &e {
-                    TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
-                    TxStoreError::KvPreconditionFailed => Status::PreconditionFailed,
-                    TxStoreError::KvSerializationConflict => Status::ServiceUnavailable,
-                    TxStoreError::KvResponseTooLarge { .. } => Status::PayloadTooLarge,
+            Err(e) => {
+                // Invalid-time observability: the core error is a unit variant
+                // that the catch-all maps to 401, so classify the reason here
+                // (server-side) from the signed window before mapping.
+                if matches!(
+                    &e,
                     TxStoreError::Tx(TxError::InvalidInvocation(
-                        invocation_model::InvocationError::MissingKvWrite(_),
-                    )) => Status::NotFound,
-                    TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
-                        database_error_status(error)
-                    }
-                    _ => Status::Unauthorized,
-                },
-                e.to_string(),
-            )),
+                        invocation_model::InvocationError::InvalidTime,
+                    ))
+                ) {
+                    crate::prometheus::observe_invocation_time_rejection(
+                        classify_invocation_time_rejection(
+                            &invocation_info,
+                            OffsetDateTime::now_utc(),
+                        ),
+                    );
+                }
+                Err((
+                    match &e {
+                        TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
+                        TxStoreError::KvPreconditionFailed => Status::PreconditionFailed,
+                        TxStoreError::KvSerializationConflict => Status::ServiceUnavailable,
+                        TxStoreError::KvResponseTooLarge { .. } => Status::PayloadTooLarge,
+                        TxStoreError::Tx(TxError::InvalidInvocation(
+                            invocation_model::InvocationError::MissingKvWrite(_),
+                        )) => Status::NotFound,
+                        TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
+                            database_error_status(error)
+                        }
+                        _ => Status::Unauthorized,
+                    },
+                    e.to_string(),
+                ))
+            }
         };
 
         if let Some(timer) = timer {

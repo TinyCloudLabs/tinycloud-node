@@ -30,8 +30,14 @@ macro_rules! impl_fromreq {
                     Some(Err(e)) => Outcome::Error((Status::Unauthorized, e)), // Revert back to Failure variant
                     None => Outcome::Forward(Status::Unauthorized),
                 };
+                // TC-326: this guard decodes the base64url auth header into a
+                // typed event (`from_header_ser`); it does NOT perform
+                // signature verification. It was previously mislabeled under
+                // `InvocationSignatureVerify`; emit the accurate
+                // `AuthorizationHeaderDecode` stage instead. The old stage is
+                // retained (unused) in the enum for metric continuity.
                 crate::prometheus::observe_stage(
-                    crate::prometheus::InvocationStage::InvocationSignatureVerify,
+                    crate::prometheus::InvocationStage::AuthorizationHeaderDecode,
                     crate::prometheus::StageOutcome::from(matches!(result, Outcome::Success(_))),
                     start.elapsed(),
                 );

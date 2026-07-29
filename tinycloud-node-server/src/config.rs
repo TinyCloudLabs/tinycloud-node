@@ -18,6 +18,8 @@ use tinycloud_core::keys::StaticSecret;
 pub struct Config {
     pub log: Logging,
     pub storage: Storage,
+    #[serde(default)]
+    pub database: DatabaseConfig,
     pub spaces: SpacesConfig,
     #[serde(default)]
     pub hooks: HooksConfig,
@@ -1073,6 +1075,30 @@ pub struct Relay {
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq, Default)]
 pub struct Telemetry {
     pub enabled: bool,
+}
+
+/// Capability-database connection tuning. Env-overridable through the same
+/// Figment mechanism as the other sections; the canonical env form is
+/// `TINYCLOUD_DATABASE__MAX_CONNECTIONS` (the double-underscore provider is the
+/// one that preserves the underscore inside the leaf key).
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct DatabaseConfig {
+    /// Maximum connections in the PostgreSQL capability-database pool. The
+    /// SQLite path uses its own fixed pool and ignores this value.
+    #[serde(default = "default_database_max_connections")]
+    pub max_connections: u32,
+}
+
+fn default_database_max_connections() -> u32 {
+    100
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: default_database_max_connections(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
