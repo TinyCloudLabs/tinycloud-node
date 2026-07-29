@@ -88,6 +88,13 @@ pub struct SessionConfig {
     /// a server-issued nonce for replay protection.
     #[serde(default)]
     pub nonce: Option<String>,
+    /// Optional per-session invocation TTL in seconds. When set, invocations
+    /// minted by this session expire `invocation_ttl_secs` seconds after
+    /// issuance (clamped to `[30, 3600]`); absent means the 120s default. It is
+    /// carried through to the resulting [`Session`], so JS callers that omit it
+    /// keep the default behavior unchanged.
+    #[serde(default)]
+    pub invocation_ttl_secs: Option<u64>,
 }
 
 #[serde_as]
@@ -101,6 +108,8 @@ pub struct PreparedSession {
     #[serde_as(as = "DisplayFromStr")]
     pub siwe: Message,
     pub verification_method: String,
+    #[serde(default)]
+    pub invocation_ttl_secs: Option<u64>,
 }
 
 #[serde_as]
@@ -127,6 +136,10 @@ pub struct Session {
     #[serde(default)]
     pub additional_spaces: Option<HashMap<String, SpaceId>>,
     pub verification_method: String,
+    /// Optional per-session invocation TTL in seconds (see
+    /// [`SessionConfig::invocation_ttl_secs`]). `None` => the 120s default.
+    #[serde(default)]
+    pub invocation_ttl_secs: Option<u64>,
 }
 
 impl SessionConfig {
@@ -209,7 +222,25 @@ impl SessionConfig {
     }
 }
 
+/// Default invocation lifetime in seconds when a session does not configure one
+/// (TC-323; the previous behavior was a hardcoded 60s).
+const DEFAULT_INVOCATION_TTL_SECS: u64 = 120;
+/// Lower clamp for a session-configured invocation TTL (footgun guard).
+const MIN_INVOCATION_TTL_SECS: u64 = 30;
+/// Upper clamp for a session-configured invocation TTL (footgun guard).
+const MAX_INVOCATION_TTL_SECS: u64 = 3600;
+
 impl Session {
+    /// Effective invocation TTL in seconds: the session's configured value
+    /// clamped to `[MIN_INVOCATION_TTL_SECS, MAX_INVOCATION_TTL_SECS]`, or
+    /// `DEFAULT_INVOCATION_TTL_SECS` when unset. Both invoke paths use this so a
+    /// minted invocation expires `now + ttl`.
+    fn effective_invocation_ttl_secs(&self) -> u64 {
+        self.invocation_ttl_secs
+            .unwrap_or(DEFAULT_INVOCATION_TTL_SECS)
+            .clamp(MIN_INVOCATION_TTL_SECS, MAX_INVOCATION_TTL_SECS)
+    }
+
     /// Allows invoking ResourceId's with any SpaceId
     pub fn invoke_any<A: IntoIterator<Item = Ability>>(
         &self,
@@ -219,8 +250,10 @@ impl Session {
         use tinycloud_auth::ssi::claims::chrono;
         // we have to use chrono here because the time crate doesnt support "now_utc" in wasm
         let now = chrono::Utc::now();
-        // 60 seconds in the future
-        let exp = ((now.timestamp() + 60i64) as f64) + (now.nanosecond() as f64 / 1_000_000_000.0);
+        // Expire `ttl` seconds in the future (session-configurable, default 120).
+        let ttl = self.effective_invocation_ttl_secs();
+        let exp =
+            ((now.timestamp() + ttl as i64) as f64) + (now.nanosecond() as f64 / 1_000_000_000.0);
         make_invocation(
             actions,
             &self.delegation_cid,
@@ -241,7 +274,9 @@ impl Session {
     ) -> Result<TinyCloudInvocation, InvocationError> {
         use tinycloud_auth::ssi::claims::chrono;
         let now = chrono::Utc::now();
-        let exp = ((now.timestamp() + 60i64) as f64) + (now.nanosecond() as f64 / 1_000_000_000.0);
+        let ttl = self.effective_invocation_ttl_secs();
+        let exp =
+            ((now.timestamp() + ttl as i64) as f64) + (now.nanosecond() as f64 / 1_000_000_000.0);
         make_invocation_from_uris(
             actions,
             &self.delegation_cid,
@@ -645,6 +680,7 @@ pub fn prepare_session(config: SessionConfig) -> Result<PreparedSession, Error> 
 
     let space_id = config.space_id.clone();
     let additional_spaces = config.additional_spaces.clone();
+    let invocation_ttl_secs = config.invocation_ttl_secs;
 
     let siwe = config
         .into_message(&verification_method)
@@ -656,6 +692,7 @@ pub fn prepare_session(config: SessionConfig) -> Result<PreparedSession, Error> 
         jwk,
         verification_method,
         siwe,
+        invocation_ttl_secs,
     })
 }
 
@@ -680,6 +717,7 @@ pub fn complete_session_setup(signed_session: SignedSession) -> Result<Session, 
         space_id: signed_session.session.space_id,
         additional_spaces: signed_session.session.additional_spaces,
         verification_method: signed_session.session.verification_method,
+        invocation_ttl_secs: signed_session.session.invocation_ttl_secs,
     })
 }
 
@@ -738,6 +776,84 @@ pub mod test {
         test_session()
             .invoke([(s, p, None, None, [a])], None)
             .expect("failed to create invocation");
+    }
+
+    #[test]
+    fn invocation_ttl_defaults_is_configurable_and_clamped() {
+        use tinycloud_auth::ssi::claims::chrono;
+
+        let service: Service = "kv".parse().unwrap();
+        let path: Path = "path".parse().unwrap();
+        let action: Ability = "tinycloud.kv/get".parse().unwrap();
+
+        // exp = now + ttl (with a sub-second fractional part), so it must land in
+        // `[before + ttl, after + ttl + 1)`; not_before must stay unset.
+        fn assert_exp(
+            before: i64,
+            after: i64,
+            expected_ttl: i64,
+            invocation: &TinyCloudInvocation,
+        ) {
+            let payload = invocation.payload();
+            assert!(payload.not_before.is_none(), "not_before must remain unset");
+            let exp = payload.expiration.as_seconds();
+            assert!(
+                exp >= (before + expected_ttl) as f64,
+                "exp {exp} should be >= before+ttl {}",
+                before + expected_ttl
+            );
+            assert!(
+                exp < (after + expected_ttl + 1) as f64,
+                "exp {exp} should be < after+ttl+1 {}",
+                after + expected_ttl + 1
+            );
+        }
+
+        // Assert the effective TTL through BOTH invoke paths, since each mints
+        // its own expiration from the shared helper.
+        let assert_ttl = |session: &Session, expected_ttl: i64| {
+            let before = chrono::Utc::now().timestamp();
+            let via_invoke = session
+                .invoke(
+                    [(service.clone(), path.clone(), None, None, [action.clone()])],
+                    None,
+                )
+                .expect("invoke should mint");
+            let after = chrono::Utc::now().timestamp();
+            assert_exp(before, after, expected_ttl, &via_invoke);
+
+            let uri = session
+                .space_id
+                .clone()
+                .to_resource(service.clone(), Some(path.clone()), None, None)
+                .as_uri();
+            let before = chrono::Utc::now().timestamp();
+            let via_uri = session
+                .invoke_any_uri([(uri, [action.clone()])], None)
+                .expect("invoke_any_uri should mint");
+            let after = chrono::Utc::now().timestamp();
+            assert_exp(before, after, expected_ttl, &via_uri);
+        };
+
+        // Default: no TTL configured => 120s.
+        let mut session = test_session();
+        assert!(
+            session.invocation_ttl_secs.is_none(),
+            "a session built without a TTL must default (None)"
+        );
+        assert_ttl(&session, 120);
+
+        // Explicit in-range value is honored.
+        session.invocation_ttl_secs = Some(300);
+        assert_ttl(&session, 300);
+
+        // Below the minimum clamps up to 30.
+        session.invocation_ttl_secs = Some(1);
+        assert_ttl(&session, 30);
+
+        // Above the maximum clamps down to 3600.
+        session.invocation_ttl_secs = Some(100_000);
+        assert_ttl(&session, 3600);
     }
 
     #[test]
