@@ -46,6 +46,32 @@ pub(crate) mod test_support {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
     }
+
+    /// Sets a process environment variable for the lifetime of the guard and
+    /// restores the previous value on drop. Hold [`env_lock`] across it.
+    #[allow(dead_code)]
+    pub struct EnvGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        #[allow(dead_code)]
+        pub fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 }
 
 use config::{BlockStorage, Config, Keys, StagingStorage};
@@ -69,7 +95,9 @@ use routes::{
         well_known_network as encryption_well_known,
     },
     hooks::{create_hook_ticket, create_webhook, delete_webhook, hook_events, list_webhooks},
-    info, invoke, open_host_key,
+    info, invoke,
+    node_keys::{node_keys, NodePublicKeys},
+    open_host_key,
     public::{public_kv_get, public_kv_head, public_kv_list, public_kv_options, RateLimiter},
     revoke, signed_kv_get,
     util_routes::*,
@@ -201,6 +229,7 @@ pub async fn app_with_control(
         cors,
         info,
         version,
+        node_keys,
         open_host_key,
         invoke,
         delegate,
@@ -243,6 +272,9 @@ pub async fn app_with_control(
     ]);
 
     let key_setup: StaticSecret = resolve_keys(&tinycloud_config.keys).await?;
+    // TC-359: publish the derived public halves so an operator can read the
+    // invitation key a dstack-keyed node actually signs with.
+    let node_public_keys = NodePublicKeys::derive(&key_setup);
     let webhook_encryption =
         ColumnEncryption::new(key_setup.derive_key(b"tinycloud/hooks/webhook-secrets"));
     let hook_runtime = HookRuntime::new(
@@ -505,6 +537,7 @@ pub async fn app_with_control(
             },
         ))
         .manage(tinycloud)
+        .manage(node_public_keys)
         .manage(sql_service);
     #[cfg(feature = "tc-bench-v1")]
     let rocket = rocket.manage(bench_state);
@@ -780,7 +813,7 @@ async fn run_retention_sweep(conn: &DatabaseConnection, retention: &config::Rete
     }
 }
 
-async fn resolve_keys(keys: &Keys) -> Result<StaticSecret> {
+pub(crate) async fn resolve_keys(keys: &Keys) -> Result<StaticSecret> {
     match keys {
         Keys::Static(s) => Ok(s.clone().try_into()?),
         #[cfg(feature = "dstack")]
