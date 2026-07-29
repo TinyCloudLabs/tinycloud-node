@@ -865,12 +865,18 @@ Issued At: 2021-12-07T18:28:18.807Z"#,
         assert!(message.verify_eip191(&incorrect).is_err());
     }
 
+    // TC-381: do NOT reword the message body below. It is the exact byte
+    // string a wallet signed in 2021, and the signature is checked against a
+    // keccak hash of it. The repo-wide orbit -> namespace rename in b46899d
+    // rewrote "access your orbit" to "access your namespace" here, which
+    // changed the EIP-191 preimage and broke the signature. Nothing caught it
+    // because `dependencies/siwe` was absent from the CI matrix.
     #[tokio::test]
     async fn verification1() {
         let message = Message::from_str(r#"localhost wants you to sign in with your Ethereum account:
 0x4b60ffAf6fD681AbcC270Faf4472011A4A14724C
 
-Allow localhost to access your namespace using their temporary session key: did:key:z6Mktud6LcDFb3heS7FFWoJhiCafmUPkCAgpvJLv5E6fgBJg#z6Mktud6LcDFb3heS7FFWoJhiCafmUPkCAgpvJLv5E6fgBJg
+Allow localhost to access your orbit using their temporary session key: did:key:z6Mktud6LcDFb3heS7FFWoJhiCafmUPkCAgpvJLv5E6fgBJg#z6Mktud6LcDFb3heS7FFWoJhiCafmUPkCAgpvJLv5E6fgBJg
 
 URI: did:key:z6Mktud6LcDFb3heS7FFWoJhiCafmUPkCAgpvJLv5E6fgBJg#z6Mktud6LcDFb3heS7FFWoJhiCafmUPkCAgpvJLv5E6fgBJg
 Version: 1

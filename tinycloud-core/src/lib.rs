@@ -20,6 +20,8 @@ pub mod sql;
 pub mod sql_sizes;
 pub mod storage;
 pub mod telemetry;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod types;
 pub mod util;
 pub mod write_hooks;
