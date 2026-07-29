@@ -453,6 +453,8 @@ pub async fn app_with_control(
     );
     let invocation_replay_cache = InvocationReplayCache::new(seed_conn.clone());
     let replay_cleanup = invocation_replay_cache.clone();
+    // TC-341: the periodic sweep also reclaims rows beyond the lifetime cap.
+    let replay_max_lifetime_secs = tinycloud_config.invocation.max_lifetime_secs;
 
     let rate_limiter = RateLimiter::new(&tinycloud_config.public_spaces);
     let webhook_dispatcher = WebhookDispatcher::new(
@@ -479,7 +481,7 @@ pub async fn app_with_control(
                 Box::pin(async move {
                     tokio::spawn(async move {
                         let _ = replay_cleanup
-                            .cleanup_expired(time::OffsetDateTime::now_utc())
+                            .cleanup(time::OffsetDateTime::now_utc(), replay_max_lifetime_secs)
                             .await;
                         let period = std::time::Duration::from_secs(60);
                         let mut interval =
@@ -489,7 +491,10 @@ pub async fn app_with_control(
                             tokio::select! {
                                 _ = interval.tick() => {
                                     let _ = replay_cleanup
-                                        .cleanup_expired(time::OffsetDateTime::now_utc())
+                                        .cleanup(
+                                            time::OffsetDateTime::now_utc(),
+                                            replay_max_lifetime_secs,
+                                        )
                                         .await;
                                 }
                                 _ = &mut shutdown => break,

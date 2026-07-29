@@ -1321,7 +1321,49 @@ async fn invoke_impl(
                 .start_timer()
         });
 
-        invocation_replay_cache.check_and_insert(&i.0).await?;
+        // TC-341: verify the invocation and bound its lifetime BEFORE recording
+        // it in the durable replay cache. The auth guard only decodes the
+        // header, so without this an unauthenticated sender of a parseable-but-
+        // unsigned invocation could persist unbounded replay rows with an
+        // attacker-chosen (far-future) expiry. Core re-verifies during
+        // processing; the resulting double verification is intentional here —
+        // collapsing it is the admission-boundary work TC-322 owns.
+        let now = OffsetDateTime::now_utc();
+
+        // (a) Cheap, crypto-free, reject-only time precheck: obviously expired
+        // or not-yet-valid envelopes are rejected before we pay for DID
+        // resolution, so a slow resolver cannot extend pre-admission work.
+        if i.0 .0.invocation.payload().validate_time(None).is_err() {
+            crate::prometheus::observe_invocation_time_rejection(
+                classify_invocation_time_rejection(&i.0 .0, now),
+            );
+            return Err((
+                Status::Unauthorized,
+                invocation_model::InvocationError::InvalidTime.to_string(),
+            ));
+        }
+
+        // (b) Full signature verification, bounded by the same DID-resolution
+        // timeout core uses.
+        invocation_model::verify_invocation(&i.0 .0.invocation)
+            .await
+            .map_err(|error| (Status::Unauthorized, error.to_string()))?;
+
+        // (c) Lifetime cap: an invocation may not claim an expiration beyond the
+        // server maximum, however it is signed.
+        if i.0 .0.invocation.payload().expiration.as_seconds()
+            > now.unix_timestamp() as f64 + config.invocation.max_lifetime_secs as f64
+        {
+            return Err((
+                Status::Unauthorized,
+                "Invocation lifetime exceeds server maximum".to_string(),
+            ));
+        }
+
+        // (d) Only now record the (verified, in-window) invocation durably.
+        invocation_replay_cache
+            .check_and_insert(&i.0, config.invocation.max_lifetime_secs)
+            .await?;
 
         // Check for SQL capabilities
         let sql_caps: Vec<_> = i
@@ -3245,6 +3287,17 @@ mod tests {
         .await?)
     }
 
+    /// A UCAN expiration far enough ahead to outlast the test yet within the
+    /// default invocation lifetime cap (TC-341), so `/invoke` admission accepts
+    /// these otherwise-unrelated invocations. Computed from `now` because the
+    /// route rejects `exp > now + max_lifetime_secs`.
+    fn test_invocation_expiration() -> tinycloud_auth::ssi::claims::jwt::NumericDate {
+        tinycloud_auth::ssi::claims::jwt::NumericDate::try_from_seconds(
+            time::OffsetDateTime::now_utc().unix_timestamp() as f64 + 200.0,
+        )
+        .expect("valid within-cap test invocation expiration")
+    }
+
     fn kv_put_capability(space: &SpaceId, path: &str) -> Capability {
         let path = path.parse().unwrap();
         Capability {
@@ -3913,7 +3966,7 @@ mod tests {
         use rocket::local::asynchronous::Client;
         use serde_json::json;
         use tinycloud_auth::authorization::Cid as AuthCid;
-        use tinycloud_auth::ssi::{claims::jwt::NumericDate, dids::DIDURLBuf, ucan::Payload};
+        use tinycloud_auth::ssi::{dids::DIDURLBuf, ucan::Payload};
         use tinycloud_auth::ucan_capabilities_object::Capabilities;
         use tinycloud_core::models::{
             abilities, actor, delegation as deleg_model, revocation as revo_model,
@@ -4059,7 +4112,7 @@ mod tests {
                     .ok_or_else(|| anyhow::anyhow!("missing did"))?
                     .parse::<DIDBuf>()?,
                 not_before: None,
-                expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
+                expiration: test_invocation_expiration(),
                 nonce: Some(nonce.to_string()),
                 // If the route trusted invocation facts over the persisted chain
                 // caveat, this prepared statement would return 999 instead of
@@ -4173,9 +4226,7 @@ mod tests {
         use rocket::local::asynchronous::Client;
         use serde_json::json;
         use tinycloud_auth::authorization::Cid as AuthCid;
-        use tinycloud_auth::ssi::{
-            claims::jwt::NumericDate, dids::DIDURLBuf, jwk::Algorithm, ucan::Payload,
-        };
+        use tinycloud_auth::ssi::{dids::DIDURLBuf, jwk::Algorithm, ucan::Payload};
         use tinycloud_auth::ucan_capabilities_object::Capabilities;
         use tinycloud_core::models::{
             abilities, actor, delegation as deleg_model, revocation as revo_model,
@@ -4325,7 +4376,7 @@ mod tests {
                 issuer: holder_verification_method.parse::<DIDURLBuf>()?,
                 audience: holder_did.parse::<DIDBuf>()?,
                 not_before: None,
-                expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
+                expiration: test_invocation_expiration(),
                 nonce: Some(nonce.to_string()),
                 facts: Some(Vec::<serde_json::Value>::new()),
                 proof: vec![parent_cid],
@@ -5713,7 +5764,7 @@ mod tests {
         nonce: &str,
         facts: Vec<serde_json::Value>,
     ) -> Result<String> {
-        use tinycloud_auth::ssi::{claims::jwt::NumericDate, dids::DIDURLBuf, ucan::Payload};
+        use tinycloud_auth::ssi::{dids::DIDURLBuf, ucan::Payload};
         use tinycloud_auth::ucan_capabilities_object::Capabilities;
 
         let mut invocation_caps = Capabilities::new();
@@ -5731,7 +5782,7 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("missing did"))?
                 .parse::<DIDBuf>()?,
             not_before: None,
-            expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
+            expiration: test_invocation_expiration(),
             nonce: Some(nonce.to_string()),
             facts: Some(facts),
             proof: vec![setup.parent_cid],
@@ -6596,6 +6647,215 @@ mod tests {
         assert_eq!(event_order::Entity::find().count(&conn).await?, 1);
         assert_eq!(epoch::Entity::find().count(&conn).await?, 1);
 
+        Ok(())
+    }
+
+    // ── TC-341: `/invoke` verifies the invocation and enforces the lifetime
+    // cap BEFORE the durable replay-cache write. Each rejection case asserts a
+    // 401 AND that no replay row was persisted for the rejected invocation. ──
+
+    /// Minimal `/invoke` rocket plus the replay DB connection so a test can
+    /// count `invocation_replay` rows. The replay DB is independent of the
+    /// TinyCloud auth DB — sufficient here because a rejected invocation never
+    /// reaches TinyCloud processing.
+    async fn tc341_invoke_rocket() -> Result<(
+        rocket::Rocket<rocket::Build>,
+        tinycloud_core::sea_orm::DatabaseConnection,
+    )> {
+        let tinycloud = test_tinycloud().await?;
+        let replay_db =
+            Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
+        Migrator::up(&replay_db, None).await?;
+        let sql_service = fresh_sql_service().await;
+        let hook_runtime = HookRuntime::new(HooksConfig::default(), [9u8; 32]);
+        let rocket = rocket::build()
+            .mount("/", rocket::routes![invoke])
+            .attach(crate::tracing::TracingFairing::new(
+                &Config::default().log.tracing,
+            ))
+            .manage(tinycloud)
+            .manage(sql_service)
+            .manage(Config::default())
+            .manage(QuotaCache::new(None, None))
+            .manage(InvocationReplayCache::new(replay_db.clone()))
+            .manage(hook_runtime)
+            .manage(BlockStage::from(crate::config::StagingStorage::Memory));
+        Ok((rocket, replay_db))
+    }
+
+    fn tc341_verification_method(jwk: &JWK) -> Result<String> {
+        let mut vm = DID_METHODS.generate(jwk, "key")?.to_string();
+        let fragment = vm
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("missing verification method fragment"))?
+            .1
+            .to_string();
+        vm.push('#');
+        vm.push_str(&fragment);
+        Ok(vm)
+    }
+
+    /// Encode a signed `kv/put` invocation on the issuer's own space. `signer`
+    /// makes the signature; `issuer_vm` is the *claimed* issuer — pass a
+    /// different key's verification method to forge a parseable invocation whose
+    /// signature does not verify.
+    fn tc341_kv_invocation(
+        signer: &JWK,
+        issuer_vm: &str,
+        expiration: tinycloud_auth::ssi::claims::jwt::NumericDate,
+        nonce: &str,
+    ) -> Result<String> {
+        use tinycloud_auth::ssi::{dids::DIDURLBuf, ucan::Payload};
+        use tinycloud_auth::ucan_capabilities_object::Capabilities;
+
+        let issuer_did = issuer_vm
+            .split('#')
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("issuer verification method missing did"))?
+            .to_string();
+        let space = SpaceId::new(issuer_did.parse::<DIDBuf>()?, "files".parse()?);
+        let resource = space.to_resource(
+            "kv".parse::<Service>()?,
+            Some("doc".parse::<AuthPath>()?),
+            None,
+            None,
+        );
+        let mut caps = Capabilities::new();
+        caps.with_action(
+            resource.as_uri(),
+            "tinycloud.kv/put".parse::<UcanAbility>()?,
+            [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+        );
+        let invocation = Payload {
+            issuer: issuer_vm.parse::<DIDURLBuf>()?,
+            audience: issuer_did.parse::<DIDBuf>()?,
+            not_before: None,
+            expiration,
+            nonce: Some(nonce.to_string()),
+            facts: Some(Vec::<serde_json::Value>::new()),
+            proof: vec![],
+            attenuation: caps,
+        }
+        .sign(signer.get_algorithm().unwrap_or_default(), signer)?;
+        Ok(invocation.encode()?)
+    }
+
+    async fn tc341_replay_row_count(
+        conn: &tinycloud_core::sea_orm::DatabaseConnection,
+    ) -> Result<u64> {
+        use tinycloud_core::sea_orm::{EntityTrait, PaginatorTrait};
+        Ok(tinycloud_core::models::invocation_replay::Entity::find()
+            .count(conn)
+            .await?)
+    }
+
+    #[tokio::test]
+    async fn tc341_unverifiable_invocation_rejected_before_replay_insert() -> Result<()> {
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+
+        let (rocket, replay_conn) = tc341_invoke_rocket().await?;
+        let client = Client::tracked(rocket).await?;
+
+        // Parseable, in-window, but signed by a different key than its claimed
+        // issuer, so the header decodes yet the signature does not verify.
+        let signer = JWK::generate_ed25519()?;
+        let claimed_issuer = JWK::generate_ed25519()?;
+        let issuer_vm = tc341_verification_method(&claimed_issuer)?;
+        let header = tc341_kv_invocation(
+            &signer,
+            &issuer_vm,
+            test_invocation_expiration(),
+            "urn:uuid:tc341-unverifiable",
+        )?;
+
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", header))
+            .header(ContentType::JSON)
+            .body("{}")
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Unauthorized);
+        assert_eq!(
+            tc341_replay_row_count(&replay_conn).await?,
+            0,
+            "an unverifiable invocation must not persist a replay row"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc341_expired_invocation_rejected_before_replay_insert() -> Result<()> {
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+
+        let (rocket, replay_conn) = tc341_invoke_rocket().await?;
+        let client = Client::tracked(rocket).await?;
+
+        // Correctly signed, but already expired: rejected by the cheap
+        // pre-crypto time precheck.
+        let signer = JWK::generate_ed25519()?;
+        let issuer_vm = tc341_verification_method(&signer)?;
+        let expired = tinycloud_auth::ssi::claims::jwt::NumericDate::try_from_seconds(
+            time::OffsetDateTime::now_utc().unix_timestamp() as f64 - 3600.0,
+        )?;
+        let header = tc341_kv_invocation(&signer, &issuer_vm, expired, "urn:uuid:tc341-expired")?;
+
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", header))
+            .header(ContentType::JSON)
+            .body("{}")
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Unauthorized);
+        assert_eq!(
+            tc341_replay_row_count(&replay_conn).await?,
+            0,
+            "an expired invocation must not persist a replay row"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc341_over_cap_invocation_rejected_with_distinct_message() -> Result<()> {
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+
+        let (rocket, replay_conn) = tc341_invoke_rocket().await?;
+        let client = Client::tracked(rocket).await?;
+
+        // Correctly signed and not expired, but claims a far-future expiration
+        // well beyond the default 300s cap.
+        let signer = JWK::generate_ed25519()?;
+        let issuer_vm = tc341_verification_method(&signer)?;
+        let over_cap =
+            tinycloud_auth::ssi::claims::jwt::NumericDate::try_from_seconds(4_102_444_800.0)?;
+        let header = tc341_kv_invocation(&signer, &issuer_vm, over_cap, "urn:uuid:tc341-over-cap")?;
+
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", header))
+            .header(ContentType::JSON)
+            .body("{}")
+            .dispatch()
+            .await;
+
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(status, Status::Unauthorized);
+        assert!(
+            body.contains("Invocation lifetime exceeds server maximum"),
+            "unexpected over-cap rejection body: {body}"
+        );
+        assert_eq!(
+            tc341_replay_row_count(&replay_conn).await?,
+            0,
+            "an over-cap invocation must not persist a replay row"
+        );
         Ok(())
     }
 }
