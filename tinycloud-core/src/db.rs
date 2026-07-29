@@ -951,6 +951,11 @@ where
         &self,
         mut keys: Vec<Hash>,
     ) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+        // Single instrumentation point for chain-guard acquisition: every
+        // caller (delegate, revoke, and the invocation path) routes through
+        // here, so the ChainGuardWait span captures the mutex-contention wait
+        // across all of them without duplicating timing at each call site.
+        let guard_wait_start = Instant::now();
         keys.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
         keys.dedup();
 
@@ -974,6 +979,11 @@ where
         for lock in locks {
             guards.push(lock.lock_owned().await);
         }
+        crate::telemetry::observe_stage(
+            crate::telemetry::InvocationStage::ChainGuardWait,
+            crate::telemetry::StageOutcome::Ok,
+            guard_wait_start.elapsed(),
+        );
         guards
     }
 
@@ -1354,6 +1364,7 @@ where
             .map(Hash::from)
             .collect();
         let authz_start = Instant::now();
+        let closure_start = Instant::now();
         let lock_keys = crate::auth_graph::load_closure_edges(&self.conn, &roots)
             .await
             .map(|(keys, _)| keys)
@@ -1363,6 +1374,11 @@ where
                     TxError::ChainTraversalLimitExceeded
                 }
             });
+        crate::telemetry::observe_stage(
+            crate::telemetry::InvocationStage::ChainClosureQuery,
+            crate::telemetry::StageOutcome::from(lock_keys.is_ok()),
+            closure_start.elapsed(),
+        );
         let lock_keys = match lock_keys {
             Ok(keys) => keys,
             Err(error) => {
@@ -1452,7 +1468,19 @@ where
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
-        let tx = self.conn.begin_with_config(isolation_level, None).await?;
+        let begin_start = Instant::now();
+        let tx_result = self.conn.begin_with_config(isolation_level, None).await;
+        crate::telemetry::observe_stage(
+            crate::telemetry::InvocationStage::DbTxBegin,
+            crate::telemetry::StageOutcome::from(tx_result.is_ok()),
+            begin_start.elapsed(),
+        );
+        let tx = tx_result?;
+        // DbTxBody spans post-begin to pre-commit. The guard defaults to an
+        // `error` outcome so any `?`/early return inside the transaction is
+        // recorded as a failure; it is disarmed to `ok` right before commit.
+        let tx_body_timer =
+            crate::telemetry::StageTimer::start(crate::telemetry::InvocationStage::DbTxBody);
         let auth_graph = match crate::auth_graph::AuthGraphSnapshot::load(&tx, &roots).await {
             Ok(graph) => graph,
             Err(error) => {
@@ -1640,6 +1668,10 @@ where
             };
         }
 
+        // Record the transaction body as successful (post-begin to
+        // pre-commit) before the commit itself; commit latency is tracked
+        // separately (EpochPersist on the delegate/revoke path).
+        tx_body_timer.observe_ok();
         // commit tx if all side effects worked
         tx.commit().await.map_err(|error| {
             if has_preconditions && is_serialization_db_error(&error) {
@@ -1775,9 +1807,17 @@ where
             }
         }
 
-        self.read_audit
+        let read_audit_start = Instant::now();
+        let record_result = self
+            .read_audit
             .record(&invocation, self.encryption.as_ref())
-            .await?;
+            .await;
+        crate::telemetry::observe_stage(
+            crate::telemetry::InvocationStage::ReadAuditWait,
+            crate::telemetry::StageOutcome::from(record_result.is_ok()),
+            read_audit_start.elapsed(),
+        );
+        record_result?;
         Ok((
             TransactResult {
                 commits: HashMap::new(),

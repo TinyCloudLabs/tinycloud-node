@@ -15,8 +15,11 @@ services:
   tinycloud:
     image: ghcr.io/tinycloudlabs/tinycloud-node:latest
     ports:
+      # Port 8001 (Prometheus /metrics) is intentionally NOT published: the
+      # metrics handler is unauthenticated and serves every series to anyone,
+      # so it must stay internal to the CVM rather than reachable via the
+      # dstack gateway.
       - "8000:8000"
-      - "8001:8001"
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
       - tinycloud-data:/app/data

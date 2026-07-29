@@ -308,7 +308,7 @@ pub async fn app_with_control(
         ConnectOptions::from(database)
     };
     if !is_sqlite {
-        connect_opts.max_connections(100);
+        connect_opts.max_connections(tinycloud_config.database.max_connections);
         if let Some(root_cert_path) = tinycloud_config
             .share_email
             .postgres_tls
@@ -462,6 +462,11 @@ pub async fn app_with_control(
     )?;
     spawn_webhook_dispatcher(webhook_dispatcher);
 
+    // TC-326: capture handles for the telemetry DB sampler before `tinycloud`
+    // is moved into Rocket-managed state below.
+    let telemetry_enabled = tinycloud_config.telemetry.enabled;
+    let telemetry_tinycloud = tinycloud.clone();
+
     let rocket = rocket::custom(config)
         .mount("/", routes)
         .attach(AdHoc::config::<Config>())
@@ -534,6 +539,43 @@ pub async fn app_with_control(
                         tokio::select! {
                             _ = interval.tick() => {
                                 run_retention_sweep(&retention_conn, &retention_config).await;
+                            }
+                            _ = &mut shutdown => break,
+                        }
+                    }
+                });
+            })
+        }))
+    } else {
+        rocket
+    };
+
+    // TC-326: pool + read-audit telemetry sampler. Gated on telemetry.enabled;
+    // an on-liftoff task that samples the DB pool gauges, probes pool-acquire
+    // latency, and advances the read-audit commit counters every 5 seconds,
+    // stopping on shutdown. Mirrors the retention-sweeper fairing above.
+    let rocket = if telemetry_enabled {
+        let telemetry_conn = seed_conn.clone();
+        rocket.attach(AdHoc::on_liftoff("telemetry-db-sampler", move |rocket| {
+            let telemetry_conn = telemetry_conn.clone();
+            let telemetry_tinycloud = telemetry_tinycloud.clone();
+            let shutdown = rocket.shutdown();
+            Box::pin(async move {
+                tokio::spawn(async move {
+                    let mut last_read_audit = (0u64, 0u64);
+                    let period = std::time::Duration::from_secs(5);
+                    let mut interval =
+                        tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+                    tokio::pin!(shutdown);
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                sample_db_telemetry(
+                                    &telemetry_conn,
+                                    &telemetry_tinycloud,
+                                    &mut last_read_audit,
+                                )
+                                .await;
                             }
                             _ = &mut shutdown => break,
                         }
@@ -624,6 +666,50 @@ pub async fn app_with_control(
     } else {
         Ok(rocket)
     }
+}
+
+/// One telemetry sample tick: update the DB pool gauges, probe pool-acquire
+/// latency (the `DbPoolAcquire` span), and advance the cumulative read-audit
+/// counters. `last_read_audit` carries the previous cumulative
+/// `(records, batches)` so the monotonic counters advance by deltas.
+///
+/// sea-orm couples pool acquisition with `BEGIN` on the generic connection, so
+/// the request-path `DbTxBegin` span cannot separate the two. This sampler is
+/// the one place the concrete pool is reachable, so it hosts the standalone
+/// pool-acquire probe (bounded by a short timeout so it never delays shutdown).
+async fn sample_db_telemetry(
+    conn: &DatabaseConnection,
+    tinycloud: &TinyCloud,
+    last_read_audit: &mut (u64, u64),
+) {
+    use tinycloud_core::sea_orm::{ConnectionTrait, DatabaseBackend};
+
+    macro_rules! sample_pool {
+        ($pool:expr) => {{
+            let pool = $pool;
+            crate::prometheus::set_db_pool_gauges(pool.size() as i64, pool.num_idle() as i64);
+            let acquire_start = std::time::Instant::now();
+            let acquired =
+                tokio::time::timeout(std::time::Duration::from_secs(2), pool.acquire()).await;
+            crate::prometheus::observe_stage(
+                crate::prometheus::InvocationStage::DbPoolAcquire,
+                crate::prometheus::StageOutcome::from(matches!(acquired, Ok(Ok(_)))),
+                acquire_start.elapsed(),
+            );
+        }};
+    }
+    match conn.get_database_backend() {
+        DatabaseBackend::Postgres => sample_pool!(conn.get_postgres_connection_pool()),
+        DatabaseBackend::Sqlite => sample_pool!(conn.get_sqlite_connection_pool()),
+        DatabaseBackend::MySql => sample_pool!(conn.get_mysql_connection_pool()),
+    }
+
+    let (records, batches) = tinycloud.read_audit_commit_stats();
+    crate::prometheus::add_read_audit_stats(
+        records.saturating_sub(last_read_audit.0),
+        batches.saturating_sub(last_read_audit.1),
+    );
+    *last_read_audit = (records, batches);
 }
 
 /// Run one retention sweep: prune terminal hook deliveries and expired signed

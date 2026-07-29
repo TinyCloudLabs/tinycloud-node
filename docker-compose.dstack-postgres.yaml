@@ -26,6 +26,11 @@ services:
       AWS_SECRET_ACCESS_KEY: "${AWS_SECRET}"
       AWS_DEFAULT_REGION: "${AWS_REGION}"
       TINYCLOUD_LOG_LEVEL: normal
+      # Enable Prometheus telemetry (metrics, span histograms, pool gauges).
+      # The metrics handler is intentionally NOT gateway-exposed: port 8001 is
+      # not published here, so the unauthenticated /metrics endpoint stays
+      # internal to the CVM.
+      TINYCLOUD_TELEMETRY__ENABLED: "true"
       TINYCLOUD_CORS: "true"
       TINYCLOUD_QUOTA_URL: "${TINYCLOUD_QUOTA_URL}"
       TINYCLOUD_ADMIN_SECRET: "${TINYCLOUD_ADMIN_SECRET}"
