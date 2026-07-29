@@ -25,7 +25,7 @@ on:
         type: boolean
         default: false
       image_version:
-        description: 'Manual image version to tag/deploy, without leading v. Defaults to the selected ref name.'
+        description: 'Manual image version to tag/deploy, without leading v. Must equal the tinycloud-node version in tinycloud-node-server/Cargo.toml at the selected ref. Defaults to the selected ref name.'
         required: false
         type: string
         default: ''
@@ -35,8 +35,62 @@ env:
   IMAGE_NAME: tinycloudlabs/tinycloud-node
 
 jobs:
+  # TC-342: every image tag this workflow can produce must agree with the crate
+  # version at the checked-out ref. `image_version` used to be unconstrained
+  # free text, which is how an image got labelled 1.10.0 from a tree whose
+  # Cargo.toml said 1.9.0 — prod then ran a binary that no tag in the repo
+  # identified, and the team debugged a feature that was not in the deployed
+  # image. Fail the whole workflow loudly instead of shipping a mislabelled tag.
+  version-guard:
+    name: Version guard
+    runs-on: ubuntu-latest
+    outputs:
+      cargo_version: ${{ steps.check.outputs.cargo_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate image version against Cargo.toml
+        id: check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_IMAGE_VERSION: ${{ inputs.image_version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+
+          # `|| true` so a missing match reaches the explicit check below
+          # instead of dying under `set -e` with no explanation.
+          CARGO_VERSION="$(grep -m1 -E '^version = "' tinycloud-node-server/Cargo.toml | cut -d '"' -f 2 || true)"
+          if [ -z "${CARGO_VERSION}" ]; then
+            echo "::error::could not read the tinycloud-node version from tinycloud-node-server/Cargo.toml"
+            exit 1
+          fi
+          echo "cargo_version=${CARGO_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tinycloud-node-server/Cargo.toml version: ${CARGO_VERSION}"
+
+          check_matches() {
+            label="$1"
+            value="$2"
+            if [ "${value#v}" != "${CARGO_VERSION}" ]; then
+              echo "::error::${label} is '${value}' but tinycloud-node-server/Cargo.toml at this ref says '${CARGO_VERSION}'. Image tags must match the crate version — bump Cargo.toml via the release-plz release PR first (see docs/releasing.md)."
+              exit 1
+            fi
+            echo "${label} '${value}' matches the crate version."
+          }
+
+          if [ "${EVENT_NAME}" = "release" ]; then
+            check_matches "release tag" "${RELEASE_TAG}"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            check_matches "git tag" "${GITHUB_REF_NAME}"
+          fi
+
+          if [ -n "${INPUT_IMAGE_VERSION}" ]; then
+            check_matches "image_version input" "${INPUT_IMAGE_VERSION}"
+          fi
+
   build:
     runs-on: ubuntu-latest
+    needs: [version-guard]
     permissions:
       contents: read
       packages: write
@@ -97,6 +151,7 @@ jobs:
 
   build-dstack:
     runs-on: ubuntu-latest
+    needs: [version-guard]
     if: github.event_name == 'release' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     permissions:
       contents: read
