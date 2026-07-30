@@ -41,6 +41,29 @@ services:
       # instance's own max_connections.
       TINYCLOUD_DATABASE__MAX_CONNECTIONS: "15"
       TINYCLOUD_CORS: "true"
+      # --- addressed sharing (TC-397) ------------------------------------
+      #
+      # The public trust document shared with Share and OpenCredentials,
+      # delivered inline because nothing else can reach this container: the
+      # image is `FROM scratch` (no shell, so share-api's decode-to-tmpfs
+      # entrypoint cannot work here) and a dstack deployment uploads only
+      # this compose file (so there is no host path to bind-mount from).
+      #
+      # Seal the base64 of the reviewed trust-bundle.production.json — the
+      # same bytes share-api serves — into the CVM's encrypted environment as
+      # SHARE_TRUST_BUNDLE_BASE64. Same variable name and same wire form
+      # share-api already uses, so one sealed value feeds both services and
+      # cannot drift between them.
+      #
+      # The `:?` form is deliberate: compose refuses to interpolate a partial
+      # deployment, failing loudly at deploy time rather than letting the node
+      # die at boot with "share email trust bundle is required".
+      TINYCLOUD_SHARE_EMAIL__ENABLED: "true"
+      TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_BASE64: "${SHARE_TRUST_BUNDLE_BASE64:?seal the reviewed share-email trust bundle, base64-encoded}"
+      # The sealed DATABASE_URL already carries sslmode=verify-full as its sole
+      # query parameter. ROOT_CERT_PATH stays unset so verify-full resolves
+      # against the compiled-in public root set (TC-363).
+      TINYCLOUD_SHARE_EMAIL__POSTGRES_TLS__SSLMODE: verify-full
       TINYCLOUD_QUOTA_URL: "${TINYCLOUD_QUOTA_URL}"
       TINYCLOUD_ADMIN_SECRET: "${TINYCLOUD_ADMIN_SECRET}"
       ROCKET_ADDRESS: "0.0.0.0"

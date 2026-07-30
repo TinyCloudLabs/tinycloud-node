@@ -87,6 +87,26 @@ pub struct ShareEmailConfig {
     /// production composition resolves them from this file.
     #[serde(default)]
     pub trust_bundle_path: Option<String>,
+    /// TC-397: the same trust document delivered inline and base64-encoded
+    /// instead of as a mounted file. Canonical env form is
+    /// `TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_BASE64`.
+    ///
+    /// The release image is `FROM scratch` — no shell, no `base64` — so the
+    /// decode-to-tmpfs entrypoint that `share-api`'s compose file uses cannot
+    /// work here, and a dstack/Phala deployment uploads only a compose file,
+    /// so there is no host path to bind-mount a file from either. An opaque
+    /// environment variable is the one channel that reaches this container in
+    /// production. It is base64 rather than raw JSON because Figment's `Env`
+    /// provider interprets brace- and bracket-delimited values as structured
+    /// data; a base64 token passes through Figment, YAML and dstack's sealed
+    /// environment storage byte-for-byte.
+    ///
+    /// At most one of this and [`Self::trust_bundle_path`] may be set. Two
+    /// sources for one document is exactly the divergence this bundle exists
+    /// to prevent, so configuring both is a startup error rather than a
+    /// silent precedence rule.
+    #[serde(default)]
+    pub trust_bundle_base64: Option<String>,
     /// Optional legacy assertions for the shared bundle's service origins.
     /// They are never a source of production trust.
     #[serde(default)]
@@ -197,6 +217,7 @@ impl Default for ShareEmailConfig {
             issuer_public_key: None,
             authority_material_path: None,
             trust_bundle_path: None,
+            trust_bundle_base64: None,
             share_origin: None,
             registry_origin: None,
             credentials_origin: None,
@@ -214,16 +235,12 @@ impl ShareEmailConfig {
         if !self.enabled {
             return Ok(self.clone());
         }
-        let Some(path) = self.trust_bundle_path.as_deref() else {
+        let Some(bytes) = self.trust_bundle_bytes()? else {
             if allows_hermetic_fixture() {
                 return Ok(self.clone());
             }
             return Err("share email trust bundle is required");
         };
-        let bytes = fs::read(path).map_err(|_| "share email trust bundle is unreadable")?;
-        if bytes.len() > 64 * 1024 {
-            return Err("share email trust bundle is too large");
-        }
         let bundle: ShareEmailTrustBundle =
             serde_json::from_slice(&bytes).map_err(|_| "share email trust bundle is invalid")?;
         bundle.validate()?;
@@ -243,6 +260,42 @@ impl ShareEmailConfig {
         resolved.issuer_key_version = bundle.issuer_key_version as u64;
         resolved.issuer_public_key = Some(bundle.issuer_public_key);
         Ok(resolved)
+    }
+
+    /// Reads the trust document from whichever single source is configured.
+    /// `Ok(None)` means no source at all, which only the hermetic-fixture
+    /// build tolerates.
+    ///
+    /// The size ceiling is applied to the *decoded* document either way, and
+    /// to the encoded form first so a hostile environment variable cannot
+    /// make the node allocate an unbounded buffer before the check runs.
+    fn trust_bundle_bytes(&self) -> Result<Option<Vec<u8>>, &'static str> {
+        const MAX_BUNDLE_BYTES: usize = 64 * 1024;
+        match (
+            self.trust_bundle_path.as_deref(),
+            self.trust_bundle_base64.as_deref(),
+        ) {
+            (Some(_), Some(_)) => Err("share email trust bundle has two sources"),
+            (Some(path), None) => {
+                let bytes = fs::read(path).map_err(|_| "share email trust bundle is unreadable")?;
+                if bytes.len() > MAX_BUNDLE_BYTES {
+                    return Err("share email trust bundle is too large");
+                }
+                Ok(Some(bytes))
+            }
+            (None, Some(encoded)) => {
+                if encoded.len() > MAX_BUNDLE_BYTES * 2 {
+                    return Err("share email trust bundle is too large");
+                }
+                let bytes = base64::decode(encoded)
+                    .map_err(|_| "share email inline trust bundle is not base64")?;
+                if bytes.len() > MAX_BUNDLE_BYTES {
+                    return Err("share email trust bundle is too large");
+                }
+                Ok(Some(bytes))
+            }
+            (None, None) => Ok(None),
+        }
     }
 
     /// Full legacy v1 validation: everything the v2/database path checks,
@@ -388,6 +441,26 @@ struct ShareEmailTrustBundle {
     return_origin: String,
     registry_origin: String,
     credentials_origin: String,
+    /// TC-397: the origin the Share host puts in its CSP `connect-src` so the
+    /// browser is allowed to reach the email service. Share's schema is
+    /// closed and *requires* this field; the node's is closed and, until now,
+    /// rejected it — one committed document could not satisfy both, and
+    /// `resolve_trust_bundle` is `?`-propagated at startup, so the mismatch
+    /// was boot-fatal.
+    ///
+    /// It is optional here on purpose. Nothing in the node reads it: the CSP
+    /// it feeds is emitted by Share, and the node already declines to
+    /// propagate the two other origins it does not consume (`shareOrigin`,
+    /// `registryOrigin` are validated and matched, never resolved into
+    /// config). Requiring a newly added field inside an unchanged document
+    /// version would also be a breaking schema change without a version bump,
+    /// making every bundle in flight boot-fatal and coupling the node and
+    /// Share deploy order. `deny_unknown_fields` still rejects genuinely
+    /// unknown keys, so the schema stays closed; `emailOrigin` simply becomes
+    /// a known field that is fully validated whenever it is present. The
+    /// requirement itself is enforced by Share, which is its only consumer.
+    #[serde(default)]
+    email_origin: Option<String>,
     node_origin: String,
     node_audience: String,
     node_invitation_kid: String,
@@ -413,6 +486,10 @@ impl ShareEmailTrustBundle {
             || self.return_origin != self.share_origin
             || !canonical_https_origin(&self.registry_origin)
             || self.credentials_origin != "https://witness.credentials.org"
+            || self
+                .email_origin
+                .as_deref()
+                .is_some_and(|origin| !canonical_https_origin(origin))
             || (!canonical_https_origin(&self.node_origin) && !fixture_node_origin)
             || self.node_audience
                 != format!(
@@ -496,6 +573,10 @@ impl ShareEmailTrustBundle {
         ]
         .into_iter()
         .any(|value| contains_placeholder(value))
+            || self
+                .email_origin
+                .as_deref()
+                .is_some_and(contains_placeholder)
             || is_fixture_public_key(&self.node_invitation_public_key)
             || is_fixture_public_key(&self.issuer_public_key)
     }
@@ -1202,6 +1283,33 @@ mod tests {
         }
     }
 
+    /// The exact `emailOrigin` the committed production document carries.
+    /// Share's schema requires the field; the node's must accept it.
+    const PRODUCTION_EMAIL_ORIGIN: &str = "https://email.tinycloud.xyz";
+
+    fn bundle_document(config: &ShareEmailConfig) -> serde_json::Value {
+        serde_json::json!({
+            "version": "tinycloud.share-email-trust-bundle/v1",
+            "shareOrigin": "https://share.tinycloud.xyz",
+            "returnOrigin": config.return_origin.clone(),
+            "registryOrigin": "https://registry.tinycloud.xyz",
+            "credentialsOrigin": "https://witness.credentials.org",
+            "emailOrigin": PRODUCTION_EMAIL_ORIGIN,
+            "nodeOrigin": config.target_origin.clone(),
+            "nodeAudience": config.node_audience.clone(),
+            "nodeInvitationKid": config.invitation_kid.clone(),
+            "nodeInvitationPublicKey": config.invitation_public_key.clone(),
+            "nodeKeyVersion": 1,
+            "nodeEnabled": true,
+            "issuerDid": config.issuer_did.clone(),
+            "issuerVct": config.issuer_vct.clone(),
+            "issuerKid": config.issuer_kid.clone(),
+            "issuerPublicKey": config.issuer_public_key.clone(),
+            "issuerKeyVersion": config.issuer_key_version,
+            "issuerEnabled": true
+        })
+    }
+
     fn install_bundle(config: &mut ShareEmailConfig) -> NamedTempFile {
         let file = NamedTempFile::new().expect("temporary trust bundle");
         let bundle = serde_json::json!({
@@ -1313,6 +1421,174 @@ mod tests {
         assert_eq!(
             config.resolve_trust_bundle(),
             Err("share email trust bundle is inconsistent")
+        );
+    }
+
+    /// TC-397. Share's trust-bundle schema is closed and *requires*
+    /// `emailOrigin` — it feeds the CSP `connect-src` without which the
+    /// browser blocks the send. The node's schema is closed too and rejected
+    /// the key outright, so one committed document could not satisfy both
+    /// sides; because `resolve_trust_bundle` is `?`-propagated out of
+    /// `app_with_control`, that mismatch killed the node at boot with
+    /// "share email trust bundle is invalid".
+    #[cfg(not(feature = "mounted-fixture"))]
+    #[tokio::test]
+    async fn a_trust_bundle_carrying_the_production_email_origin_is_accepted() {
+        let mut config = enabled_config();
+        let file = NamedTempFile::new().expect("temporary trust bundle");
+        fs::write(
+            file.path(),
+            serde_json::to_vec(&bundle_document(&config)).unwrap(),
+        )
+        .expect("trust bundle write");
+        config.trust_bundle_path = Some(file.path().display().to_string());
+
+        let resolved = config
+            .resolve_trust_bundle()
+            .expect("a bundle carrying emailOrigin must be accepted");
+
+        // Validated, but deliberately not consumed — the same treatment
+        // `shareOrigin` and `registryOrigin` already get, because the node
+        // has no use for them either.
+        assert_eq!(
+            resolved.credentials_origin.as_deref(),
+            Some("https://witness.credentials.org")
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    /// The field is optional, not ignored: whenever it is present it has to
+    /// be a canonical HTTPS origin with no path, query, fragment, port or
+    /// credentials, and it is covered by the production placeholder scan.
+    #[cfg(not(feature = "mounted-fixture"))]
+    #[tokio::test]
+    async fn a_malformed_email_origin_is_rejected() {
+        for malformed in [
+            "http://email.tinycloud.xyz",
+            "https://email.tinycloud.xyz/send",
+            "https://email.tinycloud.xyz/?queue=1",
+            "https://email.tinycloud.xyz#fragment",
+            "https://operator:secret@email.tinycloud.xyz",
+            "https://email.tinycloud.xyz:8443",
+            "email.tinycloud.xyz",
+            "",
+            // Caught by the placeholder scan rather than the origin shape.
+            "https://email.localhost",
+            "https://email.test.tinycloud.xyz",
+        ] {
+            let mut config = enabled_config();
+            let mut document = bundle_document(&config);
+            document["emailOrigin"] = serde_json::Value::String(malformed.to_owned());
+            let file = NamedTempFile::new().expect("temporary trust bundle");
+            fs::write(file.path(), serde_json::to_vec(&document).unwrap())
+                .expect("trust bundle write");
+            config.trust_bundle_path = Some(file.path().display().to_string());
+
+            assert_eq!(
+                config.resolve_trust_bundle(),
+                Err("share email trust bundle is inconsistent"),
+                "emailOrigin {malformed:?} must be rejected"
+            );
+        }
+    }
+
+    /// Widening the schema by one known field must not widen it by two: a key
+    /// the node has never heard of is still fatal.
+    #[cfg(not(feature = "mounted-fixture"))]
+    #[tokio::test]
+    async fn an_unknown_trust_bundle_field_is_still_rejected() {
+        let mut config = enabled_config();
+        let mut document = bundle_document(&config);
+        document["smtpOrigin"] = serde_json::Value::String("https://smtp.tinycloud.xyz".into());
+        let file = NamedTempFile::new().expect("temporary trust bundle");
+        fs::write(file.path(), serde_json::to_vec(&document).unwrap()).expect("trust bundle write");
+        config.trust_bundle_path = Some(file.path().display().to_string());
+
+        assert_eq!(
+            config.resolve_trust_bundle(),
+            Err("share email trust bundle is invalid")
+        );
+    }
+
+    /// TC-397: nothing could deliver a bundle file into the release
+    /// container. It is `FROM scratch`, so there is no shell to decode one
+    /// with, and a dstack deployment uploads only a compose file, so there is
+    /// no host path to bind-mount from. The document has to be able to arrive
+    /// as an opaque environment variable, and when it does it must resolve to
+    /// exactly the same trust as the mounted form.
+    #[cfg(not(feature = "mounted-fixture"))]
+    #[tokio::test]
+    async fn an_inline_base64_trust_bundle_resolves_the_same_trust_as_a_mounted_one() {
+        let mut mounted = enabled_config();
+        let _file = install_bundle(&mut mounted);
+        let from_file = mounted
+            .resolve_trust_bundle()
+            .expect("mounted bundle resolves");
+
+        let mut inline = enabled_config();
+        inline.trust_bundle_base64 = Some(base64::encode(
+            serde_json::to_vec(&bundle_document(&inline)).unwrap(),
+        ));
+        let from_env = inline
+            .resolve_trust_bundle()
+            .expect("inline bundle resolves");
+
+        assert_eq!(from_env.target_origin, from_file.target_origin);
+        assert_eq!(from_env.node_audience, from_file.node_audience);
+        assert_eq!(from_env.return_origin, from_file.return_origin);
+        assert_eq!(from_env.allowed_origins, from_file.allowed_origins);
+        assert_eq!(from_env.node_signing_kid, from_file.node_signing_kid);
+        assert_eq!(from_env.invitation_kid, from_file.invitation_kid);
+        assert_eq!(
+            from_env.invitation_public_key,
+            from_file.invitation_public_key
+        );
+        assert_eq!(from_env.issuer_did, from_file.issuer_did);
+        assert_eq!(from_env.issuer_kid, from_file.issuer_kid);
+        assert_eq!(from_env.issuer_public_key, from_file.issuer_public_key);
+        assert_eq!(from_env.credentials_origin, from_file.credentials_origin);
+        assert!(inline.validate().is_ok());
+    }
+
+    /// Two sources for one document is the drift this bundle exists to
+    /// prevent, so it is a startup error rather than a precedence rule.
+    #[cfg(not(feature = "mounted-fixture"))]
+    #[tokio::test]
+    async fn two_trust_bundle_sources_are_a_startup_error() {
+        let mut config = enabled_config();
+        let _file = install_bundle(&mut config);
+        config.trust_bundle_base64 = Some(base64::encode(
+            serde_json::to_vec(&bundle_document(&config)).unwrap(),
+        ));
+
+        assert_eq!(
+            config.resolve_trust_bundle(),
+            Err("share email trust bundle has two sources")
+        );
+    }
+
+    #[cfg(not(feature = "mounted-fixture"))]
+    #[tokio::test]
+    async fn an_undecodable_or_oversized_inline_trust_bundle_is_rejected() {
+        let mut config = enabled_config();
+        config.trust_bundle_base64 = Some("not base64!".into());
+        assert_eq!(
+            config.resolve_trust_bundle(),
+            Err("share email inline trust bundle is not base64")
+        );
+
+        let mut config = enabled_config();
+        config.trust_bundle_base64 = Some(base64::encode(b"not-json"));
+        assert_eq!(
+            config.resolve_trust_bundle(),
+            Err("share email trust bundle is invalid")
+        );
+
+        let mut config = enabled_config();
+        config.trust_bundle_base64 = Some(base64::encode(vec![b'x'; 64 * 1024 + 1]));
+        assert_eq!(
+            config.resolve_trust_bundle(),
+            Err("share email trust bundle is too large")
         );
     }
 
