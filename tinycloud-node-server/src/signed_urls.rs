@@ -200,41 +200,39 @@ where
 {
     fn respond_to(self, request: &'r Request<'_>) -> rocket::response::Result<'static> {
         let mut response = Response::build();
+        let hash = match &self {
+            Self::Full { hash, .. }
+            | Self::Partial { hash, .. }
+            | Self::Unsatisfiable { hash, .. } => hash,
+        };
+        let etag = etag(hash);
+        let not_modified = if_none_match_matches(request.headers().get_one("If-None-Match"), &etag);
+        response.header(Header::new("ETag", etag));
 
-        match self {
-            Self::Full {
-                metadata,
-                hash,
-                content,
-            } => {
-                crate::prometheus::observe_signed_kv_transfer(content.len(), content.len());
-                add_object_headers(&mut response, metadata);
-                let etag = etag(&hash);
-                response.header(Header::new("ETag", etag.clone()));
-                if if_none_match_matches(request.headers().get_one("If-None-Match"), &etag) {
-                    response.status(Status::NotModified);
-                } else {
+        if not_modified {
+            response.status(Status::NotModified);
+        } else {
+            match self {
+                Self::Full {
+                    metadata, content, ..
+                } => {
+                    crate::prometheus::observe_signed_kv_transfer(content.len(), content.len());
+                    add_object_headers(&mut response, metadata);
                     response.header(Header::new("Content-Length", content.len().to_string()));
                     response
                         .streamed_body(content.compat())
                         .max_chunk_size(STREAM_MAX_CHUNK_SIZE);
                 }
-            }
-            Self::Partial {
-                metadata,
-                hash,
-                total_size,
-                range,
-                content,
-            } => {
-                crate::prometheus::observe_signed_kv_transfer(total_size, content.len());
-                add_object_headers(&mut response, metadata);
-                response.status(Status::PartialContent);
-                let etag = etag(&hash);
-                response.header(Header::new("ETag", etag.clone()));
-                if if_none_match_matches(request.headers().get_one("If-None-Match"), &etag) {
-                    response.status(Status::NotModified);
-                } else {
+                Self::Partial {
+                    metadata,
+                    total_size,
+                    range,
+                    content,
+                    ..
+                } => {
+                    crate::prometheus::observe_signed_kv_transfer(total_size, content.len());
+                    add_object_headers(&mut response, metadata);
+                    response.status(Status::PartialContent);
                     response.header(Header::new(
                         "Content-Range",
                         format!("bytes {}-{}/{}", range.start(), range.end(), total_size),
@@ -244,14 +242,13 @@ where
                         .streamed_body(content.compat())
                         .max_chunk_size(STREAM_MAX_CHUNK_SIZE);
                 }
-            }
-            Self::Unsatisfiable { hash, total_size } => {
-                response.status(Status::RangeNotSatisfiable);
-                response.header(Header::new("ETag", etag(&hash)));
-                response.header(Header::new(
-                    "Content-Range",
-                    format!("bytes */{total_size}"),
-                ));
+                Self::Unsatisfiable { total_size, .. } => {
+                    response.status(Status::RangeNotSatisfiable);
+                    response.header(Header::new(
+                        "Content-Range",
+                        format!("bytes */{total_size}"),
+                    ));
+                }
             }
         }
         response.header(Header::new("Accept-Ranges", "bytes"));
@@ -751,6 +748,14 @@ mod tests {
         }
     }
 
+    #[get("/unsatisfiable")]
+    fn unsatisfiable_response() -> SignedKvReadResponse<Cursor<Vec<u8>>> {
+        SignedKvReadResponse::Unsatisfiable {
+            hash: hash(b"hello world"),
+            total_size: 11,
+        }
+    }
+
     #[test]
     fn parses_single_http_byte_ranges() {
         assert_eq!(
@@ -891,6 +896,47 @@ mod tests {
         assert_eq!(second.status(), Status::NotModified);
         assert!(second.headers().get_one("Content-Length").is_none());
         assert!(second.into_string().await.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unsatisfiable_range_honors_if_none_match_before_returning_416() -> Result<()> {
+        let client =
+            Client::tracked(rocket::build().mount("/", rocket::routes![unsatisfiable_response]))
+                .await?;
+        let matching_etag = etag(&hash(b"hello world"));
+
+        let not_modified = client
+            .get("/unsatisfiable")
+            .header(rocket::http::Header::new(
+                "If-None-Match",
+                matching_etag.clone(),
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(not_modified.status(), Status::NotModified);
+        assert_eq!(
+            not_modified.headers().get_one("ETag"),
+            Some(matching_etag.as_str())
+        );
+        assert!(not_modified.headers().get_one("Content-Range").is_none());
+        assert!(not_modified.headers().get_one("Content-Length").is_none());
+        assert!(not_modified.into_string().await.is_none());
+
+        let range_not_satisfiable = client
+            .get("/unsatisfiable")
+            .header(rocket::http::Header::new("If-None-Match", "\"other\""))
+            .dispatch()
+            .await;
+        assert_eq!(range_not_satisfiable.status(), Status::RangeNotSatisfiable);
+        assert_eq!(
+            range_not_satisfiable.headers().get_one("Content-Range"),
+            Some("bytes */11")
+        );
+        assert_eq!(
+            range_not_satisfiable.headers().get_one("ETag"),
+            Some(matching_etag.as_str())
+        );
         Ok(())
     }
 
