@@ -42,16 +42,36 @@ import { TinyCloudNode } from "@tinycloud/node-sdk";
 
 // ---- configuration (env-overridable) ---------------------------------------
 
-const HOST = process.env.PROBE_HOST ?? "https://node.tinycloud.xyz";
+// The workflow wires optional overrides straight from secrets/vars, which
+// arrive as EMPTY STRINGS when unset — and `??` only falls back on
+// null/undefined, so `"" ?? default` keeps the empty string. Treat blank
+// (whitespace-only) env values as absent, otherwise HOST/PREFIX go empty
+// (sign-in fails: "Space name cannot be empty") and Number("") coerces every
+// threshold to 0 (instant breach).
+function envStr(name: string, fallback: string): string {
+  const v = process.env[name];
+  return v !== undefined && v.trim() !== "" ? v : fallback;
+}
+function envMs(name: string, fallback: number): number {
+  const v = process.env[name];
+  if (v === undefined || v.trim() === "") return fallback;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error(`[probe] ${name} must be a positive number, got "${v}"`);
+  }
+  return n;
+}
+
+const HOST = envStr("PROBE_HOST", "https://node.tinycloud.xyz");
 // Dedicated, isolated space prefix for the probe identity. Never shared with
 // any user-facing app prefix.
-const PREFIX = process.env.PROBE_PREFIX ?? "tc313-write-probe";
+const PREFIX = envStr("PROBE_PREFIX", "tc313-write-probe");
 
 const THRESHOLDS_MS = {
-  signIn: Number(process.env.PROBE_THRESHOLD_SIGNIN_MS ?? 15_000),
-  put: Number(process.env.PROBE_THRESHOLD_PUT_MS ?? 5_000),
-  get: Number(process.env.PROBE_THRESHOLD_GET_MS ?? 5_000),
-  delete: Number(process.env.PROBE_THRESHOLD_DELETE_MS ?? 5_000),
+  signIn: envMs("PROBE_THRESHOLD_SIGNIN_MS", 15_000),
+  put: envMs("PROBE_THRESHOLD_PUT_MS", 5_000),
+  get: envMs("PROBE_THRESHOLD_GET_MS", 5_000),
+  delete: envMs("PROBE_THRESHOLD_DELETE_MS", 5_000),
 } as const;
 
 type Stage = keyof typeof THRESHOLDS_MS;
@@ -117,6 +137,19 @@ async function main(): Promise<void> {
 
   // 1. Sign-in + delegation activation (worst-hit path in the incident).
   results.push((await timed("signIn", () => node.signIn())).result);
+
+  // 1b. Ensure the probe's own space exists. A brand-new probe identity has no
+  // space yet, so the first write 404s "space not found"; hostOwnedSpace is
+  // idempotent (fast no-op once the space exists) and returns the space id.
+  // This is provisioning, not the steady-state write we alert on, so we time
+  // and log it but do NOT threshold-gate it — a genuine failure throws and
+  // still fails the probe. (Do not branch on the return value: it is the space
+  // id string on success and throws on failure, never a falsy sentinel.)
+  const ensureStart = performance.now();
+  const spaceId = await node.hostOwnedSpace(PREFIX);
+  console.log(
+    `[probe] ${"ensure".padEnd(8)} ${String(Math.round(performance.now() - ensureStart)).padStart(6)}ms -> ${spaceId}`,
+  );
 
   // 2. Write a small value.
   results.push(
