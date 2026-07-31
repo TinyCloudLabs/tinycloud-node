@@ -21,9 +21,9 @@ use sea_orm::{
     entity::prelude::*,
     error::{DbErr, RuntimeErr, SqlxError},
     query::*,
-    sea_query::{Expr, LikeExpr, OnConflict, Query},
+    sea_query::{Expr, ExprTrait, LikeExpr, OnConflict, Query, SimpleExpr},
     ActiveValue::Set,
-    ConnectionTrait, DatabaseTransaction, IntoActiveModel, TransactionTrait,
+    ConnectionTrait, DatabaseTransaction, DbBackend, IntoActiveModel, TransactionTrait,
 };
 use sea_orm_migration::MigratorTrait;
 use std::collections::{HashMap, HashSet};
@@ -46,6 +46,18 @@ pub const HOOK_DELIVERY_STATUS_DEAD_LETTER: &str = "dead_letter";
 type KvObjectKey = (SpaceId, Path);
 type KvObjectLock = tokio::sync::Mutex<()>;
 type KvObjectLockRegistry = Arc<tokio::sync::Mutex<HashMap<KvObjectKey, Weak<KvObjectLock>>>>;
+
+/// Per-delegation guard protecting revocation ordering (TC-324).
+///
+/// Invocations take these SHARED, delegation registration and revocation take
+/// them EXCLUSIVE. See [`SpaceDatabase::acquire_shared_chain_guards_for_keys`]
+/// for the ordering argument this encodes.
+type ChainLock = tokio::sync::RwLock<()>;
+type ChainLockRegistry = Arc<tokio::sync::Mutex<HashMap<Hash, Weak<ChainLock>>>>;
+/// Exclusive chain guard: held by delegation registration and revocation.
+type ExclusiveChainGuard = tokio::sync::OwnedRwLockWriteGuard<()>;
+/// Shared chain guard: held by invocations, which only read chain state.
+type SharedChainGuard = tokio::sync::OwnedRwLockReadGuard<()>;
 
 #[derive(Debug, Clone)]
 pub struct PendingWebhookDelivery {
@@ -75,7 +87,7 @@ pub struct SpaceDatabase<C, B, S> {
     secrets: S,
     encryption: Option<ColumnEncryption>,
     sql_sizes: SqlSizes,
-    revocation_chain_locks: Arc<tokio::sync::Mutex<HashMap<Hash, Weak<tokio::sync::Mutex<()>>>>>,
+    revocation_chain_locks: ChainLockRegistry,
     kv_object_locks: KvObjectLockRegistry,
     writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
     read_audit: ReadAuditPipeline,
@@ -681,6 +693,136 @@ fn normalize_hook_prefix(prefix: &str) -> Option<&str> {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Retention pruning (TC-287)
+//
+// Terminal `hook_delivery` rows and expired `signed_kv_ticket` rows accumulate
+// forever once a delivery reaches a terminal state or a ticket lapses. These
+// helpers delete them in bounded batches so a large backlog never turns into a
+// single unbounded DELETE that holds the writer for an unpredictable time.
+//
+// Both tables store timestamps as RFC3339 *strings* (see
+// `list_due_webhook_deliveries` and the `signed_kv_ticket` migration), so
+// callers pass a pre-formatted cutoff string and we compare lexicographically
+// in SQL — matching the existing string comparisons — rather than parsing per
+// row.
+// -----------------------------------------------------------------------------
+
+/// Delete `hook_delivery` rows matching `condition` in batches of `batch_rows`.
+///
+/// Each iteration selects a page of primary keys and deletes exactly those
+/// rows, so the statement count is bounded regardless of backlog size. The loop
+/// stops as soon as a page comes back shorter than `batch_rows` (or empty),
+/// which guarantees termination: every full page deletes `batch_rows` matching
+/// rows, monotonically shrinking the candidate set.
+async fn prune_hook_deliveries_in_batches<C: ConnectionTrait>(
+    conn: &C,
+    condition: Condition,
+    batch_rows: u64,
+) -> Result<u64, DbErr> {
+    if batch_rows == 0 {
+        return Ok(0);
+    }
+    let mut deleted = 0u64;
+    loop {
+        let ids: Vec<String> = hook_delivery::Entity::find()
+            .select_only()
+            .column(hook_delivery::Column::Id)
+            .filter(condition.clone())
+            .limit(batch_rows)
+            .into_tuple::<String>()
+            .all(conn)
+            .await?;
+        if ids.is_empty() {
+            break;
+        }
+        let page = ids.len() as u64;
+        deleted += hook_delivery::Entity::delete_many()
+            .filter(hook_delivery::Column::Id.is_in(ids))
+            .exec(conn)
+            .await?
+            .rows_affected;
+        if page < batch_rows {
+            break;
+        }
+    }
+    Ok(deleted)
+}
+
+/// Delete `hook_delivery` rows in the terminal `delivered` state whose
+/// `delivered_at` is older than `delivered_before` (RFC3339). Pending/retrying
+/// rows are never touched, and rows with a NULL `delivered_at` are excluded by
+/// the SQL comparison — only genuinely-delivered, aged rows are removed.
+pub async fn prune_delivered_hook_deliveries<C: ConnectionTrait>(
+    conn: &C,
+    delivered_before: &str,
+    batch_rows: u64,
+) -> Result<u64, DbErr> {
+    prune_hook_deliveries_in_batches(
+        conn,
+        Condition::all()
+            .add(hook_delivery::Column::Status.eq(HOOK_DELIVERY_STATUS_DELIVERED))
+            .add(hook_delivery::Column::DeliveredAt.lt(delivered_before)),
+        batch_rows,
+    )
+    .await
+}
+
+/// Delete `hook_delivery` rows in the terminal `dead_letter` state whose
+/// `created_at` is older than `created_before` (RFC3339). Dead-letter rows have
+/// exhausted their retries, so `created_at` is the stable age reference.
+pub async fn prune_dead_letter_hook_deliveries<C: ConnectionTrait>(
+    conn: &C,
+    created_before: &str,
+    batch_rows: u64,
+) -> Result<u64, DbErr> {
+    prune_hook_deliveries_in_batches(
+        conn,
+        Condition::all()
+            .add(hook_delivery::Column::Status.eq(HOOK_DELIVERY_STATUS_DEAD_LETTER))
+            .add(hook_delivery::Column::CreatedAt.lt(created_before)),
+        batch_rows,
+    )
+    .await
+}
+
+/// Delete `signed_kv_ticket` rows whose `expires_at` is older than
+/// `expired_before` (RFC3339), in batches of `batch_rows`. Same batched
+/// select-then-delete shape as the hook-delivery pruners.
+pub async fn prune_expired_signed_kv_tickets<C: ConnectionTrait>(
+    conn: &C,
+    expired_before: &str,
+    batch_rows: u64,
+) -> Result<u64, DbErr> {
+    if batch_rows == 0 {
+        return Ok(0);
+    }
+    let mut deleted = 0u64;
+    loop {
+        let ids: Vec<String> = signed_kv_ticket::Entity::find()
+            .select_only()
+            .column(signed_kv_ticket::Column::Id)
+            .filter(signed_kv_ticket::Column::ExpiresAt.lt(expired_before))
+            .limit(batch_rows)
+            .into_tuple::<String>()
+            .all(conn)
+            .await?;
+        if ids.is_empty() {
+            break;
+        }
+        let page = ids.len() as u64;
+        deleted += signed_kv_ticket::Entity::delete_many()
+            .filter(signed_kv_ticket::Column::Id.is_in(ids))
+            .exec(conn)
+            .await?
+            .rows_affected;
+        if page < batch_rows {
+            break;
+        }
+    }
+    Ok(deleted)
+}
+
 impl<C, B, K> SpaceDatabase<C, B, K>
 where
     B: StoreSize,
@@ -802,10 +944,15 @@ where
     B: StorageSetup,
     K: Secrets,
 {
+    /// Acquire EXCLUSIVE guards over the ancestor closure of `roots`.
+    ///
+    /// Used by the writers of chain state — delegation registration and
+    /// revocation. See [`Self::acquire_shared_chain_guards_for_keys`] for why
+    /// invocations may take the same guards shared instead.
     async fn acquire_chain_guards(
         &self,
         roots: &[Hash],
-    ) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>, TxError<B, K>> {
+    ) -> Result<Vec<ExclusiveChainGuard>, TxError<B, K>> {
         let keys = revocation::ancestor_chain_ids_for_roots(&self.conn, roots)
             .await
             .map_err(|error| match error {
@@ -814,36 +961,101 @@ where
                     TxError::ChainTraversalLimitExceeded
                 }
             })?;
-        Ok(self.acquire_chain_guards_for_keys(keys).await)
+        Ok(self.acquire_exclusive_chain_guards_for_keys(keys).await)
     }
 
-    async fn acquire_chain_guards_for_keys(
-        &self,
-        mut keys: Vec<Hash>,
-    ) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+    /// Resolve `keys` to their per-delegation locks in a stable global order.
+    ///
+    /// Sorting and deduplicating here is the deadlock discipline: every
+    /// acquisition — shared or exclusive — walks the key space in the same
+    /// ascending order, so a task can only ever wait on a key greater than
+    /// every key it already holds. That rules out a wait-for cycle regardless
+    /// of which mode each participant asked for, and it is why two requests
+    /// citing overlapping chains in opposite argument order cannot deadlock.
+    async fn chain_locks_for_keys(&self, mut keys: Vec<Hash>) -> Vec<Arc<ChainLock>> {
         keys.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
         keys.dedup();
 
-        let locks = {
-            let mut registry = self.revocation_chain_locks.lock().await;
-            registry.retain(|_, lock| lock.strong_count() > 0);
-            keys.into_iter()
-                .map(|key| {
-                    if let Some(lock) = registry.get(&key).and_then(Weak::upgrade) {
-                        lock
-                    } else {
-                        let lock = Arc::new(tokio::sync::Mutex::new(()));
-                        registry.insert(key, Arc::downgrade(&lock));
-                        lock
-                    }
-                })
-                .collect::<Vec<_>>()
-        };
+        let mut registry = self.revocation_chain_locks.lock().await;
+        registry.retain(|_, lock| lock.strong_count() > 0);
+        keys.into_iter()
+            .map(|key| {
+                if let Some(lock) = registry.get(&key).and_then(Weak::upgrade) {
+                    lock
+                } else {
+                    let lock = Arc::new(ChainLock::new(()));
+                    registry.insert(key, Arc::downgrade(&lock));
+                    lock
+                }
+            })
+            .collect()
+    }
 
+    /// Acquire EXCLUSIVE guards over `keys` (the full ancestor closure).
+    ///
+    /// Exclusion against the shared guards held by in-flight invocations is
+    /// what serializes a revocation against every authorization decision made
+    /// on the chain it revokes.
+    async fn acquire_exclusive_chain_guards_for_keys(
+        &self,
+        keys: Vec<Hash>,
+    ) -> Vec<ExclusiveChainGuard> {
+        // Single instrumentation point for exclusive chain-guard acquisition:
+        // delegate and revoke both route through here, so ChainGuardWait
+        // captures the contention wait without duplicating timing per call
+        // site.
+        let guard_wait_start = Instant::now();
+        let locks = self.chain_locks_for_keys(keys).await;
         let mut guards = Vec::with_capacity(locks.len());
         for lock in locks {
-            guards.push(lock.lock_owned().await);
+            guards.push(lock.write_owned().await);
         }
+        crate::telemetry::observe_stage(
+            crate::telemetry::InvocationStage::ChainGuardWait,
+            crate::telemetry::StageOutcome::Ok,
+            guard_wait_start.elapsed(),
+        );
+        guards
+    }
+
+    /// Acquire SHARED guards over `keys` (the full ancestor closure) for an
+    /// invocation.
+    ///
+    /// An invocation only *reads* chain state: it evaluates the delegation
+    /// chain and the revocation set to make an authorization decision. The
+    /// rows it writes (its own invocation record and the `parent_delegations`
+    /// edges pointing at the delegations it cited) are leaves hanging off the
+    /// graph — they never alter any delegation's ancestor closure, and nothing
+    /// traverses the graph downward from parent to child. So two invocations
+    /// on the same chain never had to exclude one another; only a writer of
+    /// chain state does. That mutual exclusion between invocations was the
+    /// dominant source of `chain_guard_wait` in production, because a single
+    /// busy account funnels all of its traffic through one root delegation.
+    ///
+    /// The security invariant is unchanged: a revocation takes these same
+    /// guards EXCLUSIVE and holds them through commit, so it cannot commit
+    /// while an invocation is being authorized against the chain it revokes,
+    /// and an invocation that starts afterwards observes the revocation.
+    ///
+    /// Load-bearing detail: `tokio::sync::RwLock` is write-preferring (its
+    /// internal semaphore hands out permits fairly, in FIFO order). Once a
+    /// revocation is queued for the write guard, newly arriving invocations
+    /// queue behind it rather than joining the current read cohort. A
+    /// continuous stream of invocations therefore cannot starve a pending
+    /// revocation — which is what makes shared invocation guards safe as a
+    /// revocation-ordering mechanism rather than merely faster.
+    async fn acquire_shared_chain_guards_for_keys(&self, keys: Vec<Hash>) -> Vec<SharedChainGuard> {
+        let guard_wait_start = Instant::now();
+        let locks = self.chain_locks_for_keys(keys).await;
+        let mut guards = Vec::with_capacity(locks.len());
+        for lock in locks {
+            guards.push(lock.read_owned().await);
+        }
+        crate::telemetry::observe_stage(
+            crate::telemetry::InvocationStage::ChainGuardWait,
+            crate::telemetry::StageOutcome::Ok,
+            guard_wait_start.elapsed(),
+        );
         guards
     }
 
@@ -1224,6 +1436,7 @@ where
             .map(Hash::from)
             .collect();
         let authz_start = Instant::now();
+        let closure_start = Instant::now();
         let lock_keys = crate::auth_graph::load_closure_edges(&self.conn, &roots)
             .await
             .map(|(keys, _)| keys)
@@ -1233,6 +1446,11 @@ where
                     TxError::ChainTraversalLimitExceeded
                 }
             });
+        crate::telemetry::observe_stage(
+            crate::telemetry::InvocationStage::ChainClosureQuery,
+            crate::telemetry::StageOutcome::from(lock_keys.is_ok()),
+            closure_start.elapsed(),
+        );
         let lock_keys = match lock_keys {
             Ok(keys) => keys,
             Err(error) => {
@@ -1244,7 +1462,13 @@ where
                 return Err(TxStoreError::Tx(error));
             }
         };
-        let _chain_guards = self.acquire_chain_guards_for_keys(lock_keys).await;
+        // TC-324: invocations take the chain guards SHARED. The full ancestor
+        // closure is still guarded and the guards are still held through
+        // commit, so a revocation (which takes them exclusive) remains
+        // serialized against this authorization decision. What is dropped is
+        // invocation-vs-invocation exclusion, which the revocation-ordering
+        // invariant never depended on.
+        let _chain_guards = self.acquire_shared_chain_guards_for_keys(lock_keys).await;
         let mutation_keys = invocation
             .0
             .capabilities
@@ -1322,7 +1546,19 @@ where
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
-        let tx = self.conn.begin_with_config(isolation_level, None).await?;
+        let begin_start = Instant::now();
+        let tx_result = self.conn.begin_with_config(isolation_level, None).await;
+        crate::telemetry::observe_stage(
+            crate::telemetry::InvocationStage::DbTxBegin,
+            crate::telemetry::StageOutcome::from(tx_result.is_ok()),
+            begin_start.elapsed(),
+        );
+        let tx = tx_result?;
+        // DbTxBody spans post-begin to pre-commit. The guard defaults to an
+        // `error` outcome so any `?`/early return inside the transaction is
+        // recorded as a failure; it is disarmed to `ok` right before commit.
+        let tx_body_timer =
+            crate::telemetry::StageTimer::start(crate::telemetry::InvocationStage::DbTxBody);
         let auth_graph = match crate::auth_graph::AuthGraphSnapshot::load(&tx, &roots).await {
             Ok(graph) => graph,
             Err(error) => {
@@ -1510,6 +1746,10 @@ where
             };
         }
 
+        // Record the transaction body as successful (post-begin to
+        // pre-commit) before the commit itself; commit latency is tracked
+        // separately (EpochPersist on the delegate/revoke path).
+        tx_body_timer.observe_ok();
         // commit tx if all side effects worked
         tx.commit().await.map_err(|error| {
             if has_preconditions && is_serialization_db_error(&error) {
@@ -1523,7 +1763,9 @@ where
 
     /// Execute a successful non-mutating invocation without entering the
     /// single-writer transaction. Authorization and data access remain under
-    /// the chain guard; the response waits for the grouped audit commit.
+    /// the caller's shared chain guards, which are held across this call and
+    /// released only after it returns; the response waits for the grouped
+    /// audit commit.
     async fn invoke_read_only<S>(
         &self,
         invocation: Invocation,
@@ -1645,9 +1887,17 @@ where
             }
         }
 
-        self.read_audit
+        let read_audit_start = Instant::now();
+        let record_result = self
+            .read_audit
             .record(&invocation, self.encryption.as_ref())
-            .await?;
+            .await;
+        crate::telemetry::observe_stage(
+            crate::telemetry::InvocationStage::ReadAuditWait,
+            crate::telemetry::StageOutcome::from(record_result.is_ok()),
+            read_audit_start.elapsed(),
+        );
+        record_result?;
         Ok((
             TransactResult {
                 commits: HashMap::new(),
@@ -2207,21 +2457,27 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     // If all spaces were filtered out, we still process delegations below
     // but skip epoch/event ordering creation
     if !event_spaces.is_empty() {
-        // get max sequence for each of the spaces
-        let mut max_seqs = event_order::Entity::find()
-            .filter(event_order::Column::Space.is_in(event_spaces.keys().cloned().map(SpaceIdWrap)))
-            .select_only()
-            .column(event_order::Column::Space)
-            .column_as(event_order::Column::Seq.max(), "max_seq")
-            .group_by(event_order::Column::Space)
-            .into_tuple::<(SpaceIdWrap, i64)>()
-            .all(db)
-            .await?
-            .into_iter()
-            .fold(HashMap::new(), |mut m, (space, seq)| {
-                m.insert(space, seq + 1);
-                m
-            });
+        // Next per-space sequence: one ungrouped MAX(seq) query per space
+        // (spaces per commit are ~1). A grouped `GROUP BY space` aggregate gets
+        // no min/max index shortcut and scans the index range per write; the
+        // ungrouped form gets the O(log n) backward index probe on
+        // `idx_event_order_space_seq`. Spaces with no events yield NULL and stay
+        // absent from the map, so the later `.remove().unwrap_or(0)` still starts
+        // them at sequence 0 — matching the grouped query's empty-group behavior.
+        let mut max_seqs: HashMap<SpaceIdWrap, i64> = HashMap::new();
+        for space in event_spaces.keys() {
+            let max_seq = event_order::Entity::find()
+                .filter(event_order::Column::Space.eq(SpaceIdWrap(space.clone())))
+                .select_only()
+                .column_as(event_order::Column::Seq.max(), "max_seq")
+                .into_tuple::<Option<i64>>()
+                .one(db)
+                .await?
+                .flatten();
+            if let Some(seq) = max_seq {
+                max_seqs.insert(SpaceIdWrap(space.clone()), seq + 1);
+            }
+        }
 
         // get 'most recent' epochs for each of the spaces
         let mut most_recent = epoch::Entity::find()
@@ -2694,6 +2950,96 @@ async fn get_kv_entity<C: ConnectionTrait>(
     Ok(result)
 }
 
+/// Half-open `[lower, upper)` bounds selecting every `ability.resource` that
+/// belongs to `space_id`.
+///
+/// `ability.resource` is persisted through `Resource`'s `Display` impl, and a
+/// TinyCloud resource always renders as
+/// `{space}/{service}[/{path}][?query][#fragment]` (see `ResourceId`'s
+/// `Display`). Both bounds are therefore derived from that same `Display`
+/// impl, so the SQL prefix cannot drift from what the column actually holds
+/// (address checksum canonicalisation, percent-encoding, and so on).
+///
+/// The upper bound appends U+10FFFD, the highest private-use code point.
+/// Stored resources are `UriStr`-validated and therefore pure ASCII, and
+/// U+10FFFD encodes as `F4 8F BF BD`, above every ASCII byte -- so under
+/// **byte ordering** no resource belonging to the space can fall outside the
+/// range. `byte_ordered_resource` is what guarantees the comparison actually
+/// is byte-ordered; these bounds are meaningless without it.
+///
+/// The range is a *superset* filter, never an exact one. Callers keep the
+/// exact `resource.space() == Some(space_id)` check in Rust to drop the rest.
+fn space_resource_bounds(space_id: &SpaceId) -> (String, String) {
+    let lower = format!("{space_id}/");
+    let upper = format!("{lower}\u{10FFFD}");
+    (lower, upper)
+}
+
+/// `ability.resource`, pinned to byte ordering.
+///
+/// Without this pin the bounds are compared using the *database's* collation,
+/// and the prefix range silently means something else. Production runs
+/// PostgreSQL with `en_US.UTF-8` (glibc), where U+10FFFD has no collation
+/// weight at all: `{space}/` and `{space}/\u{10FFFD}` collate EQUAL, so the
+/// half-open range is empty. Measured against the production database, the
+/// unpinned range returned **0 rows** for a space whose true answer was
+/// 55,568 -- every session would have activated with no delegations.
+///
+/// The byte-increment bound (`{space}0`) is no better: it fails the other way
+/// on the same database, because glibc orders punctuation below digits only
+/// at a lower weight level.
+///
+/// This is deliberately not conditional on the deployed collation. Byte
+/// ordering is the only ordering under which these bounds mean what they say,
+/// so it is stated unconditionally and the tests pin it.
+///
+/// Cost, on PostgreSQL: the pin also costs the index seek, and it does so
+/// even on a C-collated database. `COLLATE "C"` carries collation OID 950,
+/// while `pk-ability` was built with the column's default collation (OID
+/// 100), and PostgreSQL requires an exact collation match to use an index --
+/// so `ability` is scanned (measured on production: 68ms warm, 452ms cold).
+/// That is still far cheaper than loading and decoding every delegation blob,
+/// and it needs no migration. Recovering the seek needs an index on
+/// `ability(resource)` declared `COLLATE "C"` (or `text_pattern_ops`) so its
+/// OID matches, which is a migration and is deferred.
+///
+/// SQLite is unaffected: `COLLATE BINARY` there is the column's own
+/// collation, so the range still resolves as an index seek.
+fn byte_ordered_resource(backend: DbBackend) -> SimpleExpr {
+    let resource = Expr::col((abilities::Entity, abilities::Column::Resource));
+    // `$1` / `?` is sea-query's per-backend placeholder for the embedded
+    // expression above, not for a bound value.
+    match backend {
+        DbBackend::Postgres => Expr::cust_with_expr(r#"$1 COLLATE "C""#, resource),
+        // SQLite columns are BINARY (byte-ordered) by default; saying so
+        // explicitly keeps the predicate index-usable and self-documenting.
+        DbBackend::Sqlite => Expr::cust_with_expr("? COLLATE BINARY", resource),
+        // MySQL's binary collation name depends on the column's charset, so
+        // cast instead -- that is charset-independent.
+        DbBackend::MySql => Expr::cust_with_expr("CAST(? AS BINARY)", resource),
+    }
+}
+
+/// `delegation.id IN (SELECT delegation FROM ability WHERE <space range>)`.
+///
+/// A subquery rather than a predicate on the joined `ability` rows on purpose:
+/// filtering the join directly would also truncate each returned delegation's
+/// capability list, but callers need every capability a matching delegation
+/// carries -- including capabilities in other spaces. `resource` is the
+/// leading column of `ability`'s primary key, so on a byte-ordered database
+/// the range resolves as an index seek with no new index.
+fn delegations_touching_space(backend: DbBackend, space_id: &SpaceId) -> SimpleExpr {
+    let (lower, upper) = space_resource_bounds(space_id);
+    delegation::Column::Id.in_subquery(
+        Query::select()
+            .column(abilities::Column::Delegation)
+            .from(abilities::Entity)
+            .and_where(byte_ordered_resource(backend).gte(lower))
+            .and_where(byte_ordered_resource(backend).lt(upper))
+            .to_owned(),
+    )
+}
+
 async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     db: &C,
     space_id: &SpaceId,
@@ -2703,6 +3049,10 @@ async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         delegation::Entity::find()
             .left_join(revocation::Entity)
             .filter(revocation::Column::Id.is_null())
+            .filter(delegations_touching_space(
+                db.get_database_backend(),
+                space_id,
+            ))
             .find_with_related(abilities::Entity)
             .all(db)
             .await?
@@ -2714,6 +3064,9 @@ async fn get_valid_delegations<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         .zip(abilities)
         .zip(parents)
         .filter_map(|((del, ability), parents)| {
+            // `delegations_touching_space` has already narrowed this to the
+            // delegations whose resources fall in the space's prefix range;
+            // the space check below is the exact filter over that superset.
             if del.expiry.map(|e| e > now).unwrap_or(true)
                 && del.not_before.map(|n| n <= now).unwrap_or(true)
                 && ability.iter().any(|a| a.resource.space() == Some(space_id))
@@ -3112,6 +3465,10 @@ async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secret
         delegation::Entity::find()
             .left_join(revocation::Entity)
             .filter(revocation::Column::Id.is_null())
+            .filter(delegations_touching_space(
+                db.get_database_backend(),
+                space_id,
+            ))
             .find_with_related(abilities::Entity)
             .all(db)
             .await?
@@ -3136,7 +3493,9 @@ async fn get_filtered_delegations<C: ConnectionTrait, S: StorageSetup, K: Secret
                 return None;
             }
 
-            // Space membership check
+            // Space membership check. `delegations_touching_space` has already
+            // narrowed this to the delegations whose resources fall in the
+            // space's prefix range; this is the exact filter over that superset.
             if !ability.iter().any(|a| a.resource.space() == Some(space_id)) {
                 return None;
             }
@@ -3520,9 +3879,16 @@ mod test {
             list_direct_children_bounded(&db.conn, &space, &"".parse().unwrap(), 2, next.as_ref())
                 .await
                 .unwrap();
+        // TC-381: the seed keys sort as
+        // a, b, bang!key, bangXkey, c, literal%key, literalXkey, literal_key,
+        // so the page after the "b" cursor is bang!key/bangXkey. This
+        // expectation still said c/literal%key: it was written before
+        // `bang!key`/`bangXkey` were added to the seed set on a parallel
+        // branch, and the two merged cleanly because nothing in CI ran
+        // tinycloud-core's tests.
         assert_eq!(
             children.iter().map(Path::as_str).collect::<Vec<_>>(),
-            vec!["c", "literal%key"]
+            vec!["bang!key", "bangXkey"]
         );
         assert!(truncated);
         assert_eq!(
@@ -3977,10 +4343,414 @@ mod test {
         drop(first_guard);
     }
 
+    // ── TC-324: shared chain guards for invocations ─────────────────────────
+    //
+    // Invocations take the chain guards SHARED; delegation registration and
+    // revocation take them EXCLUSIVE. The tests below pin both halves of that
+    // contract: the concurrency that was bought, and the revocation ordering
+    // that must survive buying it.
+
+    type TestDb = SpaceDatabase<sea_orm::DbConn, MemoryStore, StaticSecret>;
+
+    /// Insert a standalone delegation row and return its id.
+    async fn insert_test_delegation(db: &TestDb, label: &str) -> Hash {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        let id = crate::hash::hash(label.as_bytes());
+        delegation::ActiveModel {
+            id: Set(id),
+            delegator: Set("did:key:chain-guard-owner".to_string()),
+            delegatee: Set("did:key:chain-guard-holder".to_string()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(label.as_bytes().to_vec()),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// Build `parent <- child`, the shape every chain-scoped guard walks.
+    async fn insert_test_chain(db: &TestDb, label: &str) -> (Hash, Hash) {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        let parent = insert_test_delegation(db, &format!("{label}-parent")).await;
+        let child = insert_test_delegation(db, &format!("{label}-child")).await;
+        parent_delegations::ActiveModel {
+            parent: Set(parent),
+            child: Set(child),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        (parent, child)
+    }
+
+    async fn insert_chain_guard_actors(db: &TestDb) {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        for actor_id in ["did:key:chain-guard-owner", "did:key:chain-guard-holder"] {
+            actor::ActiveModel {
+                id: Set(actor_id.to_string()),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+        }
+    }
+
+    /// Resolve the ancestor closure exactly as `invoke_with_options_mode`
+    /// does, then take the guards shared — the production invocation path.
+    async fn invocation_chain_keys(db: &TestDb, roots: &[Hash]) -> Vec<Hash> {
+        crate::auth_graph::load_closure_edges(&db.conn, roots)
+            .await
+            .map(|(keys, _)| keys)
+            .expect("chain closure query")
+    }
+
+    async fn acquire_invocation_guards(db: &TestDb, roots: &[Hash]) -> Vec<SharedChainGuard> {
+        let keys = invocation_chain_keys(db, roots).await;
+        db.acquire_shared_chain_guards_for_keys(keys).await
+    }
+
+    async fn insert_test_revocation(db: &TestDb, label: &str, revoked: Hash) {
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+
+        revocation::ActiveModel {
+            id: Set(crate::hash::hash(label.as_bytes())),
+            revoker: Set("did:key:chain-guard-owner".to_string()),
+            revoked: Set(revoked),
+            serialization: Set(label.as_bytes().to_vec()),
+            revoked_at: Set(Some(OffsetDateTime::now_utc())),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+    }
+
+    /// Let a spawned task run far enough to block on a contended guard.
+    async fn settle() {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+
+    /// TC-324 requirement 1: invocations sharing one root delegation must
+    /// hold the chain guard at the same time, not merely all succeed.
+    ///
+    /// The barrier is the proof of overlap: it can only be satisfied if every
+    /// task is inside the guarded section simultaneously. Under the previous
+    /// exclusive mutex this test would deadlock until the timeout, because
+    /// task 1 would hold the root guard while waiting for tasks that cannot
+    /// acquire it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn invocations_sharing_one_root_hold_the_chain_guard_concurrently() {
+        const INVOCATIONS: usize = 8;
+
+        let db = get_db().await.unwrap();
+        insert_chain_guard_actors(&db).await;
+        let (_parent, child) = insert_test_chain(&db, "shared-concurrency").await;
+
+        // Resolve the closure once so the test measures guard behaviour, not
+        // SQLite pool contention.
+        let keys = invocation_chain_keys(&db, &[child]).await;
+        assert_eq!(
+            keys.len(),
+            2,
+            "the full ancestor closure must still be guarded, not just the cited delegation"
+        );
+
+        let rendezvous = Arc::new(tokio::sync::Barrier::new(INVOCATIONS));
+        let mut handles = Vec::with_capacity(INVOCATIONS);
+        for _ in 0..INVOCATIONS {
+            let db = db.clone();
+            let keys = keys.clone();
+            let rendezvous = rendezvous.clone();
+            handles.push(tokio::spawn(async move {
+                let guards = db.acquire_shared_chain_guards_for_keys(keys).await;
+                // Unreachable unless every other invocation also holds the
+                // shared guards right now.
+                rendezvous.wait().await;
+                drop(guards);
+            }));
+        }
+
+        for handle in handles {
+            tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+                .await
+                .expect("invocations sharing a root delegation must overlap under the chain guard")
+                .unwrap();
+        }
+    }
+
+    /// TC-324 requirement 2: the revocation barrier survives shared guards,
+    /// in both directions.
+    ///
+    /// Direction A — a revocation cannot commit while an invocation holds
+    /// shared guards on the chain it revokes.
+    /// Direction B — an invocation that starts after the revocation commits
+    /// observes the revocation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn revocation_waits_for_in_flight_invocations_and_is_visible_after() {
+        let db = get_db().await.unwrap();
+        insert_chain_guard_actors(&db).await;
+        let (parent, child) = insert_test_chain(&db, "revocation-barrier").await;
+
+        // An invocation is in flight, authorizing against the chain.
+        let in_flight = acquire_invocation_guards(&db, &[child]).await;
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let revoke_db = db.clone();
+        let revoke = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            let guards = revoke_db
+                .acquire_chain_guards(&[parent])
+                .await
+                .ok()
+                .expect("revocation chain guards");
+            // The write happens under the exclusive guards, as `revoke` does.
+            insert_test_revocation(&revoke_db, "revocation-barrier-revocation", parent).await;
+            drop(guards);
+        });
+
+        started_rx.await.unwrap();
+        settle().await;
+
+        // Direction A. `is_finished` alone would only say the task is slow;
+        // the durable check is that the revocation has not become visible.
+        assert!(
+            !revoke.is_finished(),
+            "a revocation must wait for in-flight invocations holding shared guards on that chain"
+        );
+        assert!(
+            !crate::models::revocation::is_revoked(&db.conn, &parent)
+                .await
+                .unwrap(),
+            "a revocation must not commit while an invocation is being authorized against the chain"
+        );
+
+        // The in-flight invocation finishes and releases its shared guards.
+        drop(in_flight);
+        tokio::time::timeout(std::time::Duration::from_secs(10), revoke)
+            .await
+            .expect("the revocation must proceed once the shared guards are released")
+            .unwrap();
+
+        // Direction B: an invocation starting now is rejected by the chain.
+        let after = acquire_invocation_guards(&db, &[child]).await;
+        assert!(
+            crate::models::revocation::is_revoked(&db.conn, &parent)
+                .await
+                .unwrap(),
+            "an invocation starting after the revocation commits must observe it"
+        );
+        drop(after);
+    }
+
+    /// TC-324 requirement 3: delegation registration still mutually excludes
+    /// against invocations on the same chain, in both orders.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delegation_registration_excludes_invocations_on_the_same_chain() {
+        let db = get_db().await.unwrap();
+        insert_chain_guard_actors(&db).await;
+        let (parent, child) = insert_test_chain(&db, "registration-exclusion").await;
+
+        // Registration first: an invocation must not slip in beside it.
+        let registration = db
+            .acquire_chain_guards(&[parent])
+            .await
+            .ok()
+            .expect("delegation registration chain guards");
+
+        let keys = invocation_chain_keys(&db, &[child]).await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let invoke_db = db.clone();
+        let invoke_keys = keys.clone();
+        let invoke = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            invoke_db
+                .acquire_shared_chain_guards_for_keys(invoke_keys)
+                .await
+        });
+        started_rx.await.unwrap();
+        settle().await;
+        assert!(
+            !invoke.is_finished(),
+            "an invocation must not authorize against a chain while a delegation is being registered on it"
+        );
+        drop(registration);
+        let invocation_guards = tokio::time::timeout(std::time::Duration::from_secs(10), invoke)
+            .await
+            .expect("the invocation must proceed once registration releases the chain")
+            .unwrap();
+
+        // Reverse order: an in-flight invocation blocks registration.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let register_db = db.clone();
+        let register = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            register_db
+                .acquire_chain_guards(&[parent])
+                .await
+                .ok()
+                .expect("delegation registration chain guards")
+        });
+        started_rx.await.unwrap();
+        settle().await;
+        assert!(
+            !register.is_finished(),
+            "delegation registration must wait for in-flight invocations on the same chain"
+        );
+        drop(invocation_guards);
+        tokio::time::timeout(std::time::Duration::from_secs(10), register)
+            .await
+            .expect("registration must proceed once the shared guards are released")
+            .unwrap();
+    }
+
+    /// TC-324 requirement 4: `tokio::sync::RwLock` is write-preferring, so a
+    /// revocation queued behind a continuous stream of invocations still
+    /// acquires within a bounded time. This is the property that makes shared
+    /// invocation guards safe rather than merely fast — without it, a busy
+    /// account could hold a revocation off indefinitely.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_queued_revocation_is_not_starved_by_a_stream_of_invocations() {
+        const READERS: usize = 8;
+
+        let db = get_db().await.unwrap();
+        insert_chain_guard_actors(&db).await;
+        let (parent, child) = insert_test_chain(&db, "starvation").await;
+        let keys = invocation_chain_keys(&db, &[child]).await;
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut readers = Vec::with_capacity(READERS);
+        for _ in 0..READERS {
+            let db = db.clone();
+            let keys = keys.clone();
+            let stop = stop.clone();
+            readers.push(tokio::spawn(async move {
+                let mut acquisitions = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let guards = db.acquire_shared_chain_guards_for_keys(keys.clone()).await;
+                    acquisitions += 1;
+                    // Hold long enough that the reader cohorts overlap, so a
+                    // reader-preferring lock really would starve the writer.
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    drop(guards);
+                    tokio::task::yield_now().await;
+                }
+                acquisitions
+            }));
+        }
+
+        // Let the invocation stream saturate the chain before queueing behind it.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let queued_at = Instant::now();
+        let revocation_guards = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            db.acquire_chain_guards(&[parent]),
+        )
+        .await
+        .expect("a revocation must not be starved by a continuous stream of invocations")
+        .ok()
+        .expect("revocation chain guards");
+        let waited = queued_at.elapsed();
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(revocation_guards);
+
+        let mut total_acquisitions = 0u64;
+        for reader in readers {
+            total_acquisitions += reader.await.unwrap();
+        }
+
+        println!(
+            "TC-324 starvation evidence: {total_acquisitions} shared acquisitions across \
+             {READERS} concurrent invocation loops; queued revocation waited {waited:?}"
+        );
+        assert!(
+            total_acquisitions >= READERS as u64,
+            "the invocation stream must actually have been running (saw {total_acquisitions} acquisitions)"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(2),
+            "a queued revocation must acquire promptly; waited {waited:?}"
+        );
+    }
+
+    /// TC-324 requirement 5: multi-chain acquisitions requested in inverse
+    /// order must not deadlock, because every acquisition normalizes to the
+    /// same sorted key order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn inverse_order_multi_chain_acquisitions_do_not_deadlock() {
+        let db = get_db().await.unwrap();
+        insert_chain_guard_actors(&db).await;
+        let (_first_parent, first) = insert_test_chain(&db, "inverse-order-first").await;
+        let (_second_parent, second) = insert_test_chain(&db, "inverse-order-second").await;
+
+        // The discipline itself: inverse argument order resolves to the same
+        // lock sequence, so no participant can invert the acquisition order.
+        let forward = db.chain_locks_for_keys(vec![first, second]).await;
+        let reverse = db.chain_locks_for_keys(vec![second, first]).await;
+        assert_eq!(forward.len(), 2);
+        assert_eq!(reverse.len(), 2);
+        assert!(
+            forward
+                .iter()
+                .zip(reverse.iter())
+                .all(|(left, right)| Arc::ptr_eq(left, right)),
+            "inverse argument order must normalize to one global acquisition order"
+        );
+        drop(forward);
+        drop(reverse);
+
+        // And in anger: exclusive and shared acquisitions spanning both
+        // chains, requested in opposing orders, repeatedly interleaved.
+        let first_keys = invocation_chain_keys(&db, &[first, second]).await;
+        let second_keys = invocation_chain_keys(&db, &[second, first]).await;
+        for _ in 0..25 {
+            let exclusive_forward = {
+                let db = db.clone();
+                tokio::spawn(async move { drop(db.acquire_chain_guards(&[first, second]).await) })
+            };
+            let exclusive_reverse = {
+                let db = db.clone();
+                tokio::spawn(async move { drop(db.acquire_chain_guards(&[second, first]).await) })
+            };
+            let shared_forward = {
+                let db = db.clone();
+                let keys = first_keys.clone();
+                tokio::spawn(
+                    async move { drop(db.acquire_shared_chain_guards_for_keys(keys).await) },
+                )
+            };
+            let shared_reverse = {
+                let db = db.clone();
+                let keys = second_keys.clone();
+                tokio::spawn(
+                    async move { drop(db.acquire_shared_chain_guards_for_keys(keys).await) },
+                )
+            };
+
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                exclusive_forward.await.unwrap();
+                exclusive_reverse.await.unwrap();
+                shared_forward.await.unwrap();
+                shared_reverse.await.unwrap();
+            })
+            .await
+            .expect("sorted key order must prevent a multi-chain lock-order inversion");
+        }
+    }
+
     #[tokio::test]
     async fn postgres_concurrent_epoch_appends_do_not_serialize() {
-        let Ok(database_url) = std::env::var("TINYCLOUD_TEST_POSTGRES_URL") else {
-            eprintln!("skipping PostgreSQL concurrency test: TINYCLOUD_TEST_POSTGRES_URL is unset");
+        let Some(database_url) = crate::test_support::postgres_test_url(
+            "postgres_concurrent_epoch_appends_do_not_serialize",
+        ) else {
             return;
         };
 
@@ -4984,5 +5754,1158 @@ mod test {
             }
             other => panic!("expected FK database error, got {other:?}"),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Retention pruning (TC-287)
+    // -------------------------------------------------------------------------
+
+    async fn fresh_retention_db() -> DatabaseConnection {
+        let mut options = ConnectOptions::new("sqlite::memory:".to_string());
+        options.max_connections(1);
+        let conn = Database::connect(options).await.unwrap();
+        Migrator::up(&conn, None).await.unwrap();
+        conn
+    }
+
+    fn rfc3339(instant: OffsetDateTime) -> String {
+        instant.format(&Rfc3339).unwrap()
+    }
+
+    async fn insert_retention_subscription(conn: &DatabaseConnection) {
+        hook_subscription::Entity::insert(hook_subscription::ActiveModel::from(
+            hook_subscription::Model {
+                id: "sub".to_string(),
+                subscriber_did: "did:example:sub".to_string(),
+                space_id: "space".to_string(),
+                target_service: "kv".to_string(),
+                path_prefix: None,
+                abilities_json: None,
+                callback_url: "https://example.com/hook".to_string(),
+                encrypted_secret: vec![0u8; 4],
+                secret_key_id: "kid".to_string(),
+                active: true,
+                created_at: rfc3339(OffsetDateTime::now_utc()),
+            },
+        ))
+        .exec(conn)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_retention_delivery(
+        conn: &DatabaseConnection,
+        id: &str,
+        status: &str,
+        created_at: &str,
+        delivered_at: Option<&str>,
+    ) {
+        hook_delivery::Entity::insert(hook_delivery::ActiveModel::from(hook_delivery::Model {
+            id: id.to_string(),
+            subscription_id: "sub".to_string(),
+            event_id: "evt".to_string(),
+            payload_json: "{}".to_string(),
+            status: status.to_string(),
+            attempts: 0,
+            next_attempt_at: None,
+            last_error: None,
+            created_at: created_at.to_string(),
+            delivered_at: delivered_at.map(|value| value.to_string()),
+        }))
+        .exec(conn)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_retention_ticket(conn: &DatabaseConnection, id: &str, expires_at: &str) {
+        signed_kv_ticket::Entity::insert(signed_kv_ticket::ActiveModel::from(
+            signed_kv_ticket::Model {
+                id: id.to_string(),
+                issuer_did: "did:example:issuer".to_string(),
+                subject_did: "did:example:subject".to_string(),
+                space_id: "space".to_string(),
+                path: "path".to_string(),
+                service: "kv".to_string(),
+                ability: "tinycloud.kv/get".to_string(),
+                created_at: expires_at.to_string(),
+                expires_at: expires_at.to_string(),
+                invocation_expires_at: None,
+                parent_expires_at: None,
+                content_hash: None,
+                etag: None,
+                parent_cids_json: None,
+            },
+        ))
+        .exec(conn)
+        .await
+        .unwrap();
+    }
+
+    async fn remaining_delivery_ids(conn: &DatabaseConnection) -> Vec<String> {
+        let mut ids: Vec<String> = hook_delivery::Entity::find()
+            .all(conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn retention_prune_respects_status_and_age() {
+        let conn = fresh_retention_db().await;
+        insert_retention_subscription(&conn).await;
+
+        let now = OffsetDateTime::now_utc();
+        let stale = rfc3339(now - time::Duration::days(60));
+        let recent = rfc3339(now - time::Duration::hours(1));
+        let future = rfc3339(now + time::Duration::days(60));
+
+        // Terminal + aged: eligible for pruning.
+        insert_retention_delivery(
+            &conn,
+            "delivered_old",
+            HOOK_DELIVERY_STATUS_DELIVERED,
+            &stale,
+            Some(&stale),
+        )
+        .await;
+        insert_retention_delivery(
+            &conn,
+            "dead_letter_old",
+            HOOK_DELIVERY_STATUS_DEAD_LETTER,
+            &stale,
+            None,
+        )
+        .await;
+
+        // Terminal but recent: retained (age not met).
+        insert_retention_delivery(
+            &conn,
+            "delivered_recent",
+            HOOK_DELIVERY_STATUS_DELIVERED,
+            &recent,
+            Some(&recent),
+        )
+        .await;
+        insert_retention_delivery(
+            &conn,
+            "dead_letter_recent",
+            HOOK_DELIVERY_STATUS_DEAD_LETTER,
+            &recent,
+            None,
+        )
+        .await;
+
+        // Delivered status but no delivered_at timestamp: never matched by the
+        // NULL-excluding SQL comparison.
+        insert_retention_delivery(
+            &conn,
+            "delivered_no_ts",
+            HOOK_DELIVERY_STATUS_DELIVERED,
+            &stale,
+            None,
+        )
+        .await;
+
+        // Non-terminal rows: must never be touched regardless of age.
+        insert_retention_delivery(
+            &conn,
+            "pending_old",
+            HOOK_DELIVERY_STATUS_PENDING,
+            &stale,
+            None,
+        )
+        .await;
+        insert_retention_delivery(
+            &conn,
+            "retrying_old",
+            HOOK_DELIVERY_STATUS_RETRYING,
+            &stale,
+            None,
+        )
+        .await;
+
+        // Tickets: only those whose expiry is older than the grace cutoff go.
+        insert_retention_ticket(&conn, "ticket_stale", &stale).await;
+        insert_retention_ticket(&conn, "ticket_recent", &recent).await;
+        insert_retention_ticket(&conn, "ticket_future", &future).await;
+
+        let delivered_cutoff = rfc3339(now - time::Duration::days(7));
+        let dead_letter_cutoff = rfc3339(now - time::Duration::days(30));
+        let ticket_cutoff = rfc3339(now - time::Duration::days(7));
+
+        assert_eq!(
+            prune_delivered_hook_deliveries(&conn, &delivered_cutoff, 5000)
+                .await
+                .unwrap(),
+            1,
+            "only the aged delivered row should be pruned"
+        );
+        assert_eq!(
+            prune_dead_letter_hook_deliveries(&conn, &dead_letter_cutoff, 5000)
+                .await
+                .unwrap(),
+            1,
+            "only the aged dead_letter row should be pruned"
+        );
+        assert_eq!(
+            prune_expired_signed_kv_tickets(&conn, &ticket_cutoff, 5000)
+                .await
+                .unwrap(),
+            1,
+            "only the long-expired ticket should be pruned"
+        );
+
+        assert_eq!(
+            remaining_delivery_ids(&conn).await,
+            vec![
+                "dead_letter_recent".to_string(),
+                "delivered_no_ts".to_string(),
+                "delivered_recent".to_string(),
+                "pending_old".to_string(),
+                "retrying_old".to_string(),
+            ],
+            "pending/retrying rows and recent/timestamp-less terminal rows survive"
+        );
+
+        let mut ticket_ids: Vec<String> = signed_kv_ticket::Entity::find()
+            .all(&conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        ticket_ids.sort();
+        assert_eq!(
+            ticket_ids,
+            vec!["ticket_future".to_string(), "ticket_recent".to_string()],
+            "recently-expired and not-yet-expired tickets survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_prune_batches_terminate_and_delete_everything_eligible() {
+        let conn = fresh_retention_db().await;
+        insert_retention_subscription(&conn).await;
+
+        let now = OffsetDateTime::now_utc();
+        let stale = rfc3339(now - time::Duration::days(60));
+        for index in 0..12 {
+            insert_retention_delivery(
+                &conn,
+                &format!("delivered_{index}"),
+                HOOK_DELIVERY_STATUS_DELIVERED,
+                &stale,
+                Some(&stale),
+            )
+            .await;
+        }
+
+        let cutoff = rfc3339(now);
+
+        // batch_rows == 0 is a guarded no-op, never an infinite loop.
+        assert_eq!(
+            prune_delivered_hook_deliveries(&conn, &cutoff, 0)
+                .await
+                .unwrap(),
+            0
+        );
+
+        // batch_rows smaller than the backlog: the loop pages (5 + 5 + 2) and
+        // terminates once a short page is seen, deleting every eligible row.
+        assert_eq!(
+            prune_delivered_hook_deliveries(&conn, &cutoff, 5)
+                .await
+                .unwrap(),
+            12
+        );
+        assert!(
+            hook_delivery::Entity::find()
+                .all(&conn)
+                .await
+                .unwrap()
+                .is_empty(),
+            "all aged delivered rows should be gone after a batched sweep"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // TC-320: the SQL-side space filter on `ability.resource`.
+    // ---------------------------------------------------------------------
+
+    /// One delegation plus its abilities, and optionally a revocation.
+    /// Resources are given as strings so the rows go through exactly the
+    /// `Resource` parse/`Display` round-trip production uses.
+    async fn seed_delegation<C: ConnectionTrait>(
+        db: &C,
+        label: &str,
+        resources: &[String],
+        expiry: Option<OffsetDateTime>,
+        not_before: Option<OffsetDateTime>,
+        revoked: bool,
+    ) -> Hash {
+        use crate::types::{Ability, Caveats};
+        use std::collections::BTreeMap;
+
+        let id = crate::hash::hash(label.as_bytes());
+        // Actors are FK prerequisites for the delegation row.
+        for actor_id in [
+            format!("did:key:delegator-{label}"),
+            format!("did:key:delegatee-{label}"),
+        ] {
+            actor::ActiveModel { id: Set(actor_id) }
+                .insert(db)
+                .await
+                .ok();
+        }
+        delegation::ActiveModel {
+            id: Set(id),
+            delegator: Set(format!("did:key:delegator-{label}")),
+            delegatee: Set(format!("did:key:delegatee-{label}")),
+            expiry: Set(expiry),
+            issued_at: Set(None),
+            not_before: Set(not_before),
+            facts: Set(None),
+            serialization: Set(label.as_bytes().to_vec()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        for resource in resources {
+            abilities::ActiveModel {
+                resource: Set(resource.parse().unwrap()),
+                ability: Set(<Ability as TryFrom<String>>::try_from(
+                    "tinycloud.kv/get".to_string(),
+                )
+                .unwrap()),
+                delegation: Set(id),
+                caveats: Set(Caveats(BTreeMap::new())),
+            }
+            .insert(db)
+            .await
+            .unwrap();
+        }
+        if revoked {
+            revocation::ActiveModel {
+                id: Set(crate::hash::hash(format!("revocation-{label}").as_bytes())),
+                revoker: Set(format!("did:key:delegator-{label}")),
+                revoked: Set(id),
+                serialization: Set(label.as_bytes().to_vec()),
+                revoked_at: Set(Some(OffsetDateTime::now_utc())),
+            }
+            .insert(db)
+            .await
+            .unwrap();
+        }
+        id
+    }
+
+    /// Delegation id -> its full sorted resource list.
+    type Selection = HashMap<Hash, Vec<String>>;
+
+    fn summarize(rows: Vec<(delegation::Model, Vec<abilities::Model>)>) -> Selection {
+        rows.into_iter()
+            .map(|(del, abilities)| {
+                let mut resources: Vec<String> =
+                    abilities.iter().map(|a| a.resource.to_string()).collect();
+                resources.sort();
+                (del.id, resources)
+            })
+            .collect()
+    }
+
+    /// The pre-TC-320 selection, verbatim: load *every* unrevoked delegation
+    /// with its abilities, then filter by time and space in Rust. Kept as the
+    /// parity oracle.
+    async fn legacy_selection<C: ConnectionTrait>(
+        db: &C,
+        space_id: &SpaceId,
+        now: OffsetDateTime,
+    ) -> Selection {
+        let rows = delegation::Entity::find()
+            .left_join(revocation::Entity)
+            .filter(revocation::Column::Id.is_null())
+            .find_with_related(abilities::Entity)
+            .all(db)
+            .await
+            .unwrap();
+        summarize(
+            rows.into_iter()
+                .filter(|(del, ability)| {
+                    del.expiry.map(|e| e > now).unwrap_or(true)
+                        && del.not_before.map(|n| n <= now).unwrap_or(true)
+                        && ability.iter().any(|a| a.resource.space() == Some(space_id))
+                })
+                .collect(),
+        )
+    }
+
+    /// The TC-320 selection: the same thing, with the space prefix range
+    /// pushed into SQL ahead of the identical Rust-side filter.
+    async fn filtered_selection<C: ConnectionTrait>(
+        db: &C,
+        space_id: &SpaceId,
+        now: OffsetDateTime,
+    ) -> Selection {
+        let rows = delegation::Entity::find()
+            .left_join(revocation::Entity)
+            .filter(revocation::Column::Id.is_null())
+            .filter(delegations_touching_space(
+                db.get_database_backend(),
+                space_id,
+            ))
+            .find_with_related(abilities::Entity)
+            .all(db)
+            .await
+            .unwrap();
+        summarize(
+            rows.into_iter()
+                .filter(|(del, ability)| {
+                    del.expiry.map(|e| e > now).unwrap_or(true)
+                        && del.not_before.map(|n| n <= now).unwrap_or(true)
+                        && ability.iter().any(|a| a.resource.space() == Some(space_id))
+                })
+                .collect(),
+        )
+    }
+
+    /// Delegation ids the SQL range alone admits, with no Rust-side space
+    /// filter. Shows how tight the prefix bound really is.
+    async fn sql_range_only<C: ConnectionTrait>(db: &C, space_id: &SpaceId) -> HashSet<Hash> {
+        delegation::Entity::find()
+            .filter(delegations_touching_space(
+                db.get_database_backend(),
+                space_id,
+            ))
+            .all(db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|del| del.id)
+            .collect()
+    }
+
+    /// Pins the prefix-range scheme itself. The upper bound deliberately is
+    /// NOT the usual "increment the last byte" (`{space}0`) trick: resource
+    /// strings are ordered by the *database's* collation, and under a
+    /// punctuation-ignoring collation (glibc `en_US.utf8`, the `postgres:16`
+    /// image default) `{space}/kv/path` sorts after `{space}0`, which would
+    /// silently drop live delegations.
+    #[test]
+    fn space_resource_bounds_bracket_every_resource_in_the_space() {
+        let jwk = JWK::generate_ed25519().unwrap();
+        let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
+        let foo = SpaceId::new(did.clone(), "foo".parse().unwrap());
+        let foobar = SpaceId::new(did.clone(), "foobar".parse().unwrap());
+        let (lower, upper) = space_resource_bounds(&foo);
+
+        assert_eq!(lower, format!("{foo}/"));
+        assert_eq!(upper, format!("{foo}/\u{10FFFD}"));
+
+        // Every resource in the space renders as `{space}/...` and lands
+        // inside the range under byte ordering.
+        for suffix in ["kv/a", "kv/deep/path#list", "sql", "", "9svc", "~svc"] {
+            let resource: Resource = format!("{foo}/{suffix}").parse().unwrap();
+            let rendered = resource.to_string();
+            assert_eq!(resource.space(), Some(&foo));
+            assert!(
+                rendered.as_str() >= lower.as_str() && rendered.as_str() < upper.as_str(),
+                "`{rendered}` fell outside [{lower}, {upper})"
+            );
+        }
+
+        // The bound is derived from the same `Display` impl that writes the
+        // column, so a prefix sibling cannot be confused with the target.
+        let sibling: Resource = format!("{foobar}/kv/a").parse().unwrap();
+        assert_ne!(sibling.space(), Some(&foo));
+        assert!(
+            sibling.to_string().as_str() >= upper.as_str(),
+            "`foobar` must sort outside `foo`'s byte-ordered range"
+        );
+
+        // Both of these hold under byte ordering ONLY. The comparison is
+        // pinned to byte ordering by `byte_ordered_resource`; see
+        // `space_filter_pins_byte_ordering_in_every_backend_dialect`.
+    }
+
+    /// Regression guard for the production incident this scheme caused before
+    /// the collation pin existed.
+    ///
+    /// The bounds are byte-oriented, but SQL compares strings using the
+    /// *database's* collation. Production runs PostgreSQL under `en_US.UTF-8`
+    /// (glibc), where U+10FFFD carries no collation weight, so
+    /// `{space}/\u{10FFFD}` collates EQUAL to `{space}/` and the half-open
+    /// range matches nothing: the unpinned query returned 0 rows against a
+    /// space whose true answer was 55,568, which would have activated every
+    /// session with no delegations at all.
+    ///
+    /// So every dialect must state the byte ordering explicitly. Asserting on
+    /// the generated SQL catches this on any machine -- notably including CI,
+    /// whose `postgres:16-alpine` service is C-collated and therefore cannot
+    /// reproduce the failure by behaviour alone.
+    #[test]
+    fn space_filter_pins_byte_ordering_in_every_backend_dialect() {
+        let space = test_space_id("collation-pin");
+        for (backend, expected) in [
+            (DbBackend::Postgres, r#"COLLATE "C""#),
+            (DbBackend::Sqlite, "COLLATE BINARY"),
+            (DbBackend::MySql, "CAST("),
+        ] {
+            let sql = delegation::Entity::find()
+                .filter(delegations_touching_space(backend, &space))
+                .build(backend)
+                .sql;
+            println!("TC-320 {backend:?}: {sql}");
+            assert!(
+                sql.contains(expected),
+                "{backend:?} must pin the space range to byte ordering with `{expected}`, \
+                 got {sql}"
+            );
+            // Both bounds, not just one.
+            assert_eq!(
+                sql.matches(expected).count(),
+                2,
+                "{backend:?} must pin BOTH range bounds, got {sql}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn space_filtered_delegation_selection_matches_the_full_scan() {
+        let db = get_db().await.unwrap();
+        let conn = &db.conn;
+        let now = OffsetDateTime::now_utc();
+
+        // Prefix-sibling spaces have to share a base DID, otherwise the two
+        // space strings diverge long before the name and the range could
+        // never overlap in the first place.
+        let jwk = JWK::generate_ed25519().unwrap();
+        let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
+        let foo = SpaceId::new(did.clone(), "foo".parse().unwrap());
+        let foobar = SpaceId::new(did.clone(), "foobar".parse().unwrap());
+        let fo = SpaceId::new(did.clone(), "fo".parse().unwrap());
+        let bar = SpaceId::new(did.clone(), "bar".parse().unwrap());
+        // Same *name*, different controller.
+        let other_foo = test_space_id("foo");
+
+        let foo_live = seed_delegation(
+            conn,
+            "foo-live",
+            &[format!("{foo}/kv/a")],
+            None,
+            None,
+            false,
+        )
+        .await;
+        let foo_nested = seed_delegation(
+            conn,
+            "foo-nested",
+            &[format!("{foo}/kv/deep/path#list")],
+            None,
+            None,
+            false,
+        )
+        .await;
+        // Service with no path, and an empty-path service: both still render
+        // as `{space}/...` and must stay inside the range.
+        let foo_service_only = seed_delegation(
+            conn,
+            "foo-service-only",
+            &[format!("{foo}/sql")],
+            None,
+            None,
+            false,
+        )
+        .await;
+        let foo_expired = seed_delegation(
+            conn,
+            "foo-expired",
+            &[format!("{foo}/kv/b")],
+            Some(now - time::Duration::hours(1)),
+            None,
+            false,
+        )
+        .await;
+        let foo_future = seed_delegation(
+            conn,
+            "foo-future",
+            &[format!("{foo}/kv/c")],
+            None,
+            Some(now + time::Duration::hours(1)),
+            false,
+        )
+        .await;
+        let foo_revoked = seed_delegation(
+            conn,
+            "foo-revoked",
+            &[format!("{foo}/kv/d")],
+            None,
+            None,
+            true,
+        )
+        .await;
+        // Straddles two spaces: must appear for both, and must keep *both*
+        // capabilities either way.
+        let foo_and_bar = seed_delegation(
+            conn,
+            "foo-and-bar",
+            &[format!("{foo}/kv/e"), format!("{bar}/kv/e")],
+            None,
+            None,
+            false,
+        )
+        .await;
+        let foobar_live = seed_delegation(
+            conn,
+            "foobar-live",
+            &[format!("{foobar}/kv/a")],
+            None,
+            None,
+            false,
+        )
+        .await;
+        let fo_live =
+            seed_delegation(conn, "fo-live", &[format!("{fo}/kv/a")], None, None, false).await;
+        let other_foo_live = seed_delegation(
+            conn,
+            "other-foo-live",
+            &[format!("{other_foo}/kv/a")],
+            None,
+            None,
+            false,
+        )
+        .await;
+        // Non-TinyCloud resource (`Resource::Other`) -- has no space at all.
+        let urn_only = seed_delegation(
+            conn,
+            "urn-only",
+            &["urn:example:thing".to_string()],
+            None,
+            None,
+            false,
+        )
+        .await;
+        let no_abilities = seed_delegation(conn, "no-abilities", &[], None, None, false).await;
+
+        // Parity, space by space -- this is the contract: identical selection
+        // *and* identical per-delegation capability lists.
+        for (label, space) in [
+            ("foo", &foo),
+            ("foobar", &foobar),
+            ("fo", &fo),
+            ("bar", &bar),
+            ("other_foo", &other_foo),
+        ] {
+            let legacy = legacy_selection(conn, space, now).await;
+            let filtered = filtered_selection(conn, space, now).await;
+            assert_eq!(
+                legacy, filtered,
+                "TC-320 changed the delegation set returned for space {label}"
+            );
+        }
+
+        // ...and the parity is not vacuous.
+        let foo_set = filtered_selection(conn, &foo, now).await;
+        let foo_ids: HashSet<Hash> = foo_set.keys().copied().collect();
+        assert_eq!(
+            foo_ids,
+            HashSet::from([foo_live, foo_nested, foo_service_only, foo_and_bar]),
+            "unexpected delegation set for `foo`"
+        );
+        for (label, excluded) in [
+            ("prefix sibling `foobar`", foobar_live),
+            ("shorter prefix `fo`", fo_live),
+            ("same name, other controller", other_foo_live),
+            ("expired", foo_expired),
+            ("not yet valid", foo_future),
+            ("revoked", foo_revoked),
+            ("non-TinyCloud resource", urn_only),
+            ("no abilities", no_abilities),
+        ] {
+            assert!(!foo_ids.contains(&excluded), "{label} leaked into `foo`");
+        }
+
+        // A delegation spanning two spaces keeps its full capability list.
+        // Filtering the joined `ability` rows instead of using a subquery
+        // would silently truncate this to one resource.
+        assert_eq!(
+            foo_set.get(&foo_and_bar).map(|r| r.len()),
+            Some(2),
+            "cross-space delegation lost a capability when queried via `foo`"
+        );
+        assert_eq!(
+            filtered_selection(conn, &bar, now)
+                .await
+                .get(&foo_and_bar)
+                .map(|r| r.len()),
+            Some(2),
+            "cross-space delegation lost a capability when queried via `bar`"
+        );
+
+        // Under SQLite's byte-ordered collation the range is exact, so the
+        // prefix sibling never even reaches Rust. On a collation that ignores
+        // punctuation the range widens and the Rust-side space check above is
+        // what keeps the result correct.
+        let range_only = sql_range_only(conn, &foo).await;
+        assert!(
+            !range_only.contains(&foobar_live),
+            "`foobar` must not fall inside `foo`'s byte-ordered prefix range"
+        );
+        assert!(
+            range_only.contains(&foo_revoked),
+            "the range is a space filter only -- revocation is still handled by the join"
+        );
+    }
+
+    #[tokio::test]
+    async fn space_filtered_delegation_lookup_searches_the_ability_primary_key() {
+        let db = get_db().await.unwrap();
+        let conn = &db.conn;
+
+        // 300 delegations over 30 spaces under one controller, so the space
+        // strings share a long prefix and the planner is choosing between a
+        // real seek and a real scan.
+        let jwk = JWK::generate_ed25519().unwrap();
+        let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
+        for i in 0..300 {
+            let space = SpaceId::new(did.clone(), format!("space-{}", i % 30).parse().unwrap());
+            seed_delegation(
+                conn,
+                &format!("tc320-delegation-{i}"),
+                &[format!("{space}/kv/key-{i}")],
+                None,
+                None,
+                false,
+            )
+            .await;
+        }
+        conn.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "ANALYZE".to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let target = SpaceId::new(did.clone(), "space-7".parse().unwrap());
+        let explain = |space: Option<&SpaceId>| {
+            let mut query = delegation::Entity::find()
+                .left_join(revocation::Entity)
+                .filter(revocation::Column::Id.is_null());
+            if let Some(space) = space {
+                query = query.filter(delegations_touching_space(DbBackend::Sqlite, space));
+            }
+            let mut stmt = query
+                .find_with_related(abilities::Entity)
+                .build(DbBackend::Sqlite);
+            stmt.sql = format!("EXPLAIN QUERY PLAN {}", stmt.sql);
+            async {
+                conn.query_all(stmt)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| row.try_get::<String>("", "detail").unwrap())
+                    .collect::<Vec<String>>()
+            }
+        };
+
+        // Without the space filter this is the pre-TC-320 shape: a full scan
+        // of every delegation ever written.
+        let before = explain(None).await;
+        println!("TC-320 BEFORE (no space filter): {before:?}");
+        assert!(
+            before.iter().any(|line| line.contains("SCAN delegation")),
+            "the unfiltered capabilities-read query should scan `delegation`, got {before:?}"
+        );
+
+        let after = explain(Some(&target)).await;
+        println!("TC-320 AFTER  (space filter):    {after:?}");
+        assert!(
+            after
+                .iter()
+                .any(|line| line.contains("SEARCH") && line.contains("resource>")),
+            "the space filter must resolve as an indexed range seek on `resource`, got {after:?}"
+        );
+        assert!(
+            !after.iter().any(|line| line.contains("SCAN ability")),
+            "the space filter must not full-scan `ability`, got {after:?}"
+        );
+        assert!(
+            !after.iter().any(|line| line.contains("SCAN delegation")),
+            "the space filter must not full-scan `delegation`, got {after:?}"
+        );
+    }
+
+    /// The same parity contract on a real PostgreSQL server. SQLite cannot
+    /// prove any of the three things this covers: that the generated subquery
+    /// is valid PostgreSQL, that the U+10FFFD upper bound survives parameter
+    /// binding, and that the range resolves as an index scan on `ability`'s
+    /// primary key.
+    ///
+    /// The index assertion is gated on the database's collation on purpose.
+    /// A byte-ordered (`C`) database gets an index scan; on a linguistic
+    /// collation the range still filters correctly in SQL -- the Rust-side
+    /// space check keeps the result exact -- but the planner cannot use the
+    /// primary key for it without a `text_pattern_ops` index.
+    #[tokio::test]
+    async fn postgres_space_filtered_delegation_selection_matches_the_full_scan() {
+        let Some(database_url) = crate::test_support::postgres_test_url(
+            "postgres_space_filtered_delegation_selection_matches_the_full_scan",
+        ) else {
+            return;
+        };
+
+        let admin = Database::connect(ConnectOptions::new(database_url.clone()))
+            .await
+            .expect("connect to PostgreSQL test database");
+        let schema = format!(
+            "tc320_{}_{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        admin
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("CREATE SCHEMA {schema}"),
+            ))
+            .await
+            .expect("create isolated TC-320 schema");
+
+        let mut options = ConnectOptions::new(database_url);
+        options
+            .max_connections(4)
+            .sqlx_logging(false)
+            .set_schema_search_path(schema.clone());
+        let conn = Database::connect(options)
+            .await
+            .expect("connect to isolated TC-320 schema");
+        Migrator::up(&conn, None)
+            .await
+            .expect("migrate isolated TC-320 schema");
+
+        let collation: String = admin
+            .query_one(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT datcollate FROM pg_database WHERE datname = current_database()".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "datcollate")
+            .unwrap();
+        println!("TC-320 PostgreSQL collation: {collation}");
+
+        let exercise: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+            let now = OffsetDateTime::now_utc();
+            let jwk = JWK::generate_ed25519().unwrap();
+            let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
+            let foo = SpaceId::new(did.clone(), "foo".parse().unwrap());
+            let foobar = SpaceId::new(did.clone(), "foobar".parse().unwrap());
+            let bar = SpaceId::new(did.clone(), "bar".parse().unwrap());
+
+            seed_delegation(
+                &conn,
+                "pg-foo-live",
+                &[format!("{foo}/kv/a")],
+                None,
+                None,
+                false,
+            )
+            .await;
+            seed_delegation(
+                &conn,
+                "pg-foo-and-bar",
+                &[format!("{foo}/kv/e"), format!("{bar}/kv/e")],
+                None,
+                None,
+                false,
+            )
+            .await;
+            seed_delegation(
+                &conn,
+                "pg-foobar-live",
+                &[format!("{foobar}/kv/a")],
+                None,
+                None,
+                false,
+            )
+            .await;
+            // Bulk filler, inserted as raw SQL: parity is only interesting at
+            // a volume where the space filter actually excludes something, and
+            // realistic statistics make the logged plan representative of what
+            // production does. 20k delegations across 500 spaces.
+            let suffix = foo.suffix().to_string();
+            conn.execute(Statement::from_string(
+                DbBackend::Postgres,
+                "INSERT INTO actor (id) VALUES ('did:key:tc320-bulk') \
+                 ON CONFLICT DO NOTHING"
+                    .to_string(),
+            ))
+            .await?;
+            conn.execute(Statement::from_string(
+                DbBackend::Postgres,
+                // `1e20` is the blake3-256 multihash prefix (code 0x1e,
+                // digest length 0x20); `Hash` rejects a bare 32-byte digest.
+                "INSERT INTO delegation (id, delegator, delegatee, serialization) \
+                 SELECT decode('1e20' || lpad(to_hex(i), 64, '0'), 'hex'), \
+                        'did:key:tc320-bulk', 'did:key:tc320-bulk', '\\x00'::bytea \
+                 FROM generate_series(1, 20000) i"
+                    .to_string(),
+            ))
+            .await?;
+            conn.execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!(
+                    "INSERT INTO ability (resource, ability, delegation, caveats) \
+                     SELECT 'tinycloud:{suffix}:bulk-' || (i % 500) || '/kv/key-' || i, \
+                            'tinycloud.kv/get', \
+                            decode('1e20' || lpad(to_hex(i), 64, '0'), 'hex'), \
+                            '{{}}'::json \
+                     FROM generate_series(1, 20000) i"
+                ),
+            ))
+            .await?;
+            conn.execute(Statement::from_string(
+                DbBackend::Postgres,
+                "ANALYZE".to_string(),
+            ))
+            .await?;
+
+            for (label, space) in [("foo", &foo), ("foobar", &foobar), ("bar", &bar)] {
+                assert_eq!(
+                    legacy_selection(&conn, space, now).await,
+                    filtered_selection(&conn, space, now).await,
+                    "TC-320 changed the delegation set returned for space {label} on PostgreSQL"
+                );
+            }
+            assert_eq!(
+                filtered_selection(&conn, &foo, now).await.len(),
+                2,
+                "expected exactly the two `foo` delegations on PostgreSQL"
+            );
+
+            let mut stmt = delegation::Entity::find()
+                .left_join(revocation::Entity)
+                .filter(revocation::Column::Id.is_null())
+                .filter(delegations_touching_space(DbBackend::Postgres, &foo))
+                .find_with_related(abilities::Entity)
+                .build(DbBackend::Postgres);
+            stmt.sql = format!("EXPLAIN {}", stmt.sql);
+            let plan: Vec<String> = conn
+                .query_all(stmt)
+                .await?
+                .into_iter()
+                .map(|row| row.try_get::<String>("", "QUERY PLAN").unwrap())
+                .collect();
+            println!("TC-320 PostgreSQL plan ({collation}): {plan:?}");
+
+            // What matters here is that the space range is evaluated by the
+            // database at all, rather than every delegation being shipped to
+            // Rust and filtered there. That is the whole point of TC-320 and
+            // it holds under any collation.
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("resource") && line.contains(">=")),
+                "the space range must reach the database, got {plan:?}"
+            );
+
+            // Note what is deliberately NOT asserted: an index seek.
+            // `COLLATE "C"` carries collation OID 950, while `pk-ability` was
+            // built with the column's default collation (OID 100) -- and
+            // PostgreSQL requires an exact collation match to use an index.
+            // So the pin that makes this query correct also costs the seek,
+            // even on a C-collated database. Measured on production: 68ms
+            // warm, 452ms cold, versus loading and decoding 28,300 delegation
+            // blobs. Recovering the seek needs an index declared
+            // `COLLATE "C"` (or `text_pattern_ops`) so its OID matches, which
+            // is a migration and is deliberately deferred.
+            // SQLite is unaffected: `COLLATE BINARY` is the column's own
+            // collation there, so that plan still seeks (see
+            // `space_filtered_delegation_lookup_searches_the_ability_primary_key`).
+            Ok(())
+        }
+        .await;
+
+        admin
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("DROP SCHEMA {schema} CASCADE"),
+            ))
+            .await
+            .expect("drop isolated TC-320 schema");
+        exercise.expect("TC-320 PostgreSQL parity");
+    }
+
+    /// End-to-end regression test for the production incident.
+    ///
+    /// With `ability.resource` under a collation that gives the upper-bound
+    /// sentinel no weight -- exactly what glibc `en_US.UTF-8` does, and what
+    /// production runs -- `{space}/\u{10FFFD}` collates EQUAL to `{space}/`,
+    /// the half-open range is empty, and the space filter returns nothing.
+    /// Against the production database the unpinned query returned 0 rows
+    /// where the correct answer was 55,568; every session would have activated
+    /// with no delegations.
+    ///
+    /// Without the `COLLATE "C"` pin in `byte_ordered_resource` this test
+    /// fails. CI's `postgres:16-alpine` service is C-collated and so cannot
+    /// reproduce the failure by behaviour alone, which is exactly why the
+    /// hostile collation is constructed here rather than assumed.
+    #[tokio::test]
+    async fn postgres_space_filter_survives_a_collation_that_ignores_the_sentinel() {
+        let Some(database_url) = crate::test_support::postgres_test_url(
+            "postgres_space_filter_survives_a_collation_that_ignores_the_sentinel",
+        ) else {
+            return;
+        };
+
+        let admin = Database::connect(ConnectOptions::new(database_url.clone()))
+            .await
+            .expect("connect to PostgreSQL test database");
+        let schema = format!(
+            "tc320_collation_{}_{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        admin
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("CREATE SCHEMA {schema}"),
+            ))
+            .await
+            .expect("create isolated TC-320 collation schema");
+
+        let mut options = ConnectOptions::new(database_url);
+        options
+            .max_connections(4)
+            .sqlx_logging(false)
+            .set_schema_search_path(schema.clone());
+        let conn = Database::connect(options)
+            .await
+            .expect("connect to isolated TC-320 collation schema");
+        Migrator::up(&conn, None)
+            .await
+            .expect("migrate isolated TC-320 collation schema");
+
+        let exercise: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+            // An ICU tailoring that makes U+10FFFD completely ignorable,
+            // reproducing glibc's behaviour (glibc simply has no weight entry
+            // for it, so it contributes nothing to the sort key).
+            conn.execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!(
+                    "CREATE COLLATION tc320_ignorable (provider = icu, locale = 'en', \
+                     rules = '&[last tertiary ignorable]={}', deterministic = true)",
+                    '\u{10FFFD}'
+                ),
+            ))
+            .await?;
+            conn.execute(Statement::from_string(
+                DbBackend::Postgres,
+                "ALTER TABLE ability ALTER COLUMN resource TYPE character varying \
+                 COLLATE tc320_ignorable"
+                    .to_string(),
+            ))
+            .await?;
+
+            let now = OffsetDateTime::now_utc();
+            let jwk = JWK::generate_ed25519().unwrap();
+            let did: DIDBuf = DID_METHODS.generate(&jwk, "key").unwrap();
+            let foo = SpaceId::new(did.clone(), "foo".parse().unwrap());
+            let bar = SpaceId::new(did.clone(), "bar".parse().unwrap());
+            seed_delegation(
+                &conn,
+                "cl-foo-a",
+                &[format!("{foo}/kv/a")],
+                None,
+                None,
+                false,
+            )
+            .await;
+            seed_delegation(
+                &conn,
+                "cl-foo-b",
+                &[format!("{foo}/sql")],
+                None,
+                None,
+                false,
+            )
+            .await;
+            seed_delegation(
+                &conn,
+                "cl-bar-a",
+                &[format!("{bar}/kv/a")],
+                None,
+                None,
+                false,
+            )
+            .await;
+
+            // Prove the hazard is actually live on this column: compared with
+            // the column's own collation the range is empty, exactly as it was
+            // in production.
+            let (lower, upper) = space_resource_bounds(&foo);
+            let (lo, hi) = (lower.replace('\'', "''"), upper.replace('\'', "''"));
+            let count = |sql: String| {
+                let conn = &conn;
+                async move {
+                    conn.query_one(Statement::from_string(DbBackend::Postgres, sql))
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .try_get::<i64>("", "count")
+                        .unwrap()
+                }
+            };
+            let unpinned = count(format!(
+                "SELECT count(*) FROM ability WHERE resource >= '{lo}' AND resource < '{hi}'"
+            ))
+            .await;
+            let pinned = count(format!(
+                "SELECT count(*) FROM ability WHERE resource COLLATE \"C\" >= '{lo}' \
+                 AND resource COLLATE \"C\" < '{hi}'"
+            ))
+            .await;
+            println!("TC-320 hostile collation: unpinned={unpinned} rows, pinned={pinned} rows");
+            assert_eq!(
+                unpinned, 0,
+                "the tailored collation must reproduce the production failure, \
+                 otherwise this test proves nothing"
+            );
+            assert_eq!(pinned, 2, "the byte-ordered range must still find `foo`");
+
+            // The real query must be unaffected by the column's collation.
+            let filtered = filtered_selection(&conn, &foo, now).await;
+            assert_eq!(
+                filtered,
+                legacy_selection(&conn, &foo, now).await,
+                "the space filter must match the full scan even under a collation that \
+                 ignores the upper-bound sentinel"
+            );
+            assert_eq!(
+                filtered.len(),
+                2,
+                "the space filter returned no delegations -- this is the production outage"
+            );
+            Ok(())
+        }
+        .await;
+
+        admin
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("DROP SCHEMA {schema} CASCADE"),
+            ))
+            .await
+            .expect("drop isolated TC-320 collation schema");
+        admin
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("DROP COLLATION IF EXISTS {schema}.tc320_ignorable"),
+            ))
+            .await
+            .ok();
+        exercise.expect("TC-320 PostgreSQL collation resilience");
     }
 }

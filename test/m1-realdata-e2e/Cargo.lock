@@ -7753,7 +7753,7 @@ dependencies = [
 
 [[package]]
 name = "tinycloud-node"
-version = "1.9.0"
+version = "1.13.0"
 dependencies = [
  "anyhow",
  "async-trait",

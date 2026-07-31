@@ -13,6 +13,42 @@ name = "tinycloud-node"
 # tinycloud-core, dependencies/*) are also published with versioned deps.
 # Binary distribution happens via GitHub Releases + cargo-dist installers.
 publish = false
+# TC-342 — READ THIS BEFORE ASSUMING RELEASE-PLZ BUMPS THE VERSION. IT DOES NOT.
+#
+# `publish = false` only skips `cargo publish`; release-plz still compares the
+# local version against the crates.io release. `tinycloud-node` on crates.io is
+# a reserved 0.0.1 placeholder, so on every push to main where HEAD is ahead of
+# the newest `v*` tag, release-plz's updater takes this branch:
+#
+#   INFO tinycloud-node: local version (1.9.0) > registry version (0.0.1).
+#        Only changelog will be updated.
+#   INFO the repository is already up-to-date
+#   release_pr_output: {"prs":[]}
+#
+# It concludes a human already bumped the version, never computes a next
+# version, and exits 0. 35 consecutive post-tag runs reported success while
+# doing nothing, so 1.8.0, 1.9.0 and 1.10.0 were all hand-chosen and
+# hand-committed. Versioning in this repo is MANUAL — see docs/releasing.md.
+#
+# The documented fix is `git_only = true`
+# (https://release-plz.dev/docs/config#the-git_only-field), which resolves the
+# last release from the `git_tag_name` tags below instead of the registry. It
+# was tried and it CANNOT be used here yet: git-only mode runs
+# `cargo package --allow-dirty --workspace` in a worktree at the release tag
+# (release_plz_core::next_ver::run_cargo_package), and this workspace is not
+# packageable:
+#
+#   1. dependencies/{siwe,siwe-recap,cacao}/Cargo.toml set
+#      license-file = "../LICENSE.md", which does not exist (the license is at
+#      the repo root). Fixable in three lines.
+#   2. Blocking: siwe-recap depends on `ucan-capabilities-object` and
+#      tinycloud-auth depends on `ssi`, both unpublished TinyCloud git forks.
+#      `cargo package` rejects any git/path dependency without a version
+#      requirement, so `cargo package --workspace` cannot succeed until those
+#      forks are published or vendored.
+#
+# Flip `git_only = true` once (2) is resolved, and delete the manual process
+# from docs/releasing.md when you do.
 # cargo-dist's release workflow owns GitHub Release creation; release-plz only tags.
 git_release_enable = false
 git_tag_enable = true

@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.0](https://github.com/TinyCloudLabs/tinycloud-node/compare/v1.9.0...v1.10.0) - 2026-07-28
+
+### Added
+
+- Add owner-rooted sharing v2 registration
+  ([#168](https://github.com/TinyCloudLabs/tinycloud-node/pull/168))
+- Support sharing experience flows end to end
+  ([#159](https://github.com/TinyCloudLabs/tinycloud-node/pull/159))
+
+### Changed
+
+- *(perf)* Add missing request-path secondary indexes
+  ([#160](https://github.com/TinyCloudLabs/tinycloud-node/pull/160))
+- *(perf)* Enable release build optimizations and replace the musl allocator
+  ([#161](https://github.com/TinyCloudLabs/tinycloud-node/pull/161))
+- *(perf)* Fix shipped runtime defaults (log level, SQLite pragmas, blocking pool)
+  ([#162](https://github.com/TinyCloudLabs/tinycloud-node/pull/162))
+- *(perf)* Bound Prometheus route-label cardinality
+  ([#163](https://github.com/TinyCloudLabs/tinycloud-node/pull/163))
+- *(perf)* Stream object responses in useful chunks
+  ([#164](https://github.com/TinyCloudLabs/tinycloud-node/pull/164))
+- *(perf)* Enlarge the upload copy buffer and fix partial-write hashing
+  ([#165](https://github.com/TinyCloudLabs/tinycloud-node/pull/165))
+- *(perf)* Allowlist stored object metadata headers
+  ([#166](https://github.com/TinyCloudLabs/tinycloud-node/pull/166))
+
+### Fixed
+
+- Add revision CAS to full-checkpoint artifact save
+  ([#169](https://github.com/TinyCloudLabs/tinycloud-node/pull/169))
+- Use an ungrouped per-space `MAX(seq)` lookup in transact
+  ([#170](https://github.com/TinyCloudLabs/tinycloud-node/pull/170))
+- TTL prune for terminal `hook_delivery` rows and expired signed tickets
+  ([#172](https://github.com/TinyCloudLabs/tinycloud-node/pull/172))
+
+### Other
+
+- *(ci)* Pin the phala CLI to 1.1.19 to unbreak the Phala deploy
+  ([#171](https://github.com/TinyCloudLabs/tinycloud-node/pull/171))
+
 ## [1.9.0](https://github.com/TinyCloudLabs/tinycloud-node/compare/v1.8.0...v1.9.0) - 2026-07-25
 
 ### Added

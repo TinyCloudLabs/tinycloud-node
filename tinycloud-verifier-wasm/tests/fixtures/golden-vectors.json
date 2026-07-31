@@ -1,0 +1,413 @@
+{
+  "schemaVersion": "tc-bench-golden-v1",
+  "suite": "tc-bench-v1",
+  "generatedAt": "2025-01-01T00:00:00.000Z",
+  "signer": {
+    "address": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    "domain": "tc-bench.localhost",
+    "uri": "https://tc-bench.localhost/auth/verify",
+    "chainId": 1
+  },
+  "valid": [
+    {
+      "case": "depth-0",
+      "delegationDepth": 0,
+      "endpoint": "POST /auth/verify",
+      "operation": {
+        "service": "tinycloud.kv",
+        "space": "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench",
+        "path": "bench/kv/depth-0",
+        "action": "tinycloud.kv/get"
+      },
+      "nonce": "414edbb3ff3c1faa0c581731",
+      "proofCids": [],
+      "recap": {
+        "att": {
+          "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-0": {
+            "tinycloud.kv/get": [
+              {}
+            ]
+          }
+        },
+        "prf": [],
+        "statement": "I further authorize the stated URI to perform the following actions on my behalf: (1) 'tinycloud.kv': 'get' for 'tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-0'.",
+        "resource": "urn:recap:eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweGYzOUZkNmU1MWFhZDg4RjZGNGNlNmFCODgyNzI3OWNmZkZiOTIyNjY6YmVuY2gva3YvZGVwdGgtMCI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dfX0sInByZiI6W119"
+      },
+      "siwe": "tc-bench.localhost wants you to sign in with your Ethereum account:\n0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\n\nI further authorize the stated URI to perform the following actions on my behalf: (1) 'tinycloud.kv': 'get' for 'tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-0'.\n\nURI: https://tc-bench.localhost/auth/verify\nVersion: 1\nChain ID: 1\nNonce: 414edbb3ff3c1faa0c581731\nIssued At: 2025-01-01T00:00:00.000Z\nExpiration Time: 2030-01-01T00:00:00.000Z\nResources:\n- urn:recap:eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweGYzOUZkNmU1MWFhZDg4RjZGNGNlNmFCODgyNzI3OWNmZkZiOTIyNjY6YmVuY2gva3YvZGVwdGgtMCI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dfX0sInByZiI6W119",
+      "signature": "0x58721615a31bffc445c0fdcdae2b03c91e6379f3315c2b2f34e36ea8727523170f6de940be0f187ea77b1c41f036b123aedafb98e31458c15119f6be27f61b5f1c",
+      "expected": {
+        "status": 200,
+        "code": "OK"
+      }
+    },
+    {
+      "case": "depth-1",
+      "delegationDepth": 1,
+      "endpoint": "POST /auth/verify",
+      "operation": {
+        "service": "tinycloud.kv",
+        "space": "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench",
+        "path": "bench/kv/depth-1",
+        "action": "tinycloud.kv/get"
+      },
+      "nonce": "1239a046a1d2e30ef43f03f8",
+      "proofCids": [
+        "zb38SEm7eid5gAYxbe95Pa3AhmhRwcqGWJiFcfFgKpv6TurZj"
+      ],
+      "recap": {
+        "att": {
+          "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-1": {
+            "tinycloud.kv/get": [
+              {}
+            ]
+          }
+        },
+        "prf": [
+          "zb38SEm7eid5gAYxbe95Pa3AhmhRwcqGWJiFcfFgKpv6TurZj"
+        ],
+        "statement": "I further authorize the stated URI to perform the following actions on my behalf: (1) 'tinycloud.kv': 'get' for 'tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-1'.",
+        "resource": "urn:recap:eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweGYzOUZkNmU1MWFhZDg4RjZGNGNlNmFCODgyNzI3OWNmZkZiOTIyNjY6YmVuY2gva3YvZGVwdGgtMSI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dfX0sInByZiI6WyJ6YjM4U0VtN2VpZDVnQVl4YmU5NVBhM0FobWhSd2NxR1dKaUZjZkZnS3B2NlR1clpqIl19"
+      },
+      "siwe": "tc-bench.localhost wants you to sign in with your Ethereum account:\n0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\n\nI further authorize the stated URI to perform the following actions on my behalf: (1) 'tinycloud.kv': 'get' for 'tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-1'.\n\nURI: https://tc-bench.localhost/auth/verify\nVersion: 1\nChain ID: 1\nNonce: 1239a046a1d2e30ef43f03f8\nIssued At: 2025-01-01T00:00:00.000Z\nExpiration Time: 2030-01-01T00:00:00.000Z\nResources:\n- urn:recap:eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweGYzOUZkNmU1MWFhZDg4RjZGNGNlNmFCODgyNzI3OWNmZkZiOTIyNjY6YmVuY2gva3YvZGVwdGgtMSI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dfX0sInByZiI6WyJ6YjM4U0VtN2VpZDVnQVl4YmU5NVBhM0FobWhSd2NxR1dKaUZjZkZnS3B2NlR1clpqIl19",
+      "signature": "0x8484a302635ca5447b052b0756337c3a808da7246da50cfe4817ad66c21f278b03acf25816d649e1b95667e54443d5413dc354ace061756518dcf1ebce107f811b",
+      "expected": {
+        "status": 200,
+        "code": "OK"
+      }
+    },
+    {
+      "case": "depth-2",
+      "delegationDepth": 2,
+      "endpoint": "POST /auth/verify",
+      "operation": {
+        "service": "tinycloud.kv",
+        "space": "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench",
+        "path": "bench/kv/depth-2",
+        "action": "tinycloud.kv/get"
+      },
+      "nonce": "ab303e37ceef61b710f1f759",
+      "proofCids": [
+        "zb38SLn6LMqP5HRWKTpaP35eNhCFjCjDLg3p2cycnzK1NGaeK",
+        "zb38S8N11ZTXHRp8JYJh8xHg3qu7T8qDsQC9wwYvpL41tL5Wg"
+      ],
+      "recap": {
+        "att": {
+          "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-2": {
+            "tinycloud.kv/get": [
+              {}
+            ]
+          }
+        },
+        "prf": [
+          "zb38SLn6LMqP5HRWKTpaP35eNhCFjCjDLg3p2cycnzK1NGaeK",
+          "zb38S8N11ZTXHRp8JYJh8xHg3qu7T8qDsQC9wwYvpL41tL5Wg"
+        ],
+        "statement": "I further authorize the stated URI to perform the following actions on my behalf: (1) 'tinycloud.kv': 'get' for 'tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-2'.",
+        "resource": "urn:recap:eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweGYzOUZkNmU1MWFhZDg4RjZGNGNlNmFCODgyNzI3OWNmZkZiOTIyNjY6YmVuY2gva3YvZGVwdGgtMiI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dfX0sInByZiI6WyJ6YjM4U0xuNkxNcVA1SFJXS1RwYVAzNWVOaENGakNqRExnM3AyY3ljbnpLMU5HYWVLIiwiemIzOFM4TjExWlRYSFJwOEpZSmg4eEhnM3F1N1Q4cURzUUM5d3dZdnBMNDF0TDVXZyJdfQ"
+      },
+      "siwe": "tc-bench.localhost wants you to sign in with your Ethereum account:\n0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\n\nI further authorize the stated URI to perform the following actions on my behalf: (1) 'tinycloud.kv': 'get' for 'tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-2'.\n\nURI: https://tc-bench.localhost/auth/verify\nVersion: 1\nChain ID: 1\nNonce: ab303e37ceef61b710f1f759\nIssued At: 2025-01-01T00:00:00.000Z\nExpiration Time: 2030-01-01T00:00:00.000Z\nResources:\n- urn:recap:eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweGYzOUZkNmU1MWFhZDg4RjZGNGNlNmFCODgyNzI3OWNmZkZiOTIyNjY6YmVuY2gva3YvZGVwdGgtMiI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dfX0sInByZiI6WyJ6YjM4U0xuNkxNcVA1SFJXS1RwYVAzNWVOaENGakNqRExnM3AyY3ljbnpLMU5HYWVLIiwiemIzOFM4TjExWlRYSFJwOEpZSmg4eEhnM3F1N1Q4cURzUUM5d3dZdnBMNDF0TDVXZyJdfQ",
+      "signature": "0x369c635d6e126681c268e74447c7aa911fd6fb3c0eee9a057383be8d05ef024c4754b22074a7ba878e5fda69b78712cbd88a205b1591acfb1e2a5e8f793b0b901c",
+      "expected": {
+        "status": 200,
+        "code": "OK"
+      }
+    },
+    {
+      "case": "depth-4",
+      "delegationDepth": 4,
+      "endpoint": "POST /auth/verify",
+      "operation": {
+        "service": "tinycloud.kv",
+        "space": "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench",
+        "path": "bench/kv/depth-4",
+        "action": "tinycloud.kv/get"
+      },
+      "nonce": "6dff733c19747cd59f0adf02",
+      "proofCids": [
+        "zb38SB9PCz1GzMj3cAbvurxpMCWaELicHinJy1j7qDnpgzQea",
+        "zb38SFpi232MZwDzRUMGBAjUZNRPdrwurbjMwcrR6aLPPoM61",
+        "zb38SDo31B6raxXhZk3f6wDauVZWSppx2Faww36S7Y4xnfU6D",
+        "zb38SHKW8GaFx7AFSAX61NSPhFVJX3jiTkPT6BicS5bENvAJR"
+      ],
+      "recap": {
+        "att": {
+          "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-4": {
+            "tinycloud.kv/get": [
+              {}
+            ]
+          }
+        },
+        "prf": [
+          "zb38SB9PCz1GzMj3cAbvurxpMCWaELicHinJy1j7qDnpgzQea",
+          "zb38SFpi232MZwDzRUMGBAjUZNRPdrwurbjMwcrR6aLPPoM61",
+          "zb38SDo31B6raxXhZk3f6wDauVZWSppx2Faww36S7Y4xnfU6D",
+          "zb38SHKW8GaFx7AFSAX61NSPhFVJX3jiTkPT6BicS5bENvAJR"
+        ],
+        "statement": "I further authorize the stated URI to perform the following actions on my behalf: (1) 'tinycloud.kv': 'get' for 'tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-4'.",
+        "resource": "urn:recap:eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweGYzOUZkNmU1MWFhZDg4RjZGNGNlNmFCODgyNzI3OWNmZkZiOTIyNjY6YmVuY2gva3YvZGVwdGgtNCI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dfX0sInByZiI6WyJ6YjM4U0I5UEN6MUd6TWozY0FidnVyeHBNQ1dhRUxpY0hpbkp5MWo3cURucGd6UWVhIiwiemIzOFNGcGkyMzJNWndEelJVTUdCQWpVWk5SUGRyd3VyYmpNd2NyUjZhTFBQb002MSIsInpiMzhTRG8zMUI2cmF4WGhaazNmNndEYXVWWldTcHB4MkZhd3czNlM3WTR4bmZVNkQiLCJ6YjM4U0hLVzhHYUZ4N0FGU0FYNjFOU1BoRlZKWDNqaVRrUFQ2QmljUzViRU52QUpSIl19"
+      },
+      "siwe": "tc-bench.localhost wants you to sign in with your Ethereum account:\n0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\n\nI further authorize the stated URI to perform the following actions on my behalf: (1) 'tinycloud.kv': 'get' for 'tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-4'.\n\nURI: https://tc-bench.localhost/auth/verify\nVersion: 1\nChain ID: 1\nNonce: 6dff733c19747cd59f0adf02\nIssued At: 2025-01-01T00:00:00.000Z\nExpiration Time: 2030-01-01T00:00:00.000Z\nResources:\n- urn:recap:eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweGYzOUZkNmU1MWFhZDg4RjZGNGNlNmFCODgyNzI3OWNmZkZiOTIyNjY6YmVuY2gva3YvZGVwdGgtNCI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dfX0sInByZiI6WyJ6YjM4U0I5UEN6MUd6TWozY0FidnVyeHBNQ1dhRUxpY0hpbkp5MWo3cURucGd6UWVhIiwiemIzOFNGcGkyMzJNWndEelJVTUdCQWpVWk5SUGRyd3VyYmpNd2NyUjZhTFBQb002MSIsInpiMzhTRG8zMUI2cmF4WGhaazNmNndEYXVWWldTcHB4MkZhd3czNlM3WTR4bmZVNkQiLCJ6YjM4U0hLVzhHYUZ4N0FGU0FYNjFOU1BoRlZKWDNqaVRrUFQ2QmljUzViRU52QUpSIl19",
+      "signature": "0xab55b290ad59883e15dde447e55bcfbf53141ff42a1c9dcb1a2e790069a5040d0a9ac58a2f2a3021badb0714d3329544da5a5edbec40cd87f09b1a9b260353f41c",
+      "expected": {
+        "status": 200,
+        "code": "OK"
+      }
+    },
+    {
+      "case": "depth-8",
+      "delegationDepth": 8,
+      "endpoint": "POST /auth/verify",
+      "operation": {
+        "service": "tinycloud.kv",
+        "space": "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench",
+        "path": "bench/kv/depth-8",
+        "action": "tinycloud.kv/get"
+      },
+      "nonce": "0fe67f3673597cb3a51e4e7c",
+      "proofCids": [
+        "zb38SAoRa56TzUn1ys36tYMgpfUzUKwfCdbi6Up4y3Cmr3qii",
+        "zb38SNTeM7RbFeFNCtTXbF5cj4nUdDK3oFCtd7WPi58Sj2Pz1",
+        "zb38SJcp4Q7TTnPHCmpcnuSytvMKdsz3h8zfrGg5K5fxHqfRa",
+        "zb38SNLzf9PjVJY1cHkcGBw8AK13Eymo4eyCR9pxu3EEqeDyX",
+        "zb38SP8qpxhhAhxK2r97ykLUNjP1i5Fh2QPgoyCdjAkP7ynGm",
+        "zb38SMaCnECYX8NsdLMhHKNxfaJQXF4ADbZZDAihKfoFyVLDJ",
+        "zb38SHgyfTSFGbKyWEJzjJGLqaZrspXSWh6uWe2SP5QpgmTHL",
+        "zb38SBWqK9Y4xkPN1fiby4dL8NpTDJ79eQsox5aWjRz6PZCEB"
+      ],
+      "recap": {
+        "att": {
+          "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-8": {
+            "tinycloud.kv/get": [
+              {}
+            ]
+          }
+        },
+        "prf": [
+          "zb38SAoRa56TzUn1ys36tYMgpfUzUKwfCdbi6Up4y3Cmr3qii",
+          "zb38SNTeM7RbFeFNCtTXbF5cj4nUdDK3oFCtd7WPi58Sj2Pz1",
+          "zb38SJcp4Q7TTnPHCmpcnuSytvMKdsz3h8zfrGg5K5fxHqfRa",
+          "zb38SNLzf9PjVJY1cHkcGBw8AK13Eymo4eyCR9pxu3EEqeDyX",
+          "zb38SP8qpxhhAhxK2r97ykLUNjP1i5Fh2QPgoyCdjAkP7ynGm",
+          "zb38SMaCnECYX8NsdLMhHKNxfaJQXF4ADbZZDAihKfoFyVLDJ",
+          "zb38SHgyfTSFGbKyWEJzjJGLqaZrspXSWh6uWe2SP5QpgmTHL",
+          "zb38SBWqK9Y4xkPN1fiby4dL8NpTDJ79eQsox5aWjRz6PZCEB"
+        ],
+        "statement": "I further authorize the stated URI to perform the following actions on my behalf: (1) 'tinycloud.kv': 'get' for 'tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-8'.",
+        "resource": "urn:recap:eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweGYzOUZkNmU1MWFhZDg4RjZGNGNlNmFCODgyNzI3OWNmZkZiOTIyNjY6YmVuY2gva3YvZGVwdGgtOCI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dfX0sInByZiI6WyJ6YjM4U0FvUmE1NlR6VW4xeXMzNnRZTWdwZlV6VUt3ZkNkYmk2VXA0eTNDbXIzcWlpIiwiemIzOFNOVGVNN1JiRmVGTkN0VFhiRjVjajRuVWRESzNvRkN0ZDdXUGk1OFNqMlB6MSIsInpiMzhTSmNwNFE3VFRuUEhDbXBjbnVTeXR2TUtkc3ozaDh6ZnJHZzVLNWZ4SHFmUmEiLCJ6YjM4U05MemY5UGpWSlkxY0hrY0dCdzhBSzEzRXltbzRleUNSOXB4dTNFRXFlRHlYIiwiemIzOFNQOHFweGhoQWh4SzJyOTd5a0xVTmpQMWk1RmgyUVBnb3lDZGpBa1A3eW5HbSIsInpiMzhTTWFDbkVDWVg4TnNkTE1oSEtOeGZhSlFYRjRBRGJaWkRBaWhLZm9GeVZMREoiLCJ6YjM4U0hneWZUU0ZHYkt5V0VKempKR0xxYVpyc3BYU1doNnVXZTJTUDVRcGdtVEhMIiwiemIzOFNCV3FLOVk0eGtQTjFmaWJ5NGRMOE5wVERKNzllUXNveDVhV2pSejZQWkNFQiJdfQ"
+      },
+      "siwe": "tc-bench.localhost wants you to sign in with your Ethereum account:\n0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\n\nI further authorize the stated URI to perform the following actions on my behalf: (1) 'tinycloud.kv': 'get' for 'tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-8'.\n\nURI: https://tc-bench.localhost/auth/verify\nVersion: 1\nChain ID: 1\nNonce: 0fe67f3673597cb3a51e4e7c\nIssued At: 2025-01-01T00:00:00.000Z\nExpiration Time: 2030-01-01T00:00:00.000Z\nResources:\n- urn:recap:eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweGYzOUZkNmU1MWFhZDg4RjZGNGNlNmFCODgyNzI3OWNmZkZiOTIyNjY6YmVuY2gva3YvZGVwdGgtOCI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dfX0sInByZiI6WyJ6YjM4U0FvUmE1NlR6VW4xeXMzNnRZTWdwZlV6VUt3ZkNkYmk2VXA0eTNDbXIzcWlpIiwiemIzOFNOVGVNN1JiRmVGTkN0VFhiRjVjajRuVWRESzNvRkN0ZDdXUGk1OFNqMlB6MSIsInpiMzhTSmNwNFE3VFRuUEhDbXBjbnVTeXR2TUtkc3ozaDh6ZnJHZzVLNWZ4SHFmUmEiLCJ6YjM4U05MemY5UGpWSlkxY0hrY0dCdzhBSzEzRXltbzRleUNSOXB4dTNFRXFlRHlYIiwiemIzOFNQOHFweGhoQWh4SzJyOTd5a0xVTmpQMWk1RmgyUVBnb3lDZGpBa1A3eW5HbSIsInpiMzhTTWFDbkVDWVg4TnNkTE1oSEtOeGZhSlFYRjRBRGJaWkRBaWhLZm9GeVZMREoiLCJ6YjM4U0hneWZUU0ZHYkt5V0VKempKR0xxYVpyc3BYU1doNnVXZTJTUDVRcGdtVEhMIiwiemIzOFNCV3FLOVk0eGtQTjFmaWJ5NGRMOE5wVERKNzllUXNveDVhV2pSejZQWkNFQiJdfQ",
+      "signature": "0xccf38b26108f5da1172d4dc264c5d462e70ecbaf5ca36fba7bb32293f85bcb165ab6da760ec7cfe471fbcd0d04e41652d096531f61b7214c95c690a0073cf6881c",
+      "expected": {
+        "status": 200,
+        "code": "OK"
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "case": "expired",
+      "delegationDepth": 0,
+      "endpoint": "POST /auth/verify",
+      "operation": {
+        "service": "tinycloud.kv",
+        "space": "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench",
+        "path": "bench/kv/depth-0",
+        "action": "tinycloud.kv/get"
+      },
+      "nonce": "414edbb3ff3c1faa0c581731",
+      "proofCids": [],
+      "recap": {
+        "att": {
+          "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-0": {
+            "tinycloud.kv/get": [
+              {}
+            ]
+          }
+        },
+        "prf": [],
+        "statement": "I further authorize the stated URI to perform the following actions on my behalf: (1) 'tinycloud.kv': 'get' for 'tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-0'.",
+        "resource": "urn:recap:eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweGYzOUZkNmU1MWFhZDg4RjZGNGNlNmFCODgyNzI3OWNmZkZiOTIyNjY6YmVuY2gva3YvZGVwdGgtMCI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dfX0sInByZiI6W119"
+      },
+      "siwe": "tc-bench.localhost wants you to sign in with your Ethereum account:\n0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\n\nI further authorize the stated URI to perform the following actions on my behalf: (1) 'tinycloud.kv': 'get' for 'tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-0'.\n\nURI: https://tc-bench.localhost/auth/verify\nVersion: 1\nChain ID: 1\nNonce: 414edbb3ff3c1faa0c581731\nIssued At: 2024-12-31T23:45:00.000Z\nExpiration Time: 2024-12-31T23:59:59.000Z\nResources:\n- urn:recap:eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweGYzOUZkNmU1MWFhZDg4RjZGNGNlNmFCODgyNzI3OWNmZkZiOTIyNjY6YmVuY2gva3YvZGVwdGgtMCI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dfX0sInByZiI6W119",
+      "signature": "0x248514ff53cfe65dc67dceca465c7b6b9e43747fb414d989931873763b4b29f71427a39d7957a086af1703aa9e3586fcf74c2c527889c8f40e4efdd0c84d995f1c",
+      "expected": {
+        "status": 401,
+        "code": "AUTH_EXPIRED"
+      },
+      "invalidReason": "expired"
+    },
+    {
+      "case": "wrong-ability",
+      "delegationDepth": 1,
+      "endpoint": "POST /auth/verify",
+      "operation": {
+        "service": "tinycloud.kv",
+        "space": "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench",
+        "path": "bench/kv/depth-1",
+        "action": "tinycloud.kv/put"
+      },
+      "nonce": "e83924cbf58aec15a082544e",
+      "proofCids": [
+        "zb38SEm7eid5gAYxbe95Pa3AhmhRwcqGWJiFcfFgKpv6TurZj"
+      ],
+      "recap": {
+        "att": {
+          "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-1": {
+            "tinycloud.kv/get": [
+              {}
+            ]
+          }
+        },
+        "prf": [
+          "zb38SEm7eid5gAYxbe95Pa3AhmhRwcqGWJiFcfFgKpv6TurZj"
+        ],
+        "statement": "I further authorize the stated URI to perform the following actions on my behalf: (1) 'tinycloud.kv': 'get' for 'tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-1'.",
+        "resource": "urn:recap:eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweGYzOUZkNmU1MWFhZDg4RjZGNGNlNmFCODgyNzI3OWNmZkZiOTIyNjY6YmVuY2gva3YvZGVwdGgtMSI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dfX0sInByZiI6WyJ6YjM4U0VtN2VpZDVnQVl4YmU5NVBhM0FobWhSd2NxR1dKaUZjZkZnS3B2NlR1clpqIl19"
+      },
+      "siwe": "tc-bench.localhost wants you to sign in with your Ethereum account:\n0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\n\nI further authorize the stated URI to perform the following actions on my behalf: (1) 'tinycloud.kv': 'get' for 'tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-1'.\n\nURI: https://tc-bench.localhost/auth/verify\nVersion: 1\nChain ID: 1\nNonce: e83924cbf58aec15a082544e\nIssued At: 2025-01-01T00:00:00.000Z\nExpiration Time: 2030-01-01T00:00:00.000Z\nResources:\n- urn:recap:eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweGYzOUZkNmU1MWFhZDg4RjZGNGNlNmFCODgyNzI3OWNmZkZiOTIyNjY6YmVuY2gva3YvZGVwdGgtMSI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dfX0sInByZiI6WyJ6YjM4U0VtN2VpZDVnQVl4YmU5NVBhM0FobWhSd2NxR1dKaUZjZkZnS3B2NlR1clpqIl19",
+      "signature": "0x87d0c32e1ac1ebd07f2771d3fe1b26b0398f267bb133345bbb22880bf17b4c153022d9a25c093fc68d41183ec3eb71f10b79fa4f626a4f484b84cb7eae4d24de1b",
+      "expected": {
+        "status": 403,
+        "code": "ABILITY_DENIED"
+      },
+      "invalidReason": "wrong ability"
+    },
+    {
+      "case": "replayed-nonce",
+      "delegationDepth": 2,
+      "endpoint": "POST /auth/verify",
+      "operation": {
+        "service": "tinycloud.kv",
+        "space": "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench",
+        "path": "bench/kv/depth-2",
+        "action": "tinycloud.kv/get"
+      },
+      "nonce": "ab303e37ceef61b710f1f759",
+      "proofCids": [
+        "zb38SLn6LMqP5HRWKTpaP35eNhCFjCjDLg3p2cycnzK1NGaeK",
+        "zb38S8N11ZTXHRp8JYJh8xHg3qu7T8qDsQC9wwYvpL41tL5Wg"
+      ],
+      "recap": {
+        "att": {
+          "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-2": {
+            "tinycloud.kv/get": [
+              {}
+            ]
+          }
+        },
+        "prf": [
+          "zb38SLn6LMqP5HRWKTpaP35eNhCFjCjDLg3p2cycnzK1NGaeK",
+          "zb38S8N11ZTXHRp8JYJh8xHg3qu7T8qDsQC9wwYvpL41tL5Wg"
+        ],
+        "statement": "I further authorize the stated URI to perform the following actions on my behalf: (1) 'tinycloud.kv': 'get' for 'tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-2'.",
+        "resource": "urn:recap:eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweGYzOUZkNmU1MWFhZDg4RjZGNGNlNmFCODgyNzI3OWNmZkZiOTIyNjY6YmVuY2gva3YvZGVwdGgtMiI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dfX0sInByZiI6WyJ6YjM4U0xuNkxNcVA1SFJXS1RwYVAzNWVOaENGakNqRExnM3AyY3ljbnpLMU5HYWVLIiwiemIzOFM4TjExWlRYSFJwOEpZSmg4eEhnM3F1N1Q4cURzUUM5d3dZdnBMNDF0TDVXZyJdfQ"
+      },
+      "siwe": "tc-bench.localhost wants you to sign in with your Ethereum account:\n0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\n\nI further authorize the stated URI to perform the following actions on my behalf: (1) 'tinycloud.kv': 'get' for 'tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-2'.\n\nURI: https://tc-bench.localhost/auth/verify\nVersion: 1\nChain ID: 1\nNonce: ab303e37ceef61b710f1f759\nIssued At: 2025-01-01T00:00:00.000Z\nExpiration Time: 2030-01-01T00:00:00.000Z\nResources:\n- urn:recap:eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweGYzOUZkNmU1MWFhZDg4RjZGNGNlNmFCODgyNzI3OWNmZkZiOTIyNjY6YmVuY2gva3YvZGVwdGgtMiI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dfX0sInByZiI6WyJ6YjM4U0xuNkxNcVA1SFJXS1RwYVAzNWVOaENGakNqRExnM3AyY3ljbnpLMU5HYWVLIiwiemIzOFM4TjExWlRYSFJwOEpZSmg4eEhnM3F1N1Q4cURzUUM5d3dZdnBMNDF0TDVXZyJdfQ",
+      "signature": "0x369c635d6e126681c268e74447c7aa911fd6fb3c0eee9a057383be8d05ef024c4754b22074a7ba878e5fda69b78712cbd88a205b1591acfb1e2a5e8f793b0b901c",
+      "expected": {
+        "status": 409,
+        "code": "NONCE_REPLAY"
+      },
+      "replayOf": {
+        "case": "depth-2",
+        "delegationDepth": 2,
+        "endpoint": "POST /auth/verify",
+        "operation": {
+          "service": "tinycloud.kv",
+          "space": "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench",
+          "path": "bench/kv/depth-2",
+          "action": "tinycloud.kv/get"
+        },
+        "nonce": "ab303e37ceef61b710f1f759",
+        "proofCids": [
+          "zb38SLn6LMqP5HRWKTpaP35eNhCFjCjDLg3p2cycnzK1NGaeK",
+          "zb38S8N11ZTXHRp8JYJh8xHg3qu7T8qDsQC9wwYvpL41tL5Wg"
+        ],
+        "recap": {
+          "att": {
+            "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-2": {
+              "tinycloud.kv/get": [
+                {}
+              ]
+            }
+          },
+          "prf": [
+            "zb38SLn6LMqP5HRWKTpaP35eNhCFjCjDLg3p2cycnzK1NGaeK",
+            "zb38S8N11ZTXHRp8JYJh8xHg3qu7T8qDsQC9wwYvpL41tL5Wg"
+          ],
+          "statement": "I further authorize the stated URI to perform the following actions on my behalf: (1) 'tinycloud.kv': 'get' for 'tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-2'.",
+          "resource": "urn:recap:eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweGYzOUZkNmU1MWFhZDg4RjZGNGNlNmFCODgyNzI3OWNmZkZiOTIyNjY6YmVuY2gva3YvZGVwdGgtMiI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dfX0sInByZiI6WyJ6YjM4U0xuNkxNcVA1SFJXS1RwYVAzNWVOaENGakNqRExnM3AyY3ljbnpLMU5HYWVLIiwiemIzOFM4TjExWlRYSFJwOEpZSmg4eEhnM3F1N1Q4cURzUUM5d3dZdnBMNDF0TDVXZyJdfQ"
+        },
+        "siwe": "tc-bench.localhost wants you to sign in with your Ethereum account:\n0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\n\nI further authorize the stated URI to perform the following actions on my behalf: (1) 'tinycloud.kv': 'get' for 'tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-2'.\n\nURI: https://tc-bench.localhost/auth/verify\nVersion: 1\nChain ID: 1\nNonce: ab303e37ceef61b710f1f759\nIssued At: 2025-01-01T00:00:00.000Z\nExpiration Time: 2030-01-01T00:00:00.000Z\nResources:\n- urn:recap:eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweGYzOUZkNmU1MWFhZDg4RjZGNGNlNmFCODgyNzI3OWNmZkZiOTIyNjY6YmVuY2gva3YvZGVwdGgtMiI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dfX0sInByZiI6WyJ6YjM4U0xuNkxNcVA1SFJXS1RwYVAzNWVOaENGakNqRExnM3AyY3ljbnpLMU5HYWVLIiwiemIzOFM4TjExWlRYSFJwOEpZSmg4eEhnM3F1N1Q4cURzUUM5d3dZdnBMNDF0TDVXZyJdfQ",
+        "signature": "0x369c635d6e126681c268e74447c7aa911fd6fb3c0eee9a057383be8d05ef024c4754b22074a7ba878e5fda69b78712cbd88a205b1591acfb1e2a5e8f793b0b901c",
+        "expected": {
+          "status": 200,
+          "code": "OK"
+        }
+      },
+      "invalidReason": "replayed nonce"
+    },
+    {
+      "case": "digest-mismatch",
+      "delegationDepth": 8,
+      "endpoint": "PUT /block/:multihash",
+      "operation": {
+        "service": "tinycloud.kv",
+        "space": "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench",
+        "path": "bench/kv/depth-8",
+        "action": "tinycloud.kv/get"
+      },
+      "nonce": "0fe67f3673597cb3a51e4e7c",
+      "proofCids": [
+        "zb38SAoRa56TzUn1ys36tYMgpfUzUKwfCdbi6Up4y3Cmr3qii",
+        "zb38SNTeM7RbFeFNCtTXbF5cj4nUdDK3oFCtd7WPi58Sj2Pz1",
+        "zb38SJcp4Q7TTnPHCmpcnuSytvMKdsz3h8zfrGg5K5fxHqfRa",
+        "zb38SNLzf9PjVJY1cHkcGBw8AK13Eymo4eyCR9pxu3EEqeDyX",
+        "zb38SP8qpxhhAhxK2r97ykLUNjP1i5Fh2QPgoyCdjAkP7ynGm",
+        "zb38SMaCnECYX8NsdLMhHKNxfaJQXF4ADbZZDAihKfoFyVLDJ",
+        "zb38SHgyfTSFGbKyWEJzjJGLqaZrspXSWh6uWe2SP5QpgmTHL",
+        "zb38SBWqK9Y4xkPN1fiby4dL8NpTDJ79eQsox5aWjRz6PZCEB"
+      ],
+      "recap": {
+        "att": {
+          "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-8": {
+            "tinycloud.kv/get": [
+              {}
+            ]
+          }
+        },
+        "prf": [
+          "zb38SAoRa56TzUn1ys36tYMgpfUzUKwfCdbi6Up4y3Cmr3qii",
+          "zb38SNTeM7RbFeFNCtTXbF5cj4nUdDK3oFCtd7WPi58Sj2Pz1",
+          "zb38SJcp4Q7TTnPHCmpcnuSytvMKdsz3h8zfrGg5K5fxHqfRa",
+          "zb38SNLzf9PjVJY1cHkcGBw8AK13Eymo4eyCR9pxu3EEqeDyX",
+          "zb38SP8qpxhhAhxK2r97ykLUNjP1i5Fh2QPgoyCdjAkP7ynGm",
+          "zb38SMaCnECYX8NsdLMhHKNxfaJQXF4ADbZZDAihKfoFyVLDJ",
+          "zb38SHgyfTSFGbKyWEJzjJGLqaZrspXSWh6uWe2SP5QpgmTHL",
+          "zb38SBWqK9Y4xkPN1fiby4dL8NpTDJ79eQsox5aWjRz6PZCEB"
+        ],
+        "statement": "I further authorize the stated URI to perform the following actions on my behalf: (1) 'tinycloud.kv': 'get' for 'tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-8'.",
+        "resource": "urn:recap:eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweGYzOUZkNmU1MWFhZDg4RjZGNGNlNmFCODgyNzI3OWNmZkZiOTIyNjY6YmVuY2gva3YvZGVwdGgtOCI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dfX0sInByZiI6WyJ6YjM4U0FvUmE1NlR6VW4xeXMzNnRZTWdwZlV6VUt3ZkNkYmk2VXA0eTNDbXIzcWlpIiwiemIzOFNOVGVNN1JiRmVGTkN0VFhiRjVjajRuVWRESzNvRkN0ZDdXUGk1OFNqMlB6MSIsInpiMzhTSmNwNFE3VFRuUEhDbXBjbnVTeXR2TUtkc3ozaDh6ZnJHZzVLNWZ4SHFmUmEiLCJ6YjM4U05MemY5UGpWSlkxY0hrY0dCdzhBSzEzRXltbzRleUNSOXB4dTNFRXFlRHlYIiwiemIzOFNQOHFweGhoQWh4SzJyOTd5a0xVTmpQMWk1RmgyUVBnb3lDZGpBa1A3eW5HbSIsInpiMzhTTWFDbkVDWVg4TnNkTE1oSEtOeGZhSlFYRjRBRGJaWkRBaWhLZm9GeVZMREoiLCJ6YjM4U0hneWZUU0ZHYkt5V0VKempKR0xxYVpyc3BYU1doNnVXZTJTUDVRcGdtVEhMIiwiemIzOFNCV3FLOVk0eGtQTjFmaWJ5NGRMOE5wVERKNzllUXNveDVhV2pSejZQWkNFQiJdfQ"
+      },
+      "siwe": "tc-bench.localhost wants you to sign in with your Ethereum account:\n0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266\n\nI further authorize the stated URI to perform the following actions on my behalf: (1) 'tinycloud.kv': 'get' for 'tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:bench/kv/depth-8'.\n\nURI: https://tc-bench.localhost/auth/verify\nVersion: 1\nChain ID: 1\nNonce: 0fe67f3673597cb3a51e4e7c\nIssued At: 2025-01-01T00:00:00.000Z\nExpiration Time: 2030-01-01T00:00:00.000Z\nResources:\n- urn:recap:eyJhdHQiOnsidGlueWNsb3VkOnBraDplaXAxNTU6MToweGYzOUZkNmU1MWFhZDg4RjZGNGNlNmFCODgyNzI3OWNmZkZiOTIyNjY6YmVuY2gva3YvZGVwdGgtOCI6eyJ0aW55Y2xvdWQua3YvZ2V0Ijpbe31dfX0sInByZiI6WyJ6YjM4U0FvUmE1NlR6VW4xeXMzNnRZTWdwZlV6VUt3ZkNkYmk2VXA0eTNDbXIzcWlpIiwiemIzOFNOVGVNN1JiRmVGTkN0VFhiRjVjajRuVWRESzNvRkN0ZDdXUGk1OFNqMlB6MSIsInpiMzhTSmNwNFE3VFRuUEhDbXBjbnVTeXR2TUtkc3ozaDh6ZnJHZzVLNWZ4SHFmUmEiLCJ6YjM4U05MemY5UGpWSlkxY0hrY0dCdzhBSzEzRXltbzRleUNSOXB4dTNFRXFlRHlYIiwiemIzOFNQOHFweGhoQWh4SzJyOTd5a0xVTmpQMWk1RmgyUVBnb3lDZGpBa1A3eW5HbSIsInpiMzhTTWFDbkVDWVg4TnNkTE1oSEtOeGZhSlFYRjRBRGJaWkRBaWhLZm9GeVZMREoiLCJ6YjM4U0hneWZUU0ZHYkt5V0VKempKR0xxYVpyc3BYU1doNnVXZTJTUDVRcGdtVEhMIiwiemIzOFNCV3FLOVk0eGtQTjFmaWJ5NGRMOE5wVERKNzllUXNveDVhV2pSejZQWkNFQiJdfQ",
+      "signature": "0xccf38b26108f5da1172d4dc264c5d462e70ecbaf5ca36fba7bb32293f85bcb165ab6da760ec7cfe471fbcd0d04e41652d096531f61b7214c95c690a0073cf6881c",
+      "expected": {
+        "status": 422,
+        "code": "DIGEST_MISMATCH"
+      },
+      "invalidReason": "block digest mismatch",
+      "digest": {
+        "claimed": "1e20b118ec6e283b297bc1d9b52cd981222d894876abf8ef15166aa5a0e0b8e27476",
+        "actual": "1e20390e51471e1fabb39bd4ba9de1864bdb18d93d36def5b2aaa60598c48e908b35"
+      },
+      "block": {
+        "fixture": "64KiB",
+        "sizeBytes": 65536,
+        "path": "fixtures/blocks/64KiB.bin",
+        "contentType": "application/octet-stream",
+        "claimedMultihash": "1e20b118ec6e283b297bc1d9b52cd981222d894876abf8ef15166aa5a0e0b8e27476",
+        "actualMultihash": "1e20390e51471e1fabb39bd4ba9de1864bdb18d93d36def5b2aaa60598c48e908b35"
+      }
+    }
+  ]
+}

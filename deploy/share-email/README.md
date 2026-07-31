@@ -12,6 +12,49 @@ mounted trust-bundle path is the only production source for the public trust
 tuple; missing or inconsistent legacy field overrides fail closed. Never put a
 private key, database password, claim, credential, or token in the file.
 
+## Delivering the trust bundle (TC-397)
+
+The trust document has two interchangeable delivery forms, and exactly one may
+be configured — setting both is a startup error, because two sources for one
+document is the divergence the shared bundle exists to prevent.
+
+- `trust_bundle_path` / `TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_PATH` — a
+  read-only mounted file. Use this wherever a host filesystem exists.
+- `trust_bundle_base64` / `TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_BASE64` — the
+  same bytes, base64-encoded, inline in the environment.
+
+The inline form exists because the dstack/Phala target admits nothing else.
+The release image's runtime stage is `FROM scratch`, so there is no shell and
+no `base64` binary — the decode-to-tmpfs entrypoint `share-api`'s compose file
+uses cannot be reproduced here — and a Phala deployment uploads only a compose
+file, so there is no host path to bind-mount a bundle from. An opaque
+environment variable is the one channel that reaches the container. It is
+base64 rather than raw JSON because Figment's `Env` provider interprets brace-
+and bracket-delimited values as structured data; a base64 token passes through
+Figment, YAML and dstack's sealed environment storage byte-for-byte.
+
+Produce it from the reviewed document without a trailing newline or line
+wrapping:
+
+```sh
+SHARE_TRUST_BUNDLE_BASE64="$(base64 < trust-bundle.production.json | tr -d '\n')"
+```
+
+`share-api` reads the same document from a variable of the same name and in the
+same encoding, so a single sealed value can feed both services and cannot drift
+between them.
+
+### `emailOrigin`
+
+The document carries an `emailOrigin` field that Share's schema requires (it
+feeds the CSP `connect-src` without which the browser blocks the send). The
+node validates it — canonical HTTPS origin, no path, query, fragment, port or
+credentials, and covered by the production placeholder scan — but does not
+consume it, exactly like `shareOrigin` and `registryOrigin`. It is optional on
+this side so that adding it did not become a breaking change to an unchanged
+document version; the requirement is enforced by Share, its only consumer.
+Unknown fields are still rejected.
+
 The staging compose file consumes that mounted config and has no development
 or test fallback. It requires an immutable image reference, a PostgreSQL URL,
 the CA bundle, issuer and invitation public keys, the signed authority bundle,

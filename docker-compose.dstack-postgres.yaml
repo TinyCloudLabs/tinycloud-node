@@ -26,7 +26,44 @@ services:
       AWS_SECRET_ACCESS_KEY: "${AWS_SECRET}"
       AWS_DEFAULT_REGION: "${AWS_REGION}"
       TINYCLOUD_LOG_LEVEL: normal
+      # Enable Prometheus telemetry (metrics, span histograms, pool gauges).
+      # The metrics handler is intentionally NOT gateway-exposed: port 8001 is
+      # not published here, so the unauthenticated /metrics endpoint stays
+      # internal to the CVM.
+      TINYCLOUD_TELEMETRY__ENABLED: "true"
+      # The managed Postgres instance allows max_connections = 25 (measured
+      # 2026-07-29, with some of those reserved for superuser roles). The pool
+      # default of 100 cannot be satisfied: the node opened and held slots
+      # until the instance ran out, and further requests failed with
+      # "Failed to acquire connection from pool: Connection pool timed out"
+      # after the 30s sqlx default. Keep this below the instance limit with
+      # headroom for admin/psql access, and raise it only alongside the
+      # instance's own max_connections.
+      TINYCLOUD_DATABASE__MAX_CONNECTIONS: "15"
       TINYCLOUD_CORS: "true"
+      # --- addressed sharing (TC-397) ------------------------------------
+      #
+      # The public trust document shared with Share and OpenCredentials,
+      # delivered inline because nothing else can reach this container: the
+      # image is `FROM scratch` (no shell, so share-api's decode-to-tmpfs
+      # entrypoint cannot work here) and a dstack deployment uploads only
+      # this compose file (so there is no host path to bind-mount from).
+      #
+      # Seal the base64 of the reviewed trust-bundle.production.json — the
+      # same bytes share-api serves — into the CVM's encrypted environment as
+      # SHARE_TRUST_BUNDLE_BASE64. Same variable name and same wire form
+      # share-api already uses, so one sealed value feeds both services and
+      # cannot drift between them.
+      #
+      # The `:?` form is deliberate: compose refuses to interpolate a partial
+      # deployment, failing loudly at deploy time rather than letting the node
+      # die at boot with "share email trust bundle is required".
+      TINYCLOUD_SHARE_EMAIL__ENABLED: "true"
+      TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_BASE64: "${SHARE_TRUST_BUNDLE_BASE64:?seal the reviewed share-email trust bundle, base64-encoded}"
+      # The sealed DATABASE_URL already carries sslmode=verify-full as its sole
+      # query parameter. ROOT_CERT_PATH stays unset so verify-full resolves
+      # against the compiled-in public root set (TC-363).
+      TINYCLOUD_SHARE_EMAIL__POSTGRES_TLS__SSLMODE: verify-full
       TINYCLOUD_QUOTA_URL: "${TINYCLOUD_QUOTA_URL}"
       TINYCLOUD_ADMIN_SECRET: "${TINYCLOUD_ADMIN_SECRET}"
       ROCKET_ADDRESS: "0.0.0.0"

@@ -24,6 +24,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Run release-plz
+        id: release_pr
         uses: release-plz/action@v0.5
         with:
           command: release-pr
@@ -31,6 +32,43 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      # TC-342: this job reported a bare green whether or not it did anything,
+      # and it had in fact done nothing for 35 consecutive runs — release-plz
+      # cannot compute a version bump in this repo (see the long comment in
+      # release-plz.toml). Say so on the run itself, so "release-plz is green"
+      # is never again read as "the version was bumped".
+      - name: Report whether a version bump was computed
+        env:
+          PRS_CREATED: ${{ steps.release_pr.outputs.prs_created }}
+        run: |
+          set -euo pipefail
+
+          if [ "${PRS_CREATED}" = "true" ]; then
+            echo "release-plz opened or updated a release PR." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # This step only reports; never let it fail the job.
+          CARGO_VERSION="$(grep -m1 -E '^version = "' tinycloud-node-server/Cargo.toml | cut -d '"' -f 2 || true)"
+          LATEST_TAG="$(git tag --list 'v*' --sort=-v:refname | head -n 1 || true)"
+
+          echo "::warning title=No version bump computed::release-plz did not open a release PR. Versioning in this repo is MANUAL (TC-342) — a green run here does NOT mean the version was bumped. See docs/releasing.md."
+          {
+            echo "### release-plz did not compute a version bump"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| \`tinycloud-node-server/Cargo.toml\` | \`${CARGO_VERSION}\` |"
+            echo "| latest \`v*\` tag | \`${LATEST_TAG:-none}\` |"
+            echo
+            echo "This is the expected outcome today, **not** a quiet release cycle."
+            echo "release-plz compares against the crates.io \`tinycloud-node\` 0.0.1"
+            echo "placeholder, sees the local version as already ahead, and only ever"
+            echo "regenerates the changelog. Version numbers in this repo are chosen by"
+            echo "hand — see \`docs/releasing.md\` and the TC-342 comment in"
+            echo "\`release-plz.toml\`."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   release:
     name: Release

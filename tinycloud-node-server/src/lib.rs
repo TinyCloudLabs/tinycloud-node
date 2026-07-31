@@ -46,6 +46,32 @@ pub(crate) mod test_support {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
     }
+
+    /// Sets a process environment variable for the lifetime of the guard and
+    /// restores the previous value on drop. Hold [`env_lock`] across it.
+    #[allow(dead_code)]
+    pub struct EnvGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        #[allow(dead_code)]
+        pub fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 }
 
 use config::{BlockStorage, Config, Keys, StagingStorage};
@@ -69,7 +95,9 @@ use routes::{
         well_known_network as encryption_well_known,
     },
     hooks::{create_hook_ticket, create_webhook, delete_webhook, hook_events, list_webhooks},
-    info, invoke, open_host_key,
+    info, invoke,
+    node_keys::{node_keys, NodePublicKeys},
+    open_host_key,
     public::{public_kv_get, public_kv_head, public_kv_list, public_kv_options, RateLimiter},
     revoke, signed_kv_get,
     util_routes::*,
@@ -201,6 +229,7 @@ pub async fn app_with_control(
         cors,
         info,
         version,
+        node_keys,
         open_host_key,
         invoke,
         delegate,
@@ -243,6 +272,9 @@ pub async fn app_with_control(
     ]);
 
     let key_setup: StaticSecret = resolve_keys(&tinycloud_config.keys).await?;
+    // TC-359: publish the derived public halves so an operator can read the
+    // invitation key a dstack-keyed node actually signs with.
+    let node_public_keys = NodePublicKeys::derive(&key_setup);
     let webhook_encryption =
         ColumnEncryption::new(key_setup.derive_key(b"tinycloud/hooks/webhook-secrets"));
     let hook_runtime = HookRuntime::new(
@@ -308,7 +340,7 @@ pub async fn app_with_control(
         ConnectOptions::from(database)
     };
     if !is_sqlite {
-        connect_opts.max_connections(100);
+        connect_opts.max_connections(tinycloud_config.database.max_connections);
         if let Some(root_cert_path) = tinycloud_config
             .share_email
             .postgres_tls
@@ -453,6 +485,8 @@ pub async fn app_with_control(
     );
     let invocation_replay_cache = InvocationReplayCache::new(seed_conn.clone());
     let replay_cleanup = invocation_replay_cache.clone();
+    // TC-341: the periodic sweep also reclaims rows beyond the lifetime cap.
+    let replay_max_lifetime_secs = tinycloud_config.invocation.max_lifetime_secs;
 
     let rate_limiter = RateLimiter::new(&tinycloud_config.public_spaces);
     let webhook_dispatcher = WebhookDispatcher::new(
@@ -461,6 +495,11 @@ pub async fn app_with_control(
         webhook_encryption.clone(),
     )?;
     spawn_webhook_dispatcher(webhook_dispatcher);
+
+    // TC-326: capture handles for the telemetry DB sampler before `tinycloud`
+    // is moved into Rocket-managed state below.
+    let telemetry_enabled = tinycloud_config.telemetry.enabled;
+    let telemetry_tinycloud = tinycloud.clone();
 
     let rocket = rocket::custom(config)
         .mount("/", routes)
@@ -474,7 +513,7 @@ pub async fn app_with_control(
                 Box::pin(async move {
                     tokio::spawn(async move {
                         let _ = replay_cleanup
-                            .cleanup_expired(time::OffsetDateTime::now_utc())
+                            .cleanup(time::OffsetDateTime::now_utc(), replay_max_lifetime_secs)
                             .await;
                         let period = std::time::Duration::from_secs(60);
                         let mut interval =
@@ -484,7 +523,10 @@ pub async fn app_with_control(
                             tokio::select! {
                                 _ = interval.tick() => {
                                     let _ = replay_cleanup
-                                        .cleanup_expired(time::OffsetDateTime::now_utc())
+                                        .cleanup(
+                                            time::OffsetDateTime::now_utc(),
+                                            replay_max_lifetime_secs,
+                                        )
                                         .await;
                                 }
                                 _ = &mut shutdown => break,
@@ -495,6 +537,7 @@ pub async fn app_with_control(
             },
         ))
         .manage(tinycloud)
+        .manage(node_public_keys)
         .manage(sql_service);
     #[cfg(feature = "tc-bench-v1")]
     let rocket = rocket.manage(bench_state);
@@ -512,6 +555,75 @@ pub async fn app_with_control(
         .manage(tee_context)
         .manage(encryption_service)
         .manage(tinycloud_config.storage.staging.open().await?);
+
+    // TC-287: opt-in retention sweeper. Mirrors the invocation-replay cleanup
+    // fairing above — an on-liftoff task that prunes terminal hook deliveries
+    // and expired signed KV tickets every 5 minutes and stops on shutdown.
+    let rocket = if tinycloud_config.retention.enabled {
+        let retention_conn = seed_conn.clone();
+        let retention_config = tinycloud_config.retention.clone();
+        rocket.attach(AdHoc::on_liftoff("retention-sweeper", move |rocket| {
+            let retention_conn = retention_conn.clone();
+            let retention_config = retention_config.clone();
+            let shutdown = rocket.shutdown();
+            Box::pin(async move {
+                tokio::spawn(async move {
+                    run_retention_sweep(&retention_conn, &retention_config).await;
+                    let period = std::time::Duration::from_secs(300);
+                    let mut interval =
+                        tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+                    tokio::pin!(shutdown);
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                run_retention_sweep(&retention_conn, &retention_config).await;
+                            }
+                            _ = &mut shutdown => break,
+                        }
+                    }
+                });
+            })
+        }))
+    } else {
+        rocket
+    };
+
+    // TC-326: pool + read-audit telemetry sampler. Gated on telemetry.enabled;
+    // an on-liftoff task that samples the DB pool gauges, probes pool-acquire
+    // latency, and advances the read-audit commit counters every 5 seconds,
+    // stopping on shutdown. Mirrors the retention-sweeper fairing above.
+    let rocket = if telemetry_enabled {
+        let telemetry_conn = seed_conn.clone();
+        rocket.attach(AdHoc::on_liftoff("telemetry-db-sampler", move |rocket| {
+            let telemetry_conn = telemetry_conn.clone();
+            let telemetry_tinycloud = telemetry_tinycloud.clone();
+            let shutdown = rocket.shutdown();
+            Box::pin(async move {
+                tokio::spawn(async move {
+                    let mut last_read_audit = (0u64, 0u64);
+                    let period = std::time::Duration::from_secs(5);
+                    let mut interval =
+                        tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+                    tokio::pin!(shutdown);
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                sample_db_telemetry(
+                                    &telemetry_conn,
+                                    &telemetry_tinycloud,
+                                    &mut last_read_audit,
+                                )
+                                .await;
+                            }
+                            _ = &mut shutdown => break,
+                        }
+                    }
+                });
+            })
+        }))
+    } else {
+        rocket
+    };
 
     let rocket = if let Some(control) = control {
         let control_running = control.clone();
@@ -594,7 +706,114 @@ pub async fn app_with_control(
     }
 }
 
-async fn resolve_keys(keys: &Keys) -> Result<StaticSecret> {
+/// One telemetry sample tick: update the DB pool gauges, probe pool-acquire
+/// latency (the `DbPoolAcquire` span), and advance the cumulative read-audit
+/// counters. `last_read_audit` carries the previous cumulative
+/// `(records, batches)` so the monotonic counters advance by deltas.
+///
+/// sea-orm couples pool acquisition with `BEGIN` on the generic connection, so
+/// the request-path `DbTxBegin` span cannot separate the two. This sampler is
+/// the one place the concrete pool is reachable, so it hosts the standalone
+/// pool-acquire probe (bounded by a short timeout so it never delays shutdown).
+async fn sample_db_telemetry(
+    conn: &DatabaseConnection,
+    tinycloud: &TinyCloud,
+    last_read_audit: &mut (u64, u64),
+) {
+    use tinycloud_core::sea_orm::{ConnectionTrait, DatabaseBackend};
+
+    macro_rules! sample_pool {
+        ($pool:expr) => {{
+            let pool = $pool;
+            crate::prometheus::set_db_pool_gauges(pool.size() as i64, pool.num_idle() as i64);
+            let acquire_start = std::time::Instant::now();
+            let acquired =
+                tokio::time::timeout(std::time::Duration::from_secs(2), pool.acquire()).await;
+            crate::prometheus::observe_stage(
+                crate::prometheus::InvocationStage::DbPoolAcquire,
+                crate::prometheus::StageOutcome::from(matches!(acquired, Ok(Ok(_)))),
+                acquire_start.elapsed(),
+            );
+        }};
+    }
+    match conn.get_database_backend() {
+        DatabaseBackend::Postgres => sample_pool!(conn.get_postgres_connection_pool()),
+        DatabaseBackend::Sqlite => sample_pool!(conn.get_sqlite_connection_pool()),
+        DatabaseBackend::MySql => sample_pool!(conn.get_mysql_connection_pool()),
+    }
+
+    let (records, batches) = tinycloud.read_audit_commit_stats();
+    crate::prometheus::add_read_audit_stats(
+        records.saturating_sub(last_read_audit.0),
+        batches.saturating_sub(last_read_audit.1),
+    );
+    *last_read_audit = (records, batches);
+}
+
+/// Run one retention sweep: prune terminal hook deliveries and expired signed
+/// KV tickets older than the configured windows, in bounded batches. Errors are
+/// logged (not fatal) — this is a periodic background maintenance pass.
+async fn run_retention_sweep(conn: &DatabaseConnection, retention: &config::RetentionConfig) {
+    use time::format_description::well_known::Rfc3339;
+
+    let now = time::OffsetDateTime::now_utc();
+    let cutoff = |days: u32| {
+        (now - time::Duration::days(days as i64))
+            .format(&Rfc3339)
+            .expect("current timestamps should format as RFC3339")
+    };
+
+    let delivered_before = cutoff(retention.hook_delivered_days);
+    match tinycloud_core::db::prune_delivered_hook_deliveries(
+        conn,
+        &delivered_before,
+        retention.batch_rows,
+    )
+    .await
+    {
+        Ok(deleted) if deleted > 0 => {
+            ::tracing::info!(deleted, "retention: pruned delivered hook deliveries")
+        }
+        Ok(_) => {}
+        Err(error) => {
+            ::tracing::warn!(?error, "retention: delivered hook delivery prune failed")
+        }
+    }
+
+    let dead_letter_before = cutoff(retention.hook_dead_letter_days);
+    match tinycloud_core::db::prune_dead_letter_hook_deliveries(
+        conn,
+        &dead_letter_before,
+        retention.batch_rows,
+    )
+    .await
+    {
+        Ok(deleted) if deleted > 0 => {
+            ::tracing::info!(deleted, "retention: pruned dead-letter hook deliveries")
+        }
+        Ok(_) => {}
+        Err(error) => {
+            ::tracing::warn!(?error, "retention: dead-letter hook delivery prune failed")
+        }
+    }
+
+    let expired_before = cutoff(retention.ticket_expired_days);
+    match tinycloud_core::db::prune_expired_signed_kv_tickets(
+        conn,
+        &expired_before,
+        retention.batch_rows,
+    )
+    .await
+    {
+        Ok(deleted) if deleted > 0 => {
+            ::tracing::info!(deleted, "retention: pruned expired signed KV tickets")
+        }
+        Ok(_) => {}
+        Err(error) => ::tracing::warn!(?error, "retention: signed KV ticket prune failed"),
+    }
+}
+
+pub(crate) async fn resolve_keys(keys: &Keys) -> Result<StaticSecret> {
     match keys {
         Keys::Static(s) => Ok(s.clone().try_into()?),
         #[cfg(feature = "dstack")]

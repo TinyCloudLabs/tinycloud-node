@@ -724,8 +724,19 @@ mod tests {
 
         // Apply every migration up to (but not including) TC-282, seed
         // realistic data volumes, then observe the BEFORE plans.
+        //
+        // TC-381: this used to assume TC-282 was the last registered
+        // migration and stop at `migrations.len() - 1`. Three migrations have
+        // since been added after it, so the "BEFORE" phase was quietly running
+        // TC-282 itself and observing SEARCHes where it asserted SCANs. Locate
+        // this migration by name so the cutoff cannot drift again.
         let migrations = Migrator::migrations();
-        let before_this = (migrations.len() - 1) as u32;
+        let this_migration = Migration.name();
+        let before_this = migrations
+            .iter()
+            .position(|migration| migration.name() == this_migration)
+            .unwrap_or_else(|| panic!("{this_migration} must be registered in Migrator"))
+            as u32;
         Migrator::up(&db, Some(before_this)).await.unwrap();
         let seed = seed_representative_data(&db).await.unwrap();
 
@@ -807,7 +818,12 @@ mod tests {
 
         // down() drops all 11 and leaves the schema exactly as it was
         // before TC-282 ran.
-        Migrator::down(&db, Some(1)).await.unwrap();
+        //
+        // TC-381: `Some(1)` assumed TC-282 was the last applied migration and
+        // silently began rolling back an unrelated later migration instead.
+        // Roll back everything from the end down to and including TC-282.
+        let rollback = migrations.len() as u32 - before_this;
+        Migrator::down(&db, Some(rollback)).await.unwrap();
         for (_, table, index_name) in EXPECTED_INDEXES
             .iter()
             .map(|(name, table, _)| (*name, *table, *name))
@@ -833,5 +849,63 @@ mod tests {
 
         // Sanity check: seeding actually produced the volumes we assumed.
         assert_eq!(delegation::Entity::find().count(&db).await.unwrap(), 301);
+    }
+
+    /// TC-319: `transact` now computes the next per-space sequence with one
+    /// ungrouped `SELECT MAX(seq) FROM event_order WHERE space = ?` per space
+    /// (instead of a `GROUP BY space` aggregate). With `idx_event_order_space_seq`
+    /// present that query must resolve via a backward index seek (SEARCH), not a
+    /// table SCAN — the whole point of the rewrite.
+    #[tokio::test]
+    async fn ungrouped_per_space_max_seq_searches_event_order_index() {
+        let db = database().await;
+        Migrator::up(&db, None).await.unwrap();
+
+        // Two spaces with enough rows that the planner prefers a seek over a
+        // scan and the probed space's MAX(seq) genuinely skips the other's rows.
+        let space = test_space_id("tc319-space");
+        let other_space = test_space_id("tc319-other-space");
+        let epoch_id = hash(b"tc319-epoch");
+        for i in 0..300i64 {
+            event_order::ActiveModel {
+                seq: Set(i),
+                epoch: Set(epoch_id),
+                epoch_seq: Set(i),
+                event: Set(hash(format!("tc319-event-{i}").as_bytes())),
+                space: Set(SpaceIdWrap(if i % 2 == 0 {
+                    space.clone()
+                } else {
+                    other_space.clone()
+                })),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        db.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "ANALYZE".to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let plan = explain(
+            &db,
+            format!(
+                "SELECT MAX(seq) FROM event_order WHERE space = '{}'",
+                space.to_string().replace('\'', "''")
+            ),
+        )
+        .await;
+        println!("TC-319 ungrouped MAX(seq) plan: {plan:?}");
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("SEARCH") && line.contains("idx_event_order_space_seq")),
+            "ungrouped per-space MAX(seq) must SEARCH idx_event_order_space_seq, got {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|line| line.contains("SCAN")),
+            "ungrouped per-space MAX(seq) must not SCAN event_order, got {plan:?}"
+        );
     }
 }

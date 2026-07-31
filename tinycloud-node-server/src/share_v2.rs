@@ -36,6 +36,8 @@ use tinycloud_auth::{
 };
 use tinycloud_core::{
     encryption::{maybe_decrypt, ColumnEncryption},
+    encryption_network::NetworkId,
+    hash::Hash,
     keys::StaticSecret,
     models::{
         abilities, delegation, invocation as invocation_model, owner_share_policy, revocation,
@@ -45,7 +47,7 @@ use tinycloud_core::{
     policy_capability::jcs,
     relationships::parent_delegations,
     sea_orm::{
-        sea_query::Expr, ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection,
+        sea_query::Expr, ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr,
         EntityTrait, PaginatorTrait, QueryFilter, QuerySelect, Set, TransactionTrait,
     },
     share_email::invitation::{Ed25519InvitationSigner, InvitationSigner},
@@ -154,6 +156,64 @@ pub struct ShareV2Runtime {
     verifier: Option<ExactEmailVerifier>,
 }
 
+/// Probes that the `owner_share_policy` table is queryable.
+///
+/// The projection and the deserialization target must agree: `select_only()`
+/// narrows the SQL projection to a single column, so the rows have to be read
+/// back as that column's type. Reading them back as the full entity `Model`
+/// makes the query succeed on an empty table and fail with
+/// `ColumnNotFound` the moment a single row exists (TC-349).
+async fn probe_owner_share_policy_lookup(conn: &DatabaseConnection) -> Result<(), DbErr> {
+    owner_share_policy::Entity::find()
+        .select_only()
+        .column(owner_share_policy::Column::PolicyCid)
+        .limit(1)
+        .into_tuple::<String>()
+        .all(conn)
+        .await
+        .map(|_| ())
+}
+
+/// Probes that the `delegation` and `revocation` tables are queryable.
+///
+/// See [`probe_owner_share_policy_lookup`] for why the rows are read back as
+/// the projected column's type rather than as the entity `Model`.
+async fn probe_delegation_revocation_lookup(conn: &DatabaseConnection) -> Result<(), DbErr> {
+    delegation::Entity::find()
+        .select_only()
+        .column(delegation::Column::Id)
+        .limit(1)
+        .into_tuple::<Hash>()
+        .all(conn)
+        .await?;
+    revocation::Entity::find()
+        .select_only()
+        .column(revocation::Column::Id)
+        .limit(1)
+        .into_tuple::<Hash>()
+        .all(conn)
+        .await?;
+    Ok(())
+}
+
+/// Runs a readiness probe and reports the underlying [`DbErr`] before it is
+/// collapsed into a boolean, so a failing check is diagnosable from the logs
+/// rather than only inferable from `ready: false`.
+fn report_probe(check: &str, result: Result<(), DbErr>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::error!(
+                check,
+                error = %error,
+                error_debug = ?error,
+                "share v2 readiness probe failed"
+            );
+            false
+        }
+    }
+}
+
 impl ShareV2Runtime {
     fn static_ready(&self) -> bool {
         self.config.enabled
@@ -219,26 +279,14 @@ impl ShareV2Runtime {
     }
 
     async fn readiness(&self) -> ReadinessResponse {
-        let migration = owner_share_policy::Entity::find()
-            .limit(1)
-            .all(&self.conn)
-            .await
-            .is_ok()
-            && self.encryption_probe();
-        let graph = delegation::Entity::find()
-            .select_only()
-            .column(delegation::Column::Id)
-            .limit(1)
-            .all(&self.conn)
-            .await
-            .is_ok()
-            && revocation::Entity::find()
-                .select_only()
-                .column(revocation::Column::Id)
-                .limit(1)
-                .all(&self.conn)
-                .await
-                .is_ok();
+        let migration = report_probe(
+            "migration",
+            probe_owner_share_policy_lookup(&self.conn).await,
+        ) && self.encryption_probe();
+        let graph = report_probe(
+            "delegation_revocation_lookup",
+            probe_delegation_revocation_lookup(&self.conn).await,
+        );
         let checks = self.checks(migration, graph);
         let ready = checks.migration
             && checks.encrypted_storage
@@ -263,6 +311,63 @@ impl ShareV2Runtime {
     }
 }
 
+/// TC-359: refuse to compose when the configured invitation key is not the key
+/// this node derives and signs with.
+///
+/// `shareEmail.invitationPublicKey` is what every relying party — the share
+/// site, the witness, the recipient's browser — verifies invitation signatures
+/// against. The signing half is derived here from the node's own key material
+/// (the dstack KMS in production). Nothing downstream compared the two, so a
+/// mismatch produced no error anywhere: composition succeeded, readiness went
+/// `ready: true`, invitations were minted and signed — and every verifier
+/// silently rejected them. The only visible symptom was non-delivery.
+///
+/// A node that refuses to start with a wrong key is strictly better than one
+/// that advertises a capability it can never fulfil, so this is fail-closed.
+/// It only runs when `shareEmail.enabled` is set, so it cannot take down a
+/// node that is not serving shares.
+fn verify_configured_invitation_key(
+    config: &ShareEmailConfig,
+    key_setup: &StaticSecret,
+) -> anyhow::Result<()> {
+    let derived = key_setup.share_invitation_public_key();
+    let Some(encoded) = config.invitation_public_key.as_deref() else {
+        ::tracing::error!(
+            derived_invitation_public_key = %encode_config(derived, URL_SAFE_NO_PAD),
+            "share v2 is enabled but shareEmail.invitationPublicKey is unset"
+        );
+        anyhow::bail!(
+            "share v2 is enabled but shareEmail.invitationPublicKey is unset; this node derives \
+             {} — read it from GET /.well-known/tinycloud/node-keys",
+            encode_config(derived, URL_SAFE_NO_PAD)
+        );
+    };
+    let configured = decode_config(encoded, URL_SAFE_NO_PAD)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "shareEmail.invitationPublicKey must be 32 bytes of unpadded base64url, got {encoded:?}"
+            )
+        })?;
+    if configured != derived {
+        ::tracing::error!(
+            configured_invitation_public_key = %encode_config(configured, URL_SAFE_NO_PAD),
+            derived_invitation_public_key = %encode_config(derived, URL_SAFE_NO_PAD),
+            "configured share invitation key does not match the node's derived signing key"
+        );
+        anyhow::bail!(
+            "shareEmail.invitationPublicKey is {configured}, but this node signs share \
+             invitations with {derived}. Every relying party would reject this node's \
+             invitations and shares would silently never be delivered. Read the correct value \
+             from GET /.well-known/tinycloud/node-keys and repin the trust bundle.",
+            configured = encode_config(configured, URL_SAFE_NO_PAD),
+            derived = encode_config(derived, URL_SAFE_NO_PAD),
+        );
+    }
+    Ok(())
+}
+
 pub async fn compose(
     conn: DatabaseConnection,
     key_setup: &StaticSecret,
@@ -271,27 +376,12 @@ pub async fn compose(
     tee_key_derived: bool,
     tinycloud: Arc<crate::TinyCloud>,
 ) -> anyhow::Result<ShareV2Runtime> {
-    let migration_ready = owner_share_policy::Entity::find()
-        .select_only()
-        .column(owner_share_policy::Column::PolicyCid)
-        .limit(1)
-        .all(&conn)
-        .await
-        .is_ok();
-    let graph_ready = delegation::Entity::find()
-        .select_only()
-        .column(delegation::Column::Id)
-        .limit(1)
-        .all(&conn)
-        .await
-        .is_ok()
-        && revocation::Entity::find()
-            .select_only()
-            .column(revocation::Column::Id)
-            .limit(1)
-            .all(&conn)
-            .await
-            .is_ok();
+    verify_configured_invitation_key(&config, key_setup)?;
+    let migration_ready = report_probe("migration", probe_owner_share_policy_lookup(&conn).await);
+    let graph_ready = report_probe(
+        "delegation_revocation_lookup",
+        probe_delegation_revocation_lookup(&conn).await,
+    );
     let signing_seed = key_setup.derive_key(b"tinycloud/share-email/invitation-signing");
     let signing_secret =
         tinycloud_core::libp2p::identity::ed25519::SecretKey::try_from_bytes(signing_seed)
@@ -503,13 +593,25 @@ struct EnforcementFacts {
     space_id: String,
     path: String,
     actions: Vec<String>,
+    #[serde(
+        default,
+        rename = "decryptionNetworkId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    decryption_network_id: Option<String>,
+    #[serde(
+        default,
+        rename = "decryptionAction",
+        skip_serializing_if = "Option::is_none"
+    )]
+    decryption_action: Option<String>,
     #[serde(rename = "contentSourceDigest")]
     content_source_digest: String,
     #[serde(rename = "expiresAt")]
     expires_at: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyEnvelope {
     domain: String,
@@ -537,6 +639,8 @@ struct SdkPolicyDocument {
     content_source_digest: String,
     actions: Vec<String>,
     resource: SdkResource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decryption: Option<DecryptionGrant>,
     #[serde(rename = "expiresAt")]
     expires_at: String,
     #[serde(rename = "ownerDelegationCid")]
@@ -559,7 +663,7 @@ struct SdkResource {
     path: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyDocument {
     #[serde(rename = "type")]
@@ -576,6 +680,8 @@ struct PolicyDocument {
     target: PolicyTarget,
     resource: ExactResource,
     actions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decryption: Option<DecryptionGrant>,
     #[serde(rename = "contentSource")]
     content_source: ContentSource,
     #[serde(rename = "contentSourceDigest")]
@@ -612,6 +718,13 @@ struct ExactResource {
     path: String,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct DecryptionGrant {
+    network_id: String,
+    action: String,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 struct ContentSource {
@@ -636,6 +749,8 @@ struct Registration {
     target: RegistrationTarget,
     resource: ExactResource,
     actions: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decryption: Option<DecryptionGrant>,
     content_source: ContentSource,
     content_source_digest: String,
     registered_at: String,
@@ -755,6 +870,7 @@ pub async fn register_policy(
             path: policy.policy.resource.path.clone(),
         },
         actions: policy.policy.actions.clone(),
+        decryption: policy.policy.decryption.clone(),
         content_source: policy.policy.content_source.clone(),
         content_source_digest: request.content_source_digest.clone(),
         registered_at,
@@ -926,6 +1042,7 @@ fn parse_sdk_policy(
         || facts.space_id != sdk.content_source.space
         || facts.path != sdk.resource.path
         || facts.actions != sdk.actions
+        || !decryption_facts_match(sdk.decryption.as_ref(), facts)
         || facts.content_source_digest != sdk.content_source_digest
         || facts.owner_delegation_cid != request.owner_delegation.cid
     {
@@ -951,6 +1068,7 @@ fn parse_sdk_policy(
                 path: sdk.resource.path,
             },
             actions: sdk.actions,
+            decryption: sdk.decryption,
             content_source: ContentSource {
                 kind: sdk.content_source.kind,
                 space: sdk.content_source.space,
@@ -962,6 +1080,11 @@ fn parse_sdk_policy(
             expires_at: sdk.expires_at,
         },
     })
+}
+
+fn decryption_facts_match(decryption: Option<&DecryptionGrant>, facts: &EnforcementFacts) -> bool {
+    facts.decryption_network_id.as_deref() == decryption.map(|grant| grant.network_id.as_str())
+        && facts.decryption_action.as_deref() == decryption.map(|grant| grant.action.as_str())
 }
 
 fn sdk_policy_document_value(value: &Value) -> Result<&Value, ()> {
@@ -995,6 +1118,7 @@ fn validate_policy(
         || policy.content_source.action != "tinycloud.kv/get"
         || policy.content_source.path != policy.resource.path
         || policy.content_source.space != policy.target.space_id
+        || validate_decryption_grant(policy.decryption.as_ref(), &policy.owner_did).is_err()
     {
         return Err(());
     }
@@ -1077,6 +1201,23 @@ fn validate_policy(
     Ok(())
 }
 
+fn validate_decryption_grant(
+    decryption: Option<&DecryptionGrant>,
+    owner_did: &str,
+) -> Result<(), ()> {
+    let Some(decryption) = decryption else {
+        return Ok(());
+    };
+    let network: NetworkId = decryption.network_id.parse().map_err(|_| ())?;
+    if decryption.action != "tinycloud.encryption/decrypt"
+        || network.name() != "default"
+        || !did_principal_matches(network.owner_did(), owner_did)
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
 fn verify_policy_proof(share_key_did: &str, policy_bytes: &[u8], proof: &str) -> Result<(), ()> {
     let signature = decode_canonical_b64(proof, 64)?;
     if signature.len() != 64 {
@@ -1142,8 +1283,18 @@ async fn verify_owner_delegation(
         .all(&runtime.conn)
         .await
         .map_err(|_| ())?;
-    if abilities.len() != policy.actions.len() {
+    if !owner_delegation_abilities_match(policy, &abilities) {
         return Err(());
+    }
+    Ok(())
+}
+
+fn owner_delegation_abilities_match(
+    policy: &PolicyDocument,
+    abilities: &[abilities::Model],
+) -> bool {
+    if abilities.len() != policy.actions.len() + usize::from(policy.decryption.is_some()) {
+        return false;
     }
     for action in &policy.actions {
         let has_exact = abilities.iter().any(|ability| {
@@ -1162,10 +1313,34 @@ async fn verify_owner_delegation(
                     })
         });
         if !has_exact {
-            return Err(());
+            return false;
         }
     }
-    Ok(())
+    if let Some(decryption) = policy.decryption.as_ref() {
+        if validate_decryption_grant(Some(decryption), &policy.owner_did).is_err() {
+            return false;
+        }
+        let Ok(expected_network) = decryption.network_id.parse::<NetworkId>() else {
+            return false;
+        };
+        let decrypt_abilities = abilities
+            .iter()
+            .filter(|ability| {
+                ability.ability.to_string() == decryption.action
+                    && match &ability.resource {
+                        Resource::Other(resource) => resource
+                            .as_str()
+                            .parse::<NetworkId>()
+                            .is_ok_and(|network| network == expected_network),
+                        Resource::TinyCloud(_) => false,
+                    }
+            })
+            .count();
+        if decrypt_abilities != 1 {
+            return false;
+        }
+    }
+    true
 }
 
 async fn verify_delegation_signature(delegation: &TinyCloudDelegation) -> Result<(), ()> {
@@ -1521,6 +1696,8 @@ struct V2OuterEnvelope {
     target: PolicyTarget,
     resource: ExactResource,
     actions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decryption: Option<DecryptionGrant>,
     content_source: Value,
     content_source_digest: String,
     expires_at: String,
@@ -1531,6 +1708,7 @@ fn verify_outer_envelope(
     outer: &Value,
     request: &V2ChallengeRequest,
     share_key_did: &str,
+    decryption: Option<&DecryptionGrant>,
 ) -> Result<OffsetDateTime, ()> {
     let envelope: V2OuterEnvelope = serde_json::from_value(outer.clone()).map_err(|_| ())?;
     let normalized = serde_json::to_value(&envelope).map_err(|_| ())?;
@@ -1558,12 +1736,13 @@ fn verify_outer_envelope(
         || !matches!(envelope.resource.kind.as_str(), "exact" | "prefix")
         || envelope.resource.path != request.resource
         || envelope.actions != request.actions
+        || !decryption_binding_matches(envelope.decryption.as_ref(), decryption)
         || envelope.content_source != request.content_source
         || envelope.content_source_digest != request.content_source_digest
     {
         return Err(());
     }
-    let envelope_identity = serde_json::json!({
+    let mut envelope_identity = serde_json::json!({
         "schema": envelope.schema.clone(),
         "version": envelope.version,
         "shareId": envelope.share_id.clone(),
@@ -1576,6 +1755,12 @@ fn verify_outer_envelope(
         "contentSourceDigest": envelope.content_source_digest.clone(),
         "expiresAt": envelope.expires_at.clone(),
     });
+    if let Some(decryption) = envelope.decryption.as_ref() {
+        envelope_identity.as_object_mut().ok_or(())?.insert(
+            "decryption".to_owned(),
+            serde_json::to_value(decryption).map_err(|_| ())?,
+        );
+    }
     if raw_sha256_cid(&jcs::canonicalize(&envelope_identity)) != envelope.envelope_cid {
         return Err(());
     }
@@ -1605,6 +1790,13 @@ fn verify_outer_envelope(
         return Err(());
     }
     Ok(expiry)
+}
+
+fn decryption_binding_matches(
+    actual: Option<&DecryptionGrant>,
+    expected: Option<&DecryptionGrant>,
+) -> bool {
+    actual == expected
 }
 
 async fn registered_policy(
@@ -1660,6 +1852,7 @@ async fn registered_policy(
                     path: sdk.resource.path,
                 },
                 actions: sdk.actions,
+                decryption: sdk.decryption,
                 content_source: ContentSource {
                     kind: sdk.content_source.kind,
                     space: sdk.content_source.space,
@@ -1700,6 +1893,16 @@ async fn registered_policy(
                     space_id: row.space_id.clone(),
                     path: row.resource_path.clone(),
                     actions: serde_json::from_value(row.actions.clone()).map_err(|_| ())?,
+                    decryption_network_id: policy
+                        .policy
+                        .decryption
+                        .as_ref()
+                        .map(|grant| grant.network_id.clone()),
+                    decryption_action: policy
+                        .policy
+                        .decryption
+                        .as_ref()
+                        .map(|grant| grant.action.clone()),
                     content_source_digest: row.content_source_digest.clone(),
                     expires_at: row.expires_at.clone(),
                 },
@@ -1945,7 +2148,7 @@ fn runtime_delegation_facts(
     vp_digest: &str,
     expires_at: &str,
 ) -> Value {
-    serde_json::json!({
+    let mut facts = serde_json::json!({
         "ownerDelegationCid": registered.row.owner_delegation_cid,
         "policyCid": registered.row.policy_cid,
         "registrationCid": registered.row.registration_cid,
@@ -1964,7 +2167,21 @@ fn runtime_delegation_facts(
         "credentialDigest": credential_digest,
         "vpDigest": vp_digest,
         "expiresAt": expires_at,
-    })
+    });
+    if let Some(decryption) = registered.envelope.policy.decryption.as_ref() {
+        let object = facts
+            .as_object_mut()
+            .expect("runtime delegation facts are an object");
+        object.insert(
+            "decryptionNetworkId".to_owned(),
+            Value::String(decryption.network_id.clone()),
+        );
+        object.insert(
+            "decryptionAction".to_owned(),
+            Value::String(decryption.action.clone()),
+        );
+    }
+    facts
 }
 
 async fn create_runtime_delegation(
@@ -2178,6 +2395,7 @@ pub async fn policy_challenge_v2(
         &request.outer_envelope,
         &request,
         &registered.row.share_key_did,
+        registered.envelope.policy.decryption.as_ref(),
     )
     .map_err(|_| share_error("policy_denied"))?;
     if outer_expiry > registered.expiry {
@@ -3190,12 +3408,228 @@ mod tests {
     }
 
     #[test]
+    fn decryption_grant_is_limited_to_the_owner_default_network() {
+        let owner_did = "did:pkh:eip155:1:0x1111111111111111111111111111111111111111";
+        let valid = DecryptionGrant {
+            network_id: format!("urn:tinycloud:encryption:{owner_did}:default"),
+            action: "tinycloud.encryption/decrypt".to_owned(),
+        };
+        assert!(validate_decryption_grant(Some(&valid), owner_did).is_ok());
+        assert!(validate_decryption_grant(None, owner_did).is_ok());
+
+        let wrong_owner = DecryptionGrant {
+            network_id: "urn:tinycloud:encryption:did:pkh:eip155:1:0x2222222222222222222222222222222222222222:default".to_owned(),
+            action: valid.action.clone(),
+        };
+        assert!(validate_decryption_grant(Some(&wrong_owner), owner_did).is_err());
+
+        let wrong_network = DecryptionGrant {
+            network_id: format!("urn:tinycloud:encryption:{owner_did}:backup"),
+            action: valid.action.clone(),
+        };
+        assert!(validate_decryption_grant(Some(&wrong_network), owner_did).is_err());
+
+        let overbroad_action = DecryptionGrant {
+            network_id: valid.network_id.clone(),
+            action: "tinycloud.encryption/*".to_owned(),
+        };
+        assert!(validate_decryption_grant(Some(&overbroad_action), owner_did).is_err());
+    }
+
+    fn stored_ability(resource: Resource, action: &str) -> abilities::Model {
+        abilities::Model {
+            resource,
+            ability: tinycloud_core::types::Ability::try_from(action.to_owned()).unwrap(),
+            delegation: tinycloud_core::hash::hash(b"owner-delegation"),
+            caveats: Default::default(),
+        }
+    }
+
+    fn policy_ability(policy: &PolicyDocument, action: &str) -> abilities::Model {
+        let space: tinycloud_auth::resource::SpaceId = policy.target.space_id.parse().unwrap();
+        let service: tinycloud_auth::resource::Service = "kv".parse().unwrap();
+        let path: tinycloud_auth::resource::Path = policy.resource.path.parse().unwrap();
+        stored_ability(
+            Resource::TinyCloud(space.to_resource(service, Some(path), None, None)),
+            action,
+        )
+    }
+
+    #[test]
+    fn owner_delegation_ability_matrix_requires_exact_kv_and_decrypt_scope() {
+        let (mut envelope, _, _) = sample_policy();
+        let owner_did = "did:pkh:eip155:1:0x1111111111111111111111111111111111111111";
+        envelope.policy.owner_did = owner_did.to_owned();
+        envelope.policy.target.space_id =
+            "tinycloud:pkh:eip155:1:0x1111111111111111111111111111111111111111:applications"
+                .to_owned();
+        let decryption = DecryptionGrant {
+            network_id: format!("urn:tinycloud:encryption:{owner_did}:default"),
+            action: "tinycloud.encryption/decrypt".to_owned(),
+        };
+        envelope.policy.decryption = Some(decryption.clone());
+        let kv_abilities = envelope
+            .policy
+            .actions
+            .iter()
+            .map(|action| policy_ability(&envelope.policy, action))
+            .collect::<Vec<_>>();
+        let decrypt_ability =
+            stored_ability(decryption.network_id.parse().unwrap(), &decryption.action);
+
+        let mut valid = kv_abilities.clone();
+        valid.push(decrypt_ability.clone());
+        assert!(owner_delegation_abilities_match(&envelope.policy, &valid));
+
+        assert!(!owner_delegation_abilities_match(
+            &envelope.policy,
+            &kv_abilities
+        ));
+
+        let mut wrong_network = kv_abilities.clone();
+        wrong_network.push(stored_ability(
+            format!("urn:tinycloud:encryption:{owner_did}:backup")
+                .parse()
+                .unwrap(),
+            &decryption.action,
+        ));
+        assert!(!owner_delegation_abilities_match(
+            &envelope.policy,
+            &wrong_network
+        ));
+
+        let mut extra_action = valid.clone();
+        extra_action.push(stored_ability(
+            decryption.network_id.parse().unwrap(),
+            "tinycloud.encryption/manage",
+        ));
+        assert!(!owner_delegation_abilities_match(
+            &envelope.policy,
+            &extra_action
+        ));
+
+        let mut duplicate_decrypt = valid.clone();
+        duplicate_decrypt.push(decrypt_ability);
+        assert!(!owner_delegation_abilities_match(
+            &envelope.policy,
+            &duplicate_decrypt
+        ));
+
+        envelope.policy.decryption = None;
+        assert!(owner_delegation_abilities_match(
+            &envelope.policy,
+            &kv_abilities
+        ));
+        assert!(!owner_delegation_abilities_match(&envelope.policy, &valid));
+    }
+
+    #[test]
+    fn decryption_binding_mutations_are_rejected_or_change_artifact_identity() {
+        let (mut envelope, mut request, config) = sample_policy();
+        let owner_did = "did:pkh:eip155:1:0x1111111111111111111111111111111111111111";
+        let decryption = DecryptionGrant {
+            network_id: format!("urn:tinycloud:encryption:{owner_did}:default"),
+            action: "tinycloud.encryption/decrypt".to_owned(),
+        };
+        envelope.policy.owner_did = owner_did.to_owned();
+        envelope.policy.decryption = Some(decryption.clone());
+        request.enforcement_delegation.facts.decryption_network_id =
+            Some(decryption.network_id.clone());
+        request.enforcement_delegation.facts.decryption_action = Some(decryption.action.clone());
+
+        let policy_value = serde_json::to_value(&envelope).unwrap();
+        assert!(parse_sdk_policy(&policy_value, &request, &config, "did:key:z6MkEnforcer").is_ok());
+
+        let mut omitted_policy = policy_value.clone();
+        omitted_policy["policy"]
+            .as_object_mut()
+            .unwrap()
+            .remove("decryption");
+        assert!(
+            parse_sdk_policy(&omitted_policy, &request, &config, "did:key:z6MkEnforcer").is_err()
+        );
+
+        let mut tampered_policy = policy_value.clone();
+        tampered_policy["policy"]["decryption"]["networkId"] =
+            Value::String(format!("urn:tinycloud:encryption:{owner_did}:backup"));
+        assert!(
+            parse_sdk_policy(&tampered_policy, &request, &config, "did:key:z6MkEnforcer").is_err()
+        );
+
+        let mut unknown_policy_field = policy_value.clone();
+        unknown_policy_field["policy"]["decryption"]["scope"] = Value::String("*".to_owned());
+        assert!(parse_sdk_policy(
+            &unknown_policy_field,
+            &request,
+            &config,
+            "did:key:z6MkEnforcer"
+        )
+        .is_err());
+
+        let registration_core = serde_json::json!({
+            "policyCid": "bafy-policy",
+            "ownerDelegationCid": "bafy-owner",
+            "enforcementDelegationCid": "bafy-enforcement",
+            "ownerDid": owner_did,
+            "shareKeyDid": "did:key:z6MkShare",
+            "enforcerDid": "did:key:z6MkEnforcer",
+            "shareId": "share-1",
+            "recipientMatcher": {"kind": "exactEmail", "value": "alice@example.com"},
+            "target": {
+                "origin": config.target_origin,
+                "nodeAudience": config.node_audience,
+                "enforcerDid": "did:key:z6MkEnforcer",
+                "spaceId": "applications"
+            },
+            "resource": {"kind": "exact", "path": "shares/share-1/document.md"},
+            "actions": ["tinycloud.kv/get", "tinycloud.kv/metadata"],
+            "decryption": decryption,
+            "contentSource": envelope.policy.content_source,
+            "contentSourceDigest": envelope.policy.content_source_digest,
+            "registeredAt": "2098-01-01T00:00:00.000Z",
+            "expiresAt": "2099-01-01T00:00:00.000Z"
+        });
+        let registration_cid = raw_sha256_cid(&jcs::canonicalize(&registration_core));
+        let mut omitted_registration = registration_core.clone();
+        omitted_registration
+            .as_object_mut()
+            .unwrap()
+            .remove("decryption");
+        assert_ne!(
+            raw_sha256_cid(&jcs::canonicalize(&omitted_registration)),
+            registration_cid
+        );
+        let mut tampered_registration = registration_core.clone();
+        tampered_registration["decryption"]["action"] =
+            Value::String("tinycloud.encryption/*".to_owned());
+        assert_ne!(
+            raw_sha256_cid(&jcs::canonicalize(&tampered_registration)),
+            registration_cid
+        );
+
+        let wrong_decryption = DecryptionGrant {
+            network_id: format!("urn:tinycloud:encryption:{owner_did}:backup"),
+            action: "tinycloud.encryption/decrypt".to_owned(),
+        };
+        assert!(decryption_binding_matches(
+            Some(&decryption),
+            Some(&decryption)
+        ));
+        assert!(!decryption_binding_matches(None, Some(&decryption)));
+        assert!(!decryption_binding_matches(
+            Some(&wrong_decryption),
+            Some(&decryption)
+        ));
+    }
+
+    #[test]
     fn outer_envelope_rejects_unsigned_wrappers_and_unknown_fields() {
         let request = sample_v2_challenge();
         assert!(verify_outer_envelope(
             &serde_json::json!({"envelope": {}}),
             &request,
-            "did:key:z6MkShare"
+            "did:key:z6MkShare",
+            None,
         )
         .is_err());
         let mut value = serde_json::json!({
@@ -3215,9 +3649,9 @@ mod tests {
             "signature": {"signerDid": "did:key:z6MkShare", "algorithm": "Ed25519", "value": "signature"},
             "unsignedExtra": true
         });
-        assert!(verify_outer_envelope(&value, &request, "did:key:z6MkShare").is_err());
+        assert!(verify_outer_envelope(&value, &request, "did:key:z6MkShare", None).is_err());
         value.as_object_mut().unwrap().remove("unsignedExtra");
-        assert!(verify_outer_envelope(&value, &request, "did:key:z6MkShare").is_err());
+        assert!(verify_outer_envelope(&value, &request, "did:key:z6MkShare", None).is_err());
     }
 
     #[test]
@@ -3661,7 +4095,11 @@ mod tests {
     // capability. Proves the canonical local launch reaches ready:true and
     // that ordinary production startup (no TEE context) stays fail-closed.
 
-    fn local_tee_share_v2_config() -> ShareEmailConfig {
+    /// TC-359: the invitation key is pinned to the key the node under test
+    /// actually derives, exactly as a correctly provisioned deployment pins
+    /// it. A hardcoded fixture key here would be the very misconfiguration
+    /// `verify_configured_invitation_key` exists to reject.
+    fn local_tee_share_v2_config(key_setup: &StaticSecret) -> ShareEmailConfig {
         ShareEmailConfig {
             enabled: true,
             target_origin: "https://node.internal.tinycloud".into(),
@@ -3670,7 +4108,10 @@ mod tests {
             allowed_origins: vec!["https://share.tinycloud.xyz".into()],
             node_signing_kid: "did:web:node.internal.tinycloud#invitation-key-1".into(),
             invitation_kid: "did:web:node.internal.tinycloud#invitation-key-1".into(),
-            invitation_public_key: Some("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".into()),
+            invitation_public_key: Some(encode_config(
+                key_setup.share_invitation_public_key(),
+                URL_SAFE_NO_PAD,
+            )),
             issuer_did: "did:web:issuer.credentials.org".into(),
             issuer_kid: "did:web:issuer.credentials.org#email-signing-key-1".into(),
             issuer_key_version: 1,
@@ -3703,13 +4144,118 @@ mod tests {
         compose(
             conn,
             key_setup,
-            local_tee_share_v2_config(),
+            local_tee_share_v2_config(key_setup),
             tee_context,
             tee_key_derived,
             Arc::new(tinycloud),
         )
         .await
         .expect("share v2 runtime composes")
+    }
+
+    /// TC-359. Production published `tv7Sn8LztrteJyVgwP9aQL6b1kuiDq9CePhTx19HyrI`
+    /// — a hardcoded development fixture — as `nodeInvitationPublicKey` while
+    /// the CVM signed with a dstack-derived key nobody could read. Composition
+    /// accepted it, readiness reported healthy, and shares silently never
+    /// arrived. Composition must now refuse.
+    #[tokio::test]
+    async fn a_mismatched_invitation_key_fails_composition_loudly() {
+        let key_setup = StaticSecret::new(vec![0x42u8; 32]).expect("32-byte test secret");
+        let mut config = local_tee_share_v2_config(&key_setup);
+        // The exact fixture string production shipped.
+        config.invitation_public_key = Some("tv7Sn8LztrteJyVgwP9aQL6b1kuiDq9CePhTx19HyrI".into());
+
+        let error = verify_configured_invitation_key(&config, &key_setup)
+            .expect_err("a wrong invitation key must fail composition");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("tv7Sn8LztrteJyVgwP9aQL6b1kuiDq9CePhTx19HyrI"),
+            "the error must name the configured key: {message}"
+        );
+        assert!(
+            message.contains(&encode_config(
+                key_setup.share_invitation_public_key(),
+                URL_SAFE_NO_PAD
+            )),
+            "the error must name the key the node actually signs with: {message}"
+        );
+        assert!(
+            message.contains("/.well-known/tinycloud/node-keys"),
+            "the error must say where to read the correct key: {message}"
+        );
+    }
+
+    /// A missing key is the same failure mode as a wrong one: nothing to
+    /// verify against, so nothing would ever be delivered.
+    #[tokio::test]
+    async fn a_missing_invitation_key_fails_composition() {
+        let key_setup = StaticSecret::new(vec![0x42u8; 32]).expect("32-byte test secret");
+        let mut config = local_tee_share_v2_config(&key_setup);
+        config.invitation_public_key = None;
+
+        assert!(verify_configured_invitation_key(&config, &key_setup).is_err());
+
+        let mut config = local_tee_share_v2_config(&key_setup);
+        config.invitation_public_key = Some("not-base64url!".into());
+        assert!(verify_configured_invitation_key(&config, &key_setup).is_err());
+    }
+
+    /// The correctly provisioned shape — the config pins exactly what the node
+    /// derives — still composes.
+    #[tokio::test]
+    async fn the_derived_invitation_key_is_accepted() {
+        let key_setup = StaticSecret::new(vec![0x42u8; 32]).expect("32-byte test secret");
+        let config = local_tee_share_v2_config(&key_setup);
+        assert_eq!(
+            config.invitation_public_key.as_deref(),
+            Some(encode_config(key_setup.share_invitation_public_key(), URL_SAFE_NO_PAD).as_str())
+        );
+
+        assert!(verify_configured_invitation_key(&config, &key_setup).is_ok());
+
+        // ...and a runtime composed from it reaches ready.
+        let tee_context = TeeContext::derive_local(&key_setup);
+        let runtime = compose_test_runtime(&key_setup, Some(tee_context), true).await;
+        assert!(runtime.readiness().await.ready);
+    }
+
+    /// The mismatch has to be fatal at the `compose` boundary, not just in the
+    /// helper: that is the boundary `lib.rs` calls.
+    #[tokio::test]
+    async fn compose_refuses_to_build_a_runtime_with_a_mismatched_key() {
+        let key_setup = StaticSecret::new(vec![0x42u8; 32]).expect("32-byte test secret");
+        let mut config = local_tee_share_v2_config(&key_setup);
+        config.invitation_public_key = Some("tv7Sn8LztrteJyVgwP9aQL6b1kuiDq9CePhTx19HyrI".into());
+
+        let conn = migrated_memory_db().await;
+        let directory = tempfile::tempdir().expect("tempdir for local block store");
+        let blocks = crate::BlockConfig::B(crate::storage::file_system::FileSystemConfig::new(
+            directory.path(),
+        ))
+        .open()
+        .await
+        .expect("local block storage opens");
+        let tinycloud = crate::TinyCloud::new(conn.clone(), blocks, key_setup.clone())
+            .await
+            .expect("in-process TinyCloud composes");
+
+        let composed = compose(
+            conn,
+            &key_setup,
+            config,
+            Some(TeeContext::derive_local(&key_setup)),
+            true,
+            Arc::new(tinycloud),
+        )
+        .await;
+
+        let Err(error) = composed else {
+            panic!("compose must fail closed on an invitation-key mismatch");
+        };
+        assert!(error
+            .to_string()
+            .contains("shareEmail.invitationPublicKey is"));
     }
 
     #[tokio::test]
@@ -3751,6 +4297,150 @@ mod tests {
         assert!(
             response.checks.credential_verifier,
             "credential_verifier check must be true"
+        );
+    }
+
+    /// TC-349: the delegation/revocation readiness probe must survive the
+    /// tables being non-empty.
+    ///
+    /// The probe used to `select_only()` a single column and then read the
+    /// rows back as the full entity `Model`. That projection mismatch is
+    /// invisible on an empty table (no row is ever deserialized) and fails
+    /// with `Query(SqlxError(ColumnNotFound("delegator")))` as soon as one
+    /// delegation exists — which is what happens in the addressed-share flow
+    /// between startup and `POST /share/v2/policies`. The runtime then went
+    /// unready mid-run and 503'd with `capability_unavailable`.
+    #[tokio::test]
+    async fn readiness_survives_populated_delegation_and_revocation_tables() {
+        let key_setup = StaticSecret::new(vec![0x42u8; 32]).expect("32-byte test secret");
+        let tee_context = TeeContext::derive_local(&key_setup);
+        let runtime = compose_test_runtime(&key_setup, Some(tee_context), true).await;
+        let conn = runtime.conn.clone();
+
+        assert!(
+            runtime.readiness().await.ready,
+            "the runtime must start ready against empty tables"
+        );
+
+        actor::ActiveModel {
+            id: Set("did:key:tc349-actor".to_owned()),
+        }
+        .insert(&conn)
+        .await
+        .expect("actor row");
+        let delegation_id = hash(b"tc349-delegation");
+        delegation::ActiveModel {
+            id: Set(delegation_id),
+            delegator: Set("did:key:tc349-actor".to_owned()),
+            delegatee: Set("did:key:tc349-actor".to_owned()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(delegation_id.as_ref().to_vec()),
+        }
+        .insert(&conn)
+        .await
+        .expect("delegation row");
+
+        let after_delegation = runtime.readiness().await;
+        assert!(
+            after_delegation.checks.delegation_revocation_lookup,
+            "the lookup must stay green once a delegation row exists"
+        );
+        assert!(
+            after_delegation.ready,
+            "the runtime must stay ready once a delegation row exists"
+        );
+
+        revocation::ActiveModel {
+            id: Set(hash(b"tc349-revocation")),
+            revoker: Set("did:key:tc349-actor".to_owned()),
+            revoked: Set(delegation_id),
+            serialization: Set(b"tc349-revocation".to_vec()),
+            revoked_at: Set(Some(OffsetDateTime::now_utc())),
+        }
+        .insert(&conn)
+        .await
+        .expect("revocation row");
+
+        let after_revocation = runtime.readiness().await;
+        assert!(
+            after_revocation.checks.delegation_revocation_lookup,
+            "the lookup must stay green once a revocation row exists"
+        );
+        assert!(
+            after_revocation.ready,
+            "the runtime must stay ready once a revocation row exists"
+        );
+        assert!(
+            runtime.live().await,
+            "live() must stay true, so POST /share/v2/policies does not 503 capability_unavailable"
+        );
+    }
+
+    /// TC-349 companion: a node that boots against a database which already
+    /// holds registered policies must compose ready, not fail-closed. The
+    /// compose-time `migration` probe had the same projection mismatch, so a
+    /// restart after the first successful registration would have condemned
+    /// the runtime.
+    #[tokio::test]
+    async fn compose_is_ready_against_a_database_that_already_holds_rows() {
+        let key_setup = StaticSecret::new(vec![0x42u8; 32]).expect("32-byte test secret");
+        let tee_context = TeeContext::derive_local(&key_setup);
+        let runtime = compose_test_runtime(&key_setup, Some(tee_context.clone()), true).await;
+        let conn = runtime.conn.clone();
+
+        actor::ActiveModel {
+            id: Set("did:key:tc349-restart".to_owned()),
+        }
+        .insert(&conn)
+        .await
+        .expect("actor row");
+        let delegation_id = hash(b"tc349-restart-delegation");
+        delegation::ActiveModel {
+            id: Set(delegation_id),
+            delegator: Set("did:key:tc349-restart".to_owned()),
+            delegatee: Set("did:key:tc349-restart".to_owned()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(delegation_id.as_ref().to_vec()),
+        }
+        .insert(&conn)
+        .await
+        .expect("delegation row");
+
+        // Re-compose over the same, now-populated connection: the restart shape.
+        let directory = tempfile::tempdir().expect("tempdir for local block store");
+        let blocks = crate::BlockConfig::B(crate::storage::file_system::FileSystemConfig::new(
+            directory.path(),
+        ))
+        .open()
+        .await
+        .expect("local block storage opens");
+        let tinycloud = crate::TinyCloud::new(conn.clone(), blocks, key_setup.clone())
+            .await
+            .expect("in-process TinyCloud composes");
+        let restarted = compose(
+            conn,
+            &key_setup,
+            local_tee_share_v2_config(&key_setup),
+            Some(tee_context),
+            true,
+            Arc::new(tinycloud),
+        )
+        .await
+        .expect("share v2 runtime composes against a populated database");
+
+        assert!(
+            restarted.readiness().await.ready,
+            "a restart against a populated database must reach ready:true"
+        );
+        assert!(
+            restarted.capability().is_some(),
+            "the capability descriptor must be advertised after a restart"
         );
     }
 
@@ -3808,7 +4498,7 @@ mod tests {
         };
 
         let key_setup = StaticSecret::new(vec![0x7cu8; 32]).expect("32-byte test secret");
-        let mut config = local_tee_share_v2_config();
+        let mut config = local_tee_share_v2_config(&key_setup);
         assert!(
             config.authority_material_path.is_none(),
             "this composition must exercise the v2-only shape with no legacy authority material file"

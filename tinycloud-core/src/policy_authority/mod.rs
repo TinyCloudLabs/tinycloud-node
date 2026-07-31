@@ -3386,10 +3386,9 @@ mod tests {
     async fn postgres_policy_authority_concurrency_matrix_across_stores() {
         use sea_orm::{ConnectOptions, Database};
 
-        let Ok(database_url) = std::env::var("TINYCLOUD_TEST_POSTGRES_URL") else {
-            eprintln!(
-                "skipping PostgreSQL policy authority test: TINYCLOUD_TEST_POSTGRES_URL is unset"
-            );
+        let Some(database_url) = crate::test_support::postgres_test_url(
+            "postgres_policy_authority_concurrency_matrix_across_stores",
+        ) else {
             return;
         };
         let admin = Database::connect(ConnectOptions::new(database_url.clone()))

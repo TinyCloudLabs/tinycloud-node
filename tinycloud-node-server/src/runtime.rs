@@ -565,6 +565,49 @@ mod tests {
         assert!(cfg.telemetry.enabled);
     }
 
+    // TC-326: the compose files enable telemetry via the double-underscore env
+    // form and the DB pool max is env-overridable. Assert both forms parse.
+    #[::core::prelude::v1::test]
+    fn serve_config_figment_reads_pool_and_telemetry_from_double_underscore_env() {
+        let _lock = env_lock();
+        let temp = tempdir().unwrap();
+        let base = temp.path().join("base.toml");
+        let base_data = temp.path().join("base-data");
+        fs::create_dir_all(&base_data).unwrap();
+        fs::write(
+            &base,
+            format!(
+                "[global]\n\n[global.storage]\ndatadir = \"{}\"\n",
+                base_data.display()
+            ),
+        )
+        .unwrap();
+        let _storage_datadir = EnvGuard::unset("TINYCLOUD_STORAGE_DATADIR");
+        let _storage_datadir_canonical = EnvGuard::unset("TINYCLOUD_STORAGE__DATADIR");
+        // Canonical double-underscore forms under test (as used in the compose
+        // files). The single-underscore legacy form is unset so the assertion
+        // proves the double-underscore provider resolves them.
+        let _telemetry_canonical = EnvGuard::set("TINYCLOUD_TELEMETRY__ENABLED", "true");
+        let _telemetry_legacy = EnvGuard::unset("TINYCLOUD_TELEMETRY_ENABLED");
+        let _pool_canonical = EnvGuard::set("TINYCLOUD_DATABASE__MAX_CONNECTIONS", "200");
+        let _keys_env = clear_keys_env();
+        let _rocket_address = EnvGuard::unset("ROCKET_ADDRESS");
+        let _rocket_port = EnvGuard::unset("ROCKET_PORT");
+        let _rocket_config = EnvGuard::unset("ROCKET_CONFIG");
+        let _rocket_profile = EnvGuard::unset("ROCKET_PROFILE");
+
+        let figment = serve_config_figment(&base).unwrap();
+        let cfg = figment.extract::<config::Config>().unwrap();
+
+        // The compose form (double underscore) actually enables telemetry.
+        assert!(cfg.telemetry.enabled);
+        // The pool knob is env-overridable via the double-underscore form.
+        assert_eq!(cfg.database.max_connections, 200);
+        // Absent config falls back to the hardcoded default of 100.
+        assert_eq!(config::DatabaseConfig::default().max_connections, 100);
+        assert_eq!(config::Config::default().database.max_connections, 100);
+    }
+
     #[::core::prelude::v1::test]
     fn serve_config_figment_defaults_to_spec_bind_without_config_file() {
         let _lock = env_lock();
