@@ -1530,7 +1530,7 @@ mod tests {
     #[test]
     fn delegation_cids_still_reject_malformed_values() {
         assert!(ShareDelegationCid::parse("bafkr4i").is_err());
-        assert!(ShareDelegationCid::parse(&format!(
+        assert!(ShareDelegationCid::parse(format!(
             "zzzzzzz{}",
             &PRODUCTION_OWNER_DELEGATION_CID[7..]
         ))
@@ -1538,7 +1538,7 @@ mod tests {
         // Wrong length, right prefix.
         assert!(ShareDelegationCid::parse(&PRODUCTION_OWNER_DELEGATION_CID[..58]).is_err());
         // base32 alphabet only: `1` and `8` are not in it.
-        assert!(ShareDelegationCid::parse(&format!(
+        assert!(ShareDelegationCid::parse(format!(
             "bafkr4i1{}",
             &PRODUCTION_OWNER_DELEGATION_CID[8..]
         ))
