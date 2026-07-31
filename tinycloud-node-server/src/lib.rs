@@ -651,28 +651,7 @@ pub async fn app_with_control(
         .first()
         .cloned()
         .unwrap_or_else(|| tinycloud_config.share_email.return_origin.clone());
-    let rocket = rocket.attach(AdHoc::on_response(
-        "share-email-security-headers",
-        move |request, response| {
-            let share_allowed_origin = share_allowed_origin.clone();
-            Box::pin(async move {
-                if request.uri().path().starts_with("/share/v1/")
-                    || request.uri().path().starts_with("/share/v2/")
-                {
-                    response.set_header(Header::new("Cache-Control", "no-store"));
-                    response.set_header(Header::new("X-Content-Type-Options", "nosniff"));
-                    response.set_header(Header::new("Referrer-Policy", "no-referrer"));
-                    response.set_header(Header::new(
-                        "Access-Control-Allow-Origin",
-                        share_allowed_origin,
-                    ));
-                    response.set_header(Header::new("Access-Control-Allow-Methods", "GET, POST"));
-                    response
-                        .set_header(Header::new("Access-Control-Allow-Headers", "Content-Type"));
-                }
-            })
-        },
-    ));
+    let rocket = rocket.attach(share_security_fairing(share_allowed_origin));
 
     if tinycloud_config.cors {
         Ok(rocket.attach(AdHoc::on_response("CORS", |request, resp| {
@@ -704,6 +683,30 @@ pub async fn app_with_control(
     } else {
         Ok(rocket)
     }
+}
+
+fn share_security_fairing(share_allowed_origin: String) -> AdHoc {
+    AdHoc::on_response("share-email-security-headers", move |request, response| {
+        let share_allowed_origin = share_allowed_origin.clone();
+        Box::pin(async move {
+            if request.uri().path().starts_with("/share/v1/")
+                || request.uri().path().starts_with("/share/v2/")
+            {
+                response.set_header(Header::new("Cache-Control", "no-store"));
+                response.set_header(Header::new("X-Content-Type-Options", "nosniff"));
+                response.set_header(Header::new("Referrer-Policy", "no-referrer"));
+                response.set_header(Header::new(
+                    "Access-Control-Allow-Origin",
+                    share_allowed_origin,
+                ));
+                response.set_header(Header::new("Access-Control-Allow-Methods", "GET, POST"));
+                response.set_header(Header::new(
+                    "Access-Control-Allow-Headers",
+                    "Content-Type, Authorization",
+                ));
+            }
+        })
+    })
 }
 
 /// One telemetry sample tick: update the DB pool gauges, probe pool-acquire
@@ -940,5 +943,76 @@ mod sqlite_tuning_tests {
         assert_eq!(pragma(&db, "cache_size").await, "-65536");
         assert_eq!(pragma(&db, "temp_store").await, "2"); // 2 = MEMORY
         assert_eq!(pragma(&db, "mmap_size").await, "268435456");
+    }
+}
+
+#[cfg(test)]
+mod share_security_fairing_tests {
+    use super::share_security_fairing;
+    use rocket::{http::Header, local::asynchronous::Client, options, routes};
+
+    #[options("/share/v2/deliveries/authorize")]
+    fn share_delivery_preflight() {}
+
+    #[options("/v1/config")]
+    fn non_share_preflight() {}
+
+    #[tokio::test]
+    async fn chromium_share_delivery_preflight_allows_authorization() {
+        let client = Client::tracked(
+            rocket::build()
+                .mount("/", routes![share_delivery_preflight, non_share_preflight])
+                .attach(share_security_fairing("https://share.tinycloud.xyz".into())),
+        )
+        .await
+        .expect("valid Rocket instance");
+
+        let response = client
+            .options("/share/v2/deliveries/authorize")
+            .header(Header::new("Origin", "https://share.tinycloud.xyz"))
+            .header(Header::new("Access-Control-Request-Method", "POST"))
+            .header(Header::new(
+                "Access-Control-Request-Headers",
+                "authorization,content-type",
+            ))
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), rocket::http::Status::Ok);
+        assert_eq!(
+            response.headers().get_one("Access-Control-Allow-Origin"),
+            Some("https://share.tinycloud.xyz")
+        );
+        assert_eq!(
+            response.headers().get_one("Access-Control-Allow-Methods"),
+            Some("GET, POST")
+        );
+        assert_eq!(
+            response.headers().get_one("Access-Control-Allow-Headers"),
+            Some("Content-Type, Authorization")
+        );
+    }
+
+    #[tokio::test]
+    async fn non_share_preflight_does_not_receive_share_cors_headers() {
+        let client = Client::tracked(
+            rocket::build()
+                .mount("/", routes![share_delivery_preflight, non_share_preflight])
+                .attach(share_security_fairing("https://share.tinycloud.xyz".into())),
+        )
+        .await
+        .expect("valid Rocket instance");
+
+        let response = client.options("/v1/config").dispatch().await;
+
+        assert_eq!(response.status(), rocket::http::Status::Ok);
+        assert!(response
+            .headers()
+            .get_one("Access-Control-Allow-Origin")
+            .is_none());
+        assert!(response
+            .headers()
+            .get_one("Access-Control-Allow-Headers")
+            .is_none());
     }
 }
