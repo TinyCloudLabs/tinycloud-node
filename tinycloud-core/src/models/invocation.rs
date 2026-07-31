@@ -144,6 +144,53 @@ pub(crate) async fn process_internal<C: ConnectionTrait>(
     .await
 }
 
+/// TC-409: process an invocation that was already admitted (envelope
+/// verified once by `AdmittedInvocation::admit`). Skips only the
+/// cryptographic signature check — everything else `process` does is
+/// re-run against the current database state: signed time validity is
+/// re-checked here to close the admission-to-execution TOCTOU window,
+/// then the full authorization graph, caveat containment, revocation
+/// ordering, chain limits, and persistence proceed unchanged. Reachable
+/// only via `Event::AdmittedInvocation`, which is itself only constructed
+/// from a consumed `AdmittedInvocation` — this function does not, and
+/// must not, accept a bare invocation from any other caller.
+pub(crate) async fn process_admitted<C: ConnectionTrait>(
+    db: &C,
+    invocation: Invocation,
+    ops: Vec<VersionedOperation>,
+    encryption: Option<&ColumnEncryption>,
+    auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
+) -> Result<Hash, Error> {
+    let (i, serialized) = (invocation.0, invocation.1);
+    i.invocation
+        .payload()
+        .validate_time(None)
+        .map_err(|_| InvocationError::InvalidTime)?;
+
+    let now = OffsetDateTime::now_utc();
+    validate(db, &i, Some(now), auth_graph).await?;
+
+    save(db, i, Some(now), serialized, ops, encryption).await
+}
+
+/// TC-409: authorize an already-admitted, non-mutating invocation without
+/// recording an invocation event. Mirrors `verify_and_authorize` except it
+/// skips the signature check (already done at admission) and re-checks
+/// signed time validity instead, to close the same TOCTOU window
+/// `process_admitted` closes on the write path.
+pub(crate) async fn authorize_admitted<C: ConnectionTrait>(
+    db: &C,
+    invocation: &util::InvocationInfo,
+    now: OffsetDateTime,
+) -> Result<(), Error> {
+    invocation
+        .invocation
+        .payload()
+        .validate_time(None)
+        .map_err(|_| InvocationError::InvalidTime)?;
+    validate(db, invocation, Some(now), None).await
+}
+
 pub async fn verify_invocation(invocation: &TinyCloudInvocation) -> Result<(), Error> {
     tokio::time::timeout(
         did_resolution_timeout(),
@@ -158,6 +205,19 @@ pub async fn verify_invocation(invocation: &TinyCloudInvocation) -> Result<(), E
         .payload()
         .validate_time(None)
         .map_err(|_| InvocationError::InvalidTime)?;
+
+    // TC-409: this is the single cryptographic-verification primitive
+    // shared by every envelope-check path (`process`, `verify_and_authorize`,
+    // and `AdmittedInvocation::admit`). Recording here, rather than at any
+    // one caller, means an accidental extra call from a different path is
+    // counted too — see `crate::admission::test_hook` for why that matters.
+    // No-op outside tests/the opt-in feature, and a no-op for any identity
+    // that a test has not explicitly armed.
+    #[cfg(any(test, feature = "verification-count-test-hook"))]
+    if let Some(nonce) = invocation.payload().nonce.as_deref() {
+        crate::admission::test_hook::record(crate::hash::hash(nonce.as_bytes()));
+    }
+
     Ok(())
 }
 

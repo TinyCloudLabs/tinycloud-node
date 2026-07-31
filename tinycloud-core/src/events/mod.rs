@@ -133,6 +133,13 @@ pub(crate) enum Event {
     /// application protocol. This is private to the database composition
     /// layer; public invocations continue through the full UCAN validator.
     InternalInvocation(Box<Invocation>, Vec<Operation>),
+    /// TC-409: an invocation whose envelope was already verified once at
+    /// the admission boundary (`AdmittedInvocation::admit`). Distinct from
+    /// `InternalInvocation`: execution still re-runs the full
+    /// authorization graph, caveat containment, revocation ordering, chain
+    /// limits, and storage authorization, and re-checks signed time
+    /// validity — only the cryptographic signature check is skipped.
+    AdmittedInvocation(Box<Invocation>, Vec<Operation>),
     Delegation(Box<Delegation>),
     Revocation(Box<Revocation>),
 }
@@ -143,6 +150,7 @@ impl Event {
             Event::Delegation(d) => hash(&d.1),
             Event::Invocation(i, _) => hash(&i.1),
             Event::InternalInvocation(i, _) => hash(&i.1),
+            Event::AdmittedInvocation(i, _) => hash(&i.1),
             Event::Revocation(r) => hash(&r.1),
         }
     }
@@ -181,6 +189,7 @@ pub(crate) fn epoch_hash(
                 Ok(match e {
                     Event::Invocation(_, ops) => hash_inv(h, space, ops)?,
                     Event::InternalInvocation(_, ops) => hash_inv(h, space, ops)?,
+                    Event::AdmittedInvocation(_, ops) => hash_inv(h, space, ops)?,
                     Event::Delegation(_) => OneOrMany::One(h.to_cid(RAW_CODEC)),
                     Event::Revocation(_) => OneOrMany::One(h.to_cid(RAW_CODEC)),
                 })

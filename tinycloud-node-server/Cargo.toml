@@ -97,6 +97,16 @@ features = ["sqlite", "postgres", "mysql", "tokio"]
 [dependencies.tinycloud-auth]
 path = "../tinycloud-auth/"
 
+# TC-409: only for test builds, enable tinycloud-core's opt-in
+# verification-count test hook so node route tests can assert exactly-once
+# signature verification. Cargo only activates dev-dependency features when
+# actually building tests (`cargo test`), so this never reaches
+# `cargo build`/`cargo run`/production binaries.
+[dev-dependencies.tinycloud-core]
+path = "../tinycloud-core/"
+default-features = false
+features = ["sqlite", "postgres", "mysql", "tokio", "verification-count-test-hook"]
+
 [dev-dependencies]
 axum = { version = "0.7", features = ["ws"] }
 bs58 = "0.5"
