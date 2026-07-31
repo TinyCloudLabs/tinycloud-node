@@ -651,28 +651,7 @@ pub async fn app_with_control(
         .first()
         .cloned()
         .unwrap_or_else(|| tinycloud_config.share_email.return_origin.clone());
-    let rocket = rocket.attach(AdHoc::on_response(
-        "share-email-security-headers",
-        move |request, response| {
-            let share_allowed_origin = share_allowed_origin.clone();
-            Box::pin(async move {
-                if request.uri().path().starts_with("/share/v1/")
-                    || request.uri().path().starts_with("/share/v2/")
-                {
-                    response.set_header(Header::new("Cache-Control", "no-store"));
-                    response.set_header(Header::new("X-Content-Type-Options", "nosniff"));
-                    response.set_header(Header::new("Referrer-Policy", "no-referrer"));
-                    response.set_header(Header::new(
-                        "Access-Control-Allow-Origin",
-                        share_allowed_origin,
-                    ));
-                    response.set_header(Header::new("Access-Control-Allow-Methods", "GET, POST"));
-                    response
-                        .set_header(Header::new("Access-Control-Allow-Headers", "Content-Type"));
-                }
-            })
-        },
-    ));
+    let rocket = rocket.attach(share_security_headers_fairing(share_allowed_origin));
 
     if tinycloud_config.cors {
         Ok(rocket.attach(AdHoc::on_response("CORS", |request, resp| {
@@ -704,6 +683,49 @@ pub async fn app_with_control(
     } else {
         Ok(rocket)
     }
+}
+
+/// The response fairing that carries the browser-facing contract for
+/// `/share/v1/*` and `/share/v2/*`.
+///
+/// It is a named function rather than an inline closure so a test can attach the
+/// *same* fairing production attaches and read the headers off a real response,
+/// instead of asserting against a copy of the string list.
+///
+/// The general `CORS` fairing (which allows `*, Authorization`) deliberately
+/// skips these paths, so whatever this emits is the entire CORS policy the
+/// share routes get.
+fn share_security_headers_fairing(share_allowed_origin: String) -> AdHoc {
+    AdHoc::on_response("share-email-security-headers", move |request, response| {
+        let share_allowed_origin = share_allowed_origin.clone();
+        Box::pin(async move {
+            if request.uri().path().starts_with("/share/v1/")
+                || request.uri().path().starts_with("/share/v2/")
+            {
+                response.set_header(Header::new("Cache-Control", "no-store"));
+                response.set_header(Header::new("X-Content-Type-Options", "nosniff"));
+                response.set_header(Header::new("Referrer-Policy", "no-referrer"));
+                response.set_header(Header::new(
+                    "Access-Control-Allow-Origin",
+                    share_allowed_origin,
+                ));
+                response.set_header(Header::new("Access-Control-Allow-Methods", "GET, POST"));
+                // `Authorization` is not optional. `POST
+                // /share/v2/deliveries/authorize` is guarded by
+                // `AuthHeaderGetter<InvocationInfo>` (`share_v2.rs`), so the SDK
+                // must send an invocation in the `Authorization` header
+                // (`TinyCloudNode.ts` `authorizeShareDelivery`). While this list
+                // said only `Content-Type`, Chromium failed the preflight and
+                // never sent the request, so every addressed share on production
+                // reached "created" and then died at "The email didn't go out"
+                // (TC-442).
+                response.set_header(Header::new(
+                    "Access-Control-Allow-Headers",
+                    "Authorization, Content-Type",
+                ));
+            }
+        })
+    })
 }
 
 /// One telemetry sample tick: update the DB pool gauges, probe pool-acquire
@@ -940,5 +962,83 @@ mod sqlite_tuning_tests {
         assert_eq!(pragma(&db, "cache_size").await, "-65536");
         assert_eq!(pragma(&db, "temp_store").await, "2"); // 2 = MEMORY
         assert_eq!(pragma(&db, "mmap_size").await, "268435456");
+    }
+}
+
+#[cfg(test)]
+mod share_cors_tests {
+    use super::*;
+    use rocket::http::{Method, Status};
+    use rocket::local::asynchronous::Client;
+
+    #[options("/<_path..>")]
+    fn preflight(_path: std::path::PathBuf) -> Status {
+        Status::Ok
+    }
+
+    async fn client() -> Client {
+        let rocket = rocket::build()
+            .mount("/", rocket::routes![preflight])
+            .attach(share_security_headers_fairing(
+                "https://share.tinycloud.xyz".to_string(),
+            ));
+        Client::tracked(rocket).await.expect("rocket local client")
+    }
+
+    /// The exact preflight Chromium issues before
+    /// `POST /share/v2/deliveries/authorize`. Against the shipped
+    /// `Access-Control-Allow-Headers: Content-Type` this assertion fails, which
+    /// is the empirical proof that the browser could not send the request —
+    /// production's own preflight answered
+    /// `access-control-allow-headers: Content-Type` on 2026-07-31 while every
+    /// addressed share failed with "The email didn't go out" (TC-442).
+    #[tokio::test]
+    async fn deliveries_authorize_preflight_allows_the_authorization_header() {
+        let client = client().await;
+        let response = client
+            .req(Method::Options, "/share/v2/deliveries/authorize")
+            .header(Header::new("Origin", "https://share.tinycloud.xyz"))
+            .header(Header::new("Access-Control-Request-Method", "POST"))
+            .header(Header::new(
+                "Access-Control-Request-Headers",
+                "authorization,content-type",
+            ))
+            .dispatch()
+            .await;
+        let allowed = response
+            .headers()
+            .get_one("Access-Control-Allow-Headers")
+            .expect("share routes must answer the preflight with allow-headers")
+            .to_ascii_lowercase();
+        // A browser rejects the request unless *every* requested header is listed.
+        for requested in ["authorization", "content-type"] {
+            assert!(
+                allowed.split(',').any(|h| h.trim() == requested),
+                "Access-Control-Allow-Headers {allowed:?} omits {requested:?}, so Chromium \
+                 refuses to send the request"
+            );
+        }
+        assert_eq!(
+            response
+                .headers()
+                .get_one("Access-Control-Allow-Origin")
+                .unwrap(),
+            "https://share.tinycloud.xyz"
+        );
+    }
+
+    /// The fairing must not widen CORS for anything outside the share routes.
+    #[tokio::test]
+    async fn non_share_paths_get_no_share_cors_headers() {
+        let client = client().await;
+        let response = client
+            .req(Method::Options, "/invoke")
+            .header(Header::new("Origin", "https://share.tinycloud.xyz"))
+            .dispatch()
+            .await;
+        assert!(response
+            .headers()
+            .get_one("Access-Control-Allow-Headers")
+            .is_none());
     }
 }
