@@ -2336,6 +2336,109 @@ fn resource_scope_allows(kind: &str, scope: &str, requested: &str, action: &str)
         )
 }
 
+/// A `policy_denied` that says, in the log, which check produced it.
+///
+/// The caller still gets a flat `403 policy_denied`: which check failed is not a
+/// recipient's business, and naming it in the response would turn this route
+/// into an oracle for probing a registered policy. The operator is a different
+/// matter — `policy_challenge_v2` had twenty-one distinct ways to reach
+/// `policy_denied`, all indistinguishable from outside and none logged, so a
+/// refused claim on production could not be diagnosed without reproducing the
+/// whole stack locally. `reason` names a check and never carries a request value
+/// (TC-446).
+fn denied(reason: &'static str) -> ApiErrorResponse {
+    tracing::warn!(check = reason, "share/v2 policy challenge denied");
+    share_error("policy_denied")
+}
+
+/// Every consistency check a challenge request must pass, each with a name.
+///
+/// Behaviourally identical to the `||` chain it replaces — same predicates, same
+/// order, first failure wins — but it can say *which* one rejected the request.
+/// The names are stable identifiers for operators reading logs; they are never
+/// returned to the caller.
+fn challenge_request_violation(
+    registered: &RegisteredPolicy,
+    request: &V2ChallengeRequest,
+    runtime: &ShareV2Runtime,
+) -> Option<&'static str> {
+    let checks: [(&'static str, bool); 16] = [
+        (
+            "envelope_cid_equals_registration_cid",
+            request.envelope_cid == request.registration_cid,
+        ),
+        (
+            "share_cid_equals_envelope_cid",
+            request.share_cid == request.envelope_cid,
+        ),
+        (
+            "share_id_mismatch",
+            request.share_id != registered.envelope.policy.share_id,
+        ),
+        (
+            "owner_delegation_cid_mismatch",
+            request.delegation_cid != registered.row.owner_delegation_cid,
+        ),
+        (
+            "enforcement_delegation_cid_mismatch",
+            request.enforcement_delegation_cid != registered.row.enforcement_delegation_cid,
+        ),
+        (
+            "target_origin_mismatch",
+            request.target_origin != runtime.config.target_origin,
+        ),
+        (
+            "node_audience_mismatch",
+            request.node_audience != runtime.config.node_audience,
+        ),
+        (
+            "content_source_digest_mismatch",
+            request.content_source_digest != registered.row.content_source_digest,
+        ),
+        (
+            "content_source_not_exact",
+            request.content_source != exact_content_source(registered, request),
+        ),
+        (
+            "content_source_digest_does_not_match_content_source",
+            b64_digest(&jcs::canonicalize(&request.content_source))
+                != request.content_source_digest,
+        ),
+        (
+            "resource_scope_disallows_action",
+            !resource_scope_allows(
+                &registered.envelope.policy.resource.kind,
+                &registered.row.resource_path,
+                &request.resource,
+                &request.action,
+            ),
+        ),
+        ("actions_empty", request.actions.is_empty()),
+        (
+            "actions_missing_requested_action",
+            !request.actions.contains(&request.action),
+        ),
+        (
+            "actions_not_strictly_sorted",
+            request.actions.windows(2).any(|pair| pair[0] >= pair[1]),
+        ),
+        (
+            "action_outside_registered_policy",
+            request
+                .actions
+                .iter()
+                .any(|action| !registered.envelope.policy.actions.contains(action)),
+        ),
+        (
+            "requested_action_outside_registered_policy",
+            !registered.envelope.policy.actions.contains(&request.action),
+        ),
+    ];
+    checks
+        .into_iter()
+        .find_map(|(name, failed)| failed.then_some(name))
+}
+
 #[post("/share/v2/policy/challenges", format = "json", data = "<data>")]
 pub async fn policy_challenge_v2(
     data: Data<'_>,
@@ -2363,33 +2466,9 @@ pub async fn policy_challenge_v2(
     }
     let registered = registered_policy(runtime, &request.registration_cid, &request.policy_cid)
         .await
-        .map_err(|_| share_error("policy_denied"))?;
-    if request.envelope_cid == request.registration_cid
-        || request.share_cid == request.envelope_cid
-        || request.share_id != registered.envelope.policy.share_id
-        || request.delegation_cid != registered.row.owner_delegation_cid
-        || request.enforcement_delegation_cid != registered.row.enforcement_delegation_cid
-        || request.target_origin != runtime.config.target_origin
-        || request.node_audience != runtime.config.node_audience
-        || request.content_source_digest != registered.row.content_source_digest
-        || request.content_source != exact_content_source(&registered, &request)
-        || b64_digest(&jcs::canonicalize(&request.content_source)) != request.content_source_digest
-        || !resource_scope_allows(
-            &registered.envelope.policy.resource.kind,
-            &registered.row.resource_path,
-            &request.resource,
-            &request.action,
-        )
-        || request.actions.is_empty()
-        || !request.actions.contains(&request.action)
-        || request.actions.windows(2).any(|pair| pair[0] >= pair[1])
-        || request
-            .actions
-            .iter()
-            .any(|action| !registered.envelope.policy.actions.contains(action))
-        || !registered.envelope.policy.actions.contains(&request.action)
-    {
-        return Err(share_error("policy_denied"));
+        .map_err(|_| denied("registered_policy_lookup"))?;
+    if let Some(violation) = challenge_request_violation(&registered, &request, runtime) {
+        return Err(denied(violation));
     }
     let outer_expiry = verify_outer_envelope(
         &request.outer_envelope,
@@ -2397,16 +2476,16 @@ pub async fn policy_challenge_v2(
         &registered.row.share_key_did,
         registered.envelope.policy.decryption.as_ref(),
     )
-    .map_err(|_| share_error("policy_denied"))?;
+    .map_err(|_| denied("outer_envelope_verification"))?;
     if outer_expiry > registered.expiry {
         return Err(share_error("policy_expired"));
     }
     verify_registered_ancestors(runtime, &registered, Some(&request.enforcement_delegation))
         .await
-        .map_err(|_| share_error("policy_denied"))?;
-    let scope = typed_scope(&registered, &request).map_err(|_| share_error("policy_denied"))?;
+        .map_err(|_| denied("registered_ancestor_verification"))?;
+    let scope = typed_scope(&registered, &request).map_err(|_| denied("typed_scope"))?;
     if scope.allowed_actions.is_empty() || !scope.allowed_actions.contains(&scope.action) {
-        return Err(share_error("policy_denied"));
+        return Err(denied("scope_disallows_requested_action"));
     }
     let now = OffsetDateTime::now_utc();
     let challenge_id = tinycloud_core::share_email::invitation::random_protocol_nonce();
