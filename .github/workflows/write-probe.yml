@@ -54,19 +54,43 @@ jobs:
       run:
         working-directory: test/probe
     steps:
+      # An unconfigured probe must be visibly INACTIVE, not noisily red. Until
+      # an operator sets PROBE_PRIVATE_KEY the scheduled run would fail every 15
+      # minutes on a missing key -- alert fatigue that would bury the real
+      # write-degradation signal this probe exists to surface. Skip cleanly
+      # instead; a configured probe still fails loudly on latency, as intended.
+      - name: Check probe is configured
+        id: gate
+        # Runs before checkout, so override the job's test/probe default.
+        working-directory: ${{ github.workspace }}
+        env:
+          PROBE_PRIVATE_KEY: ${{ secrets.PROBE_PRIVATE_KEY }}
+        run: |
+          if [ -z "${PROBE_PRIVATE_KEY}" ]; then
+            echo "::notice::PROBE_PRIVATE_KEY is not set; skipping. Set it to activate the write probe."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.gate.outputs.configured == 'true'
 
       - uses: actions/setup-node@v4
+        if: steps.gate.outputs.configured == 'true'
         with:
           node-version: "20"
 
       - name: Install probe dependencies
+        if: steps.gate.outputs.configured == 'true'
         run: npm install --no-audit --no-fund
 
       - name: Type-check probe
+        if: steps.gate.outputs.configured == 'true'
         run: npm run typecheck
 
       - name: Run write probe
+        if: steps.gate.outputs.configured == 'true'
         env:
           PROBE_PRIVATE_KEY: ${{ secrets.PROBE_PRIVATE_KEY }}
           PROBE_HOST: ${{ secrets.PROBE_HOST }}
