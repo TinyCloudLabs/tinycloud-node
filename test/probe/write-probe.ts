@@ -42,17 +42,40 @@ import { TinyCloudNode } from "@tinycloud/node-sdk";
 
 // ---- configuration (env-overridable) ---------------------------------------
 
-const HOST = process.env.PROBE_HOST ?? "https://node.tinycloud.xyz";
+/**
+ * An override, or `undefined` when it was not really supplied.
+ *
+ * The workflow passes every optional override as `${{ secrets.PROBE_X }}`, and
+ * GitHub substitutes an **empty string** for a secret that is not set — so the
+ * variable arrives set-but-empty and `?? default` never fires, because `??`
+ * only falls back on `undefined`. That turned `PROBE_HOST` and `PROBE_PREFIX`
+ * into `""` (the probe died with `IdentityParseError: Space name cannot be
+ * empty`) and every threshold into `Number("")` — **0 ms**, which would have
+ * flagged every stage SLOW had it got that far.
+ */
+function override(name: string): string | undefined {
+  const value = process.env[name];
+  return value === undefined || value.trim() === "" ? undefined : value;
+}
+
+const HOST = override("PROBE_HOST") ?? "https://node.tinycloud.xyz";
 // Dedicated, isolated space prefix for the probe identity. Never shared with
 // any user-facing app prefix.
-const PREFIX = process.env.PROBE_PREFIX ?? "tc313-write-probe";
+const PREFIX = override("PROBE_PREFIX") ?? "tc313-write-probe";
 
 const THRESHOLDS_MS = {
-  signIn: Number(process.env.PROBE_THRESHOLD_SIGNIN_MS ?? 15_000),
-  put: Number(process.env.PROBE_THRESHOLD_PUT_MS ?? 5_000),
-  get: Number(process.env.PROBE_THRESHOLD_GET_MS ?? 5_000),
-  delete: Number(process.env.PROBE_THRESHOLD_DELETE_MS ?? 5_000),
+  signIn: Number(override("PROBE_THRESHOLD_SIGNIN_MS") ?? 15_000),
+  put: Number(override("PROBE_THRESHOLD_PUT_MS") ?? 5_000),
+  get: Number(override("PROBE_THRESHOLD_GET_MS") ?? 5_000),
+  delete: Number(override("PROBE_THRESHOLD_DELETE_MS") ?? 5_000),
 } as const;
+
+// A malformed override must not silently become 0 and flag every stage SLOW.
+for (const [stage, ms] of Object.entries(THRESHOLDS_MS)) {
+  if (!Number.isFinite(ms) || ms <= 0) {
+    throw new Error(`PROBE_THRESHOLD_${stage.toUpperCase()}_MS is not a positive number: ${ms}`);
+  }
+}
 
 type Stage = keyof typeof THRESHOLDS_MS;
 
