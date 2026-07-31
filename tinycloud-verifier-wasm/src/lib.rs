@@ -214,11 +214,24 @@ fn extract_recap_capabilities(
         let resource = ResourceId::from_str(resource.as_str())
             .map_err(|error| VerificationError::decode(error.to_string()))?
             .to_string();
-        for action in abilities.into_keys() {
+        // Mirror extract_ucan_capabilities exactly: a ReCap ability's note-bene
+        // collection is the caveat set. `Caveats<T>` deserialization already
+        // normalizes the spec's mandatory-but-meaningless `[{}]` sentinel down
+        // to an empty Vec (ucan-capabilities-object's caveats.rs), so an empty
+        // `caveats` map here is a genuine absence of restriction, and any
+        // non-empty map is a real, signed restriction that callers must not
+        // discard.
+        for (action, caveat_collection) in abilities.into_iter() {
+            let mut caveats = BTreeMap::new();
+            for (index, note_bene) in caveat_collection.into_inner().into_iter().enumerate() {
+                let value = serde_json::to_value(note_bene)
+                    .map_err(|error| VerificationError::decode(error.to_string()))?;
+                caveats.insert(index.to_string(), value);
+            }
             grants.push(CapabilityGrant {
                 resource: resource.clone(),
                 action: action.to_string(),
-                caveats: BTreeMap::new(),
+                caveats,
             });
         }
     }
@@ -921,6 +934,149 @@ mod tests {
             "not-a-tinycloud-resource",
             "did:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
         ));
+    }
+
+    // ReCap caveat preservation (cf-node security wave, R5). Before this,
+    // extract_recap_capabilities() iterated only ability KEYS and hard-coded
+    // an empty caveat map, so every signed CACAO reached cf-node's R5 gate
+    // reporting no caveats - a signed, caveat-restricted capability was
+    // silently upgraded to unrestricted authority in exactly the dimension
+    // the caveat restricted. These tests pin both halves: a real note-bene
+    // map survives, and the spec's mandatory `[{}]` "no restriction"
+    // sentinel still reports as no caveats. The second half is what keeps
+    // every legitimate first-party session working - treating `[{}]` as a
+    // restriction would deny every ReCap session in the stack.
+
+    const CAVEAT_TEST_RESOURCE: &str =
+        "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:myspace/kv/restricted";
+
+    /// Builds a ReCap carrying exactly the given note-bene collection for one
+    /// ability, by round-tripping through siwe-recap's own `build_message` +
+    /// `extract_and_verify` - i.e. through the real signable wire format and
+    /// its statement check, not a hand-rolled fixture.
+    fn recap_with_note_bene(
+        note_bene: Vec<BTreeMap<String, serde_json::Value>>,
+    ) -> SiweRecapCapability<serde_json::Value> {
+        let golden = parse_golden();
+        let vector = golden
+            .valid
+            .iter()
+            .find(|vector| vector.case == "depth-1")
+            .expect("depth-1 vector");
+        let mut message: tinycloud_auth::cacaos::siwe::Message =
+            vector.siwe.parse().expect("siwe parses");
+        // Start from a clean slate so the only recap resource/statement in
+        // the message is the one built below.
+        message.statement = None;
+        message.resources = Vec::new();
+
+        let mut capability = SiweRecapCapability::<serde_json::Value>::new();
+        capability
+            .with_action_convert(CAVEAT_TEST_RESOURCE, "tinycloud.kv/get", note_bene)
+            .expect("with_action_convert accepts a note-bene collection");
+
+        let message = capability
+            .build_message(message)
+            .expect("build_message produces a signable SIWE message");
+
+        SiweRecapCapability::<serde_json::Value>::extract_and_verify(&message)
+            .expect("recap extracts and its statement verifies")
+            .expect("recap is present")
+    }
+
+    fn restriction() -> BTreeMap<String, serde_json::Value> {
+        [("maxContentLength".to_string(), serde_json::json!(1024))]
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn recap_capabilities_preserve_a_real_note_bene_restriction() {
+        let recap = recap_with_note_bene(vec![restriction()]);
+        let (grants, _proofs) = extract_recap_capabilities(recap).expect("extraction succeeds");
+
+        assert_eq!(grants.len(), 1);
+        let grant = &grants[0];
+        assert_eq!(grant.action, "tinycloud.kv/get");
+        assert!(
+            !grant.caveats.is_empty(),
+            "a signed ReCap restriction must not be erased into an unrestricted grant"
+        );
+        // Same indexed serialization the UCAN path uses: position -> map.
+        assert_eq!(
+            grant.caveats.get("0"),
+            Some(&serde_json::json!({ "maxContentLength": 1024 }))
+        );
+    }
+
+    #[test]
+    fn recap_capabilities_preserve_multiple_note_bene_entries_by_index() {
+        let second: BTreeMap<String, serde_json::Value> =
+            [("prefix".to_string(), serde_json::json!("shared/"))]
+                .into_iter()
+                .collect();
+        let recap = recap_with_note_bene(vec![restriction(), second]);
+        let (grants, _proofs) = extract_recap_capabilities(recap).expect("extraction succeeds");
+
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].caveats.len(), 2);
+        assert_eq!(
+            grants[0].caveats.get("1"),
+            Some(&serde_json::json!({ "prefix": "shared/" }))
+        );
+    }
+
+    #[test]
+    fn recap_capabilities_report_no_caveats_for_the_empty_sentinel() {
+        // `[{}]` is the spec's mandatory placeholder for "no restriction" and
+        // is what every first-party session mints. It must NOT be reported as
+        // a caveat, or cf-node's fail-closed R5 gate denies all real traffic.
+        let recap = recap_with_note_bene(vec![BTreeMap::new()]);
+        let (grants, _proofs) = extract_recap_capabilities(recap).expect("extraction succeeds");
+
+        assert_eq!(grants.len(), 1);
+        assert!(grants[0].caveats.is_empty());
+    }
+
+    #[test]
+    fn golden_vector_sessions_still_report_no_caveats() {
+        // The same property end-to-end through real signed CACAOs: no frozen
+        // golden vector may start reporting a caveat.
+        let golden = parse_golden();
+        let now = OffsetDateTime::parse(
+            "2025-01-01T00:00:00.000Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("frozen clock");
+
+        for vector in &golden.valid {
+            let cacao = build_cacao(vector);
+            let raw = serde_ipld_dagcbor::to_vec(&cacao).expect("cacao encodes");
+            let verdict = verify_delegation_bytes(&raw, now.unix_timestamp() as f64)
+                .expect(vector.case.as_str());
+            for grant in &verdict.capabilities {
+                assert!(grant.caveats.is_empty(), "{}", vector.case);
+            }
+        }
+    }
+
+    #[test]
+    fn ucan_and_recap_caveat_serialization_agree() {
+        // Parity: the same note-bene collection must produce the same
+        // CapabilityGrant.caveats map regardless of delegation kind, so
+        // cf-node's single `hasCaveats` predicate is correct for both.
+        let nb = restriction();
+        let recap = recap_with_note_bene(vec![nb.clone()]);
+        let (recap_grants, _) = extract_recap_capabilities(recap).expect("recap extraction");
+
+        let mut ucan_capabilities =
+            tinycloud_auth::ucan_capabilities_object::Capabilities::<serde_json::Value>::new();
+        ucan_capabilities
+            .with_action_convert(CAVEAT_TEST_RESOURCE, "tinycloud.kv/get", vec![nb])
+            .expect("ucan with_action_convert");
+        let ucan_grants = extract_ucan_capabilities(&ucan_capabilities).expect("ucan extraction");
+
+        assert_eq!(recap_grants, ucan_grants);
     }
 
     #[test]
