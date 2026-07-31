@@ -13,10 +13,10 @@ use time::OffsetDateTime;
 use tinycloud_auth::{
     authorization::{HeaderEncode, TinyCloudDelegation, TinyCloudInvocation},
     cacaos::siwe_cacao::{SIWEPayloadConversionError, SiweCacao},
-    identity::principal_did,
+    identity::{did_principal_matches, principal_did},
     ipld_core::cid::{multibase::Base, Cid},
     multihash_codetable::{Code, MultihashDigest},
-    resource::ResourceId,
+    resource::{ResourceId, SpaceId},
     siwe_recap::Capability as SiweRecapCapability,
     ssi::{
         claims::jws::verify_bytes,
@@ -455,6 +455,29 @@ pub fn action_matches(held: &str, required: &str) -> bool {
     tinycloud_auth::policy_capability::ability_matches(held, required)
 }
 
+/// TinyCloud-space root-authority check: does `delegator` match the DID that
+/// owns `space_or_resource`'s space? Accepts either a bare `SpaceId` string
+/// (`tinycloud:<suffix>:<name>`) or a full `ResourceId` string
+/// (`tinycloud:<suffix>:<name>/<service>[/<path>]`) and extracts the space
+/// either way.
+///
+/// This mirrors only the TinyCloud-space arm of core's `is_root_authority`
+/// (`tinycloud-core/src/models/delegation.rs`) - the separate `NetworkId`
+/// arm is deliberately out of scope for this export. Any non-TinyCloud
+/// input, including a syntactically valid `NetworkId` URN
+/// (`urn:tinycloud:encryption:...`), fails to parse as either `SpaceId` or
+/// `ResourceId` here and returns `false`. Callers must not treat this as a
+/// full port of `is_root_authority`.
+pub fn space_root_authority_matches(space_or_resource: &str, delegator: &str) -> bool {
+    if let Ok(space) = SpaceId::from_str(space_or_resource) {
+        return did_principal_matches(space.did().as_str(), delegator);
+    }
+    if let Ok(resource) = ResourceId::from_str(space_or_resource) {
+        return did_principal_matches(resource.space().did().as_str(), delegator);
+    }
+    false
+}
+
 #[wasm_bindgen(js_name = verifyDelegation)]
 pub fn verify_delegation_wasm(bytes: &[u8], now_seconds: f64) -> Result<JsValue, JsValue> {
     match verify_delegation_bytes(bytes, now_seconds) {
@@ -515,6 +538,16 @@ pub fn resource_path_contains_wasm(granted_resource: String, required_resource: 
 #[wasm_bindgen(js_name = abilityMatches)]
 pub fn action_matches_wasm(held: String, required: String) -> bool {
     action_matches(&held, &required)
+}
+
+#[wasm_bindgen(js_name = spaceRootAuthorityMatches)]
+pub fn space_root_authority_matches_wasm(space_or_resource: String, delegator: String) -> bool {
+    space_root_authority_matches(&space_or_resource, &delegator)
+}
+
+#[wasm_bindgen(js_name = didPrincipalMatches)]
+pub fn did_principal_matches_wasm(a: String, b: String) -> bool {
+    did_principal_matches(&a, &b)
 }
 
 #[cfg(test)]
@@ -835,5 +868,66 @@ mod tests {
         )
         .expect_err("unauthorized action");
         assert_eq!(err.kind, VerificationErrorKind::InvalidStatement);
+    }
+
+    // Parity tests for the two authority-check exports added for the cf-node
+    // security wave (TC-428/TC-437/TC-440). These pin `space_root_authority_matches`
+    // to the TinyCloud-space arm of `is_root_authority`
+    // (tinycloud-core/src/models/delegation.rs) so a future caller cannot
+    // mistake it for the full check.
+
+    const SPACE_OWNER_LOWER: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
+    const SPACE_OWNER_CHECKSUM: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+
+    #[test]
+    fn space_root_authority_matches_owner_in_lowercase_and_eip55_casing() {
+        let space_id = format!("tinycloud:pkh:eip155:1:{SPACE_OWNER_CHECKSUM}:myspace");
+        let resource_id = format!("tinycloud:pkh:eip155:1:{SPACE_OWNER_CHECKSUM}:myspace/kv/path");
+
+        let delegator_lower = format!("did:pkh:eip155:1:{SPACE_OWNER_LOWER}");
+        let delegator_checksum = format!("did:pkh:eip155:1:{SPACE_OWNER_CHECKSUM}");
+
+        assert!(space_root_authority_matches(&space_id, &delegator_lower));
+        assert!(space_root_authority_matches(&space_id, &delegator_checksum));
+        assert!(space_root_authority_matches(&resource_id, &delegator_lower));
+        assert!(space_root_authority_matches(&resource_id, &delegator_checksum));
+    }
+
+    #[test]
+    fn space_root_authority_matches_rejects_non_owner_did_key_issuer() {
+        let space_id = format!("tinycloud:pkh:eip155:1:{SPACE_OWNER_CHECKSUM}:myspace");
+        assert!(!space_root_authority_matches(
+            &space_id,
+            "did:key:z6MkExampleSessionIssuer"
+        ));
+    }
+
+    #[test]
+    fn space_root_authority_matches_rejects_valid_network_id_urn() {
+        // A syntactically valid NetworkId URN (tinycloud-core's separate
+        // is_root_authority arm, out of scope for this space-specific
+        // export) must not parse as a SpaceId/ResourceId and must return
+        // false rather than accidentally authorizing.
+        let network_id = "urn:tinycloud:encryption:did:key:z6MkExampleAbcd:default";
+        assert!(!space_root_authority_matches(
+            network_id,
+            "did:key:z6MkExampleAbcd"
+        ));
+    }
+
+    #[test]
+    fn space_root_authority_matches_rejects_unparseable_input() {
+        assert!(!space_root_authority_matches(
+            "not-a-tinycloud-resource",
+            "did:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+        ));
+    }
+
+    #[test]
+    fn did_principal_matches_strips_fragment_and_canonicalizes_eip55() {
+        let a = format!("did:pkh:eip155:1:{SPACE_OWNER_LOWER}#controller");
+        let b = format!("did:pkh:eip155:1:{SPACE_OWNER_CHECKSUM}");
+        assert!(did_principal_matches(&a, &b));
+        assert!(!did_principal_matches(&a, "did:key:z6MkExampleAbcd"));
     }
 }
