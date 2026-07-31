@@ -1,8 +1,22 @@
 name: Docker Container
 
+# TC-312: the release -> auto-deploy chain used to fire on the GitHub Release
+# `published` event; it no longer does. release-plz.toml sets
+# `git_release_enable = false`, so release-plz only pushes the `vX.Y.Z` tag —
+# the GitHub Release itself is created by cargo-dist (release.yml) with the
+# default `GITHUB_TOKEN`. GitHub deliberately does NOT emit workflow-triggering
+# events (including `release`) for actions taken with `GITHUB_TOKEN`, to prevent
+# recursive runs, so `on: release` here never fires from a cargo-dist release
+# and prod could only be deployed by a manual `workflow_dispatch`.
+#
+# Fix: trigger on the tag push itself. release-plz pushes tags with a PAT
+# (RELEASE_PLZ_TOKEN) and a manual `git push --tags` also emits a normal `push`
+# event, so tag pushes reliably reach this workflow. `on: release` is kept for
+# backward compatibility should a PAT-published Release ever reappear.
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
     branches: [main]
   release:
@@ -101,7 +115,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main')
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -142,7 +156,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+          push: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: CARGO_FEATURES=${{ steps.build_features.outputs.cargo_features }}
@@ -152,7 +166,7 @@ jobs:
   build-dstack:
     runs-on: ubuntu-latest
     needs: [version-guard]
-    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     permissions:
       contents: read
       packages: write
@@ -217,7 +231,7 @@ jobs:
   deploy-phala:
     runs-on: ubuntu-latest
     needs: [build, build-dstack]
-    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.deploy_phala)
+    if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.deploy_phala)
     steps:
       - uses: actions/checkout@v4
 
@@ -325,3 +339,46 @@ jobs:
           } > .phala-prod.env
 
           phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml -e .phala-prod.env --wait
+
+      # TC-312: prove the deploy actually converged. The image tag matching the
+      # crate version is enforced at build time by version-guard, but nothing
+      # previously confirmed the running CVM serves it — the incident where prod
+      # reported a stale version went unnoticed for exactly this reason. Poll the
+      # public /version endpoint and fail the job if it never reports the tag we
+      # just deployed.
+      - name: Verify deployed version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_IMAGE_VERSION: ${{ inputs.image_version }}
+        run: |
+          set -euo pipefail
+
+          # Resolve the version we just deployed, mirroring the compose step.
+          if [ "${EVENT_NAME}" = "release" ]; then
+            TAG="${RELEASE_TAG}"
+          elif [ -n "${INPUT_IMAGE_VERSION}" ]; then
+            TAG="${INPUT_IMAGE_VERSION}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          EXPECTED="${TAG#v}"
+          echo "Expecting node.tinycloud.xyz to report version ${EXPECTED}"
+
+          # The CVM needs a short while to pull the new image and restart, so
+          # retry with a fixed backoff (~5 min total) before giving up.
+          ATTEMPTS=30
+          SLEEP=10
+          REPORTED=""
+          for i in $(seq 1 "${ATTEMPTS}"); do
+            REPORTED="$(curl -fsS --max-time 15 https://node.tinycloud.xyz/version | jq -r '.version' || true)"
+            echo "attempt ${i}/${ATTEMPTS}: /version reported '${REPORTED}'"
+            if [ "${REPORTED}" = "${EXPECTED}" ]; then
+              echo "node.tinycloud.xyz is serving ${EXPECTED}."
+              exit 0
+            fi
+            sleep "${SLEEP}"
+          done
+
+          echo "::error::node.tinycloud.xyz still reports '${REPORTED}' after $((ATTEMPTS * SLEEP))s, expected '${EXPECTED}'. The deploy did not converge."
+          exit 1
