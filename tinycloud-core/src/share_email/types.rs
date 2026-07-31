@@ -335,7 +335,18 @@ fn valid_cid(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte))
 }
 
-fn valid_node_cid(value: &str) -> bool {
+/// A **delegation** CID, which may be blake3-addressed.
+///
+/// `valid_cid` above accepts only `bafkrei` — CIDv1/raw/**sha2-256** — which is
+/// right for the documents this module content-addresses itself (share
+/// envelopes, policies). Delegations are minted by the delegation layer and are
+/// blake3-addressed, so they arrive as `bafkr4i`. This predicate was widened for
+/// `NodeDelegationCid` and `ShareDelegationCid` was left on `valid_cid`, so
+/// every addressed claim on production failed: `typed_scope` could not parse the
+/// owner delegation CID
+/// (`bafkr4iaickipp4ceomv46xkot4ujivcogxhmvf6xiqhqpvuuxz2urxrt7u`) and the node
+/// answered a flat `403 policy_denied` (TC-451).
+fn valid_delegation_cid(value: &str) -> bool {
     value.len() == MAX_CID_BYTES
         && (value.starts_with("bafkrei") || value.starts_with("bafkr4"))
         && value
@@ -433,7 +444,11 @@ validated_string!(TargetOrigin, InvalidTargetOrigin, valid_target_origin);
 validated_string!(ShareCid, InvalidShareCid, valid_cid);
 validated_string!(ShareId, InvalidShareId, valid_share_id);
 validated_string!(PolicyCid, InvalidPolicyCid, valid_cid);
-validated_string!(ShareDelegationCid, InvalidShareDelegationCid, valid_cid);
+validated_string!(
+    ShareDelegationCid,
+    InvalidShareDelegationCid,
+    valid_delegation_cid
+);
 validated_string!(
     AuthorityMaterialHandle,
     InvalidAuthorityMaterialHandle,
@@ -445,7 +460,11 @@ validated_string!(
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
     }
 );
-validated_string!(NodeDelegationCid, InvalidNodeDelegationCid, valid_node_cid);
+validated_string!(
+    NodeDelegationCid,
+    InvalidNodeDelegationCid,
+    valid_delegation_cid
+);
 pub type Origin = TargetOrigin;
 
 #[derive(Clone, PartialEq, Eq, Hash, Serialize)]
@@ -1478,5 +1497,51 @@ mod tests {
             assert_ne!(manifest_cid, OLD_ENVELOPE_PACKAGE_SHARE_CID);
             assert_ne!(manifest_cid, OLD_ENVELOPE_PACKAGE_POLICY_CID);
         }
+    }
+
+    /// The owner delegation CID production actually mints. Delegations are
+    /// blake3-addressed, so they arrive as `bafkr4i`, not the `bafkrei`
+    /// (sha2-256) prefix `valid_cid` accepts.
+    ///
+    /// `ShareDelegationCid` was on `valid_cid` while `NodeDelegationCid` had
+    /// already been widened, so `typed_scope` could not parse this value and
+    /// every addressed recipient claim on production was refused a flat
+    /// `403 policy_denied` (TC-451). Captured from a live claim on 2026-07-31.
+    const PRODUCTION_OWNER_DELEGATION_CID: &str =
+        "bafkr4iaickipp4ceomv46xkot4ujivcogxhmvf6xiqhqpvuuxz2urxrt7u";
+
+    #[test]
+    fn delegation_cids_accept_the_blake3_prefix_production_mints() {
+        assert!(ShareDelegationCid::parse(PRODUCTION_OWNER_DELEGATION_CID).is_ok());
+        assert!(NodeDelegationCid::parse(PRODUCTION_OWNER_DELEGATION_CID).is_ok());
+    }
+
+    #[test]
+    fn content_addressed_cids_still_require_sha256() {
+        // Share and policy CIDs are content-addressed by this module itself and
+        // stay sha2-256 only; widening the delegation validator must not widen
+        // these.
+        assert!(ShareCid::parse(PRODUCTION_OWNER_DELEGATION_CID).is_err());
+        assert!(PolicyCid::parse(PRODUCTION_OWNER_DELEGATION_CID).is_err());
+        assert!(ShareCid::parse(KV_SHARE_CID).is_ok());
+        assert!(PolicyCid::parse(KV_POLICY_CID).is_ok());
+    }
+
+    #[test]
+    fn delegation_cids_still_reject_malformed_values() {
+        assert!(ShareDelegationCid::parse("bafkr4i").is_err());
+        assert!(ShareDelegationCid::parse(&format!(
+            "zzzzzzz{}",
+            &PRODUCTION_OWNER_DELEGATION_CID[7..]
+        ))
+        .is_err());
+        // Wrong length, right prefix.
+        assert!(ShareDelegationCid::parse(&PRODUCTION_OWNER_DELEGATION_CID[..58]).is_err());
+        // base32 alphabet only: `1` and `8` are not in it.
+        assert!(ShareDelegationCid::parse(&format!(
+            "bafkr4i1{}",
+            &PRODUCTION_OWNER_DELEGATION_CID[8..]
+        ))
+        .is_err());
     }
 }
