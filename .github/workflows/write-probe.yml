@@ -1,0 +1,78 @@
+# TC-313: Synthetic end-to-end WRITE probe for the prod TinyCloud node.
+#
+# WHY: During the 2026-07-27/28 write-degradation incident, /healthz returned
+# 200 in ~300ms while kv.put took 46s and /delegate blew past Cloudflare's 100s
+# ceiling. /healthz and /version never touch the DB or the write path, so
+# uptime monitoring stayed green while writes were down. This probe drives a
+# REAL signed end-to-end write (signIn -> kv.put -> kv.get -> kv.delete) and
+# FAILS the job when any stage is too slow. A failed scheduled job is the alert
+# (GitHub sends failure notifications) -- no new always-on infra.
+#
+# OPERATOR SETUP -- set ONE repository secret (Settings -> Secrets and
+# variables -> Actions):
+#   PROBE_PRIVATE_KEY  A hex private key (with or without 0x) for a THROWAWAY
+#                      identity used only by the probe. It operates in its own
+#                      isolated space (prefix "tc313-write-probe"), so it never
+#                      touches user data. Do NOT reuse a real user/prod key.
+# Optional overrides (secrets or repo variables):
+#   PROBE_HOST (default https://node.tinycloud.xyz), PROBE_PREFIX,
+#   PROBE_THRESHOLD_SIGNIN_MS, PROBE_THRESHOLD_PUT_MS,
+#   PROBE_THRESHOLD_GET_MS, PROBE_THRESHOLD_DELETE_MS.
+#
+# READING A FAILURE: the job log prints one line per stage with its latency and
+# threshold; the slow stage is flagged SLOW. signIn slowness -> /delegate; put/
+# delete slowness -> DB write path. See test/probe/README.md for full details.
+#
+# SLACK (optional, later): if the repo adopts a Slack-notify pattern, add a
+# final step guarded by `if: failure()` posting to a SLACK_WEBHOOK_URL secret
+# (e.g. slackapi/slack-github-action). Keep it separate so a Slack outage never
+# masks the probe verdict.
+
+name: Write Probe
+
+on:
+  schedule:
+    # Every 15 minutes. A red run is the alert.
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+# Only one probe at a time; never queue a backlog if a run is slow.
+concurrency:
+  group: write-probe
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    # Hard wall below Cloudflare's 100s ceiling * a few stages, so a truly hung
+    # write path still fails the job instead of hanging the runner.
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: test/probe
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install probe dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Type-check probe
+        run: npm run typecheck
+
+      - name: Run write probe
+        env:
+          PROBE_PRIVATE_KEY: ${{ secrets.PROBE_PRIVATE_KEY }}
+          PROBE_HOST: ${{ secrets.PROBE_HOST }}
+          PROBE_PREFIX: ${{ secrets.PROBE_PREFIX }}
+          PROBE_THRESHOLD_SIGNIN_MS: ${{ secrets.PROBE_THRESHOLD_SIGNIN_MS }}
+          PROBE_THRESHOLD_PUT_MS: ${{ secrets.PROBE_THRESHOLD_PUT_MS }}
+          PROBE_THRESHOLD_GET_MS: ${{ secrets.PROBE_THRESHOLD_GET_MS }}
+          PROBE_THRESHOLD_DELETE_MS: ${{ secrets.PROBE_THRESHOLD_DELETE_MS }}
+        run: npm run probe
