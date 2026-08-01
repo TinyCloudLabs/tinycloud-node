@@ -5,9 +5,9 @@
 //! revocation lookup per ancestor (repeated for chain locking, revocation
 //! checks, and chain-window validation), the snapshot batch-loads the whole
 //! proof closure once: parent edges, then the
-//! delegation rows, the cited proofs' ability/caveat rows, and the closure's
-//! revocations in one query each. All chain checks then run in memory against
-//! the same consistent view.
+//! delegation rows, the closure's ability/caveat rows (cited roots and their
+//! ancestors alike), and the closure's revocations in one query each. All
+//! chain checks then run in memory against the same consistent view.
 
 use crate::hash::Hash;
 use crate::models::{abilities, delegation, revocation};
@@ -143,7 +143,7 @@ impl AuthGraphSnapshot {
         roots: &[Hash],
     ) -> Result<Self, ChainTraversalError> {
         let (nodes, parents) = load_closure_edges(db, roots).await?;
-        Self::load_from_closure(db, roots, nodes, parents).await
+        Self::load_from_closure(db, nodes, parents).await
     }
 
     /// Same as [`Self::load`], but for a closure (`nodes`/`parents`) already
@@ -152,9 +152,17 @@ impl AuthGraphSnapshot {
     /// complete for the connection being read from -- see [`Self::load_guarded`]
     /// for the production caller, which re-derives and verifies the closure
     /// under the caller's chain guards instead of trusting a pre-guard read.
+    ///
+    /// Ability/caveat rows are loaded for every node in the bounded closure
+    /// (`nodes`), not just the cited roots: `constrained_statement_caveat_candidates`
+    /// walks each root's full ancestor chain and reads `abilities()` at every
+    /// step, so an ancestor-only caveat (the descendant delegation carries no
+    /// caveat of its own) would otherwise be silently invisible even though it
+    /// is part of the already-loaded, already-bounded closure. `nodes` is
+    /// capped at `MAX_CHAIN_TRAVERSAL_NODES` by `load_closure_edges`, so this
+    /// stays a single bounded-size statement, not an unbounded one.
     pub(crate) async fn load_from_closure<C: ConnectionTrait>(
         db: &C,
-        roots: &[Hash],
         nodes: Vec<Hash>,
         parents: HashMap<Hash, Vec<Hash>>,
     ) -> Result<Self, ChainTraversalError> {
@@ -174,12 +182,9 @@ impl AuthGraphSnapshot {
             .map(|row| (row.id, row))
             .collect();
 
-        let mut root_ids: Vec<Hash> = roots.to_vec();
-        root_ids.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
-        root_ids.dedup();
         let mut ability_rows: HashMap<Hash, Vec<abilities::Model>> = HashMap::new();
         for row in abilities::Entity::find()
-            .filter(abilities::Column::Delegation.is_in(root_ids))
+            .filter(abilities::Column::Delegation.is_in(nodes.iter().copied()))
             .all(db)
             .await?
         {
@@ -230,14 +235,15 @@ impl AuthGraphSnapshot {
         if reloaded != guarded {
             return Err(ChainTraversalError::LimitExceeded);
         }
-        Self::load_from_closure(db, roots, nodes, edges).await
+        Self::load_from_closure(db, nodes, edges).await
     }
 
     pub(crate) fn delegation(&self, id: &Hash) -> Option<&delegation::Model> {
         self.delegations.get(id)
     }
 
-    /// Persisted ability/caveat rows for a cited proof root.
+    /// Persisted ability/caveat rows for any node in the loaded closure
+    /// (a cited proof root or one of its ancestors).
     pub(crate) fn abilities(&self, id: &Hash) -> &[abilities::Model] {
         self.abilities.get(id).map(Vec::as_slice).unwrap_or(&[])
     }
@@ -582,7 +588,7 @@ mod tests {
             assert_eq!(lock_query_count, 1, "depth {depth}: lock-key closure query");
 
             let before = counter.load(Ordering::SeqCst);
-            let snapshot = AuthGraphSnapshot::load_from_closure(&db, &[leaf], nodes, parents)
+            let snapshot = AuthGraphSnapshot::load_from_closure(&db, nodes, parents)
                 .await
                 .unwrap();
             let reuse_query_count = counter.load(Ordering::SeqCst) - before;
