@@ -143,6 +143,21 @@ impl AuthGraphSnapshot {
         roots: &[Hash],
     ) -> Result<Self, ChainTraversalError> {
         let (nodes, parents) = load_closure_edges(db, roots).await?;
+        Self::load_from_closure(db, roots, nodes, parents).await
+    }
+
+    /// Same as [`Self::load`], but for a closure (`nodes`/`parents`) already
+    /// known from a prior `load_closure_edges` call on this same connection's
+    /// database. Only safe to call with a closure that is already *proven*
+    /// complete for the connection being read from -- see [`Self::load_guarded`]
+    /// for the production caller, which re-derives and verifies the closure
+    /// under the caller's chain guards instead of trusting a pre-guard read.
+    pub(crate) async fn load_from_closure<C: ConnectionTrait>(
+        db: &C,
+        roots: &[Hash],
+        nodes: Vec<Hash>,
+        parents: HashMap<Hash, Vec<Hash>>,
+    ) -> Result<Self, ChainTraversalError> {
         if nodes.is_empty() {
             return Ok(Self {
                 parents,
@@ -187,6 +202,37 @@ impl AuthGraphSnapshot {
         })
     }
 
+    /// TC-411: the production entry point for the invocation path. `roots`
+    /// is the invocation's cited proofs; `guarded_keys` is the pre-guard
+    /// closure node set the caller already holds chain guards over (see
+    /// `SpaceDatabase::acquire_shared_chain_guards_for_keys`).
+    ///
+    /// A registration racing the guard acquisition (its exclusive guard
+    /// released just as this invocation's shared guard is granted) can leave
+    /// a cited root visible for the first time with ancestor edges that the
+    /// pre-guard closure read never saw -- `guarded_keys` would then be
+    /// missing those ancestors, and reusing it blindly would authorize
+    /// against an incomplete chain. This re-derives the closure on `db`
+    /// (expected to be the guarded connection/transaction) and fails closed
+    /// with [`ChainTraversalError::LimitExceeded`] if the freshly observed
+    /// node set is not *exactly* `guarded_keys`, instead of silently
+    /// authorizing against the stale pre-guard view. `parent_delegations`
+    /// rows are insert-only, so equality here proves the guarded view was
+    /// already complete.
+    pub(crate) async fn load_guarded<C: ConnectionTrait>(
+        db: &C,
+        roots: &[Hash],
+        guarded_keys: &[Hash],
+    ) -> Result<Self, ChainTraversalError> {
+        let (nodes, edges) = load_closure_edges(db, roots).await?;
+        let guarded: HashSet<Hash> = guarded_keys.iter().copied().collect();
+        let reloaded: HashSet<Hash> = nodes.iter().copied().collect();
+        if reloaded != guarded {
+            return Err(ChainTraversalError::LimitExceeded);
+        }
+        Self::load_from_closure(db, roots, nodes, edges).await
+    }
+
     pub(crate) fn delegation(&self, id: &Hash) -> Option<&delegation::Model> {
         self.delegations.get(id)
     }
@@ -218,6 +264,50 @@ impl AuthGraphSnapshot {
             }
         }
         ordered
+    }
+
+    /// TC-411: every distinct SQL constrained-statement caveat reachable
+    /// from `roots` (each root plus its full ancestor closure), read purely
+    /// from this already-loaded snapshot -- zero additional statements.
+    /// Mirrors the persisted-caveat shapes accepted by the historical
+    /// per-request database walk (`constrained-statements` value directly,
+    /// or nested under a `"constrained-statements"` key); resolving
+    /// ambiguity across the returned candidates (zero/one/many) is the
+    /// caller's responsibility so SQL-specific fail-closed semantics stay
+    /// out of the shared authorization graph.
+    pub(crate) fn constrained_statement_caveat_candidates(
+        &self,
+        roots: &[Hash],
+    ) -> Vec<crate::policy_capability::sql_caveat::SqlConstrainedStatementCaveat> {
+        let mut visited = HashSet::new();
+        let mut found = Vec::new();
+        for root in roots {
+            for id in self.chain_ids_from(root) {
+                if !visited.insert(id) {
+                    continue;
+                }
+                for row in self.abilities(&id) {
+                    for v in row.caveats.0.values() {
+                        let parsed =
+                            crate::policy_capability::sql_caveat::parse(v)
+                                .ok()
+                                .or_else(|| {
+                                    v.as_object()
+                                        .and_then(|o| o.get("constrained-statements"))
+                                        .and_then(|inner| {
+                                            crate::policy_capability::sql_caveat::parse(inner).ok()
+                                        })
+                                });
+                        if let Some(caveat) = parsed {
+                            if !found.contains(&caveat) {
+                                found.push(caveat);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        found
     }
 
     /// First revoked strict ancestor of `start`, as a CID string.
@@ -467,5 +557,84 @@ mod tests {
             assert_eq!(legacy_queries, expected_legacy, "depth {depth}");
             assert_eq!(optimized_queries, 5, "depth {depth}");
         }
+    }
+
+    /// Cost characteristics of the low-level `load_from_closure` primitive
+    /// in isolation: given a closure already known to be complete for the
+    /// connection being read from, it issues only the
+    /// delegations/abilities/revocations batch (3 queries) instead of
+    /// `load`'s 4 (which re-walks the recursive edge CTE), and depth 4 costs
+    /// exactly what depth 1 costs. The production invocation path does NOT
+    /// blindly reuse a pre-guard closure this way -- see
+    /// `AuthGraphSnapshot::load_guarded` and
+    /// `snapshot_load_guarded_fails_closed_on_concurrent_registration` below
+    /// for why a pre-guard closure cannot be trusted without re-verification.
+    #[tokio::test]
+    async fn snapshot_reuses_preguard_closure_without_a_second_edge_query() {
+        for depth in [0, 1, 4] {
+            let (db, counter) = counted_database().await;
+            let ids = insert_chain(&db, &format!("reuse-{depth}"), depth).await;
+            let leaf = ids[0];
+
+            let before = counter.load(Ordering::SeqCst);
+            let (nodes, parents) = load_closure_edges(&db, &[leaf]).await.unwrap();
+            let lock_query_count = counter.load(Ordering::SeqCst) - before;
+            assert_eq!(lock_query_count, 1, "depth {depth}: lock-key closure query");
+
+            let before = counter.load(Ordering::SeqCst);
+            let snapshot = AuthGraphSnapshot::load_from_closure(&db, &[leaf], nodes, parents)
+                .await
+                .unwrap();
+            let reuse_query_count = counter.load(Ordering::SeqCst) - before;
+
+            assert_eq!(
+                reuse_query_count, 3,
+                "depth {depth}: reused-closure snapshot query count must be depth-independent"
+            );
+            assert_eq!(snapshot.chain_ids_from(&leaf).len(), depth + 1);
+            // Depth 1 and depth 4 must cost exactly the same: 1 lock-key
+            // query + 3 reused-closure snapshot queries, independent of how
+            // many ancestors are in the chain.
+            if depth == 1 || depth == 4 {
+                assert_eq!(
+                    lock_query_count, 1,
+                    "depth {depth} lock-key cost vs depth 1/4 parity"
+                );
+                assert_eq!(
+                    reuse_query_count, 3,
+                    "depth {depth} snapshot cost vs depth 1/4 parity"
+                );
+            }
+        }
+    }
+
+    /// TC-411: `load_guarded` re-derives the closure on the guarded
+    /// connection and must fail closed when the guarded key set (computed
+    /// pre-guard) does not match what is actually reachable now -- the
+    /// signature of a delegation whose registration committed while this
+    /// invocation was waiting to acquire its chain guard, so the pre-guard
+    /// closure never saw the new ancestor edge.
+    #[tokio::test]
+    async fn snapshot_load_guarded_fails_closed_on_concurrent_registration() {
+        let (db, _) = counted_database().await;
+        let ids = insert_chain(&db, "race", 1).await;
+        let leaf = ids[0];
+
+        // Simulates the pre-guard closure read happening before the
+        // ancestor edge (leaf -> ids[1]) is visible: the caller believes
+        // `leaf` has no parents and only guards `[leaf]`.
+        let stale_guarded_keys = vec![leaf];
+        assert!(matches!(
+            AuthGraphSnapshot::load_guarded(&db, &[leaf], &stale_guarded_keys).await,
+            Err(ChainTraversalError::LimitExceeded)
+        ));
+
+        // Once the guarded key set matches what is actually reachable, the
+        // same call succeeds and exposes the full chain.
+        let complete_guarded_keys = ids.clone();
+        let snapshot = AuthGraphSnapshot::load_guarded(&db, &[leaf], &complete_guarded_keys)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.chain_ids_from(&leaf).len(), 2);
     }
 }

@@ -182,13 +182,14 @@ pub(crate) async fn authorize_admitted<C: ConnectionTrait>(
     db: &C,
     invocation: &util::InvocationInfo,
     now: OffsetDateTime,
+    auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
 ) -> Result<(), Error> {
     invocation
         .invocation
         .payload()
         .validate_time(None)
         .map_err(|_| InvocationError::InvalidTime)?;
-    validate(db, invocation, Some(now), None).await
+    validate(db, invocation, Some(now), auth_graph).await
 }
 
 pub async fn verify_invocation(invocation: &TinyCloudInvocation) -> Result<(), Error> {
@@ -228,8 +229,23 @@ pub async fn verify_and_authorize<C: ConnectionTrait>(
     invocation: &util::InvocationInfo,
     now: OffsetDateTime,
 ) -> Result<(), Error> {
+    verify_and_authorize_with_graph(db, invocation, now, None).await
+}
+
+/// Same as [`verify_and_authorize`], but lets a caller inside this crate that
+/// already holds a request-scoped [`crate::auth_graph::AuthGraphSnapshot`]
+/// (loaded under the shared chain guards) pass it straight through instead of
+/// letting `validate` perform a second closure/graph load (TC-411). Not
+/// `pub`: `AuthGraphSnapshot` is `pub(crate)`, so this signature cannot cross
+/// the crate boundary.
+pub(crate) async fn verify_and_authorize_with_graph<C: ConnectionTrait>(
+    db: &C,
+    invocation: &util::InvocationInfo,
+    now: OffsetDateTime,
+    auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
+) -> Result<(), Error> {
     verify_invocation(&invocation.invocation).await?;
-    validate(db, invocation, Some(now), None).await
+    validate(db, invocation, Some(now), auth_graph).await
 }
 
 // verify parenthood and authorization

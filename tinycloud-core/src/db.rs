@@ -136,6 +136,11 @@ pub struct KvInvokeOptions {
     pub max_response_bytes: Option<u64>,
     pub list_limit: Option<usize>,
     pub list_cursor: Option<Path>,
+    /// TC-411: when set, populate `TransactResult::sql_constrained_statement_candidates`
+    /// from the request-scoped authorization snapshot that this invocation
+    /// already builds -- zero additional statements. Off by default so
+    /// ordinary KV invocations don't pay even the in-memory scan cost.
+    pub derive_sql_constrained_statement_caveat: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +158,13 @@ pub struct TransactResult {
     /// CIDs of delegations that were processed (saved) regardless of space existence.
     /// Used to return a CID even when all spaces were skipped.
     pub delegation_cids: Vec<Hash>,
+    /// TC-411: distinct SQL constrained-statement caveats found on the
+    /// validated request's proof chain, populated only when
+    /// `KvInvokeOptions::derive_sql_constrained_statement_caveat` was set.
+    /// Always empty otherwise. Resolving zero/one/many candidates into an
+    /// effective (or ambiguous, fail-closed) caveat is the caller's job.
+    pub sql_constrained_statement_candidates:
+        Vec<crate::policy_capability::sql_caveat::SqlConstrainedStatementCaveat>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1587,9 +1599,8 @@ where
             .collect();
         let authz_start = Instant::now();
         let closure_start = Instant::now();
-        let lock_keys = crate::auth_graph::load_closure_edges(&self.conn, &roots)
+        let closure = crate::auth_graph::load_closure_edges(&self.conn, &roots)
             .await
-            .map(|(keys, _)| keys)
             .map_err(|error| match error {
                 revocation::ChainTraversalError::Db(error) => TxError::Db(error),
                 revocation::ChainTraversalError::LimitExceeded => {
@@ -1598,11 +1609,11 @@ where
             });
         crate::telemetry::observe_stage(
             crate::telemetry::InvocationStage::ChainClosureQuery,
-            crate::telemetry::StageOutcome::from(lock_keys.is_ok()),
+            crate::telemetry::StageOutcome::from(closure.is_ok()),
             closure_start.elapsed(),
         );
-        let lock_keys = match lock_keys {
-            Ok(keys) => keys,
+        let (lock_keys, closure_edges) = match closure {
+            Ok(closure) => closure,
             Err(error) => {
                 crate::telemetry::observe_stage(
                     crate::telemetry::InvocationStage::AuthorizationGraphLoad,
@@ -1618,7 +1629,9 @@ where
         // serialized against this authorization decision. What is dropped is
         // invocation-vs-invocation exclusion, which the revocation-ordering
         // invariant never depended on.
-        let _chain_guards = self.acquire_shared_chain_guards_for_keys(lock_keys).await;
+        let _chain_guards = self
+            .acquire_shared_chain_guards_for_keys(lock_keys.clone())
+            .await;
         let mutation_keys = invocation
             .0
             .capabilities
@@ -1636,7 +1649,45 @@ where
             })
             .collect::<Vec<_>>();
         if mutation_keys.is_empty() {
-            return self.invoke_read_only::<S>(invocation, options, mode).await;
+            // TC-411: build the request-scoped snapshot once, after the
+            // shared chain guards above are held, and pass it straight into
+            // read authorization so `validate` does not perform a second
+            // closure/graph load. `load_guarded` re-derives the closure on
+            // `self.conn` (now guarded) and fails closed if it does not
+            // exactly match the pre-guard `lock_keys` — see
+            // `AuthGraphSnapshot::load_guarded` for why the pre-guard
+            // closure alone cannot be trusted — then re-reads
+            // delegations/abilities/revocations fresh, so revocation state
+            // is current as of after guard acquisition.
+            let _ = closure_edges;
+            let auth_graph = match crate::auth_graph::AuthGraphSnapshot::load_guarded(
+                &self.conn, &roots, &lock_keys,
+            )
+            .await
+            {
+                Ok(graph) => graph,
+                Err(error) => {
+                    crate::telemetry::observe_stage(
+                        crate::telemetry::InvocationStage::AuthorizationGraphLoad,
+                        crate::telemetry::StageOutcome::Error,
+                        authz_start.elapsed(),
+                    );
+                    return Err(TxStoreError::Tx(match error {
+                        revocation::ChainTraversalError::Db(error) => TxError::Db(error),
+                        revocation::ChainTraversalError::LimitExceeded => {
+                            TxError::ChainTraversalLimitExceeded
+                        }
+                    }));
+                }
+            };
+            crate::telemetry::observe_stage(
+                crate::telemetry::InvocationStage::AuthorizationGraphLoad,
+                crate::telemetry::StageOutcome::Ok,
+                authz_start.elapsed(),
+            );
+            return self
+                .invoke_read_only::<S>(invocation, options, mode, Some(&auth_graph))
+                .await;
         }
         let _kv_object_guards = self.acquire_kv_object_guards(&mutation_keys).await;
         let mut stages = HashMap::new();
@@ -1709,22 +1760,30 @@ where
         // recorded as a failure; it is disarmed to `ok` right before commit.
         let tx_body_timer =
             crate::telemetry::StageTimer::start(crate::telemetry::InvocationStage::DbTxBody);
-        let auth_graph = match crate::auth_graph::AuthGraphSnapshot::load(&tx, &roots).await {
-            Ok(graph) => graph,
-            Err(error) => {
-                crate::telemetry::observe_stage(
-                    crate::telemetry::InvocationStage::AuthorizationGraphLoad,
-                    crate::telemetry::StageOutcome::Error,
-                    authz_start.elapsed(),
-                );
-                return Err(TxStoreError::Tx(match error {
-                    revocation::ChainTraversalError::Db(error) => TxError::Db(error),
-                    revocation::ChainTraversalError::LimitExceeded => {
-                        TxError::ChainTraversalLimitExceeded
-                    }
-                }));
-            }
-        };
+        // TC-411: re-derive and verify the closure against the pre-guard
+        // `lock_keys` inside the transaction (see the read-only branch above
+        // and `AuthGraphSnapshot::load_guarded`); delegations/abilities/
+        // revocations are loaded fresh here, on `&tx`, so mutation
+        // revocation checks remain inside the transaction.
+        let _ = closure_edges;
+        let auth_graph =
+            match crate::auth_graph::AuthGraphSnapshot::load_guarded(&tx, &roots, &lock_keys).await
+            {
+                Ok(graph) => graph,
+                Err(error) => {
+                    crate::telemetry::observe_stage(
+                        crate::telemetry::InvocationStage::AuthorizationGraphLoad,
+                        crate::telemetry::StageOutcome::Error,
+                        authz_start.elapsed(),
+                    );
+                    return Err(TxStoreError::Tx(match error {
+                        revocation::ChainTraversalError::Db(error) => TxError::Db(error),
+                        revocation::ChainTraversalError::LimitExceeded => {
+                            TxError::ChainTraversalLimitExceeded
+                        }
+                    }));
+                }
+            };
         crate::telemetry::observe_stage(
             crate::telemetry::InvocationStage::AuthorizationGraphLoad,
             crate::telemetry::StageOutcome::Ok,
@@ -1921,6 +1980,7 @@ where
         invocation: Invocation,
         options: KvInvokeOptions,
         mode: InvokeMode,
+        auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
     ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
     where
         B: ImmutableWriteStore<S> + ImmutableReadStore,
@@ -1931,19 +1991,28 @@ where
         // once at the admission boundary; only re-check authorization and
         // signed-time validity here rather than verifying the signature a
         // second time.
+        // TC-411: the caller already loaded the request-scoped snapshot under
+        // the shared chain guards, so pass it through instead of letting
+        // `validate` perform a second closure/graph load.
         match mode {
-            InvokeMode::Admitted => {
-                invocation::authorize_admitted(&self.conn, &invocation.0, OffsetDateTime::now_utc())
-                    .await
-                    .map_err(TxError::<B, K>::from)?
-            }
-            InvokeMode::Public | InvokeMode::Internal => invocation::verify_and_authorize(
+            InvokeMode::Admitted => invocation::authorize_admitted(
                 &self.conn,
                 &invocation.0,
                 OffsetDateTime::now_utc(),
+                auth_graph,
             )
             .await
             .map_err(TxError::<B, K>::from)?,
+            InvokeMode::Public | InvokeMode::Internal => {
+                invocation::verify_and_authorize_with_graph(
+                    &self.conn,
+                    &invocation.0,
+                    OffsetDateTime::now_utc(),
+                    auth_graph,
+                )
+                .await
+                .map_err(TxError::<B, K>::from)?
+            }
         };
 
         let requested_spaces = invocation.0.spaces().cloned().collect::<HashSet<_>>();
@@ -2064,11 +2133,32 @@ where
             read_audit_start.elapsed(),
         );
         record_result?;
+        // TC-411: derive the SQL constrained-statement caveat candidates
+        // straight from the already-loaded, already-validated `auth_graph`
+        // snapshot -- an in-memory scan, zero additional statements -- so a
+        // caller (the SQL route) never has to re-walk `parent_delegations`
+        // itself.
+        let sql_constrained_statement_candidates =
+            if options.derive_sql_constrained_statement_caveat {
+                let roots: Vec<Hash> = invocation
+                    .0
+                    .parents
+                    .iter()
+                    .copied()
+                    .map(Hash::from)
+                    .collect();
+                auth_graph
+                    .map(|graph| graph.constrained_statement_caveat_candidates(&roots))
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
         Ok((
             TransactResult {
                 commits: HashMap::new(),
                 skipped_spaces: Vec::new(),
                 delegation_cids: Vec::new(),
+                sql_constrained_statement_candidates,
             },
             results,
         ))
@@ -2131,6 +2221,7 @@ fn already_registered_result(retained_hash: Hash) -> TransactResult {
         commits: HashMap::new(),
         skipped_spaces: Vec::new(),
         delegation_cids: vec![retained_hash],
+        sql_constrained_statement_candidates: Vec::new(),
     }
 }
 
@@ -2386,15 +2477,23 @@ async fn event_spaces<'a, C: ConnectionTrait>(
 ) -> Result<HashMap<SpaceId, Vec<&'a (Hash, Event)>>, DbErr> {
     // get orderings of events listed as revoked by events in the ev list
     let mut spaces = HashMap::<SpaceId, Vec<&'a (Hash, Event)>>::new();
-    let revoked_events = event_order::Entity::find()
-        .filter(
-            event_order::Column::Event.is_in(ev.iter().filter_map(|(_, e)| match e {
-                Event::Revocation(r) => Some(Hash::from(r.0.revoked)),
-                _ => None,
-            })),
-        )
-        .all(db)
-        .await?;
+    let revoked_hashes: Vec<Hash> = ev
+        .iter()
+        .filter_map(|(_, e)| match e {
+            Event::Revocation(r) => Some(Hash::from(r.0.revoked)),
+            _ => None,
+        })
+        .collect();
+    // Skip the round trip entirely when this batch contains no Revocation
+    // event; an empty IN-list would otherwise still hit the DB every call.
+    let revoked_events = if revoked_hashes.is_empty() {
+        Vec::new()
+    } else {
+        event_order::Entity::find()
+            .filter(event_order::Column::Event.is_in(revoked_hashes))
+            .all(db)
+            .await?
+    };
     for e in ev {
         match &e.1 {
             Event::Delegation(d) => {
@@ -2876,6 +2975,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                 .collect(),
             skipped_spaces,
             delegation_cids,
+            sql_constrained_statement_candidates: Vec::new(),
         })
     } else {
         // All spaces were skipped (delegation-only with no existing spaces).
@@ -2919,6 +3019,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             commits: HashMap::new(),
             skipped_spaces,
             delegation_cids,
+            sql_constrained_statement_candidates: Vec::new(),
         })
     }
 }

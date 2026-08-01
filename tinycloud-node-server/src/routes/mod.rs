@@ -517,6 +517,7 @@ pub async fn delegate(
                     commits,
                     skipped_spaces,
                     delegation_cids,
+                    sql_constrained_statement_candidates: _,
                 } = result;
                 let activated: Vec<String> = commits.keys().map(|s| s.to_string()).collect();
                 let skipped: Vec<String> = skipped_spaces.iter().map(|s| s.to_string()).collect();
@@ -1024,6 +1025,7 @@ fn kv_invoke_options_for_capabilities_with_cursor(
         max_response_bytes,
         list_limit,
         list_cursor,
+        derive_sql_constrained_statement_caveat: false,
     })
 }
 
@@ -2135,9 +2137,11 @@ async fn handle_sql_invoke(
     // path is a holdover (and is still consulted as a fallback so the
     // tinycloud.sql/write path keeps working) but a constrained-statements
     // caveat on the delegation chain MUST win and fail-closed.
-    let parent_cids: Vec<_> = admitted.invocation().0.parents.to_vec();
-    let chain_constrained = derive_chain_constrained_caveat(tinycloud, &parent_cids).await?;
-
+    //
+    // TC-411: the caveat candidates are read out of `auth_result` below,
+    // straight from the request-scoped authorization snapshot that
+    // `verify_auth_admitted` already builds to authorize the invocation --
+    // no separate `parent_delegations` walk, so this adds zero statements.
     let facts_caveats: Option<SqlCaveats> = admitted
         .invocation()
         .0
@@ -2158,7 +2162,16 @@ async fn handle_sql_invoke(
     // boundary; `verify_auth_admitted` uses the admitted core entry point so this
     // shared SQL/DuckDB authorization path does not re-run signature
     // verification a second time.
-    let auth_result = verify_auth_admitted("server.sql.auth", admitted, tinycloud).await?;
+    let auth_result = verify_auth_admitted(
+        "server.sql.auth",
+        admitted,
+        tinycloud,
+        KvInvokeOptions {
+            derive_sql_constrained_statement_caveat: true,
+            ..Default::default()
+        },
+    )
+    .await?;
     let body_start = Instant::now();
     let body_result = read_json_body(data).await;
     crate::prometheus::observe_span(
@@ -2184,7 +2197,9 @@ async fn handle_sql_invoke(
     // primitive-only non-fixed binds). The chain caveat — NOT the
     // invocation envelope's facts — is the source of truth so a holder
     // cannot widen or drop their grant by editing the invocation.
-    let constrained = chain_constrained;
+    let constrained = resolve_constrained_statement_caveat(
+        auth_result.sql_constrained_statement_candidates.clone(),
+    )?;
     let sql_request = if let Some(caveat) = &constrained {
         enforce_constrained_profile(caveat, sql_request)?
     } else {
@@ -2308,34 +2323,65 @@ fn sql_request_requires_admin(request: &SqlRequest) -> bool {
     }
 }
 
-/// W1 (D): walk the validated transitive delegation chain starting from the
-/// invocation's directly-cited parents and return the first SQL
-/// constrained-statement caveat present on any ancestor's persisted abilities
-/// row. The persisted `caveats` JSON (NOT the invocation envelope's facts) is
-/// the source of truth so a holder cannot widen or drop their grant by
-/// editing the invocation. Walking ancestors closes the audit gap where a
-/// child citing a no-caveat descendant would otherwise bypass an ancestor
-/// caveat row.
-async fn derive_chain_constrained_caveat(
-    tinycloud: &State<TinyCloud>,
-    parent_cids: &[tinycloud_auth::authorization::Cid],
+/// W1 (D) / TC-411: resolve a set of distinct SQL constrained-statement
+/// caveat candidates found on a validated proof chain into the single
+/// effective caveat, or `None` if there were none. This is pure in-memory
+/// selection over already-collected candidates -- no database access -- so
+/// it is shared by the production path (candidates read straight out of the
+/// request-scoped authorization snapshot, zero additional statements) and
+/// the database-backed reference walk exercised by tests below.
+///
+///   - zero distinct caveats found -> no constraint (unchanged behavior);
+///   - exactly one distinct caveat found -> that caveat binds;
+///   - more than one distinct caveat found -> the tightest one binds only if
+///     it is a client of (contained by) every other candidate found; if no
+///     such unique tightest caveat exists, the constraints are incomparable
+///     and authorization fails closed rather than guessing (selection can
+///     never depend on row order since it does not depend on discovery
+///     order at all).
+fn resolve_constrained_statement_caveat(
+    found: Vec<tinycloud_core::policy_capability::SqlConstrainedStatementCaveat>,
 ) -> Result<
     Option<tinycloud_core::policy_capability::SqlConstrainedStatementCaveat>,
     (Status, String),
 > {
-    if parent_cids.is_empty() {
-        return Ok(None);
+    use tinycloud_core::policy_capability::sql_caveat;
+
+    match found.len() {
+        0 => Ok(None),
+        1 => Ok(found.into_iter().next()),
+        _ => {
+            // The effective caveat must be contained by every other
+            // candidate (i.e. it is the tightest of the set). Selection by
+            // structural containment, not by discovery order.
+            let tightest: Vec<_> = found
+                .iter()
+                .filter(|candidate| {
+                    found
+                        .iter()
+                        .all(|other| sql_caveat::contains(other, candidate).is_ok())
+                })
+                .collect();
+            match tightest.as_slice() {
+                [single] => Ok(Some((*single).clone())),
+                _ => Err((
+                    Status::Forbidden,
+                    "sql_constrained_statements_ambiguous_chain".to_string(),
+                )),
+            }
+        }
     }
-    let conn = tinycloud
-        .readable()
-        .await
-        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
-    derive_chain_constrained_caveat_with_conn(&conn, parent_cids).await
 }
 
-/// W1 (D): the actual chain-walk against any seaorm `ConnectionTrait`.
-/// Split out for direct test access without requiring a Rocket-managed
-/// `State<TinyCloud>`.
+/// W1 (D) / TC-411: database-backed reference implementation of the chain
+/// walk that the production path replaced with an in-memory scan of the
+/// request-scoped authorization snapshot (see
+/// `AuthGraphSnapshot::constrained_statement_caveat_candidates` and
+/// `resolve_constrained_statement_caveat` above). Test-only: kept to give
+/// the selection algorithm direct database-backed coverage (multiple
+/// roots/ancestors, ambiguous chains) without needing access to
+/// `tinycloud-core`'s crate-private snapshot type from this crate's tests.
+#[cfg(test)]
 async fn derive_chain_constrained_caveat_with_conn<C: tinycloud_core::sea_orm::ConnectionTrait>(
     conn: &C,
     parent_cids: &[tinycloud_auth::authorization::Cid],
@@ -2353,10 +2399,14 @@ async fn derive_chain_constrained_caveat_with_conn<C: tinycloud_core::sea_orm::C
         return Ok(None);
     }
 
-    // BFS the chain via parent_delegations so an ancestor's caveat row binds
-    // even if the directly-cited descendant has no caveat row of its own.
+    // BFS the whole chain via parent_delegations so an ancestor's caveat row
+    // binds even if the directly-cited descendant has no caveat row of its
+    // own, and so a caveat on any one cited root/ancestor is not missed
+    // because another root's ancestor happened to be scanned first.
     let mut frontier: Vec<Hash> = parent_cids.iter().copied().map(Hash::from).collect();
     let mut visited: HashSet<Hash> = HashSet::new();
+    let mut found: Vec<tinycloud_core::policy_capability::SqlConstrainedStatementCaveat> =
+        Vec::new();
 
     while !frontier.is_empty() {
         let batch: Vec<Hash> = frontier.drain(..).filter(|h| visited.insert(*h)).collect();
@@ -2370,12 +2420,14 @@ async fn derive_chain_constrained_caveat_with_conn<C: tinycloud_core::sea_orm::C
             .map_err(|e| (Status::InternalServerError, e.to_string()))?;
         for row in rows {
             for v in row.caveats.0.values() {
-                if let Ok(caveat) = sql_caveat::parse(v) {
-                    return Ok(Some(caveat));
-                }
-                if let Some(inner) = v.as_object().and_then(|o| o.get("constrained-statements")) {
-                    if let Ok(caveat) = sql_caveat::parse(inner) {
-                        return Ok(Some(caveat));
+                let parsed = sql_caveat::parse(v).ok().or_else(|| {
+                    v.as_object()
+                        .and_then(|o| o.get("constrained-statements"))
+                        .and_then(|inner| sql_caveat::parse(inner).ok())
+                });
+                if let Some(caveat) = parsed {
+                    if !found.contains(&caveat) {
+                        found.push(caveat);
                     }
                 }
             }
@@ -2393,7 +2445,8 @@ async fn derive_chain_constrained_caveat_with_conn<C: tinycloud_core::sea_orm::C
             }
         }
     }
-    Ok(None)
+
+    resolve_constrained_statement_caveat(found)
 }
 
 /// W1 (D): translate the chain-derived constrained-statements caveat into
@@ -2690,7 +2743,13 @@ async fn handle_duckdb_invoke(
     // envelope was verified once at admission; only authorization,
     // revocation, caveat containment, and signed-time validity are
     // re-checked here.
-    let auth_result = verify_auth_admitted("server.duckdb.auth", admitted, tinycloud).await?;
+    let auth_result = verify_auth_admitted(
+        "server.duckdb.auth",
+        admitted,
+        tinycloud,
+        KvInvokeOptions::default(),
+    )
+    .await?;
 
     let (space, path, ability) = select_database_scope(duckdb_caps, "duckdb")?;
     let db_name = DuckDbService::db_name_from_path(path);
@@ -3184,10 +3243,11 @@ async fn verify_auth_admitted(
     span: &'static str,
     invocation: AdmittedInvocation,
     tinycloud: &State<TinyCloud>,
+    options: KvInvokeOptions,
 ) -> Result<TransactResult, (Status, String)> {
     let start = Instant::now();
     let result = tinycloud
-        .invoke_admitted::<BlockStage>(invocation, HashMap::new())
+        .invoke_with_options_admitted::<BlockStage>(invocation, HashMap::new(), options)
         .await
         .map_err(|e| {
             (
