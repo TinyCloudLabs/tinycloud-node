@@ -1676,6 +1676,7 @@ struct V2DeliveryRequest {
     share_url: String,
     document_name: String,
     jti: String,
+    idempotency_key: String,
     expires_at: String,
     request_body_digest: String,
 }
@@ -3373,6 +3374,7 @@ pub async fn authorize_delivery_v2(
     if expires <= now
         || expires > now + time::Duration::minutes(5)
         || decode_canonical_b64(&request.jti, 16).map_or(true, |value| value.len() != 16)
+        || !canonical_delivery_idempotency_key(&request.idempotency_key)
     {
         return Err(share_error("delivery_authorization_invalid"));
     }
@@ -3448,7 +3450,7 @@ pub async fn authorize_delivery_v2(
         "authorityMaterialHandle": request.registration_cid,
         "authorityMaterialDigest": b64_digest(request.registration_cid.as_bytes()),
         "requestBodyDigest": request.request_body_digest,
-        "idempotencyKey": request.jti,
+        "idempotencyKey": request.idempotency_key,
         "expiresAt": request.expires_at,
         "dataAuthority": false
     });
@@ -3457,6 +3459,14 @@ pub async fn authorize_delivery_v2(
     Ok(Json(
         serde_json::json!({ "authorization": authorization, "proof": proof }),
     ))
+}
+
+fn canonical_delivery_idempotency_key(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
 }
 
 #[cfg(test)]

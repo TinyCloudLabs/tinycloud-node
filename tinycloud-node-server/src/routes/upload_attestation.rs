@@ -20,7 +20,7 @@ use std::sync::Arc;
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 use tinycloud_auth::identity::did_principal_matches;
 use tinycloud_core::{
-    models::{delegation, invocation as invocation_model},
+    models::{abilities, delegation, invocation as invocation_model},
     policy_capability::jcs,
     relationships::parent_delegations,
     sea_orm::{ColumnTrait, EntityTrait, QueryFilter},
@@ -131,6 +131,7 @@ pub struct UploadAttestation {
     pub delete_after: String,
     pub retention: Value,
     pub issued_at: String,
+    pub authority_expires_at: String,
     pub expires_at: String,
     pub jti: String,
     pub signature: String,
@@ -167,6 +168,9 @@ pub async fn mint_upload_attestation(
         .await
         .map_err(|_| error(Status::Unauthorized, "upload_authorization_invalid"))?;
     let auth = &admitted.invocation().0;
+    if auth.invocation.payload().audience.to_string() != runtime.issuer {
+        return Err(error(Status::Forbidden, "upload_authorization_invalid"));
+    }
     validate_request(&request, &runtime.share_origin, now)
         .map_err(|_| error(Status::BadRequest, "upload_attestation_invalid"))?;
     invocation_model::authorize_admitted(&runtime.conn, auth, now)
@@ -218,6 +222,7 @@ pub async fn mint_upload_attestation(
         delete_after: request.delete_after,
         retention: request.retention,
         issued_at: timestamp(now),
+        authority_expires_at: timestamp(authority_expiry),
         expires_at: timestamp(expires_at),
         jti: random_protocol_jti().as_str().to_owned(),
         signature: String::new(),
@@ -316,6 +321,9 @@ async fn owner_did_and_expiry(
             .await
             .ok()?;
         if parents.is_empty() {
+            if !has_baseline_ability(conn, current).await {
+                return None;
+            }
             return Some((row.delegator, expiry));
         }
         if parents.len() != 1 {
@@ -325,6 +333,24 @@ async fn owner_did_and_expiry(
         current = parents[0].parent;
     }
     None
+}
+
+async fn has_baseline_ability(
+    conn: &tinycloud_core::sea_orm::DatabaseConnection,
+    delegation_id: tinycloud_core::hash::Hash,
+) -> bool {
+    abilities::Entity::find()
+        .filter(abilities::Column::Delegation.eq(delegation_id))
+        .all(conn)
+        .await
+        .ok()
+        .is_some_and(|rows| {
+            rows.iter().any(|row| {
+                row.ability.as_ref().as_ref() == BASELINE_ABILITY
+                    && matches!(&row.resource, Resource::TinyCloud(resource)
+                    if resource.service().as_str() == "capabilities" && resource.path().is_none())
+            })
+        })
 }
 
 fn validate_request(
