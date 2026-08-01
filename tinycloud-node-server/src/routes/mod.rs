@@ -926,22 +926,40 @@ fn kv_invoke_options_for_capabilities_with_cursor(
         })
         .collect::<Vec<_>>();
 
+    let kv_get_targets = capabilities
+        .iter()
+        .filter(|capability| {
+            matches!(
+                (&capability.resource, capability.ability.as_ref().as_ref()),
+                (Resource::TinyCloud(resource), "tinycloud.kv/get")
+                    if resource.service().as_str() == "kv" && resource.path().is_some()
+            )
+        })
+        .count();
+
     let mut preconditions = HashMap::new();
     if let Some(value) = if_none_match {
-        if value.trim() != "*" {
-            return Err((
-                Status::BadRequest,
-                "If-None-Match only supports * for KV create".to_string(),
-            ));
+        if mutation_targets.is_empty() && kv_get_targets == 1 {
+            headers.0 .0.insert("If-None-Match".to_string(), value);
+        } else {
+            if value.trim() != "*" {
+                return Err((
+                    Status::BadRequest,
+                    "If-None-Match only supports * for KV create".to_string(),
+                ));
+            }
+            if multipart
+                || mutation_targets.len() != 1
+                || mutation_targets[0].2 != "tinycloud.kv/put"
+            {
+                return Err((
+                    Status::BadRequest,
+                    "If-None-Match: * requires exactly one non-multipart KV put".to_string(),
+                ));
+            }
+            let (space, path, _) = &mutation_targets[0];
+            preconditions.insert((space.clone(), path.clone()), KvPrecondition::DoesNotExist);
         }
-        if multipart || mutation_targets.len() != 1 || mutation_targets[0].2 != "tinycloud.kv/put" {
-            return Err((
-                Status::BadRequest,
-                "If-None-Match: * requires exactly one non-multipart KV put".to_string(),
-            ));
-        }
-        let (space, path, _) = &mutation_targets[0];
-        preconditions.insert((space.clone(), path.clone()), KvPrecondition::DoesNotExist);
     } else if let Some(value) = if_match {
         if multipart || mutation_targets.len() != 1 {
             return Err((
@@ -3272,6 +3290,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kv_read_if_none_match_remains_available_to_the_response() {
+        let space = test_space_id("conditional-kv-read");
+        let capability = kv_get_capability(&space, "files/report.txt");
+        let etag = "\"blake3-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"";
+        let mut headers = ObjectHeaders(Metadata(BTreeMap::from([(
+            "If-None-Match".to_string(),
+            etag.to_string(),
+        )])));
+
+        let options =
+            kv_invoke_options_for_capabilities(&[capability], &mut headers, false).unwrap();
+
+        assert!(options.preconditions.is_empty());
+        assert_eq!(metadata_header(&headers.0, "if-none-match"), Some(etag));
+    }
+
+    #[tokio::test]
     async fn kv_condition_headers_reject_ambiguous_or_batch_mutations() {
         let space = test_space_id("conditional-kv-invalid");
         let capabilities = [
@@ -3357,6 +3392,20 @@ mod tests {
                 None,
             )),
             ability: Ability::try_from("tinycloud.kv/put".to_string()).unwrap(),
+            caveats: Default::default(),
+        }
+    }
+
+    fn kv_get_capability(space: &SpaceId, path: &str) -> Capability {
+        let path = path.parse().unwrap();
+        Capability {
+            resource: Resource::TinyCloud(space.clone().to_resource(
+                "kv".parse().unwrap(),
+                Some(path),
+                None,
+                None,
+            )),
+            ability: Ability::try_from("tinycloud.kv/get".to_string()).unwrap(),
             caveats: Default::default(),
         }
     }
