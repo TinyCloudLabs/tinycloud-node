@@ -22,13 +22,15 @@ use tinycloud_auth::identity::did_principal_matches;
 use tinycloud_core::{
     models::{delegation, invocation as invocation_model},
     policy_capability::jcs,
-    sea_orm::EntityTrait,
+    relationships::parent_delegations,
+    sea_orm::{ColumnTrait, EntityTrait, QueryFilter},
     share_email::{
         invitation::{random_protocol_jti, Ed25519InvitationSigner, InvitationSigner},
         types::TargetOrigin,
     },
     types::Resource,
     util::{Capability, InvocationInfo},
+    AdmittedInvocation,
 };
 use tokio::io::AsyncReadExt;
 
@@ -41,9 +43,11 @@ use crate::{
 
 const DOMAIN: &[u8] = b"xyz.tinycloud.share/upload-attestation/v1\0";
 const MAX_UPLOAD_METADATA_BYTES: usize = 64 * 1024;
-const MAX_UPLOAD_BYTES: u64 = share_v2::MAX_BODY_BYTES as u64;
+const SEALED_BLOB_OVERHEAD_BYTES: u64 = 1 + 12 + 16;
+const MAX_UPLOAD_BYTES: u64 = share_v2::MAX_BODY_BYTES as u64 + SEALED_BLOB_OVERHEAD_BYTES;
 const MAX_RETENTION_BYTES: usize = 1024;
 const BASELINE_ABILITY: &str = "tinycloud.capabilities/read";
+const MAX_RETENTION_SECONDS: i64 = 8 * 24 * 60 * 60;
 
 #[derive(Debug, Serialize)]
 pub struct ApiErrorBody {
@@ -103,7 +107,6 @@ impl UploadAttestationRuntime {
 pub struct UploadAttestationRequest {
     pub share_origin: String,
     pub encrypted_blob_cid: String,
-    #[serde(alias = "sha256", alias = "encryptedBlobDigest")]
     pub encrypted_blob_sha256: String,
     pub byte_length: u64,
     pub delete_after: String,
@@ -160,10 +163,13 @@ pub async fn mint_upload_attestation(
     }
 
     let now = OffsetDateTime::now_utc();
-    let auth = &invocation.0 .0;
+    let admitted = AdmittedInvocation::admit(invocation.0, config.invocation.max_lifetime_secs)
+        .await
+        .map_err(|_| error(Status::Unauthorized, "upload_authorization_invalid"))?;
+    let auth = &admitted.invocation().0;
     validate_request(&request, &runtime.share_origin, now)
         .map_err(|_| error(Status::BadRequest, "upload_attestation_invalid"))?;
-    invocation_model::verify_and_authorize(&runtime.conn, auth, now)
+    invocation_model::authorize_admitted(&runtime.conn, auth, now)
         .await
         .map_err(|_| error(Status::Unauthorized, "upload_authorization_invalid"))?;
     if !has_baseline_scope(&auth.capabilities)
@@ -178,16 +184,26 @@ pub async fn mint_upload_attestation(
         return Err(error(Status::Unauthorized, "upload_authorization_invalid"));
     }
     replay
-        .check_and_insert(&invocation.0, max_lifetime)
+        .check_and_insert(&admitted, max_lifetime)
         .await
         .map_err(|_| error(Status::Unauthorized, "upload_authorization_invalid"))?;
 
-    let owner_did = owner_did(&runtime.conn, auth)
+    let (owner_did, delegation_expiry) = owner_did_and_expiry(&runtime.conn, auth)
         .await
         .ok_or(error(Status::Forbidden, "upload_authorization_invalid"))?;
     let session_did = auth.invoker.clone();
 
-    let expires_at = now + Duration::seconds(120);
+    let invocation_expiry = OffsetDateTime::from_unix_timestamp_nanos(
+        (auth.invocation.payload().expiration.as_seconds() * 1_000_000_000.0) as i128,
+    )
+    .map_err(|_| error(Status::Unauthorized, "upload_authorization_invalid"))?;
+    let authority_expiry = delegation_expiry
+        .map(|expiry| expiry.min(invocation_expiry))
+        .unwrap_or(invocation_expiry);
+    let expires_at = (now + Duration::seconds(120)).min(authority_expiry);
+    if expires_at <= now {
+        return Err(error(Status::Unauthorized, "upload_authorization_invalid"));
+    }
     let mut attestation = UploadAttestation {
         artifact_type: "TinyCloudShareUploadAttestation",
         version: 1,
@@ -246,12 +262,11 @@ fn without_signature(value: &Value) -> Value {
 }
 
 fn has_baseline_scope(capabilities: &[Capability]) -> bool {
-    capabilities.len() == 1
-        && capabilities.iter().any(|capability| {
-            capability.ability.as_ref().as_ref() == BASELINE_ABILITY
-                && matches!(&capability.resource, Resource::TinyCloud(resource)
+    capabilities.iter().any(|capability| {
+        capability.ability.as_ref().as_ref() == BASELINE_ABILITY
+            && matches!(&capability.resource, Resource::TinyCloud(resource)
                     if resource.service().as_str() == "capabilities" && resource.path().is_none())
-        })
+    })
 }
 
 fn invocation_body_digest_matches(invocation: &InvocationInfo, expected: &str) -> bool {
@@ -263,32 +278,53 @@ fn invocation_body_digest_matches(invocation: &InvocationInfo, expected: &str) -
         .is_some_and(|facts| {
             facts.iter().any(|fact| {
                 fact.as_object().is_some_and(|object| {
-                    [
-                        "requestBodyDigest",
-                        "bodyDigest",
-                        "xyz.tinycloud.share/requestBodyDigest",
-                        "xyz.tinycloud.share/upload/bodyDigest",
-                    ]
-                    .iter()
-                    .any(|key| object.get(*key).and_then(Value::as_str) == Some(expected))
+                    object.get("requestBodyDigest").and_then(Value::as_str) == Some(expected)
                 })
             })
         })
 }
 
-async fn owner_did(
+async fn owner_did_and_expiry(
     conn: &tinycloud_core::sea_orm::DatabaseConnection,
     invocation: &InvocationInfo,
-) -> Option<String> {
-    let parent = invocation.parents.first()?;
-    let row = delegation::Entity::find_by_id(tinycloud_core::hash::Hash::from(*parent))
-        .one(conn)
-        .await
-        .ok()??;
-    if !did_principal_matches(&row.delegatee, &invocation.invoker) {
+) -> Option<(String, Option<OffsetDateTime>)> {
+    // This route deliberately supports the ordinary one-parent session
+    // invocation shape.  A multi-parent or cyclic/malformed chain fails
+    // closed instead of attributing an intermediate delegator as owner.
+    if invocation.parents.len() != 1 {
         return None;
     }
-    Some(row.delegator)
+    let mut current = tinycloud_core::hash::Hash::from(*invocation.parents.first()?);
+    let mut expected_delegatee = invocation.invoker.clone();
+    let mut expiry: Option<OffsetDateTime> = None;
+    for _ in 0..32 {
+        let row = delegation::Entity::find_by_id(current)
+            .one(conn)
+            .await
+            .ok()??;
+        if !did_principal_matches(&row.delegatee, &expected_delegatee) {
+            return None;
+        }
+        expiry = match (expiry, row.expiry) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(value), None) | (None, Some(value)) => Some(value),
+            (None, None) => None,
+        };
+        let parents = parent_delegations::Entity::find()
+            .filter(parent_delegations::Column::Child.eq(current))
+            .all(conn)
+            .await
+            .ok()?;
+        if parents.is_empty() {
+            return Some((row.delegator, expiry));
+        }
+        if parents.len() != 1 {
+            return None;
+        }
+        expected_delegatee = row.delegator.clone();
+        current = parents[0].parent;
+    }
+    None
 }
 
 fn validate_request(
@@ -317,7 +353,10 @@ fn validate_request(
         return Err(());
     }
     let retention = jcs::canonicalize(&request.retention);
-    if request.retention.is_null() || retention.len() > MAX_RETENTION_BYTES {
+    if request.retention != Value::String("until-delete".to_owned())
+        || retention.len() > MAX_RETENTION_BYTES
+        || delete_after > now + Duration::seconds(MAX_RETENTION_SECONDS)
+    {
         return Err(());
     }
     Ok(())
@@ -337,8 +376,10 @@ fn timestamp(value: OffsetDateTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rocket::local::asynchronous::Client;
     use serde_json::json;
     use tinycloud_auth::multihash_codetable::{Code, MultihashDigest};
+    use tinycloud_core::sea_orm::Database;
 
     fn request(now: OffsetDateTime) -> UploadAttestationRequest {
         UploadAttestationRequest {
@@ -388,6 +429,165 @@ mod tests {
         assert_eq!(without_signature(&value), json!({"version": 1}));
     }
 
+    #[tokio::test]
+    async fn mounted_route_requires_a_decodable_invocation_before_body_authorization() {
+        let database = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory database");
+        let rocket = rocket::build()
+            .mount("/", rocket::routes![mint_upload_attestation])
+            .manage(None::<UploadAttestationRuntime>)
+            .manage(InvocationReplayCache::new(database))
+            .manage(Config::default());
+        let client = Client::tracked(rocket).await.expect("Rocket client");
+
+        let cases = [
+            ("missing authorization", None, Status::Unauthorized),
+            (
+                "malformed authorization",
+                Some("not-an-invocation"),
+                Status::Unauthorized,
+            ),
+        ];
+        for (name, authorization, expected) in cases {
+            let mut request = client
+                .post("/share/upload/attestation")
+                .header(rocket::http::ContentType::JSON)
+                .body("{}");
+            if let Some(value) = authorization {
+                request = request.header(rocket::http::Header::new("Authorization", value));
+            }
+            assert_eq!(request.dispatch().await.status(), expected, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mounted_route_authorization_matrix_rejects_cryptographically_valid_but_unauthorized_invocations(
+    ) {
+        use rocket::http::{ContentType, Header, Status};
+        use serde_json::Map;
+        use tinycloud_auth::{
+            resolver::DID_METHODS,
+            ssi::{
+                claims::jwt::NumericDate,
+                dids::{DIDBuf, DIDURLBuf},
+                jwk::{Algorithm, JWK},
+                ucan::Payload,
+            },
+            ucan_capabilities_object::Capabilities,
+        };
+        use tinycloud_core::keys::StaticSecret;
+
+        fn metadata(now: OffsetDateTime) -> Value {
+            let unsigned = json!({
+                "byteLength": 14,
+                "deleteAfter": timestamp(now + Duration::hours(1)),
+                "encryptedBlobCid": tinycloud_auth::ipld_core::cid::Cid::new_v1(
+                    0x55,
+                    Code::Sha2_256.digest(b"encrypted blob"),
+                ).to_string(),
+                "encryptedBlobSha256": encode_config(
+                    Sha256::digest(b"encrypted blob"),
+                    URL_SAFE_NO_PAD,
+                ),
+                "retention": "until-delete",
+                "shareOrigin": "https://share.tinycloud.xyz",
+            });
+            let request_body_digest = request_body_digest(&unsigned).expect("request digest");
+            let mut body = unsigned.as_object().cloned().expect("object");
+            body.insert(
+                "requestBodyDigest".to_owned(),
+                Value::String(request_body_digest),
+            );
+            Value::Object(body)
+        }
+
+        async fn invocation(expiration: f64, audience: &str) -> String {
+            let jwk = JWK::generate_ed25519().expect("test invocation key");
+            let issuer = DID_METHODS
+                .generate(&jwk, "key")
+                .expect("test issuer")
+                .to_string();
+            Payload {
+                issuer: issuer.parse::<DIDURLBuf>().expect("issuer vm"),
+                audience: audience.parse::<DIDBuf>().expect("audience did"),
+                not_before: None,
+                expiration: NumericDate::try_from_seconds(expiration).expect("expiration"),
+                nonce: Some(format!("urn:uuid:mounted-upload-{}", expiration as i64)),
+                facts: Some(vec![json!({ "requestBodyDigest": "wrong" })]),
+                proof: vec![],
+                attenuation: Capabilities::<Map<String, Value>>::new(),
+            }
+            .sign(Algorithm::EdDSA, &jwk)
+            .expect("signed invocation")
+            .encode()
+            .expect("encoded invocation")
+        }
+
+        let database = Database::connect("sqlite::memory:")
+            .await
+            .expect("authorization database");
+        let signer_secret = StaticSecret::new(vec![7; 32]).expect("signing secret");
+        let node_did = signer_secret.node_did();
+        let mut config = Config::default();
+        config.share_email.node_audience = node_did.clone();
+        config.share_email.node_signing_kid = format!("{node_did}#invitation-key-1");
+        let runtime = UploadAttestationRuntime::compose(
+            database.clone(),
+            &signer_secret,
+            &config.share_email,
+        )
+        .expect("mounted runtime");
+        let valid_audience = config.share_email.node_audience.clone();
+        let replay_database = Database::connect("sqlite::memory:")
+            .await
+            .expect("replay database");
+        let client = Client::tracked(
+            rocket::build()
+                .mount("/", rocket::routes![mint_upload_attestation])
+                .manage(Some(runtime))
+                .manage(InvocationReplayCache::new(replay_database))
+                .manage(config),
+        )
+        .await
+        .expect("Rocket client");
+        let now = OffsetDateTime::now_utc();
+        let cases = [
+            (
+                "missing proof",
+                now.unix_timestamp() as f64 + 60.0,
+                valid_audience.as_str(),
+                Status::Forbidden,
+            ),
+            (
+                "expired invocation",
+                now.unix_timestamp() as f64 - 1.0,
+                valid_audience.as_str(),
+                Status::Unauthorized,
+            ),
+            (
+                "wrong audience",
+                now.unix_timestamp() as f64 + 60.0,
+                "did:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7",
+                Status::Forbidden,
+            ),
+        ];
+        for (name, expiration, audience, expected) in cases {
+            let body = metadata(now);
+            let response = client
+                .post("/share/upload/attestation")
+                .header(ContentType::JSON)
+                .header(Header::new(
+                    "Authorization",
+                    invocation(expiration, audience).await,
+                ))
+                .body(jcs::canonicalize(&body))
+                .dispatch()
+                .await;
+            assert_eq!(response.status(), expected, "{name}");
+        }
+    }
+
     #[test]
     fn request_validation_rejects_redirects_and_ambiguous_origins() {
         let now = OffsetDateTime::now_utc();
@@ -416,6 +616,14 @@ mod tests {
 
         let mut candidate = request(now);
         candidate.delete_after = timestamp(now - Duration::seconds(1));
+        assert!(validate_request(&candidate, "https://share.tinycloud.xyz", now).is_err());
+
+        let mut candidate = request(now);
+        candidate.delete_after = timestamp(now + Duration::seconds(MAX_RETENTION_SECONDS + 1));
+        assert!(validate_request(&candidate, "https://share.tinycloud.xyz", now).is_err());
+
+        let mut candidate = request(now);
+        candidate.retention = Value::String("until-delete-extra".to_owned());
         assert!(validate_request(&candidate, "https://share.tinycloud.xyz", now).is_err());
     }
 }

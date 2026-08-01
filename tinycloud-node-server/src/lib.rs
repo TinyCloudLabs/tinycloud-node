@@ -441,11 +441,13 @@ pub async fn app_with_control(
         None
     };
     let upload_attestation_runtime = if tinycloud_config.share_email.enabled {
-        Some(routes::upload_attestation::UploadAttestationRuntime::compose(
-            seed_conn.clone(),
-            &key_setup,
-            &tinycloud_config.share_email,
-        )?)
+        Some(
+            routes::upload_attestation::UploadAttestationRuntime::compose(
+                seed_conn.clone(),
+                &key_setup,
+                &tinycloud_config.share_email,
+            )?,
+        )
     } else {
         None
     };

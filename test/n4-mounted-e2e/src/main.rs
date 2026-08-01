@@ -68,6 +68,14 @@ struct FixtureConfig {
     invitation_kid: String,
 }
 
+struct SessionFixture {
+    space_id: String,
+    delegation_cid: String,
+    delegation_header: String,
+    verification_method: String,
+    jwk: Value,
+}
+
 #[derive(Clone)]
 struct Case {
     kind: &'static str,
@@ -574,7 +582,7 @@ async fn seed_sql(rocket: &Rocket<Build>) -> Result<()> {
     Ok(())
 }
 
-async fn seed_kv(rocket: &Rocket<Build>, seed: [u8; 32]) -> Result<()> {
+async fn seed_kv(rocket: &Rocket<Build>, seed: [u8; 32]) -> Result<SessionFixture> {
     let space = SpaceId::from_str(
         "tinycloud:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7:documents",
     )?;
@@ -626,6 +634,14 @@ async fn seed_kv(rocket: &Rocket<Build>, seed: [u8; 32]) -> Result<()> {
         resource.clone().as_uri(),
         std::iter::once(("tinycloud.kv/put".parse()?, [])),
     );
+    let capabilities_resource =
+        space
+            .clone()
+            .to_resource("capabilities".parse::<Service>()?, None, None, None);
+    delegation_caps.with_actions(
+        capabilities_resource.as_uri(),
+        std::iter::once(("tinycloud.capabilities/read".parse()?, [])),
+    );
     let delegation = Payload {
         issuer: verification_method.parse::<DIDURLBuf>()?,
         audience: verification_method
@@ -643,8 +659,8 @@ async fn seed_kv(rocket: &Rocket<Build>, seed: [u8; 32]) -> Result<()> {
         attenuation: delegation_caps,
     }
     .sign(Algorithm::EdDSA, &jwk)?;
-    let delegation_event =
-        Delegation::from_header_ser::<TinyCloudDelegation>(&delegation.encode()?)?;
+    let delegation_header = delegation.encode()?;
+    let delegation_event = Delegation::from_header_ser::<TinyCloudDelegation>(&delegation_header)?;
     let delegation_cid = delegation_event.content_hash().to_cid(0x55);
     let tinycloud = rocket
         .state::<TinyCloud>()
@@ -691,7 +707,13 @@ async fn seed_kv(rocket: &Rocket<Build>, seed: [u8; 32]) -> Result<()> {
         .invoke::<BlockStage>(invocation, inputs)
         .await
         .map_err(|error| anyhow::anyhow!("KV seed invocation: {error}"))?;
-    Ok(())
+    Ok(SessionFixture {
+        space_id: space.to_string(),
+        delegation_cid: delegation_cid.to_string(),
+        delegation_header,
+        verification_method,
+        jwk: serde_json::to_value(jwk)?,
+    })
 }
 
 async fn mounted_http_adversarial_checks(rocket: Rocket<Build>) -> Result<()> {
@@ -829,6 +851,15 @@ async fn run() -> Result<()> {
         .windows(2)
         .find(|pair| pair[0] == "--descriptor")
         .map(|pair| PathBuf::from(&pair[1]));
+    let profile_output = args
+        .windows(2)
+        .find(|pair| pair[0] == "--profile-output")
+        .map(|pair| PathBuf::from(&pair[1]));
+    let trust_bundle_output = args
+        .windows(2)
+        .find(|pair| pair[0] == "--trust-bundle-output")
+        .map(|pair| PathBuf::from(&pair[1]));
+    let quiet = args.iter().any(|argument| argument == "--quiet");
     let issuer_public = args
         .windows(2)
         .find(|pair| pair[0] == "--issuer-public-key")
@@ -921,6 +952,9 @@ async fn run() -> Result<()> {
     });
     fs::write(&trust_bundle_path, serde_json::to_vec(&trust_bundle)?)
         .context("trust bundle write")?;
+    if let Some(path) = trust_bundle_output {
+        fs::write(path, serde_json::to_vec(&trust_bundle)?).context("joined trust bundle write")?;
+    }
     let figment = figment(
         temp.path(),
         &secret,
@@ -932,7 +966,51 @@ async fn run() -> Result<()> {
         .await
         .context("default-feature production Rocket app composition")?;
     seed_sql(&rocket).await?;
-    seed_kv(&rocket, [0x44; 32]).await?;
+    let session = seed_kv(&rocket, [0x44; 32]).await?;
+    if let Some(home) = profile_output {
+        let profile_dir = home.join(".tinycloud/profiles/joined");
+        fs::create_dir_all(&profile_dir)?;
+        let session_did = session
+            .verification_method
+            .split('#')
+            .next()
+            .context("session DID principal")?;
+        fs::write(
+            home.join(".tinycloud/config.json"),
+            "{\"defaultProfile\":\"joined\",\"version\":1}\n",
+        )?;
+        fs::write(
+            profile_dir.join("profile.json"),
+            serde_json::to_vec_pretty(&json!({
+                "name": "joined",
+                "host": format!("http://127.0.0.1:{port}"),
+                "chainId": 1,
+                "spaceName": "documents",
+                "did": session_did,
+                "sessionDid": session_did,
+                "spaceId": session.space_id,
+                "authMethod": "openkey"
+            }))?,
+        )?;
+        fs::write(
+            profile_dir.join("key.json"),
+            serde_json::to_vec_pretty(&session.jwk)?,
+        )?;
+        fs::write(
+            profile_dir.join("session.json"),
+            serde_json::to_vec_pretty(&json!({
+                "delegationHeader": {"Authorization": session.delegation_header},
+                "delegationCid": session.delegation_cid,
+                "spaceId": session.space_id,
+                "jwk": session.jwk,
+                "verificationMethod": session_did
+            }))?,
+        )?;
+        fs::write(
+            profile_dir.join("session.json.metadata.json"),
+            "{\"formatVersion\":1}\n",
+        )?;
+    }
     if self_test {
         mounted_http_adversarial_checks(rocket).await?;
         eprintln!("production HTTP adversarial checks passed");
@@ -962,7 +1040,9 @@ async fn run() -> Result<()> {
                     eprintln!("production descriptor write failed: {error}");
                 }
             }
-            println!("{}", String::from_utf8_lossy(&descriptor_bytes));
+            if !quiet {
+                println!("{}", String::from_utf8_lossy(&descriptor_bytes));
+            }
             eprintln!("tinycloud-node-production-e2e listening on http://127.0.0.1:{port}");
         })
     }));

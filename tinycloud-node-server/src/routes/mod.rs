@@ -68,8 +68,8 @@ pub mod node_keys;
 pub mod public;
 #[cfg(feature = "tc-bench-v1")]
 pub mod tc_bench;
-pub mod util;
 pub mod upload_attestation;
+pub mod util;
 use util::LimitedReader;
 
 const MAX_KV_BATCH_READ_ITEMS: usize = 100;
