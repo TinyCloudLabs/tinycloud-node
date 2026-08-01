@@ -2,7 +2,7 @@ use anyhow::Result;
 use rocket::{
     data::{Capped, FromData},
     futures::io::AsyncRead,
-    http::{ContentType, Header, Status},
+    http::{ContentType, Header, HeaderMap, Status},
     request::{FromRequest, Outcome, Request},
     response::{Responder, Response},
     serde::json::Json,
@@ -443,9 +443,19 @@ const STORED_OBJECT_HEADERS: &[&str] = &[
     "content-disposition",
 ];
 
+const X_TINYCLOUD_META_PREFIX: &str = "x-tinycloud-meta-";
+
+/// Allocation-free, ASCII-case-insensitive check for whether `name` is
+/// permitted to become stored object metadata (TC-410).
 pub(crate) fn is_storable_object_header(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    STORED_OBJECT_HEADERS.contains(&name.as_str()) || name.starts_with("x-tinycloud-meta-")
+    STORED_OBJECT_HEADERS
+        .iter()
+        .any(|header| name.eq_ignore_ascii_case(header))
+        || name
+            .as_bytes()
+            .get(..X_TINYCLOUD_META_PREFIX.len())
+            .map(|prefix| prefix.eq_ignore_ascii_case(X_TINYCLOUD_META_PREFIX.as_bytes()))
+            .unwrap_or(false)
 }
 
 pub(crate) fn filter_stored_object_metadata(metadata: Metadata) -> Metadata {
@@ -477,16 +487,60 @@ pub(crate) fn is_replayable_object_header(name: &str) -> bool {
             .any(|header| name.eq_ignore_ascii_case(header))
 }
 
+/// Lifetime-bound `/invoke` request guard (TC-410). Borrows the last
+/// Rocket-parsed value for authorization-adjacent/control headers with no
+/// allocation, and owns only the small allowlist of headers permitted to
+/// become stored object metadata. `Authorization`, `Cookie`, and every other
+/// unlisted header are never copied here; `Authorization`'s value is read
+/// only by [`crate::authorization::AuthHeaderGetter`].
+pub struct InvokeHeaders<'r> {
+    pub accept: Option<&'r str>,
+    pub content_type: Option<&'r str>,
+    pub if_match: Option<&'r str>,
+    pub if_none_match: Option<&'r str>,
+    pub expected_version: Option<&'r str>,
+    pub max_response_bytes: Option<&'r str>,
+    pub limit: Option<&'r str>,
+    pub cursor: Option<&'r str>,
+    pub metadata: Metadata,
+}
+
+/// A header nominated by a comma-separated `Connection` token is hop-by-hop
+/// for this request and must never be persisted, even if it would otherwise
+/// be storable object metadata. Scans `Connection` values directly instead
+/// of allocating a token set.
+fn connection_nominates(headers: &HeaderMap<'_>, name: &str) -> bool {
+    headers
+        .get("connection")
+        .flat_map(|value| value.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case(name))
+}
+
 #[async_trait]
-impl<'r> FromRequest<'r> for ObjectHeaders {
+impl<'r> FromRequest<'r> for InvokeHeaders<'r> {
     type Error = anyhow::Error;
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        let md: BTreeMap<String, String> = request
-            .headers()
-            .iter()
-            .map(|h| (h.name.into_string(), h.value.to_string()))
-            .collect();
-        Outcome::Success(ObjectHeaders(Metadata(md)))
+        let headers = request.headers();
+
+        let mut metadata = BTreeMap::new();
+        for header in headers.iter() {
+            let name = header.name.as_str();
+            if is_storable_object_header(name) && !connection_nominates(headers, name) {
+                metadata.insert(name.to_string(), header.value.to_string());
+            }
+        }
+
+        Outcome::Success(InvokeHeaders {
+            accept: headers.get("accept").last(),
+            content_type: headers.get("content-type").last(),
+            if_match: headers.get("if-match").last(),
+            if_none_match: headers.get("if-none-match").last(),
+            expected_version: headers.get("x-tinycloud-expected-version").last(),
+            max_response_bytes: headers.get("x-tinycloud-max-response-bytes").last(),
+            limit: headers.get("x-tinycloud-limit").last(),
+            cursor: headers.get("x-tinycloud-cursor").last(),
+            metadata: Metadata(metadata),
+        })
     }
 }
 
