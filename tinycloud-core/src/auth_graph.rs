@@ -22,6 +22,73 @@ use std::collections::{HashMap, HashSet};
 pub(crate) use crate::models::revocation::ChainTraversalError;
 use crate::models::revocation::MAX_CHAIN_TRAVERSAL_NODES;
 
+/// Depth-first cycle detection over a child->parents edge map, using the
+/// classic white/gray/black coloring so a node currently on the DFS stack
+/// (gray) being revisited proves a cycle. `edges` is bounded by
+/// `MAX_CHAIN_TRAVERSAL_NODES` before this runs, so recursion depth is
+/// bounded too.
+fn has_cycle(edges: &HashMap<Hash, Vec<Hash>>) -> bool {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Mark {
+        InProgress,
+        Done,
+    }
+    fn visit(
+        node: Hash,
+        edges: &HashMap<Hash, Vec<Hash>>,
+        marks: &mut HashMap<Hash, Mark>,
+    ) -> bool {
+        match marks.get(&node) {
+            Some(Mark::InProgress) => return true,
+            Some(Mark::Done) => return false,
+            None => {}
+        }
+        marks.insert(node, Mark::InProgress);
+        if let Some(parents) = edges.get(&node) {
+            for parent in parents {
+                if visit(*parent, edges, marks) {
+                    return true;
+                }
+            }
+        }
+        marks.insert(node, Mark::Done);
+        false
+    }
+
+    let mut marks: HashMap<Hash, Mark> = HashMap::new();
+    edges
+        .keys()
+        .any(|node| marks.get(node) != Some(&Mark::Done) && visit(*node, edges, &mut marks))
+}
+
+/// A single caveat value declares itself a `constrained-statements` caveat
+/// either directly (top-level `mode: "constrained-statements"`) or nested
+/// under a `"constrained-statements"` key. Unrelated caveat values (neither
+/// shape present) are `Ok(None)` and silently skipped, matching prior
+/// behavior. A value that *does* declare one of these shapes but fails to
+/// parse (missing/malformed `statements`, `readOnly`, etc.) is a malformed
+/// declared caveat and returns `Err`, so the caller fails closed instead of
+/// treating a broken grant as an absent one.
+fn declared_constrained_statement_caveat(
+    v: &serde_json::Value,
+) -> Result<
+    Option<crate::policy_capability::sql_caveat::SqlConstrainedStatementCaveat>,
+    crate::policy_capability::RejectionCode,
+> {
+    let declares_mode_directly = v
+        .as_object()
+        .and_then(|o| o.get("mode"))
+        .and_then(serde_json::Value::as_str)
+        == Some("constrained-statements");
+    if declares_mode_directly {
+        return crate::policy_capability::sql_caveat::parse(v).map(Some);
+    }
+    if let Some(inner) = v.as_object().and_then(|o| o.get("constrained-statements")) {
+        return crate::policy_capability::sql_caveat::parse(inner).map(Some);
+    }
+    Ok(None)
+}
+
 /// Batched ancestor-closure load over `parent_delegations`. A recursive CTE
 /// fetches all reachable edges in one query rather than walking one node at a
 /// time. The in-memory pass enforces the same fail-closed node budget as the
@@ -108,6 +175,34 @@ pub(crate) async fn load_closure_edges<C: ConnectionTrait>(
     }
     for parents in edges.values_mut() {
         parents.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
+    }
+
+    // TC-411: `rows.len() <= edge_cap` bounds edge *count*, not distinct node
+    // *count* -- a sparse, wide graph (e.g. many nodes with few parents each)
+    // can pass the edge check while still spanning far more than
+    // `MAX_CHAIN_TRAVERSAL_NODES` distinct nodes. `has_cycle` below recurses
+    // per distinct node, so that bound must be enforced first, over the
+    // decoded closure, before any recursive traversal runs.
+    let mut distinct_nodes: HashSet<Hash> = HashSet::new();
+    for (child, parents) in &edges {
+        distinct_nodes.insert(*child);
+        distinct_nodes.extend(parents.iter().copied());
+    }
+    if distinct_nodes.len() > MAX_CHAIN_TRAVERSAL_NODES {
+        return Err(ChainTraversalError::LimitExceeded);
+    }
+
+    // TC-411: a cycle in the loaded closure has no well-defined ancestor
+    // order for caveat/revocation resolution. A per-node traversal's visited
+    // set would still terminate against a cycle and silently accept the
+    // chain; fail closed instead, reusing `LimitExceeded` (already the
+    // established "reject this traversal outright" signal here -- see
+    // `load_guarded`'s guarded/reloaded mismatch case below) rather than
+    // widening the shared `ChainTraversalError` enum used across the
+    // delegate/revoke paths outside this module's scope. `has_cycle`'s
+    // recursion is now bounded by the distinct-node check above.
+    if has_cycle(&edges) {
+        return Err(ChainTraversalError::LimitExceeded);
     }
 
     let mut visited = nodes.iter().copied().collect::<HashSet<_>>();
@@ -281,10 +376,19 @@ impl AuthGraphSnapshot {
     /// ambiguity across the returned candidates (zero/one/many) is the
     /// caller's responsibility so SQL-specific fail-closed semantics stay
     /// out of the shared authorization graph.
+    ///
+    /// A caveat value that *declares* itself as `constrained-statements`
+    /// (top-level `mode`, or nested under a `"constrained-statements"` key)
+    /// but fails to parse is a malformed declared caveat, not an unrelated
+    /// one -- this fails closed with the underlying `RejectionCode` instead
+    /// of silently dropping the caveat and leaving SQL unconstrained.
     pub(crate) fn constrained_statement_caveat_candidates(
         &self,
         roots: &[Hash],
-    ) -> Vec<crate::policy_capability::sql_caveat::SqlConstrainedStatementCaveat> {
+    ) -> Result<
+        Vec<crate::policy_capability::sql_caveat::SqlConstrainedStatementCaveat>,
+        crate::policy_capability::RejectionCode,
+    > {
         let mut visited = HashSet::new();
         let mut found = Vec::new();
         for root in roots {
@@ -294,17 +398,7 @@ impl AuthGraphSnapshot {
                 }
                 for row in self.abilities(&id) {
                     for v in row.caveats.0.values() {
-                        let parsed =
-                            crate::policy_capability::sql_caveat::parse(v)
-                                .ok()
-                                .or_else(|| {
-                                    v.as_object()
-                                        .and_then(|o| o.get("constrained-statements"))
-                                        .and_then(|inner| {
-                                            crate::policy_capability::sql_caveat::parse(inner).ok()
-                                        })
-                                });
-                        if let Some(caveat) = parsed {
+                        if let Some(caveat) = declared_constrained_statement_caveat(v)? {
                             if !found.contains(&caveat) {
                                 found.push(caveat);
                             }
@@ -313,7 +407,7 @@ impl AuthGraphSnapshot {
                 }
             }
         }
-        found
+        Ok(found)
     }
 
     /// First revoked strict ancestor of `start`, as a CID string.
@@ -642,5 +736,153 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(snapshot.chain_ids_from(&leaf).len(), 2);
+    }
+
+    async fn insert_ability(
+        db: &DatabaseConnection,
+        delegation: Hash,
+        caveat_value: serde_json::Value,
+    ) {
+        use crate::types::Caveats;
+        use std::collections::BTreeMap;
+        let mut caveats = BTreeMap::new();
+        caveats.insert("caveat".to_string(), caveat_value);
+        abilities::ActiveModel {
+            resource: Set("tinycloud:did:key:actor:files/kv/doc".parse().unwrap()),
+            ability: Set("tinycloud.kv/put".to_string().try_into().unwrap()),
+            delegation: Set(delegation),
+            caveats: Set(Caveats(caveats)),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
+    /// TC-411 regression: a caveat that declares `mode:
+    /// "constrained-statements"` directly on the cited root but is missing
+    /// required fields (`readOnly`, `statements`) must fail closed rather
+    /// than being silently dropped as if the grant were unconstrained.
+    #[tokio::test]
+    async fn constrained_statement_caveat_candidates_fails_closed_on_malformed_direct_caveat() {
+        let (db, _) = counted_database().await;
+        let ids = insert_chain(&db, "malformed-direct", 0).await;
+        insert_ability(
+            &db,
+            ids[0],
+            serde_json::json!({"mode": "constrained-statements"}),
+        )
+        .await;
+
+        let snapshot = AuthGraphSnapshot::load(&db, &[ids[0]]).await.unwrap();
+        assert!(snapshot
+            .constrained_statement_caveat_candidates(&[ids[0]])
+            .is_err());
+    }
+
+    /// Same as above, but the malformed declaration lives under the nested
+    /// `"constrained-statements"` key rather than as a top-level `mode`.
+    #[tokio::test]
+    async fn constrained_statement_caveat_candidates_fails_closed_on_malformed_nested_caveat() {
+        let (db, _) = counted_database().await;
+        let ids = insert_chain(&db, "malformed-nested", 0).await;
+        insert_ability(
+            &db,
+            ids[0],
+            serde_json::json!({"constrained-statements": {"mode": "constrained-statements"}}),
+        )
+        .await;
+
+        let snapshot = AuthGraphSnapshot::load(&db, &[ids[0]]).await.unwrap();
+        assert!(snapshot
+            .constrained_statement_caveat_candidates(&[ids[0]])
+            .is_err());
+    }
+
+    /// A malformed declared caveat on a strict ancestor (not the cited root
+    /// itself) must also fail closed -- `chain_ids_from` walks the whole
+    /// closure, so this is not limited to the directly-cited proof.
+    #[tokio::test]
+    async fn constrained_statement_caveat_candidates_fails_closed_on_malformed_ancestor_caveat() {
+        let (db, _) = counted_database().await;
+        let ids = insert_chain(&db, "malformed-ancestor", 1).await;
+        insert_ability(
+            &db,
+            ids[1],
+            serde_json::json!({"mode": "constrained-statements", "readOnly": "not-a-bool"}),
+        )
+        .await;
+
+        let snapshot = AuthGraphSnapshot::load(&db, &[ids[0]]).await.unwrap();
+        assert!(snapshot
+            .constrained_statement_caveat_candidates(&[ids[0]])
+            .is_err());
+    }
+
+    /// An unrelated caveat (no `mode` field and no nested
+    /// `"constrained-statements"` key) is not a declared SQL caveat and must
+    /// be silently skipped rather than rejected.
+    #[tokio::test]
+    async fn constrained_statement_caveat_candidates_ignores_unrelated_caveats() {
+        let (db, _) = counted_database().await;
+        let ids = insert_chain(&db, "unrelated", 0).await;
+        insert_ability(&db, ids[0], serde_json::json!({"tables": ["foo"]})).await;
+
+        let snapshot = AuthGraphSnapshot::load(&db, &[ids[0]]).await.unwrap();
+        assert_eq!(
+            snapshot
+                .constrained_statement_caveat_candidates(&[ids[0]])
+                .unwrap(),
+            Vec::new()
+        );
+    }
+
+    /// TC-411 regression: a cyclic `parent_delegations` closure must fail
+    /// closed. A per-node traversal's visited set would silently terminate
+    /// against the cycle and accept the chain instead.
+    #[tokio::test]
+    async fn load_closure_edges_fails_closed_on_cyclic_proof() {
+        let (db, _) = counted_database().await;
+        let a = hash(b"cycle-a");
+        let b = hash(b"cycle-b");
+        insert_delegation(&db, a).await;
+        insert_delegation(&db, b).await;
+        insert_edge(&db, a, b).await;
+        insert_edge(&db, b, a).await;
+
+        assert!(matches!(
+            load_closure_edges(&db, &[a]).await,
+            Err(ChainTraversalError::LimitExceeded)
+        ));
+        assert!(matches!(
+            AuthGraphSnapshot::load(&db, &[a]).await,
+            Err(ChainTraversalError::LimitExceeded)
+        ));
+    }
+
+    /// TC-411 regression: a wide (fan-out) graph can hold far more distinct
+    /// nodes than `MAX_CHAIN_TRAVERSAL_NODES` while its edge count stays far
+    /// below `edge_cap` (`MAX_CHAIN_TRAVERSAL_NODES^2`), since each node
+    /// here has only one edge. The distinct-node bound must reject this
+    /// before `has_cycle`'s recursion ever runs over it -- the `rows.len() >
+    /// edge_cap` check alone would let it through.
+    #[tokio::test]
+    async fn load_closure_edges_fails_closed_on_wide_over_limit_graph() {
+        let (db, _) = counted_database().await;
+        let leaf = hash(b"wide-leaf");
+        insert_delegation(&db, leaf).await;
+        for index in 0..=MAX_CHAIN_TRAVERSAL_NODES {
+            let parent = hash(format!("wide-parent-{index}").as_bytes());
+            insert_delegation(&db, parent).await;
+            insert_edge(&db, leaf, parent).await;
+        }
+
+        assert!(matches!(
+            load_closure_edges(&db, &[leaf]).await,
+            Err(ChainTraversalError::LimitExceeded)
+        ));
+        assert!(matches!(
+            AuthGraphSnapshot::load(&db, &[leaf]).await,
+            Err(ChainTraversalError::LimitExceeded)
+        ));
     }
 }

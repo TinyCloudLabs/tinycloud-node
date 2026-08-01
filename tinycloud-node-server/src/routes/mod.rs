@@ -3221,6 +3221,12 @@ async fn verify_auth(
                     TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
                         database_error_status(error)
                     }
+                    // TC-411: a declared SQL constrained-statement caveat on
+                    // the chain failed to parse -- fail closed with the same
+                    // status as an incomparable/ambiguous caveat selection
+                    // (see `resolve_constrained_statement_caveat`), not the
+                    // generic Unauthorized catch-all.
+                    TxStoreError::Tx(TxError::MalformedSqlCaveat(_)) => Status::Forbidden,
                     _ => Status::Unauthorized,
                 },
                 e.to_string(),
@@ -3256,6 +3262,8 @@ async fn verify_auth_admitted(
                     TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
                         database_error_status(error)
                     }
+                    // TC-411: see the matching arm in `verify_auth` above.
+                    TxStoreError::Tx(TxError::MalformedSqlCaveat(_)) => Status::Forbidden,
                     _ => Status::Unauthorized,
                 },
                 e.to_string(),

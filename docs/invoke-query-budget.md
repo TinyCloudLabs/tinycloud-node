@@ -55,14 +55,26 @@ below — and are not re-counted here):
 
 | Operation | Index/read work | Notes |
 |-----------|------------------|-------|
-| `kv/get` | 1 statement | Single current-state read. |
-| `kv/head` (metadata) | 1 statement | Same read path as `get`, object body not fetched from block store. |
+| `kv/get` | 1 statement | Single current-state read; batched via `batch_get_kv_entities` so an N-item batch of `get`/`metadata` capabilities in one invocation still costs 1 statement, not N. |
+| `kv/head` (metadata) | 1 statement | Same batched read path as `get`, object body not fetched from block store. |
 | `kv/list` | 1 statement | Single bounded index scan regardless of result page size. |
-| `kv/put` | graph load + 1 persistence | Object bytes are written to the object store *before* the DB transaction commits (see "Transaction boundaries" below). |
-| `kv/delete` | graph load + reuse of already-loaded current state | Delete does not re-read current state; it reuses the row already loaded for authorization/precondition checks. |
-| Batch get/head (1 item) | 1 statement | Same shape as a single get/head. |
-| Batch get/head (10 items) | 1 statement | One `IN (...)` index query independent of batch size. |
-| Batch put (multipart history/projection) | 2 statements | Batched history append + projection upsert, independent of item count. |
+| `kv/put` | graph load + 1 persistence | Object bytes are written to the object store *before* the DB transaction begins (see "Transaction boundaries" below); history (`kv_write`) and projection (`current_kv`) persistence for every put in the invocation is batched into exactly 2 statements independent of item count (`invocation::save`, via `kv_write::Entity::insert_many` + `upsert_current_kv_batch`). |
+| `kv/delete` | 0 extra statements when reused | `db.rs` already loads the current `current_kv` row (including its owning `invocation` id) for the precondition/version check; that id is threaded through `VersionedOperation::KvDelete::deleted_invocation_id` and `invocation::resolve_deleted_invocation_id` returns it directly instead of re-querying `kv_write`. Falls back to one lookup only when deleting a key with no live current row (never written, or already deleted). |
+
+### Batch and multipart statement counts
+
+| Operation | Statement count | Test |
+|-----------|------------------|------|
+| Batch get/head, 1 item | 1 statement | `db::test::batch_get_kv_entities_issues_one_statement_regardless_of_item_count` |
+| Batch get/head, 10 items | 1 statement | same test |
+| Batch put (multipart history/projection), 1 item | 2 statements | `models::invocation::tests::multipart_put_persistence_is_two_statements_regardless_of_item_count` |
+| Batch put (multipart history/projection), 10 items | 2 statements | same test |
+| `kv/delete` with pre-loaded current state | 0 statements | `models::invocation::tests::delete_reuses_preloaded_invocation_id_without_extra_kv_write_query` |
+| `kv/delete` without pre-loaded current state (fallback) | 1 statement | same test |
+
+Each test wraps a real `sea_orm::DatabaseConnection` with `set_metric_callback`
+to count every SQL statement executed, so these are exact counts, not
+estimates.
 
 ## Replay and audit
 
@@ -113,4 +125,25 @@ separately (see `tinycloud-core/src/telemetry.rs` stage labels).
   decisions.
 - Ancestor caveats and caveat containment remain binding: a uniquely
   tightest contained caveat wins, and incomparable candidates return 403.
+- A caveat that declares itself `constrained-statements` (directly or nested
+  under a `"constrained-statements"` key) but fails to parse is a malformed
+  *declared* caveat, not an unrelated one:
+  `AuthGraphSnapshot::constrained_statement_caveat_candidates` returns an
+  error for it (`TxError::MalformedSqlCaveat`, mapped to `403 Forbidden`)
+  instead of silently dropping it as if the grant were unconstrained. See
+  `auth_graph::tests::constrained_statement_caveat_candidates_fails_closed_on_malformed_direct_caveat`,
+  `..._malformed_nested_caveat`, and `..._malformed_ancestor_caveat`.
+- A cyclic `parent_delegations` closure is rejected outright
+  (`load_closure_edges` runs a cycle check over the loaded closure before it
+  is used to derive lock keys or the snapshot) rather than being silently
+  accepted because a per-node visited-set traversal would otherwise
+  terminate against the cycle. See
+  `auth_graph::tests::load_closure_edges_fails_closed_on_cyclic_proof`.
+- Closure memory and cycle-detection recursion are bounded by distinct node
+  count, not edge count: a wide (fan-out) graph can hold far more distinct
+  nodes than `MAX_CHAIN_TRAVERSAL_NODES` while its edge count stays far
+  below `edge_cap` (`MAX_CHAIN_TRAVERSAL_NODES^2`), since each node may have
+  only one edge. `load_closure_edges` rejects on distinct-node count before
+  `has_cycle`'s recursion ever runs over it. See
+  `auth_graph::tests::load_closure_edges_fails_closed_on_wide_over_limit_graph`.
 - No cross-request authorization cache is introduced by this change.

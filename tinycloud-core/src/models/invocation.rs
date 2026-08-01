@@ -20,7 +20,9 @@ use serde::Serialize;
 use std::collections::HashMap;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_auth::{
-    authorization::TinyCloudInvocation, identity::did_principal_matches, resource::Path,
+    authorization::TinyCloudInvocation,
+    identity::did_principal_matches,
+    resource::{Path, SpaceId},
     ssi::dids::AnyDidMethod,
 };
 
@@ -567,8 +569,13 @@ async fn save<C: ConnectionTrait>(
         .await?;
     }
 
-    for param in &parameters {
-        match param {
+    // TC-411: history (kv_write) and projection (current_kv) persistence for
+    // every put in this invocation is batched into exactly two statements --
+    // one multi-row insert per table -- independent of item count, instead
+    // of one round trip per put (see `upsert_current_kv_batch`).
+    let put_writes: Vec<kv_write::Model> = parameters
+        .iter()
+        .filter_map(|param| match param {
             VersionedOperation::KvWrite {
                 key,
                 value,
@@ -577,73 +584,102 @@ async fn save<C: ConnectionTrait>(
                 seq,
                 epoch,
                 epoch_seq,
-            } => {
-                let write = kv_write::Model {
-                    invocation: hash,
-                    key: key.clone().into(),
-                    value: *value,
-                    space: space.clone().into(),
-                    metadata: metadata.clone(),
-                    seq: *seq,
-                    epoch: *epoch,
-                    epoch_seq: *epoch_seq,
-                };
-                kv_write::Entity::insert(kv_write::ActiveModel::from(write.clone()))
-                    .exec(db)
+            } => Some(kv_write::Model {
+                invocation: hash,
+                key: key.clone().into(),
+                value: *value,
+                space: space.clone().into(),
+                metadata: metadata.clone(),
+                seq: *seq,
+                epoch: *epoch,
+                epoch_seq: *epoch_seq,
+            }),
+            VersionedOperation::KvDelete { .. } => None,
+        })
+        .collect();
+    if !put_writes.is_empty() {
+        kv_write::Entity::insert_many(put_writes.iter().cloned().map(kv_write::ActiveModel::from))
+            .exec(db)
+            .await?;
+        upsert_current_kv_batch(db, put_writes).await?;
+    }
+
+    for param in &parameters {
+        if let VersionedOperation::KvDelete {
+            key,
+            version,
+            deleted_invocation_id,
+            space,
+            seq: _,
+            epoch: _,
+            epoch_seq: _,
+        } = param
+        {
+            let deleted_invocation_id =
+                resolve_deleted_invocation_id(db, space, key, *version, *deleted_invocation_id)
                     .await?;
-                upsert_current_kv(db, write).await?;
-            }
-            VersionedOperation::KvDelete {
-                key,
-                version,
-                space,
-                seq: _,
-                epoch: _,
-                epoch_seq: _,
-            } => {
-                let deleted_invocation_id = if let Some((s, e, es)) = version {
-                    kv_write::Entity::find().filter(
-                        Condition::all()
-                            .add(kv_write::Column::Key.eq(key.as_str()))
-                            .add(kv_write::Column::Space.eq(SpaceIdWrap(space.clone())))
-                            .add(kv_write::Column::Seq.eq(*s))
-                            .add(kv_write::Column::Epoch.eq(*e))
-                            .add(kv_write::Column::EpochSeq.eq(*es)),
-                    )
-                } else {
-                    kv_write::Entity::find()
-                        .filter(kv_write::Column::Key.eq(key.as_str()))
-                        .filter(kv_write::Column::Space.eq(SpaceIdWrap(space.clone())))
-                        .order_by_desc(kv_write::Column::Seq)
-                        .order_by_desc(kv_write::Column::Epoch)
-                        .order_by_desc(kv_write::Column::EpochSeq)
-                }
-                .one(db)
-                .await?
-                .ok_or_else(|| InvocationError::MissingKvWrite(key.clone()))?
-                .invocation;
-                kv_delete::Entity::insert(kv_delete::ActiveModel::from(kv_delete::Model {
-                    key: key.clone().into(),
-                    invocation_id: hash,
-                    space: space.clone().into(),
-                    deleted_invocation_id,
-                }))
-                .exec(db)
-                .await?;
-                delete_current_kv_if_invocation(
-                    db,
-                    &SpaceIdWrap(space.clone()),
-                    key.as_str(),
-                    deleted_invocation_id,
-                )
-                .await?;
-            }
+            kv_delete::Entity::insert(kv_delete::ActiveModel::from(kv_delete::Model {
+                key: key.clone().into(),
+                invocation_id: hash,
+                space: space.clone().into(),
+                deleted_invocation_id,
+            }))
+            .exec(db)
+            .await?;
+            delete_current_kv_if_invocation(
+                db,
+                &SpaceIdWrap(space.clone()),
+                key.as_str(),
+                deleted_invocation_id,
+            )
+            .await?;
         }
     }
 
     enqueue_kv_webhook_deliveries(db, hash, &invocation.invoker, issued_at, &parameters).await?;
 
     Ok(hash)
+}
+
+/// TC-411: `db.rs` already loads the current `current_kv` row (and its
+/// owning `invocation` id) under the mutation transaction before staging a
+/// delete op; `known_invocation_id` is that already-loaded id, reused here
+/// instead of re-querying `kv_write`. Only falls back to a query when the
+/// caller had no already-loaded row -- deleting a key with no live current
+/// entry (never written, or already deleted) -- which still requires
+/// deriving the most recent `kv_write` row for the audit trail.
+async fn resolve_deleted_invocation_id<C: ConnectionTrait>(
+    db: &C,
+    space: &SpaceId,
+    key: &Path,
+    version: Option<(i64, Hash, i64)>,
+    known_invocation_id: Option<Hash>,
+) -> Result<Hash, Error> {
+    if let Some(id) = known_invocation_id {
+        return Ok(id);
+    }
+    let query = if let Some((s, e, es)) = version {
+        kv_write::Entity::find().filter(
+            Condition::all()
+                .add(kv_write::Column::Key.eq(key.as_str()))
+                .add(kv_write::Column::Space.eq(SpaceIdWrap(space.clone())))
+                .add(kv_write::Column::Seq.eq(s))
+                .add(kv_write::Column::Epoch.eq(e))
+                .add(kv_write::Column::EpochSeq.eq(es)),
+        )
+    } else {
+        kv_write::Entity::find()
+            .filter(kv_write::Column::Key.eq(key.as_str()))
+            .filter(kv_write::Column::Space.eq(SpaceIdWrap(space.clone())))
+            .order_by_desc(kv_write::Column::Seq)
+            .order_by_desc(kv_write::Column::Epoch)
+            .order_by_desc(kv_write::Column::EpochSeq)
+    };
+    Ok(query
+        .one(db)
+        .await?
+        .ok_or_else(|| InvocationError::MissingKvWrite(key.clone()))?
+        .invocation)
 }
 
 fn incoming_is_newer(existing: current_kv::Entity, incoming: Alias) -> Condition {
@@ -680,21 +716,18 @@ fn incoming_is_newer(existing: current_kv::Entity, incoming: Alias) -> Condition
         )
 }
 
-pub(crate) async fn upsert_current_kv<C: ConnectionTrait>(
+/// TC-411: batched form of the single-write upsert -- one projection
+/// (`current_kv`) statement for every write in `writes`, independent of item
+/// count, instead of one upsert per write. Each row's ON CONFLICT action
+/// still resolves against that row's own `EXCLUDED`/`VALUES` values, so the
+/// per-row newer-wins ordering below is unchanged by batching.
+pub(crate) async fn upsert_current_kv_batch<C: ConnectionTrait>(
     db: &C,
-    write: kv_write::Model,
+    writes: Vec<kv_write::Model>,
 ) -> Result<(), DbErr> {
-    let current = current_kv::Model {
-        space: write.space,
-        key: write.key,
-        invocation: write.invocation,
-        seq: write.seq,
-        epoch: write.epoch,
-        epoch_seq: write.epoch_seq,
-        value: write.value,
-        metadata: write.metadata,
-        deleted: false,
-    };
+    if writes.is_empty() {
+        return Ok(());
+    }
     let mut conflict = OnConflict::columns([current_kv::Column::Space, current_kv::Column::Key]);
     if db.get_database_backend() == DatabaseBackend::MySql {
         // MySQL ignores ON CONFLICT's action WHERE. Keep the ordering fields
@@ -733,7 +766,18 @@ pub(crate) async fn upsert_current_kv<C: ConnectionTrait>(
                 Alias::new("excluded"),
             ));
     }
-    match current_kv::Entity::insert(current_kv::ActiveModel::from(current))
+    let models = writes.into_iter().map(|write| current_kv::Model {
+        space: write.space,
+        key: write.key,
+        invocation: write.invocation,
+        seq: write.seq,
+        epoch: write.epoch,
+        epoch_seq: write.epoch_seq,
+        value: write.value,
+        metadata: write.metadata,
+        deleted: false,
+    });
+    match current_kv::Entity::insert_many(models.map(current_kv::ActiveModel::from))
         .on_conflict(conflict.to_owned())
         .exec(db)
         .await
@@ -938,7 +982,7 @@ mod tests {
                 .insert(&tx)
                 .await
                 .unwrap();
-            upsert_current_kv(&tx, write).await.unwrap();
+            upsert_current_kv_batch(&tx, vec![write]).await.unwrap();
             tx.commit().await.unwrap();
         }
 
@@ -999,7 +1043,9 @@ mod tests {
             .insert(&tx)
             .await
             .unwrap();
-        upsert_current_kv(&tx, rolled_back).await.unwrap();
+        upsert_current_kv_batch(&tx, vec![rolled_back])
+            .await
+            .unwrap();
         tx.rollback().await.unwrap();
         assert_eq!(kv_write::Entity::find().count(&db).await.unwrap(), 2);
         let watermark = current_kv::Entity::find_by_id((
@@ -1034,7 +1080,9 @@ mod tests {
             .insert(&db)
             .await
             .unwrap();
-        upsert_current_kv(&db, newer.clone()).await.unwrap();
+        upsert_current_kv_batch(&db, vec![newer.clone()])
+            .await
+            .unwrap();
         kv_delete::ActiveModel {
             invocation_id: Set(crate::hash::hash(b"delete-newer")),
             space: Set(SpaceIdWrap(space.clone())),
@@ -1057,7 +1105,7 @@ mod tests {
             .insert(&db)
             .await
             .unwrap();
-        upsert_current_kv(&db, older).await.unwrap();
+        upsert_current_kv_batch(&db, vec![older]).await.unwrap();
 
         let watermark = current_kv::Entity::find_by_id((
             SpaceIdWrap(space),
@@ -1082,7 +1130,7 @@ mod tests {
         let seq_newer = test_write(&space, "by-seq", "seq-newer", 2);
         let seq_older = test_write(&space, "by-seq", "seq-older", 1);
         for write in [seq_newer.clone(), seq_older] {
-            upsert_current_kv(&db, write).await.unwrap();
+            upsert_current_kv_batch(&db, vec![write]).await.unwrap();
         }
 
         let mut epoch_a = test_write(&space, "by-epoch", "epoch-a", 3);
@@ -1092,8 +1140,12 @@ mod tests {
         } else {
             (epoch_b.clone(), epoch_a.clone())
         };
-        upsert_current_kv(&db, epoch_newer.clone()).await.unwrap();
-        upsert_current_kv(&db, epoch_older).await.unwrap();
+        upsert_current_kv_batch(&db, vec![epoch_newer.clone()])
+            .await
+            .unwrap();
+        upsert_current_kv_batch(&db, vec![epoch_older])
+            .await
+            .unwrap();
 
         epoch_a.key = "by-epoch-seq".parse::<Path>().unwrap().into();
         epoch_b.key = epoch_a.key.clone();
@@ -1101,8 +1153,10 @@ mod tests {
         epoch_b.epoch = epoch_a.epoch;
         epoch_a.epoch_seq = 2;
         epoch_b.epoch_seq = 1;
-        upsert_current_kv(&db, epoch_a.clone()).await.unwrap();
-        upsert_current_kv(&db, epoch_b).await.unwrap();
+        upsert_current_kv_batch(&db, vec![epoch_a.clone()])
+            .await
+            .unwrap();
+        upsert_current_kv_batch(&db, vec![epoch_b]).await.unwrap();
 
         for (key, invocation) in [
             ("by-seq", seq_newer.invocation),
@@ -1302,5 +1356,117 @@ mod tests {
         let child_with_constraints = make_sql_constrained_caveat("get", "SELECT 1");
         caveats_contain_child(&parent, &child_with_constraints)
             .expect("narrowing on an unconstrained parent must be allowed");
+    }
+
+    /// TC-411: multipart put persistence (`kv_write` history insert +
+    /// `current_kv` projection upsert) must be exactly two statements,
+    /// independent of how many puts are in the batch, instead of `2 * N`.
+    #[tokio::test]
+    async fn multipart_put_persistence_is_two_statements_regardless_of_item_count() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        for item_count in [1usize, 10] {
+            let mut db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+                .await
+                .unwrap();
+            Migrator::up(&db, None).await.unwrap();
+            db.execute(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "PRAGMA foreign_keys = OFF".to_string(),
+            ))
+            .await
+            .unwrap();
+            let space = test_space("multipart-put-count");
+            let writes: Vec<kv_write::Model> = (0..item_count)
+                .map(|index| test_write(&space, &format!("k/{index}"), "batched", index as i64))
+                .collect();
+
+            let counter = Arc::new(AtomicUsize::new(0));
+            let query_counter = Arc::clone(&counter);
+            db.set_metric_callback(move |_info| {
+                query_counter.fetch_add(1, Ordering::SeqCst);
+            });
+
+            let before = counter.load(Ordering::SeqCst);
+            kv_write::Entity::insert_many(writes.iter().cloned().map(kv_write::ActiveModel::from))
+                .exec(&db)
+                .await
+                .unwrap();
+            upsert_current_kv_batch(&db, writes).await.unwrap();
+            assert_eq!(
+                counter.load(Ordering::SeqCst) - before,
+                2,
+                "{item_count}-item put batch must issue exactly two statements"
+            );
+        }
+    }
+
+    /// TC-411: when `db.rs` already loaded the current `current_kv` row for
+    /// a delete and threads its `invocation` id through as
+    /// `known_invocation_id`, `resolve_deleted_invocation_id` must not
+    /// re-query `kv_write` to re-derive it. Compares the statement count of
+    /// the reuse path against the fallback (no pre-loaded id) path, which
+    /// still performs exactly one extra lookup.
+    #[tokio::test]
+    async fn delete_reuses_preloaded_invocation_id_without_extra_kv_write_query() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        async fn run(known_invocation_id: Option<Hash>) -> usize {
+            let mut db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+                .await
+                .unwrap();
+            Migrator::up(&db, None).await.unwrap();
+            db.execute(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "PRAGMA foreign_keys = OFF".to_string(),
+            ))
+            .await
+            .unwrap();
+            let space = test_space("delete-reuse-count");
+            let write = test_write(&space, "reused", "orig", 1);
+            kv_write::ActiveModel::from(write.clone())
+                .insert(&db)
+                .await
+                .unwrap();
+            upsert_current_kv_batch(&db, vec![write.clone()])
+                .await
+                .unwrap();
+
+            let counter = Arc::new(AtomicUsize::new(0));
+            let query_counter = Arc::clone(&counter);
+            db.set_metric_callback(move |_info| {
+                query_counter.fetch_add(1, Ordering::SeqCst);
+            });
+
+            let before = counter.load(Ordering::SeqCst);
+            let resolved = resolve_deleted_invocation_id(
+                &db,
+                &space,
+                &"reused".parse::<Path>().unwrap(),
+                Some((write.seq, write.epoch, write.epoch_seq)),
+                known_invocation_id,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                resolved, write.invocation,
+                "must resolve to the same invocation id regardless of path taken"
+            );
+            counter.load(Ordering::SeqCst) - before
+        }
+
+        let reused = run(Some(crate::hash::hash(b"invocation-orig"))).await;
+        let requeried = run(None).await;
+        assert_eq!(
+            requeried,
+            reused + 1,
+            "omitting the pre-loaded invocation id must cost exactly one extra kv_write query"
+        );
+        assert_eq!(
+            reused, 0,
+            "reusing the pre-loaded id must cost zero statements"
+        );
     }
 }
