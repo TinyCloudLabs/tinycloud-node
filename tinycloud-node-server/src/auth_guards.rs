@@ -121,6 +121,12 @@ fn kv_etag(hash: Hash) -> String {
     format!("\"blake3-{}\"", hex::encode(hash.as_ref()))
 }
 
+pub(crate) fn if_none_match_matches(value: Option<&str>, etag: &str) -> bool {
+    value.is_some_and(|value| {
+        value.trim() == "*" || value.split(',').any(|candidate| candidate.trim() == etag)
+    })
+}
+
 impl<'r> Responder<'r, 'static> for KvMutationResponse {
     fn respond_to(self, request: &'r Request<'_>) -> rocket::response::Result<'static> {
         let mut response = ().respond_to(request)?;
@@ -248,8 +254,58 @@ where
 mod tests {
     use super::*;
     use futures::io::Cursor;
-    use rocket::local::asynchronous::Client;
+    use rocket::{get, http::Header, local::asynchronous::Client, routes};
     use tinycloud_core::{hash::hash, KvBatchReadItem, KvBatchReadValue};
+
+    #[get("/")]
+    fn conditional_kv_response() -> KVResponse<Cursor<Vec<u8>>> {
+        let content = b"hello".to_vec();
+        KVResponse::new(
+            Metadata(BTreeMap::from([
+                (
+                    "Cache-Control".to_string(),
+                    "public, max-age=31536000".to_string(),
+                ),
+                (
+                    "CDN-Cache-Control".to_string(),
+                    "public, max-age=31536000".to_string(),
+                ),
+                (
+                    "Surrogate-Control".to_string(),
+                    "public, max-age=31536000".to_string(),
+                ),
+            ])),
+            hash(&content),
+            tinycloud_core::storage::Content::new(content.len() as u64, Cursor::new(content)),
+        )
+    }
+
+    #[tokio::test]
+    async fn matching_kv_etag_returns_a_bodyless_304() {
+        let client = Client::tracked(rocket::build().mount("/", routes![conditional_kv_response]))
+            .await
+            .unwrap();
+
+        let first = client.get("/").dispatch().await;
+        assert_eq!(first.status(), Status::Ok);
+        let etag = first.headers().get_one("ETag").unwrap().to_string();
+        assert_eq!(
+            first.headers().get_one("Cache-Control"),
+            Some("private, no-cache")
+        );
+        assert!(first.headers().get_one("CDN-Cache-Control").is_none());
+        assert!(first.headers().get_one("Surrogate-Control").is_none());
+        assert_eq!(first.into_string().await.as_deref(), Some("hello"));
+
+        let second = client
+            .get("/")
+            .header(Header::new("If-None-Match", etag))
+            .dispatch()
+            .await;
+        assert_eq!(second.status(), Status::NotModified);
+        assert!(second.headers().get_one("Content-Length").is_none());
+        assert!(second.into_string().await.is_none());
+    }
 
     #[test]
     fn batch_read_response_keeps_successes_and_missing_keys_in_order() {
@@ -308,6 +364,10 @@ mod tests {
             ),
             (
                 "cdn-cache-control".to_string(),
+                "public, max-age=31536000".to_string(),
+            ),
+            (
+                "surrogate-control".to_string(),
                 "public, max-age=31536000".to_string(),
             ),
         ])));
@@ -518,12 +578,19 @@ where
         let KVResponse(content, metadata, hash) = self;
         let content_length = content.len();
         let etag = kv_etag(hash);
-        Ok(Response::build_from(ObjectHeaders(metadata).respond_to(r)?)
-            .header(Header::new("ETag", etag))
-            .header(Header::new("Content-Length", content_length.to_string()))
-            // must ensure that Metadata::respond_to does not set the body of the response
-            .streamed_body(content.compat())
-            .max_chunk_size(STREAM_MAX_CHUNK_SIZE)
-            .finalize())
+        let not_modified = if_none_match_matches(r.headers().get_one("If-None-Match"), &etag);
+        let mut response = Response::build_from(ObjectHeaders(metadata).respond_to(r)?);
+        response.header(Header::new("ETag", etag));
+        response.header(Header::new("Cache-Control", "private, no-cache"));
+        if not_modified {
+            response.status(Status::NotModified);
+        } else {
+            response
+                .header(Header::new("Content-Length", content_length.to_string()))
+                // must ensure that Metadata::respond_to does not set the body of the response
+                .streamed_body(content.compat())
+                .max_chunk_size(STREAM_MAX_CHUNK_SIZE);
+        }
+        Ok(response.finalize())
     }
 }
