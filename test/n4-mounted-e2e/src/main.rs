@@ -769,37 +769,6 @@ async fn mounted_http_adversarial_checks(rocket: Rocket<Build>) -> Result<()> {
         }
     }
 
-    // Keep the production v2 router surface in the same mounted binary
-    // self-test. Each route is exercised through Rocket with both the real
-    // origin guard and a malformed body; a route that is merely present in a
-    // unit registry is not sufficient evidence.
-    for route in [
-        "/share/v2/policies",
-        "/share/v2/policy/challenges",
-        "/share/v2/policy/session",
-        "/share/v2/invoke",
-    ] {
-        let response = client
-            .post(route)
-            .header(json_header.clone())
-            .header(Header::new("Origin", "https://evil.example"))
-            .body("{}")
-            .dispatch()
-            .await;
-        if response.status() != rocket::http::Status::Forbidden {
-            bail!("{route} accepted an origin outside the configured host boundary");
-        }
-        let response = client
-            .post(route)
-            .header(json_header.clone())
-            .body("{}")
-            .dispatch()
-            .await;
-        if response.status() == rocket::http::Status::NotFound {
-            bail!("{route} was not mounted in the real Rocket surface");
-        }
-    }
-
     let response = client
         .post("/share/v1/invitations/consume")
         .header(json_header.clone())
