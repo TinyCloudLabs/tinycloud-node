@@ -19,7 +19,7 @@ use tracing::{info_span, Instrument};
 use crate::{
     auth_guards::{
         filter_stored_object_metadata, is_storable_object_header, DataIn, DataOut, InvOut,
-        ObjectHeaders,
+        InvokeHeaders,
     },
     authorization::AuthHeaderGetter,
     config::Config,
@@ -599,7 +599,7 @@ pub struct RevokeResponse {
 pub async fn invoke(
     i: AuthHeaderGetter<InvocationInfo>,
     req_span: TracingSpan,
-    headers: ObjectHeaders,
+    headers: InvokeHeaders<'_>,
     data: DataIn<'_>,
     staging: &State<BlockStage>,
     tinycloud: &State<TinyCloud>,
@@ -633,7 +633,7 @@ pub async fn invoke(
 pub async fn invoke(
     i: AuthHeaderGetter<InvocationInfo>,
     req_span: TracingSpan,
-    headers: ObjectHeaders,
+    headers: InvokeHeaders<'_>,
     data: DataIn<'_>,
     staging: &State<BlockStage>,
     tinycloud: &State<TinyCloud>,
@@ -674,23 +674,6 @@ type KvInputMap = HashMap<
 >;
 type ExpectedKvBatchInputs = BTreeMap<String, (SpaceId, Path)>;
 
-fn metadata_header<'a>(metadata: &'a Metadata, name: &str) -> Option<&'a str> {
-    metadata
-        .0
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.as_str())
-}
-
-fn take_metadata_header(metadata: &mut Metadata, name: &str) -> Option<String> {
-    let key = metadata
-        .0
-        .keys()
-        .find(|key| key.eq_ignore_ascii_case(name))?
-        .clone();
-    metadata.0.remove(&key)
-}
-
 fn parse_strong_blake3_etag(value: &str) -> Result<[u8; 32], (Status, String)> {
     let value = value.trim();
     let digest = value
@@ -724,10 +707,10 @@ fn parse_strong_blake3_etag(value: &str) -> Result<[u8; 32], (Status, String)> {
 }
 
 fn parse_positive_u64_header(
-    metadata: &mut Metadata,
+    value: Option<&str>,
     name: &str,
 ) -> Result<Option<u64>, (Status, String)> {
-    take_metadata_header(metadata, name)
+    value
         .map(|value| {
             let parsed = value.trim().parse::<u64>().map_err(|_| {
                 (
@@ -855,7 +838,7 @@ fn kv_list_target(capabilities: &[Capability]) -> Option<(SpaceId, Path)> {
 
 fn kv_invoke_options(
     invocation: &InvocationInfo,
-    headers: &mut ObjectHeaders,
+    headers: &InvokeHeaders<'_>,
     multipart: bool,
     cursor_key: &[u8; 32],
 ) -> Result<KvInvokeOptions, (Status, String)> {
@@ -871,7 +854,7 @@ fn kv_invoke_options(
 #[cfg(test)]
 fn kv_invoke_options_for_capabilities(
     capabilities: &[Capability],
-    headers: &mut ObjectHeaders,
+    headers: &InvokeHeaders<'_>,
     multipart: bool,
 ) -> Result<KvInvokeOptions, (Status, String)> {
     kv_invoke_options_for_capabilities_with_cursor(capabilities, headers, multipart, None, None)
@@ -879,14 +862,14 @@ fn kv_invoke_options_for_capabilities(
 
 fn kv_invoke_options_for_capabilities_with_cursor(
     capabilities: &[Capability],
-    headers: &mut ObjectHeaders,
+    headers: &InvokeHeaders<'_>,
     multipart: bool,
     cursor_key: Option<&[u8; 32]>,
     cursor_subject: Option<&str>,
 ) -> Result<KvInvokeOptions, (Status, String)> {
-    let if_match = take_metadata_header(&mut headers.0, "if-match");
-    let if_none_match = take_metadata_header(&mut headers.0, "if-none-match");
-    let expected_version = take_metadata_header(&mut headers.0, "x-tinycloud-expected-version");
+    let if_match = headers.if_match;
+    let if_none_match = headers.if_none_match;
+    let expected_version = headers.expected_version;
     if expected_version.is_some() {
         return Err((
             Status::BadRequest,
@@ -952,13 +935,13 @@ fn kv_invoke_options_for_capabilities_with_cursor(
         let (space, path, _) = &mutation_targets[0];
         preconditions.insert(
             (space.clone(), path.clone()),
-            KvPrecondition::Matches(parse_strong_blake3_etag(&value)?),
+            KvPrecondition::Matches(parse_strong_blake3_etag(value)?),
         );
     }
 
     let max_response_bytes =
-        parse_positive_u64_header(&mut headers.0, "x-tinycloud-max-response-bytes")?;
-    let list_limit = parse_positive_u64_header(&mut headers.0, "x-tinycloud-limit")?
+        parse_positive_u64_header(headers.max_response_bytes, "x-tinycloud-max-response-bytes")?;
+    let list_limit = parse_positive_u64_header(headers.limit, "x-tinycloud-limit")?
         .map(|limit| {
             if limit > 1000 {
                 Err((
@@ -970,7 +953,8 @@ fn kv_invoke_options_for_capabilities_with_cursor(
             }
         })
         .transpose()?;
-    let list_cursor = take_metadata_header(&mut headers.0, "x-tinycloud-cursor")
+    let list_cursor = headers
+        .cursor
         .map(|value| {
             let key = cursor_key
                 .ok_or_else(|| (Status::BadRequest, "Invalid KV list cursor".to_string()))?;
@@ -980,7 +964,7 @@ fn kv_invoke_options_for_capabilities_with_cursor(
                 .ok_or_else(|| (Status::BadRequest, "Invalid KV list cursor".to_string()))?;
             let limit = list_limit
                 .ok_or_else(|| (Status::BadRequest, "Invalid KV list cursor".to_string()))?;
-            decode_kv_cursor(key, &value, subject, &space, &prefix, limit)
+            decode_kv_cursor(key, value, subject, &space, &prefix, limit)
                 .map_err(|_| (Status::BadRequest, "Invalid KV list cursor".to_string()))
         })
         .transpose()?;
@@ -993,8 +977,9 @@ fn kv_invoke_options_for_capabilities_with_cursor(
     })
 }
 
-fn is_multipart(headers: &ObjectHeaders) -> bool {
-    metadata_header(&headers.0, "content-type")
+fn is_multipart(headers: &InvokeHeaders<'_>) -> bool {
+    headers
+        .content_type
         .map(|value| {
             value
                 .to_ascii_lowercase()
@@ -1182,7 +1167,7 @@ async fn copy_multipart_field_to_stage(
 
 async fn build_batch_kv_inputs(
     data: rocket::Data<'_>,
-    headers: &ObjectHeaders,
+    headers: &InvokeHeaders<'_>,
     expected: &ExpectedKvBatchInputs,
     staging: &State<BlockStage>,
     tinycloud: &State<TinyCloud>,
@@ -1193,7 +1178,7 @@ async fn build_batch_kv_inputs(
         return Ok(HashMap::new());
     }
 
-    let content_type = metadata_header(&headers.0, "content-type").ok_or_else(|| {
+    let content_type = headers.content_type.ok_or_else(|| {
         (
             Status::BadRequest,
             "Missing multipart content-type".to_string(),
@@ -1300,7 +1285,7 @@ fn classify_invocation_time_rejection(
 async fn invoke_impl(
     i: AuthHeaderGetter<InvocationInfo>,
     req_span: TracingSpan,
-    mut headers: ObjectHeaders,
+    headers: InvokeHeaders<'_>,
     data: DataIn<'_>,
     staging: &State<BlockStage>,
     tinycloud: &State<TinyCloud>,
@@ -1426,10 +1411,9 @@ async fn invoke_impl(
                     .collect();
 
             if !duckdb_caps.is_empty() {
-                let arrow_format = headers.0 .0.iter().any(|(k, v)| {
-                    k.eq_ignore_ascii_case("accept")
-                        && v.contains("application/vnd.apache.arrow.stream")
-                });
+                let arrow_format = headers
+                    .accept
+                    .is_some_and(|v| v.contains("application/vnd.apache.arrow.stream"));
                 let result = handle_duckdb_invoke(
                     admitted,
                     data,
@@ -1469,7 +1453,7 @@ async fn invoke_impl(
 
         let put_caps = kv_put_capabilities(&admitted.invocation().0);
         let is_multipart_request = is_multipart(&headers);
-        let kv_options = kv_invoke_options(&admitted.invocation().0, &mut headers, is_multipart_request, &tinycloud.kv_cursor_key())?;
+        let kv_options = kv_invoke_options(&admitted.invocation().0, &headers, is_multipart_request, &tinycloud.kv_cursor_key())?;
         let expected_batch_inputs = if is_multipart_request && !put_caps.is_empty() {
             Some(validate_kv_batch_capabilities(&admitted.invocation().0, &put_caps)?)
         } else {
@@ -1567,7 +1551,7 @@ async fn invoke_impl(
                     let mut inputs = HashMap::new();
                     inputs.insert(
                         (space.clone(), path.clone()),
-                        (filter_stored_object_metadata(headers.0), stage),
+                        (filter_stored_object_metadata(headers.metadata), stage),
                     );
                     Ok(inputs)
                 }
@@ -3199,32 +3183,30 @@ mod tests {
         assert_eq!(buffered_hash, original_hash);
     }
 
+    fn test_invoke_headers<'r>() -> InvokeHeaders<'r> {
+        InvokeHeaders {
+            accept: None,
+            content_type: None,
+            if_match: None,
+            if_none_match: None,
+            expected_version: None,
+            max_response_bytes: None,
+            limit: None,
+            cursor: None,
+            metadata: Metadata(BTreeMap::new()),
+        }
+    }
+
     #[tokio::test]
-    async fn bounded_kv_headers_are_positive_and_removed_from_object_metadata() {
-        let mut metadata = Metadata(BTreeMap::from([
-            (
-                "X-TinyCloud-Max-Response-Bytes".to_string(),
-                "1048576".to_string(),
-            ),
-            ("content-type".to_string(), "text/plain".to_string()),
-        ]));
+    async fn bounded_kv_headers_are_positive() {
         assert_eq!(
-            parse_positive_u64_header(&mut metadata, "x-tinycloud-max-response-bytes").unwrap(),
+            parse_positive_u64_header(Some("1048576"), "x-tinycloud-max-response-bytes").unwrap(),
             Some(1_048_576)
-        );
-        assert!(metadata_header(&metadata, "x-tinycloud-max-response-bytes").is_none());
-        assert_eq!(
-            metadata_header(&metadata, "content-type"),
-            Some("text/plain")
         );
 
         for invalid in ["0", "-1", "many"] {
-            let mut metadata = Metadata(BTreeMap::from([(
-                "x-tinycloud-limit".to_string(),
-                invalid.to_string(),
-            )]));
             assert_eq!(
-                parse_positive_u64_header(&mut metadata, "x-tinycloud-limit")
+                parse_positive_u64_header(Some(invalid), "x-tinycloud-limit")
                     .unwrap_err()
                     .0,
                 Status::BadRequest
@@ -3237,13 +3219,13 @@ mod tests {
         let space = test_space_id("conditional-kv-options");
         let capability = kv_put_capability(&space, "files/report.txt");
 
-        let mut create_headers = ObjectHeaders(Metadata(BTreeMap::from([(
-            "If-None-Match".to_string(),
-            "*".to_string(),
-        )])));
+        let create_headers = InvokeHeaders {
+            if_none_match: Some("*"),
+            ..test_invoke_headers()
+        };
         let create = kv_invoke_options_for_capabilities(
             std::slice::from_ref(&capability),
-            &mut create_headers,
+            &create_headers,
             false,
         )
         .unwrap();
@@ -3254,15 +3236,15 @@ mod tests {
             )),
             Some(&KvPrecondition::DoesNotExist)
         );
-        assert!(metadata_header(&create_headers.0, "if-none-match").is_none());
 
         let digest = [7u8; 32];
-        let mut replace_headers = ObjectHeaders(Metadata(BTreeMap::from([(
-            "If-Match".to_string(),
-            format!("\"blake3-{}\"", hex::encode(digest)),
-        )])));
+        let replace_etag = format!("\"blake3-{}\"", hex::encode(digest));
+        let replace_headers = InvokeHeaders {
+            if_match: Some(&replace_etag),
+            ..test_invoke_headers()
+        };
         let replace =
-            kv_invoke_options_for_capabilities(&[capability], &mut replace_headers, false).unwrap();
+            kv_invoke_options_for_capabilities(&[capability], &replace_headers, false).unwrap();
         assert_eq!(
             replace
                 .preconditions
@@ -3278,23 +3260,24 @@ mod tests {
             kv_put_capability(&space, "a"),
             kv_put_capability(&space, "b"),
         ];
-        let mut headers = ObjectHeaders(Metadata(BTreeMap::from([(
-            "If-Match".to_string(),
-            format!("\"blake3-{}\"", hex::encode([1u8; 32])),
-        )])));
+        let etag = format!("\"blake3-{}\"", hex::encode([1u8; 32]));
+        let headers = InvokeHeaders {
+            if_match: Some(&etag),
+            ..test_invoke_headers()
+        };
         assert_eq!(
-            kv_invoke_options_for_capabilities(&capabilities, &mut headers, false)
+            kv_invoke_options_for_capabilities(&capabilities, &headers, false)
                 .unwrap_err()
                 .0,
             Status::BadRequest
         );
 
-        let mut headers = ObjectHeaders(Metadata(BTreeMap::from([(
-            "If-None-Match".to_string(),
-            "*".to_string(),
-        )])));
+        let headers = InvokeHeaders {
+            if_none_match: Some("*"),
+            ..test_invoke_headers()
+        };
         assert_eq!(
-            kv_invoke_options_for_capabilities(&capabilities[..1], &mut headers, true)
+            kv_invoke_options_for_capabilities(&capabilities[..1], &headers, true)
                 .unwrap_err()
                 .0,
             Status::BadRequest
