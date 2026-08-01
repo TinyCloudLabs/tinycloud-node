@@ -29,7 +29,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::io::AsyncReadExt;
 
 use tinycloud_auth::{
-    authorization::TinyCloudDelegation,
+    authorization::{HeaderEncode, TinyCloudDelegation},
     identity::did_principal_matches,
     multihash_codetable::{Code, MultihashDigest},
     share_email_evidence::{normalized_email_hash, verify_detached_ed25519},
@@ -1366,6 +1366,52 @@ async fn verify_delegation_signature(delegation: &TinyCloudDelegation) -> Result
     Ok(())
 }
 
+/// Recipient-DID authorization carries the exact OpenKey session delegation
+/// that the authenticated client restored.  The holder signature and
+/// presentation bind its digest to the request; this check binds the same
+/// bytes to Node's durable delegation record and live revocation graph.
+async fn verify_recipient_did_credential(
+    runtime: &ShareV2Runtime,
+    credential: &str,
+    credential_cid: &str,
+    holder_did: &str,
+) -> Result<(), ()> {
+    if credential.is_empty() || credential == "openkey-device-session" {
+        return Err(());
+    }
+    let (delegation, bytes) = TinyCloudDelegation::decode(credential).map_err(|_| ())?;
+    if bytes.is_empty() || raw_blake3_cid(&bytes) != credential_cid {
+        return Err(());
+    }
+    let cid = credential_cid
+        .parse::<tinycloud_auth::ipld_core::cid::Cid>()
+        .map_err(|_| ())?;
+    let id = Hash::from(cid);
+    let row = delegation::Entity::find_by_id(id)
+        .one(&runtime.conn)
+        .await
+        .map_err(|_| ())?
+        .ok_or(())?;
+    let stored =
+        maybe_decrypt(Some(&runtime.policy_encryption), &row.serialization).map_err(|_| ())?;
+    if stored != bytes || revocation_in_ancestry(&runtime.conn, id).await? {
+        return Err(());
+    }
+    verify_delegation_signature(&delegation).await?;
+    let info = DelegationInfo::try_from(delegation).map_err(|_| ())?;
+    let now = OffsetDateTime::now_utc();
+    if !did_principal_matches(&info.delegate, holder_did)
+        || !did_principal_matches(&row.delegatee, holder_did)
+        || info.expiry.is_none_or(|expiry| expiry <= now)
+        || info.not_before.is_some_and(|not_before| not_before > now)
+        || row.expiry.is_none_or(|expiry| expiry <= now)
+        || row.not_before.is_some_and(|not_before| not_before > now)
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
 fn raw_blake3_cid(bytes: &[u8]) -> String {
     tinycloud_core::hash::hash(bytes).to_cid(0x55).to_string()
 }
@@ -2696,6 +2742,14 @@ pub async fn policy_session_v2(
             .get("credentialDigest")
             .and_then(Value::as_str)
             != Some(credential_digest.as_str())
+        || binding_message.get("targetOrigin").and_then(Value::as_str)
+            != Some(challenge_request.target_origin.as_str())
+        || binding_message.get("nodeAudience").and_then(Value::as_str)
+            != Some(challenge_request.node_audience.as_str())
+        || binding_message.get("enforcerDid").and_then(Value::as_str)
+            != Some(runtime.enforcer_did.as_str())
+        || binding_message.get("expiresAt").and_then(Value::as_str)
+            != Some(presentation.expires_at.as_str())
     {
         return Err(share_error("invalid_holder_proof"));
     }
@@ -2704,9 +2758,24 @@ pub async fn policy_session_v2(
     let holder = DidKey::parse(presentation_holder.to_owned())
         .map_err(|_| share_error("invalid_holder_proof"))?;
     if let Some(recipient_did) = registered.matcher.recipient_did() {
-        if recipient_did != presentation_holder || request.credential.is_empty() {
+        if recipient_did != presentation_holder {
             return Err(share_error("policy_denied"));
         }
+        let credential_cid = binding_message
+            .get("delegationCid")
+            .and_then(Value::as_str)
+            .ok_or_else(|| share_error("policy_denied"))?;
+        if binding_message.get("jti").and_then(Value::as_str) != Some(presentation.jti.as_str()) {
+            return Err(share_error("invalid_holder_proof"));
+        }
+        verify_recipient_did_credential(
+            runtime,
+            &request.credential,
+            credential_cid,
+            presentation_holder,
+        )
+        .await
+        .map_err(|_| share_error("policy_denied"))?;
     } else {
         let expiry = registered.expiry.unix_timestamp();
         let verifier = runtime
@@ -4923,6 +4992,24 @@ mod tests {
         assert!(
             verify_v2_proof(&holder_did, &sig_mutated, domain, &value).is_err(),
             "a single flipped signature byte must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn recipient_did_credential_rejects_the_legacy_marker_at_the_authority_boundary() {
+        let key_setup = StaticSecret::new(vec![0x39u8; 32]).expect("32-byte test secret");
+        let tee_context = TeeContext::derive_local(&key_setup);
+        let runtime = compose_test_runtime(&key_setup, Some(tee_context), true).await;
+        assert!(
+            verify_recipient_did_credential(
+                &runtime,
+                "openkey-device-session",
+                "bafybeigdyrzt5n6n4j2s5x7m7n5f4q6r3s2t1u0v9w8x7y6z5a4b3c2d1e0",
+                "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+            )
+            .await
+            .is_err(),
+            "recipient-DID authorization must never treat the old marker as a credential"
         );
     }
 
