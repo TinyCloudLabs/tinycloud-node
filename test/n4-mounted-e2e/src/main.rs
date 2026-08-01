@@ -317,9 +317,16 @@ fn build_case(
     let owner_seed = [0x55u8; 32];
     let owner = owner_did(&owner_seed);
     let expires_at = millis_time(now + time::Duration::hours(24));
-    let is_kv = kind.starts_with("kv");
+    let is_kv = kind.starts_with("kv") || kind == "recipient-did";
     let is_domain = kind == "kv-domain" || kind == "kv-folder-domain";
     let is_folder = kind == "kv-folder-domain";
+    let recipient_matcher = if kind == "recipient-did" {
+        json!({"kind":"recipientDid","value":"did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw"})
+    } else if is_domain {
+        json!({"kind":"emailDomain","value":"mailinator.com"})
+    } else {
+        json!({"kind":"exactEmail","value":"sam@tinycloud.xyz"})
+    };
     let source = if is_kv {
         json!({"kind":"kv","space":SPACE,"path":if is_folder { "documents" } else { "documents/policy-payload.md" },"action":"tinycloud.kv/get"})
     } else {
@@ -327,7 +334,7 @@ fn build_case(
         json!({"kind":"sql","space":SPACE,"database":"documents","path":"shared/plan","statement":"shared_document_by_id","arguments":arguments,"argumentsDigest":sha256_b64(&value_bytes(&arguments)),"action":"tinycloud.sql/read"})
     };
     let source_digest = sha256_b64(&value_bytes(&source));
-    let policy = json!({"type":"TinyCloudSharePolicy","version":2,"recipientMatcher":if is_domain { json!({"kind":"emailDomain","value":"mailinator.com"}) } else { json!({"kind":"exactEmail","value":"sam@tinycloud.xyz"}) },"contentSource":source,"contentSourceDigest":source_digest,"actions":if is_folder { json!(["tinycloud.kv/get","tinycloud.kv/list","tinycloud.kv/put"]) } else if is_domain { json!(["tinycloud.kv/get"]) } else if is_kv { json!(["tinycloud.kv/get","tinycloud.kv/put"]) } else { json!([source["action"]]) },"resource":if is_folder { json!({"kind":"prefix","value":"documents"}) } else { json!({"kind":"exact","value":source["path"]}) },"expiresAt":expires_at,"issuerDid":sender_did});
+    let policy = json!({"type":"TinyCloudSharePolicy","version":2,"recipientMatcher":recipient_matcher,"contentSource":source,"contentSourceDigest":source_digest,"actions":if is_folder { json!(["tinycloud.kv/get","tinycloud.kv/list","tinycloud.kv/put"]) } else if is_domain { json!(["tinycloud.kv/get"]) } else if is_kv { json!(["tinycloud.kv/get","tinycloud.kv/put"]) } else { json!([source["action"]]) },"resource":if is_folder { json!({"kind":"prefix","value":"documents"}) } else { json!({"kind":"exact","value":source["path"]}) },"expiresAt":expires_at,"issuerDid":sender_did});
     let policy_bytes = value_bytes(&policy);
     let policy_cid = cid(0x55, Code::Sha2_256, &policy_bytes);
     let delegation_cid = cid(
@@ -455,7 +462,13 @@ fn build_case(
         &node_did,
     );
     let attestation = attestation(config, &enrollment, &node_did, &status_fresh, node);
-    let authority_handle = if is_kv { "amh_kv_001" } else { "amh_sql_001" };
+    let authority_handle = if kind == "recipient-did" {
+        "amh_recipient_did_001"
+    } else if is_kv {
+        "amh_kv_001"
+    } else {
+        "amh_sql_001"
+    };
     let authority = json!({"type":"TinyCloudShareAuthorityMaterial","version":1,"handle":authority_handle,"policyOwnerDid":owner,"senderDid":sender_did,"relationship":{"policyOwnerDid":owner,"senderDid":sender_did,"authenticated":true},"mapping":{"sharePolicyCid":policy_cid,"shareDelegationCid":delegation_cid,"policyAuthorityCid":policy_parent_cid,"policyEnforcementCid":enforcement_parent_cid},"policyAuthorityBytes":b64(&authority_parent_bytes),"policyAuthorityCid":policy_parent_cid,"policyEnforcementBytes":b64(&enforcement_parent_bytes),"policyEnforcementCid":enforcement_parent_cid,"statusObservations":[authority_status,enforcement_status],"enrollment":enrollment,"attestation":attestation});
     let authority_digest = sha256_b64(&value_bytes(&authority));
     Ok(Case {
@@ -906,6 +919,7 @@ async fn run() -> Result<()> {
         build_case(&fixture_config, "kv-domain", &sender, &node, now)?,
         build_case(&fixture_config, "kv-folder-domain", &sender, &node, now)?,
         build_case(&fixture_config, "sql", &sender, &node, now)?,
+        build_case(&fixture_config, "recipient-did", &sender, &node, now)?,
     ];
     let temp = TempDir::new().context("temporary fixture directory")?;
     let material_path = temp.path().join("authority-material.json");
