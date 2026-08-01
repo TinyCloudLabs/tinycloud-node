@@ -11,6 +11,11 @@ sqlite = ["sea-orm/sqlx-sqlite", "sea-orm-migration/sqlx-sqlite"]
 postgres = ["sea-orm/sqlx-postgres", "sea-orm-migration/sqlx-postgres"]
 mysql = ["sea-orm/sqlx-mysql", "sea-orm-migration/sqlx-mysql"]
 duckdb = ["dep:arrow", "dep:duckdb"]
+# TC-409: opt-in, deterministic verification-count test hook
+# (`admission::test_hook`). Off by default; never part of a production
+# build. Downstream crates enable it only on their `tinycloud-core`
+# dev-dependency so their own tests can assert exactly-once verification.
+verification-count-test-hook = []
 
 tokio = [
     "sea-orm/runtime-tokio-rustls",

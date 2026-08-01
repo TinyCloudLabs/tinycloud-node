@@ -1,3 +1,4 @@
+use crate::admission::AdmittedInvocation;
 use crate::encryption::ColumnEncryption;
 use crate::events::{epoch_hash, Delegation, Event, HashError, Invocation, Operation, Revocation};
 use crate::hash::Hash;
@@ -78,6 +79,24 @@ pub enum AccountDelegationQueryError {
     Db(#[from] DbErr),
     #[error("delegation query invocation is not authorized")]
     Unauthorized,
+}
+
+/// TC-409: which trust mode an invocation entered `invoke_with_options_mode`
+/// under, and therefore which `Event` variant (and how much duplicate
+/// verification work) it produces. `Admitted` is only reachable by consuming
+/// an `AdmittedInvocation`, obtainable only from `AdmittedInvocation::admit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvokeMode {
+    /// Untyped public entry point: signature verification runs during
+    /// processing, same as always.
+    Public,
+    /// Pre-authorized by a trusted application protocol seam
+    /// (`invoke_internal_kv_put`). Skips the full UCAN validator entirely.
+    Internal,
+    /// Envelope already verified once at admission. Authorization,
+    /// revocation, caveat containment, and signed-time validity are still
+    /// re-checked at execution; only the signature check is skipped.
+    Admitted,
 }
 
 #[derive(Debug, Clone)]
@@ -1386,6 +1405,47 @@ where
             .await
     }
 
+    /// TC-409: process an invocation whose envelope was already verified
+    /// once by `AdmittedInvocation::admit`. Skips only that duplicate
+    /// signature check downstream; authorization, revocation, caveat
+    /// containment, and signed-time validity are still re-checked against
+    /// the current database state. This is the sole way to reach
+    /// `Event::AdmittedInvocation` — a caller without an `AdmittedInvocation`
+    /// cannot construct one.
+    pub async fn invoke_admitted<S>(
+        &self,
+        invocation: AdmittedInvocation,
+        inputs: InvocationInputs<S::Writable>,
+    ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
+    where
+        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
+        self.invoke_with_options_admitted(invocation, inputs, KvInvokeOptions::default())
+            .await
+    }
+
+    pub async fn invoke_with_options_admitted<S>(
+        &self,
+        invocation: AdmittedInvocation,
+        inputs: InvocationInputs<S::Writable>,
+        options: KvInvokeOptions,
+    ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
+    where
+        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
+        self.invoke_with_options_mode(
+            invocation.into_invocation(),
+            inputs,
+            options,
+            InvokeMode::Admitted,
+        )
+        .await
+    }
+
     pub async fn invoke_with_options<S>(
         &self,
         invocation: Invocation,
@@ -1397,7 +1457,7 @@ where
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
-        self.invoke_with_options_mode(invocation, inputs, options, false)
+        self.invoke_with_options_mode(invocation, inputs, options, InvokeMode::Public)
             .await
     }
 
@@ -1412,7 +1472,7 @@ where
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
-        self.invoke_with_options_mode(invocation, inputs, options, true)
+        self.invoke_with_options_mode(invocation, inputs, options, InvokeMode::Internal)
             .await
     }
 
@@ -1421,7 +1481,7 @@ where
         invocation: Invocation,
         mut inputs: InvocationInputs<S::Writable>,
         options: KvInvokeOptions,
-        internal: bool,
+        mode: InvokeMode,
     ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
     where
         B: ImmutableWriteStore<S> + ImmutableReadStore,
@@ -1486,7 +1546,7 @@ where
             })
             .collect::<Vec<_>>();
         if mutation_keys.is_empty() {
-            return self.invoke_read_only::<S>(invocation, options).await;
+            return self.invoke_read_only::<S>(invocation, options, mode).await;
         }
         let _kv_object_guards = self.acquire_kv_object_guards(&mutation_keys).await;
         let mut stages = HashMap::new();
@@ -1614,10 +1674,10 @@ where
                 })
             });
         //  verify and commit invocation and kv operations
-        let event = if internal {
-            Event::InternalInvocation(Box::new(invocation), ops)
-        } else {
-            Event::Invocation(Box::new(invocation), ops)
+        let event = match mode {
+            InvokeMode::Internal => Event::InternalInvocation(Box::new(invocation), ops),
+            InvokeMode::Admitted => Event::AdmittedInvocation(Box::new(invocation), ops),
+            InvokeMode::Public => Event::Invocation(Box::new(invocation), ops),
         };
         let commit = transact(
             &tx,
@@ -1770,15 +1830,31 @@ where
         &self,
         invocation: Invocation,
         options: KvInvokeOptions,
+        mode: InvokeMode,
     ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
     where
         B: ImmutableWriteStore<S> + ImmutableReadStore,
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
-        invocation::verify_and_authorize(&self.conn, &invocation.0, OffsetDateTime::now_utc())
+        // TC-409: an admitted invocation already had its signature verified
+        // once at the admission boundary; only re-check authorization and
+        // signed-time validity here rather than verifying the signature a
+        // second time.
+        match mode {
+            InvokeMode::Admitted => {
+                invocation::authorize_admitted(&self.conn, &invocation.0, OffsetDateTime::now_utc())
+                    .await
+                    .map_err(TxError::<B, K>::from)?
+            }
+            InvokeMode::Public | InvokeMode::Internal => invocation::verify_and_authorize(
+                &self.conn,
+                &invocation.0,
+                OffsetDateTime::now_utc(),
+            )
             .await
-            .map_err(TxError::<B, K>::from)?;
+            .map_err(TxError::<B, K>::from)?,
+        };
 
         let requested_spaces = invocation.0.spaces().cloned().collect::<HashSet<_>>();
         if !requested_spaces.is_empty() {
@@ -2254,6 +2330,14 @@ async fn event_spaces<'a, C: ConnectionTrait>(
                     }
                 }
             }
+            Event::AdmittedInvocation(i, _) => {
+                for space in i.0.spaces() {
+                    let entry = spaces.entry(space.clone()).or_default();
+                    if !entry.iter().any(|(h, _)| h == &e.0) {
+                        entry.push(e);
+                    }
+                }
+            }
             Event::Revocation(r) => {
                 let r_hash = Hash::from(r.0.revoked);
                 for revoked in &revoked_events {
@@ -2649,6 +2733,24 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                     )
                     .await?;
                 }
+                Event::AdmittedInvocation(i, ops) => {
+                    invocation::process_admitted(
+                        db,
+                        *i,
+                        ops.into_iter()
+                            .map(|op| {
+                                let v = space_order
+                                    .get(op.space())
+                                    .and_then(|(s, e, _, h)| Some((s, e, h.get(&hash)?)))
+                                    .unwrap();
+                                op.version(*v.0, *v.1, *v.2)
+                            })
+                            .collect(),
+                        encryption,
+                        auth_graph,
+                    )
+                    .await?;
+                }
                 Event::Revocation(r) => {
                     revocation::process(db, *r).await?;
                 }
@@ -2700,6 +2802,10 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                 }
                 Event::InternalInvocation(i, _ops) => {
                     invocation::process_internal(db, *i, Vec::new(), encryption).await?;
+                }
+                Event::AdmittedInvocation(i, _ops) => {
+                    invocation::process_admitted(db, *i, Vec::new(), encryption, auth_graph)
+                        .await?;
                 }
                 Event::Revocation(r) => {
                     revocation::process(db, *r).await?;

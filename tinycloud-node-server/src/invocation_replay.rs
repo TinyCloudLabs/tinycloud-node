@@ -7,7 +7,7 @@ use tinycloud_core::sea_orm::{
     sea_query::OnConflict, ActiveValue::Set, ColumnTrait, Condition, DatabaseConnection,
     EntityTrait, QueryFilter,
 };
-use tinycloud_core::{events::Invocation, hash::Hash};
+use tinycloud_core::{events::Invocation, hash::Hash, AdmittedInvocation};
 
 const CLOCK_SKEW_SECONDS: i64 = 60;
 
@@ -41,18 +41,22 @@ impl InvocationReplayCache {
         Self { conn }
     }
 
-    /// Record a (already verified) invocation in the durable replay table.
+    /// Record an admitted invocation in the durable replay table.
     ///
-    /// TC-341: callers MUST verify the invocation's signature and enforce the
-    /// lifetime cap before calling this — an insert here is a durable write.
-    /// The retained `expires_at` is clamped to `now + max_lifetime_secs +
-    /// clock skew` so a row can never outlive the server's lifetime cap even
-    /// if the (verified) expiration claims otherwise.
+    /// TC-409: the parameter type is `&AdmittedInvocation`, not a bare
+    /// `Invocation` — the only way to obtain one is `AdmittedInvocation::admit`,
+    /// which verifies the invocation's signature and enforces the lifetime cap.
+    /// That makes "verified before this durable write" compile-time explicit
+    /// instead of a caller obligation. The retained `expires_at` is clamped to
+    /// `now + max_lifetime_secs + clock skew` so a row can never outlive the
+    /// server's lifetime cap even if the (verified) expiration claims
+    /// otherwise.
     pub async fn check_and_insert(
         &self,
-        invocation: &Invocation,
+        invocation: &AdmittedInvocation,
         max_lifetime_secs: u64,
     ) -> Result<(), InvocationReplayError> {
+        let invocation = invocation.invocation();
         let start = Instant::now();
         let now = OffsetDateTime::now_utc();
         let key = invocation.content_hash();
