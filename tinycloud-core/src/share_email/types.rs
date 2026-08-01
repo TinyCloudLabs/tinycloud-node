@@ -1396,10 +1396,15 @@ mod tests {
         let key = RecipientMatcher::RecipientDid(HOLDER.to_owned());
         assert_eq!(key.canonical().unwrap(), format!("recipientDid:{HOLDER}"));
         assert!(key.is_canonical());
-        assert!(RecipientMatcher::RecipientDid("did:web:recipient.example:path".to_owned()).is_canonical());
+        assert!(
+            RecipientMatcher::RecipientDid("did:web:recipient.example:path".to_owned())
+                .is_canonical()
+        );
         assert!(RecipientMatcher::RecipientDid("did:pkh:eip155:1:0xabc".to_owned()).is_canonical());
         assert!(!RecipientMatcher::RecipientDid("did:key:zholder".to_owned()).is_canonical());
-        assert!(!RecipientMatcher::RecipientDid("did:web:-recipient.example".to_owned()).is_canonical());
+        assert!(
+            !RecipientMatcher::RecipientDid("did:web:-recipient.example".to_owned()).is_canonical()
+        );
         assert!(!RecipientMatcher::RecipientDid("did:pkh:eip155:1".to_owned()).is_canonical());
         assert!(!key.matches_verified_email("person@example.com"));
     }
