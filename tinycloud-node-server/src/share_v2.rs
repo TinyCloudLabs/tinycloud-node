@@ -2638,7 +2638,16 @@ pub async fn policy_session_v2(
         return Err(error(Status::ServiceUnavailable, "capability_unavailable"));
     }
     let raw = read_body(data).await?;
-    let request: V2SessionRequest = serde_json::from_slice(&raw)
+    let raw_value: Value = serde_json::from_slice(&raw)
+        .map_err(|_| error(Status::BadRequest, "policy_session_invalid"))?;
+    if !raw_value
+        .get("credential")
+        .and_then(Value::as_str)
+        .is_some_and(|credential| !credential.is_empty())
+    {
+        return Err(error(Status::Unauthorized, "recipient_credential_required"));
+    }
+    let request: V2SessionRequest = serde_json::from_value(raw_value)
         .map_err(|_| error(Status::BadRequest, "policy_session_invalid"))?;
     let challenge = share_anonymous_challenge::Entity::find_by_id(&request.challenge_id)
         .one(&runtime.conn)
