@@ -178,7 +178,7 @@ pub(crate) async fn process_admitted<C: ConnectionTrait>(
 /// skips the signature check (already done at admission) and re-checks
 /// signed time validity instead, to close the same TOCTOU window
 /// `process_admitted` closes on the write path.
-pub(crate) async fn authorize_admitted<C: ConnectionTrait>(
+pub async fn authorize_admitted<C: ConnectionTrait>(
     db: &C,
     invocation: &util::InvocationInfo,
     now: OffsetDateTime,

@@ -100,6 +100,7 @@ use routes::{
     open_host_key,
     public::{public_kv_get, public_kv_head, public_kv_list, public_kv_options, RateLimiter},
     revoke, signed_kv_get,
+    upload_attestation::mint_upload_attestation,
     util_routes::*,
     version,
 };
@@ -258,6 +259,7 @@ pub async fn app_with_control(
         encryption_well_known,
         encryption_decrypt,
         revoke_encryption_network,
+        mint_upload_attestation,
     ];
     routes.extend(share_email::public_routes());
     routes.extend(share_v2::public_routes());
@@ -438,6 +440,17 @@ pub async fn app_with_control(
     } else {
         None
     };
+    let upload_attestation_runtime = if tinycloud_config.share_email.enabled {
+        Some(
+            routes::upload_attestation::UploadAttestationRuntime::compose(
+                seed_conn.clone(),
+                &key_setup,
+                &tinycloud_config.share_email,
+            )?,
+        )
+    } else {
+        None
+    };
     if let Some(runtime) = share_email_runtime.as_ref() {
         if !runtime.bridge.self_check().await {
             anyhow::bail!(
@@ -552,6 +565,7 @@ pub async fn app_with_control(
         .manage(rate_limiter)
         .manage(share_email_runtime)
         .manage(share_v2_runtime)
+        .manage(upload_attestation_runtime)
         .manage(tee_context)
         .manage(encryption_service)
         .manage(tinycloud_config.storage.staging.open().await?);

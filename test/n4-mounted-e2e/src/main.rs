@@ -68,6 +68,14 @@ struct FixtureConfig {
     invitation_kid: String,
 }
 
+struct SessionFixture {
+    space_id: String,
+    delegation_cid: String,
+    delegation_header: String,
+    verification_method: String,
+    jwk: Value,
+}
+
 #[derive(Clone)]
 struct Case {
     kind: &'static str,
@@ -309,9 +317,16 @@ fn build_case(
     let owner_seed = [0x55u8; 32];
     let owner = owner_did(&owner_seed);
     let expires_at = millis_time(now + time::Duration::hours(24));
-    let is_kv = kind.starts_with("kv");
+    let is_kv = kind.starts_with("kv") || kind == "recipient-did";
     let is_domain = kind == "kv-domain" || kind == "kv-folder-domain";
     let is_folder = kind == "kv-folder-domain";
+    let recipient_matcher = if kind == "recipient-did" {
+        json!({"kind":"recipientDid","value":"did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw"})
+    } else if is_domain {
+        json!({"kind":"emailDomain","value":"mailinator.com"})
+    } else {
+        json!({"kind":"exactEmail","value":"sam@tinycloud.xyz"})
+    };
     let source = if is_kv {
         json!({"kind":"kv","space":SPACE,"path":if is_folder { "documents" } else { "documents/policy-payload.md" },"action":"tinycloud.kv/get"})
     } else {
@@ -319,7 +334,7 @@ fn build_case(
         json!({"kind":"sql","space":SPACE,"database":"documents","path":"shared/plan","statement":"shared_document_by_id","arguments":arguments,"argumentsDigest":sha256_b64(&value_bytes(&arguments)),"action":"tinycloud.sql/read"})
     };
     let source_digest = sha256_b64(&value_bytes(&source));
-    let policy = json!({"type":"TinyCloudSharePolicy","version":2,"recipientMatcher":if is_domain { json!({"kind":"emailDomain","value":"mailinator.com"}) } else { json!({"kind":"exactEmail","value":"sam@tinycloud.xyz"}) },"contentSource":source,"contentSourceDigest":source_digest,"actions":if is_folder { json!(["tinycloud.kv/get","tinycloud.kv/list","tinycloud.kv/put"]) } else if is_domain { json!(["tinycloud.kv/get"]) } else if is_kv { json!(["tinycloud.kv/get","tinycloud.kv/put"]) } else { json!([source["action"]]) },"resource":if is_folder { json!({"kind":"prefix","value":"documents"}) } else { json!({"kind":"exact","value":source["path"]}) },"expiresAt":expires_at,"issuerDid":sender_did});
+    let policy = json!({"type":"TinyCloudSharePolicy","version":2,"recipientMatcher":recipient_matcher,"contentSource":source,"contentSourceDigest":source_digest,"actions":if is_folder { json!(["tinycloud.kv/get","tinycloud.kv/list","tinycloud.kv/put"]) } else if is_domain { json!(["tinycloud.kv/get"]) } else if is_kv { json!(["tinycloud.kv/get","tinycloud.kv/put"]) } else { json!([source["action"]]) },"resource":if is_folder { json!({"kind":"prefix","value":"documents"}) } else { json!({"kind":"exact","value":source["path"]}) },"expiresAt":expires_at,"issuerDid":sender_did});
     let policy_bytes = value_bytes(&policy);
     let policy_cid = cid(0x55, Code::Sha2_256, &policy_bytes);
     let delegation_cid = cid(
@@ -447,7 +462,13 @@ fn build_case(
         &node_did,
     );
     let attestation = attestation(config, &enrollment, &node_did, &status_fresh, node);
-    let authority_handle = if is_kv { "amh_kv_001" } else { "amh_sql_001" };
+    let authority_handle = if kind == "recipient-did" {
+        "amh_recipient_did_001"
+    } else if is_kv {
+        "amh_kv_001"
+    } else {
+        "amh_sql_001"
+    };
     let authority = json!({"type":"TinyCloudShareAuthorityMaterial","version":1,"handle":authority_handle,"policyOwnerDid":owner,"senderDid":sender_did,"relationship":{"policyOwnerDid":owner,"senderDid":sender_did,"authenticated":true},"mapping":{"sharePolicyCid":policy_cid,"shareDelegationCid":delegation_cid,"policyAuthorityCid":policy_parent_cid,"policyEnforcementCid":enforcement_parent_cid},"policyAuthorityBytes":b64(&authority_parent_bytes),"policyAuthorityCid":policy_parent_cid,"policyEnforcementBytes":b64(&enforcement_parent_bytes),"policyEnforcementCid":enforcement_parent_cid,"statusObservations":[authority_status,enforcement_status],"enrollment":enrollment,"attestation":attestation});
     let authority_digest = sha256_b64(&value_bytes(&authority));
     Ok(Case {
@@ -574,7 +595,7 @@ async fn seed_sql(rocket: &Rocket<Build>) -> Result<()> {
     Ok(())
 }
 
-async fn seed_kv(rocket: &Rocket<Build>, seed: [u8; 32]) -> Result<()> {
+async fn seed_kv(rocket: &Rocket<Build>, seed: [u8; 32]) -> Result<SessionFixture> {
     let space = SpaceId::from_str(
         "tinycloud:key:z6MktwtqAzuD5F77tAMBMwNs1KybZeff61EehV9xB1ZpXQG7:documents",
     )?;
@@ -626,6 +647,14 @@ async fn seed_kv(rocket: &Rocket<Build>, seed: [u8; 32]) -> Result<()> {
         resource.clone().as_uri(),
         std::iter::once(("tinycloud.kv/put".parse()?, [])),
     );
+    let capabilities_resource =
+        space
+            .clone()
+            .to_resource("capabilities".parse::<Service>()?, None, None, None);
+    delegation_caps.with_actions(
+        capabilities_resource.as_uri(),
+        std::iter::once(("tinycloud.capabilities/read".parse()?, [])),
+    );
     let delegation = Payload {
         issuer: verification_method.parse::<DIDURLBuf>()?,
         audience: verification_method
@@ -643,8 +672,8 @@ async fn seed_kv(rocket: &Rocket<Build>, seed: [u8; 32]) -> Result<()> {
         attenuation: delegation_caps,
     }
     .sign(Algorithm::EdDSA, &jwk)?;
-    let delegation_event =
-        Delegation::from_header_ser::<TinyCloudDelegation>(&delegation.encode()?)?;
+    let delegation_header = delegation.encode()?;
+    let delegation_event = Delegation::from_header_ser::<TinyCloudDelegation>(&delegation_header)?;
     let delegation_cid = delegation_event.content_hash().to_cid(0x55);
     let tinycloud = rocket
         .state::<TinyCloud>()
@@ -691,7 +720,13 @@ async fn seed_kv(rocket: &Rocket<Build>, seed: [u8; 32]) -> Result<()> {
         .invoke::<BlockStage>(invocation, inputs)
         .await
         .map_err(|error| anyhow::anyhow!("KV seed invocation: {error}"))?;
-    Ok(())
+    Ok(SessionFixture {
+        space_id: space.to_string(),
+        delegation_cid: delegation_cid.to_string(),
+        delegation_header,
+        verification_method,
+        jwk: serde_json::to_value(jwk)?,
+    })
 }
 
 async fn mounted_http_adversarial_checks(rocket: Rocket<Build>) -> Result<()> {
@@ -829,6 +864,25 @@ async fn run() -> Result<()> {
         .windows(2)
         .find(|pair| pair[0] == "--descriptor")
         .map(|pair| PathBuf::from(&pair[1]));
+    let profile_output = args
+        .windows(2)
+        .find(|pair| pair[0] == "--profile-output")
+        .map(|pair| PathBuf::from(&pair[1]));
+    let trust_bundle_output = args
+        .windows(2)
+        .find(|pair| pair[0] == "--trust-bundle-output")
+        .map(|pair| PathBuf::from(&pair[1]));
+    let quiet = args.iter().any(|argument| argument == "--quiet");
+    let listen_port = args
+        .windows(2)
+        .find(|pair| pair[0] == "--listen-port")
+        .map(|pair| {
+            pair[1]
+                .parse::<u16>()
+                .context("--listen-port must be a valid TCP port")
+        })
+        .transpose()?
+        .unwrap_or(0);
     let issuer_public = args
         .windows(2)
         .find(|pair| pair[0] == "--issuer-public-key")
@@ -875,6 +929,7 @@ async fn run() -> Result<()> {
         build_case(&fixture_config, "kv-domain", &sender, &node, now)?,
         build_case(&fixture_config, "kv-folder-domain", &sender, &node, now)?,
         build_case(&fixture_config, "sql", &sender, &node, now)?,
+        build_case(&fixture_config, "recipient-did", &sender, &node, now)?,
     ];
     let temp = TempDir::new().context("temporary fixture directory")?;
     let material_path = temp.path().join("authority-material.json");
@@ -888,7 +943,7 @@ async fn run() -> Result<()> {
         .context("authority material write")?;
     tinycloud_core::share_email::AuthenticatedAuthorityMaterialProvider::from_path(&material_path)
         .map_err(|error| anyhow::anyhow!("generated authority material validation: {error:?}"))?;
-    let listener = TcpListener::bind(("127.0.0.1", 0)).context("reserve ephemeral local port")?;
+    let listener = TcpListener::bind(("127.0.0.1", listen_port)).context("reserve local port")?;
     let port = listener.local_addr()?.port();
     drop(listener);
     let invitation_public = b64(&node
@@ -921,6 +976,9 @@ async fn run() -> Result<()> {
     });
     fs::write(&trust_bundle_path, serde_json::to_vec(&trust_bundle)?)
         .context("trust bundle write")?;
+    if let Some(path) = trust_bundle_output {
+        fs::write(path, serde_json::to_vec(&trust_bundle)?).context("joined trust bundle write")?;
+    }
     let figment = figment(
         temp.path(),
         &secret,
@@ -932,7 +990,51 @@ async fn run() -> Result<()> {
         .await
         .context("default-feature production Rocket app composition")?;
     seed_sql(&rocket).await?;
-    seed_kv(&rocket, [0x44; 32]).await?;
+    let session = seed_kv(&rocket, [0x44; 32]).await?;
+    if let Some(home) = profile_output {
+        let profile_dir = home.join(".tinycloud/profiles/joined");
+        fs::create_dir_all(&profile_dir)?;
+        let session_did = session
+            .verification_method
+            .split('#')
+            .next()
+            .context("session DID principal")?;
+        fs::write(
+            home.join(".tinycloud/config.json"),
+            "{\"defaultProfile\":\"joined\",\"version\":1}\n",
+        )?;
+        fs::write(
+            profile_dir.join("profile.json"),
+            serde_json::to_vec_pretty(&json!({
+                "name": "joined",
+                "host": format!("http://127.0.0.1:{port}"),
+                "chainId": 1,
+                "spaceName": "documents",
+                "did": session_did,
+                "sessionDid": session_did,
+                "spaceId": session.space_id,
+                "authMethod": "openkey"
+            }))?,
+        )?;
+        fs::write(
+            profile_dir.join("key.json"),
+            serde_json::to_vec_pretty(&session.jwk)?,
+        )?;
+        fs::write(
+            profile_dir.join("session.json"),
+            serde_json::to_vec_pretty(&json!({
+                "delegationHeader": {"Authorization": session.delegation_header},
+                "delegationCid": session.delegation_cid,
+                "spaceId": session.space_id,
+                "jwk": session.jwk,
+                "verificationMethod": session_did
+            }))?,
+        )?;
+        fs::write(
+            profile_dir.join("session.json.metadata.json"),
+            "{\"formatVersion\":1}\n",
+        )?;
+    }
     if self_test {
         mounted_http_adversarial_checks(rocket).await?;
         eprintln!("production HTTP adversarial checks passed");
@@ -962,7 +1064,9 @@ async fn run() -> Result<()> {
                     eprintln!("production descriptor write failed: {error}");
                 }
             }
-            println!("{}", String::from_utf8_lossy(&descriptor_bytes));
+            if !quiet {
+                println!("{}", String::from_utf8_lossy(&descriptor_bytes));
+            }
             eprintln!("tinycloud-node-production-e2e listening on http://127.0.0.1:{port}");
         })
     }));

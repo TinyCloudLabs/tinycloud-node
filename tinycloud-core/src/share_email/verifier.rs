@@ -153,6 +153,7 @@ impl ExactEmailVerifier {
         let matcher = match matcher {
             RecipientMatcher::ExactEmail(value) => EmailMatcher::Exact(value),
             RecipientMatcher::EmailDomain(value) => EmailMatcher::Domain(value),
+            RecipientMatcher::RecipientDid(_) => return Err(PortError::Denied),
         };
         let evidence = self
             .verify_inner(

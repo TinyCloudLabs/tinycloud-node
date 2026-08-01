@@ -29,7 +29,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::io::AsyncReadExt;
 
 use tinycloud_auth::{
-    authorization::TinyCloudDelegation,
+    authorization::{HeaderEncode, TinyCloudDelegation},
     identity::did_principal_matches,
     multihash_codetable::{Code, MultihashDigest},
     share_email_evidence::{normalized_email_hash, verify_detached_ed25519},
@@ -1137,9 +1137,8 @@ fn validate_policy(
         || policy.recipient_matcher.value.is_empty()
         || !matches!(
             policy.recipient_matcher.kind.as_str(),
-            "exactEmail" | "emailDomain"
+            "exactEmail" | "emailDomain" | "recipientDid"
         )
-        || !policy.recipient_matcher.value.is_ascii()
     {
         return Err(());
     }
@@ -1152,6 +1151,12 @@ fn validate_policy(
             &policy.recipient_matcher.value,
         )
         .map_err(|_| ())?,
+        "recipientDid" => {
+            tinycloud_core::share_email::types::Did::parse(policy.recipient_matcher.value.clone())
+                .map_err(|_| ())?
+                .as_str()
+                .to_owned()
+        }
         _ => return Err(()),
     };
     if canonical_matcher != policy.recipient_matcher.value {
@@ -1357,6 +1362,52 @@ async fn verify_delegation_signature(delegation: &TinyCloudDelegation) -> Result
                 return Err(());
             }
         }
+    }
+    Ok(())
+}
+
+/// Recipient-DID authorization carries the exact OpenKey session delegation
+/// that the authenticated client restored.  The holder signature and
+/// presentation bind its digest to the request; this check binds the same
+/// bytes to Node's durable delegation record and live revocation graph.
+async fn verify_recipient_did_credential(
+    runtime: &ShareV2Runtime,
+    credential: &str,
+    credential_cid: &str,
+    holder_did: &str,
+) -> Result<(), ()> {
+    if credential.is_empty() || credential == "openkey-device-session" {
+        return Err(());
+    }
+    let (delegation, bytes) = TinyCloudDelegation::decode(credential).map_err(|_| ())?;
+    if bytes.is_empty() || raw_blake3_cid(&bytes) != credential_cid {
+        return Err(());
+    }
+    let cid = credential_cid
+        .parse::<tinycloud_auth::ipld_core::cid::Cid>()
+        .map_err(|_| ())?;
+    let id = Hash::from(cid);
+    let row = delegation::Entity::find_by_id(id)
+        .one(&runtime.conn)
+        .await
+        .map_err(|_| ())?
+        .ok_or(())?;
+    let stored =
+        maybe_decrypt(Some(&runtime.policy_encryption), &row.serialization).map_err(|_| ())?;
+    if stored != bytes || revocation_in_ancestry(&runtime.conn, id).await? {
+        return Err(());
+    }
+    verify_delegation_signature(&delegation).await?;
+    let info = DelegationInfo::try_from(delegation).map_err(|_| ())?;
+    let now = OffsetDateTime::now_utc();
+    if !did_principal_matches(&info.delegate, holder_did)
+        || !did_principal_matches(&row.delegatee, holder_did)
+        || info.expiry.is_none_or(|expiry| expiry <= now)
+        || info.not_before.is_some_and(|not_before| not_before > now)
+        || row.expiry.is_none_or(|expiry| expiry <= now)
+        || row.not_before.is_some_and(|not_before| not_before > now)
+    {
+        return Err(());
     }
     Ok(())
 }
@@ -1625,6 +1676,7 @@ struct V2DeliveryRequest {
     share_url: String,
     document_name: String,
     jti: String,
+    idempotency_key: String,
     expires_at: String,
     request_body_digest: String,
 }
@@ -1930,6 +1982,12 @@ async fn registered_policy(
                 &policy.policy.recipient_matcher.value,
             )
             .map_err(|_| ())?,
+        ),
+        "recipientDid" => TypedRecipientMatcher::RecipientDid(
+            Did::parse(policy.policy.recipient_matcher.value.clone())
+                .map_err(|_| ())?
+                .as_str()
+                .to_owned(),
         ),
         _ => return Err(()),
     };
@@ -2362,7 +2420,7 @@ fn challenge_request_violation(
     request: &V2ChallengeRequest,
     runtime: &ShareV2Runtime,
 ) -> Option<&'static str> {
-    let checks: [(&'static str, bool); 16] = [
+    let checks: [(&'static str, bool); 17] = [
         (
             "envelope_cid_equals_registration_cid",
             request.envelope_cid == request.registration_cid,
@@ -2432,6 +2490,13 @@ fn challenge_request_violation(
         (
             "requested_action_outside_registered_policy",
             !registered.envelope.policy.actions.contains(&request.action),
+        ),
+        (
+            "recipient_did_holder_mismatch",
+            registered
+                .matcher
+                .recipient_did()
+                .is_some_and(|recipient| recipient != request.holder_did),
         ),
     ];
     checks
@@ -2574,7 +2639,16 @@ pub async fn policy_session_v2(
         return Err(error(Status::ServiceUnavailable, "capability_unavailable"));
     }
     let raw = read_body(data).await?;
-    let request: V2SessionRequest = serde_json::from_slice(&raw)
+    let raw_value: Value = serde_json::from_slice(&raw)
+        .map_err(|_| error(Status::BadRequest, "policy_session_invalid"))?;
+    if !raw_value
+        .get("credential")
+        .and_then(Value::as_str)
+        .is_some_and(|credential| !credential.is_empty())
+    {
+        return Err(error(Status::Unauthorized, "recipient_credential_required"));
+    }
+    let request: V2SessionRequest = serde_json::from_value(raw_value)
         .map_err(|_| error(Status::BadRequest, "policy_session_invalid"))?;
     let challenge = share_anonymous_challenge::Entity::find_by_id(&request.challenge_id)
         .one(&runtime.conn)
@@ -2678,6 +2752,14 @@ pub async fn policy_session_v2(
             .get("credentialDigest")
             .and_then(Value::as_str)
             != Some(credential_digest.as_str())
+        || binding_message.get("targetOrigin").and_then(Value::as_str)
+            != Some(challenge_request.target_origin.as_str())
+        || binding_message.get("nodeAudience").and_then(Value::as_str)
+            != Some(challenge_request.node_audience.as_str())
+        || binding_message.get("enforcerDid").and_then(Value::as_str)
+            != Some(runtime.enforcer_did.as_str())
+        || binding_message.get("expiresAt").and_then(Value::as_str)
+            != Some(presentation.expires_at.as_str())
     {
         return Err(share_error("invalid_holder_proof"));
     }
@@ -2685,50 +2767,71 @@ pub async fn policy_session_v2(
         typed_scope(&registered, &challenge_request).map_err(|_| share_error("policy_denied"))?;
     let holder = DidKey::parse(presentation_holder.to_owned())
         .map_err(|_| share_error("invalid_holder_proof"))?;
-    let expiry = registered.expiry.unix_timestamp();
-    let verifier = runtime
-        .verifier
-        .as_ref()
-        .ok_or(error(Status::ServiceUnavailable, "capability_unavailable"))?
-        .at_time(now.unix_timestamp());
-    let evidence = verifier
-        .verify_matcher_for(
-            request.credential.as_bytes(),
-            &scope,
-            &holder,
-            &registered.matcher,
-            expiry,
+    if let Some(recipient_did) = registered.matcher.recipient_did() {
+        if recipient_did != presentation_holder {
+            return Err(share_error("policy_denied"));
+        }
+        let credential_cid = binding_message
+            .get("delegationCid")
+            .and_then(Value::as_str)
+            .ok_or_else(|| share_error("policy_denied"))?;
+        if binding_message.get("jti").and_then(Value::as_str) != Some(presentation.jti.as_str()) {
+            return Err(share_error("invalid_holder_proof"));
+        }
+        verify_recipient_did_credential(
+            runtime,
+            &request.credential,
+            credential_cid,
+            presentation_holder,
         )
+        .await
         .map_err(|_| share_error("policy_denied"))?;
-    if evidence.credential_digest.as_str() != credential_digest {
-        return Err(share_error("policy_denied"));
+    } else {
+        let expiry = registered.expiry.unix_timestamp();
+        let verifier = runtime
+            .verifier
+            .as_ref()
+            .ok_or(error(Status::ServiceUnavailable, "capability_unavailable"))?
+            .at_time(now.unix_timestamp());
+        let evidence = verifier
+            .verify_matcher_for(
+                request.credential.as_bytes(),
+                &scope,
+                &holder,
+                &registered.matcher,
+                expiry,
+            )
+            .map_err(|_| share_error("policy_denied"))?;
+        if evidence.credential_digest.as_str() != credential_digest {
+            return Err(share_error("policy_denied"));
+        }
+        let expected_email_hash = normalized_email_hash(&evidence.disclosed_email)
+            .map_err(|_| share_error("policy_denied"))?;
+        let challenge_nonce = ProtocolNonce::parse(request.nonce.clone())
+            .map_err(|_| share_error("invalid_holder_proof"))?;
+        let challenge_id = ProtocolNonce::parse(request.challenge_id.clone())
+            .map_err(|_| share_error("invalid_holder_proof"))?;
+        let request_digest = Sha256Digest::parse(challenge_request.request_body_digest.clone())
+            .map_err(|_| share_error("invalid_holder_proof"))?;
+        let enforcer = DidKey::parse(runtime.enforcer_did.clone())
+            .map_err(|_| share_error("invalid_holder_proof"))?;
+        verifier
+            .verify_holder_binding(
+                &holder_binding,
+                &scope,
+                &expected_email_hash,
+                &evidence.credential_digest,
+                challenge_id.as_str(),
+                &challenge_nonce,
+                &request_digest,
+                &enforcer,
+                &holder,
+                &holder,
+                &holder,
+                &holder,
+            )
+            .map_err(|_| share_error("invalid_holder_proof"))?;
     }
-    let expected_email_hash = normalized_email_hash(&evidence.disclosed_email)
-        .map_err(|_| share_error("policy_denied"))?;
-    let challenge_nonce = ProtocolNonce::parse(request.nonce.clone())
-        .map_err(|_| share_error("invalid_holder_proof"))?;
-    let challenge_id = ProtocolNonce::parse(request.challenge_id.clone())
-        .map_err(|_| share_error("invalid_holder_proof"))?;
-    let request_digest = Sha256Digest::parse(challenge_request.request_body_digest.clone())
-        .map_err(|_| share_error("invalid_holder_proof"))?;
-    let enforcer = DidKey::parse(runtime.enforcer_did.clone())
-        .map_err(|_| share_error("invalid_holder_proof"))?;
-    verifier
-        .verify_holder_binding(
-            &holder_binding,
-            &scope,
-            &expected_email_hash,
-            &evidence.credential_digest,
-            challenge_id.as_str(),
-            &challenge_nonce,
-            &request_digest,
-            &enforcer,
-            &holder,
-            &holder,
-            &holder,
-            &holder,
-        )
-        .map_err(|_| share_error("invalid_holder_proof"))?;
     let session_id = tinycloud_core::share_email::invitation::random_protocol_nonce();
     let session_expires = (now + time::Duration::minutes(5)).min(registered.expiry);
     let runtime_delegation = create_runtime_delegation(
@@ -3271,6 +3374,7 @@ pub async fn authorize_delivery_v2(
     if expires <= now
         || expires > now + time::Duration::minutes(5)
         || decode_canonical_b64(&request.jti, 16).map_or(true, |value| value.len() != 16)
+        || !canonical_delivery_idempotency_key(&request.idempotency_key)
     {
         return Err(share_error("delivery_authorization_invalid"));
     }
@@ -3346,7 +3450,7 @@ pub async fn authorize_delivery_v2(
         "authorityMaterialHandle": request.registration_cid,
         "authorityMaterialDigest": b64_digest(request.registration_cid.as_bytes()),
         "requestBodyDigest": request.request_body_digest,
-        "idempotencyKey": request.jti,
+        "idempotencyKey": request.idempotency_key,
         "expiresAt": request.expires_at,
         "dataAuthority": false
     });
@@ -3355,6 +3459,14 @@ pub async fn authorize_delivery_v2(
     Ok(Json(
         serde_json::json!({ "authorization": authorization, "proof": proof }),
     ))
+}
+
+fn canonical_delivery_idempotency_key(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
 }
 
 #[cfg(test)]
@@ -3460,6 +3572,20 @@ mod tests {
         let (mut envelope, request, config) = sample_policy();
         envelope.policy.recipient_matcher.value = "person+tag@any.example".to_owned();
         assert!(validate_policy(&envelope, &request, &config, "did:key:z6MkEnforcer").is_ok());
+    }
+
+    #[test]
+    fn policy_validation_accepts_recipient_did_and_rejects_noncanonical_dids() {
+        let (mut envelope, request, config) = sample_policy();
+        envelope.policy.recipient_matcher = RecipientMatcher {
+            kind: "recipientDid".to_owned(),
+            value: "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw".to_owned(),
+        };
+        assert!(validate_policy(&envelope, &request, &config, "did:key:z6MkEnforcer").is_ok());
+        envelope.policy.recipient_matcher.value = "did:key:zholder".to_owned();
+        assert!(validate_policy(&envelope, &request, &config, "did:key:z6MkEnforcer").is_err());
+        envelope.policy.recipient_matcher.value = "did:web:-recipient.example".to_owned();
+        assert!(validate_policy(&envelope, &request, &config, "did:key:z6MkEnforcer").is_err());
     }
 
     #[test]
@@ -4885,6 +5011,24 @@ mod tests {
         assert!(
             verify_v2_proof(&holder_did, &sig_mutated, domain, &value).is_err(),
             "a single flipped signature byte must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn recipient_did_credential_rejects_the_legacy_marker_at_the_authority_boundary() {
+        let key_setup = StaticSecret::new(vec![0x39u8; 32]).expect("32-byte test secret");
+        let tee_context = TeeContext::derive_local(&key_setup);
+        let runtime = compose_test_runtime(&key_setup, Some(tee_context), true).await;
+        assert!(
+            verify_recipient_did_credential(
+                &runtime,
+                "openkey-device-session",
+                "bafybeigdyrzt5n6n4j2s5x7m7n5f4q6r3s2t1u0v9w8x7y6z5a4b3c2d1e0",
+                "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw",
+            )
+            .await
+            .is_err(),
+            "recipient-DID authorization must never treat the old marker as a credential"
         );
     }
 
