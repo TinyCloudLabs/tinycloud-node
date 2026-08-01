@@ -1137,9 +1137,8 @@ fn validate_policy(
         || policy.recipient_matcher.value.is_empty()
         || !matches!(
             policy.recipient_matcher.kind.as_str(),
-            "exactEmail" | "emailDomain"
+            "exactEmail" | "emailDomain" | "recipientDid"
         )
-        || !policy.recipient_matcher.value.is_ascii()
     {
         return Err(());
     }
@@ -1152,6 +1151,12 @@ fn validate_policy(
             &policy.recipient_matcher.value,
         )
         .map_err(|_| ())?,
+        "recipientDid" => {
+            tinycloud_core::share_email::types::Did::parse(policy.recipient_matcher.value.clone())
+                .map_err(|_| ())?
+                .as_str()
+                .to_owned()
+        }
         _ => return Err(()),
     };
     if canonical_matcher != policy.recipient_matcher.value {
@@ -1931,6 +1936,12 @@ async fn registered_policy(
             )
             .map_err(|_| ())?,
         ),
+        "recipientDid" => TypedRecipientMatcher::RecipientDid(
+            Did::parse(policy.policy.recipient_matcher.value.clone())
+                .map_err(|_| ())?
+                .as_str()
+                .to_owned(),
+        ),
         _ => return Err(()),
     };
     let matcher_json = serde_json::to_value(&policy.policy.recipient_matcher).map_err(|_| ())?;
@@ -2362,7 +2373,7 @@ fn challenge_request_violation(
     request: &V2ChallengeRequest,
     runtime: &ShareV2Runtime,
 ) -> Option<&'static str> {
-    let checks: [(&'static str, bool); 16] = [
+    let checks: [(&'static str, bool); 17] = [
         (
             "envelope_cid_equals_registration_cid",
             request.envelope_cid == request.registration_cid,
@@ -2432,6 +2443,13 @@ fn challenge_request_violation(
         (
             "requested_action_outside_registered_policy",
             !registered.envelope.policy.actions.contains(&request.action),
+        ),
+        (
+            "recipient_did_holder_mismatch",
+            registered
+                .matcher
+                .recipient_did()
+                .is_some_and(|recipient| recipient != request.holder_did),
         ),
     ];
     checks
@@ -2685,50 +2703,56 @@ pub async fn policy_session_v2(
         typed_scope(&registered, &challenge_request).map_err(|_| share_error("policy_denied"))?;
     let holder = DidKey::parse(presentation_holder.to_owned())
         .map_err(|_| share_error("invalid_holder_proof"))?;
-    let expiry = registered.expiry.unix_timestamp();
-    let verifier = runtime
-        .verifier
-        .as_ref()
-        .ok_or(error(Status::ServiceUnavailable, "capability_unavailable"))?
-        .at_time(now.unix_timestamp());
-    let evidence = verifier
-        .verify_matcher_for(
-            request.credential.as_bytes(),
-            &scope,
-            &holder,
-            &registered.matcher,
-            expiry,
-        )
-        .map_err(|_| share_error("policy_denied"))?;
-    if evidence.credential_digest.as_str() != credential_digest {
-        return Err(share_error("policy_denied"));
+    if let Some(recipient_did) = registered.matcher.recipient_did() {
+        if recipient_did != presentation_holder || request.credential.is_empty() {
+            return Err(share_error("policy_denied"));
+        }
+    } else {
+        let expiry = registered.expiry.unix_timestamp();
+        let verifier = runtime
+            .verifier
+            .as_ref()
+            .ok_or(error(Status::ServiceUnavailable, "capability_unavailable"))?
+            .at_time(now.unix_timestamp());
+        let evidence = verifier
+            .verify_matcher_for(
+                request.credential.as_bytes(),
+                &scope,
+                &holder,
+                &registered.matcher,
+                expiry,
+            )
+            .map_err(|_| share_error("policy_denied"))?;
+        if evidence.credential_digest.as_str() != credential_digest {
+            return Err(share_error("policy_denied"));
+        }
+        let expected_email_hash = normalized_email_hash(&evidence.disclosed_email)
+            .map_err(|_| share_error("policy_denied"))?;
+        let challenge_nonce = ProtocolNonce::parse(request.nonce.clone())
+            .map_err(|_| share_error("invalid_holder_proof"))?;
+        let challenge_id = ProtocolNonce::parse(request.challenge_id.clone())
+            .map_err(|_| share_error("invalid_holder_proof"))?;
+        let request_digest = Sha256Digest::parse(challenge_request.request_body_digest.clone())
+            .map_err(|_| share_error("invalid_holder_proof"))?;
+        let enforcer = DidKey::parse(runtime.enforcer_did.clone())
+            .map_err(|_| share_error("invalid_holder_proof"))?;
+        verifier
+            .verify_holder_binding(
+                &holder_binding,
+                &scope,
+                &expected_email_hash,
+                &evidence.credential_digest,
+                challenge_id.as_str(),
+                &challenge_nonce,
+                &request_digest,
+                &enforcer,
+                &holder,
+                &holder,
+                &holder,
+                &holder,
+            )
+            .map_err(|_| share_error("invalid_holder_proof"))?;
     }
-    let expected_email_hash = normalized_email_hash(&evidence.disclosed_email)
-        .map_err(|_| share_error("policy_denied"))?;
-    let challenge_nonce = ProtocolNonce::parse(request.nonce.clone())
-        .map_err(|_| share_error("invalid_holder_proof"))?;
-    let challenge_id = ProtocolNonce::parse(request.challenge_id.clone())
-        .map_err(|_| share_error("invalid_holder_proof"))?;
-    let request_digest = Sha256Digest::parse(challenge_request.request_body_digest.clone())
-        .map_err(|_| share_error("invalid_holder_proof"))?;
-    let enforcer = DidKey::parse(runtime.enforcer_did.clone())
-        .map_err(|_| share_error("invalid_holder_proof"))?;
-    verifier
-        .verify_holder_binding(
-            &holder_binding,
-            &scope,
-            &expected_email_hash,
-            &evidence.credential_digest,
-            challenge_id.as_str(),
-            &challenge_nonce,
-            &request_digest,
-            &enforcer,
-            &holder,
-            &holder,
-            &holder,
-            &holder,
-        )
-        .map_err(|_| share_error("invalid_holder_proof"))?;
     let session_id = tinycloud_core::share_email::invitation::random_protocol_nonce();
     let session_expires = (now + time::Duration::minutes(5)).min(registered.expiry);
     let runtime_delegation = create_runtime_delegation(
@@ -3460,6 +3484,20 @@ mod tests {
         let (mut envelope, request, config) = sample_policy();
         envelope.policy.recipient_matcher.value = "person+tag@any.example".to_owned();
         assert!(validate_policy(&envelope, &request, &config, "did:key:z6MkEnforcer").is_ok());
+    }
+
+    #[test]
+    fn policy_validation_accepts_recipient_did_and_rejects_noncanonical_dids() {
+        let (mut envelope, request, config) = sample_policy();
+        envelope.policy.recipient_matcher = RecipientMatcher {
+            kind: "recipientDid".to_owned(),
+            value: "did:key:z6MktwupdmLXVVqTzCw4i46r4uGyosGXRnR3XjN4Zq7oMMsw".to_owned(),
+        };
+        assert!(validate_policy(&envelope, &request, &config, "did:key:z6MkEnforcer").is_ok());
+        envelope.policy.recipient_matcher.value = "did:key:zholder".to_owned();
+        assert!(validate_policy(&envelope, &request, &config, "did:key:z6MkEnforcer").is_err());
+        envelope.policy.recipient_matcher.value = "did:web:-recipient.example".to_owned();
+        assert!(validate_policy(&envelope, &request, &config, "did:key:z6MkEnforcer").is_err());
     }
 
     #[test]

@@ -638,6 +638,8 @@ pub enum RecipientMatcher {
     ExactEmail(String),
     #[serde(rename = "emailDomain")]
     EmailDomain(String),
+    #[serde(rename = "recipientDid")]
+    RecipientDid(String),
 }
 
 impl RecipientMatcher {
@@ -651,6 +653,9 @@ impl RecipientMatcher {
                     .map(|value| format!("emailDomain:{value}"))
                     .map_err(|_| TypeError::InvalidRecipientMatcher)
             }
+            Self::RecipientDid(value) => Did::parse(value.clone())
+                .map(|value| format!("recipientDid:{}", value.as_str()))
+                .map_err(|_| TypeError::InvalidRecipientMatcher),
         }
     }
 
@@ -660,7 +665,7 @@ impl RecipientMatcher {
         match self {
             Self::ExactEmail(value) => tinycloud_auth::share_email_evidence::normalize_email(value)
                 .map_err(|_| TypeError::InvalidRecipientMatcher),
-            Self::EmailDomain(_) => self.canonical(),
+            Self::EmailDomain(_) | Self::RecipientDid(_) => self.canonical(),
         }
     }
 
@@ -674,6 +679,9 @@ impl RecipientMatcher {
             Self::EmailDomain(value) => {
                 tinycloud_auth::share_email_evidence::normalize_policy_domain(value)
                     .is_ok_and(|normalized| normalized == *value)
+            }
+            Self::RecipientDid(value) => {
+                Did::parse(value.clone()).is_ok_and(|normalized| normalized.as_str() == value)
             }
         }
     }
@@ -695,11 +703,23 @@ impl RecipientMatcher {
                     )
                     .is_some_and(|(expected, actual)| expected == actual)
             }
+            Self::RecipientDid(_) => false,
         }
     }
 
     pub fn is_domain(&self) -> bool {
         matches!(self, Self::EmailDomain(_))
+    }
+
+    pub fn is_recipient_did(&self) -> bool {
+        matches!(self, Self::RecipientDid(_))
+    }
+
+    pub fn recipient_did(&self) -> Option<&str> {
+        match self {
+            Self::RecipientDid(value) => Some(value),
+            _ => None,
+        }
     }
 }
 
@@ -709,6 +729,9 @@ impl fmt::Debug for RecipientMatcher {
             Self::ExactEmail(_) => formatter.write_str("RecipientMatcher::ExactEmail([REDACTED])"),
             Self::EmailDomain(_) => {
                 formatter.write_str("RecipientMatcher::EmailDomain([REDACTED])")
+            }
+            Self::RecipientDid(_) => {
+                formatter.write_str("RecipientMatcher::RecipientDid([REDACTED])")
             }
         }
     }
@@ -1366,6 +1389,19 @@ mod tests {
         assert!(SafeJsonInteger::parse(SafeJsonInteger::MAX + 1).is_err());
         assert!(serde_json::from_str::<SafeJsonInteger>("9007199254740992").is_err());
         assert!(serde_json::from_str::<SafeJsonInteger>("1.0").is_err());
+    }
+
+    #[test]
+    fn recipient_did_matchers_are_canonical_and_method_validated() {
+        let key = RecipientMatcher::RecipientDid(HOLDER.to_owned());
+        assert_eq!(key.canonical().unwrap(), format!("recipientDid:{HOLDER}"));
+        assert!(key.is_canonical());
+        assert!(RecipientMatcher::RecipientDid("did:web:recipient.example:path".to_owned()).is_canonical());
+        assert!(RecipientMatcher::RecipientDid("did:pkh:eip155:1:0xabc".to_owned()).is_canonical());
+        assert!(!RecipientMatcher::RecipientDid("did:key:zholder".to_owned()).is_canonical());
+        assert!(!RecipientMatcher::RecipientDid("did:web:-recipient.example".to_owned()).is_canonical());
+        assert!(!RecipientMatcher::RecipientDid("did:pkh:eip155:1".to_owned()).is_canonical());
+        assert!(!key.matches_verified_email("person@example.com"));
     }
 
     #[test]
