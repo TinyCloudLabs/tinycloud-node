@@ -42,10 +42,11 @@ pub fn enabled() -> bool {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InvocationStage {
     RequestDecode,
-    /// Retained for metric continuity. No longer emitted: the auth-header
-    /// guard that used to record under this label actually measures header
-    /// decode, which now emits [`Self::AuthorizationHeaderDecode`]. Kept in
-    /// the enum so historical dashboards/series remain valid.
+    /// TC-326: no longer emitted by the auth-header guard, which actually
+    /// measures header decode and now emits
+    /// [`Self::AuthorizationHeaderDecode`] instead. TC-409 repurposes this
+    /// label for the one cryptographic signature verification a successful
+    /// `/invoke` performs, emitted by `AdmittedInvocation::admit`.
     InvocationSignatureVerify,
     ReplayCheck,
     AuthorizationGraphLoad,

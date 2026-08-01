@@ -41,6 +41,7 @@ use tinycloud_core::duckdb::{
     DuckDbCaveats, DuckDbError, DuckDbRequest, DuckDbResponse, DuckDbService,
 };
 use tinycloud_core::{
+    admission::AdmissionError,
     encryption_network::EncryptionService,
     events::Invocation,
     models::{
@@ -55,8 +56,8 @@ use tinycloud_core::{
     types::{Ability, DelegationQuery, DelegationQueryPage, Metadata, Resource},
     util::{Capability, DelegationInfo, InvocationInfo, RevocationInfo},
     write_hooks::{db_table_path, hook_delivery_id, subscription_matches_event, TouchedTables},
-    DelegationStatus, InvocationOutcome, KvBatchReadItem, KvBatchReadValue, KvInvokeOptions,
-    KvPrecondition, TransactResult, TxError, TxStoreError,
+    AdmittedInvocation, DelegationStatus, InvocationOutcome, KvBatchReadItem, KvBatchReadValue,
+    KvInvokeOptions, KvPrecondition, TransactResult, TxError, TxStoreError,
 };
 
 pub mod admin;
@@ -1323,13 +1324,14 @@ async fn invoke_impl(
                 .start_timer()
         });
 
-        // TC-341: verify the invocation and bound its lifetime BEFORE recording
-        // it in the durable replay cache. The auth guard only decodes the
-        // header, so without this an unauthenticated sender of a parseable-but-
-        // unsigned invocation could persist unbounded replay rows with an
-        // attacker-chosen (far-future) expiry. Core re-verifies during
-        // processing; the resulting double verification is intentional here —
-        // collapsing it is the admission-boundary work TC-322 owns.
+        // TC-409: admit the invocation exactly once. `AdmittedInvocation::admit`
+        // runs the same time-window check, full signature verification (bounded
+        // by the same DID-resolution timeout core used to run again during
+        // processing), and lifetime-cap enforcement that used to be duplicated
+        // here and inside `invocation::process`/`verify_and_authorize`. Holding
+        // the resulting `AdmittedInvocation` is what lets the durable replay
+        // insert below, and every downstream core entry point, skip re-running
+        // that verification — the type itself is the proof it already ran.
         let now = OffsetDateTime::now_utc();
 
         // (a) Cheap, crypto-free, reject-only time precheck: obviously expired
@@ -1345,32 +1347,27 @@ async fn invoke_impl(
             ));
         }
 
-        // (b) Full signature verification, bounded by the same DID-resolution
-        // timeout core uses.
-        invocation_model::verify_invocation(&i.0 .0.invocation)
+        // (b) Admission: full signature verification plus the lifetime cap,
+        // in the sole constructor that can produce an `AdmittedInvocation`.
+        let admitted = AdmittedInvocation::admit(i.0, config.invocation.max_lifetime_secs)
             .await
-            .map_err(|error| (Status::Unauthorized, error.to_string()))?;
+            .map_err(|error| {
+                let message = match &error {
+                    AdmissionError::Invocation(e) => e.to_string(),
+                    AdmissionError::LifetimeExceeded => error.to_string(),
+                };
+                (Status::Unauthorized, message)
+            })?;
 
-        // (c) Lifetime cap: an invocation may not claim an expiration beyond the
-        // server maximum, however it is signed.
-        if i.0 .0.invocation.payload().expiration.as_seconds()
-            > now.unix_timestamp() as f64 + config.invocation.max_lifetime_secs as f64
-        {
-            return Err((
-                Status::Unauthorized,
-                "Invocation lifetime exceeds server maximum".to_string(),
-            ));
-        }
-
-        // (d) Only now record the (verified, in-window) invocation durably.
+        // (c) Only now record the (verified, in-window) invocation durably.
         invocation_replay_cache
-            .check_and_insert(&i.0, config.invocation.max_lifetime_secs)
+            .check_and_insert(&admitted, config.invocation.max_lifetime_secs)
             .await?;
 
         // Check for SQL capabilities
-        let sql_caps: Vec<_> = i
+        let sql_caps: Vec<_> = admitted
+            .invocation()
             .0
-             .0
             .capabilities
             .iter()
             .filter_map(|c| match (&c.resource, c.ability.as_ref().as_ref()) {
@@ -1389,7 +1386,7 @@ async fn invoke_impl(
 
         if !sql_caps.is_empty() {
             let result = handle_sql_invoke(
-                i,
+                admitted,
                 data,
                 tinycloud,
                 sql_service,
@@ -1409,7 +1406,9 @@ async fn invoke_impl(
         {
             // Check for DuckDB capabilities
             let duckdb_caps: Vec<_> =
-                i.0 .0
+                admitted
+                    .invocation()
+                    .0
                     .capabilities
                     .iter()
                     .filter_map(|c| match (&c.resource, c.ability.as_ref().as_ref()) {
@@ -1433,7 +1432,7 @@ async fn invoke_impl(
                         && v.contains("application/vnd.apache.arrow.stream")
                 });
                 let result = handle_duckdb_invoke(
-                    i,
+                    admitted,
                     data,
                     tinycloud,
                     duckdb_service,
@@ -1452,7 +1451,7 @@ async fn invoke_impl(
         }
 
         #[cfg(not(feature = "duckdb"))]
-        if i.0 .0.capabilities.iter().any(|c| {
+        if admitted.invocation().0.capabilities.iter().any(|c| {
             matches!(
                 (&c.resource, c.ability.as_ref().as_ref()),
                 (Resource::TinyCloud(r), ability)
@@ -1469,11 +1468,11 @@ async fn invoke_impl(
             ));
         }
 
-        let put_caps = kv_put_capabilities(&i.0 .0);
+        let put_caps = kv_put_capabilities(&admitted.invocation().0);
         let is_multipart_request = is_multipart(&headers);
-        let kv_options = kv_invoke_options(&i.0 .0, &mut headers, is_multipart_request, &tinycloud.kv_cursor_key())?;
+        let kv_options = kv_invoke_options(&admitted.invocation().0, &mut headers, is_multipart_request, &tinycloud.kv_cursor_key())?;
         let expected_batch_inputs = if is_multipart_request && !put_caps.is_empty() {
-            Some(validate_kv_batch_capabilities(&i.0 .0, &put_caps)?)
+            Some(validate_kv_batch_capabilities(&admitted.invocation().0, &put_caps)?)
         } else {
             None
         };
@@ -1597,13 +1596,18 @@ async fn invoke_impl(
             stage_inputs_start.elapsed(),
         );
         let inputs = inputs_result?;
-        let invocation_info = i.0 .0.clone();
+        let invocation_info = admitted.invocation().0.clone();
         let cursor_limit = kv_options.list_limit;
         let cursor_target = kv_list_target(&invocation_info.capabilities);
         let cursor_key = tinycloud.kv_cursor_key();
         let invoke_start = Instant::now();
+        // TC-409: `admitted` was verified exactly once above; the admitted
+        // entry point re-checks authorization, revocation, caveat
+        // containment, chain limits, storage authorization, and signed-time
+        // validity against the current database state, but does not
+        // re-verify the signature.
         let invoke_result = tinycloud
-            .invoke_with_options::<BlockStage>(i.0, inputs, kv_options)
+            .invoke_with_options_admitted::<BlockStage>(admitted, inputs, kv_options)
             .await;
         crate::prometheus::observe_span(
             "server.kv.invoke",
@@ -1993,7 +1997,7 @@ fn sql_request_is_write(request: &SqlRequest, caveats: &Option<SqlCaveats>, abil
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_sql_invoke(
-    i: AuthHeaderGetter<InvocationInfo>,
+    admitted: AdmittedInvocation,
     data: DataIn<'_>,
     tinycloud: &State<TinyCloud>,
     sql_service: &State<SqlService>,
@@ -2007,25 +2011,30 @@ async fn handle_sql_invoke(
     // path is a holdover (and is still consulted as a fallback so the
     // tinycloud.sql/write path keeps working) but a constrained-statements
     // caveat on the delegation chain MUST win and fail-closed.
-    let parent_cids: Vec<_> = i.0 .0.parents.to_vec();
+    let parent_cids: Vec<_> = admitted.invocation().0.parents.to_vec();
     let chain_constrained = derive_chain_constrained_caveat(tinycloud, &parent_cids).await?;
 
-    let facts_caveats: Option<SqlCaveats> =
-        i.0 .0
-            .invocation
-            .payload()
-            .facts
-            .as_ref()
-            .and_then(|facts| {
-                facts.iter().find_map(|fact| {
-                    fact.as_object()
-                        .and_then(|obj| obj.get("sqlCaveats"))
-                        .and_then(|v| serde_json::from_value(v.clone()).ok())
-                })
-            });
+    let facts_caveats: Option<SqlCaveats> = admitted
+        .invocation()
+        .0
+        .invocation
+        .payload()
+        .facts
+        .as_ref()
+        .and_then(|facts| {
+            facts.iter().find_map(|fact| {
+                fact.as_object()
+                    .and_then(|obj| obj.get("sqlCaveats"))
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+            })
+        });
 
-    let actor = i.0 .0.invoker.clone();
-    let auth_result = verify_auth("server.sql.auth", i.0, tinycloud).await?;
+    let actor = admitted.invocation().0.invoker.clone();
+    // TC-409: `admitted` was verified exactly once at the /invoke admission
+    // boundary; `verify_auth_admitted` uses the admitted core entry point so this
+    // shared SQL/DuckDB authorization path does not re-run signature
+    // verification a second time.
+    let auth_result = verify_auth_admitted("server.sql.auth", admitted, tinycloud).await?;
     let body_start = Instant::now();
     let body_result = read_json_body(data).await;
     crate::prometheus::observe_span(
@@ -2527,7 +2536,7 @@ fn duckdb_request_is_write(
 #[cfg(feature = "duckdb")]
 #[allow(clippy::too_many_arguments)]
 async fn handle_duckdb_invoke(
-    i: AuthHeaderGetter<InvocationInfo>,
+    admitted: AdmittedInvocation,
     data: DataIn<'_>,
     tinycloud: &State<TinyCloud>,
     duckdb_service: &State<DuckDbService>,
@@ -2537,22 +2546,27 @@ async fn handle_duckdb_invoke(
     duckdb_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
     arrow_format: bool,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
-    let caveats: Option<DuckDbCaveats> =
-        i.0 .0
-            .invocation
-            .payload()
-            .facts
-            .as_ref()
-            .and_then(|facts| {
-                facts.iter().find_map(|fact| {
-                    fact.as_object()
-                        .and_then(|obj| obj.get("duckdbCaveats"))
-                        .and_then(|v| serde_json::from_value(v.clone()).ok())
-                })
-            });
+    let caveats: Option<DuckDbCaveats> = admitted
+        .invocation()
+        .0
+        .invocation
+        .payload()
+        .facts
+        .as_ref()
+        .and_then(|facts| {
+            facts.iter().find_map(|fact| {
+                fact.as_object()
+                    .and_then(|obj| obj.get("duckdbCaveats"))
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+            })
+        });
 
-    let actor = i.0 .0.invoker.clone();
-    let auth_result = verify_auth("server.duckdb.auth", i.0, tinycloud).await?;
+    let actor = admitted.invocation().0.invoker.clone();
+    // TC-409: same admitted core entry point as the SQL path above — the
+    // envelope was verified once at admission; only authorization,
+    // revocation, caveat containment, and signed-time validity are
+    // re-checked here.
+    let auth_result = verify_auth_admitted("server.duckdb.auth", admitted, tinycloud).await?;
 
     let (space, path, ability) = select_database_scope(duckdb_caps, "duckdb")?;
     let db_name = DuckDbService::db_name_from_path(path);
@@ -3016,6 +3030,40 @@ async fn verify_auth(
     let start = Instant::now();
     let result = tinycloud
         .invoke::<BlockStage>(invocation, HashMap::new())
+        .await
+        .map_err(|e| {
+            (
+                match &e {
+                    TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
+                    TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
+                        database_error_status(error)
+                    }
+                    _ => Status::Unauthorized,
+                },
+                e.to_string(),
+            )
+        })
+        .map(|(tx_result, _)| tx_result);
+    crate::prometheus::observe_span(
+        span,
+        if result.is_ok() { "ok" } else { "error" },
+        start.elapsed(),
+    );
+    result
+}
+
+/// TC-409: same as [`verify_auth`], for the shared SQL/DuckDB authorization
+/// path reached from `/invoke`, which receives an [`AdmittedInvocation`]
+/// (envelope already verified once at the admission boundary) instead of a
+/// bare `Invocation`.
+async fn verify_auth_admitted(
+    span: &'static str,
+    invocation: AdmittedInvocation,
+    tinycloud: &State<TinyCloud>,
+) -> Result<TransactResult, (Status, String)> {
+    let start = Instant::now();
+    let result = tinycloud
+        .invoke_admitted::<BlockStage>(invocation, HashMap::new())
         .await
         .map_err(|e| {
             (
@@ -6858,6 +6906,242 @@ mod tests {
             0,
             "an over-cap invocation must not persist a replay row"
         );
+        Ok(())
+    }
+
+    // ── TC-409: a successful `/invoke` request cryptographically verifies
+    // its invocation exactly once — at admission — regardless of which
+    // downstream execution path (KV or the shared SQL/DuckDB authorization
+    // seam) it takes. Both tests independently compute the invocation's
+    // content hash from the exact header string sent, so they can assert
+    // on `tinycloud_core::admission::test_hook` without any cooperation
+    // from the server beyond running the real route. ──
+
+    /// Encode a signed, root-authority, no-op-body-safe invocation on the
+    /// issuer's own space for `service`/`ability`, with no `path` (used for
+    /// the SQL capability, which is not path-scoped like KV). Returns the
+    /// encoded header alongside the space it targets, so the caller can host
+    /// that exact space before dispatching.
+    fn tc409_root_invocation(
+        signer: &JWK,
+        issuer_vm: &str,
+        service: &str,
+        ability: &str,
+        path: Option<&str>,
+        nonce: &str,
+    ) -> Result<(String, SpaceId)> {
+        use tinycloud_auth::ssi::{dids::DIDURLBuf, ucan::Payload};
+        use tinycloud_auth::ucan_capabilities_object::Capabilities;
+
+        let issuer_did = issuer_vm
+            .split('#')
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("issuer verification method missing did"))?
+            .to_string();
+        let space = SpaceId::new(issuer_did.parse::<DIDBuf>()?, "files".parse()?);
+        let resource = space.clone().to_resource(
+            service.parse::<Service>()?,
+            path.map(|p| p.parse::<AuthPath>()).transpose()?,
+            None,
+            None,
+        );
+        let mut caps = Capabilities::new();
+        caps.with_action(
+            resource.as_uri(),
+            ability.parse::<UcanAbility>()?,
+            [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+        );
+        let invocation = Payload {
+            issuer: issuer_vm.parse::<DIDURLBuf>()?,
+            audience: issuer_did.parse::<DIDBuf>()?,
+            not_before: None,
+            expiration: test_invocation_expiration(),
+            nonce: Some(nonce.to_string()),
+            facts: Some(Vec::<serde_json::Value>::new()),
+            proof: vec![],
+            attenuation: caps,
+        }
+        .sign(signer.get_algorithm().unwrap_or_default(), signer)?;
+        Ok((invocation.encode()?, space))
+    }
+
+    /// Build a real `/invoke` rocket instance with `space`'s row already
+    /// inserted into TinyCloud's own database, so a validly-signed
+    /// root-authority invocation against it reaches a genuine response
+    /// instead of 404 "space not found" (the target space is otherwise
+    /// unhosted in a fresh test database).
+    async fn tc409_invoke_rocket(
+        space: &SpaceId,
+    ) -> Result<(
+        rocket::Rocket<rocket::Build>,
+        tinycloud_core::sea_orm::DatabaseConnection,
+    )> {
+        use tinycloud_core::models::space as space_model;
+        use tinycloud_core::sea_orm::ActiveModelTrait;
+        use tinycloud_core::sea_orm::ActiveValue::Set;
+        use tinycloud_core::types::SpaceIdWrap;
+
+        let tempdir = TempDir::new()?;
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
+        let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
+        // Mirror what `StorageSetup::create` does for a newly-hosted space:
+        // normally that runs as part of a `tinycloud.space/host` delegation
+        // transaction (see `new_spaces` handling in `tinycloud-core::db`).
+        // This harness hosts `space` directly via a DB row instead of that
+        // transaction, so the block-store directory needs the same
+        // provisioning here, or a KV write 500s on a missing directory.
+        std::fs::create_dir_all(
+            tempdir
+                .path()
+                .join(space.suffix())
+                .join(space.name().as_str()),
+        )?;
+        let _persisted = tempdir.keep();
+        let tinycloud = TinyCloud::new(
+            db.clone(),
+            Either::B(storage),
+            StaticSecret::new(vec![0u8; 32]).unwrap(),
+        )
+        .await?;
+        let conn = db;
+        space_model::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&conn)
+        .await?;
+
+        let replay_db =
+            Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
+        Migrator::up(&replay_db, None).await?;
+        let sql_service = fresh_sql_service().await;
+        let hook_runtime = HookRuntime::new(HooksConfig::default(), [9u8; 32]);
+        let rocket = rocket::build()
+            .mount("/", rocket::routes![invoke])
+            .attach(crate::tracing::TracingFairing::new(
+                &Config::default().log.tracing,
+            ))
+            .manage(tinycloud)
+            .manage(sql_service)
+            .manage(Config::default())
+            .manage(QuotaCache::new(None, None))
+            .manage(InvocationReplayCache::new(replay_db))
+            .manage(hook_runtime)
+            .manage(BlockStage::from(crate::config::StagingStorage::Memory));
+        Ok((rocket, conn))
+    }
+
+    #[tokio::test]
+    async fn tc409_kv_put_verifies_signature_exactly_once() -> Result<()> {
+        use rocket::http::{ContentType, Header};
+        use rocket::local::asynchronous::Client;
+
+        let signer = JWK::generate_ed25519()?;
+        let issuer_vm = tc341_verification_method(&signer)?;
+        let nonce = "urn:uuid:tc409-kv-put";
+        // A single non-multipart `kv/put` capability streams the raw request
+        // body directly into storage as the value, so (unlike `kv/get`
+        // against a key that has never been written) this reaches a genuine
+        // 2xx without needing to seed data first.
+        let (header, space) = tc409_root_invocation(
+            &signer,
+            &issuer_vm,
+            "kv",
+            "tinycloud.kv/put",
+            Some("doc"),
+            nonce,
+        )?;
+
+        let (rocket, _conn) = tc409_invoke_rocket(&space).await?;
+        let client = Client::tracked(rocket).await?;
+
+        let identity = tinycloud_core::hash::hash(nonce.as_bytes());
+        tinycloud_core::admission::test_hook::arm(identity);
+
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", header))
+            .header(ContentType::Plain)
+            .body("tc409")
+            .dispatch()
+            .await;
+
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert!(
+            status.class().is_success(),
+            "expected a successful kv/put response for a validly-signed, root-authority \
+             invocation against a hosted space, got {status}: {body}"
+        );
+        assert_eq!(
+            tinycloud_core::admission::test_hook::count_for(identity),
+            1,
+            "a single successful /invoke request through the KV path must verify the \
+             invocation's signature exactly once (at admission, not again during execution)"
+        );
+
+        tinycloud_core::admission::test_hook::disarm(identity);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc409_sql_shared_auth_verifies_signature_exactly_once() -> Result<()> {
+        use rocket::http::{ContentType, Header};
+        use rocket::local::asynchronous::Client;
+
+        let signer = JWK::generate_ed25519()?;
+        let issuer_vm = tc341_verification_method(&signer)?;
+        let nonce = "urn:uuid:tc409-sql-write";
+        let (header, space) = tc409_root_invocation(
+            &signer,
+            &issuer_vm,
+            "sql",
+            "tinycloud.sql/write",
+            None,
+            nonce,
+        )?;
+
+        let (rocket, _conn) = tc409_invoke_rocket(&space).await?;
+        let client = Client::tracked(rocket).await?;
+
+        let identity = tinycloud_core::hash::hash(nonce.as_bytes());
+        tinycloud_core::admission::test_hook::arm(identity);
+
+        // `handle_sql_invoke` calls the shared `verify_auth_admitted` path
+        // BEFORE it executes the SQL request. A genuinely valid write (schema
+        // creation + insert against a brand-new, otherwise-empty database)
+        // exercises the shared SQL/DuckDB authorization seam through to a
+        // real 2xx response, not just "reached authorization".
+        let body = serde_json::to_string(&SqlRequest::Execute {
+            schema: Some(vec![
+                "CREATE TABLE tc409 (k TEXT PRIMARY KEY, v INTEGER NOT NULL)".to_string(),
+            ]),
+            sql: "INSERT INTO tc409 (k, v) VALUES (?, ?)".to_string(),
+            params: vec![SqlValue::Text("a".to_string()), SqlValue::Integer(1)],
+        })?;
+
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", header))
+            .header(ContentType::JSON)
+            .body(body)
+            .dispatch()
+            .await;
+
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert!(
+            status.class().is_success(),
+            "expected a successful SQL write response for a validly-signed, root-authority \
+             invocation against a hosted space, got {status}: {body}"
+        );
+        assert_eq!(
+            tinycloud_core::admission::test_hook::count_for(identity),
+            1,
+            "the shared SQL/DuckDB authorization path (verify_auth_admitted) must not \
+             re-verify a signature already verified once at admission"
+        );
+
+        tinycloud_core::admission::test_hook::disarm(identity);
         Ok(())
     }
 }
