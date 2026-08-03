@@ -22,19 +22,24 @@ use tinycloud_auth::ssi::{
     jwk::{Algorithm, Base64urlUInt, OctetParams, Params, JWK},
     ucan::Payload,
 };
+use tinycloud_auth::{
+    identity::{did_principal_matches, parse_pkh_did},
+    resource::{ResourceId, SpaceId},
+};
 use tinycloud_core::{
     events::{Delegation, SerializedEvent},
     hash::hash,
     keys::StaticSecret,
     models::{
         abilities, delegation as delegation_model, policy_v3_challenge, policy_v3_registration,
-        policy_v3_root, policy_v3_session,
+        policy_v3_root, policy_v3_session, revocation, space,
     },
     relationships::parent_delegations,
     sea_orm::{
-        sea_query::Expr, ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait,
-        QueryFilter, QuerySelect, Set, TransactionTrait,
+        sea_query::Expr, ActiveModelTrait, ColumnTrait, DatabaseConnection, DatabaseTransaction,
+        EntityTrait, QueryFilter, QuerySelect, Set, TransactionTrait,
     },
+    types::SpaceIdWrap,
     util::{DelegationInfo, InvocationInfo},
 };
 
@@ -147,8 +152,15 @@ impl PolicyV3Runtime {
         {
             return false;
         }
+        let Ok(enforcer_did) = self
+            .authenticated_registration_enforcer(&registration, OffsetDateTime::now_utc())
+            .await
+        else {
+            return false;
+        };
         if fact(&event.0.delegation, "recipientDid") != Some(event.0.delegate.as_str())
-            || fact(&event.0.delegation, "enforcerDid") != Some(self.node_did.as_str())
+            || fact(&event.0.delegation, "enforcerDid") != Some(enforcer_did.as_str())
+            || fact(&event.0.delegation, "nodeAudience") != Some(self.node_did.as_str())
         {
             return false;
         }
@@ -398,9 +410,12 @@ impl PolicyV3Runtime {
                 return Err("policy-session-fact-index-mismatch");
             }
         }
-        if fact(&session.0.delegation, "enforcerDid")
-            != fact(&enforcement_root.0.delegation, "enforcerDid")
-            || fact(&session.0.delegation, "enforcerDid") != Some(self.node_did.as_str())
+        let authenticated_enforcer = self
+            .authenticated_registration_enforcer(&registration, now)
+            .await?;
+        if fact(&session.0.delegation, "enforcerDid") != Some(authenticated_enforcer.as_str())
+            || fact(&session.0.delegation, "enforcerDid")
+                != fact(&enforcement_root.0.delegation, "enforcerDid")
             || fact(&session.0.delegation, "nodeAudience") != Some(self.node_did.as_str())
             || fact(&session.0.delegation, "recipientDid") != Some(session.0.delegate.as_str())
         {
@@ -812,6 +827,15 @@ pub struct MintRequest {
     pub requirement: Value,
     #[serde(default)]
     pub credential: Value,
+    /// CID returned by the ordinary `/delegate` import of the holder's active
+    /// TinyCloud account session. This is only an address into Node's stored
+    /// authorization graph; policy/v2 re-verifies the exact signed CACAO.
+    #[serde(default)]
+    pub account_authorization_cid: Option<String>,
+    /// Exact recipient-owned credentials space covered by the account
+    /// authorization. This is independent of the sender-owned content source.
+    #[serde(default)]
+    pub credential_space_id: Option<String>,
     #[serde(default)]
     pub presentation: Value,
 }
@@ -1129,7 +1153,11 @@ pub async fn mint(
     let credential_admission =
         registered_policy.get("schema").and_then(Value::as_str) == Some(POLICY_V2_SCHEMA);
     if credential_admission {
-        if request.requirement.is_null() || request.credential.is_null() || !request.claim.is_null()
+        if request.requirement.is_null()
+            || request.credential.is_null()
+            || !request.claim.is_null()
+            || request.account_authorization_cid.is_none()
+            || request.credential_space_id.is_none()
         {
             return Err((
                 Status::BadRequest,
@@ -1139,6 +1167,8 @@ pub async fn mint(
     } else if request.claim.is_null()
         || !request.requirement.is_null()
         || !request.credential.is_null()
+        || request.account_authorization_cid.is_some()
+        || request.credential_space_id.is_some()
     {
         return Err((Status::BadRequest, "claim-and-presentation-required".into()));
     }
@@ -1186,19 +1216,37 @@ pub async fn mint(
         }
     }
 
-    let claim_context = ClaimPresentationContext {
-        challenge_id: &request.challenge_id,
-        nonce: &request.nonce,
-        policy_cid: &request.policy_cid,
-        owner_did: fact(&policy_root.0.delegation, "ownerDid")
-            .ok_or((Status::Forbidden, "policy-owner-missing".into()))?,
-        recipient_did: &challenge.recipient_did,
-        now,
-    };
+    let policy_owner_did = fact(&policy_root.0.delegation, "ownerDid")
+        .ok_or((Status::Forbidden, "policy-owner-missing".into()))?;
     let requested = challenge
         .requested_capabilities
         .as_array()
         .ok_or((Status::Forbidden, "requested-capabilities-invalid".into()))?;
+    let account_owner_proof = if credential_admission {
+        Some(
+            authenticate_account_owner(
+                request.account_authorization_cid.as_deref(),
+                request.credential_space_id.as_deref(),
+                &challenge.recipient_did,
+                runtime,
+                tinycloud,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let claim_context = ClaimPresentationContext {
+        challenge_id: &request.challenge_id,
+        nonce: &request.nonce,
+        policy_cid: &request.policy_cid,
+        owner_did: policy_owner_did,
+        recipient_did: &challenge.recipient_did,
+        authenticated_account_owner: account_owner_proof
+            .as_ref()
+            .map(|proof| proof.owner_did.as_str()),
+        now,
+    };
     let admission_v3 = if credential_admission {
         Some(validate_credential_admission_v3(
             &request.requirement,
@@ -1410,6 +1458,9 @@ pub async fn mint(
     // abilities, ordered signed proofs), and the admitted session index are a
     // single SQL commit. Any failure rolls the whole transition back.
     let txn = runtime.conn.begin().await.map_err(db_error)?;
+    if let Some(proof) = account_owner_proof.as_ref() {
+        validate_locked_account_owner(&txn, proof).await?;
+    }
     let locked_challenge = policy_v3_challenge::Entity::find_by_id(request.challenge_id.clone())
         .lock_exclusive()
         .one(&txn)
@@ -1499,6 +1550,9 @@ pub async fn mint(
         owner_did: fact(&locked_root_events[0].0.delegation, "ownerDid")
             .ok_or((Status::Forbidden, "policy-owner-missing".into()))?,
         recipient_did: &locked_challenge.recipient_did,
+        authenticated_account_owner: account_owner_proof
+            .as_ref()
+            .map(|proof| proof.owner_did.as_str()),
         now,
     };
     let locked_admission_v3 = if credential_admission {
@@ -1596,6 +1650,37 @@ pub async fn mint(
 }
 
 impl PolicyV3Runtime {
+    async fn authenticated_registration_enforcer(
+        &self,
+        registration: &policy_v3_registration::Model,
+        now: OffsetDateTime,
+    ) -> Result<String, &'static str> {
+        let root = policy_v3_root::Entity::find_by_id(registration.enforcement_root_cid.clone())
+            .one(&self.conn)
+            .await
+            .map_err(|_| "enforcement-root-unavailable")?
+            .ok_or("enforcement-root-missing")?;
+        let event = decode_delegation(
+            std::str::from_utf8(&root.authorization_bytes)
+                .map_err(|_| "enforcement-root-invalid")?,
+        )
+        .map_err(|_| "enforcement-root-invalid")?;
+        let enforcer_did = fact(&event.0.delegation, "enforcerDid")
+            .ok_or("enforcer-binding-invalid")?
+            .to_owned();
+        let binding: Value = serde_json::from_slice(&registration.attested_enforcer_binding_bytes)
+            .map_err(|_| "enforcer-binding-invalid")?;
+        validate_attested_enforcer_binding(
+            &binding,
+            &enforcer_did,
+            &self.node_did,
+            event.0.expiry.ok_or("enforcer-binding-invalid")?,
+            now,
+        )
+        .map_err(|_| "enforcer-binding-invalid")?;
+        Ok(enforcer_did)
+    }
+
     async fn authorize_roots(
         &self,
         registration: &policy_v3_registration::Model,
@@ -3324,6 +3409,35 @@ fn is_lower_hex_digest(value: &str) -> bool {
 }
 
 fn parse_policy_kv_resource(value: &str) -> Result<(String, String), (Status, String)> {
+    // Policy/v2 SDKs use the ordinary TinyCloud resource form so the minted
+    // capabilities flow directly through `/delegate` and `/invoke`. Keep the
+    // original `tinycloud://<logical-space>/kv/<path>` parser below byte-for-
+    // byte compatible for policy/v1 and already-registered documents.
+    if !value.starts_with("tinycloud://") {
+        let resource = value
+            .parse::<ResourceId>()
+            .map_err(|_| (Status::BadRequest, "kv-resource-invalid".into()))?;
+        let path = resource
+            .path()
+            .filter(|_| {
+                resource.service().as_str() == "kv"
+                    && resource.query().is_none()
+                    && resource.fragment().is_none()
+            })
+            .ok_or((Status::BadRequest, "kv-resource-invalid".into()))?;
+        if path.as_str().is_empty()
+            || path.as_str().starts_with('/')
+            || path.as_str().ends_with('/')
+            || path.as_str().contains("//")
+            || path
+                .as_str()
+                .split('/')
+                .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+        {
+            return Err((Status::BadRequest, "kv-resource-invalid".into()));
+        }
+        return Ok((resource.space().to_string(), path.to_string()));
+    }
     let rest = value
         .strip_prefix("tinycloud://")
         .ok_or((Status::BadRequest, "kv-resource-invalid".into()))?;
@@ -3864,6 +3978,7 @@ struct ClaimPresentationContext<'a> {
     policy_cid: &'a str,
     owner_did: &'a str,
     recipient_did: &'a str,
+    authenticated_account_owner: Option<&'a str>,
     now: OffsetDateTime,
 }
 
@@ -3879,6 +3994,7 @@ fn validate_claim_and_presentation(
         owner_did,
         recipient_did,
         now,
+        ..
     } = context;
     let claim = claim
         .as_object()
@@ -4111,6 +4227,162 @@ struct CredentialAdmissionV3 {
     credential_space_owner_did: String,
 }
 
+struct AccountOwnerProof {
+    cid: tinycloud_auth::ipld_core::cid::Cid,
+    row: delegation_model::Model,
+    owner_did: String,
+    space: SpaceId,
+    expires_at: Option<OffsetDateTime>,
+}
+
+/// Authenticate the policy/v2 credential owner from an already-admitted
+/// ordinary TinyCloud account session. The CID is only an address: authority
+/// comes from the exact stored CACAO bytes, their current signature/time, the
+/// separately addressed credentials-space authority, the holder audience,
+/// and the hosted-space and revocation state in this Node.
+async fn authenticate_account_owner(
+    authorization_cid: Option<&str>,
+    credential_space_id: Option<&str>,
+    holder_did: &str,
+    runtime: &PolicyV3Runtime,
+    tinycloud: &crate::TinyCloud,
+) -> Result<AccountOwnerProof, (Status, String)> {
+    let cid = authorization_cid
+        .ok_or((Status::BadRequest, "account-authorization-required".into()))?
+        .parse::<tinycloud_auth::ipld_core::cid::Cid>()
+        .map_err(|_| (Status::Forbidden, "account-authorization-invalid".into()))?;
+    let (row, event) = tinycloud
+        .load_signed_delegation(cid)
+        .await
+        .map_err(|_| (Status::Forbidden, "account-authorization-invalid".into()))?
+        .ok_or((Status::Forbidden, "account-authorization-missing".into()))?;
+    if !holder_did.starts_with("did:key:") {
+        return Err((Status::Forbidden, "account-holder-invalid".into()));
+    }
+    if !event.0.parents.is_empty() {
+        return Err((Status::Forbidden, "account-authorization-not-root".into()));
+    }
+    if event.0.delegate != holder_did {
+        return Err((
+            Status::Forbidden,
+            "account-authorization-audience-invalid".into(),
+        ));
+    }
+    if row.delegator != event.0.delegator
+        || row.delegatee != event.0.delegate
+        || row.expiry != event.0.expiry
+        || row.not_before != event.0.not_before
+        || row.issued_at != event.0.issued_at
+    {
+        return Err((
+            Status::Forbidden,
+            "account-authorization-projection-invalid".into(),
+        ));
+    }
+    let TinyCloudDelegation::Cacao(cacao) = &event.0.delegation else {
+        return Err((Status::Forbidden, "account-authorization-not-cacao".into()));
+    };
+    cacao.verify().await.map_err(|_| {
+        (
+            Status::Forbidden,
+            "account-authorization-signature-invalid".into(),
+        )
+    })?;
+    if !cacao.payload().valid_now() {
+        return Err((Status::Forbidden, "account-authorization-inactive".into()));
+    }
+
+    let owner_did = event.0.delegator.clone();
+    if parse_pkh_did(&owner_did)
+        .map_err(|_| (Status::Forbidden, "credential-space-owner-invalid".into()))?
+        .is_none()
+    {
+        return Err((Status::Forbidden, "credential-space-owner-invalid".into()));
+    }
+    let credentials_space = credential_space_id
+        .ok_or((Status::BadRequest, "credential-space-required".into()))?
+        .parse::<SpaceId>()
+        .map_err(|_| (Status::Forbidden, "credential-space-invalid".into()))?;
+    if credentials_space.name().as_str() != "credentials"
+        || parse_pkh_did(credentials_space.did().as_str())
+            .map_err(|_| (Status::Forbidden, "credential-space-invalid".into()))?
+            .is_none()
+        || !did_principal_matches(credentials_space.did().as_str(), &owner_did)
+    {
+        return Err((
+            Status::Forbidden,
+            "credential-space-owner-binding-invalid".into(),
+        ));
+    }
+    let hosted_credentials_space = tinycloud_core::types::Resource::from(
+        credentials_space
+            .clone()
+            .to_resource("space".parse().map_err(bad)?, None, None, None),
+    );
+    if !event.0.capabilities.iter().any(|capability| {
+        capability.ability.as_ref().as_ref() == "tinycloud.space/host"
+            && capability.resource == hosted_credentials_space
+    }) {
+        return Err((
+            Status::Forbidden,
+            "account-authorization-capability-mismatch".into(),
+        ));
+    }
+    if revocation::Entity::find()
+        .filter(revocation::Column::Revoked.eq(row.id))
+        .one(&runtime.conn)
+        .await
+        .map_err(db_error)?
+        .is_some()
+        || space::Entity::find_by_id(SpaceIdWrap(credentials_space.clone()))
+            .one(&runtime.conn)
+            .await
+            .map_err(db_error)?
+            .is_none()
+    {
+        return Err((Status::Forbidden, "account-authorization-inactive".into()));
+    }
+    Ok(AccountOwnerProof {
+        cid,
+        row,
+        owner_did,
+        space: credentials_space,
+        expires_at: event.0.expiry,
+    })
+}
+
+async fn validate_locked_account_owner(
+    transaction: &DatabaseTransaction,
+    proof: &AccountOwnerProof,
+) -> Result<(), (Status, String)> {
+    let locked = delegation_model::Entity::find_by_id(proof.row.id)
+        .lock_exclusive()
+        .one(transaction)
+        .await
+        .map_err(db_error)?
+        .ok_or((Status::Conflict, "account-authorization-changed".into()))?;
+    if locked != proof.row
+        || locked.id != tinycloud_core::hash::Hash::from(proof.cid)
+        || proof
+            .expires_at
+            .is_some_and(|expires_at| expires_at <= OffsetDateTime::now_utc())
+        || revocation::Entity::find()
+            .filter(revocation::Column::Revoked.eq(locked.id))
+            .one(transaction)
+            .await
+            .map_err(db_error)?
+            .is_some()
+        || space::Entity::find_by_id(SpaceIdWrap(proof.space.clone()))
+            .one(transaction)
+            .await
+            .map_err(db_error)?
+            .is_none()
+    {
+        return Err((Status::Conflict, "account-authorization-changed".into()));
+    }
+    Ok(())
+}
+
 fn validate_credential_admission_v3(
     requirement: &Value,
     credential: &Value,
@@ -4206,12 +4478,12 @@ fn validate_credential_admission_v3(
             Status::Forbidden,
             "credential-space-owner-binding-invalid".into(),
         ))?;
-    account_owner.parse::<DIDBuf>().map_err(|_| {
-        (
+    if Some(account_owner) != context.authenticated_account_owner {
+        return Err((
             Status::Forbidden,
             "credential-space-owner-binding-invalid".into(),
-        )
-    })?;
+        ));
+    }
     let signer = validate_v3_presentation_signature(presentation, context.recipient_did)?;
     if signer != context.recipient_did {
         return Err((Status::Forbidden, "presentation-signer-untrusted".into()));
@@ -4832,7 +5104,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn policy_v2_admits_independently_issued_holder_evidence_with_distinct_principals() {
+    async fn policy_v2_admits_independently_issued_holder_evidence_with_distinct_principals(
+    ) -> anyhow::Result<()> {
+        use k256::ecdsa::SigningKey;
+        use sha3::Keccak256;
+        use tinycloud_auth::cacaos::siwe::encode_eip55;
+
         let vector: Value = serde_json::from_str(include_str!(
             "../test-fixtures/tc-470-policy-credential-requirement.json"
         ))
@@ -4856,35 +5133,61 @@ mod tests {
         let owner_did = did(&owner_key);
         let holder_did = did(&holder_key);
         let enforcer_did = did(&enforcer_key);
+        let account_key = SigningKey::from_bytes(&[0x47; 32].into())?;
+        let account_public = account_key.verifying_key().to_encoded_point(false);
+        let account_digest = Keccak256::digest(&account_public.as_bytes()[1..]);
+        let account_address: [u8; 20] = account_digest[12..].try_into()?;
+        let account_owner_did = format!("did:pkh:eip155:1:0x{}", encode_eip55(&account_address));
+        let credentials_space =
+            SpaceId::new(account_owner_did.parse::<DIDBuf>()?, "credentials".parse()?);
+        let content_space = SpaceId::new(owner_did.parse::<DIDBuf>()?, "applications".parse()?);
+        let content_resource = content_space.clone().to_resource(
+            "kv".parse()?,
+            Some("shares/tc-470/document.txt".parse()?),
+            None,
+            None,
+        );
         let node_secret = StaticSecret::new(vec![29; 32]).unwrap();
         let node_did = node_secret.node_did();
         let issuer_did = projection["issuerDid"].as_str().unwrap();
-        let account_owner_did = "did:pkh:eip155:1:0x1111111111111111111111111111111111111111";
         let principals = [
             owner_did.as_str(),
             issuer_did,
             holder_did.as_str(),
+            account_owner_did.as_str(),
             enforcer_did.as_str(),
             node_did.as_str(),
         ];
         for (index, principal) in principals.iter().enumerate() {
             assert!(!principals[..index].contains(principal));
         }
+        assert_ne!(content_space, credentials_space);
+        assert_eq!(content_space.did().as_str(), owner_did);
+        assert_eq!(credentials_space.did().as_str(), account_owner_did);
 
         let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
         let issued = now - Duration::seconds(5);
         let expires = now + Duration::seconds(600);
         let requested = vec![json!({
             "kind": "kv",
-            "resource": "tinycloud://applications/kv/shares/tc-470/document.txt",
+            "resource": content_resource.to_string(),
             "selector": "exact",
             "actions": ["tinycloud.kv/get"]
         })];
+        let encryption_resource = format!("urn:tinycloud:encryption:{owner_did}:mainnet");
+        let ceiling = vec![
+            requested[0].clone(),
+            json!({
+                "kind": "encryption",
+                "resource": encryption_resource,
+                "action": "tinycloud.encryption/decrypt"
+            }),
+        ];
         let content_source = json!({
             "shareId": "share-tc-470",
-            "kvResource": "tinycloud://applications/kv/shares/tc-470/document.txt",
+            "kvResource": content_resource.to_string(),
             "selector": "exact",
-            "encryptionNetwork": format!("urn:tinycloud:encryption:{owner_did}:mainnet"),
+            "encryptionNetwork": encryption_resource,
             "encryptedSymmetricKeyDigestHex": "aa".repeat(32),
             "keyVersion": 1,
             "mode": "immutable",
@@ -4897,7 +5200,7 @@ mod tests {
             "createdAt": format_time(issued),
             "expiresAt": format_time(expires),
             "contentSource": content_source,
-            "capabilityCeiling": requested,
+            "capabilityCeiling": ceiling,
             "credentialRequirement": projection,
             "signature": {"suite": "Ed25519", "signerDid": owner_did, "value": ""}
         });
@@ -5025,7 +5328,7 @@ mod tests {
         );
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let runtime =
-            PolicyV3Runtime::new(db, node_did, node_secret).with_credential_issuer(issuer);
+            PolicyV3Runtime::new(db.clone(), node_did, node_secret).with_credential_issuer(issuer);
         let admission = validate_credential_admission_v3(
             &requirement,
             &credential,
@@ -5037,12 +5340,13 @@ mod tests {
                 policy_cid: presentation["policyCid"].as_str().unwrap(),
                 owner_did: policy["ownerDid"].as_str().unwrap(),
                 recipient_did: holder_did.as_str(),
+                authenticated_account_owner: Some(&account_owner_did),
                 now,
             },
             &runtime,
             presentation["requestedCapabilities"].as_array().unwrap(),
         )
-        .unwrap();
+        .map_err(|(_, error)| anyhow::anyhow!(error))?;
         assert_eq!(admission.credential_id, "credential-tc-470");
         assert_eq!(admission.credential_space_owner_did, account_owner_did);
 
@@ -5070,7 +5374,488 @@ mod tests {
             now + Duration::seconds(60),
             now,
         )
-        .unwrap();
+        .map_err(|(_, error)| anyhow::anyhow!(error))?;
+
+        // Build the real sibling roots. Their authority is owner-signed, the
+        // enforcement audience is deliberately distinct from Node, and the
+        // ordinary attenuation is the same native TinyCloud KV resource that
+        // the final `/invoke` reads.
+        let projections =
+            registration_projections(&policy).map_err(|(_, error)| anyhow::anyhow!(error))?;
+        let owner_jwk = JWK::from(Params::OKP(OctetParams {
+            curve: "Ed25519".to_owned(),
+            public_key: Base64urlUInt(owner_key.public().to_bytes().to_vec()),
+            private_key: Some(Base64urlUInt(owner_key.secret().as_ref().to_vec())),
+        }));
+        let owner_vm = format!("{owner_did}#{}", owner_did.trim_start_matches("did:key:"));
+        let policy_digest =
+            policy_digest_hex(&policy).map_err(|(_, error)| anyhow::anyhow!(error))?;
+        let common_facts = json!({
+            "ownerDid": owner_did,
+            "policyId": policy["policyId"],
+            "policyDigestHex": policy_digest,
+            "policyCid": policy_cid,
+            "contentSourceDigestHex": projections.content_source_digest_hex,
+            "capabilityCeilingHashHex": projections.capability_ceiling_hash_hex,
+            "nativeProjectionHashHex": projections.native_projection_hash_hex,
+            "nodeAudience": runtime.node_did,
+        });
+        let root_payload = |audience: &str, role: &str, mode: &str, enforcer: Option<&str>| {
+            let mut facts = common_facts.as_object().unwrap().clone();
+            facts.insert("role".into(), json!(role));
+            facts.insert("mode".into(), json!(mode));
+            if let Some(enforcer) = enforcer {
+                facts.insert("enforcerDid".into(), json!(enforcer));
+            }
+            Payload {
+                issuer: owner_vm.parse::<DIDURLBuf>().unwrap(),
+                audience: audience.parse::<DIDBuf>().unwrap(),
+                not_before: Some(
+                    NumericDate::try_from_seconds(issued.unix_timestamp() as f64).unwrap(),
+                ),
+                expiration: NumericDate::try_from_seconds(expires.unix_timestamp() as f64).unwrap(),
+                nonce: Some(format!("tc-470-{role}")),
+                facts: Some(vec![Value::Object(facts)]),
+                proof: vec![],
+                attenuation: serde_json::from_value(projections.attenuation.clone()).unwrap(),
+            }
+            .sign(Algorithm::EdDSA, &owner_jwk)
+            .unwrap()
+        };
+        let policy_root_authorization = TinyCloudDelegation::Ucan(Box::new(root_payload(
+            &format!("did:tinycloud:policy:{policy_digest}"),
+            "policy-authority",
+            "policy-source",
+            None,
+        )))
+        .encode()?;
+        let enforcement_root_authorization = TinyCloudDelegation::Ucan(Box::new(root_payload(
+            &enforcer_did,
+            "policy-enforcement",
+            "conditional-mint",
+            Some(&enforcer_did),
+        )))
+        .encode()?;
+
+        use rocket::{http::ContentType, local::asynchronous::Client};
+        use std::sync::Arc;
+        use tinycloud_auth::{
+            authorization::{make_invocation, InvocationOptions},
+            cacaos::{
+                siwe::{Message, Version},
+                siwe_cacao::{Header as SiweHeader, Signature as SiweSignature, SiweCacao},
+            },
+            siwe_recap::{Ability as RecapAbility, Capability as RecapCapability},
+            ucan_capabilities_object::Capabilities,
+        };
+        use tinycloud_core::{
+            database_artifacts::SeaOrmDatabaseArtifactRepository,
+            encryption::ColumnEncryption,
+            encryption_network::{EncryptionService, LocalOneOfOneBackend},
+            sql::SqlService,
+            storage::{either::Either, StorageConfig as _},
+        };
+
+        let storage_dir = tempfile::TempDir::new()?;
+        let storage = crate::storage::file_system::FileSystemConfig::new(storage_dir.path())
+            .open()
+            .await?;
+        let _storage_dir = storage_dir.keep();
+        let tinycloud = crate::TinyCloud::new(
+            db.clone(),
+            Either::B(storage),
+            StaticSecret::new(vec![0; 32]).map_err(|_| anyhow::anyhow!("invalid secret"))?,
+        )
+        .await?;
+        let sql_dir = tempfile::TempDir::new()?;
+        let sql_path = sql_dir.path().to_string_lossy().to_string();
+        let _sql_dir = sql_dir.keep();
+        let sql_service = SqlService::new(
+            sql_path,
+            u64::MAX,
+            Arc::new(SeaOrmDatabaseArtifactRepository::new(db.clone())),
+        );
+        let encryption_backend = Arc::new(LocalOneOfOneBackend::new(ColumnEncryption::new(
+            runtime
+                .signer
+                .derive_key(b"tinycloud/encryption/network-seal"),
+        )));
+        let encryption = EncryptionService::new_with_node_keypair(
+            db.clone(),
+            runtime.signer.node_keypair(),
+            encryption_backend,
+        );
+        let rocket = rocket::build()
+            .mount(
+                "/",
+                rocket::routes![
+                    register_policy,
+                    issue_enforcer_binding,
+                    challenge,
+                    mint,
+                    crate::routes::delegate,
+                    crate::routes::invoke
+                ],
+            )
+            .attach(crate::tracing::TracingFairing::new(
+                &crate::config::Config::default().log.tracing,
+            ))
+            .manage(tinycloud)
+            .manage(runtime.clone())
+            .manage(sql_service)
+            .manage(crate::config::Config::default())
+            .manage(crate::quota::QuotaCache::new(None, None))
+            .manage(crate::invocation_replay::InvocationReplayCache::new(
+                db.clone(),
+            ))
+            .manage(crate::hooks::HookRuntime::new(
+                crate::config::HooksConfig::default(),
+                [31; 32],
+            ))
+            .manage(crate::BlockStage::from(
+                crate::config::StagingStorage::Memory,
+            ))
+            .manage(encryption);
+        let client = Client::tracked(rocket).await?;
+
+        // The sender independently hosts and writes the sender-owned content
+        // space through the ordinary graph. The recipient account proof below
+        // never carries authority for this resource.
+        let mut sender_capabilities = Capabilities::<Value>::new();
+        sender_capabilities.with_action(
+            content_space
+                .clone()
+                .to_resource("space".parse()?, None, None, None)
+                .as_uri(),
+            "tinycloud.space/host".parse::<RecapAbility>()?,
+            [std::collections::BTreeMap::<String, Value>::new()],
+        );
+        sender_capabilities.with_action(
+            content_resource.as_uri(),
+            "tinycloud.kv/put".parse::<RecapAbility>()?,
+            [std::collections::BTreeMap::<String, Value>::new()],
+        );
+        let sender_authorization = TinyCloudDelegation::Ucan(Box::new(
+            Payload {
+                issuer: owner_vm.parse()?,
+                audience: holder_did.parse()?,
+                not_before: Some(NumericDate::try_from_seconds(
+                    issued.unix_timestamp() as f64
+                )?),
+                expiration: NumericDate::try_from_seconds(expires.unix_timestamp() as f64)?,
+                nonce: Some("tc470-sender-content".into()),
+                facts: Some(vec![]),
+                proof: vec![],
+                attenuation: sender_capabilities,
+            }
+            .sign(Algorithm::EdDSA, &owner_jwk)?,
+        ))
+        .encode()?;
+        let sender_response = client
+            .post("/delegate")
+            .header(rocket::http::Header::new(
+                "Authorization",
+                sender_authorization,
+            ))
+            .dispatch()
+            .await;
+        let sender_status = sender_response.status();
+        let sender_body = sender_response.into_string().await.unwrap_or_default();
+        assert_eq!(sender_status, Status::Ok, "sender /delegate: {sender_body}");
+        let sender_cid = serde_json::from_str::<Value>(&sender_body)?["cid"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing sender delegation cid"))?
+            .parse()?;
+
+        // Import the recipient's existing SDK account-session CACAO through
+        // the real ordinary `/delegate` route. Its only signed authority is
+        // the exact recipient-owned credentials space.
+        let mut recap = RecapCapability::<Value>::new();
+        recap.with_action(
+            credentials_space
+                .clone()
+                .to_resource("space".parse()?, None, None, None)
+                .as_uri(),
+            "tinycloud.space/host".parse::<RecapAbility>()?,
+            [std::collections::BTreeMap::<String, Value>::new()],
+        );
+        let account_message = recap.build_message(Message {
+            scheme: Some("https".parse()?),
+            domain: "tc470.test".parse()?,
+            address: account_address,
+            statement: None,
+            uri: holder_did.parse()?,
+            version: Version::V1,
+            chain_id: 1,
+            nonce: "tc470-account-session".into(),
+            issued_at: issued.into(),
+            expiration_time: Some(expires.into()),
+            not_before: None,
+            request_id: None,
+            resources: vec![],
+        })?;
+        let (account_signature, recovery_id) =
+            account_key.sign_prehash_recoverable(&account_message.eip191_hash()?)?;
+        let mut account_signature_bytes = [0_u8; 65];
+        account_signature_bytes[..64].copy_from_slice(account_signature.to_bytes().as_ref());
+        account_signature_bytes[64] = u8::from(recovery_id) + 27;
+        let account_authorization = TinyCloudDelegation::Cacao(Box::new(SiweCacao::new(
+            account_message.into(),
+            SiweSignature::from(account_signature_bytes),
+            SiweHeader,
+        )))
+        .encode()?;
+        let account_response = client
+            .post("/delegate")
+            .header(rocket::http::Header::new(
+                "Authorization",
+                account_authorization,
+            ))
+            .dispatch()
+            .await;
+        let account_status = account_response.status();
+        let account_body = account_response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            account_status,
+            Status::Ok,
+            "account /delegate: {account_body}"
+        );
+        let account_cid: tinycloud_auth::ipld_core::cid::Cid =
+            serde_json::from_str::<Value>(&account_body)?["cid"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("missing account delegation cid"))?
+                .parse()?;
+        let (_, stored_account) = client
+            .rocket()
+            .state::<crate::TinyCloud>()
+            .unwrap()
+            .load_signed_delegation(account_cid)
+            .await
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow::anyhow!("missing stored account authorization"))?;
+        assert!(matches!(
+            stored_account.0.delegation,
+            TinyCloudDelegation::Cacao(_)
+        ));
+
+        // Seed a real object via the ordinary data plane so the final read
+        // proves authorization and content access rather than only admission.
+        let mut holder_jwk = JWK::from(Params::OKP(OctetParams {
+            curve: "Ed25519".to_owned(),
+            public_key: Base64urlUInt(holder_key.public().to_bytes().to_vec()),
+            private_key: Some(Base64urlUInt(holder_key.secret().as_ref().to_vec())),
+        }));
+        holder_jwk.algorithm = Some(Algorithm::EdDSA);
+        let holder_vm = format!("{holder_did}#{}", holder_did.trim_start_matches("did:key:"));
+        let seed = make_invocation(
+            [(
+                content_resource.clone(),
+                ["tinycloud.kv/put".parse::<RecapAbility>()?],
+            )],
+            &sender_cid,
+            &holder_jwk,
+            &holder_vm,
+            (OffsetDateTime::now_utc() + Duration::seconds(45)).unix_timestamp() as f64,
+            InvocationOptions {
+                nonce: Some("tc470-seed-content".into()),
+                ..InvocationOptions::default()
+            },
+        )?;
+        let seed_response = client
+            .post("/invoke")
+            .header(rocket::http::Header::new("Authorization", seed.encode()?))
+            .header(ContentType::Plain)
+            .body("tc-470-real-content")
+            .dispatch()
+            .await;
+        assert_eq!(seed_response.status(), Status::Ok);
+
+        let binding_response = client
+            .post("/share/v3/enforcer-bindings")
+            .header(ContentType::JSON)
+            .body(
+                json!({
+                    "rootExpiresAt": format_time(expires),
+                    "enforcerDid": enforcer_did,
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+        assert_eq!(binding_response.status(), Status::Ok);
+        let live_binding: Value = binding_response.into_json().await.unwrap();
+
+        let register_response = client
+            .post("/share/v3/policies")
+            .header(ContentType::JSON)
+            .body(
+                json!({
+                    "policyCid": policy_cid,
+                    "policy": policy,
+                    "policyRoot": policy_root_authorization,
+                    "enforcementRoot": enforcement_root_authorization,
+                    "contentSourceDigestHex": projections.content_source_digest_hex,
+                    "nativeProjectionHashHex": projections.native_projection_hash_hex,
+                    "attestedEnforcerBinding": live_binding,
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+        let register_status = register_response.status();
+        let register_body = register_response.into_string().await.unwrap_or_default();
+        assert_eq!(register_status, Status::Ok, "register: {register_body}");
+
+        let challenge_response = client
+            .post("/share/v3/policy/challenges")
+            .header(ContentType::JSON)
+            .body(
+                json!({
+                    "policyCid": policy_cid,
+                    "recipientDid": holder_did,
+                    "requestedCapabilities": requested,
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+        assert_eq!(challenge_response.status(), Status::Ok);
+        let challenge_value: Value = challenge_response.into_json().await.unwrap();
+        let challenge_id = challenge_value["challengeId"].as_str().unwrap();
+        let nonce = challenge_value["nonce"].as_str().unwrap();
+
+        // Rebind the real issuer-signed SD-JWT presentation to the live
+        // challenge. The complete requirement and credential remain local to
+        // this one mint request.
+        presentation["challengeId"] = json!(challenge_id);
+        presentation["nonce"] = json!(nonce);
+        presentation["jti"] = json!("presentation-tc-470-http");
+        presentation["issuedAt"] = json!(format_time(OffsetDateTime::now_utc()));
+        presentation["expiresAt"] = json!(format_time(
+            OffsetDateTime::now_utc() + Duration::seconds(45)
+        ));
+        let mut unsigned_presentation = presentation.clone();
+        unsigned_presentation
+            .as_object_mut()
+            .unwrap()
+            .remove("signature");
+        let mut presentation_preimage = CREDENTIAL_PRESENTATION_V3_DOMAIN.to_vec();
+        presentation_preimage.extend_from_slice(&canonical_json_value(&unsigned_presentation));
+        presentation["signature"]["value"] = json!(encode_config(
+            holder_key.sign(&Sha256::digest(presentation_preimage)),
+            URL_SAFE_NO_PAD
+        ));
+        let mint_response = client
+            .post("/share/v3/policy/delegations")
+            .header(ContentType::JSON)
+            .body(
+                json!({
+                    "policyCid": policy_cid,
+                    "challengeId": challenge_id,
+                    "nonce": nonce,
+                    "requirement": requirement,
+                    "credential": credential,
+                    "accountAuthorizationCid": account_cid.to_string(),
+                    "credentialSpaceId": credentials_space.to_string(),
+                    "presentation": presentation,
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+        let mint_status = mint_response.status();
+        let mint_body = mint_response.into_string().await.unwrap_or_default();
+        assert_eq!(mint_status, Status::Ok, "mint: {mint_body}");
+        let minted: Value = serde_json::from_str(&mint_body)?;
+        let s0_authorization = minted["authorization"].as_str().unwrap();
+        let s0 =
+            decode_delegation(s0_authorization).map_err(|(_, error)| anyhow::anyhow!(error))?;
+
+        // Holder redelegates S0 through the production `/delegate` route.
+        // Preserve the authenticated facts, narrow depth/time, and use a
+        // fresh reader key so `/invoke` must traverse the ordinary graph.
+        let reader_jwk = JWK::generate_ed25519()?;
+        let reader_did = tinycloud_auth::resolver::DID_METHODS
+            .generate(&reader_jwk, "key")?
+            .to_string();
+        let mut child_facts = match &s0.0.delegation {
+            TinyCloudDelegation::Ucan(ucan) => ucan.payload().facts.clone().unwrap(),
+            TinyCloudDelegation::Cacao(_) => unreachable!(),
+        };
+        child_facts[0]["remainingRedelegationDepth"] = json!(7);
+        let child_not_before = s0.0.not_before.unwrap() + Duration::milliseconds(1);
+        let child_expiry = s0.0.expiry.unwrap() - Duration::seconds(1);
+        let child = Payload {
+            issuer: holder_vm.parse()?,
+            audience: reader_did.parse()?,
+            not_before: Some(NumericDate::try_from_seconds(
+                child_not_before.unix_timestamp_nanos() as f64 / 1_000_000_000.0,
+            )?),
+            expiration: NumericDate::try_from_seconds(
+                child_expiry.unix_timestamp_nanos() as f64 / 1_000_000_000.0,
+            )?,
+            nonce: Some("tc470-policy-child".into()),
+            facts: Some(child_facts),
+            proof: vec![s0.content_hash().to_cid(0x55)],
+            attenuation: serde_json::from_value::<Capabilities<Value>>(
+                attenuation_for_policy_capabilities(&requested)
+                    .map_err(|(_, error)| anyhow::anyhow!(error))?,
+            )?,
+        }
+        .sign(Algorithm::EdDSA, &holder_jwk)?;
+        let child_authorization = TinyCloudDelegation::Ucan(Box::new(child)).encode()?;
+        let child_response = client
+            .post("/delegate")
+            .header(rocket::http::Header::new(
+                "Authorization",
+                child_authorization,
+            ))
+            .dispatch()
+            .await;
+        let child_status = child_response.status();
+        let child_body = child_response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            child_status,
+            Status::Ok,
+            "policy child /delegate: {child_body}"
+        );
+        let child_cid = serde_json::from_str::<Value>(&child_body)?["cid"]
+            .as_str()
+            .unwrap()
+            .parse()?;
+
+        let mut reader_vm = reader_did.clone();
+        reader_vm.push('#');
+        reader_vm.push_str(reader_did.trim_start_matches("did:key:"));
+        let invocation_now = OffsetDateTime::now_utc();
+        let read = Payload {
+            issuer: reader_vm.parse()?,
+            audience: reader_did.parse()?,
+            not_before: Some(NumericDate::try_from_seconds(
+                invocation_now.unix_timestamp() as f64,
+            )?),
+            expiration: NumericDate::try_from_seconds(
+                (invocation_now + Duration::seconds(30)).unix_timestamp() as f64,
+            )?,
+            nonce: Some("tc470-policy-read".into()),
+            facts: Some(Vec::<Value>::new()),
+            proof: vec![child_cid],
+            attenuation: serde_json::from_value::<Capabilities<Value>>(
+                attenuation_for_policy_capabilities(&requested)
+                    .map_err(|(_, error)| anyhow::anyhow!(error))?,
+            )?,
+        }
+        .sign(Algorithm::EdDSA, &reader_jwk)?;
+        let read_response = client
+            .post("/invoke")
+            .header(rocket::http::Header::new("Authorization", read.encode()?))
+            .dispatch()
+            .await;
+        let read_status = read_response.status();
+        let read_body = read_response.into_bytes().await.unwrap_or_default();
+        assert_eq!(read_status, Status::Ok, "read response: {read_body:?}");
+        assert_eq!(read_body, b"tc-470-real-content");
+        Ok(())
     }
 
     #[test]
