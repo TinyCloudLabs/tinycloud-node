@@ -427,6 +427,8 @@ pub async fn app_with_control(
     .await?
     .with_encryption(Some(webhook_encryption.clone()))
     .with_sql_sizes(sql_sizes.clone());
+    let encryption_service =
+        encryption_service.with_sqlite_writer_lock(tinycloud.sqlite_writer_lock());
 
     // Seed the SQL-size mirror AFTER `TinyCloud::new` ran migrations — the
     // `database_artifact` table now exists (seeding before migrations would
