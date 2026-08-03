@@ -15,6 +15,7 @@ use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 use tinycloud_auth::authorization::HeaderEncode;
 use tinycloud_auth::authorization::TinyCloudDelegation;
 use tinycloud_auth::multihash_codetable::MultihashDigest;
+use tinycloud_auth::share_email_evidence::{verify_detached_ed25519, IssuerKey};
 use tinycloud_auth::ssi::{
     claims::jwt::NumericDate,
     dids::{AnyDidMethod, DIDBuf, DIDURLBuf},
@@ -39,6 +40,10 @@ use tinycloud_core::{
 
 pub const POLICY_SESSION_PROFILE: &str = "policy-session-ucan/v1";
 pub const POLICY_V1_SCHEMA: &str = "xyz.tinycloud.policy/policy/v1";
+pub const POLICY_V2_SCHEMA: &str = "xyz.tinycloud.policy/policy/v2";
+pub const POLICY_CREDENTIAL_REQUIREMENT_V1: &str = "TinyCloudPolicyCredentialRequirement";
+pub const CREDENTIAL_PRESENTATION_V3_SCHEMA: &str = "xyz.tinycloud.policy/presentation/v3";
+const CREDENTIAL_PRESENTATION_V3_DOMAIN: &[u8] = b"xyz.tinycloud.policy/Presentation/v3\0";
 pub const POLICY_ENFORCEMENT_V2_SCHEMA: &str = "xyz.tinycloud.policy/enforcement-delegation/v2";
 pub const ATTESTED_ENFORCER_V2_SCHEMA: &str = "xyz.tinycloud.policy/attested-enforcer/v2";
 pub const ROOT_STATUS_V1_SCHEMA: &str = "xyz.tinycloud.policy/root-status/v1";
@@ -59,6 +64,7 @@ pub struct PolicyV3Runtime {
     pub conn: DatabaseConnection,
     pub node_did: String,
     signer: StaticSecret,
+    credential_issuer: Option<IssuerKey>,
 }
 
 impl PolicyV3Runtime {
@@ -71,7 +77,15 @@ impl PolicyV3Runtime {
             conn,
             node_did: node_did.into(),
             signer,
+            credential_issuer: None,
         }
+    }
+
+    /// Install the operator-authenticated OpenCredentials issuer tuple used
+    /// by policy/v2 admission. Policy/v1 remains available without it.
+    pub fn with_credential_issuer(mut self, issuer: IssuerKey) -> Self {
+        self.credential_issuer = Some(issuer);
+        self
     }
 
     fn signing_jwk(&self) -> JWK {
@@ -709,6 +723,8 @@ pub struct RegisterResponse {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EnforcerBindingRequest {
     pub root_expires_at: String,
+    #[serde(default)]
+    pub enforcer_did: Option<String>,
 }
 
 #[post("/share/v3/enforcer-bindings", format = "json", data = "<request>")]
@@ -728,13 +744,20 @@ pub async fn issue_enforcer_binding(
     // liveness itself remains bounded by independently renewable 300-second
     // status checkpoints.
     let expires = root_expiry;
+    let enforcer_did = request
+        .enforcer_did
+        .as_deref()
+        .unwrap_or(runtime.node_did.as_str());
+    enforcer_did
+        .parse::<DIDBuf>()
+        .map_err(|_| (Status::BadRequest, "enforcer-did-invalid".into()))?;
     let binding_material = serde_json::json!({
-        "enforcerDid": runtime.node_did,
+        "enforcerDid": enforcer_did,
         "nodeAudience": runtime.node_did,
     });
     let mut value = serde_json::json!({
         "schema": ATTESTED_ENFORCER_V2_SCHEMA,
-        "enforcerDid": runtime.node_did,
+        "enforcerDid": enforcer_did,
         "nodeAudience": runtime.node_did,
         "attestationBindingDigestHex": hex::encode(Sha256::digest(canonical_json_value(&binding_material))),
         "issuedAt": format_time(now),
@@ -752,13 +775,7 @@ pub async fn issue_enforcer_binding(
         "signerDid": runtime.node_did,
         "value": base64::encode_config(signature, URL_SAFE_NO_PAD),
     });
-    validate_attested_enforcer_binding(
-        &value,
-        &runtime.node_did,
-        &runtime.node_did,
-        root_expiry,
-        now,
-    )?;
+    validate_attested_enforcer_binding(&value, enforcer_did, &runtime.node_did, root_expiry, now)?;
     Ok(Json(value))
 }
 
@@ -779,6 +796,8 @@ pub struct ChallengeResponse {
     pub policy_cid: String,
     pub recipient_did: String,
     pub expires_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_audience: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -789,6 +808,10 @@ pub struct MintRequest {
     pub nonce: String,
     #[serde(default)]
     pub claim: Value,
+    #[serde(default)]
+    pub requirement: Value,
+    #[serde(default)]
+    pub credential: Value,
     #[serde(default)]
     pub presentation: Value,
 }
@@ -1070,6 +1093,8 @@ pub async fn challenge(
         policy_cid: request.policy_cid,
         recipient_did: request.recipient_did,
         expires_at: format_time(expires_at),
+        node_audience: (policy.get("schema").and_then(Value::as_str) == Some(POLICY_V2_SCHEMA))
+            .then(|| runtime.node_did.clone()),
     }))
 }
 
@@ -1092,8 +1117,8 @@ pub async fn mint(
     {
         return Err((Status::Unauthorized, "challenge-invalid".into()));
     }
-    if request.claim.is_null() || request.presentation.is_null() {
-        return Err((Status::BadRequest, "claim-and-presentation-required".into()));
+    if request.presentation.is_null() {
+        return Err((Status::BadRequest, "presentation-required".into()));
     }
     let registration = policy_v3_registration::Entity::find_by_id(request.policy_cid.clone())
         .one(&runtime.conn)
@@ -1101,6 +1126,22 @@ pub async fn mint(
         .map_err(db_error)?
         .ok_or((Status::NotFound, "policy-registration-missing".into()))?;
     let registered_policy = validate_registration_projection(&registration)?;
+    let credential_admission =
+        registered_policy.get("schema").and_then(Value::as_str) == Some(POLICY_V2_SCHEMA);
+    if credential_admission {
+        if request.requirement.is_null() || request.credential.is_null() || !request.claim.is_null()
+        {
+            return Err((
+                Status::BadRequest,
+                "credential-admission-request-invalid".into(),
+            ));
+        }
+    } else if request.claim.is_null()
+        || !request.requirement.is_null()
+        || !request.credential.is_null()
+    {
+        return Err((Status::BadRequest, "claim-and-presentation-required".into()));
+    }
     let policy_root = policy_v3_root::Entity::find_by_id(registration.policy_root_cid.clone())
         .one(&runtime.conn)
         .await
@@ -1122,13 +1163,6 @@ pub async fn mint(
     )?;
     let enforcer_did = fact(&enforcement_root.0.delegation, "enforcerDid")
         .ok_or((Status::Forbidden, "sibling-root-mismatch".into()))?;
-    // This runtime has exactly one signing key.  Do not mint an S0 whose
-    // protected enforcer fact names a different DID: that would make the
-    // authorization look policy-valid while its signature was produced by a
-    // different principal.
-    if enforcer_did != runtime.node_did {
-        return Err((Status::Forbidden, "enforcer-signing-key-mismatch".into()));
-    }
     runtime
         .authorize_roots(&registration, now)
         .await
@@ -1161,18 +1195,34 @@ pub async fn mint(
         recipient_did: &challenge.recipient_did,
         now,
     };
-    validate_claim_and_presentation(&request.claim, &request.presentation, &claim_context)?;
-
-    if request
-        .presentation
-        .get("holderDid")
-        .and_then(Value::as_str)
-        != Some(challenge.recipient_did.as_str())
-        || request.claim.get("holderDid").and_then(Value::as_str)
+    let requested = challenge
+        .requested_capabilities
+        .as_array()
+        .ok_or((Status::Forbidden, "requested-capabilities-invalid".into()))?;
+    let admission_v3 = if credential_admission {
+        Some(validate_credential_admission_v3(
+            &request.requirement,
+            &request.credential,
+            &request.presentation,
+            &registered_policy,
+            &claim_context,
+            runtime,
+            requested,
+        )?)
+    } else {
+        validate_claim_and_presentation(&request.claim, &request.presentation, &claim_context)?;
+        if request
+            .presentation
+            .get("holderDid")
+            .and_then(Value::as_str)
             != Some(challenge.recipient_did.as_str())
-    {
-        return Err((Status::Forbidden, "recipient-binding-invalid".into()));
-    }
+            || request.claim.get("holderDid").and_then(Value::as_str)
+                != Some(challenge.recipient_did.as_str())
+        {
+            return Err((Status::Forbidden, "recipient-binding-invalid".into()));
+        }
+        None
+    };
     // This is the in-process evaluator boundary. It returns an opaque value
     // consumed below; no caller-supplied Authorization or serialized decision
     // can construct the mint transition by itself.
@@ -1185,11 +1235,11 @@ pub async fn mint(
         node_did: &runtime.node_did,
         now,
     };
-    let allow = evaluate_current_allow(&request.claim, &request.presentation, &evaluation_context)?;
-    let requested = challenge
-        .requested_capabilities
-        .as_array()
-        .ok_or((Status::Forbidden, "requested-capabilities-invalid".into()))?;
+    let allow = evaluate_current_allow(
+        (!credential_admission).then_some(&request.claim),
+        &request.presentation,
+        &evaluation_context,
+    )?;
     validate_requested_policy_capabilities(
         requested,
         registered_policy
@@ -1197,22 +1247,45 @@ pub async fn mint(
             .and_then(Value::as_array)
             .ok_or((Status::Forbidden, "policy-registration-corrupt".into()))?,
     )?;
-    let claim_jti = request
-        .claim
-        .get("jti")
-        .and_then(Value::as_str)
-        .ok_or((Status::Forbidden, "claim-jti-missing".into()))?;
-    let claim_digest = digest_value(&request.claim);
-    let vp_bytes = decode_config(
-        request
-            .presentation
-            .get("vpBytesBase64")
-            .and_then(Value::as_str)
-            .ok_or((Status::Forbidden, "presentation-bytes-missing".into()))?,
-        URL_SAFE_NO_PAD,
-    )
-    .map_err(|_| (Status::Forbidden, "presentation-bytes-invalid".into()))?;
-    let vp_digest = hex::encode(Sha256::digest(vp_bytes));
+    let (claim_jti, claim_digest, vp_digest, credential_evidence_digest) =
+        if let Some(admission) = admission_v3.as_ref() {
+            (
+                admission.credential_id.as_str(),
+                admission.envelope_digest_hex.clone(),
+                admission.presentation_digest_hex.clone(),
+                hex::encode(
+                    decode_config(&admission.credential_digest, URL_SAFE_NO_PAD)
+                        .map_err(|_| (Status::Forbidden, "credential-digest-invalid".into()))?,
+                ),
+            )
+        } else {
+            let claim_jti = request
+                .claim
+                .get("jti")
+                .and_then(Value::as_str)
+                .ok_or((Status::Forbidden, "claim-jti-missing".into()))?;
+            let vp_bytes = decode_config(
+                request
+                    .presentation
+                    .get("vpBytesBase64")
+                    .and_then(Value::as_str)
+                    .ok_or((Status::Forbidden, "presentation-bytes-missing".into()))?,
+                URL_SAFE_NO_PAD,
+            )
+            .map_err(|_| (Status::Forbidden, "presentation-bytes-invalid".into()))?;
+            let evidence = request
+                .claim
+                .get("credentialEvidence")
+                .map(credential_evidence_digest)
+                .transpose()?
+                .ok_or((Status::Forbidden, "credential-evidence-missing".into()))?;
+            (
+                claim_jti,
+                digest_value(&request.claim),
+                hex::encode(Sha256::digest(vp_bytes)),
+                evidence,
+            )
+        };
     let mut facts = serde_json::Map::new();
     for key in [
         "ownerDid",
@@ -1227,19 +1300,18 @@ pub async fn mint(
             .ok_or((Status::Forbidden, "sibling-root-mismatch".into()))?;
         facts.insert(key.to_owned(), Value::String(value.to_owned()));
     }
-    let credential_evidence_digest = request
-        .claim
-        .get("credentialEvidence")
-        .map(credential_evidence_digest)
-        .transpose()?
-        .ok_or((Status::Forbidden, "credential-evidence-missing".into()))?;
     let decision_context_digest = allow._decision_context_digest_hex;
-    let issuance_audit_digest = digest_value(&serde_json::json!({
+    let mut issuance_audit = serde_json::json!({
         "challengeId": request.challenge_id,
         "claimDigestHex": claim_digest.clone(),
         "vpDigestHex": vp_digest.clone(),
         "decisionContextDigestHex": decision_context_digest.clone(),
-    }));
+    });
+    if let Some(admission) = admission_v3.as_ref() {
+        issuance_audit["credentialSpaceOwnerDid"] =
+            Value::String(admission.credential_space_owner_did.clone());
+    }
+    let issuance_audit_digest = digest_value(&issuance_audit);
     for (key, value) in [
         ("profile", POLICY_SESSION_PROFILE.to_owned()),
         ("policyCid", request.policy_cid.clone()),
@@ -1429,7 +1501,40 @@ pub async fn mint(
         recipient_did: &locked_challenge.recipient_did,
         now,
     };
-    validate_claim_and_presentation(&request.claim, &request.presentation, &locked_claim_context)?;
+    let locked_admission_v3 = if credential_admission {
+        Some(validate_credential_admission_v3(
+            &request.requirement,
+            &request.credential,
+            &request.presentation,
+            &locked_policy,
+            &locked_claim_context,
+            runtime,
+            locked_challenge
+                .requested_capabilities
+                .as_array()
+                .ok_or((Status::Forbidden, "requested-capabilities-invalid".into()))?,
+        )?)
+    } else {
+        validate_claim_and_presentation(
+            &request.claim,
+            &request.presentation,
+            &locked_claim_context,
+        )?;
+        None
+    };
+    if admission_v3
+        .as_ref()
+        .zip(locked_admission_v3.as_ref())
+        .is_some_and(|(before, after)| {
+            before.credential_id != after.credential_id
+                || before.credential_digest != after.credential_digest
+                || before.envelope_digest_hex != after.envelope_digest_hex
+                || before.presentation_digest_hex != after.presentation_digest_hex
+                || before.credential_space_owner_did != after.credential_space_owner_did
+        })
+    {
+        return Err((Status::Conflict, "credential-evaluation-changed".into()));
+    }
     validate_requested_policy_capabilities(
         locked_challenge
             .requested_capabilities
@@ -1441,7 +1546,7 @@ pub async fn mint(
             .ok_or((Status::Forbidden, "policy-registration-corrupt".into()))?,
     )?;
     let final_allow = evaluate_current_allow(
-        &request.claim,
+        (!credential_admission).then_some(&request.claim),
         &request.presentation,
         &CurrentAllowContext {
             challenge: &locked_challenge,
@@ -2761,7 +2866,7 @@ fn validate_policy_document(
     let object = policy
         .as_object()
         .ok_or((Status::BadRequest, "policy-invalid".into()))?;
-    const POLICY_KEYS: &[&str] = &[
+    const POLICY_V1_KEYS: &[&str] = &[
         "schema",
         "policyId",
         "ownerDid",
@@ -2771,14 +2876,35 @@ fn validate_policy_document(
         "capabilityCeiling",
         "signature",
     ];
+    const POLICY_V2_KEYS: &[&str] = &[
+        "schema",
+        "policyId",
+        "ownerDid",
+        "createdAt",
+        "expiresAt",
+        "contentSource",
+        "capabilityCeiling",
+        "credentialRequirement",
+        "signature",
+    ];
+    let schema = object
+        .get("schema")
+        .and_then(Value::as_str)
+        .ok_or((Status::BadRequest, "policy-invalid".into()))?;
+    let expected_keys = match schema {
+        POLICY_V1_SCHEMA => POLICY_V1_KEYS,
+        POLICY_V2_SCHEMA => POLICY_V2_KEYS,
+        _ => return Err((Status::BadRequest, "policy-schema-unsupported".into())),
+    };
     if object
         .keys()
-        .any(|key| !POLICY_KEYS.contains(&key.as_str()))
+        .any(|key| !expected_keys.contains(&key.as_str()))
+        || (schema == POLICY_V2_SCHEMA
+            && (object.len() < expected_keys.len() - 1 || object.len() > expected_keys.len()))
     {
         return Err((Status::BadRequest, "policy-unknown-field".into()));
     }
-    if object.get("schema").and_then(Value::as_str) != Some(POLICY_V1_SCHEMA)
-        || object.get("policyId").and_then(Value::as_str).is_none()
+    if object.get("policyId").and_then(Value::as_str).is_none()
         || object.get("ownerDid").and_then(Value::as_str).is_none()
         || object.get("createdAt").and_then(Value::as_str).is_none()
         || object
@@ -2792,6 +2918,13 @@ fn validate_policy_document(
         || object.get("signature").and_then(Value::as_object).is_none()
     {
         return Err((Status::BadRequest, "policy-invalid".into()));
+    }
+    if schema == POLICY_V2_SCHEMA {
+        validate_policy_credential_requirement(
+            object
+                .get("credentialRequirement")
+                .ok_or((Status::BadRequest, "credential-requirement-missing".into()))?,
+        )?;
     }
     let created_text = object.get("createdAt").and_then(Value::as_str).unwrap();
     let created =
@@ -2846,7 +2979,7 @@ fn validate_policy_document(
         .ok_or((Status::BadRequest, "policy-invalid".into()))?;
     unsigned_object.remove("policyId");
     unsigned_object.remove("signature");
-    let mut signing_bytes = POLICY_V1_SCHEMA.as_bytes().to_vec();
+    let mut signing_bytes = schema.as_bytes().to_vec();
     signing_bytes.extend_from_slice(b"\0");
     signing_bytes.extend_from_slice(&canonical_json_value(&unsigned));
     let digest = Sha256::digest(signing_bytes);
@@ -2866,7 +2999,7 @@ fn validate_policy_document(
             .ok_or((Status::BadRequest, "policy-invalid".into()))?;
         unsigned_object.remove("policyId");
         unsigned_object.remove("signature");
-        let mut preimage = POLICY_V1_SCHEMA.as_bytes().to_vec();
+        let mut preimage = schema.as_bytes().to_vec();
         preimage.push(0);
         preimage.extend_from_slice(&canonical_json_value(&unsigned_without_id));
         preimage
@@ -2876,6 +3009,80 @@ fn validate_policy_document(
         return Err((Status::Forbidden, "policy-id-mismatch".into()));
     }
     Ok(())
+}
+
+fn validate_policy_credential_requirement(
+    value: &Value,
+) -> Result<&serde_json::Map<String, Value>, (Status, String)> {
+    let object = value
+        .as_object()
+        .ok_or((Status::BadRequest, "credential-requirement-invalid".into()))?;
+    const KEYS: &[&str] = &[
+        "type",
+        "version",
+        "requirementDigest",
+        "descriptorDigest",
+        "issuerDid",
+        "issuerKid",
+        "profile",
+        "credentialType",
+    ];
+    if object.len() != KEYS.len()
+        || object.keys().any(|key| !KEYS.contains(&key.as_str()))
+        || object.get("type").and_then(Value::as_str) != Some(POLICY_CREDENTIAL_REQUIREMENT_V1)
+        || object.get("version").and_then(Value::as_u64) != Some(1)
+        || !object
+            .get("requirementDigest")
+            .and_then(Value::as_str)
+            .is_some_and(is_base64url_digest)
+        || !object
+            .get("descriptorDigest")
+            .and_then(Value::as_str)
+            .is_some_and(is_base64url_digest)
+        || object
+            .get("issuerDid")
+            .and_then(Value::as_str)
+            .is_none_or(|value| !value.starts_with("did:"))
+        || object
+            .get("issuerKid")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || !versioned_identifier(object.get("profile"))
+        || !versioned_identifier(object.get("credentialType"))
+    {
+        return Err((Status::BadRequest, "credential-requirement-invalid".into()));
+    }
+    Ok(object)
+}
+
+fn versioned_identifier(value: Option<&Value>) -> bool {
+    value.and_then(Value::as_object).is_some_and(|object| {
+        object.len() == 2
+            && object.get("version").and_then(Value::as_u64) == Some(1)
+            && object.get("id").and_then(Value::as_str).is_some_and(|id| {
+                id.len() <= 131
+                    && id
+                        .bytes()
+                        .next()
+                        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+                    && id.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || matches!(byte, b'.' | b'_' | b'-' | b'/')
+                    })
+            })
+    })
+}
+
+fn is_base64url_digest(value: &str) -> bool {
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn canonical_digest_base64url(value: &Value) -> String {
+    base64::encode_config(Sha256::digest(canonical_json_value(value)), URL_SAFE_NO_PAD)
 }
 
 fn decode_root(
@@ -3613,7 +3820,12 @@ fn policy_digest_hex(policy: &Value) -> Result<String, (Status, String)> {
         .ok_or((Status::BadRequest, "policy-invalid".into()))?;
     unsigned.remove("policyId");
     unsigned.remove("signature");
-    let mut preimage = POLICY_V1_SCHEMA.as_bytes().to_vec();
+    let schema = policy
+        .get("schema")
+        .and_then(Value::as_str)
+        .filter(|schema| matches!(*schema, POLICY_V1_SCHEMA | POLICY_V2_SCHEMA))
+        .ok_or((Status::BadRequest, "policy-schema-unsupported".into()))?;
+    let mut preimage = schema.as_bytes().to_vec();
     preimage.push(0);
     preimage.extend_from_slice(&canonical_json_value(&Value::Object(unsigned)));
     Ok(hex::encode(Sha256::digest(preimage)))
@@ -3891,6 +4103,550 @@ fn credential_evidence_digest(value: &Value) -> Result<String, (Status, String)>
     ))
 }
 
+struct CredentialAdmissionV3 {
+    credential_id: String,
+    credential_digest: String,
+    envelope_digest_hex: String,
+    presentation_digest_hex: String,
+    credential_space_owner_did: String,
+}
+
+fn validate_credential_admission_v3(
+    requirement: &Value,
+    credential: &Value,
+    presentation: &Value,
+    policy: &Value,
+    context: &ClaimPresentationContext<'_>,
+    runtime: &PolicyV3Runtime,
+    requested_capabilities: &[Value],
+) -> Result<CredentialAdmissionV3, (Status, String)> {
+    let projection = validate_policy_credential_requirement(
+        policy
+            .get("credentialRequirement")
+            .ok_or((Status::Forbidden, "credential-requirement-missing".into()))?,
+    )?;
+    validate_request_local_requirement(requirement, projection)?;
+    let issuer = runtime.credential_issuer.as_ref().ok_or((
+        Status::ServiceUnavailable,
+        "credential-issuer-unavailable".into(),
+    ))?;
+    let verified = verify_opencredentials_credential(
+        credential,
+        requirement,
+        projection,
+        issuer,
+        context.recipient_did,
+        context.now,
+    )?;
+    let presentation = presentation
+        .as_object()
+        .ok_or((Status::BadRequest, "presentation-invalid".into()))?;
+    const PRESENTATION_KEYS: &[&str] = &[
+        "schema",
+        "jti",
+        "challengeId",
+        "nonce",
+        "policyCid",
+        "nodeAudience",
+        "holderDid",
+        "subjectDid",
+        "credentialSpaceOwnerDid",
+        "credentialDigest",
+        "requirementDigest",
+        "descriptorDigest",
+        "requestedCapabilities",
+        "issuedAt",
+        "expiresAt",
+        "signature",
+    ];
+    if presentation.len() != PRESENTATION_KEYS.len()
+        || presentation
+            .keys()
+            .any(|key| !PRESENTATION_KEYS.contains(&key.as_str()))
+        || presentation.get("schema").and_then(Value::as_str)
+            != Some(CREDENTIAL_PRESENTATION_V3_SCHEMA)
+        || presentation
+            .get("jti")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || presentation.get("challengeId").and_then(Value::as_str) != Some(context.challenge_id)
+        || presentation.get("nonce").and_then(Value::as_str) != Some(context.nonce)
+        || presentation.get("policyCid").and_then(Value::as_str) != Some(context.policy_cid)
+        || presentation.get("nodeAudience").and_then(Value::as_str)
+            != Some(runtime.node_did.as_str())
+        || presentation.get("holderDid").and_then(Value::as_str) != Some(context.recipient_did)
+        || presentation.get("subjectDid").and_then(Value::as_str) != Some(context.recipient_did)
+        || presentation.get("credentialDigest").and_then(Value::as_str)
+            != Some(verified.credential_digest.as_str())
+        || presentation
+            .get("requirementDigest")
+            .and_then(Value::as_str)
+            != projection.get("requirementDigest").and_then(Value::as_str)
+        || presentation.get("descriptorDigest").and_then(Value::as_str)
+            != projection.get("descriptorDigest").and_then(Value::as_str)
+        || canonical_value_set(
+            presentation
+                .get("requestedCapabilities")
+                .and_then(Value::as_array)
+                .ok_or((
+                    Status::Forbidden,
+                    "presentation-capabilities-mismatch".into(),
+                ))?,
+        ) != canonical_value_set(requested_capabilities)
+    {
+        return Err((
+            Status::Forbidden,
+            "credential-presentation-binding-invalid".into(),
+        ));
+    }
+    let account_owner = presentation
+        .get("credentialSpaceOwnerDid")
+        .and_then(Value::as_str)
+        .ok_or((
+            Status::Forbidden,
+            "credential-space-owner-binding-invalid".into(),
+        ))?;
+    account_owner.parse::<DIDBuf>().map_err(|_| {
+        (
+            Status::Forbidden,
+            "credential-space-owner-binding-invalid".into(),
+        )
+    })?;
+    let signer = validate_v3_presentation_signature(presentation, context.recipient_did)?;
+    if signer != context.recipient_did {
+        return Err((Status::Forbidden, "presentation-signer-untrusted".into()));
+    }
+    validate_fresh_window(presentation, context.now, "presentation")?;
+    Ok(CredentialAdmissionV3 {
+        credential_id: verified.credential_id,
+        credential_digest: verified.credential_digest,
+        envelope_digest_hex: digest_value(credential),
+        presentation_digest_hex: hex::encode(Sha256::digest(canonical_json_value(&Value::Object(
+            presentation.clone(),
+        )))),
+        credential_space_owner_did: account_owner.to_owned(),
+    })
+}
+
+fn validate_request_local_requirement(
+    requirement: &Value,
+    projection: &serde_json::Map<String, Value>,
+) -> Result<(), (Status, String)> {
+    let object = requirement
+        .as_object()
+        .ok_or((Status::BadRequest, "credential-requirement-invalid".into()))?;
+    const REQUIRED_KEYS: &[&str] = &["type", "version", "profile", "credentialType", "claims"];
+    const ALLOWED_KEYS: &[&str] = &[
+        "type",
+        "version",
+        "profile",
+        "credentialType",
+        "claims",
+        "maxAgeSeconds",
+    ];
+    if object
+        .keys()
+        .any(|key| !ALLOWED_KEYS.contains(&key.as_str()))
+        || !REQUIRED_KEYS.iter().all(|key| object.contains_key(*key))
+        || object.get("type").and_then(Value::as_str) != Some("TinyCloudCredentialRequirement")
+        || object.get("version").and_then(Value::as_u64) != Some(1)
+        || !versioned_identifier(object.get("profile"))
+        || !versioned_identifier(object.get("credentialType"))
+        || object.get("profile") != projection.get("profile")
+        || object.get("credentialType") != projection.get("credentialType")
+        || object
+            .get("claims")
+            .and_then(Value::as_object)
+            .is_none_or(|claims| {
+                claims.is_empty()
+                    || claims.iter().any(|(name, value)| {
+                        name.is_empty()
+                            || name.len() > 128
+                            || value
+                                .as_str()
+                                .is_none_or(|value| value.is_empty() || value.len() > 4096)
+                    })
+            })
+        || object.get("maxAgeSeconds").is_some_and(|value| {
+            value
+                .as_u64()
+                .is_none_or(|seconds| seconds == 0 || seconds > i64::MAX as u64)
+        })
+        || projection.get("requirementDigest").and_then(Value::as_str)
+            != Some(canonical_digest_base64url(requirement).as_str())
+    {
+        return Err((
+            Status::Forbidden,
+            "credential-requirement-substituted".into(),
+        ));
+    }
+    Ok(())
+}
+
+struct VerifiedOpenCredential {
+    credential_id: String,
+    credential_digest: String,
+}
+
+fn verify_opencredentials_credential(
+    envelope: &Value,
+    requirement: &Value,
+    projection: &serde_json::Map<String, Value>,
+    trusted_issuer: &IssuerKey,
+    expected_holder: &str,
+    now: OffsetDateTime,
+) -> Result<VerifiedOpenCredential, (Status, String)> {
+    if !trusted_issuer.enabled || trusted_issuer.key_version == 0 {
+        return Err((Status::Forbidden, "credential-issuer-untrusted".into()));
+    }
+    let envelope = envelope
+        .as_object()
+        .ok_or((Status::BadRequest, "credential-envelope-invalid".into()))?;
+    const ENVELOPE_KEYS: &[&str] = &[
+        "type",
+        "version",
+        "protocol",
+        "profile",
+        "credentialType",
+        "schema",
+        "format",
+        "issuerDid",
+        "issuerKid",
+        "subjectDid",
+        "holderDid",
+        "claims",
+        "claimsDigest",
+        "descriptorDigest",
+        "credentialId",
+        "issuedAt",
+        "notBefore",
+        "expiresAt",
+        "status",
+        "credential",
+    ];
+    if envelope.len() != ENVELOPE_KEYS.len()
+        || envelope
+            .keys()
+            .any(|key| !ENVELOPE_KEYS.contains(&key.as_str()))
+        || envelope.get("type").and_then(Value::as_str) != Some("OpenCredentialsIssuedCredential")
+        || envelope.get("version").and_then(Value::as_u64) != Some(1)
+        || envelope.get("protocol").and_then(Value::as_str)
+            != Some("tinycloud.credentials/acquisition/v1")
+        || envelope.get("format").and_then(Value::as_str) != Some("vc+sd-jwt")
+        || envelope.get("profile") != projection.get("profile")
+        || envelope.get("credentialType") != projection.get("credentialType")
+        || envelope.get("schema").and_then(Value::as_str)
+            != projection
+                .get("credentialType")
+                .and_then(Value::as_object)
+                .and_then(|value| value.get("id"))
+                .and_then(Value::as_str)
+        || envelope.get("issuerDid").and_then(Value::as_str)
+            != projection.get("issuerDid").and_then(Value::as_str)
+        || envelope.get("issuerKid").and_then(Value::as_str)
+            != projection.get("issuerKid").and_then(Value::as_str)
+        || envelope.get("issuerDid").and_then(Value::as_str)
+            != Some(trusted_issuer.issuer_did.as_str())
+        || envelope.get("issuerKid").and_then(Value::as_str) != Some(trusted_issuer.kid.as_str())
+        || envelope.get("subjectDid").and_then(Value::as_str) != Some(expected_holder)
+        || envelope.get("holderDid").and_then(Value::as_str) != Some(expected_holder)
+        || envelope.get("descriptorDigest").and_then(Value::as_str)
+            != projection.get("descriptorDigest").and_then(Value::as_str)
+        || envelope
+            .get("status")
+            .and_then(Value::as_object)
+            .is_none_or(|status| {
+                status.len() != 2
+                    || status.get("method").and_then(Value::as_str) != Some("none")
+                    || status
+                        .get("freshnessSeconds")
+                        .and_then(Value::as_u64)
+                        .is_none_or(|seconds| seconds == 0)
+            })
+    {
+        return Err((Status::Forbidden, "credential-envelope-invalid".into()));
+    }
+    let credential = envelope
+        .get("credential")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 65_536)
+        .ok_or((Status::Forbidden, "credential-invalid".into()))?;
+    let mut sd_parts = credential.split('~');
+    let compact = sd_parts
+        .next()
+        .ok_or((Status::Forbidden, "credential-invalid".into()))?;
+    let disclosures = sd_parts.filter(|part| !part.is_empty()).collect::<Vec<_>>();
+    let jwt = compact.split('.').collect::<Vec<_>>();
+    if jwt.len() != 3 || jwt.iter().any(|part| part.is_empty()) {
+        return Err((Status::Forbidden, "credential-invalid".into()));
+    }
+    let header = decode_base64url_json(jwt[0])?;
+    let payload = decode_base64url_json(jwt[1])?;
+    if header.get("alg").and_then(Value::as_str) != Some("EdDSA")
+        || header
+            .get("typ")
+            .is_some_and(|value| value.as_str() != Some("vc+sd-jwt"))
+        || header
+            .get("kid")
+            .is_some_and(|value| value.as_str() != Some(trusted_issuer.kid.as_str()))
+    {
+        return Err((Status::Forbidden, "credential-signature-invalid".into()));
+    }
+    let signature = decode_base64url(jwt[2])?;
+    if signature.len() != 64 {
+        return Err((Status::Forbidden, "credential-signature-invalid".into()));
+    }
+    verify_issuer_signature(
+        &trusted_issuer.public_key,
+        format!("{}.{}", jwt[0], jwt[1]).as_bytes(),
+        &signature,
+    )?;
+    let mut disclosed = payload
+        .as_object()
+        .cloned()
+        .ok_or((Status::Forbidden, "credential-invalid".into()))?;
+    let signed_disclosures = disclosed
+        .get("_sd")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or((Status::Forbidden, "credential-invalid".into()))?;
+    if disclosed.get("_sd_alg").and_then(Value::as_str) != Some("sha-256")
+        || signed_disclosures.iter().any(|digest| {
+            digest
+                .as_str()
+                .is_none_or(|digest| !is_base64url_digest(digest))
+        })
+    {
+        return Err((Status::Forbidden, "credential-invalid".into()));
+    }
+    for disclosure in disclosures {
+        let digest = base64::encode_config(Sha256::digest(disclosure.as_bytes()), URL_SAFE_NO_PAD);
+        if !signed_disclosures
+            .iter()
+            .any(|candidate| candidate.as_str() == Some(digest.as_str()))
+        {
+            return Err((Status::Forbidden, "credential-disclosure-invalid".into()));
+        }
+        let item = decode_base64url_json_array(disclosure)?;
+        if item.len() != 3 || item[0].as_str().is_none() || item[1].as_str().is_none() {
+            return Err((Status::Forbidden, "credential-disclosure-invalid".into()));
+        }
+        let Some(name) = item[1].as_str() else {
+            return Err((Status::Forbidden, "credential-disclosure-invalid".into()));
+        };
+        if disclosed.insert(name.to_owned(), item[2].clone()).is_some() {
+            return Err((Status::Forbidden, "credential-disclosure-invalid".into()));
+        }
+    }
+    let binding = disclosed
+        .get("holderBinding")
+        .and_then(Value::as_object)
+        .ok_or((
+            Status::Forbidden,
+            "credential-holder-binding-invalid".into(),
+        ))?;
+    if disclosed.get("iss").and_then(Value::as_str) != Some(trusted_issuer.issuer_did.as_str())
+        || disclosed.get("sub").and_then(Value::as_str) != Some(expected_holder)
+        || disclosed.get("vct").and_then(Value::as_str) != Some(trusted_issuer.vct.as_str())
+        || disclosed.get("profile").and_then(Value::as_str)
+            != projection
+                .get("profile")
+                .and_then(Value::as_object)
+                .and_then(|value| value.get("id"))
+                .and_then(Value::as_str)
+        || disclosed.get("profileVersion").and_then(Value::as_u64) != Some(1)
+        || disclosed.get("descriptorDigest").and_then(Value::as_str)
+            != projection.get("descriptorDigest").and_then(Value::as_str)
+        || binding.len() != 2
+        || binding.get("did").and_then(Value::as_str) != Some(expected_holder)
+        || binding.get("signingDomain").and_then(Value::as_str)
+            != Some("tinycloud.credentials/holder-binding/v1")
+    {
+        return Err((
+            Status::Forbidden,
+            "credential-holder-binding-invalid".into(),
+        ));
+    }
+    let requirement_claims = requirement
+        .get("claims")
+        .and_then(Value::as_object)
+        .ok_or((Status::Forbidden, "credential-requirement-invalid".into()))?;
+    let envelope_claims = envelope
+        .get("claims")
+        .and_then(Value::as_object)
+        .ok_or((Status::Forbidden, "credential-claims-invalid".into()))?;
+    if requirement_claims.iter().any(|(name, expected)| {
+        disclosed.get(name) != Some(expected) || envelope_claims.get(name) != Some(expected)
+    }) || canonical_digest_base64url(&Value::Object(envelope_claims.clone()))
+        != envelope
+            .get("claimsDigest")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    {
+        return Err((
+            Status::Forbidden,
+            "credential-requirement-not-satisfied".into(),
+        ));
+    }
+    validate_credential_time(envelope, &disclosed, requirement, now)?;
+    let credential_id = disclosed
+        .get("jti")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or((Status::Forbidden, "credential-invalid".into()))?;
+    if envelope.get("credentialId").and_then(Value::as_str) != Some(credential_id) {
+        return Err((Status::Forbidden, "credential-invalid".into()));
+    }
+    Ok(VerifiedOpenCredential {
+        credential_id: credential_id.to_owned(),
+        credential_digest: base64::encode_config(
+            Sha256::digest(credential.as_bytes()),
+            URL_SAFE_NO_PAD,
+        ),
+    })
+}
+
+fn validate_v3_presentation_signature<'a>(
+    presentation: &'a serde_json::Map<String, Value>,
+    expected_holder: &str,
+) -> Result<&'a str, (Status, String)> {
+    let signature = presentation
+        .get("signature")
+        .and_then(Value::as_object)
+        .ok_or((Status::Forbidden, "presentation-signature-missing".into()))?;
+    let signer = signature
+        .get("signerDid")
+        .and_then(Value::as_str)
+        .ok_or((Status::Forbidden, "presentation-signature-invalid".into()))?;
+    if signature.len() != 3
+        || signature.get("suite").and_then(Value::as_str) != Some("Ed25519")
+        || signer != expected_holder
+    {
+        return Err((Status::Forbidden, "presentation-signer-untrusted".into()));
+    }
+    let bytes = decode_base64url(
+        signature
+            .get("value")
+            .and_then(Value::as_str)
+            .ok_or((Status::Forbidden, "presentation-signature-invalid".into()))?,
+    )?;
+    let mut unsigned = Value::Object(presentation.clone());
+    unsigned
+        .as_object_mut()
+        .ok_or((Status::Forbidden, "presentation-signature-invalid".into()))?
+        .remove("signature");
+    let mut preimage = CREDENTIAL_PRESENTATION_V3_DOMAIN.to_vec();
+    preimage.extend_from_slice(&canonical_json_value(&unsigned));
+    verify_detached_ed25519(signer, &Sha256::digest(preimage), &bytes)
+        .map_err(|_| (Status::Forbidden, "presentation-signature-invalid".into()))?;
+    Ok(signer)
+}
+
+fn validate_fresh_window(
+    object: &serde_json::Map<String, Value>,
+    now: OffsetDateTime,
+    label: &str,
+) -> Result<(), (Status, String)> {
+    let issued_text = object
+        .get("issuedAt")
+        .and_then(Value::as_str)
+        .ok_or((Status::Forbidden, format!("{label}-time-invalid")))?;
+    let expires_text = object
+        .get("expiresAt")
+        .and_then(Value::as_str)
+        .ok_or((Status::Forbidden, format!("{label}-time-invalid")))?;
+    let issued = parse_time(issued_text)
+        .map_err(|_| (Status::Forbidden, format!("{label}-time-invalid")))?;
+    let expires = parse_time(expires_text)
+        .map_err(|_| (Status::Forbidden, format!("{label}-time-invalid")))?;
+    if format_time(issued) != issued_text
+        || format_time(expires) != expires_text
+        || issued > now
+        || expires <= now
+        || expires - issued > Duration::seconds(300)
+    {
+        return Err((Status::Forbidden, format!("{label}-time-invalid")));
+    }
+    Ok(())
+}
+
+fn validate_credential_time(
+    envelope: &serde_json::Map<String, Value>,
+    disclosed: &serde_json::Map<String, Value>,
+    requirement: &Value,
+    now: OffsetDateTime,
+) -> Result<(), (Status, String)> {
+    let issued = parse_time(
+        envelope
+            .get("issuedAt")
+            .and_then(Value::as_str)
+            .ok_or((Status::Forbidden, "credential-time-invalid".into()))?,
+    )
+    .map_err(|_| (Status::Forbidden, "credential-time-invalid".into()))?;
+    let not_before = parse_time(
+        envelope
+            .get("notBefore")
+            .and_then(Value::as_str)
+            .ok_or((Status::Forbidden, "credential-time-invalid".into()))?,
+    )
+    .map_err(|_| (Status::Forbidden, "credential-time-invalid".into()))?;
+    let expires = parse_time(
+        envelope
+            .get("expiresAt")
+            .and_then(Value::as_str)
+            .ok_or((Status::Forbidden, "credential-time-invalid".into()))?,
+    )
+    .map_err(|_| (Status::Forbidden, "credential-time-invalid".into()))?;
+    if not_before > now
+        || expires <= now
+        || disclosed.get("iat").and_then(Value::as_i64) != Some(issued.unix_timestamp())
+        || disclosed.get("nbf").and_then(Value::as_i64) != Some(not_before.unix_timestamp())
+        || disclosed.get("exp").and_then(Value::as_i64) != Some(expires.unix_timestamp())
+        || requirement
+            .get("maxAgeSeconds")
+            .and_then(Value::as_i64)
+            .is_some_and(|max_age| now - issued > Duration::seconds(max_age))
+    {
+        return Err((Status::Forbidden, "credential-time-invalid".into()));
+    }
+    Ok(())
+}
+
+fn decode_base64url(value: &str) -> Result<Vec<u8>, (Status, String)> {
+    let bytes = decode_config(value, URL_SAFE_NO_PAD)
+        .map_err(|_| (Status::Forbidden, "credential-encoding-invalid".into()))?;
+    if base64::encode_config(&bytes, URL_SAFE_NO_PAD) != value {
+        return Err((Status::Forbidden, "credential-encoding-invalid".into()));
+    }
+    Ok(bytes)
+}
+
+fn decode_base64url_json(value: &str) -> Result<Value, (Status, String)> {
+    serde_json::from_slice(&decode_base64url(value)?)
+        .map_err(|_| (Status::Forbidden, "credential-json-invalid".into()))
+}
+
+fn decode_base64url_json_array(value: &str) -> Result<Vec<Value>, (Status, String)> {
+    decode_base64url_json(value)?
+        .as_array()
+        .cloned()
+        .ok_or((Status::Forbidden, "credential-json-invalid".into()))
+}
+
+fn verify_issuer_signature(
+    public_key: &[u8; 32],
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), (Status, String)> {
+    let key = JWK::from(Params::OKP(OctetParams {
+        curve: "Ed25519".to_owned(),
+        public_key: Base64urlUInt(public_key.to_vec()),
+        private_key: None,
+    }));
+    tinycloud_auth::ssi::claims::jws::verify_bytes(Algorithm::EdDSA, message, &key, signature)
+        .map_err(|_| (Status::Forbidden, "credential-signature-invalid".into()))
+}
+
 struct CurrentAllow {
     _decision_context_digest_hex: String,
     approved_capabilities: Vec<Value>,
@@ -3907,7 +4663,7 @@ struct CurrentAllowContext<'a> {
 }
 
 fn evaluate_current_allow(
-    claim: &Value,
+    legacy_claim: Option<&Value>,
     presentation: &Value,
     context: &CurrentAllowContext<'_>,
 ) -> Result<CurrentAllow, (Status, String)> {
@@ -3942,10 +4698,11 @@ fn evaluate_current_allow(
             return Err((Status::Forbidden, "policy-evaluator-denied".into()));
         }
     }
-    for (source, label) in [
-        (claim, "claim-capabilities-mismatch"),
-        (presentation, "presentation-capabilities-mismatch"),
-    ] {
+    let mut capability_sources = vec![(presentation, "presentation-capabilities-mismatch")];
+    if let Some(claim) = legacy_claim {
+        capability_sources.push((claim, "claim-capabilities-mismatch"));
+    }
+    for (source, label) in capability_sources {
         let supplied = source
             .get("requestedCapabilities")
             .and_then(Value::as_array)
@@ -3968,7 +4725,7 @@ fn evaluate_current_allow(
         "recipientDid": challenge.recipient_did,
         "challengeId": challenge.challenge_id,
         "nonceHashHex": challenge.nonce_hash_hex,
-        "claimDigestHex": digest_value(claim),
+        "claimDigestHex": legacy_claim.map(digest_value),
         "presentationDigestHex": digest_value(presentation),
         "evaluatedAt": format_time(*now),
     });
@@ -4072,6 +4829,248 @@ mod tests {
         altered["capabilityCeiling"] = json!(["tinycloud:read"]);
         let altered_bytes = canonical_json_value(&altered);
         assert!(validate_policy_document(&altered, &altered_bytes, &cid).is_err());
+    }
+
+    #[tokio::test]
+    async fn policy_v2_admits_independently_issued_holder_evidence_with_distinct_principals() {
+        let vector: Value = serde_json::from_str(include_str!(
+            "../test-fixtures/tc-470-policy-credential-requirement.json"
+        ))
+        .unwrap();
+        let requirement = vector["sdkRequirement"].clone();
+        let projection = vector["policyProjection"].clone();
+        assert_eq!(
+            canonical_digest_base64url(&requirement),
+            vector["requirementDigest"]
+        );
+
+        let owner_key = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
+        let issuer_key = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
+        let holder_key = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
+        let enforcer_key = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
+        let did = |key: &tinycloud_core::libp2p::identity::ed25519::Keypair| {
+            tinycloud_core::keys::public_key_to_did_key(
+                tinycloud_core::libp2p::identity::Keypair::from(key.clone()).public(),
+            )
+        };
+        let owner_did = did(&owner_key);
+        let holder_did = did(&holder_key);
+        let enforcer_did = did(&enforcer_key);
+        let node_secret = StaticSecret::new(vec![29; 32]).unwrap();
+        let node_did = node_secret.node_did();
+        let issuer_did = projection["issuerDid"].as_str().unwrap();
+        let account_owner_did = "did:pkh:eip155:1:0x1111111111111111111111111111111111111111";
+        let principals = [
+            owner_did.as_str(),
+            issuer_did,
+            holder_did.as_str(),
+            enforcer_did.as_str(),
+            node_did.as_str(),
+        ];
+        for (index, principal) in principals.iter().enumerate() {
+            assert!(!principals[..index].contains(principal));
+        }
+
+        let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
+        let issued = now - Duration::seconds(5);
+        let expires = now + Duration::seconds(600);
+        let requested = vec![json!({
+            "kind": "kv",
+            "resource": "tinycloud://applications/kv/shares/tc-470/document.txt",
+            "selector": "exact",
+            "actions": ["tinycloud.kv/get"]
+        })];
+        let content_source = json!({
+            "shareId": "share-tc-470",
+            "kvResource": "tinycloud://applications/kv/shares/tc-470/document.txt",
+            "selector": "exact",
+            "encryptionNetwork": format!("urn:tinycloud:encryption:{owner_did}:mainnet"),
+            "encryptedSymmetricKeyDigestHex": "aa".repeat(32),
+            "keyVersion": 1,
+            "mode": "immutable",
+            "initialCiphertextDigestHex": "bb".repeat(32)
+        });
+        let mut policy = json!({
+            "schema": POLICY_V2_SCHEMA,
+            "policyId": "pending",
+            "ownerDid": owner_did,
+            "createdAt": format_time(issued),
+            "expiresAt": format_time(expires),
+            "contentSource": content_source,
+            "capabilityCeiling": requested,
+            "credentialRequirement": projection,
+            "signature": {"suite": "Ed25519", "signerDid": owner_did, "value": ""}
+        });
+        let mut policy_unsigned = policy.clone();
+        policy_unsigned.as_object_mut().unwrap().remove("policyId");
+        policy_unsigned.as_object_mut().unwrap().remove("signature");
+        let mut policy_preimage = POLICY_V2_SCHEMA.as_bytes().to_vec();
+        policy_preimage.push(0);
+        policy_preimage.extend_from_slice(&canonical_json_value(&policy_unsigned));
+        policy["policyId"] = json!(format!(
+            "pol_{}",
+            base32_lower(&Sha256::digest(&policy_preimage))
+        ));
+        policy["signature"]["value"] = json!(encode_config(
+            owner_key.sign(&Sha256::digest(policy_preimage)),
+            URL_SAFE_NO_PAD
+        ));
+        let policy_bytes = canonical_json_value(&policy);
+        let policy_cid = tinycloud_auth::ipld_core::cid::Cid::new_v1(
+            0x55,
+            tinycloud_auth::multihash_codetable::Code::Sha2_256.digest(&policy_bytes),
+        )
+        .to_string();
+        validate_policy_document(&policy, &policy_bytes, &policy_cid).unwrap();
+
+        let disclosure = encode_config(
+            canonical_json_value(&json!(["salt-tc-470", "email", "alice@example.test"])),
+            URL_SAFE_NO_PAD,
+        );
+        let payload = json!({
+            "iss": issuer_did,
+            "sub": holder_did,
+            "iat": issued.unix_timestamp(),
+            "nbf": issued.unix_timestamp(),
+            "exp": expires.unix_timestamp(),
+            "jti": "credential-tc-470",
+            "vct": "opencredentials.email/v1",
+            "profile": "tinycloud.email-proof/v1",
+            "profileVersion": 1,
+            "descriptorDigest": vector["policyProjection"]["descriptorDigest"],
+            "holderBinding": {
+                "did": holder_did,
+                "signingDomain": "tinycloud.credentials/holder-binding/v1"
+            },
+            "_sd_alg": "sha-256",
+            "_sd": [encode_config(Sha256::digest(disclosure.as_bytes()), URL_SAFE_NO_PAD)]
+        });
+        let header = json!({
+            "alg": "EdDSA",
+            "typ": "vc+sd-jwt",
+            "kid": vector["policyProjection"]["issuerKid"]
+        });
+        let encoded_header = encode_config(canonical_json_value(&header), URL_SAFE_NO_PAD);
+        let encoded_payload = encode_config(canonical_json_value(&payload), URL_SAFE_NO_PAD);
+        let signing_input = format!("{encoded_header}.{encoded_payload}");
+        let compact = format!(
+            "{signing_input}.{}~{disclosure}",
+            encode_config(issuer_key.sign(signing_input.as_bytes()), URL_SAFE_NO_PAD)
+        );
+        let claims = json!({"email": "alice@example.test"});
+        let credential = json!({
+            "type": "OpenCredentialsIssuedCredential",
+            "version": 1,
+            "protocol": "tinycloud.credentials/acquisition/v1",
+            "profile": {"id": "tinycloud.email-proof/v1", "version": 1},
+            "credentialType": {"id": "opencredentials.email/v1", "version": 1},
+            "schema": "opencredentials.email/v1",
+            "format": "vc+sd-jwt",
+            "issuerDid": issuer_did,
+            "issuerKid": vector["policyProjection"]["issuerKid"],
+            "subjectDid": holder_did,
+            "holderDid": holder_did,
+            "claims": claims,
+            "claimsDigest": canonical_digest_base64url(&claims),
+            "descriptorDigest": vector["policyProjection"]["descriptorDigest"],
+            "credentialId": "credential-tc-470",
+            "issuedAt": format_time(issued),
+            "notBefore": format_time(issued),
+            "expiresAt": format_time(expires),
+            "status": {"method": "none", "freshnessSeconds": 300},
+            "credential": compact
+        });
+        let credential_digest = encode_config(
+            Sha256::digest(credential["credential"].as_str().unwrap().as_bytes()),
+            URL_SAFE_NO_PAD,
+        );
+        let challenge_id = "challenge-tc-470";
+        let nonce = "nonce-tc-470";
+        let mut presentation = json!({
+            "schema": CREDENTIAL_PRESENTATION_V3_SCHEMA,
+            "jti": "presentation-tc-470",
+            "challengeId": challenge_id,
+            "nonce": nonce,
+            "policyCid": policy_cid,
+            "nodeAudience": node_did,
+            "holderDid": holder_did,
+            "subjectDid": holder_did,
+            "credentialSpaceOwnerDid": account_owner_did,
+            "credentialDigest": credential_digest,
+            "requirementDigest": vector["requirementDigest"],
+            "descriptorDigest": vector["policyProjection"]["descriptorDigest"],
+            "requestedCapabilities": requested,
+            "issuedAt": format_time(now),
+            "expiresAt": format_time(now + Duration::seconds(60)),
+            "signature": {"suite": "Ed25519", "signerDid": holder_did, "value": ""}
+        });
+        let mut unsigned_presentation = presentation.clone();
+        unsigned_presentation
+            .as_object_mut()
+            .unwrap()
+            .remove("signature");
+        let mut presentation_preimage = CREDENTIAL_PRESENTATION_V3_DOMAIN.to_vec();
+        presentation_preimage.extend_from_slice(&canonical_json_value(&unsigned_presentation));
+        presentation["signature"]["value"] = json!(encode_config(
+            holder_key.sign(&Sha256::digest(presentation_preimage)),
+            URL_SAFE_NO_PAD
+        ));
+
+        let issuer = IssuerKey::new(
+            issuer_did,
+            "opencredentials.email/v1",
+            1,
+            vector["policyProjection"]["issuerKid"].as_str().unwrap(),
+            issuer_key.public().to_bytes(),
+        );
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let runtime =
+            PolicyV3Runtime::new(db, node_did, node_secret).with_credential_issuer(issuer);
+        let admission = validate_credential_admission_v3(
+            &requirement,
+            &credential,
+            &presentation,
+            &policy,
+            &ClaimPresentationContext {
+                challenge_id,
+                nonce,
+                policy_cid: presentation["policyCid"].as_str().unwrap(),
+                owner_did: policy["ownerDid"].as_str().unwrap(),
+                recipient_did: holder_did.as_str(),
+                now,
+            },
+            &runtime,
+            presentation["requestedCapabilities"].as_array().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(admission.credential_id, "credential-tc-470");
+        assert_eq!(admission.credential_space_owner_did, account_owner_did);
+
+        let binding_material =
+            json!({"enforcerDid": enforcer_did, "nodeAudience": runtime.node_did});
+        let mut binding = json!({
+            "schema": ATTESTED_ENFORCER_V2_SCHEMA,
+            "enforcerDid": enforcer_did,
+            "nodeAudience": runtime.node_did,
+            "attestationBindingDigestHex": hex::encode(Sha256::digest(canonical_json_value(&binding_material))),
+            "issuedAt": format_time(now),
+            "expiresAt": format_time(now + Duration::seconds(60))
+        });
+        let mut binding_preimage = b"xyz.tinycloud.policy/AttestedEnforcerBinding/v2\0".to_vec();
+        binding_preimage.extend_from_slice(&canonical_json_value(&binding));
+        binding["signature"] = json!({
+            "suite": "Ed25519",
+            "signerDid": runtime.node_did,
+            "value": encode_config(runtime.signer.node_keypair().sign(&Sha256::digest(binding_preimage)).unwrap(), URL_SAFE_NO_PAD)
+        });
+        validate_attested_enforcer_binding(
+            &binding,
+            enforcer_did.as_str(),
+            runtime.node_did.as_str(),
+            now + Duration::seconds(60),
+            now,
+        )
+        .unwrap();
     }
 
     #[test]
