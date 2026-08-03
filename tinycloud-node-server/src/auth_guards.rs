@@ -246,6 +246,7 @@ where
                 .header(ContentType::new("application", "vnd.apache.arrow.stream"))
                 .sized_body(data.len(), std::io::Cursor::new(data))
                 .ok(),
+            InvocationOutcome::EncryptionDecrypt(response) => Json(response).respond_to(request),
         }
     }
 }

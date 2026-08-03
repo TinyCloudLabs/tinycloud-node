@@ -7,7 +7,11 @@ use tinycloud_core::sea_orm::{
     sea_query::OnConflict, ActiveValue::Set, ColumnTrait, Condition, DatabaseConnection,
     EntityTrait, QueryFilter,
 };
-use tinycloud_core::{events::Invocation, hash::Hash, AdmittedInvocation};
+use tinycloud_core::{
+    events::Invocation,
+    hash::{hash, Hash},
+    AdmittedInvocation,
+};
 
 const CLOCK_SKEW_SECONDS: i64 = 60;
 
@@ -29,6 +33,8 @@ pub enum InvocationReplayError {
     Duplicate,
     #[error("invocation replay storage unavailable")]
     Database,
+    #[error("policy-session invocation is missing a nonce")]
+    MissingNonce,
 }
 
 #[derive(Clone)]
@@ -68,6 +74,30 @@ impl InvocationReplayCache {
             start.elapsed(),
         );
         result
+    }
+
+    /// Reserve the shared replay identity for policy-session data.  Native KV
+    /// and decrypt invocations intentionally use the same invoker+nonce key;
+    /// the signed body remains independently verified by the service.
+    pub async fn check_and_insert_invoker_nonce(
+        &self,
+        invocation: &Invocation,
+        max_lifetime_secs: u64,
+    ) -> Result<(), InvocationReplayError> {
+        let nonce = invocation
+            .0
+            .invocation
+            .payload()
+            .nonce
+            .as_ref()
+            .ok_or(InvocationReplayError::MissingNonce)?;
+        let key = invoker_nonce_key(&invocation.0.invoker, nonce);
+        let now = OffsetDateTime::now_utc();
+        self.check_and_insert_key(
+            key,
+            invocation_expires_at(invocation, now, max_lifetime_secs),
+        )
+        .await
     }
 
     async fn check_and_insert_key(
@@ -130,11 +160,20 @@ impl InvocationReplayCache {
     }
 }
 
+fn invoker_nonce_key(invoker: &str, nonce: &str) -> Hash {
+    let mut preimage = b"xyz.tinycloud/invocation-replay/v1\0".to_vec();
+    preimage.extend_from_slice(invoker.as_bytes());
+    preimage.push(0);
+    preimage.extend_from_slice(nonce.as_bytes());
+    hash(&preimage)
+}
+
 impl From<InvocationReplayError> for (Status, String) {
     fn from(err: InvocationReplayError) -> Self {
         match err {
             InvocationReplayError::Duplicate => (Status::Conflict, err.to_string()),
             InvocationReplayError::Database => (Status::InternalServerError, err.to_string()),
+            InvocationReplayError::MissingNonce => (Status::Unauthorized, err.to_string()),
         }
     }
 }
@@ -298,6 +337,15 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn altered_body_cannot_change_invoker_nonce_replay_identity() {
+        let first = invoker_nonce_key("did:key:z6MkInvoker", "nonce-405");
+        let altered_body = invoker_nonce_key("did:key:z6MkInvoker", "nonce-405");
+        assert_eq!(first, altered_body);
+        assert_ne!(first, invoker_nonce_key("did:key:z6MkInvoker", "nonce-406"));
+        assert_ne!(first, invoker_nonce_key("did:key:z6MkOther", "nonce-405"));
     }
 
     #[tokio::test]

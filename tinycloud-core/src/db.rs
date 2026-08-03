@@ -1,6 +1,8 @@
 use crate::admission::AdmittedInvocation;
 use crate::encryption::ColumnEncryption;
-use crate::events::{epoch_hash, Delegation, Event, HashError, Invocation, Operation, Revocation};
+use crate::events::{
+    epoch_hash, Delegation, Event, HashError, Invocation, Operation, Revocation, SerializedEvent,
+};
 use crate::hash::Hash;
 use crate::keys::{get_did_key, Secrets, StaticSecret};
 use crate::migrations::Migrator;
@@ -287,6 +289,14 @@ impl<C, B> SpaceDatabase<C, B, StaticSecret> {
     }
 }
 
+impl<C, B, K> SpaceDatabase<C, B, K> {
+    /// Exposes the node's capability database for projections that are
+    /// committed alongside ordinary delegation/revocation writes.
+    pub fn connection(&self) -> &C {
+        &self.conn
+    }
+}
+
 impl<C, B, K> SpaceDatabase<C, B, K>
 where
     C: TransactionTrait,
@@ -303,6 +313,47 @@ impl<C, B, K> SpaceDatabase<C, B, K>
 where
     C: ConnectionTrait,
 {
+    /// Run the ordinary invocation authorization kernel without recording an
+    /// invocation or performing a data-plane operation.  Specialized routes
+    /// (notably encryption decrypt) must call this before dispatch so they
+    /// cannot authorize from asserted capabilities alone.
+    pub async fn authorize_invocation(
+        &self,
+        invocation: &crate::util::InvocationInfo,
+        now: OffsetDateTime,
+    ) -> Result<(), crate::models::invocation::Error> {
+        invocation::verify_and_authorize(&self.conn, invocation, now).await
+    }
+
+    /// Load and reparse a delegation from its exact signed Authorization
+    /// bytes. The relational row is returned only so callers can compare all
+    /// projections against the signed source of truth.
+    pub async fn load_signed_delegation(
+        &self,
+        cid: tinycloud_auth::ipld_core::cid::Cid,
+    ) -> Result<Option<(delegation::Model, Delegation)>, String> {
+        let Some(row) = delegation::Entity::find_by_id(Hash::from(cid))
+            .one(&self.conn)
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        let bytes = crate::encryption::maybe_decrypt(self.encryption.as_ref(), &row.serialization)
+            .map_err(|error| error.to_string())?;
+        let encoded = std::str::from_utf8(&bytes).map_err(|error| error.to_string())?;
+        let event =
+            SerializedEvent::<DelegationInfo>::from_header_ser::<TinyCloudDelegation>(encoded)
+                .map_err(|error| error.to_string())?;
+        if event.serialized_bytes() != bytes.as_slice()
+            || event.content_hash() != row.id
+            || event.content_hash() != Hash::from(cid)
+        {
+            return Err("delegation-signed-bytes-mismatch".to_string());
+        }
+        Ok(Some((row, event)))
+    }
+
     /// List every space id known to this node (the full `space` table).
     /// Used by the admin usage endpoint to enumerate spaces without touching
     /// SQL directly.
@@ -1290,6 +1341,45 @@ where
         }
     }
 
+    /// Atomically register control-plane roots in the ordinary delegation
+    /// graph.  The policy v3 tables remain indexes; the graph rows are needed
+    /// so an S0 can be admitted through the same proof resolver as every
+    /// other delegation.
+    pub async fn delegate_batch(
+        &self,
+        delegations: Vec<Delegation>,
+    ) -> Result<TransactResult, TxError<B, K>> {
+        self.transact(
+            delegations
+                .into_iter()
+                .map(|delegation| Event::Delegation(Box::new(delegation)))
+                .collect(),
+        )
+        .await
+    }
+
+    /// Register a control-plane delegation batch inside a caller-owned SQL
+    /// transaction. This is used when the ordinary graph rows and their
+    /// signed-byte projection indexes must commit or roll back together.
+    pub async fn delegate_batch_in_transaction(
+        &self,
+        tx: &DatabaseTransaction,
+        delegations: Vec<Delegation>,
+    ) -> Result<TransactResult, TxError<B, K>> {
+        transact(
+            tx,
+            &self.storage,
+            &self.secrets,
+            delegations
+                .into_iter()
+                .map(|delegation| Event::Delegation(Box::new(delegation)))
+                .collect(),
+            self.encryption.as_ref(),
+            None,
+        )
+        .await
+    }
+
     pub async fn revoke(&self, revocation: Revocation) -> Result<TransactResult, TxError<B, K>> {
         let mut roots = vec![Hash::from(revocation.0.revoked)];
         roots.extend(revocation.0.parents.iter().copied().map(Hash::from));
@@ -2247,6 +2337,7 @@ pub enum InvocationOutcome<R> {
     DuckDbResult(serde_json::Value),
     DuckDbExport(Vec<u8>),
     DuckDbArrow(Vec<u8>),
+    EncryptionDecrypt(crate::encryption_network::DecryptResponseBody),
 }
 
 #[derive(Debug)]

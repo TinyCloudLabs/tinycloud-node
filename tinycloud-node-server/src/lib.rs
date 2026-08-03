@@ -22,12 +22,27 @@ pub mod hooks;
 pub mod invocation_replay;
 pub mod link;
 pub mod node_control;
+pub mod policy_v3;
 pub mod prometheus;
 pub mod quota;
 pub mod routes;
 pub mod runtime;
 pub mod share_email;
+#[cfg(tinycloud_legacy_share_v2)]
 pub mod share_v2;
+#[cfg(not(tinycloud_legacy_share_v2))]
+pub mod share_v2 {
+    #[derive(serde::Serialize)]
+    pub struct CapabilityDescriptor {}
+
+    pub struct ShareV2Runtime;
+
+    impl ShareV2Runtime {
+        pub fn capability(&self) -> Option<CapabilityDescriptor> {
+            None
+        }
+    }
+}
 pub mod signed_urls;
 pub mod storage;
 pub mod tee;
@@ -78,6 +93,12 @@ use config::{BlockStorage, Config, Keys, StagingStorage};
 use hooks::HookRuntime;
 use invocation_replay::InvocationReplayCache;
 use node_control::control::ControlPlaneHandle;
+use policy_v3::{
+    challenge as policy_v3_challenge, get_status as get_policy_v3_status,
+    issue_enforcer_binding as policy_v3_enforcer_binding, mint as policy_v3_mint,
+    register_policy as register_policy_v3, revoke_root as revoke_policy_v3_root,
+    status as policy_v3_status, PolicyV3Runtime,
+};
 use quota::QuotaCache;
 #[cfg(feature = "tc-bench-v1")]
 use routes::tc_bench::{
@@ -224,6 +245,13 @@ pub async fn app_with_control(
 
     tracing::tracing_try_init(&tinycloud_config.log)?;
 
+    #[cfg(tinycloud_legacy_share_v2)]
+    let legacy_share_v2_enabled = time::OffsetDateTime::now_utc()
+        <= time::OffsetDateTime::parse(
+            policy_v3::LAST_V2_READ_AT,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("valid legacy share cutoff");
     let mut routes = rocket::routes![
         healthcheck,
         cors,
@@ -258,9 +286,19 @@ pub async fn app_with_control(
         encryption_well_known,
         encryption_decrypt,
         revoke_encryption_network,
+        register_policy_v3,
+        get_policy_v3_status,
+        policy_v3_enforcer_binding,
+        policy_v3_challenge,
+        policy_v3_mint,
+        policy_v3_status,
+        revoke_policy_v3_root,
     ];
     routes.extend(share_email::public_routes());
-    routes.extend(share_v2::public_routes());
+    #[cfg(tinycloud_legacy_share_v2)]
+    if legacy_share_v2_enabled {
+        routes.extend(share_v2::public_routes());
+    }
     #[cfg(feature = "tc-bench-v1")]
     routes.extend(rocket::routes![
         tc_bench_auth_verify,
@@ -415,15 +453,17 @@ pub async fn app_with_control(
         Arc::new(tinycloud.clone()),
         Arc::new(sql_service.clone()),
     )?;
-    #[cfg(feature = "dstack")]
+    #[cfg(all(tinycloud_legacy_share_v2, feature = "dstack"))]
     let dstack_tee_key_derived = matches!(tinycloud_config.keys, config::Keys::Dstack)
         || matches!(tinycloud_config.keys, config::Keys::Auto) && dstack::is_available();
-    #[cfg(not(feature = "dstack"))]
+    #[cfg(all(tinycloud_legacy_share_v2, not(feature = "dstack")))]
     let dstack_tee_key_derived = false;
     // `local-tee` always derives its TeeContext from real node key material
     // (see `TeeContext::derive_local`), so it is a derived identity too.
+    #[cfg(tinycloud_legacy_share_v2)]
     let tee_key_derived = dstack_tee_key_derived || cfg!(feature = "local-tee");
-    let share_v2_runtime = if tinycloud_config.share_email.enabled {
+    #[cfg(tinycloud_legacy_share_v2)]
+    let share_v2_runtime = if legacy_share_v2_enabled && tinycloud_config.share_email.enabled {
         Some(
             share_v2::compose(
                 seed_conn.clone(),
@@ -438,6 +478,8 @@ pub async fn app_with_control(
     } else {
         None
     };
+    #[cfg(not(tinycloud_legacy_share_v2))]
+    let share_v2_runtime: Option<share_v2::ShareV2Runtime> = None;
     if let Some(runtime) = share_email_runtime.as_ref() {
         if !runtime.bridge.self_check().await {
             anyhow::bail!(
@@ -554,6 +596,12 @@ pub async fn app_with_control(
         .manage(share_v2_runtime)
         .manage(tee_context)
         .manage(encryption_service)
+        .manage(PolicyV3Runtime::new(
+            seed_conn.clone(),
+            key_setup.node_did(),
+            key_setup.clone(),
+        ))
+        .manage(seed_conn.clone())
         .manage(tinycloud_config.storage.staging.open().await?);
 
     // TC-287: opt-in retention sweeper. Mirrors the invocation-replay cleanup
@@ -656,9 +704,7 @@ pub async fn app_with_control(
     if tinycloud_config.cors {
         Ok(rocket.attach(AdHoc::on_response("CORS", |request, resp| {
             Box::pin(async move {
-                if request.uri().path().starts_with("/share/v1/")
-                    || request.uri().path().starts_with("/share/v2/")
-                {
+                if is_mounted_share_path(request.uri().path().as_str()) {
                     return;
                 }
                 resp.set_header(Header::new("Access-Control-Allow-Origin", "*"));
@@ -689,9 +735,7 @@ fn share_security_fairing(share_allowed_origin: String) -> AdHoc {
     AdHoc::on_response("share-email-security-headers", move |request, response| {
         let share_allowed_origin = share_allowed_origin.clone();
         Box::pin(async move {
-            if request.uri().path().starts_with("/share/v1/")
-                || request.uri().path().starts_with("/share/v2/")
-            {
+            if is_mounted_share_path(request.uri().path().as_str()) {
                 response.set_header(Header::new("Cache-Control", "no-store"));
                 response.set_header(Header::new("X-Content-Type-Options", "nosniff"));
                 response.set_header(Header::new("Referrer-Policy", "no-referrer"));
@@ -707,6 +751,17 @@ fn share_security_fairing(share_allowed_origin: String) -> AdHoc {
             }
         })
     })
+}
+
+fn is_mounted_share_path(path: &str) -> bool {
+    if path.starts_with("/share/v1/") || path.starts_with("/share/v3/") {
+        return true;
+    }
+    #[cfg(tinycloud_legacy_share_v2)]
+    if path.starts_with("/share/v2/") {
+        return true;
+    }
+    false
 }
 
 /// One telemetry sample tick: update the DB pool gauges, probe pool-acquire
