@@ -119,7 +119,7 @@ impl QuotaCache {
                     fetched_at.elapsed(),
                     last_failure.map(|failure| failure.elapsed()),
                 ) {
-                    self.spawn_refresh(key);
+                    self.spawn_refresh(key).await;
                 }
                 Some(ByteUnit::Byte(limit))
             }
@@ -129,7 +129,7 @@ impl QuotaCache {
                 ..
             }) => {
                 if fetched_at.elapsed() >= FAILURE_BACKOFF {
-                    self.spawn_refresh(key);
+                    self.spawn_refresh(key).await;
                 }
                 self.default_limit
             }
@@ -150,19 +150,19 @@ impl QuotaCache {
 
     /// Refresh a space's remote entry in the background, deduplicating
     /// concurrent refreshes for the same space.
-    fn spawn_refresh(&self, key: String) {
+    async fn spawn_refresh(&self, key: String) {
         let (Some(client), Some(url)) = (self.client.clone(), self.quota_url.clone()) else {
             return;
         };
+        {
+            let mut guard = self.inflight.write().await;
+            if !guard.insert(key.clone()) {
+                return; // refresh already in flight
+            }
+        }
         let remote = self.remote.clone();
         let inflight = self.inflight.clone();
         tokio::spawn(async move {
-            {
-                let mut guard = inflight.write().await;
-                if !guard.insert(key.clone()) {
-                    return; // refresh already in flight
-                }
-            }
             let fetched = fetch_remote(&client, &url, &key).await;
             record_fetch(&remote, &key, fetched).await;
             inflight.write().await.remove(&key);
@@ -321,6 +321,10 @@ async fn record_fetch(
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use tokio::io::AsyncWriteExt;
 
     fn space(n: u8) -> SpaceId {
@@ -413,6 +417,70 @@ mod test {
                 .await
                 .is_err(),
             "a recent failed refresh must suppress another background fetch",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_stale_refresh_spawns_only_one_background_fetch() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local listener");
+        let quota_url = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address")
+        );
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let server_accepted = accepted.clone();
+        let server = tokio::spawn(async move {
+            let deadline = tokio::time::sleep(Duration::from_millis(250));
+            tokio::pin!(deadline);
+            loop {
+                tokio::select! {
+                    _ = &mut deadline => break,
+                    result = listener.accept() => {
+                        let Ok((mut stream, _)) = result else {
+                            break;
+                        };
+                        server_accepted.fetch_add(1, Ordering::SeqCst);
+                        let body = r#"{"storage_limit_bytes":500}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        tokio::spawn(async move {
+                            let _ = stream.write_all(response.as_bytes()).await;
+                            let _ = stream.shutdown().await;
+                        });
+                    }
+                }
+            }
+        });
+
+        let cache = QuotaCache::new(Some(ByteUnit::Byte(100)), Some(quota_url));
+        let sid = space(1);
+        let key = sid.to_string();
+        cache.seed_remote(&key, Some(500), true).await;
+
+        let attempts = futures::future::join_all((0..8).map(|_| {
+            let cache = &cache;
+            let sid = sid.clone();
+            async move { cache.get_limit(&sid).await }
+        }))
+        .await;
+
+        assert!(
+            attempts
+                .into_iter()
+                .all(|result| result == Some(ByteUnit::Byte(500))),
+            "stale cached reads must still serve the last known limit",
+        );
+
+        server.await.expect("quota server task");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "only one refresh request should be in flight for a stale key",
         );
     }
 
