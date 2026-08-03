@@ -3227,6 +3227,8 @@ mod tests {
         ssi::{dids::DIDBuf, jwk::JWK},
     };
     use tinycloud_core::{
+        encryption::ColumnEncryption,
+        encryption_network::LocalOneOfOneBackend,
         keys::StaticSecret,
         models::{hook_delivery, hook_subscription},
         sea_orm::{ColumnTrait, ConnectOptions, Database, EntityTrait, QueryFilter, QueryOrder},
@@ -3235,6 +3237,25 @@ mod tests {
         types::{Ability, Resource},
     };
     use tokio::time::{timeout, Duration};
+
+    fn manage_tc405_test_state(
+        rocket: rocket::Rocket<rocket::Build>,
+        conn: tinycloud_core::sea_orm::DatabaseConnection,
+    ) -> rocket::Rocket<rocket::Build> {
+        let secret = StaticSecret::new(vec![7; 32]).expect("valid test secret");
+        let node_did = secret.node_did();
+        let backend = std::sync::Arc::new(LocalOneOfOneBackend::new(ColumnEncryption::new(
+            secret.derive_key(b"tinycloud/encryption/network-seal"),
+        )));
+        let encryption =
+            EncryptionService::new_with_node_keypair(conn.clone(), secret.node_keypair(), backend);
+
+        rocket
+            .manage(crate::policy_v3::PolicyV3Runtime::new(
+                conn, node_did, secret,
+            ))
+            .manage(encryption)
+    }
 
     #[derive(Debug)]
     struct TestDatabaseError {
@@ -4351,6 +4372,7 @@ mod tests {
             .manage(InvocationReplayCache::new(conn.clone()))
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
+        let rocket = manage_tc405_test_state(rocket, conn.clone());
 
         let client = Client::tracked(rocket).await?;
         let response = client
@@ -4604,6 +4626,7 @@ mod tests {
             .manage(InvocationReplayCache::new(conn.clone()))
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
+        let rocket = manage_tc405_test_state(rocket, conn.clone());
 
         let client = Client::tracked(rocket).await?;
         let response = client
@@ -6004,7 +6027,8 @@ mod tests {
         setup: MeteredSqlHttp,
         limit: rocket::data::ByteUnit,
     ) -> rocket::Rocket<rocket::Build> {
-        rocket::build()
+        let conn = setup.replay_db.clone();
+        let rocket = rocket::build()
             .mount("/", rocket::routes![invoke])
             .attach(crate::tracing::TracingFairing::new(
                 &Config::default().log.tracing,
@@ -6015,7 +6039,8 @@ mod tests {
             .manage(QuotaCache::new(Some(limit), None))
             .manage(InvocationReplayCache::new(setup.replay_db))
             .manage(HookRuntime::new(HooksConfig::default(), [9u8; 32]))
-            .manage(BlockStage::from(crate::config::StagingStorage::Memory))
+            .manage(BlockStage::from(crate::config::StagingStorage::Memory));
+        manage_tc405_test_state(rocket, conn)
     }
 
     #[tokio::test]
@@ -6384,6 +6409,7 @@ mod tests {
             ))
             .manage(tinycloud)
             .manage(Config::default());
+        let rocket = manage_tc405_test_state(rocket, conn.clone());
 
         let client = Arc::new(Client::tracked(rocket).await?);
         let auth_header = Arc::new(auth_header);
@@ -6590,7 +6616,7 @@ mod tests {
         .sign(Algorithm::EdDSA, &jwk)?
         .encode()?;
 
-        let build_client = |tc: TinyCloud| async move {
+        let build_client = |tc: TinyCloud, db: tinycloud_core::sea_orm::DatabaseConnection| async move {
             let r = rocket::build()
                 .mount("/", rocket::routes![delegate])
                 .attach(crate::tracing::TracingFairing::new(
@@ -6598,11 +6624,12 @@ mod tests {
                 ))
                 .manage(tc)
                 .manage(Config::default());
+            let r = manage_tc405_test_state(r, db);
             Client::tracked(r).await
         };
 
-        let client_a = Arc::new(build_client(tc_a).await?);
-        let client_b = Arc::new(build_client(tc_b).await?);
+        let client_a = Arc::new(build_client(tc_a, db_a).await?);
+        let client_b = Arc::new(build_client(tc_b, db_b).await?);
 
         let send = |client: Arc<Client>, hdr: String| async move {
             let resp = client
@@ -6885,6 +6912,7 @@ mod tests {
             .manage(InvocationReplayCache::new(replay_db.clone()))
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
+        let rocket = manage_tc405_test_state(rocket, replay_db.clone());
         Ok((rocket, replay_db))
     }
 
@@ -7182,6 +7210,7 @@ mod tests {
             .manage(InvocationReplayCache::new(replay_db))
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
+        let rocket = manage_tc405_test_state(rocket, conn.clone());
         Ok((rocket, conn))
     }
 

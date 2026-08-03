@@ -273,12 +273,16 @@ impl PolicyV3Runtime {
             }
             return Ok(false);
         }
-        let Some((immediate_row, immediate)) = tinycloud
-            .load_signed_delegation(invocation.parents[0])
-            .await
-            .map_err(|_| "policy-session-invalid")?
-        else {
-            return Err("policy-session-parent-missing");
+        let parent_cid = invocation.parents[0];
+        let loaded = tinycloud.load_signed_delegation(parent_cid).await;
+        let Some((immediate_row, immediate)) = (match loaded {
+            Ok(parent) => parent,
+            Err(_) if self.is_policy_protected_parent(parent_cid).await? => {
+                return Err("policy-session-invalid");
+            }
+            Err(_) => return Ok(false),
+        }) else {
+            return Ok(false);
         };
         // Sibling roots are stored in the ordinary graph only so S0 can have
         // normal proof edges. Neither root is invocation authority by itself.
@@ -290,12 +294,15 @@ impl PolicyV3Runtime {
         {
             return Err("policy-root-cannot-authorize-invocation");
         }
+        if !is_policy_session(&immediate.0) {
+            return Ok(false);
+        }
         if immediate_row.delegatee != invocation.invoker
             || immediate.0.delegate != invocation.invoker
         {
-            return Err("policy-session-invoker-mismatch");
-        }
-        if !is_policy_session(&immediate.0) {
+            // Principal/audience mismatch is an ordinary graph authorization
+            // failure. Defer it to the existing authorization path so TC-405
+            // does not change its status contract or error vocabulary.
             return Ok(false);
         }
         if !capabilities_are_contained(&invocation.capabilities, &immediate.0.capabilities) {
@@ -410,6 +417,35 @@ impl PolicyV3Runtime {
             validate_stored_root_status(&root, &root_cid, &self.node_did, now, true)?;
         }
         Ok(true)
+    }
+
+    async fn is_policy_protected_parent(
+        &self,
+        cid: tinycloud_auth::ipld_core::cid::Cid,
+    ) -> Result<bool, &'static str> {
+        let cid_string = cid.to_string();
+        if policy_v3_session::Entity::find_by_id(cid_string.clone())
+            .one(&self.conn)
+            .await
+            .map_err(|_| "policy-session-unavailable")?
+            .is_some()
+            || policy_v3_root::Entity::find_by_id(cid_string)
+                .one(&self.conn)
+                .await
+                .map_err(|_| "policy-root-unavailable")?
+                .is_some()
+        {
+            return Ok(true);
+        }
+
+        let row = delegation_model::Entity::find_by_id(tinycloud_core::hash::Hash::from(cid))
+            .one(&self.conn)
+            .await
+            .map_err(|_| "policy-session-unavailable")?;
+        Ok(row.and_then(|row| row.facts).is_some_and(|facts| {
+            facts.0.contains_key("xyz.tinycloud.policy/session-fact")
+                || facts.0.contains_key("xyz.tinycloud.policy/root-profile")
+        }))
     }
 
     /// Walk a policy chain from exact stored Authorization bytes. Every
@@ -3329,7 +3365,7 @@ fn attenuation_caveats_contain(
     {
         return true;
     }
-    fn selector<'a>(value: &'a Value) -> Option<(&'a str, &'a str)> {
+    fn selector(value: &Value) -> Option<(&str, &str)> {
         let values = value.as_array()?;
         if values.len() != 1 {
             return None;
@@ -4060,7 +4096,9 @@ mod tests {
             "selector": "exact",
             "actions": ["tinycloud.kv/get"]
         });
-        assert!(validate_requested_policy_capabilities(&[child.clone()], &ceiling).is_ok());
+        assert!(
+            validate_requested_policy_capabilities(std::slice::from_ref(&child), &ceiling).is_ok()
+        );
         for mutation in [
             json!({"kind":"kv","resource":format!("{root}-sibling"),"selector":"exact","actions":["tinycloud.kv/get"]}),
             json!({"kind":"kv","resource":format!("{root}/folder/document.txt"),"selector":"exact","actions":["tinycloud.kv/put"]}),

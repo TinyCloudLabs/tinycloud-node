@@ -79,7 +79,7 @@ pub fn selector_caveats_contain(
 ) -> Option<bool> {
     const TYPE: &str = "xyz.tinycloud.resource/selector";
 
-    fn selector<'a>(values: &'a BTreeMap<String, Value>) -> Option<(&'a str, &'a str)> {
+    fn selector(values: &BTreeMap<String, Value>) -> Option<(&str, &str)> {
         if values.len() != 1 {
             return None;
         }
