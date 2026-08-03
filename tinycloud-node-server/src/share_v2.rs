@@ -77,6 +77,24 @@ const REGISTRATION_DOMAIN: &str = "xyz.tinycloud.share/policy-registration/v2\0"
 const MAX_POLICY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_GRAPH_NODES: usize = 64;
 
+fn legacy_v2_creation_open() -> bool {
+    OffsetDateTime::now_utc()
+        < OffsetDateTime::parse(crate::policy_v3::LAST_V2_CREATE_AT, &Rfc3339)
+            .expect("valid v2 creation cutoff")
+}
+
+fn legacy_v2_reads_open() -> bool {
+    OffsetDateTime::now_utc()
+        <= OffsetDateTime::parse(crate::policy_v3::LAST_V2_READ_AT, &Rfc3339)
+            .expect("valid v2 read cutoff")
+}
+
+fn legacy_expiry_allowed(expiry: OffsetDateTime) -> bool {
+    expiry
+        <= OffsetDateTime::parse(crate::policy_v3::MAX_LEGACY_ENVELOPE_EXPIRES_AT, &Rfc3339)
+            .expect("valid legacy envelope cutoff")
+}
+
 fn canonical_did_key_kid(did: &str) -> String {
     format!("{did}#{}", did.strip_prefix("did:key:").unwrap_or(did))
 }
@@ -792,6 +810,9 @@ pub async fn register_policy(
     if !runtime.live().await {
         return Err(error(Status::ServiceUnavailable, "capability_unavailable"));
     }
+    if !legacy_v2_creation_open() {
+        return Err(error(Status::Gone, "legacy_v2_creation_closed"));
+    }
     let bytes = read_body(data).await?;
     let request: RegisterRequest = serde_json::from_slice(&bytes)
         .map_err(|_| error(Status::BadRequest, "policy_registration_invalid"))?;
@@ -1122,6 +1143,13 @@ fn validate_policy(
     {
         return Err(());
     }
+    let policy_expiry = OffsetDateTime::parse(&policy.expires_at, &Rfc3339).map_err(|_| ())?;
+    if timestamp(policy_expiry) != policy.expires_at
+        || policy_expiry <= OffsetDateTime::now_utc()
+        || !legacy_expiry_allowed(policy_expiry)
+    {
+        return Err(());
+    }
     let source = serde_json::to_value(&policy.content_source).map_err(|_| ())?;
     if b64_digest(&jcs::canonicalize(&source)) != policy.content_source_digest
         || policy.content_source_digest != request.content_source_digest
@@ -1195,7 +1223,10 @@ fn validate_policy(
         return Err(());
     }
     let expiry = OffsetDateTime::parse(&policy.expires_at, &Rfc3339).map_err(|_| ())?;
-    if timestamp(expiry) != policy.expires_at || expiry <= OffsetDateTime::now_utc() {
+    if timestamp(expiry) != policy.expires_at
+        || expiry <= OffsetDateTime::now_utc()
+        || !legacy_expiry_allowed(expiry)
+    {
         return Err(());
     }
     Ok(())
@@ -1783,7 +1814,10 @@ fn verify_outer_envelope(
         return Err(());
     }
     let expiry = OffsetDateTime::parse(&envelope.expires_at, &Rfc3339).map_err(|_| ())?;
-    if timestamp(expiry) != envelope.expires_at || expiry <= OffsetDateTime::now_utc() {
+    if timestamp(expiry) != envelope.expires_at
+        || expiry <= OffsetDateTime::now_utc()
+        || !legacy_expiry_allowed(expiry)
+    {
         return Err(());
     }
     if b64_digest(&jcs::canonicalize(&envelope.content_source)) != envelope.content_source_digest {
@@ -2452,6 +2486,9 @@ pub async fn policy_challenge_v2(
     if !runtime.live().await {
         return Err(error(Status::ServiceUnavailable, "capability_unavailable"));
     }
+    if !legacy_v2_creation_open() {
+        return Err(error(Status::Gone, "legacy_v2_creation_closed"));
+    }
     let bytes = read_body(data).await?;
     let raw: Value = serde_json::from_slice(&bytes)
         .map_err(|_| error(Status::BadRequest, "policy_challenge_invalid"))?;
@@ -2572,6 +2609,9 @@ pub async fn policy_session_v2(
         .ok_or(error(Status::ServiceUnavailable, "capability_unavailable"))?;
     if !runtime.live().await {
         return Err(error(Status::ServiceUnavailable, "capability_unavailable"));
+    }
+    if !legacy_v2_creation_open() {
+        return Err(error(Status::Gone, "legacy_v2_creation_closed"));
     }
     let raw = read_body(data).await?;
     let request: V2SessionRequest = serde_json::from_slice(&raw)
@@ -2849,6 +2889,9 @@ pub async fn invoke_v2(
     if !runtime.live().await {
         return Err(error(Status::ServiceUnavailable, "capability_unavailable"));
     }
+    if !legacy_v2_reads_open() {
+        return Err(error(Status::Gone, "legacy_v2_reads_closed"));
+    }
     let raw = read_body(data).await?;
     let envelope: V2InvokeEnvelope =
         serde_json::from_slice(&raw).map_err(|_| error(Status::BadRequest, "invoke_invalid"))?;
@@ -2862,6 +2905,10 @@ pub async fn invoke_v2(
         || OffsetDateTime::parse(&session.expires_at, &Rfc3339)
             .map_err(|_| share_error("invoke_denied"))?
             <= now
+        || !legacy_expiry_allowed(
+            OffsetDateTime::parse(&session.expires_at, &Rfc3339)
+                .map_err(|_| share_error("invoke_denied"))?,
+        )
     {
         return Err(share_error("invoke_denied"));
     }

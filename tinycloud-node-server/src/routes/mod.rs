@@ -480,11 +480,18 @@ pub async fn delegate(
     d: AuthHeaderGetter<DelegationInfo>,
     req_span: TracingSpan,
     tinycloud: &State<TinyCloud>,
+    policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
 ) -> Result<Json<DelegateResponse>, (Status, String)> {
     let action_label = "delegation";
     let span = info_span!(parent: &req_span.0, "delegate", action = %action_label);
     // Instrumenting async block to handle yielding properly
     async move {
+        if !policy_v3.ordinary_admission_allowed(tinycloud, &d.0).await {
+            return Err((
+                Status::Forbidden,
+                "policy-delegation-requires-verified-mint-or-registration".to_string(),
+            ));
+        }
         let timer = crate::prometheus::enabled().then(|| {
             crate::prometheus::AUTHORIZED_INVOKE_HISTOGRAM
                 .with_label_values(&["delegate"])
@@ -547,15 +554,16 @@ pub async fn delegate(
     .await
 }
 
-/// W1 (C): node-confirmed revocation surface.
+/// W1 (C): ordinary delegation revocation surface.
 ///
 /// Accepts a CACAO/SIWE-encoded revocation today (the on-the-wire encoding
 /// supported by `TinyCloudRevocation`); the W0 spec also calls for a
 /// `did:key`-signed UCAN-format revocation by the Grant Issuer. That second
 /// signature suite is staged on top of the existing pipeline as a followup
 /// (it requires a new variant in `tinycloud-auth::TinyCloudRevocation`); the
-/// route itself is mounted so the Policy Engine `active_cutoff` loop can
-/// rely on a confirmation response.
+/// Policy-v3 roots are control-plane artifacts and are revoked only through
+/// their signed `/share/v3/policy/status` checkpoint; this route must never
+/// turn an ordinary revocation into a root-status projection.
 #[post("/revoke")]
 pub async fn revoke(
     r: AuthHeaderGetter<RevocationInfo>,
@@ -606,6 +614,8 @@ pub async fn invoke(
     config: &State<Config>,
     quota_cache: &State<QuotaCache>,
     invocation_replay_cache: &State<InvocationReplayCache>,
+    policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
+    encryption: &State<EncryptionService>,
     sql_service: &State<SqlService>,
     duckdb_service: &State<DuckDbService>,
     hook_runtime: &State<HookRuntime>,
@@ -620,6 +630,8 @@ pub async fn invoke(
         config,
         quota_cache,
         invocation_replay_cache,
+        policy_v3,
+        encryption,
         sql_service,
         duckdb_service,
         hook_runtime,
@@ -640,6 +652,8 @@ pub async fn invoke(
     config: &State<Config>,
     quota_cache: &State<QuotaCache>,
     invocation_replay_cache: &State<InvocationReplayCache>,
+    policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
+    encryption: &State<EncryptionService>,
     sql_service: &State<SqlService>,
     hook_runtime: &State<HookRuntime>,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
@@ -653,6 +667,8 @@ pub async fn invoke(
         config,
         quota_cache,
         invocation_replay_cache,
+        policy_v3,
+        encryption,
         sql_service,
         (),
         hook_runtime,
@@ -1325,6 +1341,8 @@ async fn invoke_impl(
     config: &State<Config>,
     quota_cache: &State<QuotaCache>,
     invocation_replay_cache: &State<InvocationReplayCache>,
+    policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
+    encryption: &State<EncryptionService>,
     sql_service: &State<SqlService>,
     #[cfg_attr(not(feature = "duckdb"), allow(unused_variables))] duckdb_service: DuckDbInvokeState<
         '_,
@@ -1376,10 +1394,72 @@ async fn invoke_impl(
                 (Status::Unauthorized, message)
             })?;
 
-        // (c) Only now record the (verified, in-window) invocation durably.
-        invocation_replay_cache
-            .check_and_insert(&admitted, config.invocation.max_lifetime_secs)
-            .await?;
+        // Policy-session invocations use the same admitted invocation as every
+        // other data-plane request. The policy runtime only classifies and
+        // verifies the special S0 edge; the ordinary graph remains authoritative.
+        let policy_session_invocation = policy_v3
+            .authorize_invocation(tinycloud, &admitted.invocation().0, now)
+            .await
+            .map_err(|error| (Status::Forbidden, error.to_string()))?;
+
+        let decrypt_network = admitted
+            .invocation()
+            .0
+            .capabilities
+            .iter()
+            .find_map(|capability| {
+            let is_decrypt = capability.ability.as_ref().as_ref()
+                == tinycloud_core::encryption_network::DECRYPT_ACTION;
+            let resource = capability.resource.to_string();
+            (is_decrypt && resource.starts_with("urn:tinycloud:encryption:")).then_some(resource)
+        });
+        if let Some(network) = decrypt_network {
+            if admitted.invocation().0.capabilities.iter().any(|capability| {
+                capability.ability.as_ref().as_ref()
+                    == tinycloud_core::encryption_network::DECRYPT_ACTION
+                    && capability.resource.to_string() != network
+            }) {
+                return Err((
+                    Status::Forbidden,
+                    "decrypt invocation contains multiple networks".to_string(),
+                ));
+            }
+            let network = network.parse().map_err(
+                |error: tinycloud_core::encryption_network::NetworkIdError| {
+                    (Status::Forbidden, error.to_string())
+                },
+            )?;
+            let body = read_json_body(data).await?;
+            let body = serde_json::from_str(&body)
+                .map_err(|error| (Status::BadRequest, error.to_string()))?;
+            tinycloud
+                .authorize_invocation(&admitted.invocation().0, now)
+                .await
+                .map_err(|error| (Status::Forbidden, error.to_string()))?;
+            encryption
+                .validate_authorized_decrypt_request(&network, &admitted.invocation().0, &body)
+                .await
+                .map_err(|error| (Status::Forbidden, error.to_string()))?;
+            if policy_session_invocation {
+                invocation_replay_cache
+                    .check_and_insert_invoker_nonce(admitted.invocation(), 60)
+                    .await?;
+            } else {
+                invocation_replay_cache
+                    .check_and_insert(&admitted, config.invocation.max_lifetime_secs)
+                    .await?;
+            }
+            let verified = encryption
+                .decrypt_authorized(&network, &admitted.invocation().0, &body)
+                .await
+                .map_err(|error| (Status::Forbidden, error.to_string()))?;
+            if let Some(timer) = timer {
+                timer.observe_duration();
+            }
+            return Ok(DataOut::One(InvOut(InvocationOutcome::EncryptionDecrypt(
+                verified.response,
+            ))));
+        }
 
         // Check for SQL capabilities
         let sql_caps: Vec<_> = admitted
@@ -1402,6 +1482,15 @@ async fn invoke_impl(
             .collect();
 
         if !sql_caps.is_empty() {
+            if policy_session_invocation {
+                invocation_replay_cache
+                    .check_and_insert_invoker_nonce(admitted.invocation(), 60)
+                    .await?;
+            } else {
+                invocation_replay_cache
+                    .check_and_insert(&admitted, config.invocation.max_lifetime_secs)
+                    .await?;
+            }
             let result = handle_sql_invoke(
                 admitted,
                 data,
@@ -1444,6 +1533,15 @@ async fn invoke_impl(
                     .collect();
 
             if !duckdb_caps.is_empty() {
+                if policy_session_invocation {
+                    invocation_replay_cache
+                        .check_and_insert_invoker_nonce(admitted.invocation(), 60)
+                        .await?;
+                } else {
+                    invocation_replay_cache
+                        .check_and_insert(&admitted, config.invocation.max_lifetime_secs)
+                        .await?;
+                }
                 let arrow_format = headers.0 .0.iter().any(|(k, v)| {
                     k.eq_ignore_ascii_case("accept")
                         && v.contains("application/vnd.apache.arrow.stream")
@@ -1613,6 +1711,15 @@ async fn invoke_impl(
             stage_inputs_start.elapsed(),
         );
         let inputs = inputs_result?;
+        if policy_session_invocation {
+            invocation_replay_cache
+                .check_and_insert_invoker_nonce(admitted.invocation(), 60)
+                .await?;
+        } else {
+            invocation_replay_cache
+                .check_and_insert(&admitted, config.invocation.max_lifetime_secs)
+                .await?;
+        }
         let invocation_info = admitted.invocation().0.clone();
         let cursor_limit = kv_options.list_limit;
         let cursor_target = kv_list_target(&invocation_info.capabilities);

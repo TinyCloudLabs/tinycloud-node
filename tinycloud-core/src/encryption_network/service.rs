@@ -601,6 +601,66 @@ impl EncryptionService {
     /// Decrypt path for native TinyCloud UCAN invocations produced by
     /// node-sdk's `invokeAny`. Signature/proof-chain validation is performed
     /// by the node auth DAG before this method is called.
+    pub async fn validate_authorized_decrypt_request(
+        &self,
+        network_id: &NetworkId,
+        invocation: &InvocationInfo,
+        body_value: &Value,
+    ) -> Result<(), EncryptionServiceError> {
+        let body: DecryptRequestBody = serde_json::from_value(body_value.clone())
+            .map_err(|e| EncryptionServiceError::InvalidBody(e.to_string()))?;
+        let facts = native_decrypt_facts(invocation)?;
+        if body.ty != DECRYPT_REQUEST_TYPE
+            || facts.ty != DECRYPT_REQUEST_TYPE
+            || invocation.invocation.payload().audience != self.node_did.as_str()
+            || facts.target_node != self.node_did
+            || body.target_node != self.node_did
+        {
+            return Err(EncryptionServiceError::WrongInvocationType);
+        }
+        if &facts.network_id != network_id || &body.network_id != network_id {
+            return Err(EncryptionServiceError::NetworkMismatch);
+        }
+        let capability = invocation
+            .capabilities
+            .iter()
+            .find(|capability| capability.ability.to_string() == DECRYPT_ACTION)
+            .ok_or(EncryptionServiceError::Unauthorized)?;
+        if !network_id_matches(&capability.resource.to_string(), network_id) {
+            return Err(EncryptionServiceError::NetworkMismatch);
+        }
+        let descriptor = self.get_network(network_id).await?;
+        if descriptor.state != NetworkState::Active {
+            return Err(EncryptionServiceError::NetworkNotActive(
+                descriptor.state.as_str().to_string(),
+            ));
+        }
+        if descriptor.alg != body.alg
+            || descriptor.key_version != body.key_version
+            || descriptor.alg != facts.alg
+            || descriptor.key_version != facts.key_version
+        {
+            return Err(EncryptionServiceError::AlgKeyVersionMismatch);
+        }
+        self.validate_invocation_time(
+            native_invocation_not_before(invocation),
+            native_invocation_exp(invocation)?,
+        )?;
+        decode_base64(&body.receiver_public_key).map_err(EncryptionServiceError::Base64)?;
+        decode_base64(&body.encrypted_symmetric_key).map_err(EncryptionServiceError::Base64)?;
+        let receiver_hash = canonical_hash(&Value::String(body.receiver_public_key.clone()));
+        let key_hash = canonical_hash(&Value::String(body.encrypted_symmetric_key.clone()));
+        if receiver_hash != body.receiver_public_key_hash
+            || receiver_hash != facts.receiver_public_key_hash
+            || key_hash != body.encrypted_symmetric_key_hash
+            || key_hash != facts.encrypted_symmetric_key_hash
+            || canonical_hash(body_value) != facts.body_hash
+        {
+            return Err(EncryptionServiceError::HashMismatch("bodyHash"));
+        }
+        Ok(())
+    }
+
     pub async fn decrypt_authorized(
         &self,
         network_id: &NetworkId,
@@ -702,20 +762,11 @@ impl EncryptionService {
         let invocation_cid = native_invocation_cid(invocation)?;
         let request_hash =
             hash_hex(&[invocation_cid.as_bytes(), expected_body_hash.as_bytes()].concat());
-        if let Err(err) = self
-            .consume_nonce(
-                &invocation.invoker,
-                native_invocation_nonce(invocation)?,
-                exp,
-            )
-            .await
-        {
-            if matches!(err, EncryptionServiceError::NonceReplay) {
-                self.record_native_audit(invocation, network_id, &facts, "denied:replay")
-                    .await?;
-            }
-            return Err(err);
-        }
+        // `/invoke` owns the single common invoker+nonce reservation for both
+        // KV and decrypt.  This authorized helper is only called after that
+        // reservation and must not consume the legacy encryption_nonce table a
+        // second time.  The direct encryption route still uses `decrypt`,
+        // which retains its own legacy replay boundary for compatibility.
 
         let network_row = encryption_network::Entity::find_by_id(network_id.to_string())
             .one(&self.db)

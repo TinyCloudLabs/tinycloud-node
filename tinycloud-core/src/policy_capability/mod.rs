@@ -20,6 +20,7 @@ pub mod sql_caveat;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 pub use sql_caveat::SqlConstrainedStatementCaveat;
 
@@ -66,6 +67,69 @@ pub fn resolve_alias(action: &str) -> &str {
 /// capability rows, hashes, and serialized formats are unaffected.
 pub fn ability_matches(held: &str, required: &str) -> bool {
     tinycloud_auth::policy_capability::ability_matches(held, required)
+}
+
+/// Containment for the TC-405 native selector caveat carried by compact
+/// policy UCANs. `None` means neither side is this caveat profile, allowing
+/// callers to retain their service-specific fallback. `Some(false)` is a
+/// malformed or widening selector and must fail closed.
+pub fn selector_caveats_contain(
+    parent: &BTreeMap<String, Value>,
+    child: &BTreeMap<String, Value>,
+) -> Option<bool> {
+    const TYPE: &str = "xyz.tinycloud.resource/selector";
+
+    fn selector<'a>(values: &'a BTreeMap<String, Value>) -> Option<(&'a str, &'a str)> {
+        if values.len() != 1 {
+            return None;
+        }
+        let object = values.values().next()?.as_object()?;
+        if object.len() != 3
+            || object
+                .keys()
+                .any(|key| !["type", "kind", "value"].contains(&key.as_str()))
+            || object.get("type").and_then(Value::as_str) != Some(TYPE)
+        {
+            return None;
+        }
+        let kind = object.get("kind").and_then(Value::as_str)?;
+        let resource = object.get("value").and_then(Value::as_str)?;
+        Some((kind, resource))
+    }
+
+    let parent_mentions_selector = parent.values().any(|value| {
+        value
+            .as_object()
+            .and_then(|object| object.get("type"))
+            .and_then(Value::as_str)
+            == Some(TYPE)
+    });
+    let child_mentions_selector = child.values().any(|value| {
+        value
+            .as_object()
+            .and_then(|object| object.get("type"))
+            .and_then(Value::as_str)
+            == Some(TYPE)
+    });
+    if !parent_mentions_selector && !child_mentions_selector {
+        return None;
+    }
+    let (Some((parent_kind, parent_resource)), Some((child_kind, child_resource))) =
+        (selector(parent), selector(child))
+    else {
+        return Some(false);
+    };
+    let resource_contained = parent_resource == child_resource
+        || (parent_kind == "prefix"
+            && child_resource
+                .strip_prefix(parent_resource)
+                .is_some_and(|suffix| suffix.starts_with('/')));
+    Some(
+        resource_contained
+            && matches!(parent_kind, "exact" | "prefix")
+            && matches!(child_kind, "exact" | "prefix")
+            && !(parent_kind == "exact" && child_kind == "prefix"),
+    )
 }
 
 /// PolicyCapability — resolved authority shape used by ceilings, requested
@@ -482,6 +546,38 @@ pub struct ResolvedAuthority {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_selector_containment_is_segment_bounded() {
+        fn selector(kind: &str, resource: &str) -> BTreeMap<String, Value> {
+            BTreeMap::from([(
+                "selector".to_owned(),
+                serde_json::json!({
+                    "type": "xyz.tinycloud.resource/selector",
+                    "kind": kind,
+                    "value": resource,
+                }),
+            )])
+        }
+        let root = "tinycloud://space/kv/shares/root";
+        let parent = selector("prefix", root);
+        assert_eq!(
+            selector_caveats_contain(&parent, &selector("exact", root)),
+            Some(true)
+        );
+        assert_eq!(
+            selector_caveats_contain(&parent, &selector("exact", &format!("{root}/child"))),
+            Some(true)
+        );
+        assert_eq!(
+            selector_caveats_contain(&parent, &selector("exact", &format!("{root}-sibling"))),
+            Some(false)
+        );
+        assert_eq!(
+            selector_caveats_contain(&selector("exact", root), &selector("prefix", root)),
+            Some(false)
+        );
+    }
 
     const CANON_VECTORS: &str =
         include_str!("../../tests/fixtures/w1/policy-capability/canonicalization-vectors.json");
