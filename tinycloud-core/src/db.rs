@@ -265,6 +265,12 @@ impl<B, K> SpaceDatabase<DatabaseConnection, B, K> {
         self.sql_sizes = sql_sizes;
         self
     }
+
+    /// Share the SQLite writer gate with control-plane transactions that use
+    /// the same SeaORM connection outside `SpaceDatabase`.
+    pub fn sqlite_writer_lock(&self) -> Option<Arc<tokio::sync::Mutex<()>>> {
+        self.writer_lock.clone()
+    }
 }
 
 impl<C, B, K> SpaceDatabase<C, B, K>

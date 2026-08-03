@@ -454,7 +454,8 @@ pub async fn app_with_control(
         Arc::new(sql_service.clone()),
     )?;
     let mut policy_v3_runtime =
-        PolicyV3Runtime::new(seed_conn.clone(), key_setup.node_did(), key_setup.clone());
+        PolicyV3Runtime::new(seed_conn.clone(), key_setup.node_did(), key_setup.clone())
+            .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock());
     if let Some(encoded_key) = tinycloud_config.share_email.issuer_public_key.as_deref() {
         let decoded = base64::decode_config(encoded_key, base64::URL_SAFE_NO_PAD)
             .context("policy credential issuer public key must be canonical base64url")?;

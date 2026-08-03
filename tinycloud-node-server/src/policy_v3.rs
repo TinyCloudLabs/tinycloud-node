@@ -11,6 +11,7 @@ use rocket::{http::Status, serde::json::Json, State};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 use tinycloud_auth::authorization::HeaderEncode;
 use tinycloud_auth::authorization::TinyCloudDelegation;
@@ -70,6 +71,7 @@ pub struct PolicyV3Runtime {
     pub node_did: String,
     signer: StaticSecret,
     credential_issuer: Option<IssuerKey>,
+    sqlite_writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl PolicyV3Runtime {
@@ -83,7 +85,13 @@ impl PolicyV3Runtime {
             node_did: node_did.into(),
             signer,
             credential_issuer: None,
+            sqlite_writer_lock: None,
         }
+    }
+
+    pub fn with_sqlite_writer_lock(mut self, lock: Option<Arc<tokio::sync::Mutex<()>>>) -> Self {
+        self.sqlite_writer_lock = lock;
+        self
     }
 
     /// Install the operator-authenticated OpenCredentials issuer tuple used
@@ -1002,6 +1010,10 @@ pub async fn register_policy(
         expires_at: Set(root_expiry(&request.policy_root)
             .unwrap_or_else(|_| format_time(now + Duration::seconds(MAX_SESSION_TTL_SECONDS)))),
     };
+    let _writer = match &runtime.sqlite_writer_lock {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
     let txn = runtime.conn.begin().await.map_err(db_error)?;
     // The normal graph rows, abilities, and signed-byte projections share one
     // SQL transaction. A failure in either side leaves no partial authority.
@@ -1457,6 +1469,10 @@ pub async fn mint(
     // Challenge/JTI consumption, the exact S0 graph rows (delegation,
     // abilities, ordered signed proofs), and the admitted session index are a
     // single SQL commit. Any failure rolls the whole transition back.
+    let _writer = match &runtime.sqlite_writer_lock {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
     let txn = runtime.conn.begin().await.map_err(db_error)?;
     if let Some(proof) = account_owner_proof.as_ref() {
         validate_locked_account_owner(&txn, proof).await?;
