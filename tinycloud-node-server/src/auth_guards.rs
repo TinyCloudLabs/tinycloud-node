@@ -121,9 +121,18 @@ fn kv_etag(hash: Hash) -> String {
     format!("\"blake3-{}\"", hex::encode(hash.as_ref()))
 }
 
+fn weak_entity_tag(value: &str) -> &str {
+    value.strip_prefix("W/").unwrap_or(value)
+}
+
 pub(crate) fn if_none_match_matches(value: Option<&str>, etag: &str) -> bool {
+    let etag = weak_entity_tag(etag.trim());
     value.is_some_and(|value| {
-        value.trim() == "*" || value.split(',').any(|candidate| candidate.trim() == etag)
+        let value = value.trim();
+        value == "*"
+            || value
+                .split(',')
+                .any(|candidate| weak_entity_tag(candidate.trim()) == etag)
     })
 }
 
@@ -300,12 +309,26 @@ mod tests {
 
         let second = client
             .get("/")
-            .header(Header::new("If-None-Match", etag))
+            .header(Header::new("If-None-Match", format!("W/{etag}")))
             .dispatch()
             .await;
         assert_eq!(second.status(), Status::NotModified);
         assert!(second.headers().get_one("Content-Length").is_none());
         assert!(second.into_string().await.is_none());
+    }
+
+    #[test]
+    fn if_none_match_uses_weak_comparison_for_lists_and_wildcard() {
+        let etag = "\"blake3-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"";
+        assert!(if_none_match_matches(
+            Some("W/\"blake3-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""),
+            etag
+        ));
+        assert!(if_none_match_matches(
+            Some("\"other\", W/\"blake3-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""),
+            etag
+        ));
+        assert!(if_none_match_matches(Some("*"), etag));
     }
 
     #[test]
