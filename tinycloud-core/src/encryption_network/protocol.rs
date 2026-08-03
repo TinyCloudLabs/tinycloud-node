@@ -23,6 +23,7 @@ pub const NETWORK_REVOKE_ACTION: &str = "tinycloud.encryption/network.revoke";
 
 /// Body of a POST /encryption/networks/<networkId>/decrypt request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DecryptRequestBody {
     #[serde(rename = "type")]
     pub ty: String,
@@ -112,6 +113,7 @@ pub struct InvocationCapability {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DecryptFacts {
     #[serde(rename = "type")]
     pub ty: String,
@@ -291,5 +293,29 @@ mod tests {
         assert_eq!(json["type"], json!(DECRYPT_REQUEST_TYPE));
         let parsed: DecryptRequestBody = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.encrypted_symmetric_key, body.encrypted_symmetric_key);
+    }
+
+    #[test]
+    fn decrypt_wire_shapes_reject_unknown_fields() {
+        let body = DecryptRequestBody {
+            ty: DECRYPT_REQUEST_TYPE.to_string(),
+            target_node: "did:key:z6MkNode".to_string(),
+            network_id: "urn:tinycloud:encryption:did:key:z6Mk:default"
+                .parse()
+                .unwrap(),
+            alg: "x25519-aes256gcm/v1".to_string(),
+            key_version: 1,
+            encrypted_symmetric_key: "AQID".to_string(),
+            encrypted_symmetric_key_hash: "aa".repeat(32),
+            receiver_public_key: "BAUG".to_string(),
+            receiver_public_key_hash: "bb".repeat(32),
+        };
+        let mut body_json = serde_json::to_value(body).unwrap();
+        body_json["unsupported"] = json!(true);
+        assert!(serde_json::from_value::<DecryptRequestBody>(body_json).is_err());
+
+        let mut facts_json = serde_json::to_value(sample_invocation().facts).unwrap();
+        facts_json["unsupported"] = json!(true);
+        assert!(serde_json::from_value::<DecryptFacts>(facts_json).is_err());
     }
 }

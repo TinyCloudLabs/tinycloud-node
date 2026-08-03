@@ -610,7 +610,7 @@ pub fn start_for_paths(paths: &ProfilePaths) -> Result<()> {
     match paths.manager {
         Manager::LaunchdUser | Manager::HomebrewLaunchagent => {
             if is_launchd_loaded(paths)? {
-                run_launchctl(&["kickstart", "-k", &launchd_domain(paths), &service_label()])
+                run_launchctl(&["kickstart", "-k", &launchd_service_target(paths)])
             } else {
                 run_launchctl(&[
                     "bootstrap",
@@ -637,8 +637,17 @@ pub fn stop_for_paths(paths: &ProfilePaths) -> Result<()> {
 }
 
 pub fn restart_for_paths(paths: &ProfilePaths) -> Result<()> {
-    let _ = stop_for_paths(paths);
-    start_for_paths(paths)
+    match paths.manager {
+        Manager::LaunchdUser | Manager::HomebrewLaunchagent => {
+            if is_launchd_loaded(paths)? {
+                run_launchctl(&["kickstart", "-k", &launchd_service_target(paths)])
+            } else {
+                start_for_paths(paths)
+            }
+        }
+        Manager::SystemdUser => run_systemctl(&["--user", "restart", &service_unit_name()]),
+        Manager::SystemdSystem => run_systemctl(&["restart", &service_unit_name()]),
+    }
 }
 
 pub fn service_status_for_installed(installed: DiscoveredService) -> ServiceStatus {
@@ -1249,6 +1258,10 @@ fn launchd_domain(_paths: &ProfilePaths) -> String {
     format!("gui/{}", effective_uid())
 }
 
+fn launchd_service_target(paths: &ProfilePaths) -> String {
+    format!("{}/{}", launchd_domain(paths), service_label())
+}
+
 fn effective_uid() -> u32 {
     #[cfg(unix)]
     {
@@ -1460,10 +1473,9 @@ fn enable_service(paths: &ProfilePaths) -> Result<()> {
 
 fn disable_service(paths: &ProfilePaths) -> Result<()> {
     match paths.manager {
-        Manager::LaunchdUser | Manager::HomebrewLaunchagent => run_launchctl(&[
-            "disable",
-            &format!("{}/{}", launchd_domain(paths), service_label()),
-        ]),
+        Manager::LaunchdUser | Manager::HomebrewLaunchagent => {
+            run_launchctl(&["disable", &launchd_service_target(paths)])
+        }
         Manager::SystemdUser => run_systemctl(&["--user", "disable", &service_unit_name()]),
         Manager::SystemdSystem => run_systemctl(&["disable", &service_unit_name()]),
     }
@@ -1512,10 +1524,7 @@ fn run_command_output(args: &[&str]) -> Result<std::process::Output> {
 
 fn is_launchd_loaded(paths: &ProfilePaths) -> Result<bool> {
     let output = Command::new("launchctl")
-        .args([
-            "print",
-            &format!("{}/{}", launchd_domain(paths), service_label()),
-        ])
+        .args(["print", &launchd_service_target(paths)])
         .output()
         .with_context(|| "failed to execute launchctl")?;
     Ok(output.status.success())
@@ -1996,6 +2005,88 @@ esac
         uninstall_for_paths(&paths).unwrap();
 
         assert!(paths.config_path.exists());
+    }
+
+    #[::core::prelude::v1::test]
+    fn restart_uses_native_systemd_restart() {
+        let _lock = env_lock();
+        let temp = tempdir().unwrap();
+        let home = temp.path().join("home");
+        let config_home = temp.path().join("config");
+        let data_home = temp.path().join("data");
+        let state_home = temp.path().join("state");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&config_home).unwrap();
+        fs::create_dir_all(&data_home).unwrap();
+        fs::create_dir_all(&state_home).unwrap();
+        let _home = EnvGuard::set("HOME", &home);
+        let _config_home = EnvGuard::set("XDG_CONFIG_HOME", &config_home);
+        let _data_home = EnvGuard::set("XDG_DATA_HOME", &data_home);
+        let _state_home = EnvGuard::set("XDG_STATE_HOME", &state_home);
+
+        let bin = temp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let calls = temp.path().join("calls.log");
+        let systemctl_script = format!(
+            r#"#!/bin/sh
+while [ "${{1#-}}" != "$1" ]; do
+  shift
+done
+printf '%s\n' "$*" >> "{}"
+case "$1" in
+  restart)
+    exit 0
+    ;;
+  *)
+    echo "unexpected systemctl command: $*" >&2
+    exit 1
+    ;;
+esac
+"#,
+            calls.display(),
+        );
+        write_script(&bin, "systemctl", &systemctl_script);
+        let _path = prepend_path(&bin);
+
+        let paths = ProfilePaths::resolve(Profile::LinuxUser);
+        restart_for_paths(&paths).unwrap();
+
+        let rendered = fs::read_to_string(&calls).unwrap();
+        assert_eq!(rendered, format!("restart {}\n", service_unit_name()));
+    }
+
+    #[::core::prelude::v1::test]
+    fn restart_uses_single_native_launchd_target() {
+        let _lock = env_lock();
+        let temp = tempdir().unwrap();
+        let _config_root = EnvGuard::set("TINYCLOUD_NODE_CONFIG_ROOT", temp.path());
+        let bin = temp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let calls = temp.path().join("calls.log");
+        let launchctl_script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "{}"
+case "$1" in
+  print|kickstart)
+    exit 0
+    ;;
+  *)
+    echo "unexpected launchctl command: $*" >&2
+    exit 1
+    ;;
+esac
+"#,
+            calls.display(),
+        );
+        write_script(&bin, "launchctl", &launchctl_script);
+        let _path = prepend_path(&bin);
+
+        let paths = ProfilePaths::resolve(Profile::MacosUser);
+        restart_for_paths(&paths).unwrap();
+
+        let target = launchd_service_target(&paths);
+        let rendered = fs::read_to_string(&calls).unwrap();
+        assert_eq!(rendered, format!("print {target}\nkickstart -k {target}\n"));
     }
 
     #[::core::prelude::v1::test]
