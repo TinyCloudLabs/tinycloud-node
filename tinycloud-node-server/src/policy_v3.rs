@@ -5,7 +5,7 @@
 //! policy-session UCAN: the sibling-root registration, signed status, the
 //! challenge/claim replay boundary, and the first-admission gate.
 
-use base64::{decode_config, URL_SAFE_NO_PAD};
+use base64::{decode_config, encode_config, URL_SAFE_NO_PAD};
 use rand::RngCore;
 use rocket::{http::Status, serde::json::Json, State};
 use serde::{Deserialize, Serialize};
@@ -13,15 +13,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
-use tinycloud_auth::authorization::HeaderEncode;
 use tinycloud_auth::authorization::TinyCloudDelegation;
 use tinycloud_auth::multihash_codetable::MultihashDigest;
 use tinycloud_auth::share_email_evidence::{verify_detached_ed25519, IssuerKey};
 use tinycloud_auth::ssi::{
-    claims::jwt::NumericDate,
-    dids::{AnyDidMethod, DIDBuf, DIDURLBuf},
+    dids::{AnyDidMethod, DIDBuf},
     jwk::{Algorithm, Base64urlUInt, OctetParams, Params, JWK},
-    ucan::Payload,
 };
 use tinycloud_auth::{
     identity::{did_principal_matches, parse_pkh_did},
@@ -99,22 +96,6 @@ impl PolicyV3Runtime {
     pub fn with_credential_issuer(mut self, issuer: IssuerKey) -> Self {
         self.credential_issuer = Some(issuer);
         self
-    }
-
-    fn signing_jwk(&self) -> JWK {
-        let private_key = self.signer.derive_key(b"tinycloud/node/identity");
-        let public_key = self
-            .signer
-            .node_keypair()
-            .public()
-            .try_into_ed25519()
-            .expect("node identity is Ed25519")
-            .to_bytes();
-        JWK::from(Params::OKP(OctetParams {
-            curve: "Ed25519".to_owned(),
-            public_key: Base64urlUInt(public_key.to_vec()),
-            private_key: Some(Base64urlUInt(private_key.to_vec())),
-        }))
     }
 
     async fn is_registered_policy_root(&self, cid: &str) -> Result<bool, &'static str> {
@@ -1394,49 +1375,48 @@ pub async fn mint(
         facts.insert(key.to_owned(), Value::String(value));
     }
     facts.insert("remainingRedelegationDepth".to_owned(), Value::from(8_u64));
-    let not_before = NumericDate::try_from_seconds(now.unix_timestamp() as f64)
-        .map_err(|_| (Status::Forbidden, "session-time-invalid".into()))?;
-    let expires = (now + Duration::seconds(MAX_SESSION_TTL_SECONDS)).unix_timestamp() as f64;
-    let expiration = NumericDate::try_from_seconds(expires)
-        .map_err(|_| (Status::Forbidden, "session-time-invalid".into()))?;
-    let ucan = Payload {
-        issuer: runtime
-            .node_did
-            .parse::<DIDURLBuf>()
-            .map_err(|_| (Status::Forbidden, "node-did-invalid".into()))?,
-        audience: challenge
-            .recipient_did
-            .parse::<DIDBuf>()
-            .map_err(|_| (Status::Forbidden, "recipient-did-invalid".into()))?,
-        not_before: Some(not_before),
-        expiration,
-        nonce: Some(request.nonce.clone()),
-        facts: Some(vec![Value::Object(facts)]),
-        proof: vec![
-            registration
-                .policy_root_cid
-                .parse()
-                .map_err(|_| (Status::Forbidden, "policy-root-invalid".into()))?,
-            registration
-                .enforcement_root_cid
-                .parse()
-                .map_err(|_| (Status::Forbidden, "policy-root-invalid".into()))?,
-        ],
-        attenuation: serde_json::from_value(attenuation_for_policy_capabilities(
-            &allow.approved_capabilities,
-        )?)
-        .map_err(|_| {
-            (
-                Status::InternalServerError,
-                "session-attenuation-invalid".into(),
-            )
-        })?,
+    let not_before = now.unix_timestamp();
+    let expires = (now + Duration::seconds(MAX_SESSION_TTL_SECONDS)).unix_timestamp();
+    if expires <= not_before {
+        return Err((Status::Forbidden, "session-time-invalid".into()));
     }
-    .sign(Algorithm::EdDSA, &runtime.signing_jwk())
-    .map_err(|e| (Status::InternalServerError, e.to_string()))?;
-    let encoded = TinyCloudDelegation::Ucan(Box::new(ucan))
-        .encode()
-        .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+    let node_keypair = runtime.signer.node_keypair();
+    let node_public_key = node_keypair
+        .public()
+        .try_into_ed25519()
+        .map_err(|error| (Status::InternalServerError, error.to_string()))?
+        .to_bytes();
+    let header = serde_json::json!({
+        "alg": "EdDSA",
+        "jwk": {
+            "alg": "EdDSA",
+            "crv": "Ed25519",
+            "kty": "OKP",
+            "x": encode_config(node_public_key, URL_SAFE_NO_PAD),
+        },
+        "typ": "JWT",
+        "ucv": "0.10.0",
+    });
+    let payload = serde_json::json!({
+        "att": attenuation_for_policy_capabilities(&allow.approved_capabilities)?,
+        "aud": challenge.recipient_did,
+        "exp": expires,
+        "fct": [Value::Object(facts)],
+        "iss": runtime.node_did,
+        "nbf": not_before,
+        "nnc": request.nonce,
+        "prf": [registration.policy_root_cid, registration.enforcement_root_cid],
+    });
+    let header_segment = encode_config(canonical_json_value(&header), URL_SAFE_NO_PAD);
+    let payload_segment = encode_config(canonical_json_value(&payload), URL_SAFE_NO_PAD);
+    let signing_input = format!("{header_segment}.{payload_segment}");
+    let signature = node_keypair
+        .sign(signing_input.as_bytes())
+        .map_err(|error| (Status::InternalServerError, error.to_string()))?;
+    let encoded = format!(
+        "{signing_input}.{}",
+        encode_config(signature, URL_SAFE_NO_PAD)
+    );
     let event = decode_delegation(&encoded)?;
     let session = &event.0;
     if !is_policy_session(session) || session.parents.len() != 2 {
@@ -5079,6 +5059,8 @@ mod tests {
     use super::*;
     use base64::encode_config;
     use serde_json::json;
+    use tinycloud_auth::authorization::HeaderEncode;
+    use tinycloud_auth::ssi::{claims::jwt::NumericDate, dids::DIDURLBuf, ucan::Payload};
     use tinycloud_core::migrations::Migrator;
     use tinycloud_core::sea_orm::{Database, EntityTrait, TransactionTrait};
     use tinycloud_core::sea_orm_migration::MigratorTrait;
@@ -5809,6 +5791,11 @@ mod tests {
         assert_eq!(mint_status, Status::Ok, "mint: {mint_body}");
         let minted: Value = serde_json::from_str(&mint_body)?;
         let s0_authorization = minted["authorization"].as_str().unwrap();
+        for segment in s0_authorization.split('.').take(2) {
+            let bytes = decode_config(segment, URL_SAFE_NO_PAD)?;
+            let value: Value = serde_json::from_slice(&bytes)?;
+            assert_eq!(bytes, canonical_json_value(&value));
+        }
         let s0 =
             decode_delegation(s0_authorization).map_err(|(_, error)| anyhow::anyhow!(error))?;
 
