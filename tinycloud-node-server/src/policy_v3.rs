@@ -106,7 +106,11 @@ impl PolicyV3Runtime {
             .map_err(|_| "policy-root-unavailable")
     }
 
-    pub async fn first_admission_allowed(&self, event: &Delegation) -> Result<(), &'static str> {
+    pub async fn first_admission_allowed(
+        &self,
+        tinycloud: &crate::TinyCloud,
+        event: &Delegation,
+    ) -> Result<(), &'static str> {
         if !is_policy_session(&event.0) {
             return Ok(());
         }
@@ -195,21 +199,18 @@ impl PolicyV3Runtime {
             {
                 return Err("policy-session-root-status-invalid");
             }
-            let Some(graph_root) =
-                delegation_model::Entity::find_by_id(tinycloud_core::hash::Hash::from(
-                    match tinycloud_auth::ipld_core::cid::Cid::try_from(cid.as_str()) {
-                        Ok(cid) => cid,
-                        Err(_) => return Err("policy-session-root-cid-invalid"),
-                    },
-                ))
-                .one(&self.conn)
+            let parsed_cid = match tinycloud_auth::ipld_core::cid::Cid::try_from(cid.as_str()) {
+                Ok(cid) => cid,
+                Err(_) => return Err("policy-session-root-cid-invalid"),
+            };
+            let Some((_, graph_root)) = tinycloud
+                .load_signed_delegation(parsed_cid)
                 .await
-                .ok()
-                .flatten()
+                .map_err(|_| "policy-session-root-graph-unavailable")?
             else {
                 return Err("policy-session-root-graph-missing");
             };
-            if graph_root.serialization != root.authorization_bytes {
+            if graph_root.serialized_bytes() != root.authorization_bytes {
                 return Err("policy-session-root-graph-mismatch");
             }
         }
@@ -228,7 +229,7 @@ impl PolicyV3Runtime {
     ) -> Result<(), &'static str> {
         if is_policy_session(&event.0) {
             if event.0.parents.len() == 2 {
-                return self.first_admission_allowed(event).await;
+                return self.first_admission_allowed(tinycloud, event).await;
             }
             // A descendant carries the same protected profile fact and one
             // immediate parent. It is ordinary graph data, but it may enter
@@ -425,13 +426,12 @@ impl PolicyV3Runtime {
                 .await?;
             let root_hash = tinycloud_auth::ipld_core::cid::Cid::try_from(root_cid.as_str())
                 .map_err(|_| "policy-root-invalid")?;
-            let graph_root =
-                delegation_model::Entity::find_by_id(tinycloud_core::hash::Hash::from(root_hash))
-                    .one(&self.conn)
-                    .await
-                    .map_err(|_| "policy-root-unavailable")?
-                    .ok_or("policy-root-graph-missing")?;
-            if graph_root.serialization != root.authorization_bytes {
+            let (_, graph_root) = tinycloud
+                .load_signed_delegation(root_hash)
+                .await
+                .map_err(|_| "policy-root-unavailable")?
+                .ok_or("policy-root-graph-missing")?;
+            if graph_root.serialized_bytes() != root.authorization_bytes {
                 return Err("policy-root-graph-mismatch");
             }
             validate_stored_root_status(&root, &root_cid, &self.node_did, now, true)?;
