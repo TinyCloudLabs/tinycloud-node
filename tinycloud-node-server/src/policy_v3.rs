@@ -106,22 +106,22 @@ impl PolicyV3Runtime {
             .map_err(|_| "policy-root-unavailable")
     }
 
-    pub async fn first_admission_allowed(&self, event: &Delegation) -> bool {
+    pub async fn first_admission_allowed(&self, event: &Delegation) -> Result<(), &'static str> {
         if !is_policy_session(&event.0) {
-            return true;
+            return Ok(());
         }
         let Ok(encoded) = std::str::from_utf8(event.serialized_bytes()) else {
-            return false;
+            return Err("policy-session-bytes-invalid");
         };
         let Ok(reparsed) = decode_delegation(encoded) else {
-            return false;
+            return Err("policy-session-decode-invalid");
         };
         if reparsed.serialized_bytes() != event.serialized_bytes()
             || reparsed.content_hash() != event.content_hash()
             || !is_policy_session(&reparsed.0)
             || reparsed.0.parents.len() != 2
         {
-            return false;
+            return Err("policy-session-roundtrip-invalid");
         }
         let policy_cid = fact(&event.0.delegation, "policyCid").unwrap_or_default();
         let Some(registration) = policy_v3_registration::Entity::find_by_id(policy_cid)
@@ -130,7 +130,7 @@ impl PolicyV3Runtime {
             .ok()
             .flatten()
         else {
-            return false;
+            return Err("policy-session-registration-missing");
         };
         let proofs: Vec<String> = event.0.parents.iter().map(ToString::to_string).collect();
         if proofs
@@ -139,19 +139,19 @@ impl PolicyV3Runtime {
                 registration.enforcement_root_cid.clone(),
             ]
         {
-            return false;
+            return Err("policy-session-proof-order-invalid");
         }
         let Ok(enforcer_did) = self
             .authenticated_registration_enforcer(&registration, OffsetDateTime::now_utc())
             .await
         else {
-            return false;
+            return Err("policy-session-enforcer-invalid");
         };
         if fact(&event.0.delegation, "recipientDid") != Some(event.0.delegate.as_str())
             || fact(&event.0.delegation, "enforcerDid") != Some(enforcer_did.as_str())
             || fact(&event.0.delegation, "nodeAudience") != Some(self.node_did.as_str())
         {
-            return false;
+            return Err("policy-session-facts-invalid");
         }
         let session_cid = event.content_hash().to_cid(0x55).to_string();
         let Some(session) = policy_v3_session::Entity::find_by_id(session_cid.clone())
@@ -160,14 +160,14 @@ impl PolicyV3Runtime {
             .ok()
             .flatten()
         else {
-            return false;
+            return Err("policy-session-admission-missing");
         };
         if session.state != "admitted"
             || session.session_cid != session_cid
             || session.authorization_bytes != event.serialized_bytes()
             || session.recipient_did != event.0.delegate
         {
-            return false;
+            return Err("policy-session-admission-mismatch");
         }
         for cid in [
             &registration.policy_root_cid,
@@ -179,7 +179,7 @@ impl PolicyV3Runtime {
                 .ok()
                 .flatten()
             else {
-                return false;
+                return Err("policy-session-root-missing");
             };
             if validate_persisted_root(&root, cid, &registration.policy_cid, &self.node_did)
                 .await
@@ -193,13 +193,13 @@ impl PolicyV3Runtime {
                 )
                 .is_err()
             {
-                return false;
+                return Err("policy-session-root-status-invalid");
             }
             let Some(graph_root) =
                 delegation_model::Entity::find_by_id(tinycloud_core::hash::Hash::from(
                     match tinycloud_auth::ipld_core::cid::Cid::try_from(cid.as_str()) {
                         Ok(cid) => cid,
-                        Err(_) => return false,
+                        Err(_) => return Err("policy-session-root-cid-invalid"),
                     },
                 ))
                 .one(&self.conn)
@@ -207,13 +207,13 @@ impl PolicyV3Runtime {
                 .ok()
                 .flatten()
             else {
-                return false;
+                return Err("policy-session-root-graph-missing");
             };
             if graph_root.serialization != root.authorization_bytes {
-                return false;
+                return Err("policy-session-root-graph-mismatch");
             }
         }
-        true
+        Ok(())
     }
 
     /// Public `/delegate` is an ordinary import surface.  Policy roots are
@@ -225,7 +225,7 @@ impl PolicyV3Runtime {
         &self,
         tinycloud: &crate::TinyCloud,
         event: &Delegation,
-    ) -> bool {
+    ) -> Result<(), &'static str> {
         if is_policy_session(&event.0) {
             if event.0.parents.len() == 2 {
                 return self.first_admission_allowed(event).await;
@@ -235,22 +235,24 @@ impl PolicyV3Runtime {
             // only below an already admitted S0; roots can never be used as
             // a one-parent substitute for the conjunctive mint.
             if event.0.parents.len() != 1 {
-                return false;
+                return Err("policy-session-parent-count-invalid");
             }
             let Ok((_, parent)) = self
                 .validate_policy_chain(tinycloud, event.0.parents[0])
                 .await
             else {
-                return false;
+                return Err("policy-session-parent-invalid");
             };
-            return event.0.delegator == parent.0.delegate
+            return (event.0.delegator == parent.0.delegate
                 && descendant_time_is_narrower(&event.0, &parent.0)
                 && descendant_profile_is_inherited(&event.0, &parent.0)
                 && capabilities_are_contained(&event.0.capabilities, &parent.0.capabilities)
-                && verify_signed_delegation(&event.0.delegation).await.is_ok();
+                && verify_signed_delegation(&event.0.delegation).await.is_ok())
+            .then_some(())
+            .ok_or("policy-session-descendant-invalid");
         }
         if event.0.parents.is_empty() && is_policy_root(&event.0.delegation) {
-            return false;
+            return Err("policy-root-requires-registration");
         }
         for parent in &event.0.parents {
             // The same persisted-root predicate guards both ordinary
@@ -262,10 +264,10 @@ impl PolicyV3Runtime {
                 .await
                 .unwrap_or(true)
             {
-                return false;
+                return Err("policy-root-cannot-be-ordinary-parent");
             }
         }
-        true
+        Ok(())
     }
 
     pub async fn authorize_invocation(

@@ -486,11 +486,8 @@ pub async fn delegate(
     let span = info_span!(parent: &req_span.0, "delegate", action = %action_label);
     // Instrumenting async block to handle yielding properly
     async move {
-        if !policy_v3.ordinary_admission_allowed(tinycloud, &d.0).await {
-            return Err((
-                Status::Forbidden,
-                "policy-delegation-requires-verified-mint-or-registration".to_string(),
-            ));
+        if let Err(reason) = policy_v3.ordinary_admission_allowed(tinycloud, &d.0).await {
+            return Err((Status::Forbidden, reason.to_string()));
         }
         let timer = crate::prometheus::enabled().then(|| {
             crate::prometheus::AUTHORIZED_INVOKE_HISTOGRAM
