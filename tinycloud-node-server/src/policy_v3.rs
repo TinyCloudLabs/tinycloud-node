@@ -4335,10 +4335,27 @@ async fn authenticate_account_owner(
             .clone()
             .to_resource("space".parse().map_err(bad)?, None, None, None),
     );
-    if !event.0.capabilities.iter().any(|capability| {
+    let credential_namespace =
+        tinycloud_core::types::Resource::from(credentials_space.clone().to_resource(
+            "kv".parse().map_err(bad)?,
+            Some("v1/".parse().map_err(bad)?),
+            None,
+            None,
+        ));
+    let hosts_space = event.0.capabilities.iter().any(|capability| {
         capability.ability.as_ref().as_ref() == "tinycloud.space/host"
             && capability.resource == hosted_credentials_space
-    }) {
+    });
+    let controls_credential_namespace =
+        ["tinycloud.kv/get", "tinycloud.kv/put"]
+            .iter()
+            .all(|ability| {
+                event.0.capabilities.iter().any(|capability| {
+                    capability.ability.as_ref().as_ref() == *ability
+                        && credential_namespace.extends(&capability.resource)
+                })
+            });
+    if !hosts_space && !controls_credential_namespace {
         return Err((
             Status::Forbidden,
             "account-authorization-capability-mismatch".into(),
@@ -5585,16 +5602,19 @@ mod tests {
 
         // Import the recipient's existing SDK account-session CACAO through
         // the real ordinary `/delegate` route. Its only signed authority is
-        // the exact recipient-owned credentials space.
+        // the exact durable credential namespace used by the Web SDK.
         let mut recap = RecapCapability::<Value>::new();
-        recap.with_action(
+        let credential_namespace =
             credentials_space
                 .clone()
-                .to_resource("space".parse()?, None, None, None)
-                .as_uri(),
-            "tinycloud.space/host".parse::<RecapAbility>()?,
-            [std::collections::BTreeMap::<String, Value>::new()],
-        );
+                .to_resource("kv".parse()?, Some("v1/".parse()?), None, None);
+        for ability in ["tinycloud.kv/get", "tinycloud.kv/put"] {
+            recap.with_action(
+                credential_namespace.as_uri(),
+                ability.parse::<RecapAbility>()?,
+                [std::collections::BTreeMap::<String, Value>::new()],
+            );
+        }
         let account_message = recap.build_message(Message {
             scheme: Some("https".parse()?),
             domain: "tc470.test".parse()?,
@@ -5653,6 +5673,11 @@ mod tests {
             stored_account.0.delegation,
             TinyCloudDelegation::Cacao(_)
         ));
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(credentials_space.clone())),
+        }
+        .insert(&client.rocket().state::<PolicyV3Runtime>().unwrap().conn)
+        .await?;
 
         // Seed a real object via the ordinary data plane so the final read
         // proves authorization and content access rather than only admission.
