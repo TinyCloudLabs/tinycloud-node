@@ -410,6 +410,22 @@ jobs:
             /share/v3/policy/delegations
           )
 
+          # The direct TEE ingress obtains/loads its certificate after the
+          # node's public /version endpoint is already healthy. Wait for that
+          # TLS endpoint before probing routes so a successful rollout does
+          # not fail on a transient SSL_ERROR_SYSCALL during ingress startup.
+          for attempt in $(seq 1 30); do
+            if curl -fsS --max-time 10 "${NODE_ORIGIN}/version" > /dev/null; then
+              echo "Direct TEE ingress is ready."
+              break
+            fi
+            if [ "${attempt}" = "30" ]; then
+              echo "::error::Direct TEE ingress did not become ready after 150s."
+              exit 1
+            fi
+            sleep 5
+          done
+
           for route in "${ROUTES[@]}"; do
             RESPONSE_FILE="$(mktemp)"
             STATUS="$(curl -sS --max-time 15 -o "${RESPONSE_FILE}" -w '%{http_code}' \
