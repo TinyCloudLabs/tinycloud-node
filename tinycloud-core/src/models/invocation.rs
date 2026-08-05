@@ -1366,7 +1366,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
-        for item_count in [1usize, 10] {
+        for item_count in [1usize, 100] {
             let mut db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
                 .await
                 .unwrap();

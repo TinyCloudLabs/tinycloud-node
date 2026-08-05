@@ -1779,6 +1779,46 @@ where
             }
         }
 
+        // Resolve every requested KV read before persisting blobs or opening
+        // the mutation transaction. A response-size or object-store error is
+        // an invocation failure, so it must leave the mutation, replay row,
+        // and history uncommitted. This keeps object-store I/O outside the
+        // database transaction without changing the pre-TC-411 all-or-nothing
+        // API behavior for a mixed get + mutation invocation.
+        let mut preloaded_gets = Vec::new();
+        for cap in invocation.0.capabilities.iter() {
+            let Some(resource) = cap.resource.tinycloud_resource() else {
+                continue;
+            };
+            if resource.service().as_str() != "kv"
+                || crate::policy_capability::resolve_alias(cap.ability.as_ref().as_ref())
+                    != "tinycloud.kv/get"
+            {
+                continue;
+            }
+            let Some(path) = resource.path().cloned() else {
+                continue;
+            };
+            let space = resource.space().clone();
+            let data = get_kv(&self.conn, &self.storage, &space, &path)
+                .await
+                .map_err(|e| match e {
+                    EitherError::A(e) => TxStoreError::Tx(e.into()),
+                    EitherError::B(e) => TxStoreError::StoreRead(e),
+                })?;
+            if let (Some(limit), Some((_, _, content))) =
+                (options.max_response_bytes, data.as_ref())
+            {
+                if content.len() > limit {
+                    return Err(TxStoreError::KvResponseTooLarge {
+                        size: content.len(),
+                        limit,
+                    });
+                }
+            }
+            preloaded_gets.push((space, path, data));
+        }
+
         // TC-411: persist immutable put blobs to the object store only after
         // the guarded authorization snapshot above has already accepted the
         // request -- an unauthorized, revoked, or malformed-proof put never
@@ -1910,11 +1950,6 @@ where
         })?;
 
         let mut results = Vec::new();
-        // TC-411: `kv/get` needs an object-store read, which must never
-        // happen while this db transaction is open (see
-        // docs/invoke-query-budget.md). Record where each `kv/get` result
-        // belongs and perform the read after `tx.commit()` below instead.
-        let mut pending_gets: Vec<(usize, SpaceId, Path)> = Vec::new();
         // perform and record side effects
         for cap in caps.iter().filter_map(|c| {
             c.resource.tinycloud_resource().and_then(|r| {
@@ -1930,8 +1965,14 @@ where
         }) {
             match cap {
                 (space, "kv", "tinycloud.kv/get", path) => {
-                    pending_gets.push((results.len(), space.clone(), path.clone()));
-                    results.push(InvocationOutcome::KvRead(None));
+                    let index = preloaded_gets
+                        .iter()
+                        .position(|(loaded_space, loaded_path, _)| {
+                            loaded_space == space && loaded_path == path
+                        })
+                        .expect("preflight loads every requested kv/get");
+                    let (_, _, data) = preloaded_gets.swap_remove(index);
+                    results.push(InvocationOutcome::KvRead(data));
                 }
                 (space, "kv", "tinycloud.kv/list", path) => {
                     let (list, truncated) = list_bounded_after(
@@ -2015,30 +2056,6 @@ where
                 TxStoreError::Tx(error.into())
             }
         })?;
-        // TC-411: object-store reads for any `kv/get` capabilities happen
-        // here, after commit, on `self.conn` -- never while the transaction
-        // above was open. `_chain_guards`/`_kv_object_guards` are still held
-        // (they drop at the end of this function), so this remains
-        // consistent with the committed state.
-        for (index, space, path) in pending_gets {
-            let data = get_kv(&self.conn, &self.storage, &space, &path)
-                .await
-                .map_err(|e| match e {
-                    EitherError::A(e) => TxStoreError::Tx(e.into()),
-                    EitherError::B(e) => TxStoreError::StoreRead(e),
-                })?;
-            if let (Some(limit), Some((_, _, content))) =
-                (options.max_response_bytes, data.as_ref())
-            {
-                if content.len() > limit {
-                    return Err(TxStoreError::KvResponseTooLarge {
-                        size: content.len(),
-                        limit,
-                    });
-                }
-            }
-            results[index] = InvocationOutcome::KvRead(data);
-        }
         Ok((commit, results))
     }
 
@@ -7365,7 +7382,7 @@ mod test {
 
     /// TC-411: `batch_get_kv_entities` must issue exactly one `current_kv`
     /// statement for a batch request, independent of how many keys are in
-    /// it -- proving the one-item and ten-item budgets in
+    /// it -- proving the one-item and 100-item budgets in
     /// docs/invoke-query-budget.md instead of the pre-TC-411 one-lookup-per-
     /// capability loop.
     #[tokio::test]
@@ -7386,7 +7403,7 @@ mod test {
 
         let space = test_space_id("batch-get-count");
         let mut all_keys = Vec::new();
-        for index in 0..10 {
+        for index in 0..100 {
             let key: Path = format!("k/{index}").parse().unwrap();
             let write = crate::models::kv_write::Model {
                 space: SpaceIdWrap(space.clone()),
@@ -7424,12 +7441,12 @@ mod test {
         assert_eq!(one.len(), 1);
 
         let before = counter.load(Ordering::SeqCst);
-        let ten = batch_get_kv_entities(&conn, &all_keys).await.unwrap();
+        let hundred = batch_get_kv_entities(&conn, &all_keys).await.unwrap();
         assert_eq!(
             counter.load(Ordering::SeqCst) - before,
             1,
-            "ten-item batch must issue exactly one statement, not one per item"
+            "100-item batch must issue exactly one statement, not one per item"
         );
-        assert_eq!(ten.len(), 10);
+        assert_eq!(hundred.len(), 100);
     }
 }

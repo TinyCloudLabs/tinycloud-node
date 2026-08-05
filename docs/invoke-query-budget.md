@@ -66,9 +66,9 @@ below — and are not re-counted here):
 | Operation | Statement count | Test |
 |-----------|------------------|------|
 | Batch get/head, 1 item | 1 statement | `db::test::batch_get_kv_entities_issues_one_statement_regardless_of_item_count` |
-| Batch get/head, 10 items | 1 statement | same test |
+| Batch get/head, 100 items | 1 statement | same test |
 | Batch put (multipart history/projection), 1 item | 2 statements | `models::invocation::tests::multipart_put_persistence_is_two_statements_regardless_of_item_count` |
-| Batch put (multipart history/projection), 10 items | 2 statements | same test |
+| Batch put (multipart history/projection), 100 items | 2 statements | same test |
 | `kv/delete` with pre-loaded current state | 0 statements | `models::invocation::tests::delete_reuses_preloaded_invocation_id_without_extra_kv_write_query` |
 | `kv/delete` without pre-loaded current state (fallback) | 1 statement | same test |
 
