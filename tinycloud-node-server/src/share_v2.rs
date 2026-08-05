@@ -3417,6 +3417,17 @@ mod tests {
             serde_json::from_str(include_str!("../../fixtures/tenant_authorization_v1.json"))
                 .expect("valid fixture");
         let body = fixture["body"].as_str().expect("body").as_bytes();
+        let request: serde_json::Value =
+            serde_json::from_slice(body).expect("authorization request");
+        assert_eq!(request["proof"]["inviteCode"], "TC475-INVITE");
+        for field in ["descriptorDigest", "requirementDigest"] {
+            assert_eq!(
+                decode_config(request[field].as_str().expect("digest"), URL_SAFE_NO_PAD)
+                    .unwrap()
+                    .len(),
+                32
+            );
+        }
         assert_eq!(hex::encode(Sha256::digest(body)), fixture["contentSha256"]);
         let key = decode_config(
             fixture["webhookKey"].as_str().expect("key"),
