@@ -235,6 +235,11 @@ pub async fn app_with_control(
         .share_email
         .validate_for_v2_database(tinycloud_config.storage.database())
         .map_err(|error| anyhow::anyhow!(error))?;
+    if let Some(tenant_issuer) = tinycloud_config.tenant_issuer.as_ref() {
+        tenant_issuer
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error))?;
+    }
 
     // Ensure local storage directories exist.
     // SQLite file paths and local dirs are resources the server owns — auto-create them.
@@ -470,6 +475,23 @@ pub async fn app_with_control(
                 tinycloud_config.share_email.issuer_vct.clone(),
                 tinycloud_config.share_email.issuer_key_version,
                 tinycloud_config.share_email.issuer_kid.clone(),
+                public_key,
+            ),
+        );
+    }
+    if let Some(tenant_issuer) = tinycloud_config.tenant_issuer.as_ref() {
+        let decoded =
+            base64::decode_config(&tenant_issuer.issuer_public_key, base64::URL_SAFE_NO_PAD)
+                .context("tenant issuer public key must be canonical base64url")?;
+        let public_key: [u8; 32] = decoded
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("tenant issuer public key must be 32 bytes"))?;
+        policy_v3_runtime = policy_v3_runtime.with_credential_issuer(
+            tinycloud_auth::share_email_evidence::IssuerKey::new(
+                tenant_issuer.issuer_did.clone(),
+                policy_v3::SHAPE_ROTATOR_CREDENTIAL_TYPE,
+                tenant_issuer.issuer_key_version,
+                tenant_issuer.issuer_kid.clone(),
                 public_key,
             ),
         );
