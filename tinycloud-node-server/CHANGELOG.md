@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.14.0](https://github.com/TinyCloudLabs/tinycloud-node/compare/v1.13.0...v1.14.0) - 2026-08-05
+
+### Added
+
+- Add the Policy/v3 owner-root registration, attested-enforcer binding,
+  credential challenge, and ordinary delegation mint path
+  ([#208](https://github.com/TinyCloudLabs/tinycloud-node/pull/208),
+  [#209](https://github.com/TinyCloudLabs/tinycloud-node/pull/209)).
+- Admit holder-bound OpenCredentials evidence into Policy/v3 delegation
+  minting for the Share receiver flow
+  ([#210](https://github.com/TinyCloudLabs/tinycloud-node/pull/210)).
+- Add a synthetic end-to-end write probe for production health
+  ([#195](https://github.com/TinyCloudLabs/tinycloud-node/pull/195)).
+
+### Fixed
+
+- Accept non-TinyCloud resource URIs in verifier capability extraction and
+  expose the authority-matching verifier helpers
+  ([#192](https://github.com/TinyCloudLabs/tinycloud-node/pull/192),
+  [#213](https://github.com/TinyCloudLabs/tinycloud-node/pull/213)).
+- Accept Blake3 delegation CIDs in the share-email claim path
+  ([#198](https://github.com/TinyCloudLabs/tinycloud-node/pull/198)).
+- Preserve Share delivery authorization across browser CORS preflight
+  ([#190](https://github.com/TinyCloudLabs/tinycloud-node/pull/190)).
+
 ## [1.10.0](https://github.com/TinyCloudLabs/tinycloud-node/compare/v1.9.0...v1.10.0) - 2026-07-28
 
 ### Added

@@ -382,3 +382,41 @@ jobs:
 
           echo "::error::node.tinycloud.xyz still reports '${REPORTED}' after $((ATTEMPTS * SLEEP))s, expected '${EXPECTED}'. The deploy did not converge."
           exit 1
+
+      # TC-465: Share requires the complete Policy/v3 control plane before it
+      # can create or receive an exact-email share. A version-only check let a
+      # pre-TC-405 image look healthy while every required route returned 404.
+      # Empty JSON is deliberately rejected before any handler can mutate
+      # policy state, so this proves route mounting against the direct TEE
+      # origin without creating a binding, challenge, policy, or delegation.
+      - name: Verify deployed Policy/v3 routes
+        run: |
+          set -euo pipefail
+
+          NODE_ORIGIN="https://tee.node.tinycloud.xyz"
+          ROUTES=(
+            /share/v3/enforcer-bindings
+            /share/v3/policies
+            /share/v3/policy/challenges
+            /share/v3/policy/delegations
+          )
+
+          for route in "${ROUTES[@]}"; do
+            RESPONSE_FILE="$(mktemp)"
+            STATUS="$(curl -sS --max-time 15 -o "${RESPONSE_FILE}" -w '%{http_code}' \
+              -X POST \
+              -H 'accept: application/json' \
+              -H 'content-type: application/json' \
+              --data '{}' \
+              "${NODE_ORIGIN}${route}")"
+
+            if [ "${STATUS}" != "400" ] && [ "${STATUS}" != "422" ]; then
+              echo "::error::${route} returned HTTP ${STATUS}; expected 400 or 422 for an intentionally invalid request. The Policy/v3 production contract is not mounted correctly."
+              head -c 1000 "${RESPONSE_FILE}" || true
+              rm -f "${RESPONSE_FILE}"
+              exit 1
+            fi
+
+            echo "${route}: mounted (HTTP ${STATUS})"
+            rm -f "${RESPONSE_FILE}"
+          done
