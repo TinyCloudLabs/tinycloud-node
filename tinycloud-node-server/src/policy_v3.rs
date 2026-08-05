@@ -5099,7 +5099,7 @@ mod tests {
         let runtime = PolicyV3Runtime {
             conn: Database::connect("sqlite::memory:").await.unwrap(),
             node_did: "did:key:node".into(),
-            signer: StaticSecret::random(),
+            signer: StaticSecret::new(vec![0; 32]).unwrap(),
             credential_issuers: vec![issuer],
             sqlite_writer_lock: None,
         };
