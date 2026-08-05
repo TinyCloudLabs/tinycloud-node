@@ -40,8 +40,37 @@ pub struct Config {
     pub public_spaces: PublicSpacesConfig,
     #[serde(default)]
     pub share_email: ShareEmailConfig,
+    /// TC-475's registered Shape Rotator issuer. This is a separate, bounded
+    /// trust tuple so the frozen exact-email v1 configuration is unchanged.
+    #[serde(default)]
+    pub tenant_issuer: Option<TenantIssuerConfig>,
     #[serde(default)]
     pub retention: RetentionConfig,
+}
+
+/// The only non-email issuer that may satisfy the ordinary TC-465 policy
+/// credential path. Its profile and credential type are pinned in code;
+/// configuration supplies public verification material only.
+#[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
+pub struct TenantIssuerConfig {
+    pub issuer_did: String,
+    pub issuer_kid: String,
+    pub issuer_key_version: u64,
+    pub issuer_public_key: String,
+}
+
+impl TenantIssuerConfig {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.issuer_did.is_empty()
+            || !self.issuer_did.starts_with("did:")
+            || !canonical_kid_matches(&self.issuer_kid, &self.issuer_did)
+            || self.issuer_key_version == 0
+            || !canonical_key(&self.issuer_public_key)
+        {
+            return Err("tenant issuer configuration is incomplete");
+        }
+        Ok(())
+    }
 }
 
 /// Production exact-email composition.  The capability remains unavailable
@@ -1281,6 +1310,25 @@ mod tests {
             authority_material_path: Some("/run/tinycloud/authority-material.json".into()),
             ..ShareEmailConfig::default()
         }
+    }
+
+    #[test]
+    fn tenant_issuer_accepts_only_a_complete_public_trust_tuple() {
+        let issuer = TenantIssuerConfig {
+            issuer_did: "did:web:issuer.credentials.org".into(),
+            issuer_kid: "did:web:issuer.credentials.org#shape-rotator-1".into(),
+            issuer_key_version: 1,
+            issuer_public_key: "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA".into(),
+        };
+        assert!(issuer.validate().is_ok());
+
+        let mut invalid = issuer;
+        invalid.issuer_kid = "did:web:issuer.credentials.org#other".into();
+        invalid.issuer_did = "did:web:other.credentials.org".into();
+        assert_eq!(
+            invalid.validate(),
+            Err("tenant issuer configuration is incomplete")
+        );
     }
 
     /// The exact `emailOrigin` the committed production document carries.

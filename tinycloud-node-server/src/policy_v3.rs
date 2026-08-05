@@ -45,6 +45,8 @@ pub const POLICY_SESSION_PROFILE: &str = "policy-session-ucan/v1";
 pub const POLICY_V1_SCHEMA: &str = "xyz.tinycloud.policy/policy/v1";
 pub const POLICY_V2_SCHEMA: &str = "xyz.tinycloud.policy/policy/v2";
 pub const POLICY_CREDENTIAL_REQUIREMENT_V1: &str = "TinyCloudPolicyCredentialRequirement";
+pub const SHAPE_ROTATOR_PROFILE: &str = "shape-rotator.membership/v1";
+pub const SHAPE_ROTATOR_CREDENTIAL_TYPE: &str = "opencredentials.shape-rotator-membership/v1";
 pub const CREDENTIAL_PRESENTATION_V3_SCHEMA: &str = "xyz.tinycloud.policy/presentation/v3";
 const CREDENTIAL_PRESENTATION_V3_DOMAIN: &[u8] = b"xyz.tinycloud.policy/Presentation/v3\0";
 pub const POLICY_ENFORCEMENT_V2_SCHEMA: &str = "xyz.tinycloud.policy/enforcement-delegation/v2";
@@ -67,7 +69,7 @@ pub struct PolicyV3Runtime {
     pub conn: DatabaseConnection,
     pub node_did: String,
     signer: StaticSecret,
-    credential_issuer: Option<IssuerKey>,
+    credential_issuers: Vec<IssuerKey>,
     sqlite_writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
 }
 
@@ -81,7 +83,7 @@ impl PolicyV3Runtime {
             conn,
             node_did: node_did.into(),
             signer,
-            credential_issuer: None,
+            credential_issuers: Vec::new(),
             sqlite_writer_lock: None,
         }
     }
@@ -94,8 +96,26 @@ impl PolicyV3Runtime {
     /// Install the operator-authenticated OpenCredentials issuer tuple used
     /// by policy/v2 admission. Policy/v1 remains available without it.
     pub fn with_credential_issuer(mut self, issuer: IssuerKey) -> Self {
-        self.credential_issuer = Some(issuer);
+        self.credential_issuers.push(issuer);
         self
+    }
+
+    fn credential_issuer_for(
+        &self,
+        projection: &serde_json::Map<String, Value>,
+    ) -> Option<&IssuerKey> {
+        let issuer_did = projection.get("issuerDid")?.as_str()?;
+        let issuer_kid = projection.get("issuerKid")?.as_str()?;
+        let credential_type = projection.get("credentialType")?.get("id")?.as_str()?;
+        let profile = projection.get("profile")?.get("id")?.as_str()?;
+        self.credential_issuers.iter().find(|issuer| {
+            issuer.enabled
+                && issuer.issuer_did == issuer_did
+                && issuer.kid == issuer_kid
+                && issuer.vct == credential_type
+                && (profile != SHAPE_ROTATOR_PROFILE
+                    || credential_type == SHAPE_ROTATOR_CREDENTIAL_TYPE)
+        })
     }
 
     async fn is_registered_policy_root(&self, cid: &str) -> Result<bool, &'static str> {
@@ -4413,7 +4433,7 @@ fn validate_credential_admission_v3(
             .ok_or((Status::Forbidden, "credential-requirement-missing".into()))?,
     )?;
     validate_request_local_requirement(requirement, projection)?;
-    let issuer = runtime.credential_issuer.as_ref().ok_or((
+    let issuer = runtime.credential_issuer_for(projection).ok_or((
         Status::ServiceUnavailable,
         "credential-issuer-unavailable".into(),
     ))?;
@@ -5066,6 +5086,45 @@ mod tests {
     use tinycloud_core::migrations::Migrator;
     use tinycloud_core::sea_orm::{Database, EntityTrait, TransactionTrait};
     use tinycloud_core::sea_orm_migration::MigratorTrait;
+
+    #[tokio::test]
+    async fn registered_shape_rotator_issuer_is_selected_by_the_full_tuple() {
+        let issuer = IssuerKey::new(
+            "did:web:issuer.credentials.org",
+            SHAPE_ROTATOR_CREDENTIAL_TYPE,
+            1,
+            "did:web:issuer.credentials.org#shape-rotator-1",
+            [7; 32],
+        );
+        let runtime = PolicyV3Runtime {
+            conn: Database::connect("sqlite::memory:").await.unwrap(),
+            node_did: "did:key:node".into(),
+            signer: StaticSecret::new(vec![0; 32]).unwrap(),
+            credential_issuers: vec![issuer],
+            sqlite_writer_lock: None,
+        };
+        let mut projection = serde_json::Map::new();
+        projection.insert("issuerDid".into(), json!("did:web:issuer.credentials.org"));
+        projection.insert(
+            "issuerKid".into(),
+            json!("did:web:issuer.credentials.org#shape-rotator-1"),
+        );
+        projection.insert(
+            "profile".into(),
+            json!({"id": SHAPE_ROTATOR_PROFILE, "version": 1}),
+        );
+        projection.insert(
+            "credentialType".into(),
+            json!({"id": SHAPE_ROTATOR_CREDENTIAL_TYPE, "version": 1}),
+        );
+        assert!(runtime.credential_issuer_for(&projection).is_some());
+
+        projection.insert(
+            "credentialType".into(),
+            json!({"id": "opencredentials.email/v1", "version": 1}),
+        );
+        assert!(runtime.credential_issuer_for(&projection).is_none());
+    }
 
     fn policy_fixture() -> Value {
         let keypair = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
