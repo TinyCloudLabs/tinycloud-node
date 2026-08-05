@@ -903,7 +903,10 @@ mod tests {
         assert!(space_root_authority_matches(&space_id, &delegator_lower));
         assert!(space_root_authority_matches(&space_id, &delegator_checksum));
         assert!(space_root_authority_matches(&resource_id, &delegator_lower));
-        assert!(space_root_authority_matches(&resource_id, &delegator_checksum));
+        assert!(space_root_authority_matches(
+            &resource_id,
+            &delegator_checksum
+        ));
     }
 
     #[test]
