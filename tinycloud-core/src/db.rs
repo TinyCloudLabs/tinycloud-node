@@ -265,6 +265,12 @@ impl<B, K> SpaceDatabase<DatabaseConnection, B, K> {
         self.sql_sizes = sql_sizes;
         self
     }
+
+    /// Share the SQLite writer gate with control-plane transactions that use
+    /// the same SeaORM connection outside `SpaceDatabase`.
+    pub fn sqlite_writer_lock(&self) -> Option<Arc<tokio::sync::Mutex<()>>> {
+        self.writer_lock.clone()
+    }
 }
 
 impl<C, B, K> SpaceDatabase<C, B, K>
@@ -341,14 +347,11 @@ where
         };
         let bytes = crate::encryption::maybe_decrypt(self.encryption.as_ref(), &row.serialization)
             .map_err(|error| error.to_string())?;
-        let encoded = std::str::from_utf8(&bytes).map_err(|error| error.to_string())?;
-        let event =
-            SerializedEvent::<DelegationInfo>::from_header_ser::<TinyCloudDelegation>(encoded)
-                .map_err(|error| error.to_string())?;
-        if event.serialized_bytes() != bytes.as_slice()
-            || event.content_hash() != row.id
-            || event.content_hash() != Hash::from(cid)
-        {
+        let delegation =
+            TinyCloudDelegation::from_bytes(&bytes).map_err(|error| error.to_string())?;
+        let info = DelegationInfo::try_from(delegation).map_err(|error| error.to_string())?;
+        let event = SerializedEvent(info, bytes);
+        if event.content_hash() != row.id || event.content_hash() != Hash::from(cid) {
             return Err("delegation-signed-bytes-mismatch".to_string());
         }
         Ok(Some((row, event)))

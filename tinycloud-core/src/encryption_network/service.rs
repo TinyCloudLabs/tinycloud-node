@@ -100,6 +100,7 @@ pub struct EncryptionService {
     node_keypair: Option<Keypair>,
     backend: Arc<dyn KeyBackend>,
     invocation_ttl_seconds: i64,
+    sqlite_writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +124,7 @@ impl EncryptionService {
             node_keypair: None,
             backend,
             invocation_ttl_seconds: DEFAULT_INVOCATION_TTL_SECONDS,
+            sqlite_writer_lock: None,
         }
     }
 
@@ -138,7 +140,13 @@ impl EncryptionService {
             node_keypair: Some(node_keypair),
             backend,
             invocation_ttl_seconds: DEFAULT_INVOCATION_TTL_SECONDS,
+            sqlite_writer_lock: None,
         }
+    }
+
+    pub fn with_sqlite_writer_lock(mut self, lock: Option<Arc<tokio::sync::Mutex<()>>>) -> Self {
+        self.sqlite_writer_lock = lock;
+        self
     }
 
     pub fn node_did(&self) -> &str {
@@ -155,6 +163,10 @@ impl EncryptionService {
         &self,
         req: CreateNetworkRequest,
     ) -> Result<NetworkDescriptor, EncryptionServiceError> {
+        let _writer = match &self.sqlite_writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         let network_id = NetworkId::new(req.owner_did.clone(), req.name.clone())
             .map_err(|e| EncryptionServiceError::InvalidBody(format!("invalid network id: {e}")))?;
 
@@ -318,6 +330,10 @@ impl EncryptionService {
         &self,
         network_id: &NetworkId,
     ) -> Result<(), EncryptionServiceError> {
+        let _writer = match &self.sqlite_writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         let existing = encryption_network::Entity::find_by_id(network_id.to_string())
             .one(&self.db)
             .await?

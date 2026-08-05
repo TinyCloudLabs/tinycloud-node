@@ -427,6 +427,8 @@ pub async fn app_with_control(
     .await?
     .with_encryption(Some(webhook_encryption.clone()))
     .with_sql_sizes(sql_sizes.clone());
+    let encryption_service =
+        encryption_service.with_sqlite_writer_lock(tinycloud.sqlite_writer_lock());
 
     // Seed the SQL-size mirror AFTER `TinyCloud::new` ran migrations — the
     // `database_artifact` table now exists (seeding before migrations would
@@ -453,6 +455,25 @@ pub async fn app_with_control(
         Arc::new(tinycloud.clone()),
         Arc::new(sql_service.clone()),
     )?;
+    let mut policy_v3_runtime =
+        PolicyV3Runtime::new(seed_conn.clone(), key_setup.node_did(), key_setup.clone())
+            .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock());
+    if let Some(encoded_key) = tinycloud_config.share_email.issuer_public_key.as_deref() {
+        let decoded = base64::decode_config(encoded_key, base64::URL_SAFE_NO_PAD)
+            .context("policy credential issuer public key must be canonical base64url")?;
+        let public_key: [u8; 32] = decoded
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("policy credential issuer public key must be 32 bytes"))?;
+        policy_v3_runtime = policy_v3_runtime.with_credential_issuer(
+            tinycloud_auth::share_email_evidence::IssuerKey::new(
+                tinycloud_config.share_email.issuer_did.clone(),
+                tinycloud_config.share_email.issuer_vct.clone(),
+                tinycloud_config.share_email.issuer_key_version,
+                tinycloud_config.share_email.issuer_kid.clone(),
+                public_key,
+            ),
+        );
+    }
     #[cfg(all(tinycloud_legacy_share_v2, feature = "dstack"))]
     let dstack_tee_key_derived = matches!(tinycloud_config.keys, config::Keys::Dstack)
         || matches!(tinycloud_config.keys, config::Keys::Auto) && dstack::is_available();
@@ -596,11 +617,7 @@ pub async fn app_with_control(
         .manage(share_v2_runtime)
         .manage(tee_context)
         .manage(encryption_service)
-        .manage(PolicyV3Runtime::new(
-            seed_conn.clone(),
-            key_setup.node_did(),
-            key_setup.clone(),
-        ))
+        .manage(policy_v3_runtime)
         .manage(seed_conn.clone())
         .manage(tinycloud_config.storage.staging.open().await?);
 
