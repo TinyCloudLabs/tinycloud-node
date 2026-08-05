@@ -3407,8 +3407,44 @@ pub async fn authorize_delivery_v2(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hmac::{Hmac, Mac};
     use rocket::local::asynchronous::Client;
     use time::Duration;
+
+    #[test]
+    fn tenant_authorization_golden_vector_is_byte_exact() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../fixtures/tenant_authorization_v1.json"))
+                .expect("valid fixture");
+        let body = fixture["body"].as_str().expect("body").as_bytes();
+        assert_eq!(hex::encode(Sha256::digest(body)), fixture["contentSha256"]);
+        let key = decode_config(
+            fixture["webhookKey"].as_str().expect("key"),
+            URL_SAFE_NO_PAD,
+        )
+        .unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(&key).unwrap();
+        for (index, part) in [
+            fixture["authorizationDomain"].as_str().unwrap().as_bytes(),
+            fixture["method"].as_str().unwrap().as_bytes(),
+            fixture["route"].as_str().unwrap().as_bytes(),
+            fixture["deliveryId"].as_str().unwrap().as_bytes(),
+            fixture["timestamp"].as_str().unwrap().as_bytes(),
+            body,
+        ]
+        .iter()
+        .enumerate()
+        {
+            mac.update(part);
+            if index < 5 {
+                mac.update(b"\0");
+            }
+        }
+        assert_eq!(
+            encode_config(mac.finalize().into_bytes(), URL_SAFE_NO_PAD),
+            fixture["expectedMac"]
+        );
+    }
 
     #[test]
     fn policy_domain_matches_the_sdk_wire_contract() {
