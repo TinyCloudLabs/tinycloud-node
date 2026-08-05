@@ -169,6 +169,42 @@ fn resource_extends(granted: &str, required: &str) -> bool {
     required.extends(&granted).is_ok()
 }
 
+// TC-482: a capability's resource URI is not always a TinyCloud `tinycloud:`
+// ResourceId. Every default (no-manifest) SDK sign-in requests an encryption
+// network grant alongside kv/sql/duckdb/capabilities/hooks
+// (NodeUserAuthorization.resolveSignInCapabilities's `rawAbilities` -
+// packages/node-sdk/src/authorization/NodeUserAuthorization.ts), whose
+// resource is a `urn:tinycloud:encryption:<ownerDid>:<network>` NetworkId
+// URN, not a ResourceId.
+//
+// tinycloud-core's own capability extraction is infallible over resource
+// shape: `Resource::from(UriString)` (tinycloud-core/src/types/resource.rs)
+// tries ResourceId first and falls back to `Resource::Other(uri)` - an
+// opaque, verbatim URI - rather than rejecting the delegation. That is the
+// contract of record (tinycloud-core/src/util.rs's extract_siwe_cap /
+// extract_ucan_caps both call it unconditionally, never erroring on
+// resource shape). The WASM verifier's extract_recap_capabilities /
+// extract_ucan_capabilities previously required every resource to parse as
+// a ResourceId and threw `Decode: Incorrect Structure` otherwise, rejecting
+// a session shape the Rust node accepts every day - failing every default
+// full-permission sign-in against a WASM-verifying node with an opaque 500
+// once cf-node's own error mapping is fixed. Mirror the Rust fallback
+// exactly: canonicalize when the resource IS a TinyCloud ResourceId (which
+// also gets EIP-55 checksum normalization "for free" from ResourceId's
+// Display), and pass any other URI through unchanged otherwise. This does
+// not affect resource_extends()/resource_path_contains() above: an
+// unparseable-as-ResourceId resource still can never `extend` or contain a
+// TinyCloud ResourceId, so a non-TinyCloud capability grant remains inert
+// for every KV/SQL/etc containment check - it is carried through the
+// verdict for callers that understand its own extension semantics (e.g. a
+// caller matching NetworkId URNs directly), not silently authorized against
+// TinyCloud resources.
+fn canonicalize_capability_resource(resource: &str) -> String {
+    ResourceId::from_str(resource)
+        .map(|id| id.to_string())
+        .unwrap_or_else(|_| resource.to_string())
+}
+
 fn verify_header_bytes(bytes: &[u8]) -> Result<TinyCloudDelegation, VerificationError> {
     TinyCloudDelegation::from_bytes(bytes)
         .map_err(|error| VerificationError::decode(error.to_string()))
@@ -185,9 +221,7 @@ fn extract_ucan_capabilities(
 ) -> Result<Vec<CapabilityGrant>, VerificationError> {
     let mut grants = Vec::new();
     for (resource, abilities) in capabilities.abilities() {
-        let resource = ResourceId::from_str(resource.as_str())
-            .map_err(|error| VerificationError::decode(error.to_string()))?
-            .to_string();
+        let resource = canonicalize_capability_resource(resource.as_str());
         for (action, caveat_collection) in abilities.iter() {
             let mut caveats = BTreeMap::new();
             for (index, note_bene) in caveat_collection.as_ref().iter().enumerate() {
@@ -211,9 +245,7 @@ fn extract_recap_capabilities(
     let (caps, proofs) = capability.into_inner();
     let mut grants = Vec::new();
     for (resource, abilities) in caps.into_inner() {
-        let resource = ResourceId::from_str(resource.as_str())
-            .map_err(|error| VerificationError::decode(error.to_string()))?
-            .to_string();
+        let resource = canonicalize_capability_resource(resource.as_str());
         // Mirror extract_ucan_capabilities exactly: a ReCap ability's note-bene
         // collection is the caveat set. `Caveats<T>` deserialization already
         // normalizes the spec's mandatory-but-meaningless `[{}]` sentinel down
@@ -1039,6 +1071,59 @@ mod tests {
 
         assert_eq!(grants.len(), 1);
         assert!(grants[0].caveats.is_empty());
+    }
+
+    // TC-482: default (no-manifest) SDK sign-ins request an encryption
+    // network grant (NodeUserAuthorization.resolveSignInCapabilities's
+    // `rawAbilities`) whose resource is a `urn:tinycloud:encryption:...`
+    // NetworkId URN, not a TinyCloud `tinycloud:` ResourceId. Before this
+    // fix, extract_recap_capabilities() required every capability resource
+    // to parse as a ResourceId and threw `Decode: Incorrect Structure` on
+    // this exact shape - rejecting a session the Rust node accepts (Rust's
+    // own extraction, tinycloud-core/src/types/resource.rs's
+    // `Resource::from(UriString)`, falls back to keeping the URI verbatim
+    // instead of erroring). This pins the WASM verifier to the same
+    // behavior: a non-tinycloud resource URI must not fail extraction, and
+    // its grant must survive with the resource kept verbatim.
+    #[test]
+    fn recap_capabilities_accept_non_tinycloud_resource_uris() {
+        const NETWORK_RESOURCE: &str =
+            "urn:tinycloud:encryption:did:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:default";
+
+        let golden = parse_golden();
+        let vector = golden
+            .valid
+            .iter()
+            .find(|vector| vector.case == "depth-1")
+            .expect("depth-1 vector");
+        let mut message: tinycloud_auth::cacaos::siwe::Message =
+            vector.siwe.parse().expect("siwe parses");
+        message.statement = None;
+        message.resources = Vec::new();
+
+        let mut capability = SiweRecapCapability::<serde_json::Value>::new();
+        capability
+            .with_action_convert(
+                NETWORK_RESOURCE,
+                "tinycloud.encryption/decrypt",
+                vec![BTreeMap::new()],
+            )
+            .expect("with_action_convert accepts a raw, non-tinycloud resource URI");
+
+        let message = capability
+            .build_message(message)
+            .expect("build_message produces a signable SIWE message");
+
+        let recap = SiweRecapCapability::<serde_json::Value>::extract_and_verify(&message)
+            .expect("recap extracts and its statement verifies")
+            .expect("recap is present");
+
+        let (grants, _proofs) = extract_recap_capabilities(recap)
+            .expect("extraction must not fail on a non-tinycloud resource URI (TC-482 regression)");
+
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].resource, NETWORK_RESOURCE);
+        assert_eq!(grants[0].action, "tinycloud.encryption/decrypt");
     }
 
     #[test]
