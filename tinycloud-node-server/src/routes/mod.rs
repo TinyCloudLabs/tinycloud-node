@@ -4255,7 +4255,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn w1_rocket_http_invoke_enforces_chain_constrained_sql_and_revoke() -> Result<()> {
+    async fn w1_rocket_http_invoke_enforces_chain_constrained_sql_with_kv_mutation_and_revoke(
+    ) -> Result<()> {
         use rocket::http::{ContentType, Header, Status};
         use rocket::local::asynchronous::Client;
         use serde_json::json;
@@ -4263,12 +4264,14 @@ mod tests {
         use tinycloud_auth::ssi::{dids::DIDURLBuf, ucan::Payload};
         use tinycloud_auth::ucan_capabilities_object::Capabilities;
         use tinycloud_core::models::{
-            abilities, actor, delegation as deleg_model, revocation as revo_model,
+            abilities, actor, current_kv, delegation as deleg_model, epoch,
+            invocation as invocation_model, kv_write, revocation as revo_model,
             space as space_model,
         };
+        use tinycloud_core::relationships::event_order;
         use tinycloud_core::sea_orm::ActiveModelTrait;
         use tinycloud_core::sea_orm::ActiveValue::Set;
-        use tinycloud_core::types::{Caveats, SpaceIdWrap};
+        use tinycloud_core::types::{Caveats, Metadata, Path, SpaceIdWrap};
 
         let tempdir = TempDir::new()?;
         let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
@@ -4364,6 +4367,16 @@ mod tests {
             None,
             None,
         );
+        // Keep a KV mutation capability on every invocation below. `/invoke`
+        // dispatches to SQL when any SQL capability is present, while core
+        // authorization takes its mutation path when this `kv/del` is
+        // present. That mixed shape must not drop the SQL chain caveat.
+        let kv_resource: ResourceId = space.clone().to_resource(
+            "kv".parse::<Service>()?,
+            Some("discard".parse::<AuthPath>()?),
+            None,
+            None,
+        );
         let constrained_caveat = json!({
             "mode": "constrained-statements",
             "readOnly": true,
@@ -4383,6 +4396,68 @@ mod tests {
         }
         .insert(&conn)
         .await?;
+        abilities::ActiveModel {
+            delegation: Set(parent_hash),
+            resource: Set(Resource::TinyCloud(kv_resource.clone())),
+            ability: Set(Ability::try_from("tinycloud.kv/del".to_string()).unwrap()),
+            caveats: Set(Caveats::default()),
+        }
+        .insert(&conn)
+        .await?;
+        let seed_invocation = tinycloud_core::hash::hash(b"w1-mixed-kv-delete-invocation");
+        let seed_epoch = tinycloud_core::hash::hash(b"w1-mixed-kv-delete-epoch");
+        let seed_value = tinycloud_core::hash::hash(b"w1-mixed-kv-delete-value");
+        invocation_model::ActiveModel {
+            id: Set(seed_invocation),
+            invoker: Set(space.did().to_string()),
+            issued_at: Set(OffsetDateTime::now_utc()),
+            facts: Set(None),
+            serialization: Set(b"w1-mixed-kv-delete-invocation".to_vec()),
+        }
+        .insert(&conn)
+        .await?;
+        epoch::ActiveModel {
+            seq: Set(0),
+            id: Set(seed_epoch),
+            space: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&conn)
+        .await?;
+        event_order::ActiveModel {
+            seq: Set(0),
+            epoch: Set(seed_epoch),
+            epoch_seq: Set(0),
+            event: Set(seed_invocation),
+            space: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&conn)
+        .await?;
+        let seed_write = kv_write::Model {
+            space: SpaceIdWrap(space.clone()),
+            key: Path::try_from("discard".to_string())?,
+            invocation: seed_invocation,
+            seq: 0,
+            epoch: seed_epoch,
+            epoch_seq: 0,
+            value: seed_value,
+            metadata: Metadata(Default::default()),
+        };
+        kv_write::ActiveModel::from(seed_write.clone())
+            .insert(&conn)
+            .await?;
+        current_kv::ActiveModel {
+            space: Set(seed_write.space),
+            key: Set(seed_write.key),
+            invocation: Set(seed_invocation),
+            seq: Set(0),
+            epoch: Set(seed_epoch),
+            epoch_seq: Set(0),
+            value: Set(seed_value),
+            metadata: Set(Metadata(Default::default())),
+            deleted: Set(false),
+        }
+        .insert(&conn)
+        .await?;
         let parent_cid: AuthCid = parent_hash.to_cid(0x55);
         let mut invocation_nb = std::collections::BTreeMap::new();
         for (key, value) in constrained_caveat
@@ -4391,13 +4466,20 @@ mod tests {
         {
             invocation_nb.insert(key.clone(), value.clone());
         }
-        let make_auth_header = |nonce: &str| -> Result<String> {
+        let make_auth_header = |nonce: &str, include_kv_delete: bool| -> Result<String> {
             let mut invocation_caps = Capabilities::new();
             invocation_caps.with_action(
                 sql_resource.as_uri(),
                 "tinycloud.sql/read".parse::<UcanAbility>()?,
                 [invocation_nb.clone()],
             );
+            if include_kv_delete {
+                invocation_caps.with_action(
+                    kv_resource.as_uri(),
+                    "tinycloud.kv/del".parse::<UcanAbility>()?,
+                    [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+                );
+            }
             let invocation = Payload {
                 issuer: verification_method.parse::<DIDURLBuf>()?,
                 audience: verification_method
@@ -4426,7 +4508,7 @@ mod tests {
             .sign(jwk.get_algorithm().unwrap_or_default(), &jwk)?;
             Ok(invocation.encode()?)
         };
-        let auth_header = make_auth_header("urn:uuid:00000000-0000-4000-8000-000000000001")?;
+        let auth_header = make_auth_header("urn:uuid:00000000-0000-4000-8000-000000000001", false)?;
 
         let rocket = rocket::build()
             .mount("/", rocket::routes![invoke])
@@ -4461,6 +4543,31 @@ mod tests {
         assert_eq!(json["rowCount"], 1);
         assert_eq!(json["rows"][0][0], 111);
 
+        // Regression: a mixed SQL + KV mutation invocation follows the core
+        // mutation branch. The persisted constrained-statements caveat must
+        // still win, so raw SQL remains forbidden rather than bypassing the
+        // chain profile.
+        let raw_auth_header =
+            make_auth_header("urn:uuid:00000000-0000-4000-8000-000000000003", true)?;
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", raw_auth_header))
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&SqlRequest::Execute {
+                schema: None,
+                sql: "SELECT val FROM labels WHERE label = 'beta'".to_string(),
+                params: vec![],
+            })?)
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            Status::Forbidden,
+            "mixed SQL + KV invocation must preserve the chain SQL caveat: {body}"
+        );
+
         let response = client
             .post("/invoke")
             .header(Header::new("Authorization", auth_header.clone()))
@@ -4488,7 +4595,7 @@ mod tests {
         .insert(&conn)
         .await?;
 
-        let auth_header = make_auth_header("urn:uuid:00000000-0000-4000-8000-000000000002")?;
+        let auth_header = make_auth_header("urn:uuid:00000000-0000-4000-8000-000000000002", false)?;
         let response = client
             .post("/invoke")
             .header(Header::new("Authorization", auth_header.clone()))

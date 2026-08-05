@@ -1731,6 +1731,15 @@ where
             crate::telemetry::StageOutcome::Ok,
             authz_start.elapsed(),
         );
+        // SQL routes can carry a KV mutation capability in the same
+        // invocation. Derive the chain caveat before taking that mutation
+        // path so the SQL handler receives the same fail-closed candidates
+        // as a SQL-only (read-only) invocation. This is an in-memory scan of
+        // the guarded authorization snapshot and adds no database work.
+        let sql_constrained_statement_candidates =
+            constrained_statement_candidates(&invocation, &options, &auth_graph).map_err(
+                |rejection| TxStoreError::Tx(TxError::MalformedSqlCaveat(rejection.as_str())),
+            )?;
         let mut stages = HashMap::new();
         let mut ops = Vec::new();
         let mut write_hashes = HashMap::new();
@@ -1932,7 +1941,7 @@ where
             InvokeMode::Admitted => Event::AdmittedInvocation(Box::new(invocation), ops),
             InvokeMode::Public => Event::Invocation(Box::new(invocation), ops),
         };
-        let commit = transact(
+        let mut commit = transact(
             &tx,
             &self.storage,
             &self.secrets,
@@ -1948,6 +1957,7 @@ where
                 TxStoreError::Tx(error)
             }
         })?;
+        commit.sql_constrained_statement_candidates = sql_constrained_statement_candidates;
 
         let mut results = Vec::new();
         // perform and record side effects
@@ -2254,27 +2264,11 @@ where
         // snapshot -- an in-memory scan, zero additional statements -- so a
         // caller (the SQL route) never has to re-walk `parent_delegations`
         // itself.
-        let sql_constrained_statement_candidates = if options
-            .derive_sql_constrained_statement_caveat
-        {
-            let roots: Vec<Hash> = invocation
-                .0
-                .parents
-                .iter()
-                .copied()
-                .map(Hash::from)
-                .collect();
-            match auth_graph.map(|graph| graph.constrained_statement_caveat_candidates(&roots)) {
-                Some(Ok(candidates)) => candidates,
-                Some(Err(rejection)) => {
-                    return Err(TxStoreError::Tx(TxError::MalformedSqlCaveat(
-                        rejection.as_str(),
-                    )));
-                }
-                None => Vec::new(),
-            }
-        } else {
-            Vec::new()
+        let sql_constrained_statement_candidates = match auth_graph {
+            Some(graph) => constrained_statement_candidates(&invocation, &options, graph).map_err(
+                |rejection| TxStoreError::Tx(TxError::MalformedSqlCaveat(rejection.as_str())),
+            )?,
+            None => Vec::new(),
         };
         Ok((
             TransactResult {
@@ -2286,6 +2280,31 @@ where
             results,
         ))
     }
+}
+
+/// Extract constrained SQL caveats from the request's already-guarded
+/// authorization snapshot. Both read-only and mutation-bearing invocations
+/// use this helper: SQL routing is selected by SQL capabilities, while the
+/// transaction path is selected independently by KV mutations.
+fn constrained_statement_candidates(
+    invocation: &Invocation,
+    options: &KvInvokeOptions,
+    auth_graph: &crate::auth_graph::AuthGraphSnapshot,
+) -> Result<
+    Vec<crate::policy_capability::sql_caveat::SqlConstrainedStatementCaveat>,
+    crate::policy_capability::RejectionCode,
+> {
+    if !options.derive_sql_constrained_statement_caveat {
+        return Ok(Vec::new());
+    }
+    let roots: Vec<Hash> = invocation
+        .0
+        .parents
+        .iter()
+        .copied()
+        .map(Hash::from)
+        .collect();
+    auth_graph.constrained_statement_caveat_candidates(&roots)
 }
 
 fn chain_isolation_level<C: ConnectionTrait>(db: &C) -> Option<sea_orm::IsolationLevel> {
