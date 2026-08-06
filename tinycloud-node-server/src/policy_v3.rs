@@ -849,12 +849,14 @@ fn v3_registration_is_live(
         .is_ok_and(|expires| format_time(expires) == registration.expires_at && expires > now)
 }
 
+type V3DeliveryProjection<'a> = (&'a serde_json::Map<String, Value>, &'a str, Vec<String>);
+
 fn v3_envelope_delivery_projection<'a>(
     envelope: &'a Value,
     registration: &policy_v3_registration::Model,
     delivery: &DeliveryRuntime,
     request: &DeliveryAuthorizationRequest,
-) -> Result<(&'a serde_json::Map<String, Value>, &'a str, Vec<String>), ()> {
+) -> Result<V3DeliveryProjection<'a>, ()> {
     let object = envelope.as_object().ok_or(())?;
     let signature = object
         .get("signature")
