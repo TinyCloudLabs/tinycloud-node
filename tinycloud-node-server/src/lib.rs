@@ -94,10 +94,10 @@ use hooks::HookRuntime;
 use invocation_replay::InvocationReplayCache;
 use node_control::control::ControlPlaneHandle;
 use policy_v3::{
-    challenge as policy_v3_challenge, get_status as get_policy_v3_status,
-    issue_enforcer_binding as policy_v3_enforcer_binding, mint as policy_v3_mint,
-    register_policy as register_policy_v3, revoke_root as revoke_policy_v3_root,
-    status as policy_v3_status, PolicyV3Runtime,
+    authorize_delivery as authorize_policy_v3_delivery, challenge as policy_v3_challenge,
+    get_status as get_policy_v3_status, issue_enforcer_binding as policy_v3_enforcer_binding,
+    mint as policy_v3_mint, register_policy as register_policy_v3,
+    revoke_root as revoke_policy_v3_root, status as policy_v3_status, PolicyV3Runtime,
 };
 use quota::QuotaCache;
 #[cfg(feature = "tc-bench-v1")]
@@ -289,6 +289,7 @@ pub async fn app_with_control(
         register_policy_v3,
         get_policy_v3_status,
         policy_v3_enforcer_binding,
+        authorize_policy_v3_delivery,
         policy_v3_challenge,
         policy_v3_mint,
         policy_v3_status,
@@ -457,7 +458,8 @@ pub async fn app_with_control(
     )?;
     let mut policy_v3_runtime =
         PolicyV3Runtime::new(seed_conn.clone(), key_setup.node_did(), key_setup.clone())
-            .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock());
+            .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock())
+            .with_delivery(&tinycloud_config.share_email)?;
     if let Some(encoded_key) = tinycloud_config.share_email.issuer_public_key.as_deref() {
         let decoded = base64::decode_config(encoded_key, base64::URL_SAFE_NO_PAD)
             .context("policy credential issuer public key must be canonical base64url")?;
@@ -1024,7 +1026,10 @@ mod share_security_fairing_tests {
     use rocket::{http::Header, local::asynchronous::Client, options, routes};
 
     #[options("/share/v2/deliveries/authorize")]
-    fn share_delivery_preflight() {}
+    fn share_v2_delivery_preflight() {}
+
+    #[options("/share/v3/deliveries/authorize")]
+    fn share_v3_delivery_preflight() {}
 
     #[options("/v1/config")]
     fn non_share_preflight() {}
@@ -1033,43 +1038,65 @@ mod share_security_fairing_tests {
     async fn chromium_share_delivery_preflight_allows_authorization() {
         let client = Client::tracked(
             rocket::build()
-                .mount("/", routes![share_delivery_preflight, non_share_preflight])
+                .mount(
+                    "/",
+                    routes![
+                        share_v2_delivery_preflight,
+                        share_v3_delivery_preflight,
+                        non_share_preflight
+                    ],
+                )
                 .attach(share_security_fairing("https://share.tinycloud.xyz".into())),
         )
         .await
         .expect("valid Rocket instance");
 
-        let response = client
-            .options("/share/v2/deliveries/authorize")
-            .header(Header::new("Origin", "https://share.tinycloud.xyz"))
-            .header(Header::new("Access-Control-Request-Method", "POST"))
-            .header(Header::new(
-                "Access-Control-Request-Headers",
-                "authorization,content-type",
-            ))
-            .dispatch()
-            .await;
+        for path in [
+            "/share/v2/deliveries/authorize",
+            "/share/v3/deliveries/authorize",
+        ] {
+            let response = client
+                .options(path)
+                .header(Header::new("Origin", "https://share.tinycloud.xyz"))
+                .header(Header::new("Access-Control-Request-Method", "POST"))
+                .header(Header::new(
+                    "Access-Control-Request-Headers",
+                    "authorization,content-type",
+                ))
+                .dispatch()
+                .await;
 
-        assert_eq!(response.status(), rocket::http::Status::Ok);
-        assert_eq!(
-            response.headers().get_one("Access-Control-Allow-Origin"),
-            Some("https://share.tinycloud.xyz")
-        );
-        assert_eq!(
-            response.headers().get_one("Access-Control-Allow-Methods"),
-            Some("GET, POST")
-        );
-        assert_eq!(
-            response.headers().get_one("Access-Control-Allow-Headers"),
-            Some("Content-Type, Authorization")
-        );
+            assert_eq!(response.status(), rocket::http::Status::Ok, "{path}");
+            assert_eq!(
+                response.headers().get_one("Access-Control-Allow-Origin"),
+                Some("https://share.tinycloud.xyz"),
+                "{path}"
+            );
+            assert_eq!(
+                response.headers().get_one("Access-Control-Allow-Methods"),
+                Some("GET, POST"),
+                "{path}"
+            );
+            assert_eq!(
+                response.headers().get_one("Access-Control-Allow-Headers"),
+                Some("Content-Type, Authorization"),
+                "{path}"
+            );
+        }
     }
 
     #[tokio::test]
     async fn non_share_preflight_does_not_receive_share_cors_headers() {
         let client = Client::tracked(
             rocket::build()
-                .mount("/", routes![share_delivery_preflight, non_share_preflight])
+                .mount(
+                    "/",
+                    routes![
+                        share_v2_delivery_preflight,
+                        share_v3_delivery_preflight,
+                        non_share_preflight
+                    ],
+                )
                 .attach(share_security_fairing("https://share.tinycloud.xyz".into())),
         )
         .await

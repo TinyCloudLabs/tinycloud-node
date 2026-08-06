@@ -7755,6 +7755,7 @@ dependencies = [
 name = "tinycloud-node"
 version = "1.14.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "async-trait",
  "aws-config",
