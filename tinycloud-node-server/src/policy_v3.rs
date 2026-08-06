@@ -5,6 +5,10 @@
 //! policy-session UCAN: the sibling-root registration, signed status, the
 //! challenge/claim replay boundary, and the first-admission gate.
 
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
 use base64::{decode_config, encode_config, URL_SAFE_NO_PAD};
 use rand::RngCore;
 use rocket::{http::Status, serde::json::Json, State};
@@ -29,17 +33,21 @@ use tinycloud_core::{
     hash::hash,
     keys::StaticSecret,
     models::{
-        abilities, delegation as delegation_model, policy_v3_challenge, policy_v3_registration,
-        policy_v3_root, policy_v3_session, revocation, space,
+        abilities, delegation as delegation_model, invocation as invocation_model,
+        policy_v3_challenge, policy_v3_registration, policy_v3_root, policy_v3_session, revocation,
+        share_invitation_authorization_jti, space,
     },
     relationships::parent_delegations,
     sea_orm::{
         sea_query::Expr, ActiveModelTrait, ColumnTrait, DatabaseConnection, DatabaseTransaction,
         EntityTrait, QueryFilter, QuerySelect, Set, TransactionTrait,
     },
+    share_email::invitation::{Ed25519InvitationSigner, InvitationSigner},
     types::SpaceIdWrap,
     util::{DelegationInfo, InvocationInfo},
 };
+
+use crate::{authorization::AuthHeaderGetter, config::ShareEmailConfig};
 
 pub const POLICY_SESSION_PROFILE: &str = "policy-session-ucan/v1";
 pub const POLICY_V1_SCHEMA: &str = "xyz.tinycloud.policy/policy/v1";
@@ -61,6 +69,17 @@ const CAPABILITY_CEILING_DOMAIN: &[u8] = b"xyz.tinycloud.policy/PolicyCapability
 const NATIVE_PROJECTION_DOMAIN: &[u8] = b"xyz.tinycloud.policy/NativeProjection/v1\0";
 const MAX_STATUS_AGE_SECONDS: i64 = 300;
 const MAX_SESSION_TTL_SECONDS: i64 = 60;
+const DELIVERY_AUTHORIZATION_V3_DOMAIN: &[u8] = b"xyz.tinycloud.share/delivery-authorization/v3\0";
+
+#[derive(Clone)]
+struct DeliveryRuntime {
+    signer: Arc<Ed25519InvitationSigner>,
+    target_origin: String,
+    node_audience: String,
+    enforcer_did: String,
+    return_origin: String,
+    credentials_origin: String,
+}
 
 #[derive(Clone)]
 pub struct PolicyV3Runtime {
@@ -68,6 +87,7 @@ pub struct PolicyV3Runtime {
     pub node_did: String,
     signer: StaticSecret,
     credential_issuer: Option<IssuerKey>,
+    delivery: Option<DeliveryRuntime>,
     sqlite_writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
 }
 
@@ -82,6 +102,7 @@ impl PolicyV3Runtime {
             node_did: node_did.into(),
             signer,
             credential_issuer: None,
+            delivery: None,
             sqlite_writer_lock: None,
         }
     }
@@ -96,6 +117,46 @@ impl PolicyV3Runtime {
     pub fn with_credential_issuer(mut self, issuer: IssuerKey) -> Self {
         self.credential_issuer = Some(issuer);
         self
+    }
+
+    /// Configure the Node-owned, proof-producing delivery boundary. The
+    /// signing key must be the same derived key published in the operator's
+    /// trust bundle; an absent or mismatched key keeps v3 delivery disabled.
+    pub fn with_delivery(mut self, config: &ShareEmailConfig) -> anyhow::Result<Self> {
+        if !config.enabled {
+            return Ok(self);
+        }
+        let credentials_origin = config
+            .credentials_origin
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("v3 delivery credentials origin is missing"))?;
+        let configured = config
+            .invitation_public_key
+            .as_deref()
+            .and_then(|value| decode_config(value, URL_SAFE_NO_PAD).ok())
+            .and_then(|value| <[u8; 32]>::try_from(value).ok())
+            .ok_or_else(|| anyhow::anyhow!("v3 delivery invitation public key is invalid"))?;
+        if configured != self.signer.share_invitation_public_key() {
+            anyhow::bail!("v3 delivery invitation signing key does not match configured trust");
+        }
+        let seed = self
+            .signer
+            .derive_key(b"tinycloud/share-email/invitation-signing");
+        let secret = tinycloud_core::libp2p::identity::ed25519::SecretKey::try_from_bytes(seed)
+            .map_err(|_| anyhow::anyhow!("v3 delivery invitation signing key is invalid"))?;
+        let keypair = tinycloud_core::libp2p::identity::ed25519::Keypair::from(secret);
+        self.delivery = Some(DeliveryRuntime {
+            signer: Arc::new(Ed25519InvitationSigner::new(
+                config.invitation_kid.clone(),
+                keypair.into(),
+            )?),
+            target_origin: config.target_origin.clone(),
+            node_audience: config.node_audience.clone(),
+            enforcer_did: self.node_did.clone(),
+            return_origin: config.return_origin.clone(),
+            credentials_origin,
+        });
+        Ok(self)
     }
 
     async fn is_registered_policy_root(&self, cid: &str) -> Result<bool, &'static str> {
@@ -723,6 +784,412 @@ pub struct RegisterResponse {
     pub policy_cid: String,
     pub policy_root_cid: String,
     pub enforcement_root_cid: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeliveryAuthorizationRequest {
+    pub envelope: Value,
+    pub sealed_envelope: String,
+    pub envelope_key: String,
+    pub share_cid: String,
+    pub recipient_email: String,
+    pub share_url: String,
+    pub document_name: String,
+    pub jti: String,
+    pub expires_at: String,
+    pub request_body_digest: String,
+}
+
+fn delivery_request_digest(request: &DeliveryAuthorizationRequest) -> Result<String, ()> {
+    let mut value = serde_json::to_value(request).map_err(|_| ())?;
+    value.as_object_mut().ok_or(())?.remove("requestBodyDigest");
+    Ok(encode_config(
+        Sha256::digest(canonical_json_value(&value)),
+        URL_SAFE_NO_PAD,
+    ))
+}
+
+fn delivery_email(value: &str) -> Option<String> {
+    let (local, domain) = value.rsplit_once('@')?;
+    if local.is_empty()
+        || domain.is_empty()
+        || value.len() > 254
+        || value.bytes().any(|byte| byte <= 0x20 || byte >= 0x7f)
+        || !domain
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+    {
+        return None;
+    }
+    Some(format!(
+        "{}@{}",
+        local.to_ascii_lowercase(),
+        domain.to_ascii_lowercase()
+    ))
+}
+
+fn v3_delivery_url_matches(url: &str, origin: &str, share_cid: &str, envelope_key: &str) -> bool {
+    let prefix = format!("{origin}/s/{share_cid}#k=");
+    let Some(key) = url.strip_prefix(&prefix) else {
+        return false;
+    };
+    key == envelope_key
+        && key.len() == 43
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn v3_registration_is_live(
+    registration: &policy_v3_registration::Model,
+    now: OffsetDateTime,
+) -> bool {
+    parse_time(&registration.expires_at)
+        .is_ok_and(|expires| format_time(expires) == registration.expires_at && expires > now)
+}
+
+fn v3_envelope_delivery_projection<'a>(
+    envelope: &'a Value,
+    registration: &policy_v3_registration::Model,
+    delivery: &DeliveryRuntime,
+    request: &DeliveryAuthorizationRequest,
+) -> Result<(&'a serde_json::Map<String, Value>, &'a str, Vec<String>), ()> {
+    let object = envelope.as_object().ok_or(())?;
+    let signature = object
+        .get("signature")
+        .and_then(Value::as_object)
+        .ok_or(())?;
+    if signature.len() != 3
+        || signature.get("algorithm").and_then(Value::as_str) != Some("Ed25519")
+        || signature.get("signerDid").and_then(Value::as_str)
+            != Some(registration.owner_did.as_str())
+    {
+        return Err(());
+    }
+    let signature_bytes = signature
+        .get("value")
+        .and_then(Value::as_str)
+        .and_then(|value| decode_config(value, URL_SAFE_NO_PAD).ok())
+        .ok_or(())?;
+    let mut unsigned = envelope.clone();
+    unsigned.as_object_mut().ok_or(())?.remove("signature");
+    let mut signing_bytes = b"xyz.tinycloud.share/envelope/v3\0".to_vec();
+    signing_bytes.extend_from_slice(&canonical_json_value(&unsigned));
+    verify_detached_ed25519(
+        &registration.owner_did,
+        &Sha256::digest(signing_bytes),
+        &signature_bytes,
+    )
+    .map_err(|_| ())?;
+
+    let policy = object.get("policy").ok_or(())?;
+    if object.get("version").and_then(Value::as_u64) != Some(3)
+        || canonical_json_value(policy) != registration.policy_bytes
+        || object.get("policyCid").and_then(Value::as_str) != Some(registration.policy_cid.as_str())
+        || object
+            .get("policyRoot")
+            .and_then(Value::as_object)
+            .and_then(|root| root.get("cid"))
+            .and_then(Value::as_str)
+            != Some(registration.policy_root_cid.as_str())
+        || object
+            .get("enforcementRoot")
+            .and_then(Value::as_object)
+            .and_then(|root| root.get("cid"))
+            .and_then(Value::as_str)
+            != Some(registration.enforcement_root_cid.as_str())
+        || object.get("contentSourceDigestHex").and_then(Value::as_str)
+            != Some(registration.content_source_digest_hex.as_str())
+        || object.get("contentSource") != policy.get("contentSource")
+        || object.get("expiry").and_then(Value::as_str) != Some(registration.expires_at.as_str())
+    {
+        return Err(());
+    }
+    let target = object.get("target").and_then(Value::as_object).ok_or(())?;
+    let binding = object
+        .get("attestedEnforcerBinding")
+        .and_then(Value::as_object)
+        .ok_or(())?;
+    if target.get("origin").and_then(Value::as_str) != Some(delivery.target_origin.as_str())
+        || target.get("nodeAudience").and_then(Value::as_str)
+            != Some(delivery.enforcer_did.as_str())
+        || binding.get("enforcerDid").and_then(Value::as_str)
+            != Some(delivery.enforcer_did.as_str())
+        || binding.get("nodeAudience").and_then(Value::as_str)
+            != Some(delivery.enforcer_did.as_str())
+    {
+        return Err(());
+    }
+    let matcher = object
+        .get("recipientMatcher")
+        .and_then(Value::as_object)
+        .ok_or(())?;
+    let expected_email = matcher
+        .get("value")
+        .and_then(Value::as_str)
+        .and_then(delivery_email);
+    if matcher.len() != 2
+        || matcher.get("kind").and_then(Value::as_str) != Some("exactEmail")
+        || expected_email.as_deref() != delivery_email(&request.recipient_email).as_deref()
+        || object.get("deliveryEmail").and_then(Value::as_str)
+            != Some(request.recipient_email.as_str())
+    {
+        return Err(());
+    }
+    let display_name = object
+        .get("display")
+        .and_then(Value::as_object)
+        .and_then(|display| display.get("filename"))
+        .and_then(Value::as_str)
+        .ok_or(())?;
+    if display_name != request.document_name {
+        return Err(());
+    }
+    let actions = object
+        .get("actions")
+        .and_then(Value::as_array)
+        .ok_or(())?
+        .iter()
+        .map(|value| value.as_str().map(ToOwned::to_owned).ok_or(()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if actions.is_empty() {
+        return Err(());
+    }
+    Ok((object, display_name, actions))
+}
+
+fn verify_v3_sealed_envelope(
+    envelope: &Value,
+    request: &DeliveryAuthorizationRequest,
+) -> Result<(), ()> {
+    let sealed = decode_config(&request.sealed_envelope, URL_SAFE_NO_PAD).map_err(|_| ())?;
+    let key = decode_config(&request.envelope_key, URL_SAFE_NO_PAD).map_err(|_| ())?;
+    if sealed.len() < 29 || sealed.len() > 2 * 1024 * 1024 || sealed[0] != 1 || key.len() != 32 {
+        return Err(());
+    }
+    let expected_cid = tinycloud_auth::ipld_core::cid::Cid::new_v1(
+        0x55,
+        tinycloud_auth::multihash_codetable::Code::Sha2_256.digest(&sealed),
+    )
+    .to_string();
+    if expected_cid != request.share_cid {
+        return Err(());
+    }
+    let nonce = Nonce::from(<[u8; 12]>::try_from(&sealed[1..13]).map_err(|_| ())?);
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| ())?;
+    let plaintext = cipher
+        .decrypt(
+            &nonce,
+            aes_gcm::aead::Payload {
+                msg: &sealed[13..],
+                aad: b"tinycloud-share-envelope-v1",
+            },
+        )
+        .map_err(|_| ())?;
+    (plaintext == canonical_json_value(envelope))
+        .then_some(())
+        .ok_or(())
+}
+
+fn normal_invocation_allows_v3_delivery(
+    invocation: &InvocationInfo,
+    envelope: &serde_json::Map<String, Value>,
+) -> bool {
+    let Some(resource) = envelope
+        .get("contentSource")
+        .and_then(Value::as_object)
+        .and_then(|source| source.get("kvResource"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    invocation.capabilities.len() == 1
+        && invocation.capabilities.iter().any(|capability| {
+            capability.resource.to_string() == resource
+                && matches!(
+                    capability.ability.as_ref().as_ref(),
+                    "tinycloud.kv/get" | "tinycloud.kv/metadata"
+                )
+        })
+}
+
+#[post("/share/v3/deliveries/authorize", format = "json", data = "<request>")]
+pub async fn authorize_delivery(
+    request: Json<DeliveryAuthorizationRequest>,
+    runtime: &State<PolicyV3Runtime>,
+    invocation: AuthHeaderGetter<InvocationInfo>,
+) -> Result<Json<Value>, (Status, String)> {
+    let delivery = runtime
+        .delivery
+        .as_ref()
+        .ok_or((Status::ServiceUnavailable, "delivery-unavailable".into()))?;
+    invocation_model::verify_and_authorize(
+        &runtime.conn,
+        &invocation.0 .0,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .map_err(|_| {
+        (
+            Status::Unauthorized,
+            "delivery-authorization-invalid".into(),
+        )
+    })?;
+    let request = request.into_inner();
+    if delivery_request_digest(&request).as_deref() != Ok(request.request_body_digest.as_str())
+        || decode_config(&request.jti, URL_SAFE_NO_PAD)
+            .ok()
+            .is_none_or(|value| value.len() != 16)
+        || !v3_delivery_url_matches(
+            &request.share_url,
+            &delivery.return_origin,
+            &request.share_cid,
+            &request.envelope_key,
+        )
+        || tinycloud_auth::ipld_core::cid::Cid::try_from(request.share_cid.as_str()).is_err()
+    {
+        return Err((Status::BadRequest, "delivery-authorization-invalid".into()));
+    }
+    let policy_cid = request
+        .envelope
+        .get("policyCid")
+        .and_then(Value::as_str)
+        .ok_or((Status::BadRequest, "delivery-authorization-invalid".into()))?;
+    let registration = policy_v3_registration::Entity::find_by_id(policy_cid.to_owned())
+        .one(&runtime.conn)
+        .await
+        .map_err(db_error)?
+        .ok_or((Status::NotFound, "delivery-authorization-invalid".into()))?;
+    let now = OffsetDateTime::now_utc();
+    if !v3_registration_is_live(&registration, now) {
+        return Err((Status::Forbidden, "delivery-authorization-invalid".into()));
+    }
+    let expires = parse_time(&request.expires_at)
+        .map_err(|_| (Status::BadRequest, "delivery-authorization-invalid".into()))?;
+    if format_time(expires) != request.expires_at
+        || expires <= now
+        || expires > now + Duration::minutes(5)
+    {
+        return Err((Status::BadRequest, "delivery-authorization-invalid".into()));
+    }
+    let (envelope, _, actions) =
+        v3_envelope_delivery_projection(&request.envelope, &registration, delivery, &request)
+            .map_err(|_| (Status::Forbidden, "delivery-authorization-invalid".into()))?;
+    verify_v3_sealed_envelope(&request.envelope, &request)
+        .map_err(|_| (Status::Forbidden, "delivery-authorization-invalid".into()))?;
+    if !normal_invocation_allows_v3_delivery(&invocation.0 .0, envelope) {
+        return Err((
+            Status::Unauthorized,
+            "delivery-authorization-invalid".into(),
+        ));
+    }
+    for cid in [
+        &registration.policy_root_cid,
+        &registration.enforcement_root_cid,
+    ] {
+        let root = policy_v3_root::Entity::find_by_id(cid.to_owned())
+            .one(&runtime.conn)
+            .await
+            .map_err(db_error)?
+            .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
+        validate_stored_root_status(&root, cid, &runtime.node_did, now, true)
+            .map_err(|_| (Status::Forbidden, "delivery-authorization-invalid".into()))?;
+    }
+    let resource = envelope
+        .get("resource")
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("path"))
+        .and_then(Value::as_str)
+        .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
+    let content_source = envelope
+        .get("contentSource")
+        .cloned()
+        .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
+    let recipient_matcher = envelope
+        .get("recipientMatcher")
+        .cloned()
+        .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
+    let share_id = envelope
+        .get("shareId")
+        .and_then(Value::as_str)
+        .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
+    let enforcer_did = envelope
+        .get("target")
+        .and_then(Value::as_object)
+        .and_then(|target| target.get("nodeAudience"))
+        .and_then(Value::as_str)
+        .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
+    let authorization = serde_json::json!({
+        "type": "TinyCloudShareDeliveryAuthorization",
+        "version": 3,
+        "jti": request.jti,
+        "shareCid": request.share_cid,
+        "shareId": share_id,
+        "policyCid": registration.policy_cid,
+        "policyRootCid": registration.policy_root_cid,
+        "enforcementRootCid": registration.enforcement_root_cid,
+        "nodeAudience": delivery.node_audience,
+        "enforcerDid": enforcer_did,
+        "targetOrigin": delivery.target_origin,
+        "openCredentialsAudience": delivery.credentials_origin,
+        "holder": invocation.0 .0.invoker,
+        "recipientMatcher": recipient_matcher,
+        "deliveryEmail": request.recipient_email,
+        "shareUrl": request.share_url,
+        "returnOrigin": delivery.return_origin,
+        "documentName": request.document_name,
+        "senderDid": registration.owner_did,
+        "senderTrust": "verified",
+        "contentSource": content_source,
+        "contentSourceDigestHex": registration.content_source_digest_hex,
+        "shareExpiresAt": registration.expires_at,
+        "issuedAt": format_time(now),
+        "reportAbuseToken": request.jti,
+        "actions": actions,
+        "resource": resource,
+        "requestBodyDigest": request.request_body_digest,
+        "idempotencyKey": request.jti,
+        "expiresAt": request.expires_at,
+        "dataAuthority": false
+    });
+    let _writer = match &runtime.sqlite_writer_lock {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
+    share_invitation_authorization_jti::ActiveModel {
+        jti: Set(request.jti.clone()),
+        authorization_digest: Set(encode_config(
+            Sha256::digest(canonical_json_value(&authorization)),
+            URL_SAFE_NO_PAD,
+        )),
+        binding_json: Set(serde_json::json!({
+            "version": 3,
+            "policyCid": policy_cid,
+            "shareCid": request.share_cid,
+            "shareId": share_id,
+        })),
+        issued_at: Set(format_time(now)),
+        expires_at: Set(request.expires_at.clone()),
+        consumed_at: Set(Some(format_time(now))),
+    }
+    .insert(&runtime.conn)
+    .await
+    .map_err(|_| (Status::Conflict, "delivery-authorization-replayed".into()))?;
+    let mut signed = DELIVERY_AUTHORIZATION_V3_DOMAIN.to_vec();
+    signed.extend_from_slice(&canonical_json_value(&authorization));
+    let signature = delivery
+        .signer
+        .sign(&signed)
+        .map_err(|_| (Status::ServiceUnavailable, "delivery-unavailable".into()))?;
+    Ok(Json(serde_json::json!({
+        "authorization": authorization,
+        "proof": {
+            "alg": "EdDSA",
+            "kid": delivery.signer.kid(),
+            "signature": encode_config(signature, URL_SAFE_NO_PAD),
+        }
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -5118,6 +5585,219 @@ mod tests {
         altered["capabilityCeiling"] = json!(["tinycloud:read"]);
         let altered_bytes = canonical_json_value(&altered);
         assert!(validate_policy_document(&altered, &altered_bytes, &cid).is_err());
+    }
+
+    fn delivery_fixture() -> (
+        tinycloud_core::libp2p::identity::ed25519::Keypair,
+        policy_v3_registration::Model,
+        DeliveryRuntime,
+        DeliveryAuthorizationRequest,
+    ) {
+        let owner = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
+        let owner_did = tinycloud_core::keys::public_key_to_did_key(
+            tinycloud_core::libp2p::identity::Keypair::from(owner.clone()).public(),
+        );
+        let policy = json!({
+            "schema": POLICY_V2_SCHEMA,
+            "ownerDid": owner_did,
+            "contentSource": {"shareId":"share-v3","kvResource":"did:key:zOwner/kv/shares/share-v3/report.pdf"},
+        });
+        let policy_bytes = canonical_json_value(&policy);
+        let registration = policy_v3_registration::Model {
+            policy_cid: "bafkreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            policy_bytes,
+            policy_digest_hex: "11".repeat(32),
+            owner_did: owner_did.clone(),
+            policy_root_cid: "bafkreibbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            enforcement_root_cid: "bafkreicccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                .into(),
+            content_source_digest_hex: "22".repeat(32),
+            native_projection_hash_hex: "33".repeat(32),
+            attested_enforcer_binding_bytes: Vec::new(),
+            registered_at: "2026-08-06T12:00:00Z".into(),
+            expires_at: "2026-08-07T12:00:00Z".into(),
+        };
+        let receipt_key = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
+        let delivery = DeliveryRuntime {
+            signer: Arc::new(
+                Ed25519InvitationSigner::new(
+                    "did:web:node.tinycloud.xyz#invitation-key-1",
+                    receipt_key.into(),
+                )
+                .unwrap(),
+            ),
+            target_origin: "https://tee.node.tinycloud.xyz".into(),
+            node_audience: "did:web:tee.node.tinycloud.xyz".into(),
+            enforcer_did: "did:key:zEnforcer".into(),
+            return_origin: "https://share.tinycloud.xyz".into(),
+            credentials_origin: "https://witness.credentials.org".into(),
+        };
+        let content_source = policy["contentSource"].clone();
+        let mut envelope = json!({
+            "version": 3,
+            "shareId": "share-v3",
+            "recipientMatcher": {"kind":"exactEmail","value":"alice@example.com"},
+            "deliveryEmail": "alice@example.com",
+            "actions": ["read"],
+            "resource": {"kind":"exact","path":"shares/share-v3/report.pdf"},
+            "target": {"origin": delivery.target_origin, "nodeAudience":"did:key:zEnforcer","spaceId":"did:key:zOwner"},
+            "policy": policy,
+            "policyCid": registration.policy_cid,
+            "policyRoot": {"cid":registration.policy_root_cid,"authorization":"a.b.c","role":"policy-authority"},
+            "enforcementRoot": {"cid":registration.enforcement_root_cid,"authorization":"d.e.f","role":"policy-enforcement"},
+            "attestedEnforcerBinding": {"enforcerDid":"did:key:zEnforcer","nodeAudience":"did:key:zEnforcer"},
+            "contentSource": content_source,
+            "contentSourceDigestHex": registration.content_source_digest_hex,
+            "expiry": registration.expires_at,
+            "display": {"filename":"report.pdf"},
+        });
+        let mut bytes = b"xyz.tinycloud.share/envelope/v3\0".to_vec();
+        bytes.extend_from_slice(&canonical_json_value(&envelope));
+        envelope["signature"] = json!({
+            "algorithm":"Ed25519",
+            "signerDid":owner_did,
+            "value":encode_config(owner.sign(&Sha256::digest(bytes)), URL_SAFE_NO_PAD),
+        });
+        let key = [5_u8; 32];
+        let nonce = [6_u8; 12];
+        let ciphertext = Aes256Gcm::new_from_slice(&key)
+            .unwrap()
+            .encrypt(
+                &Nonce::from(nonce),
+                aes_gcm::aead::Payload {
+                    msg: &canonical_json_value(&envelope),
+                    aad: b"tinycloud-share-envelope-v1",
+                },
+            )
+            .unwrap();
+        let mut sealed = vec![1_u8];
+        sealed.extend_from_slice(&nonce);
+        sealed.extend_from_slice(&ciphertext);
+        let share_cid = tinycloud_auth::ipld_core::cid::Cid::new_v1(
+            0x55,
+            tinycloud_auth::multihash_codetable::Code::Sha2_256.digest(&sealed),
+        )
+        .to_string();
+        let request = DeliveryAuthorizationRequest {
+            envelope,
+            sealed_envelope: encode_config(&sealed, URL_SAFE_NO_PAD),
+            envelope_key: encode_config(key, URL_SAFE_NO_PAD),
+            share_cid: share_cid.clone(),
+            recipient_email: "alice@example.com".into(),
+            share_url: format!(
+                "https://share.tinycloud.xyz/s/{share_cid}#k={}",
+                encode_config(key, URL_SAFE_NO_PAD)
+            ),
+            document_name: "report.pdf".into(),
+            jti: encode_config([7_u8; 16], URL_SAFE_NO_PAD),
+            expires_at: "2026-08-06T12:05:00Z".into(),
+            request_body_digest: "unused".into(),
+        };
+        (owner, registration, delivery, request)
+    }
+
+    fn resign_delivery_envelope(
+        envelope: &mut Value,
+        owner: &tinycloud_core::libp2p::identity::ed25519::Keypair,
+    ) {
+        envelope.as_object_mut().unwrap().remove("signature");
+        let mut bytes = b"xyz.tinycloud.share/envelope/v3\0".to_vec();
+        bytes.extend_from_slice(&canonical_json_value(envelope));
+        let owner_did = tinycloud_core::keys::public_key_to_did_key(
+            tinycloud_core::libp2p::identity::Keypair::from(owner.clone()).public(),
+        );
+        envelope["signature"] = json!({
+            "algorithm":"Ed25519",
+            "signerDid":owner_did,
+            "value":encode_config(owner.sign(&Sha256::digest(bytes)), URL_SAFE_NO_PAD),
+        });
+    }
+
+    #[test]
+    fn v3_delivery_rejects_owner_signed_registration_substitution() {
+        let (owner, registration, delivery, mut request) = delivery_fixture();
+        assert!(v3_envelope_delivery_projection(
+            &request.envelope,
+            &registration,
+            &delivery,
+            &request,
+        )
+        .is_ok());
+
+        request.envelope["policyRoot"]["cid"] =
+            Value::String("bafkreieeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into());
+        resign_delivery_envelope(&mut request.envelope, &owner);
+        assert!(v3_envelope_delivery_projection(
+            &request.envelope,
+            &registration,
+            &delivery,
+            &request,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn v3_delivery_rejects_cid_not_bound_to_sealed_envelope() {
+        let (_, _, _, mut request) = delivery_fixture();
+        assert!(verify_v3_sealed_envelope(&request.envelope, &request).is_ok());
+
+        request.share_cid = "bafkreieeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into();
+        assert!(verify_v3_sealed_envelope(&request.envelope, &request).is_err());
+    }
+
+    #[test]
+    fn v3_delivery_rejects_link_with_different_fragment_key() {
+        let (_, _, delivery, request) = delivery_fixture();
+        assert!(v3_delivery_url_matches(
+            &request.share_url,
+            &delivery.return_origin,
+            &request.share_cid,
+            &request.envelope_key,
+        ));
+
+        let other_key = encode_config([8_u8; 32], URL_SAFE_NO_PAD);
+        let altered_url = format!(
+            "{}/s/{}#k={other_key}",
+            delivery.return_origin, request.share_cid
+        );
+        assert!(!v3_delivery_url_matches(
+            &altered_url,
+            &delivery.return_origin,
+            &request.share_cid,
+            &request.envelope_key,
+        ));
+    }
+
+    #[test]
+    fn v3_delivery_rejects_owner_signed_untrusted_enforcer() {
+        let (owner, registration, delivery, mut request) = delivery_fixture();
+        request.envelope["target"]["nodeAudience"] = Value::String("did:key:zAttacker".into());
+        request.envelope["attestedEnforcerBinding"] = json!({
+            "enforcerDid":"did:key:zAttacker",
+            "nodeAudience":"did:key:zAttacker",
+        });
+        resign_delivery_envelope(&mut request.envelope, &owner);
+
+        assert!(v3_envelope_delivery_projection(
+            &request.envelope,
+            &registration,
+            &delivery,
+            &request,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn v3_delivery_rejects_expired_registration() {
+        let (_, registration, _, _) = delivery_fixture();
+        assert!(v3_registration_is_live(
+            &registration,
+            parse_time("2026-08-07T11:59:59Z").unwrap(),
+        ));
+        assert!(!v3_registration_is_live(
+            &registration,
+            parse_time("2026-08-07T12:00:00Z").unwrap(),
+        ));
     }
 
     #[tokio::test]

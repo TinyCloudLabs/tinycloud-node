@@ -94,10 +94,10 @@ use hooks::HookRuntime;
 use invocation_replay::InvocationReplayCache;
 use node_control::control::ControlPlaneHandle;
 use policy_v3::{
-    challenge as policy_v3_challenge, get_status as get_policy_v3_status,
-    issue_enforcer_binding as policy_v3_enforcer_binding, mint as policy_v3_mint,
-    register_policy as register_policy_v3, revoke_root as revoke_policy_v3_root,
-    status as policy_v3_status, PolicyV3Runtime,
+    authorize_delivery as authorize_policy_v3_delivery, challenge as policy_v3_challenge,
+    get_status as get_policy_v3_status, issue_enforcer_binding as policy_v3_enforcer_binding,
+    mint as policy_v3_mint, register_policy as register_policy_v3,
+    revoke_root as revoke_policy_v3_root, status as policy_v3_status, PolicyV3Runtime,
 };
 use quota::QuotaCache;
 #[cfg(feature = "tc-bench-v1")]
@@ -289,6 +289,7 @@ pub async fn app_with_control(
         register_policy_v3,
         get_policy_v3_status,
         policy_v3_enforcer_binding,
+        authorize_policy_v3_delivery,
         policy_v3_challenge,
         policy_v3_mint,
         policy_v3_status,
@@ -457,7 +458,8 @@ pub async fn app_with_control(
     )?;
     let mut policy_v3_runtime =
         PolicyV3Runtime::new(seed_conn.clone(), key_setup.node_did(), key_setup.clone())
-            .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock());
+            .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock())
+            .with_delivery(&tinycloud_config.share_email)?;
     if let Some(encoded_key) = tinycloud_config.share_email.issuer_public_key.as_deref() {
         let decoded = base64::decode_config(encoded_key, base64::URL_SAFE_NO_PAD)
             .context("policy credential issuer public key must be canonical base64url")?;
