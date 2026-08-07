@@ -1293,13 +1293,57 @@ pub struct MintRequest {
     /// TinyCloud account session. This is only an address into Node's stored
     /// authorization graph; policy/v2 re-verifies the exact signed CACAO.
     #[serde(default)]
-    pub account_authorization_cid: Option<String>,
+    account_authorization_cid: RequestField<String>,
     /// Exact recipient-owned credentials space covered by the account
     /// authorization. This is independent of the sender-owned content source.
     #[serde(default)]
-    pub credential_space_id: Option<String>,
+    credential_space_id: RequestField<String>,
     #[serde(default)]
     pub presentation: Value,
+}
+
+#[derive(Debug, Default)]
+enum RequestField<T> {
+    #[default]
+    Missing,
+    Null,
+    Value(T),
+}
+
+impl<'de, T> Deserialize<'de> for RequestField<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match Option::<T>::deserialize(deserializer)? {
+            Some(value) => Self::Value(value),
+            None => Self::Null,
+        })
+    }
+}
+
+impl<T> RequestField<T> {
+    fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+
+    fn is_some(&self) -> bool {
+        matches!(self, Self::Value(_))
+    }
+
+    fn is_none(&self) -> bool {
+        !self.is_some()
+    }
+
+    fn as_ref(&self) -> Option<&T> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Missing | Self::Null => None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1626,7 +1670,8 @@ pub async fn mint(
             || request.credential.is_null()
             || !request.claim.is_null()
             || if accountless_credential_admission {
-                request.account_authorization_cid.is_some() || request.credential_space_id.is_some()
+                !request.account_authorization_cid.is_missing()
+                    || !request.credential_space_id.is_missing()
             } else {
                 request.account_authorization_cid.is_none() || request.credential_space_id.is_none()
             }
@@ -1697,8 +1742,11 @@ pub async fn mint(
     let account_owner_proof = if credential_admission && !accountless_credential_admission {
         Some(
             authenticate_account_owner(
-                request.account_authorization_cid.as_deref(),
-                request.credential_space_id.as_deref(),
+                request
+                    .account_authorization_cid
+                    .as_ref()
+                    .map(String::as_str),
+                request.credential_space_id.as_ref().map(String::as_str),
                 &challenge.recipient_did,
                 runtime,
                 tinycloud,
@@ -1844,6 +1892,17 @@ pub async fn mint(
         .and_then(|admission| admission.credential_space_owner_did.as_ref())
     {
         issuance_audit["credentialSpaceOwnerDid"] = Value::String(account_owner.clone());
+    }
+    if let Some((credential_id, presentation_jti)) =
+        credential_admission_result.as_ref().and_then(|admission| {
+            admission
+                .presentation_jti
+                .as_ref()
+                .map(|jti| (&admission.credential_id, jti))
+        })
+    {
+        issuance_audit["credentialId"] = Value::String(credential_id.clone());
+        issuance_audit["presentationJti"] = Value::String(presentation_jti.clone());
     }
     let issuance_audit_digest = digest_value(&issuance_audit);
     for (key, value) in [
@@ -2083,6 +2142,8 @@ pub async fn mint(
         .zip(locked_credential_admission_result.as_ref())
         .is_some_and(|(before, after)| {
             before.claim_jti != after.claim_jti
+                || before.credential_id != after.credential_id
+                || before.presentation_jti != after.presentation_jti
                 || before.credential_digest != after.credential_digest
                 || before.envelope_digest_hex != after.envelope_digest_hex
                 || before.presentation_digest_hex != after.presentation_digest_hex
@@ -4723,6 +4784,8 @@ fn credential_evidence_digest(value: &Value) -> Result<String, (Status, String)>
 
 struct CredentialAdmission {
     claim_jti: String,
+    credential_id: String,
+    presentation_jti: Option<String>,
     credential_digest: String,
     envelope_digest_hex: String,
     presentation_digest_hex: String,
@@ -5009,7 +5072,9 @@ fn validate_credential_admission_v3(
     }
     validate_fresh_window(presentation, context.now, "presentation")?;
     Ok(CredentialAdmission {
-        claim_jti: verified.credential_id,
+        claim_jti: verified.credential_id.clone(),
+        credential_id: verified.credential_id,
+        presentation_jti: None,
         credential_digest: verified.credential_digest,
         envelope_digest_hex: digest_value(credential),
         presentation_digest_hex: hex::encode(Sha256::digest(canonical_json_value(&Value::Object(
@@ -5061,13 +5126,34 @@ fn validate_credential_admission_v4(
             .and_then(Value::as_str)
             .ok_or((Status::Forbidden, "credential-requirement-invalid".into()))?,
     )?;
+    let claim_jti = presentation_replay_key(
+        CREDENTIAL_PRESENTATION_V4_SCHEMA,
+        context.recipient_did,
+        &presentation_jti,
+    );
     Ok(CredentialAdmission {
-        claim_jti: presentation_jti,
+        claim_jti,
+        credential_id: verified.credential_id,
+        presentation_jti: Some(presentation_jti),
         credential_digest: verified.credential_digest,
         envelope_digest_hex: digest_value(credential),
         presentation_digest_hex: hex::encode(Sha256::digest(canonical_json_value(presentation))),
         credential_space_owner_did: None,
     })
+}
+
+fn presentation_replay_key(schema: &str, holder_did: &str, presentation_jti: &str) -> String {
+    let value = serde_json::json!({
+        "schema": schema,
+        "holderDid": holder_did,
+        "jti": presentation_jti,
+    });
+    let mut preimage = b"xyz.tinycloud.policy/PresentationReplay/v1\0".to_vec();
+    preimage.extend_from_slice(&canonical_json_value(&value));
+    format!(
+        "presentation:{}",
+        encode_config(Sha256::digest(preimage), URL_SAFE_NO_PAD)
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5838,6 +5924,34 @@ mod tests {
         bad_signature["signature"]["value"] = json!(encode_config([0_u8; 64], URL_SAFE_NO_PAD));
         assert!(validate(&bad_signature).is_err());
         assert!(validate(&original).is_ok());
+    }
+
+    #[test]
+    fn presentation_replay_key_is_separated_by_schema_holder_and_jti() {
+        let holder = "did:key:z6MkehRgf7yJbgaGfYsdoAsKdBPE3dj2CYhowQdcjqSJgvVd";
+        let jti = "same-caller-controlled-jti";
+        let v4 = presentation_replay_key(CREDENTIAL_PRESENTATION_V4_SCHEMA, holder, jti);
+        assert_eq!(
+            v4,
+            presentation_replay_key(CREDENTIAL_PRESENTATION_V4_SCHEMA, holder, jti)
+        );
+        assert_ne!(v4, jti);
+        assert_ne!(
+            v4,
+            presentation_replay_key(CREDENTIAL_PRESENTATION_V3_SCHEMA, holder, jti)
+        );
+        assert_ne!(
+            v4,
+            presentation_replay_key(
+                CREDENTIAL_PRESENTATION_V4_SCHEMA,
+                "did:key:z6MkgDifferentReceiver",
+                jti,
+            )
+        );
+        assert_ne!(
+            v4,
+            presentation_replay_key(CREDENTIAL_PRESENTATION_V4_SCHEMA, holder, "different-jti")
+        );
     }
 
     fn policy_fixture() -> Value {
@@ -6914,15 +7028,30 @@ mod tests {
             holder_key.sign(&Sha256::digest(v4_preimage)),
             URL_SAFE_NO_PAD
         ));
-        let v4_request = json!({
+        let v4_request_value = json!({
             "policyCid": policy_cid,
             "challengeId": v4_challenge["challengeId"],
             "nonce": v4_challenge["nonce"],
             "requirement": requirement,
             "credential": credential,
             "presentation": v4_presentation,
-        })
-        .to_string();
+        });
+        for field in ["accountAuthorizationCid", "credentialSpaceId"] {
+            let mut explicit_null = v4_request_value.clone();
+            explicit_null[field] = Value::Null;
+            let rejected = client
+                .post("/share/v3/policy/delegations")
+                .header(ContentType::JSON)
+                .body(explicit_null.to_string())
+                .dispatch()
+                .await;
+            assert_eq!(
+                rejected.status(),
+                Status::BadRequest,
+                "accepted null {field}"
+            );
+        }
+        let v4_request = v4_request_value.to_string();
         let v4_mint_response = client
             .post("/share/v3/policy/delegations")
             .header(ContentType::JSON)
@@ -6935,13 +7064,75 @@ mod tests {
         assert!(!v4_mint_body.contains(&account_owner_did));
         assert!(!v4_mint_body.contains("credentialSpaceOwnerDid"));
         let v4_minted: Value = serde_json::from_str(&v4_mint_body)?;
-        let v4_s0 = decode_delegation(v4_minted["authorization"].as_str().unwrap())
-            .map_err(|(_, error)| anyhow::anyhow!(error))?;
+        let v4_authorization = v4_minted["authorization"].as_str().unwrap();
+        let v4_s0 =
+            decode_delegation(v4_authorization).map_err(|(_, error)| anyhow::anyhow!(error))?;
         assert_eq!(v4_s0.0.delegate, holder_did);
         assert_eq!(
             fact(&v4_s0.0.delegation, "recipientDid"),
             Some(holder_did.as_str())
         );
+        let expected_replay_key = presentation_replay_key(
+            CREDENTIAL_PRESENTATION_V4_SCHEMA,
+            &holder_did,
+            "presentation-tc-500-accountless-http",
+        );
+        assert_eq!(
+            fact(&v4_s0.0.delegation, "claimJti"),
+            Some(expected_replay_key.as_str())
+        );
+
+        let v4_delegate_response = client
+            .post("/delegate")
+            .header(rocket::http::Header::new(
+                "Authorization",
+                v4_authorization.to_owned(),
+            ))
+            .dispatch()
+            .await;
+        let v4_delegate_status = v4_delegate_response.status();
+        let v4_delegate_body = v4_delegate_response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            v4_delegate_status,
+            Status::Ok,
+            "v4 ordinary /delegate: {v4_delegate_body}"
+        );
+
+        let v4_invocation_now = OffsetDateTime::now_utc();
+        let v4_read = Payload {
+            issuer: holder_vm.parse()?,
+            audience: holder_did.parse()?,
+            not_before: Some(NumericDate::try_from_seconds(
+                v4_invocation_now.unix_timestamp() as f64,
+            )?),
+            expiration: NumericDate::try_from_seconds(
+                (v4_invocation_now + Duration::seconds(30)).unix_timestamp() as f64,
+            )?,
+            nonce: Some("tc500-accountless-policy-read".into()),
+            facts: Some(Vec::<Value>::new()),
+            proof: vec![v4_s0.content_hash().to_cid(0x55)],
+            attenuation: serde_json::from_value::<Capabilities<Value>>(
+                attenuation_for_policy_capabilities(&requested)
+                    .map_err(|(_, error)| anyhow::anyhow!(error))?,
+            )?,
+        }
+        .sign(Algorithm::EdDSA, &holder_jwk)?;
+        let v4_read_response = client
+            .post("/invoke")
+            .header(rocket::http::Header::new(
+                "Authorization",
+                v4_read.encode()?,
+            ))
+            .dispatch()
+            .await;
+        let v4_read_status = v4_read_response.status();
+        let v4_read_body = v4_read_response.into_bytes().await.unwrap_or_default();
+        assert_eq!(
+            v4_read_status,
+            Status::Ok,
+            "v4 read response: {v4_read_body:?}"
+        );
+        assert_eq!(v4_read_body, b"tc-470-real-content");
 
         let replay = client
             .post("/share/v3/policy/delegations")
