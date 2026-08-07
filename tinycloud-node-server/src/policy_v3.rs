@@ -55,6 +55,10 @@ pub const POLICY_V2_SCHEMA: &str = "xyz.tinycloud.policy/policy/v2";
 pub const POLICY_CREDENTIAL_REQUIREMENT_V1: &str = "TinyCloudPolicyCredentialRequirement";
 pub const CREDENTIAL_PRESENTATION_V3_SCHEMA: &str = "xyz.tinycloud.policy/presentation/v3";
 const CREDENTIAL_PRESENTATION_V3_DOMAIN: &[u8] = b"xyz.tinycloud.policy/Presentation/v3\0";
+pub const CREDENTIAL_PRESENTATION_V4_SCHEMA: &str = "xyz.tinycloud.policy/presentation/v4";
+const CREDENTIAL_PRESENTATION_V4_DOMAIN: &[u8] = b"xyz.tinycloud.policy/Presentation/v4\0";
+const CREDENTIAL_ID_AUDIT_V4_DOMAIN: &[u8] = b"xyz.tinycloud.policy/CredentialIdAudit/v4\0";
+const PRESENTATION_JTI_AUDIT_V4_DOMAIN: &[u8] = b"xyz.tinycloud.policy/PresentationJtiAudit/v4\0";
 pub const POLICY_ENFORCEMENT_V2_SCHEMA: &str = "xyz.tinycloud.policy/enforcement-delegation/v2";
 pub const ATTESTED_ENFORCER_V2_SCHEMA: &str = "xyz.tinycloud.policy/attested-enforcer/v2";
 pub const ROOT_STATUS_V1_SCHEMA: &str = "xyz.tinycloud.policy/root-status/v1";
@@ -1291,13 +1295,57 @@ pub struct MintRequest {
     /// TinyCloud account session. This is only an address into Node's stored
     /// authorization graph; policy/v2 re-verifies the exact signed CACAO.
     #[serde(default)]
-    pub account_authorization_cid: Option<String>,
+    account_authorization_cid: RequestField<String>,
     /// Exact recipient-owned credentials space covered by the account
     /// authorization. This is independent of the sender-owned content source.
     #[serde(default)]
-    pub credential_space_id: Option<String>,
+    credential_space_id: RequestField<String>,
     #[serde(default)]
     pub presentation: Value,
+}
+
+#[derive(Debug, Default)]
+enum RequestField<T> {
+    #[default]
+    Missing,
+    Null,
+    Value(T),
+}
+
+impl<'de, T> Deserialize<'de> for RequestField<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match Option::<T>::deserialize(deserializer)? {
+            Some(value) => Self::Value(value),
+            None => Self::Null,
+        })
+    }
+}
+
+impl<T> RequestField<T> {
+    fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+
+    fn is_some(&self) -> bool {
+        matches!(self, Self::Value(_))
+    }
+
+    fn is_none(&self) -> bool {
+        !self.is_some()
+    }
+
+    fn as_ref(&self) -> Option<&T> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Missing | Self::Null => None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1616,12 +1664,19 @@ pub async fn mint(
     let registered_policy = validate_registration_projection(&registration)?;
     let credential_admission =
         registered_policy.get("schema").and_then(Value::as_str) == Some(POLICY_V2_SCHEMA);
+    let accountless_credential_admission = credential_admission
+        && request.presentation.get("schema").and_then(Value::as_str)
+            == Some(CREDENTIAL_PRESENTATION_V4_SCHEMA);
     if credential_admission {
         if request.requirement.is_null()
             || request.credential.is_null()
             || !request.claim.is_null()
-            || request.account_authorization_cid.is_none()
-            || request.credential_space_id.is_none()
+            || if accountless_credential_admission {
+                !request.account_authorization_cid.is_missing()
+                    || !request.credential_space_id.is_missing()
+            } else {
+                request.account_authorization_cid.is_none() || request.credential_space_id.is_none()
+            }
         {
             return Err((
                 Status::BadRequest,
@@ -1686,11 +1741,14 @@ pub async fn mint(
         .requested_capabilities
         .as_array()
         .ok_or((Status::Forbidden, "requested-capabilities-invalid".into()))?;
-    let account_owner_proof = if credential_admission {
+    let account_owner_proof = if credential_admission && !accountless_credential_admission {
         Some(
             authenticate_account_owner(
-                request.account_authorization_cid.as_deref(),
-                request.credential_space_id.as_deref(),
+                request
+                    .account_authorization_cid
+                    .as_ref()
+                    .map(String::as_str),
+                request.credential_space_id.as_ref().map(String::as_str),
                 &challenge.recipient_did,
                 runtime,
                 tinycloud,
@@ -1711,16 +1769,28 @@ pub async fn mint(
             .map(|proof| proof.owner_did.as_str()),
         now,
     };
-    let admission_v3 = if credential_admission {
-        Some(validate_credential_admission_v3(
-            &request.requirement,
-            &request.credential,
-            &request.presentation,
-            &registered_policy,
-            &claim_context,
-            runtime,
-            requested,
-        )?)
+    let credential_admission_result = if credential_admission {
+        Some(if accountless_credential_admission {
+            validate_credential_admission_v4(
+                &request.requirement,
+                &request.credential,
+                &request.presentation,
+                &registered_policy,
+                &claim_context,
+                runtime,
+                requested,
+            )?
+        } else {
+            validate_credential_admission_v3(
+                &request.requirement,
+                &request.credential,
+                &request.presentation,
+                &registered_policy,
+                &claim_context,
+                runtime,
+                requested,
+            )?
+        })
     } else {
         validate_claim_and_presentation(&request.claim, &request.presentation, &claim_context)?;
         if request
@@ -1760,9 +1830,9 @@ pub async fn mint(
             .ok_or((Status::Forbidden, "policy-registration-corrupt".into()))?,
     )?;
     let (claim_jti, claim_digest, vp_digest, credential_evidence_digest) =
-        if let Some(admission) = admission_v3.as_ref() {
+        if let Some(admission) = credential_admission_result.as_ref() {
             (
-                admission.credential_id.as_str(),
+                admission.claim_jti.as_str(),
                 admission.envelope_digest_hex.clone(),
                 admission.presentation_digest_hex.clone(),
                 hex::encode(
@@ -1819,9 +1889,27 @@ pub async fn mint(
         "vpDigestHex": vp_digest.clone(),
         "decisionContextDigestHex": decision_context_digest.clone(),
     });
-    if let Some(admission) = admission_v3.as_ref() {
-        issuance_audit["credentialSpaceOwnerDid"] =
-            Value::String(admission.credential_space_owner_did.clone());
+    if let Some(account_owner) = credential_admission_result
+        .as_ref()
+        .and_then(|admission| admission.credential_space_owner_did.as_ref())
+    {
+        issuance_audit["credentialSpaceOwnerDid"] = Value::String(account_owner.clone());
+    }
+    let v4_audit_digests = credential_admission_result.as_ref().and_then(|admission| {
+        admission.presentation_jti.as_ref().map(|presentation_jti| {
+            (
+                audit_identifier_digest_hex(
+                    CREDENTIAL_ID_AUDIT_V4_DOMAIN,
+                    &admission.credential_id,
+                ),
+                audit_identifier_digest_hex(PRESENTATION_JTI_AUDIT_V4_DOMAIN, presentation_jti),
+            )
+        })
+    });
+    if let Some((credential_id_digest, presentation_jti_digest)) = v4_audit_digests.as_ref() {
+        issuance_audit["credentialIdAuditDigestHex"] = Value::String(credential_id_digest.clone());
+        issuance_audit["presentationJtiAuditDigestHex"] =
+            Value::String(presentation_jti_digest.clone());
     }
     let issuance_audit_digest = digest_value(&issuance_audit);
     for (key, value) in [
@@ -1844,6 +1932,16 @@ pub async fn mint(
         ("issuanceAuditDigestHex", issuance_audit_digest),
     ] {
         facts.insert(key.to_owned(), Value::String(value));
+    }
+    if let Some((credential_id_digest, presentation_jti_digest)) = v4_audit_digests {
+        facts.insert(
+            "credentialIdAuditDigestHex".to_owned(),
+            Value::String(credential_id_digest),
+        );
+        facts.insert(
+            "presentationJtiAuditDigestHex".to_owned(),
+            Value::String(presentation_jti_digest),
+        );
     }
     facts.insert("remainingRedelegationDepth".to_owned(), Value::from(8_u64));
     let not_before = now.unix_timestamp();
@@ -2022,19 +2120,32 @@ pub async fn mint(
             .map(|proof| proof.owner_did.as_str()),
         now,
     };
-    let locked_admission_v3 = if credential_admission {
-        Some(validate_credential_admission_v3(
-            &request.requirement,
-            &request.credential,
-            &request.presentation,
-            &locked_policy,
-            &locked_claim_context,
-            runtime,
-            locked_challenge
-                .requested_capabilities
-                .as_array()
-                .ok_or((Status::Forbidden, "requested-capabilities-invalid".into()))?,
-        )?)
+    let locked_credential_admission_result = if credential_admission {
+        let locked_requested = locked_challenge
+            .requested_capabilities
+            .as_array()
+            .ok_or((Status::Forbidden, "requested-capabilities-invalid".into()))?;
+        Some(if accountless_credential_admission {
+            validate_credential_admission_v4(
+                &request.requirement,
+                &request.credential,
+                &request.presentation,
+                &locked_policy,
+                &locked_claim_context,
+                runtime,
+                locked_requested,
+            )?
+        } else {
+            validate_credential_admission_v3(
+                &request.requirement,
+                &request.credential,
+                &request.presentation,
+                &locked_policy,
+                &locked_claim_context,
+                runtime,
+                locked_requested,
+            )?
+        })
     } else {
         validate_claim_and_presentation(
             &request.claim,
@@ -2043,11 +2154,13 @@ pub async fn mint(
         )?;
         None
     };
-    if admission_v3
+    if credential_admission_result
         .as_ref()
-        .zip(locked_admission_v3.as_ref())
+        .zip(locked_credential_admission_result.as_ref())
         .is_some_and(|(before, after)| {
-            before.credential_id != after.credential_id
+            before.claim_jti != after.claim_jti
+                || before.credential_id != after.credential_id
+                || before.presentation_jti != after.presentation_jti
                 || before.credential_digest != after.credential_digest
                 || before.envelope_digest_hex != after.envelope_digest_hex
                 || before.presentation_digest_hex != after.presentation_digest_hex
@@ -3259,11 +3372,16 @@ pub fn is_policy_session(delegation: &DelegationInfo) -> bool {
         "issuanceAuditDigestHex",
         "remainingRedelegationDepth",
     ];
-    object.len() == REQUIRED_FACTS.len()
+    const V4_AUDIT_FACTS: &[&str] = &[
+        "credentialIdAuditDigestHex",
+        "presentationJtiAuditDigestHex",
+    ];
+    let has_v4_audit = V4_AUDIT_FACTS.iter().all(|key| object.contains_key(*key));
+    object.len() == REQUIRED_FACTS.len() + usize::from(has_v4_audit) * V4_AUDIT_FACTS.len()
         && object.get("profile").and_then(Value::as_str) == Some(POLICY_SESSION_PROFILE)
-        && object
-            .keys()
-            .all(|key| REQUIRED_FACTS.contains(&key.as_str()))
+        && object.keys().all(|key| {
+            REQUIRED_FACTS.contains(&key.as_str()) || V4_AUDIT_FACTS.contains(&key.as_str())
+        })
         && REQUIRED_FACTS
             .iter()
             .filter(|key| **key != "remainingRedelegationDepth")
@@ -3273,6 +3391,13 @@ pub fn is_policy_session(delegation: &DelegationInfo) -> bool {
                     .and_then(Value::as_str)
                     .is_some_and(|v| !v.is_empty())
             })
+        && (!has_v4_audit
+            || V4_AUDIT_FACTS.iter().all(|key| {
+                object
+                    .get(*key)
+                    .and_then(Value::as_str)
+                    .is_some_and(is_lower_hex_digest)
+            }))
         && object
             .get("remainingRedelegationDepth")
             .and_then(Value::as_u64)
@@ -3301,6 +3426,8 @@ fn descendant_profile_is_inherited(child: &DelegationInfo, parent: &DelegationIn
         "credentialEvidenceDigestHex",
         "decisionContextDigestHex",
         "issuanceAuditDigestHex",
+        "credentialIdAuditDigestHex",
+        "presentationJtiAuditDigestHex",
     ];
     INHERITED_FACTS
         .iter()
@@ -3866,6 +3993,10 @@ fn domain_digest_hex(domain: &[u8], value: &Value) -> String {
     hasher.update(domain);
     hasher.update(canonical_json_value(value));
     hex::encode(hasher.finalize())
+}
+
+fn audit_identifier_digest_hex(domain: &[u8], identifier: &str) -> String {
+    domain_digest_hex(domain, &Value::String(identifier.to_owned()))
 }
 
 fn is_lower_hex_digest(value: &str) -> bool {
@@ -4686,12 +4817,14 @@ fn credential_evidence_digest(value: &Value) -> Result<String, (Status, String)>
     ))
 }
 
-struct CredentialAdmissionV3 {
+struct CredentialAdmission {
+    claim_jti: String,
     credential_id: String,
+    presentation_jti: Option<String>,
     credential_digest: String,
     envelope_digest_hex: String,
     presentation_digest_hex: String,
-    credential_space_owner_did: String,
+    credential_space_owner_did: Option<String>,
 }
 
 struct AccountOwnerProof {
@@ -4875,7 +5008,7 @@ fn validate_credential_admission_v3(
     context: &ClaimPresentationContext<'_>,
     runtime: &PolicyV3Runtime,
     requested_capabilities: &[Value],
-) -> Result<CredentialAdmissionV3, (Status, String)> {
+) -> Result<CredentialAdmission, (Status, String)> {
     let projection = validate_policy_credential_requirement(
         policy
             .get("credentialRequirement")
@@ -4973,15 +5106,175 @@ fn validate_credential_admission_v3(
         return Err((Status::Forbidden, "presentation-signer-untrusted".into()));
     }
     validate_fresh_window(presentation, context.now, "presentation")?;
-    Ok(CredentialAdmissionV3 {
+    Ok(CredentialAdmission {
+        claim_jti: verified.credential_id.clone(),
         credential_id: verified.credential_id,
+        presentation_jti: None,
         credential_digest: verified.credential_digest,
         envelope_digest_hex: digest_value(credential),
         presentation_digest_hex: hex::encode(Sha256::digest(canonical_json_value(&Value::Object(
             presentation.clone(),
         )))),
-        credential_space_owner_did: account_owner.to_owned(),
+        credential_space_owner_did: Some(account_owner.to_owned()),
     })
+}
+
+fn validate_credential_admission_v4(
+    requirement: &Value,
+    credential: &Value,
+    presentation: &Value,
+    policy: &Value,
+    context: &ClaimPresentationContext<'_>,
+    runtime: &PolicyV3Runtime,
+    requested_capabilities: &[Value],
+) -> Result<CredentialAdmission, (Status, String)> {
+    let projection = validate_policy_credential_requirement(
+        policy
+            .get("credentialRequirement")
+            .ok_or((Status::Forbidden, "credential-requirement-missing".into()))?,
+    )?;
+    validate_request_local_requirement(requirement, projection)?;
+    let issuer = runtime.credential_issuer.as_ref().ok_or((
+        Status::ServiceUnavailable,
+        "credential-issuer-unavailable".into(),
+    ))?;
+    let verified = verify_opencredentials_credential(
+        credential,
+        requirement,
+        projection,
+        issuer,
+        context.recipient_did,
+        context.now,
+    )?;
+    let presentation_jti = validate_accountless_presentation_v4(
+        presentation,
+        context,
+        runtime,
+        requested_capabilities,
+        &verified.credential_digest,
+        projection
+            .get("requirementDigest")
+            .and_then(Value::as_str)
+            .ok_or((Status::Forbidden, "credential-requirement-invalid".into()))?,
+        projection
+            .get("descriptorDigest")
+            .and_then(Value::as_str)
+            .ok_or((Status::Forbidden, "credential-requirement-invalid".into()))?,
+    )?;
+    let claim_jti = presentation_replay_key(
+        CREDENTIAL_PRESENTATION_V4_SCHEMA,
+        context.recipient_did,
+        &presentation_jti,
+    );
+    Ok(CredentialAdmission {
+        claim_jti,
+        credential_id: verified.credential_id,
+        presentation_jti: Some(presentation_jti),
+        credential_digest: verified.credential_digest,
+        envelope_digest_hex: digest_value(credential),
+        presentation_digest_hex: hex::encode(Sha256::digest(canonical_json_value(presentation))),
+        credential_space_owner_did: None,
+    })
+}
+
+fn presentation_replay_key(schema: &str, holder_did: &str, presentation_jti: &str) -> String {
+    let value = serde_json::json!({
+        "schema": schema,
+        "holderDid": holder_did,
+        "jti": presentation_jti,
+    });
+    let mut preimage = b"xyz.tinycloud.policy/PresentationReplay/v1\0".to_vec();
+    preimage.extend_from_slice(&canonical_json_value(&value));
+    format!(
+        "presentation:{}",
+        encode_config(Sha256::digest(preimage), URL_SAFE_NO_PAD)
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_accountless_presentation_v4(
+    presentation: &Value,
+    context: &ClaimPresentationContext<'_>,
+    runtime: &PolicyV3Runtime,
+    requested_capabilities: &[Value],
+    credential_digest: &str,
+    requirement_digest: &str,
+    descriptor_digest: &str,
+) -> Result<String, (Status, String)> {
+    let presentation = presentation
+        .as_object()
+        .ok_or((Status::BadRequest, "presentation-invalid".into()))?;
+    const PRESENTATION_KEYS: &[&str] = &[
+        "schema",
+        "jti",
+        "challengeId",
+        "nonce",
+        "policyCid",
+        "nodeAudience",
+        "holderDid",
+        "subjectDid",
+        "credentialDigest",
+        "requirementDigest",
+        "descriptorDigest",
+        "requestedCapabilities",
+        "issuedAt",
+        "expiresAt",
+        "signature",
+    ];
+    let jti = presentation
+        .get("jti")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or((
+            Status::Forbidden,
+            "credential-presentation-binding-invalid".into(),
+        ))?;
+    let holder = presentation.get("holderDid").and_then(Value::as_str);
+    if presentation.len() != PRESENTATION_KEYS.len()
+        || presentation
+            .keys()
+            .any(|key| !PRESENTATION_KEYS.contains(&key.as_str()))
+        || presentation.get("schema").and_then(Value::as_str)
+            != Some(CREDENTIAL_PRESENTATION_V4_SCHEMA)
+        || presentation.get("challengeId").and_then(Value::as_str) != Some(context.challenge_id)
+        || presentation.get("nonce").and_then(Value::as_str) != Some(context.nonce)
+        || presentation.get("policyCid").and_then(Value::as_str) != Some(context.policy_cid)
+        || presentation.get("nodeAudience").and_then(Value::as_str)
+            != Some(runtime.node_did.as_str())
+        || holder != Some(context.recipient_did)
+        || presentation.get("subjectDid").and_then(Value::as_str) != holder
+        || !context.recipient_did.starts_with("did:key:")
+        || ['#', '?', '/']
+            .iter()
+            .any(|separator| context.recipient_did.contains(*separator))
+        || presentation.get("credentialDigest").and_then(Value::as_str) != Some(credential_digest)
+        || presentation
+            .get("requirementDigest")
+            .and_then(Value::as_str)
+            != Some(requirement_digest)
+        || presentation.get("descriptorDigest").and_then(Value::as_str) != Some(descriptor_digest)
+        || canonical_value_set(
+            presentation
+                .get("requestedCapabilities")
+                .and_then(Value::as_array)
+                .ok_or((
+                    Status::Forbidden,
+                    "presentation-capabilities-mismatch".into(),
+                ))?,
+        ) != canonical_value_set(requested_capabilities)
+    {
+        return Err((
+            Status::Forbidden,
+            "credential-presentation-binding-invalid".into(),
+        ));
+    }
+    validate_presentation_signature(
+        presentation,
+        context.recipient_did,
+        CREDENTIAL_PRESENTATION_V4_DOMAIN,
+    )?;
+    validate_fresh_window(presentation, context.now, "presentation")?;
+    Ok(jti.to_owned())
 }
 
 fn validate_request_local_requirement(
@@ -5264,8 +5557,21 @@ fn verify_opencredentials_credential(
 
 fn validate_v3_presentation_signature<'a>(
     presentation: &'a serde_json::Map<String, Value>,
-    expected_holder: &str,
+    expected_holder: &'a str,
 ) -> Result<&'a str, (Status, String)> {
+    validate_presentation_signature(
+        presentation,
+        expected_holder,
+        CREDENTIAL_PRESENTATION_V3_DOMAIN,
+    )?;
+    Ok(expected_holder)
+}
+
+fn validate_presentation_signature(
+    presentation: &serde_json::Map<String, Value>,
+    expected_holder: &str,
+    domain: &[u8],
+) -> Result<(), (Status, String)> {
     let signature = presentation
         .get("signature")
         .and_then(Value::as_object)
@@ -5291,11 +5597,11 @@ fn validate_v3_presentation_signature<'a>(
         .as_object_mut()
         .ok_or((Status::Forbidden, "presentation-signature-invalid".into()))?
         .remove("signature");
-    let mut preimage = CREDENTIAL_PRESENTATION_V3_DOMAIN.to_vec();
+    let mut preimage = domain.to_vec();
     preimage.extend_from_slice(&canonical_json_value(&unsigned));
     verify_detached_ed25519(signer, &Sha256::digest(preimage), &bytes)
         .map_err(|_| (Status::Forbidden, "presentation-signature-invalid".into()))?;
-    Ok(signer)
+    Ok(())
 }
 
 fn validate_fresh_window(
@@ -5535,6 +5841,153 @@ mod tests {
     use tinycloud_core::migrations::Migrator;
     use tinycloud_core::sea_orm::{Database, EntityTrait, TransactionTrait};
     use tinycloud_core::sea_orm_migration::MigratorTrait;
+
+    fn tc500_v4_vector() -> Value {
+        serde_json::from_str(include_str!(
+            "../test-fixtures/tc-500-policy-presentation-v4.json"
+        ))
+        .unwrap()
+    }
+
+    fn signed_tc500_v4_presentation(vector: &Value) -> Value {
+        let mut presentation = vector["unsigned"].clone();
+        presentation["signature"] = json!({
+            "suite": "Ed25519",
+            "signerDid": vector["holderDid"],
+            "value": vector["signatureBase64Url"],
+        });
+        presentation
+    }
+
+    #[tokio::test]
+    async fn policy_presentation_v4_accepts_frozen_accountless_vector() {
+        let vector = tc500_v4_vector();
+        let unsigned = &vector["unsigned"];
+        assert_eq!(
+            canonical_json_value(unsigned),
+            vector["canonicalUnsigned"].as_str().unwrap().as_bytes()
+        );
+        let mut preimage = CREDENTIAL_PRESENTATION_V4_DOMAIN.to_vec();
+        preimage.extend_from_slice(&canonical_json_value(unsigned));
+        assert_eq!(
+            encode_config(Sha256::digest(preimage), URL_SAFE_NO_PAD),
+            vector["signingDigestBase64Url"]
+        );
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let runtime = PolicyV3Runtime::new(
+            db,
+            unsigned["nodeAudience"].as_str().unwrap(),
+            StaticSecret::new(vec![51; 32]).unwrap(),
+        );
+        let presentation = signed_tc500_v4_presentation(&vector);
+        let holder = vector["holderDid"].as_str().unwrap();
+        let context = ClaimPresentationContext {
+            challenge_id: unsigned["challengeId"].as_str().unwrap(),
+            nonce: unsigned["nonce"].as_str().unwrap(),
+            policy_cid: unsigned["policyCid"].as_str().unwrap(),
+            owner_did: "did:key:zPolicyOwner",
+            recipient_did: holder,
+            authenticated_account_owner: None,
+            now: parse_time("2026-08-07T16:00:30Z").unwrap(),
+        };
+        let jti = validate_accountless_presentation_v4(
+            &presentation,
+            &context,
+            &runtime,
+            unsigned["requestedCapabilities"].as_array().unwrap(),
+            unsigned["credentialDigest"].as_str().unwrap(),
+            unsigned["requirementDigest"].as_str().unwrap(),
+            unsigned["descriptorDigest"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(jti, unsigned["jti"]);
+    }
+
+    #[tokio::test]
+    async fn policy_presentation_v4_rejects_account_fields_and_binding_mismatches() {
+        let vector = tc500_v4_vector();
+        let unsigned = &vector["unsigned"];
+        let holder = vector["holderDid"].as_str().unwrap();
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let runtime = PolicyV3Runtime::new(
+            db,
+            unsigned["nodeAudience"].as_str().unwrap(),
+            StaticSecret::new(vec![52; 32]).unwrap(),
+        );
+        let context = ClaimPresentationContext {
+            challenge_id: unsigned["challengeId"].as_str().unwrap(),
+            nonce: unsigned["nonce"].as_str().unwrap(),
+            policy_cid: unsigned["policyCid"].as_str().unwrap(),
+            owner_did: "did:key:zPolicyOwner",
+            recipient_did: holder,
+            authenticated_account_owner: None,
+            now: parse_time("2026-08-07T16:00:30Z").unwrap(),
+        };
+        let validate = |presentation: &Value| {
+            validate_accountless_presentation_v4(
+                presentation,
+                &context,
+                &runtime,
+                unsigned["requestedCapabilities"].as_array().unwrap(),
+                unsigned["credentialDigest"].as_str().unwrap(),
+                unsigned["requirementDigest"].as_str().unwrap(),
+                unsigned["descriptorDigest"].as_str().unwrap(),
+            )
+        };
+
+        let original = signed_tc500_v4_presentation(&vector);
+        for (field, replacement) in [
+            ("challengeId", json!("different-challenge")),
+            ("nonce", json!("different-nonce")),
+            ("nodeAudience", json!("did:web:other-node.example")),
+            ("subjectDid", json!("did:key:zDifferentSubject")),
+            ("credentialDigest", json!("different-credential")),
+            ("requirementDigest", json!("different-requirement")),
+            ("descriptorDigest", json!("different-descriptor")),
+            ("requestedCapabilities", json!([])),
+        ] {
+            let mut altered = original.clone();
+            altered[field] = replacement;
+            assert!(validate(&altered).is_err(), "accepted altered {field}");
+        }
+
+        let mut account_field = original.clone();
+        account_field["credentialSpaceOwnerDid"] = json!("did:pkh:eip155:1:0x01");
+        assert!(validate(&account_field).is_err());
+        let mut bad_signature = original.clone();
+        bad_signature["signature"]["value"] = json!(encode_config([0_u8; 64], URL_SAFE_NO_PAD));
+        assert!(validate(&bad_signature).is_err());
+        assert!(validate(&original).is_ok());
+    }
+
+    #[test]
+    fn presentation_replay_key_is_separated_by_schema_holder_and_jti() {
+        let holder = "did:key:z6MkehRgf7yJbgaGfYsdoAsKdBPE3dj2CYhowQdcjqSJgvVd";
+        let jti = "same-caller-controlled-jti";
+        let v4 = presentation_replay_key(CREDENTIAL_PRESENTATION_V4_SCHEMA, holder, jti);
+        assert_eq!(
+            v4,
+            presentation_replay_key(CREDENTIAL_PRESENTATION_V4_SCHEMA, holder, jti)
+        );
+        assert_ne!(v4, jti);
+        assert_ne!(
+            v4,
+            presentation_replay_key(CREDENTIAL_PRESENTATION_V3_SCHEMA, holder, jti)
+        );
+        assert_ne!(
+            v4,
+            presentation_replay_key(
+                CREDENTIAL_PRESENTATION_V4_SCHEMA,
+                "did:key:z6MkgDifferentReceiver",
+                jti,
+            )
+        );
+        assert_ne!(
+            v4,
+            presentation_replay_key(CREDENTIAL_PRESENTATION_V4_SCHEMA, holder, "different-jti")
+        );
+    }
 
     fn policy_fixture() -> Value {
         let keypair = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
@@ -5803,8 +6256,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn policy_v2_admits_independently_issued_holder_evidence_with_distinct_principals(
-    ) -> anyhow::Result<()> {
+    async fn policy_v2_admits_v3_account_and_v4_accountless_receivers() -> anyhow::Result<()> {
         use k256::ecdsa::SigningKey;
         use sha3::Keccak256;
         use tinycloud_auth::cacaos::siwe::encode_eip55;
@@ -6046,8 +6498,11 @@ mod tests {
             presentation["requestedCapabilities"].as_array().unwrap(),
         )
         .map_err(|(_, error)| anyhow::anyhow!(error))?;
-        assert_eq!(admission.credential_id, "credential-tc-470");
-        assert_eq!(admission.credential_space_owner_did, account_owner_did);
+        assert_eq!(admission.claim_jti, "credential-tc-470");
+        assert_eq!(
+            admission.credential_space_owner_did.as_deref(),
+            Some(account_owner_did.as_str())
+        );
 
         let binding_material =
             json!({"enforcerDid": enforcer_did, "nodeAudience": runtime.node_did});
@@ -6482,6 +6937,11 @@ mod tests {
         }
         let s0 =
             decode_delegation(s0_authorization).map_err(|(_, error)| anyhow::anyhow!(error))?;
+        assert_eq!(fact(&s0.0.delegation, "credentialIdAuditDigestHex"), None);
+        assert_eq!(
+            fact(&s0.0.delegation, "presentationJtiAuditDigestHex"),
+            None
+        );
 
         // Holder redelegates S0 through the production `/delegate` route.
         // Preserve the authenticated facts, narrow depth/time, and use a
@@ -6567,6 +7027,182 @@ mod tests {
         let read_body = read_response.into_bytes().await.unwrap_or_default();
         assert_eq!(read_status, Status::Ok, "read response: {read_body:?}");
         assert_eq!(read_body, b"tc-470-real-content");
+
+        // The accountless v4 branch reuses the issuer credential and the
+        // ordinary S0 mint, but deliberately has no account authorization or
+        // credential-space input. The same receiver key spans credential,
+        // challenge, presentation, delegation audience, and invocation.
+        let v4_challenge_response = client
+            .post("/share/v3/policy/challenges")
+            .header(ContentType::JSON)
+            .body(
+                json!({
+                    "policyCid": policy_cid,
+                    "recipientDid": holder_did,
+                    "requestedCapabilities": requested,
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+        assert_eq!(v4_challenge_response.status(), Status::Ok);
+        let v4_challenge: Value = v4_challenge_response.into_json().await.unwrap();
+        let mut v4_presentation = presentation.clone();
+        v4_presentation["schema"] = json!(CREDENTIAL_PRESENTATION_V4_SCHEMA);
+        v4_presentation["jti"] = json!("presentation-tc-500-accountless-http");
+        v4_presentation["challengeId"] = v4_challenge["challengeId"].clone();
+        v4_presentation["nonce"] = v4_challenge["nonce"].clone();
+        v4_presentation
+            .as_object_mut()
+            .unwrap()
+            .remove("credentialSpaceOwnerDid");
+        v4_presentation["issuedAt"] = json!(format_time(OffsetDateTime::now_utc()));
+        v4_presentation["expiresAt"] = json!(format_time(
+            OffsetDateTime::now_utc() + Duration::seconds(45)
+        ));
+        let mut unsigned_v4 = v4_presentation.clone();
+        unsigned_v4.as_object_mut().unwrap().remove("signature");
+        let mut v4_preimage = CREDENTIAL_PRESENTATION_V4_DOMAIN.to_vec();
+        v4_preimage.extend_from_slice(&canonical_json_value(&unsigned_v4));
+        v4_presentation["signature"]["value"] = json!(encode_config(
+            holder_key.sign(&Sha256::digest(v4_preimage)),
+            URL_SAFE_NO_PAD
+        ));
+        let v4_request_value = json!({
+            "policyCid": policy_cid,
+            "challengeId": v4_challenge["challengeId"],
+            "nonce": v4_challenge["nonce"],
+            "requirement": requirement,
+            "credential": credential,
+            "presentation": v4_presentation,
+        });
+        for field in ["accountAuthorizationCid", "credentialSpaceId"] {
+            let mut explicit_null = v4_request_value.clone();
+            explicit_null[field] = Value::Null;
+            let rejected = client
+                .post("/share/v3/policy/delegations")
+                .header(ContentType::JSON)
+                .body(explicit_null.to_string())
+                .dispatch()
+                .await;
+            assert_eq!(
+                rejected.status(),
+                Status::BadRequest,
+                "accepted null {field}"
+            );
+        }
+        let v4_request = v4_request_value.to_string();
+        let v4_mint_response = client
+            .post("/share/v3/policy/delegations")
+            .header(ContentType::JSON)
+            .body(v4_request.clone())
+            .dispatch()
+            .await;
+        let v4_mint_status = v4_mint_response.status();
+        let v4_mint_body = v4_mint_response.into_string().await.unwrap_or_default();
+        assert_eq!(v4_mint_status, Status::Ok, "v4 mint: {v4_mint_body}");
+        assert!(!v4_mint_body.contains(&account_owner_did));
+        assert!(!v4_mint_body.contains("credentialSpaceOwnerDid"));
+        let v4_minted: Value = serde_json::from_str(&v4_mint_body)?;
+        let v4_authorization = v4_minted["authorization"].as_str().unwrap();
+        let v4_s0 =
+            decode_delegation(v4_authorization).map_err(|(_, error)| anyhow::anyhow!(error))?;
+        assert_eq!(v4_s0.0.delegate, holder_did);
+        assert_eq!(
+            fact(&v4_s0.0.delegation, "recipientDid"),
+            Some(holder_did.as_str())
+        );
+        let expected_replay_key = presentation_replay_key(
+            CREDENTIAL_PRESENTATION_V4_SCHEMA,
+            &holder_did,
+            "presentation-tc-500-accountless-http",
+        );
+        assert_eq!(
+            fact(&v4_s0.0.delegation, "claimJti"),
+            Some(expected_replay_key.as_str())
+        );
+        let expected_credential_id_audit =
+            audit_identifier_digest_hex(CREDENTIAL_ID_AUDIT_V4_DOMAIN, "credential-tc-470");
+        let expected_presentation_jti_audit = audit_identifier_digest_hex(
+            PRESENTATION_JTI_AUDIT_V4_DOMAIN,
+            "presentation-tc-500-accountless-http",
+        );
+        assert_eq!(
+            fact(&v4_s0.0.delegation, "credentialIdAuditDigestHex"),
+            Some(expected_credential_id_audit.as_str())
+        );
+        assert_eq!(
+            fact(&v4_s0.0.delegation, "presentationJtiAuditDigestHex"),
+            Some(expected_presentation_jti_audit.as_str())
+        );
+        let signed_v4_facts = match &v4_s0.0.delegation {
+            TinyCloudDelegation::Ucan(ucan) => {
+                serde_json::to_string(ucan.payload().facts.as_ref().unwrap())?
+            }
+            TinyCloudDelegation::Cacao(_) => unreachable!(),
+        };
+        assert!(!signed_v4_facts.contains("credential-tc-470"));
+        assert!(!signed_v4_facts.contains("presentation-tc-500-accountless-http"));
+
+        let v4_delegate_response = client
+            .post("/delegate")
+            .header(rocket::http::Header::new(
+                "Authorization",
+                v4_authorization.to_owned(),
+            ))
+            .dispatch()
+            .await;
+        let v4_delegate_status = v4_delegate_response.status();
+        let v4_delegate_body = v4_delegate_response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            v4_delegate_status,
+            Status::Ok,
+            "v4 ordinary /delegate: {v4_delegate_body}"
+        );
+
+        let v4_invocation_now = OffsetDateTime::now_utc();
+        let v4_read = Payload {
+            issuer: holder_vm.parse()?,
+            audience: holder_did.parse()?,
+            not_before: Some(NumericDate::try_from_seconds(
+                v4_invocation_now.unix_timestamp() as f64,
+            )?),
+            expiration: NumericDate::try_from_seconds(
+                (v4_invocation_now + Duration::seconds(30)).unix_timestamp() as f64,
+            )?,
+            nonce: Some("tc500-accountless-policy-read".into()),
+            facts: Some(Vec::<Value>::new()),
+            proof: vec![v4_s0.content_hash().to_cid(0x55)],
+            attenuation: serde_json::from_value::<Capabilities<Value>>(
+                attenuation_for_policy_capabilities(&requested)
+                    .map_err(|(_, error)| anyhow::anyhow!(error))?,
+            )?,
+        }
+        .sign(Algorithm::EdDSA, &holder_jwk)?;
+        let v4_read_response = client
+            .post("/invoke")
+            .header(rocket::http::Header::new(
+                "Authorization",
+                v4_read.encode()?,
+            ))
+            .dispatch()
+            .await;
+        let v4_read_status = v4_read_response.status();
+        let v4_read_body = v4_read_response.into_bytes().await.unwrap_or_default();
+        assert_eq!(
+            v4_read_status,
+            Status::Ok,
+            "v4 read response: {v4_read_body:?}"
+        );
+        assert_eq!(v4_read_body, b"tc-470-real-content");
+
+        let replay = client
+            .post("/share/v3/policy/delegations")
+            .header(ContentType::JSON)
+            .body(v4_request)
+            .dispatch()
+            .await;
+        assert_eq!(replay.status(), Status::Unauthorized);
         Ok(())
     }
 
