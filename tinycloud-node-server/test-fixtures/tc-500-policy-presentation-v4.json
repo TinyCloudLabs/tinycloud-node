@@ -1,0 +1,31 @@
+{
+  "holderSeedBase64Url": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  "holderPublicKeyBase64Url": "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg",
+  "holderDid": "did:key:z6MkehRgf7yJbgaGfYsdoAsKdBPE3dj2CYhowQdcjqSJgvVd",
+  "unsigned": {
+    "schema": "xyz.tinycloud.policy/presentation/v4",
+    "jti": "AAECAwQFBgcICQoLDA0ODw",
+    "challengeId": "Q0hBTExFTkdFLVRDLTUwMC1BQ0NPVU5UTEVTUw",
+    "nonce": "Tk9OQ0UtVEMtNTAwLUFDQ09VTlRMRVNTLTAwMQ",
+    "policyCid": "bafkreib6upizuo5hanakqk7m6esndx7zsay7bl5brxl4pzijpzzv2mx5ka",
+    "nodeAudience": "did:web:node.example",
+    "holderDid": "did:key:z6MkehRgf7yJbgaGfYsdoAsKdBPE3dj2CYhowQdcjqSJgvVd",
+    "subjectDid": "did:key:z6MkehRgf7yJbgaGfYsdoAsKdBPE3dj2CYhowQdcjqSJgvVd",
+    "credentialDigest": "Q1JFREVOVElBTC1ESUdFU1QtVEMtNTAwLTAwMQ",
+    "requirementDigest": "UkVRVUlSRU1FTlQtRElHRVNULVRDLTUwMC0wMDE",
+    "descriptorDigest": "REVTQ1JJUFRPUi1ESUdFU1QtVEMtNTAwLTAwMQ",
+    "requestedCapabilities": [
+      {
+        "kind": "kv",
+        "resource": "tinycloud://did:pkh:eip155:1:0x1111111111111111111111111111111111111111/applications/kv/shares/tc-500/document.txt",
+        "selector": "exact",
+        "actions": ["tinycloud.kv/get"]
+      }
+    ],
+    "issuedAt": "2026-08-07T16:00:00Z",
+    "expiresAt": "2026-08-07T16:01:00Z"
+  },
+  "canonicalUnsigned": "{\"challengeId\":\"Q0hBTExFTkdFLVRDLTUwMC1BQ0NPVU5UTEVTUw\",\"credentialDigest\":\"Q1JFREVOVElBTC1ESUdFU1QtVEMtNTAwLTAwMQ\",\"descriptorDigest\":\"REVTQ1JJUFRPUi1ESUdFU1QtVEMtNTAwLTAwMQ\",\"expiresAt\":\"2026-08-07T16:01:00Z\",\"holderDid\":\"did:key:z6MkehRgf7yJbgaGfYsdoAsKdBPE3dj2CYhowQdcjqSJgvVd\",\"issuedAt\":\"2026-08-07T16:00:00Z\",\"jti\":\"AAECAwQFBgcICQoLDA0ODw\",\"nodeAudience\":\"did:web:node.example\",\"nonce\":\"Tk9OQ0UtVEMtNTAwLUFDQ09VTlRMRVNTLTAwMQ\",\"policyCid\":\"bafkreib6upizuo5hanakqk7m6esndx7zsay7bl5brxl4pzijpzzv2mx5ka\",\"requestedCapabilities\":[{\"actions\":[\"tinycloud.kv/get\"],\"kind\":\"kv\",\"resource\":\"tinycloud://did:pkh:eip155:1:0x1111111111111111111111111111111111111111/applications/kv/shares/tc-500/document.txt\",\"selector\":\"exact\"}],\"requirementDigest\":\"UkVRVUlSRU1FTlQtRElHRVNULVRDLTUwMC0wMDE\",\"schema\":\"xyz.tinycloud.policy/presentation/v4\",\"subjectDid\":\"did:key:z6MkehRgf7yJbgaGfYsdoAsKdBPE3dj2CYhowQdcjqSJgvVd\"}",
+  "signingDigestBase64Url": "XDx3PJke11egOog623PUmwxcjqQnzpnYVuZYUf3Gh_A",
+  "signatureBase64Url": "aVhnsa6gGvx1phVQgQYEMW6vitruK_ptCrgfEZQICqrYYwEAxuIky3vViflwXN8lb9H27DeD8cwSPs0VFfGfBA"
+}
