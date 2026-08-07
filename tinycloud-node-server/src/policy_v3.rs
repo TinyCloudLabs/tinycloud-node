@@ -57,6 +57,8 @@ pub const CREDENTIAL_PRESENTATION_V3_SCHEMA: &str = "xyz.tinycloud.policy/presen
 const CREDENTIAL_PRESENTATION_V3_DOMAIN: &[u8] = b"xyz.tinycloud.policy/Presentation/v3\0";
 pub const CREDENTIAL_PRESENTATION_V4_SCHEMA: &str = "xyz.tinycloud.policy/presentation/v4";
 const CREDENTIAL_PRESENTATION_V4_DOMAIN: &[u8] = b"xyz.tinycloud.policy/Presentation/v4\0";
+const CREDENTIAL_ID_AUDIT_V4_DOMAIN: &[u8] = b"xyz.tinycloud.policy/CredentialIdAudit/v4\0";
+const PRESENTATION_JTI_AUDIT_V4_DOMAIN: &[u8] = b"xyz.tinycloud.policy/PresentationJtiAudit/v4\0";
 pub const POLICY_ENFORCEMENT_V2_SCHEMA: &str = "xyz.tinycloud.policy/enforcement-delegation/v2";
 pub const ATTESTED_ENFORCER_V2_SCHEMA: &str = "xyz.tinycloud.policy/attested-enforcer/v2";
 pub const ROOT_STATUS_V1_SCHEMA: &str = "xyz.tinycloud.policy/root-status/v1";
@@ -1893,16 +1895,21 @@ pub async fn mint(
     {
         issuance_audit["credentialSpaceOwnerDid"] = Value::String(account_owner.clone());
     }
-    if let Some((credential_id, presentation_jti)) =
-        credential_admission_result.as_ref().and_then(|admission| {
-            admission
-                .presentation_jti
-                .as_ref()
-                .map(|jti| (&admission.credential_id, jti))
+    let v4_audit_digests = credential_admission_result.as_ref().and_then(|admission| {
+        admission.presentation_jti.as_ref().map(|presentation_jti| {
+            (
+                audit_identifier_digest_hex(
+                    CREDENTIAL_ID_AUDIT_V4_DOMAIN,
+                    &admission.credential_id,
+                ),
+                audit_identifier_digest_hex(PRESENTATION_JTI_AUDIT_V4_DOMAIN, presentation_jti),
+            )
         })
-    {
-        issuance_audit["credentialId"] = Value::String(credential_id.clone());
-        issuance_audit["presentationJti"] = Value::String(presentation_jti.clone());
+    });
+    if let Some((credential_id_digest, presentation_jti_digest)) = v4_audit_digests.as_ref() {
+        issuance_audit["credentialIdAuditDigestHex"] = Value::String(credential_id_digest.clone());
+        issuance_audit["presentationJtiAuditDigestHex"] =
+            Value::String(presentation_jti_digest.clone());
     }
     let issuance_audit_digest = digest_value(&issuance_audit);
     for (key, value) in [
@@ -1925,6 +1932,16 @@ pub async fn mint(
         ("issuanceAuditDigestHex", issuance_audit_digest),
     ] {
         facts.insert(key.to_owned(), Value::String(value));
+    }
+    if let Some((credential_id_digest, presentation_jti_digest)) = v4_audit_digests {
+        facts.insert(
+            "credentialIdAuditDigestHex".to_owned(),
+            Value::String(credential_id_digest),
+        );
+        facts.insert(
+            "presentationJtiAuditDigestHex".to_owned(),
+            Value::String(presentation_jti_digest),
+        );
     }
     facts.insert("remainingRedelegationDepth".to_owned(), Value::from(8_u64));
     let not_before = now.unix_timestamp();
@@ -3355,11 +3372,16 @@ pub fn is_policy_session(delegation: &DelegationInfo) -> bool {
         "issuanceAuditDigestHex",
         "remainingRedelegationDepth",
     ];
-    object.len() == REQUIRED_FACTS.len()
+    const V4_AUDIT_FACTS: &[&str] = &[
+        "credentialIdAuditDigestHex",
+        "presentationJtiAuditDigestHex",
+    ];
+    let has_v4_audit = V4_AUDIT_FACTS.iter().all(|key| object.contains_key(*key));
+    object.len() == REQUIRED_FACTS.len() + usize::from(has_v4_audit) * V4_AUDIT_FACTS.len()
         && object.get("profile").and_then(Value::as_str) == Some(POLICY_SESSION_PROFILE)
-        && object
-            .keys()
-            .all(|key| REQUIRED_FACTS.contains(&key.as_str()))
+        && object.keys().all(|key| {
+            REQUIRED_FACTS.contains(&key.as_str()) || V4_AUDIT_FACTS.contains(&key.as_str())
+        })
         && REQUIRED_FACTS
             .iter()
             .filter(|key| **key != "remainingRedelegationDepth")
@@ -3369,6 +3391,13 @@ pub fn is_policy_session(delegation: &DelegationInfo) -> bool {
                     .and_then(Value::as_str)
                     .is_some_and(|v| !v.is_empty())
             })
+        && (!has_v4_audit
+            || V4_AUDIT_FACTS.iter().all(|key| {
+                object
+                    .get(*key)
+                    .and_then(Value::as_str)
+                    .is_some_and(is_lower_hex_digest)
+            }))
         && object
             .get("remainingRedelegationDepth")
             .and_then(Value::as_u64)
@@ -3397,6 +3426,8 @@ fn descendant_profile_is_inherited(child: &DelegationInfo, parent: &DelegationIn
         "credentialEvidenceDigestHex",
         "decisionContextDigestHex",
         "issuanceAuditDigestHex",
+        "credentialIdAuditDigestHex",
+        "presentationJtiAuditDigestHex",
     ];
     INHERITED_FACTS
         .iter()
@@ -3962,6 +3993,10 @@ fn domain_digest_hex(domain: &[u8], value: &Value) -> String {
     hasher.update(domain);
     hasher.update(canonical_json_value(value));
     hex::encode(hasher.finalize())
+}
+
+fn audit_identifier_digest_hex(domain: &[u8], identifier: &str) -> String {
+    domain_digest_hex(domain, &Value::String(identifier.to_owned()))
 }
 
 fn is_lower_hex_digest(value: &str) -> bool {
@@ -6902,6 +6937,11 @@ mod tests {
         }
         let s0 =
             decode_delegation(s0_authorization).map_err(|(_, error)| anyhow::anyhow!(error))?;
+        assert_eq!(fact(&s0.0.delegation, "credentialIdAuditDigestHex"), None);
+        assert_eq!(
+            fact(&s0.0.delegation, "presentationJtiAuditDigestHex"),
+            None
+        );
 
         // Holder redelegates S0 through the production `/delegate` route.
         // Preserve the authenticated facts, narrow depth/time, and use a
@@ -7081,6 +7121,28 @@ mod tests {
             fact(&v4_s0.0.delegation, "claimJti"),
             Some(expected_replay_key.as_str())
         );
+        let expected_credential_id_audit =
+            audit_identifier_digest_hex(CREDENTIAL_ID_AUDIT_V4_DOMAIN, "credential-tc-470");
+        let expected_presentation_jti_audit = audit_identifier_digest_hex(
+            PRESENTATION_JTI_AUDIT_V4_DOMAIN,
+            "presentation-tc-500-accountless-http",
+        );
+        assert_eq!(
+            fact(&v4_s0.0.delegation, "credentialIdAuditDigestHex"),
+            Some(expected_credential_id_audit.as_str())
+        );
+        assert_eq!(
+            fact(&v4_s0.0.delegation, "presentationJtiAuditDigestHex"),
+            Some(expected_presentation_jti_audit.as_str())
+        );
+        let signed_v4_facts = match &v4_s0.0.delegation {
+            TinyCloudDelegation::Ucan(ucan) => {
+                serde_json::to_string(ucan.payload().facts.as_ref().unwrap())?
+            }
+            TinyCloudDelegation::Cacao(_) => unreachable!(),
+        };
+        assert!(!signed_v4_facts.contains("credential-tc-470"));
+        assert!(!signed_v4_facts.contains("presentation-tc-500-accountless-http"));
 
         let v4_delegate_response = client
             .post("/delegate")

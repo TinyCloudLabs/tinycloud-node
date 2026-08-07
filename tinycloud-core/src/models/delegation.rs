@@ -498,12 +498,17 @@ fn is_policy_session(delegation: &TinyCloudDelegation) -> bool {
         "issuanceAuditDigestHex",
         "remainingRedelegationDepth",
     ];
-    object.len() == REQUIRED_FACTS.len()
+    const V4_AUDIT_FACTS: &[&str] = &[
+        "credentialIdAuditDigestHex",
+        "presentationJtiAuditDigestHex",
+    ];
+    let has_v4_audit = V4_AUDIT_FACTS.iter().all(|key| object.contains_key(*key));
+    object.len() == REQUIRED_FACTS.len() + usize::from(has_v4_audit) * V4_AUDIT_FACTS.len()
         && object.get("profile").and_then(serde_json::Value::as_str)
             == Some("policy-session-ucan/v1")
-        && object
-            .keys()
-            .all(|key| REQUIRED_FACTS.contains(&key.as_str()))
+        && object.keys().all(|key| {
+            REQUIRED_FACTS.contains(&key.as_str()) || V4_AUDIT_FACTS.contains(&key.as_str())
+        })
         && REQUIRED_FACTS
             .iter()
             .filter(|key| **key != "remainingRedelegationDepth")
@@ -513,6 +518,18 @@ fn is_policy_session(delegation: &TinyCloudDelegation) -> bool {
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|value| !value.is_empty())
             })
+        && (!has_v4_audit
+            || V4_AUDIT_FACTS.iter().all(|key| {
+                object
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| {
+                        value.len() == 64
+                            && value
+                                .bytes()
+                                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                    })
+            }))
         && object
             .get("remainingRedelegationDepth")
             .and_then(serde_json::Value::as_u64)
