@@ -119,6 +119,7 @@ struct ReadinessResponse {
     ready: bool,
     version: u8,
     max_body_bytes: usize,
+    enforcer_did: Option<String>,
     checks: ReadinessChecks,
 }
 
@@ -320,6 +321,7 @@ impl ShareV2Runtime {
             ready,
             version: 2,
             max_body_bytes: MAX_BODY_BYTES,
+            enforcer_did: Some(self.enforcer_did.clone()),
             checks,
         }
     }
@@ -535,6 +537,7 @@ pub async fn readiness(runtime: &State<Option<ShareV2Runtime>>) -> Json<Value> {
             ready: false,
             version: 2,
             max_body_bytes: MAX_BODY_BYTES,
+            enforcer_did: None,
             checks: ReadinessChecks {
                 migration: false,
                 encrypted_storage: false,
@@ -4397,6 +4400,11 @@ mod tests {
         let runtime = compose_test_runtime(&key_setup, Some(tee_context), true).await;
         let response = runtime.readiness().await;
 
+        assert_eq!(
+            response.enforcer_did,
+            Some(key_setup.node_did()),
+            "readiness must publish the exact runtime Ed25519 enforcer DID"
+        );
         assert!(
             response.ready,
             "the canonical local bootstrap must reach ready:true"
