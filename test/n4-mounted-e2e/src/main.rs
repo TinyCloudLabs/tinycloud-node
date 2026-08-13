@@ -499,6 +499,7 @@ fn figment(
         r#"
         address = "127.0.0.1"
         port = {port}
+        cors = true
         [keys]
         type = "Static"
         secret = "{secret}"
@@ -862,7 +863,18 @@ async fn run() -> Result<()> {
         .context("authority material write")?;
     tinycloud_core::share_email::AuthenticatedAuthorityMaterialProvider::from_path(&material_path)
         .map_err(|error| anyhow::anyhow!("generated authority material validation: {error:?}"))?;
-    let listener = TcpListener::bind(("127.0.0.1", 0)).context("reserve ephemeral local port")?;
+    let requested_port = args
+        .windows(2)
+        .find(|pair| pair[0] == "--listen-port")
+        .map(|pair| pair[1].parse::<u16>())
+        .transpose()
+        .context("--listen-port must be an integer from 1 through 65535")?
+        .unwrap_or(0);
+    if requested_port == 0 && args.windows(2).any(|pair| pair[0] == "--listen-port") {
+        bail!("--listen-port must be an integer from 1 through 65535");
+    }
+    let listener =
+        TcpListener::bind(("127.0.0.1", requested_port)).context("reserve requested local port")?;
     let port = listener.local_addr()?.port();
     drop(listener);
     let invitation_public = b64(&node
