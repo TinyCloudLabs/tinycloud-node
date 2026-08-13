@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -31,8 +32,13 @@ enum DbMessage {
 
 #[derive(Clone)]
 pub struct DatabaseHandle {
+    id: u64,
     tx: mpsc::Sender<DbMessage>,
 }
+
+/// Distinguishes one actor from its replacement for the same (space, db); see
+/// the deregistrations in [`spawn_actor`].
+static NEXT_ACTOR_ID: AtomicU64 = AtomicU64::new(0);
 
 impl DatabaseHandle {
     pub async fn execute(
@@ -91,6 +97,7 @@ pub fn spawn_actor(
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
 ) -> DatabaseHandle {
     let (tx, mut rx) = mpsc::channel::<DbMessage>(32);
+    let id = NEXT_ACTOR_ID.fetch_add(1, Ordering::Relaxed);
     let idle_timeout = std::time::Duration::from_secs(idle_timeout_secs);
 
     tokio::task::spawn_blocking(move || {
@@ -126,7 +133,7 @@ pub fn spawn_actor(
                         }
                     }
                 }
-                databases.remove(&(space_id, db_name));
+                databases.remove_if(&(space_id, db_name), |_, handle| handle.id == id);
                 return;
             }
         };
@@ -185,11 +192,17 @@ pub fn spawn_actor(
             }
         }
 
-        databases.remove(&(space_id.clone(), db_name.clone()));
+        // Deregister only OUR OWN entry. A replacement actor may already have
+        // been hydrated and registered for this key, and evicting it would send
+        // the next request through hydration while it is live — deleting and
+        // rewriting the files it holds open by path.
+        databases.remove_if(&(space_id.clone(), db_name.clone()), |_, handle| {
+            handle.id == id
+        });
         tracing::debug!(space=%space_id, db=%db_name, "Database actor shutting down");
     });
 
-    DatabaseHandle { tx }
+    DatabaseHandle { id, tx }
 }
 
 fn handle_wal(mode: &StorageMode, file_path: &Path) -> Result<Option<Vec<u8>>, DuckDbError> {

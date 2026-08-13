@@ -16,9 +16,76 @@ pub struct DatabaseArtifact {
     pub updated_at: String,
     pub backend: String,
     pub storage_mode: String,
+    pub checkpoint_content_hash: String,
     pub delta_payload: Option<Vec<u8>>,
     pub delta_content_hash: Option<String>,
     pub delta_size_bytes: i64,
+}
+
+/// What the caller's local database state derives from, asserted at save time.
+///
+/// The revision compare-and-swap below is a CONCURRENCY guard only: both saves
+/// re-read the current revision, so a writer that is merely *stale* — an actor
+/// holding a database it hydrated from an older checkpoint, running alone —
+/// reads the current revision, matches it, and overwrites the newer durable
+/// state. Carrying the base the caller actually derives from turns that into a
+/// lineage check the stale writer cannot pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactExpectation {
+    /// No lineage assertion: replace whatever is durable. For callers that
+    /// deliberately overwrite unrelated content (DuckDB `import_db`).
+    Any,
+    /// The caller derives from NO durable artifact, so it may only create one.
+    /// A row appearing in the meantime means the caller's empty database would
+    /// clobber content it never read.
+    Absent,
+    /// The caller derives from exactly this checkpoint. `checkpoint_content_hash`
+    /// (not `content_hash`) is the anchor: a WAL delta advances the revision and
+    /// the logical hash while leaving the base checkpoint — and therefore the
+    /// bytes the caller actually hydrated — unchanged.
+    Derived {
+        revision: i64,
+        checkpoint_content_hash: String,
+    },
+}
+
+impl ArtifactExpectation {
+    /// The expectation a caller carries after committing `revision` on top of
+    /// the same base checkpoint (a WAL delta save).
+    pub fn advanced_to(&self, revision: i64) -> Self {
+        match self {
+            Self::Derived {
+                checkpoint_content_hash,
+                ..
+            } => Self::Derived {
+                revision,
+                checkpoint_content_hash: checkpoint_content_hash.clone(),
+            },
+            other => other.clone(),
+        }
+    }
+
+    /// Reject before touching durable state when the base is already known to
+    /// differ. The atomic check is the `WHERE` clause on the update itself;
+    /// this only turns the common case into a precise error.
+    fn check(&self, existing: Option<(i64, &str)>) -> Result<(), DatabaseArtifactError> {
+        let conflict = match (self, existing) {
+            (Self::Any, _) => false,
+            (Self::Absent, existing) => existing.is_some(),
+            (Self::Derived { .. }, None) => true,
+            (
+                Self::Derived {
+                    revision,
+                    checkpoint_content_hash,
+                },
+                Some((current_revision, current_hash)),
+            ) => *revision != current_revision || checkpoint_content_hash != current_hash,
+        };
+        if conflict {
+            return Err(DatabaseArtifactError::StaleLineage);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +107,8 @@ pub enum DatabaseArtifactError {
     MissingCheckpoint,
     #[error("database artifact backend does not support incremental persistence")]
     IncrementalPersistenceUnsupported,
+    #[error("database artifact was written from a superseded checkpoint")]
+    StaleLineage,
 }
 
 #[async_trait]
@@ -57,6 +126,7 @@ pub trait DatabaseArtifactRepository: Send + Sync {
         space: &str,
         name: &str,
         payload: Vec<u8>,
+        expected: ArtifactExpectation,
     ) -> Result<DatabaseArtifact, DatabaseArtifactError>;
 
     async fn save_delta(
@@ -65,6 +135,7 @@ pub trait DatabaseArtifactRepository: Send + Sync {
         _space: &str,
         _name: &str,
         _payload: Vec<u8>,
+        _expected: ArtifactExpectation,
     ) -> Result<DeltaSave, DatabaseArtifactError> {
         Err(DatabaseArtifactError::IncrementalPersistenceUnsupported)
     }
@@ -134,6 +205,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                 updated_at: model.updated_at,
                 backend: model.backend,
                 storage_mode: model.storage_mode,
+                checkpoint_content_hash: model.checkpoint_content_hash,
                 delta_payload: model.delta_payload,
                 delta_content_hash: model.delta_content_hash,
                 delta_size_bytes: model.delta_size_bytes,
@@ -148,6 +220,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         space: &str,
         name: &str,
         payload: Vec<u8>,
+        expected: ArtifactExpectation,
     ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
         let size_bytes = i64::try_from(payload.len())
             .map_err(|_| DatabaseArtifactError::PayloadTooLarge(payload.len() as u64))?;
@@ -164,6 +237,30 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         .one(&self.conn)
         .await?;
 
+        expected.check(
+            existing
+                .as_ref()
+                .map(|model| (model.revision, model.checkpoint_content_hash.as_str())),
+        )?;
+
+        // A full checkpoint that is a fraction of the content it replaces is
+        // the shape of a database that reverted to an older (or empty) state
+        // and re-anchored on it. Legitimate causes exist — VACUUM, a large
+        // DELETE, WAL compaction — so this warns rather than rejects.
+        if let Some(previous) = existing.as_ref() {
+            if previous.size_bytes > 0 && size_bytes.saturating_mul(2) < previous.size_bytes {
+                tracing::warn!(
+                    service,
+                    space,
+                    name,
+                    revision = previous.revision,
+                    previous_logical_bytes = previous.size_bytes,
+                    bytes = size_bytes,
+                    "Database checkpoint shrank sharply against the artifact it replaces"
+                );
+            }
+        }
+
         let revision = existing
             .as_ref()
             .map(|model| model.revision + 1)
@@ -176,11 +273,15 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
 
         match existing.as_ref() {
             Some(existing) => {
-                // Compare-and-swap on the revision this save read: a concurrent
-                // checkpoint/delta that bumped the revision in between makes this
-                // match zero rows, so a stale actor cannot clobber newer committed
-                // state (mirrors `save_delta`'s guard). Callers surface the
-                // conflict and force actor rehydration rather than retry.
+                // Compare-and-swap on the (revision, checkpoint) this save read.
+                // That alone is a CONCURRENCY guard: it catches a writer whose
+                // base was superseded between this read and this update, and
+                // nothing else — a save re-reads the row every time, so a writer
+                // running alone always matches whatever is current no matter how
+                // stale its own database is. The lineage assertion checked above
+                // is what rejects that writer; pairing the two here is what makes
+                // the assertion atomic. Callers surface the conflict and force
+                // actor rehydration rather than retry.
                 let update = database_artifact::Entity::update_many()
                     .col_expr(database_artifact::Column::Revision, Expr::value(revision))
                     .col_expr(
@@ -231,6 +332,10 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
                     .filter(database_artifact::Column::Space.eq(space))
                     .filter(database_artifact::Column::Name.eq(name))
                     .filter(database_artifact::Column::Revision.eq(existing.revision))
+                    .filter(
+                        database_artifact::Column::CheckpointContentHash
+                            .eq(existing.checkpoint_content_hash.clone()),
+                    )
                     .exec(&self.conn)
                     .await?;
                 if update.rows_affected != 1 {
@@ -265,12 +370,13 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
 
         Ok(DatabaseArtifact {
             payload,
-            content_hash,
+            content_hash: content_hash.clone(),
             revision,
             size_bytes,
             updated_at: now,
             backend: "storage.database".to_string(),
             storage_mode: "database-blob".to_string(),
+            checkpoint_content_hash: content_hash,
             delta_payload: None,
             delta_content_hash: None,
             delta_size_bytes: 0,
@@ -283,6 +389,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         space: &str,
         name: &str,
         payload: Vec<u8>,
+        expected: ArtifactExpectation,
     ) -> Result<DeltaSave, DatabaseArtifactError> {
         let existing = database_artifact::Entity::find_by_id((
             service.to_string(),
@@ -297,6 +404,12 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         .one(&self.conn)
         .await?
         .ok_or(DatabaseArtifactError::MissingCheckpoint)?;
+
+        // A WAL is only replayable against the checkpoint it was built on, so
+        // an actor that hydrated from a different one must not attach its delta
+        // here — the resulting (checkpoint, WAL) pair would not describe any
+        // database that ever existed.
+        expected.check(Some((existing.0, existing.2.as_str())))?;
 
         let delta_size_bytes = i64::try_from(payload.len())
             .map_err(|_| DatabaseArtifactError::PayloadTooLarge(payload.len() as u64))?;
@@ -345,6 +458,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
             .filter(database_artifact::Column::Space.eq(space))
             .filter(database_artifact::Column::Name.eq(name))
             .filter(database_artifact::Column::Revision.eq(existing.0))
+            .filter(database_artifact::Column::CheckpointContentHash.eq(existing.2.clone()))
             .exec(&self.conn)
             .await?;
         if update.rows_affected != 1 {
@@ -376,11 +490,23 @@ mod tests {
         Migrator::up(&conn, None).await.unwrap();
         let repo = SeaOrmDatabaseArtifactRepository::new(conn);
 
-        repo.save("sql", "space", "main", vec![1; 100])
-            .await
-            .unwrap();
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            vec![1; 100],
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
         let delta = repo
-            .save_delta("sql", "space", "main", vec![2; 12])
+            .save_delta(
+                "sql",
+                "space",
+                "main",
+                vec![2; 12],
+                ArtifactExpectation::Any,
+            )
             .await
             .unwrap();
         assert_eq!(delta.revision, 2);
@@ -392,13 +518,132 @@ mod tests {
         assert_eq!(loaded.delta_payload, Some(vec![2; 12]));
         assert_eq!(loaded.storage_mode, "checkpoint+wal");
 
-        repo.save("sql", "space", "main", vec![3; 80])
-            .await
-            .unwrap();
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            vec![3; 80],
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
         let checkpoint = repo.load("sql", "space", "main").await.unwrap().unwrap();
         assert_eq!(checkpoint.size_bytes, 80);
         assert_eq!(checkpoint.delta_size_bytes, 0);
         assert_eq!(checkpoint.delta_payload, None);
+    }
+
+    /// The failure the revision compare-and-swap cannot see: one writer, no
+    /// concurrency, holding a database built on a superseded checkpoint.
+    #[tokio::test]
+    async fn stale_lineage_save_is_rejected_with_no_concurrent_writer() {
+        let conn = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&conn, None).await.unwrap();
+        let repo = SeaOrmDatabaseArtifactRepository::new(conn);
+
+        let base = repo
+            .save(
+                "sql",
+                "space",
+                "main",
+                vec![1; 100],
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+        let stale = ArtifactExpectation::Derived {
+            revision: base.revision,
+            checkpoint_content_hash: base.checkpoint_content_hash.clone(),
+        };
+
+        // A live actor advances the database. The stale actor's base is now gone.
+        let current = repo
+            .save("sql", "space", "main", vec![2; 200], stale.clone())
+            .await
+            .unwrap();
+        assert_eq!(current.revision, 2);
+
+        // The stale actor runs ALONE and re-reads the row, so the revision CAS
+        // it performs matches whatever is current — only the lineage it carries
+        // says its 100 bytes never derived from these 200.
+        let err = repo
+            .save("sql", "space", "main", vec![1; 100], stale.clone())
+            .await
+            .expect_err("a save from a superseded checkpoint must not commit");
+        assert!(
+            matches!(err, DatabaseArtifactError::StaleLineage),
+            "expected a lineage rejection, got {err:?}"
+        );
+        let err = repo
+            .save_delta("sql", "space", "main", vec![9; 12], stale)
+            .await
+            .expect_err("a WAL built on a superseded checkpoint must not attach");
+        assert!(
+            matches!(err, DatabaseArtifactError::StaleLineage),
+            "expected a lineage rejection, got {err:?}"
+        );
+
+        let loaded = repo.load("sql", "space", "main").await.unwrap().unwrap();
+        assert_eq!(loaded.revision, 2);
+        assert_eq!(loaded.payload, vec![2; 200]);
+        assert_eq!(loaded.delta_payload, None);
+
+        // The guard rejects only supersession: the caller that is actually
+        // caught up still commits.
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            vec![3; 300],
+            ArtifactExpectation::Derived {
+                revision: current.revision,
+                checkpoint_content_hash: current.checkpoint_content_hash,
+            },
+        )
+        .await
+        .expect("a caller on the current checkpoint must still commit");
+    }
+
+    /// The other half of the same defect: a database that hydrated from nothing
+    /// (an empty one) must not overwrite a row that appeared meanwhile.
+    #[tokio::test]
+    async fn save_expecting_no_artifact_is_rejected_once_one_exists() {
+        let conn = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&conn, None).await.unwrap();
+        let repo = SeaOrmDatabaseArtifactRepository::new(conn);
+
+        repo.save(
+            "sql",
+            "space",
+            "main",
+            vec![1; 4096],
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+
+        let err = repo
+            .save(
+                "sql",
+                "space",
+                "main",
+                vec![0; 8],
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .expect_err("an empty database must not clobber durable content");
+        assert!(
+            matches!(err, DatabaseArtifactError::StaleLineage),
+            "expected a lineage rejection, got {err:?}"
+        );
+
+        let loaded = repo.load("sql", "space", "main").await.unwrap().unwrap();
+        assert_eq!(loaded.revision, 1);
+        assert_eq!(loaded.payload, vec![1; 4096]);
     }
 
     #[tokio::test]
@@ -414,7 +659,13 @@ mod tests {
 
         // Seed the checkpoint both writers will read as their base (revision 1).
         let seeded = repo
-            .save("sql", "space", "main", vec![1; 100])
+            .save(
+                "sql",
+                "space",
+                "main",
+                vec![1; 100],
+                ArtifactExpectation::Any,
+            )
             .await
             .unwrap();
         assert_eq!(seeded.revision, 1);
@@ -431,8 +682,20 @@ mod tests {
             .with_race_barrier_for_test(std::sync::Arc::clone(&barrier));
 
         let (a, b) = tokio::join!(
-            first.save("sql", "space", "main", vec![2; 80]),
-            second.save("sql", "space", "main", vec![3; 60]),
+            first.save(
+                "sql",
+                "space",
+                "main",
+                vec![2; 80],
+                ArtifactExpectation::Any
+            ),
+            second.save(
+                "sql",
+                "space",
+                "main",
+                vec![3; 60],
+                ArtifactExpectation::Any
+            ),
         );
 
         let (winner, loser_err) = match (a, b) {
