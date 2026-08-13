@@ -499,7 +499,6 @@ fn figment(
         r#"
         address = "127.0.0.1"
         port = {port}
-        cors = true
         [keys]
         type = "Static"
         secret = "{secret}"
@@ -911,9 +910,32 @@ async fn run() -> Result<()> {
         &trust_bundle_path,
         port,
     );
+    let allowed_origin = fixture_config.return_origin.clone();
     let rocket = app(&figment)
         .await
-        .context("default-feature production Rocket app composition")?;
+        .context("default-feature production Rocket app composition")?
+        .attach(AdHoc::on_response(
+            "production-e2e-exact-cors",
+            move |_request, response| {
+                let allowed_origin = allowed_origin.clone();
+                Box::pin(async move {
+                    response.set_header(Header::new("Access-Control-Allow-Origin", allowed_origin));
+                    response.set_header(Header::new(
+                        "Access-Control-Allow-Methods",
+                        "POST, PUT, GET, OPTIONS, DELETE",
+                    ));
+                    response.set_header(Header::new(
+                        "Access-Control-Allow-Headers",
+                        "*, Authorization",
+                    ));
+                    response.set_header(Header::new(
+                        "Access-Control-Expose-Headers",
+                        "*, Authorization",
+                    ));
+                    response.set_header(Header::new("Access-Control-Allow-Credentials", "true"));
+                })
+            },
+        ));
     seed_sql(&rocket).await?;
     seed_kv(&rocket, [0x44; 32]).await?;
     if self_test {
