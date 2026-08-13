@@ -5,7 +5,8 @@ use tinycloud_auth::resource::SpaceId;
 use tokio::sync::RwLock;
 
 use crate::database_artifacts::{
-    DatabaseArtifact, DatabaseArtifactError, DatabaseArtifactRepository, DeltaSave,
+    ArtifactExpectation, DatabaseArtifact, DatabaseArtifactError, DatabaseArtifactRepository,
+    DeltaSave,
 };
 
 /// Process-local mirror of durable SQL artifact sizes, keyed by space then
@@ -111,8 +112,12 @@ impl DatabaseArtifactRepository for SizeTrackingArtifactRepository {
         space: &str,
         name: &str,
         payload: Vec<u8>,
+        expected: ArtifactExpectation,
     ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
-        let artifact = self.inner.save(service, space, name, payload).await?;
+        let artifact = self
+            .inner
+            .save(service, space, name, payload, expected)
+            .await?;
         self.sizes
             .update(service, space, name, artifact.size_bytes.max(0) as u64)
             .await;
@@ -125,8 +130,12 @@ impl DatabaseArtifactRepository for SizeTrackingArtifactRepository {
         space: &str,
         name: &str,
         payload: Vec<u8>,
+        expected: ArtifactExpectation,
     ) -> Result<DeltaSave, DatabaseArtifactError> {
-        let saved = self.inner.save_delta(service, space, name, payload).await?;
+        let saved = self
+            .inner
+            .save_delta(service, space, name, payload, expected)
+            .await?;
         self.sizes
             .update(service, space, name, saved.size_bytes.max(0) as u64)
             .await;
@@ -195,7 +204,9 @@ mod tests {
         let space = test_space_id("records");
         let key = space.to_string();
         const N: usize = 4096;
-        repo.save("sql", &key, "main", vec![0u8; N]).await.unwrap();
+        repo.save("sql", &key, "main", vec![0u8; N], ArtifactExpectation::Any)
+            .await
+            .unwrap();
         assert_eq!(sizes.space_total(&space).await, N as u64);
     }
 
@@ -206,12 +217,24 @@ mod tests {
         let key = space.to_string();
         let first = 128usize;
         let second = 256usize;
-        raw.save("sql", &key, "one", vec![0u8; first])
-            .await
-            .unwrap();
-        raw.save("sql", &key, "two", vec![0u8; second])
-            .await
-            .unwrap();
+        raw.save(
+            "sql",
+            &key,
+            "one",
+            vec![0u8; first],
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
+        raw.save(
+            "sql",
+            &key,
+            "two",
+            vec![0u8; second],
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
 
         let sizes = SqlSizes::new();
         sizes.seed_from(&conn).await.unwrap();
@@ -219,9 +242,15 @@ mod tests {
 
         // Wholesale-overwrite semantics: a larger revision of one db, re-seed.
         let third = 1024usize;
-        raw.save("sql", &key, "one", vec![0u8; third])
-            .await
-            .unwrap();
+        raw.save(
+            "sql",
+            &key,
+            "one",
+            vec![0u8; third],
+            ArtifactExpectation::Any,
+        )
+        .await
+        .unwrap();
         sizes.seed_from(&conn).await.unwrap();
         assert_eq!(sizes.space_total(&space).await, (third + second) as u64);
     }

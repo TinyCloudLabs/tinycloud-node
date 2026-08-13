@@ -1,12 +1,18 @@
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Weak,
+    },
 };
 
 use dashmap::DashMap;
 use tinycloud_auth::resource::SpaceId;
 
-use crate::database_artifacts::{DatabaseArtifactError, DatabaseArtifactRepository};
+use crate::database_artifacts::{
+    ArtifactExpectation, DatabaseArtifactError, DatabaseArtifactRepository,
+};
 
 use super::{
     caveats::DuckDbCaveats,
@@ -17,8 +23,23 @@ use super::{
 
 const MAX_WAL_DELTA_BYTES: usize = 8 * 1024 * 1024;
 
+/// DuckDB's main header carries an 8-byte checksum before its magic bytes.
+const DUCKDB_MAGIC: &[u8] = b"DUCK";
+const DUCKDB_MAGIC_OFFSET: usize = 8;
+
+/// Per-(space, db) guard over cache hydration; see [`DuckDbService::handle`].
+type HydrationLock = tokio::sync::Mutex<()>;
+type HydrationLockRegistry =
+    Arc<tokio::sync::Mutex<HashMap<(String, String), Weak<HydrationLock>>>>;
+
 pub struct DuckDbService {
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
+    hydration_locks: HydrationLockRegistry,
+    /// What each live actor's local database derives from, carried into every
+    /// durable save so a stale actor is rejected instead of clobbering. Written
+    /// on hydration (the only path that creates an actor) and after each
+    /// successful save, cleared alongside the actor by `discard_local_state`.
+    lineage: Arc<DashMap<(String, String), ArtifactExpectation>>,
     base_path: String,
     memory_threshold: u64,
     idle_timeout_secs: u64,
@@ -50,6 +71,8 @@ impl DuckDbService {
     ) -> Self {
         Self {
             databases: Arc::new(DashMap::new()),
+            hydration_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            lineage: Arc::new(DashMap::new()),
             base_path,
             memory_threshold,
             idle_timeout_secs,
@@ -123,7 +146,7 @@ impl DuckDbService {
             .map_err(|e| DuckDbError::Internal(e.to_string()))?;
 
         let final_path = dir.join(format!("{}.duckdb", db_name));
-        let temp_path = dir.join(format!("{}.duckdb.tmp", db_name));
+        let temp_path = temp_write_path(&final_path);
 
         // Write to temp file first
         tokio::fs::write(&temp_path, data)
@@ -159,10 +182,20 @@ impl DuckDbService {
         // Remove the existing handle so the next access reopens the database from the new file
         let key = (space.to_string(), db_name.to_string());
         self.databases.remove(&key);
+        // An import deliberately replaces content it never read, so it carries
+        // no lineage. Drop the evicted actor's record with it: the next access
+        // rehydrates and records what the import committed.
+        self.lineage.remove(&key);
 
         if let Err(e) = self
             .artifact_repository
-            .save("duckdb", &space.to_string(), db_name, data.to_vec())
+            .save(
+                "duckdb",
+                &space.to_string(),
+                db_name,
+                data.to_vec(),
+                ArtifactExpectation::Any,
+            )
             .await
         {
             let _ = self.discard_local_state(&key).await;
@@ -184,8 +217,27 @@ impl DuckDbService {
         .unwrap_or_else(|| "default".to_string())
     }
 
+    /// Resolve the live actor for `key`, hydrating the on-disk cache first if
+    /// there is none.
+    ///
+    /// Hydration deletes and rewrites the very files a running actor reads BY
+    /// PATH, and two hydrations of one database interleave their writes, so the
+    /// miss -> hydrate -> spawn window is serialized per (space, db) and the
+    /// actor map is re-checked under the guard. Both properties are load-bearing:
+    /// hydrating concurrently with another hydration, or under a live actor, is
+    /// how a database silently reverts to an older checkpoint.
     async fn handle(&self, space: &SpaceId, db_name: &str) -> Result<DatabaseHandle, DuckDbError> {
         let key = (space.to_string(), db_name.to_string());
+        if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
+            return Ok(handle);
+        }
+
+        let hydration_lock = self.hydration_lock(&key).await;
+        let _hydrating = hydration_lock.lock().await;
+
+        // Double-checked: whoever held the guard may have hydrated and spawned
+        // the actor already, and hydrating under it is exactly what the guard
+        // exists to prevent.
         if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
             return Ok(handle);
         }
@@ -209,8 +261,24 @@ impl DuckDbService {
             .clone())
     }
 
+    /// The hydration guard for `key`, created on first use.
+    ///
+    /// The registry holds weak references and is swept on every acquisition, so
+    /// it cannot outgrow the set of databases currently being hydrated.
+    async fn hydration_lock(&self, key: &(String, String)) -> Arc<HydrationLock> {
+        let mut registry = self.hydration_locks.lock().await;
+        registry.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = registry.get(key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(HydrationLock::new(()));
+        registry.insert(key.clone(), Arc::downgrade(&lock));
+        lock
+    }
+
     async fn hydrate_cache(&self, space: &SpaceId, db_name: &str) -> Result<(), DuckDbError> {
         let cache_path = self.cache_path(space, db_name);
+        let key = (space.to_string(), db_name.to_string());
         match self
             .artifact_repository
             .load("duckdb", &space.to_string(), db_name)
@@ -218,14 +286,61 @@ impl DuckDbService {
             .map_err(artifact_error_to_duckdb)?
         {
             Some(artifact) => {
+                tracing::info!(
+                    service = "duckdb",
+                    space = %space,
+                    db = db_name,
+                    revision = artifact.revision,
+                    storage_mode = %artifact.storage_mode,
+                    bytes = artifact.payload.len(),
+                    delta_bytes = artifact.delta_size_bytes,
+                    logical_bytes = artifact.size_bytes,
+                    content_hash = %artifact.content_hash,
+                    checkpoint_content_hash = %artifact.checkpoint_content_hash,
+                    "Loaded database artifact"
+                );
+                // Refuse to seed the cache with bytes DuckDB would misread. The
+                // checkpoint must be a database; the WAL, which carries no
+                // header of its own, must at least not be one — that is the
+                // shape a crossed hydration writes.
+                validate_payload(
+                    space,
+                    db_name,
+                    "checkpoint",
+                    &artifact.payload,
+                    is_duckdb_file,
+                )?;
+                if let Some(delta) = artifact.delta_payload.as_deref() {
+                    validate_payload(space, db_name, "wal", delta, |payload| {
+                        !is_duckdb_file(payload)
+                    })?;
+                }
+
                 remove_duckdb_cache_files(&cache_path).await?;
                 write_cache_file(&cache_path, &artifact.payload).await?;
                 if let Some(delta) = artifact.delta_payload {
                     write_cache_file(&duckdb_wal_path(&cache_path), &delta).await?;
                 }
+                self.lineage.insert(
+                    key,
+                    ArtifactExpectation::Derived {
+                        revision: artifact.revision,
+                        checkpoint_content_hash: artifact.checkpoint_content_hash,
+                    },
+                );
                 Ok(())
             }
-            None => remove_duckdb_cache_files(&cache_path).await,
+            None => {
+                tracing::info!(
+                    service = "duckdb",
+                    space = %space,
+                    db = db_name,
+                    "No durable database artifact; starting from an empty database"
+                );
+                remove_duckdb_cache_files(&cache_path).await?;
+                self.lineage.insert(key, ArtifactExpectation::Absent);
+                Ok(())
+            }
         }
     }
 
@@ -237,10 +352,31 @@ impl DuckDbService {
 
     async fn discard_local_state(&self, key: &(String, String)) -> Result<(), DuckDbError> {
         self.databases.remove(key);
+        self.lineage.remove(key);
         let cache_path = PathBuf::from(&self.base_path)
             .join(&key.0)
             .join(format!("{}.duckdb", key.1));
         remove_duckdb_cache_files(&cache_path).await
+    }
+
+    /// What the actor for `key` derives from.
+    ///
+    /// Every actor is created by `handle`, which records this during hydration,
+    /// so a live actor always has an entry. A missing one means the actor
+    /// outlived its record and there is nothing to assert against.
+    fn expectation(&self, key: &(String, String)) -> ArtifactExpectation {
+        match self.lineage.get(key).map(|entry| entry.clone()) {
+            Some(expectation) => expectation,
+            None => {
+                tracing::warn!(
+                    service = "duckdb",
+                    space = %key.0,
+                    db = %key.1,
+                    "No recorded artifact lineage for a live database; saving without a lineage assertion"
+                );
+                ArtifactExpectation::Any
+            }
+        }
     }
 
     async fn persist_write(
@@ -249,6 +385,9 @@ impl DuckDbService {
         db_name: &str,
         handle: &DatabaseHandle,
     ) -> Result<(), DuckDbError> {
+        let key = (space.to_string(), db_name.to_string());
+        let expected = self.expectation(&key);
+
         if let Some(wal) = handle
             .wal()
             .await?
@@ -256,10 +395,14 @@ impl DuckDbService {
         {
             match self
                 .artifact_repository
-                .save_delta("duckdb", &space.to_string(), db_name, wal)
+                .save_delta("duckdb", &space.to_string(), db_name, wal, expected.clone())
                 .await
             {
                 Ok(saved) => {
+                    // The delta rides on the same checkpoint, so only the
+                    // revision this actor is caught up to moves.
+                    self.lineage
+                        .insert(key, expected.advanced_to(saved.revision));
                     tracing::info!(
                         service = "duckdb",
                         space = %space,
@@ -289,13 +432,28 @@ impl DuckDbService {
         db_name: &str,
         handle: &DatabaseHandle,
     ) -> Result<Vec<u8>, DuckDbError> {
+        let key = (space.to_string(), db_name.to_string());
+        let expected = self.expectation(&key);
         let payload = handle.export().await?;
         let bytes = payload.len();
         let saved = self
             .artifact_repository
-            .save("duckdb", &space.to_string(), db_name, payload.clone())
+            .save(
+                "duckdb",
+                &space.to_string(),
+                db_name,
+                payload.clone(),
+                expected,
+            )
             .await
             .map_err(artifact_error_to_duckdb)?;
+        self.lineage.insert(
+            key,
+            ArtifactExpectation::Derived {
+                revision: saved.revision,
+                checkpoint_content_hash: saved.checkpoint_content_hash.clone(),
+            },
+        );
         tracing::info!(
             service = "duckdb",
             space = %space,
@@ -310,6 +468,56 @@ impl DuckDbService {
     }
 }
 
+/// Whether `payload` carries DuckDB's main-database header.
+fn is_duckdb_file(payload: &[u8]) -> bool {
+    payload
+        .get(DUCKDB_MAGIC_OFFSET..DUCKDB_MAGIC_OFFSET + DUCKDB_MAGIC.len())
+        .is_some_and(|magic| magic == DUCKDB_MAGIC)
+}
+
+/// Reject a hydration payload whose leading bytes are not the format the file
+/// it is about to become is read as.
+fn validate_payload(
+    space: &SpaceId,
+    db_name: &str,
+    role: &'static str,
+    payload: &[u8],
+    is_valid: impl Fn(&[u8]) -> bool,
+) -> Result<(), DuckDbError> {
+    if is_valid(payload) {
+        return Ok(());
+    }
+    tracing::error!(
+        service = "duckdb",
+        space = %space,
+        db = db_name,
+        role,
+        bytes = payload.len(),
+        leading = %hex::encode(&payload[..payload.len().min(16)]),
+        "Durable database artifact does not carry the expected file header; refusing to hydrate"
+    );
+    Err(DuckDbError::Internal(format!(
+        "database artifact {role} for {space}/{db_name} does not carry the expected file header"
+    )))
+}
+
+/// A temp sibling of `path`, unique per call.
+///
+/// The suffix is APPENDED to the whole path. `Path::with_extension` replaces
+/// everything after the last `.`, so `main.duckdb` and `main.duckdb.wal` both
+/// mapped to `main.duckdb.tmp` — as did `import_db`'s own staging file. The
+/// checkpoint and WAL writes of one hydration raced on a single file and
+/// cross-consumed each other's bytes, reverting the database silently.
+fn temp_write_path(path: &Path) -> PathBuf {
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+    PathBuf::from(format!(
+        "{}.tmp.{}.{}",
+        path.display(),
+        std::process::id(),
+        NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 async fn write_cache_file(path: &Path, payload: &[u8]) -> Result<(), DuckDbError> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -317,13 +525,16 @@ async fn write_cache_file(path: &Path, payload: &[u8]) -> Result<(), DuckDbError
             .map_err(|e| DuckDbError::Internal(e.to_string()))?;
     }
 
-    let temp_path = path.with_extension("duckdb.tmp");
-    tokio::fs::write(&temp_path, payload)
-        .await
-        .map_err(|e| DuckDbError::Internal(e.to_string()))?;
-    tokio::fs::rename(&temp_path, path)
-        .await
-        .map_err(|e| DuckDbError::Internal(e.to_string()))
+    let temp_path = temp_write_path(path);
+    if let Err(e) = tokio::fs::write(&temp_path, payload).await {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(DuckDbError::Internal(e.to_string()));
+    }
+    if let Err(e) = tokio::fs::rename(&temp_path, path).await {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(DuckDbError::Internal(e.to_string()));
+    }
+    Ok(())
 }
 
 async fn remove_duckdb_cache_files(path: &Path) -> Result<(), DuckDbError> {

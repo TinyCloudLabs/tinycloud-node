@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -36,8 +37,13 @@ enum DbMessage {
     },
 }
 
+/// Distinguishes one actor from its replacement for the same (space, db); see
+/// the deregistration at the end of [`spawn_actor`].
+static NEXT_ACTOR_ID: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Clone)]
 pub struct DatabaseHandle {
+    id: u64,
     tx: mpsc::Sender<DbMessage>,
 }
 
@@ -105,6 +111,7 @@ pub fn spawn_actor(
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
 ) -> DatabaseHandle {
     let (tx, mut rx) = mpsc::channel::<DbMessage>(32);
+    let id = NEXT_ACTOR_ID.fetch_add(1, Ordering::Relaxed);
 
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Handle::current();
@@ -173,11 +180,18 @@ pub fn spawn_actor(
             }
         }
 
-        databases.remove(&(space_id.clone(), db_name.clone()));
+        // Deregister only OUR OWN entry. A replacement actor may already have
+        // been hydrated and registered for this key (the dead-actor respawn in
+        // `SqlService::execute` does exactly that), and evicting it would send
+        // the next request through hydration while it is live — deleting and
+        // rewriting the files it holds open by path.
+        databases.remove_if(&(space_id.clone(), db_name.clone()), |_, handle| {
+            handle.id == id
+        });
         tracing::debug!(space=%space_id, db=%db_name, "Database actor shutting down");
     });
 
-    DatabaseHandle { tx }
+    DatabaseHandle { id, tx }
 }
 
 fn handle_wal(mode: &StorageMode, file_path: &Path) -> Result<Option<Vec<u8>>, SqlError> {
