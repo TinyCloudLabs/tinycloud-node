@@ -1020,7 +1020,7 @@ fn normal_invocation_allows_v3_delivery(
         })
 }
 
-#[post("/share/v3/deliveries/authorize", format = "json", data = "<request>")]
+#[post("/policy/v3/deliveries/authorize", format = "json", data = "<request>")]
 pub async fn authorize_delivery(
     request: Json<DeliveryAuthorizationRequest>,
     runtime: &State<PolicyV3Runtime>,
@@ -1206,7 +1206,7 @@ pub struct EnforcerBindingRequest {
     pub enforcer_did: Option<String>,
 }
 
-#[post("/share/v3/enforcer-bindings", format = "json", data = "<request>")]
+#[post("/policy/v3/enforcer-bindings", format = "json", data = "<request>")]
 pub async fn issue_enforcer_binding(
     request: Json<EnforcerBindingRequest>,
     runtime: &State<PolicyV3Runtime>,
@@ -1396,7 +1396,7 @@ pub struct StatusCheckpointResponse {
     pub revocation: Option<Value>,
 }
 
-#[post("/share/v3/policies", format = "json", data = "<request>")]
+#[post("/policy/v3/policies", format = "json", data = "<request>")]
 pub async fn register_policy(
     request: Json<RegisterRequest>,
     runtime: &State<PolicyV3Runtime>,
@@ -1575,7 +1575,7 @@ pub async fn register_policy(
     }))
 }
 
-#[post("/share/v3/policy/challenges", format = "json", data = "<request>")]
+#[post("/policy/v3/challenges", format = "json", data = "<request>")]
 pub async fn challenge(
     request: Json<ChallengeRequest>,
     runtime: &State<PolicyV3Runtime>,
@@ -1634,7 +1634,7 @@ pub async fn challenge(
     }))
 }
 
-#[post("/share/v3/policy/delegations", format = "json", data = "<request>")]
+#[post("/policy/v3/delegations", format = "json", data = "<request>")]
 pub async fn mint(
     request: Json<MintRequest>,
     runtime: &State<PolicyV3Runtime>,
@@ -2876,7 +2876,7 @@ async fn ingest_status_checkpoint_unmounted(
     }))
 }
 
-#[post("/share/v3/policy/status", format = "json", data = "<request>")]
+#[post("/policy/v3/status", format = "json", data = "<request>")]
 pub async fn status(
     request: Json<StatusRenewalRequest>,
     runtime: &State<PolicyV3Runtime>,
@@ -2972,7 +2972,7 @@ pub async fn status(
 /// Return the exact current signed checkpoint so an owner can bind the next
 /// renewal to its sequence and predecessor digest. The checkpoint is public
 /// liveness evidence; it cannot grant or widen authority.
-#[get("/share/v3/policy/status/<root_cid>")]
+#[get("/policy/v3/status/<root_cid>")]
 pub async fn get_status(
     root_cid: &str,
     runtime: &State<PolicyV3Runtime>,
@@ -6833,7 +6833,7 @@ mod tests {
         assert_eq!(seed_response.status(), Status::Ok);
 
         let binding_response = client
-            .post("/share/v3/enforcer-bindings")
+            .post("/policy/v3/enforcer-bindings")
             .header(ContentType::JSON)
             .body(
                 json!({
@@ -6848,7 +6848,7 @@ mod tests {
         let live_binding: Value = binding_response.into_json().await.unwrap();
 
         let register_response = client
-            .post("/share/v3/policies")
+            .post("/policy/v3/policies")
             .header(ContentType::JSON)
             .body(
                 json!({
@@ -6869,7 +6869,7 @@ mod tests {
         assert_eq!(register_status, Status::Ok, "register: {register_body}");
 
         let challenge_response = client
-            .post("/share/v3/policy/challenges")
+            .post("/policy/v3/challenges")
             .header(ContentType::JSON)
             .body(
                 json!({
@@ -6908,7 +6908,7 @@ mod tests {
             URL_SAFE_NO_PAD
         ));
         let mint_response = client
-            .post("/share/v3/policy/delegations")
+            .post("/policy/v3/delegations")
             .header(ContentType::JSON)
             .body(
                 json!({
@@ -7033,7 +7033,7 @@ mod tests {
         // credential-space input. The same receiver key spans credential,
         // challenge, presentation, delegation audience, and invocation.
         let v4_challenge_response = client
-            .post("/share/v3/policy/challenges")
+            .post("/policy/v3/challenges")
             .header(ContentType::JSON)
             .body(
                 json!({
@@ -7080,7 +7080,7 @@ mod tests {
             let mut explicit_null = v4_request_value.clone();
             explicit_null[field] = Value::Null;
             let rejected = client
-                .post("/share/v3/policy/delegations")
+                .post("/policy/v3/delegations")
                 .header(ContentType::JSON)
                 .body(explicit_null.to_string())
                 .dispatch()
@@ -7093,7 +7093,7 @@ mod tests {
         }
         let v4_request = v4_request_value.to_string();
         let v4_mint_response = client
-            .post("/share/v3/policy/delegations")
+            .post("/policy/v3/delegations")
             .header(ContentType::JSON)
             .body(v4_request.clone())
             .dispatch()
@@ -7197,7 +7197,7 @@ mod tests {
         assert_eq!(v4_read_body, b"tc-470-real-content");
 
         let replay = client
-            .post("/share/v3/policy/delegations")
+            .post("/policy/v3/delegations")
             .header(ContentType::JSON)
             .body(v4_request)
             .dispatch()

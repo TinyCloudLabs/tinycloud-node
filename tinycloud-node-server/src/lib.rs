@@ -703,7 +703,7 @@ fn share_security_fairing(share_allowed_origin: String) -> AdHoc {
 }
 
 fn is_mounted_share_path(path: &str) -> bool {
-    path.starts_with("/share/v3/policy/")
+    path.starts_with("/policy/v3/")
 }
 
 #[cfg(test)]
@@ -720,15 +720,17 @@ mod production_route_tests {
         for route in [
             "POST /delegate",
             "POST /invoke",
-            "POST /share/v3/policy/challenges",
-            "POST /share/v3/policy/delegations",
+            "POST /policy/v3/challenges",
+            "POST /policy/v3/delegations",
         ] {
             assert!(routes.contains(route), "missing required route: {route}");
         }
         for route in [
             "POST /share/v1/read",
             "POST /share/v2/invoke",
-            "POST /share/v3/deliveries/authorize",
+            "POST /share/v3/policy/challenges",
+            "POST /share/v3/policy/delegations",
+            "POST /policy/v3/deliveries/authorize",
         ] {
             assert!(
                 !routes.contains(route),
@@ -980,7 +982,7 @@ mod share_security_fairing_tests {
     use super::share_security_fairing;
     use rocket::{http::Header, local::asynchronous::Client, options, routes};
 
-    #[options("/share/v3/policy/challenges")]
+    #[options("/policy/v3/challenges")]
     fn policy_admission_preflight() {}
 
     #[options("/v1/config")]
@@ -999,7 +1001,7 @@ mod share_security_fairing_tests {
         .await
         .expect("valid Rocket instance");
 
-        for path in ["/share/v3/policy/challenges"] {
+        for path in ["/policy/v3/challenges"] {
             let response = client
                 .options(path)
                 .header(Header::new("Origin", "https://share.tinycloud.xyz"))

@@ -518,7 +518,7 @@ pub async fn delegate(
 /// signature suite is staged on top of the existing pipeline as a followup
 /// (it requires a new variant in `tinycloud-auth::TinyCloudRevocation`); the
 /// Policy-v3 roots are control-plane artifacts and are revoked only through
-/// their signed `/share/v3/policy/status` checkpoint; this route must never
+/// their signed `/policy/v3/status` checkpoint; this route must never
 /// turn an ordinary revocation into a root-status projection.
 #[post("/revoke")]
 pub async fn revoke(
