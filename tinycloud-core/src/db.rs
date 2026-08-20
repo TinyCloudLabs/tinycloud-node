@@ -34,9 +34,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tinycloud_auth::multihash_codetable::MultihashDigest;
 use tinycloud_auth::{
-    authorization::{make_invocation, EncodingError, InvocationOptions, TinyCloudDelegation},
+    authorization::{EncodingError, TinyCloudDelegation},
     identity::{canonicalize_did, did_principal_matches},
     resource::{Path, SpaceId},
 };
@@ -92,9 +91,6 @@ enum InvokeMode {
     /// Untyped public entry point: signature verification runs during
     /// processing, same as always.
     Public,
-    /// Pre-authorized by a trusted application protocol seam
-    /// (`invoke_internal_kv_put`). Skips the full UCAN validator entirely.
-    Internal,
     /// Envelope already verified once at admission. Authorization,
     /// revocation, caveat containment, and signed-time validity are still
     /// re-checked at execution; only the signature check is skipped.
@@ -1200,95 +1196,6 @@ where
         Ok(result)
     }
 
-    /// Commit a KV edit after a separate policy authority transaction has
-    /// authenticated and attenuated the request. This is intentionally an
-    /// internal Node composition seam: it creates a local invocation record
-    /// for the normal KV transaction machinery, but is not exposed as a
-    /// public authorization mechanism or a second policy engine.
-    pub async fn invoke_internal_kv_put<S>(
-        &self,
-        space: SpaceId,
-        path: Path,
-        metadata: Metadata,
-        stage: HashBuffer<S::Writable>,
-        precondition: Option<KvPrecondition>,
-    ) -> Result<Hash, TxStoreError<B, S, K>>
-    where
-        B: ImmutableWriteStore<S> + ImmutableReadStore,
-        S: ImmutableStaging,
-        S::Writable: 'static + Unpin,
-    {
-        let jwk = tinycloud_auth::ssi::jwk::JWK::generate_ed25519()
-            .map_err(|_| TxStoreError::MissingInput)?;
-        let mut verification_method = tinycloud_auth::resolver::DID_METHODS
-            .generate(&jwk, "key")
-            .map_err(|_| TxStoreError::MissingInput)?
-            .to_string();
-        let fragment = verification_method
-            .rsplit_once(':')
-            .map(|(_, fragment)| fragment.to_owned())
-            .ok_or(TxStoreError::MissingInput)?;
-        verification_method.push('#');
-        verification_method.push_str(&fragment);
-        let resource = space.clone().to_resource(
-            "kv".parse().map_err(|_| TxStoreError::MissingInput)?,
-            Some(path.clone()),
-            None,
-            None,
-        );
-        let delegation = tinycloud_auth::ipld_core::cid::Cid::new_v1(
-            0x55,
-            tinycloud_auth::multihash_codetable::Code::Blake3_256
-                .digest(b"tinycloud/native-share-internal-delegation"),
-        );
-        let invocation = make_invocation(
-            vec![(
-                resource,
-                vec!["tinycloud.kv/put"
-                    .parse::<tinycloud_auth::ucan_capabilities_object::Ability>()
-                    .map_err(|_| TxStoreError::MissingInput)?],
-            )],
-            &delegation,
-            &jwk,
-            &verification_method,
-            (OffsetDateTime::now_utc() + time::Duration::minutes(5)).unix_timestamp() as f64,
-            InvocationOptions {
-                proof: Some(Vec::new()),
-                ..InvocationOptions::default()
-            },
-        )
-        .map_err(|_| TxStoreError::MissingInput)?;
-        let info = crate::util::InvocationInfo::try_from(invocation.clone())
-            .map_err(|_| TxStoreError::MissingInput)?;
-        let serialized = invocation
-            .encode()
-            .map_err(|_| TxStoreError::MissingInput)?
-            .into_bytes();
-        let invocation = crate::events::SerializedEvent(info, serialized);
-        let mut inputs = HashMap::new();
-        inputs.insert((space, path), (metadata, stage));
-        let mut options = KvInvokeOptions::default();
-        if let Some(precondition) = precondition {
-            let key = inputs
-                .keys()
-                .next()
-                .cloned()
-                .ok_or(TxStoreError::MissingInput)?;
-            options.preconditions.insert(key, precondition);
-        }
-        let (_, mut outcomes) = self
-            .invoke_with_options_internal(invocation, inputs, options)
-            .await?;
-        let result = outcomes
-            .drain(..)
-            .find_map(|outcome| match outcome {
-                InvocationOutcome::KvWrite(hash) => Some(hash),
-                _ => None,
-            })
-            .ok_or(TxStoreError::MissingInput);
-        result
-    }
-
     pub async fn delegate(&self, delegation: Delegation) -> Result<TransactResult, TxError<B, K>> {
         let parent_hashes: Vec<Hash> = delegation
             .0
@@ -1554,21 +1461,6 @@ where
             .await
     }
 
-    async fn invoke_with_options_internal<S>(
-        &self,
-        invocation: Invocation,
-        inputs: InvocationInputs<S::Writable>,
-        options: KvInvokeOptions,
-    ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
-    where
-        B: ImmutableWriteStore<S> + ImmutableReadStore,
-        S: ImmutableStaging,
-        S::Writable: 'static + Unpin,
-    {
-        self.invoke_with_options_mode(invocation, inputs, options, InvokeMode::Internal)
-            .await
-    }
-
     async fn invoke_with_options_mode<S>(
         &self,
         invocation: Invocation,
@@ -1768,7 +1660,6 @@ where
             });
         //  verify and commit invocation and kv operations
         let event = match mode {
-            InvokeMode::Internal => Event::InternalInvocation(Box::new(invocation), ops),
             InvokeMode::Admitted => Event::AdmittedInvocation(Box::new(invocation), ops),
             InvokeMode::Public => Event::Invocation(Box::new(invocation), ops),
         };
@@ -1940,7 +1831,7 @@ where
                     .await
                     .map_err(TxError::<B, K>::from)?
             }
-            InvokeMode::Public | InvokeMode::Internal => invocation::verify_and_authorize(
+            InvokeMode::Public => invocation::verify_and_authorize(
                 &self.conn,
                 &invocation.0,
                 OffsetDateTime::now_utc(),
@@ -2416,14 +2307,6 @@ async fn event_spaces<'a, C: ConnectionTrait>(
                     }
                 }
             }
-            Event::InternalInvocation(i, _) => {
-                for space in i.0.spaces() {
-                    let entry = spaces.entry(space.clone()).or_default();
-                    if !entry.iter().any(|(h, _)| h == &e.0) {
-                        entry.push(e);
-                    }
-                }
-            }
             Event::AdmittedInvocation(i, _) => {
                 for space in i.0.spaces() {
                     let entry = spaces.entry(space.clone()).or_default();
@@ -2810,23 +2693,6 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                     )
                     .await?;
                 }
-                Event::InternalInvocation(i, ops) => {
-                    invocation::process_internal(
-                        db,
-                        *i,
-                        ops.into_iter()
-                            .map(|op| {
-                                let v = space_order
-                                    .get(op.space())
-                                    .and_then(|(s, e, _, h)| Some((s, e, h.get(&hash)?)))
-                                    .unwrap();
-                                op.version(*v.0, *v.1, *v.2)
-                            })
-                            .collect(),
-                        encryption,
-                    )
-                    .await?;
-                }
                 Event::AdmittedInvocation(i, ops) => {
                     invocation::process_admitted(
                         db,
@@ -2893,9 +2759,6 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                 }
                 Event::Invocation(i, _ops) => {
                     invocation::process(db, *i, Vec::new(), encryption, auth_graph).await?;
-                }
-                Event::InternalInvocation(i, _ops) => {
-                    invocation::process_internal(db, *i, Vec::new(), encryption).await?;
                 }
                 Event::AdmittedInvocation(i, _ops) => {
                     invocation::process_admitted(db, *i, Vec::new(), encryption, auth_graph)

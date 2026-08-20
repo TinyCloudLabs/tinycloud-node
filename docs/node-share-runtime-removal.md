@@ -28,6 +28,16 @@ surgical guard — a parent carrying that fact is rejected with
 would have widened what an existing database authorizes. Fresh databases never
 write the fact, so the guard is inert on new deployments.
 
+`SpaceDatabase::invoke_internal_kv_put` and the private
+`Event::InternalInvocation` path are gone with it. That seam existed so the
+Share native data plane could commit a KV write whose authorization had
+already been decided by the Node-local policy authority: it fabricated a
+throwaway keypair and an empty proof and persisted the mutation without the
+delegation-graph validation `Event::Invocation` performs. With Share removed
+it had no callers, so keeping a public authorization-bypass entry point in
+`tinycloud-core` served nothing. Every KV write now goes through the public
+or admitted invocation path.
+
 Nothing else about generic verification changed: every cited proof must still
 resolve, must have delegated to the child's delegator, must be unrevoked and
 non-terminal, and must contain the child's capabilities and caveats. The

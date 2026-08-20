@@ -122,28 +122,6 @@ pub(crate) async fn process<C: ConnectionTrait>(
     save(db, i, Some(now), serialized, ops, encryption).await
 }
 
-/// Persist a mutation whose authorization was completed by a trusted
-/// application protocol before it entered the database transaction. The
-/// caller must use the private `Event::InternalInvocation` path; public
-/// invocations must continue to use `process`.
-pub(crate) async fn process_internal<C: ConnectionTrait>(
-    db: &C,
-    invocation: Invocation,
-    ops: Vec<VersionedOperation>,
-    encryption: Option<&ColumnEncryption>,
-) -> Result<Hash, Error> {
-    let (i, serialized) = (invocation.0, invocation.1);
-    save(
-        db,
-        i,
-        Some(OffsetDateTime::now_utc()),
-        serialized,
-        ops,
-        encryption,
-    )
-    .await
-}
-
 /// TC-409: process an invocation that was already admitted (envelope
 /// verified once by `AdmittedInvocation::admit`). Skips only the
 /// cryptographic signature check — everything else `process` does is
