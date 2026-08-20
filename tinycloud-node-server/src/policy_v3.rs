@@ -5849,6 +5849,35 @@ mod tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn embedded_delivery_runtime_uses_node_key_and_fails_closed_on_trust_mismatch() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let signer = StaticSecret::new(vec![53; 32]).unwrap();
+        let node_did = signer.node_did();
+        let mut config = ShareEmailConfig {
+            enabled: true,
+            target_origin: "https://node.example".into(),
+            node_audience: node_did.clone(),
+            node_signing_kid: format!("{node_did}#delivery"),
+            invitation_kid: format!("{node_did}#delivery"),
+            credentials_origin: Some("https://witness.credentials.org".into()),
+            invitation_public_key: Some(encode_config(
+                signer.share_invitation_public_key(),
+                URL_SAFE_NO_PAD,
+            )),
+            ..ShareEmailConfig::default()
+        };
+        let runtime = PolicyV3Runtime::new(db.clone(), node_did.clone(), signer.clone())
+            .with_delivery(&config)
+            .unwrap();
+        assert!(runtime.delivery.is_some());
+
+        config.invitation_public_key = Some(encode_config([0_u8; 32], URL_SAFE_NO_PAD));
+        assert!(PolicyV3Runtime::new(db, node_did, signer)
+            .with_delivery(&config)
+            .is_err());
+    }
+
     fn signed_tc500_v4_presentation(vector: &Value) -> Value {
         let mut presentation = vector["unsigned"].clone();
         presentation["signature"] = json!({

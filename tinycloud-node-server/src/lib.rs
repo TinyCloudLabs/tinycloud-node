@@ -94,10 +94,10 @@ use hooks::HookRuntime;
 use invocation_replay::InvocationReplayCache;
 use node_control::control::ControlPlaneHandle;
 use policy_v3::{
-    challenge as policy_v3_challenge, get_status as get_policy_v3_status,
-    issue_enforcer_binding as policy_v3_enforcer_binding, mint as policy_v3_mint,
-    register_policy as register_policy_v3, revoke_root as revoke_policy_v3_root,
-    status as policy_v3_status, PolicyV3Runtime,
+    authorize_delivery as authorize_policy_v3_delivery, challenge as policy_v3_challenge,
+    get_status as get_policy_v3_status, issue_enforcer_binding as policy_v3_enforcer_binding,
+    mint as policy_v3_mint, register_policy as register_policy_v3,
+    revoke_root as revoke_policy_v3_root, status as policy_v3_status, PolicyV3Runtime,
 };
 use quota::QuotaCache;
 #[cfg(feature = "tc-bench-v1")]
@@ -261,6 +261,7 @@ fn production_routes() -> Vec<Route> {
         register_policy_v3,
         get_policy_v3_status,
         policy_v3_enforcer_binding,
+        authorize_policy_v3_delivery,
         policy_v3_challenge,
         policy_v3_mint,
         policy_v3_status,
@@ -275,6 +276,14 @@ pub async fn app_with_control(
 ) -> Result<Rocket<Build>> {
     let mut tinycloud_config = tinycloud_config.clone();
     tinycloud_config.storage.resolve();
+    tinycloud_config.share_email = tinycloud_config
+        .share_email
+        .resolve_trust_bundle()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    tinycloud_config
+        .share_email
+        .validate_for_v2_database(tinycloud_config.storage.database())
+        .map_err(|error| anyhow::anyhow!(error))?;
 
     // Ensure local storage directories exist.
     // SQLite file paths and local dirs are resources the server owns — auto-create them.
@@ -441,6 +450,9 @@ pub async fn app_with_control(
     let mut policy_v3_runtime =
         PolicyV3Runtime::new(seed_conn.clone(), key_setup.node_did(), key_setup.clone())
             .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock());
+    if tinycloud_config.share_email.enabled {
+        policy_v3_runtime = policy_v3_runtime.with_delivery(&tinycloud_config.share_email)?;
+    }
     if let Some(encoded_key) = tinycloud_config.share_email.issuer_public_key.as_deref() {
         let decoded = base64::decode_config(encoded_key, base64::URL_SAFE_NO_PAD)
             .context("policy credential issuer public key must be canonical base64url")?;
@@ -722,15 +734,16 @@ mod production_route_tests {
             "POST /invoke",
             "POST /policy/v3/challenges",
             "POST /policy/v3/delegations",
+            "POST /policy/v3/deliveries/authorize",
         ] {
             assert!(routes.contains(route), "missing required route: {route}");
         }
         for route in [
             "POST /share/v1/read",
             "POST /share/v2/invoke",
+            "POST /share/v2/deliveries/authorize",
             "POST /share/v3/policy/challenges",
             "POST /share/v3/policy/delegations",
-            "POST /policy/v3/deliveries/authorize",
         ] {
             assert!(
                 !routes.contains(route),
