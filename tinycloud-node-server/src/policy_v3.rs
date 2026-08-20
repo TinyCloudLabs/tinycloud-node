@@ -1108,6 +1108,8 @@ pub async fn authorize_delivery(
         .get("credentialRequirement")
         .and_then(Value::as_object)
         .and_then(|requirement| requirement.get("credentialType"))
+        .and_then(Value::as_object)
+        .and_then(|credential_type| credential_type.get("id"))
         .and_then(Value::as_str)
         .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
     if actions.as_slice() != ["read"] || credential_type != "opencredentials.email/v1" {
