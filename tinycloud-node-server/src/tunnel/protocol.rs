@@ -26,8 +26,20 @@ pub const MAX_FRAME_PAYLOAD_BYTES: usize = 1024 * 1024;
 /// envelope overhead, staying comfortably under `MAX_FRAME_PAYLOAD_BYTES`.
 pub const BODY_CHUNK_BYTES: usize = 256 * 1024;
 
+/// Product-wide ceiling (bytes) on the plaintext content a single tunnelled
+/// request or response may carry.
+const MAX_TUNNELLED_CONTENT_BYTES: usize = 100 * 1024 * 1024;
+
 /// Default cap (bytes) on a full reassembled generic HTTP request or response.
-pub const DEFAULT_MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
+///
+/// A tunnelled body is not the raw content: generic `/invoke` envelopes carry
+/// content base64url-encoded inside signed JSON, so the transport ceiling must
+/// leave room for that ~4/3 expansion plus envelope overhead on both the
+/// request and the response. Keep this value byte-identical to the pre-Share
+/// removal ceiling — shrinking it to the plaintext limit would silently reject
+/// full-size generic uploads and reads that the relay accepts today.
+pub const DEFAULT_MAX_BODY_BYTES: usize =
+    (MAX_TUNNELLED_CONTENT_BYTES / 3) * 4 + 2_000_000 + 4_000_000;
 
 // Close codes the relay uses to reject/terminate a tunnel WebSocket, in the
 // RFC 6455 private-use range. Mirrors `tinycloud-link/src/tunnel/upgrade.ts`
@@ -248,5 +260,18 @@ mod tests {
     #[::core::prelude::v1::test]
     fn parse_rejects_unknown_type() {
         assert!(TunnelFrame::parse(r#"{"type":"bogus"}"#).is_err());
+    }
+
+    /// Retiring the Share runtime must not shrink the generic tunnel's
+    /// transport ceiling. A full-size body is base64url content inside a
+    /// signed JSON envelope, so the cap has to exceed the plaintext limit.
+    #[::core::prelude::v1::test]
+    fn default_max_body_leaves_room_for_encoded_full_size_content() {
+        assert_eq!(DEFAULT_MAX_BODY_BYTES, 145_810_132);
+        assert_eq!(
+            DEFAULT_MAX_BODY_BYTES.max(MAX_TUNNELLED_CONTENT_BYTES / 3 * 4),
+            DEFAULT_MAX_BODY_BYTES,
+            "the transport cap must exceed base64-expanded full-size content"
+        );
     }
 }

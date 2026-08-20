@@ -162,6 +162,11 @@ pub enum DelegationError {
     },
     #[error("delegation-chain-traversal-limit-exceeded")]
     ChainTraversalLimitExceeded,
+    /// The cited parent is a legacy Share policy-authority/enforcement root
+    /// left in an upgraded database. It was never ordinary redelegation
+    /// authority and must not become one now that the Share runtime is gone.
+    #[error("retired-policy-root-cannot-be-ordinary-parent")]
+    RetiredPolicyRootParent,
     /// W1: child caveats are not a subset of the parent's caveats — the
     /// child dropped, widened, or replaced a constrained-statements caveat
     /// the parent carried (audit P0 finding 1). Maps to the spec rejection
@@ -269,6 +274,21 @@ async fn validate<C: ConnectionTrait>(
             for p in &all_parents {
                 if parent_is_terminal(p) {
                     return Err(DelegationError::TerminalParentCannotRedelegate.into());
+                }
+            }
+
+            // Upgrade-compatibility guard for the retired Share policy
+            // runtime. A database written by an older Node may still hold
+            // control-plane policy roots that were admitted into the ordinary
+            // graph but were never usable as an ordinary parent: only the
+            // Share conjunctive mint could draw from them. Now that the mint
+            // is gone, keep those rows fail-closed instead of silently
+            // promoting them into ordinary redelegation authority. Fresh
+            // databases never write this fact, so this only affects
+            // pre-existing rows.
+            for p in &all_parents {
+                if parent_is_retired_policy_root(p) {
+                    return Err(DelegationError::RetiredPolicyRootParent.into());
                 }
             }
 
@@ -433,6 +453,18 @@ fn extract_sql_caveat(
 /// True if the persisted parent row is marked terminal via the
 /// `xyz.tinycloud.policy/delegationMode` fact. The marker is stored in the
 /// `facts` JSON column at save time; absence is treated as attenuable.
+/// Fact key that an older Node persisted on control-plane policy-root rows.
+/// The Share policy runtime that could consume them has been removed; the
+/// rows are retained only so existing databases keep an intact history.
+const RETIRED_POLICY_ROOT_FACT_KEY: &str = "xyz.tinycloud.policy/root-profile";
+
+fn parent_is_retired_policy_root(p: &Model) -> bool {
+    let Some(Facts(map)) = &p.facts else {
+        return false;
+    };
+    map.contains_key(RETIRED_POLICY_ROOT_FACT_KEY)
+}
+
 fn parent_is_terminal(p: &Model) -> bool {
     let Some(Facts(map)) = &p.facts else {
         return false;
@@ -630,6 +662,58 @@ mod tests {
         .insert(db)
         .await
         .unwrap();
+    }
+
+    fn model_with_facts(facts: Option<Facts>) -> Model {
+        let serialization = b"retired-policy-root-parent-fixture".to_vec();
+        Model {
+            id: crate::hash::hash(&serialization),
+            delegator: "did:key:z6MkOwner".to_string(),
+            delegatee: "did:key:z6MkEnforcer".to_string(),
+            expiry: None,
+            issued_at: None,
+            not_before: None,
+            facts,
+            serialization,
+        }
+    }
+
+    /// A policy-root row left behind by an upgraded database must stay
+    /// fail-closed: retiring the Share conjunctive mint must not silently
+    /// promote it into ordinary redelegation authority.
+    #[test]
+    fn retired_policy_root_parent_is_detected_from_the_persisted_fact() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            RETIRED_POLICY_ROOT_FACT_KEY.to_string(),
+            serde_json::json!({ "role": "policy-enforcement" }),
+        );
+        assert!(parent_is_retired_policy_root(&model_with_facts(Some(
+            Facts(map)
+        ))));
+    }
+
+    /// An ordinary parent — no facts, or unrelated facts — is unaffected.
+    #[test]
+    fn ordinary_parent_is_not_treated_as_a_retired_policy_root() {
+        assert!(!parent_is_retired_policy_root(&model_with_facts(None)));
+
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            DelegationMode::FACT_KEY.to_string(),
+            serde_json::json!("terminal"),
+        );
+        assert!(!parent_is_retired_policy_root(&model_with_facts(Some(
+            Facts(map)
+        ))));
+    }
+
+    #[test]
+    fn retired_policy_root_parent_has_a_distinct_rejection_reason() {
+        assert_eq!(
+            DelegationError::RetiredPolicyRootParent.to_string(),
+            "retired-policy-root-cannot-be-ordinary-parent"
+        );
     }
 
     // ── DelegationRegistration New/Existing outcome tests ───────────────────
