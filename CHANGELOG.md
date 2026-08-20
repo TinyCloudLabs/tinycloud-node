@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Remove all Node-hosted Share v1/v2/v3 routes and the associated credential,
+  policy-decision, invitation, and session runtime. Share now obtains scoped
+  delegations from the standalone Policy Engine and uses Node's generic
+  `/delegate` and `/invoke` capability/storage APIs.
+
 ## [1.15.2] - 2026-08-13
 
 - Fix the per-app SQL/DuckDB artifact store's cold-start hydration path: hydration is now serialized per `(space, db)` (per-key singleflight with a double-checked actor re-check), cache writes use unique temp paths with magic-byte validation instead of the colliding `.db.tmp` name, and saves carry a content-lineage CAS (`StaleLineage`) so a stale actor re-hydrates instead of silently reverting an app database to an old checkpoint and persisting it. Adds checkpoint-shrink warnings and load-side artifact logging; artifact blobs that fail validation now error loudly at hydration instead of silently serving stale data (#223).

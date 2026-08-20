@@ -236,16 +236,23 @@ async fn validate<C: ConnectionTrait>(
         (false, true) => Err(DelegationError::MissingParents.into()),
         // dependant caps, parents, check parents
         (false, false) => {
-            // Only ordinary TinyCloud parents delegated to this delegator are
-            // eligible to authorize the child.
-            let all_parents: Vec<_> = Entity::find()
-                .filter(Column::Id.is_in(delegation.parents.iter().map(|c| Hash::from(*c))))
-                .filter(Column::Delegatee.eq(delegation.delegator.clone()))
-                .all(db)
-                .await?;
-
-            if all_parents.is_empty() {
-                return Err(DelegationError::MissingParents.into());
+            // Resolve every signed proof and require each one to have delegated
+            // to this child delegator. Retiring the Share-specific conjunctive
+            // policy profile must not relax ordinary capability verification by
+            // silently ignoring a missing or wrong-audience proof.
+            let mut all_parents = Vec::with_capacity(delegation.parents.len());
+            for parent_cid in &delegation.parents {
+                let Some(parent) = Entity::find_by_id(Hash::from(*parent_cid)).one(db).await?
+                else {
+                    return Err(DelegationError::MissingParents.into());
+                };
+                if parent.delegatee != delegation.delegator {
+                    return Err(DelegationError::UnauthorizedDelegator(
+                        delegation.delegator.clone(),
+                    )
+                    .into());
+                }
+                all_parents.push(parent);
             }
 
             // A revoked grant cannot authorize new descendants. Check both
