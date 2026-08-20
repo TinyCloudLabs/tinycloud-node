@@ -62,6 +62,14 @@ pub(crate) enum Operation {
         space: SpaceId,
         key: Path,
         version: Option<(i64, Hash, i64)>,
+        /// TC-411: the `current_kv.invocation` id already loaded by the
+        /// caller (`db.rs`) while resolving `version` above, threaded
+        /// through so `invocation::save` can persist the `kv_delete` audit
+        /// row without re-querying `kv_write` for it. `None` when no
+        /// current (non-deleted) row existed at delete time -- e.g.
+        /// deleting an already-deleted or never-written key -- in which
+        /// case `invocation::save` still falls back to its own lookup.
+        deleted_invocation_id: Option<Hash>,
     },
 }
 
@@ -86,10 +94,12 @@ impl Operation {
                 space,
                 key,
                 version,
+                deleted_invocation_id,
             } => VersionedOperation::KvDelete {
                 space,
                 key,
                 version,
+                deleted_invocation_id,
                 seq,
                 epoch,
                 epoch_seq,
@@ -120,6 +130,7 @@ pub(crate) enum VersionedOperation {
         space: SpaceId,
         key: Path,
         version: Option<(i64, Hash, i64)>,
+        deleted_invocation_id: Option<Hash>,
         seq: i64,
         epoch: Hash,
         epoch_seq: i64,
