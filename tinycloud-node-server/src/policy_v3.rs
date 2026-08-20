@@ -1100,10 +1100,7 @@ pub async fn authorize_delivery(
         .get("policy")
         .and_then(Value::as_object)
         .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
-    let policy_id = policy
-        .get("policyId")
-        .and_then(Value::as_str)
-        .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
+    let policy_id = registration.policy_cid.clone();
     let credential_type = policy
         .get("credentialRequirement")
         .and_then(Value::as_object)
