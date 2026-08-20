@@ -1,6 +1,5 @@
 [package]
 name = "tinycloud-node"
-build = "build.rs"
 version = "1.15.2"
 authors = ["TinyCloud Protocol"]
 edition = "2021"
@@ -18,7 +17,6 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-aes-gcm = "0.10"
 async-trait.workspace = true
 aws-config = "0.49"
 aws-sdk-dynamodb = "0.19"
@@ -112,14 +110,12 @@ features = ["sqlite", "postgres", "mysql", "tokio", "verification-count-test-hoo
 [dev-dependencies]
 axum = { version = "0.7", features = ["ws"] }
 bs58 = "0.5"
-chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 k256 = { version = "0.13.4", features = ["ecdsa"] }
 sha3 = "0.10"
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 hyper = { version = "0.14", features = ["http1", "server", "tcp"] }
 libp2p-identity = { version = "0.2", features = ["ed25519"] }
 pem = "3"
-uuid = { version = "1", features = ["v4"] }
 x509-parser = "0.16"
 
 [features]
@@ -131,15 +127,6 @@ jemalloc = ["dep:tikv-jemallocator"]
 dstack = []
 duckdb = ["tinycloud-core/duckdb"]
 tc-bench-v1 = []
-# Enables only the hermetic mounted fixture's placeholder trust identities.
-# This feature is never part of a production build.
-mounted-fixture = []
-# Enables a deterministic, key-derived TeeContext for /share/v2 on hosts with
-# no real dstack TEE (local dev, canonical local-launch harnesses). It never
-# reads fixture material or static capabilities — the identity is derived
-# from the same node key material real deployments use. This feature is
-# never part of a production build; see Dockerfile CARGO_FEATURES.
-local-tee = []
 
 # cargo-dist metadata
 [package.metadata.dist]

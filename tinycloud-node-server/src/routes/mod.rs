@@ -64,7 +64,6 @@ pub mod admin;
 pub mod attestation;
 pub mod encryption;
 pub mod hooks;
-pub mod node_keys;
 pub mod public;
 #[cfg(feature = "tc-bench-v1")]
 pub mod tc_bench;
@@ -123,35 +122,18 @@ pub struct NodeInfo {
     pub in_tee: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota_url: Option<String>,
-    #[serde(rename = "shareEmail", skip_serializing_if = "Option::is_none")]
-    pub share_email: Option<crate::share_email::CapabilityDescriptor>,
-    #[serde(rename = "shareV2", skip_serializing_if = "Option::is_none")]
-    pub share_v2: Option<crate::share_v2::CapabilityDescriptor>,
 }
 
 fn build_info(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
     encryption: &State<EncryptionService>,
-    share_email: &State<Option<crate::share_email::ShareEmailRuntime>>,
-    share_v2: &State<Option<crate::share_v2::ShareV2Runtime>>,
 ) -> NodeInfo {
     #[allow(unused_mut)]
     let mut features = vec!["kv", "delegation", "sharing", "sql"];
     #[cfg(feature = "duckdb")]
     features.push("duckdb");
     features.extend(["hooks", "signed-urls", "encryption"]);
-    if share_email.inner().is_some() {
-        features.push("share-email-claim");
-    }
-    if share_v2
-        .inner()
-        .as_ref()
-        .and_then(|runtime| runtime.capability())
-        .is_some()
-    {
-        features.push("share-v2");
-    }
     #[cfg(feature = "dstack")]
     features.push("tee");
     NodeInfo {
@@ -161,14 +143,6 @@ fn build_info(
         node_id: encryption.node_did().to_string(),
         in_tee: tee.inner().is_some(),
         quota_url: quota_cache.quota_url().map(|s| s.to_string()),
-        share_email: share_email
-            .inner()
-            .as_ref()
-            .map(|runtime| runtime.capability()),
-        share_v2: share_v2
-            .inner()
-            .as_ref()
-            .and_then(|runtime| runtime.capability()),
     }
 }
 
@@ -177,16 +151,8 @@ pub fn info(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
     encryption: &State<EncryptionService>,
-    share_email: &State<Option<crate::share_email::ShareEmailRuntime>>,
-    share_v2: &State<Option<crate::share_v2::ShareV2Runtime>>,
 ) -> Json<NodeInfo> {
-    Json(build_info(
-        tee,
-        quota_cache,
-        encryption,
-        share_email,
-        share_v2,
-    ))
+    Json(build_info(tee, quota_cache, encryption))
 }
 
 #[get("/version")]
@@ -194,16 +160,8 @@ pub fn version(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
     encryption: &State<EncryptionService>,
-    share_email: &State<Option<crate::share_email::ShareEmailRuntime>>,
-    share_v2: &State<Option<crate::share_v2::ShareV2Runtime>>,
 ) -> Json<NodeInfo> {
-    Json(build_info(
-        tee,
-        quota_cache,
-        encryption,
-        share_email,
-        share_v2,
-    ))
+    Json(build_info(tee, quota_cache, encryption))
 }
 
 #[allow(clippy::let_unit_value)]
@@ -480,15 +438,11 @@ pub async fn delegate(
     d: AuthHeaderGetter<DelegationInfo>,
     req_span: TracingSpan,
     tinycloud: &State<TinyCloud>,
-    policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
 ) -> Result<Json<DelegateResponse>, (Status, String)> {
     let action_label = "delegation";
     let span = info_span!(parent: &req_span.0, "delegate", action = %action_label);
     // Instrumenting async block to handle yielding properly
     async move {
-        if let Err(reason) = policy_v3.ordinary_admission_allowed(tinycloud, &d.0).await {
-            return Err((Status::Forbidden, reason.to_string()));
-        }
         let timer = crate::prometheus::enabled().then(|| {
             crate::prometheus::AUTHORIZED_INVOKE_HISTOGRAM
                 .with_label_values(&["delegate"])
@@ -551,16 +505,7 @@ pub async fn delegate(
     .await
 }
 
-/// W1 (C): ordinary delegation revocation surface.
-///
-/// Accepts a CACAO/SIWE-encoded revocation today (the on-the-wire encoding
-/// supported by `TinyCloudRevocation`); the W0 spec also calls for a
-/// `did:key`-signed UCAN-format revocation by the Grant Issuer. That second
-/// signature suite is staged on top of the existing pipeline as a followup
-/// (it requires a new variant in `tinycloud-auth::TinyCloudRevocation`); the
-/// Policy-v3 roots are control-plane artifacts and are revoked only through
-/// their signed `/share/v3/policy/status` checkpoint; this route must never
-/// turn an ordinary revocation into a root-status projection.
+/// Ordinary delegation revocation surface.
 #[post("/revoke")]
 pub async fn revoke(
     r: AuthHeaderGetter<RevocationInfo>,
@@ -611,7 +556,6 @@ pub async fn invoke(
     config: &State<Config>,
     quota_cache: &State<QuotaCache>,
     invocation_replay_cache: &State<InvocationReplayCache>,
-    policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
     encryption: &State<EncryptionService>,
     sql_service: &State<SqlService>,
     duckdb_service: &State<DuckDbService>,
@@ -627,7 +571,6 @@ pub async fn invoke(
         config,
         quota_cache,
         invocation_replay_cache,
-        policy_v3,
         encryption,
         sql_service,
         duckdb_service,
@@ -649,7 +592,6 @@ pub async fn invoke(
     config: &State<Config>,
     quota_cache: &State<QuotaCache>,
     invocation_replay_cache: &State<InvocationReplayCache>,
-    policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
     encryption: &State<EncryptionService>,
     sql_service: &State<SqlService>,
     hook_runtime: &State<HookRuntime>,
@@ -664,7 +606,6 @@ pub async fn invoke(
         config,
         quota_cache,
         invocation_replay_cache,
-        policy_v3,
         encryption,
         sql_service,
         (),
@@ -1338,7 +1279,6 @@ async fn invoke_impl(
     config: &State<Config>,
     quota_cache: &State<QuotaCache>,
     invocation_replay_cache: &State<InvocationReplayCache>,
-    policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
     encryption: &State<EncryptionService>,
     sql_service: &State<SqlService>,
     #[cfg_attr(not(feature = "duckdb"), allow(unused_variables))] duckdb_service: DuckDbInvokeState<
@@ -1391,14 +1331,6 @@ async fn invoke_impl(
                 (Status::Unauthorized, message)
             })?;
 
-        // Policy-session invocations use the same admitted invocation as every
-        // other data-plane request. The policy runtime only classifies and
-        // verifies the special S0 edge; the ordinary graph remains authoritative.
-        let policy_session_invocation = policy_v3
-            .authorize_invocation(tinycloud, &admitted.invocation().0, now)
-            .await
-            .map_err(|error| (Status::Forbidden, error.to_string()))?;
-
         let decrypt_network = admitted
             .invocation()
             .0
@@ -1437,15 +1369,9 @@ async fn invoke_impl(
                 .validate_authorized_decrypt_request(&network, &admitted.invocation().0, &body)
                 .await
                 .map_err(|error| (Status::Forbidden, error.to_string()))?;
-            if policy_session_invocation {
-                invocation_replay_cache
-                    .check_and_insert_invoker_nonce(admitted.invocation(), 60)
-                    .await?;
-            } else {
-                invocation_replay_cache
-                    .check_and_insert(&admitted, config.invocation.max_lifetime_secs)
-                    .await?;
-            }
+            invocation_replay_cache
+                .check_and_insert(&admitted, config.invocation.max_lifetime_secs)
+                .await?;
             let verified = encryption
                 .decrypt_authorized(&network, &admitted.invocation().0, &body)
                 .await
@@ -1479,15 +1405,9 @@ async fn invoke_impl(
             .collect();
 
         if !sql_caps.is_empty() {
-            if policy_session_invocation {
-                invocation_replay_cache
-                    .check_and_insert_invoker_nonce(admitted.invocation(), 60)
-                    .await?;
-            } else {
-                invocation_replay_cache
-                    .check_and_insert(&admitted, config.invocation.max_lifetime_secs)
-                    .await?;
-            }
+            invocation_replay_cache
+                .check_and_insert(&admitted, config.invocation.max_lifetime_secs)
+                .await?;
             let result = handle_sql_invoke(
                 admitted,
                 data,
@@ -1530,15 +1450,9 @@ async fn invoke_impl(
                     .collect();
 
             if !duckdb_caps.is_empty() {
-                if policy_session_invocation {
-                    invocation_replay_cache
-                        .check_and_insert_invoker_nonce(admitted.invocation(), 60)
-                        .await?;
-                } else {
-                    invocation_replay_cache
-                        .check_and_insert(&admitted, config.invocation.max_lifetime_secs)
-                        .await?;
-                }
+                invocation_replay_cache
+                    .check_and_insert(&admitted, config.invocation.max_lifetime_secs)
+                    .await?;
                 let arrow_format = headers.0 .0.iter().any(|(k, v)| {
                     k.eq_ignore_ascii_case("accept")
                         && v.contains("application/vnd.apache.arrow.stream")
@@ -1708,15 +1622,9 @@ async fn invoke_impl(
             stage_inputs_start.elapsed(),
         );
         let inputs = inputs_result?;
-        if policy_session_invocation {
-            invocation_replay_cache
-                .check_and_insert_invoker_nonce(admitted.invocation(), 60)
-                .await?;
-        } else {
-            invocation_replay_cache
-                .check_and_insert(&admitted, config.invocation.max_lifetime_secs)
-                .await?;
-        }
+        invocation_replay_cache
+            .check_and_insert(&admitted, config.invocation.max_lifetime_secs)
+            .await?;
         let invocation_info = admitted.invocation().0.clone();
         let cursor_limit = kv_options.list_limit;
         let cursor_target = kv_list_target(&invocation_info.capabilities);
@@ -3235,23 +3143,18 @@ mod tests {
     };
     use tokio::time::{timeout, Duration};
 
-    fn manage_tc405_test_state(
+    fn manage_encryption_test_state(
         rocket: rocket::Rocket<rocket::Build>,
         conn: tinycloud_core::sea_orm::DatabaseConnection,
     ) -> rocket::Rocket<rocket::Build> {
         let secret = StaticSecret::new(vec![7; 32]).expect("valid test secret");
-        let node_did = secret.node_did();
         let backend = std::sync::Arc::new(LocalOneOfOneBackend::new(ColumnEncryption::new(
             secret.derive_key(b"tinycloud/encryption/network-seal"),
         )));
         let encryption =
             EncryptionService::new_with_node_keypair(conn.clone(), secret.node_keypair(), backend);
 
-        rocket
-            .manage(crate::policy_v3::PolicyV3Runtime::new(
-                conn, node_did, secret,
-            ))
-            .manage(encryption)
+        rocket.manage(encryption)
     }
 
     #[derive(Debug)]
@@ -4369,7 +4272,7 @@ mod tests {
             .manage(InvocationReplayCache::new(conn.clone()))
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
-        let rocket = manage_tc405_test_state(rocket, conn.clone());
+        let rocket = manage_encryption_test_state(rocket, conn.clone());
 
         let client = Client::tracked(rocket).await?;
         let response = client
@@ -4623,7 +4526,7 @@ mod tests {
             .manage(InvocationReplayCache::new(conn.clone()))
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
-        let rocket = manage_tc405_test_state(rocket, conn.clone());
+        let rocket = manage_encryption_test_state(rocket, conn.clone());
 
         let client = Client::tracked(rocket).await?;
         let response = client
@@ -6037,7 +5940,7 @@ mod tests {
             .manage(InvocationReplayCache::new(setup.replay_db))
             .manage(HookRuntime::new(HooksConfig::default(), [9u8; 32]))
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
-        manage_tc405_test_state(rocket, conn)
+        manage_encryption_test_state(rocket, conn)
     }
 
     #[tokio::test]
@@ -6406,7 +6309,7 @@ mod tests {
             ))
             .manage(tinycloud)
             .manage(Config::default());
-        let rocket = manage_tc405_test_state(rocket, conn.clone());
+        let rocket = manage_encryption_test_state(rocket, conn.clone());
 
         let client = Arc::new(Client::tracked(rocket).await?);
         let auth_header = Arc::new(auth_header);
@@ -6621,7 +6524,7 @@ mod tests {
                 ))
                 .manage(tc)
                 .manage(Config::default());
-            let r = manage_tc405_test_state(r, db);
+            let r = manage_encryption_test_state(r, db);
             Client::tracked(r).await
         };
 
@@ -6909,7 +6812,7 @@ mod tests {
             .manage(InvocationReplayCache::new(replay_db.clone()))
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
-        let rocket = manage_tc405_test_state(rocket, replay_db.clone());
+        let rocket = manage_encryption_test_state(rocket, replay_db.clone());
         Ok((rocket, replay_db))
     }
 
@@ -7207,7 +7110,7 @@ mod tests {
             .manage(InvocationReplayCache::new(replay_db))
             .manage(hook_runtime)
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
-        let rocket = manage_tc405_test_state(rocket, conn.clone());
+        let rocket = manage_encryption_test_state(rocket, conn.clone());
         Ok((rocket, conn))
     }
 

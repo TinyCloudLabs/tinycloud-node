@@ -162,10 +162,6 @@ pub enum DelegationError {
     },
     #[error("delegation-chain-traversal-limit-exceeded")]
     ChainTraversalLimitExceeded,
-    #[error("policy-root-requires-conjunctive-session")]
-    PolicyRootRequiresConjunctiveSession,
-    #[error("policy-descendant-fact-invalid")]
-    PolicyDescendantFactInvalid,
     /// W1: child caveats are not a subset of the parent's caveats — the
     /// child dropped, widened, or replaced a constrained-statements caveat
     /// the parent carried (audit P0 finding 1). Maps to the spec rejection
@@ -236,43 +232,18 @@ async fn validate<C: ConnectionTrait>(
     match (dependant_caps.is_empty(), delegation.parents.is_empty()) {
         // no dependant caps, no parents needed, must be valid
         (true, _) => Ok(()),
-        // Policy roots are owner-signed control-plane roots.  They are
-        // admitted into the ordinary graph during policy registration, but
-        // they are never a usable grant on their own: the route gate rejects
-        // public root imports and policy-session validation requires the
-        // ordered sibling pair.  Keeping the graph row here is what lets the
-        // ordinary transaction validate an S0's proof CIDs.
-        (false, true) if is_policy_root(&delegation.delegation) => Ok(()),
         // dependant caps, no parents, invalid
         (false, true) => Err(DelegationError::MissingParents.into()),
         // dependant caps, parents, check parents
         (false, false) => {
-            // Policy-session UCANs intentionally carry two sibling roots.  The
-            // signed profile selects conjunctive semantics; using the normal
-            // delegatee filter here would either drop the policy root or make
-            // a later resolver fall back to any-parent authorization.
-            let policy_session = is_policy_session(&delegation.delegation);
-            // Resolve in the signed proof order.  A set-based query is not
-            // sufficient here: database row order must never become the
-            // authority for the ordered policy/enforcer conjunction.
-            let mut all_parents = Vec::with_capacity(delegation.parents.len());
-            for parent_cid in &delegation.parents {
-                let Some(parent) = Entity::find_by_id(Hash::from(*parent_cid)).one(db).await?
-                else {
-                    return Err(DelegationError::MissingParents.into());
-                };
-                if !policy_session && parent.delegatee != delegation.delegator {
-                    return Err(DelegationError::UnauthorizedDelegator(
-                        delegation.delegator.clone(),
-                    )
-                    .into());
-                }
-                all_parents.push(parent);
-            }
+            // Only ordinary TinyCloud parents delegated to this delegator are
+            // eligible to authorize the child.
+            let all_parents: Vec<_> = Entity::find()
+                .filter(Column::Id.is_in(delegation.parents.iter().map(|c| Hash::from(*c))))
+                .filter(Column::Delegatee.eq(delegation.delegator.clone()))
+                .all(db)
+                .await?;
 
-            // Every signed proof must resolve.  This is the security boundary
-            // that prevents an injected, reordered, or missing sibling from
-            // collapsing AND into ordinary any-parent behavior.
             if all_parents.is_empty() {
                 return Err(DelegationError::MissingParents.into());
             }
@@ -282,40 +253,6 @@ async fn validate<C: ConnectionTrait>(
             // every registration so revocation takes effect immediately.
             for parent in &all_parents {
                 ensure_parent_active(db, &parent.id).await?;
-            }
-
-            let policy_root_parent = all_parents.iter().any(|parent| {
-                parent
-                    .facts
-                    .as_ref()
-                    .is_some_and(|facts| facts.0.contains_key(POLICY_ROOT_FACT_KEY))
-            });
-            if policy_root_parent && !policy_session {
-                return Err(DelegationError::PolicyRootRequiresConjunctiveSession.into());
-            }
-            if let Some(parent) = all_parents.iter().find(|parent| {
-                parent
-                    .facts
-                    .as_ref()
-                    .is_some_and(|facts| facts.0.contains_key(POLICY_SESSION_FACT_KEY))
-            }) {
-                if let Err(error) = validate_policy_descendant(delegation, parent) {
-                    let error = match error {
-                        PolicyDescendantError::InvalidFact => {
-                            DelegationError::PolicyDescendantFactInvalid
-                        }
-                        PolicyDescendantError::UnauthorizedDelegator => {
-                            DelegationError::UnauthorizedDelegator(delegation.delegator.clone())
-                        }
-                        PolicyDescendantError::ExpiryExceedsParent => {
-                            DelegationError::ExpiryExceedsParent
-                        }
-                        PolicyDescendantError::NotBeforePrecedesParent => {
-                            DelegationError::NotBeforePrecedesParent
-                        }
-                    };
-                    return Err(error.into());
-                }
             }
 
             // W1 (B): reject any chain that cites a terminal parent. The
@@ -360,17 +297,6 @@ async fn validate<C: ConnectionTrait>(
                 })
                 .collect();
 
-            // A policy-session's two sibling proofs are a conjunction.  Do
-            // not let one live sibling authorize the child when the other is
-            // expired/not-yet-valid, and require every child capability to be
-            // contained by every cited root.
-            if policy_session && parents.len() != delegation.parents.len() {
-                if expiry_failed {
-                    return Err(DelegationError::ExpiryExceedsParent.into());
-                }
-                return Err(DelegationError::NotBeforePrecedesParent.into());
-            }
-
             // If all parents were filtered out due to time constraints, return specific error
             if parents.is_empty() {
                 if expiry_failed {
@@ -383,26 +309,6 @@ async fn validate<C: ConnectionTrait>(
 
             // get delegated abilities from each parent
             let parent_abilities = parents.load_many(abilities::Entity, db).await?;
-
-            if policy_session {
-                for c in &dependant_caps {
-                    for abilities in &parent_abilities {
-                        if !abilities.iter().any(|pc| {
-                            c.resource.extends(&pc.resource)
-                                && crate::policy_capability::ability_matches(
-                                    pc.ability.as_ref().as_ref(),
-                                    c.ability.as_ref().as_ref(),
-                                )
-                        }) {
-                            return Err(DelegationError::UnauthorizedCapability(
-                                c.resource.clone(),
-                                c.ability.clone(),
-                            )
-                            .into());
-                        }
-                    }
-                }
-            }
 
             // W1 caveat-aware containment (audit P0 finding 1): a child cap is
             // supported by a parent cap only when resource+ability extend AND
@@ -458,230 +364,6 @@ async fn validate<C: ConnectionTrait>(
             Ok(())
         }
     }
-}
-
-fn is_policy_session(delegation: &TinyCloudDelegation) -> bool {
-    let TinyCloudDelegation::Ucan(ucan) = delegation else {
-        return false;
-    };
-    // The profile is a signed selector for conjunctive sibling-root
-    // semantics.  A stray fact must never opt a normal UCAN into that path.
-    let Some(facts) = ucan.payload().facts.as_ref() else {
-        return false;
-    };
-    if facts.len() != 1 {
-        return false;
-    }
-    let Some(object) = facts[0].as_object() else {
-        return false;
-    };
-    const REQUIRED_FACTS: &[&str] = &[
-        "profile",
-        "ownerDid",
-        "policyId",
-        "policyDigestHex",
-        "policyCid",
-        "policyDelegationCid",
-        "enforcementDelegationCid",
-        "contentSourceDigestHex",
-        "capabilityCeilingHashHex",
-        "nativeProjectionHashHex",
-        "enforcerDid",
-        "nodeAudience",
-        "recipientDid",
-        "challengeId",
-        "claimDigestHex",
-        "claimJti",
-        "vpDigestHex",
-        "credentialEvidenceDigestHex",
-        "decisionContextDigestHex",
-        "issuanceAuditDigestHex",
-        "remainingRedelegationDepth",
-    ];
-    const V4_AUDIT_FACTS: &[&str] = &[
-        "credentialIdAuditDigestHex",
-        "presentationJtiAuditDigestHex",
-    ];
-    let has_v4_audit = V4_AUDIT_FACTS.iter().all(|key| object.contains_key(*key));
-    object.len() == REQUIRED_FACTS.len() + usize::from(has_v4_audit) * V4_AUDIT_FACTS.len()
-        && object.get("profile").and_then(serde_json::Value::as_str)
-            == Some("policy-session-ucan/v1")
-        && object.keys().all(|key| {
-            REQUIRED_FACTS.contains(&key.as_str()) || V4_AUDIT_FACTS.contains(&key.as_str())
-        })
-        && REQUIRED_FACTS
-            .iter()
-            .filter(|key| **key != "remainingRedelegationDepth")
-            .all(|key| {
-                object
-                    .get(*key)
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|value| !value.is_empty())
-            })
-        && (!has_v4_audit
-            || V4_AUDIT_FACTS.iter().all(|key| {
-                object
-                    .get(*key)
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|value| {
-                        value.len() == 64
-                            && value
-                                .bytes()
-                                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-                    })
-            }))
-        && object
-            .get("remainingRedelegationDepth")
-            .and_then(serde_json::Value::as_u64)
-            .is_some_and(|depth| depth <= 8)
-}
-
-fn is_policy_root(delegation: &TinyCloudDelegation) -> bool {
-    let TinyCloudDelegation::Ucan(ucan) = delegation else {
-        return false;
-    };
-    let Some(facts) = ucan.payload().facts.as_ref() else {
-        return false;
-    };
-    if facts.len() != 1 {
-        return false;
-    }
-    let Some(object) = facts[0].as_object() else {
-        return false;
-    };
-    let Some(role) = object.get("role").and_then(serde_json::Value::as_str) else {
-        return false;
-    };
-    if !matches!(role, "policy-authority" | "policy-enforcement") {
-        return false;
-    }
-    let expected = [
-        "role",
-        "mode",
-        "ownerDid",
-        "policyId",
-        "policyDigestHex",
-        "policyCid",
-        "contentSourceDigestHex",
-        "capabilityCeilingHashHex",
-        "nativeProjectionHashHex",
-        "nodeAudience",
-    ];
-    object.len() == expected.len() + usize::from(role == "policy-enforcement")
-        && expected.iter().all(|key| {
-            object
-                .get(*key)
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|value| !value.is_empty())
-        })
-        && (role != "policy-enforcement"
-            || object
-                .get("enforcerDid")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|value| !value.is_empty()))
-        && object.get("mode").and_then(serde_json::Value::as_str)
-            == Some(if role == "policy-authority" {
-                "policy-source"
-            } else {
-                "conditional-mint"
-            })
-}
-
-const POLICY_ROOT_FACT_KEY: &str = "xyz.tinycloud.policy/root-profile";
-const POLICY_SESSION_FACT_KEY: &str = "xyz.tinycloud.policy/session-fact";
-
-fn signed_policy_fact(
-    delegation: &TinyCloudDelegation,
-) -> Option<(&'static str, serde_json::Value)> {
-    let TinyCloudDelegation::Ucan(ucan) = delegation else {
-        return None;
-    };
-    let facts = ucan.payload().facts.as_ref()?;
-    if facts.len() != 1 {
-        return None;
-    }
-    let object = facts[0].as_object()?;
-    if object
-        .get("role")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|role| role == "policy-authority" || role == "policy-enforcement")
-    {
-        return Some((POLICY_ROOT_FACT_KEY, facts[0].clone()));
-    }
-    if is_policy_session(delegation) {
-        return Some((POLICY_SESSION_FACT_KEY, facts[0].clone()));
-    }
-    None
-}
-
-enum PolicyDescendantError {
-    InvalidFact,
-    UnauthorizedDelegator,
-    ExpiryExceedsParent,
-    NotBeforePrecedesParent,
-}
-
-fn validate_policy_descendant(
-    child: &util::DelegationInfo,
-    parent: &Model,
-) -> Result<(), PolicyDescendantError> {
-    if child.parents.len() != 1 {
-        return Err(PolicyDescendantError::InvalidFact);
-    }
-    let Some(parent_fact) = parent
-        .facts
-        .as_ref()
-        .and_then(|facts| facts.0.get(POLICY_SESSION_FACT_KEY))
-        .and_then(serde_json::Value::as_object)
-    else {
-        return Ok(());
-    };
-    if child.delegator != parent.delegatee {
-        return Err(PolicyDescendantError::UnauthorizedDelegator);
-    }
-    if let (Some(parent_expiry), Some(child_expiry)) = (parent.expiry, child.expiry) {
-        if child_expiry >= parent_expiry {
-            return Err(PolicyDescendantError::ExpiryExceedsParent);
-        }
-    }
-    if let (Some(parent_not_before), Some(child_not_before)) = (parent.not_before, child.not_before)
-    {
-        if child_not_before <= parent_not_before {
-            return Err(PolicyDescendantError::NotBeforePrecedesParent);
-        }
-    }
-    let TinyCloudDelegation::Ucan(ucan) = &child.delegation else {
-        return Err(PolicyDescendantError::InvalidFact);
-    };
-    let Some(facts) = ucan.payload().facts.as_ref() else {
-        return Err(PolicyDescendantError::InvalidFact);
-    };
-    if facts.len() != 1 {
-        return Err(PolicyDescendantError::InvalidFact);
-    }
-    let Some(child_fact) = facts[0].as_object() else {
-        return Err(PolicyDescendantError::InvalidFact);
-    };
-    let parent_depth = parent_fact
-        .get("remainingRedelegationDepth")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or(PolicyDescendantError::InvalidFact)?;
-    let child_depth = child_fact
-        .get("remainingRedelegationDepth")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or(PolicyDescendantError::InvalidFact)?;
-    if parent_depth == 0 || child_depth + 1 != parent_depth {
-        return Err(PolicyDescendantError::InvalidFact);
-    }
-    let mut expected = parent_fact.clone();
-    expected.insert(
-        "remainingRedelegationDepth".into(),
-        serde_json::Value::from(child_depth),
-    );
-    if &expected != child_fact {
-        return Err(PolicyDescendantError::InvalidFact);
-    }
-    Ok(())
 }
 
 /// W1 (audit P0 finding 1): is `child` a subset of `parent` per JCS caveat
@@ -818,9 +500,6 @@ async fn save<C: ConnectionTrait>(
             DelegationMode::FACT_KEY.to_string(),
             serde_json::Value::String(DelegationMode::Terminal.as_str().to_string()),
         );
-    }
-    if let Some((key, value)) = signed_policy_fact(&delegation.delegation) {
-        fact_index.insert(key.to_string(), value);
     }
     let facts = (!fact_index.is_empty()).then_some(Facts(fact_index));
 

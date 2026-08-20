@@ -25,7 +25,7 @@ pub async fn attestation(
             #[cfg(feature = "dstack")]
             {
                 let key_binding = format!(
-                    "xyz.tinycloud.share/tee-key/v1\\0:{}:{}",
+                    "xyz.tinycloud.node/tee-key/v1\\0:{}:{}",
                     ctx.enforcer_did,
                     nonce.as_deref().unwrap_or("")
                 );

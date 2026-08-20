@@ -4,7 +4,6 @@ pub mod policy_capability;
 pub mod protocol;
 pub mod resolver;
 pub mod resource;
-pub mod share_email_evidence;
 
 pub use cacaos;
 pub use ipld_core;

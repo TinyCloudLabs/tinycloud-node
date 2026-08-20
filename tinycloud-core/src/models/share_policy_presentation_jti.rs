@@ -2,7 +2,7 @@
 //!
 //! A row here is inserted exactly once per `(nonce, presentation_jti)` pair
 //! atomically with the `#117` ancestry revalidation and the opaque session
-//! handle in [`crate::share_email::bridge`]. It is never treated as an
+//! handle in the retired Share policy runtime. It is never treated as an
 //! authorization decision by itself.
 
 use sea_orm::entity::prelude::*;
