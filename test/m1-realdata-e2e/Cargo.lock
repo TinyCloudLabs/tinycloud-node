@@ -7724,7 +7724,6 @@ dependencies = [
  "dashmap",
  "futures",
  "hex",
- "k256",
  "libp2p",
  "multihash-derive 0.9.1",
  "pin-project",
@@ -7738,7 +7737,6 @@ dependencies = [
  "serde_ipld_dagcbor 0.3.0",
  "serde_json",
  "sha2 0.10.9",
- "sha3",
  "sqlparser",
  "tempfile",
  "thiserror 2.0.18",
@@ -7755,7 +7753,6 @@ dependencies = [
 name = "tinycloud-node"
 version = "1.15.2"
 dependencies = [
- "aes-gcm",
  "anyhow",
  "async-trait",
  "aws-config",

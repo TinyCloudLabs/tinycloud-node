@@ -21,7 +21,6 @@ COPY ./dependencies/siwe/ ./dependencies/siwe/
 COPY ./dependencies/siwe-recap/ ./dependencies/siwe-recap/
 COPY ./dependencies/cacao/ ./dependencies/cacao/
 COPY ./scripts/ ./scripts/
-COPY ./test/n4-mounted-e2e/ ./test/n4-mounted-e2e/
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
