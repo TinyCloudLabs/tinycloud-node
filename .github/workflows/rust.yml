@@ -137,6 +137,8 @@ jobs:
       run: rustup component add rustfmt
     - name: Verify generated capability artifacts match capabilities.json
       run: node scripts/gen-capabilities.mjs --check
+    - name: Verify deployed Policy/v3 probe contract
+      run: node scripts/check-deployment-policy-probes.mjs
 
   # test/m1-realdata-e2e, test/load/signer and test/w5-policy-runtime-node-e2e
   # are `exclude`d from the workspace in Cargo.toml, so the workspace-wide jobs
