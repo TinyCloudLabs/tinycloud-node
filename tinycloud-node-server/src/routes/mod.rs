@@ -123,35 +123,18 @@ pub struct NodeInfo {
     pub in_tee: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota_url: Option<String>,
-    #[serde(rename = "shareEmail", skip_serializing_if = "Option::is_none")]
-    pub share_email: Option<crate::share_email::CapabilityDescriptor>,
-    #[serde(rename = "shareV2", skip_serializing_if = "Option::is_none")]
-    pub share_v2: Option<crate::share_v2::CapabilityDescriptor>,
 }
 
 fn build_info(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
     encryption: &State<EncryptionService>,
-    share_email: &State<Option<crate::share_email::ShareEmailRuntime>>,
-    share_v2: &State<Option<crate::share_v2::ShareV2Runtime>>,
 ) -> NodeInfo {
     #[allow(unused_mut)]
     let mut features = vec!["kv", "delegation", "sharing", "sql"];
     #[cfg(feature = "duckdb")]
     features.push("duckdb");
     features.extend(["hooks", "signed-urls", "encryption"]);
-    if share_email.inner().is_some() {
-        features.push("share-email-claim");
-    }
-    if share_v2
-        .inner()
-        .as_ref()
-        .and_then(|runtime| runtime.capability())
-        .is_some()
-    {
-        features.push("share-v2");
-    }
     #[cfg(feature = "dstack")]
     features.push("tee");
     NodeInfo {
@@ -161,14 +144,6 @@ fn build_info(
         node_id: encryption.node_did().to_string(),
         in_tee: tee.inner().is_some(),
         quota_url: quota_cache.quota_url().map(|s| s.to_string()),
-        share_email: share_email
-            .inner()
-            .as_ref()
-            .map(|runtime| runtime.capability()),
-        share_v2: share_v2
-            .inner()
-            .as_ref()
-            .and_then(|runtime| runtime.capability()),
     }
 }
 
@@ -177,16 +152,8 @@ pub fn info(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
     encryption: &State<EncryptionService>,
-    share_email: &State<Option<crate::share_email::ShareEmailRuntime>>,
-    share_v2: &State<Option<crate::share_v2::ShareV2Runtime>>,
 ) -> Json<NodeInfo> {
-    Json(build_info(
-        tee,
-        quota_cache,
-        encryption,
-        share_email,
-        share_v2,
-    ))
+    Json(build_info(tee, quota_cache, encryption))
 }
 
 #[get("/version")]
@@ -194,16 +161,8 @@ pub fn version(
     tee: &State<Option<crate::tee::TeeContext>>,
     quota_cache: &State<QuotaCache>,
     encryption: &State<EncryptionService>,
-    share_email: &State<Option<crate::share_email::ShareEmailRuntime>>,
-    share_v2: &State<Option<crate::share_v2::ShareV2Runtime>>,
 ) -> Json<NodeInfo> {
-    Json(build_info(
-        tee,
-        quota_cache,
-        encryption,
-        share_email,
-        share_v2,
-    ))
+    Json(build_info(tee, quota_cache, encryption))
 }
 
 #[allow(clippy::let_unit_value)]
@@ -559,7 +518,7 @@ pub async fn delegate(
 /// signature suite is staged on top of the existing pipeline as a followup
 /// (it requires a new variant in `tinycloud-auth::TinyCloudRevocation`); the
 /// Policy-v3 roots are control-plane artifacts and are revoked only through
-/// their signed `/share/v3/policy/status` checkpoint; this route must never
+/// their signed `/policy/v3/status` checkpoint; this route must never
 /// turn an ordinary revocation into a root-status projection.
 #[post("/revoke")]
 pub async fn revoke(

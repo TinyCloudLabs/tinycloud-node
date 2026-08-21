@@ -9,7 +9,7 @@ extern crate async_trait;
 extern crate tokio;
 
 use anyhow::{Context, Result};
-use rocket::{fairing::AdHoc, figment::Figment, http::Header, Build, Rocket};
+use rocket::{fairing::AdHoc, figment::Figment, http::Header, Build, Rocket, Route};
 use std::{path::Path, sync::Arc};
 
 pub mod allow_list;
@@ -220,39 +220,11 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     app_with_control(config, &tinycloud_config, None).await
 }
 
-pub async fn app_with_control(
-    config: &Figment,
-    tinycloud_config: &Config,
-    control: Option<ControlPlaneHandle>,
-) -> Result<Rocket<Build>> {
-    let mut tinycloud_config = tinycloud_config.clone();
-    tinycloud_config.storage.resolve();
-    tinycloud_config.share_email = tinycloud_config
-        .share_email
-        .resolve_trust_bundle()
-        .map_err(|error| anyhow::anyhow!(error))?;
-    tinycloud_config
-        .share_email
-        .validate_for_v2_database(tinycloud_config.storage.database())
-        .map_err(|error| anyhow::anyhow!(error))?;
-
-    // Ensure local storage directories exist.
-    // SQLite file paths and local dirs are resources the server owns — auto-create them.
-    // Remote backends (Postgres, S3) are left alone; connection errors surface naturally.
-    ensure_local_dirs(&tinycloud_config.storage).await?;
-
-    prometheus::set_enabled(tinycloud_config.telemetry.enabled);
-
-    tracing::tracing_try_init(&tinycloud_config.log)?;
-
-    #[cfg(tinycloud_legacy_share_v2)]
-    let legacy_share_v2_enabled = time::OffsetDateTime::now_utc()
-        <= time::OffsetDateTime::parse(
-            policy_v3::LAST_V2_READ_AT,
-            &time::format_description::well_known::Rfc3339,
-        )
-        .expect("valid legacy share cutoff");
-    let mut routes = rocket::routes![
+/// The public Node surface keeps policy admission separate from the generic
+/// delegation and invocation data plane. Share-specific data routes are not
+/// mounted.
+fn production_routes() -> Vec<Route> {
+    rocket::routes![
         healthcheck,
         cors,
         info,
@@ -294,12 +266,38 @@ pub async fn app_with_control(
         policy_v3_mint,
         policy_v3_status,
         revoke_policy_v3_root,
-    ];
-    routes.extend(share_email::public_routes());
-    #[cfg(tinycloud_legacy_share_v2)]
-    if legacy_share_v2_enabled {
-        routes.extend(share_v2::public_routes());
-    }
+    ]
+}
+
+pub async fn app_with_control(
+    config: &Figment,
+    tinycloud_config: &Config,
+    control: Option<ControlPlaneHandle>,
+) -> Result<Rocket<Build>> {
+    let mut tinycloud_config = tinycloud_config.clone();
+    tinycloud_config.storage.resolve();
+    tinycloud_config.share_email = tinycloud_config
+        .share_email
+        .resolve_trust_bundle()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    tinycloud_config
+        .share_email
+        .validate_for_v2_database(tinycloud_config.storage.database())
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+    // Ensure local storage directories exist.
+    // SQLite file paths and local dirs are resources the server owns — auto-create them.
+    // Remote backends (Postgres, S3) are left alone; connection errors surface naturally.
+    ensure_local_dirs(&tinycloud_config.storage).await?;
+
+    prometheus::set_enabled(tinycloud_config.telemetry.enabled);
+
+    tracing::tracing_try_init(&tinycloud_config.log)?;
+
+    let routes = production_routes();
+    #[cfg(feature = "tc-bench-v1")]
+    let mut routes = routes;
+
     #[cfg(feature = "tc-bench-v1")]
     routes.extend(rocket::routes![
         tc_bench_auth_verify,
@@ -449,17 +447,12 @@ pub async fn app_with_control(
         database_artifact_repository.clone(),
     );
 
-    let share_email_runtime = share_email::compose(
-        tinycloud_config.share_email.clone(),
-        seed_conn.clone(),
-        &key_setup,
-        Arc::new(tinycloud.clone()),
-        Arc::new(sql_service.clone()),
-    )?;
     let mut policy_v3_runtime =
         PolicyV3Runtime::new(seed_conn.clone(), key_setup.node_did(), key_setup.clone())
-            .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock())
-            .with_delivery(&tinycloud_config.share_email)?;
+            .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock());
+    if tinycloud_config.share_email.enabled {
+        policy_v3_runtime = policy_v3_runtime.with_delivery(&tinycloud_config.share_email)?;
+    }
     if let Some(encoded_key) = tinycloud_config.share_email.issuer_public_key.as_deref() {
         let decoded = base64::decode_config(encoded_key, base64::URL_SAFE_NO_PAD)
             .context("policy credential issuer public key must be canonical base64url")?;
@@ -475,55 +468,6 @@ pub async fn app_with_control(
                 public_key,
             ),
         );
-    }
-    #[cfg(all(tinycloud_legacy_share_v2, feature = "dstack"))]
-    let dstack_tee_key_derived = matches!(tinycloud_config.keys, config::Keys::Dstack)
-        || matches!(tinycloud_config.keys, config::Keys::Auto) && dstack::is_available();
-    #[cfg(all(tinycloud_legacy_share_v2, not(feature = "dstack")))]
-    let dstack_tee_key_derived = false;
-    // `local-tee` always derives its TeeContext from real node key material
-    // (see `TeeContext::derive_local`), so it is a derived identity too.
-    #[cfg(tinycloud_legacy_share_v2)]
-    let tee_key_derived = dstack_tee_key_derived || cfg!(feature = "local-tee");
-    #[cfg(tinycloud_legacy_share_v2)]
-    let share_v2_runtime = if legacy_share_v2_enabled && tinycloud_config.share_email.enabled {
-        Some(
-            share_v2::compose(
-                seed_conn.clone(),
-                &key_setup,
-                tinycloud_config.share_email.clone(),
-                tee_context.clone(),
-                tee_key_derived,
-                Arc::new(tinycloud.clone()),
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
-    #[cfg(not(tinycloud_legacy_share_v2))]
-    let share_v2_runtime: Option<share_v2::ShareV2Runtime> = None;
-    if let Some(runtime) = share_email_runtime.as_ref() {
-        if !runtime.bridge.self_check().await {
-            anyhow::bail!(
-                "share email readiness failed: authority, fresh status, attestation, or database is unavailable"
-            );
-        }
-    }
-    if let Some(runtime) = share_email_runtime.as_ref() {
-        let state = runtime.state.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                if let Err(error) = state.cleanup(time::OffsetDateTime::now_utc()).await {
-                    ::tracing::warn!(
-                        ?error,
-                        "share-email cleanup failed; capability remains fail-closed"
-                    );
-                }
-            }
-        });
     }
 
     #[cfg(feature = "duckdb")]
@@ -615,8 +559,6 @@ pub async fn app_with_control(
         .manage(signed_url_runtime)
         .manage(webhook_encryption)
         .manage(rate_limiter)
-        .manage(share_email_runtime)
-        .manage(share_v2_runtime)
         .manage(tee_context)
         .manage(encryption_service)
         .manage(policy_v3_runtime)
@@ -773,14 +715,48 @@ fn share_security_fairing(share_allowed_origin: String) -> AdHoc {
 }
 
 fn is_mounted_share_path(path: &str) -> bool {
-    if path.starts_with("/share/v1/") || path.starts_with("/share/v3/") {
-        return true;
+    path.starts_with("/policy/v3/")
+}
+
+#[cfg(test)]
+mod production_route_tests {
+    use super::production_routes;
+
+    #[test]
+    fn generic_data_plane_and_embedded_policy_admission_are_mounted_without_share_data_routes() {
+        let routes: std::collections::HashSet<_> = production_routes()
+            .into_iter()
+            .map(|route| format!("{} {}", route.method, route.uri))
+            .collect();
+
+        for route in [
+            "POST /delegate",
+            "POST /invoke",
+            "POST /policy/v3/challenges",
+            "POST /policy/v3/delegations",
+            "POST /policy/v3/deliveries/authorize",
+        ] {
+            assert!(routes.contains(route), "missing required route: {route}");
+        }
+        for route in [
+            "POST /share/v1/read",
+            "POST /share/v2/invoke",
+            "POST /share/v2/deliveries/authorize",
+            "POST /share/v3/policy/challenges",
+            "POST /share/v3/policy/delegations",
+        ] {
+            assert!(
+                !routes.contains(route),
+                "retired share data route is mounted: {route}"
+            );
+        }
+        assert!(
+            routes
+                .iter()
+                .all(|route| !route.split_once(' ').unwrap().1.starts_with("/share/")),
+            "production routes must not mount any /share/* handler"
+        );
     }
-    #[cfg(tinycloud_legacy_share_v2)]
-    if path.starts_with("/share/v2/") {
-        return true;
-    }
-    false
 }
 
 /// One telemetry sample tick: update the DB pool gauges, probe pool-acquire
@@ -1025,36 +1001,26 @@ mod share_security_fairing_tests {
     use super::share_security_fairing;
     use rocket::{http::Header, local::asynchronous::Client, options, routes};
 
-    #[options("/share/v2/deliveries/authorize")]
-    fn share_v2_delivery_preflight() {}
-
-    #[options("/share/v3/deliveries/authorize")]
-    fn share_v3_delivery_preflight() {}
+    #[options("/policy/v3/challenges")]
+    fn policy_admission_preflight() {}
 
     #[options("/v1/config")]
     fn non_share_preflight() {}
 
     #[tokio::test]
-    async fn chromium_share_delivery_preflight_allows_authorization() {
+    async fn chromium_policy_admission_preflight_allows_authorization() {
         let client = Client::tracked(
             rocket::build()
                 .mount(
                     "/",
-                    routes![
-                        share_v2_delivery_preflight,
-                        share_v3_delivery_preflight,
-                        non_share_preflight
-                    ],
+                    routes![policy_admission_preflight, non_share_preflight],
                 )
                 .attach(share_security_fairing("https://share.tinycloud.xyz".into())),
         )
         .await
         .expect("valid Rocket instance");
 
-        for path in [
-            "/share/v2/deliveries/authorize",
-            "/share/v3/deliveries/authorize",
-        ] {
+        for path in ["/policy/v3/challenges"] {
             let response = client
                 .options(path)
                 .header(Header::new("Origin", "https://share.tinycloud.xyz"))
@@ -1091,11 +1057,7 @@ mod share_security_fairing_tests {
             rocket::build()
                 .mount(
                     "/",
-                    routes![
-                        share_v2_delivery_preflight,
-                        share_v3_delivery_preflight,
-                        non_share_preflight
-                    ],
+                    routes![policy_admission_preflight, non_share_preflight],
                 )
                 .attach(share_security_fairing("https://share.tinycloud.xyz".into())),
         )

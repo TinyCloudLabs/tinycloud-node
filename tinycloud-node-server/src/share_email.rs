@@ -464,20 +464,6 @@ pub const NODE_CAPABILITY_ROUTES: [&str; 4] = [
     "/share/v1/read",
 ];
 
-/// Mount the complete public Node protocol surface from one composition point.
-/// Invitation authorization is a reservation boundary; there is no public
-/// receipt-consume callback for delivery workers to invoke.
-pub fn public_routes() -> Vec<rocket::Route> {
-    rocket::routes![
-        addressed_delegate,
-        authorize_invitation,
-        policy_challenge,
-        policy_session,
-        read,
-        native_invoke
-    ]
-}
-
 /// Authenticated Node-native addressed delegation authoring on the existing
 /// `/delegate` address.  Legacy callers continue to use the ordinary
 /// Authorization header route; the media type selects this closed v2
@@ -2896,51 +2882,6 @@ mod tests {
         };
         assert_eq!(config.allowed_origins.len(), 1);
         assert!(!config.allowed_origins.iter().any(|origin| origin == "*"));
-    }
-
-    #[tokio::test]
-    async fn mounted_surface_includes_the_frozen_node_routes_and_native_invoke() {
-        let routes = public_routes();
-        assert!(routes.iter().any(|route| {
-            route.uri.path() == "/delegate"
-                && route.format.as_ref().is_some_and(|format| {
-                    format.to_string() == "application/vnd.tinycloud.delegation+json"
-                })
-        }));
-        assert!(routes.iter().any(|route| {
-            route.uri.path() == "/invoke"
-                && route.format.as_ref().is_some_and(|format| {
-                    format.to_string() == "application/vnd.tinycloud.share+json"
-                })
-        }));
-        let rocket = rocket::build()
-            .mount(
-                "/",
-                routes
-                    .into_iter()
-                    .filter(|route| route.uri.path() != "/invoke")
-                    .collect::<Vec<_>>(),
-            )
-            .manage(None::<ShareEmailRuntime>);
-        let client = Client::tracked(rocket).await.expect("Rocket client");
-
-        for route in NODE_CAPABILITY_ROUTES {
-            let response = client
-                .post(route)
-                .header(rocket::http::ContentType::JSON)
-                .body("{}")
-                .dispatch()
-                .await;
-            assert_ne!(response.status(), Status::NotFound, "{route}");
-        }
-
-        let response = client
-            .post("/share/v1/invitations/consume")
-            .header(rocket::http::ContentType::JSON)
-            .body("{}")
-            .dispatch()
-            .await;
-        assert_eq!(response.status(), Status::NotFound);
     }
 
     #[tokio::test]

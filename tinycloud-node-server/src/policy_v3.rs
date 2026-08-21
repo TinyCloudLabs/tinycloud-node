@@ -42,7 +42,6 @@ use tinycloud_core::{
         sea_query::Expr, ActiveModelTrait, ColumnTrait, DatabaseConnection, DatabaseTransaction,
         EntityTrait, QueryFilter, QuerySelect, Set, TransactionTrait,
     },
-    share_email::invitation::{Ed25519InvitationSigner, InvitationSigner},
     types::SpaceIdWrap,
     util::{DelegationInfo, InvocationInfo},
 };
@@ -73,13 +72,13 @@ const CAPABILITY_CEILING_DOMAIN: &[u8] = b"xyz.tinycloud.policy/PolicyCapability
 const NATIVE_PROJECTION_DOMAIN: &[u8] = b"xyz.tinycloud.policy/NativeProjection/v1\0";
 const MAX_STATUS_AGE_SECONDS: i64 = 300;
 const MAX_SESSION_TTL_SECONDS: i64 = 60;
-const DELIVERY_AUTHORIZATION_V3_DOMAIN: &[u8] = b"xyz.tinycloud.share/delivery-authorization/v3\0";
+const DELIVERY_ADMISSION_DOMAIN: &[u8] = b"xyz.tinycloud.policy/delivery-admission/v0\0";
+const INVITATION_REQUEST_SCHEMA: &str = "xyz.tinycloud.credentials/invitation-request/v1";
+const DELIVERY_ADMISSION_SCHEMA: &str = "xyz.tinycloud.policy/delivery-admission/v0";
 
 #[derive(Clone)]
 struct DeliveryRuntime {
-    signer: Arc<Ed25519InvitationSigner>,
     target_origin: String,
-    node_audience: String,
     enforcer_did: String,
     return_origin: String,
     credentials_origin: String,
@@ -143,19 +142,8 @@ impl PolicyV3Runtime {
         if configured != self.signer.share_invitation_public_key() {
             anyhow::bail!("v3 delivery invitation signing key does not match configured trust");
         }
-        let seed = self
-            .signer
-            .derive_key(b"tinycloud/share-email/invitation-signing");
-        let secret = tinycloud_core::libp2p::identity::ed25519::SecretKey::try_from_bytes(seed)
-            .map_err(|_| anyhow::anyhow!("v3 delivery invitation signing key is invalid"))?;
-        let keypair = tinycloud_core::libp2p::identity::ed25519::Keypair::from(secret);
         self.delivery = Some(DeliveryRuntime {
-            signer: Arc::new(Ed25519InvitationSigner::new(
-                config.invitation_kid.clone(),
-                keypair.into(),
-            )?),
             target_origin: config.target_origin.clone(),
-            node_audience: config.node_audience.clone(),
             enforcer_did: self.node_did.clone(),
             return_origin: config.return_origin.clone(),
             credentials_origin,
@@ -1020,7 +1008,7 @@ fn normal_invocation_allows_v3_delivery(
         })
 }
 
-#[post("/share/v3/deliveries/authorize", format = "json", data = "<request>")]
+#[post("/policy/v3/deliveries/authorize", format = "json", data = "<request>")]
 pub async fn authorize_delivery(
     request: Json<DeliveryAuthorizationRequest>,
     runtime: &State<PolicyV3Runtime>,
@@ -1103,61 +1091,55 @@ pub async fn authorize_delivery(
             .map_err(|_| (Status::Forbidden, "delivery-authorization-invalid".into()))?;
     }
     let resource = envelope
-        .get("resource")
-        .and_then(Value::as_object)
-        .and_then(|value| value.get("path"))
-        .and_then(Value::as_str)
-        .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
-    let content_source = envelope
         .get("contentSource")
-        .cloned()
-        .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
-    let recipient_matcher = envelope
-        .get("recipientMatcher")
-        .cloned()
-        .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
-    let share_id = envelope
-        .get("shareId")
-        .and_then(Value::as_str)
-        .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
-    let enforcer_did = envelope
-        .get("target")
         .and_then(Value::as_object)
-        .and_then(|target| target.get("nodeAudience"))
+        .and_then(|value| value.get("kvResource"))
         .and_then(Value::as_str)
         .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
-    let authorization = serde_json::json!({
-        "type": "TinyCloudShareDeliveryAuthorization",
-        "version": 3,
-        "jti": request.jti,
-        "shareCid": request.share_cid,
-        "shareId": share_id,
-        "policyCid": registration.policy_cid,
-        "policyRootCid": registration.policy_root_cid,
-        "enforcementRootCid": registration.enforcement_root_cid,
-        "nodeAudience": delivery.node_audience,
-        "enforcerDid": enforcer_did,
-        "targetOrigin": delivery.target_origin,
-        "openCredentialsAudience": delivery.credentials_origin,
-        "holder": invocation.0 .0.invoker,
-        "recipientMatcher": recipient_matcher,
-        "deliveryEmail": request.recipient_email,
-        "shareUrl": request.share_url,
-        "returnOrigin": delivery.return_origin,
-        "documentName": request.document_name,
-        "senderDid": registration.owner_did,
-        "senderTrust": "verified",
-        "contentSource": content_source,
-        "contentSourceDigestHex": registration.content_source_digest_hex,
-        "shareExpiresAt": registration.expires_at,
-        "issuedAt": format_time(now),
-        "reportAbuseToken": request.jti,
-        "actions": actions,
+    let policy = envelope
+        .get("policy")
+        .and_then(Value::as_object)
+        .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
+    let policy_id = registration.policy_cid.clone();
+    let credential_type = policy
+        .get("credentialRequirement")
+        .and_then(Value::as_object)
+        .and_then(|requirement| requirement.get("credentialType"))
+        .and_then(Value::as_object)
+        .and_then(|credential_type| credential_type.get("id"))
+        .and_then(Value::as_str)
+        .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
+    if actions.as_slice() != ["read"] || credential_type != "opencredentials.email/v1" {
+        return Err((Status::Forbidden, "delivery-authorization-invalid".into()));
+    }
+    let invitation_request = serde_json::json!({
+        "schema": INVITATION_REQUEST_SCHEMA,
+        "policyId": policy_id,
+        "recipient": request.recipient_email,
         "resource": resource,
-        "requestBodyDigest": request.request_body_digest,
-        "idempotencyKey": request.jti,
+        "credentialType": credential_type,
+        "returnLink": request.share_url,
+        "envelopeRef": request.share_cid,
+        "audience": delivery.credentials_origin,
+        "issuedAt": format_time(now),
         "expiresAt": request.expires_at,
-        "dataAuthority": false
+        "nonce": request.jti,
+    });
+    let mut admission = serde_json::json!({
+        "schema": DELIVERY_ADMISSION_SCHEMA,
+        "policyId": policy_id,
+        "ownerDid": registration.owner_did,
+        "recipient": request.recipient_email,
+        "resource": resource,
+        "actions": ["tinycloud.kv/get"],
+        "credentialType": credential_type,
+        "returnLink": request.share_url,
+        "envelopeRef": request.share_cid,
+        "senderKeyDid": invocation.0 .0.invoker,
+        "audience": delivery.credentials_origin,
+        "issuedAt": format_time(now),
+        "expiresAt": request.expires_at,
+        "nonce": request.jti,
     });
     let _writer = match &runtime.sqlite_writer_lock {
         Some(lock) => Some(lock.lock().await),
@@ -1166,14 +1148,14 @@ pub async fn authorize_delivery(
     share_invitation_authorization_jti::ActiveModel {
         jti: Set(request.jti.clone()),
         authorization_digest: Set(encode_config(
-            Sha256::digest(canonical_json_value(&authorization)),
+            Sha256::digest(canonical_json_value(&admission)),
             URL_SAFE_NO_PAD,
         )),
         binding_json: Set(serde_json::json!({
             "version": 3,
             "policyCid": policy_cid,
             "shareCid": request.share_cid,
-            "shareId": share_id,
+            "policyId": policy_id,
         })),
         issued_at: Set(format_time(now)),
         expires_at: Set(request.expires_at.clone()),
@@ -1182,19 +1164,21 @@ pub async fn authorize_delivery(
     .insert(&runtime.conn)
     .await
     .map_err(|_| (Status::Conflict, "delivery-authorization-replayed".into()))?;
-    let mut signed = DELIVERY_AUTHORIZATION_V3_DOMAIN.to_vec();
-    signed.extend_from_slice(&canonical_json_value(&authorization));
-    let signature = delivery
+    let mut signed = DELIVERY_ADMISSION_DOMAIN.to_vec();
+    signed.extend_from_slice(&canonical_json_value(&admission));
+    let signature = runtime
         .signer
-        .sign(&signed)
-        .map_err(|_| (Status::ServiceUnavailable, "delivery-unavailable".into()))?;
+        .node_keypair()
+        .sign(&Sha256::digest(signed))
+        .map_err(|error| (Status::InternalServerError, error.to_string()))?;
+    admission["signature"] = serde_json::json!({
+        "suite": "eddsa-ed25519-sha256-jcs-v1",
+        "signerDid": runtime.node_did,
+        "value": encode_config(signature, URL_SAFE_NO_PAD),
+    });
     Ok(Json(serde_json::json!({
-        "authorization": authorization,
-        "proof": {
-            "alg": "EdDSA",
-            "kid": delivery.signer.kid(),
-            "signature": encode_config(signature, URL_SAFE_NO_PAD),
-        }
+        "request": invitation_request,
+        "admission": admission,
     })))
 }
 
@@ -1206,7 +1190,7 @@ pub struct EnforcerBindingRequest {
     pub enforcer_did: Option<String>,
 }
 
-#[post("/share/v3/enforcer-bindings", format = "json", data = "<request>")]
+#[post("/policy/v3/enforcer-bindings", format = "json", data = "<request>")]
 pub async fn issue_enforcer_binding(
     request: Json<EnforcerBindingRequest>,
     runtime: &State<PolicyV3Runtime>,
@@ -1396,7 +1380,7 @@ pub struct StatusCheckpointResponse {
     pub revocation: Option<Value>,
 }
 
-#[post("/share/v3/policies", format = "json", data = "<request>")]
+#[post("/policy/v3/policies", format = "json", data = "<request>")]
 pub async fn register_policy(
     request: Json<RegisterRequest>,
     runtime: &State<PolicyV3Runtime>,
@@ -1575,7 +1559,7 @@ pub async fn register_policy(
     }))
 }
 
-#[post("/share/v3/policy/challenges", format = "json", data = "<request>")]
+#[post("/policy/v3/challenges", format = "json", data = "<request>")]
 pub async fn challenge(
     request: Json<ChallengeRequest>,
     runtime: &State<PolicyV3Runtime>,
@@ -1634,7 +1618,7 @@ pub async fn challenge(
     }))
 }
 
-#[post("/share/v3/policy/delegations", format = "json", data = "<request>")]
+#[post("/policy/v3/delegations", format = "json", data = "<request>")]
 pub async fn mint(
     request: Json<MintRequest>,
     runtime: &State<PolicyV3Runtime>,
@@ -2876,7 +2860,7 @@ async fn ingest_status_checkpoint_unmounted(
     }))
 }
 
-#[post("/share/v3/policy/status", format = "json", data = "<request>")]
+#[post("/policy/v3/status", format = "json", data = "<request>")]
 pub async fn status(
     request: Json<StatusRenewalRequest>,
     runtime: &State<PolicyV3Runtime>,
@@ -2972,7 +2956,7 @@ pub async fn status(
 /// Return the exact current signed checkpoint so an owner can bind the next
 /// renewal to its sequence and predecessor digest. The checkpoint is public
 /// liveness evidence; it cannot grant or widen authority.
-#[get("/share/v3/policy/status/<root_cid>")]
+#[get("/policy/v3/status/<root_cid>")]
 pub async fn get_status(
     root_cid: &str,
     runtime: &State<PolicyV3Runtime>,
@@ -5849,6 +5833,35 @@ mod tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn embedded_delivery_runtime_uses_node_key_and_fails_closed_on_trust_mismatch() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let signer = StaticSecret::new(vec![53; 32]).unwrap();
+        let node_did = signer.node_did();
+        let mut config = ShareEmailConfig {
+            enabled: true,
+            target_origin: "https://node.example".into(),
+            node_audience: node_did.clone(),
+            node_signing_kid: format!("{node_did}#delivery"),
+            invitation_kid: format!("{node_did}#delivery"),
+            credentials_origin: Some("https://witness.credentials.org".into()),
+            invitation_public_key: Some(encode_config(
+                signer.share_invitation_public_key(),
+                URL_SAFE_NO_PAD,
+            )),
+            ..ShareEmailConfig::default()
+        };
+        let runtime = PolicyV3Runtime::new(db.clone(), node_did.clone(), signer.clone())
+            .with_delivery(&config)
+            .unwrap();
+        assert!(runtime.delivery.is_some());
+
+        config.invitation_public_key = Some(encode_config([0_u8; 32], URL_SAFE_NO_PAD));
+        assert!(PolicyV3Runtime::new(db, node_did, signer)
+            .with_delivery(&config)
+            .is_err());
+    }
+
     fn signed_tc500_v4_presentation(vector: &Value) -> Value {
         let mut presentation = vector["unsigned"].clone();
         presentation["signature"] = json!({
@@ -5941,6 +5954,7 @@ mod tests {
             ("challengeId", json!("different-challenge")),
             ("nonce", json!("different-nonce")),
             ("nodeAudience", json!("did:web:other-node.example")),
+            ("holderDid", json!("did:key:zDifferentHolder")),
             ("subjectDid", json!("did:key:zDifferentSubject")),
             ("credentialDigest", json!("different-credential")),
             ("requirementDigest", json!("different-requirement")),
@@ -5958,7 +5972,231 @@ mod tests {
         let mut bad_signature = original.clone();
         bad_signature["signature"]["value"] = json!(encode_config([0_u8; 64], URL_SAFE_NO_PAD));
         assert!(validate(&bad_signature).is_err());
+        let mut untrusted_signer = original.clone();
+        untrusted_signer["signature"]["signerDid"] = json!("did:key:zUntrustedSigner");
+        assert!(validate(&untrusted_signer).is_err());
         assert!(validate(&original).is_ok());
+    }
+
+    #[test]
+    fn exact_resource_read_only_and_decrypt_denial_matrix_is_fail_closed() {
+        let resource = "tinycloud://applications/kv/shares/tc-500/document.txt";
+        let encryption = "urn:tinycloud:encryption:did:key:zPolicyOwner:mainnet";
+        let ceiling = vec![
+            json!({
+                "kind": "kv",
+                "resource": resource,
+                "selector": "exact",
+                "actions": ["tinycloud.kv/get"]
+            }),
+            json!({
+                "kind": "encryption",
+                "resource": encryption,
+                "action": "tinycloud.encryption/decrypt"
+            }),
+        ];
+        let exact_read = json!({
+            "kind": "kv",
+            "resource": resource,
+            "selector": "exact",
+            "actions": ["tinycloud.kv/get"]
+        });
+        let exact_decrypt = json!({
+            "kind": "encryption",
+            "resource": encryption,
+            "action": "tinycloud.encryption/decrypt"
+        });
+        assert!(validate_requested_policy_capabilities(
+            &[exact_read.clone(), exact_decrypt],
+            &ceiling,
+        )
+        .is_ok());
+
+        for (case, capability) in [
+            (
+                "wrong-resource",
+                json!({"kind":"kv","resource":format!("{resource}.other"),"selector":"exact","actions":["tinycloud.kv/get"]}),
+            ),
+            (
+                "prefix-escalation",
+                json!({"kind":"kv","resource":resource,"selector":"prefix","actions":["tinycloud.kv/get"]}),
+            ),
+            (
+                "write-escalation",
+                json!({"kind":"kv","resource":resource,"selector":"exact","actions":["tinycloud.kv/put"]}),
+            ),
+            (
+                "list-escalation",
+                json!({"kind":"kv","resource":resource,"selector":"exact","actions":["tinycloud.kv/list"]}),
+            ),
+            (
+                "decrypt-resource-mismatch",
+                json!({"kind":"encryption","resource":"urn:tinycloud:encryption:did:key:zPolicyOwner:testnet","action":"tinycloud.encryption/decrypt"}),
+            ),
+        ] {
+            assert!(
+                validate_requested_policy_capabilities(&[capability], &ceiling).is_err(),
+                "accepted {case}"
+            );
+        }
+        assert!(
+            validate_requested_policy_capabilities(
+                &[json!({
+                    "kind": "encryption",
+                    "resource": encryption,
+                    "action": "tinycloud.encryption/decrypt"
+                })],
+                std::slice::from_ref(&exact_read),
+            )
+            .is_err(),
+            "accepted decrypt escalation without an encryption ceiling"
+        );
+    }
+
+    #[test]
+    fn credential_and_presentation_time_denial_matrix_is_fail_closed() {
+        let now = parse_time("2026-08-07T16:00:30Z").unwrap();
+        let mut presentation = json!({
+            "issuedAt": "2026-08-07T16:00:00Z",
+            "expiresAt": "2026-08-07T16:01:00Z"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(validate_fresh_window(&presentation, now, "presentation").is_ok());
+        for (case, field, value) in [
+            ("not-yet-valid", "issuedAt", "2026-08-07T16:00:31Z"),
+            ("expired", "expiresAt", "2026-08-07T16:00:30Z"),
+            ("malformed", "expiresAt", "not-a-time"),
+        ] {
+            let original = presentation[field].clone();
+            presentation.insert(field.into(), json!(value));
+            assert!(
+                validate_fresh_window(&presentation, now, "presentation").is_err(),
+                "accepted {case} presentation"
+            );
+            presentation.insert(field.into(), original);
+        }
+
+        let requirement = json!({"maxAgeSeconds": 300});
+        let disclosed =
+            json!({"iat": 1786118400_i64, "nbf": 1786118400_i64, "exp": 1786118460_i64})
+                .as_object()
+                .unwrap()
+                .clone();
+        let base = json!({
+            "issuedAt": "2026-08-07T16:00:00Z",
+            "notBefore": "2026-08-07T16:00:00Z",
+            "expiresAt": "2026-08-07T16:01:00Z"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(validate_credential_time(&base, &disclosed, &requirement, now).is_ok());
+
+        let mut not_yet_valid = base.clone();
+        not_yet_valid.insert("notBefore".into(), json!("2026-08-07T16:00:31Z"));
+        assert!(validate_credential_time(&not_yet_valid, &disclosed, &requirement, now).is_err());
+        let mut expired = base.clone();
+        expired.insert("expiresAt".into(), json!("2026-08-07T16:00:30Z"));
+        assert!(validate_credential_time(&expired, &disclosed, &requirement, now).is_err());
+        let mut malformed = base;
+        malformed.insert("notBefore".into(), json!("not-a-time"));
+        assert!(validate_credential_time(&malformed, &disclosed, &requirement, now).is_err());
+    }
+
+    fn credential_envelope_stub(projection: &Value, holder: &str) -> Value {
+        json!({
+            "type": "OpenCredentialsIssuedCredential",
+            "version": 1,
+            "protocol": "tinycloud.credentials/acquisition/v1",
+            "profile": projection["profile"],
+            "credentialType": projection["credentialType"],
+            "schema": "opencredentials.email/v1",
+            "format": "vc+sd-jwt",
+            "issuerDid": projection["issuerDid"],
+            "issuerKid": projection["issuerKid"],
+            "subjectDid": holder,
+            "holderDid": holder,
+            "claims": {"email": "alice@example.test"},
+            "claimsDigest": "stub",
+            "descriptorDigest": projection["descriptorDigest"],
+            "credentialId": "stub",
+            "issuedAt": "2026-08-07T16:00:00Z",
+            "notBefore": "2026-08-07T16:00:00Z",
+            "expiresAt": "2026-08-07T16:01:00Z",
+            "status": {"method": "none", "freshnessSeconds": 60},
+            "credential": "not-a-credential"
+        })
+    }
+
+    #[test]
+    fn wrong_issuer_holder_and_malformed_or_untrusted_evidence_are_denied() {
+        let vector: Value = serde_json::from_str(include_str!(
+            "../test-fixtures/tc-470-policy-credential-requirement.json"
+        ))
+        .unwrap();
+        let requirement = &vector["sdkRequirement"];
+        let projection = vector["policyProjection"].as_object().unwrap();
+        let holder = "did:key:z6MkehRgf7yJbgaGfYsdoAsKdBPE3dj2CYhowQdcjqSJgvVd";
+        let issuer_key = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
+        let trusted = IssuerKey::new(
+            projection["issuerDid"].as_str().unwrap(),
+            "opencredentials.email/v1",
+            1,
+            projection["issuerKid"].as_str().unwrap(),
+            issuer_key.public().to_bytes(),
+        );
+        let now = parse_time("2026-08-07T16:00:30Z").unwrap();
+
+        let mut wrong_issuer = credential_envelope_stub(&vector["policyProjection"], holder);
+        wrong_issuer["issuerDid"] = json!("did:web:untrusted.example");
+        assert!(verify_opencredentials_credential(
+            &wrong_issuer,
+            requirement,
+            projection,
+            &trusted,
+            holder,
+            now,
+        )
+        .is_err());
+
+        let wrong_holder =
+            credential_envelope_stub(&vector["policyProjection"], "did:key:zDifferentHolder");
+        assert!(verify_opencredentials_credential(
+            &wrong_holder,
+            requirement,
+            projection,
+            &trusted,
+            holder,
+            now,
+        )
+        .is_err());
+        assert!(verify_opencredentials_credential(
+            &Value::Null,
+            requirement,
+            projection,
+            &trusted,
+            holder,
+            now,
+        )
+        .is_err());
+
+        let mut untrusted = trusted;
+        untrusted.enabled = false;
+        assert_eq!(
+            verify_opencredentials_credential(
+                &Value::Null,
+                requirement,
+                projection,
+                &untrusted,
+                holder,
+                now,
+            )
+            .err()
+            .unwrap(),
+            (Status::Forbidden, "credential-issuer-untrusted".into())
+        );
     }
 
     #[test]
@@ -6072,17 +6310,8 @@ mod tests {
             registered_at: "2026-08-06T12:00:00Z".into(),
             expires_at: "2026-08-07T12:00:00Z".into(),
         };
-        let receipt_key = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
         let delivery = DeliveryRuntime {
-            signer: Arc::new(
-                Ed25519InvitationSigner::new(
-                    "did:web:node.tinycloud.xyz#invitation-key-1",
-                    receipt_key.into(),
-                )
-                .unwrap(),
-            ),
             target_origin: "https://tee.node.tinycloud.xyz".into(),
-            node_audience: "did:web:tee.node.tinycloud.xyz".into(),
             enforcer_did: "did:key:zEnforcer".into(),
             return_origin: "https://share.tinycloud.xyz".into(),
             credentials_origin: "https://witness.credentials.org".into(),
@@ -6833,7 +7062,7 @@ mod tests {
         assert_eq!(seed_response.status(), Status::Ok);
 
         let binding_response = client
-            .post("/share/v3/enforcer-bindings")
+            .post("/policy/v3/enforcer-bindings")
             .header(ContentType::JSON)
             .body(
                 json!({
@@ -6848,7 +7077,7 @@ mod tests {
         let live_binding: Value = binding_response.into_json().await.unwrap();
 
         let register_response = client
-            .post("/share/v3/policies")
+            .post("/policy/v3/policies")
             .header(ContentType::JSON)
             .body(
                 json!({
@@ -6869,7 +7098,7 @@ mod tests {
         assert_eq!(register_status, Status::Ok, "register: {register_body}");
 
         let challenge_response = client
-            .post("/share/v3/policy/challenges")
+            .post("/policy/v3/challenges")
             .header(ContentType::JSON)
             .body(
                 json!({
@@ -6908,7 +7137,7 @@ mod tests {
             URL_SAFE_NO_PAD
         ));
         let mint_response = client
-            .post("/share/v3/policy/delegations")
+            .post("/policy/v3/delegations")
             .header(ContentType::JSON)
             .body(
                 json!({
@@ -7033,7 +7262,7 @@ mod tests {
         // credential-space input. The same receiver key spans credential,
         // challenge, presentation, delegation audience, and invocation.
         let v4_challenge_response = client
-            .post("/share/v3/policy/challenges")
+            .post("/policy/v3/challenges")
             .header(ContentType::JSON)
             .body(
                 json!({
@@ -7080,7 +7309,7 @@ mod tests {
             let mut explicit_null = v4_request_value.clone();
             explicit_null[field] = Value::Null;
             let rejected = client
-                .post("/share/v3/policy/delegations")
+                .post("/policy/v3/delegations")
                 .header(ContentType::JSON)
                 .body(explicit_null.to_string())
                 .dispatch()
@@ -7093,7 +7322,7 @@ mod tests {
         }
         let v4_request = v4_request_value.to_string();
         let v4_mint_response = client
-            .post("/share/v3/policy/delegations")
+            .post("/policy/v3/delegations")
             .header(ContentType::JSON)
             .body(v4_request.clone())
             .dispatch()
@@ -7197,7 +7426,7 @@ mod tests {
         assert_eq!(v4_read_body, b"tc-470-real-content");
 
         let replay = client
-            .post("/share/v3/policy/delegations")
+            .post("/policy/v3/delegations")
             .header(ContentType::JSON)
             .body(v4_request)
             .dispatch()
