@@ -750,6 +750,12 @@ mod production_route_tests {
                 "retired share data route is mounted: {route}"
             );
         }
+        assert!(
+            routes
+                .iter()
+                .all(|route| !route.split_once(' ').unwrap().1.starts_with("/share/")),
+            "production routes must not mount any /share/* handler"
+        );
     }
 }
 

@@ -492,17 +492,6 @@ pub async fn compose(
     Ok(runtime)
 }
 
-pub fn public_routes() -> Vec<rocket::Route> {
-    rocket::routes![
-        readiness,
-        register_policy,
-        policy_challenge_v2,
-        policy_session_v2,
-        invoke_v2,
-        authorize_delivery_v2
-    ]
-}
-
 pub struct ShareV2Origin;
 
 #[rocket::async_trait]
