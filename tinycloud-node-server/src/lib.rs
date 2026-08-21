@@ -729,9 +729,15 @@ mod production_route_tests {
             .map(|route| format!("{} {}", route.method, route.uri))
             .collect();
 
+        // The four routes the post-deploy workflow probes
+        // (.github/workflows/docker.yml, guarded by
+        // scripts/check-deployment-policy-probes.mjs) must all be mounted, or
+        // a release deploys, mutates production, and only then fails its probe.
         for route in [
             "POST /delegate",
             "POST /invoke",
+            "POST /policy/v3/enforcer-bindings",
+            "POST /policy/v3/policies",
             "POST /policy/v3/challenges",
             "POST /policy/v3/delegations",
             "POST /policy/v3/deliveries/authorize",

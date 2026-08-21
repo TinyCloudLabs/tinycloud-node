@@ -5,7 +5,8 @@
   "scripts": {
     "release": "cargo build --release",
     "gen:capabilities": "node scripts/gen-capabilities.mjs",
-    "check:capabilities": "node scripts/gen-capabilities.mjs --check"
+    "check:capabilities": "node scripts/gen-capabilities.mjs --check",
+    "check:deploy-probes": "node scripts/check-deployment-policy-probes.mjs"
   },
   "dependencies": {
     "zod": "3.22.4",

@@ -404,10 +404,10 @@ jobs:
 
           NODE_ORIGIN="https://tee.node.tinycloud.xyz"
           ROUTES=(
-            /share/v3/enforcer-bindings
-            /share/v3/policies
-            /share/v3/policy/challenges
-            /share/v3/policy/delegations
+            /policy/v3/enforcer-bindings
+            /policy/v3/policies
+            /policy/v3/challenges
+            /policy/v3/delegations
           )
 
           # The direct TEE ingress obtains/loads its certificate after the
