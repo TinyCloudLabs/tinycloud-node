@@ -905,7 +905,7 @@ async fn run() -> Result<()> {
         "credentialsOrigin": "https://witness.credentials.org",
         // TC-397: Share's schema requires emailOrigin, so the document this
         // production composition is exercised against carries it too.
-        "emailOrigin": "https://email.tinycloud.xyz",
+        "emailOrigin": "https://api.share.tinycloud.xyz",
         "nodeOrigin": fixture_config.target_origin.clone(),
         "nodeAudience": fixture_config.node_audience.clone(),
         "nodeInvitationKid": fixture_config.invitation_kid.clone(),
