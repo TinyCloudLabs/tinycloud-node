@@ -1,0 +1,20 @@
+{
+  "schema": "xyz.tinycloud.test/addressed-link-canonicalization/v1",
+  "envelope": {
+    "version": 3,
+    "display": { "filename": "résumé 😀.pdf" },
+    "recipientMatcher": { "value": "alice@example.test", "kind": "exactEmail" },
+    "actions": ["read"],
+    "target": {
+      "spaceId": "tinycloud:did:key:zOwner:applications",
+      "nodeAudience": "did:key:zNode",
+      "origin": "https://node.example"
+    }
+  },
+  "envelopeCanonical": "{\"actions\":[\"read\"],\"display\":{\"filename\":\"résumé 😀.pdf\"},\"recipientMatcher\":{\"kind\":\"exactEmail\",\"value\":\"alice@example.test\"},\"target\":{\"nodeAudience\":\"did:key:zNode\",\"origin\":\"https://node.example\",\"spaceId\":\"tinycloud:did:key:zOwner:applications\"},\"version\":3}",
+  "envelopeBase64Url": "eyJhY3Rpb25zIjpbInJlYWQiXSwiZGlzcGxheSI6eyJmaWxlbmFtZSI6InLDqXN1bcOpIPCfmIAucGRmIn0sInJlY2lwaWVudE1hdGNoZXIiOnsia2luZCI6ImV4YWN0RW1haWwiLCJ2YWx1ZSI6ImFsaWNlQGV4YW1wbGUudGVzdCJ9LCJ0YXJnZXQiOnsibm9kZUF1ZGllbmNlIjoiZGlkOmtleTp6Tm9kZSIsIm9yaWdpbiI6Imh0dHBzOi8vbm9kZS5leGFtcGxlIiwic3BhY2VJZCI6InRpbnljbG91ZDpkaWQ6a2V5OnpPd25lcjphcHBsaWNhdGlvbnMifSwidmVyc2lvbiI6M30",
+  "shareCid": "bafkreifkwuu6ci5izru2hmue2png5f27lnklg6opp6onheuwukckspcsea",
+  "payloadCanonical": "{\"c\":\"eyJhY3Rpb25zIjpbInJlYWQiXSwiZGlzcGxheSI6eyJmaWxlbmFtZSI6InLDqXN1bcOpIPCfmIAucGRmIn0sInJlY2lwaWVudE1hdGNoZXIiOnsia2luZCI6ImV4YWN0RW1haWwiLCJ2YWx1ZSI6ImFsaWNlQGV4YW1wbGUudGVzdCJ9LCJ0YXJnZXQiOnsibm9kZUF1ZGllbmNlIjoiZGlkOmtleTp6Tm9kZSIsIm9yaWdpbiI6Imh0dHBzOi8vbm9kZS5leGFtcGxlIiwic3BhY2VJZCI6InRpbnljbG91ZDpkaWQ6a2V5OnpPd25lcjphcHBsaWNhdGlvbnMifSwidmVyc2lvbiI6M30\",\"cid\":\"bafkreifkwuu6ci5izru2hmue2png5f27lnklg6opp6onheuwukckspcsea\",\"v\":2}",
+  "payloadBase64Url": "eyJjIjoiZXlKaFkzUnBiMjV6SWpwYkluSmxZV1FpWFN3aVpHbHpjR3hoZVNJNmV5Sm1hV3hsYm1GdFpTSTZJbkxEcVhOMWJjT3BJUENmbUlBdWNHUm1JbjBzSW5KbFkybHdhV1Z1ZEUxaGRHTm9aWElpT25zaWEybHVaQ0k2SW1WNFlXTjBSVzFoYVd3aUxDSjJZV3gxWlNJNkltRnNhV05sUUdWNFlXMXdiR1V1ZEdWemRDSjlMQ0owWVhKblpYUWlPbnNpYm05a1pVRjFaR2xsYm1ObElqb2laR2xrT210bGVUcDZUbTlrWlNJc0ltOXlhV2RwYmlJNkltaDBkSEJ6T2k4dmJtOWtaUzVsZUdGdGNHeGxJaXdpYzNCaFkyVkpaQ0k2SW5ScGJubGpiRzkxWkRwa2FXUTZhMlY1T25wUGQyNWxjanBoY0hCc2FXTmhkR2x2Ym5NaWZTd2lkbVZ5YzJsdmJpSTZNMzAiLCJjaWQiOiJiYWZrcmVpZmt3dXU2Y2k1aXpydTJobXVlMnBuZzVmMjdsbmtsZzZvcHA2b25oZXV3dWtja3NwY3NlYSIsInYiOjJ9",
+  "shareUrl": "https://share.tinycloud.xyz/viewer?tc2=eyJjIjoiZXlKaFkzUnBiMjV6SWpwYkluSmxZV1FpWFN3aVpHbHpjR3hoZVNJNmV5Sm1hV3hsYm1GdFpTSTZJbkxEcVhOMWJjT3BJUENmbUlBdWNHUm1JbjBzSW5KbFkybHdhV1Z1ZEUxaGRHTm9aWElpT25zaWEybHVaQ0k2SW1WNFlXTjBSVzFoYVd3aUxDSjJZV3gxWlNJNkltRnNhV05sUUdWNFlXMXdiR1V1ZEdWemRDSjlMQ0owWVhKblpYUWlPbnNpYm05a1pVRjFaR2xsYm1ObElqb2laR2xrT210bGVUcDZUbTlrWlNJc0ltOXlhV2RwYmlJNkltaDBkSEJ6T2k4dmJtOWtaUzVsZUdGdGNHeGxJaXdpYzNCaFkyVkpaQ0k2SW5ScGJubGpiRzkxWkRwa2FXUTZhMlY1T25wUGQyNWxjanBoY0hCc2FXTmhkR2x2Ym5NaWZTd2lkbVZ5YzJsdmJpSTZNMzAiLCJjaWQiOiJiYWZrcmVpZmt3dXU2Y2k1aXpydTJobXVlMnBuZzVmMjdsbmtsZzZvcHA2b25oZXV3dWtja3NwY3NlYSIsInYiOjJ9"
+}

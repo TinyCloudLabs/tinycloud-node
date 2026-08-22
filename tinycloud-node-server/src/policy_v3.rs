@@ -75,7 +75,6 @@ const DELIVERY_ADMISSION_SCHEMA: &str = "xyz.tinycloud.policy/delivery-admission
 #[derive(Clone)]
 struct DeliveryRuntime {
     target_origin: String,
-    enforcer_did: String,
     return_origin: String,
     email_origin: String,
 }
@@ -140,7 +139,6 @@ impl PolicyV3Runtime {
         }
         self.delivery = Some(DeliveryRuntime {
             target_origin: config.target_origin.clone(),
-            enforcer_did: self.node_did.clone(),
             return_origin: config.return_origin.clone(),
             email_origin,
         });
@@ -924,13 +922,15 @@ fn v3_envelope_delivery_projection<'a>(
         .get("attestedEnforcerBinding")
         .and_then(Value::as_object)
         .ok_or(())?;
+    let registered_binding: Value =
+        serde_json::from_slice(&registration.attested_enforcer_binding_bytes).map_err(|_| ())?;
+    let node_audience = binding
+        .get("nodeAudience")
+        .and_then(Value::as_str)
+        .ok_or(())?;
     if target.get("origin").and_then(Value::as_str) != Some(delivery.target_origin.as_str())
-        || target.get("nodeAudience").and_then(Value::as_str)
-            != Some(delivery.enforcer_did.as_str())
-        || binding.get("enforcerDid").and_then(Value::as_str)
-            != Some(delivery.enforcer_did.as_str())
-        || binding.get("nodeAudience").and_then(Value::as_str)
-            != Some(delivery.enforcer_did.as_str())
+        || target.get("nodeAudience").and_then(Value::as_str) != Some(node_audience)
+        || object.get("attestedEnforcerBinding") != Some(&registered_binding)
     {
         return Err(());
     }
@@ -5813,7 +5813,7 @@ mod tests {
     use base64::encode_config;
     use serde_json::json;
     use tinycloud_auth::authorization::HeaderEncode;
-    use tinycloud_auth::ssi::{claims::jwt::NumericDate, dids::DIDURLBuf, ucan::Payload};
+    use tinycloud_auth::ssi::{claims::jwt::NumericDate, ucan::Payload};
     use tinycloud_core::migrations::Migrator;
     use tinycloud_core::sea_orm::{Database, EntityTrait, TransactionTrait};
     use tinycloud_core::sea_orm_migration::MigratorTrait;
@@ -6289,7 +6289,7 @@ mod tests {
             "contentSource": {"shareId":"share-v3","kvResource":"did:key:zOwner/kv/shares/share-v3/report.pdf"},
         });
         let policy_bytes = canonical_json_value(&policy);
-        let registration = policy_v3_registration::Model {
+        let mut registration = policy_v3_registration::Model {
             policy_cid: "bafkreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             policy_bytes,
             policy_digest_hex: "11".repeat(32),
@@ -6305,7 +6305,6 @@ mod tests {
         };
         let delivery = DeliveryRuntime {
             target_origin: "https://tee.node.tinycloud.xyz".into(),
-            enforcer_did: "did:key:zEnforcer".into(),
             return_origin: "https://share.tinycloud.xyz".into(),
             email_origin: "https://api.share.tinycloud.xyz".into(),
         };
@@ -6328,6 +6327,8 @@ mod tests {
             "expiry": registration.expires_at,
             "display": {"filename":"report.pdf"},
         });
+        registration.attested_enforcer_binding_bytes =
+            canonical_json_value(&envelope["attestedEnforcerBinding"]);
         let mut bytes = b"xyz.tinycloud.share/envelope/v3\0".to_vec();
         bytes.extend_from_slice(&canonical_json_value(&envelope));
         envelope["signature"] = json!({
@@ -6470,6 +6471,39 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn typescript_addressed_link_vector_is_byte_exact() {
+        let vector: Value = serde_json::from_str(include_str!(
+            "../test-fixtures/tc-498-addressed-link-canonicalization.json"
+        ))
+        .unwrap();
+        let envelope = &vector["envelope"];
+        let envelope_bytes = canonical_json_value(envelope);
+        assert_eq!(
+            envelope_bytes,
+            vector["envelopeCanonical"].as_str().unwrap().as_bytes()
+        );
+        assert_eq!(
+            encode_config(&envelope_bytes, URL_SAFE_NO_PAD),
+            vector["envelopeBase64Url"]
+        );
+        let payload_bytes = decode_config(
+            vector["payloadBase64Url"].as_str().unwrap(),
+            URL_SAFE_NO_PAD,
+        )
+        .unwrap();
+        assert_eq!(
+            payload_bytes,
+            vector["payloadCanonical"].as_str().unwrap().as_bytes()
+        );
+        assert!(v3_delivery_url_matches(
+            vector["shareUrl"].as_str().unwrap(),
+            "https://share.tinycloud.xyz",
+            vector["shareCid"].as_str().unwrap(),
+            envelope,
+        ));
+    }
+
     #[tokio::test]
     async fn policy_v2_admits_v3_account_and_v4_accountless_receivers() -> anyhow::Result<()> {
         use k256::ecdsa::SigningKey;
@@ -6542,7 +6576,12 @@ mod tests {
         })];
         let encryption_resource = format!("urn:tinycloud:encryption:{owner_did}:mainnet");
         let ceiling = vec![
-            requested[0].clone(),
+            json!({
+                "kind": "kv",
+                "resource": content_resource.to_string(),
+                "selector": "exact",
+                "actions": ["tinycloud.kv/get", "tinycloud.kv/metadata"]
+            }),
             json!({
                 "kind": "encryption",
                 "resource": encryption_resource,
@@ -6693,8 +6732,20 @@ mod tests {
             issuer_key.public().to_bytes(),
         );
         let db = Database::connect("sqlite::memory:").await.unwrap();
-        let runtime =
-            PolicyV3Runtime::new(db.clone(), node_did, node_secret).with_credential_issuer(issuer);
+        let delivery_config = ShareEmailConfig {
+            enabled: true,
+            target_origin: "https://node.example".into(),
+            return_origin: "https://share.tinycloud.xyz".into(),
+            email_origin: Some("https://api.share.tinycloud.xyz".into()),
+            invitation_public_key: Some(encode_config(
+                node_secret.share_invitation_public_key(),
+                URL_SAFE_NO_PAD,
+            )),
+            ..ShareEmailConfig::default()
+        };
+        let runtime = PolicyV3Runtime::new(db.clone(), node_did.clone(), node_secret)
+            .with_credential_issuer(issuer)
+            .with_delivery(&delivery_config)?;
         let admission = validate_credential_admission_v3(
             &requirement,
             &credential,
@@ -6769,42 +6820,55 @@ mod tests {
             "nativeProjectionHashHex": projections.native_projection_hash_hex,
             "nodeAudience": runtime.node_did,
         });
-        let root_payload = |audience: &str, role: &str, mode: &str, enforcer: Option<&str>| {
-            let mut facts = common_facts.as_object().unwrap().clone();
-            facts.insert("role".into(), json!(role));
-            facts.insert("mode".into(), json!(mode));
-            if let Some(enforcer) = enforcer {
-                facts.insert("enforcerDid".into(), json!(enforcer));
-            }
-            Payload {
-                issuer: owner_vm.parse::<DIDURLBuf>().unwrap(),
-                audience: audience.parse::<DIDBuf>().unwrap(),
-                not_before: Some(
-                    NumericDate::try_from_seconds(issued.unix_timestamp() as f64).unwrap(),
-                ),
-                expiration: NumericDate::try_from_seconds(expires.unix_timestamp() as f64).unwrap(),
-                nonce: Some(format!("tc-470-{role}")),
-                facts: Some(vec![Value::Object(facts)]),
-                proof: vec![],
-                attenuation: serde_json::from_value(projections.attenuation.clone()).unwrap(),
-            }
-            .sign(Algorithm::EdDSA, &owner_jwk)
-            .unwrap()
-        };
-        let policy_root_authorization = TinyCloudDelegation::Ucan(Box::new(root_payload(
+        let root_authorization =
+            |audience: &str, role: &str, mode: &str, enforcer: Option<&str>| {
+                let mut facts = common_facts.as_object().unwrap().clone();
+                facts.insert("role".into(), json!(role));
+                facts.insert("mode".into(), json!(mode));
+                if let Some(enforcer) = enforcer {
+                    facts.insert("enforcerDid".into(), json!(enforcer));
+                }
+                let header = json!({
+                    "alg": "EdDSA",
+                    "jwk": {
+                        "alg": "EdDSA",
+                        "crv": "Ed25519",
+                        "kty": "OKP",
+                        "x": encode_config(owner_key.public().to_bytes(), URL_SAFE_NO_PAD),
+                    },
+                    "typ": "JWT",
+                    "ucv": "0.10.0",
+                });
+                let payload = json!({
+                    "att": projections.attenuation.clone(),
+                    "aud": audience,
+                    "exp": expires.unix_timestamp(),
+                    "fct": [Value::Object(facts)],
+                    "iss": owner_vm.clone(),
+                    "nbf": issued.unix_timestamp(),
+                    "nnc": format!("tc-470-{role}"),
+                    "prf": [],
+                });
+                let protected = encode_config(canonical_json_value(&header), URL_SAFE_NO_PAD);
+                let payload = encode_config(canonical_json_value(&payload), URL_SAFE_NO_PAD);
+                let signing_input = format!("{protected}.{payload}");
+                format!(
+                    "{signing_input}.{}",
+                    encode_config(owner_key.sign(signing_input.as_bytes()), URL_SAFE_NO_PAD)
+                )
+            };
+        let policy_root_authorization = root_authorization(
             &format!("did:tinycloud:policy:{policy_digest}"),
             "policy-authority",
             "policy-source",
             None,
-        )))
-        .encode()?;
-        let enforcement_root_authorization = TinyCloudDelegation::Ucan(Box::new(root_payload(
+        );
+        let enforcement_root_authorization = root_authorization(
             &enforcer_did,
             "policy-enforcement",
             "conditional-mint",
             Some(&enforcer_did),
-        )))
-        .encode()?;
+        );
 
         use rocket::{http::ContentType, local::asynchronous::Client};
         use std::sync::Arc;
@@ -6860,6 +6924,7 @@ mod tests {
                 rocket::routes![
                     register_policy,
                     issue_enforcer_binding,
+                    authorize_delivery,
                     challenge,
                     mint,
                     crate::routes::delegate,
@@ -6902,6 +6967,11 @@ mod tests {
         sender_capabilities.with_action(
             content_resource.as_uri(),
             "tinycloud.kv/put".parse::<RecapAbility>()?,
+            [std::collections::BTreeMap::<String, Value>::new()],
+        );
+        sender_capabilities.with_action(
+            content_resource.as_uri(),
+            "tinycloud.kv/get".parse::<RecapAbility>()?,
             [std::collections::BTreeMap::<String, Value>::new()],
         );
         let sender_authorization = TinyCloudDelegation::Ucan(Box::new(
@@ -7061,7 +7131,6 @@ mod tests {
             .await;
         assert_eq!(binding_response.status(), Status::Ok);
         let live_binding: Value = binding_response.into_json().await.unwrap();
-
         let register_response = client
             .post("/policy/v3/policies")
             .header(ContentType::JSON)
@@ -7082,6 +7151,150 @@ mod tests {
         let register_status = register_response.status();
         let register_body = register_response.into_string().await.unwrap_or_default();
         assert_eq!(register_status, Status::Ok, "register: {register_body}");
+        let registered: Value = serde_json::from_str(&register_body)?;
+
+        // Exercise the exact TS/Rust seam used before api.share accepts an
+        // email: owner-signed public envelope -> canonical tc2 link -> real
+        // ordinary invocation -> Node-signed delivery admission.
+        let mut delivery_envelope = json!({
+            "version": 3,
+            "shareId": "share-tc-470",
+            "recipientMatcher": {"kind":"exactEmail","value":"alice@example.test"},
+            "deliveryEmail": "alice@example.test",
+            "actions": ["read"],
+            "resource": {"kind":"exact","path":"shares/tc-470/document.txt"},
+            "target": {"origin":"https://node.example","nodeAudience":node_did,"spaceId":content_space.to_string()},
+            "policy": policy,
+            "policyCid": policy_cid,
+            "policyRoot": {"cid":registered["policyRootCid"],"authorization":policy_root_authorization,"role":"policy-authority"},
+            "enforcementRoot": {"cid":registered["enforcementRootCid"],"authorization":enforcement_root_authorization,"role":"policy-enforcement"},
+            "attestedEnforcerBinding": live_binding,
+            "contentSource": content_source,
+            "contentSourceDigestHex": projections.content_source_digest_hex,
+            "encryptionNetwork": encryption_resource,
+            "expiry": format_time(expires),
+            "display": {"filename":"document.txt"},
+            "encrypted": true,
+            "metadata": {"filename":"document.txt","mediaType":"text/plain","byteLength":19}
+        });
+        let mut envelope_preimage = b"xyz.tinycloud.share/envelope/v3\0".to_vec();
+        envelope_preimage.extend_from_slice(&canonical_json_value(&delivery_envelope));
+        delivery_envelope["signature"] = json!({
+            "algorithm":"Ed25519",
+            "signerDid":owner_did,
+            "value":encode_config(owner_key.sign(&Sha256::digest(envelope_preimage)), URL_SAFE_NO_PAD),
+        });
+        let envelope_bytes = canonical_json_value(&delivery_envelope);
+        let share_cid = tinycloud_auth::ipld_core::cid::Cid::new_v1(
+            0x55,
+            tinycloud_auth::multihash_codetable::Code::Sha2_256.digest(&envelope_bytes),
+        )
+        .to_string();
+        let link_payload = canonical_json_value(&json!({
+            "v": 2,
+            "c": encode_config(&envelope_bytes, URL_SAFE_NO_PAD),
+            "cid": share_cid,
+        }));
+        let mut delivery_request = DeliveryAuthorizationRequest {
+            envelope: delivery_envelope,
+            share_cid: share_cid.clone(),
+            recipient_email: "alice@example.test".into(),
+            share_url: format!(
+                "https://share.tinycloud.xyz/viewer?tc2={}",
+                encode_config(link_payload, URL_SAFE_NO_PAD)
+            ),
+            document_name: "document.txt".into(),
+            jti: encode_config([8_u8; 16], URL_SAFE_NO_PAD),
+            expires_at: format_time(OffsetDateTime::now_utc() + Duration::minutes(4)),
+            request_body_digest: String::new(),
+        };
+        delivery_request.request_body_digest = delivery_request_digest(&delivery_request)
+            .map_err(|_| anyhow::anyhow!("delivery request digest"))?;
+        let delivery_jwk = JWK::from(Params::OKP(OctetParams {
+            curve: "Ed25519".to_owned(),
+            public_key: Base64urlUInt(holder_key.public().to_bytes().to_vec()),
+            private_key: Some(Base64urlUInt(holder_key.secret().as_ref().to_vec())),
+        }));
+        let delivery_invocation = make_invocation(
+            [(
+                content_resource.clone(),
+                ["tinycloud.kv/get".parse::<RecapAbility>()?],
+            )],
+            &sender_cid,
+            &delivery_jwk,
+            &format!("{holder_did}#{}", holder_did.trim_start_matches("did:key:")),
+            (OffsetDateTime::now_utc() + Duration::seconds(45)).unix_timestamp() as f64,
+            InvocationOptions {
+                nonce: Some("tc498-delivery-intent".into()),
+                ..InvocationOptions::default()
+            },
+        )?;
+        let delivery_response = client
+            .post("/policy/v3/deliveries/authorize")
+            .header(ContentType::JSON)
+            .header(rocket::http::Header::new(
+                "Authorization",
+                delivery_invocation.encode()?,
+            ))
+            .body(serde_json::to_string(&delivery_request)?)
+            .dispatch()
+            .await;
+        let delivery_status = delivery_response.status();
+        let delivery_body = delivery_response.into_string().await.unwrap_or_default();
+        assert_eq!(
+            delivery_status,
+            Status::Ok,
+            "delivery authorization: {delivery_body}"
+        );
+        let delivery_receipt: Value = serde_json::from_str(&delivery_body)?;
+        assert_eq!(
+            delivery_receipt["admission"]["recipient"],
+            "alice@example.test"
+        );
+        assert_eq!(
+            delivery_receipt["admission"]["returnLink"],
+            delivery_request.share_url
+        );
+        assert_eq!(
+            delivery_receipt["admission"]["audience"],
+            "https://api.share.tinycloud.xyz"
+        );
+        if std::env::var("TC498_EMIT_DELIVERY_RECEIPT").as_deref() == Ok("1") {
+            let request = delivery_receipt["request"].clone();
+            let mut proof_preimage = INVITATION_REQUEST_SCHEMA.as_bytes().to_vec();
+            proof_preimage.push(0);
+            proof_preimage.extend_from_slice(&canonical_json_value(&request));
+            let proof = json!({
+                "alg":"EdDSA",
+                "kid":holder_did,
+                "signature":encode_config(holder_key.sign(&Sha256::digest(proof_preimage)), URL_SAFE_NO_PAD),
+            });
+            let location_payload = format!(
+                "{{\"version\":1,\"subject\":{},\"multiaddrs\":[\"/dns/node.example/tcp/443/tls/http\"],\"updated_at\":\"2026-08-22T00:00:00.000Z\",\"sequence\":1}}",
+                serde_json::to_string(&owner_did)?
+            );
+            let location_record = json!({
+                "version":1,
+                "subject":owner_did,
+                "multiaddrs":["/dns/node.example/tcp/443/tls/http"],
+                "updated_at":"2026-08-22T00:00:00.000Z",
+                "sequence":1,
+                "signature":encode_config(owner_key.sign(location_payload.as_bytes()), URL_SAFE_NO_PAD),
+            });
+            println!(
+                "TC498_DELIVERY_RECEIPT={}",
+                json!({
+                    "receipt": {
+                        "request": request,
+                        "admission": delivery_receipt["admission"],
+                        "proof": proof,
+                    },
+                    "locationRecord": location_record,
+                    "nodeOrigin": "https://node.example",
+                    "nodeDid": node_did,
+                })
+            );
+        }
 
         let challenge_response = client
             .post("/policy/v3/challenges")
