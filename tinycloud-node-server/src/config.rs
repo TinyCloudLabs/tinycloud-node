@@ -91,12 +91,9 @@ pub struct ShareEmailConfig {
     /// instead of as a mounted file. Canonical env form is
     /// `TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_BASE64`.
     ///
-    /// The release image is `FROM scratch` — no shell, no `base64` — so the
-    /// decode-to-tmpfs entrypoint that `share-api`'s compose file uses cannot
-    /// work here, and a dstack/Phala deployment uploads only a compose file,
-    /// so there is no host path to bind-mount a file from either. An opaque
-    /// environment variable is the one channel that reaches this container in
-    /// production. It is base64 rather than raw JSON because Figment's `Env`
+    /// The release image is `FROM scratch`, so an inline environment value is
+    /// supported where a read-only trust-bundle mount is unavailable. It is
+    /// base64 rather than raw JSON because Figment's `Env`
     /// provider interprets brace- and bracket-delimited values as structured
     /// data; a base64 token passes through Figment, YAML and dstack's sealed
     /// environment storage byte-for-byte.
@@ -115,6 +112,9 @@ pub struct ShareEmailConfig {
     pub registry_origin: Option<String>,
     #[serde(default)]
     pub credentials_origin: Option<String>,
+    /** Audience allowed to consume a Node-authorized email delivery. */
+    #[serde(default)]
+    pub email_origin: Option<String>,
     #[serde(default)]
     pub postgres_tls: ShareEmailPostgresTlsConfig,
     #[serde(default = "default_share_readiness_max_age")]
@@ -221,6 +221,7 @@ impl Default for ShareEmailConfig {
             share_origin: None,
             registry_origin: None,
             credentials_origin: None,
+            email_origin: None,
             postgres_tls: ShareEmailPostgresTlsConfig::default(),
             readiness_max_age_seconds: default_share_readiness_max_age(),
             clock_skew_seconds: default_share_clock_skew(),
@@ -251,6 +252,7 @@ impl ShareEmailConfig {
         resolved.return_origin = bundle.return_origin.clone();
         resolved.allowed_origins = vec![bundle.return_origin];
         resolved.credentials_origin = Some(bundle.credentials_origin.clone());
+        resolved.email_origin = Some(bundle.email_origin.clone());
         resolved.node_signing_kid = bundle.node_invitation_kid.clone();
         resolved.invitation_kid = bundle.node_invitation_kid;
         resolved.invitation_public_key = Some(bundle.node_invitation_public_key);
@@ -354,6 +356,12 @@ impl ShareEmailConfig {
             })
             || self.credentials_origin.as_deref() == Some(self.target_origin.as_str())
             || self.credentials_origin.as_deref() == Some(self.return_origin.as_str())
+            || self.email_origin.as_deref().is_none_or(|origin| {
+                tinycloud_core::share_email::TargetOrigin::parse(origin.to_owned()).is_err()
+            })
+            || self.email_origin.as_deref() == Some(self.target_origin.as_str())
+            || self.email_origin.as_deref() == Some(self.return_origin.as_str())
+            || self.email_origin == self.credentials_origin
         {
             return Err("share email configuration is incomplete");
         }
@@ -441,26 +449,10 @@ struct ShareEmailTrustBundle {
     return_origin: String,
     registry_origin: String,
     credentials_origin: String,
-    /// TC-397: the origin the Share host puts in its CSP `connect-src` so the
-    /// browser is allowed to reach the email service. Share's schema is
-    /// closed and *requires* this field; the node's is closed and, until now,
-    /// rejected it — one committed document could not satisfy both, and
-    /// `resolve_trust_bundle` is `?`-propagated at startup, so the mismatch
-    /// was boot-fatal.
-    ///
-    /// It is optional here on purpose. Nothing in the node reads it: the CSP
-    /// it feeds is emitted by Share, and the node already declines to
-    /// propagate the two other origins it does not consume (`shareOrigin`,
-    /// `registryOrigin` are validated and matched, never resolved into
-    /// config). Requiring a newly added field inside an unchanged document
-    /// version would also be a breaking schema change without a version bump,
-    /// making every bundle in flight boot-fatal and coupling the node and
-    /// Share deploy order. `deny_unknown_fields` still rejects genuinely
-    /// unknown keys, so the schema stays closed; `emailOrigin` simply becomes
-    /// a known field that is fully validated whenever it is present. The
-    /// requirement itself is enforced by Share, which is its only consumer.
-    #[serde(default)]
-    email_origin: Option<String>,
+    /// Exact audience allowed to consume a node-authorized delivery receipt.
+    /// This is required because `api.share` must never accept a receipt minted
+    /// for another service.
+    email_origin: String,
     node_origin: String,
     node_audience: String,
     node_invitation_kid: String,
@@ -486,10 +478,7 @@ impl ShareEmailTrustBundle {
             || self.return_origin != self.share_origin
             || !canonical_https_origin(&self.registry_origin)
             || self.credentials_origin != "https://witness.credentials.org"
-            || self
-                .email_origin
-                .as_deref()
-                .is_some_and(|origin| !canonical_https_origin(origin))
+            || !canonical_https_origin(&self.email_origin)
             || (!canonical_https_origin(&self.node_origin) && !fixture_node_origin)
             || self.node_audience
                 != format!(
@@ -550,7 +539,11 @@ impl ShareEmailTrustBundle {
             && config
                 .credentials_origin
                 .as_deref()
-                .is_none_or(|value| value == self.credentials_origin);
+                .is_none_or(|value| value == self.credentials_origin)
+            && config
+                .email_origin
+                .as_deref()
+                .is_none_or(|value| value == self.email_origin);
         if matches {
             Ok(())
         } else {
@@ -573,10 +566,7 @@ impl ShareEmailTrustBundle {
         ]
         .into_iter()
         .any(|value| contains_placeholder(value))
-            || self
-                .email_origin
-                .as_deref()
-                .is_some_and(contains_placeholder)
+            || contains_placeholder(&self.email_origin)
             || is_fixture_public_key(&self.node_invitation_public_key)
             || is_fixture_public_key(&self.issuer_public_key)
     }
@@ -1285,7 +1275,7 @@ mod tests {
 
     /// The exact `emailOrigin` the committed production document carries.
     /// Share's schema requires the field; the node's must accept it.
-    const PRODUCTION_EMAIL_ORIGIN: &str = "https://email.tinycloud.xyz";
+    const PRODUCTION_EMAIL_ORIGIN: &str = "https://api.share.tinycloud.xyz";
 
     fn bundle_document(config: &ShareEmailConfig) -> serde_json::Value {
         serde_json::json!({
@@ -1318,6 +1308,7 @@ mod tests {
             "returnOrigin": config.return_origin.clone(),
             "registryOrigin": "https://registry.tinycloud.xyz",
             "credentialsOrigin": "https://witness.credentials.org",
+            "emailOrigin": PRODUCTION_EMAIL_ORIGIN,
             "nodeOrigin": config.target_origin.clone(),
             "nodeAudience": config.node_audience.clone(),
             "nodeInvitationKid": config.invitation_kid.clone(),
@@ -1398,6 +1389,7 @@ mod tests {
             "returnOrigin": "https://share.tinycloud.xyz",
             "registryOrigin": "https://registry.tinycloud.xyz",
             "credentialsOrigin": "https://witness.credentials.org",
+            "emailOrigin": PRODUCTION_EMAIL_ORIGIN,
             "nodeOrigin": "https://node.example",
             "nodeAudience": "did:web:node.example",
             "nodeInvitationKid": "did:web:node.example#invitation-key-1",
@@ -1424,13 +1416,7 @@ mod tests {
         );
     }
 
-    /// TC-397. Share's trust-bundle schema is closed and *requires*
-    /// `emailOrigin` — it feeds the CSP `connect-src` without which the
-    /// browser blocks the send. The node's schema is closed too and rejected
-    /// the key outright, so one committed document could not satisfy both
-    /// sides; because `resolve_trust_bundle` is `?`-propagated out of
-    /// `app_with_control`, that mismatch killed the node at boot with
-    /// "share email trust bundle is invalid".
+    /// The same required email origin is consumed by the delivery runtime.
     #[cfg(not(feature = "mounted-fixture"))]
     #[tokio::test]
     async fn a_trust_bundle_carrying_the_production_email_origin_is_accepted() {
@@ -1447,30 +1433,27 @@ mod tests {
             .resolve_trust_bundle()
             .expect("a bundle carrying emailOrigin must be accepted");
 
-        // Validated, but deliberately not consumed — the same treatment
-        // `shareOrigin` and `registryOrigin` already get, because the node
-        // has no use for them either.
+        // The delivery runtime consumes this as the exact receipt audience.
         assert_eq!(
-            resolved.credentials_origin.as_deref(),
-            Some("https://witness.credentials.org")
+            resolved.email_origin.as_deref(),
+            Some(PRODUCTION_EMAIL_ORIGIN)
         );
         assert!(config.validate().is_ok());
     }
 
-    /// The field is optional, not ignored: whenever it is present it has to
-    /// be a canonical HTTPS origin with no path, query, fragment, port or
-    /// credentials, and it is covered by the production placeholder scan.
+    /// The required field must be a canonical HTTPS origin with no path,
+    /// query, fragment, port, or credentials.
     #[cfg(not(feature = "mounted-fixture"))]
     #[tokio::test]
     async fn a_malformed_email_origin_is_rejected() {
         for malformed in [
-            "http://email.tinycloud.xyz",
-            "https://email.tinycloud.xyz/send",
-            "https://email.tinycloud.xyz/?queue=1",
-            "https://email.tinycloud.xyz#fragment",
-            "https://operator:secret@email.tinycloud.xyz",
-            "https://email.tinycloud.xyz:8443",
-            "email.tinycloud.xyz",
+            "http://api.share.tinycloud.xyz",
+            "https://api.share.tinycloud.xyz/send",
+            "https://api.share.tinycloud.xyz/?queue=1",
+            "https://api.share.tinycloud.xyz#fragment",
+            "https://operator:secret@api.share.tinycloud.xyz",
+            "https://api.share.tinycloud.xyz:8443",
+            "api.share.tinycloud.xyz",
             "",
             // Caught by the placeholder scan rather than the origin shape.
             "https://email.localhost",

@@ -5,10 +5,6 @@
 //! policy-session UCAN: the sibling-root registration, signed status, the
 //! challenge/claim replay boundary, and the first-admission gate.
 
-use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm, Nonce,
-};
 use base64::{decode_config, encode_config, URL_SAFE_NO_PAD};
 use rand::RngCore;
 use rocket::{http::Status, serde::json::Json, State};
@@ -81,7 +77,7 @@ struct DeliveryRuntime {
     target_origin: String,
     enforcer_did: String,
     return_origin: String,
-    credentials_origin: String,
+    email_origin: String,
 }
 
 #[derive(Clone)]
@@ -129,10 +125,10 @@ impl PolicyV3Runtime {
         if !config.enabled {
             return Ok(self);
         }
-        let credentials_origin = config
-            .credentials_origin
+        let email_origin = config
+            .email_origin
             .clone()
-            .ok_or_else(|| anyhow::anyhow!("v3 delivery credentials origin is missing"))?;
+            .ok_or_else(|| anyhow::anyhow!("v3 delivery email origin is missing"))?;
         let configured = config
             .invitation_public_key
             .as_deref()
@@ -146,7 +142,7 @@ impl PolicyV3Runtime {
             target_origin: config.target_origin.clone(),
             enforcer_did: self.node_did.clone(),
             return_origin: config.return_origin.clone(),
-            credentials_origin,
+            email_origin,
         });
         Ok(self)
     }
@@ -782,8 +778,6 @@ pub struct RegisterResponse {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeliveryAuthorizationRequest {
     pub envelope: Value,
-    pub sealed_envelope: String,
-    pub envelope_key: String,
     pub share_cid: String,
     pub recipient_email: String,
     pub share_url: String,
@@ -821,16 +815,41 @@ fn delivery_email(value: &str) -> Option<String> {
     ))
 }
 
-fn v3_delivery_url_matches(url: &str, origin: &str, share_cid: &str, envelope_key: &str) -> bool {
-    let prefix = format!("{origin}/s/{share_cid}#k=");
-    let Some(key) = url.strip_prefix(&prefix) else {
+fn v3_delivery_url_matches(url: &str, origin: &str, share_cid: &str, envelope: &Value) -> bool {
+    let prefix = format!("{origin}/viewer?tc2=");
+    let Some(encoded) = url.strip_prefix(&prefix) else {
         return false;
     };
-    key == envelope_key
-        && key.len() == 43
-        && key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    let Ok(bytes) = decode_config(encoded, URL_SAFE_NO_PAD) else {
+        return false;
+    };
+    if encode_config(&bytes, URL_SAFE_NO_PAD) != encoded || bytes.len() > 4 * 1024 * 1024 {
+        return false;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    let Some(payload) = value.as_object() else {
+        return false;
+    };
+    let Some(envelope_bytes) = payload
+        .get("c")
+        .and_then(Value::as_str)
+        .and_then(|value| decode_config(value, URL_SAFE_NO_PAD).ok())
+    else {
+        return false;
+    };
+    let envelope_cid = tinycloud_auth::ipld_core::cid::Cid::new_v1(
+        0x55,
+        tinycloud_auth::multihash_codetable::Code::Sha2_256.digest(&envelope_bytes),
+    )
+    .to_string();
+    payload.len() == 3
+        && payload.get("v").and_then(Value::as_u64) == Some(2)
+        && payload.get("cid").and_then(Value::as_str) == Some(share_cid)
+        && canonical_json_value(&value) == bytes
+        && envelope_bytes == canonical_json_value(envelope)
+        && envelope_cid == share_cid
 }
 
 fn v3_registration_is_live(
@@ -953,39 +972,6 @@ fn v3_envelope_delivery_projection<'a>(
     Ok((object, display_name, actions))
 }
 
-fn verify_v3_sealed_envelope(
-    envelope: &Value,
-    request: &DeliveryAuthorizationRequest,
-) -> Result<(), ()> {
-    let sealed = decode_config(&request.sealed_envelope, URL_SAFE_NO_PAD).map_err(|_| ())?;
-    let key = decode_config(&request.envelope_key, URL_SAFE_NO_PAD).map_err(|_| ())?;
-    if sealed.len() < 29 || sealed.len() > 2 * 1024 * 1024 || sealed[0] != 1 || key.len() != 32 {
-        return Err(());
-    }
-    let expected_cid = tinycloud_auth::ipld_core::cid::Cid::new_v1(
-        0x55,
-        tinycloud_auth::multihash_codetable::Code::Sha2_256.digest(&sealed),
-    )
-    .to_string();
-    if expected_cid != request.share_cid {
-        return Err(());
-    }
-    let nonce = Nonce::from(<[u8; 12]>::try_from(&sealed[1..13]).map_err(|_| ())?);
-    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| ())?;
-    let plaintext = cipher
-        .decrypt(
-            &nonce,
-            aes_gcm::aead::Payload {
-                msg: &sealed[13..],
-                aad: b"tinycloud-share-envelope-v1",
-            },
-        )
-        .map_err(|_| ())?;
-    (plaintext == canonical_json_value(envelope))
-        .then_some(())
-        .ok_or(())
-}
-
 fn normal_invocation_allows_v3_delivery(
     invocation: &InvocationInfo,
     envelope: &serde_json::Map<String, Value>,
@@ -1039,7 +1025,7 @@ pub async fn authorize_delivery(
             &request.share_url,
             &delivery.return_origin,
             &request.share_cid,
-            &request.envelope_key,
+            &request.envelope,
         )
         || tinycloud_auth::ipld_core::cid::Cid::try_from(request.share_cid.as_str()).is_err()
     {
@@ -1070,8 +1056,6 @@ pub async fn authorize_delivery(
     let (envelope, _, actions) =
         v3_envelope_delivery_projection(&request.envelope, &registration, delivery, &request)
             .map_err(|_| (Status::Forbidden, "delivery-authorization-invalid".into()))?;
-    verify_v3_sealed_envelope(&request.envelope, &request)
-        .map_err(|_| (Status::Forbidden, "delivery-authorization-invalid".into()))?;
     if !normal_invocation_allows_v3_delivery(&invocation.0 .0, envelope) {
         return Err((
             Status::Unauthorized,
@@ -1100,6 +1084,10 @@ pub async fn authorize_delivery(
         .get("policy")
         .and_then(Value::as_object)
         .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
+    let share_expires_at = envelope
+        .get("expiry")
+        .and_then(Value::as_str)
+        .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
     let policy_id = registration.policy_cid.clone();
     let credential_type = policy
         .get("credentialRequirement")
@@ -1120,7 +1108,9 @@ pub async fn authorize_delivery(
         "credentialType": credential_type,
         "returnLink": request.share_url,
         "envelopeRef": request.share_cid,
-        "audience": delivery.credentials_origin,
+        "label": request.document_name,
+        "shareExpiresAt": share_expires_at,
+        "audience": delivery.email_origin,
         "issuedAt": format_time(now),
         "expiresAt": request.expires_at,
         "nonce": request.jti,
@@ -1135,8 +1125,10 @@ pub async fn authorize_delivery(
         "credentialType": credential_type,
         "returnLink": request.share_url,
         "envelopeRef": request.share_cid,
+        "label": request.document_name,
+        "shareExpiresAt": share_expires_at,
         "senderKeyDid": invocation.0 .0.invoker,
-        "audience": delivery.credentials_origin,
+        "audience": delivery.email_origin,
         "issuedAt": format_time(now),
         "expiresAt": request.expires_at,
         "nonce": request.jti,
@@ -5845,6 +5837,7 @@ mod tests {
             node_signing_kid: format!("{node_did}#delivery"),
             invitation_kid: format!("{node_did}#delivery"),
             credentials_origin: Some("https://witness.credentials.org".into()),
+            email_origin: Some("https://api.share.tinycloud.xyz".into()),
             invitation_public_key: Some(encode_config(
                 signer.share_invitation_public_key(),
                 URL_SAFE_NO_PAD,
@@ -6314,7 +6307,7 @@ mod tests {
             target_origin: "https://tee.node.tinycloud.xyz".into(),
             enforcer_did: "did:key:zEnforcer".into(),
             return_origin: "https://share.tinycloud.xyz".into(),
-            credentials_origin: "https://witness.credentials.org".into(),
+            email_origin: "https://api.share.tinycloud.xyz".into(),
         };
         let content_source = policy["contentSource"].clone();
         let mut envelope = json!({
@@ -6342,35 +6335,24 @@ mod tests {
             "signerDid":owner_did,
             "value":encode_config(owner.sign(&Sha256::digest(bytes)), URL_SAFE_NO_PAD),
         });
-        let key = [5_u8; 32];
-        let nonce = [6_u8; 12];
-        let ciphertext = Aes256Gcm::new_from_slice(&key)
-            .unwrap()
-            .encrypt(
-                &Nonce::from(nonce),
-                aes_gcm::aead::Payload {
-                    msg: &canonical_json_value(&envelope),
-                    aad: b"tinycloud-share-envelope-v1",
-                },
-            )
-            .unwrap();
-        let mut sealed = vec![1_u8];
-        sealed.extend_from_slice(&nonce);
-        sealed.extend_from_slice(&ciphertext);
+        let envelope_bytes = canonical_json_value(&envelope);
         let share_cid = tinycloud_auth::ipld_core::cid::Cid::new_v1(
             0x55,
-            tinycloud_auth::multihash_codetable::Code::Sha2_256.digest(&sealed),
+            tinycloud_auth::multihash_codetable::Code::Sha2_256.digest(&envelope_bytes),
         )
         .to_string();
+        let link_payload = canonical_json_value(&json!({
+            "v": 2,
+            "c": encode_config(&envelope_bytes, URL_SAFE_NO_PAD),
+            "cid": share_cid.clone(),
+        }));
         let request = DeliveryAuthorizationRequest {
             envelope,
-            sealed_envelope: encode_config(&sealed, URL_SAFE_NO_PAD),
-            envelope_key: encode_config(key, URL_SAFE_NO_PAD),
             share_cid: share_cid.clone(),
             recipient_email: "alice@example.com".into(),
             share_url: format!(
-                "https://share.tinycloud.xyz/s/{share_cid}#k={}",
-                encode_config(key, URL_SAFE_NO_PAD)
+                "https://share.tinycloud.xyz/viewer?tc2={}",
+                encode_config(link_payload, URL_SAFE_NO_PAD)
             ),
             document_name: "report.pdf".into(),
             jti: encode_config([7_u8; 16], URL_SAFE_NO_PAD),
@@ -6421,35 +6403,39 @@ mod tests {
     }
 
     #[test]
-    fn v3_delivery_rejects_cid_not_bound_to_sealed_envelope() {
-        let (_, _, _, mut request) = delivery_fixture();
-        assert!(verify_v3_sealed_envelope(&request.envelope, &request).is_ok());
-
-        request.share_cid = "bafkreieeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into();
-        assert!(verify_v3_sealed_envelope(&request.envelope, &request).is_err());
-    }
-
-    #[test]
-    fn v3_delivery_rejects_link_with_different_fragment_key() {
+    fn v3_delivery_rejects_cid_not_bound_to_public_envelope() {
         let (_, _, delivery, request) = delivery_fixture();
         assert!(v3_delivery_url_matches(
             &request.share_url,
             &delivery.return_origin,
             &request.share_cid,
-            &request.envelope_key,
+            &request.envelope,
         ));
 
-        let other_key = encode_config([8_u8; 32], URL_SAFE_NO_PAD);
-        let altered_url = format!(
-            "{}/s/{}#k={other_key}",
-            delivery.return_origin, request.share_cid
-        );
+        let altered_cid = "bafkreieeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
         assert!(!v3_delivery_url_matches(
-            &altered_url,
+            &request.share_url,
             &delivery.return_origin,
-            &request.share_cid,
-            &request.envelope_key,
+            altered_cid,
+            &request.envelope,
         ));
+    }
+
+    #[test]
+    fn v3_delivery_rejects_fragment_or_query_substitution() {
+        let (_, _, delivery, request) = delivery_fixture();
+        for altered_url in [
+            format!("{}#k=secret", request.share_url),
+            format!("{}&k=secret", request.share_url),
+            request.share_url.replace("?tc2=", "#tc2="),
+        ] {
+            assert!(!v3_delivery_url_matches(
+                &altered_url,
+                &delivery.return_origin,
+                &request.share_cid,
+                &request.envelope,
+            ));
+        }
     }
 
     #[test]

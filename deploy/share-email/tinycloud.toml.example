@@ -15,9 +15,8 @@ enabled = true
 # version, and public-key fields below. No split trust environment variables
 # are accepted by the production compose file.
 trust_bundle_path = "/run/tinycloud/share-email-trust-bundle.json"
-# TC-397: where a file cannot be mounted at all — the release image is
-# `FROM scratch` and a dstack/Phala deployment uploads only a compose file —
-# the same document arrives inline instead, base64-encoded, through
+# Where a file cannot be mounted, the same document can arrive inline,
+# base64-encoded, through
 # TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_BASE64 (config key `trust_bundle_base64`).
 # Set exactly one of the two. Configuring both is a startup error: two sources
 # for one document is precisely the divergence this bundle exists to prevent.
