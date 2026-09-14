@@ -7,7 +7,6 @@ use rusqlite::hooks::{AuthContext, Authorization};
 use tokio::sync::{mpsc, oneshot};
 
 use super::{
-    authorizer,
     caveats::SqlCaveats,
     parser,
     storage::{self, StorageMode},
@@ -20,6 +19,10 @@ const MAX_BOUNDED_QUERY_BYTES: usize = 4 * 1024 * 1024;
 const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300); // 5 min
 
 enum DbMessage {
+    Publication {
+        command: serde_json::Value,
+        response_tx: oneshot::Sender<Result<SqlExecutionResult, SqlError>>,
+    },
     Execute {
         request: SqlRequest,
         caveats: Option<SqlCaveats>,
@@ -48,6 +51,22 @@ pub struct DatabaseHandle {
 }
 
 impl DatabaseHandle {
+    pub(crate) async fn publication(
+        &self,
+        command: serde_json::Value,
+    ) -> Result<SqlExecutionResult, SqlError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send(DbMessage::Publication {
+                command,
+                response_tx,
+            })
+            .await
+            .map_err(|_| SqlError::Internal("Database actor not available".into()))?;
+        response_rx
+            .await
+            .map_err(|_| SqlError::Internal("Database actor dropped response".into()))?
+    }
     pub async fn execute(
         &self,
         request: SqlRequest,
@@ -137,6 +156,34 @@ pub fn spawn_actor(
                 };
 
             match msg {
+                DbMessage::Publication {
+                    command,
+                    response_tx,
+                } => {
+                    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+                    let readonly = matches!(
+                        command["operation"].as_str(),
+                        Some("capabilities" | "inspect")
+                    );
+                    let result =
+                        super::publication::execute(&conn, &space_id, &command).map(|receipt| {
+                            SqlExecutionResult {
+                                response: SqlResponse::Query(QueryResponse {
+                                    columns: vec!["receipt".into()],
+                                    rows: vec![vec![SqlValue::Text(receipt.to_string())]],
+                                    row_count: 1,
+                                }),
+                                write_targets: if readonly {
+                                    vec![]
+                                } else {
+                                    vec![crate::write_hooks::TouchedTables::supported(vec![
+                                        "connector_meeting".into(),
+                                    ])]
+                                },
+                            }
+                        });
+                    let _ = response_tx.send(result);
+                }
                 DbMessage::Execute {
                     request,
                     caveats,
@@ -144,6 +191,7 @@ pub fn spawn_actor(
                     response_tx,
                 } => {
                     let result = handle_message(&conn, &request, &caveats, &ability);
+                    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
 
                     // Post-write promotion check
                     if result.is_ok() && matches!(mode, StorageMode::InMemory) {
@@ -272,8 +320,12 @@ fn handle_message(
         } => {
             let parsed = parser::validate_sql(sql, caveats, ability)?;
 
-            let auth =
-                authorizer::create_authorizer(caveats.clone(), ability.to_string(), is_admin);
+            let auth = super::publication::authorizer(
+                conn,
+                caveats.clone(),
+                ability.to_string(),
+                is_admin,
+            );
             conn.authorizer(Some(auth));
 
             let result = execute_query(conn, sql, params, *max_rows, *max_bytes);
@@ -296,7 +348,8 @@ fn handle_message(
                 for stmt_sql in schema_stmts {
                     let parsed = parser::validate_sql(stmt_sql, caveats, ability)?;
                     write_targets.extend(parsed.write_targets);
-                    let auth = authorizer::create_authorizer(
+                    let auth = super::publication::authorizer(
+                        conn,
                         caveats.clone(),
                         ability.to_string(),
                         is_admin,
@@ -309,8 +362,12 @@ fn handle_message(
             }
 
             let parsed = parser::validate_sql(sql, caveats, ability)?;
-            let auth =
-                authorizer::create_authorizer(caveats.clone(), ability.to_string(), is_admin);
+            let auth = super::publication::authorizer(
+                conn,
+                caveats.clone(),
+                ability.to_string(),
+                is_admin,
+            );
             conn.authorizer(Some(auth));
 
             let result = execute_statement(conn, sql, params, is_insert_statement(&parsed));
@@ -338,8 +395,12 @@ fn handle_message(
 
             let mut results = Vec::new();
             for (stmt, is_insert) in statements.iter().zip(insert_statements) {
-                let auth =
-                    authorizer::create_authorizer(caveats.clone(), ability.to_string(), is_admin);
+                let auth = super::publication::authorizer(
+                    conn,
+                    caveats.clone(),
+                    ability.to_string(),
+                    is_admin,
+                );
                 conn.authorizer(Some(auth));
                 let result = execute_statement(conn, &stmt.sql, &stmt.params, is_insert);
                 conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
@@ -361,8 +422,12 @@ fn handle_message(
 
             let parsed = parser::validate_sql(&prepared.sql, caveats, ability)?;
 
-            let auth =
-                authorizer::create_authorizer(caveats.clone(), ability.to_string(), is_admin);
+            let auth = super::publication::authorizer(
+                conn,
+                caveats.clone(),
+                ability.to_string(),
+                is_admin,
+            );
             conn.authorizer(Some(auth));
 
             let result = if is_query_statement(&parsed) {
@@ -732,5 +797,19 @@ mod tests {
             validate_query_limits(None, Some(MAX_BOUNDED_QUERY_BYTES + 1)),
             Err(SqlError::InvalidStatement(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod publication_fencing_tests {
+    use super::*;
+    #[test]
+    fn publication_rejects_old_unfenced_sql_writers_after_activation() {
+        for sql in ["PRAGMA writable_schema=ON", "INSERT INTO connector_meeting(id,source,source_id,created_at,updated_at) VALUES('x','fireflies','x','now','now')", "DELETE FROM connector_meeting", "UPDATE connector_meeting SET title='old'", "DROP TABLE connector_meeting", "UPDATE connector_publication_control SET active=0", "DROP TABLE connector_publication_snapshot", "INSERT INTO connector_meeting_alias VALUES('x','y')"] {
+   let conn=rusqlite::Connection::open_in_memory().unwrap();
+   super::super::publication::execute(&conn,"space",&serde_json::json!({"contractVersion":3,"operation":"activate"})).unwrap();
+   let result=handle_message(&conn,&SqlRequest::Execute{sql:sql.into(),params:vec![],schema:None},&None,"tinycloud.sql/admin");
+   assert!(result.is_err(),"legacy write accepted: {sql}");
+  }
     }
 }

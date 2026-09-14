@@ -95,10 +95,41 @@ enum InvokeMode {
     /// Pre-authorized by a trusted application protocol seam
     /// (`invoke_internal_kv_put`). Skips the full UCAN validator entirely.
     Internal,
+    /// Fixed native meeting publication; the only writer of immutable snapshot keys.
+    MeetingPublication,
     /// Envelope already verified once at admission. Authorization,
     /// revocation, caveat containment, and signed-time validity are still
     /// re-checked at execution; only the signature check is skipped.
     Admitted,
+}
+
+fn meeting_snapshot_write_allowed(mode: InvokeMode, path: &str) -> bool {
+    mode == InvokeMode::MeetingPublication
+        || !crate::sql::publication::protected_snapshot_path(path)
+}
+
+#[cfg(test)]
+mod meeting_snapshot_fence_tests {
+    use super::*;
+    #[test]
+    fn publication_snapshot_prefix_rejects_legacy_and_share_writes() {
+        let path = "xyz.tinycloud.tinychat/connectors/fireflies/snapshot/source/digest";
+        for mode in [
+            InvokeMode::Public,
+            InvokeMode::Admitted,
+            InvokeMode::Internal,
+        ] {
+            assert!(!meeting_snapshot_write_allowed(mode, path));
+        }
+        assert!(meeting_snapshot_write_allowed(
+            InvokeMode::MeetingPublication,
+            path
+        ));
+        assert!(meeting_snapshot_write_allowed(
+            InvokeMode::Public,
+            "xyz.tinycloud.tinychat/connectors/fireflies/transcript/source"
+        ));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +248,8 @@ where
     Io(#[from] std::io::Error),
     #[error("Missing Input for requested action")]
     MissingInput,
+    #[error("meeting snapshot keys require the native publication boundary")]
+    MeetingSnapshotProtected,
     #[error("KV precondition failed")]
     KvPreconditionFailed,
     #[error("conditional KV transaction conflicted; retry the request")]
@@ -1218,6 +1251,82 @@ where
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
+        self.invoke_internal_kv_change::<S>(
+            space,
+            path,
+            metadata,
+            Some(stage),
+            precondition,
+            InvokeMode::Internal,
+        )
+        .await
+        .and_then(|hash| hash.ok_or(TxStoreError::MissingInput))
+    }
+    pub async fn invoke_internal_meeting_snapshot_put<S>(
+        &self,
+        space: SpaceId,
+        path: Path,
+        metadata: Metadata,
+        stage: HashBuffer<S::Writable>,
+        precondition: Option<KvPrecondition>,
+    ) -> Result<Hash, TxStoreError<B, S, K>>
+    where
+        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
+        if !crate::sql::publication::protected_snapshot_path(path.as_str()) {
+            return Err(TxStoreError::MeetingSnapshotProtected);
+        }
+        self.invoke_internal_kv_change::<S>(
+            space,
+            path,
+            metadata,
+            Some(stage),
+            precondition,
+            InvokeMode::MeetingPublication,
+        )
+        .await
+        .and_then(|hash| hash.ok_or(TxStoreError::MissingInput))
+    }
+    pub async fn invoke_internal_meeting_snapshot_delete<S>(
+        &self,
+        space: SpaceId,
+        path: Path,
+    ) -> Result<(), TxStoreError<B, S, K>>
+    where
+        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
+        if !crate::sql::publication::connector_owned_path(path.as_str()) {
+            return Err(TxStoreError::MeetingSnapshotProtected);
+        }
+        self.invoke_internal_kv_change::<S>(
+            space,
+            path,
+            Metadata(Default::default()),
+            None,
+            None,
+            InvokeMode::MeetingPublication,
+        )
+        .await
+        .map(|_| ())
+    }
+    async fn invoke_internal_kv_change<S>(
+        &self,
+        space: SpaceId,
+        path: Path,
+        metadata: Metadata,
+        stage: Option<HashBuffer<S::Writable>>,
+        precondition: Option<KvPrecondition>,
+        mode: InvokeMode,
+    ) -> Result<Option<Hash>, TxStoreError<B, S, K>>
+    where
+        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
         let jwk = tinycloud_auth::ssi::jwk::JWK::generate_ed25519()
             .map_err(|_| TxStoreError::MissingInput)?;
         let mut verification_method = tinycloud_auth::resolver::DID_METHODS
@@ -1244,9 +1353,13 @@ where
         let invocation = make_invocation(
             vec![(
                 resource,
-                vec!["tinycloud.kv/put"
-                    .parse::<tinycloud_auth::ucan_capabilities_object::Ability>()
-                    .map_err(|_| TxStoreError::MissingInput)?],
+                vec![(if stage.is_some() {
+                    "tinycloud.kv/put"
+                } else {
+                    "tinycloud.kv/del"
+                })
+                .parse::<tinycloud_auth::ucan_capabilities_object::Ability>()
+                .map_err(|_| TxStoreError::MissingInput)?],
             )],
             &delegation,
             &jwk,
@@ -1266,7 +1379,9 @@ where
             .into_bytes();
         let invocation = crate::events::SerializedEvent(info, serialized);
         let mut inputs = HashMap::new();
-        inputs.insert((space, path), (metadata, stage));
+        if let Some(stage) = stage {
+            inputs.insert((space.clone(), path.clone()), (metadata, stage));
+        }
         let mut options = KvInvokeOptions::default();
         if let Some(precondition) = precondition {
             let key = inputs
@@ -1277,12 +1392,13 @@ where
             options.preconditions.insert(key, precondition);
         }
         let (_, mut outcomes) = self
-            .invoke_with_options_internal(invocation, inputs, options)
+            .invoke_with_options_mode(invocation, inputs, options, mode)
             .await?;
         let result = outcomes
             .drain(..)
             .find_map(|outcome| match outcome {
-                InvocationOutcome::KvWrite(hash) => Some(hash),
+                InvocationOutcome::KvWrite(hash) => Some(Some(hash)),
+                InvocationOutcome::KvDelete(hash) => Some(hash),
                 _ => None,
             })
             .ok_or(TxStoreError::MissingInput);
@@ -1554,21 +1670,6 @@ where
             .await
     }
 
-    async fn invoke_with_options_internal<S>(
-        &self,
-        invocation: Invocation,
-        inputs: InvocationInputs<S::Writable>,
-        options: KvInvokeOptions,
-    ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
-    where
-        B: ImmutableWriteStore<S> + ImmutableReadStore,
-        S: ImmutableStaging,
-        S::Writable: 'static + Unpin,
-    {
-        self.invoke_with_options_mode(invocation, inputs, options, InvokeMode::Internal)
-            .await
-    }
-
     async fn invoke_with_options_mode<S>(
         &self,
         invocation: Invocation,
@@ -1581,6 +1682,21 @@ where
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
+        for cap in &invocation.0.capabilities {
+            if let Some(resource) = cap.resource.tinycloud_resource() {
+                let ability =
+                    crate::policy_capability::resolve_alias(cap.ability.as_ref().as_ref());
+                if resource.service().as_str() == "kv"
+                    && matches!(ability, "tinycloud.kv/put" | "tinycloud.kv/del")
+                {
+                    if let Some(path) = resource.path() {
+                        if !meeting_snapshot_write_allowed(mode, path.as_str()) {
+                            return Err(TxStoreError::MeetingSnapshotProtected);
+                        }
+                    }
+                }
+            }
+        }
         let roots: Vec<Hash> = invocation
             .0
             .parents
@@ -1768,7 +1884,9 @@ where
             });
         //  verify and commit invocation and kv operations
         let event = match mode {
-            InvokeMode::Internal => Event::InternalInvocation(Box::new(invocation), ops),
+            InvokeMode::Internal | InvokeMode::MeetingPublication => {
+                Event::InternalInvocation(Box::new(invocation), ops)
+            }
             InvokeMode::Admitted => Event::AdmittedInvocation(Box::new(invocation), ops),
             InvokeMode::Public => Event::Invocation(Box::new(invocation), ops),
         };
@@ -1940,13 +2058,15 @@ where
                     .await
                     .map_err(TxError::<B, K>::from)?
             }
-            InvokeMode::Public | InvokeMode::Internal => invocation::verify_and_authorize(
-                &self.conn,
-                &invocation.0,
-                OffsetDateTime::now_utc(),
-            )
-            .await
-            .map_err(TxError::<B, K>::from)?,
+            InvokeMode::Public | InvokeMode::Internal | InvokeMode::MeetingPublication => {
+                invocation::verify_and_authorize(
+                    &self.conn,
+                    &invocation.0,
+                    OffsetDateTime::now_utc(),
+                )
+                .await
+                .map_err(TxError::<B, K>::from)?
+            }
         };
 
         let requested_spaces = invocation.0.spaces().cloned().collect::<HashSet<_>>();

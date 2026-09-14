@@ -64,6 +64,7 @@ pub mod admin;
 pub mod attestation;
 pub mod encryption;
 pub mod hooks;
+mod meeting_publication;
 pub mod node_keys;
 pub mod public;
 #[cfg(feature = "tc-bench-v1")]
@@ -1451,6 +1452,7 @@ async fn invoke_impl(
                 admitted,
                 data,
                 tinycloud,
+                staging,
                 sql_service,
                 hook_runtime,
                 quota_cache,
@@ -1839,6 +1841,7 @@ async fn invoke_impl(
                     match &e {
                         TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
                         TxStoreError::KvPreconditionFailed => Status::PreconditionFailed,
+                        TxStoreError::MeetingSnapshotProtected => Status::Forbidden,
                         TxStoreError::KvSerializationConflict => Status::ServiceUnavailable,
                         TxStoreError::KvResponseTooLarge { .. } => Status::PayloadTooLarge,
                         TxStoreError::Tx(TxError::InvalidInvocation(
@@ -2014,15 +2017,27 @@ async fn emit_kv_hook_events(
 
 /// Read the request body as a JSON string.
 async fn read_json_body(data: DataIn<'_>) -> Result<String, (Status, String)> {
+    read_json_body_limited(data, 1_048_576).await
+}
+async fn read_json_body_limited(
+    data: DataIn<'_>,
+    limit: usize,
+) -> Result<String, (Status, String)> {
     let start = Instant::now();
     match data {
         DataIn::One(d) => {
             let mut buf = Vec::new();
-            let mut reader = d.open(1u8.megabytes());
+            let mut reader = d.open(((limit + 1) as u64).bytes());
             reader
                 .read_to_end(&mut buf)
                 .await
                 .map_err(|e| (Status::BadRequest, e.to_string()))?;
+            if buf.len() > limit {
+                return Err((
+                    Status::PayloadTooLarge,
+                    "JSON body exceeds complete envelope limit".into(),
+                ));
+            }
             let result = String::from_utf8(buf).map_err(|e| (Status::BadRequest, e.to_string()));
             crate::prometheus::observe_stage(
                 crate::prometheus::InvocationStage::RequestDecode,
@@ -2080,6 +2095,7 @@ async fn handle_sql_invoke(
     admitted: AdmittedInvocation,
     data: DataIn<'_>,
     tinycloud: &State<TinyCloud>,
+    staging: &State<BlockStage>,
     sql_service: &State<SqlService>,
     hook_runtime: &State<HookRuntime>,
     quota_cache: &State<QuotaCache>,
@@ -2116,7 +2132,8 @@ async fn handle_sql_invoke(
     // verification a second time.
     let auth_result = verify_auth_admitted("server.sql.auth", admitted, tinycloud).await?;
     let body_start = Instant::now();
-    let body_result = read_json_body(data).await;
+    let body_result =
+        read_json_body_limited(data, tinycloud_core::sql::publication::ENVELOPE_LIMIT).await;
     crate::prometheus::observe_span(
         "server.sql.read_body",
         if body_result.is_ok() { "ok" } else { "error" },
@@ -2178,16 +2195,33 @@ async fn handle_sql_invoke(
         staged_batch_remaining(space, tinycloud, config, quota_cache).await?;
     }
 
-    let execute_start = Instant::now();
-    let execute_result = sql_service
-        .execute(
-            space,
-            &db_name,
-            sql_request,
-            exec_caveats,
-            ability.to_string(),
+    let publication_command =
+        meeting_publication::command(&sql_request, path, ability, &exec_caveats)?;
+    if publication_command.is_some() {
+        meeting_publication::require_unconstrained_chain(tinycloud, &parent_cids).await?;
+    }
+    if publication_command.as_ref().is_some_and(|command| {
+        !matches!(
+            command["operation"].as_str(),
+            Some("capabilities" | "inspect")
         )
-        .await;
+    }) {
+        staged_batch_remaining(space, tinycloud, config, quota_cache).await?;
+    }
+    let execute_start = Instant::now();
+    let execute_result = if let Some(command) = publication_command {
+        meeting_publication::execute(tinycloud, sql_service, staging, space, command).await
+    } else {
+        sql_service
+            .execute(
+                space,
+                &db_name,
+                sql_request,
+                exec_caveats,
+                ability.to_string(),
+            )
+            .await
+    };
     crate::prometheus::observe_span(
         "server.sql.execute",
         if execute_result.is_ok() {
