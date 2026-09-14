@@ -14,10 +14,10 @@ use serde_with::{
 use std::{fs, path::PathBuf};
 use tinycloud_core::keys::StaticSecret;
 
-/// The independently operated email delivery service that may consume a
-/// node-authorized receipt in production. Keep this exact origin pinned: a
-/// syntactically valid alternate host is a different audience.
-const PRODUCTION_SHARE_EMAIL_ORIGIN: &str = "https://email.tinycloud.xyz";
+/// The OpenCredentials service that consumes a node-authorized generic
+/// credential-invitation receipt in production. Keep this exact origin pinned:
+/// a syntactically valid alternate host is a different audience.
+const PRODUCTION_SHARE_EMAIL_ORIGIN: &str = "https://witness.credentials.org";
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
 pub struct Config {
@@ -366,7 +366,6 @@ impl ShareEmailConfig {
             })
             || self.email_origin.as_deref() == Some(self.target_origin.as_str())
             || self.email_origin.as_deref() == Some(self.return_origin.as_str())
-            || self.email_origin == self.credentials_origin
         {
             return Err("share email configuration is incomplete");
         }
@@ -485,6 +484,7 @@ impl ShareEmailTrustBundle {
             || self.credentials_origin != "https://witness.credentials.org"
             || !canonical_https_origin(&self.email_origin)
             || (!allows_hermetic_fixture() && self.email_origin != PRODUCTION_SHARE_EMAIL_ORIGIN)
+            || (!allows_hermetic_fixture() && self.email_origin != self.credentials_origin)
             || (!canonical_https_origin(&self.node_origin) && !fixture_node_origin)
             || self.node_audience
                 != format!(
@@ -1279,8 +1279,9 @@ mod tests {
         }
     }
 
-    /// The exact `emailOrigin` the committed production document carries.
-    /// Share's schema requires the field; the node's must accept it.
+    /// The exact `emailOrigin` (generic invitation audience) the committed
+    /// production document carries. Share's schema requires the field; the
+    /// node's must accept it.
     const PRODUCTION_EMAIL_ORIGIN: &str = PRODUCTION_SHARE_EMAIL_ORIGIN;
 
     fn bundle_document(config: &ShareEmailConfig) -> serde_json::Value {
@@ -1422,10 +1423,10 @@ mod tests {
         );
     }
 
-    /// The same required email origin is consumed by the delivery runtime.
+    /// The same required invitation origin is consumed by the delivery runtime.
     #[cfg(not(feature = "mounted-fixture"))]
     #[tokio::test]
-    async fn a_trust_bundle_carrying_the_production_email_origin_is_accepted() {
+    async fn a_trust_bundle_carrying_the_production_invitation_origin_is_accepted() {
         let mut config = enabled_config();
         let file = NamedTempFile::new().expect("temporary trust bundle");
         fs::write(
@@ -1461,6 +1462,7 @@ mod tests {
             "https://email.tinycloud.xyz:8443",
             "email.tinycloud.xyz",
             // Correct shape, but an unreviewed production audience.
+            "https://email.tinycloud.xyz",
             "https://api.share.tinycloud.xyz",
             "",
             // Caught by the placeholder scan rather than the origin shape.

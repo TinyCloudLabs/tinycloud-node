@@ -88,7 +88,7 @@ const DELIVERY_ADMISSION_SCHEMA: &str = "xyz.tinycloud.policy/delivery-admission
 struct DeliveryRuntime {
     target_origin: String,
     return_origin: String,
-    email_origin: String,
+    invitation_origin: String,
 }
 
 #[derive(Clone)]
@@ -136,10 +136,10 @@ impl PolicyV3Runtime {
         if !config.enabled {
             return Ok(self);
         }
-        let email_origin = config
+        let invitation_origin = config
             .email_origin
             .clone()
-            .ok_or_else(|| anyhow::anyhow!("v3 delivery email origin is missing"))?;
+            .ok_or_else(|| anyhow::anyhow!("v3 credential-invitation origin is missing"))?;
         let configured = config
             .invitation_public_key
             .as_deref()
@@ -152,7 +152,7 @@ impl PolicyV3Runtime {
         self.delivery = Some(DeliveryRuntime {
             target_origin: config.target_origin.clone(),
             return_origin: config.return_origin.clone(),
-            email_origin,
+            invitation_origin,
         });
         Ok(self)
     }
@@ -1180,7 +1180,7 @@ pub async fn authorize_delivery(
         "envelopeRef": request.share_cid,
         "label": request.document_name,
         "shareExpiresAt": share_expires_at,
-        "audience": delivery.email_origin,
+        "audience": delivery.invitation_origin,
         "issuedAt": format_time(now),
         "expiresAt": request.expires_at,
         "nonce": request.jti,
@@ -1198,7 +1198,7 @@ pub async fn authorize_delivery(
         "label": request.document_name,
         "shareExpiresAt": share_expires_at,
         "senderKeyDid": invocation.0 .0.invoker,
-        "audience": delivery.email_origin,
+        "audience": delivery.invitation_origin,
         "issuedAt": format_time(now),
         "expiresAt": request.expires_at,
         "nonce": request.jti,
@@ -6162,7 +6162,7 @@ mod tests {
             node_signing_kid: format!("{node_did}#delivery"),
             invitation_kid: format!("{node_did}#delivery"),
             credentials_origin: Some("https://witness.credentials.org".into()),
-            email_origin: Some("https://email.tinycloud.xyz".into()),
+            email_origin: Some("https://witness.credentials.org".into()),
             invitation_public_key: Some(encode_config(
                 signer.share_invitation_public_key(),
                 URL_SAFE_NO_PAD,
@@ -6676,7 +6676,7 @@ mod tests {
         let delivery = DeliveryRuntime {
             target_origin: "https://tee.node.tinycloud.xyz".into(),
             return_origin: "https://share.tinycloud.xyz".into(),
-            email_origin: "https://email.tinycloud.xyz".into(),
+            invitation_origin: "https://witness.credentials.org".into(),
         };
         let content_source = policy["contentSource"].clone();
         let mut envelope = json!({
@@ -7145,7 +7145,7 @@ mod tests {
             enabled: true,
             target_origin: "https://node.example".into(),
             return_origin: "https://share.tinycloud.xyz".into(),
-            email_origin: Some("https://email.tinycloud.xyz".into()),
+            email_origin: Some("https://witness.credentials.org".into()),
             invitation_public_key: Some(encode_config(
                 node_secret.share_invitation_public_key(),
                 URL_SAFE_NO_PAD,
@@ -7660,7 +7660,7 @@ mod tests {
         );
         assert_eq!(
             delivery_receipt["admission"]["audience"],
-            "https://email.tinycloud.xyz"
+            "https://witness.credentials.org"
         );
         if std::env::var("TC498_EMIT_DELIVERY_RECEIPT").as_deref() == Ok("1") {
             let request = delivery_receipt["request"].clone();

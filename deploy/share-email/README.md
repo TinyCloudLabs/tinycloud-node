@@ -22,11 +22,14 @@ The trust bundle must bind these production origins:
 
 - `shareOrigin`: `https://share.tinycloud.xyz`
 - `registryOrigin`: `https://registry.tinycloud.xyz` (node discovery only)
-- `emailOrigin`: `https://email.tinycloud.xyz`
+- `emailOrigin`: `https://witness.credentials.org`
 - the exact owner-node origin and node/enforcer identities
 
-`emailOrigin` is required and becomes the audience of the short-lived,
-single-use delivery authorization. The node validates the requested recipient,
+`emailOrigin` is the separately validated audience of the short-lived,
+single-use generic credential-invitation authorization. It currently equals
+the OpenCredentials issuer origin because that origin receives
+`POST /v1/credential-invitations`; the Node does not infer it from credential
+issuance metadata. The node validates the requested recipient,
 share URL, label, issuer, audience, expiry, and JTI against the registered
 delegation before it signs. The email delivery service can then send that exact invitation;
 it cannot mint policy, read content, proxy an invocation, or receive a bearer

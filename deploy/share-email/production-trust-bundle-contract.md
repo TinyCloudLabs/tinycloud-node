@@ -13,9 +13,12 @@ origins are exact strings:
 - `shareOrigin` and `returnOrigin`: `https://share.tinycloud.xyz`
 - `registryOrigin`: `https://registry.tinycloud.xyz`
 - `credentialsOrigin`: `https://witness.credentials.org`
-- `emailOrigin`: `https://email.tinycloud.xyz`
+- `emailOrigin`: `https://witness.credentials.org`
 
-`emailOrigin` is the delivery-receipt audience, not a route served by Node.
+`emailOrigin` is the independently checked generic invitation-delivery
+audience, currently co-located with credential issuance at
+`https://witness.credentials.org`. It is not a route served by Node and must
+match the origin receiving `POST /v1/credential-invitations`.
 Node exposes Policy/v3 admission/control and ordinary `/delegate` and `/invoke`
 data-plane routes only; it does not expose `/share` routes or proxy delivery.
 
@@ -58,8 +61,8 @@ sets `TINYCLOUD_SHARE_EMAIL_TRUST_BUNDLE` to the reviewed JSON file and uses
 `trust_bundle_path`.
 
 Do not set both sources. Do not create a substitute `api.share.tinycloud.xyz`
-audience: Node rejects it in non-fixture builds. Share must update its
-downstream bundle producer to emit `https://email.tinycloud.xyz` before it
-removes or rotates its legacy bundle. Node validates this contract before
+or `email.tinycloud.xyz` audience: Node rejects it in non-fixture builds.
+Share must emit the generic OpenCredentials origin before it removes or
+rotates its legacy bundle. Node validates this contract before
 advertising share-email readiness, so a missing, malformed, mismatched, or
 fixture bundle fails closed.
