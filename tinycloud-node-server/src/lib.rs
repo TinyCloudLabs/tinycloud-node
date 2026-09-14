@@ -215,6 +215,11 @@ fn sqlite_connect_options(database: &str) -> ConnectOptions {
     connect_opts
 }
 
+fn node_replay_cache(tinycloud: &TinyCloud) -> InvocationReplayCache {
+    InvocationReplayCache::new(tinycloud.connection().clone())
+        .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock())
+}
+
 pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     let tinycloud_config = config.extract::<Config>()?;
     app_with_control(config, &tinycloud_config, None).await
@@ -492,7 +497,7 @@ pub async fn app_with_control(
         tinycloud_config.storage.limit,
         std::env::var("TINYCLOUD_QUOTA_URL").ok(),
     );
-    let invocation_replay_cache = InvocationReplayCache::new(seed_conn.clone());
+    let invocation_replay_cache = node_replay_cache(&tinycloud);
     let replay_cleanup = invocation_replay_cache.clone();
     // TC-341: the periodic sweep also reclaims rows beyond the lifetime cap.
     let replay_max_lifetime_secs = tinycloud_config.invocation.max_lifetime_secs;
