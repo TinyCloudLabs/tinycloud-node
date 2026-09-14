@@ -5,6 +5,10 @@
 //! policy-session UCAN: the sibling-root registration, signed status, the
 //! challenge/claim replay boundary, and the first-admission gate.
 
+use aes_gcm::{
+    aead::{Aead, KeyInit, Payload as AeadPayload},
+    Aes256Gcm, Nonce,
+};
 use base64::{decode_config, encode_config, URL_SAFE_NO_PAD};
 use rand::RngCore;
 use rocket::{http::Status, serde::json::Json, State};
@@ -68,6 +72,15 @@ const CAPABILITY_CEILING_DOMAIN: &[u8] = b"xyz.tinycloud.policy/PolicyCapability
 const NATIVE_PROJECTION_DOMAIN: &[u8] = b"xyz.tinycloud.policy/NativeProjection/v1\0";
 const MAX_SESSION_TTL_SECONDS: i64 = 60;
 const DELIVERY_ADMISSION_DOMAIN: &[u8] = b"xyz.tinycloud.policy/delivery-admission/v0\0";
+const SEALED_ENVELOPE_AAD: &[u8] = b"tinycloud-share-envelope-v1";
+const SEALED_ENVELOPE_VERSION: u8 = 1;
+const SEALED_ENVELOPE_NONCE_BYTES: usize = 12;
+const SEALED_ENVELOPE_TAG_BYTES: usize = 16;
+const MAX_SEALED_ENVELOPE_BYTES: usize = 4 * 1024 * 1024;
+// The reviewed `tinycloud.email-proof/v1` descriptor defines a 300-second
+// freshness bound for its non-revocable status. This is pinned here rather
+// than trusting the unsigned transport envelope around the SD-JWT.
+const EMAIL_PROOF_STATUS_FRESHNESS_SECONDS: i64 = 300;
 const INVITATION_REQUEST_SCHEMA: &str = "xyz.tinycloud.credentials/invitation-request/v1";
 const DELIVERY_ADMISSION_SCHEMA: &str = "xyz.tinycloud.policy/delivery-admission/v0";
 
@@ -777,6 +790,8 @@ pub struct RegisterResponse {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeliveryAuthorizationRequest {
     pub envelope: Value,
+    pub sealed_envelope: String,
+    pub envelope_key: String,
     pub share_cid: String,
     pub recipient_email: String,
     pub share_url: String,
@@ -814,15 +829,78 @@ fn delivery_email(value: &str) -> Option<String> {
     ))
 }
 
-fn v3_delivery_url_matches(url: &str, origin: &str, share_cid: &str, envelope: &Value) -> bool {
-    let prefix = format!("{origin}/viewer?tc2=");
+/// The Share SDK stores the signed recipient envelope as a versioned,
+/// AES-256-GCM sealed blob.  The public URL addresses only that ciphertext;
+/// its decryption key is a fragment and must never be sent in a query string.
+fn v3_delivery_url_matches(
+    url: &str,
+    origin: &str,
+    share_cid: &str,
+    sealed_envelope: &str,
+    envelope_key: &str,
+    envelope: &Value,
+) -> bool {
+    let Ok(sealed) = decode_config(sealed_envelope, URL_SAFE_NO_PAD) else {
+        return false;
+    };
+    let Ok(key) = decode_config(envelope_key, URL_SAFE_NO_PAD) else {
+        return false;
+    };
+    if encode_config(&sealed, URL_SAFE_NO_PAD) != sealed_envelope
+        || sealed.len() < 1 + SEALED_ENVELOPE_NONCE_BYTES + SEALED_ENVELOPE_TAG_BYTES
+        || sealed.len() > MAX_SEALED_ENVELOPE_BYTES
+        || sealed[0] != SEALED_ENVELOPE_VERSION
+        || encode_config(&key, URL_SAFE_NO_PAD) != envelope_key
+        || key.len() != 32
+    {
+        return false;
+    }
+    let sealed_cid = tinycloud_auth::ipld_core::cid::Cid::new_v1(
+        0x55,
+        tinycloud_auth::multihash_codetable::Code::Sha2_256.digest(&sealed),
+    )
+    .to_string();
+    if sealed_cid != share_cid {
+        return false;
+    }
+    let nonce = Nonce::from(
+        <[u8; SEALED_ENVELOPE_NONCE_BYTES]>::try_from(&sealed[1..1 + SEALED_ENVELOPE_NONCE_BYTES])
+            .expect("sealed envelope nonce length is fixed"),
+    );
+    let Ok(cipher) = Aes256Gcm::new_from_slice(&key) else {
+        return false;
+    };
+    let Ok(plaintext) = cipher.decrypt(
+        &nonce,
+        AeadPayload {
+            msg: &sealed[1 + SEALED_ENVELOPE_NONCE_BYTES..],
+            aad: SEALED_ENVELOPE_AAD,
+        },
+    ) else {
+        return false;
+    };
+    if plaintext != canonical_json_value(envelope) {
+        return false;
+    }
+
+    // Compact links are the normal Share SDK form. The path is the ciphertext
+    // CID; only the fragment carries the decryption key.
+    if url == format!("{origin}/s/{share_cid}#k={envelope_key}") {
+        return true;
+    }
+
+    // The SDK also supports a sealed inline form. Its complete payload stays
+    // in the fragment, so no recipient material reaches HTTP logs either.
+    let prefix = format!("{origin}/s/inline#v=2&p=");
     let Some(encoded) = url.strip_prefix(&prefix) else {
         return false;
     };
     let Ok(bytes) = decode_config(encoded, URL_SAFE_NO_PAD) else {
         return false;
     };
-    if encode_config(&bytes, URL_SAFE_NO_PAD) != encoded || bytes.len() > 4 * 1024 * 1024 {
+    if encode_config(&bytes, URL_SAFE_NO_PAD) != encoded
+        || bytes.len() > MAX_SEALED_ENVELOPE_BYTES * 2
+    {
         return false;
     }
     let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
@@ -831,24 +909,12 @@ fn v3_delivery_url_matches(url: &str, origin: &str, share_cid: &str, envelope: &
     let Some(payload) = value.as_object() else {
         return false;
     };
-    let Some(envelope_bytes) = payload
-        .get("c")
-        .and_then(Value::as_str)
-        .and_then(|value| decode_config(value, URL_SAFE_NO_PAD).ok())
-    else {
-        return false;
-    };
-    let envelope_cid = tinycloud_auth::ipld_core::cid::Cid::new_v1(
-        0x55,
-        tinycloud_auth::multihash_codetable::Code::Sha2_256.digest(&envelope_bytes),
-    )
-    .to_string();
-    payload.len() == 3
+    payload.len() == 4
         && payload.get("v").and_then(Value::as_u64) == Some(2)
+        && payload.get("c").and_then(Value::as_str) == Some(sealed_envelope)
         && payload.get("cid").and_then(Value::as_str) == Some(share_cid)
+        && payload.get("k").and_then(Value::as_str) == Some(envelope_key)
         && canonical_json_value(&value) == bytes
-        && envelope_bytes == canonical_json_value(envelope)
-        && envelope_cid == share_cid
 }
 
 fn v3_registration_is_live(
@@ -1026,6 +1092,8 @@ pub async fn authorize_delivery(
             &request.share_url,
             &delivery.return_origin,
             &request.share_cid,
+            &request.sealed_envelope,
+            &request.envelope_key,
             &request.envelope,
         )
         || tinycloud_auth::ipld_core::cid::Cid::try_from(request.share_cid.as_str()).is_err()
@@ -5401,6 +5469,26 @@ struct VerifiedOpenCredential {
     credential_digest: String,
 }
 
+fn pinned_profile_status_freshness_seconds(
+    projection: &serde_json::Map<String, Value>,
+    trusted_issuer: &IssuerKey,
+) -> Option<i64> {
+    let profile = projection
+        .get("profile")
+        .and_then(Value::as_object)
+        .and_then(|profile| profile.get("id"))
+        .and_then(Value::as_str);
+    let credential_type = projection
+        .get("credentialType")
+        .and_then(Value::as_object)
+        .and_then(|credential_type| credential_type.get("id"))
+        .and_then(Value::as_str);
+    (profile == Some("tinycloud.email-proof/v1")
+        && credential_type == Some("opencredentials.email/v1")
+        && trusted_issuer.vct == "opencredentials.email/v1")
+        .then_some(EMAIL_PROOF_STATUS_FRESHNESS_SECONDS)
+}
+
 fn verify_opencredentials_credential(
     envelope: &Value,
     requirement: &Value,
@@ -5601,7 +5689,13 @@ fn verify_opencredentials_credential(
             "credential-requirement-not-satisfied".into(),
         ));
     }
-    validate_credential_time(envelope, &disclosed, requirement, now)?;
+    validate_credential_time(
+        envelope,
+        &disclosed,
+        requirement,
+        pinned_profile_status_freshness_seconds(projection, trusted_issuer),
+        now,
+    )?;
     let credential_id = disclosed
         .get("jti")
         .and_then(Value::as_str)
@@ -5700,6 +5794,7 @@ fn validate_credential_time(
     envelope: &serde_json::Map<String, Value>,
     disclosed: &serde_json::Map<String, Value>,
     requirement: &Value,
+    status_freshness_seconds: Option<i64>,
     now: OffsetDateTime,
 ) -> Result<(), (Status, String)> {
     let issued = parse_time(
@@ -5723,27 +5818,6 @@ fn validate_credential_time(
             .ok_or((Status::Forbidden, "credential-time-invalid".into()))?,
     )
     .map_err(|_| (Status::Forbidden, "credential-time-invalid".into()))?;
-    // `tinycloud.email-proof/v1` has a non-revocable (`method: none`)
-    // credential status. Its descriptor freshness is therefore a mandatory
-    // age bound, not informational metadata. Apply it to both the account
-    // and accountless paths, which share this verifier.
-    let profile_requires_status_freshness = envelope
-        .get("profile")
-        .and_then(Value::as_object)
-        .and_then(|profile| profile.get("id"))
-        .and_then(Value::as_str)
-        == Some("tinycloud.email-proof/v1");
-    let status_freshness = profile_requires_status_freshness
-        .then(|| {
-            envelope
-                .get("status")
-                .and_then(Value::as_object)
-                .and_then(|status| status.get("freshnessSeconds"))
-                .and_then(Value::as_u64)
-                .and_then(|seconds| i64::try_from(seconds).ok())
-                .filter(|seconds| *seconds > 0)
-        })
-        .flatten();
     if issued > now
         || not_before > now
         || expires <= now
@@ -5754,8 +5828,7 @@ fn validate_credential_time(
             .get("maxAgeSeconds")
             .and_then(Value::as_i64)
             .is_some_and(|max_age| now - issued > Duration::seconds(max_age))
-        || profile_requires_status_freshness
-            && status_freshness.is_none_or(|seconds| now - issued > Duration::seconds(seconds))
+        || status_freshness_seconds.is_some_and(|seconds| now - issued > Duration::seconds(seconds))
     {
         return Err((Status::Forbidden, "credential-time-invalid".into()));
     }
@@ -6337,35 +6410,31 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        assert!(validate_credential_time(&base, &disclosed, &requirement, now).is_ok());
+        assert!(validate_credential_time(&base, &disclosed, &requirement, None, now).is_ok());
 
-        // `method: none` makes descriptor freshness the only revocation-age
-        // bound for this credential profile. The shared verifier covers both
-        // account and accountless admission paths.
-        let mut status_bounded = base.clone();
-        status_bounded.insert(
-            "profile".into(),
-            json!({"id": "tinycloud.email-proof/v1", "version": 1}),
-        );
-        status_bounded.insert(
-            "status".into(),
-            json!({"method": "none", "freshnessSeconds": 30}),
-        );
-        assert!(validate_credential_time(&status_bounded, &disclosed, &requirement, now).is_ok());
-        status_bounded["status"]["freshnessSeconds"] = json!(29);
-        assert!(validate_credential_time(&status_bounded, &disclosed, &requirement, now).is_err());
-        status_bounded.remove("status");
-        assert!(validate_credential_time(&status_bounded, &disclosed, &requirement, now).is_err());
+        // The caller obtains descriptor freshness from authenticated profile
+        // material; envelope status is deliberately not an input here.
+        assert!(validate_credential_time(&base, &disclosed, &requirement, Some(30), now).is_ok());
+        assert!(validate_credential_time(
+            &base,
+            &disclosed,
+            &requirement,
+            Some(30),
+            now + Duration::seconds(31),
+        )
+        .is_err());
 
         let mut not_yet_valid = base.clone();
         not_yet_valid.insert("notBefore".into(), json!("2026-08-07T16:00:31Z"));
-        assert!(validate_credential_time(&not_yet_valid, &disclosed, &requirement, now).is_err());
+        assert!(
+            validate_credential_time(&not_yet_valid, &disclosed, &requirement, None, now).is_err()
+        );
         let mut expired = base.clone();
         expired.insert("expiresAt".into(), json!("2026-08-07T16:00:30Z"));
-        assert!(validate_credential_time(&expired, &disclosed, &requirement, now).is_err());
+        assert!(validate_credential_time(&expired, &disclosed, &requirement, None, now).is_err());
         let mut malformed = base;
         malformed.insert("notBefore".into(), json!("not-a-time"));
-        assert!(validate_credential_time(&malformed, &disclosed, &requirement, now).is_err());
+        assert!(validate_credential_time(&malformed, &disclosed, &requirement, None, now).is_err());
     }
 
     fn credential_envelope_stub(projection: &Value, holder: &str) -> Value {
@@ -6543,6 +6612,37 @@ mod tests {
         assert!(validate_policy_document(&altered, &altered_bytes, &cid).is_err());
     }
 
+    fn seal_delivery_envelope(
+        envelope: &Value,
+        key: [u8; 32],
+        nonce: [u8; SEALED_ENVELOPE_NONCE_BYTES],
+    ) -> (String, String, String) {
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let ciphertext = cipher
+            .encrypt(
+                &Nonce::from(nonce),
+                AeadPayload {
+                    msg: &canonical_json_value(envelope),
+                    aad: SEALED_ENVELOPE_AAD,
+                },
+            )
+            .unwrap();
+        let mut sealed = Vec::with_capacity(1 + nonce.len() + ciphertext.len());
+        sealed.push(SEALED_ENVELOPE_VERSION);
+        sealed.extend_from_slice(&nonce);
+        sealed.extend_from_slice(&ciphertext);
+        let share_cid = tinycloud_auth::ipld_core::cid::Cid::new_v1(
+            0x55,
+            tinycloud_auth::multihash_codetable::Code::Sha2_256.digest(&sealed),
+        )
+        .to_string();
+        (
+            encode_config(&sealed, URL_SAFE_NO_PAD),
+            encode_config(key, URL_SAFE_NO_PAD),
+            share_cid,
+        )
+    }
+
     fn delivery_fixture() -> (
         tinycloud_core::libp2p::identity::ed25519::Keypair,
         policy_v3_registration::Model,
@@ -6606,25 +6706,15 @@ mod tests {
             "signerDid":owner_did,
             "value":encode_config(owner.sign(&Sha256::digest(bytes)), URL_SAFE_NO_PAD),
         });
-        let envelope_bytes = canonical_json_value(&envelope);
-        let share_cid = tinycloud_auth::ipld_core::cid::Cid::new_v1(
-            0x55,
-            tinycloud_auth::multihash_codetable::Code::Sha2_256.digest(&envelope_bytes),
-        )
-        .to_string();
-        let link_payload = canonical_json_value(&json!({
-            "v": 2,
-            "c": encode_config(&envelope_bytes, URL_SAFE_NO_PAD),
-            "cid": share_cid.clone(),
-        }));
+        let (sealed_envelope, envelope_key, share_cid) =
+            seal_delivery_envelope(&envelope, [9; 32], [10; SEALED_ENVELOPE_NONCE_BYTES]);
         let request = DeliveryAuthorizationRequest {
             envelope,
+            sealed_envelope,
+            envelope_key: envelope_key.clone(),
             share_cid: share_cid.clone(),
             recipient_email: "alice@example.com".into(),
-            share_url: format!(
-                "https://share.tinycloud.xyz/viewer?tc2={}",
-                encode_config(link_payload, URL_SAFE_NO_PAD)
-            ),
+            share_url: format!("https://share.tinycloud.xyz/s/{share_cid}#k={envelope_key}"),
             document_name: "report.pdf".into(),
             jti: encode_config([7_u8; 16], URL_SAFE_NO_PAD),
             expires_at: "2026-08-06T12:05:00Z".into(),
@@ -6674,12 +6764,14 @@ mod tests {
     }
 
     #[test]
-    fn v3_delivery_rejects_cid_not_bound_to_public_envelope() {
+    fn v3_delivery_binds_cid_to_the_sealed_envelope() {
         let (_, _, delivery, request) = delivery_fixture();
         assert!(v3_delivery_url_matches(
             &request.share_url,
             &delivery.return_origin,
             &request.share_cid,
+            &request.sealed_envelope,
+            &request.envelope_key,
             &request.envelope,
         ));
 
@@ -6688,6 +6780,8 @@ mod tests {
             &request.share_url,
             &delivery.return_origin,
             altered_cid,
+            &request.sealed_envelope,
+            &request.envelope_key,
             &request.envelope,
         ));
     }
@@ -6698,12 +6792,17 @@ mod tests {
         for altered_url in [
             format!("{}#k=secret", request.share_url),
             format!("{}&k=secret", request.share_url),
-            request.share_url.replace("?tc2=", "#tc2="),
+            format!(
+                "https://share.tinycloud.xyz/viewer?tc2={}",
+                encode_config(canonical_json_value(&request.envelope), URL_SAFE_NO_PAD)
+            ),
         ] {
             assert!(!v3_delivery_url_matches(
                 &altered_url,
                 &delivery.return_origin,
                 &request.share_cid,
+                &request.sealed_envelope,
+                &request.envelope_key,
                 &request.envelope,
             ));
         }
@@ -6742,35 +6841,51 @@ mod tests {
     }
 
     #[test]
-    fn typescript_addressed_link_vector_is_byte_exact() {
-        let vector: Value = serde_json::from_str(include_str!(
-            "../test-fixtures/tc-498-addressed-link-canonicalization.json"
-        ))
-        .unwrap();
-        let envelope = &vector["envelope"];
-        let envelope_bytes = canonical_json_value(envelope);
+    fn v3_delivery_url_keeps_recipient_material_out_of_loggable_portion() {
+        let (_, registration, delivery, request) = delivery_fixture();
+        let public_url = request.share_url.split('#').next().unwrap();
         assert_eq!(
-            envelope_bytes,
-            vector["envelopeCanonical"].as_str().unwrap().as_bytes()
+            public_url,
+            format!("https://share.tinycloud.xyz/s/{}", request.share_cid)
         );
-        assert_eq!(
-            encode_config(&envelope_bytes, URL_SAFE_NO_PAD),
-            vector["envelopeBase64Url"]
-        );
-        let payload_bytes = decode_config(
-            vector["payloadBase64Url"].as_str().unwrap(),
-            URL_SAFE_NO_PAD,
-        )
-        .unwrap();
-        assert_eq!(
-            payload_bytes,
-            vector["payloadCanonical"].as_str().unwrap().as_bytes()
-        );
+        assert!(!public_url.contains("?"));
+        assert!(!public_url.contains("alice@example.com"));
         assert!(v3_delivery_url_matches(
-            vector["shareUrl"].as_str().unwrap(),
-            "https://share.tinycloud.xyz",
-            vector["shareCid"].as_str().unwrap(),
-            envelope,
+            &request.share_url,
+            &delivery.return_origin,
+            &request.share_cid,
+            &request.sealed_envelope,
+            &request.envelope_key,
+            &request.envelope,
+        ));
+        assert!(v3_envelope_delivery_projection(
+            &request.envelope,
+            &registration,
+            &delivery,
+            &request,
+        )
+        .is_ok());
+
+        let inline_payload = canonical_json_value(&json!({
+            "v": 2,
+            "c": request.sealed_envelope,
+            "cid": request.share_cid,
+            "k": request.envelope_key,
+        }));
+        let inline_url = format!(
+            "https://share.tinycloud.xyz/s/inline#v=2&p={}",
+            encode_config(inline_payload, URL_SAFE_NO_PAD)
+        );
+        let inline_public_url = inline_url.split('#').next().unwrap();
+        assert_eq!(inline_public_url, "https://share.tinycloud.xyz/s/inline");
+        assert!(!inline_public_url.contains("alice@example.com"));
+        assert!(v3_delivery_url_matches(
+            &inline_url,
+            &delivery.return_origin,
+            &request.share_cid,
+            &request.sealed_envelope,
+            &request.envelope_key,
+            &request.envelope,
         ));
     }
 
@@ -7001,6 +7116,30 @@ mod tests {
             vector["policyProjection"]["issuerKid"].as_str().unwrap(),
             issuer_key.public().to_bytes(),
         );
+        let projection_object = projection.as_object().unwrap();
+        assert!(verify_opencredentials_credential(
+            &credential,
+            &requirement,
+            projection_object,
+            &issuer,
+            &holder_did,
+            issued + Duration::seconds(299),
+        )
+        .is_ok());
+        // The compact SD-JWT remains issuer-signed after this mutation. The
+        // unsigned transport envelope must not be able to extend its pinned
+        // descriptor freshness window.
+        let mut freshness_mutated = credential.clone();
+        freshness_mutated["status"]["freshnessSeconds"] = json!(3600);
+        assert!(verify_opencredentials_credential(
+            &freshness_mutated,
+            &requirement,
+            projection_object,
+            &issuer,
+            &holder_did,
+            issued + Duration::seconds(301),
+        )
+        .is_err());
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let delivery_config = ShareEmailConfig {
             enabled: true,
@@ -7424,9 +7563,9 @@ mod tests {
         assert_eq!(register_status, Status::Ok, "register: {register_body}");
         let registered: Value = serde_json::from_str(&register_body)?;
 
-        // Exercise the exact TS/Rust seam used before email delivery accepts an
-        // email: owner-signed public envelope -> canonical tc2 link -> real
-        // ordinary invocation -> Node-signed delivery admission.
+        // Exercise the exact SDK/Rust seam used before email delivery accepts
+        // an email: owner-signed envelope -> sealed `/s/<cid>#k=<key>` link
+        // -> real ordinary invocation -> Node-signed delivery admission.
         let mut delivery_envelope = json!({
             "version": 3,
             "shareId": "share-tc-470",
@@ -7455,25 +7594,18 @@ mod tests {
             "signerDid":owner_did,
             "value":encode_config(owner_key.sign(&Sha256::digest(envelope_preimage)), URL_SAFE_NO_PAD),
         });
-        let envelope_bytes = canonical_json_value(&delivery_envelope);
-        let share_cid = tinycloud_auth::ipld_core::cid::Cid::new_v1(
-            0x55,
-            tinycloud_auth::multihash_codetable::Code::Sha2_256.digest(&envelope_bytes),
-        )
-        .to_string();
-        let link_payload = canonical_json_value(&json!({
-            "v": 2,
-            "c": encode_config(&envelope_bytes, URL_SAFE_NO_PAD),
-            "cid": share_cid,
-        }));
+        let (sealed_envelope, envelope_key, share_cid) = seal_delivery_envelope(
+            &delivery_envelope,
+            [11; 32],
+            [12; SEALED_ENVELOPE_NONCE_BYTES],
+        );
         let mut delivery_request = DeliveryAuthorizationRequest {
             envelope: delivery_envelope,
+            sealed_envelope,
+            envelope_key: envelope_key.clone(),
             share_cid: share_cid.clone(),
             recipient_email: "alice@example.test".into(),
-            share_url: format!(
-                "https://share.tinycloud.xyz/viewer?tc2={}",
-                encode_config(link_payload, URL_SAFE_NO_PAD)
-            ),
+            share_url: format!("https://share.tinycloud.xyz/s/{share_cid}#k={envelope_key}"),
             document_name: "document.txt".into(),
             jti: encode_config([8_u8; 16], URL_SAFE_NO_PAD),
             expires_at: format_time(OffsetDateTime::now_utc() + Duration::minutes(4)),

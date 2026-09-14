@@ -19,6 +19,14 @@ origins are exact strings:
 Node exposes Policy/v3 admission/control and ordinary `/delegate` and `/invoke`
 data-plane routes only; it does not expose `/share` routes or proxy delivery.
 
+For addressed delivery, Share sends the SDK's `sealedEnvelope` and
+`envelopeKey` request fields. The recipient-bearing, owner-signed envelope is
+AES-256-GCM sealed; its CID addresses `/s/<cid>` and its envelope key is kept
+only in `#k=<key>`. This key unwraps share-envelope metadata, not document
+content. Node rejects plaintext recipient envelopes in a query or path and
+checks that the sealed CID, decrypted canonical envelope, exact recipient, and
+delivery authorization all agree.
+
 The node identity must be internally exact, not merely a canonical DID:
 
 - `nodeAudience` is `did:web:<nodeOrigin host>`;
