@@ -14,6 +14,11 @@ use serde_with::{
 use std::{fs, path::PathBuf};
 use tinycloud_core::keys::StaticSecret;
 
+/// The independently operated email delivery service that may consume a
+/// node-authorized receipt in production. Keep this exact origin pinned: a
+/// syntactically valid alternate host is a different audience.
+const PRODUCTION_SHARE_EMAIL_ORIGIN: &str = "https://email.tinycloud.xyz";
+
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Hash, PartialEq, Eq)]
 pub struct Config {
     pub log: Logging,
@@ -450,7 +455,7 @@ struct ShareEmailTrustBundle {
     registry_origin: String,
     credentials_origin: String,
     /// Exact audience allowed to consume a node-authorized delivery receipt.
-    /// This is required because `api.share` must never accept a receipt minted
+    /// This is required because the email delivery service must never accept a receipt minted
     /// for another service.
     email_origin: String,
     node_origin: String,
@@ -479,6 +484,7 @@ impl ShareEmailTrustBundle {
             || !canonical_https_origin(&self.registry_origin)
             || self.credentials_origin != "https://witness.credentials.org"
             || !canonical_https_origin(&self.email_origin)
+            || (!allows_hermetic_fixture() && self.email_origin != PRODUCTION_SHARE_EMAIL_ORIGIN)
             || (!canonical_https_origin(&self.node_origin) && !fixture_node_origin)
             || self.node_audience
                 != format!(
@@ -1275,7 +1281,7 @@ mod tests {
 
     /// The exact `emailOrigin` the committed production document carries.
     /// Share's schema requires the field; the node's must accept it.
-    const PRODUCTION_EMAIL_ORIGIN: &str = "https://api.share.tinycloud.xyz";
+    const PRODUCTION_EMAIL_ORIGIN: &str = PRODUCTION_SHARE_EMAIL_ORIGIN;
 
     fn bundle_document(config: &ShareEmailConfig) -> serde_json::Value {
         serde_json::json!({
@@ -1447,13 +1453,15 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_email_origin_is_rejected() {
         for malformed in [
-            "http://api.share.tinycloud.xyz",
-            "https://api.share.tinycloud.xyz/send",
-            "https://api.share.tinycloud.xyz/?queue=1",
-            "https://api.share.tinycloud.xyz#fragment",
-            "https://operator:secret@api.share.tinycloud.xyz",
-            "https://api.share.tinycloud.xyz:8443",
-            "api.share.tinycloud.xyz",
+            "http://email.tinycloud.xyz",
+            "https://email.tinycloud.xyz/send",
+            "https://email.tinycloud.xyz/?queue=1",
+            "https://email.tinycloud.xyz#fragment",
+            "https://operator:secret@email.tinycloud.xyz",
+            "https://email.tinycloud.xyz:8443",
+            "email.tinycloud.xyz",
+            // Correct shape, but an unreviewed production audience.
+            "https://api.share.tinycloud.xyz",
             "",
             // Caught by the placeholder scan rather than the origin shape.
             "https://email.localhost",

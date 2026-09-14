@@ -12,17 +12,23 @@ one copy of the reviewed trust bundle either as a read-only file through
 both is a startup error. Private keys, database passwords, credentials, and
 delivery tokens do not belong in this file.
 
+The durable production hand-off is the
+[production trust-bundle contract](production-trust-bundle-contract.md). Share
+owns the reviewed bundle after Share#102 removes its former copy; Node owns the
+fail-closed reader and must receive the same bytes through the documented
+environment contract before a release can boot.
+
 The trust bundle must bind these production origins:
 
 - `shareOrigin`: `https://share.tinycloud.xyz`
 - `registryOrigin`: `https://registry.tinycloud.xyz` (node discovery only)
-- `emailOrigin`: `https://api.share.tinycloud.xyz`
+- `emailOrigin`: `https://email.tinycloud.xyz`
 - the exact owner-node origin and node/enforcer identities
 
 `emailOrigin` is required and becomes the audience of the short-lived,
 single-use delivery authorization. The node validates the requested recipient,
 share URL, label, issuer, audience, expiry, and JTI against the registered
-delegation before it signs. `api.share` can then send that exact invitation;
+delegation before it signs. The email delivery service can then send that exact invitation;
 it cannot mint policy, read content, proxy an invocation, or receive a bearer
 fragment.
 
