@@ -8,12 +8,20 @@ pub(super) fn command(
     ability: &str,
     caveats: &Option<SqlCaveats>,
 ) -> Result<Option<serde_json::Value>, (Status, String)> {
-    let SqlRequest::ExecuteStatement { name, params } = request else {
-        return Ok(None);
+    let params = match request {
+        SqlRequest::ExecuteStatement { name, params } if name == publication::STATEMENT => params,
+        SqlRequest::Execute {
+            sql,
+            params,
+            schema,
+        } if sql == publication::STATEMENT => {
+            if schema.is_some() {
+                return Err((Status::BadRequest, "publication_schema_forbidden".into()));
+            }
+            params
+        }
+        _ => return Ok(None),
     };
-    if name != publication::STATEMENT {
-        return Ok(None);
-    }
     if path != Some(publication::SQL_PATH)
         || !tinycloud_core::policy_capability::ability_matches(ability, "tinycloud.sql/write")
         || caveats.is_some()
@@ -328,6 +336,38 @@ mod tests {
             .unwrap()["operation"],
             "capabilities"
         );
+    }
+    #[test]
+    fn publication_route_accepts_fixed_execute_without_schema() {
+        let request = SqlRequest::Execute {
+            sql: publication::STATEMENT.into(),
+            params: vec![SqlValue::Text(
+                serde_json::json!({"contractVersion":3,"operation":"capabilities"}).to_string(),
+            )],
+            schema: None,
+        };
+        assert!(command(
+            &request,
+            Some(publication::SQL_PATH),
+            "tinycloud.sql/write",
+            &None
+        )
+        .unwrap()
+        .is_some());
+        let SqlRequest::Execute { sql, params, .. } = request else {
+            unreachable!()
+        };
+        assert!(command(
+            &SqlRequest::Execute {
+                sql,
+                params,
+                schema: Some(vec!["DROP TABLE connector_meeting".into()])
+            },
+            Some(publication::SQL_PATH),
+            "tinycloud.sql/write",
+            &None
+        )
+        .is_err());
     }
     #[rocket::post("/", data = "<data>")]
     async fn framing(data: rocket::Data<'_>) -> Result<String, (Status, String)> {
