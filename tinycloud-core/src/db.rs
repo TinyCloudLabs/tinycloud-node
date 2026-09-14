@@ -1312,6 +1312,12 @@ where
         )
         .await
         .map(|_| ())
+        .or_else(|error| match error {
+            TxStoreError::Tx(TxError::InvalidInvocation(
+                crate::models::invocation::InvocationError::MissingKvWrite(_),
+            )) => Ok(()),
+            error => Err(error),
+        })
     }
     async fn invoke_internal_kv_change<S>(
         &self,
@@ -4012,6 +4018,36 @@ mod test {
     #[tokio::test]
     async fn basic() {
         let _db = get_db().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn publication_cleanup_accepts_already_absent_legacy_keys() {
+        use sea_orm::ActiveValue::Set;
+        let db = get_db().await.map_err(|error| error.to_string()).unwrap();
+        let space = test_space_id("publication-delete-absent");
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&db.conn)
+        .await
+        .map_err(|error| error.to_string())
+        .unwrap();
+        let key: Path = "xyz.tinycloud.tinychat/connectors/fireflies/transcript/absent"
+            .parse()
+            .unwrap();
+        db.invoke_internal_meeting_snapshot_delete::<crate::storage::memory::MemoryStaging>(
+            space.clone(),
+            key.clone(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+        .unwrap();
+        db.invoke_internal_meeting_snapshot_delete::<crate::storage::memory::MemoryStaging>(
+            space, key,
+        )
+        .await
+        .map_err(|error| error.to_string())
+        .unwrap();
     }
 
     #[test]

@@ -183,7 +183,7 @@ fn schema(conn: &Connection) -> Result<(), SqlError> {
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS connector_publication_identity ON connector_meeting(source,source_id)",[]).map_err(sql)?;
     }
     conn.execute("UPDATE connector_meeting SET publication_state='unavailable',publication_unavailable_reason='original_not_verified' WHERE head_revision IS NULL AND (publication_state IS NULL OR publication_state='unverified')",[]).map_err(sql)?;
-    conn.execute("UPDATE connector_meeting SET publication_state='unavailable',publication_unavailable_reason='identity_collision' WHERE (source,source_id) IN (SELECT source,source_id FROM connector_meeting GROUP BY source,source_id HAVING COUNT(*)>1)",[]).map_err(sql)?;
+    conn.execute("UPDATE connector_meeting SET publication_state='unavailable',publication_unavailable_reason='identity_collision' WHERE (publication_state IS NULL OR publication_state != 'deleted') AND (source,source_id) IN (SELECT source,source_id FROM connector_meeting GROUP BY source,source_id HAVING COUNT(*)>1)",[]).map_err(sql)?;
     conn.execute("INSERT INTO connector_publication_control VALUES(1,1) ON CONFLICT(id) DO UPDATE SET active=1",[]).map_err(sql)?;
     Ok(())
 }
@@ -731,5 +731,22 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!(new)));
+    }
+    #[test]
+    fn publication_reactivation_keeps_legacy_collision_tombstones_deleted() {
+        let conn = ready();
+        conn.execute("DROP INDEX connector_publication_identity", [])
+            .unwrap();
+        conn.execute("INSERT INTO connector_meeting(id,source,source_id,created_at,updated_at,publication_state) VALUES('a','fireflies','collision','now','now','deleted'),('b','fireflies','collision','now','now','deleted')",[]).unwrap();
+        call(&conn, json!({"operation":"activate"})).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM connector_meeting WHERE publication_state='deleted'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
     }
 }
