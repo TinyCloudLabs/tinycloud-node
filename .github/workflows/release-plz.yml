@@ -20,8 +20,8 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install reviewed Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.1
 
       - name: Run release-plz
         id: release_pr
@@ -80,8 +80,8 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install reviewed Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.1
 
       - name: Run release-plz release
         uses: release-plz/action@v0.5

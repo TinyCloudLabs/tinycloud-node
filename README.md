@@ -79,7 +79,9 @@ With telemetry enabled, backend time-to-first-byte is recorded under the `server
 
 ## Quickstart
 
-To run TinyCloud Protocol locally you will need the latest version of [rust](https://rustup.rs).
+To run TinyCloud Protocol locally, install [Rustup](https://rustup.rs). The
+repository selects the reviewed Rust `1.97.1` toolchain automatically through
+`rust-toolchain.toml`; do not substitute a floating `stable` compiler.
 
 
 You will need to create a directory for TinyCloud Protocol to store data in:

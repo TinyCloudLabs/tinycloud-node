@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.1
 
       - name: Test the public descriptor exporter
         run: cargo test -p tinycloud-node --bin export-share-invitation-descriptor
