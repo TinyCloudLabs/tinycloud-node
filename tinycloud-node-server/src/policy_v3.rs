@@ -786,7 +786,7 @@ pub struct RegisterResponse {
     pub enforcement_root_cid: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeliveryAuthorizationRequest {
     pub envelope: Value,
@@ -808,6 +808,24 @@ fn delivery_request_digest(request: &DeliveryAuthorizationRequest) -> Result<Str
         Sha256::digest(canonical_json_value(&value)),
         URL_SAFE_NO_PAD,
     ))
+}
+
+fn delivery_replay_request_matches(
+    existing: &share_invitation_authorization_jti::Model,
+    request: &DeliveryAuthorizationRequest,
+    sender_key_did: &str,
+) -> bool {
+    existing.binding_json.get("version").and_then(Value::as_u64) == Some(3)
+        && existing
+            .binding_json
+            .get("requestBodyDigest")
+            .and_then(Value::as_str)
+            == Some(request.request_body_digest.as_str())
+        && existing
+            .binding_json
+            .get("senderKeyDid")
+            .and_then(Value::as_str)
+            == Some(sender_key_did)
 }
 
 fn delivery_email(value: &str) -> Option<String> {
@@ -1061,6 +1079,80 @@ fn normal_invocation_allows_v3_delivery(
         })
 }
 
+struct DeliveryAuthorizationReceipt {
+    value: Value,
+    authorization_digest: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_delivery_authorization_receipt(
+    request: &DeliveryAuthorizationRequest,
+    registration: &policy_v3_registration::Model,
+    resource: &str,
+    credential_type: &str,
+    sender_key_did: &str,
+    audience: &str,
+    issued_at: &str,
+    runtime: &PolicyV3Runtime,
+) -> Result<DeliveryAuthorizationReceipt, (Status, String)> {
+    let invitation_request = serde_json::json!({
+        "schema": INVITATION_REQUEST_SCHEMA,
+        "policyId": registration.policy_cid,
+        "recipient": request.recipient_email,
+        "resource": resource,
+        "credentialType": credential_type,
+        "returnLink": request.share_url,
+        "envelopeRef": request.share_cid,
+        "label": request.document_name,
+        "shareExpiresAt": registration.expires_at,
+        "audience": audience,
+        "issuedAt": issued_at,
+        "expiresAt": request.expires_at,
+        "nonce": request.jti,
+    });
+    let mut admission = serde_json::json!({
+        "schema": DELIVERY_ADMISSION_SCHEMA,
+        "policyId": registration.policy_cid,
+        "ownerDid": registration.owner_did,
+        "recipient": request.recipient_email,
+        "resource": resource,
+        "actions": ["tinycloud.kv/get"],
+        "credentialType": credential_type,
+        "returnLink": request.share_url,
+        "envelopeRef": request.share_cid,
+        "label": request.document_name,
+        "shareExpiresAt": registration.expires_at,
+        "senderKeyDid": sender_key_did,
+        "audience": audience,
+        "issuedAt": issued_at,
+        "expiresAt": request.expires_at,
+        "nonce": request.jti,
+    });
+    let authorization_digest = encode_config(
+        Sha256::digest(canonical_json_value(&admission)),
+        URL_SAFE_NO_PAD,
+    );
+    let mut signed = DELIVERY_ADMISSION_DOMAIN.to_vec();
+    signed.extend_from_slice(&canonical_json_value(&admission));
+    let signature = runtime
+        .signer
+        .node_keypair()
+        .sign(&Sha256::digest(signed))
+        .map_err(|error| (Status::InternalServerError, error.to_string()))?;
+    admission["signature"] = serde_json::json!({
+        "suite": "eddsa-ed25519-sha256-jcs-v1",
+        "signerDid": runtime.node_did,
+        "value": encode_config(signature, URL_SAFE_NO_PAD),
+    });
+    Ok(DeliveryAuthorizationReceipt {
+        value: serde_json::json!({
+            "request": invitation_request,
+            "admission": admission,
+        }),
+        authorization_digest,
+    })
+}
+
 #[post("/policy/v3/deliveries/authorize", format = "json", data = "<request>")]
 pub async fn authorize_delivery(
     request: Json<DeliveryAuthorizationRequest>,
@@ -1099,6 +1191,16 @@ pub async fn authorize_delivery(
         || tinycloud_auth::ipld_core::cid::Cid::try_from(request.share_cid.as_str()).is_err()
     {
         return Err((Status::BadRequest, "delivery-authorization-invalid".into()));
+    }
+    let sender_key_did = invocation.0 .0.invoker.as_str();
+    let replay = share_invitation_authorization_jti::Entity::find_by_id(request.jti.clone())
+        .one(&runtime.conn)
+        .await
+        .map_err(db_error)?;
+    if replay.as_ref().is_some_and(|existing| {
+        !delivery_replay_request_matches(existing, &request, sender_key_did)
+    }) {
+        return Err((Status::Conflict, "delivery-authorization-replayed".into()));
     }
     let policy_cid = request
         .envelope
@@ -1158,7 +1260,6 @@ pub async fn authorize_delivery(
         .get("expiry")
         .and_then(Value::as_str)
         .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
-    let policy_id = registration.policy_cid.clone();
     let credential_type = policy
         .get("credentialRequirement")
         .and_then(Value::as_object)
@@ -1170,78 +1271,108 @@ pub async fn authorize_delivery(
     if actions.as_slice() != ["read"] || credential_type != "opencredentials.email/v1" {
         return Err((Status::Forbidden, "delivery-authorization-invalid".into()));
     }
-    let invitation_request = serde_json::json!({
-        "schema": INVITATION_REQUEST_SCHEMA,
-        "policyId": policy_id,
-        "recipient": request.recipient_email,
-        "resource": resource,
-        "credentialType": credential_type,
-        "returnLink": request.share_url,
-        "envelopeRef": request.share_cid,
-        "label": request.document_name,
-        "shareExpiresAt": share_expires_at,
-        "audience": delivery.invitation_origin,
-        "issuedAt": format_time(now),
-        "expiresAt": request.expires_at,
-        "nonce": request.jti,
-    });
-    let mut admission = serde_json::json!({
-        "schema": DELIVERY_ADMISSION_SCHEMA,
-        "policyId": policy_id,
-        "ownerDid": registration.owner_did,
-        "recipient": request.recipient_email,
-        "resource": resource,
-        "actions": ["tinycloud.kv/get"],
-        "credentialType": credential_type,
-        "returnLink": request.share_url,
-        "envelopeRef": request.share_cid,
-        "label": request.document_name,
-        "shareExpiresAt": share_expires_at,
-        "senderKeyDid": invocation.0 .0.invoker,
-        "audience": delivery.invitation_origin,
-        "issuedAt": format_time(now),
-        "expiresAt": request.expires_at,
-        "nonce": request.jti,
+    if share_expires_at != registration.expires_at {
+        return Err((Status::Forbidden, "delivery-authorization-invalid".into()));
+    }
+    let binding_json = serde_json::json!({
+        "version": 3,
+        "policyCid": policy_cid,
+        "shareCid": request.share_cid,
+        "policyId": registration.policy_cid,
+        "requestBodyDigest": request.request_body_digest,
+        "senderKeyDid": sender_key_did,
     });
     let _writer = match &runtime.sqlite_writer_lock {
         Some(lock) => Some(lock.lock().await),
         None => None,
     };
-    share_invitation_authorization_jti::ActiveModel {
+    let replay = match replay {
+        Some(existing) => Some(existing),
+        None => share_invitation_authorization_jti::Entity::find_by_id(request.jti.clone())
+            .one(&runtime.conn)
+            .await
+            .map_err(db_error)?,
+    };
+    if let Some(existing) = replay {
+        if !delivery_replay_request_matches(&existing, &request, sender_key_did)
+            || existing.binding_json != binding_json
+            || existing.expires_at != request.expires_at
+            || existing.consumed_at.is_none()
+            || !parse_time(&existing.issued_at)
+                .is_ok_and(|issued_at| format_time(issued_at) == existing.issued_at)
+        {
+            return Err((Status::Conflict, "delivery-authorization-replayed".into()));
+        }
+        let receipt = build_delivery_authorization_receipt(
+            &request,
+            &registration,
+            resource,
+            credential_type,
+            sender_key_did,
+            &delivery.invitation_origin,
+            &existing.issued_at,
+            runtime,
+        )?;
+        if receipt.authorization_digest != existing.authorization_digest {
+            return Err((Status::Conflict, "delivery-authorization-replayed".into()));
+        }
+        return Ok(Json(receipt.value));
+    }
+
+    let issued_at = format_time(now);
+    let receipt = build_delivery_authorization_receipt(
+        &request,
+        &registration,
+        resource,
+        credential_type,
+        sender_key_did,
+        &delivery.invitation_origin,
+        &issued_at,
+        runtime,
+    )?;
+    let insert = share_invitation_authorization_jti::ActiveModel {
         jti: Set(request.jti.clone()),
-        authorization_digest: Set(encode_config(
-            Sha256::digest(canonical_json_value(&admission)),
-            URL_SAFE_NO_PAD,
-        )),
-        binding_json: Set(serde_json::json!({
-            "version": 3,
-            "policyCid": policy_cid,
-            "shareCid": request.share_cid,
-            "policyId": policy_id,
-        })),
-        issued_at: Set(format_time(now)),
+        authorization_digest: Set(receipt.authorization_digest.clone()),
+        binding_json: Set(binding_json.clone()),
+        issued_at: Set(issued_at),
         expires_at: Set(request.expires_at.clone()),
         consumed_at: Set(Some(format_time(now))),
     }
     .insert(&runtime.conn)
-    .await
-    .map_err(|_| (Status::Conflict, "delivery-authorization-replayed".into()))?;
-    let mut signed = DELIVERY_ADMISSION_DOMAIN.to_vec();
-    signed.extend_from_slice(&canonical_json_value(&admission));
-    let signature = runtime
-        .signer
-        .node_keypair()
-        .sign(&Sha256::digest(signed))
-        .map_err(|error| (Status::InternalServerError, error.to_string()))?;
-    admission["signature"] = serde_json::json!({
-        "suite": "eddsa-ed25519-sha256-jcs-v1",
-        "signerDid": runtime.node_did,
-        "value": encode_config(signature, URL_SAFE_NO_PAD),
-    });
-    Ok(Json(serde_json::json!({
-        "request": invitation_request,
-        "admission": admission,
-    })))
+    .await;
+    if insert.is_ok() {
+        return Ok(Json(receipt.value));
+    }
+
+    // A concurrent exact retry may have won the durable JTI insert. Recover
+    // only the same request binding; storage failures without a matching row
+    // remain fail closed.
+    let existing = share_invitation_authorization_jti::Entity::find_by_id(request.jti.clone())
+        .one(&runtime.conn)
+        .await
+        .map_err(db_error)?
+        .ok_or((Status::InternalServerError, "delivery-unavailable".into()))?;
+    if !delivery_replay_request_matches(&existing, &request, sender_key_did)
+        || existing.binding_json != binding_json
+        || existing.expires_at != request.expires_at
+        || existing.consumed_at.is_none()
+    {
+        return Err((Status::Conflict, "delivery-authorization-replayed".into()));
+    }
+    let recovered = build_delivery_authorization_receipt(
+        &request,
+        &registration,
+        resource,
+        credential_type,
+        sender_key_did,
+        &delivery.invitation_origin,
+        &existing.issued_at,
+        runtime,
+    )?;
+    if recovered.authorization_digest != existing.authorization_digest {
+        return Err((Status::Conflict, "delivery-authorization-replayed".into()));
+    }
+    Ok(Json(recovered.value))
 }
 
 #[derive(Debug, Deserialize)]
@@ -6787,6 +6918,62 @@ mod tests {
     }
 
     #[test]
+    fn v3_delivery_replay_binding_rejects_recipient_and_resource_rebinding() {
+        let (_, registration, _, mut request) = delivery_fixture();
+        let sender_key_did = "did:key:zSender";
+        request.request_body_digest = delivery_request_digest(&request).unwrap();
+        let existing = share_invitation_authorization_jti::Model {
+            jti: request.jti.clone(),
+            authorization_digest: "digest".into(),
+            binding_json: json!({
+                "version": 3,
+                "policyCid": registration.policy_cid,
+                "shareCid": request.share_cid,
+                "policyId": registration.policy_cid,
+                "requestBodyDigest": request.request_body_digest,
+                "senderKeyDid": sender_key_did,
+            }),
+            issued_at: "2026-08-06T12:00:00Z".into(),
+            expires_at: request.expires_at.clone(),
+            consumed_at: Some("2026-08-06T12:00:00Z".into()),
+        };
+        assert!(delivery_replay_request_matches(
+            &existing,
+            &request,
+            sender_key_did
+        ));
+
+        let mut rebound_recipient = request.clone();
+        rebound_recipient.recipient_email = "mallory@example.com".into();
+        rebound_recipient.request_body_digest =
+            delivery_request_digest(&rebound_recipient).unwrap();
+        assert!(!delivery_replay_request_matches(
+            &existing,
+            &rebound_recipient,
+            sender_key_did
+        ));
+
+        let mut rebound_resource = request.clone();
+        rebound_resource.envelope["contentSource"]["kvResource"] =
+            Value::String("did:key:zOwner/kv/shares/other/report.pdf".into());
+        rebound_resource.request_body_digest = delivery_request_digest(&rebound_resource).unwrap();
+        assert!(!delivery_replay_request_matches(
+            &existing,
+            &rebound_resource,
+            sender_key_did
+        ));
+        assert!(!delivery_replay_request_matches(
+            &existing,
+            &request,
+            "did:key:zDifferentSender"
+        ));
+
+        let stored = existing.binding_json.to_string();
+        assert!(!stored.contains("alice@example.com"));
+        assert!(!stored.contains(&request.envelope_key));
+    }
+
+    #[test]
     fn v3_delivery_rejects_fragment_or_query_substitution() {
         let (_, _, delivery, request) = delivery_fixture();
         for altered_url in [
@@ -7632,12 +7819,13 @@ mod tests {
                 ..InvocationOptions::default()
             },
         )?;
+        let delivery_authorization = delivery_invocation.encode()?;
         let delivery_response = client
             .post("/policy/v3/deliveries/authorize")
             .header(ContentType::JSON)
             .header(rocket::http::Header::new(
                 "Authorization",
-                delivery_invocation.encode()?,
+                delivery_authorization.clone(),
             ))
             .body(serde_json::to_string(&delivery_request)?)
             .dispatch()
@@ -7662,6 +7850,67 @@ mod tests {
             delivery_receipt["admission"]["audience"],
             "https://witness.credentials.org"
         );
+
+        // Model the cross-service partial failure where Node authorized the
+        // delivery but the OpenCredentials response was lost. The SDK retries
+        // with the same idempotency-derived JTI and must recover the identical
+        // signed receipt so it can safely retry credential invitation creation.
+        let delivery_retry = client
+            .post("/policy/v3/deliveries/authorize")
+            .header(ContentType::JSON)
+            .header(rocket::http::Header::new(
+                "Authorization",
+                delivery_authorization.clone(),
+            ))
+            .body(serde_json::to_string(&delivery_request)?)
+            .dispatch()
+            .await;
+        let delivery_retry_status = delivery_retry.status();
+        let delivery_retry_body = delivery_retry.into_string().await.unwrap_or_default();
+        assert_eq!(
+            delivery_retry_status,
+            Status::Ok,
+            "delivery authorization retry: {delivery_retry_body}"
+        );
+        assert_eq!(delivery_retry_body, delivery_body);
+        let delivery_retry_receipt: Value = serde_json::from_str(&delivery_retry_body)?;
+        assert_eq!(delivery_retry_receipt, delivery_receipt);
+
+        let persisted_replay =
+            share_invitation_authorization_jti::Entity::find_by_id(delivery_request.jti.clone())
+                .one(&client.rocket().state::<PolicyV3Runtime>().unwrap().conn)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("missing delivery replay record"))?;
+        assert_eq!(
+            persisted_replay.binding_json["requestBodyDigest"],
+            delivery_request.request_body_digest
+        );
+        assert_eq!(persisted_replay.binding_json["senderKeyDid"], holder_did);
+        let persisted_binding = persisted_replay.binding_json.to_string();
+        assert!(!persisted_binding.contains("alice@example.test"));
+        assert!(!persisted_binding.contains(&envelope_key));
+
+        // Reusing the same JTI for a different signed body is a conflict, not
+        // a second authorization. This is checked before envelope projection
+        // so recipient/resource/link rebinding cannot change the error class.
+        let mut rebound_request: DeliveryAuthorizationRequest =
+            serde_json::from_value(serde_json::to_value(&delivery_request)?)?;
+        rebound_request.expires_at =
+            format_time(parse_time(&delivery_request.expires_at)? - Duration::seconds(1));
+        rebound_request.request_body_digest = delivery_request_digest(&rebound_request)
+            .map_err(|_| anyhow::anyhow!("rebound delivery request digest"))?;
+        let rebound_response = client
+            .post("/policy/v3/deliveries/authorize")
+            .header(ContentType::JSON)
+            .header(rocket::http::Header::new(
+                "Authorization",
+                delivery_authorization,
+            ))
+            .body(serde_json::to_string(&rebound_request)?)
+            .dispatch()
+            .await;
+        assert_eq!(rebound_response.status(), Status::Conflict);
+
         if std::env::var("TC498_EMIT_DELIVERY_RECEIPT").as_deref() == Ok("1") {
             let request = delivery_receipt["request"].clone();
             let mut proof_preimage = INVITATION_REQUEST_SCHEMA.as_bytes().to_vec();
