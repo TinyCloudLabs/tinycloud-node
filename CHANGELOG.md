@@ -1,5 +1,9 @@
 # Changelog
 
+## [1.16.1] - 2026-09-15
+
+- Complete the embedded Policy v3 admission path for exact native credential invitations: validate the sealed share envelope and canonical recipient link, bind delivery authorization to the ephemeral holder key, and issue a deterministic signed receipt with strict nonce, request-body, and sender-DID replay protection. Shared content remains in the owner's TinyCloud storage and is accessed through the ordinary `/delegate` then `/invoke` storage-enforcer flow; no Share-specific data plane is introduced (TC-500, #229).
+
 ## [1.16.0] - 2026-08-21
 
 - Embed Policy v3 admission and control in the Node and move its routes off the Share namespace: `/share/v3/{policy/challenges,policy/delegations,policies,enforcer-bindings,deliveries/authorize,policy/status}` are now Node-owned `/policy/v3/{challenges,delegations,policies,enforcer-bindings,deliveries/authorize,status}`. Browser holder-bound exact-email credentials are admitted there, and the delegation the Node mints is then exercised over the ordinary `/delegate` and `/invoke` data plane, so no Share-specific data path remains on the Node (TC-500).
