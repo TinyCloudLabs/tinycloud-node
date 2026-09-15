@@ -446,9 +446,10 @@ pub fn execute(conn: &Connection, space: &str, command: &Value) -> Result<Value,
                 .as_object_mut()
                 .unwrap()
                 .remove("cleanupKeys");
+            let public_command_raw = public_command.to_string();
             let seen:Option<(String,String)>=tx.query_row("SELECT command,receipt FROM connector_publication_deletion WHERE operation_id=?",[op],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(sql)?;
             if let Some((prior, receipt)) = seen {
-                if prior != public_command.to_string() {
+                if prior != public_command_raw {
                     return Err(err("publication_operation_reused"));
                 }
                 return serde_json::from_str(&receipt)
@@ -520,7 +521,7 @@ pub fn execute(conn: &Connection, space: &str, command: &Value) -> Result<Value,
             let receipt = json!({"contractVersion":3,"status":if operation=="delete"{"deleted"}else{"purged"},"operationId":op,"snapshotKeys":keys,"deletedCount":deleted_count});
             tx.execute(
                 "INSERT INTO connector_publication_deletion VALUES(?,?,?)",
-                params![op, public_command.to_string(), receipt.to_string()],
+                params![op, public_command_raw, receipt.to_string()],
             )
             .map_err(sql)?;
             receipt

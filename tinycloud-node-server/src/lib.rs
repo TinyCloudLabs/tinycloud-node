@@ -432,12 +432,11 @@ pub async fn app_with_control(
     .with_sql_sizes(sql_sizes.clone());
     let encryption_service =
         encryption_service.with_sqlite_writer_lock(tinycloud.sqlite_writer_lock());
-    let database_artifact_repository: Arc<dyn DatabaseArtifactRepository> = Arc::new(
-        SizeTrackingArtifactRepository::new(
+    let database_artifact_repository: Arc<dyn DatabaseArtifactRepository> =
+        Arc::new(SizeTrackingArtifactRepository::new(
             Arc::new(node_artifact_repository(&tinycloud)),
             sql_sizes.clone(),
-        ),
-    );
+        ));
 
     // Seed the SQL-size mirror AFTER `TinyCloud::new` ran migrations — the
     // `database_artifact` table now exists (seeding before migrations would
@@ -1049,23 +1048,44 @@ mod sqlite_tuning_tests {
         .await
         .unwrap();
         repository
-            .save("sql", "space", "main", vec![1; 100], ArtifactExpectation::Absent)
+            .save(
+                "sql",
+                "space",
+                "main",
+                vec![1; 100],
+                ArtifactExpectation::Absent,
+            )
             .await
             .unwrap();
 
         let gate = node.sqlite_writer_lock().unwrap();
         let writer = gate.lock().await;
         let transaction = node.readable().await.unwrap();
-        delegation::Entity::find().count(&transaction).await.unwrap();
+        delegation::Entity::find()
+            .count(&transaction)
+            .await
+            .unwrap();
         let mut save = tokio::spawn(async move {
             if delta {
                 repository
-                    .save_delta("sql", "space", "main", vec![2; 12], ArtifactExpectation::Any)
+                    .save_delta(
+                        "sql",
+                        "space",
+                        "main",
+                        vec![2; 12],
+                        ArtifactExpectation::Any,
+                    )
                     .await
                     .map(|saved| saved.revision)
             } else {
                 repository
-                    .save("sql", "space", "main", vec![3; 120], ArtifactExpectation::Any)
+                    .save(
+                        "sql",
+                        "space",
+                        "main",
+                        vec![3; 120],
+                        ArtifactExpectation::Any,
+                    )
                     .await
                     .map(|saved| saved.revision)
             }
