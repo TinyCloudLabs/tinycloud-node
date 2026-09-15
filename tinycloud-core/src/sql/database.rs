@@ -161,10 +161,6 @@ pub fn spawn_actor(
                     response_tx,
                 } => {
                     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
-                    let readonly = matches!(
-                        command["operation"].as_str(),
-                        Some("capabilities" | "inspect")
-                    );
                     let result =
                         super::publication::execute(&conn, &space_id, &command).map(|receipt| {
                             SqlExecutionResult {
@@ -173,13 +169,7 @@ pub fn spawn_actor(
                                     rows: vec![vec![SqlValue::Text(receipt.to_string())]],
                                     row_count: 1,
                                 }),
-                                write_targets: if readonly {
-                                    vec![]
-                                } else {
-                                    vec![crate::write_hooks::TouchedTables::supported(vec![
-                                        "connector_meeting".into(),
-                                    ])]
-                                },
+                                write_targets: vec![],
                             }
                         });
                     let _ = response_tx.send(result);
@@ -320,8 +310,7 @@ fn handle_message(
         } => {
             let parsed = parser::validate_sql(sql, caveats, ability)?;
 
-            let auth = super::publication::authorizer(
-                conn,
+            let auth = super::authorizer::create_authorizer(
                 caveats.clone(),
                 ability.to_string(),
                 is_admin,
@@ -348,8 +337,7 @@ fn handle_message(
                 for stmt_sql in schema_stmts {
                     let parsed = parser::validate_sql(stmt_sql, caveats, ability)?;
                     write_targets.extend(parsed.write_targets);
-                    let auth = super::publication::authorizer(
-                        conn,
+                    let auth = super::authorizer::create_authorizer(
                         caveats.clone(),
                         ability.to_string(),
                         is_admin,
@@ -362,8 +350,7 @@ fn handle_message(
             }
 
             let parsed = parser::validate_sql(sql, caveats, ability)?;
-            let auth = super::publication::authorizer(
-                conn,
+            let auth = super::authorizer::create_authorizer(
                 caveats.clone(),
                 ability.to_string(),
                 is_admin,
@@ -395,8 +382,7 @@ fn handle_message(
 
             let mut results = Vec::new();
             for (stmt, is_insert) in statements.iter().zip(insert_statements) {
-                let auth = super::publication::authorizer(
-                    conn,
+                let auth = super::authorizer::create_authorizer(
                     caveats.clone(),
                     ability.to_string(),
                     is_admin,
@@ -422,8 +408,7 @@ fn handle_message(
 
             let parsed = parser::validate_sql(&prepared.sql, caveats, ability)?;
 
-            let auth = super::publication::authorizer(
-                conn,
+            let auth = super::authorizer::create_authorizer(
                 caveats.clone(),
                 ability.to_string(),
                 is_admin,
@@ -801,15 +786,64 @@ mod tests {
 }
 
 #[cfg(test)]
-mod publication_fencing_tests {
+mod publication_rollback_tests {
     use super::*;
     #[test]
-    fn publication_rejects_old_unfenced_sql_writers_after_activation() {
-        for sql in ["PRAGMA writable_schema=ON", "INSERT INTO connector_meeting(id,source,source_id,created_at,updated_at) VALUES('x','fireflies','x','now','now')", "DELETE FROM connector_meeting", "UPDATE connector_meeting SET title='old'", "DROP TABLE connector_meeting", "UPDATE connector_publication_control SET active=0", "DROP TABLE connector_publication_snapshot", "INSERT INTO connector_meeting_alias VALUES('x','y')"] {
-   let conn=rusqlite::Connection::open_in_memory().unwrap();
-   super::super::publication::execute(&conn,"space",&serde_json::json!({"contractVersion":3,"operation":"activate"})).unwrap();
-   let result=handle_message(&conn,&SqlRequest::Execute{sql:sql.into(),params:vec![],schema:None},&None,"tinycloud.sql/admin");
-   assert!(result.is_err(),"legacy write accepted: {sql}");
-  }
+    fn publication_rollback_restores_authorized_legacy_sql_and_bookkeeping() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE connector_meeting(id TEXT PRIMARY KEY,title TEXT,metadata TEXT,publication_state TEXT); INSERT INTO connector_meeting VALUES('old','Published','{}','published'); CREATE TABLE connector_publication_control(id INTEGER PRIMARY KEY,active INTEGER NOT NULL); INSERT INTO connector_publication_control VALUES(1,1);").unwrap();
+        for sql in [
+            "UPDATE connector_meeting SET title='Original',metadata='{ \"kept\": true }',publication_state=NULL WHERE id='old'",
+            "UPDATE connector_publication_control SET active=0 WHERE id=1",
+            "INSERT INTO connector_meeting(id,title) VALUES('new','Legacy sync')",
+            "DELETE FROM connector_meeting WHERE id='new'",
+        ] {
+            handle_message(&conn, &SqlRequest::Execute { sql: sql.into(), params: vec![], schema: None }, &None, "tinycloud.sql/write").unwrap_or_else(|error| panic!("legacy recovery rejected: {error}"));
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT title,metadata,publication_state FROM connector_meeting WHERE id='old'",
+                [],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?
+                ))
+            )
+            .unwrap(),
+            ("Original".into(), "{ \"kept\": true }".into(), None)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT active FROM connector_publication_control",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn publication_rollback_keeps_normal_read_only_authority() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE connector_meeting(id TEXT PRIMARY KEY,title TEXT); INSERT INTO connector_meeting VALUES('old','Original'); CREATE TABLE connector_publication_control(id INTEGER PRIMARY KEY,active INTEGER NOT NULL); INSERT INTO connector_publication_control VALUES(1,1);").unwrap();
+        let result = handle_message(
+            &conn,
+            &SqlRequest::Execute {
+                sql: "UPDATE connector_meeting SET title='Unauthorized'".into(),
+                params: vec![],
+                schema: None,
+            },
+            &None,
+            "tinycloud.sql/read",
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            conn.query_row("SELECT title FROM connector_meeting", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            "Original"
+        );
     }
 }

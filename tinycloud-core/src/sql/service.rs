@@ -116,7 +116,7 @@ impl SqlService {
         registry.insert(key, Arc::downgrade(&lock));
         lock
     }
-    /// Called only after the native route has checked publication authority and verified KV bytes.
+    /// Read-only compatibility command; the core actor rejects withdrawn mutations.
     pub async fn meeting_publication(
         &self,
         space: &SpaceId,
@@ -1088,48 +1088,93 @@ mod tests {
         ));
     }
     #[tokio::test]
-    async fn publication_durable_cas_fences_another_node_and_recovers() {
+    async fn connector_sql_durable_cas_fences_another_node_and_recovers() {
         let repo = artifact_repository().await;
-        let space = test_space_id("publication-cas");
+        let space = test_space_id("connector-cas");
         let one = TempDir::new().unwrap();
         let two = TempDir::new().unwrap();
         let first = SqlService::new(one.path().to_string_lossy().into(), u64::MAX, repo.clone());
         let second = SqlService::new(two.path().to_string_lossy().into(), u64::MAX, repo);
         first
-            .meeting_publication(
+            .execute(
                 &space,
-                serde_json::json!({"contractVersion":3,"operation":"activate"}),
+                "connectors",
+                SqlRequest::Execute {
+                    sql: "INSERT INTO connector_meeting(id,title) VALUES('old','Original')".into(),
+                    params: vec![],
+                    schema: Some(vec![
+                        "CREATE TABLE connector_meeting(id TEXT PRIMARY KEY,title TEXT)".into(),
+                    ]),
+                },
+                None,
+                "tinycloud.sql/admin".into(),
             )
             .await
             .unwrap();
+        let query = || SqlRequest::Query {
+            sql: "SELECT title FROM connector_meeting WHERE id='old'".into(),
+            params: vec![],
+            max_rows: None,
+            max_bytes: None,
+        };
         second
-            .meeting_publication(
+            .execute(
                 &space,
-                serde_json::json!({"contractVersion":3,"operation":"capabilities"}),
+                "connectors",
+                query(),
+                None,
+                "tinycloud.sql/read".into(),
             )
             .await
             .unwrap();
-        let command = |op| serde_json::json!({"contractVersion":3,"operation":"reserve","source":"fireflies","sourceId":"source","operationId":op});
+        let update = |title: &str| SqlRequest::Execute {
+            sql: "UPDATE connector_meeting SET title=? WHERE id='old'".into(),
+            params: vec![SqlValue::Text(title.into())],
+            schema: None,
+        };
         first
-            .meeting_publication(&space, command("first"))
+            .execute(
+                &space,
+                "connectors",
+                update("First"),
+                None,
+                "tinycloud.sql/write".into(),
+            )
             .await
             .unwrap();
         assert!(second
-            .meeting_publication(&space, command("stale"))
+            .execute(
+                &space,
+                "connectors",
+                update("Stale"),
+                None,
+                "tinycloud.sql/write".into()
+            )
             .await
             .is_err());
-        let recovered = second
-            .meeting_publication(&space, command("recovered"))
+        second
+            .execute(
+                &space,
+                "connectors",
+                update("Recovered"),
+                None,
+                "tinycloud.sql/write".into(),
+            )
             .await
             .unwrap();
-        let SqlResponse::Query(receipt) = recovered.response else {
-            panic!("query receipt required")
+        let result = second
+            .execute(
+                &space,
+                "connectors",
+                query(),
+                None,
+                "tinycloud.sql/read".into(),
+            )
+            .await
+            .unwrap();
+        let SqlResponse::Query(query) = result.response else {
+            panic!("query result required")
         };
-        let SqlValue::Text(raw) = &receipt.rows[0][0] else {
-            panic!("raw JSON receipt required")
-        };
-        let value: serde_json::Value = serde_json::from_str(raw).unwrap();
-        assert_eq!(value["generation"], 2);
-        assert_eq!(value["inserted"], false);
+        assert_eq!(query.rows, vec![vec![SqlValue::Text("Recovered".into())]]);
     }
 }

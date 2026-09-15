@@ -1454,7 +1454,6 @@ async fn invoke_impl(
                 admitted,
                 data,
                 tinycloud,
-                staging,
                 sql_service,
                 hook_runtime,
                 quota_cache,
@@ -2098,7 +2097,6 @@ async fn handle_sql_invoke(
     admitted: AdmittedInvocation,
     data: DataIn<'_>,
     tinycloud: &State<TinyCloud>,
-    staging: &State<BlockStage>,
     sql_service: &State<SqlService>,
     hook_runtime: &State<HookRuntime>,
     quota_cache: &State<QuotaCache>,
@@ -2199,27 +2197,16 @@ async fn handle_sql_invoke(
     if publication_command.is_some() {
         meeting_publication::require_unconstrained_chain(tinycloud, &parent_cids).await?;
     }
-    // Barrier controls change graph state only and must remain available when
-    // content storage is full, especially release after a completed migration.
-    let grows_content = match publication_command.as_ref() {
-        Some(command) => !matches!(
-            command["operation"].as_str(),
-            Some(
-                "capabilities"
-                    | "inspect"
-                    | "freeze_legacy"
-                    | "unfreeze_legacy"
-                    | "legacy_freeze_status"
-            )
-        ),
-        None => sql_request_is_write(&sql_request, &exec_caveats, ability),
-    };
+    // Publication compatibility only exposes status and release. Both remain
+    // available when content storage is full.
+    let grows_content =
+        publication_command.is_none() && sql_request_is_write(&sql_request, &exec_caveats, ability);
     if grows_content {
         staged_batch_remaining(space, tinycloud, config, quota_cache).await?;
     }
     let execute_start = Instant::now();
     let execute_result = if let Some(command) = publication_command {
-        meeting_publication::execute(tinycloud, sql_service, staging, space, command).await
+        meeting_publication::execute(tinycloud, sql_service, space, command).await
     } else {
         sql_service
             .execute(
@@ -6043,8 +6030,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_freeze_controls_work_over_quota_while_publication_growth_rejects() -> Result<()>
-    {
+    async fn publication_rollback_release_works_over_quota_and_mutations_stay_withdrawn(
+    ) -> Result<()> {
         use rocket::{
             data::ByteUnit,
             http::{ContentType, Header},
@@ -6070,13 +6057,23 @@ mod tests {
         }
         .insert(&setup.replay_db)
         .await?;
+        // The old binary wrote this pause before the rollback deployment.
+        setup
+            .tinycloud
+            .set_legacy_meeting_write_freeze(&setup.space, true, 0)
+            .await?;
         let cases = [
+            ("capabilities", 0, 200),
             ("legacy_freeze_status", 0, 200),
-            ("freeze_legacy", 0, 200),
+            ("freeze_legacy", 0, 400),
             ("unfreeze_legacy", 1, 200),
-            ("reserve", 0, 402),
-            ("stage", 0, 402),
-            ("publish", 0, 402),
+            ("activate", 0, 400),
+            ("reserve", 0, 400),
+            ("stage", 0, 400),
+            ("publish", 0, 400),
+            ("inspect", 0, 400),
+            ("delete", 0, 400),
+            ("purge", 0, 400),
         ];
         let mut requests = vec![];
         for (index, (operation, expected, status)) in cases.into_iter().enumerate() {
@@ -6095,6 +6092,12 @@ mod tests {
             let status = response.status().code;
             let body = response.into_string().await.unwrap_or_default();
             assert_eq!(status, expected, "{operation} at exhausted quota: {body}");
+            if expected == 400 {
+                assert!(
+                    body.contains("publication_withdrawn"),
+                    "{operation}: {body}"
+                );
+            }
             if operation == "unfreeze_legacy" {
                 let response: serde_json::Value = serde_json::from_str(&body)?;
                 let receipt: serde_json::Value = serde_json::from_str(

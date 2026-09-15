@@ -1,4 +1,4 @@
-//! Native publication commands share /invoke admission and the existing SQL catalog.
+//! Status and release compatibility for the withdrawn publication protocol.
 use super::*;
 use tinycloud_core::sql::{publication, SqlExecutionResult, SqlResponse, SqlValue};
 
@@ -33,31 +33,16 @@ pub(super) fn command(
     };
     let command: serde_json::Value = serde_json::from_str(raw)
         .map_err(|_| (Status::BadRequest, "publication_invalid_command".into()))?;
-    if command["contractVersion"] != 3
-        || !matches!(
-            command["operation"].as_str(),
-            Some(
-                "capabilities"
-                    | "activate"
-                    | "reserve"
-                    | "stage"
-                    | "publish"
-                    | "inspect"
-                    | "delete"
-                    | "purge"
-                    | "freeze_legacy"
-                    | "unfreeze_legacy"
-                    | "legacy_freeze_status"
-            )
-        )
-    {
+    if command["contractVersion"] != 3 || command["operation"].as_str().is_none() {
         return Err((Status::BadRequest, "publication_invalid_command".into()));
     }
-    if matches!(
+    if !matches!(
         command["operation"].as_str(),
-        Some("freeze_legacy" | "unfreeze_legacy")
-    ) && expected_generation(&command).is_none()
-    {
+        Some("capabilities" | "unfreeze_legacy" | "legacy_freeze_status")
+    ) {
+        return Err((Status::BadRequest, "publication_withdrawn".into()));
+    }
+    if command["operation"] == "unfreeze_legacy" && expected_generation(&command).is_none() {
         return Err((
             Status::BadRequest,
             "legacy_freeze_invalid_expected_generation".into(),
@@ -135,215 +120,59 @@ fn receipt(value: serde_json::Value) -> SqlExecutionResult {
         write_targets: vec![],
     }
 }
-async fn verify(
-    tinycloud: &TinyCloud,
-    space: &SpaceId,
-    key: &str,
-    revision: &str,
-) -> Result<bool, SqlError> {
-    let path: Path = key.parse().map_err(internal)?;
-    let Some((_, _, content)) = tinycloud.kv_get(space, &path).await.map_err(internal)? else {
-        return Ok(false);
-    };
-    let mut reader = Box::pin(content).take((publication::ENVELOPE_LIMIT + 1) as u64);
-    let mut bytes = Vec::new();
-    FuturesAsyncReadExt::read_to_end(&mut reader, &mut bytes)
-        .await
-        .map_err(internal)?;
-    if bytes.len() > publication::ENVELOPE_LIMIT {
-        return Err(bad("publication_capacity"));
-    }
-    let raw = std::str::from_utf8(&bytes).map_err(|_| bad("publication_snapshot_invalid"))?;
-    if publication::digest(raw) != revision {
-        return Err(bad("publication_digest_mismatch"));
-    }
-    Ok(true)
-}
-// Serialize the SQL/KV publication sequence as one native operation on this node.
-lazy_static::lazy_static! {static ref PUBLICATION_LOCKS:std::sync::Mutex<HashMap<String,std::sync::Weak<tokio::sync::Mutex<()>>>>=std::sync::Mutex::new(HashMap::new());}
-fn protocol_lock(space: &SpaceId) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-    let mut locks = PUBLICATION_LOCKS.lock().unwrap();
-    locks.retain(|_, lock| lock.strong_count() > 0);
-    let key = space.to_string();
-    if let Some(lock) = locks.get(&key).and_then(std::sync::Weak::upgrade) {
-        return lock;
-    }
-    let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
-    locks.insert(key, std::sync::Arc::downgrade(&lock));
-    lock
-}
+/// Only status and generation-checked release remain from publication v3.
 pub(super) async fn execute(
     tinycloud: &TinyCloud,
     sql: &SqlService,
-    staging: &BlockStage,
     space: &SpaceId,
-    mut command: serde_json::Value,
+    command: serde_json::Value,
 ) -> Result<SqlExecutionResult, SqlError> {
-    let _guard = protocol_lock(space).lock_owned().await;
+    if command["contractVersion"] != 3 {
+        return Err(bad("publication_invalid_command"));
+    }
     let operation = command["operation"]
         .as_str()
-        .ok_or_else(|| bad("publication_invalid_command"))?
-        .to_owned();
-    if matches!(operation.as_str(), "freeze_legacy" | "unfreeze_legacy") {
-        let expected = expected_generation(&command)
-            .ok_or_else(|| bad("legacy_freeze_invalid_expected_generation"))?;
-        let status = tinycloud
-            .set_legacy_meeting_write_freeze(space, operation == "freeze_legacy", expected)
-            .await
-            .map_err(|error| match error {
-                tinycloud_core::meeting_legacy_guard::FreezeError::Db(error) => internal(error),
-                error => bad(&error.to_string()),
-            })?;
-        return Ok(receipt(
-            serde_json::json!({"contractVersion":3,"legacyWritesFrozen":status.frozen,"legacyFreezeGeneration":status.generation}),
-        ));
-    }
-    if operation == "legacy_freeze_status" {
-        let status = tinycloud
-            .legacy_meeting_freeze_status(space)
-            .await
-            .map_err(internal)?;
-        return Ok(receipt(
-            serde_json::json!({"contractVersion":3,"legacyWritesFrozen":status.frozen,"legacyFreezeGeneration":status.generation}),
-        ));
-    }
-    // Reject known frozen cleanup before SQL tombstones/removals. The core KV
-    // transaction guard independently closes races and internal cleanup bypasses.
-    if matches!(operation.as_str(), "delete" | "purge")
-        && tinycloud
-            .legacy_meeting_freeze_status(space)
-            .await
-            .map_err(internal)?
-            .frozen
-    {
-        return Err(SqlError::PermissionDenied(
-            "legacy meeting artifacts are frozen".into(),
-        ));
-    }
-    if operation == "stage" {
-        publication::validate_snapshot(&command)?;
-        let raw = command["snapshotRaw"]
-            .as_str()
-            .ok_or_else(|| bad("publication_invalid_command"))?
-            .to_owned();
-        let key = command["snapshotKey"]
-            .as_str()
-            .ok_or_else(|| bad("publication_invalid_command"))?
-            .to_owned();
-        let revision = command["revision"]
-            .as_str()
-            .ok_or_else(|| bad("publication_invalid_command"))?
-            .to_owned();
-        command["operation"] = serde_json::json!("prepare_stage");
-        sql.meeting_publication(space, command.clone()).await?;
-        if !verify(tinycloud, space, &key, &revision).await? {
-            let mut buffer = staging.stage(space).await.map_err(internal)?;
-            buffer.write_all(raw.as_bytes()).await.map_err(internal)?;
-            buffer.flush().await.map_err(internal)?;
-            match tinycloud
-                .invoke_internal_meeting_snapshot_put::<BlockStage>(
-                    space.clone(),
-                    key.parse().map_err(internal)?,
-                    Metadata(BTreeMap::from([(
-                        "content-type".into(),
-                        "application/json".into(),
-                    )])),
-                    buffer,
-                    Some(KvPrecondition::DoesNotExist),
-                )
+        .ok_or_else(|| bad("publication_invalid_command"))?;
+    match operation {
+        "unfreeze_legacy" => {
+            let expected = expected_generation(&command)
+                .ok_or_else(|| bad("legacy_freeze_invalid_expected_generation"))?;
+            let status = tinycloud
+                .set_legacy_meeting_write_freeze(space, false, expected)
                 .await
-            {
-                Ok(_) | Err(TxStoreError::KvPreconditionFailed) => {}
-                Err(error) => return Err(internal(error)),
-            }
+                .map_err(|error| match error {
+                    tinycloud_core::meeting_legacy_guard::FreezeError::Db(error) => internal(error),
+                    error => bad(&error.to_string()),
+                })?;
+            Ok(receipt(
+                serde_json::json!({"contractVersion":3,"legacyWritesFrozen":status.frozen,"legacyFreezeGeneration":status.generation}),
+            ))
         }
-        if !verify(tinycloud, space, &key, &revision).await? {
-            return Err(bad("publication_snapshot_missing"));
-        }
-        command["operation"] = serde_json::json!("stage");
-        command.as_object_mut().unwrap().remove("snapshotRaw");
-        // A superseding reservation/delete cannot publish this verified staged object.
-        // Failed finalization remains indexed for purge. Do not delete here: another
-        // node may already have published an idempotent attempt with the same digest.
-        return sql.meeting_publication(space, command).await;
-    }
-    if operation == "publish" {
-        let key = command["snapshotKey"]
-            .as_str()
-            .ok_or_else(|| bad("publication_invalid_command"))?;
-        let revision = command["revision"]
-            .as_str()
-            .ok_or_else(|| bad("publication_invalid_command"))?;
-        if !publication::protected_snapshot_path(key)
-            || !verify(tinycloud, space, key, revision).await?
-        {
-            return Err(bad("publication_snapshot_missing"));
-        }
-    }
-    command.as_object_mut().unwrap().remove("cleanupKeys");
-    if operation == "purge" {
-        let source = command["source"]
-            .as_str()
-            .filter(|source| {
-                matches!(
-                    *source,
-                    "fireflies" | "google-meet" | "tinycloud-transcriber"
-                )
-            })
-            .ok_or_else(|| bad("publication_invalid_source"))?;
-        let prefix: Path = format!("{}/{source}/", publication::SQL_PATH)
-            .parse()
-            .map_err(internal)?;
-        let keys = tinycloud
-            .public_kv_list(space, &prefix)
-            .await
-            .map_err(internal)?;
-        command["cleanupKeys"] = serde_json::json!(keys
-            .into_iter()
-            .map(|key| key.to_string())
-            .collect::<Vec<_>>());
-    }
-    let mut result = sql.meeting_publication(space, command).await?;
-    if operation == "capabilities" {
-        let SqlResponse::Query(query) = &mut result.response else {
-            return Err(bad("publication_receipt_invalid"));
-        };
-        let Some(SqlValue::Text(raw)) = query.rows.first_mut().and_then(|row| row.first_mut())
-        else {
-            return Err(bad("publication_receipt_invalid"));
-        };
-        let mut value: serde_json::Value = serde_json::from_str(raw).map_err(internal)?;
-        value["legacyWriteFreeze"] = serde_json::json!(true);
-        *raw = value.to_string();
-    }
-    if matches!(operation.as_str(), "delete" | "purge") {
-        let SqlResponse::Query(query) = &result.response else {
-            return Err(bad("publication_receipt_invalid"));
-        };
-        let Some(SqlValue::Text(raw)) = query.rows.first().and_then(|r| r.first()) else {
-            return Err(bad("publication_receipt_invalid"));
-        };
-        let receipt: serde_json::Value = serde_json::from_str(raw).map_err(internal)?;
-        for key in receipt["snapshotKeys"]
-            .as_array()
-            .ok_or_else(|| bad("publication_receipt_invalid"))?
-        {
-            let key = key
-                .as_str()
-                .ok_or_else(|| bad("publication_receipt_invalid"))?;
-            if !publication::connector_owned_path(key) {
-                return Err(bad("publication_receipt_invalid"));
-            }
-            tinycloud
-                .invoke_internal_meeting_snapshot_delete::<BlockStage>(
-                    space.clone(),
-                    key.parse().map_err(internal)?,
-                )
+        "legacy_freeze_status" => {
+            let status = tinycloud
+                .legacy_meeting_freeze_status(space)
                 .await
                 .map_err(internal)?;
+            Ok(receipt(
+                serde_json::json!({"contractVersion":3,"legacyWritesFrozen":status.frozen,"legacyFreezeGeneration":status.generation}),
+            ))
         }
+        "capabilities" => {
+            let mut result = sql.meeting_publication(space, command).await?;
+            let SqlResponse::Query(query) = &mut result.response else {
+                return Err(bad("publication_receipt_invalid"));
+            };
+            let Some(SqlValue::Text(raw)) = query.rows.first_mut().and_then(|row| row.first_mut())
+            else {
+                return Err(bad("publication_receipt_invalid"));
+            };
+            let mut value: serde_json::Value = serde_json::from_str(raw).map_err(internal)?;
+            value["legacyWriteFreeze"] = serde_json::json!(false);
+            *raw = value.to_string();
+            Ok(result)
+        }
+        _ => Err(bad("publication_withdrawn")),
     }
-    Ok(result)
 }
 
 #[cfg(test)]
@@ -357,15 +186,31 @@ mod tests {
         types::SpaceIdWrap,
     };
 
-    async fn legacy_route_fixture(
-        activate: bool,
-    ) -> (
-        TinyCloud,
-        SqlService,
-        BlockStage,
-        SpaceId,
-        tempfile::TempDir,
-    ) {
+    #[test]
+    fn publication_rollback_rejects_withdrawn_commands_at_admission() {
+        for operation in [
+            "activate",
+            "reserve",
+            "stage",
+            "publish",
+            "inspect",
+            "delete",
+            "purge",
+            "freeze_legacy",
+        ] {
+            let error = command(
+                &request(operation),
+                Some(publication::SQL_PATH),
+                "tinycloud.sql/write",
+                &None,
+            )
+            .expect_err("withdrawn publication command admitted");
+            assert_eq!(error.0, Status::BadRequest);
+            assert_eq!(error.1, "publication_withdrawn");
+        }
+    }
+
+    async fn legacy_route_fixture() -> (TinyCloud, SqlService, SpaceId, tempfile::TempDir) {
         let directory = tempfile::tempdir().unwrap();
         let conn = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
             .await
@@ -400,26 +245,44 @@ mod tests {
             u64::MAX,
             std::sync::Arc::new(SeaOrmDatabaseArtifactRepository::new(conn)),
         );
-        if activate {
-            sql.meeting_publication(
-                &space,
-                serde_json::json!({"contractVersion":3,"operation":"activate"}),
-            )
-            .await
-            .unwrap();
-            sql.meeting_publication(&space, serde_json::json!({"contractVersion":3,"operation":"reserve","source":"fireflies","sourceId":"old","operationId":"initial"})).await.unwrap();
-        }
-        let staging = BlockStage::from(crate::config::StagingStorage::Memory);
-        (tinycloud, sql, staging, space, directory)
+        (tinycloud, sql, space, directory)
     }
 
-    async fn catalog(sql: &SqlService, space: &SpaceId) -> serde_json::Value {
-        let result = sql
+    #[tokio::test]
+    async fn publication_rollback_rejects_direct_execution_without_catalog_changes() {
+        let (tinycloud, sql, space, _directory) = legacy_route_fixture().await;
+        for operation in [
+            "activate",
+            "reserve",
+            "prepare_stage",
+            "stage",
+            "publish",
+            "inspect",
+            "delete",
+            "purge",
+            "freeze_legacy",
+        ] {
+            let error = execute(&tinycloud, &sql, &space, serde_json::json!({"contractVersion":3,"operation":operation,"expectedGeneration":0}))
+                .await.expect_err("withdrawn command executed directly");
+            assert!(
+                error.to_string().contains("publication_withdrawn"),
+                "{operation}: {error}"
+            );
+        }
+        assert_eq!(
+            tinycloud
+                .legacy_meeting_freeze_status(&space)
+                .await
+                .unwrap()
+                .generation,
+            0
+        );
+        let catalog = sql
             .execute(
-                space,
+                &space,
                 publication::DATABASE,
                 SqlRequest::Query {
-                    sql: "SELECT * FROM connector_meeting ORDER BY id".into(),
+                    sql: "SELECT COUNT(*) FROM sqlite_master".into(),
                     params: vec![],
                     max_rows: None,
                     max_bytes: None,
@@ -429,45 +292,10 @@ mod tests {
             )
             .await
             .unwrap();
-        serde_json::to_value(result.response).unwrap()
-    }
-
-    #[tokio::test]
-    async fn legacy_freeze_delete_and_purge_leave_catalog_unchanged() {
-        for operation in ["delete", "purge"] {
-            let (tinycloud, sql, staging, space, _directory) = legacy_route_fixture(true).await;
-            let before = catalog(&sql, &space).await;
-            let frozen = execute(&tinycloud,&sql,&staging,&space,serde_json::json!({"contractVersion":3,"operation":"freeze_legacy","expectedGeneration":0})).await.unwrap();
-            let SqlResponse::Query(query) = frozen.response else {
-                panic!("freeze receipt")
-            };
-            assert_eq!(query.columns, vec!["receipt"]);
-            let SqlValue::Text(raw) = &query.rows[0][0] else {
-                panic!("freeze receipt")
-            };
-            assert_eq!(
-                serde_json::from_str::<serde_json::Value>(raw).unwrap(),
-                serde_json::json!({"contractVersion":3,"legacyWritesFrozen":true,"legacyFreezeGeneration":1})
-            );
-            let result = execute(&tinycloud,&sql,&staging,&space,serde_json::json!({"contractVersion":3,"operation":operation,"source":"fireflies","sourceId":"old","operationId":operation})).await;
-            assert!(result.is_err(), "frozen {operation} must reject");
-            assert_eq!(
-                catalog(&sql, &space).await,
-                before,
-                "frozen {operation} changed catalog before cleanup rejection"
-            );
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("legacy meeting artifacts are frozen"));
-            execute(&tinycloud,&sql,&staging,&space,serde_json::json!({"contractVersion":3,"operation":"unfreeze_legacy","expectedGeneration":1})).await.unwrap();
-            execute(&tinycloud,&sql,&staging,&space,serde_json::json!({"contractVersion":3,"operation":operation,"source":"fireflies","sourceId":"old","operationId":operation})).await.unwrap();
-            assert_ne!(
-                catalog(&sql, &space).await,
-                before,
-                "released {operation} did not resume"
-            );
-        }
+        let SqlResponse::Query(query) = catalog.response else {
+            panic!("catalog query")
+        };
+        assert_eq!(query.rows, vec![vec![SqlValue::Integer(0)]]);
     }
     fn parsed_receipt(result: SqlExecutionResult) -> serde_json::Value {
         let SqlResponse::Query(query) = result.response else {
@@ -480,13 +308,17 @@ mod tests {
         serde_json::from_str(raw).unwrap()
     }
     #[tokio::test]
-    async fn legacy_freeze_controls_are_generation_checked_without_catalog_activation() {
-        let (tinycloud, sql, staging, space, _directory) = legacy_route_fixture(false).await;
+    async fn publication_rollback_releases_existing_freeze_with_generation_checks() {
+        let (tinycloud, sql, space, _directory) = legacy_route_fixture().await;
+        // Simulate a durable freeze written by the previous release.
+        tinycloud
+            .set_legacy_meeting_write_freeze(&space, true, 0)
+            .await
+            .unwrap();
         let status = parsed_receipt(
             execute(
                 &tinycloud,
                 &sql,
-                &staging,
                 &space,
                 serde_json::json!({"contractVersion":3,"operation":"legacy_freeze_status"}),
             )
@@ -495,44 +327,62 @@ mod tests {
         );
         assert_eq!(
             status,
-            serde_json::json!({"contractVersion":3,"legacyWritesFrozen":false,"legacyFreezeGeneration":0})
+            serde_json::json!({"contractVersion":3,"legacyWritesFrozen":true,"legacyFreezeGeneration":1})
         );
         let capabilities = parsed_receipt(
             execute(
                 &tinycloud,
                 &sql,
-                &staging,
                 &space,
                 serde_json::json!({"contractVersion":3,"operation":"capabilities"}),
             )
             .await
             .unwrap(),
         );
-        assert_eq!(capabilities["legacyWriteFreeze"], true);
-        for (operation, expected, frozen, generation) in [
-            ("freeze_legacy", 0, true, 1),
-            ("freeze_legacy", 0, true, 1),
-            ("unfreeze_legacy", 1, false, 2),
-            ("unfreeze_legacy", 1, false, 2),
-            ("freeze_legacy", 2, true, 3),
-        ] {
-            let receipt=parsed_receipt(execute(&tinycloud,&sql,&staging,&space,serde_json::json!({"contractVersion":3,"operation":operation,"expectedGeneration":expected})).await.unwrap());
-            assert_eq!(
-                receipt,
-                serde_json::json!({"contractVersion":3,"legacyWritesFrozen":frozen,"legacyFreezeGeneration":generation})
-            );
-        }
-        let stale=execute(&tinycloud,&sql,&staging,&space,serde_json::json!({"contractVersion":3,"operation":"unfreeze_legacy","expectedGeneration":1})).await.unwrap_err();
+        assert_eq!(capabilities["legacyWriteFreeze"], false);
+        assert_eq!(capabilities["writerFencing"], false);
+        assert_eq!(capabilities["digestVerification"], false);
+        assert_eq!(capabilities["snapshotImmutability"], true);
+        let stale = execute(&tinycloud, &sql, &space,
+            serde_json::json!({"contractVersion":3,"operation":"unfreeze_legacy","expectedGeneration":0})).await.unwrap_err();
         assert!(stale
             .to_string()
             .contains("legacy_freeze_generation_conflict"));
-        let reserve=sql.meeting_publication(&space,serde_json::json!({"contractVersion":3,"operation":"reserve","source":"fireflies","sourceId":"old","operationId":"probe"})).await.unwrap_err();
         assert!(
-            reserve
-                .to_string()
-                .contains("publication_activation_required"),
-            "freeze unexpectedly activated catalog: {reserve}"
+            tinycloud
+                .legacy_meeting_freeze_status(&space)
+                .await
+                .unwrap()
+                .frozen
         );
+        // Exact-ticket release and a lost-ack retry must return the same generation.
+        for _ in 0..2 {
+            let receipt = parsed_receipt(execute(&tinycloud, &sql, &space,
+                serde_json::json!({"contractVersion":3,"operation":"unfreeze_legacy","expectedGeneration":1})).await.unwrap());
+            assert_eq!(
+                receipt,
+                serde_json::json!({"contractVersion":3,"legacyWritesFrozen":false,"legacyFreezeGeneration":2})
+            );
+        }
+        let catalog = sql
+            .execute(
+                &space,
+                publication::DATABASE,
+                SqlRequest::Query {
+                    sql: "SELECT COUNT(*) FROM sqlite_master".into(),
+                    params: vec![],
+                    max_rows: None,
+                    max_bytes: None,
+                },
+                None,
+                "tinycloud.sql/read".into(),
+            )
+            .await
+            .unwrap();
+        let SqlResponse::Query(query) = catalog.response else {
+            panic!("catalog query")
+        };
+        assert_eq!(query.rows, vec![vec![SqlValue::Integer(0)]]);
     }
     fn request(operation: &str) -> SqlRequest {
         SqlRequest::ExecuteStatement {
@@ -552,7 +402,7 @@ mod tests {
             serde_json::json!(i64::MAX),
             serde_json::json!(u64::MAX),
         ] {
-            let request = SqlRequest::ExecuteStatement { name:publication::STATEMENT.into(), params:vec![SqlValue::Text(serde_json::json!({"contractVersion":3,"operation":"freeze_legacy","expectedGeneration":expected}).to_string())] };
+            let request = SqlRequest::ExecuteStatement { name:publication::STATEMENT.into(), params:vec![SqlValue::Text(serde_json::json!({"contractVersion":3,"operation":"unfreeze_legacy","expectedGeneration":expected}).to_string())] };
             assert!(
                 command(
                     &request,
@@ -568,14 +418,14 @@ mod tests {
     #[test]
     fn publication_route_rejects_read_only_and_constrained_authority() {
         assert!(command(
-            &request("reserve"),
+            &request("unfreeze_legacy"),
             Some(publication::SQL_PATH),
             "tinycloud.sql/read",
             &None
         )
         .is_err());
         assert!(command(
-            &request("reserve"),
+            &request("unfreeze_legacy"),
             Some(publication::SQL_PATH),
             "tinycloud.sql/write",
             &Some(SqlCaveats::default())
@@ -585,7 +435,7 @@ mod tests {
     #[test]
     fn publication_route_rejects_wrong_database_and_private_operations() {
         assert!(command(
-            &request("reserve"),
+            &request("unfreeze_legacy"),
             Some("other/connectors"),
             "tinycloud.sql/write",
             &None
@@ -602,7 +452,7 @@ mod tests {
     #[test]
     fn publication_route_recognizes_fixed_command() {
         assert!(command(
-            &request("activate"),
+            &request("capabilities"),
             Some(publication::SQL_PATH),
             "tinycloud.sql/*",
             &None
@@ -624,7 +474,7 @@ mod tests {
 
     #[test]
     fn legacy_freeze_commands_require_existing_unconstrained_publication_authority() {
-        for operation in ["freeze_legacy", "unfreeze_legacy", "legacy_freeze_status"] {
+        for operation in ["unfreeze_legacy", "legacy_freeze_status"] {
             assert!(command(
                 &request(operation),
                 Some(publication::SQL_PATH),

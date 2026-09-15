@@ -1,57 +1,57 @@
-# Migrating legacy meeting artifacts
+# Meeting publication rollback compatibility
 
-Native meeting publication v3 publishes immutable, digest-verified snapshots through the existing authenticated SQL service. Activation adds the connector publication schema and rejects generic writes to protected catalog tables. It does not verify or convert legacy bodies automatically.
+Native meeting publication v3 has been withdrawn. Its activation, reservation, snapshot staging, publication, inspection, deletion, purge, and new-freeze commands return `publication_withdrawn` (HTTP 400). The core SQL actor independently rejects these commands, so bypassing HTTP admission cannot reactivate the protocol or mutate its catalog.
 
-A migration should inventory and validate the existing catalog and raw KV bodies, preserve a private copy and resumable operation plan, pause legacy artifact writes, activate the SQL fence, and revalidate the plan before publication. Verify every published copy before releasing the legacy KV pause. Keep the original capture extent and provenance unknown unless independently established.
+Ordinary SQL requests again use the standard SQL authorizer. Existing SQL capabilities, table/column restrictions, prepared-statement restrictions, and ancestor-chain constraints still apply. Authorized legacy clients can update `connector_meeting`; an authorized recovery operator can repair publication bookkeeping and remove the added schema through ordinary SQL and its durable artifact persistence.
 
-## Temporary write barrier
+The rollback binary does not automatically restore rows, remove publication schema, delete stored snapshots, or release existing write pauses. Those changes require a separately verified recovery of the affected space. Preserve the original private export and operation plan.
 
-These controls use the existing `tinycloud.meetingPublication.v3` statement at the exact SQL path `xyz.tinycloud.tinychat/connectors`. They require `tinycloud.sql/write` and the existing unconstrained ancestor-chain authority. Their SQL result has a `receipt` column containing one JSON string.
+## Capabilities and retained controls
+
+The existing `tinycloud.meetingPublication.v3` statement at the exact SQL path `xyz.tinycloud.tinychat/connectors` retains three commands: `capabilities`, `legacy_freeze_status`, and `unfreeze_legacy`. They require `tinycloud.sql/write` and the existing unconstrained ancestor-chain authority. Their SQL result has a `receipt` column containing one JSON string.
+
+Capabilities report:
+
+```json
+{"contractVersion":3,"writerFencing":false,"snapshotImmutability":true,"digestVerification":false,"legacyWriteFreeze":false}
+```
+
+`snapshotImmutability` remains true because the KV protection for existing snapshot keys remains enforced. New snapshots cannot be created through the withdrawn publication protocol. `legacyWriteFreeze` is false because creating a new pause is no longer exposed.
+
+Inspect a pre-existing pause:
 
 ```json
 {"contractVersion":3,"operation":"legacy_freeze_status"}
 ```
 
-A fresh space reports:
+A pause created by the previous binary may report:
 
 ```json
-{"contractVersion":3,"legacyWritesFrozen":false,"legacyFreezeGeneration":0}
+{"contractVersion":3,"legacyWritesFrozen":true,"legacyFreezeGeneration":1}
 ```
 
-Persist the expected generation before issuing a control request:
-
-```json
-{"contractVersion":3,"operation":"freeze_legacy","expectedGeneration":0}
-```
-
-The successful receipt reports `legacyWritesFrozen:true` and `legacyFreezeGeneration:1`. After publication and verification, release that generation:
+After restoring and verifying the affected catalog and original bodies, release the exact saved generation:
 
 ```json
 {"contractVersion":3,"operation":"unfreeze_legacy","expectedGeneration":1}
 ```
 
-Release reports `legacyWritesFrozen:false` and `legacyFreezeGeneration:2`. Each actual transition increments the generation. An immediate identical retry returns the same result; a stale request from an older cycle fails with `legacy_freeze_generation_conflict` (HTTP 400). Invalid generation inputs also return 400. Generations distinguish migration cycles, not independent operators issuing identical simultaneous requests; coordinate one operator per migration.
+Release reports `legacyWritesFrozen:false` and `legacyFreezeGeneration:2`. An immediate identical retry returns the same result. A stale generation fails with `legacy_freeze_generation_conflict` (HTTP 400); invalid generation inputs also return 400. Status and release remain available when content quota is exhausted and do not activate or alter the SQL catalog.
 
-The native route advertises `legacyWriteFreeze:true` in its publication capabilities. Status, freeze and release remain available when content quota is exhausted; content-growing publication operations remain quota checked.
+## Existing KV protections
 
-## Protected scope and guarantees
-
-The pause applies only to these paths under `xyz.tinycloud.tinychat/connectors/{fireflies,google-meet,tinycloud-transcriber}/`:
+An existing pause continues to block legacy writes under `xyz.tinycloud.tinychat/connectors/{fireflies,google-meet,tinycloud-transcriber}/` for:
 
 - `transcript/…`
 - `meeting/…`
 - `archive-copy/transcript/…`
 
-Reads, chat keys, cursors, credentials, other spaces and native snapshot publication remain available. Frozen ordinary KV put/delete returns HTTP 409. Frozen native delete/purge returns HTTP 403 before known catalog mutation. The core guard also rejects internal legacy cleanup.
+Reads, chat keys, cursors, credentials, and other spaces retain their existing behavior. Frozen ordinary KV put/delete returns HTTP 409. The core guard also rejects internal legacy cleanup. The pause survives a node restart; only an exact generation-checked release removes it.
 
-The durable guard is locked by the protected KV mutation transaction before its first database read. PostgreSQL row locking and SQLite writer serialization hold that lock through storage persistence and commit. A freeze acknowledgement therefore drains earlier protected KV commits. Failed guard reads fail closed, and restarting the node does not release a pause.
+The durable guard remains locked by protected KV mutation transactions through storage persistence and commit. PostgreSQL row locking and SQLite writer serialization retain their existing behavior. Failed guard reads fail closed. Existing snapshot keys remain protected after the legacy pause is released.
 
-The early native delete/purge check does not make the separate SQL publication and KV cleanup transactions globally atomic across multiple instances. Deploy compatible code to every traffic-serving node and coordinate migration writers. Freeze alone does not fence generic SQL; activation supplies that separate catalog fence.
+## Deployment compatibility
 
-Release allows later legacy artifact mutations. It does not deactivate the SQL fence or weaken immutable snapshots, which retain the verified original body independently. Older writers cannot publish to an activated catalog and should be replaced by compatible clients.
+The central `meeting_legacy_write_guard` migration and its generation history remain registered. A pre-migration binary can reject startup when it sees an unknown applied migration, so reverting the container image alone is insufficient. Do not edit migration history or restore the shared database wholesale to recover one space.
 
-## Rollout and recovery
-
-The central `meeting_legacy_write_guard` migration creates the table without automatically freezing a space. Old binaries that do not recognize its migration name may reject startup against the upgraded database. Its down operation refuses to silently discard the guard generation. A rollback build must recognize the migration; after catalog activation it must also retain the publication protocol and writer fences.
-
-Keep a compatible node running for inspection, repair and resume. Retain the original private plan and operation IDs after interruption or a lost acknowledgement. Do not invent new operations to recover uncertain publications, edit migration history, or restore a shared database wholesale to recover one space.
+Before deploying this withdrawal across shared infrastructure, identify every catalog that adopted publication v3 and coordinate its recovery and writers. Deploy the compatible binary to all traffic-serving instances. The legacy KV pause does not fence ordinary SQL after rollback, so keep application writers paused while restoring the catalog. Resume legacy writers only after verifying the restored rows and original bodies and releasing the saved KV pause.
