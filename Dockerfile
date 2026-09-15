@@ -3,14 +3,16 @@ ARG RUNTIME_BASE=scratch
 # Optional: pass "dstack", "duckdb", or "dstack duckdb" to enable build features.
 ARG CARGO_FEATURES=""
 
-FROM rust:alpine AS chef
+FROM rust:1.97.1-alpine AS chef
 RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static g++ perl make
+RUN test "$(rustc -V | awk '{print $2}')" = "1.97.1"
 RUN cargo install cargo-chef
 WORKDIR /app
 
 FROM chef AS planner
 COPY ./Cargo.lock ./
 COPY ./Cargo.toml ./
+COPY ./rust-toolchain.toml ./
 COPY ./tinycloud-node-server/ ./tinycloud-node-server/
 COPY ./tinycloud-auth/ ./tinycloud-auth/
 COPY ./tinycloud-core/ ./tinycloud-core/
@@ -27,6 +29,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 ARG CARGO_FEATURES=""
 COPY --from=planner /app/recipe.json recipe.json
+COPY --from=planner /app/rust-toolchain.toml ./
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     if [ -n "$CARGO_FEATURES" ]; then \

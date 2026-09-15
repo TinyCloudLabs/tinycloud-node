@@ -517,9 +517,11 @@ pub async fn delegate(
 /// `did:key`-signed UCAN-format revocation by the Grant Issuer. That second
 /// signature suite is staged on top of the existing pipeline as a followup
 /// (it requires a new variant in `tinycloud-auth::TinyCloudRevocation`); the
-/// Policy-v3 roots are control-plane artifacts and are revoked only through
-/// their signed `/policy/v3/status` checkpoint; this route must never
-/// turn an ordinary revocation into a root-status projection.
+/// Policy-v3 preserves its signed root-status projection, while its runtime
+/// also consults this durable generic graph. Thus an SDK revocation of a
+/// registered root immediately denies Policy/v3 admission, delivery, and
+/// ordinary descendant invocation without this route forging a status
+/// checkpoint.
 #[post("/revoke")]
 pub async fn revoke(
     r: AuthHeaderGetter<RevocationInfo>,
