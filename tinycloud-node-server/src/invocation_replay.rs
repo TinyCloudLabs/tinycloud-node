@@ -343,7 +343,10 @@ mod tests {
         let gate = node.sqlite_writer_lock().unwrap();
         let writer = gate.lock().await;
         let transaction = node.readable().await.unwrap();
-        delegation::Entity::find().count(&transaction).await.unwrap();
+        delegation::Entity::find()
+            .count(&transaction)
+            .await
+            .unwrap();
         let cleanup_replay = replay.clone();
         let mut insertion = tokio::spawn(async move {
             replay
@@ -353,9 +356,10 @@ mod tests {
                 )
                 .await
         });
-        let mut cleanup = tokio::spawn(async move {
-            cleanup_replay.cleanup(OffsetDateTime::now_utc(), 300).await
-        });
+        let mut cleanup =
+            tokio::spawn(
+                async move { cleanup_replay.cleanup(OffsetDateTime::now_utc(), 300).await },
+            );
         let early =
             tokio::time::timeout(std::time::Duration::from_millis(100), &mut insertion).await;
         let early_cleanup =
