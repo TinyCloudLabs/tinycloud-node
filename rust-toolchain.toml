@@ -1,0 +1,8 @@
+[toolchain]
+# Keep local development, CI, and release builds on the reviewed compiler
+# version. Do not use a floating `stable`: new deny-by-default lints can turn
+# an otherwise unchanged release head red.
+channel = "1.97.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
+targets = ["wasm32-unknown-unknown"]

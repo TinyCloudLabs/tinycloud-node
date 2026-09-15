@@ -5,6 +5,7 @@ const expectedRoutes = [
   "/policy/v3/policies",
   "/policy/v3/challenges",
   "/policy/v3/delegations",
+  "/policy/v3/deliveries/authorize",
 ];
 const workflow = readFileSync(".github/workflows/docker.yml", "utf8");
 const source = readFileSync("tinycloud-node-server/src/policy_v3.rs", "utf8");
