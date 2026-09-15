@@ -228,7 +228,7 @@ fn previous(conn: &Connection, head: &Head) -> Result<Value, SqlError> {
     let Some(revision) = &head.revision else {
         return conn.query_row("SELECT source,source_id,title,started_at,duration_secs,organizer_email,participants,summary_overview,summary_action_items,keywords,meeting_type,metadata FROM connector_meeting WHERE id=?",[&head.id],|r|{
    let json_cell=|i|{let raw:Option<String>=r.get(i)?;Ok::<Value,rusqlite::Error>(raw.and_then(|raw|serde_json::from_str(&raw).ok()).unwrap_or(Value::Null))};
-   Ok(json!({"id":head.id,"source":r.get::<_,String>(0)?,"sourceId":r.get::<_,String>(1)?,"title":r.get::<_,Option<String>>(2)?,"startedAt":r.get::<_,Option<String>>(3)?,"durationSecs":r.get::<_,Option<i64>>(4)?,"organizerEmail":r.get::<_,Option<String>>(5)?,"participants":json_cell(6)?.as_array().cloned().unwrap_or_default(),"summaryOverview":r.get::<_,Option<String>>(7)?,"summaryActionItems":r.get::<_,Option<String>>(8)?,"keywords":json_cell(9)?,"meetingType":r.get::<_,Option<String>>(10)?,"metadata":json_cell(11)?.as_object().cloned().unwrap_or_default()}))
+   Ok(json!({"id":head.id,"source":r.get::<_,String>(0)?,"sourceId":r.get::<_,String>(1)?,"title":r.get::<_,Option<String>>(2)?,"startedAt":r.get::<_,Option<String>>(3)?,"durationSecs":r.get::<_,Option<f64>>(4)?,"organizerEmail":r.get::<_,Option<String>>(5)?,"participants":json_cell(6)?.as_array().cloned().unwrap_or_default(),"summaryOverview":r.get::<_,Option<String>>(7)?,"summaryActionItems":r.get::<_,Option<String>>(8)?,"keywords":json_cell(9)?,"meetingType":r.get::<_,Option<String>>(10)?,"metadata":json_cell(11)?.as_object().cloned().unwrap_or_default()}))
   }).map_err(sql);
     };
     let raw:Option<String>=conn.query_row("SELECT snapshot_metadata FROM connector_publication_snapshot WHERE revision=? AND staged=1 AND published=1",[revision],|r|r.get(0)).optional().map_err(sql)?;
@@ -424,7 +424,7 @@ pub fn execute(conn: &Connection, space: &str, command: &Value) -> Result<Value,
                     }
                     tx.execute("INSERT INTO connector_meeting_alias VALUES(?,?) ON CONFLICT(alias) DO NOTHING",params![alias,row.id]).map_err(sql)?;
                 }
-                tx.execute("UPDATE connector_meeting SET title=?,started_at=?,duration_secs=?,organizer_email=?,participants=?,summary_overview=?,summary_action_items=?,keywords=?,meeting_type=?,metadata=?,updated_at=?,head_revision=?,head_snapshot_key=?,publication_head_operation=?,publication_state='published',publication_unavailable_reason=NULL WHERE id=?",params![m["title"].as_str(),m["startedAt"].as_str(),fields["durationSecs"].as_i64(),m["organizerEmail"].as_str(),m["participants"].to_string(),snapshot["overview"]["text"].as_str(),fields["summaryActionItems"].as_str(),if fields["keywords"].is_null(){None}else{Some(fields["keywords"].to_string())},fields["meetingType"].as_str(),m["metadata"].to_string(),now,text(command,"revision")?,text(command,"snapshotKey")?,text(command,"operationId")?,row.id]).map_err(sql)?;
+                tx.execute("UPDATE connector_meeting SET title=?,started_at=?,duration_secs=?,organizer_email=?,participants=?,summary_overview=?,summary_action_items=?,keywords=?,meeting_type=?,metadata=?,updated_at=?,head_revision=?,head_snapshot_key=?,publication_head_operation=?,publication_state='published',publication_unavailable_reason=NULL WHERE id=?",params![m["title"].as_str(),m["startedAt"].as_str(),fields["durationSecs"].as_f64(),m["organizerEmail"].as_str(),m["participants"].to_string(),snapshot["overview"]["text"].as_str(),fields["summaryActionItems"].as_str(),if fields["keywords"].is_null(){None}else{Some(fields["keywords"].to_string())},fields["meetingType"].as_str(),m["metadata"].to_string(),now,text(command,"revision")?,text(command,"snapshotKey")?,text(command,"operationId")?,row.id]).map_err(sql)?;
                 tx.execute(
                     "UPDATE connector_publication_snapshot SET published=1 WHERE revision=?",
                     [text(command, "revision")?],
@@ -549,7 +549,15 @@ mod tests {
         call(conn,json!({"operation":"reserve","source":"fireflies","sourceId":"source","operationId":op})).unwrap()
     }
     fn stage(conn: &Connection, reservation: &Value, text: &str) -> Value {
-        let raw=json!({"contractVersion":3,"source":"fireflies","sourceId":"source","meetingRef":reservation["meetingRef"],"operationId":reservation["operationId"],"createdAt":"2026-09-14T00:00:00Z","metadata":{"title":text,"startedAt":null,"organizerEmail":null,"participants":[],"metadata":{}},"body":{"basis":"transcript","encoding":"utf-8","schema":"text","raw":text,"original":{"digest":hex::encode(Sha256::digest(text.as_bytes())),"byteLength":text.len(),"recordCount":1,"extent":"unknown","captureComplete":null},"omissions":[]},"overview":null,"aliases":[]}).to_string();
+        stage_with_metadata(conn, reservation, text, json!({}))
+    }
+    fn stage_with_metadata(
+        conn: &Connection,
+        reservation: &Value,
+        text: &str,
+        metadata: Value,
+    ) -> Value {
+        let raw=json!({"contractVersion":3,"source":"fireflies","sourceId":"source","meetingRef":reservation["meetingRef"],"operationId":reservation["operationId"],"createdAt":"2026-09-14T00:00:00Z","metadata":{"title":text,"startedAt":null,"organizerEmail":null,"participants":[],"metadata":metadata},"body":{"basis":"transcript","encoding":"utf-8","schema":"text","raw":text,"original":{"digest":hex::encode(Sha256::digest(text.as_bytes())),"byteLength":text.len(),"recordCount":1,"extent":"unknown","captureComplete":null},"omissions":[]},"overview":null,"aliases":[]}).to_string();
         let revision = hex::encode(Sha256::digest(raw.as_bytes()));
         let mut command = reservation.clone();
         command["source"] = json!("fireflies");
@@ -563,6 +571,72 @@ mod tests {
         call(conn, command.clone()).unwrap();
         command.as_object_mut().unwrap().remove("snapshotRaw");
         command
+    }
+    fn legacy_real_duration(duration: Option<f64>) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE connector_meeting(id TEXT PRIMARY KEY,source TEXT NOT NULL,source_id TEXT NOT NULL,title TEXT,started_at TEXT,duration_secs REAL,organizer_email TEXT,participants TEXT,summary_overview TEXT,summary_action_items TEXT,keywords TEXT,meeting_type TEXT,metadata TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);").unwrap();
+        conn.execute("INSERT INTO connector_meeting(id,source,source_id,duration_secs,created_at,updated_at) VALUES('legacy','fireflies','source',?,'now','now')",[duration]).unwrap();
+        let storage_type: String = conn
+            .query_row(
+                "SELECT typeof(duration_secs) FROM connector_meeting",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            storage_type,
+            if duration.is_some() { "real" } else { "null" }
+        );
+        call(&conn, json!({"operation":"activate"})).unwrap();
+        conn
+    }
+    #[test]
+    fn publication_reserves_legacy_integral_real_duration() {
+        let conn = legacy_real_duration(Some(600.0));
+        let reserved = reserve(&conn, "integral");
+        assert_eq!(
+            reserved["previousMeeting"]["durationSecs"].as_f64(),
+            Some(600.0)
+        );
+    }
+    #[test]
+    fn publication_reserves_legacy_fractional_real_duration() {
+        let conn = legacy_real_duration(Some(1.25));
+        let reserved = reserve(&conn, "fractional");
+        assert_eq!(
+            reserved["previousMeeting"]["durationSecs"].as_f64(),
+            Some(1.25)
+        );
+    }
+    #[test]
+    fn publication_reserves_legacy_null_duration() {
+        let conn = legacy_real_duration(None);
+        assert!(reserve(&conn, "null")["previousMeeting"]["durationSecs"].is_null());
+    }
+    #[test]
+    fn publication_preserves_numeric_and_null_durations_in_catalog_and_next_reservation() {
+        for duration in [json!(600), json!(600.0), json!(1.25), Value::Null] {
+            let conn = ready();
+            let reserved = reserve(&conn, "duration");
+            let mut command = stage_with_metadata(
+                &conn,
+                &reserved,
+                "synthetic original",
+                json!({"connector_fields":{"durationSecs":duration}}),
+            );
+            command["operation"] = json!("publish");
+            call(&conn, command).unwrap();
+            let stored: Option<f64> = conn
+                .query_row("SELECT duration_secs FROM connector_meeting", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(stored, duration.as_f64(), "published duration {duration}");
+            assert_eq!(
+                reserve(&conn, "next")["previousMeeting"]["durationSecs"],
+                duration
+            );
+        }
     }
     #[test]
     fn publication_capabilities_and_first_insert_race() {
