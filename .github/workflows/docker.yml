@@ -69,6 +69,9 @@ jobs:
       - name: Audit durable meeting publication footprint without exporting data
         env:
           RECOVERY_DATABASE_URL: ${{ secrets.PROD_TINYCLOUD_DATABASE_URL }}
+          # libpq needs the public CA bundle explicitly for verify-full;
+          # production's Rust TLS client has compiled-in public roots.
+          PGSSLROOTCERT: /etc/ssl/certs/ca-certificates.crt
         run: python3 scripts/audit-meeting-rollback.py
       - uses: actions/upload-artifact@v4
         if: always()
@@ -498,8 +501,14 @@ jobs:
               --data '{}' \
               "${NODE_ORIGIN}${route}")"
 
-            if [ "${STATUS}" != "400" ] && [ "${STATUS}" != "422" ]; then
-              echo "::error::${route} returned HTTP ${STATUS}; expected 400 or 422 for an intentionally invalid request. The Policy/v3 production contract is not mounted correctly."
+            # The delivery route requires the authenticated invocation guard
+            # before JSON parsing; its intentionally unauthenticated probe is 401.
+            EXPECTED_AUTH_REJECTION=false
+            if [ "${route}" = "/policy/v3/deliveries/authorize" ] && [ "${STATUS}" = "401" ]; then
+              EXPECTED_AUTH_REJECTION=true
+            fi
+            if [ "${STATUS}" != "400" ] && [ "${STATUS}" != "422" ] && [ "${EXPECTED_AUTH_REJECTION}" != "true" ]; then
+              echo "::error::${route} returned unexpected HTTP ${STATUS} for an intentionally invalid unauthenticated request."
               head -c 1000 "${RESPONSE_FILE}" || true
               rm -f "${RESPONSE_FILE}"
               exit 1
