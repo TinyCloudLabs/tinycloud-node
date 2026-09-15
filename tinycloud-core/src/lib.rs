@@ -10,6 +10,7 @@ pub mod events;
 pub mod hash;
 pub mod keys;
 pub mod manifest;
+pub mod meeting_legacy_guard;
 pub mod migrations;
 pub mod models;
 pub mod policy_authority;

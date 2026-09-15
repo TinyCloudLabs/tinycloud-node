@@ -1842,6 +1842,7 @@ async fn invoke_impl(
                         TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
                         TxStoreError::KvPreconditionFailed => Status::PreconditionFailed,
                         TxStoreError::MeetingSnapshotProtected => Status::Forbidden,
+                        TxStoreError::LegacyMeetingFrozen => Status::Conflict,
                         TxStoreError::KvSerializationConflict => Status::ServiceUnavailable,
                         TxStoreError::KvResponseTooLarge { .. } => Status::PayloadTooLarge,
                         TxStoreError::Tx(TxError::InvalidInvocation(
@@ -2191,21 +2192,27 @@ async fn handle_sql_invoke(
     // post-execute, so a write crossing the limit is admitted and the next
     // write 402s. No shrink — DELETE does not reduce artifact size without
     // VACUUM, so an over-quota space cannot self-serve shrink.
-    if sql_request_is_write(&sql_request, &exec_caveats, ability) {
-        staged_batch_remaining(space, tinycloud, config, quota_cache).await?;
-    }
-
     let publication_command =
         meeting_publication::command(&sql_request, path, ability, &exec_caveats)?;
     if publication_command.is_some() {
         meeting_publication::require_unconstrained_chain(tinycloud, &parent_cids).await?;
     }
-    if publication_command.as_ref().is_some_and(|command| {
-        !matches!(
+    // Barrier controls change graph state only and must remain available when
+    // content storage is full, especially release after a completed migration.
+    let grows_content = match publication_command.as_ref() {
+        Some(command) => !matches!(
             command["operation"].as_str(),
-            Some("capabilities" | "inspect")
-        )
-    }) {
+            Some(
+                "capabilities"
+                    | "inspect"
+                    | "freeze_legacy"
+                    | "unfreeze_legacy"
+                    | "legacy_freeze_status"
+            )
+        ),
+        None => sql_request_is_write(&sql_request, &exec_caveats, ability),
+    };
+    if grows_content {
         staged_batch_remaining(space, tinycloud, config, quota_cache).await?;
     }
     let execute_start = Instant::now();
@@ -6031,6 +6038,71 @@ mod tests {
             .manage(HookRuntime::new(HooksConfig::default(), [9u8; 32]))
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
         manage_tc405_test_state(rocket, conn)
+    }
+
+    #[tokio::test]
+    async fn legacy_freeze_controls_work_over_quota_while_publication_growth_rejects() -> Result<()>
+    {
+        use rocket::{
+            data::ByteUnit,
+            http::{ContentType, Header},
+            local::asynchronous::Client,
+        };
+        use tinycloud_core::{
+            models::abilities,
+            sea_orm::{ActiveModelTrait, ActiveValue::Set},
+            types::Caveats,
+        };
+        let mut setup = metered_sql_http_setup("legacy-freeze-quota").await?;
+        setup.resource = setup.space.clone().to_resource(
+            "sql".parse()?,
+            Some(tinycloud_core::sql::publication::SQL_PATH.parse()?),
+            None,
+            None,
+        );
+        abilities::ActiveModel {
+            delegation: Set(setup.parent_cid.into()),
+            resource: Set(Resource::TinyCloud(setup.resource.clone())),
+            ability: Set(Ability::try_from("tinycloud.sql/write".to_string()).unwrap()),
+            caveats: Set(Caveats(Default::default())),
+        }
+        .insert(&setup.replay_db)
+        .await?;
+        let cases = [
+            ("legacy_freeze_status", 0, 200),
+            ("freeze_legacy", 0, 200),
+            ("unfreeze_legacy", 1, 200),
+            ("reserve", 0, 402),
+            ("stage", 0, 402),
+            ("publish", 0, 402),
+        ];
+        let mut requests = vec![];
+        for (index, (operation, expected, status)) in cases.into_iter().enumerate() {
+            requests.push((operation,status,sql_invocation_header(&setup,"tinycloud.sql/write",&format!("urn:uuid:legacy-quota-{index}"))?,
+                serde_json::to_string(&SqlRequest::ExecuteStatement{name:tinycloud_core::sql::publication::STATEMENT.into(),params:vec![SqlValue::Text(serde_json::json!({"contractVersion":3,"operation":operation,"expectedGeneration":expected}).to_string())]})?));
+        }
+        let client = Client::tracked(metered_sql_rocket(setup, ByteUnit::Byte(1))).await?;
+        for (operation, expected, auth, body) in requests {
+            let response = client
+                .post("/invoke")
+                .header(Header::new("Authorization", auth))
+                .header(ContentType::JSON)
+                .body(body)
+                .dispatch()
+                .await;
+            let status = response.status().code;
+            let body = response.into_string().await.unwrap_or_default();
+            assert_eq!(status, expected, "{operation} at exhausted quota: {body}");
+            if operation == "unfreeze_legacy" {
+                let response: serde_json::Value = serde_json::from_str(&body)?;
+                let receipt: serde_json::Value = serde_json::from_str(
+                    response["rows"][0][0].as_str().expect("receipt JSON cell"),
+                )?;
+                assert_eq!(receipt["legacyWritesFrozen"], false);
+                assert_eq!(receipt["legacyFreezeGeneration"], 2);
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test]
