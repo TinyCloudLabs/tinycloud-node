@@ -1806,4 +1806,21 @@ mod tests {
             "full legacy v1 validation must still require authority_material_path"
         );
     }
+
+    /// The release preflight deliberately uses the production PostgreSQL URL,
+    /// but must remain a no-I/O validation. A URL without `verify-full` is a
+    /// startup refusal even on the policy-v3 path that omits v1 authority
+    /// material.
+    #[cfg(not(feature = "mounted-fixture"))]
+    #[tokio::test]
+    async fn v2_preflight_rejects_postgres_without_verify_full() {
+        let mut config = enabled_config();
+        config.authority_material_path = None;
+        let _trust_bundle = install_bundle(&mut config);
+
+        assert_eq!(
+            config.validate_for_v2_database("postgresql://user:password@db.example/share"),
+            Err("share email PostgreSQL requires sslmode=verify-full")
+        );
+    }
 }
