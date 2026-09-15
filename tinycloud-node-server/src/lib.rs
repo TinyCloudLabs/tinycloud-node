@@ -215,6 +215,16 @@ fn sqlite_connect_options(database: &str) -> ConnectOptions {
     connect_opts
 }
 
+fn node_replay_cache(tinycloud: &TinyCloud) -> InvocationReplayCache {
+    InvocationReplayCache::new(tinycloud.connection().clone())
+        .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock())
+}
+
+fn node_artifact_repository(tinycloud: &TinyCloud) -> SeaOrmDatabaseArtifactRepository {
+    SeaOrmDatabaseArtifactRepository::new(tinycloud.connection().clone())
+        .with_sqlite_writer_lock(tinycloud.sqlite_writer_lock())
+}
+
 pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     let tinycloud_config = config.extract::<Config>()?;
     app_with_control(config, &tinycloud_config, None).await
@@ -393,16 +403,10 @@ pub async fn app_with_control(
 
     let database_connection = Database::connect(connect_opts).await?;
     // SQL/DuckDB artifact-size mirror folded into `store_size`. Empty here;
-    // wired into the decorator + SpaceDatabase BEFORE migrations, then seeded
+    // wired into SpaceDatabase, then seeded
     // from DB truth AFTER `TinyCloud::new` runs migrations (see below).
     let sql_sizes = SqlSizes::new();
     let seed_conn = database_connection.clone();
-    let raw_artifact_repository = Arc::new(SeaOrmDatabaseArtifactRepository::new(
-        database_connection.clone(),
-    ));
-    let database_artifact_repository: Arc<dyn DatabaseArtifactRepository> = Arc::new(
-        SizeTrackingArtifactRepository::new(raw_artifact_repository, sql_sizes.clone()),
-    );
 
     // Encryption module: seal network private keys with the same kind of derived
     // key used for DB column encryption. In DStack mode the seal is rooted in
@@ -428,6 +432,11 @@ pub async fn app_with_control(
     .with_sql_sizes(sql_sizes.clone());
     let encryption_service =
         encryption_service.with_sqlite_writer_lock(tinycloud.sqlite_writer_lock());
+    let database_artifact_repository: Arc<dyn DatabaseArtifactRepository> =
+        Arc::new(SizeTrackingArtifactRepository::new(
+            Arc::new(node_artifact_repository(&tinycloud)),
+            sql_sizes.clone(),
+        ));
 
     // Seed the SQL-size mirror AFTER `TinyCloud::new` ran migrations — the
     // `database_artifact` table now exists (seeding before migrations would
@@ -492,7 +501,7 @@ pub async fn app_with_control(
         tinycloud_config.storage.limit,
         std::env::var("TINYCLOUD_QUOTA_URL").ok(),
     );
-    let invocation_replay_cache = InvocationReplayCache::new(seed_conn.clone());
+    let invocation_replay_cache = node_replay_cache(&tinycloud);
     let replay_cleanup = invocation_replay_cache.clone();
     // TC-341: the periodic sweep also reclaims rows beyond the lifetime cap.
     let replay_max_lifetime_secs = tinycloud_config.invocation.max_lifetime_secs;
@@ -999,6 +1008,120 @@ mod sqlite_tuning_tests {
         assert_eq!(pragma(&db, "cache_size").await, "-65536");
         assert_eq!(pragma(&db, "temp_store").await, "2"); // 2 = MEMORY
         assert_eq!(pragma(&db, "mmap_size").await, "268435456");
+    }
+
+    async fn artifact_save_preserves_delegation_snapshot(delta: bool) {
+        use tinycloud_core::{
+            database_artifacts::ArtifactExpectation,
+            hash::hash,
+            models::{actor, delegation},
+            sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait, PaginatorTrait},
+            storage::{either::Either, StorageConfig},
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite:{}?mode=rwc",
+            directory.path().join("caps.db").display()
+        );
+        let connection = Database::connect(sqlite_connect_options(&url))
+            .await
+            .unwrap();
+        let blocks = storage::file_system::FileSystemConfig::new(directory.path().join("blocks"))
+            .open()
+            .await
+            .unwrap();
+        let node = TinyCloud::new(
+            connection,
+            Either::B(blocks),
+            tinycloud_core::keys::StaticSecret::new(vec![7u8; 64]).unwrap(),
+        )
+        .await
+        .unwrap();
+        // Exercise the production repository wiring as well as its write path.
+        let repository = node_artifact_repository(&node);
+        let actor_id = "did:key:artifact-snapshot-fixture";
+        actor::ActiveModel {
+            id: Set(actor_id.to_owned()),
+        }
+        .insert(node.connection())
+        .await
+        .unwrap();
+        repository
+            .save(
+                "sql",
+                "space",
+                "main",
+                vec![1; 100],
+                ArtifactExpectation::Absent,
+            )
+            .await
+            .unwrap();
+
+        let gate = node.sqlite_writer_lock().unwrap();
+        let writer = gate.lock().await;
+        let transaction = node.readable().await.unwrap();
+        delegation::Entity::find()
+            .count(&transaction)
+            .await
+            .unwrap();
+        let mut save = tokio::spawn(async move {
+            if delta {
+                repository
+                    .save_delta(
+                        "sql",
+                        "space",
+                        "main",
+                        vec![2; 12],
+                        ArtifactExpectation::Any,
+                    )
+                    .await
+                    .map(|saved| saved.revision)
+            } else {
+                repository
+                    .save(
+                        "sql",
+                        "space",
+                        "main",
+                        vec![3; 120],
+                        ArtifactExpectation::Any,
+                    )
+                    .await
+                    .map(|saved| saved.revision)
+            }
+        });
+        let early = tokio::time::timeout(std::time::Duration::from_millis(100), &mut save).await;
+
+        delegation::ActiveModel {
+            id: Set(hash(b"artifact-delegation-write-snapshot")),
+            delegator: Set(actor_id.to_owned()),
+            delegatee: Set(actor_id.to_owned()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(b"synthetic database race fixture".to_vec()),
+        }
+        .insert(&transaction)
+        .await
+        .expect("artifact persistence must not invalidate the delegation snapshot");
+        transaction.commit().await.unwrap();
+        assert!(
+            early.is_err(),
+            "artifact persistence must wait for the node's writer gate"
+        );
+        drop(writer);
+        assert_eq!(save.await.unwrap().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn artifact_checkpoint_cannot_invalidate_a_delegation_write_snapshot() {
+        artifact_save_preserves_delegation_snapshot(false).await;
+    }
+
+    #[tokio::test]
+    async fn artifact_delta_cannot_invalidate_a_delegation_write_snapshot() {
+        artifact_save_preserves_delegation_snapshot(true).await;
     }
 }
 

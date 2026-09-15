@@ -2768,7 +2768,16 @@ mod tests {
         use sea_orm_migration::{MigratorTrait, SchemaManager};
 
         let db = Database::connect("sqlite::memory:").await.unwrap();
-        crate::migrations::Migrator::up(&db, None).await.unwrap();
+        // Apply the prefix through this migration, not future migrations whose
+        // rollback contracts are independent of these policy tables.
+        let migrations = crate::migrations::Migrator::migrations();
+        let policy_index = migrations
+            .iter()
+            .position(|migration| migration.name() == "m20260715_000000_policy_authority")
+            .unwrap();
+        crate::migrations::Migrator::up(&db, Some(policy_index as u32 + 1))
+            .await
+            .unwrap();
         let schema = SchemaManager::new(&db);
         for table in [
             "policy_delegation",
@@ -2779,12 +2788,7 @@ mod tests {
             assert!(schema.has_table(table).await.unwrap(), "missing {table}");
         }
 
-        let migrations = crate::migrations::Migrator::migrations();
-        let policy_index = migrations
-            .iter()
-            .position(|migration| migration.name() == "m20260715_000000_policy_authority")
-            .unwrap();
-        crate::migrations::Migrator::down(&db, Some((migrations.len() - policy_index) as u32))
+        crate::migrations::Migrator::down(&db, Some(1))
             .await
             .unwrap();
         for table in [
@@ -2794,6 +2798,19 @@ mod tests {
             "policy_edge",
         ] {
             assert!(!schema.has_table(table).await.unwrap(), "retained {table}");
+        }
+
+        crate::migrations::Migrator::up(&db, Some(1)).await.unwrap();
+        for table in [
+            "policy_delegation",
+            "policy_challenge",
+            "policy_issuance_audit",
+            "policy_edge",
+        ] {
+            assert!(
+                schema.has_table(table).await.unwrap(),
+                "not restored {table}"
+            );
         }
     }
 

@@ -80,7 +80,7 @@ pub enum InvocationError {
     #[error("Unauthorized Invoker")]
     UnauthorizedInvoker(String),
     #[error("Unauthorized Action: {0} / {1}")]
-    UnauthorizedAction(Resource, Ability),
+    UnauthorizedAction(Box<Resource>, Ability),
     #[error("Cannot find parent delegation")]
     MissingParents,
     #[error("No Such Key: {0}")]
@@ -339,7 +339,7 @@ async fn validate<C: ConnectionTrait>(
                     {
                         return match dependant_caps.first() {
                             Some(capability) => Err(InvocationError::UnauthorizedAction(
-                                capability.resource.clone(),
+                                Box::new(capability.resource.clone()),
                                 capability.ability.clone(),
                             )
                             .into()),
@@ -389,7 +389,7 @@ async fn validate<C: ConnectionTrait>(
 
                 if candidates.peek().is_none() {
                     return Err(InvocationError::UnauthorizedAction(
-                        c.resource.clone(),
+                        Box::new(c.resource.clone()),
                         c.ability.clone(),
                     )
                     .into());
@@ -882,6 +882,29 @@ mod tests {
             .generate(&JWK::generate_ed25519().unwrap(), "key")
             .unwrap();
         SpaceId::new(did, name.parse().unwrap())
+    }
+
+    #[test]
+    fn authorization_errors_fit_the_inline_result_budget() {
+        // Clippy's default large-error threshold is 128 bytes. Keep the shared
+        // errors below it at their source, including the concrete model wrappers.
+        for (name, size) in [
+            ("InvocationError", std::mem::size_of::<InvocationError>()),
+            ("invocation::Error", std::mem::size_of::<Error>()),
+            (
+                "DelegationError",
+                std::mem::size_of::<crate::models::delegation::DelegationError>(),
+            ),
+            (
+                "delegation::Error",
+                std::mem::size_of::<crate::models::delegation::Error>(),
+            ),
+        ] {
+            assert!(
+                size <= 128,
+                "{name} is {size} bytes, exceeding the 128-byte result budget"
+            );
+        }
     }
 
     fn test_write(space: &SpaceId, key: &str, label: &str, seq: i64) -> kv_write::Model {

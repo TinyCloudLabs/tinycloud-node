@@ -782,7 +782,7 @@ mod tests {
         // Apply TC-282 itself and re-collect the ANALYZE'd table stats so
         // the planner sees realistic cardinalities, not empty-table
         // defaults.
-        Migrator::up(&db, None).await.unwrap();
+        Migrator::up(&db, Some(1)).await.unwrap();
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
             "ANALYZE".to_string(),
@@ -819,11 +819,9 @@ mod tests {
         // down() drops all 11 and leaves the schema exactly as it was
         // before TC-282 ran.
         //
-        // TC-381: `Some(1)` assumed TC-282 was the last applied migration and
-        // silently began rolling back an unrelated later migration instead.
-        // Roll back everything from the end down to and including TC-282.
-        let rollback = migrations.len() as u32 - before_this;
-        Migrator::down(&db, Some(rollback)).await.unwrap();
+        // TC-381: locate the prefix by name above and apply only TC-282, so
+        // this single rollback cannot accidentally target a later migration.
+        Migrator::down(&db, Some(1)).await.unwrap();
         for (_, table, index_name) in EXPECTED_INDEXES
             .iter()
             .map(|(name, table, _)| (*name, *table, *name))
@@ -837,7 +835,7 @@ mod tests {
         }
 
         // up() is re-runnable thanks to `.if_not_exists()`.
-        Migrator::up(&db, None).await.unwrap();
+        Migrator::up(&db, Some(1)).await.unwrap();
         for (index_name, table, _) in EXPECTED_INDEXES {
             assert!(
                 index_names(&db, table)

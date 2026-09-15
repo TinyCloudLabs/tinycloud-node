@@ -2389,10 +2389,8 @@ fn validate_stored_root_status(
         if previous_digest.is_some() {
             return Err("root-status-chain-invalid");
         }
-    } else {
-        if previous_digest != root.previous_checkpoint_digest_hex.as_deref() {
-            return Err("root-status-chain-invalid");
-        }
+    } else if previous_digest != root.previous_checkpoint_digest_hex.as_deref() {
+        return Err("root-status-chain-invalid");
     }
     let signature = object
         .get("signature")
