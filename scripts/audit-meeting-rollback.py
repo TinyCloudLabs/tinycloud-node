@@ -84,8 +84,16 @@ def main():
                           ('password authentication failed', 'AUTHENTICATION_FAILED'),
                           ('invalid connection option', 'UNSUPPORTED_DSN_OPTION')]
             diagnostic = next((code for marker, code in categories if marker in result.stderr), None)
+            # Fixed vocabulary reveals the error class without emitting any
+            # remote text, database identifiers or connection values.
+            vocabulary = ['ssl', 'certificate', 'tenant', 'user not found', 'password',
+                          'postgresql-client', 'install', 'connection', 'refused',
+                          'timeout', 'options', 'unsupported', 'invalid', 'permission',
+                          'does not exist', 'syntax', 'could not', 'fatal', 'server',
+                          'require', 'no such file', 'database system', 'pg_wrapper']
             print(json.dumps({'queryFailed': True, 'sqlstate': sqlstate.group(1) if sqlstate else None,
-                              'connectionCategory': diagnostic}))
+                              'connectionCategory': diagnostic, 'exitCode': result.returncode,
+                              'diagnosticTerms': [term for term in vocabulary if term in result.stderr.lower()]}))
             raise RuntimeError('AUDIT_QUERY_FAILED')
         counts = json.loads(result.stdout.strip())
         expected = {'connectorsDatabases','targetDatabases','targetPublicationCandidates',
