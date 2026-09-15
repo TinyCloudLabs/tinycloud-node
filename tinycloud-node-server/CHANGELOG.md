@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.16.0](https://github.com/TinyCloudLabs/tinycloud-node/compare/v0.0.1...v1.16.0) - 2026-09-15
+
+### Added
+
+- *(TC-498)* authorize exact native share email delivery ([#229](https://github.com/TinyCloudLabs/tinycloud-node/pull/229))
+
 ## [1.14.0](https://github.com/TinyCloudLabs/tinycloud-node/compare/v1.13.0...v1.14.0) - 2026-08-05
 
 ### Added
