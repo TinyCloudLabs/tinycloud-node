@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import re
 from datetime import datetime, timezone
 
 TARGET = '8aa0096ee9d8c64b2f59bfb7b1e6a0e7b32863948e4eb52f549b0d9927a7bb61'
@@ -71,10 +72,20 @@ def main():
     env = dict(os.environ, PGCONNECT_TIMEOUT='15', PGOPTIONS='-c default_transaction_read_only=on')
     try:
         result = subprocess.run(['psql', '--no-psqlrc', '--quiet', '--tuples-only', '--no-align',
-                                 '--set=ON_ERROR_STOP=1', '--dbname', dsn],
+                                 '--set=ON_ERROR_STOP=1', '--set=VERBOSITY=sqlstate', '--dbname', dsn],
                                 input=SQL, text=True, capture_output=True, env=env, timeout=65)
         if result.returncode:
             # Do not dump libpq diagnostics, connection data or other user data.
+            sqlstate = re.search(r'\b(?:ERROR|FATAL):\s+([0-9A-Z]{5})\b', result.stderr)
+            categories = [('invalid URI query parameter', 'UNSUPPORTED_DSN_PARAMETER'),
+                          ('could not translate host name', 'DNS_LOOKUP_FAILED'),
+                          ('Connection refused', 'CONNECTION_REFUSED'),
+                          ('timeout expired', 'CONNECTION_TIMED_OUT'),
+                          ('password authentication failed', 'AUTHENTICATION_FAILED'),
+                          ('invalid connection option', 'UNSUPPORTED_DSN_OPTION')]
+            diagnostic = next((code for marker, code in categories if marker in result.stderr), None)
+            print(json.dumps({'queryFailed': True, 'sqlstate': sqlstate.group(1) if sqlstate else None,
+                              'connectionCategory': diagnostic}))
             raise RuntimeError('AUDIT_QUERY_FAILED')
         counts = json.loads(result.stdout.strip())
         expected = {'connectorsDatabases','targetDatabases','targetPublicationCandidates',
