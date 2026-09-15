@@ -167,6 +167,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: [version-guard]
     if: github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     permissions:
       contents: read
       packages: write
@@ -218,6 +220,7 @@ jobs:
             type=raw,value=dstack${{ steps.build_features.outputs.image_suffix }},enable={{is_default_branch}}
 
       - name: Build and push dstack Docker image
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -230,10 +233,20 @@ jobs:
 
   deploy-phala:
     runs-on: ubuntu-latest
-    needs: [build, build-dstack]
+    needs: [version-guard, build, build-dstack]
     if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.deploy_phala)
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v4
+
+      - name: Log in to GHCR for runtime configuration preflight
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -248,34 +261,66 @@ jobs:
       - name: Install Phala CLI
         run: npm install -g phala@1.1.19
 
-      - name: Update compose with release tag
+      - name: Validate and pin deployment image
+        env:
+          BUILD_DIGEST: ${{ needs.build-dstack.outputs.digest }}
         run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            TAG="${{ github.event.release.tag_name }}"
-          else
-            TAG="${{ inputs.image_version }}"
-            if [ -z "${TAG}" ]; then
-              if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
-                echo "::error::workflow_dispatch deploy_phala requires image_version unless the workflow is run from a tag"
-                exit 1
-              fi
-              TAG="${GITHUB_REF_NAME}"
-            fi
+          set -euo pipefail
+          DIGEST="${BUILD_DIGEST}"
+          if ! [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::build-dstack did not produce an immutable OCI digest"
+            exit 1
           fi
-          # metadata-action emits {{version}} without the leading v (e.g. 1.3.0).
-          # Strip a leading v from the tag to match the pushed image tag.
-          VERSION="${TAG#v}"
-          DUCKDB_SUFFIX=""
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.include_duckdb }}" = "true" ]; then
-            DUCKDB_SUFFIX="-duckdb"
+          export RESOLVED_IMAGE="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+          docker pull "${RESOLVED_IMAGE}"
+          REVISION="$(docker image inspect "${RESOLVED_IMAGE}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
+          if [ "${REVISION}" != "${GITHUB_SHA}" ]; then
+            echo "::error::candidate OCI revision '${REVISION}' does not match workflow commit '${GITHUB_SHA}'"
+            exit 1
           fi
-          # The prod CVM uses the dstack-suffixed image. Replace the floating
-          # ":dstack" tag in the checked-in compose with the versioned tag
-          # built by the build-dstack job (e.g. ":1.3.0-dstack" or
-          # ":1.3.0-dstack-duckdb").
-          sed -i "s|ghcr.io/tinycloudlabs/tinycloud-node:dstack|ghcr.io/tinycloudlabs/tinycloud-node:${VERSION}-dstack${DUCKDB_SUFFIX}|g" docker-compose.dstack-postgres.yaml
-          echo "Resolved image tag: ghcr.io/tinycloudlabs/tinycloud-node:${VERSION}-dstack${DUCKDB_SUFFIX}"
+
+          # Keep this immutable reference through preflight, compose parsing,
+          # and Phala. A version tag can be retargeted between build and deploy.
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+
+          path = Path("docker-compose.dstack-postgres.yaml")
+          content = path.read_text()
+          floating = "ghcr.io/tinycloudlabs/tinycloud-node:dstack"
+          if content.count(floating) != 1:
+              raise SystemExit("expected exactly one floating dstack image in compose")
+          path.write_text(content.replace(floating, os.environ["RESOLVED_IMAGE"]))
+          PY
+          echo "Resolved immutable candidate: ${RESOLVED_IMAGE}"
           cat docker-compose.dstack-postgres.yaml
+
+      # TC-500: Phala considers a CVM ready before compose services have
+      # started. Validate the production-sealed bundle using the exact image
+      # selected above against the production database/TLS/key configuration,
+      # without opening a database, resolving dstack, network, or socket
+      # access, before the deploy step can replace the healthy CVM.
+      - name: Preflight sealed runtime configuration
+        env:
+          TINYCLOUD_STORAGE__DATABASE: ${{ secrets.PROD_TINYCLOUD_DATABASE_URL }}
+          TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_BASE64: ${{ secrets.PROD_TINYCLOUD_SHARE_TRUST_BUNDLE_BASE64 }}
+          TINYCLOUD_SHARE_EMAIL__POSTGRES_TLS__SSLMODE: verify-full
+          TINYCLOUD_KEYS__TYPE: Dstack
+        run: |
+          set -euo pipefail
+          IMAGE="$(sed -n -E 's/^    image: (ghcr.io\/tinycloudlabs\/tinycloud-node(:[^[:space:]]+|@sha256:[0-9a-f]{64}))$/\1/p' docker-compose.dstack-postgres.yaml)"
+          if [ "$(printf '%s\n' "${IMAGE}" | awk 'NF { count += 1 } END { print count + 0 }')" != "1" ]; then
+            echo "::error::Expected exactly one resolved TinyCloud Node image for runtime preflight"
+            exit 1
+          fi
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges \
+            -e TINYCLOUD_STORAGE__DATABASE \
+            -e TINYCLOUD_SHARE_EMAIL__ENABLED=true \
+            -e TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_BASE64 \
+            -e TINYCLOUD_SHARE_EMAIL__POSTGRES_TLS__SSLMODE \
+            -e TINYCLOUD_KEYS__TYPE \
+            "${IMAGE}" --validate-config
 
       - name: Deploy to Phala Cloud
         env:
@@ -408,6 +453,7 @@ jobs:
             /policy/v3/policies
             /policy/v3/challenges
             /policy/v3/delegations
+            /policy/v3/deliveries/authorize
           )
 
           # The direct TEE ingress obtains/loads its certificate after the
@@ -435,8 +481,20 @@ jobs:
               --data '{}' \
               "${NODE_ORIGIN}${route}")"
 
-            if [ "${STATUS}" != "400" ] && [ "${STATUS}" != "422" ]; then
-              echo "::error::${route} returned HTTP ${STATUS}; expected 400 or 422 for an intentionally invalid request. The Policy/v3 production contract is not mounted correctly."
+            # Delivery is authenticated before request-body validation, so an
+            # intentionally unsigned body is expected to return 401. Other
+            # control-plane routes reject the body first. Neither case may
+            # silently accept a missing route or a server failure.
+            if [ "${route}" = "/policy/v3/deliveries/authorize" ]; then
+              EXPECTED="401"
+              case "${STATUS}" in 401) VALID=true ;; *) VALID=false ;; esac
+            else
+              EXPECTED="400 or 422"
+              case "${STATUS}" in 400|422) VALID=true ;; *) VALID=false ;; esac
+            fi
+
+            if [ "${VALID}" != true ]; then
+              echo "::error::${route} returned HTTP ${STATUS}; expected ${EXPECTED} for an intentionally invalid request. The Policy/v3 production contract is not mounted correctly."
               head -c 1000 "${RESPONSE_FILE}" || true
               rm -f "${RESPONSE_FILE}"
               exit 1

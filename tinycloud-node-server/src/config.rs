@@ -1448,6 +1448,25 @@ mod tests {
         assert!(config.validate().is_ok());
     }
 
+    /// The deployed pre-TC-500 bundle used this syntactically valid legacy
+    /// audience. It must fail at the same startup gate the release preflight
+    /// invokes rather than being discovered after the CVM has been replaced.
+    #[cfg(not(feature = "mounted-fixture"))]
+    #[tokio::test]
+    async fn legacy_email_origin_is_startup_fatal() {
+        let mut config = enabled_config();
+        let mut document = bundle_document(&config);
+        document["emailOrigin"] = serde_json::Value::String("https://email.tinycloud.xyz".into());
+        let file = NamedTempFile::new().expect("temporary trust bundle");
+        fs::write(file.path(), serde_json::to_vec(&document).unwrap()).expect("trust bundle write");
+        config.trust_bundle_path = Some(file.path().display().to_string());
+
+        assert_eq!(
+            config.resolve_trust_bundle(),
+            Err("share email trust bundle is inconsistent")
+        );
+    }
+
     /// The required field must be a canonical HTTPS origin with no path,
     /// query, fragment, port, or credentials.
     #[cfg(not(feature = "mounted-fixture"))]
@@ -1461,8 +1480,6 @@ mod tests {
             "https://operator:secret@email.tinycloud.xyz",
             "https://email.tinycloud.xyz:8443",
             "email.tinycloud.xyz",
-            // Correct shape, but an unreviewed production audience.
-            "https://email.tinycloud.xyz",
             "https://api.share.tinycloud.xyz",
             "",
             // Caught by the placeholder scan rather than the origin shape.
@@ -1787,6 +1804,23 @@ mod tests {
         assert!(
             config.validate().is_err(),
             "full legacy v1 validation must still require authority_material_path"
+        );
+    }
+
+    /// The release preflight deliberately uses the production PostgreSQL URL,
+    /// but must remain a no-I/O validation. A URL without `verify-full` is a
+    /// startup refusal even on the policy-v3 path that omits v1 authority
+    /// material.
+    #[cfg(not(feature = "mounted-fixture"))]
+    #[tokio::test]
+    async fn v2_preflight_rejects_postgres_without_verify_full() {
+        let mut config = enabled_config();
+        config.authority_material_path = None;
+        let _trust_bundle = install_bundle(&mut config);
+
+        assert_eq!(
+            config.validate_for_v2_database("postgresql://user:password@db.example/share"),
+            Err("share email PostgreSQL requires sslmode=verify-full")
         );
     }
 }
