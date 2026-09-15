@@ -220,6 +220,23 @@ pub async fn app(config: &Figment) -> Result<Rocket<Build>> {
     app_with_control(config, &tinycloud_config, None).await
 }
 
+/// Resolve the startup-only configuration gates without opening a key, network
+/// or database connection. Release automation uses this through the binary's
+/// `--validate-config` mode before it replaces the running CVM.
+pub fn resolve_runtime_config(tinycloud_config: &Config) -> Result<Config> {
+    let mut resolved = tinycloud_config.clone();
+    resolved.storage.resolve();
+    resolved.share_email = resolved
+        .share_email
+        .resolve_trust_bundle()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    resolved
+        .share_email
+        .validate_for_v2_database(resolved.storage.database())
+        .map_err(|error| anyhow::anyhow!(error))?;
+    Ok(resolved)
+}
+
 /// The public Node surface keeps policy admission separate from the generic
 /// delegation and invocation data plane. Share-specific data routes are not
 /// mounted.
@@ -274,16 +291,7 @@ pub async fn app_with_control(
     tinycloud_config: &Config,
     control: Option<ControlPlaneHandle>,
 ) -> Result<Rocket<Build>> {
-    let mut tinycloud_config = tinycloud_config.clone();
-    tinycloud_config.storage.resolve();
-    tinycloud_config.share_email = tinycloud_config
-        .share_email
-        .resolve_trust_bundle()
-        .map_err(|error| anyhow::anyhow!(error))?;
-    tinycloud_config
-        .share_email
-        .validate_for_v2_database(tinycloud_config.storage.database())
-        .map_err(|error| anyhow::anyhow!(error))?;
+    let tinycloud_config = resolve_runtime_config(tinycloud_config)?;
 
     // Ensure local storage directories exist.
     // SQLite file paths and local dirs are resources the server owns — auto-create them.

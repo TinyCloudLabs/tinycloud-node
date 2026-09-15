@@ -10,7 +10,7 @@ use rocket::{
     figment::providers::{Env, Format, Serialized, Toml},
     tokio,
 };
-use tinycloud::{app, config, prometheus};
+use tinycloud::{app, config, prometheus, resolve_runtime_config};
 
 fn build_config_figment() -> rocket::figment::Figment {
     let config_file =
@@ -30,6 +30,28 @@ fn build_config_figment() -> rocket::figment::Figment {
 async fn main() {
     let config = build_config_figment(); // That's just for easy access to ROCKET_LOG_LEVEL
     let tinycloud_config = config.extract::<config::Config>().unwrap();
+
+    // This is deliberately before `app`: release automation needs to prove
+    // the exact candidate accepts the sealed trust bundle without opening the
+    // production database, resolving the node key, or binding a socket.
+    if std::env::args_os()
+        .skip(1)
+        .any(|arg| arg == "--validate-config")
+    {
+        match resolve_runtime_config(&tinycloud_config) {
+            Ok(_) => {
+                eprintln!("tinycloud-node runtime configuration is valid");
+                return;
+            }
+            Err(error) => {
+                eprintln!("tinycloud-node runtime configuration is invalid");
+                for cause in error.chain() {
+                    eprintln!("  {cause}");
+                }
+                std::process::exit(1);
+            }
+        }
+    }
 
     let rocket = match app(&config).await {
         Ok(r) => r.ignite().await.unwrap(),
