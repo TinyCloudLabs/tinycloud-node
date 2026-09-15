@@ -32,6 +32,11 @@ jobs:
     - name: Checkout TinyCloud repository
       uses: actions/checkout@v4
 
+    - name: Install reviewed Rust toolchain
+      uses: dtolnay/rust-toolchain@1.97.1
+      with:
+        components: clippy, rustfmt
+
     - name: Add the wasm32 target
       run: rustup target add wasm32-unknown-unknown
 
@@ -64,6 +69,11 @@ jobs:
     steps:
     - name: Checkout TinyCloud repository
       uses: actions/checkout@v4
+
+    - name: Install reviewed Rust toolchain
+      uses: dtolnay/rust-toolchain@1.97.1
+      with:
+        components: clippy, rustfmt
 
     # TC-381: this job used to run `cargo test -p tinycloud-core postgres_`.
     # libtest exits 0 when a name filter matches zero tests, and all four
@@ -106,6 +116,11 @@ jobs:
     - name: Checkout TinyCloud repository
       uses: actions/checkout@v4
 
+    - name: Install reviewed Rust toolchain
+      uses: dtolnay/rust-toolchain@1.97.1
+      with:
+        components: clippy, rustfmt
+
     - name: Add the wasm32 target
       run: rustup target add wasm32-unknown-unknown
 
@@ -121,6 +136,11 @@ jobs:
     - name: Checkout TinyCloud repository
       uses: actions/checkout@v4
 
+    - name: Install reviewed Rust toolchain
+      uses: dtolnay/rust-toolchain@1.97.1
+      with:
+        components: clippy, rustfmt
+
     - name: Fmt
       run: cargo fmt --all -- --check
 
@@ -129,12 +149,14 @@ jobs:
     steps:
     - name: Checkout TinyCloud repository
       uses: actions/checkout@v4
+    - name: Install reviewed Rust toolchain
+      uses: dtolnay/rust-toolchain@1.97.1
+      with:
+        components: clippy, rustfmt
     - name: Setup Node
       uses: actions/setup-node@v4
       with:
         node-version: 20
-    - name: Ensure rustfmt is available
-      run: rustup component add rustfmt
     - name: Verify generated capability artifacts match capabilities.json
       run: node scripts/gen-capabilities.mjs --check
     - name: Verify deployed Policy/v3 probe contract
@@ -151,9 +173,9 @@ jobs:
     steps:
     - name: Checkout TinyCloud repository
       uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@stable
+    - uses: dtolnay/rust-toolchain@1.97.1
       with:
-        components: rustfmt
+        components: clippy, rustfmt
     - uses: actions/setup-python@v5
       with:
         python-version: "3.12"
