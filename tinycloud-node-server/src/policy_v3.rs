@@ -6901,6 +6901,22 @@ mod tests {
         let mut exact_profile = genuine.clone();
         exact_profile["profile"] = json!({"id": "tinycloud.email-proof/v1", "version": 1});
         assert!(verify(&exact_profile, holder).is_err());
+        // A genuinely issuer-signed exact-email credential (signed profile,
+        // descriptor, and even a matching emailDomain disclosure) cannot
+        // satisfy the domain policy either.
+        let mut exact_projection = projection_value.clone();
+        exact_projection["profile"] = json!({"id": "tinycloud.email-proof/v1", "version": 1});
+        exact_projection["descriptorDigest"] = json!("1tg-qphmKBVtNwzVg9xyz-xxqt_xtMXAsQyXw46m8S0");
+        let signed_exact = email_domain_credential(
+            &issuer_key,
+            &exact_projection,
+            holder,
+            "alice@tinycloud.xyz",
+            "tinycloud.xyz",
+            "tinycloud.xyz",
+            issued,
+        );
+        assert!(verify(&signed_exact, holder).is_err());
 
         // The policy commits to the requirement digest: a request carrying a
         // different domain than the owner signed is a substitution.
