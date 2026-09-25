@@ -6706,6 +6706,209 @@ mod tests {
         })
     }
 
+    /// Mints an issuer-signed email-domain credential whose signed
+    /// disclosures and unsigned envelope claims can be varied independently.
+    fn email_domain_credential(
+        issuer_key: &tinycloud_core::libp2p::identity::ed25519::Keypair,
+        projection: &Value,
+        holder: &str,
+        email: &str,
+        signed_domain: &str,
+        envelope_domain: &str,
+        issued: OffsetDateTime,
+    ) -> Value {
+        let disclose = |salt: &str, name: &str, value: &str| {
+            encode_config(
+                canonical_json_value(&json!([salt, name, value])),
+                URL_SAFE_NO_PAD,
+            )
+        };
+        let email_disclosure = disclose("salt-email", "email", email);
+        let domain_disclosure = disclose("salt-domain", "emailDomain", signed_domain);
+        let digest = |disclosure: &str| {
+            encode_config(Sha256::digest(disclosure.as_bytes()), URL_SAFE_NO_PAD)
+        };
+        let expires = issued + Duration::seconds(600);
+        let payload = json!({
+            "iss": projection["issuerDid"], "sub": holder,
+            "iat": issued.unix_timestamp(), "nbf": issued.unix_timestamp(), "exp": expires.unix_timestamp(),
+            "jti": "credential-email-domain", "vct": "opencredentials.email/v1",
+            "profile": projection["profile"]["id"], "profileVersion": 1,
+            "descriptorDigest": projection["descriptorDigest"],
+            "holderBinding": {"did": holder, "signingDomain": "tinycloud.credentials/holder-binding/v1"},
+            "_sd_alg": "sha-256", "_sd": [digest(&email_disclosure), digest(&domain_disclosure)]
+        });
+        let header = json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": projection["issuerKid"]});
+        let signing_input = format!(
+            "{}.{}",
+            encode_config(canonical_json_value(&header), URL_SAFE_NO_PAD),
+            encode_config(canonical_json_value(&payload), URL_SAFE_NO_PAD)
+        );
+        let compact = format!(
+            "{signing_input}.{}~{email_disclosure}~{domain_disclosure}",
+            encode_config(issuer_key.sign(signing_input.as_bytes()), URL_SAFE_NO_PAD)
+        );
+        let claims = json!({"email": email, "emailDomain": envelope_domain});
+        json!({
+            "type": "OpenCredentialsIssuedCredential", "version": 1,
+            "protocol": "tinycloud.credentials/acquisition/v1",
+            "profile": projection["profile"], "credentialType": projection["credentialType"],
+            "schema": "opencredentials.email/v1", "format": "vc+sd-jwt",
+            "issuerDid": projection["issuerDid"], "issuerKid": projection["issuerKid"],
+            "subjectDid": holder, "holderDid": holder,
+            "claims": claims, "claimsDigest": canonical_digest_base64url(&claims),
+            "descriptorDigest": projection["descriptorDigest"], "credentialId": "credential-email-domain",
+            "issuedAt": format_time(issued), "notBefore": format_time(issued), "expiresAt": format_time(expires),
+            "status": {"method": "none", "freshnessSeconds": 300},
+            "credential": compact
+        })
+    }
+
+    #[test]
+    fn email_domain_requirement_is_exact_equality_on_issuer_signed_domain() {
+        let requirement = json!({
+            "type": "TinyCloudCredentialRequirement", "version": 1,
+            "profile": {"id": "tinycloud.email-domain-proof/v1", "version": 1},
+            "credentialType": {"id": "opencredentials.email/v1", "version": 1},
+            "claims": {"emailDomain": "tinycloud.xyz"},
+            "maxAgeSeconds": 300
+        });
+        let projection_value = json!({
+            "type": POLICY_CREDENTIAL_REQUIREMENT_V1, "version": 1,
+            "requirementDigest": canonical_digest_base64url(&requirement),
+            "descriptorDigest": "DdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdD",
+            "issuerDid": "did:web:issuer.credentials.org",
+            "issuerKid": "did:web:issuer.credentials.org#controller",
+            "profile": {"id": "tinycloud.email-domain-proof/v1", "version": 1},
+            "credentialType": {"id": "opencredentials.email/v1", "version": 1}
+        });
+        let projection = validate_policy_credential_requirement(&projection_value).unwrap();
+        validate_request_local_requirement(&requirement, projection).unwrap();
+        let holder = "did:key:z6MkehRgf7yJbgaGfYsdoAsKdBPE3dj2CYhowQdcjqSJgvVd";
+        let issuer_key = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
+        let trusted = IssuerKey::new(
+            "did:web:issuer.credentials.org",
+            "opencredentials.email/v1",
+            1,
+            "did:web:issuer.credentials.org#controller",
+            issuer_key.public().to_bytes(),
+        );
+        let issued = parse_time("2026-09-25T12:00:00Z").unwrap();
+        let now = issued + Duration::seconds(30);
+        let verify = |credential: &Value, holder_did: &str| {
+            verify_opencredentials_credential(
+                credential,
+                &requirement,
+                projection,
+                &trusted,
+                holder_did,
+                now,
+            )
+        };
+        let mint = |email: &str, signed: &str, envelope: &str| {
+            email_domain_credential(
+                &issuer_key,
+                &projection_value,
+                holder,
+                email,
+                signed,
+                envelope,
+                issued,
+            )
+        };
+
+        assert!(verify(
+            &mint("alice@tinycloud.xyz", "tinycloud.xyz", "tinycloud.xyz"),
+            holder
+        )
+        .is_ok());
+
+        // Suffixes, lookalikes, subdomains, case, trailing dots, and IDNA
+        // spellings are different domains: exact equality only.
+        for domain in [
+            "sub.tinycloud.xyz",
+            "tinycloud.xyz.evil",
+            "eviltinycloud.xyz",
+            "TinyCloud.xyz",
+            "tinycloud.xyz.",
+            "tinyclоud.xyz",
+            "xn--tinycloud-xyz.example",
+            "tinycloud.xyz\u{200b}",
+        ] {
+            let email = format!("alice@{domain}");
+            assert_eq!(
+                verify(&mint(&email, domain, domain), holder).err(),
+                Some((
+                    Status::Forbidden,
+                    "credential-requirement-not-satisfied".into()
+                )),
+                "{domain}"
+            );
+        }
+
+        // The unsigned envelope cannot vouch for a domain the issuer did not
+        // sign, and a signed domain cannot be relabelled in the envelope.
+        assert!(verify(
+            &mint("alice@evil.example", "evil.example", "tinycloud.xyz"),
+            holder
+        )
+        .is_err());
+        assert!(verify(
+            &mint("alice@tinycloud.xyz", "tinycloud.xyz", "evil.example"),
+            holder
+        )
+        .is_err());
+
+        // An extra unsigned disclosure, a duplicated claim, or a re-signed
+        // payload are all rejected.
+        let genuine = mint("alice@tinycloud.xyz", "tinycloud.xyz", "tinycloud.xyz");
+        let forged_disclosure = encode_config(
+            canonical_json_value(&json!(["salt-x", "emailDomain", "tinycloud.xyz"])),
+            URL_SAFE_NO_PAD,
+        );
+        let mut unsigned = genuine.clone();
+        unsigned["credential"] = json!(format!(
+            "{}~{forged_disclosure}",
+            genuine["credential"].as_str().unwrap()
+        ));
+        assert!(verify(&unsigned, holder).is_err());
+        let compact = genuine["credential"].as_str().unwrap();
+        let disclosures = compact.split('~').skip(1).collect::<Vec<_>>();
+        let mut duplicated = genuine.clone();
+        duplicated["credential"] = json!(format!("{compact}~{}", disclosures[1]));
+        assert!(verify(&duplicated, holder).is_err());
+        let mut tampered = genuine.clone();
+        let (jwt, rest) = compact.split_once('~').unwrap();
+        let parts = jwt.split('.').collect::<Vec<_>>();
+        let mut payload: Value =
+            serde_json::from_slice(&decode_config(parts[1], URL_SAFE_NO_PAD).unwrap()).unwrap();
+        payload["sub"] = json!("did:key:zAttacker");
+        tampered["credential"] = json!(format!(
+            "{}.{}.{}~{rest}",
+            parts[0],
+            encode_config(canonical_json_value(&payload), URL_SAFE_NO_PAD),
+            parts[2]
+        ));
+        assert!(verify(&tampered, holder).is_err());
+
+        // Another holder cannot present this credential, and an exact-email
+        // credential cannot satisfy the domain policy's profile.
+        assert!(verify(
+            &genuine,
+            "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH"
+        )
+        .is_err());
+        let mut exact_profile = genuine.clone();
+        exact_profile["profile"] = json!({"id": "tinycloud.email-proof/v1", "version": 1});
+        assert!(verify(&exact_profile, holder).is_err());
+
+        // The policy commits to the requirement digest: a request carrying a
+        // different domain than the owner signed is a substitution.
+        let mut substituted = requirement.clone();
+        substituted["claims"]["emailDomain"] = json!("evil.example");
+        assert!(validate_request_local_requirement(&substituted, projection).is_err());
+    }
+
     #[test]
     fn wrong_issuer_holder_and_malformed_or_untrusted_evidence_are_denied() {
         let vector: Value = serde_json::from_str(include_str!(
