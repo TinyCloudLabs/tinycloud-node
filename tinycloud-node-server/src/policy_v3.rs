@@ -6794,7 +6794,7 @@ mod tests {
         let mut exact_projection = projection_value.clone();
         exact_projection["profile"] = json!({"id": "tinycloud.email-proof/v1", "version": 1});
         exact_projection["descriptorDigest"] = json!("1tg-qphmKBVtNwzVg9xyz-xxqt_xtMXAsQyXw46m8S0");
-        let signed_exact = email_domain_credential(
+        let mut signed_exact = email_domain_credential(
             &issuer_key,
             &exact_projection,
             holder,
@@ -6803,7 +6803,17 @@ mod tests {
             "tinycloud.xyz",
             issued,
         );
-        assert!(verify(&signed_exact, holder).is_err());
+        // Relabel only the unsigned envelope as the domain profile, so the
+        // rejection must come from the issuer-signed profile/descriptor.
+        signed_exact["profile"] = projection_value["profile"].clone();
+        signed_exact["descriptorDigest"] = projection_value["descriptorDigest"].clone();
+        assert_eq!(
+            verify(&signed_exact, holder).err(),
+            Some((
+                Status::Forbidden,
+                "credential-holder-binding-invalid".into()
+            ))
+        );
 
         // The policy commits to the requirement digest: a request carrying a
         // different domain than the owner signed is a substitution.
