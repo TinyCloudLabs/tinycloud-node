@@ -5614,8 +5614,13 @@ fn pinned_profile_status_freshness_seconds(
         .and_then(Value::as_object)
         .and_then(|credential_type| credential_type.get("id"))
         .and_then(Value::as_str);
-    (profile == Some("tinycloud.email-proof/v1")
-        && credential_type == Some("opencredentials.email/v1")
+    // Both reviewed OpenCredentials mailbox profiles (exact email and email
+    // domain) declare the same 300-second status freshness. The pin applies
+    // even when a policy's own requirement omits or relaxes maxAgeSeconds.
+    (matches!(
+        profile,
+        Some("tinycloud.email-proof/v1" | "tinycloud.email-domain-proof/v1")
+    ) && credential_type == Some("opencredentials.email/v1")
         && trusted_issuer.vct == "opencredentials.email/v1")
         .then_some(EMAIL_PROOF_STATUS_FRESHNESS_SECONDS)
 }
@@ -6813,6 +6818,58 @@ mod tests {
                 Status::Forbidden,
                 "credential-holder-binding-invalid".into()
             ))
+        );
+
+        // The pinned 300-second mailbox-proof freshness applies to the domain
+        // profile even when the owner's requirement omits maxAgeSeconds.
+        let lenient_requirement = json!({
+            "type": "TinyCloudCredentialRequirement", "version": 1,
+            "profile": {"id": "tinycloud.email-domain-proof/v1", "version": 1},
+            "credentialType": {"id": "opencredentials.email/v1", "version": 1},
+            "claims": {"emailDomain": "tinycloud.xyz"}
+        });
+        let mut lenient_projection_value = projection_value.clone();
+        lenient_projection_value["requirementDigest"] =
+            json!(canonical_digest_base64url(&lenient_requirement));
+        let lenient_projection =
+            validate_policy_credential_requirement(&lenient_projection_value).unwrap();
+        assert_eq!(
+            pinned_profile_status_freshness_seconds(lenient_projection, &trusted),
+            Some(300)
+        );
+        let fresh = verify_opencredentials_credential(
+            &genuine,
+            &lenient_requirement,
+            lenient_projection,
+            &trusted,
+            holder,
+            issued + Duration::seconds(299),
+        );
+        assert!(fresh.as_ref().err().is_none(), "{:?}", fresh.err());
+        assert_eq!(
+            verify_opencredentials_credential(
+                &genuine,
+                &lenient_requirement,
+                lenient_projection,
+                &trusted,
+                holder,
+                issued + Duration::seconds(301)
+            )
+            .err(),
+            Some((Status::Forbidden, "credential-time-invalid".into()))
+        );
+        // The exact-email pin is unchanged, and an unreviewed profile is not pinned.
+        let mut exact_pin = projection_value.clone();
+        exact_pin["profile"] = json!({"id": "tinycloud.email-proof/v1", "version": 1});
+        assert_eq!(
+            pinned_profile_status_freshness_seconds(exact_pin.as_object().unwrap(), &trusted),
+            Some(300)
+        );
+        let mut other_pin = projection_value.clone();
+        other_pin["profile"] = json!({"id": "tinycloud.email-proof-lookalike/v1", "version": 1});
+        assert_eq!(
+            pinned_profile_status_freshness_seconds(other_pin.as_object().unwrap(), &trusted),
+            None
         );
 
         // The policy commits to the requirement digest: a request carrying a
