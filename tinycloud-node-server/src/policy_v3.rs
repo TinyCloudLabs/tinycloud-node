@@ -85,6 +85,8 @@ const MAX_SEALED_ENVELOPE_BYTES: usize = 4 * 1024 * 1024;
 const EMAIL_PROOF_STATUS_FRESHNESS_SECONDS: i64 = 300;
 const INVITATION_REQUEST_SCHEMA: &str = "xyz.tinycloud.credentials/invitation-request/v1";
 const DELIVERY_ADMISSION_SCHEMA: &str = "xyz.tinycloud.policy/delivery-admission/v0";
+/// OpenCredentials profile whose signed `emailDomain` claim backs domain shares.
+const EMAIL_DOMAIN_PROOF_PROFILE: &str = "tinycloud.email-domain-proof/v1";
 
 #[derive(Clone)]
 struct DeliveryRuntime {
@@ -893,6 +895,25 @@ fn delivery_email(value: &str) -> Option<String> {
     ))
 }
 
+/// A canonical recipient domain as the SDK writes it into an `emailDomain`
+/// matcher: two or more lowercase ASCII DNS labels, no IP literal.
+fn is_canonical_delivery_domain(value: &str) -> bool {
+    let labels = value.split('.').collect::<Vec<_>>();
+    value.len() <= 253
+        && labels.len() >= 2
+        && labels.iter().all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+        && !labels
+            .last()
+            .is_some_and(|tld| tld.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 /// The Share SDK stores the signed recipient envelope as a versioned,
 /// AES-256-GCM sealed blob.  The public URL addresses only that ciphertext;
 /// its decryption key is a fragment and must never be sent in a query string.
@@ -1069,15 +1090,29 @@ fn v3_envelope_delivery_projection<'a>(
         .get("recipientMatcher")
         .and_then(Value::as_object)
         .ok_or(())?;
-    let expected_email = matcher
-        .get("value")
-        .and_then(Value::as_str)
-        .and_then(delivery_email);
+    let recipient = delivery_email(&request.recipient_email).ok_or(())?;
+    let matcher_value = matcher.get("value").and_then(Value::as_str);
+    let admitted = match matcher.get("kind").and_then(Value::as_str) {
+        Some("exactEmail") => {
+            matcher_value.and_then(delivery_email).as_deref() == Some(recipient.as_str())
+        }
+        // One domain share may be emailed to any number of mailboxes at
+        // exactly that domain (no subdomains). The Node names each address in
+        // its signed admission; the envelope does not pin one.
+        Some("emailDomain") => matcher_value.is_some_and(|domain| {
+            is_canonical_delivery_domain(domain)
+                && recipient.rsplit_once('@').map(|(_, at)| at) == Some(domain)
+        }),
+        _ => false,
+    };
+    // `deliveryEmail` is optional. When the owner pinned one, only that
+    // address can be emailed.
     if matcher.len() != 2
-        || matcher.get("kind").and_then(Value::as_str) != Some("exactEmail")
-        || expected_email.as_deref() != delivery_email(&request.recipient_email).as_deref()
-        || object.get("deliveryEmail").and_then(Value::as_str)
-            != Some(request.recipient_email.as_str())
+        || !admitted
+        || recipient != request.recipient_email
+        || object
+            .get("deliveryEmail")
+            .is_some_and(|pinned| pinned.as_str() != Some(recipient.as_str()))
     {
         return Err(());
     }
@@ -1314,7 +1349,26 @@ pub async fn authorize_delivery(
         .and_then(|credential_type| credential_type.get("id"))
         .and_then(Value::as_str)
         .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
-    if actions.as_slice() != ["read"] || credential_type != "opencredentials.email/v1" {
+    if !actions.iter().any(|action| action == "read")
+        || credential_type != "opencredentials.email/v1"
+    {
+        return Err((Status::Forbidden, "delivery-authorization-invalid".into()));
+    }
+    // A domain share can be emailed to many mailboxes, so only the owner key
+    // that signed the policy may ask, and only for the domain-proof profile.
+    let domain_share = envelope
+        .get("recipientMatcher")
+        .and_then(|matcher| matcher.get("kind"))
+        .and_then(Value::as_str)
+        == Some("emailDomain");
+    let profile = policy
+        .get("credentialRequirement")
+        .and_then(|requirement| requirement.get("profile"))
+        .and_then(|profile| profile.get("id"))
+        .and_then(Value::as_str);
+    if domain_share
+        && (sender_key_did != registration.owner_did || profile != Some(EMAIL_DOMAIN_PROOF_PROFILE))
+    {
         return Err((Status::Forbidden, "delivery-authorization-invalid".into()));
     }
     if share_expires_at != registration.expires_at {
