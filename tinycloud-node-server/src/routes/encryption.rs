@@ -153,6 +153,7 @@ pub async fn decrypt(
     body: Json<serde_json::Value>,
     service: &State<EncryptionService>,
     tinycloud: &State<TinyCloud>,
+    policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
 ) -> Result<Json<DecryptResponseBody>, (Status, String)> {
     let invocation = authorization.0;
     let invocation_info = invocation.0.clone();
@@ -163,6 +164,12 @@ pub async fn decrypt(
         service.node_did(),
     )
     .await?;
+    // Same policy gate as `/invoke`: a policy-session chain must still be
+    // live (roots, session, descendants) to decrypt through this route.
+    policy_v3
+        .authorize_invocation(tinycloud, &invocation_info, time::OffsetDateTime::now_utc())
+        .await
+        .map_err(|error| (Status::Forbidden, error.to_string()))?;
 
     let net: NetworkId =
         network_id

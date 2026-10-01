@@ -208,9 +208,17 @@ pub async fn create_signed_kv_url(
     request: Json<SignedKvUrlRequest>,
     runtime: &State<SignedUrlRuntime>,
     tinycloud: &State<TinyCloud>,
+    policy_v3: &State<crate::policy_v3::PolicyV3Runtime>,
 ) -> Result<Json<SignedKvUrlResponse>, (Status, String)> {
     let invocation_info = invocation.0 .0.clone();
     verify_auth("server.signed_kv.auth", invocation.0, tinycloud).await?;
+    // Same policy gate as `/invoke`. A policy-session invocation lives at most
+    // 60 s, and the ticket never outlives it, so a revoked policy stops new
+    // signed URLs here and existing ones within a minute.
+    policy_v3
+        .authorize_invocation(tinycloud, &invocation_info, OffsetDateTime::now_utc())
+        .await
+        .map_err(|error| (Status::Forbidden, error.to_string()))?;
     let mint_start = Instant::now();
     let mint_result = mint_signed_kv_url(
         &invocation_info,
