@@ -70,6 +70,8 @@ const STATUS_DOMAIN: &[u8] = b"xyz.tinycloud.policy/RootStatusCheckpoint/v1\0";
 const CONTENT_SOURCE_DOMAIN: &[u8] = b"xyz.tinycloud.policy/ContentSource/v1\0";
 const CAPABILITY_CEILING_DOMAIN: &[u8] = b"xyz.tinycloud.policy/PolicyCapability/v1\0";
 const NATIVE_PROJECTION_DOMAIN: &[u8] = b"xyz.tinycloud.policy/NativeProjection/v1\0";
+/// Default lifetime of a minted policy session when the holder does not ask
+/// for a longer grant (older clients reject anything longer).
 const MAX_SESSION_TTL_SECONDS: i64 = 60;
 const DELIVERY_ADMISSION_DOMAIN: &[u8] = b"xyz.tinycloud.policy/delivery-admission/v0\0";
 const SEALED_ENVELOPE_AAD: &[u8] = b"tinycloud-share-envelope-v1";
@@ -299,9 +301,17 @@ impl PolicyV3Runtime {
             if event.0.parents.len() != 1 {
                 return Err("policy-session-parent-count-invalid");
             }
-            let Ok((_, parent)) = self
+            // Validate the whole chain up to the admitted S0, then compare the
+            // child with its *immediate* parent (S0 for a first hop, an
+            // earlier descendant for deeper hops).
+            if self
                 .validate_policy_chain(tinycloud, event.0.parents[0])
                 .await
+                .is_err()
+            {
+                return Err("policy-session-parent-invalid");
+            }
+            let Ok(Some((_, parent))) = tinycloud.load_signed_delegation(event.0.parents[0]).await
             else {
                 return Err("policy-session-parent-invalid");
             };
@@ -401,12 +411,12 @@ impl PolicyV3Runtime {
         if invocation_expiry - invocation_not_before > Duration::seconds(60) {
             return Err("policy-invocation-lifetime-too-long");
         }
+        // Long-lived sessions are bounded at mint by the policy and root
+        // expiries (also re-checked through the roots on every invocation);
+        // revocation of a root, session or descendant applies immediately.
         let expires = session.0.expiry.ok_or("policy-session-invalid")?;
         let not_before = session.0.not_before.ok_or("policy-session-invalid")?;
-        if now < not_before
-            || now >= expires
-            || expires - not_before > Duration::seconds(MAX_SESSION_TTL_SECONDS)
-        {
+        if now < not_before || now >= expires {
             return Err("policy-session-expired");
         }
         let registration = policy_v3_registration::Entity::find_by_id(row.policy_cid.clone())
@@ -712,6 +722,42 @@ impl PolicyV3Runtime {
         }
         Ok(())
     }
+}
+
+/// Expiry of a newly minted policy session: the holder's requested expiry
+/// (or the legacy 60 seconds) capped by every authority it derives from.
+fn session_expiry(
+    now: OffsetDateTime,
+    requested: Option<&str>,
+    root_expires_at: &str,
+    policy_expires_at: Option<&str>,
+    account_expires_at: Option<OffsetDateTime>,
+) -> Result<OffsetDateTime, (Status, String)> {
+    let invalid = || (Status::BadRequest, "session-expiry-invalid".to_owned());
+    let mut expires = match requested {
+        None => now + Duration::seconds(MAX_SESSION_TTL_SECONDS),
+        Some(value) => {
+            let requested = parse_time(value).map_err(|_| invalid())?;
+            if format_time(requested) != value || requested <= now {
+                return Err(invalid());
+            }
+            requested
+        }
+    };
+    // Core requires every delegation to sit inside its parents' windows, so a
+    // session ends strictly before the roots it is proven by.
+    let root = parse_time(root_expires_at)
+        .map_err(|_| (Status::Forbidden, "policy-root-expiry-invalid".to_owned()))?;
+    expires = expires.min(root - Duration::seconds(1));
+    if let Some(policy) = policy_expires_at {
+        let policy = parse_time(policy)
+            .map_err(|_| (Status::Forbidden, "policy-time-invalid".to_owned()))?;
+        expires = expires.min(policy);
+    }
+    if let Some(account) = account_expires_at {
+        expires = expires.min(account);
+    }
+    Ok(expires)
 }
 
 fn capabilities_are_contained(
@@ -1479,6 +1525,12 @@ pub struct MintRequest {
     credential_space_id: RequestField<String>,
     #[serde(default)]
     pub presentation: Value,
+    /// Optional RFC 3339 expiry the holder asks for. The minted session lasts
+    /// until the earliest of this, the policy expiry, the policy roots'
+    /// expiry, and (account path) the account authorization's expiry.
+    /// Without it the session keeps the legacy 60-second lifetime.
+    #[serde(default)]
+    pub requested_expires_at: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -2122,7 +2174,16 @@ pub async fn mint(
     }
     facts.insert("remainingRedelegationDepth".to_owned(), Value::from(8_u64));
     let not_before = now.unix_timestamp();
-    let expires = (now + Duration::seconds(MAX_SESSION_TTL_SECONDS)).unix_timestamp();
+    let expires = session_expiry(
+        now,
+        request.requested_expires_at.as_deref(),
+        &registration.expires_at,
+        registered_policy.get("expiresAt").and_then(Value::as_str),
+        account_owner_proof
+            .as_ref()
+            .and_then(|proof| proof.expires_at),
+    )?
+    .unix_timestamp();
     if expires <= not_before {
         return Err((Status::Forbidden, "session-time-invalid".into()));
     }
