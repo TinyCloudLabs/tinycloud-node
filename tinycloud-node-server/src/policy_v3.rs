@@ -39,8 +39,9 @@ use tinycloud_core::{
     },
     relationships::parent_delegations,
     sea_orm::{
-        sea_query::Expr, ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection,
-        DatabaseTransaction, EntityTrait, QueryFilter, QuerySelect, Set, TransactionTrait,
+        sea_query::Expr, ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait,
+        DatabaseConnection, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+        Set, TransactionTrait,
     },
     types::SpaceIdWrap,
     util::{DelegationInfo, InvocationInfo},
@@ -70,6 +71,8 @@ const STATUS_DOMAIN: &[u8] = b"xyz.tinycloud.policy/RootStatusCheckpoint/v1\0";
 const CONTENT_SOURCE_DOMAIN: &[u8] = b"xyz.tinycloud.policy/ContentSource/v1\0";
 const CAPABILITY_CEILING_DOMAIN: &[u8] = b"xyz.tinycloud.policy/PolicyCapability/v1\0";
 const NATIVE_PROJECTION_DOMAIN: &[u8] = b"xyz.tinycloud.policy/NativeProjection/v1\0";
+/// Default lifetime of a minted policy session when the holder does not ask
+/// for a longer grant (older clients reject anything longer).
 const MAX_SESSION_TTL_SECONDS: i64 = 60;
 const DELIVERY_ADMISSION_DOMAIN: &[u8] = b"xyz.tinycloud.policy/delivery-admission/v0\0";
 const SEALED_ENVELOPE_AAD: &[u8] = b"tinycloud-share-envelope-v1";
@@ -83,6 +86,12 @@ const MAX_SEALED_ENVELOPE_BYTES: usize = 4 * 1024 * 1024;
 const EMAIL_PROOF_STATUS_FRESHNESS_SECONDS: i64 = 300;
 const INVITATION_REQUEST_SCHEMA: &str = "xyz.tinycloud.credentials/invitation-request/v1";
 const DELIVERY_ADMISSION_SCHEMA: &str = "xyz.tinycloud.policy/delivery-admission/v0";
+/// OpenCredentials profile whose signed `emailDomain` claim backs domain shares.
+const EMAIL_DOMAIN_PROOF_PROFILE: &str = "tinycloud.email-domain-proof/v1";
+/// How many of the policy owner's own delegations are tried as proof of the
+/// authority its policy roots grant, out of how many recent rows.
+const MAX_OWNER_AUTHORITY_CANDIDATES: usize = 32;
+const MAX_OWNER_AUTHORITY_ROWS: u64 = 256;
 
 #[derive(Clone)]
 struct DeliveryRuntime {
@@ -299,9 +308,17 @@ impl PolicyV3Runtime {
             if event.0.parents.len() != 1 {
                 return Err("policy-session-parent-count-invalid");
             }
-            let Ok((_, parent)) = self
+            // Validate the whole chain up to the admitted S0, then compare the
+            // child with its *immediate* parent (S0 for a first hop, an
+            // earlier descendant for deeper hops).
+            if self
                 .validate_policy_chain(tinycloud, event.0.parents[0])
                 .await
+                .is_err()
+            {
+                return Err("policy-session-parent-invalid");
+            }
+            let Ok(Some((_, parent))) = tinycloud.load_signed_delegation(event.0.parents[0]).await
             else {
                 return Err("policy-session-parent-invalid");
             };
@@ -401,12 +418,12 @@ impl PolicyV3Runtime {
         if invocation_expiry - invocation_not_before > Duration::seconds(60) {
             return Err("policy-invocation-lifetime-too-long");
         }
+        // Long-lived sessions are bounded at mint by the policy and root
+        // expiries (also re-checked through the roots on every invocation);
+        // revocation of a root, session or descendant applies immediately.
         let expires = session.0.expiry.ok_or("policy-session-invalid")?;
         let not_before = session.0.not_before.ok_or("policy-session-invalid")?;
-        if now < not_before
-            || now >= expires
-            || expires - not_before > Duration::seconds(MAX_SESSION_TTL_SECONDS)
-        {
+        if now < not_before || now >= expires {
             return Err("policy-session-expired");
         }
         let registration = policy_v3_registration::Entity::find_by_id(row.policy_cid.clone())
@@ -714,6 +731,108 @@ impl PolicyV3Runtime {
     }
 }
 
+/// A policy root is parentless, so the ordinary graph admits it without
+/// checking that its signer may grant what it carries. Require that here: at
+/// `at`, the owner must hold every root capability as root authority or
+/// through one of its own ordinary delegations, by the same rules as an
+/// invocation by the owner (revocation, every chain window, caveat
+/// containment). A policy session or root is never owner authority: a
+/// recipient could otherwise re-publish what it was shared under a policy of
+/// its own that the original owner cannot revoke.
+async fn owner_holds_capabilities(
+    conn: &DatabaseConnection,
+    owner_did: &str,
+    capabilities: &[tinycloud_core::util::Capability],
+    at: OffsetDateTime,
+) -> Result<(), &'static str> {
+    let rows = delegation_model::Entity::find()
+        .filter(
+            Condition::any()
+                .add(delegation_model::Column::Delegatee.eq(owner_did))
+                .add(delegation_model::Column::Delegatee.like(format!("{owner_did}#%"))),
+        )
+        .filter(
+            Condition::any()
+                .add(delegation_model::Column::Expiry.is_null())
+                .add(delegation_model::Column::Expiry.gt(at)),
+        )
+        .order_by_with_nulls(
+            delegation_model::Column::IssuedAt,
+            tinycloud_core::sea_orm::Order::Desc,
+            tinycloud_core::sea_orm::sea_query::NullOrdering::Last,
+        )
+        .limit(MAX_OWNER_AUTHORITY_ROWS)
+        .all(conn)
+        .await
+        .map_err(|_| "policy-owner-authority-unavailable")?;
+    let candidates = rows
+        .into_iter()
+        .filter(|row| {
+            !row.facts.as_ref().is_some_and(|facts| {
+                facts.0.contains_key("xyz.tinycloud.policy/session-fact")
+                    || facts.0.contains_key("xyz.tinycloud.policy/root-profile")
+            })
+        })
+        .take(MAX_OWNER_AUTHORITY_CANDIDATES)
+        .collect::<Vec<_>>();
+    'capabilities: for capability in capabilities {
+        let capability = std::slice::from_ref(capability);
+        if invocation_model::authorize_holder(conn, owner_did, capability, &[], at)
+            .await
+            .is_ok()
+        {
+            continue;
+        }
+        for candidate in &candidates {
+            let proof = [candidate.id.to_cid(0x55)];
+            if invocation_model::authorize_holder(conn, owner_did, capability, &proof, at)
+                .await
+                .is_ok()
+            {
+                continue 'capabilities;
+            }
+        }
+        return Err("policy-owner-not-authorized");
+    }
+    Ok(())
+}
+
+/// Expiry of a newly minted policy session: the holder's requested expiry
+/// (or the legacy 60 seconds) capped by every authority it derives from.
+fn session_expiry(
+    now: OffsetDateTime,
+    requested: Option<&str>,
+    root_expires_at: &str,
+    policy_expires_at: Option<&str>,
+    account_expires_at: Option<OffsetDateTime>,
+) -> Result<OffsetDateTime, (Status, String)> {
+    let invalid = || (Status::BadRequest, "session-expiry-invalid".to_owned());
+    let mut expires = match requested {
+        None => now + Duration::seconds(MAX_SESSION_TTL_SECONDS),
+        Some(value) => {
+            let requested = parse_time(value).map_err(|_| invalid())?;
+            if format_time(requested) != value || requested <= now {
+                return Err(invalid());
+            }
+            requested
+        }
+    };
+    // Core requires every delegation to sit inside its parents' windows, so a
+    // session ends strictly before the roots it is proven by.
+    let root = parse_time(root_expires_at)
+        .map_err(|_| (Status::Forbidden, "policy-root-expiry-invalid".to_owned()))?;
+    expires = expires.min(root - Duration::seconds(1));
+    if let Some(policy) = policy_expires_at {
+        let policy = parse_time(policy)
+            .map_err(|_| (Status::Forbidden, "policy-time-invalid".to_owned()))?;
+        expires = expires.min(policy);
+    }
+    if let Some(account) = account_expires_at {
+        expires = expires.min(account);
+    }
+    Ok(expires)
+}
+
 fn capabilities_are_contained(
     child: &[tinycloud_core::util::Capability],
     parent: &[tinycloud_core::util::Capability],
@@ -845,6 +964,25 @@ fn delivery_email(value: &str) -> Option<String> {
         local.to_ascii_lowercase(),
         domain.to_ascii_lowercase()
     ))
+}
+
+/// A canonical recipient domain as the SDK writes it into an `emailDomain`
+/// matcher: two or more lowercase ASCII DNS labels, no IP literal.
+fn is_canonical_delivery_domain(value: &str) -> bool {
+    let labels = value.split('.').collect::<Vec<_>>();
+    value.len() <= 253
+        && labels.len() >= 2
+        && labels.iter().all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+        && !labels
+            .last()
+            .is_some_and(|tld| tld.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// The Share SDK stores the signed recipient envelope as a versioned,
@@ -1023,16 +1161,33 @@ fn v3_envelope_delivery_projection<'a>(
         .get("recipientMatcher")
         .and_then(Value::as_object)
         .ok_or(())?;
-    let expected_email = matcher
-        .get("value")
-        .and_then(Value::as_str)
-        .and_then(delivery_email);
-    if matcher.len() != 2
-        || matcher.get("kind").and_then(Value::as_str) != Some("exactEmail")
-        || expected_email.as_deref() != delivery_email(&request.recipient_email).as_deref()
-        || object.get("deliveryEmail").and_then(Value::as_str)
-            != Some(request.recipient_email.as_str())
-    {
+    let recipient = delivery_email(&request.recipient_email).ok_or(())?;
+    let matcher_value = matcher.get("value").and_then(Value::as_str);
+    // `deliveryEmail` is optional. When the owner pinned one, only that
+    // address can be emailed.
+    let pinned = object.get("deliveryEmail");
+    let admitted = match matcher.get("kind").and_then(Value::as_str) {
+        // Exact-email shares keep the 1.17.2 contract: the request names the
+        // matched mailbox (compared canonically) and a pinned address exactly,
+        // so a mixed-case local part still works.
+        Some("exactEmail") => {
+            matcher_value.and_then(delivery_email).as_deref() == Some(recipient.as_str())
+                && pinned
+                    .is_none_or(|pinned| pinned.as_str() == Some(request.recipient_email.as_str()))
+        }
+        // One domain share may be emailed to any number of mailboxes at
+        // exactly that domain (no subdomains). The issuer lowercases domain
+        // mailboxes, so the request must already be canonical; the Node names
+        // each address in its signed admission.
+        Some("emailDomain") => matcher_value.is_some_and(|domain| {
+            is_canonical_delivery_domain(domain)
+                && recipient == request.recipient_email
+                && recipient.rsplit_once('@').map(|(_, at)| at) == Some(domain)
+                && pinned.is_none_or(|pinned| pinned.as_str() == Some(recipient.as_str()))
+        }),
+        _ => false,
+    };
+    if matcher.len() != 2 || !admitted {
         return Err(());
     }
     let display_name = object
@@ -1055,6 +1210,37 @@ fn v3_envelope_delivery_projection<'a>(
         return Err(());
     }
     Ok((object, display_name, actions))
+}
+
+/// What a v3 delivery may email: a share that grants read under the
+/// OpenCredentials email credential. A domain share can reach many mailboxes,
+/// so only the owner key that signed its policy may ask, and only when the
+/// policy requires the domain-proof profile.
+fn v3_delivery_terms_allowed(
+    envelope: &serde_json::Map<String, Value>,
+    actions: &[String],
+    sender_key_did: &str,
+    owner_did: &str,
+) -> bool {
+    let requirement = envelope
+        .get("policy")
+        .and_then(|policy| policy.get("credentialRequirement"));
+    let identifier = |field: &str| {
+        requirement
+            .and_then(|requirement| requirement.get(field))
+            .and_then(|value| value.get("id"))
+            .and_then(Value::as_str)
+    };
+    let domain_share = envelope
+        .get("recipientMatcher")
+        .and_then(|matcher| matcher.get("kind"))
+        .and_then(Value::as_str)
+        == Some("emailDomain");
+    actions.iter().any(|action| action == "read")
+        && identifier("credentialType") == Some("opencredentials.email/v1")
+        && (!domain_share
+            || (sender_key_did == owner_did
+                && identifier("profile") == Some(EMAIL_DOMAIN_PROOF_PROFILE)))
 }
 
 fn normal_invocation_allows_v3_delivery(
@@ -1268,7 +1454,7 @@ pub async fn authorize_delivery(
         .and_then(|credential_type| credential_type.get("id"))
         .and_then(Value::as_str)
         .ok_or((Status::Forbidden, "delivery-authorization-invalid".into()))?;
-    if actions.as_slice() != ["read"] || credential_type != "opencredentials.email/v1" {
+    if !v3_delivery_terms_allowed(envelope, &actions, sender_key_did, &registration.owner_did) {
         return Err((Status::Forbidden, "delivery-authorization-invalid".into()));
     }
     if share_expires_at != registration.expires_at {
@@ -1479,6 +1665,12 @@ pub struct MintRequest {
     credential_space_id: RequestField<String>,
     #[serde(default)]
     pub presentation: Value,
+    /// Optional RFC 3339 expiry the holder asks for. The minted session lasts
+    /// until the earliest of this, the policy expiry, the policy roots'
+    /// expiry, and (account path) the account authorization's expiry.
+    /// Without it the session keeps the legacy 60-second lifetime.
+    #[serde(default)]
+    pub requested_expires_at: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -1633,6 +1825,21 @@ pub async fn register_policy(
             != request.policy.get("ownerDid").and_then(Value::as_str)
     {
         return Err((Status::Forbidden, "policy-digest-mismatch".into()));
+    }
+    let owner_did = request
+        .policy
+        .get("ownerDid")
+        .and_then(Value::as_str)
+        .ok_or((Status::BadRequest, "policy-owner-missing".into()))?;
+    for root in [&policy_root, &enforcement_root] {
+        owner_holds_capabilities(
+            &runtime.conn,
+            owner_did,
+            &root.0.capabilities,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .map_err(|error| (Status::Forbidden, error.into()))?;
     }
     if let Some(existing) = policy_v3_registration::Entity::find_by_id(request.policy_cid.clone())
         .one(&runtime.conn)
@@ -1893,6 +2100,21 @@ pub async fn mint(
         .authorize_roots(&registration, now)
         .await
         .map_err(|e| (Status::Forbidden, e.into()))?;
+    // Policies registered before owners had to hold what they grant are
+    // checked here too: the owner must have held every root capability when
+    // the policy was registered. (Owner sessions may since have expired.)
+    let registered_at = parse_time(&registration.registered_at)
+        .map_err(|_| (Status::Forbidden, "policy-registration-invalid".into()))?;
+    for root in [&policy_root, &enforcement_root] {
+        owner_holds_capabilities(
+            &runtime.conn,
+            &registration.owner_did,
+            &root.0.capabilities,
+            registered_at,
+        )
+        .await
+        .map_err(|error| (Status::Forbidden, error.into()))?;
+    }
     for (cid, expected) in [
         (&registration.policy_root_cid, &policy_root),
         (&registration.enforcement_root_cid, &enforcement_root),
@@ -2122,7 +2344,16 @@ pub async fn mint(
     }
     facts.insert("remainingRedelegationDepth".to_owned(), Value::from(8_u64));
     let not_before = now.unix_timestamp();
-    let expires = (now + Duration::seconds(MAX_SESSION_TTL_SECONDS)).unix_timestamp();
+    let expires = session_expiry(
+        now,
+        request.requested_expires_at.as_deref(),
+        &registration.expires_at,
+        registered_policy.get("expiresAt").and_then(Value::as_str),
+        account_owner_proof
+            .as_ref()
+            .and_then(|proof| proof.expires_at),
+    )?
+    .unix_timestamp();
     if expires <= not_before {
         return Err((Status::Forbidden, "session-time-invalid".into()));
     }
@@ -5612,8 +5843,13 @@ fn pinned_profile_status_freshness_seconds(
         .and_then(Value::as_object)
         .and_then(|credential_type| credential_type.get("id"))
         .and_then(Value::as_str);
-    (profile == Some("tinycloud.email-proof/v1")
-        && credential_type == Some("opencredentials.email/v1")
+    // Both reviewed OpenCredentials mailbox profiles (exact email and email
+    // domain) declare the same 300-second status freshness. The pin applies
+    // even when a policy's own requirement omits or relaxes maxAgeSeconds.
+    (matches!(
+        profile,
+        Some("tinycloud.email-proof/v1" | "tinycloud.email-domain-proof/v1")
+    ) && credential_type == Some("opencredentials.email/v1")
         && trusted_issuer.vct == "opencredentials.email/v1")
         .then_some(EMAIL_PROOF_STATUS_FRESHNESS_SECONDS)
 }
@@ -6591,6 +6827,287 @@ mod tests {
         })
     }
 
+    /// Mints an issuer-signed email-domain credential whose signed
+    /// disclosures and unsigned envelope claims can be varied independently.
+    fn email_domain_credential(
+        issuer_key: &tinycloud_core::libp2p::identity::ed25519::Keypair,
+        projection: &Value,
+        holder: &str,
+        email: &str,
+        signed_domain: &str,
+        envelope_domain: &str,
+        issued: OffsetDateTime,
+    ) -> Value {
+        let disclose = |salt: &str, name: &str, value: &str| {
+            encode_config(
+                canonical_json_value(&json!([salt, name, value])),
+                URL_SAFE_NO_PAD,
+            )
+        };
+        let email_disclosure = disclose("salt-email", "email", email);
+        let domain_disclosure = disclose("salt-domain", "emailDomain", signed_domain);
+        let digest = |disclosure: &str| {
+            encode_config(Sha256::digest(disclosure.as_bytes()), URL_SAFE_NO_PAD)
+        };
+        let expires = issued + Duration::seconds(600);
+        let payload = json!({
+            "iss": projection["issuerDid"], "sub": holder,
+            "iat": issued.unix_timestamp(), "nbf": issued.unix_timestamp(), "exp": expires.unix_timestamp(),
+            "jti": "credential-email-domain", "vct": "opencredentials.email/v1",
+            "profile": projection["profile"]["id"], "profileVersion": 1,
+            "descriptorDigest": projection["descriptorDigest"],
+            "holderBinding": {"did": holder, "signingDomain": "tinycloud.credentials/holder-binding/v1"},
+            "_sd_alg": "sha-256", "_sd": [digest(&email_disclosure), digest(&domain_disclosure)]
+        });
+        let header = json!({"alg": "EdDSA", "typ": "vc+sd-jwt", "kid": projection["issuerKid"]});
+        let signing_input = format!(
+            "{}.{}",
+            encode_config(canonical_json_value(&header), URL_SAFE_NO_PAD),
+            encode_config(canonical_json_value(&payload), URL_SAFE_NO_PAD)
+        );
+        let compact = format!(
+            "{signing_input}.{}~{email_disclosure}~{domain_disclosure}",
+            encode_config(issuer_key.sign(signing_input.as_bytes()), URL_SAFE_NO_PAD)
+        );
+        let claims = json!({"email": email, "emailDomain": envelope_domain});
+        json!({
+            "type": "OpenCredentialsIssuedCredential", "version": 1,
+            "protocol": "tinycloud.credentials/acquisition/v1",
+            "profile": projection["profile"], "credentialType": projection["credentialType"],
+            "schema": "opencredentials.email/v1", "format": "vc+sd-jwt",
+            "issuerDid": projection["issuerDid"], "issuerKid": projection["issuerKid"],
+            "subjectDid": holder, "holderDid": holder,
+            "claims": claims, "claimsDigest": canonical_digest_base64url(&claims),
+            "descriptorDigest": projection["descriptorDigest"], "credentialId": "credential-email-domain",
+            "issuedAt": format_time(issued), "notBefore": format_time(issued), "expiresAt": format_time(expires),
+            "status": {"method": "none", "freshnessSeconds": 300},
+            "credential": compact
+        })
+    }
+
+    #[test]
+    fn email_domain_requirement_is_exact_equality_on_issuer_signed_domain() {
+        let requirement = json!({
+            "type": "TinyCloudCredentialRequirement", "version": 1,
+            "profile": {"id": "tinycloud.email-domain-proof/v1", "version": 1},
+            "credentialType": {"id": "opencredentials.email/v1", "version": 1},
+            "claims": {"emailDomain": "tinycloud.xyz"},
+            "maxAgeSeconds": 300
+        });
+        let projection_value = json!({
+            "type": POLICY_CREDENTIAL_REQUIREMENT_V1, "version": 1,
+            "requirementDigest": canonical_digest_base64url(&requirement),
+            "descriptorDigest": "DdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdDdD",
+            "issuerDid": "did:web:issuer.credentials.org",
+            "issuerKid": "did:web:issuer.credentials.org#controller",
+            "profile": {"id": "tinycloud.email-domain-proof/v1", "version": 1},
+            "credentialType": {"id": "opencredentials.email/v1", "version": 1}
+        });
+        let projection = validate_policy_credential_requirement(&projection_value).unwrap();
+        validate_request_local_requirement(&requirement, projection).unwrap();
+        let holder = "did:key:z6MkehRgf7yJbgaGfYsdoAsKdBPE3dj2CYhowQdcjqSJgvVd";
+        let issuer_key = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
+        let trusted = IssuerKey::new(
+            "did:web:issuer.credentials.org",
+            "opencredentials.email/v1",
+            1,
+            "did:web:issuer.credentials.org#controller",
+            issuer_key.public().to_bytes(),
+        );
+        let issued = parse_time("2026-09-25T12:00:00Z").unwrap();
+        let now = issued + Duration::seconds(30);
+        let verify = |credential: &Value, holder_did: &str| {
+            verify_opencredentials_credential(
+                credential,
+                &requirement,
+                projection,
+                &trusted,
+                holder_did,
+                now,
+            )
+        };
+        let mint = |email: &str, signed: &str, envelope: &str| {
+            email_domain_credential(
+                &issuer_key,
+                &projection_value,
+                holder,
+                email,
+                signed,
+                envelope,
+                issued,
+            )
+        };
+
+        assert!(verify(
+            &mint("alice@tinycloud.xyz", "tinycloud.xyz", "tinycloud.xyz"),
+            holder
+        )
+        .is_ok());
+
+        // Suffixes, lookalikes, subdomains, case, trailing dots, and IDNA
+        // spellings are different domains: exact equality only.
+        for domain in [
+            "sub.tinycloud.xyz",
+            "tinycloud.xyz.evil",
+            "eviltinycloud.xyz",
+            "TinyCloud.xyz",
+            "tinycloud.xyz.",
+            "tinyclоud.xyz",
+            "xn--tinycloud-xyz.example",
+            "tinycloud.xyz\u{200b}",
+        ] {
+            let email = format!("alice@{domain}");
+            assert_eq!(
+                verify(&mint(&email, domain, domain), holder).err(),
+                Some((
+                    Status::Forbidden,
+                    "credential-requirement-not-satisfied".into()
+                )),
+                "{domain}"
+            );
+        }
+
+        // The unsigned envelope cannot vouch for a domain the issuer did not
+        // sign, and a signed domain cannot be relabelled in the envelope.
+        assert!(verify(
+            &mint("alice@evil.example", "evil.example", "tinycloud.xyz"),
+            holder
+        )
+        .is_err());
+        assert!(verify(
+            &mint("alice@tinycloud.xyz", "tinycloud.xyz", "evil.example"),
+            holder
+        )
+        .is_err());
+
+        // An extra unsigned disclosure, a duplicated claim, or a re-signed
+        // payload are all rejected.
+        let genuine = mint("alice@tinycloud.xyz", "tinycloud.xyz", "tinycloud.xyz");
+        let forged_disclosure = encode_config(
+            canonical_json_value(&json!(["salt-x", "emailDomain", "tinycloud.xyz"])),
+            URL_SAFE_NO_PAD,
+        );
+        let mut unsigned = genuine.clone();
+        unsigned["credential"] = json!(format!(
+            "{}~{forged_disclosure}",
+            genuine["credential"].as_str().unwrap()
+        ));
+        assert!(verify(&unsigned, holder).is_err());
+        let compact = genuine["credential"].as_str().unwrap();
+        let disclosures = compact.split('~').skip(1).collect::<Vec<_>>();
+        let mut duplicated = genuine.clone();
+        duplicated["credential"] = json!(format!("{compact}~{}", disclosures[1]));
+        assert!(verify(&duplicated, holder).is_err());
+        let mut tampered = genuine.clone();
+        let (jwt, rest) = compact.split_once('~').unwrap();
+        let parts = jwt.split('.').collect::<Vec<_>>();
+        let mut payload: Value =
+            serde_json::from_slice(&decode_config(parts[1], URL_SAFE_NO_PAD).unwrap()).unwrap();
+        payload["sub"] = json!("did:key:zAttacker");
+        tampered["credential"] = json!(format!(
+            "{}.{}.{}~{rest}",
+            parts[0],
+            encode_config(canonical_json_value(&payload), URL_SAFE_NO_PAD),
+            parts[2]
+        ));
+        assert!(verify(&tampered, holder).is_err());
+
+        // Another holder cannot present this credential, and an exact-email
+        // credential cannot satisfy the domain policy's profile.
+        assert!(verify(
+            &genuine,
+            "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH"
+        )
+        .is_err());
+        let mut exact_profile = genuine.clone();
+        exact_profile["profile"] = json!({"id": "tinycloud.email-proof/v1", "version": 1});
+        assert!(verify(&exact_profile, holder).is_err());
+        // A genuinely issuer-signed exact-email credential (signed profile,
+        // descriptor, and even a matching emailDomain disclosure) cannot
+        // satisfy the domain policy either.
+        let mut exact_projection = projection_value.clone();
+        exact_projection["profile"] = json!({"id": "tinycloud.email-proof/v1", "version": 1});
+        exact_projection["descriptorDigest"] = json!("1tg-qphmKBVtNwzVg9xyz-xxqt_xtMXAsQyXw46m8S0");
+        let mut signed_exact = email_domain_credential(
+            &issuer_key,
+            &exact_projection,
+            holder,
+            "alice@tinycloud.xyz",
+            "tinycloud.xyz",
+            "tinycloud.xyz",
+            issued,
+        );
+        // Relabel only the unsigned envelope as the domain profile, so the
+        // rejection must come from the issuer-signed profile/descriptor.
+        signed_exact["profile"] = projection_value["profile"].clone();
+        signed_exact["descriptorDigest"] = projection_value["descriptorDigest"].clone();
+        assert_eq!(
+            verify(&signed_exact, holder).err(),
+            Some((
+                Status::Forbidden,
+                "credential-holder-binding-invalid".into()
+            ))
+        );
+
+        // The pinned 300-second mailbox-proof freshness applies to the domain
+        // profile even when the owner's requirement omits maxAgeSeconds.
+        let lenient_requirement = json!({
+            "type": "TinyCloudCredentialRequirement", "version": 1,
+            "profile": {"id": "tinycloud.email-domain-proof/v1", "version": 1},
+            "credentialType": {"id": "opencredentials.email/v1", "version": 1},
+            "claims": {"emailDomain": "tinycloud.xyz"}
+        });
+        let mut lenient_projection_value = projection_value.clone();
+        lenient_projection_value["requirementDigest"] =
+            json!(canonical_digest_base64url(&lenient_requirement));
+        let lenient_projection =
+            validate_policy_credential_requirement(&lenient_projection_value).unwrap();
+        assert_eq!(
+            pinned_profile_status_freshness_seconds(lenient_projection, &trusted),
+            Some(300)
+        );
+        let fresh = verify_opencredentials_credential(
+            &genuine,
+            &lenient_requirement,
+            lenient_projection,
+            &trusted,
+            holder,
+            issued + Duration::seconds(299),
+        );
+        assert!(fresh.as_ref().err().is_none(), "{:?}", fresh.err());
+        assert_eq!(
+            verify_opencredentials_credential(
+                &genuine,
+                &lenient_requirement,
+                lenient_projection,
+                &trusted,
+                holder,
+                issued + Duration::seconds(301)
+            )
+            .err(),
+            Some((Status::Forbidden, "credential-time-invalid".into()))
+        );
+        // The exact-email pin is unchanged, and an unreviewed profile is not pinned.
+        let mut exact_pin = projection_value.clone();
+        exact_pin["profile"] = json!({"id": "tinycloud.email-proof/v1", "version": 1});
+        assert_eq!(
+            pinned_profile_status_freshness_seconds(exact_pin.as_object().unwrap(), &trusted),
+            Some(300)
+        );
+        let mut other_pin = projection_value.clone();
+        other_pin["profile"] = json!({"id": "tinycloud.email-proof-lookalike/v1", "version": 1});
+        assert_eq!(
+            pinned_profile_status_freshness_seconds(other_pin.as_object().unwrap(), &trusted),
+            None
+        );
+
+        // The policy commits to the requirement digest: a request carrying a
+        // different domain than the owner signed is a substitution.
+        let mut substituted = requirement.clone();
+        substituted["claims"]["emailDomain"] = json!("evil.example");
+        assert!(validate_request_local_requirement(&substituted, projection).is_err());
+    }
+
     #[test]
     fn wrong_issuer_holder_and_malformed_or_untrusted_evidence_are_denied() {
         let vector: Value = serde_json::from_str(include_str!(
@@ -7013,6 +7530,237 @@ mod tests {
     }
 
     #[test]
+    fn session_expiry_honours_the_request_and_caps_at_every_authority() {
+        let now = parse_time("2026-10-01T12:00:00Z").unwrap();
+        let at = |seconds: i64| format_time(now + Duration::seconds(seconds));
+        let expiry = |requested: Option<&str>, policy: Option<&str>, account: Option<i64>| {
+            session_expiry(
+                now,
+                requested,
+                &at(7200),
+                policy,
+                account.map(|seconds| now + Duration::seconds(seconds)),
+            )
+        };
+        // Older clients send nothing and keep the 60-second session.
+        assert_eq!(
+            expiry(None, None, None).unwrap(),
+            now + Duration::seconds(60)
+        );
+        assert_eq!(
+            expiry(Some(&at(3600)), Some(&at(9000)), None).unwrap(),
+            now + Duration::seconds(3600)
+        );
+        // Capped one second inside the roots, then by the policy and account.
+        assert_eq!(
+            expiry(Some(&at(9000)), None, None).unwrap(),
+            now + Duration::seconds(7199)
+        );
+        assert_eq!(
+            expiry(Some(&at(9000)), Some(&at(5400)), None).unwrap(),
+            now + Duration::seconds(5400)
+        );
+        assert_eq!(
+            expiry(Some(&at(9000)), Some(&at(5400)), Some(1800)).unwrap(),
+            now + Duration::seconds(1800)
+        );
+        for invalid in [
+            at(0),
+            at(-1),
+            "2026-10-01T13:00:00.000Z".to_owned(),
+            "2026-10-01T13:00:00+00:00".to_owned(),
+            "tomorrow".to_owned(),
+        ] {
+            let (status, error) = expiry(Some(&invalid), None, None).unwrap_err();
+            assert_eq!(status, Status::BadRequest, "{invalid}");
+            assert_eq!(error, "session-expiry-invalid");
+        }
+    }
+
+    #[test]
+    fn v3_delivery_admits_any_mailbox_at_exactly_the_matched_domain() {
+        let (owner, registration, delivery, mut request) = delivery_fixture();
+        request.envelope["recipientMatcher"] = json!({"kind":"emailDomain","value":"example.com"});
+        request
+            .envelope
+            .as_object_mut()
+            .unwrap()
+            .remove("deliveryEmail");
+        resign_delivery_envelope(&mut request.envelope, &owner);
+        let admits = |request: &DeliveryAuthorizationRequest| {
+            v3_envelope_delivery_projection(&request.envelope, &registration, &delivery, request)
+                .is_ok()
+        };
+        for (recipient, admitted) in [
+            ("alice@example.com", true),
+            ("bob@example.com", true),
+            ("Bob@Example.com", false),
+            ("bob@sub.example.com", false),
+            ("bob@example.com.evil", false),
+            ("bob@evilexample.com", false),
+            ("bob@example.co", false),
+            ("example.com", false),
+        ] {
+            let mut addressed = request.clone();
+            addressed.recipient_email = recipient.into();
+            assert_eq!(admits(&addressed), admitted, "{recipient}");
+        }
+
+        // The matcher must already be canonical; IP literals and single
+        // labels are not domains.
+        for domain in [
+            "Example.com",
+            "example.com.",
+            "localhost",
+            "1.2.3.4",
+            "-example.com",
+        ] {
+            let mut odd = request.clone();
+            odd.envelope["recipientMatcher"]["value"] = json!(domain);
+            resign_delivery_envelope(&mut odd.envelope, &owner);
+            odd.recipient_email = format!("bob@{}", domain.to_ascii_lowercase());
+            assert!(!admits(&odd), "{domain}");
+        }
+
+        // An owner-pinned deliveryEmail still limits delivery to that address.
+        let mut pinned = request.clone();
+        pinned.envelope["deliveryEmail"] = json!("alice@example.com");
+        resign_delivery_envelope(&mut pinned.envelope, &owner);
+        pinned.recipient_email = "alice@example.com".into();
+        assert!(admits(&pinned));
+        pinned.recipient_email = "bob@example.com".into();
+        assert!(!admits(&pinned));
+
+        // Exact-email shares no longer need deliveryEmail, but still admit
+        // only the matched mailbox.
+        let (owner, registration, delivery, mut exact) = delivery_fixture();
+        exact
+            .envelope
+            .as_object_mut()
+            .unwrap()
+            .remove("deliveryEmail");
+        resign_delivery_envelope(&mut exact.envelope, &owner);
+        assert!(
+            v3_envelope_delivery_projection(&exact.envelope, &registration, &delivery, &exact)
+                .is_ok()
+        );
+        exact.recipient_email = "bob@example.com".into();
+        assert!(
+            v3_envelope_delivery_projection(&exact.envelope, &registration, &delivery, &exact)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn v3_delivery_keeps_the_exact_email_case_contract() {
+        // 1.17.2 accepted a mixed-case local part for exact-email shares; the
+        // request must still name the matched mailbox, and a pinned address
+        // exactly.
+        let (owner, registration, delivery, mut request) = delivery_fixture();
+        request.envelope["recipientMatcher"] =
+            json!({"kind":"exactEmail","value":"Alice.Smith@Example.com"});
+        request.envelope["deliveryEmail"] = json!("Alice.Smith@example.com");
+        resign_delivery_envelope(&mut request.envelope, &owner);
+        let admits = |request: &DeliveryAuthorizationRequest| {
+            v3_envelope_delivery_projection(&request.envelope, &registration, &delivery, request)
+                .is_ok()
+        };
+        for (recipient, admitted) in [
+            ("Alice.Smith@example.com", true),
+            ("alice.smith@example.com", false),
+            ("Alice.Smith@Example.com", false),
+            ("bob@example.com", false),
+        ] {
+            let mut addressed = request.clone();
+            addressed.recipient_email = recipient.into();
+            assert_eq!(admits(&addressed), admitted, "pinned: {recipient}");
+        }
+        // Without a pinned address, any case of the matched mailbox is the
+        // matched mailbox.
+        let mut unpinned = request.clone();
+        unpinned
+            .envelope
+            .as_object_mut()
+            .unwrap()
+            .remove("deliveryEmail");
+        resign_delivery_envelope(&mut unpinned.envelope, &owner);
+        for (recipient, admitted) in [
+            ("Alice.Smith@Example.com", true),
+            ("alice.smith@example.com", true),
+            ("bob@example.com", false),
+        ] {
+            let mut addressed = unpinned.clone();
+            addressed.recipient_email = recipient.into();
+            assert_eq!(admits(&addressed), admitted, "unpinned: {recipient}");
+        }
+    }
+
+    #[test]
+    fn v3_delivery_terms_require_read_and_the_owner_for_domain_shares() {
+        let envelope = |kind: &str, profile: &str, credential_type: &str| {
+            json!({
+                "recipientMatcher": {"kind": kind, "value": "example.com"},
+                "policy": {"credentialRequirement": {
+                    "profile": {"id": profile, "version": 1},
+                    "credentialType": {"id": credential_type, "version": 1}
+                }}
+            })
+        };
+        let allowed = |envelope: &Value, actions: &[&str], sender: &str| {
+            let actions = actions
+                .iter()
+                .map(|action| action.to_string())
+                .collect::<Vec<_>>();
+            v3_delivery_terms_allowed(
+                envelope.as_object().unwrap(),
+                &actions,
+                sender,
+                "did:key:zOwner",
+            )
+        };
+        let exact = envelope(
+            "exactEmail",
+            "tinycloud.email-proof/v1",
+            "opencredentials.email/v1",
+        );
+        let domain = envelope(
+            "emailDomain",
+            EMAIL_DOMAIN_PROOF_PROFILE,
+            "opencredentials.email/v1",
+        );
+
+        // Exact-email delivery is unchanged: any authorized reader may ask.
+        assert!(allowed(&exact, &["read"], "did:key:zDelegate"));
+        // Any share that grants read can be emailed, not only view-only ones.
+        assert!(allowed(&exact, &["read", "edit"], "did:key:zOwner"));
+        assert!(!allowed(&exact, &["edit"], "did:key:zOwner"));
+        assert!(!allowed(
+            &envelope(
+                "exactEmail",
+                "tinycloud.email-proof/v1",
+                "opencredentials.phone/v1"
+            ),
+            &["read"],
+            "did:key:zOwner"
+        ));
+
+        // A domain share is emailed only at the policy owner's request and
+        // only under the domain-proof profile.
+        assert!(allowed(&domain, &["read"], "did:key:zOwner"));
+        assert!(allowed(&domain, &["read", "edit"], "did:key:zOwner"));
+        assert!(!allowed(&domain, &["read"], "did:key:zDelegate"));
+        assert!(!allowed(
+            &envelope(
+                "emailDomain",
+                "tinycloud.email-proof/v1",
+                "opencredentials.email/v1"
+            ),
+            &["read"],
+            "did:key:zOwner"
+        ));
+    }
+
+    #[test]
     fn v3_delivery_rejects_expired_registration() {
         let (_, registration, _, _) = delivery_fixture();
         assert!(v3_registration_is_live(
@@ -7076,6 +7824,36 @@ mod tests {
 
     #[tokio::test]
     async fn policy_v2_admits_v3_account_and_v4_accountless_receivers() -> anyhow::Result<()> {
+        run_policy_v2_flow(PolicyOwner::SpaceOwner).await
+    }
+
+    /// The real Share and CLI shape: the policy owner is a session key the
+    /// space owner delegated to. It registers, mints and reads; once the
+    /// space owner revokes that delegation, no new session can be minted.
+    #[tokio::test]
+    async fn policy_owner_may_be_a_session_the_space_owner_delegated_to() -> anyhow::Result<()> {
+        run_policy_v2_flow(PolicyOwner::DelegatedSession).await
+    }
+
+    /// The policy owner signs a valid, self-consistent policy over content in
+    /// a space it holds no authority in (the victim hosts and seeds it).
+    /// Registration must refuse it, so no session can ever read the bytes.
+    #[tokio::test]
+    async fn policy_registration_requires_the_owner_to_hold_what_it_grants() -> anyhow::Result<()> {
+        run_policy_v2_flow(PolicyOwner::Unauthorized).await
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum PolicyOwner {
+        /// The policy owner is the content space's owner.
+        SpaceOwner,
+        /// The policy owner is a session key the space owner delegated to.
+        DelegatedSession,
+        /// The policy owner holds nothing in the content space.
+        Unauthorized,
+    }
+
+    async fn run_policy_v2_flow(policy_owner: PolicyOwner) -> anyhow::Result<()> {
         use k256::ecdsa::SigningKey;
         use sha3::Keccak256;
         use tinycloud_auth::cacaos::siwe::encode_eip55;
@@ -7110,7 +7888,17 @@ mod tests {
         let account_owner_did = format!("did:pkh:eip155:1:0x{}", encode_eip55(&account_address));
         let credentials_space =
             SpaceId::new(account_owner_did.parse::<DIDBuf>()?, "credentials".parse()?);
-        let content_space = SpaceId::new(owner_did.parse::<DIDBuf>()?, "applications".parse()?);
+        let victim_key = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
+        let victim_did = did(&victim_key);
+        let content_owner_did = if policy_owner != PolicyOwner::SpaceOwner {
+            &victim_did
+        } else {
+            &owner_did
+        };
+        let content_space = SpaceId::new(
+            content_owner_did.parse::<DIDBuf>()?,
+            "applications".parse()?,
+        );
         let content_resource = content_space.clone().to_resource(
             "kv".parse()?,
             Some("shares/tc-470/document.txt".parse()?),
@@ -7132,7 +7920,7 @@ mod tests {
             assert!(!principals[..index].contains(principal));
         }
         assert_ne!(content_space, credentials_space);
-        assert_eq!(content_space.did().as_str(), owner_did);
+        assert_eq!(content_space.did().as_str(), content_owner_did.as_str());
         assert_eq!(credentials_space.did().as_str(), account_owner_did);
 
         let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
@@ -7144,7 +7932,7 @@ mod tests {
             "selector": "exact",
             "actions": ["tinycloud.kv/get"]
         })];
-        let encryption_resource = format!("urn:tinycloud:encryption:{owner_did}:mainnet");
+        let encryption_resource = format!("urn:tinycloud:encryption:{content_owner_did}:mainnet");
         let ceiling = vec![
             json!({
                 "kind": "kv",
@@ -7523,7 +8311,9 @@ mod tests {
                     mint,
                     crate::routes::delegate,
                     crate::routes::invoke,
-                    crate::routes::revoke
+                    crate::routes::revoke,
+                    crate::routes::create_signed_kv_url,
+                    crate::routes::signed_kv_get
                 ],
             )
             .attach(crate::tracing::TracingFairing::new(
@@ -7544,12 +8334,29 @@ mod tests {
             .manage(crate::BlockStage::from(
                 crate::config::StagingStorage::Memory,
             ))
-            .manage(encryption);
+            .manage(encryption)
+            .manage(crate::signed_urls::SignedUrlRuntime::new([33; 32]));
         let client = Client::tracked(rocket).await?;
 
         // The sender independently hosts and writes the sender-owned content
         // space through the ordinary graph. The recipient account proof below
         // never carries authority for this resource.
+        // The content space's owner hosts and seeds it through the ordinary
+        // graph: the policy owner itself, or a victim when the content is foreign.
+        let content_owner_key = if policy_owner != PolicyOwner::SpaceOwner {
+            &victim_key
+        } else {
+            &owner_key
+        };
+        let content_owner_jwk = JWK::from(Params::OKP(OctetParams {
+            curve: "Ed25519".to_owned(),
+            public_key: Base64urlUInt(content_owner_key.public().to_bytes().to_vec()),
+            private_key: Some(Base64urlUInt(content_owner_key.secret().as_ref().to_vec())),
+        }));
+        let content_owner_vm = format!(
+            "{content_owner_did}#{}",
+            content_owner_did.trim_start_matches("did:key:")
+        );
         let mut sender_capabilities = Capabilities::<Value>::new();
         sender_capabilities.with_action(
             content_space
@@ -7571,7 +8378,7 @@ mod tests {
         );
         let sender_authorization = TinyCloudDelegation::Ucan(Box::new(
             Payload {
-                issuer: owner_vm.parse()?,
+                issuer: content_owner_vm.parse()?,
                 audience: holder_did.parse()?,
                 not_before: Some(NumericDate::try_from_seconds(
                     issued.unix_timestamp() as f64
@@ -7582,7 +8389,7 @@ mod tests {
                 proof: vec![],
                 attenuation: sender_capabilities,
             }
-            .sign(Algorithm::EdDSA, &owner_jwk)?,
+            .sign(Algorithm::EdDSA, &content_owner_jwk)?,
         ))
         .encode()?;
         let sender_response = client
@@ -7600,6 +8407,56 @@ mod tests {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing sender delegation cid"))?
             .parse()?;
+
+        // A session the space owner delegated to may own a policy over what
+        // that delegation covers, as the Share and CLI owners do.
+        let owner_delegation_cid = if policy_owner == PolicyOwner::DelegatedSession {
+            let mut owner_capabilities = Capabilities::<Value>::new();
+            for ability in ["tinycloud.kv/get", "tinycloud.kv/metadata"] {
+                owner_capabilities.with_action(
+                    content_resource.as_uri(),
+                    ability.parse::<RecapAbility>()?,
+                    [std::collections::BTreeMap::<String, Value>::new()],
+                );
+            }
+            owner_capabilities.with_action(
+                encryption_resource.parse()?,
+                "tinycloud.encryption/decrypt".parse::<RecapAbility>()?,
+                [std::collections::BTreeMap::<String, Value>::new()],
+            );
+            let authorization = TinyCloudDelegation::Ucan(Box::new(
+                Payload {
+                    issuer: content_owner_vm.parse()?,
+                    audience: owner_did.parse()?,
+                    not_before: Some(NumericDate::try_from_seconds(
+                        issued.unix_timestamp() as f64
+                    )?),
+                    expiration: NumericDate::try_from_seconds(expires.unix_timestamp() as f64)?,
+                    nonce: Some("tc597-owner-session".into()),
+                    facts: Some(vec![]),
+                    proof: vec![],
+                    attenuation: owner_capabilities,
+                }
+                .sign(Algorithm::EdDSA, &content_owner_jwk)?,
+            ))
+            .encode()?;
+            let response = client
+                .post("/delegate")
+                .header(rocket::http::Header::new("Authorization", authorization))
+                .dispatch()
+                .await;
+            let status = response.status();
+            let body = response.into_string().await.unwrap_or_default();
+            assert_eq!(status, Status::Ok, "owner session /delegate: {body}");
+            Some(
+                serde_json::from_str::<Value>(&body)?["cid"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("missing owner delegation cid"))?
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
 
         // Import the recipient's existing SDK account-session CACAO through
         // the real ordinary `/delegate` route. Its only signed authority is
@@ -7745,6 +8602,23 @@ mod tests {
             .await;
         let register_status = register_response.status();
         let register_body = register_response.into_string().await.unwrap_or_default();
+        if policy_owner == PolicyOwner::Unauthorized {
+            assert_eq!(
+                register_status,
+                Status::Forbidden,
+                "register: {register_body}"
+            );
+            assert_eq!(register_body, "policy-owner-not-authorized");
+            let conn = &client.rocket().state::<PolicyV3Runtime>().unwrap().conn;
+            assert!(
+                policy_v3_registration::Entity::find_by_id(policy_cid.clone())
+                    .one(conn)
+                    .await?
+                    .is_none()
+            );
+            assert!(policy_v3_root::Entity::find().one(conn).await?.is_none());
+            return Ok(());
+        }
         assert_eq!(register_status, Status::Ok, "register: {register_body}");
         let registered: Value = serde_json::from_str(&register_body)?;
 
@@ -7908,6 +8782,66 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(rebound_response.status(), Status::Conflict);
+
+        // A domain envelope may be emailed only at the policy owner's request.
+        // The owner's delegate can read the file but cannot use the Node to
+        // email the link to other mailboxes at the domain.
+        let mut domain_envelope = delivery_request.envelope.clone();
+        let unsigned_domain = domain_envelope.as_object_mut().unwrap();
+        unsigned_domain.remove("signature");
+        unsigned_domain.remove("deliveryEmail");
+        domain_envelope["recipientMatcher"] = json!({"kind":"emailDomain","value":"example.test"});
+        let mut domain_preimage = b"xyz.tinycloud.share/envelope/v3\0".to_vec();
+        domain_preimage.extend_from_slice(&canonical_json_value(&domain_envelope));
+        domain_envelope["signature"] = json!({
+            "algorithm":"Ed25519",
+            "signerDid":owner_did,
+            "value":encode_config(owner_key.sign(&Sha256::digest(domain_preimage)), URL_SAFE_NO_PAD),
+        });
+        let (domain_sealed, domain_key, domain_cid) = seal_delivery_envelope(
+            &domain_envelope,
+            [13; 32],
+            [14; SEALED_ENVELOPE_NONCE_BYTES],
+        );
+        let mut domain_request = DeliveryAuthorizationRequest {
+            envelope: domain_envelope,
+            sealed_envelope: domain_sealed,
+            envelope_key: domain_key.clone(),
+            share_cid: domain_cid.clone(),
+            recipient_email: "bob@example.test".into(),
+            share_url: format!("https://share.tinycloud.xyz/s/{domain_cid}#k={domain_key}"),
+            document_name: "document.txt".into(),
+            jti: encode_config([9_u8; 16], URL_SAFE_NO_PAD),
+            expires_at: format_time(OffsetDateTime::now_utc() + Duration::minutes(4)),
+            request_body_digest: String::new(),
+        };
+        domain_request.request_body_digest = delivery_request_digest(&domain_request)
+            .map_err(|_| anyhow::anyhow!("domain delivery request digest"))?;
+        let domain_delivery = make_invocation(
+            [(
+                content_resource.clone(),
+                ["tinycloud.kv/get".parse::<RecapAbility>()?],
+            )],
+            &sender_cid,
+            &delivery_jwk,
+            &format!("{holder_did}#{}", holder_did.trim_start_matches("did:key:")),
+            (OffsetDateTime::now_utc() + Duration::seconds(45)).unix_timestamp() as f64,
+            InvocationOptions {
+                nonce: Some("tc530-domain-delivery-from-delegate".into()),
+                ..InvocationOptions::default()
+            },
+        )?;
+        let domain_response = client
+            .post("/policy/v3/deliveries/authorize")
+            .header(ContentType::JSON)
+            .header(rocket::http::Header::new(
+                "Authorization",
+                domain_delivery.encode()?,
+            ))
+            .body(serde_json::to_string(&domain_request)?)
+            .dispatch()
+            .await;
+        assert_eq!(domain_response.status(), Status::Forbidden);
 
         if std::env::var("TC498_EMIT_DELIVERY_RECEIPT").as_deref() == Ok("1") {
             let request = delivery_receipt["request"].clone();
@@ -8146,6 +9080,8 @@ mod tests {
             holder_key.sign(&Sha256::digest(v4_preimage)),
             URL_SAFE_NO_PAD
         ));
+        let v4_requested_expiry =
+            format_time(OffsetDateTime::now_utc().replace_nanosecond(0)? + Duration::seconds(300));
         let v4_request_value = json!({
             "policyCid": policy_cid,
             "challengeId": v4_challenge["challengeId"],
@@ -8153,6 +9089,7 @@ mod tests {
             "requirement": requirement,
             "credential": credential,
             "presentation": v4_presentation,
+            "requestedExpiresAt": v4_requested_expiry,
         });
         for field in ["accountAuthorizationCid", "credentialSpaceId"] {
             let mut explicit_null = v4_request_value.clone();
@@ -8186,6 +9123,12 @@ mod tests {
         let v4_s0 =
             decode_delegation(v4_authorization).map_err(|(_, error)| anyhow::anyhow!(error))?;
         assert_eq!(v4_s0.0.delegate, holder_did);
+        // The receiver asked for five minutes instead of the legacy minute.
+        assert_eq!(
+            v4_s0.0.expiry.map(format_time).as_deref(),
+            Some(v4_requested_expiry.as_str())
+        );
+        assert!(v4_s0.0.expiry.unwrap() - v4_s0.0.not_before.unwrap() > Duration::seconds(60));
         assert_eq!(
             fact(&v4_s0.0.delegation, "recipientDid"),
             Some(holder_did.as_str())
@@ -8274,6 +9217,175 @@ mod tests {
         );
         assert_eq!(v4_read_body, b"tc-470-real-content");
 
+        // Onward delegation from the long-lived session: holder -> reader A
+        // -> reader B. Each hop is admitted against its immediate parent.
+        let hop = |parent: &tinycloud_core::events::Delegation,
+                   issuer_jwk: &JWK,
+                   issuer_did: &str,
+                   audience_did: &str,
+                   nonce: &str|
+         -> anyhow::Result<String> {
+            let mut facts = match &parent.0.delegation {
+                TinyCloudDelegation::Ucan(ucan) => ucan.payload().facts.clone().unwrap(),
+                TinyCloudDelegation::Cacao(_) => unreachable!(),
+            };
+            let depth = facts[0]["remainingRedelegationDepth"].as_u64().unwrap();
+            facts[0]["remainingRedelegationDepth"] = json!(depth - 1);
+            let not_before = parent.0.not_before.unwrap() + Duration::milliseconds(1);
+            let expiry = parent.0.expiry.unwrap() - Duration::seconds(1);
+            let issuer_vm = format!("{issuer_did}#{}", issuer_did.trim_start_matches("did:key:"));
+            let delegation = Payload {
+                issuer: issuer_vm.parse()?,
+                audience: audience_did.parse()?,
+                not_before: Some(NumericDate::try_from_seconds(
+                    not_before.unix_timestamp_nanos() as f64 / 1_000_000_000.0,
+                )?),
+                expiration: NumericDate::try_from_seconds(
+                    expiry.unix_timestamp_nanos() as f64 / 1_000_000_000.0,
+                )?,
+                nonce: Some(nonce.into()),
+                facts: Some(facts),
+                proof: vec![parent.content_hash().to_cid(0x55)],
+                attenuation: serde_json::from_value::<Capabilities<Value>>(
+                    attenuation_for_policy_capabilities(&requested)
+                        .map_err(|(_, error)| anyhow::anyhow!(error))?,
+                )?,
+            }
+            .sign(Algorithm::EdDSA, issuer_jwk)?;
+            Ok(TinyCloudDelegation::Ucan(Box::new(delegation)).encode()?)
+        };
+        let reader_a_jwk = JWK::generate_ed25519()?;
+        let reader_a_did = tinycloud_auth::resolver::DID_METHODS
+            .generate(&reader_a_jwk, "key")?
+            .to_string();
+        let reader_b_jwk = JWK::generate_ed25519()?;
+        let reader_b_did = tinycloud_auth::resolver::DID_METHODS
+            .generate(&reader_b_jwk, "key")?
+            .to_string();
+        let mut chain_tip = v4_s0;
+        for (issuer_jwk, issuer_did, audience_did, nonce) in [
+            (&holder_jwk, &holder_did, &reader_a_did, "tc529-child"),
+            (
+                &reader_a_jwk,
+                &reader_a_did,
+                &reader_b_did,
+                "tc529-grandchild",
+            ),
+        ] {
+            let authorization = hop(&chain_tip, issuer_jwk, issuer_did, audience_did, nonce)?;
+            let response = client
+                .post("/delegate")
+                .header(rocket::http::Header::new(
+                    "Authorization",
+                    authorization.clone(),
+                ))
+                .dispatch()
+                .await;
+            let status = response.status();
+            let body = response.into_string().await.unwrap_or_default();
+            assert_eq!(status, Status::Ok, "{nonce} /delegate: {body}");
+            chain_tip =
+                decode_delegation(&authorization).map_err(|(_, error)| anyhow::anyhow!(error))?;
+        }
+        let grandchild_cid = chain_tip.content_hash().to_cid(0x55);
+        let reader_b_vm = format!(
+            "{reader_b_did}#{}",
+            reader_b_did.trim_start_matches("did:key:")
+        );
+        let reader_b_invocation = |lifetime: i64, nonce: &str| -> anyhow::Result<String> {
+            let now = OffsetDateTime::now_utc();
+            Ok(Payload {
+                issuer: reader_b_vm.parse()?,
+                audience: reader_b_did.parse()?,
+                not_before: Some(NumericDate::try_from_seconds(now.unix_timestamp() as f64)?),
+                expiration: NumericDate::try_from_seconds(
+                    (now + Duration::seconds(lifetime)).unix_timestamp() as f64,
+                )?,
+                nonce: Some(nonce.into()),
+                facts: Some(Vec::<Value>::new()),
+                proof: vec![grandchild_cid],
+                attenuation: serde_json::from_value::<Capabilities<Value>>(
+                    attenuation_for_policy_capabilities(&requested)
+                        .map_err(|(_, error)| anyhow::anyhow!(error))?,
+                )?,
+            }
+            .sign(Algorithm::EdDSA, &reader_b_jwk)?
+            .encode()?)
+        };
+        let grandchild_read = client
+            .post("/invoke")
+            .header(rocket::http::Header::new(
+                "Authorization",
+                reader_b_invocation(30, "tc529-grandchild-read")?,
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(grandchild_read.status(), Status::Ok);
+        assert_eq!(
+            grandchild_read.into_bytes().await.unwrap_or_default(),
+            b"tc-470-real-content"
+        );
+
+        // /signed/kv runs the same policy gate as /invoke. A policy
+        // invocation within the 60-second cap mints a working URL; a longer
+        // one is refused by the gate even though the ordinary graph allows it.
+        let signed_request = json!({
+            "space": content_space.to_string(),
+            "path": "shares/tc-470/document.txt",
+        })
+        .to_string();
+        let signed = client
+            .post("/signed/kv")
+            .header(ContentType::JSON)
+            .header(rocket::http::Header::new(
+                "Authorization",
+                reader_b_invocation(30, "tc529-grandchild-signed-url")?,
+            ))
+            .body(signed_request.clone())
+            .dispatch()
+            .await;
+        let signed_status = signed.status();
+        let signed_body = signed.into_string().await.unwrap_or_default();
+        assert_eq!(signed_status, Status::Ok, "signed URL: {signed_body}");
+        let signed_url = serde_json::from_str::<Value>(&signed_body)?["url"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let signed_read = client.get(signed_url).dispatch().await;
+        assert_eq!(signed_read.status(), Status::Ok);
+        assert_eq!(
+            signed_read.into_bytes().await.unwrap_or_default(),
+            b"tc-470-real-content"
+        );
+        let long_signed = client
+            .post("/signed/kv")
+            .header(ContentType::JSON)
+            .header(rocket::http::Header::new(
+                "Authorization",
+                reader_b_invocation(90, "tc529-grandchild-long-signed-url")?,
+            ))
+            .body(signed_request)
+            .dispatch()
+            .await;
+        assert_eq!(long_signed.status(), Status::Forbidden);
+        assert_eq!(
+            long_signed.into_string().await.unwrap_or_default(),
+            "policy-invocation-lifetime-too-long"
+        );
+
+        // A policy chain is never owner authority: reader B, which holds only
+        // this chain, cannot publish a policy of its own over the content.
+        assert_eq!(
+            owner_holds_capabilities(
+                &client.rocket().state::<PolicyV3Runtime>().unwrap().conn,
+                &reader_b_did,
+                &chain_tip.0.capabilities,
+                OffsetDateTime::now_utc(),
+            )
+            .await,
+            Err("policy-owner-not-authorized")
+        );
+
         // A duplicate presentation remains a replay even while the roots are
         // otherwise live. Root revocation below is a separate denial reason.
         let replay = client
@@ -8283,6 +9395,108 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(replay.status(), Status::Unauthorized);
+
+        if let Some(owner_delegation_cid) = owner_delegation_cid.as_deref() {
+            // Revoking the delegation the policy owner held stops new
+            // sessions, although the policy and its roots are untouched.
+            let mut capabilities = Capabilities::<Value>::new();
+            capabilities.with_action(
+                format!("urn:cid:{owner_delegation_cid}").parse()?,
+                "tinycloud.delegation/revoke".parse::<RecapAbility>()?,
+                [std::collections::BTreeMap::<String, Value>::new()],
+            );
+            let revocation = tinycloud_auth::authorization::TinyCloudRevocation::Ucan(Box::new(
+                Payload {
+                    issuer: content_owner_vm.parse()?,
+                    audience: content_owner_did.parse()?,
+                    not_before: None,
+                    expiration: NumericDate::try_from_seconds(
+                        (OffsetDateTime::now_utc() + Duration::seconds(60)).unix_timestamp() as f64,
+                    )?,
+                    nonce: Some("tc597-owner-session-revoke".into()),
+                    facts: Some(Vec::new()),
+                    proof: Vec::new(),
+                    attenuation: capabilities,
+                }
+                .sign(Algorithm::EdDSA, &content_owner_jwk)?,
+            ));
+            let revoked = client
+                .post("/revoke")
+                .header(rocket::http::Header::new(
+                    "Authorization",
+                    revocation.encode()?,
+                ))
+                .dispatch()
+                .await;
+            let revoked_status = revoked.status();
+            let revoked_body = revoked.into_string().await.unwrap_or_default();
+            assert_eq!(
+                revoked_status,
+                Status::Ok,
+                "owner session revoke: {revoked_body}"
+            );
+
+            let challenge_response = client
+                .post("/policy/v3/challenges")
+                .header(ContentType::JSON)
+                .body(
+                    json!({
+                        "policyCid": policy_cid,
+                        "recipientDid": holder_did,
+                        "requestedCapabilities": requested,
+                    })
+                    .to_string(),
+                )
+                .dispatch()
+                .await;
+            assert_eq!(challenge_response.status(), Status::Ok);
+            let fresh_challenge: Value = challenge_response.into_json().await.unwrap();
+            let mut fresh = presentation.clone();
+            fresh["schema"] = json!(CREDENTIAL_PRESENTATION_V4_SCHEMA);
+            fresh["jti"] = json!("presentation-tc-597-after-owner-revoke");
+            fresh["challengeId"] = fresh_challenge["challengeId"].clone();
+            fresh["nonce"] = fresh_challenge["nonce"].clone();
+            fresh
+                .as_object_mut()
+                .unwrap()
+                .remove("credentialSpaceOwnerDid");
+            fresh["issuedAt"] = json!(format_time(OffsetDateTime::now_utc()));
+            fresh["expiresAt"] = json!(format_time(
+                OffsetDateTime::now_utc() + Duration::seconds(45)
+            ));
+            let mut unsigned_fresh = fresh.clone();
+            unsigned_fresh.as_object_mut().unwrap().remove("signature");
+            let mut fresh_preimage = CREDENTIAL_PRESENTATION_V4_DOMAIN.to_vec();
+            fresh_preimage.extend_from_slice(&canonical_json_value(&unsigned_fresh));
+            fresh["signature"]["value"] = json!(encode_config(
+                holder_key.sign(&Sha256::digest(fresh_preimage)),
+                URL_SAFE_NO_PAD
+            ));
+            let refused = client
+                .post("/policy/v3/delegations")
+                .header(ContentType::JSON)
+                .body(
+                    json!({
+                        "policyCid": policy_cid,
+                        "challengeId": fresh_challenge["challengeId"],
+                        "nonce": fresh_challenge["nonce"],
+                        "requirement": requirement,
+                        "credential": credential,
+                        "presentation": fresh,
+                    })
+                    .to_string(),
+                )
+                .dispatch()
+                .await;
+            let refused_status = refused.status();
+            let refused_body = refused.into_string().await.unwrap_or_default();
+            assert_eq!(
+                refused_status,
+                Status::Forbidden,
+                "mint after owner revoke: {refused_body}"
+            );
+            assert_eq!(refused_body, "policy-owner-not-authorized");
+        }
 
         // SDK revocation writes the generic graph. Policy/v3 joins that
         // graph with its signed root status, so this one root revocation must
