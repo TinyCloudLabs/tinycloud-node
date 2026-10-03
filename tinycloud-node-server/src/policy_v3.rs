@@ -89,8 +89,9 @@ const DELIVERY_ADMISSION_SCHEMA: &str = "xyz.tinycloud.policy/delivery-admission
 /// OpenCredentials profile whose signed `emailDomain` claim backs domain shares.
 const EMAIL_DOMAIN_PROOF_PROFILE: &str = "tinycloud.email-domain-proof/v1";
 /// How many of the policy owner's own delegations are tried as proof of the
-/// authority its policy roots grant.
-const MAX_OWNER_AUTHORITY_CANDIDATES: u64 = 32;
+/// authority its policy roots grant, out of how many recent rows.
+const MAX_OWNER_AUTHORITY_CANDIDATES: usize = 32;
+const MAX_OWNER_AUTHORITY_ROWS: u64 = 256;
 
 #[derive(Clone)]
 struct DeliveryRuntime {
@@ -733,15 +734,18 @@ impl PolicyV3Runtime {
 /// A policy root is parentless, so the ordinary graph admits it without
 /// checking that its signer may grant what it carries. Require that here: at
 /// `at`, the owner must hold every root capability as root authority or
-/// through one of its own delegations, by the same rules as an invocation by
-/// the owner (revocation, every chain window, caveat containment).
+/// through one of its own ordinary delegations, by the same rules as an
+/// invocation by the owner (revocation, every chain window, caveat
+/// containment). A policy session or root is never owner authority: a
+/// recipient could otherwise re-publish what it was shared under a policy of
+/// its own that the original owner cannot revoke.
 async fn owner_holds_capabilities(
     conn: &DatabaseConnection,
     owner_did: &str,
     capabilities: &[tinycloud_core::util::Capability],
     at: OffsetDateTime,
 ) -> Result<(), &'static str> {
-    let candidates = delegation_model::Entity::find()
+    let rows = delegation_model::Entity::find()
         .filter(
             Condition::any()
                 .add(delegation_model::Column::Delegatee.eq(owner_did))
@@ -752,11 +756,25 @@ async fn owner_holds_capabilities(
                 .add(delegation_model::Column::Expiry.is_null())
                 .add(delegation_model::Column::Expiry.gt(at)),
         )
-        .order_by_desc(delegation_model::Column::IssuedAt)
-        .limit(MAX_OWNER_AUTHORITY_CANDIDATES)
+        .order_by_with_nulls(
+            delegation_model::Column::IssuedAt,
+            tinycloud_core::sea_orm::Order::Desc,
+            tinycloud_core::sea_orm::sea_query::NullOrdering::Last,
+        )
+        .limit(MAX_OWNER_AUTHORITY_ROWS)
         .all(conn)
         .await
         .map_err(|_| "policy-owner-authority-unavailable")?;
+    let candidates = rows
+        .into_iter()
+        .filter(|row| {
+            !row.facts.as_ref().is_some_and(|facts| {
+                facts.0.contains_key("xyz.tinycloud.policy/session-fact")
+                    || facts.0.contains_key("xyz.tinycloud.policy/root-profile")
+            })
+        })
+        .take(MAX_OWNER_AUTHORITY_CANDIDATES)
+        .collect::<Vec<_>>();
     'capabilities: for capability in capabilities {
         let capability = std::slice::from_ref(capability);
         if invocation_model::authorize_holder(conn, owner_did, capability, &[], at)
@@ -7806,7 +7824,15 @@ mod tests {
 
     #[tokio::test]
     async fn policy_v2_admits_v3_account_and_v4_accountless_receivers() -> anyhow::Result<()> {
-        run_policy_v2_flow(false).await
+        run_policy_v2_flow(PolicyOwner::SpaceOwner).await
+    }
+
+    /// The real Share and CLI shape: the policy owner is a session key the
+    /// space owner delegated to. It registers, mints and reads; once the
+    /// space owner revokes that delegation, no new session can be minted.
+    #[tokio::test]
+    async fn policy_owner_may_be_a_session_the_space_owner_delegated_to() -> anyhow::Result<()> {
+        run_policy_v2_flow(PolicyOwner::DelegatedSession).await
     }
 
     /// The policy owner signs a valid, self-consistent policy over content in
@@ -7814,10 +7840,20 @@ mod tests {
     /// Registration must refuse it, so no session can ever read the bytes.
     #[tokio::test]
     async fn policy_registration_requires_the_owner_to_hold_what_it_grants() -> anyhow::Result<()> {
-        run_policy_v2_flow(true).await
+        run_policy_v2_flow(PolicyOwner::Unauthorized).await
     }
 
-    async fn run_policy_v2_flow(foreign_content: bool) -> anyhow::Result<()> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum PolicyOwner {
+        /// The policy owner is the content space's owner.
+        SpaceOwner,
+        /// The policy owner is a session key the space owner delegated to.
+        DelegatedSession,
+        /// The policy owner holds nothing in the content space.
+        Unauthorized,
+    }
+
+    async fn run_policy_v2_flow(policy_owner: PolicyOwner) -> anyhow::Result<()> {
         use k256::ecdsa::SigningKey;
         use sha3::Keccak256;
         use tinycloud_auth::cacaos::siwe::encode_eip55;
@@ -7854,7 +7890,7 @@ mod tests {
             SpaceId::new(account_owner_did.parse::<DIDBuf>()?, "credentials".parse()?);
         let victim_key = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
         let victim_did = did(&victim_key);
-        let content_owner_did = if foreign_content {
+        let content_owner_did = if policy_owner != PolicyOwner::SpaceOwner {
             &victim_did
         } else {
             &owner_did
@@ -7896,7 +7932,7 @@ mod tests {
             "selector": "exact",
             "actions": ["tinycloud.kv/get"]
         })];
-        let encryption_resource = format!("urn:tinycloud:encryption:{owner_did}:mainnet");
+        let encryption_resource = format!("urn:tinycloud:encryption:{content_owner_did}:mainnet");
         let ceiling = vec![
             json!({
                 "kind": "kv",
@@ -8307,7 +8343,7 @@ mod tests {
         // never carries authority for this resource.
         // The content space's owner hosts and seeds it through the ordinary
         // graph: the policy owner itself, or a victim when the content is foreign.
-        let content_owner_key = if foreign_content {
+        let content_owner_key = if policy_owner != PolicyOwner::SpaceOwner {
             &victim_key
         } else {
             &owner_key
@@ -8371,6 +8407,56 @@ mod tests {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing sender delegation cid"))?
             .parse()?;
+
+        // A session the space owner delegated to may own a policy over what
+        // that delegation covers, as the Share and CLI owners do.
+        let owner_delegation_cid = if policy_owner == PolicyOwner::DelegatedSession {
+            let mut owner_capabilities = Capabilities::<Value>::new();
+            for ability in ["tinycloud.kv/get", "tinycloud.kv/metadata"] {
+                owner_capabilities.with_action(
+                    content_resource.as_uri(),
+                    ability.parse::<RecapAbility>()?,
+                    [std::collections::BTreeMap::<String, Value>::new()],
+                );
+            }
+            owner_capabilities.with_action(
+                encryption_resource.parse()?,
+                "tinycloud.encryption/decrypt".parse::<RecapAbility>()?,
+                [std::collections::BTreeMap::<String, Value>::new()],
+            );
+            let authorization = TinyCloudDelegation::Ucan(Box::new(
+                Payload {
+                    issuer: content_owner_vm.parse()?,
+                    audience: owner_did.parse()?,
+                    not_before: Some(NumericDate::try_from_seconds(
+                        issued.unix_timestamp() as f64
+                    )?),
+                    expiration: NumericDate::try_from_seconds(expires.unix_timestamp() as f64)?,
+                    nonce: Some("tc597-owner-session".into()),
+                    facts: Some(vec![]),
+                    proof: vec![],
+                    attenuation: owner_capabilities,
+                }
+                .sign(Algorithm::EdDSA, &content_owner_jwk)?,
+            ))
+            .encode()?;
+            let response = client
+                .post("/delegate")
+                .header(rocket::http::Header::new("Authorization", authorization))
+                .dispatch()
+                .await;
+            let status = response.status();
+            let body = response.into_string().await.unwrap_or_default();
+            assert_eq!(status, Status::Ok, "owner session /delegate: {body}");
+            Some(
+                serde_json::from_str::<Value>(&body)?["cid"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("missing owner delegation cid"))?
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
 
         // Import the recipient's existing SDK account-session CACAO through
         // the real ordinary `/delegate` route. Its only signed authority is
@@ -8516,7 +8602,7 @@ mod tests {
             .await;
         let register_status = register_response.status();
         let register_body = register_response.into_string().await.unwrap_or_default();
-        if foreign_content {
+        if policy_owner == PolicyOwner::Unauthorized {
             assert_eq!(
                 register_status,
                 Status::Forbidden,
@@ -9287,6 +9373,19 @@ mod tests {
             "policy-invocation-lifetime-too-long"
         );
 
+        // A policy chain is never owner authority: reader B, which holds only
+        // this chain, cannot publish a policy of its own over the content.
+        assert_eq!(
+            owner_holds_capabilities(
+                &client.rocket().state::<PolicyV3Runtime>().unwrap().conn,
+                &reader_b_did,
+                &chain_tip.0.capabilities,
+                OffsetDateTime::now_utc(),
+            )
+            .await,
+            Err("policy-owner-not-authorized")
+        );
+
         // A duplicate presentation remains a replay even while the roots are
         // otherwise live. Root revocation below is a separate denial reason.
         let replay = client
@@ -9296,6 +9395,108 @@ mod tests {
             .dispatch()
             .await;
         assert_eq!(replay.status(), Status::Unauthorized);
+
+        if let Some(owner_delegation_cid) = owner_delegation_cid.as_deref() {
+            // Revoking the delegation the policy owner held stops new
+            // sessions, although the policy and its roots are untouched.
+            let mut capabilities = Capabilities::<Value>::new();
+            capabilities.with_action(
+                format!("urn:cid:{owner_delegation_cid}").parse()?,
+                "tinycloud.delegation/revoke".parse::<RecapAbility>()?,
+                [std::collections::BTreeMap::<String, Value>::new()],
+            );
+            let revocation = tinycloud_auth::authorization::TinyCloudRevocation::Ucan(Box::new(
+                Payload {
+                    issuer: content_owner_vm.parse()?,
+                    audience: content_owner_did.parse()?,
+                    not_before: None,
+                    expiration: NumericDate::try_from_seconds(
+                        (OffsetDateTime::now_utc() + Duration::seconds(60)).unix_timestamp() as f64,
+                    )?,
+                    nonce: Some("tc597-owner-session-revoke".into()),
+                    facts: Some(Vec::new()),
+                    proof: Vec::new(),
+                    attenuation: capabilities,
+                }
+                .sign(Algorithm::EdDSA, &content_owner_jwk)?,
+            ));
+            let revoked = client
+                .post("/revoke")
+                .header(rocket::http::Header::new(
+                    "Authorization",
+                    revocation.encode()?,
+                ))
+                .dispatch()
+                .await;
+            let revoked_status = revoked.status();
+            let revoked_body = revoked.into_string().await.unwrap_or_default();
+            assert_eq!(
+                revoked_status,
+                Status::Ok,
+                "owner session revoke: {revoked_body}"
+            );
+
+            let challenge_response = client
+                .post("/policy/v3/challenges")
+                .header(ContentType::JSON)
+                .body(
+                    json!({
+                        "policyCid": policy_cid,
+                        "recipientDid": holder_did,
+                        "requestedCapabilities": requested,
+                    })
+                    .to_string(),
+                )
+                .dispatch()
+                .await;
+            assert_eq!(challenge_response.status(), Status::Ok);
+            let fresh_challenge: Value = challenge_response.into_json().await.unwrap();
+            let mut fresh = presentation.clone();
+            fresh["schema"] = json!(CREDENTIAL_PRESENTATION_V4_SCHEMA);
+            fresh["jti"] = json!("presentation-tc-597-after-owner-revoke");
+            fresh["challengeId"] = fresh_challenge["challengeId"].clone();
+            fresh["nonce"] = fresh_challenge["nonce"].clone();
+            fresh
+                .as_object_mut()
+                .unwrap()
+                .remove("credentialSpaceOwnerDid");
+            fresh["issuedAt"] = json!(format_time(OffsetDateTime::now_utc()));
+            fresh["expiresAt"] = json!(format_time(
+                OffsetDateTime::now_utc() + Duration::seconds(45)
+            ));
+            let mut unsigned_fresh = fresh.clone();
+            unsigned_fresh.as_object_mut().unwrap().remove("signature");
+            let mut fresh_preimage = CREDENTIAL_PRESENTATION_V4_DOMAIN.to_vec();
+            fresh_preimage.extend_from_slice(&canonical_json_value(&unsigned_fresh));
+            fresh["signature"]["value"] = json!(encode_config(
+                holder_key.sign(&Sha256::digest(fresh_preimage)),
+                URL_SAFE_NO_PAD
+            ));
+            let refused = client
+                .post("/policy/v3/delegations")
+                .header(ContentType::JSON)
+                .body(
+                    json!({
+                        "policyCid": policy_cid,
+                        "challengeId": fresh_challenge["challengeId"],
+                        "nonce": fresh_challenge["nonce"],
+                        "requirement": requirement,
+                        "credential": credential,
+                        "presentation": fresh,
+                    })
+                    .to_string(),
+                )
+                .dispatch()
+                .await;
+            let refused_status = refused.status();
+            let refused_body = refused.into_string().await.unwrap_or_default();
+            assert_eq!(
+                refused_status,
+                Status::Forbidden,
+                "mint after owner revoke: {refused_body}"
+            );
+            assert_eq!(refused_body, "policy-owner-not-authorized");
+        }
 
         // SDK revocation writes the generic graph. Policy/v3 joins that
         // graph with its signed root status, so this one root revocation must
