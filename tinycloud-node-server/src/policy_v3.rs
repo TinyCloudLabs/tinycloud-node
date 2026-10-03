@@ -1092,28 +1092,31 @@ fn v3_envelope_delivery_projection<'a>(
         .ok_or(())?;
     let recipient = delivery_email(&request.recipient_email).ok_or(())?;
     let matcher_value = matcher.get("value").and_then(Value::as_str);
+    // `deliveryEmail` is optional. When the owner pinned one, only that
+    // address can be emailed.
+    let pinned = object.get("deliveryEmail");
     let admitted = match matcher.get("kind").and_then(Value::as_str) {
+        // Exact-email shares keep the 1.17.2 contract: the request names the
+        // matched mailbox (compared canonically) and a pinned address exactly,
+        // so a mixed-case local part still works.
         Some("exactEmail") => {
             matcher_value.and_then(delivery_email).as_deref() == Some(recipient.as_str())
+                && pinned
+                    .is_none_or(|pinned| pinned.as_str() == Some(request.recipient_email.as_str()))
         }
         // One domain share may be emailed to any number of mailboxes at
-        // exactly that domain (no subdomains). The Node names each address in
-        // its signed admission; the envelope does not pin one.
+        // exactly that domain (no subdomains). The issuer lowercases domain
+        // mailboxes, so the request must already be canonical; the Node names
+        // each address in its signed admission.
         Some("emailDomain") => matcher_value.is_some_and(|domain| {
             is_canonical_delivery_domain(domain)
+                && recipient == request.recipient_email
                 && recipient.rsplit_once('@').map(|(_, at)| at) == Some(domain)
+                && pinned.is_none_or(|pinned| pinned.as_str() == Some(recipient.as_str()))
         }),
         _ => false,
     };
-    // `deliveryEmail` is optional. When the owner pinned one, only that
-    // address can be emailed.
-    if matcher.len() != 2
-        || !admitted
-        || recipient != request.recipient_email
-        || object
-            .get("deliveryEmail")
-            .is_some_and(|pinned| pinned.as_str() != Some(recipient.as_str()))
-    {
+    if matcher.len() != 2 || !admitted {
         return Err(());
     }
     let display_name = object
@@ -7545,6 +7548,50 @@ mod tests {
             v3_envelope_delivery_projection(&exact.envelope, &registration, &delivery, &exact)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn v3_delivery_keeps_the_exact_email_case_contract() {
+        // 1.17.2 accepted a mixed-case local part for exact-email shares; the
+        // request must still name the matched mailbox, and a pinned address
+        // exactly.
+        let (owner, registration, delivery, mut request) = delivery_fixture();
+        request.envelope["recipientMatcher"] =
+            json!({"kind":"exactEmail","value":"Alice.Smith@Example.com"});
+        request.envelope["deliveryEmail"] = json!("Alice.Smith@example.com");
+        resign_delivery_envelope(&mut request.envelope, &owner);
+        let admits = |request: &DeliveryAuthorizationRequest| {
+            v3_envelope_delivery_projection(&request.envelope, &registration, &delivery, request)
+                .is_ok()
+        };
+        for (recipient, admitted) in [
+            ("Alice.Smith@example.com", true),
+            ("alice.smith@example.com", false),
+            ("Alice.Smith@Example.com", false),
+            ("bob@example.com", false),
+        ] {
+            let mut addressed = request.clone();
+            addressed.recipient_email = recipient.into();
+            assert_eq!(admits(&addressed), admitted, "pinned: {recipient}");
+        }
+        // Without a pinned address, any case of the matched mailbox is the
+        // matched mailbox.
+        let mut unpinned = request.clone();
+        unpinned
+            .envelope
+            .as_object_mut()
+            .unwrap()
+            .remove("deliveryEmail");
+        resign_delivery_envelope(&mut unpinned.envelope, &owner);
+        for (recipient, admitted) in [
+            ("Alice.Smith@Example.com", true),
+            ("alice.smith@example.com", true),
+            ("bob@example.com", false),
+        ] {
+            let mut addressed = unpinned.clone();
+            addressed.recipient_email = recipient.into();
+            assert_eq!(admits(&addressed), admitted, "unpinned: {recipient}");
+        }
     }
 
     #[test]
