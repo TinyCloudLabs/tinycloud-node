@@ -239,17 +239,51 @@ async fn validate<C: ConnectionTrait>(
     time: Option<OffsetDateTime>,
     auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
 ) -> Result<(), Error> {
+    validate_capabilities(
+        db,
+        &invocation.capabilities,
+        &invocation.invoker,
+        &invocation.parents,
+        time,
+        auth_graph,
+    )
+    .await
+}
+
+/// Whether `holder` holds every capability in `capabilities` at `now` through
+/// `parents`, by exactly the rules an invocation by `holder` citing `parents`
+/// is authorized with: root authority, cited delegatees, revocation of the
+/// whole chain, every chain window, and caveat-aware containment. No signature
+/// is involved; callers use it to check that an object `holder` signed claims
+/// no more authority than `holder` has.
+pub async fn authorize_holder<C: ConnectionTrait>(
+    db: &C,
+    holder: &str,
+    capabilities: &[util::Capability],
+    parents: &[tinycloud_auth::ipld_core::cid::Cid],
+    now: OffsetDateTime,
+) -> Result<(), Error> {
+    validate_capabilities(db, capabilities, holder, parents, Some(now), None).await
+}
+
+async fn validate_capabilities<C: ConnectionTrait>(
+    db: &C,
+    capabilities: &[util::Capability],
+    invoker: &str,
+    parents: &[tinycloud_auth::ipld_core::cid::Cid],
+    time: Option<OffsetDateTime>,
+    auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
+) -> Result<(), Error> {
     // get caps which rely on delegated caps
-    let dependant_caps: Vec<_> = invocation
-        .capabilities
+    let dependant_caps: Vec<_> = capabilities
         .iter()
         .filter(|c| {
             // remove caps for which the invoker is the root authority
-            !is_root_authority(c, &invocation.invoker)
+            !is_root_authority(c, invoker)
         })
         .collect();
 
-    match (dependant_caps.is_empty(), invocation.parents.is_empty()) {
+    match (dependant_caps.is_empty(), parents.is_empty()) {
         // no dependant caps, no parents needed, must be valid
         (true, _) => Ok(()),
         // dependant caps, no parents, invalid
@@ -261,7 +295,7 @@ async fn validate<C: ConnectionTrait>(
             // cited abilities/caveats, revocations) and run every chain
             // check against that single consistent snapshot instead of
             // re-walking the database per parent and per ancestor.
-            let root_ids: Vec<Hash> = invocation.parents.iter().map(|c| Hash::from(*c)).collect();
+            let root_ids: Vec<Hash> = parents.iter().map(|c| Hash::from(*c)).collect();
             let loaded_graph;
             let graph = match auth_graph {
                 Some(graph) => graph,
@@ -292,10 +326,8 @@ async fn validate<C: ConnectionTrait>(
 
             // check parent identifies correct invoker
             for (p, _) in &parents {
-                if !did_principal_matches(&p.delegatee, &invocation.invoker) {
-                    return Err(
-                        InvocationError::UnauthorizedInvoker(invocation.invoker.clone()).into(),
-                    );
+                if !did_principal_matches(&p.delegatee, invoker) {
+                    return Err(InvocationError::UnauthorizedInvoker(invoker.to_owned()).into());
                 }
             }
 

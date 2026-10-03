@@ -39,8 +39,9 @@ use tinycloud_core::{
     },
     relationships::parent_delegations,
     sea_orm::{
-        sea_query::Expr, ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection,
-        DatabaseTransaction, EntityTrait, QueryFilter, QuerySelect, Set, TransactionTrait,
+        sea_query::Expr, ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait,
+        DatabaseConnection, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+        Set, TransactionTrait,
     },
     types::SpaceIdWrap,
     util::{DelegationInfo, InvocationInfo},
@@ -87,6 +88,9 @@ const INVITATION_REQUEST_SCHEMA: &str = "xyz.tinycloud.credentials/invitation-re
 const DELIVERY_ADMISSION_SCHEMA: &str = "xyz.tinycloud.policy/delivery-admission/v0";
 /// OpenCredentials profile whose signed `emailDomain` claim backs domain shares.
 const EMAIL_DOMAIN_PROOF_PROFILE: &str = "tinycloud.email-domain-proof/v1";
+/// How many of the policy owner's own delegations are tried as proof of the
+/// authority its policy roots grant.
+const MAX_OWNER_AUTHORITY_CANDIDATES: u64 = 32;
 
 #[derive(Clone)]
 struct DeliveryRuntime {
@@ -724,6 +728,55 @@ impl PolicyV3Runtime {
         }
         Ok(())
     }
+}
+
+/// A policy root is parentless, so the ordinary graph admits it without
+/// checking that its signer may grant what it carries. Require that here: at
+/// `at`, the owner must hold every root capability as root authority or
+/// through one of its own delegations, by the same rules as an invocation by
+/// the owner (revocation, every chain window, caveat containment).
+async fn owner_holds_capabilities(
+    conn: &DatabaseConnection,
+    owner_did: &str,
+    capabilities: &[tinycloud_core::util::Capability],
+    at: OffsetDateTime,
+) -> Result<(), &'static str> {
+    let candidates = delegation_model::Entity::find()
+        .filter(
+            Condition::any()
+                .add(delegation_model::Column::Delegatee.eq(owner_did))
+                .add(delegation_model::Column::Delegatee.like(format!("{owner_did}#%"))),
+        )
+        .filter(
+            Condition::any()
+                .add(delegation_model::Column::Expiry.is_null())
+                .add(delegation_model::Column::Expiry.gt(at)),
+        )
+        .order_by_desc(delegation_model::Column::IssuedAt)
+        .limit(MAX_OWNER_AUTHORITY_CANDIDATES)
+        .all(conn)
+        .await
+        .map_err(|_| "policy-owner-authority-unavailable")?;
+    'capabilities: for capability in capabilities {
+        let capability = std::slice::from_ref(capability);
+        if invocation_model::authorize_holder(conn, owner_did, capability, &[], at)
+            .await
+            .is_ok()
+        {
+            continue;
+        }
+        for candidate in &candidates {
+            let proof = [candidate.id.to_cid(0x55)];
+            if invocation_model::authorize_holder(conn, owner_did, capability, &proof, at)
+                .await
+                .is_ok()
+            {
+                continue 'capabilities;
+            }
+        }
+        return Err("policy-owner-not-authorized");
+    }
+    Ok(())
 }
 
 /// Expiry of a newly minted policy session: the holder's requested expiry
@@ -1755,6 +1808,21 @@ pub async fn register_policy(
     {
         return Err((Status::Forbidden, "policy-digest-mismatch".into()));
     }
+    let owner_did = request
+        .policy
+        .get("ownerDid")
+        .and_then(Value::as_str)
+        .ok_or((Status::BadRequest, "policy-owner-missing".into()))?;
+    for root in [&policy_root, &enforcement_root] {
+        owner_holds_capabilities(
+            &runtime.conn,
+            owner_did,
+            &root.0.capabilities,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .map_err(|error| (Status::Forbidden, error.into()))?;
+    }
     if let Some(existing) = policy_v3_registration::Entity::find_by_id(request.policy_cid.clone())
         .one(&runtime.conn)
         .await
@@ -2014,6 +2082,21 @@ pub async fn mint(
         .authorize_roots(&registration, now)
         .await
         .map_err(|e| (Status::Forbidden, e.into()))?;
+    // Policies registered before owners had to hold what they grant are
+    // checked here too: the owner must have held every root capability when
+    // the policy was registered. (Owner sessions may since have expired.)
+    let registered_at = parse_time(&registration.registered_at)
+        .map_err(|_| (Status::Forbidden, "policy-registration-invalid".into()))?;
+    for root in [&policy_root, &enforcement_root] {
+        owner_holds_capabilities(
+            &runtime.conn,
+            &registration.owner_did,
+            &root.0.capabilities,
+            registered_at,
+        )
+        .await
+        .map_err(|error| (Status::Forbidden, error.into()))?;
+    }
     for (cid, expected) in [
         (&registration.policy_root_cid, &policy_root),
         (&registration.enforcement_root_cid, &enforcement_root),
@@ -7723,6 +7806,18 @@ mod tests {
 
     #[tokio::test]
     async fn policy_v2_admits_v3_account_and_v4_accountless_receivers() -> anyhow::Result<()> {
+        run_policy_v2_flow(false).await
+    }
+
+    /// The policy owner signs a valid, self-consistent policy over content in
+    /// a space it holds no authority in (the victim hosts and seeds it).
+    /// Registration must refuse it, so no session can ever read the bytes.
+    #[tokio::test]
+    async fn policy_registration_requires_the_owner_to_hold_what_it_grants() -> anyhow::Result<()> {
+        run_policy_v2_flow(true).await
+    }
+
+    async fn run_policy_v2_flow(foreign_content: bool) -> anyhow::Result<()> {
         use k256::ecdsa::SigningKey;
         use sha3::Keccak256;
         use tinycloud_auth::cacaos::siwe::encode_eip55;
@@ -7757,7 +7852,17 @@ mod tests {
         let account_owner_did = format!("did:pkh:eip155:1:0x{}", encode_eip55(&account_address));
         let credentials_space =
             SpaceId::new(account_owner_did.parse::<DIDBuf>()?, "credentials".parse()?);
-        let content_space = SpaceId::new(owner_did.parse::<DIDBuf>()?, "applications".parse()?);
+        let victim_key = tinycloud_core::libp2p::identity::ed25519::Keypair::generate();
+        let victim_did = did(&victim_key);
+        let content_owner_did = if foreign_content {
+            &victim_did
+        } else {
+            &owner_did
+        };
+        let content_space = SpaceId::new(
+            content_owner_did.parse::<DIDBuf>()?,
+            "applications".parse()?,
+        );
         let content_resource = content_space.clone().to_resource(
             "kv".parse()?,
             Some("shares/tc-470/document.txt".parse()?),
@@ -7779,7 +7884,7 @@ mod tests {
             assert!(!principals[..index].contains(principal));
         }
         assert_ne!(content_space, credentials_space);
-        assert_eq!(content_space.did().as_str(), owner_did);
+        assert_eq!(content_space.did().as_str(), content_owner_did.as_str());
         assert_eq!(credentials_space.did().as_str(), account_owner_did);
 
         let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
@@ -8200,6 +8305,22 @@ mod tests {
         // The sender independently hosts and writes the sender-owned content
         // space through the ordinary graph. The recipient account proof below
         // never carries authority for this resource.
+        // The content space's owner hosts and seeds it through the ordinary
+        // graph: the policy owner itself, or a victim when the content is foreign.
+        let content_owner_key = if foreign_content {
+            &victim_key
+        } else {
+            &owner_key
+        };
+        let content_owner_jwk = JWK::from(Params::OKP(OctetParams {
+            curve: "Ed25519".to_owned(),
+            public_key: Base64urlUInt(content_owner_key.public().to_bytes().to_vec()),
+            private_key: Some(Base64urlUInt(content_owner_key.secret().as_ref().to_vec())),
+        }));
+        let content_owner_vm = format!(
+            "{content_owner_did}#{}",
+            content_owner_did.trim_start_matches("did:key:")
+        );
         let mut sender_capabilities = Capabilities::<Value>::new();
         sender_capabilities.with_action(
             content_space
@@ -8221,7 +8342,7 @@ mod tests {
         );
         let sender_authorization = TinyCloudDelegation::Ucan(Box::new(
             Payload {
-                issuer: owner_vm.parse()?,
+                issuer: content_owner_vm.parse()?,
                 audience: holder_did.parse()?,
                 not_before: Some(NumericDate::try_from_seconds(
                     issued.unix_timestamp() as f64
@@ -8232,7 +8353,7 @@ mod tests {
                 proof: vec![],
                 attenuation: sender_capabilities,
             }
-            .sign(Algorithm::EdDSA, &owner_jwk)?,
+            .sign(Algorithm::EdDSA, &content_owner_jwk)?,
         ))
         .encode()?;
         let sender_response = client
@@ -8395,6 +8516,23 @@ mod tests {
             .await;
         let register_status = register_response.status();
         let register_body = register_response.into_string().await.unwrap_or_default();
+        if foreign_content {
+            assert_eq!(
+                register_status,
+                Status::Forbidden,
+                "register: {register_body}"
+            );
+            assert_eq!(register_body, "policy-owner-not-authorized");
+            let conn = &client.rocket().state::<PolicyV3Runtime>().unwrap().conn;
+            assert!(
+                policy_v3_registration::Entity::find_by_id(policy_cid.clone())
+                    .one(conn)
+                    .await?
+                    .is_none()
+            );
+            assert!(policy_v3_root::Entity::find().one(conn).await?.is_none());
+            return Ok(());
+        }
         assert_eq!(register_status, Status::Ok, "register: {register_body}");
         let registered: Value = serde_json::from_str(&register_body)?;
 
