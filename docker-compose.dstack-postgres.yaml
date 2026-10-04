@@ -79,7 +79,13 @@ services:
       - DOMAIN=tee.node.tinycloud.xyz
       - TARGET_ENDPOINT=http://tinycloud:8000
       - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
-      - GATEWAY_DOMAIN=_.${DSTACK_GATEWAY_DOMAIN}
+      # CNAME target the ingress publishes for DOMAIN. Must not start with `_`:
+      # Android's resolver (bionic res_hnok) rejects a CNAME target whose first
+      # label is `_`, so `_.<gateway>` is unresolvable on Android (TC-513).
+      # `gateway.<gateway>` is the target Phala Cloud advertises (gateway.cname)
+      # and upstream dstack-ingress documents; routing still uses SNI + the
+      # _dstack-app-address TXT record, so TLS stays end-to-end into the CVM.
+      - GATEWAY_DOMAIN=gateway.${DSTACK_GATEWAY_DOMAIN}
       - CERTBOT_EMAIL=${CERTBOT_EMAIL}
       - SET_CAA=true
       - DNS_PROVIDER=cloudflare
