@@ -497,10 +497,13 @@ pub async fn app_with_control(
         database_artifact_repository,
     );
 
+    // Billing shares TINYCLOUD_ADMIN_SECRET with the node (it calls the
+    // node's admin API with it) and accepts it on quota fetches (TC-627).
     let quota_cache = QuotaCache::new(
         tinycloud_config.storage.limit,
         std::env::var("TINYCLOUD_QUOTA_URL").ok(),
-    );
+    )
+    .with_service_secret(std::env::var("TINYCLOUD_ADMIN_SECRET").ok());
     let invocation_replay_cache = node_replay_cache(&tinycloud);
     let replay_cleanup = invocation_replay_cache.clone();
     // TC-341: the periodic sweep also reclaims rows beyond the lifetime cap.

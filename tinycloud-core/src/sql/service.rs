@@ -16,7 +16,7 @@ use crate::database_artifacts::{
 
 use super::{
     caveats::SqlCaveats,
-    database::{spawn_actor, DatabaseHandle},
+    database::{spawn_actor, DatabaseHandle, GrowthPolicy},
     types::*,
 };
 
@@ -37,7 +37,9 @@ type HydrationLockRegistry =
 pub struct SqlService {
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
     hydration_locks: HydrationLockRegistry,
-    publication_locks: HydrationLockRegistry,
+    /// Serialize execution through durable persistence, including checkpoint
+    /// replacement, so another request cannot change the snapshot being saved.
+    operation_locks: HydrationLockRegistry,
     /// What each live actor's local database derives from, carried into every
     /// durable save so a stale actor is rejected instead of clobbering. Written
     /// on hydration (the only path that creates an actor) and after each
@@ -57,7 +59,7 @@ impl SqlService {
         Self {
             databases: Arc::new(DashMap::new()),
             hydration_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            publication_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            operation_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             lineage: Arc::new(DashMap::new()),
             base_path,
             memory_threshold,
@@ -73,16 +75,55 @@ impl SqlService {
         caveats: Option<SqlCaveats>,
         ability: String,
     ) -> Result<SqlExecutionResult, SqlError> {
-        let _publication_guard = if db_name == super::publication::DATABASE {
-            Some(self.publication_lock(space).await.lock_owned().await)
-        } else {
-            None
-        };
+        self.execute_with_growth(
+            space,
+            db_name,
+            request,
+            caveats,
+            ability,
+            GrowthPolicy::Allow,
+        )
+        .await
+    }
+
+    /// Execute on a full space: the request runs, but is undone and fails
+    /// with [`SqlError::StorageWouldGrow`] if it grew the database. Deletes,
+    /// drops and DDL whose object already exists go through. Successful writes
+    /// replace the durable checkpoint instead of accumulating charged WAL bytes.
+    pub async fn execute_without_growth(
+        &self,
+        space: &SpaceId,
+        db_name: &str,
+        request: SqlRequest,
+        caveats: Option<SqlCaveats>,
+        ability: String,
+    ) -> Result<SqlExecutionResult, SqlError> {
+        self.execute_with_growth(
+            space,
+            db_name,
+            request,
+            caveats,
+            ability,
+            GrowthPolicy::Forbid,
+        )
+        .await
+    }
+
+    async fn execute_with_growth(
+        &self,
+        space: &SpaceId,
+        db_name: &str,
+        request: SqlRequest,
+        caveats: Option<SqlCaveats>,
+        ability: String,
+        growth: GrowthPolicy,
+    ) -> Result<SqlExecutionResult, SqlError> {
+        let _operation_guard = self.operation_lock(space, db_name).await.lock_owned().await;
         let key = (space.to_string(), db_name.to_string());
         let mut handle = self.handle(space, db_name).await?;
 
         let result = match handle
-            .execute(request.clone(), caveats.clone(), ability.clone())
+            .execute(request.clone(), caveats.clone(), ability.clone(), growth)
             .await
         {
             Err(SqlError::Internal(ref msg)) if msg.contains("Database actor not available") => {
@@ -90,13 +131,13 @@ impl SqlService {
                 tracing::warn!(space=%space, db=%db_name, "Dead SQL actor detected, respawning");
                 self.databases.remove(&key);
                 handle = self.handle(space, db_name).await?;
-                handle.execute(request, caveats, ability).await
+                handle.execute(request, caveats, ability, growth).await
             }
             other => other,
         }?;
 
         if !result.write_targets.is_empty() {
-            if let Err(e) = self.persist_write(space, db_name, &handle).await {
+            if let Err(e) = self.persist_write(space, db_name, &handle, growth).await {
                 let _ = self.discard_local_state(&key).await;
                 return Err(e);
             }
@@ -105,9 +146,9 @@ impl SqlService {
         Ok(result)
     }
 
-    async fn publication_lock(&self, space: &SpaceId) -> Arc<HydrationLock> {
-        let key = (space.to_string(), super::publication::DATABASE.into());
-        let mut registry = self.publication_locks.lock().await;
+    async fn operation_lock(&self, space: &SpaceId, db_name: &str) -> Arc<HydrationLock> {
+        let key = (space.to_string(), db_name.to_string());
+        let mut registry = self.operation_locks.lock().await;
         registry.retain(|_, lock| lock.strong_count() > 0);
         if let Some(lock) = registry.get(&key).and_then(Weak::upgrade) {
             return lock;
@@ -122,13 +163,16 @@ impl SqlService {
         space: &SpaceId,
         command: serde_json::Value,
     ) -> Result<SqlExecutionResult, SqlError> {
-        let _guard = self.publication_lock(space).await.lock_owned().await;
         let db_name = super::publication::DATABASE;
+        let _guard = self.operation_lock(space, db_name).await.lock_owned().await;
         let key = (space.to_string(), db_name.to_string());
         let handle = self.handle(space, db_name).await?;
         let result = handle.publication(command).await?;
         if !result.write_targets.is_empty() {
-            if let Err(error) = self.persist_write(space, db_name, &handle).await {
+            if let Err(error) = self
+                .persist_write(space, db_name, &handle, GrowthPolicy::Allow)
+                .await
+            {
                 let _ = self.discard_local_state(&key).await;
                 return Err(error);
             }
@@ -137,6 +181,7 @@ impl SqlService {
     }
 
     pub async fn export(&self, space: &SpaceId, db_name: &str) -> Result<Vec<u8>, SqlError> {
+        let _operation_guard = self.operation_lock(space, db_name).await.lock_owned().await;
         let key = (space.to_string(), db_name.to_string());
 
         // If there's a live actor, route through it (handles both in-memory and file-backed)
@@ -334,15 +379,20 @@ impl SqlService {
         space: &SpaceId,
         db_name: &str,
         handle: &DatabaseHandle,
+        growth: GrowthPolicy,
     ) -> Result<(), SqlError> {
         let key = (space.to_string(), db_name.to_string());
         let expected = self.expectation(&key);
 
-        if let Some(wal) = handle
-            .wal()
-            .await?
-            .filter(|wal| wal.len() < MAX_WAL_DELTA_BYTES)
-        {
+        // Repeated DELETE/UPDATE/DROP operations can append WAL frames without
+        // adding a database page. Full spaces must replace checkpoint + WAL
+        // with one complete image whose size the actor's page guard bounded.
+        let wal = if growth == GrowthPolicy::Allow {
+            handle.wal().await?
+        } else {
+            None
+        };
+        if let Some(wal) = wal.filter(|wal| wal.len() < MAX_WAL_DELTA_BYTES) {
             match self
                 .artifact_repository
                 .save_delta("sql", &space.to_string(), db_name, wal, expected.clone())
@@ -551,6 +601,301 @@ mod tests {
             )
             .await
             .expect("schema ability should create tables");
+    }
+
+    /// TC-626: on a full space, writes that cannot grow the database run and
+    /// a growing write is undone. Covers both an in-memory database and one
+    /// promoted to a WAL-backed file (threshold 0), which is what large
+    /// production databases use.
+    #[tokio::test]
+    async fn execute_without_growth_keeps_non_growing_writes_and_undoes_growth() {
+        for (name, memory_threshold) in [("sql-growth-mem", u64::MAX), ("sql-growth-file", 0)] {
+            let repo = artifact_repository().await;
+            let cache = TempDir::new().unwrap();
+            let space = test_space_id(name);
+            let service = SqlService::new(
+                cache.path().to_string_lossy().to_string(),
+                memory_threshold,
+                repo.clone(),
+            );
+            let write = |sql: &str, params: Vec<SqlValue>| SqlRequest::Execute {
+                schema: None,
+                sql: sql.to_string(),
+                params,
+            };
+            let ability = || "tinycloud.sql/write".to_string();
+            for row in ["a", "b", "c"] {
+                service
+                    .execute(
+                        &space,
+                        "main",
+                        SqlRequest::Execute {
+                            schema: Some(vec![
+                                "CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY, body TEXT)"
+                                    .to_string(),
+                            ]),
+                            sql: "INSERT INTO notes (id, body) VALUES (?, ?)".to_string(),
+                            params: vec![
+                                SqlValue::Text(row.into()),
+                                SqlValue::Text("x".repeat(64)),
+                            ],
+                        },
+                        None,
+                        ability(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let mut charged_bytes = repo
+                .load("sql", &space.to_string(), "main")
+                .await
+                .unwrap()
+                .unwrap()
+                .size_bytes;
+
+            for sql in [
+                "CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY, body TEXT)",
+                "DELETE FROM notes WHERE id = 'a'",
+                "UPDATE notes SET body = 'shorter' WHERE id = 'b'",
+            ] {
+                service
+                    .execute_without_growth(&space, "main", write(sql, vec![]), None, ability())
+                    .await
+                    .unwrap_or_else(|e| panic!("{name}: non-growing write must pass: {e}"));
+                let artifact = repo
+                    .load("sql", &space.to_string(), "main")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    artifact.size_bytes <= charged_bytes,
+                    "{name}: {sql} increased charged checkpoint + WAL bytes"
+                );
+                charged_bytes = artifact.size_bytes;
+            }
+
+            let grown = service
+                .execute_without_growth(
+                    &space,
+                    "main",
+                    write(
+                        "INSERT INTO notes (id, body) VALUES ('big', ?)",
+                        vec![SqlValue::Text("y".repeat(256 * 1024))],
+                    ),
+                    None,
+                    ability(),
+                )
+                .await;
+            assert!(
+                matches!(grown, Err(SqlError::StorageWouldGrow)),
+                "{name}: a growing write must be refused, got {grown:?}"
+            );
+
+            // A later successful persistence must not pick up the refused write.
+            service
+                .execute_without_growth(
+                    &space,
+                    "main",
+                    write("UPDATE notes SET body = body", vec![]),
+                    None,
+                    ability(),
+                )
+                .await
+                .unwrap();
+            let cold_cache = TempDir::new().unwrap();
+            let recreated = SqlService::new(
+                cold_cache.path().to_string_lossy().into_owned(),
+                memory_threshold,
+                repo.clone(),
+            );
+            for reader in [&service, &recreated] {
+                let rows = reader
+                    .execute(
+                        &space,
+                        "main",
+                        SqlRequest::Query {
+                            sql: "SELECT id, body FROM notes ORDER BY id".to_string(),
+                            params: vec![],
+                            max_rows: None,
+                            max_bytes: None,
+                        },
+                        None,
+                        "tinycloud.sql/read".to_string(),
+                    )
+                    .await
+                    .unwrap();
+                match rows.response {
+                    SqlResponse::Query(query) => assert_eq!(
+                        query.rows,
+                        vec![
+                            vec![SqlValue::Text("b".into()), SqlValue::Text("shorter".into())],
+                            vec![SqlValue::Text("c".into()), SqlValue::Text("x".repeat(64))]
+                        ],
+                        "{name}: live and rehydrated state must retain the delete, not the refused insert"
+                    ),
+                    other => panic!("{name}: expected query rows, got {other:?}"),
+                }
+            }
+
+            service
+                .execute_without_growth(
+                    &space,
+                    "main",
+                    write("DROP TABLE notes", vec![]),
+                    None,
+                    ability(),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{name}: DROP must pass: {e}"));
+            let artifact = repo
+                .load("sql", &space.to_string(), "main")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                artifact.size_bytes <= charged_bytes,
+                "{name}: DROP increased charged checkpoint + WAL bytes"
+            );
+            let dropped_cache = TempDir::new().unwrap();
+            let recreated = SqlService::new(
+                dropped_cache.path().to_string_lossy().into_owned(),
+                memory_threshold,
+                repo,
+            );
+            let dropped = recreated
+                .execute(
+                    &space,
+                    "main",
+                    SqlRequest::Query {
+                        sql: "SELECT id FROM notes".into(),
+                        params: vec![],
+                        max_rows: None,
+                        max_bytes: None,
+                    },
+                    None,
+                    "tinycloud.sql/read".into(),
+                )
+                .await;
+            assert!(
+                matches!(dropped, Err(SqlError::Sqlite(_))),
+                "{name}: the dropped table must remain absent after rehydration"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_without_growth_rolls_back_growing_batch_before_rehydration() {
+        for memory_threshold in [u64::MAX, 0] {
+            let repo = artifact_repository().await;
+            let cache = TempDir::new().unwrap();
+            let cold_cache = TempDir::new().unwrap();
+            let space = test_space_id("sql-growth-batch");
+            let service = SqlService::new(
+                cache.path().to_string_lossy().into_owned(),
+                memory_threshold,
+                repo.clone(),
+            );
+            service
+                .execute(
+                    &space,
+                    "main",
+                    SqlRequest::Execute {
+                        schema: Some(vec![
+                            "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)".into(),
+                        ]),
+                        sql: "INSERT INTO notes VALUES (1, 'kept')".into(),
+                        params: vec![],
+                    },
+                    None,
+                    "tinycloud.sql/write".into(),
+                )
+                .await
+                .unwrap();
+            let charged_bytes = repo
+                .load("sql", &space.to_string(), "main")
+                .await
+                .unwrap()
+                .unwrap()
+                .size_bytes;
+            for fail_after_growth in [false, true] {
+                let mut statements = vec![
+                    SqlStatement {
+                        sql: "DELETE FROM notes".into(),
+                        params: vec![],
+                    },
+                    SqlStatement {
+                        sql: "INSERT INTO notes VALUES (2, ?)".into(),
+                        params: vec![SqlValue::Text("x".repeat(256 * 1024))],
+                    },
+                ];
+                if fail_after_growth {
+                    statements.push(SqlStatement {
+                        sql: "INSERT INTO notes VALUES (2, 'duplicate')".into(),
+                        params: vec![],
+                    });
+                }
+                let rejected = service
+                    .execute_without_growth(
+                        &space,
+                        "main",
+                        SqlRequest::Batch { statements },
+                        None,
+                        "tinycloud.sql/write".into(),
+                    )
+                    .await;
+                assert!(matches!(rejected, Err(SqlError::StorageWouldGrow)));
+            }
+
+            // Persist again so an escaped prefix or insertion cannot hide only
+            // in the old actor's cache and disappear on cold hydration.
+            service
+                .execute_without_growth(
+                    &space,
+                    "main",
+                    SqlRequest::Execute {
+                        schema: None,
+                        sql: "UPDATE notes SET body = body".into(),
+                        params: vec![],
+                    },
+                    None,
+                    "tinycloud.sql/write".into(),
+                )
+                .await
+                .unwrap();
+            let artifact = repo
+                .load("sql", &space.to_string(), "main")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(artifact.size_bytes <= charged_bytes);
+            let recreated = SqlService::new(
+                cold_cache.path().to_string_lossy().into_owned(),
+                memory_threshold,
+                repo,
+            );
+            let result = recreated
+                .execute(
+                    &space,
+                    "main",
+                    SqlRequest::Query {
+                        sql: "SELECT id, body FROM notes".into(),
+                        params: vec![],
+                        max_rows: None,
+                        max_bytes: None,
+                    },
+                    None,
+                    "tinycloud.sql/read".into(),
+                )
+                .await
+                .unwrap();
+            let SqlResponse::Query(query) = result.response else {
+                panic!("expected query response");
+            };
+            assert_eq!(
+                query.rows,
+                vec![vec![SqlValue::Integer(1), SqlValue::Text("kept".into())]]
+            );
+        }
     }
 
     #[tokio::test]

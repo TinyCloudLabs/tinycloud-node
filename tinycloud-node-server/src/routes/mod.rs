@@ -25,7 +25,10 @@ use crate::{
     config::Config,
     hooks::{HookRuntime, WriteEvent},
     invocation_replay::InvocationReplayCache,
-    quota::QuotaCache,
+    quota::{
+        QuotaCache, SpaceStorage, StorageRejection, StorageRejectionKind, StorageUsage,
+        MANAGE_STORAGE_URL,
+    },
     routes::public::is_public_space,
     signed_urls::{
         if_range_allows_range, load_signed_kv_ticket, mint_signed_kv_url,
@@ -110,6 +113,41 @@ fn database_error_status(error: &DbErr) -> Status {
         Status::ServiceUnavailable
     } else {
         Status::InternalServerError
+    }
+}
+
+/// `/invoke` failure: plain text for everything except storage rejections,
+/// which carry the structured TC-619 JSON body.
+#[derive(Debug)]
+pub enum InvokeError {
+    Text(Status, String),
+    Storage(StorageRejection),
+}
+
+impl From<(Status, String)> for InvokeError {
+    fn from((status, message): (Status, String)) -> Self {
+        Self::Text(status, message)
+    }
+}
+
+impl From<StorageRejection> for InvokeError {
+    fn from(rejection: StorageRejection) -> Self {
+        Self::Storage(rejection)
+    }
+}
+
+impl From<crate::invocation_replay::InvocationReplayError> for InvokeError {
+    fn from(error: crate::invocation_replay::InvocationReplayError) -> Self {
+        <(Status, String)>::from(error).into()
+    }
+}
+
+impl<'r> rocket::response::Responder<'r, 'static> for InvokeError {
+    fn respond_to(self, request: &'r rocket::Request<'_>) -> rocket::response::Result<'static> {
+        match self {
+            Self::Text(status, message) => (status, message).respond_to(request),
+            Self::Storage(rejection) => rejection.respond_to(request),
+        }
     }
 }
 
@@ -586,7 +624,7 @@ pub async fn invoke(
     sql_service: &State<SqlService>,
     duckdb_service: &State<DuckDbService>,
     hook_runtime: &State<HookRuntime>,
-) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
+) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, InvokeError> {
     invoke_impl(
         i,
         req_span,
@@ -623,7 +661,7 @@ pub async fn invoke(
     encryption: &State<EncryptionService>,
     sql_service: &State<SqlService>,
     hook_runtime: &State<HookRuntime>,
-) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
+) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, InvokeError> {
     invoke_impl(
         i,
         req_span,
@@ -1109,65 +1147,137 @@ fn field_metadata(field: &multer::Field<'_>) -> Metadata {
     Metadata(metadata)
 }
 
+/// A space's metered usage against its effective storage limit.
+#[derive(Debug, Clone, Copy)]
+struct StorageCheck {
+    used: u64,
+    limit: u64,
+}
+
+impl StorageCheck {
+    /// Bytes still writable, or `None` when the space is full.
+    fn remaining(self) -> Option<u64> {
+        self.limit.checked_sub(self.used).filter(|left| *left > 0)
+    }
+
+    fn reject(self, kind: StorageRejectionKind, space: &SpaceId) -> StorageRejection {
+        StorageRejection::new(kind, space, self.used, self.limit)
+    }
+}
+
+/// The space's limit: the public-space cap, or the per-space quota.
+async fn effective_storage_limit(
+    space: &SpaceId,
+    config: &State<Config>,
+    quota_cache: &State<QuotaCache>,
+) -> Option<u64> {
+    if is_public_space(space) {
+        Some(config.public_spaces.storage_limit.as_u64())
+    } else {
+        quota_cache
+            .get_limit(space)
+            .await
+            .map(|limit| limit.as_u64())
+    }
+}
+
+/// Usage against limit, or `None` when the space has no limit.
+async fn storage_check(
+    space: &SpaceId,
+    tinycloud: &State<TinyCloud>,
+    config: &State<Config>,
+    quota_cache: &State<QuotaCache>,
+) -> Result<Option<StorageCheck>, (Status, String)> {
+    let Some(limit) = effective_storage_limit(space, config, quota_cache).await else {
+        return Ok(None);
+    };
+    let used = tinycloud
+        .store_size(space)
+        .await
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?
+        .ok_or_else(|| (Status::NotFound, "space not found".to_string()))?;
+    Ok(Some(StorageCheck { used, limit }))
+}
+
+/// The owner usage read for `space`. A space that has stored nothing yet
+/// reports zero bytes used.
+async fn storage_usage(
+    space: &SpaceId,
+    tinycloud: &State<TinyCloud>,
+    config: &State<Config>,
+    quota_cache: &State<QuotaCache>,
+) -> Result<StorageUsage, (Status, String)> {
+    let limit_bytes = effective_storage_limit(space, config, quota_cache).await;
+    let used_bytes = tinycloud
+        .store_size(space)
+        .await
+        .map_err(|e| (Status::InternalServerError, e.to_string()))?
+        .unwrap_or(0);
+    Ok(StorageUsage {
+        space: SpaceStorage {
+            used_bytes,
+            limit_bytes,
+        },
+        account: quota_cache.account_usage(space).await,
+        manage_url: MANAGE_STORAGE_URL,
+    })
+}
+
+/// The space a usage read targets: every capability is
+/// `tinycloud.space/info` on the `space` service of that one space. Mixed
+/// invocations keep their previous handling.
+fn space_info_target(invocation: &InvocationInfo) -> Option<SpaceId> {
+    let mut target: Option<&SpaceId> = None;
+    for capability in &invocation.capabilities {
+        let resource = capability.resource.tinycloud_resource()?;
+        if capability.ability.as_ref().as_ref() != "tinycloud.space/info"
+            || resource.service().as_str() != "space"
+            || target.is_some_and(|space| space != resource.space())
+        {
+            return None;
+        }
+        target = Some(resource.space());
+    }
+    target.cloned()
+}
+
+/// Refuse with 402 when the space is already full; otherwise return the
+/// bytes left together with the usage they were derived from.
 async fn staged_batch_remaining(
     space: &SpaceId,
     tinycloud: &State<TinyCloud>,
     config: &State<Config>,
     quota_cache: &State<QuotaCache>,
-) -> Result<Option<(u64, u64, u64)>, (Status, String)> {
-    let effective_limit = if is_public_space(space) {
-        Some(config.public_spaces.storage_limit)
-    } else {
-        quota_cache.get_limit(space).await
-    };
-
-    let Some(limit) = effective_limit else {
+) -> Result<Option<(u64, StorageCheck)>, InvokeError> {
+    let Some(check) = storage_check(space, tinycloud, config, quota_cache).await? else {
         return Ok(None);
     };
-
-    let limit_bytes = limit.as_u64();
-    let current_size = tinycloud
-        .store_size(space)
-        .await
-        .map_err(|e| (Status::InternalServerError, e.to_string()))?
-        .ok_or_else(|| (Status::NotFound, "space not found".to_string()))?;
-    let remaining = match limit_bytes.checked_sub(current_size) {
-        None | Some(0) => {
-            return Err((
-                Status::new(402),
-                format!(
-                    "Storage quota exceeded. Used: {} bytes, Limit: {} bytes",
-                    current_size, limit_bytes
-                ),
-            ))
-        }
-        Some(remaining) => remaining,
-    };
-
-    Ok(Some((remaining, current_size, limit_bytes)))
+    match check.remaining() {
+        Some(remaining) => Ok(Some((remaining, check))),
+        None => Err(check
+            .reject(StorageRejectionKind::QuotaExceeded, space)
+            .into()),
+    }
 }
 
 async fn copy_multipart_field_to_stage(
     mut field: multer::Field<'_>,
     stage: &mut HashBuffer<<BlockStage as ImmutableStaging>::Writable>,
-    remaining: &mut Option<(u64, u64, u64)>,
-) -> Result<(), (Status, String)> {
+    space: &SpaceId,
+    remaining: &mut Option<(u64, StorageCheck)>,
+) -> Result<(), InvokeError> {
     while let Some(chunk) = field
         .chunk()
         .await
         .map_err(|e| (Status::BadRequest, e.to_string()))?
     {
-        if let Some((remaining_bytes, current_size, limit_bytes)) = remaining.as_mut() {
+        if let Some((remaining_bytes, check)) = remaining.as_mut() {
             let chunk_len = u64::try_from(chunk.len())
                 .map_err(|e| (Status::InternalServerError, e.to_string()))?;
             if chunk_len > *remaining_bytes {
-                return Err((
-                    Status::PayloadTooLarge,
-                    format!(
-                        "Write exceeds remaining storage. Used: {} bytes, Limit: {} bytes",
-                        current_size, limit_bytes
-                    ),
-                ));
+                return Err(check
+                    .reject(StorageRejectionKind::LimitReached, space)
+                    .into());
             }
             *remaining_bytes -= chunk_len;
         }
@@ -1189,7 +1299,7 @@ async fn build_batch_kv_inputs(
     tinycloud: &State<TinyCloud>,
     config: &State<Config>,
     quota_cache: &State<QuotaCache>,
-) -> Result<KvInputMap, (Status, String)> {
+) -> Result<KvInputMap, InvokeError> {
     if expected.is_empty() {
         return Ok(HashMap::new());
     }
@@ -1210,7 +1320,7 @@ async fn build_batch_kv_inputs(
         .expect("non-empty KV batch inputs have a target space");
     let mut remaining = staged_batch_remaining(space, tinycloud, config, quota_cache).await?;
     let decode_start = Instant::now();
-    let result = async {
+    let result: Result<KvInputMap, InvokeError> = async {
         while let Some(field) = multipart
             .next_field()
             .await
@@ -1230,13 +1340,15 @@ async fn build_batch_kv_inputs(
                 return Err((
                     Status::BadRequest,
                     format!("Multipart KV part {path} is not authorized by the invocation"),
-                ));
+                )
+                    .into());
             };
             if inputs.contains_key(&(space.clone(), typed_path.clone())) {
                 return Err((
                     Status::BadRequest,
                     format!("Duplicate multipart KV part for path {path}"),
-                ));
+                )
+                    .into());
             }
 
             let metadata = field_metadata(&field);
@@ -1244,7 +1356,7 @@ async fn build_batch_kv_inputs(
                 .stage(space)
                 .await
                 .map_err(|e| (Status::InternalServerError, e.to_string()))?;
-            copy_multipart_field_to_stage(field, &mut stage, &mut remaining).await?;
+            copy_multipart_field_to_stage(field, &mut stage, space, &mut remaining).await?;
             inputs.insert((space.clone(), typed_path.clone()), (metadata, stage));
         }
 
@@ -1262,7 +1374,8 @@ async fn build_batch_kv_inputs(
             return Err((
                 Status::BadRequest,
                 format!("Missing multipart KV parts for signed paths: {missing}"),
-            ));
+            )
+                .into());
         }
 
         Ok(inputs)
@@ -1315,11 +1428,11 @@ async fn invoke_impl(
         '_,
     >,
     hook_runtime: &State<HookRuntime>,
-) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
+) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, InvokeError> {
     let action_label = "invocation";
     let span = info_span!(parent: &req_span.0, "invoke", action = %action_label);
     // Instrumenting async block to handle yielding properly
-    async move {
+    let result = async move {
         let timer = crate::prometheus::enabled().then(|| {
             crate::prometheus::AUTHORIZED_INVOKE_HISTOGRAM
                 .with_label_values(&["invoke"])
@@ -1346,7 +1459,7 @@ async fn invoke_impl(
             return Err((
                 Status::Unauthorized,
                 invocation_model::InvocationError::InvalidTime.to_string(),
-            ));
+            ).into());
         }
 
         // (b) Admission: full signature verification plus the lifetime cap,
@@ -1389,7 +1502,7 @@ async fn invoke_impl(
                 return Err((
                     Status::Forbidden,
                     "decrypt invocation contains multiple networks".to_string(),
-                ));
+                ).into());
             }
             let network = network.parse().map_err(
                 |error: tinycloud_core::encryption_network::NetworkIdError| {
@@ -1426,6 +1539,29 @@ async fn invoke_impl(
             return Ok(DataOut::One(InvOut(InvocationOutcome::EncryptionDecrypt(
                 verified.response,
             ))));
+        }
+
+        // Owner usage read (TC-626): an invocation made only of
+        // `tinycloud.space/info` returns the space's storage usage, the
+        // account totals billing supplied, and the manage-storage URL.
+        if let Some(space) = space_info_target(&admitted.invocation().0) {
+            if policy_session_invocation {
+                invocation_replay_cache
+                    .check_and_insert_invoker_nonce(admitted.invocation(), 60)
+                    .await?;
+            } else {
+                invocation_replay_cache
+                    .check_and_insert(&admitted, config.invocation.max_lifetime_secs)
+                    .await?;
+            }
+            verify_auth_admitted("server.space.info", admitted, tinycloud).await?;
+            let usage = storage_usage(&space, tinycloud, config, quota_cache).await?;
+            let json = serde_json::to_value(usage)
+                .map_err(|e| (Status::InternalServerError, e.to_string()))?;
+            if let Some(timer) = timer {
+                timer.observe_duration();
+            }
+            return Ok(DataOut::One(InvOut(InvocationOutcome::SpaceInfo(json))));
         }
 
         // Check for SQL capabilities
@@ -1547,7 +1683,7 @@ async fn invoke_impl(
             return Err((
                 Status::NotImplemented,
                 "DuckDB support is not enabled on this node".to_string(),
-            ));
+            ).into());
         }
 
         let put_caps = kv_put_capabilities(&admitted.invocation().0);
@@ -1566,7 +1702,7 @@ async fn invoke_impl(
         });
 
         let stage_inputs_start = Instant::now();
-        let inputs_result: Result<KvInputMap, (Status, String)> =
+        let inputs_result: Result<KvInputMap, InvokeError> = async {
             match (data, put_caps.as_slice(), is_multipart_request) {
                 (DataIn::None | DataIn::One(_), [], _) => Ok(HashMap::new()),
                 (DataIn::One(d), [(space, path)], false) => {
@@ -1576,68 +1712,31 @@ async fn invoke_impl(
                         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
                     let open_data = d.open(1u8.gigabytes()).compat();
 
-                    // Use public space storage limit if applicable, otherwise per-space quota
-                    let effective_limit = if is_public_space(space) {
-                        Some(config.public_spaces.storage_limit)
-                    } else {
-                        quota_cache.get_limit(space).await
-                    };
-
-                    let copy_result = if let Some(limit) = effective_limit {
-                        let current_size = tinycloud
-                            .store_size(space)
+                    // Public spaces use their storage cap, others the per-space quota.
+                    let budget = staged_batch_remaining(space, tinycloud, config, quota_cache).await?;
+                    let copy_result = if let Some((remaining, check)) = budget {
+                        let decode_start = Instant::now();
+                        let result = copy_upload(LimitedReader::new(open_data, remaining), &mut stage)
                             .await
-                            .map_err(|e| (Status::InternalServerError, e.to_string()))?
-                            .ok_or_else(|| (Status::NotFound, "space not found".to_string()))?;
-                        // get the remaining allocated space for the given space storage
-                        match limit.as_u64().checked_sub(current_size) {
-                            // the current size is already equal or greater than the limit
-                            None | Some(0) => {
-                                return Err((
-                                    Status::new(402),
-                                    format!(
-                                        "Storage quota exceeded. Used: {} bytes, Limit: {} bytes",
-                                        current_size,
-                                        limit.as_u64()
-                                    ),
-                                ))
-                            }
-                            Some(remaining) => {
-                                let decode_start = Instant::now();
-                                let result = copy_upload(
-                                    LimitedReader::new(open_data, remaining),
-                                    &mut stage,
-                                )
-                                    .await
-                                    .map_err(|e| {
-                                        if e.to_string().contains("storage limit") {
-                                            (
-                                                Status::PayloadTooLarge,
-                                                format!(
-                                                    "Write exceeds remaining storage. Used: {} bytes, Limit: {} bytes",
-                                                    current_size,
-                                                    limit.as_u64()
-                                                ),
-                                            )
-                                        } else {
-                                            (Status::InternalServerError, e.to_string())
-                                        }
-                                    })
-                                ;
-                                crate::prometheus::observe_stage(
-                                    crate::prometheus::InvocationStage::RequestDecode,
-                                    crate::prometheus::StageOutcome::from(result.is_ok()),
-                                    decode_start.elapsed(),
-                                );
-                                result
-                            }
-                        }
+                            .map_err(|e| -> InvokeError {
+                                if e.to_string().contains("storage limit") {
+                                    check.reject(StorageRejectionKind::LimitReached, space).into()
+                                } else {
+                                    (Status::InternalServerError, e.to_string()).into()
+                                }
+                            });
+                        crate::prometheus::observe_stage(
+                            crate::prometheus::InvocationStage::RequestDecode,
+                            crate::prometheus::StageOutcome::from(result.is_ok()),
+                            decode_start.elapsed(),
+                        );
+                        result
                     } else {
                         // no limit on storage, just use the data as is
                         let decode_start = Instant::now();
                         let result = copy_upload(open_data, &mut stage)
                             .await
-                            .map_err(|e| (Status::InternalServerError, e.to_string()));
+                            .map_err(|e| InvokeError::from((Status::InternalServerError, e.to_string())));
                         crate::prometheus::observe_stage(
                             crate::prometheus::InvocationStage::RequestDecode,
                             crate::prometheus::StageOutcome::from(result.is_ok()),
@@ -1669,14 +1768,23 @@ async fn invoke_impl(
                 (DataIn::One(_), [_, _, ..], false) => Err((
                     Status::BadRequest,
                     "KV batch put requires multipart/form-data".to_string(),
-                )),
-                _ => Err((Status::BadRequest, "Invalid inputs".to_string())),
-        };
+                ).into()),
+                _ => Err((Status::BadRequest, "Invalid inputs".to_string()).into()),
+            }
+        }.await;
         crate::prometheus::observe_span(
             "server.kv.stage_inputs",
             if inputs_result.is_ok() { "ok" } else { "error" },
             stage_inputs_start.elapsed(),
         );
+        if matches!(&inputs_result, Err(InvokeError::Storage(_))) {
+            // Admission proves the signature, not delegated authority. Do not
+            // disclose storage/account totals for an unauthorized write.
+            tinycloud
+                .authorize_admitted(&admitted, now)
+                .await
+                .map_err(|error| (Status::Forbidden, error.to_string()))?;
+        }
         let inputs = inputs_result?;
         if policy_session_invocation {
             invocation_replay_cache
@@ -1733,7 +1841,7 @@ async fn invoke_impl(
                         Err((
                             Status::InternalServerError,
                             "KV batch put committed unexpected invocation outcomes".to_string(),
-                        ))
+                        ).into())
                     } else {
                         Ok(DataOut::One(InvOut(InvocationOutcome::KvBatchWrite(
                             written_paths,
@@ -1746,7 +1854,7 @@ async fn invoke_impl(
                             format!(
                                 "KV batch reads accept at most {MAX_KV_BATCH_READ_ITEMS} keys"
                             ),
-                        ));
+                        ).into());
                     }
                     let batch_specs = invocation_info
                         .capabilities
@@ -1773,7 +1881,7 @@ async fn invoke_impl(
                             Status::NotImplemented,
                             "Multiple invocation outcomes require a homogeneous KV get or metadata batch"
                                 .to_string(),
-                        ))
+                        ).into())
                     } else {
                         let mut results = Vec::with_capacity(outcomes.len());
                         for ((path, is_read), outcome) in
@@ -1807,7 +1915,7 @@ async fn invoke_impl(
                                     return Err((
                                         Status::InternalServerError,
                                         "KV batch produced an unexpected outcome".to_string(),
-                                    ))
+                                    ).into())
                                 }
                             };
                             results.push(KvBatchReadItem { path, value });
@@ -1863,7 +1971,7 @@ async fn invoke_impl(
                         _ => Status::Unauthorized,
                     },
                     e.to_string(),
-                ))
+                ).into())
             }
         };
 
@@ -1873,7 +1981,16 @@ async fn invoke_impl(
         res
     }
     .instrument(span)
-    .await
+    .await;
+    // Every storage rejection carries the owner's account totals when billing
+    // has supplied them, whichever path refused the write.
+    match result {
+        Err(InvokeError::Storage(mut rejection)) => {
+            rejection.account = quota_cache.account_usage(&rejection.space).await;
+            Err(InvokeError::Storage(rejection))
+        }
+        other => other,
+    }
 }
 
 async fn emit_kv_hook_events(
@@ -2110,7 +2227,7 @@ async fn handle_sql_invoke(
     quota_cache: &State<QuotaCache>,
     config: &State<Config>,
     sql_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
-) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
+) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, InvokeError> {
     // W1 (D): derive the SQL caveat from the VALIDATED delegation chain,
     // NOT from the invoker's own invocation facts. The invocation-facts
     // path is a holdover (and is still consulted as a fallback so the
@@ -2194,12 +2311,14 @@ async fn handle_sql_invoke(
         None => facts_caveats,
     };
 
-    // SQL storage quota pre-check — same limit resolution and 402 semantics
-    // as the KV path, via the shared helper so the two can't drift.
-    // Reads never 402. One-write overshoot accepted: usage is only known
-    // post-execute, so a write crossing the limit is admitted and the next
-    // write 402s. No shrink — DELETE does not reduce artifact size without
-    // VACUUM, so an over-quota space cannot self-serve shrink.
+    // SQL storage gate — same limit resolution as the KV path. Reads never
+    // 402. Under the limit, one-write overshoot is accepted: usage is only
+    // known post-execute, so a write crossing the limit is admitted and the
+    // next write meets a full space. On a full space the write still runs,
+    // inside a savepoint that is undone if the database grew, so no-op DDL
+    // (`CREATE TABLE IF NOT EXISTS` on an existing table), `DELETE` and
+    // `DROP` succeed and only growing writes get the 402. Freed pages are
+    // reused by later writes, but metered usage does not drop without VACUUM.
     let publication_command =
         meeting_publication::command(&sql_request, path, ability, &exec_caveats)?;
     if publication_command.is_some() {
@@ -2209,12 +2328,26 @@ async fn handle_sql_invoke(
     // available when content storage is full.
     let grows_content =
         publication_command.is_none() && sql_request_is_write(&sql_request, &exec_caveats, ability);
-    if grows_content {
-        staged_batch_remaining(space, tinycloud, config, quota_cache).await?;
-    }
+    let full_space = if grows_content {
+        storage_check(space, tinycloud, config, quota_cache)
+            .await?
+            .filter(|check| check.remaining().is_none())
+    } else {
+        None
+    };
     let execute_start = Instant::now();
     let execute_result = if let Some(command) = publication_command {
         meeting_publication::execute(tinycloud, sql_service, space, command).await
+    } else if full_space.is_some() {
+        sql_service
+            .execute_without_growth(
+                space,
+                &db_name,
+                sql_request,
+                exec_caveats,
+                ability.to_string(),
+            )
+            .await
     } else {
         sql_service
             .execute(
@@ -2235,7 +2368,14 @@ async fn handle_sql_invoke(
         },
         execute_start.elapsed(),
     );
-    let response = execute_result.map_err(|e| (sql_error_to_status(&e), e.to_string()))?;
+    let response = execute_result.map_err(|e| -> InvokeError {
+        match (&e, full_space) {
+            (SqlError::StorageWouldGrow, Some(check)) => check
+                .reject(StorageRejectionKind::QuotaExceeded, space)
+                .into(),
+            _ => (sql_error_to_status(&e), e.to_string()).into(),
+        }
+    })?;
 
     if let Some(epoch) = auth_result
         .commits
@@ -2608,6 +2748,7 @@ fn sql_error_to_status(err: &SqlError) -> Status {
         SqlError::DatabaseNotFound => Status::NotFound,
         SqlError::ResponseTooLarge(_) => Status::new(413),
         SqlError::QuotaExceeded => Status::new(429),
+        SqlError::StorageWouldGrow => Status::new(402),
         SqlError::InvalidStatement(_) => Status::BadRequest,
         SqlError::SchemaError(_) => Status::BadRequest,
         SqlError::ReadOnlyViolation => Status::Forbidden,
@@ -2616,15 +2757,17 @@ fn sql_error_to_status(err: &SqlError) -> Status {
     }
 }
 
-/// Classify a DuckDB request as write-class for the storage quota gate.
+/// Classify a DuckDB request as storage-growing for the storage quota gate.
 ///
 /// Mirrors `sql_request_is_write`: SQL-bearing variants are classified by
 /// the duckdb parser's `is_read_only`, `ExecuteStatement` resolves the
 /// named statement from the same caveats the execution path uses, and
 /// `Ingest`/`Import`/`ExportToKv` always grow stored bytes so they are
 /// write-class by construction. `Describe` and `Export` are reads.
+/// Full-space requests classified as writes use the service's transactional
+/// non-growth guard rather than being rejected before execution.
 #[cfg(feature = "duckdb")]
-fn duckdb_request_is_write(
+fn duckdb_request_grows_storage(
     request: &DuckDbRequest,
     caveats: &Option<DuckDbCaveats>,
     ability: &str,
@@ -2663,7 +2806,7 @@ async fn handle_duckdb_invoke(
     config: &State<Config>,
     duckdb_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
     arrow_format: bool,
-) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
+) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, InvokeError> {
     let caveats: Option<DuckDbCaveats> = admitted
         .invocation()
         .0
@@ -2709,7 +2852,8 @@ async fn handle_duckdb_invoke(
                 return Err((
                     Status::BadRequest,
                     "Expected binary body for import".to_string(),
-                ));
+                )
+                    .into());
             }
         };
 
@@ -2742,8 +2886,9 @@ async fn handle_duckdb_invoke(
         if caveats.is_some() {
             return Err((
                 Status::Forbidden,
-                "Export not allowed with active caveats".into(),
-            ));
+                "Export not allowed with active caveats".to_string(),
+            )
+                .into());
         }
         let export_start = Instant::now();
         let export_result = duckdb_service.export(space, &db_name).await;
@@ -2756,24 +2901,38 @@ async fn handle_duckdb_invoke(
         return Ok(DataOut::One(InvOut(InvocationOutcome::DuckDbExport(data))));
     }
 
-    // DuckDB storage quota pre-check — duckdb artifact bytes fold into
-    // store_size, so write-class requests must be gated exactly like the
-    // KV and SQL paths (reads never 402, one-write overshoot accepted).
-    if duckdb_request_is_write(&duckdb_request, &caveats, ability) {
-        staged_batch_remaining(space, tinycloud, config, quota_cache).await?;
-    }
+    let full_space = if duckdb_request_grows_storage(&duckdb_request, &caveats, ability) {
+        storage_check(space, tinycloud, config, quota_cache)
+            .await?
+            .filter(|check| check.remaining().is_none())
+    } else {
+        None
+    };
 
     let execute_start = Instant::now();
-    let execute_result = duckdb_service
-        .execute(
-            space,
-            &db_name,
-            duckdb_request,
-            caveats,
-            ability.to_string(),
-            arrow_format,
-        )
-        .await;
+    let execute_result = if full_space.is_some() {
+        duckdb_service
+            .execute_without_growth(
+                space,
+                &db_name,
+                duckdb_request,
+                caveats,
+                ability.to_string(),
+                arrow_format,
+            )
+            .await
+    } else {
+        duckdb_service
+            .execute(
+                space,
+                &db_name,
+                duckdb_request,
+                caveats,
+                ability.to_string(),
+                arrow_format,
+            )
+            .await
+    };
     crate::prometheus::observe_span(
         "server.duckdb.execute",
         if execute_result.is_ok() {
@@ -2783,7 +2942,14 @@ async fn handle_duckdb_invoke(
         },
         execute_start.elapsed(),
     );
-    let response = execute_result.map_err(|e| (duckdb_error_to_status(&e), e.to_string()))?;
+    let response = execute_result.map_err(|e| -> InvokeError {
+        match (&e, full_space) {
+            (DuckDbError::StorageWouldGrow, Some(check)) => check
+                .reject(StorageRejectionKind::QuotaExceeded, space)
+                .into(),
+            _ => (duckdb_error_to_status(&e), e.to_string()).into(),
+        }
+    })?;
 
     if let Some(epoch) = auth_result
         .commits
@@ -2834,6 +3000,7 @@ fn duckdb_error_to_status(err: &DuckDbError) -> Status {
         DuckDbError::DatabaseNotFound => Status::NotFound,
         DuckDbError::ResponseTooLarge(_) => Status::new(413),
         DuckDbError::QuotaExceeded => Status::new(429),
+        DuckDbError::StorageWouldGrow => Status::new(402),
         DuckDbError::IngestError(_) => Status::InternalServerError,
         DuckDbError::ExportError(_) => Status::InternalServerError,
         DuckDbError::ImportError(_) => Status::InternalServerError,
@@ -5818,6 +5985,8 @@ mod tests {
     struct MeteredSqlHttp {
         tinycloud: TinyCloud,
         sql_service: SqlService,
+        #[cfg(feature = "duckdb")]
+        duckdb_service: DuckDbService,
         replay_db: tinycloud_core::sea_orm::DatabaseConnection,
         space: SpaceId,
         resource: ResourceId,
@@ -5865,6 +6034,14 @@ mod tests {
         let raw_repo: Arc<dyn DatabaseArtifactRepository> =
             Arc::new(SeaOrmDatabaseArtifactRepository::new(sql_db));
         let tracked_repo = Arc::new(SizeTrackingArtifactRepository::new(raw_repo, sizes.clone()));
+        #[cfg(feature = "duckdb")]
+        let duckdb_service = DuckDbService::new(
+            format!("{cache_path}/duckdb"),
+            u64::MAX,
+            300,
+            "128MB".into(),
+            tracked_repo.clone(),
+        );
         let sql_service = SqlService::new(cache_path, u64::MAX, tracked_repo);
 
         let space = test_space_id(name);
@@ -5966,6 +6143,8 @@ mod tests {
         Ok(MeteredSqlHttp {
             tinycloud,
             sql_service,
+            #[cfg(feature = "duckdb")]
+            duckdb_service,
             replay_db: conn,
             space,
             resource,
@@ -6021,6 +6200,13 @@ mod tests {
         setup: MeteredSqlHttp,
         limit: rocket::data::ByteUnit,
     ) -> rocket::Rocket<rocket::Build> {
+        metered_sql_rocket_with_quota(setup, QuotaCache::new(Some(limit), None))
+    }
+
+    fn metered_sql_rocket_with_quota(
+        setup: MeteredSqlHttp,
+        quota_cache: QuotaCache,
+    ) -> rocket::Rocket<rocket::Build> {
         let conn = setup.replay_db.clone();
         let rocket = rocket::build()
             .mount("/", rocket::routes![invoke])
@@ -6030,10 +6216,12 @@ mod tests {
             .manage(setup.tinycloud)
             .manage(setup.sql_service)
             .manage(Config::default())
-            .manage(QuotaCache::new(Some(limit), None))
+            .manage(quota_cache)
             .manage(InvocationReplayCache::new(setup.replay_db))
             .manage(HookRuntime::new(HooksConfig::default(), [9u8; 32]))
             .manage(BlockStage::from(crate::config::StagingStorage::Memory));
+        #[cfg(feature = "duckdb")]
+        let rocket = rocket.manage(setup.duckdb_service);
         manage_tc405_test_state(rocket, conn)
     }
 
@@ -6118,46 +6306,346 @@ mod tests {
         Ok(())
     }
 
+    /// Grant `tinycloud.space/info` on the setup's space and sign a usage
+    /// read with it.
+    async fn space_info_invocation_header(
+        setup: &mut MeteredSqlHttp,
+        nonce: &str,
+    ) -> Result<String> {
+        use tinycloud_core::{
+            models::abilities,
+            sea_orm::{ActiveModelTrait, ActiveValue::Set},
+            types::Caveats,
+        };
+        let resource =
+            setup
+                .space
+                .clone()
+                .to_resource("space".parse::<Service>()?, None, None, None);
+        abilities::ActiveModel {
+            delegation: Set(setup.parent_cid.into()),
+            resource: Set(Resource::TinyCloud(resource.clone())),
+            ability: Set(Ability::try_from("tinycloud.space/info".to_string()).unwrap()),
+            caveats: Set(Caveats(Default::default())),
+        }
+        .insert(&setup.replay_db)
+        .await?;
+        let sql_resource = std::mem::replace(&mut setup.resource, resource);
+        let header = sql_invocation_header(setup, "tinycloud.space/info", nonce);
+        setup.resource = sql_resource;
+        header
+    }
+
+    /// A row larger than a page, so inserting it must grow the database.
+    fn growing_insert() -> SqlRequest {
+        SqlRequest::Execute {
+            schema: None,
+            sql: "INSERT INTO labels (label, val) VALUES (?, 333)".to_string(),
+            params: vec![SqlValue::Text("g".repeat(64 * 1024))],
+        }
+    }
+
+    /// Serves `body` to every request and records each raw request.
+    async fn billing_stub(
+        body: &'static str,
+    ) -> Result<(String, Arc<std::sync::Mutex<Vec<String>>>)> {
+        use tokio::io::AsyncWriteExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 16 * 1024];
+                let mut read = 0;
+                while read < buf.len() && !buf[..read].windows(4).any(|w| w == b"\r\n\r\n") {
+                    let count = stream.read(&mut buf[read..]).await.unwrap_or(0);
+                    if count == 0 {
+                        break;
+                    }
+                    read += count;
+                }
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..read]).into_owned());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        Ok((url, seen))
+    }
+
+    /// TC-626: a full space still accepts writes that cannot grow it — the
+    /// schema ensure every app runs on open, DELETE and DROP — while a
+    /// growing write is refused with the structured JSON body and undone.
     #[tokio::test]
-    async fn sql_write_over_limit_returns_402_with_kv_message() -> Result<()> {
+    async fn sql_full_space_accepts_non_growing_writes_and_refuses_growth_as_json() -> Result<()> {
         use rocket::data::ByteUnit;
         use rocket::http::{ContentType, Header, Status};
         use rocket::local::asynchronous::Client;
 
-        let setup = metered_sql_http_setup("sql-write-402").await?;
+        let mut setup = metered_sql_http_setup("sql-full-space").await?;
         let used = setup.used;
-        let auth_header = sql_invocation_header(
-            &setup,
-            "tinycloud.sql/write",
-            "urn:uuid:00000000-0000-4000-8000-0000000000t2",
-        )?;
+        let usage_header =
+            space_info_invocation_header(&mut setup, "urn:uuid:tc626-full-usage").await?;
+        let write = |nonce: &str| sql_invocation_header(&setup, "tinycloud.sql/write", nonce);
+        let ensure = write("urn:uuid:tc626-full-ensure")?;
+        let grow = write("urn:uuid:tc626-full-grow")?;
+        let delete = write("urn:uuid:tc626-full-delete")?;
+        let drop_table = write("urn:uuid:tc626-full-drop")?;
+        let count =
+            sql_invocation_header(&setup, "tinycloud.sql/read", "urn:uuid:tc626-full-count")?;
 
         let client = Client::tracked(metered_sql_rocket(setup, ByteUnit::Byte(1))).await?;
-        let response = client
-            .post("/invoke")
-            .header(Header::new("Authorization", auth_header))
-            .header(ContentType::JSON)
-            .body(serde_json::to_string(&SqlRequest::Execute {
+        let send = |auth: String, body: String| {
+            let client = &client;
+            async move {
+                let response = client
+                    .post("/invoke")
+                    .header(Header::new("Authorization", auth))
+                    .header(ContentType::JSON)
+                    .body(body)
+                    .dispatch()
+                    .await;
+                let status = response.status();
+                let content_type = response.content_type();
+                let body = response.into_string().await.unwrap_or_default();
+                (status, content_type, body)
+            }
+        };
+        let execute = |sql: &str| {
+            serde_json::to_string(&SqlRequest::Execute {
                 schema: None,
-                sql: "INSERT INTO labels (label, val) VALUES ('gamma', 333)".to_string(),
+                sql: sql.to_string(),
                 params: vec![],
-            })?)
-            .dispatch()
-            .await;
+            })
+        };
 
-        let status = response.status();
-        let body = response.into_string().await.unwrap_or_default();
+        // The owner usage read reports the full space; no billing, no account.
+        let (status, _, body) = send(usage_header, "{}".to_string()).await;
+        assert_eq!(status, Status::Ok, "usage read: {body}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body)?,
+            serde_json::json!({
+                "space": {"usedBytes": used, "limitBytes": 1},
+                "manageUrl": "https://account.tinycloud.xyz/billing",
+            })
+        );
+
+        let (status, _, body) = send(
+            ensure,
+            execute(
+                "CREATE TABLE IF NOT EXISTS labels (label TEXT PRIMARY KEY, val INTEGER NOT NULL)",
+            )?,
+        )
+        .await;
         assert_eq!(
             status,
-            Status::new(402),
-            "expected 402, got {status}: {body}"
+            Status::Ok,
+            "no-op schema ensure on a full space: {body}"
         );
+
+        let (status, content_type, body) =
+            send(grow, serde_json::to_string(&growing_insert())?).await;
+        assert_eq!(status, Status::new(402), "growing write: {body}");
+        assert_eq!(content_type, Some(ContentType::JSON));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body)?,
+            serde_json::json!({
+                "error": "storage_quota_exceeded",
+                "message": format!("Storage quota exceeded. Used: {used} bytes, Limit: 1 bytes"),
+                "space": {"usedBytes": used, "limitBytes": 1},
+            })
+        );
+
+        let (status, _, body) = send(
+            count,
+            serde_json::to_string(&SqlRequest::Query {
+                sql: "SELECT count(*) FROM labels".to_string(),
+                params: vec![],
+                max_rows: None,
+                max_bytes: None,
+            })?,
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body)?["rows"],
+            serde_json::json!([[1]]),
+            "the refused insert must be undone"
+        );
+
+        let (status, _, body) =
+            send(delete, execute("DELETE FROM labels WHERE label = 'alpha'")?).await;
+        assert_eq!(status, Status::Ok, "DELETE on a full space: {body}");
+        let (status, _, body) = send(drop_table, execute("DROP TABLE labels")?).await;
+        assert_eq!(status, Status::Ok, "DROP on a full space: {body}");
+        Ok(())
+    }
+
+    /// TC-626: billing's account totals reach both the usage read and the
+    /// 402 body, and the quota fetch carries the node's service secret.
+    #[tokio::test]
+    async fn billing_account_totals_reach_usage_read_and_storage_errors() -> Result<()> {
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+
+        let (billing_url, billing_requests) = billing_stub(
+            r#"{"storage_limit_bytes":1,"current_usage_bytes":0,"total_used":389777359,"account_limit_bytes":104857600,"plan":"free"}"#,
+        )
+        .await?;
+        let mut setup = metered_sql_http_setup("sql-billing-account").await?;
+        let used = setup.used;
+        let usage_header =
+            space_info_invocation_header(&mut setup, "urn:uuid:tc626-billing-usage").await?;
+        let grow =
+            sql_invocation_header(&setup, "tinycloud.sql/write", "urn:uuid:tc626-billing-grow")?;
+        let quota = QuotaCache::new(None, Some(billing_url))
+            .with_service_secret(Some("node-service-secret".to_string()));
+        let client = Client::tracked(metered_sql_rocket_with_quota(setup, quota)).await?;
+        let account = serde_json::json!({
+            "usedBytes": 389777359u64,
+            "limitBytes": 104857600u64,
+            "plan": "free",
+        });
+
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", usage_header))
+            .header(ContentType::JSON)
+            .body("{}")
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &response.into_string().await.unwrap_or_default()
+            )?,
+            serde_json::json!({
+                "space": {"usedBytes": used, "limitBytes": 1},
+                "account": account,
+                "manageUrl": "https://account.tinycloud.xyz/billing",
+            })
+        );
+
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", grow))
+            .header(ContentType::JSON)
+            .body(serde_json::to_string(&growing_insert())?)
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::new(402));
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap_or_default())?;
+        assert_eq!(body["error"], "storage_quota_exceeded");
+        assert_eq!(body["account"], account);
+
+        let requests = billing_requests.lock().unwrap().clone();
+        assert!(
+            !requests.is_empty(),
+            "the node must ask billing for the limit"
+        );
+        assert!(
+            requests.iter().all(|request| {
+                request.lines().any(|line| {
+                    line.eq_ignore_ascii_case("authorization: Bearer node-service-secret")
+                })
+            }),
+            "every quota fetch carries the service secret: {requests:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn storage_details_require_authority_and_kv_overflow_is_json() -> Result<()> {
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+        use tinycloud_core::{
+            models::abilities,
+            sea_orm::{ActiveModelTrait, ActiveValue::Set},
+            types::Caveats,
+        };
+
+        let (url, _) = billing_stub(
+            r#"{"storage_limit_bytes":10000000,"total_used":500,"account_limit_bytes":1000,"plan":"free"}"#,
+        ).await?;
+        let mut setup = metered_sql_http_setup("kv-storage-authority").await?;
+        let used = setup.used;
+        let quota = QuotaCache::new(None, Some(url));
+        quota.get_limit(&setup.space).await;
+        quota.set_limit(&setup.space, used + 3).await;
+
+        setup.resource = setup.space.clone().to_resource(
+            "kv".parse::<Service>()?,
+            Some("allowed".parse::<AuthPath>()?),
+            None,
+            None,
+        );
+        abilities::ActiveModel {
+            delegation: Set(setup.parent_cid.into()),
+            resource: Set(Resource::TinyCloud(setup.resource.clone())),
+            ability: Set(Ability::try_from("tinycloud.kv/put".to_string()).unwrap()),
+            caveats: Set(Caveats(Default::default())),
+        }
+        .insert(&setup.replay_db)
+        .await?;
+        let allowed = sql_invocation_header(&setup, "tinycloud.kv/put", "tc626-kv-allowed")?;
+        setup.resource = setup.space.clone().to_resource(
+            "kv".parse::<Service>()?,
+            Some("denied".parse::<AuthPath>()?),
+            None,
+            None,
+        );
+        let denied = sql_invocation_header(&setup, "tinycloud.kv/put", "tc626-kv-denied")?;
+        setup.resource =
+            setup
+                .space
+                .clone()
+                .to_resource("space".parse::<Service>()?, None, None, None);
+        let denied_usage =
+            sql_invocation_header(&setup, "tinycloud.space/info", "tc626-info-denied")?;
+        let client = Client::tracked(metered_sql_rocket_with_quota(setup, quota)).await?;
+
+        for auth in [denied, denied_usage] {
+            let response = client
+                .post("/invoke")
+                .header(Header::new("Authorization", auth))
+                .body("too large")
+                .dispatch()
+                .await;
+            assert!(
+                matches!(response.status().code, 401 | 403),
+                "unauthorized callers must not receive a storage response"
+            );
+            let body = response.into_string().await.unwrap_or_default();
+            assert!(!body.contains("usedBytes"), "{body}");
+            assert!(!body.contains("account"), "{body}");
+        }
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", allowed))
+            .body("too large")
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::PayloadTooLarge);
+        assert_eq!(response.content_type(), Some(ContentType::JSON));
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap_or_default())?;
         assert_eq!(
             body,
-            format!(
-                "Storage quota exceeded. Used: {} bytes, Limit: {} bytes",
-                used, 1
-            )
+            serde_json::json!({
+                "error": "storage_limit_reached",
+                "message": format!("Write exceeds remaining storage. Used: {used} bytes, Limit: {} bytes", used + 3),
+                "space": {"usedBytes": used, "limitBytes": used + 3},
+                "account": {"usedBytes": 500, "limitBytes": 1000, "plan": "free"},
+            })
         );
         Ok(())
     }
@@ -6251,7 +6739,7 @@ mod tests {
             "sqlCaveats": {
                 "statements": [{
                     "name": "w",
-                    "sql": "INSERT INTO labels (label, val) VALUES ('delta', 444)"
+                    "sql": "INSERT INTO labels (label, val) VALUES (?, 444)"
                 }]
             }
         })];
@@ -6269,7 +6757,7 @@ mod tests {
             .header(ContentType::JSON)
             .body(serde_json::to_string(&SqlRequest::ExecuteStatement {
                 name: "w".to_string(),
-                params: vec![],
+                params: vec![SqlValue::Text("d".repeat(64 * 1024))],
             })?)
             .dispatch()
             .await;
@@ -6281,12 +6769,10 @@ mod tests {
             Status::new(402),
             "facts-pinned ExecuteStatement write must 402, got {status}: {body}"
         );
+        let body: serde_json::Value = serde_json::from_str(&body)?;
         assert_eq!(
-            body,
-            format!(
-                "Storage quota exceeded. Used: {} bytes, Limit: {} bytes",
-                used, 1
-            )
+            body["message"],
+            format!("Storage quota exceeded. Used: {used} bytes, Limit: 1 bytes")
         );
         Ok(())
     }

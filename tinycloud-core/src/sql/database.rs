@@ -27,6 +27,7 @@ enum DbMessage {
         request: SqlRequest,
         caveats: Option<SqlCaveats>,
         ability: String,
+        growth: GrowthPolicy,
         response_tx: oneshot::Sender<Result<SqlExecutionResult, SqlError>>,
     },
     Export {
@@ -38,6 +39,16 @@ enum DbMessage {
     Wal {
         response_tx: oneshot::Sender<Result<Option<Vec<u8>>, SqlError>>,
     },
+}
+
+/// Whether a write may grow the database file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrowthPolicy {
+    Allow,
+    /// The space is full: run the request, but undo it and fail with
+    /// [`SqlError::StorageWouldGrow`] if the database grew. No-op DDL,
+    /// `DELETE` and `DROP` free pages instead of adding them, so they pass.
+    Forbid,
 }
 
 /// Distinguishes one actor from its replacement for the same (space, db); see
@@ -72,6 +83,7 @@ impl DatabaseHandle {
         request: SqlRequest,
         caveats: Option<SqlCaveats>,
         ability: String,
+        growth: GrowthPolicy,
     ) -> Result<SqlExecutionResult, SqlError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
@@ -79,6 +91,7 @@ impl DatabaseHandle {
                 request,
                 caveats,
                 ability,
+                growth,
                 response_tx,
             })
             .await
@@ -178,9 +191,15 @@ pub fn spawn_actor(
                     request,
                     caveats,
                     ability,
+                    growth,
                     response_tx,
                 } => {
-                    let result = handle_message(&conn, &request, &caveats, &ability);
+                    let result = match growth {
+                        GrowthPolicy::Allow => handle_message(&conn, &request, &caveats, &ability),
+                        GrowthPolicy::Forbid => {
+                            handle_message_without_growth(&conn, &request, &caveats, &ability)
+                        }
+                    };
                     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
 
                     // Post-write promotion check
@@ -283,12 +302,67 @@ fn handle_checkpoint(
 ) -> Result<Vec<u8>, SqlError> {
     match mode {
         StorageMode::File(_) => {
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            let busy: i64 = conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
                 .map_err(|e| SqlError::Internal(e.to_string()))?;
+            if busy != 0 {
+                return Err(SqlError::Internal("Database checkpoint is busy".into()));
+            }
             std::fs::read(file_path).map_err(|e| SqlError::Internal(e.to_string()))
         }
         StorageMode::InMemory => handle_export(conn, mode, file_path),
     }
+}
+
+const GUARD_BEGIN: &str = "SAVEPOINT tinycloud_storage_guard";
+const GUARD_KEEP: &str = "RELEASE tinycloud_storage_guard";
+const GUARD_UNDO: &str = "ROLLBACK TO tinycloud_storage_guard; RELEASE tinycloud_storage_guard";
+
+/// Run `request` inside a savepoint and keep its effects only if the
+/// database did not grow (`PRAGMA page_count` reflects uncommitted pages on
+/// this connection). A failed request that did not grow is released like an
+/// unguarded one, so partial-batch semantics stay identical.
+fn handle_message_without_growth(
+    conn: &rusqlite::Connection,
+    request: &SqlRequest,
+    caveats: &Option<SqlCaveats>,
+    ability: &str,
+) -> Result<SqlExecutionResult, SqlError> {
+    let before = page_count(conn)?;
+    conn.execute_batch(GUARD_BEGIN)
+        .map_err(|e| SqlError::Internal(e.to_string()))?;
+    let result = handle_message(conn, request, caveats, ability);
+    // An early error return can leave the request's authorizer installed.
+    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+    // ROLLBACK conflict handling can already have undone the transaction.
+    // Do not replace the request's error with "no such savepoint".
+    if result.is_err() && conn.is_autocommit() {
+        return result;
+    }
+    let grew = page_count(conn).map(|after| after > before);
+    let end = match grew {
+        Ok(false) => GUARD_KEEP,
+        Ok(true) | Err(_) => GUARD_UNDO,
+    };
+    if let Err(error) = conn.execute_batch(end) {
+        // RELEASE is also the commit for the outermost savepoint. Deferred
+        // constraints can fail here and leave both the mutation and savepoint
+        // active; undo them before the next request or checkpoint runs.
+        if !conn.is_autocommit() {
+            conn.execute_batch(GUARD_UNDO)
+                .map_err(|e| SqlError::Internal(e.to_string()))?;
+        }
+        return Err(SqlError::Sqlite(error.to_string()));
+    }
+    match grew? {
+        false => result,
+        true => Err(SqlError::StorageWouldGrow),
+    }
+}
+
+fn page_count(conn: &rusqlite::Connection) -> Result<i64, SqlError> {
+    conn.query_row("PRAGMA page_count", [], |row| row.get(0))
+        .map_err(|e| SqlError::Internal(e.to_string()))
 }
 
 fn handle_message(
@@ -581,6 +655,54 @@ fn execute_statement(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn growth_guard_rolls_back_failed_deferred_commit() {
+        let conn = storage::open_connection(&StorageMode::InMemory).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE parents (id INTEGER PRIMARY KEY);
+             CREATE TABLE children (
+                 parent_id INTEGER REFERENCES parents(id) DEFERRABLE INITIALLY DEFERRED
+             );
+             INSERT INTO parents VALUES (1);
+             INSERT INTO children VALUES (1);",
+        )
+        .unwrap();
+        let error = handle_message_without_growth(
+            &conn,
+            &SqlRequest::Execute {
+                schema: None,
+                sql: "DELETE FROM parents".into(),
+                params: vec![],
+            },
+            &None,
+            "tinycloud.sql/write",
+        )
+        .unwrap_err();
+        assert!(matches!(error, SqlError::Sqlite(_)));
+
+        // The failed RELEASE must not leave a deleted parent or an open outer
+        // transaction that swallows the next request's successful commit.
+        handle_message_without_growth(
+            &conn,
+            &SqlRequest::Execute {
+                schema: None,
+                sql: "DELETE FROM children".into(),
+                params: vec![],
+            },
+            &None,
+            "tinycloud.sql/write",
+        )
+        .unwrap();
+        assert!(conn.is_autocommit());
+        let parents: i64 = conn
+            .query_row("SELECT count(*) FROM parents", [], |row| row.get(0))
+            .unwrap();
+        let children: i64 = conn
+            .query_row("SELECT count(*) FROM children", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((parents, children), (1, 0));
+    }
 
     #[test]
     fn bounded_query_rejects_more_rows_than_requested() {
