@@ -1,4 +1,8 @@
 use rocket::data::ByteUnit;
+use rocket::http::Status;
+use rocket::response::{self, Responder};
+use rocket::serde::json::Json;
+use rocket::Request;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -6,9 +10,168 @@ use std::time::{Duration, Instant};
 use tinycloud_auth::resource::SpaceId;
 use tokio::sync::RwLock;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+/// Billing's `GET /api/quota/<space>` answer. Only `storage_limit_bytes` is
+/// required; the account fields arrived with TC-627 and are absent on older
+/// billing deployments.
+#[derive(Deserialize, Debug, Clone)]
 pub struct QuotaInfo {
     pub storage_limit_bytes: u64,
+    /// The owner's usage summed over all of their spaces.
+    #[serde(default)]
+    pub total_used: Option<u64>,
+    /// The owner's plan budget.
+    #[serde(default)]
+    pub account_limit_bytes: Option<u64>,
+    /// The plan tier id, e.g. `free` or `paid`.
+    #[serde(default)]
+    pub plan: Option<String>,
+    /// Billing could not compute every space's usage, so `total_used` is a
+    /// lower bound.
+    #[serde(default)]
+    pub degraded: Option<bool>,
+}
+
+impl QuotaInfo {
+    /// Account totals, when billing supplied both numbers and computed them
+    /// from every space. A degraded answer under-counts, so it is dropped
+    /// rather than shown.
+    fn account(self) -> Option<AccountUsage> {
+        if self.degraded == Some(true) {
+            return None;
+        }
+        Some(AccountUsage {
+            used_bytes: self.total_used?,
+            limit_bytes: self.account_limit_bytes?,
+            plan: self.plan,
+        })
+    }
+}
+
+/// The owner's account-wide storage, as last reported by billing.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountUsage {
+    pub used_bytes: u64,
+    pub limit_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+}
+
+/// What a successful quota fetch yields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemoteQuota {
+    limit_bytes: u64,
+    account: Option<AccountUsage>,
+}
+
+/// Where every storage surface sends the owner to free space or upgrade.
+pub const MANAGE_STORAGE_URL: &str = "https://account.tinycloud.xyz/billing";
+
+/// One space's metered usage against its effective limit (`None` = no limit).
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SpaceStorage {
+    pub used_bytes: u64,
+    pub limit_bytes: Option<u64>,
+}
+
+/// The owner usage read (`tinycloud.space/info`): the space's numbers, the
+/// account totals when billing supplied them, and where to manage storage.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageUsage {
+    pub space: SpaceStorage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<AccountUsage>,
+    pub manage_url: &'static str,
+}
+
+/// Which storage boundary refused a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageRejectionKind {
+    /// The space is full (HTTP 402).
+    QuotaExceeded,
+    /// This write is larger than what is left (HTTP 413).
+    LimitReached,
+}
+
+/// A write refused because it would grow storage past the space's limit.
+///
+/// Responds with the shared TC-619 JSON body. `message` keeps the sentence
+/// the node always sent, so clients that match `Used: X bytes, Limit: Y
+/// bytes` against the raw text keep working.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageRejection {
+    pub kind: StorageRejectionKind,
+    pub space: SpaceId,
+    pub used_bytes: u64,
+    pub limit_bytes: u64,
+    pub account: Option<AccountUsage>,
+}
+
+impl StorageRejection {
+    /// Construct a space rejection before optional billing enrichment.
+    pub fn new(
+        kind: StorageRejectionKind,
+        space: &SpaceId,
+        used_bytes: u64,
+        limit_bytes: u64,
+    ) -> Self {
+        Self {
+            kind,
+            space: space.clone(),
+            used_bytes,
+            limit_bytes,
+            account: None,
+        }
+    }
+
+    /// HTTP status associated with this storage boundary.
+    pub fn status(&self) -> Status {
+        match self.kind {
+            StorageRejectionKind::QuotaExceeded => Status::new(402),
+            StorageRejectionKind::LimitReached => Status::PayloadTooLarge,
+        }
+    }
+
+    /// Preserve the legacy storage-error sentence for existing clients.
+    pub fn message(&self) -> String {
+        let lead = match self.kind {
+            StorageRejectionKind::QuotaExceeded => "Storage quota exceeded",
+            StorageRejectionKind::LimitReached => "Write exceeds remaining storage",
+        };
+        format!(
+            "{lead}. Used: {} bytes, Limit: {} bytes",
+            self.used_bytes, self.limit_bytes
+        )
+    }
+}
+
+#[derive(Serialize)]
+struct StorageRejectionBody<'a> {
+    error: &'static str,
+    message: String,
+    space: SpaceStorage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account: Option<&'a AccountUsage>,
+}
+
+impl<'r> Responder<'r, 'static> for StorageRejection {
+    fn respond_to(self, request: &'r Request<'_>) -> response::Result<'static> {
+        let body = StorageRejectionBody {
+            error: match self.kind {
+                StorageRejectionKind::QuotaExceeded => "storage_quota_exceeded",
+                StorageRejectionKind::LimitReached => "storage_limit_reached",
+            },
+            message: self.message(),
+            space: SpaceStorage {
+                used_bytes: self.used_bytes,
+                limit_bytes: Some(self.limit_bytes),
+            },
+            account: self.account.as_ref(),
+        };
+        (self.status(), Json(body)).respond_to(request)
+    }
 }
 
 /// How long a remote quota answer is served without triggering a background
@@ -23,11 +186,11 @@ const FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct RemoteEntry {
     /// `None` = the last fetch failed and no prior value is known (negative
     /// cache); serve the env default until `FAILURE_BACKOFF` elapses.
-    limit_bytes: Option<u64>,
+    quota: Option<RemoteQuota>,
     fetched_at: Instant,
     /// Set by `remove_limit` (billing invalidation after a plan change): the
     /// value is served one more time while a refresh runs in the background.
@@ -60,6 +223,9 @@ pub struct QuotaCache {
     default_limit: Option<ByteUnit>,
     quota_url: Option<String>,
     client: Option<reqwest::Client>,
+    /// Sent as `Authorization: Bearer <secret>` on quota fetches so billing
+    /// can require the node's service credential (TC-627).
+    service_secret: Option<Arc<str>>,
 }
 
 impl QuotaCache {
@@ -78,7 +244,15 @@ impl QuotaCache {
             default_limit,
             quota_url,
             client,
+            service_secret: None,
         }
+    }
+
+    /// Authenticate quota fetches with the node's service secret. An empty
+    /// secret is treated as none.
+    pub fn with_service_secret(mut self, secret: Option<String>) -> Self {
+        self.service_secret = secret.filter(|s| !s.is_empty()).map(Arc::from);
+        self
     }
 
     /// Get the effective storage limit for a space.
@@ -106,14 +280,18 @@ impl QuotaCache {
             return self.default_limit;
         }
 
-        let entry = { self.remote.read().await.get(&key).copied() };
+        let entry = {
+            self.remote.read().await.get(&key).map(|e| {
+                (
+                    e.quota.as_ref().map(|q| q.limit_bytes),
+                    e.fetched_at,
+                    e.stale,
+                    e.last_failure,
+                )
+            })
+        };
         match entry {
-            Some(RemoteEntry {
-                limit_bytes: Some(limit),
-                fetched_at,
-                stale,
-                last_failure,
-            }) => {
+            Some((Some(limit), fetched_at, stale, last_failure)) => {
                 if should_spawn_refresh(
                     stale,
                     fetched_at.elapsed(),
@@ -123,11 +301,7 @@ impl QuotaCache {
                 }
                 Some(ByteUnit::Byte(limit))
             }
-            Some(RemoteEntry {
-                limit_bytes: None,
-                fetched_at,
-                ..
-            }) => {
+            Some((None, fetched_at, _, _)) => {
                 if fetched_at.elapsed() >= FAILURE_BACKOFF {
                     self.spawn_refresh(key).await;
                 }
@@ -140,12 +314,30 @@ impl QuotaCache {
         }
     }
 
+    /// The account totals billing last reported for this space's owner, if
+    /// any. Local read only: call [`Self::get_limit`] first to populate it.
+    pub async fn account_usage(&self, space_id: &SpaceId) -> Option<AccountUsage> {
+        self.remote
+            .read()
+            .await
+            .get(&space_id.to_string())
+            .and_then(|e| e.quota.as_ref())
+            .and_then(|q| q.account.clone())
+    }
+
     /// Fetch the limit from the quota service and record the outcome
     /// (success or negative entry) in the remote cache.
     async fn fetch_and_record(&self, key: &str) -> Option<u64> {
-        let fetched = fetch_remote(self.client.as_ref()?, self.quota_url.as_deref()?, key).await;
+        let fetched = fetch_remote(
+            self.client.as_ref()?,
+            self.quota_url.as_deref()?,
+            self.service_secret.as_deref(),
+            key,
+        )
+        .await;
+        let limit = fetched.as_ref().map(|q| q.limit_bytes);
         record_fetch(&self.remote, key, fetched).await;
-        fetched
+        limit
     }
 
     /// Refresh a space's remote entry in the background, deduplicating
@@ -162,8 +354,9 @@ impl QuotaCache {
         }
         let remote = self.remote.clone();
         let inflight = self.inflight.clone();
+        let secret = self.service_secret.clone();
         tokio::spawn(async move {
-            let fetched = fetch_remote(&client, &url, &key).await;
+            let fetched = fetch_remote(&client, &url, secret.as_deref(), &key).await;
             record_fetch(&remote, &key, fetched).await;
             inflight.write().await.remove(&key);
         });
@@ -206,7 +399,7 @@ impl QuotaCache {
             .read()
             .await
             .get(&space_id.to_string())
-            .and_then(|e| e.limit_bytes)
+            .and_then(|e| e.quota.as_ref().map(|q| q.limit_bytes))
     }
 
     pub async fn list_overrides(&self) -> HashMap<String, u64> {
@@ -227,7 +420,10 @@ impl QuotaCache {
         self.remote.write().await.insert(
             key.to_string(),
             RemoteEntry {
-                limit_bytes,
+                quota: limit_bytes.map(|limit_bytes| RemoteQuota {
+                    limit_bytes,
+                    account: None,
+                }),
                 fetched_at: Instant::now(),
                 stale,
                 last_failure: None,
@@ -241,18 +437,26 @@ impl QuotaCache {
             .read()
             .await
             .get(key)
-            .map(|e| (e.limit_bytes, e.stale))
+            .map(|e| (e.quota.as_ref().map(|q| q.limit_bytes), e.stale))
     }
 }
 
-async fn fetch_remote(client: &reqwest::Client, url: &str, key: &str) -> Option<u64> {
-    match client
-        .get(format!("{}/api/quota/{}", url, key))
-        .send()
-        .await
-    {
+async fn fetch_remote(
+    client: &reqwest::Client,
+    url: &str,
+    secret: Option<&str>,
+    key: &str,
+) -> Option<RemoteQuota> {
+    let mut request = client.get(format!("{}/api/quota/{}", url, key));
+    if let Some(secret) = secret {
+        request = request.bearer_auth(secret);
+    }
+    match request.send().await {
         Ok(resp) if resp.status().is_success() => match resp.json::<QuotaInfo>().await {
-            Ok(info) => Some(info.storage_limit_bytes),
+            Ok(info) => Some(RemoteQuota {
+                limit_bytes: info.storage_limit_bytes,
+                account: info.account(),
+            }),
             Err(e) => {
                 tracing::warn!("quota service returned invalid body for space {key}: {e}");
                 None
@@ -278,53 +482,37 @@ async fn fetch_remote(client: &reqwest::Client, url: &str, key: &str) -> Option<
 async fn record_fetch(
     remote: &Arc<RwLock<HashMap<String, RemoteEntry>>>,
     key: &str,
-    fetched: Option<u64>,
+    fetched: Option<RemoteQuota>,
 ) {
     let mut guard = remote.write().await;
-    match (fetched, guard.get(key).and_then(|e| e.limit_bytes)) {
-        (Some(limit), _) => {
-            guard.insert(
-                key.to_string(),
-                RemoteEntry {
-                    limit_bytes: Some(limit),
-                    fetched_at: Instant::now(),
-                    stale: false,
-                    last_failure: None,
-                },
-            );
-        }
-        (None, Some(previous)) => {
-            guard.insert(
-                key.to_string(),
-                RemoteEntry {
-                    limit_bytes: Some(previous),
-                    fetched_at: Instant::now(),
-                    stale: true,
-                    last_failure: Some(Instant::now()),
-                },
-            );
-        }
-        (None, None) => {
-            guard.insert(
-                key.to_string(),
-                RemoteEntry {
-                    limit_bytes: None,
-                    fetched_at: Instant::now(),
-                    stale: false,
-                    last_failure: None,
-                },
-            );
-        }
-    }
+    let entry = match fetched {
+        Some(quota) => RemoteEntry {
+            quota: Some(quota),
+            fetched_at: Instant::now(),
+            stale: false,
+            last_failure: None,
+        },
+        None => match guard.remove(key).and_then(|e| e.quota) {
+            Some(previous) => RemoteEntry {
+                quota: Some(previous),
+                fetched_at: Instant::now(),
+                stale: true,
+                last_failure: Some(Instant::now()),
+            },
+            None => RemoteEntry {
+                quota: None,
+                fetched_at: Instant::now(),
+                stale: false,
+                last_failure: None,
+            },
+        },
+    };
+    guard.insert(key.to_string(), entry);
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
     use tokio::io::AsyncWriteExt;
 
     fn space(n: u8) -> SpaceId {
@@ -375,6 +563,36 @@ mod test {
                 .await
                 .is_err(),
             "the fresh cached entry must avoid a second network request",
+        );
+    }
+
+    #[test]
+    fn account_totals_need_both_numbers_and_a_complete_billing_answer() {
+        let account = |body: &str| {
+            serde_json::from_str::<QuotaInfo>(body)
+                .expect("valid quota body")
+                .account()
+        };
+        assert_eq!(account(r#"{"storage_limit_bytes":0}"#), None);
+        assert_eq!(
+            account(r#"{"storage_limit_bytes":0,"total_used":5}"#),
+            None,
+            "an old billing without account_limit_bytes has no account totals"
+        );
+        assert_eq!(
+            account(
+                r#"{"storage_limit_bytes":0,"total_used":5,"account_limit_bytes":9,"plan":"free","degraded":true}"#
+            ),
+            None,
+            "a degraded total under-counts and must not be shown"
+        );
+        assert_eq!(
+            account(r#"{"storage_limit_bytes":0,"total_used":5,"account_limit_bytes":9}"#),
+            Some(AccountUsage {
+                used_bytes: 5,
+                limit_bytes: 9,
+                plan: None,
+            })
         );
     }
 
@@ -429,32 +647,25 @@ mod test {
             "http://{}",
             listener.local_addr().expect("listener address")
         );
-        let accepted = Arc::new(AtomicUsize::new(0));
-        let server_accepted = accepted.clone();
         let server = tokio::spawn(async move {
-            let deadline = tokio::time::sleep(Duration::from_millis(250));
-            tokio::pin!(deadline);
-            loop {
-                tokio::select! {
-                    _ = &mut deadline => break,
-                    result = listener.accept() => {
-                        let Ok((mut stream, _)) = result else {
-                            break;
-                        };
-                        server_accepted.fetch_add(1, Ordering::SeqCst);
-                        let body = r#"{"storage_limit_bytes":500}"#;
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            body.len(),
-                            body
-                        );
-                        tokio::spawn(async move {
-                            let _ = stream.write_all(response.as_bytes()).await;
-                            let _ = stream.shutdown().await;
-                        });
-                    }
-                }
-            }
+            // Start the duplicate-request window after the first connection,
+            // not before client construction (which can be slow in a full suite).
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("refresh must connect")
+                .expect("accept refresh");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "only one refresh request should be in flight for a stale key",
+            );
+            let body = r#"{"storage_limit_bytes":500}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
         });
 
         let cache = QuotaCache::new(Some(ByteUnit::Byte(100)), Some(quota_url));
@@ -477,11 +688,6 @@ mod test {
         );
 
         server.await.expect("quota server task");
-        assert_eq!(
-            accepted.load(Ordering::SeqCst),
-            1,
-            "only one refresh request should be in flight for a stale key",
-        );
     }
 
     #[tokio::test]
