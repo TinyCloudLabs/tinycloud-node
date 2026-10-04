@@ -256,6 +256,7 @@ where
                 .sized_body(data.len(), std::io::Cursor::new(data))
                 .ok(),
             InvocationOutcome::EncryptionDecrypt(response) => Json(response).respond_to(request),
+            InvocationOutcome::SpaceInfo(json) => Json(json).respond_to(request),
         }
     }
 }
