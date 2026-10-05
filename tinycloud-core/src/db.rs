@@ -136,6 +136,11 @@ pub struct KvInvokeOptions {
     pub max_response_bytes: Option<u64>,
     pub list_limit: Option<usize>,
     pub list_cursor: Option<Path>,
+    /// TC-411: when set, populate `TransactResult::sql_constrained_statement_candidates`
+    /// from the request-scoped authorization snapshot that this invocation
+    /// already builds -- zero additional statements. Off by default so
+    /// ordinary KV invocations don't pay even the in-memory scan cost.
+    pub derive_sql_constrained_statement_caveat: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +158,13 @@ pub struct TransactResult {
     /// CIDs of delegations that were processed (saved) regardless of space existence.
     /// Used to return a CID even when all spaces were skipped.
     pub delegation_cids: Vec<Hash>,
+    /// TC-411: distinct SQL constrained-statement caveats found on the
+    /// validated request's proof chain, populated only when
+    /// `KvInvokeOptions::derive_sql_constrained_statement_caveat` was set.
+    /// Always empty otherwise. Resolving zero/one/many candidates into an
+    /// effective (or ambiguous, fail-closed) caveat is the caller's job.
+    pub sql_constrained_statement_candidates:
+        Vec<crate::policy_capability::sql_caveat::SqlConstrainedStatementCaveat>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,6 +208,11 @@ pub enum TxError<S: StorageSetup, K: Secrets> {
     Encryption(#[from] crate::encryption::EncryptionError),
     #[error("delegation-chain-traversal-limit-exceeded")]
     ChainTraversalLimitExceeded,
+    /// TC-411: a caveat on the validated proof chain declares itself a
+    /// `constrained-statements` SQL caveat but fails to parse. Fails closed
+    /// rather than treating the grant as unconstrained.
+    #[error("malformed sql constrained-statement caveat: {0}")]
+    MalformedSqlCaveat(&'static str),
 }
 
 #[non_exhaustive]
@@ -1590,9 +1607,8 @@ where
             .collect();
         let authz_start = Instant::now();
         let closure_start = Instant::now();
-        let lock_keys = crate::auth_graph::load_closure_edges(&self.conn, &roots)
+        let closure = crate::auth_graph::load_closure_edges(&self.conn, &roots)
             .await
-            .map(|(keys, _)| keys)
             .map_err(|error| match error {
                 revocation::ChainTraversalError::Db(error) => TxError::Db(error),
                 revocation::ChainTraversalError::LimitExceeded => {
@@ -1601,11 +1617,11 @@ where
             });
         crate::telemetry::observe_stage(
             crate::telemetry::InvocationStage::ChainClosureQuery,
-            crate::telemetry::StageOutcome::from(lock_keys.is_ok()),
+            crate::telemetry::StageOutcome::from(closure.is_ok()),
             closure_start.elapsed(),
         );
-        let lock_keys = match lock_keys {
-            Ok(keys) => keys,
+        let (lock_keys, closure_edges) = match closure {
+            Ok(closure) => closure,
             Err(error) => {
                 crate::telemetry::observe_stage(
                     crate::telemetry::InvocationStage::AuthorizationGraphLoad,
@@ -1621,7 +1637,9 @@ where
         // serialized against this authorization decision. What is dropped is
         // invocation-vs-invocation exclusion, which the revocation-ordering
         // invariant never depended on.
-        let _chain_guards = self.acquire_shared_chain_guards_for_keys(lock_keys).await;
+        let _chain_guards = self
+            .acquire_shared_chain_guards_for_keys(lock_keys.clone())
+            .await;
         let mutation_keys = invocation
             .0
             .capabilities
@@ -1639,9 +1657,92 @@ where
             })
             .collect::<Vec<_>>();
         if mutation_keys.is_empty() {
-            return self.invoke_read_only::<S>(invocation, options, mode).await;
+            // TC-411: build the request-scoped snapshot once, after the
+            // shared chain guards above are held, and pass it straight into
+            // read authorization so `validate` does not perform a second
+            // closure/graph load. `load_guarded` re-derives the closure on
+            // `self.conn` (now guarded) and fails closed if it does not
+            // exactly match the pre-guard `lock_keys` — see
+            // `AuthGraphSnapshot::load_guarded` for why the pre-guard
+            // closure alone cannot be trusted — then re-reads
+            // delegations/abilities/revocations fresh, so revocation state
+            // is current as of after guard acquisition.
+            let _ = closure_edges;
+            let auth_graph = match crate::auth_graph::AuthGraphSnapshot::load_guarded(
+                &self.conn, &roots, &lock_keys,
+            )
+            .await
+            {
+                Ok(graph) => graph,
+                Err(error) => {
+                    crate::telemetry::observe_stage(
+                        crate::telemetry::InvocationStage::AuthorizationGraphLoad,
+                        crate::telemetry::StageOutcome::Error,
+                        authz_start.elapsed(),
+                    );
+                    return Err(TxStoreError::Tx(match error {
+                        revocation::ChainTraversalError::Db(error) => TxError::Db(error),
+                        revocation::ChainTraversalError::LimitExceeded => {
+                            TxError::ChainTraversalLimitExceeded
+                        }
+                    }));
+                }
+            };
+            crate::telemetry::observe_stage(
+                crate::telemetry::InvocationStage::AuthorizationGraphLoad,
+                crate::telemetry::StageOutcome::Ok,
+                authz_start.elapsed(),
+            );
+            return self
+                .invoke_read_only::<S>(invocation, options, mode, Some(&auth_graph))
+                .await;
         }
         let _kv_object_guards = self.acquire_kv_object_guards(&mutation_keys).await;
+        // TC-411: authorize the whole invocation-scoped snapshot before any
+        // object-store persistence below (see the blob-persist comment
+        // further down). Loading it here, on `self.conn` rather than inside
+        // the not-yet-open transaction, is safe because `_chain_guards`
+        // (shared, acquired above) already excludes any concurrent
+        // revocation for `lock_keys` -- so a malformed/cyclic proof,
+        // mismatched guarded closure, unauthorized ability, or revoked
+        // delegation rejects the request before any durable side effect,
+        // matching the read-only branch above instead of after blobs are
+        // already persisted.
+        let _ = closure_edges;
+        let auth_graph = match crate::auth_graph::AuthGraphSnapshot::load_guarded(
+            &self.conn, &roots, &lock_keys,
+        )
+        .await
+        {
+            Ok(graph) => graph,
+            Err(error) => {
+                crate::telemetry::observe_stage(
+                    crate::telemetry::InvocationStage::AuthorizationGraphLoad,
+                    crate::telemetry::StageOutcome::Error,
+                    authz_start.elapsed(),
+                );
+                return Err(TxStoreError::Tx(match error {
+                    revocation::ChainTraversalError::Db(error) => TxError::Db(error),
+                    revocation::ChainTraversalError::LimitExceeded => {
+                        TxError::ChainTraversalLimitExceeded
+                    }
+                }));
+            }
+        };
+        crate::telemetry::observe_stage(
+            crate::telemetry::InvocationStage::AuthorizationGraphLoad,
+            crate::telemetry::StageOutcome::Ok,
+            authz_start.elapsed(),
+        );
+        // SQL routes can carry a KV mutation capability in the same
+        // invocation. Derive the chain caveat before taking that mutation
+        // path so the SQL handler receives the same fail-closed candidates
+        // as a SQL-only (read-only) invocation. This is an in-memory scan of
+        // the guarded authorization snapshot and adds no database work.
+        let sql_constrained_statement_candidates =
+            constrained_statement_candidates(&invocation, &options, &auth_graph).map_err(
+                |rejection| TxStoreError::Tx(TxError::MalformedSqlCaveat(rejection.as_str())),
+            )?;
         let mut stages = HashMap::new();
         let mut ops = Vec::new();
         let mut write_hashes = HashMap::new();
@@ -1683,10 +1784,70 @@ where
                         space: space.clone(),
                         key: path.clone(),
                         version: None,
+                        deleted_invocation_id: None,
                     });
                 }
                 _ => {}
             }
+        }
+
+        // Resolve every requested KV read before persisting blobs or opening
+        // the mutation transaction. A response-size or object-store error is
+        // an invocation failure, so it must leave the mutation, replay row,
+        // and history uncommitted. This keeps object-store I/O outside the
+        // database transaction without changing the pre-TC-411 all-or-nothing
+        // API behavior for a mixed get + mutation invocation.
+        let mut preloaded_gets = Vec::new();
+        for cap in invocation.0.capabilities.iter() {
+            let Some(resource) = cap.resource.tinycloud_resource() else {
+                continue;
+            };
+            if resource.service().as_str() != "kv"
+                || crate::policy_capability::resolve_alias(cap.ability.as_ref().as_ref())
+                    != "tinycloud.kv/get"
+            {
+                continue;
+            }
+            let Some(path) = resource.path().cloned() else {
+                continue;
+            };
+            let space = resource.space().clone();
+            let data = get_kv(&self.conn, &self.storage, &space, &path)
+                .await
+                .map_err(|e| match e {
+                    EitherError::A(e) => TxStoreError::Tx(e.into()),
+                    EitherError::B(e) => TxStoreError::StoreRead(e),
+                })?;
+            if let (Some(limit), Some((_, _, content))) =
+                (options.max_response_bytes, data.as_ref())
+            {
+                if content.len() > limit {
+                    return Err(TxStoreError::KvResponseTooLarge {
+                        size: content.len(),
+                        limit,
+                    });
+                }
+            }
+            preloaded_gets.push((space, path, data));
+        }
+
+        // TC-411: persist immutable put blobs to the object store only after
+        // the guarded authorization snapshot above has already accepted the
+        // request -- an unauthorized, revoked, or malformed-proof put never
+        // reaches this line, so it can never create an orphan blob -- and
+        // before opening the database transaction below, since an explicit
+        // db tx must never span an object-store call (see
+        // docs/invoke-query-budget.md). Object-store failure still prevents
+        // publication outright; a blob persisted here that never ends up
+        // referenced by a committed `kv_write` row (e.g. a later database
+        // failure aborts the transaction) is a harmless, unreachable,
+        // content-addressed orphan that is never surfaced through committed
+        // KV state.
+        for (key, stage) in std::mem::take(&mut stages) {
+            self.storage
+                .persist(&key.0, stage)
+                .await
+                .map_err(TxStoreError::StoreWrite)?;
         }
 
         let has_preconditions = !options.preconditions.is_empty();
@@ -1712,28 +1873,16 @@ where
         // recorded as a failure; it is disarmed to `ok` right before commit.
         let tx_body_timer =
             crate::telemetry::StageTimer::start(crate::telemetry::InvocationStage::DbTxBody);
-        let auth_graph = match crate::auth_graph::AuthGraphSnapshot::load(&tx, &roots).await {
-            Ok(graph) => graph,
-            Err(error) => {
-                crate::telemetry::observe_stage(
-                    crate::telemetry::InvocationStage::AuthorizationGraphLoad,
-                    crate::telemetry::StageOutcome::Error,
-                    authz_start.elapsed(),
-                );
-                return Err(TxStoreError::Tx(match error {
-                    revocation::ChainTraversalError::Db(error) => TxError::Db(error),
-                    revocation::ChainTraversalError::LimitExceeded => {
-                        TxError::ChainTraversalLimitExceeded
-                    }
-                }));
-            }
-        };
-        crate::telemetry::observe_stage(
-            crate::telemetry::InvocationStage::AuthorizationGraphLoad,
-            crate::telemetry::StageOutcome::Ok,
-            authz_start.elapsed(),
-        );
+        // TC-411: the guarded authorization snapshot was already loaded above
+        // (before blob persistence, on `self.conn`) and is reused here rather
+        // than re-derived on `&tx`. `_chain_guards` covers this whole span --
+        // from before that load through commit below -- so no revocation can
+        // land between the snapshot load and commit; re-loading inside the
+        // transaction would only repeat the same five statements for no
+        // additional safety.
         let mut deleted_hashes = HashMap::new();
+        let mut deleted_versions = HashMap::new();
+        let mut deleted_invocation_ids = HashMap::new();
         for key @ (space, path) in &mutation_keys {
             let current = get_kv_entity(&tx, space, path).await?;
             if let Some(precondition) = options.preconditions.get(key) {
@@ -1747,6 +1896,29 @@ where
             }
             if let Some(entry) = current {
                 deleted_hashes.insert(key.clone(), entry.value);
+                deleted_versions.insert(key.clone(), (entry.seq, entry.epoch, entry.epoch_seq));
+                deleted_invocation_ids.insert(key.clone(), entry.invocation);
+            }
+        }
+        // TC-411: delete reuses the current-state row already loaded just
+        // above -- both its version tuple and its owning `invocation` id --
+        // instead of letting `invocation::save` re-derive either with a
+        // second `kv_write` lookup.
+        for op in ops.iter_mut() {
+            if let Operation::KvDelete {
+                space,
+                key,
+                version,
+                deleted_invocation_id,
+            } = op
+            {
+                let map_key = (space.clone(), key.clone());
+                if let Some(v) = deleted_versions.get(&map_key) {
+                    *version = Some(*v);
+                }
+                if let Some(inv) = deleted_invocation_ids.get(&map_key) {
+                    *deleted_invocation_id = Some(*inv);
+                }
             }
         }
         let caps = invocation.0.capabilities.clone();
@@ -1772,7 +1944,7 @@ where
             InvokeMode::Admitted => Event::AdmittedInvocation(Box::new(invocation), ops),
             InvokeMode::Public => Event::Invocation(Box::new(invocation), ops),
         };
-        let commit = transact(
+        let mut commit = transact(
             &tx,
             &self.storage,
             &self.secrets,
@@ -1788,6 +1960,7 @@ where
                 TxStoreError::Tx(error)
             }
         })?;
+        commit.sql_constrained_statement_candidates = sql_constrained_statement_candidates;
 
         let mut results = Vec::new();
         // perform and record side effects
@@ -1805,23 +1978,13 @@ where
         }) {
             match cap {
                 (space, "kv", "tinycloud.kv/get", path) => {
-                    let data =
-                        get_kv(&tx, &self.storage, space, path)
-                            .await
-                            .map_err(|e| match e {
-                                EitherError::A(e) => TxStoreError::Tx(e.into()),
-                                EitherError::B(e) => TxStoreError::StoreRead(e),
-                            })?;
-                    if let (Some(limit), Some((_, _, content))) =
-                        (options.max_response_bytes, data.as_ref())
-                    {
-                        if content.len() > limit {
-                            return Err(TxStoreError::KvResponseTooLarge {
-                                size: content.len(),
-                                limit,
-                            });
-                        }
-                    }
+                    let index = preloaded_gets
+                        .iter()
+                        .position(|(loaded_space, loaded_path, _)| {
+                            loaded_space == space && loaded_path == path
+                        })
+                        .expect("preflight loads every requested kv/get");
+                    let (_, _, data) = preloaded_gets.swap_remove(index);
                     results.push(InvocationOutcome::KvRead(data));
                 }
                 (space, "kv", "tinycloud.kv/list", path) => {
@@ -1843,15 +2006,10 @@ where
                     ))
                 }
                 (space, "kv", "tinycloud.kv/put", path) => {
-                    if let Some(stage) = stages.remove(&(space.clone(), path.clone())) {
-                        self.storage
-                            .persist(space, stage)
-                            .await
-                            .map_err(TxStoreError::StoreWrite)?;
-                        let hash = write_hashes
-                            .get(&(space.clone(), path.clone()))
-                            .copied()
-                            .expect("staged KV writes have a content hash");
+                    // TC-411: the blob was already persisted to the object
+                    // store before this transaction was opened (see above);
+                    // this only looks up the already-known content hash.
+                    if let Some(hash) = write_hashes.get(&(space.clone(), path.clone())).copied() {
                         results.push(InvocationOutcome::KvWrite(hash))
                     }
                 }
@@ -1924,6 +2082,7 @@ where
         invocation: Invocation,
         options: KvInvokeOptions,
         mode: InvokeMode,
+        auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
     ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
     where
         B: ImmutableWriteStore<S> + ImmutableReadStore,
@@ -1934,19 +2093,28 @@ where
         // once at the admission boundary; only re-check authorization and
         // signed-time validity here rather than verifying the signature a
         // second time.
+        // TC-411: the caller already loaded the request-scoped snapshot under
+        // the shared chain guards, so pass it through instead of letting
+        // `validate` perform a second closure/graph load.
         match mode {
-            InvokeMode::Admitted => {
-                invocation::authorize_admitted(&self.conn, &invocation.0, OffsetDateTime::now_utc())
-                    .await
-                    .map_err(TxError::<B, K>::from)?
-            }
-            InvokeMode::Public | InvokeMode::Internal => invocation::verify_and_authorize(
+            InvokeMode::Admitted => invocation::authorize_admitted(
                 &self.conn,
                 &invocation.0,
                 OffsetDateTime::now_utc(),
+                auth_graph,
             )
             .await
             .map_err(TxError::<B, K>::from)?,
+            InvokeMode::Public | InvokeMode::Internal => {
+                invocation::verify_and_authorize_with_graph(
+                    &self.conn,
+                    &invocation.0,
+                    OffsetDateTime::now_utc(),
+                    auth_graph,
+                )
+                .await
+                .map_err(TxError::<B, K>::from)?
+            }
         };
 
         let requested_spaces = invocation.0.spaces().cloned().collect::<HashSet<_>>();
@@ -1973,6 +2141,28 @@ where
                         .and_then(|value| serde_json::from_value(value.clone()).ok())
                 })
             });
+        // TC-411: batch the `current_kv` index lookup for every `kv/get`
+        // and `kv/metadata` capability in this invocation into one
+        // statement, independent of item count, instead of one lookup per
+        // capability (see `batch_get_kv_entities`).
+        let index_keys = invocation
+            .0
+            .capabilities
+            .iter()
+            .filter_map(|capability| {
+                let resource = capability.resource.tinycloud_resource()?;
+                if resource.service().as_str() != "kv" {
+                    return None;
+                }
+                let ability =
+                    crate::policy_capability::resolve_alias(capability.ability.as_ref().as_ref());
+                if !matches!(ability, "tinycloud.kv/get" | "tinycloud.kv/metadata") {
+                    return None;
+                }
+                Some((resource.space().clone(), resource.path()?.clone()))
+            })
+            .collect::<Vec<_>>();
+        let kv_entities = batch_get_kv_entities(&self.conn, &index_keys).await?;
         let mut results = Vec::new();
         for cap in invocation.0.capabilities.iter().filter_map(|capability| {
             capability
@@ -1991,12 +2181,16 @@ where
         }) {
             match cap {
                 (space, "kv", "tinycloud.kv/get", path) => {
-                    let data = get_kv(&self.conn, &self.storage, space, path)
-                        .await
-                        .map_err(|error| match error {
-                            EitherError::A(error) => TxStoreError::Tx(error.into()),
-                            EitherError::B(error) => TxStoreError::StoreRead(error),
-                        })?;
+                    let entry = kv_entities.get(&(space.clone(), path.clone()));
+                    let data = match entry {
+                        Some(entry) => self
+                            .storage
+                            .read(space, &entry.value)
+                            .await
+                            .map_err(TxStoreError::StoreRead)?
+                            .map(|content| (entry.metadata.clone(), entry.value, content)),
+                        None => None,
+                    };
                     if let (Some(limit), Some((_, _, content))) =
                         (options.max_response_bytes, data.as_ref())
                     {
@@ -2015,9 +2209,10 @@ where
                     results.push(InvocationOutcome::KvList(list, truncated, None));
                 }
                 (space, "kv", "tinycloud.kv/metadata", path) => {
-                    results.push(InvocationOutcome::KvMetadata(
-                        metadata_with_hash(&self.conn, space, path).await?,
-                    ));
+                    let metadata = kv_entities
+                        .get(&(space.clone(), path.clone()))
+                        .map(|entry| (entry.metadata.clone(), entry.value));
+                    results.push(InvocationOutcome::KvMetadata(metadata));
                 }
                 (space, "capabilities", "tinycloud.capabilities/read", path)
                     if path.as_str() == "all" =>
@@ -2067,15 +2262,52 @@ where
             read_audit_start.elapsed(),
         );
         record_result?;
+        // TC-411: derive the SQL constrained-statement caveat candidates
+        // straight from the already-loaded, already-validated `auth_graph`
+        // snapshot -- an in-memory scan, zero additional statements -- so a
+        // caller (the SQL route) never has to re-walk `parent_delegations`
+        // itself.
+        let sql_constrained_statement_candidates = match auth_graph {
+            Some(graph) => constrained_statement_candidates(&invocation, &options, graph).map_err(
+                |rejection| TxStoreError::Tx(TxError::MalformedSqlCaveat(rejection.as_str())),
+            )?,
+            None => Vec::new(),
+        };
         Ok((
             TransactResult {
                 commits: HashMap::new(),
                 skipped_spaces: Vec::new(),
                 delegation_cids: Vec::new(),
+                sql_constrained_statement_candidates,
             },
             results,
         ))
     }
+}
+
+/// Extract constrained SQL caveats from the request's already-guarded
+/// authorization snapshot. Both read-only and mutation-bearing invocations
+/// use this helper: SQL routing is selected by SQL capabilities, while the
+/// transaction path is selected independently by KV mutations.
+fn constrained_statement_candidates(
+    invocation: &Invocation,
+    options: &KvInvokeOptions,
+    auth_graph: &crate::auth_graph::AuthGraphSnapshot,
+) -> Result<
+    Vec<crate::policy_capability::sql_caveat::SqlConstrainedStatementCaveat>,
+    crate::policy_capability::RejectionCode,
+> {
+    if !options.derive_sql_constrained_statement_caveat {
+        return Ok(Vec::new());
+    }
+    let roots: Vec<Hash> = invocation
+        .0
+        .parents
+        .iter()
+        .copied()
+        .map(Hash::from)
+        .collect();
+    auth_graph.constrained_statement_caveat_candidates(&roots)
 }
 
 fn chain_isolation_level<C: ConnectionTrait>(db: &C) -> Option<sea_orm::IsolationLevel> {
@@ -2134,6 +2366,7 @@ fn already_registered_result(retained_hash: Hash) -> TransactResult {
         commits: HashMap::new(),
         skipped_spaces: Vec::new(),
         delegation_cids: vec![retained_hash],
+        sql_constrained_statement_candidates: Vec::new(),
     }
 }
 
@@ -2389,15 +2622,23 @@ async fn event_spaces<'a, C: ConnectionTrait>(
 ) -> Result<HashMap<SpaceId, Vec<&'a (Hash, Event)>>, DbErr> {
     // get orderings of events listed as revoked by events in the ev list
     let mut spaces = HashMap::<SpaceId, Vec<&'a (Hash, Event)>>::new();
-    let revoked_events = event_order::Entity::find()
-        .filter(
-            event_order::Column::Event.is_in(ev.iter().filter_map(|(_, e)| match e {
-                Event::Revocation(r) => Some(Hash::from(r.0.revoked)),
-                _ => None,
-            })),
-        )
-        .all(db)
-        .await?;
+    let revoked_hashes: Vec<Hash> = ev
+        .iter()
+        .filter_map(|(_, e)| match e {
+            Event::Revocation(r) => Some(Hash::from(r.0.revoked)),
+            _ => None,
+        })
+        .collect();
+    // Skip the round trip entirely when this batch contains no Revocation
+    // event; an empty IN-list would otherwise still hit the DB every call.
+    let revoked_events = if revoked_hashes.is_empty() {
+        Vec::new()
+    } else {
+        event_order::Entity::find()
+            .filter(event_order::Column::Event.is_in(revoked_hashes))
+            .all(db)
+            .await?
+    };
     for e in ev {
         match &e.1 {
             Event::Delegation(d) => {
@@ -2879,6 +3120,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                 .collect(),
             skipped_spaces,
             delegation_cids,
+            sql_constrained_statement_candidates: Vec::new(),
         })
     } else {
         // All spaces were skipped (delegation-only with no existing spaces).
@@ -2922,6 +3164,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             commits: HashMap::new(),
             skipped_spaces,
             delegation_cids,
+            sql_constrained_statement_candidates: Vec::new(),
         })
     }
 }
@@ -3148,6 +3391,56 @@ async fn get_kv_entity<C: ConnectionTrait>(
         start.elapsed(),
     );
     Ok(result)
+}
+
+/// TC-411: batched form of [`get_kv_entity`] -- one `current_kv` index
+/// statement for every requested key, independent of how many keys are
+/// requested, instead of one statement per key. `keys` may repeat and may
+/// span multiple spaces; the `space`/`key` filters are independent `IN`
+/// lists (a superset filter), so callers key the returned map by the exact
+/// `(space, key)` pair to drop any cross-product rows.
+async fn batch_get_kv_entities<C: ConnectionTrait>(
+    db: &C,
+    keys: &[(SpaceId, Path)],
+) -> Result<HashMap<(SpaceId, Path), current_kv::Model>, DbErr> {
+    if keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let start = Instant::now();
+    let spaces = keys
+        .iter()
+        .map(|(space, _)| SpaceIdWrap(space.clone()))
+        .collect::<Vec<_>>();
+    let paths = keys
+        .iter()
+        .map(|(_, path)| crate::types::Path(path.clone()))
+        .collect::<Vec<_>>();
+    let query_result = current_kv::Entity::find()
+        .filter(current_kv::Column::Space.is_in(spaces))
+        .filter(current_kv::Column::Key.is_in(paths))
+        .filter(current_kv::Column::Deleted.eq(false))
+        .all(db)
+        .await;
+    let rows = match query_result {
+        Ok(rows) => rows,
+        Err(error) => {
+            crate::telemetry::observe_stage(
+                crate::telemetry::InvocationStage::KvIndexLookup,
+                crate::telemetry::StageOutcome::Error,
+                start.elapsed(),
+            );
+            return Err(error);
+        }
+    };
+    crate::telemetry::observe_stage(
+        crate::telemetry::InvocationStage::KvIndexLookup,
+        crate::telemetry::StageOutcome::Ok,
+        start.elapsed(),
+    );
+    Ok(rows
+        .into_iter()
+        .map(|row| ((row.space.0.clone(), row.key.0.clone()), row))
+        .collect())
 }
 
 /// Half-open `[lower, upper)` bounds selecting every `ability.resource` that
@@ -4043,7 +4336,7 @@ mod test {
                 .insert(&db.conn)
                 .await
                 .unwrap();
-            invocation::upsert_current_kv(&db.conn, write)
+            invocation::upsert_current_kv_batch(&db.conn, vec![write])
                 .await
                 .unwrap();
         }
@@ -4222,7 +4515,7 @@ mod test {
             .await
             .unwrap()
             .unwrap();
-        invocation::upsert_current_kv(&db.conn, winner)
+        invocation::upsert_current_kv_batch(&db.conn, vec![winner])
             .await
             .unwrap();
 
@@ -7107,5 +7400,75 @@ mod test {
             .await
             .ok();
         exercise.expect("TC-320 PostgreSQL collation resilience");
+    }
+
+    /// TC-411: `batch_get_kv_entities` must issue exactly one `current_kv`
+    /// statement for a batch request, independent of how many keys are in
+    /// it -- proving the one-item and 100-item budgets in
+    /// docs/invoke-query-budget.md instead of the pre-TC-411 one-lookup-per-
+    /// capability loop.
+    #[tokio::test]
+    async fn batch_get_kv_entities_issues_one_statement_regardless_of_item_count() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let mut conn = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
+            .await
+            .unwrap();
+        Migrator::up(&conn, None).await.unwrap();
+        conn.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "PRAGMA foreign_keys = OFF".to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let space = test_space_id("batch-get-count");
+        let mut all_keys = Vec::new();
+        for index in 0..100 {
+            let key: Path = format!("k/{index}").parse().unwrap();
+            let write = crate::models::kv_write::Model {
+                space: SpaceIdWrap(space.clone()),
+                key: crate::types::Path(key.clone()),
+                invocation: crate::hash::hash(format!("inv-{index}").as_bytes()),
+                seq: 0,
+                epoch: crate::hash::hash(format!("epoch-{index}").as_bytes()),
+                epoch_seq: 0,
+                value: crate::hash::hash(format!("value-{index}").as_bytes()),
+                metadata: crate::types::Metadata(Default::default()),
+            };
+            crate::models::kv_write::ActiveModel::from(write.clone())
+                .insert(&conn)
+                .await
+                .unwrap();
+            crate::models::invocation::upsert_current_kv_batch(&conn, vec![write])
+                .await
+                .unwrap();
+            all_keys.push((space.clone(), key));
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let query_counter = Arc::clone(&counter);
+        conn.set_metric_callback(move |_info| {
+            query_counter.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let before = counter.load(Ordering::SeqCst);
+        let one = batch_get_kv_entities(&conn, &all_keys[..1]).await.unwrap();
+        assert_eq!(
+            counter.load(Ordering::SeqCst) - before,
+            1,
+            "one-item batch must issue exactly one statement"
+        );
+        assert_eq!(one.len(), 1);
+
+        let before = counter.load(Ordering::SeqCst);
+        let hundred = batch_get_kv_entities(&conn, &all_keys).await.unwrap();
+        assert_eq!(
+            counter.load(Ordering::SeqCst) - before,
+            1,
+            "100-item batch must issue exactly one statement, not one per item"
+        );
+        assert_eq!(hundred.len(), 100);
     }
 }
