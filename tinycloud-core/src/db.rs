@@ -495,7 +495,7 @@ where
         invocation: &AdmittedInvocation,
         now: OffsetDateTime,
     ) -> Result<(), crate::models::invocation::Error> {
-        invocation::authorize_admitted(&self.conn, &invocation.invocation().0, now).await
+        invocation::authorize_admitted(&self.conn, &invocation.invocation().0, now, None).await
     }
 
     /// Load and reparse a delegation from its exact signed Authorization

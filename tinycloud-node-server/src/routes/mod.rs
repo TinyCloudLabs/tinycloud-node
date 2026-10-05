@@ -2081,13 +2081,13 @@ async fn invoke_impl(
                     );
                 }
                 if let TxStoreError::KvSyncResetRequired(reason) = &e {
-                    return Err(kv_sync::kv_sync_reset_required(*reason));
+                    return Err(kv_sync::kv_sync_reset_required(*reason).into());
                 }
                 if let TxStoreError::KvSyncRetentionRefused(error) = &e {
-                    return Err(kv_sync::kv_sync_retention_refused(*error));
+                    return Err(kv_sync::kv_sync_retention_refused(*error).into());
                 }
                 if let TxStoreError::KvTooManyMutations { .. } = &e {
-                    return Err(too_many_mutations());
+                    return Err(too_many_mutations().into());
                 }
                 Err((
                     match &e {
