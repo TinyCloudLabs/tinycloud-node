@@ -73,13 +73,20 @@ and the same optional `account` object. HTTP 402 uses
 HTTP 413 uses `"error":"storage_limit_reached"` and preserves
 `Write exceeds remaining storage. Used: X bytes, Limit: Y bytes`.
 Other 413 errors, such as oversized query responses, are not storage errors.
+Delegated authority is rechecked against the current time after quota fetching
+or upload staging delays a storage rejection. Expired authority receives 403
+without space or account totals.
 
 Reads remain available on full spaces. SQLite writes run in a savepoint:
-page growth rolls the request back, while deletes, drops, no-op schema
-initialization and writes that reuse existing pages succeed. Successful
-guarded writes replace the durable checkpoint rather than accumulating WAL
-charges. DuckDB uses a conservative transactional guard for deletes, drops
-and existing `IF NOT EXISTS` objects; other writes remain refused while full.
+page growth or a failed request rolls back all its mutations. Caller transaction
+control is forbidden, including extra statements hidden after a PRAGMA.
+Deletes, drops, no-op schema initialization and writes that reuse existing pages
+can succeed. Guarded SQLite and DuckDB writes replace the durable checkpoint
+without accumulating WAL charges, but are refused if the serialized checkpoint
+would exceed the existing artifact's charged size. No-ops against absent
+databases do not create charged artifacts. DuckDB uses a conservative
+transactional guard for deletes, drops and existing `IF NOT EXISTS` objects;
+other writes remain refused while full.
 Deletion need not shrink the physical database immediately. Below the limit,
 the existing database one-write overshoot policy is unchanged.
 

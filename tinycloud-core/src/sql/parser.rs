@@ -1,6 +1,7 @@
 use sqlparser::ast::*;
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 
 use super::caveats::SqlCaveats;
 use super::types::SqlError;
@@ -29,6 +30,35 @@ pub fn validate_sql(
             return Err(SqlError::PermissionDenied(
                 "PRAGMA operations require admin ability".to_string(),
             ));
+        }
+
+        // SQLite accepts PRAGMA values that the AST parser does not support.
+        // Still tokenize the entire input so quoted/comment semicolons cannot
+        // hide another statement from the one-statement request contract.
+        let tokens = Tokenizer::new(&SQLiteDialect {}, sql)
+            .tokenize()
+            .map_err(|e| SqlError::ParseError(e.to_string()))?;
+        let mut terminated = false;
+        for token in tokens {
+            match token {
+                // sqlparser nests block comments, but SQLite ends at the first
+                // */. Fail closed rather than hiding executable SQL in a token.
+                Token::Whitespace(Whitespace::MultiLineComment(comment))
+                    if comment.contains("*/") =>
+                {
+                    return Err(SqlError::InvalidStatement(
+                        "Nested block comments are not supported by SQLite".into(),
+                    ));
+                }
+                Token::Whitespace(_) | Token::EOF => {}
+                Token::SemiColon => terminated = true,
+                _ if terminated => {
+                    return Err(SqlError::InvalidStatement(
+                        "Exactly one SQL statement is required".into(),
+                    ));
+                }
+                _ => {}
+            }
         }
 
         return Ok(ParsedQuery {
@@ -404,6 +434,21 @@ fn unique_names(names: Vec<String>) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::write_hooks::TouchedTables;
+
+    #[test]
+    fn tc626_review_pragma_rejects_hidden_statements() {
+        for sql in [
+            "PRAGMA user_version = 1; RELEASE tinycloud_storage_guard",
+            "PRAGMA table_info('semi;colon'); -- separator;\nCOMMIT",
+            "PRAGMA table_info(\"semi;colon\"); /* separator; */ SELECT 1",
+            "PRAGMA user_version = 1; /* outer /* inner */ COMMIT; -- */",
+        ] {
+            assert!(
+                validate_sql(sql, &None, "tinycloud.sql/admin").is_err(),
+                "PRAGMA must not bypass single-statement validation: {sql}"
+            );
+        }
+    }
 
     #[test]
     fn update_write_targets_only_include_target_table() {
