@@ -35,6 +35,18 @@
       "aliasOf": "tinycloud.kv/del"
     },
     {
+      "urn": "tinycloud.kv/sync",
+      "service": "tinycloud.kv",
+      "status": "active",
+      "notes": "TC-732: read-only, ordered, prefix-scoped KV change feed invoked through /invoke. Discloses key, etag, deleted flag and metadata for entries under the granted prefix; value content still requires tinycloud.kv/get. Must be granted explicitly: no wildcard (`*`) or registry action implies it."
+    },
+    {
+      "urn": "tinycloud.kv/retain",
+      "service": "tinycloud.kv",
+      "status": "active",
+      "notes": "TC-732: never invoked. Presented only via the `x-tinycloud-retention-grant` header on a tinycloud.kv/sync request to attest owner-approved offline retention (`authority.retainUntil`). Must be granted explicitly: no wildcard (`*`) or registry action implies it."
+    },
+    {
       "urn": "tinycloud.sql/read",
       "service": "tinycloud.sql",
       "status": "active"

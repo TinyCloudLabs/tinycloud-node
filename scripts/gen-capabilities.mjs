@@ -2,8 +2,11 @@
 // TC-112 capability registry codegen.
 //
 // Reads capabilities.json (the SSOT) and emits:
-//   * tinycloud-core/src/policy_capability/generated.rs — Rust constants,
-//     accepted-actions lookup, alias resolution, implication expansion.
+//   * tinycloud-core/src/policy_capability/generated.rs and
+//     tinycloud-auth/src/policy_capability/generated.rs — byte-identical Rust
+//     constants, accepted-actions lookup, alias resolution, implication
+//     expansion. The tinycloud-auth copy is the one `ability_matches` uses at
+//     runtime; the tinycloud-core copy backs core's registry drift tests.
 //   * generated/capabilities.ts — TypeScript mirror destined for js-sdk.
 //
 // Run `node scripts/gen-capabilities.mjs` to regenerate, or with `--check` to
@@ -28,7 +31,11 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const REGISTRY_PATH = join(ROOT, "capabilities.json");
-const RUST_OUT = join(ROOT, "tinycloud-core/src/policy_capability/generated.rs");
+// Identical Rust artifact written to every crate that embeds the registry.
+const RUST_OUTS = [
+  join(ROOT, "tinycloud-core/src/policy_capability/generated.rs"),
+  join(ROOT, "tinycloud-auth/src/policy_capability/generated.rs"),
+];
 // The TS mirror is destined for js-sdk; keep it out of the Rust crate's src
 // tree so cargo never sees a stray .ts file.
 const TS_OUT = join(ROOT, "generated/capabilities.ts");
@@ -298,6 +305,7 @@ function rustfmt(src) {
 
 const rust = rustfmt(emitRust());
 const ts = emitTs();
+const artifacts = [...RUST_OUTS.map((path) => [path, rust]), [TS_OUT, ts]];
 
 // --check must not fail merely because the current environment's git sha
 // differs from the one embedded in the committed artifact (every CI run on a
@@ -315,7 +323,7 @@ function normalizeGitSha(s) {
 const check = process.argv.includes("--check");
 if (check) {
   let stale = false;
-  for (const [path, want] of [[RUST_OUT, rust], [TS_OUT, ts]]) {
+  for (const [path, want] of artifacts) {
     let got = "";
     try {
       got = readFileSync(path, "utf8");
@@ -327,14 +335,27 @@ if (check) {
       stale = true;
     }
   }
+  // The Rust copies must also agree with each other byte-for-byte (including
+  // the embedded git sha, which the staleness comparison above normalizes).
+  const rustCopies = RUST_OUTS.map((path) => {
+    try {
+      return readFileSync(path, "utf8");
+    } catch {
+      return "";
+    }
+  });
+  if (rustCopies.some((copy) => copy !== rustCopies[0])) {
+    console.error(`generated Rust copies differ: ${RUST_OUTS.join(" vs ")}`);
+    stale = true;
+  }
   if (stale) {
     console.error("Run `node scripts/gen-capabilities.mjs` and commit the result.");
     process.exit(1);
   }
   console.log("capability artifacts are up to date.");
 } else {
-  writeFileSync(RUST_OUT, rust);
-  writeFileSync(TS_OUT, ts);
-  console.log(`wrote ${RUST_OUT}`);
-  console.log(`wrote ${TS_OUT}`);
+  for (const [path, content] of artifacts) {
+    writeFileSync(path, content);
+    console.log(`wrote ${path}`);
+  }
 }
