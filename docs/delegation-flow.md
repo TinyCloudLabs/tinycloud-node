@@ -57,6 +57,8 @@ Actions follow the `{namespace}.{service}/{action}` format:
 | `tinycloud.kv/list` | List KV entries |
 | `tinycloud.kv/del` | Delete KV entries |
 | `tinycloud.kv/metadata` | Read KV metadata |
+| `tinycloud.kv/sync` | Read the ordered change feed (key, ETag, deleted, metadata) under a KV prefix through `/invoke`; must be the invocation's only capability. Never implied by `*` or default session actions; grant it explicitly (TC-732) |
+| `tinycloud.kv/retain` | Never invoked. A delegation carrying it is named in `x-tinycloud-retention-grant` on a `kv/sync` request so the node attests `authority.retainUntil`; never implied (TC-732) |
 | `tinycloud.capabilities/read` | Read user capabilities |
 | `tinycloud.delegation/create` | Create delegations |
 | `tinycloud.delegation/revoke` | Revoke delegations |
