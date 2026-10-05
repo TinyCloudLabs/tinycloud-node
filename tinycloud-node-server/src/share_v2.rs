@@ -4993,7 +4993,22 @@ mod tests {
         );
         let error_body: Value = serde_json::from_slice(&raw_bytes)
             .expect("the real raw response bytes must be the documented JSON error shape");
-        assert_eq!(error_body["error"]["code"], "policy_registration_invalid");
+        let expected_code = if legacy_v2_creation_open() {
+            "policy_registration_invalid"
+        } else {
+            "legacy_v2_creation_closed"
+        };
+        assert_eq!(error_body["error"]["code"], expected_code);
+    }
+
+    /// Legacy v2 creation closed at `LAST_V2_CREATE_AT`. From then on every
+    /// registration is refused with 410 before its contents are examined.
+    fn legacy_registration_denial(while_open: Status) -> Status {
+        if legacy_v2_creation_open() {
+            while_open
+        } else {
+            Status::Gone
+        }
     }
 
     #[tokio::test]
@@ -5048,7 +5063,7 @@ mod tests {
         policy_byte_flip["policy"]["bytes"] = Value::String(policy_bytes_str);
         assert_eq!(
             dispatch(runtime.clone(), &policy_byte_flip).await,
-            Status::Forbidden,
+            legacy_registration_denial(Status::Forbidden),
             "a one-byte-mutated policy wire field must be denied"
         );
 
@@ -5065,7 +5080,7 @@ mod tests {
         ));
         assert_eq!(
             dispatch(runtime.clone(), &policy_field_mutation).await,
-            Status::Forbidden,
+            legacy_registration_denial(Status::Forbidden),
             "a mutated policy field must be denied even when it re-canonicalizes cleanly"
         );
 
@@ -5077,7 +5092,7 @@ mod tests {
         delegation_byte_flip["enforcementDelegation"]["dagCbor"] = Value::String(dag_cbor_str);
         assert_eq!(
             dispatch(runtime.clone(), &delegation_byte_flip).await,
-            Status::Forbidden,
+            legacy_registration_denial(Status::Forbidden),
             "a one-byte-mutated enforcement delegation dag-cbor must be denied"
         );
 
@@ -5087,7 +5102,7 @@ mod tests {
             Value::String("mutated/path.md".into());
         assert_eq!(
             dispatch(runtime.clone(), &delegation_field_mutation).await,
-            Status::Forbidden,
+            legacy_registration_denial(Status::Forbidden),
             "a mutated enforcement delegation fact must be denied"
         );
 
@@ -5097,7 +5112,7 @@ mod tests {
             Value::String("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned());
         assert_eq!(
             dispatch(runtime.clone(), &core_field_mutation).await,
-            Status::Forbidden,
+            legacy_registration_denial(Status::Forbidden),
             "a contentSourceDigest that no longer matches the signed policy must be denied"
         );
 
@@ -5116,7 +5131,7 @@ mod tests {
         ));
         assert_eq!(
             dispatch(runtime.clone(), &domain_mutation).await,
-            Status::Forbidden,
+            legacy_registration_denial(Status::Forbidden),
             "a mutated policy domain must be denied"
         );
 
@@ -5126,7 +5141,7 @@ mod tests {
             Value::String("did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned());
         assert_eq!(
             dispatch(runtime.clone(), &kid_mutation).await,
-            Status::Forbidden,
+            legacy_registration_denial(Status::Forbidden),
             "an enforcement delegation issuer that no longer matches the policy's share key must be denied"
         );
 
@@ -5144,7 +5159,7 @@ mod tests {
         ));
         assert_eq!(
             dispatch(runtime.clone(), &key_mutation).await,
-            Status::Forbidden,
+            legacy_registration_denial(Status::Forbidden),
             "a mutated policy shareKeyDid must be denied"
         );
 
@@ -5156,13 +5171,13 @@ mod tests {
         signature_mutation["policy"]["proof"] = Value::String(proof_str);
         assert_eq!(
             dispatch(runtime.clone(), &signature_mutation).await,
-            Status::Forbidden,
+            legacy_registration_denial(Status::Forbidden),
             "a one-byte-mutated policy proof signature must be denied"
         );
 
         assert_eq!(
             baseline,
-            Status::Forbidden,
+            legacy_registration_denial(Status::Forbidden),
             "the unmutated corpus baseline must itself be a deterministic denial (its identity fields do not \
              describe this test node's own composed identity), establishing the control for every mutation above"
         );
