@@ -39,6 +39,9 @@ enum DbMessage {
     Wal {
         response_tx: oneshot::Sender<Result<Option<Vec<u8>>, SqlError>>,
     },
+    Shutdown {
+        response_tx: oneshot::Sender<()>,
+    },
 }
 
 /// Whether a write may grow the database file.
@@ -62,6 +65,18 @@ pub struct DatabaseHandle {
 }
 
 impl DatabaseHandle {
+    /// Close the connection before acknowledging that its local files can be removed.
+    pub(crate) async fn shutdown(&self) -> Result<(), SqlError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send(DbMessage::Shutdown { response_tx })
+            .await
+            .map_err(|_| SqlError::Internal("Database actor not available".into()))?;
+        response_rx
+            .await
+            .map_err(|_| SqlError::Internal("Database actor dropped shutdown response".into()))
+    }
+
     pub(crate) async fn publication(
         &self,
         command: serde_json::Value,
@@ -159,16 +174,17 @@ pub fn spawn_actor(
         };
         let mut conn = storage::open_connection(&mode).expect("Failed to open database");
 
-        loop {
+        let shutdown_response = loop {
             // Block on receiving with timeout
             let msg =
                 match rt.block_on(async { tokio::time::timeout(IDLE_TIMEOUT, rx.recv()).await }) {
                     Ok(Some(msg)) => msg,
-                    Ok(None) => break, // Channel closed
-                    Err(_) => break,   // Idle timeout
+                    Ok(None) => break None, // Channel closed
+                    Err(_) => break None,   // Idle timeout
                 };
 
             match msg {
+                DbMessage::Shutdown { response_tx } => break Some(response_tx),
                 DbMessage::Publication {
                     command,
                     response_tx,
@@ -235,7 +251,11 @@ pub fn spawn_actor(
                     let _ = response_tx.send(result);
                 }
             }
-        }
+        };
+
+        // SQLite can checkpoint its WAL on close. Finish that before removing
+        // the registry entry or allowing a service to replace the local files.
+        drop(conn);
 
         // Deregister only OUR OWN entry. A replacement actor may already have
         // been hydrated and registered for this key (the dead-actor respawn in
@@ -246,6 +266,9 @@ pub fn spawn_actor(
             handle.id == id
         });
         tracing::debug!(space=%space_id, db=%db_name, "Database actor shutting down");
+        if let Some(response_tx) = shutdown_response {
+            let _ = response_tx.send(());
+        }
     });
 
     DatabaseHandle { id, tx }
@@ -320,8 +343,8 @@ const GUARD_UNDO: &str = "ROLLBACK TO tinycloud_storage_guard; RELEASE tinycloud
 
 /// Run `request` inside a savepoint and keep its effects only if the
 /// database did not grow (`PRAGMA page_count` reflects uncommitted pages on
-/// this connection). A failed request that did not grow is released like an
-/// unguarded one, so partial-batch semantics stay identical.
+/// this connection). Every failed guarded request is rolled back, including
+/// schema entries and batch statements that ran before a later rejection.
 fn handle_message_without_growth(
     conn: &rusqlite::Connection,
     request: &SqlRequest,
@@ -335,14 +358,14 @@ fn handle_message_without_growth(
     // An early error return can leave the request's authorizer installed.
     conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
     // ROLLBACK conflict handling can already have undone the transaction.
-    // Do not replace the request's error with "no such savepoint".
     if result.is_err() && conn.is_autocommit() {
         return result;
     }
     let grew = page_count(conn).map(|after| after > before);
     let end = match grew {
-        Ok(false) => GUARD_KEEP,
-        Ok(true) | Err(_) => GUARD_UNDO,
+        Ok(false) if result.is_ok() => GUARD_KEEP,
+        // Undo earlier statements on any error, even without page growth.
+        _ => GUARD_UNDO,
     };
     if let Err(error) = conn.execute_batch(end) {
         // RELEASE is also the commit for the outermost savepoint. Deferred
@@ -655,6 +678,172 @@ fn execute_statement(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tc626_review_release_escape_cannot_survive_checkpoint() {
+        for memory_threshold in [u64::MAX, 0] {
+            let dir = tempfile::tempdir().unwrap();
+            let actor = spawn_actor(
+                "space".into(),
+                "guard".into(),
+                dir.path().to_str().unwrap().into(),
+                memory_threshold,
+                Arc::new(DashMap::new()),
+            );
+            actor
+                .execute(
+                    SqlRequest::Execute {
+                        schema: None,
+                        sql: "CREATE TABLE data (value TEXT)".into(),
+                        params: vec![],
+                    },
+                    None,
+                    "tinycloud.sql/admin".into(),
+                    GrowthPolicy::Allow,
+                )
+                .await
+                .unwrap();
+            actor
+                .execute(
+                    SqlRequest::Execute {
+                        schema: Some(vec![
+                            "PRAGMA user_version = 1; RELEASE tinycloud_storage_guard".into(),
+                        ]),
+                        sql: "INSERT INTO data VALUES (hex(zeroblob(65536)))".into(),
+                        params: vec![],
+                    },
+                    None,
+                    "tinycloud.sql/admin".into(),
+                    GrowthPolicy::Forbid,
+                )
+                .await
+                .expect_err("the caller must not release the storage guard");
+
+            let result = actor
+                .execute(
+                    SqlRequest::Query {
+                        sql: "SELECT count(*) FROM data".into(),
+                        params: vec![],
+                        max_rows: None,
+                        max_bytes: None,
+                    },
+                    None,
+                    "tinycloud.sql/read".into(),
+                    GrowthPolicy::Allow,
+                )
+                .await
+                .unwrap();
+            let SqlResponse::Query(response) = result.response else {
+                panic!("expected query response");
+            };
+            assert_eq!(response.rows, vec![vec![SqlValue::Integer(0)]]);
+
+            let checkpoint = actor.checkpoint().await.unwrap();
+            let restored_path = dir.path().join("restored.db");
+            std::fs::write(&restored_path, checkpoint).unwrap();
+            let restored = rusqlite::Connection::open(restored_path).unwrap();
+            let count: i64 = restored
+                .query_row("SELECT count(*) FROM data", [], |row| row.get(0))
+                .unwrap();
+            let version: i64 = restored
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                count, 0,
+                "a later checkpoint must not persist rejected data"
+            );
+            assert_eq!(version, 0, "the rejected schema entry must also be undone");
+        }
+    }
+
+    #[test]
+    fn tc626_review_transaction_controls_undo_earlier_schema_entries() {
+        for control in [
+            "RELEASE tinycloud_storage_guard",
+            "RELEASE SAVEPOINT tinycloud_storage_guard",
+            "ROLLBACK",
+            "ROLLBACK TO tinycloud_storage_guard",
+            "COMMIT",
+            "END",
+            "SAVEPOINT caller_savepoint",
+            "BEGIN",
+        ] {
+            for prefix in ["", "PRAGMA user_version = 1; /* boundary; */ "] {
+                let conn = storage::open_connection(&StorageMode::InMemory).unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE data (value TEXT); INSERT INTO data VALUES ('before')",
+                )
+                .unwrap();
+                let sql = format!("{prefix}{control}");
+                let result = handle_message_without_growth(
+                    &conn,
+                    &SqlRequest::Execute {
+                        schema: Some(vec![
+                            "UPDATE data SET value = 'rejected'".into(),
+                            sql.clone(),
+                        ]),
+                        sql: "UPDATE data SET value = 'escaped'".into(),
+                        params: vec![],
+                    },
+                    &None,
+                    "tinycloud.sql/admin",
+                );
+                assert!(result.is_err(), "transaction control was accepted: {sql}");
+                let value: String = conn
+                    .query_row("SELECT value FROM data", [], |row| row.get(0))
+                    .unwrap();
+                let version: i64 = conn
+                    .query_row("PRAGMA user_version", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(value, "before", "earlier schema entry survived {sql}");
+                assert_eq!(version, 0, "PRAGMA mutation survived {sql}");
+                assert!(
+                    conn.is_autocommit(),
+                    "request left a transaction open: {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tc626_review_single_pragma_preserves_quoted_semicolons_and_comments() {
+        let conn = storage::open_connection(&StorageMode::InMemory).unwrap();
+        conn.execute_batch("CREATE TABLE \"quoted;name\" (value TEXT)")
+            .unwrap();
+        let result = handle_message_without_growth(
+            &conn,
+            &SqlRequest::Query {
+                sql: "-- leading ;\nPRAGMA table_info('quoted;name'); /* trailing ; */".into(),
+                params: vec![],
+                max_rows: None,
+                max_bytes: None,
+            },
+            &None,
+            "tinycloud.sql/admin",
+        )
+        .unwrap();
+        let SqlResponse::Query(response) = result.response else {
+            panic!("expected query response");
+        };
+        assert_eq!(response.rows[0][1], SqlValue::Text("value".into()));
+
+        handle_message_without_growth(
+            &conn,
+            &SqlRequest::Execute {
+                schema: Some(vec!["PRAGMA user_version = 7; -- trailing ;".into()]),
+                sql: "UPDATE \"quoted;name\" SET value = 'unused'".into(),
+                params: vec![],
+            },
+            &None,
+            "tinycloud.sql/admin",
+        )
+        .unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 7);
+        assert!(conn.is_autocommit());
+    }
 
     #[test]
     fn growth_guard_rolls_back_failed_deferred_commit() {

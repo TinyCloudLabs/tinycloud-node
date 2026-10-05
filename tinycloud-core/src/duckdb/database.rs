@@ -31,6 +31,9 @@ enum DbMessage {
     Wal {
         response_tx: oneshot::Sender<Result<Option<Vec<u8>>, DuckDbError>>,
     },
+    Shutdown {
+        response_tx: oneshot::Sender<()>,
+    },
 }
 
 #[derive(Clone)]
@@ -90,6 +93,18 @@ impl DatabaseHandle {
             .await
             .map_err(|_| DuckDbError::Internal("Database actor dropped response".to_string()))?
     }
+
+    /// Stop the actor and close its database before the cache is discarded.
+    pub(crate) async fn shutdown(&self) -> Result<(), DuckDbError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send(DbMessage::Shutdown { response_tx })
+            .await
+            .map_err(|_| DuckDbError::Internal("Database actor not available".to_string()))?;
+        response_rx.await.map_err(|_| {
+            DuckDbError::Internal("Database actor dropped shutdown response".to_string())
+        })
+    }
 }
 
 pub fn spawn_actor(
@@ -136,6 +151,9 @@ pub fn spawn_actor(
                             let _ = response_tx
                                 .send(Err(DuckDbError::Internal(format!("Failed to open: {}", e))));
                         }
+                        DbMessage::Shutdown { response_tx } => {
+                            let _ = response_tx.send(());
+                        }
                     }
                 }
                 databases.remove_if(&(space_id, db_name), |_, handle| handle.id == id);
@@ -143,6 +161,7 @@ pub fn spawn_actor(
             }
         };
 
+        let mut shutdown = None;
         loop {
             // Block on receiving with timeout
             let msg =
@@ -205,8 +224,16 @@ pub fn spawn_actor(
                     let result = handle_wal(&mode, &file_path);
                     let _ = response_tx.send(result);
                 }
+                DbMessage::Shutdown { response_tx } => {
+                    shutdown = Some(response_tx);
+                    break;
+                }
             }
         }
+
+        // Closing the connection can flush the database file. Complete that
+        // before allowing a replacement actor or acknowledging cache disposal.
+        drop(conn);
 
         // Deregister only OUR OWN entry. A replacement actor may already have
         // been hydrated and registered for this key, and evicting it would send
@@ -216,6 +243,9 @@ pub fn spawn_actor(
             handle.id == id
         });
         tracing::debug!(space=%space_id, db=%db_name, "Database actor shutting down");
+        if let Some(response_tx) = shutdown {
+            let _ = response_tx.send(());
+        }
     });
 
     DatabaseHandle { id, tx }
