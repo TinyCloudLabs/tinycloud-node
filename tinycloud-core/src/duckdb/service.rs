@@ -161,7 +161,14 @@ impl DuckDbService {
 
         let result = handle
             .execute(request, caveats, ability, arrow_format, without_growth)
-            .await?;
+            .await;
+        if without_growth
+            && result.is_err()
+            && self.expectation(&key) == ArtifactExpectation::Absent
+        {
+            self.discard_local_state(&key).await?;
+        }
+        let result = result?;
 
         if !result.write_targets.is_empty() {
             if without_growth && self.expectation(&key) == ArtifactExpectation::Absent {
@@ -175,9 +182,7 @@ impl DuckDbService {
             // Persist guarded writes as checkpoints, never as a larger charged
             // checkpoint+WAL artifact.
             let persisted = if without_growth {
-                self.checkpoint(space, db_name, &handle, true)
-                    .await
-                    .map(|_| ())
+                self.checkpoint(space, db_name, &handle, true).await
             } else {
                 self.persist_write(space, db_name, &handle).await
             };
@@ -190,6 +195,7 @@ impl DuckDbService {
         Ok(result)
     }
 
+    /// Export only durable data, without changing its artifact or live WAL base.
     pub async fn export(&self, space: &SpaceId, db_name: &str) -> Result<Vec<u8>, DuckDbError> {
         validate_db_name(db_name)?;
 
@@ -197,22 +203,46 @@ impl DuckDbService {
         let operation_lock = Self::database_lock(&self.operation_locks, &key).await;
         let _operation = operation_lock.lock().await;
 
-        // If there's a live actor, route through it (handles both in-memory and file-backed)
-        if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
-            return self.checkpoint(space, db_name, &handle, false).await;
-        }
-
-        if self
+        let artifact = self
             .artifact_repository
-            .load("duckdb", &space.to_string(), db_name)
+            .load("duckdb", &key.0, db_name)
             .await
             .map_err(artifact_error_to_duckdb)?
-            .is_none()
-        {
-            return Err(DuckDbError::DatabaseNotFound);
-        }
-        let handle = self.handle(space, db_name).await?;
-        self.checkpoint(space, db_name, &handle, false).await
+            .ok_or(DuckDbError::DatabaseNotFound)?;
+        validate_payload(
+            space,
+            db_name,
+            "checkpoint",
+            &artifact.payload,
+            is_duckdb_file,
+        )?;
+        let Some(delta) = artifact.delta_payload else {
+            return Ok(artifact.payload);
+        };
+        validate_payload(space, db_name, "wal", &delta, |payload| {
+            !is_duckdb_file(payload)
+        })?;
+
+        // Checkpoint a disposable copy, never the live actor. Checkpointing
+        // the actor here would reset its WAL base without persisting that base,
+        // making a later incremental save incompatible with the durable file.
+        let max_memory = self.max_memory_per_connection.clone();
+        tokio::task::spawn_blocking(move || {
+            let temp = tempfile::tempdir().map_err(|e| DuckDbError::Internal(e.to_string()))?;
+            let path = temp.path().join("export.duckdb");
+            std::fs::write(&path, artifact.payload)
+                .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+            std::fs::write(duckdb_wal_path(&path), delta)
+                .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+            let conn =
+                storage::open_connection(&storage::StorageMode::File(path.clone()), &max_memory)?;
+            conn.execute_batch("CHECKPOINT")
+                .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+            drop(conn);
+            std::fs::read(path).map_err(|e| DuckDbError::Internal(e.to_string()))
+        })
+        .await
+        .map_err(|e| DuckDbError::Internal(e.to_string()))?
     }
 
     pub async fn import_db(
@@ -516,9 +546,7 @@ impl DuckDbService {
             }
         }
 
-        self.checkpoint(space, db_name, handle, false)
-            .await
-            .map(|_| ())
+        self.checkpoint(space, db_name, handle, false).await
     }
 
     async fn checkpoint(
@@ -527,7 +555,7 @@ impl DuckDbService {
         db_name: &str,
         handle: &DatabaseHandle,
         without_growth: bool,
-    ) -> Result<Vec<u8>, DuckDbError> {
+    ) -> Result<(), DuckDbError> {
         let key = (space.to_string(), db_name.to_string());
         let expected = self.expectation(&key);
         let payload = handle.export().await?;
@@ -545,13 +573,7 @@ impl DuckDbService {
         }
         let saved = self
             .artifact_repository
-            .save(
-                "duckdb",
-                &space.to_string(),
-                db_name,
-                payload.clone(),
-                expected,
-            )
+            .save("duckdb", &space.to_string(), db_name, payload, expected)
             .await
             .map_err(artifact_error_to_duckdb)?;
         self.lineage.insert(
@@ -571,7 +593,7 @@ impl DuckDbService {
             revision = saved.revision,
             "Persisted database checkpoint"
         );
-        Ok(payload)
+        Ok(())
     }
 }
 
@@ -715,6 +737,117 @@ mod tests {
             "128MB".to_string(),
             repo,
         )
+    }
+
+    #[tokio::test]
+    async fn tc626_export_after_rejected_creation_stays_absent() {
+        for memory_threshold in [u64::MAX, 0] {
+            let sizes = SqlSizes::new();
+            let repo = Arc::new(SizeTrackingArtifactRepository::new(
+                artifact_repository().await,
+                sizes.clone(),
+            ));
+            let cache = TempDir::new().unwrap();
+            let space = test_space_id("duckdb-rejected-export");
+            let service = DuckDbService::new(
+                cache.path().to_string_lossy().into_owned(),
+                memory_threshold,
+                300,
+                "128MB".into(),
+                repo.clone(),
+            );
+            for (name, sql, grows) in [
+                ("first", "CREATE TABLE data (id INTEGER)", true),
+                ("invalid", "DELETE FROM missing", false),
+                ("second", "CREATE TABLE data (id INTEGER)", true),
+            ] {
+                let retired = service.handle(&space, name).await.unwrap();
+                let rejected = service
+                    .execute_without_growth(
+                        &space,
+                        name,
+                        DuckDbRequest::Execute {
+                            schema: None,
+                            sql: sql.into(),
+                            params: vec![],
+                        },
+                        None,
+                        "tinycloud.duckdb/write".into(),
+                        false,
+                    )
+                    .await;
+                if grows {
+                    assert!(matches!(rejected, Err(DuckDbError::StorageWouldGrow)));
+                } else {
+                    assert!(matches!(rejected, Err(DuckDbError::DuckDb(_))));
+                }
+                let exported = service.export(&space, name).await;
+                assert_eq!(sizes.space_total(&space).await, 0);
+                assert!(matches!(exported, Err(DuckDbError::DatabaseNotFound)));
+                assert!(repo
+                    .load("duckdb", &space.to_string(), name)
+                    .await
+                    .unwrap()
+                    .is_none());
+                // Cleanup must close the rejected actor, not merely hide it
+                // behind the export existence check.
+                assert!(matches!(
+                    retired
+                        .execute(
+                            DuckDbRequest::Query {
+                                sql: "SELECT 1".into(),
+                                params: vec![],
+                            },
+                            None,
+                            "tinycloud.duckdb/read".into(),
+                            false,
+                            false,
+                        )
+                        .await,
+                    Err(DuckDbError::Internal(_))
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tc626_export_of_read_only_absent_actor_stays_absent() {
+        let sizes = SqlSizes::new();
+        let repo = Arc::new(SizeTrackingArtifactRepository::new(
+            artifact_repository().await,
+            sizes.clone(),
+        ));
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("duckdb-read-export");
+        let service = DuckDbService::new(
+            cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            300,
+            "128MB".into(),
+            repo.clone(),
+        );
+        service
+            .execute(
+                &space,
+                "absent",
+                DuckDbRequest::Query {
+                    sql: "SELECT 1".into(),
+                    params: vec![],
+                },
+                None,
+                "tinycloud.duckdb/read".into(),
+                false,
+            )
+            .await
+            .unwrap();
+        let exported = service.export(&space, "absent").await;
+        assert_eq!(sizes.space_total(&space).await, 0);
+        assert!(matches!(exported, Err(DuckDbError::DatabaseNotFound)));
+        assert!(repo
+            .load("duckdb", &space.to_string(), "absent")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -1054,9 +1187,30 @@ mod tests {
             "a small write should transfer fewer bytes than the checkpoint"
         );
 
-        // DuckDB export checkpoints the engine, so the exported checkpoint is
-        // durably installed before a subsequent WAL replaces the old delta.
-        service.export(&space, "analytics").await.unwrap();
+        // Export must not rewrite durable state or checkpoint the live actor:
+        // its next WAL must still derive from the existing durable base.
+        let export_cache = TempDir::new().unwrap();
+        let cold = file_service(&export_cache, repo.clone());
+        for exporter in [&service, &cold] {
+            let bytes = exporter.export(&space, "analytics").await.unwrap();
+            let snapshot_dir = TempDir::new().unwrap();
+            let snapshot_path = snapshot_dir.path().join("snapshot.duckdb");
+            std::fs::write(&snapshot_path, bytes).unwrap();
+            let snapshot = duckdb::Connection::open(snapshot_path).unwrap();
+            let names: String = snapshot
+                .query_row("SELECT name FROM events WHERE id = 1", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(names, "one");
+            let after = repo
+                .load("duckdb", &space.to_string(), "analytics")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.revision, artifact.revision);
+            assert_eq!(after.size_bytes, artifact.size_bytes);
+            assert_eq!(after.payload, artifact.payload);
+            assert_eq!(after.delta_payload, artifact.delta_payload);
+        }
         service
             .execute(
                 &space,

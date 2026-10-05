@@ -134,7 +134,18 @@ impl SqlService {
                 handle.execute(request, caveats, ability, growth).await
             }
             other => other,
-        }?;
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if growth == GrowthPolicy::Forbid
+                    && self.expectation(&key) == ArtifactExpectation::Absent
+                {
+                    self.discard_local_state(&key).await?;
+                }
+                return Err(error);
+            }
+        };
 
         if !result.write_targets.is_empty() {
             if growth == GrowthPolicy::Forbid
@@ -142,7 +153,7 @@ impl SqlService {
             {
                 // The actor's guard admitted no new pages. Serializing this
                 // empty database would nevertheless create a charged header.
-                // Evict it too, so a later export cannot materialize the no-op.
+                // Discard the transient actor and its local cache without charging it.
                 self.discard_local_state(&key).await?;
                 return Ok(result);
             }
@@ -167,10 +178,21 @@ impl SqlService {
         lock
     }
 
-
+    /// Export a durable database without persisting changes. A cached actor
+    /// created by a query or rejected write does not establish its existence.
     pub async fn export(&self, space: &SpaceId, db_name: &str) -> Result<Vec<u8>, SqlError> {
         let _operation_guard = self.operation_lock(space, db_name).await.lock_owned().await;
         let key = (space.to_string(), db_name.to_string());
+
+        if self
+            .artifact_repository
+            .load("sql", &space.to_string(), db_name)
+            .await
+            .map_err(artifact_error_to_sql)?
+            .is_none()
+        {
+            return Err(SqlError::DatabaseNotFound);
+        }
 
         // If there's a live actor, route through it (handles both in-memory and file-backed)
         if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
@@ -184,16 +206,6 @@ impl SqlService {
                 }
                 other => return other,
             }
-        }
-
-        if self
-            .artifact_repository
-            .load("sql", &space.to_string(), db_name)
-            .await
-            .map_err(artifact_error_to_sql)?
-            .is_none()
-        {
-            return Err(SqlError::DatabaseNotFound);
         }
         self.handle(space, db_name).await?.export().await
     }
@@ -582,6 +594,125 @@ mod tests {
             .unwrap();
         Migrator::up(&db, None).await.unwrap();
         Arc::new(SeaOrmDatabaseArtifactRepository::new(db))
+    }
+
+    #[tokio::test]
+    async fn tc626_export_guarded_errors_discard_absent_actors() {
+        for memory_threshold in [u64::MAX, 0] {
+            let sizes = SqlSizes::new();
+            let repo = Arc::new(SizeTrackingArtifactRepository::new(
+                artifact_repository().await,
+                sizes.clone(),
+            ));
+            let cache = TempDir::new().unwrap();
+            let space = test_space_id("sql-rejected-export");
+            let service = SqlService::new(
+                cache.path().to_string_lossy().into_owned(),
+                memory_threshold,
+                repo.clone(),
+            );
+            for (name, sql) in [
+                ("quota", "CREATE TABLE refused (id INTEGER)"),
+                ("sql-error", "INSERT INTO missing_table VALUES (1)"),
+            ] {
+                let original = service.handle(&space, name).await.unwrap();
+                let rejected = service
+                    .execute_without_growth(
+                        &space,
+                        name,
+                        SqlRequest::Execute {
+                            schema: None,
+                            sql: sql.into(),
+                            params: vec![],
+                        },
+                        None,
+                        "tinycloud.sql/write".into(),
+                    )
+                    .await;
+                match name {
+                    "quota" => assert!(
+                        matches!(rejected, Err(SqlError::StorageWouldGrow)),
+                        "{rejected:?}"
+                    ),
+                    _ => assert!(matches!(rejected, Err(SqlError::Sqlite(_))), "{rejected:?}"),
+                }
+                // Rejection must close the actor, not merely remove its cache entry.
+                let old_actor = original
+                    .execute(
+                        SqlRequest::Query {
+                            sql: "SELECT 1".into(),
+                            params: vec![],
+                            max_rows: None,
+                            max_bytes: None,
+                        },
+                        None,
+                        "tinycloud.sql/read".into(),
+                        GrowthPolicy::Allow,
+                    )
+                    .await;
+                assert!(
+                    matches!(old_actor, Err(SqlError::Internal(_))),
+                    "{old_actor:?}"
+                );
+                assert!(matches!(
+                    service.export(&space, name).await,
+                    Err(SqlError::DatabaseNotFound)
+                ));
+                assert_eq!(sizes.space_total(&space).await, 0);
+                assert!(repo
+                    .load("sql", &space.to_string(), name)
+                    .await
+                    .unwrap()
+                    .is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tc626_export_query_only_database_is_not_found() {
+        for memory_threshold in [u64::MAX, 0] {
+            let sizes = SqlSizes::new();
+            let repo = Arc::new(SizeTrackingArtifactRepository::new(
+                artifact_repository().await,
+                sizes.clone(),
+            ));
+            let cache = TempDir::new().unwrap();
+            let space = test_space_id("sql-query-export");
+            let service = SqlService::new(
+                cache.path().to_string_lossy().into_owned(),
+                memory_threshold,
+                repo.clone(),
+            );
+            let result = service
+                .execute(
+                    &space,
+                    "main",
+                    SqlRequest::Query {
+                        sql: "SELECT 1".into(),
+                        params: vec![],
+                        max_rows: None,
+                        max_bytes: None,
+                    },
+                    None,
+                    "tinycloud.sql/read".into(),
+                )
+                .await
+                .unwrap();
+            let SqlResponse::Query(query) = result.response else {
+                panic!("query response required")
+            };
+            assert_eq!(query.rows, vec![vec![SqlValue::Integer(1)]]);
+            assert!(matches!(
+                service.export(&space, "main").await,
+                Err(SqlError::DatabaseNotFound)
+            ));
+            assert_eq!(sizes.space_total(&space).await, 0);
+            assert!(repo
+                .load("sql", &space.to_string(), "main")
+                .await
+                .unwrap()
+                .is_none());
+        }
     }
 
     #[tokio::test]
@@ -1287,6 +1418,15 @@ mod tests {
         // User-facing export must not reset the WAL baseline. A later delta
         // still has to contain both acknowledged writes.
         service.export(&space, "main").await.unwrap();
+        let after_export = repo
+            .load("sql", &space.to_string(), "main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_export.revision, artifact.revision);
+        assert_eq!(after_export.payload, artifact.payload);
+        assert_eq!(after_export.delta_payload, artifact.delta_payload);
+        assert_eq!(after_export.size_bytes, artifact.size_bytes);
         service
             .execute(
                 &space,

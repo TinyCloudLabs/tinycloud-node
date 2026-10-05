@@ -90,6 +90,12 @@ other writes remain refused while full.
 Deletion need not shrink the physical database immediately. Below the limit,
 the existing database one-write overshoot policy is unchanged.
 
+Exports do not persist checkpoints or change storage charges. Both engines
+return `DatabaseNotFound` when no durable artifact exists, even if a query
+created a temporary actor. Rejected guarded requests close absent-database
+actors. DuckDB exports replay durable WAL in a disposable copy, leaving the
+live actor's WAL base unchanged for subsequent writes.
+
 Set `TINYCLOUD_QUOTA_URL` to billing's base URL. The node fetches
 `GET /api/quota/<space>` with `Authorization: Bearer <TINYCLOUD_ADMIN_SECRET>`
 when that shared service secret is configured. The same secret protects
