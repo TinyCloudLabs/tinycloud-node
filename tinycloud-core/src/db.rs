@@ -45,7 +45,12 @@ use tinycloud_auth::{
 /// carry (TC-732). Every row an invocation touches shares one event position,
 /// and the `kv/sync` feed never splits an event across pages, so this is what
 /// bounds a feed page to `limit - 1` plus one event's rows.
-pub const KV_MAX_MUTATIONS_PER_INVOCATION: usize = 1000;
+///
+/// HTTP/1's request-header buffer (hyper: 417,792 bytes) already limits an
+/// invocation to roughly 2,400 puts, so every batch that worked before this
+/// cap still does; the cap is what bounds HTTP/2 over TLS, whose header list
+/// may reach 16 MiB.
+pub const KV_MAX_MUTATIONS_PER_INVOCATION: usize = 4096;
 
 pub const HOOK_DELIVERY_STATUS_PENDING: &str = "pending";
 pub const HOOK_DELIVERY_STATUS_RETRYING: &str = "retrying";

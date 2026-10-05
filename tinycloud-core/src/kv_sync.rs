@@ -1449,6 +1449,23 @@ pub(crate) mod tests {
         }
     }
 
+    /// Core refuses an invocation over the mutation cap before any work, so
+    /// every entry point (not just the route) bounds a feed event.
+    #[tokio::test]
+    async fn kv_invocation_over_the_mutation_cap_is_refused() {
+        let db = sqlite_db().await;
+        let owner = Owner::generate();
+        host(&db, &owner).await;
+        let keys = (0..=crate::db::KV_MAX_MUTATIONS_PER_INVOCATION)
+            .map(|index| format!("notes/{index}"))
+            .collect::<Vec<_>>();
+        let ops = keys.iter().map(|key| Op::Del(key)).collect::<Vec<_>>();
+        let error = invoke(&db, &owner, &ops, KvInvokeOptions::default())
+            .await
+            .unwrap_err();
+        assert!(error.contains("at most 4096 mutations"), "{error}");
+    }
+
     fn cursor_state() -> KvSyncState {
         let epoch = crate::hash::hash(b"epoch");
         KvSyncState {

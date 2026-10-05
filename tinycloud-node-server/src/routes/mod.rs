@@ -969,13 +969,7 @@ fn kv_invoke_options_for_capabilities_with_cursor(
         .collect::<Vec<_>>();
 
     if mutation_targets.len() > tinycloud_core::db::KV_MAX_MUTATIONS_PER_INVOCATION {
-        return Err((
-            Status::BadRequest,
-            format!(
-                "a KV invocation may carry at most {} mutations",
-                tinycloud_core::db::KV_MAX_MUTATIONS_PER_INVOCATION
-            ),
-        ));
+        return Err(too_many_mutations());
     }
 
     let kv_get_targets = capabilities
@@ -1083,6 +1077,22 @@ fn kv_invoke_options_for_capabilities_with_cursor(
         list_cursor,
         kv_sync: None,
     })
+}
+
+/// 400 for a KV invocation over `KV_MAX_MUTATIONS_PER_INVOCATION` (TC-732):
+/// `{"error":{"code":"TOO_MANY_MUTATIONS","max":4096}}`, in the same envelope
+/// as the `kv/sync` error bodies.
+fn too_many_mutations() -> (Status, String) {
+    (
+        Status::BadRequest,
+        serde_json::json!({
+            "error": {
+                "code": "TOO_MANY_MUTATIONS",
+                "max": tinycloud_core::db::KV_MAX_MUTATIONS_PER_INVOCATION,
+            }
+        })
+        .to_string(),
+    )
 }
 
 fn is_multipart(headers: &ObjectHeaders) -> bool {
@@ -1958,11 +1968,13 @@ async fn invoke_impl(
                 if let TxStoreError::KvSyncRetentionRefused(error) = &e {
                     return Err(kv_sync::kv_sync_retention_refused(*error));
                 }
+                if let TxStoreError::KvTooManyMutations { .. } = &e {
+                    return Err(too_many_mutations());
+                }
                 Err((
                     match &e {
                         TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
                         TxStoreError::KvSyncInvalidRequest(_) => Status::BadRequest,
-                        TxStoreError::KvTooManyMutations { .. } => Status::BadRequest,
                         TxStoreError::KvPreconditionFailed => Status::PreconditionFailed,
                         TxStoreError::KvResponseTooLarge { .. } => Status::PayloadTooLarge,
                         TxStoreError::KvListCursorOutsidePrefix => Status::BadRequest,
@@ -3671,7 +3683,12 @@ mod tests {
             true,
         )
         .unwrap_err();
+        assert_eq!(max, 4096);
         assert_eq!(error.0, Status::BadRequest);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&error.1).unwrap(),
+            serde_json::json!({"error": {"code": "TOO_MANY_MUTATIONS", "max": 4096}})
+        );
     }
 
     fn sql_read_capability(space: &SpaceId) -> Capability {

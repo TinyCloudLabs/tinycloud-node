@@ -59,9 +59,11 @@ feature in `/info`.
 All keys written or deleted by one invocation (for example a batch put) share
 one position, and a page never splits them: a page holds at least `limit`
 changes when more are available, and at most `limit - 1` plus all the changes
-of its last invocation. One invocation carries at most 1000 KV mutations
-(larger ones are refused with 400), so a page holds at most `limit + 999`
-changes. Within one invocation, changes are ordered by key bytes.
+of its last invocation. One invocation carries at most 4096 KV mutations
+(larger ones are refused with 400
+`{"error":{"code":"TOO_MANY_MUTATIONS","max":4096}}`), so a page holds at
+most `limit + 4095` changes. Within one invocation, changes are ordered by key
+bytes.
 
 ### Bootstrap
 
