@@ -722,7 +722,9 @@ async fn feed_rows<C: ConnectionTrait>(
 /// `current_kv` position happens to survive.
 ///
 /// The page ends on a whole event: when the `limit`-th row's event continues
-/// past it, the rest of that event joins the page (see the module docs).
+/// past it, the rest of that event joins the page (see the module docs). If
+/// every row of that event moves to a newer position between the two reads,
+/// the page can come back empty with `more` set; the next poll progresses.
 pub(crate) async fn kv_sync_page<C: ConnectionTrait>(
     db: &C,
     space: &SpaceId,

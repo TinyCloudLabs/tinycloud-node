@@ -51,19 +51,30 @@ feature in `/info`.
   cursor. `more: false` means the replica is caught up.
 - `cursor` is opaque, sealed by the node, and bound to the space and prefix.
   It is not bound to the caller; authorization is checked on every request.
+  Its length does not depend on any key or on how much the space has
+  changed.
 - An empty poll (`changes: []`) returns the request's cursor **byte for
   byte**. Writes outside the prefix never change it.
+- A page can transiently come back with `changes: []` **and** `more: true`:
+  the event that would have ended the page was overwritten or deleted between
+  the node's reads. It is not an error. Keep paging with the returned cursor;
+  the next request makes progress.
 
 ### Pages and `limit`
 
 All keys written or deleted by one invocation (for example a batch put) share
-one position, and a page never splits them: a page holds at least `limit`
-changes when more are available, and at most `limit - 1` plus all the changes
-of its last invocation. One invocation carries at most 4096 KV mutations
-(larger ones are refused with 400
-`{"error":{"code":"TOO_MANY_MUTATIONS","max":4096}}`), so a page holds at
-most `limit + 4095` changes. Within one invocation, changes are ordered by key
-bytes.
+one position, and a page never splits them: a page holds at most
+`limit - 1` changes plus all the changes of its last invocation, and usually
+at least `limit` when more are available (see the transient empty page
+above). Within one invocation, changes are ordered by key bytes.
+
+Since this release, one invocation carries at most 4096 KV mutations (larger
+ones are refused with 400 `{"error":{"code":"TOO_MANY_MUTATIONS","max":4096}}`),
+so a page of invocations written by this node version holds at most
+`limit + 4095` changes. Invocations written by earlier node versions were
+bounded only by transport limits (HTTP/1 request headers of about 400 KB;
+HTTP/2 over TLS allows header lists of up to 16 MiB), so a page ending on one
+of them can be larger. Clients must accept pages larger than `limit`.
 
 ### Bootstrap
 
