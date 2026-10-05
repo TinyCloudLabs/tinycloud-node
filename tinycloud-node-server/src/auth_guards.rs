@@ -199,14 +199,12 @@ where
                 KvListResponse(list, truncated, next_cursor).respond_to(request)
             }
             InvocationOutcome::KvSync(page) => {
-                let (Some(cursor), Some(node_did)) = (page.cursor.clone(), page.node_did.clone())
-                else {
+                let Some(node_did) = page.node_did.clone() else {
                     return Err(Status::InternalServerError);
                 };
                 Json(
                     crate::routes::kv_sync::kv_sync_response(
                         &page,
-                        cursor,
                         node_did,
                         filter_stored_object_metadata,
                     )

@@ -7,8 +7,20 @@
 //! every deleted key, and `invocation::save` is its only writer. Each row
 //! carries the position `(seq, epoch, epoch_seq)` of the key's last visible
 //! change: a write's own position, or -- since TC-732 -- the position of the
-//! delete that tombstoned it. Ordering rows by `(seq, epoch, epoch_seq, key)`
-//! is therefore a replayable feed of each key's latest state.
+//! delete that tombstoned it. Ordering rows by that position is therefore a
+//! replayable feed of each key's latest state.
+//!
+//! # Pages never split an event
+//!
+//! Every row an invocation touches shares the invocation's position, so a
+//! position names a *group* of rows. A page always ends on a whole group and
+//! the cursor stores only the last group's position, never a key: its size is
+//! constant however long the keys are. A page therefore holds at least
+//! `limit` rows when more are available, and at most `limit - 1` plus the size
+//! of its last group. A group is at most one invocation's KV operations, which
+//! `db::KV_MAX_MUTATIONS_PER_INVOCATION` caps for every write since TC-732;
+//! earlier groups were bounded only by the request size the transport
+//! admitted. Within a page, rows of one group are ordered by key bytes.
 //!
 //! # Why `seq` must be commit-ordered
 //!
@@ -25,11 +37,18 @@ use crate::hash::Hash;
 use crate::models::{current_kv, space};
 use crate::relationships::event_order;
 use crate::types::{Metadata, Resource, SpaceIdWrap};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use chacha20poly1305::{
+    aead::{Aead, KeyInit, Payload},
+    XChaCha20Poly1305, XNonce,
+};
+use rand::{rngs::OsRng, RngCore};
 use sea_orm::{
     entity::prelude::*,
-    sea_query::{Expr, ExprTrait, Order, Query, SimpleExpr},
-    Condition, ConnectionTrait, DbBackend, QueryOrder, QuerySelect, Statement,
+    sea_query::{Expr, Order, Query, SelectStatement},
+    Condition, ConnectionTrait, DbBackend, QueryOrder, QueryResult, QuerySelect, Statement,
 };
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tinycloud_auth::identity::did_principal_matches;
 use tinycloud_auth::resource::{Path, SpaceId};
@@ -110,7 +129,8 @@ pub async fn lock_space_sequences<'a, C: ConnectionTrait>(
     }
 }
 
-/// A position in a space's event order: one `event_order` row.
+/// A position in a space's event order: one `event_order` row, i.e. one
+/// event. Every row a KV invocation touches shares its event's position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KvSyncAnchor {
     pub seq: i64,
@@ -118,41 +138,31 @@ pub struct KvSyncAnchor {
     pub epoch_seq: i64,
 }
 
-/// The feed position just after the change to `key` at `anchor`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KvSyncPosition {
-    pub anchor: KvSyncAnchor,
-    pub key: String,
-}
-
-/// Decoded cursor state. `pos` is the last delivered change (none before the
-/// first change). `floor` is the space's newest event when the client first
-/// bootstrapped: tombstones at or below it predate the client and are skipped.
+/// Decoded cursor state. `pos` is the last event whose changes were all
+/// delivered (none before the first change). `floor` is the space's newest
+/// event when the client first bootstrapped: tombstones at or below it
+/// predate the client and are skipped.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct KvSyncState {
-    pub pos: Option<KvSyncPosition>,
+    pub pos: Option<KvSyncAnchor>,
     pub floor: Option<KvSyncAnchor>,
 }
 
-/// A `tinycloud.kv/sync` request's parameters, decoded by the route.
+/// A `tinycloud.kv/sync` request's parameters, as the route received them.
+/// The cursor stays sealed until the invocation is authorized, so an
+/// unauthorized caller learns nothing about it (401/403, never 410).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvSyncRequest {
-    /// Page size, `1..=KV_SYNC_MAX_LIMIT`.
+    /// Page size, `1..=KV_SYNC_MAX_LIMIT`; see the module docs for how a
+    /// page's last event can extend it.
     pub limit: usize,
-    /// `None` on the first page (no cursor).
-    pub state: Option<KvSyncState>,
+    /// The request's `x-tinycloud-cursor`, verbatim; `None` on the first
+    /// page. The route has only checked that it is well formed.
+    pub cursor: Option<String>,
+    /// The node-local key cursors are sealed under.
+    pub cursor_key: [u8; 32],
     /// CID of a `tinycloud.kv/retain` delegation presented for retention.
     pub retention_grant: Option<Hash>,
-}
-
-impl Default for KvSyncRequest {
-    fn default() -> Self {
-        Self {
-            limit: KV_SYNC_DEFAULT_LIMIT,
-            state: None,
-            retention_grant: None,
-        }
-    }
 }
 
 /// One key's latest state. `value` is `None` for a tombstone.
@@ -170,8 +180,13 @@ impl KvSyncChange {
 
 /// Node-attested authority window for the response. `not_before` is the
 /// latest `nbf` and `expires_at` the earliest `exp` across every delegation
-/// the invocation's proofs rest on; `retain_until` is the earliest `exp` in
-/// the presented retention grant's own proof closure.
+/// the invocation's proofs rest on (`None` when nothing in the closure sets
+/// one, e.g. an owner invoking directly).
+///
+/// `retain_until` is the earliest `exp` in the presented retention grant's own
+/// proof closure. `None` means no retention: either no grant was presented,
+/// or the grant's chain sets no `exp` at all, which is deliberately treated as
+/// granting none rather than unbounded retention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct KvSyncAuthority {
     pub not_before: Option<OffsetDateTime>,
@@ -187,15 +202,173 @@ pub struct KvSyncPage {
     pub changes: Vec<KvSyncChange>,
     /// More changes are available right now.
     pub more: bool,
-    /// State to encode in the next cursor. Equal to the request state when
-    /// `changes` is empty (the route then echoes the request cursor).
-    pub state: KvSyncState,
+    /// The opaque cursor to return: the request's own cursor, byte for byte,
+    /// when `changes` is empty.
+    pub cursor: String,
     pub authority: KvSyncAuthority,
-    /// The opaque cursor to return, filled in by the HTTP layer (which owns
-    /// cursor encryption), like `InvocationOutcome::KvList`'s next cursor.
-    pub cursor: Option<String>,
     /// The node identity `/info` advertises, filled in by the HTTP layer.
     pub node_did: Option<String>,
+}
+
+/// Longest cursor header accepted, in characters. A cursor holds two fixed
+/// size positions, so every cursor the node mints is far shorter.
+pub const KV_SYNC_CURSOR_MAX_LEN: usize = 4096;
+/// Cursor plaintext version. Version 1 carried the last key and is refused.
+const KV_SYNC_CURSOR_VERSION: u8 = 2;
+const CURSOR_NONCE_LEN: usize = 24;
+const CURSOR_AAD_DOMAIN: &[u8] = b"tinycloud.kv/sync\0";
+
+#[derive(Serialize, Deserialize)]
+struct WireAnchor {
+    seq: i64,
+    /// Hex of the epoch's multihash bytes.
+    epoch: String,
+    epoch_seq: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireCursor {
+    v: u8,
+    pos: Option<WireAnchor>,
+    floor: Option<WireAnchor>,
+}
+
+impl From<&KvSyncAnchor> for WireAnchor {
+    fn from(anchor: &KvSyncAnchor) -> Self {
+        Self {
+            seq: anchor.seq,
+            epoch: hex::encode(Vec::<u8>::from(anchor.epoch)),
+            epoch_seq: anchor.epoch_seq,
+        }
+    }
+}
+
+impl WireAnchor {
+    fn decode(self) -> Option<KvSyncAnchor> {
+        Some(KvSyncAnchor {
+            seq: self.seq,
+            epoch: Hash::try_from(hex::decode(self.epoch).ok()?).ok()?,
+            epoch_seq: self.epoch_seq,
+        })
+    }
+}
+
+/// Why a cursor header was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvSyncCursorError {
+    /// Not a cursor at all: empty, oversized, or not base64url. A 400.
+    Malformed,
+    /// Well formed but not minted by this node, for this space and prefix,
+    /// at this cursor version. A 410 `RESET_REQUIRED`.
+    Invalid,
+}
+
+/// Whether `value` has the shape of a cursor. Checking this needs no key and
+/// reveals nothing, so the route rejects a malformed header (400) before
+/// authorization; authenticating it waits until after authorization.
+pub fn kv_sync_cursor_is_well_formed(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= KV_SYNC_CURSOR_MAX_LEN
+        && URL_SAFE_NO_PAD
+            .decode(value)
+            .is_ok_and(|bytes| bytes.len() > CURSOR_NONCE_LEN)
+}
+
+/// `"tinycloud.kv/sync\0" || space || "\0" || prefix`: the cursor's AAD.
+fn cursor_aad(space: &SpaceId, prefix: &Path) -> Vec<u8> {
+    let mut aad = CURSOR_AAD_DOMAIN.to_vec();
+    aad.extend_from_slice(space.to_string().as_bytes());
+    aad.push(0);
+    aad.extend_from_slice(prefix.as_str().as_bytes());
+    aad
+}
+
+fn seal_cursor(
+    key: &[u8; 32],
+    space: &SpaceId,
+    prefix: &Path,
+    plaintext: &[u8],
+) -> Result<String, DbErr> {
+    let cipher = XChaCha20Poly1305::new_from_slice(key)
+        .map_err(|_| DbErr::Custom("kv/sync cursor key".to_string()))?;
+    let mut nonce = [0u8; CURSOR_NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    let aad = cursor_aad(space, prefix);
+    let ciphertext = cipher
+        .encrypt(
+            &XNonce::from(nonce),
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| DbErr::Custom("kv/sync cursor sealing".to_string()))?;
+    let mut bytes = nonce.to_vec();
+    bytes.extend_from_slice(&ciphertext);
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// Seal `state` into an opaque cursor for `space`/`prefix`:
+/// `base64url(nonce[24] || XChaCha20-Poly1305(plaintext))` with plaintext
+/// `{v:2, pos:{seq,epoch,epoch_seq}|null, floor:{seq,epoch,epoch_seq}|null}`.
+/// Its length does not depend on any key.
+pub fn encode_kv_sync_cursor(
+    key: &[u8; 32],
+    space: &SpaceId,
+    prefix: &Path,
+    state: &KvSyncState,
+) -> Result<String, DbErr> {
+    let wire = WireCursor {
+        v: KV_SYNC_CURSOR_VERSION,
+        pos: state.pos.as_ref().map(WireAnchor::from),
+        floor: state.floor.as_ref().map(WireAnchor::from),
+    };
+    let plaintext = serde_json::to_vec(&wire)
+        .map_err(|error| DbErr::Custom(format!("kv/sync cursor encoding: {error}")))?;
+    seal_cursor(key, space, prefix, &plaintext)
+}
+
+/// Open a cursor minted for `space`/`prefix` under `key`.
+pub fn decode_kv_sync_cursor(
+    key: &[u8; 32],
+    value: &str,
+    space: &SpaceId,
+    prefix: &Path,
+) -> Result<KvSyncState, KvSyncCursorError> {
+    if !kv_sync_cursor_is_well_formed(value) {
+        return Err(KvSyncCursorError::Malformed);
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| KvSyncCursorError::Malformed)?;
+    let (nonce, ciphertext) = bytes.split_at(CURSOR_NONCE_LEN);
+    let nonce: [u8; CURSOR_NONCE_LEN] =
+        nonce.try_into().map_err(|_| KvSyncCursorError::Malformed)?;
+    let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|_| KvSyncCursorError::Invalid)?;
+    let aad = cursor_aad(space, prefix);
+    let plaintext = cipher
+        .decrypt(
+            &XNonce::from(nonce),
+            Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| KvSyncCursorError::Invalid)?;
+    let wire: WireCursor =
+        serde_json::from_slice(&plaintext).map_err(|_| KvSyncCursorError::Invalid)?;
+    if wire.v != KV_SYNC_CURSOR_VERSION {
+        return Err(KvSyncCursorError::Invalid);
+    }
+    let decode = |anchor: Option<WireAnchor>| {
+        anchor
+            .map(|anchor| anchor.decode().ok_or(KvSyncCursorError::Invalid))
+            .transpose()
+    };
+    Ok(KvSyncState {
+        pos: decode(wire.pos)?,
+        floor: decode(wire.floor)?,
+    })
 }
 
 /// Why a cursor cannot be continued and the client must re-bootstrap.
@@ -384,62 +557,39 @@ async fn anchor_exists<C: ConnectionTrait>(
     .is_some_and(|row| row.seq == anchor.seq))
 }
 
-/// `current_kv.key` in byte order (see `db::byte_ordered`).
-fn key_byte_ordered(backend: DbBackend) -> SimpleExpr {
-    crate::db::byte_ordered(
-        backend,
-        Expr::col((current_kv::Entity, current_kv::Column::Key)),
-    )
-}
-
 fn col(column: current_kv::Column) -> Expr {
     Expr::col((current_kv::Entity, column))
 }
 
-/// The feed query: rows in `prefix` strictly after `pos`, minus tombstones at
-/// or below `floor.seq`, ordered by `(seq, epoch, epoch_seq, key)`. Comparison
-/// and ordering both happen in SQL with the key in one byte-ordered
-/// collation, so a page boundary cannot skip or repeat a row. One more row
-/// than `limit` is fetched to detect `more`.
-pub(crate) fn kv_sync_statement(
+/// `(seq, epoch, epoch_seq)` as one row value.
+fn position_columns() -> Expr {
+    Expr::tuple([
+        col(current_kv::Column::Seq).into(),
+        col(current_kv::Column::Epoch).into(),
+        col(current_kv::Column::EpochSeq).into(),
+    ])
+}
+
+fn position_value(anchor: &KvSyncAnchor) -> Expr {
+    Expr::tuple([
+        Expr::val(anchor.seq).into(),
+        Expr::val(anchor.epoch).into(),
+        Expr::val(anchor.epoch_seq).into(),
+    ])
+}
+
+/// The rows of `space` inside `prefix`, minus tombstones at or below
+/// `floor.seq`, with the feed's columns.
+fn feed_select(
     backend: DbBackend,
     space: &SpaceId,
     prefix: &Path,
-    limit: usize,
-    pos: Option<&KvSyncPosition>,
     floor: Option<&KvSyncAnchor>,
-) -> Statement {
+) -> SelectStatement {
     let mut condition =
         Condition::all().add(col(current_kv::Column::Space).eq(SpaceIdWrap(space.clone())));
     if let Some(prefix) = crate::db::kv_prefix_condition(backend, prefix.as_str()) {
         condition = condition.add(prefix);
-    }
-    if let Some(pos) = pos {
-        let anchor = pos.anchor;
-        let seq_eq = || col(current_kv::Column::Seq).eq(anchor.seq);
-        let epoch_eq = || col(current_kv::Column::Epoch).eq(anchor.epoch);
-        condition = condition.add(
-            Condition::any()
-                .add(col(current_kv::Column::Seq).gt(anchor.seq))
-                .add(
-                    Condition::all()
-                        .add(seq_eq())
-                        .add(col(current_kv::Column::Epoch).gt(anchor.epoch)),
-                )
-                .add(
-                    Condition::all()
-                        .add(seq_eq())
-                        .add(epoch_eq())
-                        .add(col(current_kv::Column::EpochSeq).gt(anchor.epoch_seq)),
-                )
-                .add(
-                    Condition::all()
-                        .add(seq_eq())
-                        .add(epoch_eq())
-                        .add(col(current_kv::Column::EpochSeq).eq(anchor.epoch_seq))
-                        .add(key_byte_ordered(backend).gt(pos.key.as_str())),
-                ),
-        );
     }
     if let Some(floor) = floor {
         condition = condition.add(
@@ -460,16 +610,91 @@ pub(crate) fn kv_sync_statement(
             (current_kv::Entity, current_kv::Column::Deleted),
         ])
         .from(current_kv::Entity)
-        .cond_where(condition)
+        .cond_where(condition);
+    query
+}
+
+/// The feed query: rows in `prefix` at positions strictly after `pos`, in
+/// position order, at most `limit + 1` of them.
+///
+/// `seq >= pos.seq` is redundant with the row comparison but gives every
+/// planner a plain range on the second column of `idx_current_kv_space_order`
+/// to seek on, so a caught-up poll touches only the rows after its cursor.
+/// The order is exactly the index order after `space`, so no sort is needed;
+/// keys are ordered within a group after the read (see `kv_sync_page`).
+pub(crate) fn kv_sync_statement(
+    backend: DbBackend,
+    space: &SpaceId,
+    prefix: &Path,
+    limit: usize,
+    pos: Option<&KvSyncAnchor>,
+    floor: Option<&KvSyncAnchor>,
+) -> Statement {
+    let mut query = feed_select(backend, space, prefix, floor);
+    if let Some(pos) = pos {
+        query
+            .and_where(col(current_kv::Column::Seq).gte(pos.seq))
+            .and_where(position_columns().gt(position_value(pos)));
+    }
+    query
         .order_by((current_kv::Entity, current_kv::Column::Seq), Order::Asc)
         .order_by((current_kv::Entity, current_kv::Column::Epoch), Order::Asc)
         .order_by(
             (current_kv::Entity, current_kv::Column::EpochSeq),
             Order::Asc,
         )
-        .order_by_expr(key_byte_ordered(backend), Order::Asc)
         .limit(limit.saturating_add(1) as u64);
     backend.build(&query)
+}
+
+/// Every row of one event (`group`) inside `prefix`.
+fn kv_sync_group_statement(
+    backend: DbBackend,
+    space: &SpaceId,
+    prefix: &Path,
+    group: &KvSyncAnchor,
+    floor: Option<&KvSyncAnchor>,
+) -> Statement {
+    let mut query = feed_select(backend, space, prefix, floor);
+    query.and_where(position_columns().eq(position_value(group)));
+    backend.build(&query)
+}
+
+struct FeedRow {
+    key: String,
+    anchor: KvSyncAnchor,
+    value: Option<(Hash, Metadata)>,
+}
+
+fn feed_row(row: QueryResult) -> Result<FeedRow, DbErr> {
+    let deleted: bool = row.try_get("", current_kv::Column::Deleted.as_str())?;
+    Ok(FeedRow {
+        key: row.try_get("", current_kv::Column::Key.as_str())?,
+        anchor: KvSyncAnchor {
+            seq: row.try_get("", current_kv::Column::Seq.as_str())?,
+            epoch: row.try_get("", current_kv::Column::Epoch.as_str())?,
+            epoch_seq: row.try_get("", current_kv::Column::EpochSeq.as_str())?,
+        },
+        value: if deleted {
+            None
+        } else {
+            Some((
+                row.try_get("", current_kv::Column::Value.as_str())?,
+                row.try_get("", current_kv::Column::Metadata.as_str())?,
+            ))
+        },
+    })
+}
+
+async fn feed_rows<C: ConnectionTrait>(
+    db: &C,
+    statement: Statement,
+) -> Result<Vec<FeedRow>, DbErr> {
+    db.query_all(statement)
+        .await?
+        .into_iter()
+        .map(feed_row)
+        .collect()
 }
 
 /// Read one page of the feed for `prefix` (non-empty) in `space`.
@@ -479,6 +704,9 @@ pub(crate) fn kv_sync_statement(
 /// name an existing `event_order` row of this space, or the cursor needs a
 /// reset: a restore to before the cursor replaces those rows even when an old
 /// `current_kv` position happens to survive.
+///
+/// The page ends on a whole event: when the `limit`-th row's event continues
+/// past it, the rest of that event joins the page (see the module docs).
 pub(crate) async fn kv_sync_page<C: ConnectionTrait>(
     db: &C,
     space: &SpaceId,
@@ -486,19 +714,14 @@ pub(crate) async fn kv_sync_page<C: ConnectionTrait>(
     limit: usize,
     state: Option<&KvSyncState>,
 ) -> Result<(Vec<KvSyncChange>, bool, KvSyncState), KvSyncError> {
+    let limit = limit.max(1);
     let state = match state {
         None => KvSyncState {
             pos: None,
             floor: newest_event(db, space).await?,
         },
         Some(state) => {
-            for anchor in state
-                .pos
-                .as_ref()
-                .map(|pos| &pos.anchor)
-                .into_iter()
-                .chain(state.floor.as_ref())
-            {
+            for anchor in state.pos.iter().chain(state.floor.iter()) {
                 if !anchor_exists(db, space, anchor).await? {
                     return Err(KvSyncError::ResetRequired(
                         KvSyncResetReason::PositionUnknown,
@@ -508,50 +731,98 @@ pub(crate) async fn kv_sync_page<C: ConnectionTrait>(
             state.clone()
         }
     };
-    let statement = kv_sync_statement(
-        db.get_database_backend(),
-        space,
-        prefix,
-        limit,
-        state.pos.as_ref(),
-        state.floor.as_ref(),
-    );
-    let rows = db.query_all(statement).await?;
-    let more = rows.len() > limit;
-    let mut changes = Vec::with_capacity(rows.len().min(limit));
-    let mut last = None;
-    for row in rows.into_iter().take(limit) {
-        let key: String = row.try_get("", current_kv::Column::Key.as_str())?;
-        let anchor = KvSyncAnchor {
-            seq: row.try_get("", current_kv::Column::Seq.as_str())?,
-            epoch: row.try_get("", current_kv::Column::Epoch.as_str())?,
-            epoch_seq: row.try_get("", current_kv::Column::EpochSeq.as_str())?,
-        };
-        let deleted: bool = row.try_get("", current_kv::Column::Deleted.as_str())?;
-        let value = if deleted {
-            None
+    let backend = db.get_database_backend();
+    let floor = state.floor.as_ref();
+    let mut rows = feed_rows(
+        db,
+        kv_sync_statement(backend, space, prefix, limit, state.pos.as_ref(), floor),
+    )
+    .await?;
+    let more = if rows.len() <= limit {
+        false
+    } else {
+        let last = rows[limit - 1].anchor;
+        if rows[limit].anchor == last {
+            // The page would split `last`: take the whole event instead.
+            rows.retain(|row| row.anchor != last);
+            rows.extend(
+                feed_rows(
+                    db,
+                    kv_sync_group_statement(backend, space, prefix, &last, floor),
+                )
+                .await?,
+            );
+            !feed_rows(
+                db,
+                kv_sync_statement(backend, space, prefix, 1, Some(&last), floor),
+            )
+            .await?
+            .is_empty()
         } else {
-            Some((
-                row.try_get::<Hash>("", current_kv::Column::Value.as_str())?,
-                row.try_get::<Metadata>("", current_kv::Column::Metadata.as_str())?,
-            ))
-        };
-        changes.push(KvSyncChange {
-            key: key
-                .parse()
-                .map_err(|error| DbErr::Custom(format!("invalid persisted KV path: {error}")))?,
-            value,
-        });
-        last = Some(KvSyncPosition { anchor, key });
-    }
-    let next = match last {
-        Some(pos) => KvSyncState {
-            pos: Some(pos),
-            floor: state.floor,
-        },
-        None => state,
+            rows.truncate(limit);
+            true
+        }
     };
+    // Rows arrive in position order; order each event's rows by key bytes.
+    let mut group = 0usize;
+    let mut previous = None;
+    let mut ordered = rows
+        .into_iter()
+        .map(|row| {
+            if previous != Some(row.anchor) {
+                group += 1;
+                previous = Some(row.anchor);
+            }
+            (group, row)
+        })
+        .collect::<Vec<_>>();
+    ordered.sort_by(|(left_group, left), (right_group, right)| {
+        left_group
+            .cmp(right_group)
+            .then_with(|| left.key.as_bytes().cmp(right.key.as_bytes()))
+    });
+    let next = KvSyncState {
+        pos: previous.or(state.pos),
+        floor: state.floor,
+    };
+    let changes = ordered
+        .into_iter()
+        .map(|(_, row)| {
+            Ok(KvSyncChange {
+                key: row.key.parse().map_err(|error| {
+                    DbErr::Custom(format!("invalid persisted KV path: {error}"))
+                })?,
+                value: row.value,
+            })
+        })
+        .collect::<Result<Vec<_>, DbErr>>()?;
     Ok((changes, more, next))
+}
+
+/// Serve one `kv/sync` page for an already-authorized request: open its
+/// cursor, read the page, and mint the next cursor (or echo the request's
+/// own, byte for byte, when nothing changed).
+pub(crate) async fn kv_sync_read<C: ConnectionTrait>(
+    db: &C,
+    space: &SpaceId,
+    prefix: &Path,
+    request: &KvSyncRequest,
+) -> Result<(Vec<KvSyncChange>, bool, String), KvSyncError> {
+    let state = request
+        .cursor
+        .as_deref()
+        .map(|cursor| {
+            decode_kv_sync_cursor(&request.cursor_key, cursor, space, prefix)
+                .map_err(|_| KvSyncError::ResetRequired(KvSyncResetReason::CursorInvalid))
+        })
+        .transpose()?;
+    let (changes, more, next) =
+        kv_sync_page(db, space, prefix, request.limit, state.as_ref()).await?;
+    let cursor = match (&request.cursor, changes.is_empty()) {
+        (Some(cursor), true) => cursor.clone(),
+        _ => encode_kv_sync_cursor(&request.cursor_key, space, prefix, &next)?,
+    };
+    Ok((changes, more, cursor))
 }
 
 #[cfg(test)]
@@ -939,7 +1210,7 @@ pub(crate) mod tests {
             epoch_seq: 0,
         };
         let mut unknown_pos = state.clone();
-        unknown_pos.pos.as_mut().unwrap().anchor = foreign;
+        unknown_pos.pos = Some(foreign);
         let mut unknown_floor = state.clone();
         unknown_floor.floor = Some(foreign);
         let other = Owner::generate();
@@ -977,7 +1248,7 @@ pub(crate) mod tests {
         drain(db.connection(), &owner.space, "notes", 10, &mut state).await;
         let state = state.unwrap();
         let floor = state.floor.unwrap();
-        assert_ne!(Some(floor), state.pos.as_ref().map(|pos| pos.anchor));
+        assert_ne!(Some(floor), state.pos);
 
         db.connection()
             .execute(Statement::from_string(
@@ -1094,22 +1365,207 @@ pub(crate) mod tests {
             .map(|row| row.try_get::<String>("", "detail").unwrap())
             .collect::<Vec<_>>();
         println!("TC-732 SQLite feed plan:\n  {}", plan.join("\n  "));
+        // A range seek on `seq` in the order index, not a scan of the space,
+        // and the index order serves ORDER BY (no temp B-tree).
+        let index = crate::migrations::m20261005_000000_current_kv_sync_order::INDEX_NAME;
         assert!(
-            plan.iter().any(|line| line
-                .contains(crate::migrations::m20261005_000000_current_kv_sync_order::INDEX_NAME)),
+            plan.iter()
+                .any(|line| line.contains(&format!("USING INDEX {index} (space=? AND seq>"))),
             "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|line| line.contains("TEMP B-TREE")),
+            "{plan:?}"
+        );
+    }
+
+    /// A batch invocation with more operations than `limit` is delivered in
+    /// one page, whole; the pages around it neither skip nor repeat a row.
+    #[tokio::test]
+    async fn kv_sync_page_never_splits_an_event() {
+        let db = sqlite_db().await;
+        let owner = Owner::generate();
+        host(&db, &owner).await;
+        run(&db, &owner, &[Op::Put("notes/before", b"0")]).await;
+        let batch = ["notes/e", "notes/a", "notes/d", "notes/b", "notes/c"];
+        run(&db, &owner, &batch.map(|key| Op::Put(key, key.as_bytes()))).await;
+        run(&db, &owner, &[Op::Put("notes/after-1", b"1")]).await;
+        run(&db, &owner, &[Op::Put("notes/after-2", b"2")]).await;
+
+        let prefix: Path = "notes".parse().unwrap();
+        let expected = [
+            "notes/before",
+            "notes/a",
+            "notes/b",
+            "notes/c",
+            "notes/d",
+            "notes/e",
+            "notes/after-1",
+            "notes/after-2",
+        ];
+        for limit in [1, 2, 3, 10] {
+            let mut state = Some(KvSyncState::default());
+            let mut pages = Vec::new();
+            loop {
+                let (changes, more, next) = kv_sync_page(
+                    db.connection(),
+                    &owner.space,
+                    &prefix,
+                    limit,
+                    state.as_ref(),
+                )
+                .await
+                .unwrap();
+                pages.push(
+                    changes
+                        .into_iter()
+                        .map(|change| change.key.to_string())
+                        .collect::<Vec<_>>(),
+                );
+                state = Some(next);
+                if !more {
+                    break;
+                }
+                assert!(pages.len() < 10, "limit {limit}: no end: {pages:?}");
+            }
+            assert_eq!(
+                pages.concat(),
+                expected,
+                "limit {limit}: every row once, in order: {pages:?}"
+            );
+            assert!(
+                pages
+                    .iter()
+                    .any(|page| batch.iter().all(|key| page.iter().any(|k| k == key))),
+                "limit {limit}: the batch is split across pages: {pages:?}"
+            );
+            if limit == 2 {
+                assert_eq!(
+                    pages,
+                    vec![expected[..6].to_vec(), expected[6..].to_vec()],
+                    "the batch joins the page its first row lands on"
+                );
+            }
+        }
+    }
+
+    fn cursor_state() -> KvSyncState {
+        let epoch = crate::hash::hash(b"epoch");
+        KvSyncState {
+            pos: Some(KvSyncAnchor {
+                seq: 7,
+                epoch,
+                epoch_seq: 1,
+            }),
+            floor: Some(KvSyncAnchor {
+                seq: 3,
+                epoch,
+                epoch_seq: 0,
+            }),
+        }
+    }
+
+    /// The cursor round-trips only for the space and prefix it was minted
+    /// for, under the key that minted it; everything else is `Invalid` (410),
+    /// and a header that is not a cursor at all is `Malformed` (400).
+    #[test]
+    fn kv_sync_cursor_is_bound_to_space_prefix_and_key() {
+        let key = [7u8; 32];
+        let space = Owner::generate().space;
+        let prefix: Path = "notes".parse().unwrap();
+        let cursor = encode_kv_sync_cursor(&key, &space, &prefix, &cursor_state()).unwrap();
+        assert_eq!(
+            decode_kv_sync_cursor(&key, &cursor, &space, &prefix),
+            Ok(cursor_state())
+        );
+        let other_prefix: Path = "notes-secret".parse().unwrap();
+        for (label, result) in [
+            (
+                "other prefix",
+                decode_kv_sync_cursor(&key, &cursor, &space, &other_prefix),
+            ),
+            (
+                "other space",
+                decode_kv_sync_cursor(&key, &cursor, &Owner::generate().space, &prefix),
+            ),
+            (
+                "other key",
+                decode_kv_sync_cursor(&[8u8; 32], &cursor, &space, &prefix),
+            ),
+        ] {
+            assert_eq!(result, Err(KvSyncCursorError::Invalid), "{label}");
+        }
+        for malformed in ["", "not base64!", &"A".repeat(KV_SYNC_CURSOR_MAX_LEN + 1)] {
+            assert_eq!(
+                decode_kv_sync_cursor(&key, malformed, &space, &prefix),
+                Err(KvSyncCursorError::Malformed)
+            );
+        }
+    }
+
+    /// Version 1 cursors carried the last key; they are refused with a reset
+    /// rather than misread.
+    #[test]
+    fn kv_sync_cursor_v1_is_refused() {
+        let key = [7u8; 32];
+        let space = Owner::generate().space;
+        let prefix: Path = "notes".parse().unwrap();
+        let epoch = hex::encode(Vec::<u8>::from(crate::hash::hash(b"epoch")));
+        let v1 = serde_json::json!({
+            "v": 1,
+            "pos": {"seq": 7, "epoch": epoch, "epoch_seq": 1, "key": "notes/a"},
+            "floor": null,
+        });
+        let sealed = seal_cursor(&key, &space, &prefix, &serde_json::to_vec(&v1).unwrap()).unwrap();
+        assert_eq!(
+            decode_kv_sync_cursor(&key, &sealed, &space, &prefix),
+            Err(KvSyncCursorError::Invalid)
         );
     }
 
     // ── PostgreSQL (run in CI's PG16 job; `TINYCLOUD_TEST_POSTGRES_URL`) ──
 
+    /// Drops its schema when it goes out of scope, including while a failed
+    /// assertion unwinds. `Drop` cannot await, so the drop runs on its own
+    /// thread and runtime and is joined before the test returns.
+    struct SchemaGuard {
+        url: String,
+        schema: String,
+    }
+
+    impl Drop for SchemaGuard {
+        fn drop(&mut self) {
+            let (url, schema) = (self.url.clone(), self.schema.clone());
+            let dropped = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("schema drop runtime");
+                runtime.block_on(async move {
+                    let admin = Database::connect(ConnectOptions::new(url)).await?;
+                    admin
+                        .execute(Statement::from_string(
+                            DbBackend::Postgres,
+                            format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+                        ))
+                        .await
+                        .map(|_| ())
+                })
+            })
+            .join();
+            if !matches!(dropped, Ok(Ok(()))) {
+                eprintln!("failed to drop isolated TC-732 schema {}", self.schema);
+            }
+        }
+    }
+
     /// An isolated schema with `instances` independent `SpaceDatabase`s over
     /// it, each with its own pool (15 connections, the production size) and
     /// its own in-process locks: separate node processes sharing a database.
+    /// The schema is dropped when the fixture goes out of scope.
     struct PostgresFixture {
-        admin: DatabaseConnection,
-        schema: String,
         dbs: Vec<TestDb>,
+        _schema: SchemaGuard,
     }
 
     impl PostgresFixture {
@@ -1130,6 +1586,10 @@ pub(crate) mod tests {
                 ))
                 .await
                 .expect("create isolated TC-732 schema");
+            let guard = SchemaGuard {
+                url: url.clone(),
+                schema: schema.clone(),
+            };
             let mut dbs = Vec::with_capacity(instances);
             for _ in 0..instances {
                 let mut options = ConnectOptions::new(url.clone());
@@ -1149,30 +1609,16 @@ pub(crate) mod tests {
                     .expect("migrate isolated TC-732 schema"),
                 );
             }
-            Some(Self { admin, schema, dbs })
-        }
-
-        async fn drop(self) {
-            let Self { admin, schema, dbs } = self;
-            drop(dbs);
-            admin
-                .execute(Statement::from_string(
-                    DbBackend::Postgres,
-                    format!("DROP SCHEMA {schema} CASCADE"),
-                ))
-                .await
-                .expect("drop isolated TC-732 schema");
+            Some(Self {
+                dbs,
+                _schema: guard,
+            })
         }
     }
 
-    /// `(seq, epoch bytes, epoch_seq, key bytes)`: the order the feed promises.
-    fn order_key(pos: &KvSyncPosition) -> (i64, Vec<u8>, i64, Vec<u8>) {
-        (
-            pos.anchor.seq,
-            Vec::<u8>::from(pos.anchor.epoch),
-            pos.anchor.epoch_seq,
-            pos.key.as_bytes().to_vec(),
-        )
+    /// `(seq, epoch bytes, epoch_seq)`: the order the feed promises.
+    fn order_key(pos: &KvSyncAnchor) -> (i64, Vec<u8>, i64) {
+        (pos.seq, Vec::<u8>::from(pos.epoch), pos.epoch_seq)
     }
 
     async fn print_postgres_plan(conn: &DatabaseConnection, label: &str, statement: Statement) {
@@ -1210,10 +1656,20 @@ pub(crate) mod tests {
             .await
             .unwrap();
         tx.rollback().await.unwrap();
-        println!(
-            "TC-732 PostgreSQL feed plan ({label}, enable_seqscan=off):\n  {}",
-            lines(forced)
+        let forced = lines(forced);
+        println!("TC-732 PostgreSQL feed plan ({label}, enable_seqscan=off):\n  {forced}");
+        // The poll seeks the order index at the cursor and reads it in order:
+        // a range on `seq` in the index condition, and no sort of the rest.
+        assert!(
+            forced.contains("idx_current_kv_space_order"),
+            "{label}: {forced}"
         );
+        let index_cond = forced
+            .lines()
+            .find(|line| line.trim_start().starts_with("Index Cond:"))
+            .unwrap_or_else(|| panic!("{label}: no Index Cond in {forced}"));
+        assert!(index_cond.contains("seq"), "{label}: {index_cond}");
+        assert!(!forced.contains("Sort"), "{label}: {forced}");
     }
 
     /// 32 concurrent put/delete writers in one space, spread over two
@@ -1250,7 +1706,7 @@ pub(crate) mod tests {
                         let empty = changes.is_empty();
                         if let (Some(change), Some(pos)) = (changes.into_iter().next(), &next.pos) {
                             log.push((
-                                pos.clone(),
+                                *pos,
                                 change.key.to_string(),
                                 change.value.map(|(hash, _)| hash),
                             ));
@@ -1332,7 +1788,7 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(shared, 0, "no seq may be shared across epochs");
 
-            let state = log.last().map(|(pos, _, _)| pos.clone());
+            let state = log.last().map(|(pos, _, _)| *pos);
             print_postgres_plan(
                 fixture.dbs[0].connection(),
                 "C collation, mid-feed cursor",
@@ -1348,7 +1804,7 @@ pub(crate) mod tests {
             .await;
         };
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(120), exercise).await;
-        fixture.drop().await;
+        drop(fixture);
         outcome.expect("concurrent writers and the feed reader finished");
     }
 
@@ -1399,7 +1855,7 @@ pub(crate) mod tests {
                 .unwrap();
         };
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), exercise).await;
-        fixture.drop().await;
+        drop(fixture);
         outcome.expect("cross-space lock exercise finished");
     }
 
@@ -1476,7 +1932,7 @@ pub(crate) mod tests {
             assert_eq!(row.value, replaced[0]);
         };
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(120), exercise).await;
-        fixture.drop().await;
+        drop(fixture);
         outcome.expect("conditional put races finished");
     }
 
@@ -1569,7 +2025,7 @@ pub(crate) mod tests {
             Ok(())
         }
         .await;
-        fixture.drop().await;
+        drop(fixture);
         exercise.expect("TC-732 PostgreSQL collation resilience");
     }
 }

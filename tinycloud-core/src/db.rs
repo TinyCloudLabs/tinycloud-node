@@ -41,6 +41,12 @@ use tinycloud_auth::{
     resource::{Path, SpaceId},
 };
 
+/// Most KV mutations (`kv/put` plus `kv/del` capabilities) one invocation may
+/// carry (TC-732). Every row an invocation touches shares one event position,
+/// and the `kv/sync` feed never splits an event across pages, so this is what
+/// bounds a feed page to `limit - 1` plus one event's rows.
+pub const KV_MAX_MUTATIONS_PER_INVOCATION: usize = 1000;
+
 pub const HOOK_DELIVERY_STATUS_PENDING: &str = "pending";
 pub const HOOK_DELIVERY_STATUS_RETRYING: &str = "retrying";
 pub const HOOK_DELIVERY_STATUS_DELIVERED: &str = "delivered";
@@ -237,6 +243,10 @@ where
     /// A `tinycloud.kv/list` cursor names a key outside the listed prefix.
     #[error("KV list cursor is outside the requested prefix")]
     KvListCursorOutsidePrefix,
+    /// A KV invocation carries more than `KV_MAX_MUTATIONS_PER_INVOCATION`
+    /// mutations (TC-732).
+    #[error("a KV invocation may carry at most {max} mutations, got {count}", max = KV_MAX_MUTATIONS_PER_INVOCATION)]
+    KvTooManyMutations { count: usize },
     /// A `tinycloud.kv/sync` invocation is malformed (TC-732): it must carry
     /// exactly one capability, `tinycloud.kv/sync` on a non-empty KV prefix.
     #[error("invalid kv/sync request: {0}")]
@@ -1742,6 +1752,11 @@ where
                 Some((resource.space().clone(), resource.path()?.clone()))
             })
             .collect::<Vec<_>>();
+        if mutation_keys.len() > KV_MAX_MUTATIONS_PER_INVOCATION {
+            return Err(TxStoreError::KvTooManyMutations {
+                count: mutation_keys.len(),
+            });
+        }
         if mutation_keys.is_empty() {
             return self
                 .invoke_read_only::<S>(invocation, options, mode, sync_target)
@@ -2099,7 +2114,13 @@ where
 
         let sync_outcome = match (sync_target, sync_graph.as_ref()) {
             (Some((space, prefix, resource)), Some(graph)) => {
-                let request = options.kv_sync.clone().unwrap_or_default();
+                let request =
+                    options
+                        .kv_sync
+                        .as_ref()
+                        .ok_or(TxStoreError::KvSyncInvalidRequest(
+                            "missing kv/sync request parameters",
+                        ))?;
                 let parents = invocation
                     .0
                     .parents
@@ -2119,33 +2140,29 @@ where
                     .map_err(TxStoreError::KvSyncRetentionRefused)?,
                     None => None,
                 };
-                let (changes, more, state) = crate::kv_sync::kv_sync_page(
-                    &self.conn,
-                    &space,
-                    &prefix,
-                    request.limit,
-                    request.state.as_ref(),
-                )
-                .await
-                .map_err(|error| match error {
-                    crate::kv_sync::KvSyncError::Db(error) => TxStoreError::from(error),
-                    crate::kv_sync::KvSyncError::ResetRequired(reason) => {
-                        TxStoreError::KvSyncResetRequired(reason)
-                    }
-                })?;
+                // Only now, with the invocation authorized, is the cursor
+                // opened: an unauthorized caller gets 401/403, never 410.
+                let (changes, more, cursor) =
+                    crate::kv_sync::kv_sync_read(&self.conn, &space, &prefix, request)
+                        .await
+                        .map_err(|error| match error {
+                            crate::kv_sync::KvSyncError::Db(error) => TxStoreError::from(error),
+                            crate::kv_sync::KvSyncError::ResetRequired(reason) => {
+                                TxStoreError::KvSyncResetRequired(reason)
+                            }
+                        })?;
                 Some(InvocationOutcome::KvSync(Box::new(
                     crate::kv_sync::KvSyncPage {
                         space,
                         prefix,
                         changes,
                         more,
-                        state,
+                        cursor,
                         authority: crate::kv_sync::KvSyncAuthority {
                             not_before,
                             expires_at,
                             retain_until,
                         },
-                        cursor: None,
                         node_did: None,
                     },
                 )))
@@ -3534,7 +3551,7 @@ fn byte_ordered_resource(backend: DbBackend) -> SimpleExpr {
 }
 
 /// `column`, compared in byte order on `backend` (see `byte_ordered_resource`).
-pub(crate) fn byte_ordered(backend: DbBackend, column: impl Into<SimpleExpr>) -> SimpleExpr {
+fn byte_ordered(backend: DbBackend, column: impl Into<SimpleExpr>) -> SimpleExpr {
     // `$1` / `?` is sea-query's per-backend placeholder for the embedded
     // column expression, not for a bound value.
     match backend {

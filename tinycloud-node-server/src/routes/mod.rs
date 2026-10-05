@@ -835,8 +835,8 @@ fn kv_invoke_options(
     cursor_key: &[u8; 32],
     sync_cursor_key: &[u8; 32],
 ) -> Result<KvInvokeOptions, (Status, String)> {
-    if let Some(target) = kv_sync_target(&invocation.capabilities)? {
-        return kv_sync_invoke_options(&target, headers, sync_cursor_key);
+    if kv_sync_target(&invocation.capabilities)?.is_some() {
+        return kv_sync_invoke_options(headers, sync_cursor_key);
     }
     kv_invoke_options_for_capabilities_with_cursor(
         &invocation.capabilities,
@@ -887,7 +887,6 @@ fn kv_sync_target(
 /// Decode a `kv/sync` request's headers into its options. The ordinary KV
 /// precondition and list headers do not apply to the feed.
 fn kv_sync_invoke_options(
-    (space, prefix): &(SpaceId, Path),
     headers: &mut ObjectHeaders,
     sync_cursor_key: &[u8; 32],
 ) -> Result<KvInvokeOptions, (Status, String)> {
@@ -900,9 +899,7 @@ fn kv_sync_invoke_options(
     let cursor = take_metadata_header(&mut headers.0, "x-tinycloud-cursor");
     let retention_grant = take_metadata_header(&mut headers.0, "x-tinycloud-retention-grant");
     let request = kv_sync::kv_sync_request(
-        sync_cursor_key,
-        space,
-        prefix,
+        *sync_cursor_key,
         limit,
         cursor.as_deref(),
         retention_grant.as_deref(),
@@ -970,6 +967,16 @@ fn kv_invoke_options_for_capabilities_with_cursor(
             }
         })
         .collect::<Vec<_>>();
+
+    if mutation_targets.len() > tinycloud_core::db::KV_MAX_MUTATIONS_PER_INVOCATION {
+        return Err((
+            Status::BadRequest,
+            format!(
+                "a KV invocation may carry at most {} mutations",
+                tinycloud_core::db::KV_MAX_MUTATIONS_PER_INVOCATION
+            ),
+        ));
+    }
 
     let kv_get_targets = capabilities
         .iter()
@@ -1636,10 +1643,6 @@ async fn invoke_impl(
 
         let put_caps = kv_put_capabilities(&admitted.invocation().0);
         let is_multipart_request = is_multipart(&headers);
-        // TC-732: an empty feed poll returns the request cursor byte for
-        // byte, so keep it before option parsing consumes the header.
-        let sync_request_cursor = kv_sync_target(&admitted.invocation().0.capabilities)?
-            .and_then(|_| metadata_header(&headers.0, "x-tinycloud-cursor").map(str::to_owned));
         let kv_options = kv_invoke_options(
             &admitted.invocation().0,
             &mut headers,
@@ -1810,23 +1813,6 @@ async fn invoke_impl(
                 emit_kv_hook_events(hook_runtime, tinycloud, &invocation_info, &tx_result).await;
                 for outcome in &mut outcomes {
                     if let InvocationOutcome::KvSync(page) = outcome {
-                        page.cursor = match (&sync_request_cursor, page.changes.is_empty()) {
-                            (Some(request), true) => Some(request.clone()),
-                            _ => Some(
-                                kv_sync::encode_kv_sync_cursor(
-                                    &tinycloud.kv_sync_cursor_key(),
-                                    &page.space,
-                                    &page.prefix,
-                                    &page.state,
-                                )
-                                .map_err(|_| {
-                                    (
-                                        Status::InternalServerError,
-                                        "kv/sync cursor encoding failed".to_string(),
-                                    )
-                                })?,
-                            ),
-                        };
                         page.node_did = Some(encryption.node_did().to_string());
                     }
                     if let InvocationOutcome::KvList(paths, truncated, next_cursor) = outcome {
@@ -1970,6 +1956,7 @@ async fn invoke_impl(
                     match &e {
                         TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
                         TxStoreError::KvSyncInvalidRequest(_) => Status::BadRequest,
+                        TxStoreError::KvTooManyMutations { .. } => Status::BadRequest,
                         TxStoreError::KvPreconditionFailed => Status::PreconditionFailed,
                         TxStoreError::KvResponseTooLarge { .. } => Status::PayloadTooLarge,
                         TxStoreError::KvListCursorOutsidePrefix => Status::BadRequest,
@@ -3650,6 +3637,35 @@ mod tests {
             "{}",
             error.1
         );
+    }
+
+    /// TC-732: one invocation carries at most
+    /// `KV_MAX_MUTATIONS_PER_INVOCATION` KV mutations; more is a 400 before
+    /// any input is staged.
+    #[tokio::test]
+    async fn kv_invocation_mutation_count_is_capped() {
+        let space = test_space_id("tc732-mutation-cap");
+        let put = |index: usize| {
+            let mut capability = kv_get_capability(&space, &format!("batch/{index}"));
+            capability.ability = Ability::try_from("tinycloud.kv/put".to_string()).unwrap();
+            capability
+        };
+        let max = tinycloud_core::db::KV_MAX_MUTATIONS_PER_INVOCATION;
+        let at_cap = (0..max).map(put).collect::<Vec<_>>();
+        assert!(kv_invoke_options_for_capabilities(
+            &at_cap,
+            &mut ObjectHeaders(Metadata(BTreeMap::new())),
+            true
+        )
+        .is_ok());
+        let over = (0..=max).map(put).collect::<Vec<_>>();
+        let error = kv_invoke_options_for_capabilities(
+            &over,
+            &mut ObjectHeaders(Metadata(BTreeMap::new())),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(error.0, Status::BadRequest);
     }
 
     fn sql_read_capability(space: &SpaceId) -> Capability {
@@ -7801,6 +7817,32 @@ mod tests {
             Ok(())
         }
 
+        /// An owner-root invocation of `caps` (resource URI, action).
+        fn owner_invocation(&self, caps: &[(String, &str)]) -> Result<String> {
+            use tinycloud_auth::ssi::{dids::DIDURLBuf, ucan::Payload};
+            use tinycloud_auth::ucan_capabilities_object::Capabilities;
+            let mut capabilities = Capabilities::new();
+            for (uri, action) in caps {
+                capabilities.with_action(
+                    uri.parse()?,
+                    action.parse::<UcanAbility>()?,
+                    [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+                );
+            }
+            Ok(Payload {
+                issuer: self.owner_vm.parse::<DIDURLBuf>()?,
+                audience: self.space.did().to_string().parse::<DIDBuf>()?,
+                not_before: None,
+                expiration: test_invocation_expiration(),
+                nonce: Some(self.next_nonce()),
+                facts: Some(Vec::<serde_json::Value>::new()),
+                proof: vec![],
+                attenuation: capabilities,
+            }
+            .sign(self.owner.get_algorithm().unwrap_or_default(), &self.owner)?
+            .encode()?)
+        }
+
         /// A device invocation of `caps` (path, action) citing `proof`.
         fn device_invocation(
             &self,
@@ -8043,7 +8085,7 @@ mod tests {
     #[tokio::test]
     async fn kv_sync_reset_required_on_unknown_position() -> Result<()> {
         use rocket::http::Status;
-        use tinycloud_core::kv_sync::{KvSyncAnchor, KvSyncPosition, KvSyncState};
+        use tinycloud_core::kv_sync::{encode_kv_sync_cursor, KvSyncAnchor, KvSyncState};
         let fixture = KvSyncFixture::new().await?;
         let grant = fixture
             .device_grant("reset", &["tinycloud.kv/sync"])
@@ -8053,18 +8095,15 @@ mod tests {
         assert_eq!(first.status, Status::Ok, "{}", first.body);
         let cursor = first.json["cursor"].as_str().unwrap().to_string();
 
-        let unknown = kv_sync::encode_kv_sync_cursor(
+        let unknown = encode_kv_sync_cursor(
             &fixture.sync_cursor_key,
             &fixture.space,
             &"notes/".parse()?,
             &KvSyncState {
-                pos: Some(KvSyncPosition {
-                    anchor: KvSyncAnchor {
-                        seq: 0,
-                        epoch: tinycloud_core::hash::hash(b"restored elsewhere"),
-                        epoch_seq: 0,
-                    },
-                    key: "notes/a".to_string(),
+                pos: Some(KvSyncAnchor {
+                    seq: 0,
+                    epoch: tinycloud_core::hash::hash(b"restored elsewhere"),
+                    epoch_seq: 0,
                 }),
                 floor: None,
             },
@@ -8097,6 +8136,95 @@ mod tests {
             .sync("notes/", grant, &[("x-tinycloud-cursor", "not a cursor!")])
             .await?;
         assert_eq!(reply.status, Status::BadRequest, "{}", reply.body);
+        Ok(())
+    }
+
+    /// A cursor is only authenticated once the invocation is authorized: a
+    /// caller without `kv/sync` gets 401 for a cursor that is not this
+    /// node's, where an authorized caller gets 410.
+    #[tokio::test]
+    async fn kv_sync_cursor_is_opened_only_after_authorization() -> Result<()> {
+        use rocket::http::Status;
+        let fixture = KvSyncFixture::new().await?;
+        let foreign = encode_config([7u8; 64], URL_SAFE_NO_PAD);
+        let cursor = [("x-tinycloud-cursor", foreign.as_str())];
+
+        let unauthorized = fixture
+            .device_grant("cursor-unauthorized", &["tinycloud.kv/get"])
+            .await?;
+        let reply = fixture.sync("notes/", unauthorized, &cursor).await?;
+        assert_eq!(reply.status, Status::Unauthorized, "{}", reply.body);
+
+        let authorized = fixture
+            .device_grant("cursor-authorized", &["tinycloud.kv/sync"])
+            .await?;
+        let reply = fixture.sync("notes/", authorized, &cursor).await?;
+        assert_eq!(reply.status, Status::Gone, "{}", reply.body);
+        assert_eq!(reply.json["error"]["reason"], "cursor-invalid");
+        Ok(())
+    }
+
+    /// The cursor holds no key, so a page ending on a very long key encodes
+    /// like any other: a 3000-character key, and the longest key a put can
+    /// carry over HTTP/1. The node sets no key length limit of its own; the
+    /// bound is hyper 0.14's 417,792-byte request-header buffer, which must
+    /// hold the whole Authorization header naming the key.
+    #[tokio::test]
+    async fn kv_sync_pages_ending_on_long_keys_encode() -> Result<()> {
+        use rocket::http::Status;
+        const HTTP1_HEADER_BUFFER: usize = 8192 + 4096 * 100;
+        let fixture = KvSyncFixture::new().await?;
+        let grant = fixture
+            .device_grant("long-keys", &["tinycloud.kv/sync"])
+            .await?;
+        let first = fixture.sync("notes/", grant, &[]).await?;
+        let mut cursor = first.json["cursor"].as_str().unwrap().to_string();
+
+        // Size the longest key so the request line, other headers and the
+        // Authorization header still fit hyper's buffer.
+        let header_len = |key_len: usize| -> Result<usize> {
+            let key = format!("notes/{}", "k".repeat(key_len));
+            Ok(tc409_root_invocation(
+                &fixture.owner,
+                &fixture.owner_vm,
+                "kv",
+                "tinycloud.kv/put",
+                Some(&key),
+                "urn:uuid:tc732-sizing",
+            )?
+            .0
+            .len())
+        };
+        let budget = HTTP1_HEADER_BUFFER - 4096;
+        let base = header_len(1)?;
+        let longest = (budget - base) * 3 / 4;
+        assert!(header_len(longest)? <= budget);
+
+        for key_len in [3000, longest] {
+            let key = format!("notes/{}", "k".repeat(key_len));
+            fixture.owner_write(&key, Some(b"long")).await?;
+            let reply = fixture
+                .sync("notes/", grant, &[("x-tinycloud-cursor", cursor.as_str())])
+                .await?;
+            assert_eq!(
+                reply.status,
+                Status::Ok,
+                "{key_len}-character key: {}",
+                &reply.body[..reply.body.len().min(200)]
+            );
+            assert_eq!(changes(&reply), vec![put_change(&key, b"long")]);
+            cursor = reply.json["cursor"].as_str().unwrap().to_string();
+            assert!(
+                cursor.len() < 400,
+                "cursor length {} tracks no key",
+                cursor.len()
+            );
+        }
+        let reply = fixture
+            .sync("notes/", grant, &[("x-tinycloud-cursor", cursor.as_str())])
+            .await?;
+        assert_eq!(reply.status, Status::Ok, "{}", reply.body);
+        assert!(changes(&reply).is_empty());
         Ok(())
     }
 
