@@ -19,6 +19,7 @@ pub mod m20260726_000000_owner_share_policy;
 pub mod m20260726_000001_owner_share_policy_proof;
 pub mod m20260726_000002_owner_share_enforcement_bytes;
 pub mod m20260731_000000_policy_v3;
+pub mod m20261005_000000_deactivate_hook_subscriptions;
 
 pub struct Migrator;
 
@@ -46,6 +47,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260726_000001_owner_share_policy_proof::Migration),
             Box::new(m20260726_000002_owner_share_enforcement_bytes::Migration),
             Box::new(m20260731_000000_policy_v3::Migration),
+            Box::new(m20261005_000000_deactivate_hook_subscriptions::Migration),
         ]
     }
 }

@@ -85,6 +85,11 @@ impl WriteEventBus {
     }
 }
 
+/// Node-key derivation context for hook ticket MACs. TC-541 moved it to `v2`
+/// so tickets minted before hooks requests were verified fail MAC
+/// verification once the fix is deployed.
+pub const HOOK_TICKET_KEY_CONTEXT: &[u8] = b"tinycloud/hooks/tickets/v2";
+
 #[derive(Debug, Clone)]
 pub struct HookRuntime {
     bus: WriteEventBus,
