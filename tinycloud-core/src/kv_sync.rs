@@ -218,12 +218,16 @@ const KV_SYNC_CURSOR_VERSION: u8 = 2;
 const CURSOR_NONCE_LEN: usize = 24;
 const CURSOR_AAD_DOMAIN: &[u8] = b"tinycloud.kv/sync\0";
 
+/// One position in the sealed cursor. `seq` and `epoch_seq` are 16 hex
+/// digits (the `i64`'s bits, big-endian) and the epoch is always a 34-byte
+/// multihash, so every cursor of one shape seals to the same length: its
+/// size reveals nothing about how busy the space is.
 #[derive(Serialize, Deserialize)]
 struct WireAnchor {
-    seq: i64,
+    seq: String,
     /// Hex of the epoch's multihash bytes.
     epoch: String,
-    epoch_seq: i64,
+    epoch_seq: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -233,12 +237,23 @@ struct WireCursor {
     floor: Option<WireAnchor>,
 }
 
+fn fixed_width(value: i64) -> String {
+    format!("{:016x}", value as u64)
+}
+
+fn from_fixed_width(value: &str) -> Option<i64> {
+    (value.len() == 16)
+        .then(|| u64::from_str_radix(value, 16).ok())
+        .flatten()
+        .map(|bits| bits as i64)
+}
+
 impl From<&KvSyncAnchor> for WireAnchor {
     fn from(anchor: &KvSyncAnchor) -> Self {
         Self {
-            seq: anchor.seq,
+            seq: fixed_width(anchor.seq),
             epoch: hex::encode(Vec::<u8>::from(anchor.epoch)),
-            epoch_seq: anchor.epoch_seq,
+            epoch_seq: fixed_width(anchor.epoch_seq),
         }
     }
 }
@@ -246,9 +261,9 @@ impl From<&KvSyncAnchor> for WireAnchor {
 impl WireAnchor {
     fn decode(self) -> Option<KvSyncAnchor> {
         Some(KvSyncAnchor {
-            seq: self.seq,
+            seq: from_fixed_width(&self.seq)?,
             epoch: Hash::try_from(hex::decode(self.epoch).ok()?).ok()?,
-            epoch_seq: self.epoch_seq,
+            epoch_seq: from_fixed_width(&self.epoch_seq)?,
         })
     }
 }
@@ -310,8 +325,9 @@ fn seal_cursor(
 
 /// Seal `state` into an opaque cursor for `space`/`prefix`:
 /// `base64url(nonce[24] || XChaCha20-Poly1305(plaintext))` with plaintext
-/// `{v:2, pos:{seq,epoch,epoch_seq}|null, floor:{seq,epoch,epoch_seq}|null}`.
-/// Its length does not depend on any key.
+/// `{v:2, pos:{seq,epoch,epoch_seq}|null, floor:{seq,epoch,epoch_seq}|null}`,
+/// numbers fixed-width (see `WireAnchor`). Its length depends only on which
+/// of `pos` and `floor` are present: not on any key, nor on any position.
 pub fn encode_kv_sync_cursor(
     key: &[u8; 32],
     space: &SpaceId,
@@ -1518,6 +1534,33 @@ pub(crate) mod tests {
                 Err(KvSyncCursorError::Malformed)
             );
         }
+    }
+
+    /// A cursor's length does not leak how far a space's sequence has run.
+    #[test]
+    fn kv_sync_cursor_length_is_independent_of_positions() {
+        let key = [7u8; 32];
+        let space = Owner::generate().space;
+        let prefix: Path = "notes".parse().unwrap();
+        let state = |seq: i64, epoch_seq: i64| KvSyncState {
+            pos: Some(KvSyncAnchor {
+                seq,
+                epoch: crate::hash::hash(b"epoch"),
+                epoch_seq,
+            }),
+            floor: Some(KvSyncAnchor {
+                seq: seq / 2,
+                epoch: crate::hash::hash(b"floor"),
+                epoch_seq: 0,
+            }),
+        };
+        let small = encode_kv_sync_cursor(&key, &space, &prefix, &state(1, 0)).unwrap();
+        let large = encode_kv_sync_cursor(&key, &space, &prefix, &state(i64::MAX, 4095)).unwrap();
+        assert_eq!(small.len(), large.len());
+        assert_eq!(
+            decode_kv_sync_cursor(&key, &large, &space, &prefix),
+            Ok(state(i64::MAX, 4095))
+        );
     }
 
     /// Version 1 cursors carried the last key; they are refused with a reset
