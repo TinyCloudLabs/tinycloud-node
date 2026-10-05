@@ -9,6 +9,7 @@ pub mod encryption_network;
 pub mod events;
 pub mod hash;
 pub mod keys;
+pub mod kv_sync;
 pub mod manifest;
 pub mod migrations;
 pub mod models;

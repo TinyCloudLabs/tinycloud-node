@@ -1063,7 +1063,10 @@ mod tests {
             registry.capabilities.iter().any(|e| e.urn == ability),
             "{ability} must be in the registry"
         );
-        assert!(ability_matches(ability, ability), "{ability} must match itself");
+        assert!(
+            ability_matches(ability, ability),
+            "{ability} must match itself"
+        );
 
         let held_candidates = registry
             .capabilities

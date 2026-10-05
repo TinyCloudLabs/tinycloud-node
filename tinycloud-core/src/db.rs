@@ -49,6 +49,15 @@ pub const HOOK_DELIVERY_STATUS_DEAD_LETTER: &str = "dead_letter";
 type KvObjectKey = (SpaceId, Path);
 type KvObjectLock = tokio::sync::Mutex<()>;
 type KvObjectLockRegistry = Arc<tokio::sync::Mutex<HashMap<KvObjectKey, Weak<KvObjectLock>>>>;
+/// Per-space in-process sequence lock (TC-732). Taken BEFORE `BEGIN` by every
+/// `event_order` sequence producer so same-space waiters queue in memory
+/// instead of each holding a pool connection while blocked on the database
+/// lock that `kv_sync::lock_space_sequences` takes after `BEGIN`.
+type SpaceSequenceLock = tokio::sync::Mutex<()>;
+type SpaceSequenceLockRegistry = Arc<tokio::sync::Mutex<HashMap<SpaceId, Weak<SpaceSequenceLock>>>>;
+/// Guards returned by [`SpaceDatabase::acquire_space_sequence_guards`]; hold
+/// them until the transaction commits or rolls back.
+pub type SpaceSequenceGuards = Vec<tokio::sync::OwnedMutexGuard<()>>;
 
 /// Per-delegation guard protecting revocation ordering (TC-324).
 ///
@@ -110,6 +119,7 @@ pub struct SpaceDatabase<C, B, S> {
     sql_sizes: SqlSizes,
     revocation_chain_locks: ChainLockRegistry,
     kv_object_locks: KvObjectLockRegistry,
+    space_sequence_locks: SpaceSequenceLockRegistry,
     writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
     read_audit: ReadAuditPipeline,
 }
@@ -136,6 +146,9 @@ pub struct KvInvokeOptions {
     pub max_response_bytes: Option<u64>,
     pub list_limit: Option<usize>,
     pub list_cursor: Option<Path>,
+    /// Parameters of a `tinycloud.kv/sync` request (TC-732). `None` reads the
+    /// first page at the default limit.
+    pub kv_sync: Option<crate::kv_sync::KvSyncRequest>,
 }
 
 #[derive(Debug, Clone)]
@@ -219,13 +232,22 @@ where
     MissingInput,
     #[error("KV precondition failed")]
     KvPreconditionFailed,
-    #[error("conditional KV transaction conflicted; retry the request")]
-    KvSerializationConflict,
     #[error("KV response is {size} bytes, exceeding the requested limit of {limit} bytes")]
     KvResponseTooLarge { size: u64, limit: u64 },
     /// A `tinycloud.kv/list` cursor names a key outside the listed prefix.
     #[error("KV list cursor is outside the requested prefix")]
     KvListCursorOutsidePrefix,
+    /// A `tinycloud.kv/sync` invocation is malformed (TC-732): it must carry
+    /// exactly one capability, `tinycloud.kv/sync` on a non-empty KV prefix.
+    #[error("invalid kv/sync request: {0}")]
+    KvSyncInvalidRequest(&'static str),
+    /// The `tinycloud.kv/sync` cursor cannot be continued; the client must
+    /// re-bootstrap from an empty cursor.
+    #[error("kv/sync cursor requires a reset: {}", .0.as_str())]
+    KvSyncResetRequired(crate::kv_sync::KvSyncResetReason),
+    /// The presented `tinycloud.kv/retain` grant is refused.
+    #[error("kv/sync retention grant refused: {}", .0.as_str())]
+    KvSyncRetentionRefused(crate::kv_sync::KvSyncRetentionError),
 }
 
 impl<B, S, K> From<DbErr> for TxStoreError<B, S, K>
@@ -254,6 +276,7 @@ impl<B, K> SpaceDatabase<DatabaseConnection, B, K> {
             sql_sizes: SqlSizes::default(),
             revocation_chain_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             kv_object_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            space_sequence_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             writer_lock,
             read_audit,
         })
@@ -296,6 +319,13 @@ impl<C, B> SpaceDatabase<C, B, StaticSecret> {
     pub fn kv_cursor_key(&self) -> [u8; 32] {
         self.secrets.derive_key(b"tinycloud/kv/list-cursor")
     }
+
+    /// Node-local AEAD key for `tinycloud.kv/sync` cursors (TC-732). Derived
+    /// from the configured node secret under its own context, so it is
+    /// independent of the list-cursor MAC key.
+    pub fn kv_sync_cursor_key(&self) -> [u8; 32] {
+        self.secrets.derive_key(b"tinycloud/kv/sync-cursor/v1")
+    }
 }
 
 impl<C, B, K> SpaceDatabase<C, B, K> {
@@ -303,6 +333,44 @@ impl<C, B, K> SpaceDatabase<C, B, K> {
     /// committed alongside ordinary delegation/revocation writes.
     pub fn connection(&self) -> &C {
         &self.conn
+    }
+
+    /// Acquire the in-process sequence lock of every space in `spaces`, in a
+    /// stable order (TC-732).
+    ///
+    /// Every `event_order` sequence producer takes these before `BEGIN` and
+    /// holds them through commit, then takes the database-side lock with
+    /// [`crate::kv_sync::lock_space_sequences`] right after `BEGIN`. The
+    /// in-process lock is what keeps same-space waiters from each pinning a
+    /// pool connection while they queue; the database lock is what serializes
+    /// writers in different node processes. Sorting is the deadlock
+    /// discipline, and callers take these after any chain or KV object
+    /// guards and before the SQLite writer lock.
+    pub async fn acquire_space_sequence_guards(&self, spaces: &[SpaceId]) -> SpaceSequenceGuards {
+        let mut spaces = spaces.to_vec();
+        spaces.sort_by_cached_key(|space| space.to_string());
+        spaces.dedup();
+        let locks = {
+            let mut registry = self.space_sequence_locks.lock().await;
+            registry.retain(|_, lock| lock.strong_count() > 0);
+            spaces
+                .into_iter()
+                .map(|space| {
+                    if let Some(lock) = registry.get(&space).and_then(Weak::upgrade) {
+                        lock
+                    } else {
+                        let lock = Arc::new(SpaceSequenceLock::new(()));
+                        registry.insert(space, Arc::downgrade(&lock));
+                        lock
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut guards = Vec::with_capacity(locks.len());
+        for lock in locks {
+            guards.push(lock.lock_owned().await);
+        }
+        guards
     }
 }
 
@@ -1172,6 +1240,8 @@ where
     }
 
     async fn transact(&self, events: Vec<Event>) -> Result<TransactResult, TxError<B, K>> {
+        let spaces = sequence_spaces(&self.conn, &events).await?;
+        let _sequence_guards = self.acquire_space_sequence_guards(&spaces).await;
         let _writer = match &self.writer_lock {
             Some(lock) => Some(lock.lock().await),
             None => None,
@@ -1180,6 +1250,7 @@ where
             .conn
             .begin_with_config(chain_isolation_level(&self.conn), None)
             .await?;
+        // `transact` takes the database-side sequence lock itself, first.
 
         let result = transact(
             &tx,
@@ -1584,6 +1655,26 @@ where
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
+        // TC-732: a `kv/sync` invocation must be exactly one capability on a
+        // non-empty KV prefix; anything else is rejected before any work.
+        let sync_target =
+            kv_sync_target(&invocation.0).map_err(TxStoreError::KvSyncInvalidRequest)?;
+        // TC-732 addendum: reject a list cursor outside its prefix before any
+        // side effect, not from inside the per-operation loop after puts.
+        if let Some(cursor) = options.list_cursor.as_ref() {
+            let outside = invocation.0.capabilities.iter().any(|cap| {
+                cap.resource.tinycloud_resource().is_some_and(|resource| {
+                    resource.service().as_str() == "kv"
+                        && cap.ability.as_ref().as_ref() == "tinycloud.kv/list"
+                        && resource
+                            .path()
+                            .is_some_and(|path| !kv_list_cursor_in_prefix(path, Some(cursor)))
+                })
+            });
+            if outside {
+                return Err(TxStoreError::KvListCursorOutsidePrefix);
+            }
+        }
         let roots: Vec<Hash> = invocation
             .0
             .parents
@@ -1591,9 +1682,19 @@ where
             .copied()
             .map(Hash::from)
             .collect();
+        // A presented `kv/retain` grant (TC-732) is authorized against the
+        // same chain guards as the invocation's own proofs, so a concurrent
+        // revocation of it is ordered against this read.
+        let mut guard_roots = roots.clone();
+        guard_roots.extend(
+            options
+                .kv_sync
+                .as_ref()
+                .and_then(|sync| sync.retention_grant),
+        );
         let authz_start = Instant::now();
         let closure_start = Instant::now();
-        let lock_keys = crate::auth_graph::load_closure_edges(&self.conn, &roots)
+        let lock_keys = crate::auth_graph::load_closure_edges(&self.conn, &guard_roots)
             .await
             .map(|(keys, _)| keys)
             .map_err(|error| match error {
@@ -1642,7 +1743,9 @@ where
             })
             .collect::<Vec<_>>();
         if mutation_keys.is_empty() {
-            return self.invoke_read_only::<S>(invocation, options, mode).await;
+            return self
+                .invoke_read_only::<S>(invocation, options, mode, sync_target)
+                .await;
         }
         let _kv_object_guards = self.acquire_kv_object_guards(&mutation_keys).await;
         let mut stages = HashMap::new();
@@ -1692,24 +1795,30 @@ where
             }
         }
 
-        let has_preconditions = !options.preconditions.is_empty();
-        let isolation_level = if has_preconditions {
-            conditional_kv_isolation_level(&self.conn)
-        } else {
-            chain_isolation_level(&self.conn)
-        };
+        // TC-732: conditional writes no longer need SERIALIZABLE. The
+        // per-space sequence lock is taken right after BEGIN, before the
+        // precondition read, so under READ COMMITTED that read already sees
+        // every earlier same-space commit and no same-space writer can commit
+        // until this one does. A failed precondition is a 412, never a false
+        // success (see `postgres_conditional_put_is_atomic_under_concurrency`).
+        let sequence_spaces = invocation.0.spaces().cloned().collect::<Vec<_>>();
+        let _sequence_guards = self.acquire_space_sequence_guards(&sequence_spaces).await;
         let _writer = match &self.writer_lock {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
         let begin_start = Instant::now();
-        let tx_result = self.conn.begin_with_config(isolation_level, None).await;
+        let tx_result = self
+            .conn
+            .begin_with_config(chain_isolation_level(&self.conn), None)
+            .await;
         crate::telemetry::observe_stage(
             crate::telemetry::InvocationStage::DbTxBegin,
             crate::telemetry::StageOutcome::from(tx_result.is_ok()),
             begin_start.elapsed(),
         );
         let tx = tx_result?;
+        crate::kv_sync::lock_space_sequences(&tx, &sequence_spaces).await?;
         // DbTxBody spans post-begin to pre-commit. The guard defaults to an
         // `error` outcome so any `?`/early return inside the transaction is
         // recorded as a failure; it is disarmed to `ok` right before commit.
@@ -1783,14 +1892,7 @@ where
             self.encryption.as_ref(),
             Some(&auth_graph),
         )
-        .await
-        .map_err(|error| {
-            if has_preconditions && is_serialization_failure(&error) {
-                TxStoreError::KvSerializationConflict
-            } else {
-                TxStoreError::Tx(error)
-            }
-        })?;
+        .await?;
 
         let mut results = Vec::new();
         // perform and record side effects
@@ -1828,9 +1930,6 @@ where
                     results.push(InvocationOutcome::KvRead(data));
                 }
                 (space, "kv", "tinycloud.kv/list", path) => {
-                    if !kv_list_cursor_in_prefix(path, options.list_cursor.as_ref()) {
-                        return Err(TxStoreError::KvListCursorOutsidePrefix);
-                    }
                     let (list, truncated) = list_bounded_after(
                         &tx,
                         space,
@@ -1910,13 +2009,7 @@ where
         // separately (EpochPersist on the delegate/revoke path).
         tx_body_timer.observe_ok();
         // commit tx if all side effects worked
-        tx.commit().await.map_err(|error| {
-            if has_preconditions && is_serialization_db_error(&error) {
-                TxStoreError::KvSerializationConflict
-            } else {
-                TxStoreError::Tx(error.into())
-            }
-        })?;
+        tx.commit().await?;
         Ok((commit, results))
     }
 
@@ -1930,29 +2023,67 @@ where
         invocation: Invocation,
         options: KvInvokeOptions,
         mode: InvokeMode,
+        sync_target: Option<KvSyncTarget>,
     ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
     where
         B: ImmutableWriteStore<S> + ImmutableReadStore,
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
+        let now = OffsetDateTime::now_utc();
+        // TC-732: a `kv/sync` read loads one authorization snapshot (proofs
+        // plus any presented retention grant) and uses it both to authorize
+        // and to attest the authority window, so the two cannot disagree.
+        let sync_graph = match sync_target.as_ref() {
+            Some(_) => {
+                let mut roots: Vec<Hash> = invocation
+                    .0
+                    .parents
+                    .iter()
+                    .copied()
+                    .map(Hash::from)
+                    .collect();
+                roots.extend(
+                    options
+                        .kv_sync
+                        .as_ref()
+                        .and_then(|sync| sync.retention_grant),
+                );
+                Some(
+                    crate::auth_graph::AuthGraphSnapshot::load(&self.conn, &roots)
+                        .await
+                        .map_err(|error| match error {
+                            revocation::ChainTraversalError::Db(error) => {
+                                TxError::<B, K>::Db(error)
+                            }
+                            revocation::ChainTraversalError::LimitExceeded => {
+                                TxError::ChainTraversalLimitExceeded
+                            }
+                        })?,
+                )
+            }
+            None => None,
+        };
         // TC-409: an admitted invocation already had its signature verified
         // once at the admission boundary; only re-check authorization and
         // signed-time validity here rather than verifying the signature a
         // second time.
         match mode {
             InvokeMode::Admitted => {
-                invocation::authorize_admitted(&self.conn, &invocation.0, OffsetDateTime::now_utc())
+                invocation::authorize_admitted(&self.conn, &invocation.0, now, sync_graph.as_ref())
                     .await
                     .map_err(TxError::<B, K>::from)?
             }
-            InvokeMode::Public | InvokeMode::Internal => invocation::verify_and_authorize(
-                &self.conn,
-                &invocation.0,
-                OffsetDateTime::now_utc(),
-            )
-            .await
-            .map_err(TxError::<B, K>::from)?,
+            InvokeMode::Public | InvokeMode::Internal => {
+                invocation::verify_and_authorize_with_graph(
+                    &self.conn,
+                    &invocation.0,
+                    now,
+                    sync_graph.as_ref(),
+                )
+                .await
+                .map_err(TxError::<B, K>::from)?
+            }
         };
 
         let requested_spaces = invocation.0.spaces().cloned().collect::<HashSet<_>>();
@@ -1965,6 +2096,62 @@ where
                 return Err(TxError::SpaceNotFound.into());
             }
         }
+
+        let sync_outcome = match (sync_target, sync_graph.as_ref()) {
+            (Some((space, prefix, resource)), Some(graph)) => {
+                let request = options.kv_sync.clone().unwrap_or_default();
+                let parents = invocation
+                    .0
+                    .parents
+                    .iter()
+                    .copied()
+                    .map(Hash::from)
+                    .collect::<Vec<_>>();
+                let (not_before, expires_at) = crate::kv_sync::authority_window(graph, &parents);
+                let retain_until = match request.retention_grant {
+                    Some(grant) => crate::kv_sync::retention_until(
+                        graph,
+                        &grant,
+                        &invocation.0.invoker,
+                        &resource,
+                        now,
+                    )
+                    .map_err(TxStoreError::KvSyncRetentionRefused)?,
+                    None => None,
+                };
+                let (changes, more, state) = crate::kv_sync::kv_sync_page(
+                    &self.conn,
+                    &space,
+                    &prefix,
+                    request.limit,
+                    request.state.as_ref(),
+                )
+                .await
+                .map_err(|error| match error {
+                    crate::kv_sync::KvSyncError::Db(error) => TxStoreError::from(error),
+                    crate::kv_sync::KvSyncError::ResetRequired(reason) => {
+                        TxStoreError::KvSyncResetRequired(reason)
+                    }
+                })?;
+                Some(InvocationOutcome::KvSync(Box::new(
+                    crate::kv_sync::KvSyncPage {
+                        space,
+                        prefix,
+                        changes,
+                        more,
+                        state,
+                        authority: crate::kv_sync::KvSyncAuthority {
+                            not_before,
+                            expires_at,
+                            retain_until,
+                        },
+                        cursor: None,
+                        node_did: None,
+                    },
+                )))
+            }
+            _ => None,
+        };
 
         let caps_read_params: Option<CapabilitiesReadParams> = invocation
             .0
@@ -1979,7 +2166,7 @@ where
                         .and_then(|value| serde_json::from_value(value.clone()).ok())
                 })
             });
-        let mut results = Vec::new();
+        let mut results = sync_outcome.into_iter().collect::<Vec<_>>();
         for cap in invocation.0.capabilities.iter().filter_map(|capability| {
             capability
                 .resource
@@ -2016,9 +2203,6 @@ where
                     results.push(InvocationOutcome::KvRead(data));
                 }
                 (space, "kv", "tinycloud.kv/list", path) => {
-                    if !kv_list_cursor_in_prefix(path, options.list_cursor.as_ref()) {
-                        return Err(TxStoreError::KvListCursorOutsidePrefix);
-                    }
                     let (list, truncated) = list_bounded_after(
                         &self.conn,
                         space,
@@ -2093,6 +2277,43 @@ where
     }
 }
 
+/// The `(space, prefix, resource)` a `tinycloud.kv/sync` invocation reads.
+type KvSyncTarget = (SpaceId, Path, Resource);
+
+/// The target of a `tinycloud.kv/sync` invocation, or `None` when it invokes
+/// no `kv/sync`. A `kv/sync` must be the invocation's only capability and name
+/// a non-empty KV prefix: the cursor, the authority window and the read audit
+/// all describe exactly one feed.
+fn kv_sync_target(
+    invocation: &crate::util::InvocationInfo,
+) -> Result<Option<KvSyncTarget>, &'static str> {
+    let mut sync = invocation
+        .capabilities
+        .iter()
+        .filter(|cap| cap.ability.as_ref().as_ref() == crate::kv_sync::KV_SYNC_ACTION);
+    let Some(capability) = sync.next() else {
+        return Ok(None);
+    };
+    if invocation.capabilities.len() != 1 {
+        return Err("tinycloud.kv/sync must be the invocation's only capability");
+    }
+    let target = capability
+        .resource
+        .tinycloud_resource()
+        .and_then(|resource| {
+            let path = resource.path()?;
+            (resource.service().as_str() == "kv"
+                && !path.as_str().is_empty()
+                && resource.query().is_none()
+                && resource.fragment().is_none())
+            .then(|| (resource.space().clone(), path.clone()))
+        });
+    match target {
+        Some((space, prefix)) => Ok(Some((space, prefix, capability.resource.clone()))),
+        None => Err("tinycloud.kv/sync requires a non-empty KV prefix"),
+    }
+}
+
 fn chain_isolation_level<C: ConnectionTrait>(db: &C) -> Option<sea_orm::IsolationLevel> {
     match db.get_database_backend() {
         // SQLite's default transaction mode is serializable; sqlx rejects an
@@ -2106,40 +2327,6 @@ fn chain_isolation_level<C: ConnectionTrait>(db: &C) -> Option<sea_orm::Isolatio
             Some(sea_orm::IsolationLevel::ReadCommitted)
         }
     }
-}
-
-fn conditional_kv_isolation_level<C: ConnectionTrait>(db: &C) -> Option<sea_orm::IsolationLevel> {
-    conditional_kv_isolation_for_backend(db.get_database_backend())
-}
-
-fn conditional_kv_isolation_for_backend(
-    backend: sea_orm::DatabaseBackend,
-) -> Option<sea_orm::IsolationLevel> {
-    match backend {
-        sea_orm::DatabaseBackend::Sqlite => None,
-        sea_orm::DatabaseBackend::Postgres | sea_orm::DatabaseBackend::MySql => {
-            Some(sea_orm::IsolationLevel::Serializable)
-        }
-    }
-}
-
-fn is_serialization_failure<S: StorageSetup, K: Secrets>(error: &TxError<S, K>) -> bool {
-    match error {
-        TxError::Db(error) | TxError::EpochInsert(error) => is_serialization_db_error(error),
-        _ => false,
-    }
-}
-
-fn is_serialization_db_error(error: &DbErr) -> bool {
-    matches!(
-        error,
-        DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(database_error)))
-        | DbErr::Query(RuntimeErr::SqlxError(SqlxError::Database(database_error)))
-            if matches!(
-                database_error.code().as_deref(),
-                Some("40001" | "40P01" | "1213" | "5" | "6" | "SQLITE_BUSY" | "SQLITE_LOCKED")
-            )
-    )
 }
 
 /// Returns a `TransactResult` that acknowledges a delegation already durably
@@ -2341,6 +2528,8 @@ fn is_pk_epoch_conflict(error: &DbErr) -> bool {
 #[derive(Debug)]
 pub enum InvocationOutcome<R> {
     KvList(Vec<Path>, bool, Option<String>),
+    /// One page of the `tinycloud.kv/sync` change feed (TC-732).
+    KvSync(Box<crate::kv_sync::KvSyncPage>),
     KvDelete(Option<Hash>),
     KvMetadata(Option<(Metadata, Hash)>),
     KvWrite(Hash),
@@ -2398,21 +2587,62 @@ impl<S: StorageSetup, K: Secrets> From<revocation::Error> for TxError<S, K> {
     }
 }
 
+/// Spaces whose `event_order` a transaction over `events` may append to: the
+/// set `transact` locks with `kv_sync::lock_space_sequences`, computed before
+/// `BEGIN` so callers can take the matching in-process guards first. A
+/// superset is harmless; a missing space would let a writer escape the lock.
+async fn sequence_spaces<C: ConnectionTrait>(
+    db: &C,
+    events: &[Event],
+) -> Result<Vec<SpaceId>, DbErr> {
+    let mut spaces = HashSet::new();
+    let mut revoked = Vec::new();
+    for event in events {
+        match event {
+            Event::Delegation(d) => spaces.extend(d.0.spaces().cloned()),
+            Event::Invocation(i, _)
+            | Event::InternalInvocation(i, _)
+            | Event::AdmittedInvocation(i, _) => spaces.extend(i.0.spaces().cloned()),
+            Event::Revocation(r) => revoked.push(Hash::from(r.0.revoked)),
+        }
+    }
+    if !revoked.is_empty() {
+        for row in event_order::Entity::find()
+            .filter(event_order::Column::Event.is_in(revoked))
+            .all(db)
+            .await?
+        {
+            spaces.insert(row.space.0);
+        }
+    }
+    Ok(spaces.into_iter().collect())
+}
+
 async fn event_spaces<'a, C: ConnectionTrait>(
     db: &C,
     ev: &'a [(Hash, Event)],
 ) -> Result<HashMap<SpaceId, Vec<&'a (Hash, Event)>>, DbErr> {
     // get orderings of events listed as revoked by events in the ev list
     let mut spaces = HashMap::<SpaceId, Vec<&'a (Hash, Event)>>::new();
-    let revoked_events = event_order::Entity::find()
-        .filter(
-            event_order::Column::Event.is_in(ev.iter().filter_map(|(_, e)| match e {
-                Event::Revocation(r) => Some(Hash::from(r.0.revoked)),
-                _ => None,
-            })),
-        )
-        .all(db)
-        .await?;
+    let revoked = ev
+        .iter()
+        .filter_map(|(_, e)| match e {
+            Event::Revocation(r) => Some(Hash::from(r.0.revoked)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    // TC-732: `transact` now calls this before any write. Issue no read when
+    // there is nothing to look up: on SQLite a read that opens the
+    // transaction's snapshot ahead of its first write turns a concurrent
+    // writer's commit into SQLITE_BUSY_SNAPSHOT (517) instead of a busy wait.
+    let revoked_events = if revoked.is_empty() {
+        Vec::new()
+    } else {
+        event_order::Entity::find()
+            .filter(event_order::Column::Event.is_in(revoked))
+            .all(db)
+            .await?
+    };
     for e in ev {
         match &e.1 {
             Event::Delegation(d) => {
@@ -2477,6 +2707,13 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
         .map(|e| (e.hash(), e))
         .collect::<Vec<(Hash, Event)>>();
 
+    // TC-732: every space this transaction may append to, then the per-space
+    // sequence lock, before anything else reads. The `MAX(seq)` below must see
+    // every earlier same-space commit, and no later one may commit before
+    // this one: that is what makes `seq` commit-ordered on PostgreSQL.
+    let event_spaces = event_spaces(db, &event_hashes).await?;
+    crate::kv_sync::lock_space_sequences(db, event_spaces.keys()).await?;
+
     // ── Atomic delegation registration ──────────────────────────────────────
     // Register all delegations inside this transaction before any epoch rows
     // are written. This is the authoritative New/Existing decision; the
@@ -2488,8 +2725,6 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
             registered.insert(*hash, reg);
         }
     }
-
-    let event_spaces = event_spaces(db, &event_hashes).await?;
 
     // Exclude Existing delegations from epoch construction: they were already
     // registered in a prior committed transaction and must not create new
@@ -2668,7 +2903,10 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                 .await?
                 .flatten();
             if let Some(seq) = max_seq {
-                max_seqs.insert(SpaceIdWrap(space.clone()), seq + 1);
+                let next = seq.checked_add(1).ok_or_else(|| {
+                    DbErr::Custom(format!("event_order seq overflow in space {space}"))
+                })?;
+                max_seqs.insert(SpaceIdWrap(space.clone()), next);
             }
         }
 
@@ -2966,7 +3204,13 @@ async fn list_bounded<C: ConnectionTrait>(
 /// hooks `scope_extends` applies to subscriptions): a grant on `docs` covers
 /// `docs` and `docs/a` but not `docsecret/x`, and a grant on `notes/` covers
 /// everything that starts with `notes/`. Matching is byte-exact, so `DOCS/x` is
-/// never inside `docs`. The empty prefix covers the whole space.
+/// never inside `docs`.
+///
+/// The empty prefix covers the whole space. That is where this rule departs
+/// from `ResourceId::extends`, under which an empty base path covers only the
+/// empty key and keys starting with `/`. The departure is deliberate: a
+/// path-less `kv/list` lists the whole space. `tinycloud.kv/sync` rejects an
+/// empty prefix (TC-732), so a feed's scope never depends on the difference.
 pub fn kv_prefix_covers(prefix: &str, key: &str) -> bool {
     prefix.is_empty()
         || key
@@ -2996,9 +3240,17 @@ fn byte_ordered_key(backend: DbBackend) -> SimpleExpr {
 /// start with `q`: `q` is the prefix with one trailing `/`, and `q_hi` is `q`
 /// with that `/` bumped to the next byte, `0`. A prefix without a trailing
 /// `/` also matches the bare key itself. Unlike `LIKE`, the range needs no
-/// escaping, never folds ASCII case (SQLite's `LIKE` does), and stays an
-/// index range on the `(space, key)` primary key.
-fn kv_prefix_condition(backend: DbBackend, prefix: &str) -> Option<Condition> {
+/// escaping and never folds ASCII case (SQLite's `LIKE` does).
+///
+/// This decides membership; it does not promise an index seek. On PostgreSQL
+/// the `COLLATE "C"` pin does not match the `(space, key)` primary key's
+/// collation, so only `space` seeks and the range is a filter (see
+/// `byte_ordered_resource`). On SQLite `COLLATE BINARY` is the key's own
+/// collation and the range can seek the primary key, but the bare-key `OR`
+/// arm may lead the planner -- especially once `ANALYZE` statistics exist --
+/// to a MULTI-INDEX OR plus a temp B-tree sort. The `kv/sync` feed orders by
+/// `idx_current_kv_space_order` and applies this range as a filter.
+pub(crate) fn kv_prefix_condition(backend: DbBackend, prefix: &str) -> Option<Condition> {
     if prefix.is_empty() {
         return None;
     }
@@ -3282,7 +3534,7 @@ fn byte_ordered_resource(backend: DbBackend) -> SimpleExpr {
 }
 
 /// `column`, compared in byte order on `backend` (see `byte_ordered_resource`).
-fn byte_ordered(backend: DbBackend, column: impl Into<SimpleExpr>) -> SimpleExpr {
+pub(crate) fn byte_ordered(backend: DbBackend, column: impl Into<SimpleExpr>) -> SimpleExpr {
     // `$1` / `?` is sea-query's per-backend placeholder for the embedded
     // column expression, not for a bound value.
     match backend {
@@ -3994,23 +4246,6 @@ mod test {
         ));
     }
 
-    #[test]
-    fn conditional_kv_uses_cross_process_serializable_transactions() {
-        assert_eq!(
-            conditional_kv_isolation_for_backend(sea_orm::DatabaseBackend::Sqlite),
-            None
-        );
-        for backend in [
-            sea_orm::DatabaseBackend::Postgres,
-            sea_orm::DatabaseBackend::MySql,
-        ] {
-            assert_eq!(
-                conditional_kv_isolation_for_backend(backend),
-                Some(sea_orm::IsolationLevel::Serializable)
-            );
-        }
-    }
-
     #[tokio::test]
     async fn kv_object_guards_serialize_the_same_key() {
         let db = get_db().await.unwrap();
@@ -4262,6 +4497,7 @@ mod test {
             &SpaceIdWrap(space.clone()),
             "a",
             crate::hash::hash(b"invocation-1"),
+            (1000, crate::hash::hash(b"delete-epoch"), 0),
         )
         .await
         .unwrap();
