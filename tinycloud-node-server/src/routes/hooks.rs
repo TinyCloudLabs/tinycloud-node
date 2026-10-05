@@ -160,10 +160,11 @@ pub async fn create_hook_ticket(
     .await?;
     let mut request = request.into_inner();
     authorize_ticket_scopes(&invocation, &mut request, hooks)?;
+    // Build and sign the whole ticket first: a refused request (for example a
+    // TTL that expires immediately) must not spend the invocation.
+    let ticket = mint_hook_ticket(&invocation, request, hooks, tinycloud).await?;
     invocation.consume(replay, config).await?;
-    mint_hook_ticket(&invocation, request, hooks, tinycloud)
-        .await
-        .map(Json)
+    Ok(Json(ticket))
 }
 
 /// Validate the requested subscriptions and require each to be covered by the
@@ -1440,6 +1441,18 @@ mod tests {
             service: &str,
             prefix: &str,
         ) -> (Status, String) {
+            self.ticket_with_ttl(header, space, service, prefix, 60)
+                .await
+        }
+
+        async fn ticket_with_ttl(
+            &self,
+            header: String,
+            space: &SpaceId,
+            service: &str,
+            prefix: &str,
+            ttl_seconds: u64,
+        ) -> (Status, String) {
             let response = self
                 .client
                 .post("/hooks/tickets")
@@ -1452,7 +1465,7 @@ mod tests {
                             "service": service,
                             "pathPrefix": prefix,
                         }],
-                        "ttlSeconds": 60,
+                        "ttlSeconds": ttl_seconds,
                     })
                     .to_string(),
                 )
@@ -2099,6 +2112,29 @@ mod tests {
             "{statuses:?}"
         );
         assert_eq!(fixture.persisted_rows().await?, before);
+        Ok(())
+    }
+
+    /// A ticket request refused after authorization (here a TTL that expires
+    /// immediately) must not spend the invocation: the same header still
+    /// mints a ticket once the request is valid.
+    #[tokio::test]
+    async fn refused_ticket_does_not_spend_the_invocation() -> Result<()> {
+        let fixture =
+            hook_route_fixture(&[("hooks", "kv/documents", "tinycloud.hooks/subscribe")]).await?;
+        let header = fixture.session_header(&[(fixture.hooks("kv/documents")?, SUBSCRIBE)])?;
+        let before = fixture.persisted_rows().await?;
+
+        let (status, body) = fixture
+            .ticket_with_ttl(header.clone(), &fixture.space, "kv", "documents", 0)
+            .await;
+        assert_eq!(status, Status::Unauthorized, "{body}");
+        assert_eq!(fixture.persisted_rows().await?, before);
+
+        let (status, body) = fixture
+            .ticket(header, &fixture.space, "kv", "documents")
+            .await;
+        assert_eq!(status, Status::Ok, "{body}");
         Ok(())
     }
 }

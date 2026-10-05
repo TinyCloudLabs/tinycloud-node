@@ -9088,6 +9088,8 @@ mod tests {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing policy root cid"))?
             .parse()?;
+        // Signed by the owner of `content_space` (root authority), which is
+        // not the policy owner in the delegated-session fixture.
         let owner_hooks = make_invocation(
             [(
                 hooks_resource,
