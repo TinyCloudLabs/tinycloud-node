@@ -8,14 +8,23 @@
 //! the number of `(space, seq)` groups that carry more than one distinct epoch
 //! (a duplicated per-space sequence number across concurrent epochs).
 //!
+//! Blocks go to an in-memory store by default, or to S3 with
+//! `TC732_BENCH_STORE=s3` (the node's own `S3BlockStore`, as in
+//! `docker-compose.dstack-postgres.yaml`): `TC732_BENCH_S3_ENDPOINT` and
+//! `TC732_BENCH_S3_BUCKET` name the endpoint and bucket, and the usual
+//! `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` supply
+//! credentials. Every put stores a distinct value, so each one is a real
+//! S3 HEAD + PUT.
+//!
 //! This is a manual benchmark, not a regression gate: it is `#[ignore]`d,
 //! never fails on put errors (only reports them), and skips — without
 //! panicking, even when `CI` is set — when `TINYCLOUD_TEST_POSTGRES_URL` is
 //! unset. Run it with:
 //!
 //! ```text
-//! TINYCLOUD_TEST_POSTGRES_URL=postgres://postgres@127.0.0.1:55502/postgres \
-//!   cargo test -p tinycloud-core --test postgres_kv_write_throughput -- --ignored --nocapture
+//! TINYCLOUD_TEST_POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:55516/postgres \
+//!   cargo test --release -p tinycloud-node --test postgres_kv_write_throughput \
+//!   -- --ignored --nocapture
 //! ```
 
 use std::collections::{BTreeMap, HashMap};
@@ -23,6 +32,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::io::AsyncWriteExt;
+use tinycloud::storage::s3::{S3BlockConfig, S3BlockStore};
 use tinycloud_auth::resolver::DID_METHODS;
 use tinycloud_auth::resource::{Path, Service, SpaceId};
 use tinycloud_auth::ssi::claims::jwt::NumericDate;
@@ -38,7 +48,9 @@ use tinycloud_core::sea_orm::{
     DatabaseConnection, DbBackend, Statement,
 };
 use tinycloud_core::storage::memory::{MemoryStaging, MemoryStore};
-use tinycloud_core::storage::HashBuffer;
+use tinycloud_core::storage::{
+    HashBuffer, ImmutableReadStore, ImmutableWriteStore, StorageConfig, StorageSetup,
+};
 use tinycloud_core::types::{Metadata, SpaceIdWrap};
 use tinycloud_core::{SpaceDatabase, TxError, TxStoreError};
 
@@ -50,7 +62,30 @@ const PUTS_PER_CELL: usize = 640;
 const CONCURRENCY: [usize; 3] = [1, 8, 32];
 const SPACE_FANOUT: usize = 32;
 
-type Db = SpaceDatabase<DatabaseConnection, MemoryStore, StaticSecret>;
+type Db<B> = SpaceDatabase<DatabaseConnection, B, StaticSecret>;
+
+/// The block stores the benchmark can drive.
+trait BenchStore:
+    ImmutableWriteStore<MemoryStaging, Error: Send + Sync>
+    + ImmutableReadStore<Error: Send + Sync, Readable: Send>
+    + StorageSetup<Error: Send + Sync>
+    + Clone
+    + Send
+    + Sync
+    + 'static
+{
+}
+
+impl<B> BenchStore for B where
+    B: ImmutableWriteStore<MemoryStaging, Error: Send + Sync>
+        + ImmutableReadStore<Error: Send + Sync, Readable: Send>
+        + StorageSetup<Error: Send + Sync>
+        + Clone
+        + Send
+        + Sync
+        + 'static
+{
+}
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Clone, Copy)]
@@ -154,11 +189,11 @@ struct CellReport {
     duplicate_seq_groups: i64,
 }
 
-type PutError = TxStoreError<MemoryStore, MemoryStaging, StaticSecret>;
+type PutError<B> = TxStoreError<B, MemoryStaging, StaticSecret>;
 
 /// Classify a put error by its variant (the error type is not `Debug`
 /// because `StaticSecret` deliberately is not).
-fn error_kind(error: &PutError) -> &'static str {
+fn error_kind<B: BenchStore>(error: &PutError<B>) -> &'static str {
     match error {
         TxStoreError::Tx(TxError::Db(_)) => "Tx::Db",
         TxStoreError::Tx(TxError::EpochInsert(_)) => "Tx::EpochInsert",
@@ -184,17 +219,28 @@ fn percentile(sorted: &[Duration], pct: usize) -> Duration {
     sorted[rank.min(sorted.len()) - 1]
 }
 
-async fn host_space(conn: &DatabaseConnection, space: &SpaceId) -> Result<(), BoxError> {
+async fn host_space<B: BenchStore>(
+    conn: &DatabaseConnection,
+    store: &B,
+    space: &SpaceId,
+) -> Result<(), BoxError> {
     space_model::ActiveModel {
         id: Set(SpaceIdWrap(space.clone())),
     }
     .insert(conn)
     .await?;
+    store
+        .create(space)
+        .await
+        .map_err(|_| "block store space setup failed")?;
     Ok(())
 }
 
 /// Stage the value and invoke the put; on failure returns `(kind, message)`.
-async fn run_put(db: &Db, put: PreparedPut) -> Result<(), (&'static str, String)> {
+async fn run_put<B: BenchStore>(
+    db: &Db<B>,
+    put: PreparedPut,
+) -> Result<(), (&'static str, String)> {
     let mut stage = HashBuffer::new(Vec::new());
     stage
         .write_all(&put.value)
@@ -237,8 +283,9 @@ async fn integrity(conn: &DatabaseConnection, spaces: &[SpaceId]) -> Result<(i64
     Ok((rows, duplicates))
 }
 
-async fn run_cell(
-    db: &Arc<Db>,
+async fn run_cell<B: BenchStore>(
+    db: &Arc<Db<B>>,
+    store: &B,
     conn: &DatabaseConnection,
     cell: usize,
     layout: Layout,
@@ -252,7 +299,7 @@ async fn run_cell(
         .map(|_| Owner::generate())
         .collect::<Result<Vec<_>, _>>()?;
     for owner in &owners {
-        host_space(conn, &owner.space).await?;
+        host_space(conn, store, &owner.space).await?;
     }
 
     // Pre-sign (and decode) every invocation so signing is not timed.
@@ -337,11 +384,11 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1_000.0
 }
 
-fn print_table(reports: &[CellReport]) {
+fn print_table(store: &str, reports: &[CellReport]) {
     println!();
     println!(
         "TC-732 PostgreSQL KV write throughput ({PUTS_PER_CELL} owner-root puts per cell, \
-         pool max_connections = {MAX_CONNECTIONS}, profile = {})",
+         pool max_connections = {MAX_CONNECTIONS}, blocks = {store}, profile = {})",
         if cfg!(debug_assertions) {
             "debug"
         } else {
@@ -431,35 +478,26 @@ async fn postgres_kv_write_throughput() {
         .await
         .expect("create isolated TC-732 benchmark schema");
 
+    let store = std::env::var("TC732_BENCH_STORE").unwrap_or_else(|_| "memory".to_owned());
+    let mut options = ConnectOptions::new(database_url);
+    options
+        .max_connections(MAX_CONNECTIONS)
+        .sqlx_logging(false)
+        .set_schema_search_path(schema.clone());
     let exercise: Result<Vec<CellReport>, BoxError> = async {
-        let mut options = ConnectOptions::new(database_url);
-        options
-            .max_connections(MAX_CONNECTIONS)
-            .sqlx_logging(false)
-            .set_schema_search_path(schema.clone());
         let conn = Database::connect(options).await?;
-        let db = Arc::new(
-            SpaceDatabase::new(
-                conn.clone(),
-                MemoryStore::default(),
-                StaticSecret::new(vec![0u8; 32]).map_err(|_| "static secret too short")?,
-            )
-            .await?,
-        );
-
-        // Untimed, unreported warm-up cell (pool connections, prepared
-        // statements, PostgreSQL plan caches) on its own spaces, so the first
-        // reported cell is not penalised by cold-start costs.
-        run_cell(&db, &conn, 0, Layout::ManySpaces, 8).await?;
-
-        let mut reports = Vec::new();
-        let mut cell = 1;
-        for layout in [Layout::SameSpace, Layout::ManySpaces] {
-            for concurrency in CONCURRENCY {
-                reports.push(run_cell(&db, &conn, cell, layout, concurrency).await?);
-                cell += 1;
+        let reports = match store.as_str() {
+            "memory" => run_matrix(conn.clone(), MemoryStore::default()).await?,
+            "s3" => {
+                let config: S3BlockConfig = serde_json::from_value(serde_json::json!({
+                    "bucket": std::env::var("TC732_BENCH_S3_BUCKET")?,
+                    "endpoint": std::env::var("TC732_BENCH_S3_ENDPOINT")?,
+                }))?;
+                let s3: S3BlockStore = config.open().await?;
+                run_matrix(conn.clone(), s3).await?
             }
-        }
+            other => return Err(format!("unknown TC732_BENCH_STORE {other}").into()),
+        };
         conn.close().await?;
         Ok(reports)
     }
@@ -474,5 +512,34 @@ async fn postgres_kv_write_throughput() {
         .expect("drop isolated TC-732 benchmark schema");
 
     let reports = exercise.expect("TC-732 benchmark harness failed");
-    print_table(&reports);
+    print_table(&store, &reports);
+}
+
+async fn run_matrix<B: BenchStore>(
+    conn: DatabaseConnection,
+    store: B,
+) -> Result<Vec<CellReport>, BoxError> {
+    let db = Arc::new(
+        SpaceDatabase::new(
+            conn.clone(),
+            store.clone(),
+            StaticSecret::new(vec![0u8; 32]).map_err(|_| "static secret too short")?,
+        )
+        .await?,
+    );
+
+    // Untimed, unreported warm-up cell (pool connections, prepared
+    // statements, PostgreSQL plan caches) on its own spaces, so the first
+    // reported cell is not penalised by cold-start costs.
+    run_cell(&db, &store, &conn, 0, Layout::ManySpaces, 8).await?;
+
+    let mut reports = Vec::new();
+    let mut cell = 1;
+    for layout in [Layout::SameSpace, Layout::ManySpaces] {
+        for concurrency in CONCURRENCY {
+            reports.push(run_cell(&db, &store, &conn, cell, layout, concurrency).await?);
+            cell += 1;
+        }
+    }
+    Ok(reports)
 }
