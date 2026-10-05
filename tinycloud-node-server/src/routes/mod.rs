@@ -1452,6 +1452,12 @@ async fn invoke_impl(
                 (Status::Unauthorized, message)
             })?;
 
+        // TC-732: a `kv/sync` must be the invocation's only capability, on a
+        // non-empty KV prefix. Check the shape before any specialized
+        // dispatch (encryption, SQL, DuckDB), so a mixed invocation is a 400
+        // and none of its other capabilities runs.
+        kv_sync_target(&admitted.invocation().0.capabilities)?;
+
         // Policy-session invocations use the same admitted invocation as every
         // other data-plane request. The policy runtime only classifies and
         // verifies the special S0 edge; the ordinary graph remains authoritative.
@@ -8225,6 +8231,71 @@ mod tests {
             .await?;
         assert_eq!(reply.status, Status::Ok, "{}", reply.body);
         assert!(changes(&reply).is_empty());
+        Ok(())
+    }
+
+    /// The single-capability rule is enforced before encryption, SQL or KV
+    /// dispatch: a `kv/sync` mixed with a decrypt, a SQL read or a KV put is a
+    /// 400, and the other capability does not run.
+    #[tokio::test]
+    async fn kv_sync_shape_is_checked_before_specialized_dispatch() -> Result<()> {
+        use rocket::http::Status;
+        let fixture = KvSyncFixture::new().await?;
+        let sync = (
+            fixture.kv_resource("notes/")?.to_string(),
+            "tinycloud.kv/sync",
+        );
+        let owner = fixture.space.did().to_string();
+        for (label, other) in [
+            (
+                "decrypt",
+                (
+                    format!("urn:tinycloud:encryption:{owner}:default"),
+                    tinycloud_core::encryption_network::DECRYPT_ACTION,
+                ),
+            ),
+            (
+                "sql",
+                (
+                    fixture
+                        .space
+                        .clone()
+                        .to_resource("sql".parse::<Service>()?, Some("main".parse()?), None, None)
+                        .to_string(),
+                    "tinycloud.sql/read",
+                ),
+            ),
+            (
+                "put",
+                (
+                    fixture.kv_resource("notes/x")?.to_string(),
+                    "tinycloud.kv/put",
+                ),
+            ),
+        ] {
+            let header = fixture.owner_invocation(&[sync.clone(), other])?;
+            let reply = fixture.dispatch(header, &[]).await;
+            assert_eq!(reply.status, Status::BadRequest, "{label}: {}", reply.body);
+            assert!(
+                reply.body.contains("only capability"),
+                "{label}: {}",
+                reply.body
+            );
+        }
+        let get = fixture
+            .dispatch(
+                fixture.owner_invocation(&[(
+                    fixture.kv_resource("notes/x")?.to_string(),
+                    "tinycloud.kv/get",
+                )])?,
+                &[],
+            )
+            .await;
+        assert_eq!(
+            get.status,
+            Status::NotFound,
+            "the mixed put must not have run"
+        );
         Ok(())
     }
 
