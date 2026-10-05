@@ -8154,6 +8154,9 @@ mod tests {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing policy root cid"))?
             .parse()?;
+        // The probe must be signed by the owner of `content_space` (root
+        // authority); in this fixture that is `owner`. Fixtures whose policy
+        // owner is not the space owner must sign with the space owner's key.
         let owner_hooks = make_invocation(
             [(
                 hooks_resource,
