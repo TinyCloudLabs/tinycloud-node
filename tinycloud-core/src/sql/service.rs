@@ -86,10 +86,10 @@ impl SqlService {
         .await
     }
 
-    /// Execute on a full space: the request runs, but is undone and fails
-    /// with [`SqlError::StorageWouldGrow`] if it grew the database. Deletes,
-    /// drops and DDL whose object already exists go through. Successful writes
-    /// replace the durable checkpoint instead of accumulating charged WAL bytes.
+    /// Execute on a full space: refuse growth of either the live database or
+    /// its durable representation. Successful writes replace checkpoint + WAL
+    /// without increasing charged bytes; no-ops on absent databases do not
+    /// materialize a checkpoint.
     pub async fn execute_without_growth(
         &self,
         space: &SpaceId,
@@ -137,8 +137,17 @@ impl SqlService {
         }?;
 
         if !result.write_targets.is_empty() {
+            if growth == GrowthPolicy::Forbid
+                && self.expectation(&key) == ArtifactExpectation::Absent
+            {
+                // The actor's guard admitted no new pages. Serializing this
+                // empty database would nevertheless create a charged header.
+                // Evict it too, so a later export cannot materialize the no-op.
+                self.discard_local_state(&key).await?;
+                return Ok(result);
+            }
             if let Err(e) = self.persist_write(space, db_name, &handle, growth).await {
-                let _ = self.discard_local_state(&key).await;
+                self.discard_local_state(&key).await?;
                 return Err(e);
             }
         }
@@ -157,6 +166,7 @@ impl SqlService {
         registry.insert(key, Arc::downgrade(&lock));
         lock
     }
+
 
     pub async fn export(&self, space: &SpaceId, db_name: &str) -> Result<Vec<u8>, SqlError> {
         let _operation_guard = self.operation_lock(space, db_name).await.lock_owned().await;
@@ -324,7 +334,11 @@ impl SqlService {
     }
 
     async fn discard_local_state(&self, key: &(String, String)) -> Result<(), SqlError> {
-        self.databases.remove(key);
+        if let Some((_, handle)) = self.databases.remove(key) {
+            // Wait for the connection to close before unlinking its cache:
+            // an exit-time flush must not race the next durable hydration.
+            handle.shutdown().await?;
+        }
         self.lineage.remove(key);
         let cache_path = PathBuf::from(&self.base_path)
             .join(&key.0)
@@ -363,8 +377,9 @@ impl SqlService {
         let expected = self.expectation(&key);
 
         // Repeated DELETE/UPDATE/DROP operations can append WAL frames without
-        // adding a database page. Full spaces must replace checkpoint + WAL
-        // with one complete image whose size the actor's page guard bounded.
+        // adding a database page. Full spaces replace checkpoint + WAL, but
+        // must also bound the resulting image against the durable charge:
+        // live state can include partial writes from an earlier failed request.
         let wal = if growth == GrowthPolicy::Allow {
             handle.wal().await?
         } else {
@@ -403,6 +418,17 @@ impl SqlService {
 
         let payload = handle.checkpoint().await?;
         let bytes = payload.len();
+        if growth == GrowthPolicy::Forbid {
+            let durable_bytes = self
+                .artifact_repository
+                .load("sql", &key.0, db_name)
+                .await
+                .map_err(artifact_error_to_sql)?
+                .map_or(0, |artifact| artifact.size_bytes.max(0) as u64);
+            if bytes as u64 > durable_bytes {
+                return Err(SqlError::StorageWouldGrow);
+            }
+        }
         let saved = self
             .artifact_repository
             .save("sql", &space.to_string(), db_name, payload, expected)
@@ -535,6 +561,7 @@ mod tests {
         migrations::Migrator,
         sea_orm::{ConnectOptions, Database},
         sea_orm_migration::MigratorTrait,
+        sql_sizes::{SizeTrackingArtifactRepository, SqlSizes},
     };
     use async_trait::async_trait;
     use tempfile::TempDir;
@@ -555,6 +582,181 @@ mod tests {
             .unwrap();
         Migrator::up(&db, None).await.unwrap();
         Arc::new(SeaOrmDatabaseArtifactRepository::new(db))
+    }
+
+    #[tokio::test]
+    async fn tc626_review_absent_noops_do_not_create_charged_artifacts() {
+        for memory_threshold in [u64::MAX, 0] {
+            let sizes = SqlSizes::new();
+            let repo = Arc::new(SizeTrackingArtifactRepository::new(
+                artifact_repository().await,
+                sizes.clone(),
+            ));
+            let cache = TempDir::new().unwrap();
+            let space = test_space_id("sql-absent-noops");
+            let service = SqlService::new(
+                cache.path().to_string_lossy().into_owned(),
+                memory_threshold,
+                repo.clone(),
+            );
+            for name in ["unused-one", "unused-two", "unused-three"] {
+                service
+                    .execute_without_growth(
+                        &space,
+                        name,
+                        SqlRequest::Execute {
+                            schema: None,
+                            sql: "DROP TABLE IF EXISTS absent".into(),
+                            params: vec![],
+                        },
+                        None,
+                        "tinycloud.sql/write".into(),
+                    )
+                    .await
+                    .expect("dropping an absent table is a successful no-op");
+                assert_eq!(sizes.space_total(&space).await, 0);
+                assert!(repo
+                    .load("sql", &space.to_string(), name)
+                    .await
+                    .unwrap()
+                    .is_none());
+                assert!(matches!(
+                    service.export(&space, name).await,
+                    Err(SqlError::DatabaseNotFound)
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tc626_review_serialized_growth_is_rejected_and_discarded() {
+        for memory_threshold in [u64::MAX, 0] {
+            let sizes = SqlSizes::new();
+            let repo = Arc::new(SizeTrackingArtifactRepository::new(
+                artifact_repository().await,
+                sizes.clone(),
+            ));
+            let cache = TempDir::new().unwrap();
+            let space = test_space_id("sql-durable-budget");
+            let service = SqlService::new(
+                cache.path().to_string_lossy().into_owned(),
+                memory_threshold,
+                repo.clone(),
+            );
+            service
+                .execute(
+                    &space,
+                    "main",
+                    SqlRequest::Execute {
+                        schema: Some(vec!["CREATE TABLE data (id INTEGER, body TEXT)".into()]),
+                        sql: "INSERT INTO data VALUES (1, 'durable')".into(),
+                        params: vec![],
+                    },
+                    None,
+                    "tinycloud.sql/write".into(),
+                )
+                .await
+                .unwrap();
+            let before = repo
+                .load("sql", &space.to_string(), "main")
+                .await
+                .unwrap()
+                .unwrap();
+
+            // Unguarded requests preserve partial-batch semantics. The actor can
+            // therefore contain more pages than its last durable checkpoint.
+            let failed = service
+                .execute(
+                    &space,
+                    "main",
+                    SqlRequest::Execute {
+                        schema: Some(vec![
+                            "INSERT INTO data VALUES (2, hex(zeroblob(65536)))".into()
+                        ]),
+                        sql: "INSERT INTO missing_table VALUES (1)".into(),
+                        params: vec![],
+                    },
+                    None,
+                    "tinycloud.sql/write".into(),
+                )
+                .await;
+            assert!(matches!(failed, Err(SqlError::Sqlite(_))));
+            let rejected = service
+                .execute_without_growth(
+                    &space,
+                    "main",
+                    SqlRequest::Execute {
+                        schema: None,
+                        sql: "DELETE FROM data WHERE id = 1".into(),
+                        params: vec![],
+                    },
+                    None,
+                    "tinycloud.sql/write".into(),
+                )
+                .await;
+            assert!(
+                matches!(rejected, Err(SqlError::StorageWouldGrow)),
+                "{rejected:?}"
+            );
+            let after = repo
+                .load("sql", &space.to_string(), "main")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.revision, before.revision);
+            assert_eq!(after.payload, before.payload);
+            assert_eq!(after.delta_payload, before.delta_payload);
+            assert_eq!(sizes.space_total(&space).await, before.size_bytes as u64);
+
+            let query = || SqlRequest::Query {
+                sql: "SELECT id, body FROM data ORDER BY id".into(),
+                params: vec![],
+                max_rows: None,
+                max_bytes: None,
+            };
+            let live = service
+                .execute(&space, "main", query(), None, "tinycloud.sql/read".into())
+                .await
+                .unwrap();
+            let SqlResponse::Query(live) = live.response else {
+                panic!("query response required")
+            };
+            assert_eq!(
+                live.rows,
+                vec![vec![SqlValue::Integer(1), SqlValue::Text("durable".into())]]
+            );
+            service
+                .execute(
+                    &space,
+                    "main",
+                    SqlRequest::Execute {
+                        schema: None,
+                        sql: "UPDATE data SET body = 'later' WHERE id = 1".into(),
+                        params: vec![],
+                    },
+                    None,
+                    "tinycloud.sql/write".into(),
+                )
+                .await
+                .unwrap();
+            let cold_cache = TempDir::new().unwrap();
+            let recovered = SqlService::new(
+                cold_cache.path().to_string_lossy().into_owned(),
+                memory_threshold,
+                repo,
+            );
+            let cold = recovered
+                .execute(&space, "main", query(), None, "tinycloud.sql/read".into())
+                .await
+                .unwrap();
+            let SqlResponse::Query(cold) = cold.response else {
+                panic!("query response required")
+            };
+            assert_eq!(
+                cold.rows,
+                vec![vec![SqlValue::Integer(1), SqlValue::Text("later".into())]]
+            );
+        }
     }
 
     #[tokio::test]

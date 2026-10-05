@@ -1770,9 +1770,10 @@ async fn invoke_impl(
         );
         if matches!(&inputs_result, Err(InvokeError::Storage(_))) {
             // Admission proves the signature, not delegated authority. Do not
-            // disclose storage/account totals for an unauthorized write.
+            // disclose storage/account totals for authority that expired while
+            // quota fetching or upload staging was in flight.
             tinycloud
-                .authorize_admitted(&admitted, now)
+                .authorize_admitted(&admitted, OffsetDateTime::now_utc())
                 .await
                 .map_err(|error| (Status::Forbidden, error.to_string()))?;
         }
@@ -6444,6 +6445,89 @@ mod tests {
             }),
             "every quota fetch carries the service secret: {requests:?}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc626_review_expired_delegation_cannot_disclose_quota_after_fetch() -> Result<()> {
+        use rocket::http::{Header, Status};
+        use rocket::local::asynchronous::Client;
+        use tinycloud_core::{
+            models::{abilities, delegation},
+            sea_orm::{ActiveModelTrait, ActiveValue::Set},
+            types::Caveats,
+        };
+        use tokio::io::AsyncWriteExt as _;
+
+        let mut setup = metered_sql_http_setup("quota-expiry-during-fetch").await?;
+        setup.resource = setup.space.clone().to_resource(
+            "kv".parse::<Service>()?,
+            Some("allowed".parse::<AuthPath>()?),
+            None,
+            None,
+        );
+        let parent_hash = setup.parent_cid.into();
+        abilities::ActiveModel {
+            delegation: Set(parent_hash),
+            resource: Set(Resource::TinyCloud(setup.resource.clone())),
+            ability: Set(Ability::try_from("tinycloud.kv/put".to_string()).unwrap()),
+            caveats: Set(Caveats(Default::default())),
+        }
+        .insert(&setup.replay_db)
+        .await?;
+        let header = sql_invocation_header(&setup, "tinycloud.kv/put", "tc626-expiring-quota")?;
+        let conn = setup.replay_db.clone();
+        let limit = setup.used + 3;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let quota = QuotaCache::new(None, Some(format!("http://{}", listener.local_addr()?)));
+        let client = Client::tracked(metered_sql_rocket_with_quota(setup, quota)).await?;
+
+        let billing = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = [0u8; 16 * 1024];
+            let mut read = 0;
+            while read < request.len() && !request[..read].windows(4).any(|w| w == b"\r\n\r\n") {
+                let count = stream.read(&mut request[read..]).await?;
+                anyhow::ensure!(count > 0, "quota request ended before its headers");
+                read += count;
+            }
+            // The fetch proves /invoke has captured its admission timestamp.
+            // End the delegation's validity here, before releasing this async
+            // boundary, so disclosure must use a later timestamp. No sleep race.
+            delegation::ActiveModel {
+                id: Set(parent_hash),
+                expiry: Set(Some(OffsetDateTime::now_utc())),
+                ..Default::default()
+            }
+            .update(&conn)
+            .await?;
+            let body = serde_json::json!({
+                "storage_limit_bytes": limit,
+                "total_used": 987654,
+                "account_limit_bytes": 1000000,
+                "plan": "free",
+            })
+            .to_string();
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            stream.write_all(reply.as_bytes()).await?;
+            stream.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        });
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Authorization", header))
+            .body("more than three bytes")
+            .dispatch()
+            .await;
+        billing.await??;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(status, Status::Forbidden, "expired authority: {body}");
+        assert!(!body.contains("usedBytes"), "{body}");
+        assert!(!body.contains("\"account\""), "{body}");
         Ok(())
     }
 

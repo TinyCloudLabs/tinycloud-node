@@ -483,8 +483,11 @@ pub fn create_authorizer(
             }
         }
 
-        // Allow internal operations
-        AuthAction::Transaction { .. } | AuthAction::Savepoint { .. } | AuthAction::Select => {
+        // Caller SQL must never control an actor-owned transaction/savepoint.
+        // Internal guard commands run only with this authorizer uninstalled.
+        AuthAction::Transaction { .. } | AuthAction::Savepoint { .. } => Authorization::Deny,
+
+        AuthAction::Select => {
             if !is_admin
                 && resolve_alias(ability.as_str()) == "tinycloud.sql/schema"
                 && !schema_ddl_authorized
@@ -670,6 +673,47 @@ mod tests {
         let result = conn.execute_batch(sql);
         conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
         result
+    }
+
+    #[test]
+    fn tc626_review_authorizer_denies_caller_transaction_control() {
+        for sql in [
+            "RELEASE tinycloud_storage_guard",
+            "RELEASE SAVEPOINT tinycloud_storage_guard",
+            "ROLLBACK",
+            "ROLLBACK TO tinycloud_storage_guard",
+            "COMMIT",
+            "END",
+            "SAVEPOINT caller_savepoint",
+            "BEGIN",
+        ] {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE data (value TEXT);
+                 SAVEPOINT tinycloud_storage_guard;
+                 INSERT INTO data VALUES ('pending');",
+            )
+            .unwrap();
+            let error = execute_under_authorizer(&conn, "tinycloud.sql/admin", true, sql)
+                .expect_err("caller transaction control must be denied by SQLite");
+            assert!(
+                matches!(
+                    error,
+                    rusqlite::Error::SqliteFailure(code, _)
+                        if code.code == rusqlite::ErrorCode::AuthorizationForStatementDenied
+                ),
+                "transaction control was not rejected by the authorizer: {sql}"
+            );
+            assert!(!conn.is_autocommit(), "caller closed the guard: {sql}");
+            conn.execute_batch(
+                "ROLLBACK TO tinycloud_storage_guard; RELEASE tinycloud_storage_guard",
+            )
+            .unwrap();
+            let count: i64 = conn
+                .query_row("SELECT count(*) FROM data", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "internal rollback must still work after {sql}");
+        }
     }
 
     #[test]
