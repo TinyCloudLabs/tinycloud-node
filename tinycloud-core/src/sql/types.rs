@@ -25,7 +25,7 @@ pub enum SqlRequest {
     },
     #[serde(rename = "batch")]
     Batch { statements: Vec<SqlStatement> },
-    #[serde(rename = "executeStatement")]
+    #[serde(rename = "executeStatement", alias = "execute_statement")]
     ExecuteStatement {
         name: String,
         #[serde(default)]
@@ -166,6 +166,12 @@ impl From<&SqlValue> for rusqlite::types::Value {
 #[cfg(test)]
 mod request_tests {
     use super::*;
+
+    #[test]
+    fn publication_sdk_execute_statement_spelling_is_supported() {
+        let request=serde_json::from_str::<SqlRequest>(r#"{"action":"execute_statement","name":"tinycloud.meetingPublication.v3","params":["{}"]}"#).unwrap();
+        assert!(matches!(request, SqlRequest::ExecuteStatement { .. }));
+    }
 
     #[test]
     fn query_deserializes_optional_camel_case_bounds() {

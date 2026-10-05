@@ -37,6 +37,7 @@ type HydrationLockRegistry =
 pub struct SqlService {
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
     hydration_locks: HydrationLockRegistry,
+    publication_locks: HydrationLockRegistry,
     /// What each live actor's local database derives from, carried into every
     /// durable save so a stale actor is rejected instead of clobbering. Written
     /// on hydration (the only path that creates an actor) and after each
@@ -56,6 +57,7 @@ impl SqlService {
         Self {
             databases: Arc::new(DashMap::new()),
             hydration_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            publication_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             lineage: Arc::new(DashMap::new()),
             base_path,
             memory_threshold,
@@ -71,6 +73,11 @@ impl SqlService {
         caveats: Option<SqlCaveats>,
         ability: String,
     ) -> Result<SqlExecutionResult, SqlError> {
+        let _publication_guard = if db_name == super::publication::DATABASE {
+            Some(self.publication_lock(space).await.lock_owned().await)
+        } else {
+            None
+        };
         let key = (space.to_string(), db_name.to_string());
         let mut handle = self.handle(space, db_name).await?;
 
@@ -95,6 +102,37 @@ impl SqlService {
             }
         }
 
+        Ok(result)
+    }
+
+    async fn publication_lock(&self, space: &SpaceId) -> Arc<HydrationLock> {
+        let key = (space.to_string(), super::publication::DATABASE.into());
+        let mut registry = self.publication_locks.lock().await;
+        registry.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = registry.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(HydrationLock::new(()));
+        registry.insert(key, Arc::downgrade(&lock));
+        lock
+    }
+    /// Called only after the native route has checked publication authority and verified KV bytes.
+    pub async fn meeting_publication(
+        &self,
+        space: &SpaceId,
+        command: serde_json::Value,
+    ) -> Result<SqlExecutionResult, SqlError> {
+        let _guard = self.publication_lock(space).await.lock_owned().await;
+        let db_name = super::publication::DATABASE;
+        let key = (space.to_string(), db_name.to_string());
+        let handle = self.handle(space, db_name).await?;
+        let result = handle.publication(command).await?;
+        if !result.write_targets.is_empty() {
+            if let Err(error) = self.persist_write(space, db_name, &handle).await {
+                let _ = self.discard_local_state(&key).await;
+                return Err(error);
+            }
+        }
         Ok(result)
     }
 
@@ -1048,5 +1086,50 @@ mod tests {
             service.export(&space, "main").await,
             Err(SqlError::DatabaseNotFound)
         ));
+    }
+    #[tokio::test]
+    async fn publication_durable_cas_fences_another_node_and_recovers() {
+        let repo = artifact_repository().await;
+        let space = test_space_id("publication-cas");
+        let one = TempDir::new().unwrap();
+        let two = TempDir::new().unwrap();
+        let first = SqlService::new(one.path().to_string_lossy().into(), u64::MAX, repo.clone());
+        let second = SqlService::new(two.path().to_string_lossy().into(), u64::MAX, repo);
+        first
+            .meeting_publication(
+                &space,
+                serde_json::json!({"contractVersion":3,"operation":"activate"}),
+            )
+            .await
+            .unwrap();
+        second
+            .meeting_publication(
+                &space,
+                serde_json::json!({"contractVersion":3,"operation":"capabilities"}),
+            )
+            .await
+            .unwrap();
+        let command = |op| serde_json::json!({"contractVersion":3,"operation":"reserve","source":"fireflies","sourceId":"source","operationId":op});
+        first
+            .meeting_publication(&space, command("first"))
+            .await
+            .unwrap();
+        assert!(second
+            .meeting_publication(&space, command("stale"))
+            .await
+            .is_err());
+        let recovered = second
+            .meeting_publication(&space, command("recovered"))
+            .await
+            .unwrap();
+        let SqlResponse::Query(receipt) = recovered.response else {
+            panic!("query receipt required")
+        };
+        let SqlValue::Text(raw) = &receipt.rows[0][0] else {
+            panic!("raw JSON receipt required")
+        };
+        let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(value["generation"], 2);
+        assert_eq!(value["inserted"], false);
     }
 }

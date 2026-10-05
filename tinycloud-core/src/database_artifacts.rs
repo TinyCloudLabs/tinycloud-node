@@ -144,6 +144,7 @@ pub trait DatabaseArtifactRepository: Send + Sync {
 #[derive(Clone)]
 pub struct SeaOrmDatabaseArtifactRepository {
     conn: DatabaseConnection,
+    sqlite_writer_lock: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
     /// Test-only rendezvous seam (see [`wait_at_race_barrier`]) that lets two
     /// writers read the same base revision before either commits, so the
     /// full-checkpoint CAS conflict path can be exercised deterministically.
@@ -155,9 +156,20 @@ impl SeaOrmDatabaseArtifactRepository {
     pub fn new(conn: DatabaseConnection) -> Self {
         Self {
             conn,
+            sqlite_writer_lock: None,
             #[cfg(test)]
             race_barrier: None,
         }
+    }
+
+    /// Share the node's SQLite gate: artifact writes use the capability DB and
+    /// must not advance its WAL beneath a delegation transaction's snapshot.
+    pub fn with_sqlite_writer_lock(
+        mut self,
+        lock: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
+    ) -> Self {
+        self.sqlite_writer_lock = lock;
+        self
     }
 
     #[cfg(test)]
@@ -222,6 +234,10 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         payload: Vec<u8>,
         expected: ArtifactExpectation,
     ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
+        let _writer = match &self.sqlite_writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         let size_bytes = i64::try_from(payload.len())
             .map_err(|_| DatabaseArtifactError::PayloadTooLarge(payload.len() as u64))?;
         let content_hash = hash(&payload).to_cid(0x55).to_string();
@@ -391,6 +407,10 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         payload: Vec<u8>,
         expected: ArtifactExpectation,
     ) -> Result<DeltaSave, DatabaseArtifactError> {
+        let _writer = match &self.sqlite_writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         let existing = database_artifact::Entity::find_by_id((
             service.to_string(),
             space.to_string(),

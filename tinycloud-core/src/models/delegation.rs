@@ -142,7 +142,7 @@ pub enum DelegationError {
     #[error("Unauthorized Delegator: {0}")]
     UnauthorizedDelegator(String),
     #[error("Unauthorized Capability: {0}, {1}")]
-    UnauthorizedCapability(Resource, Ability),
+    UnauthorizedCapability(Box<Resource>, Ability),
     #[error("Cannot find parent delegation")]
     MissingParents,
     #[error("Child delegation expiry exceeds parent expiry")]
@@ -395,7 +395,7 @@ async fn validate<C: ConnectionTrait>(
                                 )
                         }) {
                             return Err(DelegationError::UnauthorizedCapability(
-                                c.resource.clone(),
+                                Box::new(c.resource.clone()),
                                 c.ability.clone(),
                             )
                             .into());
@@ -432,7 +432,7 @@ async fn validate<C: ConnectionTrait>(
 
                 if candidates.peek().is_none() {
                     return Err(DelegationError::UnauthorizedCapability(
-                        c.resource.clone(),
+                        Box::new(c.resource.clone()),
                         c.ability.clone(),
                     )
                     .into());
