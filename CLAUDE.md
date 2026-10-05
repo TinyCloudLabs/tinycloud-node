@@ -112,6 +112,8 @@ Authorization: <base64url-encoded-UCAN-or-CACAO>
 - `kv/put` - Write a value
 - `kv/delete` - Remove a value
 - `kv/metadata` - Get value metadata
+- `kv/sync` - Ordered change feed (key, ETag, deleted, metadata) under a prefix; must be the invocation's only capability and is never implied by `*` or defaults (see `docs/kv-sync.md`)
+- `kv/retain` - Never invoked; a grant carrying it, named in `x-tinycloud-retention-grant` on a `kv/sync` request, makes the node attest `authority.retainUntil`
 
 ## Authentication Architecture
 
