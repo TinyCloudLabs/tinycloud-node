@@ -458,7 +458,19 @@ pub async fn list_webhooks(
         .await
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
 
+    // The query's prefix filter is an unescaped SQL `LIKE`: `_` and `%` match
+    // any character and SQLite ignores ASCII case, so it can return other
+    // subscribers' rows. Keep only rows the authorization rule itself covers.
+    let requested_path = hook_scope_path(&requested_scope.service, normalized_prefix.as_deref());
     rows.into_iter()
+        .filter(|row| {
+            row.space_id == requested_scope.space
+                && row.target_service == requested_scope.service
+                && scope_extends(
+                    &hook_scope_path(&row.target_service, row.path_prefix.as_deref()),
+                    &requested_path,
+                )
+        })
         .map(|row| webhook_response_from_model(&row))
         .collect::<Result<Vec<_>, _>>()
         .map(Json)
@@ -1503,10 +1515,14 @@ mod tests {
         }
 
         async fn list(&self, header: String) -> (Status, String) {
+            self.list_prefix(header, "documents").await
+        }
+
+        async fn list_prefix(&self, header: String, prefix: &str) -> (Status, String) {
             let response = self
                 .client
                 .get(format!(
-                    "/hooks/webhooks?space={}&service=kv&prefix=documents",
+                    "/hooks/webhooks?space={}&service=kv&prefix={prefix}",
                     self.space
                 ))
                 .header(rocket::http::Header::new("Authorization", header))
@@ -2135,6 +2151,56 @@ mod tests {
             .ticket(header, &fixture.space, "kv", "documents")
             .await;
         assert_eq!(status, Status::Ok, "{body}");
+        Ok(())
+    }
+
+    /// The subscription query's `LIKE 'prefix/%'` treats `_` and `%` as
+    /// wildcards and, on SQLite, ignores ASCII case. Listing must return only
+    /// rows inside the authorized scope, never another subscriber's rows that
+    /// merely match the pattern.
+    #[tokio::test]
+    async fn list_returns_only_rows_inside_the_authorized_scope() -> Result<()> {
+        let fixture =
+            hook_route_fixture(&[("hooks", "kv/my_docs", "tinycloud.hooks/list")]).await?;
+        let space = fixture.space.to_string();
+        let row = |id: &str, path_prefix: &str| hook_subscription::Model {
+            id: id.to_string(),
+            subscriber_did: "did:key:other-subscriber".to_string(),
+            space_id: space.clone(),
+            target_service: "kv".to_string(),
+            path_prefix: Some(path_prefix.to_string()),
+            abilities_json: None,
+            callback_url: format!("https://1.1.1.1/{id}"),
+            encrypted_secret: vec![1, 2, 3],
+            secret_key_id: HOOK_WEBHOOK_SECRET_KEY_ID.to_string(),
+            active: true,
+            created_at: "2026-10-05T00:00:00Z".to_string(),
+        };
+        hook_subscription::Entity::insert_many(
+            [
+                row("exact", "my_docs"),
+                row("nested", "my_docs/inbox"),
+                row("upper", "MY_DOCS/secret"),
+                row("underscore", "myXdocs/secret"),
+                row("percent", "my%docs/secret"),
+                row("sibling", "my_docs_archive/secret"),
+            ]
+            .map(hook_subscription::ActiveModel::from),
+        )
+        .exec(&fixture.db)
+        .await?;
+
+        let header =
+            fixture.session_header(&[(fixture.hooks("kv/my_docs")?, &["tinycloud.hooks/list"])])?;
+        let (status, body) = fixture.list_prefix(header, "my_docs").await;
+        assert_eq!(status, Status::Ok, "{body}");
+        let listed: Vec<serde_json::Value> = serde_json::from_str(&body)?;
+        let mut ids = listed
+            .iter()
+            .map(|row| row["id"].as_str().expect("webhook id"))
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, ["exact", "nested"]);
         Ok(())
     }
 }
