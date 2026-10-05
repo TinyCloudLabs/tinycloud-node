@@ -24,7 +24,7 @@ use sea_orm::{
     entity::prelude::*,
     error::{DbErr, RuntimeErr, SqlxError},
     query::*,
-    sea_query::{Expr, ExprTrait, LikeExpr, OnConflict, Query, SimpleExpr},
+    sea_query::{Expr, ExprTrait, OnConflict, Query, SimpleExpr},
     ActiveValue::Set,
     ConnectionTrait, DatabaseTransaction, DbBackend, IntoActiveModel, TransactionTrait,
 };
@@ -258,6 +258,9 @@ where
     KvSerializationConflict,
     #[error("KV response is {size} bytes, exceeding the requested limit of {limit} bytes")]
     KvResponseTooLarge { size: u64, limit: u64 },
+    /// A `tinycloud.kv/list` cursor names a key outside the listed prefix.
+    #[error("KV list cursor is outside the requested prefix")]
+    KvListCursorOutsidePrefix,
 }
 
 impl<B, S, K> From<DbErr> for TxStoreError<B, S, K>
@@ -2012,6 +2015,9 @@ where
                     results.push(InvocationOutcome::KvRead(data));
                 }
                 (space, "kv", "tinycloud.kv/list", path) => {
+                    if !kv_list_cursor_in_prefix(path, options.list_cursor.as_ref()) {
+                        return Err(TxStoreError::KvListCursorOutsidePrefix);
+                    }
                     let (list, truncated) = list_bounded_after(
                         &tx,
                         space,
@@ -2199,8 +2205,17 @@ where
                     results.push(InvocationOutcome::KvRead(data));
                 }
                 (space, "kv", "tinycloud.kv/list", path) => {
-                    let (list, truncated) =
-                        list_bounded(&self.conn, space, path, options.list_limit).await?;
+                    if !kv_list_cursor_in_prefix(path, options.list_cursor.as_ref()) {
+                        return Err(TxStoreError::KvListCursorOutsidePrefix);
+                    }
+                    let (list, truncated) = list_bounded_after(
+                        &self.conn,
+                        space,
+                        path,
+                        options.list_limit,
+                        options.list_cursor.as_ref(),
+                    )
+                    .await?;
                     results.push(InvocationOutcome::KvList(list, truncated, None));
                 }
                 (space, "kv", "tinycloud.kv/metadata", path) => {
@@ -3136,6 +3151,106 @@ async fn list_bounded<C: ConnectionTrait>(
     list_bounded_after(db, space_id, prefix, limit, None).await
 }
 
+/// Whether `key` lies inside the KV prefix `prefix`, by whole path segments.
+///
+/// This is the rule `ResourceId::extends` applies to delegation scope (and the
+/// hooks `scope_extends` applies to subscriptions): a grant on `docs` covers
+/// `docs` and `docs/a` but not `docsecret/x`, and a grant on `notes/` covers
+/// everything that starts with `notes/`. Matching is byte-exact, so `DOCS/x` is
+/// never inside `docs`. The empty prefix covers the whole space.
+pub fn kv_prefix_covers(prefix: &str, key: &str) -> bool {
+    prefix.is_empty()
+        || key
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.is_empty() || prefix.ends_with('/') || rest.starts_with('/'))
+}
+
+/// A list cursor must name a key inside the listed prefix; no cursor is fine.
+fn kv_list_cursor_in_prefix(prefix: &Path, cursor: Option<&Path>) -> bool {
+    cursor.is_none_or(|cursor| kv_prefix_covers(prefix.as_str(), cursor.as_str()))
+}
+
+/// `current_kv.key`, compared in byte order on every backend. See
+/// `byte_ordered_resource` for why the column's own collation cannot be
+/// trusted for range predicates.
+fn byte_ordered_key(backend: DbBackend) -> SimpleExpr {
+    byte_ordered(
+        backend,
+        Expr::col((current_kv::Entity, current_kv::Column::Key)),
+    )
+}
+
+/// The SQL form of `kv_prefix_covers` over `current_kv.key`, or `None` for the
+/// empty prefix (a whole-space list needs no predicate).
+///
+/// A byte-ordered half-open range `[q, q_hi)` selects exactly the keys that
+/// start with `q`: `q` is the prefix with one trailing `/`, and `q_hi` is `q`
+/// with that `/` bumped to the next byte, `0`. A prefix without a trailing
+/// `/` also matches the bare key itself. Unlike `LIKE`, the range needs no
+/// escaping, never folds ASCII case (SQLite's `LIKE` does), and stays an
+/// index range on the `(space, key)` primary key.
+fn kv_prefix_condition(backend: DbBackend, prefix: &str) -> Option<Condition> {
+    if prefix.is_empty() {
+        return None;
+    }
+    let (lower, bare_key) = if prefix.ends_with('/') {
+        (prefix.to_owned(), false)
+    } else {
+        (format!("{prefix}/"), true)
+    };
+    let upper = format!("{}0", &lower[..lower.len() - 1]);
+    let descendants = Condition::all()
+        .add(byte_ordered_key(backend).gte(lower))
+        .add(byte_ordered_key(backend).lt(upper));
+    Some(if bare_key {
+        Condition::any()
+            .add(byte_ordered_key(backend).eq(prefix))
+            .add(descendants)
+    } else {
+        descendants
+    })
+}
+
+/// The `list_bounded_after` query. Paging compares (`key > after`) and orders
+/// (`ORDER BY key`) in one collation -- the column's own -- inside SQL, so a
+/// page boundary can never skip or repeat a key; membership is decided by the
+/// byte-ordered `kv_prefix_condition`. One more row than `limit` is fetched to
+/// detect truncation.
+fn kv_list_statement(
+    backend: DbBackend,
+    space_id: &SpaceId,
+    prefix: &Path,
+    limit: Option<usize>,
+    after: Option<&Path>,
+) -> Statement {
+    let mut condition = Condition::all()
+        .add(Expr::col(current_kv::Column::Deleted).eq(false))
+        .add(
+            Expr::col((current_kv::Entity, current_kv::Column::Space))
+                .eq(SpaceIdWrap(space_id.clone())),
+        );
+    if let Some(prefix) = kv_prefix_condition(backend, prefix.as_str()) {
+        condition = condition.add(prefix);
+    }
+    if let Some(after) = after {
+        condition = condition
+            .add(Expr::col((current_kv::Entity, current_kv::Column::Key)).gt(after.as_str()));
+    }
+    let mut query = Query::select();
+    query
+        .column((current_kv::Entity, current_kv::Column::Key))
+        .from(current_kv::Entity)
+        .cond_where(condition)
+        .order_by((current_kv::Entity, current_kv::Column::Key), Order::Asc);
+    if let Some(limit) = limit {
+        query.limit(limit.saturating_add(1) as u64);
+    }
+    backend.build(&query)
+}
+
+/// List live keys inside `prefix` (by `kv_prefix_covers`), at most `limit` of
+/// them, strictly after the keyset cursor `after`. Callers validate `after`
+/// against `prefix`.
 async fn list_bounded_after<C: ConnectionTrait>(
     db: &C,
     space_id: &SpaceId,
@@ -3143,52 +3258,9 @@ async fn list_bounded_after<C: ConnectionTrait>(
     limit: Option<usize>,
     after: Option<&Path>,
 ) -> Result<(Vec<Path>, bool), DbErr> {
-    if let Some(after) = after {
-        let prefix = prefix.as_str();
-        let valid = after.as_str() == prefix
-            || (prefix.is_empty() && !after.as_str().is_empty())
-            || after
-                .as_str()
-                .strip_prefix(prefix)
-                .is_some_and(|rest| rest.starts_with('/'));
-        if !valid {
-            return Err(DbErr::Custom(
-                "KV list cursor is outside the requested prefix".to_string(),
-            ));
-        }
-    }
-    let escaped_prefix = prefix
-        .as_str()
-        .replace('!', "!!")
-        .replace('%', "!%")
-        .replace('_', "!_");
-    let mut query = Query::select();
-    query
-        .column((current_kv::Entity, current_kv::Column::Key))
-        .from(current_kv::Entity)
-        .cond_where(
-            Condition::all()
-                .add(Expr::col(current_kv::Column::Deleted).eq(false))
-                .add(
-                    Expr::col((current_kv::Entity, current_kv::Column::Key))
-                        .like(LikeExpr::new(format!("{escaped_prefix}%")).escape('!')),
-                )
-                .add(
-                    Expr::col((current_kv::Entity, current_kv::Column::Space))
-                        .eq(SpaceIdWrap(space_id.clone())),
-                ),
-        );
-    if let Some(after) = after {
-        query.cond_where(
-            Expr::col((current_kv::Entity, current_kv::Column::Key)).gt(after.as_str()),
-        );
-    }
-    query.order_by((current_kv::Entity, current_kv::Column::Key), Order::Asc);
-    if let Some(limit) = limit {
-        query.limit(limit.saturating_add(1) as u64);
-    }
+    let statement = kv_list_statement(db.get_database_backend(), space_id, prefix, limit, after);
     let mut list = db
-        .query_all(db.get_database_backend().build(&query))
+        .query_all(statement)
         .await?
         .into_iter()
         .map(|row| row.try_get::<String>("", current_kv::Column::Key.as_str()))
@@ -3197,10 +3269,7 @@ async fn list_bounded_after<C: ConnectionTrait>(
         .map(|key| key.parse())
         .collect::<Result<Vec<Path>, _>>()
         .map_err(|error| DbErr::Custom(format!("invalid persisted KV path: {error}")))?;
-    if let Some(after) = after {
-        list.retain(|path| path.as_str() > after.as_str());
-    }
-    let truncated = limit.map(|limit| list.len() > limit).unwrap_or(false);
+    let truncated = limit.is_some_and(|limit| list.len() > limit);
     if let Some(limit) = limit {
         list.truncate(limit);
     }
@@ -3397,17 +3466,24 @@ fn space_resource_bounds(space_id: &SpaceId) -> (String, String) {
 /// SQLite is unaffected: `COLLATE BINARY` there is the column's own
 /// collation, so the range still resolves as an index seek.
 fn byte_ordered_resource(backend: DbBackend) -> SimpleExpr {
-    let resource = Expr::col((abilities::Entity, abilities::Column::Resource));
+    byte_ordered(
+        backend,
+        Expr::col((abilities::Entity, abilities::Column::Resource)),
+    )
+}
+
+/// `column`, compared in byte order on `backend` (see `byte_ordered_resource`).
+fn byte_ordered(backend: DbBackend, column: impl Into<SimpleExpr>) -> SimpleExpr {
     // `$1` / `?` is sea-query's per-backend placeholder for the embedded
-    // expression above, not for a bound value.
+    // column expression, not for a bound value.
     match backend {
-        DbBackend::Postgres => Expr::cust_with_expr(r#"$1 COLLATE "C""#, resource),
+        DbBackend::Postgres => Expr::cust_with_expr(r#"$1 COLLATE "C""#, column),
         // SQLite columns are BINARY (byte-ordered) by default; saying so
         // explicitly keeps the predicate index-usable and self-documenting.
-        DbBackend::Sqlite => Expr::cust_with_expr("? COLLATE BINARY", resource),
+        DbBackend::Sqlite => Expr::cust_with_expr("? COLLATE BINARY", column),
         // MySQL's binary collation name depends on the column's charset, so
         // cast instead -- that is charset-independent.
-        DbBackend::MySql => Expr::cust_with_expr("CAST(? AS BINARY)", resource),
+        DbBackend::MySql => Expr::cust_with_expr("CAST(? AS BINARY)", column),
     }
 }
 
@@ -4624,51 +4700,37 @@ mod test {
         assert_eq!(contender.await.unwrap().len(), 1);
     }
 
-    #[tokio::test]
-    async fn bounded_kv_list_counts_distinct_keys_in_order() {
+    /// Seed `keys` as live KV entries in a fresh space through the real
+    /// `kv_write` + `current_kv` projection path, one invocation per key
+    /// (`invocation-{index}`). A repeated key overwrites the earlier write.
+    async fn seed_kv_keys<C: ConnectionTrait>(conn: &C, name: &str, keys: &[&str]) -> SpaceId {
         use sea_orm::ActiveValue::Set;
 
-        let db = get_db().await.unwrap();
-        let space = test_space_id("bounded-kv-list");
-        let actor_id = "did:key:bounded-kv-list";
+        let space = test_space_id(name);
+        let actor_id = format!("did:key:{name}");
         actor::ActiveModel {
-            id: Set(actor_id.to_string()),
+            id: Set(actor_id.clone()),
         }
-        .insert(&db.conn)
+        .insert(conn)
         .await
         .unwrap();
         space::ActiveModel {
             id: Set(SpaceIdWrap(space.clone())),
         }
-        .insert(&db.conn)
+        .insert(conn)
         .await
         .unwrap();
-
-        let shared_value = crate::hash::hash(b"shared-value");
-        for (index, key) in [
-            "a",
-            "a",
-            "b",
-            "c",
-            "literal%key",
-            "literalXkey",
-            "literal_key",
-            "bang!key",
-            "bangXkey",
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for (index, key) in keys.iter().enumerate() {
             let invocation_id = crate::hash::hash(format!("invocation-{index}").as_bytes());
             let epoch_id = crate::hash::hash(format!("epoch-{index}").as_bytes());
             invocation::ActiveModel {
                 id: Set(invocation_id),
-                invoker: Set(actor_id.to_string()),
+                invoker: Set(actor_id.clone()),
                 issued_at: Set(OffsetDateTime::now_utc()),
                 facts: Set(None),
                 serialization: Set(vec![index as u8]),
             }
-            .insert(&db.conn)
+            .insert(conn)
             .await
             .unwrap();
             epoch::ActiveModel {
@@ -4676,7 +4738,7 @@ mod test {
                 id: Set(epoch_id),
                 space: Set(SpaceIdWrap(space.clone())),
             }
-            .insert(&db.conn)
+            .insert(conn)
             .await
             .unwrap();
             event_order::ActiveModel {
@@ -4686,7 +4748,7 @@ mod test {
                 event: Set(invocation_id),
                 space: Set(SpaceIdWrap(space.clone())),
             }
-            .insert(&db.conn)
+            .insert(conn)
             .await
             .unwrap();
             let write = kv_write::Model {
@@ -4696,17 +4758,70 @@ mod test {
                 seq: index as i64,
                 epoch: epoch_id,
                 epoch_seq: 0,
-                value: shared_value,
+                value: crate::hash::hash(b"shared-value"),
                 metadata: Metadata(std::collections::BTreeMap::new()),
             };
             kv_write::ActiveModel::from(write.clone())
-                .insert(&db.conn)
+                .insert(conn)
                 .await
                 .unwrap();
-            invocation::upsert_current_kv(&db.conn, write)
-                .await
-                .unwrap();
+            invocation::upsert_current_kv(conn, write).await.unwrap();
         }
+        space
+    }
+
+    /// Page through `prefix` `limit` keys at a time, following the keyset
+    /// cursor, and return every page.
+    async fn kv_list_pages<C: ConnectionTrait>(
+        conn: &C,
+        space: &SpaceId,
+        prefix: &str,
+        limit: usize,
+    ) -> Vec<Vec<String>> {
+        let prefix: Path = prefix.parse().unwrap();
+        let mut pages = Vec::new();
+        let mut after: Option<Path> = None;
+        loop {
+            assert!(
+                kv_list_cursor_in_prefix(&prefix, after.as_ref()),
+                "a cursor the list itself produced must be accepted"
+            );
+            let (paths, truncated) =
+                list_bounded_after(conn, space, &prefix, Some(limit), after.as_ref())
+                    .await
+                    .unwrap();
+            pages.push(paths.iter().map(|p| p.as_str().to_owned()).collect());
+            if !truncated {
+                return pages;
+            }
+            assert!(pages.len() <= 16, "paging did not terminate: {pages:?}");
+            after = paths.last().cloned();
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_kv_list_counts_distinct_keys_in_order() {
+        use sea_orm::ActiveValue::Set;
+
+        let db = get_db().await.unwrap();
+        let space = seed_kv_keys(
+            &db.conn,
+            "bounded-kv-list",
+            &[
+                "a",
+                "a",
+                "b",
+                "c",
+                "literal%key",
+                "literalXkey",
+                "literal_key",
+                "bang!key",
+                "bangXkey",
+            ],
+        )
+        .await;
+        let actor_id = "did:key:bounded-kv-list";
+        let shared_value = crate::hash::hash(b"shared-value");
 
         let (paths, truncated) = list_bounded(&db.conn, &space, &"".parse().unwrap(), Some(2))
             .await
@@ -4768,25 +4883,26 @@ mod test {
             shared_value
         );
 
-        let (paths, truncated) =
-            list_bounded(&db.conn, &space, &"literal%".parse().unwrap(), Some(10))
-                .await
-                .unwrap();
-        assert_eq!(
-            paths.iter().map(Path::as_str).collect::<Vec<_>>(),
-            vec!["literal%key"]
-        );
-        assert!(!truncated);
-
+        // TC-731: a prefix names whole path segments, and `%`, `_` and `!`
+        // are literal bytes. A partial segment lists nothing, so a `LIKE`
+        // wildcard (`literal_` matching `literalXkey`) cannot leak through.
         for (prefix, expected) in [
-            ("literal_", vec!["literal_key"]),
-            ("bang!", vec!["bang!key"]),
+            ("literal%key", vec!["literal%key"]),
+            ("literal_key", vec!["literal_key"]),
+            ("bang!key", vec!["bang!key"]),
+            ("literal%", vec![]),
+            ("literal_", vec![]),
+            ("bang!", vec![]),
         ] {
             let (paths, truncated) =
                 list_bounded(&db.conn, &space, &prefix.parse().unwrap(), Some(10))
                     .await
                     .unwrap();
-            assert_eq!(paths.iter().map(Path::as_str).collect::<Vec<_>>(), expected);
+            assert_eq!(
+                paths.iter().map(Path::as_str).collect::<Vec<_>>(),
+                expected,
+                "prefix {prefix:?}"
+            );
             assert!(!truncated);
         }
 
@@ -4839,6 +4955,154 @@ mod test {
             ]
         );
         assert!(!truncated);
+    }
+
+    #[test]
+    fn kv_prefix_covers_is_the_extends_rule() {
+        for (prefix, key, covered) in [
+            ("", "anything", true),
+            ("", "", true),
+            ("docs", "docs", true),
+            ("docs", "docs/a", true),
+            ("docs", "docs/a/b", true),
+            ("docs", "docsecret/x", false),
+            ("docs", "docs-x", false),
+            ("docs", "DOCS/x", false),
+            ("docs", "doc", false),
+            ("docs/", "docs/a", true),
+            ("docs/", "docs/", true),
+            ("docs/", "docs", false),
+            ("docs/", "docsecret", false),
+        ] {
+            assert_eq!(
+                kv_prefix_covers(prefix, key),
+                covered,
+                "prefix {prefix:?}, key {key:?}"
+            );
+            if !prefix.is_empty() {
+                // The listing rule must never diverge from delegation scope.
+                let space = test_space_id("covers");
+                let resource = |path: &str| {
+                    space.clone().to_resource(
+                        "kv".parse().unwrap(),
+                        Some(path.parse().unwrap()),
+                        None,
+                        None,
+                    )
+                };
+                assert_eq!(
+                    resource(key).extends(&resource(prefix)).is_ok(),
+                    covered,
+                    "extends disagrees for prefix {prefix:?}, key {key:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn kv_list_prefix_is_segment_exact() {
+        let db = get_db().await.unwrap();
+        let space = seed_kv_keys(
+            &db.conn,
+            "segment-exact",
+            &[
+                "doc",
+                "docs",
+                "docs-x",
+                "docs.x",
+                "docs/a",
+                "docs/b/c",
+                "docsecret/x",
+                "DOCS/x",
+                "Docs",
+            ],
+        )
+        .await;
+        for (prefix, expected) in [
+            ("docs", vec!["docs", "docs/a", "docs/b/c"]),
+            ("docs/b", vec!["docs/b/c"]),
+            ("DOCS", vec!["DOCS/x"]),
+            ("docsecret", vec!["docsecret/x"]),
+            ("doc", vec!["doc"]),
+        ] {
+            let (paths, truncated) = list_bounded(&db.conn, &space, &prefix.parse().unwrap(), None)
+                .await
+                .unwrap();
+            assert_eq!(
+                paths.iter().map(Path::as_str).collect::<Vec<_>>(),
+                expected,
+                "prefix {prefix:?}"
+            );
+            assert!(!truncated);
+        }
+    }
+
+    #[tokio::test]
+    async fn kv_list_trailing_slash_prefix_excludes_bare_key() {
+        let db = get_db().await.unwrap();
+        let space = seed_kv_keys(
+            &db.conn,
+            "trailing-slash",
+            &["notes", "notes/a", "notes/b/c", "notesx/y", "NOTES/a"],
+        )
+        .await;
+        let (paths, truncated) = list_bounded(&db.conn, &space, &"notes/".parse().unwrap(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            paths.iter().map(Path::as_str).collect::<Vec<_>>(),
+            vec!["notes/a", "notes/b/c"]
+        );
+        assert!(!truncated);
+        // Page 2 of a slash-terminated prefix used to be rejected as a cursor
+        // outside the prefix (500); it must now page normally.
+        assert_eq!(
+            kv_list_pages(&db.conn, &space, "notes/", 1).await,
+            vec![vec!["notes/a"], vec!["notes/b/c"]]
+        );
+    }
+
+    #[tokio::test]
+    async fn kv_list_pages_are_distinct_and_complete() {
+        let db = get_db().await.unwrap();
+        let space = seed_kv_keys(
+            &db.conn,
+            "distinct-pages",
+            &["docs/b", "docsecret/x", "docs", "docs/a", "DOCS/z"],
+        )
+        .await;
+        assert_eq!(
+            kv_list_pages(&db.conn, &space, "docs", 1).await,
+            vec![vec!["docs"], vec!["docs/a"], vec!["docs/b"]]
+        );
+        assert_eq!(
+            kv_list_pages(&db.conn, &space, "docs", 2).await,
+            vec![vec!["docs", "docs/a"], vec!["docs/b"]]
+        );
+    }
+
+    #[test]
+    fn kv_list_cursor_outside_prefix_is_rejected() {
+        let path = |s: &str| s.parse::<Path>().unwrap();
+        assert!(kv_list_cursor_in_prefix(&path("docs"), None));
+        assert!(kv_list_cursor_in_prefix(&path("docs"), Some(&path("docs"))));
+        assert!(kv_list_cursor_in_prefix(
+            &path("docs"),
+            Some(&path("docs/a"))
+        ));
+        assert!(kv_list_cursor_in_prefix(
+            &path("notes/"),
+            Some(&path("notes/a"))
+        ));
+        assert!(kv_list_cursor_in_prefix(&path(""), Some(&path("x"))));
+        assert!(!kv_list_cursor_in_prefix(
+            &path("docs"),
+            Some(&path("docsecret/x"))
+        ));
+        assert!(!kv_list_cursor_in_prefix(
+            &path("docs"),
+            Some(&path("DOCS/x"))
+        ));
     }
 
     #[tokio::test]
@@ -4918,13 +5182,24 @@ mod test {
             ),
         )
         .await;
-        let current_list = explain(
-            &db.conn,
-            format!(
-                "SELECT key FROM current_kv WHERE space='{space_sql}' AND deleted=0 AND key LIKE 'need%' ESCAPE '!' ORDER BY key LIMIT 11"
-            ),
-        )
-        .await;
+        // TC-731: plan the statement `list_bounded_after` really runs -- the
+        // byte-ordered segment range plus a keyset cursor -- not a hand copy.
+        let mut current_list = kv_list_statement(
+            DbBackend::Sqlite,
+            &space,
+            &"need".parse().unwrap(),
+            Some(10),
+            Some(&"need/a".parse().unwrap()),
+        );
+        current_list.sql = format!("EXPLAIN QUERY PLAN {}", current_list.sql);
+        let current_list = db
+            .conn
+            .query_all(current_list)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get::<String>("", "detail").unwrap())
+            .collect::<Vec<_>>();
 
         println!(
             "TC-271 query-plan evidence: history_rows=5000 projection_rows=1 legacy_exact={legacy_exact:?} current_exact={current_exact:?} legacy_list={legacy_list:?} current_list={current_list:?}"
@@ -7767,5 +8042,132 @@ mod test {
             .await
             .ok();
         exercise.expect("TC-320 PostgreSQL collation resilience");
+    }
+
+    /// TC-731: KV list paging and prefix membership must not depend on the
+    /// `current_kv.key` collation.
+    ///
+    /// Under a linguistic collation (production's `en_US.UTF-8`; here ICU
+    /// `en`, which CI's C-collated PG16 would otherwise hide) `docs/b` sorts
+    /// before `docs/B` while byte order puts it after. The old list paged in
+    /// SQL collation and then re-filtered `> cursor` in Rust byte order, so the
+    /// page after `docs/b` dropped `docs/B`. Paging now compares and orders in
+    /// one collation inside SQL, and membership is a byte-ordered range.
+    #[tokio::test]
+    async fn postgres_kv_list_paging_survives_hostile_collation() {
+        let Some(database_url) = crate::test_support::postgres_test_url(
+            "postgres_kv_list_paging_survives_hostile_collation",
+        ) else {
+            return;
+        };
+
+        let admin = Database::connect(ConnectOptions::new(database_url.clone()))
+            .await
+            .expect("connect to PostgreSQL test database");
+        let schema = format!(
+            "tc731_collation_{}_{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        admin
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("CREATE SCHEMA {schema}"),
+            ))
+            .await
+            .expect("create isolated TC-731 collation schema");
+
+        let mut options = ConnectOptions::new(database_url);
+        options
+            .max_connections(4)
+            .sqlx_logging(false)
+            .set_schema_search_path(schema.clone());
+        let conn = Database::connect(options)
+            .await
+            .expect("connect to isolated TC-731 collation schema");
+        Migrator::up(&conn, None)
+            .await
+            .expect("migrate isolated TC-731 collation schema");
+
+        let exercise: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+            conn.execute(Statement::from_string(
+                DbBackend::Postgres,
+                "CREATE COLLATION tc731_linguistic (provider = icu, locale = 'en')".to_string(),
+            ))
+            .await?;
+            conn.execute(Statement::from_string(
+                DbBackend::Postgres,
+                "ALTER TABLE current_kv ALTER COLUMN key TYPE character varying \
+                 COLLATE tc731_linguistic"
+                    .to_string(),
+            ))
+            .await?;
+
+            let space = seed_kv_keys(
+                &conn,
+                "pg-hostile-collation",
+                &[
+                    "docs",
+                    "docs/a",
+                    "docs/B",
+                    "docs/b",
+                    "docsecret/x",
+                    "DOCS/x",
+                    "Docs/y",
+                    "docs-x",
+                ],
+            )
+            .await;
+
+            // Prove the hazard is live: the column's own order is not byte
+            // order, otherwise this test proves nothing.
+            let column_order = conn
+                .query_all(Statement::from_string(
+                    DbBackend::Postgres,
+                    "SELECT key FROM current_kv WHERE key IN ('docs/b', 'docs/B') ORDER BY key"
+                        .to_string(),
+                ))
+                .await?
+                .into_iter()
+                .map(|row| row.try_get::<String>("", "key"))
+                .collect::<Result<Vec<_>, _>>()?;
+            println!("TC-731 hostile collation: column order {column_order:?}");
+            assert_eq!(
+                column_order,
+                vec!["docs/b", "docs/B"],
+                "the linguistic collation must disagree with byte order"
+            );
+
+            let expected: std::collections::BTreeSet<String> =
+                ["docs", "docs/a", "docs/B", "docs/b"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect();
+            for limit in [1, 2, 3] {
+                let pages = kv_list_pages(&conn, &space, "docs", limit).await;
+                let keys = pages.iter().flatten().cloned().collect::<Vec<_>>();
+                let distinct = keys
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(
+                    distinct.len(),
+                    keys.len(),
+                    "limit {limit}: a key repeated across pages: {pages:?}"
+                );
+                assert_eq!(distinct, expected, "limit {limit}: pages {pages:?}");
+            }
+            Ok(())
+        }
+        .await;
+
+        admin
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("DROP SCHEMA {schema} CASCADE"),
+            ))
+            .await
+            .expect("drop isolated TC-731 collation schema");
+        exercise.expect("TC-731 PostgreSQL collation resilience");
     }
 }

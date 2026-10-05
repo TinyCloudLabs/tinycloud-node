@@ -1963,6 +1963,7 @@ async fn invoke_impl(
                         TxStoreError::LegacyMeetingFrozen => Status::Conflict,
                         TxStoreError::KvSerializationConflict => Status::ServiceUnavailable,
                         TxStoreError::KvResponseTooLarge { .. } => Status::PayloadTooLarge,
+                        TxStoreError::KvListCursorOutsidePrefix => Status::BadRequest,
                         TxStoreError::Tx(TxError::InvalidInvocation(
                             invocation_model::InvocationError::MissingKvWrite(_),
                         )) => Status::NotFound,
@@ -7971,6 +7972,129 @@ mod tests {
         );
 
         tinycloud_core::admission::test_hook::disarm(identity);
+        Ok(())
+    }
+
+    /// TC-731 happy path through the real `/invoke` route: a `kv/list` on
+    /// `docs` at limit 1 over three keys inside `docs` follows
+    /// `x-tinycloud-next-cursor` to three distinct pages, and the sibling
+    /// `docsecret/x` and the case-variant `DOCS/x` never appear. A list-only
+    /// invocation takes the read-only path, which used to drop the cursor and
+    /// return page 1 forever.
+    #[tokio::test]
+    async fn kv_list_read_only_paging_follows_next_cursor() -> Result<()> {
+        use rocket::http::{ContentType, Header, Status};
+        use rocket::local::asynchronous::Client;
+
+        let signer = JWK::generate_ed25519()?;
+        let issuer_vm = tc341_verification_method(&signer)?;
+        let keys = ["docs/b", "docsecret/x", "docs", "DOCS/x", "docs/a"];
+        let (_, space) = tc409_root_invocation(
+            &signer,
+            &issuer_vm,
+            "kv",
+            "tinycloud.kv/list",
+            Some("docs"),
+            "urn:uuid:tc731-probe",
+        )?;
+        let (rocket, _conn) = tc409_invoke_rocket(&space).await?;
+        let cursor_key = rocket
+            .state::<TinyCloud>()
+            .expect("TinyCloud is managed")
+            .kv_cursor_key();
+        let client = Client::tracked(rocket).await?;
+
+        for (index, key) in keys.iter().enumerate() {
+            let (header, _) = tc409_root_invocation(
+                &signer,
+                &issuer_vm,
+                "kv",
+                "tinycloud.kv/put",
+                Some(key),
+                &format!("urn:uuid:tc731-put-{index}"),
+            )?;
+            let response = client
+                .post("/invoke")
+                .header(Header::new("Authorization", header))
+                .header(ContentType::Plain)
+                .body(*key)
+                .dispatch()
+                .await;
+            assert!(
+                response.status().class().is_success(),
+                "seeding {key} failed: {}",
+                response.status()
+            );
+        }
+
+        let mut nonce = 0;
+        let mut list_page = |cursor: Option<String>| {
+            nonce += 1;
+            let (header, _) = tc409_root_invocation(
+                &signer,
+                &issuer_vm,
+                "kv",
+                "tinycloud.kv/list",
+                Some("docs"),
+                &format!("urn:uuid:tc731-list-{nonce}"),
+            )
+            .expect("sign list invocation");
+            let mut request = client
+                .post("/invoke")
+                .header(Header::new("Authorization", header))
+                .header(Header::new("x-tinycloud-limit", "1"));
+            if let Some(cursor) = cursor {
+                request = request.header(Header::new("x-tinycloud-cursor", cursor));
+            }
+            async move {
+                let response = request.dispatch().await;
+                let status = response.status();
+                let next = response
+                    .headers()
+                    .get_one("x-tinycloud-next-cursor")
+                    .map(str::to_owned);
+                let body = response.into_string().await.unwrap_or_default();
+                (status, body, next)
+            }
+        };
+
+        let mut pages = Vec::new();
+        let mut cursors = Vec::new();
+        let mut cursor = None;
+        loop {
+            let (status, body, next) = list_page(cursor.clone()).await;
+            assert_eq!(status, Status::Ok, "list page {}: {body}", pages.len() + 1);
+            pages.push(serde_json::from_str::<Vec<String>>(&body)?);
+            match next {
+                Some(next) => {
+                    cursors.push(next.clone());
+                    cursor = Some(next);
+                }
+                None => break,
+            }
+            assert!(pages.len() <= 4, "paging did not terminate: {pages:?}");
+        }
+        assert_eq!(
+            pages,
+            vec![
+                vec!["docs".to_string()],
+                vec!["docs/a".to_string()],
+                vec!["docs/b".to_string()],
+            ],
+            "three distinct pages, segment- and case-exact"
+        );
+
+        // A validly MAC'd cursor whose key lies outside the prefix is a typed
+        // 400, not a 500 and not a page. The node never mints one, so re-sign
+        // a real cursor with its `last` moved to the leaky sibling.
+        let mut wire: KvListCursorWire =
+            serde_json::from_slice(&decode_config(&cursors[0], URL_SAFE_NO_PAD)?)?;
+        wire.payload.last = "docsecret/x".to_string();
+        wire.mac = kv_cursor_mac(&cursor_key, &wire.payload).expect("mac");
+        let forged = encode_config(serde_json::to_vec(&wire)?, URL_SAFE_NO_PAD);
+        let (status, body, _) = list_page(Some(forged)).await;
+        assert_eq!(status, Status::BadRequest, "{body}");
+        assert!(body.contains("outside the requested prefix"), "{body}");
         Ok(())
     }
 }
