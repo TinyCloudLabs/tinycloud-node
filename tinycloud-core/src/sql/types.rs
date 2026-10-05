@@ -244,6 +244,10 @@ pub enum SqlError {
     ResponseTooLarge(u64),
     #[error("Quota exceeded")]
     QuotaExceeded,
+    /// The space is full and the request would have grown the database; it
+    /// was undone.
+    #[error("Write would grow a full database")]
+    StorageWouldGrow,
     #[error("Invalid statement: {0}")]
     InvalidStatement(String),
     #[error("Schema error: {0}")]

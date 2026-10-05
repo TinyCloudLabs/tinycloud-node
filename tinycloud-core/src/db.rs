@@ -331,6 +331,17 @@ where
         invocation::verify_and_authorize(&self.conn, invocation, now).await
     }
 
+    /// Authorize an already signature-verified invocation without recording
+    /// an event or performing an operation. Used before disclosing a write's
+    /// storage rejection to its caller.
+    pub async fn authorize_admitted(
+        &self,
+        invocation: &AdmittedInvocation,
+        now: OffsetDateTime,
+    ) -> Result<(), crate::models::invocation::Error> {
+        invocation::authorize_admitted(&self.conn, &invocation.invocation().0, now).await
+    }
+
     /// Load and reparse a delegation from its exact signed Authorization
     /// bytes. The relational row is returned only so callers can compare all
     /// projections against the signed source of truth.
@@ -2341,6 +2352,8 @@ pub enum InvocationOutcome<R> {
     DuckDbExport(Vec<u8>),
     DuckDbArrow(Vec<u8>),
     EncryptionDecrypt(crate::encryption_network::DecryptResponseBody),
+    /// `tinycloud.space/info`: the space's storage usage, rendered by the node.
+    SpaceInfo(serde_json::Value),
 }
 
 #[derive(Debug)]
