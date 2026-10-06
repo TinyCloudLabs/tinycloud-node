@@ -328,14 +328,16 @@ jobs:
             exit 0
           fi
 
-          CVM_JSON="$(mktemp)"
-          trap 'rm -f "${CVM_JSON}"' EXIT
+          if ! CVM_JSON="$(mktemp)"; then
+            echo "::error::Cannot create a temporary file for Phala's current compose"
+            exit 1
+          fi
           if ! phala cvms get tinycloud-node --json >"${CVM_JSON}" 2>/dev/null; then
             echo "::error::Cannot determine the running production revision from Phala"
             exit 1
           fi
 
-          RUNNING_IMAGE="$(python3 - "${CVM_JSON}" <<'PY'
+          if ! RUNNING_IMAGE="$(python3 - "${CVM_JSON}" <<'PY'
           import json
           import re
           import sys
@@ -366,7 +368,10 @@ jobs:
           if len(images) == 1:
               print(images[0])
           PY
-          )"
+          )"; then
+            echo "::error::Cannot determine a unique pinned production image from Phala's current compose"
+            exit 1
+          fi
           if [ -z "${RUNNING_IMAGE}" ]; then
             echo "::error::Cannot determine a unique pinned production image from Phala's current compose"
             exit 1
@@ -376,7 +381,10 @@ jobs:
             echo "::error::Cannot inspect the running production image in GHCR"
             exit 1
           fi
-          RUNNING_REVISION="$(docker image inspect "${RUNNING_IMAGE}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' 2>/dev/null || true)"
+          if ! RUNNING_REVISION="$(docker image inspect "${RUNNING_IMAGE}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' 2>/dev/null)"; then
+            echo "::error::Cannot determine the running production revision from its image label"
+            exit 1
+          fi
           if ! [[ "${RUNNING_REVISION}" =~ ^[0-9a-f]{40}$ ]] \
             || ! git cat-file -e "${RUNNING_REVISION}^{commit}" 2>/dev/null; then
             echo "::error::Cannot determine the running production revision from its image label"
