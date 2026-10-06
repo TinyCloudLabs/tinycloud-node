@@ -327,22 +327,15 @@ jobs:
             echo "::warning::allow_non_descendant=true; skipping the production revision ancestry check"
             exit 0
           fi
-          if [ -z "${PHALA_CLOUD_API_KEY}" ]; then
-            echo "::error::Cannot determine the running production revision: Phala API key is unavailable"
-            exit 1
-          fi
 
-          COMPOSE_FILE="$(mktemp)"
-          trap 'rm -f "${COMPOSE_FILE}"' EXIT
-          if ! curl --silent --show-error --fail \
-            -H "X-API-Key: ${PHALA_CLOUD_API_KEY}" \
-            "https://cloud-api.phala.com/api/v1/cvms/tinycloud-node/docker-compose.yml" \
-            --output "${COMPOSE_FILE}" 2>/dev/null; then
+          CVM_JSON="$(mktemp)"
+          trap 'rm -f "${CVM_JSON}"' EXIT
+          if ! phala cvms get tinycloud-node --json >"${CVM_JSON}" 2>/dev/null; then
             echo "::error::Cannot determine the running production revision from Phala"
             exit 1
           fi
 
-          RUNNING_IMAGE="$(python3 - "${COMPOSE_FILE}" <<'PY'
+          RUNNING_IMAGE="$(python3 - "${CVM_JSON}" <<'PY'
           import json
           import re
           import sys
@@ -356,10 +349,13 @@ jobs:
           if isinstance(response, str):
               compose = response
           elif isinstance(response, dict):
-              compose = response.get("docker_compose_file") or response.get("compose_file") or ""
+              compose_file = response.get("compose_file")
+              if isinstance(compose_file, dict):
+                  compose = compose_file.get("docker_compose_file", "")
+              else:
+                  compose = response.get("docker_compose_file", "")
           else:
               compose = ""
-
           if not isinstance(compose, str):
               sys.exit(0)
 
