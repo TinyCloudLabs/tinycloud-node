@@ -1894,21 +1894,32 @@ pub async fn register_policy(
         expires_at: Set(root_expiry(&request.policy_root)
             .unwrap_or_else(|_| format_time(now + Duration::seconds(MAX_SESSION_TTL_SECONDS)))),
     };
+    let root_delegations = vec![
+        decode_delegation(&request.policy_root)?,
+        decode_delegation(&request.enforcement_root)?,
+    ];
+    // TC-732: this transaction appends to `event_order`, so it takes the
+    // per-space sequence locks like every other sequence producer: in-process
+    // before BEGIN, then in the database right after it.
+    let sequence_spaces = root_delegations
+        .iter()
+        .flat_map(|delegation| delegation.0.spaces().cloned())
+        .collect::<Vec<_>>();
+    let _sequence_guards = tinycloud
+        .acquire_space_sequence_guards(&sequence_spaces)
+        .await;
     let _writer = match &runtime.sqlite_writer_lock {
         Some(lock) => Some(lock.lock().await),
         None => None,
     };
     let txn = runtime.conn.begin().await.map_err(db_error)?;
+    tinycloud_core::kv_sync::lock_space_sequences(&txn, &sequence_spaces)
+        .await
+        .map_err(db_error)?;
     // The normal graph rows, abilities, and signed-byte projections share one
     // SQL transaction. A failure in either side leaves no partial authority.
     tinycloud
-        .delegate_batch_in_transaction(
-            &txn,
-            vec![
-                decode_delegation(&request.policy_root)?,
-                decode_delegation(&request.enforcement_root)?,
-            ],
-        )
+        .delegate_batch_in_transaction(&txn, root_delegations)
         .await
         .map_err(|error| (Status::Forbidden, error.to_string()))?;
     registration
@@ -2426,11 +2437,20 @@ pub async fn mint(
     // Challenge/JTI consumption, the exact S0 graph rows (delegation,
     // abilities, ordered signed proofs), and the admitted session index are a
     // single SQL commit. Any failure rolls the whole transition back.
+    // TC-732: per-space sequence locks before the row locks below; see
+    // `register_policy`.
+    let sequence_spaces = event.0.spaces().cloned().collect::<Vec<_>>();
+    let _sequence_guards = tinycloud
+        .acquire_space_sequence_guards(&sequence_spaces)
+        .await;
     let _writer = match &runtime.sqlite_writer_lock {
         Some(lock) => Some(lock.lock().await),
         None => None,
     };
     let txn = runtime.conn.begin().await.map_err(db_error)?;
+    tinycloud_core::kv_sync::lock_space_sequences(&txn, &sequence_spaces)
+        .await
+        .map_err(db_error)?;
     if let Some(proof) = account_owner_proof.as_ref() {
         validate_locked_account_owner(&txn, proof).await?;
     }

@@ -1052,6 +1052,58 @@ mod tests {
         assert!(!ability_matches("totally.unknown/a", "totally.unknown/b"));
     }
 
+    /// TC-732: `ability` must be granted explicitly. No other registry URN
+    /// (including every per-service wildcard), nor the bare `*` / a
+    /// hypothetical `tinycloud.kv/*`, may satisfy it — neither through
+    /// `ability_matches` (the live-wire primitive) nor through any declared
+    /// implication in either generated copy. It still matches itself.
+    fn assert_never_implied(ability: &str) {
+        let registry: Registry = serde_json::from_str(REGISTRY_JSON).unwrap();
+        assert!(
+            registry.capabilities.iter().any(|e| e.urn == ability),
+            "{ability} must be in the registry"
+        );
+        assert!(
+            ability_matches(ability, ability),
+            "{ability} must match itself"
+        );
+
+        let held_candidates = registry
+            .capabilities
+            .iter()
+            .map(|e| e.urn.as_str())
+            .chain(["*", "tinycloud.kv/*"]);
+        for held in held_candidates {
+            if held == ability {
+                continue;
+            }
+            assert!(
+                !ability_matches(held, ability),
+                "{held} must not confer {ability}"
+            );
+            assert!(
+                !generated::implied_actions(held).contains(&ability),
+                "{held} must not imply {ability} (tinycloud-core copy)"
+            );
+            assert!(
+                !tinycloud_auth::policy_capability::implied_actions(held).contains(&ability),
+                "{held} must not imply {ability} (tinycloud-auth copy)"
+            );
+        }
+        // And it implies nothing itself.
+        assert!(generated::implied_actions(ability).is_empty());
+    }
+
+    #[test]
+    fn kv_sync_is_never_implied() {
+        assert_never_implied("tinycloud.kv/sync");
+    }
+
+    #[test]
+    fn kv_retain_is_never_implied() {
+        assert_never_implied("tinycloud.kv/retain");
+    }
+
     #[test]
     fn resolve_alias_reexport_matches_generated() {
         assert_eq!(resolve_alias("tinycloud.kv/delete"), "tinycloud.kv/del");

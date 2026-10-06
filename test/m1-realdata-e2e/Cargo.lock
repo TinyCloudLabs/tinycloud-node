@@ -7721,6 +7721,7 @@ dependencies = [
  "aes-gcm",
  "async-trait",
  "base64 0.22.1",
+ "chacha20poly1305",
  "dashmap",
  "futures",
  "hex",
@@ -7753,7 +7754,7 @@ dependencies = [
 
 [[package]]
 name = "tinycloud-node"
-version = "1.17.1"
+version = "1.19.0"
 dependencies = [
  "aes-gcm",
  "anyhow",

@@ -182,13 +182,14 @@ pub(crate) async fn authorize_admitted<C: ConnectionTrait>(
     db: &C,
     invocation: &util::InvocationInfo,
     now: OffsetDateTime,
+    auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
 ) -> Result<(), Error> {
     invocation
         .invocation
         .payload()
         .validate_time(None)
         .map_err(|_| InvocationError::InvalidTime)?;
-    validate(db, invocation, Some(now), None).await
+    validate(db, invocation, Some(now), auth_graph).await
 }
 
 pub async fn verify_invocation(invocation: &TinyCloudInvocation) -> Result<(), Error> {
@@ -228,8 +229,20 @@ pub async fn verify_and_authorize<C: ConnectionTrait>(
     invocation: &util::InvocationInfo,
     now: OffsetDateTime,
 ) -> Result<(), Error> {
+    verify_and_authorize_with_graph(db, invocation, now, None).await
+}
+
+/// [`verify_and_authorize`] against a caller-loaded authorization snapshot,
+/// so the caller can derive more facts (TC-732's authority window) from the
+/// exact graph the decision was made on.
+pub(crate) async fn verify_and_authorize_with_graph<C: ConnectionTrait>(
+    db: &C,
+    invocation: &util::InvocationInfo,
+    now: OffsetDateTime,
+    auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
+) -> Result<(), Error> {
     verify_invocation(&invocation.invocation).await?;
-    validate(db, invocation, Some(now), None).await
+    validate(db, invocation, Some(now), auth_graph).await
 }
 
 // verify parenthood and authorization
@@ -613,9 +626,9 @@ async fn save<C: ConnectionTrait>(
                 key,
                 version,
                 space,
-                seq: _,
-                epoch: _,
-                epoch_seq: _,
+                seq,
+                epoch,
+                epoch_seq,
             } => {
                 let deleted_invocation_id = if let Some((s, e, es)) = version {
                     kv_write::Entity::find().filter(
@@ -646,11 +659,16 @@ async fn save<C: ConnectionTrait>(
                 }))
                 .exec(db)
                 .await?;
+                // TC-732: the tombstone records the delete's own position, so
+                // `current_kv.(seq, epoch, epoch_seq)` stays the position of
+                // the key's last visible change and the change feed delivers
+                // the delete in order.
                 delete_current_kv_if_invocation(
                     db,
                     &SpaceIdWrap(space.clone()),
                     key.as_str(),
                     deleted_invocation_id,
+                    (*seq, *epoch, *epoch_seq),
                 )
                 .await?;
             }
@@ -660,6 +678,32 @@ async fn save<C: ConnectionTrait>(
     enqueue_kv_webhook_deliveries(db, hash, &invocation.invoker, issued_at, &parameters).await?;
 
     Ok(hash)
+}
+
+/// Whether the `incoming` row should replace the `existing` `current_kv` row:
+/// its position is strictly newer, or (TC-732) equal while the existing row is
+/// a tombstone. A tombstone now carries its delete's own position, and a
+/// `kv/del` and `kv/put` on one key in one invocation share that position;
+/// the put must still win, as it did before deletes recorded positions.
+fn incoming_supersedes(existing: current_kv::Entity, incoming: Alias) -> Condition {
+    Condition::any()
+        .add(incoming_is_newer(existing, incoming.clone()))
+        .add(
+            Condition::all()
+                .add(
+                    Expr::col((incoming.clone(), current_kv::Column::Seq))
+                        .equals((existing, current_kv::Column::Seq)),
+                )
+                .add(
+                    Expr::col((incoming.clone(), current_kv::Column::Epoch))
+                        .equals((existing, current_kv::Column::Epoch)),
+                )
+                .add(
+                    Expr::col((incoming, current_kv::Column::EpochSeq))
+                        .equals((existing, current_kv::Column::EpochSeq)),
+                )
+                .add(Expr::col((existing, current_kv::Column::Deleted)).eq(true)),
+        )
 }
 
 fn incoming_is_newer(existing: current_kv::Entity, incoming: Alias) -> Condition {
@@ -715,8 +759,10 @@ pub(crate) async fn upsert_current_kv<C: ConnectionTrait>(
     if db.get_database_backend() == DatabaseBackend::MySql {
         // MySQL ignores ON CONFLICT's action WHERE. Keep the ordering fields
         // until last because ON DUPLICATE KEY assignments are evaluated left
-        // to right.
-        const NEWER: &str = "VALUES(`seq`) > `seq` OR (VALUES(`seq`) = `seq` AND VALUES(`epoch`) > `epoch`) OR (VALUES(`seq`) = `seq` AND VALUES(`epoch`) = `epoch` AND VALUES(`epoch_seq`) > `epoch_seq`)";
+        // to right. This mirrors `incoming_supersedes`: the equal-position
+        // tombstone arm reads `deleted` before its own assignment flips it,
+        // and the ordering fields it then no longer matches are equal anyway.
+        const NEWER: &str = "VALUES(`seq`) > `seq` OR (VALUES(`seq`) = `seq` AND VALUES(`epoch`) > `epoch`) OR (VALUES(`seq`) = `seq` AND VALUES(`epoch`) = `epoch` AND VALUES(`epoch_seq`) > `epoch_seq`) OR (VALUES(`seq`) = `seq` AND VALUES(`epoch`) = `epoch` AND VALUES(`epoch_seq`) = `epoch_seq` AND `deleted`)";
         for (column, incoming) in [
             (current_kv::Column::Invocation, "invocation"),
             (current_kv::Column::Value, "value"),
@@ -744,7 +790,7 @@ pub(crate) async fn upsert_current_kv<C: ConnectionTrait>(
                 current_kv::Column::Metadata,
                 current_kv::Column::Deleted,
             ])
-            .action_cond_where(incoming_is_newer(
+            .action_cond_where(incoming_supersedes(
                 current_kv::Entity,
                 Alias::new("excluded"),
             ));
@@ -759,20 +805,52 @@ pub(crate) async fn upsert_current_kv<C: ConnectionTrait>(
     }
 }
 
+/// Tombstone `key` if its live row is still the write `invocation` produced,
+/// recording the delete's own `position` (TC-732) when it is newer than the
+/// row's. The matching-invocation predicate keeps a delete from hiding a
+/// later write to the same key.
 pub(crate) async fn delete_current_kv_if_invocation<C: ConnectionTrait>(
     db: &C,
     space: &SpaceIdWrap,
     key: &str,
     invocation: Hash,
+    position: (i64, Hash, i64),
 ) -> Result<(), DbErr> {
-    current_kv::Entity::update_many()
+    let (seq, epoch, epoch_seq) = position;
+    let position_is_newer = Condition::any()
+        .add(current_kv::Column::Seq.lt(seq))
+        .add(
+            Condition::all()
+                .add(current_kv::Column::Seq.eq(seq))
+                .add(current_kv::Column::Epoch.lt(epoch)),
+        )
+        .add(
+            Condition::all()
+                .add(current_kv::Column::Seq.eq(seq))
+                .add(current_kv::Column::Epoch.eq(epoch))
+                .add(current_kv::Column::EpochSeq.lt(epoch_seq)),
+        );
+    let advanced = current_kv::Entity::update_many()
         .col_expr(current_kv::Column::Deleted, Expr::value(true))
+        .col_expr(current_kv::Column::Seq, Expr::value(seq))
+        .col_expr(current_kv::Column::Epoch, Expr::value(epoch))
+        .col_expr(current_kv::Column::EpochSeq, Expr::value(epoch_seq))
         .filter(current_kv::Column::Space.eq(space.clone()))
         .filter(current_kv::Column::Key.eq(key))
         .filter(current_kv::Column::Invocation.eq(invocation))
+        .filter(position_is_newer)
         .exec(db)
-        .await
-        .map(|_| ())
+        .await?;
+    if advanced.rows_affected == 0 {
+        current_kv::Entity::update_many()
+            .col_expr(current_kv::Column::Deleted, Expr::value(true))
+            .filter(current_kv::Column::Space.eq(space.clone()))
+            .filter(current_kv::Column::Key.eq(key))
+            .filter(current_kv::Column::Invocation.eq(invocation))
+            .exec(db)
+            .await?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1009,6 +1087,7 @@ mod tests {
                 &SpaceIdWrap(space.clone()),
                 "ordered",
                 deleted.invocation,
+                (4, crate::hash::hash(format!("epoch-{label}").as_bytes()), 0),
             )
             .await
             .unwrap();
@@ -1088,6 +1167,7 @@ mod tests {
             &SpaceIdWrap(space.clone()),
             "ordered",
             newer.invocation,
+            (3, crate::hash::hash(b"epoch-delete-newer"), 0),
         )
         .await
         .unwrap();
