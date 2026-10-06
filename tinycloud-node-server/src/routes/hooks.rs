@@ -1,9 +1,12 @@
 use crate::{
     authorization::AuthHeaderGetter,
+    config::Config,
     hooks::{
         hook_scope_path, matches_scope, normalize_path_prefix, HookRuntime, HookSubscription,
         HookTicketClaims, HookTicketRequest, HookTicketResponse,
     },
+    invocation_replay::InvocationReplayCache,
+    policy_v3::PolicyV3Runtime,
     TinyCloud,
 };
 use rocket::{
@@ -17,41 +20,160 @@ use rocket::{
     State,
 };
 use serde::{Deserialize, Serialize};
-use std::{net::IpAddr, time::Duration};
+use std::{net::IpAddr, time::Duration, time::Instant};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_core::{
+    events::Invocation,
     hash::Blake3Hasher,
     hash::Hash,
     models::{delegation, hook_subscription},
     sea_orm::{ColumnTrait, EntityTrait, QueryFilter},
     types::Resource,
     util::InvocationInfo,
-    ColumnEncryption,
+    AdmittedInvocation, ColumnEncryption,
 };
 
+/// An invocation whose signature, lifetime cap, delegation chain, revocation
+/// status, time windows, and Policy/v3 session edge have been checked against
+/// the node's authorization graph. The `Authorization` request guard only
+/// decodes the header, so hook scope checks accept only this type: a claimed
+/// capability is never trusted until [`authorize_hook_request`] has proven it
+/// is delegated.
+struct VerifiedHookInvocation {
+    admitted: AdmittedInvocation,
+    policy_session: bool,
+}
+
+impl VerifiedHookInvocation {
+    fn info(&self) -> &InvocationInfo {
+        &self.admitted.invocation().0
+    }
+
+    /// Spend the invocation in the `/invoke` replay cache. Routes call this
+    /// only after every authorization check has passed, immediately before
+    /// their effect, so a refused request writes nothing and a captured header
+    /// cannot be replayed.
+    async fn consume(
+        &self,
+        replay: &InvocationReplayCache,
+        config: &Config,
+    ) -> Result<(), (Status, String)> {
+        if self.policy_session {
+            replay
+                .check_and_insert_invoker_nonce(self.admitted.invocation(), 60)
+                .await?;
+        } else {
+            replay
+                .check_and_insert(&self.admitted, config.invocation.max_lifetime_secs)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+/// Authorize a hooks request, read-only, before any route reads the
+/// invocation's claimed scope.
+///
+/// The ordinary `verify_auth` path runs `TinyCloud::invoke`, which records the
+/// invocation and executes mutations such as `tinycloud.kv/del` that need no
+/// input. Hooks requests therefore first refuse any capability outside the
+/// `hooks` service, then apply `/invoke`'s admission (signature, lifetime cap),
+/// the read-only invocation kernel (delegation chain, revocation, time
+/// windows), and the Policy/v3 gate. No space is looked up and nothing is
+/// written here; see [`VerifiedHookInvocation::consume`].
+async fn authorize_hook_request(
+    span: &'static str,
+    invocation: Invocation,
+    tinycloud: &TinyCloud,
+    policy_v3: &PolicyV3Runtime,
+    config: &Config,
+) -> Result<VerifiedHookInvocation, (Status, String)> {
+    let capabilities = &invocation.0.capabilities;
+    if capabilities.is_empty() || !capabilities.iter().all(is_hook_capability) {
+        return Err((
+            Status::Forbidden,
+            "hooks requests may only invoke tinycloud.hooks capabilities".to_string(),
+        ));
+    }
+    let now = OffsetDateTime::now_utc();
+    let start = Instant::now();
+    let admitted = authorize_admitted(invocation, tinycloud, config, now).await;
+    crate::prometheus::observe_span(
+        span,
+        if admitted.is_ok() { "ok" } else { "error" },
+        start.elapsed(),
+    );
+    let admitted = admitted?;
+    let policy_session = policy_v3
+        .authorize_invocation(tinycloud, &admitted.invocation().0, now)
+        .await
+        .map_err(|error| (Status::Forbidden, error.to_string()))?;
+    Ok(VerifiedHookInvocation {
+        admitted,
+        policy_session,
+    })
+}
+
+async fn authorize_admitted(
+    invocation: Invocation,
+    tinycloud: &TinyCloud,
+    config: &Config,
+    now: OffsetDateTime,
+) -> Result<AdmittedInvocation, (Status, String)> {
+    let admitted = AdmittedInvocation::admit(invocation, config.invocation.max_lifetime_secs)
+        .await
+        .map_err(|error| (Status::Unauthorized, error.to_string()))?;
+    tinycloud
+        .authorize_admitted(&admitted, now)
+        .await
+        .map_err(|error| (Status::Unauthorized, error.to_string()))?;
+    Ok(admitted)
+}
+
+fn is_hook_capability(capability: &tinycloud_core::util::Capability) -> bool {
+    matches!(&capability.resource, Resource::TinyCloud(resource) if resource.service().as_str() == "hooks")
+        && capability
+            .ability
+            .as_ref()
+            .as_ref()
+            .starts_with("tinycloud.hooks/")
+}
+
 #[post("/hooks/tickets", format = "json", data = "<request>")]
+#[allow(clippy::too_many_arguments)]
 pub async fn create_hook_ticket(
     invocation: AuthHeaderGetter<InvocationInfo>,
     request: Json<HookTicketRequest>,
     hooks: &State<HookRuntime>,
     tinycloud: &State<TinyCloud>,
+    policy_v3: &State<PolicyV3Runtime>,
+    replay: &State<InvocationReplayCache>,
+    config: &State<Config>,
 ) -> Result<Json<HookTicketResponse>, (Status, String)> {
-    mint_hook_ticket(
-        &invocation.0 .0,
-        request.into_inner(),
-        hooks.inner(),
-        tinycloud.inner(),
+    let invocation = authorize_hook_request(
+        "server.hooks.ticket.auth",
+        invocation.0,
+        tinycloud,
+        policy_v3,
+        config,
     )
-    .await
-    .map(Json)
+    .await?;
+    let mut request = request.into_inner();
+    authorize_ticket_scopes(&invocation, &mut request, hooks)?;
+    // Build and sign the whole ticket first: a refused request (for example a
+    // TTL that expires immediately) must not spend the invocation.
+    let ticket = mint_hook_ticket(&invocation, request, hooks, tinycloud).await?;
+    invocation.consume(replay, config).await?;
+    Ok(Json(ticket))
 }
 
-pub async fn mint_hook_ticket(
-    invocation: &InvocationInfo,
-    mut request: HookTicketRequest,
+/// Validate the requested subscriptions and require each to be covered by the
+/// verified invocation.
+fn authorize_ticket_scopes(
+    verified: &VerifiedHookInvocation,
+    request: &mut HookTicketRequest,
     hooks: &HookRuntime,
-    tinycloud: &TinyCloud,
-) -> Result<HookTicketResponse, (Status, String)> {
+) -> Result<(), (Status, String)> {
     if request.subscriptions.is_empty() {
         return Err((
             Status::BadRequest,
@@ -68,13 +190,23 @@ pub async fn mint_hook_ticket(
     for subscription in &mut request.subscriptions {
         subscription.path_prefix = normalize_path_prefix(subscription.path_prefix.take());
         validate_subscription(subscription)?;
-        if !is_subscription_authorized(invocation, subscription) {
+        if !is_subscription_authorized(verified, subscription) {
             return Err((
                 Status::Forbidden,
                 "requested hook scope is not authorized".to_string(),
             ));
         }
     }
+    Ok(())
+}
+
+async fn mint_hook_ticket(
+    verified: &VerifiedHookInvocation,
+    request: HookTicketRequest,
+    hooks: &HookRuntime,
+    tinycloud: &TinyCloud,
+) -> Result<HookTicketResponse, (Status, String)> {
+    let invocation = verified.info();
 
     let now = OffsetDateTime::now_utc();
     let invocation_exp = invocation_expiry(invocation)?;
@@ -212,21 +344,34 @@ pub struct HookWebhookResponse {
 pub const HOOK_WEBHOOK_SECRET_KEY_ID: &str = "primary";
 
 #[post("/hooks/webhooks", format = "json", data = "<request>")]
+#[allow(clippy::too_many_arguments)]
 pub async fn create_webhook(
     invocation: AuthHeaderGetter<InvocationInfo>,
     request: Json<HookWebhookRequest>,
     hooks: &State<HookRuntime>,
     tinycloud: &State<TinyCloud>,
     webhook_encryption: &State<ColumnEncryption>,
+    policy_v3: &State<PolicyV3Runtime>,
+    replay: &State<InvocationReplayCache>,
+    config: &State<Config>,
 ) -> Result<Json<HookWebhookResponse>, (Status, String)> {
+    let invocation = authorize_hook_request(
+        "server.hooks.webhook_register.auth",
+        invocation.0,
+        tinycloud,
+        policy_v3,
+        config,
+    )
+    .await?;
     let normalized = normalize_webhook_request(&request)?;
-    let callback_url = validate_webhook_callback_url(&request.callback_url).await?;
-    if !is_hook_action_authorized(&invocation.0 .0, &normalized, "tinycloud.hooks/register") {
+    if !is_hook_action_authorized(&invocation, &normalized, "tinycloud.hooks/register") {
         return Err((
             Status::Forbidden,
             "webhook scope is not authorized".to_string(),
         ));
     }
+    // Resolve the callback host only for an authorized caller.
+    let callback_url = validate_webhook_callback_url(&request.callback_url).await?;
 
     let active_count = tinycloud
         .count_active_hook_subscriptions(&normalized.space)
@@ -238,18 +383,19 @@ pub async fn create_webhook(
             "webhook subscription limit reached for space".to_string(),
         ));
     }
+    invocation.consume(replay, config).await?;
 
     let created_at = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .expect("current timestamps should format as RFC3339");
     let model = hook_subscription::Model {
         id: hook_subscription_id(
-            &invocation.0 .0.invoker,
+            &invocation.info().invoker,
             &normalized,
             callback_url.as_str(),
             &created_at,
         ),
-        subscriber_did: invocation.0 .0.invoker.clone(),
+        subscriber_did: invocation.info().invoker.clone(),
         space_id: normalized.space.clone(),
         target_service: normalized.service.clone(),
         path_prefix: normalized.path_prefix.clone(),
@@ -274,7 +420,18 @@ pub async fn list_webhooks(
     invocation: AuthHeaderGetter<InvocationInfo>,
     query: HookWebhookListQuery,
     tinycloud: &State<TinyCloud>,
+    policy_v3: &State<PolicyV3Runtime>,
+    replay: &State<InvocationReplayCache>,
+    config: &State<Config>,
 ) -> Result<Json<Vec<HookWebhookResponse>>, (Status, String)> {
+    let invocation = authorize_hook_request(
+        "server.hooks.webhook_list.auth",
+        invocation.0,
+        tinycloud,
+        policy_v3,
+        config,
+    )
+    .await?;
     let normalized_prefix = normalize_path_prefix(query.prefix.clone());
     let requested_scope = HookSubscription {
         space: query.space.clone(),
@@ -284,12 +441,13 @@ pub async fn list_webhooks(
     };
 
     validate_subscription(&requested_scope)?;
-    if !is_hook_action_authorized(&invocation.0 .0, &requested_scope, "tinycloud.hooks/list") {
+    if !is_hook_action_authorized(&invocation, &requested_scope, "tinycloud.hooks/list") {
         return Err((
             Status::Forbidden,
             "webhook scope is not authorized".to_string(),
         ));
     }
+    invocation.consume(replay, config).await?;
 
     let rows = tinycloud
         .list_active_hook_subscriptions(
@@ -300,7 +458,19 @@ pub async fn list_webhooks(
         .await
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
 
+    // The query's prefix filter is an unescaped SQL `LIKE`: `_` and `%` match
+    // any character and SQLite ignores ASCII case, so it can return other
+    // subscribers' rows. Keep only rows the authorization rule itself covers.
+    let requested_path = hook_scope_path(&requested_scope.service, normalized_prefix.as_deref());
     rows.into_iter()
+        .filter(|row| {
+            row.space_id == requested_scope.space
+                && row.target_service == requested_scope.service
+                && scope_extends(
+                    &hook_scope_path(&row.target_service, row.path_prefix.as_deref()),
+                    &requested_path,
+                )
+        })
         .map(|row| webhook_response_from_model(&row))
         .collect::<Result<Vec<_>, _>>()
         .map(Json)
@@ -311,17 +481,33 @@ pub async fn delete_webhook(
     invocation: AuthHeaderGetter<InvocationInfo>,
     subscription_id: &str,
     tinycloud: &State<TinyCloud>,
+    policy_v3: &State<PolicyV3Runtime>,
+    replay: &State<InvocationReplayCache>,
+    config: &State<Config>,
 ) -> Result<Status, (Status, String)> {
-    let Some(subscription) = tinycloud
+    // Authenticate before the lookup so an unauthenticated caller cannot probe
+    // which subscription ids exist.
+    let invocation = authorize_hook_request(
+        "server.hooks.webhook_unregister.auth",
+        invocation.0,
+        tinycloud,
+        policy_v3,
+        config,
+    )
+    .await?;
+    // A subscription the caller may not unregister is reported exactly like a
+    // missing one, so the route is not an oracle for other callers' ids.
+    let not_found = || {
+        (
+            Status::NotFound,
+            "webhook subscription not found".to_string(),
+        )
+    };
+    let subscription = tinycloud
         .find_hook_subscription(subscription_id)
         .await
         .map_err(|e| (Status::InternalServerError, e.to_string()))?
-    else {
-        return Err((
-            Status::NotFound,
-            "webhook subscription not found".to_string(),
-        ));
-    };
+        .ok_or_else(not_found)?;
 
     let requested_scope = HookSubscription {
         space: subscription.space_id.clone(),
@@ -331,16 +517,10 @@ pub async fn delete_webhook(
             .abilities()
             .map_err(|e| (Status::InternalServerError, e.to_string()))?,
     };
-    if !is_hook_action_authorized(
-        &invocation.0 .0,
-        &requested_scope,
-        "tinycloud.hooks/unregister",
-    ) {
-        return Err((
-            Status::Forbidden,
-            "webhook scope is not authorized".to_string(),
-        ));
+    if !is_hook_action_authorized(&invocation, &requested_scope, "tinycloud.hooks/unregister") {
+        return Err(not_found());
     }
+    invocation.consume(replay, config).await?;
 
     tinycloud
         .deactivate_hook_subscription(subscription_id)
@@ -377,21 +557,21 @@ fn validate_subscription(subscription: &HookSubscription) -> Result<(), (Status,
 }
 
 fn is_subscription_authorized(
-    invocation: &InvocationInfo,
+    invocation: &VerifiedHookInvocation,
     subscription: &HookSubscription,
 ) -> bool {
     is_hook_action_authorized(invocation, subscription, "tinycloud.hooks/subscribe")
 }
 
 fn is_hook_action_authorized(
-    invocation: &InvocationInfo,
+    verified: &VerifiedHookInvocation,
     subscription: &HookSubscription,
     ability: &str,
 ) -> bool {
     let requested_scope =
         hook_scope_path(&subscription.service, subscription.path_prefix.as_deref());
 
-    invocation.capabilities.iter().any(|capability| {
+    verified.info().capabilities.iter().any(|capability| {
         match (&capability.resource, capability.ability.as_ref().as_ref()) {
             (Resource::TinyCloud(resource), requested_ability)
                 if requested_ability == ability
@@ -667,7 +847,6 @@ mod tests {
         sea_orm::{ConnectOptions, Database},
         storage::either::Either,
         storage::StorageConfig as _,
-        util::InvocationInfo as CoreInvocationInfo,
     };
 
     fn test_hook_runtime() -> HookRuntime {
@@ -687,7 +866,36 @@ mod tests {
         .await?)
     }
 
-    fn test_invocation(hook_path: &str) -> Result<(CoreInvocationInfo, String)> {
+    /// Admits a signed invocation as a non-policy session, skipping only the
+    /// delegation-chain check: scope-matching tests below exercise the claimed
+    /// scope logic that runs after [`authorize_hook_request`].
+    async fn verified(
+        invocation: tinycloud_auth::authorization::TinyCloudInvocation,
+    ) -> Result<VerifiedHookInvocation> {
+        let invocation = Invocation::from_header_ser::<
+            tinycloud_auth::authorization::TinyCloudInvocation,
+        >(&invocation.encode()?)
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        Ok(VerifiedHookInvocation {
+            admitted: AdmittedInvocation::admit(invocation, 300).await?,
+            policy_session: false,
+        })
+    }
+
+    async fn mint(
+        verified: &VerifiedHookInvocation,
+        mut request: HookTicketRequest,
+        hooks: &HookRuntime,
+        tinycloud: &TinyCloud,
+    ) -> Result<HookTicketResponse, (Status, String)> {
+        authorize_ticket_scopes(verified, &mut request, hooks)?;
+        mint_hook_ticket(verified, request, hooks, tinycloud).await
+    }
+
+    /// Scope-matching fixture: wraps the invocation as already verified, so it
+    /// exercises only the claimed-scope checks that run after
+    /// [`authorize_hook_request`]. Route tests below cover authentication.
+    async fn test_invocation(hook_path: &str) -> Result<(VerifiedHookInvocation, String)> {
         let jwk = JWK::generate_ed25519()?;
         let mut verification_method = DID_METHODS.generate(&jwk, "key")?.to_string();
         let fragment = verification_method
@@ -721,11 +929,11 @@ mod tests {
             &delegation,
             &jwk,
             &verification_method,
-            4_102_444_800.0,
+            (OffsetDateTime::now_utc().unix_timestamp() + 240) as f64,
             InvocationOptions::default(),
         )?;
 
-        Ok((CoreInvocationInfo::try_from(invocation)?, space_string))
+        Ok((verified(invocation).await?, space_string))
     }
 
     #[tokio::test]
@@ -847,10 +1055,10 @@ mod tests {
             &delegation,
             &jwk,
             &verification_method,
-            4_102_444_800.0,
+            (OffsetDateTime::now_utc().unix_timestamp() + 240) as f64,
             InvocationOptions::default(),
         )?;
-        let invocation = CoreInvocationInfo::try_from(invocation)?;
+        let invocation = verified(invocation).await?;
         let subscription = HookSubscription {
             space: space_string,
             service: "kv".to_string(),
@@ -877,36 +1085,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mints_ticket_for_authorized_scope() -> Result<()> {
-        let tinycloud = test_tinycloud().await?;
-        let hooks = test_hook_runtime();
-        let (invocation, space) = test_invocation("kv/documents")?;
-        let request = HookTicketRequest {
-            subscriptions: vec![HookSubscription {
-                space,
-                service: "kv".to_string(),
-                path_prefix: Some("documents".to_string()),
-                abilities: vec!["tinycloud.kv/put".to_string()],
-            }],
-            ttl_seconds: Some(60),
-        };
-
-        let response = mint_hook_ticket(&invocation, request, &hooks, &tinycloud)
-            .await
-            .expect("ticket");
-        let claims = hooks.verify_ticket(&response.ticket).unwrap();
-        assert_eq!(claims.sub, invocation.invoker);
-        assert_eq!(claims.scopes.len(), 1);
-        assert_eq!(claims.scopes[0].service, "kv");
-        assert_eq!(claims.scopes[0].path_prefix.as_deref(), Some("documents"));
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn mints_ticket_for_sql_scope() -> Result<()> {
         let tinycloud = test_tinycloud().await?;
         let hooks = test_hook_runtime();
-        let (invocation, space) = test_invocation("sql/main.db")?;
+        let (invocation, space) = test_invocation("sql/main.db").await?;
         let request = HookTicketRequest {
             subscriptions: vec![HookSubscription {
                 space,
@@ -917,7 +1099,7 @@ mod tests {
             ttl_seconds: Some(60),
         };
 
-        let response = mint_hook_ticket(&invocation, request, &hooks, &tinycloud)
+        let response = mint(&invocation, request, &hooks, &tinycloud)
             .await
             .expect("ticket");
         let claims = hooks.verify_ticket(&response.ticket).unwrap();
@@ -930,7 +1112,7 @@ mod tests {
     async fn rejects_partially_authorized_ticket_requests() -> Result<()> {
         let tinycloud = test_tinycloud().await?;
         let hooks = test_hook_runtime();
-        let (invocation, space) = test_invocation("kv/documents")?;
+        let (invocation, space) = test_invocation("kv/documents").await?;
 
         let request = HookTicketRequest {
             subscriptions: vec![
@@ -950,7 +1132,7 @@ mod tests {
             ttl_seconds: Some(60),
         };
 
-        let err = mint_hook_ticket(&invocation, request, &hooks, &tinycloud)
+        let err = mint(&invocation, request, &hooks, &tinycloud)
             .await
             .expect_err("should reject mixed authorization");
         assert_eq!(err.0, Status::Forbidden);
@@ -961,7 +1143,7 @@ mod tests {
     async fn rejects_wrong_space_subscription() -> Result<()> {
         let tinycloud = test_tinycloud().await?;
         let hooks = test_hook_runtime();
-        let (invocation, _space) = test_invocation("kv/documents")?;
+        let (invocation, _space) = test_invocation("kv/documents").await?;
         let request = HookTicketRequest {
             subscriptions: vec![HookSubscription {
                 space: "tinycloud:other-space".to_string(),
@@ -972,7 +1154,7 @@ mod tests {
             ttl_seconds: Some(60),
         };
 
-        let err = mint_hook_ticket(&invocation, request, &hooks, &tinycloud)
+        let err = mint(&invocation, request, &hooks, &tinycloud)
             .await
             .expect_err("should reject wrong space");
         assert_eq!(err.0, Status::Forbidden);
@@ -1039,5 +1221,986 @@ mod tests {
         .expect_err("non-write duckdb filter should be rejected");
 
         assert_eq!(err.0, Status::BadRequest);
+    }
+
+    /// A node with two stored spaces, a delegated session key, and the hooks
+    /// routes mounted with the same managed state as production.
+    struct HookRouteFixture {
+        client: rocket::local::asynchronous::Client,
+        db: tinycloud_core::sea_orm::DatabaseConnection,
+        tinycloud: TinyCloud,
+        space: SpaceId,
+        other_space: SpaceId,
+        owner: (JWK, String),
+        session: (JWK, String),
+        session_proof: Cid,
+    }
+
+    fn did_key() -> Result<(JWK, String)> {
+        let jwk = JWK::generate_ed25519()?;
+        let did = DID_METHODS.generate(&jwk, "key")?.to_string();
+        let fragment = did
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("missing did:key fragment"))?
+            .1
+            .to_string();
+        let verification_method = format!("{did}#{fragment}");
+        Ok((jwk, verification_method))
+    }
+
+    fn did_of(verification_method: &str) -> &str {
+        verification_method
+            .split_once('#')
+            .map_or(verification_method, |(did, _)| did)
+    }
+
+    fn space_of(verification_method: &str) -> Result<SpaceId> {
+        Ok(SpaceId::new(
+            did_of(verification_method).parse::<DIDBuf>()?,
+            "alpha".parse()?,
+        ))
+    }
+
+    /// `path == ""` is the whole service, as in the node SDK's default session
+    /// grant of `hooks`.
+    fn resource(space: &SpaceId, service: &str, path: &str) -> Result<ResourceId> {
+        Ok(space.clone().to_resource(
+            service.parse::<Service>()?,
+            (!path.is_empty())
+                .then(|| path.parse::<Path>())
+                .transpose()?,
+            None,
+            None,
+        ))
+    }
+
+    /// Stores an owner -> session delegation granting `(service, path,
+    /// ability)` on the owner's space, plus a second owner's space for
+    /// cross-space attempts.
+    async fn hook_route_fixture(grants: &[(&str, &str, &str)]) -> Result<HookRouteFixture> {
+        use tinycloud_core::{
+            models::{abilities, actor, space},
+            sea_orm::{ActiveModelTrait, ActiveValue::Set},
+            types::{Ability as CoreAbility, Caveats, SpaceIdWrap},
+        };
+
+        use tinycloud_core::storage::StorageSetup;
+
+        let owner = did_key()?;
+        let (_, other_owner) = did_key()?;
+        let session = did_key()?;
+        let space = space_of(&owner.1)?;
+        let other_space = space_of(&other_owner)?;
+
+        let tempdir = TempDir::new()?;
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
+        let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
+        let _persisted = tempdir.keep();
+        for id in [&space, &other_space] {
+            storage.create(id).await?;
+        }
+        let tinycloud = TinyCloud::new(
+            db.clone(),
+            Either::B(storage),
+            StaticSecret::new(vec![0u8; 32]).unwrap(),
+        )
+        .await?;
+        for id in [&space, &other_space] {
+            space::ActiveModel {
+                id: Set(SpaceIdWrap(id.clone())),
+            }
+            .insert(&db)
+            .await?;
+        }
+        for did in [did_of(&owner.1), did_of(&session.1)] {
+            actor::ActiveModel {
+                id: Set(did.to_string()),
+            }
+            .insert(&db)
+            .await?;
+        }
+
+        let proof_hash = tinycloud_core::hash::hash(session.1.as_bytes());
+        let now = OffsetDateTime::now_utc();
+        delegation::ActiveModel {
+            id: Set(proof_hash),
+            delegator: Set(did_of(&owner.1).to_string()),
+            delegatee: Set(did_of(&session.1).to_string()),
+            expiry: Set(Some(now + time::Duration::hours(1))),
+            issued_at: Set(Some(now)),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(b"hooks-session".to_vec()),
+        }
+        .insert(&db)
+        .await?;
+        for (service, path, ability) in grants {
+            abilities::ActiveModel {
+                delegation: Set(proof_hash),
+                resource: Set(Resource::TinyCloud(resource(&space, service, path)?)),
+                ability: Set(CoreAbility::try_from(ability.to_string()).unwrap()),
+                caveats: Set(Caveats::default()),
+            }
+            .insert(&db)
+            .await?;
+        }
+
+        let node = StaticSecret::new(vec![5u8; 32]).unwrap();
+        let rocket = rocket::build()
+            .mount(
+                "/",
+                rocket::routes![
+                    create_hook_ticket,
+                    create_webhook,
+                    list_webhooks,
+                    delete_webhook
+                ],
+            )
+            .manage(tinycloud.clone())
+            .manage(test_hook_runtime())
+            .manage(ColumnEncryption::new([3u8; 32]))
+            .manage(PolicyV3Runtime::new(db.clone(), node.node_did(), node))
+            .manage(InvocationReplayCache::new(db.clone()))
+            .manage(Config::default());
+
+        Ok(HookRouteFixture {
+            client: rocket::local::asynchronous::Client::tracked(rocket).await?,
+            db,
+            tinycloud,
+            space,
+            other_space,
+            owner,
+            session,
+            session_proof: proof_hash.to_cid(0x55),
+        })
+    }
+
+    /// Signs an invocation with `signer` while claiming `issuer` as its
+    /// verification method, so a mismatched pair is a forged signature.
+    fn signed_header(
+        signer: &JWK,
+        issuer: &str,
+        proof: Vec<Cid>,
+        capabilities: &[(ResourceId, &[&str])],
+    ) -> Result<String> {
+        signed_header_expiring(signer, issuer, proof, capabilities, 240)
+    }
+
+    fn signed_header_expiring(
+        signer: &JWK,
+        issuer: &str,
+        proof: Vec<Cid>,
+        capabilities: &[(ResourceId, &[&str])],
+        lifetime_secs: i64,
+    ) -> Result<String> {
+        let expiration = (OffsetDateTime::now_utc().unix_timestamp() + lifetime_secs) as f64;
+        let unused = Cid::new_v1(0x55, Code::Blake3_256.digest(b"unused"));
+        let capabilities = capabilities
+            .iter()
+            .map(|(resource, abilities)| {
+                Ok((
+                    resource.clone(),
+                    abilities
+                        .iter()
+                        .map(|ability| ability.parse::<Ability>())
+                        .collect::<Result<Vec<_>, _>>()?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let invocation = make_invocation(
+            capabilities,
+            &unused,
+            signer,
+            issuer,
+            expiration,
+            InvocationOptions {
+                proof: Some(proof),
+                ..Default::default()
+            },
+        )?;
+        Ok(invocation.encode()?)
+    }
+
+    impl HookRouteFixture {
+        fn hooks(&self, path: &str) -> Result<ResourceId> {
+            resource(&self.space, "hooks", path)
+        }
+
+        fn session_header(&self, capabilities: &[(ResourceId, &[&str])]) -> Result<String> {
+            signed_header(
+                &self.session.0,
+                &self.session.1,
+                vec![self.session_proof],
+                capabilities,
+            )
+        }
+
+        /// Stranger key signing as the delegated session key.
+        fn forged_header(&self, capabilities: &[(ResourceId, &[&str])]) -> Result<String> {
+            let (stranger, _) = did_key()?;
+            signed_header(
+                &stranger,
+                &self.session.1,
+                vec![self.session_proof],
+                capabilities,
+            )
+        }
+
+        async fn ticket(
+            &self,
+            header: String,
+            space: &SpaceId,
+            service: &str,
+            prefix: &str,
+        ) -> (Status, String) {
+            self.ticket_with_ttl(header, space, service, prefix, 60)
+                .await
+        }
+
+        async fn ticket_with_ttl(
+            &self,
+            header: String,
+            space: &SpaceId,
+            service: &str,
+            prefix: &str,
+            ttl_seconds: u64,
+        ) -> (Status, String) {
+            let response = self
+                .client
+                .post("/hooks/tickets")
+                .header(rocket::http::Header::new("Authorization", header))
+                .header(rocket::http::ContentType::JSON)
+                .body(
+                    serde_json::json!({
+                        "subscriptions": [{
+                            "space": space.to_string(),
+                            "service": service,
+                            "pathPrefix": prefix,
+                        }],
+                        "ttlSeconds": ttl_seconds,
+                    })
+                    .to_string(),
+                )
+                .dispatch()
+                .await;
+            (
+                response.status(),
+                response.into_string().await.unwrap_or_default(),
+            )
+        }
+
+        async fn register(&self, header: String, space: &SpaceId) -> (Status, String) {
+            let response = self
+                .client
+                .post("/hooks/webhooks")
+                .header(rocket::http::Header::new("Authorization", header))
+                .header(rocket::http::ContentType::JSON)
+                .body(
+                    serde_json::json!({
+                        "space": space.to_string(),
+                        "service": "kv",
+                        "pathPrefix": "documents",
+                        // Public IP literal: passes egress checks without DNS.
+                        "callbackUrl": "https://1.1.1.1/hooks",
+                        "secret": "webhook-secret",
+                    })
+                    .to_string(),
+                )
+                .dispatch()
+                .await;
+            (
+                response.status(),
+                response.into_string().await.unwrap_or_default(),
+            )
+        }
+
+        async fn list(&self, header: String) -> (Status, String) {
+            self.list_prefix(header, "documents").await
+        }
+
+        async fn list_prefix(&self, header: String, prefix: &str) -> (Status, String) {
+            let response = self
+                .client
+                .get(format!(
+                    "/hooks/webhooks?space={}&service=kv&prefix={prefix}",
+                    self.space
+                ))
+                .header(rocket::http::Header::new("Authorization", header))
+                .dispatch()
+                .await;
+            (
+                response.status(),
+                response.into_string().await.unwrap_or_default(),
+            )
+        }
+
+        async fn unregister(&self, header: String, id: &str) -> (Status, String) {
+            let response = self
+                .client
+                .delete(format!("/hooks/webhooks/{id}"))
+                .header(rocket::http::Header::new("Authorization", header))
+                .dispatch()
+                .await;
+            (
+                response.status(),
+                response.into_string().await.unwrap_or_default(),
+            )
+        }
+
+        /// Row counts for every table a hooks request could plausibly write.
+        async fn persisted_rows(&self) -> Result<[u64; 5]> {
+            use tinycloud_core::{
+                models::{current_kv, invocation, invocation_replay},
+                sea_orm::PaginatorTrait,
+            };
+            Ok([
+                invocation::Entity::find().count(&self.db).await?,
+                invocation_replay::Entity::find().count(&self.db).await?,
+                delegation::Entity::find().count(&self.db).await?,
+                current_kv::Entity::find().count(&self.db).await?,
+                hook_subscription::Entity::find().count(&self.db).await?,
+            ])
+        }
+    }
+
+    const SUBSCRIBE: &[&str] = &["tinycloud.hooks/subscribe"];
+
+    #[tokio::test]
+    async fn whole_service_hooks_grant_covers_scoped_ticket() -> Result<()> {
+        let fixture = hook_route_fixture(&[("hooks", "", "tinycloud.hooks/subscribe")]).await?;
+        let header = fixture.session_header(&[(fixture.hooks("kv/documents")?, SUBSCRIBE)])?;
+        let (status, _) = fixture
+            .ticket(header, &fixture.space, "kv", "documents")
+            .await;
+        assert_eq!(status, Status::Ok);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delegated_sql_scope_mints_ticket() -> Result<()> {
+        let fixture = hook_route_fixture(&[(
+            "hooks",
+            "sql/conversations/conversation",
+            "tinycloud.hooks/subscribe",
+        )])
+        .await?;
+        let header = fixture
+            .session_header(&[(fixture.hooks("sql/conversations/conversation")?, SUBSCRIBE)])?;
+        let (status, body) = fixture
+            .ticket(header, &fixture.space, "sql", "conversations/conversation")
+            .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        let ticket: serde_json::Value = serde_json::from_str(&body)?;
+        let claims = test_hook_runtime()
+            .verify_ticket(ticket["ticket"].as_str().expect("ticket string"))
+            .expect("node-signed ticket");
+        assert_eq!(claims.scopes[0].service, "sql");
+        assert_eq!(
+            claims.scopes[0].path_prefix.as_deref(),
+            Some("conversations/conversation")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delegated_session_uses_every_hooks_route() -> Result<()> {
+        let fixture = hook_route_fixture(&[
+            ("hooks", "kv/documents", "tinycloud.hooks/subscribe"),
+            ("hooks", "kv/documents", "tinycloud.hooks/register"),
+            ("hooks", "kv/documents", "tinycloud.hooks/list"),
+            ("hooks", "kv/documents", "tinycloud.hooks/unregister"),
+        ])
+        .await?;
+        let scope = fixture.hooks("kv/documents")?;
+
+        let (status, body) = fixture
+            .ticket(
+                fixture.session_header(&[(scope.clone(), SUBSCRIBE)])?,
+                &fixture.space,
+                "kv",
+                "documents/inbox",
+            )
+            .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        let ticket: serde_json::Value = serde_json::from_str(&body)?;
+        let claims = test_hook_runtime()
+            .verify_ticket(ticket["ticket"].as_str().expect("ticket string"))
+            .expect("node-signed ticket");
+        assert_eq!(claims.sub, did_of(&fixture.session.1));
+        assert_eq!(
+            claims.scopes[0].path_prefix.as_deref(),
+            Some("documents/inbox")
+        );
+
+        let (status, body) = fixture
+            .register(
+                fixture.session_header(&[(scope.clone(), &["tinycloud.hooks/register"])])?,
+                &fixture.space,
+            )
+            .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        let registered: serde_json::Value = serde_json::from_str(&body)?;
+        let id = registered["id"].as_str().expect("webhook id").to_string();
+
+        let (status, body) = fixture
+            .list(fixture.session_header(&[(scope.clone(), &["tinycloud.hooks/list"])])?)
+            .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        let listed: serde_json::Value = serde_json::from_str(&body)?;
+        assert_eq!(listed[0]["id"], id.as_str());
+
+        let (status, _) = fixture
+            .unregister(
+                fixture.session_header(&[(scope, &["tinycloud.hooks/unregister"])])?,
+                &id,
+            )
+            .await;
+        assert_eq!(status, Status::NoContent);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refuses_hook_tickets_without_a_verified_delegation() -> Result<()> {
+        let fixture =
+            hook_route_fixture(&[("hooks", "kv/documents", "tinycloud.hooks/subscribe")]).await?;
+        let scope = fixture.hooks("kv/documents")?;
+        let claim = [(scope, SUBSCRIBE)];
+        let (stranger_jwk, stranger) = did_key()?;
+        let fabricated = Cid::new_v1(0x55, Code::Blake3_256.digest(b"never-delegated"));
+        let signed = fixture.session_header(&claim)?;
+        let (unsigned, _signature) = signed
+            .rsplit_once('.')
+            .ok_or_else(|| anyhow::anyhow!("JWT-encoded invocation"))?;
+
+        let attempts = [
+            ("unsigned token", format!("{unsigned}.")),
+            ("forged session signature", fixture.forged_header(&claim)?),
+            // Stranger signs honestly and borrows the session's proof.
+            (
+                "borrowed proof",
+                signed_header(
+                    &stranger_jwk,
+                    &stranger,
+                    vec![fixture.session_proof],
+                    &claim,
+                )?,
+            ),
+            (
+                "no proof",
+                signed_header(&stranger_jwk, &stranger, vec![], &claim)?,
+            ),
+            // The session key itself, citing a proof the node never stored.
+            (
+                "unstored proof",
+                signed_header(
+                    &fixture.session.0,
+                    &fixture.session.1,
+                    vec![fabricated],
+                    &claim,
+                )?,
+            ),
+        ];
+        for (case, header) in attempts {
+            let (status, body) = fixture
+                .ticket(header, &fixture.space, "kv", "documents")
+                .await;
+            assert_eq!(status, Status::Unauthorized, "{case}: {body}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refuses_claimed_but_undelegated_hook_abilities() -> Result<()> {
+        let fixture =
+            hook_route_fixture(&[("hooks", "kv/documents", "tinycloud.hooks/subscribe")]).await?;
+        let documents = fixture.hooks("kv/documents")?;
+
+        // Subscribe is delegated only on `kv/documents` of this space.
+        let wider = fixture.session_header(&[(fixture.hooks("kv")?, SUBSCRIBE)])?;
+        let (status, _) = fixture.ticket(wider, &fixture.space, "kv", "private").await;
+        assert_eq!(status, Status::Unauthorized);
+        let foreign = fixture.session_header(&[(
+            resource(&fixture.other_space, "hooks", "kv/documents")?,
+            SUBSCRIBE,
+        )])?;
+        let (status, _) = fixture
+            .ticket(foreign, &fixture.other_space, "kv", "documents")
+            .await;
+        assert_eq!(status, Status::Unauthorized);
+
+        // Management abilities were never delegated at all.
+        let register =
+            fixture.session_header(&[(documents.clone(), &["tinycloud.hooks/register"])])?;
+        assert_eq!(
+            fixture.register(register, &fixture.space).await.0,
+            Status::Unauthorized
+        );
+        let list = fixture.session_header(&[(documents.clone(), &["tinycloud.hooks/list"])])?;
+        assert_eq!(fixture.list(list).await.0, Status::Unauthorized);
+        let unregister = fixture.session_header(&[(documents, &["tinycloud.hooks/unregister"])])?;
+        assert_eq!(
+            fixture.unregister(unregister, "any-subscription").await.0,
+            Status::Unauthorized
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kv_only_delegation_cannot_claim_hooks() -> Result<()> {
+        let fixture = hook_route_fixture(&[
+            ("kv", "documents", "tinycloud.kv/get"),
+            ("kv", "documents", "tinycloud.kv/list"),
+        ])
+        .await?;
+        let header = fixture.session_header(&[(fixture.hooks("kv/documents")?, SUBSCRIBE)])?;
+        let (status, _) = fixture
+            .ticket(header, &fixture.space, "kv", "documents")
+            .await;
+        assert_eq!(status, Status::Unauthorized);
+        Ok(())
+    }
+
+    /// P1: hooks routes must not execute or record any non-hooks capability,
+    /// even a delegated `tinycloud.kv/del` that needs no input.
+    #[tokio::test]
+    async fn hooks_routes_never_execute_or_record_non_hook_capabilities() -> Result<()> {
+        use futures::AsyncWriteExt;
+        use tinycloud_core::storage::ImmutableStaging;
+
+        let fixture = hook_route_fixture(&[
+            ("kv", "documents/note", "tinycloud.kv/del"),
+            ("hooks", "kv/documents", "tinycloud.hooks/subscribe"),
+            ("hooks", "kv/documents", "tinycloud.hooks/register"),
+        ])
+        .await?;
+        let key: Path = "documents/note".parse()?;
+        let staging = crate::BlockStage::from(crate::config::StagingStorage::Memory);
+        let mut stage = staging.stage(&fixture.space).await?;
+        stage.write_all(b"keep me").await?;
+        stage.flush().await?;
+        fixture
+            .tinycloud
+            .invoke_internal_kv_put::<crate::BlockStage>(
+                fixture.space.clone(),
+                key.clone(),
+                tinycloud_core::types::Metadata(Default::default()),
+                stage,
+                None,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("seed KV value: {error}"))?;
+        let rows_before = fixture.persisted_rows().await?;
+
+        let delete = (
+            resource(&fixture.space, "kv", "documents/note")?,
+            &["tinycloud.kv/del"][..],
+        );
+        let subscribe = (fixture.hooks("kv/documents")?, SUBSCRIBE);
+        let register = (
+            fixture.hooks("kv/documents")?,
+            &["tinycloud.hooks/register"][..],
+        );
+        let cases = [
+            ("ticket, kv/del only", true, vec![delete.clone()]),
+            (
+                "ticket, hooks + kv/del",
+                true,
+                vec![subscribe, delete.clone()],
+            ),
+            ("webhook, kv/del only", false, vec![delete.clone()]),
+            ("webhook, hooks + kv/del", false, vec![register, delete]),
+        ];
+        for (case, ticket, capabilities) in cases {
+            let header = fixture.session_header(&capabilities)?;
+            let (status, body) = if ticket {
+                fixture
+                    .ticket(header, &fixture.space, "kv", "documents")
+                    .await
+            } else {
+                fixture.register(header, &fixture.space).await
+            };
+            assert_eq!(status, Status::Forbidden, "{case}: {body}");
+            assert!(
+                fixture
+                    .tinycloud
+                    .kv_get(&fixture.space, &key)
+                    .await
+                    .is_ok_and(|v| v.is_some()),
+                "{case}: key must survive"
+            );
+        }
+        assert_eq!(fixture.persisted_rows().await?, rows_before);
+        Ok(())
+    }
+
+    /// P2: a forged request is answered identically for a stored and a
+    /// missing space.
+    #[tokio::test]
+    async fn forged_requests_do_not_reveal_whether_a_space_exists() -> Result<()> {
+        let fixture =
+            hook_route_fixture(&[("hooks", "kv/documents", "tinycloud.hooks/subscribe")]).await?;
+        let (_, nobody) = did_key()?;
+        let missing = space_of(&nobody)?;
+        let mut tickets = Vec::new();
+        let mut webhooks = Vec::new();
+        let mut kv_claims = Vec::new();
+        for space in [&fixture.space, &missing] {
+            let ticket =
+                fixture.forged_header(&[(resource(space, "hooks", "kv/documents")?, SUBSCRIBE)])?;
+            tickets.push(fixture.ticket(ticket, space, "kv", "documents").await);
+            let register = fixture.forged_header(&[(
+                resource(space, "hooks", "kv/documents")?,
+                &["tinycloud.hooks/register"],
+            )])?;
+            webhooks.push(fixture.register(register, space).await);
+            // The reviewer's reproduction: a forged KV invocation, which the
+            // KV write path used to answer 404 for a missing space.
+            let kv = fixture.forged_header(&[(
+                resource(space, "kv", "documents/note")?,
+                &["tinycloud.kv/del"],
+            )])?;
+            kv_claims.push(fixture.ticket(kv, space, "kv", "documents").await);
+        }
+        assert_eq!(tickets[0].0, Status::Unauthorized);
+        assert_eq!(tickets[0], tickets[1]);
+        assert_eq!(webhooks[0].0, Status::Unauthorized);
+        assert_eq!(webhooks[0], webhooks[1]);
+        assert_eq!(kv_claims[0].0, Status::Forbidden);
+        assert_eq!(kv_claims[0], kv_claims[1]);
+        Ok(())
+    }
+
+    /// P3: unregistering a subscription the caller may not touch looks exactly
+    /// like unregistering one that does not exist.
+    #[tokio::test]
+    async fn webhook_delete_does_not_reveal_inaccessible_ids() -> Result<()> {
+        let fixture =
+            hook_route_fixture(&[("hooks", "kv/documents", "tinycloud.hooks/subscribe")]).await?;
+        let existing = fixture
+            .tinycloud
+            .create_hook_subscription(hook_subscription::Model {
+                id: "sub_existing".to_string(),
+                subscriber_did: "did:key:someone-else".to_string(),
+                space_id: fixture.space.to_string(),
+                target_service: "kv".to_string(),
+                path_prefix: Some("documents".to_string()),
+                abilities_json: None,
+                callback_url: "https://1.1.1.1/hooks".to_string(),
+                encrypted_secret: vec![1, 2, 3],
+                secret_key_id: HOOK_WEBHOOK_SECRET_KEY_ID.to_string(),
+                active: true,
+                created_at: "2026-10-05T00:00:00Z".to_string(),
+            })
+            .await?;
+        let scope = fixture.hooks("kv/documents")?;
+        let inaccessible = fixture
+            .unregister(
+                fixture.session_header(&[(scope.clone(), SUBSCRIBE)])?,
+                &existing.id,
+            )
+            .await;
+        let missing = fixture
+            .unregister(
+                fixture.session_header(&[(scope, SUBSCRIBE)])?,
+                "sub_missing",
+            )
+            .await;
+        assert_eq!(inaccessible.0, Status::NotFound);
+        assert_eq!(inaccessible, missing);
+        assert!(
+            fixture
+                .tinycloud
+                .find_hook_subscription(&existing.id)
+                .await?
+                .is_some_and(|row| row.active),
+            "subscription stays active"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hook_events_refuses_tickets_minted_under_the_pre_fix_key() -> Result<()> {
+        let node = StaticSecret::new(vec![5u8; 32]).unwrap();
+        let pre_fix = HookRuntime::new(
+            HooksConfig::default(),
+            node.derive_key(b"tinycloud/hooks/tickets"),
+        );
+        let current = HookRuntime::new(
+            HooksConfig::default(),
+            node.derive_key(crate::hooks::HOOK_TICKET_KEY_CONTEXT),
+        );
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let claims = HookTicketClaims {
+            v: 1,
+            sub: "did:key:subscriber".to_string(),
+            scopes: vec![HookSubscription {
+                space: "tinycloud:space".to_string(),
+                service: "kv".to_string(),
+                path_prefix: None,
+                abilities: Vec::new(),
+            }],
+            iat: now,
+            exp: now + 60,
+            parent_exp: now + 60,
+        };
+        let stale = pre_fix.sign_ticket(&claims).unwrap();
+        assert!(current
+            .verify_ticket(&current.sign_ticket(&claims).unwrap())
+            .is_ok());
+
+        let client = rocket::local::asynchronous::Client::tracked(
+            rocket::build()
+                .mount("/", rocket::routes![hook_events])
+                .manage(current),
+        )
+        .await?;
+        let response = client
+            .get(format!("/hooks/events?ticket={stale}"))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Unauthorized);
+        Ok(())
+    }
+
+    /// Ordinary invoke semantics: the space owner is the root authority for
+    /// its own space and needs no delegation.
+    #[tokio::test]
+    async fn space_owner_mints_ticket_without_a_delegation() -> Result<()> {
+        let fixture = hook_route_fixture(&[]).await?;
+        let header = signed_header(
+            &fixture.owner.0,
+            &fixture.owner.1,
+            vec![],
+            &[(fixture.hooks("kv/documents")?, SUBSCRIBE)],
+        )?;
+        let (status, body) = fixture
+            .ticket(header, &fixture.space, "kv", "documents")
+            .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        // Root authority covers only the owner's own spaces.
+        let foreign = signed_header(
+            &fixture.owner.0,
+            &fixture.owner.1,
+            vec![],
+            &[(
+                resource(&fixture.other_space, "hooks", "kv/documents")?,
+                SUBSCRIBE,
+            )],
+        )?;
+        let (status, _) = fixture
+            .ticket(foreign, &fixture.other_space, "kv", "documents")
+            .await;
+        assert_eq!(status, Status::Unauthorized);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn revoked_delegation_is_refused() -> Result<()> {
+        use tinycloud_core::{
+            models::revocation,
+            sea_orm::{ActiveModelTrait, ActiveValue::Set},
+        };
+        let fixture =
+            hook_route_fixture(&[("hooks", "kv/documents", "tinycloud.hooks/subscribe")]).await?;
+        let claim = [(fixture.hooks("kv/documents")?, SUBSCRIBE)];
+        let (status, _) = fixture
+            .ticket(
+                fixture.session_header(&claim)?,
+                &fixture.space,
+                "kv",
+                "documents",
+            )
+            .await;
+        assert_eq!(status, Status::Ok);
+
+        revocation::ActiveModel {
+            id: Set(tinycloud_core::hash::hash(b"revoke-hooks-session")),
+            revoker: Set(did_of(&fixture.owner.1).to_string()),
+            revoked: Set(Hash::from(fixture.session_proof)),
+            serialization: Set(b"revoke-hooks-session".to_vec()),
+            revoked_at: Set(Some(OffsetDateTime::now_utc())),
+        }
+        .insert(&fixture.db)
+        .await?;
+        let (status, body) = fixture
+            .ticket(
+                fixture.session_header(&claim)?,
+                &fixture.space,
+                "kv",
+                "documents",
+            )
+            .await;
+        assert_eq!(status, Status::Unauthorized, "{body}");
+        Ok(())
+    }
+
+    /// `/invoke`'s lifetime cap and replay cache apply to hooks requests.
+    #[tokio::test]
+    async fn replayed_or_overlong_invocations_are_refused() -> Result<()> {
+        let fixture =
+            hook_route_fixture(&[("hooks", "kv/documents", "tinycloud.hooks/subscribe")]).await?;
+        let claim = [(fixture.hooks("kv/documents")?, SUBSCRIBE)];
+        let header = fixture.session_header(&claim)?;
+        let (first, _) = fixture
+            .ticket(header.clone(), &fixture.space, "kv", "documents")
+            .await;
+        assert_eq!(first, Status::Ok);
+        let (replayed, body) = fixture
+            .ticket(header, &fixture.space, "kv", "documents")
+            .await;
+        assert_eq!(replayed, Status::Conflict, "{body}");
+
+        let overlong = signed_header_expiring(
+            &fixture.session.0,
+            &fixture.session.1,
+            vec![fixture.session_proof],
+            &claim,
+            Config::default().invocation.max_lifetime_secs as i64 + 600,
+        )?;
+        let (status, body) = fixture
+            .ticket(overlong, &fixture.space, "kv", "documents")
+            .await;
+        assert_eq!(status, Status::Unauthorized, "{body}");
+        Ok(())
+    }
+
+    /// Every refusal path leaves the database untouched: no invocation,
+    /// replay, delegation, KV, or subscription rows.
+    #[tokio::test]
+    async fn refused_hooks_requests_write_nothing() -> Result<()> {
+        let fixture = hook_route_fixture(&[
+            ("hooks", "kv/documents", "tinycloud.hooks/subscribe"),
+            ("hooks", "kv/documents", "tinycloud.hooks/list"),
+        ])
+        .await?;
+        let before = fixture.persisted_rows().await?;
+        let documents = fixture.hooks("kv/documents")?;
+        let forged = |abilities: &'static [&'static str]| {
+            fixture.forged_header(&[(documents.clone(), abilities)])
+        };
+        let undelegated = |abilities: &'static [&'static str]| {
+            fixture.session_header(&[(fixture.hooks("kv").unwrap(), abilities)])
+        };
+
+        let statuses = [
+            fixture
+                .ticket(forged(SUBSCRIBE)?, &fixture.space, "kv", "documents")
+                .await
+                .0,
+            fixture
+                .ticket(undelegated(SUBSCRIBE)?, &fixture.space, "kv", "private")
+                .await
+                .0,
+            fixture
+                .register(forged(&["tinycloud.hooks/register"])?, &fixture.space)
+                .await
+                .0,
+            fixture
+                .register(
+                    fixture
+                        .session_header(&[(documents.clone(), &["tinycloud.hooks/register"])])?,
+                    &fixture.space,
+                )
+                .await
+                .0,
+            fixture.list(forged(&["tinycloud.hooks/list"])?).await.0,
+            fixture
+                .list(undelegated(&["tinycloud.hooks/list"])?)
+                .await
+                .0,
+            fixture
+                .unregister(forged(&["tinycloud.hooks/unregister"])?, "sub_missing")
+                .await
+                .0,
+            // Authorized caller, refused by the route's own scope check.
+            fixture
+                .unregister(
+                    fixture.session_header(&[(documents.clone(), SUBSCRIBE)])?,
+                    "sub_missing",
+                )
+                .await
+                .0,
+        ];
+        assert!(
+            statuses
+                .iter()
+                .all(|status| status.class().is_client_error()),
+            "{statuses:?}"
+        );
+        assert_eq!(fixture.persisted_rows().await?, before);
+        Ok(())
+    }
+
+    /// A ticket request refused after authorization (here a TTL that expires
+    /// immediately) must not spend the invocation: the same header still
+    /// mints a ticket once the request is valid.
+    #[tokio::test]
+    async fn refused_ticket_does_not_spend_the_invocation() -> Result<()> {
+        let fixture =
+            hook_route_fixture(&[("hooks", "kv/documents", "tinycloud.hooks/subscribe")]).await?;
+        let header = fixture.session_header(&[(fixture.hooks("kv/documents")?, SUBSCRIBE)])?;
+        let before = fixture.persisted_rows().await?;
+
+        let (status, body) = fixture
+            .ticket_with_ttl(header.clone(), &fixture.space, "kv", "documents", 0)
+            .await;
+        assert_eq!(status, Status::Unauthorized, "{body}");
+        assert_eq!(fixture.persisted_rows().await?, before);
+
+        let (status, body) = fixture
+            .ticket(header, &fixture.space, "kv", "documents")
+            .await;
+        assert_eq!(status, Status::Ok, "{body}");
+        Ok(())
+    }
+
+    /// The subscription query's `LIKE 'prefix/%'` treats `_` and `%` as
+    /// wildcards and, on SQLite, ignores ASCII case. Listing must return only
+    /// rows inside the authorized scope, never another subscriber's rows that
+    /// merely match the pattern.
+    #[tokio::test]
+    async fn list_returns_only_rows_inside_the_authorized_scope() -> Result<()> {
+        let fixture =
+            hook_route_fixture(&[("hooks", "kv/my_docs", "tinycloud.hooks/list")]).await?;
+        let space = fixture.space.to_string();
+        let row = |id: &str, path_prefix: &str| hook_subscription::Model {
+            id: id.to_string(),
+            subscriber_did: "did:key:other-subscriber".to_string(),
+            space_id: space.clone(),
+            target_service: "kv".to_string(),
+            path_prefix: Some(path_prefix.to_string()),
+            abilities_json: None,
+            callback_url: format!("https://1.1.1.1/{id}"),
+            encrypted_secret: vec![1, 2, 3],
+            secret_key_id: HOOK_WEBHOOK_SECRET_KEY_ID.to_string(),
+            active: true,
+            created_at: "2026-10-05T00:00:00Z".to_string(),
+        };
+        hook_subscription::Entity::insert_many(
+            [
+                row("exact", "my_docs"),
+                row("nested", "my_docs/inbox"),
+                row("upper", "MY_DOCS/secret"),
+                row("underscore", "myXdocs/secret"),
+                row("percent", "my%docs/secret"),
+                row("sibling", "my_docs_archive/secret"),
+            ]
+            .map(hook_subscription::ActiveModel::from),
+        )
+        .exec(&fixture.db)
+        .await?;
+
+        let header =
+            fixture.session_header(&[(fixture.hooks("kv/my_docs")?, &["tinycloud.hooks/list"])])?;
+        let (status, body) = fixture.list_prefix(header, "my_docs").await;
+        assert_eq!(status, Status::Ok, "{body}");
+        let listed: Vec<serde_json::Value> = serde_json::from_str(&body)?;
+        let mut ids = listed
+            .iter()
+            .map(|row| row["id"].as_str().expect("webhook id"))
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, ["exact", "nested"]);
+        Ok(())
     }
 }

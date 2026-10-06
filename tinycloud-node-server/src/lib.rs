@@ -326,7 +326,7 @@ pub async fn app_with_control(
         ColumnEncryption::new(key_setup.derive_key(b"tinycloud/hooks/webhook-secrets"));
     let hook_runtime = HookRuntime::new(
         tinycloud_config.hooks.clone(),
-        key_setup.derive_key(b"tinycloud/hooks/tickets"),
+        key_setup.derive_key(hooks::HOOK_TICKET_KEY_CONTEXT),
     );
     let signed_url_runtime =
         signed_urls::SignedUrlRuntime::new(key_setup.derive_key(b"tinycloud/kv/signed-urls"));
