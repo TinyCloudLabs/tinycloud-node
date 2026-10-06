@@ -335,19 +335,34 @@ jobs:
           COMPOSE_FILE="$(mktemp)"
           trap 'rm -f "${COMPOSE_FILE}"' EXIT
           if ! curl --silent --show-error --fail \
-            -H "Authorization: Bearer ${PHALA_CLOUD_API_KEY}" \
-            "https://cloud-api.phala.ai/api/v1/cvms/tinycloud-node/docker-compose.yml" \
+            -H "X-API-Key: ${PHALA_CLOUD_API_KEY}" \
+            "https://cloud-api.phala.com/api/v1/cvms/tinycloud-node/docker-compose.yml" \
             --output "${COMPOSE_FILE}" 2>/dev/null; then
             echo "::error::Cannot determine the running production revision from Phala"
             exit 1
           fi
 
           RUNNING_IMAGE="$(python3 - "${COMPOSE_FILE}" <<'PY'
+          import json
           import re
           import sys
           from pathlib import Path
 
-          compose = Path(sys.argv[1]).read_text()
+          try:
+              response = json.loads(Path(sys.argv[1]).read_text())
+          except (OSError, ValueError):
+              sys.exit(0)
+
+          if isinstance(response, str):
+              compose = response
+          elif isinstance(response, dict):
+              compose = response.get("docker_compose_file") or response.get("compose_file") or ""
+          else:
+              compose = ""
+
+          if not isinstance(compose, str):
+              sys.exit(0)
+
           images = re.findall(
               r"(?m)^\s*image:\s*['\"]?(ghcr\.io/tinycloudlabs/tinycloud-node@sha256:[0-9a-f]{64})",
               compose,

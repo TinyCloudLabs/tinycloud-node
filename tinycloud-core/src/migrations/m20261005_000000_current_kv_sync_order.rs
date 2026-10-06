@@ -99,8 +99,14 @@ mod tests {
         let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
             .await
             .unwrap();
-        let previous = Migrator::migrations().len() as u32 - 1;
-        Migrator::up(&db, Some(previous)).await.unwrap();
+        let migrations = Migrator::migrations();
+        let this_migration = Migration.name();
+        let before_this = migrations
+            .iter()
+            .position(|migration| migration.name() == this_migration)
+            .unwrap_or_else(|| panic!("{this_migration} must be registered in Migrator"))
+            as u32;
+        Migrator::up(&db, Some(before_this)).await.unwrap();
         assert!(!index_exists(&db).await);
         db.execute(Statement::from_string(
             sea_orm::DatabaseBackend::Sqlite,
@@ -119,11 +125,11 @@ mod tests {
             .unwrap();
         }
 
-        Migrator::up(&db, None).await.unwrap();
+        Migration.up(&SchemaManager::new(&db)).await.unwrap();
         assert!(index_exists(&db).await);
         assert_eq!(current_kv_rows(&db).await, 2);
 
-        Migrator::down(&db, Some(1)).await.unwrap();
+        Migration.down(&SchemaManager::new(&db)).await.unwrap();
         assert!(!index_exists(&db).await);
         assert_eq!(current_kv_rows(&db).await, 2);
     }
