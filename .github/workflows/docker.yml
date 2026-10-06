@@ -332,6 +332,7 @@ jobs:
             echo "::error::Cannot create a temporary file for Phala's current compose"
             exit 1
           fi
+          trap 'rm -f "${CVM_JSON}"' EXIT
           if ! phala cvms get tinycloud-node --json >"${CVM_JSON}" 2>/dev/null; then
             echo "::error::Cannot determine the running production revision from Phala"
             exit 1
