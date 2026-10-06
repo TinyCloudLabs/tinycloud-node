@@ -21,6 +21,7 @@ pub mod m20260726_000002_owner_share_enforcement_bytes;
 pub mod m20260731_000000_policy_v3;
 pub mod m20260915_000000_meeting_legacy_write_guard;
 pub mod m20261005_000000_current_kv_sync_order;
+pub mod m20261005_000000_deactivate_hook_subscriptions;
 
 pub struct Migrator;
 
@@ -50,6 +51,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260731_000000_policy_v3::Migration),
             Box::new(m20260915_000000_meeting_legacy_write_guard::Migration),
             Box::new(m20261005_000000_current_kv_sync_order::Migration),
+            Box::new(m20261005_000000_deactivate_hook_subscriptions::Migration),
         ]
     }
 }

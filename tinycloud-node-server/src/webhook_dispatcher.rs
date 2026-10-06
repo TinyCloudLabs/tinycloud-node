@@ -453,4 +453,54 @@ mod tests {
         assert!(second.next_attempt_at.is_none());
         Ok(())
     }
+
+    #[tokio::test]
+    async fn upgrade_migration_dead_letters_pending_deliveries_as_inactive() -> Result<()> {
+        use tinycloud_core::{
+            migrations::{m20261005_000000_deactivate_hook_subscriptions as deactivate, Migrator},
+            sea_orm_migration::{MigrationName, MigratorTrait},
+        };
+
+        // A node on the previous release: subscription and delivery are live.
+        let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
+        let before_deactivation = Migrator::migrations()
+            .iter()
+            .position(|migration| migration.name() == deactivate::Migration.name())
+            .expect("deactivation migration is registered")
+            as u32;
+        Migrator::up(&db, Some(before_deactivation)).await?;
+        let encryption = ColumnEncryption::new([9u8; 32]);
+        let (callback_url, mut receiver) = spawn_callback_server(StatusCode::OK).await?;
+        let delivery_id = insert_pending_delivery(&db, &encryption, &callback_url, 0).await?;
+
+        // Booting the upgraded node applies the remaining migration.
+        let tempdir = TempDir::new()?;
+        let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
+        let _persisted = tempdir.keep();
+        let tinycloud = TinyCloud::new(
+            db.clone(),
+            Either::B(storage),
+            StaticSecret::new(vec![0u8; 32]).unwrap(),
+        )
+        .await?
+        .with_encryption(Some(encryption.clone()));
+        let dispatcher = WebhookDispatcher::new(tinycloud, HooksConfig::default(), encryption)?;
+
+        dispatcher.dispatch_due_once().await?;
+
+        let delivery = hook_delivery::Entity::find_by_id(delivery_id)
+            .one(&db)
+            .await?
+            .expect("delivery row");
+        assert_eq!(
+            delivery.status,
+            tinycloud_core::db::HOOK_DELIVERY_STATUS_DEAD_LETTER
+        );
+        assert_eq!(
+            delivery.last_error.as_deref(),
+            Some("subscription inactive")
+        );
+        assert!(receiver.try_recv().is_err(), "no callback was sent");
+        Ok(())
+    }
 }

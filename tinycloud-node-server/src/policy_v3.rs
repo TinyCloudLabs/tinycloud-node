@@ -8333,7 +8333,8 @@ mod tests {
                     crate::routes::invoke,
                     crate::routes::revoke,
                     crate::routes::create_signed_kv_url,
-                    crate::routes::signed_kv_get
+                    crate::routes::signed_kv_get,
+                    crate::routes::hooks::create_hook_ticket
                 ],
             )
             .attach(crate::tracing::TracingFairing::new(
@@ -9059,6 +9060,73 @@ mod tests {
         let read_body = read_response.into_bytes().await.unwrap_or_default();
         assert_eq!(read_status, Status::Ok, "read response: {read_body:?}");
         assert_eq!(read_body, b"tc-470-real-content");
+
+        // TC-541: hooks requests pass the same Policy/v3 gate as `/invoke`.
+        // Policies can only grant `kv` and `encryption` capabilities, so no
+        // policy session can hold `tinycloud.hooks/*`: the reader's chain is
+        // refused before the gate, and the content space's owner citing the
+        // registered policy root — which the ordinary graph allows, the space
+        // owner being root authority — is refused by the gate itself. The
+        // space owner differs from the policy owner in the delegated-session
+        // fixture, so the probe signs with the content owner's key.
+        let hooks_resource = content_space.clone().to_resource(
+            "hooks".parse()?,
+            Some("kv/shares".parse()?),
+            None,
+            None,
+        );
+        let hooks_ticket = |authorization: String| {
+            client
+                .post("/hooks/tickets")
+                .header(rocket::http::Header::new("Authorization", authorization))
+                .header(ContentType::JSON)
+                .body(
+                    json!({"subscriptions":[{
+                        "space": content_space.to_string(),
+                        "service": "kv",
+                        "pathPrefix": "shares",
+                    }]})
+                    .to_string(),
+                )
+                .dispatch()
+        };
+        let hooks_expiry = (OffsetDateTime::now_utc() + Duration::seconds(30)).unix_timestamp();
+        let reader_hooks = make_invocation(
+            [(
+                hooks_resource.clone(),
+                ["tinycloud.hooks/subscribe".parse::<RecapAbility>()?],
+            )],
+            &child_cid,
+            &reader_jwk,
+            &reader_vm,
+            hooks_expiry as f64,
+            InvocationOptions::default(),
+        )?;
+        let reader_response = hooks_ticket(reader_hooks.encode()?).await;
+        assert_eq!(reader_response.status(), Status::Unauthorized);
+        let policy_root: tinycloud_auth::ipld_core::cid::Cid = registered["policyRootCid"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("missing policy root cid"))?
+            .parse()?;
+        // Signed by the owner of `content_space` (root authority), which is
+        // not the policy owner in the delegated-session fixture.
+        let owner_hooks = make_invocation(
+            [(
+                hooks_resource,
+                ["tinycloud.hooks/subscribe".parse::<RecapAbility>()?],
+            )],
+            &policy_root,
+            &content_owner_jwk,
+            &content_owner_vm,
+            hooks_expiry as f64,
+            InvocationOptions::default(),
+        )?;
+        let owner_response = hooks_ticket(owner_hooks.encode()?).await;
+        assert_eq!(owner_response.status(), Status::Forbidden);
+        assert_eq!(
+            owner_response.into_string().await.unwrap_or_default(),
+            "policy-root-cannot-authorize-invocation"
+        );
 
         // The accountless v4 branch reuses the issuer credential and the
         // ordinary S0 mint, but deliberately has no account authorization or
