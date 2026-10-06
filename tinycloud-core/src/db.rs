@@ -487,12 +487,13 @@ where
         invocation::verify_and_authorize(&self.conn, invocation, now).await
     }
 
-    /// Authorize an already signature-verified invocation without recording
-    /// an event or performing an operation. Used before disclosing a write's
-    /// storage rejection to its caller.
+    /// [`Self::authorize_invocation`] for an invocation whose signature and
+    /// lifetime cap were already checked by [`crate::AdmittedInvocation::admit`]:
+    /// re-checks signed time validity and authorizes the persisted delegation
+    /// chain, again without recording anything or touching the data plane.
     pub async fn authorize_admitted(
         &self,
-        invocation: &AdmittedInvocation,
+        invocation: &crate::AdmittedInvocation,
         now: OffsetDateTime,
     ) -> Result<(), crate::models::invocation::Error> {
         invocation::authorize_admitted(&self.conn, &invocation.invocation().0, now, None).await

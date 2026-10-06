@@ -43,6 +43,11 @@ on:
         required: false
         type: boolean
         default: false
+      allow_non_descendant:
+        description: 'Skip the production ancestry guard for a deliberate non-descendant deployment'
+        required: false
+        type: boolean
+        default: false
       image_version:
         description: 'Manual image version to tag/deploy, without leading v. Must equal the tinycloud-node version in tinycloud-node-server/Cargo.toml at the selected ref. Defaults to the selected ref name.'
         required: false
@@ -288,6 +293,8 @@ jobs:
       packages: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Log in to GHCR for digest validation
         uses: docker/login-action@v3
@@ -308,6 +315,67 @@ jobs:
       # unpin once the prod CVM is migrated or 1.1.20+ is verified against it.
       - name: Install Phala CLI
         run: npm install -g phala@1.1.19
+
+      - name: Guard production ancestry
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+          ALLOW_NON_DESCENDANT: ${{ inputs.allow_non_descendant }}
+        run: |
+          set -euo pipefail
+
+          if [ "${ALLOW_NON_DESCENDANT}" = "true" ]; then
+            echo "::warning::allow_non_descendant=true; skipping the production revision ancestry check"
+            exit 0
+          fi
+          if [ -z "${PHALA_CLOUD_API_KEY}" ]; then
+            echo "::error::Cannot determine the running production revision: Phala API key is unavailable"
+            exit 1
+          fi
+
+          COMPOSE_FILE="$(mktemp)"
+          trap 'rm -f "${COMPOSE_FILE}"' EXIT
+          if ! curl --silent --show-error --fail \
+            -H "Authorization: Bearer ${PHALA_CLOUD_API_KEY}" \
+            "https://cloud-api.phala.ai/api/v1/cvms/tinycloud-node/docker-compose.yml" \
+            --output "${COMPOSE_FILE}" 2>/dev/null; then
+            echo "::error::Cannot determine the running production revision from Phala"
+            exit 1
+          fi
+
+          RUNNING_IMAGE="$(python3 - "${COMPOSE_FILE}" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          compose = Path(sys.argv[1]).read_text()
+          images = re.findall(
+              r"(?m)^\s*image:\s*['\"]?(ghcr\.io/tinycloudlabs/tinycloud-node@sha256:[0-9a-f]{64})",
+              compose,
+          )
+          if len(images) == 1:
+              print(images[0])
+          PY
+          )"
+          if [ -z "${RUNNING_IMAGE}" ]; then
+            echo "::error::Cannot determine a unique pinned production image from Phala's current compose"
+            exit 1
+          fi
+
+          if ! docker pull "${RUNNING_IMAGE}" >/dev/null 2>&1; then
+            echo "::error::Cannot inspect the running production image in GHCR"
+            exit 1
+          fi
+          RUNNING_REVISION="$(docker image inspect "${RUNNING_IMAGE}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' 2>/dev/null || true)"
+          if ! [[ "${RUNNING_REVISION}" =~ ^[0-9a-f]{40}$ ]] \
+            || ! git cat-file -e "${RUNNING_REVISION}^{commit}" 2>/dev/null; then
+            echo "::error::Cannot determine the running production revision from its image label"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "${RUNNING_REVISION}" HEAD; then
+            echo "::error::Running production revision ${RUNNING_REVISION} is not an ancestor of ${GITHUB_SHA}; refusing a non-descendant deployment"
+            exit 1
+          fi
+          echo "Running production revision ${RUNNING_REVISION} is an ancestor of ${GITHUB_SHA}."
 
       - name: Validate and pin deployment image
         env:
