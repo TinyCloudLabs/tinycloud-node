@@ -164,8 +164,9 @@ jobs:
 
   # test/m1-realdata-e2e, test/load/signer and test/w5-policy-runtime-node-e2e
   # are `exclude`d from the workspace in Cargo.toml, so the workspace-wide jobs
-  # above do not reach them. m1-realdata-e2e is covered by this job; the other
-  # two are covered by no job at all — recorded here rather than left implicit.
+  # above do not reach them. m1-realdata-e2e is covered by the job below and
+  # w5-policy-runtime-node-e2e by the job after it; test/load/signer is covered
+  # by no job at all — recorded here rather than left implicit.
   m1-realdata:
     runs-on: ubuntu-latest
     env:
@@ -188,3 +189,29 @@ jobs:
         cargo fmt --manifest-path test/m1-realdata-e2e/Cargo.toml -p m1-realdata-e2e -- --check
     - name: Run deterministic M1 contract tests
       run: cargo test --locked --manifest-path test/m1-realdata-e2e/Cargo.toml
+
+  # TC-780 (N1): the w5 crate is excluded from the workspace, so without this
+  # job the node e2e tests — including the SQL/DuckDB path-isolation
+  # reproduction in tests/sql_isolation.rs — would never run in CI. The crate's
+  # tinycloud-node dependency enables the `duckdb` feature, so both the sql/*
+  # and duckdb/* assertions are exercised here. Before N2 lands, this job is
+  # expected to be red on sql_isolation.rs (the documented defect); the two
+  # older tests stay green.
+  w5-node-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+    - name: Checkout TinyCloud repository
+      uses: actions/checkout@v4
+
+    - uses: dtolnay/rust-toolchain@1.97.1
+      with:
+        components: clippy, rustfmt
+
+    - name: Check formatting
+      run: cargo fmt --manifest-path test/w5-policy-runtime-node-e2e/Cargo.toml -p w5-policy-runtime-node-e2e -- --check
+
+    - name: Run the w5 node e2e suite
+      run: cargo test --locked --manifest-path test/w5-policy-runtime-node-e2e/Cargo.toml
