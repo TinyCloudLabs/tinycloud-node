@@ -964,6 +964,29 @@ pub struct SqlNamedStore {
     pub space_name: String,
 }
 
+fn sql_source_db_name(
+    space: &tinycloud_auth::resource::SpaceId,
+    path: &str,
+) -> Result<String, PortError> {
+    // Policy capabilities normalize unreserved percent escapes and NFC before
+    // comparing paths. /invoke keys the raw URI path; accept only a path that
+    // is already in that canonical, URI-representable form.
+    if !path.is_ascii()
+        || tinycloud_core::policy_capability::normalize_path("tinycloud.sql", path)
+            .map_err(|_| PortError::Denied)?
+            != path
+    {
+        return Err(PortError::Denied);
+    }
+    let resource: tinycloud_auth::resource::ResourceId = format!("{space}/sql/{path}")
+        .parse()
+        .map_err(|_| PortError::Denied)?;
+    if resource.path().map(|value| value.as_str()) != Some(path) {
+        return Err(PortError::Denied);
+    }
+    Ok(SqlService::db_name_from_path(Some(path)))
+}
+
 #[async_trait]
 impl ConstrainedNamedSqlStore for SqlNamedStore {
     async fn execute_named(
@@ -1001,10 +1024,9 @@ impl ConstrainedNamedSqlStore for SqlNamedStore {
             .service
             .execute(
                 &space,
-                // The authorized SQL resource path selects the artifact, just
-                // as it does for /invoke. `database` remains a separately
-                // pinned protocol field, not the storage selector.
-                &SqlService::db_name_from_path(Some(source.path.as_str())),
+                // `database` remains a separately pinned protocol field, not
+                // the storage selector.
+                &sql_source_db_name(&space, source.path.as_str())?,
                 SqlRequest::ExecuteStatement {
                     name: source.statement.as_str().to_owned(),
                     params,
@@ -2838,6 +2860,21 @@ pub async fn read(
 mod tests {
     use super::*;
     use rocket::local::asynchronous::Client;
+
+    #[test]
+    fn named_sql_source_uses_only_canonical_uri_paths() {
+        let space: tinycloud_auth::resource::SpaceId =
+            "tinycloud:ens:example.eth:ns0".parse().unwrap();
+        let path = "appA/connectors";
+        assert_eq!(
+            sql_source_db_name(&space, path).unwrap(),
+            SqlService::db_name_from_path(Some(path))
+        );
+        assert!(sql_source_db_name(&space, "caf%C3%A9").is_ok());
+        for path in ["cafe\u{301}", "caf\u{e9}", "a%62", "a?b", "a#b"] {
+            assert!(sql_source_db_name(&space, path).is_err(), "{path:?}");
+        }
+    }
 
     #[tokio::test]
     async fn request_body_limit_is_strict() {

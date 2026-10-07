@@ -108,6 +108,12 @@ jobs:
     - name: Run the workspace test suite
       run: cargo test --workspace
 
+    # The workspace suite does not enable tinycloud-core's DuckDB feature.
+    # Run its unit tests with that feature so SQL/DuckDB identity parity is
+    # checked in CI as well as through the excluded W5 wire-test crate.
+    - name: Run DuckDB-enabled core tests
+      run: cargo test -p tinycloud-core --features duckdb
+
   clippy:
     name: clippy (workspace)
     runs-on: ubuntu-latest

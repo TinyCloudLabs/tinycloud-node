@@ -456,6 +456,41 @@ async fn validate_capabilities<C: ConnectionTrait>(
                         .unwrap_or_else(|| "invocation-caveats-not-subset-of-chain".to_string());
                     return Err(InvocationError::CaveatsNotContained(reason).into());
                 }
+
+                // A pre-N2 SQL/DuckDB child may have been stored under the
+                // old descendant rule. At least one cited proof chain must
+                // contain this invocation all the way to its ancestors. Do
+                // not require unrelated parallel proofs to cover it, and do
+                // not combine a valid ancestor from one proof with caveats
+                // from another proof.
+                if matches!(
+                    &c.resource,
+                    Resource::TinyCloud(resource)
+                        if matches!(resource.service().as_str(), "sql" | "duckdb")
+                ) {
+                    let covers = |ability: &abilities::Model| {
+                        c.resource.extends(&ability.resource)
+                            && crate::policy_capability::ability_matches(
+                                ability.ability.as_ref().as_ref(),
+                                c.ability.as_ref().as_ref(),
+                            )
+                            && caveats_contain_child(&ability.caveats, &c.caveats).is_ok()
+                    };
+                    let valid_chain = parents.iter().any(|(parent, direct_abilities)| {
+                        direct_abilities.iter().any(&covers)
+                            && graph
+                                .chain_ids_from(&parent.id)
+                                .iter()
+                                .all(|id| graph.abilities(id).iter().any(&covers))
+                    });
+                    if !valid_chain {
+                        return Err(InvocationError::UnauthorizedAction(
+                            c.resource.clone(),
+                            c.ability.clone(),
+                        )
+                        .into());
+                    }
+                }
             }
             Ok(())
         }
