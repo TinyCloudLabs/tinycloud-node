@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.16.1](https://github.com/TinyCloudLabs/tinycloud-node/compare/v0.0.1...v1.16.1) - 2026-10-07
+
+### Added
+
+- *(TC-732)* ordered prefix-scoped KV change feed behind tinycloud.kv/sync ([#247](https://github.com/TinyCloudLabs/tinycloud-node/pull/247))
+
+### Fixed
+
+- *(TC-730)* recheck hook ticket revocation at stream open; literal subscription prefixes; complete ancestor traversal (TC-815) ([#251](https://github.com/TinyCloudLabs/tinycloud-node/pull/251))
+- *(TC-541)* authorize hooks requests like other invocation routes ([#243](https://github.com/TinyCloudLabs/tinycloud-node/pull/243))
+- *(TC-731)* segment- and case-exact KV list prefixes; honour the read-only list cursor ([#246](https://github.com/TinyCloudLabs/tinycloud-node/pull/246))
+- *(TC-500)* preflight sealed Node startup configuration ([#236](https://github.com/TinyCloudLabs/tinycloud-node/pull/236))
+
+### Other
+
+- *(server)* cache CORS preflight responses with Access-Control-Max-Age ([#240](https://github.com/TinyCloudLabs/tinycloud-node/pull/240))
+
 - Recheck hook ticket delegation revocation when event streams open and use
   literal segment-prefix matching for hook subscriptions.
 
