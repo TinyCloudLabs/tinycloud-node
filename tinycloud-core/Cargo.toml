@@ -38,6 +38,7 @@ tinycloud-auth = { version = "1.0", path = "../tinycloud-auth" }
 libp2p = { version = "0.52.1", default-features = false, features = ["ed25519"] }
 thiserror.workspace = true
 serde.workspace = true
+chacha20poly1305 = { version = "0.10", features = ["std"] }
 serde_json.workspace = true
 serde_ipld_dagcbor = "0.3"
 ucan-capabilities-object.workspace = true

@@ -9,7 +9,12 @@ extern crate async_trait;
 extern crate tokio;
 
 use anyhow::{Context, Result};
-use rocket::{fairing::AdHoc, figment::Figment, http::Header, Build, Rocket, Route};
+use rocket::{
+    fairing::AdHoc,
+    figment::Figment,
+    http::{Header, Method},
+    Build, Rocket, Route,
+};
 use std::{path::Path, sync::Arc};
 
 pub mod allow_list;
@@ -671,33 +676,55 @@ pub async fn app_with_control(
     let rocket = rocket.attach(share_security_fairing(share_allowed_origin));
 
     if tinycloud_config.cors {
-        Ok(rocket.attach(AdHoc::on_response("CORS", |request, resp| {
-            Box::pin(async move {
-                if is_mounted_share_path(request.uri().path().as_str()) {
-                    return;
-                }
-                resp.set_header(Header::new("Access-Control-Allow-Origin", "*"));
-                resp.set_header(Header::new(
-                    // allow these methods for requests
-                    "Access-Control-Allow-Methods",
-                    "POST, PUT, GET, OPTIONS, DELETE",
-                ));
-                resp.set_header(Header::new(
-                    // expose response headers to browser-run scripts
-                    "Access-Control-Expose-Headers",
-                    "*, Authorization",
-                ));
-                resp.set_header(Header::new(
-                    // allow custom headers + Authorization in requests
-                    "Access-Control-Allow-Headers",
-                    "*, Authorization",
-                ));
-                resp.set_header(Header::new("Access-Control-Allow-Credentials", "true"));
-            })
-        })))
+        Ok(rocket.attach(cors_fairing()))
     } else {
         Ok(rocket)
     }
+}
+
+/// How long, in seconds, a browser may reuse a CORS preflight result for the
+/// generic data plane before sending another `OPTIONS`.
+///
+/// Without `Access-Control-Max-Age` Chromium caches a preflight for only 5 s,
+/// so most `/invoke` calls paid an extra round trip through the TEE gateway.
+/// 7200 is Chromium's upper bound (Firefox allows 86400; WebKit clamps to
+/// 600). It also bounds how long a browser can keep acting on a cached
+/// preflight after the policy in [`cors_fairing`] is tightened.
+const CORS_PREFLIGHT_MAX_AGE_SECS: u32 = 7200;
+
+fn cors_fairing() -> AdHoc {
+    AdHoc::on_response("CORS", |request, resp| {
+        Box::pin(async move {
+            if is_mounted_share_path(request.uri().path().as_str()) {
+                return;
+            }
+            resp.set_header(Header::new("Access-Control-Allow-Origin", "*"));
+            resp.set_header(Header::new(
+                // allow these methods for requests
+                "Access-Control-Allow-Methods",
+                "POST, PUT, GET, OPTIONS, DELETE",
+            ));
+            resp.set_header(Header::new(
+                // expose response headers to browser-run scripts
+                "Access-Control-Expose-Headers",
+                "*, Authorization",
+            ));
+            resp.set_header(Header::new(
+                // allow custom headers + Authorization in requests
+                "Access-Control-Allow-Headers",
+                "*, Authorization",
+            ));
+            resp.set_header(Header::new("Access-Control-Allow-Credentials", "true"));
+            if request.method() == Method::Options {
+                // only meaningful on a preflight response; lets the browser
+                // skip the OPTIONS round trip on subsequent requests
+                resp.set_header(Header::new(
+                    "Access-Control-Max-Age",
+                    CORS_PREFLIGHT_MAX_AGE_SECS.to_string(),
+                ));
+            }
+        })
+    })
 }
 
 fn share_security_fairing(share_allowed_origin: String) -> AdHoc {
@@ -1088,6 +1115,101 @@ mod share_security_fairing_tests {
         assert!(response
             .headers()
             .get_one("Access-Control-Allow-Headers")
+            .is_none());
+    }
+}
+
+#[cfg(test)]
+mod cors_fairing_tests {
+    use super::{cors_fairing, share_security_fairing};
+    use crate::routes::util_routes;
+    use rocket::{
+        http::{Header, Status},
+        local::asynchronous::Client,
+        post, routes,
+    };
+
+    #[post("/invoke")]
+    fn invoke() {}
+
+    /// Mirrors production: the real catch-all `OPTIONS` route, with the share
+    /// fairing attached before the generic CORS fairing.
+    async fn client() -> Client {
+        Client::tracked(
+            rocket::build()
+                .mount("/", routes![util_routes::cors, invoke])
+                .attach(share_security_fairing("https://share.tinycloud.xyz".into()))
+                .attach(cors_fairing()),
+        )
+        .await
+        .expect("valid Rocket instance")
+    }
+
+    #[tokio::test]
+    async fn invoke_preflight_is_cacheable_without_widening_the_policy() {
+        let client = client().await;
+        let response = client
+            .options("/invoke")
+            .header(Header::new("Origin", "https://tinycloud.chat"))
+            .header(Header::new("Access-Control-Request-Method", "POST"))
+            .header(Header::new(
+                "Access-Control-Request-Headers",
+                "authorization,content-type",
+            ))
+            .dispatch()
+            .await;
+
+        assert_eq!(response.status(), Status::Ok);
+        let headers = response.headers();
+        assert_eq!(headers.get_one("Access-Control-Max-Age"), Some("7200"));
+        assert_eq!(headers.get_one("Access-Control-Allow-Origin"), Some("*"));
+        assert_eq!(
+            headers.get_one("Access-Control-Allow-Methods"),
+            Some("POST, PUT, GET, OPTIONS, DELETE")
+        );
+        assert_eq!(
+            headers.get_one("Access-Control-Allow-Headers"),
+            Some("*, Authorization")
+        );
+        assert_eq!(
+            headers.get_one("Access-Control-Allow-Credentials"),
+            Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn max_age_is_not_sent_on_actual_or_share_responses() {
+        let client = client().await;
+
+        let response = client
+            .post("/invoke")
+            .header(Header::new("Origin", "https://tinycloud.chat"))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        assert_eq!(
+            response.headers().get_one("Access-Control-Allow-Origin"),
+            Some("*")
+        );
+        assert!(response
+            .headers()
+            .get_one("Access-Control-Max-Age")
+            .is_none());
+
+        // the share fairing owns /policy/v3/* and is left untouched
+        let response = client
+            .options("/policy/v3/challenges")
+            .header(Header::new("Origin", "https://share.tinycloud.xyz"))
+            .header(Header::new("Access-Control-Request-Method", "POST"))
+            .dispatch()
+            .await;
+        assert_eq!(
+            response.headers().get_one("Access-Control-Allow-Origin"),
+            Some("https://share.tinycloud.xyz")
+        );
+        assert!(response
+            .headers()
+            .get_one("Access-Control-Max-Age")
             .is_none());
     }
 }
