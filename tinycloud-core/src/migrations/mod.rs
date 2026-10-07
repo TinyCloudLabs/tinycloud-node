@@ -59,3 +59,85 @@ impl MigratorTrait for Migrator {
         ]
     }
 }
+
+#[cfg(test)]
+mod release_line_tests {
+    use super::*;
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement};
+
+    #[tokio::test]
+    async fn postgres_fresh_and_release_line_upgrade_apply_n3_last() {
+        let Some(url) = crate::test_support::postgres_test_url(
+            "postgres_fresh_and_release_line_upgrade_apply_n3_last",
+        ) else {
+            return;
+        };
+        let admin = Database::connect(url.clone()).await.unwrap();
+        let base_count = (Migrator::migrations().len() - 2) as u32;
+        for path in ["fresh", "release"] {
+            let schema = format!(
+                "tc780_{path}_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            admin
+                .execute(Statement::from_string(
+                    DbBackend::Postgres,
+                    format!("CREATE SCHEMA {schema}"),
+                ))
+                .await
+                .unwrap();
+            let mut options = ConnectOptions::new(url.clone());
+            options.set_schema_search_path(schema.clone());
+            let db = Database::connect(options).await.unwrap();
+            if path == "release" {
+                Migrator::up(&db, Some(base_count)).await.unwrap();
+                let applied = db
+                    .query_all(Statement::from_string(
+                        DbBackend::Postgres,
+                        "SELECT version FROM seaql_migrations".to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(applied.len(), base_count as usize);
+                let versions: Vec<String> = applied
+                    .iter()
+                    .map(|row| row.try_get("", "version").unwrap())
+                    .collect();
+                for required in [
+                    "m20260915_000000_meeting_legacy_write_guard",
+                    "m20261005_000000_current_kv_sync_order",
+                    "m20261005_000000_deactivate_hook_subscriptions",
+                ] {
+                    assert!(versions.iter().any(|version| version == required));
+                }
+            }
+            Migrator::up(&db, None).await.unwrap();
+            let applied = db
+                .query_all(Statement::from_string(
+                    DbBackend::Postgres,
+                    "SELECT version FROM seaql_migrations".to_string(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(applied.len(), Migrator::migrations().len());
+            let versions: Vec<String> = applied
+                .iter()
+                .map(|row| row.try_get("", "version").unwrap())
+                .collect();
+            assert!(versions.contains(&"m20261007_000000_database_alias".to_string()));
+            assert!(versions.contains(&"m20261007_010000_database_identity_fence".to_string()));
+            drop(db);
+            admin
+                .execute(Statement::from_string(
+                    DbBackend::Postgres,
+                    format!("DROP SCHEMA {schema} CASCADE"),
+                ))
+                .await
+                .unwrap();
+        }
+    }
+}

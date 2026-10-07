@@ -63,6 +63,16 @@ on:
         required: false
         type: string
         default: ''
+      rollback_image_version:
+        description: 'Emergency rollback only: version label of the recorded pre-cutover digest; requires allow_non_descendant'
+        required: false
+        type: string
+        default: ''
+      rollback_image_revision:
+        description: 'Emergency rollback only: 40-character revision label of the recorded pre-cutover digest'
+        required: false
+        type: string
+        default: ''
 
 env:
   REGISTRY: ghcr.io
@@ -110,6 +120,9 @@ jobs:
           INPUT_IMAGE_VERSION: ${{ inputs.image_version }}
           INPUT_DEPLOY_DIGEST: ${{ inputs.deploy_image_digest }}
           INPUT_DEPLOY_PHALA: ${{ inputs.deploy_phala }}
+          ALLOW_NON_DESCENDANT: ${{ inputs.allow_non_descendant }}
+          ROLLBACK_VERSION: ${{ inputs.rollback_image_version }}
+          ROLLBACK_REVISION: ${{ inputs.rollback_image_revision }}
           INCLUDE_DUCKDB: ${{ inputs.include_duckdb }}
           INCLUDE_TC_BENCH_V1: ${{ inputs.include_tc_bench_v1 }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
@@ -144,6 +157,15 @@ jobs:
 
           if [ -n "${INPUT_IMAGE_VERSION}" ]; then
             check_matches "image_version input" "${INPUT_IMAGE_VERSION}"
+          fi
+          if [ -n "${ROLLBACK_VERSION}" ] || [ -n "${ROLLBACK_REVISION}" ]; then
+            if [ "${ALLOW_NON_DESCENDANT}" != "true" ] || [ -z "${INPUT_DEPLOY_DIGEST}" ] \
+              || ! [[ "${ROLLBACK_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+              || ! [[ "${ROLLBACK_REVISION}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Rollback label override requires allow_non_descendant, a digest, and valid version/revision labels"
+              exit 1
+            fi
+            echo "::warning::Emergency rollback to recorded ${ROLLBACK_VERSION} revision ${ROLLBACK_REVISION}"
           fi
           if [ -n "${INPUT_DEPLOY_DIGEST}" ]; then
             if [ "${EVENT_NAME}" != "workflow_dispatch" ] || [ "${INPUT_DEPLOY_PHALA}" != "true" ] || [ -z "${INPUT_IMAGE_VERSION}" ] \
@@ -386,7 +408,7 @@ jobs:
             exit 1
           fi
 
-          if ! docker pull "${RUNNING_IMAGE}" >/dev/null 2>&1; then
+          if ! docker pull --platform linux/amd64 "${RUNNING_IMAGE}" >/dev/null 2>&1; then
             echo "::error::Cannot inspect the running production image in GHCR"
             exit 1
           fi
@@ -412,18 +434,25 @@ jobs:
           CARGO_VERSION: ${{ needs.version-guard.outputs.cargo_version }}
           INCLUDE_DUCKDB: ${{ inputs.include_duckdb }}
           INCLUDE_TC_BENCH_V1: ${{ inputs.include_tc_bench_v1 }}
+          ROLLBACK_VERSION: ${{ inputs.rollback_image_version }}
+          ROLLBACK_REVISION: ${{ inputs.rollback_image_revision }}
         run: |
           set -euo pipefail
           DIGEST="${INPUT_DEPLOY_DIGEST:-${BUILD_DIGEST}}"
           [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::Invalid deployment digest"; exit 1; }
           export RESOLVED_IMAGE="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
-          docker pull "${RESOLVED_IMAGE}"
+          docker pull --platform linux/amd64 "${RESOLVED_IMAGE}"
           REVISION="$(docker image inspect "${RESOLVED_IMAGE}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
           VERSION="$(docker image inspect "${RESOLVED_IMAGE}" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')"
           EXPECTED="${CARGO_VERSION}-dstack"
           if [ "${INCLUDE_DUCKDB}" = "true" ]; then EXPECTED="${EXPECTED}-duckdb"; fi
           if [ "${INCLUDE_TC_BENCH_V1}" = "true" ]; then EXPECTED="${EXPECTED}-tc-bench-v1"; fi
-          if [ "${REVISION}" != "$(git rev-parse HEAD)" ] || [ "${VERSION}" != "${EXPECTED}" ]; then
+          EXPECTED_REVISION="$(git rev-parse HEAD)"
+          if [ -n "${ROLLBACK_VERSION}" ]; then
+            EXPECTED="${ROLLBACK_VERSION}-dstack"
+            EXPECTED_REVISION="${ROLLBACK_REVISION}"
+          fi
+          if [ "${REVISION}" != "${EXPECTED_REVISION}" ] || [ "${VERSION}" != "${EXPECTED}" ]; then
             echo "::error::Image revision/version labels do not match the selected checkout and requested features"
             exit 1
           fi
@@ -445,6 +474,7 @@ jobs:
       # without opening a database, resolving dstack, network, or socket
       # access, before the deploy step can replace the healthy CVM.
       - name: Preflight sealed runtime configuration
+        if: inputs.rollback_image_version == ''
         env:
           TINYCLOUD_STORAGE__DATABASE: ${{ secrets.PROD_TINYCLOUD_DATABASE_URL }}
           TINYCLOUD_DATABASE__WRITE_FENCE: ${{ inputs.sql_identity_fence }}
@@ -554,6 +584,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           INPUT_IMAGE_VERSION: ${{ inputs.image_version }}
+          ROLLBACK_VERSION: ${{ inputs.rollback_image_version }}
         run: |
           set -euo pipefail
 
@@ -565,7 +596,7 @@ jobs:
           else
             TAG="${GITHUB_REF_NAME}"
           fi
-          EXPECTED="${TAG#v}"
+          EXPECTED="${ROLLBACK_VERSION:-${TAG#v}}"
           echo "Expecting node.tinycloud.xyz to report version ${EXPECTED}"
 
           # The CVM needs a short while to pull the new image and restart, so

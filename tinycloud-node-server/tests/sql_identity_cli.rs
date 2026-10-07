@@ -68,6 +68,25 @@ async fn cli_fence_dry_run_apply_set_verify_clear() {
     .unwrap();
     drop(conn);
 
+    success(&run(root.path(), &["check-migrations"]));
+    let ledger = rusqlite::Connection::open(&db_path).unwrap();
+    ledger
+        .execute(
+            "INSERT INTO seaql_migrations (version, applied_at) VALUES ('m20990101_unknown_hotfix', 1)",
+            [],
+        )
+        .unwrap();
+    let missing = run(root.path(), &["check-migrations"]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("m20990101_unknown_hotfix"));
+    ledger
+        .execute(
+            "DELETE FROM seaql_migrations WHERE version = 'm20990101_unknown_hotfix'",
+            [],
+        )
+        .unwrap();
+    drop(ledger);
+
     let dry_run = run(root.path(), &["dry-run"]);
     success(&dry_run);
     let report = run(root.path(), &["report"]);
@@ -77,12 +96,13 @@ async fn cli_fence_dry_run_apply_set_verify_clear() {
     assert!(report_json["aliases"].as_array().unwrap().is_empty());
     let inventory: serde_json::Value = serde_json::from_slice(&dry_run.stdout).unwrap();
     assert_eq!(inventory[0]["fingerprint"]["tables"][0]["row_count"], 1);
-    let baseline = root.path().join("baseline.json");
-    std::fs::write(&baseline, &dry_run.stdout).unwrap();
+    let baseline = root.path().join("tc780-applied.json");
     let unfenced = run(root.path(), &["apply"]);
     assert!(!unfenced.status.success());
     success(&run(root.path(), &["fence", "on"]));
-    success(&run(root.path(), &["apply"]));
+    let applied = run(root.path(), &["apply"]);
+    success(&applied);
+    std::fs::write(&baseline, &applied.stdout).unwrap();
     success(&run(
         root.path(),
         &[

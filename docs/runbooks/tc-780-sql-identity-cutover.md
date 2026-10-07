@@ -1,268 +1,201 @@
-# TC-780 SQL/DuckDB identity cutover
+# TC-780 production SQL identity cutover
 
-Production uses `deploy-phala` and `docker-compose.dstack-postgres.yaml`: the
-metadata and durable SQL/DuckDB artifacts are in external Postgres. There is
-no data volume. The `FROM scratch` image has no shell, Cargo, SQLite CLI, or
-migration CLI. Build `tinycloud-sql-identity` from the reviewed N3 commit on
-a trusted operator host with
-`cargo build --locked -p tinycloud-node --features duckdb --bin tinycloud-sql-identity`.
-Give that host TLS/network access to Postgres and obtain the same database
-URL as `PROD_TINYCLOUD_DATABASE_URL` from the secret manager. Export it as
-`TC780_DATABASE_URL` without printing it or putting it in shell history.
-The examples use `TC780_CLI=target/debug/tinycloud-sql-identity` and
-`TC780_DATADIR=$(mktemp -d)`; production has no local cache directory.
+Production runs 1.17.4 with external PostgreSQL metadata and durable SQL artifacts. It has no DuckDB feature or local database cache. Use `include_duckdb=false` throughout this run. Never push a `v*` tag; its push triggers `docker.yml`.
 
-## Preflight: production snapshot dry-run (no outage)
+Use a trusted operator host with PostgreSQL 16 tools, Docker, the N3 `tinycloud-sql-identity` and `tinycloud` binaries, and TLS access to production Postgres. Obtain `TC780_DATABASE_URL` from the secret manager without echoing it or putting it in shell history. Set `TC780_CLI=target/debug/tinycloud-sql-identity`, `TC780_NODE=target/debug/tinycloud`, and `TC780_DATADIR` to a private empty directory. Every pasteable block is a subshell: a failed check stops the block without killing the operator shell.
 
-Complete this final N3 acceptance check before scheduling the outage. A
-normal `pg_dump` takes a consistent snapshot of the live external Postgres
-database without stopping the node. Restore it into an **empty local
-Postgres database**; never run the CLI's dry-run against production:
+## Preflight on a production snapshot
+
+Arrange a no-deploy/no-DDL window with the database owner. **Do not run `pg_dump` concurrently with any deployment or DDL.** Record the running image from `phala cvms get tinycloud-node --json`; require exactly one pinned `ghcr.io/tinycloudlabs/tinycloud-node@sha256:…` image. The OCI revision and digest, not a tag, are the rollback target.
 
 ```sh
-export TC780_SNAPSHOT_DUMP=tc780-production-snapshot.dump
-export TC780_SNAPSHOT_DATADIR="$(mktemp -d)"
-export TC780_SNAPSHOT_DB="tc780_cutover_$(date -u +%Y%m%dT%H%M%SZ)"
-createdb "$TC780_SNAPSHOT_DB"  # using the operator host's local Postgres credentials
-export TC780_SNAPSHOT_URL="postgresql://localhost/$TC780_SNAPSHOT_DB"
-pg_dump --dbname="$TC780_DATABASE_URL" --format=custom --no-owner \
-  --file="$TC780_SNAPSHOT_DUMP"
-pg_restore --dbname="$TC780_SNAPSHOT_URL" --no-owner "$TC780_SNAPSHOT_DUMP"
-"$TC780_CLI" --datadir "$TC780_SNAPSHOT_DATADIR" \
-  --database "$TC780_SNAPSHOT_URL" dry-run > tc780-inventory.json
-"$TC780_CLI" --datadir "$TC780_SNAPSHOT_DATADIR" \
-  --database "$TC780_SNAPSHOT_URL" report > tc780-preflight-report.json
+(
+  set -euo pipefail
+  umask 077
+  phala cvms get tinycloud-node --json > tc780-running-cvm.json
+  TC780_RUNNING_IMAGE="$(python3 - <<'PY'
+import json, re
+from pathlib import Path
+value = json.loads(Path('tc780-running-cvm.json').read_text())
+compose_file = value.get('compose_file', {}) if isinstance(value, dict) else {}
+compose = value if isinstance(value, str) else (compose_file.get('docker_compose_file', '') if isinstance(compose_file, dict) else '')
+if not compose and isinstance(value, dict):
+    compose = value.get('docker_compose_file', '')
+images = re.findall(r"(?m)^\s*image:\s*['\"]?(ghcr\.io/tinycloudlabs/tinycloud-node@sha256:[0-9a-f]{64})", compose)
+if len(images) != 1:
+    raise SystemExit('expected exactly one pinned running node image')
+print(images[0])
+PY
+)"
+  docker pull --platform linux/amd64 "$TC780_RUNNING_IMAGE"
+  TC780_RUNNING_DIGEST="${TC780_RUNNING_IMAGE##*@}"
+  TC780_RUNNING_REVISION="$(docker image inspect "$TC780_RUNNING_IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
+  TC780_RUNNING_VERSION="$(docker image inspect "$TC780_RUNNING_IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')"
+  test "$TC780_RUNNING_VERSION" = '1.17.4-dstack'
+  printf 'image=%s\ndigest=%s\nrevision=%s\nversion=%s\n' "$TC780_RUNNING_IMAGE" "$TC780_RUNNING_DIGEST" "$TC780_RUNNING_REVISION" "$TC780_RUNNING_VERSION" > tc780-running-image.txt
+  "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" check-migrations
+)
 ```
 
-Production stores artifact bytes in Postgres and has no separate node data
-volume. If an installation has a separate `sql/` or `duckdb/` artifact
-store, take a consistent filesystem snapshot and copy it under
-`$TC780_SNAPSHOT_DATADIR` with `rsync -a "$TC780_ARTIFACT_STORE"/
-"$TC780_SNAPSHOT_DATADIR"/` before the CLI commands. The local snapshot
-database must include `database_artifact`, grants and invocation history.
-Inspect and retain both JSON reports; resolve collisions and invalid names.
-Time the dump, restore and dry-run. Use those measured durations to size the
-maintenance window; do not run a first full inventory during the outage.
-
-## 1. Prevent an unfenced deploy and stage the image (no outage)
-
-Merge the reviewed N3 stack and wait for CI and the version tag **before**
-stopping the old node. `release-plz.yml` can tag a main push; `docker.yml`
-builds on `v*`, but the N3 `deploy-phala` job runs only on manual dispatch.
-The temporary repository variable gates image publishing, including
-`latest`. Set it for the build after confirming the manual-only deploy gate.
-Self-hosters who pull N3 `latest` automatically fence SQL/DuckDB while
-unmigrated legacy artifacts exist.
-
-Use a **new** release-plz `vX.Y.Z` tag containing the final approved N3
-commit. The existing `v1.16.1` tag predates this cutover and must not be
-used. The example below assumes the DuckDB-enabled production image; use
-`include_duckdb=false` and omit `-duckdb` from the image tag only if
-production has no DuckDB artifacts.
+`check-migrations` reads production's applied `seaql_migrations` rows and fails if any migration file is absent from the N3 binary. Save its output. The dump and restored DB contain private user data: use an encrypted volume and `umask 077`. Remove the dump immediately after restore. Set `TC780_SNAPSHOT_URL` to a fresh empty local PostgreSQL database URL, `TC780_SNAPSHOT_DATADIR` to a private directory, and `TC780_REHEARSAL_KEY` to a throwaway static node key.
 
 ```sh
-export TC780_REF="vX.Y.Z"  # replace with the new reviewed release-plz tag
-export TC780_APPROVED_SHA="<final-reviewed-N3-commit>"
-export TC780_VERSION="${TC780_REF#v}"
-git fetch origin --tags
-git merge-base --is-ancestor "$TC780_APPROVED_SHA" "$TC780_REF"
-test "$(git show "${TC780_REF}:tinycloud-node-server/Cargo.toml" |
-  sed -n -E 's/^version = "([^"]+)"/\1/p' | head -1)" = "$TC780_VERSION"
-gh variable set TC780_CUTOVER_READY --body true
-gh workflow run docker.yml --ref "$TC780_REF" \
-  -f deploy_phala=false -f sql_identity_fence=true \
-  -f include_duckdb=true -f image_version="$TC780_VERSION"
-gh run list --workflow docker.yml --limit 5
-export TC780_BUILD_RUN_ID="<build-run-id-from-list>"
-gh run watch "$TC780_BUILD_RUN_ID" --exit-status
-export TC780_IMAGE="ghcr.io/tinycloudlabs/tinycloud-node:${TC780_VERSION}-dstack-duckdb"
-export TC780_DIGEST="$(docker buildx imagetools inspect "$TC780_IMAGE" |
-  awk '$1 == "Digest:" { print $2; exit }')"
-case "$TC780_DIGEST" in sha256:????????????????????????????????????????????????????????????????) ;; *) exit 1 ;; esac
-docker pull "ghcr.io/tinycloudlabs/tinycloud-node@$TC780_DIGEST"
-test "$(docker image inspect "ghcr.io/tinycloudlabs/tinycloud-node@$TC780_DIGEST" \
-  --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" = \
-  "$(git rev-list -n 1 "$TC780_REF")"
+(
+  set -euo pipefail
+  umask 077
+  TC780_DUMP="$(mktemp ./tc780-snapshot.XXXXXXXX.dump)"
+  trap 'rm -f "$TC780_DUMP"' EXIT
+  /usr/bin/time -p pg_dump --dbname="$TC780_DATABASE_URL" --format=custom --no-owner --no-privileges --file="$TC780_DUMP"
+  /usr/bin/time -p pg_restore --dbname="$TC780_SNAPSHOT_URL" --clean --if-exists --no-owner --no-privileges --single-transaction --exit-on-error "$TC780_DUMP"
+  rm -f "$TC780_DUMP"
+  "$TC780_CLI" --datadir "$TC780_SNAPSHOT_DATADIR" --database "$TC780_SNAPSHOT_URL" check-migrations
+  "$TC780_CLI" --datadir "$TC780_SNAPSHOT_DATADIR" --database "$TC780_SNAPSHOT_URL" dry-run > tc780-preflight-inventory.json
+  if ! psql "$TC780_SNAPSHOT_URL" -At -c "SELECT 1 FROM pg_indexes WHERE indexname='idx_current_kv_space_order'" | grep -qx 1; then
+    /usr/bin/time -p psql "$TC780_SNAPSHOT_URL" -v ON_ERROR_STOP=1 -c 'CREATE INDEX idx_current_kv_space_order ON current_kv (space, seq, epoch, epoch_seq, key)'
+    psql "$TC780_SNAPSHOT_URL" -v ON_ERROR_STOP=1 -c 'DROP INDEX idx_current_kv_space_order'
+  else
+    echo 'current_kv_sync_order index already present; no build needed'
+  fi
+  /usr/bin/time -p "$TC780_CLI" --datadir "$TC780_SNAPSHOT_DATADIR" --database "$TC780_SNAPSHOT_URL" fence on
+  "$TC780_CLI" --datadir "$TC780_SNAPSHOT_DATADIR" --database "$TC780_SNAPSHOT_URL" apply > tc780-preflight-applied.json
+  "$TC780_CLI" --datadir "$TC780_SNAPSHOT_DATADIR" --database "$TC780_SNAPSHOT_URL" verify --baseline tc780-preflight-applied.json > tc780-preflight-verified.json
+  ROCKET_ADDRESS=127.0.0.1 ROCKET_PORT=18080 TINYCLOUD_STORAGE__DATABASE="$TC780_SNAPSHOT_URL" TINYCLOUD_STORAGE__DATADIR="$TC780_SNAPSHOT_DATADIR" TINYCLOUD_DATABASE__WRITE_FENCE=false TINYCLOUD_KEYS_SECRET="$TC780_REHEARSAL_KEY" "$TC780_NODE" > tc780-preflight-node.log 2>&1 &
+  TC780_PID=$!
+  trap 'kill "$TC780_PID" 2>/dev/null || true; rm -f "$TC780_DUMP"' EXIT
+  for attempt in $(seq 1 30); do
+    if curl -fsS http://127.0.0.1:18080/healthz >/dev/null; then break; fi
+    sleep 1
+  done
+  curl -fsS http://127.0.0.1:18080/healthz >/dev/null
+  kill "$TC780_PID"
+  wait "$TC780_PID" || true
+)
 ```
 
-Record the digest and verify the pulled image's
-`org.opencontainers.image.revision` label equals the commit at
-`$TC780_REF`. Keep that ref and digest unchanged through steps 7 and 9.
-The deploy workflow accepts `prebuilt_dstack_digest`, skips its Docker
-builds, and still checks the digest's revision against the selected ref.
+Check the boot log for missing-migration errors and confirm the node reached `/healthz`. On the restored DB, use a signed test client to confirm an authorized exact-path web SQL read returns the expected row and short legacy paths cannot read it. Keep private inventory and verification reports for drift checks. Drop the snapshot DB and delete its directory after approval. Record the measured `pg_restore`, index-build and `fence on` times. If an installation has filesystem artifacts, copy their caches and WAL files into `TC780_SNAPSHOT_DATADIR` before `dry-run`.
 
-**Outage budget:** the **entire node, including KV**, is unavailable from
-step 2 until the fenced N3 node starts in step 7. If merge and CI build
-happened after step 2, they would extend that outage; they are completed
-here. These are planning allowances, not measured production timings;
-replace the data-size-dependent ranges with the preflight rehearsal results.
+## 1. Stage the release-line image
 
-| Step | Estimated time | Whole-node outage? |
+After review and merge into `Codex/roman/rollback-meeting-node-20260915`, build 1.20.0 with `docker.yml` `workflow_dispatch`: `deploy_phala=false`, `include_duckdb=false`, `image_version=1.20.0`. The temporary `TC780_CUTOVER_READY=true` repository variable permits image publishing; it does not authorize deployment. Record the immutable `1.20.0-dstack` digest, pull it with `docker pull --platform linux/amd64`, and require its OCI revision to equal the merged release-line SHA. Do not push a tag. Production 1.17.4 stays running.
+
+| Phase | Budget | Service state |
 | --- | --- | --- |
-| Preflight snapshot, restore, dry-run | 15–60 minutes, measure the data-sized work | No |
-| 1. Merge, CI, tag, build/push image | 20–60 minutes | No |
-| 2. Stop old node | 1–2 minutes | Starts here |
-| 3. Drain/checkpoint | 1–3 minutes | Yes |
-| 4. Full backup | 5–20 minutes, replace with measured dump time | Yes |
-| 5. Review inventory | 1–2 minutes | Yes |
-| 6. Alias transaction | 5–20 minutes, replace with measured dry-run time | Yes |
-| 7. Deploy staged image | 5–10 minutes | Ends when healthy |
-| 8. Offline verify | 5–20 minutes | No; SQL/DuckDB fenced |
-| 9. Unfence redeploy | 5–10 minutes | No; SQL/DuckDB fenced until complete |
+| Preflight dump, restore, index timing, apply/verify, boot | Measured before outage | 1.17.4 serving |
+| 1. Review, merge, build, pin digest | Before outage | 1.17.4 serving |
+| 2–6. Stop, drain, backup, drift check, apply | Measured backup and `fence on` times | Whole node down, including KV |
+| 7. Promote pinned N3 digest | 5–10 minutes | Whole-node outage ends when healthy; SQL fenced |
+| 8. Offline verify | Measured rehearsal time | KV serving; SQL fenced |
+| 9. SQL smoke and `fence off` | A few minutes | SQL resumes without redeploy |
 
-## 2. Fence
+## 2–5. Stop, drain, back up, check drift
 
-The old binary cannot honor the N3 fence. From an authorized workstation,
-run `phala ssh tinycloud-node`. On the CVM host, identify and stop only the
-tinycloud compose service:
+On the CVM, `phala ssh tinycloud-node` and stop exactly the `tinycloud` compose service. Wait for active requests to finish. There is no local cache volume in production. Never restart 1.17.4 after the N3 migration ledger is written.
 
 ```sh
-docker ps --filter label=com.docker.compose.service=tinycloud --format '{{.ID}}'
-docker ps --filter label=com.docker.compose.service=tinycloud --quiet | xargs -r docker stop
+(
+  set -euo pipefail
+  TC780_NODE_ID="$(docker ps --filter label=com.docker.compose.service=tinycloud --quiet)"
+  test "$(printf '%s\n' "$TC780_NODE_ID" | grep -c .)" -eq 1
+  docker stop "$TC780_NODE_ID"
+)
 ```
 
-Confirm exactly one production node was selected and public `/invoke` is
-unavailable. There is no ingress 503 rule in this topology. A manually
-stopped `restart: unless-stopped` container stays stopped until redeploy.
-Never restart the old binary after the N3 migration ledger entry is written.
-
-## 3. Drain and checkpoint
-
-Wait for in-flight requests to finish and confirm the node and its database
-actors are stopped. Postgres commits durable artifacts on every write.
-Production has no SQLite/DuckDB cache volume to checkpoint. For a self-hosted
-file-backed node, stop it and checkpoint its SQLite metadata database with
-`sqlite3 /path/to/data/caps.db 'PRAGMA wal_checkpoint(TRUNCATE);'`. Keep SQL
-and DuckDB cache files and their `.db-wal`, `.db-shm`, and `.duckdb.wal`
-files together. After the pre-migration backup in step 4, run `fence on`
-and the N3 CLI `checkpoint` command while the server remains stopped.
-
-## 4. Back up
-
-Before **any** N3 metadata mutation, back up the full Postgres database,
-including migration ledger, artifacts, grants, and invocation history:
+With the node stopped, take a protected full Postgres backup. Record its filename and checksum. It includes `seaql_migrations`, SQL artifacts, KV, delegations, invocations and shares. Keep it untouched. Recheck migration coverage and compare a fresh inventory to preflight for new artifacts, changed classifications, collisions and row counts. If drift is material, repeat the rehearsal on a new snapshot.
 
 ```sh
-pg_dump --dbname="$TC780_DATABASE_URL" --format=custom --no-owner \
-  --file="tc780-pre-cutover-$(date -u +%Y%m%dT%H%M%SZ).dump"
+(
+  set -euo pipefail
+  umask 077
+  TC780_BACKUP="tc780-pre-cutover-$(date -u +%Y%m%dT%H%M%SZ).dump"
+  /usr/bin/time -p pg_dump --dbname="$TC780_DATABASE_URL" --format=custom --no-owner --no-privileges --file="$TC780_BACKUP"
+  shasum -a 256 "$TC780_BACKUP" > "$TC780_BACKUP.sha256"
+  "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" check-migrations
+  "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" dry-run > tc780-outage-inventory.json
+)
 ```
 
-Record the filename and SHA-256 checksum. A self-hoster backs up the entire
-stopped data directory, including WAL and checkpoint files. Rollback to the
-old binary requires this **full pre-migration** backup.
+Persist the backup filename, digest and running-image record outside the subshell for the rollback operator. Keep the dump on encrypted storage.
 
-## 5. Confirm the reviewed inventory
+## 6. Durable fence and alias transaction
 
-Confirm the backup succeeded and the preflight `tc780-inventory.json` and
-`tc780-preflight-report.json` were approved. Their classifications, table
-lists, schema hashes, row counts, and collision checks came from the copied
-production snapshot. Do not repeat the full dry-run while the node is down.
-If material legacy data appeared since the snapshot, stop and repeat the
-preflight procedure before applying aliases. For a file-backed installation,
-back up `caps.db`, `sql/`, and `duckdb/` together, including WAL files.
-
-## 6. Alias transaction
-
-Keep the old node stopped. On the operator host run:
+Keep 1.17.4 stopped. `fence on` applies the N3 migrations. `apply` fingerprints artifacts inside its alias transaction and writes `tc780-applied.json`; this is the verification baseline. Ambiguous and unattributed names stay quarantined. Document owner-approved `set` resolutions before step 7.
 
 ```sh
-"$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" fence on
-"$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" apply > tc780-applied.json
-"$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" report > tc780-aliases.json
+(
+  set -euo pipefail
+  "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" fence on
+  "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" apply > tc780-applied.json
+  "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" report > tc780-aliases.json
+)
 ```
 
-`fence on` creates the N3 tables and persists the fence in metadata. Every
-mutating CLI command checks it. `apply` inventories and writes quarantine
-and unique alias rows in one transaction, refuses digest collisions, and
-never renames artifact files or modifies checkpoint/WAL columns. It can be
-retried. Ambiguous and unattributed artifacts remain quarantined; every
-candidate path rejects `/invoke`, including writes, until an authorized
-mapping exists. Keep owner approval, then run
-`set <sql|duckdb> <space> <physical> --path <logical-path> --authorized`
-(or `--pathless`). `clear <service> <space> --path <logical-path>` removes
-an alias only while fenced.
+## 7. Promote the pinned N3 image while SQL is fenced
 
-## 7. Deploy the prebuilt N3 image while fenced
-
-The reviewed image was built and pushed in step 1. Deploy its immutable
-digest without another Docker build:
+The **config fence is off** at deployment. The durable metadata fence from step 6 holds SQL fenced and is checked on every request. KV can resume. The TC-767 ancestry guard stays enabled; `deploy_image_digest` skips rebuilding.
 
 ```sh
-gh workflow run docker.yml --ref "$TC780_REF" \
-  -f deploy_phala=true -f sql_identity_fence=true \
-  -f include_duckdb=true -f image_version="$TC780_VERSION" \
-  -f prebuilt_dstack_digest="$TC780_DIGEST"
+(
+  set -euo pipefail
+  gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref Codex/roman/rollback-meeting-node-20260915 -f image_version=1.20.0 -f deploy_phala=true -f include_duckdb=false -f sql_identity_fence=false -f deploy_image_digest="$TC780_N3_DIGEST"
+)
 ```
 
-Watch the deployment run to completion. The workflow passes
-`SQL_IDENTITY_FENCE=true` into the Phala compose file, so
-`TINYCLOUD_DATABASE__WRITE_FENCE=true` is set before `/tinycloud` starts.
-Confirm `/version` converges. Do not use a `v*` auto-deploy.
-The whole-node/KV outage ends when this fenced N3 node is healthy.
+Watch the workflow, `/healthz` and `/version` until 1.20.0 is healthy. Require SQL `/invoke` to return 503 under the durable fence and confirm KV works. The whole-node outage ends here.
 
-## 8. Restart verification
+## 8. Verify before SQL resumes
 
-Confirm the restarted node's SQL/DuckDB `/invoke` returns 503. Offline,
-compare **every** aliased artifact with the immutable pre-cutover report:
+Compare aliased artifacts to the **transaction-time** baseline. The preflight inventory is for drift detection only.
 
 ```sh
-"$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" \
-  verify --baseline tc780-inventory.json > tc780-verified.json
+(
+  set -euo pipefail
+  "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" verify --baseline tc780-applied.json > tc780-verified.json
+)
 ```
 
-`verify` loads durable artifacts into temporary local database files and
-compares table lists, schema hashes, and row counts. It needs no end-user
-signing keys. Verify an authorized web `/invoke` smoke case on a staging
-clone, then run the production smoke case immediately after step 9.
+## 9. SQL smoke gate and unfence
 
-## 9. Unfence
-
-Run `fence off` against production Postgres while the deployed binary
-still has `TINYCLOUD_DATABASE__WRITE_FENCE=true`. Redeploy the same
-prebuilt digest with the fence input off:
+Require the signed exact-path SQL smoke on the rehearsed snapshot to have passed: an authorized web read returned the preflight row, a short legacy path could not read it, and an unresolved name was rejected. In production, require SQL `/invoke` to return 503 while fenced, verify the expected alias in `report`, and confirm KV health. A version check alone does not pass this gate. Prepare three different fresh signed invocation bodies and their private header files: `TC780_SQL_FENCED_BODY`/`TC780_SQL_FENCED_HEADERS`, `TC780_SQL_OPEN_BODY`/`TC780_SQL_OPEN_HEADERS`, and `TC780_SQL_SHORT_BODY`/`TC780_SQL_SHORT_HEADERS`. The first two read the original full web path; the last attempts the short legacy path. Set `TC780_SQL_EXPECTED_MARKER` to a known nonsecret row value from preflight. Run **only** `fence off`; the running node observes the durable flag on every request and serves SQL without restart or redeploy. Monitor errors and digest artifacts.
 
 ```sh
-"$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" fence off
-gh workflow run docker.yml --ref "$TC780_REF" \
-  -f deploy_phala=true -f sql_identity_fence=false \
-  -f include_duckdb=true -f image_version="$TC780_VERSION" \
-  -f prebuilt_dstack_digest="$TC780_DIGEST"
+(
+  set -euo pipefail
+  "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" report > tc780-before-unfence.json
+  test -n "$TC780_SQL_EXPECTED_MARKER"
+  for file in "$TC780_SQL_FENCED_BODY" "$TC780_SQL_FENCED_HEADERS" "$TC780_SQL_OPEN_BODY" "$TC780_SQL_OPEN_HEADERS" "$TC780_SQL_SHORT_BODY" "$TC780_SQL_SHORT_HEADERS"; do test -s "$file"; done
+  status="$(curl -sS -o tc780-fenced-response.json -w '%{http_code}' -H @"$TC780_SQL_FENCED_HEADERS" --data-binary @"$TC780_SQL_FENCED_BODY" https://tee.node.tinycloud.xyz/invoke)"
+  test "$status" = 503
+  "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" fence off
+  status="$(curl -sS -o tc780-open-response.json -w '%{http_code}' -H @"$TC780_SQL_OPEN_HEADERS" --data-binary @"$TC780_SQL_OPEN_BODY" https://tee.node.tinycloud.xyz/invoke)"
+  test "$status" = 200
+  jq -e --arg marker "$TC780_SQL_EXPECTED_MARKER" '.. | strings | select(contains($marker))' tc780-open-response.json >/dev/null
+  status="$(curl -sS -o tc780-short-response.json -w '%{http_code}' -H @"$TC780_SQL_SHORT_HEADERS" --data-binary @"$TC780_SQL_SHORT_BODY" https://tee.node.tinycloud.xyz/invoke)"
+  case "$status" in 403|409) ;; *) echo "short legacy SQL path returned $status" >&2; exit 1 ;; esac
+)
 ```
 
-Watch the deployment run to completion. This redeploy restarts the container with
-the fence disabled. Confirm existing web data loads by `/invoke` at its
-original full logical path with an authorized test client; unresolved paths
-return 409; writes work. Monitor errors and new digest artifacts.
+## Rollback criteria and exact path
 
-After the observation window, restore normal release behavior in a separate
-reviewed PR: remove the temporary `TC780_CUTOVER_READY` publishing gate
-and restore the `v*` `deploy-phala` trigger in `docker.yml`. Merge it
-only after Phala and self-hosted migrations are verified and communicated.
+Roll back if N3 cannot boot, KV remains unavailable after step 7, verification mismatches transaction-time fingerprints, or the authorized SQL smoke fails and cannot be corrected while fenced. Before step 9, keep the durable fence on while investigating. After step 9, stop N3 and fence traffic before restoring. Preserve a separate N3-state backup for analysis.
 
-## Rollback
-
-Stop the N3 container as in step 2, or redeploy with
-`sql_identity_fence=true` and confirm 503 before restore. Back up the N3
-state for investigation. Restore the **entire** pre-cutover metadata backup
-while stopped:
+**`pg_restore --clean` loses every write since step 7: KV, delegations, invocations and shares, plus SQL writes after step 9.** Notify owners and choose the rollback deliberately. Restore the entire pre-cutover backup. `--clean` can leave N3-only tables, so drop them and confirm no N3 ledger rows remain. If any check fails, keep the node stopped.
 
 ```sh
-pg_restore --dbname="$TC780_DATABASE_URL" --clean --if-exists --no-owner \
-  --single-transaction --exit-on-error \
-  tc780-pre-cutover-YYYYMMDDTHHMMSSZ.dump
-psql "$TC780_DATABASE_URL" -v ON_ERROR_STOP=1 \
-  -c 'DROP TABLE IF EXISTS database_identity_fence, database_alias, database_legacy_artifact;'
-test "$(psql "$TC780_DATABASE_URL" -At -c \
-  "SELECT count(*) FROM seaql_migrations WHERE version IN ('m20261007_000000_database_alias', 'm20261007_010000_database_identity_fence')")" = 0
+(
+  set -euo pipefail
+  pg_restore --dbname="$TC780_DATABASE_URL" --clean --if-exists --no-owner --no-privileges --single-transaction --exit-on-error "$TC780_BACKUP"
+  psql "$TC780_DATABASE_URL" -v ON_ERROR_STOP=1 -c 'DROP TABLE IF EXISTS database_identity_fence, database_alias, database_legacy_artifact;'
+  test "$(psql "$TC780_DATABASE_URL" -At -c "SELECT count(*) FROM seaql_migrations WHERE version IN ('m20261007_000000_database_alias','m20261007_010000_database_identity_fence')")" = 0
+)
 ```
 
-Postgres `pg_restore --clean` only cleans objects present in its archive;
-it leaves the newer N3 tables, including a stale enabled fence row, behind.
-Drop those tables as shown and verify the restored migration ledger has no
-N3 entries. If restore, cleanup, or ledger verification fails, keep the node
-stopped and fenced. Then redeploy the old pinned image. Clearing aliases is **not** a rollback:
-the old binary does not recognize the N3 migration ledger entry and fails at
-boot. For file-backed nodes restore the complete metadata and cache backup
-together. After N2 digest identities accept writes, the old binary cannot
-read or merge them; restoring the backup discards those writes. Reconcile
-them separately before rollback.
+Use the **recorded** running 1.17.4 digest and OCI revision from preflight after independently rechecking its labels. Load the two values from the protected record into `TC780_RUNNING_DIGEST` and `TC780_RUNNING_REVISION` in the operator shell. TC-767's ancestry guard is roll-forward only. `allow_non_descendant=true` is its sanctioned emergency override; the rollback version/revision inputs require that override and make the workflow validate the digest's recorded labels. The N3 image-only `--validate-config` preflight is skipped for the legacy rollback image; Compose configuration validation still runs. Use the current release-line ref, whose Cargo version remains 1.20.0:
+
+```sh
+(
+  set -euo pipefail
+  gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref Codex/roman/rollback-meeting-node-20260915 -f image_version=1.20.0 -f deploy_phala=true -f include_duckdb=false -f sql_identity_fence=false -f allow_non_descendant=true -f deploy_image_digest="$TC780_RUNNING_DIGEST" -f rollback_image_version=1.17.4 -f rollback_image_revision="$TC780_RUNNING_REVISION"
+)
+```
+
+Verify `/healthz`, `/version` reporting 1.17.4, and the approved signed SQL read. Keep the protected backup until the observation window closes. Restore normal automatic release behavior only in a separately reviewed change after the cutover.

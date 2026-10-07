@@ -480,7 +480,7 @@ async fn validate_capabilities<C: ConnectionTrait>(
                         .has_covering_chain(parents.iter().map(|(parent, _)| parent.id), covers);
                     if !valid_chain {
                         return Err(InvocationError::UnauthorizedAction(
-                            c.resource.clone(),
+                            Box::new(c.resource.clone()),
                             c.ability.clone(),
                         )
                         .into());

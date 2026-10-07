@@ -1580,10 +1580,10 @@ async fn invoke_impl(
             crate::prometheus::observe_invocation_time_rejection(
                 classify_invocation_time_rejection(&i.0 .0, now),
             );
-            return Err((
+            return Err(InvokeError::Text(
                 Status::Unauthorized,
                 invocation_model::InvocationError::InvalidTime.to_string(),
-            ).into());
+            ));
         }
 
         // (b) Admission: full signature verification plus the lifetime cap,
@@ -1720,7 +1720,7 @@ async fn invoke_impl(
             // request must never become migration attribution evidence.
             if tinycloud.effective_database_fence(config.database.write_fence)
                 .await.map_err(identity_resolution_error)? {
-                return Err((Status::ServiceUnavailable, "SQL identity cutover fence is active".into()));
+                return Err((Status::ServiceUnavailable, "SQL identity cutover fence is active".into()).into());
             }
             let (space, path, _) = select_database_scope(&sql_caps, "sql")?;
             database_migration::resolve(tinycloud.connection(), "sql", &space.to_string(), path)
@@ -1778,7 +1778,7 @@ async fn invoke_impl(
             if !duckdb_caps.is_empty() {
                 if tinycloud.effective_database_fence(config.database.write_fence)
                     .await.map_err(identity_resolution_error)? {
-                    return Err((Status::ServiceUnavailable, "DuckDB identity cutover fence is active".into()));
+                    return Err((Status::ServiceUnavailable, "DuckDB identity cutover fence is active".into()).into());
                 }
                 let (space, path, _) = select_database_scope(&duckdb_caps, "duckdb")?;
                 database_migration::resolve(tinycloud.connection(), "duckdb", &space.to_string(), path)
@@ -2407,7 +2407,8 @@ async fn handle_sql_invoke(
         return Err((
             Status::ServiceUnavailable,
             "SQL identity cutover fence is active".into(),
-        ).into());
+        )
+            .into());
     }
     // W1 (D): derive the SQL caveat from the VALIDATED delegation chain,
     // NOT from the invoker's own invocation facts. The invocation-facts
@@ -2997,7 +2998,8 @@ async fn handle_duckdb_invoke(
         return Err((
             Status::ServiceUnavailable,
             "DuckDB identity cutover fence is active".into(),
-        ).into());
+        )
+            .into());
     }
     let caveats: Option<DuckDbCaveats> = admitted
         .invocation()

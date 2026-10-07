@@ -2895,7 +2895,7 @@ mod tests {
     use rocket::local::asynchronous::Client;
 
     #[tokio::test]
-    async fn named_sql_read_on_unmigrated_node_returns_unavailable_before_opening_digest() {
+    async fn named_sql_store_fence_check_rejects_unmigrated_artifact() {
         use tinycloud_core::{
             database_artifacts::SeaOrmDatabaseArtifactRepository,
             models::database_artifact,

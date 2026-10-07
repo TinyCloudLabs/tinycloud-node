@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use tinycloud_core::{
     database_migration as migration,
     migrations::Migrator,
-    sea_orm::{ConnectOptions, Database},
+    sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement},
     sea_orm_migration::MigratorTrait,
 };
 
@@ -25,6 +25,8 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Refuse a cutover if the connected database has applied an unknown migration.
+    CheckMigrations,
     /// JSON inventory and migration dry-run. This command never writes.
     Inventory,
     /// Preview classification and collisions on a copied data directory.
@@ -63,7 +65,7 @@ enum Command {
     },
     /// Show all aliases and unresolved inventory entries.
     Report,
-    /// Read every aliased artifact offline and compare with a saved dry-run.
+    /// Read every aliased artifact offline and compare with saved apply output.
     Verify {
         #[arg(long)]
         baseline: PathBuf,
@@ -88,7 +90,11 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let readonly = matches!(
         &args.command,
-        Command::Inventory | Command::DryRun | Command::Report | Command::Verify { .. }
+        Command::CheckMigrations
+            | Command::Inventory
+            | Command::DryRun
+            | Command::Report
+            | Command::Verify { .. }
     );
     let url = args.database.unwrap_or_else(|| {
         format!(
@@ -99,6 +105,32 @@ async fn main() -> anyhow::Result<()> {
     });
     let conn = Database::connect(ConnectOptions::new(url)).await?;
     match args.command {
+        Command::CheckMigrations => {
+            let known: std::collections::HashSet<String> = Migrator::migrations()
+                .into_iter()
+                .map(|migration| migration.name().to_string())
+                .collect();
+            let rows = conn
+                .query_all(Statement::from_string(
+                    conn.get_database_backend(),
+                    "SELECT version FROM seaql_migrations".to_string(),
+                ))
+                .await?;
+            let applied: Vec<String> = rows
+                .iter()
+                .map(|row| row.try_get("", "version"))
+                .collect::<Result<_, _>>()?;
+            let missing: Vec<_> = applied
+                .iter()
+                .filter(|version| !known.contains(*version))
+                .collect();
+            anyhow::ensure!(
+                missing.is_empty(),
+                "N3 binary is missing applied migration files: {}",
+                missing.into_iter().cloned().collect::<Vec<_>>().join(", ")
+            );
+            println!("N3 covers all {} applied migration rows", applied.len());
+        }
         Command::Inventory | Command::DryRun => {
             let items = migration::inventory(&conn, &args.datadir).await?;
             println!("{}", serde_json::to_string_pretty(&items)?);

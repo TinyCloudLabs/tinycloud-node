@@ -331,8 +331,9 @@ impl EffectiveFenceCache {
                 return Ok(fenced);
             }
         }
+        let scan_started = Instant::now();
         let fenced = has_unmigrated_artifacts(conn).await?;
-        *cached = Some((Instant::now(), fenced));
+        *cached = Some((scan_started, fenced));
         Ok(fenced)
     }
 }
