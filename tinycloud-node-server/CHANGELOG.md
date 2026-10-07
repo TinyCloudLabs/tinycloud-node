@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Recheck hook ticket delegation revocation when event streams open and use
+  literal segment-prefix matching for hook subscriptions.
+
 ## [1.14.0](https://github.com/TinyCloudLabs/tinycloud-node/compare/v1.13.0...v1.14.0) - 2026-08-05
 
 ### Added

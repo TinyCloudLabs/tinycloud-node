@@ -1,3 +1,5 @@
+use tinycloud_auth::ipld_core::cid::Cid;
+
 use crate::config::HooksConfig;
 use base64::{decode_config, encode_config, URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
@@ -46,6 +48,7 @@ pub struct HookTicketClaims {
     pub iat: i64,
     pub exp: i64,
     pub parent_exp: i64,
+    pub authorizing_delegations: Vec<Cid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,10 +88,9 @@ impl WriteEventBus {
     }
 }
 
-/// Node-key derivation context for hook ticket MACs. TC-541 moved it to `v2`
-/// so tickets minted before hooks requests were verified fail MAC
-/// verification once the fix is deployed.
-pub const HOOK_TICKET_KEY_CONTEXT: &[u8] = b"tinycloud/hooks/tickets/v2";
+/// Node-key derivation context for hook ticket MACs. TC-730 rotates it to `v3`
+/// so tickets without authorizing delegation claims fail MAC verification.
+pub const HOOK_TICKET_KEY_CONTEXT: &[u8] = b"tinycloud/hooks/tickets/v3";
 
 #[derive(Debug, Clone)]
 pub struct HookRuntime {
@@ -220,7 +222,7 @@ mod tests {
     async fn ticket_round_trip() {
         let runtime = HookRuntime::new(HooksConfig::default(), [7u8; 32]);
         let claims = HookTicketClaims {
-            v: 1,
+            v: 2,
             sub: "did:key:test".to_string(),
             scopes: vec![HookSubscription {
                 space: "tinycloud:space".to_string(),
@@ -231,12 +233,36 @@ mod tests {
             iat: 10,
             exp: 20,
             parent_exp: 20,
+            authorizing_delegations: Vec::new(),
         };
 
         let ticket = runtime.sign_ticket(&claims).unwrap();
         let decoded = runtime.verify_ticket(&ticket).unwrap();
         assert_eq!(decoded.sub, claims.sub);
         assert_eq!(decoded.scopes, claims.scopes);
+    }
+
+    #[test]
+    fn rejects_ticket_claims_without_authorizing_delegations() {
+        let runtime = HookRuntime::new(HooksConfig::default(), [7u8; 32]);
+        let payload = serde_json::json!({
+            "v": 1,
+            "sub": "did:key:test",
+            "scopes": [],
+            "iat": 10,
+            "exp": 20,
+            "parentExp": 20,
+        });
+        let encoded_payload = encode_config(payload.to_string(), URL_SAFE_NO_PAD);
+        let mut mac = TicketMac::new_from_slice(&runtime.ticket_key).unwrap();
+        mac.update(encoded_payload.as_bytes());
+        let signature = encode_config(mac.finalize().into_bytes(), URL_SAFE_NO_PAD);
+        let ticket = format!("{encoded_payload}.{signature}");
+
+        assert_eq!(
+            runtime.verify_ticket(&ticket).unwrap_err(),
+            "invalid ticket payload"
+        );
     }
 
     #[tokio::test]

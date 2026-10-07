@@ -230,12 +230,13 @@ async fn mint_hook_ticket(
     }
 
     let claims = HookTicketClaims {
-        v: 1,
+        v: 2,
         sub: invocation.invoker.clone(),
         scopes: request.subscriptions,
         iat: now.unix_timestamp(),
         exp,
         parent_exp,
+        authorizing_delegations: invocation.parents.clone(),
     };
     let ticket = hooks
         .sign_ticket(&claims)
@@ -252,10 +253,21 @@ async fn mint_hook_ticket(
 pub async fn hook_events<'r>(
     ticket: &'r str,
     hooks: &'r State<HookRuntime>,
+    tinycloud: &'r State<TinyCloud>,
 ) -> Result<EventStream![Event + 'r], (Status, String)> {
     let claims = hooks
         .verify_ticket(ticket)
         .map_err(|e| (Status::Unauthorized, e))?;
+    if !tinycloud
+        .delegation_chains_unrevoked(&claims.authorizing_delegations)
+        .await
+        .map_err(|error| (Status::InternalServerError, error.to_string()))?
+    {
+        return Err((
+            Status::Unauthorized,
+            "hook ticket authority revoked".to_string(),
+        ));
+    }
     let lease = hooks
         .try_acquire_stream()
         .map_err(|e| (Status::TooManyRequests, e))?;
@@ -458,9 +470,8 @@ pub async fn list_webhooks(
         .await
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
 
-    // The query's prefix filter is an unescaped SQL `LIKE`: `_` and `%` match
-    // any character and SQLite ignores ASCII case, so it can return other
-    // subscribers' rows. Keep only rows the authorization rule itself covers.
+    // The database predicate is byte-exact and segment-aware. Keep this
+    // authorization post-filter as defense in depth.
     let requested_path = hook_scope_path(&requested_scope.service, normalized_prefix.as_deref());
     rows.into_iter()
         .filter(|row| {
@@ -1351,6 +1362,7 @@ mod tests {
                 "/",
                 rocket::routes![
                     create_hook_ticket,
+                    hook_events,
                     create_webhook,
                     list_webhooks,
                     delete_webhook
@@ -1931,7 +1943,7 @@ mod tests {
         );
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let claims = HookTicketClaims {
-            v: 1,
+            v: 2,
             sub: "did:key:subscriber".to_string(),
             scopes: vec![HookSubscription {
                 space: "tinycloud:space".to_string(),
@@ -1942,6 +1954,7 @@ mod tests {
             iat: now,
             exp: now + 60,
             parent_exp: now + 60,
+            authorizing_delegations: Vec::new(),
         };
         let stale = pre_fix.sign_ticket(&claims).unwrap();
         assert!(current
@@ -1951,7 +1964,8 @@ mod tests {
         let client = rocket::local::asynchronous::Client::tracked(
             rocket::build()
                 .mount("/", rocket::routes![hook_events])
-                .manage(current),
+                .manage(current)
+                .manage(test_tinycloud().await?),
         )
         .await?;
         let response = client
@@ -2022,6 +2036,7 @@ mod tests {
         }
         .insert(&fixture.db)
         .await?;
+
         let (status, body) = fixture
             .ticket(
                 fixture.session_header(&claim)?,
@@ -2031,6 +2046,72 @@ mod tests {
             )
             .await;
         assert_eq!(status, Status::Unauthorized, "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hook_stream_rejects_ticket_after_authority_revocation() -> Result<()> {
+        use tinycloud_core::{
+            models::revocation,
+            sea_orm::{ActiveModelTrait, ActiveValue::Set},
+        };
+
+        let fixture =
+            hook_route_fixture(&[("hooks", "kv/documents", "tinycloud.hooks/subscribe")]).await?;
+        let claim = [(fixture.hooks("kv/documents")?, SUBSCRIBE)];
+
+        let (status, live_body) = fixture
+            .ticket(
+                fixture.session_header(&claim)?,
+                &fixture.space,
+                "kv",
+                "documents",
+            )
+            .await;
+        assert_eq!(status, Status::Ok, "{live_body}");
+        let live_ticket: serde_json::Value = serde_json::from_str(&live_body)?;
+        let live_response = fixture
+            .client
+            .get(format!(
+                "/hooks/events?ticket={}",
+                live_ticket["ticket"].as_str().expect("signed ticket")
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(live_response.status(), Status::Ok);
+
+        let (status, revoked_body) = fixture
+            .ticket(
+                fixture.session_header(&claim)?,
+                &fixture.space,
+                "kv",
+                "documents",
+            )
+            .await;
+        assert_eq!(status, Status::Ok, "{revoked_body}");
+        let revoked_ticket: serde_json::Value = serde_json::from_str(&revoked_body)?;
+        revocation::ActiveModel {
+            id: Set(tinycloud_core::hash::hash(b"revoke-hooks-stream")),
+            revoker: Set(did_of(&fixture.owner.1).to_string()),
+            revoked: Set(Hash::from(fixture.session_proof)),
+            serialization: Set(b"revoke-hooks-stream".to_vec()),
+            revoked_at: Set(Some(OffsetDateTime::now_utc())),
+        }
+        .insert(&fixture.db)
+        .await?;
+        let response = fixture
+            .client
+            .get(format!(
+                "/hooks/events?ticket={}",
+                revoked_ticket["ticket"].as_str().expect("signed ticket")
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Unauthorized);
+        assert_eq!(
+            response.into_string().await.as_deref(),
+            Some("hook ticket authority revoked")
+        );
         Ok(())
     }
 
