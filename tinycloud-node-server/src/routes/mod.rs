@@ -1573,7 +1573,7 @@ async fn invoke_impl(
             // Reject quarantined paths and an active cutover fence before
             // verify_auth_admitted persists invoked_abilities. A rejected
             // request must never become migration attribution evidence.
-            if database_migration::effective_fence(tinycloud.connection(), config.database.write_fence)
+            if tinycloud.effective_database_fence(config.database.write_fence)
                 .await.map_err(identity_resolution_error)? {
                 return Err((Status::ServiceUnavailable, "SQL identity cutover fence is active".into()));
             }
@@ -1631,7 +1631,7 @@ async fn invoke_impl(
                     .collect();
 
             if !duckdb_caps.is_empty() {
-                if database_migration::effective_fence(tinycloud.connection(), config.database.write_fence)
+                if tinycloud.effective_database_fence(config.database.write_fence)
                     .await.map_err(identity_resolution_error)? {
                     return Err((Status::ServiceUnavailable, "DuckDB identity cutover fence is active".into()));
                 }
@@ -2258,7 +2258,8 @@ async fn handle_sql_invoke(
     config: &State<Config>,
     sql_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
-    if database_migration::effective_fence(tinycloud.connection(), config.database.write_fence)
+    if tinycloud
+        .effective_database_fence(config.database.write_fence)
         .await
         .map_err(identity_resolution_error)?
     {
@@ -2808,7 +2809,8 @@ async fn handle_duckdb_invoke(
     duckdb_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
     arrow_format: bool,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
-    if database_migration::effective_fence(tinycloud.connection(), config.database.write_fence)
+    if tinycloud
+        .effective_database_fence(config.database.write_fence)
         .await
         .map_err(identity_resolution_error)?
     {

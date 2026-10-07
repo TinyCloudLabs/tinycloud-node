@@ -579,6 +579,9 @@ async fn legacy_inventory_attributes_from_invoked_abilities_without_a_grant() ->
         items[0].collision,
         "the existing digest must block auto alias"
     );
+    // The node caches the legacy inventory for one second; a legacy row
+    // inserted behind its back becomes visible on the next refresh.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let unfenced_write = invocation(
         &owner_jwk,
         &owner_did,

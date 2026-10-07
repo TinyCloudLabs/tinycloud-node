@@ -48,6 +48,11 @@ on:
         required: false
         type: string
         default: ''
+      prebuilt_dstack_digest:
+        description: 'Reviewed dstack image digest for cutover deploys; skips rebuilding images while production is stopped'
+        required: false
+        type: string
+        default: ''
 
 env:
   REGISTRY: ghcr.io
@@ -140,9 +145,11 @@ jobs:
             FEATURES="${FEATURES:+$FEATURES }tc-bench-v1"
             IMAGE_SUFFIX="${IMAGE_SUFFIX}-tc-bench-v1"
           fi
-          echo "cargo_features=${FEATURES}" >> "$GITHUB_OUTPUT"
-          echo "image_suffix=${IMAGE_SUFFIX}" >> "$GITHUB_OUTPUT"
-          echo "manual_version=${{ inputs.image_version }}" >> "$GITHUB_OUTPUT"
+          {
+            echo "cargo_features=${FEATURES}"
+            echo "image_suffix=${IMAGE_SUFFIX}"
+            echo "manual_version=${{ inputs.image_version }}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata (tags, labels)
         id: meta
@@ -158,6 +165,7 @@ jobs:
             type=raw,value=latest${{ steps.build_features.outputs.image_suffix }},enable={{is_default_branch}}
 
       - name: Build and push Docker image
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.prebuilt_dstack_digest == '' }}
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -173,7 +181,7 @@ jobs:
     needs: [version-guard]
     if: vars.TC780_CUTOVER_READY == 'true' && (github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     outputs:
-      digest: ${{ steps.build.outputs.digest }}
+      digest: ${{ steps.build.outputs.digest || steps.prebuilt.outputs.digest }}
     permissions:
       contents: read
       packages: write
@@ -206,10 +214,12 @@ jobs:
             IMAGE_SUFFIX="${IMAGE_SUFFIX}-tc-bench-v1"
             SHA_PREFIX="${SHA_PREFIX}tc-bench-v1-"
           fi
-          echo "cargo_features=${FEATURES}" >> "$GITHUB_OUTPUT"
-          echo "image_suffix=${IMAGE_SUFFIX}" >> "$GITHUB_OUTPUT"
-          echo "sha_prefix=${SHA_PREFIX}" >> "$GITHUB_OUTPUT"
-          echo "manual_version=${{ inputs.image_version }}" >> "$GITHUB_OUTPUT"
+          {
+            echo "cargo_features=${FEATURES}"
+            echo "image_suffix=${IMAGE_SUFFIX}"
+            echo "sha_prefix=${SHA_PREFIX}"
+            echo "manual_version=${{ inputs.image_version }}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata (tags, labels)
         id: meta
@@ -226,6 +236,7 @@ jobs:
 
       - name: Build and push dstack Docker image
         id: build
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.prebuilt_dstack_digest == '' }}
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -235,6 +246,20 @@ jobs:
           build-args: CARGO_FEATURES=${{ steps.build_features.outputs.cargo_features }}
           cache-from: type=gha,scope=dstack
           cache-to: type=gha,mode=max,scope=dstack
+
+      - name: Select reviewed prebuilt dstack image
+        id: prebuilt
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.prebuilt_dstack_digest != '' }}
+        env:
+          INPUT_DIGEST: ${{ inputs.prebuilt_dstack_digest }}
+          DEPLOY_PHALA: ${{ inputs.deploy_phala }}
+        run: |
+          set -euo pipefail
+          if [ "${DEPLOY_PHALA}" != "true" ] || ! [[ "${INPUT_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::prebuilt_dstack_digest requires deploy_phala=true and a sha256 OCI digest"
+            exit 1
+          fi
+          echo "digest=${INPUT_DIGEST}" >> "$GITHUB_OUTPUT"
 
   deploy-phala:
     runs-on: ubuntu-latest

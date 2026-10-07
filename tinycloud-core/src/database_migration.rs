@@ -4,6 +4,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
+    time::{Duration, Instant},
 };
 
 use sea_orm::{
@@ -296,11 +297,44 @@ pub async fn has_unmigrated_artifacts<C: ConnectionTrait>(
         .any(|row| !is_digest_name(&row.2) && !registered.contains(&row)))
 }
 
-pub async fn effective_fence(
-    conn: &DatabaseConnection,
-    configured: bool,
-) -> Result<bool, MigrationError> {
-    Ok(configured || metadata_fenced(conn).await? || has_unmigrated_artifacts(conn).await?)
+/// Caches only the expensive legacy-artifact inventory. The durable metadata
+/// fence is read on every check, so turning it on takes effect even while an
+/// earlier "unfenced" inventory result is cached.
+#[derive(Debug)]
+pub struct EffectiveFenceCache {
+    legacy: tokio::sync::Mutex<Option<(Instant, bool)>>,
+    ttl: Duration,
+}
+
+impl Default for EffectiveFenceCache {
+    fn default() -> Self {
+        Self {
+            legacy: tokio::sync::Mutex::new(None),
+            ttl: Duration::from_secs(1),
+        }
+    }
+}
+
+impl EffectiveFenceCache {
+    /// Check the durable fence on every call and refresh the legacy scan after its TTL.
+    pub async fn check(
+        &self,
+        conn: &DatabaseConnection,
+        configured: bool,
+    ) -> Result<bool, MigrationError> {
+        if configured || metadata_fenced(conn).await? {
+            return Ok(true);
+        }
+        let mut cached = self.legacy.lock().await;
+        if let Some((checked_at, fenced)) = *cached {
+            if checked_at.elapsed() < self.ttl {
+                return Ok(fenced);
+            }
+        }
+        let fenced = has_unmigrated_artifacts(conn).await?;
+        *cached = Some((Instant::now(), fenced));
+        Ok(fenced)
+    }
 }
 
 fn legacy_name(service: &str, path: Option<&str>) -> String {
@@ -802,6 +836,9 @@ pub async fn clear_alias(
 pub async fn aliases(
     conn: &DatabaseConnection,
 ) -> Result<Vec<database_alias::Model>, MigrationError> {
+    if !SchemaManager::new(conn).has_table("database_alias").await? {
+        return Ok(Vec::new());
+    }
     Ok(database_alias::Entity::find().all(conn).await?)
 }
 
@@ -809,6 +846,12 @@ pub async fn aliases(
 pub async fn quarantined(
     conn: &DatabaseConnection,
 ) -> Result<Vec<database_legacy_artifact::Model>, MigrationError> {
+    if !SchemaManager::new(conn)
+        .has_table("database_legacy_artifact")
+        .await?
+    {
+        return Ok(Vec::new());
+    }
     Ok(database_legacy_artifact::Entity::find().all(conn).await?)
 }
 
@@ -870,6 +913,77 @@ pub fn checkpoint_cache(datadir: &Path) -> Result<(usize, usize), MigrationError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn effective_fence_caches_legacy_scan_but_observes_metadata_fence_live() {
+        use sea_orm::Database;
+        use sea_orm_migration::MigratorTrait;
+
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Database::connect(format!(
+            "sqlite:{}?mode=rwc",
+            dir.path().join("caps.db").display()
+        ))
+        .await
+        .unwrap();
+        crate::migrations::Migrator::up(&conn, None).await.unwrap();
+        let cache = EffectiveFenceCache {
+            legacy: tokio::sync::Mutex::new(None),
+            ttl: Duration::from_secs(60),
+        };
+        assert!(!cache.check(&conn, false).await.unwrap());
+        database_artifact::ActiveModel {
+            service: Set("sql".into()),
+            space: Set("test-space".into()),
+            name: Set("threads".into()),
+            revision: Set(1),
+            content_hash: Set("fixture".into()),
+            payload: Set(vec![]),
+            size_bytes: Set(0),
+            backend: Set("sqlite".into()),
+            storage_mode: Set("database-blob".into()),
+            created_at: Set("2026-01-01T00:00:00Z".into()),
+            updated_at: Set("2026-01-01T00:00:00Z".into()),
+            checkpoint_size_bytes: Set(0),
+            checkpoint_content_hash: Set("fixture".into()),
+            delta_payload: Set(None),
+            delta_content_hash: Set(None),
+            delta_size_bytes: Set(0),
+        }
+        .insert(&conn)
+        .await
+        .unwrap();
+        assert!(!cache.check(&conn, false).await.unwrap(), "scan is cached");
+        cache.legacy.lock().await.as_mut().unwrap().0 = Instant::now() - Duration::from_secs(61);
+        assert!(
+            cache.check(&conn, false).await.unwrap(),
+            "unmigrated artifact fences"
+        );
+        database_legacy_artifact::ActiveModel {
+            service: Set("sql".into()),
+            space: Set("test-space".into()),
+            physical_name: Set("threads".into()),
+        }
+        .insert(&conn)
+        .await
+        .unwrap();
+        cache.legacy.lock().await.as_mut().unwrap().0 = Instant::now() - Duration::from_secs(61);
+        assert!(
+            !cache.check(&conn, false).await.unwrap(),
+            "migration clears auto fence"
+        );
+        set_fence(&conn, true).await.unwrap();
+        assert!(
+            cache.check(&conn, false).await.unwrap(),
+            "metadata fence bypasses cached false"
+        );
+        set_fence(&conn, false).await.unwrap();
+        assert!(!cache.check(&conn, false).await.unwrap());
+        assert!(
+            cache.check(&conn, true).await.unwrap(),
+            "configured fence is immediate"
+        );
+    }
 
     #[test]
     fn only_exact_n2_names_are_excluded_and_invalid_legacy_names_fail_preview() {
