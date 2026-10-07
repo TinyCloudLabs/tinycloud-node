@@ -962,6 +962,8 @@ impl TinyCloudKvStore {
 pub struct SqlNamedStore {
     pub service: Arc<SqlService>,
     pub space_name: String,
+    pub conn: DatabaseConnection,
+    pub write_fence: bool,
 }
 
 fn sql_source_db_name(
@@ -994,6 +996,9 @@ impl ConstrainedNamedSqlStore for SqlNamedStore {
         source: &SqlReadSource,
         statement: &PinnedNamedStatement,
     ) -> Result<NamedSqlRows, PortError> {
+        if self.write_fence {
+            return Err(PortError::Storage);
+        }
         if source.statement.as_str() != statement.statement.name
             || source.database != statement.database
             || source.path != statement.path
@@ -1007,6 +1012,15 @@ impl ConstrainedNamedSqlStore for SqlNamedStore {
             .map_err(|_| PortError::Denied)?;
         let name = self.space_name.parse().map_err(|_| PortError::Denied)?;
         let space = tinycloud_auth::resource::SpaceId::new(did, name);
+        let _ = sql_source_db_name(&space, source.path.as_str())?;
+        let physical = tinycloud_core::database_migration::resolve(
+            &self.conn,
+            "sql",
+            &space.to_string(),
+            Some(source.path.as_str()),
+        )
+        .await
+        .map_err(|_| PortError::Denied)?;
         let mut params = Vec::with_capacity(source.arguments.len());
         for value in source.arguments.values() {
             params.push(SqlValue::Integer(value.get()));
@@ -1026,7 +1040,7 @@ impl ConstrainedNamedSqlStore for SqlNamedStore {
                 &space,
                 // `database` remains a separately pinned protocol field, not
                 // the storage selector.
-                &sql_source_db_name(&space, source.path.as_str())?,
+                &physical,
                 SqlRequest::ExecuteStatement {
                     name: source.statement.as_str().to_owned(),
                     params,
@@ -1098,6 +1112,7 @@ pub fn compose(
     key_setup: &tinycloud_core::keys::StaticSecret,
     tinycloud: Arc<TinyCloud>,
     sql_service: Arc<SqlService>,
+    write_fence: bool,
 ) -> anyhow::Result<Option<ShareEmailRuntime>> {
     // v2 policy sharing is deliberately independent of the legacy v1
     // authority-material provider.  A v2-only node has no reason to load the
@@ -1212,6 +1227,8 @@ pub fn compose(
     let sql = SqlNamedStore {
         service: sql_service,
         space_name: config.space_name.clone(),
+        conn: conn.clone(),
+        write_fence,
     };
     let data_plane = HolderBoundDataPlane::new(
         bridge.clone(),

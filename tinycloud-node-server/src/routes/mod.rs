@@ -45,6 +45,7 @@ use tinycloud_core::duckdb::{
 };
 use tinycloud_core::{
     admission::AdmissionError,
+    database_migration,
     encryption_network::EncryptionService,
     events::Invocation,
     models::{
@@ -152,6 +153,17 @@ impl<'r> rocket::response::Responder<'r, 'static> for InvokeError {
             Self::Storage(rejection) => rejection.respond_to(request),
         }
     }
+}
+
+fn identity_resolution_error(error: database_migration::MigrationError) -> (Status, String) {
+    let status = match &error {
+        database_migration::MigrationError::Quarantined
+        | database_migration::MigrationError::Collision => Status::Conflict,
+        database_migration::MigrationError::Database(_)
+        | database_migration::MigrationError::MissingLegacyArtifact => Status::ServiceUnavailable,
+        _ => Status::InternalServerError,
+    };
+    (status, error.to_string())
 }
 
 #[derive(Serialize)]
@@ -2370,6 +2382,12 @@ async fn handle_sql_invoke(
     config: &State<Config>,
     sql_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, InvokeError> {
+    if config.database.write_fence {
+        return Err((
+            Status::ServiceUnavailable,
+            "SQL identity cutover fence is active".into(),
+        ).into());
+    }
     // W1 (D): derive the SQL caveat from the VALIDATED delegation chain,
     // NOT from the invoker's own invocation facts. The invocation-facts
     // path is a holdover (and is still consulted as a fallback so the
@@ -2412,8 +2430,10 @@ async fn handle_sql_invoke(
     let (space, path, ability) = select_database_scope(sql_caps, "sql")?;
     // N3 will resolve this logical identity through an explicit alias table.
     // Do not fall back to the legacy final-segment selector here.
-    let db_name = SqlService::db_name_from_path(path);
     let space_id = space.to_string();
+    let db_name = database_migration::resolve(tinycloud.connection(), "sql", &space_id, path)
+        .await
+        .map_err(identity_resolution_error)?;
 
     let sql_request: SqlRequest =
         serde_json::from_str(&body_str).map_err(|e| (Status::BadRequest, e.to_string()))?;
@@ -2948,6 +2968,12 @@ async fn handle_duckdb_invoke(
     duckdb_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
     arrow_format: bool,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, InvokeError> {
+    if config.database.write_fence {
+        return Err((
+            Status::ServiceUnavailable,
+            "DuckDB identity cutover fence is active".into(),
+        ).into());
+    }
     let caveats: Option<DuckDbCaveats> = admitted
         .invocation()
         .0
@@ -2972,8 +2998,10 @@ async fn handle_duckdb_invoke(
 
     let (space, path, ability) = select_database_scope(duckdb_caps, "duckdb")?;
     // Keep the logical path separate from any legacy physical artifact name.
-    let db_name = DuckDbService::db_name_from_path(path);
     let space_id = space.to_string();
+    let db_name = database_migration::resolve(tinycloud.connection(), "duckdb", &space_id, path)
+        .await
+        .map_err(identity_resolution_error)?;
 
     if ability == "tinycloud.duckdb/import" {
         // Import always grows the database artifact — gate before reading

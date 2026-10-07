@@ -152,7 +152,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     needs: [version-guard]
-    if: inputs.deploy_image_digest == '' && !inputs.rollback_audit_only
+    if: vars.TC780_CUTOVER_READY == 'true' && inputs.deploy_image_digest == '' && !inputs.rollback_audit_only
     permissions:
       contents: read
       packages: write
@@ -204,7 +204,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+          push: ${{ vars.TC780_CUTOVER_READY == 'true' && (github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main')) }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: CARGO_FEATURES=${{ steps.build_features.outputs.cargo_features }}
@@ -214,7 +214,7 @@ jobs:
   build-dstack:
     runs-on: ubuntu-latest
     needs: [version-guard]
-    if: inputs.deploy_image_digest == '' && !inputs.rollback_audit_only && (github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: vars.TC780_CUTOVER_READY == 'true' && inputs.deploy_image_digest == '' && !inputs.rollback_audit_only && (github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     outputs:
       digest: ${{ steps.build.outputs.digest }}
     permissions:
@@ -283,9 +283,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: [version-guard, build, build-dstack]
     if: >-
-      ${{ !cancelled() && !inputs.rollback_audit_only && needs.version-guard.result == 'success' &&
-        (github.event_name == 'release' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
-          (github.event_name == 'workflow_dispatch' && inputs.deploy_phala)) &&
+      ${{ vars.TC780_CUTOVER_READY == 'true' && !cancelled() && !inputs.rollback_audit_only && needs.version-guard.result == 'success' &&
+        github.event_name == 'workflow_dispatch' && inputs.deploy_phala &&
         ((inputs.deploy_image_digest != '' && needs.build.result == 'skipped' && needs.build-dstack.result == 'skipped') ||
           (inputs.deploy_image_digest == '' && needs.build.result == 'success' && needs.build-dstack.result == 'success')) }}
     permissions:

@@ -54,12 +54,14 @@ use tinycloud_auth::{
     ucan_capabilities_object::Capabilities,
 };
 use tinycloud_core::{
+    database_migration,
+    database_artifacts::SeaOrmDatabaseArtifactRepository,
     duckdb::{DuckDbRequest, DuckDbValue},
     hash::Hash,
-    models::{abilities, actor, space},
+    models::{abilities, actor, database_artifact, database_legacy_artifact, space},
     relationships::parent_delegations,
-    sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database, DatabaseConnection},
-    sql::{SqlRequest, SqlValue},
+    sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database, DatabaseConnection, EntityTrait},
+    sql::{SqlRequest, SqlService, SqlValue},
     types::{Ability, Caveats, Resource, SpaceIdWrap},
 };
 
@@ -86,6 +88,182 @@ fn space_identity(name: &str) -> Result<(JWK, String, String, SpaceId)> {
         .to_string();
     let vm = format!("{did_string}#{fragment}");
     Ok((jwk, did_string, vm, SpaceId::new(did, name.parse()?)))
+}
+
+/// Restart with the existing metadata database and cache. Unlike `boot_node`,
+/// this must not insert another space/actor row.
+async fn restart_node(tempdir: &TempDir, fenced: bool) -> Result<Client> {
+    let datadir = tempdir.path().join("data");
+    let secret = URL_SAFE_NO_PAD.encode([9u8; 32]);
+    let overlay = format!(r#"
+[storage]
+datadir = "{}"
+[keys]
+type = "Static"
+secret = "{}"
+[database]
+write_fence = {}
+"#, datadir.display(), secret, fenced);
+    let figment = rocket::Config::figment()
+        .merge(Serialized::defaults(tinycloud::config::Config::default()))
+        .merge(Toml::string(&overlay));
+    let cfg = figment.extract::<tinycloud::config::Config>()?;
+    Ok(Client::tracked(tinycloud::app_with_control(&figment, &cfg, None).await?).await?)
+}
+
+#[tokio::test]
+async fn legacy_web_artifacts_load_via_invoke_after_alias_cutover_and_restart() -> Result<()> {
+    use std::sync::Arc;
+    use tinycloud_core::duckdb::DuckDbService;
+
+    let tempdir = TempDir::new()?;
+    let (owner_jwk, owner_did, owner_vm, space_id) = space_identity("tc780-n3-web")?;
+    let (holder_jwk, holder_did, holder_vm) = holder_identity()?;
+    let (client, conn) = boot_node(&tempdir, &space_id, &[owner_did.clone(), holder_did.clone()]).await?;
+    let datadir = tempdir.path().join("data");
+    let repo = Arc::new(SeaOrmDatabaseArtifactRepository::new(conn.clone()));
+
+    // These writes use the exact pre-N2 physical selectors. The active node
+    // sees only N2 logical names until the alias transaction is applied.
+    let sql = SqlService::new(datadir.join("sql").display().to_string(), 0, repo.clone());
+    for (physical, row) in [("threads", "exo-thread-row"), ("canvas", "exo-canvas-row"),
+        ("connectors", "shared-old-row"), ("orphan", "unattributed-row")] {
+        sql.execute(&space_id, physical, serde_json::from_value(sql_write_body(row))?, None,
+            "tinycloud.sql/write".into()).await?;
+    }
+    let duck = DuckDbService::new(datadir.join("duckdb").display().to_string(), 0, 60,
+        "1GB".into(), repo);
+    duck.execute(&space_id, "default", serde_json::from_value(duckdb_write_body("exo-duck-default"))?,
+        None, "tinycloud.duckdb/write".into(), false).await?;
+
+    let sql_path = "xyz.tinycloud.tinychat/threads";
+    let canvas_path = "xyz.tinycloud.tinychat/canvas";
+    let sql_resource = db_resource(&space_id, "sql", sql_path)?;
+    let canvas_resource = db_resource(&space_id, "sql", canvas_path)?;
+    let duck_resource = db_resource(&space_id, "duckdb", "appA/")?;
+    let connectors_a = db_resource(&space_id, "sql", "xyz.tinycloud.tinychat/connectors")?;
+    let connectors_b = db_resource(&space_id, "sql", "another.app/connectors")?;
+    for (index, resource) in [&sql_resource, &canvas_resource, &duck_resource,
+        &connectors_a, &connectors_b].into_iter().enumerate() {
+        let ability = if resource.service().as_str() == "sql" { "tinycloud.sql/read" }
+            else { "tinycloud.duckdb/read" };
+        persist_grant(&conn, tinycloud_core::hash::hash(format!("n3-grant-{index}").as_bytes()),
+            &owner_did, &holder_did, resource, ability).await?;
+    }
+
+    let items = database_migration::inventory(&conn, &datadir).await?;
+    let find = |service: &str, physical: &str| items.iter().find(|item|
+        item.service == service && item.physical_name == physical).unwrap();
+    assert_eq!(find("sql", "threads").classification, "unique");
+    assert_eq!(find("sql", "connectors").classification, "ambiguous");
+    assert_eq!(find("sql", "orphan").classification, "unattributed");
+    assert_eq!(find("duckdb", "default").paths, vec![Some("appA/".to_owned())]);
+    let key = ("sql".to_owned(), space_id.to_string(), "threads".to_owned());
+    let checkpoint_before = database_artifact::Entity::find_by_id(key.clone()).one(&conn).await?;
+    database_migration::apply_inventory(&conn, &items).await?;
+    database_migration::apply_inventory(&conn, &items).await?;
+    assert_eq!(database_artifact::Entity::find_by_id(key).one(&conn).await?, checkpoint_before);
+
+    let sql_read = serde_json::to_value(SqlRequest::Query { sql: "SELECT v FROM t".into(),
+        params: vec![], max_rows: None, max_bytes: None })?;
+    let duck_read = serde_json::to_value(DuckDbRequest::Query { sql: "SELECT v FROM t".into(),
+        params: vec![] })?;
+    for (resource, ability, body, value, suffix) in [
+        (&sql_resource, "tinycloud.sql/read", &sql_read, "exo-thread-row", "11"),
+        (&canvas_resource, "tinycloud.sql/read", &sql_read, "exo-canvas-row", "12"),
+        (&duck_resource, "tinycloud.duckdb/read", &duck_read, "exo-duck-default", "13"),
+    ] {
+        let grant = tinycloud_core::hash::hash(format!("n3-grant-{}", if suffix == "11" {0} else if suffix == "12" {1} else {2}).as_bytes());
+        let header = invocation(&holder_jwk, &holder_did, &holder_vm,
+            vec![grant.to_cid(0x55)], resource, ability,
+            &format!("urn:uuid:00000000-0000-4000-8000-0000000000{suffix}"))?;
+        let (status, response) = invoke_json(&client, header, body).await;
+        assert_eq!(status, Status::Ok, "{response}");
+        assert!(response.contains(value), "{response}");
+    }
+
+    // A short-name holder has a valid grant but can never reach a reserved
+    // legacy artifact, whether another path aliases it or nobody does.
+    for (path, suffix) in [("threads", "14"), ("orphan", "15"), ("connectors", "16")] {
+        let resource = db_resource(&space_id, "sql", path)?;
+        let (status, response) = invoke_json(&client,
+            invocation(&owner_jwk, &owner_did, &owner_vm, vec![], &resource,
+                "tinycloud.sql/read", &format!("urn:uuid:00000000-0000-4000-8000-0000000000{suffix}"))?,
+            &sql_read).await;
+        assert_eq!(status, Status::Conflict, "{path}: {response}");
+    }
+    for (resource, suffix) in [
+        (db_resource(&space_id, "duckdb", "default")?, "21"),
+        (space_id.clone().to_resource("duckdb".parse()?, None, None, None), "22"),
+    ] {
+        let (status, response) = invoke_json(&client,
+            invocation(&owner_jwk, &owner_did, &owner_vm, vec![], &resource,
+                "tinycloud.duckdb/read", &format!("urn:uuid:00000000-0000-4000-8000-0000000000{suffix}"))?,
+            &duck_read).await;
+        assert_eq!(status, Status::Conflict, "{resource}: {response}");
+    }
+    database_migration::set_alias(&conn, "sql", &space_id.to_string(),
+        Some("xyz.tinycloud.tinychat/connectors"), "connectors").await?;
+    let header = invocation(&holder_jwk, &holder_did, &holder_vm,
+        vec![tinycloud_core::hash::hash(b"n3-grant-3").to_cid(0x55)], &connectors_a,
+        "tinycloud.sql/read", "urn:uuid:00000000-0000-4000-8000-000000000019")?;
+    let (status, response) = invoke_json(&client, header, &sql_read).await;
+    assert_eq!(status, Status::Ok, "{response}");
+    assert!(response.contains("shared-old-row"));
+    database_migration::clear_alias(&conn, "sql", &space_id.to_string(),
+        Some("xyz.tinycloud.tinychat/connectors")).await?;
+    assert_eq!(database_migration::resolve(&conn, "sql", &space_id.to_string(),
+        Some("connectors")).await.unwrap_err().to_string(),
+        "quarantined legacy artifact is unreachable without an explicit alias");
+    drop(client);
+    let restarted = restart_node(&tempdir, false).await?;
+    let header = invocation(&holder_jwk, &holder_did, &holder_vm,
+        vec![tinycloud_core::hash::hash(b"n3-grant-0").to_cid(0x55)], &sql_resource,
+        "tinycloud.sql/read", "urn:uuid:00000000-0000-4000-8000-000000000017")?;
+    let (status, response) = invoke_json(&restarted, header, &sql_read).await;
+    assert_eq!(status, Status::Ok, "{response}");
+    assert!(response.contains("exo-thread-row"));
+    drop(restarted);
+    let fenced = restart_node(&tempdir, true).await?;
+    let write = invocation(&owner_jwk, &owner_did, &owner_vm, vec![], &sql_resource,
+        "tinycloud.sql/write", "urn:uuid:00000000-0000-4000-8000-000000000018")?;
+    let (status, response) = invoke_json(&fenced, write, &sql_write_body("blocked")).await;
+    assert_eq!(status, Status::ServiceUnavailable, "{response}");
+    let duck_write = invocation(&owner_jwk, &owner_did, &owner_vm, vec![], &duck_resource,
+        "tinycloud.duckdb/write", "urn:uuid:00000000-0000-4000-8000-000000000020")?;
+    let (status, response) = invoke_json(&fenced, duck_write,
+        &duckdb_write_body("blocked")).await;
+    assert_eq!(status, Status::ServiceUnavailable, "{response}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_alias_collision_refuses_the_whole_transaction() -> Result<()> {
+    use std::sync::Arc;
+    let tempdir = TempDir::new()?;
+    let (_, owner_did, _, space_id) = space_identity("tc780-n3-collision")?;
+    let (client, conn) = boot_node(&tempdir, &space_id, &[owner_did.clone()]).await?;
+    let datadir = tempdir.path().join("data");
+    let repo = Arc::new(SeaOrmDatabaseArtifactRepository::new(conn.clone()));
+    let sql = SqlService::new(datadir.join("sql").display().to_string(), 0, repo);
+    let path = "exo/threads";
+    let digest = tinycloud_core::database_identity::logical_name(Some(path));
+    for name in ["threads", digest.as_str()] {
+        sql.execute(&space_id, name, serde_json::from_value(sql_write_body("row"))?, None,
+            "tinycloud.sql/write".into()).await?;
+    }
+    let resource = db_resource(&space_id, "sql", path)?;
+    persist_grant(&conn, tinycloud_core::hash::hash(b"n3-collision"),
+        &owner_did, &owner_did, &resource, "tinycloud.sql/read").await?;
+    let items = database_migration::inventory(&conn, &datadir).await?;
+    assert!(items.iter().any(|item| item.physical_name == "threads" && item.collision));
+    assert!(database_migration::apply_inventory(&conn, &items).await.is_err());
+    assert!(database_migration::aliases(&conn).await?.is_empty());
+    assert!(database_legacy_artifact::Entity::find().all(&conn).await?.is_empty());
+    let resolved = database_migration::resolve(&conn, "sql", &space_id.to_string(), Some(path)).await?;
+    assert_eq!(resolved, digest);
+    drop(client);
+    Ok(())
 }
 
 fn holder_identity() -> Result<(JWK, String, String)> {
