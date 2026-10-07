@@ -188,9 +188,11 @@ jobs:
             FEATURES="${FEATURES:+$FEATURES }tc-bench-v1"
             IMAGE_SUFFIX="${IMAGE_SUFFIX}-tc-bench-v1"
           fi
-          echo "cargo_features=${FEATURES}" >> "$GITHUB_OUTPUT"
-          echo "image_suffix=${IMAGE_SUFFIX}" >> "$GITHUB_OUTPUT"
-          echo "manual_version=${{ inputs.image_version }}" >> "$GITHUB_OUTPUT"
+          {
+            echo "cargo_features=${FEATURES}"
+            echo "image_suffix=${IMAGE_SUFFIX}"
+            echo "manual_version=${{ inputs.image_version }}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata (tags, labels)
         id: meta
@@ -254,10 +256,12 @@ jobs:
             IMAGE_SUFFIX="${IMAGE_SUFFIX}-tc-bench-v1"
             SHA_PREFIX="${SHA_PREFIX}tc-bench-v1-"
           fi
-          echo "cargo_features=${FEATURES}" >> "$GITHUB_OUTPUT"
-          echo "image_suffix=${IMAGE_SUFFIX}" >> "$GITHUB_OUTPUT"
-          echo "sha_prefix=${SHA_PREFIX}" >> "$GITHUB_OUTPUT"
-          echo "manual_version=${{ inputs.image_version }}" >> "$GITHUB_OUTPUT"
+          {
+            echo "cargo_features=${FEATURES}"
+            echo "image_suffix=${IMAGE_SUFFIX}"
+            echo "sha_prefix=${SHA_PREFIX}"
+            echo "manual_version=${{ inputs.image_version }}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata (tags, labels)
         id: meta

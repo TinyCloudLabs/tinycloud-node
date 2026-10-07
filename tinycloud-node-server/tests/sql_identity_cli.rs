@@ -70,6 +70,11 @@ async fn cli_fence_dry_run_apply_set_verify_clear() {
 
     let dry_run = run(root.path(), &["dry-run"]);
     success(&dry_run);
+    let report = run(root.path(), &["report"]);
+    success(&report);
+    let report_json: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(report_json["inventory"].as_array().unwrap().len(), 1);
+    assert!(report_json["aliases"].as_array().unwrap().is_empty());
     let inventory: serde_json::Value = serde_json::from_slice(&dry_run.stdout).unwrap();
     assert_eq!(inventory[0]["fingerprint"]["tables"][0]["row_count"], 1);
     let baseline = root.path().join("baseline.json");

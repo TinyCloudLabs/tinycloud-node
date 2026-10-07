@@ -164,6 +164,7 @@ pub struct SpaceDatabase<C, B, S> {
     space_sequence_locks: SpaceSequenceLockRegistry,
     writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
     read_audit: ReadAuditPipeline,
+    database_fence_cache: Arc<crate::database_migration::EffectiveFenceCache>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,6 +330,9 @@ impl<B, K> SpaceDatabase<DatabaseConnection, B, K> {
             space_sequence_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             writer_lock,
             read_audit,
+            database_fence_cache: Arc::new(
+                crate::database_migration::EffectiveFenceCache::default(),
+            ),
         })
     }
 
@@ -346,6 +350,16 @@ impl<B, K> SpaceDatabase<DatabaseConnection, B, K> {
     /// the same SeaORM connection outside `SpaceDatabase`.
     pub fn sqlite_writer_lock(&self) -> Option<Arc<tokio::sync::Mutex<()>>> {
         self.writer_lock.clone()
+    }
+
+    /// Check the configured, metadata, and unmigrated-artifact SQL/DuckDB fences.
+    pub async fn effective_database_fence(
+        &self,
+        configured: bool,
+    ) -> Result<bool, crate::database_migration::MigrationError> {
+        self.database_fence_cache
+            .check(&self.conn, configured)
+            .await
     }
 }
 
@@ -383,6 +397,11 @@ impl<C, B, K> SpaceDatabase<C, B, K> {
     /// committed alongside ordinary delegation/revocation writes.
     pub fn connection(&self) -> &C {
         &self.conn
+    }
+
+    /// Share the SQL/DuckDB cutover fence cache with all node data paths.
+    pub fn database_fence_cache(&self) -> Arc<crate::database_migration::EffectiveFenceCache> {
+        Arc::clone(&self.database_fence_cache)
     }
 
     /// Acquire the in-process sequence lock of every space in `spaces`, in a
