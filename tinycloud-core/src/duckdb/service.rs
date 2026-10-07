@@ -47,7 +47,7 @@ pub struct DuckDbService {
     artifact_repository: Arc<dyn DatabaseArtifactRepository>,
 }
 
-fn validate_db_name(name: &str) -> Result<(), DuckDbError> {
+pub(crate) fn validate_db_name(name: &str) -> Result<(), DuckDbError> {
     if name.contains("..")
         || name.contains('/')
         || name.contains('\\')
@@ -206,15 +206,12 @@ impl DuckDbService {
     }
 
     pub fn db_name_from_path(path: Option<&str>) -> String {
-        path.map(|p| {
-            let name = p.split('/').next_back().unwrap_or("default");
-            if validate_db_name(name).is_err() {
-                "default".to_string()
-            } else {
-                name.to_string()
-            }
-        })
-        .unwrap_or_else(|| "default".to_string())
+        crate::database_identity::logical_name(path)
+    }
+
+    /// The pre-N2 selector, for N3's explicit legacy-artifact inventory only.
+    pub fn legacy_db_name_from_path(path: Option<&str>) -> String {
+        crate::database_identity::legacy_duckdb_name(path)
     }
 
     /// Resolve the live actor for `key`, hydrating the on-disk cache first if

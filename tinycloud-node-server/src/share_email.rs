@@ -1001,7 +1001,10 @@ impl ConstrainedNamedSqlStore for SqlNamedStore {
             .service
             .execute(
                 &space,
-                source.database.as_str(),
+                // The authorized SQL resource path selects the artifact, just
+                // as it does for /invoke. `database` remains a separately
+                // pinned protocol field, not the storage selector.
+                &SqlService::db_name_from_path(Some(source.path.as_str())),
                 SqlRequest::ExecuteStatement {
                     name: source.statement.as_str().to_owned(),
                     params,

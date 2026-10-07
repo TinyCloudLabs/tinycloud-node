@@ -144,6 +144,7 @@ secret = "{}"
     let sql_service = rocket
         .state::<SqlService>()
         .context("node app must manage SqlService")?;
+    let db_name = SqlService::db_name_from_path(Some("main"));
     let conn = Database::connect(ConnectOptions::new(db_url)).await?;
 
     let space_id = test_space_id(SPACE_NAME);
@@ -157,7 +158,7 @@ secret = "{}"
     sql_service
         .execute(
             &space_id,
-            "main",
+            &db_name,
             SqlRequest::Execute {
                 schema: Some(vec![
                     "CREATE TABLE labels (label TEXT PRIMARY KEY, val INTEGER NOT NULL)"
@@ -173,7 +174,7 @@ secret = "{}"
     sql_service
         .execute(
             &space_id,
-            "main",
+            &db_name,
             SqlRequest::Execute {
                 schema: None,
                 sql: "INSERT INTO labels (label, val) VALUES (?, ?)".to_string(),
