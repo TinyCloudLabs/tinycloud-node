@@ -1,8 +1,8 @@
 use crate::{
     authorization::AuthHeaderGetter,
     hooks::{
-        hook_scope_path, matches_scope, normalize_path_prefix, HookRuntime, HookSubscription,
-        HookTicketClaims, HookTicketRequest, HookTicketResponse,
+        hook_scope_path, matches_scope, normalize_path_prefix_for_service, HookRuntime,
+        HookSubscription, HookTicketClaims, HookTicketRequest, HookTicketResponse,
     },
     TinyCloud,
 };
@@ -66,7 +66,10 @@ pub async fn mint_hook_ticket(
     }
 
     for subscription in &mut request.subscriptions {
-        subscription.path_prefix = normalize_path_prefix(subscription.path_prefix.take());
+        subscription.path_prefix = normalize_path_prefix_for_service(
+            &subscription.service,
+            subscription.path_prefix.take(),
+        );
         validate_subscription(subscription)?;
         if !is_subscription_authorized(invocation, subscription) {
             return Err((
@@ -275,7 +278,7 @@ pub async fn list_webhooks(
     query: HookWebhookListQuery,
     tinycloud: &State<TinyCloud>,
 ) -> Result<Json<Vec<HookWebhookResponse>>, (Status, String)> {
-    let normalized_prefix = normalize_path_prefix(query.prefix.clone());
+    let normalized_prefix = normalize_path_prefix_for_service(&query.service, query.prefix.clone());
     let requested_scope = HookSubscription {
         space: query.space.clone(),
         service: query.service.clone(),
@@ -301,6 +304,13 @@ pub async fn list_webhooks(
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
 
     rows.into_iter()
+        .filter(|row| {
+            !matches!(requested_scope.service.as_str(), "sql" | "duckdb")
+                || tinycloud_core::write_hooks::database_scope_matches(
+                    requested_scope.path_prefix.as_deref(),
+                    row.path_prefix.as_deref(),
+                )
+        })
         .map(|row| webhook_response_from_model(&row))
         .collect::<Result<Vec<_>, _>>()
         .map(Json)
@@ -409,6 +419,25 @@ fn is_hook_action_authorized(
 }
 
 fn scope_extends(requested_scope: &str, authorized_scope: &str) -> bool {
+    let (requested_service, requested_path) = requested_scope
+        .split_once('/')
+        .map_or((requested_scope, None), |(service, path)| {
+            (service, Some(path))
+        });
+    let (authorized_service, authorized_path) = authorized_scope
+        .split_once('/')
+        .map_or((authorized_scope, None), |(service, path)| {
+            (service, Some(path))
+        });
+    if requested_service != authorized_service {
+        return false;
+    }
+    if matches!(requested_service, "sql" | "duckdb") {
+        return tinycloud_core::write_hooks::database_scope_matches(
+            authorized_path,
+            requested_path,
+        );
+    }
     requested_scope == authorized_scope
         || requested_scope.starts_with(&format!("{authorized_scope}/"))
 }
@@ -425,7 +454,8 @@ fn invocation_expiry(invocation: &InvocationInfo) -> Result<i64, (Status, String
 pub fn normalize_webhook_request(
     request: &HookWebhookRequest,
 ) -> Result<HookSubscription, (Status, String)> {
-    let path_prefix = normalize_path_prefix(request.path_prefix.clone());
+    let path_prefix =
+        normalize_path_prefix_for_service(&request.service, request.path_prefix.clone());
     let subscription = HookSubscription {
         space: request.space.clone(),
         service: request.service.clone(),
@@ -1001,6 +1031,23 @@ mod tests {
             abilities: vec!["tinycloud.sql/write".to_string()],
         })
         .expect("sql subscription should be allowed");
+    }
+
+    #[test]
+    fn sql_hook_grants_match_exact_databases_or_slash_namespaces() {
+        assert!(scope_extends("sql/appA/connectors", "sql/appA/connectors"));
+        assert!(!scope_extends(
+            "sql/appA/connectors/private",
+            "sql/appA/connectors"
+        ));
+        assert!(scope_extends(
+            "sql/appA/connectors/private",
+            "sql/appA/connectors/"
+        ));
+        assert_eq!(
+            normalize_path_prefix_for_service("sql", Some("/appA/connectors/".into())).as_deref(),
+            Some("appA/connectors/")
+        );
     }
 
     #[cfg(feature = "duckdb")]

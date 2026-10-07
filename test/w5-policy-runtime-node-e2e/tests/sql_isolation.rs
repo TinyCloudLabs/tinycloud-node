@@ -57,6 +57,7 @@ use tinycloud_core::{
     duckdb::{DuckDbRequest, DuckDbValue},
     hash::Hash,
     models::{abilities, actor, space},
+    relationships::parent_delegations,
     sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database, DatabaseConnection},
     sql::{SqlRequest, SqlValue},
     types::{Ability, Caveats, Resource, SpaceIdWrap},
@@ -510,5 +511,219 @@ async fn duckdb_paths_do_not_share_databases_and_grants_are_exact() -> Result<()
         "DuckDB path isolation violated:\n  - {}",
         failures.join("\n  - ")
     );
+    Ok(())
+}
+
+fn regression_engine(service: &'static str) -> Result<Engine> {
+    Ok(match service {
+        "sql" => Engine {
+            service,
+            write_ability: "tinycloud.sql/write",
+            read_ability: "tinycloud.sql/read",
+            grant_seed: b"tc780-n2-ancestor-sql",
+            nonce_prefix: "000000000c",
+            write_body: sql_write_body,
+            read_body: serde_json::to_value(SqlRequest::Query {
+                sql: "SELECT v FROM t".to_string(),
+                params: vec![],
+                max_rows: None,
+                max_bytes: None,
+            })?,
+        },
+        "duckdb" => Engine {
+            service,
+            write_ability: "tinycloud.duckdb/write",
+            read_ability: "tinycloud.duckdb/read",
+            grant_seed: b"tc780-n2-ancestor-duckdb",
+            nonce_prefix: "000000000d",
+            write_body: duckdb_write_body,
+            read_body: serde_json::to_value(DuckDbRequest::Query {
+                sql: "SELECT v FROM t".to_string(),
+                params: vec![],
+            })?,
+        },
+        _ => unreachable!(),
+    })
+}
+
+/// Simulate a child delegation persisted under the pre-N2 descendant rule.
+/// Its slash path covers the invocation by itself, but its exact ancestor does
+/// not. The full /invoke authorization path must reject it for both engines.
+#[tokio::test]
+async fn pre_n2_descendant_delegation_cannot_outgrow_exact_ancestor() -> Result<()> {
+    for service in ["sql", "duckdb"] {
+        let engine = regression_engine(service)?;
+        let tempdir = TempDir::new()?;
+        let (_owner_jwk, owner_did, _owner_vm, space_id) = space_identity(service)?;
+        let (holder_jwk, holder_did, holder_vm) = holder_identity()?;
+        let (client, conn) = boot_node(
+            &tempdir,
+            &space_id,
+            &[owner_did.clone(), holder_did.clone()],
+        )
+        .await?;
+
+        let exact = db_resource(&space_id, service, "appA/connectors")?;
+        let slash_child = db_resource(&space_id, service, "appA/connectors/")?;
+        let private = db_resource(&space_id, service, "appA/connectors/private")?;
+        let parent_id = tinycloud_core::hash::hash(format!("{service}-exact").as_bytes());
+        let child_id = tinycloud_core::hash::hash(format!("{service}-slash-child").as_bytes());
+        persist_grant(
+            &conn,
+            parent_id,
+            &owner_did,
+            &holder_did,
+            &exact,
+            engine.read_ability,
+        )
+        .await?;
+        persist_grant(
+            &conn,
+            child_id,
+            &holder_did,
+            &holder_did,
+            &slash_child,
+            engine.read_ability,
+        )
+        .await?;
+        parent_delegations::ActiveModel {
+            parent: Set(parent_id),
+            child: Set(child_id),
+        }
+        .insert(&conn)
+        .await?;
+
+        let (status, body) = invoke_json(
+            &client,
+            invocation(
+                &holder_jwk,
+                &holder_did,
+                &holder_vm,
+                vec![child_id.to_cid(0x55)],
+                &private,
+                engine.read_ability,
+                &format!("urn:uuid:00000000-0000-4000-8000-{}13", engine.nonce_prefix),
+            )?,
+            &engine.read_body,
+        )
+        .await;
+        assert_eq!(status, Status::Unauthorized, "{service}: {body}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn long_database_paths_work_through_invoke_for_both_engines() -> Result<()> {
+    for service in ["sql", "duckdb"] {
+        let engine = regression_engine(service)?;
+        let tempdir = TempDir::new()?;
+        let (owner_jwk, owner_did, owner_vm, space_id) = space_identity(service)?;
+        let (client, _conn) = boot_node(&tempdir, &space_id, &[owner_did.clone()]).await?;
+        let path = format!("appA/{}", "x".repeat(1024));
+        let resource = db_resource(&space_id, service, &path)?;
+        for (ability, nonce_suffix, body) in [
+            (
+                engine.write_ability,
+                "11",
+                (engine.write_body)("long-path-row"),
+            ),
+            (engine.read_ability, "12", engine.read_body.clone()),
+        ] {
+            let (status, response) = invoke_json(
+                &client,
+                invocation(
+                    &owner_jwk,
+                    &owner_did,
+                    &owner_vm,
+                    vec![],
+                    &resource,
+                    ability,
+                    &format!(
+                        "urn:uuid:00000000-0000-4000-8000-{}{nonce_suffix}",
+                        engine.nonce_prefix
+                    ),
+                )?,
+                &body,
+            )
+            .await;
+            assert_eq!(status, Status::Ok, "{service}: {response}");
+            if ability == engine.read_ability {
+                assert!(response.contains("long-path-row"), "{service}: {response}");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unrelated_parallel_proof_does_not_narrow_a_valid_database_chain() -> Result<()> {
+    for service in ["sql", "duckdb"] {
+        let engine = regression_engine(service)?;
+        let tempdir = TempDir::new()?;
+        let (owner_jwk, owner_did, owner_vm, space_id) = space_identity(service)?;
+        let (holder_jwk, holder_did, holder_vm) = holder_identity()?;
+        let (client, conn) = boot_node(
+            &tempdir,
+            &space_id,
+            &[owner_did.clone(), holder_did.clone()],
+        )
+        .await?;
+        let database = db_resource(&space_id, service, "appA/connectors")?;
+        let kv = db_resource(&space_id, "kv", "appA/notes")?;
+
+        let (status, body) = invoke_json(
+            &client,
+            invocation(
+                &owner_jwk,
+                &owner_did,
+                &owner_vm,
+                vec![],
+                &database,
+                engine.write_ability,
+                &format!("urn:uuid:00000000-0000-4000-8000-{}14", engine.nonce_prefix),
+            )?,
+            &(engine.write_body)("valid-chain-row"),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{service}: {body}");
+
+        let db_grant = tinycloud_core::hash::hash(format!("{service}-valid-db").as_bytes());
+        let kv_grant = tinycloud_core::hash::hash(format!("{service}-unrelated-kv").as_bytes());
+        persist_grant(
+            &conn,
+            db_grant,
+            &owner_did,
+            &holder_did,
+            &database,
+            engine.read_ability,
+        )
+        .await?;
+        persist_grant(
+            &conn,
+            kv_grant,
+            &owner_did,
+            &holder_did,
+            &kv,
+            "tinycloud.kv/get",
+        )
+        .await?;
+
+        let (status, body) = invoke_json(
+            &client,
+            invocation(
+                &holder_jwk,
+                &holder_did,
+                &holder_vm,
+                vec![db_grant.to_cid(0x55), kv_grant.to_cid(0x55)],
+                &database,
+                engine.read_ability,
+                &format!("urn:uuid:00000000-0000-4000-8000-{}15", engine.nonce_prefix),
+            )?,
+            &engine.read_body,
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{service}: {body}");
+        assert!(body.contains("valid-chain-row"), "{service}: {body}");
+    }
     Ok(())
 }

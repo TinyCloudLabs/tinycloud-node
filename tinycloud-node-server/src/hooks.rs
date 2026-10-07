@@ -7,6 +7,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
+use tinycloud_core::write_hooks::database_scope_matches;
 use tokio::sync::broadcast;
 
 type TicketMac = Hmac<Sha256>;
@@ -59,6 +60,11 @@ pub struct WriteEvent {
     pub ability: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Logical SQL/DuckDB resource path. Absent for KV and pathless databases.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table_name: Option<String>,
     pub actor: String,
     pub epoch: String,
     pub event_index: u32,
@@ -182,10 +188,35 @@ pub fn matches_scope(event: &WriteEvent, scope: &HookSubscription) -> bool {
         return false;
     }
 
+    if matches!(event.service.as_str(), "sql" | "duckdb") {
+        return database_scope_matches(
+            scope.path_prefix.as_deref(),
+            event.database_path.as_deref(),
+        );
+    }
+
     match (&scope.path_prefix, &event.path) {
         (None, _) => true,
         (Some(prefix), Some(path)) => path == prefix || path.starts_with(&format!("{prefix}/")),
         (Some(prefix), None) => prefix.is_empty(),
+    }
+}
+
+pub fn normalize_path_prefix_for_service(
+    service: &str,
+    path_prefix: Option<String>,
+) -> Option<String> {
+    if matches!(service, "sql" | "duckdb") {
+        path_prefix.and_then(|prefix| {
+            let trimmed = prefix.trim_start_matches('/').to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
+    } else {
+        normalize_path_prefix(path_prefix)
     }
 }
 
@@ -243,6 +274,8 @@ mod tests {
             service: "kv".to_string(),
             ability: "tinycloud.kv/put".to_string(),
             path: Some("documents/123".to_string()),
+            database_path: None,
+            table_name: None,
             actor: "did:key:test".to_string(),
             epoch: "epoch".to_string(),
             event_index: 0,
@@ -285,7 +318,12 @@ mod tests {
             space: "tinycloud:space".to_string(),
             service: "sql".to_string(),
             ability: "tinycloud.sql/write".to_string(),
-            path: Some("main.db/users".to_string()),
+            path: Some(tinycloud_core::write_hooks::db_table_path(
+                Some("main.db"),
+                "users",
+            )),
+            database_path: Some("main.db".to_string()),
+            table_name: Some("users".to_string()),
             actor: "did:key:test".to_string(),
             epoch: "epoch".to_string(),
             event_index: 0,
@@ -311,6 +349,18 @@ mod tests {
                 abilities: vec!["tinycloud.sql/write".to_string()],
             }
         ));
+
+        let mut child_event = sql_event.clone();
+        child_event.database_path = Some("main.db/private".to_string());
+        assert!(!matches_scope(
+            &child_event,
+            &HookSubscription {
+                space: "tinycloud:space".to_string(),
+                service: "sql".to_string(),
+                path_prefix: Some("main.db".to_string()),
+                abilities: vec!["tinycloud.sql/write".to_string()],
+            }
+        ));
     }
 
     #[tokio::test]
@@ -322,6 +372,8 @@ mod tests {
             service: "kv".to_string(),
             ability: "tinycloud.kv/put".to_string(),
             path: Some("documents/123".to_string()),
+            database_path: None,
+            table_name: None,
             actor: "did:key:test".to_string(),
             epoch: "epoch".to_string(),
             event_index: 0,

@@ -395,12 +395,15 @@ mod tests {
             for (grant, invoked, allowed_for_database, allowed_for_kv) in [
                 ("appA/connectors", "appA/connectors", true, true),
                 ("appA/connectors", "appA/connectors/private", false, true),
+                ("appA/connectors", "appA/connectors/", false, true),
                 ("appA/connectors", "appA/connectors2", false, false),
                 ("appA/connectors", "appB/connectors", false, false),
                 ("appA/connectors/", "appA/connectors/private", true, true),
                 ("appA/connectors/", "appA/connectors2", false, false),
                 ("appA/", "appA/connectors", true, true),
                 ("appA/", "appB/connectors", false, false),
+                ("", "", true, true),
+                ("", "/child", false, true),
             ] {
                 let base: ResourceId = format!("tinycloud:ens:example.eth:ns0/{service}/{grant}")
                     .parse()
@@ -429,6 +432,10 @@ mod tests {
                     .parse()
                     .unwrap();
             assert!(child.extends(&root).is_ok(), "{service} pathless grant");
+            assert!(
+                root.extends(&child).is_err(),
+                "{service} pathless invocation"
+            );
         }
     }
 

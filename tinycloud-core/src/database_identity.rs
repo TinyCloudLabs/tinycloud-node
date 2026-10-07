@@ -3,17 +3,21 @@
 //! N3 can resolve these logical names through explicit aliases to old physical
 //! artifacts. Never interpret a logical name as an old selector during lookup.
 
-/// An injective, file-safe encoding of the complete resource path.
+/// A stable, fixed-length, file-safe digest of the complete resource path.
 ///
 /// The `n`/`p` marker distinguishes a pathless resource from an explicitly
-/// empty path. Hex encoding preserves every byte, including slashes, percent
-/// escapes, repeated separators, and trailing slashes. It also prevents a
-/// resource path from injecting a filesystem separator or `..` into a cache
-/// filename. SQL and DuckDB artifacts already have separate service keys.
+/// empty path. Hashing the raw UTF-8 bytes preserves the distinction between
+/// slashes, percent escapes, repeated separators, and trailing slashes without
+/// making long paths exceed filesystem component limits. The physical name is
+/// opaque; callers needing the logical path must keep it separately. SQL and
+/// DuckDB artifacts already have separate service keys.
 pub fn logical_name(path: Option<&str>) -> String {
     match path {
         None => "v2n".to_string(),
-        Some(path) => format!("v2p{}", hex::encode(path.as_bytes())),
+        Some(path) => {
+            use sha2::{Digest, Sha256};
+            format!("v2d{}", hex::encode(Sha256::digest(path.as_bytes())))
+        }
     }
 }
 
@@ -70,8 +74,18 @@ mod tests {
             assert!(name.bytes().all(|byte| byte.is_ascii_alphanumeric()));
         }
         assert_eq!(logical_name(None), "v2n");
-        assert_eq!(logical_name(Some("")), "v2p");
-        assert_eq!(logical_name(Some("a/b")), "v2p612f62");
+        assert_ne!(logical_name(Some("")), logical_name(None));
+        assert_eq!(logical_name(Some("a/b")).len(), 67);
+        assert!(logical_name(Some("a/b")).starts_with("v2d"));
+    }
+
+    #[test]
+    fn long_path_identity_fits_a_filename_component() {
+        let path = "a".repeat(1024);
+        let name = logical_name(Some(&path));
+        assert_eq!(name.len(), 67);
+        assert_ne!(name, logical_name(Some(&format!("{path}b"))));
+        assert!(name.bytes().all(|byte| byte.is_ascii_alphanumeric()));
     }
 
     #[test]
@@ -96,6 +110,7 @@ mod tests {
             Some("appA/"),
             Some("appA/.."),
             Some("appA/a\\b"),
+            Some(&"a".repeat(1024)),
         ] {
             let sql = crate::sql::SqlService::db_name_from_path(path);
             let duckdb = crate::duckdb::DuckDbService::db_name_from_path(path);
