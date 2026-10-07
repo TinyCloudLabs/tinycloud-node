@@ -20,7 +20,7 @@ use rocket::{
     State,
 };
 use serde::{Deserialize, Serialize};
-use std::{net::IpAddr, time::Duration, time::Instant};
+use std::{future::Future, net::IpAddr, time::Duration, time::Instant};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_core::{
     events::Invocation,
@@ -249,6 +249,43 @@ async fn mint_hook_ticket(
     Ok(HookTicketResponse { ticket, expires_at })
 }
 
+async fn hook_stream_deadline<F, Fut, Clock>(
+    claims: &HookTicketClaims,
+    max_ticket_ttl_seconds: u64,
+    check_authority: F,
+    mut now: Clock,
+) -> Result<rocket::tokio::time::Instant, (Status, String)>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<(), (Status, String)>>,
+    Clock: FnMut() -> OffsetDateTime,
+{
+    let initial_now = now();
+    let deadline = claims
+        .exp
+        .min(claims.parent_exp)
+        .min(initial_now.unix_timestamp() + max_ticket_ttl_seconds as i64);
+    let expired = || (Status::Unauthorized, "hook ticket expired".to_string());
+    if deadline <= initial_now.unix_timestamp() {
+        return Err(expired());
+    }
+    let deadline_at = OffsetDateTime::from_unix_timestamp(deadline)
+        .map_err(|error| (Status::InternalServerError, error.to_string()))?;
+
+    check_authority().await?;
+
+    let stream_now = now();
+    if deadline_at <= stream_now {
+        return Err(expired());
+    }
+    let remaining = deadline_at - stream_now;
+    let remaining = Duration::new(
+        remaining.whole_seconds() as u64,
+        remaining.subsec_nanoseconds() as u32,
+    );
+    Ok(rocket::tokio::time::Instant::now() + remaining)
+}
+
 #[get("/hooks/events?<ticket>")]
 pub async fn hook_events<'r>(
     ticket: &'r str,
@@ -258,35 +295,35 @@ pub async fn hook_events<'r>(
     let claims = hooks
         .verify_ticket(ticket)
         .map_err(|e| (Status::Unauthorized, e))?;
-    let now = OffsetDateTime::now_utc().unix_timestamp();
-    let deadline = claims
-        .exp
-        .min(claims.parent_exp)
-        .min(now + hooks.config().max_ticket_ttl_seconds as i64);
-
-    if deadline <= now {
-        return Err((Status::Unauthorized, "hook ticket expired".to_string()));
-    }
-    if !tinycloud
-        .delegation_chains_unrevoked(&claims.authorizing_delegations)
-        .await
-        .map_err(|error| (Status::InternalServerError, error.to_string()))?
-    {
-        return Err((
-            Status::Unauthorized,
-            "hook ticket authority revoked".to_string(),
-        ));
-    }
+    let stream_deadline = hook_stream_deadline(
+        &claims,
+        hooks.config().max_ticket_ttl_seconds,
+        || async {
+            if tinycloud
+                .delegation_chains_unrevoked(&claims.authorizing_delegations)
+                .await
+                .map_err(|error| (Status::InternalServerError, error.to_string()))?
+            {
+                Ok(())
+            } else {
+                Err((
+                    Status::Unauthorized,
+                    "hook ticket authority revoked".to_string(),
+                ))
+            }
+        },
+        OffsetDateTime::now_utc,
+    )
+    .await?;
     let lease = hooks
         .try_acquire_stream()
         .map_err(|e| (Status::TooManyRequests, e))?;
 
     let mut receiver = hooks.bus().subscribe();
-    let sleep_duration = Duration::from_secs((deadline - now) as u64);
 
     Ok(EventStream! {
         let _lease = lease;
-        let deadline_sleep = rocket::tokio::time::sleep(sleep_duration);
+        let deadline_sleep = rocket::tokio::time::sleep_until(stream_deadline);
         rocket::tokio::pin!(deadline_sleep);
 
         loop {
@@ -861,6 +898,45 @@ mod tests {
 
     fn test_hook_runtime() -> HookRuntime {
         HookRuntime::new(HooksConfig::default(), [7u8; 32])
+    }
+
+    #[tokio::test]
+    async fn hook_ticket_expiring_during_authority_lookup_is_rejected() {
+        use std::sync::{
+            atomic::{AtomicI64, Ordering},
+            Arc,
+        };
+
+        let clock = Arc::new(AtomicI64::new(100));
+        let authority_clock = Arc::clone(&clock);
+        let request_clock = Arc::clone(&clock);
+        let claims = HookTicketClaims {
+            v: 2,
+            sub: "did:key:subscriber".to_string(),
+            scopes: Vec::new(),
+            iat: 100,
+            exp: 101,
+            parent_exp: 101,
+            authorizing_delegations: Vec::new(),
+        };
+
+        let result = hook_stream_deadline(
+            &claims,
+            300,
+            move || async move {
+                authority_clock.store(102, Ordering::Relaxed);
+                Ok(())
+            },
+            move || {
+                OffsetDateTime::from_unix_timestamp(request_clock.load(Ordering::Relaxed)).unwrap()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            result.unwrap_err(),
+            (Status::Unauthorized, "hook ticket expired".to_string())
+        );
     }
 
     async fn test_tinycloud() -> Result<TinyCloud> {

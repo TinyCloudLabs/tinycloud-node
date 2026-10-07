@@ -59,6 +59,8 @@ impl ActiveModelBehavior for ActiveModel {}
 /// proof chain. This bounds database work for deep and wide proof DAGs.
 pub const MAX_CHAIN_TRAVERSAL_NODES: usize = 64;
 
+const PARENT_DELEGATION_PAGE_SIZE: usize = MAX_CHAIN_TRAVERSAL_NODES + 1;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ChainTraversalError {
     #[error(transparent)]
@@ -124,9 +126,7 @@ pub(crate) async fn ancestor_chain_ids_for_roots<C: ConnectionTrait>(
         // the node budget.
         let mut offset = 0;
         loop {
-            let page_size = MAX_CHAIN_TRAVERSAL_NODES
-                .saturating_sub(visited.len() + frontier.len())
-                .saturating_add(1);
+            let page_size = PARENT_DELEGATION_PAGE_SIZE;
             let parents = parent_delegations::Entity::find()
                 .filter(parent_delegations::Column::Child.eq(current))
                 .order_by_asc(parent_delegations::Column::Parent)
@@ -542,6 +542,43 @@ mod tests {
             first_revoked_ancestor(&db, &child).await,
             Err(ChainTraversalError::LimitExceeded)
         ));
+    }
+
+    #[tokio::test]
+    async fn dense_64_node_dag_uses_one_parent_query_per_node() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let mut db = database().await;
+        let ids: Vec<_> = (0..MAX_CHAIN_TRAVERSAL_NODES)
+            .map(|index| hash(format!("dense-dag-{index}").as_bytes()))
+            .collect();
+        for id in &ids {
+            insert_delegation(&db, *id).await;
+        }
+        for child in 1..ids.len() {
+            for parent in 0..child {
+                insert_link(&db, ids[child], ids[parent]).await;
+            }
+        }
+
+        let query_count = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&query_count);
+        db.set_metric_callback(move |_info| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let chain = ancestor_chain_ids_for_roots(&db, &[ids[ids.len() - 1]])
+            .await
+            .unwrap();
+
+        assert_eq!(chain.len(), MAX_CHAIN_TRAVERSAL_NODES);
+        assert_eq!(
+            query_count.load(Ordering::Relaxed),
+            MAX_CHAIN_TRAVERSAL_NODES
+        );
     }
 
     #[tokio::test]
