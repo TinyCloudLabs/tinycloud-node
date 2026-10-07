@@ -62,6 +62,10 @@ use tinycloud_core::{
 };
 
 const FAR_FUTURE_SECONDS: f64 = 4_102_444_800.0; // 2100-01-01
+/// Value written under `appA/connectors`. The holder's exact-path grant must
+/// return it — a read that is rejected or empty is an over-narrowed grant,
+/// not correct isolation.
+const APP_A_ROW: &str = "appa-owned-row";
 /// Value only ever written under `appB/connectors`. Any read path that returns
 /// it proves cross-app data sharing.
 const APP_B_SECRET: &str = "appb-only-row";
@@ -258,6 +262,24 @@ fn check(failures: &mut Vec<String>, ok: bool, detail: impl std::fmt::Display) {
     }
 }
 
+fn sql_write_body(row: &str) -> serde_json::Value {
+    serde_json::to_value(SqlRequest::Execute {
+        schema: Some(vec!["CREATE TABLE IF NOT EXISTS t (v TEXT)".to_string()]),
+        sql: "INSERT INTO t (v) VALUES (?)".to_string(),
+        params: vec![SqlValue::Text(row.to_string())],
+    })
+    .expect("SqlRequest serializes")
+}
+
+fn duckdb_write_body(row: &str) -> serde_json::Value {
+    serde_json::to_value(DuckDbRequest::Execute {
+        sql: "INSERT INTO t (v) VALUES (?)".to_string(),
+        params: vec![DuckDbValue::Text(row.to_string())],
+        schema: Some(vec!["CREATE TABLE IF NOT EXISTS t (v TEXT)".to_string()]),
+    })
+    .expect("DuckDbRequest serializes")
+}
+
 /// Per-engine parameters for the shared scenario driver.
 struct Engine {
     service: &'static str,
@@ -265,7 +287,10 @@ struct Engine {
     read_ability: &'static str,
     grant_seed: &'static [u8],
     nonce_prefix: &'static str,
-    write_body: serde_json::Value,
+    /// Builds the Execute body writing `row` into `t`. The DDL is `IF NOT
+    /// EXISTS` because on main BOTH owner writes land in the same `connectors`
+    /// database — the second write must still succeed so the two rows coexist.
+    write_body: fn(&str) -> serde_json::Value,
     read_body: serde_json::Value,
 }
 
@@ -289,34 +314,41 @@ async fn run_scenario(engine: &Engine, space_name: &str, tempdir: &TempDir) -> R
 
     let mut failures: Vec<String> = Vec::new();
 
-    // The OWNER writes APP_B_SECRET under `appB/connectors` through the real
-    // invoke path. Root authority means no grant row is needed for this call.
+    // The OWNER writes under BOTH paths through the real invoke path — root
+    // authority means no grant row is needed. On main these land in the same
+    // `connectors` database; after N2 they are separate databases.
+    let appa = db_resource(&space_id, engine.service, "appA/connectors")?;
     let appb = db_resource(&space_id, engine.service, "appB/connectors")?;
-    let (status, body) = invoke_json(
-        &client,
-        invocation(
-            &owner.jwk,
-            &owner.did,
-            &owner.vm,
-            vec![],
-            &appb,
-            engine.write_ability,
-            &format!("urn:uuid:00000000-0000-4000-8000-{}01", engine.nonce_prefix),
-        )?,
-        &engine.write_body,
-    )
-    .await;
-    if status != Status::Ok {
-        // Seed failed — the rest of the scenario is meaningless. This is a
-        // harness bug, not the defect, so bail loudly.
-        return Err(anyhow::anyhow!(
-            "owner write under appB/connectors must succeed (got {status}): {body}"
-        ));
+    for (resource, row, nonce_suffix) in [(&appa, APP_A_ROW, "05"), (&appb, APP_B_SECRET, "01")] {
+        let (status, body) = invoke_json(
+            &client,
+            invocation(
+                &owner.jwk,
+                &owner.did,
+                &owner.vm,
+                vec![],
+                resource,
+                engine.write_ability,
+                &format!(
+                    "urn:uuid:00000000-0000-4000-8000-{}{nonce_suffix}",
+                    engine.nonce_prefix
+                ),
+            )?,
+            &(engine.write_body)(row),
+        )
+        .await;
+        if status != Status::Ok {
+            // Seed failed — the rest of the scenario is meaningless. This is a
+            // harness bug, not the defect, so bail loudly.
+            return Err(anyhow::anyhow!(
+                "owner write of {row:?} under {} must succeed (got {status}): {body}",
+                resource.path().map(|p| p.as_str()).unwrap_or("<none>"),
+            ));
+        }
     }
 
     // The holder is granted `<engine>/read` on the EXACT path
     // `appA/connectors` — no trailing slash.
-    let appa = db_resource(&space_id, engine.service, "appA/connectors")?;
     let holder_grant = tinycloud_core::hash::hash(engine.grant_seed);
     persist_grant(
         &conn,
@@ -328,9 +360,11 @@ async fn run_scenario(engine: &Engine, space_name: &str, tempdir: &TempDir) -> R
     )
     .await?;
 
-    // (1) Cross-app isolation: `appA/connectors` must not see data written
-    // under `appB/connectors`. On main both paths resolve to the `connectors`
-    // database, so the response contains APP_B_SECRET.
+    // (1) Cross-app isolation, in both directions of correctness: the exact-
+    // path grant must SUCCEED and return appA's own row (an over-narrowed fix
+    // that rejects or empties this read is also wrong), AND it must not leak
+    // appB's row. On main both paths resolve to the `connectors` database, so
+    // the response contains BOTH rows.
     let (status, body) = invoke_json(
         &client,
         invocation(
@@ -345,6 +379,15 @@ async fn run_scenario(engine: &Engine, space_name: &str, tempdir: &TempDir) -> R
         &engine.read_body,
     )
     .await;
+    check(
+        &mut failures,
+        status == Status::Ok && body.contains(APP_A_ROW),
+        format!(
+            "the exact-path grant on appA/connectors must authorize a read \
+             returning its own row (expected 200 with {APP_A_ROW:?}, got \
+             {status}): {body}"
+        ),
+    );
     check(
         &mut failures,
         !body.contains(APP_B_SECRET),
@@ -425,11 +468,7 @@ async fn sql_paths_do_not_share_databases_and_grants_are_exact() -> Result<()> {
         read_ability: "tinycloud.sql/read",
         grant_seed: b"tc780-n1-sql-read-appA-connectors",
         nonce_prefix: "000000000a",
-        write_body: serde_json::to_value(SqlRequest::Execute {
-            schema: Some(vec!["CREATE TABLE t (v TEXT)".to_string()]),
-            sql: "INSERT INTO t (v) VALUES (?)".to_string(),
-            params: vec![SqlValue::Text(APP_B_SECRET.to_string())],
-        })?,
+        write_body: sql_write_body,
         read_body: serde_json::to_value(SqlRequest::Query {
             sql: "SELECT v FROM t".to_string(),
             params: vec![],
@@ -458,11 +497,7 @@ async fn duckdb_paths_do_not_share_databases_and_grants_are_exact() -> Result<()
         read_ability: "tinycloud.duckdb/read",
         grant_seed: b"tc780-n1-duckdb-read-appA-connectors",
         nonce_prefix: "000000000b",
-        write_body: serde_json::to_value(DuckDbRequest::Execute {
-            sql: "INSERT INTO t (v) VALUES (?)".to_string(),
-            params: vec![DuckDbValue::Text(APP_B_SECRET.to_string())],
-            schema: Some(vec!["CREATE TABLE t (v TEXT)".to_string()]),
-        })?,
+        write_body: duckdb_write_body,
         read_body: serde_json::to_value(DuckDbRequest::Query {
             sql: "SELECT v FROM t".to_string(),
             params: vec![],
