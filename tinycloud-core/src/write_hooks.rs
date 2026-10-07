@@ -28,8 +28,10 @@ impl TouchedTables {
     }
 }
 
-pub fn db_table_path(db_name: &str, table_name: &str) -> String {
-    format!("{db_name}/{table_name}")
+/// Hook paths use the logical resource path, not an encoded artifact name.
+/// A pathless database is represented by `default` at the route boundary.
+pub fn db_table_path(db_path: &str, table_name: &str) -> String {
+    format!("{db_path}/{table_name}")
 }
 
 pub fn subscription_matches_event(

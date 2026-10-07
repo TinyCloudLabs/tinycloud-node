@@ -1,19 +1,20 @@
-//! TC-780 (N1) reproduction, run against the REAL node authorization and
+//! TC-780 (N1/N2) regression, run against the REAL node authorization and
 //! `/invoke` path — not a unit test of `db_name_from_path`.
 //!
-//! Two defects are pinned by asserting the CORRECT behavior, so both tests are
-//! expected to FAIL on `main` until N2 lands:
+//! Two defects are pinned by asserting the required behavior. Both tests fail
+//! on the pre-N2 code and pass with full-path identity and exact-path grants:
 //!
 //! 1. **Cross-app database sharing.** `SqlService::db_name_from_path`
 //!    (`tinycloud-core/src/sql/service.rs`) and
 //!    `DuckDbService::db_name_from_path` (`tinycloud-core/src/duckdb/service.rs`)
-//!    key databases by `(space, last_path_segment)`. Within one space,
-//!    `appA/connectors` and `appB/connectors` therefore open the SAME database:
+//!    previously keyed databases by `(space, last_path_segment)`. Within one
+//!    space, `appA/connectors` and `appB/connectors` therefore opened the SAME database:
 //!    rows the owner writes under `appB/connectors` are returned to a holder
 //!    whose grant only covers `appA/connectors`.
 //!
 //! 2. **Descendant authorization.** `ResourceId::extends`
-//!    (`tinycloud-auth/src/resource.rs`) treats a capability path as a prefix:
+//!    (`tinycloud-auth/src/resource.rs`) previously treated a SQL or DuckDB
+//!    capability path without a trailing slash as a prefix:
 //!    a grant for the exact path `appA/connectors` (no trailing slash) also
 //!    authorizes an invocation on `appA/connectors/private`, which opens a
 //!    completely different database (`private`) that the grant never named.

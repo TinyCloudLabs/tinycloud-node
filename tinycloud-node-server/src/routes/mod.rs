@@ -2404,6 +2404,8 @@ async fn handle_sql_invoke(
     let body_str = body_result?;
 
     let (space, path, ability) = select_database_scope(sql_caps, "sql")?;
+    // N3 will resolve this logical identity through an explicit alias table.
+    // Do not fall back to the legacy final-segment selector here.
     let db_name = SqlService::db_name_from_path(path);
     let space_id = space.to_string();
 
@@ -2522,7 +2524,7 @@ async fn handle_sql_invoke(
             let events = database_write_events(
                 &space_id,
                 "sql",
-                &db_name,
+                path.unwrap_or("default"),
                 &actor,
                 &epoch,
                 &timestamp,
@@ -2966,6 +2968,7 @@ async fn handle_duckdb_invoke(
     let auth_result = verify_auth_admitted("server.duckdb.auth", admitted, tinycloud).await?;
 
     let (space, path, ability) = select_database_scope(duckdb_caps, "duckdb")?;
+    // Keep the logical path separate from any legacy physical artifact name.
     let db_name = DuckDbService::db_name_from_path(path);
     let space_id = space.to_string();
 
@@ -3096,7 +3099,7 @@ async fn handle_duckdb_invoke(
             let events = database_write_events(
                 &space_id,
                 "duckdb",
-                &db_name,
+                path.unwrap_or("default"),
                 &actor,
                 &epoch,
                 &timestamp,
@@ -4059,7 +4062,7 @@ mod tests {
         let events = database_write_events(
             "tinycloud:space",
             "sql",
-            "main.db",
+            "appA/main.db",
             "did:key:test",
             "epoch",
             "2026-01-01T00:00:00Z",
@@ -4084,13 +4087,13 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(first.path.as_deref(), Some("main.db/users"));
+        assert_eq!(first.path.as_deref(), Some("appA/main.db/users"));
         assert_eq!(first.ability, "tinycloud.sql/write");
         assert_eq!(first.event_index, 0);
-        assert_eq!(second.path.as_deref(), Some("main.db/orders"));
+        assert_eq!(second.path.as_deref(), Some("appA/main.db/orders"));
         assert_eq!(second.ability, "tinycloud.sql/write");
         assert_eq!(second.event_index, 1);
-        assert_eq!(third.path.as_deref(), Some("main.db/audit"));
+        assert_eq!(third.path.as_deref(), Some("appA/main.db/audit"));
         assert_eq!(third.ability, "tinycloud.sql/write");
         assert_eq!(third.event_index, 2);
     }
@@ -4103,7 +4106,7 @@ mod tests {
         let events = database_write_events(
             "tinycloud:space",
             "duckdb",
-            "analytics.duckdb",
+            "appB/analytics.duckdb",
             "did:key:test",
             "epoch",
             "2026-01-01T00:00:00Z",
@@ -4117,7 +4120,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(event.ability, "tinycloud.duckdb/write");
-        assert_eq!(event.path.as_deref(), Some("analytics.duckdb/events"));
+        assert_eq!(event.path.as_deref(), Some("appB/analytics.duckdb/events"));
     }
 
     #[tokio::test]
@@ -4474,7 +4477,7 @@ mod tests {
         service
             .execute(
                 &space,
-                "main",
+                &SqlService::db_name_from_path(Some("main")),
                 SqlRequest::Execute {
                     schema: Some(vec![
                         "CREATE TABLE labels (label TEXT PRIMARY KEY, val INTEGER NOT NULL)"
@@ -4491,7 +4494,7 @@ mod tests {
         service
             .execute(
                 &space,
-                "main",
+                &SqlService::db_name_from_path(Some("main")),
                 SqlRequest::Execute {
                     schema: None,
                     sql: "INSERT INTO labels (label, val) VALUES (?, ?)".to_string(),
@@ -4526,7 +4529,7 @@ mod tests {
         let result: SqlExecutionResult = service
             .execute(
                 &space,
-                "main",
+                &SqlService::db_name_from_path(Some("main")),
                 bound,
                 Some(sql_caveats),
                 "tinycloud.sql/read".to_string(),
@@ -4582,7 +4585,7 @@ mod tests {
         sql_service
             .execute(
                 &space,
-                "main",
+                &SqlService::db_name_from_path(Some("main")),
                 SqlRequest::Execute {
                     schema: Some(vec![
                         "CREATE TABLE labels (label TEXT PRIMARY KEY, val INTEGER NOT NULL)"
@@ -4598,7 +4601,7 @@ mod tests {
         sql_service
             .execute(
                 &space,
-                "main",
+                &SqlService::db_name_from_path(Some("main")),
                 SqlRequest::Execute {
                     schema: None,
                     sql: "INSERT INTO labels (label, val) VALUES (?, ?)".to_string(),
@@ -4855,7 +4858,7 @@ mod tests {
         sql_service
             .execute(
                 &space,
-                "main",
+                &SqlService::db_name_from_path(Some("main")),
                 SqlRequest::Execute {
                     schema: Some(vec![
                         "CREATE TABLE labels (label TEXT PRIMARY KEY, val INTEGER NOT NULL)"
@@ -4871,7 +4874,7 @@ mod tests {
         sql_service
             .execute(
                 &space,
-                "main",
+                &SqlService::db_name_from_path(Some("main")),
                 SqlRequest::Execute {
                     schema: None,
                     sql: "INSERT INTO labels (label, val) VALUES (?, ?)".to_string(),
@@ -6252,7 +6255,7 @@ mod tests {
         sql_service
             .execute(
                 &space,
-                "main",
+                &SqlService::db_name_from_path(Some("main")),
                 SqlRequest::Execute {
                     schema: Some(vec![
                         "CREATE TABLE labels (label TEXT PRIMARY KEY, val INTEGER NOT NULL)"
@@ -7129,7 +7132,7 @@ mod tests {
             .sql_service
             .execute(
                 &setup.space,
-                "main",
+                &SqlService::db_name_from_path(Some("main")),
                 SqlRequest::Execute {
                     schema: None,
                     sql: "INSERT INTO labels (label, val) VALUES (?, ?)".to_string(),

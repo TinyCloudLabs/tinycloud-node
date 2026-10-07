@@ -233,8 +233,12 @@ impl SqlService {
     }
 
     pub fn db_name_from_path(path: Option<&str>) -> String {
-        path.map(|p| p.split('/').next_back().unwrap_or("default").to_string())
-            .unwrap_or_else(|| "default".to_string())
+        crate::database_identity::logical_name(path)
+    }
+
+    /// The pre-N2 selector, for N3's explicit legacy-artifact inventory only.
+    pub fn legacy_db_name_from_path(path: Option<&str>) -> String {
+        crate::database_identity::legacy_sql_name(path)
     }
 
     /// Resolve the live actor for `key`, hydrating the on-disk cache first if
