@@ -109,6 +109,17 @@ async fn cli_fence_dry_run_apply_set_verify_clear() {
     );
     assert!(!remote.status.success());
     assert!(String::from_utf8_lossy(&remote.stderr).contains("local database URL"));
+    let remote_override = run(
+        root.path(),
+        &[
+            "--database",
+            "postgres://localhost/tinycloud?host=example.invalid",
+            "offline-fingerprint",
+            "--local-snapshot",
+        ],
+    );
+    assert!(!remote_override.status.success());
+    assert!(String::from_utf8_lossy(&remote_override.stderr).contains("local database URL"));
     let offline = run(root.path(), &["offline-fingerprint", "--local-snapshot"]);
     success(&offline);
     let offline_json: serde_json::Value = serde_json::from_slice(&offline.stdout).unwrap();

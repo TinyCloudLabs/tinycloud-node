@@ -95,13 +95,18 @@ fn is_local_database_url(url: &str) -> bool {
     if url.starts_with("sqlite:") {
         return true;
     }
-    let Some(authority) = url
+    let Some(rest) = url
         .strip_prefix("postgres://")
         .or_else(|| url.strip_prefix("postgresql://"))
-        .and_then(|rest| rest.split('/').next())
     else {
         return false;
     };
+    // PostgreSQL URL query parameters can override the host in some clients.
+    // The offline mode has no reason to accept them.
+    if rest.contains('?') || rest.contains('#') {
+        return false;
+    }
+    let authority = rest.split('/').next().unwrap_or(rest);
     let host = authority.rsplit('@').next().unwrap_or(authority);
     host == "localhost"
         || host.starts_with("localhost:")
