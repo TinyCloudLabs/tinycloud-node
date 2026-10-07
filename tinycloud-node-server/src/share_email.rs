@@ -1026,7 +1026,8 @@ impl ConstrainedNamedSqlStore for SqlNamedStore {
             .map_err(|_| PortError::Denied)?;
         let name = self.space_name.parse().map_err(|_| PortError::Denied)?;
         let space = tinycloud_auth::resource::SpaceId::new(did, name);
-        let _ = sql_source_db_name(&space, source.path.as_str())?;
+        // Validate the pinned source path before resolving its physical artifact.
+        sql_source_db_name(&space, source.path.as_str())?;
         let physical = tinycloud_core::database_migration::resolve(
             &self.conn,
             "sql",
@@ -2895,7 +2896,7 @@ mod tests {
     use rocket::local::asynchronous::Client;
 
     #[tokio::test]
-    async fn named_sql_store_fence_check_rejects_unmigrated_artifact() {
+    async fn named_sql_store_execute_named_rejects_unmigrated_artifact_before_resolution() {
         use tinycloud_core::{
             database_artifacts::SeaOrmDatabaseArtifactRepository,
             models::database_artifact,
@@ -2946,7 +2947,30 @@ mod tests {
             write_fence: false,
             fence_cache: Arc::new(Default::default()),
         };
-        let error = store.check_fence().await.unwrap_err();
+        let did = tinycloud_auth::resolver::DID_METHODS
+            .generate(
+                &tinycloud_auth::ssi::jwk::JWK::generate_ed25519().unwrap(),
+                "key",
+            )
+            .unwrap();
+        let source = SqlReadSource {
+            space: Did::parse(did.to_string()).unwrap(),
+            database: tinycloud_core::share_email::DatabaseName::parse("content_db").unwrap(),
+            path: Path::parse("web/threads").unwrap(),
+            statement: tinycloud_core::share_email::NamedStatement::parse("read_threads").unwrap(),
+            arguments: Default::default(),
+            arguments_digest: tinycloud_core::share_email::Sha256Digest::from_bytes([0; 32]),
+        };
+        let pinned = PinnedNamedStatement {
+            database: source.database.clone(),
+            path: source.path.clone(),
+            statement: tinycloud_core::policy_capability::sql_caveat::ConstrainedStatement {
+                name: source.statement.as_str().to_owned(),
+                sql: "SELECT v FROM t".into(),
+                fixed_params: vec![],
+            },
+        };
+        let error = store.execute_named(&source, &pinned).await.unwrap_err();
         assert_eq!(error, PortError::Unavailable);
         assert_eq!(DataPlaneError::from(error), DataPlaneError::Storage);
     }

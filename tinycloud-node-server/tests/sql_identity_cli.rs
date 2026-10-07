@@ -95,7 +95,27 @@ async fn cli_fence_dry_run_apply_set_verify_clear() {
     assert_eq!(report_json["inventory"].as_array().unwrap().len(), 1);
     assert!(report_json["aliases"].as_array().unwrap().is_empty());
     let inventory: serde_json::Value = serde_json::from_slice(&dry_run.stdout).unwrap();
-    assert_eq!(inventory[0]["fingerprint"]["tables"][0]["row_count"], 1);
+    assert_eq!(inventory[0]["metadata"]["revision"], 1);
+    assert!(inventory[0].get("offline_fingerprint").is_none());
+    assert!(!run(root.path(), &["offline-fingerprint"]).status.success());
+    let remote = run(
+        root.path(),
+        &[
+            "--database",
+            "postgres://example.invalid/tinycloud",
+            "offline-fingerprint",
+            "--local-snapshot",
+        ],
+    );
+    assert!(!remote.status.success());
+    assert!(String::from_utf8_lossy(&remote.stderr).contains("local database URL"));
+    let offline = run(root.path(), &["offline-fingerprint", "--local-snapshot"]);
+    success(&offline);
+    let offline_json: serde_json::Value = serde_json::from_slice(&offline.stdout).unwrap();
+    assert_eq!(
+        offline_json[0]["offline_fingerprint"]["tables"][0]["row_count"],
+        1
+    );
     let baseline = root.path().join("tc780-applied.json");
     let unfenced = run(root.path(), &["apply"]);
     assert!(!unfenced.status.success());
@@ -119,6 +139,26 @@ async fn cli_fence_dry_run_apply_set_verify_clear() {
         root.path(),
         &["verify", "--baseline", baseline.to_str().unwrap()],
     ));
+    let ledger = rusqlite::Connection::open(&db_path).unwrap();
+    ledger
+        .execute(
+            "UPDATE database_artifact SET revision = 2 WHERE service = 'sql' AND name = 'threads'",
+            [],
+        )
+        .unwrap();
+    assert!(!run(
+        root.path(),
+        &["verify", "--baseline", baseline.to_str().unwrap()]
+    )
+    .status
+    .success());
+    ledger
+        .execute(
+            "UPDATE database_artifact SET revision = 1 WHERE service = 'sql' AND name = 'threads'",
+            [],
+        )
+        .unwrap();
+    drop(ledger);
     success(&run(
         root.path(),
         &["clear", "sql", &space, "--path", "web/threads"],

@@ -62,6 +62,18 @@ pub struct ArtifactFingerprint {
     pub tables: Vec<TableFingerprint>,
 }
 
+/// Fields read from production artifact rows. This deliberately excludes both
+/// bytea payload columns, even when the row is very large.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactMetadata {
+    pub revision: i64,
+    pub size_bytes: i64,
+    pub checkpoint_content_hash: String,
+    pub checkpoint_size_bytes: i64,
+    pub delta_content_hash: Option<String>,
+    pub delta_size_bytes: i64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InventoryItem {
     pub service: String,
@@ -72,7 +84,9 @@ pub struct InventoryItem {
     pub paths: Vec<Option<String>>,
     pub classification: String,
     pub collision: bool,
-    pub fingerprint: Option<ArtifactFingerprint>,
+    pub metadata: Option<ArtifactMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_fingerprint: Option<ArtifactFingerprint>,
 }
 
 fn hash_schema(value: &str) -> String {
@@ -168,7 +182,73 @@ fn fingerprint_duckdb(path: &Path) -> Result<ArtifactFingerprint, MigrationError
     })
 }
 
+fn artifact_metadata_query(
+    service: &str,
+    space: &str,
+    name: &str,
+) -> sea_orm::Select<database_artifact::Entity> {
+    database_artifact::Entity::find_by_id((service.to_owned(), space.to_owned(), name.to_owned()))
+        .select_only()
+        .column(database_artifact::Column::Revision)
+        .column(database_artifact::Column::SizeBytes)
+        .column(database_artifact::Column::CheckpointContentHash)
+        .column(database_artifact::Column::CheckpointSizeBytes)
+        .column(database_artifact::Column::DeltaContentHash)
+        .column(database_artifact::Column::DeltaSizeBytes)
+}
+
+fn artifact_identity_query() -> sea_orm::Select<database_artifact::Entity> {
+    database_artifact::Entity::find()
+        .filter(database_artifact::Column::Service.is_in(["sql", "duckdb"]))
+        .select_only()
+        .column(database_artifact::Column::Service)
+        .column(database_artifact::Column::Space)
+        .column(database_artifact::Column::Name)
+}
+
+fn artifact_name_query(
+    service: &str,
+    space: &str,
+    name: &str,
+) -> sea_orm::Select<database_artifact::Entity> {
+    database_artifact::Entity::find_by_id((service.to_owned(), space.to_owned(), name.to_owned()))
+        .select_only()
+        .column(database_artifact::Column::Name)
+}
+
 async fn fingerprint<C: ConnectionTrait>(
+    conn: &C,
+    service: &str,
+    space: &str,
+    name: &str,
+) -> Result<Option<ArtifactMetadata>, MigrationError> {
+    let row: Option<(i64, i64, String, i64, Option<String>, i64)> =
+        artifact_metadata_query(service, space, name)
+            .into_tuple()
+            .one(conn)
+            .await?;
+    Ok(row.map(
+        |(
+            revision,
+            size_bytes,
+            checkpoint_content_hash,
+            checkpoint_size_bytes,
+            delta_content_hash,
+            delta_size_bytes,
+        )| ArtifactMetadata {
+            revision,
+            size_bytes,
+            checkpoint_content_hash,
+            checkpoint_size_bytes,
+            delta_content_hash,
+            delta_size_bytes,
+        },
+    ))
+}
+
+/// Reads artifact bytes only for an explicitly designated local snapshot.
+/// Production-facing inventory, apply, report, and verify never call this.
+async fn offline_fingerprint<C: ConnectionTrait>(
     conn: &C,
     datadir: &Path,
     service: &str,
@@ -224,6 +304,26 @@ async fn fingerprint<C: ConnectionTrait>(
             ))
         }
     }
+}
+
+/// Full schema and row-count inspection is limited to an operator-designated
+/// local snapshot. The caller must enforce that boundary before invoking it.
+pub async fn offline_inventory(
+    conn: &DatabaseConnection,
+    datadir: &Path,
+) -> Result<Vec<InventoryItem>, MigrationError> {
+    let mut items = inventory(conn, datadir).await?;
+    for item in &mut items {
+        item.offline_fingerprint = offline_fingerprint(
+            conn,
+            datadir,
+            &item.service,
+            &item.space,
+            &item.physical_name,
+        )
+        .await?;
+    }
+    Ok(items)
 }
 
 /// Only N2's exact on-disk spellings are excluded. A malformed prefix is
@@ -283,15 +383,8 @@ pub async fn has_unmigrated_artifacts<C: ConnectionTrait>(
         .await?
         .into_iter()
         .collect();
-    let rows: Vec<(String, String, String)> = database_artifact::Entity::find()
-        .filter(database_artifact::Column::Service.is_in(["sql", "duckdb"]))
-        .select_only()
-        .column(database_artifact::Column::Service)
-        .column(database_artifact::Column::Space)
-        .column(database_artifact::Column::Name)
-        .into_tuple()
-        .all(conn)
-        .await?;
+    let rows: Vec<(String, String, String)> =
+        artifact_identity_query().into_tuple().all(conn).await?;
     Ok(rows
         .into_iter()
         .any(|row| !is_digest_name(&row.2) && !registered.contains(&row)))
@@ -352,17 +445,11 @@ async fn artifact_exists<C: sea_orm::ConnectionTrait>(
     space: &str,
     name: &str,
 ) -> Result<bool, DbErr> {
-    Ok(database_artifact::Entity::find_by_id((
-        service.to_owned(),
-        space.to_owned(),
-        name.to_owned(),
-    ))
-    .select_only()
-    .column(database_artifact::Column::Name)
-    .into_tuple::<String>()
-    .one(conn)
-    .await?
-    .is_some())
+    Ok(artifact_name_query(service, space, name)
+        .into_tuple::<String>()
+        .one(conn)
+        .await?
+        .is_some())
 }
 
 /// Scan durable rows and local cache files, then attribute each old artifact
@@ -381,15 +468,8 @@ async fn inventory_in<C: ConnectionTrait>(
     datadir: &Path,
     aliases_exist: bool,
 ) -> Result<Vec<InventoryItem>, MigrationError> {
-    let rows: Vec<(String, String, String)> = database_artifact::Entity::find()
-        .filter(database_artifact::Column::Service.is_in(["sql", "duckdb"]))
-        .select_only()
-        .column(database_artifact::Column::Service)
-        .column(database_artifact::Column::Space)
-        .column(database_artifact::Column::Name)
-        .into_tuple()
-        .all(conn)
-        .await?;
+    let rows: Vec<(String, String, String)> =
+        artifact_identity_query().into_tuple().all(conn).await?;
     let mut artifacts: BTreeMap<(String, String, String), (bool, bool)> = BTreeMap::new();
     for (service, space, name) in rows {
         if !is_digest_name(&name) {
@@ -510,7 +590,8 @@ async fn inventory_in<C: ConnectionTrait>(
             false
         };
         result.push(InventoryItem {
-            fingerprint: fingerprint(conn, datadir, &service, &space, &physical_name).await?,
+            metadata: fingerprint(conn, &service, &space, &physical_name).await?,
+            offline_fingerprint: None,
             service,
             space,
             physical_name,
@@ -915,6 +996,42 @@ pub fn checkpoint_cache(datadir: &Path) -> Result<(usize, usize), MigrationError
 mod tests {
     use super::*;
 
+    use sea_orm::QueryTrait;
+
+    #[test]
+    fn production_inventory_queries_never_select_artifact_payloads() {
+        for backend in [
+            sea_orm::DatabaseBackend::Postgres,
+            sea_orm::DatabaseBackend::Sqlite,
+        ] {
+            for sql in [
+                artifact_identity_query().build(backend).to_string(),
+                artifact_name_query("sql", "space", "threads")
+                    .build(backend)
+                    .to_string(),
+                artifact_metadata_query("sql", "space", "threads")
+                    .build(backend)
+                    .to_string(),
+            ] {
+                assert!(!sql.contains("\"payload\""), "{sql}");
+                assert!(!sql.contains("\"delta_payload\""), "{sql}");
+            }
+            let sql = artifact_metadata_query("sql", "space", "threads")
+                .build(backend)
+                .to_string();
+            for field in [
+                "revision",
+                "size_bytes",
+                "checkpoint_content_hash",
+                "checkpoint_size_bytes",
+                "delta_content_hash",
+                "delta_size_bytes",
+            ] {
+                assert!(sql.contains(field), "{sql}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn effective_fence_caches_legacy_scan_but_observes_metadata_fence_live() {
         use sea_orm::Database;
@@ -1007,7 +1124,8 @@ mod tests {
             paths: vec![Some("web/notes..v2".into())],
             classification: "unique".into(),
             collision: false,
-            fingerprint: None,
+            metadata: None,
+            offline_fingerprint: None,
         };
         assert!(matches!(
             validate_inventory(std::slice::from_ref(&item)),

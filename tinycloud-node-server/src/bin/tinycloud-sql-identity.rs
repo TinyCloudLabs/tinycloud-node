@@ -31,6 +31,12 @@ enum Command {
     Inventory,
     /// Preview classification and collisions on a copied data directory.
     DryRun,
+    /// Inspect schema and row counts from a local snapshot, including artifact bytes.
+    OfflineFingerprint {
+        /// Explicitly attest that this database is a local snapshot or copy.
+        #[arg(long)]
+        local_snapshot: bool,
+    },
     /// Checkpoint every local SQL/DuckDB cache after stopping the fenced node.
     Checkpoint,
     /// Persist the metadata fence. The server also honors this flag at runtime.
@@ -65,7 +71,7 @@ enum Command {
     },
     /// Show all aliases and unresolved inventory entries.
     Report,
-    /// Read every aliased artifact offline and compare with saved apply output.
+    /// Compare aliased artifact metadata with the transaction-time apply output.
     Verify {
         #[arg(long)]
         baseline: PathBuf,
@@ -85,6 +91,26 @@ fn requested_path(path: &Option<String>, pathless: bool) -> anyhow::Result<Optio
     Ok(path.as_deref())
 }
 
+fn is_local_database_url(url: &str) -> bool {
+    if url.starts_with("sqlite:") {
+        return true;
+    }
+    let Some(authority) = url
+        .strip_prefix("postgres://")
+        .or_else(|| url.strip_prefix("postgresql://"))
+        .and_then(|rest| rest.split('/').next())
+    else {
+        return false;
+    };
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    host == "localhost"
+        || host.starts_with("localhost:")
+        || host == "127.0.0.1"
+        || host.starts_with("127.0.0.1:")
+        || host == "[::1]"
+        || host.starts_with("[::1]:")
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -93,6 +119,7 @@ async fn main() -> anyhow::Result<()> {
         Command::CheckMigrations
             | Command::Inventory
             | Command::DryRun
+            | Command::OfflineFingerprint { .. }
             | Command::Report
             | Command::Verify { .. }
     );
@@ -103,6 +130,16 @@ async fn main() -> anyhow::Result<()> {
             if readonly { "?mode=ro" } else { "?mode=rw" }
         )
     });
+    if let Command::OfflineFingerprint { local_snapshot } = &args.command {
+        anyhow::ensure!(
+            *local_snapshot,
+            "offline-fingerprint requires --local-snapshot"
+        );
+        anyhow::ensure!(
+            is_local_database_url(&url),
+            "offline-fingerprint requires a local database URL"
+        );
+    }
     let conn = Database::connect(ConnectOptions::new(url)).await?;
     match args.command {
         Command::CheckMigrations => {
@@ -135,6 +172,10 @@ async fn main() -> anyhow::Result<()> {
             let items = migration::inventory(&conn, &args.datadir).await?;
             println!("{}", serde_json::to_string_pretty(&items)?);
             migration::validate_inventory(&items)?;
+        }
+        Command::OfflineFingerprint { .. } => {
+            let items = migration::offline_inventory(&conn, &args.datadir).await?;
+            println!("{}", serde_json::to_string_pretty(&items)?);
         }
         Command::Fence { state } => {
             Migrator::up(&conn, None).await?;
@@ -243,17 +284,17 @@ async fn main() -> anyhow::Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("aliased artifact missing: {key:?}"))?;
                 anyhow::ensure!(actual.durable, "aliased durable artifact missing: {key:?}");
                 anyhow::ensure!(
-                    expected.fingerprint.is_some(),
-                    "baseline has no fingerprint: {key:?}"
+                    expected.metadata.is_some(),
+                    "baseline has no artifact metadata: {key:?}"
                 );
                 anyhow::ensure!(
-                    expected.fingerprint == actual.fingerprint,
-                    "schema or row-count mismatch: {key:?}: expected {:?}, actual {:?}",
-                    expected.fingerprint,
-                    actual.fingerprint
+                    expected.metadata == actual.metadata,
+                    "artifact metadata mismatch: {key:?}: expected {:?}, actual {:?}",
+                    expected.metadata,
+                    actual.metadata
                 );
                 verified.push(serde_json::json!({"service": alias.service, "space": alias.space,
-                    "path": alias.path, "physical_name": alias.physical_name, "fingerprint": actual.fingerprint}));
+                    "path": alias.path, "physical_name": alias.physical_name, "metadata": actual.metadata}));
             }
             println!("{}", serde_json::to_string_pretty(&verified)?);
         }
