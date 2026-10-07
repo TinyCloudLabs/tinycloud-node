@@ -110,6 +110,7 @@ default-features = false
 features = ["sqlite", "postgres", "mysql", "tokio", "verification-count-test-hook"]
 
 [dev-dependencies]
+rusqlite.workspace = true
 axum = { version = "0.7", features = ["ws"] }
 bs58 = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }

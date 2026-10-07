@@ -193,7 +193,7 @@ secret = "{}"
     sql_service
         .execute(
             &space_id,
-            "records",
+            &tinycloud_core::database_identity::logical_name(Some("records")),
             SqlRequest::Execute {
                 schema: Some(vec!["CREATE TABLE seed (id INTEGER)".to_string()]),
                 sql: "INSERT INTO seed (id) VALUES (?)".to_string(),

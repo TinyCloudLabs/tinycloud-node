@@ -23,6 +23,7 @@ pub mod m20260915_000000_meeting_legacy_write_guard;
 pub mod m20261005_000000_current_kv_sync_order;
 pub mod m20261005_000000_deactivate_hook_subscriptions;
 pub mod m20261007_000000_database_alias;
+pub mod m20261007_010000_database_identity_fence;
 
 pub struct Migrator;
 
@@ -54,6 +55,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261005_000000_current_kv_sync_order::Migration),
             Box::new(m20261005_000000_deactivate_hook_subscriptions::Migration),
             Box::new(m20261007_000000_database_alias::Migration),
+            Box::new(m20261007_010000_database_identity_fence::Migration),
         ]
     }
 }

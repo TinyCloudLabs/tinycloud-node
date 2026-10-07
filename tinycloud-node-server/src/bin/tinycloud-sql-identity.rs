@@ -30,16 +30,15 @@ enum Command {
     /// Preview classification and collisions on a copied data directory.
     DryRun,
     /// Checkpoint every local SQL/DuckDB cache after stopping the fenced node.
-    Checkpoint {
-        #[arg(long)]
-        fence_confirmed: bool,
+    Checkpoint,
+    /// Persist the metadata fence. The server also honors this flag at runtime.
+    Fence {
+        #[arg(value_enum)]
+        state: FenceState,
     },
     /// Quarantine every discovered artifact and alias uniquely attributed ones
     /// in one transaction. Run only after fencing, drain, and backup.
-    Apply {
-        #[arg(long)]
-        fence_confirmed: bool,
-    },
+    Apply,
     /// Assign an ambiguous or unattributed artifact to one owner-approved path.
     #[command(alias = "resolve")]
     Set {
@@ -52,8 +51,6 @@ enum Command {
         pathless: bool,
         #[arg(long)]
         authorized: bool,
-        #[arg(long)]
-        fence_confirmed: bool,
     },
     /// Clear an alias, leaving its artifact quarantined.
     Clear {
@@ -63,11 +60,20 @@ enum Command {
         path: Option<String>,
         #[arg(long)]
         pathless: bool,
-        #[arg(long)]
-        fence_confirmed: bool,
     },
     /// Show all aliases and unresolved inventory entries.
     Report,
+    /// Read every aliased artifact offline and compare with a saved dry-run.
+    Verify {
+        #[arg(long)]
+        baseline: PathBuf,
+    },
+}
+
+#[derive(clap::ValueEnum, Clone)]
+enum FenceState {
+    On,
+    Off,
 }
 
 fn requested_path(path: &Option<String>, pathless: bool) -> anyhow::Result<Option<&str>> {
@@ -80,18 +86,9 @@ fn requested_path(path: &Option<String>, pathless: bool) -> anyhow::Result<Optio
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    if let Command::Checkpoint { fence_confirmed } = &args.command {
-        anyhow::ensure!(
-            *fence_confirmed,
-            "stop the fenced node before checkpointing, then pass --fence-confirmed"
-        );
-        let (sql, duckdb) = migration::checkpoint_cache(&args.datadir)?;
-        println!("checkpointed {sql} SQL and {duckdb} DuckDB caches");
-        return Ok(());
-    }
     let readonly = matches!(
         &args.command,
-        Command::Inventory | Command::DryRun | Command::Report
+        Command::Inventory | Command::DryRun | Command::Report | Command::Verify { .. }
     );
     let url = args.database.unwrap_or_else(|| {
         format!(
@@ -105,20 +102,28 @@ async fn main() -> anyhow::Result<()> {
         Command::Inventory | Command::DryRun => {
             let items = migration::inventory(&conn, &args.datadir).await?;
             println!("{}", serde_json::to_string_pretty(&items)?);
+            migration::validate_inventory(&items)?;
         }
-        Command::Checkpoint { .. } => unreachable!("checkpoint handled before metadata connection"),
-        Command::Apply { fence_confirmed } => {
-            anyhow::ensure!(
-                fence_confirmed,
-                "verify the running node returns 503 for SQL/DuckDB, then pass --fence-confirmed"
-            );
+        Command::Fence { state } => {
             Migrator::up(&conn, None).await?;
-            let items = migration::inventory(&conn, &args.datadir).await?;
-            anyhow::ensure!(
-                items.iter().all(|item| !item.collision),
-                "collision in inventory; resolve before applying"
+            migration::set_fence(&conn, matches!(state, FenceState::On)).await?;
+            println!(
+                "metadata fence {}",
+                if matches!(state, FenceState::On) {
+                    "on"
+                } else {
+                    "off"
+                }
             );
-            migration::apply_inventory(&conn, &items).await?;
+        }
+        Command::Checkpoint => {
+            migration::require_fence(&conn).await?;
+            let (sql, duckdb) = migration::checkpoint_cache(&args.datadir)?;
+            println!("checkpointed {sql} SQL and {duckdb} DuckDB caches");
+        }
+        Command::Apply => {
+            migration::require_fence(&conn).await?;
+            let items = migration::apply(&conn, &args.datadir).await?;
             println!("{}", serde_json::to_string_pretty(&items)?);
         }
         Command::Set {
@@ -128,10 +133,11 @@ async fn main() -> anyhow::Result<()> {
             path,
             pathless,
             authorized,
-            fence_confirmed,
         } => {
-            anyhow::ensure!(authorized && fence_confirmed,
-                "set requires owner/admin authorization and active fence (--authorized --fence-confirmed)");
+            anyhow::ensure!(
+                authorized,
+                "set requires owner/admin authorization (--authorized)"
+            );
             migration::set_alias(
                 &conn,
                 &service,
@@ -147,12 +153,7 @@ async fn main() -> anyhow::Result<()> {
             space,
             path,
             pathless,
-            fence_confirmed,
         } => {
-            anyhow::ensure!(
-                fence_confirmed,
-                "clear requires an active fence (--fence-confirmed)"
-            );
             migration::clear_alias(&conn, &service, &space, requested_path(&path, pathless)?)
                 .await?;
             println!("alias cleared");
@@ -191,6 +192,38 @@ async fn main() -> anyhow::Result<()> {
                     "unresolved": unresolved, "quarantined": quarantine_rows,
                 }))?
             );
+        }
+        Command::Verify { baseline } => {
+            let before: Vec<migration::InventoryItem> =
+                serde_json::from_slice(&std::fs::read(baseline)?)?;
+            let current = migration::inventory(&conn, &args.datadir).await?;
+            let aliases = migration::aliases(&conn).await?;
+            let mut verified = Vec::new();
+            for alias in aliases {
+                let key = (&alias.service, &alias.space, &alias.physical_name);
+                let expected = before
+                    .iter()
+                    .find(|item| (&item.service, &item.space, &item.physical_name) == key)
+                    .ok_or_else(|| anyhow::anyhow!("alias missing from baseline: {key:?}"))?;
+                let actual = current
+                    .iter()
+                    .find(|item| (&item.service, &item.space, &item.physical_name) == key)
+                    .ok_or_else(|| anyhow::anyhow!("aliased artifact missing: {key:?}"))?;
+                anyhow::ensure!(actual.durable, "aliased durable artifact missing: {key:?}");
+                anyhow::ensure!(
+                    expected.fingerprint.is_some(),
+                    "baseline has no fingerprint: {key:?}"
+                );
+                anyhow::ensure!(
+                    expected.fingerprint == actual.fingerprint,
+                    "schema or row-count mismatch: {key:?}: expected {:?}, actual {:?}",
+                    expected.fingerprint,
+                    actual.fingerprint
+                );
+                verified.push(serde_json::json!({"service": alias.service, "space": alias.space,
+                    "path": alias.path, "physical_name": alias.physical_name, "fingerprint": actual.fingerprint}));
+            }
+            println!("{}", serde_json::to_string_pretty(&verified)?);
         }
     }
     Ok(())

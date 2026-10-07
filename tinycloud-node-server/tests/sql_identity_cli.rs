@@ -1,0 +1,116 @@
+use std::{path::Path, process::Command};
+
+use tinycloud_auth::{resolver::DID_METHODS, resource::SpaceId, ssi::jwk::JWK};
+use tinycloud_core::{
+    migrations::Migrator,
+    models::database_artifact,
+    sea_orm::{ActiveModelTrait, ActiveValue::Set, Database},
+    sea_orm_migration::MigratorTrait,
+};
+
+fn run(datadir: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_tinycloud-sql-identity"))
+        .arg("--datadir")
+        .arg(datadir)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn success(output: &std::process::Output) {
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn cli_fence_dry_run_apply_set_verify_clear() {
+    let root = tempfile::tempdir().unwrap();
+    let db_path = root.path().join("caps.db");
+    let conn = Database::connect(format!("sqlite:{}?mode=rwc", db_path.display()))
+        .await
+        .unwrap();
+    // A production snapshot predates N3's alias and fence migrations.
+    let pre_n3_steps = (Migrator::migrations().len() - 2) as u32;
+    Migrator::up(&conn, Some(pre_n3_steps)).await.unwrap();
+    let jwk = JWK::generate_ed25519().unwrap();
+    let did = DID_METHODS.generate(&jwk, "key").unwrap();
+    let space = SpaceId::new(did, "cli".parse().unwrap()).to_string();
+    let physical = root.path().join("legacy.db");
+    let sqlite = rusqlite::Connection::open(&physical).unwrap();
+    sqlite
+        .execute_batch("CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('existing-web-row');")
+        .unwrap();
+    drop(sqlite);
+    database_artifact::ActiveModel {
+        service: Set("sql".into()),
+        space: Set(space.clone()),
+        name: Set("threads".into()),
+        revision: Set(1),
+        content_hash: Set("fixture".into()),
+        payload: Set(std::fs::read(physical).unwrap()),
+        size_bytes: Set(8192),
+        backend: Set("sqlite".into()),
+        storage_mode: Set("database-blob".into()),
+        created_at: Set("2026-01-01T00:00:00Z".into()),
+        updated_at: Set("2026-01-01T00:00:00Z".into()),
+        checkpoint_size_bytes: Set(8192),
+        checkpoint_content_hash: Set("fixture".into()),
+        delta_payload: Set(None),
+        delta_content_hash: Set(None),
+        delta_size_bytes: Set(0),
+    }
+    .insert(&conn)
+    .await
+    .unwrap();
+    drop(conn);
+
+    let dry_run = run(root.path(), &["dry-run"]);
+    success(&dry_run);
+    let inventory: serde_json::Value = serde_json::from_slice(&dry_run.stdout).unwrap();
+    assert_eq!(inventory[0]["fingerprint"]["tables"][0]["row_count"], 1);
+    let baseline = root.path().join("baseline.json");
+    std::fs::write(&baseline, &dry_run.stdout).unwrap();
+    let unfenced = run(root.path(), &["apply"]);
+    assert!(!unfenced.status.success());
+    success(&run(root.path(), &["fence", "on"]));
+    success(&run(root.path(), &["apply"]));
+    success(&run(
+        root.path(),
+        &[
+            "set",
+            "sql",
+            &space,
+            "threads",
+            "--path",
+            "web/threads",
+            "--authorized",
+        ],
+    ));
+    success(&run(
+        root.path(),
+        &["verify", "--baseline", baseline.to_str().unwrap()],
+    ));
+    success(&run(
+        root.path(),
+        &["clear", "sql", &space, "--path", "web/threads"],
+    ));
+    success(&run(root.path(), &["fence", "off"]));
+    assert!(!run(
+        root.path(),
+        &[
+            "set",
+            "sql",
+            &space,
+            "threads",
+            "--path",
+            "web/threads",
+            "--authorized"
+        ]
+    )
+    .status
+    .success());
+}
