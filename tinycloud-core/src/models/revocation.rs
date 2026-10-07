@@ -2,7 +2,9 @@ use super::super::{events::Revocation, models::*, relationships::*};
 use crate::hash::{hash, Hash};
 use crate::models::did_resolution::did_resolution_timeout;
 use crate::types::Resource;
-use sea_orm::{entity::prelude::*, sea_query::OnConflict, ConnectionTrait, QuerySelect};
+use sea_orm::{
+    entity::prelude::*, sea_query::OnConflict, ConnectionTrait, QueryOrder, QuerySelect,
+};
 use std::collections::HashSet;
 use time::OffsetDateTime;
 use tinycloud_auth::{
@@ -56,6 +58,8 @@ impl ActiveModelBehavior for ActiveModel {}
 /// Maximum number of distinct delegation nodes examined while validating a
 /// proof chain. This bounds database work for deep and wide proof DAGs.
 pub const MAX_CHAIN_TRAVERSAL_NODES: usize = 64;
+
+const PARENT_DELEGATION_PAGE_SIZE: usize = MAX_CHAIN_TRAVERSAL_NODES + 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ChainTraversalError {
@@ -114,20 +118,35 @@ pub(crate) async fn ancestor_chain_ids_for_roots<C: ConnectionTrait>(
         if visited.len() > MAX_CHAIN_TRAVERSAL_NODES {
             return Err(ChainTraversalError::LimitExceeded);
         }
-        let remaining = MAX_CHAIN_TRAVERSAL_NODES - visited.len();
         ordered.push(current);
-        let parents = parent_delegations::Entity::find()
-            .filter(parent_delegations::Column::Child.eq(current))
-            .limit((remaining + 1) as u64)
-            .all(db)
-            .await?;
-        for link in parents {
-            if !visited.contains(&link.parent) && !frontier.contains(&link.parent) {
-                if visited.len() + frontier.len() >= MAX_CHAIN_TRAVERSAL_NODES {
-                    return Err(ChainTraversalError::LimitExceeded);
+
+        // Page parent edges. A single capped query can hide an unvisited
+        // parent behind rows that are already in `visited` or `frontier`.
+        // Continue until the child is exhausted or the actual closure exceeds
+        // the node budget.
+        let mut offset = 0;
+        loop {
+            let page_size = PARENT_DELEGATION_PAGE_SIZE;
+            let parents = parent_delegations::Entity::find()
+                .filter(parent_delegations::Column::Child.eq(current))
+                .order_by_asc(parent_delegations::Column::Parent)
+                .limit(page_size as u64)
+                .offset(offset as u64)
+                .all(db)
+                .await?;
+            let page_len = parents.len();
+            for link in parents {
+                if !visited.contains(&link.parent) && !frontier.contains(&link.parent) {
+                    if visited.len() + frontier.len() >= MAX_CHAIN_TRAVERSAL_NODES {
+                        return Err(ChainTraversalError::LimitExceeded);
+                    }
+                    frontier.push(link.parent);
                 }
-                frontier.push(link.parent);
             }
+            if page_len < page_size {
+                break;
+            }
+            offset += page_len;
         }
     }
     Ok(ordered)
@@ -386,7 +405,7 @@ mod tests {
         db
     }
 
-    async fn insert_delegation(db: &sea_orm::DbConn, id: Hash) {
+    async fn insert_delegation<C: ConnectionTrait>(db: &C, id: Hash) {
         delegation::ActiveModel {
             id: Set(id),
             delegator: Set("did:key:actor".to_string()),
@@ -402,7 +421,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn insert_link(db: &sea_orm::DbConn, child: Hash, parent: Hash) {
+    async fn insert_link<C: ConnectionTrait>(db: &C, child: Hash, parent: Hash) {
         parent_delegations::ActiveModel {
             parent: Set(parent),
             child: Set(child),
@@ -410,6 +429,83 @@ mod tests {
         .insert(db)
         .await
         .unwrap();
+    }
+
+    async fn assert_shared_ancestor_is_loaded<C: ConnectionTrait>(db: &C) {
+        let mut ids: Vec<_> = (0..MAX_CHAIN_TRAVERSAL_NODES)
+            .map(|index| hash(format!("shared-ancestor-boundary-{index}").as_bytes()))
+            .collect();
+        ids.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
+        let (roots, hidden_ancestor) = ids.split_at(MAX_CHAIN_TRAVERSAL_NODES - 1);
+        for id in &ids {
+            insert_delegation(db, *id).await;
+        }
+        // The lowest root is processed after the two cited parents. The
+        // uncited ancestor sorts after both and used to fall beyond LIMIT.
+        insert_link(db, roots[0], roots[MAX_CHAIN_TRAVERSAL_NODES - 3]).await;
+        insert_link(db, roots[0], roots[MAX_CHAIN_TRAVERSAL_NODES - 2]).await;
+        insert_link(db, roots[0], hidden_ancestor[0]).await;
+
+        let chain = ancestor_chain_ids_for_roots(db, roots).await.unwrap();
+        assert_eq!(chain.len(), MAX_CHAIN_TRAVERSAL_NODES);
+        assert!(
+            chain.contains(&hidden_ancestor[0]),
+            "a parent after already-visited shared parents must be traversed"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_ancestor_after_visited_roots_is_loaded_on_sqlite() {
+        let db = database().await;
+        assert_shared_ancestor_is_loaded(&db).await;
+    }
+
+    #[tokio::test]
+    async fn shared_ancestor_after_visited_roots_is_loaded_on_postgres() {
+        use sea_orm::{DbBackend, Statement};
+
+        let Some(database_url) = crate::test_support::postgres_test_url(
+            "shared_ancestor_after_visited_roots_is_loaded_on_postgres",
+        ) else {
+            return;
+        };
+        let admin = Database::connect(ConnectOptions::new(database_url.clone()))
+            .await
+            .expect("connect to PostgreSQL test database");
+        let schema = format!(
+            "tc815_{}_{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        admin
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("CREATE SCHEMA {schema}"),
+            ))
+            .await
+            .expect("create isolated TC-815 schema");
+        let mut options = ConnectOptions::new(database_url);
+        options.set_schema_search_path(schema.clone());
+        let exercise = async {
+            let db = Database::connect(options).await?;
+            Migrator::up(&db, None).await?;
+            actor::ActiveModel {
+                id: Set("did:key:actor".to_string()),
+            }
+            .insert(&db)
+            .await?;
+            assert_shared_ancestor_is_loaded(&db).await;
+            Ok::<_, sea_orm::DbErr>(())
+        }
+        .await;
+        admin
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("DROP SCHEMA {schema} CASCADE"),
+            ))
+            .await
+            .expect("drop isolated TC-815 schema");
+        exercise.expect("TC-815 PostgreSQL shared-ancestor traversal");
     }
 
     #[tokio::test]
@@ -446,6 +542,43 @@ mod tests {
             first_revoked_ancestor(&db, &child).await,
             Err(ChainTraversalError::LimitExceeded)
         ));
+    }
+
+    #[tokio::test]
+    async fn dense_64_node_dag_uses_one_parent_query_per_node() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let mut db = database().await;
+        let ids: Vec<_> = (0..MAX_CHAIN_TRAVERSAL_NODES)
+            .map(|index| hash(format!("dense-dag-{index}").as_bytes()))
+            .collect();
+        for id in &ids {
+            insert_delegation(&db, *id).await;
+        }
+        for child in 1..ids.len() {
+            for parent in 0..child {
+                insert_link(&db, ids[child], ids[parent]).await;
+            }
+        }
+
+        let query_count = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&query_count);
+        db.set_metric_callback(move |_info| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let chain = ancestor_chain_ids_for_roots(&db, &[ids[ids.len() - 1]])
+            .await
+            .unwrap();
+
+        assert_eq!(chain.len(), MAX_CHAIN_TRAVERSAL_NODES);
+        assert_eq!(
+            query_count.load(Ordering::Relaxed),
+            MAX_CHAIN_TRAVERSAL_NODES
+        );
     }
 
     #[tokio::test]

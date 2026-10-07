@@ -38,6 +38,7 @@ use tinycloud_auth::multihash_codetable::MultihashDigest;
 use tinycloud_auth::{
     authorization::{make_invocation, EncodingError, InvocationOptions, TinyCloudDelegation},
     identity::{canonicalize_did, did_principal_matches},
+    ipld_core::cid::Cid,
     resource::{Path, SpaceId},
 };
 
@@ -499,6 +500,24 @@ where
         invocation::authorize_admitted(&self.conn, &invocation.invocation().0, now, None).await
     }
 
+    /// Check the persisted revocation state for cited delegations and every
+    /// ancestor, without re-admitting the invocation that minted a ticket.
+    pub async fn delegation_chains_unrevoked(&self, roots: &[Cid]) -> Result<bool, DbErr> {
+        let roots = roots.iter().copied().map(Hash::from).collect::<Vec<_>>();
+        if roots.is_empty() {
+            return Ok(true);
+        }
+        let chain_ids = revocation::ancestor_chain_ids_for_roots(&self.conn, &roots)
+            .await
+            .map_err(|error| DbErr::Custom(error.to_string()))?;
+        for id in chain_ids {
+            if revocation::is_revoked(&self.conn, &id).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Load and reparse a delegation from its exact signed Authorization
     /// bytes. The relational row is returned only so callers can compare all
     /// projections against the signed source of truth.
@@ -869,11 +888,15 @@ where
         );
 
         if let Some(prefix) = prefix.and_then(normalize_hook_prefix) {
-            query = query.filter(
-                Condition::any()
-                    .add(hook_subscription::Column::PathPrefix.eq(prefix))
-                    .add(hook_subscription::Column::PathPrefix.starts_with(format!("{prefix}/"))),
-            );
+            let column = Expr::col((
+                hook_subscription::Entity,
+                hook_subscription::Column::PathPrefix,
+            ));
+            if let Some(condition) =
+                prefix_condition(self.conn.get_database_backend(), column, prefix)
+            {
+                query = query.filter(condition);
+            }
         }
 
         query
@@ -3441,53 +3464,44 @@ fn kv_list_cursor_in_prefix(prefix: &Path, cursor: Option<&Path>) -> bool {
     cursor.is_none_or(|cursor| kv_prefix_covers(prefix.as_str(), cursor.as_str()))
 }
 
-/// `current_kv.key`, compared in byte order on every backend. See
-/// `byte_ordered_resource` for why the column's own collation cannot be
-/// trusted for range predicates.
-fn byte_ordered_key(backend: DbBackend) -> SimpleExpr {
-    byte_ordered(
-        backend,
-        Expr::col((current_kv::Entity, current_kv::Column::Key)),
-    )
-}
-
-/// The SQL form of `kv_prefix_covers` over `current_kv.key`, or `None` for the
-/// empty prefix (a whole-space list needs no predicate).
+/// Compare arbitrary resource columns in byte order on every backend. See
+/// `byte_ordered_resource` for why a column's native collation is not trusted.
 ///
-/// A byte-ordered half-open range `[q, q_hi)` selects exactly the keys that
-/// start with `q`: `q` is the prefix with one trailing `/`, and `q_hi` is `q`
-/// with that `/` bumped to the next byte, `0`. A prefix without a trailing
-/// `/` also matches the bare key itself. Unlike `LIKE`, the range needs no
-/// escaping and never folds ASCII case (SQLite's `LIKE` does).
-///
-/// This decides membership; it does not promise an index seek. On PostgreSQL
-/// the `COLLATE "C"` pin does not match the `(space, key)` primary key's
-/// collation, so only `space` seeks and the range is a filter (see
-/// `byte_ordered_resource`). On SQLite `COLLATE BINARY` is the key's own
-/// collation and the range can seek the primary key, but the bare-key `OR`
-/// arm may lead the planner -- especially once `ANALYZE` statistics exist --
-/// to a MULTI-INDEX OR plus a temp B-tree sort. The `kv/sync` feed orders by
-/// `idx_current_kv_space_order` and applies this range as a filter.
-pub(crate) fn kv_prefix_condition(backend: DbBackend, prefix: &str) -> Option<Condition> {
+/// A byte-ordered half-open range selects descendants without `LIKE`
+/// wildcards or backend-specific escaping. For prefixes without a trailing
+/// slash, also match the bare key itself.
+fn prefix_condition(
+    backend: DbBackend,
+    column: impl Into<SimpleExpr> + Clone,
+    prefix: &str,
+) -> Option<Condition> {
     if prefix.is_empty() {
         return None;
     }
-    let (lower, bare_key) = if prefix.ends_with('/') {
+    let (lower, bare_prefix) = if prefix.ends_with('/') {
         (prefix.to_owned(), false)
     } else {
         (format!("{prefix}/"), true)
     };
     let upper = format!("{}0", &lower[..lower.len() - 1]);
     let descendants = Condition::all()
-        .add(byte_ordered_key(backend).gte(lower))
-        .add(byte_ordered_key(backend).lt(upper));
-    Some(if bare_key {
+        .add(byte_ordered(backend, column.clone()).gte(lower))
+        .add(byte_ordered(backend, column.clone()).lt(upper));
+    Some(if bare_prefix {
         Condition::any()
-            .add(byte_ordered_key(backend).eq(prefix))
+            .add(byte_ordered(backend, column.clone()).eq(prefix))
             .add(descendants)
     } else {
         descendants
     })
+}
+
+pub(crate) fn kv_prefix_condition(backend: DbBackend, prefix: &str) -> Option<Condition> {
+    prefix_condition(
+        backend,
+        Expr::col((current_kv::Entity, current_kv::Column::Key)),
+        prefix,
+    )
 }
 
 /// The `list_bounded_after` query. Paging compares (`key > after`) and orders
@@ -8432,5 +8446,107 @@ mod test {
             .await
             .expect("drop isolated TC-731 collation schema");
         exercise.expect("TC-731 PostgreSQL collation resilience");
+    }
+
+    async fn assert_hook_prefix_filter(
+        db: &SpaceDatabase<sea_orm::DbConn, MemoryStore, StaticSecret>,
+    ) {
+        let rows = [
+            ("underscore_exact", "my_docs"),
+            ("underscore_child", "my_docs/inner"),
+            ("underscore_wildcard", "myXdocs/inner"),
+            ("percent_exact", "my%docs"),
+            ("percent_child", "my%docs/inner"),
+            ("percent_wildcard", "myPdocs/inner"),
+            ("sibling", "my_docs_archive/inner"),
+        ];
+        for (id, path_prefix) in rows {
+            db.create_hook_subscription(hook_subscription::Model {
+                id: id.to_string(),
+                subscriber_did: "did:key:subscriber".to_string(),
+                space_id: "tinycloud:space".to_string(),
+                target_service: "kv".to_string(),
+                path_prefix: Some(path_prefix.to_string()),
+                abilities_json: None,
+                callback_url: format!("https://example.com/{id}"),
+                encrypted_secret: Vec::new(),
+                secret_key_id: "primary".to_string(),
+                active: true,
+                created_at: id.to_string(),
+            })
+            .await
+            .unwrap();
+        }
+
+        let mut underscore = db
+            .list_active_hook_subscriptions("tinycloud:space", "kv", Some("my_docs"))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        underscore.sort();
+        assert_eq!(underscore, ["underscore_child", "underscore_exact"]);
+
+        let mut percent = db
+            .list_active_hook_subscriptions("tinycloud:space", "kv", Some("my%docs"))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        percent.sort();
+        assert_eq!(percent, ["percent_child", "percent_exact"]);
+    }
+
+    #[tokio::test]
+    async fn active_hook_subscription_prefix_is_literal_on_sqlite() {
+        let db = get_db().await.unwrap();
+        assert_hook_prefix_filter(&db).await;
+    }
+
+    #[tokio::test]
+    async fn active_hook_subscription_prefix_is_literal_on_postgres() {
+        let Some(database_url) = crate::test_support::postgres_test_url(
+            "active_hook_subscription_prefix_is_literal_on_postgres",
+        ) else {
+            return;
+        };
+        let admin = Database::connect(ConnectOptions::new(database_url.clone()))
+            .await
+            .expect("connect to PostgreSQL test database");
+        let schema = format!(
+            "tc730_{}_{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        admin
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("CREATE SCHEMA {schema}"),
+            ))
+            .await
+            .expect("create isolated TC-730 schema");
+        let mut options = ConnectOptions::new(database_url);
+        options.set_schema_search_path(schema.clone());
+        let exercise = async {
+            let db = SpaceDatabase::new(
+                Database::connect(options).await?,
+                MemoryStore::default(),
+                StaticSecret::new([0u8; 32].to_vec()).unwrap(),
+            )
+            .await?;
+            assert_hook_prefix_filter(&db).await;
+            Ok::<_, DbErr>(())
+        }
+        .await;
+        admin
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("DROP SCHEMA {schema} CASCADE"),
+            ))
+            .await
+            .expect("drop isolated TC-730 schema");
+        exercise.expect("TC-730 PostgreSQL literal prefix filter");
     }
 }
