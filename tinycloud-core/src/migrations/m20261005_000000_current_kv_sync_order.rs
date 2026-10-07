@@ -99,7 +99,11 @@ mod tests {
         let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string()))
             .await
             .unwrap();
-        let previous = Migrator::migrations().len() as u32 - 1;
+        let migrations = Migrator::migrations();
+        let previous = migrations
+            .iter()
+            .position(|migration| migration.name() == "m20261005_000000_current_kv_sync_order")
+            .expect("feed index migration must be registered") as u32;
         Migrator::up(&db, Some(previous)).await.unwrap();
         assert!(!index_exists(&db).await);
         db.execute(Statement::from_string(
@@ -123,7 +127,9 @@ mod tests {
         assert!(index_exists(&db).await);
         assert_eq!(current_kv_rows(&db).await, 2);
 
-        Migrator::down(&db, Some(1)).await.unwrap();
+        Migrator::down(&db, Some(migrations.len() as u32 - previous))
+            .await
+            .unwrap();
         assert!(!index_exists(&db).await);
         assert_eq!(current_kv_rows(&db).await, 2);
     }

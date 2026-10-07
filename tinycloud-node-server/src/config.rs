@@ -1179,6 +1179,10 @@ pub struct DatabaseConfig {
     /// SQLite path uses its own fixed pool and ignores this value.
     #[serde(default = "default_database_max_connections")]
     pub max_connections: u32,
+    /// Stop SQL and DuckDB invocations during the TC-780 identity cutover.
+    /// Canonical environment form: TINYCLOUD_DATABASE__WRITE_FENCE=true.
+    #[serde(default)]
+    pub write_fence: bool,
 }
 
 fn default_database_max_connections() -> u32 {
@@ -1189,6 +1193,7 @@ impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
             max_connections: default_database_max_connections(),
+            write_fence: false,
         }
     }
 }
