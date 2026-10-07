@@ -328,6 +328,7 @@ pub async fn hook_events<'r>(
 
         loop {
             rocket::tokio::select! {
+                biased;
                 _ = &mut deadline_sleep => {
                     break;
                 }
@@ -937,6 +938,63 @@ mod tests {
             result.unwrap_err(),
             (Status::Unauthorized, "hook ticket expired".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn hook_event_stream_does_not_emit_queued_events_after_expiry() -> Result<()> {
+        let hooks = test_hook_runtime();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let ticket = hooks
+            .sign_ticket(&HookTicketClaims {
+                v: 2,
+                sub: "did:key:subscriber".to_string(),
+                scopes: vec![HookSubscription {
+                    space: "tinycloud:space".to_string(),
+                    service: "kv".to_string(),
+                    path_prefix: None,
+                    abilities: Vec::new(),
+                }],
+                iat: now,
+                exp: now + 3,
+                parent_exp: now + 3,
+                authorizing_delegations: Vec::new(),
+            })
+            .map_err(anyhow::Error::msg)?;
+
+        let client = rocket::local::asynchronous::Client::tracked(
+            rocket::build()
+                .mount("/", rocket::routes![hook_events])
+                .manage(hooks.clone())
+                .manage(test_tinycloud().await?),
+        )
+        .await?;
+        let response = client
+            .get(format!("/hooks/events?ticket={ticket}"))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        hooks.bus().publish(crate::hooks::WriteEvent {
+            event_type: "write".to_string(),
+            id: "epoch:1".to_string(),
+            space: "tinycloud:space".to_string(),
+            service: "kv".to_string(),
+            ability: "tinycloud.kv/put".to_string(),
+            path: Some("documents/1".to_string()),
+            actor: "did:key:actor".to_string(),
+            epoch: "epoch".to_string(),
+            event_index: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+        });
+
+        // The signed expiry is at most three seconds from the current wall
+        // clock. Do not poll the response body until that absolute deadline
+        // has passed, leaving both the timer and queued event ready together.
+        rocket::tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(
+            response.into_string().await.unwrap_or_default().is_empty(),
+            "queued events must not be emitted after the ticket deadline"
+        );
+        Ok(())
     }
 
     async fn test_tinycloud() -> Result<TinyCloud> {
