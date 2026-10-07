@@ -38,6 +38,11 @@ on:
         required: false
         type: boolean
         default: false
+      sql_identity_fence:
+        description: 'Keep SQL/DuckDB fenced in the Phala deploy (true until offline verification passes)'
+        required: true
+        type: boolean
+        default: true
       image_version:
         description: 'Manual image version to tag/deploy, without leading v. Must equal the tinycloud-node version in tinycloud-node-server/Cargo.toml at the selected ref. Defaults to the selected ref name.'
         required: false
@@ -306,6 +311,7 @@ jobs:
       - name: Preflight sealed runtime configuration
         env:
           TINYCLOUD_STORAGE__DATABASE: ${{ secrets.PROD_TINYCLOUD_DATABASE_URL }}
+          TINYCLOUD_DATABASE__WRITE_FENCE: ${{ inputs.sql_identity_fence }}
           TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_BASE64: ${{ secrets.PROD_TINYCLOUD_SHARE_TRUST_BUNDLE_BASE64 }}
           TINYCLOUD_SHARE_EMAIL__POSTGRES_TLS__SSLMODE: verify-full
           TINYCLOUD_KEYS__TYPE: Dstack
@@ -319,6 +325,7 @@ jobs:
           docker run --rm --network none --read-only --cap-drop ALL \
             --security-opt no-new-privileges \
             -e TINYCLOUD_STORAGE__DATABASE \
+            -e TINYCLOUD_DATABASE__WRITE_FENCE \
             -e TINYCLOUD_SHARE_EMAIL__ENABLED=true \
             -e TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_BASE64 \
             -e TINYCLOUD_SHARE_EMAIL__POSTGRES_TLS__SSLMODE \
@@ -340,6 +347,7 @@ jobs:
           PHALA_ENV_CLOUDFLARE_API_TOKEN: ${{ secrets.PROD_TINYCLOUD_CLOUDFLARE_API_TOKEN }}
           PHALA_ENV_DSTACK_GATEWAY_DOMAIN: ${{ secrets.PROD_TINYCLOUD_DSTACK_GATEWAY_DOMAIN }}
           PHALA_ENV_CERTBOT_EMAIL: ${{ secrets.PROD_TINYCLOUD_CERTBOT_EMAIL }}
+          PHALA_ENV_SQL_IDENTITY_FENCE: ${{ inputs.sql_identity_fence }}
         # Update the existing prod CVM (name: tinycloud-node) in the
         # Tiny Cloud workspace. The PHALA_CLOUD_API_KEY secret is
         # workspace-scoped and must be issued from that workspace.
@@ -360,6 +368,7 @@ jobs:
             PHALA_ENV_CLOUDFLARE_API_TOKEN
             PHALA_ENV_DSTACK_GATEWAY_DOMAIN
             PHALA_ENV_CERTBOT_EMAIL
+            PHALA_ENV_SQL_IDENTITY_FENCE
           )
 
           for var in "${required_vars[@]}"; do
@@ -382,6 +391,7 @@ jobs:
             printf 'CLOUDFLARE_API_TOKEN=%s\n' "$PHALA_ENV_CLOUDFLARE_API_TOKEN"
             printf 'DSTACK_GATEWAY_DOMAIN=%s\n' "$PHALA_ENV_DSTACK_GATEWAY_DOMAIN"
             printf 'CERTBOT_EMAIL=%s\n' "$PHALA_ENV_CERTBOT_EMAIL"
+            printf 'SQL_IDENTITY_FENCE=%s\n' "$PHALA_ENV_SQL_IDENTITY_FENCE"
             # SSH public keys authorized on the CVM (checked into the repo,
             # see dstack-authorized-keys). The Phala Cloud pre-launch script
             # writes DSTACK_AUTHORIZED_KEYS to /home/root/.ssh/authorized_keys

@@ -21,6 +21,7 @@ pub mod m20260726_000002_owner_share_enforcement_bytes;
 pub mod m20260731_000000_policy_v3;
 pub mod m20261005_000000_current_kv_sync_order;
 pub mod m20261007_000000_database_alias;
+pub mod m20261007_010000_database_identity_fence;
 
 pub struct Migrator;
 
@@ -50,6 +51,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260731_000000_policy_v3::Migration),
             Box::new(m20261005_000000_current_kv_sync_order::Migration),
             Box::new(m20261007_000000_database_alias::Migration),
+            Box::new(m20261007_010000_database_identity_fence::Migration),
         ]
     }
 }

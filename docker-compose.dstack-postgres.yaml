@@ -40,6 +40,9 @@ services:
       # headroom for admin/psql access, and raise it only alongside the
       # instance's own max_connections.
       TINYCLOUD_DATABASE__MAX_CONNECTIONS: "15"
+      # Required for every manual TC-780 deploy. Keep true through offline
+      # verification; only the final, explicitly reviewed redeploy sets false.
+      TINYCLOUD_DATABASE__WRITE_FENCE: "${SQL_IDENTITY_FENCE:?set true during cutover, false after verification}"
       TINYCLOUD_CORS: "true"
       # --- addressed sharing (TC-397) ------------------------------------
       #

@@ -7,15 +7,19 @@ use std::{
 };
 
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, DbErr, EntityTrait,
-    QueryFilter, QuerySelect, TransactionTrait,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr,
+    EntityTrait, QueryFilter, QuerySelect, TransactionTrait,
 };
 use sea_orm_migration::SchemaManager;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     database_identity::{legacy_duckdb_name, legacy_sql_name, logical_name},
-    models::{abilities, database_alias, database_artifact, database_legacy_artifact},
+    models::{
+        abilities, database_alias, database_artifact, database_identity_fence,
+        database_legacy_artifact,
+    },
     relationships::invoked_abilities,
     types::Resource,
 };
@@ -34,13 +38,30 @@ pub enum MigrationError {
     AlreadyAssigned,
     #[error("quarantined legacy artifact is unreachable without an explicit alias")]
     Quarantined,
+    #[error("SQL/DuckDB identity fence is not enabled in metadata")]
+    FenceRequired,
+    #[error("inventory cannot alias this legacy name: {0}")]
+    InvalidInventory(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("checkpoint failed: {0}")]
     Checkpoint(String),
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TableFingerprint {
+    pub name: String,
+    pub schema_hash: String,
+    pub row_count: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactFingerprint {
+    pub schema_hash: String,
+    pub tables: Vec<TableFingerprint>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InventoryItem {
     pub service: String,
     pub space: String,
@@ -48,8 +69,238 @@ pub struct InventoryItem {
     pub durable: bool,
     pub cached: bool,
     pub paths: Vec<Option<String>>,
-    pub classification: &'static str,
+    pub classification: String,
     pub collision: bool,
+    pub fingerprint: Option<ArtifactFingerprint>,
+}
+
+fn hash_schema(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn fingerprint_sqlite(path: &Path) -> Result<ArtifactFingerprint, MigrationError> {
+    let db =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| MigrationError::Checkpoint(e.to_string()))?;
+    let mut statement = db.prepare("SELECT name, COALESCE(sql, '') FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        .map_err(|e| MigrationError::Checkpoint(e.to_string()))?;
+    let schemas: Vec<(String, String)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| MigrationError::Checkpoint(e.to_string()))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| MigrationError::Checkpoint(e.to_string()))?;
+    let mut tables = Vec::new();
+    for (name, schema) in schemas {
+        let sql = format!("SELECT COUNT(*) FROM {}", quote_identifier(&name));
+        let row_count = db
+            .query_row(&sql, [], |row| row.get(0))
+            .map_err(|e| MigrationError::Checkpoint(e.to_string()))?;
+        tables.push(TableFingerprint {
+            name,
+            schema_hash: hash_schema(&schema),
+            row_count,
+        });
+    }
+    let schema_hash = hash_schema(
+        &serde_json::to_string(
+            &tables
+                .iter()
+                .map(|t| (&t.name, &t.schema_hash))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| MigrationError::Checkpoint(e.to_string()))?,
+    );
+    Ok(ArtifactFingerprint {
+        schema_hash,
+        tables,
+    })
+}
+
+#[cfg(feature = "duckdb")]
+fn fingerprint_duckdb(path: &Path) -> Result<ArtifactFingerprint, MigrationError> {
+    let db =
+        duckdb::Connection::open(path).map_err(|e| MigrationError::Checkpoint(e.to_string()))?;
+    let mut statement = db.prepare("SELECT table_schema, table_name FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema NOT IN ('information_schema', 'pg_catalog') ORDER BY table_schema, table_name")
+        .map_err(|e| MigrationError::Checkpoint(e.to_string()))?;
+    let names: Vec<(String, String)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| MigrationError::Checkpoint(e.to_string()))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| MigrationError::Checkpoint(e.to_string()))?;
+    let mut tables = Vec::new();
+    for (schema, name) in names {
+        let columns: Vec<(String, String, String)> = db.prepare("SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema=?1 AND table_name=?2 ORDER BY ordinal_position")
+            .map_err(|e| MigrationError::Checkpoint(e.to_string()))?
+            .query_map(duckdb::params![schema, name], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(|e| MigrationError::Checkpoint(e.to_string()))?
+            .collect::<Result<_, _>>().map_err(|e| MigrationError::Checkpoint(e.to_string()))?;
+        let sql = format!(
+            "SELECT COUNT(*) FROM {}.{}",
+            quote_identifier(&schema),
+            quote_identifier(&name)
+        );
+        let row_count = db
+            .query_row(&sql, [], |row| row.get(0))
+            .map_err(|e| MigrationError::Checkpoint(e.to_string()))?;
+        tables.push(TableFingerprint {
+            name: format!("{schema}.{name}"),
+            schema_hash: hash_schema(&format!("{columns:?}")),
+            row_count,
+        });
+    }
+    let schema_hash = hash_schema(
+        &serde_json::to_string(
+            &tables
+                .iter()
+                .map(|t| (&t.name, &t.schema_hash))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| MigrationError::Checkpoint(e.to_string()))?,
+    );
+    Ok(ArtifactFingerprint {
+        schema_hash,
+        tables,
+    })
+}
+
+async fn fingerprint<C: ConnectionTrait>(
+    conn: &C,
+    datadir: &Path,
+    service: &str,
+    space: &str,
+    name: &str,
+) -> Result<Option<ArtifactFingerprint>, MigrationError> {
+    let row = database_artifact::Entity::find_by_id((
+        service.to_owned(),
+        space.to_owned(),
+        name.to_owned(),
+    ))
+    .one(conn)
+    .await?;
+    let temp = tempfile::tempdir()?;
+    let suffix = if service == "sql" { ".db" } else { ".duckdb" };
+    let path = temp.path().join(format!("artifact{suffix}"));
+    if let Some(row) = row {
+        std::fs::write(&path, row.payload)?;
+        if let Some(delta) = row.delta_payload {
+            let wal = if service == "sql" {
+                format!("{}-wal", path.display())
+            } else {
+                format!("{}.wal", path.display())
+            };
+            std::fs::write(wal, delta)?;
+        }
+    } else {
+        let cache = datadir
+            .join(service)
+            .join(space)
+            .join(format!("{name}{suffix}"));
+        if !cache.exists() {
+            return Ok(None);
+        }
+        std::fs::copy(&cache, &path)?;
+        let wal_suffix = if service == "sql" { "-wal" } else { ".wal" };
+        let source_wal = format!("{}{wal_suffix}", cache.display());
+        if Path::new(&source_wal).exists() {
+            std::fs::copy(source_wal, format!("{}{wal_suffix}", path.display()))?;
+        }
+    }
+    if service == "sql" {
+        fingerprint_sqlite(&path).map(Some)
+    } else {
+        #[cfg(feature = "duckdb")]
+        {
+            fingerprint_duckdb(&path).map(Some)
+        }
+        #[cfg(not(feature = "duckdb"))]
+        {
+            Err(MigrationError::Checkpoint(
+                "rebuild the CLI with --features duckdb".into(),
+            ))
+        }
+    }
+}
+
+/// Only N2's exact on-disk spellings are excluded. A malformed prefix is
+/// still inventoried and fenced, rather than silently treated as migrated.
+pub fn is_digest_name(name: &str) -> bool {
+    name == "v2n"
+        || (name.len() == 67
+            && name.starts_with("v2d")
+            && name[3..]
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+}
+
+pub async fn set_fence(conn: &DatabaseConnection, enabled: bool) -> Result<(), MigrationError> {
+    if !enabled && has_unmigrated_artifacts(conn).await? {
+        return Err(MigrationError::FenceRequired);
+    }
+    let tx = conn.begin().await?;
+    database_identity_fence::Entity::delete_by_id(1)
+        .exec(&tx)
+        .await?;
+    database_identity_fence::ActiveModel {
+        id: Set(1),
+        enabled: Set(enabled),
+    }
+    .insert(&tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn metadata_fenced<C: ConnectionTrait>(conn: &C) -> Result<bool, MigrationError> {
+    Ok(database_identity_fence::Entity::find_by_id(1)
+        .one(conn)
+        .await?
+        .is_some_and(|row| row.enabled))
+}
+
+pub async fn require_fence<C: ConnectionTrait>(conn: &C) -> Result<(), MigrationError> {
+    if metadata_fenced(conn).await? {
+        Ok(())
+    } else {
+        Err(MigrationError::FenceRequired)
+    }
+}
+
+pub async fn has_unmigrated_artifacts<C: ConnectionTrait>(
+    conn: &C,
+) -> Result<bool, MigrationError> {
+    let registered: BTreeSet<(String, String, String)> = database_legacy_artifact::Entity::find()
+        .select_only()
+        .column(database_legacy_artifact::Column::Service)
+        .column(database_legacy_artifact::Column::Space)
+        .column(database_legacy_artifact::Column::PhysicalName)
+        .into_tuple::<(String, String, String)>()
+        .all(conn)
+        .await?
+        .into_iter()
+        .collect();
+    let rows: Vec<(String, String, String)> = database_artifact::Entity::find()
+        .filter(database_artifact::Column::Service.is_in(["sql", "duckdb"]))
+        .select_only()
+        .column(database_artifact::Column::Service)
+        .column(database_artifact::Column::Space)
+        .column(database_artifact::Column::Name)
+        .into_tuple()
+        .all(conn)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .any(|row| !is_digest_name(&row.2) && !registered.contains(&row)))
+}
+
+pub async fn effective_fence(
+    conn: &DatabaseConnection,
+    configured: bool,
+) -> Result<bool, MigrationError> {
+    Ok(configured || metadata_fenced(conn).await? || has_unmigrated_artifacts(conn).await?)
 }
 
 fn legacy_name(service: &str, path: Option<&str>) -> String {
@@ -87,7 +338,16 @@ pub async fn inventory(
     datadir: &Path,
 ) -> Result<Vec<InventoryItem>, MigrationError> {
     let aliases_exist = SchemaManager::new(conn).has_table("database_alias").await?;
+    inventory_in(conn, datadir, aliases_exist).await
+}
+
+async fn inventory_in<C: ConnectionTrait>(
+    conn: &C,
+    datadir: &Path,
+    aliases_exist: bool,
+) -> Result<Vec<InventoryItem>, MigrationError> {
     let rows: Vec<(String, String, String)> = database_artifact::Entity::find()
+        .filter(database_artifact::Column::Service.is_in(["sql", "duckdb"]))
         .select_only()
         .column(database_artifact::Column::Service)
         .column(database_artifact::Column::Space)
@@ -97,7 +357,7 @@ pub async fn inventory(
         .await?;
     let mut artifacts: BTreeMap<(String, String, String), (bool, bool)> = BTreeMap::new();
     for (service, space, name) in rows {
-        if service == "sql" || service == "duckdb" {
+        if !is_digest_name(&name) {
             artifacts.entry((service, space, name)).or_default().0 = true;
         }
     }
@@ -127,7 +387,7 @@ pub async fn inventory(
                         filename.strip_suffix(".duckdb.wal")
                     }
                 });
-                if let Some(name) = name {
+                if let Some(name) = name.filter(|name| !is_digest_name(name)) {
                     artifacts
                         .entry((service.to_owned(), space.clone(), name.to_owned()))
                         .or_default()
@@ -138,12 +398,22 @@ pub async fn inventory(
     }
     let mut history: BTreeMap<(String, String, String), BTreeSet<Option<String>>> = BTreeMap::new();
     let grants: Vec<Resource> = abilities::Entity::find()
+        .filter(
+            abilities::Column::Resource
+                .contains("/sql")
+                .or(abilities::Column::Resource.contains("/duckdb")),
+        )
         .select_only()
         .column(abilities::Column::Resource)
         .into_tuple()
         .all(conn)
         .await?;
     let invocations: Vec<Resource> = invoked_abilities::Entity::find()
+        .filter(
+            invoked_abilities::Column::Resource
+                .contains("/sql")
+                .or(invoked_abilities::Column::Resource.contains("/duckdb")),
+        )
         .select_only()
         .column(invoked_abilities::Column::Resource)
         .into_tuple()
@@ -185,21 +455,34 @@ pub async fn inventory(
             } else {
                 None
             };
+            let physical_alias = if aliases_exist {
+                database_alias::Entity::find()
+                    .filter(database_alias::Column::Service.eq(&service))
+                    .filter(database_alias::Column::Space.eq(&space))
+                    .filter(database_alias::Column::PhysicalName.eq(&physical_name))
+                    .one(conn)
+                    .await?
+            } else {
+                None
+            };
             artifact_exists(conn, &service, &space, &digest).await?
                 || existing.is_some_and(|alias| {
                     alias.physical_name != physical_name || alias.path != paths[0]
                 })
+                || physical_alias
+                    .is_some_and(|alias| alias.logical_name != digest || alias.path != paths[0])
         } else {
             false
         };
         result.push(InventoryItem {
+            fingerprint: fingerprint(conn, datadir, &service, &space, &physical_name).await?,
             service,
             space,
             physical_name,
             durable,
             cached,
             paths,
-            classification,
+            classification: classification.to_owned(),
             collision,
         });
     }
@@ -239,6 +522,25 @@ pub async fn resolve(
     // A short legacy spelling is reserved even though its N2 digest differs.
     // This makes attempted access to both mapped and unresolved old names an
     // explicit rejection, rather than allowing an apparently empty database.
+    let old_name = legacy_name(service, path);
+    if database_legacy_artifact::Entity::find_by_id((
+        service.to_owned(),
+        space.to_owned(),
+        old_name.clone(),
+    ))
+    .one(conn)
+    .await?
+    .is_some()
+        && database_alias::Entity::find()
+            .filter(database_alias::Column::Service.eq(service))
+            .filter(database_alias::Column::Space.eq(space))
+            .filter(database_alias::Column::PhysicalName.eq(&old_name))
+            .one(conn)
+            .await?
+            .is_none()
+    {
+        return Err(MigrationError::Quarantined);
+    }
     if let Some(short_name) = path.filter(|p| !p.contains('/')) {
         if database_legacy_artifact::Entity::find_by_id((
             service.to_owned(),
@@ -313,13 +615,71 @@ pub async fn apply_inventory(
     items: &[InventoryItem],
 ) -> Result<(), MigrationError> {
     let tx = conn.begin().await?;
+    apply_inventory_in(&tx, items).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub fn validate_inventory(items: &[InventoryItem]) -> Result<(), MigrationError> {
+    for item in items {
+        if item.collision {
+            return Err(MigrationError::Collision);
+        }
+        // Even an unresolved artifact must be called out during dry-run if
+        // no future authorized mapping could pass set_alias_in.
+        if item.physical_name.contains('/')
+            || item.physical_name.contains('\\')
+            || item.physical_name.contains('\0')
+            || item.physical_name.contains("..")
+        {
+            return Err(MigrationError::InvalidInventory(format!(
+                "{}/{}/{}",
+                item.service, item.space, item.physical_name
+            )));
+        }
+        if item.classification == "unique" && item.durable {
+            validate(
+                &item.service,
+                &item.space,
+                item.paths[0].as_deref(),
+                &item.physical_name,
+            )
+            .map_err(|_| {
+                MigrationError::InvalidInventory(format!(
+                    "{}/{}/{}",
+                    item.service, item.space, item.physical_name
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn apply(
+    conn: &DatabaseConnection,
+    datadir: &Path,
+) -> Result<Vec<InventoryItem>, MigrationError> {
+    let tx = conn.begin().await?;
+    require_fence(&tx).await?;
+    let items = inventory_in(&tx, datadir, true).await?;
+    validate_inventory(&items)?;
+    apply_inventory_in(&tx, &items).await?;
+    tx.commit().await?;
+    Ok(items)
+}
+
+async fn apply_inventory_in<C: ConnectionTrait>(
+    conn: &C,
+    items: &[InventoryItem],
+) -> Result<(), MigrationError> {
+    validate_inventory(items)?;
     for item in items {
         if database_legacy_artifact::Entity::find_by_id((
             item.service.clone(),
             item.space.clone(),
             item.physical_name.clone(),
         ))
-        .one(&tx)
+        .one(conn)
         .await?
         .is_none()
         {
@@ -328,14 +688,14 @@ pub async fn apply_inventory(
                 space: Set(item.space.clone()),
                 physical_name: Set(item.physical_name.clone()),
             }
-            .insert(&tx)
+            .insert(conn)
             .await?;
         }
     }
     for item in items {
         if item.classification == "unique" && item.durable {
             set_alias_in(
-                &tx,
+                conn,
                 &item.service,
                 &item.space,
                 item.paths[0].as_deref(),
@@ -344,7 +704,6 @@ pub async fn apply_inventory(
             .await?;
         }
     }
-    tx.commit().await?;
     Ok(())
 }
 
@@ -414,6 +773,7 @@ pub async fn set_alias(
     physical: &str,
 ) -> Result<(), MigrationError> {
     let tx = conn.begin().await?;
+    require_fence(&tx).await?;
     set_alias_in(&tx, service, space, path, physical).await?;
     tx.commit().await?;
     Ok(())
@@ -426,13 +786,16 @@ pub async fn clear_alias(
     path: Option<&str>,
 ) -> Result<(), MigrationError> {
     validate(service, space, path, &legacy_name(service, path))?;
+    let tx = conn.begin().await?;
+    require_fence(&tx).await?;
     database_alias::Entity::delete_by_id((
         service.to_owned(),
         space.to_owned(),
         logical_name(path),
     ))
-    .exec(conn)
+    .exec(&tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -507,6 +870,42 @@ pub fn checkpoint_cache(datadir: &Path) -> Result<(usize, usize), MigrationError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_exact_n2_names_are_excluded_and_invalid_legacy_names_fail_preview() {
+        let digest = logical_name(Some("web/threads"));
+        assert!(is_digest_name(&digest));
+        assert!(is_digest_name("v2n"));
+        assert!(!is_digest_name("v2dnot-a-digest"));
+        assert!(!is_digest_name("v2dABC"));
+        let jwk = tinycloud_auth::ssi::jwk::JWK::generate_ed25519().unwrap();
+        let did = tinycloud_auth::resolver::DID_METHODS
+            .generate(&jwk, "key")
+            .unwrap();
+        let space = tinycloud_auth::resource::SpaceId::new(did, "preview".parse().unwrap());
+        let item = InventoryItem {
+            service: "sql".into(),
+            space: space.to_string(),
+            physical_name: "notes..v2".into(),
+            durable: true,
+            cached: false,
+            paths: vec![Some("web/notes..v2".into())],
+            classification: "unique".into(),
+            collision: false,
+            fingerprint: None,
+        };
+        assert!(matches!(
+            validate_inventory(std::slice::from_ref(&item)),
+            Err(MigrationError::InvalidInventory(_))
+        ));
+        let mut unattributed = item;
+        unattributed.classification = "unattributed".into();
+        unattributed.paths.clear();
+        assert!(matches!(
+            validate_inventory(&[unattributed]),
+            Err(MigrationError::InvalidInventory(_))
+        ));
+    }
 
     #[test]
     fn checkpoint_scans_space_caches_without_renaming_files() {

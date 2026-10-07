@@ -1570,6 +1570,16 @@ async fn invoke_impl(
             .collect();
 
         if !sql_caps.is_empty() {
+            // Reject quarantined paths and an active cutover fence before
+            // verify_auth_admitted persists invoked_abilities. A rejected
+            // request must never become migration attribution evidence.
+            if database_migration::effective_fence(tinycloud.connection(), config.database.write_fence)
+                .await.map_err(identity_resolution_error)? {
+                return Err((Status::ServiceUnavailable, "SQL identity cutover fence is active".into()));
+            }
+            let (space, path, _) = select_database_scope(&sql_caps, "sql")?;
+            database_migration::resolve(tinycloud.connection(), "sql", &space.to_string(), path)
+                .await.map_err(identity_resolution_error)?;
             if policy_session_invocation {
                 invocation_replay_cache
                     .check_and_insert_invoker_nonce(admitted.invocation(), 60)
@@ -1621,6 +1631,13 @@ async fn invoke_impl(
                     .collect();
 
             if !duckdb_caps.is_empty() {
+                if database_migration::effective_fence(tinycloud.connection(), config.database.write_fence)
+                    .await.map_err(identity_resolution_error)? {
+                    return Err((Status::ServiceUnavailable, "DuckDB identity cutover fence is active".into()));
+                }
+                let (space, path, _) = select_database_scope(&duckdb_caps, "duckdb")?;
+                database_migration::resolve(tinycloud.connection(), "duckdb", &space.to_string(), path)
+                    .await.map_err(identity_resolution_error)?;
                 if policy_session_invocation {
                     invocation_replay_cache
                         .check_and_insert_invoker_nonce(admitted.invocation(), 60)
@@ -2241,7 +2258,10 @@ async fn handle_sql_invoke(
     config: &State<Config>,
     sql_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
-    if config.database.write_fence {
+    if database_migration::effective_fence(tinycloud.connection(), config.database.write_fence)
+        .await
+        .map_err(identity_resolution_error)?
+    {
         return Err((
             Status::ServiceUnavailable,
             "SQL identity cutover fence is active".into(),
@@ -2788,7 +2808,10 @@ async fn handle_duckdb_invoke(
     duckdb_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
     arrow_format: bool,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, (Status, String)> {
-    if config.database.write_fence {
+    if database_migration::effective_fence(tinycloud.connection(), config.database.write_fence)
+        .await
+        .map_err(identity_resolution_error)?
+    {
         return Err((
             Status::ServiceUnavailable,
             "DuckDB identity cutover fence is active".into(),

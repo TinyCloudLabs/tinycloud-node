@@ -3,6 +3,7 @@ pub mod actor;
 pub mod current_kv;
 pub mod database_alias;
 pub mod database_artifact;
+pub mod database_identity_fence;
 pub mod database_legacy_artifact;
 pub mod delegation;
 pub(crate) mod did_resolution;
