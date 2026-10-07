@@ -417,6 +417,18 @@ where
         invocation::verify_and_authorize(&self.conn, invocation, now).await
     }
 
+    /// [`Self::authorize_invocation`] for an invocation whose signature and
+    /// lifetime cap were already checked by [`crate::AdmittedInvocation::admit`]:
+    /// re-checks signed time validity and authorizes the persisted delegation
+    /// chain, again without recording anything or touching the data plane.
+    pub async fn authorize_admitted(
+        &self,
+        invocation: &crate::AdmittedInvocation,
+        now: OffsetDateTime,
+    ) -> Result<(), crate::models::invocation::Error> {
+        invocation::authorize_admitted(&self.conn, &invocation.invocation().0, now, None).await
+    }
+
     /// Load and reparse a delegation from its exact signed Authorization
     /// bytes. The relational row is returned only so callers can compare all
     /// projections against the signed source of truth.
