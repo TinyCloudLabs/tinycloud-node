@@ -193,6 +193,48 @@ impl AuthGraphSnapshot {
         self.abilities.get(id).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    /// Whether one cited proof reaches a root through nodes whose abilities
+    /// all cover the invoked capability. Results are memoized across branches
+    /// and cited proofs; cycles and missing rows fail closed.
+    pub(crate) fn has_covering_chain(
+        &self,
+        starts: impl IntoIterator<Item = Hash>,
+        covers: impl Fn(&abilities::Model) -> bool,
+    ) -> bool {
+        fn visit<F: Fn(&abilities::Model) -> bool>(
+            graph: &AuthGraphSnapshot,
+            id: Hash,
+            covers: &F,
+            memo: &mut HashMap<Hash, bool>,
+            visiting: &mut HashSet<Hash>,
+        ) -> bool {
+            if let Some(&valid) = memo.get(&id) {
+                return valid;
+            }
+            if visiting.contains(&id) || memo.len() + visiting.len() >= MAX_CHAIN_TRAVERSAL_NODES {
+                return false;
+            }
+            visiting.insert(id);
+            let valid = graph.delegation(&id).is_some()
+                && graph.abilities(&id).iter().any(covers)
+                && graph.parents.get(&id).is_none_or(|parents| {
+                    parents.is_empty()
+                        || parents
+                            .iter()
+                            .any(|parent| visit(graph, *parent, covers, memo, visiting))
+                });
+            visiting.remove(&id);
+            memo.insert(id, valid);
+            valid
+        }
+
+        let mut memo = HashMap::new();
+        let mut visiting = HashSet::new();
+        starts
+            .into_iter()
+            .any(|id| visit(self, id, &covers, &mut memo, &mut visiting))
+    }
+
     pub(crate) fn is_revoked(&self, id: &Hash) -> bool {
         self.revoked.contains(id)
     }

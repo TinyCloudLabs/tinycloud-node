@@ -3228,10 +3228,9 @@ fn missing_database_admin_capability_error(
         "duckdb" => "tinycloud.duckdb/admin",
         _ => "tinycloud.kv/put",
     };
-    let resource_path = path.unwrap_or("default").parse().unwrap();
     let resource = Resource::TinyCloud(space.clone().to_resource(
         service.parse().unwrap(),
-        Some(resource_path),
+        path.map(|path| path.parse().unwrap()),
         None,
         None,
     ));
@@ -3753,13 +3752,13 @@ mod tests {
     }
 
     #[test]
-    fn pathless_admin_error_names_logical_default_resource() {
+    fn pathless_admin_error_names_pathless_resource() {
         let space = test_space_id("secrets");
         let (status, message) = missing_database_admin_capability_error(&space, None, "sql");
         assert_eq!(status, Status::Unauthorized);
         assert_eq!(
             message,
-            format!("Unauthorized Action: {space}/sql/default / tinycloud.sql/admin")
+            format!("Unauthorized Action: {space}/sql / tinycloud.sql/admin")
         );
     }
 

@@ -444,13 +444,8 @@ async fn validate<C: ConnectionTrait>(
                             )
                             && caveats_contain_child(&ability.caveats, &c.caveats).is_ok()
                     };
-                    let valid_chain = parents.iter().any(|(parent, direct_abilities)| {
-                        direct_abilities.iter().any(&covers)
-                            && graph
-                                .chain_ids_from(&parent.id)
-                                .iter()
-                                .all(|id| graph.abilities(id).iter().any(&covers))
-                    });
+                    let valid_chain = graph
+                        .has_covering_chain(parents.iter().map(|(parent, _)| parent.id), covers);
                     if !valid_chain {
                         return Err(InvocationError::UnauthorizedAction(
                             c.resource.clone(),

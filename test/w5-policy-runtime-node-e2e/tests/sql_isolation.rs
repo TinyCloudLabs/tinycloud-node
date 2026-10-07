@@ -612,6 +612,116 @@ async fn pre_n2_descendant_delegation_cannot_outgrow_exact_ancestor() -> Result<
     Ok(())
 }
 
+/// A leaf with capabilities for two databases can cite one grant for each.
+/// Invoking either capability needs one covering path through its own grant,
+/// even though the other cited parent does not cover that database.
+#[tokio::test]
+async fn mixed_parent_delegation_keeps_each_database_capability() -> Result<()> {
+    for service in ["sql", "duckdb"] {
+        let engine = regression_engine(service)?;
+        let tempdir = TempDir::new()?;
+        let (owner_jwk, owner_did, owner_vm, space_id) = space_identity(service)?;
+        let (holder_jwk, holder_did, holder_vm) = holder_identity()?;
+        let (client, conn) = boot_node(
+            &tempdir,
+            &space_id,
+            &[owner_did.clone(), holder_did.clone()],
+        )
+        .await?;
+        let resources = [
+            db_resource(&space_id, service, "appA/a")?,
+            db_resource(&space_id, service, "appA/b")?,
+        ];
+        let root_ids = [
+            tinycloud_core::hash::hash(format!("{service}-mixed-a").as_bytes()),
+            tinycloud_core::hash::hash(format!("{service}-mixed-b").as_bytes()),
+        ];
+        let leaf_id = tinycloud_core::hash::hash(format!("{service}-mixed-leaf").as_bytes());
+
+        for (index, resource) in resources.iter().enumerate() {
+            let (status, body) = invoke_json(
+                &client,
+                invocation(
+                    &owner_jwk,
+                    &owner_did,
+                    &owner_vm,
+                    vec![],
+                    resource,
+                    engine.write_ability,
+                    &format!(
+                        "urn:uuid:00000000-0000-4000-8000-{}2{index}",
+                        engine.nonce_prefix
+                    ),
+                )?,
+                &(engine.write_body)(&format!("mixed-row-{index}")),
+            )
+            .await;
+            assert_eq!(status, Status::Ok, "{service}: {body}");
+
+            persist_grant(
+                &conn,
+                root_ids[index],
+                &owner_did,
+                &holder_did,
+                resource,
+                engine.read_ability,
+            )
+            .await?;
+        }
+        persist_grant(
+            &conn,
+            leaf_id,
+            &holder_did,
+            &holder_did,
+            &resources[0],
+            engine.read_ability,
+        )
+        .await?;
+        abilities::ActiveModel {
+            delegation: Set(leaf_id),
+            resource: Set(Resource::TinyCloud(resources[1].clone())),
+            ability: Set(Ability::try_from(engine.read_ability.to_string()).unwrap()),
+            caveats: Set(Caveats(BTreeMap::new())),
+        }
+        .insert(&conn)
+        .await?;
+        for root_id in root_ids {
+            parent_delegations::ActiveModel {
+                parent: Set(root_id),
+                child: Set(leaf_id),
+            }
+            .insert(&conn)
+            .await?;
+        }
+
+        for (index, resource) in resources.iter().enumerate() {
+            let (status, body) = invoke_json(
+                &client,
+                invocation(
+                    &holder_jwk,
+                    &holder_did,
+                    &holder_vm,
+                    vec![leaf_id.to_cid(0x55)],
+                    resource,
+                    engine.read_ability,
+                    &format!(
+                        "urn:uuid:00000000-0000-4000-8000-{}3{index}",
+                        engine.nonce_prefix
+                    ),
+                )?,
+                &engine.read_body,
+            )
+            .await;
+            assert_eq!(status, Status::Ok, "{service}: {body}");
+            assert!(
+                body.contains(&format!("mixed-row-{index}")),
+                "{service}: {body}"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn long_database_paths_work_through_invoke_for_both_engines() -> Result<()> {
     for service in ["sql", "duckdb"] {
