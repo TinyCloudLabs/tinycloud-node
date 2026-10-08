@@ -2975,6 +2975,111 @@ mod tests {
         assert_eq!(DataPlaneError::from(error), DataPlaneError::Storage);
     }
 
+    #[tokio::test]
+    async fn named_sql_store_execute_named_reads_migrated_alias() {
+        use tinycloud_core::{
+            database_artifacts::{
+                ArtifactExpectation, DatabaseArtifactRepository, SeaOrmDatabaseArtifactRepository,
+            },
+            models::database_legacy_artifact,
+            sea_orm::{ActiveModelTrait, ActiveValue::Set, Database},
+            sea_orm_migration::MigratorTrait,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fixture.sqlite");
+        {
+            let db = rusqlite::Connection::open(&db_path).unwrap();
+            db.execute_batch("CREATE TABLE t(v TEXT); INSERT INTO t(v) VALUES ('aliased');")
+                .unwrap();
+        }
+        let conn = Database::connect(format!(
+            "sqlite:{}?mode=rwc",
+            dir.path().join("caps.db").display()
+        ))
+        .await
+        .unwrap();
+        tinycloud_core::migrations::Migrator::up(&conn, None)
+            .await
+            .unwrap();
+        let did = tinycloud_auth::resolver::DID_METHODS
+            .generate(
+                &tinycloud_auth::ssi::jwk::JWK::generate_ed25519().unwrap(),
+                "key",
+            )
+            .unwrap();
+        let source = SqlReadSource {
+            space: Did::parse(did.to_string()).unwrap(),
+            database: tinycloud_core::share_email::DatabaseName::parse("content_db").unwrap(),
+            path: Path::parse("web/threads").unwrap(),
+            statement: tinycloud_core::share_email::NamedStatement::parse("read_threads").unwrap(),
+            arguments: Default::default(),
+            arguments_digest: tinycloud_core::share_email::Sha256Digest::from_bytes([0; 32]),
+        };
+        let space = tinycloud_auth::resource::SpaceId::new(
+            did.to_string().parse().unwrap(),
+            "test".parse().unwrap(),
+        );
+        let physical = SqlService::legacy_db_name_from_path(Some("web/threads"));
+        let repo = Arc::new(SeaOrmDatabaseArtifactRepository::new(conn.clone()));
+        repo.save(
+            "sql",
+            &space.to_string(),
+            &physical,
+            std::fs::read(db_path).unwrap(),
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+        tinycloud_core::database_migration::set_fence(&conn, true)
+            .await
+            .unwrap();
+        database_legacy_artifact::ActiveModel {
+            service: Set("sql".into()),
+            space: Set(space.to_string()),
+            physical_name: Set(physical.clone()),
+        }
+        .insert(&conn)
+        .await
+        .unwrap();
+        tinycloud_core::database_migration::set_alias(
+            &conn,
+            "sql",
+            &space.to_string(),
+            Some("web/threads"),
+            &physical,
+        )
+        .await
+        .unwrap();
+        tinycloud_core::database_migration::set_fence(&conn, false)
+            .await
+            .unwrap();
+
+        let store = SqlNamedStore {
+            service: Arc::new(SqlService::new(
+                dir.path().join("sql").display().to_string(),
+                0,
+                repo,
+            )),
+            space_name: "test".into(),
+            conn,
+            write_fence: false,
+            fence_cache: Arc::new(Default::default()),
+        };
+        let pinned = PinnedNamedStatement {
+            database: source.database.clone(),
+            path: source.path.clone(),
+            statement: tinycloud_core::policy_capability::sql_caveat::ConstrainedStatement {
+                name: source.statement.as_str().to_owned(),
+                sql: "SELECT v FROM t".into(),
+                fixed_params: vec![],
+            },
+        };
+        let rows = store.execute_named(&source, &pinned).await.unwrap();
+        assert_eq!(rows.columns, ["v"]);
+        assert_eq!(rows.rows, [[SqlValue::Text("aliased".into())]]);
+    }
+
     #[test]
     fn named_sql_source_uses_only_canonical_uri_paths() {
         let space: tinycloud_auth::resource::SpaceId =

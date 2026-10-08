@@ -2,11 +2,11 @@
 
 ## [Unreleased]
 
-## [1.20.0] - 2026-10-07
+## [1.20.0] - 2026-10-08
 
 - Isolate SQL and DuckDB databases by full resource path, require exact non-slash database grants and covering delegation chains, and keep hook and share-email SQL reads within the authorized identity (TC-780).
 - Add a write-fenced migration from legacy physical names to quarantined aliases, with a preflight migration inventory, transaction-time fingerprint verification, and an explicit cutover runbook (TC-780).
-- Keep the production release line's meeting guard, TC-541 hotfix and KV-sync migrations; add the TC-780 migrations after them. Gate image publishing and require manual digest promotion for the cutover (TC-780).
+- Keep the production release line's meeting guard, TC-541 and TC-730/TC-815 hook fixes, and KV-sync migrations; add the TC-780 migrations after them. Gate image publishing and require manual digest promotion for the cutover (TC-780).
 
 ## [1.19.2] - 2026-10-07
 

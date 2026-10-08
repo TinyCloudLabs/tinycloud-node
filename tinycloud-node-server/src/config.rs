@@ -1362,6 +1362,21 @@ mod tests {
 
     #[cfg(not(feature = "mounted-fixture"))]
     #[tokio::test]
+    async fn legacy_email_origin_is_startup_fatal() {
+        let mut config = enabled_config();
+        let mut document = bundle_document(&config);
+        document["emailOrigin"] = serde_json::Value::String("https://email.tinycloud.xyz".into());
+        let file = NamedTempFile::new().expect("temporary trust bundle");
+        fs::write(file.path(), serde_json::to_vec(&document).unwrap()).expect("trust bundle write");
+        config.trust_bundle_path = Some(file.path().display().to_string());
+        assert_eq!(
+            config.resolve_trust_bundle(),
+            Err("share email trust bundle is inconsistent")
+        );
+    }
+
+    #[cfg(not(feature = "mounted-fixture"))]
+    #[tokio::test]
     async fn production_rejects_unreadable_and_malformed_trust_bundles() {
         let mut config = enabled_config();
         config.trust_bundle_path = Some("/tmp/tinycloud-share-email-missing-bundle".into());
@@ -1466,8 +1481,6 @@ mod tests {
             "https://operator:secret@email.tinycloud.xyz",
             "https://email.tinycloud.xyz:8443",
             "email.tinycloud.xyz",
-            // Correct shape, but an unreviewed production audience.
-            "https://email.tinycloud.xyz",
             "https://api.share.tinycloud.xyz",
             "",
             // Caught by the placeholder scan rather than the origin shape.
@@ -1792,6 +1805,18 @@ mod tests {
         assert!(
             config.validate().is_err(),
             "full legacy v1 validation must still require authority_material_path"
+        );
+    }
+
+    #[cfg(not(feature = "mounted-fixture"))]
+    #[tokio::test]
+    async fn v2_preflight_rejects_postgres_without_verify_full() {
+        let mut config = enabled_config();
+        config.authority_material_path = None;
+        let _trust_bundle = install_bundle(&mut config);
+        assert_eq!(
+            config.validate_for_v2_database("postgresql://user:password@db.example/share"),
+            Err("share email PostgreSQL requires sslmode=verify-full")
         );
     }
 }
