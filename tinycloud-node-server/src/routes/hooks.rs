@@ -20,7 +20,7 @@ use rocket::{
     State,
 };
 use serde::{Deserialize, Serialize};
-use std::{net::IpAddr, time::Duration, time::Instant};
+use std::{future::Future, net::IpAddr, time::Duration, time::Instant};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_core::{
     events::Invocation,
@@ -233,12 +233,13 @@ async fn mint_hook_ticket(
     }
 
     let claims = HookTicketClaims {
-        v: 1,
+        v: 2,
         sub: invocation.invoker.clone(),
         scopes: request.subscriptions,
         iat: now.unix_timestamp(),
         exp,
         parent_exp,
+        authorizing_delegations: invocation.parents.clone(),
     };
     let ticket = hooks
         .sign_ticket(&claims)
@@ -251,38 +252,86 @@ async fn mint_hook_ticket(
     Ok(HookTicketResponse { ticket, expires_at })
 }
 
+async fn hook_stream_deadline<F, Fut, Clock>(
+    claims: &HookTicketClaims,
+    max_ticket_ttl_seconds: u64,
+    check_authority: F,
+    mut now: Clock,
+) -> Result<rocket::tokio::time::Instant, (Status, String)>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<(), (Status, String)>>,
+    Clock: FnMut() -> OffsetDateTime,
+{
+    let initial_now = now();
+    let deadline = claims
+        .exp
+        .min(claims.parent_exp)
+        .min(initial_now.unix_timestamp() + max_ticket_ttl_seconds as i64);
+    let expired = || (Status::Unauthorized, "hook ticket expired".to_string());
+    if deadline <= initial_now.unix_timestamp() {
+        return Err(expired());
+    }
+    let deadline_at = OffsetDateTime::from_unix_timestamp(deadline)
+        .map_err(|error| (Status::InternalServerError, error.to_string()))?;
+
+    check_authority().await?;
+
+    let stream_now = now();
+    if deadline_at <= stream_now {
+        return Err(expired());
+    }
+    let remaining = deadline_at - stream_now;
+    let remaining = Duration::new(
+        remaining.whole_seconds() as u64,
+        remaining.subsec_nanoseconds() as u32,
+    );
+    Ok(rocket::tokio::time::Instant::now() + remaining)
+}
+
 #[get("/hooks/events?<ticket>")]
 pub async fn hook_events<'r>(
     ticket: &'r str,
     hooks: &'r State<HookRuntime>,
+    tinycloud: &'r State<TinyCloud>,
 ) -> Result<EventStream![Event + 'r], (Status, String)> {
     let claims = hooks
         .verify_ticket(ticket)
         .map_err(|e| (Status::Unauthorized, e))?;
+    let stream_deadline = hook_stream_deadline(
+        &claims,
+        hooks.config().max_ticket_ttl_seconds,
+        || async {
+            if tinycloud
+                .delegation_chains_unrevoked(&claims.authorizing_delegations)
+                .await
+                .map_err(|error| (Status::InternalServerError, error.to_string()))?
+            {
+                Ok(())
+            } else {
+                Err((
+                    Status::Unauthorized,
+                    "hook ticket authority revoked".to_string(),
+                ))
+            }
+        },
+        OffsetDateTime::now_utc,
+    )
+    .await?;
     let lease = hooks
         .try_acquire_stream()
         .map_err(|e| (Status::TooManyRequests, e))?;
 
-    let now = OffsetDateTime::now_utc().unix_timestamp();
-    let deadline = claims
-        .exp
-        .min(claims.parent_exp)
-        .min(now + hooks.config().max_ticket_ttl_seconds as i64);
-
-    if deadline <= now {
-        return Err((Status::Unauthorized, "hook ticket expired".to_string()));
-    }
-
     let mut receiver = hooks.bus().subscribe();
-    let sleep_duration = Duration::from_secs((deadline - now) as u64);
 
     Ok(EventStream! {
         let _lease = lease;
-        let deadline_sleep = rocket::tokio::time::sleep(sleep_duration);
+        let deadline_sleep = rocket::tokio::time::sleep_until(stream_deadline);
         rocket::tokio::pin!(deadline_sleep);
 
         loop {
             rocket::tokio::select! {
+                biased;
                 _ = &mut deadline_sleep => {
                     break;
                 }
@@ -461,9 +510,8 @@ pub async fn list_webhooks(
         .await
         .map_err(|e| (Status::InternalServerError, e.to_string()))?;
 
-    // The query's prefix filter is an unescaped SQL `LIKE`: `_` and `%` match
-    // any character and SQLite ignores ASCII case, so it can return other
-    // subscribers' rows. Keep only rows the authorization rule itself covers.
+    // The database predicate is byte-exact and segment-aware. Keep this
+    // authorization post-filter as defense in depth.
     let requested_path = hook_scope_path(&requested_scope.service, normalized_prefix.as_deref());
     rows.into_iter()
         .filter(|row| {
@@ -879,6 +927,108 @@ mod tests {
 
     fn test_hook_runtime() -> HookRuntime {
         HookRuntime::new(HooksConfig::default(), [7u8; 32])
+    }
+
+    #[tokio::test]
+    async fn hook_ticket_expiring_during_authority_lookup_is_rejected() {
+        use std::sync::{
+            atomic::{AtomicI64, Ordering},
+            Arc,
+        };
+
+        let clock = Arc::new(AtomicI64::new(100));
+        let authority_clock = Arc::clone(&clock);
+        let request_clock = Arc::clone(&clock);
+        let claims = HookTicketClaims {
+            v: 2,
+            sub: "did:key:subscriber".to_string(),
+            scopes: Vec::new(),
+            iat: 100,
+            exp: 101,
+            parent_exp: 101,
+            authorizing_delegations: Vec::new(),
+        };
+
+        let result = hook_stream_deadline(
+            &claims,
+            300,
+            move || async move {
+                authority_clock.store(102, Ordering::Relaxed);
+                Ok(())
+            },
+            move || {
+                OffsetDateTime::from_unix_timestamp(request_clock.load(Ordering::Relaxed)).unwrap()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            result.unwrap_err(),
+            (Status::Unauthorized, "hook ticket expired".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_event_stream_does_not_emit_queued_events_after_expiry() -> Result<()> {
+        let hooks = test_hook_runtime();
+        let client = rocket::local::asynchronous::Client::tracked(
+            rocket::build()
+                .mount("/", rocket::routes![hook_events])
+                .manage(hooks.clone())
+                .manage(test_tinycloud().await?),
+        )
+        .await?;
+        rocket::tokio::time::pause();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let ticket = hooks
+            .sign_ticket(&HookTicketClaims {
+                v: 2,
+                sub: "did:key:subscriber".to_string(),
+                scopes: vec![HookSubscription {
+                    space: "tinycloud:space".to_string(),
+                    service: "kv".to_string(),
+                    path_prefix: None,
+                    abilities: Vec::new(),
+                }],
+                iat: now,
+                exp: now + 10,
+                parent_exp: now + 10,
+                authorizing_delegations: Vec::new(),
+            })
+            .map_err(anyhow::Error::msg)?;
+
+        let mut responses = Vec::with_capacity(64);
+        for _ in 0..64 {
+            let response = client
+                .get(format!("/hooks/events?ticket={ticket}"))
+                .dispatch()
+                .await;
+            assert_eq!(response.status(), Status::Ok);
+            responses.push(response);
+        }
+        hooks.bus().publish(crate::hooks::WriteEvent {
+            event_type: "write".to_string(),
+            id: "epoch:1".to_string(),
+            space: "tinycloud:space".to_string(),
+            service: "kv".to_string(),
+            ability: "tinycloud.kv/put".to_string(),
+            path: Some("documents/1".to_string()),
+            database_path: None,
+            table_name: None,
+            actor: "did:key:actor".to_string(),
+            epoch: "epoch".to_string(),
+            event_index: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+        });
+
+        rocket::tokio::time::advance(Duration::from_secs(11)).await;
+        for response in responses {
+            assert!(
+                response.into_string().await.unwrap_or_default().is_empty(),
+                "queued events must not be emitted after the ticket deadline"
+            );
+        }
+        Ok(())
     }
 
     async fn test_tinycloud() -> Result<TinyCloud> {
@@ -1396,6 +1546,7 @@ mod tests {
                 "/",
                 rocket::routes![
                     create_hook_ticket,
+                    hook_events,
                     create_webhook,
                     list_webhooks,
                     delete_webhook
@@ -1976,7 +2127,7 @@ mod tests {
         );
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let claims = HookTicketClaims {
-            v: 1,
+            v: 2,
             sub: "did:key:subscriber".to_string(),
             scopes: vec![HookSubscription {
                 space: "tinycloud:space".to_string(),
@@ -1987,6 +2138,7 @@ mod tests {
             iat: now,
             exp: now + 60,
             parent_exp: now + 60,
+            authorizing_delegations: Vec::new(),
         };
         let stale = pre_fix.sign_ticket(&claims).unwrap();
         assert!(current
@@ -1996,7 +2148,8 @@ mod tests {
         let client = rocket::local::asynchronous::Client::tracked(
             rocket::build()
                 .mount("/", rocket::routes![hook_events])
-                .manage(current),
+                .manage(current)
+                .manage(test_tinycloud().await?),
         )
         .await?;
         let response = client
@@ -2067,6 +2220,7 @@ mod tests {
         }
         .insert(&fixture.db)
         .await?;
+
         let (status, body) = fixture
             .ticket(
                 fixture.session_header(&claim)?,
@@ -2076,6 +2230,199 @@ mod tests {
             )
             .await;
         assert_eq!(status, Status::Unauthorized, "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hook_stream_rejects_ticket_after_authority_revocation() -> Result<()> {
+        use tinycloud_core::{
+            models::revocation,
+            sea_orm::{ActiveModelTrait, ActiveValue::Set},
+        };
+
+        let fixture =
+            hook_route_fixture(&[("hooks", "kv/documents", "tinycloud.hooks/subscribe")]).await?;
+        let claim = [(fixture.hooks("kv/documents")?, SUBSCRIBE)];
+
+        let (status, live_body) = fixture
+            .ticket(
+                fixture.session_header(&claim)?,
+                &fixture.space,
+                "kv",
+                "documents",
+            )
+            .await;
+        assert_eq!(status, Status::Ok, "{live_body}");
+        let live_ticket: serde_json::Value = serde_json::from_str(&live_body)?;
+        let live_response = fixture
+            .client
+            .get(format!(
+                "/hooks/events?ticket={}",
+                live_ticket["ticket"].as_str().expect("signed ticket")
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(live_response.status(), Status::Ok);
+
+        let (status, revoked_body) = fixture
+            .ticket(
+                fixture.session_header(&claim)?,
+                &fixture.space,
+                "kv",
+                "documents",
+            )
+            .await;
+        assert_eq!(status, Status::Ok, "{revoked_body}");
+        let revoked_ticket: serde_json::Value = serde_json::from_str(&revoked_body)?;
+        revocation::ActiveModel {
+            id: Set(tinycloud_core::hash::hash(b"revoke-hooks-stream")),
+            revoker: Set(did_of(&fixture.owner.1).to_string()),
+            revoked: Set(Hash::from(fixture.session_proof)),
+            serialization: Set(b"revoke-hooks-stream".to_vec()),
+            revoked_at: Set(Some(OffsetDateTime::now_utc())),
+        }
+        .insert(&fixture.db)
+        .await?;
+        let response = fixture
+            .client
+            .get(format!(
+                "/hooks/events?ticket={}",
+                revoked_ticket["ticket"].as_str().expect("signed ticket")
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Unauthorized);
+        assert_eq!(
+            response.into_string().await.as_deref(),
+            Some("hook ticket authority revoked")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hook_stream_rejects_revoked_shared_ancestor_at_traversal_boundary() -> Result<()> {
+        use tinycloud_core::{
+            models::revocation,
+            relationships::parent_delegations,
+            sea_orm::{ActiveModelTrait, ActiveValue::Set},
+        };
+
+        let fixture = hook_route_fixture(&[]).await?;
+        let mut ids: Vec<_> = (0..tinycloud_core::models::revocation::MAX_CHAIN_TRAVERSAL_NODES)
+            .map(|index| {
+                tinycloud_core::hash::hash(
+                    format!("hook-shared-ancestor-boundary-{index}").as_bytes(),
+                )
+            })
+            .collect();
+        ids.sort_by(|left, right| left.as_ref().cmp(right.as_ref()));
+        let (roots, hidden_ancestor) =
+            ids.split_at(tinycloud_core::models::revocation::MAX_CHAIN_TRAVERSAL_NODES - 1);
+        for id in &ids {
+            delegation::ActiveModel {
+                id: Set(*id),
+                delegator: Set(did_of(&fixture.owner.1).to_string()),
+                delegatee: Set(did_of(&fixture.session.1).to_string()),
+                expiry: Set(None),
+                issued_at: Set(None),
+                not_before: Set(None),
+                facts: Set(None),
+                serialization: Set(id.as_ref().to_vec()),
+            }
+            .insert(&fixture.db)
+            .await?;
+        }
+        for parent in [
+            roots[tinycloud_core::models::revocation::MAX_CHAIN_TRAVERSAL_NODES - 3],
+            roots[tinycloud_core::models::revocation::MAX_CHAIN_TRAVERSAL_NODES - 2],
+            hidden_ancestor[0],
+        ] {
+            parent_delegations::ActiveModel {
+                child: Set(roots[0]),
+                parent: Set(parent),
+            }
+            .insert(&fixture.db)
+            .await?;
+        }
+        revocation::ActiveModel {
+            id: Set(tinycloud_core::hash::hash(b"revoke-hidden-stream-ancestor")),
+            revoker: Set(did_of(&fixture.owner.1).to_string()),
+            revoked: Set(hidden_ancestor[0]),
+            serialization: Set(b"revoke-hidden-stream-ancestor".to_vec()),
+            revoked_at: Set(Some(OffsetDateTime::now_utc())),
+        }
+        .insert(&fixture.db)
+        .await?;
+
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let claims = HookTicketClaims {
+            v: 2,
+            sub: "did:key:subscriber".to_string(),
+            scopes: vec![HookSubscription {
+                space: fixture.space.to_string(),
+                service: "kv".to_string(),
+                path_prefix: Some("documents".to_string()),
+                abilities: Vec::new(),
+            }],
+            iat: now,
+            exp: now + 60,
+            parent_exp: now + 60,
+            authorizing_delegations: roots.iter().map(|id| id.to_cid(0x55)).collect(),
+        };
+        let ticket = test_hook_runtime()
+            .sign_ticket(&claims)
+            .map_err(anyhow::Error::msg)?;
+        let response = fixture
+            .client
+            .get(format!("/hooks/events?ticket={ticket}"))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Unauthorized);
+        assert_eq!(
+            response.into_string().await.as_deref(),
+            Some("hook ticket authority revoked")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_hook_ticket_skips_delegation_revocation_lookup() -> Result<()> {
+        let fixture = hook_route_fixture(&[]).await?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let authorizing_delegations = (0
+            ..=tinycloud_core::models::revocation::MAX_CHAIN_TRAVERSAL_NODES)
+            .map(|index| {
+                tinycloud_core::hash::hash(format!("expired-ticket-root-{index}").as_bytes())
+                    .to_cid(0x55)
+            })
+            .collect();
+        let ticket = test_hook_runtime()
+            .sign_ticket(&HookTicketClaims {
+                v: 2,
+                sub: "did:key:subscriber".to_string(),
+                scopes: vec![HookSubscription {
+                    space: fixture.space.to_string(),
+                    service: "kv".to_string(),
+                    path_prefix: Some("documents".to_string()),
+                    abilities: Vec::new(),
+                }],
+                iat: now - 120,
+                exp: now - 60,
+                parent_exp: now - 60,
+                authorizing_delegations,
+            })
+            .map_err(anyhow::Error::msg)?;
+
+        let response = fixture
+            .client
+            .get(format!("/hooks/events?ticket={ticket}"))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Unauthorized);
+        assert_eq!(
+            response.into_string().await.as_deref(),
+            Some("hook ticket expired")
+        );
         Ok(())
     }
 

@@ -111,6 +111,7 @@ features = ["sqlite", "postgres", "mysql", "tokio", "verification-count-test-hoo
 
 [dev-dependencies]
 rusqlite.workspace = true
+tokio = { version = "1", features = ["test-util"] }
 axum = { version = "0.7", features = ["ws"] }
 bs58 = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
