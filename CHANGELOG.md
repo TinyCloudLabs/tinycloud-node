@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [1.19.2] - 2026-10-07
+
+- Re-check hook-ticket delegation revocation and stream expiry at open, prioritize the absolute deadline over queued events, and match literal subscription prefixes; tickets minted under the prior v2 key context must be re-minted (TC-730).
+- Bound proof-DAG ancestor traversal to 64 nodes with fixed-size parent pages and fail closed when the closure exceeds the limit (TC-815).
+
 ## [1.19.1] - 2026-10-06
 
 - Include the TC-541 hooks authorization, replay-safety and subscription-reset fixes, including the `m20261005_000000_deactivate_hook_subscriptions` migration.
