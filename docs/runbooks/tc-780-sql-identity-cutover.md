@@ -234,22 +234,52 @@ Before step 2, confirm the dispatch gate and frozen release ref. These checks mu
 )
 ```
 
-Just before step 2, time one **read-only** `dry-run` against the still-serving production database. It selects artifact metadata and `resource`, never artifact bytes. This captures PlanetScale latency as well as row count; do not begin the outage if it takes over 45 seconds or if its identities, paths, classification or collisions differ from the snapshot baseline. The outage repeats this drift check after stopping the node, then `apply` re-inventories inside its transaction. These fresh checks retain the review's abort-on-new-database-or-identity guarantee.
+Just before step 2, time one **read-only** `dry-run` against the still-serving production database. It selects artifact metadata and `resource`, never artifact bytes. This captures PlanetScale latency as well as row count; do not begin the outage if it takes over 45 seconds or if it shows disallowed drift from the snapshot baseline. Run it **immediately before the stop**: its inventory becomes the drift baseline for steps 4–5. The only allowed drift is an **added** durable database that classifies as `unique` with exactly one path and no collision; normal sign-ups create these continuously. A removed baseline database, a changed path set, classification or collision, any new `ambiguous` or unattributed database, or any collision halts. Allowed additions are listed (service, space name, database, path) and recorded privately. The outage repeats this drift check against the serving baseline after stopping the node, then `apply` re-inventories inside its transaction.
 
 ```sh
 (
   set -euo pipefail
+  umask 077
+  at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   started="$(date +%s)"
   /usr/bin/time -p timeout 45 "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" dry-run \
     > ./tc780-private/serving-inventory.json
   seconds="$(($(date +%s) - started))"
   test "$seconds" -le 45
-  for phase in preflight serving; do
-    jq -S '[.[] | {service,space,physical_name,paths,classification,collision}] | sort_by(.service,.space,.physical_name)' \
-      "./tc780-private/$phase-inventory.json" > "./tc780-private/$phase-identities.json"
-  done
-  cmp ./tc780-private/preflight-identities.json ./tc780-private/serving-identities.json
-  jq --argjson seconds "$seconds" '.serving_dry_run_seconds=$seconds' \
+  python3 - ./tc780-private/preflight-inventory.json ./tc780-private/serving-inventory.json \
+    ./tc780-private/serving-additions.json <<'PY'
+import csv, json, sys
+from pathlib import Path
+def inventory(path):
+    return {(i['service'], i['space'], i['physical_name']): i for i in json.loads(Path(path).read_text())}
+def shape(item):
+    return (sorted(item['paths'], key=lambda p: (p is None, p or '')), item['classification'], item['collision'])
+def allowed(item):
+    return item['durable'] and item['classification'] == 'unique' and len(item['paths']) == 1 and not item['collision']
+base, current = inventory(sys.argv[1]), inventory(sys.argv[2])
+errors = [f'removed {k[0]}/{k[2]}' for k in base if k not in current]
+errors += [f'changed {k[0]}/{k[2]}' for k in base if k in current and shape(base[k]) != shape(current[k])]
+errors += [f'collision {k[0]}/{k[2]}' for k, item in current.items() if item['collision']]
+added = sorted(k for k in current if k not in base)
+errors += [f"disallowed addition {k[0]}/{k[2]} ({current[k]['classification']}, {len(current[k]['paths'])} paths)" for k in added if not allowed(current[k])]
+if len(sys.argv) > 4:
+    def identities(path):
+        with Path(path).open(newline='') as file:
+            return {(row['service'], row['space'], row['name']) for row in csv.DictReader(file)}
+    before, after = identities(sys.argv[4]), identities(sys.argv[5])
+    errors += [f'artifact removed {k[0]}/{k[2]}' for k in before - after]
+    errors += [f'artifact addition not allowed {k[0]}/{k[2]}' for k in after - before if k not in current or not allowed(current[k])]
+if errors:
+    raise SystemExit('inventory drift: ' + '; '.join(sorted(errors)))
+additions = [{'service': k[0], 'space': k[1], 'name': k[2], 'path': current[k]['paths'][0]} for k in added]
+Path(sys.argv[3]).write_text(json.dumps(additions))
+for a in additions:
+    print(f"allowed addition: {a['service']} {a['space'].rsplit(':', 1)[-1]} {a['name']} path={a['path']}")
+print(f'{len(additions)} allowed additions; no disallowed drift')
+PY
+  jq --argjson seconds "$seconds" --arg at "$at" --slurpfile added ./tc780-private/serving-additions.json \
+    '.serving_dry_run_seconds=$seconds | .serving_baseline_inventory="./tc780-private/serving-inventory.json" |
+     .serving_baseline_at=$at | .serving_allowed_additions=$added[0]' \
     ./tc780-private/record.json > ./tc780-private/record.next.json
   mv ./tc780-private/record.next.json ./tc780-private/record.json
 )
@@ -275,7 +305,7 @@ Immediately before step 2, Sam may take a **manual PlanetScale backup in the web
 | 1. Snapshot, metadata rehearsal, image, signed smoke and production timing gate | Production metadata dump measured 41 min; full serving `dry-run` must finish within 45 s; all before outage | Old version serving |
 | 2. Stop and drain | Up to 1 min | Whole node down, including KV |
 | 3. Public schema, migration ledger and artifact metadata backup | Local PG18: 1.45 s + 0.39 s for dumps; cap 2 min including manifest | Whole node down |
-| 4–5. Migration coverage and fresh identity/path/classification drift check | Scaled PG18 `dry-run`: 15.79 s; allow 2 min including checks, with a 90 s scan cutoff | Whole node down; abort on any new database or identity |
+| 4–5. Migration coverage and fresh identity/path/classification drift check | Scaled PG18 `dry-run`: 15.79 s; allow 2 min including checks, with a 90 s scan cutoff | Whole node down; drift against the block-05 serving baseline: only added `unique` single-path databases pass, anything else aborts |
 | 6. Durable fence and alias transaction | Scaled PG18 `apply`: 6.93 s; allow 2 min, with a 90 s scan cutoff | Whole node down; SQL fenced |
 | 7. Promote pinned N3 digest | 5–10 min, bounded by the 20-minute global deadline | Whole-node outage ends when healthy; SQL fenced |
 | 8. Report and verify transaction-time metadata | Scaled PG18 `report`: 4.69 s; allow 2 min | KV serving; SQL fenced |
@@ -349,19 +379,41 @@ On the CVM:
   ledger_state="$(budget psql "$TC780_DATABASE_URL" -v ON_ERROR_STOP=1 -Atc "SELECT count(*)::text || ':' || count(*) FILTER (WHERE version IN ('m20261007_000000_database_alias','m20261007_010000_database_identity_fence'))::text FROM seaql_migrations")"
   test "$ledger_state" = '23:0' || { echo "migration ledger changed before N3; got $ledger_state" >&2; exit 1; }
   budget timeout 90 /usr/bin/time -p "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" dry-run > ./tc780-private/outage-inventory.json
-  python3 - <<'PY'
-import csv
+  baseline="$(jq -er '.serving_baseline_inventory' ./tc780-private/record.json)"
+  python3 - "$baseline" ./tc780-private/outage-inventory.json ./tc780-private/outage-additions.json \
+    ./tc780-private/artifact-metadata.csv ./tc780-private/outage-artifact-metadata.csv <<'PY'
+import csv, json, sys
 from pathlib import Path
-def identities(path):
-    with Path(path).open(newline='') as file:
-        return {(row['service'], row['space'], row['name']) for row in csv.DictReader(file)}
-assert identities('tc780-private/artifact-metadata.csv') == identities('tc780-private/outage-artifact-metadata.csv'), 'artifact identity drift'
+def inventory(path):
+    return {(i['service'], i['space'], i['physical_name']): i for i in json.loads(Path(path).read_text())}
+def shape(item):
+    return (sorted(item['paths'], key=lambda p: (p is None, p or '')), item['classification'], item['collision'])
+def allowed(item):
+    return item['durable'] and item['classification'] == 'unique' and len(item['paths']) == 1 and not item['collision']
+base, current = inventory(sys.argv[1]), inventory(sys.argv[2])
+errors = [f'removed {k[0]}/{k[2]}' for k in base if k not in current]
+errors += [f'changed {k[0]}/{k[2]}' for k in base if k in current and shape(base[k]) != shape(current[k])]
+errors += [f'collision {k[0]}/{k[2]}' for k, item in current.items() if item['collision']]
+added = sorted(k for k in current if k not in base)
+errors += [f"disallowed addition {k[0]}/{k[2]} ({current[k]['classification']}, {len(current[k]['paths'])} paths)" for k in added if not allowed(current[k])]
+if len(sys.argv) > 4:
+    def identities(path):
+        with Path(path).open(newline='') as file:
+            return {(row['service'], row['space'], row['name']) for row in csv.DictReader(file)}
+    before, after = identities(sys.argv[4]), identities(sys.argv[5])
+    errors += [f'artifact removed {k[0]}/{k[2]}' for k in before - after]
+    errors += [f'artifact addition not allowed {k[0]}/{k[2]}' for k in after - before if k not in current or not allowed(current[k])]
+if errors:
+    raise SystemExit('inventory drift: ' + '; '.join(sorted(errors)))
+additions = [{'service': k[0], 'space': k[1], 'name': k[2], 'path': current[k]['paths'][0]} for k in added]
+Path(sys.argv[3]).write_text(json.dumps(additions))
+for a in additions:
+    print(f"allowed addition: {a['service']} {a['space'].rsplit(':', 1)[-1]} {a['name']} path={a['path']}")
+print(f'{len(additions)} allowed additions; no disallowed drift')
 PY
-  for phase in preflight outage; do
-    jq -S '[.[] | {service,space,physical_name,paths,classification,collision}] | sort_by(.service,.space,.physical_name)' \
-      "./tc780-private/$phase-inventory.json" > "./tc780-private/$phase-identities.json"
-  done
-  cmp ./tc780-private/preflight-identities.json ./tc780-private/outage-identities.json
+  jq --slurpfile added ./tc780-private/outage-additions.json '.outage_allowed_additions=$added[0]' \
+    ./tc780-private/record.json > ./tc780-private/record.next.json
+  mv ./tc780-private/record.next.json ./tc780-private/record.json
   test "$(date +%s)" -lt "$deadline"
   jq --argjson now "$(date +%s)" '.phase="step6_started" | .step6_started_at=$now' ./tc780-private/record.json > ./tc780-private/record.next.json
   mv ./tc780-private/record.next.json ./tc780-private/record.json
