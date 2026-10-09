@@ -2,7 +2,7 @@
 
 Production may run **1.19.1 or 1.19.2** when this cutover starts. Preflight records the actual running version, revision and digest; those exact values are the rollback target. Production uses external PlanetScale PostgreSQL metadata, durable SQL artifacts, no DuckDB feature and no local artifact cache. Set `include_duckdb=false`. A production artifact is about **79 MB**; reading its whole payload has crash-restarted this PostgreSQL instance. Every production inventory, backup and drift check below reads artifact **metadata only**. Never select `payload` or `delta_payload` from production, run the offline fingerprint command against production, or take a production dump containing `database_artifact` rows. Never push a `v*` tag.
 
-Use a private encrypted volume on a trusted Linux/amd64 operator host with PostgreSQL 16 tools, Docker, `jq`, the N3 `tinycloud-sql-identity` CLI and a signed SQL test client. Obtain `TC780_DATABASE_URL` and the sealed trust bundle through the secret manager without echoing them or putting them in shell history. Export `TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_BASE64` from that bundle before the image preflight; require it to be nonempty. Set `TC780_SNAPSHOT_URL` to a fresh empty **local** PostgreSQL database, and provide a throwaway `TC780_REHEARSAL_KEY`. Set `TC780_SMOKE_SPACE` to a space controlled by the operator, with a small SQL database and a known nonsecret marker. If needed, create this fixture through normal signed SQL requests **before** the snapshot; never choose another user's database. All blocks are `set -euo pipefail` subshells; a failed check stops that block without exiting the operator shell. They use `./tc780-private/record.json` to carry values across blocks and to the rollback operator. Protect this directory and delete the dump immediately after restore.
+Use a private encrypted volume on a trusted Linux/amd64 operator host with PostgreSQL 16 tools, Docker, `jq`, `phala@1.1.19` (the version pinned in `docker.yml`), the N3 `tinycloud-sql-identity` CLI and a signed SQL test client. Obtain `TC780_DATABASE_URL` and the sealed trust bundle through the secret manager without echoing them or putting them in shell history. Export `TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_BASE64` from that bundle before the image preflight; require it to be nonempty. Set `TC780_SNAPSHOT_URL` to a fresh empty **local** PostgreSQL database, and provide a throwaway `TC780_REHEARSAL_KEY`. Set `TC780_SMOKE_SPACE` to a space controlled by the operator, with a small SQL database and a known nonsecret marker. If needed, create this fixture through normal signed SQL requests **before** the snapshot; never choose another user's database. All blocks are `set -euo pipefail` subshells; a failed check stops that block without exiting the operator shell. They use `./tc780-private/record.json` to carry values across blocks and to the rollback operator. Protect this directory and delete the dump immediately after restore.
 
 ## Preflight: record image and check migration coverage
 
@@ -298,7 +298,7 @@ PY
   done
   cmp ./tc780-private/preflight-identities.json ./tc780-private/outage-identities.json
   test "$(date +%s)" -lt "$deadline"
-  jq '.phase="step6_started"' ./tc780-private/record.json > ./tc780-private/record.next.json
+  jq --argjson now "$(date +%s)" '.phase="step6_started" | .step6_started_at=$now' ./tc780-private/record.json > ./tc780-private/record.next.json
   mv ./tc780-private/record.next.json ./tc780-private/record.json
   budget "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" fence on
   budget "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" apply > ./tc780-private/tc780-applied.json
@@ -317,6 +317,7 @@ Deploy with the **config fence off**. The step-6 durable metadata fence holds SQ
 ```sh
 (
   set -euo pipefail
+  gh() { timeout 15 gh "$@"; }
   digest="$(jq -er '.n3_digest' ./tc780-private/record.json)"
   revision="$(jq -er '.n3_revision' ./tc780-private/record.json)"
   deadline="$(jq -er '.outage_deadline_epoch' ./tc780-private/record.json)"
@@ -324,7 +325,7 @@ Deploy with the **config fence off**. The step-6 durable metadata fence holds SQ
   test "$(gh api repos/TinyCloudLabs/tinycloud-node/actions/variables/TC780_CUTOVER_READY --jq .value)" = true
   test "$(git ls-remote origin refs/heads/Codex/roman/rollback-meeting-node-20260915 | cut -f1)" = "$revision"
   before="$(gh run list -R TinyCloudLabs/tinycloud-node --workflow docker.yml --branch Codex/roman/rollback-meeting-node-20260915 --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId // 0')"
-  jq --argjson before "$before" '. + {n3_previous_run_id:$before,phase:"step7_dispatching",n3_dispatch_exit_status:null} | del(.n3_deploy_run_id)' ./tc780-private/record.json > ./tc780-private/record.next.json
+  jq --argjson before "$before" --argjson now "$(date +%s)" '. + {n3_previous_run_id:$before,n3_dispatch_started_at:$now,phase:"step7_dispatching",n3_dispatch_exit_status:null} | del(.n3_deploy_run_id)' ./tc780-private/record.json > ./tc780-private/record.next.json
   mv ./tc780-private/record.next.json ./tc780-private/record.json
   if gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref Codex/roman/rollback-meeting-node-20260915 \
     -f image_version=1.20.0 -f deploy_phala=true -f include_duckdb=false \
@@ -393,19 +394,30 @@ No redeploy is required after `fence off`. Monitor SQL errors, KV health and new
 
 ## Rollback criteria and exact non-destructive path
 
-Abort forward progress immediately at the recorded **20-minute deadline**, or if the frozen ref changes, step 7's workflow fails, N3 cannot boot, KV remains unavailable, verification differs from `tc780-applied.json`, or the signed SQL smoke fails and cannot be corrected while fenced. The abort ladder is based on `record.json`:
+Abort forward progress immediately at the recorded **20-minute deadline**, or if the frozen ref changes, step 7's workflow fails, N3 cannot boot, KV remains unavailable, verification differs from `tc780-applied.json`, or the signed SQL smoke fails and cannot be corrected while fenced. Use the recorded `phase` and the N3 migration ledger together; never infer safety from a GitHub run's completion or the absence of a container. The old 1.19.2 binary refuses to boot while N3 migration rows exist. This refusal is the final guard against serving with the wrong schema; clear those rows only while every node container is stopped.
 
-- **Before `phase=step6_started`:** no N3 ledger change was attempted. On the CVM, keep the old `tinycloud` container running, or `docker start` it if stopped, and verify health. If it cannot be started, use the old-digest promotion block below **without** the ledger transaction.
-- **At or after `phase=step6_started`:** first cancel and settle any step-7 run (or establish that it was never dispatched), then inspect Phala's desired image and the CVM's actual running image. Stop any running node, run the ledger rollback transaction, then dispatch and watch promotion of the recorded old digest. This includes a failed `apply`, a step-7 workflow failure, and a case where N3 never started. Complete this rollback even if the 20-minute forward budget has expired.
+| Recorded phase | Required checks | Next allowed step |
+| --- | --- | --- |
+| `stopping`, `stopped_before_step6` | Ledger has no N3 rows; inspect old container | Start old container and health-check it; if absent, dispatch old digest without a ledger transaction |
+| `step6_started`, `step6_applied` | Settle step-7 run; read Phala `in_progress`, `progress.target`, desired image and CVM containers | If N3 runs and Phala is settled, stop it and clear ledger. If N3 never appears, use the five-minute deadline below, then stop, clear ledger and promote old digest. If still updating at the deadline, escalate the Phala update and repeat this gate before any ledger change |
+| `step7_dispatching`, `step7_running`, `step7_deployed`, `step7_never_dispatched` | Account for or cancel the step-7 run; apply the same Phala/CVM gate | Stop every node and clear ledger, then promote old digest; when no run was dispatched, the old-container path is also allowed if the ledger is clean |
+| `rollback_stopped` | All node containers stopped; check `step6_started_at` and N3 ledger rows | If step 6 began, run the idempotent ledger transaction and record `rollback_ledger_cleared`; otherwise promote old digest with zero N3 rows |
+| `rollback_ledger_cleared` | Ledger has zero N3 rows; Phala/CVM images known | Dispatch the recorded old digest, including a retry while Phala still desires N3 and no node runs |
+| `rollback_dispatching`, `rollback_running`, `rollback_failed` | Account for and settle any rollback run within the stated bounds; inspect Phala and ledger | If no rollback run appeared after three minutes and Phala is settled, retry old-digest dispatch. If a run failed or N3 rows returned, stop all nodes, clear ledger again, and retry promotion. If old image is desired, take the recovery ladder |
+| `rollback_deployed` | Phala desires old image, `in_progress=false`, zero N3 rows and old container healthy | Admit traffic and record `rollback_healthy`; otherwise stop all nodes, clear ledger and run the recovery ladder |
+| `rollback_healthy` | Old version healthy and zero N3 rows | Observe through the rollback window; investigate and re-enter recovery if health or ledger changes |
+
+Every halt above has a deadline and a next action. The five-minute no-container timer begins at the first observed N3 desire and is stored in `record.json`; it does not restart on repeated checks. At expiry, if `in_progress=false` and no N3 container exists, stop any node, clear the ledger and dispatch the old digest. If `in_progress=true` or the target is unexpected at expiry, escalate the Phala operation immediately, keep the ledger intact, and repeat the gate after the operation is settled. On a promotion failure, the recovery ladder below stops every node and re-clears any N3 rows before starting 1.19.2. A failed dispatch has a three-minute discovery deadline, then a defined retry. Complete rollback even when the forward outage deadline has expired.
 
 Before step 9, keep the durable fence on during investigation. After step 9, stop N3 and block traffic before changing metadata. Preserve a separate N3-state backup for analysis if needed; exclude artifact table data from any operator `pg_dump`.
 
-If step 7 was dispatched, cancel its recorded run **before** touching the CVM or ledger. `timeout gh run watch` only stops the local watcher; it does not cancel the workflow, and a terminal GitHub run does not prove that Phala stopped updating the CVM. If `phase=step7_dispatching` but the run ID is absent, the block searches for a newer run. It declares **never dispatched** only after three minutes with no newer `docker.yml` dispatch run than `n3_previous_run_id` **and** Phala's desired Compose image still equal to `running_image`. The saved `n3_dispatch_exit_status` records whether `gh workflow run` failed; even a zero exit status alone does not prove a run exists. A newer run with a different revision or an unreadable/changed Phala image halts for investigation. The cancellation loops can sleep for **20 minutes total** (120 × 5 seconds before and after force-cancel), plus up to 242 GitHub status requests and the cancel requests; those requests have no fixed timeout, so the actual worst case is unbounded. Escalate after the first 120 polls with force-cancel; if the second wait still does not reach `completed`, leave the CVM and ledger untouched.
+If step 7 was dispatched, cancel its recorded run **before** touching the CVM or ledger. `timeout gh run watch` only stops the local watcher; it does not cancel the workflow, and a terminal GitHub run does not prove that Phala stopped updating the CVM. If `phase=step7_dispatching` but the run ID is absent, the block searches for a newer run. It declares **never dispatched** only after three minutes with no newer `docker.yml` dispatch run than `n3_previous_run_id` **and** Phala's desired Compose image still equal to `running_image`. The saved `n3_dispatch_exit_status` is checked when no run appears: a nonzero status corroborates failed dispatch, while a zero status still requires the three-minute run search and Phala check. A newer run with a different revision or an unreadable/changed Phala image halts for investigation. GitHub requests have a 15-second limit. Cancel polling lasts at most ten minutes, then force-cancel and poll for at most ten more minutes. If a request times out or the second wait does not reach `completed`, escalate the GitHub run and leave the CVM and ledger untouched until a fresh terminal-state check passes.
 
 ```sh
 (
   set -euo pipefail
   umask 077
+  gh() { timeout 15 gh "$@"; }
   phase="$(jq -er '.phase' ./tc780-private/record.json)"
   case "$phase" in
     step7_dispatching|step7_running|step7_deployed)
@@ -413,7 +425,8 @@ If step 7 was dispatched, cancel its recorded run **before** touching the CVM or
       if test -z "$run_id"; then
         before="$(jq -er '.n3_previous_run_id' ./tc780-private/record.json)"
         revision="$(jq -er '.n3_revision' ./tc780-private/record.json)"
-        for attempt in $(seq 1 36); do
+        search_deadline="$(($(jq -er '.n3_dispatch_started_at' ./tc780-private/record.json) + 180))"
+        while test "$(date +%s)" -lt "$search_deadline"; do
           run_id="$(gh run list -R TinyCloudLabs/tinycloud-node --workflow docker.yml --branch Codex/roman/rollback-meeting-node-20260915 --event workflow_dispatch --limit 30 --json databaseId,headSha \
             --jq "[.[] | select(.databaseId > $before and .headSha == \"$revision\") | .databaseId] | first // empty")"
           test -z "$run_id" || break
@@ -423,7 +436,7 @@ If step 7 was dispatched, cancel its recorded run **before** touching the CVM or
       if test -z "$run_id"; then
         newest="$(gh run list -R TinyCloudLabs/tinycloud-node --workflow docker.yml --branch Codex/roman/rollback-meeting-node-20260915 --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId // 0')"
         test "$newest" -le "$before" || { echo 'newer docker.yml run is unaccounted for; halt rollback' >&2; exit 1; }
-        phala cvms get tinycloud-node --json > ./tc780-private/abort-cvm.json
+        timeout 15 phala cvms get tinycloud-node --json > ./tc780-private/abort-cvm.json
         desired="$(python3 - <<'PY'
 import json, re
 from pathlib import Path
@@ -440,6 +453,9 @@ PY
 )"
         old="$(jq -er '.running_image' ./tc780-private/record.json)"
         test "$desired" = "$old" || { echo 'Phala desired image changed; halt rollback' >&2; exit 1; }
+        jq -e '.in_progress == false and (.progress == null or (.progress | type == "object"))' ./tc780-private/abort-cvm.json >/dev/null
+        dispatch_status="$(jq -r '.n3_dispatch_exit_status // "unrecorded"' ./tc780-private/record.json)"
+        case "$dispatch_status" in 0) echo 'dispatch returned success but no run appeared; verified absent after three minutes' ;; *) echo "dispatch status $dispatch_status; verified absent after three minutes" ;; esac
         jq '.phase="step7_never_dispatched"' ./tc780-private/record.json > ./tc780-private/record.next.json
         mv ./tc780-private/record.next.json ./tc780-private/record.json
         echo 'No newer docker.yml run after three minutes; Phala still desires the old image'
@@ -449,14 +465,16 @@ PY
       mv ./tc780-private/record.next.json ./tc780-private/record.json
       status="$(gh run view "$run_id" -R TinyCloudLabs/tinycloud-node --json status --jq .status)"
       if test "$status" != completed; then gh run cancel "$run_id" -R TinyCloudLabs/tinycloud-node || true; fi
-      for attempt in $(seq 1 120); do
+      poll_deadline="$(($(date +%s) + 600))"
+      while test "$(date +%s)" -lt "$poll_deadline"; do
         status="$(gh run view "$run_id" -R TinyCloudLabs/tinycloud-node --json status --jq .status)"
         test "$status" = completed && break
         sleep 5
       done
       if test "$status" != completed; then
         gh api -X POST "repos/TinyCloudLabs/tinycloud-node/actions/runs/$run_id/force-cancel"
-        for attempt in $(seq 1 120); do
+        poll_deadline="$(($(date +%s) + 600))"
+        while test "$(date +%s)" -lt "$poll_deadline"; do
           status="$(gh run view "$run_id" -R TinyCloudLabs/tinycloud-node --json status --jq .status)"
           test "$status" = completed && break
           sleep 5
@@ -468,46 +486,63 @@ PY
 )
 ```
 
-Before the CVM stop and ledger transaction, run the following on the operator host. `phala cvms get --json` exposes the desired Compose image in `compose_file.docker_compose_file` (or top-level `docker_compose_file`), as used by `docker.yml`; the workflow does **not** establish a reliable JSON field for an in-progress update. If Phala still desires N3, the CVM check below requires an **already running N3 container** before stopping it. If N3 is not running yet, halt with the ledger intact and repeat this gate after it starts. If Phala still desires the old image after a recorded N3 run, separately confirm in the Phala control plane that no update is in progress, then set `TC780_PHALA_UPDATE_SETTLED=confirmed`; without that confirmation, halt. An unreadable or unexpected desired image also halts. A completed GitHub run, or no currently running container, never supplies this confirmation.
+Before the CVM stop and ledger transaction, run the following on the operator host, and refresh it before every promotion retry or old-container start. `phala cvms get --json` in CLI v1.1.19 exposes the desired Compose image, `in_progress`, and a nullable `progress.target`. Require `in_progress=false` before a ledger change; record the target and reject an unexpected node image target. When Phala desires the old image after an N3 run, manually confirm that the control plane has settled and set `TC780_PHALA_UPDATE_SETTLED_RUN_ID` to that recorded N3 run ID for this attempt. A changed or unreadable desired image halts. When Phala desires N3, the recorded five-minute deadline supplies a finite exit if no N3 container appears. After `rollback_ledger_cleared`, a stopped N3 container is expected and does not block a rollback dispatch retry.
 
 ```sh
 (
   set -euo pipefail
   umask 077
-  phala cvms get tinycloud-node --json > ./tc780-private/abort-cvm.json
-  desired="$(python3 - <<'PY'
+  timeout 15 phala cvms get tinycloud-node --json > ./tc780-private/abort-cvm.json
+  desired="$(python3 - <<'PY2'
 import json, re
 from pathlib import Path
 value = json.loads(Path('tc780-private/abort-cvm.json').read_text())
-compose_file = value.get('compose_file', {}) if isinstance(value, dict) else {}
-compose = value if isinstance(value, str) else (compose_file.get('docker_compose_file', '') if isinstance(compose_file, dict) else '')
-if not compose and isinstance(value, dict):
+if not isinstance(value, dict) or value.get('success') is False or not isinstance(value.get('in_progress'), bool) or (value.get('progress') is not None and not isinstance(value['progress'], dict)):
+    raise SystemExit('Phala progress fields are unreadable; repeat gate or escalate')
+compose_file = value.get('compose_file', {})
+compose = compose_file.get('docker_compose_file', '') if isinstance(compose_file, dict) else compose_file
+if not compose:
     compose = value.get('docker_compose_file', '')
 images = re.findall(r"(?m)^\s*image:\s*['\"]?(ghcr\.io/tinycloudlabs/tinycloud-node@sha256:[0-9a-f]{64})", compose)
 if len(images) != 1:
     raise SystemExit('cannot identify one pinned desired node image; halt rollback')
 print(images[0])
-PY
+PY2
 )"
   old="$(jq -er '.running_image' ./tc780-private/record.json)"
   n3="ghcr.io/tinycloudlabs/tinycloud-node@$(jq -er '.n3_digest' ./tc780-private/record.json)"
   case "$desired" in "$old"|"$n3") ;; *) echo 'unexpected Phala desired image; halt rollback' >&2; exit 1;; esac
+  target="$(jq -c '.progress.target' ./tc780-private/abort-cvm.json)"
+  target_image="$(jq -r '.progress.target | if type == "string" then . else empty end' ./tc780-private/abort-cvm.json)"
+  case "$target_image" in ghcr.io/tinycloudlabs/tinycloud-node@*)
+    case "$target_image" in "$old"|"$n3") ;; *) echo 'unexpected Phala progress target image; escalate' >&2; exit 1;; esac
+    ;;
+  esac
   run_id="$(jq -r '.n3_deploy_run_id // empty' ./tc780-private/record.json)"
   if test "$desired" = "$old" && test -n "$run_id"; then
-    test "${TC780_PHALA_UPDATE_SETTLED:-}" = confirmed || { echo 'confirm no Phala update is in progress before rollback' >&2; exit 1; }
+    test "${TC780_PHALA_UPDATE_SETTLED_RUN_ID:-}" = "$run_id" || { echo 'confirm settled Phala update for this N3 run ID' >&2; exit 1; }
   fi
-  jq --arg desired "$desired" '.abort_desired_image=$desired' ./tc780-private/record.json > ./tc780-private/record.next.json
+  jq --arg desired "$desired" --argjson target "$target" --argjson in_progress "$(jq -r '.in_progress' ./tc780-private/abort-cvm.json)" --argjson now "$(date +%s)" \
+    '.abort_desired_image=$desired | .abort_progress_target=$target | .abort_in_progress=$in_progress |
+     if $desired == ("ghcr.io/tinycloudlabs/tinycloud-node@" + .n3_digest) then
+       .n3_no_container_deadline_epoch //= ($now + 300)
+     else . end' ./tc780-private/record.json > ./tc780-private/record.next.json
   mv ./tc780-private/record.next.json ./tc780-private/record.json
+  if ! jq -e '.in_progress == false' ./tc780-private/abort-cvm.json >/dev/null; then
+    echo 'Phala update is in progress; repeat gate by the recorded five-minute deadline, then escalate the operation' >&2
+    exit 1
+  fi
   printf 'Phala desired node image: %s\n' "$desired"
 )
 ```
 
-On the CVM set `TC780_OLD_IMAGE`, `TC780_N3_IMAGE`, and `TC780_PHALA_DESIRED_IMAGE` to `running_image`, `ghcr.io/tinycloudlabs/tinycloud-node@<n3_digest>`, and `abort_desired_image` from the operator's `record.json`. Inspect the **running container** as well. An unknown running image or multiple running node containers halts rollback for investigation. Keep these values for the stop and failed-promotion checks below.
+On the CVM set `TC780_ROLLBACK_LEDGER_CLEARED=true` only when `record.json` has `rollback_ledger_cleared_at` and the ledger count is zero. Set `TC780_PHALA_IN_PROGRESS` and `TC780_N3_NO_CONTAINER_DEADLINE_EPOCH` from `record.json`. Set `TC780_OLD_IMAGE`, `TC780_N3_IMAGE`, and `TC780_PHALA_DESIRED_IMAGE` to `running_image`, `ghcr.io/tinycloudlabs/tinycloud-node@<n3_digest>`, and `abort_desired_image` from the operator's `record.json`. Inspect the **running container** as well. An unknown running image or multiple running node containers halts rollback for investigation. Keep these values for the stop and failed-promotion checks below.
 
 ```sh
 (
   set -euo pipefail
   test -n "$TC780_OLD_IMAGE" && test -n "$TC780_N3_IMAGE" && test -n "$TC780_PHALA_DESIRED_IMAGE"
+  test "${TC780_PHALA_IN_PROGRESS:-}" = false
   case "$TC780_PHALA_DESIRED_IMAGE" in "$TC780_OLD_IMAGE"|"$TC780_N3_IMAGE") ;; *) echo 'unexpected Phala desired image; halt rollback' >&2; exit 1;; esac
   node_id="$(docker ps --filter label=com.docker.compose.service=tinycloud --quiet)"
   test "$(printf '%s\n' "$node_id" | grep -c . || true)" -le 1
@@ -518,8 +553,20 @@ On the CVM set `TC780_OLD_IMAGE`, `TC780_N3_IMAGE`, and `TC780_PHALA_DESIRED_IMA
   else
     echo 'No running tinycloud container on CVM'
   fi
-  if test "$TC780_PHALA_DESIRED_IMAGE" = "$TC780_N3_IMAGE"; then
-    test -n "$node_id" && test "$image" = "$TC780_N3_IMAGE" || { echo 'Phala desires N3 but N3 is not running yet; halt before ledger rollback' >&2; exit 1; }
+  if test "${TC780_ROLLBACK_LEDGER_CLEARED:-false}" = true && test -n "$node_id" && test "$image" = "$TC780_N3_IMAGE"; then
+    echo 'N3 restarted after ledger rollback; stop all nodes and repair ledger before promotion' >&2
+    exit 1
+  fi
+  if test "$TC780_PHALA_DESIRED_IMAGE" = "$TC780_N3_IMAGE" && { test -z "$node_id" || test "$image" != "$TC780_N3_IMAGE"; }; then
+    if test "${TC780_ROLLBACK_LEDGER_CLEARED:-false}" = true; then
+      test -z "$node_id" || { echo 'node restarted after ledger rollback; stop all nodes and repair ledger before dispatch' >&2; exit 1; }
+      echo 'N3 is stopped after ledger rollback; retry old-digest dispatch'
+    elif test "$(date +%s)" -ge "$TC780_N3_NO_CONTAINER_DEADLINE_EPOCH"; then
+      echo 'N3 did not appear within five minutes; stop any node, clear ledger and promote old digest'
+    else
+      echo 'N3 has not appeared; repeat gate at recorded five-minute deadline' >&2
+      exit 1
+    fi
   fi
 )
 ```
@@ -552,11 +599,22 @@ On the CVM, stop the N3 service and confirm it is stopped before touching the le
 )
 ```
 
-Only for aborts at or after `phase=step6_started`, on the operator host remove the N3 metadata and migration rows in one transaction. Do this after the CVM image check and stop above:
+On the operator host, record `phase=rollback_stopped` after the CVM stop check succeeds.
 
 ```sh
 (
   set -euo pipefail
+  jq '.phase="rollback_stopped"' ./tc780-private/record.json > ./tc780-private/record.next.json
+  mv ./tc780-private/record.next.json ./tc780-private/record.json
+)
+```
+
+Only when `step6_started_at` is recorded, on the operator host remove the N3 metadata and migration rows in one transaction. Do this after the CVM image check and stop above:
+
+```sh
+(
+  set -euo pipefail
+  jq -e 'has("step6_started_at") and .phase == "rollback_stopped"' ./tc780-private/record.json >/dev/null
   psql "$TC780_DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
 BEGIN;
 DROP TABLE IF EXISTS database_identity_fence, database_alias, database_legacy_artifact;
@@ -568,26 +626,43 @@ DO $$ BEGIN
 END $$;
 COMMIT;
 SQL
+  jq --argjson now "$(date +%s)" '.phase="rollback_ledger_cleared" | .rollback_ledger_cleared_at=$now' ./tc780-private/record.json > ./tc780-private/record.next.json
+  mv ./tc780-private/record.next.json ./tc780-private/record.json
 )
 ```
 
-For either path that needs image promotion, run this separate sanctioned TC-767 rollback dispatch on the operator host. A pre-step-6 fallback starts here and does not run the ledger transaction. If this dispatch command fails before a new run appears, wait three minutes and verify that no newer `docker.yml` run exists, then repeat the Phala desired-image and CVM checks above before retrying this block. It clears the previous rollback run ID at each attempt. If either check is uncertain, halt before touching the CVM or ledger:
+For either path that needs image promotion, run this separate sanctioned TC-767 rollback dispatch on the operator host. A pre-step-6 fallback starts here and does not run the ledger transaction. If this dispatch command fails before a new run appears, wait at most three minutes and verify that no newer `docker.yml` run exists. Repeat the Phala and CVM checks, then retry this block. `rollback_ledger_cleared_at` permits Phala to desire N3 with no running container; do not restart N3. If Phala has not settled, escalate at the five-minute deadline. It clears the previous rollback run ID at each attempt. If either check is uncertain, halt before touching the CVM or ledger:
 
 ```sh
 (
   set -euo pipefail
+  gh() { timeout 15 gh "$@"; }
   version="$(jq -er '.running_version' ./tc780-private/record.json)"
   case "$version" in 1.19.1-dstack|1.19.2-dstack) ;; *) exit 1;; esac
+  if jq -e 'has("step6_started_at")' ./tc780-private/record.json >/dev/null; then
+    jq -e 'has("rollback_ledger_cleared_at")' ./tc780-private/record.json >/dev/null || {
+      echo 'step 6 began but ledger rollback is not recorded; stop nodes and clear ledger first' >&2; exit 1;
+    }
+  fi
+  rows="$(psql "$TC780_DATABASE_URL" -v ON_ERROR_STOP=1 -Atc "SELECT count(*) FROM seaql_migrations WHERE version IN ('m20261007_000000_database_alias','m20261007_010000_database_identity_fence')")"
+  test "$rows" -eq 0 || { echo 'N3 ledger rows returned; stop all nodes and re-run ledger rollback before dispatch' >&2; exit 1; }
   digest="$(jq -er '.running_digest' ./tc780-private/record.json)"
   revision="$(jq -er '.running_revision' ./tc780-private/record.json)"
   before="$(gh run list -R TinyCloudLabs/tinycloud-node --workflow docker.yml --branch Codex/roman/rollback-meeting-node-20260915 --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId // 0')"
-  jq --argjson before "$before" '. + {rollback_previous_run_id:$before,phase:"rollback_dispatching"} | del(.rollback_deploy_run_id)' \
+  jq --argjson before "$before" --argjson now "$(date +%s)" '. + {rollback_previous_run_id:$before,rollback_dispatch_started_at:$now,phase:"rollback_dispatching"} | del(.rollback_deploy_run_id)' \
     ./tc780-private/record.json > ./tc780-private/record.next.json
   mv ./tc780-private/record.next.json ./tc780-private/record.json
-  gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref Codex/roman/rollback-meeting-node-20260915 \
+  if gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref Codex/roman/rollback-meeting-node-20260915 \
     -f image_version=1.20.0 -f deploy_phala=true -f include_duckdb=false -f sql_identity_fence=false \
     -f allow_non_descendant=true -f deploy_image_digest="$digest" \
-    -f rollback_image_version="${version%-dstack}" -f rollback_image_revision="$revision"
+    -f rollback_image_version="${version%-dstack}" -f rollback_image_revision="$revision"; then
+    dispatch_status=0
+  else
+    dispatch_status=$?
+  fi
+  jq --argjson status "$dispatch_status" '.rollback_dispatch_exit_status=$status' ./tc780-private/record.json > ./tc780-private/record.next.json
+  mv ./tc780-private/record.next.json ./tc780-private/record.json
+  test "$dispatch_status" -eq 0 || { echo 'rollback dispatch failed; account for any run, then retry' >&2; exit 1; }
   n3_revision="$(jq -er '.n3_revision' ./tc780-private/record.json)"
   run_id=''
   for attempt in $(seq 1 30); do
@@ -600,7 +675,7 @@ For either path that needs image promotion, run this separate sanctioned TC-767 
   jq --argjson run_id "$run_id" '. + {rollback_deploy_run_id:$run_id,phase:"rollback_running"}' \
     ./tc780-private/record.json > ./tc780-private/record.next.json
   mv ./tc780-private/record.next.json ./tc780-private/record.json
-  if ! gh run watch "$run_id" -R TinyCloudLabs/tinycloud-node --exit-status; then
+  if ! timeout 600 gh run watch "$run_id" -R TinyCloudLabs/tinycloud-node --exit-status; then
     jq '.phase="rollback_failed"' ./tc780-private/record.json > ./tc780-private/record.next.json
     mv ./tc780-private/record.next.json ./tc780-private/record.json
     echo 'rollback deploy failed; follow failed-promotion step below' >&2
@@ -618,11 +693,12 @@ SQL
 )
 ```
 
-If the rollback deploy or its local watcher fails, **do not restart N3** after the ledger transaction. First settle the recorded rollback run: a failed local watch does not prove the workflow stopped. Cancel it if still active, wait for `completed`, and inspect its conclusion and logs. This has the same worst case as the N3 cancel block: 20 minutes of sleeps plus up to 242 status requests and two cancel requests, with no finite wall-clock bound on those requests. Force-cancel after the first 120 polls; if the second 120 polls do not reach `completed`, escalate and leave the CVM untouched.
+If the rollback deploy or its local watcher fails, **do not restart N3** after the ledger transaction. First settle the recorded rollback run: a failed local watch does not prove the workflow stopped. Cancel it if still active, wait up to ten minutes for `completed`, force-cancel, then wait up to ten more minutes. GitHub requests have a 15-second limit. If a request times out or the second wait expires, escalate the GitHub run and leave the CVM untouched until a fresh terminal-state check passes. If no run appears by the recorded three-minute deadline, repeat the Phala and CVM gates and retry the old-digest dispatch.
 
 ```sh
 (
   set -euo pipefail
+  gh() { timeout 15 gh "$@"; }
   run_id="$(jq -r '.rollback_deploy_run_id // empty' ./tc780-private/record.json)"
   if test -z "$run_id"; then
     before="$(jq -er '.rollback_previous_run_id' ./tc780-private/record.json)"
@@ -630,19 +706,37 @@ If the rollback deploy or its local watcher fails, **do not restart N3** after t
     run_id="$(gh run list -R TinyCloudLabs/tinycloud-node --workflow docker.yml --branch Codex/roman/rollback-meeting-node-20260915 --event workflow_dispatch --limit 30 --json databaseId,headSha \
       --jq "[.[] | select(.databaseId > $before and .headSha == \"$revision\") | .databaseId] | first // empty")"
   fi
-  test -n "$run_id" || { echo 'rollback dispatch not accounted for; halt' >&2; exit 1; }
+  if test -z "$run_id"; then
+    search_deadline="$(($(jq -er '.rollback_dispatch_started_at' ./tc780-private/record.json) + 180))"
+    while test "$(date +%s)" -lt "$search_deadline"; do
+      sleep 5
+      run_id="$(gh run list -R TinyCloudLabs/tinycloud-node --workflow docker.yml --branch Codex/roman/rollback-meeting-node-20260915 --event workflow_dispatch --limit 30 --json databaseId,headSha \
+        --jq "[.[] | select(.databaseId > $before and .headSha == \"$revision\") | .databaseId] | first // empty")"
+      test -z "$run_id" || break
+    done
+  fi
+  if test -z "$run_id"; then
+    newest="$(gh run list -R TinyCloudLabs/tinycloud-node --workflow docker.yml --branch Codex/roman/rollback-meeting-node-20260915 --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId // 0')"
+    test "$newest" -le "$before" || { echo 'newer rollback run is unaccounted for; escalate' >&2; exit 1; }
+    jq 'if has("step6_started_at") then .phase="rollback_ledger_cleared" else .phase="rollback_stopped" end' ./tc780-private/record.json > ./tc780-private/record.next.json
+    mv ./tc780-private/record.next.json ./tc780-private/record.json
+    echo 'No rollback run after three minutes; repeat Phala/CVM gates and retry old-digest dispatch'
+    exit 0
+  fi
   jq --argjson run_id "$run_id" '.rollback_deploy_run_id=$run_id' ./tc780-private/record.json > ./tc780-private/record.next.json
   mv ./tc780-private/record.next.json ./tc780-private/record.json
   status="$(gh run view "$run_id" -R TinyCloudLabs/tinycloud-node --json status --jq .status)"
   if test "$status" != completed; then gh run cancel "$run_id" -R TinyCloudLabs/tinycloud-node || true; fi
-  for attempt in $(seq 1 120); do
+  poll_deadline="$(($(date +%s) + 600))"
+  while test "$(date +%s)" -lt "$poll_deadline"; do
     status="$(gh run view "$run_id" -R TinyCloudLabs/tinycloud-node --json status --jq .status)"
     test "$status" = completed && break
     sleep 5
   done
   if test "$status" != completed; then
     gh api -X POST "repos/TinyCloudLabs/tinycloud-node/actions/runs/$run_id/force-cancel"
-    for attempt in $(seq 1 120); do
+    poll_deadline="$(($(date +%s) + 600))"
+    while test "$(date +%s)" -lt "$poll_deadline"; do
       status="$(gh run view "$run_id" -R TinyCloudLabs/tinycloud-node --json status --jq .status)"
       test "$status" = completed && break
       sleep 5
@@ -653,7 +747,7 @@ If the rollback deploy or its local watcher fails, **do not restart N3** after t
 )
 ```
 
-Before any `docker start` after a failed promotion, repeat the Phala desired-image gate above. If Phala desires N3 and N3 is not yet running, halt and wait with the ledger unchanged. On the operator host, check the N3 ledger rows **before** attempting to start the old container. A positive count means a late N3 start re-applied its migrations. Keep the result with the private record:
+Before any `docker start` after a failed promotion, repeat the Phala desired-image gate above. If Phala still desires N3, retry the old-digest dispatch after the recorded ledger-cleared phase; do not start an old container under an N3 desired image. If no N3 container appears, use the recorded five-minute deadline and settled `in_progress=false` gate, then proceed through the recovery ladder. On the operator host, check the N3 ledger rows **before** attempting to start the old container. A positive count means a late N3 start re-applied its migrations. Keep the result with the private record:
 
 ```sh
 (
@@ -707,6 +801,8 @@ DO $$ BEGIN
 END $$;
 COMMIT;
 SQL
+  jq --argjson now "$(date +%s)" '.phase="rollback_ledger_cleared" | .rollback_ledger_cleared_at=$now' ./tc780-private/record.json > ./tc780-private/record.next.json
+  mv ./tc780-private/record.next.json ./tc780-private/record.json
 )
 ```
 
@@ -731,7 +827,20 @@ Only after that transaction commits, on the CVM start the existing old container
 )
 ```
 
-Check `/healthz`, `/version` against the recorded old version and the approved signed SQL read. Recheck that the N3 ledger rows are absent before admitting traffic. If the post-deploy ledger assertion fails, block traffic and repair the ledger with every node container stopped before attempting to boot the old image. If the old container is absent or cannot pass these checks, keep the node stopped and escalate the outage. On a promotion retry, clear the stale rollback run ID via the dispatch block, settle that new run, then repeat the Phala gate, ledger check, container stop and idempotent ledger transaction before starting the old container. Retry of the promotion block alone is insufficient when N3 rows have reappeared.
+Check `/healthz`, `/version` against the recorded old version and the approved signed SQL read. Recheck that the N3 ledger rows are absent before admitting traffic. After all three checks pass, record completion on the operator host:
+
+```sh
+(
+  set -euo pipefail
+  test "${TC780_OLD_NODE_HEALTH_CONFIRMED:-}" = confirmed
+  rows="$(psql "$TC780_DATABASE_URL" -v ON_ERROR_STOP=1 -Atc "SELECT count(*) FROM seaql_migrations WHERE version IN ('m20261007_000000_database_alias','m20261007_010000_database_identity_fence')")"
+  test "$rows" -eq 0
+  jq '.phase="rollback_healthy"' ./tc780-private/record.json > ./tc780-private/record.next.json
+  mv ./tc780-private/record.next.json ./tc780-private/record.json
+)
+```
+
+If the post-deploy ledger assertion fails, block traffic and repair the ledger with every node container stopped before attempting to boot the old image. If the old container is absent or cannot pass these checks, keep the node stopped and escalate the outage. On a promotion retry, clear the stale rollback run ID via the dispatch block, settle that new run, then repeat the Phala gate, ledger check, container stop and idempotent ledger transaction before starting the old container. Retry of the promotion block alone is insufficient when N3 rows have reappeared.
 
 TC-767's ancestry guard is roll-forward only. `allow_non_descendant=true` plus the recorded digest/version/revision is its sanctioned emergency override; the workflow validates those labels. The N3 image-only config preflight is skipped for the old rollback image, while Compose validation still runs. Verify `/healthz`, `/version` matches `running_version` in the record and the approved signed SQL read.
 
