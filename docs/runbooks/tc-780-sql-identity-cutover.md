@@ -264,6 +264,8 @@ On the CVM:
 (
   set -euo pipefail
   umask 077
+  phase="$(jq -r '.phase // "unset"' ./tc780-private/record.json)"
+  test "$phase" = stopped_before_step6 || { echo "phase=$phase: follow the rollback table row for $phase; do not re-run step 6 or fence on" >&2; exit 1; }
   deadline="$(jq -er '.outage_deadline_epoch' ./tc780-private/record.json)"
   budget() {
     remaining="$((deadline - $(date +%s)))"
@@ -318,6 +320,8 @@ Deploy with the **config fence off**. The step-6 durable metadata fence holds SQ
 (
   set -euo pipefail
   gh() { timeout 15 gh "$@"; }
+  phase="$(jq -r '.phase // "unset"' ./tc780-private/record.json)"
+  test "$phase" = step6_applied || { echo "phase=$phase: follow the step6_started/step6_applied table row before step 7" >&2; exit 1; }
   digest="$(jq -er '.n3_digest' ./tc780-private/record.json)"
   revision="$(jq -er '.n3_revision' ./tc780-private/record.json)"
   deadline="$(jq -er '.outage_deadline_epoch' ./tc780-private/record.json)"
@@ -366,6 +370,11 @@ Require `/healthz` and `/version` to report healthy 1.20.0. A signed SQL `/invok
   set -euo pipefail
   "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" verify \
     --baseline ./tc780-private/tc780-applied.json > ./tc780-private/verified.json
+  baseline_aliases="$(jq -er '.aliases | if type == "array" then length else error("step-6 alias baseline is not an array") end' ./tc780-private/aliases.json)"
+  verified_aliases="$(jq -er 'if type == "array" then length else error("verified aliases are not an array") end' ./tc780-private/verified.json)"
+  test "$verified_aliases" -ge "$baseline_aliases" && { test "$baseline_aliases" -eq 0 || test "$verified_aliases" -gt 0; } || {
+    echo "verified $verified_aliases aliases; step-6 baseline has $baseline_aliases" >&2; exit 1;
+  }
 )
 ```
 
@@ -376,6 +385,8 @@ Use only the recorded smoke database in the operator-controlled `TC780_SMOKE_SPA
 ```sh
 (
   set -euo pipefail
+  phase="$(jq -r '.phase // "unset"' ./tc780-private/record.json)"
+  test "$phase" = step7_deployed || { echo "phase=$phase: follow the step7_dispatching/step7_running/step7_deployed table row before step 9 or any fence on re-run" >&2; exit 1; }
   test -n "$TC780_SQL_EXPECTED_MARKER"
   for file in "$TC780_SQL_FENCED_BODY" "$TC780_SQL_FENCED_HEADERS" "$TC780_SQL_OPEN_BODY" "$TC780_SQL_OPEN_HEADERS" "$TC780_SQL_SHORT_BODY" "$TC780_SQL_SHORT_HEADERS"; do test -s "$file"; done
   "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" report > ./tc780-private/before-unfence.json
@@ -399,17 +410,28 @@ Abort forward progress immediately at the recorded **20-minute deadline**, or if
 | Recorded phase | Required checks | Next allowed step |
 | --- | --- | --- |
 | `stopping`, `stopped_before_step6` | Ledger has no N3 rows; inspect old container | Start old container and health-check it; if absent, dispatch old digest without a ledger transaction |
-| `step6_started`, `step6_applied` | Settle step-7 run; read Phala `in_progress`, `progress.target`, desired image and CVM containers | If N3 runs and Phala is settled, stop it and clear ledger. If N3 never appears, use the five-minute deadline below, then stop, clear ledger and promote old digest. If still updating at the deadline, escalate the Phala update and repeat this gate before any ledger change |
-| `step7_dispatching`, `step7_running`, `step7_deployed`, `step7_never_dispatched` | Account for or cancel the step-7 run; apply the same Phala/CVM gate | Stop every node and clear ledger, then promote old digest; when no run was dispatched, the old-container path is also allowed if the ledger is clean |
+| `step6_started`, `step6_applied` | No step-7 run exists; read Phala `in_progress`, `progress.target`, desired image and CVM containers | If N3 runs and Phala is settled, stop it and clear ledger. If N3 never appears, use the five-minute deadline below, then stop, clear ledger and promote old digest. If still updating at the deadline, escalate the Phala update and repeat this gate before any ledger change |
+| `step7_dispatching`, `step7_running`, `step7_deployed`, `step7_never_dispatched` | Account for or cancel the step-7 run; apply the same Phala/CVM gate | Stop every node and clear ledger, then promote old digest; when no run was dispatched, the old-container path is also allowed with zero N3 ledger rows |
 | `rollback_stopped` | All node containers stopped; check `step6_started_at` and N3 ledger rows | If step 6 began, run the idempotent ledger transaction and record `rollback_ledger_cleared`; otherwise promote old digest with zero N3 rows |
 | `rollback_ledger_cleared` | Ledger has zero N3 rows; Phala/CVM images known | Dispatch the recorded old digest, including a retry while Phala still desires N3 and no node runs |
-| `rollback_dispatching`, `rollback_running`, `rollback_failed` | Account for and settle any rollback run within the stated bounds; inspect Phala and ledger | If no rollback run appeared after three minutes and Phala is settled, retry old-digest dispatch. If a run failed or N3 rows returned, stop all nodes, clear ledger again, and retry promotion. If old image is desired, take the recovery ladder |
-| `rollback_deployed` | Phala desires old image, `in_progress=false`, zero N3 rows and old container healthy | Admit traffic and record `rollback_healthy`; otherwise stop all nodes, clear ledger and run the recovery ladder |
+| `rollback_dispatching`, `rollback_running`, `rollback_failed` | Account for and settle any rollback run within the stated bounds; inspect Phala and ledger | If no rollback run appeared after three minutes and Phala is settled, retry old-digest dispatch. If a run failed or N3 rows returned, stop all nodes, clear ledger again, and retry promotion. If old image is desired but no old container appears within five minutes after `in_progress=false`, re-run the old-digest dispatch block |
+| `rollback_deployed` | Phala desires old image, `in_progress=false`, zero N3 rows and old container healthy | Admit traffic and record `rollback_healthy`; if no old container appears within five minutes after `in_progress=false`, re-run the old-digest dispatch block; otherwise stop all nodes, clear ledger and run the recovery ladder |
 | `rollback_healthy` | Old version healthy and zero N3 rows | Observe through the rollback window; investigate and re-enter recovery if health or ledger changes |
 
-Every halt above has a deadline and a next action. The five-minute no-container timer begins at the first observed N3 desire and is stored in `record.json`; it does not restart on repeated checks. At expiry, if `in_progress=false` and no N3 container exists, stop any node, clear the ledger and dispatch the old digest. If `in_progress=true` or the target is unexpected at expiry, escalate the Phala operation immediately, keep the ledger intact, and repeat the gate after the operation is settled. On a promotion failure, the recovery ladder below stops every node and re-clears any N3 rows before starting 1.19.2. A failed dispatch has a three-minute discovery deadline, then a defined retry. Complete rollback even when the forward outage deadline has expired.
+Every halt above has a deadline and a next action. The five-minute no-container timers begin only after `in_progress=false` with the corresponding image desired; each is stored in `record.json` and does not restart on repeated checks. At N3 timer expiry, if no N3 container exists, stop any node, clear the ledger and dispatch the old digest. At old-image timer expiry, if no old container exists, re-run the old-digest dispatch block after the Phala/CVM gate. If `in_progress=true` or the target is unexpected, escalate the Phala operation immediately, keep the ledger intact, and repeat the gate after the operation is settled. On a promotion failure, the recovery ladder below stops every node and re-clears any N3 rows before starting 1.19.2. A failed dispatch has a three-minute discovery deadline, then a defined retry. Complete rollback even when the forward outage deadline has expired.
 
 Before step 9, keep the durable fence on during investigation. After step 9, stop N3 and block traffic before changing metadata. Preserve a separate N3-state backup for analysis if needed; exclude artifact table data from any operator `pg_dump`.
+
+If investigation requires re-running `fence on` after step 6, use this block only after the N3 deployment reached `step7_deployed`; do not re-run steps 2–6:
+
+```sh
+(
+  set -euo pipefail
+  phase="$(jq -r '.phase // "unset"' ./tc780-private/record.json)"
+  test "$phase" = step7_deployed || { echo "phase=$phase: follow the rollback table row for $phase before a fence on re-run" >&2; exit 1; }
+  "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" fence on
+)
+```
 
 If step 7 was dispatched, cancel its recorded run **before** touching the CVM or ledger. `timeout gh run watch` only stops the local watcher; it does not cancel the workflow, and a terminal GitHub run does not prove that Phala stopped updating the CVM. If `phase=step7_dispatching` but the run ID is absent, the block searches for a newer run. It declares **never dispatched** only after three minutes with no newer `docker.yml` dispatch run than `n3_previous_run_id` **and** Phala's desired Compose image still equal to `running_image`. The saved `n3_dispatch_exit_status` is checked when no run appears: a nonzero status corroborates failed dispatch, while a zero status still requires the three-minute run search and Phala check. A newer run with a different revision or an unreadable/changed Phala image halts for investigation. GitHub requests have a 15-second limit. Cancel polling lasts at most ten minutes, then force-cancel and poll for at most ten more minutes. If a request times out or the second wait does not reach `completed`, escalate the GitHub run and leave the CVM and ledger untouched until a fresh terminal-state check passes.
 
@@ -481,15 +503,17 @@ PY
         done
       fi
       test "$(gh run view "$run_id" -R TinyCloudLabs/tinycloud-node --json status --jq .status)" = completed
+      jq --argjson run_id "$run_id" '.n3_run_settled_id=$run_id' ./tc780-private/record.json > ./tc780-private/record.next.json
+      mv ./tc780-private/record.next.json ./tc780-private/record.json
       ;;
   esac
 )
 ```
 
-Before the CVM stop and ledger transaction, run the following on the operator host, and refresh it before every promotion retry or old-container start. `phala cvms get --json` in CLI v1.1.19 exposes the desired Compose image, `in_progress`, and a nullable `progress.target`. Require `in_progress=false` before a ledger change; record the target and reject an unexpected node image target. When Phala desires the old image after an N3 run, manually confirm that the control plane has settled and set `TC780_PHALA_UPDATE_SETTLED_RUN_ID` to that recorded N3 run ID for this attempt. A changed or unreadable desired image halts. When Phala desires N3, the recorded five-minute deadline supplies a finite exit if no N3 container appears. After `rollback_ledger_cleared`, a stopped N3 container is expected and does not block a rollback dispatch retry.
+Before the CVM stop and ledger transaction, run the following on the operator host, and refresh it before every promotion retry or old-container start. `phala cvms get --json` in CLI v1.1.19 exposes the desired Compose image, `in_progress`, and a nullable `progress.target`. Require `in_progress=false` before a ledger change; record the target and reject an unexpected node image target. When Phala desires the old image after a deploy run, manually confirm that the control plane has settled and set `TC780_PHALA_UPDATE_SETTLED_RUN_ID` to the current rollback run ID, or the N3 run ID if no rollback run exists, for this attempt. A changed or unreadable desired image halts. When Phala desires N3, the recorded five-minute deadline supplies a finite exit if no N3 container appears. When Phala desires the old image, the corresponding five-minute deadline permits an old-digest dispatch retry if no old container appears. After `rollback_ledger_cleared`, a stopped N3 container is expected and does not block a rollback dispatch retry.
 
 ```sh
-(
+if (
   set -euo pipefail
   umask 077
   timeout 15 phala cvms get tinycloud-node --json > ./tc780-private/abort-cvm.json
@@ -518,31 +542,39 @@ PY2
     case "$target_image" in "$old"|"$n3") ;; *) echo 'unexpected Phala progress target image; escalate' >&2; exit 1;; esac
     ;;
   esac
-  run_id="$(jq -r '.n3_deploy_run_id // empty' ./tc780-private/record.json)"
+  run_id="$(jq -r '.rollback_deploy_run_id // .n3_deploy_run_id // empty' ./tc780-private/record.json)"
   if test "$desired" = "$old" && test -n "$run_id"; then
-    test "${TC780_PHALA_UPDATE_SETTLED_RUN_ID:-}" = "$run_id" || { echo 'confirm settled Phala update for this N3 run ID' >&2; exit 1; }
+    test "${TC780_PHALA_UPDATE_SETTLED_RUN_ID:-}" = "$run_id" || { echo "confirm settled Phala update for current run ID $run_id" >&2; exit 1; }
   fi
   jq --arg desired "$desired" --argjson target "$target" --argjson in_progress "$(jq -r '.in_progress' ./tc780-private/abort-cvm.json)" --argjson now "$(date +%s)" \
     '.abort_desired_image=$desired | .abort_progress_target=$target | .abort_in_progress=$in_progress |
-     if $desired == ("ghcr.io/tinycloudlabs/tinycloud-node@" + .n3_digest) then
+     if $in_progress == false and $desired == ("ghcr.io/tinycloudlabs/tinycloud-node@" + .n3_digest) then
        .n3_no_container_deadline_epoch //= ($now + 300)
+     elif $in_progress == false and $desired == .running_image and .rollback_dispatch_started_at != null then
+       .old_no_container_deadline_epoch //= ($now + 300)
      else . end' ./tc780-private/record.json > ./tc780-private/record.next.json
   mv ./tc780-private/record.next.json ./tc780-private/record.json
   if ! jq -e '.in_progress == false' ./tc780-private/abort-cvm.json >/dev/null; then
-    echo 'Phala update is in progress; repeat gate by the recorded five-minute deadline, then escalate the operation' >&2
+    echo 'Phala update is in progress; repeat gate when settled, then use the recorded five-minute no-container deadline' >&2
     exit 1
   fi
   printf 'Phala desired node image: %s\n' "$desired"
-)
+); then
+  gate_status=0
+else
+  gate_status=$?
+fi
+unset TC780_PHALA_UPDATE_SETTLED_RUN_ID
+test "$gate_status" -eq 0
 ```
 
-On the CVM set `TC780_ROLLBACK_LEDGER_CLEARED=true` only when `record.json` has `rollback_ledger_cleared_at` and the ledger count is zero. Set `TC780_PHALA_IN_PROGRESS` and `TC780_N3_NO_CONTAINER_DEADLINE_EPOCH` from `record.json`. Set `TC780_OLD_IMAGE`, `TC780_N3_IMAGE`, and `TC780_PHALA_DESIRED_IMAGE` to `running_image`, `ghcr.io/tinycloudlabs/tinycloud-node@<n3_digest>`, and `abort_desired_image` from the operator's `record.json`. Inspect the **running container** as well. An unknown running image or multiple running node containers halts rollback for investigation. Keep these values for the stop and failed-promotion checks below.
+On the CVM set `TC780_ROLLBACK_LEDGER_CLEARED=true` only when `record.json` has `rollback_ledger_cleared_at` and the ledger count is zero. Set `TC780_PHALA_IN_PROGRESS`, `TC780_N3_NO_CONTAINER_DEADLINE_EPOCH`, `TC780_OLD_NO_CONTAINER_DEADLINE_EPOCH`, and `TC780_ROLLBACK_DISPATCH_STARTED_AT` from the record keys `abort_in_progress`, `n3_no_container_deadline_epoch`, `old_no_container_deadline_epoch`, and `rollback_dispatch_started_at`, respectively. Use `jq -er '.abort_in_progress | select(type == "boolean") | tostring'` for the boolean: `jq '.abort_in_progress // empty'` drops `false`. Set `TC780_OLD_IMAGE`, `TC780_N3_IMAGE`, and `TC780_PHALA_DESIRED_IMAGE` to `running_image`, `ghcr.io/tinycloudlabs/tinycloud-node@<n3_digest>`, and `abort_desired_image` from the operator's `record.json`. Inspect the **running container** as well. An unknown running image or multiple running node containers halts rollback for investigation. Keep these values for the stop and failed-promotion checks below.
 
 ```sh
 (
   set -euo pipefail
   test -n "$TC780_OLD_IMAGE" && test -n "$TC780_N3_IMAGE" && test -n "$TC780_PHALA_DESIRED_IMAGE"
-  test "${TC780_PHALA_IN_PROGRESS:-}" = false
+  test "${TC780_PHALA_IN_PROGRESS:-}" = false || { echo "TC780_PHALA_IN_PROGRESS must be false (got ${TC780_PHALA_IN_PROGRESS:-empty}); repeat Phala gate" >&2; exit 1; }
   case "$TC780_PHALA_DESIRED_IMAGE" in "$TC780_OLD_IMAGE"|"$TC780_N3_IMAGE") ;; *) echo 'unexpected Phala desired image; halt rollback' >&2; exit 1;; esac
   node_id="$(docker ps --filter label=com.docker.compose.service=tinycloud --quiet)"
   test "$(printf '%s\n' "$node_id" | grep -c . || true)" -le 1
@@ -565,6 +597,15 @@ On the CVM set `TC780_ROLLBACK_LEDGER_CLEARED=true` only when `record.json` has 
       echo 'N3 did not appear within five minutes; stop any node, clear ledger and promote old digest'
     else
       echo 'N3 has not appeared; repeat gate at recorded five-minute deadline' >&2
+      exit 1
+    fi
+  fi
+  if test "$TC780_PHALA_DESIRED_IMAGE" = "$TC780_OLD_IMAGE" && test -n "${TC780_ROLLBACK_DISPATCH_STARTED_AT:-}" && { test -z "$node_id" || test "$image" != "$TC780_OLD_IMAGE"; }; then
+    test -n "${TC780_OLD_NO_CONTAINER_DEADLINE_EPOCH:-}" || { echo 'old-image no-container deadline missing; repeat Phala gate' >&2; exit 1; }
+    if test "$(date +%s)" -ge "$TC780_OLD_NO_CONTAINER_DEADLINE_EPOCH"; then
+      echo 'Old container did not appear within five minutes; re-run old-digest dispatch block'
+    else
+      echo 'Old container has not appeared; repeat gate at recorded five-minute deadline' >&2
       exit 1
     fi
   fi
@@ -604,6 +645,20 @@ On the operator host, record `phase=rollback_stopped` after the CVM stop check s
 ```sh
 (
   set -euo pipefail
+  phase="$(jq -r '.phase // "unset"' ./tc780-private/record.json)"
+  case "$phase" in
+    stopping|stopped_before_step6|step6_started|step6_applied|step7_never_dispatched|step7_dispatching|step7_running|step7_deployed) ;;
+    *) echo "phase=$phase: follow the rollback table row for $phase before rollback_stopped" >&2; exit 1;;
+  esac
+  jq -e '.abort_in_progress == false' ./tc780-private/record.json >/dev/null || {
+    echo "phase=$phase: Phala is not recorded settled; follow its phase table row and repeat the Phala gate" >&2; exit 1;
+  }
+  case "$phase" in
+    step7_dispatching|step7_running|step7_deployed)
+      jq -e '.n3_deploy_run_id != null and .n3_run_settled_id == .n3_deploy_run_id' ./tc780-private/record.json >/dev/null || {
+        echo "phase=$phase: follow the step7_dispatching/step7_running/step7_deployed table row and settle this N3 run first" >&2; exit 1;
+      };;
+  esac
   jq '.phase="rollback_stopped"' ./tc780-private/record.json > ./tc780-private/record.next.json
   mv ./tc780-private/record.next.json ./tc780-private/record.json
 )
@@ -626,7 +681,9 @@ DO $$ BEGIN
 END $$;
 COMMIT;
 SQL
-  jq --argjson now "$(date +%s)" '.phase="rollback_ledger_cleared" | .rollback_ledger_cleared_at=$now' ./tc780-private/record.json > ./tc780-private/record.next.json
+  rows="$(psql "$TC780_DATABASE_URL" -v ON_ERROR_STOP=1 -Atc "SELECT count(*) FROM seaql_migrations WHERE version IN ('m20261007_000000_database_alias','m20261007_010000_database_identity_fence')")"
+  test "$rows" -eq 0 || { echo 'N3 ledger rows remain; do not record rollback_ledger_cleared' >&2; exit 1; }
+  jq --argjson now "$(date +%s)" '.phase="rollback_ledger_cleared" | .rollback_ledger_cleared_at=$now | del(.n3_no_container_deadline_epoch,.old_no_container_deadline_epoch)' ./tc780-private/record.json > ./tc780-private/record.next.json
   mv ./tc780-private/record.next.json ./tc780-private/record.json
 )
 ```
@@ -718,7 +775,9 @@ If the rollback deploy or its local watcher fails, **do not restart N3** after t
   if test -z "$run_id"; then
     newest="$(gh run list -R TinyCloudLabs/tinycloud-node --workflow docker.yml --branch Codex/roman/rollback-meeting-node-20260915 --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId // 0')"
     test "$newest" -le "$before" || { echo 'newer rollback run is unaccounted for; escalate' >&2; exit 1; }
-    jq 'if has("step6_started_at") then .phase="rollback_ledger_cleared" else .phase="rollback_stopped" end' ./tc780-private/record.json > ./tc780-private/record.next.json
+    rows="$(psql "$TC780_DATABASE_URL" -v ON_ERROR_STOP=1 -Atc "SELECT count(*) FROM seaql_migrations WHERE version IN ('m20261007_000000_database_alias','m20261007_010000_database_identity_fence')")"
+    test "$rows" -eq 0 || { echo 'N3 ledger rows remain; stop all nodes and clear ledger before retry' >&2; exit 1; }
+    jq 'if has("step6_started_at") then .phase="rollback_ledger_cleared" | del(.n3_no_container_deadline_epoch,.old_no_container_deadline_epoch) else .phase="rollback_stopped" end' ./tc780-private/record.json > ./tc780-private/record.next.json
     mv ./tc780-private/record.next.json ./tc780-private/record.json
     echo 'No rollback run after three minutes; repeat Phala/CVM gates and retry old-digest dispatch'
     exit 0
@@ -780,7 +839,7 @@ On the CVM, stop **every running node container**, including an old one, before 
     docker stop "$running_id"
   done <<< "$(docker ps --filter label=com.docker.compose.service=tinycloud --quiet)"
   test "$(docker ps --filter label=com.docker.compose.service=tinycloud --quiet | grep -c . || true)" -eq 0
-  test -n "$old_id" || { echo 'old container absent; keep node stopped and escalate' >&2; exit 1; }
+  test -n "$old_id" || { echo 'old container absent; after the old-image five-minute Phala/CVM gate, re-run old-digest dispatch block' >&2; exit 1; }
   printf 'Stopped all node containers; old container ID: %s\n' "$old_id"
 )
 ```
@@ -801,7 +860,9 @@ DO $$ BEGIN
 END $$;
 COMMIT;
 SQL
-  jq --argjson now "$(date +%s)" '.phase="rollback_ledger_cleared" | .rollback_ledger_cleared_at=$now' ./tc780-private/record.json > ./tc780-private/record.next.json
+  rows="$(psql "$TC780_DATABASE_URL" -v ON_ERROR_STOP=1 -Atc "SELECT count(*) FROM seaql_migrations WHERE version IN ('m20261007_000000_database_alias','m20261007_010000_database_identity_fence')")"
+  test "$rows" -eq 0 || { echo 'N3 ledger rows remain; do not record rollback_ledger_cleared' >&2; exit 1; }
+  jq --argjson now "$(date +%s)" '.phase="rollback_ledger_cleared" | .rollback_ledger_cleared_at=$now | del(.n3_no_container_deadline_epoch,.old_no_container_deadline_epoch)' ./tc780-private/record.json > ./tc780-private/record.next.json
   mv ./tc780-private/record.next.json ./tc780-private/record.json
 )
 ```
