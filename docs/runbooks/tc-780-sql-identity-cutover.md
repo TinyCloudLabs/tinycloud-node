@@ -2,7 +2,7 @@
 
 Production may run **1.19.1 or 1.19.2** when this cutover starts. Preflight records the actual running version, revision and digest; those exact values are the rollback target. Production uses external PlanetScale PostgreSQL metadata, durable SQL artifacts, no DuckDB feature and no local artifact cache. Set `include_duckdb=false`. A production artifact is about **79 MB**; reading its whole payload has crash-restarted this PostgreSQL instance. Every production inventory, backup and drift check below reads artifact **metadata only**. Never select `payload` or `delta_payload` from production, run the offline fingerprint command against production, or take a production dump containing `database_artifact` rows. Never push a `v*` tag.
 
-Use a private encrypted volume on a trusted Linux/amd64 operator host with PostgreSQL 16 tools, Docker, `jq`, `phala@1.1.19` (the version pinned in `docker.yml`), the N3 `tinycloud-sql-identity` CLI and a signed SQL test client. Obtain `TC780_DATABASE_URL` and the sealed trust bundle through the secret manager without echoing them or putting them in shell history. Export `TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_BASE64` from that bundle before the image preflight; require it to be nonempty. Set `TC780_SNAPSHOT_URL` to a fresh empty **local** PostgreSQL database, and provide a throwaway `TC780_REHEARSAL_KEY`. Set `TC780_SMOKE_SPACE` to a space controlled by the operator, with a small SQL database and a known nonsecret marker. If needed, create this fixture through normal signed SQL requests **before** the snapshot; never choose another user's database. All blocks are `set -euo pipefail` subshells; a failed check stops that block without exiting the operator shell. They use `./tc780-private/record.json` to carry values across blocks and to the rollback operator. Protect this directory and delete the dump immediately after restore.
+Use a private encrypted volume on a trusted Linux/amd64 operator host with PostgreSQL 18 `pg_dump`, `pg_restore` and `psql` on `PATH`, a PostgreSQL 18 local snapshot server, Docker, `jq`, `phala@1.1.19` (the version pinned in `docker.yml`), the N3 `tinycloud-sql-identity` CLI and a signed SQL test client. Install the pinned CLI with `npm install -g phala@1.1.19`; export the `tinycloudxyz` token explicitly as `PHALA_CLOUD_API_KEY`, as `docker.yml` does. Obtain `TC780_DATABASE_URL` and the sealed trust bundle through the secret manager without echoing them or putting them in shell history. Export `TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_BASE64` from that bundle before the image preflight; require it to be nonempty. Set `TC780_SNAPSHOT_URL` to a fresh empty **local PostgreSQL 18** database, and provide a throwaway `TC780_REHEARSAL_KEY`. Set `TC780_SMOKE_SPACE` to a space controlled by the operator, with a small SQL database and a known nonsecret marker. If needed, create this fixture through normal signed SQL requests **before** the snapshot; never choose another user's database. All blocks are `set -euo pipefail` subshells; a failed check stops that block without exiting the operator shell. They use `./tc780-private/record.json` to carry values across blocks and to the rollback operator. Protect this directory and delete the dump immediately after restore.
 
 ## Preflight: record image and check migration coverage
 
@@ -13,6 +13,7 @@ Arrange a no-deploy/no-DDL window with the database owner. `pg_dump` must never 
   set -euo pipefail
   umask 077
   mkdir -p ./tc780-private
+  test -n "${PHALA_CLOUD_API_KEY:-}"
   phala cvms get tinycloud-node --json > ./tc780-private/running-cvm.json
   image="$(python3 - <<'PY'
 import json, re
@@ -41,7 +42,7 @@ PY
 
 ## Preflight: protected metadata-only snapshot and full rehearsal
 
-The snapshot deliberately lacks real artifact bytes. N3 writes aliases and fence metadata; it never writes `database_artifact`. Take a protected custom dump with `--exclude-table-data=public.database_artifact`, then export a CSV manifest with `service`, `space`, `name` and the six fingerprint fields (`revision`, `size_bytes`, `checkpoint_content_hash`, `checkpoint_size_bytes`, `delta_content_hash`, `delta_size_bytes`). This uses stored lengths; if an actual byte length is ever needed, use `octet_length()`, never `md5()` or a payload value. A PlanetScale-managed backup is a recommended additional safety step for an operator with PlanetScale access.
+The snapshot deliberately lacks real artifact bytes. N3 writes aliases and fence metadata; it never writes `database_artifact`. Take a protected custom dump with `--exclude-table-data=public.database_artifact`, restore it by its TOC list into the fresh empty local PostgreSQL 18 database without `--clean`, then export a CSV manifest with `service`, `space`, `name` and the six fingerprint fields (`revision`, `size_bytes`, `checkpoint_content_hash`, `checkpoint_size_bytes`, `delta_content_hash`, `delta_size_bytes`). This uses stored lengths; if an actual byte length is ever needed, use `octet_length()`, never `md5()` or a payload value. A PlanetScale-managed backup is a recommended additional safety step for an operator with PlanetScale access.
 
 ```sh
 (
@@ -51,6 +52,7 @@ The snapshot deliberately lacks real artifact bytes. N3 writes aliases and fence
   trap 'rm -f "$dump"' EXIT
   /usr/bin/time -p pg_dump --dbname="$TC780_DATABASE_URL" --format=custom --no-owner --no-privileges \
     --exclude-table-data=public.database_artifact --file="$dump"
+  pg_restore --list "$dump" > ./tc780-private/snapshot.toc
   psql "$TC780_DATABASE_URL" -v ON_ERROR_STOP=1 -c \
     "COPY (SELECT service,space,name,revision,size_bytes,checkpoint_content_hash,checkpoint_size_bytes,delta_content_hash,delta_size_bytes FROM public.database_artifact ORDER BY service,space,name) TO STDOUT WITH CSV HEADER" \
     > ./tc780-private/artifact-metadata.csv
@@ -77,7 +79,7 @@ DO $$ BEGIN
   END IF;
 END $$;
 SQL
-  /usr/bin/time -p pg_restore --dbname="$TC780_SNAPSHOT_URL" --no-owner --no-privileges \
+  /usr/bin/time -p pg_restore --use-list=./tc780-private/snapshot.toc --dbname="$TC780_SNAPSHOT_URL" --no-owner --no-privileges \
     --single-transaction --exit-on-error "$dump"
   rm -f "$dump"
   trap - EXIT
@@ -413,7 +415,7 @@ Abort forward progress immediately at the recorded **20-minute deadline**, or if
 | Recorded phase | Required checks | Next allowed step |
 | --- | --- | --- |
 | `stopping`, `stopped_before_step6` | Ledger has no N3 rows; inspect old container | Start old container and health-check it; if absent, dispatch old digest without a ledger transaction |
-| `step6_started`, `step6_applied` | No step-7 run exists; read Phala `in_progress`, `progress.target`, desired image and CVM containers | If N3 runs and Phala is settled, stop it and clear ledger. If N3 never appears, use the five-minute deadline below, then stop, clear ledger and promote old digest. If still updating at the deadline, escalate the Phala update and repeat this gate before any ledger change |
+| `step6_started`, `step6_applied` | No step-7 run exists; read Phala `in_progress`, desired image and CVM containers | If N3 runs and Phala is settled, stop it and clear ledger. If N3 never appears, use the five-minute deadline below, then stop, clear ledger and promote old digest. If still updating at the deadline, escalate the Phala update and repeat this gate before any ledger change |
 | `step7_dispatching`, `step7_running`, `step7_deployed`, `step7_never_dispatched` | Account for or cancel the step-7 run; apply the same Phala/CVM gate | Stop every node and clear ledger, then promote old digest; when no run was dispatched, the old-container path is also allowed with zero N3 ledger rows |
 | `rollback_stopped` | All node containers stopped; check `step6_started_at` and N3 ledger rows | If step 6 began, run the idempotent ledger transaction and record `rollback_ledger_cleared`; otherwise promote old digest with zero N3 rows |
 | `rollback_ledger_cleared` | Ledger has zero N3 rows; Phala/CVM images known | Dispatch the recorded old digest, including a retry while Phala still desires N3 and no node runs |
@@ -421,7 +423,7 @@ Abort forward progress immediately at the recorded **20-minute deadline**, or if
 | `rollback_deployed` | Phala desires old image, `in_progress=false`, zero N3 rows and old container healthy | Admit traffic and record `rollback_healthy`; if no old container appears within five minutes after `in_progress=false`, re-run the old-digest dispatch block; otherwise stop all nodes, clear ledger and run the recovery ladder |
 | `rollback_healthy` | Old version healthy and zero N3 rows | Observe through the rollback window; investigate and re-enter recovery if health or ledger changes |
 
-Every halt above has a deadline and a next action. The five-minute no-container timers begin only after `in_progress=false` with the corresponding image desired; each is stored in `record.json` and does not restart on repeated checks. At N3 timer expiry, if no N3 container exists, stop any node, clear the ledger and dispatch the old digest. At old-image timer expiry, if no old container exists, re-run the old-digest dispatch block after the Phala/CVM gate. If `in_progress=true` or the target is unexpected, escalate the Phala operation immediately, keep the ledger intact, and repeat the gate after the operation is settled. On a promotion failure, the recovery ladder below stops every node and re-clears any N3 rows before starting 1.19.2. A failed dispatch has a three-minute discovery deadline, then a defined retry. Complete rollback even when the forward outage deadline has expired.
+Every halt above has a deadline and a next action. The five-minute no-container timers begin only after `in_progress=false` with the corresponding image desired; each is stored in `record.json` and does not restart on repeated checks. At N3 timer expiry, if no N3 container exists, stop any node, clear the ledger and dispatch the old digest. At old-image timer expiry, if no old container exists, re-run the old-digest dispatch block after the Phala/CVM gate. If `in_progress=true` or the desired image is unexpected, escalate the Phala operation immediately, keep the ledger intact, and repeat the gate after the operation is settled. On a promotion failure, the recovery ladder below stops every node and re-clears any N3 rows before starting 1.19.2. A failed dispatch has a three-minute discovery deadline, then a defined retry. Complete rollback even when the forward outage deadline has expired.
 
 Before step 9, keep the durable fence on during investigation. After step 9, stop N3 and block traffic before changing metadata. Preserve a separate N3-state backup for analysis if needed; exclude artifact table data from any operator `pg_dump`.
 
@@ -461,11 +463,15 @@ If step 7 was dispatched, cancel its recorded run **before** touching the CVM or
       if test -z "$run_id"; then
         newest="$(gh run list -R TinyCloudLabs/tinycloud-node --workflow docker.yml --branch Codex/roman/rollback-meeting-node-20260915 --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId // 0')"
         test "$newest" -le "$before" || { echo 'newer docker.yml run is unaccounted for; halt rollback' >&2; exit 1; }
+        test -n "${PHALA_CLOUD_API_KEY:-}"
         timeout 15 phala cvms get tinycloud-node --json > ./tc780-private/abort-cvm.json
+        timeout 15 phala cvms get tinycloud-node --json --api-version 2025-10-28 > ./tc780-private/abort-cvm-state.json
         desired="$(python3 - <<'PY'
 import json, re
 from pathlib import Path
 value = json.loads(Path('tc780-private/abort-cvm.json').read_text())
+if not isinstance(value, dict) or value.get('success') is not True:
+    raise SystemExit('Phala desired image is unreadable; halt rollback')
 compose_file = value.get('compose_file', {}) if isinstance(value, dict) else {}
 compose = value if isinstance(value, str) else (compose_file.get('docker_compose_file', '') if isinstance(compose_file, dict) else '')
 if not compose and isinstance(value, dict):
@@ -478,7 +484,7 @@ PY
 )"
         old="$(jq -er '.running_image' ./tc780-private/record.json)"
         test "$desired" = "$old" || { echo 'Phala desired image changed; halt rollback' >&2; exit 1; }
-        jq -e '.in_progress == false and (.progress == null or (.progress | type == "object"))' ./tc780-private/abort-cvm.json >/dev/null
+        jq -e '.success == true and (.in_progress | type) == "boolean" and .in_progress == false' ./tc780-private/abort-cvm-state.json >/dev/null
         dispatch_status="$(jq -r '.n3_dispatch_exit_status // "unrecorded"' ./tc780-private/record.json)"
         case "$dispatch_status" in 0) echo 'dispatch returned success but no run appeared; verified absent after three minutes' ;; *) echo "dispatch status $dispatch_status; verified absent after three minutes" ;; esac
         jq '.phase="step7_never_dispatched"' ./tc780-private/record.json > ./tc780-private/record.next.json
@@ -513,19 +519,21 @@ PY
 )
 ```
 
-Before the CVM stop and ledger transaction, run the following on the operator host, and refresh it before every promotion retry or old-container start. `phala cvms get --json` in CLI v1.1.19 exposes the desired Compose image, `in_progress`, and a nullable `progress.target`. Require `in_progress=false` before a ledger change; record the target and reject an unexpected node image target. When Phala desires the old image after a deploy run, manually confirm that the control plane has settled and set `TC780_PHALA_UPDATE_SETTLED_RUN_ID` to the current rollback run ID, or the N3 run ID if no rollback run exists, for this attempt. A changed or unreadable desired image halts. When Phala desires N3, the recorded five-minute deadline supplies a finite exit if no N3 container appears. When Phala desires the old image, the corresponding five-minute deadline permits an old-digest dispatch retry if no old container appears. After `rollback_ledger_cleared`, a stopped N3 container is expected and does not block a rollback dispatch retry.
+Before the CVM stop and ledger transaction, run the following on the operator host, and refresh it before every promotion retry or old-container start. With Phala CLI v1.1.19, the default API supplies the desired Compose image and `--api-version 2025-10-28` supplies the boolean `in_progress`; both reads must succeed. A missing or nonboolean `in_progress` halts. Treat an update to N3 as in flight only when `in_progress=true` and the desired Compose image is N3; `progress.target` has no observed in-flight shape and is not a decision input. Require `in_progress=false` before a ledger change. When Phala desires the old image after a deploy run, manually confirm that the control plane has settled and set `TC780_PHALA_UPDATE_SETTLED_RUN_ID` to the current rollback run ID, or the N3 run ID if no rollback run exists, for this attempt. A changed or unreadable desired image halts. When Phala desires N3, the recorded five-minute deadline supplies a finite exit if no N3 container appears. When Phala desires the old image, the corresponding five-minute deadline permits an old-digest dispatch retry if no old container appears. After `rollback_ledger_cleared`, a stopped N3 container is expected and does not block a rollback dispatch retry.
 
 ```sh
 (
   set -euo pipefail
   umask 077
+  test -n "${PHALA_CLOUD_API_KEY:-}"
   timeout 15 phala cvms get tinycloud-node --json > ./tc780-private/abort-cvm.json
+  timeout 15 phala cvms get tinycloud-node --json --api-version 2025-10-28 > ./tc780-private/abort-cvm-state.json
   desired="$(python3 - <<'PY2'
 import json, re
 from pathlib import Path
 value = json.loads(Path('tc780-private/abort-cvm.json').read_text())
-if not isinstance(value, dict) or value.get('success') is False or not isinstance(value.get('in_progress'), bool) or (value.get('progress') is not None and not isinstance(value['progress'], dict)):
-    raise SystemExit('Phala progress fields are unreadable; repeat gate or escalate')
+if not isinstance(value, dict) or value.get('success') is not True:
+    raise SystemExit('Phala desired image is unreadable; repeat gate or escalate')
 compose_file = value.get('compose_file', {})
 compose = compose_file.get('docker_compose_file', '') if isinstance(compose_file, dict) else compose_file
 if not compose:
@@ -539,26 +547,21 @@ PY2
   old="$(jq -er '.running_image' ./tc780-private/record.json)"
   n3="ghcr.io/tinycloudlabs/tinycloud-node@$(jq -er '.n3_digest' ./tc780-private/record.json)"
   case "$desired" in "$old"|"$n3") ;; *) echo 'unexpected Phala desired image; halt rollback' >&2; exit 1;; esac
-  target="$(jq -c '.progress.target' ./tc780-private/abort-cvm.json)"
-  target_image="$(jq -r '.progress.target | if type == "string" then . else empty end' ./tc780-private/abort-cvm.json)"
-  case "$target_image" in ghcr.io/tinycloudlabs/tinycloud-node@*)
-    case "$target_image" in "$old"|"$n3") ;; *) echo 'unexpected Phala progress target image; escalate' >&2; exit 1;; esac
-    ;;
-  esac
+  in_progress="$(jq -er 'if .success == true and (.in_progress | type) == "boolean" then .in_progress | tostring else error("Phala in_progress is unreadable") end' ./tc780-private/abort-cvm-state.json)"
   run_id="$(jq -r '.rollback_deploy_run_id // .n3_deploy_run_id // empty' ./tc780-private/record.json)"
-  if test "$desired" = "$old" && test -n "$run_id"; then
+  if test "$in_progress" = false && test "$desired" = "$old" && test -n "$run_id"; then
     test "${TC780_PHALA_UPDATE_SETTLED_RUN_ID:-}" = "$run_id" || { echo "confirm settled Phala update for current run ID $run_id" >&2; exit 1; }
   fi
-  jq --arg desired "$desired" --argjson target "$target" --argjson in_progress "$(jq -r '.in_progress' ./tc780-private/abort-cvm.json)" --argjson now "$(date +%s)" \
-    '.abort_desired_image=$desired | .abort_progress_target=$target | .abort_in_progress=$in_progress |
+  jq --arg desired "$desired" --argjson in_progress "$in_progress" --argjson now "$(date +%s)" \
+    '.abort_desired_image=$desired | .abort_in_progress=$in_progress |
      if $in_progress == false and $desired == ("ghcr.io/tinycloudlabs/tinycloud-node@" + .n3_digest) then
        .n3_no_container_deadline_epoch //= ($now + 300)
      elif $in_progress == false and $desired == .running_image and .rollback_dispatch_started_at != null then
        .old_no_container_deadline_epoch //= ($now + 300)
      else . end' ./tc780-private/record.json > ./tc780-private/record.next.json
   mv ./tc780-private/record.next.json ./tc780-private/record.json
-  if ! jq -e '.in_progress == false' ./tc780-private/abort-cvm.json >/dev/null; then
-    echo 'Phala update is in progress; repeat gate when settled, then use the recorded five-minute no-container deadline' >&2
+  if test "$in_progress" = true; then
+    echo "Phala update is in progress toward desired image $desired; repeat gate when settled, then use the recorded five-minute no-container deadline" >&2
     exit 1
   fi
   printf 'Phala desired node image: %s\n' "$desired"
