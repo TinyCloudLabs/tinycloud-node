@@ -2,7 +2,7 @@
 
 Production may run **1.19.1 or 1.19.2** when this cutover starts. Preflight records the actual running version, revision and digest; those exact values are the rollback target. Production uses external PlanetScale PostgreSQL metadata, durable SQL artifacts, no DuckDB feature and no local artifact cache. Set `include_duckdb=false`. A production artifact is about **79 MB**; reading its whole payload has crash-restarted this PostgreSQL instance. Every production inventory, backup and drift check below reads artifact **metadata only**. Never select `payload` or `delta_payload` from production, run the offline fingerprint command against production, or take a production dump containing `database_artifact` rows. Never push a `v*` tag.
 
-Use a private encrypted volume on a trusted Linux/amd64 operator host with PostgreSQL 18 `pg_dump`, `pg_restore` and `psql` on `PATH`, a PostgreSQL 18 local snapshot server, Docker, `jq`, `phala@1.1.19` (the version pinned in `docker.yml`), the N3 `tinycloud-sql-identity` CLI and a signed SQL test client. Install the pinned CLI with `npm install -g phala@1.1.19`; export the `tinycloudxyz` token explicitly as `PHALA_CLOUD_API_KEY`, as `docker.yml` does. Obtain `TC780_DATABASE_URL` and the sealed trust bundle through the secret manager without echoing them or putting them in shell history. Export `TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_BASE64` from that bundle before the image preflight; require it to be nonempty. Set `TC780_SNAPSHOT_URL` to a fresh empty **local PostgreSQL 18** database, and provide a throwaway `TC780_REHEARSAL_KEY`. Set `TC780_SMOKE_SPACE` to a space controlled by the operator, with a small SQL database and a known nonsecret marker. If needed, create this fixture through normal signed SQL requests **before** the snapshot; never choose another user's database. All blocks are `set -euo pipefail` subshells; a failed check stops that block without exiting the operator shell. They use `./tc780-private/record.json` to carry values across blocks and to the rollback operator. Protect this directory and delete the dump immediately after restore.
+Use a private encrypted volume on a trusted Linux/amd64 operator host with PostgreSQL 18 `pg_dump`, `pg_restore` and `psql` on `PATH`, a PostgreSQL 18 local snapshot server, Docker, `jq`, `phala@1.1.19` (the version pinned in `docker.yml`), the N3 `tinycloud-sql-identity` CLI and a signed SQL test client. Install the pinned CLI with `npm install -g phala@1.1.19`; export the `tinycloudxyz` token explicitly as `PHALA_CLOUD_API_KEY`, as `docker.yml` does. Obtain `TC780_DATABASE_URL` and the sealed trust bundle through the secret manager without echoing them or putting them in shell history. Set `PGSSLROOTCERT` to a readable CA bundle **file** (for example `/opt/homebrew/etc/openssl@3/cert.pem` on macOS), never `system`: `psql` accepts `PGSSLROOTCERT=system` but the N3 CLI treats it as a file path. Export `TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_BASE64` from that bundle before the image preflight; require it to be nonempty. Set `TC780_SNAPSHOT_URL` to a fresh empty **local PostgreSQL 18** database, and provide a throwaway `TC780_REHEARSAL_KEY`. Set `TC780_SMOKE_SPACE` to a space controlled by the operator, with a small SQL database and a known nonsecret marker. If needed, create this fixture through normal signed SQL requests **before** the snapshot; never choose another user's database. All blocks are `set -euo pipefail` subshells; a failed check stops that block without exiting the operator shell. They use `./tc780-private/record.json` to carry values across blocks and to the rollback operator. Protect this directory and retain the pre-outage dump through the cutover observation window.
 
 ## Preflight: record image and check migration coverage
 
@@ -14,6 +14,7 @@ Arrange a no-deploy/no-DDL window with the database owner. `pg_dump` must never 
   umask 077
   mkdir -p ./tc780-private
   test -n "${PHALA_CLOUD_API_KEY:-}"
+  test -r "${PGSSLROOTCERT:?set PGSSLROOTCERT to a CA bundle file}"
   phala cvms get tinycloud-node --json > ./tc780-private/running-cvm.json
   image="$(python3 - <<'PY'
 import json, re
@@ -37,22 +38,33 @@ PY
   jq -n --arg image "$image" --arg digest "${image##*@}" --arg revision "$revision" --arg version "$version" \
     '{running_image:$image,running_digest:$digest,running_revision:$revision,running_version:$version}' > ./tc780-private/record.json
   "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" check-migrations
+  ledger_state="$(psql "$TC780_DATABASE_URL" -v ON_ERROR_STOP=1 -Atc "SELECT count(*)::text || ':' || count(*) FILTER (WHERE version IN ('m20261007_000000_database_alias','m20261007_010000_database_identity_fence'))::text FROM seaql_migrations")"
+  test "$ledger_state" = '23:0' || { echo "expected all 23 pre-N3 migrations and no N3 rows; got $ledger_state" >&2; exit 1; }
 )
 ```
 
 ## Preflight: protected metadata-only snapshot and full rehearsal
 
-The snapshot deliberately lacks real artifact bytes. N3 writes aliases and fence metadata; it never writes `database_artifact`. Take a protected custom dump with `--exclude-table-data=public.database_artifact`, restore it by its TOC list into the fresh empty local PostgreSQL 18 database without `--clean`, then export a CSV manifest with `service`, `space`, `name` and the six fingerprint fields (`revision`, `size_bytes`, `checkpoint_content_hash`, `checkpoint_size_bytes`, `delta_content_hash`, `delta_size_bytes`). This uses stored lengths; if an actual byte length is ever needed, use `octet_length()`, never `md5()` or a payload value. A PlanetScale-managed backup is a recommended additional safety step for an operator with PlanetScale access.
+The snapshot deliberately lacks real artifact bytes. N3 writes aliases and fence metadata; it never writes `database_artifact`. Take a protected custom dump with `--exclude-table-data=public.database_artifact`, restore it by its TOC list into the fresh empty local PostgreSQL 18 database without `--clean`, then export a CSV manifest with `service`, `space`, `name` and the six fingerprint fields (`revision`, `size_bytes`, `checkpoint_content_hash`, `checkpoint_size_bytes`, `delta_content_hash`, `delta_size_bytes`). This uses stored lengths; if an actual byte length is ever needed, use `octet_length()`, never `md5()` or a payload value. Record the dump's UTC completion time: it is the pre-outage metadata recovery point taken while the old node serves. PlanetScale's automatic backups provide complete managed recovery, including artifact bytes omitted from the operator dump.
 
 ```sh
 (
   set -euo pipefail
   umask 077
-  dump="$(mktemp ./tc780-private/snapshot.XXXXXXXX.dump)"
+  dump="$(mktemp ./tc780-private/snapshot.dump.XXXXXXXX)"
   trap 'rm -f "$dump"' EXIT
   /usr/bin/time -p pg_dump --dbname="$TC780_DATABASE_URL" --format=custom --no-owner --no-privileges \
     --exclude-table-data=public.database_artifact --file="$dump"
+  trap - EXIT
   pg_restore --list "$dump" > ./tc780-private/snapshot.toc
+  awk '$0 !~ /^;/ && ($0 ~ / SCHEMA - public / || $0 ~ / SCHEMA - pscale_extensions / || $0 ~ / EXTENSION - hypopg / || $0 ~ / COMMENT - EXTENSION hypopg /) {print ";" $0; next} {print}' \
+    ./tc780-private/snapshot.toc > ./tc780-private/snapshot.restore.toc
+  test "$(grep -Ec '^;[0-9]+;.*(SCHEMA - pscale_extensions|EXTENSION - hypopg|COMMENT - EXTENSION hypopg)' ./tc780-private/snapshot.restore.toc)" -eq 3
+  ! grep -E '^[0-9]+;.*(SCHEMA - pscale_extensions|EXTENSION - hypopg|COMMENT - EXTENSION hypopg)' ./tc780-private/snapshot.restore.toc
+  jq --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg dump "$dump" \
+    '.pre_outage_snapshot_completed_at=$at | .pre_outage_snapshot=$dump' \
+    ./tc780-private/record.json > ./tc780-private/record.next.json
+  mv ./tc780-private/record.next.json ./tc780-private/record.json
   psql "$TC780_DATABASE_URL" -v ON_ERROR_STOP=1 -c \
     "COPY (SELECT service,space,name,revision,size_bytes,checkpoint_content_hash,checkpoint_size_bytes,delta_content_hash,delta_size_bytes FROM public.database_artifact ORDER BY service,space,name) TO STDOUT WITH CSV HEADER" \
     > ./tc780-private/artifact-metadata.csv
@@ -79,10 +91,8 @@ DO $$ BEGIN
   END IF;
 END $$;
 SQL
-  /usr/bin/time -p pg_restore --use-list=./tc780-private/snapshot.toc --dbname="$TC780_SNAPSHOT_URL" --no-owner --no-privileges \
+  /usr/bin/time -p pg_restore --use-list=./tc780-private/snapshot.restore.toc --dbname="$TC780_SNAPSHOT_URL" --no-owner --no-privileges \
     --single-transaction --exit-on-error "$dump"
-  rm -f "$dump"
-  trap - EXIT
   psql "$TC780_SNAPSHOT_URL" -v ON_ERROR_STOP=1 -c \
     'CREATE TABLE tc780_artifact_manifest (service text, space text, name text, revision bigint, size_bytes bigint, checkpoint_content_hash text, checkpoint_size_bytes bigint, delta_content_hash text, delta_size_bytes bigint)'
   psql "$TC780_SNAPSHOT_URL" -v ON_ERROR_STOP=1 -c \
@@ -98,7 +108,7 @@ DROP TABLE tc780_artifact_manifest;
 COMMIT;
 SQL
   "$TC780_CLI" --datadir "$TC780_SNAPSHOT_DATADIR" --database "$TC780_SNAPSHOT_URL" check-migrations
-  "$TC780_CLI" --datadir "$TC780_SNAPSHOT_DATADIR" --database "$TC780_SNAPSHOT_URL" dry-run > ./tc780-private/preflight-inventory.json
+  /usr/bin/time -p "$TC780_CLI" --datadir "$TC780_SNAPSHOT_DATADIR" --database "$TC780_SNAPSHOT_URL" dry-run > ./tc780-private/preflight-inventory.json
   jq -e --arg smoke_space "$TC780_SMOKE_SPACE" '[.[] | select(.service == "sql" and .space == $smoke_space and .durable and .classification == "unique" and
     (.paths | length) == 1 and (.paths[0] | type) == "string" and
     (.paths[0] | startswith("web/")) and .metadata != null and
@@ -211,7 +221,7 @@ SQL
 )
 ```
 
-Record measured `pg_restore` and index-build times, migration results, boot log and signed smoke outputs. Retain private inventory reports for drift comparison. Destroy the local snapshot after approval. The artifact metadata CSV is sensitive; protect and delete it after cutover. The local `--network none` image check uses a dummy PostgreSQL URL with the same TLS shape; `--validate-config` does no database I/O. The deployment workflow validates its own configured secret.
+Record measured `pg_restore` and index-build times, migration results, boot log and signed smoke outputs. Retain the encrypted pre-outage dump and private inventory reports for drift comparison; destroy the restored local snapshot after approval. The artifact metadata CSV is sensitive; protect and delete it after cutover. The local `--network none` image check uses a dummy PostgreSQL URL with the same TLS shape; `--validate-config` does no database I/O. The deployment workflow validates its own configured secret.
 
 Before step 2, confirm the dispatch gate and frozen release ref. These checks must pass again immediately before step 7:
 
@@ -224,21 +234,59 @@ Before step 2, confirm the dispatch gate and frozen release ref. These checks mu
 )
 ```
 
+Just before step 2, time one **read-only** `dry-run` against the still-serving production database. It selects artifact metadata and `resource`, never artifact bytes. This captures PlanetScale latency as well as row count; do not begin the outage if it takes over 45 seconds or if its identities, paths, classification or collisions differ from the snapshot baseline. The outage repeats this drift check after stopping the node, then `apply` re-inventories inside its transaction. These fresh checks retain the review's abort-on-new-database-or-identity guarantee.
+
+```sh
+(
+  set -euo pipefail
+  started="$(date +%s)"
+  /usr/bin/time -p timeout 45 "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" dry-run \
+    > ./tc780-private/serving-inventory.json
+  seconds="$(($(date +%s) - started))"
+  test "$seconds" -le 45
+  for phase in preflight serving; do
+    jq -S '[.[] | {service,space,physical_name,paths,classification,collision}] | sort_by(.service,.space,.physical_name)' \
+      "./tc780-private/$phase-inventory.json" > "./tc780-private/$phase-identities.json"
+  done
+  cmp ./tc780-private/preflight-identities.json ./tc780-private/serving-identities.json
+  jq --argjson seconds "$seconds" '.serving_dry_run_seconds=$seconds' \
+    ./tc780-private/record.json > ./tc780-private/record.next.json
+  mv ./tc780-private/record.next.json ./tc780-private/record.json
+)
+```
+
+Immediately before step 2, Sam may take a **manual PlanetScale backup in the web console**. The operator cannot create one from this host. Record `taken` only after Sam confirms it, otherwise record `not_taken` and continue; this checkpoint does not block the cutover. PlanetScale automatic backups remain the complete disaster-recovery basis alongside the timestamped pre-outage metadata dump.
+
+```sh
+(
+  set -euo pipefail
+  status="${TC780_MANUAL_BACKUP_STATUS:-not_taken}"
+  case "$status" in taken|not_taken) ;; *) echo 'manual backup status must be taken or not_taken' >&2; exit 1;; esac
+  jq --arg status "$status" '.planetscale_manual_backup=$status' \
+    ./tc780-private/record.json > ./tc780-private/record.next.json
+  mv ./tc780-private/record.next.json ./tc780-private/record.json
+)
+```
+
 ## Outage and user impact
 
-| Phase | Budget | Service state |
+| Step | Expected time and cutoff | Service state |
 | --- | --- | --- |
-| Snapshot, metadata rehearsal, image extraction, config preflight and signed smoke | Measured before outage | Recorded old version serving |
-| Stop, drain, backup, drift check and alias transaction | Measured backup and migration time | Whole node down, including KV |
-| Step 7, promote pinned N3 digest | 5–10 minutes | Whole-node outage ends when healthy; SQL fenced |
-| Step 8, verify transaction-time metadata | Measured rehearsal time | KV serving; SQL fenced |
-| Step 9, signed SQL smoke and CLI unfence | A few minutes | SQL resumes without redeploy |
+| 1. Snapshot, metadata rehearsal, image, signed smoke and production timing gate | Production metadata dump measured 41 min; full serving `dry-run` must finish within 45 s; all before outage | Old version serving |
+| 2. Stop and drain | Up to 1 min | Whole node down, including KV |
+| 3. Public schema, migration ledger and artifact metadata backup | Local PG18: 1.45 s + 0.39 s for dumps; cap 2 min including manifest | Whole node down |
+| 4–5. Migration coverage and fresh identity/path/classification drift check | Scaled PG18 `dry-run`: 15.79 s; allow 2 min including checks, with a 90 s scan cutoff | Whole node down; abort on any new database or identity |
+| 6. Durable fence and alias transaction | Scaled PG18 `apply`: 6.93 s; allow 2 min, with a 90 s scan cutoff | Whole node down; SQL fenced |
+| 7. Promote pinned N3 digest | 5–10 min, bounded by the 20-minute global deadline | Whole-node outage ends when healthy; SQL fenced |
+| 8. Report and verify transaction-time metadata | Scaled PG18 `report`: 4.69 s; allow 2 min | KV serving; SQL fenced |
+| 9. Signed SQL smoke and CLI unfence | A few minutes | SQL resumes without redeploy |
+| 10. Observe SQL, KV and artifacts | Through the observation window | Service serving |
 
-The maximum whole-node outage is **20 minutes from the stop in step 2**. The recorded `outage_deadline_epoch` is the abort-at-T trigger: before any next action, and while watching a deployment, stop forward progress when it is reached and take the abort path below. An operator should also watch the clock during long `pg_dump` and `apply` commands. N3 changes SQL/DuckDB identity scoping. Hook subscriptions on table-suffixed SQL/DuckDB paths stop firing; TC-541 already deactivated older hook subscriptions, so this affects subscriptions registered since 1.17.4. TC-730 also rotates hook tickets to v3 and changes subscription prefix matching to literal path segments. Communicate these changes before the cutover.
+The 20-minute whole-node outage starts at the step-2 stop. The explicit allowances above reserve **at least 3 minutes** after a worst-case 10-minute step-7 deploy (1 + 2 + 2 + 2 + 10 = 17 minutes). The inventory fixture had 612,091 `ability` and 1,546,356 `invoked_abilities` rows, matching production row estimates, plus 715 synthetic metadata-only artifacts with uniquely attributed paths. Its heaps were 59 and 137 MiB, versus production's 115 and 386 MiB. The first scaled `dry-run` took 15.79 seconds and `apply` 6.93 seconds locally. Scaling the scan portion by heap bytes gives about **23 seconds** for production inventory before network latency; the serving-database 45-second gate measures that latency before the stop. The full fresh scan stays inside the outage because the measured production cost must pass this gate; it catches any new database or identity without relying on asynchronous statistics or payload reads. If an in-outage scan exceeds 90 seconds, abort rather than consume the deployment reserve. The recorded `outage_deadline_epoch` is the abort-at-T trigger: before any next action, and while watching a deployment, stop forward progress when it is reached and take the abort path below. N3 changes SQL/DuckDB identity scoping. Hook subscriptions on table-suffixed SQL/DuckDB paths stop firing; TC-541 already deactivated older hook subscriptions, so this affects subscriptions registered since 1.17.4. TC-730 also rotates hook tickets to v3 and changes subscription prefix matching to literal path segments. Communicate these changes before the cutover.
 
 ## Steps 2–6: stop, protected backup, drift check, durable fence
 
-Stop exactly the `tinycloud` compose service on the CVM and drain active requests. There is no local artifact cache volume. Keep the recorded old node stopped after N3 migrations enter the ledger. The new backup excludes artifact data; its metadata manifest is separate. A PlanetScale-managed backup is recommended for full disaster recovery. Do not overlap this dump with a deploy or DDL.
+Stop exactly the `tinycloud` compose service on the CVM and drain active requests. There is no local artifact cache volume. Keep the recorded old node stopped after N3 migrations enter the ledger. Step 3 saves the public schema and the 23-row `seaql_migrations` ledger only; it never reads ledger-table or artifact rows. The two N3 migrations create only `database_alias`, `database_legacy_artifact`, and `database_identity_fence`, and Migrator records their two versions in `seaql_migrations`. `fence` and `apply` write only those new tables; `report` is read-only. The ordinary rollback SQL below drops the three tables and deletes the two version rows; it neither reads nor restores `invocation`, `invoked_abilities`, `parent_delegation`, `event_order`, `epoch_order`, `ability`, or `epoch`. The pre-outage metadata dump and PlanetScale automatic backups cover disaster recovery. Do not overlap either step-3 dump with a deploy or DDL.
 
 ```sh
 (
@@ -280,17 +328,27 @@ On the CVM:
   test "$(date +%s)" -lt "$deadline"
   jq '.phase="stopped_before_step6"' ./tc780-private/record.json > ./tc780-private/record.next.json
   mv ./tc780-private/record.next.json ./tc780-private/record.json
-  backup="./tc780-private/pre-cutover-$(date -u +%Y%m%dT%H%M%SZ).dump"
-  budget /usr/bin/time -p pg_dump --dbname="$TC780_DATABASE_URL" --format=custom --no-owner --no-privileges \
-    --exclude-table-data=public.database_artifact --file="$backup"
-  budget psql "$TC780_DATABASE_URL" -v ON_ERROR_STOP=1 -c \
+  backup_base="./tc780-private/pre-cutover-$(date -u +%Y%m%dT%H%M%SZ)"
+  schema_backup="$backup_base.schema.dump"
+  ledger_backup="$backup_base.ledger.dump"
+  step3_start="$(date +%s)"
+  budget timeout 45 /usr/bin/time -p pg_dump --dbname="$TC780_DATABASE_URL" --format=custom --no-owner --no-privileges \
+    --schema=public --schema-only --file="$schema_backup"
+  budget timeout 30 /usr/bin/time -p pg_dump --dbname="$TC780_DATABASE_URL" --format=custom --no-owner --no-privileges \
+    --table=public.seaql_migrations --data-only --file="$ledger_backup"
+  budget timeout 30 psql "$TC780_DATABASE_URL" -v ON_ERROR_STOP=1 -c \
     "COPY (SELECT service,space,name,revision,size_bytes,checkpoint_content_hash,checkpoint_size_bytes,delta_content_hash,delta_size_bytes FROM public.database_artifact ORDER BY service,space,name) TO STDOUT WITH CSV HEADER" \
     > ./tc780-private/outage-artifact-metadata.csv
-  shasum -a 256 "$backup" > "$backup.sha256"
-  jq --arg backup "$backup" '. + {backup:$backup}' ./tc780-private/record.json > ./tc780-private/record.next.json
+  step3_seconds="$(($(date +%s) - step3_start))"
+  test "$step3_seconds" -le 120 || { echo 'step 3 exceeded its 2-minute cap; abort forward progress' >&2; exit 1; }
+  shasum -a 256 "$schema_backup" "$ledger_backup" > "$backup_base.sha256"
+  jq --arg schema "$schema_backup" --arg ledger "$ledger_backup" --argjson seconds "$step3_seconds" \
+    '. + {schema_backup:$schema,ledger_backup:$ledger,step3_seconds:$seconds}' ./tc780-private/record.json > ./tc780-private/record.next.json
   mv ./tc780-private/record.next.json ./tc780-private/record.json
   budget "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" check-migrations
-  budget "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" dry-run > ./tc780-private/outage-inventory.json
+  ledger_state="$(budget psql "$TC780_DATABASE_URL" -v ON_ERROR_STOP=1 -Atc "SELECT count(*)::text || ':' || count(*) FILTER (WHERE version IN ('m20261007_000000_database_alias','m20261007_010000_database_identity_fence'))::text FROM seaql_migrations")"
+  test "$ledger_state" = '23:0' || { echo "migration ledger changed before N3; got $ledger_state" >&2; exit 1; }
+  budget timeout 90 /usr/bin/time -p "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" dry-run > ./tc780-private/outage-inventory.json
   python3 - <<'PY'
 import csv
 from pathlib import Path
@@ -307,9 +365,8 @@ PY
   test "$(date +%s)" -lt "$deadline"
   jq --argjson now "$(date +%s)" '.phase="step6_started" | .step6_started_at=$now' ./tc780-private/record.json > ./tc780-private/record.next.json
   mv ./tc780-private/record.next.json ./tc780-private/record.json
-  budget "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" fence on
-  budget "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" apply > ./tc780-private/tc780-applied.json
-  budget "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" report > ./tc780-private/aliases.json
+  budget timeout 30 "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" fence on
+  budget timeout 90 /usr/bin/time -p "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" apply > ./tc780-private/tc780-applied.json
   jq '.phase="step6_applied"' ./tc780-private/record.json > ./tc780-private/record.next.json
   mv ./tc780-private/record.next.json ./tc780-private/record.json
 )
@@ -373,6 +430,7 @@ Require `/healthz` and `/version` to report healthy 1.20.0. A signed SQL `/invok
 ```sh
 (
   set -euo pipefail
+  /usr/bin/time -p "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" report > ./tc780-private/aliases.json
   "$TC780_CLI" --datadir "$TC780_DATADIR" --database "$TC780_DATABASE_URL" verify \
     --baseline ./tc780-private/tc780-applied.json > ./tc780-private/verified.json
   baseline_aliases="$(jq -er '.aliases | if type == "array" then length else error("step-6 alias baseline is not an array") end' ./tc780-private/aliases.json)"
@@ -908,16 +966,17 @@ If the post-deploy ledger assertion fails, block traffic and repair the ledger w
 
 TC-767's ancestry guard is roll-forward only. `allow_non_descendant=true` plus the recorded digest/version/revision is its sanctioned emergency override; the workflow validates those labels. The N3 image-only config preflight is skipped for the old rollback image, while Compose validation still runs. Verify `/healthz`, `/version` matches `running_version` in the record and the approved signed SQL read.
 
-**Never run `pg_restore --clean` with this operator dump on production.** The dump contains `database_artifact` schema but no artifact rows: a clean restore drops the production table and recreates it empty, wiping every artifact. It also loses every write since step 7: KV, delegations, invocations and shares, plus SQL writes after step 9. For disaster recovery, prefer a complete PlanetScale-managed backup. If recovering selected metadata from the operator dump, build a TOC list and exclude every artifact entry, then restore **to a fresh recovery database**, never directly to production:
+**Never run `pg_restore --clean` with either operator dump on production.** The pre-outage dump contains `database_artifact` schema but no artifact rows: a clean restore drops the production table and recreates it empty, wiping every artifact. It also loses every later write: KV, delegations, invocations and shares, plus SQL writes after step 9. For disaster recovery, prefer a complete PlanetScale-managed backup. If recovering selected metadata from the timestamped pre-outage dump, exclude every artifact entry and the three PlanetScale-only TOC entries, then restore **to a fresh recovery database**, never directly to production:
 
 ```sh
 (
   set -euo pipefail
-  dump="$(jq -er '.backup' ./tc780-private/record.json)"
+  dump="$(jq -er '.pre_outage_snapshot' ./tc780-private/record.json)"
   pg_restore -l "$dump" > ./tc780-private/recovery.toc
-  awk '/database_artifact/ && $0 !~ /^;/ {print ";" $0; next} {print}' \
+  awk '$0 !~ /^;/ && ($0 ~ /database_artifact/ || $0 ~ / SCHEMA - public / || $0 ~ / SCHEMA - pscale_extensions / || $0 ~ / EXTENSION - hypopg / || $0 ~ / COMMENT - EXTENSION hypopg /) {print ";" $0; next} {print}' \
     ./tc780-private/recovery.toc > ./tc780-private/recovery-without-artifacts.toc
-  ! grep -E '^[0-9]+;.*database_artifact' ./tc780-private/recovery-without-artifacts.toc
+  test "$(grep -Ec '^;[0-9]+;.*(SCHEMA - pscale_extensions|EXTENSION - hypopg|COMMENT - EXTENSION hypopg)' ./tc780-private/recovery-without-artifacts.toc)" -eq 3
+  ! grep -E '^[0-9]+;.*(database_artifact|SCHEMA - pscale_extensions|EXTENSION - hypopg|COMMENT - EXTENSION hypopg)' ./tc780-private/recovery-without-artifacts.toc
   pg_restore --use-list=./tc780-private/recovery-without-artifacts.toc \
     --no-owner --no-privileges --single-transaction --exit-on-error \
     --dbname="$TC780_FRESH_RECOVERY_URL" "$dump"
