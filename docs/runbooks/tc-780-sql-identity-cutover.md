@@ -54,7 +54,30 @@ The snapshot deliberately lacks real artifact bytes. N3 writes aliases and fence
   psql "$TC780_DATABASE_URL" -v ON_ERROR_STOP=1 -c \
     "COPY (SELECT service,space,name,revision,size_bytes,checkpoint_content_hash,checkpoint_size_bytes,delta_content_hash,delta_size_bytes FROM public.database_artifact ORDER BY service,space,name) TO STDOUT WITH CSV HEADER" \
     > ./tc780-private/artifact-metadata.csv
-  /usr/bin/time -p pg_restore --dbname="$TC780_SNAPSHOT_URL" --clean --if-exists --no-owner --no-privileges \
+  test "$TC780_SNAPSHOT_URL" != "$TC780_DATABASE_URL"
+  python3 - "$TC780_SNAPSHOT_URL" <<'PY'
+import ipaddress
+import sys
+from urllib.parse import urlsplit
+url = urlsplit(sys.argv[1])
+host = url.hostname
+if url.scheme not in ('postgres', 'postgresql') or not host or not (host == 'localhost' or ipaddress.ip_address(host).is_loopback):
+    raise SystemExit('snapshot URL must name a loopback PostgreSQL host')
+PY
+  psql "$TC780_SNAPSHOT_URL" -v ON_ERROR_STOP=1 <<'SQL'
+DO $$ BEGIN
+  IF NOT (inet_server_addr() <<= inet '127.0.0.0/8' OR inet_server_addr() = inet '::1') THEN
+    RAISE EXCEPTION 'snapshot connection is not loopback';
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg_toast%')
+     OR EXISTS (SELECT 1 FROM pg_namespace
+                WHERE nspname NOT IN ('public', 'pg_catalog', 'information_schema') AND nspname NOT LIKE 'pg_toast%' AND nspname NOT LIKE 'pg_temp_%') THEN
+    RAISE EXCEPTION 'snapshot target database is not empty';
+  END IF;
+END $$;
+SQL
+  /usr/bin/time -p pg_restore --dbname="$TC780_SNAPSHOT_URL" --no-owner --no-privileges \
     --single-transaction --exit-on-error "$dump"
   rm -f "$dump"
   trap - EXIT
@@ -98,6 +121,8 @@ SQL
 The placeholder payloads above are **only** for migration and metadata rehearsal. Never serve them to users. `smoke-choice.json` selects the smallest attributed web SQL artifact under 1 MiB **in `TC780_SMOKE_SPACE`**, by metadata, and records its exact path. If none is suitable, create a small authorized SQL fixture in that operator-controlled space while the old node still serves, then retake the metadata snapshot and repeat preflight. Build its rehearsal payload locally as a small SQLite database and replace **only its snapshot placeholder** with synthetic bytes. Do not copy any production artifact payload. Provide `TC780_SYNTHETIC_ARTIFACT_CSV`, a locally generated one-row CSV with columns `payload_hex,content_hash`; its hash must be the node's content CID for the synthetic SQLite bytes. The signed test client must have matching snapshot authorization and a known nonsecret row marker. Provide fresh `TC780_SQL_REHEARSAL_FENCED_BODY`/`TC780_SQL_REHEARSAL_FENCED_HEADERS`, `TC780_SQL_REHEARSAL_OPEN_BODY`/`TC780_SQL_REHEARSAL_OPEN_HEADERS`, and `TC780_SQL_REHEARSAL_SHORT_BODY`/`TC780_SQL_REHEARSAL_SHORT_HEADERS`. Preflight fails unless the fenced read is unavailable, the exact-path read succeeds after CLI `fence off`, and the short-path read fails. The same client supplies three fresh signed request bodies and header files for step 9. Do not use a version response as the SQL smoke gate.
 
 The optional `offline-fingerprint --local-snapshot` command reads full artifact bytes for schema and row counts. It refuses remote database URLs and must be used only on a local copy whose artifacts are all synthetic or small. It is not part of the production inventory, apply, report or verify path.
+
+Merge into `Codex/roman/rollback-meeting-node-20260915` with a **merge commit** that retains the running production revision as an ancestor. Do not squash, rebase or force-update this release line: `docker.yml` checks `git merge-base --is-ancestor` before deployment.
 
 After the reviewed release-line merge and `docker.yml` `workflow_dispatch` build (`deploy_phala=false`, `include_duckdb=false`, `image_version=1.20.0`), export `TC780_N3_DIGEST=sha256:<full build digest>` and `TC780_MERGED_REVISION=<full merged commit SHA>` from the completed build, then pin both in the record below. The repository variable `TC780_CUTOVER_READY=true` permits the dispatch; keep it true through the rollback window. Before step 2, a repository administrator must apply a temporary GitHub ruleset to `refs/heads/Codex/roman/rollback-meeting-node-20260915` that restricts updates and force pushes; the release owner must hold the merge queue and reserve `docker.yml` dispatches for this cutover. Record the ruleset ID and remove it only after the cutover or rollback observation window. Check the remote HEAD against the pinned N3 revision immediately before stopping the old node and again before step 7. A changed ref aborts the cutover. Do not deploy yet.
 
@@ -157,14 +182,14 @@ WHERE service = 'sql' AND space = :'smoke_space' AND name = :'smoke_name' AND oc
 \gset
 \if :fixture_applied
 \else
-\quit 1
+DO $$ BEGIN RAISE EXCEPTION 'synthetic fixture was not applied exactly once'; END $$;
 \endif
 DROP TABLE tc780_synthetic_fixture;
 SQL
   ROCKET_ADDRESS=127.0.0.1 ROCKET_PORT=18080 \
     TINYCLOUD_STORAGE__DATABASE="$TC780_SNAPSHOT_URL" \
     TINYCLOUD_STORAGE__DATADIR="$TC780_SNAPSHOT_DATADIR" \
-    TINYCLOUD_DATABASE__WRITE_FENCE=false TINYCLOUD_KEYS_SECRET="$TC780_REHEARSAL_KEY" \
+    TINYCLOUD_DATABASE__WRITE_FENCE=false TINYCLOUD_KEYS_TYPE=Static TINYCLOUD_KEYS_SECRET="$TC780_REHEARSAL_KEY" \
     ./tc780-private/tinycloud-n3 > ./tc780-private/preflight-node.log 2>&1 &
   pid=$!
   trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
@@ -299,6 +324,8 @@ Deploy with the **config fence off**. The step-6 durable metadata fence holds SQ
   test "$(gh api repos/TinyCloudLabs/tinycloud-node/actions/variables/TC780_CUTOVER_READY --jq .value)" = true
   test "$(git ls-remote origin refs/heads/Codex/roman/rollback-meeting-node-20260915 | cut -f1)" = "$revision"
   before="$(gh run list -R TinyCloudLabs/tinycloud-node --workflow docker.yml --branch Codex/roman/rollback-meeting-node-20260915 --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId // 0')"
+  jq --argjson before "$before" '. + {n3_previous_run_id:$before,phase:"step7_dispatching"}' ./tc780-private/record.json > ./tc780-private/record.next.json
+  mv ./tc780-private/record.next.json ./tc780-private/record.json
   gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref Codex/roman/rollback-meeting-node-20260915 \
     -f image_version=1.20.0 -f deploy_phala=true -f include_duckdb=false \
     -f sql_identity_fence=false -f deploy_image_digest="$digest"
@@ -310,10 +337,13 @@ Deploy with the **config fence off**. The step-6 durable metadata fence holds SQ
     sleep 2
   done
   test -n "$run_id"
+  jq --argjson run_id "$run_id" '. + {n3_deploy_run_id:$run_id,phase:"step7_running"}' \
+    ./tc780-private/record.json > ./tc780-private/record.next.json
+  mv ./tc780-private/record.next.json ./tc780-private/record.json
   remaining="$((deadline - $(date +%s)))"
   test "$remaining" -gt 0
   timeout "$remaining" gh run watch "$run_id" -R TinyCloudLabs/tinycloud-node --exit-status
-  jq --argjson run_id "$run_id" '. + {n3_deploy_run_id:$run_id,phase:"step7_deployed"}' \
+  jq '.phase="step7_deployed"' \
     ./tc780-private/record.json > ./tc780-private/record.next.json
   mv ./tc780-private/record.next.json ./tc780-private/record.json
 )
@@ -358,10 +388,58 @@ No redeploy is required after `fence off`. Monitor SQL errors, KV health and new
 
 Abort forward progress immediately at the recorded **20-minute deadline**, or if the frozen ref changes, step 7's workflow fails, N3 cannot boot, KV remains unavailable, verification differs from `tc780-applied.json`, or the signed SQL smoke fails and cannot be corrected while fenced. The abort ladder is based on `record.json`:
 
-- **Before `phase=step6_started`:** no N3 ledger change was attempted. On the CVM, keep the old `tinycloud` container running, or `docker start` it if stopped, and verify health. If it cannot be started, promote the recorded digest using the rollback workflow below. Do not run the ledger transaction for this path.
-- **At or after `phase=step6_started`:** stop any running node, run the ledger rollback transaction below, then dispatch and watch promotion of the recorded old digest. This includes a failed `apply`, a step-7 workflow failure, and a case where N3 never started. Complete this rollback even if the 20-minute forward budget has expired.
+- **Before `phase=step6_started`:** no N3 ledger change was attempted. On the CVM, keep the old `tinycloud` container running, or `docker start` it if stopped, and verify health. If it cannot be started, use the old-digest promotion block below **without** the ledger transaction.
+- **At or after `phase=step6_started`:** first cancel and settle any step-7 run, then confirm the CVM's actual running image. Stop any running node, run the ledger rollback transaction, then dispatch and watch promotion of the recorded old digest. This includes a failed `apply`, a step-7 workflow failure, and a case where N3 never started. Complete this rollback even if the 20-minute forward budget has expired.
 
 Before step 9, keep the durable fence on during investigation. After step 9, stop N3 and block traffic before changing metadata. Preserve a separate N3-state backup for analysis if needed; exclude artifact table data from any operator `pg_dump`.
+
+If step 7 was dispatched, cancel its recorded run **before** touching the CVM or ledger. `timeout gh run watch` only stops the local watcher; it does not cancel the workflow. If `phase=step7_dispatching` but the run ID is absent, this block tries to recover it from the saved previous ID and pinned revision. If it cannot, investigate GitHub Actions until the dispatch is accounted for; do not stop the node or alter the ledger while an N3 deploy may still be running. If cancellation does not reach `completed` within ten minutes, escalate the outage and leave the CVM and ledger untouched until it does.
+
+```sh
+(
+  set -euo pipefail
+  phase="$(jq -er '.phase' ./tc780-private/record.json)"
+  case "$phase" in
+    step7_dispatching|step7_running|step7_deployed)
+      run_id="$(jq -r '.n3_deploy_run_id // empty' ./tc780-private/record.json)"
+      if test -z "$run_id"; then
+        before="$(jq -er '.n3_previous_run_id' ./tc780-private/record.json)"
+        revision="$(jq -er '.n3_revision' ./tc780-private/record.json)"
+        run_id="$(gh run list -R TinyCloudLabs/tinycloud-node --workflow docker.yml --branch Codex/roman/rollback-meeting-node-20260915 --event workflow_dispatch --limit 30 --json databaseId,headSha \
+          --jq "[.[] | select(.databaseId > $before and .headSha == \"$revision\") | .databaseId] | first // empty")"
+      fi
+      test -n "$run_id" || { echo 'N3 dispatch not accounted for; halt rollback' >&2; exit 1; }
+      jq --argjson run_id "$run_id" '.n3_deploy_run_id=$run_id' ./tc780-private/record.json > ./tc780-private/record.next.json
+      mv ./tc780-private/record.next.json ./tc780-private/record.json
+      for attempt in $(seq 1 120); do
+        status="$(gh run view "$run_id" -R TinyCloudLabs/tinycloud-node --json status --jq .status)"
+        test "$status" != completed || break
+        gh run cancel "$run_id" -R TinyCloudLabs/tinycloud-node || true
+        sleep 5
+      done
+      test "$(gh run view "$run_id" -R TinyCloudLabs/tinycloud-node --json status --jq .status)" = completed
+      ;;
+  esac
+)
+```
+
+For aborts at or after step 6, on the CVM set `TC780_OLD_IMAGE` and `TC780_N3_IMAGE` to `running_image` and `ghcr.io/tinycloudlabs/tinycloud-node@<n3_digest>` from the operator's `record.json`. Inspect the **running container**, not just the desired Compose image. An unknown running image or multiple running node containers halts rollback for investigation. Keep these values for the stop and failed-promotion checks below.
+
+```sh
+(
+  set -euo pipefail
+  test -n "$TC780_OLD_IMAGE" && test -n "$TC780_N3_IMAGE"
+  node_id="$(docker ps --filter label=com.docker.compose.service=tinycloud --quiet)"
+  test "$(printf '%s\n' "$node_id" | grep -c . || true)" -le 1
+  if test -n "$node_id"; then
+    image="$(docker inspect "$node_id" --format '{{.Config.Image}}')"
+    printf 'Running node image: %s\n' "$image"
+    case "$image" in "$TC780_OLD_IMAGE"|"$TC780_N3_IMAGE") ;; *) echo 'unknown running node image; halt rollback' >&2; exit 1;; esac
+  else
+    echo 'No running tinycloud container on CVM'
+  fi
+)
+```
 
 Before step 6, ensure the old container is running on the CVM:
 
@@ -391,13 +469,11 @@ On the CVM, stop the N3 service and confirm it is stopped before touching the le
 )
 ```
 
-On the operator host, run the transactional metadata rollback and sanctioned TC-767 digest promotion:
+Only for aborts at or after `phase=step6_started`, on the operator host remove the N3 metadata and migration rows in one transaction. Do this after the CVM image check and stop above:
 
 ```sh
 (
   set -euo pipefail
-  version="$(jq -er '.running_version' ./tc780-private/record.json)"
-  case "$version" in 1.19.1-dstack|1.19.2-dstack) ;; *) exit 1;; esac
   psql "$TC780_DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
 BEGIN;
 DROP TABLE IF EXISTS database_identity_fence, database_alias, database_legacy_artifact;
@@ -409,9 +485,22 @@ DO $$ BEGIN
 END $$;
 COMMIT;
 SQL
+)
+```
+
+For either path that needs image promotion, run this separate sanctioned TC-767 rollback dispatch on the operator host. A pre-step-6 fallback starts here and does not run the ledger transaction:
+
+```sh
+(
+  set -euo pipefail
+  version="$(jq -er '.running_version' ./tc780-private/record.json)"
+  case "$version" in 1.19.1-dstack|1.19.2-dstack) ;; *) exit 1;; esac
   digest="$(jq -er '.running_digest' ./tc780-private/record.json)"
   revision="$(jq -er '.running_revision' ./tc780-private/record.json)"
   before="$(gh run list -R TinyCloudLabs/tinycloud-node --workflow docker.yml --branch Codex/roman/rollback-meeting-node-20260915 --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId // 0')"
+  jq --argjson before "$before" '. + {rollback_previous_run_id:$before,phase:"rollback_dispatching"}' \
+    ./tc780-private/record.json > ./tc780-private/record.next.json
+  mv ./tc780-private/record.next.json ./tc780-private/record.json
   gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref Codex/roman/rollback-meeting-node-20260915 \
     -f image_version=1.20.0 -f deploy_phala=true -f include_duckdb=false -f sql_identity_fence=false \
     -f allow_non_descendant=true -f deploy_image_digest="$digest" \
@@ -425,9 +514,82 @@ SQL
     sleep 2
   done
   test -n "$run_id"
-  gh run watch "$run_id" -R TinyCloudLabs/tinycloud-node --exit-status
+  jq --argjson run_id "$run_id" '. + {rollback_deploy_run_id:$run_id,phase:"rollback_running"}' \
+    ./tc780-private/record.json > ./tc780-private/record.next.json
+  mv ./tc780-private/record.next.json ./tc780-private/record.json
+  if ! gh run watch "$run_id" -R TinyCloudLabs/tinycloud-node --exit-status; then
+    jq '.phase="rollback_failed"' ./tc780-private/record.json > ./tc780-private/record.next.json
+    mv ./tc780-private/record.next.json ./tc780-private/record.json
+    echo 'rollback deploy failed; follow failed-promotion step below' >&2
+    exit 1
+  fi
+  psql "$TC780_DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM seaql_migrations WHERE version IN ('m20261007_000000_database_alias','m20261007_010000_database_identity_fence')) THEN
+    RAISE EXCEPTION 'N3 migration ledger reappeared after rollback deploy';
+  END IF;
+END $$;
+SQL
+  jq '.phase="rollback_deployed"' ./tc780-private/record.json > ./tc780-private/record.next.json
+  mv ./tc780-private/record.next.json ./tc780-private/record.json
 )
 ```
+
+If the rollback deploy or its local watcher fails, **do not restart N3** after the ledger transaction. First settle the recorded rollback run: a failed local watch does not prove the workflow stopped. Cancel it if still active, wait for `completed`, and inspect its conclusion and logs. If it remains active after ten minutes, escalate and leave the CVM untouched until it is terminal.
+
+```sh
+(
+  set -euo pipefail
+  run_id="$(jq -r '.rollback_deploy_run_id // empty' ./tc780-private/record.json)"
+  if test -z "$run_id"; then
+    before="$(jq -er '.rollback_previous_run_id' ./tc780-private/record.json)"
+    revision="$(jq -er '.n3_revision' ./tc780-private/record.json)"
+    run_id="$(gh run list -R TinyCloudLabs/tinycloud-node --workflow docker.yml --branch Codex/roman/rollback-meeting-node-20260915 --event workflow_dispatch --limit 30 --json databaseId,headSha \
+      --jq "[.[] | select(.databaseId > $before and .headSha == \"$revision\") | .databaseId] | first // empty")"
+  fi
+  test -n "$run_id" || { echo 'rollback dispatch not accounted for; halt' >&2; exit 1; }
+  jq --argjson run_id "$run_id" '.rollback_deploy_run_id=$run_id' ./tc780-private/record.json > ./tc780-private/record.next.json
+  mv ./tc780-private/record.next.json ./tc780-private/record.json
+  for attempt in $(seq 1 120); do
+    status="$(gh run view "$run_id" -R TinyCloudLabs/tinycloud-node --json status --jq .status)"
+    test "$status" != completed || break
+    gh run cancel "$run_id" -R TinyCloudLabs/tinycloud-node || true
+    sleep 5
+  done
+  test "$(gh run view "$run_id" -R TinyCloudLabs/tinycloud-node --json status --jq .status)" = completed
+  gh run view "$run_id" -R TinyCloudLabs/tinycloud-node --json status,conclusion
+)
+```
+
+On the CVM, use the recorded `TC780_OLD_IMAGE` and `TC780_N3_IMAGE`. Stop a resumed N3 container before recovering an existing old container; an unknown image halts recovery:
+
+```sh
+(
+  set -euo pipefail
+  test -n "$TC780_OLD_IMAGE" && test -n "$TC780_N3_IMAGE"
+  old_id=''
+  while IFS= read -r node_id; do
+    test -n "$node_id" || continue
+    if test "$(docker inspect "$node_id" --format '{{.Config.Image}}')" = "$TC780_OLD_IMAGE"; then
+      test -z "$old_id" || { echo 'multiple old containers; halt' >&2; exit 1; }
+      old_id="$node_id"
+    fi
+  done <<< "$(docker ps -a --filter label=com.docker.compose.service=tinycloud --quiet)"
+  running_id="$(docker ps --filter label=com.docker.compose.service=tinycloud --quiet)"
+  test "$(printf '%s\n' "$running_id" | grep -c . || true)" -le 1
+  if test -n "$running_id" && test "$running_id" != "$old_id"; then
+    test "$(docker inspect "$running_id" --format '{{.Config.Image}}')" = "$TC780_N3_IMAGE" || { echo 'unknown running image; halt' >&2; exit 1; }
+    docker stop "$running_id"
+    running_id=''
+  fi
+  test -n "$old_id" || { echo 'old container absent; keep node stopped and escalate' >&2; exit 1; }
+  test -z "$running_id" || test "$running_id" = "$old_id"
+  if test "$(docker inspect "$old_id" --format '{{.State.Running}}')" = false; then docker start "$old_id"; fi
+  test "$(docker inspect "$old_id" --format '{{.State.Running}}')" = true
+)
+```
+
+Check `/healthz`, `/version` against the recorded old version and the approved signed SQL read. Recheck that the N3 ledger rows are absent before admitting traffic. If the post-deploy ledger assertion fails, block traffic and investigate before attempting to boot the old image. If the old container is absent or cannot pass these checks, keep the node stopped, escalate the outage and retry only the old-digest promotion block after correcting the workflow failure.
 
 TC-767's ancestry guard is roll-forward only. `allow_non_descendant=true` plus the recorded digest/version/revision is its sanctioned emergency override; the workflow validates those labels. The N3 image-only config preflight is skipped for the old rollback image, while Compose validation still runs. Verify `/healthz`, `/version` matches `running_version` in the record and the approved signed SQL read.
 
