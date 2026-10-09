@@ -9680,7 +9680,7 @@ dependencies = [
 
 [[package]]
 name = "tinycloud-node"
-version = "1.19.2"
+version = "1.20.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -9723,6 +9723,7 @@ dependencies = [
  "rocket",
  "rpassword",
  "rsa 0.9.10",
+ "rusqlite",
  "rustls 0.23.36",
  "rustls-pemfile 2.2.0",
  "scrypt",

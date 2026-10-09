@@ -45,6 +45,7 @@ use tinycloud_core::duckdb::{
 };
 use tinycloud_core::{
     admission::AdmissionError,
+    database_migration,
     encryption_network::EncryptionService,
     events::Invocation,
     models::{
@@ -58,7 +59,9 @@ use tinycloud_core::{
     storage::{HashBuffer, ImmutableReadStore, ImmutableStaging},
     types::{Ability, DelegationQuery, DelegationQueryPage, Metadata, Resource},
     util::{Capability, DelegationInfo, InvocationInfo, RevocationInfo},
-    write_hooks::{db_table_path, hook_delivery_id, subscription_matches_event, TouchedTables},
+    write_hooks::{
+        database_subscription_matches_event, db_table_path, hook_delivery_id, TouchedTables,
+    },
     AdmittedInvocation, DelegationStatus, InvocationOutcome, KvBatchReadItem, KvBatchReadValue,
     KvInvokeOptions, KvPrecondition, TransactResult, TxError, TxStoreError,
 };
@@ -150,6 +153,17 @@ impl<'r> rocket::response::Responder<'r, 'static> for InvokeError {
             Self::Storage(rejection) => rejection.respond_to(request),
         }
     }
+}
+
+fn identity_resolution_error(error: database_migration::MigrationError) -> (Status, String) {
+    let status = match &error {
+        database_migration::MigrationError::Quarantined
+        | database_migration::MigrationError::Collision => Status::Conflict,
+        database_migration::MigrationError::Database(_)
+        | database_migration::MigrationError::MissingLegacyArtifact => Status::ServiceUnavailable,
+        _ => Status::InternalServerError,
+    };
+    (status, error.to_string())
 }
 
 #[derive(Serialize)]
@@ -1566,10 +1580,10 @@ async fn invoke_impl(
             crate::prometheus::observe_invocation_time_rejection(
                 classify_invocation_time_rejection(&i.0 .0, now),
             );
-            return Err((
+            return Err(InvokeError::Text(
                 Status::Unauthorized,
                 invocation_model::InvocationError::InvalidTime.to_string(),
-            ).into());
+            ));
         }
 
         // (b) Admission: full signature verification plus the lifetime cap,
@@ -1701,6 +1715,16 @@ async fn invoke_impl(
             .collect();
 
         if !sql_caps.is_empty() {
+            // Reject quarantined paths and an active cutover fence before
+            // verify_auth_admitted persists invoked_abilities. A rejected
+            // request must never become migration attribution evidence.
+            if tinycloud.effective_database_fence(config.database.write_fence)
+                .await.map_err(identity_resolution_error)? {
+                return Err((Status::ServiceUnavailable, "SQL identity cutover fence is active".into()).into());
+            }
+            let (space, path, _) = select_database_scope(&sql_caps, "sql")?;
+            database_migration::resolve(tinycloud.connection(), "sql", &space.to_string(), path)
+                .await.map_err(identity_resolution_error)?;
             if policy_session_invocation {
                 invocation_replay_cache
                     .check_and_insert_invoker_nonce(admitted.invocation(), 60)
@@ -1752,6 +1776,13 @@ async fn invoke_impl(
                     .collect();
 
             if !duckdb_caps.is_empty() {
+                if tinycloud.effective_database_fence(config.database.write_fence)
+                    .await.map_err(identity_resolution_error)? {
+                    return Err((Status::ServiceUnavailable, "DuckDB identity cutover fence is active".into()).into());
+                }
+                let (space, path, _) = select_database_scope(&duckdb_caps, "duckdb")?;
+                database_migration::resolve(tinycloud.connection(), "duckdb", &space.to_string(), path)
+                    .await.map_err(identity_resolution_error)?;
                 if policy_session_invocation {
                     invocation_replay_cache
                         .check_and_insert_invoker_nonce(admitted.invocation(), 60)
@@ -2238,6 +2269,8 @@ async fn emit_kv_hook_events(
                 service: "kv".to_string(),
                 ability: "tinycloud.kv/put".to_string(),
                 path: Some(row.key.to_string()),
+                database_path: None,
+                table_name: None,
                 actor: invocation.invoker.clone(),
                 epoch: commit.rev.to_cid(0x55).to_string(),
                 event_index: current_index,
@@ -2250,6 +2283,8 @@ async fn emit_kv_hook_events(
                 service: "kv".to_string(),
                 ability: "tinycloud.kv/del".to_string(),
                 path: Some(row.key.to_string()),
+                database_path: None,
+                table_name: None,
                 actor: invocation.invoker.clone(),
                 epoch: commit.rev.to_cid(0x55).to_string(),
                 event_index: current_index,
@@ -2364,6 +2399,17 @@ async fn handle_sql_invoke(
     config: &State<Config>,
     sql_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, InvokeError> {
+    if tinycloud
+        .effective_database_fence(config.database.write_fence)
+        .await
+        .map_err(identity_resolution_error)?
+    {
+        return Err((
+            Status::ServiceUnavailable,
+            "SQL identity cutover fence is active".into(),
+        )
+            .into());
+    }
     // W1 (D): derive the SQL caveat from the VALIDATED delegation chain,
     // NOT from the invoker's own invocation facts. The invocation-facts
     // path is a holdover (and is still consulted as a fallback so the
@@ -2404,13 +2450,17 @@ async fn handle_sql_invoke(
     let body_str = body_result?;
 
     let (space, path, ability) = select_database_scope(sql_caps, "sql")?;
-    let db_name = SqlService::db_name_from_path(path);
+    // N3 will resolve this logical identity through an explicit alias table.
+    // Do not fall back to the legacy final-segment selector here.
     let space_id = space.to_string();
+    let db_name = database_migration::resolve(tinycloud.connection(), "sql", &space_id, path)
+        .await
+        .map_err(identity_resolution_error)?;
 
     let sql_request: SqlRequest =
         serde_json::from_str(&body_str).map_err(|e| (Status::BadRequest, e.to_string()))?;
 
-    require_sql_admin_for_request(&sql_request, space, path, &db_name, sql_caps)?;
+    require_sql_admin_for_request(&sql_request, space, path, sql_caps)?;
 
     // W1 (D): under a constrained-statements profile (carried by the
     // validated transitive delegation chain), raw paths are blocked
@@ -2522,7 +2572,7 @@ async fn handle_sql_invoke(
             let events = database_write_events(
                 &space_id,
                 "sql",
-                &db_name,
+                path,
                 &actor,
                 &epoch,
                 &timestamp,
@@ -2548,16 +2598,13 @@ fn require_sql_admin_for_request(
     request: &SqlRequest,
     space: &SpaceId,
     path: Option<&str>,
-    db_name: &str,
     caps: &[(SpaceId, Option<String>, String)],
 ) -> Result<(), (Status, String)> {
     if !sql_request_requires_admin(request) || has_database_admin_capability(caps, "sql") {
         return Ok(());
     }
 
-    Err(missing_database_admin_capability_error(
-        space, path, db_name, "sql",
-    ))
+    Err(missing_database_admin_capability_error(space, path, "sql"))
 }
 
 fn sql_request_requires_admin(request: &SqlRequest) -> bool {
@@ -2943,6 +2990,17 @@ async fn handle_duckdb_invoke(
     duckdb_caps: &[(tinycloud_auth::resource::SpaceId, Option<String>, String)],
     arrow_format: bool,
 ) -> Result<DataOut<<BlockStores as ImmutableReadStore>::Readable>, InvokeError> {
+    if tinycloud
+        .effective_database_fence(config.database.write_fence)
+        .await
+        .map_err(identity_resolution_error)?
+    {
+        return Err((
+            Status::ServiceUnavailable,
+            "DuckDB identity cutover fence is active".into(),
+        )
+            .into());
+    }
     let caveats: Option<DuckDbCaveats> = admitted
         .invocation()
         .0
@@ -2966,8 +3024,11 @@ async fn handle_duckdb_invoke(
     let auth_result = verify_auth_admitted("server.duckdb.auth", admitted, tinycloud).await?;
 
     let (space, path, ability) = select_database_scope(duckdb_caps, "duckdb")?;
-    let db_name = DuckDbService::db_name_from_path(path);
+    // Keep the logical path separate from any legacy physical artifact name.
     let space_id = space.to_string();
+    let db_name = database_migration::resolve(tinycloud.connection(), "duckdb", &space_id, path)
+        .await
+        .map_err(identity_resolution_error)?;
 
     if ability == "tinycloud.duckdb/import" {
         // Import always grows the database artifact — gate before reading
@@ -3096,7 +3157,7 @@ async fn handle_duckdb_invoke(
             let events = database_write_events(
                 &space_id,
                 "duckdb",
-                &db_name,
+                path,
                 &actor,
                 &epoch,
                 &timestamp,
@@ -3147,7 +3208,7 @@ fn duckdb_error_to_status(err: &DuckDbError) -> Status {
 fn database_write_events(
     space: &str,
     service: &str,
-    db_name: &str,
+    db_path: Option<&str>,
     actor: &str,
     epoch: &str,
     timestamp: &str,
@@ -3169,7 +3230,9 @@ fn database_write_events(
                 space: space.to_string(),
                 service: service.to_string(),
                 ability: ability.to_string(),
-                path: Some(db_table_path(db_name, table)),
+                path: Some(db_table_path(db_path, table)),
+                database_path: db_path.map(ToString::to_string),
+                table_name: Some(table.to_string()),
                 actor: actor.to_string(),
                 epoch: epoch.to_string(),
                 event_index,
@@ -3227,19 +3290,19 @@ async fn enqueue_database_webhook_deliveries(
     }
 
     let mut cached_subscriptions =
-        HashMap::<(String, String, String), Vec<hook_subscription::Model>>::new();
+        HashMap::<(String, String), Vec<hook_subscription::Model>>::new();
     let mut pending = Vec::<hook_delivery::Model>::new();
 
     for event in events {
-        let Some(path) = event.path.as_deref() else {
+        if event.path.is_none() {
             continue;
-        };
+        }
 
-        let cache_key = (event.space.clone(), event.service.clone(), path.to_string());
+        let cache_key = (event.space.clone(), event.service.clone());
 
         if !cached_subscriptions.contains_key(&cache_key) {
             let rows = tinycloud
-                .list_active_hook_subscriptions(&event.space, &event.service, Some(path))
+                .list_active_hook_subscriptions(&event.space, &event.service, None)
                 .await?;
             cached_subscriptions.insert(cache_key.clone(), rows);
         }
@@ -3258,7 +3321,11 @@ async fn enqueue_database_webhook_deliveries(
             subscriptions
                 .iter()
                 .filter(|subscription| {
-                    subscription_matches_event(subscription, path, &event.ability)
+                    database_subscription_matches_event(
+                        subscription,
+                        event.database_path.as_deref(),
+                        &event.ability,
+                    )
                 })
                 .map(|subscription| hook_delivery::Model {
                     id: hook_delivery_id(&subscription.id, &event.id),
@@ -3413,7 +3480,6 @@ fn has_database_admin_capability(
 fn missing_database_admin_capability_error(
     space: &tinycloud_auth::resource::SpaceId,
     path: Option<&str>,
-    db_name: &str,
     service: &str,
 ) -> (Status, String) {
     let ability = match service {
@@ -3421,10 +3487,9 @@ fn missing_database_admin_capability_error(
         "duckdb" => "tinycloud.duckdb/admin",
         _ => "tinycloud.kv/put",
     };
-    let resource_path = path.unwrap_or(db_name).parse().unwrap();
     let resource = Resource::TinyCloud(space.clone().to_resource(
         service.parse().unwrap(),
-        Some(resource_path),
+        path.map(|path| path.parse().unwrap()),
         None,
         None,
     ));
@@ -3935,14 +4000,24 @@ mod tests {
             "tinycloud.sql/read".to_string(),
         )];
 
-        let err =
-            require_sql_admin_for_request(&request, &space, Some("default"), "default", &caps)
-                .expect_err("PRAGMA with only read should ask for admin");
+        let err = require_sql_admin_for_request(&request, &space, Some("default"), &caps)
+            .expect_err("PRAGMA with only read should ask for admin");
 
         assert_eq!(err.0, Status::Unauthorized);
         assert_eq!(
             err.1,
             format!("Unauthorized Action: {space}/sql/default / tinycloud.sql/admin")
+        );
+    }
+
+    #[test]
+    fn pathless_admin_error_names_pathless_resource() {
+        let space = test_space_id("secrets");
+        let (status, message) = missing_database_admin_capability_error(&space, None, "sql");
+        assert_eq!(status, Status::Unauthorized);
+        assert_eq!(
+            message,
+            format!("Unauthorized Action: {space}/sql / tinycloud.sql/admin")
         );
     }
 
@@ -3961,7 +4036,7 @@ mod tests {
             "tinycloud.sql/admin".to_string(),
         )];
 
-        require_sql_admin_for_request(&request, &space, Some("default"), "default", &caps)
+        require_sql_admin_for_request(&request, &space, Some("default"), &caps)
             .expect("admin PRAGMA should be accepted");
     }
 
@@ -4059,7 +4134,7 @@ mod tests {
         let events = database_write_events(
             "tinycloud:space",
             "sql",
-            "main.db",
+            Some("appA/main.db"),
             "did:key:test",
             "epoch",
             "2026-01-01T00:00:00Z",
@@ -4084,13 +4159,24 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(first.path.as_deref(), Some("main.db/users"));
+        assert_eq!(
+            first.path.as_deref(),
+            Some(db_table_path(Some("appA/main.db"), "users").as_str())
+        );
+        assert_eq!(first.database_path.as_deref(), Some("appA/main.db"));
+        assert_eq!(first.table_name.as_deref(), Some("users"));
         assert_eq!(first.ability, "tinycloud.sql/write");
         assert_eq!(first.event_index, 0);
-        assert_eq!(second.path.as_deref(), Some("main.db/orders"));
+        assert_eq!(
+            second.path.as_deref(),
+            Some(db_table_path(Some("appA/main.db"), "orders").as_str())
+        );
         assert_eq!(second.ability, "tinycloud.sql/write");
         assert_eq!(second.event_index, 1);
-        assert_eq!(third.path.as_deref(), Some("main.db/audit"));
+        assert_eq!(
+            third.path.as_deref(),
+            Some(db_table_path(Some("appA/main.db"), "audit").as_str())
+        );
         assert_eq!(third.ability, "tinycloud.sql/write");
         assert_eq!(third.event_index, 2);
     }
@@ -4103,7 +4189,7 @@ mod tests {
         let events = database_write_events(
             "tinycloud:space",
             "duckdb",
-            "analytics.duckdb",
+            Some("appB/analytics.duckdb"),
             "did:key:test",
             "epoch",
             "2026-01-01T00:00:00Z",
@@ -4117,7 +4203,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(event.ability, "tinycloud.duckdb/write");
-        assert_eq!(event.path.as_deref(), Some("analytics.duckdb/events"));
+        assert_eq!(
+            event.path.as_deref(),
+            Some(db_table_path(Some("appB/analytics.duckdb"), "events").as_str())
+        );
     }
 
     #[tokio::test]
@@ -4202,14 +4291,14 @@ mod tests {
             "sub_sql",
             "tinycloud:space",
             "sql",
-            Some("main.db/users"),
+            Some("main.db"),
             &["tinycloud.sql/write"],
         );
         let duck_sub = subscription_model(
             "sub_duck",
             "tinycloud:space",
             "duckdb",
-            Some("analytics.duckdb/events"),
+            Some("analytics.duckdb"),
             &["tinycloud.duckdb/write"],
         );
         tinycloud.create_hook_subscription(sql_sub).await?;
@@ -4218,7 +4307,7 @@ mod tests {
         let sql_events = database_write_events(
             "tinycloud:space",
             "sql",
-            "main.db",
+            Some("main.db"),
             "did:key:alice",
             "epoch-sql",
             "2026-04-09T01:00:00Z",
@@ -4227,7 +4316,7 @@ mod tests {
         let duck_events = database_write_events(
             "tinycloud:space",
             "duckdb",
-            "analytics.duckdb",
+            Some("analytics.duckdb"),
             "did:key:alice",
             "epoch-duck",
             "2026-04-09T01:00:01Z",
@@ -4235,6 +4324,15 @@ mod tests {
         );
         let mut events = sql_events;
         events.extend(duck_events);
+        events.extend(database_write_events(
+            "tinycloud:space",
+            "sql",
+            Some("main.db/private"),
+            "did:key:alice",
+            "epoch-child",
+            "2026-04-09T01:00:02Z",
+            &[TouchedTables::supported(vec!["users".to_string()])],
+        ));
 
         enqueue_database_webhook_deliveries(&tinycloud, &events).await?;
         enqueue_database_webhook_deliveries(&tinycloud, &events).await?;
@@ -4263,7 +4361,7 @@ mod tests {
             "sub_sql",
             "tinycloud:space",
             "sql",
-            Some("main.db/users"),
+            Some("main.db"),
             &["tinycloud.sql/write"],
         );
         tinycloud.create_hook_subscription(sql_sub).await?;
@@ -4271,7 +4369,7 @@ mod tests {
         let events = database_write_events(
             "tinycloud:space",
             "sql",
-            "main.db",
+            Some("main.db"),
             "did:key:alice",
             "epoch-sql",
             "2026-04-09T01:00:00Z",
@@ -4474,7 +4572,7 @@ mod tests {
         service
             .execute(
                 &space,
-                "main",
+                &SqlService::db_name_from_path(Some("main")),
                 SqlRequest::Execute {
                     schema: Some(vec![
                         "CREATE TABLE labels (label TEXT PRIMARY KEY, val INTEGER NOT NULL)"
@@ -4491,7 +4589,7 @@ mod tests {
         service
             .execute(
                 &space,
-                "main",
+                &SqlService::db_name_from_path(Some("main")),
                 SqlRequest::Execute {
                     schema: None,
                     sql: "INSERT INTO labels (label, val) VALUES (?, ?)".to_string(),
@@ -4526,7 +4624,7 @@ mod tests {
         let result: SqlExecutionResult = service
             .execute(
                 &space,
-                "main",
+                &SqlService::db_name_from_path(Some("main")),
                 bound,
                 Some(sql_caveats),
                 "tinycloud.sql/read".to_string(),
@@ -4582,7 +4680,7 @@ mod tests {
         sql_service
             .execute(
                 &space,
-                "main",
+                &SqlService::db_name_from_path(Some("main")),
                 SqlRequest::Execute {
                     schema: Some(vec![
                         "CREATE TABLE labels (label TEXT PRIMARY KEY, val INTEGER NOT NULL)"
@@ -4598,7 +4696,7 @@ mod tests {
         sql_service
             .execute(
                 &space,
-                "main",
+                &SqlService::db_name_from_path(Some("main")),
                 SqlRequest::Execute {
                     schema: None,
                     sql: "INSERT INTO labels (label, val) VALUES (?, ?)".to_string(),
@@ -4855,7 +4953,7 @@ mod tests {
         sql_service
             .execute(
                 &space,
-                "main",
+                &SqlService::db_name_from_path(Some("main")),
                 SqlRequest::Execute {
                     schema: Some(vec![
                         "CREATE TABLE labels (label TEXT PRIMARY KEY, val INTEGER NOT NULL)"
@@ -4871,7 +4969,7 @@ mod tests {
         sql_service
             .execute(
                 &space,
-                "main",
+                &SqlService::db_name_from_path(Some("main")),
                 SqlRequest::Execute {
                     schema: None,
                     sql: "INSERT INTO labels (label, val) VALUES (?, ?)".to_string(),
@@ -6252,7 +6350,7 @@ mod tests {
         sql_service
             .execute(
                 &space,
-                "main",
+                &SqlService::db_name_from_path(Some("main")),
                 SqlRequest::Execute {
                     schema: Some(vec![
                         "CREATE TABLE labels (label TEXT PRIMARY KEY, val INTEGER NOT NULL)"
@@ -7129,7 +7227,7 @@ mod tests {
             .sql_service
             .execute(
                 &setup.space,
-                "main",
+                &SqlService::db_name_from_path(Some("main")),
                 SqlRequest::Execute {
                     schema: None,
                     sql: "INSERT INTO labels (label, val) VALUES (?, ?)".to_string(),

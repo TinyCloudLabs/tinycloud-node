@@ -202,10 +202,14 @@ impl ResourceId {
             base.path().map(|p| p.as_str()),
         ) {
             (Some(s), Some(b)) => {
-                !s.starts_with(b)
-                    || !(b.ends_with('/')
-                        || s.len() == b.len()
-                        || s.as_bytes().get(b.len()) == Some(&b'/'))
+                if matches!(self.service().as_str(), "sql" | "duckdb") && !b.ends_with('/') {
+                    s != b
+                } else {
+                    !s.starts_with(b)
+                        || !(b.ends_with('/')
+                            || s.len() == b.len()
+                            || s.as_bytes().get(b.len()) == Some(&b'/'))
+                }
             }
             (Some(_), None) | (None, None) => false,
             (None, Some(_)) => true,
@@ -384,6 +388,56 @@ impl FromStr for ResourceId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sql_and_duckdb_grants_match_exact_paths_or_slash_namespaces() {
+        for service in ["sql", "duckdb", "kv"] {
+            for (grant, invoked, allowed_for_database, allowed_for_kv) in [
+                ("appA/connectors", "appA/connectors", true, true),
+                ("appA/connectors", "appA/connectors/private", false, true),
+                ("appA/connectors", "appA/connectors/", false, true),
+                ("appA/connectors", "appA/connectors2", false, false),
+                ("appA/connectors", "appB/connectors", false, false),
+                ("appA/connectors/", "appA/connectors/private", true, true),
+                ("appA/connectors/", "appA/connectors2", false, false),
+                ("appA/", "appA/connectors", true, true),
+                ("appA/", "appB/connectors", false, false),
+                ("", "", true, true),
+                ("", "/child", false, true),
+            ] {
+                let base: ResourceId = format!("tinycloud:ens:example.eth:ns0/{service}/{grant}")
+                    .parse()
+                    .unwrap();
+                let requested: ResourceId =
+                    format!("tinycloud:ens:example.eth:ns0/{service}/{invoked}")
+                        .parse()
+                        .unwrap();
+                let allowed = if service == "kv" {
+                    allowed_for_kv
+                } else {
+                    allowed_for_database
+                };
+                assert_eq!(
+                    requested.extends(&base).is_ok(),
+                    allowed,
+                    "{service}: {grant:?} -> {invoked:?}"
+                );
+            }
+
+            let root: ResourceId = format!("tinycloud:ens:example.eth:ns0/{service}")
+                .parse()
+                .unwrap();
+            let child: ResourceId =
+                format!("tinycloud:ens:example.eth:ns0/{service}/appA/connectors")
+                    .parse()
+                    .unwrap();
+            assert!(child.extends(&root).is_ok(), "{service} pathless grant");
+            assert!(
+                root.extends(&child).is_err(),
+                "{service} pathless invocation"
+            );
+        }
+    }
 
     #[test]
     fn basic() {

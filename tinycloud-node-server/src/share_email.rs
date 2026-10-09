@@ -962,6 +962,47 @@ impl TinyCloudKvStore {
 pub struct SqlNamedStore {
     pub service: Arc<SqlService>,
     pub space_name: String,
+    pub conn: DatabaseConnection,
+    pub write_fence: bool,
+    pub fence_cache: Arc<tinycloud_core::database_migration::EffectiveFenceCache>,
+}
+
+impl SqlNamedStore {
+    async fn check_fence(&self) -> Result<(), PortError> {
+        if self
+            .fence_cache
+            .check(&self.conn, self.write_fence)
+            .await
+            .map_err(|_| PortError::Unavailable)?
+        {
+            Err(PortError::Unavailable)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn sql_source_db_name(
+    space: &tinycloud_auth::resource::SpaceId,
+    path: &str,
+) -> Result<String, PortError> {
+    // Policy capabilities normalize unreserved percent escapes and NFC before
+    // comparing paths. /invoke keys the raw URI path; accept only a path that
+    // is already in that canonical, URI-representable form.
+    if !path.is_ascii()
+        || tinycloud_core::policy_capability::normalize_path("tinycloud.sql", path)
+            .map_err(|_| PortError::Denied)?
+            != path
+    {
+        return Err(PortError::Denied);
+    }
+    let resource: tinycloud_auth::resource::ResourceId = format!("{space}/sql/{path}")
+        .parse()
+        .map_err(|_| PortError::Denied)?;
+    if resource.path().map(|value| value.as_str()) != Some(path) {
+        return Err(PortError::Denied);
+    }
+    Ok(SqlService::db_name_from_path(Some(path)))
 }
 
 #[async_trait]
@@ -971,6 +1012,7 @@ impl ConstrainedNamedSqlStore for SqlNamedStore {
         source: &SqlReadSource,
         statement: &PinnedNamedStatement,
     ) -> Result<NamedSqlRows, PortError> {
+        self.check_fence().await?;
         if source.statement.as_str() != statement.statement.name
             || source.database != statement.database
             || source.path != statement.path
@@ -984,6 +1026,16 @@ impl ConstrainedNamedSqlStore for SqlNamedStore {
             .map_err(|_| PortError::Denied)?;
         let name = self.space_name.parse().map_err(|_| PortError::Denied)?;
         let space = tinycloud_auth::resource::SpaceId::new(did, name);
+        // Validate the pinned source path before resolving its physical artifact.
+        sql_source_db_name(&space, source.path.as_str())?;
+        let physical = tinycloud_core::database_migration::resolve(
+            &self.conn,
+            "sql",
+            &space.to_string(),
+            Some(source.path.as_str()),
+        )
+        .await
+        .map_err(|_| PortError::Denied)?;
         let mut params = Vec::with_capacity(source.arguments.len());
         for value in source.arguments.values() {
             params.push(SqlValue::Integer(value.get()));
@@ -1001,7 +1053,9 @@ impl ConstrainedNamedSqlStore for SqlNamedStore {
             .service
             .execute(
                 &space,
-                source.database.as_str(),
+                // `database` remains a separately pinned protocol field, not
+                // the storage selector.
+                &physical,
                 SqlRequest::ExecuteStatement {
                     name: source.statement.as_str().to_owned(),
                     params,
@@ -1073,6 +1127,7 @@ pub fn compose(
     key_setup: &tinycloud_core::keys::StaticSecret,
     tinycloud: Arc<TinyCloud>,
     sql_service: Arc<SqlService>,
+    write_fence: bool,
 ) -> anyhow::Result<Option<ShareEmailRuntime>> {
     // v2 policy sharing is deliberately independent of the legacy v1
     // authority-material provider.  A v2-only node has no reason to load the
@@ -1179,6 +1234,7 @@ pub fn compose(
             "share email authority, status, attestation, or signer material is not ready"
         ));
     }
+    let fence_cache = tinycloud.database_fence_cache();
     let kv = TinyCloudKvStore {
         tinycloud,
         space_name: config.space_name.clone(),
@@ -1187,6 +1243,9 @@ pub fn compose(
     let sql = SqlNamedStore {
         service: sql_service,
         space_name: config.space_name.clone(),
+        conn: conn.clone(),
+        write_fence,
+        fence_cache,
     };
     let data_plane = HolderBoundDataPlane::new(
         bridge.clone(),
@@ -2835,6 +2894,206 @@ pub async fn read(
 mod tests {
     use super::*;
     use rocket::local::asynchronous::Client;
+
+    #[tokio::test]
+    async fn named_sql_store_execute_named_rejects_unmigrated_artifact_before_resolution() {
+        use tinycloud_core::{
+            database_artifacts::SeaOrmDatabaseArtifactRepository,
+            models::database_artifact,
+            sea_orm::{ActiveModelTrait, ActiveValue::Set, Database},
+            sea_orm_migration::MigratorTrait,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Database::connect(format!(
+            "sqlite:{}?mode=rwc",
+            dir.path().join("caps.db").display()
+        ))
+        .await
+        .unwrap();
+        tinycloud_core::migrations::Migrator::up(&conn, None)
+            .await
+            .unwrap();
+        database_artifact::ActiveModel {
+            service: Set("sql".into()),
+            space: Set("test-space".into()),
+            name: Set("threads".into()),
+            revision: Set(1),
+            content_hash: Set("fixture".into()),
+            payload: Set(vec![]),
+            size_bytes: Set(0),
+            backend: Set("sqlite".into()),
+            storage_mode: Set("database-blob".into()),
+            created_at: Set("2026-01-01T00:00:00Z".into()),
+            updated_at: Set("2026-01-01T00:00:00Z".into()),
+            checkpoint_size_bytes: Set(0),
+            checkpoint_content_hash: Set("fixture".into()),
+            delta_payload: Set(None),
+            delta_content_hash: Set(None),
+            delta_size_bytes: Set(0),
+        }
+        .insert(&conn)
+        .await
+        .unwrap();
+        let repo = Arc::new(SeaOrmDatabaseArtifactRepository::new(conn.clone()));
+        let store = SqlNamedStore {
+            service: Arc::new(SqlService::new(
+                dir.path().join("sql").display().to_string(),
+                0,
+                repo,
+            )),
+            space_name: "test".into(),
+            conn,
+            write_fence: false,
+            fence_cache: Arc::new(Default::default()),
+        };
+        let did = tinycloud_auth::resolver::DID_METHODS
+            .generate(
+                &tinycloud_auth::ssi::jwk::JWK::generate_ed25519().unwrap(),
+                "key",
+            )
+            .unwrap();
+        let source = SqlReadSource {
+            space: Did::parse(did.to_string()).unwrap(),
+            database: tinycloud_core::share_email::DatabaseName::parse("content_db").unwrap(),
+            path: Path::parse("web/threads").unwrap(),
+            statement: tinycloud_core::share_email::NamedStatement::parse("read_threads").unwrap(),
+            arguments: Default::default(),
+            arguments_digest: tinycloud_core::share_email::Sha256Digest::from_bytes([0; 32]),
+        };
+        let pinned = PinnedNamedStatement {
+            database: source.database.clone(),
+            path: source.path.clone(),
+            statement: tinycloud_core::policy_capability::sql_caveat::ConstrainedStatement {
+                name: source.statement.as_str().to_owned(),
+                sql: "SELECT v FROM t".into(),
+                fixed_params: vec![],
+            },
+        };
+        let error = store.execute_named(&source, &pinned).await.unwrap_err();
+        assert_eq!(error, PortError::Unavailable);
+        assert_eq!(DataPlaneError::from(error), DataPlaneError::Storage);
+    }
+
+    #[tokio::test]
+    async fn named_sql_store_execute_named_reads_migrated_alias() {
+        use tinycloud_core::{
+            database_artifacts::{
+                ArtifactExpectation, DatabaseArtifactRepository, SeaOrmDatabaseArtifactRepository,
+            },
+            models::database_legacy_artifact,
+            sea_orm::{ActiveModelTrait, ActiveValue::Set, Database},
+            sea_orm_migration::MigratorTrait,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("fixture.sqlite");
+        {
+            let db = rusqlite::Connection::open(&db_path).unwrap();
+            db.execute_batch("CREATE TABLE t(v TEXT); INSERT INTO t(v) VALUES ('aliased');")
+                .unwrap();
+        }
+        let conn = Database::connect(format!(
+            "sqlite:{}?mode=rwc",
+            dir.path().join("caps.db").display()
+        ))
+        .await
+        .unwrap();
+        tinycloud_core::migrations::Migrator::up(&conn, None)
+            .await
+            .unwrap();
+        let did = tinycloud_auth::resolver::DID_METHODS
+            .generate(
+                &tinycloud_auth::ssi::jwk::JWK::generate_ed25519().unwrap(),
+                "key",
+            )
+            .unwrap();
+        let source = SqlReadSource {
+            space: Did::parse(did.to_string()).unwrap(),
+            database: tinycloud_core::share_email::DatabaseName::parse("content_db").unwrap(),
+            path: Path::parse("web/threads").unwrap(),
+            statement: tinycloud_core::share_email::NamedStatement::parse("read_threads").unwrap(),
+            arguments: Default::default(),
+            arguments_digest: tinycloud_core::share_email::Sha256Digest::from_bytes([0; 32]),
+        };
+        let space = tinycloud_auth::resource::SpaceId::new(
+            did.to_string().parse().unwrap(),
+            "test".parse().unwrap(),
+        );
+        let physical = SqlService::legacy_db_name_from_path(Some("web/threads"));
+        let repo = Arc::new(SeaOrmDatabaseArtifactRepository::new(conn.clone()));
+        repo.save(
+            "sql",
+            &space.to_string(),
+            &physical,
+            std::fs::read(db_path).unwrap(),
+            ArtifactExpectation::Absent,
+        )
+        .await
+        .unwrap();
+        tinycloud_core::database_migration::set_fence(&conn, true)
+            .await
+            .unwrap();
+        database_legacy_artifact::ActiveModel {
+            service: Set("sql".into()),
+            space: Set(space.to_string()),
+            physical_name: Set(physical.clone()),
+        }
+        .insert(&conn)
+        .await
+        .unwrap();
+        tinycloud_core::database_migration::set_alias(
+            &conn,
+            "sql",
+            &space.to_string(),
+            Some("web/threads"),
+            &physical,
+        )
+        .await
+        .unwrap();
+        tinycloud_core::database_migration::set_fence(&conn, false)
+            .await
+            .unwrap();
+
+        let store = SqlNamedStore {
+            service: Arc::new(SqlService::new(
+                dir.path().join("sql").display().to_string(),
+                0,
+                repo,
+            )),
+            space_name: "test".into(),
+            conn,
+            write_fence: false,
+            fence_cache: Arc::new(Default::default()),
+        };
+        let pinned = PinnedNamedStatement {
+            database: source.database.clone(),
+            path: source.path.clone(),
+            statement: tinycloud_core::policy_capability::sql_caveat::ConstrainedStatement {
+                name: source.statement.as_str().to_owned(),
+                sql: "SELECT v FROM t".into(),
+                fixed_params: vec![],
+            },
+        };
+        let rows = store.execute_named(&source, &pinned).await.unwrap();
+        assert_eq!(rows.columns, ["v"]);
+        assert_eq!(rows.rows, [[SqlValue::Text("aliased".into())]]);
+    }
+
+    #[test]
+    fn named_sql_source_uses_only_canonical_uri_paths() {
+        let space: tinycloud_auth::resource::SpaceId =
+            "tinycloud:ens:example.eth:ns0".parse().unwrap();
+        let path = "appA/connectors";
+        assert_eq!(
+            sql_source_db_name(&space, path).unwrap(),
+            SqlService::db_name_from_path(Some(path))
+        );
+        assert!(sql_source_db_name(&space, "caf%C3%A9").is_ok());
+        for path in ["cafe\u{301}", "caf\u{e9}", "a%62", "a?b", "a#b"] {
+            assert!(sql_source_db_name(&space, path).is_err(), "{path:?}");
+        }
+    }
 
     #[tokio::test]
     async fn request_body_limit_is_strict() {
