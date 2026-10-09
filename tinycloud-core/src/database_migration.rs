@@ -9,7 +9,7 @@ use std::{
 
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr,
-    EntityTrait, QueryFilter, QuerySelect, TransactionTrait,
+    EntityTrait, FromQueryResult, QueryFilter, QuerySelect, TransactionTrait,
 };
 use sea_orm_migration::SchemaManager;
 use serde::{Deserialize, Serialize};
@@ -182,13 +182,22 @@ fn fingerprint_duckdb(path: &Path) -> Result<ArtifactFingerprint, MigrationError
     })
 }
 
-fn artifact_metadata_query(
-    service: &str,
-    space: &str,
-    name: &str,
-) -> sea_orm::Select<database_artifact::Entity> {
-    database_artifact::Entity::find_by_id((service.to_owned(), space.to_owned(), name.to_owned()))
+fn artifact_identity_query() -> sea_orm::Select<database_artifact::Entity> {
+    database_artifact::Entity::find()
+        .filter(database_artifact::Column::Service.is_in(["sql", "duckdb"]))
         .select_only()
+        .column(database_artifact::Column::Service)
+        .column(database_artifact::Column::Space)
+        .column(database_artifact::Column::Name)
+}
+
+fn artifact_inventory_query() -> sea_orm::Select<database_artifact::Entity> {
+    database_artifact::Entity::find()
+        .filter(database_artifact::Column::Service.is_in(["sql", "duckdb"]))
+        .select_only()
+        .column(database_artifact::Column::Service)
+        .column(database_artifact::Column::Space)
+        .column(database_artifact::Column::Name)
         .column(database_artifact::Column::Revision)
         .column(database_artifact::Column::SizeBytes)
         .column(database_artifact::Column::CheckpointContentHash)
@@ -197,13 +206,17 @@ fn artifact_metadata_query(
         .column(database_artifact::Column::DeltaSizeBytes)
 }
 
-fn artifact_identity_query() -> sea_orm::Select<database_artifact::Entity> {
-    database_artifact::Entity::find()
-        .filter(database_artifact::Column::Service.is_in(["sql", "duckdb"]))
-        .select_only()
-        .column(database_artifact::Column::Service)
-        .column(database_artifact::Column::Space)
-        .column(database_artifact::Column::Name)
+#[derive(FromQueryResult)]
+struct ArtifactInventoryRow {
+    service: String,
+    space: String,
+    name: String,
+    revision: i64,
+    size_bytes: i64,
+    checkpoint_content_hash: String,
+    checkpoint_size_bytes: i64,
+    delta_content_hash: Option<String>,
+    delta_size_bytes: i64,
 }
 
 fn artifact_name_query(
@@ -214,36 +227,6 @@ fn artifact_name_query(
     database_artifact::Entity::find_by_id((service.to_owned(), space.to_owned(), name.to_owned()))
         .select_only()
         .column(database_artifact::Column::Name)
-}
-
-async fn fingerprint<C: ConnectionTrait>(
-    conn: &C,
-    service: &str,
-    space: &str,
-    name: &str,
-) -> Result<Option<ArtifactMetadata>, MigrationError> {
-    let row: Option<(i64, i64, String, i64, Option<String>, i64)> =
-        artifact_metadata_query(service, space, name)
-            .into_tuple()
-            .one(conn)
-            .await?;
-    Ok(row.map(
-        |(
-            revision,
-            size_bytes,
-            checkpoint_content_hash,
-            checkpoint_size_bytes,
-            delta_content_hash,
-            delta_size_bytes,
-        )| ArtifactMetadata {
-            revision,
-            size_bytes,
-            checkpoint_content_hash,
-            checkpoint_size_bytes,
-            delta_content_hash,
-            delta_size_bytes,
-        },
-    ))
 }
 
 /// Reads artifact bytes only for an explicitly designated local snapshot.
@@ -468,12 +451,37 @@ async fn inventory_in<C: ConnectionTrait>(
     datadir: &Path,
     aliases_exist: bool,
 ) -> Result<Vec<InventoryItem>, MigrationError> {
-    let rows: Vec<(String, String, String)> =
-        artifact_identity_query().into_tuple().all(conn).await?;
+    let rows: Vec<ArtifactInventoryRow> = artifact_inventory_query().into_model().all(conn).await?;
     let mut artifacts: BTreeMap<(String, String, String), (bool, bool)> = BTreeMap::new();
-    for (service, space, name) in rows {
+    let mut metadata = BTreeMap::new();
+    let mut artifact_names = BTreeSet::new();
+    for ArtifactInventoryRow {
+        service,
+        space,
+        name,
+        revision,
+        size_bytes,
+        checkpoint_content_hash,
+        checkpoint_size_bytes,
+        delta_content_hash,
+        delta_size_bytes,
+    } in rows
+    {
+        artifact_names.insert((service.clone(), space.clone(), name.clone()));
         if !is_digest_name(&name) {
-            artifacts.entry((service, space, name)).or_default().0 = true;
+            let key = (service, space, name);
+            metadata.insert(
+                key.clone(),
+                ArtifactMetadata {
+                    revision,
+                    size_bytes,
+                    checkpoint_content_hash,
+                    checkpoint_size_bytes,
+                    delta_content_hash,
+                    delta_size_bytes,
+                },
+            );
+            artifacts.entry(key).or_default().0 = true;
         }
     }
     for (service, extension) in [("sql", ".db"), ("duckdb", ".duckdb")] {
@@ -549,6 +557,31 @@ async fn inventory_in<C: ConnectionTrait>(
             .or_default()
             .insert(path);
     }
+    let aliases: Vec<database_alias::Model> = if aliases_exist {
+        database_alias::Entity::find().all(conn).await?
+    } else {
+        Vec::new()
+    };
+    let mut aliases_by_logical = BTreeMap::new();
+    let mut aliases_by_physical = BTreeMap::new();
+    for alias in aliases {
+        aliases_by_logical.insert(
+            (
+                alias.service.clone(),
+                alias.space.clone(),
+                alias.logical_name.clone(),
+            ),
+            alias.clone(),
+        );
+        aliases_by_physical.insert(
+            (
+                alias.service.clone(),
+                alias.space.clone(),
+                alias.physical_name.clone(),
+            ),
+            alias,
+        );
+    }
     let mut result = Vec::new();
     for ((service, space, physical_name), (durable, cached)) in artifacts {
         let paths: Vec<_> = history
@@ -563,24 +596,11 @@ async fn inventory_in<C: ConnectionTrait>(
         };
         let collision = if paths.len() == 1 {
             let digest = logical_name(paths[0].as_deref());
-            let existing = if aliases_exist {
-                database_alias::Entity::find_by_id((service.clone(), space.clone(), digest.clone()))
-                    .one(conn)
-                    .await?
-            } else {
-                None
-            };
-            let physical_alias = if aliases_exist {
-                database_alias::Entity::find()
-                    .filter(database_alias::Column::Service.eq(&service))
-                    .filter(database_alias::Column::Space.eq(&space))
-                    .filter(database_alias::Column::PhysicalName.eq(&physical_name))
-                    .one(conn)
-                    .await?
-            } else {
-                None
-            };
-            artifact_exists(conn, &service, &space, &digest).await?
+            let existing =
+                aliases_by_logical.get(&(service.clone(), space.clone(), digest.clone()));
+            let physical_alias =
+                aliases_by_physical.get(&(service.clone(), space.clone(), physical_name.clone()));
+            artifact_names.contains(&(service.clone(), space.clone(), digest.clone()))
                 || existing.is_some_and(|alias| {
                     alias.physical_name != physical_name || alias.path != paths[0]
                 })
@@ -590,7 +610,7 @@ async fn inventory_in<C: ConnectionTrait>(
             false
         };
         result.push(InventoryItem {
-            metadata: fingerprint(conn, &service, &space, &physical_name).await?,
+            metadata: metadata.remove(&(service.clone(), space.clone(), physical_name.clone())),
             offline_fingerprint: None,
             service,
             space,
@@ -789,36 +809,112 @@ async fn apply_inventory_in<C: ConnectionTrait>(
     items: &[InventoryItem],
 ) -> Result<(), MigrationError> {
     validate_inventory(items)?;
+    let mut registered: BTreeSet<(String, String, String)> =
+        database_legacy_artifact::Entity::find()
+            .select_only()
+            .column(database_legacy_artifact::Column::Service)
+            .column(database_legacy_artifact::Column::Space)
+            .column(database_legacy_artifact::Column::PhysicalName)
+            .into_tuple()
+            .all(conn)
+            .await?
+            .into_iter()
+            .collect();
+    let artifacts: BTreeSet<(String, String, String)> = artifact_identity_query()
+        .into_tuple()
+        .all(conn)
+        .await?
+        .into_iter()
+        .collect();
+    let mut aliases_by_logical = BTreeMap::new();
+    let mut aliases_by_physical = BTreeMap::new();
+    for alias in database_alias::Entity::find().all(conn).await? {
+        aliases_by_logical.insert(
+            (
+                alias.service.clone(),
+                alias.space.clone(),
+                alias.logical_name.clone(),
+            ),
+            alias.clone(),
+        );
+        aliases_by_physical.insert(
+            (
+                alias.service.clone(),
+                alias.space.clone(),
+                alias.physical_name.clone(),
+            ),
+            alias,
+        );
+    }
+    let mut new_legacy = Vec::new();
     for item in items {
-        if database_legacy_artifact::Entity::find_by_id((
+        if registered.insert((
             item.service.clone(),
             item.space.clone(),
             item.physical_name.clone(),
-        ))
-        .one(conn)
-        .await?
-        .is_none()
-        {
-            database_legacy_artifact::ActiveModel {
+        )) {
+            new_legacy.push(database_legacy_artifact::ActiveModel {
                 service: Set(item.service.clone()),
                 space: Set(item.space.clone()),
                 physical_name: Set(item.physical_name.clone()),
-            }
-            .insert(conn)
-            .await?;
+            });
         }
     }
+    if !new_legacy.is_empty() {
+        database_legacy_artifact::Entity::insert_many(new_legacy)
+            .exec(conn)
+            .await?;
+    }
+    let mut new_aliases = Vec::new();
     for item in items {
         if item.classification == "unique" && item.durable {
-            set_alias_in(
-                conn,
-                &item.service,
-                &item.space,
-                item.paths[0].as_deref(),
-                &item.physical_name,
-            )
-            .await?;
+            let path = item.paths[0].as_deref();
+            validate(&item.service, &item.space, path, &item.physical_name)?;
+            let physical_key = (
+                item.service.clone(),
+                item.space.clone(),
+                item.physical_name.clone(),
+            );
+            if !registered.contains(&physical_key) || !artifacts.contains(&physical_key) {
+                return Err(MigrationError::MissingLegacyArtifact);
+            }
+            let digest = logical_name(path);
+            if artifacts.contains(&(item.service.clone(), item.space.clone(), digest.clone())) {
+                return Err(MigrationError::Collision);
+            }
+            let logical_key = (item.service.clone(), item.space.clone(), digest.clone());
+            if let Some(existing) = aliases_by_logical.get(&logical_key) {
+                if existing.physical_name == item.physical_name && existing.path.as_deref() == path
+                {
+                    continue;
+                }
+                return Err(MigrationError::Collision);
+            }
+            if aliases_by_physical.contains_key(&physical_key) {
+                return Err(MigrationError::AlreadyAssigned);
+            }
+            let alias = database_alias::Model {
+                service: item.service.clone(),
+                space: item.space.clone(),
+                logical_name: digest,
+                path: path.map(str::to_owned),
+                physical_name: item.physical_name.clone(),
+            };
+            aliases_by_logical.insert(logical_key, alias.clone());
+            aliases_by_physical.insert(physical_key, alias.clone());
+            new_aliases.push(database_alias::ActiveModel {
+                service: Set(alias.service),
+                space: Set(alias.space),
+                logical_name: Set(alias.logical_name),
+                path: Set(alias.path),
+                physical_name: Set(alias.physical_name),
+            });
         }
+    }
+    if !new_aliases.is_empty() {
+        database_alias::Entity::insert_many(new_aliases)
+            .exec(conn)
+            .await?;
     }
     Ok(())
 }
@@ -1009,16 +1105,12 @@ mod tests {
                 artifact_name_query("sql", "space", "threads")
                     .build(backend)
                     .to_string(),
-                artifact_metadata_query("sql", "space", "threads")
-                    .build(backend)
-                    .to_string(),
+                artifact_inventory_query().build(backend).to_string(),
             ] {
                 assert!(!sql.contains("\"payload\""), "{sql}");
                 assert!(!sql.contains("\"delta_payload\""), "{sql}");
             }
-            let sql = artifact_metadata_query("sql", "space", "threads")
-                .build(backend)
-                .to_string();
+            let sql = artifact_inventory_query().build(backend).to_string();
             for field in [
                 "revision",
                 "size_bytes",

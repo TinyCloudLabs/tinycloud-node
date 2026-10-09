@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TC-780 CLI inventory batching</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; color: #183040; background: #f5f7f8; }
+    body { max-width: 920px; margin: 0 auto; padding: 32px 20px 72px; line-height: 1.5; }
+    h1, h2 { line-height: 1.15; }
+    h1 { font-size: 2rem; margin-bottom: .3rem; }
+    h2 { border-top: 1px solid #cad5dc; padding-top: 1.4rem; margin-top: 2rem; }
+    .subtitle { color: #526979; margin-top: 0; }
+    .callout { background: #e5f3ef; border-left: 4px solid #147d69; padding: 14px 18px; margin: 24px 0; }
+    table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid #d9e1e5; }
+    th { background: #e9eff2; }
+    td.num { text-align: right; }
+    code { background: #e9eff2; border-radius: 3px; padding: 1px 4px; overflow-wrap: anywhere; }
+    .small { color: #526979; font-size: .93rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>TC-780 CLI inventory batching</h1>
+    <p class="subtitle">Local PG18 equivalence and WAN-latency evidence · 9 October 2026</p>
+  </header>
+
+  <div class="callout">The final CLI completed dry-run in 2.111 s and apply in 2.106 s with 70 ms added to every PostgreSQL ready cycle. Both are below the 20 s target.</div>
+
+  <section>
+    <h2>Change</h2>
+    <p>The CLI now reads SQL and DuckDB artifact identity and metadata in one query, loads the existing aliases once, and classifies collisions in memory. Its existing set-based ability and invocation reads remain. Apply loads the existing quarantine, artifact, and alias sets once, then inserts new quarantine and alias rows with two multi-row statements inside the existing transaction.</p>
+    <p>The artifact query names nine metadata fields explicitly. Neither <code>payload</code> nor <code>delta_payload</code> appears in a production-facing inventory SELECT. The fence, drift verification, quarantine and <code>set --authorized</code> paths are retained.</p>
+  </section>
+
+  <section>
+    <h2>Fixture and equivalence</h2>
+    <p>A local PostgreSQL 18 fixture was cloned into separate old and new databases. It contains 715 SQL artifacts, 612,091 <code>ability</code> rows, and 1,546,356 <code>invoked_abilities</code> rows, matching the production row estimates recorded in <code>/tmp/tc780-cutover/table-sizes.txt</code>. Of the artifacts, 400 classify as unique, 100 as ambiguous, and 215 as unattributed. This synthetic fixture matches row counts; it does not reproduce production byte sizes or data distribution.</p>
+    <p>The old binary was built from branch base <code>5858bc28a2da06f96667cc2104f4da7d2d74c511</code>. The final binary was built from the change. Byte comparisons passed for dry-run JSON and apply JSON, both directly and through the latency proxy. The same byte comparisons passed for 400 alias rows, 715 quarantine rows, one fence row, and explicit metadata exports of 715 artifact rows. The JSON output SHA-256 for both versions and both commands is <code>9b21ea10ebe3c27c89e43b4433683208b1cbae31afef9e488df3271d9aa1c908</code>.</p>
+    <p class="small">The CLI statement logs contain no SELECT of the artifact payload columns. An initial local row export selected the synthetic fixture’s empty payload columns; that export was discarded and replaced with an explicit metadata-only comparison. No production artifact payload was read.</p>
+  </section>
+
+  <section>
+    <h2>Database work and latency</h2>
+    <table>
+      <thead><tr><th>Command</th><th class="num">Old SQL statements</th><th class="num">New SQL statements</th><th class="num">Old ready cycles</th><th class="num">New ready cycles</th><th class="num">Old wall</th><th class="num">New wall</th></tr></thead>
+      <tbody>
+        <tr><td>dry-run</td><td class="num">1,919</td><td class="num">5</td><td class="num">5,767</td><td class="num">21</td><td class="num">300.829 s</td><td class="num">2.111 s</td></tr>
+        <tr><td>apply</td><td class="num">5,752</td><td class="num">13</td><td class="num">5,769</td><td class="num">28</td><td class="num">446.423 s</td><td class="num">2.106 s</td></tr>
+      </tbody>
+    </table>
+    <p class="small">Statement counts came from <code>log_statement=all</code> in uncontended direct runs. A local TCP proxy delayed each server <code>ReadyForQuery</code> message by 70 ms and counted those ready cycles across the CLI’s connections. The wall times include the local scan, connection setup, and proxy delay. The old and final new binaries used clones of the same fixture.</p>
+  </section>
+
+  <section>
+    <h2>Production connectivity check</h2>
+    <p>Exactly five separate <code>SELECT 1</code> calls were timed from this Mac using the private production URL. Their elapsed times were 1,143.5 ms, 912.0 ms, 1,023.0 ms, 2,289.8 ms, and 1,039.3 ms; median 1,039.3 ms. Each timing includes connection and TLS setup, so these numbers are an end-to-end trivial-query measurement rather than a pure steady-state network RTT. No other production queries were made.</p>
+  </section>
+
+  <section>
+    <h2>Gates and deployed-node path</h2>
+    <p><code>cargo fmt --all --check</code>, <code>cargo clippy --workspace --all-targets -- -D warnings</code>, <code>cargo test --workspace</code> with a local PostgreSQL URL, and the separate CLI test target all passed.</p>
+    <p>The deployed N3 node calls the same <code>database_migration</code> module for the effective fence and SQL/DuckDB <code>resolve</code> during serving. It does not call <code>inventory</code> or <code>apply</code> at boot or while serving; those entry points are called by the operator CLI. Shipping this CLI from the new branch does not require rebuilding the existing N3 image.</p>
+  </section>
+</body>
+</html>
