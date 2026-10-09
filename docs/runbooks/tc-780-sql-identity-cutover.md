@@ -265,7 +265,10 @@ On the CVM:
   set -euo pipefail
   umask 077
   phase="$(jq -r '.phase // "unset"' ./tc780-private/record.json)"
-  test "$phase" = stopped_before_step6 || { echo "phase=$phase: follow the rollback table row for $phase; do not re-run step 6 or fence on" >&2; exit 1; }
+  case "$phase" in
+    stopping|stopped_before_step6) ;;
+    *) echo "phase=$phase: follow the rollback table row for $phase; do not re-run step 6 or fence on" >&2; exit 1 ;;
+  esac
   deadline="$(jq -er '.outage_deadline_epoch' ./tc780-private/record.json)"
   budget() {
     remaining="$((deadline - $(date +%s)))"
@@ -513,7 +516,7 @@ PY
 Before the CVM stop and ledger transaction, run the following on the operator host, and refresh it before every promotion retry or old-container start. `phala cvms get --json` in CLI v1.1.19 exposes the desired Compose image, `in_progress`, and a nullable `progress.target`. Require `in_progress=false` before a ledger change; record the target and reject an unexpected node image target. When Phala desires the old image after a deploy run, manually confirm that the control plane has settled and set `TC780_PHALA_UPDATE_SETTLED_RUN_ID` to the current rollback run ID, or the N3 run ID if no rollback run exists, for this attempt. A changed or unreadable desired image halts. When Phala desires N3, the recorded five-minute deadline supplies a finite exit if no N3 container appears. When Phala desires the old image, the corresponding five-minute deadline permits an old-digest dispatch retry if no old container appears. After `rollback_ledger_cleared`, a stopped N3 container is expected and does not block a rollback dispatch retry.
 
 ```sh
-if (
+(
   set -euo pipefail
   umask 077
   timeout 15 phala cvms get tinycloud-node --json > ./tc780-private/abort-cvm.json
@@ -559,11 +562,8 @@ PY2
     exit 1
   fi
   printf 'Phala desired node image: %s\n' "$desired"
-); then
-  gate_status=0
-else
-  gate_status=$?
-fi
+)
+gate_status=$?
 unset TC780_PHALA_UPDATE_SETTLED_RUN_ID
 test "$gate_status" -eq 0
 ```
@@ -706,7 +706,7 @@ For either path that needs image promotion, run this separate sanctioned TC-767 
   digest="$(jq -er '.running_digest' ./tc780-private/record.json)"
   revision="$(jq -er '.running_revision' ./tc780-private/record.json)"
   before="$(gh run list -R TinyCloudLabs/tinycloud-node --workflow docker.yml --branch Codex/roman/rollback-meeting-node-20260915 --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId // 0')"
-  jq --argjson before "$before" --argjson now "$(date +%s)" '. + {rollback_previous_run_id:$before,rollback_dispatch_started_at:$now,phase:"rollback_dispatching"} | del(.rollback_deploy_run_id)' \
+  jq --argjson before "$before" --argjson now "$(date +%s)" '. + {rollback_previous_run_id:$before,rollback_dispatch_started_at:$now,phase:"rollback_dispatching"} | del(.rollback_deploy_run_id, .old_no_container_deadline_epoch)' \
     ./tc780-private/record.json > ./tc780-private/record.next.json
   mv ./tc780-private/record.next.json ./tc780-private/record.json
   if gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref Codex/roman/rollback-meeting-node-20260915 \
