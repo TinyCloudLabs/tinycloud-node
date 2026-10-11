@@ -97,12 +97,12 @@ jobs:
         count="$(cargo test -p tinycloud-core --lib -- --list \
           | grep -cE '::postgres_[a-z0-9_]+: test$' || true)"
         echo "PostgreSQL regressions discovered: ${count}"
-        if [ "${count}" -lt 4 ]; then
-          echo "::error::expected at least 4 postgres_* regressions in tinycloud-core, found ${count}. They were renamed or deleted — restore them, or update this guard deliberately (TC-381)."
+        if [ "${count}" -lt 5 ]; then
+          echo "::error::expected at least 5 postgres_* regressions in tinycloud-core, found ${count}. They were renamed or deleted — restore them, or update this guard deliberately (TC-381)."
           exit 1
         fi
 
-    # The four postgres_* regressions run as part of this suite, against the
+    # The five postgres_* regressions run as part of this suite, against the
     # service container above. tinycloud-core's other ~300 tests — which no CI
     # job had ever executed — run here too.
     - name: Run the workspace test suite
