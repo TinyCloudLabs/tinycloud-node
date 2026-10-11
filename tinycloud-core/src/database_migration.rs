@@ -8,8 +8,11 @@ use std::{
 };
 
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr,
-    EntityTrait, QueryFilter, QuerySelect, TransactionTrait,
+    sea_query::{Expr, Query},
+    ActiveModelTrait,
+    ActiveValue::Set,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, QuerySelect,
+    TransactionTrait,
 };
 use sea_orm_migration::SchemaManager;
 use serde::{Deserialize, Serialize};
@@ -206,6 +209,34 @@ fn artifact_identity_query() -> sea_orm::Select<database_artifact::Entity> {
         .column(database_artifact::Column::Name)
 }
 
+/// SQL/DuckDB artifacts with no registered legacy row. Digest names are still in the result;
+/// `has_unmigrated_artifacts` excludes them with the exact `is_digest_name` rule.
+fn unregistered_artifact_query() -> sea_orm::Select<database_artifact::Entity> {
+    use database_artifact::{Column as Artifact, Entity as ArtifactTable};
+    use database_legacy_artifact::{Column as Legacy, Entity as LegacyTable};
+    artifact_identity_query().filter(
+        Expr::exists(
+            Query::select()
+                .expr(Expr::value(1))
+                .from(LegacyTable)
+                .and_where(
+                    Expr::col((LegacyTable, Legacy::Service))
+                        .equals((ArtifactTable, Artifact::Service)),
+                )
+                .and_where(
+                    Expr::col((LegacyTable, Legacy::Space))
+                        .equals((ArtifactTable, Artifact::Space)),
+                )
+                .and_where(
+                    Expr::col((LegacyTable, Legacy::PhysicalName))
+                        .equals((ArtifactTable, Artifact::Name)),
+                )
+                .to_owned(),
+        )
+        .not(),
+    )
+}
+
 fn artifact_name_query(
     service: &str,
     space: &str,
@@ -373,21 +404,10 @@ pub async fn require_fence<C: ConnectionTrait>(conn: &C) -> Result<(), Migration
 pub async fn has_unmigrated_artifacts<C: ConnectionTrait>(
     conn: &C,
 ) -> Result<bool, MigrationError> {
-    let registered: BTreeSet<(String, String, String)> = database_legacy_artifact::Entity::find()
-        .select_only()
-        .column(database_legacy_artifact::Column::Service)
-        .column(database_legacy_artifact::Column::Space)
-        .column(database_legacy_artifact::Column::PhysicalName)
-        .into_tuple::<(String, String, String)>()
-        .all(conn)
-        .await?
-        .into_iter()
-        .collect();
-    let rows: Vec<(String, String, String)> =
-        artifact_identity_query().into_tuple().all(conn).await?;
-    Ok(rows
-        .into_iter()
-        .any(|row| !is_digest_name(&row.2) && !registered.contains(&row)))
+    // One anti-join on the database instead of transferring both tables on every check.
+    let unregistered: Vec<(String, String, String)> =
+        unregistered_artifact_query().into_tuple().all(conn).await?;
+    Ok(unregistered.iter().any(|row| !is_digest_name(&row.2)))
 }
 
 /// Caches only the expensive legacy-artifact inventory. The durable metadata
@@ -1006,6 +1026,7 @@ mod tests {
         ] {
             for sql in [
                 artifact_identity_query().build(backend).to_string(),
+                unregistered_artifact_query().build(backend).to_string(),
                 artifact_name_query("sql", "space", "threads")
                     .build(backend)
                     .to_string(),
@@ -1030,6 +1051,71 @@ mod tests {
                 assert!(sql.contains(field), "{sql}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn unregistered_scan_ignores_digests_and_registered_legacy_names() {
+        use sea_orm::Database;
+        use sea_orm_migration::MigratorTrait;
+
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Database::connect(format!(
+            "sqlite:{}?mode=rwc",
+            dir.path().join("caps.db").display()
+        ))
+        .await
+        .unwrap();
+        crate::migrations::Migrator::up(&conn, None).await.unwrap();
+        let artifact = |space: &str, name: &str| database_artifact::ActiveModel {
+            service: Set("sql".into()),
+            space: Set(space.into()),
+            name: Set(name.into()),
+            revision: Set(1),
+            content_hash: Set("fixture".into()),
+            payload: Set(vec![]),
+            size_bytes: Set(0),
+            backend: Set("sqlite".into()),
+            storage_mode: Set("database-blob".into()),
+            created_at: Set("2026-01-01T00:00:00Z".into()),
+            updated_at: Set("2026-01-01T00:00:00Z".into()),
+            checkpoint_size_bytes: Set(0),
+            checkpoint_content_hash: Set("fixture".into()),
+            delta_payload: Set(None),
+            delta_content_hash: Set(None),
+            delta_size_bytes: Set(0),
+        };
+        artifact("a", &format!("v2d{}", "0".repeat(64)))
+            .insert(&conn)
+            .await
+            .unwrap();
+        artifact("a", "v2n").insert(&conn).await.unwrap();
+        assert!(!has_unmigrated_artifacts(&conn).await.unwrap(), "digests");
+        artifact("a", "threads").insert(&conn).await.unwrap();
+        // The same legacy name registered for another space does not cover it.
+        database_legacy_artifact::ActiveModel {
+            service: Set("sql".into()),
+            space: Set("b".into()),
+            physical_name: Set("threads".into()),
+        }
+        .insert(&conn)
+        .await
+        .unwrap();
+        assert!(
+            has_unmigrated_artifacts(&conn).await.unwrap(),
+            "unregistered"
+        );
+        database_legacy_artifact::ActiveModel {
+            service: Set("sql".into()),
+            space: Set("a".into()),
+            physical_name: Set("threads".into()),
+        }
+        .insert(&conn)
+        .await
+        .unwrap();
+        assert!(
+            !has_unmigrated_artifacts(&conn).await.unwrap(),
+            "registered"
+        );
     }
 
     #[tokio::test]
