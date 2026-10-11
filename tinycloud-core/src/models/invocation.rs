@@ -459,10 +459,11 @@ async fn validate_capabilities<C: ConnectionTrait>(
 
                 // A pre-N2 SQL/DuckDB child may have been stored under the
                 // old descendant rule. At least one cited proof chain must
-                // contain this invocation all the way to its ancestors. Do
-                // not require unrelated parallel proofs to cover it, and do
-                // not combine a valid ancestor from one proof with caveats
-                // from another proof.
+                // contain this invocation at every ancestor up to the space
+                // owner; an owner-issued delegation is the authority
+                // boundary, as at registration. Do not require unrelated
+                // parallel proofs to cover it, and do not combine a valid
+                // ancestor from one proof with caveats from another proof.
                 if matches!(
                     &c.resource,
                     Resource::TinyCloud(resource)
@@ -476,8 +477,11 @@ async fn validate_capabilities<C: ConnectionTrait>(
                             )
                             && caveats_contain_child(&ability.caveats, &c.caveats).is_ok()
                     };
-                    let valid_chain = graph
-                        .has_covering_chain(parents.iter().map(|(parent, _)| parent.id), covers);
+                    let valid_chain = graph.has_covering_chain(
+                        parents.iter().map(|(parent, _)| parent.id),
+                        covers,
+                        |row| is_root_authority(c, &row.delegator),
+                    );
                     if !valid_chain {
                         return Err(InvocationError::UnauthorizedAction(
                             Box::new(c.resource.clone()),
