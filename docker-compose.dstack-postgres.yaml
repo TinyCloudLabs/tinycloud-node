@@ -73,8 +73,7 @@ services:
       ROCKET_MAX_BLOCKING: "1024"
 
   dstack-ingress:
-    # Production must set TINYCLOUD_INGRESS_IMAGE to the built wrapper's immutable GHCR digest.
-    image: ${TINYCLOUD_INGRESS_IMAGE:-ghcr.io/tinycloudlabs/tinycloud-node-ingress:latest}
+    image: dstacktee/dstack-ingress:20250924@sha256:40429d78060ef3066b5f93676bf3ba7c2e9ac47d4648440febfdda558aed4b32
     ports:
       - "443:443"
     depends_on:
