@@ -8510,10 +8510,12 @@ mod tests {
             )
         }
 
+        /// An empty path is pathless except for KV, which keeps the explicit
+        /// `{space}/kv/` spelling; `kv_pathless_resource` signs `{space}/kv`.
         fn resource_in(&self, space: &SpaceId, service: &str, path: &str) -> Result<ResourceId> {
             Ok(space.clone().to_resource(
                 service.parse::<Service>()?,
-                (!path.is_empty())
+                (service == "kv" || !path.is_empty())
                     .then(|| path.parse::<AuthPath>())
                     .transpose()?,
                 None,
@@ -9252,6 +9254,12 @@ mod tests {
         use rocket::http::Status;
 
         let fixture = KvSyncFixture::new().await?;
+        // `device_invocation` with "" must sign the empty-path spelling, not
+        // the pathless one, or this test compares a spelling with itself.
+        assert_ne!(
+            fixture.resource_in(&fixture.space, "kv", "")?,
+            fixture.kv_pathless_resource()?
+        );
         let expiry = whole_seconds_from_now(20 * 86_400);
         let sync_grants = [
             fixture
