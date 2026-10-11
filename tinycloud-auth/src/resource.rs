@@ -190,6 +190,22 @@ impl ResourceId {
     pub fn fragment(&self) -> Option<&UriFragmentString> {
         self.fragment.as_ref()
     }
+    /// Returns this resource with an empty KV path normalized to the pathless
+    /// whole-space root. Other services and non-empty paths are unchanged.
+    pub fn canonicalize_kv_root(&self) -> Self {
+        let mut resource = self.clone();
+        if resource.path().is_some() && resource.canonical_kv_path().is_none() {
+            resource.path = None;
+        }
+        resource
+    }
+    /// Returns the path used for containment, treating an empty KV path as
+    /// the pathless whole-space root without allocating.
+    pub fn canonical_kv_path(&self) -> Option<&Path> {
+        self.path()
+            .filter(|path| self.service().as_str() != "kv" || !path.as_str().is_empty())
+    }
+
     pub fn extends(&self, base: &ResourceId) -> Result<(), ResourceCheckError> {
         if base.space() != self.space() {
             Err(ResourceCheckError::IncorrectSpace)
@@ -197,26 +213,28 @@ impl ResourceId {
             Err(ResourceCheckError::IncorrectService)
         } else if base.fragment() != self.fragment() {
             Err(ResourceCheckError::IncorrectFragment)
-        } else if match (
-            self.path().map(|p| p.as_str()),
-            base.path().map(|p| p.as_str()),
-        ) {
-            (Some(s), Some(b)) => {
-                if matches!(self.service().as_str(), "sql" | "duckdb") && !b.ends_with('/') {
-                    s != b
-                } else {
-                    !s.starts_with(b)
-                        || !(b.ends_with('/')
-                            || s.len() == b.len()
-                            || s.as_bytes().get(b.len()) == Some(&b'/'))
-                }
-            }
-            (Some(_), None) | (None, None) => false,
-            (None, Some(_)) => true,
-        } {
-            Err(ResourceCheckError::DoesNotExtendPath)
         } else {
-            Ok(())
+            if match (
+                self.canonical_kv_path().map(|path| path.as_str()),
+                base.canonical_kv_path().map(|path| path.as_str()),
+            ) {
+                (Some(s), Some(b)) => {
+                    if matches!(self.service().as_str(), "sql" | "duckdb") && !b.ends_with('/') {
+                        s != b
+                    } else {
+                        !s.starts_with(b)
+                            || !(b.ends_with('/')
+                                || s.len() == b.len()
+                                || s.as_bytes().get(b.len()) == Some(&b'/'))
+                    }
+                }
+                (Some(_), None) | (None, None) => false,
+                (None, Some(_)) => true,
+            } {
+                Err(ResourceCheckError::DoesNotExtendPath)
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -437,6 +455,24 @@ mod tests {
                 "{service} pathless invocation"
             );
         }
+    }
+    #[test]
+    fn kv_root_pathless_and_empty_path_are_equivalent_only_for_kv() {
+        let pathless: ResourceId = "tinycloud:ens:example.eth:ns0/kv".parse().unwrap();
+        let empty_path: ResourceId = "tinycloud:ens:example.eth:ns0/kv/".parse().unwrap();
+        assert!(pathless.extends(&empty_path).is_ok());
+        assert!(empty_path.extends(&pathless).is_ok());
+
+        let notes: ResourceId = "tinycloud:ens:example.eth:ns0/kv/notes/".parse().unwrap();
+        assert!(notes.extends(&pathless).is_ok());
+        assert!(notes.extends(&empty_path).is_ok());
+        assert!(pathless.extends(&notes).is_err());
+        assert!(empty_path.extends(&notes).is_err());
+
+        let other_service: ResourceId = "tinycloud:ens:example.eth:ns0/sql/".parse().unwrap();
+        let other_pathless: ResourceId = "tinycloud:ens:example.eth:ns0/sql".parse().unwrap();
+        assert!(other_service.extends(&other_pathless).is_ok());
+        assert!(other_pathless.extends(&other_service).is_err());
     }
 
     #[test]

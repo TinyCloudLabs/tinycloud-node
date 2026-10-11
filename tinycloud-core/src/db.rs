@@ -1869,7 +1869,8 @@ where
         S::Writable: 'static + Unpin,
     {
         // TC-732: a `kv/sync` invocation must be exactly one capability on a
-        // non-empty KV prefix; anything else is rejected before any work.
+        // KV resource (the root resource is the whole-space feed); anything
+        // else is rejected before any work.
         let sync_target =
             kv_sync_target(&invocation.0).map_err(TxStoreError::KvSyncInvalidRequest)?;
         // TC-732 addendum: reject a list cursor outside its prefix before any
@@ -2539,9 +2540,9 @@ where
 type KvSyncTarget = (SpaceId, Path, Resource);
 
 /// The target of a `tinycloud.kv/sync` invocation, or `None` when it invokes
-/// no `kv/sync`. A `kv/sync` must be the invocation's only capability and name
-/// a non-empty KV prefix: the cursor, the authority window and the read audit
-/// all describe exactly one feed.
+/// no `kv/sync`. A root resource is canonicalized to an empty prefix and a
+/// pathless `kv` resource, so cursors, authority, and retention describe one
+/// stable whole-space feed regardless of `{space}/kv` vs `{space}/kv/`.
 fn kv_sync_target(
     invocation: &crate::util::InvocationInfo,
 ) -> Result<Option<KvSyncTarget>, &'static str> {
@@ -2559,16 +2560,21 @@ fn kv_sync_target(
         .resource
         .tinycloud_resource()
         .and_then(|resource| {
-            let path = resource.path()?;
             (resource.service().as_str() == "kv"
-                && !path.as_str().is_empty()
                 && resource.query().is_none()
                 && resource.fragment().is_none())
-            .then(|| (resource.space().clone(), path.clone()))
+            .then(|| {
+                let prefix = resource
+                    .path()
+                    .cloned()
+                    .unwrap_or_else(|| "".parse().expect("empty Path is valid"));
+                let canonical_resource = Resource::TinyCloud(resource.canonicalize_kv_root());
+                (resource.space().clone(), prefix, canonical_resource)
+            })
         });
     match target {
-        Some((space, prefix)) => Ok(Some((space, prefix, capability.resource.clone()))),
-        None => Err("tinycloud.kv/sync requires a non-empty KV prefix"),
+        Some((space, prefix, resource)) => Ok(Some((space, prefix, resource))),
+        None => Err("tinycloud.kv/sync requires a KV resource without query or fragment"),
     }
 }
 
