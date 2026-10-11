@@ -15,6 +15,9 @@ root feeds advertise `kv-sync-root` alongside `kv-sync-v1` in `/info`.
   `{space}/kv/{prefix}` or the root resource `{space}/kv`. The root resource
   reads the whole space; a prefix-scoped grant does not authorize that feed.
   Anything else is a 400, checked before any other capability is dispatched.
+- Pathless `{space}/kv` and empty-path `{space}/kv/` are equivalent for sync
+  authorization, attenuation, and retention containment. This root equivalence
+  does not widen non-empty prefix boundaries or affect other services.
 - `tinycloud.kv/sync` is never implied: no other action, `*`, or
   `tinycloud.kv/*` grants it, and default session builders do not include it.
   A device bundle that syncs is typically `get,list,metadata,sync` on the

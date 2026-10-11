@@ -195,6 +195,7 @@ fn build_info(
         "kv-sync-v1",
         "kv-sync-root",
     ]);
+    #[cfg(feature = "dstack")]
     features.push("tee");
     NodeInfo {
         protocol: tinycloud_auth::protocol::PROTOCOL_VERSION,
@@ -8142,7 +8143,7 @@ mod tests {
         let sql_service = fresh_sql_service().await;
         let hook_runtime = HookRuntime::new(HooksConfig::default(), [9u8; 32]);
         let rocket = rocket::build()
-            .mount("/", rocket::routes![invoke, info])
+            .mount("/", rocket::routes![invoke, info, delegate])
             .attach(crate::tracing::TracingFairing::new(
                 &Config::default().log.tracing,
             ))
@@ -8500,12 +8501,17 @@ mod tests {
         fn kv_resource(&self, path: &str) -> Result<ResourceId> {
             Ok(self.space.clone().to_resource(
                 "kv".parse::<Service>()?,
-                (!path.is_empty())
-                    .then(|| path.parse::<AuthPath>())
-                    .transpose()?,
+                Some(path.parse::<AuthPath>()?),
                 None,
                 None,
             ))
+        }
+
+        fn kv_pathless_resource(&self) -> Result<ResourceId> {
+            Ok(self
+                .space
+                .clone()
+                .to_resource("kv".parse::<Service>()?, None, None, None))
         }
 
         /// The owner writes (`Some(body)`) or deletes (`None`) `key`.
@@ -8592,6 +8598,66 @@ mod tests {
             Ok(id)
         }
 
+        async fn signed_root_grant(
+            &self,
+            label: &str,
+            action: &str,
+            expiry: OffsetDateTime,
+            pathless: bool,
+        ) -> Result<tinycloud_core::hash::Hash> {
+            use rocket::http::Header;
+            use tinycloud_auth::{
+                ssi::{
+                    claims::jwt::NumericDate,
+                    dids::{DIDBuf, DIDURLBuf},
+                    ucan::Payload,
+                },
+                ucan_capabilities_object::Capabilities,
+            };
+
+            let resource = if pathless {
+                self.kv_pathless_resource()?
+            } else {
+                self.kv_resource("")?
+            };
+            let mut capabilities = Capabilities::new();
+            capabilities.with_action(
+                resource.as_uri(),
+                action.parse::<UcanAbility>()?,
+                [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+            );
+            let token = Payload {
+                issuer: self.owner_vm.parse::<DIDURLBuf>()?,
+                audience: self.device_did().parse::<DIDBuf>()?,
+                not_before: None,
+                expiration: NumericDate::try_from_seconds(expiry.unix_timestamp() as f64)?,
+                nonce: Some(format!("urn:uuid:tc858-{label}")),
+                facts: Some(Vec::<serde_json::Value>::new()),
+                proof: vec![],
+                attenuation: capabilities,
+            }
+            .sign(self.owner.get_algorithm().unwrap_or_default(), &self.owner)?
+            .encode()?;
+            let response = self
+                .client
+                .post("/delegate")
+                .header(Header::new("Authorization", token))
+                .dispatch()
+                .await;
+            let status = response.status();
+            let body = response.into_string().await.unwrap_or_default();
+            anyhow::ensure!(
+                status.class().is_success(),
+                "signed root grant {label} failed: {status}: {body}"
+            );
+            let body: serde_json::Value = serde_json::from_str(&body)?;
+            let cid = body["cid"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("signed delegation response missing cid"))?
+                .parse::<tinycloud_auth::ipld_core::cid::Cid>()?;
+            Ok(tinycloud_core::hash::Hash::from(cid))
+        }
+
         /// The owner's device grant on `notes/` with `actions`, expiring in an
         /// hour.
         async fn device_grant(
@@ -8673,6 +8739,36 @@ mod tests {
                     [std::collections::BTreeMap::<String, serde_json::Value>::new()],
                 );
             }
+            Ok(Payload {
+                issuer: self.device_vm.parse::<DIDURLBuf>()?,
+                audience: self.device_did().parse::<DIDBuf>()?,
+                not_before: None,
+                expiration: test_invocation_expiration(),
+                nonce: Some(self.next_nonce()),
+                facts: Some(Vec::<serde_json::Value>::new()),
+                proof: vec![proof.to_cid(0x55)],
+                attenuation: capabilities,
+            }
+            .sign(
+                self.device.get_algorithm().unwrap_or_default(),
+                &self.device,
+            )?
+            .encode()?)
+        }
+
+        fn device_pathless_invocation(
+            &self,
+            action: &str,
+            proof: tinycloud_core::hash::Hash,
+        ) -> Result<String> {
+            use tinycloud_auth::ssi::{dids::DIDURLBuf, ucan::Payload};
+            use tinycloud_auth::ucan_capabilities_object::Capabilities;
+            let mut capabilities = Capabilities::new();
+            capabilities.with_action(
+                self.kv_pathless_resource()?.as_uri(),
+                action.parse::<UcanAbility>()?,
+                [std::collections::BTreeMap::<String, serde_json::Value>::new()],
+            );
             Ok(Payload {
                 issuer: self.device_vm.parse::<DIDURLBuf>()?,
                 audience: self.device_did().parse::<DIDBuf>()?,
@@ -9034,6 +9130,83 @@ mod tests {
             .await;
         assert_eq!(slash.status, Status::Ok, "{}", slash.body);
         assert_eq!(slash.json["source"]["prefix"], "");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kv_sync_root_spelling_equivalence_applies_to_signed_grants() -> Result<()> {
+        use rocket::http::Status;
+
+        let fixture = KvSyncFixture::new().await?;
+        let expiry = whole_seconds_from_now(20 * 86_400);
+        let sync_grants = [
+            fixture
+                .signed_root_grant("empty-root-sync", "tinycloud.kv/sync", expiry, false)
+                .await?,
+            fixture
+                .signed_root_grant("pathless-root-sync", "tinycloud.kv/sync", expiry, true)
+                .await?,
+        ];
+        for grant in sync_grants {
+            let invocations = [
+                fixture.device_pathless_invocation("tinycloud.kv/sync", grant)?,
+                fixture.device_invocation(&[("", "tinycloud.kv/sync")], grant)?,
+            ];
+            for invocation in invocations {
+                let reply = fixture.dispatch(invocation, &[]).await;
+                assert_eq!(reply.status, Status::Ok, "{}", reply.body);
+            }
+        }
+
+        let sync = fixture
+            .signed_root_grant(
+                "retention-sync",
+                "tinycloud.kv/sync",
+                whole_seconds_from_now(3600),
+                false,
+            )
+            .await?;
+        let retain_grants = [
+            fixture
+                .signed_root_grant("empty-root-retain", "tinycloud.kv/retain", expiry, false)
+                .await?,
+            fixture
+                .signed_root_grant("pathless-root-retain", "tinycloud.kv/retain", expiry, true)
+                .await?,
+        ];
+        for pathless in [true, false] {
+            for retain in retain_grants {
+                let invocation = if pathless {
+                    fixture.device_pathless_invocation("tinycloud.kv/sync", sync)?
+                } else {
+                    fixture.device_invocation(&[("", "tinycloud.kv/sync")], sync)?
+                };
+                let retain_cid = retain.to_cid(0x55).to_string();
+                let reply = fixture
+                    .dispatch(invocation, &[("x-tinycloud-retention-grant", &retain_cid)])
+                    .await;
+                assert_eq!(reply.status, Status::Ok, "{}", reply.body);
+            }
+        }
+
+        let notes_grant = fixture
+            .device_grant("notes-only-sync", &["tinycloud.kv/sync"])
+            .await?;
+        let notes_to_root = fixture
+            .dispatch(
+                fixture.device_pathless_invocation("tinycloud.kv/sync", notes_grant)?,
+                &[],
+            )
+            .await;
+        assert_eq!(
+            notes_to_root.status,
+            Status::Unauthorized,
+            "{}",
+            notes_to_root.body
+        );
+
+        let root_to_notes = fixture.sync("notes/", sync, &[]).await?;
+        assert_eq!(root_to_notes.status, Status::Ok, "{}", root_to_notes.body);
         Ok(())
     }
 

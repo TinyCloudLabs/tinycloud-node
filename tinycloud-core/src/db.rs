@@ -2568,16 +2568,7 @@ fn kv_sync_target(
                     .path()
                     .cloned()
                     .unwrap_or_else(|| "".parse().expect("empty Path is valid"));
-                let canonical_resource = if prefix.as_str().is_empty() {
-                    Resource::TinyCloud(resource.space().clone().to_resource(
-                        resource.service().clone(),
-                        None,
-                        None,
-                        None,
-                    ))
-                } else {
-                    capability.resource.clone()
-                };
+                let canonical_resource = Resource::TinyCloud(resource.canonicalize_kv_root());
                 (resource.space().clone(), prefix, canonical_resource)
             })
         });
