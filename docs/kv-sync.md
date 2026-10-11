@@ -1,25 +1,28 @@
 # `tinycloud.kv/sync` wire contract
 
 `tinycloud.kv/sync` (TC-732) is an ordered, resumable, delete-aware feed of
-the latest state of every key under one KV prefix. A device uses it to keep a
-local read replica: the feed says which keys changed and what they now hold
-(ETag, metadata, or deleted); content is still read with `tinycloud.kv/get`
-and checked against the ETag. Nodes that serve it advertise the `kv-sync-v1`
-feature in `/info`.
+the latest state of every key under one KV prefix. The KV root resource,
+`{space}/kv` (also accepted as `{space}/kv/`), selects every key in the space.
+A device uses it to keep a local read replica: the feed says which keys
+changed and what they now hold (ETag, metadata, or deleted); content is still
+read with `tinycloud.kv/get` and checked against the ETag. Nodes that serve
+root feeds advertise `kv-sync-root` alongside `kv-sync-v1` in `/info`.
 
 ## Authorization
 
 - The invocation goes to `POST /invoke` like any KV read, and must carry
   **exactly one** capability: `tinycloud.kv/sync` on
-  `{space}/kv/{prefix}`, with a non-empty prefix. Anything else is a 400,
-  checked before any other capability is dispatched.
+  `{space}/kv/{prefix}` or the root resource `{space}/kv`. The root resource
+  reads the whole space; a prefix-scoped grant does not authorize that feed.
+  Anything else is a 400, checked before any other capability is dispatched.
 - `tinycloud.kv/sync` is never implied: no other action, `*`, or
   `tinycloud.kv/*` grants it, and default session builders do not include it.
   A device bundle that syncs is typically `get,list,metadata,sync` on the
   prefix.
 - Prefixes match by whole path segments and byte-exactly: a grant on `notes`
   covers `notes` and `notes/a`, not `notes-secret/x` or `NOTES/x`; a grant on
-  `notes/` covers everything under `notes/` but not `notes` itself.
+  `notes/` covers everything under `notes/` but not `notes` itself. Neither
+  scoped grant covers the root feed.
 
 ## Request headers
 
@@ -27,7 +30,7 @@ feature in `/info`.
 |---|---|
 | `x-tinycloud-limit` | Page size, 1–1000. Default 500. |
 | `x-tinycloud-cursor` | The `cursor` from the previous response. Omit it to bootstrap. |
-| `x-tinycloud-retention-grant` | Optional CID of a delegation carrying `tinycloud.kv/retain` on the prefix (see `authority.retainUntil`). |
+| `x-tinycloud-retention-grant` | Optional CID of a delegation carrying `tinycloud.kv/retain` on the prefix or the whole-space root (see `authority.retainUntil`). |
 
 ## Response (200)
 
@@ -44,6 +47,8 @@ feature in `/info`.
 }
 ```
 
+- For a whole-space feed, `source.prefix` is the empty string.
+
 - `changes` holds each changed key's **latest** state, in the order the
   changes committed. A key appears again only if it changes again. `etag` is
   the same strong ETag `kv/get` returns.
@@ -54,7 +59,8 @@ feature in `/info`.
   Its length does not depend on any key or on how much the space has
   changed.
 - An empty poll (`changes: []`) returns the request's cursor **byte for
-  byte**. Writes outside the prefix never change it.
+  byte**. Writes outside the selected prefix never change it; for the root
+  feed, all writes in the selected space are in scope.
 - A page can transiently come back with `changes: []` **and** `more: true`:
   the event that would have ended the page was overwritten or deleted between
   the node's reads. It is not an error. Keep paging with the returned cursor;
@@ -78,8 +84,9 @@ of them can be larger. Clients must accept pages larger than `limit`.
 
 ### Bootstrap
 
-The first request (no cursor) starts from the beginning of the prefix. Keys
-deleted before that first request are not reported; deletions after it are.
+The first request (no cursor) starts from the beginning of the selected prefix;
+for a root feed, that is the beginning of the space. Keys deleted before that
+first request are not reported; deletions after it are.
 
 ## `authority`
 
@@ -98,14 +105,15 @@ The node attests the window in which the caller's authority holds:
 
 A retention grant must be held by the invoker, be unrevoked along its whole
 chain, be inside its chain's validity window, and carry `tinycloud.kv/retain`
-on a resource the sync prefix extends. `tinycloud.kv/retain` is never invoked
-and never implied.
+on a resource the sync prefix extends. For a root feed, only a root-scoped
+retention grant covers the feed. `tinycloud.kv/retain` is never invoked and
+never implied.
 
 ## Errors
 
 | Status | Body | When |
 |---|---|---|
-| 400 | text | More than one capability; an empty prefix; `x-tinycloud-limit` outside 1–1000; a cursor that is not a cursor (empty, longer than 4096 characters, or not base64url); a retention header that is not a CID. |
+| 400 | text | More than one capability; a sync resource that is not a KV resource or has a query/fragment; `x-tinycloud-limit` outside 1–1000; a cursor that is not a cursor (empty, longer than 4096 characters, or not base64url); a retention header that is not a CID. |
 | 401 | text, e.g. `delegation-revoked: ...` | The caller is not authorized, including a revoked or expired grant. Checked before the cursor is opened, so an unauthorized caller never sees 410. |
 | 403 | `{"error":{"code":"RETENTION_GRANT_REFUSED","reason":"<reason>"}}` | The retention grant is refused. Reasons: `retention-grant-not-found`, `retention-grant-holder-mismatch`, `retention-grant-revoked`, `retention-grant-ancestor-revoked`, `retention-grant-not-yet-valid`, `retention-grant-expired`, `retention-grant-not-covering`. The sync is not served without retention. |
 | 410 | `{"error":{"code":"RESET_REQUIRED","reason":"cursor-invalid"}}` | The cursor was not minted by this node for this space and prefix, or is from an older cursor version. |

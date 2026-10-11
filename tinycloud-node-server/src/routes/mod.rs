@@ -188,8 +188,13 @@ fn build_info(
     let mut features = vec!["kv", "delegation", "sharing", "sql"];
     #[cfg(feature = "duckdb")]
     features.push("duckdb");
-    features.extend(["hooks", "signed-urls", "encryption", "kv-sync-v1"]);
-    #[cfg(feature = "dstack")]
+    features.extend([
+        "hooks",
+        "signed-urls",
+        "encryption",
+        "kv-sync-v1",
+        "kv-sync-root",
+    ]);
     features.push("tee");
     NodeInfo {
         protocol: tinycloud_auth::protocol::PROTOCOL_VERSION,
@@ -909,8 +914,9 @@ fn kv_invoke_options(
 }
 
 /// The `(space, prefix)` of a `tinycloud.kv/sync` invocation (TC-732), or
-/// `None` when it invokes no `kv/sync`. A `kv/sync` must be the invocation's
-/// only capability and name a non-empty KV prefix; anything else is a 400.
+/// `None` when it invokes no `kv/sync`. The root resource `{space}/kv` and
+/// `{space}/kv/` both name the whole-space feed; every other check remains
+/// strict.
 fn kv_sync_target(
     capabilities: &[Capability],
 ) -> Result<Option<(SpaceId, Path)>, (Status, String)> {
@@ -929,18 +935,17 @@ fn kv_sync_target(
         Resource::TinyCloud(resource)
             if resource.service().as_str() == "kv"
                 && resource.query().is_none()
-                && resource.fragment().is_none()
-                && resource
-                    .path()
-                    .is_some_and(|path| !path.as_str().is_empty()) =>
+                && resource.fragment().is_none() =>
         {
-            Ok(resource
+            let prefix = resource
                 .path()
-                .map(|path| (resource.space().clone(), path.clone())))
+                .cloned()
+                .unwrap_or_else(|| "".parse().expect("empty Path is valid"));
+            Ok(Some((resource.space().clone(), prefix)))
         }
         _ => Err((
             Status::BadRequest,
-            "tinycloud.kv/sync requires a non-empty KV prefix".to_string(),
+            "tinycloud.kv/sync requires a KV resource without query or fragment".to_string(),
         )),
     }
 }
@@ -1598,10 +1603,10 @@ async fn invoke_impl(
                 (Status::Unauthorized, message)
             })?;
 
-        // TC-732: a `kv/sync` must be the invocation's only capability, on a
-        // non-empty KV prefix. Check the shape before any specialized
-        // dispatch (encryption, SQL, DuckDB), so a mixed invocation is a 400
-        // and none of its other capabilities runs.
+        // TC-732: `kv/sync` must be the invocation's only capability and
+        // target a KV resource. The KV root is the whole-space feed. Check
+        // shape before any specialized dispatch so mixed invocations fail
+        // before another capability runs.
         kv_sync_target(&admitted.invocation().0.capabilities)?;
 
         // Policy-session invocations use the same admitted invocation as every
@@ -8137,12 +8142,13 @@ mod tests {
         let sql_service = fresh_sql_service().await;
         let hook_runtime = HookRuntime::new(HooksConfig::default(), [9u8; 32]);
         let rocket = rocket::build()
-            .mount("/", rocket::routes![invoke])
+            .mount("/", rocket::routes![invoke, info])
             .attach(crate::tracing::TracingFairing::new(
                 &Config::default().log.tracing,
             ))
             .manage(tinycloud)
             .manage(sql_service)
+            .manage(None::<crate::tee::TeeContext>)
             .manage(Config::default())
             .manage(QuotaCache::new(None, None))
             .manage(InvocationReplayCache::new(replay_db))
@@ -8833,6 +8839,205 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kv_sync_root_feed_pages_and_requires_root_authority() -> Result<()> {
+        use rocket::http::Status;
+        use tinycloud_core::kv_sync::{encode_kv_sync_cursor, KvSyncAnchor, KvSyncState};
+
+        let fixture = KvSyncFixture::new().await?;
+        let root_grant = fixture
+            .grant(
+                "root-sync",
+                &fixture.space.did().to_string(),
+                &fixture.device_did(),
+                &[("", "tinycloud.kv/sync")],
+                None,
+                Some(whole_seconds_from_now(3600)),
+                &[],
+            )
+            .await?;
+        let scoped_grant = fixture
+            .device_grant("scoped-sync", &["tinycloud.kv/sync"])
+            .await?;
+
+        let denied = fixture.sync("", scoped_grant, &[]).await?;
+        assert_eq!(denied.status, Status::Unauthorized, "{}", denied.body);
+
+        // Seed a current_kv row for a different hosted space. A root feed
+        // without the mandatory space predicate would disclose it.
+        {
+            use tinycloud_core::{
+                models::{current_kv, space as space_model},
+                sea_orm::{ActiveModelTrait, ActiveValue::Set},
+                types::{Metadata, SpaceIdWrap},
+            };
+            let foreign_space = test_space_id("tc908-foreign");
+            space_model::ActiveModel {
+                id: Set(SpaceIdWrap(foreign_space.clone())),
+            }
+            .insert(&fixture.conn)
+            .await?;
+            current_kv::ActiveModel {
+                space: Set(SpaceIdWrap(foreign_space)),
+                key: Set(tinycloud_core::types::Path::try_from(
+                    "hidden/foreign".to_string(),
+                )?),
+                invocation: Set(tinycloud_core::hash::hash(b"tc908-foreign-invocation")),
+                seq: Set(1),
+                epoch: Set(tinycloud_core::hash::hash(b"tc908-foreign-epoch")),
+                epoch_seq: Set(1),
+                value: Set(tinycloud_core::hash::hash(b"foreign secret")),
+                metadata: Set(Metadata(Default::default())),
+                deleted: Set(false),
+            }
+            .insert(&fixture.conn)
+            .await?;
+        }
+
+        let root = fixture.sync("", root_grant, &[]).await?;
+        assert_eq!(root.status, Status::Ok, "{}", root.body);
+        assert_eq!(root.json["source"]["prefix"], "");
+        assert!(changes(&root).is_empty());
+
+        let retain_expiry = whole_seconds_from_now(20 * 86_400);
+        let root_retain = fixture
+            .grant(
+                "root-retain",
+                &fixture.space.did().to_string(),
+                &fixture.device_did(),
+                &[("", "tinycloud.kv/retain")],
+                None,
+                Some(retain_expiry),
+                &[],
+            )
+            .await?;
+        let retain_cid = root_retain.to_cid(0x55).to_string();
+        let retained = fixture
+            .sync(
+                "",
+                root_grant,
+                &[("x-tinycloud-retention-grant", retain_cid.as_str())],
+            )
+            .await?;
+        assert_eq!(retained.status, Status::Ok, "{}", retained.body);
+        assert_eq!(
+            retained.json["authority"]["retainUntil"],
+            rfc3339(retain_expiry)
+        );
+
+        let scoped_retain = fixture
+            .device_grant("scoped-retain", &["tinycloud.kv/retain"])
+            .await?;
+        let scoped_retain_cid = scoped_retain.to_cid(0x55).to_string();
+        let refused = fixture
+            .sync(
+                "",
+                root_grant,
+                &[("x-tinycloud-retention-grant", scoped_retain_cid.as_str())],
+            )
+            .await?;
+        assert_eq!(refused.status, Status::Forbidden, "{}", refused.body);
+        assert_eq!(
+            refused.json["error"]["reason"],
+            "retention-grant-not-covering"
+        );
+
+        let info = fixture.client.get("/info").dispatch().await;
+        assert_eq!(info.status(), Status::Ok);
+        let info: serde_json::Value =
+            serde_json::from_str(&info.into_string().await.unwrap_or_default())?;
+        assert!(info["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|feature| feature == "kv-sync-root"));
+
+        fixture.owner_write("notes/a", Some(b"note")).await?;
+        fixture
+            .owner_write("photos/nested/b", Some(b"photo"))
+            .await?;
+        fixture.owner_write("root-file", Some(b"root")).await?;
+
+        let mut cursor = root.json["cursor"].as_str().unwrap().to_string();
+        let mut seen = Vec::new();
+        loop {
+            let page = fixture
+                .sync(
+                    "",
+                    root_grant,
+                    &[
+                        ("x-tinycloud-limit", "1"),
+                        ("x-tinycloud-cursor", cursor.as_str()),
+                    ],
+                )
+                .await?;
+            assert_eq!(page.status, Status::Ok, "{}", page.body);
+            seen.extend(changes(&page));
+            cursor = page.json["cursor"].as_str().unwrap().to_string();
+            if !page.json["more"].as_bool().unwrap() {
+                break;
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![
+                put_change("notes/a", b"note"),
+                put_change("photos/nested/b", b"photo"),
+                put_change("root-file", b"root"),
+            ]
+        );
+        fixture.owner_write("notes/a", None).await?;
+        let deleted = fixture
+            .sync(
+                "",
+                root_grant,
+                &[
+                    ("x-tinycloud-limit", "1"),
+                    ("x-tinycloud-cursor", cursor.as_str()),
+                ],
+            )
+            .await?;
+        assert_eq!(deleted.status, Status::Ok, "{}", deleted.body);
+        assert_eq!(changes(&deleted), vec![("notes/a".to_string(), true, None)]);
+
+        let unknown = encode_kv_sync_cursor(
+            &fixture.sync_cursor_key,
+            &fixture.space,
+            &"".parse()?,
+            &KvSyncState {
+                pos: Some(KvSyncAnchor {
+                    seq: 0,
+                    epoch: tinycloud_core::hash::hash(b"restored elsewhere"),
+                    epoch_seq: 0,
+                }),
+                floor: None,
+            },
+        )?;
+        let reset = fixture
+            .sync("", root_grant, &[("x-tinycloud-cursor", unknown.as_str())])
+            .await?;
+        assert_eq!(reset.status, Status::Gone, "{}", reset.body);
+        assert_eq!(reset.json["error"]["reason"], "position-unknown");
+
+        // `{space}/kv/` parses with an empty Path but shares the canonical
+        // whole-space prefix used by pathless `{space}/kv`.
+        let root_slash = fixture.space.clone().to_resource(
+            "kv".parse::<Service>()?,
+            Some("".parse::<AuthPath>()?),
+            None,
+            None,
+        );
+        let slash = fixture
+            .dispatch(
+                fixture.owner_invocation(&[(root_slash.to_string(), "tinycloud.kv/sync")])?,
+                &[],
+            )
+            .await;
+        assert_eq!(slash.status, Status::Ok, "{}", slash.body);
+        assert_eq!(slash.json["source"]["prefix"], "");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn kv_sync_requires_explicit_sync_grant() -> Result<()> {
         use rocket::http::Status;
         let fixture = KvSyncFixture::new().await?;
@@ -8885,8 +9090,7 @@ mod tests {
 
         let whole_space = fixture.device_invocation(&[("", "tinycloud.kv/sync")], grant)?;
         let reply = fixture.dispatch(whole_space, &[]).await;
-        assert_eq!(reply.status, Status::BadRequest, "{}", reply.body);
-        assert!(reply.body.contains("non-empty KV prefix"), "{}", reply.body);
+        assert_eq!(reply.status, Status::Unauthorized, "{}", reply.body);
         Ok(())
     }
 
