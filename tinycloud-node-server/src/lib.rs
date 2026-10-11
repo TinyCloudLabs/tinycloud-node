@@ -405,6 +405,11 @@ pub async fn app_with_control(
     };
     if !is_sqlite {
         connect_opts.max_connections(tinycloud_config.database.max_connections);
+        // sqlx pings every pooled connection before handing it out by default.
+        // Most statements run directly on the pool, so with the database a WAN
+        // round-trip away that ping doubled the cost of nearly every statement.
+        // A connection the server dropped now fails on its first query instead.
+        connect_opts.test_before_acquire(false);
         if let Some(root_cert_path) = tinycloud_config
             .share_email
             .postgres_tls
