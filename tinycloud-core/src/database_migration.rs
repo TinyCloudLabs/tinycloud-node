@@ -1137,9 +1137,42 @@ mod tests {
         assert_unregistered_scan(&conn).await;
     }
 
+    /// Drops the isolated schema when the test ends, including while a failed assertion unwinds.
+    struct PostgresSchemaGuard {
+        url: String,
+        schema: String,
+    }
+
+    impl Drop for PostgresSchemaGuard {
+        fn drop(&mut self) {
+            use sea_orm::{ConnectOptions, Database, DbBackend, Statement};
+            let (url, schema) = (self.url.clone(), self.schema.clone());
+            let dropped = std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("schema drop runtime")
+                    .block_on(async move {
+                        Database::connect(ConnectOptions::new(url))
+                            .await?
+                            .execute(Statement::from_string(
+                                DbBackend::Postgres,
+                                format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+                            ))
+                            .await
+                            .map(|_| ())
+                    })
+            })
+            .join();
+            if !matches!(dropped, Ok(Ok(()))) {
+                eprintln!("failed to drop isolated schema {}", self.schema);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn postgres_unregistered_scan_ignores_digests_and_registered_legacy_names() {
-        use sea_orm::{Database, DbBackend, Statement};
+        use sea_orm::{ConnectOptions, Database, DbBackend, Statement};
         use sea_orm_migration::MigratorTrait;
 
         let Some(url) = crate::test_support::postgres_test_url(
@@ -1147,35 +1180,30 @@ mod tests {
         ) else {
             return;
         };
-        let name = format!("tc_unregistered_{}", std::process::id());
-        let admin = Database::connect(url.clone()).await.unwrap();
-        admin
+        let schema = format!(
+            "tc780_scan_{}_{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        Database::connect(ConnectOptions::new(url.clone()))
+            .await
+            .unwrap()
             .execute(Statement::from_string(
                 DbBackend::Postgres,
-                format!("DROP DATABASE IF EXISTS {name}"),
+                format!("CREATE SCHEMA {schema}"),
             ))
             .await
             .unwrap();
-        admin
-            .execute(Statement::from_string(
-                DbBackend::Postgres,
-                format!("CREATE DATABASE {name}"),
-            ))
-            .await
-            .unwrap();
-        let base = url.split('?').next().unwrap();
-        let scoped = format!("{}/{name}", &base[..base.rfind('/').unwrap()]);
-        let conn = Database::connect(scoped).await.unwrap();
+        let _guard = PostgresSchemaGuard {
+            url: url.clone(),
+            schema: schema.clone(),
+        };
+        let mut options = ConnectOptions::new(url);
+        options.set_schema_search_path(schema);
+        let conn = Database::connect(options).await.unwrap();
         crate::migrations::Migrator::up(&conn, None).await.unwrap();
         assert_unregistered_scan(&conn).await;
         conn.close().await.unwrap();
-        admin
-            .execute(Statement::from_string(
-                DbBackend::Postgres,
-                format!("DROP DATABASE {name}"),
-            ))
-            .await
-            .unwrap();
     }
 
     #[tokio::test]
