@@ -404,10 +404,36 @@ pub async fn require_fence<C: ConnectionTrait>(conn: &C) -> Result<(), Migration
 pub async fn has_unmigrated_artifacts<C: ConnectionTrait>(
     conn: &C,
 ) -> Result<bool, MigrationError> {
-    // One anti-join on the database instead of transferring both tables on every check.
+    if conn.get_database_backend() == sea_orm::DatabaseBackend::MySql {
+        // MySQL's usual collations compare strings case- and accent-insensitively, so a
+        // database-side match could hide an artifact the exact comparison below would flag.
+        return has_unmigrated_artifacts_exact(conn).await;
+    }
+    // PostgreSQL (deterministic collations) and SQLite (BINARY) compare these keys byte for
+    // byte, so one anti-join replaces transferring both tables on every check.
     let unregistered: Vec<(String, String, String)> =
         unregistered_artifact_query().into_tuple().all(conn).await?;
     Ok(unregistered.iter().any(|row| !is_digest_name(&row.2)))
+}
+
+async fn has_unmigrated_artifacts_exact<C: ConnectionTrait>(
+    conn: &C,
+) -> Result<bool, MigrationError> {
+    let registered: BTreeSet<(String, String, String)> = database_legacy_artifact::Entity::find()
+        .select_only()
+        .column(database_legacy_artifact::Column::Service)
+        .column(database_legacy_artifact::Column::Space)
+        .column(database_legacy_artifact::Column::PhysicalName)
+        .into_tuple::<(String, String, String)>()
+        .all(conn)
+        .await?
+        .into_iter()
+        .collect();
+    let rows: Vec<(String, String, String)> =
+        artifact_identity_query().into_tuple().all(conn).await?;
+    Ok(rows
+        .into_iter()
+        .any(|row| !is_digest_name(&row.2) && !registered.contains(&row)))
 }
 
 /// Caches only the expensive legacy-artifact inventory. The durable metadata
@@ -1053,19 +1079,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn unregistered_scan_ignores_digests_and_registered_legacy_names() {
-        use sea_orm::Database;
-        use sea_orm_migration::MigratorTrait;
-
-        let dir = tempfile::tempdir().unwrap();
-        let conn = Database::connect(format!(
-            "sqlite:{}?mode=rwc",
-            dir.path().join("caps.db").display()
-        ))
-        .await
-        .unwrap();
-        crate::migrations::Migrator::up(&conn, None).await.unwrap();
+    async fn assert_unregistered_scan(conn: &DatabaseConnection) {
         let artifact = |space: &str, name: &str| database_artifact::ActiveModel {
             service: Set("sql".into()),
             space: Set(space.into()),
@@ -1084,38 +1098,84 @@ mod tests {
             delta_content_hash: Set(None),
             delta_size_bytes: Set(0),
         };
+        let legacy = |space: &str, name: &str| database_legacy_artifact::ActiveModel {
+            service: Set("sql".into()),
+            space: Set(space.into()),
+            physical_name: Set(name.into()),
+        };
         artifact("a", &format!("v2d{}", "0".repeat(64)))
-            .insert(&conn)
+            .insert(conn)
             .await
             .unwrap();
-        artifact("a", "v2n").insert(&conn).await.unwrap();
-        assert!(!has_unmigrated_artifacts(&conn).await.unwrap(), "digests");
-        artifact("a", "threads").insert(&conn).await.unwrap();
-        // The same legacy name registered for another space does not cover it.
-        database_legacy_artifact::ActiveModel {
-            service: Set("sql".into()),
-            space: Set("b".into()),
-            physical_name: Set("threads".into()),
-        }
-        .insert(&conn)
-        .await
-        .unwrap();
+        artifact("a", "v2n").insert(conn).await.unwrap();
+        assert!(!has_unmigrated_artifacts(conn).await.unwrap(), "digests");
+        artifact("a", "threads").insert(conn).await.unwrap();
+        // Another space, or another spelling, does not register it.
+        legacy("b", "threads").insert(conn).await.unwrap();
+        legacy("a", "Threads").insert(conn).await.unwrap();
         assert!(
-            has_unmigrated_artifacts(&conn).await.unwrap(),
+            has_unmigrated_artifacts(conn).await.unwrap(),
             "unregistered"
         );
-        database_legacy_artifact::ActiveModel {
-            service: Set("sql".into()),
-            space: Set("a".into()),
-            physical_name: Set("threads".into()),
-        }
-        .insert(&conn)
+        legacy("a", "threads").insert(conn).await.unwrap();
+        assert!(!has_unmigrated_artifacts(conn).await.unwrap(), "registered");
+    }
+
+    #[tokio::test]
+    async fn unregistered_scan_ignores_digests_and_registered_legacy_names() {
+        use sea_orm::Database;
+        use sea_orm_migration::MigratorTrait;
+
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Database::connect(format!(
+            "sqlite:{}?mode=rwc",
+            dir.path().join("caps.db").display()
+        ))
         .await
         .unwrap();
-        assert!(
-            !has_unmigrated_artifacts(&conn).await.unwrap(),
-            "registered"
-        );
+        crate::migrations::Migrator::up(&conn, None).await.unwrap();
+        assert_unregistered_scan(&conn).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_unregistered_scan_ignores_digests_and_registered_legacy_names() {
+        use sea_orm::{Database, DbBackend, Statement};
+        use sea_orm_migration::MigratorTrait;
+
+        let Some(url) = crate::test_support::postgres_test_url(
+            "postgres_unregistered_scan_ignores_digests_and_registered_legacy_names",
+        ) else {
+            return;
+        };
+        let name = format!("tc_unregistered_{}", std::process::id());
+        let admin = Database::connect(url.clone()).await.unwrap();
+        admin
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("DROP DATABASE IF EXISTS {name}"),
+            ))
+            .await
+            .unwrap();
+        admin
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("CREATE DATABASE {name}"),
+            ))
+            .await
+            .unwrap();
+        let base = url.split('?').next().unwrap();
+        let scoped = format!("{}/{name}", &base[..base.rfind('/').unwrap()]);
+        let conn = Database::connect(scoped).await.unwrap();
+        crate::migrations::Migrator::up(&conn, None).await.unwrap();
+        assert_unregistered_scan(&conn).await;
+        conn.close().await.unwrap();
+        admin
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("DROP DATABASE {name}"),
+            ))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
