@@ -418,9 +418,15 @@ pub async fn app_with_control(
         }
     }
     // sqlx logs the text of every statement (placeholders, never bound
-    // values) at INFO by default. Keep statement text out of production logs
-    // (TC-961): a statement built with an inline literal would carry it.
-    connect_opts.sqlx_logging_level(tracing_log::log::LevelFilter::Debug);
+    // values) at INFO, and of statements slower than 1 s at WARN. Keep
+    // statement text out of production logs (TC-961): a statement built with
+    // an inline literal would carry it.
+    connect_opts
+        .sqlx_logging_level(tracing_log::log::LevelFilter::Debug)
+        .sqlx_slow_statements_logging_settings(
+            tracing_log::log::LevelFilter::Debug,
+            std::time::Duration::from_secs(1),
+        );
 
     let database_connection = Database::connect(connect_opts).await?;
     // SQL/DuckDB artifact-size mirror folded into `store_size`. Empty here;

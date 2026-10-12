@@ -53,7 +53,14 @@ pub fn promote_to_file(conn: &Connection, path: &PathBuf) -> Result<Connection, 
         std::fs::create_dir_all(parent).map_err(|e| SqlError::Internal(e.to_string()))?;
     }
 
-    let mut file_conn = Connection::open(path).map_err(|e| SqlError::Internal(e.to_string()))?;
+    // rusqlite appends the file path, which holds the space id, to open
+    // errors. The caller logs this error, so keep only the SQLite code (TC-961).
+    let mut file_conn = Connection::open(path).map_err(|e| {
+        SqlError::Internal(format!(
+            "opening the database file failed: {:?}",
+            e.sqlite_error_code()
+        ))
+    })?;
 
     // Use SQLite backup API
     {

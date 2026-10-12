@@ -3,7 +3,7 @@ use opentelemetry_otlp::ExporterBuildError;
 use rocket::{
     config::LogLevel,
     fairing::{Fairing, Info, Kind},
-    http::Status,
+    http::{Method, Status},
     request::{FromRequest, Outcome},
     Data, Request, Response,
 };
@@ -66,12 +66,16 @@ const ROCKET_STARTUP_MODULES: &[&str] = &[
 /// startup messages and its non-request `rocket::server` warnings (signals,
 /// shutdown, malformed HTTP) still pass.
 ///
-/// sea-orm's TRACE spans record every statement with its bound values, so
-/// they are dropped too.
+/// sea-orm's TRACE spans record every statement with its bound values, and
+/// the outbound HTTP clients log full URLs below INFO: reqwest a redirect's
+/// URL (the quota service URL holds the space id), the AWS SDK the S3 key
+/// (which starts with the space id) and the SigV4-signed request. Those are
+/// dropped too.
 fn may_be_logged(metadata: &Metadata<'_>) -> bool {
     let target = metadata.target();
+    let level = *metadata.level();
     if target == "rocket::server" {
-        return *metadata.level() <= Level::WARN;
+        return level <= Level::WARN;
     }
     if target == "rocket" || target.starts_with("rocket::") {
         let module = target.strip_suffix("::_").unwrap_or(target);
@@ -81,7 +85,10 @@ fn may_be_logged(metadata: &Metadata<'_>) -> bool {
                 .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
         });
     }
-    if target.starts_with("sea_orm") && *metadata.level() == Level::TRACE {
+    if target.starts_with("sea_orm") && level == Level::TRACE {
+        return false;
+    }
+    if (target.starts_with("aws_") || target.starts_with("reqwest")) && level > Level::INFO {
         return false;
     }
     !target.ends_with("::_")
@@ -104,6 +111,9 @@ pub struct TracingSpan(pub Span);
 #[derive(Clone)]
 struct RequestTelemetry {
     start: Instant,
+    /// The method as received. Rocket rewrites an unrouted HEAD to GET before
+    /// dispatching it to a GET route.
+    method: Method,
 }
 
 pub struct TracingFairing {
@@ -433,6 +443,7 @@ impl Fairing for TracingFairing {
         req.local_cache(|| {
             Some(RequestTelemetry {
                 start: Instant::now(),
+                method: req.method(),
             })
         });
     }
@@ -471,7 +482,7 @@ impl Fairing for TracingFairing {
         let status = res.status().code;
         tracing::info!(
             target: REQUEST_LOG_TARGET,
-            method = %req.method(),
+            method = %telemetry.method,
             route = %route,
             status,
             latency_us = elapsed.as_micros() as u64,

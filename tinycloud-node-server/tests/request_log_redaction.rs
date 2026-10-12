@@ -104,12 +104,24 @@ fn assert_request_data_stays_out_of_logs(extra_env: &[(&str, &str)]) {
     let wallet = uuid::Uuid::new_v4().simple().to_string() + "00000000";
     let space = format!("tinycloud:pkh:eip155:1:0x{wallet}:default");
     let key = marker("tc961key");
+    let hook_ticket = marker("tc961hookticket");
     let bearer = marker("tc961bearer");
 
-    let server = Command::new(env!("CARGO_BIN_EXE_tinycloud"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tinycloud"));
+    // Start from no inherited node configuration, so the child can only touch
+    // the temporary directory (an inherited TINYCLOUD_STORAGE__DATABASE would
+    // otherwise be migrated) and only the log settings below apply.
+    for (name, _) in std::env::vars_os() {
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with("TINYCLOUD_")
+            || name_str.starts_with("ROCKET_")
+            || name_str == "RUST_LOG"
+        {
+            command.env_remove(&name);
+        }
+    }
+    let server = command
         .current_dir(dir.path())
-        .env_remove("RUST_LOG")
-        .env_remove("ROCKET_LOG_LEVEL")
         .env("TINYCLOUD_CONFIG_FILE", dir.path().join("absent.toml"))
         .env("TINYCLOUD_ADDRESS", "127.0.0.1")
         .env("TINYCLOUD_PORT", port.to_string())
@@ -130,27 +142,54 @@ fn assert_request_data_stays_out_of_logs(extra_env: &[(&str, &str)]) {
     let client = reqwest::blocking::Client::new();
     wait_until_healthy(&client, &base, &mut server.0);
 
-    // Matched routes, a query string, and paths no route matches (Rocket logs
-    // those separately, at ERROR).
+    // Matched routes, query strings, and paths no route matches (Rocket logs
+    // those separately, at ERROR). The third value is the expected request
+    // line: the method as sent and the route template. Rocket answers the
+    // HEAD on /signed/kv with the GET route.
     let requests = [
-        (reqwest::Method::GET, format!("/signed/kv/{ticket}")),
-        (reqwest::Method::HEAD, format!("/signed/kv/{ticket}")),
         (
-            reqwest::Method::GET,
+            "GET",
+            format!("/signed/kv/{ticket}"),
+            "/signed/kv/<ticket_id>",
+        ),
+        (
+            "HEAD",
+            format!("/signed/kv/{ticket}"),
+            "/signed/kv/<ticket_id>",
+        ),
+        (
+            "GET",
             format!("/signed/kv/{ticket}/unmatched"),
+            "<unmatched>",
         ),
-        (reqwest::Method::GET, format!("/public/{space}/kv/{key}")),
-        (reqwest::Method::HEAD, format!("/public/{space}/kv/{key}")),
         (
-            reqwest::Method::GET,
+            "GET",
+            format!("/public/{space}/kv/{key}"),
+            "/public/<space_id>/kv/<key..>",
+        ),
+        (
+            "HEAD",
+            format!("/public/{space}/kv/{key}"),
+            "/public/<space_id>/kv/<key..>",
+        ),
+        (
+            "GET",
             format!("/public/{space}/kv?prefix={key}"),
+            "/public/<space_id>/kv?<prefix>",
         ),
         (
-            reqwest::Method::GET,
+            "GET",
             format!("/public/{space}/unmatched/{key}"),
+            "<unmatched>",
+        ),
+        (
+            "GET",
+            format!("/hooks/events?ticket={hook_ticket}"),
+            "/hooks/events?<ticket>",
         ),
     ];
-    for (method, path) in &requests {
+    for (method, path, _) in &requests {
+        let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
         let response = client
             .request(method.clone(), format!("{base}{path}"))
             .bearer_auth(&bearer)
@@ -170,6 +209,7 @@ fn assert_request_data_stays_out_of_logs(extra_env: &[(&str, &str)]) {
 
     for (what, needle) in [
         ("signed-KV ticket id", ticket.as_str()),
+        ("hook ticket", hook_ticket.as_str()),
         ("space id", space.as_str()),
         ("wallet address", wallet.as_str()),
         ("KV key", key.as_str()),
@@ -183,16 +223,23 @@ fn assert_request_data_stays_out_of_logs(extra_env: &[(&str, &str)]) {
         );
     }
 
-    // Requests are still logged, by route template rather than raw path.
-    for template in [
-        "/signed/kv/<ticket_id>",
-        "/public/<space_id>/kv/<key..>",
-        "/public/<space_id>/kv?<prefix>",
-    ] {
+    // Every request is still logged once, by its method and route template.
+    let request_lines: Vec<&str> = logs
+        .lines()
+        .filter(|line| line.contains("tinycloud::request") && !line.contains("route=/healthz "))
+        .collect();
+    for (method, path, route) in &requests {
+        let expected = format!("method={method} route={route} ");
         assert!(
-            logs.lines()
-                .any(|line| line.contains("tinycloud::request") && line.contains(template)),
-            "no request line for {template}; logs:\n{logs}"
+            request_lines.iter().any(|line| line.contains(&expected)),
+            "no `{expected}` request line for {method} {path}; request lines:\n{}",
+            request_lines.join("\n")
         );
     }
+    assert_eq!(
+        request_lines.len(),
+        requests.len(),
+        "expected one request line per request:\n{}",
+        request_lines.join("\n")
+    );
 }
