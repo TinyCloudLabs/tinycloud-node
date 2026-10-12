@@ -459,6 +459,8 @@ pub enum DuckDbError {
     ResponseTooLarge(u64),
     #[error("Quota exceeded")]
     QuotaExceeded,
+    #[error("Operation would increase database storage")]
+    StorageWouldGrow,
     #[error("Invalid statement: {0}")]
     InvalidStatement(String),
     #[error("Schema error: {0}")]

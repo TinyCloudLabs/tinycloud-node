@@ -32,12 +32,77 @@ The SDK checks this endpoint during sign-in and requires an exact protocol versi
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
 | `GET` | `/version` | No | Protocol version and feature discovery |
-| `POST` | `/invoke` | Yes | Execute KV operations (get, put, list, delete) |
+| `POST` | `/invoke` | Yes | Execute KV/SQL/DuckDB operations or read storage usage |
 | `POST` | `/signed/kv` | Yes | Create an expiring signed URL for an exact KV object read |
 | `GET` | `/signed/kv/<ticketId>` | Signed URL ticket | Fetch a KV object, including single byte ranges |
 | `POST` | `/delegate` | Yes | Create capability delegations |
 | `GET` | `/peer/generate/<space>` | No | Generate space host key pair |
 | `GET` | `/healthz` | No | Health check |
+
+### Storage usage and full-space writes
+
+Send `POST /invoke` with a normal signed invocation granting
+`tinycloud.space/info` on the target space's `space` service, for example
+`tinycloud:pkh:eip155:1:<address>:<space>/space`. The body may be `{}`.
+The target comes from the signed resource, not the body; all capabilities
+in this invocation must be `space/info` for the same space. Normal delegation,
+expiry, revocation and replay checks apply. No admin credential is needed.
+
+The `200 application/json` response is:
+
+```json
+{
+  "space": {"usedBytes": 123, "limitBytes": 456},
+  "account": {"usedBytes": 789, "limitBytes": 1000, "plan": "free"},
+  "manageUrl": "https://account.tinycloud.xyz/billing"
+}
+```
+
+All sizes are bytes. `space.limitBytes` is `null` when unlimited; empty spaces
+report zero usage. `account` is omitted unless billing supplied both account
+totals in a non-degraded answer. `plan` is omitted when older billing omits it.
+Account numbers use the quota cache's existing stale-while-revalidate policy.
+Clients must explicitly request `tinycloud.space/info` in their session
+authority; existing SDK default sessions do not include it. The node does not
+expand existing grants.
+
+Storage rejections use `application/json` with `error`, `message`, `space`,
+and the same optional `account` object. HTTP 402 uses
+`"error":"storage_quota_exceeded"` and preserves the message
+`Storage quota exceeded. Used: X bytes, Limit: Y bytes`.
+HTTP 413 uses `"error":"storage_limit_reached"` and preserves
+`Write exceeds remaining storage. Used: X bytes, Limit: Y bytes`.
+Other 413 errors, such as oversized query responses, are not storage errors.
+Delegated authority is rechecked against the current time after quota fetching
+or upload staging delays a storage rejection. Expired authority receives 403
+without space or account totals.
+
+Reads remain available on full spaces. SQLite writes run in a savepoint:
+page growth or a failed request rolls back all its mutations. Caller transaction
+control is forbidden, including extra statements hidden after a PRAGMA.
+Deletes, drops, no-op schema initialization and writes that reuse existing pages
+can succeed. Guarded SQLite and DuckDB writes replace the durable checkpoint
+without accumulating WAL charges, but are refused if the serialized checkpoint
+would exceed the existing artifact's charged size. No-ops against absent
+databases do not create charged artifacts. DuckDB uses a conservative
+transactional guard for deletes, drops and existing `IF NOT EXISTS` objects;
+other writes remain refused while full.
+Deletion need not shrink the physical database immediately. Below the limit,
+the existing database one-write overshoot policy is unchanged.
+
+Exports do not persist checkpoints or change storage charges. Both engines
+return `DatabaseNotFound` when no durable artifact exists, even if a query
+created a temporary actor. Rejected guarded requests close absent-database
+actors. DuckDB exports replay durable WAL in a disposable copy, leaving the
+live actor's WAL base unchanged for subsequent writes.
+
+Set `TINYCLOUD_QUOTA_URL` to billing's base URL. The node fetches
+`GET /api/quota/<space>` with `Authorization: Bearer <TINYCLOUD_ADMIN_SECRET>`
+when that shared service secret is configured. The same secret protects
+`/admin/quota`; never expose it to browser clients. Old billing responses
+containing only `storage_limit_bytes` remain supported. Local testing can
+set an in-memory limit with authenticated
+`PUT /admin/quota/<space>` and `{"limit_bytes":1}`; overrides reset on restart.
 
 ### Signed KV URLs
 

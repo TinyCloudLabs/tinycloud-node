@@ -2602,6 +2602,8 @@ pub enum InvocationOutcome<R> {
     DuckDbExport(Vec<u8>),
     DuckDbArrow(Vec<u8>),
     EncryptionDecrypt(crate::encryption_network::DecryptResponseBody),
+    /// `tinycloud.space/info`: the space's storage usage, rendered by the node.
+    SpaceInfo(serde_json::Value),
 }
 
 #[derive(Debug)]

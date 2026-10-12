@@ -27,14 +27,14 @@ const MAX_WAL_DELTA_BYTES: usize = 8 * 1024 * 1024;
 const DUCKDB_MAGIC: &[u8] = b"DUCK";
 const DUCKDB_MAGIC_OFFSET: usize = 8;
 
-/// Per-(space, db) guard over cache hydration; see [`DuckDbService::handle`].
-type HydrationLock = tokio::sync::Mutex<()>;
-type HydrationLockRegistry =
-    Arc<tokio::sync::Mutex<HashMap<(String, String), Weak<HydrationLock>>>>;
+/// Per-(space, db) guards for hydration and execution-through-persistence.
+type DatabaseLock = tokio::sync::Mutex<()>;
+type DatabaseLockRegistry = Arc<tokio::sync::Mutex<HashMap<(String, String), Weak<DatabaseLock>>>>;
 
 pub struct DuckDbService {
     databases: Arc<DashMap<(String, String), DatabaseHandle>>,
-    hydration_locks: HydrationLockRegistry,
+    hydration_locks: DatabaseLockRegistry,
+    operation_locks: DatabaseLockRegistry,
     /// What each live actor's local database derives from, carried into every
     /// durable save so a stale actor is rejected instead of clobbering. Written
     /// on hydration (the only path that creates an actor) and after each
@@ -45,6 +45,11 @@ pub struct DuckDbService {
     idle_timeout_secs: u64,
     max_memory_per_connection: String,
     artifact_repository: Arc<dyn DatabaseArtifactRepository>,
+}
+
+struct ExecuteOptions {
+    arrow_format: bool,
+    without_growth: bool,
 }
 
 fn validate_db_name(name: &str) -> Result<(), DuckDbError> {
@@ -72,6 +77,7 @@ impl DuckDbService {
         Self {
             databases: Arc::new(DashMap::new()),
             hydration_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            operation_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             lineage: Arc::new(DashMap::new()),
             base_path,
             memory_threshold,
@@ -90,18 +96,98 @@ impl DuckDbService {
         ability: String,
         arrow_format: bool,
     ) -> Result<DuckDbExecutionResult, DuckDbError> {
+        self.execute_inner(
+            space,
+            db_name,
+            request,
+            caveats,
+            ability,
+            ExecuteOptions {
+                arrow_format,
+                without_growth: false,
+            },
+        )
+        .await
+    }
+
+    /// Execute a request in a full space, atomically refusing storage growth.
+    ///
+    /// DELETE, DROP, reads, and existing-object IF NOT EXISTS DDL are accepted
+    /// only if their serialized checkpoint also fits the durable byte charge.
+    /// No-ops on absent databases do not create charged artifacts. Refused
+    /// writes are discarded before subsequent reads or persistence.
+    pub async fn execute_without_growth(
+        &self,
+        space: &SpaceId,
+        db_name: &str,
+        request: DuckDbRequest,
+        caveats: Option<DuckDbCaveats>,
+        ability: String,
+        arrow_format: bool,
+    ) -> Result<DuckDbExecutionResult, DuckDbError> {
+        self.execute_inner(
+            space,
+            db_name,
+            request,
+            caveats,
+            ability,
+            ExecuteOptions {
+                arrow_format,
+                without_growth: true,
+            },
+        )
+        .await
+    }
+
+    async fn execute_inner(
+        &self,
+        space: &SpaceId,
+        db_name: &str,
+        request: DuckDbRequest,
+        caveats: Option<DuckDbCaveats>,
+        ability: String,
+        options: ExecuteOptions,
+    ) -> Result<DuckDbExecutionResult, DuckDbError> {
+        let ExecuteOptions {
+            arrow_format,
+            without_growth,
+        } = options;
         validate_db_name(db_name)?;
 
         let key = (space.to_string(), db_name.to_string());
+        let operation_lock = Self::database_lock(&self.operation_locks, &key).await;
+        let _operation = operation_lock.lock().await;
         let handle = self.handle(space, db_name).await?;
 
         let result = handle
-            .execute(request, caveats, ability, arrow_format)
-            .await?;
+            .execute(request, caveats, ability, arrow_format, without_growth)
+            .await;
+        if without_growth
+            && result.is_err()
+            && self.expectation(&key) == ArtifactExpectation::Absent
+        {
+            self.discard_local_state(&key).await?;
+        }
+        let result = result?;
 
         if !result.write_targets.is_empty() {
-            if let Err(e) = self.persist_write(space, db_name, &handle).await {
-                let _ = self.discard_local_state(&key).await;
+            if without_growth && self.expectation(&key) == ArtifactExpectation::Absent {
+                // The actor permits only shrinking/no-op writes on an empty
+                // database. Its serialized header is still nonempty, so leave
+                // the artifact absent and prevent later export from saving it.
+                self.discard_local_state(&key).await?;
+                return Ok(result);
+            }
+            // A DELETE can append WAL bytes despite reducing logical content.
+            // Persist guarded writes as checkpoints, never as a larger charged
+            // checkpoint+WAL artifact.
+            let persisted = if without_growth {
+                self.checkpoint(space, db_name, &handle, true).await
+            } else {
+                self.persist_write(space, db_name, &handle).await
+            };
+            if let Err(e) = persisted {
+                self.discard_local_state(&key).await?;
                 return Err(e);
             }
         }
@@ -109,27 +195,54 @@ impl DuckDbService {
         Ok(result)
     }
 
+    /// Export only durable data, without changing its artifact or live WAL base.
     pub async fn export(&self, space: &SpaceId, db_name: &str) -> Result<Vec<u8>, DuckDbError> {
         validate_db_name(db_name)?;
 
         let key = (space.to_string(), db_name.to_string());
+        let operation_lock = Self::database_lock(&self.operation_locks, &key).await;
+        let _operation = operation_lock.lock().await;
 
-        // If there's a live actor, route through it (handles both in-memory and file-backed)
-        if let Some(handle) = self.databases.get(&key).map(|h| h.clone()) {
-            return self.checkpoint(space, db_name, &handle).await;
-        }
-
-        if self
+        let artifact = self
             .artifact_repository
-            .load("duckdb", &space.to_string(), db_name)
+            .load("duckdb", &key.0, db_name)
             .await
             .map_err(artifact_error_to_duckdb)?
-            .is_none()
-        {
-            return Err(DuckDbError::DatabaseNotFound);
-        }
-        let handle = self.handle(space, db_name).await?;
-        self.checkpoint(space, db_name, &handle).await
+            .ok_or(DuckDbError::DatabaseNotFound)?;
+        validate_payload(
+            space,
+            db_name,
+            "checkpoint",
+            &artifact.payload,
+            is_duckdb_file,
+        )?;
+        let Some(delta) = artifact.delta_payload else {
+            return Ok(artifact.payload);
+        };
+        validate_payload(space, db_name, "wal", &delta, |payload| {
+            !is_duckdb_file(payload)
+        })?;
+
+        // Checkpoint a disposable copy, never the live actor. Checkpointing
+        // the actor here would reset its WAL base without persisting that base,
+        // making a later incremental save incompatible with the durable file.
+        let max_memory = self.max_memory_per_connection.clone();
+        tokio::task::spawn_blocking(move || {
+            let temp = tempfile::tempdir().map_err(|e| DuckDbError::Internal(e.to_string()))?;
+            let path = temp.path().join("export.duckdb");
+            std::fs::write(&path, artifact.payload)
+                .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+            std::fs::write(duckdb_wal_path(&path), delta)
+                .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+            let conn =
+                storage::open_connection(&storage::StorageMode::File(path.clone()), &max_memory)?;
+            conn.execute_batch("CHECKPOINT")
+                .map_err(|e| DuckDbError::Internal(e.to_string()))?;
+            drop(conn);
+            std::fs::read(path).map_err(|e| DuckDbError::Internal(e.to_string()))
+        })
+        .await
+        .map_err(|e| DuckDbError::Internal(e.to_string()))?
     }
 
     pub async fn import_db(
@@ -139,6 +252,12 @@ impl DuckDbService {
         data: &[u8],
     ) -> Result<(), DuckDbError> {
         validate_db_name(db_name)?;
+        let operation_lock = Self::database_lock(
+            &self.operation_locks,
+            &(space.to_string(), db_name.to_string()),
+        )
+        .await;
+        let _operation = operation_lock.lock().await;
 
         let dir = std::path::PathBuf::from(&self.base_path).join(space.to_string());
         tokio::fs::create_dir_all(&dir)
@@ -198,7 +317,7 @@ impl DuckDbService {
             )
             .await
         {
-            let _ = self.discard_local_state(&key).await;
+            self.discard_local_state(&key).await?;
             return Err(artifact_error_to_duckdb(e));
         }
 
@@ -232,7 +351,7 @@ impl DuckDbService {
             return Ok(handle);
         }
 
-        let hydration_lock = self.hydration_lock(&key).await;
+        let hydration_lock = Self::database_lock(&self.hydration_locks, &key).await;
         let _hydrating = hydration_lock.lock().await;
 
         // Double-checked: whoever held the guard may have hydrated and spawned
@@ -261,17 +380,17 @@ impl DuckDbService {
             .clone())
     }
 
-    /// The hydration guard for `key`, created on first use.
-    ///
-    /// The registry holds weak references and is swept on every acquisition, so
-    /// it cannot outgrow the set of databases currently being hydrated.
-    async fn hydration_lock(&self, key: &(String, String)) -> Arc<HydrationLock> {
-        let mut registry = self.hydration_locks.lock().await;
+    /// Resolve a per-database guard without retaining idle locks indefinitely.
+    async fn database_lock(
+        registry: &DatabaseLockRegistry,
+        key: &(String, String),
+    ) -> Arc<DatabaseLock> {
+        let mut registry = registry.lock().await;
         registry.retain(|_, lock| lock.strong_count() > 0);
         if let Some(lock) = registry.get(key).and_then(Weak::upgrade) {
             return lock;
         }
-        let lock = Arc::new(HydrationLock::new(()));
+        let lock = Arc::new(DatabaseLock::new(()));
         registry.insert(key.clone(), Arc::downgrade(&lock));
         lock
     }
@@ -351,7 +470,11 @@ impl DuckDbService {
     }
 
     async fn discard_local_state(&self, key: &(String, String)) -> Result<(), DuckDbError> {
-        self.databases.remove(key);
+        if let Some((_, handle)) = self.databases.remove(key) {
+            // DuckDB can flush on connection close. Await it before deleting
+            // the cache so an old actor cannot overwrite a new hydration.
+            handle.shutdown().await?;
+        }
         self.lineage.remove(key);
         let cache_path = PathBuf::from(&self.base_path)
             .join(&key.0)
@@ -423,7 +546,7 @@ impl DuckDbService {
             }
         }
 
-        self.checkpoint(space, db_name, handle).await.map(|_| ())
+        self.checkpoint(space, db_name, handle, false).await
     }
 
     async fn checkpoint(
@@ -431,20 +554,26 @@ impl DuckDbService {
         space: &SpaceId,
         db_name: &str,
         handle: &DatabaseHandle,
-    ) -> Result<Vec<u8>, DuckDbError> {
+        without_growth: bool,
+    ) -> Result<(), DuckDbError> {
         let key = (space.to_string(), db_name.to_string());
         let expected = self.expectation(&key);
         let payload = handle.export().await?;
         let bytes = payload.len();
+        if without_growth {
+            let durable_bytes = self
+                .artifact_repository
+                .load("duckdb", &key.0, db_name)
+                .await
+                .map_err(artifact_error_to_duckdb)?
+                .map_or(0, |artifact| artifact.size_bytes.max(0) as u64);
+            if bytes as u64 > durable_bytes {
+                return Err(DuckDbError::StorageWouldGrow);
+            }
+        }
         let saved = self
             .artifact_repository
-            .save(
-                "duckdb",
-                &space.to_string(),
-                db_name,
-                payload.clone(),
-                expected,
-            )
+            .save("duckdb", &space.to_string(), db_name, payload, expected)
             .await
             .map_err(artifact_error_to_duckdb)?;
         self.lineage.insert(
@@ -464,7 +593,7 @@ impl DuckDbService {
             revision = saved.revision,
             "Persisted database checkpoint"
         );
-        Ok(payload)
+        Ok(())
     }
 }
 
@@ -568,6 +697,7 @@ mod tests {
         migrations::Migrator,
         sea_orm::{ConnectOptions, Database},
         sea_orm_migration::MigratorTrait,
+        sql_sizes::{SizeTrackingArtifactRepository, SqlSizes},
     };
     use tempfile::TempDir;
     use tinycloud_auth::{
@@ -607,6 +737,317 @@ mod tests {
             "128MB".to_string(),
             repo,
         )
+    }
+
+    #[tokio::test]
+    async fn tc626_export_after_rejected_creation_stays_absent() {
+        for memory_threshold in [u64::MAX, 0] {
+            let sizes = SqlSizes::new();
+            let repo = Arc::new(SizeTrackingArtifactRepository::new(
+                artifact_repository().await,
+                sizes.clone(),
+            ));
+            let cache = TempDir::new().unwrap();
+            let space = test_space_id("duckdb-rejected-export");
+            let service = DuckDbService::new(
+                cache.path().to_string_lossy().into_owned(),
+                memory_threshold,
+                300,
+                "128MB".into(),
+                repo.clone(),
+            );
+            for (name, sql, grows) in [
+                ("first", "CREATE TABLE data (id INTEGER)", true),
+                ("invalid", "DELETE FROM missing", false),
+                ("second", "CREATE TABLE data (id INTEGER)", true),
+            ] {
+                let retired = service.handle(&space, name).await.unwrap();
+                let rejected = service
+                    .execute_without_growth(
+                        &space,
+                        name,
+                        DuckDbRequest::Execute {
+                            schema: None,
+                            sql: sql.into(),
+                            params: vec![],
+                        },
+                        None,
+                        "tinycloud.duckdb/write".into(),
+                        false,
+                    )
+                    .await;
+                if grows {
+                    assert!(matches!(rejected, Err(DuckDbError::StorageWouldGrow)));
+                } else {
+                    assert!(matches!(rejected, Err(DuckDbError::DuckDb(_))));
+                }
+                let exported = service.export(&space, name).await;
+                assert_eq!(sizes.space_total(&space).await, 0);
+                assert!(matches!(exported, Err(DuckDbError::DatabaseNotFound)));
+                assert!(repo
+                    .load("duckdb", &space.to_string(), name)
+                    .await
+                    .unwrap()
+                    .is_none());
+                // Cleanup must close the rejected actor, not merely hide it
+                // behind the export existence check.
+                assert!(matches!(
+                    retired
+                        .execute(
+                            DuckDbRequest::Query {
+                                sql: "SELECT 1".into(),
+                                params: vec![],
+                            },
+                            None,
+                            "tinycloud.duckdb/read".into(),
+                            false,
+                            false,
+                        )
+                        .await,
+                    Err(DuckDbError::Internal(_))
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tc626_export_of_read_only_absent_actor_stays_absent() {
+        let sizes = SqlSizes::new();
+        let repo = Arc::new(SizeTrackingArtifactRepository::new(
+            artifact_repository().await,
+            sizes.clone(),
+        ));
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("duckdb-read-export");
+        let service = DuckDbService::new(
+            cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            300,
+            "128MB".into(),
+            repo.clone(),
+        );
+        service
+            .execute(
+                &space,
+                "absent",
+                DuckDbRequest::Query {
+                    sql: "SELECT 1".into(),
+                    params: vec![],
+                },
+                None,
+                "tinycloud.duckdb/read".into(),
+                false,
+            )
+            .await
+            .unwrap();
+        let exported = service.export(&space, "absent").await;
+        assert_eq!(sizes.space_total(&space).await, 0);
+        assert!(matches!(exported, Err(DuckDbError::DatabaseNotFound)));
+        assert!(repo
+            .load("duckdb", &space.to_string(), "absent")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn tc626_review_absent_noops_do_not_create_charged_artifacts() {
+        for memory_threshold in [u64::MAX, 0] {
+            let sizes = SqlSizes::new();
+            let repo = Arc::new(SizeTrackingArtifactRepository::new(
+                artifact_repository().await,
+                sizes.clone(),
+            ));
+            let cache = TempDir::new().unwrap();
+            let space = test_space_id("duckdb-absent-noops");
+            let service = DuckDbService::new(
+                cache.path().to_string_lossy().into_owned(),
+                memory_threshold,
+                300,
+                "128MB".into(),
+                repo.clone(),
+            );
+            for name in ["unused-one", "unused-two", "unused-three"] {
+                service
+                    .execute_without_growth(
+                        &space,
+                        name,
+                        DuckDbRequest::Execute {
+                            schema: None,
+                            sql: "DROP TABLE IF EXISTS absent".into(),
+                            params: vec![],
+                        },
+                        None,
+                        "tinycloud.duckdb/write".into(),
+                        false,
+                    )
+                    .await
+                    .expect("dropping an absent table is a successful no-op");
+                assert_eq!(sizes.space_total(&space).await, 0);
+                assert!(repo
+                    .load("duckdb", &space.to_string(), name)
+                    .await
+                    .unwrap()
+                    .is_none());
+                assert!(matches!(
+                    service.export(&space, name).await,
+                    Err(DuckDbError::DatabaseNotFound)
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tc626_review_serialized_growth_is_rejected_and_discarded() {
+        for memory_threshold in [u64::MAX, 0] {
+            let sizes = SqlSizes::new();
+            let repo = Arc::new(SizeTrackingArtifactRepository::new(
+                artifact_repository().await,
+                sizes.clone(),
+            ));
+            let cache = TempDir::new().unwrap();
+            let space = test_space_id("duckdb-durable-budget");
+            let service = DuckDbService::new(
+                cache.path().to_string_lossy().into_owned(),
+                memory_threshold,
+                300,
+                "128MB".into(),
+                repo.clone(),
+            );
+            service
+                .execute(
+                    &space,
+                    "main",
+                    DuckDbRequest::Execute {
+                        schema: Some(vec!["CREATE TABLE data (id INTEGER, body VARCHAR)".into()]),
+                        sql: "INSERT INTO data VALUES (1, 'durable')".into(),
+                        params: vec![],
+                    },
+                    None,
+                    "tinycloud.duckdb/write".into(),
+                    false,
+                )
+                .await
+                .unwrap();
+            let before = repo
+                .load("duckdb", &space.to_string(), "main")
+                .await
+                .unwrap()
+                .unwrap();
+            let failed = service
+                .execute(
+                    &space,
+                    "main",
+                    DuckDbRequest::Execute {
+                        schema: Some(vec![
+                            "INSERT INTO data SELECT i + 2, md5(CAST(i AS VARCHAR)) FROM range(20000) t(i)".into(),
+                        ]),
+                        sql: "INSERT INTO missing_table VALUES (1)".into(),
+                        params: vec![],
+                    },
+                    None,
+                    "tinycloud.duckdb/write".into(),
+                    false,
+                )
+                .await;
+            assert!(matches!(failed, Err(DuckDbError::DuckDb(_))));
+            let rejected = service
+                .execute_without_growth(
+                    &space,
+                    "main",
+                    DuckDbRequest::Execute {
+                        schema: None,
+                        sql: "DELETE FROM data WHERE id = 1".into(),
+                        params: vec![],
+                    },
+                    None,
+                    "tinycloud.duckdb/write".into(),
+                    false,
+                )
+                .await;
+            assert!(
+                matches!(rejected, Err(DuckDbError::StorageWouldGrow)),
+                "{rejected:?}"
+            );
+            let after = repo
+                .load("duckdb", &space.to_string(), "main")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.revision, before.revision);
+            assert_eq!(after.payload, before.payload);
+            assert_eq!(after.delta_payload, before.delta_payload);
+            assert_eq!(sizes.space_total(&space).await, before.size_bytes as u64);
+            let query = || DuckDbRequest::Query {
+                sql: "SELECT id, body FROM data ORDER BY id".into(),
+                params: vec![],
+            };
+            let live = service
+                .execute(
+                    &space,
+                    "main",
+                    query(),
+                    None,
+                    "tinycloud.duckdb/read".into(),
+                    false,
+                )
+                .await
+                .unwrap();
+            let DuckDbResponse::Query(live) = live.response else {
+                panic!("query response required")
+            };
+            assert_eq!(
+                live.rows,
+                vec![vec![
+                    DuckDbValue::Integer(1),
+                    DuckDbValue::Text("durable".into())
+                ]]
+            );
+            service
+                .execute(
+                    &space,
+                    "main",
+                    DuckDbRequest::Execute {
+                        schema: None,
+                        sql: "UPDATE data SET body = 'later' WHERE id = 1".into(),
+                        params: vec![],
+                    },
+                    None,
+                    "tinycloud.duckdb/write".into(),
+                    false,
+                )
+                .await
+                .unwrap();
+            let cold_cache = TempDir::new().unwrap();
+            let recovered = DuckDbService::new(
+                cold_cache.path().to_string_lossy().into_owned(),
+                memory_threshold,
+                300,
+                "128MB".into(),
+                repo,
+            );
+            let cold = recovered
+                .execute(
+                    &space,
+                    "main",
+                    query(),
+                    None,
+                    "tinycloud.duckdb/read".into(),
+                    false,
+                )
+                .await
+                .unwrap();
+            let DuckDbResponse::Query(cold) = cold.response else {
+                panic!("query response required")
+            };
+            assert_eq!(
+                cold.rows,
+                vec![vec![
+                    DuckDbValue::Integer(1),
+                    DuckDbValue::Text("later".into())
+                ]]
+            );
+        }
     }
 
     #[tokio::test]
@@ -746,9 +1187,30 @@ mod tests {
             "a small write should transfer fewer bytes than the checkpoint"
         );
 
-        // DuckDB export checkpoints the engine, so the exported checkpoint is
-        // durably installed before a subsequent WAL replaces the old delta.
-        service.export(&space, "analytics").await.unwrap();
+        // Export must not rewrite durable state or checkpoint the live actor:
+        // its next WAL must still derive from the existing durable base.
+        let export_cache = TempDir::new().unwrap();
+        let cold = file_service(&export_cache, repo.clone());
+        for exporter in [&service, &cold] {
+            let bytes = exporter.export(&space, "analytics").await.unwrap();
+            let snapshot_dir = TempDir::new().unwrap();
+            let snapshot_path = snapshot_dir.path().join("snapshot.duckdb");
+            std::fs::write(&snapshot_path, bytes).unwrap();
+            let snapshot = duckdb::Connection::open(snapshot_path).unwrap();
+            let names: String = snapshot
+                .query_row("SELECT name FROM events WHERE id = 1", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(names, "one");
+            let after = repo
+                .load("duckdb", &space.to_string(), "analytics")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.revision, artifact.revision);
+            assert_eq!(after.size_bytes, artifact.size_bytes);
+            assert_eq!(after.payload, artifact.payload);
+            assert_eq!(after.delta_payload, artifact.delta_payload);
+        }
         service
             .execute(
                 &space,
@@ -846,6 +1308,123 @@ mod tests {
                 assert_eq!(query.rows[0][0], DuckDbValue::Text("imported".to_string()));
             }
             other => panic!("expected query response, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn duckdb_full_database_writes_persist_without_retaining_rejected_growth() {
+        let repo = artifact_repository().await;
+        let source_cache = TempDir::new().unwrap();
+        let guarded_cache = TempDir::new().unwrap();
+        let recovery_cache = TempDir::new().unwrap();
+        let space = test_space_id("duckdb-full");
+        let source = service(&source_cache, repo.clone());
+        source
+            .execute(
+                &space,
+                "analytics",
+                DuckDbRequest::Execute {
+                    schema: Some(vec![
+                        "CREATE TABLE events (id INTEGER); CREATE TABLE obsolete (id INTEGER)"
+                            .to_string(),
+                    ]),
+                    sql: "INSERT INTO events VALUES (1), (2)".to_string(),
+                    params: Vec::new(),
+                },
+                None,
+                "tinycloud.duckdb/write".to_string(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // A fresh service hydrates a real file-backed database.
+        let guarded = file_service(&guarded_cache, repo.clone());
+        guarded
+            .execute_without_growth(
+                &space,
+                "analytics",
+                DuckDbRequest::Execute {
+                    schema: Some(vec![
+                        "CREATE TABLE IF NOT EXISTS events (id INTEGER); DROP TABLE obsolete"
+                            .to_string(),
+                    ]),
+                    sql: "DELETE FROM events WHERE id = ?".to_string(),
+                    params: vec![DuckDbValue::Integer(1)],
+                },
+                None,
+                "tinycloud.duckdb/write".to_string(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let rejected = guarded
+            .execute_without_growth(
+                &space,
+                "analytics",
+                DuckDbRequest::Batch {
+                    statements: vec![
+                        DuckDbStatement {
+                            sql: "DELETE FROM events".to_string(),
+                            params: Vec::new(),
+                        },
+                        DuckDbStatement {
+                            sql: "CREATE TABLE IF NOT EXISTS rejected (id INTEGER)".to_string(),
+                            params: Vec::new(),
+                        },
+                    ],
+                    transactional: false,
+                },
+                None,
+                "tinycloud.duckdb/write".to_string(),
+                false,
+            )
+            .await;
+        assert!(matches!(rejected, Err(DuckDbError::StorageWouldGrow)));
+
+        let recovered = file_service(&recovery_cache, repo);
+        let result = recovered
+            .execute(
+                &space,
+                "analytics",
+                DuckDbRequest::Query {
+                    sql: "SELECT id FROM events".to_string(),
+                    params: Vec::new(),
+                },
+                None,
+                "tinycloud.duckdb/read".to_string(),
+                false,
+            )
+            .await
+            .unwrap();
+        match result.response {
+            DuckDbResponse::Query(query) => {
+                assert_eq!(query.rows, vec![vec![DuckDbValue::Integer(2)]]);
+            }
+            other => panic!("expected query response, got {other:?}"),
+        }
+        let schema = recovered
+            .execute(
+                &space,
+                "analytics",
+                DuckDbRequest::Describe,
+                None,
+                "tinycloud.duckdb/read".to_string(),
+                false,
+            )
+            .await
+            .unwrap();
+        match schema.response {
+            DuckDbResponse::Describe(schema) => {
+                let tables: Vec<_> = schema
+                    .tables
+                    .iter()
+                    .map(|table| table.name.as_str())
+                    .collect();
+                assert_eq!(tables, vec!["events"]);
+            }
+            other => panic!("expected schema response, got {other:?}"),
         }
     }
 }
