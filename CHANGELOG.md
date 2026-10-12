@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - CORS preflight (`OPTIONS`) responses on the generic data plane carry `Access-Control-Max-Age: 7200`, so browsers reuse a preflight instead of repeating it before most `/invoke` calls. Share-owned `/policy/v3/*` responses are unchanged (#240, carried from `main` when the 1.20.1 release line merged into `main`, TC-940).
+- The production ingress accepts request bodies up to 200 MB, and allows 600 s for proxied reads and sends (`CLIENT_MAX_BODY_SIZE=200m`, `PROXY_READ_TIMEOUT`, `PROXY_SEND_TIMEOUT`). The wrapper's base moves from `dstack-ingress:20250924` to `dstack-ingress:1.4`, the newest upstream image that honours `CLIENT_MAX_BODY_SIZE`, and keeps the TC-910 32 KB header buffers. Pinned wrapper: `sha256:08cf3ee4ab4054cc2657da12304ae344d6b2156c1fa11ffd7da5e64cd1bca416` (#261, carried to `main` by TC-940).
 
 ## [1.20.1] - 2026-10-11
 
