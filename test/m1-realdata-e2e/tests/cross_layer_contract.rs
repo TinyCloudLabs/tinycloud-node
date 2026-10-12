@@ -51,6 +51,7 @@ use tinycloud_auth::{
     ucan_capabilities_object::Capabilities,
 };
 use tinycloud_core::{
+    database_identity::logical_name,
     hash::{hash, Hash},
     models::{abilities, delegation, space},
     sea_orm::{
@@ -67,7 +68,13 @@ const ISSUER: &str = "did:web:issuer.credentials.org";
 const AUDIENCE: &str = "policy-engine:m1-realdata";
 const SPACE_NAME: &str = "applications";
 const SQL_PATH: &str = "xyz.tinycloud.listen/conversations";
-const SQL_DB: &str = "conversations";
+
+/// The physical database the node resolves for `SQL_PATH`. Since TC-780 the
+/// node selects databases by full-path digest, and a non-digest artifact is an
+/// unmigrated legacy database that fences SQL with 503.
+fn sql_db() -> String {
+    logical_name(Some(SQL_PATH))
+}
 const KV_PATH: &str = "audio/conversation-a/recording";
 const CONVERSATION_ID: &str = "conversation-a";
 const EVIDENCE_ID: &str = "email-domain";
@@ -1148,7 +1155,7 @@ async fn seed_listen_kv(
 async fn seed_listen_sql(sql: &SqlService, space: &SpaceId) -> Result<()> {
     sql.execute(
         space,
-        SQL_DB,
+        &sql_db(),
         SqlRequest::Execute {
             schema: Some(vec![
                 "CREATE TABLE conversation (id TEXT PRIMARY KEY, title TEXT, source TEXT, source_id TEXT, source_url TEXT, started_at TEXT, ended_at TEXT, duration_secs INTEGER, summary TEXT, metadata TEXT, transcript_json TEXT, transcript_text TEXT, created_at TEXT, updated_at TEXT)".to_string(),
@@ -1178,7 +1185,7 @@ async fn seed_listen_sql(sql: &SqlService, space: &SpaceId) -> Result<()> {
     .await?;
     sql.execute(
         space,
-        SQL_DB,
+        &sql_db(),
         SqlRequest::Execute {
             schema: None,
             sql: "INSERT INTO participant (id, conversation_id, name, email, speaker_label) VALUES (?, ?, ?, ?, ?)".to_string(),
@@ -1822,7 +1829,7 @@ fn parent_config_from_vector(
 async fn seed_grant_vector_sql(sql: &SqlService, space: &SpaceId) -> Result<()> {
     sql.execute(
         space,
-        SQL_DB,
+        &sql_db(),
         SqlRequest::Execute {
             schema: Some(vec!["CREATE TABLE conversation (id TEXT PRIMARY KEY, title TEXT, source TEXT, source_id TEXT, source_url TEXT, started_at TEXT, ended_at TEXT, duration_secs INTEGER, summary TEXT, metadata TEXT, transcript_json TEXT, transcript_text TEXT, created_at TEXT, updated_at TEXT)".to_string()]),
             sql: "INSERT INTO conversation (id, title, source, source_id, source_url, started_at, ended_at, duration_secs, summary, metadata, transcript_json, transcript_text, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string(),
