@@ -135,7 +135,7 @@ Validate Capability → Check Resource Permission → Execute Operation
 
 ```toml
 [global]
-log_level = "normal"              # Rocket log verbosity: off, debug, normal, critical (NOT trace/info/warn/error)
+log_level = "normal"              # Default log verbosity: off, critical, normal, debug (NOT trace/info/warn/error)
 port = 8000                       # HTTP server port
 cors = true                       # Enable CORS headers
 
@@ -163,8 +163,8 @@ All use the `TINYCLOUD_` prefix:
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `TINYCLOUD_LOG_LEVEL` | Rocket's own log verbosity (off/debug/normal/critical). Does **not** control application log output — see `RUST_LOG` below. | `normal` |
-| `RUST_LOG` | The actual verbosity control for the `tracing`/`EnvFilter` subscriber that emits all application log lines. Defaults to `info` if unset. | `debug`, `tinycloud=debug` |
+| `TINYCLOUD_LOG_LEVEL` | Default log verbosity: `off`, `critical` (warnings and errors), `normal` (info) or `debug`. Used when `RUST_LOG` is unset. | `normal` |
+| `RUST_LOG` | Overrides the verbosity with a `tracing` `EnvFilter`. | `debug`, `tinycloud=debug` |
 | `TINYCLOUD_PORT` | Server port | `8000` |
 | `TINYCLOUD_STORAGE_DATADIR` | Root data directory | `./data` |
 | `TINYCLOUD_STORAGE_DATABASE` | Database URL (override) | `sqlite:./data/caps.db` |
@@ -313,9 +313,11 @@ docker run -d \
 
 ### Debug Logging
 
-Application log verbosity is controlled by `RUST_LOG` (a `tracing`
-`EnvFilter`), not `TINYCLOUD_LOG_LEVEL` (which only affects Rocket's own
-internal logger and is not the mechanism used to filter application logs).
+Log verbosity comes from `TINYCLOUD_LOG_LEVEL` (`normal` = info), or from
+`RUST_LOG` (a `tracing` `EnvFilter`) when that is set. Production logs are
+public: never log request URIs, credentials, space IDs, DIDs or keys
+(TC-961). Rocket's own per-request logging is filtered out at every level,
+and `tinycloud::request` logs each request by route template.
 Set it for verbose output:
 ```bash
 RUST_LOG=debug cargo run

@@ -226,10 +226,10 @@ pub fn spawn_actor(
                                     Ok(new_conn) => {
                                         conn = new_conn;
                                         mode = StorageMode::File(file_path.clone());
-                                        tracing::info!(space=%space_id, db=%db_name, "Promoted database to file storage");
+                                        tracing::info!("Promoted database to file storage");
                                     }
                                     Err(e) => {
-                                        tracing::error!(space=%space_id, db=%db_name, error=%e, "Failed to promote database to file");
+                                        tracing::error!(error=%e, "Failed to promote database to file");
                                     }
                                 }
                             }
@@ -265,7 +265,7 @@ pub fn spawn_actor(
         databases.remove_if(&(space_id.clone(), db_name.clone()), |_, handle| {
             handle.id == id
         });
-        tracing::debug!(space=%space_id, db=%db_name, "Database actor shutting down");
+        tracing::debug!("Database actor shutting down");
         if let Some(response_tx) = shutdown_response {
             let _ = response_tx.send(());
         }

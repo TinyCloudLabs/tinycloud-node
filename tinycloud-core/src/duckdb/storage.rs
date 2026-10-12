@@ -163,9 +163,9 @@ pub fn copy_tables(src: &Connection, dest: &Connection) -> Result<(), DuckDbErro
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| DuckDbError::Internal(e.to_string()))?;
 
-    for (name, view_sql) in &views {
+    for (_, view_sql) in &views {
         if let Err(e) = dest.execute_batch(view_sql) {
-            tracing::warn!(view=%name, error=%e, "failed to copy view during table copy");
+            tracing::warn!(error=%e, "failed to copy view during table copy");
         }
     }
 

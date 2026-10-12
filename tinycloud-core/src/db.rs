@@ -3138,8 +3138,8 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
                 .any(|s| !new_space_ids.contains(s) && !existing.contains(s))
             {
                 tracing::error!(
-                    requested_spaces = ?event_spaces.keys().collect::<Vec<_>>(),
-                    existing_spaces = ?existing,
+                    requested_spaces = event_spaces.len(),
+                    existing_spaces = existing.len(),
                     "invocation referenced a space absent from the database"
                 );
                 return Err(TxError::SpaceNotFound);

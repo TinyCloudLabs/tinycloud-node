@@ -38,19 +38,13 @@ impl MigrationTrait for Migration {
             .await?
             .rows_affected;
 
-        // Callback URLs and secrets are deliberately not logged.
+        // Callback URLs, secrets, space IDs and subscriber DIDs are
+        // deliberately not logged.
         tracing::warn!(
             deactivated,
             owners = owners.len(),
             "deactivated webhook subscriptions; owners must re-register"
         );
-        for (space_id, subscriber_did) in &owners {
-            tracing::warn!(
-                space_id = %space_id,
-                subscriber_did = %subscriber_did,
-                "webhook subscription deactivated"
-            );
-        }
         Ok(())
     }
 

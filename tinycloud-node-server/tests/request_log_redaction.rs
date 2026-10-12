@@ -79,8 +79,23 @@ fn wait_until_healthy(client: &reqwest::blocking::Client, base: &str, server: &m
     panic!("tinycloud did not become healthy within 60s");
 }
 
+/// Production runs `TINYCLOUD_LOG_LEVEL=normal`.
 #[test]
 fn production_logs_carry_neither_signed_kv_tickets_nor_space_ids() {
+    assert_request_data_stays_out_of_logs(&[]);
+}
+
+#[test]
+fn debug_logs_carry_no_request_data() {
+    assert_request_data_stays_out_of_logs(&[("TINYCLOUD_LOG_LEVEL", "debug")]);
+}
+
+#[test]
+fn trace_logs_carry_no_request_data() {
+    assert_request_data_stays_out_of_logs(&[("RUST_LOG", "trace")]);
+}
+
+fn assert_request_data_stays_out_of_logs(extra_env: &[(&str, &str)]) {
     let dir = tempfile::tempdir().unwrap();
     let port = free_port();
     let base = format!("http://127.0.0.1:{port}");
@@ -89,6 +104,7 @@ fn production_logs_carry_neither_signed_kv_tickets_nor_space_ids() {
     let wallet = uuid::Uuid::new_v4().simple().to_string() + "00000000";
     let space = format!("tinycloud:pkh:eip155:1:0x{wallet}:default");
     let key = marker("tc961key");
+    let bearer = marker("tc961bearer");
 
     let server = Command::new(env!("CARGO_BIN_EXE_tinycloud"))
         .current_dir(dir.path())
@@ -98,6 +114,7 @@ fn production_logs_carry_neither_signed_kv_tickets_nor_space_ids() {
         .env("TINYCLOUD_ADDRESS", "127.0.0.1")
         .env("TINYCLOUD_PORT", port.to_string())
         .env("TINYCLOUD_LOG_LEVEL", "normal")
+        .envs(extra_env.iter().copied())
         .env("TINYCLOUD_TELEMETRY__ENABLED", "true")
         .env("TINYCLOUD_PROMETHEUS__PORT", free_port().to_string())
         .env("TINYCLOUD_STORAGE__DATADIR", dir.path().join("data"))
@@ -118,15 +135,25 @@ fn production_logs_carry_neither_signed_kv_tickets_nor_space_ids() {
     let requests = [
         (reqwest::Method::GET, format!("/signed/kv/{ticket}")),
         (reqwest::Method::HEAD, format!("/signed/kv/{ticket}")),
-        (reqwest::Method::GET, format!("/signed/kv/{ticket}/unmatched")),
+        (
+            reqwest::Method::GET,
+            format!("/signed/kv/{ticket}/unmatched"),
+        ),
         (reqwest::Method::GET, format!("/public/{space}/kv/{key}")),
         (reqwest::Method::HEAD, format!("/public/{space}/kv/{key}")),
-        (reqwest::Method::GET, format!("/public/{space}/kv?prefix={key}")),
-        (reqwest::Method::GET, format!("/public/{space}/unmatched/{key}")),
+        (
+            reqwest::Method::GET,
+            format!("/public/{space}/kv?prefix={key}"),
+        ),
+        (
+            reqwest::Method::GET,
+            format!("/public/{space}/unmatched/{key}"),
+        ),
     ];
     for (method, path) in &requests {
         let response = client
             .request(method.clone(), format!("{base}{path}"))
+            .bearer_auth(&bearer)
             .send()
             .unwrap();
         assert!(
@@ -146,6 +173,7 @@ fn production_logs_carry_neither_signed_kv_tickets_nor_space_ids() {
         ("space id", space.as_str()),
         ("wallet address", wallet.as_str()),
         ("KV key", key.as_str()),
+        ("Authorization header", bearer.as_str()),
     ] {
         let leaked: Vec<&str> = logs.lines().filter(|line| line.contains(needle)).collect();
         assert!(

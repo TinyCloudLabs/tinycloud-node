@@ -26,8 +26,32 @@ fn build_config_figment() -> rocket::figment::Figment {
         .merge(Env::prefixed("ROCKET_").global())
 }
 
+/// Report panics off the main thread (request handlers and background tasks)
+/// by location only. Their messages can format request data, and production
+/// logs are public (TC-961). Startup panics on the main thread keep the
+/// default report, which operators need to fix a bad configuration.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        if thread.name() == Some("main") {
+            default_hook(info);
+            return;
+        }
+        let location = info
+            .location()
+            .map(|location| format!("{}:{}", location.file(), location.line()));
+        eprintln!(
+            "thread '{}' panicked at {}: <message withheld from the log>",
+            thread.name().unwrap_or("<unnamed>"),
+            location.as_deref().unwrap_or("<unknown>"),
+        );
+    }));
+}
+
 #[rocket::main]
 async fn main() {
+    install_panic_hook();
     let config = build_config_figment(); // That's just for easy access to ROCKET_LOG_LEVEL
     let tinycloud_config = config.extract::<config::Config>().unwrap();
 

@@ -128,7 +128,7 @@ impl SqlService {
         {
             Err(SqlError::Internal(ref msg)) if msg.contains("Database actor not available") => {
                 // Actor is dead — remove stale entry and respawn
-                tracing::warn!(space=%space, db=%db_name, "Dead SQL actor detected, respawning");
+                tracing::warn!("Dead SQL actor detected, respawning");
                 self.databases.remove(&key);
                 handle = self.handle(space, db_name).await?;
                 handle.execute(request, caveats, ability, growth).await
@@ -223,7 +223,7 @@ impl SqlService {
                     if msg.contains("Database actor not available") =>
                 {
                     // Actor is dead — remove stale entry and fall through to cold read
-                    tracing::warn!(space=%space, db=%db_name, "Dead SQL actor detected during export, removing");
+                    tracing::warn!("Dead SQL actor detected during export, removing");
                     self.databases.remove(&key);
                 }
                 other => return other,
@@ -310,8 +310,6 @@ impl SqlService {
             Some(artifact) => {
                 tracing::info!(
                     service = "sql",
-                    space = %space,
-                    db = db_name,
                     revision = artifact.revision,
                     storage_mode = %artifact.storage_mode,
                     bytes = artifact.payload.len(),
@@ -354,8 +352,6 @@ impl SqlService {
             None => {
                 tracing::info!(
                     service = "sql",
-                    space = %space,
-                    db = db_name,
                     "No durable database artifact; starting from an empty database"
                 );
                 remove_sql_cache_files(&cache_path).await?;
@@ -395,8 +391,6 @@ impl SqlService {
             None => {
                 tracing::warn!(
                     service = "sql",
-                    space = %key.0,
-                    db = %key.1,
                     "No recorded artifact lineage for a live database; saving without a lineage assertion"
                 );
                 ArtifactExpectation::Any
@@ -436,8 +430,6 @@ impl SqlService {
                         .insert(key, expected.advanced_to(saved.revision));
                     tracing::info!(
                         service = "sql",
-                        space = %space,
-                        db = db_name,
                         mode = "wal",
                         bytes = saved.delta_size_bytes,
                         logical_bytes = saved.size_bytes,
@@ -481,8 +473,6 @@ impl SqlService {
         );
         tracing::info!(
             service = "sql",
-            space = %space,
-            db = db_name,
             mode = "checkpoint",
             bytes,
             logical_bytes = saved.size_bytes,
@@ -519,8 +509,6 @@ fn validate_payload(
     }
     tracing::error!(
         service = "sql",
-        space = %space,
-        db = db_name,
         role,
         bytes = payload.len(),
         leading = %hex::encode(&payload[..payload.len().min(16)]),
