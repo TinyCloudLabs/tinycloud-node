@@ -16,7 +16,10 @@ use crate::{
     types::{Ability, Resource},
 };
 use sea_orm::{
-    sea_query::OnConflict, ActiveValue::Set, ConnectionTrait, DbErr, EntityTrait, TransactionTrait,
+    sea_query::{Alias, CommonTableExpression, OnConflict, WithClause},
+    ActiveValue::Set,
+    ConnectionTrait, DbBackend, DbErr, EntityTrait, Insert, QueryTrait, Statement,
+    TransactionTrait,
 };
 use std::collections::HashSet;
 use std::sync::{
@@ -156,15 +159,77 @@ async fn run_pipeline(
     }
 }
 
-async fn persist_batch<C: TransactionTrait>(conn: &C, batch: &[Command]) -> Result<(), DbErr> {
+async fn persist_batch<C: ConnectionTrait + TransactionTrait>(
+    conn: &C,
+    batch: &[Command],
+) -> Result<(), DbErr> {
+    let inserts = audit_inserts(batch);
+    if conn.get_database_backend() == DbBackend::Postgres {
+        if let Some(statement) = inserts.as_ref().and_then(postgres_single_statement) {
+            return conn.execute(statement).await.map(|_| ());
+        }
+    }
     let tx = conn.begin().await?;
-    persist_records(&tx, batch).await?;
+    if let Some(inserts) = inserts {
+        persist_inserts(&tx, inserts).await?;
+    }
     tx.commit().await
 }
 
-/// Persist an entire drained batch with a constant number of statements — at
-/// most one `insert_many` per table — instead of the previous ~4 statements
-/// per record.
+/// PostgreSQL commits the batch's INSERTs as one statement instead of
+/// `BEGIN`, one statement per table and `COMMIT` (6 sequential round-trips
+/// for a typical read). The INSERTs are exactly those `persist_inserts` runs,
+/// with the same rows and `ON CONFLICT DO NOTHING` targets, as data-modifying
+/// CTEs of the invocation INSERT. One statement is atomic on its own, and
+/// PostgreSQL checks the foreign keys between these tables (invocation to
+/// actor, invoked ability to invocation, parent edge to delegation) at the end
+/// of the statement, so rows inserted by a sibling CTE satisfy them.
+/// PostgreSQL does not define the order in which the CTEs run, so their rows
+/// may be locked in a different order than the old transaction's; only two
+/// writers of the same invocation id could notice, and the invocation replay
+/// guard admits an invocation once.
+///
+/// `None` when the combined statement would bind more than the 65,535
+/// parameters PostgreSQL's protocol allows (each per-table statement had that
+/// limit on its own); `persist_batch` then takes the transactional path.
+fn postgres_single_statement(inserts: &AuditInserts) -> Option<Statement> {
+    let mut ctes = WithClause::new();
+    let mut any_cte = false;
+    for (name, insert) in [
+        (
+            "read_audit_actor",
+            inserts.actors.as_ref().map(|i| i.as_query().clone()),
+        ),
+        (
+            "read_audit_invoked_abilities",
+            inserts.abilities.as_ref().map(|i| i.as_query().clone()),
+        ),
+        (
+            "read_audit_parent_delegation",
+            inserts.parents.as_ref().map(|i| i.as_query().clone()),
+        ),
+    ] {
+        if let Some(insert) = insert {
+            ctes.cte(
+                CommonTableExpression::new()
+                    .table_name(Alias::new(name))
+                    .query(insert)
+                    .to_owned(),
+            );
+            any_cte = true;
+        }
+    }
+    let mut statement = inserts.invocations.as_query().clone();
+    if any_cte {
+        statement.with_cte(ctes);
+    }
+    let statement = DbBackend::Postgres.build(&statement);
+    let parameters = statement.values.as_ref().map_or(0, |values| values.0.len());
+    (parameters <= usize::from(u16::MAX)).then_some(statement)
+}
+
+/// The INSERTs that persist one drained batch: at most one `insert_many` per
+/// table, instead of the previous ~4 statements per record.
 ///
 /// Every VALUES list is deduplicated by its `ON CONFLICT` target before it is
 /// sent. This is mandatory once rows are batched: some backends (notably
@@ -178,7 +243,15 @@ async fn persist_batch<C: TransactionTrait>(conn: &C, batch: &[Command]) -> Resu
 /// `ON CONFLICT DO NOTHING` targets, the already-encrypted `serialization`
 /// bytes carried verbatim from each record, and — because inserts stay
 /// conflict-idempotent — identical final table contents and no-op re-persists.
-async fn persist_records<C: ConnectionTrait>(db: &C, batch: &[Command]) -> Result<(), DbErr> {
+struct AuditInserts {
+    actors: Option<Insert<actor::ActiveModel>>,
+    invocations: Insert<invocation::ActiveModel>,
+    abilities: Option<Insert<invoked_abilities::ActiveModel>>,
+    parents: Option<Insert<parent_delegations::ActiveModel>>,
+}
+
+/// `None` for a batch with no records.
+fn audit_inserts(batch: &[Command]) -> Option<AuditInserts> {
     // Collapse repeated invocations (identical concurrent reads hash to the
     // same id) to their first occurrence so every downstream VALUES list is
     // duplicate-free at the invocation level.
@@ -190,7 +263,7 @@ async fn persist_records<C: ConnectionTrait>(db: &C, batch: &[Command]) -> Resul
         .collect();
 
     if records.is_empty() {
-        return Ok(());
+        return None;
     }
 
     // 1. Actors — one row per distinct invoker.
@@ -202,18 +275,13 @@ async fn persist_records<C: ConnectionTrait>(db: &C, batch: &[Command]) -> Resul
             id: Set(record.invoker.clone()),
         })
         .collect();
-    if !actors.is_empty() {
-        ignore_record_not_inserted(
-            actor::Entity::insert_many(actors)
-                .on_conflict(
-                    OnConflict::column(actor::Column::Id)
-                        .do_nothing()
-                        .to_owned(),
-                )
-                .exec(db)
-                .await,
-        )?;
-    }
+    let actors = (!actors.is_empty()).then(|| {
+        actor::Entity::insert_many(actors).on_conflict(
+            OnConflict::column(actor::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+    });
 
     // 2. Invocations — one row per distinct invocation (records already deduped).
     let invocations: Vec<invocation::ActiveModel> = records
@@ -226,16 +294,11 @@ async fn persist_records<C: ConnectionTrait>(db: &C, batch: &[Command]) -> Resul
             serialization: Set(record.serialization.clone()),
         })
         .collect();
-    ignore_record_not_inserted(
-        invocation::Entity::insert_many(invocations)
-            .on_conflict(
-                OnConflict::column(invocation::Column::Id)
-                    .do_nothing()
-                    .to_owned(),
-            )
-            .exec(db)
-            .await,
-    )?;
+    let invocations = invocation::Entity::insert_many(invocations).on_conflict(
+        OnConflict::column(invocation::Column::Id)
+            .do_nothing()
+            .to_owned(),
+    );
 
     // 3. Invoked abilities — every (invocation, resource, ability) across the
     //    batch, deduplicated by the full primary key.
@@ -260,22 +323,17 @@ async fn persist_records<C: ConnectionTrait>(db: &C, batch: &[Command]) -> Resul
             },
         )
         .collect();
-    if !abilities.is_empty() {
-        ignore_record_not_inserted(
-            invoked_abilities::Entity::insert_many(abilities)
-                .on_conflict(
-                    OnConflict::columns([
-                        invoked_abilities::Column::Invocation,
-                        invoked_abilities::Column::Resource,
-                        invoked_abilities::Column::Ability,
-                    ])
-                    .do_nothing()
-                    .to_owned(),
-                )
-                .exec(db)
-                .await,
-        )?;
-    }
+    let abilities = (!abilities.is_empty()).then(|| {
+        invoked_abilities::Entity::insert_many(abilities).on_conflict(
+            OnConflict::columns([
+                invoked_abilities::Column::Invocation,
+                invoked_abilities::Column::Resource,
+                invoked_abilities::Column::Ability,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+    });
 
     // 4. Parent delegations — every (parent, child) across the batch,
     //    deduplicated by the full primary key.
@@ -292,22 +350,44 @@ async fn persist_records<C: ConnectionTrait>(db: &C, batch: &[Command]) -> Resul
             child: Set(child),
         })
         .collect();
-    if !parents.is_empty() {
-        ignore_record_not_inserted(
-            parent_delegations::Entity::insert_many(parents)
-                .on_conflict(
-                    OnConflict::columns([
-                        parent_delegations::Column::Parent,
-                        parent_delegations::Column::Child,
-                    ])
-                    .do_nothing()
-                    .to_owned(),
-                )
-                .exec(db)
-                .await,
-        )?;
-    }
+    let parents = (!parents.is_empty()).then(|| {
+        parent_delegations::Entity::insert_many(parents).on_conflict(
+            OnConflict::columns([
+                parent_delegations::Column::Parent,
+                parent_delegations::Column::Child,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+    });
 
+    Some(AuditInserts {
+        actors,
+        invocations,
+        abilities,
+        parents,
+    })
+}
+
+/// Persist a drained batch inside the caller's transaction with one statement
+/// per table (SQLite, MySQL, and PostgreSQL past the parameter limit).
+async fn persist_inserts<C: ConnectionTrait>(db: &C, inserts: AuditInserts) -> Result<(), DbErr> {
+    let AuditInserts {
+        actors,
+        invocations,
+        abilities,
+        parents,
+    } = inserts;
+    if let Some(actors) = actors {
+        ignore_record_not_inserted(actors.exec(db).await)?;
+    }
+    ignore_record_not_inserted(invocations.exec(db).await)?;
+    if let Some(abilities) = abilities {
+        ignore_record_not_inserted(abilities.exec(db).await)?;
+    }
+    if let Some(parents) = parents {
+        ignore_record_not_inserted(parents.exec(db).await)?;
+    }
     Ok(())
 }
 
@@ -482,6 +562,40 @@ mod tests {
     #[tokio::test]
     async fn batched_persist_matches_per_record_contents_and_is_idempotent() {
         let conn = database("sqlite::memory:".to_string(), 1).await;
+        assert_batched_persist_contents(&conn, persist_batch_boxed).await;
+    }
+
+    /// How a test persists a batch: `persist_batch` (one statement on
+    /// PostgreSQL), or the transaction of per-table INSERTs it replaces there.
+    type Persist = for<'a> fn(
+        &'a DatabaseConnection,
+        &'a [Command],
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), DbErr>> + Send + 'a>,
+    >;
+
+    fn persist_batch_boxed<'a>(
+        conn: &'a DatabaseConnection,
+        batch: &'a [Command],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DbErr>> + Send + 'a>> {
+        Box::pin(persist_batch(conn, batch))
+    }
+
+    fn persist_in_transaction<'a>(
+        conn: &'a DatabaseConnection,
+        batch: &'a [Command],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DbErr>> + Send + 'a>> {
+        Box::pin(async move {
+            let tx = conn.begin().await?;
+            if let Some(inserts) = audit_inserts(batch) {
+                persist_inserts(&tx, inserts).await?;
+            }
+            tx.commit().await
+        })
+    }
+
+    async fn assert_batched_persist_contents(conn: &DatabaseConnection, persist: Persist) {
+        let conn = conn.clone();
 
         let parent_one = crate::hash::hash(b"parent-one");
         let parent_two = crate::hash::hash(b"parent-two");
@@ -516,7 +630,7 @@ mod tests {
         let bob_id = bob.id;
 
         let batch = vec![command(alice1), command(alice2), command(bob)];
-        persist_batch(&conn, &batch).await.unwrap();
+        persist(&conn, &batch).await.unwrap();
 
         // Actors: the duplicate invoker collapses to one row.
         let actors: HashSet<String> = actor::Entity::find()
@@ -584,7 +698,7 @@ mod tests {
         assert_eq!(parent_rows, expected_parents);
 
         // Re-persisting the identical batch is a no-op (ON CONFLICT DO NOTHING).
-        persist_batch(&conn, &batch).await.unwrap();
+        persist(&conn, &batch).await.unwrap();
         assert_eq!(invocation::Entity::find().count(&conn).await.unwrap(), 3);
         assert_eq!(
             invoked_abilities::Entity::find()
@@ -600,5 +714,231 @@ mod tests {
                 .unwrap(),
             3
         );
+    }
+
+    async fn audit_rows(
+        conn: &DatabaseConnection,
+    ) -> (
+        Vec<String>,
+        Vec<(Hash, String, Vec<u8>)>,
+        Vec<(Hash, String, String)>,
+        Vec<(Hash, Hash)>,
+    ) {
+        let mut actors: Vec<String> = actor::Entity::find()
+            .all(conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .filter(|id| id != "did:key:parent-authority")
+            .collect();
+        let mut invocations: Vec<(Hash, String, Vec<u8>)> = invocation::Entity::find()
+            .all(conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.id, row.invoker, row.serialization))
+            .collect();
+        let mut abilities: Vec<(Hash, String, String)> = invoked_abilities::Entity::find()
+            .all(conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.invocation,
+                    row.resource.to_string(),
+                    row.ability.to_string(),
+                )
+            })
+            .collect();
+        let mut parents: Vec<(Hash, Hash)> = parent_delegations::Entity::find()
+            .all(conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.parent, row.child))
+            .collect();
+        actors.sort();
+        invocations.sort_by(|left, right| left.0.as_ref().cmp(right.0.as_ref()));
+        abilities.sort_by(|left, right| {
+            (left.0.as_ref(), &left.1, &left.2).cmp(&(right.0.as_ref(), &right.1, &right.2))
+        });
+        parents.sort_by(|left, right| {
+            (left.0.as_ref(), left.1.as_ref()).cmp(&(right.0.as_ref(), right.1.as_ref()))
+        });
+        (actors, invocations, abilities, parents)
+    }
+
+    /// PostgreSQL persists a batch as one statement. The same batch persisted
+    /// by the transaction of per-table INSERTs it replaced (in a second,
+    /// isolated schema) leaves exactly the same rows, a failing batch leaves
+    /// none of its rows on either path, and concurrent reads still group
+    /// commit and are durable.
+    #[tokio::test]
+    async fn postgres_read_audit_batch_is_one_atomic_statement_with_unchanged_rows() {
+        use crate::test_support::PostgresTestSchema;
+        use std::sync::atomic::AtomicUsize;
+
+        const TEST: &str = "postgres_read_audit_batch_is_one_atomic_statement_with_unchanged_rows";
+        let Some(transactional) = PostgresTestSchema::new(TEST).await else {
+            return;
+        };
+        let Some(single) = PostgresTestSchema::new(TEST).await else {
+            return;
+        };
+        // The new actors in this batch exercise invocation -> actor, and its
+        // parents invoked_abilities -> invocation and parent -> delegation,
+        // all within one statement.
+        assert_batched_persist_contents(&transactional.conn, persist_in_transaction).await;
+        assert_batched_persist_contents(&single.conn, persist_batch_boxed).await;
+        assert_eq!(
+            audit_rows(&single.conn).await,
+            audit_rows(&transactional.conn).await
+        );
+
+        // One statement per batch on PostgreSQL; the transactional path ran
+        // one per table (plus BEGIN and COMMIT on the wire).
+        let parent = crate::hash::hash(b"parent-one");
+        let batch = || {
+            vec![
+                command(rich_record(
+                    "count-1",
+                    "did:key:count",
+                    vec![(
+                        resource("tinycloud:did:key:ne-delegator:files/kv/count"),
+                        ability("tinycloud.kv/get"),
+                    )],
+                    vec![parent],
+                )),
+                command(rich_record("count-2", "did:key:count", vec![], vec![])),
+            ]
+        };
+        for (conn, persist, expected) in [
+            (&single.conn, persist_batch_boxed as Persist, 1),
+            (&transactional.conn, persist_in_transaction as Persist, 4),
+        ] {
+            let statements = Arc::new(AtomicUsize::new(0));
+            let counter = statements.clone();
+            let mut counted = conn.clone();
+            counted.set_metric_callback(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            });
+            persist(&counted, &batch()).await.unwrap();
+            assert_eq!(statements.load(Ordering::SeqCst), expected);
+        }
+        assert_eq!(
+            audit_rows(&single.conn).await,
+            audit_rows(&transactional.conn).await
+        );
+
+        // A record citing a delegation that does not exist violates the parent
+        // edge's foreign key: the whole batch fails, including its new actor
+        // and the other record's rows.
+        let doomed = vec![
+            command(rich_record("doomed-ok", "did:key:doomed", vec![], vec![])),
+            command(rich_record(
+                "doomed-bad",
+                "did:key:doomed",
+                vec![],
+                vec![crate::hash::hash(b"no-such-delegation")],
+            )),
+        ];
+        for (conn, persist) in [
+            (&single.conn, persist_batch_boxed as Persist),
+            (&transactional.conn, persist_in_transaction as Persist),
+        ] {
+            let before = audit_rows(conn).await;
+            assert!(persist(conn, &doomed).await.is_err());
+            assert_eq!(audit_rows(conn).await, before);
+        }
+
+        // The pipeline itself, without a writer lock as on PostgreSQL in
+        // production: concurrent reads group commit and are durable.
+        let pipeline = ReadAuditPipeline::start(single.conn.clone(), None);
+        let before = invocation::Entity::find()
+            .count(&single.conn)
+            .await
+            .unwrap();
+        let requests = (0..32)
+            .map(|index| {
+                let pipeline = pipeline.clone();
+                tokio::spawn(async move { pipeline.enqueue(record(index)).await })
+            })
+            .collect::<Vec<_>>();
+        for request in requests {
+            request.await.unwrap().unwrap();
+        }
+        let (records, batches) = pipeline.stats();
+        assert_eq!(records, 32);
+        assert!(batches < records, "saturated reads share commits");
+        assert_eq!(
+            invocation::Entity::find()
+                .count(&single.conn)
+                .await
+                .unwrap(),
+            before + 32
+        );
+    }
+
+    #[test]
+    fn single_statement_audit_covers_every_table_and_falls_back_past_the_parameter_limit() {
+        assert!(audit_inserts(&[]).is_none());
+        let single_statement = |batch: &[Command]| {
+            postgres_single_statement(&audit_inserts(batch).expect("a non-empty batch"))
+        };
+
+        let get = ability("tinycloud.kv/get");
+        let batch = vec![command(rich_record(
+            "shape",
+            "did:key:shape",
+            vec![(
+                resource("tinycloud:did:key:ne-delegator:files/kv/a"),
+                get.clone(),
+            )],
+            vec![crate::hash::hash(b"parent")],
+        ))];
+        let sql = single_statement(&batch)
+            .expect("an ordinary batch is one statement")
+            .sql;
+        assert!(sql.starts_with("WITH "), "{sql}");
+        for table in [
+            r#"INSERT INTO "actor""#,
+            r#"INSERT INTO "invoked_abilities""#,
+            r#"INSERT INTO "parent_delegation""#,
+            r#"INSERT INTO "invocation""#,
+        ] {
+            assert_eq!(sql.matches(table).count(), 1, "{table}: {sql}");
+        }
+        assert_eq!(sql.matches("ON CONFLICT").count(), 4, "{sql}");
+        assert!(!sql.contains("RETURNING"), "{sql}");
+
+        // 6 parameters for the actor and invocation, 3 per invoked ability:
+        // past 65,535 the batch takes the transactional path instead.
+        let fits = (65_535 - 6) / 3;
+        let abilities = |count: usize| {
+            (0..count)
+                .map(|index| {
+                    (
+                        resource(&format!("tinycloud:did:key:ne-delegator:files/kv/{index}")),
+                        get.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let at_limit = vec![command(rich_record(
+            "at-limit",
+            "did:key:limit",
+            abilities(fits),
+            vec![],
+        ))];
+        assert!(single_statement(&at_limit).is_some());
+        let past_limit = vec![command(rich_record(
+            "past-limit",
+            "did:key:limit",
+            abilities(fits + 1),
+            vec![],
+        ))];
+        assert!(single_statement(&past_limit).is_none());
     }
 }
