@@ -139,7 +139,7 @@ secret = "{}"
         .merge(Toml::string(&config_overlay));
     let mut tinycloud_config = figment.extract::<tinycloud::config::Config>()?;
     tinycloud_config.storage.resolve();
-    let rocket = tinycloud::app(&figment, &tinycloud_config, None).await?;
+    let rocket = tinycloud::app_with_control(&figment, &tinycloud_config, None).await?;
 
     let sql_service = rocket
         .state::<SqlService>()
@@ -255,7 +255,11 @@ secret = "{}"
         issuer: holder_verification_method.parse::<DIDURLBuf>()?,
         audience: holder_did.parse::<DIDBuf>()?,
         not_before: None,
-        expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
+        // Under the node's 300 s invocation lifetime cap
+        // (config.invocation.max_lifetime_secs).
+        expiration: NumericDate::try_from_seconds(
+            time::OffsetDateTime::now_utc().unix_timestamp() as f64 + 250.0,
+        )?,
         nonce: Some("urn:uuid:00000000-0000-4000-8000-0000000000w5".to_string()),
         facts: Some(Vec::<serde_json::Value>::new()),
         proof: vec![parent_cid],
@@ -308,7 +312,9 @@ secret = "{}"
         issuer: holder_verification_method.parse::<DIDURLBuf>()?,
         audience: holder_did.parse::<DIDBuf>()?,
         not_before: None,
-        expiration: NumericDate::try_from_seconds(4_102_444_800.0)?,
+        expiration: NumericDate::try_from_seconds(
+            time::OffsetDateTime::now_utc().unix_timestamp() as f64 + 250.0,
+        )?,
         nonce: Some("urn:uuid:00000000-0000-4000-8000-0000000001w5".to_string()),
         facts: Some(Vec::<serde_json::Value>::new()),
         proof: vec![parent_cid],
