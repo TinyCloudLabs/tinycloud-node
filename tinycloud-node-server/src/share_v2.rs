@@ -4655,6 +4655,7 @@ mod tests {
             &key_setup,
             Arc::new(tinycloud.clone()),
             sql_service,
+            false,
         )
         .expect("v1 composition must not error when authority material is simply absent");
         assert!(

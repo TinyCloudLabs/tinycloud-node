@@ -116,10 +116,41 @@ enum InvokeMode {
     /// Pre-authorized by a trusted application protocol seam
     /// (`invoke_internal_kv_put`). Skips the full UCAN validator entirely.
     Internal,
+    /// Fixed native meeting publication; the only writer of immutable snapshot keys.
+    MeetingPublication,
     /// Envelope already verified once at admission. Authorization,
     /// revocation, caveat containment, and signed-time validity are still
     /// re-checked at execution; only the signature check is skipped.
     Admitted,
+}
+
+fn meeting_snapshot_write_allowed(mode: InvokeMode, path: &str) -> bool {
+    mode == InvokeMode::MeetingPublication
+        || !crate::sql::publication::protected_snapshot_path(path)
+}
+
+#[cfg(test)]
+mod meeting_snapshot_fence_tests {
+    use super::*;
+    #[test]
+    fn publication_snapshot_prefix_rejects_legacy_and_share_writes() {
+        let path = "xyz.tinycloud.tinychat/connectors/fireflies/snapshot/source/digest";
+        for mode in [
+            InvokeMode::Public,
+            InvokeMode::Admitted,
+            InvokeMode::Internal,
+        ] {
+            assert!(!meeting_snapshot_write_allowed(mode, path));
+        }
+        assert!(meeting_snapshot_write_allowed(
+            InvokeMode::MeetingPublication,
+            path
+        ));
+        assert!(meeting_snapshot_write_allowed(
+            InvokeMode::Public,
+            "xyz.tinycloud.tinychat/connectors/fireflies/transcript/source"
+        ));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +165,7 @@ pub struct SpaceDatabase<C, B, S> {
     space_sequence_locks: SpaceSequenceLockRegistry,
     writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
     read_audit: ReadAuditPipeline,
+    database_fence_cache: Arc<crate::database_migration::EffectiveFenceCache>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,6 +274,10 @@ where
     Io(#[from] std::io::Error),
     #[error("Missing Input for requested action")]
     MissingInput,
+    #[error("meeting snapshot keys require the native publication boundary")]
+    MeetingSnapshotProtected,
+    #[error("legacy meeting artifacts are frozen")]
+    LegacyMeetingFrozen,
     #[error("KV precondition failed")]
     KvPreconditionFailed,
     #[error("KV response is {size} bytes, exceeding the requested limit of {limit} bytes")]
@@ -295,6 +331,9 @@ impl<B, K> SpaceDatabase<DatabaseConnection, B, K> {
             space_sequence_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             writer_lock,
             read_audit,
+            database_fence_cache: Arc::new(
+                crate::database_migration::EffectiveFenceCache::default(),
+            ),
         })
     }
 
@@ -312,6 +351,16 @@ impl<B, K> SpaceDatabase<DatabaseConnection, B, K> {
     /// the same SeaORM connection outside `SpaceDatabase`.
     pub fn sqlite_writer_lock(&self) -> Option<Arc<tokio::sync::Mutex<()>>> {
         self.writer_lock.clone()
+    }
+
+    /// Check the configured, metadata, and unmigrated-artifact SQL/DuckDB fences.
+    pub async fn effective_database_fence(
+        &self,
+        configured: bool,
+    ) -> Result<bool, crate::database_migration::MigrationError> {
+        self.database_fence_cache
+            .check(&self.conn, configured)
+            .await
     }
 }
 
@@ -349,6 +398,11 @@ impl<C, B, K> SpaceDatabase<C, B, K> {
     /// committed alongside ordinary delegation/revocation writes.
     pub fn connection(&self) -> &C {
         &self.conn
+    }
+
+    /// Share the SQL/DuckDB cutover fence cache with all node data paths.
+    pub fn database_fence_cache(&self) -> Arc<crate::database_migration::EffectiveFenceCache> {
+        Arc::clone(&self.database_fence_cache)
     }
 
     /// Acquire the in-process sequence lock of every space in `spaces`, in a
@@ -394,6 +448,41 @@ impl<C, B, K> SpaceDatabase<C, B, K>
 where
     C: TransactionTrait,
 {
+    /// Change the legacy artifact barrier. Freeze commit is the drain acknowledgement.
+    pub async fn set_legacy_meeting_write_freeze(
+        &self,
+        space: &SpaceId,
+        frozen: bool,
+        expected_generation: i64,
+    ) -> Result<crate::meeting_legacy_guard::FreezeStatus, crate::meeting_legacy_guard::FreezeError>
+    where
+        C: ConnectionTrait,
+    {
+        let _writer = match &self.writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        let tx = self
+            .conn
+            .begin_with_config(chain_isolation_level(&self.conn), None)
+            .await?;
+        let status =
+            crate::meeting_legacy_guard::transition(&tx, space, frozen, expected_generation)
+                .await?;
+        tx.commit().await?;
+        Ok(status)
+    }
+
+    pub async fn legacy_meeting_freeze_status(
+        &self,
+        space: &SpaceId,
+    ) -> Result<crate::meeting_legacy_guard::FreezeStatus, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        crate::meeting_legacy_guard::status(&self.conn, space).await
+    }
+
     // to allow users to make custom read queries
     pub async fn readable(&self) -> Result<DatabaseTransaction, DbErr> {
         self.conn
@@ -1342,6 +1431,88 @@ where
         S: ImmutableStaging,
         S::Writable: 'static + Unpin,
     {
+        self.invoke_internal_kv_change::<S>(
+            space,
+            path,
+            metadata,
+            Some(stage),
+            precondition,
+            InvokeMode::Internal,
+        )
+        .await
+        .and_then(|hash| hash.ok_or(TxStoreError::MissingInput))
+    }
+    pub async fn invoke_internal_meeting_snapshot_put<S>(
+        &self,
+        space: SpaceId,
+        path: Path,
+        metadata: Metadata,
+        stage: HashBuffer<S::Writable>,
+        precondition: Option<KvPrecondition>,
+    ) -> Result<Hash, TxStoreError<B, S, K>>
+    where
+        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
+        if !crate::sql::publication::protected_snapshot_path(path.as_str()) {
+            return Err(TxStoreError::MeetingSnapshotProtected);
+        }
+        self.invoke_internal_kv_change::<S>(
+            space,
+            path,
+            metadata,
+            Some(stage),
+            precondition,
+            InvokeMode::MeetingPublication,
+        )
+        .await
+        .and_then(|hash| hash.ok_or(TxStoreError::MissingInput))
+    }
+    pub async fn invoke_internal_meeting_snapshot_delete<S>(
+        &self,
+        space: SpaceId,
+        path: Path,
+    ) -> Result<(), TxStoreError<B, S, K>>
+    where
+        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
+        if !crate::sql::publication::connector_owned_path(path.as_str()) {
+            return Err(TxStoreError::MeetingSnapshotProtected);
+        }
+        self.invoke_internal_kv_change::<S>(
+            space,
+            path,
+            Metadata(Default::default()),
+            None,
+            None,
+            InvokeMode::MeetingPublication,
+        )
+        .await
+        .map(|_| ())
+        .or_else(|error| match error {
+            TxStoreError::Tx(TxError::InvalidInvocation(
+                crate::models::invocation::InvocationError::MissingKvWrite(_),
+            )) => Ok(()),
+            error => Err(error),
+        })
+    }
+    async fn invoke_internal_kv_change<S>(
+        &self,
+        space: SpaceId,
+        path: Path,
+        metadata: Metadata,
+        stage: Option<HashBuffer<S::Writable>>,
+        precondition: Option<KvPrecondition>,
+        mode: InvokeMode,
+    ) -> Result<Option<Hash>, TxStoreError<B, S, K>>
+    where
+        B: ImmutableWriteStore<S> + ImmutableReadStore,
+        S: ImmutableStaging,
+        S::Writable: 'static + Unpin,
+    {
         let jwk = tinycloud_auth::ssi::jwk::JWK::generate_ed25519()
             .map_err(|_| TxStoreError::MissingInput)?;
         let mut verification_method = tinycloud_auth::resolver::DID_METHODS
@@ -1368,9 +1539,13 @@ where
         let invocation = make_invocation(
             vec![(
                 resource,
-                vec!["tinycloud.kv/put"
-                    .parse::<tinycloud_auth::ucan_capabilities_object::Ability>()
-                    .map_err(|_| TxStoreError::MissingInput)?],
+                vec![(if stage.is_some() {
+                    "tinycloud.kv/put"
+                } else {
+                    "tinycloud.kv/del"
+                })
+                .parse::<tinycloud_auth::ucan_capabilities_object::Ability>()
+                .map_err(|_| TxStoreError::MissingInput)?],
             )],
             &delegation,
             &jwk,
@@ -1390,7 +1565,9 @@ where
             .into_bytes();
         let invocation = crate::events::SerializedEvent(info, serialized);
         let mut inputs = HashMap::new();
-        inputs.insert((space, path), (metadata, stage));
+        if let Some(stage) = stage {
+            inputs.insert((space.clone(), path.clone()), (metadata, stage));
+        }
         let mut options = KvInvokeOptions::default();
         if let Some(precondition) = precondition {
             let key = inputs
@@ -1401,12 +1578,13 @@ where
             options.preconditions.insert(key, precondition);
         }
         let (_, mut outcomes) = self
-            .invoke_with_options_internal(invocation, inputs, options)
+            .invoke_with_options_mode(invocation, inputs, options, mode)
             .await?;
         let result = outcomes
             .drain(..)
             .find_map(|outcome| match outcome {
-                InvocationOutcome::KvWrite(hash) => Some(hash),
+                InvocationOutcome::KvWrite(hash) => Some(Some(hash)),
+                InvocationOutcome::KvDelete(hash) => Some(hash),
                 _ => None,
             })
             .ok_or(TxStoreError::MissingInput);
@@ -1678,21 +1856,6 @@ where
             .await
     }
 
-    async fn invoke_with_options_internal<S>(
-        &self,
-        invocation: Invocation,
-        inputs: InvocationInputs<S::Writable>,
-        options: KvInvokeOptions,
-    ) -> Result<(TransactResult, Vec<InvocationOutcome<B::Readable>>), TxStoreError<B, S, K>>
-    where
-        B: ImmutableWriteStore<S> + ImmutableReadStore,
-        S: ImmutableStaging,
-        S::Writable: 'static + Unpin,
-    {
-        self.invoke_with_options_mode(invocation, inputs, options, InvokeMode::Internal)
-            .await
-    }
-
     async fn invoke_with_options_mode<S>(
         &self,
         invocation: Invocation,
@@ -1706,7 +1869,8 @@ where
         S::Writable: 'static + Unpin,
     {
         // TC-732: a `kv/sync` invocation must be exactly one capability on a
-        // non-empty KV prefix; anything else is rejected before any work.
+        // KV resource (the root resource is the whole-space feed); anything
+        // else is rejected before any work.
         let sync_target =
             kv_sync_target(&invocation.0).map_err(TxStoreError::KvSyncInvalidRequest)?;
         // TC-732 addendum: reject a list cursor outside its prefix before any
@@ -1723,6 +1887,23 @@ where
             });
             if outside {
                 return Err(TxStoreError::KvListCursorOutsidePrefix);
+            }
+        }
+        // Meeting legacy write guard: reject kv/put and kv/del on protected
+        // snapshot paths unless this is the fixed publication mode.
+        for cap in &invocation.0.capabilities {
+            if let Some(resource) = cap.resource.tinycloud_resource() {
+                let ability =
+                    crate::policy_capability::resolve_alias(cap.ability.as_ref().as_ref());
+                if resource.service().as_str() == "kv"
+                    && matches!(ability, "tinycloud.kv/put" | "tinycloud.kv/del")
+                {
+                    if let Some(path) = resource.path() {
+                        if !meeting_snapshot_write_allowed(mode, path.as_str()) {
+                            return Err(TxStoreError::MeetingSnapshotProtected);
+                        }
+                    }
+                }
             }
         }
         let roots: Vec<Hash> = invocation
@@ -1873,7 +2054,26 @@ where
             begin_start.elapsed(),
         );
         let tx = tx_result?;
+        // TC-732: order this transaction's event sequence under the
+        // per-space lock. On PostgreSQL this is an advisory lock, so the
+        // meeting legacy guard lock below is still the first row lock.
         crate::kv_sync::lock_space_sequences(&tx, &sequence_spaces).await?;
+        // This must be the transaction's FIRST row lock / first database
+        // operation on SQLite: a preceding SQLite read would permit a
+        // read-to-write upgrade race. Distinct spaces are locked in a stable
+        // order to prevent cross-space deadlocks on PG.
+        let mut legacy_spaces: Vec<_> = mutation_keys
+            .iter()
+            .filter(|(_, path)| crate::meeting_legacy_guard::protects(path.as_str()))
+            .map(|(space, _)| space)
+            .collect();
+        legacy_spaces.sort_by_key(|space| space.to_string());
+        legacy_spaces.dedup();
+        for space in legacy_spaces {
+            if crate::meeting_legacy_guard::lock_writer(&tx, space).await? {
+                return Err(TxStoreError::LegacyMeetingFrozen);
+            }
+        }
         // DbTxBody spans post-begin to pre-commit. The guard defaults to an
         // `error` outcome so any `?`/early return inside the transaction is
         // recorded as a failure; it is disarmed to `ok` right before commit.
@@ -1935,7 +2135,9 @@ where
             });
         //  verify and commit invocation and kv operations
         let event = match mode {
-            InvokeMode::Internal => Event::InternalInvocation(Box::new(invocation), ops),
+            InvokeMode::Internal | InvokeMode::MeetingPublication => {
+                Event::InternalInvocation(Box::new(invocation), ops)
+            }
             InvokeMode::Admitted => Event::AdmittedInvocation(Box::new(invocation), ops),
             InvokeMode::Public => Event::Invocation(Box::new(invocation), ops),
         };
@@ -2129,7 +2331,7 @@ where
                     .await
                     .map_err(TxError::<B, K>::from)?
             }
-            InvokeMode::Public | InvokeMode::Internal => {
+            InvokeMode::Public | InvokeMode::Internal | InvokeMode::MeetingPublication => {
                 invocation::verify_and_authorize_with_graph(
                     &self.conn,
                     &invocation.0,
@@ -2338,9 +2540,9 @@ where
 type KvSyncTarget = (SpaceId, Path, Resource);
 
 /// The target of a `tinycloud.kv/sync` invocation, or `None` when it invokes
-/// no `kv/sync`. A `kv/sync` must be the invocation's only capability and name
-/// a non-empty KV prefix: the cursor, the authority window and the read audit
-/// all describe exactly one feed.
+/// no `kv/sync`. A root resource is canonicalized to an empty prefix and a
+/// pathless `kv` resource, so cursors, authority, and retention describe one
+/// stable whole-space feed regardless of `{space}/kv` vs `{space}/kv/`.
 fn kv_sync_target(
     invocation: &crate::util::InvocationInfo,
 ) -> Result<Option<KvSyncTarget>, &'static str> {
@@ -2358,16 +2560,21 @@ fn kv_sync_target(
         .resource
         .tinycloud_resource()
         .and_then(|resource| {
-            let path = resource.path()?;
             (resource.service().as_str() == "kv"
-                && !path.as_str().is_empty()
                 && resource.query().is_none()
                 && resource.fragment().is_none())
-            .then(|| (resource.space().clone(), path.clone()))
+            .then(|| {
+                let prefix = resource
+                    .path()
+                    .cloned()
+                    .unwrap_or_else(|| "".parse().expect("empty Path is valid"));
+                let canonical_resource = Resource::TinyCloud(resource.canonicalize_kv_root());
+                (resource.space().clone(), prefix, canonical_resource)
+            })
         });
     match target {
-        Some((space, prefix)) => Ok(Some((space, prefix, capability.resource.clone()))),
-        None => Err("tinycloud.kv/sync requires a non-empty KV prefix"),
+        Some((space, prefix, resource)) => Ok(Some((space, prefix, resource))),
+        None => Err("tinycloud.kv/sync requires a KV resource without query or fragment"),
     }
 }
 
@@ -4270,6 +4477,475 @@ mod test {
     #[tokio::test]
     async fn basic() {
         let _db = get_db().await.unwrap();
+    }
+
+    async fn frozen_legacy_fixture() -> (
+        SpaceDatabase<sea_orm::DbConn, MemoryStore, StaticSecret>,
+        SpaceId,
+    ) {
+        let db = get_db().await.unwrap();
+        let space = test_space_id("legacy-freeze");
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+        db.conn.execute_unprepared("CREATE TABLE IF NOT EXISTS meeting_legacy_write_guard(space TEXT PRIMARY KEY, frozen BOOLEAN NOT NULL)").await.unwrap();
+        db.conn
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO meeting_legacy_write_guard(space,frozen) VALUES(?,true)",
+                [space.to_string().into()],
+            ))
+            .await
+            .unwrap();
+        (db, space)
+    }
+
+    #[tokio::test]
+    async fn legacy_freeze_rejects_internal_put_from_durable_guard() {
+        use futures::io::AsyncWriteExt;
+        let (db, space) = frozen_legacy_fixture().await;
+        let mut stage = HashBuffer::new(Vec::new());
+        stage
+            .write_all(b"original must stay unchanged")
+            .await
+            .unwrap();
+        let result = db
+            .invoke_internal_kv_put::<crate::storage::memory::MemoryStaging>(
+                space,
+                "xyz.tinycloud.tinychat/connectors/fireflies/transcript/old"
+                    .parse()
+                    .unwrap(),
+                Metadata(Default::default()),
+                stage,
+                None,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "persisted freeze must reject an internal legacy put"
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("legacy meeting artifacts are frozen"));
+    }
+
+    #[tokio::test]
+    async fn legacy_freeze_rejects_native_cleanup_even_when_key_is_absent() {
+        let (db, space) = frozen_legacy_fixture().await;
+        let result = db
+            .invoke_internal_meeting_snapshot_delete::<crate::storage::memory::MemoryStaging>(
+                space,
+                "xyz.tinycloud.tinychat/connectors/google-meet/meeting/old"
+                    .parse()
+                    .unwrap(),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "native cleanup must not bypass a persisted legacy freeze"
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("legacy meeting artifacts are frozen"));
+    }
+
+    fn legacy_test_invocation(space: &SpaceId, path: &Path, ability: &str) -> Invocation {
+        let jwk = JWK::generate_ed25519().unwrap();
+        let did = DID_METHODS.generate(&jwk, "key").unwrap().to_string();
+        let verification_method = format!("{did}#{}", did.rsplit(':').next().unwrap());
+        let delegation = tinycloud_auth::ipld_core::cid::Cid::new_v1(
+            0x55,
+            tinycloud_auth::multihash_codetable::Code::Blake3_256.digest(b"legacy-freeze-test"),
+        );
+        let signed = make_invocation(
+            vec![(
+                space
+                    .clone()
+                    .to_resource("kv".parse().unwrap(), Some(path.clone()), None, None),
+                vec![ability.parse().unwrap()],
+            )],
+            &delegation,
+            &jwk,
+            &verification_method,
+            (OffsetDateTime::now_utc() + time::Duration::minutes(5)).unix_timestamp() as f64,
+            InvocationOptions {
+                proof: Some(vec![]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let encoded = signed.encode().unwrap().into_bytes();
+        crate::events::SerializedEvent(
+            crate::util::InvocationInfo::try_from(signed).unwrap(),
+            encoded,
+        )
+    }
+
+    #[tokio::test]
+    async fn legacy_freeze_covers_public_admitted_put_delete_and_deprecated_delete() {
+        use crate::storage::memory::MemoryStaging;
+        use futures::io::AsyncWriteExt;
+        let (db, space) = frozen_legacy_fixture().await;
+        let path: Path = "xyz.tinycloud.tinychat/connectors/fireflies/archive-copy/transcript/old"
+            .parse()
+            .unwrap();
+        for ability in [
+            "tinycloud.kv/put",
+            "tinycloud.kv/del",
+            "tinycloud.kv/delete",
+        ] {
+            for admitted in [false, true] {
+                let invocation = legacy_test_invocation(&space, &path, ability);
+                let mut inputs = HashMap::new();
+                if ability == "tinycloud.kv/put" {
+                    let mut stage = HashBuffer::new(Vec::new());
+                    stage.write_all(b"replacement").await.unwrap();
+                    inputs.insert(
+                        (space.clone(), path.clone()),
+                        (Metadata(Default::default()), stage),
+                    );
+                }
+                let result = if admitted {
+                    db.invoke_admitted::<MemoryStaging>(
+                        AdmittedInvocation::admit(invocation, 600).await.unwrap(),
+                        inputs,
+                    )
+                    .await
+                } else {
+                    db.invoke::<MemoryStaging>(invocation, inputs).await
+                };
+                assert!(
+                    matches!(result, Err(TxStoreError::LegacyMeetingFrozen)),
+                    "{ability} admitted={admitted}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_freeze_preserves_artifacts_but_allows_cursor_chat_other_space_and_native_snapshot(
+    ) {
+        use crate::storage::memory::MemoryStaging;
+        use futures::io::AsyncWriteExt;
+        let db = get_db().await.unwrap();
+        let space = test_space_id("legacy-scope");
+        let other = test_space_id("legacy-other");
+        for id in [&space, &other] {
+            space::ActiveModel {
+                id: Set(SpaceIdWrap(id.clone())),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+        }
+        let mut keys = vec![];
+        for source in ["fireflies", "google-meet", "tinycloud-transcriber"] {
+            for family in ["transcript", "meeting", "archive-copy/transcript"] {
+                let path: Path = format!("xyz.tinycloud.tinychat/connectors/{source}/{family}/old")
+                    .parse()
+                    .unwrap();
+                let mut stage = HashBuffer::new(Vec::new());
+                stage.write_all(b"original exact bytes\r\n").await.unwrap();
+                let hash = db
+                    .invoke_internal_kv_put::<MemoryStaging>(
+                        space.clone(),
+                        path.clone(),
+                        Metadata(Default::default()),
+                        stage,
+                        None,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())
+                    .unwrap();
+                keys.push((path, hash));
+            }
+        }
+        db.set_legacy_meeting_write_freeze(&space, true, 0)
+            .await
+            .unwrap();
+        for (path, hash) in keys {
+            let mut stage = HashBuffer::new(Vec::new());
+            stage.write_all(b"changed").await.unwrap();
+            let put = db
+                .invoke_internal_kv_put::<MemoryStaging>(
+                    space.clone(),
+                    path.clone(),
+                    Metadata(Default::default()),
+                    stage,
+                    None,
+                )
+                .await;
+            assert!(matches!(put, Err(TxStoreError::LegacyMeetingFrozen)));
+            let delete = db
+                .invoke_internal_meeting_snapshot_delete::<MemoryStaging>(
+                    space.clone(),
+                    path.clone(),
+                )
+                .await;
+            assert!(matches!(delete, Err(TxStoreError::LegacyMeetingFrozen)));
+            assert_eq!(db.kv_get(&space, &path).await.unwrap().unwrap().1, hash);
+        }
+        for (id, key, native) in [
+            (
+                &space,
+                "xyz.tinycloud.tinychat/connectors/google-meet/drive-page-token",
+                false,
+            ),
+            (&space, "xyz.tinycloud.tinychat/chat/thread", false),
+            (
+                &other,
+                "xyz.tinycloud.tinychat/connectors/fireflies/transcript/other",
+                false,
+            ),
+            (
+                &space,
+                "xyz.tinycloud.tinychat/connectors/fireflies/snapshot/new/revision",
+                true,
+            ),
+        ] {
+            let path: Path = key.parse().unwrap();
+            let mut stage = HashBuffer::new(Vec::new());
+            stage.write_all(b"allowed").await.unwrap();
+            if native {
+                db.invoke_internal_meeting_snapshot_put::<MemoryStaging>(
+                    id.clone(),
+                    path.clone(),
+                    Metadata(Default::default()),
+                    stage,
+                    None,
+                )
+                .await
+                .map_err(|e| e.to_string())
+                .unwrap();
+                db.invoke_internal_meeting_snapshot_delete::<MemoryStaging>(id.clone(), path)
+                    .await
+                    .map_err(|e| e.to_string())
+                    .unwrap();
+            } else {
+                db.invoke_internal_kv_put::<MemoryStaging>(
+                    id.clone(),
+                    path,
+                    Metadata(Default::default()),
+                    stage,
+                    None,
+                )
+                .await
+                .map_err(|e| e.to_string())
+                .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_freeze_guard_database_failure_rejects_internal_write() {
+        use futures::io::AsyncWriteExt;
+        let (db, space) = frozen_legacy_fixture().await;
+        db.conn
+            .execute_unprepared("DROP TABLE meeting_legacy_write_guard")
+            .await
+            .unwrap();
+        assert!(db.legacy_meeting_freeze_status(&space).await.is_err());
+        let mut stage = HashBuffer::new(Vec::new());
+        stage.write_all(b"must not save").await.unwrap();
+        let result = db
+            .invoke_internal_kv_put::<crate::storage::memory::MemoryStaging>(
+                space,
+                "xyz.tinycloud.tinychat/connectors/fireflies/transcript/old"
+                    .parse()
+                    .unwrap(),
+                Metadata(Default::default()),
+                stage,
+                None,
+            )
+            .await;
+        assert!(matches!(result, Err(TxStoreError::Tx(TxError::Db(_)))));
+    }
+
+    #[derive(Clone, Default)]
+    struct LegacyPausedStore {
+        inner: MemoryStore,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait::async_trait]
+    impl StorageSetup for LegacyPausedStore {
+        type Error = std::io::Error;
+        async fn create(&self, space: &SpaceId) -> Result<(), Self::Error> {
+            self.inner.create(space).await
+        }
+    }
+    #[async_trait::async_trait]
+    impl ImmutableReadStore for LegacyPausedStore {
+        type Error = std::io::Error;
+        type Readable = futures::io::Cursor<Vec<u8>>;
+        async fn contains(&self, space: &SpaceId, hash: &Hash) -> Result<bool, Self::Error> {
+            self.inner.contains(space, hash).await
+        }
+        async fn read(
+            &self,
+            space: &SpaceId,
+            hash: &Hash,
+        ) -> Result<Option<Content<Self::Readable>>, Self::Error> {
+            self.inner.read(space, hash).await
+        }
+        async fn read_range(
+            &self,
+            space: &SpaceId,
+            hash: &Hash,
+            range: crate::storage::ByteRangeSpec,
+        ) -> Result<Option<crate::storage::RangeRead<Self::Readable>>, Self::Error> {
+            self.inner.read_range(space, hash, range).await
+        }
+    }
+    #[async_trait::async_trait]
+    impl ImmutableWriteStore<crate::storage::memory::MemoryStaging> for LegacyPausedStore {
+        type Error = std::io::Error;
+        async fn persist(
+            &self,
+            space: &SpaceId,
+            stage: HashBuffer<Vec<u8>>,
+        ) -> Result<Hash, Self::Error> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.inner.persist(space, stage).await
+        }
+    }
+    #[tokio::test]
+    async fn legacy_freeze_ack_waits_for_actual_in_flight_kv_storage_and_commit() {
+        use crate::storage::memory::MemoryStaging;
+        use futures::io::AsyncWriteExt;
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("native.sqlite").display()
+        );
+        let storage = LegacyPausedStore::default();
+        let first = SpaceDatabase::new(
+            Database::connect(url.clone()).await.unwrap(),
+            storage.clone(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        // Independent DB pool and process-local mutex: only the durable lock can order these.
+        let second = SpaceDatabase::new(
+            Database::connect(url).await.unwrap(),
+            storage.clone(),
+            StaticSecret::new(vec![0; 32]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let space = test_space_id("legacy-actual-in-flight");
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&first.conn)
+        .await
+        .unwrap();
+        let path: Path = "xyz.tinycloud.tinychat/connectors/fireflies/transcript/inflight"
+            .parse()
+            .unwrap();
+        let writer_space = space.clone();
+        let writer_path = path.clone();
+        let writer = tokio::spawn(async move {
+            let mut stage = HashBuffer::new(Vec::new());
+            stage.write_all(b"in-flight original").await.unwrap();
+            first
+                .invoke_internal_kv_put::<MemoryStaging>(
+                    writer_space,
+                    writer_path,
+                    Metadata(Default::default()),
+                    stage,
+                    None,
+                )
+                .await
+                .map_err(|e| e.to_string())
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            storage.entered.notified(),
+        )
+        .await
+        .unwrap();
+        let freeze_space = space.clone();
+        let freeze_db = second.clone();
+        let mut freeze = tokio::spawn(async move {
+            freeze_db
+                .set_legacy_meeting_write_freeze(&freeze_space, true, 0)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut freeze)
+                .await
+                .is_err()
+        );
+        storage.release.notify_one();
+        let original_hash = tokio::time::timeout(std::time::Duration::from_secs(10), writer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), freeze)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .frozen
+        );
+        assert_eq!(
+            second.kv_get(&space, &path).await.unwrap().unwrap().1,
+            original_hash
+        );
+        let mut stage = HashBuffer::new(Vec::new());
+        stage.write_all(b"too late").await.unwrap();
+        assert!(matches!(
+            second
+                .invoke_internal_kv_put::<MemoryStaging>(
+                    space,
+                    path,
+                    Metadata(Default::default()),
+                    stage,
+                    None
+                )
+                .await,
+            Err(TxStoreError::LegacyMeetingFrozen)
+        ));
+    }
+
+    #[tokio::test]
+    async fn publication_cleanup_accepts_already_absent_legacy_keys() {
+        use sea_orm::ActiveValue::Set;
+        let db = get_db().await.map_err(|error| error.to_string()).unwrap();
+        let space = test_space_id("publication-delete-absent");
+        space::ActiveModel {
+            id: Set(SpaceIdWrap(space.clone())),
+        }
+        .insert(&db.conn)
+        .await
+        .map_err(|error| error.to_string())
+        .unwrap();
+        let key: Path = "xyz.tinycloud.tinychat/connectors/fireflies/transcript/absent"
+            .parse()
+            .unwrap();
+        db.invoke_internal_meeting_snapshot_delete::<crate::storage::memory::MemoryStaging>(
+            space.clone(),
+            key.clone(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+        .unwrap();
+        db.invoke_internal_meeting_snapshot_delete::<crate::storage::memory::MemoryStaging>(
+            space, key,
+        )
+        .await
+        .map_err(|error| error.to_string())
+        .unwrap();
     }
 
     #[test]

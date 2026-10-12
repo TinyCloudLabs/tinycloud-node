@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use rocket::http::Status;
 use time::{Duration, OffsetDateTime};
@@ -40,11 +40,22 @@ pub enum InvocationReplayError {
 #[derive(Clone)]
 pub struct InvocationReplayCache {
     conn: DatabaseConnection,
+    sqlite_writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl InvocationReplayCache {
     pub fn new(conn: DatabaseConnection) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            sqlite_writer_lock: None,
+        }
+    }
+
+    /// Replay writes share the node's SQLite gate with delegation transactions
+    /// so they cannot invalidate a transaction's read-before-write snapshot.
+    pub fn with_sqlite_writer_lock(mut self, lock: Option<Arc<tokio::sync::Mutex<()>>>) -> Self {
+        self.sqlite_writer_lock = lock;
+        self
     }
 
     /// Record an admitted invocation in the durable replay table.
@@ -105,6 +116,10 @@ impl InvocationReplayCache {
         key: Hash,
         expires_at: OffsetDateTime,
     ) -> Result<(), InvocationReplayError> {
+        let _writer = match &self.sqlite_writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         let inserted = invocation_replay::Entity::insert(invocation_replay::ActiveModel {
             content_hash: Set(key),
             expires_at: Set(expires_at),
@@ -141,6 +156,10 @@ impl InvocationReplayCache {
         now: OffsetDateTime,
         max_lifetime_secs: u64,
     ) -> Result<u64, InvocationReplayError> {
+        let _writer = match &self.sqlite_writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         invocation_replay::Entity::delete_many()
             .filter(
                 Condition::any()
@@ -272,6 +291,105 @@ mod tests {
         let db = connect_database("sqlite::memory:").await;
         Migrator::up(&db, None).await.unwrap();
         db
+    }
+
+    #[tokio::test]
+    async fn replay_insert_cannot_invalidate_a_delegation_write_snapshot() {
+        use tinycloud_core::models::{actor, delegation};
+        use tinycloud_core::sea_orm::ActiveModelTrait;
+        use tinycloud_core::storage::{either::Either, StorageConfig};
+
+        let directory = tempfile::tempdir().unwrap();
+        let url = format!(
+            "sqlite:{}?mode=rwc",
+            directory.path().join("caps.db").display()
+        );
+        let connection = Database::connect(crate::sqlite_connect_options(&url))
+            .await
+            .unwrap();
+        let storage =
+            crate::storage::file_system::FileSystemConfig::new(directory.path().join("blocks"))
+                .open()
+                .await
+                .unwrap();
+        let node = crate::TinyCloud::new(
+            connection,
+            Either::B(storage),
+            tinycloud_core::keys::StaticSecret::new(vec![7u8; 64]).unwrap(),
+        )
+        .await
+        .unwrap();
+        // Reuse the production pool configuration and cache constructor without
+        // starting the process-global log collector in a parallel unit suite.
+        let replay = crate::node_replay_cache(&node);
+        let actor_id = "did:key:sqlite-race-fixture";
+        actor::ActiveModel {
+            id: Set(actor_id.to_owned()),
+        }
+        .insert(node.connection())
+        .await
+        .unwrap();
+        replay
+            .check_and_insert_key(
+                hash(b"expired-replay"),
+                OffsetDateTime::now_utc() - Duration::seconds(1),
+            )
+            .await
+            .unwrap();
+
+        // Delegation transactions hold this gate while reading authority and
+        // then writing graph rows. A replay write between those steps advances
+        // SQLite's WAL and makes the older snapshot fail with code 517.
+        let gate = node.sqlite_writer_lock().unwrap();
+        let writer = gate.lock().await;
+        let transaction = node.readable().await.unwrap();
+        delegation::Entity::find()
+            .count(&transaction)
+            .await
+            .unwrap();
+        let cleanup_replay = replay.clone();
+        let mut insertion = tokio::spawn(async move {
+            replay
+                .check_and_insert_key(
+                    hash(b"concurrent-replay"),
+                    OffsetDateTime::now_utc() + Duration::seconds(60),
+                )
+                .await
+        });
+        let mut cleanup =
+            tokio::spawn(
+                async move { cleanup_replay.cleanup(OffsetDateTime::now_utc(), 300).await },
+            );
+        let early =
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut insertion).await;
+        let early_cleanup =
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut cleanup).await;
+
+        delegation::ActiveModel {
+            id: Set(hash(b"delegation-write-snapshot")),
+            delegator: Set(actor_id.to_owned()),
+            delegatee: Set(actor_id.to_owned()),
+            expiry: Set(None),
+            issued_at: Set(None),
+            not_before: Set(None),
+            facts: Set(None),
+            serialization: Set(b"synthetic database race fixture".to_vec()),
+        }
+        .insert(&transaction)
+        .await
+        .expect("concurrent replay must not invalidate the delegation snapshot");
+        transaction.commit().await.unwrap();
+        assert!(
+            early.is_err(),
+            "replay insertion must wait for the node's writer gate"
+        );
+        assert!(
+            early_cleanup.is_err(),
+            "replay cleanup must wait for the node's writer gate"
+        );
+        drop(writer);
+        insertion.await.unwrap().unwrap();
+        assert_eq!(cleanup.await.unwrap().unwrap(), 1);
     }
 
     #[tokio::test]

@@ -1,7 +1,10 @@
 pub mod abilities;
 pub mod actor;
 pub mod current_kv;
+pub mod database_alias;
 pub mod database_artifact;
+pub mod database_identity_fence;
+pub mod database_legacy_artifact;
 pub mod delegation;
 pub(crate) mod did_resolution;
 pub mod encryption_audit;
@@ -16,6 +19,7 @@ pub mod invocation;
 pub mod invocation_replay;
 pub mod kv_delete;
 pub mod kv_write;
+pub mod meeting_legacy_write_guard;
 pub mod owner_share_policy;
 pub mod policy_challenge;
 pub mod policy_delegation;

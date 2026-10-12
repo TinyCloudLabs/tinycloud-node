@@ -128,7 +128,12 @@ fn holder_invocation(
         issuer: holder_vm.parse::<DIDURLBuf>()?,
         audience: holder_did.parse::<DIDBuf>()?,
         not_before: None,
-        expiration: NumericDate::try_from_seconds(FAR_FUTURE_SECONDS)?,
+        // Under the node's 300 s invocation lifetime cap
+        // (config.invocation.max_lifetime_secs): a far-future exp is rejected
+        // before authorization runs.
+        expiration: NumericDate::try_from_seconds(
+            time::OffsetDateTime::now_utc().unix_timestamp() as f64 + 250.0,
+        )?,
         nonce: Some(nonce.to_string()),
         facts: Some(Vec::<serde_json::Value>::new()),
         proof: vec![parent_cid],
@@ -161,7 +166,7 @@ secret = "{}"
         .merge(Toml::string(&config_overlay));
     let mut tinycloud_config = figment.extract::<tinycloud::config::Config>()?;
     tinycloud_config.storage.resolve();
-    let rocket = tinycloud::app(&figment, &tinycloud_config, None).await?;
+    let rocket = tinycloud::app_with_control(&figment, &tinycloud_config, None).await?;
     let sql_service = rocket
         .state::<SqlService>()
         .context("node app must manage SqlService")?;
@@ -188,7 +193,7 @@ secret = "{}"
     sql_service
         .execute(
             &space_id,
-            "records",
+            &tinycloud_core::database_identity::logical_name(Some("records")),
             SqlRequest::Execute {
                 schema: Some(vec!["CREATE TABLE seed (id INTEGER)".to_string()]),
                 sql: "INSERT INTO seed (id) VALUES (?)".to_string(),

@@ -80,7 +80,7 @@ pub enum InvocationError {
     #[error("Unauthorized Invoker")]
     UnauthorizedInvoker(String),
     #[error("Unauthorized Action: {0} / {1}")]
-    UnauthorizedAction(Resource, Ability),
+    UnauthorizedAction(Box<Resource>, Ability),
     #[error("Cannot find parent delegation")]
     MissingParents,
     #[error("No Such Key: {0}")]
@@ -252,17 +252,51 @@ async fn validate<C: ConnectionTrait>(
     time: Option<OffsetDateTime>,
     auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
 ) -> Result<(), Error> {
+    validate_capabilities(
+        db,
+        &invocation.capabilities,
+        &invocation.invoker,
+        &invocation.parents,
+        time,
+        auth_graph,
+    )
+    .await
+}
+
+/// Whether `holder` holds every capability in `capabilities` at `now` through
+/// `parents`, by exactly the rules an invocation by `holder` citing `parents`
+/// is authorized with: root authority, cited delegatees, revocation of the
+/// whole chain, every chain window, and caveat-aware containment. No signature
+/// is involved; callers use it to check that an object `holder` signed claims
+/// no more authority than `holder` has.
+pub async fn authorize_holder<C: ConnectionTrait>(
+    db: &C,
+    holder: &str,
+    capabilities: &[util::Capability],
+    parents: &[tinycloud_auth::ipld_core::cid::Cid],
+    now: OffsetDateTime,
+) -> Result<(), Error> {
+    validate_capabilities(db, capabilities, holder, parents, Some(now), None).await
+}
+
+async fn validate_capabilities<C: ConnectionTrait>(
+    db: &C,
+    capabilities: &[util::Capability],
+    invoker: &str,
+    parents: &[tinycloud_auth::ipld_core::cid::Cid],
+    time: Option<OffsetDateTime>,
+    auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
+) -> Result<(), Error> {
     // get caps which rely on delegated caps
-    let dependant_caps: Vec<_> = invocation
-        .capabilities
+    let dependant_caps: Vec<_> = capabilities
         .iter()
         .filter(|c| {
             // remove caps for which the invoker is the root authority
-            !is_root_authority(c, &invocation.invoker)
+            !is_root_authority(c, invoker)
         })
         .collect();
 
-    match (dependant_caps.is_empty(), invocation.parents.is_empty()) {
+    match (dependant_caps.is_empty(), parents.is_empty()) {
         // no dependant caps, no parents needed, must be valid
         (true, _) => Ok(()),
         // dependant caps, no parents, invalid
@@ -274,7 +308,7 @@ async fn validate<C: ConnectionTrait>(
             // cited abilities/caveats, revocations) and run every chain
             // check against that single consistent snapshot instead of
             // re-walking the database per parent and per ancestor.
-            let root_ids: Vec<Hash> = invocation.parents.iter().map(|c| Hash::from(*c)).collect();
+            let root_ids: Vec<Hash> = parents.iter().map(|c| Hash::from(*c)).collect();
             let loaded_graph;
             let graph = match auth_graph {
                 Some(graph) => graph,
@@ -305,10 +339,8 @@ async fn validate<C: ConnectionTrait>(
 
             // check parent identifies correct invoker
             for (p, _) in &parents {
-                if !did_principal_matches(&p.delegatee, &invocation.invoker) {
-                    return Err(
-                        InvocationError::UnauthorizedInvoker(invocation.invoker.clone()).into(),
-                    );
+                if !did_principal_matches(&p.delegatee, invoker) {
+                    return Err(InvocationError::UnauthorizedInvoker(invoker.to_owned()).into());
                 }
             }
 
@@ -352,7 +384,7 @@ async fn validate<C: ConnectionTrait>(
                     {
                         return match dependant_caps.first() {
                             Some(capability) => Err(InvocationError::UnauthorizedAction(
-                                capability.resource.clone(),
+                                Box::new(capability.resource.clone()),
                                 capability.ability.clone(),
                             )
                             .into()),
@@ -402,7 +434,7 @@ async fn validate<C: ConnectionTrait>(
 
                 if candidates.peek().is_none() {
                     return Err(InvocationError::UnauthorizedAction(
-                        c.resource.clone(),
+                        Box::new(c.resource.clone()),
                         c.ability.clone(),
                     )
                     .into());
@@ -423,6 +455,40 @@ async fn validate<C: ConnectionTrait>(
                     let reason = last_reason
                         .unwrap_or_else(|| "invocation-caveats-not-subset-of-chain".to_string());
                     return Err(InvocationError::CaveatsNotContained(reason).into());
+                }
+
+                // A pre-N2 SQL/DuckDB child may have been stored under the
+                // old descendant rule. At least one cited proof chain must
+                // contain this invocation at every ancestor up to the space
+                // owner; an owner-issued delegation is the authority
+                // boundary, as at registration. Do not require unrelated
+                // parallel proofs to cover it, and do not combine a valid
+                // ancestor from one proof with caveats from another proof.
+                if matches!(
+                    &c.resource,
+                    Resource::TinyCloud(resource)
+                        if matches!(resource.service().as_str(), "sql" | "duckdb")
+                ) {
+                    let covers = |ability: &abilities::Model| {
+                        c.resource.extends(&ability.resource)
+                            && crate::policy_capability::ability_matches(
+                                ability.ability.as_ref().as_ref(),
+                                c.ability.as_ref().as_ref(),
+                            )
+                            && caveats_contain_child(&ability.caveats, &c.caveats).is_ok()
+                    };
+                    let valid_chain = graph.has_covering_chain(
+                        parents.iter().map(|(parent, _)| parent.id),
+                        covers,
+                        |row| is_root_authority(c, &row.delegator),
+                    );
+                    if !valid_chain {
+                        return Err(InvocationError::UnauthorizedAction(
+                            Box::new(c.resource.clone()),
+                            c.ability.clone(),
+                        )
+                        .into());
+                    }
                 }
             }
             Ok(())
@@ -960,6 +1026,29 @@ mod tests {
             .generate(&JWK::generate_ed25519().unwrap(), "key")
             .unwrap();
         SpaceId::new(did, name.parse().unwrap())
+    }
+
+    #[test]
+    fn authorization_errors_fit_the_inline_result_budget() {
+        // Clippy's default large-error threshold is 128 bytes. Keep the shared
+        // errors below it at their source, including the concrete model wrappers.
+        for (name, size) in [
+            ("InvocationError", std::mem::size_of::<InvocationError>()),
+            ("invocation::Error", std::mem::size_of::<Error>()),
+            (
+                "DelegationError",
+                std::mem::size_of::<crate::models::delegation::DelegationError>(),
+            ),
+            (
+                "delegation::Error",
+                std::mem::size_of::<crate::models::delegation::Error>(),
+            ),
+        ] {
+            assert!(
+                size <= 128,
+                "{name} is {size} bytes, exceeding the 128-byte result budget"
+            );
+        }
     }
 
     fn test_write(space: &SpaceId, key: &str, label: &str, seq: i64) -> kv_write::Model {

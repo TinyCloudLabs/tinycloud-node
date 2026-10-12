@@ -23,6 +23,11 @@ on:
     types: [published]
   workflow_dispatch:
     inputs:
+      rollback_audit_only:
+        description: 'Read-only aggregate meeting rollback inventory; skips image builds and deployment'
+        required: false
+        type: boolean
+        default: false
       include_duckdb:
         description: 'Build images with DuckDB support enabled'
         required: false
@@ -38,8 +43,33 @@ on:
         required: false
         type: boolean
         default: false
+      allow_non_descendant:
+        description: 'Skip the production ancestry guard for a deliberate non-descendant deployment'
+        required: false
+        type: boolean
+        default: false
+      sql_identity_fence:
+        description: 'Keep SQL/DuckDB fenced in the Phala deploy (true until offline verification passes)'
+        required: true
+        type: boolean
+        default: true
       image_version:
         description: 'Manual image version to tag/deploy, without leading v. Must equal the tinycloud-node version in tinycloud-node-server/Cargo.toml at the selected ref. Defaults to the selected ref name.'
+        required: false
+        type: string
+        default: ''
+      deploy_image_digest:
+        description: 'Promote an existing sha256 digest without rebuilding. Requires deploy_phala, matching image_version, and default dstack features.'
+        required: false
+        type: string
+        default: ''
+      rollback_image_version:
+        description: 'Emergency rollback only: version label of the recorded pre-cutover digest; requires allow_non_descendant'
+        required: false
+        type: string
+        default: ''
+      rollback_image_revision:
+        description: 'Emergency rollback only: 40-character revision label of the recorded pre-cutover digest'
         required: false
         type: string
         default: ''
@@ -49,6 +79,26 @@ env:
   IMAGE_NAME: tinycloudlabs/tinycloud-node
 
 jobs:
+  rollback-audit:
+    if: github.event_name == 'workflow_dispatch' && inputs.rollback_audit_only
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit durable meeting publication footprint without exporting data
+        env:
+          RECOVERY_DATABASE_URL: ${{ secrets.PROD_TINYCLOUD_DATABASE_URL }}
+          # libpq needs the public CA bundle explicitly for verify-full;
+          # production's Rust TLS client has compiled-in public roots.
+          PGSSLROOTCERT: /etc/ssl/certs/ca-certificates.crt
+        run: python3 scripts/audit-meeting-rollback.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: meeting-rollback-audit
+          path: meeting-rollback-audit.json
+          if-no-files-found: ignore
   # TC-342: every image tag this workflow can produce must agree with the crate
   # version at the checked-out ref. `image_version` used to be unconstrained
   # free text, which is how an image got labelled 1.10.0 from a tree whose
@@ -68,6 +118,13 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_IMAGE_VERSION: ${{ inputs.image_version }}
+          INPUT_DEPLOY_DIGEST: ${{ inputs.deploy_image_digest }}
+          INPUT_DEPLOY_PHALA: ${{ inputs.deploy_phala }}
+          ALLOW_NON_DESCENDANT: ${{ inputs.allow_non_descendant }}
+          ROLLBACK_VERSION: ${{ inputs.rollback_image_version }}
+          ROLLBACK_REVISION: ${{ inputs.rollback_image_revision }}
+          INCLUDE_DUCKDB: ${{ inputs.include_duckdb }}
+          INCLUDE_TC_BENCH_V1: ${{ inputs.include_tc_bench_v1 }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
@@ -101,10 +158,28 @@ jobs:
           if [ -n "${INPUT_IMAGE_VERSION}" ]; then
             check_matches "image_version input" "${INPUT_IMAGE_VERSION}"
           fi
+          if [ -n "${ROLLBACK_VERSION}" ] || [ -n "${ROLLBACK_REVISION}" ]; then
+            if [ "${ALLOW_NON_DESCENDANT}" != "true" ] || [ -z "${INPUT_DEPLOY_DIGEST}" ] \
+              || ! [[ "${ROLLBACK_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+              || ! [[ "${ROLLBACK_REVISION}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Rollback label override requires allow_non_descendant, a digest, and valid version/revision labels"
+              exit 1
+            fi
+            echo "::warning::Emergency rollback to recorded ${ROLLBACK_VERSION} revision ${ROLLBACK_REVISION}"
+          fi
+          if [ -n "${INPUT_DEPLOY_DIGEST}" ]; then
+            if [ "${EVENT_NAME}" != "workflow_dispatch" ] || [ "${INPUT_DEPLOY_PHALA}" != "true" ] || [ -z "${INPUT_IMAGE_VERSION}" ] \
+              || [ "${INCLUDE_DUCKDB}" = "true" ] || [ "${INCLUDE_TC_BENCH_V1}" = "true" ] \
+              || ! [[ "${INPUT_DEPLOY_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Digest promotion requires deploy_phala=true, matching image_version, default dstack features and a sha256 digest."
+              exit 1
+            fi
+          fi
 
   build:
     runs-on: ubuntu-latest
     needs: [version-guard]
+    if: vars.TC780_CUTOVER_READY == 'true' && inputs.deploy_image_digest == '' && !inputs.rollback_audit_only
     permissions:
       contents: read
       packages: write
@@ -135,9 +210,11 @@ jobs:
             FEATURES="${FEATURES:+$FEATURES }tc-bench-v1"
             IMAGE_SUFFIX="${IMAGE_SUFFIX}-tc-bench-v1"
           fi
-          echo "cargo_features=${FEATURES}" >> "$GITHUB_OUTPUT"
-          echo "image_suffix=${IMAGE_SUFFIX}" >> "$GITHUB_OUTPUT"
-          echo "manual_version=${{ inputs.image_version }}" >> "$GITHUB_OUTPUT"
+          {
+            echo "cargo_features=${FEATURES}"
+            echo "image_suffix=${IMAGE_SUFFIX}"
+            echo "manual_version=${{ inputs.image_version }}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata (tags, labels)
         id: meta
@@ -156,7 +233,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+          push: ${{ vars.TC780_CUTOVER_READY == 'true' && (github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main')) }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: CARGO_FEATURES=${{ steps.build_features.outputs.cargo_features }}
@@ -166,7 +243,7 @@ jobs:
   build-dstack:
     runs-on: ubuntu-latest
     needs: [version-guard]
-    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: vars.TC780_CUTOVER_READY == 'true' && inputs.deploy_image_digest == '' && !inputs.rollback_audit_only && (github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     outputs:
       digest: ${{ steps.build.outputs.digest }}
     permissions:
@@ -201,10 +278,12 @@ jobs:
             IMAGE_SUFFIX="${IMAGE_SUFFIX}-tc-bench-v1"
             SHA_PREFIX="${SHA_PREFIX}tc-bench-v1-"
           fi
-          echo "cargo_features=${FEATURES}" >> "$GITHUB_OUTPUT"
-          echo "image_suffix=${IMAGE_SUFFIX}" >> "$GITHUB_OUTPUT"
-          echo "sha_prefix=${SHA_PREFIX}" >> "$GITHUB_OUTPUT"
-          echo "manual_version=${{ inputs.image_version }}" >> "$GITHUB_OUTPUT"
+          {
+            echo "cargo_features=${FEATURES}"
+            echo "image_suffix=${IMAGE_SUFFIX}"
+            echo "sha_prefix=${SHA_PREFIX}"
+            echo "manual_version=${{ inputs.image_version }}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata (tags, labels)
         id: meta
@@ -231,17 +310,68 @@ jobs:
           cache-from: type=gha,scope=dstack
           cache-to: type=gha,mode=max,scope=dstack
 
+  build-ingress:
+    name: Build dstack ingress image
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'pull_request' ||
+      (vars.TC780_CUTOVER_READY == 'true' && inputs.deploy_image_digest == '' && !inputs.rollback_audit_only && (github.event_name == 'release' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main')))
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/tinycloudlabs/tinycloud-node-ingress
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push ingress image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: deploy/ingress
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - name: Record ingress image digest
+        if: steps.build.outputs.digest != ''
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: echo "ghcr.io/tinycloudlabs/tinycloud-node-ingress@${IMAGE_DIGEST}" >> "$GITHUB_STEP_SUMMARY"
   deploy-phala:
     runs-on: ubuntu-latest
     needs: [version-guard, build, build-dstack]
-    if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.deploy_phala)
+    if: >-
+      ${{ vars.TC780_CUTOVER_READY == 'true' && !cancelled() && !inputs.rollback_audit_only && needs.version-guard.result == 'success' &&
+        github.event_name == 'workflow_dispatch' && inputs.deploy_phala &&
+        ((inputs.deploy_image_digest != '' && needs.build.result == 'skipped' && needs.build-dstack.result == 'skipped') ||
+          (inputs.deploy_image_digest == '' && needs.build.result == 'success' && needs.build-dstack.result == 'success')) }}
     permissions:
       contents: read
       packages: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Log in to GHCR for runtime configuration preflight
+      - name: Log in to GHCR for digest validation
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -261,38 +391,126 @@ jobs:
       - name: Install Phala CLI
         run: npm install -g phala@1.1.19
 
-      - name: Validate and pin deployment image
+      - name: Guard production ancestry
         env:
-          BUILD_DIGEST: ${{ needs.build-dstack.outputs.digest }}
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+          ALLOW_NON_DESCENDANT: ${{ inputs.allow_non_descendant }}
         run: |
           set -euo pipefail
-          DIGEST="${BUILD_DIGEST}"
-          if ! [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::build-dstack did not produce an immutable OCI digest"
+
+          if [ "${ALLOW_NON_DESCENDANT}" = "true" ]; then
+            echo "::warning::allow_non_descendant=true; skipping the production revision ancestry check"
+            exit 0
+          fi
+
+          if ! CVM_JSON="$(mktemp)"; then
+            echo "::error::Cannot create a temporary file for Phala's current compose"
             exit 1
           fi
-          export RESOLVED_IMAGE="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
-          docker pull "${RESOLVED_IMAGE}"
-          REVISION="$(docker image inspect "${RESOLVED_IMAGE}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
-          if [ "${REVISION}" != "${GITHUB_SHA}" ]; then
-            echo "::error::candidate OCI revision '${REVISION}' does not match workflow commit '${GITHUB_SHA}'"
+          trap 'rm -f "${CVM_JSON}"' EXIT
+          if ! phala cvms get tinycloud-node --json >"${CVM_JSON}" 2>/dev/null; then
+            echo "::error::Cannot determine the running production revision from Phala"
             exit 1
           fi
 
-          # Keep this immutable reference through preflight, compose parsing,
-          # and Phala. A version tag can be retargeted between build and deploy.
-          python3 - <<'PY'
+          if ! RUNNING_IMAGE="$(python3 - "${CVM_JSON}" <<'PY'
+          import json
+          import re
+          import sys
           from pathlib import Path
-          import os
 
-          path = Path("docker-compose.dstack-postgres.yaml")
-          content = path.read_text()
-          floating = "ghcr.io/tinycloudlabs/tinycloud-node:dstack"
-          if content.count(floating) != 1:
-              raise SystemExit("expected exactly one floating dstack image in compose")
-          path.write_text(content.replace(floating, os.environ["RESOLVED_IMAGE"]))
+          try:
+              response = json.loads(Path(sys.argv[1]).read_text())
+          except (OSError, ValueError):
+              sys.exit(0)
+
+          if isinstance(response, str):
+              compose = response
+          elif isinstance(response, dict):
+              compose_file = response.get("compose_file")
+              if isinstance(compose_file, dict):
+                  compose = compose_file.get("docker_compose_file", "")
+              else:
+                  compose = response.get("docker_compose_file", "")
+          else:
+              compose = ""
+          if not isinstance(compose, str):
+              sys.exit(0)
+
+          images = re.findall(
+              r"(?m)^\s*image:\s*['\"]?(ghcr\.io/tinycloudlabs/tinycloud-node@sha256:[0-9a-f]{64})",
+              compose,
+          )
+          if len(images) == 1:
+              print(images[0])
           PY
-          echo "Resolved immutable candidate: ${RESOLVED_IMAGE}"
+          )"; then
+            echo "::error::Cannot determine a unique pinned production image from Phala's current compose"
+            exit 1
+          fi
+          if [ -z "${RUNNING_IMAGE}" ]; then
+            echo "::error::Cannot determine a unique pinned production image from Phala's current compose"
+            exit 1
+          fi
+
+          if ! docker pull --platform linux/amd64 "${RUNNING_IMAGE}" >/dev/null 2>&1; then
+            echo "::error::Cannot inspect the running production image in GHCR"
+            exit 1
+          fi
+          if ! RUNNING_REVISION="$(docker image inspect "${RUNNING_IMAGE}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' 2>/dev/null)"; then
+            echo "::error::Cannot determine the running production revision from its image label"
+            exit 1
+          fi
+          if ! [[ "${RUNNING_REVISION}" =~ ^[0-9a-f]{40}$ ]] \
+            || ! git cat-file -e "${RUNNING_REVISION}^{commit}" 2>/dev/null; then
+            echo "::error::Cannot determine the running production revision from its image label"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "${RUNNING_REVISION}" HEAD; then
+            echo "::error::Running production revision ${RUNNING_REVISION} is not an ancestor of ${GITHUB_SHA}; refusing a non-descendant deployment"
+            exit 1
+          fi
+          echo "Running production revision ${RUNNING_REVISION} is an ancestor of ${GITHUB_SHA}."
+
+      - name: Validate and pin deployment image
+        env:
+          INPUT_DEPLOY_DIGEST: ${{ inputs.deploy_image_digest }}
+          BUILD_DIGEST: ${{ needs.build-dstack.outputs.digest }}
+          CARGO_VERSION: ${{ needs.version-guard.outputs.cargo_version }}
+          INCLUDE_DUCKDB: ${{ inputs.include_duckdb }}
+          INCLUDE_TC_BENCH_V1: ${{ inputs.include_tc_bench_v1 }}
+          ROLLBACK_VERSION: ${{ inputs.rollback_image_version }}
+          ROLLBACK_REVISION: ${{ inputs.rollback_image_revision }}
+        run: |
+          set -euo pipefail
+          DIGEST="${INPUT_DEPLOY_DIGEST:-${BUILD_DIGEST}}"
+          [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::Invalid deployment digest"; exit 1; }
+          export RESOLVED_IMAGE="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+          docker pull --platform linux/amd64 "${RESOLVED_IMAGE}"
+          REVISION="$(docker image inspect "${RESOLVED_IMAGE}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
+          VERSION="$(docker image inspect "${RESOLVED_IMAGE}" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')"
+          EXPECTED="${CARGO_VERSION}-dstack"
+          if [ "${INCLUDE_DUCKDB}" = "true" ]; then EXPECTED="${EXPECTED}-duckdb"; fi
+          if [ "${INCLUDE_TC_BENCH_V1}" = "true" ]; then EXPECTED="${EXPECTED}-tc-bench-v1"; fi
+          EXPECTED_REVISION="$(git rev-parse HEAD)"
+          if [ -n "${ROLLBACK_VERSION}" ]; then
+            EXPECTED="${ROLLBACK_VERSION}-dstack"
+            EXPECTED_REVISION="${ROLLBACK_REVISION}"
+          fi
+          if [ "${REVISION}" != "${EXPECTED_REVISION}" ] || [ "${VERSION}" != "${EXPECTED}" ]; then
+            echo "::error::Image revision/version labels do not match the selected checkout and requested features"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          path = Path('docker-compose.dstack-postgres.yaml')
+          content = path.read_text()
+          original = 'ghcr.io/tinycloudlabs/tinycloud-node:dstack'
+          assert content.count(original) == 1, 'Expected exactly one native image reference'
+          path.write_text(content.replace(original, os.environ['RESOLVED_IMAGE']))
+          PY
+          echo "Resolved image: ${RESOLVED_IMAGE} (revision ${REVISION}, version ${VERSION})"
           cat docker-compose.dstack-postgres.yaml
 
       # TC-500: Phala considers a CVM ready before compose services have
@@ -301,8 +519,10 @@ jobs:
       # without opening a database, resolving dstack, network, or socket
       # access, before the deploy step can replace the healthy CVM.
       - name: Preflight sealed runtime configuration
+        if: inputs.rollback_image_version == ''
         env:
           TINYCLOUD_STORAGE__DATABASE: ${{ secrets.PROD_TINYCLOUD_DATABASE_URL }}
+          TINYCLOUD_DATABASE__WRITE_FENCE: ${{ inputs.sql_identity_fence }}
           TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_BASE64: ${{ secrets.PROD_TINYCLOUD_SHARE_TRUST_BUNDLE_BASE64 }}
           TINYCLOUD_SHARE_EMAIL__POSTGRES_TLS__SSLMODE: verify-full
           TINYCLOUD_KEYS__TYPE: Dstack
@@ -316,6 +536,7 @@ jobs:
           docker run --rm --network none --read-only --cap-drop ALL \
             --security-opt no-new-privileges \
             -e TINYCLOUD_STORAGE__DATABASE \
+            -e TINYCLOUD_DATABASE__WRITE_FENCE \
             -e TINYCLOUD_SHARE_EMAIL__ENABLED=true \
             -e TINYCLOUD_SHARE_EMAIL__TRUST_BUNDLE_BASE64 \
             -e TINYCLOUD_SHARE_EMAIL__POSTGRES_TLS__SSLMODE \
@@ -337,6 +558,7 @@ jobs:
           PHALA_ENV_CLOUDFLARE_API_TOKEN: ${{ secrets.PROD_TINYCLOUD_CLOUDFLARE_API_TOKEN }}
           PHALA_ENV_DSTACK_GATEWAY_DOMAIN: ${{ secrets.PROD_TINYCLOUD_DSTACK_GATEWAY_DOMAIN }}
           PHALA_ENV_CERTBOT_EMAIL: ${{ secrets.PROD_TINYCLOUD_CERTBOT_EMAIL }}
+          PHALA_ENV_SQL_IDENTITY_FENCE: ${{ inputs.sql_identity_fence }}
         # Update the existing prod CVM (name: tinycloud-node) in the
         # Tiny Cloud workspace. The PHALA_CLOUD_API_KEY secret is
         # workspace-scoped and must be issued from that workspace.
@@ -357,6 +579,7 @@ jobs:
             PHALA_ENV_CLOUDFLARE_API_TOKEN
             PHALA_ENV_DSTACK_GATEWAY_DOMAIN
             PHALA_ENV_CERTBOT_EMAIL
+            PHALA_ENV_SQL_IDENTITY_FENCE
           )
 
           for var in "${required_vars[@]}"; do
@@ -379,6 +602,7 @@ jobs:
             printf 'CLOUDFLARE_API_TOKEN=%s\n' "$PHALA_ENV_CLOUDFLARE_API_TOKEN"
             printf 'DSTACK_GATEWAY_DOMAIN=%s\n' "$PHALA_ENV_DSTACK_GATEWAY_DOMAIN"
             printf 'CERTBOT_EMAIL=%s\n' "$PHALA_ENV_CERTBOT_EMAIL"
+            printf 'SQL_IDENTITY_FENCE=%s\n' "$PHALA_ENV_SQL_IDENTITY_FENCE"
             # SSH public keys authorized on the CVM (checked into the repo,
             # see dstack-authorized-keys). The Phala Cloud pre-launch script
             # writes DSTACK_AUTHORIZED_KEYS to /home/root/.ssh/authorized_keys
@@ -392,7 +616,7 @@ jobs:
           docker compose --env-file .phala-prod.env \
             -f docker-compose.dstack-postgres.yaml config --quiet
 
-          phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml -e .phala-prod.env --wait
+          phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml -e .phala-prod.env --no-public-logs --wait
 
       # TC-312: prove the deploy actually converged. The image tag matching the
       # crate version is enforced at build time by version-guard, but nothing
@@ -405,6 +629,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           INPUT_IMAGE_VERSION: ${{ inputs.image_version }}
+          ROLLBACK_VERSION: ${{ inputs.rollback_image_version }}
         run: |
           set -euo pipefail
 
@@ -416,7 +641,7 @@ jobs:
           else
             TAG="${GITHUB_REF_NAME}"
           fi
-          EXPECTED="${TAG#v}"
+          EXPECTED="${ROLLBACK_VERSION:-${TAG#v}}"
           echo "Expecting node.tinycloud.xyz to report version ${EXPECTED}"
 
           # The CVM needs a short while to pull the new image and restart, so
@@ -481,20 +706,14 @@ jobs:
               --data '{}' \
               "${NODE_ORIGIN}${route}")"
 
-            # Delivery is authenticated before request-body validation, so an
-            # intentionally unsigned body is expected to return 401. Other
-            # control-plane routes reject the body first. Neither case may
-            # silently accept a missing route or a server failure.
-            if [ "${route}" = "/policy/v3/deliveries/authorize" ]; then
-              EXPECTED="401"
-              case "${STATUS}" in 401) VALID=true ;; *) VALID=false ;; esac
-            else
-              EXPECTED="400 or 422"
-              case "${STATUS}" in 400|422) VALID=true ;; *) VALID=false ;; esac
+            # The delivery route requires the authenticated invocation guard
+            # before JSON parsing; its intentionally unauthenticated probe is 401.
+            EXPECTED_AUTH_REJECTION=false
+            if [ "${route}" = "/policy/v3/deliveries/authorize" ] && [ "${STATUS}" = "401" ]; then
+              EXPECTED_AUTH_REJECTION=true
             fi
-
-            if [ "${VALID}" != true ]; then
-              echo "::error::${route} returned HTTP ${STATUS}; expected ${EXPECTED} for an intentionally invalid request. The Policy/v3 production contract is not mounted correctly."
+            if [ "${STATUS}" != "400" ] && [ "${STATUS}" != "422" ] && [ "${EXPECTED_AUTH_REJECTION}" != "true" ]; then
+              echo "::error::${route} returned unexpected HTTP ${STATUS} for an intentionally invalid unauthenticated request."
               head -c 1000 "${RESPONSE_FILE}" || true
               rm -f "${RESPONSE_FILE}"
               exit 1
