@@ -31,3 +31,81 @@ pub(crate) fn postgres_test_url(test: &str) -> Option<String> {
         }
     }
 }
+
+/// A migrated connection to a throwaway schema on the
+/// `TINYCLOUD_TEST_POSTGRES_URL` database (`search_path` is that schema). The
+/// schema is dropped when this goes out of scope, including while a failed
+/// assertion unwinds. `Drop` cannot await, so the drop runs on its own thread
+/// and runtime and is joined before the test returns.
+pub(crate) struct PostgresTestSchema {
+    pub(crate) conn: sea_orm::DatabaseConnection,
+    url: String,
+    schema: String,
+}
+
+impl PostgresTestSchema {
+    /// `None` (skip) only where `postgres_test_url` allows it: never in CI.
+    pub(crate) async fn new(test: &str) -> Option<Self> {
+        use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement};
+        use sea_orm_migration::MigratorTrait;
+
+        let url = postgres_test_url(test)?;
+        let schema = format!(
+            "tc_test_{}_{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        let admin = Database::connect(ConnectOptions::new(url.clone()))
+            .await
+            .expect("connect to PostgreSQL test database");
+        admin
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("CREATE SCHEMA {schema}"),
+            ))
+            .await
+            .expect("create isolated test schema");
+        admin.close().await.expect("close admin connection");
+        let mut options = ConnectOptions::new(url.clone());
+        options
+            .max_connections(4)
+            .sqlx_logging(false)
+            .set_schema_search_path(schema.clone());
+        let conn = Database::connect(options)
+            .await
+            .expect("connect to isolated test schema");
+        let fixture = Self { conn, url, schema };
+        crate::migrations::Migrator::up(&fixture.conn, None)
+            .await
+            .expect("migrate isolated test schema");
+        Some(fixture)
+    }
+}
+
+impl Drop for PostgresTestSchema {
+    fn drop(&mut self) {
+        use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement};
+
+        let (url, schema) = (self.url.clone(), self.schema.clone());
+        let dropped = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("schema drop runtime")
+                .block_on(async move {
+                    Database::connect(ConnectOptions::new(url))
+                        .await?
+                        .execute(Statement::from_string(
+                            DbBackend::Postgres,
+                            format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+                        ))
+                        .await
+                        .map(|_| ())
+                })
+        })
+        .join();
+        if !matches!(dropped, Ok(Ok(()))) {
+            eprintln!("failed to drop isolated test schema {}", self.schema);
+        }
+    }
+}
