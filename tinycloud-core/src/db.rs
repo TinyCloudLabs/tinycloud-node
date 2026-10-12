@@ -1431,6 +1431,7 @@ where
             events,
             self.encryption.as_ref(),
             None,
+            &[],
         )
         .await?;
 
@@ -1714,6 +1715,7 @@ where
                 .collect(),
             self.encryption.as_ref(),
             None,
+            &[],
         )
         .await
     }
@@ -2177,6 +2179,8 @@ where
             vec![event],
             self.encryption.as_ref(),
             Some(&auth_graph),
+            // Taken on this `tx` right after BEGIN, above.
+            &sequence_spaces,
         )
         .await?;
 
@@ -3015,6 +3019,9 @@ async fn event_spaces<'a, C: ConnectionTrait>(
     Ok(spaces)
 }
 
+/// `sequence_locks_held` lists the spaces whose sequence lock the caller has
+/// already taken on `db` (this same transaction) with
+/// `kv_sync::lock_space_sequences`; `&[]` when it has taken none.
 pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     db: &C,
     store_setup: &S,
@@ -3022,6 +3029,7 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     events: Vec<Event>,
     encryption: Option<&ColumnEncryption>,
     auth_graph: Option<&crate::auth_graph::AuthGraphSnapshot>,
+    sequence_locks_held: &[SpaceId],
 ) -> Result<TransactResult, TxError<S, K>> {
     // for each event, get the hash and the relevent space(s)
     let event_hashes = events
@@ -3033,8 +3041,11 @@ pub(crate) async fn transact<C: ConnectionTrait, S: StorageSetup, K: Secrets>(
     // sequence lock, before anything else reads. The `MAX(seq)` below must see
     // every earlier same-space commit, and no later one may commit before
     // this one: that is what makes `seq` commit-ordered on PostgreSQL.
+    // A lock this transaction already holds is not asked for again (on
+    // PostgreSQL that would only be a re-entrant no-op round-trip).
     let event_spaces = event_spaces(db, &event_hashes).await?;
-    crate::kv_sync::lock_space_sequences(db, event_spaces.keys()).await?;
+    crate::kv_sync::lock_space_sequences_not_held(db, event_spaces.keys(), sequence_locks_held)
+        .await?;
 
     // ── Atomic delegation registration ──────────────────────────────────────
     // Register all delegations inside this transaction before any epoch rows

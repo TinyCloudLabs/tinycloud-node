@@ -129,6 +129,36 @@ pub async fn lock_space_sequences<'a, C: ConnectionTrait>(
     }
 }
 
+/// `lock_space_sequences` on a transaction that has already taken the
+/// sequence locks of `held` with `lock_space_sequences`.
+///
+/// PostgreSQL's transaction-level advisory locks are re-entrant and are held
+/// until the transaction ends, so asking again for a key this transaction
+/// holds returns at once and changes nothing: it is only a round-trip. Those
+/// keys are skipped; every other key is taken exactly as `lock_space_sequences`
+/// would, in the same ascending order. MySQL (row locks, which depend on the
+/// space row existing when asked) and SQLite (no-op) are unchanged.
+pub async fn lock_space_sequences_not_held<'a, C: ConnectionTrait>(
+    db: &C,
+    spaces: impl IntoIterator<Item = &'a SpaceId>,
+    held: &[SpaceId],
+) -> Result<(), DbErr> {
+    match db.get_database_backend() {
+        DbBackend::Postgres => {
+            let held = held
+                .iter()
+                .map(space_sequence_lock_key)
+                .collect::<std::collections::BTreeSet<_>>();
+            let spaces = spaces
+                .into_iter()
+                .filter(|space| !held.contains(&space_sequence_lock_key(space)))
+                .collect::<Vec<_>>();
+            lock_space_sequences(db, spaces).await
+        }
+        DbBackend::Sqlite | DbBackend::MySql => lock_space_sequences(db, spaces).await,
+    }
+}
+
 /// A position in a space's event order: one `event_order` row, i.e. one
 /// event. Every row a KV invocation touches shares its event's position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2089,5 +2119,100 @@ pub(crate) mod tests {
         .await;
         drop(fixture);
         exercise.expect("TC-732 PostgreSQL collation resilience");
+    }
+
+    async fn sequence_lock_is_free(conn: &DatabaseConnection, space: &SpaceId) -> bool {
+        conn.query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT pg_try_advisory_xact_lock($1) AS free",
+            [space_sequence_lock_key(space).into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<bool>("", "free")
+        .unwrap()
+    }
+
+    /// A connection that counts the sequence-lock statements it runs.
+    fn counting_sequence_locks(
+        conn: &DatabaseConnection,
+    ) -> (DatabaseConnection, std::sync::Arc<AtomicU64>) {
+        let locks = std::sync::Arc::new(AtomicU64::new(0));
+        let counter = locks.clone();
+        let mut conn = conn.clone();
+        conn.set_metric_callback(move |info| {
+            if info.statement.sql.contains("pg_advisory_xact_lock") {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        (conn, locks)
+    }
+
+    /// Keys the transaction already holds are not asked for again; the
+    /// others are, and every one stays held until the transaction ends.
+    #[tokio::test]
+    async fn postgres_held_sequence_locks_are_not_asked_for_again() {
+        let Some(schema) = crate::test_support::PostgresTestSchema::new(
+            "postgres_held_sequence_locks_are_not_asked_for_again",
+        )
+        .await
+        else {
+            return;
+        };
+        let (a, b) = (Owner::generate().space, Owner::generate().space);
+        let (conn, locks) = counting_sequence_locks(&schema.conn);
+        let tx = conn.begin().await.unwrap();
+        lock_space_sequences(&tx, [&a]).await.unwrap();
+        assert_eq!(locks.load(Ordering::SeqCst), 1);
+        lock_space_sequences_not_held(&tx, [&a, &b], std::slice::from_ref(&a))
+            .await
+            .unwrap();
+        assert_eq!(locks.load(Ordering::SeqCst), 2, "only b is asked for");
+        lock_space_sequences_not_held(&tx, [&a, &b], &[a.clone(), b.clone()])
+            .await
+            .unwrap();
+        assert_eq!(locks.load(Ordering::SeqCst), 2, "both held already");
+        assert!(!sequence_lock_is_free(&schema.conn, &a).await);
+        assert!(!sequence_lock_is_free(&schema.conn, &b).await);
+        tx.commit().await.unwrap();
+        assert!(sequence_lock_is_free(&schema.conn, &a).await);
+        assert!(sequence_lock_is_free(&schema.conn, &b).await);
+    }
+
+    /// A KV write asks for its space's sequence lock once: right after BEGIN.
+    /// `transact` runs on the same transaction and no longer asks again.
+    #[tokio::test]
+    async fn postgres_kv_write_takes_its_space_sequence_lock_once() {
+        let Some(schema) = crate::test_support::PostgresTestSchema::new(
+            "postgres_kv_write_takes_its_space_sequence_lock_once",
+        )
+        .await
+        else {
+            return;
+        };
+        let (conn, locks) = counting_sequence_locks(&schema.conn);
+        let db: TestDb = SpaceDatabase::new(
+            conn,
+            MemoryStore::default(),
+            StaticSecret::new([0u8; 32].to_vec()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let owner = Owner::generate();
+        host(&db, &owner).await;
+        let cases: [(&str, &[Op<'_>]); 3] = [
+            ("put", &[Op::Put("notes/a", b"one")]),
+            (
+                "two puts",
+                &[Op::Put("notes/a", b"two"), Op::Put("notes/b", b"three")],
+            ),
+            ("delete", &[Op::Del("notes/a")]),
+        ];
+        for (label, ops) in cases {
+            let before = locks.load(Ordering::SeqCst);
+            run(&db, &owner, ops).await;
+            assert_eq!(locks.load(Ordering::SeqCst) - before, 1, "{label}");
+        }
     }
 }
