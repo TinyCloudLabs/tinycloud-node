@@ -193,18 +193,21 @@ impl AuthGraphSnapshot {
         self.abilities.get(id).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    /// Whether one cited proof reaches a root through nodes whose abilities
-    /// all cover the invoked capability. Results are memoized across branches
-    /// and cited proofs; cycles and missing rows fail closed.
+    /// Whether one cited proof reaches a parentless or owner-issued authority
+    /// through nodes whose abilities all cover the invoked capability.
+    /// Results are memoized across branches and cited proofs; cycles, missing
+    /// rows and budget overflow fail closed.
     pub(crate) fn has_covering_chain(
         &self,
         starts: impl IntoIterator<Item = Hash>,
         covers: impl Fn(&abilities::Model) -> bool,
+        is_authority: impl Fn(&delegation::Model) -> bool,
     ) -> bool {
-        fn visit<F: Fn(&abilities::Model) -> bool>(
+        fn visit<F: Fn(&abilities::Model) -> bool, A: Fn(&delegation::Model) -> bool>(
             graph: &AuthGraphSnapshot,
             id: Hash,
             covers: &F,
+            is_authority: &A,
             memo: &mut HashMap<Hash, bool>,
             visiting: &mut HashSet<Hash>,
         ) -> bool {
@@ -215,14 +218,18 @@ impl AuthGraphSnapshot {
                 return false;
             }
             visiting.insert(id);
-            let valid = graph.delegation(&id).is_some()
-                && graph.abilities(&id).iter().any(covers)
-                && graph.parents.get(&id).is_none_or(|parents| {
-                    parents.is_empty()
-                        || parents
-                            .iter()
-                            .any(|parent| visit(graph, *parent, covers, memo, visiting))
-                });
+            let valid = if let Some(row) = graph.delegation(&id) {
+                graph.abilities(&id).iter().any(covers)
+                    && (is_authority(row)
+                        || graph.parents.get(&id).is_none_or(|parents| {
+                            parents.is_empty()
+                                || parents.iter().any(|parent| {
+                                    visit(graph, *parent, covers, is_authority, memo, visiting)
+                                })
+                        }))
+            } else {
+                false
+            };
             visiting.remove(&id);
             memo.insert(id, valid);
             valid
@@ -232,7 +239,7 @@ impl AuthGraphSnapshot {
         let mut visiting = HashSet::new();
         starts
             .into_iter()
-            .any(|id| visit(self, id, &covers, &mut memo, &mut visiting))
+            .any(|id| visit(self, id, &covers, &is_authority, &mut memo, &mut visiting))
     }
 
     pub(crate) fn is_revoked(&self, id: &Hash) -> bool {

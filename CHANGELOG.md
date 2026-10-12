@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [1.20.1] - 2026-10-11
+
+- SQL and DuckDB invocations: the covering-chain check stops at a delegation issued by the owner of the invoked space, as registration already does. An owner's SQL/DuckDB grant that also cites a foreign proof (for example another user's KV grant) no longer gets 401. Every non-owner ancestor must still cover the invoked database, ability and caveats (TC-894, port of TC-825).
+- `tinycloud.kv/sync` may be granted on the whole-space KV root (`{space}/kv` or `{space}/kv/`), advertised as `kv-sync-root` in `/info`. Prefix grants still cannot reach the root (TC-908).
+- Add the `tinycloud-node-ingress` wrapper image: the pinned dstack-ingress base plus `large_client_header_buffers 4 32k`, so signed delegation `Authorization` headers over 8 KiB are no longer rejected with 400 (TC-910).
+
 ## [1.20.0] - 2026-10-08
 
 - Isolate SQL and DuckDB databases by full resource path, require exact non-slash database grants and covering delegation chains, and keep hook and share-email SQL reads within the authorized identity (TC-780).
