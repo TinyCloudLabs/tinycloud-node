@@ -616,7 +616,7 @@ jobs:
           docker compose --env-file .phala-prod.env \
             -f docker-compose.dstack-postgres.yaml config --quiet
 
-          phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml -e .phala-prod.env --wait
+          phala deploy --cvm-id tinycloud-node -c docker-compose.dstack-postgres.yaml -e .phala-prod.env --no-public-logs --wait
 
       # TC-312: prove the deploy actually converged. The image tag matching the
       # crate version is enforced at build time by version-guard, but nothing
