@@ -36,6 +36,12 @@ jobs:
       uses: dtolnay/rust-toolchain@1.97.1
       with:
         components: clippy, rustfmt
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      with:
+        shared-key: rust-1.97.1-dev-default
+        workspaces: . -> target
+        save-if: ${{ github.ref == 'refs/heads/main' }}
 
     - name: Add the wasm32 target
       run: rustup target add wasm32-unknown-unknown
@@ -82,6 +88,12 @@ jobs:
     # green having asserted nothing, with nothing to say so. The name filter is
     # gone (the whole workspace suite runs now) and the two remaining ways to
     # silently execute nothing are both checked below.
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      with:
+        shared-key: rust-1.97.1-test-default-duckdb
+        workspaces: . -> target
+        save-if: ${{ github.ref == 'refs/heads/main' }}
     - name: Assert PostgreSQL is reachable
       run: |
         set -euo pipefail
@@ -126,6 +138,12 @@ jobs:
       uses: dtolnay/rust-toolchain@1.97.1
       with:
         components: clippy, rustfmt
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      with:
+        shared-key: rust-1.97.1-dev-default
+        workspaces: . -> target
+        save-if: ${{ github.ref == 'refs/heads/main' }}
 
     - name: Add the wasm32 target
       run: rustup target add wasm32-unknown-unknown
@@ -190,6 +208,12 @@ jobs:
     - uses: dtolnay/rust-toolchain@1.97.1
       with:
         components: clippy, rustfmt
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      with:
+        shared-key: rust-1.97.1-test-m1-realdata
+        workspaces: test/m1-realdata-e2e -> test/m1-realdata-e2e/target
+        save-if: ${{ github.ref == 'refs/heads/main' }}
     - uses: actions/setup-python@v5
       with:
         python-version: "3.12"

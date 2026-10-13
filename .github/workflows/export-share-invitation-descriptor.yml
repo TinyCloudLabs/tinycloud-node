@@ -16,6 +16,12 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@1.97.1
 
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: rust-1.97.1-test-run-default
+          workspaces: . -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test the public descriptor exporter
         run: cargo test -p tinycloud-node --bin export-share-invitation-descriptor
 
