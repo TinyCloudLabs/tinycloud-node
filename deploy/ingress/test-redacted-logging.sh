@@ -50,6 +50,8 @@ BEARER="tc970bearer$(hex 12)"
 FORWARDED_IP="198.51.100.$((RANDOM % 200 + 20))"
 USER_AGENT="tc970agent$(hex 12)"
 REFERER_MARKER="tc970referer$(hex 12)"
+# nginx accepts only A-Z, `_` and `-` in a method.
+METHOD="TCMETHOD$(hex 8 | tr '0-9a-f' 'GHIJKLMNOPQRSTUV')"
 DOMAIN="ingress-logtest.local"
 
 # Inside the ingress container: a self-signed certificate where the entrypoint
@@ -128,6 +130,12 @@ expect_status 401 "https://$DOMAIN/signed/kv/$TICKET"
 expect_status 200 "https://$DOMAIN/hooks/events?ticket=$HOOK_TICKET"
 expect_status 502 "https://$DOMAIN/public/$SPACE/kv/$KEY"
 expect_status 401 "https://$DOMAIN/signed/kv/$TICKET/unmatched"
+# HTTP/1.1, a client-chosen method, and a 400 raised before routing (a header
+# line over the 32 KB buffers) with the ticket in the request line.
+expect_status 401 --http1.1 "https://$DOMAIN/signed/kv/$TICKET"
+expect_status 401 --http1.1 -X "$METHOD" "https://$DOMAIN/signed/kv/$TICKET"
+expect_status 400 --http1.1 -H "X-Large: $(head -c 40000 /dev/zero | tr '\0' a)" \
+    "https://$DOMAIN/signed/kv/$TICKET"
 
 # TC-910: a single header line of about 30 KB fits the 32 KB buffers.
 LARGE_HEADER="X-Large: $(head -c 30000 /dev/zero | tr '\0' a)"
@@ -152,7 +160,8 @@ for pair in \
     "client address=$CLIENT_IP" \
     "X-Forwarded-For address=$FORWARDED_IP" \
     "User-Agent=$USER_AGENT" \
-    "Referer=$REFERER_MARKER"; do
+    "Referer=$REFERER_MARKER" \
+    "request method=$METHOD"; do
     what=${pair%%=*}
     needle=${pair#*=}
     if grep -F -- "$needle" <<<"$LOGS" >&2; then
@@ -166,19 +175,35 @@ done
 LOG_FILES=$($DOCKER exec "$INGRESS" find /var/log/nginx -type f -size +0c)
 [ -z "$LOG_FILES" ] || { $DOCKER exec "$INGRESS" sh -c "head -c 2000 $LOG_FILES" >&2; fail "nginx wrote to unrotated log files: $LOG_FILES"; }
 
-# Each request is still logged, by route template and status.
+# Every access line is valid JSON with the expected fields, and each request
+# is logged by method, route class and status.
+ACCESS=$(python3 -c '
+import json, sys
+for line in sys.stdin:
+    if not line.startswith("{"):
+        continue
+    record = json.loads(line)
+    for key in ("status", "bytes"):
+        assert isinstance(record[key], int), line
+    assert isinstance(record["request_time"], (int, float)), line
+    for key in ("time", "method", "route", "protocol", "upstream_status",
+                "upstream_connect_time", "upstream_response_time"):
+        assert isinstance(record[key], str), line
+    print(record["method"], record["route"], record["status"])
+' <<<"$LOGS") || { echo "$LOGS" >&2; fail "an access log line is not the expected JSON"; }
 expect_line() {
-    local route=$1 status=$2
-    grep -F "\"route\":\"$route\"" <<<"$LOGS" | grep -qF "\"status\":$status" \
-        || { echo "$LOGS" >&2; fail "no access log line for $route with status $status"; }
+    grep -qxF "$*" <<<"$ACCESS" \
+        || { echo "$ACCESS" >&2; fail "no access log line: $*"; }
 }
-expect_line "/signed/kv/<ticket_id>" 401
-expect_line "/hooks/events" 200
-expect_line "/public/<space_id>/kv/<key..>" 502
-expect_line "<other>" 401
-expect_line "/delegate" 200
-expect_line "/invoke" 200
-expect_line "/invoke" 413
+expect_line GET "/signed/kv/<ticket_id>" 401
+expect_line GET "/hooks/events" 200
+expect_line GET "/public/<space_id>/kv/<key..>" 502
+expect_line GET "<other>" 401
+expect_line "<other>" "/signed/kv/<ticket_id>" 401
+expect_line GET "/signed/kv/<ticket_id>" 400
+expect_line GET "/delegate" 200
+expect_line POST "/invoke" 200
+expect_line POST "/invoke" 413
 
 echo "ingress container output:"
 sed 's/^/  /' <<<"$LOGS"
