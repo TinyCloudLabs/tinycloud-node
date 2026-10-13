@@ -21,8 +21,10 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
-    ports:
-      - "8000:8000"
+    # TC-1012: no `ports:` on purpose. A published port is served by the Phala
+    # gateway at https://<app_id>-8000.<gateway>/, bypassing dstack-ingress
+    # (header/body limits, redacted access log, our TLS). The ingress reaches
+    # the node over the compose network at http://tinycloud:8000.
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
     environment:

@@ -759,3 +759,24 @@ jobs:
             echo "${route}: mounted (HTTP ${STATUS})"
             rm -f "${RESPONSE_FILE}"
           done
+
+      # TC-1012: the node's :8000 must only be reachable through dstack-ingress.
+      # If the compose publishes it, the Phala gateway serves it directly at
+      # <app_id>-8000.<gateway_domain> and bypasses the ingress limits/logs.
+      # An unpublished port closes the TLS stream with no HTTP response (000).
+      - name: Verify app port is not exposed by the Phala gateway
+        run: |
+          set -euo pipefail
+          # tinycloud-node prod CVM app_id on dstack-pha-prod5.
+          RAW_URL="https://350d124c81d53a57e8899e9f85a904918e663b61-8000.dstack-pha-prod5.phala.network/version"
+          INGRESS_STATUS="$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' https://tee.node.tinycloud.xyz/version || true)"
+          if [ "${INGRESS_STATUS}" != "200" ]; then
+            echo "::error::TC-1012: https://tee.node.tinycloud.xyz/version returned HTTP ${INGRESS_STATUS}, expected 200 via dstack-ingress."
+            exit 1
+          fi
+          RAW_STATUS="$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' "${RAW_URL}" || true)"
+          if [ "${RAW_STATUS}" != "000" ]; then
+            echo "::error::TC-1012: ${RAW_URL} returned HTTP ${RAW_STATUS}; port 8000 is published and bypasses dstack-ingress."
+            exit 1
+          fi
+          echo "Ingress serves /version (200); gateway app port 8000 gives no HTTP response."
