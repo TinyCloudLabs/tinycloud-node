@@ -58,6 +58,62 @@ an ancestor of `origin/main` (`scripts/ci/check-deploy-ref.sh`, run both in
 dispatch from any other branch or tag fails with
 `Deploy refused (main-only)`.
 
+### The `production` environment (TC-971)
+
+The ref check above runs inside the workflow file of the dispatched ref, so it
+only protects refs whose `docker.yml` already has it. `workflow_dispatch` runs
+the workflow file at the selected ref, and repository or organization secrets
+are readable by every ref. To close that, every job that reads production
+secrets runs in the GitHub `production` environment, and those secrets exist
+only there:
+
+| Workflow | Job | Production secrets |
+| --- | --- | --- |
+| `docker.yml` | `deploy-phala` | `PHALA_CLOUD_API_KEY` and the `PROD_TINYCLOUD_*` sealed config |
+| `docker.yml` | `rollback-audit` | `PROD_TINYCLOUD_DATABASE_URL` |
+| `export-share-invitation-descriptor.yml` | `export` | `PROD_TINYCLOUD_KEYS_SECRET` |
+
+Environment settings (Settings → Environments → `production`):
+
+- Deployment branches and tags: **Selected branches and tags**, with the branch
+  rule `main` and the tag rule `v*`. GitHub rejects a job for any other ref
+  before it starts.
+- Required reviewers: none. Wait timer: none.
+- Secrets: `PHALA_CLOUD_API_KEY`, `PROD_TINYCLOUD_DATABASE_URL`,
+  `PROD_TINYCLOUD_S3_BUCKET`, `PROD_TINYCLOUD_S3_ENDPOINT`,
+  `PROD_TINYCLOUD_AWS_ACCESS_KEY_ID`, `PROD_TINYCLOUD_AWS_SECRET_ACCESS_KEY`,
+  `PROD_TINYCLOUD_AWS_REGION`, `PROD_TINYCLOUD_QUOTA_URL`,
+  `PROD_TINYCLOUD_ADMIN_SECRET`, `PROD_TINYCLOUD_SHARE_TRUST_BUNDLE_BASE64`,
+  `PROD_TINYCLOUD_CLOUDFLARE_API_TOKEN`, `PROD_TINYCLOUD_DSTACK_GATEWAY_DOMAIN`,
+  `PROD_TINYCLOUD_CERTBOT_EMAIL`, `PROD_TINYCLOUD_KEYS_SECRET`.
+- None of these may also exist as a repository secret, and this repository
+  must not be selected for the organization secret `PHALA_CLOUD_API_KEY`. A
+  same-named repository or organization secret is still readable by a job
+  without `environment: production`.
+
+What this blocks: a dispatch on an unlocked branch fails the environment's
+branch policy, even if that branch edits `docker.yml` to name the environment.
+A dispatch on an old tag or branch whose `docker.yml` predates this section
+runs without the environment and gets empty secrets, so its deploy fails (in
+current workflows, at `Missing required GitHub secret for Phala deploy`).
+
+What it does not block: `v*` is a name filter, not a check on the tagged
+commit. Anyone who can push a `v*` tag can tag a commit off `main` whose
+`docker.yml` names `production` and drops `scripts/ci/check-deploy-ref.sh`.
+Treat tag creators as production operators, and restrict creating, updating
+and deleting `v*` tags to release automation and admins with a tag ruleset.
+The organization `PHALA_CLOUD_API_KEY` is also shared with other repositories.
+Deselecting this repository doesn't stop those repositories from using the
+key. A production-only Phala key that is stored only in this environment
+closes that gap.
+
+`TC780_CUTOVER_READY` stays a repository variable: the build jobs, which have
+no environment, read it too. `GITHUB_TOKEN` is the automatic token.
+
+If a job that names the environment ever runs before the environment exists,
+GitHub creates `production` with no branch policy. Create the environment and
+its branch policy before any workflow that names it runs.
+
 1. **Get the digest.** The tag push runs `docker.yml`, whose `build-dstack`
    job pushes `ghcr.io/tinycloudlabs/tinycloud-node:X.Y.Z-dstack`. Copy the
    digest from that job's log, then confirm its labels from the registry
@@ -148,10 +204,13 @@ gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
 - The sealed-config preflight is skipped for rollbacks, and the post-deploy
   `/version` check expects `rollback_image_version`. Run the same manual
   verification as for a release.
+- Rollback runs in the `production` environment like any other deploy, and
+  `main` is admitted by its branch policy. No environment change is needed.
 - Do not roll back by dispatching on an old tag or a retired branch. Old refs
-  carry an older `docker.yml` without the main-only guard, and the retired
-  deploy branches (`feat/tc-780-release-line`,
-  `Codex/roman/rollback-meeting-node-20260915`) are locked.
+  carry an older `docker.yml` without the main-only guard or the `production`
+  environment, so they get no deploy secrets and fail. The retired deploy
+  branches (`feat/tc-780-release-line`,
+  `Codex/roman/rollback-meeting-node-20260915`) are also locked.
 
 ## Why the version bump is manual
 

@@ -9,6 +9,8 @@ permissions:
 jobs:
   export:
     runs-on: ubuntu-latest
+    # TC-971: PROD_TINYCLOUD_KEYS_SECRET lives in the production environment.
+    environment: production
     steps:
       - uses: actions/checkout@v4
 
