@@ -276,8 +276,9 @@ pub async fn connect_database(tinycloud_config: &Config) -> Result<RecoveringCon
 /// statements run directly on the pool, so with the database a WAN round trip
 /// away that ping doubled the cost of nearly every statement. It is off here;
 /// instead the pool's [`PoolRecovery`] hook pings only the idle connections
-/// that predate an observed connection loss, and [`RecoveringConnection`]
-/// retries the statement that observed it when that is safe.
+/// that predate an observed connection loss or have been idle for a minute,
+/// and [`RecoveringConnection`] retries the statement that observed a loss
+/// when that is safe.
 ///
 /// sea-orm's `Database::connect` cannot install that hook, so the pool is
 /// built here with the same connect options it would have applied: the URL,
@@ -286,6 +287,17 @@ pub async fn connect_database(tinycloud_config: &Config) -> Result<RecoveringCon
 pub async fn postgres_pool(
     connect_opts: ConnectOptions,
     root_cert_path: Option<&str>,
+) -> Result<RecoveringConnection> {
+    postgres_pool_with_recovery(connect_opts, root_cert_path, PoolRecovery::new()).await
+}
+
+/// [`postgres_pool`] with a given recovery state. Production uses
+/// [`postgres_pool`]; tests use this to shorten the idle threshold
+/// ([`PoolRecovery::with_idle_revalidation`]).
+pub async fn postgres_pool_with_recovery(
+    connect_opts: ConnectOptions,
+    root_cert_path: Option<&str>,
+    recovery: Arc<PoolRecovery>,
 ) -> Result<RecoveringConnection> {
     use tinycloud_core::sea_orm::{
         sqlx::{postgres::PgConnectOptions, ConnectOptions as _, Postgres},
@@ -300,7 +312,6 @@ pub async fn postgres_pool(
     if let Some(root_cert_path) = root_cert_path {
         options = options.ssl_root_cert(root_cert_path);
     }
-    let recovery = PoolRecovery::new();
     let pool = recovery
         .install(
             connect_opts

@@ -14,10 +14,20 @@
 //!   a transaction are never retried: they run on the
 //!   [`DatabaseTransaction`]'s own connection, which this type never wraps.
 //! - [`PoolRecovery`] remembers when a connection loss was last observed.
-//!   The pool's `before_acquire` hook pings only the idle connections that
-//!   were released at or before that instant, so after one detected loss
-//!   every connection that might be dead is checked before reuse, while the
-//!   steady state costs no extra round trip.
+//!   The pool's `before_acquire` hook pings an idle connection only if it
+//!   was released at or before that instant, or has sat idle for at least
+//!   [`IDLE_REVALIDATE_AFTER`]. Every acquisition after the first observed
+//!   loss is therefore checked, and so is every connection an idle reaper
+//!   (`idle_session_timeout`, a NAT or load balancer) may have closed, while
+//!   a pool in normal use costs no extra round trip.
+//!
+//! What this does not cover: statements that had already acquired a dead
+//! connection when the first loss was observed (a concurrent wave right
+//! after a failover) each meet that connection. The reads and `BEGIN`s
+//! among them are retried once on a checked connection; each write among
+//! them fails. A reaper faster than [`IDLE_REVALIDATE_AFTER`] is covered
+//! only by the loss rule: the first statement on each reaped connection
+//! fails, and is retried if it is a read or `BEGIN`.
 //!
 //! sqlx pings a connection when it is released to the pool and closes it if
 //! that ping fails, so a connection is known to be live when it enters the
@@ -305,16 +315,27 @@ where
     result
 }
 
+/// How long a pooled connection may sit idle before the acquire hook
+/// checks it regardless of losses: idle reapers (PostgreSQL's
+/// `idle_session_timeout`, NAT and load-balancer timeouts) close
+/// connections without any statement observing it. In normal use the
+/// webhook dispatcher's 1 Hz poll and request traffic rotate through the
+/// FIFO idle queue, so a connection is reused within seconds and this
+/// never fires.
+pub const IDLE_REVALIDATE_AFTER: Duration = Duration::from_secs(60);
+
 /// Pool-wide record of the last observed connection loss (TC-951).
 ///
 /// A pool built with [`PoolRecovery::install`] pings an idle connection
 /// before handing it out only if the connection was released to the pool at
-/// or before the last loss that [`RecoveringConnection`] observed. A failed
-/// ping makes sqlx close that connection and move on to the next idle one,
-/// or open a new one. With no loss, no connection is ever pinged.
+/// or before the last loss that [`RecoveringConnection`] observed, or has
+/// been idle for at least the idle threshold ([`IDLE_REVALIDATE_AFTER`]). A
+/// failed ping makes sqlx close that connection and open a new one in its
+/// place.
 #[derive(Debug)]
 pub struct PoolRecovery {
     origin: Instant,
+    idle_revalidate_after: Duration,
     /// Nanoseconds after `origin` of the last observed loss, plus one; zero
     /// means no loss has been observed.
     lost_at: AtomicU64,
@@ -341,6 +362,7 @@ impl Default for PoolRecovery {
     fn default() -> Self {
         Self {
             origin: Instant::now(),
+            idle_revalidate_after: IDLE_REVALIDATE_AFTER,
             lost_at: AtomicU64::new(0),
             losses: AtomicU64::new(0),
             retries: AtomicU64::new(0),
@@ -355,6 +377,15 @@ impl PoolRecovery {
         Arc::new(Self::default())
     }
 
+    /// A recovery state with a different idle threshold than
+    /// [`IDLE_REVALIDATE_AFTER`]. Tests only: they cannot wait a minute.
+    pub fn with_idle_revalidation(idle_revalidate_after: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            idle_revalidate_after,
+            ..Self::default()
+        })
+    }
+
     /// Record that a connection of this pool was found dead now.
     pub fn mark_lost(&self) {
         self.losses.fetch_add(1, Ordering::Relaxed);
@@ -364,9 +395,13 @@ impl PoolRecovery {
         self.lost_at.fetch_max(now, Ordering::AcqRel);
     }
 
-    /// Whether a connection that has been idle for `idle_for` was released
-    /// at or before the last observed loss, and so may be dead.
+    /// Whether a connection that has been idle for `idle_for` may be dead:
+    /// it was released at or before the last observed loss, or it has been
+    /// idle long enough for an idle reaper to have closed it.
     pub fn needs_revalidation(&self, idle_for: Duration) -> bool {
+        if idle_for >= self.idle_revalidate_after {
+            return true;
+        }
         let lost_at = self.lost_at.load(Ordering::Acquire);
         if lost_at == 0 {
             return false;
@@ -410,7 +445,7 @@ impl PoolRecovery {
                 match conn.ping().await {
                     Ok(()) => Ok(true),
                     Err(error) => {
-                        // sqlx closes the connection and tries the next one.
+                        // sqlx closes the connection and opens a new one in its place.
                         recovery
                             .revalidation_failures
                             .fetch_add(1, Ordering::Relaxed);
@@ -461,10 +496,18 @@ fn connection_error_class(error: &DbErr) -> Option<&'static str> {
         SqlxError::Protocol(_) => Some("protocol"),
         SqlxError::WorkerCrashed => Some("worker_crashed"),
         SqlxError::Database(error) => match error.code().as_deref() {
-            // admin_shutdown, crash_shutdown, cannot_connect_now
+            // The server ended this session (PostgreSQL 16 errcodes):
+            // 57P01 admin_shutdown, 57P02 crash_shutdown, 57P03
+            // cannot_connect_now, 57P04 database_dropped, 57P05
+            // idle_session_timeout, and 25P03
+            // idle_in_transaction_session_timeout. Not 57014
+            // (query_canceled) or 57000: the session survives those.
             Some("57P01") => Some("sqlstate_57P01"),
             Some("57P02") => Some("sqlstate_57P02"),
             Some("57P03") => Some("sqlstate_57P03"),
+            Some("57P04") => Some("sqlstate_57P04"),
+            Some("57P05") => Some("sqlstate_57P05"),
+            Some("25P03") => Some("sqlstate_25P03"),
             // Class 08: connection exception.
             Some(code) if code.starts_with("08") => Some("sqlstate_08"),
             _ => None,
@@ -473,37 +516,179 @@ fn connection_error_class(error: &DbErr) -> Option<&'static str> {
     }
 }
 
-/// Keywords that make a statement unsafe to run twice, wherever they occur.
+/// Keywords that make a statement unsafe to run twice, wherever they occur
+/// as a bare word.
 const WRITE_KEYWORDS: [&str; 5] = ["INSERT", "UPDATE", "DELETE", "MERGE", "INTO"];
+
+/// The only bare words a read-only statement may put directly before `(`:
+/// SQL keywords that open a subquery, a list or a grouping, and the pure
+/// built-in aggregates and functions the node's generated SQL uses. A call
+/// of anything else (`nextval`, `setval`, `pg_advisory_lock`,
+/// `pg_terminate_backend`, `set_config`, `lo_*`, a user-defined function)
+/// may have side effects, so it makes the statement non-retryable.
+const CALL_ALLOWLIST: [&str; 36] = [
+    // keywords
+    "SELECT",
+    "FROM",
+    "WHERE",
+    "AND",
+    "OR",
+    "NOT",
+    "IN",
+    "EXISTS",
+    "ANY",
+    "ALL",
+    "SOME",
+    "AS",
+    "ON",
+    "USING",
+    "JOIN",
+    "UNION",
+    "INTERSECT",
+    "EXCEPT",
+    "VALUES",
+    "BY",
+    "HAVING",
+    "LIMIT",
+    "OFFSET",
+    "WHEN",
+    "THEN",
+    "ELSE",
+    "IS",
+    "LIKE",
+    // pure built-ins
+    "COUNT",
+    "MAX",
+    "MIN",
+    "SUM",
+    "AVG",
+    "COALESCE",
+    "LOWER",
+    "UPPER",
+];
+
+#[derive(Debug, PartialEq, Eq)]
+enum Token<'a> {
+    /// An unquoted word: a keyword, an identifier, a number or `$n`.
+    Word(&'a str),
+    /// A double-quoted identifier.
+    Quoted,
+    Punct(u8),
+}
+
+/// Split `sql` into tokens, or `None` for an unterminated quoted
+/// identifier. The caller has already rejected string literals, comments
+/// and non-ASCII text.
+fn tokens(sql: &str) -> Option<Vec<Token<'_>>> {
+    let bytes = sql.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte.is_ascii_whitespace() {
+            i += 1;
+        } else if byte == b'"' {
+            i += 1;
+            loop {
+                match bytes.get(i) {
+                    None => return None,
+                    Some(b'"') if bytes.get(i + 1) == Some(&b'"') => i += 2,
+                    Some(b'"') => break,
+                    Some(_) => i += 1,
+                }
+            }
+            i += 1;
+            tokens.push(Token::Quoted);
+        } else if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' {
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$')
+            {
+                i += 1;
+            }
+            tokens.push(Token::Word(&sql[start..i]));
+        } else {
+            tokens.push(Token::Punct(byte));
+            i += 1;
+        }
+    }
+    Some(tokens)
+}
 
 /// Whether running `sql` a second time cannot change the database.
 ///
-/// True only for a statement whose first keyword is `SELECT` or `WITH` and
-/// that contains none of `INSERT`, `UPDATE`, `DELETE`, `MERGE` or `INTO` as
-/// a whole word anywhere (case-insensitive). The scan ignores quoting, so a
-/// literal or identifier spelled like one of those words makes a read
-/// non-retryable; a false match can only ever prevent a retry. `INTO`
-/// catches `SELECT ... INTO`, which creates a table.
+/// Deliberately conservative: anything it cannot prove harmless is "no",
+/// and a wrong "no" only costs a retry. True only when all of these hold:
+///
+/// - the text is ASCII, with no `;` (anywhere, even in a literal), no
+///   comment (`--`, `/*`), no string literal or dollar quote (`'`, `$` not
+///   followed by a digit), no `&` (`U&"..."` identifiers), no `\` and no
+///   `::` cast, which could run a user-defined cast;
+/// - the first token is `SELECT` or `WITH`;
+/// - no bare `INSERT`, `UPDATE` (also `FOR UPDATE`), `DELETE`, `MERGE` or
+///   `INTO` (`SELECT ... INTO` creates a table);
+/// - every `(` follows punctuation, a word in [`CALL_ALLOWLIST`] that is not
+///   qualified (`schema.count(` is a different function), or a quoted
+///   identifier right after `WITH` or `WITH RECURSIVE` (a CTE's column
+///   list). A quoted name anywhere else before `(` may be a call.
+///   Whitespace between a name and `(` changes nothing.
 pub fn is_read_only_statement(sql: &str) -> bool {
-    let mut words = sql
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .filter(|word| !word.is_empty());
-    let Some(first) = words.next() else {
+    if !sql.is_ascii()
+        || sql.contains([';', '\'', '&', '\\'])
+        || sql.contains("--")
+        || sql.contains("/*")
+        || sql.contains("::")
+    {
+        return false;
+    }
+    let bytes = sql.as_bytes();
+    if bytes
+        .iter()
+        .enumerate()
+        .any(|(i, b)| *b == b'$' && !bytes.get(i + 1).is_some_and(u8::is_ascii_digit))
+    {
+        return false;
+    }
+    let Some(tokens) = tokens(sql) else {
         return false;
     };
-    // The first word must also be the statement's first token: `(SELECT`
-    // or a leading comment is not classified.
-    if !sql.trim_start().starts_with(first) {
+    let is_word = |token: Option<&Token<'_>>, keyword: &str| matches!(token, Some(Token::Word(word)) if word.eq_ignore_ascii_case(keyword));
+    if !(is_word(tokens.first(), "SELECT") || is_word(tokens.first(), "WITH")) {
         return false;
     }
-    if !(first.eq_ignore_ascii_case("SELECT") || first.eq_ignore_ascii_case("WITH")) {
-        return false;
+    for (i, token) in tokens.iter().enumerate() {
+        match token {
+            Token::Word(word)
+                if WRITE_KEYWORDS
+                    .iter()
+                    .any(|keyword| word.eq_ignore_ascii_case(keyword)) =>
+            {
+                return false;
+            }
+            Token::Punct(b'(') => {
+                let before = i.checked_sub(1).map(|j| &tokens[j]);
+                let before_that = i.checked_sub(2).map(|j| &tokens[j]);
+                let allowed = match before {
+                    None | Some(Token::Punct(b'.')) => false,
+                    Some(Token::Punct(_)) => true,
+                    Some(Token::Word(word)) => {
+                        !matches!(before_that, Some(Token::Punct(b'.')))
+                            && CALL_ALLOWLIST
+                                .iter()
+                                .any(|allowed| word.eq_ignore_ascii_case(allowed))
+                    }
+                    Some(Token::Quoted) => {
+                        is_word(before_that, "WITH") || is_word(before_that, "RECURSIVE")
+                    }
+                };
+                if !allowed {
+                    return false;
+                }
+            }
+            _ => {}
+        }
     }
-    !words.any(|word| {
-        WRITE_KEYWORDS
-            .iter()
-            .any(|keyword| word.eq_ignore_ascii_case(keyword))
-    })
+    true
 }
 
 #[cfg(test)]
@@ -576,7 +761,7 @@ mod tests {
 
     #[test]
     fn connection_class_errors_are_recognized_in_every_wrapper() {
-        let positives: [fn() -> SqlxError; 10] = [
+        let positives: [fn() -> SqlxError; 13] = [
             || SqlxError::Io(io::Error::from(io::ErrorKind::ConnectionReset)),
             || SqlxError::Io(io::Error::from(io::ErrorKind::UnexpectedEof)),
             || SqlxError::Io(io::Error::from(io::ErrorKind::BrokenPipe)),
@@ -586,6 +771,9 @@ mod tests {
             || sqlstate("57P01"),
             || sqlstate("57P02"),
             || sqlstate("57P03"),
+            || sqlstate("57P04"),
+            || sqlstate("57P05"),
+            || sqlstate("25P03"),
             || sqlstate("08006"),
         ];
         for make in positives {
@@ -697,9 +885,122 @@ mod tests {
         }
     }
 
+    /// Calls that may have side effects, and every way to hide one, are
+    /// never classified read-only (Astra's review of TC-951).
+    #[test]
+    fn side_effects_and_hidden_calls_are_not_read_only() {
+        for unsafe_sql in [
+            // Volatile and side-effecting functions, bare or bound.
+            "SELECT nextval('s')",
+            "SELECT nextval($1)",
+            "SELECT setval($1, $2)",
+            "SELECT currval($1)",
+            "SELECT pg_advisory_lock($1)",
+            "SELECT pg_advisory_xact_lock($1)",
+            "SELECT pg_terminate_backend($1)",
+            "SELECT set_config($1, $2, $3)",
+            "SELECT lo_create($1)",
+            "SELECT lo_unlink($1)",
+            "SELECT my_function($1)",
+            "SELECT \"t\".\"c\" FROM \"t\" WHERE \"t\".\"c\" = touch($1)",
+            "WITH x AS (SELECT nextval($1)) SELECT * FROM x",
+            // Whitespace between the name and `(`.
+            "SELECT nextval ($1)",
+            "SELECT nextval\n($1)",
+            "SELECT nextval\t\r\n  ($1)",
+            // Qualified calls: an allowlisted basename is a different function.
+            "SELECT evil.count($1)",
+            "SELECT pg_catalog.count(*) FROM t",
+            "SELECT \"evil\".\"count\"(*) FROM t",
+            "SELECT \"evil\".count(*) FROM t",
+            // Quoted and escaped names before `(`.
+            "SELECT \"count\"(*) FROM t",
+            "SELECT \"nextval\"($1)",
+            "SELECT \"nextval\" ($1)",
+            "SELECT U&\"nextval\"($1)",
+            "SELECT u&\"\\006Eextval\"($1)",
+            "SELECT 1, \"f\"($1) AS x",
+            // Comments, which must never be stripped before classifying.
+            "SELECT nextval/*x*/($1)",
+            "SELECT 1 -- harmless",
+            "SELECT /* */ 1",
+            // Multiple statements, a `;` in a literal included.
+            "SELECT 1; TRUNCATE TABLE t",
+            "SELECT 1;",
+            "SELECT 'a;b'",
+            // Writes, locks, table creation.
+            "SELECT * INTO new_table FROM t",
+            "SELECT * FROM t FOR UPDATE",
+            "SELECT * FROM t FOR NO KEY UPDATE",
+            "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d",
+            // Casts, literals, dollar quotes, non-ASCII.
+            "SELECT $1::regclass",
+            "SELECT $tag$x$tag$",
+            "SELECT E'\\x'",
+            "SELECT nеxtval($1)",
+            // Not a statement we classify.
+            "TRUNCATE TABLE t",
+            "VALUES (1)",
+            "(SELECT 1)",
+            "SELECT \"unterminated",
+        ] {
+            assert!(!is_read_only_statement(unsafe_sql), "{unsafe_sql}");
+        }
+        for read in [
+            "SELECT COUNT(*) FROM t WHERE c IN ($1, $2)",
+            "SELECT count (*) FROM t",
+            "SELECT MAX(\"t\".\"seq\") AS \"m\" FROM \"t\" WHERE NOT EXISTS (SELECT $1)",
+            "SELECT coalesce(\"a\", $1) FROM \"t\" WHERE \"b\" = ANY($2)",
+            "WITH \"x\" (\"a\") AS (SELECT $1) SELECT \"a\" FROM \"x\"",
+        ] {
+            assert!(is_read_only_statement(read), "{read}");
+        }
+    }
+
+    /// Every autocommit statement PostgreSQL logged for sign-in, KV put,
+    /// KV get and SQL in the TC-946 lab (texts with `$n`, no values). Each
+    /// read must stay retryable, so the allowlist cannot silently switch
+    /// recovery off on the hot paths, and each write must not.
+    #[test]
+    fn logged_autocommit_statements_keep_their_classification() {
+        let corpus = include_str!("../tests/fixtures/postgres-autocommit-statements.txt");
+        let (mut reads, mut writes) = (0, 0);
+        for statement in corpus.lines().filter(|line| !line.trim().is_empty()) {
+            let words = statement
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter(|word| !word.is_empty())
+                .collect::<Vec<_>>();
+            let writes_rows = words.iter().any(|word| {
+                ["INSERT", "UPDATE", "DELETE"]
+                    .iter()
+                    .any(|keyword| word.eq_ignore_ascii_case(keyword))
+            });
+            let read = matches!(words.first(), Some(&"SELECT") | Some(&"WITH")) && !writes_rows;
+            assert_eq!(is_read_only_statement(statement), read, "{statement}");
+            if read {
+                reads += 1;
+            } else {
+                writes += 1;
+            }
+        }
+        assert_eq!((reads, writes), (20, 12));
+    }
+
+    #[test]
+    fn long_idle_connections_are_revalidated_without_a_loss() {
+        let recovery = PoolRecovery::new();
+        assert!(!recovery.needs_revalidation(IDLE_REVALIDATE_AFTER - Duration::from_millis(1)));
+        assert!(recovery.needs_revalidation(IDLE_REVALIDATE_AFTER));
+        let fast = PoolRecovery::with_idle_revalidation(Duration::from_millis(500));
+        assert!(!fast.needs_revalidation(Duration::from_millis(499)));
+        assert!(fast.needs_revalidation(Duration::from_millis(500)));
+        assert_eq!(fast.stats(), PoolRecoveryStats::default());
+    }
+
     #[test]
     fn revalidation_covers_only_connections_released_before_a_loss() {
-        let recovery = PoolRecovery::new();
+        // The loss rule alone: no idle threshold.
+        let recovery = PoolRecovery::with_idle_revalidation(Duration::MAX);
         assert!(!recovery.needs_revalidation(Duration::from_secs(3600)));
         std::thread::sleep(Duration::from_millis(20));
         recovery.mark_lost();
