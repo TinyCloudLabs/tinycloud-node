@@ -2,7 +2,7 @@
 
 The tee.node production ingress has nginx's default `large_client_header_buffers 4 8k`. Session activation (`POST /delegate`) places the signed delegation in one `Authorization` header; replication login headers can exceed 8 KiB and fail with `400 Request Header Or Cookie Too Large`.
 
-`deploy/ingress/Dockerfile` wraps the pinned `dstacktee/dstack-ingress:1.4` image and copies `header-buffers.conf` to `/etc/nginx/conf.d/00-header-buffers.conf`. 1.20.1 shipped the wrapper on `dstack-ingress:20250924`; #261 moved it to `1.4`, which also honours `CLIENT_MAX_BODY_SIZE` (200 MB) and the proxy timeouts set in the compose. The directive `large_client_header_buffers 4 32k;` resides in the nginx `http {}` context. The prefixed filename is loaded before its generated `default.conf` server block. This raises the per-header-line capacity while retaining four buffers.
+`deploy/ingress/Dockerfile` wraps the pinned `dstacktee/dstack-ingress:1.4` image and copies `header-buffers.conf` to `/etc/nginx/conf.d/00-header-buffers.conf`. 1.20.1 shipped the wrapper on `dstack-ingress:20250924`; #261 moved it to `1.4`, which also honours `CLIENT_MAX_BODY_SIZE`. The compose sets it to 32 MB and leaves the proxy timeouts at nginx's defaults (TC-940). The directive `large_client_header_buffers 4 32k;` resides in the nginx `http {}` context. The prefixed filename is loaded before its generated `default.conf` server block. This raises the per-header-line capacity while retaining four buffers.
 
 The upstream entrypoint's `setup_nginx_conf` generates `default.conf`; it does not remove the custom `00-header-buffers.conf` drop-in. The directive is valid in `http` context.
 
