@@ -212,7 +212,7 @@ jobs:
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       with:
         shared-key: rust-1.97.1-test-m1-realdata
-        workspaces: test/m1-realdata-e2e -> test/m1-realdata-e2e/target
+        workspaces: test/m1-realdata-e2e -> target
         save-if: ${{ github.ref == 'refs/heads/main' }}
     - uses: actions/setup-python@v5
       with:
