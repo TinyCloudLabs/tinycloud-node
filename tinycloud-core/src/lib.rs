@@ -4,6 +4,7 @@ pub mod database_artifacts;
 pub mod database_identity;
 pub mod database_migration;
 pub mod db;
+pub mod db_pool;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 pub mod encryption;
@@ -36,6 +37,7 @@ pub use db::{
     Commit, DelegationStatus, InvocationOutcome, KvBatchReadItem, KvBatchReadValue,
     KvInvokeOptions, KvPrecondition, SpaceDatabase, TransactResult, TxError, TxStoreError,
 };
+pub use db_pool::RecoveringConnection;
 pub use encryption::ColumnEncryption;
 pub use libp2p;
 pub use sea_orm;

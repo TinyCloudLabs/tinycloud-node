@@ -1,4 +1,5 @@
 use crate::admission::AdmittedInvocation;
+use crate::db_pool::RecoveringConnection;
 use crate::encryption::ColumnEncryption;
 use crate::events::{
     epoch_hash, Delegation, Event, HashError, Invocation, Operation, Revocation, SerializedEvent,
@@ -318,12 +319,18 @@ where
     }
 }
 
-impl<B, K> SpaceDatabase<DatabaseConnection, B, K> {
-    pub async fn new(conn: DatabaseConnection, storage: B, secrets: K) -> Result<Self, DbErr> {
-        Migrator::up(&conn, None).await?;
-        let writer_lock = (conn.get_database_backend() == sea_orm::DatabaseBackend::Sqlite)
+impl<C, B, K> SpaceDatabase<C, B, K>
+where
+    C: ConnectionTrait + Clone + Into<RecoveringConnection>,
+{
+    pub async fn new(conn: C, storage: B, secrets: K) -> Result<Self, DbErr> {
+        let pool: RecoveringConnection = conn.clone().into();
+        // sea-orm-migration's schema manager accepts only the raw sea-orm
+        // connection. Migrations run once at boot, before any request.
+        Migrator::up(pool.sea_orm_connection(), None).await?;
+        let writer_lock = (pool.get_database_backend() == sea_orm::DatabaseBackend::Sqlite)
             .then(|| Arc::new(tokio::sync::Mutex::new(())));
-        let read_audit = ReadAuditPipeline::start(conn.clone(), writer_lock.clone());
+        let read_audit = ReadAuditPipeline::start(pool, writer_lock.clone());
         Ok(Self {
             conn,
             storage,

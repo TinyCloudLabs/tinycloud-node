@@ -29,9 +29,9 @@ impl SqlSizes {
     /// `TinyCloud::new` (which runs `Migrator::up`, db.rs:142) has created the
     /// `database_artifact` table. A constructor that SELECTs before migrations
     /// would hit a nonexistent table and fail boot on a fresh datadir.
-    pub async fn seed_from(
+    pub async fn seed_from<C: sea_orm::ConnectionTrait>(
         &self,
-        conn: &sea_orm::DatabaseConnection,
+        conn: &C,
     ) -> Result<(), sea_orm::DbErr> {
         use crate::models::database_artifact::{Column, Entity};
         use sea_orm::{EntityTrait, QuerySelect};

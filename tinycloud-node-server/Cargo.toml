@@ -117,6 +117,9 @@ bs58 = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 k256 = { version = "0.13.4", features = ["ecdsa"] }
 sha3 = "0.10"
+# The Rust half of the JS SDK: builds the same host and session SIWE
+# delegations a real `signIn` sends (tests/postgres_round_trip_budget.rs).
+tinycloud-sdk-wasm = { path = "../tinycloud-sdk-wasm" }
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 hyper = { version = "0.14", features = ["http1", "server", "tcp"] }
 libp2p-identity = { version = "0.2", features = ["ed25519"] }

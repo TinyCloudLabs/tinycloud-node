@@ -4,9 +4,9 @@ use rocket::http::Status;
 use time::{Duration, OffsetDateTime};
 use tinycloud_core::models::invocation_replay;
 use tinycloud_core::sea_orm::{
-    sea_query::OnConflict, ActiveValue::Set, ColumnTrait, Condition, DatabaseConnection,
-    EntityTrait, QueryFilter,
+    sea_query::OnConflict, ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryFilter,
 };
+use tinycloud_core::RecoveringConnection;
 use tinycloud_core::{
     events::Invocation,
     hash::{hash, Hash},
@@ -39,14 +39,14 @@ pub enum InvocationReplayError {
 
 #[derive(Clone)]
 pub struct InvocationReplayCache {
-    conn: DatabaseConnection,
+    conn: RecoveringConnection,
     sqlite_writer_lock: Option<Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl InvocationReplayCache {
-    pub fn new(conn: DatabaseConnection) -> Self {
+    pub fn new(conn: impl Into<RecoveringConnection>) -> Self {
         Self {
-            conn,
+            conn: conn.into(),
             sqlite_writer_lock: None,
         }
     }
@@ -313,7 +313,7 @@ mod tests {
                 .await
                 .unwrap();
         let node = crate::TinyCloud::new(
-            connection,
+            connection.into(),
             Either::B(storage),
             tinycloud_core::keys::StaticSecret::new(vec![7u8; 64]).unwrap(),
         )

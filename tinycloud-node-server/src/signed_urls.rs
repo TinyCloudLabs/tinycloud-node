@@ -613,7 +613,7 @@ mod tests {
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
         let _persisted = tempdir.keep();
         Ok(TinyCloud::new(
-            db,
+            db.into(),
             Either::B(storage),
             StaticSecret::new(vec![0u8; 32]).unwrap(),
         )

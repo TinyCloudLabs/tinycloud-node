@@ -3858,7 +3858,7 @@ mod tests {
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
         let _persisted = tempdir.keep();
         Ok(TinyCloud::new(
-            db,
+            db.into(),
             Either::B(storage),
             StaticSecret::new(vec![0u8; 32]).unwrap(),
         )
@@ -4666,7 +4666,7 @@ mod tests {
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
         let _persisted = tempdir.keep();
         let tinycloud = TinyCloud::new(
-            db.clone(),
+            db.clone().into(),
             Either::B(storage),
             StaticSecret::new(vec![0u8; 32]).unwrap(),
         )
@@ -4938,7 +4938,7 @@ mod tests {
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
         let _persisted = tempdir.keep();
         let tinycloud = TinyCloud::new(
-            db.clone(),
+            db.clone().into(),
             Either::B(storage),
             StaticSecret::new(vec![0u8; 32]).unwrap(),
         )
@@ -6314,7 +6314,7 @@ mod tests {
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
         let _persisted = tempdir.keep();
         let tinycloud = TinyCloud::new(
-            auth_db.clone(),
+            auth_db.clone().into(),
             Either::B(storage),
             StaticSecret::new(vec![0u8; 32]).unwrap(),
         )
@@ -7291,7 +7291,7 @@ mod tests {
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
         let _persisted = tempdir.keep();
         let tinycloud = TinyCloud::new(
-            db.clone(),
+            db.clone().into(),
             Either::B(storage),
             StaticSecret::new(vec![0u8; 32]).unwrap(),
         )
@@ -7493,7 +7493,7 @@ mod tests {
         let db_a = Database::connect(crate::sqlite_connect_options(&db_url)).await?;
         let storage_fa = NodeFileSystemConfig::new(&storage_a).open().await?;
         let tc_a = TinyCloud::new(
-            db_a.clone(),
+            db_a.clone().into(),
             Either::B(storage_fa),
             StaticSecret::new(vec![0u8; 32]).unwrap(),
         )
@@ -7502,7 +7502,7 @@ mod tests {
         let db_b = Database::connect(crate::sqlite_connect_options(&db_url)).await?;
         let storage_fb = NodeFileSystemConfig::new(&storage_b).open().await?;
         let tc_b = TinyCloud::new(
-            db_b.clone(),
+            db_b.clone().into(),
             Either::B(storage_fb),
             StaticSecret::new(vec![0u8; 32]).unwrap(),
         )
@@ -8123,7 +8123,7 @@ mod tests {
         )?;
         let _persisted = tempdir.keep();
         let tinycloud = TinyCloud::new(
-            db.clone(),
+            db.clone().into(),
             Either::B(storage),
             StaticSecret::new(vec![0u8; 32]).unwrap(),
         )

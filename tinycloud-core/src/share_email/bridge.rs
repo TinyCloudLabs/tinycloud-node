@@ -19,8 +19,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::{rngs::OsRng, RngCore};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    TransactionTrait,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -64,7 +63,7 @@ use super::{
 /// effects are transactionally atomic per call.
 #[derive(Clone)]
 pub struct DatabaseAuthorityBridge117 {
-    conn: DatabaseConnection,
+    conn: crate::db_pool::RecoveringConnection,
     authority: DatabaseAuthorityStore,
     authority_material: Option<Arc<dyn AuthorityMaterialProvider>>,
     status_provider: Option<Arc<dyn FreshAuthenticatedStatusProvider>>,
@@ -449,9 +448,12 @@ impl DatabaseAuthorityBridge117 {
 
     /// `conn` and `authority` must share the same underlying database so a
     /// transaction begun on `conn` is visible to `authority`'s row locks.
-    pub fn new(conn: DatabaseConnection, authority: DatabaseAuthorityStore) -> Self {
+    pub fn new(
+        conn: impl Into<crate::db_pool::RecoveringConnection>,
+        authority: DatabaseAuthorityStore,
+    ) -> Self {
         Self {
-            conn,
+            conn: conn.into(),
             authority,
             authority_material: None,
             status_provider: None,
