@@ -41,7 +41,7 @@ use tinycloud_core::{
     sea_orm::{
         sea_query::Expr, ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait,
         DatabaseConnection, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
-        Set, TransactionTrait,
+        Set,
     },
     types::SpaceIdWrap,
     util::{DelegationInfo, InvocationInfo},
@@ -1912,7 +1912,9 @@ pub async fn register_policy(
         Some(lock) => Some(lock.lock().await),
         None => None,
     };
-    let txn = runtime.conn.begin().await.map_err(db_error)?;
+    let txn = tinycloud_core::db::begin_write_transaction(&runtime.conn, None)
+        .await
+        .map_err(db_error)?;
     tinycloud_core::kv_sync::lock_space_sequences(&txn, &sequence_spaces)
         .await
         .map_err(db_error)?;
@@ -2447,7 +2449,9 @@ pub async fn mint(
         Some(lock) => Some(lock.lock().await),
         None => None,
     };
-    let txn = runtime.conn.begin().await.map_err(db_error)?;
+    let txn = tinycloud_core::db::begin_write_transaction(&runtime.conn, None)
+        .await
+        .map_err(db_error)?;
     tinycloud_core::kv_sync::lock_space_sequences(&txn, &sequence_spaces)
         .await
         .map_err(db_error)?;

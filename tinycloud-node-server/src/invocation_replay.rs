@@ -593,3 +593,6 @@ mod tests {
         assert_eq!(statements.load(Ordering::SeqCst), 1);
     }
 }
+
+#[cfg(test)]
+mod write_snapshot_tests;
