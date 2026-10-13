@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - The Postgres pool no longer pings an idle connection before every statement, which removes about half of the node's Postgres round trips. A connection lost while idle (a failover, an idle-session timeout, a dropped socket) is handled instead: `BEGIN` and read-only statements that fail on a lost connection are retried once, never writes or `COMMIT`; and once a loss is seen, the pool pings a connection before reuse only if it was already idle when that loss was seen. A failover costs at most one non-retryable failure instead of a run of 500s. New metric: `tinycloud_db_connection_events_total{event="lost|retried|revalidated|revalidation_failed"}` (TC-951).
+- The SQL/DuckDB identity-fence cache refresh finds unregistered legacy artifacts with one `NOT EXISTS` query instead of loading every legacy row and artifact name into the node. The fence decision and the 1 s cache TTL are unchanged; MySQL keeps the exact comparison. No schema change (TC-951, from #254).
 
 ## [1.20.3] - 2026-10-13
 
