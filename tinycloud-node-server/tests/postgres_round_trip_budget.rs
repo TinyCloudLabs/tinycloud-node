@@ -114,13 +114,14 @@ use tokio::{
 };
 
 /// Round trips allowed per flow; see the module docs. Measured with
-/// `test_before_acquire(false)` (TC-951):
+/// `test_before_acquire(false)`, database identity resolve as one statement,
+/// the read audit as one statement and no second sequence lock (TC-951):
 ///
-/// - sign-in 92 = peer key 0 + host `/delegate` 17 + session `/delegate` 18
-///   + account-space SQL write 57;
-/// - kv put 38;
-/// - kv get 27, including the read-audit commit.
-const BUDGETS: [(&str, u64); 3] = [("sign-in", 92), ("kv put", 38), ("kv get", 27)];
+/// - sign-in 75 = peer key 0 + host `/delegate` 17 + session `/delegate` 18
+///   + account-space SQL write 40;
+/// - kv put 37;
+/// - kv get 22, including the read-audit commit.
+const BUDGETS: [(&str, u64); 3] = [("sign-in", 75), ("kv put", 37), ("kv get", 22)];
 
 /// Full sign-in plus put plus get rounds run before the measured one.
 const WARM_UP_ROUNDS: u8 = 3;

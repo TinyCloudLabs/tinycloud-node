@@ -16,7 +16,10 @@ use crate::{
     types::{Ability, Resource},
 };
 use sea_orm::{
-    sea_query::OnConflict, ActiveValue::Set, ConnectionTrait, DbErr, EntityTrait, TransactionTrait,
+    sea_query::{Alias, CommonTableExpression, OnConflict, WithClause},
+    ActiveValue::Set,
+    ConnectionTrait, DbBackend, DbErr, EntityTrait, Insert, QueryTrait, Statement,
+    TransactionTrait,
 };
 use std::collections::HashSet;
 use std::sync::{
@@ -156,15 +159,78 @@ async fn run_pipeline(
     }
 }
 
-async fn persist_batch<C: TransactionTrait>(conn: &C, batch: &[Command]) -> Result<(), DbErr> {
+async fn persist_batch(conn: &RecoveringConnection, batch: &[Command]) -> Result<(), DbErr> {
+    let inserts = audit_inserts(batch);
+    if conn.get_database_backend() == DbBackend::Postgres {
+        if let Some(statement) = inserts.as_ref().and_then(postgres_single_statement) {
+            // Every INSERT in the statement is `ON CONFLICT DO NOTHING` on
+            // keys fixed by the batch, and the readers wait only for "the
+            // rows exist", so running it again after a lost connection is a
+            // no-op if the first run committed (TC-951).
+            return conn.execute_idempotent(statement).await.map(|_| ());
+        }
+    }
     let tx = conn.begin().await?;
-    persist_records(&tx, batch).await?;
+    if let Some(inserts) = inserts {
+        persist_inserts(&tx, inserts).await?;
+    }
     tx.commit().await
 }
 
-/// Persist an entire drained batch with a constant number of statements — at
-/// most one `insert_many` per table — instead of the previous ~4 statements
-/// per record.
+/// PostgreSQL commits the batch's INSERTs as one statement instead of
+/// `BEGIN`, one statement per table and `COMMIT` (6 sequential round-trips
+/// for a typical read). The INSERTs are exactly those `persist_inserts` runs,
+/// with the same rows and `ON CONFLICT DO NOTHING` targets, as data-modifying
+/// CTEs of the invocation INSERT. One statement is atomic on its own, and
+/// PostgreSQL checks the foreign keys between these tables (invocation to
+/// actor, invoked ability to invocation, parent edge to delegation) at the end
+/// of the statement, so rows inserted by a sibling CTE satisfy them.
+/// PostgreSQL does not define the order in which the CTEs run, so their rows
+/// may be locked in a different order than the old transaction's; only two
+/// writers of the same invocation id could notice, and the invocation replay
+/// guard admits an invocation once.
+///
+/// `None` when the combined statement would bind more than the 65,535
+/// parameters PostgreSQL's protocol allows (each per-table statement had that
+/// limit on its own); `persist_batch` then takes the transactional path.
+fn postgres_single_statement(inserts: &AuditInserts) -> Option<Statement> {
+    let mut ctes = WithClause::new();
+    let mut any_cte = false;
+    for (name, insert) in [
+        (
+            "read_audit_actor",
+            inserts.actors.as_ref().map(|i| i.as_query().clone()),
+        ),
+        (
+            "read_audit_invoked_abilities",
+            inserts.abilities.as_ref().map(|i| i.as_query().clone()),
+        ),
+        (
+            "read_audit_parent_delegation",
+            inserts.parents.as_ref().map(|i| i.as_query().clone()),
+        ),
+    ] {
+        if let Some(insert) = insert {
+            ctes.cte(
+                CommonTableExpression::new()
+                    .table_name(Alias::new(name))
+                    .query(insert)
+                    .to_owned(),
+            );
+            any_cte = true;
+        }
+    }
+    let mut statement = inserts.invocations.as_query().clone();
+    if any_cte {
+        statement.with_cte(ctes);
+    }
+    let statement = DbBackend::Postgres.build(&statement);
+    let parameters = statement.values.as_ref().map_or(0, |values| values.0.len());
+    (parameters <= usize::from(u16::MAX)).then_some(statement)
+}
+
+/// The INSERTs that persist one drained batch: at most one `insert_many` per
+/// table, instead of the previous ~4 statements per record.
 ///
 /// Every VALUES list is deduplicated by its `ON CONFLICT` target before it is
 /// sent. This is mandatory once rows are batched: some backends (notably
@@ -178,7 +244,15 @@ async fn persist_batch<C: TransactionTrait>(conn: &C, batch: &[Command]) -> Resu
 /// `ON CONFLICT DO NOTHING` targets, the already-encrypted `serialization`
 /// bytes carried verbatim from each record, and — because inserts stay
 /// conflict-idempotent — identical final table contents and no-op re-persists.
-async fn persist_records<C: ConnectionTrait>(db: &C, batch: &[Command]) -> Result<(), DbErr> {
+struct AuditInserts {
+    actors: Option<Insert<actor::ActiveModel>>,
+    invocations: Insert<invocation::ActiveModel>,
+    abilities: Option<Insert<invoked_abilities::ActiveModel>>,
+    parents: Option<Insert<parent_delegations::ActiveModel>>,
+}
+
+/// `None` for a batch with no records.
+fn audit_inserts(batch: &[Command]) -> Option<AuditInserts> {
     // Collapse repeated invocations (identical concurrent reads hash to the
     // same id) to their first occurrence so every downstream VALUES list is
     // duplicate-free at the invocation level.
@@ -190,7 +264,7 @@ async fn persist_records<C: ConnectionTrait>(db: &C, batch: &[Command]) -> Resul
         .collect();
 
     if records.is_empty() {
-        return Ok(());
+        return None;
     }
 
     // 1. Actors — one row per distinct invoker.
@@ -202,18 +276,13 @@ async fn persist_records<C: ConnectionTrait>(db: &C, batch: &[Command]) -> Resul
             id: Set(record.invoker.clone()),
         })
         .collect();
-    if !actors.is_empty() {
-        ignore_record_not_inserted(
-            actor::Entity::insert_many(actors)
-                .on_conflict(
-                    OnConflict::column(actor::Column::Id)
-                        .do_nothing()
-                        .to_owned(),
-                )
-                .exec(db)
-                .await,
-        )?;
-    }
+    let actors = (!actors.is_empty()).then(|| {
+        actor::Entity::insert_many(actors).on_conflict(
+            OnConflict::column(actor::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+    });
 
     // 2. Invocations — one row per distinct invocation (records already deduped).
     let invocations: Vec<invocation::ActiveModel> = records
@@ -226,16 +295,11 @@ async fn persist_records<C: ConnectionTrait>(db: &C, batch: &[Command]) -> Resul
             serialization: Set(record.serialization.clone()),
         })
         .collect();
-    ignore_record_not_inserted(
-        invocation::Entity::insert_many(invocations)
-            .on_conflict(
-                OnConflict::column(invocation::Column::Id)
-                    .do_nothing()
-                    .to_owned(),
-            )
-            .exec(db)
-            .await,
-    )?;
+    let invocations = invocation::Entity::insert_many(invocations).on_conflict(
+        OnConflict::column(invocation::Column::Id)
+            .do_nothing()
+            .to_owned(),
+    );
 
     // 3. Invoked abilities — every (invocation, resource, ability) across the
     //    batch, deduplicated by the full primary key.
@@ -260,22 +324,17 @@ async fn persist_records<C: ConnectionTrait>(db: &C, batch: &[Command]) -> Resul
             },
         )
         .collect();
-    if !abilities.is_empty() {
-        ignore_record_not_inserted(
-            invoked_abilities::Entity::insert_many(abilities)
-                .on_conflict(
-                    OnConflict::columns([
-                        invoked_abilities::Column::Invocation,
-                        invoked_abilities::Column::Resource,
-                        invoked_abilities::Column::Ability,
-                    ])
-                    .do_nothing()
-                    .to_owned(),
-                )
-                .exec(db)
-                .await,
-        )?;
-    }
+    let abilities = (!abilities.is_empty()).then(|| {
+        invoked_abilities::Entity::insert_many(abilities).on_conflict(
+            OnConflict::columns([
+                invoked_abilities::Column::Invocation,
+                invoked_abilities::Column::Resource,
+                invoked_abilities::Column::Ability,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+    });
 
     // 4. Parent delegations — every (parent, child) across the batch,
     //    deduplicated by the full primary key.
@@ -292,22 +351,44 @@ async fn persist_records<C: ConnectionTrait>(db: &C, batch: &[Command]) -> Resul
             child: Set(child),
         })
         .collect();
-    if !parents.is_empty() {
-        ignore_record_not_inserted(
-            parent_delegations::Entity::insert_many(parents)
-                .on_conflict(
-                    OnConflict::columns([
-                        parent_delegations::Column::Parent,
-                        parent_delegations::Column::Child,
-                    ])
-                    .do_nothing()
-                    .to_owned(),
-                )
-                .exec(db)
-                .await,
-        )?;
-    }
+    let parents = (!parents.is_empty()).then(|| {
+        parent_delegations::Entity::insert_many(parents).on_conflict(
+            OnConflict::columns([
+                parent_delegations::Column::Parent,
+                parent_delegations::Column::Child,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+    });
 
+    Some(AuditInserts {
+        actors,
+        invocations,
+        abilities,
+        parents,
+    })
+}
+
+/// Persist a drained batch inside the caller's transaction with one statement
+/// per table (SQLite, MySQL, and PostgreSQL past the parameter limit).
+async fn persist_inserts<C: ConnectionTrait>(db: &C, inserts: AuditInserts) -> Result<(), DbErr> {
+    let AuditInserts {
+        actors,
+        invocations,
+        abilities,
+        parents,
+    } = inserts;
+    if let Some(actors) = actors {
+        ignore_record_not_inserted(actors.exec(db).await)?;
+    }
+    ignore_record_not_inserted(invocations.exec(db).await)?;
+    if let Some(abilities) = abilities {
+        ignore_record_not_inserted(abilities.exec(db).await)?;
+    }
+    if let Some(parents) = parents {
+        ignore_record_not_inserted(parents.exec(db).await)?;
+    }
     Ok(())
 }
 
@@ -482,6 +563,42 @@ mod tests {
     #[tokio::test]
     async fn batched_persist_matches_per_record_contents_and_is_idempotent() {
         let conn = database("sqlite::memory:".to_string(), 1).await;
+        assert_batched_persist_contents(&conn, persist_batch_boxed).await;
+    }
+
+    /// How a test persists a batch: `persist_batch` (one statement on
+    /// PostgreSQL), or the transaction of per-table INSERTs it replaces there.
+    type Persist = for<'a> fn(
+        &'a DatabaseConnection,
+        &'a [Command],
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), DbErr>> + Send + 'a>,
+    >;
+
+    fn persist_batch_boxed<'a>(
+        conn: &'a DatabaseConnection,
+        batch: &'a [Command],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DbErr>> + Send + 'a>> {
+        Box::pin(
+            async move { persist_batch(&RecoveringConnection::new(conn.clone()), batch).await },
+        )
+    }
+
+    fn persist_in_transaction<'a>(
+        conn: &'a DatabaseConnection,
+        batch: &'a [Command],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DbErr>> + Send + 'a>> {
+        Box::pin(async move {
+            let tx = conn.begin().await?;
+            if let Some(inserts) = audit_inserts(batch) {
+                persist_inserts(&tx, inserts).await?;
+            }
+            tx.commit().await
+        })
+    }
+
+    async fn assert_batched_persist_contents(conn: &DatabaseConnection, persist: Persist) {
+        let conn = conn.clone();
 
         let parent_one = crate::hash::hash(b"parent-one");
         let parent_two = crate::hash::hash(b"parent-two");
@@ -516,7 +633,7 @@ mod tests {
         let bob_id = bob.id;
 
         let batch = vec![command(alice1), command(alice2), command(bob)];
-        persist_batch(&conn, &batch).await.unwrap();
+        persist(&conn, &batch).await.unwrap();
 
         // Actors: the duplicate invoker collapses to one row.
         let actors: HashSet<String> = actor::Entity::find()
@@ -584,7 +701,7 @@ mod tests {
         assert_eq!(parent_rows, expected_parents);
 
         // Re-persisting the identical batch is a no-op (ON CONFLICT DO NOTHING).
-        persist_batch(&conn, &batch).await.unwrap();
+        persist(&conn, &batch).await.unwrap();
         assert_eq!(invocation::Entity::find().count(&conn).await.unwrap(), 3);
         assert_eq!(
             invoked_abilities::Entity::find()
@@ -600,5 +717,921 @@ mod tests {
                 .unwrap(),
             3
         );
+    }
+
+    async fn audit_rows(
+        conn: &DatabaseConnection,
+    ) -> (
+        Vec<String>,
+        Vec<(Hash, String, Vec<u8>)>,
+        Vec<(Hash, String, String)>,
+        Vec<(Hash, Hash)>,
+    ) {
+        let mut actors: Vec<String> = actor::Entity::find()
+            .all(conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .filter(|id| id != "did:key:parent-authority")
+            .collect();
+        let mut invocations: Vec<(Hash, String, Vec<u8>)> = invocation::Entity::find()
+            .all(conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.id, row.invoker, row.serialization))
+            .collect();
+        let mut abilities: Vec<(Hash, String, String)> = invoked_abilities::Entity::find()
+            .all(conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.invocation,
+                    row.resource.to_string(),
+                    row.ability.to_string(),
+                )
+            })
+            .collect();
+        let mut parents: Vec<(Hash, Hash)> = parent_delegations::Entity::find()
+            .all(conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.parent, row.child))
+            .collect();
+        actors.sort();
+        invocations.sort_by(|left, right| left.0.as_ref().cmp(right.0.as_ref()));
+        abilities.sort_by(|left, right| {
+            (left.0.as_ref(), &left.1, &left.2).cmp(&(right.0.as_ref(), &right.1, &right.2))
+        });
+        parents.sort_by(|left, right| {
+            (left.0.as_ref(), left.1.as_ref()).cmp(&(right.0.as_ref(), right.1.as_ref()))
+        });
+        (actors, invocations, abilities, parents)
+    }
+
+    /// PostgreSQL persists a batch as one statement. The same batch persisted
+    /// by the transaction of per-table INSERTs it replaced (in a second,
+    /// isolated schema) leaves exactly the same rows, a failing batch leaves
+    /// none of its rows on either path, and concurrent reads still group
+    /// commit and are durable.
+    #[tokio::test]
+    async fn postgres_read_audit_batch_is_one_atomic_statement_with_unchanged_rows() {
+        use crate::test_support::PostgresTestSchema;
+        use std::sync::atomic::AtomicUsize;
+
+        const TEST: &str = "postgres_read_audit_batch_is_one_atomic_statement_with_unchanged_rows";
+        let Some(transactional) = PostgresTestSchema::new(TEST).await else {
+            return;
+        };
+        let Some(single) = PostgresTestSchema::new(TEST).await else {
+            return;
+        };
+        // The new actors in this batch exercise invocation -> actor, and its
+        // parents invoked_abilities -> invocation and parent -> delegation,
+        // all within one statement.
+        assert_batched_persist_contents(&transactional.conn, persist_in_transaction).await;
+        assert_batched_persist_contents(&single.conn, persist_batch_boxed).await;
+        assert_eq!(
+            audit_rows(&single.conn).await,
+            audit_rows(&transactional.conn).await
+        );
+
+        // One statement per batch on PostgreSQL; the transactional path ran
+        // one per table (plus BEGIN and COMMIT on the wire).
+        let parent = crate::hash::hash(b"parent-one");
+        let batch = || {
+            vec![
+                command(rich_record(
+                    "count-1",
+                    "did:key:count",
+                    vec![(
+                        resource("tinycloud:did:key:ne-delegator:files/kv/count"),
+                        ability("tinycloud.kv/get"),
+                    )],
+                    vec![parent],
+                )),
+                command(rich_record("count-2", "did:key:count", vec![], vec![])),
+            ]
+        };
+        for (conn, persist, expected) in [
+            (&single.conn, persist_batch_boxed as Persist, 1),
+            (&transactional.conn, persist_in_transaction as Persist, 4),
+        ] {
+            let statements = Arc::new(AtomicUsize::new(0));
+            let counter = statements.clone();
+            let mut counted = conn.clone();
+            counted.set_metric_callback(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            });
+            persist(&counted, &batch()).await.unwrap();
+            assert_eq!(statements.load(Ordering::SeqCst), expected);
+        }
+        assert_eq!(
+            audit_rows(&single.conn).await,
+            audit_rows(&transactional.conn).await
+        );
+
+        // A record citing a delegation that does not exist violates the parent
+        // edge's foreign key: the whole batch fails, including its new actor
+        // and the other record's rows.
+        let doomed = vec![
+            command(rich_record("doomed-ok", "did:key:doomed", vec![], vec![])),
+            command(rich_record(
+                "doomed-bad",
+                "did:key:doomed",
+                vec![],
+                vec![crate::hash::hash(b"no-such-delegation")],
+            )),
+        ];
+        for (conn, persist) in [
+            (&single.conn, persist_batch_boxed as Persist),
+            (&transactional.conn, persist_in_transaction as Persist),
+        ] {
+            let before = audit_rows(conn).await;
+            assert!(persist(conn, &doomed).await.is_err());
+            assert_eq!(audit_rows(conn).await, before);
+        }
+
+        // The pipeline itself, without a writer lock as on PostgreSQL in
+        // production: concurrent reads group commit and are durable.
+        let pipeline = ReadAuditPipeline::start(single.conn.clone(), None);
+        let before = invocation::Entity::find()
+            .count(&single.conn)
+            .await
+            .unwrap();
+        let requests = (0..32)
+            .map(|index| {
+                let pipeline = pipeline.clone();
+                tokio::spawn(async move { pipeline.enqueue(record(index)).await })
+            })
+            .collect::<Vec<_>>();
+        for request in requests {
+            request.await.unwrap().unwrap();
+        }
+        let (records, batches) = pipeline.stats();
+        assert_eq!(records, 32);
+        assert!(batches < records, "saturated reads share commits");
+        assert_eq!(
+            invocation::Entity::find()
+                .count(&single.conn)
+                .await
+                .unwrap(),
+            before + 32
+        );
+    }
+
+    #[test]
+    fn single_statement_audit_covers_every_table_and_falls_back_past_the_parameter_limit() {
+        assert!(audit_inserts(&[]).is_none());
+        let single_statement = |batch: &[Command]| {
+            postgres_single_statement(&audit_inserts(batch).expect("a non-empty batch"))
+        };
+
+        let get = ability("tinycloud.kv/get");
+        let batch = vec![command(rich_record(
+            "shape",
+            "did:key:shape",
+            vec![(
+                resource("tinycloud:did:key:ne-delegator:files/kv/a"),
+                get.clone(),
+            )],
+            vec![crate::hash::hash(b"parent")],
+        ))];
+        let sql = single_statement(&batch)
+            .expect("an ordinary batch is one statement")
+            .sql;
+        assert!(sql.starts_with("WITH "), "{sql}");
+        for table in [
+            r#"INSERT INTO "actor""#,
+            r#"INSERT INTO "invoked_abilities""#,
+            r#"INSERT INTO "parent_delegation""#,
+            r#"INSERT INTO "invocation""#,
+        ] {
+            assert_eq!(sql.matches(table).count(), 1, "{table}: {sql}");
+        }
+        assert_eq!(sql.matches("ON CONFLICT").count(), 4, "{sql}");
+        assert!(!sql.contains("RETURNING"), "{sql}");
+
+        // 6 parameters for the actor and invocation, 3 per invoked ability:
+        // past 65,535 the batch takes the transactional path instead.
+        let fits = (65_535 - 6) / 3;
+        let abilities = |count: usize| {
+            (0..count)
+                .map(|index| {
+                    (
+                        resource(&format!("tinycloud:did:key:ne-delegator:files/kv/{index}")),
+                        get.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let at_limit = vec![command(rich_record(
+            "at-limit",
+            "did:key:limit",
+            abilities(fits),
+            vec![],
+        ))];
+        assert!(single_statement(&at_limit).is_some());
+        let past_limit = vec![command(rich_record(
+            "past-limit",
+            "did:key:limit",
+            abilities(fits + 1),
+            vec![],
+        ))];
+        assert!(single_statement(&past_limit).is_none());
+    }
+
+    // PostgreSQL regressions for the read-audit pipeline as a whole (TC-951):
+    // completeness under saturated, overlapping reads, and atomicity when a
+    // batch fails part-way through, on the single statement and the
+    // transactional path alike.
+
+    type RowSets = (
+        HashSet<String>,
+        HashSet<(Hash, String, Vec<u8>)>,
+        HashSet<(Hash, String, String)>,
+        HashSet<(Hash, Hash)>,
+    );
+
+    async fn audit_row_sets(conn: &DatabaseConnection) -> RowSets {
+        let (actors, invocations, abilities, parents) = audit_rows(conn).await;
+        (
+            actors.into_iter().collect(),
+            invocations.into_iter().collect(),
+            abilities.into_iter().collect(),
+            parents.into_iter().collect(),
+        )
+    }
+
+    /// The rows `reads` must leave, derived from the records alone: every
+    /// invoker, one invocation per id, and every capability and parent edge
+    /// of every read.
+    fn expected_rows(reads: &[ReadAuditRecord]) -> RowSets {
+        let mut rows = RowSets::default();
+        for read in reads {
+            rows.0.insert(read.invoker.clone());
+            rows.1
+                .insert((read.id, read.invoker.clone(), read.serialization.clone()));
+            for (resource, ability) in &read.abilities {
+                rows.2
+                    .insert((read.id, resource.to_string(), ability.to_string()));
+            }
+            for parent in &read.parents {
+                rows.3.insert((*parent, read.id));
+            }
+        }
+        rows
+    }
+
+    fn union(mut left: RowSets, right: RowSets) -> RowSets {
+        left.0.extend(right.0);
+        left.1.extend(right.1);
+        left.2.extend(right.2);
+        left.3.extend(right.3);
+        left
+    }
+
+    fn commands(reads: Vec<ReadAuditRecord>) -> Vec<Command> {
+        reads.into_iter().map(command).collect()
+    }
+
+    async fn query_i32(conn: &impl ConnectionTrait, sql: &str, values: Vec<sea_orm::Value>) -> i32 {
+        conn.query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            sql,
+            values,
+        ))
+        .await
+        .unwrap()
+        .expect("one row")
+        .try_get_by_index(0)
+        .unwrap()
+    }
+
+    /// Another pool on `fixture`'s schema. It skips the ping before acquire
+    /// like the node's PostgreSQL pool, so a connection the server killed is
+    /// only noticed when it is returned.
+    async fn schema_pool(
+        test: &str,
+        fixture: &DatabaseConnection,
+        max_connections: u32,
+    ) -> DatabaseConnection {
+        let url = crate::test_support::postgres_test_url(test).expect("the fixture exists");
+        let schema: String = fixture
+            .query_one(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT current_schema()",
+            ))
+            .await
+            .unwrap()
+            .expect("one row")
+            .try_get_by_index(0)
+            .unwrap();
+        let mut options = ConnectOptions::new(url);
+        options
+            .max_connections(max_connections)
+            .test_before_acquire(false)
+            .sqlx_logging(false)
+            .set_schema_search_path(schema);
+        Database::connect(options).await.unwrap()
+    }
+
+    /// An open transaction on its own connection holding an uncommitted
+    /// `actor` row and optionally an uncommitted `invocation`, so an audit
+    /// INSERT of the same key waits inside PostgreSQL until it ends.
+    struct RowLock {
+        tx: sea_orm::DatabaseTransaction,
+        pid: i32,
+    }
+
+    async fn row_lock(conn: &DatabaseConnection, actor: &str, invocation: Option<Hash>) -> RowLock {
+        let tx = conn.begin().await.unwrap();
+        let pid = query_i32(&tx, "SELECT pg_backend_pid()", Vec::new()).await;
+        actor::Entity::insert(actor::ActiveModel {
+            id: Set(actor.to_string()),
+        })
+        .exec(&tx)
+        .await
+        .unwrap();
+        if let Some(id) = invocation {
+            invocation::Entity::insert(invocation::ActiveModel {
+                id: Set(id),
+                invoker: Set(actor.to_string()),
+                issued_at: Set(OffsetDateTime::now_utc()),
+                facts: Set(None),
+                serialization: Set(b"held by another transaction".to_vec()),
+            })
+            .exec(&tx)
+            .await
+            .unwrap();
+        }
+        RowLock { tx, pid }
+    }
+
+    /// The backend that waits on a lock held by `blocker`. Polls until one
+    /// does; the deadline only turns a hang into a failure.
+    async fn backend_blocked_by(observer: &DatabaseConnection, blocker: i32) -> i32 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if let Some(row) = observer
+                .query_one(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+                    [blocker.into()],
+                ))
+                .await
+                .unwrap()
+            {
+                return row.try_get_by_index(0).unwrap();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no backend waits on {blocker}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The single statement is idempotent, so `persist_batch` retries it
+    /// once after its backend is terminated (TC-951); the retry waits on the
+    /// same row lock from a new backend. Terminate that one too, so the
+    /// batch fails after its one retry.
+    async fn terminate_retry(observer: &DatabaseConnection, blocker: i32, first: i32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let retry: i32 = loop {
+            if let Some(row) = observer
+                .query_one(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT pid FROM pg_stat_activity \
+                     WHERE $1 = ANY(pg_blocking_pids(pid)) AND pid <> $2",
+                    [blocker.into(), first.into()],
+                ))
+                .await
+                .unwrap()
+            {
+                break row.try_get_by_index(0).unwrap();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the audit statement was not retried"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        terminate_backend(observer, retry).await;
+    }
+
+    async fn terminate_backend(observer: &DatabaseConnection, pid: i32) {
+        let terminated: bool = observer
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT pg_terminate_backend($1)",
+                [pid.into()],
+            ))
+            .await
+            .unwrap()
+            .expect("one row")
+            .try_get_by_index(0)
+            .unwrap();
+        assert!(terminated, "backend {pid} was not terminated");
+    }
+
+    /// A pipeline whose next batch, the gate read alone, waits inside
+    /// PostgreSQL on another transaction's uncommitted actor row. Reads
+    /// enqueued meanwhile stay in the channel, so once the gate commits the
+    /// following batches are exactly consecutive runs of `MAX_BATCH_SIZE`.
+    struct Stall {
+        lock: RowLock,
+        gate: tokio::task::JoinHandle<Result<(), DbErr>>,
+    }
+
+    fn gate_read(name: &str) -> ReadAuditRecord {
+        rich_record(name, &format!("did:key:{name}"), vec![], vec![])
+    }
+
+    async fn stall(
+        pipeline: &ReadAuditPipeline,
+        locks: &DatabaseConnection,
+        observer: &DatabaseConnection,
+        gate: &str,
+    ) -> Stall {
+        let lock = row_lock(locks, &format!("did:key:{gate}"), None).await;
+        let pipeline = pipeline.clone();
+        let read = gate_read(gate);
+        let gate = tokio::spawn(async move { pipeline.enqueue(read).await });
+        backend_blocked_by(observer, lock.pid).await;
+        Stall { lock, gate }
+    }
+
+    impl Stall {
+        /// Rolls the lock back, so the gate read commits.
+        async fn release(self) {
+            self.lock.tx.rollback().await.unwrap();
+            self.gate.await.unwrap().unwrap();
+        }
+    }
+
+    /// Enqueues `reads` on a stalled pipeline in this order, one task per
+    /// read, all waiting at once. Returns each read's receipt.
+    async fn enqueue_in_order(
+        pipeline: &ReadAuditPipeline,
+        reads: Vec<ReadAuditRecord>,
+    ) -> Vec<tokio::task::JoinHandle<Result<(), DbErr>>> {
+        let queued = || CHANNEL_CAPACITY - pipeline.sender.capacity();
+        let already = queued();
+        let mut receipts = Vec::new();
+        for read in reads {
+            let sender = pipeline.clone();
+            receipts.push(tokio::spawn(async move { sender.enqueue(read).await }));
+            while queued() < already + receipts.len() {
+                tokio::task::yield_now().await;
+            }
+        }
+        receipts
+    }
+
+    /// One read of the overlap workload: 7 invokers, 4 parent delegations,
+    /// 3 resources shared by every read, a capability listed twice, a parent
+    /// cited twice, and reads with no capability or parent.
+    fn overlapping_read(key: usize, parents: &[Hash]) -> ReadAuditRecord {
+        let resources = ["a", "b", "c"]
+            .map(|name| resource(&format!("tinycloud:did:key:ne-delegator:files/kv/{name}")));
+        let get = ability("tinycloud.kv/get");
+        let put = ability("tinycloud.kv/put");
+        let mut abilities = Vec::new();
+        let mut cited = Vec::new();
+        if !key.is_multiple_of(13) {
+            abilities.push((resources[key % 3].clone(), get.clone()));
+            cited.push(parents[key % 4]);
+        }
+        if key.is_multiple_of(2) {
+            abilities.push((resources[(key + 1) % 3].clone(), put));
+        }
+        if key.is_multiple_of(4) {
+            abilities.push((resources[key % 3].clone(), get));
+        }
+        if key.is_multiple_of(3) {
+            cited.push(parents[(key + 1) % 4]);
+        }
+        if key.is_multiple_of(11) {
+            cited.push(parents[key % 4]);
+        }
+        rich_record(
+            &format!("overlap-{key}"),
+            &format!("did:key:reader-{}", key % 7),
+            abilities,
+            cited,
+        )
+    }
+
+    /// The read the `index`th request makes. Identical reads hash to one
+    /// invocation id: every tenth request repeats the one before it (same
+    /// batch), and from the second batch on another tenth repeats the read
+    /// made one batch earlier (already committed).
+    fn overlap_key(index: usize) -> usize {
+        match index % 10 {
+            9 => index - 1,
+            5 if index >= MAX_BATCH_SIZE => index - MAX_BATCH_SIZE,
+            _ => index,
+        }
+    }
+
+    /// Every read through the real pipeline on PostgreSQL commits exactly the
+    /// rows the transactional path commits for the same batches (run in a
+    /// second, isolated schema), and every waiting read gets Ok. 200 reads
+    /// queue behind a stalled batch, so they commit as exactly 64 + 64 + 64 +
+    /// 8 with repeated invokers, parents and invocations inside each batch and
+    /// across batches; then 100 more run free, half of them repeating
+    /// committed reads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_read_audit_pipeline_commits_every_overlapping_read_like_the_transaction() {
+        use crate::test_support::PostgresTestSchema;
+
+        const TEST: &str =
+            "postgres_read_audit_pipeline_commits_every_overlapping_read_like_the_transaction";
+        const SATURATED: usize = 200;
+        let Some(pipelined) = PostgresTestSchema::new(TEST).await else {
+            return;
+        };
+        let Some(transactional) = PostgresTestSchema::new(TEST).await else {
+            return;
+        };
+        let parents: Vec<Hash> = (0..4)
+            .map(|index| crate::hash::hash(format!("overlap-parent-{index}").as_bytes()))
+            .collect();
+        for conn in [&pipelined.conn, &transactional.conn] {
+            for parent in &parents {
+                insert_parent_delegation(conn, *parent).await;
+            }
+        }
+        let reads = |indexes: std::ops::Range<usize>| {
+            indexes
+                .map(|index| overlapping_read(overlap_key(index), &parents))
+                .collect::<Vec<_>>()
+        };
+
+        let pipeline = ReadAuditPipeline::start(schema_pool(TEST, &pipelined.conn, 4).await, None);
+        let locks = schema_pool(TEST, &pipelined.conn, 1).await;
+        let stalled = stall(&pipeline, &locks, &pipelined.conn, "overlap-gate").await;
+        let receipts = enqueue_in_order(&pipeline, reads(0..SATURATED)).await;
+        stalled.release().await;
+        for receipt in receipts {
+            receipt.await.unwrap().unwrap();
+        }
+        assert_eq!(
+            pipeline.stats(),
+            (
+                1 + SATURATED as u64,
+                1 + SATURATED.div_ceil(MAX_BATCH_SIZE) as u64
+            )
+        );
+
+        let receipts = reads(150..250)
+            .into_iter()
+            .map(|read| {
+                let pipeline = pipeline.clone();
+                tokio::spawn(async move { pipeline.enqueue(read).await })
+            })
+            .collect::<Vec<_>>();
+        for receipt in receipts {
+            receipt.await.unwrap().unwrap();
+        }
+        assert_eq!(pipeline.stats().0, 1 + SATURATED as u64 + 100);
+
+        // The transactional path, batch for batch.
+        persist_in_transaction(&transactional.conn, &[command(gate_read("overlap-gate"))])
+            .await
+            .unwrap();
+        for start in (0..SATURATED).step_by(MAX_BATCH_SIZE) {
+            let batch = commands(reads(start..SATURATED.min(start + MAX_BATCH_SIZE)));
+            persist_in_transaction(&transactional.conn, &batch)
+                .await
+                .unwrap();
+        }
+        for read in reads(150..250) {
+            persist_in_transaction(&transactional.conn, &[command(read)])
+                .await
+                .unwrap();
+        }
+
+        let rows = audit_rows(&pipelined.conn).await;
+        assert_eq!(rows, audit_rows(&transactional.conn).await);
+
+        let mut all = vec![gate_read("overlap-gate")];
+        all.extend(reads(0..SATURATED));
+        all.extend(reads(150..250));
+        let expected = expected_rows(&all);
+        assert!(
+            expected.1.len() < all.len(),
+            "the workload repeats invocations"
+        );
+        assert_eq!(audit_row_sets(&pipelined.conn).await, expected);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Failure {
+        /// A read cites a delegation that does not exist: the parent edge's
+        /// foreign key fails once the batch's INSERTs have run.
+        MissingParent,
+        /// The writer's backend is terminated while its INSERT of the
+        /// batch's last invocation waits on another transaction's
+        /// uncommitted row, after the earlier invocations went in.
+        Terminated,
+    }
+
+    impl Failure {
+        fn name(self) -> &'static str {
+            match self {
+                Failure::MissingParent => "missing-parent",
+                Failure::Terminated => "terminated",
+            }
+        }
+
+        /// Text of the error every waiter must receive.
+        fn error(self) -> &'static str {
+            match self {
+                Failure::MissingParent => "foreign key constraint",
+                Failure::Terminated => "terminating connection",
+            }
+        }
+
+        fn held_invocation(self) -> Hash {
+            crate::hash::hash(format!("{}-held", self.name()).as_bytes())
+        }
+    }
+
+    const COMMITTED_READ: &str = "already-committed";
+
+    fn committed_read(parent: Hash) -> ReadAuditRecord {
+        rich_record(
+            COMMITTED_READ,
+            "did:key:already-committed",
+            vec![(
+                resource("tinycloud:did:key:ne-delegator:files/kv/doomed"),
+                ability("tinycloud.kv/get"),
+            )],
+            vec![parent],
+        )
+    }
+
+    /// Reads that commit on their own: new invokers, capabilities and parent
+    /// edges, a read repeated within the batch, and a repeat of
+    /// `committed_read`.
+    fn valid_reads(failure: Failure, parent: Hash) -> Vec<ReadAuditRecord> {
+        let name = failure.name();
+        let read = |seed: &str, invoker: &str, parents: Vec<Hash>| {
+            rich_record(
+                &format!("{name}-{seed}"),
+                &format!("did:key:{name}-{invoker}"),
+                vec![(
+                    resource("tinycloud:did:key:ne-delegator:files/kv/doomed"),
+                    ability("tinycloud.kv/get"),
+                )],
+                parents,
+            )
+        };
+        vec![
+            read("a", "first", vec![parent]),
+            committed_read(parent),
+            read("b", "second", vec![]),
+            read("a", "first", vec![parent]),
+        ]
+    }
+
+    /// `valid_reads` plus the read that makes the batch fail as `failure`
+    /// says: in the middle for `MissingParent`, last for `Terminated` (it is
+    /// `held_invocation`, whose row the test holds). With `oversized`, one
+    /// more read before the last has so many capabilities that the batch
+    /// exceeds the single statement's parameter limit (while each per-table
+    /// INSERT stays within it), so it takes the transactional path.
+    fn doomed_reads(failure: Failure, parent: Hash, oversized: bool) -> Vec<ReadAuditRecord> {
+        let name = failure.name();
+        let mut reads = valid_reads(failure, parent);
+        match failure {
+            Failure::MissingParent => reads.insert(
+                2,
+                rich_record(
+                    &format!("{name}-orphan"),
+                    &format!("did:key:{name}-orphan"),
+                    vec![],
+                    vec![crate::hash::hash(b"no-such-delegation")],
+                ),
+            ),
+            Failure::Terminated => reads.push(ReadAuditRecord {
+                id: failure.held_invocation(),
+                ..rich_record(
+                    "held",
+                    &format!("did:key:{name}-second"),
+                    vec![(
+                        resource("tinycloud:did:key:ne-delegator:files/kv/held"),
+                        ability("tinycloud.kv/get"),
+                    )],
+                    vec![parent],
+                )
+            }),
+        }
+        if oversized {
+            let ability_rows = expected_rows(&reads).2.len();
+            let capabilities = (ability_rows..21_840)
+                .map(|index| {
+                    (
+                        resource(&format!(
+                            "tinycloud:did:key:ne-delegator:files/kv/oversized/{index}"
+                        )),
+                        ability("tinycloud.kv/get"),
+                    )
+                })
+                .collect();
+            let last = reads.len() - 1;
+            reads.insert(
+                last,
+                rich_record(
+                    &format!("{name}-oversized"),
+                    &format!("did:key:{name}-oversized"),
+                    capabilities,
+                    vec![],
+                ),
+            );
+        }
+        let batch = commands(reads);
+        assert_eq!(
+            postgres_single_statement(&audit_inserts(&batch).unwrap()).is_some(),
+            !oversized,
+            "the batch takes the intended path"
+        );
+        batch.into_iter().map(|command| command.record).collect()
+    }
+
+    /// A batch that fails part-way commits none of its rows on PostgreSQL,
+    /// and every read waiting on it gets the error, on the single statement
+    /// and on the transactional path (a batch past the parameter limit). The
+    /// batch carries new invokers, capabilities and parent edges, a read
+    /// repeated within it and one already committed. It fails either by a
+    /// foreign key or by the writer's backend being terminated while it
+    /// waits on a row lock after inserting earlier invocations. The next
+    /// batch commits, on a fresh connection after the termination. Both
+    /// paths end with identical rows. The single statement is retried once
+    /// after a termination (TC-951), so it fails only when the retry's
+    /// backend is terminated too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_read_audit_failed_batch_commits_nothing_and_fails_every_waiter() {
+        use crate::test_support::PostgresTestSchema;
+
+        const TEST: &str =
+            "postgres_read_audit_failed_batch_commits_nothing_and_fails_every_waiter";
+        let mut final_rows = Vec::new();
+        for oversized in [false, true] {
+            let Some(fixture) = PostgresTestSchema::new(TEST).await else {
+                return;
+            };
+            let conn = &fixture.conn;
+            let parent = crate::hash::hash(b"doomed-parent");
+            insert_parent_delegation(conn, parent).await;
+            persist_in_transaction(conn, &[command(committed_read(parent))])
+                .await
+                .unwrap();
+            let pipeline = ReadAuditPipeline::start(schema_pool(TEST, conn, 4).await, None);
+            let locks = schema_pool(TEST, conn, 2).await;
+
+            for failure in [Failure::Terminated, Failure::MissingParent] {
+                let gate = format!("gate-{}", failure.name());
+                let before = union(
+                    audit_row_sets(conn).await,
+                    expected_rows(&[gate_read(&gate)]),
+                );
+                let stats = pipeline.stats();
+
+                let stalled = stall(&pipeline, &locks, conn, &gate).await;
+                let held = match failure {
+                    Failure::Terminated => Some(
+                        row_lock(
+                            &locks,
+                            "did:key:lock-holder",
+                            Some(failure.held_invocation()),
+                        )
+                        .await,
+                    ),
+                    Failure::MissingParent => None,
+                };
+                let reads = doomed_reads(failure, parent, oversized);
+                let waiters = reads.len();
+                let receipts = enqueue_in_order(&pipeline, reads).await;
+                stalled.release().await;
+                if let Some(held) = &held {
+                    let writer = backend_blocked_by(conn, held.pid).await;
+                    terminate_backend(conn, writer).await;
+                    if !oversized {
+                        terminate_retry(conn, held.pid, writer).await;
+                    }
+                }
+                let mut failed = 0;
+                for receipt in receipts {
+                    let error = receipt
+                        .await
+                        .unwrap()
+                        .expect_err("a read of a failed batch is not acknowledged");
+                    assert!(
+                        error.to_string().contains(failure.error()),
+                        "{failure:?}: {error}"
+                    );
+                    failed += 1;
+                }
+                assert_eq!(failed, waiters);
+                if let Some(held) = held {
+                    held.tx.rollback().await.unwrap();
+                }
+                assert_eq!(audit_row_sets(conn).await, before, "{failure:?}");
+                assert_eq!(pipeline.stats(), (stats.0 + 1, stats.1 + 1));
+
+                // The next batch commits: the same reads without the one
+                // that failed them.
+                let receipts = valid_reads(failure, parent)
+                    .into_iter()
+                    .map(|read| {
+                        let pipeline = pipeline.clone();
+                        tokio::spawn(async move { pipeline.enqueue(read).await })
+                    })
+                    .collect::<Vec<_>>();
+                for receipt in receipts {
+                    receipt.await.unwrap().unwrap();
+                }
+                assert_eq!(
+                    audit_row_sets(conn).await,
+                    union(before, expected_rows(&valid_reads(failure, parent))),
+                    "{failure:?}"
+                );
+            }
+            final_rows.push(audit_rows(conn).await);
+        }
+        assert_eq!(final_rows[0], final_rows[1]);
+    }
+
+    /// The same failing batch through `persist_batch` (one statement) and
+    /// through the transaction it replaced, each in its own schema: both
+    /// return the same error and leave the same rows as before, whether a
+    /// foreign key fails or the backend is terminated mid-write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_read_audit_failed_batch_fails_alike_on_both_paths() {
+        use crate::test_support::PostgresTestSchema;
+
+        const TEST: &str = "postgres_read_audit_failed_batch_fails_alike_on_both_paths";
+        let mut outcomes = Vec::new();
+        for (persist, retried) in [
+            (persist_batch_boxed as Persist, true),
+            (persist_in_transaction as Persist, false),
+        ] {
+            let Some(fixture) = PostgresTestSchema::new(TEST).await else {
+                return;
+            };
+            let conn = &fixture.conn;
+            let parent = crate::hash::hash(b"doomed-parent");
+            insert_parent_delegation(conn, parent).await;
+            persist_in_transaction(conn, &[command(committed_read(parent))])
+                .await
+                .unwrap();
+            let writer = schema_pool(TEST, conn, 1).await;
+            let locks = schema_pool(TEST, conn, 1).await;
+
+            let mut outcome = Vec::new();
+            for failure in [Failure::MissingParent, Failure::Terminated] {
+                let before = audit_rows(conn).await;
+                let held = match failure {
+                    Failure::Terminated => Some(
+                        row_lock(
+                            &locks,
+                            "did:key:lock-holder",
+                            Some(failure.held_invocation()),
+                        )
+                        .await,
+                    ),
+                    Failure::MissingParent => None,
+                };
+                let batch = commands(doomed_reads(failure, parent, false));
+                let writer = writer.clone();
+                let persisted = tokio::spawn(async move {
+                    persist(&writer, &batch).await.map_err(|e| e.to_string())
+                });
+                if let Some(held) = &held {
+                    let backend = backend_blocked_by(conn, held.pid).await;
+                    terminate_backend(conn, backend).await;
+                    if retried {
+                        terminate_retry(conn, held.pid, backend).await;
+                    }
+                }
+                let error = persisted.await.unwrap().expect_err("the batch fails");
+                assert!(error.contains(failure.error()), "{failure:?}: {error}");
+                if let Some(held) = held {
+                    held.tx.rollback().await.unwrap();
+                }
+                let after = audit_rows(conn).await;
+                assert_eq!(after, before, "{failure:?}");
+                outcome.push((failure.name(), error, after));
+            }
+            outcomes.push(outcome);
+        }
+        assert_eq!(outcomes[0], outcomes[1]);
     }
 }

@@ -957,6 +957,7 @@ mod tests {
             PoolRecoveryStats {
                 losses: after.losses - before.losses,
                 retries: after.retries - before.retries,
+                idempotent_retries: after.idempotent_retries - before.idempotent_retries,
                 revalidations: after.revalidations - before.revalidations,
                 revalidation_failures: after.revalidation_failures - before.revalidation_failures,
             }

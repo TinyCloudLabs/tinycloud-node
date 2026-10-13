@@ -37,6 +37,7 @@ use tinycloud_auth::ssi::ucan::Payload;
 use tinycloud_auth::ucan_capabilities_object::{Ability, Capabilities};
 use tinycloud_core::db_pool::{is_connection_error, PoolRecoveryStats};
 use tinycloud_core::events::{Delegation, Invocation, TinyCloudInvocation};
+use tinycloud_core::hash::Hash;
 use tinycloud_core::keys::StaticSecret;
 use tinycloud_core::models::space as space_model;
 use tinycloud_core::sea_orm::{
@@ -311,22 +312,47 @@ impl Fixture {
     }
 
     async fn get(&mut self, key: &str) -> Result<(), String> {
+        self.get_audited(key).await.map(|_| ())
+    }
+
+    /// A KV get; returns the id of its invocation, which the read audit
+    /// records.
+    async fn get_audited(&mut self, key: &str) -> Result<Hash, String> {
         let key: Path = key.parse().unwrap();
         let nonce = self.nonce();
         let invocation = self
             .owner
             .invocation("tinycloud.kv/get", &key, &nonce)
             .unwrap();
+        let id = invocation.content_hash();
         let (_, outcomes) = self
             .db
             .invoke::<MemoryStaging>(invocation, HashMap::new())
             .await
             .map_err(|error| format!("kv get: {error}"))?;
         if outcomes.len() == 1 {
-            Ok(())
+            Ok(id)
         } else {
             Err(format!("kv get: {} outcomes", outcomes.len()))
         }
+    }
+
+    /// Audit rows recorded for invocation `id`.
+    async fn audit_rows(&self, id: Hash) -> i64 {
+        self.admin
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                format!(
+                    "SELECT count(*) AS n FROM {}.invocation WHERE id = $1",
+                    self.schema
+                ),
+                [id.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "n")
+            .unwrap()
     }
 
     async fn delegate(&mut self, key: &str) -> Result<(), String> {
@@ -394,7 +420,12 @@ impl Fixture {
         }
         drop(held);
         let idle = self.settle().await;
-        assert_eq!(idle.len(), WARM_CONNECTIONS, "idle pooled connections");
+        // The read-audit pipeline shares the pool and may have opened one more.
+        assert!(
+            idle.len() >= WARM_CONNECTIONS,
+            "only {} idle pooled connections",
+            idle.len()
+        );
         idle
     }
 
@@ -530,6 +561,7 @@ fn delta(before: PoolRecoveryStats, after: PoolRecoveryStats) -> PoolRecoverySta
     PoolRecoveryStats {
         losses: after.losses - before.losses,
         retries: after.retries - before.retries,
+        idempotent_retries: after.idempotent_retries - before.idempotent_retries,
         revalidations: after.revalidations - before.revalidations,
         revalidation_failures: after.revalidation_failures - before.revalidation_failures,
     }
@@ -1260,6 +1292,58 @@ async fn postgres_concurrent_wave_after_mass_loss() {
         delta(after_wave, fixture.stats()).losses,
         0,
         "no loss after the wave"
+    );
+    fixture.drop_schema().await;
+}
+
+/// The read audit commits on PostgreSQL as one `WITH ... INSERT` statement,
+/// which the read-only classifier does not retry. It goes through
+/// `execute_idempotent` instead: with one dead connection at each position
+/// of the idle queue, some KV get's audit statement meets it, is retried,
+/// and the get succeeds with its audit row written exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_read_audit_statement_survives_a_stale_connection() {
+    let Some(url) = postgres_url("postgres_read_audit_statement_survives_a_stale_connection")
+    else {
+        return;
+    };
+    let mut fixture = Fixture::new("audit", &url, None).await;
+    fixture.warm().await;
+    fixture.put("audit/key").await.unwrap();
+    let mut audit_hits = Vec::new();
+    for position in 0..WARM_CONNECTIONS {
+        fixture.fill_pool().await;
+        let victim = fixture.order_idle_queue(position).await;
+        fixture.terminate(&BTreeSet::from([victim])).await;
+        let before = fixture.stats();
+        let mut rounds = 0;
+        while fixture.stats().losses == before.losses {
+            rounds += 1;
+            assert!(rounds <= 30, "position {position}: never reached");
+            let id = fixture
+                .get_audited("audit/key")
+                .await
+                .unwrap_or_else(|error| panic!("position {position}: {error}"));
+            assert_eq!(
+                fixture.audit_rows(id).await,
+                1,
+                "position {position}: the get's audit row exists exactly once"
+            );
+        }
+        let total = delta(before, fixture.stats());
+        assert_eq!(
+            (total.losses, total.retries),
+            (1, 1),
+            "position {position}: {total:?}"
+        );
+        if total.idempotent_retries == 1 {
+            audit_hits.push(position);
+        }
+    }
+    eprintln!("queue positions whose dead connection met the read-audit statement: {audit_hits:?}");
+    assert!(
+        !audit_hits.is_empty(),
+        "no position put the dead connection under the read-audit statement"
     );
     fixture.drop_schema().await;
 }

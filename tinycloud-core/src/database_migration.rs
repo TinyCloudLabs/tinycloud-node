@@ -651,8 +651,264 @@ async fn inventory_in<C: ConnectionTrait>(
     Ok(result)
 }
 
+/// One point lookup that `resolve` depends on. Each tag names exactly one of
+/// the lookups `resolve_sequential` issues, with the same `WHERE` predicate, so
+/// the database's own comparison rules decide every match as before. Rust only
+/// checks which tags came back; it never compares names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolveLookup {
+    /// `database_alias` by (service, space, logical_name = digest).
+    Alias,
+    /// `database_artifact` by (service, space, name = digest).
+    DigestArtifact,
+    /// `database_legacy_artifact` by the alias's physical name.
+    AliasLegacy,
+    /// `database_artifact` by the alias's physical name.
+    AliasArtifact,
+    /// `database_legacy_artifact` by the pre-N2 name of `path`.
+    OldLegacy,
+    /// Any `database_alias` whose physical name is the pre-N2 name of `path`.
+    OldAlias,
+    /// `database_legacy_artifact` by a short (slash-free) `path`.
+    ShortLegacy,
+    /// `database_legacy_artifact` by `default`, for a pathless database.
+    DefaultLegacy,
+    /// `database_legacy_artifact` by the digest itself.
+    DigestLegacy,
+}
+
+impl ResolveLookup {
+    const ALL: [Self; 9] = [
+        Self::Alias,
+        Self::DigestArtifact,
+        Self::AliasLegacy,
+        Self::AliasArtifact,
+        Self::OldLegacy,
+        Self::OldAlias,
+        Self::ShortLegacy,
+        Self::DefaultLegacy,
+        Self::DigestLegacy,
+    ];
+
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Alias => "alias",
+            Self::DigestArtifact => "digest_artifact",
+            Self::AliasLegacy => "alias_legacy",
+            Self::AliasArtifact => "alias_artifact",
+            Self::OldLegacy => "old_legacy",
+            Self::OldAlias => "old_alias",
+            Self::ShortLegacy => "short_legacy",
+            Self::DefaultLegacy => "default_legacy",
+            Self::DigestLegacy => "digest_legacy",
+        }
+    }
+}
+
+/// Every lookup `resolve` may need, as one `UNION ALL` statement: one branch
+/// per lookup, each tagged and each with the predicate its own query used to
+/// have. The two alias-dependent lookups read the alias's physical name with
+/// the same primary-key lookup, as a subquery. Artifact branches select only
+/// `name`, never a payload column.
+fn resolve_query(
+    service: &str,
+    space: &str,
+    path: Option<&str>,
+) -> sea_orm::sea_query::SelectStatement {
+    use database_alias::{Column as AliasColumn, Entity as AliasTable};
+    use database_artifact::{Column as ArtifactColumn, Entity as ArtifactTable};
+    use database_legacy_artifact::{Column as LegacyColumn, Entity as LegacyTable};
+    use sea_orm::sea_query::{
+        Alias, Expr, IntoIden, Query, SelectStatement, SimpleExpr, UnionType,
+    };
+
+    /// `SELECT '<tag>' AS lookup, <value> AS name FROM <table>
+    ///  WHERE service = $service AND space = $space AND <name>`
+    fn branch<T: IntoIden + Copy + 'static, C: IntoIden + Copy + 'static>(
+        lookup: ResolveLookup,
+        table: T,
+        [service_column, space_column, value_column]: [C; 3],
+        (service, space): (&str, &str),
+        name: SimpleExpr,
+    ) -> SelectStatement {
+        Query::select()
+            .expr_as(Expr::val(lookup.tag()), Alias::new("lookup"))
+            .expr_as(Expr::col((table, value_column)), Alias::new("name"))
+            .from(table)
+            .and_where(Expr::col((table, service_column)).eq(service))
+            .and_where(Expr::col((table, space_column)).eq(space))
+            .and_where(name)
+            .to_owned()
+    }
+
+    let key = (service, space);
+    let digest = logical_name(path);
+    let old_name = legacy_name(service, path);
+    let alias = [
+        AliasColumn::Service,
+        AliasColumn::Space,
+        AliasColumn::PhysicalName,
+    ];
+    let artifact = [
+        ArtifactColumn::Service,
+        ArtifactColumn::Space,
+        ArtifactColumn::Name,
+    ];
+    let legacy = [
+        LegacyColumn::Service,
+        LegacyColumn::Space,
+        LegacyColumn::PhysicalName,
+    ];
+    let alias_logical = Expr::col((AliasTable, AliasColumn::LogicalName)).eq(digest.as_str());
+    let alias_physical = || Expr::col((AliasTable, AliasColumn::PhysicalName));
+    let artifact_name = || Expr::col((ArtifactTable, ArtifactColumn::Name));
+    let legacy_name = || Expr::col((LegacyTable, LegacyColumn::PhysicalName));
+    // The alias's physical name, by the alias primary key (at most one row).
+    let alias_target = Query::select()
+        .column((AliasTable, AliasColumn::PhysicalName))
+        .from(AliasTable)
+        .and_where(Expr::col((AliasTable, AliasColumn::Service)).eq(service))
+        .and_where(Expr::col((AliasTable, AliasColumn::Space)).eq(space))
+        .and_where(alias_logical.clone())
+        .to_owned();
+
+    let mut query = branch(ResolveLookup::Alias, AliasTable, alias, key, alias_logical);
+    let mut branches = vec![
+        branch(
+            ResolveLookup::DigestArtifact,
+            ArtifactTable,
+            artifact,
+            key,
+            artifact_name().eq(digest.as_str()),
+        ),
+        branch(
+            ResolveLookup::AliasLegacy,
+            LegacyTable,
+            legacy,
+            key,
+            legacy_name().in_subquery(alias_target.clone()),
+        ),
+        branch(
+            ResolveLookup::AliasArtifact,
+            ArtifactTable,
+            artifact,
+            key,
+            artifact_name().in_subquery(alias_target),
+        ),
+        branch(
+            ResolveLookup::OldLegacy,
+            LegacyTable,
+            legacy,
+            key,
+            legacy_name().eq(old_name.as_str()),
+        ),
+        branch(
+            ResolveLookup::OldAlias,
+            AliasTable,
+            alias,
+            key,
+            alias_physical().eq(old_name.as_str()),
+        ),
+    ];
+    if let Some(short_name) = path.filter(|p| !p.contains('/')) {
+        branches.push(branch(
+            ResolveLookup::ShortLegacy,
+            LegacyTable,
+            legacy,
+            key,
+            legacy_name().eq(short_name),
+        ));
+    }
+    if path.is_none() {
+        branches.push(branch(
+            ResolveLookup::DefaultLegacy,
+            LegacyTable,
+            legacy,
+            key,
+            legacy_name().eq("default"),
+        ));
+    }
+    branches.push(branch(
+        ResolveLookup::DigestLegacy,
+        LegacyTable,
+        legacy,
+        key,
+        legacy_name().eq(digest.as_str()),
+    ));
+    for next in branches {
+        query.union(UnionType::All, next);
+    }
+    query
+}
+
 /// Resolve only through an explicit alias, or to an unreserved N2 digest.
+///
+/// On PostgreSQL and SQLite all lookups run as one statement
+/// (`resolve_query`); the decision below is `resolve_sequential`'s, in the
+/// same precedence. MySQL keeps `resolve_sequential`: the single statement
+/// compares the alias's physical name column to column and unions `name`
+/// columns of three tables, and MySQL tables created at different times may
+/// carry different collations.
 pub async fn resolve<C: ConnectionTrait>(
+    conn: &C,
+    service: &str,
+    space: &str,
+    path: Option<&str>,
+) -> Result<String, MigrationError> {
+    if conn.get_database_backend() == sea_orm::DatabaseBackend::MySql {
+        return resolve_sequential(conn, service, space, path).await;
+    }
+    let digest = logical_name(path);
+    let rows = conn
+        .query_all(
+            conn.get_database_backend()
+                .build(&resolve_query(service, space, path)),
+        )
+        .await?;
+    let mut alias_physical_name = None;
+    let mut found = BTreeSet::new();
+    for row in rows {
+        let tag: String = row.try_get("", "lookup")?;
+        let Some(lookup) = ResolveLookup::ALL.into_iter().find(|l| l.tag() == tag) else {
+            return Err(DbErr::Custom(format!("unexpected resolve lookup tag {tag}")).into());
+        };
+        if lookup == ResolveLookup::Alias {
+            alias_physical_name = Some(row.try_get::<String>("", "name")?);
+        }
+        found.insert(lookup.tag());
+    }
+    let found = |lookup: ResolveLookup| found.contains(lookup.tag());
+
+    if let Some(physical_name) = alias_physical_name {
+        if found(ResolveLookup::DigestArtifact) {
+            return Err(MigrationError::Collision);
+        }
+        if !found(ResolveLookup::AliasLegacy) || !found(ResolveLookup::AliasArtifact) {
+            return Err(MigrationError::MissingLegacyArtifact);
+        }
+        return Ok(physical_name);
+    }
+    // A short legacy spelling is reserved even though its N2 digest differs.
+    // This makes attempted access to both mapped and unresolved old names an
+    // explicit rejection, rather than allowing an apparently empty database.
+    if found(ResolveLookup::OldLegacy) && !found(ResolveLookup::OldAlias) {
+        return Err(MigrationError::Quarantined);
+    }
+    if path.is_some_and(|p| !p.contains('/')) && found(ResolveLookup::ShortLegacy) {
+        return Err(MigrationError::Quarantined);
+    }
+    if path.is_none() && found(ResolveLookup::DefaultLegacy) {
+        return Err(MigrationError::Quarantined);
+    }
+    if found(ResolveLookup::DigestLegacy) {
+        return Err(MigrationError::Quarantined);
+    }
+    Ok(digest)
+}
+
+/// `resolve` as one statement per lookup, as shipped in 1.20.x. MySQL still
+/// uses it, and the single-statement `resolve` is tested against it.
+async fn resolve_sequential<C: ConnectionTrait>(
     conn: &C,
     service: &str,
     space: &str,
@@ -1636,5 +1892,808 @@ mod tests {
         #[cfg(not(feature = "duckdb"))]
         assert_eq!(counts.1, 0);
         assert!(sql_path.exists());
+    }
+
+    /// `resolve`'s outcome as a comparable value. Every fixture below is
+    /// expected to resolve or to fail with one of these three errors.
+    fn resolve_outcome(result: Result<String, MigrationError>) -> String {
+        match result {
+            Ok(name) => format!("ok:{name}"),
+            Err(MigrationError::Collision) => "collision".into(),
+            Err(MigrationError::MissingLegacyArtifact) => "missing-legacy-artifact".into(),
+            Err(MigrationError::Quarantined) => "quarantined".into(),
+            Err(other) => panic!("unexpected resolve error: {other:?}"),
+        }
+    }
+
+    fn artifact(service: &str, space: &str, name: &str) -> database_artifact::ActiveModel {
+        database_artifact::ActiveModel {
+            service: Set(service.into()),
+            space: Set(space.into()),
+            name: Set(name.into()),
+            revision: Set(1),
+            content_hash: Set("fixture".into()),
+            payload: Set(vec![]),
+            size_bytes: Set(0),
+            backend: Set("sqlite".into()),
+            storage_mode: Set("database-blob".into()),
+            created_at: Set("2026-01-01T00:00:00Z".into()),
+            updated_at: Set("2026-01-01T00:00:00Z".into()),
+            checkpoint_size_bytes: Set(0),
+            checkpoint_content_hash: Set("fixture".into()),
+            delta_payload: Set(None),
+            delta_content_hash: Set(None),
+            delta_size_bytes: Set(0),
+        }
+    }
+
+    fn legacy(service: &str, space: &str, name: &str) -> database_legacy_artifact::ActiveModel {
+        database_legacy_artifact::ActiveModel {
+            service: Set(service.into()),
+            space: Set(space.into()),
+            physical_name: Set(name.into()),
+        }
+    }
+
+    fn alias(
+        service: &str,
+        space: &str,
+        path: Option<&str>,
+        physical: &str,
+    ) -> database_alias::ActiveModel {
+        database_alias::ActiveModel {
+            service: Set(service.into()),
+            space: Set(space.into()),
+            logical_name: Set(logical_name(path)),
+            path: Set(path.map(str::to_owned)),
+            physical_name: Set(physical.into()),
+        }
+    }
+
+    /// Asserts each `(path, expected)` through both resolvers.
+    async fn assert_resolves(
+        conn: &DatabaseConnection,
+        service: &str,
+        space: &str,
+        step: &str,
+        expected: &[(Option<&str>, String)],
+    ) {
+        for (path, expected) in expected {
+            let single = resolve_outcome(resolve(conn, service, space, *path).await);
+            let sequential = resolve_outcome(resolve_sequential(conn, service, space, *path).await);
+            assert_eq!(
+                single, sequential,
+                "{service}/{step}/{path:?}: single vs sequential"
+            );
+            assert_eq!(&single, expected, "{service}/{step}/{path:?}");
+        }
+    }
+
+    /// Every branch of `resolve`, checked against the statement-per-lookup
+    /// oracle and against the outcome each branch is meant to produce. Each
+    /// case gets its own space, and unrelated rows in other spaces and
+    /// services must not change any outcome.
+    ///
+    /// These tables have no time-bounded or status column: a database identity
+    /// cannot expire, and a legacy row's presence is its quarantine. The only
+    /// lifecycle transitions are the rows themselves appearing or going away,
+    /// so the cases below also cover an alias withdrawn by `clear_alias`
+    /// (the old artifact stays registered), an alias whose legacy row or
+    /// artifact is gone, and a legacy row with no artifact (cache-only).
+    async fn assert_resolve_matches_sequential(conn: &DatabaseConnection) {
+        enum Row<'a> {
+            Artifact(&'a str),
+            Legacy(&'a str),
+            Alias(Option<&'a str>, &'a str),
+        }
+        use Row::{Alias, Artifact, Legacy};
+        let threads = logical_name(Some("app/threads"));
+        let digest_of = |path: Option<&str>| format!("ok:{}", logical_name(path));
+        // (case, path, rows in the case's own space, expected outcome)
+        let cases: Vec<(&str, Option<&str>, Vec<Row>, String)> = vec![
+            (
+                "miss",
+                Some("app/threads"),
+                vec![],
+                digest_of(Some("app/threads")),
+            ),
+            (
+                "miss-short",
+                Some("threads"),
+                vec![],
+                digest_of(Some("threads")),
+            ),
+            ("miss-pathless", None, vec![], "ok:v2n".into()),
+            (
+                "alias-hit",
+                Some("app/threads"),
+                vec![
+                    Alias(Some("app/threads"), "threads"),
+                    Legacy("threads"),
+                    Artifact("threads"),
+                ],
+                "ok:threads".into(),
+            ),
+            (
+                "alias-hit-pathless",
+                None,
+                vec![
+                    Alias(None, "default"),
+                    Legacy("default"),
+                    Artifact("default"),
+                ],
+                "ok:default".into(),
+            ),
+            (
+                "alias-collides-with-digest-artifact",
+                Some("app/threads"),
+                vec![
+                    Alias(Some("app/threads"), "threads"),
+                    Legacy("threads"),
+                    Artifact("threads"),
+                    Artifact(&threads),
+                ],
+                "collision".into(),
+            ),
+            (
+                "alias-without-legacy-row",
+                Some("app/threads"),
+                vec![Alias(Some("app/threads"), "threads"), Artifact("threads")],
+                "missing-legacy-artifact".into(),
+            ),
+            (
+                "alias-without-artifact",
+                Some("app/threads"),
+                vec![Alias(Some("app/threads"), "threads"), Legacy("threads")],
+                "missing-legacy-artifact".into(),
+            ),
+            (
+                // Only the alias for this path counts: another alias's legacy
+                // row and artifact do not satisfy it.
+                "alias-checks-only-its-own-physical-name",
+                Some("app/threads"),
+                vec![
+                    Alias(Some("app/threads"), "threads"),
+                    Alias(Some("other/notes"), "notes"),
+                    Legacy("notes"),
+                    Artifact("notes"),
+                ],
+                "missing-legacy-artifact".into(),
+            ),
+            (
+                "alias-collision-is-checked-before-missing-legacy",
+                Some("app/threads"),
+                vec![Alias(Some("app/threads"), "threads"), Artifact(&threads)],
+                "collision".into(),
+            ),
+            (
+                "alias-hit-wins-over-reserved-names",
+                Some("app/threads"),
+                vec![
+                    Alias(Some("app/threads"), "threads"),
+                    Legacy("threads"),
+                    Artifact("threads"),
+                    Legacy(&threads),
+                ],
+                "ok:threads".into(),
+            ),
+            (
+                "legacy-old-name",
+                Some("app/threads"),
+                vec![Legacy("threads")],
+                "quarantined".into(),
+            ),
+            (
+                "legacy-old-name-aliased-by-another-path",
+                Some("app/threads"),
+                vec![Legacy("threads"), Alias(Some("other/threads"), "threads")],
+                digest_of(Some("app/threads")),
+            ),
+            (
+                "legacy-short-name",
+                Some("notes"),
+                vec![Legacy("notes")],
+                "quarantined".into(),
+            ),
+            (
+                // The old-name check passes (an alias maps "notes"), so only
+                // the short-name check can reject it.
+                "legacy-short-name-behind-an-aliased-old-name",
+                Some("notes"),
+                vec![Legacy("notes"), Alias(Some("other/notes"), "notes")],
+                "quarantined".into(),
+            ),
+            (
+                "legacy-default",
+                None,
+                vec![Legacy("default")],
+                "quarantined".into(),
+            ),
+            (
+                // Likewise: only the pathless "default" check can reject it.
+                "legacy-default-behind-an-aliased-old-name",
+                None,
+                vec![Legacy("default"), Alias(Some("other/db"), "default")],
+                "quarantined".into(),
+            ),
+            (
+                "legacy-default-does-not-reserve-a-path",
+                Some("app/threads"),
+                vec![Legacy("default")],
+                digest_of(Some("app/threads")),
+            ),
+            (
+                "legacy-digest-name",
+                Some("app/threads"),
+                vec![Legacy(&threads)],
+                "quarantined".into(),
+            ),
+            (
+                "case-variant-is-another-name",
+                Some("app/threads"),
+                vec![Legacy("Threads"), Alias(Some("app/Threads"), "Threads")],
+                digest_of(Some("app/threads")),
+            ),
+            // Append new cases: the statement-count test names spaces by index.
+            (
+                // The state `clear_alias` leaves: the old artifact is still
+                // registered and still exists, but nothing maps it.
+                "cleared-alias-leaves-old-name-quarantined",
+                Some("app/threads"),
+                vec![Legacy("threads"), Artifact("threads")],
+                "quarantined".into(),
+            ),
+            (
+                "cleared-pathless-alias-leaves-default-quarantined",
+                None,
+                vec![Legacy("default"), Artifact("default")],
+                "quarantined".into(),
+            ),
+            (
+                "alias-with-neither-legacy-row-nor-artifact",
+                Some("app/threads"),
+                vec![Alias(Some("app/threads"), "threads")],
+                "missing-legacy-artifact".into(),
+            ),
+            (
+                "pathless-alias-with-neither-legacy-row-nor-artifact",
+                None,
+                vec![Alias(None, "default")],
+                "missing-legacy-artifact".into(),
+            ),
+            (
+                // Without the alias, the "default" row would quarantine it.
+                "pathless-alias-without-artifact-is-missing-not-quarantined",
+                None,
+                vec![Alias(None, "default"), Legacy("default")],
+                "missing-legacy-artifact".into(),
+            ),
+            (
+                "alias-without-legacy-row-is-missing-not-quarantined-by-digest-name",
+                Some("app/threads"),
+                vec![
+                    Alias(Some("app/threads"), "threads"),
+                    Artifact("threads"),
+                    Legacy(&threads),
+                ],
+                "missing-legacy-artifact".into(),
+            ),
+            (
+                "short-path-alias-hit-wins-over-short-name-reservation",
+                Some("notes"),
+                vec![
+                    Alias(Some("notes"), "notes"),
+                    Legacy("notes"),
+                    Artifact("notes"),
+                ],
+                "ok:notes".into(),
+            ),
+            (
+                "short-path-alias-without-artifact-is-missing-not-quarantined",
+                Some("notes"),
+                vec![Alias(Some("notes"), "notes"), Legacy("notes")],
+                "missing-legacy-artifact".into(),
+            ),
+            (
+                // Only raw writes can produce this (`set_alias` insists on the
+                // old name); the alias still decides, and the unmapped old
+                // name does not quarantine it.
+                "alias-to-another-physical-name",
+                Some("app/threads"),
+                vec![
+                    Alias(Some("app/threads"), "notes"),
+                    Legacy("notes"),
+                    Artifact("notes"),
+                    Legacy("threads"),
+                ],
+                "ok:notes".into(),
+            ),
+            (
+                "alias-to-its-own-digest-collides",
+                Some("app/threads"),
+                vec![
+                    Alias(Some("app/threads"), &threads),
+                    Legacy(&threads),
+                    Artifact(&threads),
+                ],
+                "collision".into(),
+            ),
+            (
+                "alias-to-its-own-digest-without-artifact",
+                Some("app/threads"),
+                vec![Alias(Some("app/threads"), &threads), Legacy(&threads)],
+                "missing-legacy-artifact".into(),
+            ),
+            (
+                "alias-collision-is-checked-before-missing-artifact",
+                Some("app/threads"),
+                vec![
+                    Alias(Some("app/threads"), "threads"),
+                    Legacy("threads"),
+                    Artifact(&threads),
+                ],
+                "collision".into(),
+            ),
+            (
+                "pathless-alias-collides-with-v2n-artifact",
+                None,
+                vec![
+                    Alias(None, "default"),
+                    Legacy("default"),
+                    Artifact("default"),
+                    Artifact("v2n"),
+                ],
+                "collision".into(),
+            ),
+            (
+                // An N2 database: a digest artifact is a collision only for an alias.
+                "digest-artifact-without-alias",
+                Some("app/threads"),
+                vec![Artifact(&threads)],
+                digest_of(Some("app/threads")),
+            ),
+            (
+                "digest-artifact-behind-quarantined-old-name",
+                Some("app/threads"),
+                vec![Artifact(&threads), Legacy("threads")],
+                "quarantined".into(),
+            ),
+            (
+                // Its old name is "default" in both services, unlike app/threads.
+                "legacy-default-reserves-a-path-ending-in-default",
+                Some("x/default"),
+                vec![Legacy("default")],
+                "quarantined".into(),
+            ),
+            (
+                "legacy-v2n-reserves-the-pathless-database",
+                None,
+                vec![Legacy("v2n")],
+                "quarantined".into(),
+            ),
+            (
+                // An empty old name: SQL's old name is "", DuckDB's is
+                // "default", and both see "" as the short name.
+                "legacy-empty-name-reserves-the-empty-path",
+                Some(""),
+                vec![Legacy("")],
+                "quarantined".into(),
+            ),
+        ];
+
+        let mut checked = 0;
+        for service in ["sql", "duckdb"] {
+            // Rows for every case's names, but in other spaces and the other
+            // service: none of them may change an outcome.
+            let noise_service = if service == "sql" { "duckdb" } else { "sql" };
+            for (index, (_, _, rows, _)) in cases.iter().enumerate() {
+                for (noise_service, noise_space) in [
+                    (noise_service, format!("{service}-case-{index}")),
+                    (service, format!("{service}-noise-{index}")),
+                ] {
+                    for row in rows {
+                        match row {
+                            Artifact(name) => artifact(noise_service, &noise_space, name)
+                                .insert(conn)
+                                .await
+                                .map(|_| ()),
+                            Legacy(name) => legacy(noise_service, &noise_space, name)
+                                .insert(conn)
+                                .await
+                                .map(|_| ()),
+                            Alias(path, physical) => {
+                                alias(noise_service, &noise_space, *path, physical)
+                                    .insert(conn)
+                                    .await
+                                    .map(|_| ())
+                            }
+                        }
+                        .unwrap();
+                    }
+                }
+            }
+            for (index, (case, path, rows, expected)) in cases.iter().enumerate() {
+                let space = format!("{service}-case-{index}");
+                // Before the case's own rows exist, both see a plain miss.
+                for before in [
+                    resolve(conn, service, &space, *path).await,
+                    resolve_sequential(conn, service, &space, *path).await,
+                ] {
+                    assert_eq!(
+                        resolve_outcome(before),
+                        digest_of(*path),
+                        "{service}/{case} before its rows exist"
+                    );
+                }
+                for row in rows {
+                    match row {
+                        Artifact(name) => artifact(service, &space, name)
+                            .insert(conn)
+                            .await
+                            .map(|_| ()),
+                        Legacy(name) => {
+                            legacy(service, &space, name).insert(conn).await.map(|_| ())
+                        }
+                        Alias(path, physical) => alias(service, &space, *path, physical)
+                            .insert(conn)
+                            .await
+                            .map(|_| ()),
+                    }
+                    .unwrap();
+                }
+                let single = resolve_outcome(resolve(conn, service, &space, *path).await);
+                let sequential =
+                    resolve_outcome(resolve_sequential(conn, service, &space, *path).await);
+                assert_eq!(single, sequential, "{service}/{case}: single vs sequential");
+                assert_eq!(&single, expected, "{service}/{case}");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 2 * cases.len());
+
+        // DuckDB maps an unsafe name to "default", so its short-name check is
+        // the only one that sees the name itself.
+        let space = "duckdb-unsafe-short-name";
+        legacy("duckdb", space, "a..b").insert(conn).await.unwrap();
+        assert_eq!(legacy_name("duckdb", Some("a..b")), "default");
+        for result in [
+            resolve(conn, "duckdb", space, Some("a..b")).await,
+            resolve_sequential(conn, "duckdb", space, Some("a..b")).await,
+        ] {
+            assert_eq!(resolve_outcome(result), "quarantined");
+        }
+
+        // The rows as the production writers leave them. `apply_inventory`
+        // registers every old artifact, including a cache-only one with no
+        // artifact row, and aliases each durable one with a unique path.
+        // `clear_alias` withdraws an alias, the nearest thing this schema has
+        // to revocation; `set_alias` re-targets the old artifact.
+        let jwk = tinycloud_auth::ssi::jwk::JWK::generate_ed25519().unwrap();
+        let did = tinycloud_auth::resolver::DID_METHODS
+            .generate(&jwk, "key")
+            .unwrap();
+        let lifecycle =
+            tinycloud_auth::resource::SpaceId::new(did, "lifecycle".parse().unwrap()).to_string();
+        let digest = |path: &str| format!("ok:{}", logical_name(Some(path)));
+        set_fence(conn, true).await.unwrap();
+        for service in ["sql", "duckdb"] {
+            let item = |physical: &str, path: &str, durable: bool| InventoryItem {
+                service: service.into(),
+                space: lifecycle.clone(),
+                physical_name: physical.into(),
+                durable,
+                cached: !durable,
+                paths: vec![Some(path.into())],
+                classification: "unique".into(),
+                collision: false,
+                metadata: None,
+                offline_fingerprint: None,
+            };
+            artifact(service, &lifecycle, "threads")
+                .insert(conn)
+                .await
+                .unwrap();
+            apply_inventory(
+                conn,
+                &[
+                    item("threads", "app/threads", true),
+                    item("notes", "app/notes", false),
+                ],
+            )
+            .await
+            .unwrap();
+            assert_resolves(
+                conn,
+                service,
+                &lifecycle,
+                "applied",
+                &[
+                    (Some("app/threads"), "ok:threads".into()),
+                    (Some("other/threads"), digest("other/threads")),
+                    (Some("threads"), "quarantined".into()),
+                    // Registered, but its artifact exists only in a cache.
+                    (Some("app/notes"), "quarantined".into()),
+                    (None, "ok:v2n".into()),
+                ],
+            )
+            .await;
+
+            clear_alias(conn, service, &lifecycle, Some("app/threads"))
+                .await
+                .unwrap();
+            assert_resolves(
+                conn,
+                service,
+                &lifecycle,
+                "cleared",
+                &[
+                    (Some("app/threads"), "quarantined".into()),
+                    (Some("other/threads"), "quarantined".into()),
+                    (Some("threads"), "quarantined".into()),
+                ],
+            )
+            .await;
+
+            set_alias(conn, service, &lifecycle, Some("other/threads"), "threads")
+                .await
+                .unwrap();
+            // A cache-only artifact cannot be aliased, so no production
+            // writer leaves an alias without its artifact.
+            assert!(matches!(
+                set_alias(conn, service, &lifecycle, Some("app/notes"), "notes").await,
+                Err(MigrationError::MissingLegacyArtifact)
+            ));
+            assert_resolves(
+                conn,
+                service,
+                &lifecycle,
+                "re-targeted",
+                &[
+                    (Some("other/threads"), "ok:threads".into()),
+                    (Some("app/threads"), digest("app/threads")),
+                    (Some("threads"), "quarantined".into()),
+                    (Some("app/notes"), "quarantined".into()),
+                ],
+            )
+            .await;
+        }
+    }
+
+    /// `resolve` against `resolve_sequential` on pseudo-random table states.
+    /// Each state is one fresh space holding rows of both services, named from
+    /// a small alphabet: every old name and every digest of `PATHS`. Every path
+    /// is then resolved in both services. An alias usually points at its own
+    /// old name and usually brings that legacy row and artifact along, so
+    /// alias hits, collisions and missing legacy artifacts are common, not only
+    /// quarantines and plain misses. Earlier states' rows sit in other spaces.
+    async fn assert_resolve_matches_sequential_on_random_states(conn: &DatabaseConnection) {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+
+        const SEED: u64 = 0x0951;
+        const STATES: usize = 300;
+        // A pathless database, short and nested paths, two paths sharing an
+        // old name, a case variant, a nested path whose old name is
+        // "default", a DuckDB-unsafe name, an empty path and a trailing slash.
+        const PATHS: [Option<&str>; 10] = [
+            None,
+            Some("threads"),
+            Some("app/threads"),
+            Some("other/threads"),
+            Some("app/Threads"),
+            Some("notes"),
+            Some("x/default"),
+            Some("a..b"),
+            Some(""),
+            Some("app/"),
+        ];
+        let names: Vec<String> = PATHS
+            .iter()
+            .flat_map(|path| {
+                [
+                    legacy_name("sql", *path),
+                    legacy_name("duckdb", *path),
+                    logical_name(*path),
+                ]
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+
+        let mut rng = StdRng::seed_from_u64(SEED);
+        let mut outcomes: BTreeMap<&str, usize> = BTreeMap::new();
+        for state in 0..STATES {
+            let space = format!("random-{state}");
+            let mut described = Vec::new();
+            let tx = conn.begin().await.unwrap();
+            for service in ["sql", "duckdb"] {
+                let mut artifacts = BTreeSet::new();
+                let mut legacies = BTreeSet::new();
+                let mut aliases = BTreeMap::new();
+                for name in &names {
+                    if rng.gen_bool(0.15) {
+                        artifacts.insert(name.clone());
+                    }
+                    if rng.gen_bool(0.15) {
+                        legacies.insert(name.clone());
+                    }
+                }
+                for path in PATHS {
+                    if !rng.gen_bool(0.3) {
+                        continue;
+                    }
+                    let physical = if rng.gen_bool(0.6) {
+                        legacy_name(service, path)
+                    } else {
+                        names[rng.gen_range(0..names.len())].clone()
+                    };
+                    // A physical name belongs to at most one alias.
+                    if aliases.values().any(|taken| *taken == physical) {
+                        continue;
+                    }
+                    if rng.gen_bool(0.7) {
+                        legacies.insert(physical.clone());
+                    }
+                    if rng.gen_bool(0.7) {
+                        artifacts.insert(physical.clone());
+                    }
+                    aliases.insert(path, physical);
+                }
+                for name in &artifacts {
+                    artifact(service, &space, name).insert(&tx).await.unwrap();
+                }
+                for name in &legacies {
+                    legacy(service, &space, name).insert(&tx).await.unwrap();
+                }
+                for (path, physical) in &aliases {
+                    alias(service, &space, *path, physical)
+                        .insert(&tx)
+                        .await
+                        .unwrap();
+                }
+                described.push(format!(
+                    "{service}: artifacts {artifacts:?}, legacy {legacies:?}, aliases {aliases:?}"
+                ));
+            }
+            tx.commit().await.unwrap();
+
+            for service in ["sql", "duckdb"] {
+                for path in PATHS {
+                    let single = resolve_outcome(resolve(conn, service, &space, path).await);
+                    let sequential =
+                        resolve_outcome(resolve_sequential(conn, service, &space, path).await);
+                    assert_eq!(
+                        single, sequential,
+                        "seed {SEED:#x} state {state} {service} {path:?}: {described:#?}"
+                    );
+                    let kind = match single.strip_prefix("ok:") {
+                        Some(name) if name == logical_name(path) => "digest",
+                        Some(_) => "alias",
+                        None => match single.as_str() {
+                            "collision" => "collision",
+                            "missing-legacy-artifact" => "missing-legacy-artifact",
+                            _ => "quarantined",
+                        },
+                    };
+                    *outcomes.entry(kind).or_default() += 1;
+                }
+            }
+        }
+        // The generator must reach every outcome often, or the comparison
+        // above proves little.
+        for kind in [
+            "digest",
+            "alias",
+            "collision",
+            "missing-legacy-artifact",
+            "quarantined",
+        ] {
+            assert!(
+                outcomes.get(kind).copied().unwrap_or(0) >= 100,
+                "too few {kind} outcomes: {outcomes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_query_never_selects_artifact_payloads() {
+        use sea_orm::DatabaseBackend;
+
+        for backend in [
+            DatabaseBackend::Postgres,
+            DatabaseBackend::Sqlite,
+            DatabaseBackend::MySql,
+        ] {
+            for path in [Some("app/threads"), Some("threads"), None] {
+                let sql = backend
+                    .build(&resolve_query("sql", "space", path))
+                    .to_string();
+                assert!(!sql.contains("payload"), "{sql}");
+                // Alias, digest artifact, the alias's legacy row and artifact, the
+                // old name, any alias of the old name, the digest as a legacy
+                // name; plus the short name or "default" when they apply.
+                let branches = if path == Some("app/threads") { 7 } else { 8 };
+                assert_eq!(sql.matches("UNION ALL").count(), branches - 1, "{sql}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn single_statement_resolve_matches_sequential_resolve() {
+        use sea_orm::Database;
+        use sea_orm_migration::MigratorTrait;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = Database::connect(format!(
+            "sqlite:{}?mode=rwc",
+            dir.path().join("caps.db").display()
+        ))
+        .await
+        .unwrap();
+        crate::migrations::Migrator::up(&conn, None).await.unwrap();
+        assert_resolve_matches_sequential(&conn).await;
+
+        // One statement per resolve, whichever branch decides it: a miss, an
+        // alias hit, the short-name check and the pathless "default" check.
+        let statements = Arc::new(AtomicUsize::new(0));
+        let counter = statements.clone();
+        conn.set_metric_callback(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let miss = format!("ok:{}", logical_name(Some("app/threads")));
+        for (space, path, expected) in [
+            ("sql-case-0", Some("app/threads"), miss.as_str()),
+            ("sql-case-3", Some("app/threads"), "ok:threads"),
+            ("sql-case-14", Some("notes"), "quarantined"),
+            ("sql-case-16", None, "quarantined"),
+        ] {
+            let before = statements.load(Ordering::SeqCst);
+            let outcome = resolve_outcome(resolve(&conn, "sql", space, path).await);
+            assert_eq!(statements.load(Ordering::SeqCst) - before, 1, "{space}");
+            assert_eq!(outcome, expected, "{space}");
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_single_statement_resolve_matches_sequential_resolve() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_single_statement_resolve_matches_sequential_resolve",
+        )
+        .await
+        else {
+            return;
+        };
+        assert_resolve_matches_sequential(&fixture.conn).await;
+    }
+
+    #[tokio::test]
+    async fn single_statement_resolve_matches_sequential_resolve_on_random_states() {
+        use sea_orm::Database;
+        use sea_orm_migration::MigratorTrait;
+
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Database::connect(format!(
+            "sqlite:{}?mode=rwc",
+            dir.path().join("caps.db").display()
+        ))
+        .await
+        .unwrap();
+        crate::migrations::Migrator::up(&conn, None).await.unwrap();
+        assert_resolve_matches_sequential_on_random_states(&conn).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_single_statement_resolve_matches_sequential_resolve_on_random_states() {
+        let Some(fixture) = crate::test_support::PostgresTestSchema::new(
+            "postgres_single_statement_resolve_matches_sequential_resolve_on_random_states",
+        )
+        .await
+        else {
+            return;
+        };
+        assert_resolve_matches_sequential_on_random_states(&fixture.conn).await;
     }
 }

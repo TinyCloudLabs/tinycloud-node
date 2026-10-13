@@ -172,6 +172,31 @@ impl RecoveringConnection {
         }
     }
 
+    /// Execute a write the caller asserts is idempotent, retrying it once
+    /// on a connection-class error like a read-only statement.
+    ///
+    /// The caller asserts that running `stmt` a second time is a no-op even
+    /// if the first run committed before its connection was lost (for
+    /// example: every row it writes is an `INSERT ... ON CONFLICT DO NOTHING`
+    /// on a key fixed by the statement, so a second run finds the rows and
+    /// writes nothing). The read-only classifier cannot see that, so without
+    /// this assertion such a statement is never retried. Do not use it for a
+    /// statement whose effect or result depends on whether it already ran:
+    /// the replay guard's `INSERT ... ON CONFLICT DO NOTHING` reports a
+    /// conflict as a replay, so it must not be retried.
+    pub async fn execute_idempotent(&self, stmt: Statement) -> Result<ExecResult, DbErr> {
+        match self.conn.execute(stmt.clone()).await {
+            Err(error) if is_connection_error(&error) => {
+                self.lost("execute_idempotent", &error, true);
+                if let Some(recovery) = &self.recovery {
+                    recovery.idempotent_retries.fetch_add(1, Ordering::Relaxed);
+                }
+                self.retried("execute_idempotent", self.conn.execute(stmt).await)
+            }
+            result => result,
+        }
+    }
+
     /// The outcome of the one retry. It is never retried again, but a
     /// connection lost again is still recorded.
     fn retried<T>(&self, operation: &'static str, result: Result<T, DbErr>) -> Result<T, DbErr> {
@@ -341,6 +366,7 @@ pub struct PoolRecovery {
     lost_at: AtomicU64,
     losses: AtomicU64,
     retries: AtomicU64,
+    idempotent_retries: AtomicU64,
     revalidations: AtomicU64,
     revalidation_failures: AtomicU64,
 }
@@ -352,6 +378,9 @@ pub struct PoolRecoveryStats {
     pub losses: u64,
     /// Of those, the ones that were retried.
     pub retries: u64,
+    /// Of the retries, those of a write the caller asserted is idempotent
+    /// (`RecoveringConnection::execute_idempotent`).
+    pub idempotent_retries: u64,
     /// Idle connections pinged by the acquire hook.
     pub revalidations: u64,
     /// Of those, the ones whose ping failed and that were closed.
@@ -366,6 +395,7 @@ impl Default for PoolRecovery {
             lost_at: AtomicU64::new(0),
             losses: AtomicU64::new(0),
             retries: AtomicU64::new(0),
+            idempotent_retries: AtomicU64::new(0),
             revalidations: AtomicU64::new(0),
             revalidation_failures: AtomicU64::new(0),
         }
@@ -418,6 +448,7 @@ impl PoolRecovery {
         PoolRecoveryStats {
             losses: self.losses.load(Ordering::Relaxed),
             retries: self.retries.load(Ordering::Relaxed),
+            idempotent_retries: self.idempotent_retries.load(Ordering::Relaxed),
             revalidations: self.revalidations.load(Ordering::Relaxed),
             revalidation_failures: self.revalidation_failures.load(Ordering::Relaxed),
         }
