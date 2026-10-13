@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- The Postgres pool no longer pings an idle connection before every statement, which removes about half of the node's Postgres round trips. A connection lost while idle (a failover, an idle-session timeout, a dropped socket) is handled instead: `BEGIN` and read-only statements that fail on a lost connection are retried once, never writes or `COMMIT`; and once a loss is seen, the pool pings a connection before reuse only if it was already idle when that loss was seen. A failover costs at most one non-retryable failure instead of a run of 500s. New metric: `tinycloud_db_connection_events_total{event="lost|retried|revalidated|revalidation_failed"}` (TC-951).
+
 ## [1.20.3] - 2026-10-13
 
 A security release. Up to 1.20.2, a webhook subscription registered under a delegated `tinycloud.hooks/register` grant kept receiving signed write events (key names, writer DIDs) after that grant was revoked or expired, because delivery never re-checked the subscriber's authority. From 1.20.3 the dispatcher re-checks the subscriber's current authority when it delivers (once per subscription per dispatch pass), so such a subscription stops delivering once that delegation is revoked or expires, unless another live grant still gives the subscriber that authority (TC-991, #274). It also caps the ingress and node containers' Docker logs (TC-970, #273). No schema change, so rolling back to 1.20.2 is DB-safe.

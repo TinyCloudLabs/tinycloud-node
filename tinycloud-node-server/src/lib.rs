@@ -138,6 +138,7 @@ use tee::TeeContext;
 use tinycloud_core::duckdb::DuckDbService;
 use tinycloud_core::{
     database_artifacts::{DatabaseArtifactRepository, SeaOrmDatabaseArtifactRepository},
+    db_pool::PoolRecovery,
     encryption_network::{EncryptionService, LocalOneOfOneBackend},
     keys::{SecretsSetup, StaticSecret},
     sea_orm::{ConnectOptions, Database},
@@ -218,6 +219,100 @@ fn sqlite_connect_options(database: &str) -> ConnectOptions {
             .pragma("wal_autocheckpoint", "1000") // explicit; matches SQLite's compiled-in default
     });
     connect_opts
+}
+
+/// sqlx logs the text of every statement (placeholders, never bound values)
+/// at INFO, and of statements slower than 1 s at WARN. Keep statement text out
+/// of production logs (TC-961): a statement built with an inline literal would
+/// carry it.
+const STATEMENT_LOG_LEVEL: tracing_log::log::LevelFilter = tracing_log::log::LevelFilter::Debug;
+const SLOW_STATEMENT_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Open the node's capability-database pool from the resolved configuration.
+///
+/// Postgres gets [`postgres_pool`]: no unconditional pre-acquire ping, plus
+/// connection-loss recovery (TC-951). MySQL keeps sqlx's default pre-acquire
+/// ping, since no recovery hook exists for it here. Both, and SQLite, are
+/// wrapped in a [`RecoveringConnection`], which retries a `BEGIN` or a
+/// read-only statement once after a lost connection.
+pub async fn connect_database(tinycloud_config: &Config) -> Result<RecoveringConnection> {
+    let database = tinycloud_config.storage.database();
+    if database.starts_with("sqlite") {
+        // WAL permits readers to progress while the core's shared writer lock
+        // serializes mutations and durable read-audit batches. A one-connection
+        // pool made every authenticated read wait behind audit writes.
+        let mut connect_opts = sqlite_connect_options(database);
+        connect_opts
+            .sqlx_logging_level(STATEMENT_LOG_LEVEL)
+            .sqlx_slow_statements_logging_settings(STATEMENT_LOG_LEVEL, SLOW_STATEMENT_THRESHOLD);
+        return Ok(RecoveringConnection::new(
+            Database::connect(connect_opts).await?,
+        ));
+    }
+    let mut connect_opts = ConnectOptions::from(database);
+    connect_opts.max_connections(tinycloud_config.database.max_connections);
+    if database.starts_with("postgres://") || database.starts_with("postgresql://") {
+        return postgres_pool(
+            connect_opts,
+            tinycloud_config
+                .share_email
+                .postgres_tls
+                .root_cert_path
+                .as_deref(),
+        )
+        .await;
+    }
+    connect_opts
+        .sqlx_logging_level(STATEMENT_LOG_LEVEL)
+        .sqlx_slow_statements_logging_settings(STATEMENT_LOG_LEVEL, SLOW_STATEMENT_THRESHOLD);
+    Ok(RecoveringConnection::new(
+        Database::connect(connect_opts).await?,
+    ))
+}
+
+/// Build the Postgres pool for `connect_opts` (its URL and pool settings).
+///
+/// sqlx pings every pooled connection before handing it out by default. Most
+/// statements run directly on the pool, so with the database a WAN round trip
+/// away that ping doubled the cost of nearly every statement. It is off here;
+/// instead the pool's [`PoolRecovery`] hook pings only the idle connections
+/// that predate an observed connection loss, and [`RecoveringConnection`]
+/// retries the statement that observed it when that is safe.
+///
+/// sea-orm's `Database::connect` cannot install that hook, so the pool is
+/// built here with the same connect options it would have applied: the URL,
+/// statement logging, and the configured TLS root certificate. No search
+/// path is configured, and the pool connects eagerly, as before.
+pub async fn postgres_pool(
+    connect_opts: ConnectOptions,
+    root_cert_path: Option<&str>,
+) -> Result<RecoveringConnection> {
+    use tinycloud_core::sea_orm::{
+        sqlx::{postgres::PgConnectOptions, ConnectOptions as _, Postgres},
+        SqlxPostgresConnector,
+    };
+
+    let mut options = connect_opts
+        .get_url()
+        .parse::<PgConnectOptions>()?
+        .log_statements(STATEMENT_LOG_LEVEL)
+        .log_slow_statements(STATEMENT_LOG_LEVEL, SLOW_STATEMENT_THRESHOLD);
+    if let Some(root_cert_path) = root_cert_path {
+        options = options.ssl_root_cert(root_cert_path);
+    }
+    let recovery = PoolRecovery::new();
+    let pool = recovery
+        .install(
+            connect_opts
+                .sqlx_pool_options::<Postgres>()
+                .test_before_acquire(false),
+        )
+        .connect_with(options)
+        .await?;
+    Ok(RecoveringConnection::with_recovery(
+        SqlxPostgresConnector::from_sqlx_postgres_pool(pool),
+        recovery,
+    ))
 }
 
 fn node_replay_cache(tinycloud: &TinyCloud) -> InvocationReplayCache {
@@ -393,47 +488,7 @@ pub async fn app_with_control(
         Some(TeeContext::derive_local(&key_setup))
     });
 
-    let database = tinycloud_config.storage.database();
-    let is_sqlite = database.starts_with("sqlite");
-    let mut connect_opts = if is_sqlite {
-        // WAL permits readers to progress while the core's shared writer lock
-        // serializes mutations and durable read-audit batches. A one-connection
-        // pool made every authenticated read wait behind audit writes.
-        sqlite_connect_options(database)
-    } else {
-        ConnectOptions::from(database)
-    };
-    if !is_sqlite {
-        connect_opts.max_connections(tinycloud_config.database.max_connections);
-        // sqlx pings every pooled connection before handing it out by default.
-        // Most statements run directly on the pool, so with the database a WAN
-        // round-trip away that ping doubled the cost of nearly every statement.
-        // A connection the server dropped now fails on its first query instead.
-        connect_opts.test_before_acquire(false);
-        if let Some(root_cert_path) = tinycloud_config
-            .share_email
-            .postgres_tls
-            .root_cert_path
-            .as_deref()
-        {
-            let root_cert_path = root_cert_path.to_owned();
-            connect_opts.map_sqlx_postgres_opts(move |options| {
-                options.ssl_root_cert(root_cert_path.clone())
-            });
-        }
-    }
-    // sqlx logs the text of every statement (placeholders, never bound
-    // values) at INFO, and of statements slower than 1 s at WARN. Keep
-    // statement text out of production logs (TC-961): a statement built with
-    // an inline literal would carry it.
-    connect_opts
-        .sqlx_logging_level(tracing_log::log::LevelFilter::Debug)
-        .sqlx_slow_statements_logging_settings(
-            tracing_log::log::LevelFilter::Debug,
-            std::time::Duration::from_secs(1),
-        );
-
-    let database_connection = RecoveringConnection::new(Database::connect(connect_opts).await?);
+    let database_connection = connect_database(&tinycloud_config).await?;
     // SQL/DuckDB artifact-size mirror folded into `store_size`. Empty here;
     // wired into SpaceDatabase, then seeded
     // from DB truth AFTER `TinyCloud::new` runs migrations (see below).
@@ -478,7 +533,11 @@ pub async fn app_with_control(
     let bench_state = BenchState::new(
         &tinycloud_config.tc_bench,
         seed_conn.clone(),
-        if is_sqlite { 1 } else { 100 },
+        if tinycloud_config.storage.database().starts_with("sqlite") {
+            1
+        } else {
+            100
+        },
     )
     .await?;
 

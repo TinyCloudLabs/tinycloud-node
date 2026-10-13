@@ -1,8 +1,8 @@
-use prometheus::{register_histogram_vec, HistogramVec};
+use prometheus::{register_histogram_vec, register_int_counter_vec, HistogramVec, IntCounterVec};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
-        OnceLock,
+        LazyLock, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -154,6 +154,48 @@ pub fn observe_span(span: &'static str, outcome: &'static str, duration: Duratio
 
 pub fn observe_stage(stage: InvocationStage, outcome: StageOutcome, duration: Duration) {
     observe_span(stage.as_str(), outcome.as_str(), duration);
+}
+
+/// A connection-loss event on the node's database pool (TC-951). The label
+/// set is fixed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DbConnectionEvent {
+    /// A statement or `BEGIN` failed with a connection-class error.
+    Lost,
+    /// The failed statement or `BEGIN` was run once more.
+    Retried,
+    /// The acquire hook pinged an idle connection released before a loss.
+    Revalidated,
+    /// That ping failed and the connection was closed.
+    RevalidationFailed,
+}
+
+impl DbConnectionEvent {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Lost => "lost",
+            Self::Retried => "retried",
+            Self::Revalidated => "revalidated",
+            Self::RevalidationFailed => "revalidation_failed",
+        }
+    }
+}
+
+static DB_CONNECTION_EVENTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "tinycloud_db_connection_events_total",
+        "Database pool connection losses, statement retries and idle-connection re-validations.",
+        &["event"]
+    )
+    .expect("db connection counter should register exactly once")
+});
+
+pub fn observe_db_connection_event(event: DbConnectionEvent) {
+    if enabled() {
+        DB_CONNECTION_EVENTS
+            .with_label_values(&[event.as_str()])
+            .inc();
+    }
 }
 
 /// RAII stage timer for spans with many exit points. Defaults to an `Error`
