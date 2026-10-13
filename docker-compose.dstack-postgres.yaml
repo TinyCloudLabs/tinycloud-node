@@ -73,7 +73,7 @@ services:
       ROCKET_MAX_BLOCKING: "1024"
 
   dstack-ingress:
-    image: ghcr.io/tinycloudlabs/tinycloud-node-ingress@sha256:08cf3ee4ab4054cc2657da12304ae344d6b2156c1fa11ffd7da5e64cd1bca416
+    image: ghcr.io/tinycloudlabs/tinycloud-node-ingress@sha256:63c1c44e2ded5b73a5f174807b91ca677826974df0f9ab3045f6ec87865a5744
     ports:
       - "443:443"
     depends_on:
