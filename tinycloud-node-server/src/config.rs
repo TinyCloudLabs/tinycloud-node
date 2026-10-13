@@ -1186,9 +1186,12 @@ pub struct DatabaseConfig {
     pub write_fence: bool,
     /// Close a pooled connection that has sat idle this long, so it is
     /// recycled before a NAT, load balancer or proxy idle cutoff drops it
-    /// silently (TC-1054). 240 s sits below the common 4-minute middlebox
-    /// cutoff, AWS NAT Gateway's 350 s and PlanetScale PSBouncer's 600 s
-    /// `server_idle_timeout`. PostgreSQL and MySQL only.
+    /// silently (TC-1054). 210 s sits strictly below the common 4-minute
+    /// middlebox cutoff, AWS NAT Gateway's 350 s and PlanetScale PSBouncer's
+    /// 600 s `server_idle_timeout`. sqlx's reaper enforces it every
+    /// `min(idle_timeout, max_lifetime)`; the TC-951 acquire hook pings any
+    /// connection idle 60 s or more before reuse, and keepalive probes every
+    /// 15 s keep middlebox state alive meanwhile. PostgreSQL and MySQL only.
     #[serde(default = "default_database_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
     /// Close a pooled connection this long after it was opened (TC-1054);
@@ -1250,7 +1253,7 @@ fn default_database_max_connections() -> u32 {
 }
 
 fn default_database_idle_timeout_secs() -> u64 {
-    240
+    210
 }
 
 fn default_true() -> bool {

@@ -215,7 +215,7 @@ These bound how long one PostgreSQL round trip can block a request (TC-1054). Ea
 | Option | Default | Description |
 |:-------|:--------|:------------|
 | database.max_connections | `100` | Pool size. |
-| database.idle_timeout_secs | `240` | Close a connection idle this long, so it is recycled before a NAT, load-balancer or proxy idle cutoff drops it silently. 240 s sits below the common 4-minute middlebox cutoff, AWS NAT Gateway's 350 s and PlanetScale PSBouncer's 600 s `server_idle_timeout`. Also applies to MySQL. |
+| database.idle_timeout_secs | `210` | Close a connection idle this long, so it is recycled before a NAT, load-balancer or proxy idle cutoff drops it silently. 210 s sits strictly below the common 4-minute middlebox cutoff, AWS NAT Gateway's 350 s and PlanetScale PSBouncer's 600 s `server_idle_timeout`. sqlx's reaper enforces it every `min(idle_timeout, max_lifetime)`; meanwhile a connection idle 60 s or more is pinged before reuse, and keepalive probes every 15 s keep middlebox state alive. Also applies to MySQL. |
 | database.max_lifetime_secs | `1800` | Close a connection this long after it opened. PlanetScale asks for at most 24 h; PSBouncer's `server_lifetime` is 3600 s. Also applies to MySQL. |
 | database.tcp_keepalive | `true` | Set TCP keepalive and `TCP_USER_TIMEOUT` on every connection's socket (Linux only; elsewhere a logged no-op), so a connection the network silently drops fails within about 30 s instead of the kernel's ~15-minute retransmission timeout. A connection whose socket cannot be configured is refused and reopened, never used. |
 | database.tcp_keepalive_idle_secs | `15` | Idle time before the first keepalive probe. |

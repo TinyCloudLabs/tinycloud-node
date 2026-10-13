@@ -629,7 +629,7 @@ mod tests {
                 defaults.retry_window_ms,
             ),
             (
-                240,
+                210,
                 1800,
                 tinycloud_core::db_pool::StatementTimeoutMode::Session,
                 30_000,
