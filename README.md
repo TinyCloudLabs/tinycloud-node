@@ -217,20 +217,30 @@ These bound how long one PostgreSQL round trip can block a request (TC-1054). Ea
 | database.max_connections | `100` | Pool size. |
 | database.idle_timeout_secs | `240` | Close a connection idle this long, so it is recycled before a NAT, load-balancer or proxy idle cutoff drops it silently. 240 s sits below the common 4-minute middlebox cutoff, AWS NAT Gateway's 350 s and PlanetScale PSBouncer's 600 s `server_idle_timeout`. Also applies to MySQL. |
 | database.max_lifetime_secs | `1800` | Close a connection this long after it opened. PlanetScale asks for at most 24 h; PSBouncer's `server_lifetime` is 3600 s. Also applies to MySQL. |
-| database.tcp_keepalive | `true` | Set TCP keepalive and `TCP_USER_TIMEOUT` on every connection's socket (Linux only; elsewhere a logged no-op), so a connection the network silently drops fails within about 30 s instead of the kernel's ~15-minute retransmission timeout. |
+| database.tcp_keepalive | `true` | Set TCP keepalive and `TCP_USER_TIMEOUT` on every connection's socket (Linux only; elsewhere a logged no-op), so a connection the network silently drops fails within about 30 s instead of the kernel's ~15-minute retransmission timeout. A connection whose socket cannot be configured is refused and reopened, never used. |
 | database.tcp_keepalive_idle_secs | `15` | Idle time before the first keepalive probe. |
 | database.tcp_keepalive_interval_secs | `5` | Time between unanswered probes. |
 | database.tcp_keepalive_retries | `3` | Unanswered probes before the connection is dropped (15 + 3 × 5 = 30 s). |
 | database.tcp_user_timeout_ms | `30000` | `TCP_USER_TIMEOUT`: how long sent data may go unacknowledged before the connection is dropped. `0` keeps the kernel default. |
 | database.statement_timeout_mode | `session` | How PostgreSQL's `statement_timeout` is applied: `session` sets it once on each new connection (no per-request cost; covers every statement); `local` sets it with `SET LOCAL` in each explicit transaction (safe behind a transaction-pooling proxy, but one more round trip per transaction, and autocommit statements are not covered); `off` disables it. |
 | database.statement_timeout_ms | `30000` | `statement_timeout` for every statement. `0` disables it. |
-| database.bulk_statement_timeout_ms | `120000` | `statement_timeout` for statements that move a whole SQL or DuckDB artifact: hydration loads and checkpoints larger than 8 MiB. 120 s moves 100 MiB at 0.85 MiB/s (about 7 Mbit/s). |
+| database.bulk_statement_timeout_ms | `120000` | `statement_timeout` for statements on a whole SQL or DuckDB artifact larger than 8 MiB (or of unknown size): hydration loads and checkpoint saves, whose server-side work on a ~100 MiB value can outlast the base limit. PostgreSQL does not cancel a statement while it writes a row to the client, so the download itself is not limited by either value. |
+| database.retry_window_ms | `10000` | A read (or `BEGIN`) whose connection is lost is retried once only if that attempt failed within this window. A connection found dead at once is retried; one whose loss took a keepalive expiry to detect is not, so a request waits for at most one detection plus this window (about 40 s), under the 60 s ingress timeout. |
 
-Schema migrations always run with no statement timeout. A request whose statement times out or whose connection is lost gets a `503` and may be retried. Customer SQL (`tinycloud.sql/*`) runs in the node's local SQLite engine, never on PostgreSQL, so `statement_timeout` does not limit it.
+Schema migrations always run with no statement timeout. Customer SQL (`tinycloud.sql/*`) runs in the node's local SQLite engine, never on PostgreSQL, so `statement_timeout` does not limit it.
+
+A database failure gets one of two responses, which clients must tell apart by the body's leading code:
+
+| Status | Body starts with | `Retry-After` | Meaning |
+|:-------|:-----------------|:--------------|:--------|
+| `503` | `unavailable_retryable:` | `1` | No write of the request can have taken effect: no connection could be had, the request only read, or PostgreSQL refused the statement (statement timeout, serialization failure, deadlock). A fresh request is safe. |
+| `500` | `outcome_unknown:` | none | The connection was lost after a write or `COMMIT` was sent: the write may have been applied. Read the state back before deciding to retry; re-sending the identical signed request is answered `409` (replay protection), except a delegation, which is idempotent. |
+
+Other `503`s (for example the identity-cutover fence) carry neither code.
 
 With `session`, behind a transaction-pooling proxy (PgBouncer, PlanetScale PSBouncer on port 6432) the per-connection `SET` lands on whichever server connection served it, so coverage becomes best-effort and the setting can reach other clients of the same proxy. The scoped limits (no limit for migrations, the bulk limit) use `SET LOCAL` and stay inside their transaction. Use `local` there if full coverage matters.
 
-The keepalive setting is a stopgap: sqlx 0.8 can't set socket options, so the node finds each new connection's socket by its peer address and sets them itself (`tinycloud-node-server/src/pg_keepalive.rs`).
+The keepalive setting is a stopgap (TC-1061): sqlx 0.8 can't set socket options, so when the pool opens a connection the node configures every TCP socket of its process whose peer port is the database port and whose keepalive is still off (`tinycloud-node-server/src/pg_keepalive.rs`). Nothing else in the node connects to that port (webhooks must use HTTPS on 443). The startup line `PostgreSQL pool connection limits` reports `sockets_configured`, `connections_opened` and `keepalive_missed`; after a deploy, `sockets_configured >= connections_opened` with no `PostgreSQL TCP keepalive missed a connection's socket` warning means every connection in use is protected.
 
 #### Migrations
 

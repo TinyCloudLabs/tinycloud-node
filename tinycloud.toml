@@ -41,6 +41,7 @@ cors = true
     # statement_timeout_mode = "session"   # session | local | off
     # statement_timeout_ms = 30000
     # bulk_statement_timeout_ms = 120000
+    # retry_window_ms = 10000
 
 [global.keys]
     type = "Static"

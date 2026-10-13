@@ -626,13 +626,15 @@ mod tests {
                 defaults.statement_timeout_mode,
                 defaults.statement_timeout_ms,
                 defaults.bulk_statement_timeout_ms,
+                defaults.retry_window_ms,
             ),
             (
                 240,
                 1800,
                 tinycloud_core::db_pool::StatementTimeoutMode::Session,
                 30_000,
-                120_000
+                120_000,
+                10_000
             )
         );
         assert_eq!(

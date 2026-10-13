@@ -358,9 +358,14 @@ pub async fn postgres_pool_with_recovery(
             let keepalive = on_connect.clone();
             let session_statement = session_statement.clone();
             Box::pin(async move {
-                // First, so the statements below are already covered.
+                // First, so the statements below are already covered. A
+                // connection whose socket may be left unprotected is not
+                // admitted: sqlx closes it and connects again (TC-1054).
                 if let Some(keepalive) = keepalive {
-                    keepalive.on_connect().await;
+                    keepalive
+                        .on_connect()
+                        .await
+                        .map_err(tinycloud_core::sea_orm::sqlx::Error::Io)?;
                 }
                 if let Some(statement) = session_statement {
                     conn.execute(statement.as_str()).await?;
@@ -375,6 +380,7 @@ pub async fn postgres_pool_with_recovery(
         statement_timeout_mode = ?statement_timeouts.mode,
         statement_timeout_ms = statement_timeouts.base.as_millis() as u64,
         bulk_statement_timeout_ms = statement_timeouts.bulk.as_millis() as u64,
+        retry_window_ms = database.retry_window_ms,
         tcp_keepalive = keepalive_settings.is_some(),
         tcp_keepalive_idle_secs = keepalive_settings.map(|s| s.idle.as_secs()),
         tcp_keepalive_interval_secs = keepalive_settings.map(|s| s.interval.as_secs()),
@@ -384,13 +390,15 @@ pub async fn postgres_pool_with_recovery(
             .map(|t| t.as_millis() as u64),
         sockets_configured = pg_keepalive::KeepaliveConfigurator::configured(),
         connections_opened = pg_keepalive::KeepaliveConfigurator::connections(),
+        keepalive_missed = pg_keepalive::KeepaliveConfigurator::missed(),
         "PostgreSQL pool connection limits"
     );
     Ok(RecoveringConnection::with_recovery(
         SqlxPostgresConnector::from_sqlx_postgres_pool(pool),
         recovery,
     )
-    .with_statement_timeouts(statement_timeouts))
+    .with_statement_timeouts(statement_timeouts)
+    .with_retry_window(Duration::from_millis(database.retry_window_ms)))
 }
 
 fn node_replay_cache(tinycloud: &TinyCloud) -> InvocationReplayCache {
@@ -841,7 +849,9 @@ pub async fn app_with_control(
         .first()
         .cloned()
         .unwrap_or_else(|| tinycloud_config.share_email.return_origin.clone());
-    let rocket = rocket.attach(share_security_fairing(share_allowed_origin));
+    let rocket = rocket
+        .attach(share_security_fairing(share_allowed_origin))
+        .attach(retry_after_fairing());
 
     if tinycloud_config.cors {
         Ok(rocket.attach(cors_fairing()))
@@ -859,6 +869,32 @@ pub async fn app_with_control(
 /// 600). It also bounds how long a browser can keep acting on a cached
 /// preflight after the policy in [`cors_fairing`] is tightened.
 const CORS_PREFLIGHT_MAX_AGE_SECS: u32 = 7200;
+
+/// `Retry-After` on a database failure that is safe to retry (TC-1054).
+///
+/// Routes report database failures as plain-text `(Status, String)`; a
+/// retryable one is a `503` whose body starts with
+/// [`routes::UNAVAILABLE_RETRYABLE`]. Other `503`s (cutover fence, missing
+/// configuration) and the `500` [`routes::OUTCOME_UNKNOWN`] get no header.
+fn retry_after_fairing() -> AdHoc {
+    AdHoc::on_response("Retry-After", |_, resp| {
+        Box::pin(async move {
+            if resp.status() != rocket::http::Status::ServiceUnavailable {
+                return;
+            }
+            let Ok(body) = resp.body_mut().to_string().await else {
+                return;
+            };
+            if body.starts_with(routes::UNAVAILABLE_RETRYABLE) {
+                resp.set_header(Header::new(
+                    "Retry-After",
+                    routes::RETRY_AFTER_SECS.to_string(),
+                ));
+            }
+            resp.set_sized_body(body.len(), std::io::Cursor::new(body));
+        })
+    })
+}
 
 fn cors_fairing() -> AdHoc {
     AdHoc::on_response("CORS", |request, resp| {
@@ -1499,5 +1535,77 @@ mod cors_fairing_tests {
             .headers()
             .get_one("Access-Control-Max-Age")
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod retry_after_fairing_tests {
+    use super::{cors_fairing, retry_after_fairing, routes};
+    use rocket::{get, http::Status, local::asynchronous::Client, routes};
+
+    #[get("/retryable")]
+    fn retryable() -> (Status, String) {
+        (
+            Status::ServiceUnavailable,
+            format!("{}: pool exhausted", routes::UNAVAILABLE_RETRYABLE),
+        )
+    }
+
+    #[get("/unknown")]
+    fn unknown() -> (Status, String) {
+        (
+            Status::InternalServerError,
+            format!(
+                "{}: the write may have been applied",
+                routes::OUTCOME_UNKNOWN
+            ),
+        )
+    }
+
+    #[get("/fenced")]
+    fn fenced() -> (Status, String) {
+        (
+            Status::ServiceUnavailable,
+            "SQL identity cutover fence is active".to_string(),
+        )
+    }
+
+    /// TC-1054: clients tell a retryable database failure (503,
+    /// `unavailable_retryable`, `Retry-After`) from one whose write may have
+    /// applied (500, `outcome_unknown`, no `Retry-After`); CORS still applies.
+    #[tokio::test]
+    async fn only_retryable_database_failures_carry_retry_after() {
+        let client = Client::tracked(
+            rocket::build()
+                .mount("/", routes![retryable, unknown, fenced])
+                .attach(retry_after_fairing())
+                .attach(cors_fairing()),
+        )
+        .await
+        .expect("valid Rocket instance");
+
+        let response = client.get("/retryable").dispatch().await;
+        assert_eq!(response.status(), Status::ServiceUnavailable);
+        assert_eq!(response.headers().get_one("Retry-After"), Some("1"));
+        assert_eq!(
+            response.headers().get_one("Access-Control-Allow-Origin"),
+            Some("*")
+        );
+        let body = response.into_string().await.unwrap();
+        assert_eq!(body, "unavailable_retryable: pool exhausted", "body kept");
+
+        for path in ["/unknown", "/fenced"] {
+            let response = client.get(path).dispatch().await;
+            assert!(
+                response.headers().get_one("Retry-After").is_none(),
+                "{path}"
+            );
+            assert_eq!(
+                response.headers().get_one("Access-Control-Allow-Origin"),
+                Some("*"),
+                "{path}"
+            );
+            assert!(!response.into_string().await.unwrap().is_empty(), "{path}");
+        }
     }
 }

@@ -264,10 +264,18 @@ pub enum SqlError {
     ParseError(String),
     #[error("Internal error: {0}")]
     Internal(String),
-    /// The durable store was briefly unreachable or too slow: a lost
-    /// connection, an exhausted pool or a statement timeout. Nothing was
-    /// applied that the next attempt cannot see, so the client may retry
-    /// (TC-1054).
-    #[error("Database storage temporarily unavailable; retry the request")]
+    /// The durable store was briefly unreachable or too slow (a lost
+    /// connection, an exhausted pool, a statement timeout), and no write of
+    /// the request can have taken effect: hydration failed, or the artifact
+    /// write was refused or never sent. A fresh request is safe (TC-1054).
+    /// A failure after the write was sent is [`SqlError::OutcomeUnknown`].
+    #[error("unavailable_retryable: database storage temporarily unavailable; retry the request")]
     Unavailable,
+    /// The connection was lost after the request's write was sent: it may
+    /// or may not have been applied. The client must read the database back
+    /// before deciding to retry (TC-1054).
+    #[error(
+        "outcome_unknown: the write may have been applied; read the database back before retrying"
+    )]
+    OutcomeUnknown,
 }

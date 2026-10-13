@@ -47,7 +47,9 @@ use tinycloud_auth::resolver::DID_METHODS;
 use tinycloud_auth::resource::SpaceId;
 use tinycloud_auth::ssi::dids::DIDBuf;
 use tinycloud_auth::ssi::jwk::JWK;
-use tinycloud_core::database_artifacts::SeaOrmDatabaseArtifactRepository;
+use tinycloud_core::database_artifacts::{
+    DatabaseArtifactError, DatabaseArtifactRepository, SeaOrmDatabaseArtifactRepository,
+};
 use tinycloud_core::db_pool::{is_transient_error, transient_error_class, StatementTimeoutMode};
 use tinycloud_core::sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement,
@@ -55,6 +57,7 @@ use tinycloud_core::sea_orm::{
 };
 use tinycloud_core::sql::{SqlError, SqlRequest, SqlResponse, SqlService, SqlValue};
 use tinycloud_core::RecoveringConnection;
+use tinycloud_core::{SizeTrackingArtifactRepository, SqlSizes};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -534,6 +537,121 @@ async fn postgres_large_artifacts_persist_under_default_timeouts() {
     schema.drop().await;
 }
 
+/// A large hydration whose server-side work outlasts the base statement
+/// timeout succeeds, because the size mirror marks the artifact large and
+/// its load runs under the bulk timeout; the same load forced under the base
+/// timeout is cancelled (Opus's M6). The artifact is read through a view
+/// that sleeps 1 s per row, standing in for detoasting and decompressing a
+/// large payload. (A slow network does not exercise this: the artifact is
+/// one row, and PostgreSQL does not cancel a statement while it is writing
+/// a row to the client.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_large_hydration_runs_under_the_bulk_timeout() {
+    let Some(url) = postgres_url("postgres_large_hydration_runs_under_the_bulk_timeout") else {
+        return;
+    };
+    let schema = Schema::new(&url, "bulkload").await;
+    let direct = pool(schema.url(&url, None), |_| {}).await;
+    tinycloud_core::db::migrate(&direct).await.unwrap();
+    let space = test_space("bulkload");
+    {
+        let cache = tempfile::TempDir::new().unwrap();
+        let seed = sql_service(&direct, &cache);
+        for _ in 0..3 {
+            write(&seed, &space, "a", 4 * 1024 * 1024).await.unwrap();
+        }
+    }
+    let name = &schema.name;
+    schema
+        .admin
+        .execute_unprepared(&format!(
+            "ALTER TABLE {name}.database_artifact RENAME TO database_artifact_rows; \
+             CREATE FUNCTION {name}.slow_row() RETURNS boolean LANGUAGE plpgsql AS \
+             $$ BEGIN PERFORM pg_sleep(1); RETURN true; END $$; \
+             CREATE VIEW {name}.database_artifact AS \
+             SELECT * FROM {name}.database_artifact_rows WHERE {name}.slow_row();"
+        ))
+        .await
+        .unwrap();
+
+    let strict = pool(schema.url(&url, None), |config| {
+        config.database.statement_timeout_ms = 500;
+        config.database.bulk_statement_timeout_ms = 10_000;
+    })
+    .await;
+    let sizes = SqlSizes::new();
+    sizes.seed_from(&direct).await.unwrap();
+    let repository = Arc::new(SeaOrmDatabaseArtifactRepository::new(strict.clone()));
+    let cache = tempfile::TempDir::new().unwrap();
+    let service = SqlService::new(
+        cache.path().to_string_lossy().into_owned(),
+        u64::MAX,
+        Arc::new(SizeTrackingArtifactRepository::new(
+            repository.clone(),
+            sizes,
+        )),
+    );
+    assert_eq!(count(&service, &space, "a").await.unwrap(), 3);
+
+    let error = repository
+        .load_sized("sql", &space.to_string(), "a", Some(0))
+        .await
+        .expect_err("the same load under the 500 ms base timeout is cancelled");
+    match &error {
+        DatabaseArtifactError::Db(error) => {
+            assert_eq!(
+                transient_error_class(error),
+                Some("sqlstate_57014"),
+                "{error:?}"
+            )
+        }
+        other => panic!("expected a database error, got {other:?}"),
+    }
+    for conn in [direct, strict] {
+        conn.sea_orm_connection().clone().close().await.unwrap();
+    }
+    schema.drop().await;
+}
+
+/// A connection whose socket cannot be configured is never admitted
+/// (Astra's P1): sqlx retries the connect until the acquire deadline and the
+/// pool fails with a retryable acquire error instead of handing out an
+/// unprotected connection. Linux caps `TCP_KEEPCNT` at 127, so 1000 makes
+/// every configuration fail.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_unconfigurable_keepalive_admits_no_connection() {
+    let Some(url) = postgres_url("postgres_unconfigurable_keepalive_admits_no_connection") else {
+        return;
+    };
+    let schema = Schema::new(&url, "failclosed").await;
+    // A peer port of its own, so no other pool's scan configures the socket.
+    let proxy = Proxy::start(upstream_addr(&url), None).await;
+    let mut config = Config::default();
+    config.database.tcp_keepalive_retries = 1000;
+    let mut options = ConnectOptions::new(schema.url(&url, Some(proxy.addr)));
+    options
+        .max_connections(2)
+        .acquire_timeout(Duration::from_secs(2));
+    let missed = tinycloud::pg_keepalive::KeepaliveConfigurator::missed();
+    let started = Instant::now();
+    let result = tinycloud::postgres_pool_with_recovery(
+        options,
+        None,
+        &config.database,
+        tinycloud_core::db_pool::PoolRecovery::new(),
+    )
+    .await;
+    assert!(result.is_err(), "no connection was admitted");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(tinycloud::pg_keepalive::KeepaliveConfigurator::missed() > missed);
+    schema.drop().await;
+}
+
 // ---------------------------------------------------------------------------
 // Black-hole tests.
 
@@ -805,21 +923,59 @@ async fn blackhole_idle_connections_fail_fast_and_recover() {
 
 /// (b, c) A connection that dies mid-hydration, while the request holds its
 /// database's operation lock (TC-1054 exp 4; 1.20.4 hung 156 s). Every
-/// connection streaming the large artifact is black-holed, so the request,
-/// and its one retry, end with a retryable `Unavailable` within the bound;
-/// the lock is released, so the next request on the database hydrates and
-/// succeeds; another database is served throughout.
+/// connection streaming the large artifact is black-holed. The first attempt
+/// fails within the retry window (test keepalive detects in about 3 s, the
+/// default window is 10 s), so the read is retried once; the retry is cut
+/// too, and the request ends with a retryable `Unavailable`. The lock is
+/// released, so the next request on the database hydrates and succeeds;
+/// another database is served throughout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn blackhole_mid_hydration_releases_the_database_lock() {
     let Some(url) = blackhole_url("blackhole_mid_hydration_releases_the_database_lock") else {
         return;
     };
-    let schema = Schema::new(&url, "bhlock").await;
+    let (_, cut) = mid_hydration_blackhole(&url, "bhlock", |_| {}).await;
+    assert_eq!(cut, 2, "the attempt and its one retry were each cut");
+}
+
+/// The bound under the lock (TC-1054, Opus): a hydration whose connection
+/// loss took longer than the retry window to detect is not retried, so the
+/// request waits for one detection, not two. In production the window is
+/// 10 s and a detection about 30 s, so the worst case is about 40 s, under
+/// the 60 s ingress timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blackhole_mid_hydration_waits_for_one_detection_only() {
+    let Some(url) = blackhole_url("blackhole_mid_hydration_waits_for_one_detection_only") else {
+        return;
+    };
+    let (elapsed, cut) = mid_hydration_blackhole(&url, "bhbound", |config| {
+        config.database.retry_window_ms = 1_000;
+    })
+    .await;
+    assert_eq!(cut, 1, "no retry after a slow detection");
+    // Under 1 s of transfer before the cut, plus one detection (about 3 s).
+    assert!(elapsed < Duration::from_secs(6), "{elapsed:?}");
+}
+
+/// Black-hole every connection streaming db `a`'s hydration on a cold node,
+/// check the request on `a` fails retryably while db `b` is served, then
+/// that the next request on `a` succeeds. Returns the failed request's
+/// duration and how many connections were cut.
+async fn mid_hydration_blackhole(
+    url: &str,
+    name: &'static str,
+    tune: impl FnOnce(&mut Config),
+) -> (Duration, usize) {
+    let schema = Schema::new(url, name).await;
     // 4 MiB/s to the pool: a 12 MiB hydration takes about 3 s.
-    let proxy = Arc::new(Proxy::start(upstream_addr(&url), Some(4 * 1024 * 1024)).await);
-    let conn = pool(schema.url(&url, Some(proxy.addr)), fast_keepalive).await;
+    let proxy = Arc::new(Proxy::start(upstream_addr(url), Some(4 * 1024 * 1024)).await);
+    let conn = pool(schema.url(url, Some(proxy.addr)), |config| {
+        fast_keepalive(config);
+        tune(config);
+    })
+    .await;
     tinycloud_core::db::migrate(&conn).await.unwrap();
-    let space = test_space("bhlock");
+    let space = test_space(name);
     {
         let cache = tempfile::TempDir::new().unwrap();
         let seed = sql_service(&conn, &cache);
@@ -894,6 +1050,8 @@ async fn blackhole_mid_hydration_releases_the_database_lock() {
         .expect("the next request on the database succeeds");
     assert_eq!(rows, 3);
     eprintln!("next request on a: {:?}", started.elapsed());
+    let cut = blackhole.lock().unwrap().clients.len();
     drop(blackhole);
     schema.drop().await;
+    (elapsed, cut)
 }

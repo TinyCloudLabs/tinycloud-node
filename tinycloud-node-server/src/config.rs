@@ -1206,9 +1206,13 @@ pub struct DatabaseConfig {
     /// Zero disables it.
     #[serde(default = "default_database_statement_timeout_ms")]
     pub statement_timeout_ms: u64,
-    /// `statement_timeout` for the statements that move a whole SQL or
-    /// DuckDB artifact (hydration loads and full checkpoint saves), in
-    /// milliseconds. 120 s moves 100 MiB at 0.85 MiB/s (about 7 Mbit/s).
+    /// `statement_timeout`, in milliseconds, for the statements on a whole
+    /// SQL or DuckDB artifact that may be larger than a WAL delta (hydration
+    /// loads and checkpoint saves over 8 MiB, or of unknown size): the
+    /// server's work on a ~100 MiB value (detoasting and decompressing it on
+    /// load; compressing, TOASTing and WAL-logging it on save) can outlast
+    /// the base limit. PostgreSQL does not cancel a statement while it is
+    /// writing a row to the client, so the download itself is not limited.
     #[serde(default = "default_database_bulk_statement_timeout_ms")]
     pub bulk_statement_timeout_ms: u64,
     /// Enable TCP keepalive and `TCP_USER_TIMEOUT` on PostgreSQL connection
@@ -1231,6 +1235,14 @@ pub struct DatabaseConfig {
     /// kernel default.
     #[serde(default = "default_database_tcp_user_timeout_ms")]
     pub tcp_user_timeout_ms: u64,
+    /// A read (or `BEGIN`) whose connection is lost is retried once only if
+    /// that attempt failed within this many milliseconds (TC-1054). A
+    /// connection found dead at once is retried; one whose loss took a
+    /// keepalive or `TCP_USER_TIMEOUT` expiry (~30 s) to detect is not, so
+    /// the worst case is one detection plus this window (~40 s), inside the
+    /// 60 s ingress timeout, rather than two detections (~60 s).
+    #[serde(default = "default_database_retry_window_ms")]
+    pub retry_window_ms: u64,
 }
 
 fn default_database_max_connections() -> u32 {
@@ -1273,6 +1285,10 @@ fn default_database_tcp_user_timeout_ms() -> u64 {
     30_000
 }
 
+fn default_database_retry_window_ms() -> u64 {
+    10_000
+}
+
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
@@ -1288,6 +1304,7 @@ impl Default for DatabaseConfig {
             tcp_keepalive_interval_secs: default_database_tcp_keepalive_interval_secs(),
             tcp_keepalive_retries: default_database_tcp_keepalive_retries(),
             tcp_user_timeout_ms: default_database_tcp_user_timeout_ms(),
+            retry_window_ms: default_database_retry_window_ms(),
         }
     }
 }

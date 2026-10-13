@@ -120,6 +120,19 @@ pub trait DatabaseArtifactRepository: Send + Sync {
         name: &str,
     ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError>;
 
+    /// [`Self::load`], told the artifact's stored size when the caller knows
+    /// it, so a repository can skip the bulk statement timeout's extra round
+    /// trips for a small artifact (TC-1054). `None` means unknown.
+    async fn load_sized(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        _known_size: Option<u64>,
+    ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError> {
+        self.load(service, space, name).await
+    }
+
     async fn save(
         &self,
         service: &str,
@@ -144,8 +157,9 @@ pub trait DatabaseArtifactRepository: Send + Sync {
 /// The largest artifact payload written under the pool's base statement
 /// timeout; a larger checkpoint is written in a
 /// [`RecoveringConnection::begin_bulk`] scope (TC-1054). It matches the SQL
-/// service's WAL delta bound (8 MiB): at a conservative 1 MiB/s an 8 MiB
-/// write takes 8 s, well inside the 30 s default.
+/// service's WAL delta bound (8 MiB): the server's work on an 8 MiB value
+/// (compression, TOAST, WAL) takes well under a second, far inside the 30 s
+/// default. Loads use the same bound, judged by the stored size.
 ///
 /// [`RecoveringConnection::begin_bulk`]: crate::db_pool::RecoveringConnection::begin_bulk
 pub const BASE_TIMEOUT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
@@ -217,38 +231,57 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         space: &str,
         name: &str,
     ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError> {
-        // Hydration reads the whole checkpoint and WAL in one statement, so
-        // it runs under the bulk statement timeout (TC-1054).
-        self.conn
-            .bulk_read("load_artifact", || async {
-                let scope = self.conn.begin_bulk().await?;
-                let row = database_artifact::Entity::find_by_id((
-                    service.to_string(),
-                    space.to_string(),
-                    name.to_string(),
-                ))
-                .one(&scope)
-                .await?;
-                scope.commit().await?;
-                Ok(row)
-            })
-            .await
-            .map(|row| {
-                row.map(|model| DatabaseArtifact {
-                    payload: model.payload,
-                    content_hash: model.content_hash,
-                    revision: model.revision,
-                    size_bytes: model.size_bytes,
-                    updated_at: model.updated_at,
-                    backend: model.backend,
-                    storage_mode: model.storage_mode,
-                    checkpoint_content_hash: model.checkpoint_content_hash,
-                    delta_payload: model.delta_payload,
-                    delta_content_hash: model.delta_content_hash,
-                    delta_size_bytes: model.delta_size_bytes,
+        self.load_sized(service, space, name, None).await
+    }
+
+    async fn load_sized(
+        &self,
+        service: &str,
+        space: &str,
+        name: &str,
+        known_size: Option<u64>,
+    ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError> {
+        // Hydration reads the whole checkpoint and WAL in one statement. One
+        // that may be larger than a delta runs under the bulk statement
+        // timeout (TC-1054); a known-small one under the base timeout, with
+        // no extra round trip.
+        let bulk = known_size.is_none_or(|size| size > BASE_TIMEOUT_PAYLOAD_BYTES as u64);
+        let find = || {
+            database_artifact::Entity::find_by_id((
+                service.to_string(),
+                space.to_string(),
+                name.to_string(),
+            ))
+        };
+        let row = if bulk {
+            self.conn
+                .bulk_read("load_artifact", || async {
+                    let scope = self.conn.begin_bulk_read().await?;
+                    let row = find().one(&scope).await?;
+                    scope.commit().await?;
+                    Ok(row)
                 })
+                .await
+        } else {
+            // A read-only statement on the pool, retried like any other.
+            find().one(&self.conn).await
+        };
+        row.map(|row| {
+            row.map(|model| DatabaseArtifact {
+                payload: model.payload,
+                content_hash: model.content_hash,
+                revision: model.revision,
+                size_bytes: model.size_bytes,
+                updated_at: model.updated_at,
+                backend: model.backend,
+                storage_mode: model.storage_mode,
+                checkpoint_content_hash: model.checkpoint_content_hash,
+                delta_payload: model.delta_payload,
+                delta_content_hash: model.delta_content_hash,
+                delta_size_bytes: model.delta_size_bytes,
             })
-            .map_err(DatabaseArtifactError::Db)
+        })
+        .map_err(DatabaseArtifactError::Db)
     }
 
     async fn save(

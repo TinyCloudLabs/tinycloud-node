@@ -46,6 +46,7 @@ use tinycloud_core::duckdb::{
 use tinycloud_core::{
     admission::AdmissionError,
     database_migration,
+    db_pool::{classify_failure, track_writes, TransientFailure},
     encryption_network::EncryptionService,
     events::Invocation,
     models::{
@@ -91,14 +92,45 @@ where
     .await
 }
 
-/// 503 for an error the client may retry shortly: a lost connection, an
-/// exhausted pool, a statement timeout (57014), a serialization failure or a
-/// deadlock (TC-1054). Otherwise 500.
-fn database_error_status(error: &DbErr) -> Status {
-    if tinycloud_core::db_pool::is_transient_error(error) {
-        Status::ServiceUnavailable
-    } else {
-        Status::InternalServerError
+/// Body prefix of a database failure that is safe to retry with a fresh
+/// request; the response is a `503` with `Retry-After` (TC-1054).
+pub const UNAVAILABLE_RETRYABLE: &str = "unavailable_retryable";
+/// Body prefix of a database failure after a write may have been applied;
+/// the response is a `500` with no `Retry-After` (TC-1054).
+pub const OUTCOME_UNKNOWN: &str = "outcome_unknown";
+/// `Retry-After` on an [`UNAVAILABLE_RETRYABLE`] response, in seconds.
+pub const RETRY_AFTER_SECS: u32 = 1;
+
+/// The response to a database failure of an operation (TC-1054):
+///
+/// - `503` with `Retry-After`, body `unavailable_retryable: ...`: transient, and no write of the
+///   operation can have taken effect (no connection to be had, a read, a
+///   statement the server refused). A fresh request is safe.
+/// - `500` without `Retry-After`, body `outcome_unknown: ...`: transient, but the connection was
+///   lost after a write or `COMMIT` was sent, so it may have been applied.
+///   The client must read the state back before deciding to retry;
+///   re-sending the identical signed request is answered 409 (replay
+///   protection), except a delegation, which is idempotent.
+/// - `500` with the error otherwise.
+///
+/// `write_may_have_applied` comes from [`track_writes`] around the operation.
+fn database_failure(
+    error: &DbErr,
+    write_may_have_applied: bool,
+    message: String,
+) -> (Status, String) {
+    match classify_failure(error, write_may_have_applied) {
+        Some(TransientFailure::Retryable) => (
+            Status::ServiceUnavailable,
+            format!("{UNAVAILABLE_RETRYABLE}: {message}"),
+        ),
+        Some(TransientFailure::OutcomeUnknown) => (
+            Status::InternalServerError,
+            format!(
+                "{OUTCOME_UNKNOWN}: the write may have been applied; read it back before retrying: {message}"
+            ),
+        ),
+        None => (Status::InternalServerError, message),
     }
 }
 
@@ -503,20 +535,14 @@ pub async fn delegate(
                 .with_label_values(&["delegate"])
                 .start_timer()
         });
-        let res = tinycloud
-            .delegate(d.0)
-            .await
-            .map_err(|e| {
-                (
-                    match &e {
-                        TxError::SpaceNotFound => Status::NotFound,
-                        TxError::Db(error) | TxError::EpochInsert(error) => {
-                            database_error_status(error)
-                        }
-                        _ => Status::Unauthorized,
-                    },
-                    e.to_string(),
-                )
+        let (res, write_may_have_applied) = track_writes(tinycloud.delegate(d.0)).await;
+        let res = res
+            .map_err(|e| match &e {
+                TxError::Db(error) | TxError::EpochInsert(error) => {
+                    database_failure(error, write_may_have_applied, e.to_string())
+                }
+                TxError::SpaceNotFound => (Status::NotFound, e.to_string()),
+                _ => (Status::Unauthorized, e.to_string()),
             })
             .and_then(|result: TransactResult| {
                 let TransactResult {
@@ -581,17 +607,13 @@ pub async fn revoke(
     let span = info_span!(parent: &req_span.0, "revoke");
     async move {
         let revoked_cid = r.0 .0.revoked.to_string();
-        let res = tinycloud.revoke(r.0).await.map_err(|e| {
-            (
-                match &e {
-                    TxError::SpaceNotFound => Status::NotFound,
-                    TxError::Db(error) | TxError::EpochInsert(error) => {
-                        database_error_status(error)
-                    }
-                    _ => Status::Forbidden,
-                },
-                e.to_string(),
-            )
+        let (res, write_may_have_applied) = track_writes(tinycloud.revoke(r.0)).await;
+        let res = res.map_err(|e| match &e {
+            TxError::Db(error) | TxError::EpochInsert(error) => {
+                database_failure(error, write_may_have_applied, e.to_string())
+            }
+            TxError::SpaceNotFound => (Status::NotFound, e.to_string()),
+            _ => (Status::Forbidden, e.to_string()),
         })?;
         let _ = res;
         Ok(Json(RevokeResponse {
@@ -1947,9 +1969,19 @@ async fn invoke_impl(
         // containment, chain limits, storage authorization, and signed-time
         // validity against the current database state, but does not
         // re-verify the signature.
-        let invoke_result = tinycloud
-            .invoke_with_options_admitted::<BlockStage>(admitted, inputs, kv_options)
-            .await;
+        // A KV read also commits its invocation record, which a retry need
+        // not reconcile; only a put or delete can leave an unknown outcome.
+        let kv_mutates = invocation_info.capabilities.iter().any(|capability| {
+            matches!(
+                capability.ability.as_ref().as_ref(),
+                "tinycloud.kv/put" | "tinycloud.kv/del" | "tinycloud.kv/delete"
+            )
+        });
+        let (invoke_result, write_may_have_applied) = track_writes(
+            tinycloud.invoke_with_options_admitted::<BlockStage>(admitted, inputs, kv_options),
+        )
+        .await;
+        let write_may_have_applied = kv_mutates && write_may_have_applied;
         crate::prometheus::observe_span(
             "server.kv.invoke",
             if invoke_result.is_ok() { "ok" } else { "error" },
@@ -2108,6 +2140,11 @@ async fn invoke_impl(
                 if let TxStoreError::KvTooManyMutations { .. } = &e {
                     return Err(too_many_mutations().into());
                 }
+                if let TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) = &e {
+                    return Err(
+                        database_failure(error, write_may_have_applied, e.to_string()).into()
+                    );
+                }
                 Err((
                     match &e {
                         TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
@@ -2120,9 +2157,6 @@ async fn invoke_impl(
                         TxStoreError::Tx(TxError::InvalidInvocation(
                             invocation_model::InvocationError::MissingKvWrite(_),
                         )) => Status::NotFound,
-                        TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
-                            database_error_status(error)
-                        }
                         _ => Status::Unauthorized,
                     },
                     e.to_string(),
@@ -2924,6 +2958,7 @@ fn sql_error_to_status(err: &SqlError) -> Status {
         SqlError::ParseError(_) => Status::BadRequest,
         SqlError::Internal(_) => Status::InternalServerError,
         SqlError::Unavailable => Status::ServiceUnavailable,
+        SqlError::OutcomeUnknown => Status::InternalServerError,
     }
 }
 
@@ -3504,17 +3539,14 @@ async fn verify_auth(
     let result = tinycloud
         .invoke::<BlockStage>(invocation, HashMap::new())
         .await
-        .map_err(|e| {
-            (
-                match &e {
-                    TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
-                    TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
-                        database_error_status(error)
-                    }
-                    _ => Status::Unauthorized,
-                },
-                e.to_string(),
-            )
+        // Authorization records only the invocation; the operation it
+        // authorizes has not run, so a database failure here is retryable.
+        .map_err(|e| match &e {
+            TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
+                database_failure(error, false, e.to_string())
+            }
+            TxStoreError::Tx(TxError::SpaceNotFound) => (Status::NotFound, e.to_string()),
+            _ => (Status::Unauthorized, e.to_string()),
         })
         .map(|(tx_result, _)| tx_result);
     crate::prometheus::observe_span(
@@ -3538,17 +3570,14 @@ async fn verify_auth_admitted(
     let result = tinycloud
         .invoke_admitted::<BlockStage>(invocation, HashMap::new())
         .await
-        .map_err(|e| {
-            (
-                match &e {
-                    TxStoreError::Tx(TxError::SpaceNotFound) => Status::NotFound,
-                    TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
-                        database_error_status(error)
-                    }
-                    _ => Status::Unauthorized,
-                },
-                e.to_string(),
-            )
+        // Authorization records only the invocation; the operation it
+        // authorizes has not run, so a database failure here is retryable.
+        .map_err(|e| match &e {
+            TxStoreError::Tx(TxError::Db(error) | TxError::EpochInsert(error)) => {
+                database_failure(error, false, e.to_string())
+            }
+            TxStoreError::Tx(TxError::SpaceNotFound) => (Status::NotFound, e.to_string()),
+            _ => (Status::Unauthorized, e.to_string()),
         })
         .map(|(tx_result, _)| tx_result);
     crate::prometheus::observe_span(
@@ -3817,33 +3846,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transient_database_errors_are_retryable() {
+    async fn database_failures_are_retryable_only_before_a_write_may_apply() {
+        let status = |error: &DbErr, applied| database_failure(error, applied, String::new());
+        // Refused by the server, or no connection: definitely not applied.
         for code in ["40001", "40P01", "57014"] {
-            assert_eq!(
-                database_error_status(&db_error_with_sqlstate(code)),
-                Status::ServiceUnavailable,
-                "{code}"
-            );
+            let (code_status, body) = status(&db_error_with_sqlstate(code), false);
+            assert_eq!(code_status, Status::ServiceUnavailable, "{code}");
+            assert!(body.starts_with("unavailable_retryable:"), "{body}");
         }
-        for code in ["23505", "28000"] {
-            assert_eq!(
-                database_error_status(&db_error_with_sqlstate(code)),
-                Status::InternalServerError,
-                "{code}"
-            );
-        }
+        let exhausted =
+            DbErr::ConnectionAcquire(tinycloud_core::sea_orm::error::ConnAcquireErr::Timeout);
+        assert_eq!(status(&exhausted, false).0, Status::ServiceUnavailable);
         // A connection that died under the statement (TCP keepalive or
-        // `TCP_USER_TIMEOUT` expiring), and an exhausted pool.
+        // `TCP_USER_TIMEOUT` expiring): retryable before any write ...
         let lost = DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Io(std::io::Error::from(
             std::io::ErrorKind::TimedOut,
         ))));
-        assert_eq!(database_error_status(&lost), Status::ServiceUnavailable);
-        let exhausted =
-            DbErr::ConnectionAcquire(tinycloud_core::sea_orm::error::ConnAcquireErr::Timeout);
-        assert_eq!(
-            database_error_status(&exhausted),
-            Status::ServiceUnavailable
-        );
+        assert_eq!(status(&lost, false).0, Status::ServiceUnavailable);
+        // ... but once a write may have been applied, the outcome is unknown:
+        // a distinct, not blindly retryable response.
+        for error in [&lost, &exhausted, &db_error_with_sqlstate("57014")] {
+            let (code_status, body) = status(error, true);
+            assert_eq!(code_status, Status::InternalServerError, "{error:?}");
+            assert!(body.starts_with("outcome_unknown:"), "{body}");
+        }
+        for code in ["23505", "28000"] {
+            for applied in [false, true] {
+                let (code_status, body) = status(&db_error_with_sqlstate(code), applied);
+                assert_eq!(code_status, Status::InternalServerError, "{code}");
+                assert!(!body.contains("outcome_unknown"), "{body}");
+            }
+        }
     }
 
     #[test]
@@ -3852,6 +3885,16 @@ mod tests {
             sql_error_to_status(&SqlError::Unavailable),
             Status::ServiceUnavailable
         );
+        assert_eq!(
+            sql_error_to_status(&SqlError::OutcomeUnknown),
+            Status::InternalServerError
+        );
+        assert!(SqlError::OutcomeUnknown
+            .to_string()
+            .starts_with(&format!("{OUTCOME_UNKNOWN}:")));
+        assert!(SqlError::Unavailable
+            .to_string()
+            .starts_with(&format!("{UNAVAILABLE_RETRYABLE}:")));
         assert_eq!(
             sql_error_to_status(&SqlError::Internal("x".into())),
             Status::InternalServerError

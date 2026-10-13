@@ -13,7 +13,7 @@ use tinycloud_auth::resource::SpaceId;
 use crate::database_artifacts::{
     ArtifactExpectation, DatabaseArtifactError, DatabaseArtifactRepository,
 };
-use crate::db_pool::{is_transient_error, transient_error_class};
+use crate::db_pool::{is_transient_error, track_writes, transient_error_class};
 
 use super::{
     caveats::SqlCaveats,
@@ -158,9 +158,17 @@ impl SqlService {
                 self.discard_local_state(&key).await?;
                 return Ok(result);
             }
-            if let Err(e) = self.persist_write(space, db_name, &handle, growth).await {
+            let (persisted, write_may_have_applied) =
+                track_writes(self.persist_write(space, db_name, &handle, growth)).await;
+            if let Err(e) = persisted {
                 self.discard_local_state(&key).await?;
-                return Err(e);
+                // A lost connection after the artifact write was sent: the
+                // write may be durable, so a blind retry could apply it
+                // twice (TC-1054).
+                return Err(match e {
+                    SqlError::Unavailable if write_may_have_applied => SqlError::OutcomeUnknown,
+                    e => e,
+                });
             }
         }
 
@@ -1727,6 +1735,119 @@ mod tests {
         inner: Arc<SeaOrmDatabaseArtifactRepository>,
         failures: AtomicU64,
         error: fn() -> DbErr,
+    }
+
+    /// Performs every save, then reports the first `lost_replies` of them
+    /// as lost connections: the write committed, its reply never arrived.
+    struct LostReplyArtifactRepository {
+        inner: Arc<SeaOrmDatabaseArtifactRepository>,
+        lost_replies: AtomicU64,
+    }
+
+    impl LostReplyArtifactRepository {
+        fn lose_reply(&self) -> Result<(), DatabaseArtifactError> {
+            let losing = self
+                .lost_replies
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if losing {
+                Err(DatabaseArtifactError::Db(DbErr::Exec(
+                    sea_orm::RuntimeErr::SqlxError(sea_orm::error::SqlxError::Io(
+                        std::io::Error::from(std::io::ErrorKind::TimedOut),
+                    )),
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DatabaseArtifactRepository for LostReplyArtifactRepository {
+        async fn load(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+        ) -> Result<Option<DatabaseArtifact>, DatabaseArtifactError> {
+            self.inner.load(service, space, name).await
+        }
+
+        async fn save(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+            payload: Vec<u8>,
+            expected: ArtifactExpectation,
+        ) -> Result<DatabaseArtifact, DatabaseArtifactError> {
+            let saved = self
+                .inner
+                .save(service, space, name, payload, expected)
+                .await?;
+            self.lose_reply()?;
+            Ok(saved)
+        }
+
+        async fn save_delta(
+            &self,
+            service: &str,
+            space: &str,
+            name: &str,
+            payload: Vec<u8>,
+            expected: ArtifactExpectation,
+        ) -> Result<DeltaSave, DatabaseArtifactError> {
+            let saved = self
+                .inner
+                .save_delta(service, space, name, payload, expected)
+                .await?;
+            self.lose_reply()?;
+            Ok(saved)
+        }
+    }
+
+    /// TC-1054 (Astra's P2): a persist whose write committed but whose reply
+    /// was lost is `OutcomeUnknown`, not a retryable `Unavailable`: the write
+    /// is durable, and a blind fresh retry would apply it twice.
+    #[tokio::test]
+    async fn a_lost_commit_reply_is_an_unknown_outcome() {
+        let repo = Arc::new(LostReplyArtifactRepository {
+            inner: artifact_repository().await,
+            lost_replies: AtomicU64::new(0),
+        });
+        let cache = TempDir::new().unwrap();
+        let space = test_space_id("sql-lost-reply");
+        let service = SqlService::new(
+            cache.path().to_string_lossy().into_owned(),
+            u64::MAX,
+            repo.clone(),
+        );
+        let write = |value: &'static str| {
+            service.execute(
+                &space,
+                "a",
+                insert(value),
+                None,
+                "tinycloud.sql/write".into(),
+            )
+        };
+        write("first").await.unwrap();
+
+        repo.lost_replies.store(1, Ordering::SeqCst);
+        let err = write("second").await.expect_err("the reply was lost");
+        assert!(matches!(err, SqlError::OutcomeUnknown), "{err:?}");
+        // The write is durable: reading back (after re-hydration) shows it,
+        // which is what the client must do before deciding to retry.
+        let read = service
+            .execute(&space, "a", count(), None, "tinycloud.sql/read".into())
+            .await
+            .unwrap();
+        match read.response {
+            SqlResponse::Query(query) => {
+                assert_eq!(query.rows, vec![vec![SqlValue::Integer(2)]])
+            }
+            other => panic!("expected a query response, got {other:?}"),
+        }
     }
 
     impl FlakyArtifactRepository {
