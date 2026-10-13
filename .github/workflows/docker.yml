@@ -706,14 +706,20 @@ jobs:
               --data '{}' \
               "${NODE_ORIGIN}${route}")"
 
-            # The delivery route requires the authenticated invocation guard
-            # before JSON parsing; its intentionally unauthenticated probe is 401.
-            EXPECTED_AUTH_REJECTION=false
-            if [ "${route}" = "/policy/v3/deliveries/authorize" ] && [ "${STATUS}" = "401" ]; then
-              EXPECTED_AUTH_REJECTION=true
+            # Delivery is authenticated before request-body validation, so its
+            # intentionally unsigned probe must be exactly 401. Other
+            # control-plane routes reject the body first (400 or 422). Neither
+            # case may silently accept a missing route or a server failure.
+            if [ "${route}" = "/policy/v3/deliveries/authorize" ]; then
+              EXPECTED="401"
+              case "${STATUS}" in 401) VALID=true ;; *) VALID=false ;; esac
+            else
+              EXPECTED="400 or 422"
+              case "${STATUS}" in 400|422) VALID=true ;; *) VALID=false ;; esac
             fi
-            if [ "${STATUS}" != "400" ] && [ "${STATUS}" != "422" ] && [ "${EXPECTED_AUTH_REJECTION}" != "true" ]; then
-              echo "::error::${route} returned unexpected HTTP ${STATUS} for an intentionally invalid unauthenticated request."
+
+            if [ "${VALID}" != true ]; then
+              echo "::error::${route} returned HTTP ${STATUS}; expected ${EXPECTED} for an intentionally invalid unauthenticated request."
               head -c 1000 "${RESPONSE_FILE}" || true
               rm -f "${RESPONSE_FILE}"
               exit 1
