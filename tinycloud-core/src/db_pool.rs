@@ -301,19 +301,28 @@ impl RecoveringConnection {
         Ok(BulkScope::Transaction(transaction))
     }
 
-    /// Run `read`, a use of a [`Self::begin_bulk_read`] scope, and run
-    /// it once more if it fails with a connection-class error, as a
-    /// read-only statement on the pool would be.
+    /// Run `read` in a [`Self::begin_bulk_read`] scope, and run the whole
+    /// attempt once more if it lost its connection within the retry window,
+    /// as a read-only statement on the pool would be. The attempt's `BEGIN` is
+    /// not retried on its own: nested retries would let one request wait for
+    /// several connection-loss detections.
     pub async fn bulk_read<T, F, Fut>(&self, operation: &'static str, read: F) -> Result<T, DbErr>
     where
-        F: Fn() -> Fut,
+        F: Fn(BulkScope) -> Fut,
         Fut: Future<Output = Result<T, DbErr>>,
     {
-        if self.bulk_statement_timeout().is_none() {
+        let Some(timeout) = self.bulk_statement_timeout() else {
             // The scope is the pool, whose statements retry themselves.
-            return read().await;
-        }
-        self.run(operation, true, read).await
+            return read(BulkScope::Pool(self.clone())).await;
+        };
+        self.run(operation, true, || async {
+            let transaction = self.conn.begin().await?;
+            transaction
+                .execute_unprepared(&set_local_statement_timeout(timeout))
+                .await?;
+            read(BulkScope::Transaction(transaction)).await
+        })
+        .await
     }
 
     /// The `statement_timeout` a [`Self::begin_bulk`] transaction runs with, or

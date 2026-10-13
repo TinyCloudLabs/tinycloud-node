@@ -255,8 +255,7 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
         };
         let row = if bulk {
             self.conn
-                .bulk_read("load_artifact", || async {
-                    let scope = self.conn.begin_bulk_read().await?;
+                .bulk_read("load_artifact", |scope| async move {
                     let row = find().one(&scope).await?;
                     scope.commit().await?;
                     Ok(row)

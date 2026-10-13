@@ -692,6 +692,13 @@ impl Proxy {
         Self { addr, links }
     }
 
+    /// Start counting forwarded bytes afresh on every connection.
+    fn reset_counters(&self) {
+        for link in self.links.lock().unwrap().iter() {
+            link.down.store(0, Ordering::Relaxed);
+        }
+    }
+
     fn clients(&self) -> Vec<SocketAddr> {
         self.links
             .lock()
@@ -934,8 +941,10 @@ async fn blackhole_mid_hydration_releases_the_database_lock() {
     let Some(url) = blackhole_url("blackhole_mid_hydration_releases_the_database_lock") else {
         return;
     };
-    let (_, cut) = mid_hydration_blackhole(&url, "bhlock", |_| {}).await;
+    let (elapsed, cut) = mid_hydration_blackhole(&url, "bhlock", |_| {}).await;
     assert_eq!(cut, 2, "the attempt and its one retry were each cut");
+    // Two detections (about 3 s each), never a third from a nested retry.
+    assert!(elapsed < Duration::from_secs(9), "{elapsed:?}");
 }
 
 /// The bound under the lock (TC-1054, Opus): a hydration whose connection
@@ -957,6 +966,21 @@ async fn blackhole_mid_hydration_waits_for_one_detection_only() {
     assert!(elapsed < Duration::from_secs(6), "{elapsed:?}");
 }
 
+/// The case CI found: the hydration's `BEGIN` draws an idle connection that
+/// died silently, and the load on the next connection is cut mid-transfer.
+/// The attempt is retried as a whole, its `BEGIN` never on its own, so the
+/// request waits for at most two detections, not three.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blackhole_dead_idle_connection_then_cut_hydration_waits_two_detections_at_most() {
+    let Some(url) = blackhole_url(
+        "blackhole_dead_idle_connection_then_cut_hydration_waits_two_detections_at_most",
+    ) else {
+        return;
+    };
+    let (elapsed, _) = mid_hydration_blackhole_with(&url, "bhidlecut", |_| {}, true).await;
+    assert!(elapsed < Duration::from_secs(9), "{elapsed:?}");
+}
+
 /// Black-hole every connection streaming db `a`'s hydration on a cold node,
 /// check the request on `a` fails retryably while db `b` is served, then
 /// that the next request on `a` succeeds. Returns the failed request's
@@ -965,6 +989,18 @@ async fn mid_hydration_blackhole(
     url: &str,
     name: &'static str,
     tune: impl FnOnce(&mut Config),
+) -> (Duration, usize) {
+    mid_hydration_blackhole_with(url, name, tune, false).await
+}
+
+/// [`mid_hydration_blackhole`]; with `kill_idle`, every idle pooled
+/// connection is black-holed first too, so the hydration's `BEGIN` may draw
+/// a dead one (and db `b` is not expected to be served meanwhile).
+async fn mid_hydration_blackhole_with(
+    url: &str,
+    name: &'static str,
+    tune: impl FnOnce(&mut Config),
+    kill_idle: bool,
 ) -> (Duration, usize) {
     let schema = Schema::new(url, name).await;
     // 4 MiB/s to the pool: a 12 MiB hydration takes about 3 s.
@@ -985,10 +1021,17 @@ async fn mid_hydration_blackhole(
         write(&seed, &space, "b", 1024).await.unwrap();
     }
 
-    // A cold node: the next request on each database hydrates it.
+    // A cold node: the next request on each database hydrates it. Only
+    // traffic from here on marks a connection as streaming the artifact.
     let cache = tempfile::TempDir::new().unwrap();
     let service = Arc::new(sql_service(&conn, &cache));
+    proxy.reset_counters();
     let blackhole = Arc::new(Mutex::new(Blackhole::new(proxy.addr)));
+    if kill_idle {
+        for client in proxy.clients() {
+            blackhole.lock().unwrap().drop_packets_of(client);
+        }
+    }
     let cutting = Arc::new(AtomicBool::new(true));
     let cutter = {
         let (proxy, blackhole, cutting) = (proxy.clone(), blackhole.clone(), cutting.clone());
@@ -1005,7 +1048,7 @@ async fn mid_hydration_blackhole(
         let (service, space, cutting) = (service.clone(), space.clone(), cutting.clone());
         tokio::spawn(async move {
             let mut latencies = Vec::new();
-            while cutting.load(Ordering::Relaxed) {
+            while !kill_idle && cutting.load(Ordering::Relaxed) {
                 let started = Instant::now();
                 let rows = count(&service, &space, "b")
                     .await
@@ -1034,7 +1077,7 @@ async fn mid_hydration_blackhole(
     cutter.await.unwrap();
     let latencies = other.await.unwrap();
     eprintln!("db b during the black hole: {latencies:?}");
-    assert!(latencies.len() >= 3, "{latencies:?}");
+    assert!(kill_idle || latencies.len() >= 3, "{latencies:?}");
     assert!(
         latencies
             .iter()
