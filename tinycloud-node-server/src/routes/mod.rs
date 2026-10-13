@@ -9835,6 +9835,92 @@ mod tests {
         assert_eq!(reply.json["error"]["reason"], "retention-grant-revoked");
         Ok(())
     }
+    // ── TC-957 ──
+
+    /// The CLI's local-login bootstrap signs the account-index SQL grant on the
+    /// default space (`{owner}:default/sql/account`) and then invokes
+    /// `tinycloud.sql/schema` on `{owner}:account/sql/account` with only that
+    /// proof. The owner is the same, but the space is not, so the node must
+    /// refuse; the same grant signed on the account space must succeed.
+    #[tokio::test]
+    async fn tc957_account_index_schema_needs_an_account_space_grant() -> Result<()> {
+        use rocket::http::Status;
+        let f = KvSyncFixture::new().await?;
+        let account = SpaceId::new(f.space.did().to_owned(), "account".parse()?);
+        {
+            // Same owner as `f.space`, so its actor row already exists.
+            use tinycloud_core::sea_orm::{ActiveModelTrait, ActiveValue::Set};
+            tinycloud_core::models::space::ActiveModel {
+                id: Set(tinycloud_core::types::SpaceIdWrap(account.clone())),
+            }
+            .insert(&f.conn)
+            .await?;
+        }
+        let owner = f.space.did().to_string();
+        let device = f.device_did();
+        let abilities = [
+            "tinycloud.sql/read",
+            "tinycloud.sql/write",
+            "tinycloud.sql/schema",
+        ];
+        async fn invoke(
+            f: &KvSyncFixture,
+            account: &SpaceId,
+            proof: tinycloud_core::hash::Hash,
+        ) -> Result<SyncReply> {
+            let header = f.device_invocation_in(
+                &[
+                    (account, "account", "tinycloud.sql/schema"),
+                    (account, "account", "tinycloud.sql/write"),
+                ],
+                &[proof],
+            )?;
+            let batch = SqlRequest::Batch {
+                statements: vec![tinycloud_core::sql::types::SqlStatement {
+                    sql: "CREATE TABLE IF NOT EXISTS t (v TEXT)".into(),
+                    params: vec![],
+                }],
+            };
+            f.invoke_json(header, &batch).await
+        }
+
+        let cross_space = f
+            .grant_in(
+                "tc957-default-space-shape",
+                &owner,
+                &device,
+                &abilities.map(|a| (&f.space, "account", a)),
+                None,
+                None,
+                &[],
+            )
+            .await?;
+        let refused = invoke(&f, &account, cross_space).await?;
+        assert_eq!(refused.status, Status::Unauthorized, "{}", refused.body);
+        assert!(
+            refused
+                .body
+                .contains(":account/sql/account / tinycloud.sql/schema"),
+            "{}",
+            refused.body
+        );
+
+        let same_space = f
+            .grant_in(
+                "tc957-account-space-shape",
+                &owner,
+                &device,
+                &abilities.map(|a| (&account, "account", a)),
+                None,
+                None,
+                &[],
+            )
+            .await?;
+        let created = invoke(&f, &account, same_space).await?;
+        assert_eq!(created.status, Status::Ok, "{}", created.body);
+        Ok(())
+    }
+
     // ── TC-825 ──
 
     fn tc825_sql_query(sql: &str) -> SqlRequest {
