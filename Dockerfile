@@ -31,6 +31,9 @@ FROM chef AS builder
 ARG CARGO_FEATURES=""
 COPY --from=planner /app/recipe.json recipe.json
 COPY --from=planner /app/rust-toolchain.toml ./
+# The [patch]ed sqlx-core (TC-1054) is a path dependency outside the
+# workspace, so the recipe does not carry it; cook needs the real crate.
+COPY --from=planner /app/vendor/ ./vendor/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     if [ -n "$CARGO_FEATURES" ]; then \
