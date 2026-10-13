@@ -255,9 +255,11 @@ async fn postgres_pool_sockets_carry_keepalive_and_user_timeout() {
         return;
     };
     let schema = Schema::new(&url, "keepalive").await;
-    // A peer no other pool in this process connects to: a scan configures
-    // every new socket to its database peer, whichever pool opened it.
+    // Settings are registered per connect target: a proxy of its own.
     let proxy = Proxy::start(upstream_addr(&url), None).await;
+    // A socket to the same target that sqlx did not open, before and after
+    // the pool connects: never touched.
+    let before = std::net::TcpStream::connect(proxy.addr).unwrap();
     let conn = pool(schema.url(&url, Some(proxy.addr)), |config| {
         config.database.tcp_keepalive_idle_secs = 7;
         config.database.tcp_keepalive_interval_secs = 3;
@@ -270,9 +272,12 @@ async fn postgres_pool_sockets_carry_keepalive_and_user_timeout() {
     for _ in 0..3 {
         held.push(pool.acquire().await.unwrap());
     }
+    let after = std::net::TcpStream::connect(proxy.addr).unwrap();
+    let foreign = [before.local_addr().unwrap(), after.local_addr().unwrap()];
 
     let port = proxy.addr.port();
     let mut configured = 0;
+    let mut inbound = 0;
     for entry in std::fs::read_dir("/proc/self/fd").unwrap().flatten() {
         let Ok(fd) = entry.file_name().to_string_lossy().parse::<i32>() else {
             continue;
@@ -280,12 +285,27 @@ async fn postgres_pool_sockets_carry_keepalive_and_user_timeout() {
         // SAFETY: borrowed for getsockopt only; the pool keeps these open.
         let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
         let socket = socket2::SockRef::from(&fd);
-        let to_server = socket
-            .peer_addr()
-            .ok()
-            .and_then(|addr| addr.as_socket())
-            .is_some_and(|peer| peer.port() == port);
-        if !to_server {
+        let local = socket.local_addr().ok().and_then(|addr| addr.as_socket());
+        let peer = socket.peer_addr().ok().and_then(|addr| addr.as_socket());
+        // Inbound: the proxy's listener and the sockets it accepted.
+        if local.is_some_and(|local| local.port() == port) {
+            inbound += 1;
+            assert!(
+                !socket.keepalive().unwrap(),
+                "inbound sockets are untouched"
+            );
+            assert_eq!(socket.tcp_user_timeout().unwrap(), None);
+            continue;
+        }
+        if !peer.is_some_and(|peer| peer.port() == port) {
+            continue;
+        }
+        if local.is_some_and(|local| foreign.contains(&local)) {
+            assert!(
+                !socket.keepalive().unwrap(),
+                "only sqlx's sockets are configured"
+            );
+            assert_eq!(socket.tcp_user_timeout().unwrap(), None);
             continue;
         }
         configured += 1;
@@ -302,6 +322,10 @@ async fn postgres_pool_sockets_carry_keepalive_and_user_timeout() {
         configured,
         pool.size() as usize,
         "every connection of the pool is configured"
+    );
+    assert!(
+        inbound > pool.size() as usize,
+        "the proxy's sockets were checked"
     );
     drop(held);
     conn.sea_orm_connection().clone().close().await.unwrap();
@@ -613,11 +637,10 @@ async fn postgres_large_hydration_runs_under_the_bulk_timeout() {
     schema.drop().await;
 }
 
-/// A connection whose socket cannot be configured is never admitted
-/// (Astra's P1): sqlx retries the connect until the acquire deadline and the
-/// pool fails with a retryable acquire error instead of handing out an
-/// unprotected connection. Linux caps `TCP_KEEPCNT` at 127, so 1000 makes
-/// every configuration fail.
+/// Fail-closed (TC-1054): a connect whose keepalive options cannot be set
+/// fails in the patched sqlx-core, so the pool never hands out a connection
+/// without them. Linux caps `TCP_KEEPCNT` at 127, so 1000 fails every
+/// connect.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_unconfigurable_keepalive_admits_no_connection() {
@@ -625,7 +648,7 @@ async fn postgres_unconfigurable_keepalive_admits_no_connection() {
         return;
     };
     let schema = Schema::new(&url, "failclosed").await;
-    // A peer port of its own, so no other pool's scan configures the socket.
+    // A target of its own: settings are registered per connect target.
     let proxy = Proxy::start(upstream_addr(&url), None).await;
     let mut config = Config::default();
     config.database.tcp_keepalive_retries = 1000;
@@ -633,22 +656,24 @@ async fn postgres_unconfigurable_keepalive_admits_no_connection() {
     options
         .max_connections(2)
         .acquire_timeout(Duration::from_secs(2));
-    let missed = tinycloud::pg_keepalive::KeepaliveConfigurator::missed();
     let started = Instant::now();
-    let result = tinycloud::postgres_pool_with_recovery(
+    let error = tinycloud::postgres_pool_with_recovery(
         options,
         None,
         &config.database,
         tinycloud_core::db_pool::PoolRecovery::new(),
     )
-    .await;
-    assert!(result.is_err(), "no connection was admitted");
+    .await
+    .expect_err("no connection was admitted");
+    assert!(
+        format!("{error:#}").contains("os error 22"),
+        "the setsockopt failure (EINVAL) failed the connect: {error:#}"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(10),
         "{:?}",
         started.elapsed()
     );
-    assert!(tinycloud::pg_keepalive::KeepaliveConfigurator::missed() > missed);
     schema.drop().await;
 }
 

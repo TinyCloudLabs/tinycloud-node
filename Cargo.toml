@@ -18,6 +18,7 @@ default-members = ["tinycloud-node-server"]
 
 exclude = [
     "test/load/signer",
+    "vendor/sqlx-core",
     "test/m1-realdata-e2e",
     "test/w5-policy-runtime-node-e2e",
 ]
@@ -56,6 +57,11 @@ cacaos = { path = "dependencies/cacao", version = "1.0.0" }
 [patch.crates-io]
 # Fix RUSTSEC-2025-0047: Out-of-bounds access in get_disjoint_mut (0.4.10 -> 0.4.11)
 slab = { git = "https://github.com/tokio-rs/slab", tag = "v0.4.11" }
+# TC-1054: sqlx-core 0.8.6 with TCP keepalive and TCP_USER_TIMEOUT set on
+# every new connection's socket (see vendor/sqlx-core/PATCH.md). Drop it
+# when upstream supports them, or sea-orm moves to an sqlx that does
+# (TC-1061).
+sqlx-core = { path = "vendor/sqlx-core" }
 
 [profile.release]
 lto = "fat"

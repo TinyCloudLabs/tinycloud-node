@@ -914,12 +914,15 @@ fn note_write_outcome<T>(result: &Result<T, DbErr>) {
 pub enum TransientFailure {
     /// No write of the operation can have taken effect: the pool had no
     /// connection to give, a connection was lost before any write was
-    /// sent, the operation only read, or the server refused the statement
-    /// (statement timeout, serialization failure, deadlock). A fresh
-    /// attempt is safe.
+    /// sent, the operation only read, or the server refused an autocommit
+    /// statement (statement timeout, serialization failure, deadlock). A
+    /// fresh attempt is safe.
     Retryable,
     /// A write may have committed before the failure: its connection was
-    /// lost after the write or `COMMIT` was sent. The client must read the
+    /// lost after the write or `COMMIT` was sent, or any transient failure
+    /// came after a read-write transaction began (even a refused
+    /// statement, which aborts it: the statements and `COMMIT` of a
+    /// transaction are not observed one by one). The client must read the
     /// state back before deciding to retry.
     OutcomeUnknown,
 }

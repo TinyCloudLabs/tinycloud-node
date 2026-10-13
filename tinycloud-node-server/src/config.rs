@@ -1219,9 +1219,11 @@ pub struct DatabaseConfig {
     #[serde(default = "default_database_bulk_statement_timeout_ms")]
     pub bulk_statement_timeout_ms: u64,
     /// Enable TCP keepalive and `TCP_USER_TIMEOUT` on PostgreSQL connection
-    /// sockets (Linux only), so a connection the network silently drops
-    /// fails within tens of seconds instead of the kernel's ~15 min
-    /// retransmission timeout (TC-1054).
+    /// sockets, so a connection the network silently drops fails within tens
+    /// of seconds instead of the kernel's ~15 min retransmission timeout
+    /// (TC-1054). Set by the vendored sqlx-core as each connection connects
+    /// (`vendor/sqlx-core/PATCH.md`); the interval, count and user timeout
+    /// are Linux only, elsewhere only the idle time applies.
     #[serde(default = "default_true")]
     pub tcp_keepalive: bool,
     /// Seconds a connection is idle before the first keepalive probe.
@@ -1326,9 +1328,12 @@ impl DatabaseConfig {
     }
 
     /// The keepalive settings for PostgreSQL sockets, or `None` when off.
-    pub fn tcp_keepalive(&self) -> Option<crate::pg_keepalive::TcpKeepalive> {
+    /// Out-of-range values (Linux caps `TCP_KEEPCNT` at 127 and
+    /// `TCP_KEEPIDLE` and `TCP_KEEPINTVL` at 32767 s) make every connect
+    /// fail, so the node does not start.
+    pub fn tcp_keepalive(&self) -> Option<sqlx_core::net::tcp_keepalive::TcpKeepalive> {
         self.tcp_keepalive
-            .then(|| crate::pg_keepalive::TcpKeepalive {
+            .then(|| sqlx_core::net::tcp_keepalive::TcpKeepalive {
                 idle: Duration::from_secs(self.tcp_keepalive_idle_secs.max(1)),
                 interval: Duration::from_secs(self.tcp_keepalive_interval_secs.max(1)),
                 retries: self.tcp_keepalive_retries.max(1),

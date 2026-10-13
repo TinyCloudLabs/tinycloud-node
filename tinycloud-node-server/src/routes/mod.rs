@@ -104,10 +104,12 @@ pub const RETRY_AFTER_SECS: u32 = 1;
 /// The response to a database failure of an operation (TC-1054):
 ///
 /// - `503` with `Retry-After`, body `unavailable_retryable: ...`: transient, and no write of the
-///   operation can have taken effect (no connection to be had, a read, a
-///   statement the server refused). A fresh request is safe.
+///   operation can have taken effect (no connection to be had, a read, an
+///   autocommit statement the server refused). A fresh request is safe.
 /// - `500` without `Retry-After`, body `outcome_unknown: ...`: transient, but the connection was
-///   lost after a write or `COMMIT` was sent, so it may have been applied.
+///   lost after a write or `COMMIT` was sent, or the failure came after a
+///   read-write transaction began (including a refused statement in it),
+///   so it may have been applied.
 ///   The client must read the state back before deciding to retry;
 ///   re-sending the identical signed request is answered 409 (replay
 ///   protection), except a delegation, which is idempotent.

@@ -639,7 +639,7 @@ mod tests {
         );
         assert_eq!(
             defaults.tcp_keepalive(),
-            Some(crate::pg_keepalive::TcpKeepalive {
+            Some(sqlx_core::net::tcp_keepalive::TcpKeepalive {
                 idle: std::time::Duration::from_secs(15),
                 interval: std::time::Duration::from_secs(5),
                 retries: 3,

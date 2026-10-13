@@ -15,7 +15,14 @@ use rocket::{
     http::{Header, Method},
     Build, Rocket, Route,
 };
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    path::Path,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 pub mod allow_list;
 pub mod auth_guards;
@@ -27,7 +34,6 @@ pub mod hooks;
 pub mod invocation_replay;
 pub mod link;
 pub mod node_control;
-pub mod pg_keepalive;
 pub mod policy_v3;
 pub mod prometheus;
 pub mod quota;
@@ -281,6 +287,13 @@ pub async fn connect_database(tinycloud_config: &Config) -> Result<RecoveringCon
     ))
 }
 
+static POSTGRES_CONNECTIONS_OPENED: AtomicU64 = AtomicU64::new(0);
+
+/// PostgreSQL connections the node's pools have opened in this process.
+pub fn postgres_connections_opened() -> u64 {
+    POSTGRES_CONNECTIONS_OPENED.load(Ordering::Relaxed)
+}
+
 /// Build the Postgres pool for `connect_opts` (its URL and pool settings).
 ///
 /// sqlx pings every pooled connection before handing it out by default. Most
@@ -292,9 +305,11 @@ pub async fn connect_database(tinycloud_config: &Config) -> Result<RecoveringCon
 /// when that is safe.
 ///
 /// Every new connection then gets, from `database` (TC-1054):
-/// - TCP keepalive and `TCP_USER_TIMEOUT` on its socket
-///   ([`pg_keepalive`]), so a connection the network drops silently fails
-///   within tens of seconds instead of hanging for up to ~15 min;
+/// - TCP keepalive and `TCP_USER_TIMEOUT` on its socket, set by the vendored
+///   sqlx-core's `connect_tcp` as it connects (`vendor/sqlx-core/PATCH.md`),
+///   so a connection the network drops silently fails within tens of
+///   seconds instead of hanging for up to ~15 min. A connect whose options
+///   cannot be set fails;
 /// - in [`tinycloud_core::db_pool::StatementTimeoutMode::Session`], `SET statement_timeout`, so a
 ///   statement stuck on a live connection fails server-side. Migrations and
 ///   whole-artifact transfers scope their own limits
@@ -334,20 +349,16 @@ pub async fn postgres_pool_with_recovery(
     if let Some(root_cert_path) = root_cert_path {
         options = options.ssl_root_cert(root_cert_path);
     }
-    let keepalive = match database.tcp_keepalive() {
-        Some(settings) => {
-            pg_keepalive::log_unsupported_once();
-            pg_keepalive::KeepaliveConfigurator::new(
-                settings,
-                options.get_host(),
-                options.get_port(),
-            )
-        }
-        None => None,
-    };
+    // Registered per connect target before the pool opens its first
+    // connection; the vendored sqlx-core applies it in `connect_tcp`.
+    let keepalive = database.tcp_keepalive();
+    sqlx_core::net::tcp_keepalive::set_tcp_keepalive(
+        options.get_host(),
+        options.get_port(),
+        keepalive,
+    );
     let statement_timeouts = database.statement_timeouts();
     let session_statement = statement_timeouts.session_statement();
-    let on_connect = keepalive.clone();
     let pool = recovery
         .install(
             connect_opts
@@ -355,18 +366,9 @@ pub async fn postgres_pool_with_recovery(
                 .test_before_acquire(false),
         )
         .after_connect(move |conn, _meta| {
-            let keepalive = on_connect.clone();
             let session_statement = session_statement.clone();
             Box::pin(async move {
-                // First, so the statements below are already covered. A
-                // connection whose socket may be left unprotected is not
-                // admitted: sqlx closes it and connects again (TC-1054).
-                if let Some(keepalive) = keepalive {
-                    keepalive
-                        .on_connect()
-                        .await
-                        .map_err(tinycloud_core::sea_orm::sqlx::Error::Io)?;
-                }
+                POSTGRES_CONNECTIONS_OPENED.fetch_add(1, Ordering::Relaxed);
                 if let Some(statement) = session_statement {
                     conn.execute(statement.as_str()).await?;
                 }
@@ -375,22 +377,23 @@ pub async fn postgres_pool_with_recovery(
         })
         .connect_with(options)
         .await?;
-    let keepalive_settings = keepalive.as_ref().map(|keepalive| keepalive.settings());
+    // After a deploy, `sockets_configured >= connections_opened` shows every
+    // connection got its keepalive options (a connect that cannot set them
+    // fails, with a warning from sqlx-core).
     ::tracing::info!(
         statement_timeout_mode = ?statement_timeouts.mode,
         statement_timeout_ms = statement_timeouts.base.as_millis() as u64,
         bulk_statement_timeout_ms = statement_timeouts.bulk.as_millis() as u64,
         retry_window_ms = database.retry_window_ms,
-        tcp_keepalive = keepalive_settings.is_some(),
-        tcp_keepalive_idle_secs = keepalive_settings.map(|s| s.idle.as_secs()),
-        tcp_keepalive_interval_secs = keepalive_settings.map(|s| s.interval.as_secs()),
-        tcp_keepalive_retries = keepalive_settings.map(|s| s.retries),
-        tcp_user_timeout_ms = keepalive_settings
-            .and_then(|s| s.user_timeout)
+        tcp_keepalive = keepalive.is_some(),
+        tcp_keepalive_idle_secs = keepalive.map(|k| k.idle.as_secs()),
+        tcp_keepalive_interval_secs = keepalive.map(|k| k.interval.as_secs()),
+        tcp_keepalive_retries = keepalive.map(|k| k.retries),
+        tcp_user_timeout_ms = keepalive
+            .and_then(|k| k.user_timeout)
             .map(|t| t.as_millis() as u64),
-        sockets_configured = pg_keepalive::KeepaliveConfigurator::configured(),
-        connections_opened = pg_keepalive::KeepaliveConfigurator::connections(),
-        keepalive_missed = pg_keepalive::KeepaliveConfigurator::missed(),
+        sockets_configured = sqlx_core::net::tcp_keepalive::sockets_configured(),
+        connections_opened = postgres_connections_opened(),
         "PostgreSQL pool connection limits"
     );
     Ok(RecoveringConnection::with_recovery(
