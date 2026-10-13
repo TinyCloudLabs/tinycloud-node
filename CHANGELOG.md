@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 - Webhook deliveries re-check the subscriber's authority at send time. A subscription whose subscriber no longer holds `tinycloud.hooks/register` on its space and path — revoked, expired, narrowed, or a revoked or expired ancestor — is deactivated and its pending deliveries dead-letter as "subscription authority lapsed". Owner (root-authority) subscriptions are unaffected. SDK webhooks are registered by the session key, so they stop when the session grant expires; re-register with a live session. No schema change; rollback to 1.20.2 is DB-safe (TC-991).
-- The ingress container's Docker log is capped at 3 × 50 MB (`logging: json-file`, `max-size: 50m`, `max-file: 3` in `docker-compose.dstack-postgres.yaml`), so its per-request stdout lines no longer depend on the CVM daemon's default rotation (TC-970).
+- The ingress and node containers' Docker logs are capped at 3 × 50 MB each (`logging: json-file`, `max-size: 50m`, `max-file: 3` in `docker-compose.dstack-postgres.yaml`), so their per-request stdout lines no longer depend on the CVM daemon's default rotation (TC-970).
 
 ## [1.20.2] - 2026-10-13
 
