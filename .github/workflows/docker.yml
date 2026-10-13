@@ -577,8 +577,10 @@ jobs:
       # TC-1012: this compose no longer publishes :8000, so the gateway stops
       # serving <app_id>-8000. node.tinycloud.xyz (the SDK default) must already
       # go through dstack-ingress, or replacing the CVM takes it down. Only the
-      # ingress serves /evidences/ (the node itself returns 404), so a 200 here
-      # proves the worker was repointed. Refuse before touching the CVM.
+      # ingress serves /evidences/ (the node itself returns 404), so a 404 here
+      # means the worker still points at the raw port: refuse before touching
+      # the CVM. Any other non-200 (e.g. a broken ingress) only warns, so the
+      # gate cannot block the redeploy that fixes it.
       - name: Require node.tinycloud.xyz to route through the ingress
         run: |
           set -euo pipefail
@@ -592,8 +594,11 @@ jobs:
             echo "attempt ${attempt}/3: node.tinycloud.xyz/evidences/ returned HTTP ${STATUS}"
             [ "${attempt}" = 3 ] || sleep 5
           done
-          echo "::error::TC-1012: node.tinycloud.xyz still bypasses the ingress (/evidences/ HTTP ${STATUS}); deploy the tinycloud-dev worker repoint (samgbafa/tinycloud-dev#83) first"
-          exit 1
+          if [ "${STATUS}" = "404" ]; then
+            echo "::error::TC-1012: node.tinycloud.xyz still bypasses the ingress (/evidences/ HTTP 404); deploy the tinycloud-dev worker repoint (samgbafa/tinycloud-dev#83) first"
+            exit 1
+          fi
+          echo "::warning::TC-1012: node.tinycloud.xyz/evidences/ returned HTTP ${STATUS} (not the raw-port 404); proceeding with deploy"
 
       - name: Deploy to Phala Cloud
         env:
