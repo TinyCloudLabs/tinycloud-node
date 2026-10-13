@@ -9846,12 +9846,15 @@ mod tests {
     async fn tc957_account_index_schema_needs_an_account_space_grant() -> Result<()> {
         use rocket::http::Status;
         let f = KvSyncFixture::new().await?;
+        // The fixture's own space is `files`; the reported shape is
+        // `default` → `account`, so build both explicitly.
+        let default = SpaceId::new(f.space.did().to_owned(), "default".parse()?);
         let account = SpaceId::new(f.space.did().to_owned(), "account".parse()?);
-        {
+        for space in [&default, &account] {
             // Same owner as `f.space`, so its actor row already exists.
             use tinycloud_core::sea_orm::{ActiveModelTrait, ActiveValue::Set};
             tinycloud_core::models::space::ActiveModel {
-                id: Set(tinycloud_core::types::SpaceIdWrap(account.clone())),
+                id: Set(tinycloud_core::types::SpaceIdWrap(space.clone())),
             }
             .insert(&f.conn)
             .await?;
@@ -9889,7 +9892,7 @@ mod tests {
                 "tc957-default-space-shape",
                 &owner,
                 &device,
-                &abilities.map(|a| (&f.space, "account", a)),
+                &abilities.map(|a| (&default, "account", a)),
                 None,
                 None,
                 &[],
