@@ -11303,8 +11303,24 @@ mod tests {
 
     #[tokio::test]
     async fn f43_webhook_stops_delivering_after_registering_delegation_expires() -> Result<()> {
-        let expiry = whole_seconds_from_now(3);
-        let (f, _grant, dispatcher, mut delivered) = f43_registered_webhook(expiry).await?;
+        // Mint the grant after fixture setup (slow under a parallel suite), so the
+        // window only has to cover registration and the control delivery.
+        let (f, dispatcher) = tc991_fixture().await?;
+        let scope = [("kv/documents", "tinycloud.hooks/register")];
+        let expiry = whole_seconds_from_now(10);
+        let grant = f
+            .grant(
+                "f43-hooks-register",
+                &f.space.did().to_string(),
+                &f.device_did(),
+                &scope,
+                None,
+                Some(expiry),
+                &[],
+            )
+            .await?;
+        let (_, mut delivered) =
+            tc991_register(&f, f.device_invocation(&scope, grant)?, "kv", "documents").await?;
 
         f.owner_write("documents/before.txt", Some(b"v1")).await?;
         let bodies = f43_deliver(&dispatcher, &mut delivered).await?;
