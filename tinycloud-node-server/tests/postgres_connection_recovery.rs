@@ -6,8 +6,8 @@
 //! succeed: a KV put and a KV get through `SpaceDatabase::invoke`, and a
 //! `delegate`, each with a signed owner invocation or delegation.
 //!
-//! - A terminated backend (`pg_terminate_backend`, what a failover or an
-//!   idle-session reaper does) answers with FATAL 57P01.
+//! - A terminated backend (`pg_terminate_backend`, what a failover does)
+//!   answers with FATAL 57P01; an idle-session reaper with FATAL 57P05.
 //! - A cut connection (a proxy or NAT dropping it) is reset by an in-test
 //!   TCP proxy between the pool and Postgres.
 //!
@@ -41,7 +41,7 @@ use tinycloud_core::keys::StaticSecret;
 use tinycloud_core::models::space as space_model;
 use tinycloud_core::sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ConnectOptions, ConnectionTrait, Database,
-    DatabaseConnection, DbBackend, Statement,
+    DatabaseConnection, DbBackend, Statement, TransactionTrait,
 };
 use tinycloud_core::storage::memory::{MemoryStaging, MemoryStore};
 use tinycloud_core::storage::{HashBuffer, StorageSetup};
@@ -70,6 +70,15 @@ fn init_tracing() {
             "tinycloud_core::db_pool=warn",
         ))
         .try_init();
+}
+
+/// Each test holds up to `MAX_CONNECTIONS` server connections; the test
+/// server's `max_connections` (100 by default) is shared with other suites.
+/// At most this many of these tests hold their pools at once.
+static SERVER_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(3);
+
+async fn server_slot() -> tokio::sync::SemaphorePermit<'static> {
+    SERVER_SLOTS.acquire().await.unwrap()
 }
 
 fn postgres_url(test: &str) -> Option<String> {
@@ -170,6 +179,7 @@ struct Fixture {
     db: Db,
     owner: Owner,
     requests: u64,
+    _slot: tokio::sync::SemaphorePermit<'static>,
 }
 
 /// `url` with this test's `application_name` and `search_path`, optionally
@@ -202,6 +212,7 @@ fn upstream_addr(url: &str) -> SocketAddr {
 impl Fixture {
     async fn new(name: &'static str, url: &str, via: Option<SocketAddr>) -> Self {
         init_tracing();
+        let slot = server_slot().await;
         let admin = Database::connect(ConnectOptions::new(url.to_owned()))
             .await
             .expect("connect to the test server");
@@ -263,6 +274,7 @@ impl Fixture {
             db,
             owner,
             requests: 0,
+            _slot: slot,
         };
         fixture.put("warm/seed").await.expect("seed put");
         fixture
@@ -612,8 +624,9 @@ async fn pipe(
 }
 
 /// Mass loss, as in a failover: every idle backend of the pool is
-/// terminated. Each request still succeeds, with at most one retry, and the
-/// pool replaces the dead connections.
+/// terminated. Requests issued one at a time each succeed, with at most one
+/// retry, and the pool replaces the dead connections. (Concurrent requests
+/// right after the loss: `postgres_concurrent_wave_after_mass_loss`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_requests_survive_termination_of_every_idle_connection() {
     let Some(url) = postgres_url("postgres_requests_survive_termination_of_every_idle_connection")
@@ -883,5 +896,370 @@ async fn postgres_steady_state_acquire_costs_no_ping() {
         "connections idle since before the loss are pinged: {after:?}"
     );
     assert_eq!(after.revalidation_failures, 0, "only the victim was dead");
+    fixture.drop_schema().await;
+}
+
+/// A pool on `url` with `application_name` and server `session_options`
+/// (`-c name=value ...`): the production constructor when `recovery` is
+/// `None`, else the same pool builder with that recovery state.
+async fn session_pool(
+    url: &str,
+    application_name: &str,
+    session_options: &str,
+    max_connections: u32,
+    recovery: Option<Arc<tinycloud_core::db_pool::PoolRecovery>>,
+) -> RecoveringConnection {
+    init_tracing();
+    let mut url = reqwest::Url::parse(url).unwrap();
+    url.query_pairs_mut()
+        .append_pair("application_name", application_name)
+        .append_pair("options", session_options);
+    let conn = match recovery {
+        None => {
+            let mut config = Config::default();
+            config.storage.database = Some(url.to_string());
+            config.database.max_connections = max_connections;
+            tinycloud::connect_database(&config).await.unwrap()
+        }
+        Some(recovery) => {
+            let mut options = ConnectOptions::new(url.to_string());
+            options.max_connections(max_connections);
+            tinycloud::postgres_pool_with_recovery(options, None, recovery)
+                .await
+                .unwrap()
+        }
+    };
+    assert!(conn.recovery().is_some());
+    conn
+}
+
+/// Open `count` connections at once and wait until all are idle again.
+async fn open_idle(conn: &RecoveringConnection, count: usize) {
+    let pool = conn.sea_orm_connection().get_postgres_connection_pool();
+    let mut held = Vec::new();
+    for _ in 0..count {
+        held.push(pool.acquire().await.unwrap());
+    }
+    drop(held);
+    for _ in 0..400 {
+        if pool.num_idle() == count && pool.size() as usize == count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("pool did not settle at {count} idle connections");
+}
+
+fn unique(name: &str) -> String {
+    format!(
+        "tc951-{name}-{}-{}",
+        std::process::id(),
+        time::OffsetDateTime::now_utc().unix_timestamp_nanos() % 1_000_000_000_000
+    )
+}
+
+fn select_one() -> Statement {
+    Statement::from_string(DbBackend::Postgres, "SELECT 1 AS one")
+}
+
+/// PostgreSQL's `idle_session_timeout` ends an idle pooled session with
+/// FATAL 57P05 (Astra's repro). It is a lost connection: on the production
+/// pool, a read and a `BEGIN` after the timeout each succeed with one retry,
+/// and once a loss is seen the other reaped connections are revalidated
+/// before reuse.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_idle_session_timeout_is_a_lost_connection() {
+    let Some(url) = postgres_url("postgres_idle_session_timeout_is_a_lost_connection") else {
+        return;
+    };
+    let _slot = server_slot().await;
+    let timeout = "-c idle_session_timeout=500ms";
+
+    // The raw error a reaped session returns, unretried.
+    let conn = session_pool(&url, &unique("57p05-raw"), timeout, 1, None).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let error = conn
+        .sea_orm_connection()
+        .query_one(select_one())
+        .await
+        .expect_err("the reaped session fails");
+    eprintln!("a session reaped by idle_session_timeout: {error:?}");
+    assert!(is_connection_error(&error), "{error:?}");
+
+    // One connection: a read, then a BEGIN, each after the timeout.
+    let conn = session_pool(&url, &unique("57p05-one"), timeout, 1, None).await;
+    let recovery = Arc::clone(conn.recovery().unwrap());
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    conn.query_one(select_one())
+        .await
+        .expect("the read recovers")
+        .unwrap();
+    assert_eq!((recovery.stats().losses, recovery.stats().retries), (1, 1));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let tx = conn.begin().await.expect("BEGIN recovers");
+    tx.query_one(select_one()).await.unwrap().unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!((recovery.stats().losses, recovery.stats().retries), (2, 2));
+
+    // Several reaped connections: after the first loss the rest are
+    // revalidated, and closed, before reuse.
+    let conn = session_pool(&url, &unique("57p05-many"), timeout, 4, None).await;
+    let recovery = Arc::clone(conn.recovery().unwrap());
+    open_idle(&conn, 4).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    conn.query_one(select_one())
+        .await
+        .expect("the read recovers")
+        .unwrap();
+    let stats = recovery.stats();
+    eprintln!("4 reaped connections, one read: {stats:?}");
+    assert_eq!((stats.losses, stats.retries), (1, 1), "{stats:?}");
+    assert!(
+        stats.revalidations >= 1 && stats.revalidation_failures >= 1,
+        "{stats:?}"
+    );
+}
+
+/// A reaper that keeps closing idle connections (`idle_session_timeout`, a
+/// NAT or load balancer) produces dead connections released after any
+/// observed loss. The idle threshold covers them: each autocommit INSERT
+/// and each BEGIN, after the session timeout, succeeds with no loss, the
+/// hook having revalidated its connection, and no INSERT runs twice. The
+/// threshold is shortened from production's 60 s to 500 ms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_idle_reaped_connections_are_revalidated_before_reuse() {
+    let Some(url) = postgres_url("postgres_idle_reaped_connections_are_revalidated_before_reuse")
+    else {
+        return;
+    };
+    let _slot = server_slot().await;
+    let admin = Database::connect(ConnectOptions::new(url.clone()))
+        .await
+        .unwrap();
+    let schema = unique("reaped").replace('-', "_");
+    admin
+        .execute_unprepared(&format!(
+            "CREATE SCHEMA {schema}; CREATE TABLE {schema}.tc951_reaped (marker text NOT NULL)"
+        ))
+        .await
+        .unwrap();
+    let recovery =
+        tinycloud_core::db_pool::PoolRecovery::with_idle_revalidation(Duration::from_millis(500));
+    let conn = session_pool(
+        &url,
+        &unique("reaped"),
+        &format!("-c search_path={schema} -c idle_session_timeout=1000"),
+        4,
+        Some(Arc::clone(&recovery)),
+    )
+    .await;
+    open_idle(&conn, 4).await;
+
+    let insert = |marker: String| {
+        Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "INSERT INTO tc951_reaped (marker) VALUES ($1)",
+            [marker.into()],
+        )
+    };
+    let rounds = 4;
+    for round in 0..rounds {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        conn.execute(insert(format!("autocommit-{round}")))
+            .await
+            .unwrap_or_else(|error| panic!("autocommit INSERT {round}: {error:?}"));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let tx = conn
+            .begin()
+            .await
+            .unwrap_or_else(|error| panic!("BEGIN {round}: {error:?}"));
+        tx.execute(insert(format!("transaction-{round}")))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let stats = recovery.stats();
+    eprintln!("{rounds} rounds of INSERT and BEGIN after 1.5 s idle: {stats:?}");
+    assert_eq!((stats.losses, stats.retries), (0, 0), "{stats:?}");
+    assert!(stats.revalidations > 0, "{stats:?}");
+    let rows = admin
+        .query_one(Statement::from_string(
+            DbBackend::Postgres,
+            format!("SELECT count(*) AS n, count(DISTINCT marker) AS d FROM {schema}.tc951_reaped"),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rows.try_get::<i64>("", "n").unwrap(), 2 * rounds);
+    assert_eq!(rows.try_get::<i64>("", "d").unwrap(), 2 * rounds);
+    conn.sea_orm_connection()
+        .get_postgres_connection_pool()
+        .close()
+        .await;
+    admin
+        .execute_unprepared(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
+
+/// Astra's probe: `SELECT nextval(...)` is not read-only. When its response
+/// is lost after the server ran it, it is not run again: the error is
+/// returned and the sequence advanced exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_side_effecting_select_is_not_retried() {
+    let Some(url) = postgres_url("postgres_side_effecting_select_is_not_retried") else {
+        return;
+    };
+    let proxy = Proxy::start(upstream_addr(&url)).await;
+    let fixture = Fixture::new("nextval", &url, Some(proxy.addr)).await;
+    fixture
+        .conn
+        .execute_unprepared("CREATE SEQUENCE tc951_seq")
+        .await
+        .unwrap();
+    fixture.settle().await;
+    let before = fixture.stats();
+    proxy.cut_after_forwarding(b"tc951_seq");
+    let error = fixture
+        .conn
+        .execute_unprepared("SELECT nextval('tc951_seq')")
+        .await
+        .expect_err("the nextval response was lost");
+    assert!(is_connection_error(&error), "{error:?}");
+    let after = delta(before, fixture.stats());
+    assert_eq!((after.losses, after.retries), (1, 0), "{after:?}");
+    let last = fixture
+        .admin
+        .query_one(Statement::from_string(
+            DbBackend::Postgres,
+            format!(
+                "SELECT last_value, is_called FROM {}.tc951_seq",
+                fixture.schema
+            ),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(last.try_get::<i64>("", "last_value").unwrap(), 1);
+    assert!(last.try_get::<bool>("", "is_called").unwrap());
+    fixture.drop_schema().await;
+}
+
+/// A concurrent wave right after every idle connection died. The tasks that
+/// acquired a dead connection before the first loss was observed each meet
+/// it: the reads and BEGINs among them are retried and succeed; the writes
+/// among them fail, never more than the dead connections. Every request
+/// after the wave succeeds with no further loss.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_concurrent_wave_after_mass_loss() {
+    let Some(url) = postgres_url("postgres_concurrent_wave_after_mass_loss") else {
+        return;
+    };
+    let mut fixture = Fixture::new("wave", &url, None).await;
+    fixture
+        .conn
+        .execute_unprepared("CREATE TABLE tc951_wave (marker text NOT NULL)")
+        .await
+        .unwrap();
+    let idle = fixture.warm().await;
+    fixture.terminate(&idle).await;
+    let before = fixture.stats();
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Kind {
+        Read,
+        Begin,
+        Write,
+    }
+    let per_kind = 6;
+    let wave = [Kind::Read, Kind::Begin, Kind::Write]
+        .into_iter()
+        .flat_map(|kind| (0..per_kind).map(move |i| (kind, i)))
+        .collect::<Vec<_>>();
+    let barrier = Arc::new(tokio::sync::Barrier::new(wave.len()));
+    let tasks = wave
+        .into_iter()
+        .map(|(kind, i)| {
+            let conn = fixture.conn.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                let insert = Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "INSERT INTO tc951_wave (marker) VALUES ($1)",
+                    [format!("{kind:?}-{i}").into()],
+                );
+                barrier.wait().await;
+                let result = match kind {
+                    Kind::Read => conn.query_one(select_one()).await.map(|_| ()),
+                    Kind::Begin => {
+                        async {
+                            let tx = conn.begin().await?;
+                            tx.execute(insert).await?;
+                            tx.commit().await
+                        }
+                        .await
+                    }
+                    Kind::Write => conn.execute(insert).await.map(|_| ()),
+                };
+                (kind, result)
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut write_failures = 0u64;
+    let mut written = 0i64;
+    for task in tasks {
+        let (kind, result) = task.await.unwrap();
+        match (kind, result) {
+            (Kind::Write, Err(error)) => {
+                assert!(is_connection_error(&error), "{error:?}");
+                write_failures += 1;
+            }
+            (_, Err(error)) => panic!("{kind:?} failed: {error:?}"),
+            (Kind::Read, Ok(())) => {}
+            (_, Ok(())) => written += 1,
+        }
+    }
+    let wave_stats = delta(before, fixture.stats());
+    eprintln!(
+        "wave of {} after terminating {} idle connections: {write_failures} write failures, {wave_stats:?}",
+        3 * per_kind,
+        idle.len()
+    );
+    assert!(write_failures <= idle.len() as u64);
+    assert_eq!(
+        wave_stats.losses,
+        wave_stats.retries + write_failures,
+        "every loss was retried, or is a failed write: {wave_stats:?}"
+    );
+    assert_eq!(
+        fixture.row_count("tc951_wave").await,
+        written,
+        "no write ran twice"
+    );
+
+    let after_wave = fixture.stats();
+    for round in 0..3 {
+        fixture.conn.query_one(select_one()).await.unwrap();
+        let tx = fixture.conn.begin().await.unwrap();
+        tx.commit().await.unwrap();
+        fixture
+            .conn
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "INSERT INTO tc951_wave (marker) VALUES ($1)",
+                [format!("after-{round}").into()],
+            ))
+            .await
+            .unwrap();
+        let key = format!("after/wave/{round}");
+        fixture.put(&key).await.unwrap();
+        fixture.get(&key).await.unwrap();
+        fixture.delegate(&key).await.unwrap();
+    }
+    assert_eq!(
+        delta(after_wave, fixture.stats()).losses,
+        0,
+        "no loss after the wave"
+    );
     fixture.drop_schema().await;
 }
