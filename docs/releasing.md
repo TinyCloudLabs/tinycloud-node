@@ -94,11 +94,18 @@ Environment settings (Settings → Environments → `production`):
 What this blocks: a dispatch on an unlocked branch fails the environment's
 branch policy, even if that branch edits `docker.yml` to name the environment.
 A dispatch on an old tag or branch whose `docker.yml` predates this section
-runs without the environment and gets empty secrets, so the deploy step stops
-at `Missing required GitHub secret for Phala deploy`. A `v*` tag cut after this
-change carries the environment and still goes through
-`scripts/ci/check-deploy-ref.sh`, which requires the tag commit to be on
-`main`.
+runs without the environment and gets empty secrets, so its deploy fails (in
+current workflows, at `Missing required GitHub secret for Phala deploy`).
+
+What it does not block: `v*` is a name filter, not a check on the tagged
+commit. Anyone who can push a `v*` tag can tag a commit off `main` whose
+`docker.yml` names `production` and drops `scripts/ci/check-deploy-ref.sh`.
+Treat tag creators as production operators, and restrict creating, updating
+and deleting `v*` tags to release automation and admins with a tag ruleset.
+The organization `PHALA_CLOUD_API_KEY` is also shared with other repositories.
+Deselecting this repository doesn't stop those repositories from using the
+key. A production-only Phala key that is stored only in this environment
+closes that gap.
 
 `TC780_CUTOVER_READY` stays a repository variable: the build jobs, which have
 no environment, read it too. `GITHUB_TOKEN` is the automatic token.
