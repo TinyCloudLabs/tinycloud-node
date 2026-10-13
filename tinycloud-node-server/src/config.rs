@@ -1241,9 +1241,12 @@ pub struct DatabaseConfig {
     /// A read (or `BEGIN`) whose connection is lost is retried once only if
     /// that attempt failed within this many milliseconds (TC-1054). A
     /// connection found dead at once is retried; one whose loss took a
-    /// keepalive or `TCP_USER_TIMEOUT` expiry (~30 s) to detect is not, so
-    /// the worst case is one detection plus this window (~40 s), inside the
-    /// 60 s ingress timeout, rather than two detections (~60 s).
+    /// keepalive or `TCP_USER_TIMEOUT` expiry (~30 s) to detect is not. This
+    /// bounds the retry, so one read waits for one detection plus at most
+    /// this window (~40 s) of connection-loss detection rather than two
+    /// detections (~60 s). It is not a request or per-db lock deadline:
+    /// acquisition waits, legitimate transfers and queueing behind the lock
+    /// add to it (the general deadline is later TC-1054 work).
     #[serde(default = "default_database_retry_window_ms")]
     pub retry_window_ms: u64,
 }

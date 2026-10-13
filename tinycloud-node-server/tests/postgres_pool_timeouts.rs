@@ -947,11 +947,11 @@ async fn blackhole_mid_hydration_releases_the_database_lock() {
     assert!(elapsed < Duration::from_secs(9), "{elapsed:?}");
 }
 
-/// The bound under the lock (TC-1054, Opus): a hydration whose connection
-/// loss took longer than the retry window to detect is not retried, so the
-/// request waits for one detection, not two. In production the window is
-/// 10 s and a detection about 30 s, so the worst case is about 40 s, under
-/// the 60 s ingress timeout.
+/// The retry window (TC-1054, Opus): a hydration whose connection loss took
+/// longer than the window to detect is not retried, so it waits for one
+/// detection, not two. In production the window is 10 s and a detection
+/// about 30 s, so connection-loss detection costs a read at most about 40 s;
+/// this bounds the retry, not the request or the per-db lock hold.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn blackhole_mid_hydration_waits_for_one_detection_only() {
     let Some(url) = blackhole_url("blackhole_mid_hydration_waits_for_one_detection_only") else {

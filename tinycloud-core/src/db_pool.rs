@@ -108,8 +108,9 @@ impl RecoveringConnection {
     /// Retry a statement after a lost connection only if its first attempt
     /// failed within `window` (TC-1054). A connection found dead at once (reaped
     /// while idle) is still retried; one that took a keepalive or
-    /// `TCP_USER_TIMEOUT` expiry to detect is not, so a request waits for at
-    /// most one such detection plus `window`, not two detections.
+    /// `TCP_USER_TIMEOUT` expiry to detect is not, so one statement's
+    /// connection-loss detection costs at most one detection plus `window`,
+    /// not two. This bounds the retry only, not the request.
     pub fn with_retry_window(mut self, window: Duration) -> Self {
         self.retry_window = Some(window);
         self
