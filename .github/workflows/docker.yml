@@ -574,6 +574,27 @@ jobs:
             -e TINYCLOUD_KEYS__TYPE \
             "${IMAGE}" --validate-config
 
+      # TC-1012: this compose no longer publishes :8000, so the gateway stops
+      # serving <app_id>-8000. node.tinycloud.xyz (the SDK default) must already
+      # go through dstack-ingress, or replacing the CVM takes it down. Only the
+      # ingress serves /evidences/ (the node itself returns 404), so a 200 here
+      # proves the worker was repointed. Refuse before touching the CVM.
+      - name: Require node.tinycloud.xyz to route through the ingress
+        run: |
+          set -euo pipefail
+          STATUS="000"
+          for attempt in 1 2 3; do
+            STATUS="$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' https://node.tinycloud.xyz/evidences/ || true)"
+            if [ "${STATUS}" = "200" ]; then
+              echo "node.tinycloud.xyz routes through the ingress (/evidences/ 200)."
+              exit 0
+            fi
+            echo "attempt ${attempt}/3: node.tinycloud.xyz/evidences/ returned HTTP ${STATUS}"
+            [ "${attempt}" = 3 ] || sleep 5
+          done
+          echo "::error::TC-1012: node.tinycloud.xyz still bypasses the ingress (/evidences/ HTTP ${STATUS}); deploy the tinycloud-dev worker repoint (samgbafa/tinycloud-dev#83) first"
+          exit 1
+
       - name: Deploy to Phala Cloud
         env:
           PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
