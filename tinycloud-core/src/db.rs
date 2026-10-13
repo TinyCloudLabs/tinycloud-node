@@ -94,6 +94,10 @@ pub struct PendingWebhookDelivery {
     pub encrypted_secret: Vec<u8>,
     pub secret_key_id: String,
     pub subscription_active: bool,
+    pub subscriber_did: String,
+    pub space_id: String,
+    pub target_service: String,
+    pub path_prefix: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -786,6 +790,10 @@ where
                             encrypted_secret: subscription.encrypted_secret,
                             secret_key_id: subscription.secret_key_id,
                             subscription_active: subscription.active,
+                            subscriber_did: subscription.subscriber_did,
+                            space_id: subscription.space_id,
+                            target_service: subscription.target_service,
+                            path_prefix: subscription.path_prefix,
                         })
                     })
                     .collect()
@@ -939,6 +947,19 @@ where
         hook_subscription::Entity::find_by_id(subscription_id.to_string())
             .one(&self.conn)
             .await
+    }
+
+    pub async fn hook_register_authority_holds(
+        &self,
+        holder: &str,
+        space_id: &str,
+        scope_path: &str,
+        now: OffsetDateTime,
+    ) -> Result<bool, DbErr> {
+        crate::write_hooks::hook_register_authority_holds(
+            &self.conn, holder, space_id, scope_path, now,
+        )
+        .await
     }
 
     pub async fn create_signed_kv_ticket(

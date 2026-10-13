@@ -8450,6 +8450,13 @@ mod tests {
 
     impl KvSyncFixture {
         async fn new() -> Result<Self> {
+            Self::new_with(|rocket| rocket).await
+        }
+
+        /// [`Self::new`] with extra routes or managed state on the same rocket.
+        async fn new_with(
+            extend: impl FnOnce(rocket::Rocket<rocket::Build>) -> rocket::Rocket<rocket::Build>,
+        ) -> Result<Self> {
             use tinycloud_core::models::actor;
             use tinycloud_core::sea_orm::ActiveModelTrait;
             use tinycloud_core::sea_orm::ActiveValue::Set;
@@ -8465,6 +8472,7 @@ mod tests {
                 "urn:uuid:tc732-probe",
             )?;
             let (rocket, conn) = tc409_invoke_rocket(&space).await?;
+            let rocket = extend(rocket);
             let sync_cursor_key = rocket
                 .state::<TinyCloud>()
                 .expect("TinyCloud is managed")
@@ -10776,6 +10784,594 @@ mod tests {
         )
         .await?;
         assert_eq!(denied.status, Status::Unauthorized, "{}", denied.body);
+        Ok(())
+    }
+
+    // ── F-20261007-43: a webhook must not outlive the delegation that
+    // registered it. `/hooks/events` re-checks revocation and caps a stream
+    // at the authorizing chain's expiry; a webhook subscription stores no
+    // delegation reference, so delivery never re-checks either. ──
+
+    const F43_WEBHOOK_KEY: [u8; 32] = [3; 32];
+
+    /// A local callback endpoint that records each delivered body.
+    async fn f43_callback_server() -> Result<(String, tokio::sync::mpsc::UnboundedReceiver<String>)>
+    {
+        use hyper::service::{make_service_fn, service_fn};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let make_service = make_service_fn(move |_| {
+            let tx = tx.clone();
+            async move {
+                Ok::<_, std::convert::Infallible>(service_fn(
+                    move |request: hyper::Request<hyper::Body>| {
+                        let tx = tx.clone();
+                        async move {
+                            let body = hyper::body::to_bytes(request.into_body()).await.unwrap();
+                            let _ = tx.send(String::from_utf8_lossy(&body).into_owned());
+                            Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                                hyper::Body::empty(),
+                            ))
+                        }
+                    },
+                ))
+            }
+        });
+        rocket::tokio::spawn(async move {
+            let _ = hyper::Server::from_tcp(listener)
+                .unwrap()
+                .serve(make_service)
+                .await;
+        });
+        Ok((format!("http://{address}/hooks"), rx))
+    }
+
+    /// A device registers a webhook on `kv/documents` of the owner's space
+    /// through the real `/hooks/webhooks` route, under an owner grant of
+    /// `tinycloud.hooks/register` on exactly that scope expiring at `expiry`.
+    /// Returns the fixture, the grant, a dispatcher, and the callback's
+    /// receiver.
+    async fn f43_registered_webhook(
+        expiry: OffsetDateTime,
+    ) -> Result<(
+        KvSyncFixture,
+        tinycloud_core::hash::Hash,
+        crate::webhook_dispatcher::WebhookDispatcher,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    )> {
+        let (f, dispatcher) = tc991_fixture().await?;
+        let scope = [("kv/documents", "tinycloud.hooks/register")];
+        let grant = f
+            .grant(
+                "f43-hooks-register",
+                &f.space.did().to_string(),
+                &f.device_did(),
+                &scope,
+                None,
+                Some(expiry),
+                &[],
+            )
+            .await?;
+        let (_, delivered) =
+            tc991_register(&f, f.device_invocation(&scope, grant)?, "kv", "documents").await?;
+        Ok((f, grant, dispatcher, delivered))
+    }
+
+    async fn tc991_fixture() -> Result<(KvSyncFixture, crate::webhook_dispatcher::WebhookDispatcher)>
+    {
+        let f = KvSyncFixture::new_with(|rocket| {
+            rocket
+                .mount(
+                    "/",
+                    rocket::routes![hooks::create_webhook, hooks::delete_webhook],
+                )
+                .manage(ColumnEncryption::new(F43_WEBHOOK_KEY))
+        })
+        .await?;
+        let tinycloud = f
+            .client
+            .rocket()
+            .state::<TinyCloud>()
+            .expect("TinyCloud is managed")
+            .clone();
+        let dispatcher = crate::webhook_dispatcher::WebhookDispatcher::new(
+            tinycloud,
+            HooksConfig::default(),
+            ColumnEncryption::new(F43_WEBHOOK_KEY),
+        )?;
+        Ok((f, dispatcher))
+    }
+
+    async fn tc991_register(
+        f: &KvSyncFixture,
+        authorization: String,
+        service: &str,
+        path_prefix: &str,
+    ) -> Result<(String, tokio::sync::mpsc::UnboundedReceiver<String>)> {
+        use rocket::http::{ContentType, Header};
+        use tinycloud_core::sea_orm::{ActiveModelTrait, ActiveValue::Set, IntoActiveModel};
+        let response = f
+            .client
+            .post("/hooks/webhooks")
+            .header(Header::new("Authorization", authorization))
+            .header(ContentType::JSON)
+            .body(
+                serde_json::json!({
+                    "space": f.space.to_string(),
+                    "service": service,
+                    "pathPrefix": path_prefix,
+                    "callbackUrl": "https://1.1.1.1/hooks",
+                    "secret": "webhook-secret",
+                })
+                .to_string(),
+            )
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        anyhow::ensure!(status == Status::Ok, "register webhook: {status}: {body}");
+        let id = serde_json::from_str::<serde_json::Value>(&body)?["id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("webhook id missing: {body}"))?
+            .to_string();
+
+        // Registration accepts only public HTTPS; point the stored callback
+        // at a local receiver, which the dispatcher allows under cfg(test).
+        let (callback, delivered) = f43_callback_server().await?;
+        let mut row = hook_subscription::Entity::find_by_id(id.clone())
+            .one(&f.conn)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("registered subscription row missing"))?
+            .into_active_model();
+        row.callback_url = Set(callback);
+        row.update(&f.conn).await?;
+
+        Ok((id, delivered))
+    }
+
+    #[tokio::test]
+    async fn tc991_lapsed_subscription_is_deactivated_and_its_delivery_dead_lettered() -> Result<()>
+    {
+        use tinycloud_core::sea_orm::PaginatorTrait;
+        let (f, grant, dispatcher, mut delivered) =
+            f43_registered_webhook(whole_seconds_from_now(3600)).await?;
+        f.revoke("tc991-lapsed", grant).await?;
+        f.owner_write("documents/after.txt", Some(b"v1")).await?;
+        assert!(f43_deliver(&dispatcher, &mut delivered).await?.is_empty());
+        let subscription = hook_subscription::Entity::find()
+            .one(&f.conn)
+            .await?
+            .unwrap();
+        assert!(!subscription.active);
+        let delivery = hook_delivery::Entity::find().one(&f.conn).await?.unwrap();
+        assert_eq!(
+            delivery.status,
+            tinycloud_core::db::HOOK_DELIVERY_STATUS_DEAD_LETTER
+        );
+        assert_eq!(
+            delivery.last_error.as_deref(),
+            Some("subscription authority lapsed")
+        );
+        let count = hook_delivery::Entity::find().count(&f.conn).await?;
+        assert_eq!(count, 1);
+        f.owner_write("documents/again.txt", Some(b"v2")).await?;
+        assert_eq!(hook_delivery::Entity::find().count(&f.conn).await?, count);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc991_owner_registered_webhook_keeps_delivering() -> Result<()> {
+        let (f, dispatcher) = tc991_fixture().await?;
+        let (_, mut delivered) = tc991_register(
+            &f,
+            f.owner_invocation(&[(
+                f.resource_in(&f.space, "hooks", "kv/documents")?
+                    .to_string(),
+                "tinycloud.hooks/register",
+            )])?,
+            "kv",
+            "documents",
+        )
+        .await?;
+        let grant = f
+            .grant(
+                "tc991-unrelated",
+                &f.space.did().to_string(),
+                &f.device_did(),
+                &[("kv/documents", "tinycloud.hooks/register")],
+                None,
+                Some(whole_seconds_from_now(3600)),
+                &[],
+            )
+            .await?;
+        for key in ["documents/before.txt", "documents/after.txt"] {
+            if key.ends_with("after.txt") {
+                f.revoke("tc991-unrelated-revoked", grant).await?;
+            }
+            f.owner_write(key, Some(b"v1")).await?;
+            assert_eq!(f43_deliver(&dispatcher, &mut delivered).await?.len(), 1);
+        }
+        assert!(
+            hook_subscription::Entity::find()
+                .one(&f.conn)
+                .await?
+                .unwrap()
+                .active
+        );
+        Ok(())
+    }
+
+    async fn tc991_redelegation_case(path: &str, ability: &str, expected: usize) -> Result<()> {
+        let (f, grant, dispatcher, mut delivered) =
+            f43_registered_webhook(whole_seconds_from_now(3600)).await?;
+        f.owner_write("documents/before.txt", Some(b"v1")).await?;
+        assert_eq!(f43_deliver(&dispatcher, &mut delivered).await?.len(), 1);
+        f.grant(
+            "tc991-replacement",
+            &f.space.did().to_string(),
+            &f.device_did(),
+            &[(path, ability)],
+            None,
+            Some(whole_seconds_from_now(3600)),
+            &[],
+        )
+        .await?;
+        f.revoke("tc991-replaced", grant).await?;
+        f.owner_write("documents/after.txt", Some(b"v2")).await?;
+        assert_eq!(
+            f43_deliver(&dispatcher, &mut delivered).await?.len(),
+            expected
+        );
+        assert_eq!(
+            hook_subscription::Entity::find()
+                .one(&f.conn)
+                .await?
+                .unwrap()
+                .active,
+            expected == 1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc991_narrowed_path_redelegation_stops_delivery() -> Result<()> {
+        tc991_redelegation_case("kv/documents/public", "tinycloud.hooks/register", 0).await
+    }
+
+    #[tokio::test]
+    async fn tc991_narrowed_ability_redelegation_stops_delivery() -> Result<()> {
+        tc991_redelegation_case("kv/documents", "tinycloud.hooks/list", 0).await
+    }
+
+    #[tokio::test]
+    async fn tc991_wider_live_grant_keeps_delivering_after_registering_grant_is_revoked(
+    ) -> Result<()> {
+        tc991_redelegation_case("kv", "tinycloud.hooks/register", 1).await
+    }
+
+    async fn tc991_chain_case(revoke_parent: bool) -> Result<()> {
+        use tinycloud_core::models::actor;
+        use tinycloud_core::sea_orm::{ActiveModelTrait, ActiveValue::Set};
+        let (f, dispatcher) = tc991_fixture().await?;
+        let intermediate = JWK::generate_ed25519()?;
+        let intermediate_did = KvSyncFixture::did_of(&tc341_verification_method(&intermediate)?);
+        actor::ActiveModel {
+            id: Set(intermediate_did.clone()),
+        }
+        .insert(&f.conn)
+        .await?;
+        let scope = [("kv/documents", "tinycloud.hooks/register")];
+        let parent = f
+            .grant(
+                "tc991-parent",
+                &f.space.did().to_string(),
+                &intermediate_did,
+                &scope,
+                None,
+                Some(whole_seconds_from_now(3600)),
+                &[],
+            )
+            .await?;
+        let child = f
+            .grant(
+                "tc991-child",
+                &intermediate_did,
+                &f.device_did(),
+                &scope,
+                None,
+                Some(whole_seconds_from_now(1800)),
+                &[parent],
+            )
+            .await?;
+        let (_, mut delivered) =
+            tc991_register(&f, f.device_invocation(&scope, child)?, "kv", "documents").await?;
+        f.owner_write("documents/before.txt", Some(b"v1")).await?;
+        assert_eq!(f43_deliver(&dispatcher, &mut delivered).await?.len(), 1);
+        if revoke_parent {
+            f.revoke("tc991-parent-revoked", parent).await?;
+        }
+        f.owner_write("documents/after.txt", Some(b"v2")).await?;
+        assert_eq!(
+            f43_deliver(&dispatcher, &mut delivered).await?.len(),
+            usize::from(!revoke_parent)
+        );
+        assert_eq!(
+            hook_subscription::Entity::find()
+                .one(&f.conn)
+                .await?
+                .unwrap()
+                .active,
+            !revoke_parent
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc991_parent_revocation_stops_redelegated_subscription() -> Result<()> {
+        tc991_chain_case(true).await
+    }
+
+    #[tokio::test]
+    async fn tc991_redelegated_subscription_delivers_while_chain_is_live() -> Result<()> {
+        tc991_chain_case(false).await
+    }
+
+    async fn tc991_sql_case(owner: bool) -> Result<()> {
+        let (f, dispatcher) = tc991_fixture().await?;
+        let scope = [("sql/main.db", "tinycloud.hooks/register")];
+        let grant = f
+            .grant(
+                "tc991-sql",
+                &f.space.did().to_string(),
+                &f.device_did(),
+                &scope,
+                None,
+                Some(whole_seconds_from_now(3600)),
+                &[],
+            )
+            .await?;
+        let authorization = if owner {
+            f.owner_invocation(&[(
+                f.resource_in(&f.space, "hooks", "sql/main.db")?.to_string(),
+                "tinycloud.hooks/register",
+            )])?
+        } else {
+            f.device_invocation(&scope, grant)?
+        };
+        let (_, mut delivered) = tc991_register(&f, authorization, "sql", "main.db").await?;
+        let tinycloud = f.client.rocket().state::<TinyCloud>().unwrap();
+        for epoch in ["epoch-tc991-sql-1", "epoch-tc991-sql-2"] {
+            if epoch.ends_with("-2") {
+                f.revoke("tc991-sql-revoked", grant).await?;
+            }
+            let events = database_write_events(
+                &f.space.to_string(),
+                "sql",
+                Some("main.db"),
+                &f.device_did(),
+                epoch,
+                &rfc3339(OffsetDateTime::now_utc()),
+                &[TouchedTables::supported(vec!["users".into()])],
+            );
+            enqueue_database_webhook_deliveries(tinycloud, &events).await?;
+            let expected = usize::from(owner || epoch.ends_with("-1"));
+            assert_eq!(
+                f43_deliver(&dispatcher, &mut delivered).await?.len(),
+                expected
+            );
+        }
+        assert_eq!(
+            hook_subscription::Entity::find()
+                .one(&f.conn)
+                .await?
+                .unwrap()
+                .active,
+            owner
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tc991_delegated_sql_webhook_stops_after_revocation() -> Result<()> {
+        tc991_sql_case(false).await
+    }
+
+    #[tokio::test]
+    async fn tc991_owner_sql_webhook_keeps_delivering() -> Result<()> {
+        tc991_sql_case(true).await
+    }
+
+    #[tokio::test]
+    async fn tc991_preexisting_rows_are_judged_by_current_authority() -> Result<()> {
+        use tinycloud_core::models::actor;
+        use tinycloud_core::sea_orm::{ActiveModelTrait, ActiveValue::Set};
+        let (f, dispatcher) = tc991_fixture().await?;
+        let revoked_key = JWK::generate_ed25519()?;
+        let revoked_did = KvSyncFixture::did_of(&tc341_verification_method(&revoked_key)?);
+        actor::ActiveModel {
+            id: Set(revoked_did.clone()),
+        }
+        .insert(&f.conn)
+        .await?;
+        let scope = [("kv/documents", "tinycloud.hooks/register")];
+        f.grant(
+            "tc991-existing-live",
+            &f.space.did().to_string(),
+            &f.device_did(),
+            &scope,
+            None,
+            Some(whole_seconds_from_now(3600)),
+            &[],
+        )
+        .await?;
+        let grant = f
+            .grant(
+                "tc991-existing-revoked",
+                &f.space.did().to_string(),
+                &revoked_did,
+                &scope,
+                None,
+                Some(whole_seconds_from_now(3600)),
+                &[],
+            )
+            .await?;
+        f.revoke("tc991-existing-revoke", grant).await?;
+        let mut receivers = Vec::new();
+        for (id, subscriber) in [
+            ("tc991-owner", f.space.did().to_string()),
+            ("tc991-live", f.device_did()),
+            ("tc991-revoked", revoked_did),
+        ] {
+            let (callback_url, receiver) = f43_callback_server().await?;
+            hook_subscription::Entity::insert(hook_subscription::ActiveModel::from(
+                hook_subscription::Model {
+                    id: id.to_string(),
+                    subscriber_did: subscriber,
+                    space_id: f.space.to_string(),
+                    target_service: "kv".to_string(),
+                    path_prefix: Some("documents".to_string()),
+                    abilities_json: None,
+                    callback_url,
+                    encrypted_secret: ColumnEncryption::new(F43_WEBHOOK_KEY)
+                        .encrypt(b"webhook-secret"),
+                    secret_key_id: "primary".to_string(),
+                    active: true,
+                    created_at: rfc3339(OffsetDateTime::now_utc()),
+                },
+            ))
+            .exec(&f.conn)
+            .await?;
+            receivers.push((id, receiver));
+        }
+        f.owner_write("documents/existing.txt", Some(b"v1")).await?;
+        dispatcher.dispatch_due_once().await?;
+        for (id, mut receiver) in receivers {
+            let expected = usize::from(id != "tc991-revoked");
+            let mut bodies = Vec::new();
+            while let Ok(body) = receiver.try_recv() {
+                bodies.push(body);
+            }
+            assert_eq!(bodies.len(), expected, "{id}");
+            assert_eq!(
+                hook_subscription::Entity::find_by_id(id)
+                    .one(&f.conn)
+                    .await?
+                    .unwrap()
+                    .active,
+                expected == 1,
+                "{id}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Dispatch everything due and return the bodies the callback received.
+    async fn f43_deliver(
+        dispatcher: &crate::webhook_dispatcher::WebhookDispatcher,
+        delivered: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) -> Result<Vec<String>> {
+        dispatcher.dispatch_due_once().await?;
+        // The callback records a body before it responds, and the dispatcher
+        // awaits that response, so everything delivered is already queued.
+        let mut bodies = Vec::new();
+        while let Ok(body) = delivered.try_recv() {
+            bodies.push(body);
+        }
+        Ok(bodies)
+    }
+
+    #[tokio::test]
+    async fn f43_webhook_stops_delivering_after_registering_delegation_is_revoked() -> Result<()> {
+        let (f, grant, dispatcher, mut delivered) =
+            f43_registered_webhook(whole_seconds_from_now(3600)).await?;
+
+        f.owner_write("documents/before.txt", Some(b"v1")).await?;
+        let bodies = f43_deliver(&dispatcher, &mut delivered).await?;
+        assert_eq!(bodies.len(), 1, "live grant must deliver: {bodies:?}");
+        assert!(bodies[0].contains("documents/before.txt"), "{}", bodies[0]);
+
+        f.revoke("f43-revoke-hooks-register", grant).await?;
+        f.owner_write("documents/after.txt", Some(b"v2")).await?;
+        let bodies = f43_deliver(&dispatcher, &mut delivered).await?;
+        assert!(
+            bodies.is_empty(),
+            "a revoked registrant still received write events: {bodies:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn f43_webhook_stops_delivering_after_registering_delegation_expires() -> Result<()> {
+        // Mint the grant after fixture setup (slow under a parallel suite), so the
+        // window only has to cover registration and the control delivery.
+        let (f, dispatcher) = tc991_fixture().await?;
+        let scope = [("kv/documents", "tinycloud.hooks/register")];
+        let expiry = whole_seconds_from_now(10);
+        let grant = f
+            .grant(
+                "f43-hooks-register",
+                &f.space.did().to_string(),
+                &f.device_did(),
+                &scope,
+                None,
+                Some(expiry),
+                &[],
+            )
+            .await?;
+        let (_, mut delivered) =
+            tc991_register(&f, f.device_invocation(&scope, grant)?, "kv", "documents").await?;
+
+        f.owner_write("documents/before.txt", Some(b"v1")).await?;
+        let bodies = f43_deliver(&dispatcher, &mut delivered).await?;
+        assert_eq!(bodies.len(), 1, "live grant must deliver: {bodies:?}");
+
+        let wait = expiry - OffsetDateTime::now_utc() + time::Duration::seconds(1);
+        tokio::time::sleep(Duration::from_millis(
+            wait.whole_milliseconds().max(0) as u64
+        ))
+        .await;
+        f.owner_write("documents/after.txt", Some(b"v2")).await?;
+        let bodies = f43_deliver(&dispatcher, &mut delivered).await?;
+        assert!(
+            bodies.is_empty(),
+            "an expired registrant still received write events: {bodies:?}"
+        );
+        Ok(())
+    }
+
+    /// Stop-gap: the space owner, on root authority alone, can unregister a
+    /// delegate's webhook, and a delivery already queued for it is not sent.
+    #[tokio::test]
+    async fn f43_owner_can_unregister_a_delegates_webhook() -> Result<()> {
+        use rocket::http::Header;
+        let (f, _grant, dispatcher, mut delivered) =
+            f43_registered_webhook(whole_seconds_from_now(3600)).await?;
+        let id = hook_subscription::Entity::find()
+            .one(&f.conn)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("registered subscription row missing"))?
+            .id;
+
+        // Queued while the subscription is active, dispatched after removal.
+        f.owner_write("documents/queued.txt", Some(b"v1")).await?;
+        let uri = f
+            .resource_in(&f.space, "hooks", "kv/documents")?
+            .to_string();
+        let response = f
+            .client
+            .delete(format!("/hooks/webhooks/{id}"))
+            .header(Header::new(
+                "Authorization",
+                f.owner_invocation(&[(uri, "tinycloud.hooks/unregister")])?,
+            ))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::NoContent);
+
+        f.owner_write("documents/after.txt", Some(b"v2")).await?;
+        let bodies = f43_deliver(&dispatcher, &mut delivered).await?;
+        assert!(bodies.is_empty(), "{bodies:?}");
         Ok(())
     }
 }

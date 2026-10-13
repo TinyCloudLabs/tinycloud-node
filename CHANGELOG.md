@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Webhook deliveries re-check the subscriber's authority at send time. A subscription whose subscriber no longer holds `tinycloud.hooks/register` on its space and path — revoked, expired, narrowed, or a revoked or expired ancestor — is deactivated and its pending deliveries dead-letter as "subscription authority lapsed". Owner (root-authority) subscriptions are unaffected. SDK webhooks are registered by the session key, so they stop when the session grant expires; re-register with a live session. No schema change; rollback to 1.20.2 is DB-safe (TC-991).
+
 ## [1.20.2] - 2026-10-13
 
 The first production release built from `main`. It carries the 1.20.1 release line forward (TC-940), plus the Exo upload fix, TC-899, TC-961 and TC-970.

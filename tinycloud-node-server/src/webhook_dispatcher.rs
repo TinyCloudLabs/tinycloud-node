@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use hmac::{Hmac, Mac};
 use reqwest::{redirect::Policy, Client, Url};
 use sha2::Sha256;
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tinycloud_core::ColumnEncryption;
 
@@ -42,8 +42,11 @@ impl WebhookDispatcher {
             .await
             .context("loading due webhook deliveries")?;
 
+        // TC-991: re-derived once per subscription per pass and never carried across passes,
+        // so a revocation or expiry applies by the next pass.
+        let mut authority = HashMap::<String, bool>::new();
         for delivery in deliveries {
-            if let Err(error) = self.dispatch_delivery(delivery).await {
+            if let Err(error) = self.dispatch_delivery(delivery, &mut authority).await {
                 tracing::warn!(error = %error, "webhook delivery attempt failed");
             }
         }
@@ -54,12 +57,49 @@ impl WebhookDispatcher {
     async fn dispatch_delivery(
         &self,
         delivery: tinycloud_core::db::PendingWebhookDelivery,
+        authority: &mut HashMap<String, bool>,
     ) -> Result<()> {
         let current_attempt = delivery.attempts + 1;
 
         if !delivery.subscription_active {
             self.record_terminal_failure(delivery.id, current_attempt, "subscription inactive")
                 .await?;
+            return Ok(());
+        }
+
+        let authorized = match authority.get(&delivery.subscription_id) {
+            Some(authorized) => *authorized,
+            None => {
+                let authorized = self
+                    .tinycloud
+                    .hook_register_authority_holds(
+                        &delivery.subscriber_did,
+                        &delivery.space_id,
+                        &crate::hooks::hook_scope_path(
+                            &delivery.target_service,
+                            delivery.path_prefix.as_deref(),
+                        ),
+                        OffsetDateTime::now_utc(),
+                    )
+                    .await
+                    .context("checking webhook subscription authority")?;
+                if !authorized {
+                    self.tinycloud
+                        .deactivate_hook_subscription(&delivery.subscription_id)
+                        .await
+                        .context("deactivating webhook subscription whose authority lapsed")?;
+                }
+                authority.insert(delivery.subscription_id.clone(), authorized);
+                authorized
+            }
+        };
+        if !authorized {
+            self.record_terminal_failure(
+                delivery.id,
+                current_attempt,
+                "subscription authority lapsed",
+            )
+            .await?;
             return Ok(());
         }
 
@@ -264,6 +304,9 @@ mod tests {
         storage::StorageConfig as _,
     };
 
+    const OWNER_DID: &str = "did:key:z6Mkpcii8rkJV79k3JV37Wm5utAU6WkRsziqXf6mpMs734vB";
+    const SPACE_ID: &str = "tinycloud:key:z6Mkpcii8rkJV79k3JV37Wm5utAU6WkRsziqXf6mpMs734vB:files";
+
     async fn test_tinycloud() -> Result<(TinyCloud, DatabaseConnection, ColumnEncryption)> {
         let tempdir = TempDir::new()?;
         let db = Database::connect(ConnectOptions::new("sqlite::memory:".to_string())).await?;
@@ -341,8 +384,8 @@ mod tests {
         hook_subscription::Entity::insert(hook_subscription::ActiveModel::from(
             hook_subscription::Model {
                 id: subscription_id.clone(),
-                subscriber_did: "did:key:test".to_string(),
-                space_id: "tinycloud:space".to_string(),
+                subscriber_did: OWNER_DID.to_string(),
+                space_id: SPACE_ID.to_string(),
                 target_service: "kv".to_string(),
                 path_prefix: Some("documents".to_string()),
                 abilities_json: Some(
@@ -363,7 +406,7 @@ mod tests {
             id: delivery_id.clone(),
             subscription_id,
             event_id: "event_01".to_string(),
-            payload_json: r#"{"id":"event_01","space":"tinycloud:space"}"#.to_string(),
+            payload_json: serde_json::json!({"id": "event_01", "space": SPACE_ID}).to_string(),
             status: tinycloud_core::db::HOOK_DELIVERY_STATUS_PENDING.to_string(),
             attempts,
             next_attempt_at: None,
@@ -390,7 +433,10 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), receiver.recv())
                 .await?
                 .expect("callback request");
-        assert_eq!(body, r#"{"id":"event_01","space":"tinycloud:space"}"#);
+        assert_eq!(
+            body,
+            serde_json::json!({"id": "event_01", "space": SPACE_ID}).to_string()
+        );
         assert_eq!(event_id, "event_01");
         assert_eq!(signature, sign_payload(b"hook-secret", body.as_bytes())?);
 
