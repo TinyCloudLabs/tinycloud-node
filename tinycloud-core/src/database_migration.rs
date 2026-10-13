@@ -1170,16 +1170,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn postgres_unregistered_scan_ignores_digests_and_registered_legacy_names() {
+    /// Connects to `TINYCLOUD_TEST_POSTGRES_URL` inside a fresh, migrated schema that the guard
+    /// drops. `None` when the URL is unset outside CI.
+    async fn migrated_postgres_schema(
+        test: &str,
+    ) -> Option<(PostgresSchemaGuard, DatabaseConnection)> {
         use sea_orm::{ConnectOptions, Database, DbBackend, Statement};
         use sea_orm_migration::MigratorTrait;
 
-        let Some(url) = crate::test_support::postgres_test_url(
-            "postgres_unregistered_scan_ignores_digests_and_registered_legacy_names",
-        ) else {
-            return;
-        };
+        let url = crate::test_support::postgres_test_url(test)?;
         let schema = format!(
             "tc780_scan_{}_{}",
             std::process::id(),
@@ -1194,7 +1193,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let _guard = PostgresSchemaGuard {
+        let guard = PostgresSchemaGuard {
             url: url.clone(),
             schema: schema.clone(),
         };
@@ -1202,7 +1201,303 @@ mod tests {
         options.set_schema_search_path(schema);
         let conn = Database::connect(options).await.unwrap();
         crate::migrations::Migrator::up(&conn, None).await.unwrap();
+        Some((guard, conn))
+    }
+
+    #[tokio::test]
+    async fn postgres_unregistered_scan_ignores_digests_and_registered_legacy_names() {
+        let Some((_guard, conn)) = migrated_postgres_schema(
+            "postgres_unregistered_scan_ignores_digests_and_registered_legacy_names",
+        )
+        .await
+        else {
+            return;
+        };
         assert_unregistered_scan(&conn).await;
+        conn.close().await.unwrap();
+    }
+
+    type ArtifactKey = (String, String, String);
+
+    fn key(service: &str, space: &str, name: &str) -> ArtifactKey {
+        (service.into(), space.into(), name.into())
+    }
+
+    /// The pre-anti-join scan from main (41785e6), frozen as the oracle: load every registered
+    /// legacy key and every SQL/DuckDB artifact key, then compare them exactly in Rust. Returns
+    /// the unregistered keys (digest names included, as the anti-join returns them) and the
+    /// old decision.
+    async fn old_unregistered_scan(conn: &DatabaseConnection) -> (Vec<ArtifactKey>, bool) {
+        let registered: BTreeSet<ArtifactKey> = database_legacy_artifact::Entity::find()
+            .select_only()
+            .column(database_legacy_artifact::Column::Service)
+            .column(database_legacy_artifact::Column::Space)
+            .column(database_legacy_artifact::Column::PhysicalName)
+            .into_tuple::<ArtifactKey>()
+            .all(conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        let rows: Vec<ArtifactKey> = database_artifact::Entity::find()
+            .filter(database_artifact::Column::Service.is_in(["sql", "duckdb"]))
+            .select_only()
+            .column(database_artifact::Column::Service)
+            .column(database_artifact::Column::Space)
+            .column(database_artifact::Column::Name)
+            .into_tuple()
+            .all(conn)
+            .await
+            .unwrap();
+        let fenced = rows
+            .iter()
+            .any(|row| !is_digest_name(&row.2) && !registered.contains(row));
+        let mut unregistered: Vec<ArtifactKey> = rows
+            .into_iter()
+            .filter(|row| !registered.contains(row))
+            .collect();
+        unregistered.sort();
+        (unregistered, fenced)
+    }
+
+    /// The anti-join must return exactly the oracle's rows, as a multiset (a rewrite that
+    /// duplicated or dropped a row fails), and `has_unmigrated_artifacts` must decide the same.
+    /// Returns the non-digest rows the decision rests on.
+    async fn assert_scan_matches_old_scan(
+        conn: &DatabaseConnection,
+        phase: &str,
+    ) -> BTreeSet<ArtifactKey> {
+        let (old, old_fenced) = old_unregistered_scan(conn).await;
+        let mut new: Vec<ArtifactKey> = unregistered_artifact_query()
+            .into_tuple()
+            .all(conn)
+            .await
+            .unwrap();
+        new.sort();
+        if new != old {
+            let (old_set, new_set): (BTreeSet<_>, BTreeSet<_>) =
+                (old.iter().collect(), new.iter().collect());
+            panic!(
+                "{phase}: anti-join rows differ from the old scan (old {} rows, new {} rows)\n\
+                 only old: {:?}\nonly new: {:?}",
+                old.len(),
+                new.len(),
+                old_set.difference(&new_set).collect::<Vec<_>>(),
+                new_set.difference(&old_set).collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(
+            has_unmigrated_artifacts(conn).await.unwrap(),
+            old_fenced,
+            "{phase}: decision"
+        );
+        new.into_iter()
+            .filter(|row| !is_digest_name(&row.2))
+            .collect()
+    }
+
+    async fn insert_scan_artifacts(conn: &DatabaseConnection, keys: &[ArtifactKey]) {
+        for chunk in keys.chunks(100) {
+            database_artifact::Entity::insert_many(chunk.iter().map(|(service, space, name)| {
+                database_artifact::ActiveModel {
+                    service: Set(service.clone()),
+                    space: Set(space.clone()),
+                    name: Set(name.clone()),
+                    revision: Set(1),
+                    content_hash: Set("fixture".into()),
+                    payload: Set(vec![]),
+                    size_bytes: Set(0),
+                    backend: Set("sqlite".into()),
+                    storage_mode: Set("database-blob".into()),
+                    created_at: Set("2026-01-01T00:00:00Z".into()),
+                    updated_at: Set("2026-01-01T00:00:00Z".into()),
+                    checkpoint_size_bytes: Set(0),
+                    checkpoint_content_hash: Set("fixture".into()),
+                    delta_payload: Set(None),
+                    delta_content_hash: Set(None),
+                    delta_size_bytes: Set(0),
+                }
+            }))
+            .exec(conn)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn insert_scan_legacy(conn: &DatabaseConnection, keys: &[ArtifactKey]) {
+        for chunk in keys.chunks(100) {
+            database_legacy_artifact::Entity::insert_many(chunk.iter().map(
+                |(service, space, name)| database_legacy_artifact::ActiveModel {
+                    service: Set(service.clone()),
+                    space: Set(space.clone()),
+                    physical_name: Set(name.clone()),
+                },
+            ))
+            .exec(conn)
+            .await
+            .unwrap();
+        }
+    }
+
+    /// TC-780/TC-951: differential check of the `NOT EXISTS` anti-join against the old
+    /// Rust-side scan, phase by phase over several hundred rows of mixed fixtures.
+    async fn assert_unregistered_scan_matches_old_scan(conn: &DatabaseConnection) {
+        const SERVICES: [&str; 2] = ["sql", "duckdb"];
+        let spaces: Vec<String> = (0..6)
+            .map(|i| format!("tinycloud:pkh:eip155:1:0x{i:040x}:default"))
+            .collect();
+        let digest = |seed: u64| format!("v2d{:064x}", seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let each_store = || {
+            SERVICES
+                .iter()
+                .flat_map(|service| spaces.iter().map(move |space| (*service, space.as_str())))
+        };
+
+        // Empty tables.
+        assert!(assert_scan_matches_old_scan(conn, "empty").await.is_empty());
+
+        // Legacy rows whose artifact does not exist register nothing and fence nothing.
+        let orphans: Vec<ArtifactKey> = each_store()
+            .flat_map(|(service, space)| {
+                (0..25).map(move |i| key(service, space, &format!("orphan-{i}")))
+            })
+            .collect();
+        insert_scan_legacy(conn, &orphans).await;
+        assert!(assert_scan_matches_old_scan(conn, "legacy only")
+            .await
+            .is_empty());
+
+        // Registered legacy names, digest names (registered and not), and artifacts of other
+        // services that the scan must ignore whatever their names.
+        let mut artifacts = Vec::new();
+        let mut legacy = Vec::new();
+        for (n, (service, space)) in (0u64..).zip(each_store()) {
+            for i in 0..20 {
+                artifacts.push(key(service, space, &format!("db-{i}")));
+                legacy.push(key(service, space, &format!("db-{i}")));
+            }
+            artifacts.push(key(service, space, "v2n"));
+            for i in 0..7 {
+                let name = digest(n * 100 + i + 1);
+                artifacts.push(key(service, space, &name));
+                if i < 2 {
+                    legacy.push(key(service, space, &name));
+                }
+            }
+        }
+        for space in &spaces {
+            for service in ["kv", "SQL", "DuckDB", "sqlite", "sql "] {
+                artifacts.push(key(service, space, "threads"));
+                artifacts.push(key(service, space, "never-registered"));
+            }
+        }
+        insert_scan_artifacts(conn, &artifacts).await;
+        insert_scan_legacy(conn, &legacy).await;
+        assert!(
+            assert_scan_matches_old_scan(conn, "registered and digests")
+                .await
+                .is_empty(),
+            "only digest names are unregistered so far"
+        );
+
+        // Names that are unregistered, including ones registered only under another spelling,
+        // space or service. Both scans compare exactly, so every one of them fences.
+        let (a, b) = (spaces[0].as_str(), spaces[1].as_str());
+        let mut unregistered: Vec<ArtifactKey> = each_store()
+            .flat_map(|(service, space)| {
+                (0..10).map(move |i| key(service, space, &format!("fresh-{i}")))
+            })
+            .collect();
+        let mut variant_legacy = Vec::new();
+        for (artifact, registered_as) in [
+            // Case and whitespace variants of registered names, both directions.
+            ("DB-3", "db-3"),
+            ("db-4 ", "db-4"),
+            (" db-5", "db-5"),
+            ("db-6\t", "db-6"),
+            ("threads", "Threads"),
+            ("notes", "notes "),
+            ("notes2", "NOTES2"),
+            // Unicode: NFC vs NFD, and case folding beyond ASCII.
+            ("caf\u{e9}", "cafe\u{301}"),
+            ("stra\u{df}e", "STRASSE"),
+            ("\u{c4}rger", "\u{e4}rger"),
+            // Near-misses of the `v2n` digest spelling.
+            ("v2N", "v2n"),
+            ("v2n ", "v2n"),
+        ] {
+            unregistered.push(key("sql", a, artifact));
+            variant_legacy.push(key("sql", a, registered_as));
+        }
+        // Near-misses of the `v2d<64 lowercase hex>` digest spelling.
+        for name in [
+            format!("v2d{}", "a".repeat(63) + "A"),
+            format!("v2d{}", "0".repeat(63)),
+            format!("v2d{}", "0".repeat(65)),
+            format!("V2d{}", "0".repeat(64)),
+            format!("v2d{}g", "0".repeat(63)),
+        ] {
+            unregistered.push(key("duckdb", a, &name));
+        }
+        // The same name registered in another space, a differently spelled space, or another
+        // service.
+        for (name, other) in [
+            ("shared", key("sql", b, "shared")),
+            ("upper-space", key("sql", &a.to_uppercase(), "upper-space")),
+            ("other-service", key("duckdb", a, "other-service")),
+            ("cased-service", key("SQL", a, "cased-service")),
+            ("noise-service", key("kv", a, "noise-service")),
+        ] {
+            unregistered.push(key("sql", a, name));
+            variant_legacy.push(other);
+        }
+        variant_legacy.sort();
+        variant_legacy.dedup();
+        variant_legacy.retain(|row| !legacy.contains(row));
+        insert_scan_artifacts(conn, &unregistered).await;
+        insert_scan_legacy(conn, &variant_legacy).await;
+        let found = assert_scan_matches_old_scan(conn, "unregistered names").await;
+        assert_eq!(
+            found,
+            unregistered.iter().cloned().collect::<BTreeSet<_>>(),
+            "exactly the unregistered non-digest names fence"
+        );
+
+        // Registering all but one still fences; registering the last one clears it.
+        let (last, rest) = unregistered.split_last().unwrap();
+        insert_scan_legacy(conn, rest).await;
+        let found = assert_scan_matches_old_scan(conn, "one left").await;
+        assert_eq!(found, BTreeSet::from([last.clone()]));
+        insert_scan_legacy(conn, std::slice::from_ref(last)).await;
+        assert!(assert_scan_matches_old_scan(conn, "all registered")
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn unregistered_scan_matches_the_old_scan() {
+        use sea_orm::Database;
+        use sea_orm_migration::MigratorTrait;
+
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Database::connect(format!(
+            "sqlite:{}?mode=rwc",
+            dir.path().join("caps.db").display()
+        ))
+        .await
+        .unwrap();
+        crate::migrations::Migrator::up(&conn, None).await.unwrap();
+        assert_unregistered_scan_matches_old_scan(&conn).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_unregistered_scan_matches_the_old_scan() {
+        let Some((_guard, conn)) =
+            migrated_postgres_schema("postgres_unregistered_scan_matches_the_old_scan").await
+        else {
+            return;
+        };
+        assert_unregistered_scan_matches_old_scan(&conn).await;
         conn.close().await.unwrap();
     }
 
