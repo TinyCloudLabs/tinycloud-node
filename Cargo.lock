@@ -9742,6 +9742,7 @@ dependencies = [
  "time",
  "tinycloud-auth",
  "tinycloud-core",
+ "tinycloud-sdk-wasm",
  "tokio",
  "tokio-rustls 0.26.4",
  "tokio-stream",
