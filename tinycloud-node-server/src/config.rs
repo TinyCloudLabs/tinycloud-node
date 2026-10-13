@@ -11,7 +11,8 @@ use serde_with::{
     formats::Unpadded,
     serde_as, FromInto,
 };
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, time::Duration};
+use tinycloud_core::db_pool::{StatementTimeoutMode, StatementTimeouts};
 use tinycloud_core::keys::StaticSecret;
 
 /// The OpenCredentials service that consumes a node-authorized generic
@@ -1183,10 +1184,93 @@ pub struct DatabaseConfig {
     /// Canonical environment form: TINYCLOUD_DATABASE__WRITE_FENCE=true.
     #[serde(default)]
     pub write_fence: bool,
+    /// Close a pooled connection that has sat idle this long, so it is
+    /// recycled before a NAT, load balancer or proxy idle cutoff drops it
+    /// silently (TC-1054). 240 s sits below the common 4-minute middlebox
+    /// cutoff, AWS NAT Gateway's 350 s and PlanetScale PSBouncer's 600 s
+    /// `server_idle_timeout`. PostgreSQL and MySQL only.
+    #[serde(default = "default_database_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+    /// Close a pooled connection this long after it was opened (TC-1054);
+    /// PlanetScale asks for at most 24 h, and PSBouncer's `server_lifetime`
+    /// is 3600 s. PostgreSQL and MySQL only.
+    #[serde(default = "default_database_max_lifetime_secs")]
+    pub max_lifetime_secs: u64,
+    /// How PostgreSQL's `statement_timeout` is applied (TC-1054): `session`
+    /// (once per connection, the default), `local` (per explicit
+    /// transaction; one more round trip each, autocommit statements
+    /// uncovered) or `off`. See `StatementTimeoutMode`.
+    #[serde(default)]
+    pub statement_timeout_mode: StatementTimeoutMode,
+    /// PostgreSQL `statement_timeout` for every statement, in milliseconds.
+    /// Zero disables it.
+    #[serde(default = "default_database_statement_timeout_ms")]
+    pub statement_timeout_ms: u64,
+    /// `statement_timeout` for the statements that move a whole SQL or
+    /// DuckDB artifact (hydration loads and full checkpoint saves), in
+    /// milliseconds. 120 s moves 100 MiB at 0.85 MiB/s (about 7 Mbit/s).
+    #[serde(default = "default_database_bulk_statement_timeout_ms")]
+    pub bulk_statement_timeout_ms: u64,
+    /// Enable TCP keepalive and `TCP_USER_TIMEOUT` on PostgreSQL connection
+    /// sockets (Linux only), so a connection the network silently drops
+    /// fails within tens of seconds instead of the kernel's ~15 min
+    /// retransmission timeout (TC-1054).
+    #[serde(default = "default_true")]
+    pub tcp_keepalive: bool,
+    /// Seconds a connection is idle before the first keepalive probe.
+    #[serde(default = "default_database_tcp_keepalive_idle_secs")]
+    pub tcp_keepalive_idle_secs: u64,
+    /// Seconds between unanswered keepalive probes.
+    #[serde(default = "default_database_tcp_keepalive_interval_secs")]
+    pub tcp_keepalive_interval_secs: u64,
+    /// Unanswered keepalive probes before the connection is dropped.
+    #[serde(default = "default_database_tcp_keepalive_retries")]
+    pub tcp_keepalive_retries: u32,
+    /// `TCP_USER_TIMEOUT` in milliseconds: how long sent data may go
+    /// unacknowledged before the connection is dropped. Zero leaves the
+    /// kernel default.
+    #[serde(default = "default_database_tcp_user_timeout_ms")]
+    pub tcp_user_timeout_ms: u64,
 }
 
 fn default_database_max_connections() -> u32 {
     100
+}
+
+fn default_database_idle_timeout_secs() -> u64 {
+    240
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_database_max_lifetime_secs() -> u64 {
+    1800
+}
+
+fn default_database_statement_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_database_bulk_statement_timeout_ms() -> u64 {
+    120_000
+}
+
+fn default_database_tcp_keepalive_idle_secs() -> u64 {
+    15
+}
+
+fn default_database_tcp_keepalive_interval_secs() -> u64 {
+    5
+}
+
+fn default_database_tcp_keepalive_retries() -> u32 {
+    3
+}
+
+fn default_database_tcp_user_timeout_ms() -> u64 {
+    30_000
 }
 
 impl Default for DatabaseConfig {
@@ -1194,7 +1278,40 @@ impl Default for DatabaseConfig {
         Self {
             max_connections: default_database_max_connections(),
             write_fence: false,
+            idle_timeout_secs: default_database_idle_timeout_secs(),
+            max_lifetime_secs: default_database_max_lifetime_secs(),
+            statement_timeout_mode: StatementTimeoutMode::default(),
+            statement_timeout_ms: default_database_statement_timeout_ms(),
+            bulk_statement_timeout_ms: default_database_bulk_statement_timeout_ms(),
+            tcp_keepalive: true,
+            tcp_keepalive_idle_secs: default_database_tcp_keepalive_idle_secs(),
+            tcp_keepalive_interval_secs: default_database_tcp_keepalive_interval_secs(),
+            tcp_keepalive_retries: default_database_tcp_keepalive_retries(),
+            tcp_user_timeout_ms: default_database_tcp_user_timeout_ms(),
         }
+    }
+}
+
+impl DatabaseConfig {
+    /// The pool's PostgreSQL `statement_timeout` policy.
+    pub fn statement_timeouts(&self) -> StatementTimeouts {
+        StatementTimeouts {
+            mode: self.statement_timeout_mode,
+            base: Duration::from_millis(self.statement_timeout_ms),
+            bulk: Duration::from_millis(self.bulk_statement_timeout_ms),
+        }
+    }
+
+    /// The keepalive settings for PostgreSQL sockets, or `None` when off.
+    pub fn tcp_keepalive(&self) -> Option<crate::pg_keepalive::TcpKeepalive> {
+        self.tcp_keepalive
+            .then(|| crate::pg_keepalive::TcpKeepalive {
+                idle: Duration::from_secs(self.tcp_keepalive_idle_secs.max(1)),
+                interval: Duration::from_secs(self.tcp_keepalive_interval_secs.max(1)),
+                retries: self.tcp_keepalive_retries.max(1),
+                user_timeout: (self.tcp_user_timeout_ms > 0)
+                    .then(|| Duration::from_millis(self.tcp_user_timeout_ms)),
+            })
     }
 }
 

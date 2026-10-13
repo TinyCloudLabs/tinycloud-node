@@ -32,6 +32,12 @@
 //! sqlx pings a connection when it is released to the pool and closes it if
 //! that ping fails, so a connection is known to be live when it enters the
 //! idle queue; it can only go stale while it sits there.
+//!
+//! None of this bounds a statement whose connection dies silently while it
+//! runs (a network black hole: no FIN, no RST). TC-1054 bounds that in the
+//! node's pool setup, with TCP keepalive and `TCP_USER_TIMEOUT` on every
+//! connection's socket, and bounds slow statements on a live connection with
+//! a PostgreSQL `statement_timeout` ([`StatementTimeouts`]).
 
 use std::{
     future::Future,
@@ -62,6 +68,7 @@ use crate::telemetry::{observe_db_connection_event, DbConnectionEvent};
 pub struct RecoveringConnection {
     conn: DatabaseConnection,
     recovery: Option<Arc<PoolRecovery>>,
+    statement_timeouts: Option<StatementTimeouts>,
 }
 
 impl RecoveringConnection {
@@ -73,6 +80,7 @@ impl RecoveringConnection {
         Self {
             conn,
             recovery: None,
+            statement_timeouts: None,
         }
     }
 
@@ -82,7 +90,21 @@ impl RecoveringConnection {
         Self {
             conn,
             recovery: Some(recovery),
+            statement_timeouts: None,
         }
+    }
+
+    /// Record the `statement_timeout` policy the pool was built with, so
+    /// [`Self::begin`] (in [`StatementTimeoutMode::Local`]) and
+    /// [`Self::begin_bulk`] can scope it. PostgreSQL only; other backends ignore it.
+    pub fn with_statement_timeouts(mut self, statement_timeouts: StatementTimeouts) -> Self {
+        self.statement_timeouts = Some(statement_timeouts);
+        self
+    }
+
+    /// The `statement_timeout` policy, when one was recorded.
+    pub fn statement_timeouts(&self) -> Option<StatementTimeouts> {
+        self.statement_timeouts
     }
 
     /// The pool's recovery state, when it has one.
@@ -209,6 +231,235 @@ impl RecoveringConnection {
     }
 }
 
+impl RecoveringConnection {
+    /// Open a scope whose statements are allowed the bulk `statement_timeout`
+    /// ([`StatementTimeouts::bulk`]), for statements that legitimately move a
+    /// whole database artifact (TC-1054). Finish it with
+    /// [`BulkScope::commit`]; dropping it rolls back.
+    ///
+    /// On PostgreSQL with a statement timeout configured, the scope is a
+    /// transaction opened with `SET LOCAL statement_timeout`: three more
+    /// round trips (`BEGIN`, `SET LOCAL`, `COMMIT`), so use it only on
+    /// infrequent paths. Statements in it are not retried after a lost
+    /// connection; wrap a read in [`Self::bulk_read`] for that. Everywhere
+    /// else the scope is the pool itself, statement by statement, under the
+    /// usual retry policy.
+    pub async fn begin_bulk(&self) -> Result<BulkScope, DbErr> {
+        let Some(timeout) = self.bulk_statement_timeout() else {
+            return Ok(BulkScope::Pool(self.clone()));
+        };
+        let transaction = self.run("begin", true, || self.conn.begin()).await?;
+        transaction
+            .execute_unprepared(&set_local_statement_timeout(timeout))
+            .await?;
+        Ok(BulkScope::Transaction(transaction))
+    }
+
+    /// Run `read`, a read-only use of a [`Self::begin_bulk`] scope, and run
+    /// it once more if it fails with a connection-class error, as a
+    /// read-only statement on the pool would be.
+    pub async fn bulk_read<T, F, Fut>(&self, operation: &'static str, read: F) -> Result<T, DbErr>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<T, DbErr>>,
+    {
+        if self.bulk_statement_timeout().is_none() {
+            // The scope is the pool, whose statements retry themselves.
+            return read().await;
+        }
+        self.run(operation, true, read).await
+    }
+
+    /// The `statement_timeout` a [`Self::begin_bulk`] transaction runs with, or
+    /// `None` when no statement timeout applies to this pool.
+    fn bulk_statement_timeout(&self) -> Option<Duration> {
+        let timeouts = self.statement_timeouts?;
+        (self.conn.get_database_backend() == DatabaseBackend::Postgres && timeouts.is_enabled())
+            .then_some(timeouts.bulk)
+    }
+
+    /// Apply [`StatementTimeoutMode::Local`] to a transaction just begun.
+    async fn scope_local_timeout(
+        &self,
+        transaction: DatabaseTransaction,
+    ) -> Result<DatabaseTransaction, DbErr> {
+        if let Some(timeouts) = self.statement_timeouts {
+            if timeouts.mode == StatementTimeoutMode::Local
+                && timeouts.is_enabled()
+                && self.conn.get_database_backend() == DatabaseBackend::Postgres
+            {
+                transaction
+                    .execute_unprepared(&set_local_statement_timeout(timeouts.base))
+                    .await?;
+            }
+        }
+        Ok(transaction)
+    }
+}
+
+/// A [`RecoveringConnection::begin_bulk`] scope: the pool itself, or the
+/// transaction that raised the statement timeout.
+pub enum BulkScope {
+    Pool(RecoveringConnection),
+    Transaction(DatabaseTransaction),
+}
+
+impl BulkScope {
+    /// Commit the scope's transaction, if it has one.
+    pub async fn commit(self) -> Result<(), DbErr> {
+        match self {
+            Self::Pool(_) => Ok(()),
+            Self::Transaction(transaction) => transaction.commit().await,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ConnectionTrait for BulkScope {
+    fn get_database_backend(&self) -> DatabaseBackend {
+        match self {
+            Self::Pool(conn) => conn.get_database_backend(),
+            Self::Transaction(transaction) => transaction.get_database_backend(),
+        }
+    }
+
+    async fn execute(&self, stmt: Statement) -> Result<ExecResult, DbErr> {
+        match self {
+            Self::Pool(conn) => conn.execute(stmt).await,
+            Self::Transaction(transaction) => transaction.execute(stmt).await,
+        }
+    }
+
+    async fn execute_unprepared(&self, sql: &str) -> Result<ExecResult, DbErr> {
+        match self {
+            Self::Pool(conn) => conn.execute_unprepared(sql).await,
+            Self::Transaction(transaction) => transaction.execute_unprepared(sql).await,
+        }
+    }
+
+    async fn query_one(&self, stmt: Statement) -> Result<Option<QueryResult>, DbErr> {
+        match self {
+            Self::Pool(conn) => conn.query_one(stmt).await,
+            Self::Transaction(transaction) => transaction.query_one(stmt).await,
+        }
+    }
+
+    async fn query_all(&self, stmt: Statement) -> Result<Vec<QueryResult>, DbErr> {
+        match self {
+            Self::Pool(conn) => conn.query_all(stmt).await,
+            Self::Transaction(transaction) => transaction.query_all(stmt).await,
+        }
+    }
+
+    fn support_returning(&self) -> bool {
+        match self {
+            Self::Pool(conn) => conn.support_returning(),
+            Self::Transaction(transaction) => transaction.support_returning(),
+        }
+    }
+
+    fn is_mock_connection(&self) -> bool {
+        match self {
+            Self::Pool(conn) => conn.is_mock_connection(),
+            Self::Transaction(transaction) => transaction.is_mock_connection(),
+        }
+    }
+}
+
+/// How the node's PostgreSQL pool applies `statement_timeout` (TC-1054).
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum StatementTimeoutMode {
+    /// `SET statement_timeout` once per connection, when the pool opens it.
+    /// It costs no round trip per request and covers every statement,
+    /// autocommit ones included. Behind a transaction-pooling proxy
+    /// (PgBouncer, PlanetScale PSBouncer) the `SET` lands on whichever server
+    /// connection served it, so coverage is best-effort there and the setting
+    /// can reach other clients of the proxy. The scoped limits
+    /// ([`EXEMPT_STATEMENT_TIMEOUT`], [`RecoveringConnection::begin_bulk`])
+    /// use `SET LOCAL` and stay inside their transaction.
+    #[default]
+    Session,
+    /// `SET LOCAL statement_timeout` at the start of every explicit
+    /// transaction: safe under transaction pooling, but one more round trip
+    /// per transaction, and autocommit statements get no timeout.
+    Local,
+    /// No statement timeout.
+    Off,
+}
+
+/// The PostgreSQL `statement_timeout` policy of the node's pool (TC-1054).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatementTimeouts {
+    pub mode: StatementTimeoutMode,
+    /// The timeout of every statement. Zero disables it, like
+    /// [`StatementTimeoutMode::Off`].
+    pub base: Duration,
+    /// The timeout of a [`RecoveringConnection::begin_bulk`] scope's
+    /// statements: whole-artifact loads and full checkpoint saves.
+    pub bulk: Duration,
+}
+
+impl StatementTimeouts {
+    fn is_enabled(&self) -> bool {
+        self.mode != StatementTimeoutMode::Off && !self.base.is_zero()
+    }
+
+    /// The statement to run on each new connection, in
+    /// [`StatementTimeoutMode::Session`].
+    pub fn session_statement(&self) -> Option<String> {
+        (self.mode == StatementTimeoutMode::Session && self.is_enabled())
+            .then(|| format!("SET statement_timeout = {}", millis(self.base)))
+    }
+}
+
+/// Lift the statement timeout for the rest of the current transaction. Run
+/// first in the transaction that applies the schema migrations: a migration
+/// or a backfill may run for minutes.
+pub const EXEMPT_STATEMENT_TIMEOUT: &str = "SET LOCAL statement_timeout = 0";
+
+fn set_local_statement_timeout(timeout: Duration) -> String {
+    format!("SET LOCAL statement_timeout = {}", millis(timeout))
+}
+
+/// A PostgreSQL duration in milliseconds, at least 1 (0 would disable it).
+fn millis(timeout: Duration) -> u128 {
+    timeout.as_millis().max(1)
+}
+
+/// Whether `error` is worth retrying a little later: the connection was lost,
+/// the pool had none to give, the statement was cancelled (57014, which a
+/// `statement_timeout` raises), or the transaction lost a serialization race
+/// or deadlock (40001, 40P01). Routes answer these with 503 (TC-1054).
+pub fn is_transient_error(error: &DbErr) -> bool {
+    transient_error_class(error).is_some()
+}
+
+/// The class of a [transient](is_transient_error) error, safe to log
+/// (TC-961), or `None` for any other error.
+pub fn transient_error_class(error: &DbErr) -> Option<&'static str> {
+    if let Some(class) = connection_error_class(error) {
+        return Some(class);
+    }
+    if matches!(error, DbErr::ConnectionAcquire(_)) {
+        return Some("pool_acquire");
+    }
+    let (DbErr::Conn(RuntimeErr::SqlxError(SqlxError::Database(error)))
+    | DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(error)))
+    | DbErr::Query(RuntimeErr::SqlxError(SqlxError::Database(error)))) = error
+    else {
+        return None;
+    };
+    match error.code().as_deref() {
+        Some("57014") => Some("sqlstate_57014"),
+        Some("40001") => Some("sqlstate_40001"),
+        Some("40P01") => Some("sqlstate_40P01"),
+        _ => None,
+    }
+}
+
 impl From<DatabaseConnection> for RecoveringConnection {
     fn from(conn: DatabaseConnection) -> Self {
         Self::new(conn)
@@ -255,9 +506,12 @@ impl ConnectionTrait for RecoveringConnection {
 #[async_trait::async_trait]
 impl TransactionTrait for RecoveringConnection {
     /// `BEGIN` is retried once on a connection-class error: it failed, so no
-    /// statement of the transaction ran.
+    /// statement of the transaction ran. In [`StatementTimeoutMode::Local`]
+    /// the transaction then sets its `statement_timeout` (one more round
+    /// trip).
     async fn begin(&self) -> Result<DatabaseTransaction, DbErr> {
-        self.run("begin", true, || self.conn.begin()).await
+        let transaction = self.run("begin", true, || self.conn.begin()).await?;
+        self.scope_local_timeout(transaction).await
     }
 
     async fn begin_with_config(
@@ -265,10 +519,12 @@ impl TransactionTrait for RecoveringConnection {
         isolation_level: Option<IsolationLevel>,
         access_mode: Option<AccessMode>,
     ) -> Result<DatabaseTransaction, DbErr> {
-        self.run("begin", true, || {
-            self.conn.begin_with_config(isolation_level, access_mode)
-        })
-        .await
+        let transaction = self
+            .run("begin", true, || {
+                self.conn.begin_with_config(isolation_level, access_mode)
+            })
+            .await?;
+        self.scope_local_timeout(transaction).await
     }
 
     /// sea-orm's `transaction`, on top of the retried [`Self::begin`]. The
@@ -1060,6 +1316,94 @@ mod tests {
         assert!(!recovery.needs_revalidation(Duration::from_millis(5)));
         assert!(!recovery.needs_revalidation(Duration::ZERO));
         assert_eq!(recovery.stats().losses, 1);
+    }
+
+    #[test]
+    fn transient_errors_are_connection_losses_timeouts_and_conflicts() {
+        for code in ["57014", "40001", "40P01", "57P01", "08006"] {
+            for error in wrapped(|| sqlstate(code)) {
+                assert!(is_transient_error(&error), "{code} in {error:?}");
+            }
+        }
+        for code in ["23505", "42P01", "57000"] {
+            for error in wrapped(|| sqlstate(code)) {
+                assert!(!is_transient_error(&error), "{code} in {error:?}");
+            }
+        }
+        for error in wrapped(|| SqlxError::Io(io::Error::from(io::ErrorKind::TimedOut))) {
+            assert_eq!(transient_error_class(&error), Some("io"));
+        }
+        assert_eq!(
+            transient_error_class(&DbErr::ConnectionAcquire(ConnAcquireErr::Timeout)),
+            Some("pool_acquire")
+        );
+        assert_eq!(
+            transient_error_class(&wrapped(|| sqlstate("57014"))[1]),
+            Some("sqlstate_57014")
+        );
+        assert!(!is_transient_error(&DbErr::Custom("x".into())));
+    }
+
+    #[test]
+    fn statement_timeouts_render_per_mode() {
+        let timeouts = |mode, base_ms| StatementTimeouts {
+            mode,
+            base: Duration::from_millis(base_ms),
+            bulk: Duration::from_secs(120),
+        };
+        assert_eq!(
+            timeouts(StatementTimeoutMode::Session, 30_000)
+                .session_statement()
+                .as_deref(),
+            Some("SET statement_timeout = 30000")
+        );
+        assert_eq!(
+            timeouts(StatementTimeoutMode::Local, 30_000).session_statement(),
+            None
+        );
+        assert_eq!(
+            timeouts(StatementTimeoutMode::Off, 30_000).session_statement(),
+            None
+        );
+        assert_eq!(
+            timeouts(StatementTimeoutMode::Session, 0).session_statement(),
+            None
+        );
+        assert_eq!(
+            set_local_statement_timeout(Duration::from_secs(120)),
+            "SET LOCAL statement_timeout = 120000"
+        );
+        // A sub-millisecond timeout must not become 0, which disables it.
+        assert_eq!(
+            set_local_statement_timeout(Duration::from_micros(10)),
+            "SET LOCAL statement_timeout = 1"
+        );
+        assert_eq!(
+            StatementTimeoutMode::default(),
+            StatementTimeoutMode::Session
+        );
+    }
+
+    /// Off PostgreSQL, a bulk scope is the pool itself: no transaction, and
+    /// statements keep their retry policy.
+    #[tokio::test]
+    async fn bulk_scope_is_the_pool_off_postgres() {
+        let conn = sqlite().await.with_statement_timeouts(StatementTimeouts {
+            mode: StatementTimeoutMode::Session,
+            base: Duration::from_millis(1),
+            bulk: Duration::from_millis(1),
+        });
+        let scope = conn.begin_bulk().await.unwrap();
+        assert!(matches!(scope, BulkScope::Pool(_)));
+        assert_eq!(actor::Entity::find().count(&scope).await.unwrap(), 0);
+        scope.commit().await.unwrap();
+        // `local` mode issues nothing on SQLite either.
+        let local = sqlite().await.with_statement_timeouts(StatementTimeouts {
+            mode: StatementTimeoutMode::Local,
+            base: Duration::from_millis(1),
+            bulk: Duration::from_millis(1),
+        });
+        local.begin().await.unwrap().commit().await.unwrap();
     }
 
     async fn sqlite() -> RecoveringConnection {

@@ -264,4 +264,10 @@ pub enum SqlError {
     ParseError(String),
     #[error("Internal error: {0}")]
     Internal(String),
+    /// The durable store was briefly unreachable or too slow: a lost
+    /// connection, an exhausted pool or a statement timeout. Nothing was
+    /// applied that the next attempt cannot see, so the client may retry
+    /// (TC-1054).
+    #[error("Database storage temporarily unavailable; retry the request")]
+    Unavailable,
 }

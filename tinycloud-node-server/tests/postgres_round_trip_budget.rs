@@ -117,11 +117,15 @@ use tokio::{
 /// `test_before_acquire(false)`, database identity resolve as one statement,
 /// the read audit as one statement and no second sequence lock (TC-951):
 ///
-/// - sign-in 75 = peer key 0 + host `/delegate` 17 + session `/delegate` 18
-///   + account-space SQL write 40;
+/// - sign-in 78 = peer key 0 + host `/delegate` 17 + session `/delegate` 18
+///   + account-space SQL write 43;
+/// - the SQL write hydrates the account's database, and a hydration load
+///   runs in a transaction that raises its `statement_timeout` to the bulk
+///   value (`BEGIN`, `SET LOCAL`, `COMMIT`: 3 round trips, TC-1054); it
+///   recurs only for a database whose actor has been idle for 5 minutes;
 /// - kv put 37;
 /// - kv get 22, including the read-audit commit.
-const BUDGETS: [(&str, u64); 3] = [("sign-in", 75), ("kv put", 37), ("kv get", 22)];
+const BUDGETS: [(&str, u64); 3] = [("sign-in", 78), ("kv put", 37), ("kv get", 22)];
 
 /// Full sign-in plus put plus get rounds run before the measured one.
 const WARM_UP_ROUNDS: u8 = 3;

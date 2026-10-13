@@ -590,6 +590,8 @@ mod tests {
         let _telemetry_canonical = EnvGuard::set("TINYCLOUD_TELEMETRY__ENABLED", "true");
         let _telemetry_legacy = EnvGuard::unset("TINYCLOUD_TELEMETRY_ENABLED");
         let _pool_canonical = EnvGuard::set("TINYCLOUD_DATABASE__MAX_CONNECTIONS", "200");
+        let _timeout_mode = EnvGuard::set("TINYCLOUD_DATABASE__STATEMENT_TIMEOUT_MODE", "local");
+        let _user_timeout = EnvGuard::set("TINYCLOUD_DATABASE__TCP_USER_TIMEOUT_MS", "20000");
         let _keys_env = clear_keys_env();
         let _rocket_address = EnvGuard::unset("ROCKET_ADDRESS");
         let _rocket_port = EnvGuard::unset("ROCKET_PORT");
@@ -606,6 +608,42 @@ mod tests {
         // Absent config falls back to the hardcoded default of 100.
         assert_eq!(config::DatabaseConfig::default().max_connections, 100);
         assert_eq!(config::Config::default().database.max_connections, 100);
+        // TC-1054 pool limits: env-overridable, with safe defaults.
+        assert_eq!(
+            cfg.database.statement_timeout_mode,
+            tinycloud_core::db_pool::StatementTimeoutMode::Local
+        );
+        assert_eq!(cfg.database.tcp_user_timeout_ms, 20_000);
+        let defaults = config::DatabaseConfig::default();
+        assert_eq!(
+            cfg.database.statement_timeout_ms,
+            defaults.statement_timeout_ms
+        );
+        assert_eq!(
+            (
+                defaults.idle_timeout_secs,
+                defaults.max_lifetime_secs,
+                defaults.statement_timeout_mode,
+                defaults.statement_timeout_ms,
+                defaults.bulk_statement_timeout_ms,
+            ),
+            (
+                240,
+                1800,
+                tinycloud_core::db_pool::StatementTimeoutMode::Session,
+                30_000,
+                120_000
+            )
+        );
+        assert_eq!(
+            defaults.tcp_keepalive(),
+            Some(crate::pg_keepalive::TcpKeepalive {
+                idle: std::time::Duration::from_secs(15),
+                interval: std::time::Duration::from_secs(5),
+                retries: 3,
+                user_timeout: Some(std::time::Duration::from_secs(30)),
+            })
+        );
     }
 
     #[::core::prelude::v1::test]

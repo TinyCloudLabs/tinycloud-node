@@ -51,10 +51,7 @@ use tinycloud_core::{
     models::{
         hook_delivery, hook_subscription, invocation as invocation_model, kv_delete, kv_write,
     },
-    sea_orm::{
-        error::{RuntimeErr, SqlxError},
-        ColumnTrait, DbErr, EntityTrait, QueryFilter, QueryOrder,
-    },
+    sea_orm::{ColumnTrait, DbErr, EntityTrait, QueryFilter, QueryOrder},
     sql::{SqlCaveats, SqlError, SqlRequest, SqlService},
     storage::{HashBuffer, ImmutableReadStore, ImmutableStaging},
     types::{Ability, DelegationQuery, DelegationQueryPage, Metadata, Resource},
@@ -94,26 +91,11 @@ where
     .await
 }
 
-fn retryable_sqlstate(code: &str) -> bool {
-    matches!(code, "40001" | "40P01")
-}
-
-fn is_retryable_database_error(error: &DbErr) -> bool {
-    let runtime_error = match error {
-        DbErr::Conn(error) | DbErr::Exec(error) | DbErr::Query(error) => error,
-        _ => return false,
-    };
-    let RuntimeErr::SqlxError(SqlxError::Database(database_error)) = runtime_error else {
-        return false;
-    };
-    database_error
-        .code()
-        .as_deref()
-        .is_some_and(retryable_sqlstate)
-}
-
+/// 503 for an error the client may retry shortly: a lost connection, an
+/// exhausted pool, a statement timeout (57014), a serialization failure or a
+/// deadlock (TC-1054). Otherwise 500.
 fn database_error_status(error: &DbErr) -> Status {
-    if is_retryable_database_error(error) {
+    if tinycloud_core::db_pool::is_transient_error(error) {
         Status::ServiceUnavailable
     } else {
         Status::InternalServerError
@@ -2941,6 +2923,7 @@ fn sql_error_to_status(err: &SqlError) -> Status {
         SqlError::ReadOnlyViolation => Status::Forbidden,
         SqlError::ParseError(_) => Status::BadRequest,
         SqlError::Internal(_) => Status::InternalServerError,
+        SqlError::Unavailable => Status::ServiceUnavailable,
     }
 }
 
@@ -3597,7 +3580,10 @@ mod tests {
         encryption_network::LocalOneOfOneBackend,
         keys::StaticSecret,
         models::{hook_delivery, hook_subscription},
-        sea_orm::{ColumnTrait, ConnectOptions, Database, EntityTrait, QueryFilter, QueryOrder},
+        sea_orm::{
+            error::{RuntimeErr, SqlxError},
+            ColumnTrait, ConnectOptions, Database, EntityTrait, QueryFilter, QueryOrder,
+        },
         storage::either::Either,
         storage::StorageConfig as _,
         types::{Ability, Resource},
@@ -3831,17 +3817,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serialization_and_deadlock_sqlstates_are_retryable() {
-        assert!(retryable_sqlstate("40001"));
-        assert!(retryable_sqlstate("40P01"));
-        assert!(!retryable_sqlstate("23505"));
-        assert!(!retryable_sqlstate("28000"));
+    async fn transient_database_errors_are_retryable() {
+        for code in ["40001", "40P01", "57014"] {
+            assert_eq!(
+                database_error_status(&db_error_with_sqlstate(code)),
+                Status::ServiceUnavailable,
+                "{code}"
+            );
+        }
+        for code in ["23505", "28000"] {
+            assert_eq!(
+                database_error_status(&db_error_with_sqlstate(code)),
+                Status::InternalServerError,
+                "{code}"
+            );
+        }
+        // A connection that died under the statement (TCP keepalive or
+        // `TCP_USER_TIMEOUT` expiring), and an exhausted pool.
+        let lost = DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Io(std::io::Error::from(
+            std::io::ErrorKind::TimedOut,
+        ))));
+        assert_eq!(database_error_status(&lost), Status::ServiceUnavailable);
+        let exhausted =
+            DbErr::ConnectionAcquire(tinycloud_core::sea_orm::error::ConnAcquireErr::Timeout);
         assert_eq!(
-            database_error_status(&db_error_with_sqlstate("40001")),
+            database_error_status(&exhausted),
+            Status::ServiceUnavailable
+        );
+    }
+
+    #[test]
+    fn unavailable_sql_storage_is_retryable() {
+        assert_eq!(
+            sql_error_to_status(&SqlError::Unavailable),
             Status::ServiceUnavailable
         );
         assert_eq!(
-            database_error_status(&db_error_with_sqlstate("23505")),
+            sql_error_to_status(&SqlError::Internal("x".into())),
             Status::InternalServerError
         );
     }

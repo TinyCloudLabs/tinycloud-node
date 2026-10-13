@@ -956,7 +956,7 @@ async fn session_pool(
         Some(recovery) => {
             let mut options = ConnectOptions::new(url.to_string());
             options.max_connections(max_connections);
-            tinycloud::postgres_pool_with_recovery(options, None, recovery)
+            tinycloud::postgres_pool_with_recovery(options, None, &Default::default(), recovery)
                 .await
                 .unwrap()
         }

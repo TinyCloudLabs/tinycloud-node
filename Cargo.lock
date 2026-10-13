@@ -9735,6 +9735,7 @@ dependencies = [
  "serde_with 3.16.1",
  "sha2 0.10.9",
  "sha3",
+ "socket2 0.5.10",
  "subtle",
  "tempfile",
  "thiserror 2.0.18",

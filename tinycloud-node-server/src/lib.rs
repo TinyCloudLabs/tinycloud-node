@@ -15,7 +15,7 @@ use rocket::{
     http::{Header, Method},
     Build, Rocket, Route,
 };
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Duration};
 
 pub mod allow_list;
 pub mod auth_guards;
@@ -27,6 +27,7 @@ pub mod hooks;
 pub mod invocation_replay;
 pub mod link;
 pub mod node_control;
+pub mod pg_keepalive;
 pub mod policy_v3;
 pub mod prometheus;
 pub mod quota;
@@ -250,7 +251,16 @@ pub async fn connect_database(tinycloud_config: &Config) -> Result<RecoveringCon
         ));
     }
     let mut connect_opts = ConnectOptions::from(database);
-    connect_opts.max_connections(tinycloud_config.database.max_connections);
+    connect_opts
+        .max_connections(tinycloud_config.database.max_connections)
+        // Recycle connections before a middlebox idle cutoff drops them
+        // silently (TC-1054).
+        .idle_timeout(Duration::from_secs(
+            tinycloud_config.database.idle_timeout_secs,
+        ))
+        .max_lifetime(Duration::from_secs(
+            tinycloud_config.database.max_lifetime_secs,
+        ));
     if database.starts_with("postgres://") || database.starts_with("postgresql://") {
         return postgres_pool(
             connect_opts,
@@ -259,6 +269,7 @@ pub async fn connect_database(tinycloud_config: &Config) -> Result<RecoveringCon
                 .postgres_tls
                 .root_cert_path
                 .as_deref(),
+            &tinycloud_config.database,
         )
         .await;
     }
@@ -280,15 +291,25 @@ pub async fn connect_database(tinycloud_config: &Config) -> Result<RecoveringCon
 /// and [`RecoveringConnection`] retries the statement that observed a loss
 /// when that is safe.
 ///
-/// sea-orm's `Database::connect` cannot install that hook, so the pool is
+/// Every new connection then gets, from `database` (TC-1054):
+/// - TCP keepalive and `TCP_USER_TIMEOUT` on its socket
+///   ([`pg_keepalive`]), so a connection the network drops silently fails
+///   within tens of seconds instead of hanging for up to ~15 min;
+/// - in [`tinycloud_core::db_pool::StatementTimeoutMode::Session`], `SET statement_timeout`, so a
+///   statement stuck on a live connection fails server-side. Migrations and
+///   whole-artifact transfers scope their own limits
+///   ([`tinycloud_core::db::migrate`], [`RecoveringConnection::begin_bulk`]).
+///
+/// sea-orm's `Database::connect` cannot install these hooks, so the pool is
 /// built here with the same connect options it would have applied: the URL,
 /// statement logging, and the configured TLS root certificate. No search
 /// path is configured, and the pool connects eagerly, as before.
 pub async fn postgres_pool(
     connect_opts: ConnectOptions,
     root_cert_path: Option<&str>,
+    database: &config::DatabaseConfig,
 ) -> Result<RecoveringConnection> {
-    postgres_pool_with_recovery(connect_opts, root_cert_path, PoolRecovery::new()).await
+    postgres_pool_with_recovery(connect_opts, root_cert_path, database, PoolRecovery::new()).await
 }
 
 /// [`postgres_pool`] with a given recovery state. Production uses
@@ -297,10 +318,11 @@ pub async fn postgres_pool(
 pub async fn postgres_pool_with_recovery(
     connect_opts: ConnectOptions,
     root_cert_path: Option<&str>,
+    database: &config::DatabaseConfig,
     recovery: Arc<PoolRecovery>,
 ) -> Result<RecoveringConnection> {
     use tinycloud_core::sea_orm::{
-        sqlx::{postgres::PgConnectOptions, ConnectOptions as _, Postgres},
+        sqlx::{postgres::PgConnectOptions, ConnectOptions as _, Executor as _, Postgres},
         SqlxPostgresConnector,
     };
 
@@ -312,18 +334,63 @@ pub async fn postgres_pool_with_recovery(
     if let Some(root_cert_path) = root_cert_path {
         options = options.ssl_root_cert(root_cert_path);
     }
+    let keepalive = match database.tcp_keepalive() {
+        Some(settings) => {
+            pg_keepalive::log_unsupported_once();
+            pg_keepalive::KeepaliveConfigurator::new(
+                settings,
+                options.get_host(),
+                options.get_port(),
+            )
+        }
+        None => None,
+    };
+    let statement_timeouts = database.statement_timeouts();
+    let session_statement = statement_timeouts.session_statement();
+    let on_connect = keepalive.clone();
     let pool = recovery
         .install(
             connect_opts
                 .sqlx_pool_options::<Postgres>()
                 .test_before_acquire(false),
         )
+        .after_connect(move |conn, _meta| {
+            let keepalive = on_connect.clone();
+            let session_statement = session_statement.clone();
+            Box::pin(async move {
+                // First, so the statements below are already covered.
+                if let Some(keepalive) = keepalive {
+                    keepalive.on_connect().await;
+                }
+                if let Some(statement) = session_statement {
+                    conn.execute(statement.as_str()).await?;
+                }
+                Ok(())
+            })
+        })
         .connect_with(options)
         .await?;
+    let keepalive_settings = keepalive.as_ref().map(|keepalive| keepalive.settings());
+    ::tracing::info!(
+        statement_timeout_mode = ?statement_timeouts.mode,
+        statement_timeout_ms = statement_timeouts.base.as_millis() as u64,
+        bulk_statement_timeout_ms = statement_timeouts.bulk.as_millis() as u64,
+        tcp_keepalive = keepalive_settings.is_some(),
+        tcp_keepalive_idle_secs = keepalive_settings.map(|s| s.idle.as_secs()),
+        tcp_keepalive_interval_secs = keepalive_settings.map(|s| s.interval.as_secs()),
+        tcp_keepalive_retries = keepalive_settings.map(|s| s.retries),
+        tcp_user_timeout_ms = keepalive_settings
+            .and_then(|s| s.user_timeout)
+            .map(|t| t.as_millis() as u64),
+        sockets_configured = pg_keepalive::KeepaliveConfigurator::configured(),
+        connections_opened = pg_keepalive::KeepaliveConfigurator::connections(),
+        "PostgreSQL pool connection limits"
+    );
     Ok(RecoveringConnection::with_recovery(
         SqlxPostgresConnector::from_sqlx_postgres_pool(pool),
         recovery,
-    ))
+    )
+    .with_statement_timeouts(statement_timeouts))
 }
 
 fn node_replay_cache(tinycloud: &TinyCloud) -> InvocationReplayCache {

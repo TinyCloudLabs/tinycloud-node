@@ -208,6 +208,30 @@ The SQL database can be configured with `storage.database` or the `TINYCLOUD_STO
 
 This will default to an in-memory Sqlite database (i.e. `sqlite::memory:`).
 
+#### PostgreSQL pool limits
+
+These bound how long one PostgreSQL round trip can block a request (TC-1054). Each can be set in `[global.database]` or with the `TINYCLOUD_DATABASE__<NAME>` environment variable (for example `TINYCLOUD_DATABASE__STATEMENT_TIMEOUT_MS`).
+
+| Option | Default | Description |
+|:-------|:--------|:------------|
+| database.max_connections | `100` | Pool size. |
+| database.idle_timeout_secs | `240` | Close a connection idle this long, so it is recycled before a NAT, load-balancer or proxy idle cutoff drops it silently. 240 s sits below the common 4-minute middlebox cutoff, AWS NAT Gateway's 350 s and PlanetScale PSBouncer's 600 s `server_idle_timeout`. Also applies to MySQL. |
+| database.max_lifetime_secs | `1800` | Close a connection this long after it opened. PlanetScale asks for at most 24 h; PSBouncer's `server_lifetime` is 3600 s. Also applies to MySQL. |
+| database.tcp_keepalive | `true` | Set TCP keepalive and `TCP_USER_TIMEOUT` on every connection's socket (Linux only; elsewhere a logged no-op), so a connection the network silently drops fails within about 30 s instead of the kernel's ~15-minute retransmission timeout. |
+| database.tcp_keepalive_idle_secs | `15` | Idle time before the first keepalive probe. |
+| database.tcp_keepalive_interval_secs | `5` | Time between unanswered probes. |
+| database.tcp_keepalive_retries | `3` | Unanswered probes before the connection is dropped (15 + 3 × 5 = 30 s). |
+| database.tcp_user_timeout_ms | `30000` | `TCP_USER_TIMEOUT`: how long sent data may go unacknowledged before the connection is dropped. `0` keeps the kernel default. |
+| database.statement_timeout_mode | `session` | How PostgreSQL's `statement_timeout` is applied: `session` sets it once on each new connection (no per-request cost; covers every statement); `local` sets it with `SET LOCAL` in each explicit transaction (safe behind a transaction-pooling proxy, but one more round trip per transaction, and autocommit statements are not covered); `off` disables it. |
+| database.statement_timeout_ms | `30000` | `statement_timeout` for every statement. `0` disables it. |
+| database.bulk_statement_timeout_ms | `120000` | `statement_timeout` for statements that move a whole SQL or DuckDB artifact: hydration loads and checkpoints larger than 8 MiB. 120 s moves 100 MiB at 0.85 MiB/s (about 7 Mbit/s). |
+
+Schema migrations always run with no statement timeout. A request whose statement times out or whose connection is lost gets a `503` and may be retried. Customer SQL (`tinycloud.sql/*`) runs in the node's local SQLite engine, never on PostgreSQL, so `statement_timeout` does not limit it.
+
+With `session`, behind a transaction-pooling proxy (PgBouncer, PlanetScale PSBouncer on port 6432) the per-connection `SET` lands on whichever server connection served it, so coverage becomes best-effort and the setting can reach other clients of the same proxy. The scoped limits (no limit for migrations, the bulk limit) use `SET LOCAL` and stay inside their transaction. Use `local` there if full coverage matters.
+
+The keepalive setting is a stopgap: sqlx 0.8 can't set socket options, so the node finds each new connection's socket by its peer address and sets them itself (`tinycloud-node-server/src/pg_keepalive.rs`).
+
 #### Migrations
 
 TinyCloud Protocol will automatically apply the relevant migrations to your chosen SQL database. Use caution if you are sharing this database with another application.

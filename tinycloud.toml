@@ -27,6 +27,21 @@ cors = true
     type = "Local"
     # path = "./data/blocks"   # defaults to {datadir}/blocks
 
+[global.database]
+    ## PostgreSQL pool limits (TC-1054); see README "PostgreSQL pool limits".
+    ## Env: TINYCLOUD_DATABASE__<NAME>, e.g. TINYCLOUD_DATABASE__STATEMENT_TIMEOUT_MS
+    # max_connections = 100
+    # idle_timeout_secs = 240
+    # max_lifetime_secs = 1800
+    # tcp_keepalive = true
+    # tcp_keepalive_idle_secs = 15
+    # tcp_keepalive_interval_secs = 5
+    # tcp_keepalive_retries = 3
+    # tcp_user_timeout_ms = 30000
+    # statement_timeout_mode = "session"   # session | local | off
+    # statement_timeout_ms = 30000
+    # bulk_statement_timeout_ms = 120000
+
 [global.keys]
     type = "Static"
     secret = "U29tZSBsb25nIHBpZWNlIG9mIGVudHJvcHkgd2hpY2ggaXMgYSBzZWNyZXQgYW5kIG1vcmUgdGhhbiAzMiBieXRlcw"
