@@ -8,8 +8,11 @@ use std::{
 };
 
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr,
-    EntityTrait, QueryFilter, QuerySelect, TransactionTrait,
+    sea_query::{Expr, Query},
+    ActiveModelTrait,
+    ActiveValue::Set,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, QuerySelect,
+    TransactionTrait,
 };
 use sea_orm_migration::SchemaManager;
 use serde::{Deserialize, Serialize};
@@ -206,6 +209,34 @@ fn artifact_identity_query() -> sea_orm::Select<database_artifact::Entity> {
         .column(database_artifact::Column::Name)
 }
 
+/// SQL/DuckDB artifacts with no registered legacy row. Digest names are still in the result;
+/// `has_unmigrated_artifacts` excludes them with the exact `is_digest_name` rule.
+fn unregistered_artifact_query() -> sea_orm::Select<database_artifact::Entity> {
+    use database_artifact::{Column as Artifact, Entity as ArtifactTable};
+    use database_legacy_artifact::{Column as Legacy, Entity as LegacyTable};
+    artifact_identity_query().filter(
+        Expr::exists(
+            Query::select()
+                .expr(Expr::value(1))
+                .from(LegacyTable)
+                .and_where(
+                    Expr::col((LegacyTable, Legacy::Service))
+                        .equals((ArtifactTable, Artifact::Service)),
+                )
+                .and_where(
+                    Expr::col((LegacyTable, Legacy::Space))
+                        .equals((ArtifactTable, Artifact::Space)),
+                )
+                .and_where(
+                    Expr::col((LegacyTable, Legacy::PhysicalName))
+                        .equals((ArtifactTable, Artifact::Name)),
+                )
+                .to_owned(),
+        )
+        .not(),
+    )
+}
+
 fn artifact_name_query(
     service: &str,
     space: &str,
@@ -371,6 +402,21 @@ pub async fn require_fence<C: ConnectionTrait>(conn: &C) -> Result<(), Migration
 }
 
 pub async fn has_unmigrated_artifacts<C: ConnectionTrait>(
+    conn: &C,
+) -> Result<bool, MigrationError> {
+    if conn.get_database_backend() == sea_orm::DatabaseBackend::MySql {
+        // MySQL's usual collations compare strings case- and accent-insensitively, so a
+        // database-side match could hide an artifact the exact comparison below would flag.
+        return has_unmigrated_artifacts_exact(conn).await;
+    }
+    // PostgreSQL (deterministic collations) and SQLite (BINARY) compare these keys byte for
+    // byte, so one anti-join replaces transferring both tables on every check.
+    let unregistered: Vec<(String, String, String)> =
+        unregistered_artifact_query().into_tuple().all(conn).await?;
+    Ok(unregistered.iter().any(|row| !is_digest_name(&row.2)))
+}
+
+async fn has_unmigrated_artifacts_exact<C: ConnectionTrait>(
     conn: &C,
 ) -> Result<bool, MigrationError> {
     let registered: BTreeSet<(String, String, String)> = database_legacy_artifact::Entity::find()
@@ -1006,6 +1052,7 @@ mod tests {
         ] {
             for sql in [
                 artifact_identity_query().build(backend).to_string(),
+                unregistered_artifact_query().build(backend).to_string(),
                 artifact_name_query("sql", "space", "threads")
                     .build(backend)
                     .to_string(),
@@ -1030,6 +1077,133 @@ mod tests {
                 assert!(sql.contains(field), "{sql}");
             }
         }
+    }
+
+    async fn assert_unregistered_scan(conn: &DatabaseConnection) {
+        let artifact = |space: &str, name: &str| database_artifact::ActiveModel {
+            service: Set("sql".into()),
+            space: Set(space.into()),
+            name: Set(name.into()),
+            revision: Set(1),
+            content_hash: Set("fixture".into()),
+            payload: Set(vec![]),
+            size_bytes: Set(0),
+            backend: Set("sqlite".into()),
+            storage_mode: Set("database-blob".into()),
+            created_at: Set("2026-01-01T00:00:00Z".into()),
+            updated_at: Set("2026-01-01T00:00:00Z".into()),
+            checkpoint_size_bytes: Set(0),
+            checkpoint_content_hash: Set("fixture".into()),
+            delta_payload: Set(None),
+            delta_content_hash: Set(None),
+            delta_size_bytes: Set(0),
+        };
+        let legacy = |space: &str, name: &str| database_legacy_artifact::ActiveModel {
+            service: Set("sql".into()),
+            space: Set(space.into()),
+            physical_name: Set(name.into()),
+        };
+        artifact("a", &format!("v2d{}", "0".repeat(64)))
+            .insert(conn)
+            .await
+            .unwrap();
+        artifact("a", "v2n").insert(conn).await.unwrap();
+        assert!(!has_unmigrated_artifacts(conn).await.unwrap(), "digests");
+        artifact("a", "threads").insert(conn).await.unwrap();
+        // Another space, or another spelling, does not register it.
+        legacy("b", "threads").insert(conn).await.unwrap();
+        legacy("a", "Threads").insert(conn).await.unwrap();
+        assert!(
+            has_unmigrated_artifacts(conn).await.unwrap(),
+            "unregistered"
+        );
+        legacy("a", "threads").insert(conn).await.unwrap();
+        assert!(!has_unmigrated_artifacts(conn).await.unwrap(), "registered");
+    }
+
+    #[tokio::test]
+    async fn unregistered_scan_ignores_digests_and_registered_legacy_names() {
+        use sea_orm::Database;
+        use sea_orm_migration::MigratorTrait;
+
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Database::connect(format!(
+            "sqlite:{}?mode=rwc",
+            dir.path().join("caps.db").display()
+        ))
+        .await
+        .unwrap();
+        crate::migrations::Migrator::up(&conn, None).await.unwrap();
+        assert_unregistered_scan(&conn).await;
+    }
+
+    /// Drops the isolated schema when the test ends, including while a failed assertion unwinds.
+    struct PostgresSchemaGuard {
+        url: String,
+        schema: String,
+    }
+
+    impl Drop for PostgresSchemaGuard {
+        fn drop(&mut self) {
+            use sea_orm::{ConnectOptions, Database, DbBackend, Statement};
+            let (url, schema) = (self.url.clone(), self.schema.clone());
+            let dropped = std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("schema drop runtime")
+                    .block_on(async move {
+                        Database::connect(ConnectOptions::new(url))
+                            .await?
+                            .execute(Statement::from_string(
+                                DbBackend::Postgres,
+                                format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+                            ))
+                            .await
+                            .map(|_| ())
+                    })
+            })
+            .join();
+            if !matches!(dropped, Ok(Ok(()))) {
+                eprintln!("failed to drop isolated schema {}", self.schema);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_unregistered_scan_ignores_digests_and_registered_legacy_names() {
+        use sea_orm::{ConnectOptions, Database, DbBackend, Statement};
+        use sea_orm_migration::MigratorTrait;
+
+        let Some(url) = crate::test_support::postgres_test_url(
+            "postgres_unregistered_scan_ignores_digests_and_registered_legacy_names",
+        ) else {
+            return;
+        };
+        let schema = format!(
+            "tc780_scan_{}_{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        );
+        Database::connect(ConnectOptions::new(url.clone()))
+            .await
+            .unwrap()
+            .execute(Statement::from_string(
+                DbBackend::Postgres,
+                format!("CREATE SCHEMA {schema}"),
+            ))
+            .await
+            .unwrap();
+        let _guard = PostgresSchemaGuard {
+            url: url.clone(),
+            schema: schema.clone(),
+        };
+        let mut options = ConnectOptions::new(url);
+        options.set_schema_search_path(schema);
+        let conn = Database::connect(options).await.unwrap();
+        crate::migrations::Migrator::up(&conn, None).await.unwrap();
+        assert_unregistered_scan(&conn).await;
+        conn.close().await.unwrap();
     }
 
     #[tokio::test]
