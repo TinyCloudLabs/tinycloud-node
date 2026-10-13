@@ -82,6 +82,8 @@ jobs:
   rollback-audit:
     if: github.event_name == 'workflow_dispatch' && inputs.rollback_audit_only
     runs-on: ubuntu-latest
+    # TC-971: PROD_TINYCLOUD_DATABASE_URL lives in the production environment.
+    environment: production
     permissions:
       contents: read
     steps:
@@ -379,6 +381,11 @@ jobs:
   deploy-phala:
     runs-on: ubuntu-latest
     needs: [version-guard, build, build-dstack]
+    # TC-971: the deploy secrets live only in the production environment, whose
+    # deployment policy admits main and v* tags. A dispatch from any other ref
+    # is rejected before the job starts, and an old ref whose docker.yml lacks
+    # this line gets no deploy secrets at all. See docs/releasing.md.
+    environment: production
     if: >-
       ${{ vars.TC780_CUTOVER_READY == 'true' && !cancelled() && !inputs.rollback_audit_only && needs.version-guard.result == 'success' &&
         github.event_name == 'workflow_dispatch' && inputs.deploy_phala &&
