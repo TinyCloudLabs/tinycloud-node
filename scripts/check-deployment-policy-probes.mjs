@@ -35,10 +35,16 @@ for (const invariant of [
   'NODE_ORIGIN="https://tee.node.tinycloud.xyz"',
   '"${NODE_ORIGIN}/version"',
   "--data '{}'",
-  '"${STATUS}" != "400"',
-  '"${STATUS}" != "422"',
+  'if [ "${route}" = "/policy/v3/deliveries/authorize" ]',
+  'EXPECTED="401"',
+  'case "${STATUS}" in 401) VALID=true',
+  'EXPECTED="400 or 422"',
+  'case "${STATUS}" in 400|422) VALID=true',
 ]) {
   if (!probe.includes(invariant)) {
     throw new Error(`Policy/v3 deployment probe lost required invariant: ${invariant}`);
   }
+}
+if (/400\|401|401\|4|"\$\{STATUS\}" = "401"/.test(probe)) {
+  throw new Error("the unsigned delivery probe must require exactly HTTP 401");
 }
