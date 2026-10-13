@@ -64,12 +64,12 @@ on:
         type: string
         default: ''
       rollback_image_version:
-        description: 'Emergency rollback only: version label of the recorded pre-cutover digest; requires allow_non_descendant'
+        description: 'Emergency rollback only: version label of a recorded digest whose revision is in main history'
         required: false
         type: string
         default: ''
       rollback_image_revision:
-        description: 'Emergency rollback only: 40-character revision label of the recorded pre-cutover digest'
+        description: 'Emergency rollback only: 40-character revision label of the recorded digest (must be an ancestor of main)'
         required: false
         type: string
         default: ''
@@ -120,7 +120,6 @@ jobs:
           INPUT_IMAGE_VERSION: ${{ inputs.image_version }}
           INPUT_DEPLOY_DIGEST: ${{ inputs.deploy_image_digest }}
           INPUT_DEPLOY_PHALA: ${{ inputs.deploy_phala }}
-          ALLOW_NON_DESCENDANT: ${{ inputs.allow_non_descendant }}
           ROLLBACK_VERSION: ${{ inputs.rollback_image_version }}
           ROLLBACK_REVISION: ${{ inputs.rollback_image_revision }}
           INCLUDE_DUCKDB: ${{ inputs.include_duckdb }}
@@ -158,11 +157,15 @@ jobs:
           if [ -n "${INPUT_IMAGE_VERSION}" ]; then
             check_matches "image_version input" "${INPUT_IMAGE_VERSION}"
           fi
+          # TC-940: every production revision is in main's history, so a
+          # rollback dispatched on main passes the ancestry guard without
+          # allow_non_descendant. The rollback revision itself must be an
+          # ancestor of main (checked by scripts/ci/check-deploy-ref.sh).
           if [ -n "${ROLLBACK_VERSION}" ] || [ -n "${ROLLBACK_REVISION}" ]; then
-            if [ "${ALLOW_NON_DESCENDANT}" != "true" ] || [ -z "${INPUT_DEPLOY_DIGEST}" ] \
+            if [ -z "${INPUT_DEPLOY_DIGEST}" ] \
               || ! [[ "${ROLLBACK_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
               || ! [[ "${ROLLBACK_REVISION}" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "::error::Rollback label override requires allow_non_descendant, a digest, and valid version/revision labels"
+              echo "::error::Rollback label override requires a digest and valid version/revision labels"
               exit 1
             fi
             echo "::warning::Emergency rollback to recorded ${ROLLBACK_VERSION} revision ${ROLLBACK_REVISION}"
@@ -175,6 +178,18 @@ jobs:
               exit 1
             fi
           fi
+
+      # TC-940: refuse a production deploy from anything but main or a vX.Y.Z
+      # tag on main's history before spending time on image builds. The
+      # deploy-phala job repeats this check next to the secrets.
+      - name: Guard main-only deploy source
+        if: github.event_name == 'workflow_dispatch' && inputs.deploy_phala
+        env:
+          ROLLBACK_REVISION: ${{ inputs.rollback_image_revision }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet --no-tags --unshallow origin '+refs/heads/main:refs/remotes/origin/main'
+          bash scripts/ci/check-deploy-ref.sh
 
   build:
     runs-on: ubuntu-latest
@@ -370,6 +385,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      # TC-940: production is built and promoted only from main. Refuse any
+      # other dispatched ref before this job touches a deploy secret.
+      - name: Guard main-only deploy source
+        env:
+          ROLLBACK_REVISION: ${{ inputs.rollback_image_revision }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          bash scripts/ci/check-deploy-ref.sh
 
       - name: Log in to GHCR for digest validation
         uses: docker/login-action@v3

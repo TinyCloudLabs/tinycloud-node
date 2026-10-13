@@ -18,11 +18,12 @@ a feature that was not in the deployed binary.
 | Bump `Cargo.toml` + write the `CHANGELOG.md` entry | **a human, in a PR** | you decide to release |
 | Create the `vX.Y.Z` git tag | `release-plz` (`release` job in `.github/workflows/release-plz.yml`) | the version-bump PR lands on `main` |
 | Build binaries + create the GitHub Release | `cargo-dist` (`.github/workflows/release.yml`) | the `vX.Y.Z` tag |
-| Build + push GHCR images | `.github/workflows/docker.yml` | the GitHub Release, or manual dispatch |
-| Deploy the dstack image to the Phala prod CVM | `docker.yml` `deploy-phala` job | the GitHub Release, or manual dispatch with `deploy_phala` |
+| Build + push GHCR images | `.github/workflows/docker.yml` | the `vX.Y.Z` tag push |
+| Deploy the dstack image to the Phala prod CVM | `docker.yml` `deploy-phala` job | **manual** `workflow_dispatch` with `deploy_phala`, on the `vX.Y.Z` tag or `main` only — see [Promoting to production](#promoting-to-production-main-only) |
 
 The `release` job genuinely works: it reads the version out of `Cargo.toml` and
-creates the matching tag. Everything downstream of the tag is automated. Only
+creates the matching tag. Everything downstream of the tag is automated except
+the production promotion, which is a deliberate manual dispatch. Only
 the version *number* is manual.
 
 ## Cutting a release
@@ -35,16 +36,122 @@ the version *number* is manual.
    Choose the number from the commits since the last tag
    (`git log --oneline "$(git describe --tags --abbrev=0)"..main`) using normal
    semver rules.
-3. Merge it. The `release` job tags `vX.Y.Z` and the tag drives `cargo-dist`
-   and the image build.
-4. Confirm the deployed image tag matches: the `version-guard` job in
-   `docker.yml` fails the build if it doesn't, so a green deploy is a real
-   signal here.
+3. Merge it. The `release` job tags `vX.Y.Z` on that `main` commit and the
+   tag drives `cargo-dist` and the image build. If the tag does not appear,
+   the release owner tags the merge commit on `main` by hand — never a commit
+   that is not on `main`.
+4. Promote the tag's image to production and verify it — next section. Nothing
+   deploys automatically.
 
 Do **not** hand-edit a version onto an in-flight release branch, and do not type
 a version into the `docker.yml` `image_version` input that `Cargo.toml` does not
 already claim. Both have happened (`0b48da2`, and the image tagged `1.10.0`
 built from a `1.9.0` tree); the `version-guard` job now blocks the second one.
+
+## Promoting to production (main-only)
+
+Production is built and promoted **only from `main`** (TC-940, 2026-10-13).
+There is no release branch. The `deploy-phala` job refuses to run unless the
+dispatched ref is `refs/heads/main` or a `refs/tags/vX.Y.Z` tag whose commit is
+an ancestor of `origin/main` (`scripts/ci/check-deploy-ref.sh`, run both in
+`version-guard` before any build and again at the start of `deploy-phala`). A
+dispatch from any other branch or tag fails with
+`Deploy refused (main-only)`.
+
+1. **Get the digest.** The tag push runs `docker.yml`, whose `build-dstack`
+   job pushes `ghcr.io/tinycloudlabs/tinycloud-node:X.Y.Z-dstack`. Copy the
+   digest from that job's log, then confirm its labels from the registry
+   (the mutable tag can race, so always promote by digest):
+
+   ```sh
+   docker buildx imagetools inspect ghcr.io/tinycloudlabs/tinycloud-node@sha256:<digest> \
+     --format '{{ json .Image.Config.Labels }}'   # revision == tag commit, version == X.Y.Z-dstack
+   ```
+
+2. **Promote from the tag:**
+
+   ```sh
+   gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref vX.Y.Z \
+     -f deploy_phala=true -f image_version=X.Y.Z \
+     -f deploy_image_digest=sha256:<digest> \
+     -f sql_identity_fence=false
+   ```
+
+   - Dispatch on the **tag**, not `main`. The deploy requires the image's
+     `org.opencontainers.image.revision` label to equal `HEAD` of the dispatched
+     ref; the tag always points at the build commit, while `main` only does
+     until the next merge. (`--ref main` works only while `main`'s tip is the
+     tag commit.)
+   - `sql_identity_fence=false` is required. The input defaults to `true`,
+     which re-fences SQL/DuckDB in production (503s).
+   - The production ancestry guard still applies: the revision prod is running
+     must be an ancestor of the dispatched commit. Every production revision is
+     on `main`, so a normal release passes it. Do not set
+     `allow_non_descendant` for a release.
+
+3. **Verify.** The workflow itself polls `node.tinycloud.xyz/version` and the
+   Policy/v3 routes. Then check by hand:
+
+   - `/info` reports the new version and the expected feature set:
+
+     ```sh
+     curl -fsS https://tee.node.tinycloud.xyz/info | jq '{version, features, inTEE}'
+     ```
+
+     Compare `features` with the previous release (1.20.1 reports `kv`,
+     `delegation`, `sharing`, `sql`, `hooks`, `signed-urls`, `encryption`,
+     `kv-sync-v1`, `kv-sync-root`, `tee`).
+   - Large headers still reach the node (TC-910 raised the ingress header
+     buffers to `4 32k`). A ~30 KB `Authorization` header must get the node's
+     own `401 Unauthorized` page, not an nginx `400 Request Header Or Cookie
+     Too Large` or a reset connection:
+
+     ```sh
+     H="$(head -c 30000 /dev/zero | tr '\0' a)"
+     curl -sS -o /dev/null -w '%{http_code}\n' -X POST -H "Authorization: ${H}" \
+       https://tee.node.tinycloud.xyz/delegate   # expect 401
+     ```
+   - Login, KV and SQL work end to end with a throwaway key, not a real
+     account: create a key-only `tc` profile (`tc init --key-only`), then
+     `tc auth login --method local`, and do a KV put/get and a SQL query in
+     that profile's space. This exercises `/delegate`, `/invoke` KV and SQL.
+     Run it with stderr visible (no `2>/dev/null`), so a failing request shows
+     its error rather than an empty result.
+
+## Rolling back
+
+Roll back by promoting an older **recorded** digest, dispatched on `main`.
+Keep a record (digest, version, revision) of every digest you promote.
+
+```sh
+gh workflow run docker.yml -R TinyCloudLabs/tinycloud-node --ref main \
+  -f deploy_phala=true \
+  -f image_version=<version in main's Cargo.toml> \
+  -f deploy_image_digest=sha256:<old digest> \
+  -f rollback_image_version=<old version, e.g. 1.20.1> \
+  -f rollback_image_revision=<old image's 40-char revision label> \
+  -f sql_identity_fence=false
+```
+
+- The `rollback_image_*` inputs replace the "revision label equals HEAD"
+  check with "labels equal these recorded values". The rollback revision must
+  be an ancestor of `main`, which every production revision since TC-940 is.
+- `allow_non_descendant` is **not** needed. The ancestry guard compares the
+  revision prod is currently running with `main`, and that revision is on
+  `main`. Keep `allow_non_descendant` as break-glass for when Phala or GHCR
+  cannot be queried for the running revision; the main-only check still
+  applies with it set.
+- The compose file and the ingress image come from `main`, not from the old
+  release; only the node binary rolls back. Check
+  `tinycloud-core/src/migrations` between the two revisions first: a binary
+  rollback across a schema migration is not DB-safe.
+- The sealed-config preflight is skipped for rollbacks, and the post-deploy
+  `/version` check expects `rollback_image_version`. Run the same manual
+  verification as for a release.
+- Do not roll back by dispatching on an old tag or a retired branch. Old refs
+  carry an older `docker.yml` without the main-only guard, and the retired
+  deploy branches (`feat/tc-780-release-line`,
+  `Codex/roman/rollback-meeting-node-20260915`) are locked.
 
 ## Why the version bump is manual
 
