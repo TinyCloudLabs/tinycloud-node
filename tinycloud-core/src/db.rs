@@ -446,6 +446,17 @@ impl<C, B, K> SpaceDatabase<C, B, K> {
 
 impl<C, B, K> SpaceDatabase<C, B, K>
 where
+    C: TransactionTrait + ConnectionTrait,
+{
+    /// The graph transaction behind delegation, revocation and KV writes.
+    /// Callers take the SQLite writer gate first.
+    pub async fn begin_graph_transaction(&self) -> Result<DatabaseTransaction, DbErr> {
+        begin_write_transaction(&self.conn, chain_isolation_level(&self.conn)).await
+    }
+}
+
+impl<C, B, K> SpaceDatabase<C, B, K>
+where
     C: TransactionTrait,
 {
     /// Change the legacy artifact barrier. Freeze commit is the drain acknowledgement.
@@ -462,10 +473,7 @@ where
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
-        let tx = self
-            .conn
-            .begin_with_config(chain_isolation_level(&self.conn), None)
-            .await?;
+        let tx = self.begin_graph_transaction().await?;
         let status =
             crate::meeting_legacy_guard::transition(&tx, space, frozen, expected_generation)
                 .await?;
@@ -1385,10 +1393,7 @@ where
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
-        let tx = self
-            .conn
-            .begin_with_config(chain_isolation_level(&self.conn), None)
-            .await?;
+        let tx = self.begin_graph_transaction().await?;
         // `transact` takes the database-side sequence lock itself, first.
 
         let result = transact(
@@ -2044,10 +2049,7 @@ where
             None => None,
         };
         let begin_start = Instant::now();
-        let tx_result = self
-            .conn
-            .begin_with_config(chain_isolation_level(&self.conn), None)
-            .await;
+        let tx_result = self.begin_graph_transaction().await;
         crate::telemetry::observe_stage(
             crate::telemetry::InvocationStage::DbTxBegin,
             crate::telemetry::StageOutcome::from(tx_result.is_ok()),
@@ -2591,6 +2593,16 @@ fn chain_isolation_level<C: ConnectionTrait>(db: &C) -> Option<sea_orm::Isolatio
             Some(sea_orm::IsolationLevel::ReadCommitted)
         }
     }
+}
+
+/// Begin a transaction that will write to the capability database.
+///
+/// Other backends get exactly `begin_with_config(isolation_level, None)`.
+pub async fn begin_write_transaction<C: TransactionTrait>(
+    conn: &C,
+    isolation_level: Option<sea_orm::IsolationLevel>,
+) -> Result<DatabaseTransaction, DbErr> {
+    conn.begin_with_config(isolation_level, None).await
 }
 
 /// Returns a `TransactResult` that acknowledges a delegation already durably
@@ -4477,6 +4489,160 @@ mod test {
     #[tokio::test]
     async fn basic() {
         let _db = get_db().await.unwrap();
+    }
+
+    /// A file-backed WAL pool with the given busy timeout and size; the first
+    /// pool on a file also runs the migrations.
+    async fn sqlite_write_pool(
+        path: &std::path::Path,
+        busy_timeout: std::time::Duration,
+        max_connections: u32,
+    ) -> sea_orm::DbConn {
+        let mut options = ConnectOptions::new(format!("sqlite:{}?mode=rwc", path.display()));
+        options.max_connections(max_connections);
+        options.map_sqlx_sqlite_opts(move |options| {
+            options
+                .pragma("journal_mode", "WAL")
+                .busy_timeout(busy_timeout)
+        });
+        let conn = Database::connect(options).await.unwrap();
+        Migrator::up(&conn, None).await.unwrap();
+        conn
+    }
+
+    fn sqlite_error_code(error: &DbErr) -> Option<String> {
+        match error {
+            DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(e)))
+            | DbErr::Query(RuntimeErr::SqlxError(SqlxError::Database(e)))
+            | DbErr::Conn(RuntimeErr::SqlxError(SqlxError::Database(e))) => {
+                e.code().map(|code| code.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    fn test_actor(id: &str) -> actor::ActiveModel {
+        actor::ActiveModel {
+            id: Set(id.to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_write_transaction_drop_rolls_back_and_connection_is_reusable() {
+        let directory = tempfile::tempdir().unwrap();
+        // One connection, so every transaction below reuses it.
+        let conn = sqlite_write_pool(
+            &directory.path().join("caps.db"),
+            std::time::Duration::from_secs(5),
+            1,
+        )
+        .await;
+
+        let tx = begin_write_transaction(&conn, None).await.unwrap();
+        test_actor("did:key:dropped").insert(&tx).await.unwrap();
+        drop(tx);
+
+        let tx = begin_write_transaction(&conn, None).await.unwrap();
+        assert!(actor::Entity::find_by_id("did:key:dropped")
+            .one(&tx)
+            .await
+            .unwrap()
+            .is_none());
+        test_actor("did:key:committed").insert(&tx).await.unwrap();
+        tx.commit().await.unwrap();
+        assert!(actor::Entity::find_by_id("did:key:committed")
+            .one(&conn)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn sqlite_write_transaction_busy_at_begin_is_a_clean_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("caps.db");
+        let holder = sqlite_write_pool(&path, std::time::Duration::from_secs(5), 1).await;
+        let waiter = sqlite_write_pool(&path, std::time::Duration::from_millis(100), 1).await;
+
+        let held = begin_write_transaction(&holder, None).await.unwrap();
+        let error = begin_write_transaction(&waiter, None)
+            .await
+            .expect_err("the write lock is held by another connection");
+        assert_eq!(sqlite_error_code(&error).as_deref(), Some("5"), "{error}");
+        held.commit().await.unwrap();
+
+        // The failed begin left the waiter's only connection usable.
+        let tx = begin_write_transaction(&waiter, None).await.unwrap();
+        test_actor("did:key:after-busy").insert(&tx).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_write_transaction_reserves_before_first_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("caps.db");
+        let conn = sqlite_write_pool(&path, std::time::Duration::from_secs(5), 1).await;
+        let other = sqlite_write_pool(&path, std::time::Duration::from_millis(100), 1).await;
+
+        let tx = begin_write_transaction(&conn, None).await.unwrap();
+        epoch::Entity::find().count(&tx).await.unwrap();
+        let error = test_actor("did:key:other-writer")
+            .insert(&other)
+            .await
+            .expect_err("a write transaction holds the write lock from its first statement");
+        assert_eq!(sqlite_error_code(&error).as_deref(), Some("5"), "{error}");
+        tx.commit().await.unwrap();
+        test_actor("did:key:other-writer")
+            .insert(&other)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_write_transaction_is_a_plain_begin() {
+        let Some(database_url) =
+            crate::test_support::postgres_test_url("postgres_write_transaction_is_a_plain_begin")
+        else {
+            return;
+        };
+        let conn = Database::connect(ConnectOptions::new(database_url))
+            .await
+            .expect("connect to PostgreSQL test database");
+
+        for (isolation, expected) in [
+            (
+                Some(sea_orm::IsolationLevel::ReadCommitted),
+                "read committed",
+            ),
+            (None, "read committed"),
+        ] {
+            let tx = begin_write_transaction(&conn, isolation).await.unwrap();
+            let level: String = tx
+                .query_one(Statement::from_string(
+                    DbBackend::Postgres,
+                    "SELECT current_setting('transaction_isolation') AS level",
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "level")
+                .unwrap();
+            assert_eq!(level, expected);
+            // No statement ran that could have taken a table lock.
+            let row_locks: i64 = tx
+                .query_one(Statement::from_string(
+                    DbBackend::Postgres,
+                    "SELECT count(*) AS n FROM pg_locks WHERE pid = pg_backend_pid() \
+                     AND locktype = 'relation' AND mode = 'RowExclusiveLock'",
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "n")
+                .unwrap();
+            assert_eq!(row_locks, 0);
+            tx.rollback().await.unwrap();
+        }
     }
 
     async fn frozen_legacy_fixture() -> (
