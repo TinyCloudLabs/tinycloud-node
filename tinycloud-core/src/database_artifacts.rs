@@ -267,8 +267,6 @@ impl DatabaseArtifactRepository for SeaOrmDatabaseArtifactRepository {
             if previous.size_bytes > 0 && size_bytes.saturating_mul(2) < previous.size_bytes {
                 tracing::warn!(
                     service,
-                    space,
-                    name,
                     revision = previous.revision,
                     previous_logical_bytes = previous.size_bytes,
                     bytes = size_bytes,

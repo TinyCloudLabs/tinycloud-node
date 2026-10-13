@@ -2301,8 +2301,6 @@ async fn emit_kv_hook_events(
 
         let Some(event) = event else {
             tracing::warn!(
-                space = %space_id,
-                path = %path,
                 ability = %ability,
                 "missing committed kv hook row for invocation"
             );

@@ -183,8 +183,8 @@ The following common options are available:
 
 | Option              | env var                      | description                                                                |
 |:--------------------|:-----------------------------|:---------------------------------------------------------------------------|
-| log_level           | TINYCLOUD_LOG_LEVEL           | Set Rocket's own log verbosity, options are "off", "debug", "normal", "critical". Does **not** control application log output (see `RUST_LOG`) |
-| (n/a)               | RUST_LOG                      | Set the verbosity of application log output (a `tracing` `EnvFilter`), e.g. `debug` or `tinycloud=debug`. Defaults to `info` |
+| log_level           | TINYCLOUD_LOG_LEVEL           | Default log verbosity: "off", "critical" (warnings and errors), "normal" (info) or "debug". Used when `RUST_LOG` is unset. Request URIs are never logged at any level; each request is logged once by route template, status and latency |
+| (n/a)               | RUST_LOG                      | Override the log verbosity with a `tracing` `EnvFilter`, e.g. `debug` or `tinycloud=debug` |
 | address             | TINYCLOUD_ADDRESS             | Set the listening address of the TinyCloud Protocol instance                           |
 | port                | TINYCLOUD_PORT                | Set the listening TCP port for the TinyCloud Protocol instance                         |
 | storage.blocks.type | TINYCLOUD_STORAGE_BLOCKS_TYPE | Set the mode of block storage, options are "Local" and "S3"                |

@@ -314,7 +314,12 @@ pub async fn app_with_control(
 
     prometheus::set_enabled(tinycloud_config.telemetry.enabled);
 
-    tracing::tracing_try_init(&tinycloud_config.log)?;
+    // `log_level` (`TINYCLOUD_LOG_LEVEL`) sets the default application log
+    // level; `RUST_LOG` overrides it.
+    tracing::tracing_try_init(
+        &tinycloud_config.log,
+        config.extract_inner::<rocket::config::LogLevel>("log_level")?,
+    )?;
 
     let routes = production_routes();
     #[cfg(feature = "tc-bench-v1")]
@@ -412,6 +417,16 @@ pub async fn app_with_control(
             });
         }
     }
+    // sqlx logs the text of every statement (placeholders, never bound
+    // values) at INFO, and of statements slower than 1 s at WARN. Keep
+    // statement text out of production logs (TC-961): a statement built with
+    // an inline literal would carry it.
+    connect_opts
+        .sqlx_logging_level(tracing_log::log::LevelFilter::Debug)
+        .sqlx_slow_statements_logging_settings(
+            tracing_log::log::LevelFilter::Debug,
+            std::time::Duration::from_secs(1),
+        );
 
     let database_connection = Database::connect(connect_opts).await?;
     // SQL/DuckDB artifact-size mirror folded into `store_size`. Empty here;

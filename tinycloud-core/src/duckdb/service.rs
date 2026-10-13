@@ -404,8 +404,6 @@ impl DuckDbService {
             Some(artifact) => {
                 tracing::info!(
                     service = "duckdb",
-                    space = %space,
-                    db = db_name,
                     revision = artifact.revision,
                     storage_mode = %artifact.storage_mode,
                     bytes = artifact.payload.len(),
@@ -449,8 +447,6 @@ impl DuckDbService {
             None => {
                 tracing::info!(
                     service = "duckdb",
-                    space = %space,
-                    db = db_name,
                     "No durable database artifact; starting from an empty database"
                 );
                 remove_duckdb_cache_files(&cache_path).await?;
@@ -490,8 +486,6 @@ impl DuckDbService {
             None => {
                 tracing::warn!(
                     service = "duckdb",
-                    space = %key.0,
-                    db = %key.1,
                     "No recorded artifact lineage for a live database; saving without a lineage assertion"
                 );
                 ArtifactExpectation::Any
@@ -525,8 +519,6 @@ impl DuckDbService {
                         .insert(key, expected.advanced_to(saved.revision));
                     tracing::info!(
                         service = "duckdb",
-                        space = %space,
-                        db = db_name,
                         mode = "wal",
                         bytes = saved.delta_size_bytes,
                         logical_bytes = saved.size_bytes,
@@ -582,8 +574,6 @@ impl DuckDbService {
         );
         tracing::info!(
             service = "duckdb",
-            space = %space,
-            db = db_name,
             mode = "checkpoint",
             bytes,
             logical_bytes = saved.size_bytes,
@@ -615,8 +605,6 @@ fn validate_payload(
     }
     tracing::error!(
         service = "duckdb",
-        space = %space,
-        db = db_name,
         role,
         bytes = payload.len(),
         leading = %hex::encode(&payload[..payload.len().min(16)]),

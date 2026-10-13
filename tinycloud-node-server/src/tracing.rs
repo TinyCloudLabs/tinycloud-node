@@ -1,8 +1,9 @@
 use opentelemetry::trace::{TraceContextExt, TracerProvider};
 use opentelemetry_otlp::ExporterBuildError;
 use rocket::{
+    config::LogLevel,
     fairing::{Fairing, Info, Kind},
-    http::Status,
+    http::{Method, Status},
     request::{FromRequest, Outcome},
     Data, Request, Response,
 };
@@ -18,12 +19,15 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tracing::{
     field::{Field, Visit},
     info_span,
+    level_filters::LevelFilter,
     subscriber::set_global_default,
-    Event, Level, Span, Subscriber,
+    Event, Level, Metadata, Span, Subscriber,
 };
 use tracing_log::LogTracer;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use tracing_subscriber::{layer::Context, layer::SubscriberExt, Layer, Registry};
+use tracing_subscriber::{
+    filter::filter_fn, layer::Context, layer::SubscriberExt, Layer, Registry,
+};
 
 use crate::config;
 
@@ -34,12 +38,82 @@ use crate::config;
 /// value, regardless of how many distinct unmatched paths are probed.
 const UNMATCHED_ROUTE_LABEL: &str = "<unmatched>";
 
+/// Target of the one log line per request (method, route template, status,
+/// latency). It replaces Rocket's own request logging, which prints the raw URI.
+const REQUEST_LOG_TARGET: &str = "tinycloud::request";
+
+/// Rocket modules that log only at ignite, liftoff or shutdown, never request
+/// data. Rocket's other modules log per request.
+const ROCKET_STARTUP_MODULES: &[&str] = &[
+    "rocket::launch",
+    "rocket::rkt",
+    "rocket::config",
+    "rocket::fairing",
+    "rocket::shield",
+    "rocket::error",
+    "rocket::state",
+];
+
+/// Whether an event or span may reach any log output (TC-961: production logs
+/// are public).
+///
+/// Request URIs carry bearer credentials (`/signed/kv/<ticket_id>`) and space
+/// IDs, which embed wallet addresses. Rocket logs the raw URI of every request
+/// at INFO, of unmatched ones at ERROR, and the whole request with headers at
+/// DEBUG. Its generated route code logs failed guards with their raw input
+/// under `<module>::_` targets. All of that is dropped at every level;
+/// `TracingFairing` logs each request by route template instead. Rocket's
+/// startup messages and its non-request `rocket::server` warnings (signals,
+/// shutdown, malformed HTTP) still pass.
+///
+/// sea-orm's TRACE spans record every statement with its bound values, and
+/// the outbound HTTP clients log full URLs below INFO: reqwest a redirect's
+/// URL (the quota service URL holds the space id), the AWS SDK the S3 key
+/// (which starts with the space id) and the SigV4-signed request. Those are
+/// dropped too.
+fn may_be_logged(metadata: &Metadata<'_>) -> bool {
+    let target = metadata.target();
+    let level = *metadata.level();
+    if target == "rocket::server" {
+        return level <= Level::WARN;
+    }
+    if target == "rocket" || target.starts_with("rocket::") {
+        let module = target.strip_suffix("::_").unwrap_or(target);
+        return ROCKET_STARTUP_MODULES.iter().any(|allowed| {
+            module
+                .strip_prefix(allowed)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+        });
+    }
+    if target.starts_with("sea_orm") && level == Level::TRACE {
+        return false;
+    }
+    if (target.starts_with("aws_") || target.starts_with("reqwest")) && level > Level::INFO {
+        return false;
+    }
+    !target.ends_with("::_")
+}
+
+/// Default application log level for Rocket's `log_level` setting
+/// (`TINYCLOUD_LOG_LEVEL`), used when `RUST_LOG` is unset.
+fn default_log_level(level: LogLevel) -> LevelFilter {
+    match level {
+        LogLevel::Critical => LevelFilter::WARN,
+        LogLevel::Normal => LevelFilter::INFO,
+        LogLevel::Debug => LevelFilter::DEBUG,
+        LogLevel::Off => LevelFilter::OFF,
+    }
+}
+
 #[derive(Clone)]
 pub struct TracingSpan(pub Span);
 
 #[derive(Clone)]
 struct RequestTelemetry {
     start: Instant,
+    /// The method as received. Rocket rewrites an unrouted HEAD to GET before
+    /// dispatching it to a GET route.
+    method: Method,
 }
 
 pub struct TracingFairing {
@@ -306,10 +380,13 @@ where
     }
 }
 
-pub fn tracing_try_init(config: &config::Logging) -> Result<(), ExporterBuildError> {
+pub fn tracing_try_init(
+    config: &config::Logging,
+    log_level: LogLevel,
+) -> Result<(), ExporterBuildError> {
     let _ = LogTracer::init();
     let env_filter = tracing_subscriber::EnvFilter::builder()
-        .with_default_directive(Level::INFO.into())
+        .with_default_directive(default_log_level(log_level).into())
         .from_env_lossy();
     let subscriber = tracing_subscriber::fmt::layer();
     let log = match config.format {
@@ -333,6 +410,7 @@ pub fn tracing_try_init(config: &config::Logging) -> Result<(), ExporterBuildErr
     };
     let collector = Registry::default()
         .with(env_filter)
+        .with(filter_fn(may_be_logged))
         .with(log)
         .with(CaptureLayer)
         .with(telemetry);
@@ -362,13 +440,12 @@ impl Fairing for TracingFairing {
             );
         }
         req.local_cache(|| Some(TracingSpan(span)));
-        if crate::prometheus::enabled() {
-            req.local_cache(|| {
-                Some(RequestTelemetry {
-                    start: Instant::now(),
-                })
-            });
-        }
+        req.local_cache(|| {
+            Some(RequestTelemetry {
+                start: Instant::now(),
+                method: req.method(),
+            })
+        });
     }
 
     async fn on_response<'r>(&self, req: &'r Request<'_>, res: &mut Response<'r>) {
@@ -385,28 +462,40 @@ impl Fairing for TracingFairing {
             };
             res.set_raw_header(self.header_name.clone(), format!("{trace_id}"));
         }
+        let Some(telemetry) = req
+            .local_cache(|| Option::<RequestTelemetry>::None)
+            .to_owned()
+        else {
+            return;
+        };
+        let elapsed = telemetry.start.elapsed();
+        // Unmatched requests (404s from scanner traffic, e.g. `/.env`,
+        // `/wp-login.php`) have no `Route`, so fall back to a fixed sentinel.
+        // Neither the log line nor the metric label ever carries the raw
+        // request path: it can hold bearer tickets and space IDs (TC-961), and
+        // every distinct probed path would otherwise create its own permanent
+        // histogram series (TC-286).
+        let route = match req.route() {
+            Some(route) => Cow::Owned(route.uri.to_string()),
+            None => Cow::Borrowed(UNMATCHED_ROUTE_LABEL),
+        };
+        let status = res.status().code;
+        tracing::info!(
+            target: REQUEST_LOG_TARGET,
+            method = %telemetry.method,
+            route = %route,
+            status,
+            latency_us = elapsed.as_micros() as u64,
+            "request"
+        );
         if crate::prometheus::enabled() {
-            if let Some(telemetry) = req
-                .local_cache(|| Option::<RequestTelemetry>::None)
-                .to_owned()
-            {
-                // Unmatched requests (404s from scanner traffic, e.g. `/.env`,
-                // `/wp-login.php`) have no `Route`, so fall back to a fixed
-                // sentinel rather than the raw request path -- otherwise every
-                // distinct probed path would create its own permanent
-                // histogram series (TC-286).
-                let route = match req.route() {
-                    Some(route) => Cow::Owned(route.uri.to_string()),
-                    None => Cow::Borrowed(UNMATCHED_ROUTE_LABEL),
-                };
-                crate::prometheus::REQUEST_HISTOGRAM
-                    .with_label_values(&[
-                        req.method().as_str(),
-                        route.as_ref(),
-                        res.status().code.to_string().as_str(),
-                    ])
-                    .observe(telemetry.start.elapsed().as_secs_f64());
-            }
+            crate::prometheus::REQUEST_HISTOGRAM
+                .with_label_values(&[
+                    req.method().as_str(),
+                    route.as_ref(),
+                    status.to_string().as_str(),
+                ])
+                .observe(elapsed.as_secs_f64());
         }
     }
 }

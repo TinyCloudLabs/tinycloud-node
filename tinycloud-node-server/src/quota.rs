@@ -458,19 +458,22 @@ async fn fetch_remote(
                 account: info.account(),
             }),
             Err(e) => {
-                tracing::warn!("quota service returned invalid body for space {key}: {e}");
+                tracing::warn!(
+                    "quota service returned an invalid body: {}",
+                    e.without_url()
+                );
                 None
             }
         },
         Ok(resp) => {
-            tracing::warn!(
-                "quota service returned {} for space {key}, using fallback",
-                resp.status()
-            );
+            tracing::warn!("quota service returned {}, using fallback", resp.status());
             None
         }
         Err(e) => {
-            tracing::debug!("quota service unavailable for space {key} ({e}), using fallback");
+            tracing::debug!(
+                "quota service unavailable ({}), using fallback",
+                e.without_url()
+            );
             None
         }
     }
