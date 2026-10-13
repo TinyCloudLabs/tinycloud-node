@@ -763,7 +763,8 @@ jobs:
       # TC-1012: the node's :8000 must only be reachable through dstack-ingress.
       # If the compose publishes it, the Phala gateway serves it directly at
       # <app_id>-8000.<gateway_domain> and bypasses the ingress limits/logs.
-      # An unpublished port closes the TLS stream with no HTTP response (000).
+      # A closed port makes the gateway accept TLS and then close the stream
+      # (curl exit 52/56, no HTTP status). Other curl errors prove nothing.
       - name: Verify app port is not exposed by the Phala gateway
         run: |
           set -euo pipefail
@@ -774,9 +775,26 @@ jobs:
             echo "::error::TC-1012: https://tee.node.tinycloud.xyz/version returned HTTP ${INGRESS_STATUS}, expected 200 via dstack-ingress."
             exit 1
           fi
-          RAW_STATUS="$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' "${RAW_URL}" || true)"
-          if [ "${RAW_STATUS}" != "000" ]; then
-            echo "::error::TC-1012: ${RAW_URL} returned HTTP ${RAW_STATUS}; port 8000 is published and bypasses dstack-ingress."
+          CLOSED=0
+          RC=0
+          for attempt in $(seq 1 10); do
+            RC=0
+            RAW_STATUS="$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' "${RAW_URL}" 2>/tmp/tc1012-curl.err)" || RC=$?
+            if [ "${RAW_STATUS}" != "000" ]; then
+              echo "::error::TC-1012: ${RAW_URL} returned HTTP ${RAW_STATUS}; port 8000 is published and bypasses dstack-ingress."
+              exit 1
+            fi
+            if [ "${RC}" = 52 ] || [ "${RC}" = 56 ]; then
+              CLOSED=$((CLOSED + 1))
+              [ "${CLOSED}" -ge 3 ] && break
+            else
+              echo "TC-1012 probe inconclusive (curl exit ${RC}): $(cat /tmp/tc1012-curl.err)"
+              CLOSED=0
+            fi
+            sleep 5
+          done
+          if [ "${CLOSED}" -lt 3 ]; then
+            echo "::error::TC-1012: could not confirm ${RAW_URL} is closed (last curl exit ${RC})."
             exit 1
           fi
-          echo "Ingress serves /version (200); gateway app port 8000 gives no HTTP response."
+          echo "Ingress serves /version (200); gateway app port 8000 is closed (curl exit ${RC}, ${CLOSED} consecutive)."
