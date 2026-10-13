@@ -2060,10 +2060,9 @@ where
         // per-space lock. On PostgreSQL this is an advisory lock, so the
         // meeting legacy guard lock below is still the first row lock.
         crate::kv_sync::lock_space_sequences(&tx, &sequence_spaces).await?;
-        // This must be the transaction's FIRST row lock / first database
-        // operation on SQLite: a preceding SQLite read would permit a
-        // read-to-write upgrade race. Distinct spaces are locked in a stable
-        // order to prevent cross-space deadlocks on PG.
+        // On SQLite `begin_graph_transaction` already holds the write lock,
+        // so no read-to-write upgrade race remains. Distinct spaces are
+        // locked in a stable order to prevent cross-space deadlocks on PG.
         let mut legacy_spaces: Vec<_> = mutation_keys
             .iter()
             .filter(|(_, path)| crate::meeting_legacy_guard::protects(path.as_str()))
@@ -2595,14 +2594,31 @@ fn chain_isolation_level<C: ConnectionTrait>(db: &C) -> Option<sea_orm::Isolatio
     }
 }
 
+/// First statement of every SQLite write transaction. It changes no rows but
+/// takes the database write lock before the transaction reads anything, which
+/// is what `BEGIN IMMEDIATE` would do (sea-orm 1.1 cannot send a custom BEGIN).
+/// A deferred transaction pins its snapshot at its first read instead, and any
+/// other connection that commits before its first write then makes that write
+/// fail with SQLITE_BUSY_SNAPSHOT (517), which busy_timeout cannot retry
+/// (TC-899). `WHERE 0` is not valid PostgreSQL, so it can never run there
+/// unnoticed.
+const SQLITE_RESERVE_WRITE_LOCK: &str = "UPDATE epoch SET seq = seq WHERE 0";
+
 /// Begin a transaction that will write to the capability database.
 ///
-/// Other backends get exactly `begin_with_config(isolation_level, None)`.
+/// On SQLite the write lock is reserved before the first read, so a concurrent
+/// writer (gated or not, in this process or another) waits in SQLite's busy
+/// handler instead of invalidating the snapshot. Other backends get exactly
+/// `begin_with_config(isolation_level, None)`.
 pub async fn begin_write_transaction<C: TransactionTrait>(
     conn: &C,
     isolation_level: Option<sea_orm::IsolationLevel>,
 ) -> Result<DatabaseTransaction, DbErr> {
-    conn.begin_with_config(isolation_level, None).await
+    let tx = conn.begin_with_config(isolation_level, None).await?;
+    if tx.get_database_backend() == DbBackend::Sqlite {
+        tx.execute_unprepared(SQLITE_RESERVE_WRITE_LOCK).await?;
+    }
+    Ok(tx)
 }
 
 /// Returns a `TransactResult` that acknowledges a delegation already durably
