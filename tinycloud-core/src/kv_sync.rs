@@ -153,6 +153,19 @@ pub async fn lock_space_sequences_not_held<'a, C: ConnectionTrait>(
                 .into_iter()
                 .filter(|space| !held.contains(&space_sequence_lock_key(space)))
                 .collect::<Vec<_>>();
+            // Advisory locks are only deadlock-free when every transaction
+            // takes them in one global ascending order. Keys taken here come
+            // after the held ones, so they must all sort above them; today the
+            // only non-empty caller holds every key it asks for.
+            debug_assert!(
+                spaces
+                    .iter()
+                    .map(|space| space_sequence_lock_key(space))
+                    .min()
+                    .zip(held.last())
+                    .is_none_or(|(next, held)| next > *held),
+                "sequence locks not held must sort above the held ones"
+            );
             lock_space_sequences(db, spaces).await
         }
         DbBackend::Sqlite | DbBackend::MySql => lock_space_sequences(db, spaces).await,
@@ -1677,14 +1690,24 @@ pub(crate) mod tests {
     /// it, each with its own pool (15 connections, the production size) and
     /// its own in-process locks: separate node processes sharing a database.
     /// The schema is dropped when the fixture goes out of scope.
+    ///
+    /// Fixtures are serialized within the test process. Each one opens up to
+    /// `instances × 15` connections, and several concurrency tests running
+    /// in parallel can exhaust PostgreSQL's default `max_connections = 100`
+    /// ("sorry, too many clients already" at `CREATE SCHEMA`).
     struct PostgresFixture {
         dbs: Vec<TestDb>,
         _schema: SchemaGuard,
+        // Last, so the schema is dropped before the next fixture starts.
+        _serial: tokio::sync::MutexGuard<'static, ()>,
     }
+
+    static POSTGRES_FIXTURES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     impl PostgresFixture {
         async fn new(test: &str, instances: usize) -> Option<Self> {
             let url = crate::test_support::postgres_test_url(test)?;
+            let serial = POSTGRES_FIXTURES.lock().await;
             let admin = Database::connect(ConnectOptions::new(url.clone()))
                 .await
                 .expect("connect to PostgreSQL test database");
@@ -1726,6 +1749,7 @@ pub(crate) mod tests {
             Some(Self {
                 dbs,
                 _schema: guard,
+                _serial: serial,
             })
         }
     }
@@ -2666,7 +2690,13 @@ pub(crate) mod tests {
         else {
             return;
         };
-        let (a, b) = (Owner::generate().space, Owner::generate().space);
+        // `b` sorts above `a`, so taking it after the held `a` keeps the
+        // global ascending lock order that `lock_space_sequences_not_held`
+        // asserts.
+        let (mut a, mut b) = (Owner::generate().space, Owner::generate().space);
+        if space_sequence_lock_key(&a) > space_sequence_lock_key(&b) {
+            std::mem::swap(&mut a, &mut b);
+        }
         let (conn, locks) = counting_sequence_locks(&schema.conn);
         let tx = conn.begin().await.unwrap();
         lock_space_sequences(&tx, [&a]).await.unwrap();
