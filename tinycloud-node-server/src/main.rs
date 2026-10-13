@@ -31,9 +31,6 @@ async fn main() {
     let config = build_config_figment(); // That's just for easy access to ROCKET_LOG_LEVEL
     let tinycloud_config = config.extract::<config::Config>().unwrap();
 
-    // This is deliberately before `app`: release automation needs to prove
-    // the exact candidate accepts the sealed trust bundle without opening the
-    // production database, resolving the node key, or binding a socket.
     if std::env::args_os()
         .skip(1)
         .any(|arg| arg == "--validate-config")

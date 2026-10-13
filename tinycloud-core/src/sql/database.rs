@@ -7,7 +7,6 @@ use rusqlite::hooks::{AuthContext, Authorization};
 use tokio::sync::{mpsc, oneshot};
 
 use super::{
-    authorizer,
     caveats::SqlCaveats,
     parser,
     storage::{self, StorageMode},
@@ -20,6 +19,10 @@ const MAX_BOUNDED_QUERY_BYTES: usize = 4 * 1024 * 1024;
 const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300); // 5 min
 
 enum DbMessage {
+    Publication {
+        command: serde_json::Value,
+        response_tx: oneshot::Sender<Result<SqlExecutionResult, SqlError>>,
+    },
     Execute {
         request: SqlRequest,
         caveats: Option<SqlCaveats>,
@@ -72,6 +75,23 @@ impl DatabaseHandle {
         response_rx
             .await
             .map_err(|_| SqlError::Internal("Database actor dropped shutdown response".into()))
+    }
+
+    pub(crate) async fn publication(
+        &self,
+        command: serde_json::Value,
+    ) -> Result<SqlExecutionResult, SqlError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.tx
+            .send(DbMessage::Publication {
+                command,
+                response_tx,
+            })
+            .await
+            .map_err(|_| SqlError::Internal("Database actor not available".into()))?;
+        response_rx
+            .await
+            .map_err(|_| SqlError::Internal("Database actor dropped response".into()))?
     }
     pub async fn execute(
         &self,
@@ -165,6 +185,24 @@ pub fn spawn_actor(
 
             match msg {
                 DbMessage::Shutdown { response_tx } => break Some(response_tx),
+                DbMessage::Publication {
+                    command,
+                    response_tx,
+                } => {
+                    conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+                    let result =
+                        super::publication::execute(&conn, &space_id, &command).map(|receipt| {
+                            SqlExecutionResult {
+                                response: SqlResponse::Query(QueryResponse {
+                                    columns: vec!["receipt".into()],
+                                    rows: vec![vec![SqlValue::Text(receipt.to_string())]],
+                                    row_count: 1,
+                                }),
+                                write_targets: vec![],
+                            }
+                        });
+                    let _ = response_tx.send(result);
+                }
                 DbMessage::Execute {
                     request,
                     caveats,
@@ -369,8 +407,11 @@ fn handle_message(
         } => {
             let parsed = parser::validate_sql(sql, caveats, ability)?;
 
-            let auth =
-                authorizer::create_authorizer(caveats.clone(), ability.to_string(), is_admin);
+            let auth = super::authorizer::create_authorizer(
+                caveats.clone(),
+                ability.to_string(),
+                is_admin,
+            );
             conn.authorizer(Some(auth));
 
             let result = execute_query(conn, sql, params, *max_rows, *max_bytes);
@@ -393,7 +434,7 @@ fn handle_message(
                 for stmt_sql in schema_stmts {
                     let parsed = parser::validate_sql(stmt_sql, caveats, ability)?;
                     write_targets.extend(parsed.write_targets);
-                    let auth = authorizer::create_authorizer(
+                    let auth = super::authorizer::create_authorizer(
                         caveats.clone(),
                         ability.to_string(),
                         is_admin,
@@ -406,8 +447,11 @@ fn handle_message(
             }
 
             let parsed = parser::validate_sql(sql, caveats, ability)?;
-            let auth =
-                authorizer::create_authorizer(caveats.clone(), ability.to_string(), is_admin);
+            let auth = super::authorizer::create_authorizer(
+                caveats.clone(),
+                ability.to_string(),
+                is_admin,
+            );
             conn.authorizer(Some(auth));
 
             let result = execute_statement(conn, sql, params, is_insert_statement(&parsed));
@@ -435,8 +479,11 @@ fn handle_message(
 
             let mut results = Vec::new();
             for (stmt, is_insert) in statements.iter().zip(insert_statements) {
-                let auth =
-                    authorizer::create_authorizer(caveats.clone(), ability.to_string(), is_admin);
+                let auth = super::authorizer::create_authorizer(
+                    caveats.clone(),
+                    ability.to_string(),
+                    is_admin,
+                );
                 conn.authorizer(Some(auth));
                 let result = execute_statement(conn, &stmt.sql, &stmt.params, is_insert);
                 conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
@@ -458,8 +505,11 @@ fn handle_message(
 
             let parsed = parser::validate_sql(&prepared.sql, caveats, ability)?;
 
-            let auth =
-                authorizer::create_authorizer(caveats.clone(), ability.to_string(), is_admin);
+            let auth = super::authorizer::create_authorizer(
+                caveats.clone(),
+                ability.to_string(),
+                is_admin,
+            );
             conn.authorizer(Some(auth));
 
             let result = if is_query_statement(&parsed) {
@@ -1043,5 +1093,68 @@ mod tests {
             validate_query_limits(None, Some(MAX_BOUNDED_QUERY_BYTES + 1)),
             Err(SqlError::InvalidStatement(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod publication_rollback_tests {
+    use super::*;
+    #[test]
+    fn publication_rollback_restores_authorized_legacy_sql_and_bookkeeping() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE connector_meeting(id TEXT PRIMARY KEY,title TEXT,metadata TEXT,publication_state TEXT); INSERT INTO connector_meeting VALUES('old','Published','{}','published'); CREATE TABLE connector_publication_control(id INTEGER PRIMARY KEY,active INTEGER NOT NULL); INSERT INTO connector_publication_control VALUES(1,1);").unwrap();
+        for sql in [
+            "UPDATE connector_meeting SET title='Original',metadata='{ \"kept\": true }',publication_state=NULL WHERE id='old'",
+            "UPDATE connector_publication_control SET active=0 WHERE id=1",
+            "INSERT INTO connector_meeting(id,title) VALUES('new','Legacy sync')",
+            "DELETE FROM connector_meeting WHERE id='new'",
+        ] {
+            handle_message(&conn, &SqlRequest::Execute { sql: sql.into(), params: vec![], schema: None }, &None, "tinycloud.sql/write").unwrap_or_else(|error| panic!("legacy recovery rejected: {error}"));
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT title,metadata,publication_state FROM connector_meeting WHERE id='old'",
+                [],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?
+                ))
+            )
+            .unwrap(),
+            ("Original".into(), "{ \"kept\": true }".into(), None)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT active FROM connector_publication_control",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn publication_rollback_keeps_normal_read_only_authority() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE connector_meeting(id TEXT PRIMARY KEY,title TEXT); INSERT INTO connector_meeting VALUES('old','Original'); CREATE TABLE connector_publication_control(id INTEGER PRIMARY KEY,active INTEGER NOT NULL); INSERT INTO connector_publication_control VALUES(1,1);").unwrap();
+        let result = handle_message(
+            &conn,
+            &SqlRequest::Execute {
+                sql: "UPDATE connector_meeting SET title='Unauthorized'".into(),
+                params: vec![],
+                schema: None,
+            },
+            &None,
+            "tinycloud.sql/read",
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            conn.query_row("SELECT title FROM connector_meeting", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            "Original"
+        );
     }
 }

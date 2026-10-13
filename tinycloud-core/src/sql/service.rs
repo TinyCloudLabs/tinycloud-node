@@ -177,6 +177,28 @@ impl SqlService {
         registry.insert(key, Arc::downgrade(&lock));
         lock
     }
+    /// Read-only compatibility command; the core actor rejects withdrawn mutations.
+    pub async fn meeting_publication(
+        &self,
+        space: &SpaceId,
+        command: serde_json::Value,
+    ) -> Result<SqlExecutionResult, SqlError> {
+        let db_name = super::publication::DATABASE;
+        let _guard = self.operation_lock(space, db_name).await.lock_owned().await;
+        let key = (space.to_string(), db_name.to_string());
+        let handle = self.handle(space, db_name).await?;
+        let result = handle.publication(command).await?;
+        if !result.write_targets.is_empty() {
+            if let Err(error) = self
+                .persist_write(space, db_name, &handle, GrowthPolicy::Allow)
+                .await
+            {
+                self.discard_local_state(&key).await?;
+                return Err(error);
+            }
+        }
+        Ok(result)
+    }
 
     /// Export a durable database without persisting changes. A cached actor
     /// created by a query or rejected write does not establish its existence.
@@ -211,8 +233,12 @@ impl SqlService {
     }
 
     pub fn db_name_from_path(path: Option<&str>) -> String {
-        path.map(|p| p.split('/').next_back().unwrap_or("default").to_string())
-            .unwrap_or_else(|| "default".to_string())
+        crate::database_identity::logical_name(path)
+    }
+
+    /// The pre-N2 selector, for N3's explicit legacy-artifact inventory only.
+    pub fn legacy_db_name_from_path(path: Option<&str>) -> String {
+        crate::database_identity::legacy_sql_name(path)
     }
 
     /// Resolve the live actor for `key`, hydrating the on-disk cache first if
@@ -1751,5 +1777,95 @@ mod tests {
             service.export(&space, "main").await,
             Err(SqlError::DatabaseNotFound)
         ));
+    }
+    #[tokio::test]
+    async fn connector_sql_durable_cas_fences_another_node_and_recovers() {
+        let repo = artifact_repository().await;
+        let space = test_space_id("connector-cas");
+        let one = TempDir::new().unwrap();
+        let two = TempDir::new().unwrap();
+        let first = SqlService::new(one.path().to_string_lossy().into(), u64::MAX, repo.clone());
+        let second = SqlService::new(two.path().to_string_lossy().into(), u64::MAX, repo);
+        first
+            .execute(
+                &space,
+                "connectors",
+                SqlRequest::Execute {
+                    sql: "INSERT INTO connector_meeting(id,title) VALUES('old','Original')".into(),
+                    params: vec![],
+                    schema: Some(vec![
+                        "CREATE TABLE connector_meeting(id TEXT PRIMARY KEY,title TEXT)".into(),
+                    ]),
+                },
+                None,
+                "tinycloud.sql/admin".into(),
+            )
+            .await
+            .unwrap();
+        let query = || SqlRequest::Query {
+            sql: "SELECT title FROM connector_meeting WHERE id='old'".into(),
+            params: vec![],
+            max_rows: None,
+            max_bytes: None,
+        };
+        second
+            .execute(
+                &space,
+                "connectors",
+                query(),
+                None,
+                "tinycloud.sql/read".into(),
+            )
+            .await
+            .unwrap();
+        let update = |title: &str| SqlRequest::Execute {
+            sql: "UPDATE connector_meeting SET title=? WHERE id='old'".into(),
+            params: vec![SqlValue::Text(title.into())],
+            schema: None,
+        };
+        first
+            .execute(
+                &space,
+                "connectors",
+                update("First"),
+                None,
+                "tinycloud.sql/write".into(),
+            )
+            .await
+            .unwrap();
+        assert!(second
+            .execute(
+                &space,
+                "connectors",
+                update("Stale"),
+                None,
+                "tinycloud.sql/write".into()
+            )
+            .await
+            .is_err());
+        second
+            .execute(
+                &space,
+                "connectors",
+                update("Recovered"),
+                None,
+                "tinycloud.sql/write".into(),
+            )
+            .await
+            .unwrap();
+        let result = second
+            .execute(
+                &space,
+                "connectors",
+                query(),
+                None,
+                "tinycloud.sql/read".into(),
+            )
+            .await
+            .unwrap();
+        let SqlResponse::Query(query) = result.response else {
+            panic!("query result required")
+        };
+        assert_eq!(query.rows, vec![vec![SqlValue::Text("Recovered".into())]]);
     }
 }

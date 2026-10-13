@@ -3,6 +3,37 @@
 TinyCloud stores file-backed SQL and DuckDB databases as a durable checkpoint
 plus the database engine's current write-ahead log (WAL).
 
+## Database identity (TC-780 N2)
+
+SQL and DuckDB select databases by the complete resource path within a space.
+The path bytes are mapped to a fixed-length, case-safe `v2d` plus SHA-256 hex
+physical name. A pathless resource uses `v2n`, distinct from an explicitly
+empty path and from a path named `default`. The logical path remains in the
+resource; it cannot be recovered from the physical name. The old final-segment
+selectors remain available only for the explicit N3 legacy-artifact migration;
+N2 performs no migration or fallback.
+DuckDB paths ending in an empty or formerly invalid final segment now get their
+own encoded identities instead of opening the old `default` artifact.
+At the N3 cutover, the resolver must reserve every preexisting physical name:
+only an explicit `(service, space, logical identity)` alias may reach a legacy
+artifact, even if its physical name happens to equal a newly encoded identity.
+Unresolved legacy artifacts remain inaccessible.
+
+SQL and DuckDB grants without a trailing slash match one exact path. Grants
+ending in `/`, and pathless grants, still cover a namespace. KV matching is
+unchanged. The share-email named SQL adapter accepts a canonical URI path and
+keys by that authorized `path`, using the same identity as `/invoke`; its
+separately pinned `database` field does not select a physical artifact.
+
+SQL and DuckDB hook event `path` values encode the database path and table
+name as separate components: `db/p<hex database path>/table/<hex table name>`;
+pathless databases use `db/n/table/<hex table name>`. Events also carry
+`databasePath` (absent for pathless) and `tableName`. Subscription path scopes
+refer to the **logical database path**: a non-slash scope is exact, and a
+slash-terminated scope covers a namespace. KV event paths and matching are
+unchanged. Existing SQL/DuckDB subscribers using table-suffixed scopes must
+update them to database scopes.
+
 ## Acknowledgement contract
 
 - A mutation is not acknowledged until either its WAL or a replacement

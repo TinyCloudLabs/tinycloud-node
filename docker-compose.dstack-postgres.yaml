@@ -40,6 +40,9 @@ services:
       # headroom for admin/psql access, and raise it only alongside the
       # instance's own max_connections.
       TINYCLOUD_DATABASE__MAX_CONNECTIONS: "15"
+      # Required for every manual TC-780 deploy. Keep true through offline
+      # verification; only the final, explicitly reviewed redeploy sets false.
+      TINYCLOUD_DATABASE__WRITE_FENCE: "${SQL_IDENTITY_FENCE:?set true during cutover, false after verification}"
       TINYCLOUD_CORS: "true"
       # --- addressed sharing (TC-397) ------------------------------------
       #
@@ -70,7 +73,7 @@ services:
       ROCKET_MAX_BLOCKING: "1024"
 
   dstack-ingress:
-    image: dstacktee/dstack-ingress:20250924@sha256:40429d78060ef3066b5f93676bf3ba7c2e9ac47d4648440febfdda558aed4b32
+    image: ghcr.io/tinycloudlabs/tinycloud-node-ingress@sha256:726c6d35858e50c5524cc97e789c2c8f09620e77d708bb71bdc9370e3d80ed3e
     ports:
       - "443:443"
     depends_on:

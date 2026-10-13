@@ -108,6 +108,12 @@ jobs:
     - name: Run the workspace test suite
       run: cargo test --workspace
 
+    # The workspace suite does not enable tinycloud-core's DuckDB feature.
+    # Run its unit tests with that feature so SQL/DuckDB identity parity is
+    # checked in CI as well as through the excluded W5 wire-test crate.
+    - name: Run DuckDB-enabled core tests
+      run: cargo test -p tinycloud-core --features duckdb
+
   clippy:
     name: clippy (workspace)
     runs-on: ubuntu-latest
@@ -164,8 +170,14 @@ jobs:
 
   # test/m1-realdata-e2e, test/load/signer and test/w5-policy-runtime-node-e2e
   # are `exclude`d from the workspace in Cargo.toml, so the workspace-wide jobs
-  # above do not reach them. m1-realdata-e2e is covered by this job; the other
-  # two are covered by no job at all — recorded here rather than left implicit.
+  # above do not reach them. m1-realdata-e2e is covered by the job below.
+  # w5-policy-runtime-node-e2e (including the TC-780 SQL/DuckDB isolation suite
+  # in tests/sql_isolation.rs) depends on the private TinyCloudLabs/policy-engine
+  # repository by git, which this workflow's token cannot clone, so it runs
+  # locally before a release (`cargo test --locked --manifest-path
+  # test/w5-policy-runtime-node-e2e/Cargo.toml`); a CI job needs a read token
+  # for that repository first. test/load/signer is covered by no job at all.
+  # Recorded here rather than left implicit.
   m1-realdata:
     runs-on: ubuntu-latest
     env:

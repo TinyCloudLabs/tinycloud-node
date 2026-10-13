@@ -28,8 +28,37 @@ impl TouchedTables {
     }
 }
 
-pub fn db_table_path(db_name: &str, table_name: &str) -> String {
-    format!("{db_name}/{table_name}")
+/// An unambiguous event path for a database and table. Both components are
+/// encoded independently, so a slash in either can never move their boundary.
+/// `n` and `p` distinguish a pathless database from an explicitly empty path.
+pub fn db_table_path(db_path: Option<&str>, table_name: &str) -> String {
+    let database = match db_path {
+        None => "n".to_string(),
+        Some(path) => format!("p{}", hex::encode(path.as_bytes())),
+    };
+    format!("db/{database}/table/{}", hex::encode(table_name.as_bytes()))
+}
+
+/// SQL/DuckDB subscriptions address database resources, independent of the
+/// encoded event path. Non-slash scopes are exact; slash scopes are namespaces.
+pub fn database_scope_matches(scope: Option<&str>, database_path: Option<&str>) -> bool {
+    match (scope, database_path) {
+        (None, _) => true,
+        (Some(scope), Some(path)) if scope.ends_with('/') => path.starts_with(scope),
+        (Some(scope), Some(path)) => path == scope,
+        (Some(_), None) => false,
+    }
+}
+
+pub fn database_subscription_matches_event(
+    subscription: &hook_subscription::Model,
+    database_path: Option<&str>,
+    ability: &str,
+) -> bool {
+    database_scope_matches(subscription.path_prefix.as_deref(), database_path)
+        && subscription
+            .abilities()
+            .is_ok_and(|abilities| abilities.is_empty() || abilities.iter().any(|a| a == ability))
 }
 
 pub fn subscription_matches_event(
@@ -139,5 +168,58 @@ mod tests {
         let other = hook_delivery_id("sub_02", "event_01");
         assert_eq!(left, right);
         assert_ne!(left, other);
+    }
+
+    #[test]
+    fn database_event_paths_have_unambiguous_components() {
+        assert_ne!(
+            db_table_path(None, "items"),
+            db_table_path(Some("default"), "items")
+        );
+        assert_ne!(
+            db_table_path(Some("appA/connectors"), "private/items"),
+            db_table_path(Some("appA/connectors/private"), "items")
+        );
+        assert_ne!(
+            db_table_path(Some(""), "items"),
+            db_table_path(None, "items")
+        );
+    }
+
+    #[test]
+    fn database_hook_scopes_follow_exact_and_slash_grants() {
+        let exact = test_subscription(Some("appA/connectors"), &["tinycloud.sql/write"]);
+        assert!(database_subscription_matches_event(
+            &exact,
+            Some("appA/connectors"),
+            "tinycloud.sql/write"
+        ));
+        assert!(!database_subscription_matches_event(
+            &exact,
+            Some("appA/connectors/private"),
+            "tinycloud.sql/write"
+        ));
+        let namespace = test_subscription(Some("appA/connectors/"), &[]);
+        assert!(database_subscription_matches_event(
+            &namespace,
+            Some("appA/connectors/private"),
+            "tinycloud.sql/write"
+        ));
+        assert!(!database_subscription_matches_event(
+            &exact,
+            None,
+            "tinycloud.sql/write"
+        ));
+        let default = test_subscription(Some("default"), &[]);
+        assert!(database_subscription_matches_event(
+            &default,
+            Some("default"),
+            "tinycloud.sql/write"
+        ));
+        assert!(!database_subscription_matches_event(
+            &default,
+            None,
+            "tinycloud.sql/write"
+        ));
     }
 }

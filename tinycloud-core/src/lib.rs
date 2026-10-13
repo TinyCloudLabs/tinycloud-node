@@ -1,6 +1,8 @@
 pub mod admission;
 pub(crate) mod auth_graph;
 pub mod database_artifacts;
+pub mod database_identity;
+pub mod database_migration;
 pub mod db;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
@@ -11,6 +13,7 @@ pub mod hash;
 pub mod keys;
 pub mod kv_sync;
 pub mod manifest;
+pub mod meeting_legacy_guard;
 pub mod migrations;
 pub mod models;
 pub mod policy_authority;
