@@ -1,4 +1,5 @@
 mod socket;
+pub mod tcp_keepalive;
 pub mod tls;
 
 pub use socket::{

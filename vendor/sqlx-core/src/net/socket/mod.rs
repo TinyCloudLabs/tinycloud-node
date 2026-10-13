@@ -198,6 +198,8 @@ pub async fn connect_tcp<Ws: WithSocket>(
 
         let stream = TcpStream::connect((host, port)).await?;
         stream.set_nodelay(true)?;
+        // TinyCloud patch (TC-1054): keepalive and TCP_USER_TIMEOUT.
+        crate::net::tcp_keepalive::apply(socket2::SockRef::from(&stream), host, port)?;
 
         return Ok(with_socket.with_socket(stream).await);
     }
