@@ -159,14 +159,15 @@ async fn run_pipeline(
     }
 }
 
-async fn persist_batch<C: ConnectionTrait + TransactionTrait>(
-    conn: &C,
-    batch: &[Command],
-) -> Result<(), DbErr> {
+async fn persist_batch(conn: &RecoveringConnection, batch: &[Command]) -> Result<(), DbErr> {
     let inserts = audit_inserts(batch);
     if conn.get_database_backend() == DbBackend::Postgres {
         if let Some(statement) = inserts.as_ref().and_then(postgres_single_statement) {
-            return conn.execute(statement).await.map(|_| ());
+            // Every INSERT in the statement is `ON CONFLICT DO NOTHING` on
+            // keys fixed by the batch, and the readers wait only for "the
+            // rows exist", so running it again after a lost connection is a
+            // no-op if the first run committed (TC-951).
+            return conn.execute_idempotent(statement).await.map(|_| ());
         }
     }
     let tx = conn.begin().await?;
@@ -578,7 +579,9 @@ mod tests {
         conn: &'a DatabaseConnection,
         batch: &'a [Command],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DbErr>> + Send + 'a>> {
-        Box::pin(persist_batch(conn, batch))
+        Box::pin(
+            async move { persist_batch(&RecoveringConnection::new(conn.clone()), batch).await },
+        )
     }
 
     fn persist_in_transaction<'a>(
@@ -1093,6 +1096,34 @@ mod tests {
         }
     }
 
+    /// The single statement is idempotent, so `persist_batch` retries it
+    /// once after its backend is terminated (TC-951); the retry waits on the
+    /// same row lock from a new backend. Terminate that one too, so the
+    /// batch fails after its one retry.
+    async fn terminate_retry(observer: &DatabaseConnection, blocker: i32, first: i32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let retry: i32 = loop {
+            if let Some(row) = observer
+                .query_one(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT pid FROM pg_stat_activity \
+                     WHERE $1 = ANY(pg_blocking_pids(pid)) AND pid <> $2",
+                    [blocker.into(), first.into()],
+                ))
+                .await
+                .unwrap()
+            {
+                break row.try_get_by_index(0).unwrap();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the audit statement was not retried"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        terminate_backend(observer, retry).await;
+    }
+
     async fn terminate_backend(observer: &DatabaseConnection, pid: i32) {
         let terminated: bool = observer
             .query_one(Statement::from_sql_and_values(
@@ -1442,7 +1473,9 @@ mod tests {
     /// foreign key or by the writer's backend being terminated while it
     /// waits on a row lock after inserting earlier invocations. The next
     /// batch commits, on a fresh connection after the termination. Both
-    /// paths end with identical rows.
+    /// paths end with identical rows. The single statement is retried once
+    /// after a termination (TC-951), so it fails only when the retry's
+    /// backend is terminated too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn postgres_read_audit_failed_batch_commits_nothing_and_fails_every_waiter() {
         use crate::test_support::PostgresTestSchema;
@@ -1490,6 +1523,9 @@ mod tests {
                 if let Some(held) = &held {
                     let writer = backend_blocked_by(conn, held.pid).await;
                     terminate_backend(conn, writer).await;
+                    if !oversized {
+                        terminate_retry(conn, held.pid, writer).await;
+                    }
                 }
                 let mut failed = 0;
                 for receipt in receipts {
@@ -1543,9 +1579,9 @@ mod tests {
 
         const TEST: &str = "postgres_read_audit_failed_batch_fails_alike_on_both_paths";
         let mut outcomes = Vec::new();
-        for persist in [
-            persist_batch_boxed as Persist,
-            persist_in_transaction as Persist,
+        for (persist, retried) in [
+            (persist_batch_boxed as Persist, true),
+            (persist_in_transaction as Persist, false),
         ] {
             let Some(fixture) = PostgresTestSchema::new(TEST).await else {
                 return;
@@ -1581,6 +1617,9 @@ mod tests {
                 if let Some(held) = &held {
                     let backend = backend_blocked_by(conn, held.pid).await;
                     terminate_backend(conn, backend).await;
+                    if retried {
+                        terminate_retry(conn, held.pid, backend).await;
+                    }
                 }
                 let error = persisted.await.unwrap().expect_err("the batch fails");
                 assert!(error.contains(failure.error()), "{failure:?}: {error}");
