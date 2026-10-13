@@ -16,8 +16,7 @@ use sea_orm::{
     sea_query::{Expr, OnConflict},
     ActiveModelTrait,
     ActiveValue::Set,
-    ColumnTrait, DatabaseConnection, DatabaseTransaction, DbErr, EntityTrait, QueryFilter,
-    TransactionTrait,
+    ColumnTrait, DatabaseTransaction, DbErr, EntityTrait, QueryFilter, TransactionTrait,
 };
 use serde_json::Value;
 use std::fmt;
@@ -66,12 +65,12 @@ impl From<InvitationError> for StateError {
 
 #[derive(Clone)]
 pub struct ProtocolStateRepository {
-    conn: DatabaseConnection,
+    conn: crate::db_pool::RecoveringConnection,
 }
 
 impl ProtocolStateRepository {
-    pub fn new(conn: DatabaseConnection) -> Self {
-        Self { conn }
+    pub fn new(conn: impl Into<crate::db_pool::RecoveringConnection>) -> Self {
+        Self { conn: conn.into() }
     }
 
     pub async fn reserve_invitation_authorization(

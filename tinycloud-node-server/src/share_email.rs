@@ -34,7 +34,6 @@ use tinycloud_auth::share_email_evidence::{IssuerKey, IssuerTrustRegistry};
 use tinycloud_core::{
     policy_authority::DatabaseAuthorityStore,
     policy_capability::jcs,
-    sea_orm::DatabaseConnection,
     share_email::{
         data_plane::{
             ConstrainedNamedSqlStore, DataPlaneError, ExactKvStore, HolderBoundDataPlane,
@@ -962,7 +961,7 @@ impl TinyCloudKvStore {
 pub struct SqlNamedStore {
     pub service: Arc<SqlService>,
     pub space_name: String,
-    pub conn: DatabaseConnection,
+    pub conn: tinycloud_core::RecoveringConnection,
     pub write_fence: bool,
     pub fence_cache: Arc<tinycloud_core::database_migration::EffectiveFenceCache>,
 }
@@ -1123,12 +1122,13 @@ impl ShareEmailRuntime {
 
 pub fn compose(
     config: ShareEmailConfig,
-    conn: DatabaseConnection,
+    conn: impl Into<tinycloud_core::RecoveringConnection>,
     key_setup: &tinycloud_core::keys::StaticSecret,
     tinycloud: Arc<TinyCloud>,
     sql_service: Arc<SqlService>,
     write_fence: bool,
 ) -> anyhow::Result<Option<ShareEmailRuntime>> {
+    let conn = conn.into();
     // v2 policy sharing is deliberately independent of the legacy v1
     // authority-material provider.  A v2-only node has no reason to load the
     // static tuple at all; leaving this surface absent keeps v1 compatibility
@@ -2943,7 +2943,7 @@ mod tests {
                 repo,
             )),
             space_name: "test".into(),
-            conn,
+            conn: conn.into(),
             write_fence: false,
             fence_cache: Arc::new(Default::default()),
         };
@@ -3062,7 +3062,7 @@ mod tests {
                 repo,
             )),
             space_name: "test".into(),
-            conn,
+            conn: conn.into(),
             write_fence: false,
             fence_cache: Arc::new(Default::default()),
         };

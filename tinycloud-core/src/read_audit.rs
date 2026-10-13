@@ -7,6 +7,7 @@
 //! one transaction. Mutations and audit batches share the same writer lock.
 
 use crate::{
+    db_pool::RecoveringConnection,
     encryption::{maybe_encrypt, ColumnEncryption},
     events::Invocation,
     hash::Hash,
@@ -15,8 +16,7 @@ use crate::{
     types::{Ability, Resource},
 };
 use sea_orm::{
-    sea_query::OnConflict, ActiveValue::Set, ConnectionTrait, DatabaseConnection, DbErr,
-    EntityTrait, TransactionTrait,
+    sea_query::OnConflict, ActiveValue::Set, ConnectionTrait, DbErr, EntityTrait, TransactionTrait,
 };
 use std::collections::HashSet;
 use std::sync::{
@@ -81,7 +81,11 @@ pub(crate) struct ReadAuditPipeline {
 }
 
 impl ReadAuditPipeline {
-    pub(crate) fn start(conn: DatabaseConnection, writer_lock: Option<Arc<Mutex<()>>>) -> Self {
+    pub(crate) fn start(
+        conn: impl Into<RecoveringConnection>,
+        writer_lock: Option<Arc<Mutex<()>>>,
+    ) -> Self {
+        let conn = conn.into();
         let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
         let stats = Arc::new(PipelineStats::default());
         tokio::spawn(run_pipeline(conn, writer_lock, receiver, stats.clone()));
@@ -118,7 +122,7 @@ impl ReadAuditPipeline {
 }
 
 async fn run_pipeline(
-    conn: DatabaseConnection,
+    conn: RecoveringConnection,
     writer_lock: Option<Arc<Mutex<()>>>,
     mut receiver: mpsc::Receiver<Command>,
     stats: Arc<PipelineStats>,
@@ -152,7 +156,7 @@ async fn run_pipeline(
     }
 }
 
-async fn persist_batch(conn: &DatabaseConnection, batch: &[Command]) -> Result<(), DbErr> {
+async fn persist_batch<C: TransactionTrait>(conn: &C, batch: &[Command]) -> Result<(), DbErr> {
     let tx = conn.begin().await?;
     persist_records(&tx, batch).await?;
     tx.commit().await
@@ -318,7 +322,7 @@ fn ignore_record_not_inserted<T>(result: Result<T, DbErr>) -> Result<(), DbErr> 
 mod tests {
     use super::*;
     use crate::migrations::Migrator;
-    use sea_orm::{ConnectOptions, Database, PaginatorTrait};
+    use sea_orm::{ConnectOptions, Database, DatabaseConnection, PaginatorTrait};
     use sea_orm_migration::MigratorTrait;
 
     fn record(index: usize) -> ReadAuditRecord {

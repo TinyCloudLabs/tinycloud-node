@@ -40,11 +40,11 @@ use tinycloud_core::{
     relationships::parent_delegations,
     sea_orm::{
         sea_query::Expr, ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait,
-        DatabaseConnection, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
-        Set,
+        DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
     },
     types::SpaceIdWrap,
     util::{DelegationInfo, InvocationInfo},
+    RecoveringConnection,
 };
 
 use crate::{authorization::AuthHeaderGetter, config::ShareEmailConfig};
@@ -102,7 +102,7 @@ struct DeliveryRuntime {
 
 #[derive(Clone)]
 pub struct PolicyV3Runtime {
-    pub conn: DatabaseConnection,
+    pub conn: RecoveringConnection,
     pub node_did: String,
     signer: StaticSecret,
     credential_issuer: Option<IssuerKey>,
@@ -112,12 +112,12 @@ pub struct PolicyV3Runtime {
 
 impl PolicyV3Runtime {
     pub fn new(
-        conn: DatabaseConnection,
+        conn: impl Into<RecoveringConnection>,
         node_did: impl Into<String>,
         signer: StaticSecret,
     ) -> Self {
         Self {
-            conn,
+            conn: conn.into(),
             node_did: node_did.into(),
             signer,
             credential_issuer: None,
@@ -739,8 +739,8 @@ impl PolicyV3Runtime {
 /// containment). A policy session or root is never owner authority: a
 /// recipient could otherwise re-publish what it was shared under a policy of
 /// its own that the original owner cannot revoke.
-async fn owner_holds_capabilities(
-    conn: &DatabaseConnection,
+async fn owner_holds_capabilities<C: ConnectionTrait>(
+    conn: &C,
     owner_did: &str,
     capabilities: &[tinycloud_core::util::Capability],
     at: OffsetDateTime,
@@ -8301,7 +8301,7 @@ mod tests {
             .await?;
         let _storage_dir = storage_dir.keep();
         let tinycloud = crate::TinyCloud::new(
-            db.clone(),
+            db.clone().into(),
             Either::B(storage),
             StaticSecret::new(vec![0; 32]).map_err(|_| anyhow::anyhow!("invalid secret"))?,
         )

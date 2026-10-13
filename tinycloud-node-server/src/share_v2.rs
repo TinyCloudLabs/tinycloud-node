@@ -47,8 +47,8 @@ use tinycloud_core::{
     policy_capability::jcs,
     relationships::parent_delegations,
     sea_orm::{
-        sea_query::Expr, ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr,
-        EntityTrait, PaginatorTrait, QueryFilter, QuerySelect, Set, TransactionTrait,
+        sea_query::Expr, ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait,
+        PaginatorTrait, QueryFilter, QuerySelect, Set, TransactionTrait,
     },
     share_email::invitation::{Ed25519InvitationSigner, InvitationSigner},
     share_email::{
@@ -159,7 +159,7 @@ fn error(status: Status, code: &'static str) -> ApiErrorResponse {
 
 #[derive(Clone)]
 pub struct ShareV2Runtime {
-    conn: DatabaseConnection,
+    conn: tinycloud_core::RecoveringConnection,
     tinycloud: Arc<crate::TinyCloud>,
     policy_encryption: ColumnEncryption,
     signer: Arc<Ed25519InvitationSigner>,
@@ -182,7 +182,7 @@ pub struct ShareV2Runtime {
 /// back as that column's type. Reading them back as the full entity `Model`
 /// makes the query succeed on an empty table and fail with
 /// `ColumnNotFound` the moment a single row exists (TC-349).
-async fn probe_owner_share_policy_lookup(conn: &DatabaseConnection) -> Result<(), DbErr> {
+async fn probe_owner_share_policy_lookup<C: ConnectionTrait>(conn: &C) -> Result<(), DbErr> {
     owner_share_policy::Entity::find()
         .select_only()
         .column(owner_share_policy::Column::PolicyCid)
@@ -197,7 +197,7 @@ async fn probe_owner_share_policy_lookup(conn: &DatabaseConnection) -> Result<()
 ///
 /// See [`probe_owner_share_policy_lookup`] for why the rows are read back as
 /// the projected column's type rather than as the entity `Model`.
-async fn probe_delegation_revocation_lookup(conn: &DatabaseConnection) -> Result<(), DbErr> {
+async fn probe_delegation_revocation_lookup<C: ConnectionTrait>(conn: &C) -> Result<(), DbErr> {
     delegation::Entity::find()
         .select_only()
         .column(delegation::Column::Id)
@@ -389,13 +389,14 @@ fn verify_configured_invitation_key(
 }
 
 pub async fn compose(
-    conn: DatabaseConnection,
+    conn: impl Into<tinycloud_core::RecoveringConnection>,
     key_setup: &StaticSecret,
     config: ShareEmailConfig,
     tee_context: Option<TeeContext>,
     tee_key_derived: bool,
     tinycloud: Arc<crate::TinyCloud>,
 ) -> anyhow::Result<ShareV2Runtime> {
+    let conn = conn.into();
     verify_configured_invitation_key(&config, key_setup)?;
     let migration_ready = report_probe("migration", probe_owner_share_policy_lookup(&conn).await);
     let graph_ready = report_probe(
@@ -4256,7 +4257,7 @@ mod tests {
         .open()
         .await
         .expect("local block storage opens");
-        let tinycloud = crate::TinyCloud::new(conn.clone(), blocks, key_setup.clone())
+        let tinycloud = crate::TinyCloud::new(conn.clone().into(), blocks, key_setup.clone())
             .await
             .expect("in-process TinyCloud composes");
         compose(
@@ -4354,7 +4355,7 @@ mod tests {
         .open()
         .await
         .expect("local block storage opens");
-        let tinycloud = crate::TinyCloud::new(conn.clone(), blocks, key_setup.clone())
+        let tinycloud = crate::TinyCloud::new(conn.clone().into(), blocks, key_setup.clone())
             .await
             .expect("in-process TinyCloud composes");
 
@@ -4636,7 +4637,7 @@ mod tests {
         .open()
         .await
         .expect("local block storage opens");
-        let tinycloud = crate::TinyCloud::new(conn.clone(), blocks, key_setup.clone())
+        let tinycloud = crate::TinyCloud::new(conn.clone().into(), blocks, key_setup.clone())
             .await
             .expect("in-process TinyCloud composes");
         let sql_root = tempfile::tempdir().expect("tempdir for sql store");

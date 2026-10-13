@@ -9,16 +9,14 @@
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, DbErr, EntityTrait,
-    QueryFilter,
-};
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, DbErr, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tinycloud_auth::identity::did_principal_matches;
 
+use crate::db_pool::RecoveringConnection;
 use crate::hash::hash;
 use crate::keys::{public_key_to_did_key, Keypair, PublicKey};
 use crate::models::{
@@ -95,7 +93,7 @@ pub enum EncryptionServiceError {
 }
 
 pub struct EncryptionService {
-    db: DatabaseConnection,
+    db: RecoveringConnection,
     node_did: String,
     node_keypair: Option<Keypair>,
     backend: Arc<dyn KeyBackend>,
@@ -117,9 +115,13 @@ pub struct VerifiedDecrypt {
 }
 
 impl EncryptionService {
-    pub fn new(db: DatabaseConnection, node_did: String, backend: Arc<dyn KeyBackend>) -> Self {
+    pub fn new(
+        db: impl Into<RecoveringConnection>,
+        node_did: String,
+        backend: Arc<dyn KeyBackend>,
+    ) -> Self {
         Self {
-            db,
+            db: db.into(),
             node_did,
             node_keypair: None,
             backend,
@@ -129,13 +131,13 @@ impl EncryptionService {
     }
 
     pub fn new_with_node_keypair(
-        db: DatabaseConnection,
+        db: impl Into<RecoveringConnection>,
         node_keypair: Keypair,
         backend: Arc<dyn KeyBackend>,
     ) -> Self {
         let node_did = public_key_to_did_key(node_keypair.public());
         Self {
-            db,
+            db: db.into(),
             node_did,
             node_keypair: Some(node_keypair),
             backend,

@@ -221,7 +221,7 @@ mod tests {
                 .await
                 .unwrap();
         let tinycloud = TinyCloud::new(
-            conn.clone(),
+            conn.clone().into(),
             Either::B(storage),
             StaticSecret::new(vec![0; 32]).unwrap(),
         )

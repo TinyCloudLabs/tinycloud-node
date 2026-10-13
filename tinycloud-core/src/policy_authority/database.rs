@@ -1,23 +1,22 @@
 use super::*;
 use crate::models::{policy_challenge, policy_delegation, policy_edge, policy_issuance_audit};
 use sea_orm::{
-    sea_query::Expr, ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection,
-    DatabaseTransaction, DbBackend, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
-    TransactionTrait,
+    sea_query::Expr, ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseTransaction,
+    DbBackend, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 
 #[derive(Clone)]
 pub struct DatabaseAuthorityStore {
-    db: DatabaseConnection,
+    db: crate::db_pool::RecoveringConnection,
     chain_locks: Arc<tokio::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>,
     #[cfg(test)]
     race_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
 impl DatabaseAuthorityStore {
-    pub fn new(db: DatabaseConnection) -> Self {
+    pub fn new(db: impl Into<crate::db_pool::RecoveringConnection>) -> Self {
         Self {
-            db,
+            db: db.into(),
             chain_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             #[cfg(test)]
             race_barrier: None,
@@ -968,7 +967,7 @@ fn ensure_live_model(
     Ok(artifact)
 }
 
-fn policy_isolation_level(connection: &DatabaseConnection) -> Option<sea_orm::IsolationLevel> {
+fn policy_isolation_level<C: ConnectionTrait>(connection: &C) -> Option<sea_orm::IsolationLevel> {
     match connection.get_database_backend() {
         DbBackend::Postgres | DbBackend::MySql => Some(sea_orm::IsolationLevel::ReadCommitted),
         DbBackend::Sqlite => None,

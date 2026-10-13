@@ -94,7 +94,7 @@ async fn race(competitor: Competitor, begin: Begin) -> (Result<(), DbErr>, bool)
             .await
             .unwrap();
     let node = crate::TinyCloud::new(
-        connection,
+        connection.into(),
         Either::B(storage),
         tinycloud_core::keys::StaticSecret::new(vec![7u8; 64]).unwrap(),
     )

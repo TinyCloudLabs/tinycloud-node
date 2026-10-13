@@ -22,10 +22,8 @@ use tinycloud_auth::{
 };
 use tinycloud_core::{
     hash::{hash, Hash},
-    sea_orm::{
-        ConnectionTrait, DatabaseBackend, DatabaseConnection, DbErr, QueryResult, Statement,
-        TransactionTrait,
-    },
+    sea_orm::{ConnectionTrait, DatabaseBackend, DbErr, QueryResult, Statement, TransactionTrait},
+    RecoveringConnection,
 };
 
 use crate::config::TcBenchConfig;
@@ -103,7 +101,7 @@ pub struct BenchHealth {
 
 #[derive(Clone, Debug)]
 pub struct BenchState {
-    db: DatabaseConnection,
+    db: RecoveringConnection,
     region: String,
     sqlite: SqliteHealth,
     artifact_hashes: ArtifactHashes,
@@ -327,9 +325,10 @@ impl BenchTimings {
 impl BenchState {
     pub async fn new(
         config: &TcBenchConfig,
-        db: DatabaseConnection,
+        db: impl Into<RecoveringConnection>,
         sqlite_pool_size: u32,
     ) -> Result<Self, DbErr> {
+        let db = db.into();
         let sqlite = SqliteHealth {
             journal_mode: "WAL".to_string(),
             synchronous: "default".to_string(),
@@ -345,7 +344,7 @@ impl BenchState {
         Ok(state)
     }
 
-    fn db(&self) -> &DatabaseConnection {
+    fn db(&self) -> &RecoveringConnection {
         &self.db
     }
 

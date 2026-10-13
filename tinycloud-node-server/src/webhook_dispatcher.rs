@@ -314,7 +314,7 @@ mod tests {
         let _persisted = tempdir.keep();
         let encryption = ColumnEncryption::new([9u8; 32]);
         let tinycloud = TinyCloud::new(
-            db.clone(),
+            db.clone().into(),
             Either::B(storage),
             StaticSecret::new(vec![0u8; 32]).unwrap(),
         )
@@ -524,7 +524,7 @@ mod tests {
         let storage = NodeFileSystemConfig::new(tempdir.path()).open().await?;
         let _persisted = tempdir.keep();
         let tinycloud = TinyCloud::new(
-            db.clone(),
+            db.clone().into(),
             Either::B(storage),
             StaticSecret::new(vec![0u8; 32]).unwrap(),
         )

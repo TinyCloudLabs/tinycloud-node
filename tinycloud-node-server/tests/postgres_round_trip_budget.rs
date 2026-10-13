@@ -100,8 +100,9 @@ use tinycloud_auth::{
     ssi::dids::DIDBuf,
 };
 use tinycloud_core::{
-    sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement},
+    sea_orm::{ConnectionTrait, Database, DbBackend, Statement},
     sql::SqlRequest,
+    RecoveringConnection,
 };
 use tinycloud_sdk_wasm::{
     host::{generate_host_siwe_message, siwe_to_delegation_headers, HostConfig, SignedMessage},
@@ -528,8 +529,9 @@ impl Node {
     fn pool(&self) -> &tinycloud_core::sea_orm::sqlx::PgPool {
         self.client
             .rocket()
-            .state::<DatabaseConnection>()
-            .expect("the node manages its DatabaseConnection")
+            .state::<RecoveringConnection>()
+            .expect("the node manages its RecoveringConnection")
+            .sea_orm_connection()
             .get_postgres_connection_pool()
     }
 

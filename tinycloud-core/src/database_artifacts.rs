@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use sea_orm::{
-    sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, DbErr,
-    EntityTrait, QueryFilter, QuerySelect,
+    sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, DbErr, EntityTrait,
+    QueryFilter, QuerySelect,
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
@@ -143,7 +143,7 @@ pub trait DatabaseArtifactRepository: Send + Sync {
 
 #[derive(Clone)]
 pub struct SeaOrmDatabaseArtifactRepository {
-    conn: DatabaseConnection,
+    conn: crate::db_pool::RecoveringConnection,
     sqlite_writer_lock: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
     /// Test-only rendezvous seam (see [`wait_at_race_barrier`]) that lets two
     /// writers read the same base revision before either commits, so the
@@ -153,9 +153,9 @@ pub struct SeaOrmDatabaseArtifactRepository {
 }
 
 impl SeaOrmDatabaseArtifactRepository {
-    pub fn new(conn: DatabaseConnection) -> Self {
+    pub fn new(conn: impl Into<crate::db_pool::RecoveringConnection>) -> Self {
         Self {
-            conn,
+            conn: conn.into(),
             sqlite_writer_lock: None,
             #[cfg(test)]
             race_barrier: None,

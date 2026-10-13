@@ -456,9 +456,9 @@ impl Default for EffectiveFenceCache {
 
 impl EffectiveFenceCache {
     /// Check the durable fence on every call and refresh the legacy scan after its TTL.
-    pub async fn check(
+    pub async fn check<C: ConnectionTrait>(
         &self,
-        conn: &DatabaseConnection,
+        conn: &C,
         configured: bool,
     ) -> Result<bool, MigrationError> {
         if configured || metadata_fenced(conn).await? {
@@ -652,8 +652,8 @@ async fn inventory_in<C: ConnectionTrait>(
 }
 
 /// Resolve only through an explicit alias, or to an unreserved N2 digest.
-pub async fn resolve(
-    conn: &DatabaseConnection,
+pub async fn resolve<C: ConnectionTrait>(
+    conn: &C,
     service: &str,
     space: &str,
     path: Option<&str>,

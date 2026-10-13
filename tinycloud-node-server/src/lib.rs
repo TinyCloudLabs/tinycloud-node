@@ -140,11 +140,11 @@ use tinycloud_core::{
     database_artifacts::{DatabaseArtifactRepository, SeaOrmDatabaseArtifactRepository},
     encryption_network::{EncryptionService, LocalOneOfOneBackend},
     keys::{SecretsSetup, StaticSecret},
-    sea_orm::{ConnectOptions, Database, DatabaseConnection},
+    sea_orm::{ConnectOptions, Database},
     sql::SqlService,
     sql_sizes::{SizeTrackingArtifactRepository, SqlSizes},
     storage::{either::Either, memory::MemoryStaging, StorageConfig},
-    ColumnEncryption, SpaceDatabase,
+    ColumnEncryption, RecoveringConnection, SpaceDatabase,
 };
 use webhook_dispatcher::{spawn_webhook_dispatcher, WebhookDispatcher};
 
@@ -188,7 +188,7 @@ impl From<BlockStage> for StagingStorage {
     }
 }
 
-pub type TinyCloud = SpaceDatabase<DatabaseConnection, BlockStores, StaticSecret>;
+pub type TinyCloud = SpaceDatabase<RecoveringConnection, BlockStores, StaticSecret>;
 
 /// Size of the SQLite connection pool used for the capability database.
 const SQLITE_MAX_CONNECTIONS: u32 = 16;
@@ -433,7 +433,7 @@ pub async fn app_with_control(
             std::time::Duration::from_secs(1),
         );
 
-    let database_connection = Database::connect(connect_opts).await?;
+    let database_connection = RecoveringConnection::new(Database::connect(connect_opts).await?);
     // SQL/DuckDB artifact-size mirror folded into `store_size`. Empty here;
     // wired into SpaceDatabase, then seeded
     // from DB truth AFTER `TinyCloud::new` runs migrations (see below).
@@ -841,7 +841,7 @@ mod production_route_tests {
 /// the one place the concrete pool is reachable, so it hosts the standalone
 /// pool-acquire probe (bounded by a short timeout so it never delays shutdown).
 async fn sample_db_telemetry(
-    conn: &DatabaseConnection,
+    conn: &RecoveringConnection,
     tinycloud: &TinyCloud,
     last_read_audit: &mut (u64, u64),
 ) {
@@ -861,10 +861,11 @@ async fn sample_db_telemetry(
             );
         }};
     }
-    match conn.get_database_backend() {
-        DatabaseBackend::Postgres => sample_pool!(conn.get_postgres_connection_pool()),
-        DatabaseBackend::Sqlite => sample_pool!(conn.get_sqlite_connection_pool()),
-        DatabaseBackend::MySql => sample_pool!(conn.get_mysql_connection_pool()),
+    let pool = conn.sea_orm_connection();
+    match pool.get_database_backend() {
+        DatabaseBackend::Postgres => sample_pool!(pool.get_postgres_connection_pool()),
+        DatabaseBackend::Sqlite => sample_pool!(pool.get_sqlite_connection_pool()),
+        DatabaseBackend::MySql => sample_pool!(pool.get_mysql_connection_pool()),
     }
 
     let (records, batches) = tinycloud.read_audit_commit_stats();
@@ -878,7 +879,10 @@ async fn sample_db_telemetry(
 /// Run one retention sweep: prune terminal hook deliveries and expired signed
 /// KV tickets older than the configured windows, in bounded batches. Errors are
 /// logged (not fatal) — this is a periodic background maintenance pass.
-async fn run_retention_sweep(conn: &DatabaseConnection, retention: &config::RetentionConfig) {
+async fn run_retention_sweep<C: tinycloud_core::sea_orm::ConnectionTrait>(
+    conn: &C,
+    retention: &config::RetentionConfig,
+) {
     use time::format_description::well_known::Rfc3339;
 
     let now = time::OffsetDateTime::now_utc();
@@ -1030,7 +1034,9 @@ async fn ensure_local_dirs(storage: &config::Storage) -> Result<()> {
 #[cfg(test)]
 mod sqlite_tuning_tests {
     use super::*;
-    use tinycloud_core::sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+    use tinycloud_core::sea_orm::{
+        ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement,
+    };
 
     async fn pragma(db: &DatabaseConnection, name: &str) -> String {
         let row = db
@@ -1089,7 +1095,7 @@ mod sqlite_tuning_tests {
             .await
             .unwrap();
         let node = TinyCloud::new(
-            connection,
+            connection.into(),
             Either::B(blocks),
             tinycloud_core::keys::StaticSecret::new(vec![7u8; 64]).unwrap(),
         )
