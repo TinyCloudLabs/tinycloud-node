@@ -254,8 +254,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: CARGO_FEATURES=${{ steps.build_features.outputs.cargo_features }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=node
+          cache-to: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) && 'type=gha,mode=max,scope=node' || '' }}
 
   build-dstack:
     runs-on: ubuntu-latest
@@ -325,7 +325,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: CARGO_FEATURES=${{ steps.build_features.outputs.cargo_features }}
           cache-from: type=gha,scope=dstack
-          cache-to: type=gha,mode=max,scope=dstack
+          cache-to: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) && 'type=gha,mode=max,scope=dstack' || '' }}
 
   build-ingress:
     name: Build dstack ingress image
@@ -373,6 +373,8 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=ingress
+          cache-to: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) && 'type=gha,mode=max,scope=ingress' || '' }}
       - name: Record ingress image digest
         if: steps.build.outputs.digest != ''
         env:
