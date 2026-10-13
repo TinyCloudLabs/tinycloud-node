@@ -622,8 +622,10 @@ fn tokens(sql: &str) -> Option<Vec<Token<'_>>> {
 ///
 /// - the text is ASCII, with no `;` (anywhere, even in a literal), no
 ///   comment (`--`, `/*`), no string literal or dollar quote (`'`, `$` not
-///   followed by a digit), no `&` (`U&"..."` identifiers), no `\` and no
-///   `::` cast, which could run a user-defined cast;
+///   followed by a digit), no `&` (`U&"..."` identifiers), no `\`, no
+///   `::` cast (which could run a user-defined cast), and no backtick or
+///   square bracket (MySQL and SQLite quoted identifiers, which the
+///   tokenizer does not model, so a quoted call there could slip through);
 /// - the first token is `SELECT` or `WITH`;
 /// - no bare `INSERT`, `UPDATE` (also `FOR UPDATE`), `DELETE`, `MERGE` or
 ///   `INTO` (`SELECT ... INTO` creates a table);
@@ -633,8 +635,17 @@ fn tokens(sql: &str) -> Option<Vec<Token<'_>>> {
 ///   list). A quoted name anywhere else before `(` may be a call.
 ///   Whitespace between a name and `(` changes nothing.
 pub fn is_read_only_statement(sql: &str) -> bool {
+    // Writes are most statements; reject them before scanning or allocating.
+    let first_word = sql
+        .trim_start()
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .next()
+        .unwrap_or("");
+    if !(first_word.eq_ignore_ascii_case("SELECT") || first_word.eq_ignore_ascii_case("WITH")) {
+        return false;
+    }
     if !sql.is_ascii()
-        || sql.contains([';', '\'', '&', '\\'])
+        || sql.contains([';', '\'', '&', '\\', '`', '[', ']'])
         || sql.contains("--")
         || sql.contains("/*")
         || sql.contains("::")
@@ -920,6 +931,11 @@ mod tests {
             "SELECT U&\"nextval\"($1)",
             "SELECT u&\"\\006Eextval\"($1)",
             "SELECT 1, \"f\"($1) AS x",
+            // MySQL/SQLite quoted identifiers, plain and qualified.
+            "SELECT `my_write_function`(1)",
+            "SELECT [my_write_function](1)",
+            "SELECT `evil`.`count`(*) FROM t",
+            "SELECT [evil].count(*) FROM t",
             // Comments, which must never be stripped before classifying.
             "SELECT nextval/*x*/($1)",
             "SELECT 1 -- harmless",
