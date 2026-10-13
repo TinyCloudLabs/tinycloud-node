@@ -931,14 +931,20 @@ pub(crate) mod tests {
             }
         }
 
-        fn invocation(&self, ops: &[Op<'_>]) -> Invocation {
+        /// Another space of this owner: it is the root authority there too.
+        fn space_named(&self, name: &str) -> SpaceId {
+            SpaceId::new(self.did.parse::<DIDBuf>().unwrap(), name.parse().unwrap())
+        }
+
+        /// One owner-root invocation of `ops`, each in the space it names.
+        fn invocation_in(&self, ops: &[(&SpaceId, &Op<'_>)]) -> Invocation {
             let mut caps = Capabilities::new();
-            for op in ops {
+            for (space, op) in ops {
                 let (key, ability) = match op {
                     Op::Put(key, _) | Op::PutMeta(key, _, _) => (key, "tinycloud.kv/put"),
                     Op::Del(key) => (key, "tinycloud.kv/del"),
                 };
-                let resource = self.space.clone().to_resource(
+                let resource = (*space).clone().to_resource(
                     "kv".parse::<Service>().unwrap(),
                     Some(key.parse().unwrap()),
                     None,
@@ -986,8 +992,12 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn host(db: &TestDb, owner: &Owner) {
+        host_space(db, &owner.space).await;
+    }
+
+    async fn host_space(db: &TestDb, space: &SpaceId) {
         space::ActiveModel {
-            id: Set(SpaceIdWrap(owner.space.clone())),
+            id: Set(SpaceIdWrap(space.clone())),
         }
         .insert(db.connection())
         .await
@@ -1003,8 +1013,20 @@ pub(crate) mod tests {
         ops: &[Op<'_>],
         options: KvInvokeOptions,
     ) -> Result<Vec<Hash>, String> {
+        let ops = ops.iter().map(|op| (&owner.space, op)).collect::<Vec<_>>();
+        invoke_in(db, owner, &ops, options).await
+    }
+
+    /// `invoke` with each operation in the space it names, all of them
+    /// spaces of `owner`.
+    async fn invoke_in(
+        db: &TestDb,
+        owner: &Owner,
+        ops: &[(&SpaceId, &Op<'_>)],
+        options: KvInvokeOptions,
+    ) -> Result<Vec<Hash>, String> {
         let mut inputs = std::collections::HashMap::new();
-        for op in ops {
+        for (space, op) in ops {
             let (key, value, metadata) = match op {
                 Op::Put(key, value) => (key, value, &[][..]),
                 Op::PutMeta(key, value, metadata) => (key, value, *metadata),
@@ -1019,12 +1041,12 @@ pub(crate) mod tests {
                     .collect(),
             );
             inputs.insert(
-                (owner.space.clone(), key.parse::<Path>().unwrap()),
+                ((*space).clone(), key.parse::<Path>().unwrap()),
                 (metadata, stage),
             );
         }
         let (_, outcomes) = db
-            .invoke_with_options::<MemoryStaging>(owner.invocation(ops), inputs, options)
+            .invoke_with_options::<MemoryStaging>(owner.invocation_in(ops), inputs, options)
             .await
             .map_err(|error| error.to_string())?;
         Ok(outcomes
@@ -1713,6 +1735,131 @@ pub(crate) mod tests {
         (pos.seq, Vec::<u8>::from(pos.epoch), pos.epoch_seq)
     }
 
+    /// TC-951: `space`'s committed history is one chain. The seqs `0..n` each
+    /// name exactly one epoch; the epoch at seq 0 has no parent and the one at
+    /// seq `k` has exactly one, the epoch at seq `k - 1`; and every
+    /// `event_order` row carries its epoch's seq. An epoch's parents are the
+    /// heads its transaction read, so each commit computed its seq after its
+    /// predecessor was visible: seq order is commit order. Two writers that
+    /// read the same head (no shared sequence lock) leave a repeated seq or a
+    /// fork here. Returns `n`.
+    async fn assert_linear_history(
+        conn: &DatabaseConnection,
+        space: &SpaceId,
+        label: &str,
+    ) -> usize {
+        use crate::models::epoch;
+        use crate::relationships::epoch_order;
+        let space = SpaceIdWrap(space.clone());
+        let mut epochs = epoch::Entity::find()
+            .filter(epoch::Column::Space.eq(space.clone()))
+            .all(conn)
+            .await
+            .unwrap();
+        epochs.sort_by_key(|epoch| epoch.seq);
+        assert_eq!(
+            epochs.iter().map(|epoch| epoch.seq).collect::<Vec<_>>(),
+            (0..epochs.len() as i64).collect::<Vec<_>>(),
+            "{label}: every seq must name exactly one epoch"
+        );
+        let mut parents = std::collections::HashMap::<Hash, Vec<Hash>>::new();
+        for edge in epoch_order::Entity::find()
+            .filter(epoch_order::Column::Space.eq(space.clone()))
+            .all(conn)
+            .await
+            .unwrap()
+        {
+            parents.entry(edge.child).or_default().push(edge.parent);
+        }
+        for (seq, epoch) in epochs.iter().enumerate() {
+            let predecessor = seq.checked_sub(1).map(|previous| epochs[previous].id);
+            assert_eq!(
+                parents.remove(&epoch.id).unwrap_or_default(),
+                Vec::from_iter(predecessor),
+                "{label}: the epoch at seq {seq} must follow exactly the one before it"
+            );
+        }
+        assert!(
+            parents.is_empty(),
+            "{label}: an ordering edge names an epoch outside the history"
+        );
+        let seq_of = epochs
+            .iter()
+            .map(|epoch| (epoch.id, epoch.seq))
+            .collect::<std::collections::HashMap<_, _>>();
+        for event in event_order::Entity::find()
+            .filter(event_order::Column::Space.eq(space))
+            .all(conn)
+            .await
+            .unwrap()
+        {
+            assert_eq!(
+                seq_of.get(&event.epoch),
+                Some(&event.seq),
+                "{label}: an event must carry its epoch's seq"
+            );
+        }
+        epochs.len()
+    }
+
+    /// TC-951: no lost update. Every key's `current_kv` row is live and is
+    /// the key's highest-positioned `kv_write`: same invocation, value and
+    /// position. Returns the rows by key.
+    async fn assert_current_kv_is_latest_write(
+        conn: &DatabaseConnection,
+        space: &SpaceId,
+        label: &str,
+    ) -> BTreeMap<String, current_kv::Model> {
+        use crate::models::kv_write;
+        let position =
+            |write: &kv_write::Model| (write.seq, Vec::<u8>::from(write.epoch), write.epoch_seq);
+        let space = SpaceIdWrap(space.clone());
+        let mut latest = BTreeMap::<String, kv_write::Model>::new();
+        for write in kv_write::Entity::find()
+            .filter(kv_write::Column::Space.eq(space.clone()))
+            .all(conn)
+            .await
+            .unwrap()
+        {
+            let key = write.key.0.to_string();
+            if latest
+                .get(&key)
+                .is_none_or(|seen| position(seen) < position(&write))
+            {
+                latest.insert(key, write);
+            }
+        }
+        let current = current_kv::Entity::find()
+            .filter(current_kv::Column::Space.eq(space))
+            .all(conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.key.0.to_string(), row))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            current.keys().collect::<Vec<_>>(),
+            latest.keys().collect::<Vec<_>>(),
+            "{label}: one current row per written key"
+        );
+        for (key, write) in &latest {
+            let row = &current[key];
+            assert!(!row.deleted, "{label}: {key} must be live");
+            assert_eq!(
+                (row.invocation, row.value, row.seq, row.epoch, row.epoch_seq),
+                (
+                    write.invocation,
+                    write.value,
+                    write.seq,
+                    write.epoch,
+                    write.epoch_seq
+                ),
+                "{label}: {key} must hold its newest write"
+            );
+        }
+        current
+    }
+
     async fn print_postgres_plan(conn: &DatabaseConnection, label: &str, statement: Statement) {
         conn.execute(Statement::from_string(
             DbBackend::Postgres,
@@ -1952,49 +2099,67 @@ pub(crate) mod tests {
     }
 
     /// Conditional writes run under READ COMMITTED behind the sequence lock.
-    /// Concurrent creates (and concurrent replaces against one etag) on one
-    /// key, across two node instances, admit exactly one winner; every loser
-    /// is a precondition failure, never a false success.
+    /// 32 contenders on four node instances race one key, round after round:
+    /// a create (if-none-match), ten replaces in which half the contenders
+    /// present the current etag and half the one it replaced, a re-create
+    /// over a tombstone, and a create over a live value. Each round admits
+    /// exactly one winner, always a contender whose precondition held when
+    /// the round began (none in the last round); every loser is a
+    /// precondition failure, never a false success, and leaves no write and
+    /// no epoch behind (TC-951).
     #[tokio::test]
     async fn postgres_conditional_put_is_atomic_under_concurrency() {
-        let Some(fixture) =
-            PostgresFixture::new("postgres_conditional_put_is_atomic_under_concurrency", 2).await
+        use crate::models::kv_write;
+        const INSTANCES: usize = 4;
+        const CONTENDERS: usize = 32;
+        let Some(fixture) = PostgresFixture::new(
+            "postgres_conditional_put_is_atomic_under_concurrency",
+            INSTANCES,
+        )
+        .await
         else {
             return;
         };
         let owner = std::sync::Arc::new(Owner::generate());
         host(&fixture.dbs[0], &owner).await;
+        let conn = fixture.dbs[0].connection();
         let key: Path = "notes/x".parse().unwrap();
 
-        let race = |precondition: KvPrecondition, round: &'static str| {
-            let tasks = (0..16)
-                .map(|contender| {
-                    let db = fixture.dbs[contender % 2].clone();
+        // Contender `i` presents `preconditions[i]`. Returns the winners as
+        // `(contender, etag)`.
+        let race = |round: String, preconditions: Vec<KvPrecondition>| {
+            let tasks = preconditions
+                .into_iter()
+                .enumerate()
+                .map(|(contender, precondition)| {
+                    let db = fixture.dbs[contender % INSTANCES].clone();
                     let owner = owner.clone();
                     let key = key.clone();
+                    let value = format!("{round}-{contender}");
                     tokio::spawn(async move {
                         let mut options = KvInvokeOptions::default();
                         options
                             .preconditions
                             .insert((owner.space.clone(), key), precondition);
-                        let value = format!("{round}-{contender}");
-                        invoke(
+                        let outcome = invoke(
                             &db,
                             &owner,
                             &[Op::Put("notes/x", value.as_bytes())],
                             options,
                         )
-                        .await
-                        .map(|hashes| hashes[0])
+                        .await;
+                        (contender, outcome)
                     })
                 })
                 .collect::<Vec<_>>();
             async move {
+                // Every contender finishes before any verdict, so a failed
+                // assertion never leaves a transaction in flight.
                 let mut winners = Vec::new();
-                for task in tasks {
-                    match task.await.unwrap() {
-                        Ok(hash) => winners.push(hash),
-                        Err(error) => assert!(
+                for outcome in futures::future::join_all(tasks).await {
+                    match outcome.unwrap() {
+                        (contender, Ok(written)) => winners.push((contender, written[0])),
+                        (_, Err(error)) => assert!(
                             error.contains("precondition"),
                             "{round}: a loser must fail its precondition, got {error}"
                         ),
@@ -2003,29 +2168,370 @@ pub(crate) mod tests {
                 winners
             }
         };
+        let if_match = |etag: Hash| KvPrecondition::Matches(etag.as_ref().try_into().unwrap());
+        let who = |winners: &[(usize, Hash)]| {
+            winners
+                .iter()
+                .map(|(contender, _)| *contender)
+                .collect::<Vec<_>>()
+        };
 
         let exercise = async {
-            let created = race(KvPrecondition::DoesNotExist, "create").await;
-            assert_eq!(created.len(), 1, "exactly one create wins: {created:?}");
-            let replaced = race(
-                KvPrecondition::Matches(created[0].as_ref().try_into().unwrap()),
-                "replace",
-            )
-            .await;
-            assert_eq!(replaced.len(), 1, "exactly one replace wins: {replaced:?}");
+            let create = || vec![KvPrecondition::DoesNotExist; CONTENDERS];
+            let created = race("create".into(), create()).await;
+            assert_eq!(
+                created.len(),
+                1,
+                "exactly one create wins: {:?}",
+                who(&created)
+            );
+            let mut committed = vec![created[0].1];
+            // Before the first replace no etag has been replaced yet: present
+            // one that was never written.
+            let mut stale = crate::hash::hash(b"never written");
+            for round in 0..10 {
+                let current = committed[committed.len() - 1];
+                let preconditions = (0..CONTENDERS)
+                    .map(|contender| if_match(if contender % 2 == 0 { current } else { stale }))
+                    .collect();
+                let replaced = race(format!("replace{round}"), preconditions).await;
+                assert_eq!(
+                    replaced.len(),
+                    1,
+                    "replace {round}: exactly one wins: {:?}",
+                    who(&replaced)
+                );
+                assert_eq!(
+                    replaced[0].0 % 2,
+                    0,
+                    "replace {round}: a stale etag must never win"
+                );
+                stale = current;
+                committed.push(replaced[0].1);
+            }
+            run(&fixture.dbs[1], &owner, &[Op::Del("notes/x")]).await;
+            let recreated = race("recreate".into(), create()).await;
+            assert_eq!(
+                recreated.len(),
+                1,
+                "exactly one create over the tombstone wins: {:?}",
+                who(&recreated)
+            );
+            committed.push(recreated[0].1);
+            let over_live = race("create-over-live".into(), create()).await;
+            assert!(
+                over_live.is_empty(),
+                "a create over a live value never wins: {:?}",
+                who(&over_live)
+            );
+
             let row = current_kv::Entity::find_by_id((
                 SpaceIdWrap(owner.space.clone()),
                 crate::types::Path(key.clone()),
             ))
-            .one(fixture.dbs[0].connection())
+            .one(conn)
             .await
             .unwrap()
             .unwrap();
-            assert_eq!(row.value, replaced[0]);
+            assert!(!row.deleted);
+            assert_eq!(row.value, committed[committed.len() - 1]);
+            // Only winners wrote, in round order; the delete is the one other
+            // commit.
+            let mut writes = kv_write::Entity::find()
+                .filter(kv_write::Column::Space.eq(SpaceIdWrap(owner.space.clone())))
+                .all(conn)
+                .await
+                .unwrap();
+            writes.sort_by_key(|write| write.seq);
+            assert_eq!(
+                writes.iter().map(|write| write.value).collect::<Vec<_>>(),
+                committed
+            );
+            assert_eq!(
+                assert_linear_history(conn, &owner.space, "conditional").await,
+                committed.len() + 1
+            );
         };
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(120), exercise).await;
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(300), exercise).await;
         drop(fixture);
         outcome.expect("conditional put races finished");
+    }
+
+    /// TC-951: 32 writers put distinct values to one key of one space at
+    /// once, for 10 rounds, spread over four node instances (each with its
+    /// own 15-connection pool and in-process locks, so only the
+    /// database-side sequence lock orders them). Every put succeeds and
+    /// commits once, at its own seq of one linear history; a put that
+    /// returned before another began has the lower seq; and after every round
+    /// `current_kv` holds the highest-seq write, one of that round's (no lost
+    /// update).
+    #[tokio::test]
+    async fn postgres_same_key_puts_commit_in_one_seq_ordered_history() {
+        use crate::models::kv_write;
+        const INSTANCES: usize = 4;
+        const WRITERS: usize = 32;
+        const ROUNDS: usize = 10;
+        const KEY: &str = "notes/hot";
+        let Some(fixture) = PostgresFixture::new(
+            "postgres_same_key_puts_commit_in_one_seq_ordered_history",
+            INSTANCES,
+        )
+        .await
+        else {
+            return;
+        };
+        let owner = std::sync::Arc::new(Owner::generate());
+        host(&fixture.dbs[0], &owner).await;
+        let conn = fixture.dbs[0].connection();
+
+        let exercise = async {
+            // A logical clock: each put ticks it before it starts and after it
+            // returns, which orders puts in real time without timing them.
+            let clock = std::sync::Arc::new(AtomicU64::new(0));
+            // `(etag, round, started, returned)` per put.
+            let mut puts = Vec::new();
+            for round in 0..ROUNDS {
+                let tasks = (0..WRITERS)
+                    .map(|writer| {
+                        let db = fixture.dbs[writer % INSTANCES].clone();
+                        let (owner, clock) = (owner.clone(), clock.clone());
+                        tokio::spawn(async move {
+                            let value = format!("round{round}-writer{writer}");
+                            let started = clock.fetch_add(1, Ordering::SeqCst);
+                            let outcome = invoke(
+                                &db,
+                                &owner,
+                                &[Op::Put(KEY, value.as_bytes())],
+                                KvInvokeOptions::default(),
+                            )
+                            .await;
+                            let returned = clock.fetch_add(1, Ordering::SeqCst);
+                            (value, outcome, started, returned)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                // Every put of the round finishes before any verdict, so a
+                // failed assertion never leaves a transaction in flight.
+                for outcome in futures::future::join_all(tasks).await {
+                    let (value, outcome, started, returned) = outcome.unwrap();
+                    let etag = crate::hash::hash(value.as_bytes());
+                    match outcome {
+                        Ok(written) => assert_eq!(written, vec![etag], "{value}"),
+                        Err(error) => panic!("{value}: an unconditional put must succeed: {error}"),
+                    }
+                    puts.push((etag, round, started, returned));
+                }
+                let current =
+                    assert_current_kv_is_latest_write(conn, &owner.space, "same key").await;
+                assert!(
+                    puts.iter()
+                        .any(|&(etag, of, _, _)| of == round && etag == current[KEY].value),
+                    "round {round}: the newest write must be one of this round's"
+                );
+            }
+
+            assert_eq!(
+                assert_linear_history(conn, &owner.space, "same key").await,
+                WRITERS * ROUNDS,
+                "one commit per put"
+            );
+            let writes = kv_write::Entity::find()
+                .filter(kv_write::Column::Space.eq(SpaceIdWrap(owner.space.clone())))
+                .all(conn)
+                .await
+                .unwrap();
+            assert_eq!(writes.len(), WRITERS * ROUNDS, "one kv_write per put");
+            let seq_of = writes
+                .into_iter()
+                .map(|write| (write.value, write.seq))
+                .collect::<std::collections::HashMap<_, _>>();
+            assert_eq!(seq_of.len(), WRITERS * ROUNDS);
+            for &(before, _, _, returned) in &puts {
+                for &(after, _, started, _) in &puts {
+                    if returned < started {
+                        assert!(
+                            seq_of[&before] < seq_of[&after],
+                            "a put that returned before another began must have the lower seq"
+                        );
+                    }
+                }
+            }
+        };
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(300), exercise).await;
+        drop(fixture);
+        outcome.expect("same-key writers finished");
+    }
+
+    /// TC-951: same-key, other-key and multi-space puts at once, for 10
+    /// rounds across four node instances. Three spaces of one owner; each
+    /// round 32 writers put a hot key in one space, their own key in one
+    /// space, the hot key of each pair of spaces in one invocation, or their
+    /// own key in all three. A multi-space put takes its spaces' sequence
+    /// locks in one global order and holds them to commit, so: no put
+    /// deadlocks or fails; every space keeps one linear history with one
+    /// commit per put that touched it; a multi-space put lands in each of its
+    /// spaces as one invocation; two multi-space puts are ordered the same
+    /// way in every space they share; and every key holds its newest write.
+    #[tokio::test]
+    async fn postgres_mixed_and_multi_space_puts_stay_ordered() {
+        use crate::models::kv_write;
+        const INSTANCES: usize = 4;
+        const WRITERS: usize = 32;
+        const ROUNDS: usize = 10;
+        // Per role (`writer % 8`): the spaces it puts to in one invocation,
+        // and its key (`None`: the writer's own key).
+        const ROLES: [(&[usize], Option<&str>); 8] = [
+            (&[0], Some("shared/hot")),
+            (&[1], Some("shared/hot")),
+            (&[0], None),
+            (&[2], None),
+            (&[0, 1], Some("shared/hot")),
+            (&[1, 2], Some("shared/hot")),
+            (&[2, 0], Some("shared/hot")),
+            (&[0, 1, 2], None),
+        ];
+        let Some(fixture) = PostgresFixture::new(
+            "postgres_mixed_and_multi_space_puts_stay_ordered",
+            INSTANCES,
+        )
+        .await
+        else {
+            return;
+        };
+        let owner = std::sync::Arc::new(Owner::generate());
+        let spaces = std::sync::Arc::new([
+            owner.space.clone(),
+            owner.space_named("photos"),
+            owner.space_named("music"),
+        ]);
+        for space in spaces.iter() {
+            host_space(&fixture.dbs[0], space).await;
+        }
+        let conn = fixture.dbs[0].connection();
+
+        let exercise = async {
+            // Per put: `(space index, etag)` of each value it wrote.
+            let mut puts = Vec::<Vec<(usize, Hash)>>::new();
+            for round in 0..ROUNDS {
+                let tasks = (0..WRITERS)
+                    .map(|writer| {
+                        let db = fixture.dbs[writer % INSTANCES].clone();
+                        let (owner, spaces) = (owner.clone(), spaces.clone());
+                        tokio::spawn(async move {
+                            let (targets, key) = ROLES[writer % ROLES.len()];
+                            let key =
+                                key.map_or_else(|| format!("own/writer{writer}"), str::to_owned);
+                            let values = targets
+                                .iter()
+                                .map(|&space| {
+                                    (space, format!("round{round}-writer{writer}-space{space}"))
+                                })
+                                .collect::<Vec<_>>();
+                            let ops = values
+                                .iter()
+                                .map(|(_, value)| Op::Put(&key, value.as_bytes()))
+                                .collect::<Vec<_>>();
+                            let ops = values
+                                .iter()
+                                .zip(&ops)
+                                .map(|((space, _), op)| (&spaces[*space], op))
+                                .collect::<Vec<_>>();
+                            let outcome =
+                                invoke_in(&db, &owner, &ops, KvInvokeOptions::default()).await;
+                            let written = values
+                                .iter()
+                                .map(|(space, value)| (*space, crate::hash::hash(value.as_bytes())))
+                                .collect::<Vec<_>>();
+                            (format!("round {round} writer {writer}"), written, outcome)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                // Every put of the round finishes before any verdict.
+                for outcome in futures::future::join_all(tasks).await {
+                    let (label, written, outcome) = outcome.unwrap();
+                    let etags = outcome
+                        .unwrap_or_else(|error| panic!("{label}: every put must succeed: {error}"));
+                    assert_eq!(etags.len(), written.len(), "{label}");
+                    assert!(
+                        written.iter().all(|(_, etag)| etags.contains(etag)),
+                        "{label}"
+                    );
+                    puts.push(written);
+                }
+            }
+
+            // etag -> (space index, invocation, seq)
+            let mut write_of = std::collections::HashMap::new();
+            for (index, space) in spaces.iter().enumerate() {
+                let label = format!("space {index}");
+                let touching = puts
+                    .iter()
+                    .filter(|put| put.iter().any(|&(of, _)| of == index))
+                    .count();
+                assert_eq!(
+                    assert_linear_history(conn, space, &label).await,
+                    touching,
+                    "{label}: one commit per put that touched it"
+                );
+                assert_current_kv_is_latest_write(conn, space, &label).await;
+                for write in kv_write::Entity::find()
+                    .filter(kv_write::Column::Space.eq(SpaceIdWrap(space.clone())))
+                    .all(conn)
+                    .await
+                    .unwrap()
+                {
+                    let seen = write_of.insert(write.value, (index, write.invocation, write.seq));
+                    assert!(seen.is_none(), "{label}: every value is written once");
+                }
+            }
+            assert_eq!(
+                write_of.len(),
+                puts.iter().map(Vec::len).sum::<usize>(),
+                "one kv_write per value put"
+            );
+            for put in &puts {
+                let invocations = put
+                    .iter()
+                    .map(|(space, etag)| {
+                        let (landed, invocation, _) = write_of[etag];
+                        assert_eq!(landed, *space, "a value lands in the space it was put to");
+                        invocation
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    invocations.windows(2).all(|pair| pair[0] == pair[1]),
+                    "a multi-space put is one invocation in all its spaces"
+                );
+            }
+            // Two multi-space puts each held both of their shared spaces'
+            // locks to commit, so one preceded the other in both.
+            let multi = puts
+                .iter()
+                .filter(|put| put.len() > 1)
+                .map(|put| {
+                    put.iter()
+                        .map(|(space, etag)| (*space, write_of[etag].2))
+                        .collect::<BTreeMap<_, _>>()
+                })
+                .collect::<Vec<_>>();
+            for (index, first) in multi.iter().enumerate() {
+                for second in &multi[index + 1..] {
+                    let orders = first
+                        .iter()
+                        .filter_map(|(space, seq)| second.get(space).map(|other| seq.cmp(other)))
+                        .collect::<Vec<_>>();
+                    assert!(
+                        orders.windows(2).all(|pair| pair[0] == pair[1])
+                            && !orders.contains(&std::cmp::Ordering::Equal),
+                        "multi-space puts must be ordered alike in every shared space: \
+                         {first:?} vs {second:?}"
+                    );
+                }
+            }
+        };
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(300), exercise).await;
+        drop(fixture);
+        outcome.expect("mixed writers finished");
     }
 
     /// Feed paging compares and orders keys in byte order inside SQL, so a
