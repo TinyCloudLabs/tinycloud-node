@@ -591,14 +591,14 @@ jobs:
               echo "node.tinycloud.xyz routes through the ingress (/evidences/ 200)."
               exit 0
             fi
+            if [ "${STATUS}" = "404" ]; then
+              echo "::error::TC-1012: node.tinycloud.xyz still bypasses the ingress (/evidences/ HTTP 404); deploy the tinycloud-dev worker repoint (samgbafa/tinycloud-dev#83) first"
+              exit 1
+            fi
             echo "attempt ${attempt}/3: node.tinycloud.xyz/evidences/ returned HTTP ${STATUS}"
             [ "${attempt}" = 3 ] || sleep 5
           done
-          if [ "${STATUS}" = "404" ]; then
-            echo "::error::TC-1012: node.tinycloud.xyz still bypasses the ingress (/evidences/ HTTP 404); deploy the tinycloud-dev worker repoint (samgbafa/tinycloud-dev#83) first"
-            exit 1
-          fi
-          echo "::warning::TC-1012: node.tinycloud.xyz/evidences/ returned HTTP ${STATUS} (not the raw-port 404); proceeding with deploy"
+          echo "::warning::TC-1012: node.tinycloud.xyz/evidences/ returned HTTP ${STATUS} (no 200, no raw-port 404 in 3 attempts); proceeding with deploy"
 
       - name: Deploy to Phala Cloud
         env:
