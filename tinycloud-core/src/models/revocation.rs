@@ -164,10 +164,11 @@ pub(crate) async fn effective_rows<C: ConnectionTrait>(
         .collect()
 }
 
-pub(crate) async fn is_revoked<C: ConnectionTrait>(
-    db: &C,
-    delegation_id: &Hash,
-) -> Result<bool, DbErr> {
+/// Whether this delegation or any persisted equivalent CID has been revoked.
+///
+/// Use the caller's transaction for an admission-time recheck; signed targets
+/// and stored delegation IDs are never rewritten.
+pub async fn is_revoked<C: ConnectionTrait>(db: &C, delegation_id: &Hash) -> Result<bool, DbErr> {
     Ok(Entity::find()
         .filter(target_condition(Expr::value(*delegation_id)))
         .one(db)

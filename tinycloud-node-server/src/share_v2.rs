@@ -1402,13 +1402,7 @@ async fn revocation_in_ancestry<C: ConnectionTrait>(
         if visited.len() > MAX_GRAPH_NODES {
             return Err(());
         }
-        if revocation::Entity::find()
-            .filter(revocation::Column::Revoked.eq(current))
-            .count(db)
-            .await
-            .map_err(|_| ())?
-            > 0
-        {
+        if revocation::is_revoked(db, &current).await.map_err(|_| ())? {
             return Ok(true);
         }
         let parents = parent_delegations::Entity::find()
@@ -2023,12 +2017,7 @@ async fn cid_revoked<C: ConnectionTrait>(db: &C, cid: &str) -> Result<bool, ()> 
         .parse::<tinycloud_auth::ipld_core::cid::Cid>()
         .map_err(|_| ())?
         .into();
-    Ok(revocation::Entity::find()
-        .filter(revocation::Column::Revoked.eq(id))
-        .count(db)
-        .await
-        .map_err(|_| ())?
-        > 0)
+    revocation::is_revoked(db, &id).await.map_err(|_| ())
 }
 
 fn typed_scope(
@@ -3419,6 +3408,9 @@ mod tests {
     use super::*;
     use rocket::local::asynchronous::Client;
     use time::Duration;
+
+    #[path = "alias_revocation_tests.rs"]
+    mod alias_revocation_tests;
 
     #[test]
     fn policy_domain_matches_the_sdk_wire_contract() {

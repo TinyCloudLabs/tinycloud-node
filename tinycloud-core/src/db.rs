@@ -1316,6 +1316,25 @@ where
         Ok(self.acquire_exclusive_chain_guards_for_keys(keys).await)
     }
 
+    /// Hold shared guards for the canonical ancestor identities of `roots`.
+    ///
+    /// These coordinate admission with delegation/revocation writers using
+    /// this database and its clones. Acquire before space-sequence guards or
+    /// SQL transactions, and retain through commit or rollback. Callers must
+    /// still recheck effective revocation inside their admission transaction.
+    pub async fn guard_delegation_chains(
+        &self,
+        roots: &[Hash],
+    ) -> Result<Vec<SharedChainGuard>, DbErr> {
+        let keys = crate::auth_graph::load_chain_lock_ids(&self.conn, roots)
+            .await
+            .map_err(|error| match error {
+                revocation::ChainTraversalError::Db(error) => error,
+                error => DbErr::Custom(error.to_string()),
+            })?;
+        Ok(self.acquire_shared_chain_guards_for_keys(keys).await)
+    }
+
     /// Resolve `keys` to their per-delegation locks in a stable global order.
     ///
     /// Sorting and deduplicating here is the deadlock discipline: every

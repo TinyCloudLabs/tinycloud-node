@@ -434,6 +434,16 @@ authorization without an extra request round trip. New delegations and their
 alias commit together; PostgreSQL uses a dependent insert CTE to preserve the
 existing registration round-trip budget.
 
+Policy v3 account-owner credential admission, its locked transactional recheck,
+and legacy Share v2 ancestry/root checks use the same effective revocation
+predicate, not an exact stored-ID comparison. Account-owner authentication takes
+shared canonical ancestor guards with `TinyCloud::guard_delegation_chains`
+before per-space guards or the SQL transaction and retains them in the proof
+through commit or rollback. These guards coordinate the database instance and
+its clones through their shared graph-lock registry; they are not distributed
+locks. The transaction still rechecks effective revocation, including a sibling
+revocation committed by a separately constructed database instance.
+
 Legacy capability list/chain responses advertise the stored CID and return
 the exact stored raw header, not a re-encoding of the decoded CACAO. Their
 parent CID fields retain the signed child references. Existing legacy list
