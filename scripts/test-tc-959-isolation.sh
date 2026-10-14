@@ -89,6 +89,8 @@ PORT_HOLDER_MODE=container
 ss() {
   if [[ "$3" == "sport = :18000" && "$PORT_HOLDER_MODE" == container ]]; then
     printf '%s\n' 'LISTEN 0 4096 127.0.0.1:18000 0.0.0.0:* users:(("docker-proxy",pid=123,fd=4))'
+  elif [[ "$3" == "sport = :12201" && "$PORT_HOLDER_MODE" == udp ]]; then
+    printf '%s\n' 'UNCONN 0 0 0.0.0.0:12201 0.0.0.0:* users:(("docker-proxy",pid=456,fd=7))'
   fi
 }
 docker_cmd() {
@@ -96,10 +98,17 @@ docker_cmd() {
     printf '%s\n' 'tc959-existing-compose'
     return 0
   fi
+  if [[ "$1" == ps && "$3" == publish=12201/udp ]]; then
+    printf '%s\n' 'tc959-udp-owner'
+    return 0
+  fi
   return 1
 }
 port_error=$(check_host_ports_free 2>&1) && fail "busy host port passed preflight"
 [[ "$port_error" == *"127.0.0.1:18000"* && "$port_error" == *"tc959-existing-compose"* ]] || fail "port preflight omitted listener owner: $port_error"
+PORT_HOLDER_MODE=udp
+port_error=$(check_host_ports_free 2>&1) && fail "busy host UDP port passed preflight"
+[[ "$port_error" == *"127.0.0.1:12201/udp"* && "$port_error" == *"tc959-udp-owner"* ]] || fail "UDP port preflight omitted listener owner: $port_error"
 
 # Container-scoped crash proofs use an exact container ID and never host PIDs.
 VECTOR_ID=0123456789abcdef-vector

@@ -34,6 +34,12 @@ docker_cmd() {
     record "DRY-RUN docker $*"
     return 0
   fi
+  if [[ "${1:-}" == timeout ]]; then
+    local seconds=$2
+    shift 2
+    timeout "$seconds" docker "$@"
+    return
+  fi
   command docker "$@"
 }
 compose_cmd() {
@@ -61,12 +67,17 @@ memory_sampler() {
 }
 
 cleanup() {
-  local status=$?
+  local status=$? probe_id
+  local -a probe_ids=()
   if [[ -n "$SAMPLER_PID" ]]; then
     rm -f "$SAMPLER_STOP"
     wait "$SAMPLER_PID" || true
   fi
   if [[ "$DRY_RUN" != 1 && "$STARTED" == 1 ]]; then
+    mapfile -t probe_ids < <(docker_cmd ps -aq --filter "label=com.docker.compose.project=$PROJECT" --filter "label=tc959.probe=true" 2>/dev/null || true)
+    for probe_id in "${probe_ids[@]}"; do
+      [[ -n "$probe_id" ]] && docker_cmd rm -f "$probe_id" >/dev/null 2>&1 || true
+    done
     compose_cmd down --remove-orphans --volumes >/dev/null 2>&1 || true
   fi
   rm -rf "$WORK"
@@ -180,7 +191,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
   dstack-ingress:
-    image: alpine:3.21
+    image: alpine:3.21@sha256:ce64758a109eb420d874a118f87920e625e12d3634e03b4a5573fd9f6e5d3507
     environment: !override {}
     command:
       - /bin/sh
@@ -333,6 +344,7 @@ if [[ "$DRY_RUN" == 1 ]]; then
 fi
 
 require docker
+require timeout
 require curl
 require ip
 require ss
@@ -448,7 +460,7 @@ INGRESS_ID=$(compose_cmd ps -q dstack-ingress)
 
 send_from_container() {
   local network=$1 target=$2
-  docker_cmd run --rm --network "$network" --mount "type=bind,src=$SENDER,dst=/sender.mjs,readonly" node:20-alpine node /sender.mjs "$target" 12201 "$payload"
+  docker_cmd timeout 60 run --rm --label "com.docker.compose.project=$PROJECT" --label "tc959.probe=true" --network "$network" --mount "type=bind,src=$SENDER,dst=/sender.mjs,readonly" node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 node /sender.mjs "$target" 12201 "$payload"
 }
 send_probe() {
   local sender=$1 network=$2 target=$3

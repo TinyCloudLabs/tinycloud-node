@@ -8,6 +8,14 @@ check_host_ports_free() {
     [[ -z "$containers" ]] || owner="$containers; $listeners"
     fail "host port 127.0.0.1:$port is already in use: $owner"
   done
+
+  listeners=$(ss -H -lunp 'sport = :12201') || fail "could not inspect host UDP port 127.0.0.1:12201"
+  if [[ -n "$listeners" ]]; then
+    containers=$(docker_cmd ps --filter "publish=12201/udp" --format '{{.Names}}' 2>/dev/null || true)
+    owner=$listeners
+    [[ -z "$containers" ]] || owner="$containers; $listeners"
+    fail "host port 127.0.0.1:12201/udp is already in use: $owner"
+  fi
 }
 
 started_at_is_newer() {

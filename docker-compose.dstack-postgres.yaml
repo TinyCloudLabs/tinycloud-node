@@ -679,6 +679,10 @@ services:
             auth: { strategy: bearer, token: "SECRET[bs.bs_token]" }
             batch: { max_bytes: 4000000, timeout_secs: 5 }
             buffer: { type: memory, max_events: 1000, when_full: drop_newest }
+    # Production uses unset; exec vector, removing the token from Vector's
+    # process environment only. tini (PID 1, UID 10001) retains the initial
+    # environment; same-UID readers can already read the tmpfs token file.
+    # Docker daemon/API principals can inspect the configured environment.
     entrypoint:
       - /bin/sh
       - -ec

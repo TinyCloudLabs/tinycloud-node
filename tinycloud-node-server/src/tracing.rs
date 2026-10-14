@@ -515,7 +515,7 @@ pub fn tracing_try_init(
         config::LoggingFormat::Text => subscriber.boxed(),
         config::LoggingFormat::Json => subscriber
             .json()
-            .with_writer(CappedJsonMakeWriter(|| std::io::stderr()))
+            .with_writer(CappedJsonMakeWriter(std::io::stderr))
             .boxed(),
     };
     let telemetry = if config.tracing.enabled {
