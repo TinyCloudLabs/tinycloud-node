@@ -195,4 +195,34 @@ expect_crash_failure "RestartCount advanced past expected +1" after-signal
 CURRENT_RESTARTS=5
 CURRENT_STARTED=$SNAPSHOT_STARTED
 expect_crash_failure "StartedAt did not advance" after-signal
+SNAPSHOT_STARTED=2026-10-14T10:00:00.11Z
+CURRENT_STARTED=2026-10-14T10:00:00.1Z
+expect_crash_failure "StartedAt did not advance" after-signal
+
+assert_crash_recovered() {
+  SECONDS=0
+  SIGNALS=0
+  RECOVERED_LINE_COUNT=""
+  crash_vector 17
+  assert_eq "$SIGNALS" 1
+  assert_eq "$RECOVERED_LINE_COUNT" 17
+}
+SNAPSHOT_STARTED=2026-10-14T10:00:00.1Z
+CURRENT_STARTED=2026-10-14T10:00:00.11Z
+assert_crash_recovered
+SNAPSHOT_STARTED=2026-10-14T10:00:00Z
+CURRENT_STARTED=2026-10-14T10:00:00Z
+expect_crash_failure "StartedAt did not advance" after-signal
+SNAPSHOT_STARTED=2026-10-14T10:00:00Z
+CURRENT_STARTED=2026-10-14T10:00:00.000000001Z
+assert_crash_recovered
+SNAPSHOT_STARTED=2026-10-14T10:00:00.123456788Z
+CURRENT_STARTED=2026-10-14T10:00:00.123456789Z
+assert_crash_recovered
+SNAPSHOT_STARTED=2026-10-14T10:00:00Z
+CURRENT_STARTED=0001-01-01T00:00:00Z
+expect_crash_failure "StartedAt did not advance" after-signal
+SNAPSHOT_STARTED=2026-10-14T10:00:00.999999999+01:30
+CURRENT_STARTED=2026-10-14T08:30:01Z
+assert_crash_recovered
 printf '%s\n' 'PASS: exact-container crash identity and restart proofs'

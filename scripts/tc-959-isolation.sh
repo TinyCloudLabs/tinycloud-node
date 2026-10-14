@@ -10,6 +10,35 @@ check_host_ports_free() {
   done
 }
 
+started_at_is_newer() {
+  node -e '
+const parseNanoseconds = (value) => {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/.exec(value);
+  if (!match) throw new Error("invalid RFC3339Nano timestamp");
+  const [, year, month, day, hour, minute, second, fraction = "", zone] = match;
+  if (Number(hour) > 23 || Number(minute) > 59 || Number(second) > 59) throw new Error("invalid timestamp time");
+  const offsetHour = zone === "Z" ? 0 : Number(zone.slice(1, 3));
+  const offsetMinute = zone === "Z" ? 0 : Number(zone.slice(4, 6));
+  if (offsetHour > 23 || offsetMinute > 59) throw new Error("invalid timestamp offset");
+  const instant = Date.parse(`${year}-${month}-${day}T${hour}:${minute}:${second}${zone}`);
+  if (!Number.isSafeInteger(instant)) throw new Error("timestamp is out of range");
+  const offsetSign = zone === "Z" ? 0 : (zone[0] === "+" ? 1 : -1);
+  const wallTime = new Date(instant + offsetSign * (offsetHour * 60 + offsetMinute) * 60000).toISOString().slice(0, 19);
+  if (wallTime !== `${year}-${month}-${day}T${hour}:${minute}:${second}`) throw new Error("invalid timestamp date");
+  const nanoseconds = BigInt(instant / 1000) * 1000000000n + BigInt(fraction.padEnd(9, "0") || "0");
+  if (nanoseconds === -62135596800000000000n) throw new Error("Docker StartedAt is the zero time");
+  return nanoseconds;
+};
+try {
+  const [current, previous] = process.argv.slice(1);
+  process.exit(parseNanoseconds(current) > parseNanoseconds(previous) ? 0 : 1);
+} catch {
+  process.exit(1);
+}
+' "$1" "$2"
+}
+
+
 crash_vector() {
   local previous_line_count=$1 snapshot snapshot_id restart_before started_before
   local pids vector_pid comm target_restart current current_id current_restart current_started current_running
@@ -48,7 +77,8 @@ crash_vector() {
       fail "Vector RestartCount advanced past expected +1: before=$restart_before after=$current_restart"
     fi
     if (( current_restart == target_restart )) &&
-       [[ "$current_started" > "$started_before" && "$current_running" == true ]]; then
+       [[ "$current_running" == true ]] &&
+       started_at_is_newer "$current_started" "$started_before"; then
       break
     fi
     sleep 0.2
@@ -57,7 +87,7 @@ crash_vector() {
   [[ "$current_id" == "$snapshot_id" ]] || fail "Vector container ID changed during crash recovery"
   [[ "$current_restart" =~ ^[0-9]+$ ]] && (( current_restart == target_restart )) ||
     fail "Vector RestartCount did not increase by exactly one: before=$restart_before after=${current_restart:-unavailable}"
-  [[ "$current_started" > "$started_before" ]] || fail "Vector StartedAt did not advance after crash"
+  started_at_is_newer "$current_started" "$started_before" || fail "Vector StartedAt did not advance after crash"
   [[ "$current_running" == true ]] || fail "Vector was not running after crash recovery"
   wait_vector
   [[ "$VECTOR_ID" == "$snapshot_id" ]] || fail "Vector container ID changed while waiting for output"
