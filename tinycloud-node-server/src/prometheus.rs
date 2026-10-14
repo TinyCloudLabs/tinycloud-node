@@ -26,7 +26,18 @@ pub const VALIDITY_SLACK_BUCKETS: &[f64] = &[
     1.0, 5.0, 10.0, 15.0, 30.0, 45.0, 60.0, 90.0, 120.0, 300.0, 600.0,
 ];
 
+pub fn observe_did_resolution_refused(method: &str, reason: &str) {
+    DID_RESOLUTION_REFUSED
+        .with_label_values(&[method, reason])
+        .inc();
+}
+
 lazy_static! {
+    pub static ref DID_RESOLUTION_REFUSED: IntCounterVec = register_int_counter_vec!(
+        "tinycloud_did_resolution_refused_total",
+        "UCAN issuer resolution refusals by method and reason.",
+        &["method", "reason"]
+    ).unwrap();
     pub static ref REQUEST_HISTOGRAM: HistogramVec = register_histogram_vec!(
         "tinycloud_http_request_duration_seconds",
         "HTTP request latencies in seconds.",

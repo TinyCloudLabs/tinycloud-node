@@ -1,7 +1,7 @@
 use crate::encryption::ColumnEncryption;
 use crate::encryption_network::NetworkId;
 use crate::hash::Hash;
-use crate::models::did_resolution::did_resolution_timeout;
+use crate::models::did_resolution::{verify_ucan_signature, UcanVerifyError};
 use crate::policy_capability::sql_caveat;
 use crate::types::{Ability, Caveats, Facts, Resource};
 use crate::util::DelegationMode;
@@ -9,9 +9,7 @@ use crate::{events::Delegation, models::*, relationships::*, util};
 use sea_orm::{entity::prelude::*, sea_query::OnConflict, ConnectionTrait};
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
-use tinycloud_auth::{
-    authorization::TinyCloudDelegation, identity::did_principal_matches, ssi::dids::AnyDidMethod,
-};
+use tinycloud_auth::{authorization::TinyCloudDelegation, identity::did_principal_matches};
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "delegation")]
@@ -139,6 +137,10 @@ pub enum DelegationError {
     InvalidTime,
     #[error("Failed to verify signature")]
     InvalidSignature,
+    #[error("did_method_disabled: DID method `{0}` is not resolvable on this node")]
+    UnsupportedDidMethod(String),
+    #[error("did_url_query_rejected: issuer DID URL must not carry a query")]
+    DidUrlQueryRejected,
     #[error("Unauthorized Delegator: {0}")]
     UnauthorizedDelegator(String),
     #[error("Unauthorized Capability: {0}, {1}")]
@@ -193,14 +195,17 @@ pub(crate) async fn process<C: ConnectionTrait>(
 async fn verify(delegation: &TinyCloudDelegation) -> Result<(), Error> {
     match delegation {
         TinyCloudDelegation::Ucan(ref ucan) => {
-            tokio::time::timeout(
-                did_resolution_timeout(),
-                // TODO go back to static DID_METHODS
-                ucan.verify_signature(&AnyDidMethod::default()),
-            )
-            .await
-            .map_err(|_| DelegationError::InvalidSignature)?
-            .map_err(|_| DelegationError::InvalidSignature)?;
+            verify_ucan_signature(ucan)
+                .await
+                .map_err(|error| match error {
+                    UcanVerifyError::MethodDisabled { method } => {
+                        DelegationError::UnsupportedDidMethod(method)
+                    }
+                    UcanVerifyError::QueryRejected => DelegationError::DidUrlQueryRejected,
+                    UcanVerifyError::Timeout | UcanVerifyError::Invalid => {
+                        DelegationError::InvalidSignature
+                    }
+                })?;
             ucan.payload()
                 .validate_time(None)
                 .map_err(|_| DelegationError::InvalidTime)?;
@@ -909,6 +914,28 @@ async fn save_actors<C: ConnectionTrait>(actors: &[&str], db: &C) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn did_web_refusal_precedes_resolution() {
+        use crate::test_support::did_resolution::*;
+        use tinycloud_auth::ssi::jwk::{Algorithm, JWK};
+        let listener = bound_listener();
+        let issuer = format!(
+            "did:web:127.0.0.1%3A{}",
+            listener.local_addr().unwrap().port()
+        );
+        let ucan = signed_ucan(&issuer, &JWK::generate_ed25519().unwrap(), Algorithm::EdDSA);
+        let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        let token = ucan.encode().unwrap();
+        let event = crate::events::Delegation::from_header_ser::<
+            tinycloud_auth::authorization::TinyCloudDelegation,
+        >(&token)
+        .unwrap();
+        let result = super::process(&db, &event, None).await;
+        assert!(
+            matches!(result, Err(super::Error::InvalidDelegation(super::DelegationError::UnsupportedDidMethod(method))) if method == "web")
+        );
+        assert_no_connections(&[&listener]).await;
+    }
     use super::*;
     use crate::migrations::Migrator;
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database};

@@ -109,3 +109,7 @@ impl Drop for PostgresTestSchema {
         }
     }
 }
+
+pub(crate) mod did_resolution {
+    include!("../tests/support/did_resolution.rs");
+}

@@ -143,6 +143,28 @@ mod tests {
     }
 
     #[test]
+    fn did_resolution_defaults_off_and_canonical_env_enables_it() {
+        let _lock = lock_env();
+        let _network = EnvVarGuard::unset("TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS");
+        assert!(!config::Config::default().did_resolution.network_methods);
+        assert!(
+            !build_config_figment()
+                .extract::<config::Config>()
+                .unwrap()
+                .did_resolution
+                .network_methods
+        );
+        let _network = EnvVarGuard::set("TINYCLOUD_DID_RESOLUTION__NETWORK_METHODS", "true");
+        assert!(
+            build_config_figment()
+                .extract::<config::Config>()
+                .unwrap()
+                .did_resolution
+                .network_methods
+        );
+    }
+
+    #[test]
     fn canonical_double_underscore_loads_hooks_max_ticket_ttl_seconds() {
         let _lock = lock_env();
         let _legacy = EnvVarGuard::unset("TINYCLOUD_HOOKS_MAX_TICKET_TTL_SECONDS");

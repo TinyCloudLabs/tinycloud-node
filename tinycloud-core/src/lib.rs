@@ -5,6 +5,7 @@ pub mod database_identity;
 pub mod database_migration;
 pub mod db;
 pub mod db_pool;
+pub mod did_resolution;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 pub mod encryption;

@@ -1370,7 +1370,7 @@ fn owner_delegation_abilities_match(
 async fn verify_delegation_signature(delegation: &TinyCloudDelegation) -> Result<(), ()> {
     match delegation {
         TinyCloudDelegation::Ucan(ucan) => {
-            ucan.verify_signature(&tinycloud_auth::ssi::dids::AnyDidMethod::default())
+            tinycloud_core::did_resolution::verify_ucan_signature(ucan)
                 .await
                 .map_err(|_| ())?;
             ucan.payload().validate_time(None).map_err(|_| ())?;
@@ -3399,6 +3399,23 @@ pub async fn authorize_delivery_v2(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn did_web_refusal_precedes_resolution() {
+        use crate::did_resolution_test_support::*;
+        use tinycloud_auth::ssi::jwk::{Algorithm, JWK};
+        let listener = bound_listener();
+        let issuer = format!(
+            "did:web:127.0.0.1%3A{}",
+            listener.local_addr().unwrap().port()
+        );
+        let ucan = signed_ucan(&issuer, &JWK::generate_ed25519().unwrap(), Algorithm::EdDSA);
+        assert!(
+            super::verify_delegation_signature(&TinyCloudDelegation::Ucan(Box::new(ucan)))
+                .await
+                .is_err()
+        );
+        assert_no_connections(&[&listener]).await;
+    }
     use super::*;
     use rocket::local::asynchronous::Client;
     use time::Duration;
